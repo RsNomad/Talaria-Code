@@ -101,7 +101,7 @@ function registerTrustGatedZone(opts: TrustGatedZoneOptions): () => void {
  * Wiring is intentionally tiny: pick a backend, hand it to the view provider,
  * register the view + commands, then bring the two independent zones
  * (autocomplete, codebase RAG) online alongside it. Activation is lazy — VS
- * Code auto-generates the `onView:hermes.panel` activation event for the
+ * Code auto-generates the `onView:talaria.panel` activation event for the
  * contributed webview view (package.json, Agent C), so we never use `"*"`
  * (best-practices.md).
  */

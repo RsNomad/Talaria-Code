@@ -95,7 +95,7 @@ export function decideSeedDelivery(isWebviewLive: boolean): 'post' | 'latch' {
  */
 export class HermesViewProvider implements vscode.WebviewViewProvider {
   /** View id contributed in package.json (Agent C) and used in `activate`. */
-  public static readonly viewId = 'hermes.panel';
+  public static readonly viewId = 'talaria.panel';
 
   private view?: vscode.WebviewView;
   private readonly disposables: vscode.Disposable[] = [];
