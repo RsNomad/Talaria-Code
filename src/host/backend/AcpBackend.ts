@@ -786,7 +786,7 @@ export class AcpBackend implements AgentBackend {
         type: 'tab.error',
         tabId,
         kind: 'open-failed',
-        message: 'Hermes is not connected yet.',
+        message: 'The agent is not connected yet.',
       });
       return;
     }

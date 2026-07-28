@@ -989,7 +989,7 @@ describe('SessionController.sendPrompt — V-18 STEER-QUEUE: mid-turn control ut
         {
           type: 'error',
           sessionId: 'session-1',
-          message: 'The /steer or /queue command may not have been delivered — Hermes did not acknowledge it.',
+          message: 'The /steer or /queue command may not have been delivered — the agent did not acknowledge it.',
         },
       ]);
       // The deadline handler must NOT call client.cancel — that is

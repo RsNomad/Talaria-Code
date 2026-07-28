@@ -56,10 +56,10 @@ const SET_API_KEY_ACTION = 'Set API Key';
  *   never reaches the engine).
  */
 const WARN_MSG = (model: string): string =>
-  `Hermes autocomplete: unrecognized model "${model}". Hermes has no prompt template for this model and will fall back to a generic FIM format — completions may be malformed or silently wrong. Officially supported: qwen2.5-coder (for example "qwen2.5-coder:7b-base").`;
+  `Talaria autocomplete: unrecognized model "${model}". Talaria has no prompt template for this model and will fall back to a generic FIM format — completions may be malformed or silently wrong. Officially supported: qwen2.5-coder (for example "qwen2.5-coder:7b-base").`;
 
 const REFUSE_MSG = (model: string): string =>
-  `Hermes autocomplete is paused: unrecognized model "${model}". The vllm backend needs Hermes to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "hermes.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`;
+  `Talaria autocomplete is paused: unrecognized model "${model}". The vllm backend needs Talaria to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "hermes.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`;
 
 /**
  * A5: one-shot dedup for the actionable autocomplete failures

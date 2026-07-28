@@ -1337,7 +1337,7 @@ describe('HermesInlineCompletionProvider — unknown-model warning / refusal (Ta
     // T7 (final-review remediation): example tag is the BASE build, never
     // the bare instruct tag (F §6.3, owner-ratified).
     expect(message).toBe(
-      `Hermes autocomplete is paused: unrecognized model "${UNKNOWN_MODEL}". The vllm backend needs Hermes to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "hermes.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`,
+      `Talaria autocomplete is paused: unrecognized model "${UNKNOWN_MODEL}". The vllm backend needs Talaria to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "hermes.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`,
     );
     // T7: assert BOTH polarities explicitly (not just the `toBe` pin above),
     // so a future loosening of the exact-match pin cannot silently reopen
@@ -1369,7 +1369,7 @@ describe('HermesInlineCompletionProvider — unknown-model warning / refusal (Ta
     // T7 (final-review remediation): example tag is the BASE build, never
     // the bare instruct tag (F §6.3, owner-ratified).
     expect(message).toBe(
-      `Hermes autocomplete: unrecognized model "${UNKNOWN_MODEL}". Hermes has no prompt template for this model and will fall back to a generic FIM format — completions may be malformed or silently wrong. Officially supported: qwen2.5-coder (for example "qwen2.5-coder:7b-base").`,
+      `Talaria autocomplete: unrecognized model "${UNKNOWN_MODEL}". Talaria has no prompt template for this model and will fall back to a generic FIM format — completions may be malformed or silently wrong. Officially supported: qwen2.5-coder (for example "qwen2.5-coder:7b-base").`,
     );
     // T7: assert BOTH polarities explicitly (not just the `toBe` pin above),
     // so a future loosening of the exact-match pin cannot silently reopen

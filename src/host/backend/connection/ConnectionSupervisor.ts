@@ -262,7 +262,7 @@ export class ConnectionSupervisor {
       // initialize left NO banner at all. One signal per outage, the SAME
       // guard discipline as `handleAcpCrash` (below): a respawn-loop attempt
       // failing here must NOT add a second banner on top of the crash's own
-      // ("Talaria exited unexpectedly — reconnecting…").
+      // ("The agent exited unexpectedly — reconnecting…").
       if (!wasRespawning && (this.acpState as string) !== 'disposed') {
         this.port.emit({
           type: 'system.error',
@@ -440,7 +440,7 @@ export class ConnectionSupervisor {
         if (this.acpState !== 'respawning') {
           this.port.emit({
             type: 'system.error',
-            message: 'Hermes did not respond while starting a session — will retry on the next start.',
+            message: 'The agent did not respond while starting a session — will retry on the next start.',
           });
         }
         this.port.logger?.append(
@@ -768,7 +768,7 @@ export class ConnectionSupervisor {
           type: 'tab.error',
           tabId: controller.tabId,
           kind: 'session-lost',
-          message: 'Session ended — a new Hermes session was started.',
+          message: 'Session ended — a new agent session was started.',
         });
       }
     }
@@ -833,7 +833,7 @@ export class ConnectionSupervisor {
       // W4 §7 B1: connection-global — hits every open tab, so it rides
       // `system.error` (no sessionId), never a session-scoped `error` that
       // drop-unknown would eat the moment that one tab closes.
-      this.port.emit({ type: 'system.error', message: 'Talaria exited unexpectedly — reconnecting…' });
+      this.port.emit({ type: 'system.error', message: 'The agent exited unexpectedly — reconnecting…' });
     }
     // W4-T5a (Q-10): snapshot every registered session's identity BEFORE the
     // per-controller fan-out / the coming respawn's teardownSession() clears

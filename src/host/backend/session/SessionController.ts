@@ -256,7 +256,7 @@ export class SessionController {
   sendPrompt(text: string, mode: AgentMode, attachments?: Attachment[], mentions?: ContextRef[]): void {
     const client = this.port.getClient();
     if (!client) {
-      this.port.emitSystemError('Talaria session is not started yet.');
+      this.port.emitSystemError('The agent session is not started yet.');
       return;
     }
 
@@ -417,7 +417,7 @@ export class SessionController {
     this.port.emit({
       type: 'error',
       sessionId: this.sessionId,
-      message: 'The /steer or /queue command may not have been delivered — Hermes did not acknowledge it.',
+      message: 'The /steer or /queue command may not have been delivered — the agent did not acknowledge it.',
     });
   }
 
@@ -637,7 +637,7 @@ export class SessionController {
       this.port.emit({
         type: 'error',
         sessionId: this.sessionId,
-        message: 'Cannot switch model: Hermes is not connected. Retrying the connection…',
+        message: 'Cannot switch model: the agent is not connected. Retrying the connection…',
       });
       this.port.emit({ type: 'model.state', sessionId: this.sessionId, modelId: previous });
       return;

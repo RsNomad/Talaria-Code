@@ -113,7 +113,7 @@ export class OneShotRunner {
   async oneShot(prompt: string, opts: { cwd: string; timeoutMs?: number }): Promise<OneShotResult> {
     const client = this.port.getClient();
     if (!client || !this.port.getConnectionCwd()) {
-      return { ok: false, error: 'Talaria session is not started yet.' };
+      return { ok: false, error: 'The agent session is not started yet.' };
     }
     const cwd = opts.cwd;
     const root = this.port.resolveRoot(cwd);

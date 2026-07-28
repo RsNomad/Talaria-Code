@@ -161,7 +161,7 @@ describe('HermesViewProvider — control.request responder (Part A2)', () => {
   });
 
   it('echoes an ok:false control.response carrying the rejection message on the same requestId', async () => {
-    const invokeControl = vi.fn().mockRejectedValue(new Error('Talaria session is not started yet.'));
+    const invokeControl = vi.fn().mockRejectedValue(new Error('The agent session is not started yet.'));
     const { provider, posted } = makeProvider(invokeControl);
 
     seam(provider).handleWebviewMessage({
@@ -177,7 +177,7 @@ describe('HermesViewProvider — control.request responder (Part A2)', () => {
         type: 'control.response',
         requestId: 7,
         ok: false,
-        error: { message: 'Talaria session is not started yet.' },
+        error: { message: 'The agent session is not started yet.' },
       },
     ]);
   });
