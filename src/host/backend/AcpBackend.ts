@@ -200,7 +200,7 @@ export class AcpBackend implements AgentBackend {
    * The ONLY remaining reads are `getPreset()`/`getAvailableCommands()`
    * (via {@link activeController}) — a genuinely last-resort, DISPLAY-only
    * hydrate-seed with no session identity available at its call site
-   * (`HermesViewProvider.seedState`, itself pre-tab-bind); see
+   * (`TalariaViewProvider.seedState`, itself pre-tab-bind); see
    * {@link activeController}'s own doc.
    *
    * W6-FI-b: stays physically HERE (not moved onto {@link ConnectionSupervisor})
@@ -971,7 +971,7 @@ export class AcpBackend implements AgentBackend {
   // `ControlDispatcher`'s own doc for the full rationale (unchanged).
 
   /**
-   * W2-F1: `HermesViewProvider.seedState`'s hydrate-seed read.
+   * W2-F1: `TalariaViewProvider.seedState`'s hydrate-seed read.
    *
    * W6-FI-c (3-way ARCH I-4, part 3 of 3): a thin passthrough to {@link
    * controlDispatcher} — see its own doc for the full W6-FG/W6-FF
@@ -994,7 +994,7 @@ export class AcpBackend implements AgentBackend {
 
   /**
    * W6-FF (3-way ARCH I-1): every LIVE session's tab-identity triple
-   * (+rootId), for `HermesViewProvider.seedState`'s `hydrate` payload.
+   * (+rootId), for `TalariaViewProvider.seedState`'s `hydrate` payload.
    *
    * W6-FI-c (3-way ARCH I-4, part 3 of 3): a thin passthrough to {@link
    * controlDispatcher} — see its own doc (unchanged).

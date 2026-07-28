@@ -103,7 +103,7 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
       // configuration, and runs whether or not autocomplete is even enabled
       // (`buildEngine` runs before any `cfg.enabled` check). A throw here
       // previously escaped `activate()` itself (`extension.ts` has no
-      // try/catch around `registerHermesAutocomplete`), killing every zone
+      // try/catch around `registerTalariaAutocomplete`), killing every zone
       // registered after autocomplete (RAG, the LSP/MCP lib server, the
       // dashboard, ...).
       //

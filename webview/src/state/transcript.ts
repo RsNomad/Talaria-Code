@@ -484,7 +484,7 @@ function foldPanelData(state: AppState, msg: Extract<HostToWebview, { type: 'pan
  * live host-side session list `hydrate` now carries whenever
  * `AcpBackend.listTabs()`'s registry is non-empty. VS Code's
  * `retainContextWhenHidden` is documented BEST-EFFORT
- * (`HermesViewProvider.ts`): a memory-pressure dispose+recreate tears down
+ * (`TalariaViewProvider.ts`): a memory-pressure dispose+recreate tears down
  * this webview instance and mounts a fresh one at `INITIAL_STATE` (one
  * unbound bootstrap tab) while N host `SessionController`s are still alive.
  * Without this, `sessionToTab` never learns about them and every subsequent
@@ -636,7 +636,7 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
 
     // D2 (A2): connection-global scalar push, folded exactly like `theme`
     // above — the trust-upgrade mock->acp swap's ONLY signal, since
-    // `HermesViewProvider.setBackend` deliberately never re-hydrates.
+    // `TalariaViewProvider.setBackend` deliberately never re-hydrates.
     case 'backend.state':
       return { ...state, backendKind: msg.kind };
 

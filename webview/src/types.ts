@@ -251,7 +251,7 @@ export interface AppState {
    * above), not per-tab (P-1: there is exactly one backend per connection,
    * never one per chat tab). Folded from `WebviewState.backendKind` on
    * `hydrate` and from the `backend.state` push on a mock->acp trust-upgrade
-   * swap (`HermesViewProvider.setBackend` never re-hydrates — see
+   * swap (`TalariaViewProvider.setBackend` never re-hydrates — see
    * `state/transcript.ts`'s `backend.state` case doc). Drives the "Mock"
    * `Pill` in `TabStrip`.
    */

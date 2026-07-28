@@ -26,7 +26,7 @@ export interface DiffTabIdentity {
  * The `(sessionId, toolId)` a diff tab's `talaria-diff:` URIs encode, or
  * `undefined` when the tab isn't one of ours (an ordinary file-compare tab,
  * missing input) — or, defensively, when the two sides disagree (a shape
- * neither `HermesViewProvider.openDiffPreview` nor `DiffPreviewProvider`
+ * neither `TalariaViewProvider.openDiffPreview` nor `DiffPreviewProvider`
  * ever produces; fail closed rather than guess which side to trust). Prefers
  * the `modified` (after) side, since that's the one VS Code keeps
  * focused/dirty, falling back to `original` when only it is present.

@@ -65,7 +65,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
    * affordance it would be on a real page, and this repo has no
    * test/observation confirming it actually re-navigates the iframe. The
    * documented recovery is host-driven instead: post the `reload`
-   * `webviewToHost` message and let `HermesViewProvider` re-assign
+   * `webviewToHost` message and let `TalariaViewProvider` re-assign
    * `webview.html` through its normal `buildHtml` path (fresh CSP nonce,
    * same policy, same script/style URIs) — that re-mounts a fresh React
    * tree the same way the initial `resolveWebviewView` does.

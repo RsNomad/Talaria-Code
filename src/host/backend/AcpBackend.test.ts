@@ -2062,7 +2062,7 @@ describe('AcpBackend.openTab/closeTab — W4-T3b (§2d/§2e Deliverable 5): the 
   });
 });
 
-describe('AcpBackend.listTabs — W6-FF (3-way ARCH I-1): the live tab list HermesViewProvider\'s hydrate payload reuses', () => {
+describe('AcpBackend.listTabs — W6-FF (3-way ARCH I-1): the live tab list TalariaViewProvider\'s hydrate payload reuses', () => {
   it('is empty before any session is established (a genuine cold boot — nothing live to reconcile)', () => {
     const { backend } = makeStartableBackend();
     expect(backend.listTabs()).toEqual([]);
@@ -6842,7 +6842,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
   // hardcoded pinned-default use, and the wire message was never actually
   // sent by the webview (the mode picker uses a completely different path,
   // `mode.set` -> `setCustomMode`, sessionId-scoped, untouched). Deleting the
-  // WHOLE vestigial vertical slice (wire type -> HermesViewProvider handler
+  // WHOLE vestigial vertical slice (wire type -> TalariaViewProvider handler
   // -> AgentBackend interface -> AcpBackend/ControlDispatcher fan-out) is
   // strictly safer than clamping it in place: a sessionId-less broadcast
   // method can no longer exist to be misused by a future caller, however

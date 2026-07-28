@@ -90,7 +90,7 @@ export interface HermesCrossFileContextService {
 
 /**
  * Constructs the real `CrossFileContextService` (owned by
- * `registerHermesAutocomplete`, index.ts) wired to real vscode listeners:
+ * `registerTalariaAutocomplete`, index.ts) wired to real vscode listeners:
  * tab open/close, save (+ quarantine clear), active-editor change (+ MRU
  * tracking for the recently-opened source), and per-keystroke bookkeeping
  * that arms the debounced idle-tick gather trigger. NOT unit tested

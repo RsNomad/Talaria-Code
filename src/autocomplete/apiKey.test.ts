@@ -94,7 +94,7 @@ describe('shouldClearLegacyApiKeySetting — the two-session migration gate', ()
  *
  * `initApiKey` is module-private and `index.ts` has no test-only-export
  * precedent, so it is driven through the ONLY public entry point,
- * `registerHermesAutocomplete`, exactly as the extension host drives it.
+ * `registerTalariaAutocomplete`, exactly as the extension host drives it.
  *
  * Spies are plain functions pushing into arrays, never `vi.fn()` — `vi.fn()`
  * swallows unhandled rejections, which is how a vacuous assertion gets built
@@ -266,12 +266,12 @@ vi.mock('./nextedit/shell.vscode', () => ({
     accepted: () => {},
     acceptCommandId: () => undefined,
   },
-  registerHermesNextEdit: () => ({ dispose() {} }),
+  registerTalariaNextEdit: () => ({ dispose() {} }),
   requestNextEditToggle: () => Promise.resolve({ next: false, generic: false }),
 }));
 
 import * as vscode from 'vscode';
-import { registerHermesAutocomplete } from './index';
+import { registerTalariaAutocomplete } from './index';
 
 function makeFakeContext(options: {
   secrets: Map<string, string>;
@@ -324,7 +324,7 @@ async function initApiKeyForTest(
   settingValue: string | undefined,
 ): Promise<string | undefined> {
   host.settings.set('talaria.autocomplete.apiKey', settingValue ?? '');
-  const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+  const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
   await flushAsync();
   disposable.dispose();
   return host.backendApiKeys[host.backendApiKeys.length - 1];
@@ -441,7 +441,7 @@ describe('initApiKey — the migrating session leaves the durable copy alone', (
     const ctx = makeFakeContext({ secrets: stored });
     host.settings.set('talaria.autocomplete.apiKey', 'sk-legacy');
 
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
 
     host.settings.set('talaria.autocomplete.apiKey', '');
@@ -542,7 +542,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
   }): Promise<void> {
     host.settings.set('talaria.autocomplete.apiKey', options.setting);
     const ctx = makeFakeContext({ secrets: options.secrets });
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
     // Only the command's own messages should be asserted below.
     host.infos.length = 0;
@@ -577,7 +577,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
 
     host.settings.set('talaria.autocomplete.apiKey', 'sk-legacy');
     const ctx = makeFakeContext({ secrets: stored });
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
     host.configUpdates.length = 0;
     host.inputBoxValue = undefined;
@@ -701,7 +701,7 @@ describe('FINDING 2: the SAVE branch stores the key and NEVER puts it in a messa
   }): Promise<void> {
     host.settings.set('talaria.autocomplete.apiKey', options.setting);
     const ctx = makeFakeContext({ secrets: options.secrets });
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
     host.infos.length = 0;
     host.warnings.length = 0;

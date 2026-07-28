@@ -246,7 +246,7 @@ vi.mock('./backend', () => ({
   },
 }));
 
-import { registerHermesNextEdit, fimActivityRelay } from './shell.vscode';
+import { registerTalariaNextEdit, fimActivityRelay } from './shell.vscode';
 import { NextEditGuard, NEXT_EDIT_TOGGLES_KEY } from './guard';
 import { applyToggleRequest, type ToggleRequest, type ToggleState } from './mode';
 import { collectNonTestTsSources, type ScannableSource } from '../../host/purityScan';
@@ -319,7 +319,7 @@ const SRC_REACH_SENTINELS = [
   'autocomplete/context/ringBuffer.ts',
   'autocomplete/nextedit/guard.ts',
   'autocomplete/nextedit/shell.vscode.ts',
-  'host/HermesViewProvider.ts',
+  'host/TalariaViewProvider.ts',
 ] as const;
 
 describe('scan reach — every src/-wide lock below really walks the whole tree', () => {
@@ -530,7 +530,7 @@ async function setupShell(toggles: ToggleState): Promise<vscodeTypes.Disposable>
   const guard = await NextEditGuard.hydrate(makeRecordingMemento(toggles).memento, {
     reportFailure: SHELL_DEPS.reportFailure,
   });
-  return registerHermesNextEdit(makeContext(), guard, SHELL_DEPS);
+  return registerTalariaNextEdit(makeContext(), guard, SHELL_DEPS);
 }
 
 /** Drives the ONE trigger path through its edit-burst source, then settles the

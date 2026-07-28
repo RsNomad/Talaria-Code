@@ -86,7 +86,7 @@ describe('Next Edit Suggestions rows — frozen owner-approved copy (08 §8)', (
  * THE BUG. Both rows rendered only inside `<RemotePanel remote={globalPanels.
  * settings}>` (`App.tsx:656-671`), i.e. only after the Hermes agent answered
  * `panel.data`. But the toggles are pure extension `globalState`, served
- * HOST-INTERNALLY (`HermesViewProvider.ts:591`) and pushed over
+ * HOST-INTERNALLY (`TalariaViewProvider.ts:591`) and pushed over
  * `nextEdit.state` into `AppState.nextEditToggles` — they need no agent at
  * all, and `state.nextEditToggles` is a top-level connection-global slice
  * that is populated whether or not any panel fetch ever resolves.

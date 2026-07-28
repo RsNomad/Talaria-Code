@@ -18,7 +18,7 @@ import { diffIdentityFromDiffTabInput, type DiffTabIdentity } from './diffDecisi
 
 /** Structural capability check — only the real `AcpBackend` implements the
  * whole-file accept helper (mirrors the reach-for-it-when-present, no-op-
- * otherwise posture `HermesViewProvider.ts` applies to `AgentBackend`'s
+ * otherwise posture `TalariaViewProvider.ts` applies to `AgentBackend`'s
  * optional members, P7-N12 · I-8). */
 interface WholeFileAcceptCapable {
   acceptWholeFileDiff(sessionId: string, toolId: string): void;

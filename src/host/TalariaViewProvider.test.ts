@@ -1,7 +1,7 @@
 /*
  * Host-side of the id-correlated request/response path (Part A2).
  *
- * `HermesViewProvider` receives a webview `control.request`, runs
+ * `TalariaViewProvider` receives a webview `control.request`, runs
  * `backend.invokeControl`, and MUST always echo a `control.response` back with
  * the same `requestId` — resolving (ok:true) or rejecting (ok:false), never
  * hanging. This is the responder half of the RpcClient tested in
@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as vscode from 'vscode';
-import { HermesViewProvider, capSeedText, decideSeedDelivery } from './HermesViewProvider';
+import { TalariaViewProvider, capSeedText, decideSeedDelivery } from './TalariaViewProvider';
 import type { AgentBackend } from './backend/AgentBackend';
 import type {
   ContextRef,
@@ -41,7 +41,7 @@ vi.mock('vscode', () => {
     ColorThemeKind: { Light: 1, Dark: 2, HighContrast: 3, HighContrastLight: 4 },
     Uri: {
       joinPath: (...parts: unknown[]) => ({ parts }),
-      // W2 T4 (F-D): `HermesViewProvider.diff.open` builds `talaria-diff:` URIs
+      // W2 T4 (F-D): `TalariaViewProvider.diff.open` builds `talaria-diff:` URIs
       // via `Uri.from({scheme, authority, path})` — a minimal structural
       // stand-in good enough for assertions on the parts it was called with.
       from: (components: { scheme: string; authority?: string; path?: string }) => ({ ...components }),
@@ -108,10 +108,10 @@ function makeTabsBackend(tabs: HydrateTabSeed[]): TabsBackend {
 }
 
 function makeProviderWith(backend: AgentBackend): {
-  provider: HermesViewProvider;
+  provider: TalariaViewProvider;
   posted: HostToWebviewMessage[];
 } {
-  const provider = new HermesViewProvider({ fsPath: '/ext' } as never, backend);
+  const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend);
   const posted: HostToWebviewMessage[] = [];
   seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
   return { provider, posted };
@@ -122,16 +122,16 @@ interface ProviderSeam {
   handleWebviewMessage: (msg: WebviewToHostMessage) => void;
 }
 
-function seam(p: HermesViewProvider): ProviderSeam {
+function seam(p: TalariaViewProvider): ProviderSeam {
   return p as unknown as ProviderSeam;
 }
 
 function makeProvider(invokeControl: AgentBackend['invokeControl']): {
-  provider: HermesViewProvider;
+  provider: TalariaViewProvider;
   posted: HostToWebviewMessage[];
 } {
   const backend = makeFakeBackend(invokeControl);
-  const provider = new HermesViewProvider({ fsPath: '/ext' } as never, backend);
+  const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend);
   const posted: HostToWebviewMessage[] = [];
   seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
   return { provider, posted };
@@ -143,7 +143,7 @@ async function flush(): Promise<void> {
   await Promise.resolve();
 }
 
-describe('HermesViewProvider — control.request responder (Part A2)', () => {
+describe('TalariaViewProvider — control.request responder (Part A2)', () => {
   it('echoes an ok:true control.response with the invokeControl result and the same requestId', async () => {
     const invokeControl = vi.fn().mockResolvedValue({ tools: [] });
     const { provider, posted } = makeProvider(invokeControl);
@@ -201,15 +201,15 @@ describe('HermesViewProvider — control.request responder (Part A2)', () => {
   });
 });
 
-describe('HermesViewProvider — W2 T2d: context.searchFiles wiring', () => {
+describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
   function makeProviderWithSearch(searchFiles?: (query: string, maxResults: number) => Promise<string[]>): {
-    provider: HermesViewProvider;
+    provider: TalariaViewProvider;
     posted: HostToWebviewMessage[];
     invokeControl: AgentBackend['invokeControl'];
   } {
     const invokeControl = vi.fn().mockResolvedValue(undefined);
     const backend = makeFakeBackend(invokeControl);
-    const provider = new HermesViewProvider({ fsPath: '/ext' } as never, backend, undefined, searchFiles);
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend, undefined, searchFiles);
     const posted: HostToWebviewMessage[] = [];
     seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
     return { provider, posted, invokeControl };
@@ -267,7 +267,7 @@ describe('HermesViewProvider — W2 T2d: context.searchFiles wiring', () => {
   });
 });
 
-describe('HermesViewProvider — W2-F1 edit-policy preset routing', () => {
+describe('TalariaViewProvider — W2-F1 edit-policy preset routing', () => {
   it('routes policy.setPreset to a preset-capable backend', () => {
     const backend = makePresetBackend('manual');
     const { provider } = makeProviderWith(backend);
@@ -315,7 +315,7 @@ describe('HermesViewProvider — W2-F1 edit-policy preset routing', () => {
   });
 });
 
-describe('HermesViewProvider — D2 (A2): mock/real backend badge', () => {
+describe('TalariaViewProvider — D2 (A2): mock/real backend badge', () => {
   it('seeds the bootstrap hydrate state with the backend kind', () => {
     const { provider, posted } = makeProviderWith(makeFakeBackend());
 
@@ -351,7 +351,7 @@ function makeCustomModeBackend(setCustomMode = vi.fn()): CustomModeBackend {
   return { ...makeFakeBackend(), setCustomMode };
 }
 
-describe('HermesViewProvider — SF-2 (T4b): mode.set routing', () => {
+describe('TalariaViewProvider — SF-2 (T4b): mode.set routing', () => {
   it('routes mode.set to a custom-mode-capable backend', () => {
     const backend = makeCustomModeBackend();
     const { provider } = makeProviderWith(backend);
@@ -387,7 +387,7 @@ function makeLoadTabBackend(loadTab = vi.fn().mockResolvedValue(undefined)): Loa
   return { ...makeFakeBackend(), loadTab };
 }
 
-describe('HermesViewProvider — W4-T5b: tab.load routing (§2d wire, not a CONTROL_METHODS entry)', () => {
+describe('TalariaViewProvider — W4-T5b: tab.load routing (§2d wire, not a CONTROL_METHODS entry)', () => {
   it('routes tab.load to a loadTab-capable backend with {tabId, sessionId, cwd}', () => {
     const backend = makeLoadTabBackend();
     const { provider } = makeProviderWith(backend);
@@ -416,7 +416,7 @@ describe('HermesViewProvider — W4-T5b: tab.load routing (§2d wire, not a CONT
   });
 });
 
-describe('HermesViewProvider — W2 T2c: prompt routing threads @-mentions through to the backend', () => {
+describe('TalariaViewProvider — W2 T2c: prompt routing threads @-mentions through to the backend', () => {
   it("passes message.mentions through verbatim as sendPrompt's 4th argument", () => {
     const sendPrompt = vi.fn();
     const { provider } = makeProviderWith(makeFakeBackend(undefined, { sendPrompt }));
@@ -437,7 +437,7 @@ describe('HermesViewProvider — W2 T2c: prompt routing threads @-mentions throu
   });
 });
 
-describe('HermesViewProvider — W2 F-S: available_commands hydrate carry', () => {
+describe('TalariaViewProvider — W2 F-S: available_commands hydrate carry', () => {
   it('seeds the bootstrap hydrate state with the backend cached catalog (a re-created view gets it without an adapter replay)', () => {
     const commands: SlashCommandInfo[] = [{ name: 'help', description: 'Show help' }];
     const { provider, posted } = makeProviderWith(makeCommandsBackend(commands));
@@ -468,7 +468,7 @@ describe('HermesViewProvider — W2 F-S: available_commands hydrate carry', () =
   });
 });
 
-describe('HermesViewProvider — W6-FF (3-way ARCH I-1): hydrate carries the live tab list (re-create no-orphan)', () => {
+describe('TalariaViewProvider — W6-FF (3-way ARCH I-1): hydrate carries the live tab list (re-create no-orphan)', () => {
   it('seeds hydrate.state.tabs from a tabs-capable backend\'s live registry', () => {
     const seed: HydrateTabSeed[] = [
       { tabId: 'tab-a', sessionId: 'sA', cwd: '/root-a', rootId: '/root-a', preset: 'manual' },
@@ -504,7 +504,7 @@ describe('HermesViewProvider — W6-FF (3-way ARCH I-1): hydrate carries the liv
   });
 });
 
-describe('HermesViewProvider — R-C4: ready arms the backend ONCE (no live-session replacement)', () => {
+describe('TalariaViewProvider — R-C4: ready arms the backend ONCE (no live-session replacement)', () => {
   it('a second ready does not call backend.start() again', () => {
     const start = vi.fn();
     const backend = makeFakeBackend(undefined, { start });
@@ -553,10 +553,10 @@ describe('HermesViewProvider — R-C4: ready arms the backend ONCE (no live-sess
  * `ConnectionSupervisor` restart fan-out), not a host-side guess emitted
  * before the backend has even chosen a new session id.
  */
-describe('HermesViewProvider — T-1 (V-12 RESTART-STATE): the retired PENDING_SESSION_PLACEHOLDER dead-letter', () => {
+describe('TalariaViewProvider — T-1 (V-12 RESTART-STATE): the retired PENDING_SESSION_PLACEHOLDER dead-letter', () => {
   it('grep-level lock: the source never mentions the retired "pending-session" placeholder id again', () => {
     const here = dirname(fileURLToPath(import.meta.url));
-    const source = readFileSync(join(here, 'HermesViewProvider.ts'), 'utf8');
+    const source = readFileSync(join(here, 'TalariaViewProvider.ts'), 'utf8');
 
     expect(source).not.toContain('pending-session');
   });
@@ -625,7 +625,7 @@ describe('decideSeedDelivery — pure pending-seed latch decision (§2e)', () =>
   });
 });
 
-describe('HermesViewProvider — W2 T3: seedComposer (§2e pending-seed latch)', () => {
+describe('TalariaViewProvider — W2 T3: seedComposer (§2e pending-seed latch)', () => {
   function composerSeedMessages(posted: HostToWebviewMessage[]): HostToWebviewMessage[] {
     return posted.filter((m) => m.type === 'composer.seed');
   }
@@ -657,13 +657,13 @@ describe('HermesViewProvider — W2 T3: seedComposer (§2e pending-seed latch)',
     const executeCommand = vi.mocked(vscode.commands.executeCommand);
     executeCommand.mockClear();
     const backend = makeFakeBackend();
-    const provider = new HermesViewProvider({ fsPath: '/ext' } as never, backend);
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend);
     // Deliberately NOT attaching a view — simulates the command firing before
     // the panel has ever been opened/resolved this session.
 
     provider.seedComposer({ text: 'Add this.' });
 
-    expect(executeCommand).toHaveBeenCalledWith(`${HermesViewProvider.viewId}.focus`);
+    expect(executeCommand).toHaveBeenCalledWith(`${TalariaViewProvider.viewId}.focus`);
 
     // The view now resolves (user's panel opens) and the webview announces ready.
     const posted: HostToWebviewMessage[] = [];
@@ -718,7 +718,7 @@ describe('HermesViewProvider — W2 T3: seedComposer (§2e pending-seed latch)',
   });
 });
 
-describe('HermesViewProvider — W2 T4 F-D: diff.open routing', () => {
+describe('TalariaViewProvider — W2 T4 F-D: diff.open routing', () => {
   it('opens both talaria-diff: virtual sides via vscode.diff, titled as a pending-approval preview', () => {
     const executeCommand = vi.mocked(vscode.commands.executeCommand);
     executeCommand.mockClear();
@@ -766,7 +766,7 @@ describe('HermesViewProvider — W2 T4 F-D: diff.open routing', () => {
     executeCommand.mockClear();
     executeCommand.mockRejectedValueOnce(new Error('no diff content provider registered'));
     const logger = { appendLine: vi.fn() } as unknown as vscode.OutputChannel;
-    const provider = new HermesViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(), logger);
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(), logger);
     seam(provider).view = { webview: { postMessage: () => {} } };
 
     seam(provider).handleWebviewMessage({
@@ -819,9 +819,9 @@ function makeFakeWebviewView(posted: HostToWebviewMessage[]): {
   return { view, fireDispose: () => disposeCb?.() };
 }
 
-describe('HermesViewProvider — T3 review Minor (deliverable 8): onDidDispose latches instead of leaving a stale live view', () => {
+describe('TalariaViewProvider — T3 review Minor (deliverable 8): onDidDispose latches instead of leaving a stale live view', () => {
   it('a memory-pressure dispose (no reopen) clears view + isWebviewLive; a seedComposer that arrives in that window LATCHES and is delivered once a fresh view is resolved and ready', () => {
-    const provider = new HermesViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
 
     const posted1: HostToWebviewMessage[] = [];
     const { view: view1, fireDispose } = makeFakeWebviewView(posted1);
@@ -919,7 +919,7 @@ function makeFakeTogglePort(initial: { next: boolean; generic: boolean }) {
 function makeProviderWithTogglePort(initial: { next: boolean; generic: boolean }) {
   const { calls, invokeControl } = recordingInvokeControl();
   const backend = makeFakeBackend(invokeControl);
-  const provider = new HermesViewProvider({ fsPath: '/ext' } as never, backend);
+  const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend);
   const posted: HostToWebviewMessage[] = [];
   seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
   const fake = makeFakeTogglePort(initial);
@@ -927,7 +927,7 @@ function makeProviderWithTogglePort(initial: { next: boolean; generic: boolean }
   return { provider, posted, calls, fake };
 }
 
-describe('HermesViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)', () => {
+describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)', () => {
   it('an accepted toggle answers ok:true with the NEW state and never forwards to backend.invokeControl', async () => {
     const { provider, posted, calls, fake } = makeProviderWithTogglePort({ next: false, generic: false });
     posted.length = 0;
@@ -1014,7 +1014,7 @@ describe('HermesViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)'
 
   it('answers honestly (ok:false) when no toggle port is wired yet — never forwards the orphan request to the agent', async () => {
     const { calls, invokeControl } = recordingInvokeControl();
-    const provider = new HermesViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(invokeControl));
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(invokeControl));
     const posted: HostToWebviewMessage[] = [];
     seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
 
@@ -1048,9 +1048,9 @@ describe('HermesViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)'
  * requires observing a real `buildHtml()` output, not just that some field
  * changed.
  */
-describe('HermesViewProvider — F11 ErrorBoundary Reload (host-driven webview.html re-assign)', () => {
+describe('TalariaViewProvider — F11 ErrorBoundary Reload (host-driven webview.html re-assign)', () => {
   it('re-assigns webview.html via the same nonce/html-builder path as the initial resolveWebviewView', () => {
-    const provider = new HermesViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
     const posted: HostToWebviewMessage[] = [];
     const { view } = makeFakeWebviewView(posted);
     provider.resolveWebviewView(view as never, {} as never, {} as never);
@@ -1073,13 +1073,13 @@ describe('HermesViewProvider — F11 ErrorBoundary Reload (host-driven webview.h
   });
 
   it('is a no-op — never throws — when no view is currently resolved (view torn down between fallback render and message arrival)', () => {
-    const provider = new HermesViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
 
     expect(() => seam(provider).handleWebviewMessage({ type: 'reload' })).not.toThrow();
   });
 
   it('re-closes the isWebviewLive latch (MINOR-1): a seedComposer arriving in the reload window LATCHES instead of posting into the mid-reload webview', () => {
-    const provider = new HermesViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
     const posted: HostToWebviewMessage[] = [];
     const { view } = makeFakeWebviewView(posted);
     provider.resolveWebviewView(view as never, {} as never, {} as never);

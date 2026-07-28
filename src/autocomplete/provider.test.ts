@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
 import {
-  HermesInlineCompletionProvider,
+  TalariaInlineCompletionProvider,
   reponameFromWorkspace,
   clearSurfacedAutocompleteFailures,
   type FimActivityListener,
@@ -55,7 +55,7 @@ vi.mock('vscode', () => {
     // A5: the surfacing primitive + the `Set API Key` action's invocation
     // target. `showWarningMessage` resolves to `undefined` by default
     // (matches the real Thenable's "dismissed" result) — mirrors
-    // `HermesViewProvider.test.ts`'s identical mock-default posture.
+    // `TalariaViewProvider.test.ts`'s identical mock-default posture.
     window: { showWarningMessage: vi.fn().mockResolvedValue(undefined) },
     commands: { executeCommand: vi.fn().mockResolvedValue(undefined) },
   };
@@ -148,8 +148,8 @@ function makeProvider(
   engine: FakeEngine,
   contextService: FakeContextService = new FakeContextService(),
   opts: FailureSurfacingOpts = {},
-): HermesInlineCompletionProvider {
-  return new HermesInlineCompletionProvider(
+): TalariaInlineCompletionProvider {
+  return new TalariaInlineCompletionProvider(
     () => engine as unknown as FimEngine,
     () => true,
     () => false, // not Restricted Mode / not remote — never skip (S4.3 covered separately below)
@@ -176,7 +176,7 @@ function attachedNextEdit(commandId: string): FimActivityListener {
   };
 }
 
-describe('HermesInlineCompletionProvider — secret-path skip (S4.1)', () => {
+describe('TalariaInlineCompletionProvider — secret-path skip (S4.1)', () => {
   it('returns null for a secret-classified document (.env) without calling the engine', async () => {
     // Full FakeDocument (getText/offsetAt/lineAt all present) so a would-be bug
     // in the secret-skip couldn't hide behind an unrelated TypeError — if the
@@ -257,7 +257,7 @@ describe('HermesInlineCompletionProvider — secret-path skip (S4.1)', () => {
 });
 
 describe(
-  'HermesInlineCompletionProvider — Restricted Mode remote-endpoint skip (S4.3): ' +
+  'TalariaInlineCompletionProvider — Restricted Mode remote-endpoint skip (S4.3): ' +
     'returns null in Restricted Mode when the endpoint is remote (non-loopback), ' +
     'but completes for a loopback endpoint',
   () => {
@@ -267,7 +267,7 @@ describe(
       const engine = new FakeEngine();
       engine.respondWith = 'ata()';
       // Restricted Mode + a remote (non-loopback) configured endpoint.
-      const provider = new HermesInlineCompletionProvider(
+      const provider = new TalariaInlineCompletionProvider(
         () => engine as unknown as FimEngine,
         () => true,
         () => true,
@@ -298,7 +298,7 @@ describe(
       const engine = new FakeEngine();
       engine.respondWith = 'ata()';
       // Restricted Mode, but the configured endpoint is loopback -> never skip.
-      const provider = new HermesInlineCompletionProvider(
+      const provider = new TalariaInlineCompletionProvider(
         () => engine as unknown as FimEngine,
         () => true,
         () => false,
@@ -325,7 +325,7 @@ describe(
   },
 );
 
-describe('HermesInlineCompletionProvider — widget-open prefix/range (finding #1)', () => {
+describe('TalariaInlineCompletionProvider — widget-open prefix/range (finding #1)', () => {
   it('splices the prefix at the widget range start, not the cursor — no duplicated typed text', async () => {
     const doc = new FakeDocument('getD');
     const position = new vscode.Position(0, 4); // cursor right after "getD"
@@ -474,7 +474,7 @@ describe('reponameFromWorkspace', () => {
 });
 
 // ── W5-T5: the snippets seam + reponame + egressPreconditionsMet ───────────
-describe('HermesInlineCompletionProvider — cross-file wiring (W5-T5)', () => {
+describe('TalariaInlineCompletionProvider — cross-file wiring (W5-T5)', () => {
   afterEach(() => {
     (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = undefined;
   });
@@ -581,7 +581,7 @@ describe('HermesInlineCompletionProvider — cross-file wiring (W5-T5)', () => {
     const position = new vscode.Position(0, 4);
     const engine = new FakeEngine();
     engine.respondWith = 'SHOULD_NOT_BE_USED';
-    const provider = new HermesInlineCompletionProvider(
+    const provider = new TalariaInlineCompletionProvider(
       () => engine as unknown as FimEngine,
       () => true, // enabled
       () => true, // skipUntrustedRemote
@@ -611,7 +611,7 @@ describe('HermesInlineCompletionProvider — cross-file wiring (W5-T5)', () => {
     const position = new vscode.Position(0, 4);
     const engine = new FakeEngine();
     engine.respondWith = 'SHOULD_NOT_BE_USED';
-    const provider = new HermesInlineCompletionProvider(
+    const provider = new TalariaInlineCompletionProvider(
       () => engine as unknown as FimEngine,
       () => false, // NOT enabled
       () => false, // skipUntrustedRemote
@@ -801,7 +801,7 @@ describe('the R4 accept command is advertised only by an ATTACHED next-edit regi
   const ACCEPT_COMMAND = 'talaria.nextEdit.onFimAccept';
 
   async function completeOnce(
-    provider: HermesInlineCompletionProvider,
+    provider: TalariaInlineCompletionProvider,
   ): Promise<vscode.InlineCompletionItem[]> {
     const doc = new FakeDocument('const ');
     const result = await provider.provideInlineCompletionItems(
@@ -848,7 +848,7 @@ describe('the R4 accept command is advertised only by an ATTACHED next-edit regi
 });
 
 // ── A5: narrowed catch — surface the 3 actionable failures, once each ──────
-describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
+describe('TalariaInlineCompletionProvider — failure surfacing (A5)', () => {
   beforeEach(() => {
     clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
@@ -861,7 +861,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
    *  these tests, only `engine.complete`'s outcome (set via
    *  `engine.throwError`) matters. */
   async function complete(
-    provider: HermesInlineCompletionProvider,
+    provider: TalariaInlineCompletionProvider,
   ): Promise<vscode.InlineCompletionItem[] | vscode.InlineCompletionList | null> {
     const doc = new FakeDocument('getD');
     const position = new vscode.Position(0, 4);
@@ -1290,7 +1290,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
 });
 
 // ── Task 16 (08 §11, ADR-010): unknown-model one-shot warning / vllm refusal ──
-describe('HermesInlineCompletionProvider — unknown-model warning / refusal (Task 16)', () => {
+describe('TalariaInlineCompletionProvider — unknown-model warning / refusal (Task 16)', () => {
   beforeEach(() => {
     clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
@@ -1305,7 +1305,7 @@ describe('HermesInlineCompletionProvider — unknown-model warning / refusal (Ta
   const KNOWN_MODEL = 'qwen2.5-coder:7b';
 
   async function complete(
-    provider: HermesInlineCompletionProvider,
+    provider: TalariaInlineCompletionProvider,
   ): Promise<vscode.InlineCompletionItem[] | vscode.InlineCompletionList | null> {
     const doc = new FakeDocument('getD');
     const position = new vscode.Position(0, 4);
@@ -1448,10 +1448,10 @@ describe('HermesInlineCompletionProvider — unknown-model warning / refusal (Ta
 // ── M3 (A7, pulled forward from A5's review): on a keyring-less Fedora box
 // (our actual ship target), `talaria.setAutocompleteApiKey` — invoked from
 // the `Set API Key` action — can reject the `showWarningMessage` Thenable.
-// Precedent: `HermesViewProvider.ts`'s `openDiffPreview` routes an identical
+// Precedent: `TalariaViewProvider.ts`'s `openDiffPreview` routes an identical
 // shape to its logger via two-argument `.then(undefined, ...)` — `Thenable`
 // (unlike a real Promise) has no `.catch`.
-describe('HermesInlineCompletionProvider — M3: showWarningMessage rejection is routed to reportFailure, never unhandled', () => {
+describe('TalariaInlineCompletionProvider — M3: showWarningMessage rejection is routed to reportFailure, never unhandled', () => {
   beforeEach(() => {
     clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
@@ -1501,7 +1501,7 @@ describe('HermesInlineCompletionProvider — M3: showWarningMessage rejection is
 // (`showWarningMessage` resolves to `'Set API Key'` -> `executeCommand`
 // rejects) rather than M3's mock (`showWarningMessage` itself rejecting),
 // which is the exact distinction the final security review's probe proved.
-describe('HermesInlineCompletionProvider — F-A: a rejected talaria.setAutocompleteApiKey command must reach reportFailure and re-arm the Set', () => {
+describe('TalariaInlineCompletionProvider — F-A: a rejected talaria.setAutocompleteApiKey command must reach reportFailure and re-arm the Set', () => {
   beforeEach(() => {
     clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
@@ -1509,7 +1509,7 @@ describe('HermesInlineCompletionProvider — F-A: a rejected talaria.setAutocomp
   });
 
   async function complete(
-    provider: HermesInlineCompletionProvider,
+    provider: TalariaInlineCompletionProvider,
   ): Promise<vscode.InlineCompletionItem[] | vscode.InlineCompletionList | null> {
     const doc = new FakeDocument('getD');
     const position = new vscode.Position(0, 4);

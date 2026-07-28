@@ -1,5 +1,5 @@
 /**
- * W2 T3 — F-A code actions (§3.3): the ONE `HermesCodeActionProvider`,
+ * W2 T3 — F-A code actions (§3.3): the ONE `TalariaCodeActionProvider`,
  * registered on `'*'` for `providedCodeActionKinds: [QuickFix]`. Returns
  * "Fix with Hermes" ONLY when `context.diagnostics.length > 0` (no
  * always-on lightbulb, doc 03 §5.1), `isPreferred: false` (never hijack the
@@ -26,7 +26,7 @@ export function shouldOfferFix(diagnosticsLength: number): boolean {
   return diagnosticsLength > 0;
 }
 
-export class HermesCodeActionProvider implements vscode.CodeActionProvider {
+export class TalariaCodeActionProvider implements vscode.CodeActionProvider {
   static readonly providedCodeActionKinds = [vscode.CodeActionKind.QuickFix];
 
   provideCodeActions(

@@ -154,10 +154,10 @@ describe('createBackend — F-1 unknown backend name fails closed', () => {
  * undefined`, even for the correct, documented "key lives in SecretStorage"
  * configuration, and even when autocomplete is disabled (`buildEngine` runs
  * before any `cfg.enabled` check). A throw here escaped `activate()` itself
- * (no try/catch anywhere around `registerHermesAutocomplete`,
+ * (no try/catch anywhere around `registerTalariaAutocomplete`,
  * `extension.ts:325`), killing every zone registered after autocomplete. See
  * `activationDoesNotThrow.test.ts` for the real-activation regression proof
- * (drives the REAL `registerHermesAutocomplete` against this REAL
+ * (drives the REAL `registerTalariaAutocomplete` against this REAL
  * `createBackend`, not a mock — every OTHER activation test mocks
  * `./backendFactory`, which is exactly why this shipped with the full suite
  * green).

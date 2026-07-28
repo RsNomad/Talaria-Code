@@ -1,12 +1,12 @@
 import * as path from 'node:path';
 
 import * as vscode from 'vscode';
-import { HermesViewProvider } from './host/HermesViewProvider';
+import { TalariaViewProvider } from './host/TalariaViewProvider';
 import { AgentBackend } from './host/backend/AgentBackend';
 import { MockBackend } from './host/backend/MockBackend';
 import { AcpBackend } from './host/backend/AcpBackend';
 import type { HermesRuntimeConfig } from './host/runtime/resolveHermes';
-import { registerHermesAutocomplete } from './autocomplete';
+import { registerTalariaAutocomplete } from './autocomplete';
 import { createIndexer, type Indexer } from './rag/indexer';
 import { selectBackendKind, shouldActivateLib, shouldActivateRag } from './host/trustGate';
 import { isHttpUrl } from './shared/url';
@@ -23,7 +23,7 @@ import { TerminalCapture } from './host/context/terminalCapture';
 import type { FindFilesFn } from './host/context/searchFilesResponse';
 import { createGitPort } from './host/scm/gitPort';
 import { registerEditorActions } from './host/commands/editorActions.vscode';
-import { HermesCodeActionProvider } from './host/commands/HermesCodeActionProvider';
+import { TalariaCodeActionProvider } from './host/commands/TalariaCodeActionProvider';
 import { registerDiffDecisionCommands } from './host/commands/diffDecision.vscode';
 import { EditPreviewRegistry } from './host/preview/EditPreviewRegistry';
 import { DiffPreviewProvider, TALARIA_DIFF_SCHEME } from './host/preview/DiffPreviewProvider';
@@ -157,7 +157,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // `selectBackendKind` decision point). The MockBackend path never calls
   // this, so it stays resolver-free by construction. `searchFilesPort` is
   // captured in the outer closure below so the SAME trust-gated
-  // `WorkspacePort.findFiles` can also be wired into `HermesViewProvider`'s
+  // `WorkspacePort.findFiles` can also be wired into `TalariaViewProvider`'s
   // `context.searchFiles` handler (§2e) — a separate seam from the resolver
   // (the resolver lives inside `AcpBackend`; search doesn't touch the agent
   // at all), but gated by the identical condition.
@@ -197,7 +197,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(backend);
 
   // ── View provider ────────────────────────────────────────────────────────
-  const provider = new HermesViewProvider(
+  const provider = new TalariaViewProvider(
     context.extensionUri,
     backend,
     output,
@@ -206,7 +206,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(provider);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
-      HermesViewProvider.viewId,
+      TalariaViewProvider.viewId,
       provider,
       { webviewOptions: { retainContextWhenHidden: true } },
     ),
@@ -269,7 +269,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // online/offline in lockstep with `talaria.ready`'s OWN gate (same
   // trusted-∧-real-backend condition the RAG indexer/dashboard/checkpoint
   // tracker above already use), never registered twice on a later trust
-  // grant. `HermesCodeActionProvider` itself only ever SEEDS the composer
+  // grant. `TalariaCodeActionProvider` itself only ever SEEDS the composer
   // (`editorActions.vscode.ts`) — never a `WorkspaceEdit`.
   let editorActionsRegistered = false;
   const registerEditorActionsIfEligible = (): void => {
@@ -277,8 +277,8 @@ export function activate(context: vscode.ExtensionContext): void {
     editorActionsRegistered = true;
     registerEditorActions(context, provider);
     context.subscriptions.push(
-      vscode.languages.registerCodeActionsProvider('*', new HermesCodeActionProvider(), {
-        providedCodeActionKinds: HermesCodeActionProvider.providedCodeActionKinds,
+      vscode.languages.registerCodeActionsProvider('*', new TalariaCodeActionProvider(), {
+        providedCodeActionKinds: TalariaCodeActionProvider.providedCodeActionKinds,
       }),
     );
   };
@@ -320,9 +320,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // capability to the view provider once the Guard has hydrated, so the
   // Settings panel's «Next Edit Suggestions» rows can drive it over the
   // host-internal correlated `nextEdit.toggle` request. The port is built
-  // inside `registerHermesAutocomplete` (the only holder of the Guard) and
+  // inside `registerTalariaAutocomplete` (the only holder of the Guard) and
   // routes through `requestNextEditToggle`, never `guard.requestToggle`.
-  registerHermesAutocomplete(
+  registerTalariaAutocomplete(
     context,
     (msg) => output.appendLine(msg),
     (port) => provider.setNextEditToggles(port),
@@ -551,7 +551,7 @@ async function activateCodebaseRag(
   // Register `codebase_search` with the ACP backend BEFORE the (potentially
   // slow) initial index build below, so it's already known by the time
   // `AcpBackend.start()` fires `session/new` — which can happen as soon as
-  // the webview mounts (`HermesViewProvider`'s `ready` handler), independent
+  // the webview mounts (`TalariaViewProvider`'s `ready` handler), independent
   // of how long indexing takes. Trust + `talaria.rag.enabled` gating already
   // happened above/in the caller (this function only ever runs when
   // `shouldActivateRag` said yes — see `startRagIfEligible`); no trust

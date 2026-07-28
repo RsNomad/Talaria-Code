@@ -4,7 +4,7 @@ import { AutocompleteDebouncer } from './debouncer';
 import { InMemoryCompletionCache } from './cache';
 import { readConfig, effectivePrefixInjection, type HermesAutocompleteConfig } from './config';
 import { FimEngine } from './engine';
-import { HermesInlineCompletionProvider, clearSurfacedAutocompleteFailures } from './provider';
+import { TalariaInlineCompletionProvider, clearSurfacedAutocompleteFailures } from './provider';
 import {
   AUTOCOMPLETE_API_KEY_SECRET,
   pickApiKey,
@@ -16,7 +16,7 @@ import { getTemplateForModel } from './templates';
 import { crossFileMode } from './context/mode';
 import { createHermesCrossFileContextService } from './context/contextService.vscode';
 import { NextEditGuard } from './nextedit/guard';
-import { fimActivityRelay, registerHermesNextEdit, requestNextEditToggle } from './nextedit/shell.vscode';
+import { fimActivityRelay, registerTalariaNextEdit, requestNextEditToggle } from './nextedit/shell.vscode';
 import type { NextEditShellDeps } from './nextedit/shell.vscode';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
 import type { BackendCapabilities, FimBackend, FimTemplate } from './types';
@@ -70,7 +70,7 @@ function endpointHost(rawUrl: string): string {
  * settings. A legacy `talaria.autocomplete.apiKey` setting is migrated into
  * SecretStorage on first activation. The key is never logged.
  */
-export function registerHermesAutocomplete(
+export function registerTalariaAutocomplete(
   context: vscode.ExtensionContext,
   // A5: DI seam for the `Hermes` output channel line a surfaced failure
   // also appends — mirrors `ControlDispatcherHostPort.showWarningMessage`'s
@@ -84,7 +84,7 @@ export function registerHermesAutocomplete(
   // once, from the hydration continuation below; never called when
   // hydration fails, so the view provider keeps refusing `nextEdit.toggle`
   // honestly instead of pretending a store exists. `extension.ts` wires it
-  // to `HermesViewProvider.setNextEditToggles`.
+  // to `TalariaViewProvider.setNextEditToggles`.
   onNextEditToggles?: (port: NextEditTogglePort) => void,
 ): vscode.Disposable {
   let cfg = readConfig();
@@ -101,7 +101,7 @@ export function registerHermesAutocomplete(
   let remote = !isLoopbackEndpoint(cfg.endpoint);
 
   // W5-T5: owns the single `CrossFileContextService` for this activation
-  // (§2.1 critic-C finding 7 — `registerHermesAutocomplete` is the
+  // (§2.1 critic-C finding 7 — `registerTalariaAutocomplete` is the
   // composition root). Constructed ONCE — its listeners live for the whole
   // activation; `rebuild()` below reconfigures its mode in place rather than
   // tearing down and re-subscribing (no new refresh path).
@@ -126,7 +126,7 @@ export function registerHermesAutocomplete(
       getWarmUpEnabled: () => cfg.crossFile.warmUp,
     });
 
-  const provider = new HermesInlineCompletionProvider(
+  const provider = new TalariaInlineCompletionProvider(
     () => engine,
     () => cfg.enabled,
     () => remote && !vscode.workspace.isTrusted,
@@ -141,7 +141,7 @@ export function registerHermesAutocomplete(
     () => cfg.model,
     reportFailure,
     // W5.1 Task 12 (R2/R4): the next-edit observation seam. `fimActivityRelay`
-    // is a fixed forwarding address — a no-op until `registerHermesNextEdit`
+    // is a fixed forwarding address — a no-op until `registerTalariaNextEdit`
     // below attaches to it, and a no-op again after it disposes. Passing it
     // unconditionally keeps the provider's construction independent of
     // whether next-edit registered successfully.
@@ -267,7 +267,7 @@ export function registerHermesAutocomplete(
   // bypassed.
   let nextEditDisposable: vscode.Disposable | undefined;
   let nextEditTornDown = false;
-  // Hoisted so the toggle port below and `registerHermesNextEdit` share ONE
+  // Hoisted so the toggle port below and `registerTalariaNextEdit` share ONE
   // deps object: `requestNextEditToggle`'s Generic refusal must be decided
   // against exactly the FIM backend the runtime path would use, never a
   // second, separately-built copy that could drift.
@@ -290,7 +290,7 @@ export function registerHermesAutocomplete(
       // Registration lost the race with disposal (deactivate during startup):
       // do not attach listeners to a torn-down activation.
       if (nextEditTornDown) return;
-      nextEditDisposable = registerHermesNextEdit(context, guard, nextEditDeps);
+      nextEditDisposable = registerTalariaNextEdit(context, guard, nextEditDeps);
       // W5.1 R5 (Task 13): publish the toggle capability to the webview's
       // view provider. `request` goes through `requestNextEditToggle` — NOT
       // `guard.requestToggle` — because only the wrapper can refuse a Generic
@@ -303,7 +303,7 @@ export function registerHermesAutocomplete(
         onDidChange: (listener) => guard.onDidChange(listener),
       });
     },
-    // Logging is the whole remedy, and that is now safe: `registerHermesNextEdit`
+    // Logging is the whole remedy, and that is now safe: `registerTalariaNextEdit`
     // never runs, so `fimActivityRelay` stays the no-op it was constructed as —
     // and a no-op relay advertises NO accept command (`acceptCommandId()` returns
     // `undefined`), so FIM items ship without one instead of naming a command

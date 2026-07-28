@@ -146,7 +146,7 @@ function modelTagSentences(markdown: string): string[] {
 /** Reach proof: a scan over an empty/renamed file passes forever. */
 describe('reach proof — every file these locks read really was read', () => {
   it('each source under lock is non-empty and is the file it claims to be', () => {
-    expect(SHELL_SRC).toContain('registerHermesNextEdit');
+    expect(SHELL_SRC).toContain('registerTalariaNextEdit');
     expect(CONFIG_SRC).toContain('export function readConfig');
     expect(TOPOLOGY_DOC).toContain('three roles, two settings');
     expect(NEXT_EDIT_DOC).toContain('# Next Edit Suggestions');

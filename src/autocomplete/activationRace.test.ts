@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
  * unproven at once.
  *
  * WHAT THE LINE HOLDS. `NextEditGuard.hydrate` is async, so
- * `registerHermesNextEdit` always lands on a later tick. Close the window (or
+ * `registerTalariaNextEdit` always lands on a later tick. Close the window (or
  * reload the extension) during startup and the composite disposable runs
  * FIRST — the activation is already dead when hydration resolves. Without the
  * guard the continuation then goes on to:
@@ -32,7 +32,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
  * `registerCommand` then throws *command already exists*.
  *
  * WHY THE SHELL IS MOCKED HERE. The observable this test needs is whether the
- * continuation RAN AT ALL — `registerHermesNextEdit` is the single gate every
+ * continuation RAN AT ALL — `registerTalariaNextEdit` is the single gate every
  * one of (1)(2)(3) sits behind, so counting its calls is necessary and
  * sufficient. The real shell is exercised for its own behaviour by
  * `nextedit/shell.vscode.test.ts`; re-constructing it here would only add a
@@ -61,7 +61,7 @@ const host = {
 /** Every call the hydration continuation makes, in order. */
 const shell = {
   registerCalls: 0,
-  /** Disposals of the disposable `registerHermesNextEdit` handed back. */
+  /** Disposals of the disposable `registerTalariaNextEdit` handed back. */
   disposeCalls: 0,
 };
 
@@ -137,7 +137,7 @@ vi.mock('./context/contextService.vscode', () => ({
 }));
 
 /**
- * `registerHermesNextEdit` counts its calls and — exactly like the real one
+ * `registerTalariaNextEdit` counts its calls and — exactly like the real one
  * (`shell.vscode.ts:1391`) — pushes onto `context.subscriptions`. That push is
  * modelled rather than stubbed away because "what landed on an already-drained
  * subscriptions array" is one of the three consequences under test.
@@ -149,7 +149,7 @@ vi.mock('./nextedit/shell.vscode', () => ({
     accepted: () => {},
     acceptCommandId: () => undefined,
   },
-  registerHermesNextEdit: (context: { subscriptions: { dispose(): void }[] }) => {
+  registerTalariaNextEdit: (context: { subscriptions: { dispose(): void }[] }) => {
     shell.registerCalls += 1;
     const disposable = {
       dispose: () => {
@@ -162,7 +162,7 @@ vi.mock('./nextedit/shell.vscode', () => ({
   requestNextEditToggle: () => Promise.resolve({ next: false, generic: false }),
 }));
 
-import { registerHermesAutocomplete } from './index';
+import { registerTalariaAutocomplete } from './index';
 
 interface FakeContext {
   ctx: import('vscode').ExtensionContext;
@@ -213,7 +213,7 @@ describe('FINDING 1: next-edit registration must not attach to a torn-down activ
   it('deactivating before hydration resolves cancels the registration entirely', async () => {
     const { ctx, subscriptions } = makeFakeContext();
 
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     // Nothing may have registered yet — hydration is async by construction. If
     // this ever fails, the race below is no longer the race being tested.
     expect(
@@ -248,7 +248,7 @@ describe('FINDING 1: next-edit registration must not attach to a torn-down activ
     const { ctx } = makeFakeContext();
     let portsPublished = 0;
 
-    const disposable = registerHermesAutocomplete(
+    const disposable = registerTalariaAutocomplete(
       ctx,
       (msg: string) => host.failures.push(msg),
       () => {
@@ -273,7 +273,7 @@ describe('FINDING 1: next-edit registration must not attach to a torn-down activ
     const { ctx, subscriptions } = makeFakeContext();
     let portsPublished = 0;
 
-    const disposable = registerHermesAutocomplete(
+    const disposable = registerTalariaAutocomplete(
       ctx,
       (msg: string) => host.failures.push(msg),
       () => {
@@ -310,7 +310,7 @@ describe('FINDING 1: next-edit registration must not attach to a torn-down activ
   it('the torn-down activation never registers-then-disposes — it never registers at all', async () => {
     const { ctx } = makeFakeContext();
 
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     disposable.dispose();
 
     await flushAsync();

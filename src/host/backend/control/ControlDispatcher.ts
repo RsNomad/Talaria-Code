@@ -561,7 +561,7 @@ export class ControlDispatcher {
 
   /**
    * W6-FF (3-way ARCH I-1): every LIVE session's tab-identity triple
-   * (+rootId), for `HermesViewProvider.seedState`'s `hydrate` payload. Moved
+   * (+rootId), for `TalariaViewProvider.seedState`'s `hydrate` payload. Moved
    * verbatim off `AcpBackend.listTabs` — see the original method's doc
    * (unchanged); reads `this.port.sessions.values()` instead of `this.
    * sessions.values()`.

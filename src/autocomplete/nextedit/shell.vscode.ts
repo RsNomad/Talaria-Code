@@ -284,7 +284,7 @@ export function makeExecutor(
 
 /**
  * The command VS Code executes when the user ACCEPTS FIM ghost text — the R4
- * seam. Registered exactly once, by `registerHermesNextEdit` below, and
+ * seam. Registered exactly once, by `registerTalariaNextEdit` below, and
  * advertised to `provider.ts` through `acceptCommandId()` ONLY by the
  * registration that registered it. `provider.ts` never names this string: an
  * item can therefore not carry a command id that nothing has registered.
@@ -301,12 +301,12 @@ const NO_OP_FIM_ACTIVITY: FimActivityListener = {
 let currentFimActivity: FimActivityListener = NO_OP_FIM_ACTIVITY;
 
 /**
- * The stable object `index.ts` hands to `HermesInlineCompletionProvider`.
+ * The stable object `index.ts` hands to `TalariaInlineCompletionProvider`.
  *
  * Composition-order problem it solves: the provider is constructed by
- * `registerHermesAutocomplete`, the listener's real implementation by
- * `registerHermesNextEdit`, and neither can hold the other's result at
- * construction time — while `registerHermesNextEdit`'s signature is pinned to
+ * `registerTalariaAutocomplete`, the listener's real implementation by
+ * `registerTalariaNextEdit`, and neither can hold the other's result at
+ * construction time — while `registerTalariaNextEdit`'s signature is pinned to
  * return a bare `Disposable`. This relay is a fixed forwarding address: it is
  * a no-op until the shell attaches (so a build with next-edit unregistered
  * behaves exactly as before), and reverts to a no-op on dispose.
@@ -759,10 +759,10 @@ function toContentChangeLites(
 
 /**
  * Wires next-edit into VS Code. Called from `index.ts` beside
- * `registerHermesAutocomplete`, with a Guard already hydrated from
+ * `registerTalariaAutocomplete`, with a Guard already hydrated from
  * `context.globalState`.
  */
-export function registerHermesNextEdit(
+export function registerTalariaNextEdit(
   context: vscode.ExtensionContext,
   guard: NextEditGuard,
   deps: NextEditShellDeps,
@@ -805,7 +805,7 @@ export function registerHermesNextEdit(
    * "surface once (actionable)".
    *
    * REGISTRATION-scoped, not module-scoped, which is the one deliberate
-   * difference from the FIM side: `registerHermesNextEdit` IS next-edit's
+   * difference from the FIM side: `registerTalariaNextEdit` IS next-edit's
    * re-arm point (a fresh registration re-arms every warning), so no
    * `clearSurfaced…` export is needed and no state leaks between activations.
    * A config-change re-arm was considered and rejected: it would need an

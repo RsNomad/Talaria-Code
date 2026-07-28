@@ -324,7 +324,7 @@ export function SettingsPanel({
 
           F-7: and it renders OUTSIDE the gate below — unconditionally, in
           every RemoteData state. These toggles are extension `globalState`
-          served HOST-INTERNALLY (`HermesViewProvider.ts:591`) and pushed over
+          served HOST-INTERNALLY (`TalariaViewProvider.ts:591`) and pushed over
           `nextEdit.state`; no agent is involved at any point. Gating them on
           the agent-backed `panel.data` fetch (the pre-fix structure) meant
           that when the Hermes CLI failed to start, Settings showed Error +

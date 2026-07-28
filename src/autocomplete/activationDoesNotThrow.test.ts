@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 /**
- * Review C-1 (CRITICAL). `registerHermesAutocomplete`'s `buildEngine` call
+ * Review C-1 (CRITICAL). `registerTalariaAutocomplete`'s `buildEngine` call
  * at activation (`index.ts:95`) runs SYNCHRONOUSLY, before SecretStorage's
  * async `context.secrets.get` has resolved (`index.ts:90-94` documents this
  * deliberately) — so the FIRST `createBackend` call any activation ever
@@ -10,7 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  * whether autocomplete is even enabled (`buildEngine` runs before any
  * `cfg.enabled` check). A `createBackend` that THROWS for a keyless
  * `codestral` config therefore throws out of `activate()` itself
- * (`extension.ts:325` calls `registerHermesAutocomplete` unguarded, and
+ * (`extension.ts:325` calls `registerTalariaAutocomplete` unguarded, and
  * `activate()` has no try/catch anywhere around it) — killing every zone
  * registered after it (RAG, the LSP/MCP lib server, the dashboard, ...) —
  * for the legitimate, DOCUMENTED "key lives in SecretStorage" configuration.
@@ -103,12 +103,12 @@ vi.mock('./nextedit/shell.vscode', () => ({
     accepted: () => {},
     acceptCommandId: () => undefined,
   },
-  registerHermesNextEdit: () => ({ dispose() {} }),
+  registerTalariaNextEdit: () => ({ dispose() {} }),
   requestNextEditToggle: () => Promise.resolve({ next: false, generic: false }),
 }));
 
 import * as vscode from 'vscode';
-import { registerHermesAutocomplete } from './index';
+import { registerTalariaAutocomplete } from './index';
 
 /**
  * `secrets.get` deliberately resolves on a LATER microtask (a real
@@ -140,7 +140,7 @@ function makeFakeContext(secretValue: string | undefined): vscode.ExtensionConte
   } as unknown as vscode.ExtensionContext;
 }
 
-describe('C-1: registerHermesAutocomplete must not throw during synchronous activation (real backendFactory, real CodestralFimBackend)', () => {
+describe('C-1: registerTalariaAutocomplete must not throw during synchronous activation (real backendFactory, real CodestralFimBackend)', () => {
   beforeEach(() => {
     resetHost();
   });
@@ -154,7 +154,7 @@ describe('C-1: registerHermesAutocomplete must not throw during synchronous acti
 
     let disposable: vscode.Disposable | undefined;
     expect(() => {
-      disposable = registerHermesAutocomplete(ctx, (msg) => host.failures.push(msg));
+      disposable = registerTalariaAutocomplete(ctx, (msg) => host.failures.push(msg));
     }).not.toThrow();
 
     disposable?.dispose();
@@ -167,7 +167,7 @@ describe('C-1: registerHermesAutocomplete must not throw during synchronous acti
 
     let disposable: vscode.Disposable | undefined;
     expect(() => {
-      disposable = registerHermesAutocomplete(ctx, (msg) => host.failures.push(msg));
+      disposable = registerTalariaAutocomplete(ctx, (msg) => host.failures.push(msg));
     }).not.toThrow();
 
     disposable?.dispose();
@@ -188,7 +188,7 @@ describe('C-1: registerHermesAutocomplete must not throw during synchronous acti
    */
   it("does not throw when talaria.autocomplete.backend is switched to codestral via a live config change, before any key exists anywhere (the 'self-healing instance' is now moot — rebuild() never throws for this case)", () => {
     const ctx = makeFakeContext(undefined);
-    const disposable = registerHermesAutocomplete(ctx, (msg) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg) => host.failures.push(msg));
 
     host.settings.set('talaria.autocomplete.backend', 'codestral');
     expect(() => {
@@ -205,7 +205,7 @@ describe('C-1: registerHermesAutocomplete must not throw during synchronous acti
 
     let disposable: vscode.Disposable | undefined;
     expect(() => {
-      disposable = registerHermesAutocomplete(ctx, (msg) => host.failures.push(msg));
+      disposable = registerTalariaAutocomplete(ctx, (msg) => host.failures.push(msg));
     }).not.toThrow();
 
     disposable?.dispose();

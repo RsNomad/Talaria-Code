@@ -87,12 +87,12 @@ vi.mock('./nextedit/shell.vscode', () => ({
     accepted: () => {},
     acceptCommandId: () => undefined,
   },
-  registerHermesNextEdit: () => ({ dispose() {} }),
+  registerTalariaNextEdit: () => ({ dispose() {} }),
   requestNextEditToggle: () => Promise.resolve({ next: false, generic: false }),
 }));
 
 import * as vscode from 'vscode';
-import { registerHermesAutocomplete } from './index';
+import { registerTalariaAutocomplete } from './index';
 import { AUTOCOMPLETE_API_KEY_SECRET } from './apiKey';
 
 /** Lets pending microtasks (async key load, `rebuild()`, the re-read) run. */
@@ -156,7 +156,7 @@ describe('C-7: a failed secret re-read is reported, never silent', () => {
   it('reports failure and keeps going when SecretStorage.get rejects on a post-activation re-read, instead of leaving the old key live in silence', async () => {
     const { ctx, fireSecretChange } = makeFakeContext();
 
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync(); // let activation's own (successful) key load settle first
     expect(
       host.failures,
@@ -175,7 +175,7 @@ describe('C-7: a failed secret re-read is reported, never silent', () => {
   it("never echoes the error text (only its kind) — a keyring error can carry the key's storage path", async () => {
     const { ctx, fireSecretChange } = makeFakeContext();
 
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
 
     fireSecretChange({ key: AUTOCOMPLETE_API_KEY_SECRET });
@@ -190,7 +190,7 @@ describe('C-7: a failed secret re-read is reported, never silent', () => {
   it('ignores a change on an unrelated secret key (no re-read, nothing reported)', async () => {
     const { ctx, fireSecretChange } = makeFakeContext();
 
-    const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
 
     fireSecretChange({ key: 'some.other.secret' });

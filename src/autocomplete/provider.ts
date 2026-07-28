@@ -21,7 +21,7 @@ import { isKnownFimModel } from './templates';
  * A5: the `Set API Key` action label shown on the 401/403 warning
  * (jobA-common.md invariant 3/5 — no key/response body ever appears here,
  * only this fixed string) and the one value {@link
- * HermesInlineCompletionProvider}'s `showWarningMessage` handler checks for
+ * TalariaInlineCompletionProvider}'s `showWarningMessage` handler checks for
  * before invoking `talaria.setAutocompleteApiKey`.
  */
 const SET_API_KEY_ACTION = 'Set API Key';
@@ -175,7 +175,7 @@ export function reponameFromWorkspace(
 
 /**
  * Thin VS Code adapter over the IDE-agnostic `FimEngine`. Registered for
- * `{ pattern: '**' }` by `registerHermesAutocomplete` (`index.ts`).
+ * `{ pattern: '**' }` by `registerTalariaAutocomplete` (`index.ts`).
  *
  * Grounded via Context7 (`/websites/code_visualstudio_api`):
  * - `provideInlineCompletionItems(document, position, context, token)` is called on
@@ -187,7 +187,7 @@ export function reponameFromWorkspace(
  *   gesture -> skip debounce (mapped to `{ manual: true }` on the engine).
  * - `new vscode.InlineCompletionItem(insertText, range?, command?)`.
  */
-export class HermesInlineCompletionProvider
+export class TalariaInlineCompletionProvider
   implements vscode.InlineCompletionItemProvider
 {
   constructor(
@@ -241,7 +241,7 @@ export class HermesInlineCompletionProvider
    * two-argument `.then(onFulfilled, onRejected)` form below routes a
    * REJECTED `showWarningMessage` Thenable itself to {@link reportFailure}
    * instead of leaving an unhandled rejection. Mirrors
-   * `HermesViewProvider.ts`'s `openDiffPreview`.
+   * `TalariaViewProvider.ts`'s `openDiffPreview`.
    *
    * F-A (final fix wave): that `onRejected` arm only ever sees
    * `showWarningMessage` rejecting — it is blind to a rejection thrown

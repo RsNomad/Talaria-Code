@@ -14,7 +14,7 @@ import type {
 /**
  * The single seam between the extension host and *whatever* is driving Hermes.
  *
- * The host (see {@link ../HermesViewProvider}) never talks to a process or a
+ * The host (see {@link ../TalariaViewProvider}) never talks to a process or a
  * mock directly — it talks to an `AgentBackend`. That is what makes the
  * mock→real swap a one-line change in `extension.ts`:
  *
@@ -25,7 +25,7 @@ import type {
  *
  * ## Contract
  * - **Inbound (webview → host → backend):** the imperative methods below. The
- *   `HermesViewProvider` decodes `WebviewToHostMessage` and calls these.
+ *   `TalariaViewProvider` decodes `WebviewToHostMessage` and calls these.
  * - **Outbound (backend → host → webview):** the {@link onMessage} event. A
  *   backend emits fully-formed {@link HostToWebviewMessage} values; the provider
  *   forwards them verbatim over `postMessage`. Backends are responsible for
@@ -40,9 +40,9 @@ export interface AgentBackend extends vscode.Disposable {
    * D2 (A2 — architect decision memo §"Decision 2"): which backend this
    * instance IS — `MockBackend.kind = 'mock'`, `AcpBackend.kind = 'acp'`.
    * REQUIRED (no honest default exists for an absent value — see
-   * `WebviewState.backendKind`'s doc for why). `HermesViewProvider` reads it
+   * `WebviewState.backendKind`'s doc for why). `TalariaViewProvider` reads it
    * at hydrate-seed time (`seedState().backendKind`) and again on every
-   * {@link ../HermesViewProvider.setBackend} swap (posts a `backend.state`
+   * {@link ../TalariaViewProvider.setBackend} swap (posts a `backend.state`
    * push) so the webview's "Mock" badge never lags the LIVE backend.
    */
   readonly kind: BackendKind;
@@ -150,14 +150,14 @@ export interface AgentBackend extends vscode.Disposable {
 
   // ── Optional structural capabilities (P7-N12 · I-8) ───────────────────────
   // These five members are OPTIONAL — only the real `AcpBackend` implements
-  // any of them; `MockBackend` implements none. `HermesViewProvider` reaches
+  // any of them; `MockBackend` implements none. `TalariaViewProvider` reaches
   // for each with a plain `backend.foo?.(...)`/`backend.foo !== undefined`
   // check and no-ops (or falls back to a boot default) when it's absent — the
   // same backend-agnostic posture the rest of this interface's REQUIRED
   // members already keep, now with a typed home instead of a hand-rolled
   // `typeof backend.foo === 'function'` shadow-probe + duck-typed local
   // interface per capability (five of those had accumulated in
-  // `HermesViewProvider.ts` — arch review `final-3way-2-arch.md` I-8: "promote
+  // `TalariaViewProvider.ts` — arch review `final-3way-2-arch.md` I-8: "promote
   // all five to optional `AgentBackend` members ... every future feature gets
   // a typed home instead of a new probe"). Behavior-identical: an absent
   // optional is exactly the old shadow-probe returning `false`.

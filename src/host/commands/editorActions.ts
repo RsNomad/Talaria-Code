@@ -119,8 +119,8 @@ export function flattenDiagnosticsForFix(
 }
 
 /**
- * Structural seam over `HermesViewProvider` (same reach-for-the-capability
- * posture `HermesViewProvider.ts` applies to `AgentBackend`'s optional
+ * Structural seam over `TalariaViewProvider` (same reach-for-the-capability
+ * posture `TalariaViewProvider.ts` applies to `AgentBackend`'s optional
  * members, P7-N12 · I-8) — the impure handlers in `editorActions.vscode.ts`
  * depend on this ONE method, not the concrete provider class.
  */

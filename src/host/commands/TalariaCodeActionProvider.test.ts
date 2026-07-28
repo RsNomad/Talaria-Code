@@ -1,14 +1,14 @@
 /**
  * W2 T3 (F-A code actions, §3.3) — `shouldOfferFix`, the PURE predicate
- * behind `HermesCodeActionProvider.provideCodeActions`: the QuickFix "Fix
+ * behind `TalariaCodeActionProvider.provideCodeActions`: the QuickFix "Fix
  * with Hermes" action is offered ONLY when the range has at least one
  * diagnostic (no always-on lightbulb, doc 03 §5.1).
  */
 import { describe, it, expect, vi } from 'vitest';
 import { must } from '../../testing/must';
 
-// Minimal `vscode` mock — only the surface HermesCodeActionProvider.ts
-// touches (same posture as HermesViewProvider.test.ts's mock).
+// Minimal `vscode` mock — only the surface TalariaCodeActionProvider.ts
+// touches (same posture as TalariaViewProvider.test.ts's mock).
 vi.mock('vscode', () => {
   class CodeAction {
     title: string;
@@ -26,7 +26,7 @@ vi.mock('vscode', () => {
   };
 });
 
-const { shouldOfferFix, HermesCodeActionProvider } = await import('./HermesCodeActionProvider');
+const { shouldOfferFix, TalariaCodeActionProvider } = await import('./TalariaCodeActionProvider');
 
 describe('shouldOfferFix — QuickFix gate (only when diagnostics are present)', () => {
   it('offers the fix when there is at least one diagnostic', () => {
@@ -42,8 +42,8 @@ describe('shouldOfferFix — QuickFix gate (only when diagnostics are present)',
   });
 });
 
-describe('HermesCodeActionProvider.provideCodeActions', () => {
-  const provider = new HermesCodeActionProvider();
+describe('TalariaCodeActionProvider.provideCodeActions', () => {
+  const provider = new TalariaCodeActionProvider();
 
   it('returns no actions when the range has zero diagnostics (no always-on lightbulb)', () => {
     const actions = provider.provideCodeActions({} as never, {} as never, { diagnostics: [] } as never);

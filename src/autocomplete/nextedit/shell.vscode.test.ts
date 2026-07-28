@@ -320,7 +320,7 @@ vi.mock('./scan', async () => {
 
 import {
   makeExecutor,
-  registerHermesNextEdit,
+  registerTalariaNextEdit,
   requestNextEditToggle,
   deriveGenericTransport,
   fimActivityRelay,
@@ -654,7 +654,7 @@ async function setupShell(toggles?: ToggleState): Promise<{
   disposable: vscodeTypes.Disposable;
 }> {
   const guard = await NextEditGuard.hydrate(makeMemento(toggles), { reportFailure: SHELL_DEPS.reportFailure });
-  const disposable = registerHermesNextEdit(makeContext(), guard, SHELL_DEPS);
+  const disposable = registerTalariaNextEdit(makeContext(), guard, SHELL_DEPS);
   return { guard, disposable };
 }
 

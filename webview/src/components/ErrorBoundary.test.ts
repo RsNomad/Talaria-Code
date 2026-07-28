@@ -13,7 +13,7 @@
  *
  * F11: the Reload button's handler (`private readonly reload`) is likewise
  * exercised directly (no render/click) — an instance's own arrow-bound class
- * field, invoked the same "seam" way `HermesViewProvider.test.ts`'s `seam()`
+ * field, invoked the same "seam" way `TalariaViewProvider.test.ts`'s `seam()`
  * cast reaches private host methods. `../bridge` is mocked because its real
  * module-level singleton touches `window` at import time (`bridge.test.ts`'s
  * documented reason), which this `node`-environment project does not have —

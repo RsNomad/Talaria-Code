@@ -36,7 +36,7 @@ import { must } from '../../testing/must';
  * `genericInstruct.test.ts`, `fsm.test.ts`, `guard.test.ts`, `mode.test.ts`)
  * — none of them drives a REAL render -> REAL mint -> REAL fetch -> REAL
  * parse -> REAL fsm -> REAL executor chain through the ONE public entry
- * point (`registerHermesNextEdit`) in a single test. That seam is this
+ * point (`registerTalariaNextEdit`) in a single test. That seam is this
  * file's whole job; it is the only place a wiring mistake between two
  * already-reviewed modules (e.g. a route built for the wrong endpoint, a
  * response shape the real parser rejects, a real HTTP-level abort that
@@ -200,7 +200,7 @@ vi.mock('vscode', () => {
 // real scan, the real fsm — imported AFTER the vscode mock so they resolve
 // against it. Nothing under `./` is mocked in this file except `vscode`
 // itself and (below) `global.fetch`.
-import { registerHermesNextEdit, requestNextEditToggle, fimActivityRelay, GENERIC_SETUP_NOTE } from './shell.vscode';
+import { registerTalariaNextEdit, requestNextEditToggle, fimActivityRelay, GENERIC_SETUP_NOTE } from './shell.vscode';
 
 // ─────────────────────────────── fetch stubbing ──────────────────────────────
 
@@ -393,7 +393,7 @@ const DEPS = {
 
 async function setupShell(toggles: ToggleState): Promise<{ guard: NextEditGuard; disposable: vscodeTypes.Disposable }> {
   const guard = await NextEditGuard.hydrate(makeMemento(toggles), { reportFailure: DEPS.reportFailure });
-  const disposable = registerHermesNextEdit(makeContext(), guard, DEPS);
+  const disposable = registerTalariaNextEdit(makeContext(), guard, DEPS);
   return { guard, disposable };
 }
 
@@ -627,7 +627,7 @@ describe('R5 refusal round-trip (owner: turn ONE on, the second is refused, one 
     // attempt must not have disturbed NEXT's own ability to function.
     const calls = stubFetchAlwaysRewrites();
     host.activeTextEditor = makeEditor(makeDoc());
-    registerHermesNextEdit(makeContext(), guard, DEPS);
+    registerTalariaNextEdit(makeContext(), guard, DEPS);
     await fireTrigger();
     expect(calls).toHaveLength(1);
     expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
@@ -657,7 +657,7 @@ describe('R5 cold-start sanitize (owner: a hand-edited both-on store is unrepres
 
     const calls = stubFetchNeverCalled();
     host.activeTextEditor = makeEditor(makeDoc());
-    registerHermesNextEdit(makeContext(), guard, DEPS);
+    registerTalariaNextEdit(makeContext(), guard, DEPS);
 
     await fireTrigger();
     expect(calls, 'a sanitized both-off store must build zero next-edit requests').toHaveLength(0);

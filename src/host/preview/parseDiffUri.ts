@@ -62,7 +62,7 @@ export function parseDiffUri(uri: DiffUriLike): ParsedDiffUri | null {
 /**
  * {@link parseDiffUri}'s inverse: the `{scheme, authority, path}` parts for
  * one `talaria-diff:` side, ready to hand to `vscode.Uri.from(...)`. Kept pure
- * (no `vscode` import) so `HermesViewProvider`'s `diff.open` routing stays a
+ * (no `vscode` import) so `TalariaViewProvider`'s `diff.open` routing stays a
  * one-line `vscode.Uri.from(buildDiffUriParts(...))` call — the URI-building
  * logic itself is headless-tested here, round-tripped against
  * {@link parseDiffUri} in the test file. Assumes `sessionId`/`toolId` never

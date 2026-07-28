@@ -726,7 +726,7 @@ export interface WebviewState {
    * backend with no multi-tab registry (mock). Non-empty means "this webview
    * instance is fresh, but N host `SessionController`s are still alive" —
    * VS Code's `retainContextWhenHidden` is documented BEST-EFFORT
-   * (`HermesViewProvider.ts`), so a memory-pressure dispose+recreate fires
+   * (`TalariaViewProvider.ts`), so a memory-pressure dispose+recreate fires
    * exactly this path. The reducer's `hydrate` fold reconciles its tab model
    * from this list instead of trusting its own freshly-booted (single/empty)
    * tab set, so every live session's stream re-binds to its real tab instead
@@ -991,7 +991,7 @@ export type HostToWebview =
   /**
    * D2 (A2): the LIVE backend changed — CONNECTION-GLOBAL (no sessionId),
    * exactly like `theme` above. Today's only origin is the trust-upgrade
-   * mock->acp swap (`HermesViewProvider.setBackend`, fired from
+   * mock->acp swap (`TalariaViewProvider.setBackend`, fired from
    * `onDidGrantWorkspaceTrust`); posted AFTER the relay is re-pointed at the
    * new backend so `postToWebview` forwards through the correct instance.
    * Paired with `WebviewState.backendKind` (the hydrate-time seed) — this

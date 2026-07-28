@@ -2,7 +2,7 @@
  * W5.1 R5 (Task 13) — the capability the webview's `nextEdit.toggle` request
  * is answered from.
  *
- * `HermesViewProvider` must be able to serve the toggle WITHOUT knowing that
+ * `TalariaViewProvider` must be able to serve the toggle WITHOUT knowing that
  * a `NextEditGuard` (or an autocomplete tree, or a `vscode.Memento`) exists —
  * the view provider is host plumbing, the Guard is the autocomplete zone's.
  * This narrow port is the seam between them, mirroring the `FindFilesFn`

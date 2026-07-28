@@ -93,7 +93,7 @@ export function decideSeedDelivery(isWebviewLive: boolean): 'post' | 'latch' {
  * case alive in the webview itself, and a window reload deliberately starts
  * an empty chat (the live child process died with the window anyway).
  */
-export class HermesViewProvider implements vscode.WebviewViewProvider {
+export class TalariaViewProvider implements vscode.WebviewViewProvider {
   /** View id contributed in package.json (Agent C) and used in `activate`. */
   public static readonly viewId = 'talaria.panel';
 
@@ -177,7 +177,7 @@ export class HermesViewProvider implements vscode.WebviewViewProvider {
   /**
    * W5.1 R5 (Task 13): wire the next-edit toggle capability. Called by
    * `extension.ts` from the Guard-hydration continuation in
-   * `registerHermesAutocomplete`.
+   * `registerTalariaAutocomplete`.
    *
    * Subscribes to the port's `onDidChange` and relays every ACCEPTED change
    * to the webview as a `nextEdit.state` push — the panel's ONLY source of
@@ -697,7 +697,7 @@ export class HermesViewProvider implements vscode.WebviewViewProvider {
     if (this.view) {
       this.view.show?.(true);
     } else {
-      void vscode.commands.executeCommand(`${HermesViewProvider.viewId}.focus`);
+      void vscode.commands.executeCommand(`${TalariaViewProvider.viewId}.focus`);
     }
   }
 

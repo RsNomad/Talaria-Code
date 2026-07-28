@@ -47,7 +47,7 @@ docs/**
 #                        hoisted to root node_modules, not nested under
 #                        apache-arrow/node_modules, so each needs its own
 #                        allow-list line.
-#   @vscode/codicons  -> HermesViewProvider loads
+#   @vscode/codicons  -> TalariaViewProvider loads
 #                        node_modules/@vscode/codicons/dist/{codicon.css,
 #                        codicon.ttf} for the webview's icon font
 #                        (localResourceRoots + the <link> in buildHtml).
