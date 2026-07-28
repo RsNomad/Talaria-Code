@@ -28,7 +28,7 @@ import type { HermesAutocompleteConfig } from './config';
  *
  * Deduped by a fixed per-warning key, re-armed by
  * {@link clearBackendFactoryWarnings} — `index.ts`'s `rebuild()` calls it on
- * every `hermes.autocomplete.*` config change, the SAME re-arm discipline
+ * every `talaria.autocomplete.*` config change, the SAME re-arm discipline
  * `provider.ts`'s `clearSurfacedAutocompleteFailures` already uses for its
  * own (request-time) warnings — so a user who fixes (or re-breaks) their
  * config gets a fresh signal on the very next build instead of either
@@ -39,7 +39,7 @@ const warnedOnce = new Set<string>();
 function warnOnce(key: string, message: string): void {
   if (warnedOnce.has(key)) return;
   warnedOnce.add(key);
-  console.warn(`[hermes.autocomplete] ${message}`);
+  console.warn(`[talaria.autocomplete] ${message}`);
 }
 
 /** Re-arms every construction-time warning `createBackend` can emit — see
@@ -65,7 +65,7 @@ function endpointPort(rawEndpoint: string): string | undefined {
   }
 }
 
-/** Builds the configured `FimBackend` from `hermes.autocomplete.*` settings. */
+/** Builds the configured `FimBackend` from `talaria.autocomplete.*` settings. */
 export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
   switch (cfg.backend) {
     case 'ollama':
@@ -76,7 +76,7 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
       if (cfg.apiKey && cfg.apiKey.trim().length > 0) {
         warnOnce(
           'ollama-key-dropped',
-          'hermes.autocomplete.apiKey is set, but backend=ollama has no authentication of its own — the key will never be sent. Clear the key, or switch to a backend that supports one.',
+          'talaria.autocomplete.apiKey is set, but backend=ollama has no authentication of its own — the key will never be sent. Clear the key, or switch to a backend that supports one.',
         );
       }
       return new OllamaFimBackend({ apiBase: cfg.endpoint, model: cfg.model });
@@ -90,7 +90,7 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
       if (cfg.model.includes(':')) {
         warnOnce(
           'vllm-ollama-style-model',
-          `hermes.autocomplete.model ("${cfg.model}") looks like an Ollama-style "name:tag" — vLLM serves models by their own repo id/served-name and will likely 404 on this exact string. Set "hermes.autocomplete.model" to the name your vLLM server actually serves.`,
+          `talaria.autocomplete.model ("${cfg.model}") looks like an Ollama-style "name:tag" — vLLM serves models by their own repo id/served-name and will likely 404 on this exact string. Set "talaria.autocomplete.model" to the name your vLLM server actually serves.`,
         );
       }
       return new VllmFimBackend({ apiBase: cfg.endpoint, model: cfg.model, apiKey: cfg.apiKey });
@@ -127,7 +127,7 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
       if (endpointPort(cfg.endpoint) === VLLM_DEFAULT_PORT) {
         warnOnce(
           'openai-compat-vllm-port',
-          `hermes.autocomplete.endpoint (${cfg.endpoint}) uses vLLM's default port with backend=openai-compat — vLLM 400-rejects the "suffix" field this backend sends. If this endpoint really is a vLLM server, switch "hermes.autocomplete.backend" to "vllm" instead.`,
+          `talaria.autocomplete.endpoint (${cfg.endpoint}) uses vLLM's default port with backend=openai-compat — vLLM 400-rejects the "suffix" field this backend sends. If this endpoint really is a vLLM server, switch "talaria.autocomplete.backend" to "vllm" instead.`,
         );
       }
       return new OpenAICompatFimBackend({

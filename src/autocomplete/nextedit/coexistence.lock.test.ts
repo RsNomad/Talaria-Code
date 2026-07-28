@@ -567,8 +567,8 @@ function resetR2(): void {
   autocompleteConfig.endpoint = 'http://127.0.0.1:11434';
   autocompleteConfig.model = 'qwen2.5-coder:7b';
   autocompleteConfig.backend = 'ollama';
-  host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-  host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+  host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+  host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
 }
 
 describe('R2 LOCK (trigger gate): with FIM busy the trigger path builds ZERO requests', () => {

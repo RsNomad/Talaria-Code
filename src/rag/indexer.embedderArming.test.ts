@@ -72,10 +72,10 @@ describe('createIndexer — width-refusal guard is armed on the real HttpEmbedde
     await fs.writeFile(abs, content, 'utf8');
   }
 
-  it('refuses a build when the server returns a vector whose width does not match the configured hermes.rag.dims', async () => {
+  it('refuses a build when the server returns a vector whose width does not match the configured talaria.rag.dims', async () => {
     await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
 
-    // Models the D-1 residual case: the user configured hermes.rag.dims=768
+    // Models the D-1 residual case: the user configured talaria.rag.dims=768
     // (declaring the width they expect), but the runner ignores `dimensions`
     // (llama.cpp) or otherwise returns a differently-shaped vector (here: 3).
     const fetchSpy = vi.fn(
@@ -96,7 +96,7 @@ describe('createIndexer — width-refusal guard is armed on the real HttpEmbedde
     expect(fetchSpy).toHaveBeenCalled();
   });
 
-  it('does not refuse when hermes.rag.dims is left at 0 (no declared width to enforce)', async () => {
+  it('does not refuse when talaria.rag.dims is left at 0 (no declared width to enforce)', async () => {
     await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
 
     const fetchSpy = vi.fn(
@@ -118,7 +118,7 @@ describe('createIndexer — width-refusal guard is armed on the real HttpEmbedde
   });
 });
 
-describe('Task 14b: the D-2 sidecar records the OBSERVED vector width and enforces it on the NEXT build, even at hermes.rag.dims=0 (the default)', () => {
+describe('Task 14b: the D-2 sidecar records the OBSERVED vector width and enforces it on the NEXT build, even at talaria.rag.dims=0 (the default)', () => {
   let workspaceRoot: string;
   let indexDir: string;
   const originalFetch = globalThis.fetch;
@@ -284,7 +284,7 @@ describe('Final-review Finding 1: computeEffectiveWidth must gate on the stored 
     // embedding at width 2 into that same table is the silent
     // truncate/null-pad corruption this fix closes. A NEW createIndexer
     // instance models a real-world model-name change (a fresh activation
-    // with a different `hermes.embedModel` setting), which is exactly when
+    // with a different `talaria.embedModel` setting), which is exactly when
     // the fingerprint mismatches.
     const indexer2 = createIndexer({
       workspaceRoot,

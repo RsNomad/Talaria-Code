@@ -89,7 +89,7 @@ code --install-extension talaria-code-*.vsix
    с моделями выше).
 2. Откройте панель **Talaria** на боковой панели активности.
 3. Укажите расширению путь к вашей установке Hermes и переключите
-   `hermes.backend` с `mock` на `acp` (см. «Настройка»).
+   `talaria.backend` с `mock` на `acp` (см. «Настройка»).
 
 При первом запуске используется сценарный **mock**-бэкенд, чтобы можно было
 изучить интерфейс без запущенного процесса Hermes — он работает на любой ОС.
@@ -97,22 +97,22 @@ code --install-extension talaria-code-*.vsix
 
 ## Настройка
 
-Настройки живут в неймспейсе **`hermes.*`** (Talaria Code — клиент Hermes). Те,
+Настройки живут в неймспейсе **`talaria.*`** (Talaria Code — клиент Hermes). Те,
 что нужны чаще всего:
 
 | Настройка | По умолчанию | Что делает |
 |---|---|---|
-| `hermes.backend` | `mock` | С каким бэкендом общаться. Поставьте `acp` для реального бэкенда Hermes. |
-| `hermes.hermesPath` | `""` | Абсолютный путь к исполняемому файлу `hermes`. |
-| `hermes.pythonPath` | `""` | Интерпретатор Python для запуска реального бэкенда Hermes. |
-| `hermes.cwd` | `""` | Рабочая директория агента (по умолчанию — первая папка воркспейса). |
-| `hermes.autocomplete.enabled` | `true` | Включить встроенное (FIM) автодополнение. |
-| `hermes.autocomplete.backend` | `ollama` | Бэкенд, обслуживающий автодополнение. |
-| `hermes.autocomplete.model` | `qwen2.5-coder:1.5b-base` | Модель для автодополнения. |
-| `hermes.autocomplete.endpoint` | `""` | Базовый URL бэкенда автодополнения (может быть вашим узлом). |
-| `hermes.rag.enabled` | `true` | Включить RAG-индекс кодовой базы и поиск. |
-| `hermes.rag.embedEndpoint` | `http://127.0.0.1:11434` | Базовый URL бэкенда эмбеддингов. |
-| `hermes.rag.embedModel` | `qwen3-embedding:0.6b` | Модель для эмбеддинга фрагментов кода. |
+| `talaria.backend` | `mock` | С каким бэкендом общаться. Поставьте `acp` для реального бэкенда Hermes. |
+| `talaria.hermesPath` | `""` | Абсолютный путь к исполняемому файлу `hermes`. |
+| `talaria.pythonPath` | `""` | Интерпретатор Python для запуска реального бэкенда Hermes. |
+| `talaria.cwd` | `""` | Рабочая директория агента (по умолчанию — первая папка воркспейса). |
+| `talaria.autocomplete.enabled` | `true` | Включить встроенное (FIM) автодополнение. |
+| `talaria.autocomplete.backend` | `ollama` | Бэкенд, обслуживающий автодополнение. |
+| `talaria.autocomplete.model` | `qwen2.5-coder:1.5b-base` | Модель для автодополнения. |
+| `talaria.autocomplete.endpoint` | `""` | Базовый URL бэкенда автодополнения (может быть вашим узлом). |
+| `talaria.rag.enabled` | `true` | Включить RAG-индекс кодовой базы и поиск. |
+| `talaria.rag.embedEndpoint` | `http://127.0.0.1:11434` | Базовый URL бэкенда эмбеддингов. |
+| `talaria.rag.embedModel` | `qwen3-embedding:0.6b` | Модель для эмбеддинга фрагментов кода. |
 
 Полный набор — в UI настроек (поиск по `hermes`).
 

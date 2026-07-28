@@ -5,13 +5,13 @@ import type { ModeFloor } from './policy/editPolicy';
 /**
  * W4-T4b — the vscode-boundary read for SF-2 custom modes
  * (`docs/research/wave-4/00-architecture-and-paths.md` §4.1/§4.3). This is
- * the ONLY module that reads/validates `hermes.customModes`; the pure engine
+ * the ONLY module that reads/validates `talaria.customModes`; the pure engine
  * (`policy/editPolicy.ts`) never imports `vscode` and only ever consumes the
  * {@link ModeFloor} snapshot {@link buildModeFloorSnapshot} produces here.
  * Mirrors `src/autocomplete/config.ts`'s read pattern.
  */
 
-const CUSTOM_MODES_SECTION = 'hermes.customModes';
+const CUSTOM_MODES_SECTION = 'talaria.customModes';
 
 /**
  * §4.3 mitigation 3 (defense-in-depth ONLY — the primary self-widening
@@ -37,7 +37,7 @@ const SELF_PROTECTION_DENY: readonly string[] = ['.vscode/settings.json', '*.cod
  *
  * Defensive on untrusted workspace data throughout: a malformed/non-array
  * `workspaceValue`, a non-object entry, or an entry missing `id`/`name` is
- * dropped rather than thrown — `hermes.customModes` is workspace-controlled
+ * dropped rather than thrown — `talaria.customModes` is workspace-controlled
  * settings data, not a value this extension itself produced.
  */
 export function readCustomModes(): CustomModeConfig[] {

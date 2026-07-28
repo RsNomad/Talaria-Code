@@ -299,7 +299,7 @@ export class AcpBackend implements AgentBackend {
   // private implementation detail of the method that moved with it.
 
   /**
-   * W4-T4b (SF-2 §4.3 mitigation 2): disposable for the `hermes.customModes`
+   * W4-T4b (SF-2 §4.3 mitigation 2): disposable for the `talaria.customModes`
    * change-detection subscription — owned here (not `context.subscriptions`,
    * mirroring how `clientExitSub`/`this.control` are owned) so a mock->real
    * trust-upgrade swap (which disposes the OLD backend) also unsubscribes
@@ -438,12 +438,12 @@ export class AcpBackend implements AgentBackend {
     };
     this.controlDispatcher = new ControlDispatcher(controlPort);
     // W4-T4b (§4.3 mitigation 2 — the self-widening close's second leg): a
-    // `hermes.customModes` disk change NEVER auto-re-snapshots a live
+    // `talaria.customModes` disk change NEVER auto-re-snapshots a live
     // session's enforced floor (mitigation 1, `setCustomMode`, is what
     // snapshots) — see `ControlDispatcher.handleCustomModesConfigChanged`'s
     // doc (W6-FI-c: moved off this class, called through the delegate below).
     this.customModesConfigSub = vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('hermes.customModes')) this.controlDispatcher.handleCustomModesConfigChanged();
+      if (e.affectsConfiguration('talaria.customModes')) this.controlDispatcher.handleCustomModesConfigChanged();
     });
     // W1.5: route Skills & Tools through the dashboard REST channel (real
     // enabled/description/provenance/usage + a real toggle) via Z3's Open-Closed

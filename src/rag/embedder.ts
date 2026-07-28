@@ -41,7 +41,7 @@ export function buildEmbeddingsRequestBody(
   // (`server/routes.go:981-982`); vLLM raises ValueError for a non-Matryoshka
   // model (`vllm/pooling_params.py:166-173`) — an HTTP 400 that kills the
   // whole index build. So we send it only when the user explicitly asked for
-  // it (`hermes.rag.dims` > 0), and never as a silent default.
+  // it (`talaria.rag.dims` > 0), and never as a silent default.
   if (dimensions !== undefined && dimensions > 0) {
     body.dimensions = dimensions;
   }
@@ -202,7 +202,7 @@ export class HttpEmbedder implements Embedder {
       const mismatched = vectors.find((v) => v.length !== expectedWidth);
       if (mismatched !== undefined) {
         throw new Error(
-          `embedding width mismatch: server returned ${mismatched.length}, index schema expects ${expectedWidth}. Set hermes.rag.dims to match your model, or delete the index directory and rebuild.`,
+          `embedding width mismatch: server returned ${mismatched.length}, index schema expects ${expectedWidth}. Set talaria.rag.dims to match your model, or delete the index directory and rebuild.`,
         );
       }
     }

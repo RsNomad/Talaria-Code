@@ -1,6 +1,6 @@
 // nextedit/backend.ts — Job B Task 11 · the next-edit HTTP transport.
 //
-// Two non-streaming transports (`hermes.nextEdit.backend: 'ollama' |
+// Two non-streaming transports (`talaria.nextEdit.backend: 'ollama' |
 // 'openai-compat'` — ADR-009, `09-jobB-final-plan.md` Global Constraints
 // "Two transports only"). `predict` runs a PINNED order, every step a
 // security or correctness invariant from the Global Constraints:

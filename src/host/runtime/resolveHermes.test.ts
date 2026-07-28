@@ -58,23 +58,23 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
     expect(calls).toHaveLength(1);
   });
 
-  it('a failed exec surfaces an actionable error naming hermes.hermesPath — and is NOT cached', async () => {
+  it('a failed exec surfaces an actionable error naming talaria.hermesPath — and is NOT cached', async () => {
     let attempts = 0;
     const failing: ExecLookup = async () => {
       attempts += 1;
       throw new Error('ETIMEDOUT');
     };
-    await expect(resolveHermesBin({}, failing)).rejects.toThrow(/hermes\.hermesPath/);
+    await expect(resolveHermesBin({}, failing)).rejects.toThrow(/talaria\.hermesPath/);
     await expect(resolveHermesBin({}, failing)).rejects.toThrow();
     expect(attempts).toBe(2); // failure retried, never cached
   });
 
   it('empty or non-absolute output is rejected with the actionable error', async () => {
     const { exec } = fakeExec('\n');
-    await expect(resolveHermesBin({}, exec)).rejects.toThrow(/hermes\.hermesPath/);
+    await expect(resolveHermesBin({}, exec)).rejects.toThrow(/talaria\.hermesPath/);
     resetHermesBinCache();
     const relative = fakeExec('hermes: aliased to hx\n');
-    await expect(resolveHermesBin({}, relative.exec)).rejects.toThrow(/hermes\.hermesPath/);
+    await expect(resolveHermesBin({}, relative.exec)).rejects.toThrow(/talaria\.hermesPath/);
   });
 
   it('resolveHermes derives the sibling venv python and both spawn specs from the discovered bin', async () => {
@@ -98,7 +98,7 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
   });
 });
 
-describe('package.json — R-A5: hermes.hermesPath is contributed machine-scoped and trust-restricted', () => {
+describe('package.json — R-A5: talaria.hermesPath is contributed machine-scoped and trust-restricted', () => {
   const manifest = JSON.parse(
     readFileSync(path.join(__dirname, '..', '..', '..', 'package.json'), 'utf-8'),
   ) as {
@@ -110,16 +110,16 @@ describe('package.json — R-A5: hermes.hermesPath is contributed machine-scoped
     capabilities: { untrustedWorkspaces: { restrictedConfigurations: string[] } };
   };
 
-  it('contributes hermes.hermesPath (string, machine scope, empty default)', () => {
-    const prop = must(manifest.contributes.configuration.properties['hermes.hermesPath']);
+  it('contributes talaria.hermesPath (string, machine scope, empty default)', () => {
+    const prop = must(manifest.contributes.configuration.properties['talaria.hermesPath']);
     expect(prop.type).toBe('string');
     expect(prop.scope).toBe('machine');
     expect(prop.default).toBe('');
   });
 
-  it('lists hermes.hermesPath in untrustedWorkspaces.restrictedConfigurations', () => {
+  it('lists talaria.hermesPath in untrustedWorkspaces.restrictedConfigurations', () => {
     expect(manifest.capabilities.untrustedWorkspaces.restrictedConfigurations).toContain(
-      'hermes.hermesPath',
+      'talaria.hermesPath',
     );
   });
 });

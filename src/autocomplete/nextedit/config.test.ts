@@ -19,13 +19,13 @@ describe('readNextEditConfig', () => {
   });
 
   it('an unknown backend id falls back to ollama (mirrors readConfig backend validation)', () => {
-    settings.set('hermes.nextEdit.backend', 'grpc');
+    settings.set('talaria.nextEdit.backend', 'grpc');
     expect(readNextEditConfig().backend).toBe('ollama');
   });
 
-  it('a stray hermes.nextEdit.enabled/generic in settings.json is IGNORED — shape pin; the load-bearing R5 lock is provider.test.ts (package.json scope/absence)', () => {
-    settings.set('hermes.nextEdit.enabled', true);
-    settings.set('hermes.nextEdit.generic', true);
+  it('a stray talaria.nextEdit.enabled/generic in settings.json is IGNORED — shape pin; the load-bearing R5 lock is provider.test.ts (package.json scope/absence)', () => {
+    settings.set('talaria.nextEdit.enabled', true);
+    settings.set('talaria.nextEdit.generic', true);
     // Honesty note (T1 review minor, assessment R-4): this assertion is
     // tautological BY CONSTRUCTION — readNextEditConfig builds exactly
     // {backend, endpoint, model}, so `enabled`/`generic` can never appear

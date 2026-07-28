@@ -19,16 +19,16 @@ exclusive — turning one on while the other is already on is refused (see
 
 | Source | Model | Endpoint | Notes |
 | --- | --- | --- | --- |
-| **NEXT** | `sweep-next-edit-v2-7B` | its own endpoint (`hermes.nextEdit.endpoint`) | A dedicated next-edit model with its own request format. **This model has no published benchmark score** — the only number that ever circulated for a "sweep next-edit" model belongs to a different, unreleased model, not this one. Treat its quality as unmeasured. |
-| **Generic** | whatever `hermes.autocomplete.model` is currently set to | your existing FIM endpoint (`hermes.autocomplete.endpoint`) | Reuses the same model and endpoint your FIM completions already use, with a different request shape (an instruction prompt) that asks the model to emulate a next-edit rewrite. See below for what model that actually is and what its quality figure does and doesn't cover. |
+| **NEXT** | `sweep-next-edit-v2-7B` | its own endpoint (`talaria.nextEdit.endpoint`) | A dedicated next-edit model with its own request format. **This model has no published benchmark score** — the only number that ever circulated for a "sweep next-edit" model belongs to a different, unreleased model, not this one. Treat its quality as unmeasured. |
+| **Generic** | whatever `talaria.autocomplete.model` is currently set to | your existing FIM endpoint (`talaria.autocomplete.endpoint`) | Reuses the same model and endpoint your FIM completions already use, with a different request shape (an instruction prompt) that asks the model to emulate a next-edit rewrite. See below for what model that actually is and what its quality figure does and doesn't cover. |
 
-FIM's model is whatever `hermes.autocomplete.model` is set to in
+FIM's model is whatever `talaria.autocomplete.model` is set to in
 `settings.json` — that setting is data (which model to use), not one of the
 on/off toggles covered in [Turning it on](#turning-it-on). **The shipped
 default is `qwen2.5-coder:1.5b-base`.** If you've never touched that setting,
 that's what's serving your FIM completions today — and, if you turn Generic
 on, your Generic next-edit suggestions too, since Generic rides the same
-model. If you want a bigger model, set `hermes.autocomplete.model` to
+model. If you want a bigger model, set `talaria.autocomplete.model` to
 `qwen2.5-coder:7b-base` — **not** `qwen2.5-coder:7b`. On Ollama the bare
 `:7b` tag is the *instruct* build (same digest as `:7b-instruct` and
 `:latest`), and instruction tuning costs infilling quality, which is exactly
@@ -39,7 +39,7 @@ infilling benchmarks is small (roughly 3 points), so the bigger model is a
 modest gain for four times the weight.
 
 Turning NEXT or Generic on or off never changes FIM itself: it keeps
-completing the current line from `hermes.autocomplete.endpoint` exactly as it
+completing the current line from `talaria.autocomplete.endpoint` exactly as it
 does today, on whatever model that endpoint is configured for.
 
 Generic's **vendor-reported quality figure — 55.62% (vendor-reported,
@@ -95,12 +95,12 @@ Two rules the panel enforces, both worth knowing before you rely on them:
    notice. You'll need to re-enable whichever source you actually want from
    the Settings panel.
 
-**NEXT needs `hermes.nextEdit.model` set by hand — nothing in the panel does
+**NEXT needs `talaria.nextEdit.model` set by hand — nothing in the panel does
 it for you.** The switch only turns the source on; it does not pick a model.
-If you flip NEXT on without having set `hermes.nextEdit.model`, the first
+If you flip NEXT on without having set `talaria.nextEdit.model`, the first
 time Next Edit would otherwise try to build a suggestion, Hermes shows a
-one-time warning telling you to set `hermes.nextEdit.model` (for example to
-`sweep-next-edit-v2-7B`), together with `hermes.nextEdit.endpoint` if your
+one-time warning telling you to set `talaria.nextEdit.model` (for example to
+`sweep-next-edit-v2-7B`), together with `talaria.nextEdit.endpoint` if your
 model isn't on the default port. Until you set it, NEXT stays on but never
 produces a suggestion.
 
@@ -108,20 +108,20 @@ produces a suggestion.
 
 | Setting | Purpose | Default |
 | --- | --- | --- |
-| `hermes.nextEdit.endpoint` | The NEXT source's server URL. Leave empty to use the backend's default (`http://127.0.0.1:11434` for Ollama, `http://127.0.0.1:8000` for an OpenAI-compatible server). | `''` |
-| `hermes.nextEdit.model` | The NEXT source's model — `sweep-next-edit-v2-7B` for the officially supported setup. | `''` |
-| `hermes.nextEdit.backend` | The NEXT source's transport: `ollama` or `openai-compat`. | `ollama` |
+| `talaria.nextEdit.endpoint` | The NEXT source's server URL. Leave empty to use the backend's default (`http://127.0.0.1:11434` for Ollama, `http://127.0.0.1:8000` for an OpenAI-compatible server). | `''` |
+| `talaria.nextEdit.model` | The NEXT source's model — `sweep-next-edit-v2-7B` for the officially supported setup. | `''` |
+| `talaria.nextEdit.backend` | The NEXT source's transport: `ollama` or `openai-compat`. | `ollama` |
 
 The Generic source has no settings of its own — by design, it rides whatever
-`hermes.autocomplete.*` is already configured for FIM (see Scenario 3 below).
+`talaria.autocomplete.*` is already configured for FIM (see Scenario 3 below).
 
 ## The three supported scenarios
 
 ### Scenario 1 — FIM + NEXT (two endpoints, two backends, no conflict)
 
 Turn NEXT on, leave Generic off. FIM keeps completing the current line from
-`hermes.autocomplete.endpoint`; NEXT proposes rewrites of the region around
-your cursor from its own `hermes.nextEdit.endpoint`, on its own model
+`talaria.autocomplete.endpoint`; NEXT proposes rewrites of the region around
+your cursor from its own `talaria.nextEdit.endpoint`, on its own model
 (`sweep-next-edit-v2-7B`). The two never compete for the same request: only
 one of them is ever building a request at a time (Next Edit steps aside
 whenever FIM's ghost text is on screen or in flight), so there's no scenario
@@ -142,14 +142,14 @@ endpoint is ever contacted.
 
 Turn Generic on, leave NEXT off. There is no second endpoint and no second
 model here: Generic sends its requests to your existing
-`hermes.autocomplete.endpoint`, using your existing `hermes.autocomplete.model`
+`talaria.autocomplete.endpoint`, using your existing `talaria.autocomplete.model`
 — it just asks that same model a differently-shaped question (an instruction
 prompt) to emulate a next-edit rewrite. The moment you accept the Generic
 toggle, Hermes shows a one-time setup note explaining the recipe below — it
 does not appear again after that.
 
 **Check which model that actually is before you judge the results.** Open
-`settings.json` and look at `hermes.autocomplete.model` (it can never be
+`settings.json` and look at `talaria.autocomplete.model` (it can never be
 empty — an unset value silently falls back to the shipped default, it never
 serves an empty string). If it's still `qwen2.5-coder:1.5b-base` (the shipped
 default), that's the model Generic will use too, and the 55.62% quality
@@ -232,7 +232,7 @@ model repeatedly evicted and reloaded just from switching between typing
 
 #### Remote endpoints: the two-box rule
 
-If `hermes.nextEdit.endpoint` or `hermes.autocomplete.endpoint` points at a
+If `talaria.nextEdit.endpoint` or `talaria.autocomplete.endpoint` points at a
 machine other than your own (a GPU box on your LAN, say) **and** you've
 configured an API key for it, Hermes refuses to send that key over plain
 `http://` to a non-local host — sending a credential in cleartext across a

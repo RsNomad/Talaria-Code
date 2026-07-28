@@ -432,8 +432,8 @@ function resetAll(): void {
   autocompleteConfig.endpoint = 'http://127.0.0.1:11434';
   autocompleteConfig.model = 'qwen2.5-coder:7b';
   autocompleteConfig.backend = 'ollama';
-  host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-  host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+  host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+  host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
 }
 
 afterEach(() => {
@@ -456,7 +456,7 @@ describe('Scenario 1 (owner: FIM ON + NEXT ON — two endpoints, two backends, n
 
     expect(calls, 'the request must reach the REAL fetch exactly once').toHaveLength(1);
     const call = must(calls[0]);
-    // "against cfg.endpoint" — hermes.nextEdit.endpoint, NEVER the FIM/
+    // "against cfg.endpoint" — talaria.nextEdit.endpoint, NEVER the FIM/
     // autocomplete endpoint (proving the two-endpoints half of the owner's
     // sentence, not merely that SOME endpoint was called).
     expect(call.url).toBe('http://127.0.0.1:11435/api/generate');
@@ -513,7 +513,7 @@ describe('Scenario 3 (owner: FIM ON + Generic ON — one endpoint/model, a secon
 
     // edit -> trigger -> genericInstruct render -> mint -> predict (real
     // fetch) -> parse -> proposalReady, against the AUTOCOMPLETE endpoint —
-    // NEVER hermes.nextEdit.endpoint (proving "rides the main FIM endpoint",
+    // NEVER talaria.nextEdit.endpoint (proving "rides the main FIM endpoint",
     // not merely "some endpoint").
     await fireTrigger();
 

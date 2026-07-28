@@ -19,7 +19,7 @@ interface CacheEntry {
  * the pruned prefix text. The engine is responsible for keeping the cache scoped to
  * one model (Continue does this implicitly since `selectedModelByRole.autocomplete`
  * rarely changes mid-session); `FimEngine` gets a fresh cache whenever the user
- * changes `hermes.autocomplete.model`/`backend` (see `index.ts`).
+ * changes `talaria.autocomplete.model`/`backend` (see `index.ts`).
  */
 export class InMemoryCompletionCache implements CompletionCache {
   private readonly cache = new Map<string, CacheEntry>();

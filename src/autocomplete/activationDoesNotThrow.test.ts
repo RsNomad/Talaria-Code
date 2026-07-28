@@ -123,7 +123,7 @@ function makeFakeContext(secretValue: string | undefined): vscode.ExtensionConte
     subscriptions: [] as { dispose(): void }[],
     secrets: {
       get: (key: string) =>
-        Promise.resolve(key === 'hermes.autocomplete.apiKey' ? secretValue : undefined),
+        Promise.resolve(key === 'talaria.autocomplete.apiKey' ? secretValue : undefined),
       store: () => Promise.resolve(),
       delete: () => Promise.resolve(),
       onDidChange: () => ({ dispose() {} }),
@@ -146,8 +146,8 @@ describe('C-1: registerHermesAutocomplete must not throw during synchronous acti
   });
 
   it('does not throw when backend=codestral and the key legitimately lives ONLY in SecretStorage (async — not yet resolved at the point buildEngine runs)', () => {
-    host.settings.set('hermes.autocomplete.backend', 'codestral');
-    // No `hermes.autocomplete.apiKey` setting at all: the documented,
+    host.settings.set('talaria.autocomplete.backend', 'codestral');
+    // No `talaria.autocomplete.apiKey` setting at all: the documented,
     // correct configuration — the user ran "Hermes: Set Autocomplete API
     // Key" and the key lives ONLY in SecretStorage.
     const ctx = makeFakeContext('sk-real-key-in-secretstorage');
@@ -161,8 +161,8 @@ describe('C-1: registerHermesAutocomplete must not throw during synchronous acti
   });
 
   it('does not throw when autocomplete is disabled and backend=codestral with no key anywhere (buildEngine runs before any cfg.enabled check)', () => {
-    host.settings.set('hermes.autocomplete.enabled', false);
-    host.settings.set('hermes.autocomplete.backend', 'codestral');
+    host.settings.set('talaria.autocomplete.enabled', false);
+    host.settings.set('talaria.autocomplete.backend', 'codestral');
     const ctx = makeFakeContext(undefined);
 
     let disposable: vscode.Disposable | undefined;
@@ -175,7 +175,7 @@ describe('C-1: registerHermesAutocomplete must not throw during synchronous acti
 
   /**
    * Review C-1's "second, self-healing instance": switching
-   * `hermes.autocomplete.backend` to `codestral` in user settings BEFORE a
+   * `talaria.autocomplete.backend` to `codestral` in user settings BEFORE a
    * key exists anywhere used to throw inside the `onDidChangeConfiguration`
    * listener (`index.ts:208-217`) — `cfg` was reassigned before the
    * throwing `rebuild()` call, leaving the provider's `cfg`-reading
@@ -186,14 +186,14 @@ describe('C-1: registerHermesAutocomplete must not throw during synchronous acti
    * here by firing a real config-change event and asserting it completes
    * without throwing.
    */
-  it("does not throw when hermes.autocomplete.backend is switched to codestral via a live config change, before any key exists anywhere (the 'self-healing instance' is now moot — rebuild() never throws for this case)", () => {
+  it("does not throw when talaria.autocomplete.backend is switched to codestral via a live config change, before any key exists anywhere (the 'self-healing instance' is now moot — rebuild() never throws for this case)", () => {
     const ctx = makeFakeContext(undefined);
     const disposable = registerHermesAutocomplete(ctx, (msg) => host.failures.push(msg));
 
-    host.settings.set('hermes.autocomplete.backend', 'codestral');
+    host.settings.set('talaria.autocomplete.backend', 'codestral');
     expect(() => {
       for (const listener of host.configListeners) {
-        listener({ affectsConfiguration: (section) => section === 'hermes.autocomplete' });
+        listener({ affectsConfiguration: (section) => section === 'talaria.autocomplete' });
       }
     }).not.toThrow();
 

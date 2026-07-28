@@ -147,7 +147,7 @@ export type EditPolicyPreset = 'manual' | 'normal' | 'strict' | 'plan';
  * actually driving the panel. `'mock'` = the process-free canned-scenario
  * player (`MockBackend`) — either the configured default, OR the silent
  * untrusted-workspace fallback `selectBackendKind` (`src/host/trustGate.ts`)
- * applies even when `hermes.backend` is set to `'acp'`. `'acp'` = the real
+ * applies even when `talaria.backend` is set to `'acp'`. `'acp'` = the real
  * agent (`AcpBackend`), spawned only in a trusted workspace.
  *
  * Canonical home is HERE (not `trustGate.ts`) so this dependency-free shared
@@ -1101,7 +1101,7 @@ export interface CustomModeInfo {
 
 /**
  * SF-2 (W4 §4.1) — the HOST-SIDE config shape for one entry of the
- * `hermes.customModes` VS Code setting. NOT a wire message: T4b reads this
+ * `talaria.customModes` VS Code setting. NOT a wire message: T4b reads this
  * from `vscode.workspace.getConfiguration().inspect(...).workspaceValue`
  * (`src/host/backend/customModes.ts`), builds a `ModeFloor` snapshot from it
  * (`editPolicy.ts`), and reduces it to {@link CustomModeInfo} for the wire

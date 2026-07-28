@@ -96,7 +96,7 @@ export function presentResult(result: GenerateResult, output: Logger): void {
 async function runGenerateCommitMessage(getBackend: () => AgentBackend, output: Logger): Promise<void> {
   const backend = getBackend();
   if (!oneShotCapable(backend)) {
-    void vscode.window.showWarningMessage('Talaria: commit-message generation needs the real Hermes backend (hermes.backend = "acp").');
+    void vscode.window.showWarningMessage('Talaria: commit-message generation needs the real Hermes backend (talaria.backend = "acp").');
     return;
   }
 

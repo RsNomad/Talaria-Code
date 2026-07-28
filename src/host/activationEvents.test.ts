@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 /**
  * V-20 (Tier-2 remediation, T-20, owner-ratified fork F-2): the extension's
- * default-on autocomplete feature (`hermes.autocomplete.*`) has no `onView`/
+ * default-on autocomplete feature (`talaria.autocomplete.*`) has no `onView`/
  * `onCommand` trigger of its own — before this fix, `activationEvents` was
  * empty (`[]`), so the extension only activated once the user opened the
  * Hermes sidebar or ran a Hermes command, leaving autocomplete silently

@@ -24,7 +24,7 @@ import { must } from '../../testing/must';
  * otherwise; reject (retryable, memo cleared) when the spawned server never
  * becomes healthy; and that `ensure` is memoized across concurrent callers.
  *
- * S3 (CWE-306/346): `hermes.dashboardAdopt` DEFAULTS to `'spawn-only'`, which
+ * S3 (CWE-306/346): `talaria.dashboardAdopt` DEFAULTS to `'spawn-only'`, which
  * NEVER calls `probeAdopt` — it always spawns its own child, then verifies the
  * healthy server's served session token has the provenance of OUR spawn
  * (`isForeignBackendToken`, mirrored from Hermes desktop's

@@ -11,7 +11,7 @@ export interface HermesNextEditConfig {
 }
 
 export function readNextEditConfig(): HermesNextEditConfig {
-  const cfg = vscode.workspace.getConfiguration('hermes.nextEdit');
+  const cfg = vscode.workspace.getConfiguration('talaria.nextEdit');
   const rawBackend = cfg.get<string>('backend', 'ollama').trim();
   return {
     backend: (TRANSPORT_IDS as readonly string[]).includes(rawBackend)

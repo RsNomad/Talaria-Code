@@ -716,8 +716,8 @@ describe('next-edit trigger — the gates, IN ORDER', () => {
     autocompleteConfig.model = 'qwen2.5-coder:7b';
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -765,7 +765,7 @@ describe('next-edit trigger — the gates, IN ORDER', () => {
   });
 
   it('GATE 3 (untrusted + remote endpoint): builds nothing', async () => {
-    host.settings.set('hermes.nextEdit.endpoint', 'http://gpu.example.com:11434');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://gpu.example.com:11434');
     host.activeTextEditor = makeEditor(makeDoc());
     host.isTrusted = false;
     await setupShell({ next: true, generic: false });
@@ -846,15 +846,15 @@ describe('next-edit mode routing', () => {
     autocompleteConfig.model = 'qwen2.5-coder:7b';
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it('NEXT routes to hermes.nextEdit.endpoint/model with the sweep-v2 format', async () => {
+  it('NEXT routes to talaria.nextEdit.endpoint/model with the sweep-v2 format', async () => {
     host.activeTextEditor = makeEditor(makeDoc());
     await setupShell({ next: true, generic: false });
 
@@ -903,7 +903,7 @@ describe('next-edit mode routing', () => {
   });
 
   it('NEXT with an empty configured model builds nothing (an empty model can only 404)', async () => {
-    host.settings.set('hermes.nextEdit.model', '');
+    host.settings.set('talaria.nextEdit.model', '');
     host.activeTextEditor = makeEditor(makeDoc());
     await setupShell({ next: true, generic: false });
 
@@ -1019,8 +1019,8 @@ describe('next-edit R2 single-flight and the FIM seam', () => {
     autocompleteConfig.model = 'qwen2.5-coder:7b';
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -1289,8 +1289,8 @@ describe('next-edit editor identity across the round trip (F-1)', () => {
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -1394,8 +1394,8 @@ describe('next-edit does not build while a proposal owns the screen (F-2)', () =
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -1476,8 +1476,8 @@ describe('next-edit filters the cross-document diff ring before the mint (F-3)',
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -1591,8 +1591,8 @@ describe('next-edit fails VISIBLY, once (F-4 / F-5 / C-5)', () => {
     autocompleteConfig.model = 'qwen2.5-coder:7b';
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -1609,7 +1609,7 @@ describe('next-edit fails VISIBLY, once (F-4 / F-5 / C-5)', () => {
 
     expect(host.warnings).toHaveLength(1);
     expect(host.warnings[0]).toContain('sweep-next-edit-v2-7B');
-    expect(host.warnings[0]).toContain('hermes.nextEdit.model');
+    expect(host.warnings[0]).toContain('talaria.nextEdit.model');
     expect(failures).toHaveLength(1);
 
     // One-shot: a failing config must not toast on every keystroke.
@@ -1677,8 +1677,8 @@ describe('next-edit fails VISIBLY, once (F-4 / F-5 / C-5)', () => {
     expect(failures).toEqual([]);
   });
 
-  it('F-5: NEXT on with an EMPTY hermes.nextEdit.model says so once, instead of being permanently, silently inert', async () => {
-    host.settings.set('hermes.nextEdit.model', '');
+  it('F-5: NEXT on with an EMPTY talaria.nextEdit.model says so once, instead of being permanently, silently inert', async () => {
+    host.settings.set('talaria.nextEdit.model', '');
     host.activeTextEditor = makeEditor(makeDoc());
     await setupShell({ next: true, generic: false });
 
@@ -1686,7 +1686,7 @@ describe('next-edit fails VISIBLY, once (F-4 / F-5 / C-5)', () => {
 
     expect(backendSpy.predicts).toHaveLength(0);
     expect(host.warnings).toEqual([NEXT_EDIT_MODEL_UNSET_NOTE]);
-    expect(NEXT_EDIT_MODEL_UNSET_NOTE).toContain('hermes.nextEdit.model');
+    expect(NEXT_EDIT_MODEL_UNSET_NOTE).toContain('talaria.nextEdit.model');
     expect(failures).toEqual([NEXT_EDIT_MODEL_UNSET_NOTE]);
 
     await fireTrigger();
@@ -1698,7 +1698,7 @@ describe('next-edit fails VISIBLY, once (F-4 / F-5 / C-5)', () => {
     await setupShell({ next: false, generic: true });
 
     // Ratified against ollama; the user then switches
-    // `hermes.autocomplete.backend`. The toggle stays ON, and before this the
+    // `talaria.autocomplete.backend`. The toggle stays ON, and before this the
     // run-time path just returned `null` — permanently, silently dead.
     autocompleteConfig.backend = 'codestral';
 
@@ -1741,8 +1741,8 @@ describe('V-1: next-edit is not structurally dead on an oversized file (bounded,
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -1830,8 +1830,8 @@ describe('V-1: next-edit is not structurally dead on an oversized file (bounded,
     expect(msg).toContain('oversized-line');
     expect(msg).toContain('No request was sent');
     expect(msg.toLowerCase()).not.toContain('server');
-    expect(msg).not.toContain('hermes.nextEdit.endpoint');
-    expect(msg).not.toContain('hermes.nextEdit.model');
+    expect(msg).not.toContain('talaria.nextEdit.endpoint');
+    expect(msg).not.toContain('talaria.nextEdit.model');
     expect(failures).toEqual([msg]);
   });
 
@@ -1907,8 +1907,8 @@ describe('next-edit recovers from stale FIM ghost-text visibility (C-6)', () => 
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -1973,8 +1973,8 @@ describe('next-edit locator says something true (U-7)', () => {
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -2020,8 +2020,8 @@ describe('next-edit locator says something true (U-7)', () => {
     })();
 
     resetHost();
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
     host.activeTextEditor = makeEditor(makeDoc({ text: TALL }), 20); // region = 10..30
     await setupShell({ next: true, generic: false });
     await fireTrigger();
@@ -2041,8 +2041,8 @@ describe('next-edit document listeners', () => {
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -2161,8 +2161,8 @@ describe('next-edit commands', () => {
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -2387,8 +2387,8 @@ async function applyCredentialScenario(scenario: CredentialScenario): Promise<vo
   if (scenario.autocompleteModel !== undefined) autocompleteConfig.model = scenario.autocompleteModel;
   if (scenario.autocompleteBackend !== undefined) autocompleteConfig.backend = scenario.autocompleteBackend;
   autocompleteConfig.apiKey = scenario.autocompleteApiKey;
-  if (scenario.nextEditEndpoint !== undefined) host.settings.set('hermes.nextEdit.endpoint', scenario.nextEditEndpoint);
-  if (scenario.nextEditModel !== undefined) host.settings.set('hermes.nextEdit.model', scenario.nextEditModel);
+  if (scenario.nextEditEndpoint !== undefined) host.settings.set('talaria.nextEdit.endpoint', scenario.nextEditEndpoint);
+  if (scenario.nextEditModel !== undefined) host.settings.set('talaria.nextEdit.model', scenario.nextEditModel);
   host.activeTextEditor = makeEditor(makeDoc());
   await setupShell(
     scenario.mode === 'generic' ? { next: false, generic: true } : { next: true, generic: false },
@@ -2506,8 +2506,8 @@ describe('W5.2 credentials: Generic rides FIM\'s endpoint, therefore FIM\'s key'
     autocompleteConfig.model = 'qwen2.5-coder:7b';
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -2625,8 +2625,8 @@ describe('W5.2 tripwire: a NEXT route to a non-loopback host is reported once', 
     autocompleteConfig.model = 'qwen2.5-coder:7b';
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -2818,8 +2818,8 @@ describe('C-3: original/ and current/ agree on the trailing newline (wire bytes)
     autocompleteConfig.model = 'qwen2.5-coder:7b';
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -2967,8 +2967,8 @@ describe('B-2/B-8: the round-trip freshness checks are individually observable',
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -3099,8 +3099,8 @@ describe('B-3/B-7: ordering and settle no-ops are individually observable', () =
     backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
     autocompleteConfig.backend = 'ollama';
     autocompleteConfig.apiKey = undefined;
-    host.settings.set('hermes.nextEdit.endpoint', 'http://127.0.0.1:11435');
-    host.settings.set('hermes.nextEdit.model', 'sweep-next-edit-v2-7B');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
   });
 
   afterEach(() => {
@@ -3108,7 +3108,7 @@ describe('B-3/B-7: ordering and settle no-ops are individually observable', () =
   });
 
   it('B-3: the trust read happens strictly BEFORE the backend is constructed', async () => {
-    host.settings.set('hermes.nextEdit.endpoint', 'http://gpu.example.com:11434');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://gpu.example.com:11434');
     host.activeTextEditor = makeEditor(makeDoc());
     host.isTrusted = true;
     await setupShell({ next: true, generic: false });
@@ -3126,7 +3126,7 @@ describe('B-3/B-7: ordering and settle no-ops are individually observable', () =
   });
 
   it('B-3: an untrusted workspace with a REMOTE endpoint never constructs the backend at all', async () => {
-    host.settings.set('hermes.nextEdit.endpoint', 'http://gpu.example.com:11434');
+    host.settings.set('talaria.nextEdit.endpoint', 'http://gpu.example.com:11434');
     host.activeTextEditor = makeEditor(makeDoc());
     host.isTrusted = false;
     await setupShell({ next: true, generic: false });

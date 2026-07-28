@@ -323,7 +323,7 @@ async function initApiKeyForTest(
   ctx: vscode.ExtensionContext,
   settingValue: string | undefined,
 ): Promise<string | undefined> {
-  host.settings.set('hermes.autocomplete.apiKey', settingValue ?? '');
+  host.settings.set('talaria.autocomplete.apiKey', settingValue ?? '');
   const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
   await flushAsync();
   disposable.dispose();
@@ -342,7 +342,7 @@ describe('initApiKey — the migrating session leaves the durable copy alone', (
     const key = await initApiKeyForTest(ctx, 'sk-legacy');
 
     expect(key).toBe('sk-legacy');
-    expect(stored.get('hermes.autocomplete.apiKey')).toBe('sk-legacy');
+    expect(stored.get('talaria.autocomplete.apiKey')).toBe('sk-legacy');
     expect(
       host.configUpdates,
       'DATA LOSS: clearing the plaintext setting in the migrating session destroys the only durable copy ' +
@@ -364,7 +364,7 @@ describe('initApiKey — the migrating session leaves the durable copy alone', (
   });
 
   it('session 2 — the secret read back without migrating — clears the setting', async () => {
-    const stored = new Map([['hermes.autocomplete.apiKey', 'sk-legacy']]);
+    const stored = new Map([['talaria.autocomplete.apiKey', 'sk-legacy']]);
     const ctx = makeFakeContext({ secrets: stored });
 
     await initApiKeyForTest(ctx, 'sk-legacy');
@@ -411,7 +411,7 @@ describe('initApiKey — the migrating session leaves the durable copy alone', (
    * actually executes.
    */
   it('surfaces and logs nothing at all on the clearing session (so no message can carry the key)', async () => {
-    const stored = new Map([['hermes.autocomplete.apiKey', 'sk-legacy']]);
+    const stored = new Map([['talaria.autocomplete.apiKey', 'sk-legacy']]);
     const ctx = makeFakeContext({ secrets: stored });
 
     await initApiKeyForTest(ctx, 'sk-legacy');
@@ -439,12 +439,12 @@ describe('initApiKey — the migrating session leaves the durable copy alone', (
   it('the migrated key lives in the activation, not the setting — it survives the setting being removed', async () => {
     const stored = new Map<string, string>();
     const ctx = makeFakeContext({ secrets: stored });
-    host.settings.set('hermes.autocomplete.apiKey', 'sk-legacy');
+    host.settings.set('talaria.autocomplete.apiKey', 'sk-legacy');
 
     const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
 
-    host.settings.set('hermes.autocomplete.apiKey', '');
+    host.settings.set('talaria.autocomplete.apiKey', '');
     expect(
       host.configListeners,
       'no captured listener would make every assertion below vacuous',
@@ -540,7 +540,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
     setting: string;
     input: string;
   }): Promise<void> {
-    host.settings.set('hermes.autocomplete.apiKey', options.setting);
+    host.settings.set('talaria.autocomplete.apiKey', options.setting);
     const ctx = makeFakeContext({ secrets: options.secrets });
     const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
@@ -562,9 +562,9 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
 
     await activateThenRunClearCommand({ secrets: stored, setting: 'sk-legacy', input: '' });
 
-    expect(stored.has('hermes.autocomplete.apiKey'), 'the secret must be gone').toBe(false);
+    expect(stored.has('talaria.autocomplete.apiKey'), 'the secret must be gone').toBe(false);
     expect(
-      host.settings.get('hermes.autocomplete.apiKey'),
+      host.settings.get('talaria.autocomplete.apiKey'),
       'REGRESSION: a surviving plaintext setting is a live key — pickApiKey falls back to it and the next ' +
         'activation re-migrates it into SecretStorage, so the user was told "cleared" and still has a key',
     ).toBeUndefined();
@@ -573,9 +573,9 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
   });
 
   it('cancelling (Escape, not a blank line) still touches nothing', async () => {
-    const stored = new Map([['hermes.autocomplete.apiKey', 'sk-secret']]);
+    const stored = new Map([['talaria.autocomplete.apiKey', 'sk-secret']]);
 
-    host.settings.set('hermes.autocomplete.apiKey', 'sk-legacy');
+    host.settings.set('talaria.autocomplete.apiKey', 'sk-legacy');
     const ctx = makeFakeContext({ secrets: stored });
     const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
@@ -584,17 +584,17 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
     await host.commands.get('talaria.setAutocompleteApiKey')!();
     disposable.dispose();
 
-    expect(stored.get('hermes.autocomplete.apiKey')).toBe('sk-secret');
+    expect(stored.get('talaria.autocomplete.apiKey')).toBe('sk-secret');
     expect(host.configUpdates, 'a cancelled prompt must not clear anything').toEqual([]);
   });
 
   it('F-3: clears a plaintext setting whose value DIFFERS from the secret (no other path can)', async () => {
-    const stored = new Map([['hermes.autocomplete.apiKey', 'sk-secret']]);
+    const stored = new Map([['talaria.autocomplete.apiKey', 'sk-secret']]);
 
     await activateThenRunClearCommand({ secrets: stored, setting: 'sk-different', input: '' });
 
     expect(
-      host.settings.get('hermes.autocomplete.apiKey'),
+      host.settings.get('talaria.autocomplete.apiKey'),
       'the automatic path refuses this forever (values disagree), so an H1-class plaintext credential ' +
         'would otherwise persist with no way for the user to be rid of it',
     ).toBeUndefined();
@@ -607,13 +607,13 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
 
     await activateThenRunClearCommand({ secrets: stored, setting: 'sk-legacy', input: '   ' });
 
-    expect(stored.has('hermes.autocomplete.apiKey'), 'the secret half did succeed').toBe(false);
+    expect(stored.has('talaria.autocomplete.apiKey'), 'the secret half did succeed').toBe(false);
     expect(
       host.infos,
       'telling the user "cleared" while a live plaintext key remains is exactly the lie F-2 removes',
     ).toEqual([]);
     expect(host.warnings).toHaveLength(1);
-    expect(host.warnings[0]).toContain('hermes.autocomplete.apiKey');
+    expect(host.warnings[0]).toContain('talaria.autocomplete.apiKey');
     expect(
       host.warnings[0],
       'the warning names the SETTING to remove, never its value',
@@ -636,7 +636,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
   });
 
   it('writes no setting update at all when there is no plaintext value to clear', async () => {
-    const stored = new Map([['hermes.autocomplete.apiKey', 'sk-secret']]);
+    const stored = new Map([['talaria.autocomplete.apiKey', 'sk-secret']]);
 
     await activateThenRunClearCommand({ secrets: stored, setting: '', input: '' });
 
@@ -699,7 +699,7 @@ describe('FINDING 2: the SAVE branch stores the key and NEVER puts it in a messa
     setting: string;
     input: string;
   }): Promise<void> {
-    host.settings.set('hermes.autocomplete.apiKey', options.setting);
+    host.settings.set('talaria.autocomplete.apiKey', options.setting);
     const ctx = makeFakeContext({ secrets: options.secrets });
     const disposable = registerHermesAutocomplete(ctx, (msg: string) => host.failures.push(msg));
     await flushAsync();
@@ -721,7 +721,7 @@ describe('FINDING 2: the SAVE branch stores the key and NEVER puts it in a messa
 
     await activateThenSaveKey({ secrets: stored, setting: '', input: 'sk-brand-new-value' });
 
-    expect(stored.get('hermes.autocomplete.apiKey'), 'the key must reach the OS keychain').toBe(
+    expect(stored.get('talaria.autocomplete.apiKey'), 'the key must reach the OS keychain').toBe(
       'sk-brand-new-value',
     );
     expect(
@@ -758,7 +758,7 @@ describe('FINDING 2: the SAVE branch stores the key and NEVER puts it in a messa
 
     await activateThenSaveKey({ secrets: stored, setting: '', input: '  sk-brand-new-value\t' });
 
-    expect(stored.get('hermes.autocomplete.apiKey')).toBe('sk-brand-new-value');
+    expect(stored.get('talaria.autocomplete.apiKey')).toBe('sk-brand-new-value');
   });
 
   /**
@@ -780,6 +780,6 @@ describe('FINDING 2: the SAVE branch stores the key and NEVER puts it in a messa
       host.configUpdates,
       'the new secret has not been proven to survive a restart, so the durable copy must stay',
     ).toEqual([]);
-    expect(host.settings.get('hermes.autocomplete.apiKey')).toBe('sk-legacy');
+    expect(host.settings.get('talaria.autocomplete.apiKey')).toBe('sk-legacy');
   });
 });

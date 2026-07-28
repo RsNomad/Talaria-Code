@@ -3,7 +3,7 @@
  *
  * The key must live in the OS keychain via `context.secrets`, NOT in plaintext
  * settings where Settings Sync, other extensions, or a committed
- * `settings.json` could leak it. The legacy `hermes.autocomplete.apiKey`
+ * `settings.json` could leak it. The legacy `talaria.autocomplete.apiKey`
  * setting is kept only (machine-scoped) as a migration source and is never
  * logged.
  *
@@ -11,7 +11,7 @@
  */
 
 /** SecretStorage key under which the autocomplete API key is persisted. */
-export const AUTOCOMPLETE_API_KEY_SECRET = 'hermes.autocomplete.apiKey';
+export const AUTOCOMPLETE_API_KEY_SECRET = 'talaria.autocomplete.apiKey';
 
 /**
  * The effective API key: prefer the keychain-backed SecretStorage value over
@@ -60,7 +60,7 @@ export function shouldMigrateApiKey(
  *
  * F-3 (fix wave): that last requirement means this AUTOMATIC path can never
  * clear a plaintext value that disagrees with the secret, so one would
- * otherwise linger forever. It is not stranded: the `Hermes: Set Autocomplete
+ * otherwise linger forever. It is not stranded: the `Talaria: Set Autocomplete
  * API Key` command's clear branch removes the setting unconditionally, which
  * is sound precisely because it is the user explicitly asking to hold no key
  * — none of the durability reasoning above applies to a deletion that was

@@ -24,15 +24,15 @@ import { execFile } from 'node:child_process';
  * non-empty stdout line (login shells echo profile/motd noise first), and
  * caches a successful result for the extension-host lifetime (failures are
  * never cached, so a user can install `hermes` and retry without reloading).
- * `hermes.hermesPath` remains the escape hatch when PATH discovery cannot
+ * `talaria.hermesPath` remains the escape hatch when PATH discovery cannot
  * work (Flatpak VS Code, Remote-SSH with a non-login PATH, custom installs).
  */
 
-/** User-overridable configuration (from `hermes.*` settings, spec §2.1). */
+/** User-overridable configuration (from `talaria.*` settings, spec §2.1). */
 export interface HermesRuntimeConfig {
   /** Explicit path to the `hermes` executable. Overrides PATH lookup. */
   hermesPath?: string;
-  /** Explicit interpreter path (`hermes.pythonPath`). Overrides derivation. */
+  /** Explicit interpreter path (`talaria.pythonPath`). Overrides derivation. */
   pythonPath?: string;
   /** Working directory for spawned children (usually the workspace root). */
   cwd?: string;
@@ -160,7 +160,7 @@ export function resetHermesBinCache(): void {
  * - Otherwise run `command -v hermes` *inside a login shell* so PATH matches
  *   what the user's terminal would see, with a 10s timeout. The result is
  *   cached on success; a failure throws an actionable error pointing at the
- *   `hermes.hermesPath` escape hatch and is retried on the next call.
+ *   `talaria.hermesPath` escape hatch and is retried on the next call.
  *
  * `command` is a POSIX shell builtin, not an external executable, so the
  * lookup runs WITHOUT the `exec` wrapper (`exec` only PATH-searches for a
@@ -184,7 +184,7 @@ export async function resolveHermesBin(
       `Could not locate 'hermes' on the login-shell PATH ` +
         `(ran: ${lookup.command} ${lookup.args.join(' ')}): ` +
         `${err instanceof Error ? err.message : String(err)}. ` +
-        `Set the 'hermes.hermesPath' setting to the absolute path of the hermes executable ` +
+        `Set the 'talaria.hermesPath' setting to the absolute path of the hermes executable ` +
         `(Flatpak VS Code and Remote-SSH sessions usually need this).`,
     );
   }
@@ -196,7 +196,7 @@ export async function resolveHermesBin(
   if (!bin.startsWith('/')) {
     throw new Error(
       `'command -v hermes' returned no usable path (output: ${JSON.stringify(stdout.trim())}). ` +
-        `Set the 'hermes.hermesPath' setting to the absolute path of the hermes executable.`,
+        `Set the 'talaria.hermesPath' setting to the absolute path of the hermes executable.`,
     );
   }
   cachedHermesBin = bin;

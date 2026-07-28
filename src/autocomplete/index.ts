@@ -63,11 +63,11 @@ function endpointHost(rawUrl: string): string {
 /**
  * Frozen public entry (docs/specs/wave-1.md, Zone AC) — the controller wires this
  * into `extension.ts`. Reads its own config from
- * `vscode.workspace.getConfiguration('hermes.autocomplete')`.
+ * `vscode.workspace.getConfiguration('talaria.autocomplete')`.
  *
  * Security (security-review.md H1): the API key is sourced from
  * `context.secrets` (SecretStorage, OS-keychain-backed), NOT from plaintext
- * settings. A legacy `hermes.autocomplete.apiKey` setting is migrated into
+ * settings. A legacy `talaria.autocomplete.apiKey` setting is migrated into
  * SecretStorage on first activation. The key is never logged.
  */
 export function registerHermesAutocomplete(
@@ -95,7 +95,7 @@ export function registerHermesAutocomplete(
   let built = buildEngine(cfg, secretApiKey);
   let engine = built.engine;
   // S4.3: recomputed alongside `engine` on every rebuild (config change), so a
-  // changed `hermes.autocomplete.endpoint` is reflected immediately. Workspace
+  // changed `talaria.autocomplete.endpoint` is reflected immediately. Workspace
   // trust itself needs no separate listener here — `vscode.workspace.isTrusted`
   // below is read live on every completion request, not captured.
   let remote = !isLoopbackEndpoint(cfg.endpoint);
@@ -121,7 +121,7 @@ export function registerHermesAutocomplete(
       getSkipUntrustedRemote: () => remote && !vscode.workspace.isTrusted,
       getEnabled: () => cfg.enabled,
       // A live closure over the mutable `cfg` binding below (reassigned by
-      // `onDidChangeConfiguration`) — reads `hermes.autocomplete.crossFile.
+      // `onDidChangeConfiguration`) — reads `talaria.autocomplete.crossFile.
       // warmUp` fresh on every call, needing no separate refresh path.
       getWarmUpEnabled: () => cfg.crossFile.warmUp,
     });
@@ -135,7 +135,7 @@ export function registerHermesAutocomplete(
     // `onDidChangeConfiguration`), same posture as `getEnabled` above.
     () => cfg.backend,
     () => endpointHost(cfg.endpoint),
-    // F-B: same live-closure posture — reads `hermes.autocomplete.model`
+    // F-B: same live-closure posture — reads `talaria.autocomplete.model`
     // fresh on every failure so the 404 arm's message always names the
     // currently-configured model, not a stale one from a prior rebuild.
     () => cfg.model,
@@ -214,7 +214,7 @@ export function registerHermesAutocomplete(
   );
 
   const configDisposable = vscode.workspace.onDidChangeConfiguration((e) => {
-    if (!e.affectsConfiguration('hermes.autocomplete')) return;
+    if (!e.affectsConfiguration('talaria.autocomplete')) return;
     // Model/backend/budget/temperature all feed into the engine's construction
     // (and the cache is keyed under an implicit "current model" assumption — see
     // cache.ts's design note), so we simply rebuild the whole engine rather than
@@ -358,7 +358,7 @@ async function initApiKey(
   if (shouldClearLegacyApiKeySetting(effective, settingValue, migratedThisSession)) {
     try {
       await vscode.workspace
-        .getConfiguration('hermes.autocomplete')
+        .getConfiguration('talaria.autocomplete')
         .update('apiKey', undefined, vscode.ConfigurationTarget.Global);
     } catch {
       // Non-fatal: the machine-scoped plaintext setting may linger, but the
@@ -374,14 +374,14 @@ async function initApiKey(
  * value is actually GONE afterwards rather than whether the call resolved.
  *
  * Returns `true` when nothing is left for `pickApiKey` to fall back to. The
- * post-update re-read is the point: `hermes.autocomplete.apiKey` is
+ * post-update re-read is the point: `talaria.autocomplete.apiKey` is
  * machine-scoped, and a resolving `update` is not proof the value is gone —
  * the same "a resolving call proves nothing" trap ADR-017 is built around.
  * A fresh `getConfiguration` snapshot is taken deliberately; the pre-update
  * one predates the write.
  */
 async function clearLegacyApiKeySetting(): Promise<boolean> {
-  const config = vscode.workspace.getConfiguration('hermes.autocomplete');
+  const config = vscode.workspace.getConfiguration('talaria.autocomplete');
   // Nothing to clear: skip the write rather than churn the user's
   // settings.json (and report honest success — no value remains).
   if (!config.get<string>('apiKey', '').trim()) return true;
@@ -390,7 +390,7 @@ async function clearLegacyApiKeySetting(): Promise<boolean> {
   } catch {
     return false;
   }
-  return !vscode.workspace.getConfiguration('hermes.autocomplete').get<string>('apiKey', '').trim();
+  return !vscode.workspace.getConfiguration('talaria.autocomplete').get<string>('apiKey', '').trim();
 }
 
 /** Command handler: prompt for the key (masked) and store it in SecretStorage. */
@@ -432,7 +432,7 @@ async function promptAndStoreApiKey(context: vscode.ExtensionContext): Promise<v
       // to remove — never its value.
       void vscode.window.showWarningMessage(
         'Talaria: the API key was removed from the OS keychain, but the deprecated ' +
-          '`hermes.autocomplete.apiKey` setting could not be cleared and is still in effect. ' +
+          '`talaria.autocomplete.apiKey` setting could not be cleared and is still in effect. ' +
           'Remove it manually in Settings.',
       );
     }
@@ -477,7 +477,7 @@ function buildEngine(
     options: {
       model: cfg.model,
       maxPromptTokens: cfg.maxPromptTokens,
-      // Not exposed as their own `hermes.autocomplete.*` keys (the frozen contract
+      // Not exposed as their own `talaria.autocomplete.*` keys (the frozen contract
       // only names enabled/backend/endpoint/model/debounceMs/maxPromptTokens/
       // temperature) — these mirror Continue's tuned defaults (how-to §2.2).
       prefixPercentage: 0.3,

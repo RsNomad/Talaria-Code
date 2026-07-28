@@ -84,7 +84,7 @@ code --install-extension talaria-code-*.vsix
 1. Install and run the **Hermes** agent and a **model runtime** (e.g. Ollama with
    the models above).
 2. Open the **Talaria** panel from the activity bar.
-3. Point the extension at your Hermes install, then switch `hermes.backend` from
+3. Point the extension at your Hermes install, then switch `talaria.backend` from
    `mock` to `acp` (see Configuration).
 
 On first run the extension uses a scripted **mock** backend so you can explore the
@@ -93,22 +93,22 @@ live against your real agent.
 
 ## Configuration
 
-Settings live under the **`hermes.*`** namespace (Talaria Code is a Hermes
+Settings live under the **`talaria.*`** namespace (Talaria Code is a Hermes
 client). The ones you'll usually touch:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `hermes.backend` | `mock` | Which agent backend to talk to. Set to `acp` for the real Hermes backend. |
-| `hermes.hermesPath` | `""` | Absolute path to the `hermes` executable. |
-| `hermes.pythonPath` | `""` | Python interpreter used to launch the real Hermes backend. |
-| `hermes.cwd` | `""` | Working directory for the agent (defaults to the first workspace folder). |
-| `hermes.autocomplete.enabled` | `true` | Enable inline (FIM) autocomplete. |
-| `hermes.autocomplete.backend` | `ollama` | FIM backend serving completions. |
-| `hermes.autocomplete.model` | `qwen2.5-coder:1.5b-base` | Model used for completions. |
-| `hermes.autocomplete.endpoint` | `""` | Base URL for the completion backend (may be a node you host). |
-| `hermes.rag.enabled` | `true` | Enable the codebase RAG index and search. |
-| `hermes.rag.embedEndpoint` | `http://127.0.0.1:11434` | Embeddings backend base URL. |
-| `hermes.rag.embedModel` | `qwen3-embedding:0.6b` | Model used to embed code chunks. |
+| `talaria.backend` | `mock` | Which agent backend to talk to. Set to `acp` for the real Hermes backend. |
+| `talaria.hermesPath` | `""` | Absolute path to the `hermes` executable. |
+| `talaria.pythonPath` | `""` | Python interpreter used to launch the real Hermes backend. |
+| `talaria.cwd` | `""` | Working directory for the agent (defaults to the first workspace folder). |
+| `talaria.autocomplete.enabled` | `true` | Enable inline (FIM) autocomplete. |
+| `talaria.autocomplete.backend` | `ollama` | FIM backend serving completions. |
+| `talaria.autocomplete.model` | `qwen2.5-coder:1.5b-base` | Model used for completions. |
+| `talaria.autocomplete.endpoint` | `""` | Base URL for the completion backend (may be a node you host). |
+| `talaria.rag.enabled` | `true` | Enable the codebase RAG index and search. |
+| `talaria.rag.embedEndpoint` | `http://127.0.0.1:11434` | Embeddings backend base URL. |
+| `talaria.rag.embedModel` | `qwen3-embedding:0.6b` | Model used to embed code chunks. |
 
 The full set is available in the Settings UI (search `hermes`).
 

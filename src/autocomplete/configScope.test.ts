@@ -10,18 +10,18 @@ import { join } from 'node:path';
  *
  * I-2 (Important): a closed list is blind to any FUTURE egress-steering key
  * nobody remembers to add to it. Proven by the reviewer: adding an unscoped
- * `hermes.autocomplete.endpointFallback` ("Secondary base URL used when the
+ * `talaria.autocomplete.endpointFallback` ("Secondary base URL used when the
  * primary endpoint fails.") to `package.json` left the old list-based test
  * green. This file now scans EVERY key in the manifest by NAME PATTERN
  * instead of by a fixed list — the same open-ended shape
- * `provider.test.ts:705-719` already uses for `hermes.nextEdit.*` (loop over
+ * `provider.test.ts:705-719` already uses for `talaria.nextEdit.*` (loop over
  * every key matching a namespace prefix, not a fixed list), generalised
  * here from "matches a namespace" to "matches a name pattern", since
  * egress-steering keys are not confined to one namespace
- * (`hermes.autocomplete.*`, `hermes.rag.*`, `hermes.nextEdit.*` all have
+ * (`talaria.autocomplete.*`, `talaria.rag.*`, `talaria.nextEdit.*` all have
  * some).
  *
- * I-1 (Important): the original comment/list called `hermes.autocomplete.
+ * I-1 (Important): the original comment/list called `talaria.autocomplete.
  * model` an "egress-steering key" in the SAME breath `provider.test.ts`'s
  * own `restrictedConfigurations` comment says "a model NAME picks no
  * destination". Both were true for what each was actually claiming
@@ -32,7 +32,7 @@ import { join } from 'node:path';
  * (`model`), with different, honestly-stated rationales — see each
  * pattern's own doc comment.
  *
- * I-3 (Important): `hermes.rag.embedModel` met the package.json's own
+ * I-3 (Important): `talaria.rag.embedModel` met the package.json's own
  * stated criterion for machine-scoping `model` ("a workspace cannot
  * silently repoint completions/embeddings at a different model") but was
  * unscoped. Fixed in `package.json`; `MODEL_INTEGRITY_PATTERN` below now
@@ -80,7 +80,7 @@ function configurationProperties(): Record<string, ConfigProperty> {
  * these words (case-insensitive) can plausibly select/redirect a network
  * destination or carry credentials onto the wire — `endpoint`/`url`/`host`
  * (destination), `apikey`/`token` (credential), `backend` (a transport
- * SELECTOR — this task's own root cause: `hermes.autocomplete.backend`
+ * SELECTOR — this task's own root cause: `talaria.autocomplete.backend`
  * SELECTS the endpoint via `config.ts`'s `DEFAULT_ENDPOINTS`).
  */
 const EGRESS_DESTINATION_PATTERN = /endpoint|apikey|url|token|host|backend/i;
@@ -92,15 +92,15 @@ const EGRESS_DESTINATION_PATTERN = /endpoint|apikey|url|token|host|backend/i;
  * Verified by reading both call sites (`config.ts`, `backendFactory.ts`):
  * neither is ever read as a URL or a header — both are plain numbers.
  *
- *   - `hermes.autocomplete.maxPromptTokens` — matches on the substring
+ *   - `talaria.autocomplete.maxPromptTokens` — matches on the substring
  *     "Token" (from "...Tokens"). A NUMERIC prompt-size budget, never an
  *     auth token.
- *   - `hermes.rag.maxChunkTokens` — same word, same reason: a numeric
+ *   - `talaria.rag.maxChunkTokens` — same word, same reason: a numeric
  *     chunk-size budget.
  */
 const EGRESS_DESTINATION_EXCEPTIONS = new Set<string>([
-  'hermes.autocomplete.maxPromptTokens',
-  'hermes.rag.maxChunkTokens',
+  'talaria.autocomplete.maxPromptTokens',
+  'talaria.rag.maxChunkTokens',
 ]);
 
 /**
@@ -139,13 +139,13 @@ describe('LOCK: every egress-DESTINATION-steering setting is machine-scoped (I-2
     const eligible = eligibleKeys(props);
     expect(eligible.length).toBeGreaterThan(0);
     for (const expected of [
-      'hermes.backend',
-      'hermes.autocomplete.backend',
-      'hermes.autocomplete.endpoint',
-      'hermes.autocomplete.apiKey',
-      'hermes.rag.embedEndpoint',
-      'hermes.nextEdit.backend',
-      'hermes.nextEdit.endpoint',
+      'talaria.backend',
+      'talaria.autocomplete.backend',
+      'talaria.autocomplete.endpoint',
+      'talaria.autocomplete.apiKey',
+      'talaria.rag.embedEndpoint',
+      'talaria.nextEdit.backend',
+      'talaria.nextEdit.endpoint',
     ]) {
       expect(
         eligible,
@@ -172,7 +172,7 @@ describe('LOCK: every egress-DESTINATION-steering setting is machine-scoped (I-2
    * `ringBuffer.test.ts`'s SPREAD_RE/CAST_RE probes — rather than a
    * permanent edit to `package.json`). This is the reviewer's EXACT
    * defeating mutation from the review report: an unscoped
-   * `hermes.autocomplete.endpointFallback` ("Secondary base URL used when
+   * `talaria.autocomplete.endpointFallback` ("Secondary base URL used when
    * the primary endpoint fails."), which defeated the OLD fixed-list test
    * outright (it was simply never in the list, so the list-based assertion
    * never even looked at it). The open-ended pattern catches it by NAME
@@ -181,20 +181,20 @@ describe('LOCK: every egress-DESTINATION-steering setting is machine-scoped (I-2
   it('RED-first proof: an unscoped key added anywhere in the manifest whose name matches the pattern is caught (in-memory injection — no permanent package.json edit)', () => {
     const props: Record<string, ConfigProperty> = {
       ...configurationProperties(),
-      'hermes.autocomplete.endpointFallback': {},
+      'talaria.autocomplete.endpointFallback': {},
     };
     const notMachine = eligibleKeys(props).filter((key) => props[key]?.scope !== 'machine');
-    expect(notMachine).toContain('hermes.autocomplete.endpointFallback');
+    expect(notMachine).toContain('talaria.autocomplete.endpointFallback');
   });
 
   it('sanity: the guard is not vacuously true — a key with scope machine explicitly REMOVED would be caught too', () => {
     const real = configurationProperties();
     const mutated: Record<string, ConfigProperty> = {
       ...real,
-      'hermes.autocomplete.endpoint': { scope: undefined },
+      'talaria.autocomplete.endpoint': { scope: undefined },
     };
     const notMachine = eligibleKeys(mutated).filter((key) => mutated[key]?.scope !== 'machine');
-    expect(notMachine).toContain('hermes.autocomplete.endpoint');
+    expect(notMachine).toContain('talaria.autocomplete.endpoint');
   });
 });
 
@@ -207,11 +207,11 @@ describe('LOCK: every model-integrity setting is machine-scoped (I-1/I-3: a sepa
     expect(notMachine).toEqual([]);
   });
 
-  it("non-vacuous: matches all three known model keys, including I-3's hermes.rag.embedModel", () => {
+  it("non-vacuous: matches all three known model keys, including I-3's talaria.rag.embedModel", () => {
     const props = configurationProperties();
     const eligible = eligibleKeys(props);
     expect(eligible.length).toBeGreaterThan(0);
-    for (const expected of ['hermes.autocomplete.model', 'hermes.nextEdit.model', 'hermes.rag.embedModel']) {
+    for (const expected of ['talaria.autocomplete.model', 'talaria.nextEdit.model', 'talaria.rag.embedModel']) {
       expect(eligible, `${expected} must be in scope for this lock`).toContain(expected);
     }
   });
@@ -219,10 +219,10 @@ describe('LOCK: every model-integrity setting is machine-scoped (I-1/I-3: a sepa
   it('RED-first proof: an unscoped model key is caught (in-memory injection)', () => {
     const props: Record<string, ConfigProperty> = {
       ...configurationProperties(),
-      'hermes.rag.embedModel': { scope: undefined },
+      'talaria.rag.embedModel': { scope: undefined },
     };
     const notMachine = eligibleKeys(props).filter((key) => props[key]?.scope !== 'machine');
-    expect(notMachine).toContain('hermes.rag.embedModel');
+    expect(notMachine).toContain('talaria.rag.embedModel');
   });
 
   it('sanity: the two patterns are genuinely disjoint — no key matches both (a key double-counted in both lists would mask a gap in either)', () => {

@@ -2,8 +2,8 @@
  * Shape-only validation that a configured endpoint is an `http(s)` URL.
  *
  * ## Why (security-review.md M3 / C1)
- * Configured endpoints (`hermes.autocomplete.endpoint`,
- * `hermes.rag.embedEndpoint`) are `POST`ed code context / embeddings. This
+ * Configured endpoints (`talaria.autocomplete.endpoint`,
+ * `talaria.rag.embedEndpoint`) are `POST`ed code context / embeddings. This
  * guard rejects non-http(s) schemes (`file:`, `data:`, …) and outright garbage
  * so a mistyped or hostile value can't smuggle in another scheme.
  *

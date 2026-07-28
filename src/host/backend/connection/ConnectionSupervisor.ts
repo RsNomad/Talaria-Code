@@ -338,11 +338,11 @@ export class ConnectionSupervisor {
       if (outcome.kind === 'connected') return;
       if (outcome.kind === 'deadline') {
         throw new Error(
-          `Hermes did not become ready within ${CONNECT_PHASE_DEADLINE_MS / 1000}s. Check the Hermes install (hermes.hermesPath / Python venv) — see the Talaria Code output channel.`,
+          `Hermes did not become ready within ${CONNECT_PHASE_DEADLINE_MS / 1000}s. Check the Hermes install (talaria.hermesPath / Python venv) — see the Talaria Code output channel.`,
         );
       }
       throw new Error(
-        `hermes acp exited during startup (code ${outcome.code}). Check the Hermes install (hermes.hermesPath / Python venv) — see the Talaria Code output channel.`,
+        `hermes acp exited during startup (code ${outcome.code}). Check the Hermes install (talaria.hermesPath / Python venv) — see the Talaria Code output channel.`,
       );
     } finally {
       exitSub?.dispose();

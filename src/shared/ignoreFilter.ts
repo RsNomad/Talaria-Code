@@ -67,7 +67,7 @@ export const DEFAULT_IGNORE_PATTERNS: readonly string[] = [
 /**
  * Builds a path-ignore predicate from `.gitignore`-style file contents (one
  * string per discovered ignore file), plus the default excludes above, plus
- * any user-configured extra patterns (`hermes.rag.excludeGlobs`). The
+ * any user-configured extra patterns (`talaria.rag.excludeGlobs`). The
  * returned predicate expects **POSIX-relative** paths from the workspace
  * root (see `toPosixRelative` in `src/rag/gitignore.ts`) — that's what the
  * `ignore` package itself expects.

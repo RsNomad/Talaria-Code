@@ -3,7 +3,7 @@ import { isHttpUrl } from '../shared/url';
 import type { FimBackendName } from './types';
 
 /**
- * Config surface for this zone, read from `hermes.autocomplete.*`. The frozen
+ * Config surface for this zone, read from `talaria.autocomplete.*`. The frozen
  * contract (docs/specs/wave-1.md, Zone AC) names exactly: `enabled`, `backend`,
  * `endpoint`, `model`, `debounceMs`, `maxPromptTokens`, `temperature`. `apiKey` is
  * an extra key this zone needs for the optional cloud/remote backends (Codestral,
@@ -23,7 +23,7 @@ export interface HermesAutocompleteConfig {
 }
 
 /**
- * W5-T5 · `hermes.autocomplete.crossFile.*` (§4.5/B5). `prefixInjection` is
+ * W5-T5 · `talaria.autocomplete.crossFile.*` (§4.5/B5). `prefixInjection` is
  * the RAW setting value — NOT yet loopback-gated. Callers must pass it
  * through `effectivePrefixInjection` (below) with the resolved endpoint's
  * loopback status before feeding it to `crossFileMode` (`context/mode.ts`).
@@ -32,7 +32,7 @@ export interface CrossFileConfig {
   enabled: boolean;
   prefixInjection: boolean;
   prefixInjectionRemote: boolean;
-  /** W5-T7 · `hermes.autocomplete.crossFile.warmUp` (default false, §2.4).
+  /** W5-T7 · `talaria.autocomplete.crossFile.warmUp` (default false, §2.4).
    *  Fires a llama.vim-style KV-cache warm-up on snapshot regeneration —
    *  only takes effect when the active backend implements `warmUp` (only
    *  `LlamaCppInfillBackend` this wave) and `egressPreconditionsMet()`
@@ -61,7 +61,7 @@ function isFimBackendName(value: string): value is FimBackendName {
 }
 
 export function readConfig(): HermesAutocompleteConfig {
-  const cfg = vscode.workspace.getConfiguration('hermes.autocomplete');
+  const cfg = vscode.workspace.getConfiguration('talaria.autocomplete');
 
   const rawBackend = cfg.get<string>('backend', 'ollama');
   const backend: FimBackendName = isFimBackendName(rawBackend)

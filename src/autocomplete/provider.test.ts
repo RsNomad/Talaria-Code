@@ -711,18 +711,18 @@ describe('next-edit contributions shape-lock', () => {
       fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'),
     ) as { contributes?: { configuration?: { properties?: Record<string, { scope?: string }> } } };
     const props = pkg.contributes?.configuration?.properties ?? {};
-    expect(props['hermes.nextEdit.enabled']).toBeUndefined();   // the toggle lives in the Guard's store
-    expect(props['hermes.nextEdit.generic']).toBeUndefined();   // (owner: settings carry DATA, not state)
+    expect(props['talaria.nextEdit.enabled']).toBeUndefined();   // the toggle lives in the Guard's store
+    expect(props['talaria.nextEdit.generic']).toBeUndefined();   // (owner: settings carry DATA, not state)
     for (const [key, def] of Object.entries(props)) {
-      if (key.startsWith('hermes.nextEdit.')) {
+      if (key.startsWith('talaria.nextEdit.')) {
         expect(def.scope, `${key} must be machine-scoped (config.ts:71-74 precedent)`).toBe('machine');
       }
     }
   });
 
   /*
-   * FIX WAVE 2 (S-3). `hermes.nextEdit.endpoint` is the next-edit twin of
-   * `hermes.autocomplete.endpoint` — the destination editor text egresses to,
+   * FIX WAVE 2 (S-3). `talaria.nextEdit.endpoint` is the next-edit twin of
+   * `talaria.autocomplete.endpoint` — the destination editor text egresses to,
    * i.e. the wave-1 exfil vector. Its FIM counterpart is listed under
    * `capabilities.untrustedWorkspaces.restrictedConfigurations`; this one was
    * not.
@@ -735,20 +735,20 @@ describe('next-edit contributions shape-lock', () => {
    * only thing standing between a checked-in settings file and an
    * attacker-chosen endpoint.
    *
-   * Deliberately endpoint-only, mirroring FIM exactly: `hermes.autocomplete.
+   * Deliberately endpoint-only, mirroring FIM exactly: `talaria.autocomplete.
    * model` is not listed either (a model NAME picks no destination), and
    * next-edit has no apiKey setting at all.
    *
    * (Review I-1: this is a statement about THIS list —
    * `restrictedConfigurations`, the workspace-TRUST gate — not about
-   * `scope`. `hermes.autocomplete.model` IS `scope: "machine"`, for an
+   * `scope`. `talaria.autocomplete.model` IS `scope: "machine"`, for an
    * unrelated reason: not trust, but workspace-OVERRIDE — a workspace
    * cannot silently swap which model serves completions. See
    * `configScope.test.ts`'s `MODEL_INTEGRITY_PATTERN` lock and `config.ts`'s
    * comment on `DEFAULT_ENDPOINTS`, which now keeps the two rationales
    * apart explicitly.)
    */
-  it('S-3: hermes.nextEdit.endpoint is trust-restricted, exactly like its FIM counterpart (the egress destination)', async () => {
+  it('S-3: talaria.nextEdit.endpoint is trust-restricted, exactly like its FIM counterpart (the egress destination)', async () => {
     const fs = await import('node:fs');
     const path = await import('node:path');
     const pkg = JSON.parse(
@@ -759,15 +759,15 @@ describe('next-edit contributions shape-lock', () => {
     expect(
       restricted,
       'reach: an empty restrictedConfigurations list would rubber-stamp every assertion here',
-    ).toContain('hermes.autocomplete.endpoint');
+    ).toContain('talaria.autocomplete.endpoint');
     expect(
       restricted,
-      'S-3: hermes.nextEdit.endpoint must be trust-restricted — it is the next-edit egress destination, the exact role hermes.autocomplete.endpoint plays for FIM',
-    ).toContain('hermes.nextEdit.endpoint');
+      'S-3: talaria.nextEdit.endpoint must be trust-restricted — it is the next-edit egress destination, the exact role talaria.autocomplete.endpoint plays for FIM',
+    ).toContain('talaria.nextEdit.endpoint');
   });
 
   /**
-   * Review I-1. `hermes.autocomplete.backend` is the endpoint SELECTOR this
+   * Review I-1. `talaria.autocomplete.backend` is the endpoint SELECTOR this
    * whole task exists to lock down (`config.ts`'s `DEFAULT_ENDPOINTS`) — it
    * was added to `restrictedConfigurations` alongside `.endpoint`/`.apiKey`
    * for the same reason S-3 gives above (both belts, independent
@@ -776,7 +776,7 @@ describe('next-edit contributions shape-lock', () => {
    * relaxation must not silently be the only thing standing between such a
    * file and an attacker-chosen endpoint.
    */
-  it('review I-1: hermes.autocomplete.backend is trust-restricted too — it SELECTS the egress destination via DEFAULT_ENDPOINTS', async () => {
+  it('review I-1: talaria.autocomplete.backend is trust-restricted too — it SELECTS the egress destination via DEFAULT_ENDPOINTS', async () => {
     const fs = await import('node:fs');
     const path = await import('node:path');
     const pkg = JSON.parse(
@@ -787,11 +787,11 @@ describe('next-edit contributions shape-lock', () => {
     expect(
       restricted,
       'reach: an empty restrictedConfigurations list would rubber-stamp this assertion',
-    ).toContain('hermes.autocomplete.endpoint');
+    ).toContain('talaria.autocomplete.endpoint');
     expect(
       restricted,
-      'I-1: hermes.autocomplete.backend selects the endpoint (audit C-4\'s root cause) and must be trust-restricted like the endpoint itself',
-    ).toContain('hermes.autocomplete.backend');
+      'I-1: talaria.autocomplete.backend selects the endpoint (audit C-4\'s root cause) and must be trust-restricted like the endpoint itself',
+    ).toContain('talaria.autocomplete.backend');
   });
 });
 
@@ -931,7 +931,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
     expect(items).toContain('Set API Key');
   });
 
-  it('a 400 BackendHttpError surfaces the endpoint-dialect hint (mentions hermes.autocomplete.backend) as a hedged likely cause, not an assertion of fact (F-C Minor-1), with no action button', async () => {
+  it('a 400 BackendHttpError surfaces the endpoint-dialect hint (mentions talaria.autocomplete.backend) as a hedged likely cause, not an assertion of fact (F-C Minor-1), with no action button', async () => {
     const engine = new FakeEngine();
     engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 400 Bad Request', 400, 'Bad Request');
     const showWarningMessage = mockShowWarningMessage;
@@ -941,7 +941,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
 
     expect(showWarningMessage).toHaveBeenCalledTimes(1);
     const [message, ...items] = must(showWarningMessage.mock.calls[0]);
-    expect(message).toContain('hermes.autocomplete.backend');
+    expect(message).toContain('talaria.autocomplete.backend');
     expect(message).toContain('400 Bad Request');
     // F-C Minor-1: vLLM also 400s on context-length overflow, not just a
     // dialect mismatch — a user with maxPromptTokens set higher than the
@@ -957,7 +957,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
   // misconfiguration that previously fell through every arm to the silent
   // `return null`. This is the DEFAULT vLLM path: config.ts's DEFAULT_MODEL
   // is an Ollama tag format vLLM can never serve, so a user who authenticates
-  // correctly and never touches hermes.autocomplete.model gets pure silence.
+  // correctly and never touches talaria.autocomplete.model gets pure silence.
   it('a 404 BackendHttpError surfaces a warning exactly once, naming the configured model; the identical second failure is silent', async () => {
     const engine = new FakeEngine();
     engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 404 Not Found', 404, 'Not Found');
@@ -973,7 +973,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
     const [message] = must(showWarningMessage.mock.calls[0]);
     expect(message).toContain('qwen2.5-coder:1.5b-base');
     expect(message).toContain('404');
-    expect(message).toContain('hermes.autocomplete.model');
+    expect(message).toContain('talaria.autocomplete.model');
 
     // Same anti-spam discipline as the other three arms.
     const second = await complete(provider);
@@ -1035,7 +1035,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
   it('a MissingApiKeyError is always surfaced with the Set API Key action, and never carries a key value', async () => {
     const engine = new FakeEngine();
     engine.throwError = new MissingApiKeyError(
-      'hermes.autocomplete.backend=codestral requires an API key. Run "Talaria: Set Autocomplete API Key", or choose a local backend.',
+      'talaria.autocomplete.backend=codestral requires an API key. Run "Talaria: Set Autocomplete API Key", or choose a local backend.',
     );
     const showWarningMessage = mockShowWarningMessage;
     const provider = makeProvider(engine, undefined, { getBackendName: () => 'codestral' });
@@ -1337,7 +1337,7 @@ describe('HermesInlineCompletionProvider — unknown-model warning / refusal (Ta
     // T7 (final-review remediation): example tag is the BASE build, never
     // the bare instruct tag (F §6.3, owner-ratified).
     expect(message).toBe(
-      `Talaria autocomplete is paused: unrecognized model "${UNKNOWN_MODEL}". The vllm backend needs Talaria to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "hermes.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`,
+      `Talaria autocomplete is paused: unrecognized model "${UNKNOWN_MODEL}". The vllm backend needs Talaria to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "talaria.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`,
     );
     // T7: assert BOTH polarities explicitly (not just the `toBe` pin above),
     // so a future loosening of the exact-match pin cannot silently reopen

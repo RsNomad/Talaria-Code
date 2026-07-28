@@ -190,7 +190,7 @@ export interface CrossFileContextServiceModeInput {
   /**
    * W5-T7 — the currently-active `FimBackend`, re-supplied on every
    * `reconfigure()` alongside `capabilities`/`template` so a backend switch
-   * (e.g. `hermes.autocomplete.backend` changes from `ollama` to
+   * (e.g. `talaria.autocomplete.backend` changes from `ollama` to
    * `llamacpp`) retargets warm-up immediately rather than firing against a
    * stale backend instance. Optional — most tests of this service don't
    * exercise warm-up at all and can omit it (no `.warmUp` ever fires
@@ -210,7 +210,7 @@ export interface CrossFileContextServiceDeps extends CrossFileContextServiceMode
   readonly getSkipUntrustedRemote: () => boolean;
   readonly getEnabled: () => boolean;
   /**
-   * W5-T7 — reads `hermes.autocomplete.crossFile.warmUp` (default false).
+   * W5-T7 — reads `talaria.autocomplete.crossFile.warmUp` (default false).
    * A stable closure over live config (like `getEnabled`/
    * `getSkipUntrustedRemote`), NOT re-supplied via `reconfigure()` — it
    * needs no refresh path of its own because `index.ts` closes over the
@@ -525,7 +525,7 @@ export class CrossFileContextService {
   /**
    * §2.4 warm-up hook (W5-T7). Fires a llama.vim-style KV-cache warm-up,
    * fire-and-forget, ONLY when ALL of:
-   *  1. `getWarmUpEnabled()` — `hermes.autocomplete.crossFile.warmUp`,
+   *  1. `getWarmUpEnabled()` — `talaria.autocomplete.crossFile.warmUp`,
    *     default-off (no default-on until Fedora P2 evidence).
    *  2. `egressPreconditionsMet()` — the SAME shared predicate the provider
    *     itself consults (R14 — warm-up is a second, independent egress

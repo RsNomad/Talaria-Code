@@ -61,14 +61,14 @@ import type {
 /** The two context keys the executor owns — it is their ONLY writer. */
 export type NextEditContextKey = 'talaria.nextEdit.jumpVisible' | 'talaria.nextEdit.jumped';
 
-/** The edit-burst debounce. Matches `hermes.autocomplete.debounceMs`'s own
+/** The edit-burst debounce. Matches `talaria.autocomplete.debounceMs`'s own
  *  350 ms default — next-edit rides the same "the user paused typing" signal
  *  FIM does, and reuses FIM's debouncer implementation rather than a second
  *  hand-rolled timer. */
 const TRIGGER_DEBOUNCE_MS = 350;
 
 /**
- * Transport defaults for an EMPTY `hermes.nextEdit.endpoint`, whose setting
+ * Transport defaults for an EMPTY `talaria.nextEdit.endpoint`, whose setting
  * description promises "Leave empty to use the backend's default". These
  * mirror `config.ts`'s own `DEFAULT_ENDPOINTS` rows for the two transports
  * next-edit supports (that table is module-private there, so the two rows are
@@ -91,7 +91,7 @@ export const GENERIC_SETUP_NOTE =
 /**
  * F-5 — the NEXT twin of {@link GENERIC_SETUP_NOTE}.
  *
- * `hermes.nextEdit.model` ships EMPTY (there is no sane default: the model is
+ * `talaria.nextEdit.model` ships EMPTY (there is no sane default: the model is
  * served on the user's own endpoint), so flipping the NEXT row on with shipped
  * defaults used to be permanently, silently inert while the panel row read
  * "Uses sweep-next-edit-v2-7B on its own endpoint" in the present tense.
@@ -103,7 +103,7 @@ export const GENERIC_SETUP_NOTE =
  * whether a model is loaded) — it fires on the observed empty string only.
  */
 export const NEXT_EDIT_MODEL_UNSET_NOTE =
-  'Next Edit is on, but "hermes.nextEdit.model" is empty — no suggestion can ever be produced. Set it in your settings (for example "sweep-next-edit-v2-7B"), together with "hermes.nextEdit.endpoint" if your model is not on the default port.';
+  'Next Edit is on, but "talaria.nextEdit.model" is empty — no suggestion can ever be produced. Set it in your settings (for example "sweep-next-edit-v2-7B"), together with "talaria.nextEdit.endpoint" if your model is not on the default port.';
 
 /**
  * `08` §5.3 / ADR-009 — why Generic REFUSES these two FIM backends rather
@@ -117,7 +117,7 @@ export const NEXT_EDIT_MODEL_UNSET_NOTE =
  * all. Actionable copy: names the offending backend and the exact way out.
  */
 export function genericUnsupportedBackendMessage(fimBackend: string): string {
-  return `Next Edit (Generic) cannot use the "${fimBackend}" autocomplete backend: that API re-templates the prompt server-side, which would silently corrupt the next-edit prompt. Set "hermes.autocomplete.backend" to ollama, vllm or llamacpp, or use the NEXT source instead.`;
+  return `Next Edit (Generic) cannot use the "${fimBackend}" autocomplete backend: that API re-templates the prompt server-side, which would silently corrupt the next-edit prompt. Set "talaria.autocomplete.backend" to ollama, vllm or llamacpp, or use the NEXT source instead.`;
 }
 
 /** Copy for every `noteOnce` msgId the FSM can emit. */
@@ -425,7 +425,7 @@ function isLoopbackEndpoint(rawUrl: string): boolean {
  */
 type RouteResolution =
   | { kind: 'route'; route: NextEditRoute }
-  /** NEXT is on but `hermes.nextEdit.model` is empty — actionable (F-5). */
+  /** NEXT is on but `talaria.nextEdit.model` is empty — actionable (F-5). */
   | { kind: 'next-model-unset' }
   /** Generic against a FIM backend whose API re-templates the prompt. The
    *  toggle-time refusal (`requestNextEditToggle`) cannot cover this: the
@@ -438,7 +438,7 @@ type RouteResolution =
 
 /**
  * Endpoint/model/transport/format per mode (`08` §5.3):
- *  - `next`    ⇒ `hermes.nextEdit.{endpoint,model,backend}` + sweep-v2;
+ *  - `next`    ⇒ `talaria.nextEdit.{endpoint,model,backend}` + sweep-v2;
  *  - `generic` ⇒ the AUTOCOMPLETE endpoint+model + generic-instruct, with the
  *                transport DERIVED from the FIM backend id.
  *
@@ -958,8 +958,8 @@ export function registerHermesNextEdit(
   function surfaceTriggerFailure(err: unknown, route: NextEditRoute, mode: NextEditMode): void {
     const where = endpointLabel(route.apiBase);
     const endpointSetting =
-      mode === 'next' ? '"hermes.nextEdit.endpoint"' : '"hermes.autocomplete.endpoint"';
-    const modelSetting = mode === 'next' ? '"hermes.nextEdit.model"' : '"hermes.autocomplete.model"';
+      mode === 'next' ? '"talaria.nextEdit.endpoint"' : '"talaria.autocomplete.endpoint"';
+    const modelSetting = mode === 'next' ? '"talaria.nextEdit.model"' : '"talaria.autocomplete.model"';
     const key = (statusClass: string): string => `${route.transport}|${where}|${statusClass}`;
 
     if (err instanceof InsecureTransportError) {
@@ -1128,7 +1128,7 @@ export function registerHermesNextEdit(
     if (mode === 'next' && route.remote) {
       surfaceOnce(
         'next-remote-endpoint',
-        'Next Edit is using a REMOTE endpoint for its dedicated model (hermes.nextEdit.endpoint). ' +
+        'Next Edit is using a REMOTE endpoint for its dedicated model (talaria.nextEdit.endpoint). ' +
           'Next Edit sends no credential of its own. If this endpoint requires authentication, say so — ' +
           'it would need its own key, never the autocomplete key.',
       );

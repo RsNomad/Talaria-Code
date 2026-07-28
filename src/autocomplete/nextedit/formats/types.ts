@@ -5,7 +5,7 @@
 // `NextEditFormatId` is Task 1's declaration (nextedit/types.ts) — it is
 // CONSUMED here (imported for `NextEditFormat.id`'s type), never
 // redeclared. With exactly two formats selected by the R5 mode, there is
-// no format registry, no `hermes.nextEdit.format` setting, no `'auto'`,
+// no format registry, no `talaria.nextEdit.format` setting, no `'auto'`,
 // and no model-name sniffing (§4.1): the NEXT toggle implies sweep-v2, the
 // Generic toggle implies generic-instruct — nothing on the wire identifies
 // a dialect, so a wrong guess would be confident garbage.

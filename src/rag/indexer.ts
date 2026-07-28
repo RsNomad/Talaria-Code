@@ -37,7 +37,7 @@ export interface IndexerOptions {
   maxChunkTokens?: number;
   /** File-watcher debounce, ms (how-to §6: ~300-800ms). */
   debounceMs?: number;
-  /** Extra ignore globs beyond `.gitignore`/`.hermesignore` (e.g. `hermes.rag.excludeGlobs`). */
+  /** Extra ignore globs beyond `.gitignore`/`.hermesignore` (e.g. `talaria.rag.excludeGlobs`). */
   extraIgnoreGlobs?: string[];
   /**
    * Directory containing the `tree-sitter-*.wasm` grammar files. Must resolve
@@ -109,7 +109,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   });
   // Task 14b: the width-refusal guard (embedder.ts) is now armed PER BUILD via
   // `computeEffectiveWidth`, not once here at construction — see that
-  // function's doc comment for the full policy (declared `hermes.rag.dims`,
+  // function's doc comment for the full policy (declared `talaria.rag.dims`,
   // OR the width observed and recorded by a previous build once the D-2
   // fingerprint still matches). This is the SOLE width-check site; nothing
   // else in this file re-checks vector width.
@@ -155,7 +155,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
      * has been observed yet) and on a legacy sidecar written before this
      * field existed; both must still parse.
      *
-     * This exists because `hermes.rag.dims` defaults to 0 ("let the server
+     * This exists because `talaria.rag.dims` defaults to 0 ("let the server
      * decide"), and at dims=0 nothing else records what width the server
      * actually returned. Verified empirically (see embedder.ts's comment on
      * `expectedWidth`): LanceDB's `mergeInsert(...).execute()` does not
@@ -190,7 +190,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
    * function only DECIDES what value to pass it, it does not itself check
    * anything. The decision: prefer the width OBSERVED and stored on a
    * previous build, whenever one is on record; otherwise fall back to the
-   * width the user explicitly declared via `hermes.rag.dims` (Task 14's
+   * width the user explicitly declared via `talaria.rag.dims` (Task 14's
    * existing D-1 arming, unchanged); otherwise there is nothing to enforce
    * yet (first build, dims=0 — bootstrapping).
    *
@@ -202,7 +202,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
    * back into the recompute set, but that recompute still upserts into the
    * SAME fixed-width table. Gating the width check on the fingerprint (the
    * previous behaviour) left this refusal disarmed at the default
-   * `hermes.rag.dims=0` on exactly a model-name change: `mergeInsert(...)`
+   * `talaria.rag.dims=0` on exactly a model-name change: `mergeInsert(...)`
    * does not reject a wrong-width row, it silently truncates or null-pads it
    * (Task 14b's embedder.ts comment) — so a new model with a different
    * native width would have corrupted the index with no error at all. This

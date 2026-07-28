@@ -103,7 +103,7 @@ const MODEL_TAG = /`?qwen2\.5-coder:[a-z0-9.\-]+`?/i;
 const BASE_MODEL_TAG = /qwen2\.5-coder:[a-z0-9.\-]*-base/i;
 /**
  * Verbs that turn a mention into an INSTRUCTION. Deliberately broad: the point
- * of Finding 3 is that pinning one phrasing (``set `hermes.autocomplete.model`
+ * of Finding 3 is that pinning one phrasing (``set `talaria.autocomplete.model`
  * to``) let a differently-worded recommendation through.
  */
 const RECOMMENDING_VERB = /\b(set|use|using|switch|write|choose|pick|prefer|recommend\w*|configure|point)\b/i;
@@ -221,7 +221,7 @@ describe('LOCK 2: the shipped FIM default model agrees across code, manifest and
   const DEFAULT_MODEL = 'qwen2.5-coder:1.5b-base';
 
   it('`package.json` and `config.ts` hold the same default', () => {
-    expect(CONFIG_PROPERTIES['hermes.autocomplete.model']?.default).toBe(DEFAULT_MODEL);
+    expect(CONFIG_PROPERTIES['talaria.autocomplete.model']?.default).toBe(DEFAULT_MODEL);
     expect(CONFIG_SRC).toContain(`const DEFAULT_MODEL = '${DEFAULT_MODEL}';`);
   });
 
@@ -234,7 +234,7 @@ describe('LOCK 2: the shipped FIM default model agrees across code, manifest and
    * FINDING 3 — this check's REACH, corrected.
    *
    * What it used to do: inspect the tag following the literal phrase ``set
-   * `hermes.autocomplete.model` to``, in exactly two documents. Its own comment
+   * `talaria.autocomplete.model` to``, in exactly two documents. Its own comment
    * said "Reach is asserted per subject" — true of the SITES it counted, false
    * of the PHRASINGS it covered, so it read as much stronger assurance than it
    * gave. The code lens planted ``For better quality, use `qwen2.5-coder:7b` as
@@ -264,7 +264,7 @@ describe('LOCK 2: the shipped FIM default model agrees across code, manifest and
    *    pages must be able to explain why it is the wrong choice.
    */
   it('no user doc recommends the bare `:7b` tag via the phrase the setting instruction uses', () => {
-    const INSTRUCTION = /set `hermes\.autocomplete\.model` to ?/gi;
+    const INSTRUCTION = /set `talaria\.autocomplete\.model` to ?/gi;
     let sitesAcrossCorpus = 0;
     const sitesByPage = new Map<string, number>();
 
@@ -344,7 +344,7 @@ describe('LOCK 2: the shipped FIM default model agrees across code, manifest and
     // The old phrase-anchored instrument, run on the same sentence, finds
     // nothing — which is precisely why widening was the remedy and not a
     // tightening of the old pattern.
-    expect(planted).not.toMatch(/set `hermes\.autocomplete\.model` to/i);
+    expect(planted).not.toMatch(/set `talaria\.autocomplete\.model` to/i);
   });
 
   it('negative control: the predicate does NOT flag prose that merely explains the bare tag', () => {
@@ -395,15 +395,15 @@ describe('LOCK 2: the shipped FIM default model agrees across code, manifest and
  */
 describe('LOCK 3: the quoted setting description is quoted correctly', () => {
   const QUOTED =
-    'Generic always uses the FIM model on `#hermes.autocomplete.endpoint#`, never this setting.';
+    'Generic always uses the FIM model on `#talaria.autocomplete.endpoint#`, never this setting.';
 
-  it('the sentence the page attributes to `hermes.nextEdit.backend` is really its description', () => {
-    expect(CONFIG_PROPERTIES['hermes.nextEdit.backend']?.description).toContain(QUOTED);
+  it('the sentence the page attributes to `talaria.nextEdit.backend` is really its description', () => {
+    expect(CONFIG_PROPERTIES['talaria.nextEdit.backend']?.description).toContain(QUOTED);
   });
 
   it('the page quotes it, and attributes it to the setting that actually carries it', () => {
     expect(flatten(TOPOLOGY_DOC)).toContain(QUOTED);
-    expect(flatten(TOPOLOGY_DOC)).toContain('`hermes.nextEdit.backend` setting says so');
+    expect(flatten(TOPOLOGY_DOC)).toContain('`talaria.nextEdit.backend` setting says so');
   });
 });
 
@@ -413,16 +413,16 @@ describe('LOCK 3: the quoted setting description is quoted correctly', () => {
  *
  * The second half is the point most easily blurred by a well-meaning edit: the
  * on/off state is Guard state in `globalState`, never a configuration key
- * (R5). A doc that tells a user to set `hermes.nextEdit.enabled` sends them to
+ * (R5). A doc that tells a user to set `talaria.nextEdit.enabled` sends them to
  * a key that does not exist.
  */
 describe('LOCK 4: three roles, two settings — and the toggles are not settings', () => {
   it('every model/endpoint setting the page names is a real configuration key', () => {
     for (const key of [
-      'hermes.autocomplete.model',
-      'hermes.autocomplete.endpoint',
-      'hermes.nextEdit.model',
-      'hermes.nextEdit.endpoint',
+      'talaria.autocomplete.model',
+      'talaria.autocomplete.endpoint',
+      'talaria.nextEdit.model',
+      'talaria.nextEdit.endpoint',
     ]) {
       expect(TOPOLOGY_DOC, `the page must name ${key}`).toContain(key);
       expect(CONFIG_PROPERTIES[key], `${key} must exist in package.json`).toBeDefined();
@@ -431,8 +431,8 @@ describe('LOCK 4: three roles, two settings — and the toggles are not settings
 
   it('the on/off toggles are NOT configuration keys, exactly as the page says', () => {
     for (const key of Object.keys(CONFIG_PROPERTIES)) {
-      expect(key).not.toBe('hermes.nextEdit.enabled');
-      expect(key).not.toBe('hermes.nextEdit.generic');
+      expect(key).not.toBe('talaria.nextEdit.enabled');
+      expect(key).not.toBe('talaria.nextEdit.generic');
     }
     expect(TOPOLOGY_DOC).toContain('are NOT `settings.json` settings');
   });

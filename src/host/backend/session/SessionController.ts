@@ -664,7 +664,7 @@ export class SessionController {
    * `modeId` is `null` (mode cleared), mirroring `setMode`'s clamp posture.
    * From this call until the next one, `buildPresentEffectSignals` reads
    * `this.activeCustomMode` at signal-build time (per permission request) —
-   * a disk change to `hermes.customModes` in between does NOT reach here
+   * a disk change to `talaria.customModes` in between does NOT reach here
    * (the router's `onDidChangeConfiguration` handler deliberately never
    * calls this method); the snapshot changes ONLY via an explicit re-pick.
    */

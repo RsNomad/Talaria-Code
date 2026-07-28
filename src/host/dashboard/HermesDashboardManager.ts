@@ -15,7 +15,7 @@ import { isForeignBackendToken } from './servedToken';
  * server (W1.5). Mirrors the tui_gateway/ACP spawn the extension already owns.
  *
  * ## S3 — spawn-only default + served-token provenance (CWE-306/346)
- * `hermes.dashboardAdopt` (`opts.adopt`) selects the discovery strategy:
+ * `talaria.dashboardAdopt` (`opts.adopt`) selects the discovery strategy:
  *
  *  - **`'spawn-only'` (default, SECURE).** Never probes or adopts a pre-existing
  *    peer — shape alone (`probeAdopt`) is spoofable by any local squatter that
@@ -97,14 +97,14 @@ export interface HermesDashboardManagerDeps {
 
 export interface HermesDashboardManagerOptions {
   config: HermesRuntimeConfig;
-  /** `hermes.dashboardPort` (default 9119). */
+  /** `talaria.dashboardPort` (default 9119). */
   port: number;
   host?: string;
   logger?: Logger;
   /** Health-probe backoff schedule (ms) for a freshly-spawned child. */
   probeBackoffMs?: number[];
   /**
-   * `hermes.dashboardAdopt`: `'spawn-only'` (default, SECURE) never adopts a
+   * `talaria.dashboardAdopt`: `'spawn-only'` (default, SECURE) never adopts a
    * foreign peer — it always spawns and provenance-verifies its own child.
    * `'shape'` is the legacy INSECURE opt-in (shape-only adoption, Security M3
    * without the S3 provenance hardening). Defaults to `'spawn-only'`.

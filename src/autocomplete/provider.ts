@@ -59,7 +59,7 @@ const WARN_MSG = (model: string): string =>
   `Talaria autocomplete: unrecognized model "${model}". Talaria has no prompt template for this model and will fall back to a generic FIM format — completions may be malformed or silently wrong. Officially supported: qwen2.5-coder (for example "qwen2.5-coder:7b-base").`;
 
 const REFUSE_MSG = (model: string): string =>
-  `Talaria autocomplete is paused: unrecognized model "${model}". The vllm backend needs Talaria to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "hermes.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`;
+  `Talaria autocomplete is paused: unrecognized model "${model}". The vllm backend needs Talaria to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "talaria.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`;
 
 /**
  * A5: one-shot dedup for the actionable autocomplete failures
@@ -76,7 +76,7 @@ const surfacedAutocompleteFailures = new Set<string>();
 
 /**
  * A5: re-arms every surfaced-once autocomplete failure warning. Wired into
- * `index.ts`'s `rebuild()` (fires on every `hermes.autocomplete.*` config
+ * `index.ts`'s `rebuild()` (fires on every `talaria.autocomplete.*` config
  * change and on the initial API-key load) so a user who just fixed their
  * key/endpoint gets a second signal on the next failure instead of
  * permanent silence.
@@ -547,7 +547,7 @@ export class HermesInlineCompletionProvider
         // was ever supplied).
         this.surfaceIfFirst(
           key('missing-key'),
-          `Talaria autocomplete: ${backend} requires an API key. Run "Talaria: Set Autocomplete API Key", or switch "hermes.autocomplete.backend" to a local backend.`,
+          `Talaria autocomplete: ${backend} requires an API key. Run "Talaria: Set Autocomplete API Key", or switch "talaria.autocomplete.backend" to a local backend.`,
           [SET_API_KEY_ACTION],
         );
       } else if (err instanceof BackendHttpError && (err.status === 401 || err.status === 403)) {
@@ -566,16 +566,16 @@ export class HermesInlineCompletionProvider
         // params) — hedge rather than assert a cause this code cannot know.
         this.surfaceIfFirst(
           key('dialect'),
-          `Talaria autocomplete: ${backend} rejected the request (${err.status} ${err.statusText}). This usually means "hermes.autocomplete.backend" doesn't match your server's API dialect — it can also mean the request itself was invalid (e.g. too many tokens for the server's context length).`,
+          `Talaria autocomplete: ${backend} rejected the request (${err.status} ${err.statusText}). This usually means "talaria.autocomplete.backend" doesn't match your server's API dialect — it can also mean the request itself was invalid (e.g. too many tokens for the server's context length).`,
         );
       } else if (err instanceof BackendHttpError && err.status === 404) {
         // F-B: vLLM's check_model 404s for a model it doesn't serve — the
         // DEFAULT vLLM path, since config.ts's DEFAULT_MODEL is an Ollama tag
         // format vLLM never serves. Without this arm, a correctly-authed user
-        // who never touches hermes.autocomplete.model gets pure silence.
+        // who never touches talaria.autocomplete.model gets pure silence.
         this.surfaceIfFirst(
           key('model'),
-          `Talaria autocomplete: ${backend} does not serve the model "${this.getModelName()}" (404). Check "hermes.autocomplete.model".`,
+          `Talaria autocomplete: ${backend} does not serve the model "${this.getModelName()}" (404). Check "talaria.autocomplete.model".`,
         );
       } else if (err instanceof BackendStreamError) {
         // T-5 (closes V-14): a mid-stream SSE error frame on an otherwise-200

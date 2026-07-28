@@ -76,7 +76,7 @@ export { CheckpointLockTimeoutError } from './shadowLock';
 
 /** Tunables for a {@link CheckpointTracker} instance. */
 export interface CheckpointTrackerOptions {
-  /** Extra ignore globs beyond `.gitignore`/`.hermesignore` (e.g. `hermes.rag.excludeGlobs`). */
+  /** Extra ignore globs beyond `.gitignore`/`.hermesignore` (e.g. `talaria.rag.excludeGlobs`). */
   extraIgnoreGlobs?: readonly string[];
   /** Per-file size cutoff in bytes; larger files are excluded even if not gitignored. Default 2 MiB. */
   maxFileBytes?: number;

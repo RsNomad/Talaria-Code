@@ -31,15 +31,15 @@ import { registerGenerateCommitMessageCommand } from './host/scm/generateCommitC
 
 /**
  * P7-N12 · I-9 — the shape a trust-gated MCP-server zone (RAG, LIB, and any
- * future one) is configured with: a `hermes.<section>.enabled` toggle, an
+ * future one) is configured with: a `talaria.<section>.enabled` toggle, an
  * `enabled ∧ hasWorkspace ∧ isTrusted` gate, and a log prefix for the
  * "why not started" line. See {@link registerTrustGatedZone}.
  */
 interface TrustGatedZoneOptions {
-  /** The `hermes.<section>` config namespace this zone's `enabled` flag
-   * lives under (`hermes.rag` / `hermes.lib`) — also the exact key echoed,
+  /** The `talaria.<section>` config namespace this zone's `enabled` flag
+   * lives under (`talaria.rag` / `talaria.lib`) — also the exact key echoed,
    * verbatim, in the "disabled" reason string. */
-  readonly configSection: 'hermes.rag' | 'hermes.lib';
+  readonly configSection: 'talaria.rag' | 'talaria.lib';
   /** Log-line prefix (`Talaria RAG` / `Talaria LSP` — LIB's zone is
    * architecturally "LIB" but has always logged as "Talaria LSP"; preserved
    * verbatim by this refactor, not renamed). */
@@ -111,15 +111,15 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // ── Backend selection: the mock→real swap seam (TRUST-GATED) ─────────────
   // DEFAULT is the mock so the panel runs on any OS with no Hermes process
-  // (pinned decision #4). `hermes.backend: "acp"` switches to the real
+  // (pinned decision #4). `talaria.backend: "acp"` switches to the real
   // backend, which spawns `hermes acp` (Fedora/Linux only, per Zone ACP).
   //
   // SECURITY (security-review.md C1): the `acp` backend spawns child processes
-  // via the (now machine-scoped) `hermes.pythonPath`/`hermes.cwd`. It is only
+  // via the (now machine-scoped) `talaria.pythonPath`/`talaria.cwd`. It is only
   // ever constructed in a TRUSTED workspace; otherwise we fall back to the
   // process-free mock. `selectBackendKind` is the single decision point.
   const readRuntimeConfig = (): HermesRuntimeConfig => {
-    const hermesCfg = vscode.workspace.getConfiguration('hermes');
+    const hermesCfg = vscode.workspace.getConfiguration('talaria');
     return {
       hermesPath: hermesCfg.get<string>('hermesPath', '').trim() || undefined,
       pythonPath: hermesCfg.get<string>('pythonPath', '').trim() || undefined,
@@ -127,7 +127,7 @@ export function activate(context: vscode.ExtensionContext): void {
     };
   };
   const configuredBackend = (): string =>
-    vscode.workspace.getConfiguration('hermes').get<string>('backend', 'mock');
+    vscode.workspace.getConfiguration('talaria').get<string>('backend', 'mock');
 
   // W1.5: the dashboard REST channel (adopt-or-spawn `HermesDashboardManager`)
   // powering the REAL Skills & Tools panels. Constructed ONLY in the acp path,
@@ -139,12 +139,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // `context.subscriptions` entry that could outlive the backend. `dispose()`
   // kills any `serve` child we spawned; an adopted dashboard is left running.
   //
-  // S3 (CWE-306/346): `hermes.dashboardAdopt` selects discovery strategy —
+  // S3 (CWE-306/346): `talaria.dashboardAdopt` selects discovery strategy —
   // `'spawn-only'` (secure default) never adopts a foreign peer; `'shape'` is
   // the legacy INSECURE opt-in. Any unrecognised config value fails CLOSED to
   // the secure default rather than being cast/trusted.
   const createDashboard = (): DashboardService => {
-    const cfg = vscode.workspace.getConfiguration('hermes');
+    const cfg = vscode.workspace.getConfiguration('talaria');
     const port = cfg.get<number>('dashboardPort', 9119);
     const adopt: 'spawn-only' | 'shape' =
       cfg.get<string>('dashboardAdopt', 'spawn-only') === 'shape' ? 'shape' : 'spawn-only';
@@ -251,7 +251,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // The FULL gate (refines the S0 "always true" scaffolding): the SAME
   // trust+backend decision `selectBackendKind`/`makeAcpBackend` use above,
   // so `talaria.ready` is true iff the workspace is trusted AND
-  // `hermes.backend` is actually `acp` — exactly the Cody `cody.activated`
+  // `talaria.backend` is actually `acp` — exactly the Cody `cody.activated`
   // pattern doc §3.3 pins. Drives the `editor/context` "Hermes" submenu's
   // `when: editorHasSelection && talaria.ready` (package.json) and gates the
   // editor-actions/QuickFix registration below. Re-computed and re-set on
@@ -310,7 +310,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // an API key is never sent over cleartext http to a remote host (S4.2), and
   // in Restricted Mode a remote (non-loopback) endpoint is skipped entirely
   // (S4.3) — only the default loopback path stays live untrusted. Reads
-  // `hermes.autocomplete.*` itself.
+  // `talaria.autocomplete.*` itself.
   //
   // A5: `reportFailure` is the real implementation of provider.ts's injected
   // seam — every surfaced (actionable) autocomplete failure also gets one
@@ -332,7 +332,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // The indexer walks the workspace and POSTs file contents to an embeddings
   // endpoint, so it only runs in a trusted workspace (C1 exfil vector B).
   const startRagIfEligible = registerTrustGatedZone({
-    configSection: 'hermes.rag',
+    configSection: 'talaria.rag',
     logPrefix: 'Talaria RAG',
     hasWorkspace: () => !!firstWorkspaceRoot(),
     isTrusted: () => vscode.workspace.isTrusted,
@@ -396,7 +396,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(libHost);
 
   const startLibIfEligible = registerTrustGatedZone({
-    configSection: 'hermes.lib',
+    configSection: 'talaria.lib',
     logPrefix: 'Talaria LSP',
     hasWorkspace: () => !!firstWorkspaceRoot(),
     isTrusted: () => vscode.workspace.isTrusted,
@@ -508,7 +508,7 @@ export async function deactivate(): Promise<void> {
  * Bring up the Zone RG indexer (extension-host side), register the
  * `codebase_search` MCP server (Zone RG's `dist/mcp/codebase-server.js`,
  * spawned by Hermes itself — never by the extension) via `registerMcpServer`,
- * then build the index. Requires `hermes.rag.enabled` and an open workspace;
+ * then build the index. Requires `talaria.rag.enabled` and an open workspace;
  * no-ops otherwise (there is nothing to index, nothing to register).
  */
 async function activateCodebaseRag(
@@ -516,13 +516,13 @@ async function activateCodebaseRag(
   output: vscode.OutputChannel,
   registerMcpServer: (server: AcpMcpServerStdio) => void,
 ): Promise<void> {
-  const ragCfg = vscode.workspace.getConfiguration('hermes.rag');
+  const ragCfg = vscode.workspace.getConfiguration('talaria.rag');
   const enabled = ragCfg.get<boolean>('enabled', true);
   const workspaceRoot = firstWorkspaceRoot();
 
   if (!enabled || !workspaceRoot) {
     output.appendLine(
-      `Talaria RAG: ${!enabled ? 'disabled (hermes.rag.enabled=false)' : 'no workspace open'} — skipping indexer.`,
+      `Talaria RAG: ${!enabled ? 'disabled (talaria.rag.enabled=false)' : 'no workspace open'} — skipping indexer.`,
     );
     return;
   }
@@ -552,7 +552,7 @@ async function activateCodebaseRag(
   // slow) initial index build below, so it's already known by the time
   // `AcpBackend.start()` fires `session/new` — which can happen as soon as
   // the webview mounts (`HermesViewProvider`'s `ready` handler), independent
-  // of how long indexing takes. Trust + `hermes.rag.enabled` gating already
+  // of how long indexing takes. Trust + `talaria.rag.enabled` gating already
   // happened above/in the caller (this function only ever runs when
   // `shouldActivateRag` said yes — see `startRagIfEligible`); no trust
   // decision is made here.

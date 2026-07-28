@@ -79,7 +79,7 @@ function createRecentlyOpenedSource(getMruUris: () => readonly string[]): Snippe
 export interface CreateCrossFileContextServiceOptions extends CrossFileContextServiceModeInput {
   readonly getSkipUntrustedRemote: () => boolean;
   readonly getEnabled: () => boolean;
-  /** W5-T7 — `hermes.autocomplete.crossFile.warmUp` (default false). */
+  /** W5-T7 — `talaria.autocomplete.crossFile.warmUp` (default false). */
   readonly getWarmUpEnabled?: () => boolean;
 }
 

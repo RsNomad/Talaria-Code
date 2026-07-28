@@ -7,7 +7,7 @@
  * ## Why (security-review.md C1)
  * The real `acp` backend spawns child processes (`hermes acp`,
  * `python -m tui_gateway.entry`) using the workspace-influenced
- * `hermes.pythonPath`/`hermes.cwd`, and the RAG indexer walks the workspace and
+ * `talaria.pythonPath`/`talaria.cwd`, and the RAG indexer walks the workspace and
  * POSTs file contents to an embeddings endpoint. Both are unsafe to run against
  * a repository the user has not explicitly trusted. The default `mock` backend
  * spawns nothing and does no network/FS work, so it is safe in either mode.
@@ -26,7 +26,7 @@ import type { BackendKind } from '../shared/protocol';
 export type { BackendKind };
 
 /**
- * Which backend to actually construct, given the configured `hermes.backend`
+ * Which backend to actually construct, given the configured `talaria.backend`
  * value and the current Workspace Trust state.
  *
  * The process-spawning `acp` backend is chosen ONLY in a trusted workspace;

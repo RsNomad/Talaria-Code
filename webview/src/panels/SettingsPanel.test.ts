@@ -33,7 +33,7 @@ describe('Next Edit Suggestions rows — frozen owner-approved copy (08 §8)', (
     const next = must(NEXT_EDIT_ROWS[0]);
     expect(next.label).toBe('Next Edit — dedicated model');
     expect(next.description).toBe(
-      'Uses sweep-next-edit-v2-7B on its own endpoint (hermes.nextEdit.endpoint). No published benchmark score exists for this model. Mutually exclusive with Generic.',
+      'Uses sweep-next-edit-v2-7B on its own endpoint (talaria.nextEdit.endpoint). No published benchmark score exists for this model. Mutually exclusive with Generic.',
     );
   });
 

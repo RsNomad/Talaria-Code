@@ -76,28 +76,28 @@ code --install-extension talaria-code-*.vsix
 
 1. 安装并运行 **Hermes** 代理与一个 **模型运行时**（例如带上述模型的 Ollama）。
 2. 从活动栏打开 **Talaria** 面板。
-3. 将扩展指向你的 Hermes 安装，然后把 `hermes.backend` 从 `mock` 切换为 `acp`（见「配置」）。
+3. 将扩展指向你的 Hermes 安装，然后把 `talaria.backend` 从 `mock` 切换为 `acp`（见「配置」）。
 
 首次运行时，扩展会使用脚本化的 **mock** 后端，让你在不启动 Hermes 进程的情况下浏览界面
 —— 它可在任意系统运行。切换为 `acp` 即可对接你的真实代理进入实时模式。
 
 ## 配置
 
-设置位于 **`hermes.*`** 命名空间下（Talaria Code 是 Hermes 客户端）。你通常会用到的：
+设置位于 **`talaria.*`** 命名空间下（Talaria Code 是 Hermes 客户端）。你通常会用到的：
 
 | 设置项 | 默认值 | 作用 |
 |---|---|---|
-| `hermes.backend` | `mock` | 与哪个代理后端通信。设为 `acp` 以使用真实的 Hermes 后端。 |
-| `hermes.hermesPath` | `""` | `hermes` 可执行文件的绝对路径。 |
-| `hermes.pythonPath` | `""` | 用于启动真实 Hermes 后端的 Python 解释器。 |
-| `hermes.cwd` | `""` | 代理的工作目录（默认取第一个工作区文件夹）。 |
-| `hermes.autocomplete.enabled` | `true` | 启用行内（FIM）补全。 |
-| `hermes.autocomplete.backend` | `ollama` | 提供补全服务的后端。 |
-| `hermes.autocomplete.model` | `qwen2.5-coder:1.5b-base` | 用于补全的模型。 |
-| `hermes.autocomplete.endpoint` | `""` | 补全后端的基础 URL（可以是你自己托管的节点）。 |
-| `hermes.rag.enabled` | `true` | 启用代码库 RAG 索引与搜索。 |
-| `hermes.rag.embedEndpoint` | `http://127.0.0.1:11434` | 嵌入后端的基础 URL。 |
-| `hermes.rag.embedModel` | `qwen3-embedding:0.6b` | 用于嵌入代码片段的模型。 |
+| `talaria.backend` | `mock` | 与哪个代理后端通信。设为 `acp` 以使用真实的 Hermes 后端。 |
+| `talaria.hermesPath` | `""` | `hermes` 可执行文件的绝对路径。 |
+| `talaria.pythonPath` | `""` | 用于启动真实 Hermes 后端的 Python 解释器。 |
+| `talaria.cwd` | `""` | 代理的工作目录（默认取第一个工作区文件夹）。 |
+| `talaria.autocomplete.enabled` | `true` | 启用行内（FIM）补全。 |
+| `talaria.autocomplete.backend` | `ollama` | 提供补全服务的后端。 |
+| `talaria.autocomplete.model` | `qwen2.5-coder:1.5b-base` | 用于补全的模型。 |
+| `talaria.autocomplete.endpoint` | `""` | 补全后端的基础 URL（可以是你自己托管的节点）。 |
+| `talaria.rag.enabled` | `true` | 启用代码库 RAG 索引与搜索。 |
+| `talaria.rag.embedEndpoint` | `http://127.0.0.1:11434` | 嵌入后端的基础 URL。 |
+| `talaria.rag.embedModel` | `qwen3-embedding:0.6b` | 用于嵌入代码片段的模型。 |
 
 完整设置见设置界面（搜索 `hermes`）。
 

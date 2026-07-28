@@ -633,7 +633,7 @@ describe('G-3: clicking a settings row error must not toggle the switch', () => 
                 name: 'autocomplete',
                 fields: [
                   {
-                    key: 'hermes.autocomplete.enabled',
+                    key: 'talaria.autocomplete.enabled',
                     type: 'boolean',
                     value: true,
                     description: 'Enable Talaria inline (FIM) autocomplete.',
@@ -654,7 +654,7 @@ describe('G-3: clicking a settings row error must not toggle the switch', () => 
     );
 
     // Fail the write so the inline error appears.
-    await user.click(screen.getByRole('switch', { name: 'hermes.autocomplete.enabled' }));
+    await user.click(screen.getByRole('switch', { name: 'talaria.autocomplete.enabled' }));
     const error = await screen.findByText(/Not saved:/);
     sets.length = 0;
 
@@ -674,7 +674,7 @@ describe('G-3: clicking a settings row error must not toggle the switch', () => 
             sections: [
               {
                 name: 'autocomplete',
-                fields: [{ key: 'hermes.autocomplete.enabled', type: 'boolean', value: true }],
+                fields: [{ key: 'talaria.autocomplete.enabled', type: 'boolean', value: true }],
               },
             ],
           },
@@ -688,7 +688,7 @@ describe('G-3: clicking a settings row error must not toggle the switch', () => 
       />,
     );
 
-    await user.click(screen.getByText('hermes.autocomplete.enabled'));
+    await user.click(screen.getByText('talaria.autocomplete.enabled'));
     expect(sets).toHaveLength(1);
   });
 
@@ -703,7 +703,7 @@ describe('G-3: clicking a settings row error must not toggle the switch', () => 
             sections: [
               {
                 name: 'autocomplete',
-                fields: [{ key: 'hermes.autocomplete.enabled', type: 'boolean', value: true }],
+                fields: [{ key: 'talaria.autocomplete.enabled', type: 'boolean', value: true }],
               },
             ],
           },
@@ -720,7 +720,7 @@ describe('G-3: clicking a settings row error must not toggle the switch', () => 
       />,
     );
 
-    const control = screen.getByRole('switch', { name: 'hermes.autocomplete.enabled' });
+    const control = screen.getByRole('switch', { name: 'talaria.autocomplete.enabled' });
     await user.click(control);
     await user.click(control); // second click while the first is in flight
     expect(sets).toHaveLength(1);

@@ -191,7 +191,7 @@ describe('createBackend — audit C-4 / review C-1: a keyless Codestral config b
         [Symbol.asyncIterator]();
 
       await expect(iterator.next()).rejects.toThrow(
-        'hermes.autocomplete.backend=codestral requires an API key',
+        'talaria.autocomplete.backend=codestral requires an API key',
       );
       expect(fetchSpy).toHaveBeenCalledTimes(0);
     } finally {
@@ -216,7 +216,7 @@ describe('createBackend — audit C-4 / review C-1: a keyless Codestral config b
 /**
  * T-6 F4: `OllamaFimBackendOptions` has no `apiKey` field at all — Ollama's
  * `/api/generate` has no auth story this codebase speaks, so a configured
- * `hermes.autocomplete.apiKey` is silently dropped on the floor with no
+ * `talaria.autocomplete.apiKey` is silently dropped on the floor with no
  * signal anywhere (the key never even reaches `OllamaFimBackend`). This is
  * a construction-time, warn-only observation — `createBackend` must never
  * throw (see the codestral arm's own doc comment above), so this is a

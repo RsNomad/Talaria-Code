@@ -55,7 +55,7 @@ import { must } from '../../testing/must';
  * `vscode.workspace.onDidChangeConfiguration` (the §4.3 mitigation 2
  * disposable) — every test in this file constructs a real `AcpBackend`, so
  * this must exist unconditionally or the whole suite breaks, not just the
- * new SF-2 tests. `getConfiguration().inspect('hermes.customModes')` backs
+ * new SF-2 tests. `getConfiguration().inspect('talaria.customModes')` backs
  * `readCustomModes()` (called from `setCustomMode`/`openSession`'s
  * `mode.state` emit/the config-change handler); `window.showWarningMessage`
  * backs the self-widening warning + `customModes.ts`'s own rule-ingest
@@ -107,7 +107,7 @@ vi.mock('vscode', () => {
     __configChangeListeners: [],
     getConfiguration: () => ({
       inspect: (key: string) => {
-        if (key !== 'hermes.customModes') return undefined;
+        if (key !== 'talaria.customModes') return undefined;
         return {
           workspaceValue: workspace.__customModesWorkspaceValue,
           workspaceFolderValue: workspace.__customModesFolderValue,
@@ -744,7 +744,7 @@ describe('AcpBackend.sendPrompt — ARCH-1 (final review, UI I-3): a user action
 const mockWorkspace = vscode.workspace as unknown as {
   workspaceFolders: Array<{ uri: { fsPath: string } }> | undefined;
   __fileBody: string;
-  /** W4-T4b: the `hermes.customModes` WORKSPACE-scoped value `readCustomModes()` reads. */
+  /** W4-T4b: the `talaria.customModes` WORKSPACE-scoped value `readCustomModes()` reads. */
   __customModesWorkspaceValue: unknown;
   /** W4-T4b: a FOLDER-scoped value, present only to prove `readCustomModes` ignores it (B10). */
   __customModesFolderValue: unknown;
@@ -8664,7 +8664,7 @@ describe('AcpBackend — SF-2 (T4b) §4.3 mitigation 2: onDidChangeConfiguration
     mockShowWarningMessage.mockClear();
   });
 
-  it('a disk change to hermes.customModes does NOT re-snapshot a session with an active mode — the ENFORCED snapshot stays the OLD floor, and a visible warning fires (the load-bearing self-widening test)', () => {
+  it('a disk change to talaria.customModes does NOT re-snapshot a session with an active mode — the ENFORCED snapshot stays the OLD floor, and a visible warning fires (the load-bearing self-widening test)', () => {
     mockWorkspace.__customModesWorkspaceValue = [{ id: 'docs-only', name: 'Docs only', allowOnly: ['docs/'] }];
     const { backend, messages } = makePolicyBackend();
     const onConfigChange = lastConfigChangeListener();
@@ -8676,7 +8676,7 @@ describe('AcpBackend — SF-2 (T4b) §4.3 mitigation 2: onDidChangeConfiguration
     // The agent (or a bypass channel — terminal/execute_code/MCP) widens the
     // ON-DISK definition: the mode now allows EVERYTHING (no allowOnly).
     mockWorkspace.__customModesWorkspaceValue = [{ id: 'docs-only', name: 'Docs only' }];
-    onConfigChange({ affectsConfiguration: (s) => s === 'hermes.customModes' });
+    onConfigChange({ affectsConfiguration: (s) => s === 'talaria.customModes' });
 
     // The load-bearing assertion: the ENFORCED snapshot is the SAME OBJECT,
     // never replaced — a settings write cannot mutate a live session's floor.
@@ -8700,7 +8700,7 @@ describe('AcpBackend — SF-2 (T4b) §4.3 mitigation 2: onDidChangeConfiguration
     messages.length = 0;
     mockShowWarningMessage.mockClear();
 
-    onConfigChange({ affectsConfiguration: (s) => s === 'hermes.autocomplete.enabled' });
+    onConfigChange({ affectsConfiguration: (s) => s === 'talaria.autocomplete.enabled' });
 
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
     expect(messages.some((m) => m.type === 'mode.state')).toBe(false);
@@ -8711,7 +8711,7 @@ describe('AcpBackend — SF-2 (T4b) §4.3 mitigation 2: onDidChangeConfiguration
     const onConfigChange = lastConfigChangeListener();
     mockShowWarningMessage.mockClear();
 
-    onConfigChange({ affectsConfiguration: (s) => s === 'hermes.customModes' });
+    onConfigChange({ affectsConfiguration: (s) => s === 'talaria.customModes' });
 
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });

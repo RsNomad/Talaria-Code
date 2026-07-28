@@ -5,17 +5,17 @@ for you — the settings are yours, and this page is the map.
 
 | Role | Model setting | Endpoint | What it sends |
 |---|---|---|---|
-| **Autocomplete (FIM)** | `hermes.autocomplete.model` | `hermes.autocomplete.endpoint` | Raw fill-in-the-middle tokens |
-| **Next Edit — Generic via your FIM model** | **the same** `hermes.autocomplete.model` | **the same** `hermes.autocomplete.endpoint` | A ChatML instruction prompt |
-| **Next Edit — dedicated model** | `hermes.nextEdit.model` | `hermes.nextEdit.endpoint` | The sweep-v2 format |
+| **Autocomplete (FIM)** | `talaria.autocomplete.model` | `talaria.autocomplete.endpoint` | Raw fill-in-the-middle tokens |
+| **Next Edit — Generic via your FIM model** | **the same** `talaria.autocomplete.model` | **the same** `talaria.autocomplete.endpoint` | A ChatML instruction prompt |
+| **Next Edit — dedicated model** | `talaria.nextEdit.model` | `talaria.nextEdit.endpoint` | The sweep-v2 format |
 
 The two Next Edit role names above are the row labels you will see in the panel. They are **mutually
 exclusive** — turning one on while the other is on is refused.
 
 **There is no separate Generic model, by design.** Generic rides the FIM model on the FIM endpoint. The
-`hermes.nextEdit.backend` setting says so in its own description: *"Generic always uses the FIM model on
-`#hermes.autocomplete.endpoint#`, never this setting."* — and `hermes.nextEdit.endpoint`'s description says
-the same about the endpoint half. Setting `hermes.nextEdit.model` has no effect whatsoever on Generic.
+`talaria.nextEdit.backend` setting says so in its own description: *"Generic always uses the FIM model on
+`#talaria.autocomplete.endpoint#`, never this setting."* — and `talaria.nextEdit.endpoint`'s description says
+the same about the endpoint half. Setting `talaria.nextEdit.model` has no effect whatsoever on Generic.
 
 ## Where each of these lives — and it is two different places
 
@@ -25,7 +25,7 @@ This trips people up, so it is worth being blunt about:
   the way you edit any VS Code setting.
 - **The Next Edit on/off toggles are NOT `settings.json` settings and never will be.** They live in the
   extension's own **Settings panel**, under «Next Edit Suggestions». You will not find
-  `hermes.nextEdit.enabled` or `hermes.nextEdit.generic` in your settings file, because no such keys exist.
+  `talaria.nextEdit.enabled` or `talaria.nextEdit.generic` in your settings file, because no such keys exist.
 
 So: `settings.json` carries the DATA, the Settings panel carries the STATE. Nothing on this page asks you to
 turn a feature on by editing a settings file.
@@ -42,7 +42,7 @@ single model that is ideal for both.
 
 **Our recommendation: use a `-base` model.** The shipped default, `qwen2.5-coder:1.5b-base`, already is one,
 so if you have never touched the setting there is nothing to do. If you want the bigger model, set
-`hermes.autocomplete.model` to `qwen2.5-coder:7b-base` — see the warning below about the bare `:7b` tag.
+`talaria.autocomplete.model` to `qwen2.5-coder:7b-base` — see the warning below about the bare `:7b` tag.
 
 The reason is priority, not quality: autocomplete is **on by default** and runs while you type, while both
 Next Edit sources are **off by default**. The default should serve the always-on route.

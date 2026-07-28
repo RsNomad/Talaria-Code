@@ -20,7 +20,7 @@ vi.mock('vscode', () => {
     __folderValue: undefined,
     getConfiguration: () => ({
       inspect: (key: string) => {
-        if (key !== 'hermes.customModes') return undefined;
+        if (key !== 'talaria.customModes') return undefined;
         return {
           workspaceValue: workspace.__workspaceValue,
           workspaceFolderValue: workspace.__folderValue,
@@ -48,7 +48,7 @@ beforeEach(() => {
 });
 
 describe('readCustomModes — B10: reads the WORKSPACE value, never the merged/folder value', () => {
-  it('returns [] when hermes.customModes has no workspace value configured', () => {
+  it('returns [] when talaria.customModes has no workspace value configured', () => {
     expect(readCustomModes()).toEqual([]);
   });
 

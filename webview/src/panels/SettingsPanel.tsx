@@ -97,7 +97,7 @@ export const NEXT_EDIT_ROWS: ReadonlyArray<{
     source: 'next',
     label: 'Next Edit — dedicated model',
     description:
-      'Uses sweep-next-edit-v2-7B on its own endpoint (hermes.nextEdit.endpoint). No published benchmark score exists for this model. Mutually exclusive with Generic.',
+      'Uses sweep-next-edit-v2-7B on its own endpoint (talaria.nextEdit.endpoint). No published benchmark score exists for this model. Mutually exclusive with Generic.',
   },
   {
     source: 'generic',

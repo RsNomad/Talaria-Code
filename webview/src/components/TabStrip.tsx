@@ -160,7 +160,7 @@ export function TabStrip({ tabs, activeTabId, maxTabs, onSelect, onClose, onOpen
       {backendKind === 'mock' && (
         <span
           className="ml-auto flex-none"
-          title="MockBackend — set hermes.backend to 'acp' and trust this workspace to run the real agent."
+          title="MockBackend — set talaria.backend to 'acp' and trust this workspace to run the real agent."
         >
           <Pill tone="warn">Mock</Pill>
         </span>
