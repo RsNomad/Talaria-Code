@@ -2,7 +2,7 @@
 
 Owner: the build system + extension manifest. This documents how the two bundles
 are produced, how F5 works, and the dependency approach. Lane: repo-root config
-files + `.vscode/` + `media/hermes.svg` + this doc. Nothing under `src/**`,
+files + `.vscode/` + `media/talaria.svg` + this doc. Nothing under `src/**`,
 `webview/**`, or other agents' docs.
 
 ## Dependency approach — ONE INSTALL via npm WORKSPACES
@@ -104,7 +104,7 @@ tsconfig.json         typecheck config for src/**
 .vscode/tasks.json    build / watch (+ watch:host / watch:webview) tasks
 .vscodeignore         package contents (ship dist/ + media/ only)
 .gitignore            node_modules, dist, out, *.vsix
-media/hermes.svg      teal Hermes activity-bar glyph
+media/talaria.svg     teal Talaria activity-bar glyph
 README.md             what it is + install + F5
 docs/build-setup.md   this file
 ```

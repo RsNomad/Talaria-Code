@@ -223,7 +223,7 @@ export function activate(context: vscode.ExtensionContext): void {
     // click produced VS Code's "command 'hermes.openSettings' not found".
     // Locked by `src/host/commandParity.test.ts`.
     vscode.commands.registerCommand('hermes.openSettings', () =>
-      vscode.commands.executeCommand('workbench.action.openSettings', '@ext:syntinal.hermes-vscode'),
+      vscode.commands.executeCommand('workbench.action.openSettings', '@ext:syntinal.talaria-code'),
     ),
     vscode.commands.registerCommand('hermes.showLogs', () => output.show()),
   );
