@@ -1,6 +1,6 @@
-# Webview UI — Architecture (Agent B)
+# Webview UI — Architecture (webview layer)
 
-The in-panel React app for the Hermes VS Code extension: a streaming agent chat
+The in-panel React app for the Talaria Code extension: a streaming agent chat
 plus side panels to manage the agent. This doc covers the stack, component tree,
 message flow, and theming. Lane: `webview/**` + this file.
 
@@ -13,8 +13,8 @@ message flow, and theming. Lane: `webview/**` + this file.
   No Material Symbols, no external/CDN fonts.
 - **Build → `../dist/webview/`** (relative to `webview/`), a single JS bundle
   (`assets/webview.js`) + single CSS (`assets/index.css`). `base: './'` so every
-  asset URL is relative and rewritable by `asWebviewUri`. Agent C's root scripts
-  orchestrate this via the npm **workspace** (`"workspaces": ["webview"]`); run
+  asset URL is relative and rewritable by `asWebviewUri`. The build/manifest
+  layer's root scripts orchestrate this via the npm **workspace** (`"workspaces": ["webview"]`); run
   `npm run build` in `webview/` for a standalone build (`tsc --noEmit && vite build`).
 - **Runs on any OS with no Hermes process**: standalone (Vite dev or a plain
   browser) the app detects the absence of `acquireVsCodeApi` and drives itself
@@ -32,7 +32,7 @@ webview/
     ├── main.tsx               mounts App; imports codicons + theme + styles; wires mock
     ├── App.tsx                subscribes to bridge, reduces state, renders surface
     ├── bridge.ts              typed acquireVsCodeApi wrapper (+ standalone mock hookup)
-    ├── protocol.ts            LOCAL MIRROR of src/shared/protocol (Agent D = source of truth)
+    ├── protocol.ts            LOCAL MIRROR of src/shared/protocol (shared-contract layer = source of truth)
     ├── types.ts               view-model types + INITIAL_STATE
     ├── theme.css              brand tokens layered onto --vscode-* (light/dark/HC)
     ├── index.css              Tailwind layers + globals + telemetry label style
@@ -67,7 +67,7 @@ raise actions (per-hunk accept/reject, option pick) back up to `App`.
 
 ## Message flow
 
-One typed protocol (`protocol.ts`, mirroring Agent D's `src/shared/protocol.ts`).
+One typed protocol (`protocol.ts`, mirroring the shared-contract layer's `src/shared/protocol.ts`).
 `bridge` is the only thing that touches `postMessage` / `acquireVsCodeApi`.
 
 **host → webview** (folded by `state/transcript.ts` reducer):
@@ -96,7 +96,7 @@ after disposal (no `retainContextWhenHidden` needed).
 
 ## Theming
 
-`theme.css` defines Hermes brand tokens (`--h-*`) that **resolve to `--vscode-*`
+`theme.css` defines Talaria brand tokens (`--h-*`) that **resolve to `--vscode-*`
 theme variables** for all surfaces/text, and to **fixed brand hues** for the teal
 accent and diff/status colors. Tailwind's color + font scales point at these
 `--h-*` vars, so every utility stays theme-aware. Body-class overrides
@@ -108,7 +108,7 @@ fallbacks keep it legible with no host.
 Design language: an **instrument-cluster aesthetic** — monospace uppercase
 micro-labels (`h-eyebrow`, status `Pill`s) read like telemetry for an autonomous
 process; teal is the "live signal" color (streaming, active, agent voice) layered
-over the user's native theme so the panel reads as Hermes without fighting VS Code.
+over the user's native theme so the panel reads as Talaria without fighting VS Code.
 
 ## Responsiveness & quality floor
 
@@ -119,7 +119,7 @@ over the user's native theme so the panel reads as Hermes without fighting VS Co
 - Visible keyboard focus (`:focus-visible`), `role="switch"` toggles, reduced-motion
   honored (streaming pulses + mock timing collapse under `prefers-reduced-motion`).
 
-## Contract note for Agent D
+## Contract note
 
 `protocol.ts` is a thin local mirror so the webview builds before `src/shared`
 lands. The `type` string literals are the contract and are byte-identical to the

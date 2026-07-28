@@ -1,6 +1,6 @@
-# Where Hermes stores your API key (and what can go wrong on Linux)
+# Where Talaria Code stores your API key (and what can go wrong on Linux)
 
-Hermes stores the autocomplete API key in **VS Code's SecretStorage**, never in `settings.json`.
+Talaria Code stores the autocomplete API key in **VS Code's SecretStorage**, never in `settings.json`.
 
 ## How it actually works
 
@@ -10,7 +10,7 @@ keyring** — they are encrypted and written into VS Code's own SQLite state DB
 <https://code.visualstudio.com/docs/configure/settings-sync#_troubleshooting-keychain-issues>
 
 **If no keyring is available, VS Code silently falls back to in-memory storage.** Saving appears to succeed
-and the key works for the rest of the session — then it is gone when you quit. Hermes cannot detect this
+and the key works for the rest of the session — then it is gone when you quit. Talaria Code cannot detect this
 directly (no API exposes the storage mode), so it protects you a different way: **it keeps your old plaintext
 setting until it has seen the key survive a restart.**
 
@@ -37,10 +37,10 @@ setting until it has seen the key survive a restart.**
   understanding.
 - **A decryption failure deletes the secret.** If the encryption backend changes between sessions (keyring
   reset, switching `gnome-libsecret` ↔ `basic`, Flatpak permission changes), VS Code deletes the unreadable
-  secret rather than returning it. Re-enter the key with **Hermes: Set Autocomplete API Key**.
+  secret rather than returning it. Re-enter the key with **Talaria: Set Autocomplete API Key**.
 
-## Hermes does not inspect your system
+## Talaria Code does not inspect your system
 
-Hermes never reads `XDG_CURRENT_DESKTOP`, never runs `secret-tool` or `dbus-send`, never checks D-Bus, and
+Talaria Code never reads `XDG_CURRENT_DESKTOP`, never runs `secret-tool` or `dbus-send`, never checks D-Bus, and
 never edits `argv.json`. It only observes the outcomes of its own storage calls. Under Remote-SSH, probing
 would examine the wrong machine anyway.

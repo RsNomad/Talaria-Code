@@ -232,17 +232,17 @@
         {
           "command": "talaria.addToHermes",
           "when": "editorHasSelection && talaria.ready",
-          "group": "1_hermes@1"
+          "group": "1_talaria@1"
         },
         {
           "command": "talaria.explainWithHermes",
           "when": "editorHasSelection && talaria.ready",
-          "group": "1_hermes@2"
+          "group": "1_talaria@2"
         },
         {
           "command": "talaria.improveWithHermes",
           "when": "editorHasSelection && talaria.ready",
-          "group": "1_hermes@3"
+          "group": "1_talaria@3"
         }
       ]
     },

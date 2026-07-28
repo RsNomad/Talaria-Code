@@ -1,4 +1,4 @@
-# Host ↔ Webview Protocol — Contract (Agent D)
+# Host ↔ Webview Protocol — Contract
 
 The single, typed message contract between the extension host and the webview.
 Source of truth: [`src/shared/protocol.ts`](../src/shared/protocol.ts). Mock replay

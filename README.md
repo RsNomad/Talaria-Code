@@ -110,7 +110,7 @@ client). The ones you'll usually touch:
 | `talaria.rag.embedEndpoint` | `http://127.0.0.1:11434` | Embeddings backend base URL. |
 | `talaria.rag.embedModel` | `qwen3-embedding:0.6b` | Model used to embed code chunks. |
 
-The full set is available in the Settings UI (search `hermes`).
+The full set is available in the Settings UI (search `talaria`).
 
 ## How it works
 

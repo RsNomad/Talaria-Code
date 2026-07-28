@@ -21,9 +21,9 @@ Synthesized from the VS Code Extension API reference + Microsoft/VS Code docs (C
 
 ## Activation & contributions
 - **Contribute a view container + webview view**: `contributes.viewsContainers.activitybar` + `contributes.views.<container>` with `"type": "webview"`. VS Code auto-generates the `onView:<id>` activation event for contributed views, so **`activationEvents` can stay minimal/empty** — do NOT use `"*"`.
-- Keep activation lazy: the extension wakes when the Hermes view is opened.
+- Keep activation lazy: the extension wakes when the Talaria view is opened.
 - Register commands in `contributes.commands`; surface them in `contributes.menus` (e.g. `view/title` "New Session" with a codicon `$(add)`).
-- User settings go in `contributes.configuration` (read via `workspace.getConfiguration`), e.g. `hermes.pythonPath`, `hermes.cwd`.
+- User settings go in `contributes.configuration` (read via `workspace.getConfiguration`), e.g. `talaria.pythonPath`, `talaria.cwd`.
 
 ## Bundling
 - **Two bundles.** Host: esbuild → `dist/extension.js` (CommonJS, `external: ['vscode']`, `platform: node`). Webview: Vite (React) → `dist/webview/` (ES modules, single entry).

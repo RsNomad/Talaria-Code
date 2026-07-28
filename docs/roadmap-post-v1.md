@@ -1,4 +1,4 @@
-# Hermes VS Code — Post-v1 Roadmap («как / что / куда / зачем»)
+# Talaria Code — Post-v1 Roadmap («как / что / куда / зачем»)
 
 **Status:** planning doc for everything AFTER the v1 core. Not a start signal. Companion to `all-in-build-reference.md` (architecture) and `specs/wave-1.md` (what v1 built). Grounded in the neighbor feature-map (Cline/Roo/Kilo/Continue/Refact/ACP-client), the 3 review reports, and §05 Language Intelligence Bridge.
 
@@ -8,7 +8,7 @@ Core is built, green (259/259), hardening + packaging in flight:
 - **Autocomplete (FIM):** own `InlineCompletionItemProvider` + pluggable backend (Ollama/llama.cpp/vLLM/Codestral).
 - **RAG engine (built):** tree-sitter chunker + `/v1/embeddings` + LanceDB hybrid + stdio MCP `codebase_search`.
 - **Control transport (tui_gateway):** `ControlChannel` (spawn + `gateway.ready` + dispatch + events).
-- **Rails:** backend swap (`hermes.backend` mock↔acp), Workspace-Trust hardening, per-platform packaging.
+- **Rails:** backend swap (`talaria.backend` mock↔acp), Workspace-Trust hardening, per-platform packaging.
 
 **Channel legend:** **ACP** = Hermes already streams it, just render · **tui_gw** = control-plane RPC · **BUILD** = our work on VS Code APIs · **ENGINE** = needs a model/index backend.
 

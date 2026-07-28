@@ -1,6 +1,6 @@
 # Packaging (per-platform `.vsix`)
 
-**P0 constraint (architecture-review.md GZ1):** Hermes ships a native module,
+**P0 constraint (architecture-review.md GZ1):** Talaria Code ships a native module,
 `@lancedb/lancedb` (napi-rs / N-API). LanceDB distributes one prebuilt binary
 package *per OS+arch+libc* as an `optionalDependency`:
 

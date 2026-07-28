@@ -114,7 +114,7 @@ code --install-extension talaria-code-*.vsix
 | `talaria.rag.embedEndpoint` | `http://127.0.0.1:11434` | Базовый URL бэкенда эмбеддингов. |
 | `talaria.rag.embedModel` | `qwen3-embedding:0.6b` | Модель для эмбеддинга фрагментов кода. |
 
-Полный набор — в UI настроек (поиск по `hermes`).
+Полный набор — в UI настроек (поиск по `talaria`).
 
 ## Как это устроено
 

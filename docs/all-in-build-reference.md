@@ -1,4 +1,4 @@
-# Hermes VS Code Extension — All-In Build Reference (справочник)
+# Talaria Code — All-In Build Reference (справочник)
 
 **Status:** REFERENCE for the full "all-in" extension. This is NOT a start signal — do not dispatch build agents until the user explicitly says "go". Consolidates everything discussed so future work is a lookup, not a re-derivation.
 
@@ -9,7 +9,7 @@
 ## 1. Architecture (the rails — already scaffolded)
 ```
 VS Code extension host (Node/TS)                 webview (React+Vite+Tailwind)
-  AgentBackend (swappable via `hermes.backend`)     one typed protocol
+  AgentBackend (swappable via `talaria.backend`)     one typed protocol
     ├─ MockBackend      (default; canned; dev)       (src/shared/protocol.ts,
     ├─ AcpBackend       → spawn `hermes acp`           mirrored in webview)
     └─ ControlChannel   → spawn `python -m tui_gateway.entry`
@@ -85,7 +85,7 @@ Omni-channel messaging (Telegram/Slack/Discord rendering — Hermes-as-service; 
 
 ## 9. Gates / prerequisites
 - **Hermes installed on Fedora and `hermes acp` runs** (Phase 1 gate). — pending, user will install.
-- **Inference runner reachable** (powers autocomplete + RAG): inference runs on a **remote runner node** (Ollama / llama.cpp / vLLM), reached over HTTP at a **configurable endpoint** (`hermes.inference.endpoint`) — NOT local, NOT bundled in the extension. Pull there: `qwen2.5-coder:1.5b-base` (FIM) + `qwen3-embedding:0.6b` (embedder; fallback `nomic-embed-text`). **One node serves both** FIM completion and RAG embeddings. Runner API contracts pinned from source in `research/vscode-hermes/runner-apis-howto.md` (clones under `/Runners`).
+- **Inference runner reachable** (powers autocomplete + RAG): inference runs on a **remote runner node** (Ollama / llama.cpp / vLLM), reached over HTTP at a **configurable endpoint** (`talaria.inference.endpoint`) — NOT local, NOT bundled in the extension. Pull there: `qwen2.5-coder:1.5b-base` (FIM) + `qwen3-embedding:0.6b` (embedder; fallback `nomic-embed-text`). **One node serves both** FIM completion and RAG embeddings. Runner API contracts pinned from source in `research/vscode-hermes/runner-apis-howto.md` (clones under `/Runners`).
 - **Topology (corrected): agent stack is LOCAL, only models are REMOTE.** Hermes harness + its tools + its MCP + our extension + our MCP (`codebase_search`) + the vector index + the repo all live on the dev machine. The **single network hop is inference HTTP** (FIM prefix/suffix + embeddings) to the remote runner. No tunnelling — MCP/index/LSP/git are co-located with the local agent.
 
 ## 10. Decisions (resolved 2026-07-11)
@@ -98,7 +98,7 @@ Omni-channel messaging (Telegram/Slack/Discord rendering — Hermes-as-service; 
 Full how-to (grounded, with exact FIM tokens + endpoint bodies): `research/vscode-hermes/autocomplete-fim-howto.md`.
 
 - **What it is:** a fast, small-model **fill-in-the-middle** ghost-text loop — a **separate subsystem from the Hermes ACP agent** (the agent is too slow/agentic for keystroke latency). Native hook: `vscode.languages.registerInlineCompletionItemProvider`.
-- **Architecture:** own a **thin `InlineCompletionItemProvider`** over an IDE-agnostic `FimEngine`, with a **pluggable `FimBackend`** (`ollama` | `llamacpp` | `codestral` | `openai-compat` | `tabby`). Do **NOT** adopt TabbyML wholesale — it ships its own `tabby-agent` LSP + client UX + Rust server that duplicate/compete with Hermes's identity; keep Tabby as *one optional backend* pointed at its `POST /v1/completions`. Mirrors Continue.dev's split (core engine + thin VS Code adapter).
+- **Architecture:** own a **thin `InlineCompletionItemProvider`** over an IDE-agnostic `FimEngine`, with a **pluggable `FimBackend`** (`ollama` | `llamacpp` | `codestral` | `openai-compat` | `tabby`). Do **NOT** adopt TabbyML wholesale — it ships its own `tabby-agent` LSP + client UX + Rust server that duplicate/compete with Talaria's identity; keep Tabby as *one optional backend* pointed at its `POST /v1/completions`. Mirrors Continue.dev's split (core engine + thin VS Code adapter).
 - **v1 backend:** `qwen2.5-coder:1.5b-base` (or `3b`) via **Ollama `POST /api/generate`** with `{prompt: prefix, suffix, keep_alive:"30m", stream:true}` — Ollama applies the model's FIM template server-side, so we send **raw** prefix/suffix. `llama.cpp /infill` (`input_extra`) is the cross-file upgrade; Codestral `/v1/fim/completions` is the optional cloud-quality backend.
 - **FIM tokens (Qwen2.5-Coder):** `<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>` + repo-level `<|repo_name|>`/`<|file_sep|>` for cross-file; send those as **stop tokens**.
 - **`InferenceBackend` = 3 real FIM branches (source-grounded, `research/vscode-hermes/runner-apis-howto.md`):** **Ollama** → `/api/generate` (or `/v1/completions`) with `suffix`, server-side FIM template (avoid `raw:true` — it disables suffix-FIM); **llama.cpp** → `/infill` only (`input_prefix`/`input_suffix`; its `/v1/completions` *rejects* `suffix`); **vLLM** → **no server-side FIM** (`suffix` silently ignored, no `/infill`) → we **hand-build** `<|fim_prefix|>…<|fim_suffix|>…<|fim_middle|>` and POST as plain `prompt` to `/v1/completions` (needs a per-model FIM-token table). Ports: Ollama `11434` / llama.cpp `8080` / vLLM `8000`, auth optional.
@@ -110,10 +110,10 @@ Full how-to (grounded, with exact FIM tokens + endpoint bodies): `research/vscod
 
 ### 11.1 Alternatives considered + upgrade ladder
 Five architecture options were weighed; **A won** (it's what §11 describes):
-- **A — own thin provider + pluggable local FIM backend** ✅ best: control, Hermes identity, local/offline; B & E slot in as *backends/upgrades*, not replacements.
+- **A — own thin provider + pluggable local FIM backend** ✅ best: control, Talaria identity, local/offline; B & E slot in as *backends/upgrades*, not replacements.
 - **B — adopt a self-hosted engine wholesale** (Tabby server, or Refact's single-binary `refact-lsp` with built-in AST+VecDB RAG) ⚠️ → keep as an *optional backend*, not the whole engine (a 2nd brain competes with Hermes; heavy server).
 - **C — fork an OSS engine as a library** (Continue `core/autocomplete`) ⚠️ → borrow ideas, not the codebase.
-- **D — don't build; coexist with Twinny / llama.vscode** ❌ → breaks the "one complete extension / Hermes identity" thesis (double UI).
+- **D — don't build; coexist with Twinny / llama.vscode** ❌ → breaks the "one complete extension / Talaria identity" thesis (double UI).
 - **E — next-edit instead of FIM** (Continue **Instinct** 7B open; Zed **Zeta-2** Apache-2.0) 🔮 → v3 stretch: the real quality lever, but needs a specialist model + richer rendering the InlineCompletion API only partly supports.
 
 **Upgrade ladder:** FIM (v1, qwen2.5-coder:1.5b via Ollama) → cross-file context (llama.cpp `/infill` **or** Refact-style AST+VecDB) → next-edit (Instinct/Zeta) in v3.

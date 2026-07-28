@@ -1,6 +1,6 @@
 # Next Edit Suggestions
 
-**Next Edit Suggestions** is an opt-in layer on top of Hermes autocomplete. Where
+**Next Edit Suggestions** is an opt-in layer on top of Talaria's autocomplete. Where
 FIM (fill-in-the-middle) completes the current line, Next Edit looks at the
 small region around your cursor — about ten lines above and ten lines below —
 and proposes a rewrite of that region: fixing up a variable you renamed
@@ -32,7 +32,7 @@ model. If you want a bigger model, set `talaria.autocomplete.model` to
 `qwen2.5-coder:7b-base` — **not** `qwen2.5-coder:7b`. On Ollama the bare
 `:7b` tag is the *instruct* build (same digest as `:7b-instruct` and
 `:latest`), and instruction tuning costs infilling quality, which is exactly
-what autocomplete does. Hermes cannot warn you about this: its known-model
+what autocomplete does. Talaria Code cannot warn you about this: its known-model
 check matches on "qwen" and "coder", so `:7b` looks recognised and the
 degradation is silent. The measured gap between `1.5b-base` and `7b-base` on
 infilling benchmarks is small (roughly 3 points), so the bigger model is a
@@ -70,11 +70,11 @@ the same as any other edit.
 
 ## Turning it on
 
-**The NEXT and Generic switches live in Hermes's own Settings panel inside the
+**The NEXT and Generic switches live in Talaria's own Settings panel inside the
 editor — they are not VS Code settings, and they are not something you edit in
 `settings.json`.** `settings.json` only ever carries *data* for Next Edit
 (which endpoint, which model, which backend) — never the on/off state. Open
-the Hermes Settings panel and use the two rows under **"Next Edit
+the Talaria Settings panel and use the two rows under **"Next Edit
 Suggestions"**:
 
 - **Next Edit — dedicated model** (the NEXT source)
@@ -90,7 +90,7 @@ Two rules the panel enforces, both worth knowing before you rely on them:
 2. **A conflicting saved state is never honored.** If Next Edit's internal
    state is ever found holding *both* sources on at startup — for example
    because of a bug, or because someone edited the extension's stored state by
-   hand outside the Settings panel — Hermes does not try to reconcile it. It
+   hand outside the Settings panel — Talaria Code does not try to reconcile it. It
    resets **both sources to off**, saves that reset, and shows a one-time
    notice. You'll need to re-enable whichever source you actually want from
    the Settings panel.
@@ -98,7 +98,7 @@ Two rules the panel enforces, both worth knowing before you rely on them:
 **NEXT needs `talaria.nextEdit.model` set by hand — nothing in the panel does
 it for you.** The switch only turns the source on; it does not pick a model.
 If you flip NEXT on without having set `talaria.nextEdit.model`, the first
-time Next Edit would otherwise try to build a suggestion, Hermes shows a
+time Next Edit would otherwise try to build a suggestion, Talaria Code shows a
 one-time warning telling you to set `talaria.nextEdit.model` (for example to
 `sweep-next-edit-v2-7B`), together with `talaria.nextEdit.endpoint` if your
 model isn't on the default port. Until you set it, NEXT stays on but never
@@ -145,7 +145,7 @@ model here: Generic sends its requests to your existing
 `talaria.autocomplete.endpoint`, using your existing `talaria.autocomplete.model`
 — it just asks that same model a differently-shaped question (an instruction
 prompt) to emulate a next-edit rewrite. The moment you accept the Generic
-toggle, Hermes shows a one-time setup note explaining the recipe below — it
+toggle, Talaria Code shows a one-time setup note explaining the recipe below — it
 does not appear again after that.
 
 **Check which model that actually is before you judge the results.** Open
@@ -195,7 +195,7 @@ sudo systemctl restart ollama
 GPU's VRAM, and below 23 GiB of VRAM that auto-sized default is **4096
 tokens**. Generic's prompt — the whole recent-changes history plus the file
 content it sends — measures roughly **6,000 tokens** (vendor-reported,
-±2,500). That doesn't fit in a 4096-token window. Hermes has no way to detect
+±2,500). That doesn't fit in a 4096-token window. Talaria Code has no way to detect
 this from the client side, so nothing stops the request from going out — it
 just gets silently truncated on the server before the model ever sees the
 whole thing, and you get a plausible-looking but quietly-wrong suggestion,
@@ -204,14 +204,14 @@ the server's default so both your FIM requests and Generic's requests fit
 comfortably.
 
 **Why raising the shared default is safe, and doesn't cause reload churn.**
-Hermes never sends a per-request context size on any next-edit or FIM
+Talaria Code never sends a per-request context size on any next-edit or FIM
 request — there is no code path anywhere in the extension that sends a
 context-window override. Both your FIM requests and Generic's requests are
 always "auto" as far as Ollama is concerned. Ollama only has to reload a
 model when two callers ask for genuinely *different* context configurations —
 which does not happen here, because both callers are auto and therefore
 resolve to the *same* value. (The case that WOULD cause repeated reloads is
-one caller sending an explicit context size while another sends auto — Hermes
+one caller sending an explicit context size while another sends auto — Talaria Code
 never does that itself, so switching between FIM and Generic on the same
 model doesn't thrash the server.) Raising `OLLAMA_CONTEXT_LENGTH` just raises
 the one shared number both sides land on.
@@ -234,7 +234,7 @@ model repeatedly evicted and reloaded just from switching between typing
 
 If `talaria.nextEdit.endpoint` or `talaria.autocomplete.endpoint` points at a
 machine other than your own (a GPU box on your LAN, say) **and** you've
-configured an API key for it, Hermes refuses to send that key over plain
+configured an API key for it, Talaria Code refuses to send that key over plain
 `http://` to a non-local host — sending a credential in cleartext across a
 real network is exactly the mistake this check exists to stop. You have two
 ways around it: terminate TLS on the remote box so the endpoint is `https://`,
@@ -244,10 +244,10 @@ A local, loopback endpoint with no API key is never affected by this check.
 
 ## What Next Edit deliberately does not do
 
-Hermes never measures your GPU's VRAM, never detects what hardware you're
+Talaria Code never measures your GPU's VRAM, never detects what hardware you're
 running, and never checks whether a model actually fits before sending a
 request. Sizing your setup — which model, which context length, whether NEXT
 and Generic can coexist on the same card as your FIM model — is entirely on
 you. The `OLLAMA_CONTEXT_LENGTH` recipe above and the one-time setup note are
-the only help Hermes offers here; nothing in the extension inspects your
+the only help Talaria Code offers here; nothing in the extension inspects your
 server or your hardware to do this automatically.

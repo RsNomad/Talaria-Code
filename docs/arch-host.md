@@ -1,17 +1,17 @@
-# Host Architecture (Agent A — extension host layer)
+# Host Architecture (extension host layer)
 
-The extension-host half of the Hermes VS Code extension: `src/extension.ts` +
+The extension-host half of the Talaria Code extension: `src/extension.ts` +
 `src/host/**`. It owns activation, the webview bridge, the backend abstraction,
 the stdio transport, and Linux-first runtime resolution. It does **not** touch
-`package.json` (Agent C), `src/shared/**` (Agent D — the protocol contract), or
-`webview/**` (Agent B — the React UI).
+`package.json` (build/manifest layer), `src/shared/**` (the protocol contract), or
+`webview/**` (the React UI).
 
 ## Layer map
 
 ```
 extension.ts                      activate(): pick backend, register view + command
 └─ host/
-   ├─ HermesViewProvider.ts       WebviewViewProvider: CSP+nonce HTML, dumb message pipe
+   ├─ TalariaViewProvider.ts      WebviewViewProvider: CSP+nonce HTML, dumb message pipe
    ├─ backend/
    │  ├─ AgentBackend.ts          THE seam — interface every backend implements
    │  ├─ MockBackend.ts           DEFAULT — replays mockScenario, no process/network
@@ -30,7 +30,7 @@ extension.ts                      activate(): pick backend, register view + comm
 ## Data flow (both directions are one hop)
 
 ```
-webview ──postMessage──► HermesViewProvider ──method call──► AgentBackend
+webview ──postMessage──► TalariaViewProvider ──method call──► AgentBackend
         ◄─postMessage──                     ◄──onMessage event──
 ```
 
@@ -68,7 +68,7 @@ Both backends share one rule for side panels: panel data is **pushed** as a
 panels behave identically whether the data came from `mockScenario` or a live
 tui_gateway RPC.
 
-## Contract dependencies (Agent D — `src/shared/*`)
+## Contract dependencies (`src/shared/*`)
 
 This layer imports **types by name** and does not define them. Required exports:
 
@@ -134,7 +134,7 @@ One primitive for **both** future channels (spec §2): spawn a child, frame
 newline-delimited JSON on `\n` (buffering partial lines), correlate `request()`
 by `id`, `notify()` fire-and-forget, fan out `event`/notification frames via
 `onEvent()`, `dispose()` = SIGTERM → SIGKILL after 5s. stdout is protocol-only;
-stderr + a send/recv **traffic tap** go to a `Logger` (the "Hermes" output
+stderr + a send/recv **traffic tap** go to a `Logger` (the "Talaria Code" output
 channel). Per-request timeout defaults to 120s (long turns). It has **no
 `vscode` dependency** so it is reusable and testable.
 
@@ -152,7 +152,7 @@ real; only the OS lookup is stubbed:
   escaped.
 - `resolveHermes(config)` → `{ hermesBin, python, cwd, acp, control }` where
   `acp` = login-shell `hermes acp` and `control` = login-shell
-  `python -m tui_gateway.entry`. `resolveHermesBin` honours a `hermes.pythonPath`
+  `python -m tui_gateway.entry`. `resolveHermesBin` honours a `talaria.pythonPath`
   / explicit-path override; otherwise it would run `command -v hermes` inside the
   login shell (the exact command is built; the exec is `notImplemented()` until
   Fedora wiring).
@@ -182,9 +182,9 @@ JSDoc, so filling them in is fill-in-the-blanks, not redesign:
    …). `invokeControl` is a thin passthrough to `dispatch`; results are emitted
    as `panel.data`. Crash-respawn and WS-attach mode
    (`HERMES_TUI_GATEWAY_URL`) swap only the transport.
-5. **Config** — read `hermes.pythonPath` / `hermes.cwd` via
+5. **Config** — read `talaria.pythonPath` / `talaria.cwd` via
    `workspace.getConfiguration` into `HermesRuntimeConfig` and pass to the
-   backend constructor. (Settings themselves are contributed by Agent C.)
+   backend constructor. (Settings themselves are contributed by the build/manifest layer.)
 
 Golden rule preserved throughout: **Hermes owns the filesystem**; the editor is a
 viewer/approver of diffs, never the FS writer (spec §0).

@@ -1,9 +1,9 @@
-# Build Setup & DevX (Agent C)
+# Build Setup & DevX (build/manifest layer)
 
 Owner: the build system + extension manifest. This documents how the two bundles
 are produced, how F5 works, and the dependency approach. Lane: repo-root config
 files + `.vscode/` + `media/talaria.svg` + this doc. Nothing under `src/**`,
-`webview/**`, or other agents' docs.
+`webview/**`, or the other layers' docs.
 
 ## Dependency approach — ONE INSTALL via npm WORKSPACES
 
@@ -14,7 +14,7 @@ non-overlapping dependency lists.
 - Root `package.json` declares `"workspaces": ["webview"]` and holds only the
   **host tooling**: `esbuild`, `typescript`, `@types/vscode`, `@types/node`,
   `@vscode/vsce`, `concurrently`.
-- `webview/package.json` (owned by Agent B) holds the **webview stack**:
+- `webview/package.json` (owned by the webview layer) holds the **webview stack**:
   `vite`, `@vitejs/plugin-react`, `react`, `react-dom`, `@types/react(-dom)`,
   `tailwindcss`, `postcss`, `autoprefixer`, `@vscode/codicons`.
 - `npm install` at the root installs both (webview deps hoist into the root
@@ -22,9 +22,9 @@ non-overlapping dependency lists.
   npm puts the root `node_modules/.bin` on PATH so `vite` resolves.
 
 Why workspaces (not one flat root `package.json`, and not two separate
-installs): Agent B had already authored a self-contained `webview/package.json`.
+installs): the webview layer had already authored a self-contained `webview/package.json`.
 Workspaces honor that split **and** still deliver the "one `npm install`" DevX
-goal — no duplicate lockfiles, no per-package install step, no forcing Agent B
+goal — no duplicate lockfiles, no per-package install step, no forcing the webview layer
 to delete their manifest. This is the single documented approach for the repo.
 
 What this pins for the **webview** (already true on disk — do not change):
@@ -32,7 +32,7 @@ What this pins for the **webview** (already true on disk — do not change):
   `tailwind.config.js` + `postcss.config.js` — not the v4 `@tailwindcss/*` path.
 - `vite.config.ts`: `build.outDir: '../dist/webview'`, `emptyOutDir: true`,
   `base: './'` so assets load through `asWebviewUri` (relative URLs).
-- If webview deps change, edit `webview/package.json` (Agent B's lane), not root.
+- If webview deps change, edit `webview/package.json` (the webview lane), not root.
 
 ## The two bundles
 
@@ -43,18 +43,18 @@ What this pins for the **webview** (already true on disk — do not change):
 - `--watch`: esbuild context watch; prints `[watch] build started/finished`
   markers consumed by the `tasks.json` background problem matcher.
 
-### Webview — Vite (`webview/`, owned by Agent B)
+### Webview — Vite (`webview/`, webview layer)
 - `npm run build:webview` runs `cd webview && vite build`.
 - Outputs ES modules + CSS to `dist/webview/` (single entry).
 - The host loads them via `webview.asWebviewUri`, with `localResourceRoots`
   pointing at `dist/` and `media/`, under a strict CSP + per-load nonce
-  (Agent A's host code).
+  (the host layer's code).
 
 ## Shared protocol path
 
-`src/shared/protocol.ts` (owned by Agent D) is the source of truth.
+`src/shared/protocol.ts` (owned by the shared-contract layer) is the source of truth.
 - Host: `import { ... } from './shared/protocol'` (bundled by esbuild).
-- Webview: currently uses a **local mirror** `webview/src/protocol.ts` (Agent B)
+- Webview: currently uses a **local mirror** `webview/src/protocol.ts` (webview layer)
   so the webview builds independently during parallel scaffolding. Its header
   notes it must stay byte-identical to the shared module and should later become
   a re-export (`export * from '../../src/shared/protocol'`), which Vite bundles
@@ -76,10 +76,10 @@ transpiling; `tsc --noEmit` (`npm run check-types`) is the type gate.
 3. `preLaunchTask: "npm: build"` builds both bundles into `dist/`.
 4. VS Code opens the **Extension Development Host** with
    `--extensionDevelopmentPath=${workspaceFolder}`.
-5. `activationEvents: []` + the contributed `hermes.panel` webview view →
-   VS Code auto-generates `onView:hermes.panel`; opening the Hermes Activity Bar
-   container activates the extension lazily.
-6. The panel renders the webview with **mock data** — `hermes.backend` defaults
+5. `activationEvents: []` + the contributed `talaria.panel` webview view →
+   VS Code auto-generates `onView:talaria.panel`; opening the Talaria Code
+   Activity Bar container activates the extension lazily.
+6. The panel renders the webview with **mock data** — `talaria.backend` defaults
    to `mock`, so **no process is spawned**. Works on any OS, Windows included.
 
 For live reload use **"Run Extension (watch)"** → `preLaunchTask: "npm: watch"`

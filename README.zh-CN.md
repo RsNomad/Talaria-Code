@@ -99,7 +99,7 @@ code --install-extension talaria-code-*.vsix
 | `talaria.rag.embedEndpoint` | `http://127.0.0.1:11434` | 嵌入后端的基础 URL。 |
 | `talaria.rag.embedModel` | `qwen3-embedding:0.6b` | 用于嵌入代码片段的模型。 |
 
-完整设置见设置界面（搜索 `hermes`）。
+完整设置见设置界面（搜索 `talaria`）。
 
 ## 工作原理
 

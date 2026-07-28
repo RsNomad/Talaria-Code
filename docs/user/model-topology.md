@@ -1,6 +1,6 @@
 # Which model does what: three roles, two settings
 
-Hermes has **three** model roles but only **two** model settings. Nothing detects, measures, or manages this
+Talaria Code has **three** model roles but only **two** model settings. Nothing detects, measures, or manages this
 for you — the settings are yours, and this page is the map.
 
 | Role | Model setting | Endpoint | What it sends |
