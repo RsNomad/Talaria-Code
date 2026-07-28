@@ -570,7 +570,7 @@ export class HermesViewProvider implements vscode.WebviewViewProvider {
 
   /**
    * W2 T4 (F-D, §3.5): open the read-only editor diff preview for a PENDING
-   * edit approval. Both sides are `hermes-diff:` virtual documents — content
+   * edit approval. Both sides are `talaria-diff:` virtual documents — content
    * is served entirely by `DiffPreviewProvider` off the host-only
    * `EditPreviewRegistry` (never a file read); the REAL file is never a diff
    * side. `vscode.diff`'s title makes the pending/preview nature explicit so

@@ -212,12 +212,12 @@
       "editor/title": [
         {
           "command": "hermes.acceptDiff",
-          "when": "resourceScheme == hermes-diff",
+          "when": "resourceScheme == talaria-diff",
           "group": "navigation@1"
         },
         {
           "command": "hermes.rejectDiff",
-          "when": "resourceScheme == hermes-diff",
+          "when": "resourceScheme == talaria-diff",
           "group": "navigation@2"
         }
       ],

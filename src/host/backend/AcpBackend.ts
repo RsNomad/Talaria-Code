@@ -929,7 +929,7 @@ export class AcpBackend implements AgentBackend {
 
   /**
    * W2 T4 (F-D, §3.5): the diff-preview editor's Accept button. Session-scoped
-   * (W4-T3b review I-1): the `hermes-diff:` tab URI carries the OWNING
+   * (W4-T3b review I-1): the `talaria-diff:` tab URI carries the OWNING
    * `sessionId` (`parseDiffUri`), so route to THAT controller — never the
    * ambient `activeController()`, which under multi-tab is the last session to
    * act, NOT the tab the diff belongs to (a mismatch would hang session A's

@@ -26,7 +26,7 @@ import { registerEditorActions } from './host/commands/editorActions.vscode';
 import { HermesCodeActionProvider } from './host/commands/HermesCodeActionProvider';
 import { registerDiffDecisionCommands } from './host/commands/diffDecision.vscode';
 import { EditPreviewRegistry } from './host/preview/EditPreviewRegistry';
-import { DiffPreviewProvider, HERMES_DIFF_SCHEME } from './host/preview/DiffPreviewProvider';
+import { DiffPreviewProvider, TALARIA_DIFF_SCHEME } from './host/preview/DiffPreviewProvider';
 import { registerGenerateCommitMessageCommand } from './host/scm/generateCommitCommand.vscode';
 
 /**
@@ -229,7 +229,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // ── W2 T4 (F-D, §3.5): read-only proposed-edit diff preview ──────────────
-  // The `hermes-diff:` virtual-document provider + its editor-title Accept/
+  // The `talaria-diff:` virtual-document provider + its editor-title Accept/
   // Reject commands. Registered ONCE, unconditionally (never gated behind
   // trust/`hermes.ready` like the editor actions below) — both are inert
   // until a `diff.open` actually fires, which only ever happens from a LIVE
@@ -240,7 +240,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const diffPreviewProvider = new DiffPreviewProvider(editPreviewRegistry);
   context.subscriptions.push(diffPreviewProvider);
   context.subscriptions.push(
-    vscode.workspace.registerTextDocumentContentProvider(HERMES_DIFF_SCHEME, diffPreviewProvider),
+    vscode.workspace.registerTextDocumentContentProvider(TALARIA_DIFF_SCHEME, diffPreviewProvider),
   );
   // `getBackend` is a thunk (not a snapshot) so the trust-upgrade mock→real
   // swap below (which reassigns the outer `backend` binding) is reflected at

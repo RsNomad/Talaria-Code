@@ -1,6 +1,6 @@
 /**
  * W2 T4 — F-D proposed-edit diff preview (§3.5): the host-only, ask-path-scoped
- * store the `hermes-diff:` virtual-document provider reads from.
+ * store the `talaria-diff:` virtual-document provider reads from.
  *
  * SECURITY (§7 B7 — the load-bearing invariant of this whole feature): this
  * registry is the ONLY content source `DiffPreviewProvider` may ever consult.
@@ -28,7 +28,7 @@
  * every controller). A `toolCallId` collision across two DIFFERENT sessions
  * — plausible, since each session's own ACP-side id scheme is independent —
  * would otherwise cross-wire one session's pending diff preview into
- * another's `hermes-diff:` document. The compound key removes that
+ * another's `talaria-diff:` document. The compound key removes that
  * collision class unconditionally, without waiting on a probe.
  *
  * Deliberately `vscode`-FREE (no `vscode.EventEmitter`) so it's headless
@@ -51,7 +51,7 @@ interface PreviewEntry {
   files: PreviewFile[];
 }
 
-/** A file's before/after texts, as served to the `hermes-diff:` provider. */
+/** A file's before/after texts, as served to the `talaria-diff:` provider. */
 export interface PreviewFileTexts {
   oldText?: string | null;
   newText: string;

@@ -41,7 +41,7 @@ vi.mock('vscode', () => {
     ColorThemeKind: { Light: 1, Dark: 2, HighContrast: 3, HighContrastLight: 4 },
     Uri: {
       joinPath: (...parts: unknown[]) => ({ parts }),
-      // W2 T4 (F-D): `HermesViewProvider.diff.open` builds `hermes-diff:` URIs
+      // W2 T4 (F-D): `HermesViewProvider.diff.open` builds `talaria-diff:` URIs
       // via `Uri.from({scheme, authority, path})` — a minimal structural
       // stand-in good enough for assertions on the parts it was called with.
       from: (components: { scheme: string; authority?: string; path?: string }) => ({ ...components }),
@@ -719,7 +719,7 @@ describe('HermesViewProvider — W2 T3: seedComposer (§2e pending-seed latch)',
 });
 
 describe('HermesViewProvider — W2 T4 F-D: diff.open routing', () => {
-  it('opens both hermes-diff: virtual sides via vscode.diff, titled as a pending-approval preview', () => {
+  it('opens both talaria-diff: virtual sides via vscode.diff, titled as a pending-approval preview', () => {
     const executeCommand = vi.mocked(vscode.commands.executeCommand);
     executeCommand.mockClear();
     const { provider } = makeProviderWith(makeFakeBackend());
@@ -733,8 +733,8 @@ describe('HermesViewProvider — W2 T4 F-D: diff.open routing', () => {
 
     expect(executeCommand).toHaveBeenCalledWith(
       'vscode.diff',
-      expect.objectContaining({ scheme: 'hermes-diff', authority: 'before', path: '/session-1/tool-1/src/a.ts' }),
-      expect.objectContaining({ scheme: 'hermes-diff', authority: 'after', path: '/session-1/tool-1/src/a.ts' }),
+      expect.objectContaining({ scheme: 'talaria-diff', authority: 'before', path: '/session-1/tool-1/src/a.ts' }),
+      expect.objectContaining({ scheme: 'talaria-diff', authority: 'after', path: '/session-1/tool-1/src/a.ts' }),
       'a.ts (proposed by Talaria — pending approval)',
       { preview: true },
     );

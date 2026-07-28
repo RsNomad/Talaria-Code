@@ -1499,7 +1499,7 @@ export type WebviewToHost =
 
   /**
    * W2 F-D: open the read-only editor diff preview for a PENDING edit
-   * approval (the `hermes-diff:` virtual-document scheme). Origin: §2e.
+   * approval (the `talaria-diff:` virtual-document scheme). Origin: §2e.
    * W4-T3b (T1b carry — Q-9/R7, resolves the S0 TODO): carries `sessionId`
    * — `EditPreviewRegistry` is now keyed `(sessionId, toolCallId)` (a single
    * shared instance across every session's port), so disambiguating a

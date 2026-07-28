@@ -1,6 +1,6 @@
 /**
  * W2 T4 — F-D (§3.5): the pure half of the editor-title Accept/Reject
- * commands — resolving WHICH pending edit-approval a `hermes-diff:` diff tab
+ * commands — resolving WHICH pending edit-approval a `talaria-diff:` diff tab
  * belongs to. The vscode-touching shell (`instanceof TabInputTextDiff`
  * narrowing, command registration, `tabGroups` closing) lives in
  * `diffDecision.vscode.ts`, mirroring `editorActions.ts`/`editorActions.vscode.ts`'s
@@ -14,7 +14,7 @@ export interface DiffTabInputLike {
   modified?: DiffUriLike;
 }
 
-/** The `(sessionId, toolId)` compound a `hermes-diff:` diff tab's URIs
+/** The `(sessionId, toolId)` compound a `talaria-diff:` diff tab's URIs
  * encode (W4-T3b — the URI now carries `sessionId` too, since
  * `EditPreviewRegistry`/`AcpBackend.resolveDiff` are both session-scoped). */
 export interface DiffTabIdentity {
@@ -23,7 +23,7 @@ export interface DiffTabIdentity {
 }
 
 /**
- * The `(sessionId, toolId)` a diff tab's `hermes-diff:` URIs encode, or
+ * The `(sessionId, toolId)` a diff tab's `talaria-diff:` URIs encode, or
  * `undefined` when the tab isn't one of ours (an ordinary file-compare tab,
  * missing input) — or, defensively, when the two sides disagree (a shape
  * neither `HermesViewProvider.openDiffPreview` nor `DiffPreviewProvider`
@@ -36,7 +36,7 @@ export interface DiffTabIdentity {
  * `AcpBackend.resolveDiff`/`acceptWholeFileDiff` are session-scoped, and the
  * editor-title Accept/Reject commands have no OTHER session-identity source
  * of their own (they resolve off the active EDITOR TAB, not a chat tab) — so
- * the sessionId embedded in the tab's OWN `hermes-diff:` URI is the correct,
+ * the sessionId embedded in the tab's OWN `talaria-diff:` URI is the correct,
  * and only available, source.
  */
 export function diffIdentityFromDiffTabInput(input: DiffTabInputLike | undefined): DiffTabIdentity | undefined {

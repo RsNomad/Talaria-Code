@@ -3,7 +3,7 @@ import type { EditPreviewRegistry } from './EditPreviewRegistry';
 import { parseDiffUri } from './parseDiffUri';
 
 /**
- * W2 T4 — F-D: the `hermes-diff:` `TextDocumentContentProvider`. Both diff
+ * W2 T4 — F-D: the `talaria-diff:` `TextDocumentContentProvider`. Both diff
  * sides are virtual documents served entirely from {@link EditPreviewRegistry}
  * — the real file is NEVER a diff side and is NEVER read here.
  *
@@ -12,14 +12,14 @@ import { parseDiffUri } from './parseDiffUri';
  * doesn't currently carry — e.g. its approval already resolved) returns the
  * literal `"(resolved)"` placeholder. There is no `fs`/`vscode.workspace.fs`
  * call anywhere in this file — a read fallback here would turn the scheme
- * into an arbitrary-read oracle for anything named on the `hermes-diff:`
+ * into an arbitrary-read oracle for anything named on the `talaria-diff:`
  * authority, independent of whether an approval was ever live for it.
  *
  * Build-blind (compile-checked + Fedora-verified) — deliberately thin: all
  * the parsing/lookup logic it calls (`parseDiffUri`, `registry.getFile`) is
  * pure and already headless-tested; this class is just the vscode wiring.
  */
-export const HERMES_DIFF_SCHEME = 'hermes-diff';
+export const TALARIA_DIFF_SCHEME = 'talaria-diff';
 
 /** Served when the registry has nothing for the requested (toolId, path) —
  * NEVER a file read (see the class doc's §7 B7 pin). */

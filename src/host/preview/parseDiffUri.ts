@@ -1,8 +1,8 @@
 /**
- * W2 T4 — F-D: pure `hermes-diff:` URI parser.
+ * W2 T4 — F-D: pure `talaria-diff:` URI parser.
  *
- * `hermes-diff://before/<sessionId>/<toolId>/<path>` /
- * `hermes-diff://after/<sessionId>/<toolId>/<path>`. Structural over a
+ * `talaria-diff://before/<sessionId>/<toolId>/<path>` /
+ * `talaria-diff://after/<sessionId>/<toolId>/<path>`. Structural over a
  * `vscode.Uri`-shaped value (`{scheme, authority, path}` — `vscode.Uri.path`
  * is already percent-DECODED) so this stays headless unit-testable without
  * importing `vscode`.
@@ -36,7 +36,7 @@ export interface DiffUriLike {
   path: string;
 }
 
-const SCHEME = 'hermes-diff';
+const SCHEME = 'talaria-diff';
 
 export function parseDiffUri(uri: DiffUriLike): ParsedDiffUri | null {
   if (uri.scheme !== SCHEME) return null;
@@ -61,7 +61,7 @@ export function parseDiffUri(uri: DiffUriLike): ParsedDiffUri | null {
 
 /**
  * {@link parseDiffUri}'s inverse: the `{scheme, authority, path}` parts for
- * one `hermes-diff:` side, ready to hand to `vscode.Uri.from(...)`. Kept pure
+ * one `talaria-diff:` side, ready to hand to `vscode.Uri.from(...)`. Kept pure
  * (no `vscode` import) so `HermesViewProvider`'s `diff.open` routing stays a
  * one-line `vscode.Uri.from(buildDiffUriParts(...))` call — the URI-building
  * logic itself is headless-tested here, round-tripped against

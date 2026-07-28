@@ -1,11 +1,11 @@
 /**
  * W2 T4 — F-D (§3.5): the `hermes.acceptDiff`/`hermes.rejectDiff` editor-title
  * commands (`package.json`'s `editor/title` menu, `when: resourceScheme ==
- * hermes-diff`). Build-blind (compile-checked + Fedora-verified) —
+ * talaria-diff`). Build-blind (compile-checked + Fedora-verified) —
  * deliberately thin: resolve the active diff tab's toolId (pure,
  * `diffDecision.ts`), delegate into the EXISTING `resolveDiff` seam (no new
  * resolution path — Reject denies whole-file, Accept walks every tracked
- * hunk via `AcpBackend.acceptWholeFileDiff`), then close every `hermes-diff:`
+ * hunk via `AcpBackend.acceptWholeFileDiff`), then close every `talaria-diff:`
  * tab for that toolId (Cline's diff-tab lifecycle pattern: the registry
  * clearing itself, at the `resolveDiff`/`respondApproval` removal sites, is
  * what makes `DiffPreviewProvider` start serving the placeholder — this just
@@ -28,7 +28,7 @@ function wholeFileAcceptCapable(backend: AgentBackend): backend is AgentBackend 
   return typeof (backend as Partial<WholeFileAcceptCapable>).acceptWholeFileDiff === 'function';
 }
 
-/** The `(sessionId, toolId)` the given tab's `hermes-diff:` URIs encode, or
+/** The `(sessionId, toolId)` the given tab's `talaria-diff:` URIs encode, or
  * `undefined` if it isn't one of ours. The one `instanceof TabInputTextDiff`
  * narrowing point — everything past it is the pure `diffIdentityFromDiffTabInput`. */
 function diffTabIdentity(tab: vscode.Tab | undefined): DiffTabIdentity | undefined {
@@ -41,7 +41,7 @@ function allTabs(): vscode.Tab[] {
   return vscode.window.tabGroups.all.flatMap((group) => group.tabs);
 }
 
-/** Close every `hermes-diff:` diff tab for `(sessionId, toolId)` (there can
+/** Close every `talaria-diff:` diff tab for `(sessionId, toolId)` (there can
  * be more than one — e.g. the same preview opened in a split view). Scoped
  * by BOTH — a different session's tab sharing the same toolId string must
  * never be closed as a side effect (W4-T3b, the same collision class the
