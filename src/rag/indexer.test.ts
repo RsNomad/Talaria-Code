@@ -1,0 +1,603 @@
+import { promises as fs, mkdtempSync, rmSync } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * W5-T6 — RAG index path-filter security fix.
+ *
+ * `createIndexer` is orchestration glue over `LanceDBStore`/`HttpEmbedder`
+ * (native/HTTP surface), so those are mocked here exactly like the rest of
+ * `src/rag` keeps native deps behind interfaces for testability. The real
+ * `node:fs`, chunker, and gitignore filter run against a throwaway temp
+ * workspace so these tests exercise the actual walk/reindex/manifest logic,
+ * not a re-description of it.
+ */
+const { upsertMock, deleteByPathMock, initMock, closeMock, embedMock } = vi.hoisted(() => ({
+  // Typed with the one field the D-2 tests below read back (`path`), so
+  // `upsertMock.mock.calls` carries real argument types instead of `[]` —
+  // the mock's runtime behavior (ignore the argument, resolve void) is
+  // unchanged.
+  upsertMock: vi.fn(async (_records: Array<{ path: string }>) => {}),
+  deleteByPathMock: vi.fn(async (_path: string) => {}),
+  initMock: vi.fn(async () => {}),
+  closeMock: vi.fn(async () => {}),
+  embedMock: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3])),
+}));
+
+vi.mock('./store/LanceDBStore', () => ({
+  LanceDBStore: class {
+    init = initMock;
+    upsert = upsertMock;
+    deleteByPath = deleteByPathMock;
+    listFileHashes = vi.fn(async () => ({}));
+    hybridSearch = vi.fn(async () => []);
+    close = closeMock;
+  },
+}));
+
+vi.mock('./embedder', () => ({
+  HttpEmbedder: class {
+    embed = embedMock;
+  },
+}));
+
+/**
+ * B-10 isolation only (see the test below that uses it): `walk()`
+ * (indexer.ts:161) and the self-heal purge loop (indexer.ts:257-262) call
+ * the SAME `isSecretForCompletion`, so with the real classifier a secret
+ * path can never reach `current` — meaning the ordinary
+ * stored-but-absent-from-current delete pass (`diffContentHashes`) already
+ * purges any secret-only-in-manifest entry, independent of the purge loop.
+ * This wrapper lets ONE test make walk()'s classifier call disagree with
+ * the purge loop's, to exercise the purge loop's own branch. Every other
+ * test in this file gets the real, unmocked classifier (the wrapped
+ * default), so this changes nothing for them.
+ */
+const { isSecretForCompletionBox } = vi.hoisted(() => ({
+  isSecretForCompletionBox: {
+    actual: (_p: string): boolean => {
+      throw new Error('isSecretForCompletion real implementation not captured yet');
+    },
+  },
+}));
+
+vi.mock('../shared/secretPaths', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../shared/secretPaths')>();
+  isSecretForCompletionBox.actual = actual.isSecretForCompletion;
+  return { ...actual, isSecretForCompletion: vi.fn(actual.isSecretForCompletion) };
+});
+
+const fsWatcherListeners = vi.hoisted(() => ({
+  create: [] as Array<(uri: { fsPath: string }) => void>,
+  change: [] as Array<(uri: { fsPath: string }) => void>,
+  delete: [] as Array<(uri: { fsPath: string }) => void>,
+}));
+
+vi.mock('vscode', () => {
+  class Disposable {
+    static from(...disposables: Array<{ dispose(): void }>) {
+      return { dispose: () => disposables.forEach((d) => d.dispose()) };
+    }
+  }
+  const workspace = {
+    createFileSystemWatcher: () => ({
+      onDidCreate: (cb: (uri: { fsPath: string }) => void) => {
+        fsWatcherListeners.create.push(cb);
+        return { dispose: () => {} };
+      },
+      onDidChange: (cb: (uri: { fsPath: string }) => void) => {
+        fsWatcherListeners.change.push(cb);
+        return { dispose: () => {} };
+      },
+      onDidDelete: (cb: (uri: { fsPath: string }) => void) => {
+        fsWatcherListeners.delete.push(cb);
+        return { dispose: () => {} };
+      },
+      dispose: () => {},
+    }),
+  };
+  return { Disposable, workspace };
+});
+
+// eslint-disable-next-line import/first -- must follow the vi.mock calls above.
+import { hashContent } from './contentHash';
+// eslint-disable-next-line import/first -- must follow the vi.mock calls above.
+import { createIndexer } from './indexer';
+// eslint-disable-next-line import/first -- must follow the vi.mock calls above; this is the mocked (wrapped) export.
+import { isSecretForCompletion } from '../shared/secretPaths';
+
+describe('createIndexer — secret-path filtering (W5-T6)', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-test-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    // undo any per-test override (see the B-10 isolation test below) so
+    // later tests keep getting the real classifier.
+    vi.mocked(isSecretForCompletion).mockImplementation(isSecretForCompletionBox.actual);
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer(debounceMs = 10) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  async function readManifest(): Promise<Record<string, string>> {
+    const raw = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8');
+    return JSON.parse(raw) as Record<string, string>;
+  }
+
+  it('never collects/reindexes secret-path files during a full build', async () => {
+    await writeWorkspaceFile('.env', 'SECRET=shhh\n');
+    await writeWorkspaceFile('config/id_rsa', 'not a real key but the name is the secret\n');
+    await writeWorkspaceFile('.aws/credentials', '[default]\naws_access_key_id=AKIAEXAMPLE\n');
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    expect(upsertMock).not.toHaveBeenCalled();
+
+    const manifest = await readManifest();
+    expect(manifest['.env']).toBeUndefined();
+    expect(manifest['config/id_rsa']).toBeUndefined();
+    expect(manifest['.aws/credentials']).toBeUndefined();
+  });
+
+  it('still indexes a non-secret file normally (regression)', async () => {
+    await writeWorkspaceFile('src/app.txt', 'hello world, an ordinary file with real content to chunk.\n');
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    expect(upsertMock).toHaveBeenCalled();
+    const manifest = await readManifest();
+    expect(manifest['src/app.txt']).toBeDefined();
+  });
+
+  it('B-10: purges a secret path that exists ONLY in the stored manifest (no file on disk)', async () => {
+    // The previous fixture wrote a real `.env` to disk, so `walk()`'s own
+    // filter already excluded it from `current` and the ORDINARY delete pass
+    // satisfied both assertions — the purge loop could be deleted and the test
+    // stayed green (audit B-10, equivalence by construction). With no file on
+    // disk the path is absent from `current` AND absent from the delete diff,
+    // so ONLY the purge loop at indexer.ts:257-262 can remove it.
+    await writeWorkspaceFile('src/app.txt', 'unchanged content for the regression file.\n');
+    await fs.mkdir(indexDir, { recursive: true });
+    // Simulates an index built BEFORE this fix: `.env` was embedded and is
+    // still sitting in the manifest. Deliberately do NOT create `.env` on
+    // disk — that is the whole point of this fixture (see comment above).
+    await fs.writeFile(
+      path.join(indexDir, 'manifest.json'),
+      JSON.stringify({ '.env': 'deadbeef', 'src/app.txt': 'stale-hash-will-be-recomputed' }),
+      'utf8',
+    );
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    const manifest = await readManifest();
+    expect(Object.keys(manifest)).not.toContain('.env');
+    expect(deleteByPathMock.mock.calls.map(([calledPath]) => calledPath)).toContain('.env');
+    // the non-secret entry survives reconciliation (re-embedded, since the
+    // stored hash was stale).
+    expect(manifest['src/app.txt']).toBeDefined();
+  });
+
+  it('B-10 isolation: purges via the purge loop even when walk() itself did not exclude the path', async () => {
+    // The B-10 test above (secret only in the manifest, absent from disk) is
+    // ALSO satisfied by the ORDINARY delete pass alone: `diffContentHashes`
+    // deletes anything present in `stored` but absent from `current`, for
+    // ANY reason, not just secrecy — and walk() (indexer.ts:161) already
+    // guarantees a real secret path is always absent from `current`, using
+    // the exact same classifier the purge loop uses. Verified empirically:
+    // deleting the purge loop and re-running the B-10 test above still
+    // passes (see task-12-report.md, Plant 1 finding). So B-10 alone does
+    // NOT isolate the purge loop's own branch.
+    //
+    // This test does. `.env` is REAL, on disk, unchanged (its manifest hash
+    // matches its current content hash exactly) — the scenario the purge
+    // loop's own doc comment names: "independent of whether walk()'s filter
+    // above already excluded it from current." To force that exact
+    // disagreement without touching indexer.ts, the mocked classifier
+    // answers `false` on its first call (walk()'s check — modelling "wasn't
+    // classified as secret when this file was indexed") and `true` from the
+    // second call on (the purge loop's check — modelling "the classifier
+    // caught up since"). With the purge loop intact, ONLY it can act here:
+    // the ordinary diff sees an unchanged hash and does nothing on its own.
+    await writeWorkspaceFile('.env', 'SECRET=shhh\n');
+    const onDiskHash = hashContent('SECRET=shhh\n');
+
+    await fs.mkdir(indexDir, { recursive: true });
+    await fs.writeFile(path.join(indexDir, 'manifest.json'), JSON.stringify({ '.env': onDiskHash }), 'utf8');
+
+    let calls = 0;
+    vi.mocked(isSecretForCompletion).mockImplementation(() => {
+      calls += 1;
+      return calls > 1;
+    });
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    expect(deleteByPathMock.mock.calls.map(([calledPath]) => calledPath)).toContain('.env');
+  });
+
+  it('skips a secret-path file on the incremental change path (create/change event)', async () => {
+    await writeWorkspaceFile('.env', 'SECRET=shhh\n');
+
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    expect(fsWatcherListeners.create.length).toBeGreaterThan(0);
+    const onCreate = fsWatcherListeners.create[0]!;
+    onCreate({ fsPath: path.join(workspaceRoot, '.env') });
+
+    // past the 10ms debounce configured above, plus slack for the async
+    // handler (fs read + manifest read/write) to complete.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(upsertMock).not.toHaveBeenCalled();
+    expect(deleteByPathMock).toHaveBeenCalledWith('.env');
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+
+  it('still indexes a non-secret file on the incremental change path (regression)', async () => {
+    await writeWorkspaceFile('src/app.txt', 'hello world, an ordinary file with real content to chunk.\n');
+
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    const onCreate = fsWatcherListeners.create[0]!;
+    onCreate({ fsPath: path.join(workspaceRoot, 'src/app.txt') });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(upsertMock).toHaveBeenCalled();
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+});
+
+describe('D-2: the index carries a model/dimension fingerprint', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+  const APP_TS_CONTENT = 'export const x = 1;\n';
+
+  beforeEach(async () => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-meta-test-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+
+    await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'src', 'app.ts'), APP_TS_CONTENT, 'utf8');
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeMetaIndexer() {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-embed-model',
+      dims: 0,
+    });
+  }
+
+  async function readMetaFixture(): Promise<unknown> {
+    const raw = await fs.readFile(path.join(indexDir, 'manifest.meta.json'), 'utf8');
+    return JSON.parse(raw);
+  }
+
+  async function writeMetaFixture(meta: unknown): Promise<void> {
+    await fs.mkdir(indexDir, { recursive: true });
+    await fs.writeFile(path.join(indexDir, 'manifest.meta.json'), JSON.stringify(meta), 'utf8');
+  }
+
+  async function writeManifestFixture(manifest: Record<string, string>): Promise<void> {
+    await fs.mkdir(indexDir, { recursive: true });
+    await fs.writeFile(path.join(indexDir, 'manifest.json'), JSON.stringify(manifest), 'utf8');
+  }
+
+  /**
+   * Real recompute evidence, not a mock-existence check: `reindexFiles` is the
+   * only path that calls `store.upsert`, and it is only reached for paths
+   * `diffContentHashes` puts in `toCompute`. So "which paths were upserted"
+   * is exactly "which paths got recomputed" — read from the real ChunkRecord
+   * payloads the indexer built, not from a boolean flag.
+   */
+  function recomputedPaths(): string[] {
+    return upsertMock.mock.calls.flatMap(([records]) => records.map((r) => r.path));
+  }
+
+  it('writes the fingerprint sidecar on a fresh build, including the OBSERVED vector width (Task 14b)', async () => {
+    const indexer = makeMetaIndexer();
+    await indexer.build();
+    const meta = await readMetaFixture();
+    // embedMock (this file's top-level mock) returns `[0.1, 0.2, 0.3]` per
+    // text — width 3 — so a fresh build that embeds real content must record
+    // that observed width alongside the existing schema/embedModel/dims
+    // fingerprint fields.
+    expect(meta).toEqual({ schema: 1, embedModel: 'test-embed-model', dims: 0, width: 3 });
+  });
+
+  it('rebuilds from scratch when the stored fingerprint names a DIFFERENT model', async () => {
+    // The stored hash matches the file's ACTUAL on-disk content exactly, so
+    // an ordinary content-hash diff (with no fingerprint check at all) would
+    // find nothing changed and would NOT recompute this file. If this test
+    // recomputed it anyway, that would prove nothing except that the fixture
+    // hash was stale — this fixture is deliberately fresh so ONLY the
+    // fingerprint-mismatch discard can be the reason a recompute happens.
+    await writeMetaFixture({ schema: 1, embedModel: 'some-other-model', dims: 0 });
+    await writeManifestFixture({ 'src/app.ts': hashContent(APP_TS_CONTENT) });
+
+    const indexer = makeMetaIndexer();
+    await indexer.build();
+
+    // A changed embedding model makes every stored vector incomparable. Reusing
+    // the manifest would silently poison every future search — the manifest
+    // holds only path->contentHash, so nothing else could ever notice.
+    expect(recomputedPaths()).toContain('src/app.ts');
+  });
+});
+
+describe('D-5: manifest read-modify-write is serialized under concurrent events', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-d5-test-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeD5Indexer(debounceMs = 5) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  async function readManifest(): Promise<Record<string, string>> {
+    const raw = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8');
+    return JSON.parse(raw) as Record<string, string>;
+  }
+
+  it('two different files changing in the same debounce window both survive in the final manifest', async () => {
+    // The real hazard D-5 names: `handleFsEvent` debounces PER PATH (each
+    // `uri.fsPath` gets its own timer, see indexer.ts's `timers` map), so two
+    // DIFFERENT files changing close together fire two independent, overlapping
+    // read-modify-write cycles over the SAME manifest.json. Without
+    // serialization this is a classic lost update: whichever cycle writes
+    // last wins, silently dropping the other's entry — even though neither
+    // cycle did anything wrong on its own.
+    await writeWorkspaceFile('a.txt', 'file a content\n');
+    await writeWorkspaceFile('b.txt', 'file b content\n');
+
+    const indexer = makeD5Indexer();
+    const disposable = indexer.watch();
+
+    // Force file a's embed call (the first one issued) to resolve well after
+    // file b's entire cycle would finish on its own — this is what makes the
+    // interleaving deterministic instead of a timing-dependent flake. It
+    // does not touch b's embed call; the mock reverts to its normal fast
+    // implementation for every call after this one.
+    embedMock.mockImplementationOnce(async (texts: string[]) => {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      return texts.map(() => [0.1, 0.2, 0.3]);
+    });
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'a.txt') });
+    // b's event fires after a's debounce timer has already started (and,
+    // shortly after, a's slow embed call) — so if the two cycles were NOT
+    // serialized, b's fast cycle would finish and write first, and a's slow
+    // cycle would finish later and overwrite b's entry with a stale
+    // manifest that never saw it.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    onChange({ fsPath: path.join(workspaceRoot, 'b.txt') });
+
+    // Comfortably past both debounces plus the artificial 80ms embed delay.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const manifest = await readManifest();
+    expect(manifest['a.txt']).toBeDefined();
+    expect(manifest['b.txt']).toBeDefined();
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+});
+
+describe('RAG-4: watch() Disposable clears pending debounce timers on dispose', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-rag4-test-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  function makeIndexer(debounceMs = 30) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  it('a debounce timer scheduled before dispose() never fires handleFsEvent afterward', async () => {
+    await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
+
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'src/app.ts') });
+
+    // Disposing the watch()-returned Disposable itself (NOT indexer.dispose()
+    // — a SEPARATE lifecycle: e.g. VS Code tearing down context.subscriptions
+    // on deactivate while the Indexer object survives) BEFORE the debounce
+    // elapses must cancel the pending timer, not just stop future events.
+    disposable.dispose();
+
+    // Comfortably past the debounce window, with slack for the (would-be)
+    // async handler to have run if the timer had fired.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // handleFsEvent's first action is ensureStoreInitialized() -> store.init()
+    // — if the timer had fired despite dispose(), initMock would have been
+    // called.
+    expect(initMock).not.toHaveBeenCalled();
+    expect(upsertMock).not.toHaveBeenCalled();
+
+    indexer.dispose();
+  });
+
+  it('regression: a debounce timer that already fired before dispose still reindexes normally', async () => {
+    await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
+
+    const indexer = makeIndexer(10);
+    const disposable = indexer.watch();
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'src/app.ts') });
+
+    // Past the 10ms debounce, plus slack for the async handler to complete —
+    // dispose() only happens AFTER the timer has already fired.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    disposable.dispose();
+
+    expect(upsertMock).toHaveBeenCalled();
+
+    indexer.dispose();
+  });
+});
+
+describe('RAG-2: the serialize chain accepts the NEXT event after a batch embed failure (e.g. an embed timeout)', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-rag2-test-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  it('a build() call that rejects (e.g. an embed timeout) does not poison later build() calls', async () => {
+    await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
+
+    const indexer = createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+    });
+
+    // Models what HttpEmbedder.embedBatch now does when the RAG-2 deadline
+    // fires: the embed() call rejects. indexer.ts has no try/catch around
+    // this call inside reindexFiles, so the rejection propagates straight up
+    // through runBuild -> serialize(runBuild) -> this build() call's promise
+    // — "the indexer's existing per-batch error handling" the fix brief
+    // names is exactly this propagation, not a swallow.
+    embedMock.mockRejectedValueOnce(new Error('embeddings request timed out'));
+
+    await expect(indexer.build()).rejects.toThrow('embeddings request timed out');
+
+    // The shared buildChain (indexer.ts's serialize()) must still accept and
+    // run the NEXT enqueued build — one rejected link in the chain must not
+    // wedge every future build behind it.
+    await writeWorkspaceFile('src/other.ts', 'export const y = 2;\n');
+    await expect(indexer.build()).resolves.toBeUndefined();
+    expect(upsertMock).toHaveBeenCalled();
+  });
+});

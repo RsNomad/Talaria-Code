@@ -1,0 +1,92 @@
+/*
+ * Hermes brand tokens layered over VS Code theme variables.
+ * ------------------------------------------------------------------
+ * Surfaces and text FOLLOW the user's active VS Code theme (via --vscode-*),
+ * so the panel always feels native. Our teal brand accent + diff/status hues
+ * are FIXED tokens layered on top, so it reads as "Hermes" in any theme.
+ *
+ * VS Code puts .vscode-light / .vscode-dark / .vscode-high-contrast on <body>.
+ * The var(--vscode-*, fallback) form keeps the UI legible when running the
+ * bundle standalone in a plain browser (Vite dev / mock mode) where the
+ * --vscode-* vars are absent.
+ */
+
+:root {
+  /* ---- surfaces (follow VS Code) ---- */
+  --h-surface: var(--vscode-editor-background, #12161b);
+  --h-raised: var(--vscode-sideBar-background, #171d24);
+  --h-panel: var(--vscode-editorWidget-background, #1b222a);
+  --h-overlay: var(--vscode-editorHoverWidget-background, #232a33);
+  --h-border: var(--vscode-panel-border, rgba(255, 255, 255, 0.09));
+  --h-border-strong: var(--vscode-contrastBorder, rgba(255, 255, 255, 0.16));
+
+  /* ---- text (follow VS Code) ---- */
+  --h-fg: var(--vscode-foreground, #e7ecf1);
+  --h-muted: var(--vscode-descriptionForeground, #b4bfc8);
+  --h-faint: var(--vscode-disabledForeground, #7c8791);
+
+  /* ---- brand accent (fixed teal, tuned per theme below) ---- */
+  --h-accent: #12a594;
+  --h-accent-fg: #ffffff; /* text/icon color that sits ON the accent fill */
+  --h-accent-soft: rgba(18, 165, 148, 0.15);
+
+  /* ---- semantic status hues (fixed) ---- */
+  --h-add: #2fae6b;
+  --h-add-soft: rgba(47, 174, 107, 0.15);
+  --h-del: #e05475;
+  --h-del-soft: rgba(224, 84, 117, 0.15);
+  --h-warn: #d68a2e;
+  --h-warn-soft: rgba(214, 138, 46, 0.15);
+  --h-run: #7b7ef0;
+  --h-run-soft: rgba(123, 126, 240, 0.15);
+
+  /* ---- type ---- */
+  --h-font-sans: var(--vscode-font-family, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif);
+  --h-font-mono: var(--vscode-editor-font-family, ui-monospace, 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace);
+}
+
+/* Dark themes: brighten accent so it reads as a live signal on dark surfaces. */
+body.vscode-dark {
+  --h-accent: #2dd4bf;
+  --h-accent-fg: #04211f;
+  --h-accent-soft: rgba(45, 212, 191, 0.14);
+  --h-add: #3fbe79;
+  --h-del: #f27093;
+  --h-warn: #e7a44a;
+  --h-run: #9295f5;
+}
+
+/* Light themes: deepen accent for contrast on light surfaces. */
+body.vscode-light {
+  --h-accent: #0d8a7d;
+  --h-accent-fg: #ffffff;
+  --h-accent-soft: rgba(13, 138, 125, 0.12);
+  --h-add: #1a7f4b;
+  --h-del: #c43b57;
+  --h-warn: #b26206;
+  --h-run: #5457d6;
+  --h-border: var(--vscode-panel-border, rgba(18, 23, 28, 0.12));
+  --h-border-strong: var(--vscode-contrastBorder, rgba(18, 23, 28, 0.22));
+}
+
+/* High contrast: rely on VS Code's contrast borders; keep a vivid accent. */
+body.vscode-high-contrast {
+  --h-accent: #2dd4bf;
+  --h-accent-fg: #000000;
+  --h-border: var(--vscode-contrastBorder, #6fc3df);
+  --h-border-strong: var(--vscode-contrastBorder, #6fc3df);
+}
+body.vscode-high-contrast-light {
+  --h-accent: #0d6f65;
+  --h-accent-fg: #ffffff;
+  --h-border: var(--vscode-contrastBorder, #0f4a91);
+  --h-border-strong: var(--vscode-contrastBorder, #0f4a91);
+}
+
+/* Standalone fallback (no VS Code host = no body theme class): assume dark. */
+body:not([class*='vscode-']) {
+  --h-accent: #2dd4bf;
+  --h-accent-fg: #04211f;
+  color-scheme: dark;
+  background: #12161b;
+}

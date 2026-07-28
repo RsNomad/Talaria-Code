@@ -1,0 +1,72 @@
+# Ship only dist/ + media/ (+ package.json/README). Exclude everything else.
+
+# Sources (bundled into dist/ at build time)
+src/**
+webview/**
+
+# Build config & tooling
+esbuild.js
+tsconfig*.json
+.vscode/**
+.vscode-test/**
+.github/**
+
+# Docs & meta
+docs/**
+.gitignore
+.vscodeignore
+**/.eslintrc*
+**/*.map
+**/*.ts
+# `**/*.ts` does NOT match `.tsx` — glob extension matching is exact, so a
+# `.tsx` file is only excluded here by the `src/**` and `webview/**` rules
+# above. That covers every `.tsx` in the tree TODAY; it would not cover one
+# added outside those two roots, which would then ship in the .vsix. Listed
+# explicitly so the exclusion rests on the extension rather than on where the
+# file happens to live (final review, Finding 4).
+**/*.tsx
+**/tsconfig*.json
+
+# Dev dependencies (no runtime deps are shipped) — except the native/wasm
+# packages esbuild marks `external` (can't be bundled: LanceDB's native
+# binary, web-tree-sitter's wasm loader, + the prebuilt grammar wasms), which
+# must ship in the .vsix for dist/extension.js and dist/mcp/codebase-server.js
+# to resolve them at runtime (integration checklist #3), PLUS their own
+# runtime dependency closure and the webview's codicon font. Verified against
+# the installed tree + package-lock.json (architecture-review.md P0):
+#
+#   @lancedb/lancedb  -> reflect-metadata (dep), apache-arrow (peerDep, actually
+#                        required: dist/index.js eagerly requires ./embedding,
+#                        which requires reflect-metadata + uses apache-arrow
+#                        via ../arrow.js); @lancedb/lancedb-<os>-<arch>-* is
+#                        the per-platform native binary (optionalDependency),
+#                        already covered by the @lancedb/** wildcard below.
+#   apache-arrow      -> Arrow.node.js (its Node entry) requires `tslib`
+#                        directly and pulls in ipc/reader.js + ipc/writer.js,
+#                        which require `flatbuffers` (ipc/message.js). Both are
+#                        hoisted to root node_modules, not nested under
+#                        apache-arrow/node_modules, so each needs its own
+#                        allow-list line.
+#   @vscode/codicons  -> HermesViewProvider loads
+#                        node_modules/@vscode/codicons/dist/{codicon.css,
+#                        codicon.ttf} for the webview's icon font
+#                        (localResourceRoots + the <link> in buildHtml).
+#
+# NOT shipped (bundled into dist/* by esbuild instead, per esbuild.js — only
+# @lancedb/lancedb + web-tree-sitter are marked `external`):
+#   @modelcontextprotocol/sdk, zod, ignore, @agentclientprotocol/sdk
+#
+# NOT needed at runtime (LanceDB optionalDependencies for its embedding-function
+# registry, e.g. `registry.get("openai")`/`.get("transformers")` — we never call
+# those; only the registry's reflect-metadata side-effect import is reachable):
+#   openai, @huggingface/transformers, @huggingface/jinja
+node_modules/**
+!node_modules/@lancedb/**
+!node_modules/web-tree-sitter/**
+!node_modules/tree-sitter-wasms/**
+!node_modules/apache-arrow/**
+!node_modules/reflect-metadata/**
+!node_modules/flatbuffers/**
+!node_modules/tslib/**
+!node_modules/@vscode/codicons/**
+.git/**

@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+coverage/
+
+# Package artifacts
+*.vsix
+
+# Logs / caches
+*.log
+.vite/
+.DS_Store
+Thumbs.db
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Editor / IDE — commit the dev entrypoints (F5), ignore personal settings
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# Agent tooling & internal docs — NOT for the public repo
+.claude/
+.superpowers/
+docs_claude/
+
+# Neural-net / model / vector-index artifacts
+.hermes/
+*.gguf
+*.bin
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.tflite
+*.pkl
+*.npy
+*.npz
+*.lance
+**/*.lance/

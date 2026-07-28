@@ -1,0 +1,400 @@
+/*
+ * MockBackend — canned host used when no VS Code extension is present.
+ * ------------------------------------------------------------------
+ * It receives webview->host messages and replays the SHARED scripted
+ * host->webview stream (mirrored from src/shared/mockScenario.ts): a full agent
+ * turn (reasoning -> tool -> diff -> approval -> plan -> message -> result) plus
+ * static-but-real-looking panel payloads. This is the same message shape the
+ * real host emits, so App renders identically either way.
+ *
+ * In the shipped extension the real host owns this contract; the MockBackend is
+ * only wired in standalone dev (see bridge.attachMock).
+ *
+ * W4-T3b (§7 B12): this is the ONLY place W4's multi-tab UI is driveable
+ * pre-Fedora under the build-blind rule, so it now mints a REAL session PER
+ * TAB (`mock-session-N`) and plays an INDEPENDENT copy of the scripted turn
+ * per session — two tabs' turns genuinely interleave, exercising the P-1
+ * bleed hazard, the tab strip, drop-unknown routing, and the pending/bound
+ * composer states with real (not merely typed) coverage.
+ */
+import type {
+  EditPolicyPreset,
+  GlobalPanel,
+  HostToWebview,
+  NextEditToggleSource,
+  NextEditToggleState,
+  Panel,
+  PanelDataMap,
+  WebviewToHost,
+  WebviewState,
+} from '../protocol';
+import { BOOTSTRAP_TAB_ID, makePanelData } from '../protocol';
+import { mockApprovalId, mockTheme, mockTurn, panelData } from './fixtures';
+import { NEXT_EDIT_ROWS } from '../panels/SettingsPanel';
+
+type Send = (msg: HostToWebview) => void;
+
+/**
+ * FIX WAVE 2 (wave-1 handoff — U-6 drift). The scaffold's refusal copy is
+ * DERIVED from the same frozen row table the panel renders
+ * (`NEXT_EDIT_ROWS`), never retyped, and mirrors the real Guard's
+ * `REFUSAL_MESSAGES` (`src/autocomplete/nextedit/guard.ts`): refusing source
+ * X names the OTHER row's label, because that is the row the user has to go
+ * turn off.
+ *
+ * It used to read "turn off Generic first" / "turn off NEXT first" — the
+ * pre-U-6 wording, naming tokens that appear NOWHERE on screen. Wave 1 fixed
+ * the real Guard and the mock was left behind, so the one surface this UX is
+ * driveable on pre-Fedora modelled a refusal production no longer emits.
+ *
+ * Why derived and not imported outright: `guard.ts` imports `vscode`, so its
+ * `REFUSAL_MESSAGES` is unreachable from the webview's module graph. Tying
+ * the LABELS to `NEXT_EDIT_ROWS` removes the half that actually drifted; the
+ * surrounding template is pinned by `MockBackend.test.ts`.
+ */
+function mockRefusalMessage(refused: NextEditToggleSource): string {
+  const other = refused === 'next' ? 'generic' : 'next';
+  const otherLabel = NEXT_EDIT_ROWS.find((row) => row.source === other)?.label ?? '';
+  return `Next Edit: turn off "${otherLabel}" first — the two sources are mutually exclusive.`;
+}
+
+const REDUCED_MOTION =
+  typeof window !== 'undefined' &&
+  window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+
+/** One bound tab's independent scripted-turn player + policy state. */
+interface SessionPlayer {
+  readonly sessionId: string;
+  timers: ReturnType<typeof setTimeout>[];
+  /** Index in `mockTurn` the player is parked at, waiting on an approval; -1 when free. */
+  parkedAt: number;
+  preset: EditPolicyPreset;
+}
+
+/** Shallow-restamp a scripted `HostToWebview` message onto `sessionId` — every
+ * `mockTurn` step bakes in a single fixed session id; replaying the SAME
+ * script for a second, independent tab must not leak the first tab's id. */
+function restamp(msg: HostToWebview, sessionId: string): HostToWebview {
+  if ('sessionId' in msg) return { ...msg, sessionId };
+  return msg;
+}
+
+export class MockBackend {
+  private send: Send;
+  /** W4-T3b (B12): one player per BOUND tab, keyed by sessionId — the
+   * two-tab interleave vehicle. Replaces the old single connection-level
+   * `parkedAt`/`timers`/`preset`/`currentSessionId` fields. */
+  private readonly players = new Map<string, SessionPlayer>();
+  /** The bootstrap tab's session id, once auto-bound (mirrors the REAL
+   * backend's `establishInitialSession`/host MockBackend's `start()` —
+   * §2c: "the first tab's open replaces today's in-`start()` session
+   * mint" is honored here too: the bootstrap tab binds on `ready`, no
+   * explicit `tab.open` needed for tab #1). */
+  private bootstrapSessionId: string | undefined;
+  private nextMockSessionSeq = 0;
+  /** R5 (Task 13): the scaffold's stand-in for the Guard's `globalState`
+   *  store. In-memory only — the standalone app has no persistence — and
+   *  boots both-OFF, the same hardcoded first-run default the Guard uses. */
+  private nextEditToggles: NextEditToggleState = { next: false, generic: false };
+
+  constructor(send: Send) {
+    this.send = send;
+  }
+
+  /** Handle an inbound webview->host message. */
+  handle(msg: WebviewToHost): void {
+    switch (msg.type) {
+      case 'ready':
+        this.hydrate();
+        break;
+      case 'prompt':
+        this.runTurn(msg.sessionId);
+        break;
+      case 'newSession':
+        // Legacy connection-global "start over" affordance (no sessionId on
+        // the wire) — operates on the bootstrap session, matching the
+        // pre-T3b single-session behavior; the tab strip's "+" is `tab.open`.
+        this.newSessionFor(this.bootstrapSessionId ?? this.bindBootstrap());
+        break;
+      case 'switchPanel':
+        this.sendPanel(msg.panel);
+        break;
+      case 'tab.open':
+        this.bindTab(msg.tabId);
+        break;
+      case 'control.request':
+        this.handleControlRequest(msg);
+        break;
+      case 'approval.respond':
+        this.resumeParked(msg.sessionId, msg.id);
+        break;
+      case 'cancel':
+        this.cancelTurn(msg.sessionId);
+        break;
+      case 'policy.setPreset': {
+        const player = this.players.get(msg.sessionId);
+        if (player) player.preset = msg.preset;
+        this.send({ type: 'policy.state', sessionId: msg.sessionId, preset: msg.preset });
+        break;
+      }
+      case 'setModel':
+        // ARCH-1 (final review, UI I-1) / T2: the mock always confirms — the
+        // real host's `SessionController.setModel` only ever emits a
+        // rejection when the underlying ACP `session/set_model` call fails,
+        // which the mock has no analogue for. This closes the P7-N6 "push
+        // that never came" gap (`modelSelection.ts`'s header doc): before
+        // this, ModelsPanel's header/highlight (`resolveEffectiveModelId`)
+        // never saw a corrective/confirming push and stayed pinned to the
+        // stale panel payload until the next unrelated re-hydrate.
+        this.send({ type: 'model.state', sessionId: msg.sessionId, modelId: msg.modelId });
+        break;
+      default:
+        // setMode / diff.resolve / control.invoke / tab.close / tab.activate
+        // are acknowledged optimistically in the UI; nothing to echo in the
+        // mock.
+        break;
+    }
+  }
+
+  dispose(): void {
+    for (const player of this.players.values()) this.clearTimers(player);
+  }
+
+  // ---- tab binding ----
+
+  /** Auto-bind the bootstrap tab (idempotent — only the FIRST `ready` binds
+   * it, mirroring the real backend's `backendStarted` R-C4 latch). Returns
+   * its sessionId. */
+  private bindBootstrap(): string {
+    if (this.bootstrapSessionId) return this.bootstrapSessionId;
+    const sessionId = this.mintSession();
+    this.bootstrapSessionId = sessionId;
+    this.registerPlayer(sessionId);
+    this.emit({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId, rootId: sessionId });
+    return sessionId;
+  }
+
+  /** W4 §2d/§7 B12: mint a fresh session and bind it to a NEW (non-bootstrap)
+   * tab — the "+" button's real, independently-playable multi-session path. */
+  private bindTab(tabId: string): void {
+    const sessionId = this.mintSession();
+    this.registerPlayer(sessionId);
+    this.emit({ type: 'tab.bound', tabId, sessionId, rootId: sessionId });
+  }
+
+  private registerPlayer(sessionId: string): void {
+    this.players.set(sessionId, { sessionId, timers: [], parkedAt: -1, preset: 'manual' });
+  }
+
+  /** W4 §2d/§7 B12: mint the next scaffold session id (`mock-session-N`). */
+  private mintSession(): string {
+    this.nextMockSessionSeq += 1;
+    return `mock-session-${this.nextMockSessionSeq}`;
+  }
+
+  // ---- scripted streams (per session) ----
+
+  private hydrate(): void {
+    this.send({ type: 'theme', theme: mockTheme });
+    const state: WebviewState = {
+      sessionId: null,
+      theme: mockTheme,
+      mode: 'default',
+      // D2 (A2): this standalone webview-dev mock has no real backend at
+      // all — 'mock' is the only honest value.
+      backendKind: 'mock',
+      // W2-F1: reflect the live preset (boots at 'manual', the same
+      // ask-everything default as the real host) so a rebuild stays coherent.
+      preset: 'manual',
+      currentModelId: null,
+      activePanel: 'chat',
+    };
+    this.send({ type: 'hydrate', state });
+    // R5 (Task 13): mirror the host's mount-time `nextEdit.state` push, so the
+    // scaffold's Settings rows are seeded from the (mock) store rather than
+    // rendering the boot default indefinitely.
+    this.send({ type: 'nextEdit.state', state: this.nextEditToggles });
+    this.bindBootstrap();
+  }
+
+  private newSessionFor(sessionId: string): void {
+    const player = this.players.get(sessionId);
+    if (player) {
+      this.clearTimers(player);
+      player.parkedAt = -1;
+    }
+    this.emit({ type: 'clear', sessionId });
+  }
+
+  private sendPanel(panel: Panel): void {
+    if (panel === 'chat') return;
+    this.emit(this.buildPanelDataMessage(panel, panelData[panel]));
+  }
+
+  /**
+   * W4 §7 B2: mirrors `AcpBackend.buildPanelDataMessage`/the host
+   * MockBackend's twin — the standalone mock has no real per-root/per-cwd
+   * scoping either (S0/T3b posture unchanged for panels — B12 is scoped to
+   * the CHAT interleave), so `rootId`/`cwd` both fall back to the bootstrap
+   * (or freshly-bound) session id.
+   */
+  private buildPanelDataMessage<P extends Exclude<Panel, 'chat'>>(panel: P, data: PanelDataMap[P]): HostToWebview {
+    const sessionId = this.bootstrapSessionId ?? this.bindBootstrap();
+    if (panel === 'subagents') {
+      return makePanelData(panel, data as PanelDataMap['subagents'], { sessionId });
+    }
+    if (panel === 'checkpoints') {
+      return makePanelData(panel, data as PanelDataMap['checkpoints'], { rootId: sessionId });
+    }
+    if (panel === 'sessions') {
+      return makePanelData(panel, data as PanelDataMap['sessions'], { cwd: sessionId });
+    }
+    if (panel === 'tools' || panel === 'mcp' || panel === 'skills' || panel === 'models' || panel === 'settings') {
+      return makePanelData(panel, data as PanelDataMap[GlobalPanel]);
+    }
+    const exhaustive: never = panel;
+    throw new Error(`unhandled panel: ${String(exhaustive)}`);
+  }
+
+  /**
+   * Answer a correlated `control.request` (Part A2): fire the relevant
+   * `panel.data` push (for a panel fetch) or a canned result (checkpoint
+   * restore), then always echo a `control.response` back so the webview's
+   * pending promise resolves — the standalone mirror of the host's
+   * `invokeControl` round trip.
+   */
+  private handleControlRequest(msg: Extract<WebviewToHost, { type: 'control.request' }>): void {
+    const { requestId, method, params } = msg;
+    if (method === 'panel.data') {
+      const panel = (params as { panel?: Panel } | undefined)?.panel;
+      if (panel && panel !== 'chat') this.sendPanel(panel);
+      this.send({ type: 'control.response', requestId, ok: true, result: undefined });
+      return;
+    }
+    if (method === 'checkpoint.restore') {
+      this.send({
+        type: 'control.response',
+        requestId,
+        ok: true,
+        result: { restored: true, filesChanged: 0, changedPaths: [] },
+      });
+      return;
+    }
+    if (method === 'nextEdit.toggle') {
+      this.handleNextEditToggle(requestId, params);
+      return;
+    }
+    // Any other correlated method: acknowledge with no result.
+    this.send({ type: 'control.response', requestId, ok: true, result: undefined });
+  }
+
+  /**
+   * R5 (Task 13): the standalone mirror of the host's Guard. Modelled, not
+   * acked: the catch-all above would have confirmed BOTH sources on, which is
+   * precisely the both-on state the real Guard makes unreachable — and this
+   * scaffold is the only place the toggle UX (including the refusal
+   * snap-back) can be driven pre-Fedora, so it has to tell the truth.
+   *
+   * Mirrors `applyToggleRequest`'s rule and `NextEditGuard`'s ordering: a
+   * refusal persists nothing and pushes nothing; an accepted change notifies
+   * BEFORE the response resolves. The refusal copy is the Guard's own.
+   */
+  private handleNextEditToggle(requestId: number, params: Record<string, unknown> | undefined): void {
+    const source = params?.source;
+    const on = params?.on;
+    if ((source !== 'next' && source !== 'generic') || typeof on !== 'boolean') {
+      this.send({
+        type: 'control.response',
+        requestId,
+        ok: false,
+        error: { message: 'Next Edit: malformed toggle request.' },
+      });
+      return;
+    }
+    const conflict = source === 'next' ? this.nextEditToggles.generic : this.nextEditToggles.next;
+    if (on && conflict) {
+      this.send({
+        type: 'control.response',
+        requestId,
+        ok: false,
+        error: { message: mockRefusalMessage(source) },
+      });
+      return;
+    }
+    this.nextEditToggles =
+      source === 'next'
+        ? { next: on, generic: this.nextEditToggles.generic }
+        : { next: this.nextEditToggles.next, generic: on };
+    this.send({ type: 'nextEdit.state', state: this.nextEditToggles });
+    this.send({ type: 'control.response', requestId, ok: true, result: this.nextEditToggles });
+  }
+
+  /** Start (or restart) `sessionId`'s scripted turn from the top — an
+   * unregistered sessionId (a `prompt` for a session the mock never bound,
+   * theoretically unreachable through the real App.tsx flow) is dropped
+   * silently rather than fabricating a player, mirroring the reducer's own
+   * drop-unknown discipline. */
+  private runTurn(sessionId: string): void {
+    const player = this.players.get(sessionId);
+    if (!player) return;
+    this.clearTimers(player);
+    player.parkedAt = -1;
+    this.playFrom(player, 0);
+  }
+
+  /** Walk `mockTurn` from step `i` for `player`'s OWN session, sleeping each
+   * step's delay, parking on gates. Every emitted message is restamped onto
+   * `player.sessionId` — the P-1 isolation guarantee for the mock itself. */
+  private playFrom(player: SessionPlayer, i: number): void {
+    if (i >= mockTurn.length) return;
+    const step = mockTurn[i];
+    if (step === undefined) return;
+    this.at(player, step.delayMs, () => {
+      this.emit(restamp(step.message, player.sessionId));
+      if (step.gate) {
+        player.parkedAt = i;
+        return; // wait for the matching user response
+      }
+      this.playFrom(player, i + 1);
+    });
+  }
+
+  /** Resume `sessionId`'s parked script iff it is genuinely parked on
+   * `approvalId` — a mismatched or already-resolved session is a silent
+   * no-op (never resumes a DIFFERENT tab's script; the independent-parking
+   * guarantee B12 exists to exercise). */
+  private resumeParked(sessionId: string, approvalId: string): void {
+    const player = this.players.get(sessionId);
+    if (!player || player.parkedAt < 0 || approvalId !== mockApprovalId) return;
+    const resume = player.parkedAt + 1;
+    player.parkedAt = -1;
+    this.playFrom(player, resume);
+  }
+
+  private cancelTurn(sessionId: string): void {
+    const player = this.players.get(sessionId);
+    if (player) {
+      this.clearTimers(player);
+      player.parkedAt = -1;
+    }
+    this.emit({ type: 'turn.end', turnId: 'turn-1', sessionId, status: 'cancelled' });
+  }
+
+  /** W4 §2d/§7 B12: send + track nothing globally anymore (each message
+   * already carries its OWN correct sessionId, restamped at the source). */
+  private emit(message: HostToWebview): void {
+    this.send(message);
+  }
+
+  /** Delay helper (per-player timer bookkeeping) that respects reduced-motion
+   * by collapsing to near-instant. */
+  private at(player: SessionPlayer, ms: number, fn: () => void): void {
+    const delay = REDUCED_MOTION ? Math.min(ms, 30) : ms;
+    player.timers.push(setTimeout(fn, delay));
+  }
+
+  private clearTimers(player: SessionPlayer): void {
+    player.timers.forEach(clearTimeout);
+    player.timers = [];
+  }
+}

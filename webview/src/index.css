@@ -1,0 +1,117 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Global element styling. Codicon font is imported in main.tsx from
+ * @vscode/codicons; Vite emits the .ttf as a hashed asset and rewrites the
+ * @font-face url() relatively, so the host serves it via asWebviewUri under
+ * the font-src CSP directive. No external / CDN fonts.
+ */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--h-font-sans);
+  font-size: 13px;
+  color: var(--h-fg);
+  background: var(--h-surface);
+  -webkit-font-smoothing: antialiased;
+  /* never scroll the page body horizontally — inner regions scroll instead */
+  overflow: hidden;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Thin, theme-aware scrollbars that match VS Code's own. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--vscode-scrollbarSlider-background, rgba(255, 255, 255, 0.18)) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background, rgba(255, 255, 255, 0.18));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground, rgba(255, 255, 255, 0.28));
+  background-clip: padding-box;
+}
+
+/* Keyboard focus visibility is part of the quality floor. */
+:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, var(--h-accent));
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+/* Telemetry micro-label: the signature monospace uppercase readout. */
+.h-eyebrow {
+  font-family: var(--h-font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--h-faint);
+}
+
+.codicon {
+  font-size: 16px;
+  line-height: 1;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/*
+ * T-15/F12: VS Code's own `workbench.reduceMotion` setting does not set the
+ * OS-level `prefers-reduced-motion` media feature the rule above relies on
+ * — it reaches a webview only as the `vscode-reduce-motion` class VS Code
+ * adds to `<body>` (VS Code webview API guide, fetched live for this task:
+ * https://code.visualstudio.com/api/extension-guides/webview). Duplicate the
+ * same kill rules under that class so a user who set the VS Code preference
+ * but whose OS has no reduced-motion preference set still gets it.
+ */
+body.vscode-reduce-motion *,
+body.vscode-reduce-motion *::before,
+body.vscode-reduce-motion *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+}
+
+/* Ambient "live" pulse for running/streaming indicators (motion-safe). */
+@keyframes h-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.h-live {
+  animation: h-pulse 1.4s ease-in-out infinite;
+}

@@ -1,0 +1,20 @@
+# A-3 (final-review-findings.md, final-fix-wave-3): pin line endings so a
+# fresh checkout is reproducible across Windows/macOS/Linux dev boxes, and
+# matches the Fedora/Linux ship target.
+#
+# Without this pin, a fresh Windows checkout with `core.autocrlf=true`
+# silently converts the repo's LF line endings to CRLF on checkout. That
+# breaks `src/shared/secretPaths.freeze.test.ts`'s `classifyPath` freeze-lock:
+# its `CLOSE_MARKER = '\n}\n'` never matches inside a CRLF-terminated file, so
+# `extractClassifyPathSpan` throws before the hash comparison ever runs. All
+# four final-review worktrees hit exactly this. It fails RED — the safe
+# direction — but an unreproducible red on the single most security-critical
+# lock in the repo (the byte-freeze on `classifyPath`, golden
+# `3e7a0b3e6805415b4ad24c520c141bb0b578598bd2b574fcb65dc69cfec79bf2`) trains
+# people to wave off that failure as a known-flaky checkout artifact instead
+# of a real signal — precisely the one lock nobody may ever learn to ignore.
+#
+# `text=auto eol=lf` forces every text file (git's own heuristic decides text
+# vs. binary) to LF in the working tree regardless of a contributor's local
+# `core.autocrlf`, so "gate green" means the same thing on every box.
+* text=auto eol=lf

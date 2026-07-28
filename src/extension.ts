@@ -1,0 +1,694 @@
+import * as path from 'node:path';
+
+import * as vscode from 'vscode';
+import { HermesViewProvider } from './host/HermesViewProvider';
+import { AgentBackend } from './host/backend/AgentBackend';
+import { MockBackend } from './host/backend/MockBackend';
+import { AcpBackend } from './host/backend/AcpBackend';
+import type { HermesRuntimeConfig } from './host/runtime/resolveHermes';
+import { registerHermesAutocomplete } from './autocomplete';
+import { createIndexer, type Indexer } from './rag/indexer';
+import { selectBackendKind, shouldActivateLib, shouldActivateRag } from './host/trustGate';
+import { isHttpUrl } from './shared/url';
+import type { AcpMcpServerStdio } from './host/backend/acp/acpClient';
+import { CODEBASE_SEARCH_TOOL_NAME } from './mcp/toolSchema';
+import { createLibServerHost } from './mcp/lsp/libServerHost';
+import { buildLibMcpServer, createSharedLspToolState } from './mcp/lsp/tools';
+import { createLibToolDeps } from './host/lib/libToolDeps.vscode';
+import { CheckpointTracker, GitUnavailableError } from './host/checkpoints/CheckpointTracker';
+import { HermesDashboardManager, type DashboardService } from './host/dashboard/HermesDashboardManager';
+import { ContextResolver } from './host/context/resolver';
+import { createVscodeContextPorts } from './host/context/ports.vscode';
+import { TerminalCapture } from './host/context/terminalCapture';
+import type { FindFilesFn } from './host/context/searchFilesResponse';
+import { createGitPort } from './host/scm/gitPort';
+import { registerEditorActions } from './host/commands/editorActions.vscode';
+import { HermesCodeActionProvider } from './host/commands/HermesCodeActionProvider';
+import { registerDiffDecisionCommands } from './host/commands/diffDecision.vscode';
+import { EditPreviewRegistry } from './host/preview/EditPreviewRegistry';
+import { DiffPreviewProvider, HERMES_DIFF_SCHEME } from './host/preview/DiffPreviewProvider';
+import { registerGenerateCommitMessageCommand } from './host/scm/generateCommitCommand.vscode';
+
+/**
+ * P7-N12 · I-9 — the shape a trust-gated MCP-server zone (RAG, LIB, and any
+ * future one) is configured with: a `hermes.<section>.enabled` toggle, an
+ * `enabled ∧ hasWorkspace ∧ isTrusted` gate, and a log prefix for the
+ * "why not started" line. See {@link registerTrustGatedZone}.
+ */
+interface TrustGatedZoneOptions {
+  /** The `hermes.<section>` config namespace this zone's `enabled` flag
+   * lives under (`hermes.rag` / `hermes.lib`) — also the exact key echoed,
+   * verbatim, in the "disabled" reason string. */
+  readonly configSection: 'hermes.rag' | 'hermes.lib';
+  /** Log-line prefix (`Hermes RAG` / `Hermes LSP` — LIB's zone is
+   * architecturally "LIB" but has always logged as "Hermes LSP"; preserved
+   * verbatim by this refactor, not renamed). */
+  readonly logPrefix: string;
+  /** Read fresh on every eligibility check (never cached) — same posture the
+   * original per-zone closures already had. */
+  readonly hasWorkspace: () => boolean;
+  readonly isTrusted: () => boolean;
+  readonly shouldActivate: (enabled: boolean, hasWorkspace: boolean, isTrusted: boolean) => boolean;
+  readonly output: vscode.OutputChannel;
+  /**
+   * The zone's actual start logic — invoked ONCE, the first time eligibility
+   * passes. Deliberately left to the caller: RAG's `activateCodebaseRag` is
+   * fire-and-forget (its own try/catch covers the index-build step) while
+   * LIB awaits `libHost.start()` and needs its own `.catch` — those two
+   * shapes differ enough that folding them into this helper would obscure a
+   * real difference (per the brief's own escape hatch); only the identical
+   * latch→eligibility→log ceremony above `start()` is centralized here.
+   */
+  readonly start: () => void;
+}
+
+/**
+ * P7-N12 · I-9 (`.superpowers/sdd/reports/final-3way-2-arch.md`) — the
+ * identical latch→eligibility→log ceremony Zone RG (RAG) and Zone LIB each
+ * hand-duplicated ("a 2nd MCP server means a 3rd copy"). Behavior-preserving
+ * extraction: the SAME `enabled` config read, the SAME `shouldActivate*`
+ * gate, the SAME three-way "disabled / no workspace / not trusted" reason
+ * string, and the SAME once-only latch every zone had before this
+ * extraction — only centralized into one place. Returns a `run()` function
+ * the caller invokes once at activation time and again, idempotently
+ * (latch-guarded), from `onDidGrantWorkspaceTrust` — the CALL ORDER between
+ * zones (RAG before LIB) is still whatever order the caller invokes the
+ * returned functions in; this helper only owns the per-zone gate, not
+ * cross-zone sequencing.
+ */
+function registerTrustGatedZone(opts: TrustGatedZoneOptions): () => void {
+  let started = false;
+  return () => {
+    if (started) return;
+    const enabled = vscode.workspace.getConfiguration(opts.configSection).get<boolean>('enabled', true);
+    if (!opts.shouldActivate(enabled, opts.hasWorkspace(), opts.isTrusted())) {
+      const reason = !enabled
+        ? `disabled (${opts.configSection}.enabled=false)`
+        : !opts.hasWorkspace()
+          ? 'no workspace open'
+          : 'workspace not trusted (Restricted Mode)';
+      opts.output.appendLine(`${opts.logPrefix}: not started — ${reason}.`);
+      return;
+    }
+    started = true;
+    opts.start();
+  };
+}
+
+/**
+ * Extension entry point.
+ *
+ * Wiring is intentionally tiny: pick a backend, hand it to the view provider,
+ * register the view + commands, then bring the two independent zones
+ * (autocomplete, codebase RAG) online alongside it. Activation is lazy — VS
+ * Code auto-generates the `onView:hermes.panel` activation event for the
+ * contributed webview view (package.json, Agent C), so we never use `"*"`
+ * (best-practices.md).
+ */
+export function activate(context: vscode.ExtensionContext): void {
+  const output = vscode.window.createOutputChannel('Hermes');
+  context.subscriptions.push(output);
+
+  // ── Backend selection: the mock→real swap seam (TRUST-GATED) ─────────────
+  // DEFAULT is the mock so the panel runs on any OS with no Hermes process
+  // (pinned decision #4). `hermes.backend: "acp"` switches to the real
+  // backend, which spawns `hermes acp` (Fedora/Linux only, per Zone ACP).
+  //
+  // SECURITY (security-review.md C1): the `acp` backend spawns child processes
+  // via the (now machine-scoped) `hermes.pythonPath`/`hermes.cwd`. It is only
+  // ever constructed in a TRUSTED workspace; otherwise we fall back to the
+  // process-free mock. `selectBackendKind` is the single decision point.
+  const readRuntimeConfig = (): HermesRuntimeConfig => {
+    const hermesCfg = vscode.workspace.getConfiguration('hermes');
+    return {
+      hermesPath: hermesCfg.get<string>('hermesPath', '').trim() || undefined,
+      pythonPath: hermesCfg.get<string>('pythonPath', '').trim() || undefined,
+      cwd: hermesCfg.get<string>('cwd', '').trim() || firstWorkspaceRoot(),
+    };
+  };
+  const configuredBackend = (): string =>
+    vscode.workspace.getConfiguration('hermes').get<string>('backend', 'mock');
+
+  // W1.5: the dashboard REST channel (adopt-or-spawn `HermesDashboardManager`)
+  // powering the REAL Skills & Tools panels. Constructed ONLY in the acp path,
+  // which only holds in a trusted workspace (`selectBackendKind`) — the same
+  // process-spawn gate the ACP/tui_gateway children already sit behind, so it
+  // never spawns in mock/untrusted. A#10: the OWNING `AcpBackend` disposes it
+  // (`AcpBackend.dispose` -> `dashboard.dispose()`), so a trust-upgrade swap
+  // (which disposes the old backend) also kills its dashboard — no separate
+  // `context.subscriptions` entry that could outlive the backend. `dispose()`
+  // kills any `serve` child we spawned; an adopted dashboard is left running.
+  //
+  // S3 (CWE-306/346): `hermes.dashboardAdopt` selects discovery strategy —
+  // `'spawn-only'` (secure default) never adopts a foreign peer; `'shape'` is
+  // the legacy INSECURE opt-in. Any unrecognised config value fails CLOSED to
+  // the secure default rather than being cast/trusted.
+  const createDashboard = (): DashboardService => {
+    const cfg = vscode.workspace.getConfiguration('hermes');
+    const port = cfg.get<number>('dashboardPort', 9119);
+    const adopt: 'spawn-only' | 'shape' =
+      cfg.get<string>('dashboardAdopt', 'spawn-only') === 'shape' ? 'shape' : 'spawn-only';
+    return new HermesDashboardManager({ config: readRuntimeConfig(), port, adopt, logger: output });
+  };
+
+  // W2 T2d (§2a/§2d point 4): the real `ContextResolver`, gated EXACTLY like
+  // `createCheckpointTracker`/`createDashboard` above — constructed only
+  // inside `makeAcpBackend` (trusted workspace + `backend==='acp'`, the same
+  // `selectBackendKind` decision point). The MockBackend path never calls
+  // this, so it stays resolver-free by construction. `searchFilesPort` is
+  // captured in the outer closure below so the SAME trust-gated
+  // `WorkspacePort.findFiles` can also be wired into `HermesViewProvider`'s
+  // `context.searchFiles` handler (§2e) — a separate seam from the resolver
+  // (the resolver lives inside `AcpBackend`; search doesn't touch the agent
+  // at all), but gated by the identical condition.
+  let searchFilesPort: FindFilesFn | undefined;
+
+  // W2 T4 (F-D, §3.5): the host-only, ask-path-scoped diff-preview registry.
+  // ONE shared instance for the extension's lifetime — constructed here
+  // (before any backend), injected into every `AcpBackend` `makeAcpBackend()`
+  // builds (including the trust-upgrade mock→real swap below), and read by
+  // the ONE `DiffPreviewProvider` registered once, further down. Never reset
+  // across a backend swap: the OLD backend's own `dispose()` ->
+  // `teardownSession()` -> `cancelPendingApprovals()` already clears every
+  // entry it owned before the swap replaces it, so nothing stale survives.
+  const editPreviewRegistry = new EditPreviewRegistry();
+
+  const makeAcpBackend = (): AcpBackend => {
+    const terminalCapture = new TerminalCapture(output);
+    context.subscriptions.push(terminalCapture);
+    const ports = createVscodeContextPorts(terminalCapture, createGitPort());
+    searchFilesPort = ports.workspace.findFiles;
+
+    return new AcpBackend(
+      readRuntimeConfig(),
+      output,
+      undefined,
+      createCheckpointTracker(context, output),
+      createDashboard(),
+      new ContextResolver(ports),
+      editPreviewRegistry,
+    );
+  };
+
+  let backend: AgentBackend =
+    selectBackendKind(configuredBackend(), vscode.workspace.isTrusted) === 'acp'
+      ? makeAcpBackend()
+      : new MockBackend();
+  context.subscriptions.push(backend);
+
+  // ── View provider ────────────────────────────────────────────────────────
+  const provider = new HermesViewProvider(
+    context.extensionUri,
+    backend,
+    output,
+    searchFilesPort,
+  );
+  context.subscriptions.push(provider);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      HermesViewProvider.viewId,
+      provider,
+      { webviewOptions: { retainContextWhenHidden: true } },
+    ),
+  );
+
+  // ── Commands ─────────────────────────────────────────────────────────────
+  context.subscriptions.push(
+    vscode.commands.registerCommand('hermes.newSession', () =>
+      provider.newSession(),
+    ),
+    // Audit H-1: both of these were DECLARED in package.json and registered
+    // nowhere. `hermes.openSettings` is bound to a permanently visible gear on
+    // the panel title (`package.json:197`, view/title, navigation@1), so every
+    // click produced VS Code's "command 'hermes.openSettings' not found".
+    // Locked by `src/host/commandParity.test.ts`.
+    vscode.commands.registerCommand('hermes.openSettings', () =>
+      vscode.commands.executeCommand('workbench.action.openSettings', '@ext:syntinal.hermes-vscode'),
+    ),
+    vscode.commands.registerCommand('hermes.showLogs', () => output.show()),
+  );
+
+  // ── W2 T4 (F-D, §3.5): read-only proposed-edit diff preview ──────────────
+  // The `hermes-diff:` virtual-document provider + its editor-title Accept/
+  // Reject commands. Registered ONCE, unconditionally (never gated behind
+  // trust/`hermes.ready` like the editor actions below) — both are inert
+  // until a `diff.open` actually fires, which only ever happens from a LIVE
+  // pending-approval DiffCard in the real backend; registering them earlier
+  // is harmless (no fs/process touch) and, unlike the editor actions, they
+  // are never re-registered on a later trust grant, so there is no
+  // double-registration hazard to guard against here.
+  const diffPreviewProvider = new DiffPreviewProvider(editPreviewRegistry);
+  context.subscriptions.push(diffPreviewProvider);
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(HERMES_DIFF_SCHEME, diffPreviewProvider),
+  );
+  // `getBackend` is a thunk (not a snapshot) so the trust-upgrade mock→real
+  // swap below (which reassigns the outer `backend` binding) is reflected at
+  // invocation time — same posture as `startRagIfEligible`'s backend read.
+  registerDiffDecisionCommands(context, () => backend);
+
+  // ── W2 T3 (§3.3): `hermes.ready` context key = trusted ∧ real backend ────
+  // The FULL gate (refines the S0 "always true" scaffolding): the SAME
+  // trust+backend decision `selectBackendKind`/`makeAcpBackend` use above,
+  // so `hermes.ready` is true iff the workspace is trusted AND
+  // `hermes.backend` is actually `acp` — exactly the Cody `cody.activated`
+  // pattern doc §3.3 pins. Drives the `editor/context` "Hermes" submenu's
+  // `when: editorHasSelection && hermes.ready` (package.json) and gates the
+  // editor-actions/QuickFix registration below. Re-computed and re-set on
+  // `onDidGrantWorkspaceTrust` (below) since trust can only ever be granted
+  // mid-session, never revoked.
+  const isHermesReady = (): boolean => selectBackendKind(configuredBackend(), vscode.workspace.isTrusted) === 'acp';
+  const updateReadyContext = (): void => {
+    void vscode.commands.executeCommand('setContext', 'hermes.ready', isHermesReady());
+  };
+  updateReadyContext();
+
+  // ── W2 T3 (§3.3): F-A code actions — editor submenu + QuickFix ───────────
+  // Registering the (inert until invoked) commands/provider is itself
+  // harmless (no process spawn, no I/O) — gated here anyway so it comes
+  // online/offline in lockstep with `hermes.ready`'s OWN gate (same
+  // trusted-∧-real-backend condition the RAG indexer/dashboard/checkpoint
+  // tracker above already use), never registered twice on a later trust
+  // grant. `HermesCodeActionProvider` itself only ever SEEDS the composer
+  // (`editorActions.vscode.ts`) — never a `WorkspaceEdit`.
+  let editorActionsRegistered = false;
+  const registerEditorActionsIfEligible = (): void => {
+    if (editorActionsRegistered || !isHermesReady()) return;
+    editorActionsRegistered = true;
+    registerEditorActions(context, provider);
+    context.subscriptions.push(
+      vscode.languages.registerCodeActionsProvider('*', new HermesCodeActionProvider(), {
+        providedCodeActionKinds: HermesCodeActionProvider.providedCodeActionKinds,
+      }),
+    );
+  };
+  registerEditorActionsIfEligible();
+
+  // ── W2 T5c (F-C, §3.4): commit-gen `scm/title` $(sparkle) command ────────
+  // Same trust-gated latch posture as the editor actions above: registering
+  // the (inert until invoked) command is itself harmless, but it is gated
+  // here so it comes online/offline in lockstep with `hermes.ready`'s SAME
+  // trusted-∧-real-backend condition (`package.json`'s `scm/title` `when`
+  // clause repeats that condition on the button itself) — a real (not mock)
+  // backend is required anyway, since only `AcpBackend` implements the
+  // one-shot surface the command binds to (`generateCommitCommand.vscode.ts`'s
+  // `oneShotCapable` guard). `getBackend` is a thunk so the trust-upgrade
+  // mock→real swap below is reflected at invocation time, same as
+  // `registerDiffDecisionCommands` above.
+  let generateCommitCommandRegistered = false;
+  const registerGenerateCommitMessageCommandIfEligible = (): void => {
+    if (generateCommitCommandRegistered || !isHermesReady()) return;
+    generateCommitCommandRegistered = true;
+    registerGenerateCommitMessageCommand(context, () => backend, output);
+  };
+  registerGenerateCommitMessageCommandIfEligible();
+
+  // ── Zone AC: inline (FIM) autocomplete ───────────────────────────────────
+  // Self-registers its own disposables (config watcher, provider, secret) —
+  // see src/autocomplete/index.ts. Safe in untrusted workspaces: no process
+  // spawn, no FS walk, secret-classified documents are never completed (S4.1),
+  // an API key is never sent over cleartext http to a remote host (S4.2), and
+  // in Restricted Mode a remote (non-loopback) endpoint is skipped entirely
+  // (S4.3) — only the default loopback path stays live untrusted. Reads
+  // `hermes.autocomplete.*` itself.
+  //
+  // A5: `reportFailure` is the real implementation of provider.ts's injected
+  // seam — every surfaced (actionable) autocomplete failure also gets one
+  // line in the SAME `Hermes` output channel every other zone logs to.
+  //
+  // W5.1 R5 (Task 13): the third argument publishes the next-edit toggle
+  // capability to the view provider once the Guard has hydrated, so the
+  // Settings panel's «Next Edit Suggestions» rows can drive it over the
+  // host-internal correlated `nextEdit.toggle` request. The port is built
+  // inside `registerHermesAutocomplete` (the only holder of the Guard) and
+  // routes through `requestNextEditToggle`, never `guard.requestToggle`.
+  registerHermesAutocomplete(
+    context,
+    (msg) => output.appendLine(msg),
+    (port) => provider.setNextEditToggles(port),
+  );
+
+  // ── Zone RG: codebase RAG indexer + MCP search server (TRUST-GATED) ──────
+  // The indexer walks the workspace and POSTs file contents to an embeddings
+  // endpoint, so it only runs in a trusted workspace (C1 exfil vector B).
+  const startRagIfEligible = registerTrustGatedZone({
+    configSection: 'hermes.rag',
+    logPrefix: 'Hermes RAG',
+    hasWorkspace: () => !!firstWorkspaceRoot(),
+    isTrusted: () => vscode.workspace.isTrusted,
+    shouldActivate: shouldActivateRag,
+    output,
+    start: () => {
+      // Zone RAG (`docs/specs/wave-1-golive.md` pinned contract): register
+      // `codebase_search` with whichever backend is CURRENT when this callback
+      // fires — `backend` is the outer `let` above, so a trust-triggered
+      // mock→real upgrade (below) is already reflected by the time it runs.
+      void activateCodebaseRag(context, output, (server) => {
+        if (backend instanceof AcpBackend) backend.setMcpServer('codebase_search', server);
+      });
+    },
+  });
+  startRagIfEligible();
+
+  // ── Zone LIB: read-only LSP-over-HTTP MCP server (TRUST-GATED) ───────────
+  // Binds a loopback listener exposing live language-server intelligence
+  // (diagnostics/definitions/references/symbols/hover) as read-only MCP
+  // tools, so it only runs in a trusted workspace with an open folder —
+  // mirrors Zone RG's trust gate exactly (`shouldActivateLib`, `trustGate.ts`).
+  //
+  // OWNERSHIP (research doc §4.1): `libHost` is constructed ONCE here and
+  // pushed onto `context.subscriptions` — extension-host lifetime, deliberately
+  // NOT owned/disposed by `AcpBackend` the way the dashboard is (`AcpBackend`
+  // above). `start()` is idempotent (same port/token on every call), so this
+  // singleton survives the mock→acp backend upgrade on trust-grant below, and
+  // is exactly the seam a future W4 multi-session window reuses unchanged.
+  //
+  // S-1 fix (`.superpowers/sdd/reports/final-3way-arch.md` finding S-1): the
+  // stateless HTTP transport (`server.ts`) calls `buildMcpServer` below on
+  // EVERY POST/tool call, so `createSharedLspToolState()` — the concurrency
+  // pool, first-empty indexing tracker, and doc-symbols LRU — is constructed
+  // exactly ONCE here, at the composition root, and threaded through every
+  // `createLibToolDeps` call. `buildLibMcpServer`/`createLibToolDeps`
+  // themselves still run fresh per POST (the correct per-request McpServer
+  // idiom) — only these three primitives are long-lived.
+  const sharedLspToolState = createSharedLspToolState();
+  const libHost = createLibServerHost({
+    buildMcpServer: () => buildLibMcpServer(createLibToolDeps(output, sharedLspToolState)),
+    log: (m) => output.appendLine(`Hermes LSP: ${m}`),
+    // T-9 (squatter full closure, following up T-E1): the accessor already
+    // burns on permanent-down (`libServerHost`'s own `advertisement()`
+    // clears), but this session already captured a COPY below
+    // (`backend.setMcpServer('vscode_lsp', advertisement)`) that would
+    // otherwise be re-sent, token included, on every future
+    // `session/new`/`session/load`/`session/resume` — to whatever now owns
+    // the port. Withdraw it from whichever backend is CURRENT when this
+    // fires — same outer-`let` re-target posture as the registration site
+    // below and the RAG zone's `setMcpServer` call above.
+    onPermanentDown: () => {
+      if (backend instanceof AcpBackend) {
+        backend.setMcpServer('vscode_lsp', undefined);
+      }
+      output.appendLine(
+        'Hermes LSP: server permanently down — tool registration withdrawn for future sessions.',
+      );
+    },
+  });
+  context.subscriptions.push(libHost);
+
+  const startLibIfEligible = registerTrustGatedZone({
+    configSection: 'hermes.lib',
+    logPrefix: 'Hermes LSP',
+    hasWorkspace: () => !!firstWorkspaceRoot(),
+    isTrusted: () => vscode.workspace.isTrusted,
+    shouldActivate: shouldActivateLib,
+    output,
+    start: () => {
+      // Init runs eagerly here (research doc §4.2) — there is no wire to add an
+      // MCP server to a LIVE session, so registration must exist before the
+      // webview-mount-triggered `AcpBackend.start()` races it. Bind first...
+      void (async (): Promise<void> => {
+        await libHost.start();
+        const advertisement = libHost.advertisement();
+        if (advertisement === undefined) {
+          // Fail-soft (§4.1): a failed bind (or the one allowed same-port rebind
+          // also failing) leaves LIB permanently down for this ext-host session —
+          // no tools registered, nothing to un-register later.
+          output.appendLine('Hermes LSP: bind failed — LIB stays down for this session.');
+          return;
+        }
+        // ...then register with whichever backend is CURRENT when this resolves —
+        // `backend` is the outer `let` above, same posture as `startRagIfEligible`,
+        // so a trust-triggered mock→real upgrade is already reflected here.
+        if (backend instanceof AcpBackend) {
+          backend.setMcpServer('vscode_lsp', advertisement);
+        }
+      })().catch((err: unknown) => {
+        output.appendLine(`Hermes LSP: unexpected start failure — ${String(err)}`);
+      });
+    },
+  });
+  startLibIfEligible();
+
+  // ── Bring trust-gated features online if trust is granted mid-session ────
+  context.subscriptions.push(
+    vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      output.appendLine('Hermes: workspace trust granted — enabling trust-gated features.');
+      // Upgrade mock → real backend if the user configured `acp`.
+      if (
+        selectBackendKind(configuredBackend(), true) === 'acp' &&
+        !(backend instanceof AcpBackend)
+      ) {
+        const upgraded = makeAcpBackend();
+        context.subscriptions.push(upgraded);
+        provider.setBackend(upgraded);
+        // `makeAcpBackend` just reassigned `searchFilesPort` (closure) to the
+        // freshly-constructed trust-gated `WorkspacePort.findFiles` — rewire
+        // the view provider's `context.searchFiles` source the same way
+        // `setBackend` rewires the backend, so `@file` search comes online
+        // on this trust-upgrade path too (§2e).
+        provider.setSearchFiles(searchFilesPort);
+        backend.dispose();
+        backend = upgraded;
+        output.appendLine('Hermes: backend upgraded to AcpBackend.');
+      }
+      startRagIfEligible();
+      // §4.2 ordering: the backend upgrade above (if any) and `startRagIfEligible()`
+      // both happen BEFORE this — `startLibIfEligible` reads the CURRENT
+      // `backend` (same closure-over-outer-`let` posture as RAG), so calling
+      // it any earlier would risk registering the spec on the soon-disposed
+      // Mock backend instead of the freshly-upgraded `AcpBackend`.
+      startLibIfEligible();
+      // W2 T3 (§3.3): re-derive `hermes.ready` now that trust flipped — the
+      // Cody `cody.activated` re-set pattern — and bring the editor
+      // actions/QuickFix online if they weren't already (mirrors the RAG
+      // latch immediately above; both gate on the identical trusted-∧-acp
+      // condition).
+      updateReadyContext();
+      registerEditorActionsIfEligible();
+      registerGenerateCommitMessageCommandIfEligible();
+    }),
+  );
+
+  output.appendLine(
+    `Hermes extension activated (${backend instanceof AcpBackend ? 'AcpBackend' : 'MockBackend'}${
+      vscode.workspace.isTrusted ? '' : ', Restricted Mode'
+    }).`,
+  );
+}
+
+/**
+ * The most-recently constructed checkpoint tracker (Fix-A follow-up / A#10): held
+ * at module scope ONLY so {@link deactivate} can flush its pending object
+ * localization before shutdown. Set in {@link createCheckpointTracker}.
+ */
+let activeCheckpointTracker: CheckpointTracker | undefined;
+
+export async function deactivate(): Promise<void> {
+  // Everything registered in `context.subscriptions` (the backend + its
+  // dashboard, the indexer, output channel) is disposed by VS Code
+  // automatically. The one durability-sensitive step is the checkpoint
+  // tracker's OFF-BARRIER object localization (Fix-A relocated `repack -a -d`
+  // off the turn's critical path, leaving a residual window where a real-repo
+  // `git gc` in the seconds before the debounced localization runs could orphan
+  // a just-made checkpoint). Flushing it here on shutdown closes that window
+  // (`CheckpointTracker.localizeAlternateObjects`'s note). Best-effort — never
+  // throw out of deactivate.
+  const tracker = activeCheckpointTracker;
+  if (tracker) {
+    try {
+      await tracker.flushLocalization();
+    } catch {
+      /* best-effort durability flush on shutdown */
+    }
+    tracker.dispose();
+  }
+}
+
+/**
+ * Bring up the Zone RG indexer (extension-host side), register the
+ * `codebase_search` MCP server (Zone RG's `dist/mcp/codebase-server.js`,
+ * spawned by Hermes itself — never by the extension) via `registerMcpServer`,
+ * then build the index. Requires `hermes.rag.enabled` and an open workspace;
+ * no-ops otherwise (there is nothing to index, nothing to register).
+ */
+async function activateCodebaseRag(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+  registerMcpServer: (server: AcpMcpServerStdio) => void,
+): Promise<void> {
+  const ragCfg = vscode.workspace.getConfiguration('hermes.rag');
+  const enabled = ragCfg.get<boolean>('enabled', true);
+  const workspaceRoot = firstWorkspaceRoot();
+
+  if (!enabled || !workspaceRoot) {
+    output.appendLine(
+      `Hermes RAG: ${!enabled ? 'disabled (hermes.rag.enabled=false)' : 'no workspace open'} — skipping indexer.`,
+    );
+    return;
+  }
+
+  const indexDirSetting = ragCfg.get<string>('indexDir', '.hermes/index') || '.hermes/index';
+  const indexDir = path.isAbsolute(indexDirSetting)
+    ? indexDirSetting
+    : path.join(workspaceRoot, indexDirSetting);
+  // May be a REMOTE embeddings node (by design). Only reject a non-http(s)
+  // scheme / garbage and fall back to the default; no loopback allow-listing.
+  const DEFAULT_EMBED_ENDPOINT = 'http://127.0.0.1:11434';
+  const rawEmbedEndpoint = ragCfg.get<string>('embedEndpoint', DEFAULT_EMBED_ENDPOINT);
+  const embedEndpoint = isHttpUrl(rawEmbedEndpoint) ? rawEmbedEndpoint : DEFAULT_EMBED_ENDPOINT;
+  if (embedEndpoint !== rawEmbedEndpoint) {
+    output.appendLine(
+      `Hermes RAG: invalid embedEndpoint (not http/https) — falling back to ${DEFAULT_EMBED_ENDPOINT}.`,
+    );
+  }
+  const embedModel = ragCfg.get<string>('embedModel', 'qwen3-embedding:0.6b');
+  const dims = ragCfg.get<number>('dims', 0);
+  const maxChunkTokens = ragCfg.get<number>('maxChunkTokens', 512);
+  const debounceMs = ragCfg.get<number>('debounceMs', 500);
+  const excludeGlobs = ragCfg.get<string[]>('excludeGlobs', []);
+
+  // ── MCP server registration (Zone RAG) ────────────────────────────────────
+  // Register `codebase_search` with the ACP backend BEFORE the (potentially
+  // slow) initial index build below, so it's already known by the time
+  // `AcpBackend.start()` fires `session/new` — which can happen as soon as
+  // the webview mounts (`HermesViewProvider`'s `ready` handler), independent
+  // of how long indexing takes. Trust + `hermes.rag.enabled` gating already
+  // happened above/in the caller (this function only ever runs when
+  // `shouldActivateRag` said yes — see `startRagIfEligible`); no trust
+  // decision is made here.
+  //
+  // PACKAGING (architecture-review.md P0 / wave-1.md "[PACKAGE — P0]"): spawn
+  // via VS Code's OWN bundled Node (`process.execPath` + `ELECTRON_RUN_AS_NODE`)
+  // instead of a bare `node` on PATH, so this works on a Fedora box with no
+  // system Node install — the extension (and the child it hands this spec to)
+  // is then fully self-contained. `process.execPath` inside Electron plus
+  // `ELECTRON_RUN_AS_NODE: '1'` makes the same binary behave as plain
+  // `node <script> <args>` (standard Electron/VS Code trick).
+  const mcpServer = buildRagMcpServer({
+    nodeExecPath: process.execPath,
+    serverScriptPath: context.asAbsolutePath(path.join('dist', 'mcp', 'codebase-server.js')),
+    indexDir,
+    embedEndpoint,
+    embedModel,
+    dims,
+  });
+  registerMcpServer(mcpServer);
+  output.appendLine(
+    `Hermes RAG: registered '${CODEBASE_SEARCH_TOOL_NAME}' MCP server (re-sent on every session/new).`,
+  );
+
+  // The extension's OWN tree-sitter-wasms grammars — never the workspace's
+  // (integration checklist #5 / wave-1.md task 5). `context.asAbsolutePath`
+  // resolves relative to the installed extension, independent of cwd/OS.
+  const grammarsDir = context.asAbsolutePath(
+    path.join('node_modules', 'tree-sitter-wasms', 'out'),
+  );
+
+  const indexer: Indexer = createIndexer({
+    workspaceRoot,
+    indexDir,
+    embedEndpoint,
+    embedModel,
+    dims,
+    maxChunkTokens,
+    debounceMs,
+    extraIgnoreGlobs: excludeGlobs,
+    grammarsDir,
+  });
+
+  context.subscriptions.push(indexer.watch());
+  context.subscriptions.push({ dispose: () => indexer.dispose() });
+
+  try {
+    await indexer.build();
+    output.appendLine('Hermes RAG: initial index build complete.');
+  } catch (err) {
+    output.appendLine(`Hermes RAG: initial index build failed — ${String(err)}`);
+  }
+}
+
+/**
+ * Build the `codebase_search` `AcpMcpServerStdio` value (Zone RAG). Pure
+ * function of primitive config — no `vscode`/OS/FS touch — so it's
+ * unit-testable without an extension host. Pinned shape
+ * (`docs/specs/wave-1-golive.md`): `{name, command, args[],
+ * env:[{name,value}]}` — `env` is a LIST of `{name,value}` pairs (ACP
+ * `EnvVariable`), NOT a dict, unlike Node's own `child_process` env
+ * convention.
+ */
+export function buildRagMcpServer(params: {
+  nodeExecPath: string;
+  serverScriptPath: string;
+  indexDir: string;
+  embedEndpoint: string;
+  embedModel: string;
+  dims: number;
+}): AcpMcpServerStdio {
+  return {
+    name: CODEBASE_SEARCH_TOOL_NAME,
+    command: params.nodeExecPath,
+    args: [params.serverScriptPath],
+    env: [
+      { name: 'ELECTRON_RUN_AS_NODE', value: '1' },
+      { name: 'HERMES_INDEX_DIR', value: params.indexDir },
+      { name: 'HERMES_EMBED_ENDPOINT', value: params.embedEndpoint },
+      { name: 'EMBED_MODEL', value: params.embedModel },
+      { name: 'HERMES_EMBED_DIMS', value: String(params.dims) },
+    ],
+  };
+}
+
+function firstWorkspaceRoot(): string | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
+/**
+ * Zone CKPT: construct + lazily initialize the extension-side checkpoint
+ * tracker (shadow-git; `src/host/checkpoints/CheckpointTracker.ts`, frozen —
+ * used, never modified). Storage dir = this extension's own storage path
+ * (`context.globalStorageUri`, never the workspace); workspace root = the
+ * first open folder.
+ *
+ * Both call sites are already inside the `selectBackendKind(...) === 'acp'`
+ * branch, which only ever holds in a TRUSTED workspace (`trustGate.ts`) — so
+ * this needs no separate trust check of its own, even though the tracker
+ * spawns real `git` subprocesses with `cwd` inside the workspace (the same
+ * "spawns processes against workspace content" risk class as the ACP backend
+ * itself, security-review.md C1).
+ *
+ * `init()` is fire-and-forget here: it's also auto-invoked lazily by every
+ * `CheckpointTracker` method, so activation never blocks on it. A rejection
+ * (in particular `GitUnavailableError` — `git` not found on PATH) is only
+ * logged here; `AcpBackend.refreshCheckpointsPanel` is what actually turns
+ * ANY tracker failure into the panel's `available:false` state, so the exact
+ * timing of this `.catch()` racing a panel open doesn't matter. On success,
+ * also runs one opportunistic, non-blocking `cleanup()` (`git gc --prune`).
+ */
+function createCheckpointTracker(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+): CheckpointTracker | undefined {
+  const workspaceRoot = firstWorkspaceRoot();
+  if (!workspaceRoot) {
+    output.appendLine('Hermes Checkpoints: no workspace open — checkpoints disabled.');
+    return undefined;
+  }
+
+  const tracker = new CheckpointTracker(context.globalStorageUri.fsPath, workspaceRoot);
+  // Hold the latest tracker at module scope so `deactivate` can flush its
+  // pending object localization on shutdown (A#10 durability window).
+  activeCheckpointTracker = tracker;
+  tracker
+    .init()
+    .then(() => {
+      output.appendLine('Hermes Checkpoints: shadow-git tracker initialized.');
+      void tracker.cleanup().catch((err: unknown) => {
+        output.appendLine(`Hermes Checkpoints: cleanup failed — ${String(err)}`);
+      });
+    })
+    .catch((err: unknown) => {
+      const reason = err instanceof GitUnavailableError ? err.message : String(err);
+      output.appendLine(`Hermes Checkpoints: unavailable — ${reason}`);
+    });
+  return tracker;
+}
