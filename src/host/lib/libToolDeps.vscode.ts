@@ -248,7 +248,7 @@ export function createLibToolDeps(
   shared: SharedLspToolState,
 ): LspToolDeps {
   const rawGateway = createLspGateway();
-  const log = (msg: string): void => output.appendLine(`Hermes LSP: ${msg}`);
+  const log = (msg: string): void => output.appendLine(`Talaria LSP: ${msg}`);
 
   const gateway: LspToolGateway = {
     getDiagnostics(uri) {

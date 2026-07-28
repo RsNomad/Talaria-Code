@@ -31,7 +31,7 @@ if (root) {
           host payload layer 1 didn't anticipate, or any future bug) shows a
           recoverable "reload" fallback instead of unmounting to a blank
           webview. */}
-      <ErrorBoundary region="Hermes">
+      <ErrorBoundary region="Talaria Code">
         <App />
       </ErrorBoundary>
     </StrictMode>,

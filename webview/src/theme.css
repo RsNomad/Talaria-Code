@@ -1,9 +1,9 @@
 /*
- * Hermes brand tokens layered over VS Code theme variables.
+ * Talaria Code brand tokens layered over VS Code theme variables.
  * ------------------------------------------------------------------
  * Surfaces and text FOLLOW the user's active VS Code theme (via --vscode-*),
  * so the panel always feels native. Our teal brand accent + diff/status hues
- * are FIXED tokens layered on top, so it reads as "Hermes" in any theme.
+ * are FIXED tokens layered on top, so it reads as "Talaria Code" in any theme.
  *
  * VS Code puts .vscode-light / .vscode-dark / .vscode-high-contrast on <body>.
  * The var(--vscode-*, fallback) form keeps the UI legible when running the

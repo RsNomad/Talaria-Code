@@ -161,7 +161,7 @@ describe('HermesViewProvider — control.request responder (Part A2)', () => {
   });
 
   it('echoes an ok:false control.response carrying the rejection message on the same requestId', async () => {
-    const invokeControl = vi.fn().mockRejectedValue(new Error('Hermes session is not started yet.'));
+    const invokeControl = vi.fn().mockRejectedValue(new Error('Talaria session is not started yet.'));
     const { provider, posted } = makeProvider(invokeControl);
 
     seam(provider).handleWebviewMessage({
@@ -177,7 +177,7 @@ describe('HermesViewProvider — control.request responder (Part A2)', () => {
         type: 'control.response',
         requestId: 7,
         ok: false,
-        error: { message: 'Hermes session is not started yet.' },
+        error: { message: 'Talaria session is not started yet.' },
       },
     ]);
   });
@@ -735,7 +735,7 @@ describe('HermesViewProvider — W2 T4 F-D: diff.open routing', () => {
       'vscode.diff',
       expect.objectContaining({ scheme: 'hermes-diff', authority: 'before', path: '/session-1/tool-1/src/a.ts' }),
       expect.objectContaining({ scheme: 'hermes-diff', authority: 'after', path: '/session-1/tool-1/src/a.ts' }),
-      'a.ts (proposed by Hermes — pending approval)',
+      'a.ts (proposed by Talaria — pending approval)',
       { preview: true },
     );
   });
@@ -756,7 +756,7 @@ describe('HermesViewProvider — W2 T4 F-D: diff.open routing', () => {
       'vscode.diff',
       expect.objectContaining({ path: '/session-1/tool-2/src/deep/nested/file.ts' }),
       expect.objectContaining({ path: '/session-1/tool-2/src/deep/nested/file.ts' }),
-      'file.ts (proposed by Hermes — pending approval)',
+      'file.ts (proposed by Talaria — pending approval)',
       { preview: true },
     );
   });

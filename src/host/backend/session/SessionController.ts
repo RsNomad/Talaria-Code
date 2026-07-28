@@ -256,7 +256,7 @@ export class SessionController {
   sendPrompt(text: string, mode: AgentMode, attachments?: Attachment[], mentions?: ContextRef[]): void {
     const client = this.port.getClient();
     if (!client) {
-      this.port.emitSystemError('Hermes session is not started yet.');
+      this.port.emitSystemError('Talaria session is not started yet.');
       return;
     }
 

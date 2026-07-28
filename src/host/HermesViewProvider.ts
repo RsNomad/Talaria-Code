@@ -320,7 +320,7 @@ export class HermesViewProvider implements vscode.WebviewViewProvider {
     const capped = capSeedText(seed.text);
     if (capped.truncated) {
       void vscode.window.showWarningMessage(
-        'Hermes: the seeded prompt exceeded the 64 KB limit and was truncated.',
+        'Talaria: the seeded prompt exceeded the 64 KB limit and was truncated.',
       );
     }
     const payload = { text: capped.text, mentions: seed.mentions };
@@ -590,7 +590,7 @@ export class HermesViewProvider implements vscode.WebviewViewProvider {
         'vscode.diff',
         before,
         after,
-        `${basename} (proposed by Hermes — pending approval)`,
+        `${basename} (proposed by Talaria — pending approval)`,
         { preview: true },
       )
       .then(undefined, (err) => this.logger?.appendLine(`[diff.open] ${String(err)}`));
@@ -814,7 +814,7 @@ export class HermesViewProvider implements vscode.WebviewViewProvider {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link href="${styleUri}" rel="stylesheet" />
   <link href="${codiconUri}" rel="stylesheet" />
-  <title>Hermes</title>
+  <title>Talaria Code</title>
 </head>
 <body>
   <div id="root"></div>

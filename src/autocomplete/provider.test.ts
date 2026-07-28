@@ -926,7 +926,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
     // "incorrect". F-C Minor-3: statusText ("Forbidden"), not a bare code,
     // and "the vllm server", not raw "vllm" as the grammatical subject.
     expect(message).toBe(
-      'Hermes autocomplete: the vllm server rejected the request (403 Forbidden) — the API key is missing or incorrect.',
+      'Talaria autocomplete: the vllm server rejected the request (403 Forbidden) — the API key is missing or incorrect.',
     );
     expect(items).toContain('Set API Key');
   });
@@ -1035,7 +1035,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
   it('a MissingApiKeyError is always surfaced with the Set API Key action, and never carries a key value', async () => {
     const engine = new FakeEngine();
     engine.throwError = new MissingApiKeyError(
-      'hermes.autocomplete.backend=codestral requires an API key. Run "Hermes: Set Autocomplete API Key", or choose a local backend.',
+      'hermes.autocomplete.backend=codestral requires an API key. Run "Talaria: Set Autocomplete API Key", or choose a local backend.',
     );
     const showWarningMessage = mockShowWarningMessage;
     const provider = makeProvider(engine, undefined, { getBackendName: () => 'codestral' });

@@ -40,8 +40,8 @@ interface TrustGatedZoneOptions {
    * lives under (`hermes.rag` / `hermes.lib`) — also the exact key echoed,
    * verbatim, in the "disabled" reason string. */
   readonly configSection: 'hermes.rag' | 'hermes.lib';
-  /** Log-line prefix (`Hermes RAG` / `Hermes LSP` — LIB's zone is
-   * architecturally "LIB" but has always logged as "Hermes LSP"; preserved
+  /** Log-line prefix (`Talaria RAG` / `Talaria LSP` — LIB's zone is
+   * architecturally "LIB" but has always logged as "Talaria LSP"; preserved
    * verbatim by this refactor, not renamed). */
   readonly logPrefix: string;
   /** Read fresh on every eligibility check (never cached) — same posture the
@@ -106,7 +106,7 @@ function registerTrustGatedZone(opts: TrustGatedZoneOptions): () => void {
  * (best-practices.md).
  */
 export function activate(context: vscode.ExtensionContext): void {
-  const output = vscode.window.createOutputChannel('Hermes');
+  const output = vscode.window.createOutputChannel('Talaria Code');
   context.subscriptions.push(output);
 
   // ── Backend selection: the mock→real swap seam (TRUST-GATED) ─────────────
@@ -314,7 +314,7 @@ export function activate(context: vscode.ExtensionContext): void {
   //
   // A5: `reportFailure` is the real implementation of provider.ts's injected
   // seam — every surfaced (actionable) autocomplete failure also gets one
-  // line in the SAME `Hermes` output channel every other zone logs to.
+  // line in the SAME `Talaria Code` output channel every other zone logs to.
   //
   // W5.1 R5 (Task 13): the third argument publishes the next-edit toggle
   // capability to the view provider once the Guard has hydrated, so the
@@ -333,7 +333,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // endpoint, so it only runs in a trusted workspace (C1 exfil vector B).
   const startRagIfEligible = registerTrustGatedZone({
     configSection: 'hermes.rag',
-    logPrefix: 'Hermes RAG',
+    logPrefix: 'Talaria RAG',
     hasWorkspace: () => !!firstWorkspaceRoot(),
     isTrusted: () => vscode.workspace.isTrusted,
     shouldActivate: shouldActivateRag,
@@ -374,7 +374,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const sharedLspToolState = createSharedLspToolState();
   const libHost = createLibServerHost({
     buildMcpServer: () => buildLibMcpServer(createLibToolDeps(output, sharedLspToolState)),
-    log: (m) => output.appendLine(`Hermes LSP: ${m}`),
+    log: (m) => output.appendLine(`Talaria LSP: ${m}`),
     // T-9 (squatter full closure, following up T-E1): the accessor already
     // burns on permanent-down (`libServerHost`'s own `advertisement()`
     // clears), but this session already captured a COPY below
@@ -389,7 +389,7 @@ export function activate(context: vscode.ExtensionContext): void {
         backend.setMcpServer('vscode_lsp', undefined);
       }
       output.appendLine(
-        'Hermes LSP: server permanently down — tool registration withdrawn for future sessions.',
+        'Talaria LSP: server permanently down — tool registration withdrawn for future sessions.',
       );
     },
   });
@@ -397,7 +397,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const startLibIfEligible = registerTrustGatedZone({
     configSection: 'hermes.lib',
-    logPrefix: 'Hermes LSP',
+    logPrefix: 'Talaria LSP',
     hasWorkspace: () => !!firstWorkspaceRoot(),
     isTrusted: () => vscode.workspace.isTrusted,
     shouldActivate: shouldActivateLib,
@@ -413,7 +413,7 @@ export function activate(context: vscode.ExtensionContext): void {
           // Fail-soft (§4.1): a failed bind (or the one allowed same-port rebind
           // also failing) leaves LIB permanently down for this ext-host session —
           // no tools registered, nothing to un-register later.
-          output.appendLine('Hermes LSP: bind failed — LIB stays down for this session.');
+          output.appendLine('Talaria LSP: bind failed — LIB stays down for this session.');
           return;
         }
         // ...then register with whichever backend is CURRENT when this resolves —
@@ -423,7 +423,7 @@ export function activate(context: vscode.ExtensionContext): void {
           backend.setMcpServer('vscode_lsp', advertisement);
         }
       })().catch((err: unknown) => {
-        output.appendLine(`Hermes LSP: unexpected start failure — ${String(err)}`);
+        output.appendLine(`Talaria LSP: unexpected start failure — ${String(err)}`);
       });
     },
   });
@@ -432,7 +432,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // ── Bring trust-gated features online if trust is granted mid-session ────
   context.subscriptions.push(
     vscode.workspace.onDidGrantWorkspaceTrust(() => {
-      output.appendLine('Hermes: workspace trust granted — enabling trust-gated features.');
+      output.appendLine('Talaria: workspace trust granted — enabling trust-gated features.');
       // Upgrade mock → real backend if the user configured `acp`.
       if (
         selectBackendKind(configuredBackend(), true) === 'acp' &&
@@ -449,7 +449,7 @@ export function activate(context: vscode.ExtensionContext): void {
         provider.setSearchFiles(searchFilesPort);
         backend.dispose();
         backend = upgraded;
-        output.appendLine('Hermes: backend upgraded to AcpBackend.');
+        output.appendLine('Talaria: backend upgraded to AcpBackend.');
       }
       startRagIfEligible();
       // §4.2 ordering: the backend upgrade above (if any) and `startRagIfEligible()`
@@ -470,7 +470,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   output.appendLine(
-    `Hermes extension activated (${backend instanceof AcpBackend ? 'AcpBackend' : 'MockBackend'}${
+    `Talaria Code extension activated (${backend instanceof AcpBackend ? 'AcpBackend' : 'MockBackend'}${
       vscode.workspace.isTrusted ? '' : ', Restricted Mode'
     }).`,
   );
@@ -522,7 +522,7 @@ async function activateCodebaseRag(
 
   if (!enabled || !workspaceRoot) {
     output.appendLine(
-      `Hermes RAG: ${!enabled ? 'disabled (hermes.rag.enabled=false)' : 'no workspace open'} — skipping indexer.`,
+      `Talaria RAG: ${!enabled ? 'disabled (hermes.rag.enabled=false)' : 'no workspace open'} — skipping indexer.`,
     );
     return;
   }
@@ -538,7 +538,7 @@ async function activateCodebaseRag(
   const embedEndpoint = isHttpUrl(rawEmbedEndpoint) ? rawEmbedEndpoint : DEFAULT_EMBED_ENDPOINT;
   if (embedEndpoint !== rawEmbedEndpoint) {
     output.appendLine(
-      `Hermes RAG: invalid embedEndpoint (not http/https) — falling back to ${DEFAULT_EMBED_ENDPOINT}.`,
+      `Talaria RAG: invalid embedEndpoint (not http/https) — falling back to ${DEFAULT_EMBED_ENDPOINT}.`,
     );
   }
   const embedModel = ragCfg.get<string>('embedModel', 'qwen3-embedding:0.6b');
@@ -574,7 +574,7 @@ async function activateCodebaseRag(
   });
   registerMcpServer(mcpServer);
   output.appendLine(
-    `Hermes RAG: registered '${CODEBASE_SEARCH_TOOL_NAME}' MCP server (re-sent on every session/new).`,
+    `Talaria RAG: registered '${CODEBASE_SEARCH_TOOL_NAME}' MCP server (re-sent on every session/new).`,
   );
 
   // The extension's OWN tree-sitter-wasms grammars — never the workspace's
@@ -601,9 +601,9 @@ async function activateCodebaseRag(
 
   try {
     await indexer.build();
-    output.appendLine('Hermes RAG: initial index build complete.');
+    output.appendLine('Talaria RAG: initial index build complete.');
   } catch (err) {
-    output.appendLine(`Hermes RAG: initial index build failed — ${String(err)}`);
+    output.appendLine(`Talaria RAG: initial index build failed — ${String(err)}`);
   }
 }
 
@@ -670,7 +670,7 @@ function createCheckpointTracker(
 ): CheckpointTracker | undefined {
   const workspaceRoot = firstWorkspaceRoot();
   if (!workspaceRoot) {
-    output.appendLine('Hermes Checkpoints: no workspace open — checkpoints disabled.');
+    output.appendLine('Talaria Checkpoints: no workspace open — checkpoints disabled.');
     return undefined;
   }
 
@@ -681,14 +681,14 @@ function createCheckpointTracker(
   tracker
     .init()
     .then(() => {
-      output.appendLine('Hermes Checkpoints: shadow-git tracker initialized.');
+      output.appendLine('Talaria Checkpoints: shadow-git tracker initialized.');
       void tracker.cleanup().catch((err: unknown) => {
-        output.appendLine(`Hermes Checkpoints: cleanup failed — ${String(err)}`);
+        output.appendLine(`Talaria Checkpoints: cleanup failed — ${String(err)}`);
       });
     })
     .catch((err: unknown) => {
       const reason = err instanceof GitUnavailableError ? err.message : String(err);
-      output.appendLine(`Hermes Checkpoints: unavailable — ${reason}`);
+      output.appendLine(`Talaria Checkpoints: unavailable — ${reason}`);
     });
   return tracker;
 }

@@ -1,7 +1,7 @@
 {
   "name": "hermes-vscode",
-  "displayName": "Hermes",
-  "description": "In-editor face of Hermes, an AI agent system — chat, tools, MCP, skills, checkpoints and more, in a native VS Code panel.",
+  "displayName": "Talaria Code",
+  "description": "Talaria Code — an in-editor client for the Hermes agent: chat, tools, MCP, skills, checkpoints and more, in a native VS Code panel.",
   "version": "0.0.1",
   "publisher": "syntinal",
   "license": "GPL-3.0-or-later",
@@ -27,7 +27,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "In an untrusted (Restricted Mode) workspace Hermes runs only its process-free mock backend: it will not spawn the Hermes agent (`hermes acp` / `python -m tui_gateway.entry`), will not index the codebase (file walk + embeddings upload), and will not bind the read-only LSP-over-HTTP MCP server that exposes live language-server intelligence (diagnostics, definitions, references, symbols, hover) to the agent. Grant Workspace Trust to enable the real backend, RAG indexing, and LSP tools.",
+      "description": "In an untrusted (Restricted Mode) workspace Talaria Code runs only its process-free mock backend: it will not spawn the Hermes agent (`hermes acp` / `python -m tui_gateway.entry`), will not index the codebase (file walk + embeddings upload), and will not bind the read-only LSP-over-HTTP MCP server that exposes live language-server intelligence (diagnostics, definitions, references, symbols, hover) to the agent. Grant Workspace Trust to enable the real backend, RAG indexing, and LSP tools.",
       "restrictedConfigurations": [
         "hermes.hermesPath",
         "hermes.pythonPath",
@@ -47,7 +47,7 @@
     },
     "virtualWorkspaces": {
       "supported": "limited",
-      "description": "In a virtual workspace Hermes cannot spawn its local child processes or index a real on-disk codebase; only the mock backend and inline autocomplete are available."
+      "description": "In a virtual workspace Talaria Code cannot spawn its local child processes or index a real on-disk codebase; only the mock backend and inline autocomplete are available."
     }
   },
   "contributes": {
@@ -55,7 +55,7 @@
       "activitybar": [
         {
           "id": "hermes",
-          "title": "Hermes",
+          "title": "Talaria Code",
           "icon": "media/hermes.svg"
         }
       ]
@@ -65,7 +65,7 @@
         {
           "type": "webview",
           "id": "hermes.panel",
-          "name": "Hermes"
+          "name": "Talaria Code"
         }
       ]
     },
@@ -73,83 +73,83 @@
       {
         "command": "hermes.newSession",
         "title": "New Session",
-        "category": "Hermes",
+        "category": "Talaria",
         "icon": "$(add)"
       },
       {
         "command": "hermes.openSettings",
         "title": "Open Settings",
-        "category": "Hermes",
+        "category": "Talaria",
         "icon": "$(gear)"
       },
       {
         "command": "hermes.showLogs",
         "title": "Show Logs",
-        "category": "Hermes",
+        "category": "Talaria",
         "icon": "$(output)"
       },
       {
         "command": "hermes.setAutocompleteApiKey",
         "title": "Set Autocomplete API Key",
-        "category": "Hermes"
+        "category": "Talaria"
       },
       {
         "command": "hermes.addToHermes",
-        "title": "Add to Hermes",
-        "category": "Hermes"
+        "title": "Add to Talaria",
+        "category": "Talaria"
       },
       {
         "command": "hermes.explainWithHermes",
-        "title": "Explain with Hermes",
-        "category": "Hermes"
+        "title": "Explain with Talaria",
+        "category": "Talaria"
       },
       {
         "command": "hermes.improveWithHermes",
-        "title": "Improve with Hermes",
-        "category": "Hermes"
+        "title": "Improve with Talaria",
+        "category": "Talaria"
       },
       {
         "command": "hermes.fixWithHermes",
-        "title": "Fix with Hermes",
-        "category": "Hermes"
+        "title": "Fix with Talaria",
+        "category": "Talaria"
       },
       {
         "command": "hermes.acceptDiff",
-        "title": "Accept (Hermes)",
-        "category": "Hermes",
+        "title": "Accept (Talaria)",
+        "category": "Talaria",
         "icon": "$(check)"
       },
       {
         "command": "hermes.rejectDiff",
-        "title": "Reject (Hermes)",
-        "category": "Hermes",
+        "title": "Reject (Talaria)",
+        "category": "Talaria",
         "icon": "$(close)"
       },
       {
         "command": "hermes.generateCommitMessage",
         "title": "Generate Commit Message",
-        "category": "Hermes",
+        "category": "Talaria",
         "icon": "$(sparkle)"
       },
       {
         "command": "hermes.nextEdit.jump",
         "title": "Next Edit Suggestions: Jump to Proposal",
-        "category": "Hermes"
+        "category": "Talaria"
       },
       {
         "command": "hermes.nextEdit.accept",
         "title": "Next Edit Suggestions: Accept Proposal",
-        "category": "Hermes"
+        "category": "Talaria"
       },
       {
         "command": "hermes.nextEdit.dismiss",
         "title": "Next Edit Suggestions: Dismiss Proposal",
-        "category": "Hermes"
+        "category": "Talaria"
       },
       {
         "command": "hermes.nextEdit.onFimAccept",
         "title": "Next Edit Suggestions: On Autocomplete Accepted",
-        "category": "Hermes"
+        "category": "Talaria"
       }
     ],
     "keybindings": [
@@ -172,7 +172,7 @@
     "submenus": [
       {
         "id": "hermes.editorSubmenu",
-        "label": "Hermes",
+        "label": "Talaria",
         "icon": "media/hermes.svg"
       }
     ],
@@ -247,7 +247,7 @@
       ]
     },
     "configuration": {
-      "title": "Hermes",
+      "title": "Talaria Code",
       "properties": {
         "hermes.hermesPath": {
           "type": "string",
@@ -304,7 +304,7 @@
         "hermes.autocomplete.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Enable Hermes inline (FIM) autocomplete."
+          "description": "Enable Talaria inline (FIM) autocomplete."
         },
         "hermes.autocomplete.backend": {
           "type": "string",
@@ -350,7 +350,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "**Deprecated — use the `Hermes: Set Autocomplete API Key` command instead**, which stores the key in the OS keychain (SecretStorage). API key for backends that require auth (e.g. `codestral`, `openai-compat`). A value here is migrated into SecretStorage on activation and then cleared. Machine-scoped: not workspace-overridable (security)."
+          "markdownDescription": "**Deprecated — use the `Talaria: Set Autocomplete API Key` command instead**, which stores the key in the OS keychain (SecretStorage). API key for backends that require auth (e.g. `codestral`, `openai-compat`). A value here is migrated into SecretStorage on activation and then cleared. Machine-scoped: not workspace-overridable (security)."
         },
         "hermes.autocomplete.crossFile.enabled": {
           "type": "boolean",

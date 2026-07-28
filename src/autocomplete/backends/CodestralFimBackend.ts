@@ -61,7 +61,7 @@ export class CodestralFimBackend implements FimBackend {
     // `Bearer` header reach the wire.
     if (this.opts.apiKey.trim().length === 0) {
       throw new MissingApiKeyError(
-        'hermes.autocomplete.backend=codestral requires an API key. Run "Hermes: Set Autocomplete API Key", or choose a local backend.',
+        'hermes.autocomplete.backend=codestral requires an API key. Run "Talaria: Set Autocomplete API Key", or choose a local backend.',
       );
     }
     // F5 (D2 parity): the guard above already proves this is non-empty

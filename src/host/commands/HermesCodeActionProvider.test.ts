@@ -56,12 +56,12 @@ describe('HermesCodeActionProvider.provideCodeActions', () => {
 
     expect(actions).toHaveLength(1);
     const action = must(actions[0]);
-    expect(action.title).toBe('Fix with Hermes');
+    expect(action.title).toBe('Fix with Talaria');
     expect(action.kind).toBe('quickfix');
     expect(action.isPreferred).toBe(false);
     expect(action.command).toEqual({
       command: 'hermes.fixWithHermes',
-      title: 'Fix with Hermes',
+      title: 'Fix with Talaria',
       arguments: [diagnostics],
     });
   });

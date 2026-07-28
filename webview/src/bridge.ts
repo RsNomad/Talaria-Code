@@ -57,7 +57,7 @@ class Bridge {
 
   /** Reject all in-flight correlated requests (view teardown). Idempotent. */
   dispose(): void {
-    this.rpc.rejectAll('Hermes webview was disposed.');
+    this.rpc.rejectAll('Talaria webview was disposed.');
   }
 
   /** True when running inside the real VS Code webview host. */

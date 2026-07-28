@@ -72,7 +72,7 @@ suggestion is expected to be wrong. Review all of them.
 > **Careful with the bare `:7b` tag.** On Ollama, `qwen2.5-coder:7b` is the **instruct** build — it resolves
 > to the same digest (`dae161e27b0e`) as `:7b-instruct` and `:latest`, while `:7b-base` is a genuinely
 > different artifact (`bd8755145f1c`). If you want the 7B base model you must write `qwen2.5-coder:7b-base`.
-> Hermes cannot warn you: it recognises the model by the words "qwen" and "coder", so the bare tag looks
+> Talaria Code cannot warn you: it recognises the model by the words "qwen" and "coder", so the bare tag looks
 > recognised, works mechanically, and is quietly worse at infilling. There is no client-side check that can
 > catch this — the model is present, recognised, and functional; it is only wrong in a way nothing local can
 > see.
@@ -85,7 +85,7 @@ once**. For a 7B pair that is roughly 4.7 GB of weights for the Qwen side and ab
 of 16 GB of VRAM in practice. Treat that as a rule of thumb, not a measurement: the real number depends on
 your quantisation and the context length you configure, and it is yours to work out.
 
-**Hermes does not check any of this.** It never measures VRAM, never detects your hardware, never counts
+**Talaria Code does not check any of this.** It never measures VRAM, never detects your hardware, never counts
 loaded models, and never decides whether a model fits. That is deliberate, and it is a rule the codebase
 holds itself to rather than an oversight. If the two do not fit together, you will see it as slow responses
 or as your server evicting one model to load the other — so pick sizes that fit, or run one feature at a

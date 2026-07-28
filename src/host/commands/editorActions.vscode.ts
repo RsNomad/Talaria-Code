@@ -82,7 +82,7 @@ function runSeedAction(
   const snapshot = snapshotSelection(editor);
   if (isSecretForCompletion(snapshot.path)) {
     void vscode.window.showWarningMessage(
-      `Hermes: "${snapshot.path}" looks like a secret file — refusing to send its contents. Paste it manually if you really need to.`,
+      `Talaria: "${snapshot.path}" looks like a secret file — refusing to send its contents. Paste it manually if you really need to.`,
     );
     return;
   }

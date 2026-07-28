@@ -58,7 +58,7 @@ describe('panel RemoteData reducer helpers (Part X2)', () => {
 describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
   it('a rejecting invoke flips the panel to an error state (no eternal spinner)', async () => {
     const dispatch = vi.fn();
-    const request = vi.fn().mockRejectedValue(new Error('Hermes session is not started yet.'));
+    const request = vi.fn().mockRejectedValue(new Error('Talaria session is not started yet.'));
 
     await fetchPanel('mcp', { request, dispatch });
 
@@ -67,7 +67,7 @@ describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
     expect(dispatch).toHaveBeenNthCalledWith(2, {
       type: 'local.panelError',
       panel: 'mcp',
-      message: 'Hermes session is not started yet.',
+      message: 'Talaria session is not started yet.',
       retryable: true,
     });
   });

@@ -58,11 +58,11 @@ describe('transcript reducer — W4 §7 B1: system.error is a GLOBAL banner, spl
   it('a system.error sets AppState.systemError (not any tab slot)', () => {
     const state = reduce(INITIAL_STATE, {
       type: 'system.error',
-      message: 'Hermes exited unexpectedly — reconnecting…',
+      message: 'Talaria exited unexpectedly — reconnecting…',
       detail: 'child pid 4212',
     });
     expect(state.systemError).toEqual({
-      message: 'Hermes exited unexpectedly — reconnecting…',
+      message: 'Talaria exited unexpectedly — reconnecting…',
       detail: 'child pid 4212',
     });
     expect(activeTab(state).error).toBeUndefined();
@@ -1434,9 +1434,9 @@ describe('transcript reducer — ARCH-1 (final review) / Q2: system.recovered re
   it('system.recovered clears AppState.systemError', () => {
     let state = reduce(INITIAL_STATE, {
       type: 'system.error',
-      message: 'Hermes exited unexpectedly — reconnecting…',
+      message: 'Talaria exited unexpectedly — reconnecting…',
     });
-    expect(state.systemError?.message).toBe('Hermes exited unexpectedly — reconnecting…');
+    expect(state.systemError?.message).toBe('Talaria exited unexpectedly — reconnecting…');
 
     state = reduce(state, { type: 'system.recovered' });
 

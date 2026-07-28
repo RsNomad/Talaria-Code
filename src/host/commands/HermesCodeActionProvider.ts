@@ -36,11 +36,11 @@ export class HermesCodeActionProvider implements vscode.CodeActionProvider {
   ): vscode.CodeAction[] {
     if (!shouldOfferFix(context.diagnostics.length)) return [];
 
-    const action = new vscode.CodeAction('Fix with Hermes', vscode.CodeActionKind.QuickFix);
+    const action = new vscode.CodeAction('Fix with Talaria', vscode.CodeActionKind.QuickFix);
     action.isPreferred = false;
     action.command = {
       command: 'hermes.fixWithHermes',
-      title: 'Fix with Hermes',
+      title: 'Fix with Talaria',
       arguments: [context.diagnostics],
     };
     return [action];

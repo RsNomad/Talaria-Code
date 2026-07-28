@@ -122,7 +122,7 @@ function toStringArray(value: unknown): string[] | undefined {
  */
 function warnOnSuspiciousRules(config: CustomModeConfig): void {
   const warn = (message: string): void => {
-    void vscode.window.showWarningMessage(`Hermes custom mode "${config.name}": ${message}`);
+    void vscode.window.showWarningMessage(`Talaria custom mode "${config.name}": ${message}`);
   };
   for (const rule of config.deny ?? []) {
     if (rule.startsWith('/')) {

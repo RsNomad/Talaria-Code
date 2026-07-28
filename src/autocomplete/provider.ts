@@ -534,9 +534,9 @@ export class HermesInlineCompletionProvider
         // (still no key, no response body) in the output channel only.
         this.surfaceIfFirst(
           key('insecure-transport'),
-          'Hermes autocomplete: refusing to send the API key over cleartext HTTP to a remote host. Use https, or point the endpoint at a loopback address (127.0.0.1/localhost).',
+          'Talaria autocomplete: refusing to send the API key over cleartext HTTP to a remote host. Use https, or point the endpoint at a loopback address (127.0.0.1/localhost).',
           [],
-          `Hermes autocomplete: ${err.message}`,
+          `Talaria autocomplete: ${err.message}`,
         );
       } else if (err instanceof MissingApiKeyError) {
         // Review C-1 fix: CodestralFimBackend.streamFim throws this BEFORE
@@ -547,7 +547,7 @@ export class HermesInlineCompletionProvider
         // was ever supplied).
         this.surfaceIfFirst(
           key('missing-key'),
-          `Hermes autocomplete: ${backend} requires an API key. Run "Hermes: Set Autocomplete API Key", or switch "hermes.autocomplete.backend" to a local backend.`,
+          `Talaria autocomplete: ${backend} requires an API key. Run "Talaria: Set Autocomplete API Key", or switch "hermes.autocomplete.backend" to a local backend.`,
           [SET_API_KEY_ACTION],
         );
       } else if (err instanceof BackendHttpError && (err.status === 401 || err.status === 403)) {
@@ -557,7 +557,7 @@ export class HermesInlineCompletionProvider
         // "the vllm server" rather than raw "vllm" as the grammatical subject.
         this.surfaceIfFirst(
           key('auth'),
-          `Hermes autocomplete: the ${backend} server rejected the request (${err.status} ${err.statusText}) — the API key is missing or incorrect.`,
+          `Talaria autocomplete: the ${backend} server rejected the request (${err.status} ${err.statusText}) — the API key is missing or incorrect.`,
           [SET_API_KEY_ACTION],
         );
       } else if (err instanceof BackendHttpError && err.status === 400) {
@@ -566,7 +566,7 @@ export class HermesInlineCompletionProvider
         // params) — hedge rather than assert a cause this code cannot know.
         this.surfaceIfFirst(
           key('dialect'),
-          `Hermes autocomplete: ${backend} rejected the request (${err.status} ${err.statusText}). This usually means "hermes.autocomplete.backend" doesn't match your server's API dialect — it can also mean the request itself was invalid (e.g. too many tokens for the server's context length).`,
+          `Talaria autocomplete: ${backend} rejected the request (${err.status} ${err.statusText}). This usually means "hermes.autocomplete.backend" doesn't match your server's API dialect — it can also mean the request itself was invalid (e.g. too many tokens for the server's context length).`,
         );
       } else if (err instanceof BackendHttpError && err.status === 404) {
         // F-B: vLLM's check_model 404s for a model it doesn't serve — the
@@ -575,7 +575,7 @@ export class HermesInlineCompletionProvider
         // who never touches hermes.autocomplete.model gets pure silence.
         this.surfaceIfFirst(
           key('model'),
-          `Hermes autocomplete: ${backend} does not serve the model "${this.getModelName()}" (404). Check "hermes.autocomplete.model".`,
+          `Talaria autocomplete: ${backend} does not serve the model "${this.getModelName()}" (404). Check "hermes.autocomplete.model".`,
         );
       } else if (err instanceof BackendStreamError) {
         // T-5 (closes V-14): a mid-stream SSE error frame on an otherwise-200
@@ -588,7 +588,7 @@ export class HermesInlineCompletionProvider
         // and this toast is a fixed template that never reads `err.message`.
         this.surfaceIfFirst(
           key('stream'),
-          `Hermes autocomplete: the ${backend} server at ${host} reported an error while generating (mid-stream). Check the server log.`,
+          `Talaria autocomplete: the ${backend} server at ${host} reported an error while generating (mid-stream). Check the server log.`,
         );
       } else if (err instanceof BackendHttpError) {
         // T-D1 (closes V-15): every OTHER HTTP status a FIM backend can throw
@@ -611,7 +611,7 @@ export class HermesInlineCompletionProvider
             : '';
         this.surfaceIfFirst(
           key(`status-${err.status}`),
-          `Hermes autocomplete: the ${backend} server rejected the request (${err.status} ${err.statusText}).${fimHint}`,
+          `Talaria autocomplete: the ${backend} server rejected the request (${err.status} ${err.statusText}).${fimHint}`,
         );
       }
       return null;

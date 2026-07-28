@@ -314,7 +314,7 @@ export function SettingsPanel({
   onToggleNextEdit,
 }: SettingsPanelProps) {
   return (
-    <PanelShell title="Hermes config">
+    <PanelShell title="Talaria config">
       {/* R5 (Task 13): the next-edit toggles are EXTENSION state, not
           config.yaml data, so they render as their own section rather than
           among the config sections. Placed first: this is the flagship

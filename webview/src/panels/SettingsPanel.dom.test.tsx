@@ -636,7 +636,7 @@ describe('G-3: clicking a settings row error must not toggle the switch', () => 
                     key: 'hermes.autocomplete.enabled',
                     type: 'boolean',
                     value: true,
-                    description: 'Enable Hermes inline (FIM) autocomplete.',
+                    description: 'Enable Talaria inline (FIM) autocomplete.',
                   },
                 ],
               },

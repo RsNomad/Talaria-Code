@@ -30,8 +30,8 @@ export function Hero({ onStarter, disabled }: HeroProps) {
         <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-accent text-accent-fg">
           <Icon name="hubot" size={24} />
         </span>
-        <span className="h-eyebrow">Hermes</span>
-        <h1 className="text-[15px] font-semibold tracking-tight text-fg">What should Hermes do?</h1>
+        <span className="h-eyebrow">Talaria Code</span>
+        <h1 className="text-[15px] font-semibold tracking-tight text-fg">What should Talaria do?</h1>
       </div>
 
       <div className="flex w-full max-w-[380px] flex-wrap justify-center gap-2">

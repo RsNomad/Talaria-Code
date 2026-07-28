@@ -568,7 +568,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
       'REGRESSION: a surviving plaintext setting is a live key — pickApiKey falls back to it and the next ' +
         'activation re-migrates it into SecretStorage, so the user was told "cleared" and still has a key',
     ).toBeUndefined();
-    expect(host.infos).toEqual(['Hermes: autocomplete API key cleared.']);
+    expect(host.infos).toEqual(['Talaria: autocomplete API key cleared.']);
     expect(host.warnings).toEqual([]);
   });
 
@@ -598,7 +598,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
       'the automatic path refuses this forever (values disagree), so an H1-class plaintext credential ' +
         'would otherwise persist with no way for the user to be rid of it',
     ).toBeUndefined();
-    expect(host.infos).toEqual(['Hermes: autocomplete API key cleared.']);
+    expect(host.infos).toEqual(['Talaria: autocomplete API key cleared.']);
   });
 
   it('does NOT claim success when clearing the setting throws', async () => {
@@ -644,7 +644,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
       host.configUpdates,
       'nothing to clear must not provoke a pointless write into the user settings.json',
     ).toEqual([]);
-    expect(host.infos).toEqual(['Hermes: autocomplete API key cleared.']);
+    expect(host.infos).toEqual(['Talaria: autocomplete API key cleared.']);
   });
 });
 
@@ -728,7 +728,7 @@ describe('FINDING 2: the SAVE branch stores the key and NEVER puts it in a messa
       host.infos,
       'SECURITY: this message is one line below the raw key. Interpolating it here persists the credential ' +
         'in the Notifications centre and the window log — exact equality is what makes that go red',
-    ).toEqual(['Hermes: autocomplete API key saved to SecretStorage.']);
+    ).toEqual(['Talaria: autocomplete API key saved to SecretStorage.']);
     expect(host.warnings).toEqual([]);
     expect(host.failures).toEqual([]);
   });

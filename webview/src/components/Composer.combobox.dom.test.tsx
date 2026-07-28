@@ -67,7 +67,7 @@ function StatefulComposer(props: {
 }
 
 function getTextarea(): HTMLElement {
-  return screen.getByPlaceholderText(/Ask Hermes/);
+  return screen.getByPlaceholderText(/Ask Talaria/);
 }
 
 describe('B4: composer textarea is an APG combobox — collapsed state', () => {

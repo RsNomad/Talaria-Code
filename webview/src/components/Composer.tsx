@@ -397,7 +397,7 @@ export function Composer({
       // generic files get the tight 512 KB cap.
       const cap = maxInlineBytes(kind);
       if (file.size > cap) {
-        console.warn(`Hermes: "${file.name}" is ${file.size} bytes, over the ${cap}-byte inline cap — skipping attachment`);
+        console.warn(`Talaria: "${file.name}" is ${file.size} bytes, over the ${cap}-byte inline cap — skipping attachment`);
         // A2 (UI I-9): the console.warn above is invisible to the user —
         // this is the user-visible, screen-reader-announced counterpart.
         setAttachNotice(`"${file.name}" is too large to attach — skipped.`);
@@ -863,7 +863,7 @@ export function Composer({
             placeholder={
               disabled
                 ? (disabledPlaceholder ?? 'Connecting…')
-                : 'Ask Hermes…  (@ to reference, Enter to send)'
+                : 'Ask Talaria…  (@ to reference, Enter to send)'
             }
             style={{ height }}
             onChange={(e) => {

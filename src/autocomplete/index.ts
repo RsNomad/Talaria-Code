@@ -396,7 +396,7 @@ async function clearLegacyApiKeySetting(): Promise<boolean> {
 /** Command handler: prompt for the key (masked) and store it in SecretStorage. */
 async function promptAndStoreApiKey(context: vscode.ExtensionContext): Promise<void> {
   const value = await vscode.window.showInputBox({
-    title: 'Hermes Autocomplete API Key',
+    title: 'Talaria Autocomplete API Key',
     prompt: 'Stored securely in the OS keychain (SecretStorage). Leave blank to clear.',
     password: true,
     ignoreFocusOut: true,
@@ -426,19 +426,19 @@ async function promptAndStoreApiKey(context: vscode.ExtensionContext): Promise<v
     // forbids, because the replacement has not been proven to survive a
     // restart.
     if (await clearLegacyApiKeySetting()) {
-      void vscode.window.showInformationMessage('Hermes: autocomplete API key cleared.');
+      void vscode.window.showInformationMessage('Talaria: autocomplete API key cleared.');
     } else {
       // Never claim a removal that could not be confirmed. Names the setting
       // to remove — never its value.
       void vscode.window.showWarningMessage(
-        'Hermes: the API key was removed from the OS keychain, but the deprecated ' +
+        'Talaria: the API key was removed from the OS keychain, but the deprecated ' +
           '`hermes.autocomplete.apiKey` setting could not be cleared and is still in effect. ' +
           'Remove it manually in Settings.',
       );
     }
   } else {
     await context.secrets.store(AUTOCOMPLETE_API_KEY_SECRET, value.trim());
-    void vscode.window.showInformationMessage('Hermes: autocomplete API key saved to SecretStorage.');
+    void vscode.window.showInformationMessage('Talaria: autocomplete API key saved to SecretStorage.');
   }
 }
 

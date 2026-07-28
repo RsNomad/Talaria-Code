@@ -15,7 +15,7 @@
  * SCM-2 (§12.1 T-11): `presentResult` takes a `Logger` (the SAME minimal
  * `{append(line)}` shape `JsonRpcStdio.ts` defines and
  * `HermesDashboardManager`/`HermesDashboardClient` already thread the
- * "Hermes" `vscode.OutputChannel` through as) so a `model-error`'s raw
+ * "Talaria Code" `vscode.OutputChannel` through as) so a `model-error`'s raw
  * provider/model detail — which may originate straight from
  * `AcpBackend.oneShot`'s `error` string, or from SCM-1's caught-exception
  * message — has somewhere honest to go OTHER than the toast (Invariant #3;
@@ -54,7 +54,7 @@ function oneShotCapable(backend: AgentBackend): backend is AgentBackend & OneSho
  *
  * SCM-2: a `model-error` never echoes `result.message` into the toast — that
  * field can carry a raw provider/model error body (Invariant #3). The user
- * gets one fixed, generic notice; `output` (the "Hermes" output channel)
+ * gets one fixed, generic notice; `output` (the "Talaria Code" output channel)
  * gets the real detail, for anyone who goes looking. Exported for direct
  * unit testing (`generateCommitCommand.vscode.test.ts`) against a narrow
  * `vi.mock('vscode')`, same discipline `gitPort.test.ts` uses. */
@@ -68,13 +68,13 @@ export function presentResult(result: GenerateResult, output: Logger): void {
       notes.push(`${result.droppedFiles.length} file(s) dropped (over the diff budget)`);
     }
     if (notes.length > 0) {
-      void vscode.window.showInformationMessage(`Hermes: commit message generated — ${notes.join(', ')}.`);
+      void vscode.window.showInformationMessage(`Talaria: commit message generated — ${notes.join(', ')}.`);
     }
     return;
   }
 
   if (result.kind === 'transient') {
-    void vscode.window.showWarningMessage(`Hermes: ${result.message}`);
+    void vscode.window.showWarningMessage(`Talaria: ${result.message}`);
     return;
   }
 
@@ -85,18 +85,18 @@ export function presentResult(result: GenerateResult, output: Logger): void {
     // user — it goes to the output channel only; the toast stays fixed.
     output.append(`[commit message] generation failed: ${result.message}`);
     void vscode.window.showWarningMessage(
-      'Hermes: could not generate a commit message — see the "Hermes" output channel for details.',
+      'Talaria: could not generate a commit message — see the "Talaria Code" output channel for details.',
     );
     return;
   }
 
-  void vscode.window.showWarningMessage(`Hermes: ${result.message}`);
+  void vscode.window.showWarningMessage(`Talaria: ${result.message}`);
 }
 
 async function runGenerateCommitMessage(getBackend: () => AgentBackend, output: Logger): Promise<void> {
   const backend = getBackend();
   if (!oneShotCapable(backend)) {
-    void vscode.window.showWarningMessage('Hermes: commit-message generation needs the real Hermes backend (hermes.backend = "acp").');
+    void vscode.window.showWarningMessage('Talaria: commit-message generation needs the real Hermes backend (hermes.backend = "acp").');
     return;
   }
 
@@ -121,7 +121,7 @@ async function runGenerateCommitMessage(getBackend: () => AgentBackend, output: 
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: 'Hermes: generating commit message…',
+      title: 'Talaria: generating commit message…',
       cancellable: true,
     },
     async (progress, token) => {
@@ -135,8 +135,8 @@ async function runGenerateCommitMessage(getBackend: () => AgentBackend, output: 
  * Register the `scm/title` command. `getBackend` is a thunk (not a snapshot)
  * so the trust-upgrade mock→real backend swap in `extension.ts` is always
  * reflected at invocation time — same posture as `registerDiffDecisionCommands`.
- * `output` is the shared "Hermes" output channel (`extension.ts`'s single
- * `vscode.window.createOutputChannel('Hermes')`) — SCM-2's landing spot for
+ * `output` is the shared "Talaria Code" output channel (`extension.ts`'s single
+ * `vscode.window.createOutputChannel('Talaria Code')`) — SCM-2's landing spot for
  * a `model-error`'s raw detail.
  */
 export function registerGenerateCommitMessageCommand(

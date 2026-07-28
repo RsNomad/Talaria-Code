@@ -262,7 +262,7 @@ export class ConnectionSupervisor {
       // initialize left NO banner at all. One signal per outage, the SAME
       // guard discipline as `handleAcpCrash` (below): a respawn-loop attempt
       // failing here must NOT add a second banner on top of the crash's own
-      // ("Hermes exited unexpectedly — reconnecting…").
+      // ("Talaria exited unexpectedly — reconnecting…").
       if (!wasRespawning && (this.acpState as string) !== 'disposed') {
         this.port.emit({
           type: 'system.error',
@@ -338,11 +338,11 @@ export class ConnectionSupervisor {
       if (outcome.kind === 'connected') return;
       if (outcome.kind === 'deadline') {
         throw new Error(
-          `Hermes did not become ready within ${CONNECT_PHASE_DEADLINE_MS / 1000}s. Check the Hermes install (hermes.hermesPath / Python venv) — see the Hermes output channel.`,
+          `Hermes did not become ready within ${CONNECT_PHASE_DEADLINE_MS / 1000}s. Check the Hermes install (hermes.hermesPath / Python venv) — see the Talaria Code output channel.`,
         );
       }
       throw new Error(
-        `hermes acp exited during startup (code ${outcome.code}). Check the Hermes install (hermes.hermesPath / Python venv) — see the Hermes output channel.`,
+        `hermes acp exited during startup (code ${outcome.code}). Check the Hermes install (hermes.hermesPath / Python venv) — see the Talaria Code output channel.`,
       );
     } finally {
       exitSub?.dispose();
@@ -833,7 +833,7 @@ export class ConnectionSupervisor {
       // W4 §7 B1: connection-global — hits every open tab, so it rides
       // `system.error` (no sessionId), never a session-scoped `error` that
       // drop-unknown would eat the moment that one tab closes.
-      this.port.emit({ type: 'system.error', message: 'Hermes exited unexpectedly — reconnecting…' });
+      this.port.emit({ type: 'system.error', message: 'Talaria exited unexpectedly — reconnecting…' });
     }
     // W4-T5a (Q-10): snapshot every registered session's identity BEFORE the
     // per-controller fan-out / the coming respawn's teardownSession() clears

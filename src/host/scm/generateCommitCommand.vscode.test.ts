@@ -6,7 +6,7 @@
  * `AcpBackend.oneShot`, or SCM-1's caught-exception `.message`) — Invariant
  * #3 (see `HermesDashboardClient.ts`'s identical posture) forbids surfacing
  * that to the user. The user-facing toast gets one fixed, generic copy; the
- * raw detail goes ONLY to the injected `Logger` (structurally the "Hermes"
+ * raw detail goes ONLY to the injected `Logger` (structurally the "Talaria Code"
  * `vscode.OutputChannel`, same `Logger` shape `JsonRpcStdio.ts` already
  * defines and `HermesDashboardManager`/`Client` already reuse).
  *
@@ -79,7 +79,7 @@ describe('presentResult — SCM-2: a model-error result never echoes the raw mes
     presentResult(result, logger);
 
     const warnMock = vi.mocked(vscode.window.showWarningMessage);
-    expect(warnMock).toHaveBeenCalledWith('Hermes: Nothing to commit — stage or make some changes first.');
+    expect(warnMock).toHaveBeenCalledWith('Talaria: Nothing to commit — stage or make some changes first.');
     expect(logger.lines).toHaveLength(0); // non-model-error path never touches the logger
   });
 

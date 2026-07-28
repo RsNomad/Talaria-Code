@@ -439,7 +439,7 @@ describe('LOCK 4: three roles, two settings — and the toggles are not settings
 });
 
 /**
- * LOCK 5 — "Hermes cannot warn you about the `:7b` swap."
+ * LOCK 5 — "Talaria Code cannot warn you about the `:7b` swap."
  *
  * The sharpest claim on the page, and the only one that is a statement about
  * runtime behaviour rather than about text. It is asserted against the real
@@ -459,7 +459,7 @@ describe('LOCK 5: the known-model check genuinely cannot distinguish base from i
   });
 
   it('the page states the consequence rather than promising a warning', () => {
-    expect(TOPOLOGY_DOC).toContain('Hermes cannot warn you');
+    expect(TOPOLOGY_DOC).toContain('Talaria Code cannot warn you');
   });
 });
 
@@ -486,6 +486,6 @@ describe('LOCK 6: the no-orchestration promise the page makes is true of the she
 
   it('the page promises exactly that, and promises no detection', () => {
     expect(TOPOLOGY_DOC).toContain('never measures VRAM');
-    expect(TOPOLOGY_DOC).toContain('Hermes does not check any of this');
+    expect(TOPOLOGY_DOC).toContain('Talaria Code does not check any of this');
   });
 });

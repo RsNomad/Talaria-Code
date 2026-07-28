@@ -280,7 +280,7 @@ describe('F-7: the Next Edit section is reachable with the agent backend DOWN', 
   it('RED-first proof: the SAME predicates flag the pre-fix (gated) structure', () => {
     // The exact shape the bug had: the section nested inside the gate.
     const gatedPanel = [
-      '<PanelShell title="Hermes config">',
+      '<PanelShell title="Talaria config">',
       '  <RemotePanel remote={config} loadingHint="Loading settings…" onRetry={onRetryConfig}>',
       '    {(data) => (<>',
       '      {NEXT_EDIT_ROWS.map((row) => (<NextEditRow key={row.source} />))}',

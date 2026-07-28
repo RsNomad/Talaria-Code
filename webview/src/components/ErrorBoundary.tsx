@@ -56,7 +56,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 
   override componentDidCatch(error: Error, info: ErrorInfo): void {
-    console.error(`Hermes: render error in ${this.props.region}`, error, info.componentStack);
+    console.error(`Talaria: render error in ${this.props.region}`, error, info.componentStack);
   }
 
   /**
