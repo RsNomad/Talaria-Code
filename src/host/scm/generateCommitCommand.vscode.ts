@@ -1,7 +1,7 @@
 /**
- * W2 T5c — F-C (§3.4): the `hermes.generateCommitMessage` command behind the
+ * W2 T5c — F-C (§3.4): the `talaria.generateCommitMessage` command behind the
  * `scm/title` `$(sparkle)` button (`package.json`'s `menus.scm/title`, `when:
- * "scmProvider == git && hermes.ready"`). Build-blind (compile-checked +
+ * "scmProvider == git && talaria.ready"`). Build-blind (compile-checked +
  * Fedora-verified) — deliberately thin: build the real `GitPort` (T2d,
  * `gitPort.ts`) + a `UtilityModelPort` bound to the backend's `oneShot`
  * (T5b), run the headless {@link generateCommitMessage} (`generateCommitCommand.ts`)
@@ -145,6 +145,6 @@ export function registerGenerateCommitMessageCommand(
   output: Logger,
 ): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('hermes.generateCommitMessage', () => runGenerateCommitMessage(getBackend, output)),
+    vscode.commands.registerCommand('talaria.generateCommitMessage', () => runGenerateCommitMessage(getBackend, output)),
   );
 }

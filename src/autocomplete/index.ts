@@ -248,7 +248,7 @@ export function registerHermesAutocomplete(
   });
 
   const setKeyCommand = vscode.commands.registerCommand(
-    'hermes.setAutocompleteApiKey',
+    'talaria.setAutocompleteApiKey',
     () => promptAndStoreApiKey(context),
   );
 

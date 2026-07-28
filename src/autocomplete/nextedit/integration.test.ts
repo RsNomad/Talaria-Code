@@ -471,22 +471,22 @@ describe('Scenario 1 (owner: FIM ON + NEXT ON — two endpoints, two backends, n
     expect(options.stop).toEqual(['<|endoftext|>', '<|file_sep|>']);
 
     // proposalReady -> decorations
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
     expect(anyDecorationShown()).toBe(true);
 
     // tabJump -> reveal
-    await host.registeredCommands.get('hermes.nextEdit.jump')?.();
-    expect(contextKeyValue('hermes.nextEdit.jumped')).toBe(true);
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+    expect(contextKeyValue('talaria.nextEdit.jumped')).toBe(true);
     expect(host.reveals.length).toBeGreaterThan(0);
 
     // tabAccept -> applyEdit(true) -> idle, keys false
-    await host.registeredCommands.get('hermes.nextEdit.accept')?.();
+    await host.registeredCommands.get('talaria.nextEdit.accept')?.();
     await vi.advanceTimersByTimeAsync(0);
 
     expect(host.appliedEdits).toHaveLength(1);
     expect(must(host.appliedEdits[0]).newText).toContain('REWRITTEN LINE');
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
-    expect(contextKeyValue('hermes.nextEdit.jumped')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumped')).toBe(false);
     // applyEdit(true): a successful apply notes nothing (contrast the
     // FAILED-apply case, which notes once).
     expect(host.warnings).toEqual([]);
@@ -525,16 +525,16 @@ describe('Scenario 3 (owner: FIM ON + Generic ON — one endpoint/model, a secon
     expect(call.body.prompt).toContain('<|im_start|>user');
     expect(call.body.raw).toBe(true);
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
     expect(anyDecorationShown()).toBe(true);
 
-    await host.registeredCommands.get('hermes.nextEdit.jump')?.();
-    await host.registeredCommands.get('hermes.nextEdit.accept')?.();
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+    await host.registeredCommands.get('talaria.nextEdit.accept')?.();
     await vi.advanceTimersByTimeAsync(0);
 
     expect(host.appliedEdits).toHaveLength(1);
     expect(must(host.appliedEdits[0]).newText).toContain('REWRITTEN LINE');
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
 
     // THE "once" — load-bearing (controller ambiguity #3). A full, accepted
     // next-edit cycle must NOT re-fire the setup note: it is tied to the
@@ -549,9 +549,9 @@ describe('Scenario 3 (owner: FIM ON + Generic ON — one endpoint/model, a secon
     // pass with a single cycle but this second one would catch a
     // per-request re-fire regression.
     await fireTrigger();
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
-    await host.registeredCommands.get('hermes.nextEdit.jump')?.();
-    await host.registeredCommands.get('hermes.nextEdit.accept')?.();
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+    await host.registeredCommands.get('talaria.nextEdit.accept')?.();
     await vi.advanceTimersByTimeAsync(0);
 
     expect(calls.length).toBeGreaterThanOrEqual(2);
@@ -573,7 +573,7 @@ describe('Scenario 2 (owner: FIM ON, NEXT OFF, Generic OFF — plain FIM only)',
 
     await fireTrigger();
     expect(calls).toHaveLength(0);
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBeUndefined();
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBeUndefined();
 
     // FIM unaffected: its own activity relay (the ONLY seam next-edit has
     // into FIM's lifecycle, `08` §7.2/§7.4) must keep working without ever
@@ -630,7 +630,7 @@ describe('R5 refusal round-trip (owner: turn ONE on, the second is refused, one 
     registerHermesNextEdit(makeContext(), guard, DEPS);
     await fireTrigger();
     expect(calls).toHaveLength(1);
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
 
     expect(() => fimActivityRelay.requestStarted()).not.toThrow();
     expect(() => fimActivityRelay.resultShown(false)).not.toThrow();
@@ -702,7 +702,7 @@ describe('Cross-channel (owner: R2 — FIM always wins over an in-flight next-ed
     // backend.predict() -> the shell's own catch -> back to idle.
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).not.toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).not.toBe(true);
     expect(anyDecorationShown(), 'NO decoration may ever appear for an aborted next-edit request').toBe(false);
   });
 });

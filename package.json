@@ -71,102 +71,102 @@
     },
     "commands": [
       {
-        "command": "hermes.newSession",
+        "command": "talaria.newSession",
         "title": "New Session",
         "category": "Talaria",
         "icon": "$(add)"
       },
       {
-        "command": "hermes.openSettings",
+        "command": "talaria.openSettings",
         "title": "Open Settings",
         "category": "Talaria",
         "icon": "$(gear)"
       },
       {
-        "command": "hermes.showLogs",
+        "command": "talaria.showLogs",
         "title": "Show Logs",
         "category": "Talaria",
         "icon": "$(output)"
       },
       {
-        "command": "hermes.setAutocompleteApiKey",
+        "command": "talaria.setAutocompleteApiKey",
         "title": "Set Autocomplete API Key",
         "category": "Talaria"
       },
       {
-        "command": "hermes.addToHermes",
+        "command": "talaria.addToHermes",
         "title": "Add to Talaria",
         "category": "Talaria"
       },
       {
-        "command": "hermes.explainWithHermes",
+        "command": "talaria.explainWithHermes",
         "title": "Explain with Talaria",
         "category": "Talaria"
       },
       {
-        "command": "hermes.improveWithHermes",
+        "command": "talaria.improveWithHermes",
         "title": "Improve with Talaria",
         "category": "Talaria"
       },
       {
-        "command": "hermes.fixWithHermes",
+        "command": "talaria.fixWithHermes",
         "title": "Fix with Talaria",
         "category": "Talaria"
       },
       {
-        "command": "hermes.acceptDiff",
+        "command": "talaria.acceptDiff",
         "title": "Accept (Talaria)",
         "category": "Talaria",
         "icon": "$(check)"
       },
       {
-        "command": "hermes.rejectDiff",
+        "command": "talaria.rejectDiff",
         "title": "Reject (Talaria)",
         "category": "Talaria",
         "icon": "$(close)"
       },
       {
-        "command": "hermes.generateCommitMessage",
+        "command": "talaria.generateCommitMessage",
         "title": "Generate Commit Message",
         "category": "Talaria",
         "icon": "$(sparkle)"
       },
       {
-        "command": "hermes.nextEdit.jump",
+        "command": "talaria.nextEdit.jump",
         "title": "Next Edit Suggestions: Jump to Proposal",
         "category": "Talaria"
       },
       {
-        "command": "hermes.nextEdit.accept",
+        "command": "talaria.nextEdit.accept",
         "title": "Next Edit Suggestions: Accept Proposal",
         "category": "Talaria"
       },
       {
-        "command": "hermes.nextEdit.dismiss",
+        "command": "talaria.nextEdit.dismiss",
         "title": "Next Edit Suggestions: Dismiss Proposal",
         "category": "Talaria"
       },
       {
-        "command": "hermes.nextEdit.onFimAccept",
+        "command": "talaria.nextEdit.onFimAccept",
         "title": "Next Edit Suggestions: On Autocomplete Accepted",
         "category": "Talaria"
       }
     ],
     "keybindings": [
       {
-        "command": "hermes.nextEdit.jump",
+        "command": "talaria.nextEdit.jump",
         "key": "tab",
-        "when": "hermes.nextEdit.jumpVisible && !hermes.nextEdit.jumped && editorTextFocus && !editorReadonly && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode && !editorTabMovesFocus"
+        "when": "talaria.nextEdit.jumpVisible && !talaria.nextEdit.jumped && editorTextFocus && !editorReadonly && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode && !editorTabMovesFocus"
       },
       {
-        "command": "hermes.nextEdit.accept",
+        "command": "talaria.nextEdit.accept",
         "key": "tab",
-        "when": "hermes.nextEdit.jumpVisible && hermes.nextEdit.jumped && editorTextFocus && !editorReadonly && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode && !editorTabMovesFocus"
+        "when": "talaria.nextEdit.jumpVisible && talaria.nextEdit.jumped && editorTextFocus && !editorReadonly && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode && !editorTabMovesFocus"
       },
       {
-        "command": "hermes.nextEdit.dismiss",
+        "command": "talaria.nextEdit.dismiss",
         "key": "escape",
-        "when": "hermes.nextEdit.jumpVisible && editorTextFocus && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode"
+        "when": "talaria.nextEdit.jumpVisible && editorTextFocus && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode"
       }
     ],
     "submenus": [
@@ -179,25 +179,25 @@
     "menus": {
       "commandPalette": [
         {
-          "command": "hermes.nextEdit.jump",
+          "command": "talaria.nextEdit.jump",
           "when": "false"
         },
         {
-          "command": "hermes.nextEdit.accept",
+          "command": "talaria.nextEdit.accept",
           "when": "false"
         },
         {
-          "command": "hermes.nextEdit.dismiss",
+          "command": "talaria.nextEdit.dismiss",
           "when": "false"
         },
         {
-          "command": "hermes.nextEdit.onFimAccept",
+          "command": "talaria.nextEdit.onFimAccept",
           "when": "false"
         }
       ],
       "view/title": [
         {
-          "command": "hermes.openSettings",
+          "command": "talaria.openSettings",
           "when": "view == talaria.panel",
           "group": "navigation@1"
         }
@@ -205,43 +205,43 @@
       "editor/context": [
         {
           "submenu": "talaria.editorSubmenu",
-          "when": "editorHasSelection && hermes.ready",
+          "when": "editorHasSelection && talaria.ready",
           "group": "1_modification"
         }
       ],
       "editor/title": [
         {
-          "command": "hermes.acceptDiff",
+          "command": "talaria.acceptDiff",
           "when": "resourceScheme == talaria-diff",
           "group": "navigation@1"
         },
         {
-          "command": "hermes.rejectDiff",
+          "command": "talaria.rejectDiff",
           "when": "resourceScheme == talaria-diff",
           "group": "navigation@2"
         }
       ],
       "scm/title": [
         {
-          "command": "hermes.generateCommitMessage",
-          "when": "scmProvider == git && hermes.ready",
+          "command": "talaria.generateCommitMessage",
+          "when": "scmProvider == git && talaria.ready",
           "group": "navigation"
         }
       ],
       "talaria.editorSubmenu": [
         {
-          "command": "hermes.addToHermes",
-          "when": "editorHasSelection && hermes.ready",
+          "command": "talaria.addToHermes",
+          "when": "editorHasSelection && talaria.ready",
           "group": "1_hermes@1"
         },
         {
-          "command": "hermes.explainWithHermes",
-          "when": "editorHasSelection && hermes.ready",
+          "command": "talaria.explainWithHermes",
+          "when": "editorHasSelection && talaria.ready",
           "group": "1_hermes@2"
         },
         {
-          "command": "hermes.improveWithHermes",
-          "when": "editorHasSelection && hermes.ready",
+          "command": "talaria.improveWithHermes",
+          "when": "editorHasSelection && talaria.ready",
           "group": "1_hermes@3"
         }
       ]

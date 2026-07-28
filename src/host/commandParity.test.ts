@@ -124,7 +124,7 @@ function registeredCommandIds(): Set<string> {
     for (const match of file.content.matchAll(constDeclPattern)) {
       const name = match[1];
       const value = match[2];
-      if (name && value && referencedIdentifiers.has(name) && value.startsWith('hermes.')) {
+      if (name && value && referencedIdentifiers.has(name) && value.startsWith('talaria.')) {
         ids.add(value);
       }
     }
@@ -149,9 +149,9 @@ describe('LOCK: every declared command is registered somewhere under src/', () =
     expect(declaredCommandIds().length).toBeGreaterThanOrEqual(15);
 
     const registered = registeredCommandIds();
-    expect(registered.has('hermes.newSession')).toBe(true);
-    expect(registered.has('hermes.acceptDiff')).toBe(true);
-    expect(registered.has('hermes.generateCommitMessage')).toBe(true);
+    expect(registered.has('talaria.newSession')).toBe(true);
+    expect(registered.has('talaria.acceptDiff')).toBe(true);
+    expect(registered.has('talaria.generateCommitMessage')).toBe(true);
   });
 
   // M-2 (3-lens review): this file used to carry a third test here,

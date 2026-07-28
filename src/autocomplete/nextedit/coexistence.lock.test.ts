@@ -680,7 +680,7 @@ describe('R2 LOCK (single-flight DIRECTION): FIM-start aborts next-edit; next-ed
     await vi.advanceTimersByTimeAsync(0);
 
     expect(
-      contextKeyValue('hermes.nextEdit.jumpVisible'),
+      contextKeyValue('talaria.nextEdit.jumpVisible'),
       'NON-VACUITY CONTROL failed: an unaborted deferred response must reach the screen, or HALF 1 below proves nothing (absence would be true either way)',
     ).toBe(true);
   });
@@ -712,7 +712,7 @@ describe('R2 LOCK (single-flight DIRECTION): FIM-start aborts next-edit; next-ed
     settle();
     await vi.advanceTimersByTimeAsync(0);
     expect(
-      contextKeyValue('hermes.nextEdit.jumpVisible'),
+      contextKeyValue('talaria.nextEdit.jumpVisible'),
       'R2 HALF 1 failed: a response that lands AFTER its signal was aborted must be discarded, not shown as a proposal',
     ).not.toBe(true);
   });
@@ -960,25 +960,25 @@ interface PackageKeybinding {
  */
 const EXPECTED_KEYBINDINGS: readonly PackageKeybinding[] = [
   {
-    command: 'hermes.nextEdit.jump',
+    command: 'talaria.nextEdit.jump',
     key: 'tab',
-    when: 'hermes.nextEdit.jumpVisible && !hermes.nextEdit.jumped && editorTextFocus && !editorReadonly && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode && !editorTabMovesFocus',
+    when: 'talaria.nextEdit.jumpVisible && !talaria.nextEdit.jumped && editorTextFocus && !editorReadonly && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode && !editorTabMovesFocus',
   },
   {
-    command: 'hermes.nextEdit.accept',
+    command: 'talaria.nextEdit.accept',
     key: 'tab',
-    when: 'hermes.nextEdit.jumpVisible && hermes.nextEdit.jumped && editorTextFocus && !editorReadonly && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode && !editorTabMovesFocus',
+    when: 'talaria.nextEdit.jumpVisible && talaria.nextEdit.jumped && editorTextFocus && !editorReadonly && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode && !editorTabMovesFocus',
   },
   {
-    command: 'hermes.nextEdit.dismiss',
+    command: 'talaria.nextEdit.dismiss',
     key: 'escape',
-    when: 'hermes.nextEdit.jumpVisible && editorTextFocus && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode',
+    when: 'talaria.nextEdit.jumpVisible && editorTextFocus && !suggestWidgetVisible && !inlineSuggestionVisible && !inlineEditIsVisible && !inSnippetMode',
   },
 ];
 
 /**
  * FIX WAVE 2 (F-6). Esc's clause used to be only
- * `hermes.nextEdit.jumpVisible && editorTextFocus`, and the old rationale
+ * `talaria.nextEdit.jumpVisible && editorTextFocus`, and the old rationale
  * ("Esc is not contended the way Tab is — core closes widgets first by
  * weight") was BACKWARDS. `keybindingService.ts`'s `_asCommandRule` assigns
  * package.json-contributed bindings `KeybindingWeight.ExternalExtension`
@@ -1022,7 +1022,7 @@ function readPackageJson(): RawPackageJson {
 /** The exact filter the lock depends on, extracted so a perturbed (but
  *  still REAL-data-derived) package object can be run through it too. */
 function filterNextEditKeybindings(pkg: RawPackageJson): PackageKeybinding[] {
-  return (pkg.contributes?.keybindings ?? []).filter((b) => b.command.startsWith('hermes.nextEdit.'));
+  return (pkg.contributes?.keybindings ?? []).filter((b) => b.command.startsWith('talaria.nextEdit.'));
 }
 
 function loadNextEditKeybindings(): PackageKeybinding[] {
@@ -1034,7 +1034,7 @@ describe('R3 LOCK: the Tab table — every next-edit keybinding when-clause EQUA
     const bindings = loadNextEditKeybindings();
     expect(
       bindings.length,
-      'R3 reach failed: package.json read returned ZERO hermes.nextEdit.* keybindings — an empty read would rubber-stamp every check below',
+      'R3 reach failed: package.json read returned ZERO talaria.nextEdit.* keybindings — an empty read would rubber-stamp every check below',
     ).toBeGreaterThan(0);
     expect(
       bindings,
@@ -1061,10 +1061,10 @@ describe('R3 LOCK: the Tab table — every next-edit keybinding when-clause EQUA
   });
 
   it('Tab ownership is DISJOINT: jump and accept differ only in the jumped polarity', () => {
-    const jump = EXPECTED_KEYBINDINGS.find((b) => b.command === 'hermes.nextEdit.jump');
-    const accept = EXPECTED_KEYBINDINGS.find((b) => b.command === 'hermes.nextEdit.accept');
+    const jump = EXPECTED_KEYBINDINGS.find((b) => b.command === 'talaria.nextEdit.jump');
+    const accept = EXPECTED_KEYBINDINGS.find((b) => b.command === 'talaria.nextEdit.accept');
     expect(
-      jump?.when.replace('!hermes.nextEdit.jumped', 'hermes.nextEdit.jumped'),
+      jump?.when.replace('!talaria.nextEdit.jumped', 'talaria.nextEdit.jumped'),
       'R3 failed: jump and accept when-clauses must differ ONLY in the jumped polarity — Tab ownership would no longer be total and disjoint',
     ).toBe(accept?.when);
   });
@@ -1087,8 +1087,8 @@ describe('R3 LOCK: the Tab table — every next-edit keybinding when-clause EQUA
   it('RED-first proof: a guard dropped from the REAL on-disk jump clause fails the equality check', () => {
     const pkg = readPackageJson();
     const realKeybindings = pkg.contributes?.keybindings ?? [];
-    const jumpIndex = realKeybindings.findIndex((b) => b.command === 'hermes.nextEdit.jump');
-    expect(jumpIndex, 'reach: package.json must declare hermes.nextEdit.jump').toBeGreaterThanOrEqual(0);
+    const jumpIndex = realKeybindings.findIndex((b) => b.command === 'talaria.nextEdit.jump');
+    expect(jumpIndex, 'reach: package.json must declare talaria.nextEdit.jump').toBeGreaterThanOrEqual(0);
 
     const realJump = realKeybindings[jumpIndex] as PackageKeybinding;
     const perturbedWhen = realJump.when.replace(' && !editorTabMovesFocus', '');

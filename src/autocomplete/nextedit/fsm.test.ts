@@ -28,7 +28,7 @@ it('the two-step Tab: proposed→jumped(reveal), jumped→idle(applyEdit)', () =
   const jump = reduceNextEdit({ kind: 'proposed', p: P }, { kind: 'tabJump' });
   expect(jump.state).toEqual({ kind: 'jumped', p: P });
   expect(jump.effects).toEqual([
-    { kind: 'setContext', key: 'hermes.nextEdit.jumped', value: true },
+    { kind: 'setContext', key: 'talaria.nextEdit.jumped', value: true },
     { kind: 'reveal', range: { startLine: 40, endLine: 60 } },
   ]);
 
@@ -44,7 +44,7 @@ it('idle × proposalReady ⇒ proposed, setContext(jumpVisible,true) + showDecor
   const { state, effects } = reduceNextEdit({ kind: 'idle' }, { kind: 'proposalReady', p: P });
   expect(state).toEqual({ kind: 'proposed', p: P });
   expect(effects).toEqual([
-    { kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true },
+    { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
     { kind: 'showDecorations', p: P },
   ]);
 });
@@ -151,7 +151,7 @@ function applyEffects(w: World, effects: readonly NextEditEffect[]): World {
   let decorationsShown = w.decorationsShown;
   for (const f of effects) {
     if (f.kind === 'setContext') {
-      if (f.key === 'hermes.nextEdit.jumpVisible') jumpVisible = f.value;
+      if (f.key === 'talaria.nextEdit.jumpVisible') jumpVisible = f.value;
       else jumped = f.value;
     } else if (f.kind === 'showDecorations') {
       decorationsShown = true;

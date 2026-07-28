@@ -294,7 +294,7 @@ export class HermesViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * `hermes.newSession` command handler: start a fresh backend session.
+   * `talaria.newSession` command handler: start a fresh backend session.
    *
    * T-1 (V-12 RESTART-STATE): no host-side `clear` here anymore — see
    * {@link setBackend}'s matching doc for why the old

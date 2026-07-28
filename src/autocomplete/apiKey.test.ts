@@ -547,7 +547,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
     // Only the command's own messages should be asserted below.
     host.infos.length = 0;
     host.warnings.length = 0;
-    const handler = host.commands.get('hermes.setAutocompleteApiKey');
+    const handler = host.commands.get('talaria.setAutocompleteApiKey');
     expect(
       typeof handler,
       'an unregistered command would make every assertion below vacuous',
@@ -581,7 +581,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
     await flushAsync();
     host.configUpdates.length = 0;
     host.inputBoxValue = undefined;
-    await host.commands.get('hermes.setAutocompleteApiKey')!();
+    await host.commands.get('talaria.setAutocompleteApiKey')!();
     disposable.dispose();
 
     expect(stored.get('hermes.autocomplete.apiKey')).toBe('sk-secret');
@@ -689,7 +689,7 @@ describe('FINDING 2: the SAVE branch stores the key and NEVER puts it in a messa
   });
 
   /**
-   * Activates, then drives `hermes.setAutocompleteApiKey` with a NON-EMPTY
+   * Activates, then drives `talaria.setAutocompleteApiKey` with a NON-EMPTY
    * input — the save path, exactly as the palette drives it. Messages emitted
    * during activation itself are cleared first so only the command's own
    * output is asserted.
@@ -706,7 +706,7 @@ describe('FINDING 2: the SAVE branch stores the key and NEVER puts it in a messa
     host.infos.length = 0;
     host.warnings.length = 0;
     host.configUpdates.length = 0;
-    const handler = host.commands.get('hermes.setAutocompleteApiKey');
+    const handler = host.commands.get('talaria.setAutocompleteApiKey');
     expect(
       typeof handler,
       'an unregistered command would make every assertion below vacuous',

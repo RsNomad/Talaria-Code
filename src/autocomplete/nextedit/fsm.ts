@@ -19,7 +19,7 @@
  *
  * The deleted wall-clock timer is replaced by a strictly stronger invariant,
  * proved exhaustively in `fsm.test.ts`: after every effect batch the
- * `hermes.nextEdit.jumpVisible` context key and the decorations are never
+ * `talaria.nextEdit.jumpVisible` context key and the decorations are never
  * left half-set — either both up (`proposed`/`jumped`) or both down
  * (`idle`). Every transition NOT named in the table below (an "unmodeled
  * combination") falls through to the same safe default: `idle + clearAll`.
@@ -96,7 +96,7 @@ export function reduceNextEdit(
         return {
           state: { kind: 'proposed', p: e.p },
           effects: [
-            { kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true },
+            { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
             { kind: 'showDecorations', p: e.p },
           ],
         };
@@ -112,7 +112,7 @@ export function reduceNextEdit(
         return {
           state: { kind: 'jumped', p: s.p },
           effects: [
-            { kind: 'setContext', key: 'hermes.nextEdit.jumped', value: true },
+            { kind: 'setContext', key: 'talaria.nextEdit.jumped', value: true },
             { kind: 'reveal', range: { startLine: s.p.region.startLine, endLine: s.p.region.endLine } },
           ],
         };

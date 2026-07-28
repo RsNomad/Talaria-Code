@@ -59,7 +59,7 @@ import type {
 } from './types';
 
 /** The two context keys the executor owns — it is their ONLY writer. */
-export type NextEditContextKey = 'hermes.nextEdit.jumpVisible' | 'hermes.nextEdit.jumped';
+export type NextEditContextKey = 'talaria.nextEdit.jumpVisible' | 'talaria.nextEdit.jumped';
 
 /** The edit-burst debounce. Matches `hermes.autocomplete.debounceMs`'s own
  *  350 ms default — next-edit rides the same "the user paused typing" signal
@@ -175,7 +175,7 @@ export interface NextEditExecutor {
  * fail:
  *
  *  1. **The invariant that replaced the deleted wall-clock timeout**: after
- *     every batch, `hermes.nextEdit.jumpVisible` is up if and only if
+ *     every batch, `talaria.nextEdit.jumpVisible` is up if and only if
  *     decorations are on screen. The FSM guarantees the batches are
  *     well-formed; this function guarantees a THROWING host cannot leave the
  *     pair half-set — any exception mid-batch forces a full `clearAll`. A
@@ -206,8 +206,8 @@ export function makeExecutor(
   const noted = new Set<string>();
 
   function clearAll(): void {
-    host.setContext('hermes.nextEdit.jumpVisible', false);
-    host.setContext('hermes.nextEdit.jumped', false);
+    host.setContext('talaria.nextEdit.jumpVisible', false);
+    host.setContext('talaria.nextEdit.jumped', false);
     host.clearDecorations();
     shownProposal = null;
     jumped = false;
@@ -217,7 +217,7 @@ export function makeExecutor(
     switch (effect.kind) {
       case 'setContext': {
         host.setContext(effect.key, effect.value);
-        if (effect.key === 'hermes.nextEdit.jumped') {
+        if (effect.key === 'talaria.nextEdit.jumped') {
           jumped = effect.value;
           // Property 2 above — re-render the locator's verb in place.
           if (shownProposal !== null && !host.showDecorations(shownProposal, jumped)) {
@@ -289,7 +289,7 @@ export function makeExecutor(
  * registration that registered it. `provider.ts` never names this string: an
  * item can therefore not carry a command id that nothing has registered.
  */
-const FIM_ACCEPT_COMMAND = 'hermes.nextEdit.onFimAccept';
+const FIM_ACCEPT_COMMAND = 'talaria.nextEdit.onFimAccept';
 
 const NO_OP_FIM_ACTIVITY: FimActivityListener = {
   requestStarted: () => {},
@@ -1421,13 +1421,13 @@ export function registerHermesNextEdit(
 
   // ── commands (registered ONCE) ─────────────────────────────────────────────
 
-  const jumpCommand = vscode.commands.registerCommand('hermes.nextEdit.jump', () => {
+  const jumpCommand = vscode.commands.registerCommand('talaria.nextEdit.jump', () => {
     dispatch({ kind: 'tabJump' });
   });
-  const acceptCommand = vscode.commands.registerCommand('hermes.nextEdit.accept', () => {
+  const acceptCommand = vscode.commands.registerCommand('talaria.nextEdit.accept', () => {
     dispatch({ kind: 'tabAccept' });
   });
-  const dismissCommand = vscode.commands.registerCommand('hermes.nextEdit.dismiss', () => {
+  const dismissCommand = vscode.commands.registerCommand('talaria.nextEdit.dismiss', () => {
     dispatch({ kind: 'esc' });
   });
   // The R4 seam: fired by the InlineCompletionItem's own `command`, which VS

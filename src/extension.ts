@@ -214,24 +214,24 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // ── Commands ─────────────────────────────────────────────────────────────
   context.subscriptions.push(
-    vscode.commands.registerCommand('hermes.newSession', () =>
+    vscode.commands.registerCommand('talaria.newSession', () =>
       provider.newSession(),
     ),
     // Audit H-1: both of these were DECLARED in package.json and registered
-    // nowhere. `hermes.openSettings` is bound to a permanently visible gear on
+    // nowhere. `talaria.openSettings` is bound to a permanently visible gear on
     // the panel title (`package.json:197`, view/title, navigation@1), so every
-    // click produced VS Code's "command 'hermes.openSettings' not found".
+    // click produced VS Code's "command 'talaria.openSettings' not found".
     // Locked by `src/host/commandParity.test.ts`.
-    vscode.commands.registerCommand('hermes.openSettings', () =>
+    vscode.commands.registerCommand('talaria.openSettings', () =>
       vscode.commands.executeCommand('workbench.action.openSettings', '@ext:syntinal.talaria-code'),
     ),
-    vscode.commands.registerCommand('hermes.showLogs', () => output.show()),
+    vscode.commands.registerCommand('talaria.showLogs', () => output.show()),
   );
 
   // ── W2 T4 (F-D, §3.5): read-only proposed-edit diff preview ──────────────
   // The `talaria-diff:` virtual-document provider + its editor-title Accept/
   // Reject commands. Registered ONCE, unconditionally (never gated behind
-  // trust/`hermes.ready` like the editor actions below) — both are inert
+  // trust/`talaria.ready` like the editor actions below) — both are inert
   // until a `diff.open` actually fires, which only ever happens from a LIVE
   // pending-approval DiffCard in the real backend; registering them earlier
   // is harmless (no fs/process touch) and, unlike the editor actions, they
@@ -247,26 +247,26 @@ export function activate(context: vscode.ExtensionContext): void {
   // invocation time — same posture as `startRagIfEligible`'s backend read.
   registerDiffDecisionCommands(context, () => backend);
 
-  // ── W2 T3 (§3.3): `hermes.ready` context key = trusted ∧ real backend ────
+  // ── W2 T3 (§3.3): `talaria.ready` context key = trusted ∧ real backend ────
   // The FULL gate (refines the S0 "always true" scaffolding): the SAME
   // trust+backend decision `selectBackendKind`/`makeAcpBackend` use above,
-  // so `hermes.ready` is true iff the workspace is trusted AND
+  // so `talaria.ready` is true iff the workspace is trusted AND
   // `hermes.backend` is actually `acp` — exactly the Cody `cody.activated`
   // pattern doc §3.3 pins. Drives the `editor/context` "Hermes" submenu's
-  // `when: editorHasSelection && hermes.ready` (package.json) and gates the
+  // `when: editorHasSelection && talaria.ready` (package.json) and gates the
   // editor-actions/QuickFix registration below. Re-computed and re-set on
   // `onDidGrantWorkspaceTrust` (below) since trust can only ever be granted
   // mid-session, never revoked.
   const isHermesReady = (): boolean => selectBackendKind(configuredBackend(), vscode.workspace.isTrusted) === 'acp';
   const updateReadyContext = (): void => {
-    void vscode.commands.executeCommand('setContext', 'hermes.ready', isHermesReady());
+    void vscode.commands.executeCommand('setContext', 'talaria.ready', isHermesReady());
   };
   updateReadyContext();
 
   // ── W2 T3 (§3.3): F-A code actions — editor submenu + QuickFix ───────────
   // Registering the (inert until invoked) commands/provider is itself
   // harmless (no process spawn, no I/O) — gated here anyway so it comes
-  // online/offline in lockstep with `hermes.ready`'s OWN gate (same
+  // online/offline in lockstep with `talaria.ready`'s OWN gate (same
   // trusted-∧-real-backend condition the RAG indexer/dashboard/checkpoint
   // tracker above already use), never registered twice on a later trust
   // grant. `HermesCodeActionProvider` itself only ever SEEDS the composer
@@ -287,7 +287,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // ── W2 T5c (F-C, §3.4): commit-gen `scm/title` $(sparkle) command ────────
   // Same trust-gated latch posture as the editor actions above: registering
   // the (inert until invoked) command is itself harmless, but it is gated
-  // here so it comes online/offline in lockstep with `hermes.ready`'s SAME
+  // here so it comes online/offline in lockstep with `talaria.ready`'s SAME
   // trusted-∧-real-backend condition (`package.json`'s `scm/title` `when`
   // clause repeats that condition on the button itself) — a real (not mock)
   // backend is required anyway, since only `AcpBackend` implements the
@@ -458,7 +458,7 @@ export function activate(context: vscode.ExtensionContext): void {
       // it any earlier would risk registering the spec on the soon-disposed
       // Mock backend instead of the freshly-upgraded `AcpBackend`.
       startLibIfEligible();
-      // W2 T3 (§3.3): re-derive `hermes.ready` now that trust flipped — the
+      // W2 T3 (§3.3): re-derive `talaria.ready` now that trust flipped — the
       // Cody `cody.activated` re-set pattern — and bring the editor
       // actions/QuickFix online if they weren't already (mirrors the RAG
       // latch immediately above; both gate on the identical trusted-∧-acp

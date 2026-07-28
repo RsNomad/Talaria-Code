@@ -59,7 +59,7 @@ export type NextEditFsmEvent =
   | { kind: 'fimVisibility'; visible: boolean }
   | { kind: 'applyResult'; ok: boolean };
 export type NextEditEffect =
-  | { kind: 'setContext'; key: 'hermes.nextEdit.jumpVisible' | 'hermes.nextEdit.jumped'; value: boolean }
+  | { kind: 'setContext'; key: 'talaria.nextEdit.jumpVisible' | 'talaria.nextEdit.jumped'; value: boolean }
   | { kind: 'showDecorations'; p: AnchoredProposal }
   | { kind: 'reveal'; range: LineRange }
   | { kind: 'applyEdit'; region: EditableRegion; newText: string }

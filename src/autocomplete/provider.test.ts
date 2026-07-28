@@ -654,13 +654,13 @@ describe('next-edit contributions shape-lock', () => {
     const all = pkg.contributes?.keybindings ?? [];
     // The full negative-guard set binds the TAB owners (jump/accept) — Tab is the contended key (R3).
     const tabBindings = all.filter((k) =>
-      k.command === 'hermes.nextEdit.jump' || k.command === 'hermes.nextEdit.accept',
+      k.command === 'talaria.nextEdit.jump' || k.command === 'talaria.nextEdit.accept',
     );
     for (const binding of tabBindings) {
       for (const guard of REQUIRED_GUARDS) {
         expect(binding.when ?? '', `${binding.command} must gate on ${guard}`).toContain(guard);
       }
-      expect(binding.when ?? '').toContain('hermes.nextEdit.jumpVisible');
+      expect(binding.when ?? '').toContain('talaria.nextEdit.jumpVisible');
     }
     // FIX WAVE 2 (F-6). This used to read "Esc is not contended the way Tab is — core closes
     // widgets first by weight". That was BACKWARDS: `keybindingService.ts::_asCommandRule` gives
@@ -676,10 +676,10 @@ describe('next-edit contributions shape-lock', () => {
     const DISMISS_YIELDS_TO = [
       '!suggestWidgetVisible', '!inlineSuggestionVisible', '!inlineEditIsVisible', '!inSnippetMode',
     ] as const;
-    const dismissBindings = all.filter((k) => k.command === 'hermes.nextEdit.dismiss');
-    expect(dismissBindings.length, 'reach: package.json must declare hermes.nextEdit.dismiss').toBeGreaterThan(0);
+    const dismissBindings = all.filter((k) => k.command === 'talaria.nextEdit.dismiss');
+    expect(dismissBindings.length, 'reach: package.json must declare talaria.nextEdit.dismiss').toBeGreaterThan(0);
     for (const binding of dismissBindings) {
-      expect(binding.when ?? '').toContain('hermes.nextEdit.jumpVisible');
+      expect(binding.when ?? '').toContain('talaria.nextEdit.jumpVisible');
       expect(binding.when ?? '').toContain('editorTextFocus');
       for (const guard of DISMISS_YIELDS_TO) {
         expect(binding.when ?? '', `dismiss must yield Esc to ${guard.slice(1)} while it is up`).toContain(guard);
@@ -701,7 +701,7 @@ describe('next-edit contributions shape-lock', () => {
     const fs = await import('node:fs');
     const path = await import('node:path');
     const source = fs.readFileSync(path.join(__dirname, 'provider.ts'), 'utf8');
-    expect(source).not.toMatch(/registerCommand\(\s*['"]hermes\.nextEdit/);
+    expect(source).not.toMatch(/registerCommand\(\s*['"]talaria\.nextEdit/);
   });
 
   it('R5: the toggles are NOT settings — no enabled/generic contribution exists, and every nextEdit data key is machine-scoped', async () => {
@@ -798,7 +798,7 @@ describe('next-edit contributions shape-lock', () => {
 // ── FIX WAVE (finding 5): the R4 accept command must never be advertised
 //    by an item while nothing has registered it ──────────────────────────────
 describe('the R4 accept command is advertised only by an ATTACHED next-edit registration', () => {
-  const ACCEPT_COMMAND = 'hermes.nextEdit.onFimAccept';
+  const ACCEPT_COMMAND = 'talaria.nextEdit.onFimAccept';
 
   async function completeOnce(
     provider: HermesInlineCompletionProvider,
@@ -819,7 +819,7 @@ describe('the R4 accept command is advertised only by an ATTACHED next-edit regi
   it('next-edit UNATTACHED (the state a REJECTED hydrate leaves behind): the item carries no command at all', async () => {
     const engine = new FakeEngine();
     engine.respondWith = 'x = 1;';
-    // `index.ts` registers `hermes.nextEdit.onFimAccept` only inside
+    // `index.ts` registers `talaria.nextEdit.onFimAccept` only inside
     // `NextEditGuard.hydrate().then(...)`, and its rejection handler merely
     // logs — so a failed hydration leaves the seam a no-op forever. An item
     // that still carried the command id would make EVERY FIM accept execute
@@ -1183,7 +1183,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('the Set API Key action invokes hermes.setAutocompleteApiKey', async () => {
+  it('the Set API Key action invokes talaria.setAutocompleteApiKey', async () => {
     const engine = new FakeEngine();
     engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 401 Unauthorized', 401, 'Unauthorized');
     mockShowWarningMessage.mockResolvedValueOnce('Set API Key');
@@ -1195,7 +1195,7 @@ describe('HermesInlineCompletionProvider — failure surfacing (A5)', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(executeCommand).toHaveBeenCalledWith('hermes.setAutocompleteApiKey');
+    expect(executeCommand).toHaveBeenCalledWith('talaria.setAutocompleteApiKey');
   });
 
   it('dismissing the warning (undefined result) does not throw and does not invoke the command', async () => {
@@ -1446,7 +1446,7 @@ describe('HermesInlineCompletionProvider — unknown-model warning / refusal (Ta
 });
 
 // ── M3 (A7, pulled forward from A5's review): on a keyring-less Fedora box
-// (our actual ship target), `hermes.setAutocompleteApiKey` — invoked from
+// (our actual ship target), `talaria.setAutocompleteApiKey` — invoked from
 // the `Set API Key` action — can reject the `showWarningMessage` Thenable.
 // Precedent: `HermesViewProvider.ts`'s `openDiffPreview` routes an identical
 // shape to its logger via two-argument `.then(undefined, ...)` — `Thenable`
@@ -1492,7 +1492,7 @@ describe('HermesInlineCompletionProvider — M3: showWarningMessage rejection is
 });
 
 // ── F-A (final fix wave): M3 only ever attached a rejection handler to
-// `showWarningMessage` itself — the SEPARATE `hermes.setAutocompleteApiKey`
+// `showWarningMessage` itself — the SEPARATE `talaria.setAutocompleteApiKey`
 // command promise invoked from inside `onFulfilled` was still `void`-discarded,
 // so on a keyring-less Fedora box (the scenario M3's own doc comment names)
 // `secrets.store` rejecting vanished silently: no error shown, the key never
@@ -1501,7 +1501,7 @@ describe('HermesInlineCompletionProvider — M3: showWarningMessage rejection is
 // (`showWarningMessage` resolves to `'Set API Key'` -> `executeCommand`
 // rejects) rather than M3's mock (`showWarningMessage` itself rejecting),
 // which is the exact distinction the final security review's probe proved.
-describe('HermesInlineCompletionProvider — F-A: a rejected hermes.setAutocompleteApiKey command must reach reportFailure and re-arm the Set', () => {
+describe('HermesInlineCompletionProvider — F-A: a rejected talaria.setAutocompleteApiKey command must reach reportFailure and re-arm the Set', () => {
   beforeEach(() => {
     clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
@@ -1524,7 +1524,7 @@ describe('HermesInlineCompletionProvider — F-A: a rejected hermes.setAutocompl
     );
   }
 
-  it('a rejected hermes.setAutocompleteApiKey command (e.g. no keyring on Fedora) is reported via reportFailure instead of vanishing as a discarded `void` promise', async () => {
+  it('a rejected talaria.setAutocompleteApiKey command (e.g. no keyring on Fedora) is reported via reportFailure instead of vanishing as a discarded `void` promise', async () => {
     const engine = new FakeEngine();
     engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 401 Unauthorized', 401, 'Unauthorized');
     const reportFailure = vi.fn();

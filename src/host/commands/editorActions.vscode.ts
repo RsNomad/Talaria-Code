@@ -1,7 +1,7 @@
 /**
  * W2 T3 — F-A code actions (§3.3): the impure command handlers behind the
  * `editor/context` "Hermes" submenu (Add/Explain/Improve with Hermes) and the
- * `hermes.fixWithHermes` command the QuickFix action
+ * `talaria.fixWithHermes` command the QuickFix action
  * (`HermesCodeActionProvider.ts`) binds to. This is the ONLY `vscode`
  * importer in `src/host/commands/` — mirrors `context/ports.vscode.ts`'s
  * split (pure logic in `editorActions.ts`, the `vscode`-touching shell
@@ -121,7 +121,7 @@ export function improveWithHermes(provider: SeedTarget): void {
 }
 
 /**
- * Bound to the `hermes.fixWithHermes` command `HermesCodeActionProvider`'s
+ * Bound to the `talaria.fixWithHermes` command `HermesCodeActionProvider`'s
  * "Fix with Hermes" QuickFix carries (`command.arguments`) — `diagnostics`
  * are the SAME `context.diagnostics` VS Code handed the provider for the
  * range that produced the lightbulb, so the seeded "Problems:" section is
@@ -145,11 +145,11 @@ export function fixWithHermes(provider: SeedTarget, diagnostics: readonly vscode
  */
 export function registerEditorActions(context: vscode.ExtensionContext, provider: SeedTarget): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('hermes.addToHermes', () => addToHermes(provider)),
-    vscode.commands.registerCommand('hermes.explainWithHermes', () => explainWithHermes(provider)),
-    vscode.commands.registerCommand('hermes.improveWithHermes', () => improveWithHermes(provider)),
+    vscode.commands.registerCommand('talaria.addToHermes', () => addToHermes(provider)),
+    vscode.commands.registerCommand('talaria.explainWithHermes', () => explainWithHermes(provider)),
+    vscode.commands.registerCommand('talaria.improveWithHermes', () => improveWithHermes(provider)),
     vscode.commands.registerCommand(
-      'hermes.fixWithHermes',
+      'talaria.fixWithHermes',
       (diagnostics?: vscode.Diagnostic[]) => fixWithHermes(provider, diagnostics ?? []),
     ),
   );

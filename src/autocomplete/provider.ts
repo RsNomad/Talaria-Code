@@ -22,7 +22,7 @@ import { isKnownFimModel } from './templates';
  * (jobA-common.md invariant 3/5 — no key/response body ever appears here,
  * only this fixed string) and the one value {@link
  * HermesInlineCompletionProvider}'s `showWarningMessage` handler checks for
- * before invoking `hermes.setAutocompleteApiKey`.
+ * before invoking `talaria.setAutocompleteApiKey`.
  */
 const SET_API_KEY_ACTION = 'Set API Key';
 
@@ -245,7 +245,7 @@ export class HermesInlineCompletionProvider
    *
    * F-A (final fix wave): that `onRejected` arm only ever sees
    * `showWarningMessage` rejecting — it is blind to a rejection thrown
-   * *inside* `onFulfilled`, and `hermes.setAutocompleteApiKey`'s own promise
+   * *inside* `onFulfilled`, and `talaria.setAutocompleteApiKey`'s own promise
    * used to be `void`-discarded there. On a keyring-less Fedora box (our ship
    * target) `context.secrets.store` can reject: the key was never saved, no
    * error shown, and — because `store` failing means `onDidChange` never
@@ -274,7 +274,7 @@ export class HermesInlineCompletionProvider
     void vscode.window.showWarningMessage(message, ...items).then(
       (selection) => {
         if (selection === SET_API_KEY_ACTION) {
-          void vscode.commands.executeCommand('hermes.setAutocompleteApiKey').then(undefined, (err) => {
+          void vscode.commands.executeCommand('talaria.setAutocompleteApiKey').then(undefined, (err) => {
             surfacedAutocompleteFailures.delete(key);
             this.reportFailure(`[autocomplete.setApiKey] ${String(err)}`);
           });

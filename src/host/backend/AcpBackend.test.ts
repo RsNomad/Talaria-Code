@@ -1218,7 +1218,7 @@ describe('AcpBackend.start — Zone RAG: codebase_search MCP server registration
     backend.setMcpServer('codebase_search', fakeMcpServer);
 
     await backend.start(); // initial session
-    await backend.start(); // hermes.newSession / trust-upgrade re-init
+    await backend.start(); // talaria.newSession / trust-upgrade re-init
 
     expect(clients).toHaveLength(2);
     expect(must(must(clients[0]).newSessionCalls[0]).mcpServers).toEqual([fakeMcpServer]);
@@ -2270,7 +2270,7 @@ describe('AcpBackend — R-A6: ACP child crash-respawn (ControlChannel machine c
   it('an intentional restart (start()) detaches the old client — its late exit neither respawns nor signals', async () => {
     const { backend, clients } = makeStartableBackend();
     await backend.start();
-    await backend.start(); // hermes.newSession-style re-init
+    await backend.start(); // talaria.newSession-style re-init
     const messages: HostToWebviewMessage[] = [];
     backend.onMessage((m) => messages.push(m));
 
@@ -2639,7 +2639,7 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
 });
 
 /**
- * T-1 (V-12 RESTART-STATE): today, an EXPLICIT restart (`hermes.newSession` /
+ * T-1 (V-12 RESTART-STATE): today, an EXPLICIT restart (`talaria.newSession` /
  * the trust-upgrade `setBackend` swap → `AcpBackend.start()` a second time)
  * reaches `ConnectionSupervisor.startInternal` → `teardownSession()` →
  * `SessionRegistry.disposeAll()`, which disposes every registered controller

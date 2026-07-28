@@ -408,14 +408,14 @@ describe('next-edit effect executor', () => {
     const mock = makeMockHost();
     const exec = makeExecutor(mock);
     const batches: NextEditEffect[][] = [
-      [{ kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true }, { kind: 'showDecorations', p: P }],
+      [{ kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true }, { kind: 'showDecorations', p: P }],
       [{ kind: 'clearAll' }],
-      [{ kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true }, { kind: 'showDecorations', p: P }],
+      [{ kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true }, { kind: 'showDecorations', p: P }],
       [{ kind: 'clearAll' }],
     ];
     for (const b of batches) {
       exec.run(b);
-      expect(mock.contextKeys.get('hermes.nextEdit.jumpVisible') === true)
+      expect(mock.contextKeys.get('talaria.nextEdit.jumpVisible') === true)
         .toBe(mock.regionDecorationRanges.length > 0);
     }
   });
@@ -425,15 +425,15 @@ describe('next-edit effect executor', () => {
     const exec = makeExecutor(mock);
 
     exec.run([
-      { kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true },
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
       { kind: 'showDecorations', p: P },
-      { kind: 'setContext', key: 'hermes.nextEdit.jumped', value: true },
+      { kind: 'setContext', key: 'talaria.nextEdit.jumped', value: true },
     ]);
     expect(mock.regionDecorationRanges.length).toBe(1);
 
     exec.run([{ kind: 'clearAll' }]);
-    expect(mock.contextKeys.get('hermes.nextEdit.jumpVisible')).toBe(false);
-    expect(mock.contextKeys.get('hermes.nextEdit.jumped')).toBe(false);
+    expect(mock.contextKeys.get('talaria.nextEdit.jumpVisible')).toBe(false);
+    expect(mock.contextKeys.get('talaria.nextEdit.jumped')).toBe(false);
     expect(mock.regionDecorationRanges.length).toBe(0);
   });
 
@@ -443,12 +443,12 @@ describe('next-edit effect executor', () => {
     mock.throwOnShowDecorations = true;
 
     exec.run([
-      { kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true },
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
       { kind: 'showDecorations', p: P },
     ]);
 
-    expect(mock.contextKeys.get('hermes.nextEdit.jumpVisible')).toBe(false);
-    expect(mock.contextKeys.get('hermes.nextEdit.jumped')).toBe(false);
+    expect(mock.contextKeys.get('talaria.nextEdit.jumpVisible')).toBe(false);
+    expect(mock.contextKeys.get('talaria.nextEdit.jumped')).toBe(false);
     expect(mock.regionDecorationRanges.length).toBe(0);
   });
 
@@ -462,12 +462,12 @@ describe('next-edit effect executor', () => {
     // silently steal Tab") but only enforced it for a THROWING host — a host
     // that early-returns walks straight through.
     exec.run([
-      { kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true },
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
       { kind: 'showDecorations', p: P },
     ]);
 
-    expect(mock.contextKeys.get('hermes.nextEdit.jumpVisible')).toBe(false);
-    expect(mock.contextKeys.get('hermes.nextEdit.jumped')).toBe(false);
+    expect(mock.contextKeys.get('talaria.nextEdit.jumpVisible')).toBe(false);
+    expect(mock.contextKeys.get('talaria.nextEdit.jumped')).toBe(false);
     expect(mock.regionDecorationRanges.length).toBe(0);
   });
 
@@ -476,16 +476,16 @@ describe('next-edit effect executor', () => {
     const exec = makeExecutor(mock);
 
     exec.run([
-      { kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true },
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
       { kind: 'showDecorations', p: P },
     ]);
     expect(mock.regionDecorationRanges.length).toBe(1);
 
     // The editor went away between the proposal and the jump.
     mock.paintDeclined = true;
-    exec.run([{ kind: 'setContext', key: 'hermes.nextEdit.jumped', value: true }]);
+    exec.run([{ kind: 'setContext', key: 'talaria.nextEdit.jumped', value: true }]);
 
-    expect(mock.contextKeys.get('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(mock.contextKeys.get('talaria.nextEdit.jumpVisible')).toBe(false);
     expect(mock.regionDecorationRanges.length).toBe(0);
   });
 
@@ -539,13 +539,13 @@ describe('next-edit effect executor', () => {
     const exec = makeExecutor(mock);
 
     exec.run([
-      { kind: 'setContext', key: 'hermes.nextEdit.jumpVisible', value: true },
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
       { kind: 'showDecorations', p: P },
     ]);
     expect(mock.locatorTexts).toEqual(['Tab to jump']);
 
     exec.run([
-      { kind: 'setContext', key: 'hermes.nextEdit.jumped', value: true },
+      { kind: 'setContext', key: 'talaria.nextEdit.jumped', value: true },
       { kind: 'reveal', range: { startLine: 4, endLine: 8 } },
     ]);
     expect(mock.locatorTexts).toEqual(['Tab to jump', 'Tab to accept']);
@@ -1076,7 +1076,7 @@ describe('next-edit R2 single-flight and the FIM seam', () => {
     // Non-vacuity proof for the next test: this exact response IS capable of
     // reaching proposalReady, so the abort test below is asserting a real
     // absence rather than an impossibility.
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
     expect(host.decorationCalls.some((c) => c.ranges.length > 0)).toBe(true);
   });
 
@@ -1100,7 +1100,7 @@ describe('next-edit R2 single-flight and the FIM seam', () => {
     settle();
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).not.toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).not.toBe(true);
     expect(host.decorationCalls.some((c) => c.ranges.length > 0)).toBe(false);
   });
 
@@ -1133,7 +1133,7 @@ describe('next-edit R2 single-flight and the FIM seam', () => {
     fimActivityRelay.resultShown(true);
     expect(backendSpy.predicts).toHaveLength(0); // still visible: GATE 2 holds
 
-    await host.registeredCommands.get('hermes.nextEdit.onFimAccept')?.();
+    await host.registeredCommands.get('talaria.nextEdit.onFimAccept')?.();
     await vi.advanceTimersByTimeAsync(400);
     await vi.advanceTimersByTimeAsync(0);
 
@@ -1265,7 +1265,7 @@ describe('next-edit R2 single-flight and the FIM seam', () => {
 
     await fireTrigger();
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
     expect(host.decorationCalls.some((c) => c.ranges.length > 0)).toBe(true);
   });
 });
@@ -1321,7 +1321,7 @@ describe('next-edit editor identity across the round trip (F-1)', () => {
     settle();
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
     expect(host.decorationCalls.some((c) => c.ranges.length > 0)).toBe(true);
   });
 
@@ -1343,8 +1343,8 @@ describe('next-edit editor identity across the round trip (F-1)', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     // `jumpVisible` true with zero decorations anywhere is the failure: Tab
-    // in b.ts would fire `hermes.nextEdit.jump` instead of indenting.
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).not.toBe(true);
+    // in b.ts would fire `talaria.nextEdit.jump` instead of indenting.
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).not.toBe(true);
     expect(host.decorationCalls.some((c) => c.ranges.length > 0)).toBe(false);
 
     // The LOAD-BEARING half, and the same discipline GATE 5's `mintCalls`
@@ -1355,7 +1355,7 @@ describe('next-edit editor identity across the round trip (F-1)', () => {
     // RAISED here: delete the post-round-trip `editorFor(uri)` re-check and
     // this is the assertion that fails.
     const raised = host.executed.filter(
-      (e) => e.command === 'setContext' && e.args[0] === 'hermes.nextEdit.jumpVisible' && e.args[1] === true,
+      (e) => e.command === 'setContext' && e.args[0] === 'talaria.nextEdit.jumpVisible' && e.args[1] === true,
     );
     expect(raised).toEqual([]);
   });
@@ -1364,7 +1364,7 @@ describe('next-edit editor identity across the round trip (F-1)', () => {
     host.activeTextEditor = makeEditor(makeDoc());
     await setupShell({ next: true, generic: false });
     await fireTrigger();
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
 
     // The active editor moves WITHOUT the `onDidChangeActiveTextEditor`
     // handler firing — the race the uri check exists for. `reveal` reads
@@ -1372,7 +1372,7 @@ describe('next-edit editor identity across the round trip (F-1)', () => {
     host.activeTextEditor = makeEditor(otherDoc());
     host.reveals.length = 0;
 
-    await host.registeredCommands.get('hermes.nextEdit.jump')?.();
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
 
     expect(host.reveals).toEqual([]);
   });
@@ -1410,7 +1410,7 @@ describe('next-edit does not build while a proposal owns the screen (F-2)', () =
     host.activeTextEditor = makeEditor(doc, 40); // region = lines 30..50
     await setupShell({ next: true, generic: false });
     await fireTrigger();
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
     expect(backendSpy.predicts).toHaveLength(1);
 
     // Insert two lines at line 5 — entirely above the region, so `remapRange`
@@ -1434,7 +1434,7 @@ describe('next-edit does not build while a proposal owns the screen (F-2)', () =
     // request while something is displayed.
     expect(backendSpy.predicts).toHaveLength(1);
     // And the remapped proposal is still on screen.
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
   });
 
   it('dismissing the proposal re-opens the trigger — the gate is a gate, not a permanent stop', async () => {
@@ -1444,7 +1444,7 @@ describe('next-edit does not build while a proposal owns the screen (F-2)', () =
     await fireTrigger();
     expect(backendSpy.predicts).toHaveLength(1);
 
-    await host.registeredCommands.get('hermes.nextEdit.dismiss')?.();
+    await host.registeredCommands.get('talaria.nextEdit.dismiss')?.();
     await fireTrigger();
 
     expect(backendSpy.predicts).toHaveLength(2);
@@ -2055,7 +2055,7 @@ describe('next-edit document listeners', () => {
     host.activeTextEditor = makeEditor(doc);
     await setupShell({ next: true, generic: false });
     await fireTrigger();
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
     return doc;
   }
 
@@ -2075,7 +2075,7 @@ describe('next-edit document listeners', () => {
       { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, text: 'x' },
     ]);
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
   });
 
   it('an edit OVERLAPPING the region dismisses the proposal (remapRange returns null)', async () => {
@@ -2085,7 +2085,7 @@ describe('next-edit document listeners', () => {
       { range: { start: { line: 10, character: 0 }, end: { line: 10, character: 3 } }, text: 'zzz' },
     ]);
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
   });
 
   it('an edit ENTIRELY ABOVE the region SHIFTS the proposal down instead of dismissing it', async () => {
@@ -2095,7 +2095,7 @@ describe('next-edit document listeners', () => {
     host.activeTextEditor = makeEditor(doc, 40); // region = lines 30..50
     await setupShell({ next: true, generic: false });
     await fireTrigger();
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
 
     // The REGION decoration carries bare ranges; the locator decoration
     // carries `{ range, renderOptions }` entries. Tell them apart by shape.
@@ -2111,7 +2111,7 @@ describe('next-edit document listeners', () => {
       { range: { start: { line: 5, character: 0 }, end: { line: 5, character: 0 } }, text: 'a\nb\n' },
     ]);
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
     const after = regionCalls();
     expect(after.length).toBeGreaterThan(before);
     // The re-anchored region starts 2 lines lower than the original 30.
@@ -2126,7 +2126,7 @@ describe('next-edit document listeners', () => {
       handler(undefined);
     }
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
   });
 
   it('focusLost (window unfocused) clears the proposal', async () => {
@@ -2136,7 +2136,7 @@ describe('next-edit document listeners', () => {
       handler({ focused: false });
     }
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
   });
 
   it('a window state that REGAINS focus does not disturb a live proposal', async () => {
@@ -2146,7 +2146,7 @@ describe('next-edit document listeners', () => {
       handler({ focused: true });
     }
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(true);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
   });
 });
 
@@ -2173,10 +2173,10 @@ describe('next-edit commands', () => {
     await setupShell({ next: false, generic: false });
 
     for (const id of [
-      'hermes.nextEdit.jump',
-      'hermes.nextEdit.accept',
-      'hermes.nextEdit.dismiss',
-      'hermes.nextEdit.onFimAccept',
+      'talaria.nextEdit.jump',
+      'talaria.nextEdit.accept',
+      'talaria.nextEdit.dismiss',
+      'talaria.nextEdit.onFimAccept',
     ]) {
       expect(host.registrationCounts.get(id), `${id} registration count`).toBe(1);
     }
@@ -2187,15 +2187,15 @@ describe('next-edit commands', () => {
     await setupShell({ next: true, generic: false });
     await fireTrigger();
 
-    await host.registeredCommands.get('hermes.nextEdit.jump')?.();
-    expect(contextKeyValue('hermes.nextEdit.jumped')).toBe(true);
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+    expect(contextKeyValue('talaria.nextEdit.jumped')).toBe(true);
 
-    await host.registeredCommands.get('hermes.nextEdit.accept')?.();
+    await host.registeredCommands.get('talaria.nextEdit.accept')?.();
     await vi.advanceTimersByTimeAsync(0);
 
     expect(host.appliedEdits).toHaveLength(1);
     expect(must(host.appliedEdits[0]).newText).toContain('REWRITTEN LINE');
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
   });
 
   it('a FAILED applyEdit dismisses and notes once', async () => {
@@ -2204,11 +2204,11 @@ describe('next-edit commands', () => {
     await setupShell({ next: true, generic: false });
     await fireTrigger();
 
-    await host.registeredCommands.get('hermes.nextEdit.jump')?.();
-    await host.registeredCommands.get('hermes.nextEdit.accept')?.();
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+    await host.registeredCommands.get('talaria.nextEdit.accept')?.();
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
     expect(host.warnings).toHaveLength(1);
     expect(failures).toHaveLength(1);
   });
@@ -2218,9 +2218,9 @@ describe('next-edit commands', () => {
     await setupShell({ next: true, generic: false });
     await fireTrigger();
 
-    await host.registeredCommands.get('hermes.nextEdit.dismiss')?.();
+    await host.registeredCommands.get('talaria.nextEdit.dismiss')?.();
 
-    expect(contextKeyValue('hermes.nextEdit.jumpVisible')).toBe(false);
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(false);
   });
 
   it('disposing the shell detaches the FIM relay (a later FIM event is a no-op)', async () => {
@@ -2247,8 +2247,8 @@ describe('next-edit commands', () => {
 
     // Attached: the advertised id is registered, and executing it reaches the
     // live shell rather than a missing command.
-    expect(fimActivityRelay.acceptCommandId()).toBe('hermes.nextEdit.onFimAccept');
-    expect(host.registeredCommands.has('hermes.nextEdit.onFimAccept')).toBe(true);
+    expect(fimActivityRelay.acceptCommandId()).toBe('talaria.nextEdit.onFimAccept');
+    expect(host.registeredCommands.has('talaria.nextEdit.onFimAccept')).toBe(true);
 
     disposable.dispose();
 
@@ -2284,18 +2284,18 @@ describe('LOCK: the shell is the only next-edit context-key writer, and register
    * The WRITE signature, not a mere mention: `executeCommand('setContext',
    * ...)` is the only way a context key can actually be set. `fsm.ts` and
    * `types.ts` both name the string `'setContext'` (they declare and emit the
-   * EFFECT describing a write) and both name `hermes.nextEdit.*` keys — but
+   * EFFECT describing a write) and both name `talaria.nextEdit.*` keys — but
    * neither can perform one, which is precisely the separation this lock
    * exists to keep: the pure core decides, the shell alone acts.
    */
   const SET_CONTEXT_WRITE_RE = /executeCommand\(\s*['"]setContext['"]/;
 
-  it('no other non-test file under src/ writes hermes.nextEdit.* context keys', async () => {
+  it('no other non-test file under src/ writes talaria.nextEdit.* context keys', async () => {
     const { collectNonTestTsSources } = await import('../../host/purityScan');
     const path = await import('node:path');
 
     const offenders = collectNonTestTsSources(path.join(__dirname, '..', '..'))
-      .filter((f) => SET_CONTEXT_WRITE_RE.test(f.content) && /hermes\.nextEdit\./.test(f.content))
+      .filter((f) => SET_CONTEXT_WRITE_RE.test(f.content) && /talaria\.nextEdit\./.test(f.content))
       .map((f) => f.file);
 
     expect(offenders).toEqual(['autocomplete/nextedit/shell.vscode.ts']);
@@ -2304,7 +2304,7 @@ describe('LOCK: the shell is the only next-edit context-key writer, and register
   it('the write-signature predicate is not a no-op that would rubber-stamp everything (sanity check on the mechanism)', () => {
     expect(SET_CONTEXT_WRITE_RE.test("void vscode.commands.executeCommand('setContext', key, value);")).toBe(true);
     // A pure core naming the effect kind is NOT a write.
-    expect(SET_CONTEXT_WRITE_RE.test("| { kind: 'setContext'; key: 'hermes.nextEdit.jumped' }")).toBe(false);
+    expect(SET_CONTEXT_WRITE_RE.test("| { kind: 'setContext'; key: 'talaria.nextEdit.jumped' }")).toBe(false);
   });
 
   it('the shell never registers an InlineCompletionItemProvider (exactly ONE, forever — index.ts owns it)', async () => {
@@ -2361,7 +2361,7 @@ interface CredentialScenario {
   /**
    * W5.2 Task 3 (tripwire) — how many times `runTriggerCapturingFetch` drives
    * the ONE trigger path. Default 1 (every existing caller). Each firing
-   * after the first is preceded by the `hermes.nextEdit.dismiss` command (the
+   * after the first is preceded by the `talaria.nextEdit.dismiss` command (the
    * same `esc` a user would press), which `08` §7.6 defines as an
    * unconditional return to `idle` from any state, so a SECOND genuine
    * trigger reliably reaches the route-resolution site again.
@@ -2482,7 +2482,7 @@ async function runTriggerCapturingFetch(scenario: CredentialScenario): Promise<C
         // Reset to `idle` before the NEXT firing — see `CredentialScenario`'s
         // `triggers` doc comment for why this is required for a second
         // firing to reach the route-resolution site at all.
-        host.registeredCommands.get('hermes.nextEdit.dismiss')?.();
+        host.registeredCommands.get('talaria.nextEdit.dismiss')?.();
       }
     }
   } finally {

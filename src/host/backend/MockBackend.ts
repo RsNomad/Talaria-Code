@@ -83,7 +83,7 @@ export class MockBackend implements AgentBackend {
 
   start(): void {
     // Nothing to spin up — a mock is always "connected". A fresh start rewinds
-    // so `hermes.newSession` gives a clean replay.
+    // so `talaria.newSession` gives a clean replay.
     this.reset();
     // T-1 (V-12 RESTART-STATE) mock parity: `MOCK_SESSION_ID`/`MOCK_TAB_ID`
     // never change across a restart, so the `tab.bound` re-emit below alone

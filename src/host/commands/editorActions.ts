@@ -1,7 +1,7 @@
 /**
  * W2 T3 — F-A code actions (§3.3, Candidate A "context-menu-first"): the
  * PURE seed-building units behind the `editor/context` "Hermes" submenu
- * (Add/Explain/Improve with Hermes) and the `hermes.fixWithHermes` QuickFix
+ * (Add/Explain/Improve with Hermes) and the `talaria.fixWithHermes` QuickFix
  * command. The impure command handlers (`window.activeTextEditor` snapshot,
  * the secret-floor notification, command registration) live in
  * `editorActions.vscode.ts` — split the same way `context/format.ts` +

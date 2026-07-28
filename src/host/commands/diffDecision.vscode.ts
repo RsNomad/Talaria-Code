@@ -1,5 +1,5 @@
 /**
- * W2 T4 — F-D (§3.5): the `hermes.acceptDiff`/`hermes.rejectDiff` editor-title
+ * W2 T4 — F-D (§3.5): the `talaria.acceptDiff`/`talaria.rejectDiff` editor-title
  * commands (`package.json`'s `editor/title` menu, `when: resourceScheme ==
  * talaria-diff`). Build-blind (compile-checked + Fedora-verified) —
  * deliberately thin: resolve the active diff tab's toolId (pure,
@@ -82,7 +82,7 @@ export function registerDiffDecisionCommands(
   getBackend: () => AgentBackend,
 ): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('hermes.acceptDiff', () => resolveActiveDiff(getBackend, 'accept')),
-    vscode.commands.registerCommand('hermes.rejectDiff', () => resolveActiveDiff(getBackend, 'reject')),
+    vscode.commands.registerCommand('talaria.acceptDiff', () => resolveActiveDiff(getBackend, 'accept')),
+    vscode.commands.registerCommand('talaria.rejectDiff', () => resolveActiveDiff(getBackend, 'reject')),
   );
 }

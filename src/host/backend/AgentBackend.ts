@@ -59,7 +59,7 @@ export interface AgentBackend extends vscode.Disposable {
    * initializes the ACP connection, and opens a session.
    *
    * Safe to call again to start a *new* session (the provider calls it from the
-   * `hermes.newSession` command after clearing the transcript).
+   * `talaria.newSession` command after clearing the transcript).
    */
   start(): Promise<void> | void;
 
