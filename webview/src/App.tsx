@@ -52,6 +52,7 @@ import { SessionsPanel } from './panels/SessionsPanel';
 import { ModelsPanel } from './panels/ModelsPanel';
 import { SettingsPanel } from './panels/SettingsPanel';
 import { ErrorBanner } from './components/ErrorBanner';
+import { MockNotice } from './components/MockNotice';
 import { Icon } from './components/Icon';
 
 type Action = { host: HostToWebview } | { local: LocalAction };
@@ -497,6 +498,16 @@ export function App() {
         onOpen={openTab}
         backendKind={state.backendKind}
       />
+
+      {/* Audit-3 I-2 (Task A-3): persistent, non-dismissible mock-mode
+          disclosure — driven by the same connection-global backendKind the
+          pill above already reads; see MockNotice.tsx for the fork F-2(A)
+          rationale. Deliberately NOT gated on hydration — the pre-hydrate
+          'mock' boot default showing this notice is the documented honest-
+          boot decision (types.ts D2/A2), self-correcting the instant
+          hydrate/backend.state lands. */}
+      {state.backendKind === 'mock' && <MockNotice />}
+
       <PriorityTabs active={state.activePanel} onSelect={selectPanel} />
 
       {/* Audit G-6 (WCAG 2.2 SC 4.1.2): both dismiss buttons contained only

@@ -343,3 +343,67 @@ describe('T-16 F9: every PriorityTabs tab controls a real role=tabpanel, and non
     expect(screen.getAllByRole('tabpanel')).toHaveLength(1);
   });
 });
+
+/**
+ * Audit-3 I-2 / remediation architecture §2.3 (Task A-3): the only prior
+ * disclosure that the connection-global `backendKind` is `'mock'` was
+ * TabStrip's hover-`title`-gated pill — unreachable to keyboard/touch
+ * scanning and invisible to a tester mid-flow. `MockNotice` (new component)
+ * is a persistent, non-dismissible, text-only strip mounted directly under
+ * `TabStrip`, driven by the SAME `state.backendKind` the pill already reads
+ * (folded from `hydrate` and the `backend.state` push — `transcript.ts`'s
+ * `case 'backend.state': return { ...state, backendKind: msg.kind }`).
+ * Fork F-2(A): no dismiss state, no buttons — so there is nothing to drive
+ * here except `backendKind` itself.
+ */
+describe('A-3 (audit-3 I-2): persistent mock-mode disclosure strip', () => {
+  const theme = { kind: 'dark' as const, accent: '#14b8a6' };
+
+  /** Minimal valid `hydrate` seed (same required fields as
+   *  `transcript.test.ts`'s hydrate payloads) with a caller-chosen
+   *  `backendKind`. */
+  function hydrateWith(backendKind: 'mock' | 'acp') {
+    act(() => {
+      bridge.emit({
+        type: 'hydrate',
+        state: {
+          sessionId: null,
+          theme,
+          mode: 'default',
+          preset: 'manual',
+          currentModelId: null,
+          activePanel: 'chat',
+          backendKind,
+        },
+      });
+    });
+  }
+
+  it('is visible (role=note, non-hover text) once hydrate confirms the live backend is mock', () => {
+    render(<App />);
+    hydrateWith('mock');
+
+    const notice = screen.getByRole('note', { name: 'Demo mode notice' });
+    expect(notice).toHaveTextContent(
+      'Demo mode — responses are canned. Set talaria.backend to "acp" and trust this workspace to use the real agent.',
+    );
+  });
+
+  it('disappears once a `backend.state` push reports the trust-upgrade swap to acp', () => {
+    render(<App />);
+    hydrateWith('mock');
+    expect(screen.getByRole('note', { name: 'Demo mode notice' })).toBeInTheDocument();
+
+    act(() => {
+      bridge.emit({ type: 'backend.state', kind: 'acp' });
+    });
+
+    expect(screen.queryByRole('note', { name: 'Demo mode notice' })).not.toBeInTheDocument();
+  });
+
+  it('the pre-hydrate boot-default render also shows the notice (documented honest-boot decision, types.ts D2/A2) — no gating state added', () => {
+    render(<App />);
+    // No hydrate delivered yet: INITIAL_STATE.backendKind boots 'mock'.
+    expect(screen.getByRole('note', { name: 'Demo mode notice' })).toBeInTheDocument();
+  });
+});
