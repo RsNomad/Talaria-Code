@@ -182,8 +182,25 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
     }
 
     case 'message.end': {
-      const target = [...tab.transcript].reverse().find((i) => i.kind === 'message' && i.turnId === msg.turnId);
+      // audit-3 Code Important: the host accumulates ALL deltas for the whole
+      // turn and emits ONE message.end carrying the FULL turn buffer
+      // (turnTranslator.ts:39-49, pinned by turnTranslator.test.ts). On a
+      // say→tool→say turn the deltas already built TWO+ message blocks (an
+      // interleaving tool/reasoning/approval/plan element closes the
+      // pre-tool block via closeOpenMessages, so the next delta opens a NEW
+      // one) — the whole-turn buffer only equals ONE block's own text when
+      // exactly one block exists for the turn. Reconcile `text` from the
+      // buffer ONLY in that single-block case; with multiple blocks, trust
+      // the delta-built text and only settle `streaming`.
+      const blocks = tab.transcript.filter(
+        (i): i is Extract<TranscriptItem, { kind: 'message' }> => i.kind === 'message' && i.turnId === msg.turnId,
+      );
+      const target = blocks[blocks.length - 1];
       if (!target) {
+        // Unreachable today: finish() only emits message.end after >=1
+        // delta (turnTranslator.ts:45), which implies >=1 message block
+        // already exists for the turn — kept as a defensive fallback per
+        // this codebase's defensive-fold convention (audit-3 Code Info-1).
         return {
           ...tab,
           transcript: [
@@ -192,9 +209,10 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
           ],
         };
       }
+      const text = blocks.length === 1 ? msg.text : target.text;
       return {
         ...tab,
-        transcript: tab.transcript.map((i) => (i === target ? { ...i, text: msg.text, streaming: false } : i)),
+        transcript: tab.transcript.map((i) => (i === target ? { ...i, text, streaming: false } : i)),
       };
     }
 

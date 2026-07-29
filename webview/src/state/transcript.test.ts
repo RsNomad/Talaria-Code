@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { DataPanel, PanelDataMap, ThemeInfo } from '../protocol';
-import { BOOTSTRAP_TAB_ID, INITIAL_STATE, makeTabState, type AppState } from '../types';
+import { BOOTSTRAP_TAB_ID, INITIAL_STATE, makeTabState, type AppState, type MessageItem } from '../types';
 import { must } from '../testing/must';
 import { assertExhaustivePanel } from './panels';
 import { reduce, reduceLocal } from './transcript';
@@ -1794,5 +1794,46 @@ describe('transcript reducer — T-A1 (audit-2 Cluster A, M3): webview authorita
 
     const approval = activeTab(state).transcript.find((i) => i.kind === 'approval');
     expect(approval).toMatchObject({ id: 'appr-1', timeoutMs: 60_000 });
+  });
+});
+
+describe('transcript reducer — audit-3 Code Important: message.end must not duplicate pre-tool text on an interleaved (say→tool→say) turn', () => {
+  /** Host contract (turnTranslator.ts:39-49, pinned by turnTranslator.test.ts):
+   * ONE message.end per turn, carrying the FULL accumulated turn buffer. On a
+   * delta→tool→delta turn the deltas already built TWO message blocks (the
+   * pre-tool block is closed by closeOpenMessages when the tool card
+   * interleaves). Reconciling message.end by overwriting the LAST block with
+   * the whole-turn buffer duplicates the pre-tool text into it. */
+  it('delta → tool.start → delta → message.end settles streaming without duplicating the pre-tool block\'s text', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'Found it. ' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'x',
+      kind: 'execute',
+      title: 'run',
+      status: 'running',
+    });
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'Done.' });
+    state = reduce(state, { type: 'message.end', turnId: 't1', sessionId: 's1', text: 'Found it. Done.' });
+
+    const msgs = activeTab(state).transcript.filter((i): i is MessageItem => i.kind === 'message');
+    // Pre-fix: ['Found it. ', 'Found it. Done.'] — the reducer overwrote the
+    // LAST block with the whole-turn buffer, duplicating the pre-tool text.
+    expect(msgs.map((m) => m.text)).toEqual(['Found it. ', 'Done.']);
+    expect(msgs.every((m) => m.streaming === false)).toBe(true);
+  });
+
+  it('message.end on a single-block turn still reconciles text to the authoritative buffer (guards the pre-existing reconcile path — must NOT regress)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'Hi' });
+    state = reduce(state, { type: 'message.end', turnId: 't1', sessionId: 's1', text: 'Hi there' });
+
+    const msgs = activeTab(state).transcript.filter((i): i is MessageItem => i.kind === 'message');
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]?.text).toBe('Hi there');
+    expect(msgs[0]?.streaming).toBe(false);
   });
 });
