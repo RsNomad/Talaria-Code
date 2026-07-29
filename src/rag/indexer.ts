@@ -9,6 +9,15 @@ import * as vscode from 'vscode';
 // `shared/secretPaths.ts` — the RAG indexer is an egress-only consumer, not
 // a host-policy one.
 import { isSecretForCompletion } from '../shared/secretPaths';
+// SEC-1 (audit-3, RATIFIED): the path filter above (`isSecretForCompletion`
+// in `walk()`) only stops a `.env`/`id_rsa`-class FILE from being indexed at
+// all — it says nothing about a secret living INSIDE a normally-named file
+// (e.g. an API key in `src/config.ts`). The completion/FIM path already runs
+// this SAME content scanner before anything is sent to an inference
+// endpoint; `reindexFiles` below now runs it too, per chunk, before that
+// chunk is embedded and stored (AISVS 8.2.1: detect before embedding, since
+// embedded content cannot be reliably redacted from the resulting index).
+import { scanSnippetForSecrets } from '../autocomplete/context/secretScanner';
 // T-19 (C1+C2): createIgnoreFilter moved to shared/ignoreFilter.ts; toPosixRelative stayed in ./gitignore.
 import { createIgnoreFilter } from '../shared/ignoreFilter';
 import { chunkFile } from './chunker';
@@ -59,6 +68,14 @@ export interface Indexer {
 const MANIFEST_FILE = 'manifest.json';
 const MAX_FILE_BYTES = 1_000_000; // matches Continue's shouldChunk cutoff
 const EMBED_BATCH_SIZE = 64; // how-to §2.4: batch ~64-200
+// SEC-1 (audit-3) / F-3b: bump this when secretScanner.ts's rules change so
+// every workspace re-scans its whole index on upgrade — see `IndexMeta.
+// scannerVersion` and `fingerprintMatches` below. A rule-set change can only
+// make MORE content newly-detected as a secret; an index built under an
+// older, narrower rule set may still hold content that the current rules
+// would now drop, and there is no other signal that would ever force that
+// content back through the (now-stricter) content gate.
+const SCANNER_VERSION = 1;
 
 const EXTENSION_TO_LANGUAGE_ID: Record<string, string> = {
   ts: 'typescript',
@@ -165,10 +182,28 @@ export function createIndexer(opts: IndexerOptions): Indexer {
      * NEXT build compare against it even when dims=0.
      */
     width?: number;
+    /**
+     * SEC-1 (audit-3) / F-3b: the `SCANNER_VERSION` this build's index was
+     * written under. Optional — like `width?`, a legacy sidecar written
+     * before this field existed still `JSON.parse`s and casts cleanly, and
+     * simply reads back as `undefined` here.
+     *
+     * Folding this into the SAME fingerprint `writeMeta`/`fingerprintMatches`
+     * already use for `embedModel`/`dims` reuses the existing "mismatch ->
+     * force a full recompute of every current path" machinery (see
+     * `fingerprintMatches` and its caller in `runBuild`) to also cover a
+     * secret-scanner upgrade: content embedded under an older/absent scanner
+     * may still hold a secret the CURRENT rules would now catch, and nothing
+     * else would ever re-examine already-unchanged file content to find that
+     * out. An `undefined === 1` comparison on a legacy sidecar deliberately
+     * evaluates to `false` (mismatch), forcing exactly one full re-embed the
+     * first time a workspace opens under this fix.
+     */
+    scannerVersion?: number;
   }
 
   function currentMeta(): IndexMeta {
-    return { schema: 1, embedModel: opts.embedModel, dims: opts.dims ?? 0 };
+    return { schema: 1, embedModel: opts.embedModel, dims: opts.dims ?? 0, scannerVersion: SCANNER_VERSION };
   }
 
   async function readMeta(): Promise<IndexMeta | undefined> {
@@ -181,7 +216,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
 
   function fingerprintMatches(stored: IndexMeta | undefined): boolean {
     const want = currentMeta();
-    return stored?.schema === 1 && stored.embedModel === want.embedModel && stored.dims === want.dims;
+    return (
+      stored?.schema === 1 &&
+      stored.embedModel === want.embedModel &&
+      stored.dims === want.dims &&
+      stored.scannerVersion === want.scannerVersion
+    );
   }
 
   /**
@@ -276,8 +316,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // Secret-path floor (W5-T6): a `.env`/`id_rsa`/`.aws/credentials`-class
       // file is skipped BEFORE it is ever read/chunked/embedded — same
       // classifier as the completion exfiltration gate (one source of
-      // truth). This is a PATH filter only; it does not scan content, and it
-      // cannot be overridden by `.gitignore` negation (defense in depth).
+      // truth). This walk-time check is a PATH filter only; it does not
+      // scan content, and it cannot be overridden by `.gitignore` negation
+      // (defense in depth). SEC-1 (audit-3) adds the missing CONTENT layer
+      // for files that pass this path filter — see the `scanSnippetForSecrets`
+      // call in `reindexFiles` below, the two layers together now mirror the
+      // completion path's path+content gate.
       if (ignoreFilter(rel) || isSecretForCompletion(rel)) continue;
       if (entry.isDirectory()) {
         await walk(abs, ignoreFilter, out);
@@ -334,6 +378,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       });
 
       chunks.forEach((chunk, i) => {
+        // SEC-1 (audit-3): Layer-2 CONTENT gate, mirroring the completion
+        // path. Drop the POSITIVE CHUNK ONLY (not the whole file) so index
+        // coverage survives — AISVS 8.2.1 "dropped based on policy". Silent
+        // drop: the scanner's verdict is text-free (ruleId only) and NOTHING
+        // is logged here.
+        if (!scanSnippetForSecrets({ path: relPath, content: chunk.headeredContent }).allowed) return;
         pendingRecords.push({
           id: createHash('sha256')
             .update(`${relPath}:${chunk.startLine}-${chunk.endLine}:${i}`)

@@ -5,14 +5,20 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * W5-T6 — RAG index path-filter security fix.
+ * W5-T6 — RAG index path-filter security fix. Extended by SEC-1 (audit-3):
+ * a PATH-only gate stops a `.env`/`id_rsa`-class FILE from being indexed at
+ * all, but says nothing about a secret living INSIDE a normally-named file
+ * (e.g. an API key in `src/config.ts`) — that content used to be chunked,
+ * embedded, and stored verbatim. `reindexFiles` now also runs the real
+ * `scanSnippetForSecrets` content gate per chunk before it is embedded, so
+ * these tests exercise BOTH layers together, not just the path layer.
  *
  * `createIndexer` is orchestration glue over `LanceDBStore`/`HttpEmbedder`
  * (native/HTTP surface), so those are mocked here exactly like the rest of
  * `src/rag` keeps native deps behind interfaces for testability. The real
- * `node:fs`, chunker, and gitignore filter run against a throwaway temp
- * workspace so these tests exercise the actual walk/reindex/manifest logic,
- * not a re-description of it.
+ * `node:fs`, chunker, gitignore filter, and secret scanner run against a
+ * throwaway temp workspace so these tests exercise the actual
+ * walk/reindex/manifest/scan logic, not a re-description of it.
  */
 const { upsertMock, deleteByPathMock, initMock, closeMock, embedMock } = vi.hoisted(() => ({
   // Typed with the one field the D-2 tests below read back (`path`), so
@@ -107,6 +113,9 @@ import { hashContent } from './contentHash';
 import { createIndexer } from './indexer';
 // eslint-disable-next-line import/first -- must follow the vi.mock calls above; this is the mocked (wrapped) export.
 import { isSecretForCompletion } from '../shared/secretPaths';
+// eslint-disable-next-line import/first -- must follow the vi.mock calls above. NOT mocked in this
+// file — the real scanner runs against real chunk content (SEC-1, audit-3).
+import { scanSnippetForSecrets } from '../autocomplete/context/secretScanner';
 
 describe('createIndexer — secret-path filtering (W5-T6)', () => {
   let workspaceRoot: string;
@@ -287,6 +296,103 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
   });
 });
 
+describe('SEC-1 (audit-3): RAG content secret-scan drops the CHUNK, not the file', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-sec1-test-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer() {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      maxChunkTokens: 50,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  const AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
+  const AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+  const CLEAN_MARKER = 'UNIQUE_CLEAN_SIBLING_CHUNK_MARKER_TALARIA_A1';
+
+  /**
+   * Builds a 41-line `.ts` file so the line-window fallback chunker
+   * (`chunkByLines`: 40-line window, 10-line overlap -> 30-line step; AST
+   * chunking never engages in this test since no real tree-sitter grammar
+   * directory exists under the temp workspace, exactly like the D-2 tests
+   * below) splits it into EXACTLY 2 chunks:
+   *  - chunk 1 = lines 0-39 (0-indexed) — carries the secret, placed at
+   *    lines 0-1 so it never reaches chunk 2.
+   *  - chunk 2 = lines 30-40 — a clean sibling. Lines 30-39 overlap with
+   *    chunk 1, but line 40 (the unique marker) exists ONLY in chunk 2, so
+   *    finding the marker in the embedded texts proves chunk 2 survived.
+   */
+  function buildSplitFileContent(): string {
+    const lines: string[] = [];
+    lines.push(`const awsAccessKeyId = "${AWS_ACCESS_KEY_ID}";`);
+    lines.push(`const awsSecretAccessKey = "${AWS_SECRET_ACCESS_KEY}";`);
+    for (let i = 2; i < 30; i++) lines.push(`const filler${i} = ${i};`);
+    for (let i = 30; i < 41; i++) lines.push(`const cleanLine${i} = "${CLEAN_MARKER}_${i}";`);
+    return lines.join('\n') + '\n';
+  }
+
+  it('drops only the secret-carrying chunk, keeps the clean sibling chunk, on a full build (MUST fail at HEAD)', async () => {
+    // Scratch sanity check (brief: "CONFIRM it actually trips the real
+    // scanner"): the exact secret-carrying line pair, run through the real
+    // (unmocked) scanner directly, must be rejected before this test trusts
+    // the indexer to have dropped it for the right reason.
+    const sanity = scanSnippetForSecrets({
+      path: 'src/config.ts',
+      content: `const awsAccessKeyId = "${AWS_ACCESS_KEY_ID}";\nconst awsSecretAccessKey = "${AWS_SECRET_ACCESS_KEY}";\n`,
+    });
+    expect(sanity.allowed).toBe(false);
+
+    const content = buildSplitFileContent();
+    await writeWorkspaceFile('src/config.ts', content);
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    expect(embedMock).toHaveBeenCalled();
+    const embeddedTexts = embedMock.mock.calls.flatMap(([texts]) => texts);
+
+    // Exactly 1 of the 2 real chunks survived the content gate.
+    expect(embeddedTexts.length).toBe(1);
+
+    for (const text of embeddedTexts) {
+      expect(text).not.toContain(AWS_ACCESS_KEY_ID);
+      expect(text).not.toContain(AWS_SECRET_ACCESS_KEY);
+    }
+    expect(embeddedTexts.some((text) => text.includes(CLEAN_MARKER))).toBe(true);
+
+    const upsertedRecords = upsertMock.mock.calls.flatMap(([records]) => records) as Array<{
+      content?: string;
+    }>;
+    for (const record of upsertedRecords) {
+      expect(record.content ?? '').not.toContain(AWS_ACCESS_KEY_ID);
+    }
+  });
+});
+
 describe('D-2: the index carries a model/dimension fingerprint', () => {
   let workspaceRoot: string;
   let indexDir: string;
@@ -352,8 +458,9 @@ describe('D-2: the index carries a model/dimension fingerprint', () => {
     // embedMock (this file's top-level mock) returns `[0.1, 0.2, 0.3]` per
     // text — width 3 — so a fresh build that embeds real content must record
     // that observed width alongside the existing schema/embedModel/dims
-    // fingerprint fields.
-    expect(meta).toEqual({ schema: 1, embedModel: 'test-embed-model', dims: 0, width: 3 });
+    // fingerprint fields. SEC-1/F-3b extends this fixture: `scannerVersion`
+    // must be stamped too, the same way `width` already is.
+    expect(meta).toEqual({ schema: 1, embedModel: 'test-embed-model', dims: 0, width: 3, scannerVersion: 1 });
   });
 
   it('rebuilds from scratch when the stored fingerprint names a DIFFERENT model', async () => {
@@ -372,6 +479,28 @@ describe('D-2: the index carries a model/dimension fingerprint', () => {
     // A changed embedding model makes every stored vector incomparable. Reusing
     // the manifest would silently poison every future search — the manifest
     // holds only path->contentHash, so nothing else could ever notice.
+    expect(recomputedPaths()).toContain('src/app.ts');
+  });
+
+  it('SEC-1/F-3b: rebuilds from scratch when the stored fingerprint predates scannerVersion (legacy sidecar, MUST fail at HEAD)', async () => {
+    // A legacy sidecar: schema/embedModel/dims all MATCH current exactly (the
+    // ordinary fingerprint used to consider this a match), but it predates
+    // the `scannerVersion` field entirely — modelling an index built before
+    // this fix existed, which may still hold chunk content that was never
+    // run through a content scan at all. The stored hash matches the file's
+    // actual on-disk content exactly (same "deliberately fresh" fixture
+    // shape as the sibling test above), so only the missing-scannerVersion
+    // mismatch can be the reason a recompute happens here.
+    await writeMetaFixture({ schema: 1, embedModel: 'test-embed-model', dims: 0 });
+    await writeManifestFixture({ 'src/app.ts': hashContent(APP_TS_CONTENT) });
+
+    const indexer = makeMetaIndexer();
+    await indexer.build();
+
+    // Content embedded before the SEC-1 content gate existed was never
+    // scanned; reusing it silently would leave that gap open forever, since
+    // an unchanged content hash alone gives the ordinary diff no reason to
+    // ever look at this file's content again.
     expect(recomputedPaths()).toContain('src/app.ts');
   });
 });
