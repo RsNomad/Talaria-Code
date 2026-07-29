@@ -23,7 +23,9 @@
   /* ---- text (follow VS Code) ---- */
   --h-fg: var(--vscode-foreground, #e7ecf1);
   --h-muted: var(--vscode-descriptionForeground, #b4bfc8);
-  --h-faint: var(--vscode-disabledForeground, #7c8791);
+  /* faint = tertiary ACTIVE text tier; genuinely-disabled controls use
+     `disabled:opacity-*` modifiers, never this token. */
+  --h-faint: var(--vscode-descriptionForeground, #8a949e);
 
   /* ---- brand accent (fixed teal, tuned per theme below) ---- */
   --h-accent: #12a594;
