@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Hermes VS Code extension webview UI (React + Vite + Tailwind). Builds to ../dist/webview.",
+  "description": "Talaria Code webview UI (React + Vite + Tailwind). Builds to ../dist/webview.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

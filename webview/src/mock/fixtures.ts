@@ -236,7 +236,7 @@ export const mockTurn: MockStep[] = [
       id: APPROVAL_ID,
       kind: 'command',
       title: 'Run `npm test`?',
-      detail: 'Hermes wants to execute the terminal command `npm test` in the workspace root.',
+      detail: 'Talaria wants to execute the terminal command `npm test` in the workspace root.',
       toolId: TOOL_TEST,
       timeoutMs: 60000,
       options: [
@@ -399,8 +399,8 @@ export const panelData: PanelDataMap = {
 
   sessions: {
     sessions: [
-      { id: 'sess-hist-3', cwd: '/home/dev/hermes-vscode', title: 'Refactor login() to async/await', updatedAt: '2026-07-11T14:32:10Z' },
-      { id: 'sess-hist-2', cwd: '/home/dev/hermes-vscode', title: 'Wire up the RAG search MCP server', updatedAt: '2026-07-10T09:12:00Z' },
+      { id: 'sess-hist-3', cwd: '/home/dev/talaria-code', title: 'Refactor login() to async/await', updatedAt: '2026-07-11T14:32:10Z' },
+      { id: 'sess-hist-2', cwd: '/home/dev/talaria-code', title: 'Wire up the RAG search MCP server', updatedAt: '2026-07-10T09:12:00Z' },
       { id: 'sess-hist-1', cwd: '/home/dev/other-repo', title: undefined, updatedAt: '2026-07-09T22:05:44Z' },
     ],
   },
