@@ -7,7 +7,7 @@ import { join } from 'node:path';
  * default-on autocomplete feature (`talaria.autocomplete.*`) has no `onView`/
  * `onCommand` trigger of its own — before this fix, `activationEvents` was
  * empty (`[]`), so the extension only activated once the user opened the
- * Hermes sidebar or ran a Hermes command, leaving autocomplete silently
+ * Talaria sidebar or ran a Talaria command, leaving autocomplete silently
  * inert on a fresh window. `onStartupFinished` is the sanctioned SPECIFIC
  * activation event for this case (vscode-extension skill baseline / VS Code
  * activation-events docs) — NOT `*`, which is the discouraged eager-

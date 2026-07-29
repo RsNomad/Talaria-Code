@@ -3,7 +3,7 @@
  * indexing a `Record<Enum, X>` render map must never resolve to `undefined`.
  * Today's un-guarded `STATUS[bad]` is `undefined`, so a caller's `.tone`
  * dereference throws mid-render with no error boundary — blanking the whole
- * webview (`.superpowers/sdd/reports/final-3way-2-ui.md` finding I1).
+ * webview (finding I1).
  */
 import { describe, it, expect } from 'vitest';
 import { totalLookup } from './lookup';

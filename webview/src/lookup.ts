@@ -10,8 +10,7 @@
  * host, a bug, a corrupted message) makes `map[key]` `undefined` at runtime
  * even though TypeScript believes it is always present, and dereferencing a
  * field off that (`.tone`) throws mid-render — with no error boundary that
- * blanks the whole webview (see `.superpowers/sdd/reports/final-3way-2-ui.md`
- * finding I1).
+ * blanks the whole webview (finding I1).
  *
  * `totalLookup` makes every such access TOTAL: an unrecognized key falls
  * back to a caller-supplied safe default instead of `undefined`, without a

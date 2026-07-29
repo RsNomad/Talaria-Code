@@ -1,6 +1,5 @@
 /**
- * W2 T5c — commit-gen orchestrator (`docs/research/wave-2/00-architecture-and-paths.md`
- * §3.4 "F-C Commit-message generation"). Wires the ALREADY-COMMITTED building
+ * W2 T5c — commit-gen orchestrator ("F-C Commit-message generation"). Wires the ALREADY-COMMITTED building
  * blocks — `GitPort` (T2d, `context/types.ts`/`gitPort.ts`), the pure message
  * pipeline (T5a, `commitMessage.ts`) + secret/budget units (§2d,
  * `context/sanitize.ts`), and the one-shot `UtilityModelPort` (T5b,

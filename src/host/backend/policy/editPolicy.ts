@@ -2,7 +2,7 @@
  * W2-F1 · Zone A — the pure edit-policy engine.
  *
  * This module is a LITERAL transcription of the pinned cross-zone contract C2
- * (decision table + classifiers) from `docs/specs/wave-2-f1-v1-build-spec.md`.
+ * (decision table + classifiers).
  * It is the client-authoritative rule engine behind the four edit-approval
  * presets (Manual / Normal / Strict / Plan). Zone B (`AcpBackend`) builds a
  * {@link PolicySignal} from each `session/request_permission` and calls

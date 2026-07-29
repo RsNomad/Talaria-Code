@@ -6846,7 +6846,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
   // -> AgentBackend interface -> AcpBackend/ControlDispatcher fan-out) is
   // strictly safer than clamping it in place: a sessionId-less broadcast
   // method can no longer exist to be misused by a future caller, however
-  // well-intentioned. See `.superpowers/sdd/reports/p7-n10-report.md`.
+  // well-intentioned.
   it('P7-N10 footgun-closed: AcpBackend no longer exposes a setMode fan-out method at all', () => {
     const { backend } = makeBackend();
 

@@ -76,8 +76,7 @@ export interface AgentBackend extends vscode.Disposable {
    * ACP `image.attach`/`pdf.attach`/`file.attach` in the real backend; the
    * mock ignores them).
    *
-   * `mentions` (W2 F-M, optional/additive — `docs/research/wave-2/
-   * 00-architecture-and-paths.md` §2a/§2e) carries the composer's structured
+   * `mentions` (W2 F-M, optional/additive) carries the composer's structured
    * `@`-mention refs. S0 scaffolding only: {@link MockBackend} ignores it and
    * `AcpBackend` accepts-but-does-not-yet-resolve it — the host-side
    * resolution seam (workspace confinement, secret gate, the pure mapper onto

@@ -1,8 +1,7 @@
 // nextedit/formats/genericInstruct.test.ts — Job B Task 8 · generic-instruct
 // render + render-drift goldens. Every literal below is transcribed from
-// Sweep's published eval prompt for base qwen (blog appendix `qwen_prompt.md`,
-// quoted verbatim in `docs/research/wave-5.1/05-model-reuse.md` §2.1 —
-// re-verified against https://blog.sweep.dev/posts/oss-next-edit at
+// Sweep's published eval prompt for base qwen (blog appendix `qwen_prompt.md`)
+// — re-verified against https://blog.sweep.dev/posts/oss-next-edit at
 // write-time — see the implementation's own doc comment + the commit
 // message for the citation). The golden (`describe('golden prompt')`) pins
 // the FULL wire string for a fixed fixture so a one-character token drift

@@ -63,7 +63,7 @@ interface TrustGatedZoneOptions {
 }
 
 /**
- * P7-N12 · I-9 (`.superpowers/sdd/reports/final-3way-2-arch.md`) — the
+ * P7-N12 · I-9 — the
  * identical latch→eligibility→log ceremony Zone RG (RAG) and Zone LIB each
  * hand-duplicated ("a 2nd MCP server means a 3rd copy"). Behavior-preserving
  * extraction: the SAME `enabled` config read, the SAME `shouldActivate*`
@@ -339,7 +339,7 @@ export function activate(context: vscode.ExtensionContext): void {
     shouldActivate: shouldActivateRag,
     output,
     start: () => {
-      // Zone RAG (`docs/specs/wave-1-golive.md` pinned contract): register
+      // Zone RAG (pinned contract): register
       // `codebase_search` with whichever backend is CURRENT when this callback
       // fires — `backend` is the outer `let` above, so a trust-triggered
       // mock→real upgrade (below) is already reflected by the time it runs.
@@ -363,7 +363,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // singleton survives the mock→acp backend upgrade on trust-grant below, and
   // is exactly the seam a future W4 multi-session window reuses unchanged.
   //
-  // S-1 fix (`.superpowers/sdd/reports/final-3way-arch.md` finding S-1): the
+  // S-1 fix: the
   // stateless HTTP transport (`server.ts`) calls `buildMcpServer` below on
   // EVERY POST/tool call, so `createSharedLspToolState()` — the concurrency
   // pool, first-empty indexing tracker, and doc-symbols LRU — is constructed
@@ -610,8 +610,8 @@ async function activateCodebaseRag(
 /**
  * Build the `codebase_search` `AcpMcpServerStdio` value (Zone RAG). Pure
  * function of primitive config — no `vscode`/OS/FS touch — so it's
- * unit-testable without an extension host. Pinned shape
- * (`docs/specs/wave-1-golive.md`): `{name, command, args[],
+ * unit-testable without an extension host. Pinned shape:
+ * `{name, command, args[],
  * env:[{name,value}]}` — `env` is a LIST of `{name,value}` pairs (ACP
  * `EnvVariable`), NOT a dict, unlike Node's own `child_process` env
  * convention.

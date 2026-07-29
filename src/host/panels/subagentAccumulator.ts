@@ -9,8 +9,7 @@ import type { AcpSessionUpdate, AcpToolCallFields } from '../backend/acp/types';
  * `tool_call_update` events — NOT `tui_gateway`'s `delegation.status`/
  * `spawn_tree.list`/`subagent.*` (those reflect the tui_gateway control-plane
  * child process, a DIFFERENT process from the actual chat agent — wave-1
- * architecture decision, `docs/specs/wave-1-golive.md` Zone SUB / "Contract
- * note"). Unlike every entry in `reshapePanelData.ts`, there is no single
+ * architecture decision). Unlike every entry in `reshapePanelData.ts`, there is no single
  * "get me the tree" RPC to reshape — this module IS the accumulator that
  * `reshapePanelData.ts`'s `// Zone SUB` comment points at.
  *

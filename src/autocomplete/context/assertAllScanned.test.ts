@@ -17,8 +17,7 @@ vi.mock('./secretScanner', async (importOriginal) => {
 
 /**
  * §3.2 — the wire-adjacent `assertAllScanned` egress backstop (ratified W5
- * critic-pin B1: `docs/research/_critic-pins.md`, `docs/research/wave-5/
- * 00-architecture-and-paths.md` §3.2 "Wire-adjacent backstop"). Recovered
+ * critic-pin B1, "Wire-adjacent backstop"). Recovered
  * from `final-3way-arch.md` finding I-5, which flags it as the ONLY layer
  * that catches "cast-free `any`-laundering" — a snippet that reaches
  * `FimContext.snippets` without ever passing through `ringBuffer.ingest`'s

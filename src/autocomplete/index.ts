@@ -61,7 +61,7 @@ function endpointHost(rawUrl: string): string {
 }
 
 /**
- * Frozen public entry (docs/specs/wave-1.md, Zone AC) — the controller wires this
+ * Frozen public entry (Zone AC) — the controller wires this
  * into `extension.ts`. Reads its own config from
  * `vscode.workspace.getConfiguration('talaria.autocomplete')`.
  *

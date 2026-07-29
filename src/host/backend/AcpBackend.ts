@@ -83,8 +83,7 @@ import { ControlDispatcher, type ControlDispatcherHostPort } from './control/Con
  * command cache) lives on a per-session {@link SessionController}, minted by
  * {@link openSession}/{@link loadSessionIntoTab} and looked up by `sessionId`
  * for every session-targeting `AgentBackend` call — see each router method's
- * doc below for the exact `docs/research/wave-4/00-architecture-and-paths.md`
- * §2c routing-table row it implements.
+ * doc below for the exact routing-table row it implements.
  *
  * The one-shot utility-model surface ({@link oneShot}) is DELIBERATELY NOT
  * part of the SessionController extraction — it is connection-level (an
@@ -233,7 +232,7 @@ export class AcpBackend implements AgentBackend {
    * keyed by their wire `name` — an insertion-ordered `Map` (plain JS `Map`
    * iteration order IS insertion order; no extra structure needed). Today
    * holds the stdio `codebase_search` server (Zone RAG,
-   * `docs/specs/wave-1-golive.md` pinned contract, `undefined`/absent until
+   * pinned contract, `undefined`/absent until
    * `extension.ts` calls {@link setMcpServer} — it owns the Workspace-Trust +
    * `shouldActivateRag` gate) and, once W3 T7 wires it, the http
    * `vscode_lsp` server (research doc §4.4). This class makes no trust
@@ -815,10 +814,9 @@ export class AcpBackend implements AgentBackend {
    * by `name` that every subsequent `session/new`/`session/load` should
    * advertise (see the `start()` comment above for the re-send rationale).
    * `extension.ts` is the only caller — it owns each entry's activation gate
-   * (Zone RAG: Workspace Trust + `shouldActivateRag`,
-   * `docs/specs/wave-1-golive.md`: "only register `codebase_search` when RAG
-   * is active and the workspace is trusted; omit it otherwise"; W3 LIB
-   * (T7): `shouldActivateLib`, research doc §4.2) — this class makes no
+   * (Zone RAG: Workspace Trust + `shouldActivateRag` — "only register
+   * `codebase_search` when RAG is active and the workspace is trusted; omit it
+   * otherwise"; W3 LIB (T7): `shouldActivateLib`, research doc §4.2) — this class makes no
    * trust decision of its own for any entry.
    *
    * Key/name-drift guard (critic A finding 7): when SETTING (`server`
@@ -901,8 +899,7 @@ export class AcpBackend implements AgentBackend {
    * on the EXISTING ACP connection via an ephemeral `session/new`. Backs
    * {@link UtilityModelPort} (T5c binds the two; this class does not
    * `implements` the port itself — callers should depend on the port, not on
-   * `AcpBackend`). See `docs/research/wave-2/00-architecture-and-paths.md`
-   * §2c for the six pinned requirements.
+   * `AcpBackend`). See §2c for the six pinned requirements.
    *
    * W6-FI-a (3-way ARCH I-4, part 1 of 3): a thin passthrough to
    * {@link oneShotRunner} — the mutual-exclusion/deadline/ephemeral-registry

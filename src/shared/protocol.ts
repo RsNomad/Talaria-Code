@@ -1,5 +1,5 @@
 /**
- * Hermes VS Code Extension — Host <-> Webview protocol (single source of truth).
+ * Talaria Code — Host <-> Webview protocol (single source of truth).
  *
  * This file is the CONTRACT every other agent depends on. The host (extension)
  * translates backend events (ACP `session/update` notifications and tui_gateway
@@ -124,7 +124,7 @@ export type AgentMode = 'default' | 'accept_edits' | 'dont_ask';
  * all four presets pin the ACP session mode at 'default' so every main-loop
  * FILE EDIT (`write_file`/`patch`) surfaces to our `request_permission` seam
  * (any other wire mode lets Hermes auto-approve those edits internally and
- * bypass the client engine — see `docs/specs/wave-2-mode-coordination-howto.md`).
+ * bypass the client engine).
  *
  * HONEST SCOPE (F3): the seam does NOT pre-approve everything. Ordinary shell
  * commands are auto-approved by Hermes (only its own dangerous-command regex
@@ -180,8 +180,7 @@ export interface UsageInfo {
 }
 
 /* ------------------------------------------------------------------ *
- * W2 shared context/command shapes (docs/research/wave-2/00-architecture-
- * and-paths.md §2e "Protocol additions", added verbatim). One closed set,
+ * W2 shared context/command shapes (added verbatim). One closed set,
  * reused by the mentions composer (F-M), code actions (F-A, via
  * `composer.seed`), and slash commands (F-S, via `commands.available`).
  * ------------------------------------------------------------------ */
@@ -333,9 +332,8 @@ export interface SkillsData {
 /**
  * One checkpoint row. Origin: the extension-side `CheckpointTracker`
  * (shadow-git; `src/host/checkpoints/CheckpointTracker.ts`) — NOT TUI
- * `rollback.list`. Per the Zone CKPT architecture decision
- * (`docs/specs/wave-1-golive.md`), checkpoints are an extension-side shadow-git
- * mechanism entirely independent of Hermes' own rollback system, snapshotting
+ * `rollback.list`. Per the Zone CKPT architecture decision, checkpoints are
+ * an extension-side shadow-git mechanism entirely independent of Hermes' own rollback system, snapshotting
  * the workspace at each ACP prompt-turn boundary (before the turn, and —
  * W2-F2 — after it settles). `id` is the shadow repo's `write-tree` hash.
  */
@@ -355,8 +353,7 @@ export interface Checkpoint {
   /**
    * W4-T5b: a short, stable, human-readable tag identifying which session
    * created this row (checkpoints are per-ROOT, shared across every
-   * same-root tab — see `docs/research/wave-4/00-architecture-and-paths.md`
-   * §2f) — captured by the controller AT SNAPSHOT TIME and stored verbatim.
+   * same-root tab) — captured by the controller AT SNAPSHOT TIME and stored verbatim.
    * **DISPLAY-ONLY (R8): never a correlation/identity key.** The
    * before/after correlation stays `(turnOrdinal, phase)` — deliberately NOT
    * the ACP session id, which rotates on auto-compaction (see {@link
@@ -432,8 +429,7 @@ export interface CheckpointRedoState {
  * events (`src/host/panels/subagentAccumulator.ts`) — NOT TUI
  * `subagent.*`/`delegation.status` (those reflect the tui_gateway
  * control-plane process, a DIFFERENT process from the live chat agent —
- * wave-1 architecture decision, `docs/specs/wave-1-golive.md` Zone SUB /
- * "Contract note"). A `delegate_task` call is an ordinary ACP tool call on
+ * wave-1 architecture decision). A `delegate_task` call is an ordinary ACP tool call on
  * the wire, so a tracked delegation starts `running` and Hermes drives it to
  * `complete`/`failed` via a `tool_call_update`.
  *
@@ -461,7 +457,7 @@ export type SubagentStatus = 'running' | 'complete' | 'failed' | 'interrupted';
  * context that never surfaces its own tool-call events back to this stream,
  * so a recursive tree, a per-node `role`, a per-node `model`, and a nesting
  * `depth` are simply not observable from here — modeling them would be
- * fabrication (see `docs/specs/zone-sub-report.md`). A batched
+ * fabrication. A batched
  * `delegate_task` call (multiple tasks in one call) is still exactly one
  * `toolCallId` / one node: Hermes never gives a batch's per-task breakdown
  * its own tool-call events either, only a combined prose summary in the
@@ -500,7 +496,7 @@ export interface SubagentNode {
  * Subagents / delegation panel payload — REFINED from the original
  * tui_gateway-oriented placeholder (`root`/`paused`/`maxConcurrent`/
  * `maxDepth`), which assumed a full spawn tree plus pause/resume control
- * that the ACP channel cannot provide (`docs/specs/zone-sub-report.md`). A
+ * that the ACP channel cannot provide. A
  * flat list, not a tree — see {@link SubagentNode}'s fidelity note. Origin:
  * `SubagentAccumulator`'s current snapshot (`src/host/panels/
  * subagentAccumulator.ts`), pushed by `AcpBackend` whenever a `delegate_task`

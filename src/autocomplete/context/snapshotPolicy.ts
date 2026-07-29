@@ -1,6 +1,6 @@
 /**
  * W5-T3 · `snapshotPolicy.ts` — the KV-stable snapshot regeneration predicate
- * (`docs/research/wave-5/00-architecture-and-paths.md` §2.4, critic-A finding 1).
+ * (critic-A finding 1).
  *
  * This is a PAUSE DETECTOR, not a rate limiter. Pinned formula:
  *

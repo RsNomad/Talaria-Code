@@ -637,8 +637,7 @@ describe('TalariaInlineCompletionProvider — cross-file wiring (W5-T5)', () => 
   });
 });
 
-// ── W5.1: next-edit shape-lock (rewrites the W5-T5 absence guard — decision recorded in
-//    docs/research/wave-5.1/08-jobB-final-architecture.md §7.3) ─────────────────────────
+// ── W5.1: next-edit shape-lock (rewrites the W5-T5 absence guard) ─────────────────────────
 describe('next-edit contributions shape-lock', () => {
   const REQUIRED_GUARDS = [
     'editorTextFocus', '!editorReadonly', '!suggestWidgetVisible',

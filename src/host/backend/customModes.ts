@@ -3,8 +3,7 @@ import type { CustomModeConfig, CustomModeInfo } from '../../shared/protocol';
 import type { ModeFloor } from './policy/editPolicy';
 
 /**
- * W4-T4b — the vscode-boundary read for SF-2 custom modes
- * (`docs/research/wave-4/00-architecture-and-paths.md` §4.1/§4.3). This is
+ * W4-T4b — the vscode-boundary read for SF-2 custom modes. This is
  * the ONLY module that reads/validates `talaria.customModes`; the pure engine
  * (`policy/editPolicy.ts`) never imports `vscode` and only ever consumes the
  * {@link ModeFloor} snapshot {@link buildModeFloorSnapshot} produces here.

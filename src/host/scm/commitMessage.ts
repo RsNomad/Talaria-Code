@@ -1,6 +1,6 @@
 /**
  * F-C commit-message generation — the PURE message pipeline
- * (`docs/research/wave-2/00-architecture-and-paths.md` §3.4: `GitPort` →
+ * (`GitPort` →
  * secret-exclusion + `truncateDiffToBudget` (§2d, `context/sanitize.ts`) →
  * `buildCommitPrompt` → model → `parseCommitMessage`). This module is the
  * pure sibling of `gitPort.ts` in this directory — zero `vscode`, zero I/O,
@@ -60,8 +60,7 @@ export interface BuildCommitPromptInput {
 const MAX_STYLE_SUBJECTS = 5;
 
 /**
- * aider's `commit_system` prompt (`docs/research/wave-2/04-commit-generation.md`
- * §2.4), reused verbatim as the output contract — the "dead simple,
+ * aider's `commit_system` prompt, reused verbatim as the output contract — the "dead simple,
  * deterministic output contract" §4's synthesis names as the minimal viable
  * prompt. The `{language_instruction}` i18n hook from the source template is
  * dropped: `buildCommitPrompt`'s input carries no language/instructions

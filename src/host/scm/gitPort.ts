@@ -12,9 +12,8 @@
  *
  * Grounded at write-time: the git extension's public surface is vendored
  * in `./git.d.ts` (see that file's header for the exact grounding — fetched
- * raw from `microsoft/vscode` at write-time, cross-checked against
- * `docs/research/wave-2/04-commit-generation.md` §3's prior Context7
- * grounding of the SAME activation sequence — `Extension.isActive` /
+ * raw from `microsoft/vscode` at write-time, cross-checked against a prior
+ * Context7 grounding of the SAME activation sequence — `Extension.isActive` /
  * `.activate()` / `GitExtension.enabled` BEFORE `getAPI(1)`, since `getAPI`
  * throws when the extension is disabled; never `!`-assert `getExtension`'s
  * result). `vscode.extensions.getExtension`/`Extension<T>.isActive`/

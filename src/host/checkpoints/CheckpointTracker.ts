@@ -24,8 +24,7 @@ export { CheckpointLockTimeoutError } from './shadowLock';
 /**
  * CheckpointTracker — an extension-side, OpenCode-derived shadow-git engine.
  *
- * Design (grounded in `docs/specs/research-checkpoints-cline.md` §4 and
- * summarized in `docs/specs/wave-1-golive.md` Zone CKPT):
+ * Design:
  *
  * - **Shadow repo, not the real one.** `GIT_DIR` lives under extension
  *   storage (`<storageDir>/checkpoints/<hash(workspaceRoot)>/.git`),
@@ -1365,7 +1364,7 @@ export class CheckpointTracker {
  * `index.redo.anchorId`'s row, and only then may it delete unreferenced refs
  * — deleting by age or by "the row I just removed" would unpin a tree a
  * surviving row still references (the exact Kilo 7-day-GC / Roo-truncate
- * failure family; see docs/reviews/plans/bucket-2-phase1-plan.md Task 11).
+ * failure family).
  */
 function refName(treeHash: string): string {
   return `refs/hermes/checkpoints/${treeHash}`;

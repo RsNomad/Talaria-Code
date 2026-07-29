@@ -989,8 +989,7 @@ export class SessionController {
   /**
    * W4-T5b (checkpoint-row session labels — DISPLAY-ONLY, R8): a short,
    * stable, human-readable tag identifying THIS session on a per-root
-   * shared checkpoint timeline (`docs/research/wave-4/
-   * 00-architecture-and-paths.md` §2f: checkpoints are per-ROOT, shared
+   * shared checkpoint timeline (checkpoints are per-ROOT, shared
    * across every same-root tab). Read fresh from `this.sessionId` at each
    * snapshot call site — i.e. captured AT SNAPSHOT TIME — and handed to
    * `tracker.snapshot(...)` as plain data; the tracker stores it verbatim on

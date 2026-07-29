@@ -27,7 +27,7 @@ import { must } from '../../testing/must';
  *
  * Every assertion below was proven RED by planting the corresponding violation
  * (a changed literal / a removed sentence / an added key) and watching it fail
- * before being reverted — see `.superpowers/sdd/reports/task-11-report.md`.
+ * before being reverted.
  */
 
 const NEXTEDIT_DIR = __dirname;

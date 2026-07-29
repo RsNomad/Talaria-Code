@@ -3,8 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 /**
- * O_PATH confined-open unit (accepted-limits Limit-1 close — `docs/research/
- * accepted-limits/00` §2). Closes the classic `realpath`→open TOCTOU on
+ * O_PATH confined-open unit (accepted-limits Limit-1 close). Closes the classic `realpath`→open TOCTOU on
  * `handleReadTextFile`: between the pre-check's `realpath` and the actual read,
  * a prompt-injected agent could flip a path component to a symlink and redirect
  * the read outside the workspace. Here we PIN the validated inode with `O_PATH`

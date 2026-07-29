@@ -19,7 +19,7 @@ import type {
 
 /**
  * Fixture-based unit tests for the Zone S reshaping seam. The reference panel
- * is Tools (`tools.list`) — see `docs/specs/contracts-tui-gateway.md` §2:
+ * is Tools (`tools.list`) — per the tui_gateway wire contract:
  *
  *   `tools.list` -> `{"toolsets": [{"name","description","tool_count",
  *   "enabled","tools": [...resolved tool defs]}]}` (`tui_gateway/server.py:13439-13467`)

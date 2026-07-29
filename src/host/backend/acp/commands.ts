@@ -2,7 +2,7 @@ import type { SlashCommandInfo } from '../../../shared/protocol';
 
 /**
  * ACP `available_commands_update.availableCommands` -> {@link SlashCommandInfo}[]
- * (W2 F-S, `docs/research/wave-2/00-architecture-and-paths.md` §2e/§3.2).
+ * (W2 F-S).
  *
  * The exact Hermes payload shape is UNPINNED until verified live (Fedora probe
  * P3 — see {@link AcpAvailableCommand}'s own doc), so `raw` is read as

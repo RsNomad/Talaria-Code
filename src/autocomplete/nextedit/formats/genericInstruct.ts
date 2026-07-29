@@ -8,13 +8,13 @@
 // format (`05` §2.3's table).
 //
 // Every literal below is transcribed verbatim from Sweep's published eval
-// prompt for base qwen — blog appendix `qwen_prompt.md`, quoted in full in
-// `docs/research/wave-5.1/05-model-reuse.md` §2.1 (itself sourced from
+// prompt for base qwen — blog appendix `qwen_prompt.md`, quoted in full
+// (itself sourced from
 // https://blog.sweep.dev/posts/oss-next-edit, "Appendix → Prompt
 // Construction") — RE-VERIFIED against that same URL at write-time (see the
 // shipping commit message for the re-verification note). This exact prompt
-// is also transcribed independently in `08-jobB-final-architecture.md` §4.4
-// and `.superpowers/sdd/task-8-brief.md`; all three agree byte-for-byte
+// is also transcribed independently in `08-jobB-final-architecture.md` §4.4;
+// both agree byte-for-byte
 // WITH EACH OTHER — which is not the same as agreeing with the published
 // artefact. Two details are NOT verifiable and must not be described as
 // verbatim (`G-vendor-spec-audit.md` §4):

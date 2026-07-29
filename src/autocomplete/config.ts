@@ -4,7 +4,7 @@ import type { FimBackendName } from './types';
 
 /**
  * Config surface for this zone, read from `talaria.autocomplete.*`. The frozen
- * contract (docs/specs/wave-1.md, Zone AC) names exactly: `enabled`, `backend`,
+ * contract (Zone AC) names exactly: `enabled`, `backend`,
  * `endpoint`, `model`, `debounceMs`, `maxPromptTokens`, `temperature`. `apiKey` is
  * an extra key this zone needs for the optional cloud/remote backends (Codestral,
  * openai-compat with auth) — see the report's "open concerns" for what the

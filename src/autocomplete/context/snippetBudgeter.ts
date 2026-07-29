@@ -1,7 +1,6 @@
 /**
  * W5-T3 · `snippetBudgeter.ts` — priority ladder → dedup → per-mode budget →
  * line-aligned skip-not-crop → most-relevant-LAST → frozen snapshot.
- * `docs/research/wave-5/00-architecture-and-paths.md` §2.2/§2.5/§2.6.
  *
  * Pure: no `vscode`, no `fs`, no `Date.now()`/`Math.random()`, no `any`. This
  * module never mints a `ScannedSnippet` from scratch — it only ever narrows

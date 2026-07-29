@@ -1,7 +1,6 @@
 /**
  * W5-T3 · `ringBuffer.ts` — the security choke point of Wave 5 cross-file
  * autocomplete. `ingest()` is the ONLY write path into snippet state.
- * `docs/research/wave-5/00-architecture-and-paths.md` §2.1/§2.2/§2.4/§3.2/§3.3.
  *
  * Per-source ring PARTITIONS (critic-A finding 3 — NOT one shared FIFO): the
  * high-volume `recently-edited` stream can never evict `recently-opened`

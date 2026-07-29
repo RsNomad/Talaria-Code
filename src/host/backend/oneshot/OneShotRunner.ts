@@ -24,9 +24,8 @@ import type { OneShotResult } from '../../scm/utilityModel';
  * {@link OneShotHostPort}.
  *
  * §2c — "One-shot model-call surface": a silent, isolated single model call
- * on the EXISTING ACP connection via an ephemeral `session/new`. See
- * `docs/research/wave-2/00-architecture-and-paths.md` §2c for the six pinned
- * requirements; each is tagged `§2c req N` at its implementation site below,
+ * on the EXISTING ACP connection via an ephemeral `session/new`. See §2c for
+ * the six pinned requirements; each is tagged `§2c req N` at its implementation site below,
  * same as before the extraction.
  */
 export class OneShotRunner {

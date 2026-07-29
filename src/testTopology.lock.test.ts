@@ -52,9 +52,9 @@ const REPO_ROOT = join(__dirname, '..');
 /**
  * Directories the collector never walks. `dist`/`coverage`/`.vscode-test` are
  * build or tool output (and gitignored); `node_modules` and `.git` are
- * self-evident. Everything else IS walked, including `docs/`, `media/` and
- * `.superpowers/` — an orphan hides best somewhere nobody thinks of as a
- * source root, which is exactly why the walk must not be narrowed to `src/`.
+ * self-evident. Everything else IS walked, including `docs/`, `media/`, and
+ * other hidden directories — an orphan hides best somewhere nobody thinks of
+ * as a source root, which is exactly why the walk must not be narrowed to `src/`.
  */
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'out', 'coverage', '.vscode-test']);
 

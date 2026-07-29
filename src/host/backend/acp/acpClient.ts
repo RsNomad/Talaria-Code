@@ -147,7 +147,7 @@ export interface AcpPromptResult {
  * historical citation, not one re-checkable from this checkout). Deliberately
  * a LIST item, not a dict entry: Node's own `child_process` env convention is
  * `Record<string,string>`, which is NOT what goes over the wire here (pinned
- * contract, `docs/specs/wave-1-golive.md`: "ACP McpServerStdio: {name,
+ * contract: "ACP McpServerStdio: {name,
  * command, args[], env:[{name,value}]}").
  */
 export interface AcpEnvVariable {
@@ -212,7 +212,7 @@ export interface AcpClientLike {
   listSessions(cwd?: string, cursor?: string): Promise<AcpListSessionsRawResult>;
   /**
    * Zone HIST: ACP `session/load`. `mcpServers` MUST be re-sent (RAG's pinned
-   * cross-zone contract, `docs/specs/wave-1-golive.md`: "Re-send `mcpServers`
+   * cross-zone contract: "Re-send `mcpServers`
    * on every `session/new` AND `resume`/`load`/`fork`" — the agent does not
    * retain them across a load, exactly like `newSession`).
    */

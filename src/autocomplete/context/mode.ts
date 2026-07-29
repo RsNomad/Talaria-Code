@@ -1,6 +1,5 @@
 /**
- * Cross-file assembly-mode predicate + the comment-injection assembler (§4.2/§4.5
- * of `docs/research/wave-5/00-architecture-and-paths.md`). Pure, host-agnostic —
+ * Cross-file assembly-mode predicate + the comment-injection assembler (§4.2/§4.5). Pure, host-agnostic —
  * no `vscode`. Consumed by `engine.ts` (comment-inject application) and by T5's
  * `provider.ts`/`config.ts` (mode resolution feeding `AutocompleteOptions.crossFileMode`).
  */

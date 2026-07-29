@@ -9,7 +9,7 @@
  * note in `protocol.ts`). For the same reason there is no pause/resume
  * control here — ACP exposes no such capability for a delegation, and
  * routing that button through tui_gateway would silently act on the wrong
- * process (per the wave-1 architecture decision, `docs/specs/wave-1-golive.md`).
+ * process (per the wave-1 architecture decision).
  */
 import type { SubagentsData, SubagentStatus } from '../protocol';
 import { totalLookup } from '../lookup';

@@ -37,7 +37,7 @@ import type {
  */
 
 /* ------------------------------------------------------------------ *
- * Raw tui_gateway shapes — grounded in docs/specs/contracts-tui-gateway.md §2
+ * Raw tui_gateway shapes — grounded in the pinned tui_gateway wire contract
  * ------------------------------------------------------------------ */
 
 /**
@@ -274,7 +274,7 @@ function formatCommand(cfg: RawMcpServerConfig): string {
  * Join `config.get({key:"full"}).mcp_servers` with `tools.list`'s toolset
  * `tool_count` into `McpData` (`McpPanel.tsx`).
  *
- * `reload.mcp` (the third source `docs/specs/wave-1-golive.md` suggested
+ * `reload.mcp` (the third source the original design suggested
  * joining) was traced to `tui_gateway/server.py:11137-11223` and returns only
  * `{"status": "confirm_required"|"reloaded", "message"?}` — no per-server
  * data — so it contributes nothing to this pure reshaper; it is wired as the

@@ -35,8 +35,7 @@ import { must } from '../../testing/must';
  * A lock that cannot go RED is WORSE than no lock: it advertises a safety
  * property that is not there. So every source-scan lock below obeys three
  * rules, and every one of them was verified by planting a real violation,
- * watching the RED, and restoring byte-for-byte (recorded in
- * `.superpowers/sdd/reports/task-14-report.md`):
+ * watching the RED, and restoring byte-for-byte:
  *
  *  1. **Comments are stripped before matching.** A pattern run against raw
  *     content is satisfiable by prose. The `raw`-polarity lock below is the
@@ -867,9 +866,8 @@ describe('R2 LOCK (single-flight DIRECTION, structural): the shell aborts only i
    * RED-first proof, byte-for-byte the reviewer's actual finding: a
    * `getFimController` handle threaded through `NextEditShellDeps` and
    * cancelled with idiomatic optional chaining inside `requestStarted()`.
-   * This is the exact shape that left the pre-fix regex at 65/65 green (see
-   * `.superpowers/sdd/reports/task-14-report.md` — the fix was verified by
-   * planting this in the REAL `shell.vscode.ts` and `NextEditShellDeps`,
+   * This is the exact shape that left the pre-fix regex at 65/65 green — the
+   * fix was verified by planting this in the REAL `shell.vscode.ts` and `NextEditShellDeps`,
    * watching this predicate flag it, then reverting byte-exactly).
    */
   it('RED-first proof: an optional-chained FIM abort (deps.getFimController?.()?.abort()) IS flagged', () => {

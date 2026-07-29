@@ -9,9 +9,8 @@
  * (`https://raw.githubusercontent.com/microsoft/vscode/main/extensions/git/src/api/git.d.ts`,
  * `main` branch) and quoting the exact interfaces below — NOT written from
  * memory, per the T2d brief's mandatory grounding requirement. This is the
- * SAME file `docs/research/wave-2/04-commit-generation.md` §3
- * (Context7-grounded) already walked through; that doc's summary is reused
- * here, not re-derived.
+ * same Context7 grounding already performed elsewhere in this repo for the
+ * same activation sequence; that grounding is reused here, not re-derived.
  *
  * The full upstream file also declares many methods/interfaces this
  * extension never calls (branches, remotes, staging, merge, worktrees,

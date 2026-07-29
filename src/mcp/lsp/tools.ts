@@ -62,9 +62,8 @@
  * The concurrency pool, the doc-symbols LRU, and the indexing tracker are
  * created ONCE at the composition root via {@link createSharedLspToolState}
  * (from the T6a factories) and threaded into every handler through
- * {@link LspToolDeps} — real bounds, not re-created per request. (S-1 fix —
- * see `.superpowers/sdd/reports/final-3way-arch.md` finding S-1: the
- * stateless HTTP transport calls the `buildMcpServer` factory — and so
+ * {@link LspToolDeps} — real bounds, not re-created per request. (S-1 fix:
+ * the stateless HTTP transport calls the `buildMcpServer` factory — and so
  * {@link buildLibMcpServer} itself — on EVERY POST/tool call, so any state
  * created *inside* this function is silently re-created every call, never
  * shared. The composition root (`extension.ts` / `libServerHost` start path)
@@ -144,7 +143,7 @@ export type {
 } from './lspToolContract';
 
 // ---------------------------------------------------------------------------
-// The injected seam — I-7 (`.superpowers/sdd/reports/final-3way-2-arch.md`):
+// The injected seam — I-7:
 // every type declaration that used to live here (`ResolvedPathArg`,
 // `RawDiagnostic(s)(Group)`, `RawDocumentSymbolEntry`, `RawCodeAction(Edit|
 // File)`, `LspToolGateway`, `Pool`, `LspToolDeps`, `SharedLspToolState`) moved

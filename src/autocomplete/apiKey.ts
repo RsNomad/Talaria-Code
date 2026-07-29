@@ -46,7 +46,7 @@ export function shouldMigrateApiKey(
  * VS Code silently fell back to in-memory secret storage: `store()` resolves
  * (there is nothing to encrypt, so no error surfaces), `get()` works for the
  * rest of the session, and the value is gone on quit — leaving no copy
- * anywhere. See `docs/adr/ADR-017-two-session-secret-migration.md`.
+ * anywhere.
  *
  * So the durable copy is kept until a LATER activation reads the secret back
  * WITHOUT migration having run. That read is the only evidence available

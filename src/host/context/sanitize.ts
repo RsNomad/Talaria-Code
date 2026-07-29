@@ -1,6 +1,6 @@
 /**
  * The untrusted-context policy (§2d "Untrusted-context handling — one
- * policy", `docs/research/wave-2/00-architecture-and-paths.md`). Pure —
+ * policy"). Pure —
  * zero `vscode`, zero I/O — enforced by the resolver (T2b) and, later, the
  * commit-gen orchestrator (T5).
  */
@@ -290,8 +290,7 @@ function isTestPath(path: string): boolean {
 }
 
 /**
- * GitLens' priority score (`docs/research/wave-2/04-commit-generation.md`
- * §6.1): source files score high; lockfiles/generated/dist/minified/binary
+ * GitLens' priority score: source files score high; lockfiles/generated/dist/minified/binary
  * score near-zero (so they never crowd out real code, regardless of their
  * byte size); test files are deprioritized to 0.6x their base score. Used
  * only for ORDERING (which files `truncateDiffToBudget` keeps), never

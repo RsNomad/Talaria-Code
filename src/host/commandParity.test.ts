@@ -52,8 +52,7 @@ import { collectNonTestTsSources, type PuritySourceFile } from './purityScan';
  *
  * RED/GREEN verification for C-1, I-2, and the manifest-vacuity guard (M-1,
  * below) — the reviewer's exact mutations replayed against this
- * implementation, plus the reverts — is recorded with real command output in
- * `.superpowers/sdd/task-1-report.md`.
+ * implementation, plus the reverts — was verified with real command output.
  */
 const REPO_ROOT = join(__dirname, '..', '..');
 
@@ -162,6 +161,6 @@ describe('LOCK: every declared command is registered somewhere under src/', () =
   // (C-1, I-2, M-1) despite being named "RED-first proof" — a test that
   // cannot fail is worse than no test, because it stops anyone else from
   // looking. Deleted; the real RED-first plant is the reviewer's mutations
-  // above, replayed against THIS implementation and recorded with actual
-  // command output in `.superpowers/sdd/task-1-report.md`.
+  // above, replayed against THIS implementation and verified with actual
+  // command output.
 });

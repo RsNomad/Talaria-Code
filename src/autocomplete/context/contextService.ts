@@ -3,7 +3,6 @@
  * turns background gather triggers (tab open/close, save, active-editor
  * change, a debounced idle tick — NEVER a keystroke) into a KV-stable
  * `SnippetSnapshot` the provider reads synchronously.
- * `docs/research/wave-5/00-architecture-and-paths.md` §2.1/§2.4/§3.2/§3.3/§4.2.
  *
  * Split, mirroring this repo's established `<name>.ts`/`<name>.vscode.ts`
  * convention (`src/host/context/ports.vscode.ts`, `diffDecision.ts`/

@@ -1,7 +1,6 @@
 /**
  * W5-T1 · the content secret scanner — the security spine of Wave 5 cross-file
- * autocomplete. Pure, zero-dependency, no `vscode`/`fs`/network. See
- * `docs/research/wave-5/00-architecture-and-paths.md` §3.3 for the design.
+ * autocomplete. Pure, zero-dependency, no `vscode`/`fs`/network.
  *
  * `scanSnippetForSecrets` gates every cross-file snippet BEFORE it can enter
  * the ring buffer (T3 wires the choke point; this module is the pure unit it

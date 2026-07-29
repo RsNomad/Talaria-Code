@@ -1,5 +1,5 @@
 /**
- * Hermes VS Code Extension — canned mock data replayed by the MockBackend.
+ * Talaria Code — canned mock data replayed by the MockBackend.
  *
  * `mockTurn` is an ordered, delay-timed script of {@link HostToWebview} messages
  * modelling ONE realistic coding turn: the user asks to refactor `login()`, the

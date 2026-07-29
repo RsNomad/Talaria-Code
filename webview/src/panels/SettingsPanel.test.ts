@@ -1,8 +1,7 @@
 /*
  * W5.1 Task 13 (R5) — the two «Next Edit Suggestions» rows.
  *
- * The row LABELS and DESCRIPTIONS are owner-approved, frozen copy
- * (`docs/research/wave-5.1/08-jobB-final-architecture.md` §8's table). They
+ * The row LABELS and DESCRIPTIONS are owner-approved, frozen copy. They
  * are exported as data (`NEXT_EDIT_ROWS`) rather than buried in JSX precisely
  * so this file can lock them character-for-character: the honesty disclaimers
  * ("No published benchmark score exists for this model.", "vendor-reported,

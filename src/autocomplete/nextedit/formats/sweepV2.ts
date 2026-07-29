@@ -1,8 +1,7 @@
 // nextedit/formats/sweepV2.ts — Job B Task 6 (RENDER) + Task 7 (PARSE) ·
 // sweep-next-edit-v2-7B. Every literal token, the block skeleton, the
 // line-number convention, and `compute_prefill`'s two branches are
-// transcribed verbatim from `docs/research/wave-5.1/04-wire-formats.md`
-// §1.2/§1.4/§1.6/§8, itself read directly out of
+// transcribed verbatim, itself read directly out of
 // https://huggingface.co/sweepai/sweep-next-edit-v2-7B/blob/main/inference.py
 // (`PROMPT_TEMPLATE`, `DIFF_FORMAT`, `compute_prefill`, `STOP_TOKENS`,
 // `MAX_NEW_TOKENS`, `do_sample=False`) — RE-VERIFIED against that same

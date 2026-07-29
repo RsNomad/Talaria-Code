@@ -37,9 +37,8 @@ const SET_API_KEY_ACTION = 'Set API Key';
  * tag resolves to the INSTRUCT build (shares digest `dae161e27b0e` with
  * `:7b-instruct`); the base, FIM-capable artifact is the distinct
  * `:7b-base` tag (digest `bd8755145f1c`) — confirmed live against
- * https://ollama.com/library/qwen2.5-coder/tags. See
- * `docs/research/wave-5.2/F-fim-default-decision.md` §6.3, which already
- * ratified this exact change for every other surface in the repo. This is
+ * https://ollama.com/library/qwen2.5-coder/tags. This change was already
+ * ratified for every other surface in the repo. This is
  * the ONE authorized exception to "do not improve the wording" above: the
  * model-tag example only, nothing else in either string changes.
  *

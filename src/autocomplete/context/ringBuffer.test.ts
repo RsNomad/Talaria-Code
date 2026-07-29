@@ -646,7 +646,7 @@ describe('no brand-preserving spread produces a ScannedSnippet outside the sanct
 });
 
 /**
- * Remediation R-1a (docs/research/wave-5.1/10-remediation-assessment.md): the
+ * Remediation R-1a: the
  * SIBLING cast-forgery guard for the REQUEST-level brand.
  * `ScannedNextEditRequest` (nextedit/types.ts:21) is minted ONLY by
  * `mintScannedNextEditRequest` (nextedit/scan.ts:171) — the request-level

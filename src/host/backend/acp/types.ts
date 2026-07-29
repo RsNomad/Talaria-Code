@@ -106,8 +106,7 @@ export interface AcpPlanEntry {
 
 /**
  * One entry of an ACP `available_commands_update` (the agent-control slash
- * command catalog — W2 F-S, `docs/research/wave-2/00-architecture-and-paths.md`
- * §2e). The exact Hermes payload shape is UNPINNED until verified live
+ * command catalog — W2 F-S). The exact Hermes payload shape is UNPINNED until verified live
  * (Fedora probe P3), so every field below is read DEFENSIVELY by whichever
  * mapper parses this (T1) — an entry failing a shape guard is dropped rather
  * than throwing.
@@ -226,7 +225,7 @@ export type AcpSessionUpdate =
        * Hermes session id and lineage root across a compression-driven
        * session rotation (`acp_adapter/server.py:_send_session_info_update`,
        * `field_meta=meta`; `acp_adapter/provenance.py`). Tracked open item R9
-       * (`docs/reviews/l2-hermes-contract-map.md`) needs exactly this field;
+       * needs exactly this field;
        * it was unreachable under the old open-record placeholder's implicit
        * shape and is now typed so a future consumer does not have to
        * reverse-engineer it from the wire.

@@ -1,8 +1,7 @@
 /**
  * Host-side context/menu resolution seam — port & shape definitions ONLY.
  *
- * S0 scaffolding (`docs/research/wave-2/00-architecture-and-paths.md` §2a
- * "Host-side context/menu resolution seam"): this file carries the pure
+ * S0 scaffolding ("Host-side context/menu resolution seam"): this file carries the pure
  * TYPES the later resolution work (T2) implements against — `resolver.ts`
  * (the impure shell, over these ports), `ports.vscode.ts` (the ONLY
  * `vscode`-importing file in this directory), `format.ts`, `sanitize.ts`,

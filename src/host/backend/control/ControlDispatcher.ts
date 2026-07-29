@@ -604,7 +604,7 @@ export class ControlDispatcher {
    * enforced by the INDEPENDENT per-session mechanisms already on
    * `SessionController` (constructor init, the newSession/loadSession
    * reassert-on-drift, the per-turn reassert) — none of which ever routed
-   * through the fan-out. See `.superpowers/sdd/reports/p7-n10-report.md`.
+   * through the fan-out.
    */
 
   /**

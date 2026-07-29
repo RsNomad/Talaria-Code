@@ -1,8 +1,7 @@
 /**
  * Sanitized child-process environment for shadow-git commands.
  *
- * Rationale (`docs/specs/research-checkpoints-cline.md` §1, §4c — Fedora
- * dev-container / direnv leakage): a shell that already exports
+ * Rationale (Fedora dev-container / direnv leakage): a shell that already exports
  * `GIT_DIR`/`GIT_WORK_TREE`/etc. (common in devcontainers, direnv-managed
  * shells, or a parent git hook) would otherwise silently redirect our
  * shadow-git commands into the wrong repository — the exact class of bug

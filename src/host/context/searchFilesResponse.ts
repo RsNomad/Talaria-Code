@@ -1,6 +1,6 @@
 /**
  * Pure response-building for the `context.searchFiles` control request
- * (`docs/research/wave-2/00-architecture-and-paths.md` §2e; §7 finding A4
+ * (§7 finding A4
  * "moved INTO `CONTROL_METHODS` as an `invokeControl`-style special-case,
  * B9's clamps adopted"). `TalariaViewProvider.ts` calls this with a real
  * `WorkspacePort.findFiles`; this file takes it as an INJECTED function so

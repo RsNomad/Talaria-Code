@@ -1,8 +1,7 @@
 /**
  * W6-FD · the `assertAllScanned` wire-adjacent egress backstop — ratified
- * resolution of W5 critic-pin B1 (`docs/research/_critic-pins.md`,
- * `docs/research/wave-5/00-architecture-and-paths.md` §3.2 "Wire-adjacent
- * backstop"), built per `final-3way-arch.md` finding I-5 (it was ratified in
+ * resolution of W5 critic-pin B1 ("Wire-adjacent backstop"), built per
+ * `final-3way-arch.md` finding I-5 (it was ratified in
  * the W5 design but SILENTLY DROPPED at build time — zero hits in tree).
  *
  * The `ScannedSnippet` brand (`context/types.ts`'s `declare const SCANNED:

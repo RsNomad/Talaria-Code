@@ -2,7 +2,7 @@
  * W2 T5b (§2c "One-shot model-call surface") — the feature-facing port a
  * caller (T5c's commit-gen orchestrator, later any "explain quietly"
  * affordance) depends on, NEVER on `AcpBackend` directly. Shape pinned
- * verbatim in `docs/research/wave-2/00-architecture-and-paths.md` §2c.
+ * verbatim (§2c).
  *
  * `AcpBackend.oneShot` (same task) is the only implementation today — it
  * rides the EXISTING ACP connection via an ephemeral `session/new`, so a
