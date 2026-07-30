@@ -1190,17 +1190,23 @@ export class SessionController {
       this.port.emit({ type: 'model.state', sessionId, modelId: result.currentModelId });
     }
     await this.pinWireModeDefault(result.currentModeId);
-    // I-2 (W1-T3 review, Important fix): recheck for a superseding
-    // `loadReplay` AFTER this await — the guard just above (~:1180) only
-    // covers the `client.loadSession` await; `pinWireModeDefault` is a
-    // SEPARATE suspension point with no recheck of its own before this fix.
-    // THIS call reset `this.replay` to `undefined` two lines above; the ONLY
-    // way it can be non-undefined again by the time we resume here is a
-    // second, superseding `loadReplay` claiming it in the meantime — in
-    // which case everything past this point (subagents mutation,
-    // `commands.available`, the closing `turn.end`) belongs to a turn that
-    // no longer exists from the webview's perspective and must not fire.
-    if (this.replay !== undefined) return;
+    // I-2 (W1-T3 review, Important fix; re-review fix2 added `|| this.
+    // disposed`): recheck for a superseding `loadReplay` AFTER this await —
+    // the guard just above (~:1180) only covers the `client.loadSession`
+    // await; `pinWireModeDefault` is a SEPARATE suspension point with no
+    // recheck of its own before this fix. THIS call reset `this.replay` to
+    // `undefined` two lines above; a non-undefined value at this point can
+    // only mean a second, superseding `loadReplay` claimed it on the SAME
+    // instance in the meantime (the synthetic case production never
+    // creates). The REAL production supersede is `SessionRegistry.open`
+    // minting a FRESH controller and DISPOSING this one — which also resets
+    // `this.replay` to `undefined` (not to a new token), so the first half
+    // alone is FALSE and blind to it; `dispose()` sets `this.disposed =
+    // true`, which is what the second half catches. Either way, everything
+    // past this point (subagents mutation, `commands.available`, the
+    // closing `turn.end`) belongs to a turn that no longer exists from the
+    // webview's perspective and must not fire.
+    if (this.replay !== undefined || this.disposed) return;
     this.markSubagentsInterrupted();
     if (this.lastCommands) {
       this.port.emit({ type: 'commands.available', sessionId, commands: this.lastCommands });

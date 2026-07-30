@@ -1183,6 +1183,13 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
     return { promise, resolve };
   }
 
+  // I-2 re-review (W1-T3 fix2): this first test exercises the SYNTHETIC
+  // same-instance variant — a second `loadReplay` re-claiming `this.replay`
+  // on the SAME controller — which the recheck's `this.replay !== undefined`
+  // half does cover, but which production never actually does. The test
+  // below it ('A DISPOSED while parked...') exercises the REAL production
+  // supersede: `SessionRegistry.open` minting a FRESH controller and
+  // DISPOSING this one, which is what the `|| this.disposed` half guards.
   it('A superseded WHILE parked on pinWireModeDefault emits NOTHING past the pin — no stale turn.end, and the superseding load B still finishes honestly', async () => {
     const loadSessionA = deferred<AcpLoadSessionResult>();
     const loadSessionB = deferred<AcpLoadSessionResult>();
@@ -1274,5 +1281,104 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
     const resultB = await replayB;
     expect(resultB).toEqual({ found: true, currentModeId: 'default' });
     expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'complete' }));
+  });
+
+  /**
+   * I-2 re-review (W1-T3 fix2, Important): the production supersede.
+   * `recoverOneSession` (`ConnectionSupervisor.ts:600`) and
+   * `loadSessionIntoTab` (`AcpBackend.ts:1200`) never re-claim `this.replay`
+   * on the SAME controller instance the way the synthetic test above does —
+   * they mint a FRESH controller via `SessionRegistry.open`, which DISPOSES
+   * the prior controller for that sessionId (`SessionRegistry.ts:38-41`).
+   * `dispose()` resets `this.replay` back to `undefined` (not to a new
+   * token) and sets `this.disposed = true`. Pre-fix, the recheck's
+   * `this.replay !== undefined` half is FALSE on the disposed controller (it
+   * really is `undefined` again) — so the disposed controller falls through
+   * and fires `markSubagentsInterrupted()` + a stale `turn.end{complete}`
+   * into a tab a fresh controller has since taken over. Fixed by also
+   * guarding `this.disposed`.
+   */
+  it('A DISPOSED while parked on pinWireModeDefault (the real production supersede — SessionRegistry.open minting a fresh controller) emits NOTHING past the pin', async () => {
+    const loadSessionA = deferred<AcpLoadSessionResult>();
+    const setSessionModeA = deferred<void>();
+
+    const client: AcpClientLike = {
+      connect: async () => {
+        throw new Error('unused: connect');
+      },
+      initialize: async () => {
+        throw new Error('unused: initialize');
+      },
+      newSession: async () => {
+        throw new Error('unused: newSession');
+      },
+      prompt: async () => {
+        throw new Error('unused: prompt');
+      },
+      cancel: async () => {
+        throw new Error('unused: cancel');
+      },
+      // A is a drifted session (forces the pin's setSessionMode call, which
+      // this test parks open).
+      setSessionMode: async (sessionId: string) => {
+        if (sessionId === 'session-A') return setSessionModeA.promise;
+        throw new Error(`unexpected setSessionMode call for ${sessionId}`);
+      },
+      setSessionModel: async () => {
+        throw new Error('unused: setSessionModel');
+      },
+      listSessions: async (): Promise<AcpListSessionsRawResult> => {
+        throw new Error('unused: listSessions');
+      },
+      loadSession: async (_cwd: string, sessionId: string) => {
+        if (sessionId === 'session-A') return loadSessionA.promise;
+        throw new Error(`unexpected loadSession call for ${sessionId}`);
+      },
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+
+    const emitted: HostToWebviewMessage[] = [];
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => [],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      editPreviewRegistry: undefined,
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('bootstrap', '/ws', port);
+
+    // A starts and parks on `client.loadSession`.
+    const replayA = controller.loadReplay('/ws', 'session-A', '/ws', []);
+
+    // A's load resolves with a drift, so A proceeds into the pin — which
+    // itself parks on `setSessionModeA`. Flush generously: since
+    // `setSessionModeA` never resolves on its own, A cannot run past that
+    // await no matter how many microtasks are flushed here.
+    loadSessionA.resolve({ found: true, currentModeId: 'accept_edits' });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    // The REAL production supersede: a fresh controller is minted for this
+    // sessionId (`SessionRegistry.open`) and THIS controller is disposed —
+    // never a second `loadReplay` call on the same instance. No live turn
+    // is registered here, so `dispose()` takes its no-op branch for the
+    // cancel/turn-lease bookkeeping; what matters is `this.replay =
+    // undefined` and `this.disposed = true`.
+    emitted.length = 0; // isolate: only what happens from here on is under test
+    controller.dispose();
+
+    // Let A's pin settle — A resumes INSIDE loadReplay, past the pin await,
+    // on a controller that is now disposed.
+    setSessionModeA.resolve(undefined);
+    const resultA = await replayA;
+
+    // The fix: A emits NOTHING past the pin boundary once disposed — no
+    // stale turn.end, no commands.available, nothing.
+    expect(emitted).toEqual([]);
+    expect(resultA).toBeUndefined();
   });
 });
