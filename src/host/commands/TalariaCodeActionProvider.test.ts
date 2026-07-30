@@ -50,7 +50,7 @@ describe('TalariaCodeActionProvider.provideCodeActions', () => {
     expect(actions).toEqual([]);
   });
 
-  it('returns exactly one "Fix with Hermes" QuickFix action, not preferred, bound to talaria.fixWithHermes', () => {
+  it('returns exactly one "Fix with Hermes" QuickFix action, not preferred, bound to talaria.fixCode', () => {
     const diagnostics = [{ message: 'boom' }];
     const actions = provider.provideCodeActions({} as never, {} as never, { diagnostics } as never);
 
@@ -60,7 +60,7 @@ describe('TalariaCodeActionProvider.provideCodeActions', () => {
     expect(action.kind).toBe('quickfix');
     expect(action.isPreferred).toBe(false);
     expect(action.command).toEqual({
-      command: 'talaria.fixWithHermes',
+      command: 'talaria.fixCode',
       title: 'Fix with Talaria',
       arguments: [diagnostics],
     });

@@ -1,7 +1,7 @@
 /**
  * W2 T3 — F-A code actions (§3.3): the impure command handlers behind the
  * `editor/context` "Hermes" submenu (Add/Explain/Improve with Hermes) and the
- * `talaria.fixWithHermes` command the QuickFix action
+ * `talaria.fixCode` command the QuickFix action
  * (`TalariaCodeActionProvider.ts`) binds to. This is the ONLY `vscode`
  * importer in `src/host/commands/` — mirrors `context/ports.vscode.ts`'s
  * split (pure logic in `editorActions.ts`, the `vscode`-touching shell
@@ -108,27 +108,27 @@ function runSeedAction(
   provider.seedComposer(seed);
 }
 
-export function addToHermes(provider: SeedTarget): void {
+export function addToChat(provider: SeedTarget): void {
   runSeedAction('add', provider);
 }
 
-export function explainWithHermes(provider: SeedTarget): void {
+export function explainCode(provider: SeedTarget): void {
   runSeedAction('explain', provider);
 }
 
-export function improveWithHermes(provider: SeedTarget): void {
+export function improveCode(provider: SeedTarget): void {
   runSeedAction('improve', provider);
 }
 
 /**
- * Bound to the `talaria.fixWithHermes` command `TalariaCodeActionProvider`'s
+ * Bound to the `talaria.fixCode` command `TalariaCodeActionProvider`'s
  * "Fix with Hermes" QuickFix carries (`command.arguments`) — `diagnostics`
  * are the SAME `context.diagnostics` VS Code handed the provider for the
  * range that produced the lightbulb, so the seeded "Problems:" section is
  * exactly what triggered the action (more precise than re-querying
  * `languages.getDiagnostics` at invocation time).
  */
-export function fixWithHermes(provider: SeedTarget, diagnostics: readonly vscode.Diagnostic[] = []): void {
+export function fixCode(provider: SeedTarget, diagnostics: readonly vscode.Diagnostic[] = []): void {
   const flat: FlatDiagnostic[] = diagnostics.map((d) => ({
     severity: d.severity,
     line: d.range.start.line,
@@ -145,12 +145,12 @@ export function fixWithHermes(provider: SeedTarget, diagnostics: readonly vscode
  */
 export function registerEditorActions(context: vscode.ExtensionContext, provider: SeedTarget): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand('talaria.addToHermes', () => addToHermes(provider)),
-    vscode.commands.registerCommand('talaria.explainWithHermes', () => explainWithHermes(provider)),
-    vscode.commands.registerCommand('talaria.improveWithHermes', () => improveWithHermes(provider)),
+    vscode.commands.registerCommand('talaria.addToChat', () => addToChat(provider)),
+    vscode.commands.registerCommand('talaria.explainCode', () => explainCode(provider)),
+    vscode.commands.registerCommand('talaria.improveCode', () => improveCode(provider)),
     vscode.commands.registerCommand(
-      'talaria.fixWithHermes',
-      (diagnostics?: vscode.Diagnostic[]) => fixWithHermes(provider, diagnostics ?? []),
+      'talaria.fixCode',
+      (diagnostics?: vscode.Diagnostic[]) => fixCode(provider, diagnostics ?? []),
     ),
   );
 }

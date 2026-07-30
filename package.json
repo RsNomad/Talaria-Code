@@ -94,22 +94,22 @@
         "category": "Talaria"
       },
       {
-        "command": "talaria.addToHermes",
+        "command": "talaria.addToChat",
         "title": "Add to Talaria",
         "category": "Talaria"
       },
       {
-        "command": "talaria.explainWithHermes",
+        "command": "talaria.explainCode",
         "title": "Explain with Talaria",
         "category": "Talaria"
       },
       {
-        "command": "talaria.improveWithHermes",
+        "command": "talaria.improveCode",
         "title": "Improve with Talaria",
         "category": "Talaria"
       },
       {
-        "command": "talaria.fixWithHermes",
+        "command": "talaria.fixCode",
         "title": "Fix with Talaria",
         "category": "Talaria"
       },
@@ -230,17 +230,17 @@
       ],
       "talaria.editorSubmenu": [
         {
-          "command": "talaria.addToHermes",
+          "command": "talaria.addToChat",
           "when": "editorHasSelection && talaria.ready",
           "group": "1_talaria@1"
         },
         {
-          "command": "talaria.explainWithHermes",
+          "command": "talaria.explainCode",
           "when": "editorHasSelection && talaria.ready",
           "group": "1_talaria@2"
         },
         {
-          "command": "talaria.improveWithHermes",
+          "command": "talaria.improveCode",
           "when": "editorHasSelection && talaria.ready",
           "group": "1_talaria@3"
         }

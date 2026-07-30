@@ -1,7 +1,7 @@
 /**
  * W2 T3 — F-A code actions (§3.3, Candidate A "context-menu-first"): the
  * PURE seed-building units behind the `editor/context` "Hermes" submenu
- * (Add/Explain/Improve with Hermes) and the `talaria.fixWithHermes` QuickFix
+ * (Add/Explain/Improve with Hermes) and the `talaria.fixCode` QuickFix
  * command. The impure command handlers (`window.activeTextEditor` snapshot,
  * the secret-floor notification, command registration) live in
  * `editorActions.vscode.ts` — split the same way `context/format.ts` +
@@ -91,7 +91,7 @@ export function buildSeed(input: BuildSeedInput): ComposerSeedPayload {
  * `mapDiagnosticEntries`/`ports.vscode.ts`) and a duck-typed
  * {@link FlatDiagnostic} shape — no `vscode.Diagnostic` import needed, so
  * this is headlessly testable even though its only real caller
- * (`fixWithHermes` in `editorActions.vscode.ts`) feeds it a mapped
+ * (`fixCode` in `editorActions.vscode.ts`) feeds it a mapped
  * `vscode.Diagnostic[]` (which structurally satisfies the shape). Reuses the
  * already-tested
  * `mapDiagnosticEntries`/`formatDiagnostics` (Error+Warning only, grouped —

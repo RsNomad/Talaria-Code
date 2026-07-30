@@ -8,7 +8,7 @@
  * `provideCodeActions`).
  *
  * Like every editor action in this feature, the returned action is a prompt
- * SEEDER: its `command` is bound to `talaria.fixWithHermes`
+ * SEEDER: its `command` is bound to `talaria.fixCode`
  * (`editorActions.vscode.ts`), which snapshots the editor and posts
  * `composer.seed` — NEVER a `WorkspaceEdit`. `context.diagnostics` (already
  * scoped to `range` by VS Code) is forwarded as the command's argument so the
@@ -39,7 +39,7 @@ export class TalariaCodeActionProvider implements vscode.CodeActionProvider {
     const action = new vscode.CodeAction('Fix with Talaria', vscode.CodeActionKind.QuickFix);
     action.isPreferred = false;
     action.command = {
-      command: 'talaria.fixWithHermes',
+      command: 'talaria.fixCode',
       title: 'Fix with Talaria',
       arguments: [context.diagnostics],
     };
