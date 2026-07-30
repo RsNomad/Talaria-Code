@@ -68,12 +68,21 @@ function HunkView({
   pending,
   denied,
   onResolve,
+  hunkNumber,
+  total,
+  path,
 }: {
   hunk: DiffHunk;
   resolution?: 'accept' | 'reject';
   pending: boolean;
   denied: boolean;
   onResolve: (action: 'accept' | 'reject') => void;
+  /** B5 (M-3): this hunk's 1-based position within the file's diff — combined
+   * with `total`/`path` to give the Accept/Reject buttons a per-hunk
+   * accessible name (otherwise identical across every hunk in the card). */
+  hunkNumber: number;
+  total: number;
+  path: string;
 }) {
   const resolved = resolution !== undefined;
   const showButtons = pending && !resolved;
@@ -112,6 +121,7 @@ function HunkView({
           <button
             type="button"
             onClick={() => onResolve('accept')}
+            aria-label={`Accept hunk ${hunkNumber} of ${total} in ${path}`}
             className="rounded border border-accent bg-accent px-2.5 py-1 text-2xs font-semibold text-accent-fg hover:opacity-90"
           >
             Accept hunk
@@ -119,6 +129,7 @@ function HunkView({
           <button
             type="button"
             onClick={() => onResolve('reject')}
+            aria-label={`Reject hunk ${hunkNumber} of ${total} in ${path}`}
             className="rounded border border-border px-2.5 py-1 text-2xs font-semibold text-muted hover:bg-overlay"
           >
             Reject
@@ -164,6 +175,9 @@ export function DiffCard({ diff, resolvedHunks, hunkOffset, onResolve, pending, 
             pending={pending ?? false}
             denied={denied}
             onResolve={(action) => onResolve(index, action)}
+            hunkNumber={i + 1}
+            total={total}
+            path={diff.path}
           />
         );
       })}

@@ -78,8 +78,11 @@ describe('DiffCard — T-A2: hunk buttons gated on pending && !resolved (V-7)', 
     render(
       <DiffCard diff={diff} resolvedHunks={{}} hunkOffset={0} onResolve={() => undefined} pending />,
     );
-    expect(screen.getByRole('button', { name: 'Accept hunk' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Reject' })).toBeInTheDocument();
+    // B5 (M-3): accessible name is now per-hunk ("Accept hunk 1 of 1 in
+    // src/example.ts"); the VISIBLE text ("Accept hunk"/"Reject") is asserted
+    // separately in the B5 describe block below.
+    expect(screen.getByRole('button', { name: 'Accept hunk 1 of 1 in src/example.ts' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Reject hunk 1 of 1 in src/example.ts' })).toBeInTheDocument();
   });
 
   it('does not render Accept/Reject for an already-resolved hunk even when pending=true (unchanged: resolved hunks never re-offer buttons)', () => {
@@ -172,5 +175,70 @@ describe('DiffCard — T-A2-SC2/SC3: denied-derived "not applied" pill (never fr
     expect(screen.queryByText('not applied')).not.toBeInTheDocument();
     expect(screen.queryByText('accepted')).not.toBeInTheDocument();
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * B5 (audit-3 UI/UX M-3): across N hunks, `HunkView`'s Accept/Reject buttons
+ * previously shared the exact same accessible name ("Accept hunk" / "Reject")
+ * for every hunk in the card — a screen-reader user tabbing/browsing by role
+ * gets an announced list of indistinguishable "Accept hunk, Accept hunk,
+ * Accept hunk..." with no way to tell which hunk a given button acts on.
+ * Each button now carries a per-hunk `aria-label` naming its position
+ * (`hunkNumber of total`) and the file `path`, while the VISIBLE text stays
+ * "Accept hunk"/"Reject" unchanged.
+ */
+describe('DiffCard — B5: per-hunk Accept/Reject accessible names are distinct (M-3)', () => {
+  const multiHunkDiff: ToolDiff = {
+    path: 'src/multi.ts',
+    hunks: [
+      { header: '@@ -1,2 +1,2 @@', lines: [{ sign: '+', text: 'first hunk line' }] },
+      { header: '@@ -10,2 +10,2 @@', lines: [{ sign: '+', text: 'second hunk line' }] },
+    ],
+  };
+
+  it('gives each Accept button a distinct aria-label containing the path and "of {total}"', () => {
+    render(
+      <DiffCard
+        diff={multiHunkDiff}
+        resolvedHunks={{}}
+        hunkOffset={0}
+        onResolve={() => undefined}
+        pending
+      />,
+    );
+    const acceptButtons = screen.getAllByText('Accept hunk').map((el) => el.closest('button'));
+    expect(acceptButtons).toHaveLength(2);
+    const labels = acceptButtons.map((b) => b?.getAttribute('aria-label'));
+    // Distinct across hunks — a screen reader must be able to tell them apart.
+    expect(new Set(labels).size).toBe(2);
+    for (const label of labels) {
+      expect(label).toContain('src/multi.ts');
+      expect(label).toContain('of 2');
+    }
+    expect(labels[0]).toBe('Accept hunk 1 of 2 in src/multi.ts');
+    expect(labels[1]).toBe('Accept hunk 2 of 2 in src/multi.ts');
+    // Visible text must stay unchanged.
+    for (const b of acceptButtons) {
+      expect(b).toHaveTextContent('Accept hunk');
+    }
+  });
+
+  it('gives each Reject button a distinct aria-label containing the path and "of {total}"', () => {
+    render(
+      <DiffCard
+        diff={multiHunkDiff}
+        resolvedHunks={{}}
+        hunkOffset={0}
+        onResolve={() => undefined}
+        pending
+      />,
+    );
+    const rejectButtons = screen.getAllByText('Reject').map((el) => el.closest('button'));
+    expect(rejectButtons).toHaveLength(2);
+    const labels = rejectButtons.map((b) => b?.getAttribute('aria-label'));
+    expect(new Set(labels).size).toBe(2);
+    expect(labels[0]).toBe('Reject hunk 1 of 2 in src/multi.ts');
+    expect(labels[1]).toBe('Reject hunk 2 of 2 in src/multi.ts');
   });
 });

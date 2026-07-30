@@ -58,7 +58,15 @@ export function RemotePanel<T>({ remote, loadingHint, onRetry, children }: Remot
     return <>{children(remote.data)}</>;
   }
   // idle | loading
-  return <EmptyPanel hint={loadingHint} />;
+  // B5 (M-4): announce "busy" for screen readers while the fetch is in
+  // flight — this wrapper is local to the loading branch; success/error
+  // paths and `EmptyPanel` itself (shared by genuine non-loading empty
+  // states) are untouched.
+  return (
+    <div role="status" aria-busy="true">
+      <EmptyPanel hint={loadingHint} />
+    </div>
+  );
 }
 
 function PanelError({

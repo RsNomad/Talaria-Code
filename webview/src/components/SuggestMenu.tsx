@@ -108,6 +108,7 @@ export function SuggestMenu<T extends SuggestItem>({
                 id={activeOptionId(idBase, i)}
                 role="option"
                 type="button"
+                tabIndex={-1}
                 aria-selected={on}
                 // Keep textarea focus: prevent the mousedown from blurring it.
                 onMouseDown={(e) => e.preventDefault()}

@@ -98,3 +98,34 @@ describe('B4: SuggestMenu option ids', () => {
     expect(document.getElementById('filepick-opt-0')).not.toBeNull();
   });
 });
+
+/**
+ * B5 (audit-3 UI/UX M-2): options are never real Tab stops in the APG
+ * combobox pattern — DOM focus stays on the owning textarea the whole time,
+ * and the visually-"focused" option is only ever communicated via
+ * `aria-activedescendant` ("DOM focus is maintained on the combobox... the
+ * assistive technology focus is moved within the listbox using
+ * aria-activedescendant", https://www.w3.org/WAI/ARIA/apg/patterns/combobox/,
+ * fetched this task). Without `tabIndex={-1}` every `role="option"` button is
+ * an ordinary Tab stop, so a sighted keyboard user tabbing through the page
+ * lands on menu rows the combobox contract says should be unreachable by Tab.
+ */
+describe('B5: SuggestMenu options are not Tab stops (APG combobox)', () => {
+  it('every role="option" element has tabIndex={-1}', () => {
+    render(
+      <SuggestMenu
+        idBase="mention"
+        ariaLabel="Insert a reference"
+        heading="Reference"
+        items={ITEMS}
+        activeIndex={1}
+        onPick={() => undefined}
+      />,
+    );
+    const options = screen.getAllByRole('option');
+    expect(options).toHaveLength(3);
+    for (const option of options) {
+      expect(option).toHaveAttribute('tabindex', '-1');
+    }
+  });
+});
