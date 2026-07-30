@@ -74,6 +74,16 @@ interface JsonRpcNotificationFrame {
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 const KILL_GRACE_MS = 5_000;
 
+/**
+ * B-4 (SEC-6): a single stdout frame may not exceed this before its
+ * terminating newline arrives. Matches autocomplete/backends/http.ts's
+ * MAX_STREAM_BYTES (4 MiB). A frame larger than this is a corrupt or
+ * hostile stream (a truncated JSON line would fail to parse anyway), so
+ * we refuse to buffer it and tear the transport down for a clean respawn
+ * rather than grow unbounded or silently truncate.
+ */
+const MAX_LINE_BYTES = 4 * 1024 * 1024;
+
 export class JsonRpcStdio implements Disposable {
   private readonly child: ChildProcess;
   private readonly logger?: Logger;
@@ -198,6 +208,38 @@ export class JsonRpcStdio implements Disposable {
       const line = this.stdoutBuffer.slice(0, newlineIndex).trim();
       this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
       if (line.length > 0) this.handleFrame(line);
+    }
+
+    // B-4 (SEC-6): bound the RESIDUAL (post-drain) partial frame, not the
+    // transient pre-drain total — a legitimate burst of many complete
+    // `\n`-terminated frames in one chunk can exceed MAX_LINE_BYTES in
+    // total without ever leaving an oversized unterminated tail behind, and
+    // must not false-trip. What's left here (if anything) is always a
+    // SINGLE partial line still waiting on its terminator.
+    if (this.stdoutBuffer.length > MAX_LINE_BYTES) {
+      const oversizedByteCount = this.stdoutBuffer.length;
+      // Never retain the oversized data and never parse a partial frame —
+      // clear before anything else so no code path downstream can see it.
+      this.stdoutBuffer = '';
+      this.log(
+        `[fatal] residual stdout line exceeded ${MAX_LINE_BYTES} bytes ` +
+          `(${oversizedByteCount} bytes buffered, no terminating newline) — ` +
+          'tearing down transport for respawn',
+      );
+      this.rejectAll(
+        new Error(
+          `JsonRpcStdio: stdout frame exceeded ${MAX_LINE_BYTES} bytes ` +
+            `(${oversizedByteCount} bytes) without a terminating newline`,
+        ),
+      );
+      // Reuse the existing teardown path: dispose() kills the child
+      // (SIGTERM, escalating to SIGKILL) without inventing a parallel error
+      // channel. dispose() does not remove the constructor's 'exit'
+      // listener, so the natural exit -> exitHandlers chain still fires
+      // once the child actually dies — the same signal a crash reaches —
+      // which is what drives an upstream supervisor's respawn (e.g.
+      // ControlChannel.spawnAndAwaitReady's `transport.onExit(...)`).
+      this.dispose();
     }
   }
 
