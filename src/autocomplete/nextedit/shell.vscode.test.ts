@@ -2420,7 +2420,7 @@ async function runTriggerCapturingBackendOptions(
 interface CredentialFetchRun {
   /** How many times the process actually tried to talk to the network. */
   fetchCalls: number;
-  /** Lines that reached the Hermes output channel (`deps.reportFailure`). */
+  /** Lines that reached the Talaria output channel (`deps.reportFailure`). */
   surfaced: string[];
   /** Toasts (`vscode.window.showWarningMessage`). */
   warnings: string[];

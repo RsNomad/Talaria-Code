@@ -1,8 +1,8 @@
 /*
  * App root. Subscribes to the bridge, folds SHARED host messages into AppState
  * via the reducer, and renders the Priority+ tab strip + the active surface
- * (chat or a side panel). The native VS Code view title bar owns the "HERMES"
- * title + gear, so the webview draws no top chrome of its own. User actions post
+ * (chat or a side panel). The native VS Code view title bar owns the "TALARIA
+ * CODE" title + gear, so the webview draws no top chrome of its own. User actions post
  * typed webview->host messages through the bridge; optimistic UI updates are
  * applied locally. Only the composer height is persisted via vscode.setState
  * (H9-M9: trimmed from a wider {activePanel, sessionId, composerHeight}

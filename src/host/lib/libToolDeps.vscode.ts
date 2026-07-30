@@ -230,9 +230,9 @@ function mapRawCodeAction(action: vscode.CodeAction): RawCodeAction {
 
 /**
  * Build the real, vscode-backed `LspToolDeps` T6b's `buildLibMcpServer`
- * consumes. `output` is the extension's shared Hermes output channel — every
+ * consumes. `output` is the extension's shared Talaria output channel — every
  * fail-closed/degraded signal below is logged there, prefixed identically to
- * every other Hermes log line.
+ * every other Talaria log line.
  *
  * `shared` (S-1 fix) is the composition root's ONE `createSharedLspToolState()`
  * result — the concurrency pool, first-empty indexing tracker, and

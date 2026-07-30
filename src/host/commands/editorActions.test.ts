@@ -1,7 +1,7 @@
 /**
  * W2 T3 (F-A code actions, §3.3) — the PURE `buildSeed` seed-text builder.
  *
- * Every editor action (Add/Explain/Improve/Fix with Hermes) is a prompt
+ * Every editor action (Add/Explain/Improve/Fix with Talaria) is a prompt
  * SEEDER, never a `WorkspaceEdit`: the impure command handler snapshots
  * `vscode.window.activeTextEditor` and hands the plain data over to this
  * function, which builds the `composer.seed` payload

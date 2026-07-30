@@ -1,6 +1,6 @@
 /*
- * Centered Hermes hero — the empty chat state, shown before the first turn.
- * The Hermes mark, one direct question, and a few starter chips that submit on
+ * Centered Talaria hero — the empty chat state, shown before the first turn.
+ * The Talaria mark, one direct question, and a few starter chips that submit on
  * click. Flex-centered and responsive; it yields to the transcript the moment a
  * turn starts streaming (per the writing guidance: an empty screen invites an
  * action, it doesn't set a mood).

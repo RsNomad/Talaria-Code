@@ -21,7 +21,7 @@
  * remounts a fresh (untripped) boundary — no extra `key` needed.
  *
  * Never a silent swallow: `componentDidCatch` always logs (this file's
- * existing `Hermes: ...`-prefixed `console.error`/`console.warn`
+ * existing `Talaria: ...`-prefixed `console.error`/`console.warn`
  * convention — see `state/transcript.ts`), and `render` always shows a
  * visible fallback card, never blank/empty output.
  */

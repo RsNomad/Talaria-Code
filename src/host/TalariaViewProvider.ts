@@ -69,7 +69,7 @@ export function decideSeedDelivery(isWebviewLive: boolean): 'post' | 'latch' {
  */
 
 /**
- * Hosts the Hermes React webview and is the ONLY bridge between it and the
+ * Hosts the Talaria React webview and is the ONLY bridge between it and the
  * {@link AgentBackend}. It is deliberately a dumb pipe:
  *
  * - backend → webview: forwards every {@link HostToWebviewMessage} from

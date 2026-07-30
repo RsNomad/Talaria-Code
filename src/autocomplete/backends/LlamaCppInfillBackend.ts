@@ -21,6 +21,10 @@ export interface LlamaCppInfillBackendOptions {
 
 interface LlamaCppInfillResponse {
   content?: string;
+  /** dead: constant `true` in the local llama.cpp snapshot, never the real
+   * completion-reason discriminator — that's `stop_type` (unread here, and
+   * unread by anything downstream). Kept typed but never consulted below
+   * (`:133-136` reads `content` only). Per audit-3 CA-1. */
   stop?: boolean;
 }
 
@@ -148,8 +152,14 @@ export class LlamaCppInfillBackend implements FimBackend {
    * snippet set ONLY, never active-file content (finding 2/R14): that is
    * what keeps warm-up from becoming a second, unguarded active-file egress
    * channel. `n_predict`/`t_max_prompt_ms`/`t_max_predict_ms` are all pinned
-   * to 1 so the server does the minimum work needed to prime KV for the
-   * snippet set (mirrors llama.vim's own warm-up request shape).
+   * to 1, mirroring llama.vim's own warm-up request shape — but per audit-3
+   * CA-1, `t_max_prompt_ms`/`t_max_predict_ms` are DEAD in the local
+   * llama.cpp snapshot (schema registration commented out), so those two
+   * time caps don't actually apply. Net effect today is beneficial: warm-up
+   * ends up doing the full `input_extra` KV-cache priming rather than
+   * stopping at 1 ms. If llama.cpp re-enables the parameter, warm-up would
+   * silently start under-priming instead — no error, just a latency
+   * regression.
    */
   warmUp(snippets: readonly ScannedSnippet[], signal: AbortSignal): void {
     const url = joinUrl(this.opts.apiBase, 'infill');

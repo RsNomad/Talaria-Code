@@ -1,6 +1,6 @@
 /**
  * W2 T3 — F-A code actions (§3.3): the impure command handlers behind the
- * `editor/context` "Hermes" submenu (Add/Explain/Improve with Hermes) and the
+ * `editor/context` "Talaria" submenu (Add/Explain/Improve with Talaria) and the
  * `talaria.fixCode` command the QuickFix action
  * (`TalariaCodeActionProvider.ts`) binds to. This is the ONLY `vscode`
  * importer in `src/host/commands/` — mirrors `context/ports.vscode.ts`'s
@@ -122,7 +122,7 @@ export function improveCode(provider: SeedTarget): void {
 
 /**
  * Bound to the `talaria.fixCode` command `TalariaCodeActionProvider`'s
- * "Fix with Hermes" QuickFix carries (`command.arguments`) — `diagnostics`
+ * "Fix with Talaria" QuickFix carries (`command.arguments`) — `diagnostics`
  * are the SAME `context.diagnostics` VS Code handed the provider for the
  * range that produced the lightbulb, so the seeded "Problems:" section is
  * exactly what triggered the action (more precise than re-querying

@@ -211,7 +211,7 @@ export class TalariaInlineCompletionProvider
     // fixed `'model'` statusClass) — the model name is user config, not a
     // secret, so naming it is safe and is what makes the message actionable.
     private readonly getModelName: () => string,
-    // A5: DI seam for the `Hermes` output channel line — mirrors
+    // A5: DI seam for the `Talaria` output channel line — mirrors
     // `ControlDispatcherHostPort.showWarningMessage`'s posture
     // (`host/backend/control/ControlDispatcher.ts:59-60`): keeps this file
     // mockable without a real `vscode.OutputChannel`. Wired to the real
@@ -228,7 +228,7 @@ export class TalariaInlineCompletionProvider
    * A5: surface `message` (+ optional action `items`, e.g. `Set API Key`)
    * via `vscode.window.showWarningMessage` — the repo's established
    * surfacing primitive (precedent: `host/backend/customModes.ts:125`) —
-   * and append one line to the `Hermes` output channel via the injected
+   * and append one line to the `Talaria` output channel via the injected
    * {@link reportFailure} seam. Only on the FIRST insertion of `key` into
    * {@link surfacedAutocompleteFailures} (one-shot, not per-keystroke);
    * every subsequent identical failure is silent until the next engine

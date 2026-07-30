@@ -141,14 +141,16 @@ export interface AcpPromptResult {
 
 /**
  * An environment variable to set when launching an MCP server — ACP's
- * `EnvVariable` (`@zed-industries/agent-client-protocol`'s `schema.d.ts`:
- * `{name, value}` — confirmed against that package before Audit C-1 replaced
- * it with `@agentclientprotocol/sdk`; it is no longer installed, so this is a
- * historical citation, not one re-checkable from this checkout). Deliberately
- * a LIST item, not a dict entry: Node's own `child_process` env convention is
- * `Record<string,string>`, which is NOT what goes over the wire here (pinned
- * contract: "ACP McpServerStdio: {name,
- * command, args[], env:[{name,value}]}").
+ * `EnvVariable`. Re-verified (audit-3 CA-12) against the INSTALLED
+ * `@agentclientprotocol/sdk@0.17.1` (`package.json`'s pinned version;
+ * `node_modules/@agentclientprotocol/sdk/dist/schema/types.gen.d.ts`,
+ * `EnvVariable`): still exactly `{name: string, value: string}` (plus an
+ * optional `_meta`, unused here) — the shape below is current, not a stale
+ * carryover from the predecessor `@zed-industries/agent-client-protocol`
+ * package Audit C-1 replaced. Deliberately a LIST item, not a dict entry:
+ * Node's own `child_process` env convention is `Record<string,string>`,
+ * which is NOT what goes over the wire here (pinned contract: "ACP
+ * McpServerStdio: {name, command, args[], env:[{name,value}]}").
  */
 export interface AcpEnvVariable {
   name: string;
@@ -156,14 +158,17 @@ export interface AcpEnvVariable {
 }
 
 /**
- * ACP `McpServer`'s stdio-transport variant — the SDK's `Stdio` interface
- * (`schema.d.ts` of `@zed-industries/agent-client-protocol`: this variant has
- * no `type` discriminant field, unlike the `http`/`sse` variants which
- * require `type: "http"`/`"sse"` — confirmed against that package before
- * Audit C-1 replaced it with `@agentclientprotocol/sdk`; it is no longer
- * installed, so this is a historical citation, not one re-checkable from this
- * checkout). The only transport Zone RG's `codebase_search` server needs — a
- * bare stdio child process (`dist/mcp/codebase-server.js`).
+ * ACP `McpServer`'s stdio-transport variant — the SDK's `McpServerStdio`
+ * type. Re-verified (audit-3 CA-12) against the INSTALLED
+ * `@agentclientprotocol/sdk@0.17.1`
+ * (`node_modules/@agentclientprotocol/sdk/dist/schema/types.gen.d.ts`,
+ * `McpServerStdio`): still `{name, command, args: string[], env:
+ * Array<EnvVariable>}` with no `type` discriminant field, unlike the
+ * `http`/`sse` variants which require `type: "http"`/`"sse"` — the shape
+ * below is current, not a stale carryover from the predecessor
+ * `@zed-industries/agent-client-protocol` package Audit C-1 replaced. The
+ * only transport Zone RG's `codebase_search` server needs — a bare stdio
+ * child process (`dist/mcp/codebase-server.js`).
  */
 export interface AcpMcpServerStdio {
   name: string;
@@ -334,6 +339,9 @@ export class AcpClient implements AcpClientLike {
         async requestPermission(params: unknown): Promise<AcpRequestPermissionResponse> {
           return callbacks.onRequestPermission(params as AcpRequestPermissionRequest);
         },
+        // dead vs hermes-agent ≤2026.7.7.2 — harness never calls client fs
+        // (reads go direct to disk); kept for ACP-spec correctness. See
+        // audit-3 CA-16.
         async readTextFile(params: {
           path: string;
           line?: number | null;

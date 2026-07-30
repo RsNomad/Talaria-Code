@@ -72,11 +72,11 @@ function endpointHost(rawUrl: string): string {
  */
 export function registerTalariaAutocomplete(
   context: vscode.ExtensionContext,
-  // A5: DI seam for the `Hermes` output channel line a surfaced failure
+  // A5: DI seam for the `Talaria` output channel line a surfaced failure
   // also appends — mirrors `ControlDispatcherHostPort.showWarningMessage`'s
   // posture (`host/backend/control/ControlDispatcher.ts:59-60`). The real
   // implementation (`output.appendLine`) is wired in at `extension.ts`,
-  // where the `Hermes` output channel lives.
+  // where the `Talaria` output channel lives.
   reportFailure: (msg: string) => void,
   // W5.1 R5 (Task 13): DI sink for the next-edit toggle capability. This
   // function is the ONLY place that holds the hydrated Guard, so it is the

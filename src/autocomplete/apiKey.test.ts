@@ -470,7 +470,7 @@ describe('initApiKey — the migrating session leaves the durable copy alone', (
    * The injected error deliberately embeds the key, so the `.not.toContain`
    * below is non-vacuous — `host.failures[0]` is pinned to exist by the
    * length assertion first, and an arm that echoed `String(err)` would ship
-   * the credential straight into the `Hermes` output channel.
+   * the credential straight into the `Talaria` output channel.
    */
   it('reports a rejecting SecretStorage by kind — never unhandled, never echoing the error text', async () => {
     const stored = new Map<string, string>();
@@ -654,7 +654,7 @@ describe('the "clear my key" command leaves no key anywhere it can reach', () =>
  * where the raw key is in scope on the line above a user-visible toast.
  *
  * The security lens replaced the constant message with
- * `` `Hermes: saved ${value.trim()}` `` — the raw API key interpolated into a
+ * `` `Talaria: saved ${value.trim()}` `` — the raw API key interpolated into a
  * notification, which persists in the Notifications centre AND the window log
  * — and the full suite stayed GREEN.
  *

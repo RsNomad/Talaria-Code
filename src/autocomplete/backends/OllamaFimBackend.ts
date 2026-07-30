@@ -23,9 +23,10 @@ interface OllamaGenerateChunk {
  * - `suffix` requires the model's Insert capability; Ollama fills `{{.Prompt}}` /
  *   `{{.Suffix}}` in the model template server-side.
  * - We deliberately never send `raw: true` here — raw mode skips templating
- *   entirely (routes.go:510) and effectively disables `suffix`-based FIM
- *   (routes.go:432), so a `raw:true` + `suffix` combination would silently do
- *   nothing useful.
+ *   entirely (routes.go:510), which effectively disables `suffix`-based FIM
+ *   (the old `routes.go:432` cite for this specific claim was stale —
+ *   `suffix` isn't handled at that line — per audit-3 CA-1), so a `raw:true`
+ *   + `suffix` combination would silently do nothing useful.
  * - Response is streamed as newline-delimited JSON; each chunk carries `.response`,
  *   the final one `"done": true`.
  */

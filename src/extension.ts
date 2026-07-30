@@ -252,7 +252,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // trust+backend decision `selectBackendKind`/`makeAcpBackend` use above,
   // so `talaria.ready` is true iff the workspace is trusted AND
   // `talaria.backend` is actually `acp` — exactly the Cody `cody.activated`
-  // pattern doc §3.3 pins. Drives the `editor/context` "Hermes" submenu's
+  // pattern doc §3.3 pins. Drives the `editor/context` "Talaria" submenu's
   // `when: editorHasSelection && talaria.ready` (package.json) and gates the
   // editor-actions/QuickFix registration below. Re-computed and re-set on
   // `onDidGrantWorkspaceTrust` (below) since trust can only ever be granted

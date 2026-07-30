@@ -1,7 +1,7 @@
 /**
  * W2 T3 — F-A code actions (§3.3): the ONE `TalariaCodeActionProvider`,
  * registered on `'*'` for `providedCodeActionKinds: [QuickFix]`. Returns
- * "Fix with Hermes" ONLY when `context.diagnostics.length > 0` (no
+ * "Fix with Talaria" ONLY when `context.diagnostics.length > 0` (no
  * always-on lightbulb, doc 03 §5.1), `isPreferred: false` (never hijack the
  * LSP's own quick fix, doc 03 §5.9), no Refactor-kind abuse (§5.2), and no
  * work beyond the synchronous predicate below (§5.4 — no async work in

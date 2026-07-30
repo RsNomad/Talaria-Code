@@ -14,7 +14,7 @@
  * exactly `body.classList.add('vscode-reduce-motion')`). Without a
  * `body.vscode-reduce-motion` rule duplicating the kill, a user who set
  * `workbench.reduceMotion` but whose OS has no reduced-motion preference
- * gets none of Hermes' own animations suppressed.
+ * gets none of Talaria's own animations suppressed.
  *
  * `.tsx`/DOM assertions can't exercise actual CSS cascade rules (jsdom does
  * not apply stylesheet files), so this is a text-level characterization

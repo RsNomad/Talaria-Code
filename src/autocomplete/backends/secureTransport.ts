@@ -46,7 +46,7 @@ export function assertSecureAuthTransport(rawUrl: string, hasApiKey: boolean): v
   if (u.protocol === 'https:') return;
   if (u.protocol === 'http:' && isLoopbackHost(u.hostname)) return;
   // SAFETY CONTRACT (security M-3 / F-C item 4): this exact message reaches
-  // the Hermes OUTPUT CHANNEL verbatim via provider.ts:405 (the toast is
+  // the Talaria OUTPUT CHANNEL verbatim via provider.ts:405 (the toast is
   // rebuilt; the channel line is not). NEVER interpolate rawUrl, a
   // hostname, or any other caller-supplied value here — rawUrl can carry
   // userinfo credentials (https://user:pass@host). Locked by the

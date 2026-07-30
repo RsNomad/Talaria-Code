@@ -1,7 +1,7 @@
 /**
  * W2 T3 (F-A code actions, §3.3) — `shouldOfferFix`, the PURE predicate
  * behind `TalariaCodeActionProvider.provideCodeActions`: the QuickFix "Fix
- * with Hermes" action is offered ONLY when the range has at least one
+ * with Talaria" action is offered ONLY when the range has at least one
  * diagnostic (no always-on lightbulb, doc 03 §5.1).
  */
 import { describe, it, expect, vi } from 'vitest';
@@ -50,7 +50,7 @@ describe('TalariaCodeActionProvider.provideCodeActions', () => {
     expect(actions).toEqual([]);
   });
 
-  it('returns exactly one "Fix with Hermes" QuickFix action, not preferred, bound to talaria.fixCode', () => {
+  it('returns exactly one "Fix with Talaria" QuickFix action, not preferred, bound to talaria.fixCode', () => {
     const diagnostics = [{ message: 'boom' }];
     const actions = provider.provideCodeActions({} as never, {} as never, { diagnostics } as never);
 

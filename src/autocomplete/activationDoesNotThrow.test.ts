@@ -148,7 +148,7 @@ describe('C-1: registerTalariaAutocomplete must not throw during synchronous act
   it('does not throw when backend=codestral and the key legitimately lives ONLY in SecretStorage (async — not yet resolved at the point buildEngine runs)', () => {
     host.settings.set('talaria.autocomplete.backend', 'codestral');
     // No `talaria.autocomplete.apiKey` setting at all: the documented,
-    // correct configuration — the user ran "Hermes: Set Autocomplete API
+    // correct configuration — the user ran "Talaria: Set Autocomplete API
     // Key" and the key lives ONLY in SecretStorage.
     const ctx = makeFakeContext('sk-real-key-in-secretstorage');
 
