@@ -232,6 +232,30 @@ export class SessionController {
    * W2-F1 wire-pin (mode-coordination §4.1–4.2): keep Hermes's ACP
    * edit-approval mode at `'default'` for THIS session. Moved off
    * `AcpBackend.pinWireModeDefault` — F4 (the pin is per-controller now).
+   *
+   * CF-01/I-2 (W1-T3): this is the ONE place both call sites reach —
+   * `loadReplay` (~:1123) and `AcpBackend.openSession` (~:754) — so
+   * catching `setSessionMode`'s rejection HERE closes both by construction,
+   * with no duplicated try/catch at either await. Before this fix, a
+   * rejection propagated out of `loadReplay` (falsifying its documented
+   * "never rejects" contract — the webview's already-emitted `clear`/
+   * `turn.start` pair would never get a closing `turn.end`) and out of
+   * `openSession` (which `establishInitialSession`'s try/catch does stop
+   * from crashing `start()`, but only by DISHONESTLY reporting the whole
+   * session establish as failed — `system.error` — even though `tab.bound`/
+   * `mode.state` already fired for a session that is actually live and
+   * usable).
+   *
+   * Degrade, don't reject: log status-only (never the raw error body beyond
+   * `Error.message` — matches every other degrade site in this file, e.g.
+   * {@link snapshotCheckpoint}/{@link snapshotAfterTurn}) and return without
+   * claiming the pin succeeded. `this.currentMode` is deliberately left
+   * untouched on failure (never force-set to `'default'`) — the per-turn
+   * re-pin at `runTurn` (~:863-865) is the fail-CLOSED backstop: it aborts
+   * (rather than silently continuing) the next turn attempt if the wire
+   * mode still isn't confirmed `'default'`, so a still-`accept_edits`
+   * session server-side can never slip a prompt past our approval gate just
+   * because this best-effort re-assert once failed.
    */
   async pinWireModeDefault(reportedModeId: string): Promise<void> {
     const client = this.port.getClient();
@@ -239,7 +263,14 @@ export class SessionController {
       this.port.logger?.append(
         `[SessionController] wire-mode drift: session reported '${reportedModeId}', re-asserting 'default'`,
       );
-      await client.setSessionMode(this.sessionId, 'default');
+      try {
+        await client.setSessionMode(this.sessionId, 'default');
+      } catch (err) {
+        this.port.logger?.append(
+          `[SessionController] wire-mode re-assert failed — degrading (session may still be non-default server-side, a later turn's own re-pin is the backstop): ${errorMessage(err)}`,
+        );
+        return;
+      }
     }
     this.currentMode = 'default';
   }

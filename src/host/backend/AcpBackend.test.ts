@@ -620,6 +620,31 @@ describe('AcpBackend.runTurn — catch-block guard for a superseded turn (findin
       { type: 'turn.end', sessionId: 'session-1', turnId: 'turn-1', status: 'error' },
     ]);
   });
+
+  /**
+   * W1-T3 (CF-01/I-2 brief, RED test (b)): a rejected `client.prompt()` — the
+   * `SessionController.ts` ~:892 await — must settle the turn with NO leaked
+   * pending state: `turnActive` (`ControlDispatcher.listTabs()`'s own
+   * per-tab liveness field, `controller.hasLiveTurn()`) must go back to
+   * `false`, exactly like a clean turn end. `runTurn`'s existing try/catch
+   * (spanning both the :863-865 setSessionMode re-pin AND the :892 prompt
+   * await) already routes a rejection here through `emitTurnEnd`, which
+   * clears `liveTurnId` — this test pins that guarantee explicitly, in the
+   * brief's own vocabulary, rather than only inferring it indirectly (as the
+   * two tests above do, via a second `sendPrompt`/an empty message list).
+   */
+  it('W1-T3: a rejected client.prompt() leaves no stranded turnActive (listTabs reflects the turn as over)', async () => {
+    const { backend, client } = makeBackend();
+
+    backend.sendPrompt('session-1', 'first prompt', 'default');
+    await flushMicrotasks();
+    expect(backend.listTabs().find((t) => t.sessionId === 'session-1')?.turnActive).toBe(true);
+
+    client.rejectInFlightPrompt(new Error('boom: connection reset'));
+    await flushMicrotasks();
+
+    expect(backend.listTabs().find((t) => t.sessionId === 'session-1')?.turnActive).toBe(false);
+  });
 });
 
 /**
@@ -6867,6 +6892,89 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
 
     // currentMode is already 'default', so no per-turn setSessionMode churn.
     expect(client.setSessionModeCalls).toEqual([]);
+  });
+
+  /**
+   * CF-01/I-2 (W1-T3, concurrency-critical): `pinWireModeDefault` is called
+   * from TWO await sites that must never let a REJECTED `setSessionMode`
+   * escape uncaught — `loadReplay` (`SessionController.ts` ~:1123) and
+   * `openSession` (`AcpBackend.ts` ~:754). Before this fix, NEITHER call
+   * site wrapped the pin, so a rejection propagated:
+   *  - out of `loadReplay` -> `loadSessionIntoTab` -> `invokeControl`,
+   *    falsifying `loadReplay`'s documented "never rejects" contract and
+   *    leaving the webview's transcript stuck mid-turn (the `clear`/
+   *    `turn.start` pair it already emitted is never closed by a `turn.end`
+   *    — a genuinely different, protocol-level channel from the
+   *    `control.response{ok:false}` `TalariaViewProvider` turns the
+   *    rejection into, so that outer catch does NOT paper over this).
+   *  - out of `openSession` -> `establishInitialSession`'s try/catch, which
+   *    (correctly) stops it from crashing `start()`, but DISHONESTLY
+   *    reports the whole session establish as FAILED (`system.error`) even
+   *    though `tab.bound`/`mode.state` already fired moments earlier and the
+   *    session is actually live and usable — the "V-4/V-5 cards honesty"
+   *    class of bug this codebase has repeatedly hardened against.
+   *
+   * The fix lives in ONE place — `pinWireModeDefault` itself now catches
+   * `setSessionMode`'s rejection, logs status-only, and returns without
+   * throwing — so both call sites are closed by construction; no call-site
+   * wrapping is duplicated at either await.
+   */
+  describe('CF-01/I-2 (W1-T3): a REJECTED setSessionMode pin degrades instead of propagating', () => {
+    it('loadReplay: never rejects past the pin, and still emits the closing turn.end (found:true, mode drift, setSessionMode rejects)', async () => {
+      const { backend, client, messages } = makeBackend();
+      mockWorkspace.workspaceFolders = undefined; // no roots -> load cwd confinement skipped (mirrors :6854)
+      client.setLoadSessionResult({ found: true, currentModeId: 'accept_edits' }); // forces the pin's setSessionMode call
+      client.setSessionMode = (sessionId: string, modeId: string) => {
+        client.setSessionModeCalls.push({ sessionId, modeId }); // still record the attempt, like the real method does
+        return Promise.reject(new Error('wire: setSessionMode failed'));
+      };
+
+      // RED (pre-fix): this rejects — `loadReplay`'s "never rejects" contract
+      // is falsified by the un-caught pin at SessionController.ts ~:1123.
+      const result = await backend.invokeControl('session.load', { sessionId: 'old-session', cwd: '/ws' });
+      expect(result).toBeDefined(); // the load itself genuinely succeeded — only the best-effort pin degraded
+
+      // The pin was attempted (recorded before it rejected) — this is a real
+      // degrade, not a silent skip.
+      expect(client.setSessionModeCalls).toContainEqual({ sessionId: 'old-session', modeId: 'default' });
+
+      // The closing terminal signal is still emitted — the webview is never
+      // left stuck mid-turn with an opened-but-never-closed transcript.
+      const turnEnds = messages.filter((m) => m.type === 'turn.end');
+      expect(turnEnds).toHaveLength(1);
+      expect(turnEnds[0]).toMatchObject({ status: 'complete' }); // the replay itself succeeded
+      expect(messages.filter((m) => m.type === 'error')).toEqual([]); // status-only log, never a user-facing error for a best-effort pin
+    });
+
+    it('openSession: a rejected pin does not turn an already-bound session into a spurious start failure, and inFlightStart still resets', async () => {
+      const { backend, clients } = makeStartableBackend(undefined, (client) => {
+        client.newSessionModeId = 'accept_edits'; // forces the pin's setSessionMode call
+        client.setSessionMode = (sessionId: string, modeId: string) => {
+          client.setSessionModeCalls.push({ sessionId, modeId }); // still record the attempt, like the real method does
+          return Promise.reject(new Error('wire: setSessionMode failed'));
+        };
+      });
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      // RED (pre-fix): `openSession`'s un-caught pin rejects `openSession`
+      // itself; `establishInitialSession`'s try/catch swallows that so
+      // `start()` doesn't throw, but it ALSO fires a spurious
+      // `system.error` ("Failed to start a Hermes session…") even though
+      // `tab.bound` already fired for a session that is actually live.
+      await backend.start();
+
+      expect(messages.some((m) => m.type === 'tab.bound')).toBe(true);
+      expect(messages.filter((m) => m.type === 'system.error')).toEqual([]);
+      expect(must(clients[0]).setSessionModeCalls).toContainEqual({ sessionId: 'session-1', modeId: 'default' });
+
+      // Not wedged: the start-tail resets to idle...
+      expect(seam(backend).inFlightStart).toBeUndefined();
+      // ...and the bound session is genuinely usable afterward.
+      backend.sendPrompt('session-1', 'hello', 'default');
+      await flushMicrotasks();
+      expect(must(clients[0]).promptCallCount).toBe(1);
+    });
   });
 
   // P7-N10: the sessionId-less fan-out `setMode` (`ControlDispatcher.setMode`
