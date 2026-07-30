@@ -461,6 +461,42 @@ describe('reshapeSessionsList', () => {
     const result = reshapeSessionsList({ sessions: [{ session_id: 's1' }] });
     expect(result.sessions[0]).toEqual({ id: 's1', cwd: '', title: undefined, updatedAt: undefined });
   });
+
+  /**
+   * CA-17 (audit-3): `session/list`'s `updated_at` can arrive as a
+   * STRINGIFIED epoch float (e.g. Python `str(time.time())` — seconds, with
+   * a fractional part) rather than an ISO-8601 string. Before this fix, the
+   * reshape did a bare `String(updatedAtRaw)` passthrough, so an epoch-float
+   * string came out unchanged — `SessionsPanel.tsx`'s `relativeAge` then
+   * calls `Date.parse` on it, which does NOT recognize a bare numeric
+   * string, so it falls back to displaying the raw float string instead of
+   * an age (wrong/no date — cosmetic but user-visible). The fix normalizes
+   * an epoch-numeric string (seconds OR milliseconds, auto-detected by
+   * magnitude) into the same ISO-8601 shape the existing (already-working)
+   * ISO-string path produces, so `Date.parse` downstream succeeds either way.
+   */
+  describe('CA-17: epoch-float-string updatedAt parsing', () => {
+    it('parses a stringified epoch-SECONDS float into the same ISO shape an ISO string already produces', () => {
+      const result = reshapeSessionsList({
+        sessions: [{ session_id: 's1', cwd: '/ws', updated_at: '1690633200.5' }],
+      });
+      expect(result.sessions[0]?.updatedAt).toBe(new Date(1690633200.5 * 1000).toISOString());
+    });
+
+    it('parses a stringified epoch-MILLISECONDS integer into the same ISO shape an ISO string already produces', () => {
+      const result = reshapeSessionsList({
+        sessions: [{ session_id: 's1', cwd: '/ws', updated_at: '1690633200000' }],
+      });
+      expect(result.sessions[0]?.updatedAt).toBe(new Date(1690633200000).toISOString());
+    });
+
+    it('still passes an ISO-8601 updated_at through unchanged (existing behavior, not a regression)', () => {
+      const result = reshapeSessionsList({
+        sessions: [{ session_id: 's1', cwd: '/ws', updated_at: '2026-07-10T12:00:00Z' }],
+      });
+      expect(result.sessions[0]?.updatedAt).toBe('2026-07-10T12:00:00Z');
+    });
+  });
 });
 
 /**

@@ -342,6 +342,40 @@ export interface RawSessionListResult {
   nextCursor?: string | null;
 }
 
+/** CA-17 (audit-3): a bare epoch-numeric string/number — optionally
+ *  fractional (Python `str(time.time())` produces exactly this shape:
+ *  seconds, with a fractional part). `Date.parse`/`new Date(string)` do NOT
+ *  recognize this format (it isn't ISO-8601), so left as-is it round-trips
+ *  through {@link reshapeSessionsList} unchanged and then fails to parse
+ *  downstream (`SessionsPanel.tsx`'s `relativeAge`). */
+const EPOCH_NUMERIC_PATTERN = /^\d+(\.\d+)?$/;
+
+/** Epoch values at or above this magnitude are treated as milliseconds
+ *  rather than seconds — ~2001-09-09 in ms, ~year 33658 in seconds, so any
+ *  plausible current-era timestamp sorts unambiguously on one side of it.
+ *  The same threshold libraries like Moment/Day.js use for auto unit
+ *  detection. */
+const EPOCH_MS_THRESHOLD = 1e12;
+
+/**
+ * CA-17 (audit-3): normalize a raw `updated_at`/`updatedAt` value into a
+ * string `Date.parse` can actually consume. An ISO-8601 string (the
+ * documented/expected shape) passes through unchanged — that path already
+ * worked. A bare epoch-numeric string or number (seconds or milliseconds,
+ * auto-detected by magnitude via {@link EPOCH_MS_THRESHOLD}) is converted to
+ * an ISO-8601 string, matching the shape the already-working ISO path
+ * produces, so `SessionsPanel.tsx`'s downstream `Date.parse` succeeds
+ * either way.
+ */
+function normalizeUpdatedAt(raw: string | number | null | undefined): string | undefined {
+  if (raw == null) return undefined;
+  const str = String(raw);
+  if (!EPOCH_NUMERIC_PATTERN.test(str)) return str;
+  const epoch = parseFloat(str);
+  const ms = epoch < EPOCH_MS_THRESHOLD ? epoch * 1000 : epoch;
+  return new Date(ms).toISOString();
+}
+
 /**
  * Reshape a raw ACP `session/list` result into `SessionsData`
  * (`SessionsPanel.tsx`): rename `session_id`->`id`, `next_cursor`->`nextCursor`,
@@ -350,7 +384,9 @@ export interface RawSessionListResult {
  * (Python `None` serialized to JSON, per `acp_adapter/server.py:1279-1291`'s
  * `s.get("title")`/`next_cursor = ... if has_more ... else None`) collapses to
  * `undefined`, matching the frozen `SessionSummary`/`SessionsData`'s optional
- * (not nullable) fields.
+ * (not nullable) fields. `updated_at` may also arrive as a stringified epoch
+ * float (or a raw epoch number) rather than ISO-8601 — see
+ * {@link normalizeUpdatedAt} (CA-17).
  */
 export function reshapeSessionsList(raw: RawSessionListResult): SessionsData {
   const sessions: SessionSummary[] = (raw.sessions ?? []).map((s) => {
@@ -360,7 +396,7 @@ export function reshapeSessionsList(raw: RawSessionListResult): SessionsData {
       id,
       cwd: s.cwd ?? '',
       title: s.title ?? undefined,
-      updatedAt: updatedAtRaw == null ? undefined : String(updatedAtRaw),
+      updatedAt: normalizeUpdatedAt(updatedAtRaw),
     };
   });
   const nextCursor = raw.next_cursor ?? raw.nextCursor ?? undefined;

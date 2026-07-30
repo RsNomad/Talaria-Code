@@ -35,6 +35,26 @@ function firstNumber(...values: (number | undefined)[]): number | undefined {
 }
 
 /**
+ * Already-warned unrecognized/missing stopReason ids (CA-4) — a module-level
+ * `Set`, not a per-call one, so the warning is truly once-per-unique-id for
+ * the process lifetime, matching every other `warnOnce` in this codebase.
+ */
+const warnedStopReasons = new Set<string>();
+
+/**
+ * CA-4 (audit-3, F-4): warns ONCE per unique unrecognized/missing stopReason
+ * id. The message names ONLY the reason id (`String(stopReason)`, so
+ * `undefined` -> `"undefined"`) — never a payload/body, matching every other
+ * warn-once in this codebase.
+ */
+function warnOnceUnknownStopReason(stopReason: AcpStopReason | string | undefined): void {
+  const key = String(stopReason);
+  if (warnedStopReasons.has(key)) return;
+  warnedStopReasons.add(key);
+  console.warn(`[talaria] unrecognized ACP stopReason "${key}" — treating turn as error (fail-closed).`);
+}
+
+/**
  * ACP `PromptResponse.stopReason` -> protocol `turn.end.status`.
  * `refusal` is treated as an error (the model declined); `max_tokens` /
  * `max_turn_requests` still count as a completed turn (it ended, just
@@ -49,7 +69,13 @@ export function mapStopReasonToStatus(stopReason: AcpStopReason | string | undef
     case 'end_turn':
     case 'max_tokens':
     case 'max_turn_requests':
+      return 'complete';           // truncated-but-ended is still a completed turn (documented)
     default:
-      return 'complete';
+      // CA-4 (audit-3, F-4): an unknown or missing stopReason is NOT success.
+      // Fail closed (V-17: "undefined is never success") — surface it as an
+      // error rather than silently reporting complete. warn-once names the
+      // unrecognized reason id only (no payload).
+      warnOnceUnknownStopReason(stopReason);
+      return 'error';
   }
 }

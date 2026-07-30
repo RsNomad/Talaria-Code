@@ -46,8 +46,13 @@ describe('mapStopReasonToStatus', () => {
     expect(mapStopReasonToStatus('max_turn_requests')).toBe('complete');
   });
 
-  it('defaults unknown/missing to complete', () => {
-    expect(mapStopReasonToStatus(undefined)).toBe('complete');
-    expect(mapStopReasonToStatus('something_new')).toBe('complete');
+  it('maps unknown/missing stopReason to error (fail-closed, CA-4)', () => {
+    // CA-4 (audit-3, F-4 — RATIFIED overturn): this test used to assert
+    // 'complete' here, which pinned a fail-open bug — an unrecognized or
+    // missing stopReason silently read as a successful turn. Per V-17
+    // ("undefined is never success"), an unknown/missing stopReason must
+    // surface as an error instead.
+    expect(mapStopReasonToStatus(undefined)).toBe('error');
+    expect(mapStopReasonToStatus('something_new')).toBe('error');
   });
 });

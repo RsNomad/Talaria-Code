@@ -295,8 +295,13 @@ describe('createBackend — F6: warns once for a self-documented-broken backend/
     warnSpy.mockRestore();
   });
 
-  it('warns when backend=openai-compat is pointed at vLLM\'s default port (127.0.0.1:8000)', () => {
+  it('CA-8: does NOT warn when backend=openai-compat is pointed at its own shipped default endpoint (127.0.0.1:8000) — no self-warning about the extension\'s own default', () => {
     createBackend(cfg({ backend: 'openai-compat', endpoint: 'http://127.0.0.1:8000' }));
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('CA-8: still warns when backend=openai-compat is pointed at vLLM\'s default PORT on a DIFFERENT host (not openai-compat\'s own shipped default) — the vLLM heuristic still fires', () => {
+    createBackend(cfg({ backend: 'openai-compat', endpoint: 'http://192.168.1.50:8000' }));
     expect(warnSpy).toHaveBeenCalledTimes(1);
     expect(String(warnSpy.mock.calls[0]?.[0])).toMatch(/vllm/i);
   });

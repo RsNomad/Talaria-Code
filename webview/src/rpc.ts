@@ -52,14 +52,19 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  * time out HERE first, which reads as a false "failed" AND re-arms the
  * destructive "Restore anyway" confirmation for a restore that actually
  * succeeded. `checkpoint.restore`/`checkpoint.redo` get a per-method
- * timeout independent of the connection default (see {@link request});
- * every other method, INCLUDING the sibling `checkpoint.redoAll`
- * (deliberately left out — narrowly scoped to the two methods this fix
- * targets), keeps the ordinary default.
+ * timeout independent of the connection default (see {@link request}).
+ *
+ * `checkpoint.redoAll` (audit-3 Code M-2) is included here BY SYMMETRY with
+ * `checkpoint.redo` — a redo-all runs the same worktree-restore machinery on
+ * the host side and is at least as slow as a single redo, so leaving it on
+ * the 30s default was an oversight (it inherited the same false-timeout
+ * failure mode T-12 fixed for restore/redo), not a deliberate scoping
+ * decision. Every other method keeps the ordinary default.
  */
 const METHOD_TIMEOUT_OVERRIDES_MS: Partial<Record<ControlRequestMethod, number>> = {
   'checkpoint.restore': 150_000,
   'checkpoint.redo': 150_000,
+  'checkpoint.redoAll': 150_000,
 };
 
 export class RpcClient {

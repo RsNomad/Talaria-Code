@@ -228,8 +228,11 @@ describe('RpcClient — W5.1 Task 13 (R5): nextEdit.toggle correlation', () => {
  * successful restore used to time out HERE first, reading as a false
  * "failed" and re-arming the destructive "Restore anyway" confirmation.
  * `checkpoint.restore`/`checkpoint.redo` get a per-method 150_000ms
- * override; every other method (including the sibling `checkpoint.redoAll`,
- * deliberately NOT in scope here) keeps the connection default.
+ * override; audit-3 Code M-2 added `checkpoint.redoAll` to the same
+ * override BY SYMMETRY with `checkpoint.redo` — a redo-all is the same
+ * long-running checkpoint op the other two already cover, and the earlier
+ * exclusion was an oversight, not a deliberate scoping decision. Every
+ * OTHER method keeps the connection default.
  */
 describe('RpcClient — per-method timeout override (T-12 RPC deadline)', () => {
   function captureTimeoutMs(rpcOpts: { timeoutMs?: number } = {}): { rpc: RpcClient; capturedMs: () => number | undefined } {
@@ -254,6 +257,12 @@ describe('RpcClient — per-method timeout override (T-12 RPC deadline)', () => 
   it('RED: checkpoint.redo arms a 150000ms timer, not the 30000ms connection default', () => {
     const { rpc, capturedMs } = captureTimeoutMs();
     rpc.request('checkpoint.redo');
+    expect(capturedMs()).toBe(150_000);
+  });
+
+  it('checkpoint.redoAll arms a 150000ms timer, not the 30000ms connection default (Code M-2: symmetry with checkpoint.redo)', () => {
+    const { rpc, capturedMs } = captureTimeoutMs();
+    rpc.request('checkpoint.redoAll');
     expect(capturedMs()).toBe(150_000);
   });
 

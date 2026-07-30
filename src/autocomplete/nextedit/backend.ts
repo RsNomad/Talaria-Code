@@ -192,6 +192,19 @@ export class NextEditHttpBackend {
         response.statusText,
       );
     }
+    // CA-5 (audit-3): a missing body on an `ok` response isn't an
+    // HTTP-status failure — there's no real status to report as the cause,
+    // so this stays a plain Error rather than a fabricated BackendHttpError
+    // with an invented status. Mirrors every FIM backend's identical named
+    // guard (e.g. `OllamaFimBackend.ts`) — without it, `readJsonBounded`
+    // falls through to `JSON.parse('')` on a null body, which DOES throw,
+    // but an opaque `SyntaxError: Unexpected end of JSON input` that never
+    // names next-edit or the Ollama transport.
+    if (!response.body) {
+      throw new Error(
+        `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
+      );
+    }
 
     // D1: bounded read (4 MiB cap), not the unbounded response.json() —
     // Ollama's non-streaming /api/generate body is bounded by our own
@@ -238,6 +251,14 @@ export class NextEditHttpBackend {
         `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
         response.status,
         response.statusText,
+      );
+    }
+    // CA-5 (audit-3): same missing-body guard as predictOllama above — see
+    // its comment for the full rationale (mirrors every FIM backend's
+    // identical named guard).
+    if (!response.body) {
+      throw new Error(
+        `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
       );
     }
 

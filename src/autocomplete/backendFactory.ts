@@ -53,6 +53,16 @@ export function clearBackendFactoryWarnings(): void {
  *  that constant, so this file's dependency surface stays exactly what it was. */
 const VLLM_DEFAULT_PORT = '8000';
 
+/** CA-8 (audit-3): `config.ts`'s unexported `DEFAULT_ENDPOINTS['openai-compat']`
+ *  (`'http://127.0.0.1:8000'`) — duplicated as a literal for the same reason
+ *  as {@link VLLM_DEFAULT_PORT} above (this file's dependency surface stays
+ *  exactly what it was). This backend's OWN shipped default happens to sit on
+ *  vLLM's default port too, so without this the F6 vLLM-port heuristic below
+ *  fires on a completely untouched, freshly-installed openai-compat config —
+ *  the extension warning about its own default. Does NOT change the default
+ *  port/endpoint value; only suppresses the self-warning for it. */
+const OPENAI_COMPAT_DEFAULT_ENDPOINT = 'http://127.0.0.1:8000';
+
 /** `undefined` on anything `URL` can't parse — `cfg.endpoint` is normally
  *  already `isHttpUrl`-validated by `config.ts:readConfig`, but a hand-built
  *  config (this function is exported and callable directly, not only via
@@ -123,8 +133,13 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
       // point it at vLLM (400-rejects the `suffix` field this backend
       // sends) — vLLM's DEFAULT port is the one signal available here
       // without a request, so an endpoint on that exact port is worth a
-      // heads-up even though it is ALSO this backend's own default.
-      if (endpointPort(cfg.endpoint) === VLLM_DEFAULT_PORT) {
+      // heads-up. CA-8 (audit-3): EXCEPT when `cfg.endpoint` is exactly this
+      // backend's own shipped default — that endpoint is what a fresh,
+      // untouched openai-compat config already has, and warning about it
+      // was the extension flagging its own default as broken. A DIFFERENT
+      // host on port 8000 still gets the heads-up (it's ambiguous whether
+      // that's really a vLLM server), only the exact-default case is silent.
+      if (cfg.endpoint !== OPENAI_COMPAT_DEFAULT_ENDPOINT && endpointPort(cfg.endpoint) === VLLM_DEFAULT_PORT) {
         warnOnce(
           'openai-compat-vllm-port',
           `talaria.autocomplete.endpoint (${cfg.endpoint}) uses vLLM's default port with backend=openai-compat — vLLM 400-rejects the "suffix" field this backend sends. If this endpoint really is a vLLM server, switch "talaria.autocomplete.backend" to "vllm" instead.`,

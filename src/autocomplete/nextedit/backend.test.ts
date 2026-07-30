@@ -367,6 +367,72 @@ describe('NextEditHttpBackend.predict — A1 typed HTTP errors (status + statusT
   });
 });
 
+/**
+ * CA-5 (audit-3): the FIM backends (`OllamaFimBackend.ts`, `VllmFimBackend.ts`,
+ * `OpenAICompatFimBackend.ts`, `CodestralFimBackend.ts`, `LlamaCppInfillBackend.ts`)
+ * all carry a named guard — `if (!response.body) throw new Error(...)` —
+ * immediately after the `!response.ok` check, so a missing body on an `ok`
+ * response fails with a message naming the backend/status instead of falling
+ * through to `readJsonBounded`'s `JSON.parse('')`, which throws an OPAQUE
+ * `SyntaxError: Unexpected end of JSON input` that never names next-edit or
+ * the transport (see `LlamaCppInfillBackend.test.ts`'s F5 doc comment — this
+ * is the exact same defect shape, just in next-edit instead of FIM). Without
+ * the guard, `caught instanceof Error` is ALREADY true (SyntaxError extends
+ * Error) and `caught instanceof BackendHttpError` is already false — the
+ * meaningful assertion is the MESSAGE: only the named guard produces one
+ * that mentions the transport/status instead of "Unexpected end of JSON
+ * input".
+ */
+describe('NextEditHttpBackend.predict — CA-5 missing response.body guard (mirrors the FIM backends)', () => {
+  it('ollama: a missing response.body on an ok response throws a NAMED error (not an opaque JSON.parse SyntaxError)', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: null,
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = makeBackend('ollama');
+
+    let caught: unknown;
+    try {
+      await backend.predict(minted(), rendered(), new AbortController().signal);
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(BackendHttpError);
+    expect((caught as Error).message).not.toMatch(/Unexpected end of JSON input/);
+    expect((caught as Error).message).toMatch(/Next-edit Ollama .*(api\/generate|failed)/);
+    expect((caught as Error).message).toContain('200');
+  });
+
+  it('openai-compat: a missing response.body on an ok response throws a NAMED error (not an opaque JSON.parse SyntaxError)', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: null,
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = makeBackend('openai-compat');
+
+    let caught: unknown;
+    try {
+      await backend.predict(minted(), rendered(), new AbortController().signal);
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(BackendHttpError);
+    expect((caught as Error).message).not.toMatch(/Unexpected end of JSON input/);
+    expect((caught as Error).message).toMatch(/Next-edit openai-compat .*(v1\/completions|failed)/);
+    expect((caught as Error).message).toContain('200');
+  });
+});
+
 describe('NextEditHttpBackend.predict — abort signal', () => {
   it('abort signal is honored (fetch receives the same signal)', async () => {
     const fetchSpy = vi
