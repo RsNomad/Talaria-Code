@@ -707,7 +707,22 @@ export function Composer({
 
   const submit = () => {
     const trimmed = draft.trim();
-    if ((!trimmed && draftAttachments.length === 0) || busy || disabled) return;
+    const hasContent = trimmed.length > 0 || draftAttachments.length > 0;
+    if (!hasContent || disabled) return;
+    // UI#9-honesty: a submit fired while the ACTIVE tab has a LIVE turn
+    // (`busy` — `App.tsx` wires this from `tab.turnActive`) must never
+    // silently swallow the user's Enter. `onSubmit` below is simply never
+    // called in this branch, so the draft/attachments (both controlled props
+    // from `TabState`) are untouched — but that alone gave ZERO visible
+    // feedback: `onKeyDown` unconditionally `preventDefault()`s a non-shift
+    // Enter before `submit()` runs, so the keystroke vanished with no
+    // newline, no message, no notice. Reuses the EXISTING composer status
+    // surface (A2's `attachNotice` state + the permanently-mounted
+    // `LiveRegion` below) rather than inventing a second one.
+    if (busy) {
+      setAttachNotice('A turn is still running — wait for it to finish, or Stop it, before sending.');
+      return;
+    }
     // W2 T2e (§2b/§7 A7): `mentions` is a PURE re-derivation of the FINAL
     // submitted text at the moment of send — never a side-array accumulated
     // across edits, so it can never desync from what the user actually typed.

@@ -455,6 +455,94 @@ function renderComposerForIME(overrides: {
   return { onSubmit };
 }
 
+/**
+ * UI#9-honesty: submitting while the ACTIVE tab has a LIVE turn must never
+ * silently swallow the user's Enter. `App.tsx:640` wires `busy={tab.turnActive}`
+ * (`transcript.test.ts`: "the composer shows Stop, not Send" while `turnActive`
+ * is true) — so `busy===true` here IS "the active tab has a live turn".
+ *
+ * Composer.tsx's `submit()` already no-ops when `busy` is true (`onSubmit` is
+ * never called, so the draft/attachments controlled props are never touched —
+ * preservation was never actually at risk). But `onKeyDown` unconditionally
+ * `e.preventDefault()`s a non-shift Enter BEFORE that no-op runs, so the
+ * keystroke vanishes with zero feedback: no newline, no message, no toast, no
+ * status text — a silent drop. This reuses the composer's EXISTING status
+ * surface (A2's `attachNotice` state + the permanently-mounted `LiveRegion`,
+ * `role="status"`) rather than inventing a second one.
+ */
+function renderComposerBusy(overrides: {
+  onSubmit?: (text: string, attachments?: Attachment[], mentions?: unknown[]) => void;
+  draft?: string;
+  draftAttachments?: Attachment[];
+} = {}) {
+  const onSubmit = overrides.onSubmit ?? vi.fn();
+  const initialDraft = overrides.draft ?? 'do not eat this message';
+  const attachments = overrides.draftAttachments ?? [{ id: 'a1', name: 'notes.txt', kind: 'file' as const }];
+
+  function StatefulBusyComposer() {
+    const [draft, setDraft] = useState(initialDraft);
+    return (
+      <Composer
+        tabId="tab-1"
+        draft={draft}
+        draftAttachments={attachments}
+        onDraftChange={setDraft}
+        onAttachAdd={() => undefined}
+        onAttachRemove={() => undefined}
+        preset="normal"
+        modelLabel="test-model"
+        busy={true}
+        disabled={false}
+        activeModeId={null}
+        availableModes={[]}
+        onSetMode={async () => undefined}
+        initialHeight={120}
+        onHeightChange={() => undefined}
+        onSubmit={onSubmit}
+        onCancel={() => undefined}
+        onSetPreset={async () => undefined}
+        onPickModel={() => undefined}
+        onNewSession={() => undefined}
+        availableCommands={[]}
+        searchFiles={async () => []}
+        pendingSeed={null}
+        onSeedApplied={() => undefined}
+      />
+    );
+  }
+
+  render(<StatefulBusyComposer />);
+  return { onSubmit };
+}
+
+describe('UI#9-honesty: a mid-turn submit never silently vanishes', () => {
+  it('pressing Enter while the active tab has a live turn does not send, preserves the draft and attachments, and surfaces an honest "still running" affordance', () => {
+    const { onSubmit } = renderComposerBusy({ draft: 'do not eat this message' });
+    const textarea = screen.getByRole('combobox');
+
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+
+    // No silent send.
+    expect(onSubmit).not.toHaveBeenCalled();
+    // The draft is PRESERVED, not cleared.
+    expect(textarea).toHaveValue('do not eat this message');
+    // The attachment chip is PRESERVED, not cleared.
+    expect(screen.getByText('notes.txt')).toBeInTheDocument();
+    // An honest, visible affordance — not a silent no-op — via the EXISTING
+    // composer status LiveRegion (role="status").
+    expect(screen.getByRole('status')).toHaveTextContent(/turn.*running|still running/i);
+  });
+
+  it('clicking the (disabled) Send button while a turn is live is inert — Stop is rendered instead, so Send is not even present', () => {
+    renderComposerBusy();
+    // `busy` swaps the toolbar's Send button for Stop entirely (existing
+    // behavior, unchanged) — this pins that Send is never simultaneously
+    // clickable during a live turn.
+    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument();
+  });
+});
+
 describe('CF-02: Enter/Tab are ignored while an IME composition is in flight', () => {
   it('a keydown Enter whose nativeEvent.isComposing===true does NOT submit', () => {
     const { onSubmit } = renderComposerForIME();
