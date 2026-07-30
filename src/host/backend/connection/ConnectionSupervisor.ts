@@ -257,6 +257,15 @@ export class ConnectionSupervisor {
       // (same reasoning as `scheduleAcpRespawn`'s cast below) — a real
       // runtime possibility TS's synchronous CFA doesn't model.
       if ((this.acpState as string) !== 'disposed') this.acpState = 'idle';
+      // CF-01/I-1: mirrors `handleAcpCrash`'s own arch-A2 guard (:856-857) —
+      // a connect-phase failure must dispose+clear the zombie client the
+      // same way a post-connection crash does. Without this, the
+      // assignment at :221 survives the failure: `getClient()` keeps
+      // returning a client whose transport is dead, so a later `openTab`
+      // calls `newSession()` on it and NEVER settles — wedging
+      // `inFlightStart` forever behind a permanent "reconnecting…" banner.
+      this.client?.dispose();
+      this.client = undefined;
       // T-B1 (closes V-8): a connect-phase failure must become a VISIBLE
       // error — before this task, a hung/dead child during connect/
       // initialize left NO banner at all. One signal per outage, the SAME

@@ -1619,6 +1619,30 @@ describe('AcpBackend.start — T-B1: connect-phase exit-race + deadline (closes 
     expect(acpStateOf(backend)).toBe('ready');
   });
 
+  it('CF-01/I-1: a connect-phase failure disposes+clears the client — getClient() must not return the zombie transport', async () => {
+    const { backend, clients } = makeStartableBackend(undefined, (client, index) => {
+      if (index === 0) client.initialize = () => new Promise<void>(() => {}); // never resolves
+    });
+
+    const startPromise = backend.start();
+    await flushMicrotasks();
+    expect(clients).toHaveLength(1);
+
+    must(clients[0]).simulateExit(1);
+    await flushMicrotasks();
+    await expect(startPromise).rejects.toThrow(/exited during startup/);
+
+    // RED (pre-fix): the connect-phase catch (`startInternal`, :253-273)
+    // resets `acpState` but never disposes/clears `this.client` — the
+    // assignment made earlier (:221) survives the failure, leaving a zombie
+    // transport. A later `openTab` would call `newSession()` on this dead
+    // client and never settle, wedging `inFlightStart` forever behind a
+    // permanent "reconnecting…". `getClient()` must return `undefined` once
+    // the connect phase has failed, exactly as `handleAcpCrash` (:856-857)
+    // already guarantees for a post-connection crash.
+    expect(getSupervisorClient(backend)).toBeUndefined();
+  });
+
   it('the connect-phase deadline fires when the connect phase hangs with no exit at all', async () => {
     const { backend } = makeStartableBackend(undefined, (client, index) => {
       if (index === 0) {
@@ -3861,6 +3885,17 @@ function callHandleAcpCrash(backend: AcpBackend): (code: number | null) => void 
     backend as unknown as { connectionSupervisor: { handleAcpCrash(code: number | null): void } }
   ).connectionSupervisor;
   return supervisor.handleAcpCrash.bind(supervisor);
+}
+
+/** CF-01/I-1: reaches past `private` only to get at `connectionSupervisor`
+ * itself (same posture as every other supervisor seam in this file) —
+ * `getClient()` is PUBLIC on `ConnectionSupervisor`, so no further cast is
+ * needed once the field is reached. Used to prove a failed connect phase
+ * actually clears the zombie client, not just resets `acpState`. */
+function getSupervisorClient(backend: AcpBackend): unknown {
+  return (
+    backend as unknown as { connectionSupervisor: { getClient(): unknown } }
+  ).connectionSupervisor.getClient();
 }
 
 /** W4-T5a: reaches past `private` to drive `loadSessionIntoTab(sessionId, cwd, tabId)`
