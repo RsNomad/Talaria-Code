@@ -543,6 +543,67 @@ describe('UI#9-honesty: a mid-turn submit never silently vanishes', () => {
   });
 });
 
+/**
+ * UI#9 review: `Composer` is rendered ONCE per chat panel — unlike `ChatView`
+ * in `App.tsx` (`key={tab.tabId}`), it is NOT remounted on a tab switch. The
+ * `[tabId]`-keyed effect above resets per-tab-scoped ephemeral UI state
+ * (mention/slash suggest, preset/mode menus, dragging) on switch, but did NOT
+ * reset `attachNotice` — so a "still running" notice set by `submit()`'s busy
+ * branch on tab A survived a switch to an idle tab B, where Send is enabled,
+ * misrepresenting B as having a live turn with no timeout to clear it.
+ */
+function composerElement(props: { tabId: string; busy: boolean; draft: string }) {
+  return (
+    <Composer
+      tabId={props.tabId}
+      draft={props.draft}
+      draftAttachments={[]}
+      onDraftChange={() => undefined}
+      onAttachAdd={() => undefined}
+      onAttachRemove={() => undefined}
+      preset="normal"
+      modelLabel="test-model"
+      busy={props.busy}
+      disabled={false}
+      activeModeId={null}
+      availableModes={[]}
+      onSetMode={async () => undefined}
+      initialHeight={120}
+      onHeightChange={() => undefined}
+      onSubmit={async () => undefined}
+      onCancel={() => undefined}
+      onSetPreset={async () => undefined}
+      onPickModel={() => undefined}
+      onNewSession={() => undefined}
+      availableCommands={[]}
+      searchFiles={async () => []}
+      pendingSeed={null}
+      onSeedApplied={() => undefined}
+    />
+  );
+}
+
+describe('UI#9 review: the "still running" status notice cannot survive a tab switch', () => {
+  it('clears the notice when the tab switches from the busy tab to a different, idle tab', () => {
+    const { rerender } = render(
+      composerElement({ tabId: 'tab-A', busy: true, draft: 'do not eat this message' }),
+    );
+    const textarea = screen.getByRole('combobox');
+
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+
+    // Sanity: the busy-branch notice fired on tab A.
+    expect(screen.getByRole('status')).toHaveTextContent(/still running/i);
+
+    // Simulate switching to a DIFFERENT, IDLE tab: same mounted Composer
+    // instance (it is not keyed by tabId), new tabId, busy now false.
+    rerender(composerElement({ tabId: 'tab-B', busy: false, draft: '' }));
+
+    // The stale notice must NOT survive onto tab B — tab B has no live turn.
+    expect(screen.getByRole('status')).toBeEmptyDOMElement();
+  });
+});
+
 describe('CF-02: Enter/Tab are ignored while an IME composition is in flight', () => {
   it('a keydown Enter whose nativeEvent.isComposing===true does NOT submit', () => {
     const { onSubmit } = renderComposerForIME();

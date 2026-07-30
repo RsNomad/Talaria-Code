@@ -430,12 +430,20 @@ export function Composer({
   // This is what `key={tabId}` would have bought, WITHOUT its fault of
   // discarding the draft and re-firing the `pendingSeed` effect onto the
   // newly-active tab (see the design doc's "Why not key" section).
+  // UI#9 review: `attachNotice` is EXACTLY this same class of per-tab-scoped,
+  // ephemeral UI state — a "still running" (busy-submit) or attachment-failure
+  // notice set while looking at tab A describes tab A's condition at that
+  // moment, not whatever tab is active after a switch. Left unreset, it
+  // survives onto the newly-active tab with no timeout to clear it — e.g. a
+  // "still running" notice minted on a busy tab A stays visible (falsely) on
+  // an idle tab B where Send is enabled.
   useEffect(() => {
     mentionSuggest.close();
     slashSuggest.close();
     presetMenu.closeMenu(false);
     modeMenu.closeMenu(false);
     setDragging(false);
+    setAttachNotice('');
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately
     // keyed on tabId ONLY; mentionSuggest/slashSuggest/presetMenu/modeMenu
     // are stable-enough per render — their imperative methods' identity
