@@ -1187,10 +1187,16 @@ export class AcpBackend implements AgentBackend {
    *
    * NEVER throws to the caller (mirrors {@link openTab}'s fire-and-forget +
    * terminal-reply discipline): `loadSessionIntoTab`'s own early-return
-   * branches already emit the tab-scoped `error` (no live client, cwd
-   * outside the workspace, target tab busy) or simply no-op, so this
-   * try/catch only guards a genuinely unexpected rejection — defense in
-   * depth, the same posture {@link openTabInternal} takes around
+   * branches ALL emit a terminal signal now (CF-14 fix — corrects this doc's
+   * former FALSE claim that every branch already did; no live client and cwd
+   * outside the workspace used to only log and silently return, an ARCH-1-
+   * banned no-op). No live client and cwd outside the workspace each fire
+   * `tab.error{kind:'open-failed'}` (mirrors {@link openTabInternal}'s
+   * identical no-client shape — the initial bind never succeeded); target
+   * tab busy fires the session-scoped `error` against the tab's current
+   * occupant (unchanged). None of the three branches simply no-ops anymore,
+   * so this try/catch only guards a genuinely unexpected rejection —
+   * defense in depth, the same posture {@link openTabInternal} takes around
    * `openSession`.
    *
    * W6-FI-c (3-way ARCH I-4, part 3 of 3): a thin passthrough to {@link
@@ -1245,6 +1251,16 @@ export class AcpBackend implements AgentBackend {
   ): Promise<AcpLoadSessionResult | undefined> {
     if (!this.connectionSupervisor.getClient()) {
       this.logger?.append(`[AcpBackend] session.load: no live client (sessionId=${sessionId}, cwd=${cwd})`);
+      // CF-14 (ARCH-1 ban on silent no-ops): a History click during a
+      // backend outage used to only log — the tab just never loaded, with no
+      // affordance. Mirrors `openTabInternal`'s identical no-client shape
+      // (same `kind:'open-failed'`: the initial bind never succeeded).
+      this.emitter.fire({
+        type: 'tab.error',
+        tabId,
+        kind: 'open-failed',
+        message: 'The agent is not connected yet.',
+      });
       return undefined;
     }
 
@@ -1268,6 +1284,17 @@ export class AcpBackend implements AgentBackend {
       const confined = await resolveWithinWorkspaceReal(cwd, roots);
       if (confined === null) {
         this.logger?.append(`[AcpBackend] session.load denied — cwd outside the workspace: ${cwd}`);
+        // CF-14 (ARCH-1 ban on silent no-ops): this used to only log — same
+        // silent-drop bug as the no-client branch above. Status/reason only
+        // — never echo the offending `cwd` into the user-facing message
+        // (mirrors `SessionController`'s "never the path" discipline for
+        // dropped attachments).
+        this.emitter.fire({
+          type: 'tab.error',
+          tabId,
+          kind: 'open-failed',
+          message: 'This session is outside the current workspace and cannot be loaded.',
+        });
         return undefined;
       }
       adoptedCwd = confined;

@@ -3777,12 +3777,47 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
     );
   });
 
-  it('never throws/rejects when there is no live client (mirrors openTab\'s fire-and-forget discipline)', async () => {
+  it('CF-14: emits tab.error{kind:"open-failed"} (never throws/rejects) when there is no live client — mirrors openTab\'s fire-and-forget discipline', async () => {
     const config: HermesRuntimeConfig = {};
     const { AcpBackend: RealAcpBackend } = await import('./AcpBackend');
     const backend = new RealAcpBackend(config);
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
 
     await expect(backend.loadTab('tab-9', 'history-session', '/ws')).resolves.toBeUndefined();
+
+    // CF-14 (ARCH-1 ban on silent no-ops): a History click during a backend
+    // outage used to only log — the tab just never loaded, with no
+    // affordance. Mirrors `openTabInternal`'s identical no-client shape.
+    expect(messages).toEqual([
+      { type: 'tab.error', tabId: 'tab-9', kind: 'open-failed', message: expect.any(String) },
+    ]);
+  });
+
+  it('CF-14: emits tab.error{kind:"open-failed"} (message never echoes the path) when the load cwd is outside every open workspace folder', async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'hermes-acp-loadtab-outside-'));
+    try {
+      mockWorkspace.workspaceFolders = [{ uri: { fsPath: tmpRoot } }];
+      const { backend, clients } = makeStartableBackend();
+      await backend.start();
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      const outsideCwd = path.resolve('/etc');
+      await expect(backend.loadTab('tab-2', 'history-session', outsideCwd)).resolves.toBeUndefined();
+
+      expect(must(clients[0]).loadSessionCalls).toEqual([]); // refused before reaching the ACP client
+      expect(messages).toEqual([
+        { type: 'tab.error', tabId: 'tab-2', kind: 'open-failed', message: expect.any(String) },
+      ]);
+      // Sec-M2 / status-reason-only: the offending path must never be echoed
+      // back into the user-facing message (mirrors `SessionController`'s
+      // "never the path" discipline for dropped attachments).
+      const [emitted] = messages;
+      expect((emitted as { message: string }).message).not.toContain(outsideCwd);
+    } finally {
+      await fsp.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+    }
   });
 
   it('resolves cleanly (no throw) when the target tab is busy — loadSessionIntoTab\'s own P3 refusal, unchanged', async () => {
@@ -5651,7 +5686,7 @@ describe('AcpBackend.loadSession — S-M4 / Sec-M2: cwd confined to an open work
     mockWorkspace.workspaceFolders = undefined;
   });
 
-  it('denies a session.load whose cwd is outside every open workspace folder', async () => {
+  it('denies a session.load whose cwd is outside every open workspace folder — CF-14: emits tab.error{kind:"open-failed"} (legacy caller, tabId defaults to BOOTSTRAP_TAB_ID) instead of the old silent no-op', async () => {
     const { backend, client, messages } = makeBackend();
     mockWorkspace.workspaceFolders = [{ uri: { fsPath: tmpRoot } }];
 
@@ -5662,7 +5697,9 @@ describe('AcpBackend.loadSession — S-M4 / Sec-M2: cwd confined to an open work
 
     expect(result).toBeUndefined();
     expect(client.loadSessionCalls).toEqual([]);
-    expect(messages).toEqual([]);
+    expect(messages).toEqual([
+      { type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'open-failed', message: expect.any(String) },
+    ]);
   });
 
   it('allows a session.load whose cwd really lives inside an open workspace folder', async () => {
