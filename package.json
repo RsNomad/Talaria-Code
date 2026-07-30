@@ -317,7 +317,7 @@
           ],
           "default": "ollama",
           "scope": "machine",
-          "markdownDescription": "Which FIM backend serves autocomplete requests. Machine-scoped: a workspace cannot flip this to a cloud backend and redirect your code off the machine (security — this setting SELECTS the endpoint)."
+          "markdownDescription": "Which FIM backend serves autocomplete requests. Machine-scoped: a workspace cannot flip this to a cloud backend and redirect your code off the machine (security — this setting SELECTS the endpoint). Note on `openai-compat`: a strictly-spec OpenAI server can reject the request with HTTP 400 — Talaria sends more than four `stop` sequences and a `skip_special_tokens` field, which some servers refuse. If yours does, use the `vllm`, `ollama`, or `llamacpp` backend instead, or point `openai-compat` at a lenient gateway."
         },
         "talaria.autocomplete.endpoint": {
           "type": "string",

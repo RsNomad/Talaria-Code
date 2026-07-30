@@ -66,7 +66,11 @@ absolute system paths) are refused, not resolved.
 
 And the settings that decide which model and backend you talk to are
 machine-scoped on purpose, so a repository you open can't quietly repoint the
-agent at some other endpoint.
+agent at some other endpoint. The same reasoning is why the RAG embedding
+endpoint isn't additionally screened for internal or metadata addresses:
+it's machine-scoped too, and anyone who can already set it can already run
+code on the machine — so a network-level filter would be guarding a door that
+is already open.
 
 ## The build
 
