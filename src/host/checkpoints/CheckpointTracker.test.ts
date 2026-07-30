@@ -1335,6 +1335,48 @@ describe('CheckpointTracker', () => {
       const { checkpoints } = await tracker.list();
       expect(checkpoints).toHaveLength(1);
     });
+
+    it('rejects the snapshot when an ignore-file read wedges (fs.readFile on .gitignore/.hermesignore never resolves), leaving currentBaselineId uncorrupted (CF-17)', async () => {
+      await writeFile('a.txt', 'A1');
+      // Small budget so the wedged read fails fast. gitTimeoutMs IS the scan
+      // deadline (I-1 reuses the same budget as the git ops).
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { gitTimeoutMs: 300 });
+      await tracker.init();
+      const ckpt1 = (await tracker.snapshot(1, 'first'))!; // real, succeeds
+
+      const baselineBefore = (await readDiskIndex(tracker)).currentBaselineId;
+      expect(baselineBefore).not.toBeNull();
+
+      // Wedge ONLY the ignore-file reads: `fs.readFile('.gitignore'|'.hermesignore')`
+      // never resolves — the exact stalled-mount/FUSE-hang the scan-deadline doc
+      // cites, but landing on the read that (before CF-17) ran BEFORE
+      // `raceScanDeadline` ever started, so no deadline bounded it. Every other
+      // `fs.readFile` call (e.g. the metadata index) passes through untouched, so
+      // only this one read wedges.
+      const realReadFile = fs.readFile.bind(fs);
+      const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (file, ...rest) => {
+        const p = String(file);
+        if (p.endsWith('.gitignore') || p.endsWith('.hermesignore')) {
+          return new Promise(() => undefined) as never;
+        }
+        return realReadFile(file as never, ...(rest as unknown as never[]));
+      });
+
+      await writeFile('a.txt', 'A2-EDIT'); // give the (doomed) snapshot a real change
+      await expect(tracker.snapshot(2, 'second')).rejects.toBeInstanceOf(WorktreeScanTimeoutError);
+      readFileSpy.mockRestore();
+
+      // C1-safe: the barrier rejected BEFORE write-tree, so no half-tree became
+      // the baseline and no phantom record was written.
+      const after = await readDiskIndex(tracker);
+      expect(after.currentBaselineId).toBe(baselineBefore);
+      expect(after.checkpoints).toHaveLength(1);
+      expect(must(after.checkpoints[0]).id).toBe(ckpt1.id);
+
+      // In-memory view agrees (fail-open: the turn would proceed unprotected).
+      const { checkpoints } = await tracker.list();
+      expect(checkpoints).toHaveLength(1);
+    });
   });
 
   describe('warm index keeps the captured tree exact (corr-I1)', () => {

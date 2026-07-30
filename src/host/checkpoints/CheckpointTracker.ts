@@ -1228,32 +1228,43 @@ export class CheckpointTracker {
    * Recursively enumerates workspace files, applying the shared ignore filter +
    * size cutoff, under a WALL-CLOCK DEADLINE (I-1 / arch A#1).
    *
-   * This walk is the FIRST step of the pre-turn snapshot barrier and runs BEFORE
-   * any git subprocess, so the git-child timeout that bounds every other barrier
-   * op (`gitProcess`) does NOT cover it. A stalled workspace FS — the exact
+   * This scan — the `.gitignore`/`.hermesignore` reads THEN the directory walk —
+   * is the FIRST step of the pre-turn snapshot barrier and runs BEFORE any git
+   * subprocess, so the git-child timeout that bounds every other barrier op
+   * (`gitProcess`) does NOT cover it. A stalled workspace FS — the exact
    * NFS/sshfs / filesystem stall that timeout comment cites — would wedge an
-   * `fs.readdir`/`fs.stat` in the libuv threadpool, the awaited barrier would
-   * never settle, and the user's prompt would be silently never sent (the git
-   * timeout could never fire because execution never reaches a git subprocess).
+   * `fs.readFile`/`fs.readdir`/`fs.stat` in the libuv threadpool, the awaited
+   * barrier would never settle, and the user's prompt would be silently never
+   * sent (the git timeout could never fire because execution never reaches a
+   * git subprocess).
    *
-   * We bound the walk with the SAME budget as the git ops ({@link gitTimeoutMs})
-   * two ways, closing both the slow-but-progressing and the fully-wedged subsets:
+   * CF-17: the ignore-file reads are JUST AS wedge-prone as the walk's own
+   * `fs.readdir`/`fs.stat` calls (same libuv threadpool, same class of stalled
+   * mount), so they run INSIDE the same raced `scan()` closure below instead of
+   * before it — otherwise they'd be a deadline-free prefix that could hang the
+   * barrier forever before the race even starts.
+   *
+   * We bound the WHOLE scan with the SAME budget as the git ops
+   * ({@link gitTimeoutMs}) two ways, closing both the slow-but-progressing and
+   * the fully-wedged subsets:
    *  - a per-entry deadline check throws once `Date.now()` passes the deadline
-   *    (bounds a walk that keeps resolving fs calls but too slowly / too many);
-   *  - the whole walk is raced against a timer that rejects when a single fs call
-   *    never resolves at all (the wedged-FS case a per-entry check can't catch).
+   *    (bounds a scan that keeps resolving fs calls but too slowly / too many);
+   *  - the whole scan is raced against a timer that rejects when a single fs
+   *    call never resolves at all (the wedged-FS case a per-entry check can't
+   *    catch — including a wedged ignore-file read).
    * Either path rejects with a typed {@link WorktreeScanTimeoutError}, which
    * flows to `snapshot()`'s caller EXACTLY like {@link GitTimeoutError} → the
    * barrier's existing fail-open path (turn proceeds UNPROTECTED, never blocked).
    *
    * C1-SAFE: this bounds-and-REJECTS the snapshot before `write-tree`, so a
    * timed-out/wedged scan can NEVER set `currentBaselineId` — the baseline still
-   * only ever moves after a completed `write-tree` (a late-resolving walk is
-   * abandoned, not finished late). A hard uninterruptible D-state `lstat` cannot
-   * be bounded in userspace (the raced timer settles our awaiting promise, but
-   * the underlying syscall still leaks in the threadpool) — that is the accepted
-   * irreducible limit for the walk, just as it is for git; we close the
-   * slow/progressing-and-wedged-but-cancelable-await subset, which is the point.
+   * only ever moves after a completed `write-tree` (a late-resolving scan is
+   * abandoned, not finished late). A hard uninterruptible D-state `lstat`/`read`
+   * cannot be bounded in userspace (the raced timer settles our awaiting
+   * promise, but the underlying syscall still leaks in the threadpool) — that is
+   * the accepted irreducible limit for the scan, just as it is for git; we close
+   * the slow/progressing-and-wedged-but-cancelable-await subset, which is the
+   * point.
    */
   private async scanWorktree(): Promise<string[]> {
     const budgetMs = this.gitTimeoutMs;
@@ -1268,63 +1279,75 @@ export class CheckpointTracker {
       }
     };
 
-    const gitignoreContents: string[] = [];
-    for (const name of ['.gitignore', '.hermesignore']) {
-      try {
-        gitignoreContents.push(await fs.readFile(path.join(this.workspaceRoot, name), 'utf8'));
-      } catch {
-        // absent — defaults still apply.
-      }
-    }
-    const isIgnored = createIgnoreFilter(gitignoreContents, this.extraIgnoreGlobs);
-
     const included: string[] = [];
-    const walk = async (absDir: string, relDir: string): Promise<void> => {
+    // CF-17: the ignore-file reads + the walk are ONE raced unit, so a wedged
+    // `fs.readFile` on `.gitignore`/`.hermesignore` is bounded by the exact same
+    // deadline as a wedged `fs.readdir`/`fs.stat` in the walk below.
+    const scan = async (): Promise<void> => {
       checkDeadline();
-      let entries;
-      try {
-        entries = await fs.readdir(absDir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const entry of entries) {
+      const gitignoreContents: string[] = [];
+      for (const name of ['.gitignore', '.hermesignore']) {
         checkDeadline();
-        if (entry.isSymbolicLink()) continue; // never follow symlinks (footgun avoidance)
-        const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) {
-          if (isIgnored(`${relPath}/`)) continue;
-          await walk(path.join(absDir, entry.name), relPath);
-        } else if (entry.isFile()) {
-          if (isIgnored(relPath)) continue;
-          let size = 0;
-          try {
-            size = (await fs.stat(path.join(absDir, entry.name))).size;
-          } catch {
-            continue; // vanished mid-walk
-          }
-          if (size > this.maxFileBytes) continue;
-          included.push(relPath);
+        try {
+          gitignoreContents.push(await fs.readFile(path.join(this.workspaceRoot, name), 'utf8'));
+        } catch {
+          // absent — defaults still apply.
         }
       }
+      const isIgnored = createIgnoreFilter(gitignoreContents, this.extraIgnoreGlobs);
+
+      const walk = async (absDir: string, relDir: string): Promise<void> => {
+        checkDeadline();
+        let entries;
+        try {
+          entries = await fs.readdir(absDir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          checkDeadline();
+          if (entry.isSymbolicLink()) continue; // never follow symlinks (footgun avoidance)
+          const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
+          if (entry.isDirectory()) {
+            if (isIgnored(`${relPath}/`)) continue;
+            await walk(path.join(absDir, entry.name), relPath);
+          } else if (entry.isFile()) {
+            if (isIgnored(relPath)) continue;
+            let size = 0;
+            try {
+              size = (await fs.stat(path.join(absDir, entry.name))).size;
+            } catch {
+              continue; // vanished mid-walk
+            }
+            if (size > this.maxFileBytes) continue;
+            included.push(relPath);
+          }
+        }
+      };
+
+      await walk(this.workspaceRoot, '');
     };
 
-    await this.raceScanDeadline(walk(this.workspaceRoot, ''), budgetMs);
+    await this.raceScanDeadline(scan(), budgetMs);
     included.sort();
     return included;
   }
 
   /**
-   * Settle `walk` OR a wall-clock timer, whichever comes first (I-1). If the
-   * timer wins we reject with {@link WorktreeScanTimeoutError} even though the
-   * walk's wedged fs call is still pending in the threadpool (it cannot be
-   * cancelled — the accepted irreducible limit). `walk` already carries a
-   * rejection handler from `Promise.race`, so its later settlement (if any) is a
-   * no-op rather than an unhandled rejection. `budgetMs <= 0` disables the timer
-   * (parity with the git ops' `timeoutMs: 0`), leaving only the per-entry check.
+   * Settle `task` OR a wall-clock timer, whichever comes first (I-1). `task` is
+   * the FULL raced scope — CF-17: the `.gitignore`/`.hermesignore` reads AND the
+   * directory walk, not just the walk — so both are bounded by the SAME
+   * deadline. If the timer wins we reject with {@link WorktreeScanTimeoutError}
+   * even though `task`'s wedged fs call is still pending in the threadpool (it
+   * cannot be cancelled — the accepted irreducible limit). `task` already
+   * carries a rejection handler from `Promise.race`, so its later settlement (if
+   * any) is a no-op rather than an unhandled rejection. `budgetMs <= 0` disables
+   * the timer (parity with the git ops' `timeoutMs: 0`), leaving only the
+   * per-entry check.
    */
-  private async raceScanDeadline(walk: Promise<void>, budgetMs: number): Promise<void> {
+  private async raceScanDeadline(task: Promise<void>, budgetMs: number): Promise<void> {
     if (budgetMs <= 0) {
-      await walk;
+      await task;
       return;
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1334,15 +1357,15 @@ export class CheckpointTracker {
           new WorktreeScanTimeoutError(
             `worktree scan exceeded the ${budgetMs}ms wall-clock deadline and was abandoned ` +
               '(a wedged workspace filesystem — e.g. an NFS/sshfs worktree or an FS stall — whose ' +
-              'fs.readdir/fs.stat never returned); the turn proceeds unprotected.',
+              'fs.readFile/fs.readdir/fs.stat never returned); the turn proceeds unprotected.',
           ),
         );
       }, budgetMs);
-      // Never keep the extension host alive just to time out a walk.
+      // Never keep the extension host alive just to time out a scan.
       (timer as { unref?: () => void }).unref?.();
     });
     try {
-      await Promise.race([walk, timeout]);
+      await Promise.race([task, timeout]);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
