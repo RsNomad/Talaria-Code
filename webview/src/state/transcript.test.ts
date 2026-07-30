@@ -1495,6 +1495,36 @@ describe('transcript reducer — ARCH-1 (final review, UI I-3): draft survives a
     expect(activeTab(state).draft).toBe('new text typed after send');
   });
 
+  it('CF-03: a whitespace-padded draft clears (+ its attachment chips) on the trimmed echo (Composer sends draft.trim())', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 'sess1' });
+    // The composer sends `draft.trim()` as the prompt text — the RAW draft
+    // still carries the trailing space the user typed.
+    state = reduceLocal(state, { type: 'local.draft.set', tabId: state.activeTabId, text: 'fix bug ' });
+    state = reduceLocal(state, {
+      type: 'local.draft.attach.add',
+      tabId: state.activeTabId,
+      attachment: { id: 'a1', name: 'a.txt', kind: 'file' },
+    });
+
+    // The host echoes back the TRIMMED text it actually admitted.
+    state = reduce(state, { type: 'user', turnId: 't1', sessionId: 'sess1', text: 'fix bug', mode: 'default' });
+
+    expect(activeTab(state).draft).toBe('');
+    expect(activeTab(state).draftAttachments).toEqual([]);
+  });
+
+  it('CF-03: a genuinely-different retyped draft is still preserved even though its trim would collide on whitespace alone', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 'sess1' });
+    // The user retyped a NEW draft (not just re-padded the sent one) while
+    // the echo was in flight — trimmed, it's still a different string from
+    // what was sent, so the guard must not clobber it.
+    state = reduceLocal(state, { type: 'local.draft.set', tabId: state.activeTabId, text: '  a new draft  ' });
+
+    state = reduce(state, { type: 'user', turnId: 't1', sessionId: 'sess1', text: 'fix bug', mode: 'default' });
+
+    expect(activeTab(state).draft).toBe('  a new draft  ');
+  });
+
   it('tab.error{kind:session-lost} regresses binding to unbound and sets the standing sessionLost marker; tab.bound clears it', () => {
     let state = reduce(INITIAL_STATE, {
       type: 'tab.bound',

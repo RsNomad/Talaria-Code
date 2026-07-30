@@ -639,9 +639,12 @@ export function Composer({
     // submitted text at the moment of send — never a side-array accumulated
     // across edits, so it can never desync from what the user actually typed.
     const mentions = parseMentions(trimmed);
-    // P7-N1: no local clear here — `onSubmit` is App's `sendDraft`, which
-    // posts the prompt AND dispatches `local.draft.clear` for this tab as one
-    // paired action. Composer only closes its own transient suggest popovers.
+    // CF-03 (was P7-N1, now stale): no local clear here, but NOT because
+    // `sendDraft` clears it — ARCH-1 removed that optimistic dispatch (see
+    // `useHostActions.sendDraft`). The draft clears only once the HOST's
+    // `user` admission echo arrives, folded in `transcript.ts`'s `user` case
+    // against this TRIMMED text (`tab.draft.trim() === msg.text`). Composer
+    // only closes its own transient suggest popovers here.
     onSubmit(trimmed, draftAttachments.length ? draftAttachments : undefined, mentions.length ? mentions : undefined);
     mentionSuggest.close();
     slashSuggest.close();

@@ -153,10 +153,15 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       // admission echo (emitted synchronously at `SessionController.sendPrompt`
       // AFTER every refusal gate), never optimistically at post time
       // (`useHostActions.sendDraft` no longer dispatches `local.draft.clear`).
-      // Exact-match guard: if the user already retyped new text while the
-      // echo was in flight, `tab.draft` no longer equals `msg.text` — their
-      // new text survives untouched.
-      const admitted = tab.draft === msg.text;
+      // CF-03: the Composer sends `draft.trim()` as the prompt text (see
+      // Composer.tsx `submit`), so `msg.text` here is always the TRIMMED
+      // echo — comparing it against the RAW `tab.draft` meant a
+      // whitespace-padded draft ('fix bug ') never matched its own trimmed
+      // send ('fix bug') and the draft + its attachment chips survived to be
+      // accidentally re-sent. Trim-aware guard: if the user already retyped
+      // new text while the echo was in flight, `tab.draft.trim()` no longer
+      // equals `msg.text` — their new text survives untouched.
+      const admitted = tab.draft.trim() === msg.text;
       return {
         ...tab,
         ...(admitted ? { draft: '', draftAttachments: [] } : {}),
