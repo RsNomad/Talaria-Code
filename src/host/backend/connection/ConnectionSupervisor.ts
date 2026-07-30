@@ -859,7 +859,25 @@ export class ConnectionSupervisor {
     // independent of (and before) the per-controller handling below.
     // W6-FI-a: delegates to `OneShotRunner` via the port.
     this.port.settleOneShot('ACP connection lost');
-    for (const controller of this.port.sessions.values()) controller.endOnCrash();
+    // CF-01/A fix wave (arch Important, secondary robustness fix): guarded
+    // per-controller, mirroring `recoverSessions`'s EXISTING per-attempt
+    // try/catch (`:533-546`) — defensive-only (`SessionController.endOnCrash`
+    // never throws today, pure turn/state bookkeeping + event emission), but
+    // an unguarded abort here would skip BOTH the remaining controllers'
+    // crash-end AND the trailing `this.client?.dispose()` below, which is
+    // what clears `this.connection` (via `AcpClient.dispose()`) and is now
+    // the ONLY thing standing between a stale post-terminate client
+    // reference and a hang if `terminate()` itself somehow didn't already
+    // self-clear it — see `acpClient.ts`'s `terminate` closure doc.
+    for (const controller of this.port.sessions.values()) {
+      try {
+        controller.endOnCrash();
+      } catch (err) {
+        this.port.logger?.append(
+          `[AcpBackend] crash fan-out: endOnCrash failed for session '${controller.sessionId}' (tab '${controller.tabId}'), continuing: ${errorMessage(err)}`,
+        );
+      }
+    }
     // arch-A2: null the dead client so sendPrompt/loadSession's admission
     // guards refuse honestly ("not started yet") during the backoff window.
     this.client?.dispose();

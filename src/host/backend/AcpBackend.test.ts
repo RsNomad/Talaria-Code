@@ -311,7 +311,13 @@ class FakeAcpClient {
   }
   async setSessionModel(_sessionId: string, _modelId: string): Promise<void> {}
   async cancel(_sessionId: string): Promise<void> {}
-  dispose(): void {}
+  /** CF-01/A fix wave: counts calls — proves `handleAcpCrash`'s per-controller
+   *  `endOnCrash()` loop guard still reaches the trailing `client.dispose()`
+   *  even when an earlier iteration throws (the loop-guard regression test). */
+  disposeCallCount = 0;
+  dispose(): void {
+    this.disposeCallCount++;
+  }
 
   /** W4-T5b: records every `closeSession` call — the best-effort `session/close` seam. */
   closeSessionCalls: string[] = [];
@@ -2509,6 +2515,60 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
     );
     // no per-tab session-lost — both recovered
     expect(messages.some((m) => m.type === 'tab.error')).toBe(false);
+  });
+
+  /**
+   * CF-01/A fix wave (arch Important, secondary robustness fix): mirrors
+   * `recoverSessions`'s EXISTING per-attempt try/catch (`:533-546`) — before
+   * this fix, `handleAcpCrash`'s per-controller `endOnCrash()` loop
+   * (`:862`) had none, so ONE controller throwing aborted the loop before
+   * the REMAINING controllers got their own crash-end AND before the
+   * trailing `this.client?.dispose()` ran. `dispose()` is exactly what
+   * clears `this.connection` — see `acpClient.terminate.test.ts`'s
+   * companion fix — so an unguarded abort here could leave a stale client
+   * reference's residual post-terminate window open again on TOP of simply
+   * dropping the other tab's honest crash signal.
+   *
+   * `session-1`'s controller is registered FIRST (Map insertion order), so
+   * forcing ITS `endOnCrash()` to throw proves the loop survives past the
+   * FIRST iteration, not just tolerates a throw on the last one.
+   *
+   * RED (pre-fix): the loop aborts at session-1 — session-2 never gets its
+   * `turn.end{status:'error'}` bracket and `disposeCallCount` stays 0.
+   */
+  it('one controller\'s endOnCrash() throwing does not skip the remaining controllers\' crash-end nor the trailing client.dispose() (handleAcpCrash loop guard)', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).queueSessionId('session-2');
+    await backend.openTab('tab-2'); // session-2
+
+    backend.sendPrompt('session-2', 'work', 'default'); // tab-2's turn is LIVE at crash time
+    await flushMicrotasks();
+    expect(must(clients[0]).promptCallCount).toBe(1);
+
+    // Force session-1's endOnCrash to throw — an own-property override on
+    // the REAL controller instance (seamFor targets the production object
+    // directly), simulating a genuinely unexpected defensive-guard failure.
+    seamFor(backend, 'session-1').endOnCrash = () => {
+      throw new Error('boom: endOnCrash exploded');
+    };
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    must(clients[0]).simulateExit(1);
+
+    // session-2's live turn still gets its honest error bracket despite
+    // session-1's endOnCrash throwing FIRST in iteration order.
+    expect(messages).toContainEqual({
+      type: 'turn.end',
+      sessionId: 'session-2',
+      turnId: expect.any(String),
+      status: 'error',
+    });
+    // The trailing `this.client?.dispose()` (arch-A2 guard, AFTER the loop)
+    // still ran despite the mid-loop throw.
+    expect(must(clients[0]).disposeCallCount).toBe(1);
   });
 
   it('a load that FAILS for one session -> tab.error{tabId, kind:"session-lost"} for THAT tab; the OTHER recovers independently (F2 per-tab try/catch)', async () => {

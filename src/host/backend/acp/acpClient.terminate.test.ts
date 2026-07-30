@@ -19,8 +19,9 @@ import type { ChildProcess } from 'node:child_process';
  * This file proves the fix at the SEAM: `AcpClient` itself now races every
  * request-shaped method against a per-connection termination promise that
  * rejects from the SAME `terminate()` choke `child.on('exit'|'error')`
- * already funnels through (`acpClient.ts` ~:290-300) — no caller-side
- * plumbing required. Mirrors `acpClient.wire.test.ts`'s mock-child pattern:
+ * already funnels through (`acpClient.ts`'s `connect()`-local `terminate`
+ * closure, ~:360) — no caller-side plumbing required. Mirrors
+ * `acpClient.wire.test.ts`'s mock-child pattern:
  * a fake `ChildProcess` (`EventEmitter` + real `PassThrough` stdio) drives
  * the REAL, production `AcpClient`; `child.stdout` never emits a byte, so a
  * request's underlying SDK promise would stay pending forever on its own —
@@ -130,5 +131,52 @@ describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
     stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: 0, result: { sessions: [] } })}\n`);
 
     await expect(listResult).resolves.toEqual({ sessions: [] });
+  });
+
+  /**
+   * CF-01/A fix wave (arch Important): `terminate()` used to clear ONLY
+   * `this.child`, not `this.connection` — a request issued on a STALE
+   * captured `client` reference (e.g. `SessionController.runTurn`'s
+   * `client` local, read once and reused across an `await`) AFTER
+   * termination fell through `raceTermination`'s `op()`-only passthrough
+   * (no live `terminationPromise` left to race against) straight into
+   * `requireConnection()`, which found `this.connection` still set and
+   * handed back a dead `ClientSideConnection` — the exact same "SDK never
+   * rejects on stream close" hang this whole file exists to close, just
+   * reopened for the post-terminate window. Fixed by clearing
+   * `this.connection` in the SAME synchronous block that clears
+   * `this.child`, so `requireConnection()` now throws synchronously
+   * (surfaced here as the returned promise rejecting) regardless of
+   * whether any external `dispose()` ever ran.
+   *
+   * RED (pre-fix): this assertion's `rejects.toThrow(/not connected/i)`
+   * fails — the promise instead hangs (child.stdout never emits a byte, so
+   * nothing ever answers the SDK's request) until vitest's timeout.
+   */
+  it('a request issued on a STALE client reference AFTER termination fails fast (requireConnection), not hangs, even with no dispose() in between', async () => {
+    const { client, child } = await connectClient();
+
+    child.emit('exit', 1);
+    // Let the termination promise's own rejection reaction (already marked
+    // "handled" via `.catch(() => {})` in `connect()`) drain — this test
+    // deliberately issues the NEXT call only after termination has fully
+    // settled, simulating a caller that re-enters on a stale ref sometime
+    // later, not one racing the exit event itself.
+    await Promise.resolve();
+
+    await expect(client.listSessions()).rejects.toThrow(/not connected/i);
+  });
+
+  /**
+   * [Minor] hardening (both review lenses): `ConnectionSupervisor` already
+   * guarantees "one `connect()` per `AcpClient` instance" by CONVENTION
+   * (`createClient` mints a brand-new instance per connect/respawn) — this
+   * makes the single-lifecycle invariant SELF-enforcing instead of relying
+   * on every future caller obeying that convention.
+   */
+  it('connect() throws if the client is already connected (double-invocation guard)', async () => {
+    const { client } = await connectClient();
+
+    await expect(client.connect()).rejects.toThrow(/already connected/i);
   });
 });

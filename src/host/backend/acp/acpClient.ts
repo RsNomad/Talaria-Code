@@ -268,8 +268,8 @@ export class AcpClient implements AcpClientLike {
    * Created fresh in {@link connect} (one pair per live child — a reconnect
    * gets a NEW pair, never reuses a dead connection's), and rejected inside
    * `terminate()` (the single death choke `child.on('exit'|'error')` both
-   * funnel through, ~:290-300 below) — the SAME event that already fires
-   * {@link exitHandlers}.
+   * funnel through, `connect()`'s own `terminate` closure, ~:360 below) —
+   * the SAME event that already fires {@link exitHandlers}.
    */
   private terminationReject: ((e: unknown) => void) | undefined;
   private terminationPromise: Promise<never> | undefined;
@@ -285,8 +285,11 @@ export class AcpClient implements AcpClientLike {
    * already throws synchronously in that state for every request method, so
    * this never masks "not connected" as a hang. Also a no-op passthrough
    * after `terminate()` has cleared the pair on THIS (now-dead, single-
-   * lifecycle) instance — see `terminate`'s own doc for why that residual
-   * window is accepted rather than closed.
+   * lifecycle) instance — CF-01/A fix wave: no longer a residual hang risk,
+   * because `terminate()` ALSO clears `this.connection` in that same
+   * synchronous block, so `op()`'s own `requireConnection()` call throws
+   * fast instead of reaching a dead `ClientSideConnection` — see
+   * `terminate`'s own doc.
    */
   private raceTermination<T>(op: () => Promise<T>): Promise<T> {
     const term = this.terminationPromise;
@@ -298,8 +301,20 @@ export class AcpClient implements AcpClientLike {
     return { dispose: () => void this.exitHandlers.delete(handler) };
   }
 
-  /** Spawn `hermes acp` and construct the ACP client-side connection over it. */
+  /**
+   * Spawn `hermes acp` and construct the ACP client-side connection over it.
+   *
+   * [Minor] hardening (both review lenses, CF-01/A fix wave): self-enforces
+   * the single-lifecycle invariant `ConnectionSupervisor.createClient`
+   * currently guarantees only by CONVENTION (a fresh `AcpClient` instance
+   * per connect/respawn — `connect()` is never meant to run twice on the
+   * same object). Throwing here turns a hypothetical future violation of
+   * that convention into an honest, immediate failure instead of silently
+   * orphaning the FIRST child/connection pair (overwritten below with no
+   * cleanup) while leaving the first termination pair's promise dangling.
+   */
   async connect(): Promise<void> {
+    if (this.child) throw new Error('AcpClient.connect: already connected');
     const { command, args } = this.options.spawn;
     this.log(`spawn: ${command} ${args.join(' ')}`);
     const child = spawn(command, args, {
@@ -348,30 +363,57 @@ export class AcpClient implements AcpClientLike {
     const terminate = (code: number | null): void => {
       if (this.child !== child) return;
       this.child = undefined;
-      // W1-T1 (CF-01/A-2): reject FIRST — before the exitHandlers fan-out —
-      // so a caller `await`ing a raced request method (whose settlement
-      // reaches it via a microtask, same as everything below) observes the
-      // termination regardless of what an `onExit` handler does (including
-      // one that throws, already tolerated by the try/catch below). Message
-      // carries status/reason only (the exit/error code) — never body/key/
-      // path content, per this task's own constraint.
+      // CF-01/A fix wave (arch Important, post-3cdd78e review): clear
+      // `this.connection` in this SAME synchronous block, not just
+      // `this.child` — makes the residual post-terminate window
+      // SELF-sufficient. Before this, a request issued on a STALE captured
+      // `client` reference (e.g. `SessionController.runTurn`'s `client`
+      // local, read once and reused across an `await`) fell through
+      // `raceTermination`'s `op()`-only passthrough (no live
+      // `terminationPromise` left to race) straight into
+      // `requireConnection()`, which still found `this.connection` set and
+      // handed back a dead `ClientSideConnection` — hanging again exactly
+      // like every request did before W1-T1's original fix, UNLESS some
+      // external `dispose()` (e.g. `ConnectionSupervisor.handleAcpCrash`'s
+      // `client.dispose()`, itself sitting behind a per-controller
+      // `endOnCrash()` loop) happened to run first and clear it instead.
+      // Clearing it HERE removes that dependency: `requireConnection()` now
+      // throws synchronously (surfacing as a fast rejection) for any
+      // post-terminate call on this instance, self-sufficiently, regardless
+      // of what any external cleanup does or when. Verified safe: every
+      // `client.onExit(...)` registrant against THIS interface
+      // (`ConnectionSupervisor`'s crash handler, its connect-phase race, and
+      // its `raceAgainstChildExit` recovery race — the only three
+      // registrants, all in `connection/ConnectionSupervisor.ts`) is a bare
+      // resolve/reject/state-bookkeeping callback that never itself calls
+      // back into this client, so clearing `this.connection` here cannot
+      // break the `exitHandlers` fan-out below.
+      this.connection = undefined;
+      // W1-T1 (CF-01/A-2): reject before the exitHandlers fan-out, for
+      // readability — NOT what guarantees observation. `reject()` only
+      // SCHEDULES a microtask reaction; it never runs synchronously, so
+      // ordering it before-vs-after the fan-out changes nothing about WHEN a
+      // caller's raced `await` actually wakes. What DOES guarantee it: this
+      // whole `terminate` function (this reject call, the pair-clear below,
+      // and the fan-out loop) runs SYNCHRONOUSLY, while every reaction to
+      // the termination promise is a DEFERRED microtask — so the fan-out
+      // (including a handler that throws, already tolerated by the
+      // try/catch below) always finishes before any caller can observe the
+      // rejection, true regardless of reject-before-or-after placement here.
+      // Message carries status/reason only (the exit/error code) — never
+      // body/key/path content, per this task's own constraint.
       //
       // Clear the pair right after: this exact `AcpClient` instance is
       // single-lifecycle (`ConnectionSupervisor.createClient` mints a BRAND
       // NEW instance for every connect/respawn — `connect()` is never called
-      // twice on the same object), so clearing has no effect on any future
-      // reconnect; it only affects a call issued to THIS now-dead instance
-      // after this point. Residual, accepted, and NOT a regression: such a
-      // call falls through `raceTermination`'s `op()`-only branch and can
-      // hang again exactly like every request did before this task — but
-      // only for a caller holding a STALE captured `client` reference from
-      // before the crash rather than re-reading `port.getClient()` (which
-      // every call site already nulls out synchronously inside this SAME
-      // `exitHandlers` fan-out, e.g. `ConnectionSupervisor.handleAcpCrash`'s
-      // `this.client = undefined` — a caller that re-reads sees no client at
-      // all and never issues the call). The request THAT WAS IN FLIGHT AT
-      // THE MOMENT OF DEATH — the case this task exists to fix — is caught
-      // above, before the pair is cleared, regardless.
+      // twice on the same object, now self-enforced by `connect()`'s own
+      // guard too), so clearing has no effect on any future reconnect; it
+      // only affects a call issued to THIS now-dead instance after this
+      // point — self-sufficiently fast-failing per the `this.connection`
+      // clear above, not merely "residual and accepted" as this comment used
+      // to claim. The request THAT WAS IN FLIGHT AT THE MOMENT OF DEATH —
+      // the case W1-T1 exists to fix — is caught above, before the pair is
+      // cleared, regardless.
       this.terminationReject?.(new Error(`AcpClient: child terminated (code ${code})`));
       this.terminationReject = undefined;
       this.terminationPromise = undefined;
@@ -503,15 +545,29 @@ export class AcpClient implements AcpClientLike {
   }
 
   async prompt(sessionId: string, content: AcpOutboundContentBlock[]): Promise<AcpPromptResult> {
-    // W1-T1 (CF-01/A-2): raced against child termination — the PRIMARY site
-    // this task exists for. `SessionController.runTurn`'s `:961` await (the
-    // live turn's own prompt) had NO manual race of its own before this fix
-    // — a child death mid-turn hung the turn forever, spinner and all;
-    // `runTurn`'s try/catch (already correct) simply never got a chance to
-    // fire because the awaited promise never settled. `runControlUtterance`'s
-    // own wall-clock `Promise.race` and `OneShotRunner`'s body-vs-deadline
-    // race, both around OTHER `prompt` call sites, stay exactly as-is —
-    // redundant with this, not replaced by it.
+    // W1-T1 (CF-01/A-2): raced against child termination. CF-01/A review
+    // correction: this is NOT the primary site the task exists for — a
+    // child death mid-turn was ALREADY not user-visible before this fix,
+    // because `ConnectionSupervisor.handleAcpCrash`'s per-controller
+    // `endOnCrash()` fan-out (synchronous, on the SAME crash event) already
+    // ends the live turn honestly (`turn.end{status:'error'}`) regardless of
+    // whether this `prompt()` await itself ever settles. The genuine
+    // net-new benefit here is narrower but real: without this race,
+    // `SessionController.runTurn`'s `:961` await (the live turn's own
+    // `prompt` call) LEAKS a permanently-unsettled continuation on child
+    // death — the awaited promise itself never resolves/rejects, so
+    // `runTurn`'s try/catch and everything after that await never run for
+    // that invocation, a dangling promise/closure that outlives the turn it
+    // belongs to (never user-visible, but a real leak this closes). The
+    // LOAD-BEARING new-fix sites — callers with NO crash backstop of their
+    // own and no pre-existing manual race — are `listSessions` (below;
+    // `SessionsPanelSource.fetchPage` had nothing else un-jamming it, so the
+    // Sessions panel fetch genuinely hung forever) and `setSessionModel`
+    // (below; its caller's UI rollback could not fire at all without this).
+    // `runControlUtterance`'s own wall-clock `Promise.race` and
+    // `OneShotRunner`'s body-vs-deadline race, both around OTHER `prompt`
+    // call sites, stay exactly as-is — redundant with this, not replaced by
+    // it.
     const response = (await this.raceTermination(() =>
       this.requireConnection().prompt({ sessionId, prompt: content }),
     )) as AcpPromptResult;
