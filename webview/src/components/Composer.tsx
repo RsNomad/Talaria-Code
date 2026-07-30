@@ -237,11 +237,19 @@ function chipIcon(kind: Attachment['kind']): string {
  * global instead, which the webview host and jsdom both provide.
  *
  * POSIX-only (Fedora is the target platform): `file:///abs/path` has an
- * empty authority; Node's own `fileURLToPath` treats a non-empty-host
- * `file://` URI as a REMOTE/UNC form on POSIX and rejects it there — so a
- * non-empty `url.hostname` here is deliberately left unhandled (returns
- * `undefined`, falling through to the non-URI branch below) rather than
- * guessed at.
+ * empty authority, and per RFC 8089 + Node's own `fileURLToPath` docs
+ * ("On Unix-like systems, only localhost or an empty host is supported"),
+ * `file://localhost/abs/path` is an equally valid LOCAL alias for it —
+ * only a genuinely different, non-empty, non-localhost host (e.g.
+ * `file://otherhost/...`) is a REMOTE/UNC form. The WHATWG `URL` parser
+ * used here already normalizes a literal `localhost` authority (any case,
+ * even percent-encoded) to an empty `url.hostname` for the `file:` scheme
+ * as part of its own "file host" state, so the `!== 'localhost'` check
+ * below is belt-and-suspenders — it makes the RFC 8089 exemption explicit
+ * in this function's own logic instead of leaning on that engine-internal
+ * normalization implicitly. A genuinely different host is deliberately
+ * left unhandled (returns `undefined`, falling through to the non-URI
+ * branch below) rather than guessed at.
  *
  * @returns the decoded fsPath, or `undefined` when `uri` is not a
  *          recognizable local `file://` URI (caller falls back to storing
@@ -251,7 +259,7 @@ function fileUriToFsPath(uri: string): string | undefined {
   if (!/^file:\/\//i.test(uri)) return undefined;
   try {
     const url = new URL(uri);
-    if (url.hostname) return undefined;
+    if (url.hostname && url.hostname.toLowerCase() !== 'localhost') return undefined;
     return decodeURIComponent(url.pathname);
   } catch {
     return undefined;

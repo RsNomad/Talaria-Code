@@ -591,4 +591,56 @@ describe('CF-07: Explorer drag-drop of a file:// URI is parsed to an fsPath', ()
     expect(added[0]!.path).toBe(rawPath);
     expect(added[0]!.name).toBe('README.md');
   });
+
+  // Review finding (post-approval, non-blocking): RFC 8089 + Node's
+  // `fileURLToPath` docs ("On Unix-like systems, only localhost or an empty
+  // host is supported") both treat `file://localhost/...` as a VALID alias
+  // for `file:///...` on POSIX.
+  //
+  // VERIFIED (write-time, both Node directly and this file's own jsdom
+  // Vitest env) that this specific case does NOT actually go red against
+  // the PRE-fix `if (url.hostname) return undefined`: the WHATWG `URL`
+  // parser's "file host" state already normalizes a literal `localhost`
+  // authority (any case, even percent-encoded — `loc%61lhost` too) to an
+  // empty `url.hostname` for the `file:` scheme, so `url.hostname` was
+  // already `''` here before this fix, same as an authority-less
+  // `file:///...`. This test therefore documents/pins already-correct
+  // behavior (a characterization test) rather than reproducing a live
+  // CF-07 regression the way the sibling cases above do — the production
+  // change this task adds (`!== 'localhost'`) is a harmless, explicit
+  // belt-and-suspenders guard (see the `fileUriToFsPath` doc comment), not
+  // a behavior change for THIS input. It still earns its place: it pins
+  // the RFC 8089 contract against any future engine/polyfill that stops
+  // normalizing localhost, and against a future edit that swaps the
+  // `url.hostname` check for something that no longer benefits from that
+  // normalization.
+  it('a file://localhost/... URI (inside a workspace root) is treated as local, not remote — same fsPath + confinement as an empty-host URI', async () => {
+    const added: Attachment[] = [];
+    const { container } = renderComposerForAttachments((a) => added.push(a));
+
+    simulateExplorerUriDrop(container, 'file://localhost/home/user/app.ts');
+
+    expect(added).toHaveLength(1);
+    const attachment = added[0]!;
+
+    expect(attachment.path).toBe('/home/user/app.ts');
+    expect(attachment.path).not.toMatch(/^file:\/\//);
+
+    const confine: AttachmentConfineFn = async (p, roots) => resolveWithinWorkspace(p, roots);
+    const result = await confineAttachmentPaths([attachment], ['/home/user'], confine);
+    expect(result.droppedCount).toBe(0);
+    expect(result.attachments).toHaveLength(1);
+  });
+
+  it('a file:// URI with a genuine remote host still falls through to the raw-URI fallback, unchanged', () => {
+    const added: Attachment[] = [];
+    const { container } = renderComposerForAttachments((a) => added.push(a));
+
+    simulateExplorerUriDrop(container, 'file://otherhost/home/user/app.ts');
+
+    expect(added).toHaveLength(1);
+    // Unlike localhost, a genuine remote host is left on the pre-fix
+    // behavior: the raw URI is stored verbatim (caller's fallback branch).
+    expect(added[0]!.path).toBe('file://otherhost/home/user/app.ts');
+  });
 });
