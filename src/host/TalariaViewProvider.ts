@@ -801,7 +801,18 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     const csp = [
       `default-src 'none'`,
       `img-src ${webview.cspSource} data:`,
-      `style-src ${webview.cspSource} 'unsafe-inline'`,
+      // SEC-3 (audit-3 B-2): no `'unsafe-inline'`. All webview styling is
+      // static stylesheets served under `${webview.cspSource}` (Vite's
+      // extracted `index.css` + codicon.css, the two <link>s below) plus
+      // React `style={{…}}` props — the latter are CSSOM property
+      // assignments (`el.style.x = y`), which CSP style-src does NOT govern.
+      // There is no literal `<style>`/`style=""` in the shell, no runtime
+      // style injection (createElement('style')/insertRule/setAttribute),
+      // no CSS-in-JS lib, and no dangerouslySetInnerHTML anywhere in the
+      // webview — so nothing needs an inline allowance. Final acceptance is
+      // a live F5 run (CSP is enforced only in a real webview host; tsc and
+      // vitest are blind to it).
+      `style-src ${webview.cspSource}`,
       `font-src ${webview.cspSource}`,
       `script-src 'nonce-${nonce}'`,
     ].join('; ');
