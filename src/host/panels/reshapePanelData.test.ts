@@ -496,6 +496,33 @@ describe('reshapeSessionsList', () => {
       });
       expect(result.sessions[0]?.updatedAt).toBe('2026-07-10T12:00:00Z');
     });
+
+    it('degrades an out-of-range/overflow epoch (nanosecond-shaped) to the raw string instead of throwing (B-6 review)', () => {
+      // A NANOSECOND epoch string (Python `str(time.time_ns())`, 19 digits)
+      // matches EPOCH_NUMERIC_PATTERN; parseFloat -> 1.7e18, treated as ms ->
+      // Invalid Date. `new Date(...).toISOString()` would throw RangeError,
+      // which has NO catch up to invokeControl and would fail the WHOLE
+      // sessions-list fetch. The reshape must degrade the one bad entry and
+      // keep the fetch (and the good sibling row) alive.
+      const nanoEpoch = '1700000000000000000';
+      expect(() =>
+        reshapeSessionsList({
+          sessions: [
+            { session_id: 's1', cwd: '/ws', updated_at: nanoEpoch },
+            { session_id: 's2', cwd: '/ws', updated_at: '2026-07-10T12:00:00Z' },
+          ],
+        }),
+      ).not.toThrow();
+      const result = reshapeSessionsList({
+        sessions: [
+          { session_id: 's1', cwd: '/ws', updated_at: nanoEpoch },
+          { session_id: 's2', cwd: '/ws', updated_at: '2026-07-10T12:00:00Z' },
+        ],
+      });
+      // Bad entry degrades to the raw string; the good sibling still renders.
+      expect(result.sessions[0]?.updatedAt).toBe(nanoEpoch);
+      expect(result.sessions[1]?.updatedAt).toBe('2026-07-10T12:00:00Z');
+    });
   });
 });
 

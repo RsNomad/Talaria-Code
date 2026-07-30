@@ -373,7 +373,20 @@ function normalizeUpdatedAt(raw: string | number | null | undefined): string | u
   if (!EPOCH_NUMERIC_PATTERN.test(str)) return str;
   const epoch = parseFloat(str);
   const ms = epoch < EPOCH_MS_THRESHOLD ? epoch * 1000 : epoch;
-  return new Date(ms).toISOString();
+  // CA-17 (B-6 review): never THROW on an out-of-range/overflow epoch.
+  // `new Date(ms).toISOString()` throws `RangeError: Invalid time value`
+  // when `ms` is non-finite or outside the ±8.64e15 Date range — e.g. a
+  // NANOSECOND-epoch string (`str(time.time_ns())` -> "1700000000000000000",
+  // matches EPOCH_NUMERIC_PATTERN, parseFloat -> 1.7e18 -> treated as ms ->
+  // Invalid Date), or a huge string parseFloat rounds to Infinity. The
+  // reshape's contract is to DEGRADE a bad entry, not throw: the throw has
+  // no catch between here and `invokeControl`, so one malformed timestamp on
+  // one session would fail the WHOLE sessions-list fetch (no rows render) —
+  // strictly worse than the cosmetically-wrong age this fix set out to
+  // reduce, and worse than the non-throwing `String(raw)` it replaced. Fall
+  // back to the raw string on an invalid date.
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? str : d.toISOString();
 }
 
 /**
