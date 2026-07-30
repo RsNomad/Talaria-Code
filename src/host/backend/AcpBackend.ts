@@ -293,6 +293,31 @@ export class AcpBackend implements AgentBackend {
   /** The process-unique approval-id mint — STAYS connection-level (§2c). */
   private approvalCounter = 0;
 
+  /**
+   * CF-01/L3-1 fix (Important — 3-lens review of the tail-serialization
+   * commit): a SYNCHRONOUS close tombstone. {@link closeTab} now defers the
+   * ACTUAL registry removal onto {@link connectionSupervisor}'s topology
+   * tail (see that method's own doc) — while a close is queued but has not
+   * yet run, the closed session `S` stays LIVE in `this.sessions`. Two
+   * hazards that opened: (1) `ConnectionSupervisor.handleAcpCrash`'s
+   * `pendingRecovery` snapshot reads the live registry — a crash landing in
+   * that window captures `S` and the coming respawn re-`session/load`s a
+   * tab the user already asked to close (resurrection); (2) {@link
+   * sendPrompt} (never tail-wrapped) can still find `S` live and start a
+   * turn on a closing tab. `closeTab` adds `sessionId` here SYNCHRONOUSLY,
+   * BEFORE enqueuing the deferred close; `closeTabInternal` removes it once
+   * the actual `sessions.close` has run. This restores the
+   * pre-serialization SYNCHRONOUS visibility of a close (a crash snapshot /
+   * `sendPrompt` see it INSTANTLY) while keeping the removal ITSELF
+   * deferred on the tail — ordering safety is unchanged: a close still
+   * queues behind an in-flight load rather than interrupting one mid-
+   * `loadReplay`. Read by `ConnectionSupervisor.handleAcpCrash` through the
+   * narrow `ConnectionSupervisorHostPort.isPendingClose` predicate (not a
+   * broad new port surface — see that member's own doc) and directly by
+   * {@link sendPrompt}/{@link handleSessionUpdate} (same class).
+   */
+  private readonly pendingClose = new Set<string>();
+
   // AH5: `dashboardToggleTail` (the HOST-SIDE serialization tail for
   // `toggleDashboard`) moved onto `ControlDispatcher` (W6-FI-c) — it was a
   // private implementation detail of the method that moved with it.
@@ -399,6 +424,11 @@ export class AcpBackend implements AgentBackend {
       buildSessionPort: (sessionId, cwd) => this.buildSessionPort(sessionId, cwd),
       openSession: (cwd, tabId, isStaleAttempt) => this.openSession(cwd, tabId, isStaleAttempt),
       getMcpServers: () => [...this.mcpServers.values()],
+      // CF-01/L3-1 fix (Important): the narrow cross-boundary read
+      // `handleAcpCrash`'s `pendingRecovery` snapshot needs — see
+      // `pendingClose`'s own doc and `ConnectionSupervisorHostPort
+      // .isPendingClose`'s own doc for the full tombstone rationale.
+      isPendingClose: (sessionId) => this.pendingClose.has(sessionId),
       // W6-P7-N11 (3-way ARCH I-4): the shared bind-announcement pair — see
       // `announceSessionBound`'s own doc for the preserved order/shape.
       announceSessionBound: (tabId, sessionId, rootId) => this.announceSessionBound(tabId, sessionId, rootId),
@@ -812,23 +842,43 @@ export class AcpBackend implements AgentBackend {
    * interleave with an in-flight load/open/start/respawn. The public
    * signature stays synchronous `void` (matches `AgentBackend`'s interface
    * and every existing caller's fire-and-forget usage, e.g.
-   * `TalariaViewProvider`'s `tab.close` handler) — only the OBSERVABLE effect
-   * (the registry removal) is now deferred a few microtask ticks, until this
-   * call reaches the head of the tail, instead of happening synchronously.
-   * Mirrors {@link ControlDispatcher.refreshCheckpointsPanel}'s
-   * `void promise.catch(...)` fire-and-forget idiom: a rejection (defensive
-   * only — neither `SessionRegistry.close` nor `SessionController.dispose`
-   * throws today) is caught and logged here instead of becoming an
-   * unhandled rejection.
+   * `TalariaViewProvider`'s `tab.close` handler). CORRECTED (3-lens review of
+   * this same commit): the OBSERVABLE effect (the registry removal) is
+   * deferred — NOT "a few microtask ticks" (that undersold it) — the true
+   * bound is "queues behind whatever is currently on `inFlightStart`", which
+   * can be an in-flight load/respawn-recovery, up to
+   * `ConnectionSupervisor`'s own `SESSION_ESTABLISH_DEADLINE_MS` (120s)
+   * before that link even settles. Mirrors {@link
+   * ControlDispatcher.refreshCheckpointsPanel}'s `void promise.catch(...)`
+   * fire-and-forget idiom: a rejection (defensive only — neither
+   * `SessionRegistry.close` nor `SessionController.dispose` throws today) is
+   * caught and logged here instead of becoming an unhandled rejection.
+   *
+   * CF-01/L3-1 fix (Important, the review's own finding): REMOVAL being
+   * deferred does NOT mean VISIBILITY is — {@link pendingClose} tombstones
+   * `sessionId` here, SYNCHRONOUSLY, before the deferred link is even
+   * enqueued below, so `ConnectionSupervisor.handleAcpCrash`'s
+   * `pendingRecovery` snapshot and {@link sendPrompt} both see this close
+   * INSTANTLY (never resurrecting/turning-on a session the user just asked
+   * to close), even though the registry entry itself lingers a little
+   * longer. See {@link pendingClose}'s own doc for the full rationale.
    */
   closeTab(sessionId: string): void {
+    this.pendingClose.add(sessionId);
     void this.connectionSupervisor.runOnStartTail(() => this.closeTabInternal(sessionId)).catch((err: unknown) => {
       this.logger?.append(`[AcpBackend] closeTab failed (sessionId=${sessionId}): ${errorMessage(err)}`);
     });
   }
 
   private async closeTabInternal(sessionId: string): Promise<void> {
-    this.sessions.close(sessionId);
+    try {
+      this.sessions.close(sessionId);
+    } finally {
+      // CF-01/L3-1 fix: clear the tombstone only once the ACTUAL removal has
+      // run — see {@link pendingClose}'s own doc. `finally` so a defensive
+      // (never-happens-today) throw from `sessions.close` still clears it.
+      this.pendingClose.delete(sessionId);
+    }
   }
 
   /**
@@ -870,6 +920,13 @@ export class AcpBackend implements AgentBackend {
    * own lease-acquire refuses for free (no separate router-side check).
    */
   sendPrompt(sessionId: string, text: string, mode: AgentMode, attachments?: Attachment[], mentions?: ContextRef[]): void {
+    // CF-01/L3-1 fix (Important): a session mid-`closeTab` (tombstoned
+    // synchronously, actual removal still queued on the topology tail) must
+    // never start a new turn — see {@link pendingClose}'s own doc. Silent
+    // no-op, NOT the ARCH-1 error path below: the user just asked to close
+    // THIS exact tab, so a stray/raced send for it needs no feedback the way
+    // a genuinely-unexpected lost session does.
+    if (this.pendingClose.has(sessionId)) return;
     const controller = this.sessions.get(sessionId);
     if (!controller) {
       // ARCH-1 (final review, UI I-3): a user-initiated action must never
@@ -1291,8 +1348,50 @@ export class AcpBackend implements AgentBackend {
     // starts with no custom mode, so its picker populates.
     this.announceSessionBound(tabId, sessionId, controller.getRootId());
 
+    // CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
+    // commit): `client.loadSession` (inside `loadReplay`) had NO wall-clock
+    // deadline at all — only `AcpClient.raceTermination`'s child-EXIT-only
+    // race. Before this commit that was merely a LOCALIZED hang (this one
+    // tab's load); now that this whole method is tail-serialized (see
+    // `loadSessionIntoTab`'s own doc), a hung-but-alive child wedges the
+    // ENTIRE topology tail forever — every subsequent `openTab`/`closeTab`/
+    // `loadSessionIntoTab`/`start` chains behind it. Mirrors
+    // `recoverOneSession`'s `SESSION_ESTABLISH_DEADLINE_MS` deadline via
+    // {@link ConnectionSupervisor.raceSessionLoadAgainstDeadline} — see that
+    // method's own doc for why it is DELIBERATELY NOT a reuse of
+    // `raceAgainstChildExit` (that helper cannot distinguish "the deadline
+    // fired" from "`loadReplay` genuinely resolved `undefined`" — the
+    // ordinary `found:false`/rejected-load outcome, which already emits its
+    // OWN session-scoped `error` via `loadReplay` itself and must NOT also
+    // get a second, duplicate `tab.error` here).
     const mcpServers = [...this.mcpServers.values()];
-    return controller.loadReplay(cwd, sessionId, adoptedCwd, mcpServers);
+    const loadReplay = controller.loadReplay(cwd, sessionId, adoptedCwd, mcpServers);
+    const outcome = await this.connectionSupervisor.raceSessionLoadAgainstDeadline(loadReplay);
+    if (outcome.kind === 'timeout') {
+      // The child stayed ALIVE but never answered within
+      // SESSION_ESTABLISH_DEADLINE_MS. JS promises can't be cancelled — the
+      // original `loadReplay` keeps running in the background and MAY still
+      // belatedly resolve. Identity-guarded close (mirrors
+      // `recoverOneSession`'s own guard, W6-FG) de-fangs that: disposing
+      // `controller` now sets `this.replay = undefined` on it, which trips
+      // `loadReplay`'s own supersede recheck (`this.replay !== replay`) the
+      // moment the belated `client.loadSession` finally settles, making that
+      // continuation a silent no-op instead of emitting stale `clear`/
+      // `turn.start`/`turn.end` into a tab we already told the user timed
+      // out. Emits the SAME tab-chrome restart affordance
+      // (`tab.error{kind:'session-lost'}`, §7 B8) the recovery path's own
+      // timeout uses, and — by returning — RELEASES the topology tail for
+      // the next queued link.
+      if (this.sessions.get(sessionId) === controller) this.sessions.close(sessionId);
+      this.emitter.fire({
+        type: 'tab.error',
+        tabId,
+        kind: 'session-lost',
+        message: 'The agent did not respond while loading this session — try again.',
+      });
+      return undefined;
+    }
+    return outcome.value;
   }
 
   dispose(): void {
@@ -1340,6 +1439,13 @@ export class AcpBackend implements AgentBackend {
   private handleSessionUpdate(sessionId: string, update: AcpSessionUpdate): void {
     if (this.oneShotRunner.has(sessionId)) {
       this.oneShotRunner.collect(sessionId, update);
+      return;
+    }
+    // CF-01/L3-1 fix (Minor, optional per review): a session mid-`closeTab`
+    // is about to be gone — drop its stream fan-out too, same rationale as
+    // {@link sendPrompt}'s guard above (see {@link pendingClose}'s own doc).
+    if (this.pendingClose.has(sessionId)) {
+      this.logger?.append(`[AcpBackend] session/update for closing session '${sessionId}' — dropped`);
       return;
     }
 

@@ -129,6 +129,45 @@ export class ConnectionSupervisor {
    */
   private pendingRecovery: Array<{ sessionId: string; cwd: string; tabId: string }> | undefined;
 
+  /**
+   * CF-01/L3-1 fix (Important — 3-lens review of the tail-serialization
+   * commit): a cheap, SYNCHRONOUS-ONLY re-entrancy guard for {@link
+   * runOnStartTail}. True for EXACTLY the duration of the synchronous call
+   * into a queued `fn()` — set right before invoking it, cleared in a
+   * `finally` the INSTANT that call RETURNS CONTROL (a pending promise, for
+   * every real `fn` here — never once that promise later SETTLES).
+   *
+   * Scoped this narrowly on purpose. `runOnStartTail`'s own SELF-DEADLOCK
+   * WARNING (below) is a "verified by inspection" invariant with NO runtime
+   * enforcement today — a future 5th tail user whose `fn` body calls ANOTHER
+   * tail-wrapped method (`start`/`openTab`/`closeTab`/`loadSessionIntoTab`)
+   * as an immediate, un-awaited action would silently and PERMANENTLY wedge
+   * the whole topology tail (no error, no timeout — the inner call enqueues
+   * onto `fn`'s OWN still-pending promise, which can never settle because
+   * `fn` is now itself waiting on that very link). A flag held for `fn`'s
+   * ENTIRE lifetime (cleared on SETTLEMENT rather than on invocation-return)
+   * would also catch that self-recursive case — but it would ALSO throw on
+   * the legitimate, extensively-tested pattern this whole class exists to
+   * support: an unrelated, concurrent top-level caller (e.g. a user's
+   * `closeTab` firing while a DIFFERENT `fn` is still suspended mid-`await`)
+   * queueing BEHIND the in-flight link (`AcpBackend.test.ts`'s "CF-01/L3-1:
+   * loadSessionIntoTab/closeTab are serialized on the SAME runOnStartTail
+   * queue" describe block is exactly this scenario, and must not false-trip).
+   *
+   * The narrow window sidesteps that conflict: by the time a legitimate
+   * concurrent caller's OWN `runOnStartTail` call happens, the in-flight
+   * `fn`'s synchronous invocation has ALREADY returned control (its
+   * `finally` already cleared the flag) — only a call SYNCHRONOUSLY NESTED
+   * inside `fn`'s own still-executing call frame ever observes the flag as
+   * `true`. This is a best-effort diagnostic for the common mistake (an
+   * immediate, un-awaited nested call, the shape every existing tail user
+   * takes — `fn` IS the wrapped method's entire body), not a comprehensive
+   * one: an `fn` that awaits something else first and only THEN re-enters is
+   * not caught by this guard and would still silently wedge, exactly as
+   * before this fix. "Cheap" — not perfect — was the brief.
+   */
+  private executingOnTail = false;
+
   constructor(private readonly port: ConnectionSupervisorHostPort) {}
 
   /** The live ACP client, read at call time — `undefined` before/between connections. */
@@ -216,11 +255,41 @@ export class ConnectionSupervisor {
    * (a self-deadlock). None of `start`/`openTab`/`loadSessionIntoTab`/
    * `closeTab`'s wrapped bodies call each other or themselves — each enqueues
    * exactly once, at its own outer entry point, verified by inspection.
+   *
+   * CF-01/L3-1 fix (Important — 3-lens review): the paragraph above was
+   * "verified by inspection" ONLY — no runtime enforcement backed it, so a
+   * future 5th tail user violating it would silently and PERMANENTLY wedge
+   * the whole connection topology (no error, no timeout — the exact
+   * never-resolves class this codebase deadline-protects everywhere else).
+   * {@link executingOnTail} now makes a DIRECT, synchronous violation (`fn`
+   * calling another tail-wrapped method as an immediate, un-awaited action —
+   * the shape every current `fn` here takes) fail LOUDLY instead: see that
+   * field's own doc for the exact scope (synchronous-only) and why a wider
+   * "true for fn's whole lifetime" guard would have false-tripped the
+   * legitimate concurrent-queueing pattern this method exists to provide.
+   *
+   * CONNECTION-WIDE, not per-tab (Minor doc fix, same review): every one of
+   * `start`/`openTab`/`closeTab`/`loadSessionIntoTab` chains onto this ONE
+   * shared tail regardless of WHICH tab it targets — a slow op on one tab
+   * (e.g. a near-deadline History-load) blocks topology mutations on every
+   * OTHER tab too, until it settles or times out. This is the intended cost
+   * of closing the cross-tab race family CF-01/L3-1 retired, not an
+   * accidental side effect.
    */
   runOnStartTail<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.executingOnTail) {
+      throw new Error('runOnStartTail: re-entrant call would deadlock the topology tail');
+    }
     const run = (this.inFlightStart ?? Promise.resolve())
       .catch(() => undefined)
-      .then(() => fn());
+      .then(() => {
+        this.executingOnTail = true;
+        try {
+          return fn();
+        } finally {
+          this.executingOnTail = false;
+        }
+      });
     this.inFlightStart = run;
     run
       .finally(() => {
@@ -807,6 +876,69 @@ export class ConnectionSupervisor {
   }
 
   /**
+   * CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
+   * commit): gives an arbitrary in-flight promise `p` (here:
+   * `AcpBackend.loadSessionIntoTabInternal`'s `controller.loadReplay(...)`,
+   * whose `client.loadSession` had NO wall-clock deadline at all — only
+   * `AcpClient.raceTermination`'s child-EXIT-only race) the SAME {@link
+   * SESSION_ESTABLISH_DEADLINE_MS} `recoverOneSession`'s own `session/load`
+   * already gets via {@link raceAgainstChildExit}.
+   *
+   * Deliberately NOT built on `raceAgainstChildExit` itself, despite the
+   * SAME deadline duration: that helper collapses "the deadline fired" and
+   * "`p` genuinely resolved to `undefined` on its own" into the SAME
+   * `undefined` return value. That ambiguity is harmless for
+   * `recoverOneSession` (both outcomes get IDENTICAL `tab.error{session-lost}`
+   * + identity-guarded-close handling there) but would be WRONG here:
+   * `loadReplay` legitimately resolves `undefined` on an ordinary
+   * `found:false`/rejected direct load — a case that already emits its OWN
+   * session-scoped `error` (see `SessionController.loadReplay`'s own doc)
+   * and, unlike recovery, leaves the controller registered — it must NOT
+   * also get a second, duplicate `tab.error` here (see the existing "audit
+   * A-3" `found:false` tests in `AcpBackend.test.ts`, which pin the EXACT
+   * message list with no `tab.error` in it). Returns a DISCRIMINATED
+   * outcome instead, so `loadSessionIntoTabInternal` can tell "`p` settled
+   * on its own" (even with an `undefined` value) apart from "we gave up
+   * waiting."
+   *
+   * Deadline-only — no child-exit race, unlike `raceAgainstChildExit`: a
+   * child exit already reaches `p` via `AcpClient.raceTermination` (rejects
+   * the in-flight `client.loadSession` the instant `terminate()` fires —
+   * W1-T1/CF-01/A-2, added after `raceRecoveryAgainstChildExit`'s own
+   * exit-race was written), which `loadReplay`'s try/catch already turns
+   * into an honest, session-scoped failure — no SEPARATE exit-race is
+   * needed at this layer.
+   */
+  raceSessionLoadAgainstDeadline<T>(p: Promise<T>): Promise<{ kind: 'settled'; value: T } | { kind: 'timeout' }> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ kind: 'timeout' });
+      }, SESSION_ESTABLISH_DEADLINE_MS);
+      // Don't keep the event loop alive on this deadline — matches every
+      // other deadline timer in this class (raceConnectPhase/
+      // raceAgainstChildExit/scheduleAcpRespawn).
+      timer.unref?.();
+      p.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ kind: 'settled', value });
+        },
+        (err: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  /**
    * T-1 (V-12 RESTART-STATE): on a fresh boot OR an EXPLICIT user restart —
    * `pendingRecovery === undefined`, the SAME discriminator
    * `establishInitialSession` already consumes; a crash respawn sets it
@@ -892,6 +1024,17 @@ export class ConnectionSupervisor {
    * the respawned connection is healthy (§7 B8's "never a silent drop,
    * never a silent new session", generalized to every tab, not just the
    * bootstrap one).
+   *
+   * CF-01/L3-1 fix (Important — 3-lens review): the snapshot below EXCLUDES
+   * any session `AcpBackend.pendingClose` currently tombstones (via the
+   * narrow {@link ConnectionSupervisorHostPort.isPendingClose} predicate). A
+   * `closeTab(S)` defers S's ACTUAL registry removal onto the topology tail
+   * (`AcpBackend.closeTab`'s own doc), so S can still be LIVE in
+   * `this.port.sessions` at the exact instant a crash lands here — without
+   * this filter, a crash landing in that window would resurrect a session
+   * the user already asked to close (re-`session/load`s it and re-binds its
+   * tab on the coming respawn). See `AcpBackend.pendingClose`'s own doc for
+   * the full tombstone rationale.
    */
   private handleAcpCrash(code: number | null): void {
     this.clientExitSub?.dispose();
@@ -912,11 +1055,13 @@ export class ConnectionSupervisor {
     // capturing here (vs. after the loop) makes no functional difference,
     // but doing it FIRST keeps the recovery worklist visibly independent of
     // whatever endOnCrash does to each controller's turn/replay state.
-    this.pendingRecovery = [...this.port.sessions.values()].map((controller) => ({
-      sessionId: controller.sessionId,
-      cwd: controller.cwd,
-      tabId: controller.tabId,
-    }));
+    this.pendingRecovery = [...this.port.sessions.values()]
+      .filter((controller) => !this.port.isPendingClose(controller.sessionId))
+      .map((controller) => ({
+        sessionId: controller.sessionId,
+        cwd: controller.cwd,
+        tabId: controller.tabId,
+      }));
     // §2c req 5: settle any in-flight one-shot on this SAME child crash —
     // independent of (and before) the per-controller handling below.
     // W6-FI-a: delegates to `OneShotRunner` via the port.
@@ -1073,6 +1218,17 @@ export interface ConnectionSupervisorHostPort {
   settleOneShot(reason: string): void;
   /** `AcpBackend.resetSessionsAccumulation` — clear the Sessions panel's paginated accumulation. */
   resetSessionsAccumulation(): void;
+  /**
+   * CF-01/L3-1 fix (Important): narrow predicate — is `sessionId` mid-close
+   * (added synchronously by `AcpBackend.closeTab`, cleared once the deferred
+   * `closeTabInternal` actually runs)? {@link handleAcpCrash}'s
+   * `pendingRecovery` snapshot excludes any session this returns `true` for
+   * — a user-closed session must never be resurrected by a crash respawn.
+   * Deliberately a single boolean read (not a broader "give me the whole
+   * set" surface) — this class needs no other visibility into `pendingClose`.
+   * See `AcpBackend.pendingClose`'s own doc for the full tombstone rationale.
+   */
+  isPendingClose(sessionId: string): boolean;
 
   /**
    * Fires a HostToWebview message (mirrors `SessionHostPort.emit`, but

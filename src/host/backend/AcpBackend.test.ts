@@ -2122,6 +2122,99 @@ describe('AcpBackend.openTab/closeTab — W4-T3b (§2d/§2e Deliverable 5): the 
   });
 });
 
+/**
+ * CF-01/L3-1 fix (Important — 3-lens review): `closeTab` DEFERS the actual
+ * registry removal onto the topology tail (see that method's own doc) —
+ * while a close is queued but not yet run, the closed session stays LIVE in
+ * the registry. These tests drive the two realized hazards the review found
+ * in that deferral window and prove the SYNCHRONOUS `pendingClose` tombstone
+ * closes both: (a) a crash landing in the window must not resurrect a
+ * user-closed tab via `handleAcpCrash`'s `pendingRecovery` snapshot; (b) a
+ * racing `sendPrompt` for the closing session must no-op, not start a turn.
+ */
+describe('AcpBackend.closeTab — CF-01/L3-1 fix (Important): the pendingClose tombstone gives SYNCHRONOUS visibility even though removal stays deferred', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('closeTab(S) immediately followed by a crash excludes S from the respawn\'s recovery snapshot — no resurrection of a user-closed tab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).queueSessionId('session-2');
+    await backend.openTab('tab-2'); // session-2
+
+    backend.closeTab('session-2'); // tombstoned SYNCHRONOUSLY; the actual removal is still queued on the tail
+    // Sanity: the deferral window is real — the removal has not run yet.
+    expect(hasController(backend, 'session-2')).toBe(true);
+
+    must(clients[0]).simulateExit(1); // crash lands INSIDE the close's deferral window, before its tail link has a turn
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await vi.advanceTimersByTimeAsync(500); // respawn fires -> recoverSessions runs
+
+    // RED (pre-fix): session-2 was still in the LIVE registry the instant
+    // handleAcpCrash snapshotted pendingRecovery — the respawn re-`session/
+    // load`s it and re-binds 'tab-2', resurrecting a tab the user already
+    // asked to close.
+    expect(must(clients[1]).loadSessionCalls.map((c) => c.sessionId)).toEqual(['session-1']);
+    expect(
+      messages.some((m) => m.type === 'tab.bound' && (m as { sessionId?: string }).sessionId === 'session-2'),
+    ).toBe(false);
+    expect(hasController(backend, 'session-2')).toBe(false);
+  });
+
+  it('closeTab(S) followed immediately by sendPrompt(S) no-ops during the deferral window — no turn starts on a closing tab', async () => {
+    const { backend, messages } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
+
+    backend.closeTab('session-1'); // tombstoned SYNCHRONOUSLY; the actual removal is still queued on the tail
+    // Sanity: the deferral window is real.
+    expect(hasController(backend, 'session-1')).toBe(true);
+
+    // `SessionController.sendPrompt` emits `turn.start`/`user` and acquires
+    // the root turn lease SYNCHRONOUSLY, before its first `await` — so this
+    // is a non-racy proof-point (unlike `client.promptCallCount`, which
+    // — even PRE-fix — can read back as 0 anyway once the deferred close's
+    // own `dispose()` reaches `this.currentTurnId = undefined` first and
+    // trips `runTurnWithCheckpoint`'s post-checkpoint-await supersede guard;
+    // that is accidental, timing-dependent masking, not the tombstone
+    // working, and must not be mistaken for it).
+    //
+    // RED (pre-fix): sendPrompt still finds session-1 live in the registry
+    // during this window and SYNCHRONOUSLY starts a turn (turn.start/user)
+    // on a tab the user just closed, before any dispose() race can matter.
+    backend.sendPrompt('session-1', 'hello', 'default');
+
+    expect(messages.some((m) => m.type === 'turn.start')).toBe(false);
+    expect(messages.some((m) => m.type === 'user')).toBe(false);
+    expect(anyLiveTurnOnRoot(backend, '')).toBe(false); // the root turn lease was never acquired
+  });
+
+  it('the tombstone clears once the deferred close actually runs (not permanently stuck) — sendPrompt AFTER the window resolves normally on a fresh session reusing the tab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).queueSessionId('session-2');
+    await backend.openTab('tab-2'); // session-2
+
+    backend.closeTab('session-2');
+    await flushMicrotasks(); // let the deferred close actually run
+
+    expect(hasController(backend, 'session-2')).toBe(false);
+
+    // A later, unrelated session sharing no state with the closed one sends
+    // normally — the tombstone did not leak past its own deferral window.
+    must(clients[0]).queueSessionId('session-3');
+    await backend.openTab('tab-3'); // session-3
+    backend.sendPrompt('session-3', 'hi again', 'default');
+    await flushMicrotasks();
+
+    expect(must(clients[0]).promptCallCount).toBe(1);
+  });
+});
+
 describe('AcpBackend.listTabs — W6-FF (3-way ARCH I-1): the live tab list TalariaViewProvider\'s hydrate payload reuses', () => {
   it('is empty before any session is established (a genuine cold boot — nothing live to reconcile)', () => {
     const { backend } = makeStartableBackend();
@@ -3041,6 +3134,185 @@ describe('AcpBackend — CF-01/L3-1: loadSessionIntoTab/closeTab are serialized 
 
     // Now the queued close has had its turn.
     expect(hasController(backend, 'session-1')).toBe(false);
+  });
+});
+
+/**
+ * CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
+ * commit): `loadSessionIntoTabInternal`'s `client.loadSession` had NO
+ * wall-clock deadline at all — only `AcpClient.raceTermination`'s
+ * child-EXIT-only race. Pre-fix this was a LOCALIZED hang (one tab); now
+ * that the whole method is tail-serialized (the describe block immediately
+ * above), a hung-but-alive child wedges the ENTIRE topology tail forever —
+ * every subsequent `openTab`/`closeTab`/`loadSessionIntoTab`/`start` chains
+ * behind it. These tests prove `ConnectionSupervisor
+ * .raceSessionLoadAgainstDeadline`'s `SESSION_ESTABLISH_DEADLINE_MS` (120s)
+ * closes that gap, mirroring the T-3 "session-establish wall-clock deadline"
+ * describe block's own style for the bootstrap/recovery legs.
+ */
+describe('AcpBackend.loadTab — CF-01/L3-1 fix (Critical): a hung-but-alive client.loadSession must not wedge the topology tail forever', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a direct History-load whose client.loadSession never resolves times out at the deadline, emits tab.error, disposes the abandoned controller, and releases the tail for a subsequent openTab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).hangLoadSession();
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    const loadPromise = backend.loadTab('tab-2', 'history-session', '/ws');
+    const settlement = trackSettlement(loadPromise);
+    await flushMicrotasks();
+    expect(settlement.settled()).toBe(false); // still hanging in client.loadSession — the child never exits
+
+    await vi.advanceTimersByTimeAsync(119_999);
+    expect(settlement.settled()).toBe(false); // not yet — still inside the 120s window
+
+    await vi.advanceTimersByTimeAsync(1);
+
+    // RED (pre-fix): loadSessionIntoTabInternal's client.loadSession call has
+    // no wall-clock deadline at all — advancing fake time does nothing, and
+    // settlement.settled() stays false forever (the whole topology tail is
+    // wedged: no `openTab`/`closeTab`/another load could ever run again).
+    expect(settlement.settled()).toBe(true);
+    await loadPromise;
+
+    expect(messages).toContainEqual({
+      type: 'tab.error',
+      tabId: 'tab-2',
+      kind: 'session-lost',
+      message: expect.any(String),
+    });
+    // The abandoned attempt's controller is disposed (identity-guarded,
+    // mirrors recoverOneSession's own guard) — not left half-registered,
+    // permanently "replaying".
+    expect(hasController(backend, 'history-session')).toBe(false);
+
+    // Tail un-jammed: a SECOND topology op (openTab) actually runs.
+    messages.length = 0;
+    must(clients[0]).queueSessionId('session-3');
+    await backend.openTab('tab-3');
+    expect(messages).toContainEqual({
+      type: 'tab.bound',
+      tabId: 'tab-3',
+      sessionId: 'session-3',
+      rootId: expect.any(String),
+    });
+  });
+
+  it('a belated client.loadSession resolution AFTER the deadline fires is a silent no-op (no stale clear/turn.start/turn.end into the already-timed-out tab)', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    const resolver = deferred<AcpLoadSessionResult>();
+    must(clients[0]).loadSession = async (cwd: string, sessionId: string, mcpServers?: AcpMcpServer[]) => {
+      must(clients[0]).loadSessionCalls.push({ cwd, sessionId, mcpServers });
+      return resolver.promise;
+    };
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    const loadPromise = backend.loadTab('tab-2', 'history-session', '/ws');
+    await vi.advanceTimersByTimeAsync(120_000); // the deadline fires — client.loadSession still hasn't answered
+    await loadPromise;
+    messages.length = 0;
+
+    // The ORIGINAL client.loadSession call was never cancelled (JS promises
+    // can't be) — it now answers LATE, after the deadline already gave up.
+    resolver.resolve({ found: true, currentModeId: 'default' });
+    await flushMicrotasks();
+
+    // No belated clear/turn.start/turn.end/tab.bound for an attempt nobody
+    // is waiting on anymore.
+    expect(messages).toEqual([]);
+  });
+
+  it('sanity: a client.loadSession that resolves well within the deadline is unaffected (no stray timer left armed)', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    must(clients[0]).setLoadSessionResult({ found: true, currentModeId: 'default' });
+
+    await backend.loadTab('tab-2', 'history-session', '/ws');
+
+    expect(hasController(backend, 'history-session')).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+/**
+ * CF-01/L3-1 fix (Important — 3-lens review): `runOnStartTail`'s
+ * SELF-DEADLOCK WARNING was "verified by inspection" only, with no runtime
+ * enforcement. This proves the new {@link ConnectionSupervisor
+ * .executingOnTail} guard turns a synchronous re-entrant call into a loud,
+ * immediate error instead of a silent, permanent wedge — and that it does
+ * NOT false-trip the legitimate sequential/concurrent-queueing pattern the
+ * describe block above (and the "CF-01/L3-1: loadSessionIntoTab/closeTab are
+ * serialized..." block further above) already exercise extensively.
+ */
+describe('ConnectionSupervisor.runOnStartTail — CF-01/L3-1 fix (Important): a re-entrant call throws instead of self-deadlocking the whole topology tail', () => {
+  it('a synchronously re-entrant fn (calls runOnStartTail again before returning) rejects with a diagnostic error instead of wedging the tail forever, and un-jams it for the next call', async () => {
+    const { backend } = makeBackend();
+    const supervisor = connectionSupervisorOf(backend);
+
+    // RED (pre-fix): the inner call silently enqueues behind the OUTER
+    // call's own still-pending promise — a genuine self-deadlock (no error,
+    // no timeout): neither promise can ever settle, since each is waiting
+    // on the other.
+    const outer = supervisor.runOnStartTail(() => supervisor.runOnStartTail(() => Promise.resolve('inner')));
+    const settlement = trackSettlement(outer);
+    await flushMicrotasks();
+
+    expect(settlement.settled()).toBe(true);
+    await expect(outer).rejects.toThrow('runOnStartTail: re-entrant call would deadlock the topology tail');
+
+    // Tail un-jammed: a fresh call afterward actually runs (not wedged).
+    await expect(supervisor.runOnStartTail(() => Promise.resolve('after'))).resolves.toBe('after');
+  });
+
+  it('does NOT false-trip the legitimate pattern: a tail link fn completing, then the NEXT queued link running (sequential, not re-entrant)', async () => {
+    const { backend } = makeBackend();
+    const supervisor = connectionSupervisorOf(backend);
+
+    const order: string[] = [];
+    const p1 = supervisor.runOnStartTail(async () => {
+      order.push('fn1-start');
+      await Promise.resolve();
+      order.push('fn1-end');
+      return 'one';
+    });
+    const p2 = supervisor.runOnStartTail(async () => {
+      order.push('fn2-start');
+      return 'two';
+    });
+
+    await expect(p1).resolves.toBe('one');
+    await expect(p2).resolves.toBe('two');
+    expect(order).toEqual(['fn1-start', 'fn1-end', 'fn2-start']);
+  });
+
+  it('does NOT false-trip the legitimate pattern: an unrelated concurrent caller queues behind an fn still suspended mid-await', async () => {
+    const { backend } = makeBackend();
+    const supervisor = connectionSupervisorOf(backend);
+    const d = deferred<string>();
+
+    const p1 = supervisor.runOnStartTail(() => d.promise); // suspended, not yet settled
+    await flushMicrotasks();
+
+    // A totally independent, concurrent call — NOT nested inside fn1's own
+    // execution — must enqueue normally, not throw.
+    const p2 = supervisor.runOnStartTail(() => Promise.resolve('concurrent'));
+    await flushMicrotasks();
+    expect(trackSettlement(p2).settled()).toBe(false); // queued behind p1, not yet its turn
+
+    d.resolve('first');
+    await expect(p1).resolves.toBe('first');
+    await expect(p2).resolves.toBe('concurrent');
   });
 });
 
@@ -4179,6 +4451,22 @@ function rootIdFor(backend: AcpBackend, cwd: string): string {
 
 function hasController(backend: AcpBackend, sessionId: string): boolean {
   return (backend as unknown as { sessions: { has(id: string): boolean } }).sessions.has(sessionId);
+}
+
+/**
+ * CF-01/L3-1 fix: reaches past `private` to drive `ConnectionSupervisor
+ * .runOnStartTail` DIRECTLY — the re-entrancy-guard tests need to construct
+ * both the "genuinely re-entrant" and "legitimate concurrent" scenarios at
+ * the tail-primitive level itself, independent of any particular wrapped
+ * method (`start`/`openTab`/`closeTab`/`loadSessionIntoTab`), none of which
+ * actually re-enters (that's the whole point being tested).
+ */
+function connectionSupervisorOf(backend: AcpBackend): { runOnStartTail<T>(fn: () => Promise<T>): Promise<T> } {
+  return (
+    backend as unknown as {
+      connectionSupervisor: { runOnStartTail<T>(fn: () => Promise<T>): Promise<T> };
+    }
+  ).connectionSupervisor;
 }
 
 /** C1: reaches past `private` to read the registry's CURRENT tabId -> sessionId
