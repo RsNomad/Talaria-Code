@@ -394,6 +394,53 @@ describe('ControlChannel respawn/dispose races (CF-01 / L6 I-4, I-5)', () => {
     }
   });
 
+  it('start() clears an armed respawn-backoff timer via clearRespawnTimer() (white-box: pins the mechanism, not just the outcome)', async () => {
+    // The test above proves the *outcome* (no double-spawn), but it passes
+    // with EITHER fix present alone: `attemptRespawn`'s
+    // `pendingReady || state === 'ready'` guard already suppresses the stale
+    // timer's callback in that test's timing (a fresh `pendingReady` is set
+    // by the explicit `start()` before the original timer's deadline is
+    // reached), so it can't distinguish "start() calls clearRespawnTimer()"
+    // from "attemptRespawn() happens to no-op". This test asserts on the
+    // timer directly, synchronously, before the attemptRespawn guard could
+    // ever come into play.
+    vi.useFakeTimers();
+    try {
+      const { factory, transports } = makeFactory();
+      const channel = new ControlChannel(CONFIG, undefined, factory);
+
+      const startPromise = channel.start();
+      await flushMicrotasksFake();
+      must(transports[0]).emit('event', GATEWAY_READY);
+      await startPromise;
+
+      // Crash arms exactly one pending timer: scheduleRespawn()'s backoff.
+      must(transports[0]).exit(1);
+      expect(vi.getTimerCount()).toBe(1);
+
+      // Call start() but deliberately do NOT await or advance time yet.
+      // `start()` has no `await` of its own, and `spawnAndAwaitReady()`'s
+      // first line (`await resolveHermes(...)`) resolves via microtasks
+      // only (CONFIG.hermesPath is set, so `resolveHermesBin` never touches
+      // a timer) — so the ENTIRE synchronous prefix of this call, including
+      // `this.clearRespawnTimer()`, runs before control returns here, and
+      // the READY_TIMEOUT_MS handshake timer (armed later, inside
+      // `awaitReady()`) has NOT been created yet. At this exact instant the
+      // only timer that could possibly be pending is the original
+      // respawn-backoff timeout from the crash above.
+      const restartPromise = channel.start();
+      expect(vi.getTimerCount()).toBe(0); // the armed respawn timer was cleared
+
+      await flushMicrotasksFake();
+      expect(transports).toHaveLength(2); // the explicit start()'s own spawn
+      must(transports[1]).emit('event', GATEWAY_READY);
+      await restartPromise;
+      channel.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('dispose() during the ready handshake does not resurrect to ready and disposes the freshly-spawned transport', async () => {
     const { factory, transports } = makeFactory();
     const channel = new ControlChannel(CONFIG, undefined, factory);
@@ -411,6 +458,31 @@ describe('ControlChannel respawn/dispose races (CF-01 / L6 I-4, I-5)', () => {
     expect(must(transports[0]).disposed).toBe(true); // no orphaned child
 
     // Must stay disposed — never resurrected to 'ready' by the late handshake.
+    await expect(channel.dispatch('tools.list')).rejects.toThrow(/disposed/i);
+  });
+
+  it('dispose() racing the resolveHermes() await aborts before any transport is spawned', async () => {
+    // Covers the EARLIER disposed re-check in `spawnAndAwaitReady()`
+    // (right after `await resolveHermes(...)`, before the transport is
+    // constructed) — distinct from the test above, which races dispose()
+    // against the LATER re-check (after the transport exists and the
+    // handshake is in flight). Here `transports` must stay empty: a
+    // disposed channel must never spawn a process at all.
+    const { factory, transports } = makeFactory();
+    const channel = new ControlChannel(CONFIG, undefined, factory);
+
+    const startPromise = channel.start();
+    // No await/flush here: `start()` has no `await` of its own, and
+    // `spawnAndAwaitReady()`'s first line pauses at `await
+    // resolveHermes(this.config)`, which resolves via microtasks only
+    // (CONFIG.hermesPath is set, so `resolveHermesBin` never touches a
+    // timer). So calling `dispose()` synchronously right after `start()`
+    // lands strictly BEFORE `resolveHermes()`'s await settles and strictly
+    // BEFORE the transport is created — exactly the CF-01/I-5 window.
+    channel.dispose();
+
+    await expect(startPromise).rejects.toThrow(/disposed/i);
+    expect(transports).toHaveLength(0); // no transport spawned for a disposed channel
     await expect(channel.dispatch('tools.list')).rejects.toThrow(/disposed/i);
   });
 });

@@ -102,10 +102,13 @@ export class ControlChannel {
   async start(): Promise<void> {
     // CF-01/I-4: an explicit (re)start replaces any pending respawn retry —
     // mirrors `ConnectionSupervisor.startInternal`'s `clearAcpRespawnTimer()`
-    // first act. Without this, a `start()` issued while a crash-respawn
-    // backoff is armed leaves the stale timer live; it later fires
-    // `attemptRespawn()` on top of the spawn `start()` just kicked off,
-    // double-spawning the control child.
+    // call (`ConnectionSupervisor.ts:314-316`: the disposed-check runs
+    // first there, `clearAcpRespawnTimer()` second — order doesn't matter
+    // for this invariant, only that it runs on every (re)start). Without
+    // this, a `start()` issued while a crash-respawn backoff is armed
+    // leaves the stale timer live; it later fires `attemptRespawn()` on top
+    // of the spawn `start()` just kicked off, double-spawning the control
+    // child.
     this.clearRespawnTimer();
     if (this.state === 'disposed') {
       throw new Error('ControlChannel: disposed');
