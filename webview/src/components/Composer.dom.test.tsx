@@ -5,6 +5,16 @@ import userEvent from '@testing-library/user-event';
 import { Composer } from './Composer';
 import type { ComposerSeed } from '../composer/applySeed';
 import type { Attachment, CustomModeInfo, EditPolicyPreset } from '../protocol';
+// CF-07: the confinement HALF of the drag-drop test drives the REAL
+// production predicate/orchestration the host runs `Attachment.path`
+// through post-drop — not a hand-rolled restatement of it — so a passing
+// test is proof the composer's output satisfies the host-side contract,
+// not just this file's guess at it. Both are pure (no `vscode`, no I/O at
+// import time — `attachments.ts` doc, `sanitize.ts` doc); `resolveWithinWorkspace`
+// is the synchronous, filesystem-free lexical predicate (no `realpath`), so
+// no on-disk fixtures are needed to prove containment.
+import { confineAttachmentPaths, type AttachmentConfineFn } from '../../../src/host/backend/acp/attachments';
+import { resolveWithinWorkspace } from '../../../src/host/backend/acp/pathConfine';
 
 /**
  * Audit C-3 (Critical). `pendingSeed` was never reset, and the Composer's
@@ -510,5 +520,75 @@ describe('CF-02: Enter/Tab are ignored while an IME composition is in flight', (
     fireEvent.keyDown(textarea, { key: 'Enter' });
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith('ok now', undefined, undefined);
+  });
+});
+
+/**
+ * CF-07 (L5 F-8): Explorer drag-drop must store an fsPath, not a raw
+ * `file://` URI. `Attachment.path`'s contract is "Workspace path" (an
+ * fsPath) — host-side `confineAttachmentPaths` (`src/host/backend/acp/
+ * attachments.ts`, read-verify only, NOT edited by this task) resolves it
+ * against each workspace root via `path.resolve`. A raw `file://` URI
+ * string never resolves inside any root that way, so an Explorer drag was
+ * silently dropped with a misleading "outside the workspace" outcome.
+ * `pathToFileUri`'s URI-passthrough sits AFTER confinement and is never
+ * reached for this case.
+ */
+function simulateExplorerUriDrop(container: HTMLElement, uri: string) {
+  const dropTarget = container.firstElementChild as HTMLElement;
+  fireEvent.drop(dropTarget, {
+    dataTransfer: {
+      types: ['text/uri-list'],
+      getData: (type: string) => (type === 'text/uri-list' ? uri : ''),
+    },
+  });
+}
+
+describe('CF-07: Explorer drag-drop of a file:// URI is parsed to an fsPath', () => {
+  it('a dropped file:// URI (inside a workspace root) becomes an Attachment.path fsPath, and confines successfully', async () => {
+    const added: Attachment[] = [];
+    const { container } = renderComposerForAttachments((a) => added.push(a));
+
+    simulateExplorerUriDrop(container, 'file:///home/user/proj/src/app.ts');
+
+    expect(added).toHaveLength(1);
+    const attachment = added[0]!;
+
+    // The defect: today `attachment.path` is the raw `file://` string
+    // (POSIX `file:///abs` -> fsPath is everything after the third slash).
+    expect(attachment.path).toBe('/home/user/proj/src/app.ts');
+    expect(attachment.path).not.toMatch(/^file:\/\//);
+
+    // Confinement contract: feed the produced attachment through the REAL
+    // `confineAttachmentPaths`, with the REAL pure/lexical confine
+    // predicate injected (no realpath -> no on-disk fixture needed). Today
+    // (raw URI stored) this drops the attachment; after the fix it must not.
+    const confine: AttachmentConfineFn = async (p, roots) => resolveWithinWorkspace(p, roots);
+    const result = await confineAttachmentPaths([attachment], ['/home/user/proj'], confine);
+    expect(result.droppedCount).toBe(0);
+    expect(result.attachments).toHaveLength(1);
+  });
+
+  it('URL-encoded characters in the URI (e.g. a space as %20) are decoded into the fsPath', () => {
+    const added: Attachment[] = [];
+    const { container } = renderComposerForAttachments((a) => added.push(a));
+
+    simulateExplorerUriDrop(container, 'file:///home/user/proj/my%20notes.txt');
+
+    expect(added).toHaveLength(1);
+    expect(added[0]!.path).toBe('/home/user/proj/my notes.txt');
+    expect(added[0]!.name).toBe('my notes.txt');
+  });
+
+  it('a non-URI drop (already an fsPath) keeps working unchanged', () => {
+    const added: Attachment[] = [];
+    const { container } = renderComposerForAttachments((a) => added.push(a));
+    const rawPath = '/home/user/proj/README.md';
+
+    simulateExplorerUriDrop(container, rawPath);
+
+    expect(added).toHaveLength(1);
+    expect(added[0]!.path).toBe(rawPath);
+    expect(added[0]!.name).toBe('README.md');
   });
 });

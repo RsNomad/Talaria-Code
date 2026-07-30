@@ -215,6 +215,50 @@ function chipIcon(kind: Attachment['kind']): string {
 }
 
 /**
+ * CF-07 (L5 F-8): an Explorer drag delivers its `text/uri-list` entry as a
+ * `file://` URI (e.g. `file:///home/user/proj/src/app.ts`), but
+ * `Attachment.path`'s contract is a workspace fsPath — host-side
+ * `confineAttachmentPaths` (`src/host/backend/acp/attachments.ts`)
+ * `path.resolve()`s it against each workspace root. A raw URI string never
+ * resolves inside any root that way, so storing it verbatim gets the
+ * attachment silently dropped with a misleading "outside the workspace or
+ * secret-classified" outcome — fixed HERE, at the composer boundary, so
+ * confinement itself stays a pure fsPath-only contract (smaller blast
+ * radius than teaching it to accept URIs too).
+ *
+ * Grounded via Context7 (`/nodejs/node`, `url.fileURLToPath` doc, write-time):
+ * `new URL(uri).pathname` alone is NOT the fsPath — it stays
+ * percent-encoded (`file:///hello world` -> pathname `/hello%20world`,
+ * `file:///你好.txt` -> `/%E4%BD%A0%E5%A5%BD.txt`) — `decodeURIComponent`
+ * on top is required to get the real path back, exactly what
+ * `fileURLToPath` does internally. `url.fileURLToPath` itself is Node-only
+ * and unavailable here (this module runs in the webview's browser
+ * context), so this reimplements its POSIX case against the WHATWG `URL`
+ * global instead, which the webview host and jsdom both provide.
+ *
+ * POSIX-only (Fedora is the target platform): `file:///abs/path` has an
+ * empty authority; Node's own `fileURLToPath` treats a non-empty-host
+ * `file://` URI as a REMOTE/UNC form on POSIX and rejects it there — so a
+ * non-empty `url.hostname` here is deliberately left unhandled (returns
+ * `undefined`, falling through to the non-URI branch below) rather than
+ * guessed at.
+ *
+ * @returns the decoded fsPath, or `undefined` when `uri` is not a
+ *          recognizable local `file://` URI (caller falls back to storing
+ *          it verbatim, unchanged from before this fix).
+ */
+function fileUriToFsPath(uri: string): string | undefined {
+  if (!/^file:\/\//i.test(uri)) return undefined;
+  try {
+    const url = new URL(uri);
+    if (url.hostname) return undefined;
+    return decodeURIComponent(url.pathname);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Audit C-3 (Critical): every `ComposerSeed` object ever applied, by
  * reference. MODULE-scoped (not component-instance `useState`/`useRef`) on
  * purpose — this component unmounts whenever the user leaves the chat panel
@@ -468,6 +512,17 @@ export function Composer({
         .map((s) => s.trim())
         .filter((s) => s && !s.startsWith('#'))
         .forEach((u) => {
+          // CF-07: a `file://` URI is parsed to its fsPath before it's
+          // stored — `path` is already decoded in that case, so the name is
+          // taken from IT (not re-decoded, which would corrupt a filename
+          // that happens to contain a literal `%`). A non-URI drop is
+          // already an fsPath — unchanged prior behavior.
+          const fsPath = fileUriToFsPath(u);
+          if (fsPath !== undefined) {
+            const name = fsPath.split('/').pop() || fsPath;
+            onAttachAdd({ id: uid(), name, kind: 'file', path: fsPath });
+            return;
+          }
           const name = decodeURIComponent(u.split('/').pop() || u);
           onAttachAdd({ id: uid(), name, kind: 'file', path: u });
         });
