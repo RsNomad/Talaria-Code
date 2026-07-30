@@ -692,6 +692,14 @@ export class SessionController {
    * settlement handlers so a superseded attempt's belated settlement can
    * never clobber a newer attempt's already-landed terminal push (moved
    * off `AcpBackend.setModel`, then reworked for ARCH-1).
+   *
+   * D3/A8 partial close (W1-T9): the seq re-check alone does not cover a
+   * resolve landing after THIS controller died (`dispose()`) or was evicted
+   * (`getClient()` goes `undefined` without a formal dispose) — the resolve
+   * arm re-checks both, AFTER the seq guard, before treating the resolve as
+   * ground truth. Disposed stays silent (BF-B discipline — see the resolve
+   * arm's comment); evicted-but-alive emits the same corrective pair the
+   * `!client` entry guard above does.
    */
   setModel(id: string): void {
     const client = this.port.getClient();
@@ -709,6 +717,36 @@ export class SessionController {
     void client.setSessionModel(this.sessionId, id).then(
       () => {
         if (seq !== this.modelSwitchSeq) return; // superseded — the newer attempt owns the terminal push
+        // D3/A8 partial close (W1-T9): a resolve can land AFTER this
+        // controller died or was evicted mid-RPC — accepting it as ground
+        // truth here would be a FALSE "switched", emitted silently (today's
+        // bug). Split the two liveness failures deliberately, they are NOT
+        // interchangeable:
+        //  - disposed: stay as silent as every other BF-B liveness guard in
+        //    this file (`reportUndeliveredUtterance`, `emitApprovalCard`,
+        //    the `loadReplay` continuation, `dispose()` itself). By the time
+        //    a belated resolve lands here, `SessionRegistry.open`'s
+        //    same-sessionId replace (W6-FB) may already have minted a FRESH
+        //    controller sharing this same `port` — emitting would risk
+        //    clobbering THAT controller's already-landed state with this
+        //    dead one's stale `previous`. Suppressing `currentModelId` +
+        //    the success push below already closes the false-success bug;
+        //    no additional emit is needed or safe here.
+        //  - client evicted but NOT disposed: this controller is still
+        //    alive and visible to the user — the same case the entry guard
+        //    above (`!client`) already handles by emitting. Mirror it: an
+        //    honest, status-only error plus a snap-back `model.state` to
+        //    the model that was actually active before this attempt.
+        if (this.disposed) return;
+        if (!this.port.getClient()) {
+          this.port.emit({
+            type: 'error',
+            sessionId: this.sessionId,
+            message: "Couldn't confirm the model switch — the agent connection was lost.",
+          });
+          this.port.emit({ type: 'model.state', sessionId: this.sessionId, modelId: previous });
+          return;
+        }
         this.currentModelId = id;
         this.port.emit({ type: 'model.state', sessionId: this.sessionId, modelId: id });
       },

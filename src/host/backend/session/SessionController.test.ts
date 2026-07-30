@@ -304,6 +304,102 @@ describe('SessionController.setModel — ARCH-1 (final review, UI I-1): terminal
       modelId: 'B',
     });
   });
+
+  /**
+   * D3/A8 partial close (W1-T9): the pinned SDK coerces a `null`
+   * `unstable_setSessionModel` result (Hermes's "unknown session" answer)
+   * into `{}` — byte-identical to a genuine empty success — so the client
+   * cannot discriminate the two over a LIVE connection (that residual is a
+   * filed upstream ask, not closeable here). BUT a DIFFERENT, closeable slice
+   * exists: today's resolve handler assigns `currentModelId` and emits the
+   * success `model.state{id}` UNCONDITIONALLY, so a resolve landing AFTER
+   * this controller has died (`dispose()`) or been evicted (`getClient()`
+   * goes `undefined` without a formal dispose) emits a FALSE "switched" —
+   * silently, because nothing re-checks liveness on the happy path.
+   *
+   * `dispose()` case: the controller must stay as silent as every other
+   * BF-B liveness guard in this file (`reportUndeliveredUtterance`,
+   * `emitApprovalCard`, the `loadReplay` continuation, `dispose()` itself) —
+   * `SessionRegistry.open`'s same-sessionId replace (W6-FB) can already have
+   * minted a FRESH controller sharing this `port` by the time this resolve
+   * lands, so an emit here would risk clobbering the NEW controller's
+   * already-landed state with THIS dead controller's stale `previous`. No
+   * emit is the fail-safe choice, not a fail-silent one: the false success
+   * (`currentModelId` + the success push) is still fully suppressed.
+   */
+  it('a resolve landing AFTER dispose() must not assign currentModelId or emit anything (BF-B liveness discipline)', async () => {
+    let resolveRpc!: () => void;
+    const deferred = new Promise<void>((resolve) => {
+      resolveRpc = resolve;
+    });
+    const client = makeFakeClient(vi.fn().mockImplementation(() => deferred));
+    const { port, emitted } = makeControllerPort(client);
+    const controller = new SessionController('session-1', '/tmp/ws', port);
+    controller.currentModelId = 'A';
+
+    controller.setModel('B'); // RPC in flight
+    controller.dispose(); // controller dies WHILE the RPC is still in flight
+    resolveRpc(); // the RPC settles AFTER death
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // RED today: the resolve handler has no liveness check at all — it
+    // assigns `currentModelId = 'B'` and emits the success `model.state`
+    // unconditionally, even though the controller is dead.
+    expect(controller.currentModelId).toBe('A');
+    expect(emitted).toEqual([]);
+  });
+
+  /**
+   * The `getClient()`-goes-`undefined`-without-dispose case: the controller
+   * itself is still ALIVE (not disposed) — this is the entry guard's own
+   * `!client` scenario (:700 above), just discovered late instead of at
+   * call time. That existing guard already emits a corrective push in this
+   * exact situation, so the resolve arm mirrors it: an honest, status-only
+   * `error` plus a snap-back `model.state{previous}` — never the false
+   * success, and never a silent drop either (this controller is still very
+   * much live and visible to the user).
+   */
+  it('a resolve landing AFTER the client is evicted (controller still alive) emits a corrective model.state{previous} + status-only error, never the false success', async () => {
+    let resolveRpc!: () => void;
+    const deferred = new Promise<void>((resolve) => {
+      resolveRpc = resolve;
+    });
+    let client: AcpClientLike | undefined = makeFakeClient(vi.fn().mockImplementation(() => deferred));
+    const emitted: HostToWebviewMessage[] = [];
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => [],
+      refreshCheckpointsPanel: () => {},
+      editPreviewRegistry: undefined,
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', '/tmp/ws', port);
+    controller.currentModelId = 'A';
+
+    controller.setModel('B'); // RPC in flight, client still live at call time
+    client = undefined; // evicted mid-RPC — controller is NOT disposed
+    resolveRpc(); // the RPC settles AFTER eviction
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // RED today: the resolve handler assigns `currentModelId = 'B'` and
+    // emits the false success `model.state{modelId:'B'}` regardless.
+    expect(controller.currentModelId).toBe('A');
+    expect(emitted.some((m) => m.type === 'model.state' && m.modelId === 'B')).toBe(false);
+    const push = emitted.find(
+      (m): m is Extract<HostToWebviewMessage, { type: 'model.state' }> => m.type === 'model.state',
+    );
+    expect(push?.modelId).toBe('A');
+    expect(emitted.some((m) => m.type === 'error')).toBe(true);
+  });
 });
 
 /**
