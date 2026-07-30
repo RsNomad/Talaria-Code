@@ -693,13 +693,19 @@ export class SessionController {
    * never clobber a newer attempt's already-landed terminal push (moved
    * off `AcpBackend.setModel`, then reworked for ARCH-1).
    *
-   * D3/A8 partial close (W1-T9): the seq re-check alone does not cover a
-   * resolve landing after THIS controller died (`dispose()`) or was evicted
-   * (`getClient()` goes `undefined` without a formal dispose) — the resolve
-   * arm re-checks both, AFTER the seq guard, before treating the resolve as
-   * ground truth. Disposed stays silent (BF-B discipline — see the resolve
-   * arm's comment); evicted-but-alive emits the same corrective pair the
-   * `!client` entry guard above does.
+   * D3/A8 partial close (W1-T9), completed by W1-T9b: the seq re-check alone
+   * does not cover a settlement landing after THIS controller died
+   * (`dispose()`) or was evicted (`getClient()` goes `undefined` without a
+   * formal dispose) — the resolve arm re-checks both, AFTER the seq guard,
+   * before treating the resolve as ground truth; the reject arm re-checks
+   * `disposed` the same way (W1-T9b — `AcpClient.setSessionModel` races the
+   * RPC against `raceTermination`, so a reject can land for reasons other
+   * than child death, including after dispose). Disposed stays silent (BF-B
+   * discipline — see each arm's own comment); evicted-but-alive emits the
+   * same corrective pair the `!client` entry guard above does (the reject
+   * arm has no separate evicted-but-alive branch — an alive controller
+   * always reports a failed switch, whether or not the client happens to
+   * still be present).
    */
   setModel(id: string): void {
     const client = this.port.getClient();
@@ -752,6 +758,20 @@ export class SessionController {
       },
       (err: unknown) => {
         if (seq !== this.modelSwitchSeq) return;
+        // A8/D3 fast-follow (W1-T9b): mirrors the resolve arm's disposed
+        // guard above. `AcpClient.setSessionModel` races the RPC against
+        // `raceTermination`, so a reject can land for reasons OTHER than
+        // child death (a genuine protocol error) — including AFTER this
+        // controller died (`dispose()`), same as a resolve can. Stay silent
+        // here for the identical reason: `SessionRegistry.open`'s
+        // same-sessionId replace (W6-FB) may already have minted a FRESH
+        // controller sharing this `port`, and emitting would clobber THAT
+        // controller's already-landed state with this dead one's stale
+        // `model.state{previous}` through the shared host-wide emitter (the
+        // webview folds purely by `sessionId`). A still-ALIVE controller
+        // (this check false) must still report the failed switch below —
+        // that is this arm's actual job.
+        if (this.disposed) return;
         this.port.emit({ type: 'error', sessionId: this.sessionId, message: `Failed to switch model: ${errorMessage(err)}` });
         this.port.emit({ type: 'model.state', sessionId: this.sessionId, modelId: previous });
       },

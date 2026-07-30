@@ -353,6 +353,46 @@ describe('SessionController.setModel — ARCH-1 (final review, UI I-1): terminal
   });
 
   /**
+   * A8/D3 fast-follow (W1-T9b): review of the resolve-arm fix above (the
+   * test just before this one) flagged the SIBLING reject arm as having the
+   * IDENTICAL clobber hazard, UNGUARDED. `AcpClient.setSessionModel` races
+   * the RPC against `raceTermination`, so it can REJECT for reasons OTHER
+   * than child death (a genuine protocol error) — meaning a reject can land
+   * on a controller that was DISPOSED via the W6-FB same-sessionId-reopen
+   * path just as easily as a resolve can. Same fail-safe posture as the
+   * resolve arm applies for the identical reason: `SessionRegistry.open`'s
+   * same-sessionId replace may already have minted a FRESH controller
+   * sharing this dead controller's `port` by the time this reject lands —
+   * emitting the stale `model.state{previous}` (+ `error`) through the
+   * shared host-wide emitter would clobber that fresh controller's
+   * already-landed state, folded purely by `sessionId` in the webview.
+   */
+  it('a reject landing AFTER dispose() must emit nothing (BF-B liveness discipline, reject arm)', async () => {
+    let rejectRpc!: (err: unknown) => void;
+    const deferred = new Promise<void>((_resolve, reject) => {
+      rejectRpc = reject;
+    });
+    const client = makeFakeClient(vi.fn().mockImplementation(() => deferred));
+    const { port, emitted } = makeControllerPort(client);
+    const controller = new SessionController('session-1', '/tmp/ws', port);
+    controller.currentModelId = 'A';
+
+    controller.setModel('B'); // RPC in flight
+    controller.dispose(); // controller dies WHILE the RPC is still in flight
+    rejectRpc(new Error('unknown model')); // the RPC settles AFTER death
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // RED today: the reject handler only re-checks `seq` — it has no
+    // liveness (`this.disposed`) check at all, so it emits the stale
+    // `error` + corrective `model.state{previous}` unconditionally, even
+    // though the controller is dead.
+    expect(emitted).toEqual([]);
+  });
+
+  /**
    * The `getClient()`-goes-`undefined`-without-dispose case: the controller
    * itself is still ALIVE (not disposed) — this is the entry guard's own
    * `!client` scenario (:700 above), just discovered late instead of at
