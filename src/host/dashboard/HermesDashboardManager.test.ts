@@ -480,6 +480,68 @@ describe('HermesDashboardManager.ensure — P4a: no spawned-child leak on a post
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CF-15 (L6 I-9): ensure() must invalidate its success memo after a
+// POST-READY child death — otherwise the Skills/Tools panel's "Retry" hands
+// back the dead client forever, with no recovery short of a window reload.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('HermesDashboardManager.ensure — CF-15: re-checks child liveness before trusting the memo', () => {
+  it('a child that dies AFTER a successful bring-up forces the next ensure() to re-bring-up a fresh client, not return the dead one', async () => {
+    // A mutable-liveness fake (unlike `fakeChild`'s fixed boolean) so we can
+    // simulate the child dying AFTER `ensure()` already resolved successfully.
+    let firstChildAlive = true;
+    const firstChild: DashboardChild & { killed: boolean } = {
+      killed: false,
+      kill() {
+        this.killed = true;
+      },
+      alive: () => firstChildAlive,
+    };
+    const secondChild = fakeChild(true);
+
+    const firstClient = fakeClient({ probeSeq: [true] });
+    const secondClient = fakeClient({ probeSeq: [true] });
+
+    const spawnCalls: string[] = [];
+    let makeClientCallCount = 0;
+
+    const manager = new HermesDashboardManager({
+      config: {},
+      port: 9119,
+      probeBackoffMs: [1],
+      deps: {
+        makeClient: () => {
+          makeClientCallCount++;
+          return makeClientCallCount === 1 ? firstClient : secondClient;
+        },
+        spawn: async (token) => {
+          spawnCalls.push(token);
+          return spawnCalls.length === 1 ? firstChild : secondChild;
+        },
+        sleep: async () => {},
+        mintToken: () => 'minted-token',
+      },
+    });
+
+    const first = await manager.ensure();
+    expect(first).toBe(firstClient);
+    expect(spawnCalls.length).toBe(1);
+
+    // The spawned backend crashes AFTER the successful bring-up. `ensure()` is
+    // memoized on success — without the fix, the next call just returns the
+    // cached (dead) `firstClient` forever; the Retry button is a no-op.
+    firstChildAlive = false;
+
+    const second = await manager.ensure();
+
+    expect(spawnCalls.length).toBe(2); // re-brought-up a fresh child, not reused the dead memo
+    expect(second).toBe(secondClient); // a FRESH client...
+    expect(second).not.toBe(first); // ...never the dead one
+    expect(firstChild.killed).toBe(true); // the dead child is torn down, not just abandoned
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // T-B2 — dashboard liveness fail-open (closes V-9)
 // ─────────────────────────────────────────────────────────────────────────────
 //

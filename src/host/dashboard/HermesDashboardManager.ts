@@ -142,6 +142,24 @@ export class HermesDashboardManager implements DashboardService {
 
   ensure(): Promise<DashboardClientLike> {
     if (this.disposed) return Promise.reject(new Error('HermesDashboardManager: disposed'));
+    // CF-15: a previously memoized bring-up (`this.ready` already resolved)
+    // can go stale when the child dies AFTER we started trusting it — e.g. the
+    // spawned Hermes backend crashes post-ready. Without this re-check, the
+    // Skills/Tools panel's "Retry" would call `ensure()` and get the SAME dead
+    // client back forever (the memo only clears on a bring-up REJECTION, never
+    // on a later liveness change). Detect that here, before the memo check,
+    // and clear the same fields `dispose()` clears — `kill()` is idempotent
+    // (a no-op on an already-dead child) so this mirrors that path exactly
+    // rather than hand-rolling a partial reset.
+    if (this.child && !this.child.alive()) {
+      try {
+        this.child.kill();
+      } catch (err) {
+        this.log(`failed to kill dead dashboard child: ${errorMessage(err)}`);
+      }
+      this.child = undefined;
+      this.ready = undefined;
+    }
     if (!this.ready) {
       this.ready = this.bringUp().catch((err) => {
         // Clear the memo so the NEXT panel fetch (Retry) re-attempts adopt/spawn
