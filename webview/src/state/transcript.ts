@@ -49,6 +49,41 @@ function closeOpenMessages(list: TranscriptItem[]): TranscriptItem[] {
 }
 
 /**
+ * CF-06 (R2 — "settled is enumerated, not derived"): the ONE place every
+ * still-open/streaming transcript-item kind is settled, used on an ABNORMAL
+ * `turn.end` (any status other than `'complete'` — see that arm's own
+ * deliberate no-fold below, T-A1 owner fork, left unchanged). Before this
+ * fix, settling was enumerated per-kind: `closeOpenMessages` settled only
+ * `message`, and the turn.end fold mapped only `tool`/`approval` — a
+ * streaming `reasoning` block fell through BOTH and never settled on an
+ * abnormal turn.end, leaving an eternal "Thinking" spinner and its 10 Hz
+ * `setInterval` (`ReasoningBlock.tsx`, keyed on `item.streaming`). Every
+ * open/streaming kind is enumerated HERE, in one function, so a FUTURE
+ * streaming kind added to `TranscriptItem` is a single-site fix, not a fresh
+ * miss (see the trip-wire test in transcript.test.ts). `closeOpenMessages`
+ * above is UNCHANGED and keeps its own separate MID-TURN role (closing a
+ * prior message block when a new reasoning/tool/approval/plan/result block
+ * starts) — this function only takes over the turn-END settle.
+ */
+function settleOpenItems(list: TranscriptItem[]): TranscriptItem[] {
+  return list.map((item) => {
+    if (item.kind === 'message' && item.streaming) {
+      return { ...item, streaming: false };
+    }
+    if (item.kind === 'reasoning' && item.streaming) {
+      return { ...item, streaming: false };
+    }
+    if (item.kind === 'tool' && (item.status === 'pending' || item.status === 'running')) {
+      return { ...item, status: 'interrupted' as const };
+    }
+    if (item.kind === 'approval' && item.settledOutcome === undefined) {
+      return { ...item, settledOutcome: 'cancelled' as const };
+    }
+    return item;
+  });
+}
+
+/**
  * T-A1 (V-7): the first option of the given kind, or undefined if the
  * approval carries none (never fabricated). Mirrors the host's own
  * `findOptionId` (`SessionController.ts`) so the webview's optimistic
@@ -94,31 +129,23 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       return { ...tab, transcript: [], plan: [], turnActive: false, error: undefined };
 
     case 'turn.end': {
-      const transcript = closeOpenMessages(tab.transcript);
       if (msg.status === 'complete') {
-        // T-A1 owner fork: NO fold on a complete turn — a tool/approval
-        // still open after `status: 'complete'` is a host bug better left
-        // visible than papered over client-side.
-        return { ...tab, turnActive: false, transcript };
+        // T-A1 owner fork: NO fold on a complete turn — a tool/approval (or,
+        // by the same fork, a reasoning block) still open after
+        // `status: 'complete'` is a host bug better left visible than
+        // papered over client-side. `closeOpenMessages` still runs its own
+        // narrower MID-TURN role here (settling only a still-streaming
+        // `message` block) — unchanged, pre-dates this fork.
+        return { ...tab, turnActive: false, transcript: closeOpenMessages(tab.transcript) };
       }
-      // V-5/V-4: the webview mirror of the host's `markSubagentsInterrupted`
-      // — a turn ending anything other than `'complete'` means nothing is
-      // still running in THIS session (one live turn per session), so every
-      // still-open tool card and unsettled approval card must stop lying
-      // about being live.
-      return {
-        ...tab,
-        turnActive: false,
-        transcript: transcript.map((item) => {
-          if (item.kind === 'tool' && (item.status === 'pending' || item.status === 'running')) {
-            return { ...item, status: 'interrupted' as const };
-          }
-          if (item.kind === 'approval' && item.settledOutcome === undefined) {
-            return { ...item, settledOutcome: 'cancelled' as const };
-          }
-          return item;
-        }),
-      };
+      // V-5/V-4 + CF-06/R2: the webview mirror of the host's
+      // `markSubagentsInterrupted` — a turn ending anything other than
+      // `'complete'` means nothing is still running in THIS session (one
+      // live turn per session), so EVERY still-open/streaming transcript
+      // item — message, reasoning, tool, approval alike — must stop lying
+      // about being live. Derived in one place (settleOpenItems) instead of
+      // enumerated per-kind here.
+      return { ...tab, turnActive: false, transcript: settleOpenItems(tab.transcript) };
     }
 
     case 'user': {

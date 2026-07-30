@@ -1797,6 +1797,73 @@ describe('transcript reducer — T-A1 (audit-2 Cluster A, M3): webview authorita
   });
 });
 
+describe('transcript reducer — CF-06 / R2: settleOpenItems — settling every open/streaming kind is DERIVED in one place, not enumerated per-kind', () => {
+  it('RED: turn.end{status:"error"} settles a still-streaming reasoning block (pre-fix: closeOpenMessages only settles "message", and the turn.end fold only mapped tool/approval — a streaming reasoning block fell through both and stayed streaming:true forever, the eternal "Thinking" spinner)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    expect(activeTab(state).transcript.find((i) => i.kind === 'reasoning')).toMatchObject({ streaming: true });
+
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'error' });
+
+    const reasoning = activeTab(state).transcript.find((i) => i.kind === 'reasoning');
+    expect(reasoning).toMatchObject({ blockId: 'r1', streaming: false });
+  });
+
+  it('trip-wire: an abnormal turn.end with one OPEN item of every streaming/settleable kind (message, reasoning, tool, approval) leaves NONE streaming/open — a future streaming kind that forgets to plug into settleOpenItems fails HERE, not in a per-kind test nobody wrote', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    // Order matters: each of tool.start/approval.request/reasoning.start
+    // closes any PRIOR open message block (closeOpenMessages' mid-turn role,
+    // deliberately kept) — so the message block is opened LAST, after every
+    // other kind, to land all four open simultaneously.
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tool-1',
+      kind: 'execute',
+      title: 'run: npm test',
+      status: 'running',
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      kind: 'command',
+      title: 'Run: npm test',
+      options: [{ id: 'allow', label: 'Allow', kind: 'allow_once' }],
+    });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'partial answer' });
+
+    // Confirm the precondition non-vacuously: all four ARE open before turn.end.
+    const before = activeTab(state).transcript;
+    expect(before).toHaveLength(4);
+    const beforeApproval = before.find((i) => i.kind === 'approval');
+    expect(before.find((i) => i.kind === 'tool')).toMatchObject({ status: 'running' });
+    expect(beforeApproval?.kind === 'approval' ? beforeApproval.settledOutcome : 'wrong-kind').toBeUndefined();
+    expect(before.find((i) => i.kind === 'reasoning')).toMatchObject({ streaming: true });
+    expect(before.find((i) => i.kind === 'message')).toMatchObject({ streaming: true });
+
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'error' });
+
+    const after = activeTab(state).transcript;
+    expect(after).toHaveLength(4);
+    for (const item of after) {
+      if (item.kind === 'message' || item.kind === 'reasoning') {
+        expect(item.streaming).toBe(false);
+      }
+      if (item.kind === 'tool') {
+        expect(item.status).not.toBe('pending');
+        expect(item.status).not.toBe('running');
+      }
+      if (item.kind === 'approval') {
+        expect(item.settledOutcome).not.toBeUndefined();
+      }
+    }
+  });
+});
+
 describe('transcript reducer — audit-3 Code Important: message.end must not duplicate pre-tool text on an interleaved (say→tool→say) turn', () => {
   /** Host contract (turnTranslator.ts:39-49, pinned by turnTranslator.test.ts):
    * ONE message.end per turn, carrying the FULL accumulated turn buffer. On a
