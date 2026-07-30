@@ -160,6 +160,30 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
     expect(posted).toEqual([{ type: 'control.response', requestId: 42, ok: true, result: { tools: [] } }]);
   });
 
+  it('SEC-4 (audit-3 B-3): redacts credential-shaped fields in a config.show result before posting to the webview', async () => {
+    const invokeControl = vi
+      .fn()
+      .mockResolvedValue({ mcp_servers: [{ name: 'x', env: { API_KEY: 'sk-secret-123' } }], theme: 'dark' });
+    const { provider, posted } = makeProvider(invokeControl);
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 9,
+      method: 'config.show',
+      params: undefined,
+    });
+    await flush();
+
+    expect(posted).toEqual([
+      {
+        type: 'control.response',
+        requestId: 9,
+        ok: true,
+        result: { mcp_servers: [{ name: 'x', env: '[redacted]' }], theme: 'dark' },
+      },
+    ]);
+  });
+
   it('echoes an ok:false control.response carrying the rejection message on the same requestId', async () => {
     const invokeControl = vi.fn().mockRejectedValue(new Error('The agent session is not started yet.'));
     const { provider, posted } = makeProvider(invokeControl);

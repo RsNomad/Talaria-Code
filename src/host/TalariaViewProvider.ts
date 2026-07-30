@@ -18,6 +18,7 @@ import type { FindFilesFn } from './context/searchFilesResponse';
 import { buildDiffUriParts } from './preview/parseDiffUri';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
 import type { NextEditToggleState } from '../shared/protocol';
+import { redactControlResponse } from './redactControlResponse';
 
 /** Fixed brand accent (teal), layered over `--vscode-*` surfaces in the view. */
 const BRAND_ACCENT = '#14b8a6';
@@ -624,7 +625,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
           : method === 'context.searchFiles'
             ? await this.handleSearchFiles(params)
             : await this.backend.invokeControl(method, params);
-      this.postToWebview({ type: 'control.response', requestId, ok: true, result });
+      this.postToWebview({ type: 'control.response', requestId, ok: true, result: redactControlResponse(method, result) });
     } catch (err) {
       this.logger?.appendLine(`[control.request] ${method} failed: ${String(err)}`);
       this.postToWebview({
