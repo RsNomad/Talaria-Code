@@ -354,3 +354,63 @@ describe('ControlChannel crash-respawn', () => {
     expect(transports).toHaveLength(1); // no respawn after dispose
   });
 });
+
+describe('ControlChannel respawn/dispose races (CF-01 / L6 I-4, I-5)', () => {
+  it('start() during an armed respawn backoff timer leaves no stale timer to double-spawn', async () => {
+    vi.useFakeTimers();
+    try {
+      const { factory, transports } = makeFactory();
+      const channel = new ControlChannel(CONFIG, undefined, factory);
+
+      const startPromise = channel.start();
+      await flushMicrotasksFake();
+      must(transports[0]).emit('event', GATEWAY_READY);
+      await startPromise;
+
+      // Crash schedules a respawn attempt at 500ms (respawnBackoffMs(1)).
+      must(transports[0]).exit(1);
+      expect(transports).toHaveLength(1);
+
+      // Well before the backoff elapses, an explicit start() re-arms a fresh
+      // spawn attempt of its own (state is 'respawning', not 'ready', so
+      // start() proceeds rather than returning early).
+      await vi.advanceTimersByTimeAsync(100);
+      const restartPromise = channel.start();
+      await flushMicrotasksFake();
+      expect(transports).toHaveLength(2); // the explicit start()'s spawn
+
+      // Advance PAST the ORIGINAL 500ms backoff deadline (100 + 500 = 600).
+      // A stale (uncleared) respawn timer fires attemptRespawn() here and
+      // spawns a THIRD transport — that's the bug: start() must clear
+      // `respawnTimer` so this stale callback never runs.
+      await vi.advanceTimersByTimeAsync(500);
+      expect(transports).toHaveLength(2); // stale timer must NOT double-spawn
+
+      must(transports[1]).emit('event', GATEWAY_READY);
+      await restartPromise;
+      channel.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('dispose() during the ready handshake does not resurrect to ready and disposes the freshly-spawned transport', async () => {
+    const { factory, transports } = makeFactory();
+    const channel = new ControlChannel(CONFIG, undefined, factory);
+
+    const startPromise = channel.start();
+    await flushMicrotasks();
+    expect(transports).toHaveLength(1);
+
+    // dispose() races the in-flight handshake — the ready event arrives
+    // AFTER dispose() has already run.
+    channel.dispose();
+    must(transports[0]).emit('event', GATEWAY_READY);
+
+    await expect(startPromise).rejects.toThrow(/disposed/i);
+    expect(must(transports[0]).disposed).toBe(true); // no orphaned child
+
+    // Must stay disposed — never resurrected to 'ready' by the late handshake.
+    await expect(channel.dispatch('tools.list')).rejects.toThrow(/disposed/i);
+  });
+});

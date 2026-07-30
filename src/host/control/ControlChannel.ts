@@ -100,6 +100,13 @@ export class ControlChannel {
 
   /** Spawn `python -m tui_gateway.entry` and await the `gateway.ready` event. */
   async start(): Promise<void> {
+    // CF-01/I-4: an explicit (re)start replaces any pending respawn retry —
+    // mirrors `ConnectionSupervisor.startInternal`'s `clearAcpRespawnTimer()`
+    // first act. Without this, a `start()` issued while a crash-respawn
+    // backoff is armed leaves the stale timer live; it later fires
+    // `attemptRespawn()` on top of the spawn `start()` just kicked off,
+    // double-spawning the control child.
+    this.clearRespawnTimer();
     if (this.state === 'disposed') {
       throw new Error('ControlChannel: disposed');
     }
@@ -147,10 +154,7 @@ export class ControlChannel {
 
   dispose(): void {
     this.state = 'disposed';
-    if (this.respawnTimer) {
-      clearTimeout(this.respawnTimer);
-      this.respawnTimer = undefined;
-    }
+    this.clearRespawnTimer();
     this.transportEventSub?.dispose();
     this.transportExitSub?.dispose();
     this.transportEventSub = undefined;
@@ -165,6 +169,13 @@ export class ControlChannel {
   /** Resolve the runtime, spawn the transport, and await the ready handshake. */
   private async spawnAndAwaitReady(): Promise<void> {
     const resolved = await resolveHermes(this.config);
+    // CF-01/I-5: `dispose()` can fire while `resolveHermes()` is in flight
+    // (before any transport exists) — don't spawn a process for a channel
+    // that's already gone.
+    if (this.state === 'disposed') {
+      throw new Error('ControlChannel: disposed');
+    }
+
     const transport = this.createTransport({
       command: resolved.control.command,
       args: resolved.control.args,
@@ -187,6 +198,27 @@ export class ControlChannel {
       throw err;
     }
 
+    // CF-01/I-5: `dispose()` racing THIS exact await — it fires after the
+    // transport is spawned and subscribed but before the handshake settles —
+    // must not be resurrected by a late `gateway.ready`. Mirrors
+    // `HermesDashboardManager.bringUp()`'s post-await disposed re-checks:
+    // abort and dispose the just-spawned transport instead of publishing it
+    // as `'ready'`, so a disposed channel stays disposed and no child is
+    // orphaned. Cast breaks tsc's (incorrect, for real async re-entrancy)
+    // control-flow narrowing carried over from the `!== 'disposed'` check
+    // above the `await` — same idiom as `ConnectionSupervisor.ts`'s
+    // `(this.acpState as string) !== 'disposed'`.
+    if ((this.state as ControlChannelState) === 'disposed') {
+      eventSub.dispose();
+      transport.dispose();
+      throw new Error('ControlChannel: disposed');
+    }
+
+    // Defensive: don't orphan a still-assigned prior transport. Normal
+    // crash/dispose paths already clear `this.transport` before a new
+    // `spawnAndAwaitReady()` attempt begins, but this keeps that invariant
+    // even if a future caller of this method doesn't.
+    this.transport?.dispose();
     this.transport = transport;
     this.transportEventSub = eventSub;
     this.transportExitSub = transport.onExit((code) => this.handleCrash(code));
@@ -289,6 +321,12 @@ export class ControlChannel {
 
   private attemptRespawn(): void {
     if (this.state === 'disposed') return;
+    // CF-01/I-4: guard against firing on top of an already-pending spawn
+    // (an explicit `start()` may have raced this timer into the same
+    // `respawning` window) or a channel that already reconnected — only
+    // `disposed` was checked before, which let a stale/duplicate timer fire
+    // `spawnAndAwaitReady()` a second time.
+    if (this.pendingReady || this.state === 'ready') return;
     this.state = 'respawning';
     this.pendingReady = this.spawnAndAwaitReady()
       .catch((err) => {
@@ -304,6 +342,14 @@ export class ControlChannel {
     // warning (any external `start()` caller that captured this same
     // promise before it was replaced still observes the rejection).
     this.pendingReady.catch(() => {});
+  }
+
+  /** Mirrors `ConnectionSupervisor.clearAcpRespawnTimer()`. */
+  private clearRespawnTimer(): void {
+    if (this.respawnTimer) {
+      clearTimeout(this.respawnTimer);
+      this.respawnTimer = undefined;
+    }
   }
 
   private log(message: string): void {
