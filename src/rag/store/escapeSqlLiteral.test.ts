@@ -28,4 +28,14 @@ describe('escapeSqlLiteral', () => {
     expect(escapeSqlLiteral('typescript')).toBe('typescript');
     expect(escapeSqlLiteral('')).toBe('');
   });
+
+  it('leaves a backslash literal and still doubles an adjacent quote (no backslash-escape breakout)', () => {
+    // A lone backslash is a LITERAL backslash — DataFusion/LanceDB SQL has no
+    // backslash string-escape, so it must pass through unchanged.
+    expect(escapeSqlLiteral('a\\b')).toBe('a\\b');
+    // The security-relevant case: a backslash immediately before a quote must
+    // NOT be treated as a MySQL-style `\'` escape. The quote is still doubled,
+    // so a `\'`-prefixed payload cannot close the surrounding literal early.
+    expect(escapeSqlLiteral("ts\\' OR 1=1 --")).toBe("ts\\'' OR 1=1 --");
+  });
 });
