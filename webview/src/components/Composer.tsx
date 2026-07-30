@@ -277,6 +277,16 @@ export function Composer({
 
   const rootRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  /**
+   * CF-02: belt for the compositionstart/compositionend event-order gap
+   * (`onKeyDown` below). `nativeEvent.isComposing`/`keyCode === 229` are the
+   * primary per-keystroke IME signals, but the confirming keydown and
+   * `compositionend` are not guaranteed to fire in the same order across
+   * browsers — this ref is set true on `compositionstart` and flips false
+   * ONLY once `compositionend` actually fires, so it stays a reliable third
+   * signal even on a keydown where both nativeEvent flags are silent.
+   */
+  const composingRef = useRef(false);
   const presetWrapRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -659,6 +669,22 @@ export function Composer({
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // CF-02: an IME (CJK input, accented-character compose sequences, …)
+    // sends its OWN Enter to COMMIT the in-flight composition — that keydown
+    // must never reach either Enter/Tab consumer below (the suggest-menu
+    // pick dispatch just below, or the submit branch at the bottom), or a
+    // half-composed draft gets sent / a suggestion gets committed out from
+    // under the user. Three ORed signals, per the grounding in
+    // `Composer.dom.test.tsx`: `nativeEvent.isComposing` (the modern,
+    // per-keystroke check), `nativeEvent.keyCode === 229` (some browsers,
+    // e.g. Safari, can already report `isComposing === false` on the
+    // confirming keydown), and `composingRef` (belt for the compositionend/
+    // confirming-keydown event-order gap — set on `onCompositionStart`/
+    // `onCompositionEnd` on the textarea below). Deliberately scoped to
+    // Enter/Tab only — Arrow/Escape navigation is unaffected. No
+    // `preventDefault()` here: while composing, the browser/IME owns Enter.
+    const composing = e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current;
+    if (composing && (e.key === 'Enter' || e.key === 'Tab')) return;
     // The ONE shared reducer (useSuggest.onKeyDown) handles Arrow/Enter/Tab/
     // Esc for whichever trigger is open — `@` and `/` can never both be open
     // at once (one caret position can't sit inside two different open
@@ -879,6 +905,15 @@ export function Composer({
             }}
             onKeyDown={onKeyDown}
             onPaste={onPaste}
+            // CF-02: the composingRef belt onKeyDown consults above — set
+            // true for the whole span an IME composition is open, false only
+            // once it actually ends.
+            onCompositionStart={() => {
+              composingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              composingRef.current = false;
+            }}
             className="w-full resize-none overflow-y-auto bg-transparent px-3 py-2 text-[12.5px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:cursor-not-allowed disabled:opacity-60"
           />
         </div>

@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { useState } from 'react';
+import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { Composer } from './Composer';
 import type { ComposerSeed } from '../composer/applySeed';
 import type { Attachment, CustomModeInfo, EditPolicyPreset } from '../protocol';
@@ -376,5 +378,137 @@ describe('B5: state-bearing chips carry a dynamic aria-label (title alone is unr
     const updated = screen.getByRole('button', { name: 'Model: claude-sonnet' });
     expect(updated).toHaveAttribute('aria-label', 'Model: claude-sonnet');
     expect(screen.queryByRole('button', { name: 'Model: gpt-5-mini' })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * CF-02 (L1 UIUX-I1): IME composition guard. Before this task the composer
+ * had ZERO isComposing/keyCode-229/compositionstart-end handling anywhere
+ * (`grep -rn "isComposing\|keyCode\|229\|compositionend" webview/src` → 0
+ * hits) — so the Enter an IME sends to COMMIT a composition (Japanese/
+ * Chinese/Korean input, accented-character compose sequences, …) was
+ * indistinguishable from the user's own "send" Enter: it fired `submit()`
+ * with a half-composed draft and destroyed the in-flight composition. EVERY
+ * Enter/Tab consumer in `onKeyDown` — the main submit branch and the shared
+ * `useSuggest` mention/slash commit path — must ignore the key while
+ * composing.
+ *
+ * Grounded (fetched this task): `nativeEvent.isComposing` is the modern
+ * per-keystroke signal (Chromium/Firefox, confirming Enter); `keyCode === 229`
+ * is the historical IME sentinel some browsers still need — Safari can
+ * already report `isComposing === false` on the very keydown that confirms
+ * the conversion (see e.g. https://dev.to/yukimi-inu/why-16-billion-east-asians-are-quietly-raging-at-your-enter-key-handler-1po0,
+ * fetched this task). A `compositionstart`/`compositionend` ref is a THIRD
+ * belt: event ORDER across the confirming keydown and `compositionend` is not
+ * guaranteed cross-browser (https://dev.to/greymothjp/the-enter-key-that-fires-while-youre-still-typing-goo,
+ * fetched this task), so neither nativeEvent flag alone is trustworthy in
+ * every case. The fix ORs all three signals rather than trusting any one.
+ */
+function renderComposerForIME(overrides: {
+  onSubmit?: (text: string, attachments?: Attachment[], mentions?: unknown[]) => void;
+} = {}) {
+  const onSubmit = overrides.onSubmit ?? vi.fn();
+
+  function StatefulComposer() {
+    const [draft, setDraft] = useState('');
+    return (
+      <Composer
+        tabId="tab-1"
+        draft={draft}
+        draftAttachments={[]}
+        onDraftChange={setDraft}
+        onAttachAdd={() => undefined}
+        onAttachRemove={() => undefined}
+        preset="normal"
+        modelLabel="test-model"
+        busy={false}
+        disabled={false}
+        activeModeId={null}
+        availableModes={[]}
+        onSetMode={async () => undefined}
+        initialHeight={120}
+        onHeightChange={() => undefined}
+        onSubmit={onSubmit}
+        onCancel={() => undefined}
+        onSetPreset={async () => undefined}
+        onPickModel={() => undefined}
+        onNewSession={() => undefined}
+        availableCommands={[]}
+        searchFiles={async () => []}
+        pendingSeed={null}
+        onSeedApplied={() => undefined}
+      />
+    );
+  }
+
+  render(<StatefulComposer />);
+  return { onSubmit };
+}
+
+describe('CF-02: Enter/Tab are ignored while an IME composition is in flight', () => {
+  it('a keydown Enter whose nativeEvent.isComposing===true does NOT submit', () => {
+    const { onSubmit } = renderComposerForIME();
+    const textarea = screen.getByRole('combobox');
+
+    fireEvent.change(textarea, { target: { value: 'にほんご' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', isComposing: true });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('a normal Enter (isComposing false) still submits — the guard is not overbroad', () => {
+    const { onSubmit } = renderComposerForIME();
+    const textarea = screen.getByRole('combobox');
+
+    fireEvent.change(textarea, { target: { value: 'hello world' } });
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit).toHaveBeenCalledWith('hello world', undefined, undefined);
+  });
+
+  it('the keyCode===229 legacy IME sentinel also blocks submit (the Safari path, isComposing already false)', () => {
+    const { onSubmit } = renderComposerForIME();
+    const textarea = screen.getByRole('combobox');
+
+    fireEvent.change(textarea, { target: { value: 'weird safari state' } });
+    fireEvent.keyDown(textarea, { key: 'Enter', isComposing: false, keyCode: 229 });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('the shared suggest-menu Enter commit path also ignores a composing Enter (menu stays open, nothing picked)', async () => {
+    const user = userEvent.setup();
+    const { onSubmit } = renderComposerForIME();
+    const textarea = screen.getByRole('combobox');
+
+    await user.type(textarea, '@');
+    expect(textarea).toHaveAttribute('aria-expanded', 'true');
+
+    fireEvent.keyDown(textarea, { key: 'Enter', isComposing: true });
+
+    // A real (non-composing) Enter here would COMMIT the top mention item
+    // ("File") — rewriting the draft to `@file:` and drilling into the file
+    // submenu (see Composer.tsx's `pickMention`). Composing must leave the
+    // draft untouched and must not submit either.
+    expect(textarea).toHaveValue('@');
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('the compositionstart/compositionend ref is a belt: it blocks Enter even when nativeEvent itself stays silent, and un-blocks after compositionend', () => {
+    const { onSubmit } = renderComposerForIME();
+    const textarea = screen.getByRole('combobox');
+
+    fireEvent.change(textarea, { target: { value: 'ok now' } });
+    fireEvent.compositionStart(textarea);
+    // A confirming Enter mid-composition with NEITHER nativeEvent signal set
+    // — only the ref (flipped true by compositionstart, above) can catch this.
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(textarea);
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit).toHaveBeenCalledWith('ok now', undefined, undefined);
   });
 });
