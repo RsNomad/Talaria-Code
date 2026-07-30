@@ -118,6 +118,15 @@ export class JsonRpcStdio implements Disposable {
       this.log(`[stderr] ${chunk.replace(/\n$/, '')}`),
     );
 
+    // I-7: a write against a stdin whose child already died surfaces as an
+    // async 'error' on the stream (e.g. EPIPE). With no listener, Node
+    // throws it as an unhandled 'error' event — a process-level crash.
+    // Mirrors gitProcess.ts's EPIPE guard. Log status/message only, never
+    // the frame body (could carry a secret).
+    this.child.stdin?.on('error', (err: NodeJS.ErrnoException) =>
+      this.log(`[warn] stdin error: ${err.code ?? ''} ${err.message}`.trim()),
+    );
+
     this.child.on('error', (err) =>
       this.rejectAll(new Error(`child process error: ${String(err)}`)),
     );
@@ -247,7 +256,16 @@ export class JsonRpcStdio implements Disposable {
     this.log(`← ${line}`);
     let frame: JsonRpcResponseFrame | JsonRpcNotificationFrame;
     try {
-      frame = JSON.parse(line);
+      const parsed: unknown = JSON.parse(line);
+      // I-6: `42`, `null`, `"str"`, `true` are all valid JSON, but none of
+      // them are objects — `'id' in parsed` throws a TypeError on a
+      // primitive. Warn-drop down the SAME path as a non-JSON parse
+      // failure instead of letting that throw escape the handler.
+      if (typeof parsed !== 'object' || parsed === null) {
+        this.log(`[warn] non-object stdout frame dropped: ${line}`);
+        return;
+      }
+      frame = parsed as JsonRpcResponseFrame | JsonRpcNotificationFrame;
     } catch {
       this.log(`[warn] non-JSON stdout line dropped: ${line}`);
       return;

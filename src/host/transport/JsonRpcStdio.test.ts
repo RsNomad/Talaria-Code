@@ -122,3 +122,87 @@ describe('JsonRpcStdio.onStdout — B-4 (SEC-6): cap the residual (post-drain) s
     await expect(pending).resolves.toBe('pong');
   });
 });
+
+/**
+ * CF-16 / L6 I-6: `42`, `null`, `"str"`, `true` are all VALID JSON, so
+ * `JSON.parse` happily returns them — but they are not objects, and the
+ * response-frame check does `'id' in frame`. The `in` operator throws a
+ * `TypeError` on a non-object right-hand side (`'id' in 42`), so a
+ * primitive frame from the child crashed `onStdout` instead of being
+ * dropped like any other malformed line. The fix extends the existing
+ * parse-failure guard to also catch `typeof frame !== 'object' ||
+ * frame === null`, warn-dropping down the SAME path — never reaching the
+ * `in` check.
+ */
+describe("JsonRpcStdio.handleFrame — I-6: primitive JSON frames are warn-dropped, not thrown", () => {
+  it('does not throw on a bare-number frame, and still processes a valid frame in the same chunk', async () => {
+    const logged: string[] = [];
+    const { child, stdout } = makeFakeChild();
+    vi.mocked(spawn).mockReturnValue(child);
+    const transport = new JsonRpcStdio({
+      command: 'python',
+      args: ['-m', 'tui_gateway.entry'],
+      logger: { append: (line) => logged.push(line) },
+    });
+
+    const pending = transport.request('ping');
+    await flush();
+
+    // A primitive JSON frame (`42`) immediately followed by a genuine
+    // response frame for the pending request, in ONE stdout chunk — the
+    // primitive must not stop the valid frame after it from processing.
+    expect(() => {
+      stdout.emit(
+        'data',
+        `42\n${JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'pong' })}\n`,
+      );
+    }).not.toThrow();
+
+    await expect(pending).resolves.toBe('pong');
+    expect(logged.some((l) => /warn/i.test(l) && /dropped/i.test(l))).toBe(true);
+  });
+
+  it.each([
+    ['null', 'null'],
+    ['a bare string', '"str"'],
+    ['a bare boolean', 'true'],
+  ])('does not throw on %s frame', async (_label, primitiveJson) => {
+    const { child, stdout } = makeFakeChild();
+    vi.mocked(spawn).mockReturnValue(child);
+    new JsonRpcStdio({ command: 'python', args: ['-m', 'tui_gateway.entry'] });
+
+    expect(() => stdout.emit('data', `${primitiveJson}\n`)).not.toThrow();
+    await flush();
+  });
+});
+
+/**
+ * CF-16 / L6 I-7: a write against a dead child's stdin surfaces as an
+ * async `'error'` event (e.g. EPIPE) on the `Writable` stream. Node's
+ * `EventEmitter` throws an unhandled `'error'` event SYNCHRONOUSLY from
+ * `.emit()` when no listener is registered — an uncaught exception that
+ * crashes the whole extension host process. `gitProcess.ts` guards this
+ * exact case (`child.stdin.on('error', () => undefined)`); `JsonRpcStdio`
+ * had no such listener on `child.stdin`. The fix attaches one in the
+ * constructor that logs status/message only (never body/secret), mirroring
+ * `gitProcess.ts`.
+ */
+describe('JsonRpcStdio — I-7: child.stdin has an error listener (write-after-death)', () => {
+  it('does not throw when stdin emits an error, and logs it', () => {
+    const logged: string[] = [];
+    const { child, stdin } = makeFakeChild();
+    vi.mocked(spawn).mockReturnValue(child);
+    new JsonRpcStdio({
+      command: 'python',
+      args: ['-m', 'tui_gateway.entry'],
+      logger: { append: (line) => logged.push(line) },
+    });
+
+    const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    // With no 'error' listener on stdin, EventEmitter#emit('error', ...)
+    // throws synchronously, right here — that IS the crash this guards.
+    expect(() => stdin.emit('error', epipe)).not.toThrow();
+
+    expect(logged.some((l) => /EPIPE/i.test(l))).toBe(true);
+  });
+});
