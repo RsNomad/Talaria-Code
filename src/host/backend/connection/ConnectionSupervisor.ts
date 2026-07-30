@@ -93,8 +93,17 @@ export class ConnectionSupervisor {
    * runOnStartTail}, `AcpBackend.openTab`) — see the original field doc
    * (preserved on `AcpBackend.ts` pre-W6-FI-b) for the full
    * interleaving-hazard rationale, unchanged by this extraction.
+   *
+   * CF-01/L3-1: `AcpBackend.loadSessionIntoTab` (both its `session.load` and
+   * `tab.load` callers) and `AcpBackend.closeTab` now ALSO chain onto this
+   * SAME tail — see {@link runOnStartTail}'s doc. Typed `Promise<unknown>`
+   * (widened from `Promise<void>`) because `runOnStartTail` is now generic
+   * over its callback's resolved type (a value-returning load vs. a
+   * void-returning start/close) — this field only ever chains on the
+   * settlement of whatever's queued, never reads its resolved value, so the
+   * widened type is safe.
    */
-  private inFlightStart: Promise<void> | undefined;
+  private inFlightStart: Promise<unknown> | undefined;
 
   /**
    * R-A6: ACP-channel lifecycle — the same five-state machine ControlChannel
@@ -164,6 +173,29 @@ export class ConnectionSupervisor {
    * method is that ONE mechanism, now with one implementation instead of two
    * copies.
    *
+   * CF-01/L3-1 (closes the C1/W6-FB/W6-FG cross-tab race family's
+   * generator): `AcpBackend.loadSessionIntoTab` (the single choke point BOTH
+   * the `session.load` control method and the `tab.load` wire entry funnel
+   * through) and `AcpBackend.closeTab` now chain onto this SAME tail too —
+   * every topology mutation (start / respawn-recovery / openTab / a
+   * History-load / a tab close) is therefore FULLY serialized, in FIFO call
+   * order, with no exceptions. This retires the W6-FG doc's "loadTab is
+   * fire-and-forget, NOT serialized behind inFlightStart" note (see
+   * `recoverSessions`/`recoverOneSession`'s own doc, corrected alongside this
+   * change) — that race can no longer occur. The pre-existing per-call
+   * guards inside those bodies (the C1 post-await occupant re-read, the
+   * W6-FB registry-level same-sessionId dedup, `recoverOneSession`'s
+   * identity-guarded close) are intentionally left in place as redundancy —
+   * they no longer have a live caller-facing race to catch via the public
+   * API, but they cost nothing to keep and remain a second line of defense.
+   *
+   * Generic over the callback's resolved type (`T`) rather than fixed to
+   * `void` — `start`/`openTab`/`closeTab`'s bodies resolve `void`, but
+   * `loadSessionIntoTab`'s resolves an `AcpLoadSessionResult | undefined`
+   * VALUE that its own caller needs back. The chaining logic itself never
+   * inspects `inFlightStart`'s resolved value (only its settlement), so
+   * genericizing is behavior-preserving for every existing `void` caller.
+   *
    * M1: `this.inFlightStart` must be assigned `run` itself (not a
    * `.finally()`-derived promise) — the self-reset check below
    * (`this.inFlightStart === run`) compares by identity, and `.finally()`
@@ -174,8 +206,18 @@ export class ConnectionSupervisor {
    * throwaway used only for its side effect, with a no-op `.catch` so a
    * rejected `run` doesn't also surface as an unhandled rejection on that
    * separate (unreferenced) promise object.
+   *
+   * SELF-DEADLOCK WARNING for future callers: `fn` must NOT itself invoke
+   * another method that also calls `runOnStartTail` (directly or
+   * transitively) — that would enqueue a SECOND link onto this same tail
+   * from WITHIN the first link's own execution, and since the tail only
+   * advances once the CURRENTLY-RUNNING link's promise settles, that inner
+   * call would wait forever for a predecessor that is, in fact, itself
+   * (a self-deadlock). None of `start`/`openTab`/`loadSessionIntoTab`/
+   * `closeTab`'s wrapped bodies call each other or themselves — each enqueues
+   * exactly once, at its own outer entry point, verified by inspection.
    */
-  runOnStartTail(fn: () => Promise<void>): Promise<void> {
+  runOnStartTail<T>(fn: () => Promise<T>): Promise<T> {
     const run = (this.inFlightStart ?? Promise.resolve())
       .catch(() => undefined)
       .then(() => fn());
@@ -486,21 +528,32 @@ export class ConnectionSupervisor {
    * INDIVIDUALLY try/caught (F2's "per-tab session phase") so one
    * unrecoverable session can never wedge the connection or abort the
    * others. Runs INSIDE `establishInitialSession`, itself inside
-   * `startInternal`'s `inFlightStart` tail — a concurrent `openTab` (the
-   * ONLY other caller genuinely chained onto this SAME tail, via {@link
-   * runOnStartTail}) cannot interleave a half-recovered handshake, and no
-   * second child is ever spawned here.
+   * `startInternal`'s `inFlightStart` tail — a concurrent `openTab` OR (CF-01/
+   * L3-1, below) `loadTab`/`session.load`/`closeTab` cannot interleave a
+   * half-recovered handshake, and no second child is ever spawned here.
    *
-   * W6-FG (doc-honesty fix — a prior revision of this comment overclaimed
-   * `tab.load`/`sendPrompt` were ALSO "queued behind the same tail"; they are
-   * NOT): `loadTab` (the `tab.load` wire entry) is fire-and-forget — it
-   * awaits `AcpBackend.loadSessionIntoTab` directly, with no `inFlightStart`
-   * chaining at all — and `sendPrompt` is a synchronous void passthrough to
-   * `this.sessions.get(sessionId)?.sendPrompt(...)`. Either CAN genuinely
-   * interleave with a still-in-flight recovery here; see {@link
-   * recoverOneSession}'s own doc for the race this creates (a same-`sessionId`
-   * `tab.load` winning the registry slot mid-recovery) and its
-   * identity-guarded close.
+   * CF-01/L3-1 (UPDATE — supersedes the W6-FG paragraph immediately below):
+   * `loadTab`/`session.load` (both routed through `AcpBackend
+   * .loadSessionIntoTab`) now ALSO chain onto this SAME `inFlightStart` tail
+   * (via {@link runOnStartTail}) — a `tab.load` issued while a respawn
+   * recovery is still in flight now QUEUES behind it instead of interleaving;
+   * it does not even begin running until this entire recovery settles. The
+   * W6-FG race described below (and its identity-guarded close in {@link
+   * recoverOneSession}) can therefore no longer be TRIGGERED through the
+   * public API — the guard is kept as redundancy, not removed. `sendPrompt`
+   * is unaffected (still a synchronous void passthrough, still can
+   * technically overlap a recovery in flight, but that is a per-session-turn
+   * concern, not a topology-identity one — out of this task's scope).
+   *
+   * W6-FG (doc-honesty fix, HISTORICAL — the race this originally described,
+   * now closed by CF-01/L3-1 above): a prior revision of this comment
+   * overclaimed `tab.load`/`sendPrompt` were ALSO "queued behind the same
+   * tail"; they were NOT. `loadTab` (the `tab.load` wire entry) was
+   * fire-and-forget — it awaited `AcpBackend.loadSessionIntoTab` directly,
+   * with no `inFlightStart` chaining at all. It COULD genuinely interleave
+   * with a still-in-flight recovery here; see {@link recoverOneSession}'s own
+   * doc for the race this created (a same-`sessionId` `tab.load` winning the
+   * registry slot mid-recovery) and its identity-guarded close.
    *
    * T5 (UI I-2 / Q2, owner-ratified — REVERSES the paragraph this replaces;
    * see `remediation-architecture.md` §2 for the full argument): the prior
@@ -568,14 +621,23 @@ export class ConnectionSupervisor {
    * registry's F6 remove-before-dispose, IDENTITY-GUARDED (see the close
    * below) — never a second, unconditional removal path.
    *
+   * CF-01/L3-1: the race this doc originally described can no longer be
+   * reached through the public API — `loadTab`/`session.load` now chain onto
+   * this SAME `inFlightStart` tail (see {@link recoverSessions}'s own
+   * updated doc), so a `tab.load` for this `sessionId` cannot even START
+   * until this recovery attempt's `loadReplay` has fully settled. The
+   * identity-guarded close immediately below is KEPT anyway — pure
+   * redundancy now, never removed (a future caller reaching this method some
+   * other way, or a bug in the tail itself, still can't zombify the winner).
+   *
    * W6-FG (folded-in W6-FB review Minor — doc-honesty fix + the identity
-   * guard itself): a prior revision of this comment claimed "this controller
-   * was just minted exclusively for this attempt, so `loadReplay`'s internal
-   * 'superseded while awaiting' branch can never fire for it" — that is
-   * FALSE. `loadTab`/`tab.load` is fire-and-forget, NOT serialized behind
-   * `inFlightStart` (see {@link recoverSessions}'s own corrected doc) — a
-   * user CAN load this SAME `sessionId` into a DIFFERENT tab while this
-   * `loadReplay` await is still in flight. `SessionRegistry.open`'s W6-FB
+   * guard itself, HISTORICAL): a prior revision of this comment claimed
+   * "this controller was just minted exclusively for this attempt, so
+   * `loadReplay`'s internal 'superseded while awaiting' branch can never fire
+   * for it" — that was FALSE at the time. `loadTab`/`tab.load` used to be
+   * fire-and-forget, NOT serialized behind `inFlightStart` — a
+   * user COULD load this SAME `sessionId` into a DIFFERENT tab while this
+   * `loadReplay` await was still in flight. `SessionRegistry.open`'s W6-FB
    * remove-then-dispose then disposes THIS `controller` and rebinds
    * `sessionId` to the winner's fresh controller — which DOES trip
    * `loadReplay`'s own supersede guard (`this.replay !== replay`) on THIS

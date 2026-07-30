@@ -2101,6 +2101,11 @@ describe('AcpBackend.openTab/closeTab — W4-T3b (§2d/§2e Deliverable 5): the 
     await backend.openTab('tab-2'); // session-2
 
     backend.closeTab('session-2');
+    // CF-01/L3-1: closeTab now chains onto the SAME `inFlightStart` tail as
+    // start/openTab/loadSessionIntoTab — the actual removal happens a few
+    // microtask ticks later (once this call reaches the head of the tail),
+    // not synchronously. Flush before relying on it having taken effect.
+    await flushMicrotasks();
 
     // session-2's controller is gone (a sendPrompt for it is silently a
     // no-op — SessionRegistry.get returns undefined); session-1 is untouched.
@@ -2143,13 +2148,14 @@ describe('AcpBackend.listTabs — W6-FF (3-way ARCH I-1): the live tab list Tala
     expect(byTab[BOOTSTRAP_TAB_ID]?.cwd.length).toBeGreaterThan(0);
   });
 
-  it('drops a closed tab immediately (mirrors SessionRegistry.close\'s remove-before-dispose)', async () => {
+  it('drops a closed tab once its close settles on the topology tail (mirrors SessionRegistry.close\'s remove-before-dispose; CF-01/L3-1: no longer literally synchronous — see the sibling test above)', async () => {
     const { backend, clients } = makeStartableBackend();
     await backend.start();
     must(clients[0]).queueSessionId('session-2');
     await backend.openTab('tab-2');
 
     backend.closeTab('session-2');
+    await flushMicrotasks(); // CF-01/L3-1: closeTab is now tail-queued, not synchronous
 
     expect(backend.listTabs().map((t) => t.tabId)).toEqual([BOOTSTRAP_TAB_ID]);
   });
@@ -2858,18 +2864,32 @@ describe('AcpBackend — T-1 (V-12 RESTART-STATE): explicit restart fans out end
 
 /**
  * W6-FG (folded-in W6-FB review Minor — a pre-existing race in the
- * twice-bitten `recoverOneSession`/`SessionRegistry` zone): `recoverOneSession`
- * closes by KEY (`this.sessions.close(sessionId)`) after a failed/superseded
- * recovery load, with NO identity guard. `loadTab`/`tab.load` is NOT
- * serialized behind `inFlightStart` (only `openTab` is, :853) — a user can
- * load the SAME `sessionId` into a DIFFERENT tab WHILE this recovery's own
- * `loadReplay` await is still in flight. `SessionRegistry.open`'s W6-FB
- * remove-then-dispose then disposes recovery's controller and rebinds
- * `sessionId` to the winner's fresh controller. If recovery's own load THEN
- * fails, closing by key disposes the WINNER (not recovery's stale attempt),
- * silently zombifying the winner's tab with no `tab.error` at all.
+ * twice-bitten `recoverOneSession`/`SessionRegistry` zone, HISTORICAL):
+ * `recoverOneSession` closes by KEY (`this.sessions.close(sessionId)`) after
+ * a failed/superseded recovery load, with NO identity guard. `loadTab`/
+ * `tab.load` used to NOT be serialized behind `inFlightStart` (only `openTab`
+ * was) — a user could load the SAME `sessionId` into a DIFFERENT tab WHILE
+ * this recovery's own `loadReplay` await was still in flight.
+ * `SessionRegistry.open`'s W6-FB remove-then-dispose then disposed recovery's
+ * controller and rebound `sessionId` to the winner's fresh controller. If
+ * recovery's own load THEN failed, closing by key disposed the WINNER (not
+ * recovery's stale attempt), silently zombifying the winner's tab with no
+ * `tab.error` at all. `recoverOneSession`'s identity-guarded close (see its
+ * own doc on `ConnectionSupervisor.ts`) fixed the SYMPTOM.
+ *
+ * CF-01/L3-1 (closes the CAUSE — this task): `loadTab`/`session.load` now
+ * chain onto the SAME `inFlightStart` tail as `start`/`openTab`/`closeTab`
+ * (via `ConnectionSupervisor.runOnStartTail`) — the interleaving this whole
+ * describe block exists to survive can no longer be TRIGGERED through the
+ * public API at all: a `tab.load` issued while a respawn recovery is in
+ * flight now QUEUES behind it instead of racing it. The test below replaces
+ * the old "prove the identity guard saves us after the race happens" proof
+ * (no longer constructible) with the stronger, more direct "prove the race
+ * can't happen" proof — the exact serialization this task's RED-first test
+ * plan calls for. `recoverOneSession`'s identity-guarded close stays in the
+ * source, unchanged, as redundancy (see its own doc).
  */
-describe('AcpBackend — W6-FG: recoverOneSession identity-guarded close (folded-in W6-FB review Minor)', () => {
+describe('AcpBackend — CF-01/L3-1: loadTab is now serialized on the SAME tail as start/openTab/respawn-recovery (retires the W6-FG race above)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -2877,7 +2897,7 @@ describe('AcpBackend — W6-FG: recoverOneSession identity-guarded close (folded
     vi.useRealTimers();
   });
 
-  it('a same-sessionId tab.load that wins the slot WHILE recovery is in flight survives recovery\'s own later failed-load cleanup', async () => {
+  it('a tab.load for the SAME sessionId issued WHILE a respawn recovery is still in flight does not even reach its own client.loadSession call until recovery settles', async () => {
     const loadCalls: Array<{
       resolve: (r: AcpLoadSessionResult) => void;
       reject: (e: unknown) => void;
@@ -2886,7 +2906,7 @@ describe('AcpBackend — W6-FG: recoverOneSession identity-guarded close (folded
       if (index === 1) {
         // The respawned child's `loadSession` never auto-resolves — the test
         // drives each call's outcome individually (recovery's own call is
-        // call #0; the winning tab.load's own call is call #1).
+        // call #0; tab-2's own call, once it FINALLY starts, is call #1).
         client.loadSession = (_cwd: string, _sessionId: string, _mcpServers?: AcpMcpServer[]) =>
           new Promise<AcpLoadSessionResult>((resolve, reject) => {
             loadCalls.push({ resolve, reject });
@@ -2896,48 +2916,131 @@ describe('AcpBackend — W6-FG: recoverOneSession identity-guarded close (folded
     await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID, on client[0]
 
     must(clients[0]).simulateExit(1); // crash -> respawning, backoff scheduled
-    await vi.advanceTimersByTimeAsync(500); // respawn #1 fires -> recoverOneSession's own loadReplay (call #0) is now in flight
+    await vi.advanceTimersByTimeAsync(500); // respawn #1 fires -> recoverOneSession's own loadReplay (call #0) is now in flight, still inside start()'s OWN runOnStartTail turn
 
     expect(loadCalls).toHaveLength(1); // recovery's own session-1 load — not yet settled
 
     const messages: HostToWebviewMessage[] = [];
     backend.onMessage((m) => messages.push(m));
 
-    // The race: a SECOND tab loads the SAME sessionId WHILE recovery is still
-    // stuck awaiting its own loadSession. loadTab is fire-and-forget (unlike
-    // openTab, it is never chained onto `inFlightStart`), so this genuinely
-    // interleaves with the still-in-flight respawn tail.
+    // CF-01/L3-1: tab-2 loads the SAME sessionId WHILE recovery is still
+    // stuck awaiting its own loadSession. loadTab now chains onto the SAME
+    // `inFlightStart` tail the in-flight start()/recovery call already
+    // occupies — it cannot even BEGIN running until that entire call settles.
     const t2Promise = backend.loadTab('tab-2', 'session-1', '/ws');
     await flushMicrotasks();
-    expect(loadCalls).toHaveLength(2); // T2's own session-1 load (call #1) — SessionRegistry.open already
-    // disposed recovery's controller and rebound 'session-1' -> T2's fresh one, synchronously, above.
-
-    // T2's own load succeeds promptly — T2 becomes the genuine, fully-loaded winner.
-    must(loadCalls[1]).resolve({ found: true, currentModeId: 'default' });
-    await flushMicrotasks();
-    await t2Promise;
-    expect(sessionIdForTab(backend, 'tab-2')).toBe('session-1');
-    const winner = (backend as unknown as { sessions: { get(id: string): unknown } }).sessions.get('session-1');
-    expect(winner).toBeDefined();
+    // RED (pre-fix): this used to be 2 — tab-2's own load reached
+    // client.loadSession immediately, genuinely interleaving with recovery.
+    // GREEN (post-fix, asserted here): tab-2's load is queued behind
+    // recovery — no second call has been made yet.
+    expect(loadCalls).toHaveLength(1);
 
     // Recovery's OWN load (call #0) now fails. `SessionController.loadReplay`
     // never rejects (it catches internally) — this settles `recoverOneSession`'s
-    // `result === undefined` failure branch, which is where the buggy
-    // key-close lives.
+    // `result === undefined` failure branch, which identity-guard-closes
+    // session-1 (still its own, untouched, controller at this point).
     must(loadCalls[0]).reject(new Error('history store corrupt'));
     await flushMicrotasks();
 
-    // The winner (T2's controller) must survive — recovery's cleanup must
-    // never dispose a controller it does not itself own anymore.
-    expect(hasController(backend, 'session-1')).toBe(true);
+    expect(
+      messages.filter((m) => m.type === 'tab.error' && (m as { tabId: string }).tabId === BOOTSTRAP_TAB_ID),
+    ).toContainEqual({
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: expect.any(String),
+    });
+
+    // NOW that start()/recovery's tail turn has settled, tab-2's queued load
+    // finally starts — it was waiting its turn, never lost or dropped.
+    expect(loadCalls).toHaveLength(2);
+    must(loadCalls[1]).resolve({ found: true, currentModeId: 'default' });
+    await flushMicrotasks();
+    await t2Promise;
+
     expect(sessionIdForTab(backend, 'tab-2')).toBe('session-1');
-    expect((backend as unknown as { sessions: { get(id: string): unknown } }).sessions.get('session-1')).toBe(
-      winner,
-    );
-    // T2 was never actually lost — no tab.error ever targets it.
+    expect(hasController(backend, 'session-1')).toBe(true);
+    // tab-2 was never actually lost — no tab.error ever targets it.
     expect(
       messages.filter((m) => m.type === 'tab.error' && (m as { tabId: string }).tabId === 'tab-2'),
     ).toEqual([]);
+  });
+});
+
+/**
+ * CF-01/L3-1 (the task's own RED-first proof, dedicated + minimal — see the
+ * describe block above for the same guarantee proven against a live
+ * respawn): `loadSessionIntoTab` (both its `session.load`/`tab.load`
+ * entries) and `closeTab` now chain onto the SAME `inFlightStart` tail as
+ * `start`/`openTab`, via `ConnectionSupervisor.runOnStartTail`. These two
+ * tests drive the brief's exact two scenarios directly, with no respawn
+ * involved: two rapid loads, and a close racing an in-flight load.
+ */
+describe('AcpBackend — CF-01/L3-1: loadSessionIntoTab/closeTab are serialized on the SAME runOnStartTail queue as start/openTab', () => {
+  it('two rapid loadTab calls into DIFFERENT tabs never interleave — the second does not reach its own client.loadSession until the first fully settles', async () => {
+    const { backend } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
+    const calls: Array<ReturnType<typeof deferred<AcpLoadSessionResult>>> = [];
+    const client = {
+      async loadSession(): Promise<AcpLoadSessionResult> {
+        const d = deferred<AcpLoadSessionResult>();
+        calls.push(d);
+        return d.promise;
+      },
+    };
+    seam(backend).client = client;
+
+    const p1 = backend.loadTab('tab-1', 'a', '/ws');
+    const p2 = backend.loadTab('tab-2', 'b', '/ws');
+    await flushMicrotasks();
+
+    // RED (pre-fix): both loads reach client.loadSession back-to-back — this
+    // would already be 2 here. GREEN (post-fix): load B is queued behind
+    // load A on the SAME `inFlightStart` tail — it cannot start until load
+    // A's ENTIRE tail-wrapped call (through its own client.loadSession
+    // resolving and its whole announce/loadReplay chain) settles.
+    expect(calls).toHaveLength(1);
+
+    calls[0]?.resolve({ found: true, currentModeId: 'default' });
+    await p1;
+    await flushMicrotasks();
+
+    // NOW load B has started — its turn on the tail arrived.
+    expect(calls).toHaveLength(2);
+    calls[1]?.resolve({ found: true, currentModeId: 'default' });
+    await p2;
+
+    expect(sessionIdForTab(backend, 'tab-1')).toBe('a');
+    expect(sessionIdForTab(backend, 'tab-2')).toBe('b');
+  });
+
+  it('closeTab racing an in-flight loadTab serializes: the close does not take effect until the load settles', async () => {
+    const { backend } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
+    const d = deferred<AcpLoadSessionResult>();
+    const client = {
+      async loadSession(): Promise<AcpLoadSessionResult> {
+        return d.promise;
+      },
+    };
+    seam(backend).client = client;
+
+    const loadPromise = backend.loadTab('tab-2', 'history-session', '/ws'); // in flight, blocked on d
+    await flushMicrotasks();
+
+    backend.closeTab('session-1'); // fired WHILE the load is still in flight
+    await flushMicrotasks();
+
+    // RED (pre-fix): closeTab ran free (not on the tail) — it disposed
+    // session-1 immediately, regardless of the in-flight load. GREEN
+    // (post-fix): closeTab is queued BEHIND the in-flight load on the SAME
+    // tail — session-1 is still alive until the load settles.
+    expect(hasController(backend, 'session-1')).toBe(true);
+
+    d.resolve({ found: true, currentModeId: 'default' });
+    await loadPromise;
+    await flushMicrotasks();
+
+    // Now the queued close has had its turn.
+    expect(hasController(backend, 'session-1')).toBe(false);
   });
 });
 
@@ -3072,7 +3175,14 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
       },
     };
     seam(backend).client = client;
-    const load = callLoadSessionIntoTab(backend);
+    // CF-01/L3-1: this test needs load B to genuinely START while load A is
+    // still hung — the outer `loadSessionIntoTab` now fully serializes on
+    // `inFlightStart`, which would make load B wait for load A forever (a
+    // real deadlock, since A only resolves once B has already been observed
+    // below). Drive `loadSessionIntoTabInternal` directly to keep proving
+    // this INTERNAL supersede-guard still works under real interleaving —
+    // see `callLoadSessionIntoTabInternal`'s own doc.
+    const load = callLoadSessionIntoTabInternal(backend);
 
     const p1 = load('a', '/ws', BOOTSTRAP_TAB_ID); // hangs — the SLOWER load
     const p2 = load('b', '/ws', BOOTSTRAP_TAB_ID); // mints fresh, disposes A's controller (F6)
@@ -3114,7 +3224,11 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
       },
     };
     seam(backend).client = client;
-    const load = callLoadSessionIntoTab(backend);
+    // CF-01/L3-1: see the found:true sibling test above — drives the
+    // internal method directly so load B can genuinely start while load A
+    // is still hung (the outer wrapper now fully serializes, which would
+    // deadlock this exact setup).
+    const load = callLoadSessionIntoTabInternal(backend);
 
     const p1 = load('a', '/ws', BOOTSTRAP_TAB_ID); // hangs — the SLOWER load, will belatedly resolve found:false
     const p2 = load('b', '/ws', BOOTSTRAP_TAB_ID); // mints fresh, disposes A's controller (F6)
@@ -3170,7 +3284,15 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
         },
       };
       seam(backend).client = client;
-      const load = callLoadSessionIntoTab(backend);
+      // CF-01/L3-1: this test needs BOTH loads to genuinely reach their own
+      // `client.loadSession` call before either resolves — the outer
+      // `loadSessionIntoTab` now fully serializes on `inFlightStart`, which
+      // would make load B wait for load A's entire turn (a real deadlock,
+      // since the poll below waits for BOTH to be pending). Drive
+      // `loadSessionIntoTabInternal` directly to keep proving the INTERNAL
+      // C1 re-read still works under real interleaving — see
+      // `callLoadSessionIntoTabInternal`'s own doc.
+      const load = callLoadSessionIntoTabInternal(backend);
 
       const p1 = load('a', project, BOOTSTRAP_TAB_ID);
       const p2 = load('b', project, BOOTSTRAP_TAB_ID);
@@ -3305,7 +3427,11 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
         },
       };
       seam(backend).client = client;
-      const load = callLoadSessionIntoTab(backend);
+      // CF-01/L3-1: see the C1 concurrency test above — drives the internal
+      // method directly so both loads can genuinely reach `client.loadSession`
+      // before either resolves (the outer wrapper now fully serializes,
+      // which would deadlock this exact poll-for-both-pending setup).
+      const load = callLoadSessionIntoTabInternal(backend);
 
       const p1 = load('SA', project, 'tab-x');
       const p2 = load('SA', project, 'tab-y');
@@ -3893,9 +4019,19 @@ describe('AcpBackend.loadSession — P4b: a superseded load\'s belated resolutio
       },
     };
     seam(backend).client = client;
+    // CF-01/L3-1: this test needs load B to genuinely mint + dispose load
+    // A's controller WHILE load A is still hung on its own client.loadSession
+    // — the outer `loadSessionIntoTab` (which `invokeControl('session.load', …)`
+    // now routes through) fully serializes on `inFlightStart`, which would
+    // make load B wait for load A forever (a real deadlock, since A only
+    // resolves after B is observed below). Drive `loadSessionIntoTabInternal`
+    // directly (bypassing `invokeControl`) to keep proving this INTERNAL
+    // supersede-guard still works under real interleaving — see
+    // `callLoadSessionIntoTabInternal`'s own doc.
+    const load = callLoadSessionIntoTabInternal(backend);
 
-    const p1 = backend.invokeControl('session.load', { sessionId: 'a', cwd: '/ws' }); // load A — hangs, mints controller A
-    const p2 = backend.invokeControl('session.load', { sessionId: 'b', cwd: '/ws' }); // load B — mints controller B, disposes A (F6)
+    const p1 = load('a', '/ws', BOOTSTRAP_TAB_ID); // load A — hangs, mints controller A
+    const p2 = load('b', '/ws', BOOTSTRAP_TAB_ID); // load B — mints controller B, disposes A (F6)
     await p2;
 
     // W4-T5a: unlike the pre-T5a reuse-in-place approximation (one shared
@@ -3996,6 +4132,35 @@ function callLoadSessionIntoTab(
       loadSessionIntoTab: (sessionId: string, cwd: string, tabId: string) => Promise<AcpLoadSessionResult | undefined>;
     }
   ).loadSessionIntoTab.bind(backend);
+}
+
+/**
+ * CF-01/L3-1: reaches past `private` to drive `loadSessionIntoTabInternal`
+ * directly, BYPASSING the outer `loadSessionIntoTab` tail-serialization
+ * wrapper. The outer wrapper now fully serializes every load onto
+ * `inFlightStart` (see `ConnectionSupervisor.runOnStartTail`'s own doc), so
+ * two loads issued back-to-back through the PUBLIC entry (`callLoadSessionIntoTab`
+ * above, or `loadTab`/`session.load`) can no longer genuinely overlap — the
+ * handful of tests that specifically drive REAL interleaving (to prove the
+ * pre-existing C1 re-read / W6-FB registry-level dedup / P4b supersede-guard
+ * INSIDE the internal method still behave correctly under it) use THIS seam
+ * instead. Those guards are still real, still-shipped code — CF-01/L3-1
+ * deliberately keeps them as redundancy rather than removing them — this
+ * helper is how this file keeps exercising them directly now that the outer
+ * wrapper makes them unreachable via any public entry point.
+ */
+function callLoadSessionIntoTabInternal(
+  backend: AcpBackend,
+): (sessionId: string, cwd: string, tabId: string) => Promise<AcpLoadSessionResult | undefined> {
+  return (
+    backend as unknown as {
+      loadSessionIntoTabInternal: (
+        sessionId: string,
+        cwd: string,
+        tabId: string,
+      ) => Promise<AcpLoadSessionResult | undefined>;
+    }
+  ).loadSessionIntoTabInternal.bind(backend);
 }
 
 /** Reach past `private` to read a specific controller's `getRootId()` — the

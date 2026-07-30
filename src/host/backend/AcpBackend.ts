@@ -804,8 +804,30 @@ export class AcpBackend implements AgentBackend {
    * through to {@link SessionRegistry.close}'s existing F6 remove-before-
    * dispose guarantee. A no-op for an unrecognized `sessionId` (a still-
    * unbound tab closed before its `tab.open` resolved has none to send).
+   *
+   * CF-01/L3-1 (closes the C1/W6-FB/W6-FG cross-tab race family's generator):
+   * the actual removal (`closeTabInternal`) now chains onto the SAME
+   * `inFlightStart` tail `start()`/`openTab`/`loadSessionIntoTab` use, via
+   * {@link ConnectionSupervisor.runOnStartTail} — a close can no longer
+   * interleave with an in-flight load/open/start/respawn. The public
+   * signature stays synchronous `void` (matches `AgentBackend`'s interface
+   * and every existing caller's fire-and-forget usage, e.g.
+   * `TalariaViewProvider`'s `tab.close` handler) — only the OBSERVABLE effect
+   * (the registry removal) is now deferred a few microtask ticks, until this
+   * call reaches the head of the tail, instead of happening synchronously.
+   * Mirrors {@link ControlDispatcher.refreshCheckpointsPanel}'s
+   * `void promise.catch(...)` fire-and-forget idiom: a rejection (defensive
+   * only — neither `SessionRegistry.close` nor `SessionController.dispose`
+   * throws today) is caught and logged here instead of becoming an
+   * unhandled rejection.
    */
   closeTab(sessionId: string): void {
+    void this.connectionSupervisor.runOnStartTail(() => this.closeTabInternal(sessionId)).catch((err: unknown) => {
+      this.logger?.append(`[AcpBackend] closeTab failed (sessionId=${sessionId}): ${errorMessage(err)}`);
+    });
+  }
+
+  private async closeTabInternal(sessionId: string): Promise<void> {
     this.sessions.close(sessionId);
   }
 
@@ -1124,10 +1146,45 @@ export class AcpBackend implements AgentBackend {
     return this.controlDispatcher.loadTab(tabId, sessionId, cwd);
   }
 
+  /**
+   * CF-01/L3-1 (closes the C1/W6-FB/W6-FG cross-tab race family's
+   * generator): the tail-wrapped ENTRY — BOTH callers (`invokeControl`'s
+   * `session.load` branch and `loadTab`/`tab.load`, via the SAME injected
+   * `ControlDispatcherHostPort.loadSessionIntoTab` accessor, :436) reach the
+   * real body exclusively through this method, so wrapping HERE — once —
+   * covers both entry points, exactly mirroring how {@link openTab} wraps
+   * {@link openTabInternal}. Chains onto the SAME `inFlightStart` tail
+   * `start()`/`openTab`/`closeTab` use, via {@link
+   * ConnectionSupervisor.runOnStartTail}: a load can no longer interleave
+   * with a start/respawn-recovery/openTab/another load/a close. See
+   * `ConnectionSupervisor.recoverSessions`/`recoverOneSession`'s own doc for
+   * the exact W6-FG race this retires (a `tab.load` racing a still-in-flight
+   * respawn recovery). The C1 post-confinement-await re-read and the W6-FB
+   * registry-level same-`sessionId` dedup INSIDE {@link
+   * loadSessionIntoTabInternal} are UNCHANGED — kept as redundancy, not
+   * removed (see that method's own doc, preserved verbatim).
+   *
+   * NO SELF-DEADLOCK: `loadSessionIntoTabInternal`'s body never calls
+   * `start`/`openTab`/`closeTab`/`loadSessionIntoTab` (itself) — it only
+   * reaches `this.sessions.*`/`this.buildSessionPort`/
+   * `this.announceSessionBound`/`controller.loadReplay`, none of which touch
+   * `runOnStartTail` — so this enqueues exactly once per call, at this outer
+   * entry, never re-entering the tail from within an already-queued link.
+   */
   private async loadSessionIntoTab(
     sessionId: string,
     cwd: string,
     tabId: string = BOOTSTRAP_TAB_ID,
+  ): Promise<AcpLoadSessionResult | undefined> {
+    return this.connectionSupervisor.runOnStartTail(() =>
+      this.loadSessionIntoTabInternal(sessionId, cwd, tabId),
+    );
+  }
+
+  private async loadSessionIntoTabInternal(
+    sessionId: string,
+    cwd: string,
+    tabId: string,
   ): Promise<AcpLoadSessionResult | undefined> {
     if (!this.connectionSupervisor.getClient()) {
       this.logger?.append(`[AcpBackend] session.load: no live client (sessionId=${sessionId}, cwd=${cwd})`);
