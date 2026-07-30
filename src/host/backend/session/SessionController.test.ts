@@ -34,7 +34,7 @@ import type { SessionHostPort } from './types';
 import type { RootCoordinatorLike } from '../../checkpoints/RootCoordinator';
 import { buildCancelledOutcome } from '../acp/permission';
 import type { AcpRequestPermissionRequest, AcpOutboundContentBlock } from '../acp/types';
-import type { AcpClientLike, AcpListSessionsRawResult } from '../acp/acpClient';
+import type { AcpClientLike, AcpListSessionsRawResult, AcpLoadSessionResult } from '../acp/acpClient';
 import type { Attachment, HostToWebviewMessage } from '../../../shared/protocol';
 
 const EDIT_OPTIONS = [
@@ -1153,5 +1153,126 @@ describe('SessionController.sendPrompt — V-19: attachment path confinement', (
     expect(promptContent).toHaveLength(2);
     expect(promptContent?.[1]).toMatchObject({ type: 'resource_link', name: 'notes.txt', mimeType: 'text/plain' });
     expect(emitted.some((m) => m.type === 'error')).toBe(false);
+  });
+});
+
+/**
+ * I-2 (W1-T3 review, Important fix): `loadReplay`'s LAST supersede guard
+ * (`this.replay !== replay`) sits right before `this.replay = undefined`
+ * (~:1142-1144) — but `await this.pinWireModeDefault(...)` (~:1154) is a
+ * SEPARATE suspension point AFTER that guard, with no recheck once it
+ * resolves. If a second, superseding `loadReplay` call (B) starts while the
+ * first (A) is parked on that pin await — and B is itself still in flight
+ * (parked on its OWN `client.loadSession` await, so `this.replay` still
+ * points at B's fresh `ReplayTranslator`) — A resuming after the pin would,
+ * pre-fix, call `markSubagentsInterrupted()` against B's already-reset fold
+ * and emit a STALE `turn.end{complete}` for A's own superseded turn on top
+ * of B's still-live replay. Fixed: recheck `this.replay !== undefined`
+ * right after the pin await, before touching subagents or emitting
+ * `turn.end` — A's own reset at ~:1144 left `this.replay` `undefined`; a
+ * non-undefined value at this point can only mean a superseding call
+ * claimed it in the meantime.
+ */
+describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck AFTER the pinWireModeDefault await', () => {
+  /** Same tiny deferred-promise helper `AcpBackend.test.ts` uses. */
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  it('A superseded WHILE parked on pinWireModeDefault emits NOTHING past the pin — no stale turn.end, and the superseding load B still finishes honestly', async () => {
+    const loadSessionA = deferred<AcpLoadSessionResult>();
+    const loadSessionB = deferred<AcpLoadSessionResult>();
+    const setSessionModeA = deferred<void>();
+
+    const client: AcpClientLike = {
+      connect: async () => {
+        throw new Error('unused: connect');
+      },
+      initialize: async () => {
+        throw new Error('unused: initialize');
+      },
+      newSession: async () => {
+        throw new Error('unused: newSession');
+      },
+      prompt: async () => {
+        throw new Error('unused: prompt');
+      },
+      cancel: async () => {
+        throw new Error('unused: cancel');
+      },
+      // A is a drifted session (forces the pin's setSessionMode call, which
+      // this test parks open); B never drifts, so its own pin never calls
+      // this at all.
+      setSessionMode: async (sessionId: string) => {
+        if (sessionId === 'session-A') return setSessionModeA.promise;
+        throw new Error(`unexpected setSessionMode call for ${sessionId}`);
+      },
+      setSessionModel: async () => {
+        throw new Error('unused: setSessionModel');
+      },
+      listSessions: async (): Promise<AcpListSessionsRawResult> => {
+        throw new Error('unused: listSessions');
+      },
+      loadSession: async (_cwd: string, sessionId: string) => {
+        if (sessionId === 'session-A') return loadSessionA.promise;
+        if (sessionId === 'session-B') return loadSessionB.promise;
+        throw new Error(`unexpected loadSession call for ${sessionId}`);
+      },
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+
+    const emitted: HostToWebviewMessage[] = [];
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => [],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      editPreviewRegistry: undefined,
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('bootstrap', '/ws', port);
+
+    // A starts and parks on `client.loadSession`.
+    const replayA = controller.loadReplay('/ws', 'session-A', '/ws', []);
+
+    // A's load resolves with a drift, so A proceeds into the pin — which
+    // itself parks on `setSessionModeA`. Flush generously: since
+    // `setSessionModeA` never resolves on its own, A cannot run past that
+    // await no matter how many microtasks are flushed here.
+    loadSessionA.resolve({ found: true, currentModeId: 'accept_edits' });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    // B supersedes A on the SAME controller — a second, later `loadReplay`
+    // call — and parks on ITS OWN `client.loadSession` (never reaches the
+    // pin in this test). `this.replay` now points at B's fresh
+    // ReplayTranslator.
+    const replayB = controller.loadReplay('/ws', 'session-B', '/ws', []);
+    await Promise.resolve();
+
+    emitted.length = 0; // isolate: only what happens from here on is under test
+
+    // Let A's pin settle — A resumes INSIDE loadReplay, past the pin await,
+    // with B still fully in flight.
+    setSessionModeA.resolve(undefined);
+    const resultA = await replayA;
+
+    // The fix: A emits NOTHING past the pin boundary once superseded — no
+    // stale turn.end, no commands.available, nothing.
+    expect(emitted).toEqual([]);
+    expect(resultA).toBeUndefined();
+
+    // B is unaffected and still completes honestly with its own turn.end.
+    loadSessionB.resolve({ found: true, currentModeId: 'default' });
+    const resultB = await replayB;
+    expect(resultB).toEqual({ found: true, currentModeId: 'default' });
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'complete' }));
   });
 });

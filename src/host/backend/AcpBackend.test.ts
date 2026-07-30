@@ -6946,7 +6946,49 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
       expect(messages.filter((m) => m.type === 'error')).toEqual([]); // status-only log, never a user-facing error for a best-effort pin
     });
 
-    it('openSession: a rejected pin does not turn an already-bound session into a spurious start failure, and inFlightStart still resets', async () => {
+    /**
+     * CF-01 (W1-T3 review, CRITICAL fix): the brief's concrete failing
+     * scenario end to end — crash-recovery/History `loadReplay` for a
+     * session Hermes reports as `accept_edits` (real drift), whose re-pin
+     * ALSO rejects. The load itself still degrades honestly (proven by the
+     * test right above). The bug: before the fix, `currentMode` stayed
+     * `'default'` regardless (the ONLY value ever assigned to it anywhere in
+     * the file), so `runTurn`'s `!== 'default'` re-pin check could never
+     * fire — a subsequent prompt would reach `client.prompt` on a session
+     * that is STILL `accept_edits` server-side, Hermes auto-applying edits
+     * with no `request_permission`, our whole out-of-process approval gate
+     * silently bypassed for the session's entire life. Fixed: the degraded
+     * pin now seeds `currentMode` with the drifted id, so the NEXT turn
+     * genuinely re-attempts the pin — and, since it ALSO fails here, aborts
+     * the turn honestly instead of ever reaching `client.prompt`.
+     */
+    it('CF-01 fix: a loadReplay-drifted session with a persistently-failing pin ABORTS its next turn — never reaches client.prompt', async () => {
+      const { backend, client, messages } = makeBackend();
+      mockWorkspace.workspaceFolders = undefined; // no roots -> load cwd confinement skipped
+      client.setLoadSessionResult({ found: true, currentModeId: 'accept_edits' }); // forces the pin's setSessionMode call
+      client.setSessionMode = (sessionId: string, modeId: string) => {
+        client.setSessionModeCalls.push({ sessionId, modeId }); // still record the attempt, like the real method does
+        return Promise.reject(new Error('wire: setSessionMode failed'));
+      };
+
+      await backend.invokeControl('session.load', { sessionId: 'old-session', cwd: '/ws' });
+      messages.length = 0; // isolate the assertions below to the NEXT turn only
+
+      backend.sendPrompt('old-session', 'hello', 'default');
+      await flushMicrotasks();
+
+      expect(client.promptCallCount).toBe(0); // never reached — fail-closed
+      // The re-pin was genuinely re-attempted on the next turn (not skipped
+      // as dead code): one attempt from the load's own degraded pin, one
+      // from runTurn's re-pin.
+      expect(
+        client.setSessionModeCalls.filter((c) => c.sessionId === 'old-session' && c.modeId === 'default'),
+      ).toHaveLength(2);
+      expect(messages.some((m) => m.type === 'error')).toBe(true);
+      expect(messages).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'error' }));
+    });
+
+    it('openSession: a rejected pin does not turn an already-bound session into a spurious start failure — but a STILL-drifted session then fail-closes its next turn (CF-01 review fix)', async () => {
       const { backend, clients } = makeStartableBackend(undefined, (client) => {
         client.newSessionModeId = 'accept_edits'; // forces the pin's setSessionMode call
         client.setSessionMode = (sessionId: string, modeId: string) => {
@@ -6957,11 +6999,10 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
       const messages: HostToWebviewMessage[] = [];
       backend.onMessage((m) => messages.push(m));
 
-      // RED (pre-fix): `openSession`'s un-caught pin rejects `openSession`
-      // itself; `establishInitialSession`'s try/catch swallows that so
-      // `start()` doesn't throw, but it ALSO fires a spurious
-      // `system.error` ("Failed to start a Hermes session…") even though
-      // `tab.bound` already fired for a session that is actually live.
+      // `openSession`'s pin degrades honestly — no spurious `system.error`;
+      // `tab.bound`/`mode.state` already fired for a session that is
+      // genuinely live and usable, so the whole establish is NOT reported
+      // failed just because the best-effort re-assert didn't land.
       await backend.start();
 
       expect(messages.some((m) => m.type === 'tab.bound')).toBe(true);
@@ -6970,10 +7011,27 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
 
       // Not wedged: the start-tail resets to idle...
       expect(seam(backend).inFlightStart).toBeUndefined();
-      // ...and the bound session is genuinely usable afterward.
+
+      // CF-01 (W1-T3 review, CRITICAL fix): the session is STILL accept_edits
+      // server-side — the pin never actually succeeded. The OLD version of
+      // this test asserted the next prompt proceeds anyway
+      // (`promptCallCount===1`), which was the bug this fix closes: that
+      // would let a prompt reach Hermes on an unconfirmed accept_edits
+      // session, with NO `request_permission` — our whole approval gate
+      // silently bypassed. After the fix, `currentMode` was seeded with the
+      // drifted id, so `runTurn`'s re-pin check is a REAL backstop: it
+      // genuinely retries `setSessionMode` — and since this mock keeps
+      // rejecting, the turn now ABORTS honestly instead of silently
+      // proceeding.
+      messages.length = 0;
       backend.sendPrompt('session-1', 'hello', 'default');
       await flushMicrotasks();
-      expect(must(clients[0]).promptCallCount).toBe(1);
+
+      expect(must(clients[0]).promptCallCount).toBe(0); // client.prompt is NEVER reached — fail-closed
+      // The re-pin was genuinely attempted a second time — not skipped as dead code.
+      expect(must(clients[0]).setSessionModeCalls.filter((c) => c.modeId === 'default')).toHaveLength(2);
+      expect(messages.some((m) => m.type === 'error')).toBe(true);
+      expect(messages).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'error' }));
     });
   });
 

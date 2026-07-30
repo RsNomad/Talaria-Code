@@ -116,8 +116,19 @@ export class SessionController {
   // --- policy inputs ------------------------------------------------------
   /** W2-F1: boots at `'manual'` — today's ask-everything behavior. */
   private activePreset: EditPolicyPreset = 'manual';
-  /** F4: the wire `AgentMode` pin now lives PER-CONTROLLER (was a flat `AcpBackend` field). */
-  private currentMode: AgentMode = 'default';
+  /**
+   * F4: the wire `AgentMode` pin now lives PER-CONTROLLER (was a flat
+   * `AcpBackend` field).
+   *
+   * CF-01 (W1-T3 review, CRITICAL fix): widened from `AgentMode` to `string`.
+   * A failed re-assert (`pinWireModeDefault`'s catch) now seeds this field
+   * with the RAW drifted mode id Hermes reported — not guaranteed to be one
+   * of our own `AgentMode` literals — so `runTurn`'s `!== 'default'` re-pin
+   * check (~:894, this field's ONLY reader in the file — grep-confirmed) can
+   * actually detect the drift, instead of the field staying permanently
+   * `'default'` (its only other assignments) and that check being dead code.
+   */
+  private currentMode: string = 'default';
   /**
    * W4-T4b (SF-2 §4.3 mitigation 1 — the self-widening PRIMARY fix): the
    * active custom mode's snapshot, or `undefined` when no mode is active.
@@ -249,13 +260,30 @@ export class SessionController {
    * Degrade, don't reject: log status-only (never the raw error body beyond
    * `Error.message` — matches every other degrade site in this file, e.g.
    * {@link snapshotCheckpoint}/{@link snapshotAfterTurn}) and return without
-   * claiming the pin succeeded. `this.currentMode` is deliberately left
-   * untouched on failure (never force-set to `'default'`) — the per-turn
-   * re-pin at `runTurn` (~:863-865) is the fail-CLOSED backstop: it aborts
-   * (rather than silently continuing) the next turn attempt if the wire
-   * mode still isn't confirmed `'default'`, so a still-`accept_edits`
-   * session server-side can never slip a prompt past our approval gate just
-   * because this best-effort re-assert once failed.
+   * claiming the pin succeeded.
+   *
+   * CF-01 (W1-T3 3-lens review — CRITICAL fix): the FIRST version of this
+   * degrade left `this.currentMode` untouched on failure and called
+   * `runTurn`'s re-pin check "the fail-CLOSED backstop". That claim was
+   * false: `currentMode` is written `'default'` EVERYWHERE ELSE in this file
+   * (init, this method's own success tail below, `runTurn`'s own re-pin
+   * success) — so "left untouched" meant it silently STAYED `'default'` even
+   * though the session is still non-default server-side, and `runTurn`'s
+   * `!== 'default'` check (~:894) could then NEVER fire. That "backstop" was
+   * unreachable dead code, not a safeguard — a drifted `accept_edits`
+   * session could take a prompt with Hermes auto-applying edits (no
+   * `request_permission`), our whole out-of-process approval gate silently
+   * bypassed for the session's entire life.
+   *
+   * Fixed: the catch below now SEEDS `this.currentMode` with the raw
+   * drifted `reportedModeId` Hermes actually reported (this is why the
+   * field's type widened from `AgentMode` to `string` — see its own doc).
+   * That makes `runTurn`'s check a REAL backstop: it forces a genuine re-pin
+   * attempt on the session's next turn; if THAT re-pin also fails,
+   * `runTurn`'s own try/catch (~:943) aborts the turn with an honest
+   * `error` — `client.prompt` is never reached. A degraded pin can
+   * therefore delay a prompt (one failed-then-retried re-pin) or abort it
+   * outright — it can never let one through silently un-pinned.
    */
   async pinWireModeDefault(reportedModeId: string): Promise<void> {
     const client = this.port.getClient();
@@ -267,8 +295,13 @@ export class SessionController {
         await client.setSessionMode(this.sessionId, 'default');
       } catch (err) {
         this.port.logger?.append(
-          `[SessionController] wire-mode re-assert failed — degrading (session may still be non-default server-side, a later turn's own re-pin is the backstop): ${errorMessage(err)}`,
+          `[SessionController] wire-mode re-assert failed — degrading (session still reports '${reportedModeId}' server-side; seeding currentMode so the NEXT turn's re-pin is a real backstop, not dead code): ${errorMessage(err)}`,
         );
+        // CF-01: seed the drift itself — NEVER force-set to 'default' here,
+        // which would dishonestly claim a pin that just failed. See this
+        // method's own doc above for why this is what makes `runTurn`'s
+        // re-pin check reachable at all.
+        this.currentMode = reportedModeId;
         return;
       }
     }
@@ -891,6 +924,11 @@ export class SessionController {
           `[policy] clamped incoming prompt mode '${mode}' -> 'default' (preset '${this.activePreset}' active)`,
         );
       }
+      // CF-01 (W1-T3 review): the REAL fail-closed backstop for a degraded
+      // `pinWireModeDefault` — see that method's own doc for the mechanism.
+      // A genuine re-pin attempt here; if it rejects, this whole `try`'s
+      // catch (below) aborts the turn with an honest `error` — `client
+      // .prompt` just below is never reached on an unconfirmed session.
       if (this.currentMode !== 'default') {
         await client.setSessionMode(this.sessionId, 'default');
         this.currentMode = 'default';
@@ -1152,6 +1190,17 @@ export class SessionController {
       this.port.emit({ type: 'model.state', sessionId, modelId: result.currentModelId });
     }
     await this.pinWireModeDefault(result.currentModeId);
+    // I-2 (W1-T3 review, Important fix): recheck for a superseding
+    // `loadReplay` AFTER this await — the guard just above (~:1180) only
+    // covers the `client.loadSession` await; `pinWireModeDefault` is a
+    // SEPARATE suspension point with no recheck of its own before this fix.
+    // THIS call reset `this.replay` to `undefined` two lines above; the ONLY
+    // way it can be non-undefined again by the time we resume here is a
+    // second, superseding `loadReplay` claiming it in the meantime — in
+    // which case everything past this point (subagents mutation,
+    // `commands.available`, the closing `turn.end`) belongs to a turn that
+    // no longer exists from the webview's perspective and must not fire.
+    if (this.replay !== undefined) return;
     this.markSubagentsInterrupted();
     if (this.lastCommands) {
       this.port.emit({ type: 'commands.available', sessionId, commands: this.lastCommands });
