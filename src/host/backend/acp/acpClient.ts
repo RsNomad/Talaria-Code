@@ -252,7 +252,46 @@ export class AcpClient implements AcpClientLike {
   private connection: ClientSideConnection | undefined;
   private readonly exitHandlers = new Set<(code: number | null) => void>();
 
+  /**
+   * W1-T1 (CF-01/A-2): the central terminate-race primitive. The pinned ACP
+   * SDK never rejects an in-flight request when the child's stdio stream
+   * closes (child death) — an unraced `await this.requireConnection().foo()`
+   * hangs forever if the child dies mid-request. Every OTHER un-jam
+   * mechanism in this codebase (`SessionController.runControlUtterance`'s
+   * wall-clock `Promise.race`, `ConnectionSupervisor.raceAgainstChildExit`'s
+   * `onExit`-based race) is bolted on at a CALLER, ad hoc, per call site —
+   * this pair + {@link raceTermination} instead fixes it ONCE, at the seam
+   * every request method already funnels through, so a future request
+   * method (or an existing one a future caller reaches un-raced) is
+   * protected for free.
+   *
+   * Created fresh in {@link connect} (one pair per live child — a reconnect
+   * gets a NEW pair, never reuses a dead connection's), and rejected inside
+   * `terminate()` (the single death choke `child.on('exit'|'error')` both
+   * funnel through, ~:290-300 below) — the SAME event that already fires
+   * {@link exitHandlers}.
+   */
+  private terminationReject: ((e: unknown) => void) | undefined;
+  private terminationPromise: Promise<never> | undefined;
+
   constructor(private readonly options: AcpClientOptions) {}
+
+  /**
+   * Races `op()` against this connection's termination promise — resolves/
+   * rejects with `op()`'s own outcome on the happy path (the race's OTHER
+   * side never settles until the child dies), rejects with the "terminated"
+   * error the instant the child dies first. A no-op passthrough
+   * (`return op()`) before the first {@link connect} — `requireConnection()`
+   * already throws synchronously in that state for every request method, so
+   * this never masks "not connected" as a hang. Also a no-op passthrough
+   * after `terminate()` has cleared the pair on THIS (now-dead, single-
+   * lifecycle) instance — see `terminate`'s own doc for why that residual
+   * window is accepted rather than closed.
+   */
+  private raceTermination<T>(op: () => Promise<T>): Promise<T> {
+    const term = this.terminationPromise;
+    return term ? Promise.race([op(), term]) : op();
+  }
 
   onExit(handler: (code: number | null) => void): { dispose(): void } {
     this.exitHandlers.add(handler);
@@ -269,6 +308,25 @@ export class AcpClient implements AcpClientLike {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;
+
+    // W1-T1: a fresh termination pair for THIS child — a reconnect after a
+    // prior death gets its own new pair, never inherits the dead one's
+    // (already-settled) promise. The `.catch(() => {})` below is load-
+    // bearing, not decorative: if no request happens to be in flight when
+    // `terminate()` later rejects this promise, {@link raceTermination} has
+    // never attached a `Promise.race` handler to it, and an unhandled
+    // rejection on ANY promise — even one nobody is awaiting — crashes a
+    // Node process under `--unhandled-rejections=strict` (the extension
+    // host's default) or logs a scary warning otherwise. Attaching this
+    // no-op handler here marks the promise "handled" for Node's own
+    // bookkeeping while leaving it fully live for `Promise.race` to consume
+    // later — multiple `.then`/`.catch` reactions on one promise are
+    // ordinary, independent subscribers, not a single consumed value.
+    const terminationPromise = new Promise<never>((_resolve, reject) => {
+      this.terminationReject = reject;
+    });
+    terminationPromise.catch(() => {});
+    this.terminationPromise = terminationPromise;
 
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (chunk: string) => this.log(`[stderr] ${chunk.replace(/\n$/, '')}`));
@@ -290,6 +348,33 @@ export class AcpClient implements AcpClientLike {
     const terminate = (code: number | null): void => {
       if (this.child !== child) return;
       this.child = undefined;
+      // W1-T1 (CF-01/A-2): reject FIRST — before the exitHandlers fan-out —
+      // so a caller `await`ing a raced request method (whose settlement
+      // reaches it via a microtask, same as everything below) observes the
+      // termination regardless of what an `onExit` handler does (including
+      // one that throws, already tolerated by the try/catch below). Message
+      // carries status/reason only (the exit/error code) — never body/key/
+      // path content, per this task's own constraint.
+      //
+      // Clear the pair right after: this exact `AcpClient` instance is
+      // single-lifecycle (`ConnectionSupervisor.createClient` mints a BRAND
+      // NEW instance for every connect/respawn — `connect()` is never called
+      // twice on the same object), so clearing has no effect on any future
+      // reconnect; it only affects a call issued to THIS now-dead instance
+      // after this point. Residual, accepted, and NOT a regression: such a
+      // call falls through `raceTermination`'s `op()`-only branch and can
+      // hang again exactly like every request did before this task — but
+      // only for a caller holding a STALE captured `client` reference from
+      // before the crash rather than re-reading `port.getClient()` (which
+      // every call site already nulls out synchronously inside this SAME
+      // `exitHandlers` fan-out, e.g. `ConnectionSupervisor.handleAcpCrash`'s
+      // `this.client = undefined` — a caller that re-reads sees no client at
+      // all and never issues the call). The request THAT WAS IN FLIGHT AT
+      // THE MOMENT OF DEATH — the case this task exists to fix — is caught
+      // above, before the pair is cleared, regardless.
+      this.terminationReject?.(new Error(`AcpClient: child terminated (code ${code})`));
+      this.terminationReject = undefined;
+      this.terminationPromise = undefined;
       for (const handler of [...this.exitHandlers]) {
         try {
           handler(code);
@@ -393,7 +478,16 @@ export class AcpClient implements AcpClientLike {
    * across calls, so it must be passed on every `session/new`.
    */
   async newSession(cwd: string, mcpServers: AcpMcpServer[] = []): Promise<AcpNewSessionResult> {
-    const response = (await this.requireConnection().newSession({ cwd, mcpServers })) as {
+    // W1-T1 (CF-01/A-2): raced against child termination — see
+    // {@link raceTermination}'s own doc. `ConnectionSupervisor
+    // .establishInitialSession`'s `raceAgainstChildExit` around THIS whole
+    // call (an independent, pre-existing `onExit`-based race) stays exactly
+    // as-is; this is belt-and-braces redundancy for that one caller, and the
+    // ONLY protection for every other `newSession` caller (e.g.
+    // `OneShotRunner`'s own wall-clock-deadline race around its whole body).
+    const response = (await this.raceTermination(() =>
+      this.requireConnection().newSession({ cwd, mcpServers }),
+    )) as {
       sessionId: string;
       modes?: { currentModeId?: string };
       models?: { currentModelId?: string };
@@ -409,16 +503,37 @@ export class AcpClient implements AcpClientLike {
   }
 
   async prompt(sessionId: string, content: AcpOutboundContentBlock[]): Promise<AcpPromptResult> {
-    const response = (await this.requireConnection().prompt({ sessionId, prompt: content })) as AcpPromptResult;
+    // W1-T1 (CF-01/A-2): raced against child termination — the PRIMARY site
+    // this task exists for. `SessionController.runTurn`'s `:961` await (the
+    // live turn's own prompt) had NO manual race of its own before this fix
+    // — a child death mid-turn hung the turn forever, spinner and all;
+    // `runTurn`'s try/catch (already correct) simply never got a chance to
+    // fire because the awaited promise never settled. `runControlUtterance`'s
+    // own wall-clock `Promise.race` and `OneShotRunner`'s body-vs-deadline
+    // race, both around OTHER `prompt` call sites, stay exactly as-is —
+    // redundant with this, not replaced by it.
+    const response = (await this.raceTermination(() =>
+      this.requireConnection().prompt({ sessionId, prompt: content }),
+    )) as AcpPromptResult;
     return response;
   }
 
   async cancel(sessionId: string): Promise<void> {
-    await this.requireConnection().cancel({ sessionId });
+    // W1-T1 (CF-01/A-2): raced against child termination. Every existing
+    // caller already treats a `cancel` rejection as fire-and-forget
+    // (`void client.cancel(...).catch(err => log(...))`) — this only turns
+    // an eternal dangling promise into one that settles honestly and fast.
+    await this.raceTermination(() => this.requireConnection().cancel({ sessionId }));
   }
 
   async setSessionMode(sessionId: string, modeId: string): Promise<void> {
-    await this.requireConnection().setSessionMode({ sessionId, modeId });
+    // W1-T1 (CF-01/A-2): raced against child termination. Both callers
+    // (`SessionController.pinWireModeDefault`'s degrade-on-catch and
+    // `runTurn`'s own re-pin, the LATTER sharing `runTurn`'s try/catch with
+    // the `prompt` call above) already `await` this inside a `try` — before
+    // this fix that `catch` could never fire on child death because the
+    // await itself never settled; this is what makes it reachable.
+    await this.raceTermination(() => this.requireConnection().setSessionMode({ sessionId, modeId }));
   }
 
   /**
@@ -476,7 +591,13 @@ export class AcpClient implements AcpClientLike {
    * `=== null` check that can never fire against the pinned SDK.
    */
   async setSessionModel(sessionId: string, modelId: string): Promise<void> {
-    await this.requireConnection().unstable_setSessionModel({ sessionId, modelId });
+    // W1-T1 (CF-01/A-2): raced against child termination. The sole caller
+    // (`SessionController.setModel`) already attaches an explicit rejection
+    // handler (`.then(resolve, reject)`, a seq-guarded UI rollback) — this
+    // turns an eternal dangling promise (today: the UI stays optimistically
+    // "switching…" forever on a child death mid-request) into an honest,
+    // fast failure through that SAME existing handler.
+    await this.raceTermination(() => this.requireConnection().unstable_setSessionModel({ sessionId, modelId }));
   }
 
   /**
@@ -492,8 +613,27 @@ export class AcpClient implements AcpClientLike {
     const params: Record<string, unknown> = {};
     if (cwd !== undefined) params.cwd = cwd;
     if (cursor !== undefined) params.cursor = cursor;
-    return (await this.requireConnection().listSessions(
-      params as Parameters<ClientSideConnection['listSessions']>[0],
+    // W1-T1 (CF-01/A-2): raced against child termination — the SECOND
+    // primary site this task exists for. The sole caller
+    // (`SessionsPanelSource.fetchPage`, `host/panels/panelSources.ts`) had NO
+    // race of its own before this fix: a child death mid-request hung the
+    // Sessions panel's fetch forever (a real hang, not merely an eventual
+    // 30s webview-side RPC timeout — that timeout only starts the clock, it
+    // never un-jams THIS await). The rejection now propagates through
+    // `SessionsPanelSource.fetch`'s un-caught `try/finally` (finally only
+    // clears the in-flight coalescing map, it never swallows) to
+    // `ControlDispatcher.fetchPanelData`/`invokeControl` (also uncaught by
+    // design — the correlated `control.request` path is where errors are
+    // meant to be turned into a wire response), and both of ITS callers
+    // already handle a rejection honestly:
+    // `TalariaViewProvider`'s `switchPanel` branch (`void
+    // this.backend.invokeControl(...).catch(err => log(...))`) and its
+    // `control.request` branch (`handleControlRequest`'s `try/catch`, which
+    // always posts a `control.response{ok:false}` back — the webview's
+    // `RpcClient` then rejects the caller's pending promise immediately
+    // instead of only via its own 30s timeout fallback).
+    return (await this.raceTermination(() =>
+      this.requireConnection().listSessions(params as Parameters<ClientSideConnection['listSessions']>[0]),
     )) as AcpListSessionsRawResult;
   }
 
@@ -515,7 +655,18 @@ export class AcpClient implements AcpClientLike {
     sessionId: string,
     mcpServers: AcpMcpServer[] = [],
   ): Promise<AcpLoadSessionResult> {
-    const response = (await this.requireConnection().loadSession({ cwd, sessionId, mcpServers })) as {
+    // W1-T1 (CF-01/A-2): raced against child termination.
+    // `ConnectionSupervisor.recoverOneSession`'s crash-recovery caller
+    // already races this same call via `raceRecoveryAgainstChildExit`
+    // (`onExit`-based, pre-existing) — redundant with this, unchanged.
+    // `SessionController.loadReplay`'s History-panel caller (`:1141`) had NO
+    // race of its own: its `try/catch` (already correct — emits an honest
+    // `error` + terminal `turn.end`) could never fire on a child death
+    // mid-load before this fix, for the identical "the await itself never
+    // settles" reason `runTurn`'s `prompt` catch couldn't.
+    const response = (await this.raceTermination(() =>
+      this.requireConnection().loadSession({ cwd, sessionId, mcpServers }),
+    )) as {
       modes?: { currentModeId?: string };
       models?: { currentModelId?: string };
     };
