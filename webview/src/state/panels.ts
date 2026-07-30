@@ -33,7 +33,27 @@ export type PanelStateMap = { [P in DataPanel]?: RemoteData<PanelDataMap[P]> };
  * `sessions` (one shared slice) and every global panel.
  */
 export type PanelAction =
-  | { type: 'local.panelLoading'; panel: DataPanel; scopeKey?: string }
+  | {
+      type: 'local.panelLoading';
+      panel: DataPanel;
+      scopeKey?: string;
+      /**
+       * CF-10: set ONLY by `fetchPanel`'s unbound-subagents short-circuit —
+       * carries the immediate empty payload for a fetch that was never
+       * actually issued (an unbound tab's subagents request can never
+       * receive its push, so there is no real "loading" happening). Kept
+       * under the SAME `local.panelLoading` discriminant (rather than a new
+       * action type) so the routing this already has —
+       * `reduceLocal`/`reducePanelActionScoped` in `transcript.ts` — doesn't
+       * need a matching new case; `applyPanelTransition` below is the only
+       * place that inspects it. Type-erased to `unknown` for the same reason
+       * `PanelAction` stays panel-agnostic everywhere else in this file (see
+       * `reducePanelAction`'s doc): the caller (`fetchPanel`) is the only
+       * place that ever sets it, and only with a
+       * `PanelDataMap['subagents']`-shaped value.
+       */
+      emptyData?: unknown;
+    }
   | { type: 'local.panelError'; panel: DataPanel; message: string; retryable: boolean; scopeKey?: string };
 
 /**
@@ -62,6 +82,11 @@ export function setPanelSuccess<P extends DataPanel>(
  */
 export function applyPanelTransition<T>(current: RemoteData<T>, action: PanelAction): RemoteData<T> {
   if (action.type === 'local.panelLoading') {
+    // CF-10: `fetchPanel`'s unbound-subagents short-circuit carries its
+    // pre-built empty payload here instead of a real fetch-in-flight — land
+    // it as an immediate success rather than `loading`. See `PanelAction`'s
+    // `emptyData` doc for why the cast is safe.
+    if (action.emptyData !== undefined) return success(action.emptyData as T);
     return current.status === 'success' ? current : loading;
   }
   return failure({ message: action.message, retryable: action.retryable });
@@ -130,6 +155,17 @@ export interface FetchPanelDeps {
  * whichever tab/root this fetch belongs to is fixed for its whole lifetime,
  * independent of whatever the ACTIVE tab happens to be when the promise
  * settles. Omit it for panels that don't need one (sessions/global).
+ *
+ * CF-10: an UNBOUND tab (no `sessionId` yet — before a session binds) can
+ * never receive a `subagents` push — the host stamps it `unknown-session`
+ * and `foldSessionScoped` drops any push that doesn't match a REAL session,
+ * so the RPC would resolve while the tab's slice never gets its data and the
+ * panel spins on "Loading subagents…" forever. `resolvePanelRequest` already
+ * omits `sessionId` from `req.params` for exactly this case (its own test
+ * pins that). Detected here, BEFORE the fetch is issued, from that same
+ * signal — an honest empty success is dispatched instead, and `deps.request`
+ * is never called. Bound tabs (`req.params` carries `sessionId`) and every
+ * other panel fall through to the unchanged fetch path below.
  */
 export function fetchPanel(
   panel: DataPanel,
@@ -141,6 +177,13 @@ export function fetchPanel(
 ): Promise<void> {
   const { scopeKey } = opts;
   const req = opts.req ?? { method: 'panel.data' as const, params: { panel } };
+
+  if (panel === 'subagents' && !(req.params && 'sessionId' in req.params)) {
+    const emptySubagents: PanelDataMap['subagents'] = { delegations: [] };
+    deps.dispatch({ type: 'local.panelLoading', panel, scopeKey, emptyData: emptySubagents });
+    return Promise.resolve();
+  }
+
   deps.dispatch({ type: 'local.panelLoading', panel, scopeKey });
   return deps.request(req.method, req.params).then(
     () => {

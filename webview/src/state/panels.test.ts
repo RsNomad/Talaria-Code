@@ -10,8 +10,9 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { DataPanel, PanelDataMap } from '../protocol';
-import { isError, isLoading, isSuccess } from './remoteData';
+import { idle, isError, isLoading, isSuccess } from './remoteData';
 import {
+  applyPanelTransition,
   assertExhaustivePanel,
   fetchPanel,
   reducePanelAction,
@@ -52,6 +53,32 @@ describe('panel RemoteData reducer helpers (Part X2)', () => {
     if (entry && isError(entry)) {
       expect(entry.error).toEqual({ message: 'not connected', retryable: true });
     }
+  });
+
+  /*
+   * CF-10: an unbound tab's subagents request can never receive its push (the
+   * host stamps it `unknown-session`; `foldSessionScoped` drops it — see
+   * `fetchPanel`'s short-circuit below), so `fetchPanel` announces it via a
+   * `local.panelLoading` action carrying `emptyData` instead of a real
+   * fetch-in-flight. `applyPanelTransition` (the scoped-panel half —
+   * `subagents`/`checkpoints`/`sessions` all fold through this, not the
+   * keyed-map `reducePanelAction` above) must turn THAT into an immediate
+   * `success`, not `loading`.
+   */
+  it('CF-10: applyPanelTransition turns a panelLoading action carrying emptyData into an immediate success, not loading', () => {
+    const next = applyPanelTransition(idle, {
+      type: 'local.panelLoading',
+      panel: 'subagents',
+      scopeKey: 'tab-1',
+      emptyData: { delegations: [] },
+    });
+    expect(isSuccess(next)).toBe(true);
+    if (isSuccess(next)) expect(next.data).toEqual({ delegations: [] });
+  });
+
+  it('a plain panelLoading action (no emptyData) still transitions to loading, unaffected', () => {
+    const next = applyPanelTransition(idle, { type: 'local.panelLoading', panel: 'subagents', scopeKey: 'tab-1' });
+    expect(isLoading(next)).toBe(true);
   });
 });
 
@@ -135,6 +162,61 @@ describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
       message: 'list failed',
       retryable: true,
     });
+  });
+
+  /*
+   * CF-10: an UNBOUND tab (no `sessionId` yet — before a session binds) omits
+   * `sessionId` from its subagents `panel.data` request params (see
+   * `resolvePanelRequest`'s own "unbound tab" test below — this is the exact
+   * signal it produces). The host stamps the resulting push `unknown-session`;
+   * `foldSessionScoped` drops it (it can't match this tab's real session,
+   * which doesn't exist yet); the RPC still resolves, but nothing ever lands
+   * -> the panel spins on "Loading subagents…" forever. Fix: `fetchPanel`
+   * detects the unbound case from `req.params` BEFORE issuing the fetch and
+   * short-circuits to an immediate empty success instead.
+   */
+  it('CF-10: an UNBOUND tab (no sessionId) subagents request short-circuits to an empty success — the RPC is never sent', async () => {
+    const dispatch = vi.fn();
+    const request = vi.fn();
+
+    await fetchPanel(
+      'subagents',
+      { request, dispatch },
+      { scopeKey: 'tab-1', req: { method: 'panel.data', params: { panel: 'subagents' } } },
+    );
+
+    expect(request).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'local.panelLoading',
+      panel: 'subagents',
+      scopeKey: 'tab-1',
+      emptyData: { delegations: [] },
+    });
+  });
+
+  it('CF-10: a BOUND tab (sessionId present) subagents request is unaffected — still fetches and announces plain loading', async () => {
+    const dispatch = vi.fn();
+    const request = vi.fn().mockResolvedValue(undefined);
+
+    await fetchPanel(
+      'subagents',
+      { request, dispatch },
+      { scopeKey: 'tab-1', req: { method: 'panel.data', params: { panel: 'subagents', sessionId: 'session-1' } } },
+    );
+
+    expect(request).toHaveBeenCalledWith('panel.data', { panel: 'subagents', sessionId: 'session-1' });
+    expect(dispatch).toHaveBeenCalledWith({ type: 'local.panelLoading', panel: 'subagents', scopeKey: 'tab-1' });
+  });
+
+  it('CF-10: the short-circuit is subagents-only — an unbound "sessions" request (no sessionId either) still fetches normally', async () => {
+    const dispatch = vi.fn();
+    const request = vi.fn().mockResolvedValue(undefined);
+
+    await fetchPanel('sessions', { request, dispatch }, { req: { method: 'panel.data', params: { panel: 'sessions' } } });
+
+    expect(request).toHaveBeenCalledWith('panel.data', { panel: 'sessions' });
+    expect(dispatch).toHaveBeenCalledWith({ type: 'local.panelLoading', panel: 'sessions', scopeKey: undefined });
   });
 });
 
