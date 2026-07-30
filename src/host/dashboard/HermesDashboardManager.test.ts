@@ -542,6 +542,126 @@ describe('HermesDashboardManager.ensure — CF-15: re-checks child liveness befo
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CF-15 REVIEW: the dead-child guard (~154-162) can force a SECOND concurrent
+// bringUp() while an EARLIER bringUp() is still pending. When the stale first
+// attempt later settles (fails), its catch handlers must NOT unconditionally
+// stomp `this.ready`/`this.child` if a newer, healthy bring-up has since
+// become the current memo — that clobber leaks the healthy child (invisible
+// to dispose()) and forces a redundant extra bring-up.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('HermesDashboardManager.ensure — CF-15 review: identity-guards a stale concurrent attempt', () => {
+  it('a stale FIRST bring-up that fails AFTER a concurrent SECOND bring-up already succeeded must not clobber the healthy this.ready/this.child (reviewer-reproduced overlap)', async () => {
+    // child1: starts alive, then "dies" while attempt1 is still stuck probing.
+    let child1Alive = true;
+    const child1: DashboardChild & { killed: boolean } = {
+      killed: false,
+      kill() {
+        this.killed = true;
+      },
+      alive: () => child1Alive,
+    };
+    const child2 = fakeChild(true);
+
+    // client1's probe() is gated: it stays pending until the test explicitly
+    // resolves it, so attempt1 (bringUp() #1) can be parked mid-flight AFTER
+    // it has already assigned `this.child = child1` (pre-health-probe), which
+    // is exactly the window the reviewer's finding names.
+    let resolveProbe1Called!: () => void;
+    const probe1CalledPromise = new Promise<void>((resolve) => {
+      resolveProbe1Called = resolve;
+    });
+    let resolveFirstProbeGate!: (v: boolean) => void;
+    const firstProbeGate = new Promise<boolean>((resolve) => {
+      resolveFirstProbeGate = resolve;
+    });
+    const client1: FakeClientHandle = {
+      get probeAdoptCallCount() {
+        return 0;
+      },
+      probe: async () => {
+        resolveProbe1Called();
+        return firstProbeGate;
+      },
+      probeAdopt: async () => false,
+      fetchServedToken: async () => null,
+      listSkills: async () => [],
+      listToolsets: async () => [],
+      toggleSkill: async (name, enabled) => ({ ok: true, name, enabled }),
+      toggleToolset: async (name, enabled) => ({ ok: true, name, enabled }),
+    };
+    const client2 = fakeClient({ probeSeq: [true] });
+
+    const spawnCalls: string[] = [];
+    let spawnCallCount = 0;
+    let makeClientCallCount = 0;
+
+    const manager = new HermesDashboardManager({
+      config: {},
+      port: 9119,
+      probeBackoffMs: [1], // ONE attempt: client1's gated `false` exhausts it immediately
+      deps: {
+        makeClient: () => {
+          makeClientCallCount++;
+          if (makeClientCallCount === 1) return client1;
+          if (makeClientCallCount === 2) return client2;
+          // A distinct 3rd client — if a redundant 3rd bring-up happens
+          // (pre-fix), it must be THIS, never client1/client2, so the
+          // assertions below can tell the two apart unambiguously.
+          return fakeClient({ probeSeq: [true] });
+        },
+        spawn: async (token) => {
+          spawnCallCount++;
+          spawnCalls.push(token);
+          if (spawnCallCount === 1) return child1;
+          if (spawnCallCount === 2) return child2;
+          // A distinct 3rd child, likewise never child1/child2.
+          return fakeChild(true);
+        },
+        sleep: async () => {},
+        mintToken: () => `token-${spawnCallCount + 1}`,
+      },
+    });
+
+    // Attempt 1: this.child gets assigned child1, then parks inside
+    // waitHealthy() awaiting the gated probe.
+    const firstEnsure = manager.ensure();
+    await probe1CalledPromise;
+
+    // child1 dies while attempt1 is still pending.
+    child1Alive = false;
+
+    // Attempt 2 (concurrent): the CF-15 dead-child guard fires (this.child
+    // === child1, dead) -> clears this.child/this.ready -> starts a fresh,
+    // independent bring-up that spawns + health-probes child2 successfully.
+    const secondEnsure = manager.ensure();
+    const client2Result = await secondEnsure;
+    expect(client2Result).toBe(client2);
+    expect(spawnCalls.length).toBe(2); // spawned twice so far (child1, child2) — expected, not the bug
+
+    // Now let the STALE attempt1 settle (fail): its gated probe resolves
+    // false, exhausting the single-entry backoff -> waitHealthy() throws.
+    resolveFirstProbeGate(false);
+    await expect(firstEnsure).rejects.toThrow(/did not become reachable/);
+
+    // The healthy child2 must NOT have been killed by attempt1's stale catch.
+    expect(child2.killed).toBe(false);
+
+    // A subsequent ensure() must return the SAME memoized healthy client —
+    // NOT trigger a 3rd redundant bring-up (this.ready must still be
+    // attempt2's resolved promise, not clobbered back to undefined).
+    const third = await manager.ensure();
+    expect(third).toBe(client2Result);
+    expect(spawnCalls.length).toBe(2); // still 2 — no redundant 3rd spawn
+
+    // dispose() must still be able to see/kill child2 (this.child must still
+    // point at it — not orphaned/leaked by attempt1's stale unconditional clear).
+    manager.dispose();
+    expect(child2.killed).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // T-B2 — dashboard liveness fail-open (closes V-9)
 // ─────────────────────────────────────────────────────────────────────────────
 //

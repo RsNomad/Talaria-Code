@@ -161,12 +161,22 @@ export class HermesDashboardManager implements DashboardService {
       this.ready = undefined;
     }
     if (!this.ready) {
-      this.ready = this.bringUp().catch((err) => {
+      // CF-15 review: the dead-child guard above can clear this.ready/this.child
+      // and force a SECOND, concurrent bringUp() while an EARLIER bringUp() is
+      // still pending (its own this.child was already assigned pre-health-probe).
+      // If that stale first attempt later fails, its rejection must NOT clobber
+      // this.ready if a newer bring-up has since become the current memo — mirror
+      // the codebase's identity self-reset idiom (ConnectionSupervisor's
+      // `this.inFlightStart === run`): capture the attempt promise itself and
+      // only clear this.ready if it is STILL that same attempt.
+      const attempt: Promise<DashboardClientLike> = this.bringUp().catch((err) => {
         // Clear the memo so the NEXT panel fetch (Retry) re-attempts adopt/spawn
-        // rather than caching the failure forever.
-        this.ready = undefined;
+        // rather than caching the failure forever — but only if we're still the
+        // current attempt (see comment above).
+        if (this.ready === attempt) this.ready = undefined;
         throw err;
       });
+      this.ready = attempt;
     }
     return this.ready;
   }
@@ -264,8 +274,15 @@ export class HermesDashboardManager implements DashboardService {
       // survive the spawn) — adopt the served token going forward.
       return servedToken && servedToken !== token ? this.deps.makeClient(servedToken) : client;
     } catch (err) {
-      child.kill(); // idempotent — a no-op if dispose() already killed it
-      this.child = undefined;
+      child.kill(); // idempotent — a no-op if dispose() already killed it; kills
+      // OUR OWN spawned child (the local `child`, captured above), never a
+      // later attempt's — that part was already identity-correct.
+      // CF-15 review: only null this.child if it is STILL the child THIS
+      // attempt spawned — a concurrent ensure() (the dead-child guard) may have
+      // started a second, independent bring-up that already installed a
+      // healthy child as the current this.child; a stale attempt failing later
+      // must not clobber it (leaked healthy child + redundant re-spawn).
+      if (this.child === child) this.child = undefined;
       throw err;
     }
   }
