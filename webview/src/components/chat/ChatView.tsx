@@ -2,7 +2,7 @@
  * Renders the streaming transcript. Auto-scrolls to the newest item unless the
  * user has scrolled up to read history. Dispatches diff / approval resolutions.
  */
-import { memo, useEffect, useRef } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { TranscriptItem, ToolItem } from '../../types';
 import { Hero } from '../Hero';
 import { LiveRegion } from '../LiveRegion';
@@ -14,6 +14,31 @@ import { DiffCard } from './DiffCard';
 import { ApprovalCard } from './ApprovalCard';
 import { PlanList } from './PlanList';
 import { ResultSummary } from './ResultSummary';
+import { JumpToLatest } from './JumpToLatest';
+
+/**
+ * UI#1: the streaming-pin re-pin buffer, raised from the original ~48px.
+ * Any scroll position within this many px of true bottom still counts as
+ * "pinned" — a couple of message-line's worth of slack absorbs ordinary
+ * wheel/trackpad jitter near the bottom edge without spuriously flipping
+ * the latch (and un-hiding the jump-to-latest pill) for a scroll the user
+ * never intended as "step away from live content".
+ */
+const REPIN_BUFFER_PX = 100;
+
+/**
+ * UI#1: native `scrollIntoView({behavior:'smooth'})` is not a CSS
+ * transition, so the global `prefers-reduced-motion` kill-rule (`index.css`)
+ * has no effect on it — this must be checked explicitly, mirroring the same
+ * defensive `matchMedia` guard `MockBackend.ts` already uses (jsdom, and
+ * some older engines, don't implement `matchMedia` at all).
+ */
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false)
+  );
+}
 
 interface ChatViewProps {
   transcript: TranscriptItem[];
@@ -280,20 +305,72 @@ export const ChatView = memo(function ChatView({
 }: ChatViewProps) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // UI#1: `pinnedRef` stays the single SYNCHRONOUS source of truth for the
+  // scroll effect below (exactly like the original design — mutated
+  // directly by the scroll handler, read imperatively, no render-timing
+  // dependency). `pinned` state MIRRORS it purely so the render below can
+  // expose `!pinned` to gate the jump-to-latest pill; nothing reads `pinned`
+  // to decide whether to scroll.
   const pinnedRef = useRef(true);
+  const [pinned, setPinned] = useState(true);
+  /** UI#1: transcript length at the moment we last went unpinned (or the
+   * latch last reset at a turn start) — the baseline the unseen count below
+   * is measured against. */
+  const unseenBaselineRef = useRef(0);
+  /** UI#1: the turnId of the most recent `user` item already reacted to as
+   * a turn start, so the effect below can tell "this turn's transcript grew
+   * again" from "a NEW turn just began" without a dedicated prop. */
+  const lastTurnIdRef = useRef<string | undefined>(undefined);
   const pendingToolIds = pendingDiffToolIds(transcript);
   const deniedIds = deniedToolIds(transcript);
 
-  // Track whether the user is pinned to the bottom.
+  // Track whether the user is pinned to the bottom. UI#1: buffer raised
+  // 48px -> 100px (see REPIN_BUFFER_PX doc).
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
-    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < REPIN_BUFFER_PX;
+    if (atBottom === pinnedRef.current) return;
+    pinnedRef.current = atBottom;
+    // Just scrolled away: snapshot how much already existed, so later growth
+    // can be counted as "unseen" against this baseline.
+    if (!atBottom) unseenBaselineRef.current = transcript.length;
+    setPinned(atBottom);
+  };
+
+  // UI#1: the pill's one-click way back — re-pins and scrolls to the
+  // newest item. `unseenCount` below falls back to 0 the instant `pinned`
+  // flips true, which is what hides the pill (no separate "hide" step).
+  const jumpToLatest = () => {
+    pinnedRef.current = true;
+    setPinned(true);
+    endRef.current?.scrollIntoView({
+      block: 'end',
+      behavior: prefersReducedMotion() ? 'auto' : 'smooth',
+    });
   };
 
   useEffect(() => {
+    // UI#1: RESET the pin latch on turn start. A fresh `user` item landing
+    // as the transcript's newest entry means a new turn just began — the
+    // whole point of pinning is to show what's happening NOW, so a scroll-up
+    // from turns ago must not go on silently suppressing auto-scroll forever.
+    const lastItem = transcript[transcript.length - 1];
+    if (lastItem && lastItem.kind === 'user' && lastItem.turnId !== lastTurnIdRef.current) {
+      lastTurnIdRef.current = lastItem.turnId;
+      unseenBaselineRef.current = transcript.length;
+      if (!pinnedRef.current) {
+        pinnedRef.current = true;
+        setPinned(true);
+      }
+    }
     if (pinnedRef.current) endRef.current?.scrollIntoView({ block: 'end' });
   }, [transcript]);
+
+  // UI#1: how much has arrived since the user scrolled away — always 0
+  // while pinned (nothing to "catch up" on) and the gate `!pinned &&
+  // unseenCount > 0` below relies on that for hiding the pill on re-pin.
+  const unseenCount = pinned ? 0 : Math.max(0, transcript.length - unseenBaselineRef.current);
 
   if (transcript.length === 0) {
     return <Hero onStarter={onStarter} disabled={starterDisabled} />;
@@ -314,20 +391,26 @@ export const ChatView = memo(function ChatView({
        * silent, not descriptive, the instant one settles). Same
        * always-mounted, text-swap-only discipline as the assertive sibling. */}
       <LiveRegion text={settlementAnnouncement(transcript)} className="sr-only" />
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        role="log"
-        aria-label="Conversation"
-        tabIndex={0}
-        className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-3 py-3.5"
-      >
-        {transcript.map((item, i) => (
-          <div key={itemKey(item, i)}>
-            {renderItem(item, onApproval, onDiff, onOpenDiff, pendingToolIds, deniedIds)}
-          </div>
-        ))}
-        <div ref={endRef} />
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div
+          ref={scrollRef}
+          onScroll={onScroll}
+          role="log"
+          aria-label="Conversation"
+          tabIndex={0}
+          className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-3 py-3.5"
+        >
+          {transcript.map((item, i) => (
+            <div key={itemKey(item, i)}>
+              {renderItem(item, onApproval, onDiff, onOpenDiff, pendingToolIds, deniedIds)}
+            </div>
+          ))}
+          <div ref={endRef} />
+        </div>
+        {/* UI#1: only while scrolled away from the bottom AND content has
+         * actually landed below the user — never merely for "scrolled up",
+         * and never while pinned (see `unseenCount`'s doc above). */}
+        {!pinned && unseenCount > 0 && <JumpToLatest count={unseenCount} onClick={jumpToLatest} />}
       </div>
     </>
   );

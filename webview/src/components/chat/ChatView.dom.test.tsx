@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'vitest';
-import { render } from '@testing-library/react';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, fireEvent } from '@testing-library/react';
 import { ChatView } from './ChatView';
-import type { ApprovalItem, MessageItem, TranscriptItem } from '../../types';
+import type { ApprovalItem, MessageItem, TranscriptItem, UserItem } from '../../types';
 
 /**
  * UI I-7 (path doc `af-architecture-path.md` §4 B1). Two independent gaps:
@@ -30,6 +30,10 @@ import type { ApprovalItem, MessageItem, TranscriptItem } from '../../types';
 
 function messageItem(overrides: Partial<MessageItem> = {}): MessageItem {
   return { kind: 'message', turnId: 't1', id: 'm1', text: 'hello', streaming: false, ...overrides };
+}
+
+function userItem(overrides: Partial<UserItem> = {}): UserItem {
+  return { kind: 'user', turnId: 't1', text: 'hi', mode: 'default', ...overrides };
 }
 
 function approvalItem(overrides: Partial<ApprovalItem> = {}): ApprovalItem {
@@ -179,5 +183,178 @@ describe('ChatView accessibility (T-A2-SC4): polite settlement announcement', ()
     const { getByRole } = renderChatView([messageItem(), approvalItem()]);
 
     expect(getByRole('status')).toHaveTextContent('');
+  });
+});
+
+/**
+ * UI#1 (Wave 2, task W2-T7). ChatView's streaming auto-scroll "pin" used to
+ * implement only HALF the contract: scrolling up during a live turn silenced
+ * auto-scroll with no signal that content was still arriving below and no
+ * one-click way back — the user just quietly falls behind. `scrollAway`
+ * below fakes jsdom's always-zero scroll geometry (jsdom runs no real
+ * layout, same gap `PriorityTabs.dom.test.tsx` documents for
+ * `offsetWidth`/`getBoundingClientRect`) so `ChatView`'s own `onScroll`
+ * handler sees a real "scrolled far from the bottom" position and flips its
+ * pin latch, exactly like a real trackpad scroll would.
+ */
+function scrollAway(log: HTMLElement) {
+  Object.defineProperty(log, 'scrollHeight', { value: 2000, configurable: true });
+  Object.defineProperty(log, 'scrollTop', { value: 200, configurable: true });
+  Object.defineProperty(log, 'clientHeight', { value: 400, configurable: true });
+  // distance = 2000 - 200 - 400 = 1400px — far past even the raised ~100px
+  // re-pin buffer, so this is unambiguously "scrolled away" under either the
+  // old 48px or the new ~100px threshold.
+  fireEvent.scroll(log);
+}
+
+describe('ChatView jump-to-latest pill (UI#1)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders a jump-to-latest pill carrying the unseen count once new content arrives after the user scrolls away', () => {
+    const { getByRole, rerender } = renderChatView([
+      userItem(),
+      messageItem({ id: 'm1', streaming: true, text: 'partial' }),
+    ]);
+
+    scrollAway(getByRole('log'));
+
+    // Two more blocks stream in while the user is scrolled away reading history.
+    rerender(
+      <ChatView
+        transcript={[
+          userItem(),
+          messageItem({ id: 'm1', streaming: true, text: 'partial and more' }),
+          messageItem({ id: 'm2', streaming: true, text: 'a second block' }),
+          messageItem({ id: 'm3', streaming: true, text: 'a third block' }),
+        ]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+      />,
+    );
+
+    const pill = getByRole('button', { name: 'Jump to latest, 2 new' });
+    expect(pill).toBeInTheDocument();
+  });
+
+  it('does not render the pill while pinned to the bottom, even as new content streams in', () => {
+    const { getByRole, queryByRole, rerender } = renderChatView([
+      userItem(),
+      messageItem({ id: 'm1', streaming: true, text: 'partial' }),
+    ]);
+    // No scroll — stays pinned.
+    void getByRole('log');
+
+    rerender(
+      <ChatView
+        transcript={[
+          userItem(),
+          messageItem({ id: 'm1', streaming: true, text: 'partial and more' }),
+          messageItem({ id: 'm2', streaming: true, text: 'a second block' }),
+        ]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+      />,
+    );
+
+    expect(queryByRole('button', { name: /Jump to latest/ })).toBeNull();
+  });
+
+  it('does not render the pill right after scrolling away when nothing new has arrived yet', () => {
+    const { getByRole, queryByRole } = renderChatView([
+      userItem(),
+      messageItem({ id: 'm1', streaming: true, text: 'partial' }),
+    ]);
+
+    scrollAway(getByRole('log'));
+
+    expect(queryByRole('button', { name: /Jump to latest/ })).toBeNull();
+  });
+
+  it('clicking the pill re-pins, scrolls to the newest item, and hides itself', () => {
+    const { getByRole, queryByRole, rerender } = renderChatView([
+      userItem(),
+      messageItem({ id: 'm1', streaming: true, text: 'partial' }),
+    ]);
+
+    scrollAway(getByRole('log'));
+    rerender(
+      <ChatView
+        transcript={[
+          userItem(),
+          messageItem({ id: 'm1', streaming: true, text: 'partial and more' }),
+          messageItem({ id: 'm2', streaming: true, text: 'a second block' }),
+          messageItem({ id: 'm3', streaming: true, text: 'a third block' }),
+        ]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+      />,
+    );
+
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+    const pill = getByRole('button', { name: 'Jump to latest, 2 new' });
+
+    fireEvent.click(pill);
+
+    expect(scrollSpy).toHaveBeenCalled();
+    expect(queryByRole('button', { name: /Jump to latest/ })).toBeNull();
+  });
+
+  /**
+   * The other half of the wiring fix: the pin latch must RESET when a new
+   * turn starts, even if the user scrolled away mid the PREVIOUS turn — a
+   * fresh `user` item landing as the transcript's newest entry means the
+   * conversation has moved on, and silently staying unpinned forever (long
+   * after the user forgot they'd scrolled) is the exact bug this task closes.
+   */
+  it('resets the pin latch on turn start, auto-scrolling again even though the user never re-pinned by hand', () => {
+    const { getByRole, queryByRole, rerender } = renderChatView([
+      userItem({ turnId: 't1' }),
+      messageItem({ id: 'm1', turnId: 't1', streaming: true, text: 'partial' }),
+    ]);
+
+    scrollAway(getByRole('log'));
+    rerender(
+      <ChatView
+        transcript={[
+          userItem({ turnId: 't1' }),
+          messageItem({ id: 'm1', turnId: 't1', streaming: false, text: 'done' }),
+          messageItem({ id: 'm2', turnId: 't1', streaming: false, text: 'a second block' }),
+        ]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+      />,
+    );
+    // Sanity: the pill is up before the new turn starts.
+    expect(getByRole('button', { name: 'Jump to latest, 1 new' })).toBeInTheDocument();
+
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+    // A brand new turn begins — a fresh `user` item lands as the newest entry.
+    rerender(
+      <ChatView
+        transcript={[
+          userItem({ turnId: 't1' }),
+          messageItem({ id: 'm1', turnId: 't1', streaming: false, text: 'done' }),
+          messageItem({ id: 'm2', turnId: 't1', streaming: false, text: 'a second block' }),
+          userItem({ turnId: 't2', text: 'next question' }),
+        ]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+      />,
+    );
+
+    expect(scrollSpy).toHaveBeenCalled();
+    expect(queryByRole('button', { name: /Jump to latest/ })).toBeNull();
   });
 });
