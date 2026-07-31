@@ -495,11 +495,14 @@
     "watch:webview": "cd webview && vite build --watch",
     "watch": "concurrently -n host,webview -c blue,green \"npm:watch:host\" \"npm:watch:webview\"",
     "check-types": "tsc --noEmit",
+    "check-types:all": "npm run check-types && npm run typecheck -w webview",
     "package": "vsce package",
     "package:linux-x64": "vsce package --target linux-x64",
     "package:linux-arm64": "vsce package --target linux-arm64",
     "vscode:prepublish": "npm run build:host -- --production && npm run build:webview",
-    "test": "vitest run"
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "gate": "npm run check-types:all && npm test"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "0.17.1",
