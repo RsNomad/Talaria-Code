@@ -11,11 +11,21 @@
  * the tracker's own review fought for must not be bypassed from the UI.
  */
 import { useState } from 'react';
-import type { Checkpoint, CheckpointRestoreResult, CheckpointsData } from '../protocol';
+import type { Checkpoint, CheckpointPhase, CheckpointRestoreResult, CheckpointsData } from '../protocol';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
 import { PanelShell } from './PanelShell';
+
+/** CF-12/m-9: human label for a checkpoint row's {@link Checkpoint.phase}. */
+const PHASE_LABELS: Record<CheckpointPhase, string> = {
+  before: 'Before',
+  after: 'After',
+  anchor: 'Anchor',
+};
+
+/** Which redo action a pending/blocked/completed redo state refers to. */
+type RedoKind = 'redo' | 'redoAll';
 
 /**
  * W4-T5b: the muted `· <label>` suffix for a checkpoint row's meta line —
@@ -76,6 +86,21 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
   const [confirming, setConfirming] = useState<string | undefined>(undefined);
   const [restoringId, setRestoringId] = useState<string | undefined>(undefined);
   const [restored, setRestored] = useState<string | undefined>(undefined);
+
+  /**
+   * CF-12 (W3-T7): the Redo / Redo-all affordance for {@link
+   * CheckpointsData.redo} — mirrors the row-level restore state above
+   * (`redoPending` = in-flight lock, `redoBlocked` = the dirty-worktree
+   * guard's refusal + force-retry, `redoDone`/`redoSkipped` = the success
+   * acknowledgement and its partial-rollback notice), one instance for the
+   * whole panel since a redo target is not a per-row action — it targets the
+   * tracker's own stored cursor/anchor (`CheckpointRedoState.cursorId`/
+   * `.anchorId`), never a checkpoint id the panel picks.
+   */
+  const [redoPending, setRedoPending] = useState<RedoKind | undefined>(undefined);
+  const [redoBlocked, setRedoBlocked] = useState<{ kind: RedoKind; reason: string } | undefined>(undefined);
+  const [redoDone, setRedoDone] = useState<RedoKind | undefined>(undefined);
+  const [redoSkipped, setRedoSkipped] = useState<{ kind: RedoKind; paths: string[] } | undefined>(undefined);
 
   if (data.available === false) {
     return (
@@ -148,8 +173,159 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
     void restore(id, force).finally(() => setRestoringId(undefined));
   };
 
+  /**
+   * CF-12 (W3-T7): fires the correlated `checkpoint.redo`/`checkpoint.redoAll`
+   * request DIRECTLY over `bridge` — the same seam `ErrorBoundary.tsx`'s
+   * Reload button uses for `bridge.post` — rather than a new callback prop
+   * threaded through `App.tsx` (this task's scope is this file alone).
+   * `ControlDispatcher.redoCheckpoint` (host) takes `{force?, rootId?}` — NO
+   * checkpoint id, unlike restore: redo/redoAll step/jump the tracker's own
+   * stored cursor toward its anchor, not a panel-picked row. `rootId` is
+   * intentionally omitted: the panel has no route to the active tab's
+   * `rootId` without that extra wiring; the host's single-root convenience
+   * fallback (`resolveRestoreTargetRoot`) covers the common case, and a
+   * genuinely ambiguous multi-root workspace surfaces its own honest
+   * refusal through the SAME `redoBlocked` UI below, exactly like a restore
+   * would for the same condition.
+   *
+   * `bridge` is loaded via a dynamic `import('../bridge')` rather than a
+   * static top-level import: `../bridge`'s module-level singleton touches
+   * `window` at import time (documented at `bridge.test.ts`/
+   * `ErrorBoundary.test.ts`), and this file is also imported by the PURE,
+   * `environment: 'node'` `CheckpointsPanel.test.ts` (for
+   * `checkpointSessionLabelSuffix`) — a static import would crash that
+   * suite. Deferring the import into this handler means it only evaluates
+   * when a redo is actually invoked (never during the pure test's import),
+   * with zero behavior change for real use: `App.tsx` already imports
+   * `../bridge` statically, so by the time this panel is ever on screen the
+   * module — and its one singleton — is already resolved/cached.
+   */
+  const runRedo = (kind: RedoKind, force?: boolean) => {
+    if (redoPending !== undefined) return; // in flight — ignore repeat clicks
+    setRedoPending(kind);
+    setRedoDone(undefined);
+    if (!force) setRedoBlocked(undefined);
+    setRedoSkipped(undefined);
+    const method = kind === 'redo' ? 'checkpoint.redo' : 'checkpoint.redoAll';
+    const params: Record<string, unknown> = {};
+    if (force) params.force = true;
+    void import('../bridge')
+      .then(({ bridge }) => bridge.request(method, params))
+      .then(
+        (raw) => {
+          const result = raw as CheckpointRestoreResult | undefined;
+          // Mirrors T-C2 (V-17) above: `undefined` is never success.
+          if (!result) {
+            setRedoBlocked({ kind, reason: 'Redo failed — the host returned no result.' });
+          } else if (!result.restored) {
+            setRedoBlocked({ kind, reason: result.reason || 'Redo was refused.' });
+          } else {
+            setRedoBlocked(undefined);
+            setRedoDone(kind);
+            if (result.skippedPaths && result.skippedPaths.length > 0) {
+              setRedoSkipped({ kind, paths: result.skippedPaths });
+            }
+          }
+        },
+        (err: unknown) => {
+          setRedoBlocked({ kind, reason: err instanceof Error ? err.message : 'Redo failed.' });
+        },
+      )
+      .finally(() => setRedoPending(undefined));
+  };
+
+  const redoStatusText = redoBlocked
+    ? ''
+    : redoPending
+      ? redoPending === 'redo'
+        ? 'Redoing…'
+        : 'Redoing all…'
+      : redoDone
+        ? redoDone === 'redo'
+          ? 'Workspace redone to the next checkpoint.'
+          : 'Workspace redone to the latest state.'
+        : '';
+
   return (
     <PanelShell title="Checkpoints" meta={`${data.checkpoints.length} saved`}>
+      {data.redo && (
+        <div className="mb-3 rounded-card border border-border bg-surface px-3 py-2">
+          <div className="flex items-start gap-1.5 text-2xs text-fg">
+            <Icon name="info" size={12} className="mt-0.5 flex-none text-faint" />
+            <span>
+              {data.redo.anchorTurnOrdinal !== undefined
+                ? `A checkpoint was undone — redo is available back to turn ${data.redo.anchorTurnOrdinal}.`
+                : 'A checkpoint was undone — redo is available.'}
+            </span>
+          </div>
+
+          {redoBlocked ? (
+            <div className="mt-1.5 rounded border border-warn bg-warn-soft px-2 py-1.5">
+              <div className="flex items-start gap-1.5 text-2xs text-fg">
+                <Icon name="warning" size={12} className="mt-0.5 flex-none text-warn" />
+                <span>{redoBlocked.reason}</span>
+              </div>
+              <div className="mt-1.5 flex gap-2">
+                <button
+                  type="button"
+                  aria-disabled={redoPending !== undefined ? true : undefined}
+                  onClick={() => runRedo(redoBlocked.kind, true)}
+                  className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay aria-disabled:cursor-default aria-disabled:opacity-50"
+                >
+                  {redoBlocked.kind === 'redo' ? 'Redo anyway' : 'Redo all anyway'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRedoBlocked(undefined)}
+                  className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="mt-1.5 flex items-center gap-2">
+              <button
+                type="button"
+                disabled={redoPending !== undefined}
+                onClick={() => runRedo('redo')}
+                className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:opacity-50"
+              >
+                Redo
+              </button>
+              <button
+                type="button"
+                disabled={redoPending !== undefined}
+                onClick={() => runRedo('redoAll')}
+                className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:opacity-50"
+              >
+                Redo all
+              </button>
+            </div>
+          )}
+
+          <LiveRegion text={redoStatusText} className={redoStatusText ? 'mt-1.5 text-2xs text-fg' : ''} />
+
+          {redoSkipped && (
+            <div className="mt-1.5 rounded border border-border bg-overlay px-2 py-1.5">
+              <div className="flex items-start gap-1.5 text-2xs text-fg">
+                <Icon name="info" size={12} className="mt-0.5 flex-none text-faint" />
+                <span>
+                  Redone. {redoSkipped.paths.length} file{redoSkipped.paths.length === 1 ? '' : 's'} skipped
+                  — a symlink pointed outside the workspace.
+                </span>
+              </div>
+              <ul className="mt-1 list-none space-y-0.5 pl-[18px]">
+                {redoSkipped.paths.map((p) => (
+                  <li key={p} className="truncate font-mono text-2xs text-faint">
+                    {p}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
       <ol className="relative m-0 list-none p-0">
         {data.checkpoints.map((cp, i) => {
           const last = i === data.checkpoints.length - 1;
@@ -221,6 +397,12 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
                 </div>
                 <div className="mt-0.5 flex flex-wrap items-center gap-2 font-mono text-2xs text-faint">
                   <span>{cp.age}</span>
+                  {cp.phase && (
+                    <>
+                      <span>·</span>
+                      <span className="truncate">{PHASE_LABELS[cp.phase]}</span>
+                    </>
+                  )}
                   {cp.filesChanged !== undefined && (
                     <>
                       <span>·</span>

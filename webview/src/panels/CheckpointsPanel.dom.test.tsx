@@ -12,12 +12,13 @@
  * instance created BEFORE render) and the `checkpoint()` fixture pattern from
  * `CheckpointsPanel.test.ts`.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { ReactElement } from 'react';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { Checkpoint, CheckpointRestoreResult, CheckpointsData } from '../protocol';
+import type { Checkpoint, CheckpointRedoState, CheckpointRestoreResult, CheckpointsData } from '../protocol';
 import { CheckpointsPanel } from './CheckpointsPanel';
+import { bridge } from '../bridge';
 
 /** Documented shape: invoke `userEvent.setup()` BEFORE rendering, and use the
  *  returned instance rather than the direct API. */
@@ -244,5 +245,138 @@ describe('F6: checkpoint restore progress/success is carried by a permanently-mo
     // RED today: the success span is a brand-new node conditionally mounted
     // once `restored === cp.id` — not the same node that was present before.
     expect(after).toBe(before);
+  });
+});
+
+/**
+ * CF-12 (W3-T7): the host-side anchored-redo path (`CheckpointRedoState`,
+ * `ControlDispatcher.redoCheckpoint`, `CheckpointTracker.redo()`/`.redoAll()`)
+ * has existed since W2-F2 Phase 1, but the panel never read `data.redo` (grep
+ * `redo` in this file: 0 hits before this task) — so after a mistaken restore
+ * there was no UI to recover. `checkpoint.redo`/`checkpoint.redoAll` are
+ * host-dispatcher special-cases (`ControlDispatcher.ts`) taking `{force?,
+ * rootId?}` over the CORRELATED `control.request` path — no checkpoint `id`,
+ * unlike restore: redo/redoAll act on the tracker's own stored cursor/anchor.
+ * The panel fires them directly over `bridge.request` (same seam
+ * `ErrorBoundary.tsx`'s Reload button uses for `bridge.post`) rather than a
+ * new `onRedo` callback prop threaded through `App.tsx` — this task's scope
+ * is this file alone.
+ */
+describe('CF-12: Redo/Redo-all render from data.redo and fire checkpoint.redo/redoAll directly', () => {
+  function renderWithRedo(
+    config: { redo?: CheckpointRedoState; checkpoints?: Checkpoint[] } = {},
+  ) {
+    const data: CheckpointsData = {
+      checkpoints: config.checkpoints ?? [checkpoint()],
+      redo: config.redo,
+    };
+    return render(
+      <CheckpointsPanel
+        data={data}
+        onRestore={async () => ({ restored: true, filesChanged: 0, changedPaths: [] })}
+      />,
+    );
+  }
+
+  it('renders no Redo controls when data.redo is absent (no dead affordance)', () => {
+    renderWithRedo();
+
+    expect(screen.queryByRole('button', { name: 'Redo' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Redo all' })).not.toBeInTheDocument();
+  });
+
+  it('renders Redo and Redo all when data.redo is present, and clicking Redo posts checkpoint.redo with {} (no id, per the host special-case)', async () => {
+    const requestSpy = vi
+      .spyOn(bridge, 'request')
+      .mockResolvedValue({ restored: true, filesChanged: 0, changedPaths: [] });
+    const user = userEvent.setup();
+    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1', anchorTurnOrdinal: 3 } });
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+
+    expect(requestSpy).toHaveBeenCalledWith('checkpoint.redo', {});
+    requestSpy.mockRestore();
+  });
+
+  it('clicking Redo all posts checkpoint.redoAll with {}', async () => {
+    const requestSpy = vi
+      .spyOn(bridge, 'request')
+      .mockResolvedValue({ restored: true, filesChanged: 0, changedPaths: [] });
+    const user = userEvent.setup();
+    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' } });
+
+    await user.click(screen.getByRole('button', { name: 'Redo all' }));
+
+    expect(requestSpy).toHaveBeenCalledWith('checkpoint.redoAll', {});
+    requestSpy.mockRestore();
+  });
+
+  it('disables both Redo buttons while a request is in flight (honest pending state, no double-fire)', async () => {
+    let release: ((v: CheckpointRestoreResult) => void) | undefined;
+    const requestSpy = vi.spyOn(bridge, 'request').mockImplementation(
+      () =>
+        new Promise((r) => {
+          release = r;
+        }),
+    );
+    const user = userEvent.setup();
+    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' } });
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+
+    expect(screen.getByRole('button', { name: 'Redo' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Redo all' })).toBeDisabled();
+
+    release?.({ restored: true, filesChanged: 0, changedPaths: [] });
+    requestSpy.mockRestore();
+  });
+
+  it('a refused redo surfaces its reason and a force retry, mirroring the restore block/"anyway" pattern', async () => {
+    const requestSpy = vi
+      .spyOn(bridge, 'request')
+      .mockResolvedValue({ restored: false, reason: 'A turn is still running — wait for it to finish.' });
+    const user = userEvent.setup();
+    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' } });
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+
+    expect(await screen.findByText('A turn is still running — wait for it to finish.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Redo anyway' })).toBeInTheDocument();
+    requestSpy.mockRestore();
+  });
+
+  it('a successful redo is acknowledged in the UI', async () => {
+    const requestSpy = vi
+      .spyOn(bridge, 'request')
+      .mockResolvedValue({ restored: true, filesChanged: 2, changedPaths: ['a.txt', 'b.txt'] });
+    const user = userEvent.setup();
+    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' } });
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+
+    expect(await screen.findByText(/redone/i)).toBeInTheDocument();
+    requestSpy.mockRestore();
+  });
+
+  it('renders the before/after/anchor phase label for rows that carry a phase (folds Minor m-9)', () => {
+    renderWithRedo({
+      checkpoints: [
+        checkpoint({ id: 'c1', phase: 'before' }),
+        checkpoint({ id: 'c2', phase: 'after' }),
+        checkpoint({ id: 'c3', phase: 'anchor' }),
+      ],
+    });
+
+    expect(screen.getByText('Before')).toBeInTheDocument();
+    expect(screen.getByText('After')).toBeInTheDocument();
+    expect(screen.getByText('Anchor')).toBeInTheDocument();
+  });
+
+  it('renders no phase label for a legacy row that carries none', () => {
+    renderWithRedo({ checkpoints: [checkpoint({ id: 'c-legacy' })] });
+
+    expect(screen.queryByText('Before')).not.toBeInTheDocument();
+    expect(screen.queryByText('After')).not.toBeInTheDocument();
+    expect(screen.queryByText('Anchor')).not.toBeInTheDocument();
   });
 });
