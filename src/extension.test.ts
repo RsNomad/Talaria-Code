@@ -44,6 +44,14 @@ const state = {
   isTrusted: true,
   workspaceFolders: undefined as unknown,
   activeTextEditor: undefined as unknown,
+  // CF-09: config-change listeners registered via
+  // `vscode.workspace.onDidChangeConfiguration`, the executed-command log
+  // (so a test can assert `workbench.action.reloadWindow` actually ran), and
+  // the button label `showInformationMessage` resolves to (so a test can
+  // simulate the user clicking "Reload Window" vs. dismissing the prompt).
+  configChangeListeners: new Set<(e: { affectsConfiguration: (section: string) => boolean }) => void>(),
+  executedCommands: [] as string[],
+  infoResponse: undefined as string | undefined,
 };
 
 function resetState(): void {
@@ -54,6 +62,9 @@ function resetState(): void {
   state.isTrusted = true;
   state.workspaceFolders = undefined;
   state.activeTextEditor = undefined;
+  state.configChangeListeners.clear();
+  state.executedCommands.length = 0;
+  state.infoResponse = undefined;
 }
 
 vi.mock('vscode', () => {
@@ -96,7 +107,10 @@ vi.mock('vscode', () => {
         state.registeredCommands.set(id, handler);
         return { dispose: () => state.registeredCommands.delete(id) };
       },
-      executeCommand: (..._args: unknown[]) => Promise.resolve(undefined),
+      executeCommand: (...args: unknown[]) => {
+        state.executedCommands.push(String(args[0]));
+        return Promise.resolve(undefined);
+      },
     },
     languages: {
       registerCodeActionsProvider: () => ({ dispose() {} }),
@@ -114,9 +128,9 @@ vi.mock('vscode', () => {
         state.warnings.push(msg);
         return Promise.resolve(undefined);
       },
-      showInformationMessage: (msg: string) => {
+      showInformationMessage: (msg: string, ..._items: string[]) => {
         state.infos.push(msg);
-        return Promise.resolve(undefined);
+        return Promise.resolve(state.infoResponse);
       },
       get activeTextEditor() {
         return state.activeTextEditor;
@@ -140,6 +154,10 @@ vi.mock('vscode', () => {
         return state.workspaceFolders as never;
       },
       onDidGrantWorkspaceTrust: () => ({ dispose() {} }),
+      onDidChangeConfiguration: (listener: (e: { affectsConfiguration: (section: string) => boolean }) => void) => {
+        state.configChangeListeners.add(listener);
+        return { dispose: () => state.configChangeListeners.delete(listener) };
+      },
       registerTextDocumentContentProvider: () => ({ dispose() {} }),
     },
   };
@@ -253,5 +271,78 @@ describe('CF-08: palette commands register under the DEFAULT (mock) backend', ()
 
     await handler?.();
     expect(state.warnings.some((w) => /needs? the real Hermes backend/i.test(w))).toBe(true);
+  });
+});
+
+/**
+ * Fires every listener registered via `vscode.workspace.onDidChangeConfiguration`
+ * with a fake `ConfigurationChangeEvent` whose `affectsConfiguration` is the
+ * given predicate — mirrors how VS Code itself invokes the real listener.
+ */
+function fireConfigChange(affects: (section: string) => boolean): void {
+  const event = { affectsConfiguration: affects };
+  for (const listener of [...state.configChangeListeners]) listener(event);
+}
+
+/** Flushes the microtask queue so a `showInformationMessage(...).then(...)`
+ * chain (fire-and-forget in `activate()`, never awaited by the caller) has
+ * had a chance to run before the test asserts on its effects. */
+function flushMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * CF-09 / L5 F-5: backend selection (`mock` vs `acp`) is resolved ONCE at
+ * `activate()` (re-evaluated only on a trust grant). There is NO
+ * `onDidChangeConfiguration` listener for `talaria.backend`, so the README's
+ * onboarding step 3 ("switch talaria.backend from mock to acp") is a silent
+ * no-op until the user manually reloads the window. Fix: an
+ * `onDidChangeConfiguration` listener that, when `talaria.backend` is the
+ * key that changed, prompts "reload to apply" and, on "Reload Window",
+ * executes `workbench.action.reloadWindow` — never a live hot-swap (that
+ * stays out of scope; the prompt is the contract).
+ */
+describe('CF-09: reload prompt when talaria.backend changes', () => {
+  beforeEach(() => {
+    resetState();
+  });
+
+  it('shows a "reload to apply" prompt when talaria.backend changes', () => {
+    activate(makeFakeContext());
+
+    fireConfigChange((section) => section === 'talaria.backend');
+
+    expect(
+      state.infos.some((m) => /reload/i.test(m)),
+      `expected a reload prompt, got infos: ${JSON.stringify(state.infos)}`,
+    ).toBe(true);
+  });
+
+  it('does not prompt when an unrelated setting changes', () => {
+    activate(makeFakeContext());
+
+    fireConfigChange((section) => section === 'talaria.someOtherSetting');
+
+    expect(state.infos.some((m) => /reload/i.test(m))).toBe(false);
+  });
+
+  it('reloads the window when the user accepts the "Reload Window" prompt action', async () => {
+    activate(makeFakeContext());
+    state.infoResponse = 'Reload Window';
+
+    fireConfigChange((section) => section === 'talaria.backend');
+    await flushMicrotasks();
+
+    expect(state.executedCommands).toContain('workbench.action.reloadWindow');
+  });
+
+  it('does not reload when the user dismisses the prompt without choosing an action', async () => {
+    activate(makeFakeContext());
+    state.infoResponse = undefined;
+
+    fireConfigChange((section) => section === 'talaria.backend');
+    await flushMicrotasks();
+
+    expect(state.executedCommands).not.toContain('workbench.action.reloadWindow');
   });
 });

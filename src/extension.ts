@@ -197,6 +197,34 @@ export function activate(context: vscode.ExtensionContext): void {
       : new MockBackend();
   context.subscriptions.push(backend);
 
+  // ── CF-09 / L5 F-5: prompt "reload to apply" on talaria.backend change ───
+  // Backend selection above is resolved ONCE at activate() (re-evaluated
+  // only via `makeAcpBackend` on a trust grant). The README's onboarding
+  // step 3 tells the user to flip `talaria.backend` from `mock` to `acp` —
+  // without this listener nothing reacts until a manual reload, which reads
+  // as a silently-broken setting. A PROMPT (never an auto-reload, never a
+  // live hot-swap of `backend` here) is the safe v1: respawn semantics plus
+  // a possible in-flight session make a silent reload dangerous, and
+  // re-deriving the backend live is out of scope — this listener only ever
+  // asks. Only the `talaria.backend` key triggers it (every other config
+  // key is ignored). Disposed via `context.subscriptions` like every other
+  // listener in this function — no leak.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (!e.affectsConfiguration('talaria.backend')) return;
+      void vscode.window
+        .showInformationMessage(
+          'Talaria: backend setting changed — reload the window to apply.',
+          'Reload Window',
+        )
+        .then((choice) => {
+          if (choice === 'Reload Window') {
+            void vscode.commands.executeCommand('workbench.action.reloadWindow');
+          }
+        });
+    }),
+  );
+
   // ── View provider ────────────────────────────────────────────────────────
   const provider = new TalariaViewProvider(
     context.extensionUri,
