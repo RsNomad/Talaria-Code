@@ -30,6 +30,19 @@ export function redactControlResponse(method: string, result: unknown): unknown 
   return redactValue(result);
 }
 
+/**
+ * CF-13 C-1: the SAME deep, key-based deny-list walker `redactControlResponse`
+ * uses for `config.show`/`model.options`, exported UNGATED (no method
+ * allowlist) for callers that need to redact secret-shaped fields wherever
+ * they appear — e.g. `JsonRpcStdio`'s traffic tap, which logs EVERY method's
+ * frame, not just the two gated here. Reuses the same `SECRET_KEY` deny-list
+ * on purpose: one doctrine, not two. Pure — never mutates, never throws on
+ * non-object input.
+ */
+export function redactSecretsDeep(value: unknown): unknown {
+  return redactValue(value);
+}
+
 function redactValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((element) => redactValue(element));

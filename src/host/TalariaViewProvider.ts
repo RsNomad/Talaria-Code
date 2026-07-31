@@ -629,7 +629,14 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    *  - never logs the params (`this.backend.invokeControl` is called
    *    directly here, not through `handleControlRequest`'s generic
    *    control-response path, and the catch below logs only the
-   *    server-authored failure MESSAGE, never `params`).
+   *    server-authored failure MESSAGE, never `params`) — and (CF-13 I-1)
+   *    does not rest THAT on the harness contract alone: the in-scope
+   *    `apiKey` value is scrubbed out of the message text before it is
+   *    logged or shown, a client-side backstop in case a future/misbehaving
+   *    server-authored message ever echoed it back;
+   *  - (CF-13 M-1) never prompts/dispatches for an empty or whitespace-only
+   *    `slug` — a row with a missing `slug` (`reshapeModelOptions`'s
+   *    `row.slug ?? ''`) must not wire a `model.addKey({slug:''})`.
    *
    * A cancelled (`undefined`) or blank prompt is a silent no-op — nothing
    * to save. A `model.save_key` failure surfaces a STATUS-ONLY message
@@ -640,6 +647,8 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * panel and pushes it — this method does not need to.
    */
   private async promptAndSaveProviderKey(slug: string): Promise<void> {
+    if (!slug.trim()) return; // M-1: no slug to key against — nothing to prompt/dispatch
+
     const value = await vscode.window.showInputBox({
       title: `Talaria: Add ${slug} API Key`,
       prompt:
@@ -657,15 +666,19 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     } catch (err) {
       // Never log/surface `err`'s raw params — only the server-authored
       // failure message, which the harness's `model.save_key` never echoes
-      // the submitted key into (`server.py:12426-12503`).
+      // the submitted key into (`server.py:12426-12503`). CF-13 I-1: don't
+      // rest solely on that contract — `apiKey` is in scope here, so scrub
+      // its literal value out of the message before it is logged OR shown,
+      // for both the log and BOTH user-facing branches below.
       const message = errorMessage(err);
-      this.logger?.appendLine(`[model.addKey] ${slug} failed: ${message}`);
-      if (message.includes('[4006]')) {
+      const safeMessage = apiKey ? message.split(apiKey).join('[redacted]') : message;
+      this.logger?.appendLine(`[model.addKey] ${slug} failed: ${safeMessage}`);
+      if (safeMessage.includes('[4006]')) {
         void vscode.window.showWarningMessage(
           `Talaria: '${slug}' credentials are managed by this install and are read-only.`,
         );
       } else {
-        void vscode.window.showErrorMessage(`Talaria: could not save the '${slug}' API key — ${message}`);
+        void vscode.window.showErrorMessage(`Talaria: could not save the '${slug}' API key — ${safeMessage}`);
       }
     }
   }

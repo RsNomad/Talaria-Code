@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from 'node:child_process';
+import { redactSecretsDeep } from '../redactControlResponse';
 
 /**
  * Newline-delimited JSON-RPC 2.0 over a child process's stdio.
@@ -13,7 +14,13 @@ import { spawn, ChildProcess } from 'node:child_process';
  *   human logs go to stderr, which we forward to {@link Logger} untouched.
  * - **Traffic tap.** Every framed send/recv is logged (`→`/`←`) when a logger is
  *   provided — cheap and invaluable when debugging the wire (ported idea from
- *   `vscode-acp-main`).
+ *   `vscode-acp-main`). CF-13 C-1 (SECURITY): several control methods carry
+ *   credential-shaped fields (`model.save_key`'s `api_key` param;
+ *   `config.show`/`model.options`'s `env` results) — the LOGGED line is
+ *   redacted via {@link redactSecretsDeep} (the SAME `SECRET_KEY` deny-list
+ *   `redactControlResponse.ts` uses) before it reaches the logger. This is
+ *   LOG-ONLY: the bytes actually written to `child.stdin` are always the
+ *   real, unredacted frame — the harness needs the real value.
  * - **Timeouts.** Per-request default 120s (long agent turns); overridable.
  * - **Kill discipline.** `dispose()` → SIGTERM, then SIGKILL after 5s.
  *
@@ -206,7 +213,11 @@ export class JsonRpcStdio implements Disposable {
 
   private send(frame: object): void {
     const line = JSON.stringify(frame) + '\n';
-    this.log(`→ ${line.trimEnd()}`);
+    // CF-13 C-1: log the REDACTED frame (log-only) — the REAL, unredacted
+    // `line` still goes to stdin below. Never let a bug in the redactor
+    // block the send: fall back to a static marker rather than the raw
+    // frame if stringifying the redacted copy somehow throws.
+    this.log(`→ ${this.redactFrameForLog(frame)}`);
     this.child.stdin?.write(line);
   }
 
@@ -253,7 +264,14 @@ export class JsonRpcStdio implements Disposable {
   }
 
   private handleFrame(line: string): void {
-    this.log(`← ${line}`);
+    // CF-13 C-1: best-effort separate parse just for the log string (does
+    // NOT replace/short-circuit the real parse right below — dispatch
+    // semantics are unchanged). A response RESULT can carry credential-
+    // shaped fields (e.g. `config.show`/`model.options`'s `env`), so redact
+    // before logging; a non-JSON/non-object line logs unchanged (key-based
+    // redaction is inapplicable, and our own key never appears in a
+    // malformed inbound frame).
+    this.log(`← ${this.redactLineForLog(line)}`);
     let frame: JsonRpcResponseFrame | JsonRpcNotificationFrame;
     try {
       const parsed: unknown = JSON.parse(line);
@@ -311,5 +329,41 @@ export class JsonRpcStdio implements Disposable {
 
   private log(message: string): void {
     this.logger?.append(`[JsonRpcStdio] ${message}`);
+  }
+
+  /**
+   * CF-13 C-1: redact an OUTBOUND frame object (already parsed — `send()`
+   * builds it in hand) for the `→` log line. Never the source of truth for
+   * what hits the wire — `send()` still writes the real, unredacted `line`
+   * to stdin. Defensive: a redaction/stringify failure must never block the
+   * send, so it falls back to a static marker rather than the raw frame
+   * (which could carry a secret).
+   */
+  private redactFrameForLog(frame: object): string {
+    try {
+      return JSON.stringify(redactSecretsDeep(frame));
+    } catch {
+      return '[unloggable frame]';
+    }
+  }
+
+  /**
+   * CF-13 C-1: best-effort redaction of an INBOUND raw line for the `←` log
+   * line. A separate parse from `handleFrame`'s real dispatch parse — kept
+   * deliberately simple/isolated so this logging concern can never perturb
+   * dispatch semantics. Non-JSON or non-object input (primitives, malformed
+   * lines) is returned unchanged: key-based redaction doesn't apply, and a
+   * malformed/primitive frame from the child can't carry OUR key.
+   */
+  private redactLineForLog(line: string): string {
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (typeof parsed === 'object' && parsed !== null) {
+        return JSON.stringify(redactSecretsDeep(parsed));
+      }
+    } catch {
+      // Not JSON — fall through to the raw line below.
+    }
+    return line;
   }
 }

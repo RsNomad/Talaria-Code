@@ -206,3 +206,88 @@ describe('JsonRpcStdio — I-7: child.stdin has an error listener (write-after-d
     expect(logged.some((l) => /EPIPE/i.test(l))).toBe(true);
   });
 });
+
+/**
+ * CF-13 security review of `b800b79`: CONFIRMED Critical — the traffic tap
+ * (`send()`'s `→` log and `handleFrame()`'s `←` log) wrote the FULL framed
+ * JSON verbatim to the logger, which for `model.save_key({slug, api_key})`
+ * means the raw provider API key landed in cleartext in the always-on
+ * "Talaria Code" output channel. `TalariaViewProvider.test.ts`'s and
+ * `AcpBackend.test.ts`'s existing "never logged" tests use a mock backend /
+ * fake control boundary and never reach THIS tap — so they never proved the
+ * property their names claimed. These are the GENUINE transport-level
+ * tests: a real `JsonRpcStdio` over a fake child, asserting (a) the logger
+ * never sees the raw secret and DOES see the redaction marker, while (b)
+ * the bytes actually written to `child.stdin` carry the REAL key
+ * unchanged — redaction is LOG-ONLY, the harness needs the real value on
+ * the wire.
+ */
+describe('JsonRpcStdio traffic tap — SECRET DISCIPLINE: redact secret-shaped fields in the log, never the wire (CF-13 C-1/C-2)', () => {
+  it('send(): a secret-shaped param (api_key) is redacted in the → log line but the REAL key still hits stdin', async () => {
+    const logged: string[] = [];
+    const { child, stdin } = makeFakeChild();
+    vi.mocked(spawn).mockReturnValue(child);
+    const writeSpy = vi.spyOn(stdin, 'write');
+    const transport = new JsonRpcStdio({
+      command: 'python',
+      args: ['-m', 'tui_gateway.entry'],
+      logger: { append: (line) => logged.push(line) },
+    });
+
+    const pending = transport.request('model.save_key', {
+      slug: 'deepseek',
+      api_key: 'sk-PLANTED-SECRET-VALUE',
+    });
+    pending.catch(() => {});
+    await flush();
+
+    // LOG: the raw key must never appear anywhere in the traffic tap, and
+    // the redaction marker must be present in its place.
+    const logText = logged.join('\n');
+    expect(logText).not.toContain('sk-PLANTED-SECRET-VALUE');
+    expect(logText).toContain('[redacted]');
+
+    // WIRE: the bytes actually written to the child's stdin carry the REAL,
+    // unredacted key — the harness needs it to authenticate the provider.
+    expect(writeSpy).toHaveBeenCalled();
+    const written = writeSpy.mock.calls.map((call) => String(call[0])).join('');
+    expect(written).toContain('sk-PLANTED-SECRET-VALUE');
+
+    transport.dispose();
+  });
+
+  it('handleFrame(): a secret-shaped field in a RECV response result (e.g. config.show env) is redacted before the ← log line', async () => {
+    const logged: string[] = [];
+    const { child, stdout } = makeFakeChild();
+    vi.mocked(spawn).mockReturnValue(child);
+    const transport = new JsonRpcStdio({
+      command: 'python',
+      args: ['-m', 'tui_gateway.entry'],
+      logger: { append: (line) => logged.push(line) },
+    });
+
+    const pending = transport.request('config.show');
+    pending.catch(() => {});
+    await flush();
+
+    const responseFrame = {
+      jsonrpc: '2.0',
+      id: 1,
+      result: {
+        mcp_servers: [{ name: 'x', env: { API_KEY: 'sk-PLANTED-RECV-SECRET' } }],
+      },
+    };
+    stdout.emit('data', `${JSON.stringify(responseFrame)}\n`);
+    await flush();
+
+    const logText = logged.join('\n');
+    expect(logText).not.toContain('sk-PLANTED-RECV-SECRET');
+    expect(logText).toContain('[redacted]');
+
+    // The RESOLVED value (what the caller actually gets) is unaffected —
+    // redaction is a LOG-ONLY concern, never a wire/data concern.
+    await expect(pending).resolves.toEqual(responseFrame.result);
+
+    transport.dispose();
+  });
+});

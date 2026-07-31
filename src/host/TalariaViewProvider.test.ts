@@ -1186,7 +1186,9 @@ describe('TalariaViewProvider — CF-13/D1: model.addKey ("Add provider key")', 
     });
   });
 
-  it('SECRET DISCIPLINE: the entered key is never logged, on success or on failure', async () => {
+  it("promptAndSaveProviderKey's OWN catch never logs/surfaces the key it holds, on success or on failure " +
+    '(scope: this branch only — it does NOT prove the transport tap below it is clean; ' +
+    'see JsonRpcStdio.test.ts for the genuine transport-level proof, CF-13 C-2)', async () => {
     mockShowInputBox.mockResolvedValueOnce('sk-super-secret-value');
     const invokeControl = vi
       .fn()
@@ -1203,6 +1205,38 @@ describe('TalariaViewProvider — CF-13/D1: model.addKey ("Add provider key")', 
     // and never surfaced back to the user either
     expect(mockShowErrorMessage.mock.calls.flat().join(' ')).not.toContain('sk-super-secret-value');
     expect(mockShowWarningMessage.mock.calls.flat().join(' ')).not.toContain('sk-super-secret-value');
+  });
+
+  it('I-1: a server error MESSAGE that happens to echo the submitted key back is scrubbed before log/surface ' +
+    '(client-side backstop — does not rely solely on the harness contract never echoing it)', async () => {
+    mockShowInputBox.mockResolvedValueOnce('sk-super-secret-value');
+    const invokeControl = vi
+      .fn()
+      .mockRejectedValue(
+        new Error('model.save_key failed [4002]: sk-super-secret-value is not a recognized key'),
+      );
+    const logged: string[] = [];
+    const logger = { appendLine: (line: string) => logged.push(line) } as unknown as vscode.OutputChannel;
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(invokeControl), logger);
+    seam(provider).view = { webview: { postMessage: () => {} } };
+
+    seam(provider).handleWebviewMessage({ type: 'model.addKey', slug: 'deepseek' });
+    await flush();
+
+    expect(logged.some((line) => line.includes('sk-super-secret-value'))).toBe(false);
+    expect(logged.some((line) => line.includes('[redacted]'))).toBe(true);
+    expect(mockShowErrorMessage.mock.calls.flat().join(' ')).not.toContain('sk-super-secret-value');
+  });
+
+  it('M-1: an empty/whitespace-only slug is a no-op — never prompts, never dispatches model.save_key', async () => {
+    const invokeControl = vi.fn().mockResolvedValue({ provider: {} });
+    const { provider } = makeProviderWith(makeFakeBackend(invokeControl));
+
+    seam(provider).handleWebviewMessage({ type: 'model.addKey', slug: '   ' });
+    await flush();
+
+    expect(mockShowInputBox).not.toHaveBeenCalled();
+    expect(invokeControl).not.toHaveBeenCalled();
   });
 
   it('a 4006 (managed install) failure surfaces a STATUS-ONLY read-only message — never the key', async () => {
