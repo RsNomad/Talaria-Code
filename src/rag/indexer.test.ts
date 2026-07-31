@@ -960,3 +960,117 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     indexer.dispose();
   });
 });
+
+describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBuild', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-a5t10-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer(debounceMs = 5) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  function readFileCallsFor(spy: { mock: { calls: unknown[][] } }, absPath: string): number {
+    return spy.mock.calls.filter((call) => call[0] === absPath).length;
+  }
+
+  it('RED: the ignore filter is read from disk ONCE across multiple watch events, not re-read per event', async () => {
+    await writeWorkspaceFile('.gitignore', 'dist/**\n');
+    await writeWorkspaceFile('a.txt', 'file a content\n');
+    await writeWorkspaceFile('b.txt', 'file b content\n');
+    const gitignorePath = path.join(workspaceRoot, '.gitignore');
+
+    const readFileSpy = vi.spyOn(fs, 'readFile');
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'a.txt') });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'b.txt') });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // At HEAD: loadIgnoreFilter() re-reads .gitignore on EVERY handleFsEvent
+    // call — 2 events -> 2 reads, growing unboundedly with watcher traffic.
+    expect(readFileCallsFor(readFileSpy, gitignorePath)).toBe(1);
+
+    readFileSpy.mockRestore();
+    disposable.dispose();
+    indexer.dispose();
+  });
+
+  it('regression pin: a change to .gitignore invalidates the cached filter — the new rule applies to the very next event (green at HEAD too — proves caching does not break correctness)', async () => {
+    await writeWorkspaceFile('.gitignore', '# no generated/** rule yet\n');
+    await writeWorkspaceFile('generated/x.txt', 'generated content that should become ignored\n');
+
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    // Prime the cache with the OLD .gitignore (no generated/** rule) via an
+    // unrelated event.
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'unrelated.txt') });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    await writeWorkspaceFile('.gitignore', 'generated/**\n');
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, '.gitignore') });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    embedMock.mockClear();
+    upsertMock.mockClear();
+
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'generated', 'x.txt') });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(embedMock).not.toHaveBeenCalled();
+    expect(upsertMock).not.toHaveBeenCalled();
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+
+  it("RED: runBuild reads each candidate file's bytes ONCE — reindexFiles reuses the hash-pass buffer instead of re-reading", async () => {
+    await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
+    const absPath = path.join(workspaceRoot, 'src', 'app.ts');
+
+    const readFileSpy = vi.spyOn(fs, 'readFile');
+    const indexer = makeIndexer();
+
+    await indexer.build();
+
+    // At HEAD: runBuild's hash pass reads absPath once (indexer.ts's
+    // `current` loop), then reindexFiles reads it AGAIN for every path that
+    // ends up in `toCompute` — everything, on a fresh build — even though
+    // the content cannot have changed between the two passes.
+    expect(readFileCallsFor(readFileSpy, absPath)).toBe(1);
+
+    readFileSpy.mockRestore();
+    indexer.dispose();
+  });
+});

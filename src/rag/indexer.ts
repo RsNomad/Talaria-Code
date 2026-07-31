@@ -196,6 +196,16 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     return initPromise;
   }
 
+  // AUDIT-5 Task 10 (perf): a `**/*` watcher fires `handleFsEvent` once per
+  // saved file, and the pre-Task-10 shape re-read + re-parsed `.gitignore`/
+  // `.hermesignore` from disk on EVERY one of those events even though the
+  // ignore rules themselves almost never change between saves. Cached here
+  // and invalidated (not just cleared once) at the two points the rules
+  // actually can change: the start of every full build (`runBuild` — picks
+  // up edits made outside the watcher, e.g. `git pull`), and any watch event
+  // whose own path IS one of the ignore files (see `handleFsEvent`).
+  let cachedIgnoreFilter: ((relPosixPath: string) => boolean) | undefined;
+
   async function readManifest(): Promise<Record<string, string>> {
     try {
       const raw = await fs.readFile(manifestPath, 'utf8');
@@ -335,6 +345,9 @@ export function createIndexer(opts: IndexerOptions): Indexer {
    * stored width) may still be trusted.
    */
   async function loadIgnoreFilter(): Promise<(relPosixPath: string) => boolean> {
+    // AUDIT-5 Task 10: serve the cached predicate when one is live — see the
+    // `cachedIgnoreFilter` declaration above for the invalidation contract.
+    if (cachedIgnoreFilter) return cachedIgnoreFilter;
     const gitignoreContents: string[] = [];
     try {
       gitignoreContents.push(await fs.readFile(path.join(opts.workspaceRoot, '.gitignore'), 'utf8'));
@@ -349,7 +362,9 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     const base = createIgnoreFilter(gitignoreContents, opts.extraIgnoreGlobs ?? []);
     // AUDIT-5 ARCH-1: fold the indexDir self-exclusion into the ONE filter
     // both runBuild's walk() and handleFsEvent already share.
-    return (relPosixPath: string): boolean => isUnderIndexDir(relPosixPath) || base(relPosixPath);
+    const filter = (relPosixPath: string): boolean => isUnderIndexDir(relPosixPath) || base(relPosixPath);
+    cachedIgnoreFilter = filter;
+    return filter;
   }
 
   async function walk(
@@ -395,11 +410,19 @@ export function createIndexer(opts: IndexerOptions): Indexer {
    * non-empty batch, or `undefined` if this call embedded nothing (e.g. the
    * diff found no files to recompute) — the caller uses this to decide what
    * to persist into the D-2 sidecar.
+   *
+   * AUDIT-5 Task 10: `preloaded` is an optional absPath -> Buffer map. When
+   * the caller already has a path's bytes in hand (`runBuild`'s hash pass
+   * reads every candidate once already), pass them here instead of letting
+   * this function `fs.readFile` the same path a second time. The watch path
+   * (`handleFsEvent`) has no such buffer and passes nothing — it keeps its
+   * original single read.
    */
   async function reindexFiles(
     absPaths: string[],
     manifest: Record<string, string>,
     expectedWidth: number | undefined,
+    preloaded?: Map<string, Buffer>,
   ): Promise<number | undefined> {
     await ensureStoreInitialized();
     const pendingRecords: ChunkRecord[] = [];
@@ -408,7 +431,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       const relPath = toPosixRelative(path.relative(opts.workspaceRoot, absPath));
       let buf: Buffer;
       try {
-        buf = await fs.readFile(absPath);
+        buf = preloaded?.get(absPath) ?? (await fs.readFile(absPath));
       } catch {
         continue; // deleted between walk and read; the delete pass handles it.
       }
@@ -479,18 +502,32 @@ export function createIndexer(opts: IndexerOptions): Indexer {
 
   async function runBuild(): Promise<void> {
     await ensureStoreInitialized();
+    // AUDIT-5 Task 10: force a fresh ignore-filter read for every full
+    // build, independent of whatever the watch path may already have
+    // cached — a full build is exactly the point at which `.gitignore`/
+    // `.hermesignore` edits made OUTSIDE the watcher (e.g. `git pull`, or
+    // the file arriving before `watch()` was ever called) must be picked up.
+    cachedIgnoreFilter = undefined;
     const ignoreFilter = await loadIgnoreFilter();
 
     const absPaths: string[] = [];
     await walk(opts.workspaceRoot, ignoreFilter, absPaths);
 
     const current: Record<string, string> = {};
+    // AUDIT-5 Task 10: read each candidate's bytes ONCE here for the hash
+    // pass, and hand the same buffer to reindexFiles's embed pass below via
+    // `preloaded` — the pre-Task-10 shape read every candidate file twice on
+    // every full build (once here, again inside reindexFiles for whichever
+    // paths ended up in `toCompute`), even though the content cannot have
+    // changed between the two passes within one build.
+    const preloaded = new Map<string, Buffer>();
     for (const absPath of absPaths) {
       const relPath = toPosixRelative(path.relative(opts.workspaceRoot, absPath));
       try {
         const buf = await fs.readFile(absPath);
         if (buf.byteLength > MAX_FILE_BYTES || looksBinary(buf)) continue;
         current[relPath] = hashContent(buf.toString('utf8'));
+        preloaded.set(absPath, buf);
       } catch {
         continue;
       }
@@ -538,7 +575,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     const manifest = { ...stored };
     const toComputeAbs = toCompute.map((rel) => path.join(opts.workspaceRoot, rel));
     const effectiveWidth = computeEffectiveWidth(storedMeta);
-    const observedWidth = await reindexFiles(toComputeAbs, manifest, effectiveWidth);
+    const observedWidth = await reindexFiles(toComputeAbs, manifest, effectiveWidth, preloaded);
 
     await writeManifest(manifest);
     // Task 14b: if this build embedded nothing (nothing changed, or a
@@ -585,6 +622,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // out-of-scope paths inside createIgnoreFilter instead: the shared
       // filter's loud throw is its contract (pinned in ignoreFilter.test.ts).
       if (!isPathValid(relPath)) return;
+      // AUDIT-5 Task 10: the cached ignore filter goes stale the moment one
+      // of the ignore files itself changes (edit OR delete) — invalidate
+      // BEFORE this event's own loadIgnoreFilter() call so this event, and
+      // every event after it, sees the new rules immediately.
+      if (relPath === '.gitignore' || relPath === '.hermesignore') {
+        cachedIgnoreFilter = undefined;
+      }
       const ignoreFilter = await loadIgnoreFilter();
       if (ignoreFilter(relPath)) return;
 
