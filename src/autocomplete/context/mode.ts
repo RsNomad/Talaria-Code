@@ -71,6 +71,14 @@ function formatSnippetAsComment(snippet: CrossFileSnippet, commentToken: string)
  * an additive brand) is assignable here, so callers pass either without a cast and
  * unit tests can build plain fixtures with no factory. The scan gate lives at the
  * `FimContext.snippets` boundary, not on this formatter.
+ *
+ * `snippets` arrives ordered most-relevant-LAST (types.ts:~25 / `snippetBudgeter.ts`
+ * §2.5) — the budget fill below therefore walks the array BACKWARDS (tail-to-head)
+ * so it keeps the most-relevant snippets and drops the least-relevant ones first
+ * (CF-23 / L6 I-14: a forward walk that breaks on first overflow does the opposite —
+ * it keeps the least-relevant head and drops the most-relevant tail). Survivors are
+ * then re-emitted in their ORIGINAL array order, so the OUTPUT ordering the consumer
+ * expects (most-relevant-LAST) is unchanged — only the DROP order is reversed.
  */
 export function injectSnippetsAsComments(
   prunedPrefix: string,
@@ -80,22 +88,27 @@ export function injectSnippetsAsComments(
 ): string {
   const commentToken = getSingleLineComment(languageId) ?? '#';
 
-  const blocks: string[] = [];
+  const survivors: string[] = [];
   let usedChars = 0;
-  for (const snippet of snippets) {
+  for (let i = snippets.length - 1; i >= 0; i--) {
+    const snippet = snippets[i];
+    if (snippet === undefined) {
+      continue; // unreachable: i ranges over valid indices of `snippets`
+    }
     const block = formatSnippetAsComment(snippet, commentToken);
     const addedChars = block.length + 1; // +1 for the trailing newline separator
     if (usedChars + addedChars > budgetChars) {
       break; // skip-not-crop: stop at the snippet boundary, never truncate mid-snippet
     }
-    blocks.push(block);
+    survivors.push(block);
     usedChars += addedChars;
   }
+  survivors.reverse(); // restore most-relevant-LAST emit order (only drop order was reversed)
 
-  if (blocks.length === 0) {
+  if (survivors.length === 0) {
     return prunedPrefix;
   }
-  return blocks.join('\n') + '\n' + prunedPrefix;
+  return survivors.join('\n') + '\n' + prunedPrefix;
 }
 
 // ── RESERVED SEAM (W5.1 next-edit, NOT built) ──────────────────────────────
