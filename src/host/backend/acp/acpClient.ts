@@ -1,6 +1,12 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
+// AUDIT-5 advisory: ACP protocol v2 REMOVES `session/load` (replaced by
+// `session/resume` + replayFrom, mcpServers still required on resume —
+// Context7 /agentclientprotocol/agent-client-protocol, migration.mdx). Both
+// sides are deliberately pinned to v1 (sdk 0.17.1 exact / Hermes
+// agent-client-protocol==0.9.0). Treat ANY sdk bump as a MIGRATION
+// (load→resume, replay contract, mcpServers), never a routine upgrade.
 import type { Logger } from '../../transport/JsonRpcStdio';
 import type { SpawnSpec } from '../../runtime/resolveHermes';
 import type {
@@ -777,6 +783,17 @@ export class AcpClient implements AcpClientLike {
     this.connection = undefined;
     const child = this.child;
     this.child = undefined;
+    // AUDIT-5 ARCH-4: settle the W1-T1 termination pair on INTENTIONAL
+    // teardown too. terminate()'s identity guard (`this.child !== child`)
+    // deliberately suppresses the exitHandlers fan-out when the killed child
+    // later exits — but that also suppressed the pair rejection, leaving an
+    // in-flight raceTermination()'d RPC (e.g. the Sessions panel's
+    // listSessions) dangling until the webview's 30s RPC timeout. Reject it
+    // here, same message shape as terminate() with code null. Safe with no
+    // racer attached: connect() marked the promise handled (`.catch(() => {})`).
+    this.terminationReject?.(new Error('AcpClient: child terminated (code null)'));
+    this.terminationReject = undefined;
+    this.terminationPromise = undefined;
     if (child && child.exitCode === null && !child.killed) {
       child.kill('SIGTERM');
       const killTimer = setTimeout(() => {

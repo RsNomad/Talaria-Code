@@ -179,4 +179,24 @@ describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
 
     await expect(client.connect()).rejects.toThrow(/already connected/i);
   });
+
+  it('AUDIT-5 ARCH-4: dispose() settles the termination pair — an in-flight RPC rejects promptly instead of dangling until the webview 30s timeout', async () => {
+    const { client } = await connectClient();
+    const listResult = client.listSessions(); // stdout never answers — only the pair can settle this
+
+    client.dispose(); // intentional teardown: Restart Agent Connection / deactivate / backend swap
+
+    await expect(listResult).rejects.toThrow(/terminated/i);
+  });
+
+  it('regression pin: dispose() keeps suppressing the exitHandlers fan-out when the SIGTERMed child eventually exits', async () => {
+    const { client, child } = await connectClient();
+    const exits: Array<number | null> = [];
+    client.onExit((code) => exits.push(code));
+
+    client.dispose();
+    child.emit('exit', 0);
+
+    expect(exits).toEqual([]); // terminate()'s identity guard still eats the late exit — intentional
+  });
 });
