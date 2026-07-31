@@ -80,6 +80,32 @@ export interface NextEditBackendOptions {
   sentinels: readonly string[];
 }
 
+/**
+ * CF-24 / L6 I-15: mirrors `../backendFactory.ts`'s own `warnedOnce`/
+ * `warnOnce`/`clearBackendFactoryWarnings` VERBATIM — same dedupe-by-fixed-key
+ * Set, same `console.warn` (never `vscode.window` — this module deliberately
+ * never imports `vscode`, which is what keeps `predict` callable from a plain
+ * unit test), same re-arm-by-export discipline. `backendFactory.ts`'s F4 arm
+ * already solved this exact problem for the FIM `ollama` backend (which has
+ * no `apiKey` field at all); this is the same fix for next-edit's `ollama`
+ * transport, which has the identical no-auth-story shape (see `predict`'s
+ * key-drop below).
+ */
+const warnedOnce = new Set<string>();
+
+function warnOnce(key: string, message: string): void {
+  if (warnedOnce.has(key)) return;
+  warnedOnce.add(key);
+  console.warn(`[talaria.nextEdit] ${message}`);
+}
+
+/** Re-arms every construction-time warning {@link warnOnce} can emit — see
+ *  its doc comment for the re-arm discipline this exists for (mirrors
+ *  `../backendFactory.ts`'s `clearBackendFactoryWarnings`). */
+export function clearNextEditBackendWarnings(): void {
+  warnedOnce.clear();
+}
+
 /** Ollama `/api/generate` (non-streaming) response shape — only the fields
  *  this backend reads. `done_reason` is optional: Ollama's own empty-string
  *  `done_reason` case (`08` §5.3) is covered by the same `undefined`/
@@ -143,7 +169,31 @@ export class NextEditHttpBackend {
     // character), so an untrimmed check here would let
     // `assertSecureAuthTransport` treat "   " as "a real key is present"
     // while the header downstream would send `Bearer    ` verbatim.
-    const apiKey = this.opts.apiKey?.trim() || undefined;
+    const trimmedApiKey = this.opts.apiKey?.trim() || undefined;
+
+    // CF-24 / L6 I-15 — parity with `../backendFactory.ts`'s own `ollama`
+    // arm (F4, mirrored verbatim via `warnOnce`/`warnedOnce` above): Ollama's
+    // `/api/generate` has no auth story this codebase speaks to here either
+    // — `predictOllama` below never reads `apiKey` at all, so a leftover key
+    // is DROPPED for this transport (warn-once, never the key value) instead
+    // of being treated as "present" by `assertSecureAuthTransport`. Without
+    // this, a perfectly reachable, intended http Ollama endpoint that would
+    // NEVER actually see the key throws a FALSE `InsecureTransportError` the
+    // moment a leftover key (e.g. inherited from FIM's credential via the
+    // `generic` next-edit route, `shell.vscode.ts`'s `resolveRoute`) happens
+    // to be set and the endpoint is a non-loopback host — a documented,
+    // supported Ollama deployment shape (`OllamaFimBackend.ts`'s own
+    // "loopback-or-remote-runner" comment). Does NOT weaken the
+    // openai-compat transport below, which DOES put the key on the wire
+    // (`predictOpenAiCompat`'s `Authorization` header) and so must keep
+    // refusing exactly as before — this is parity, not a removed protection.
+    if (this.opts.transport === 'ollama' && trimmedApiKey !== undefined) {
+      warnOnce(
+        'nextedit-ollama-key-dropped',
+        'An apiKey is configured, but the next-edit ollama transport has no authentication of its own — the key will never be sent. Clear the key, or switch talaria.nextEdit.backend to a transport that supports one.',
+      );
+    }
+    const apiKey = this.opts.transport === 'ollama' ? undefined : trimmedApiKey;
 
     // (1) S4.2 (CWE-319): refuse to send the Bearer key over cleartext http
     // to a remote host — before touching the network.

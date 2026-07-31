@@ -2575,15 +2575,50 @@ describe('W5.2 credentials: Generic rides FIM\'s endpoint, therefore FIM\'s key'
     ).toBeUndefined();
   });
 
+  /**
+   * CF-24 / L6 I-15 (backend.ts, `NextEditHttpBackend.predict`): `ollama`
+   * never attaches `Authorization` at all (`predictOllama` builds
+   * `Content-Type` only — parity with `OllamaFimBackend.ts`, and now also
+   * with `backendFactory.ts`'s own F4 arm, which drops a leftover apiKey for
+   * backend=ollama unconditionally, not just on loopback). A leftover key
+   * with `ollama` here is therefore DROPPED (warn-once) rather than refused
+   * — refusing it was a FALSE `InsecureTransportError`, since the key was
+   * never going to reach the wire either way. `vllm` (-> `deriveGenericTransport`
+   * -> `openai-compat`) is the transport that actually attaches the key
+   * (`predictOpenAiCompat`'s `Authorization` header), so it is the one this
+   * test now uses to keep proving the REAL protection still holds — the same
+   * substitution the neighboring 401 test below already made, for the
+   * identical reason (see its own comment).
+   */
   it('GENERIC + key + cleartext http:// to a REMOTE host: refuses, and fetch is never called', async () => {
+    const run = await runTriggerCapturingFetch({
+      mode: 'generic',
+      autocompleteEndpoint: 'http://remote-box.example.test:8000',
+      autocompleteBackend: 'vllm',
+      autocompleteApiKey: 'sk-live-cleartext',
+    });
+    expect(run.fetchCalls, 'egress guards fail toward LESS egress — nothing may leave').toBe(0);
+    expect(run.surfaced.join('\n')).toContain('refusing to send credentials over cleartext HTTP');
+  });
+
+  /**
+   * CF-24 / L6 I-15 — the corrected behavior for the transport that does NOT
+   * attach the key: a leftover apiKey on backend=ollama, even over cleartext
+   * http to a REMOTE host, now builds a WORKING backend (fetch reaches the
+   * wire) instead of a false `InsecureTransportError`, exactly mirroring
+   * `backendFactory.ts`'s own F4 arm for FIM's `ollama` backend. Proven here
+   * end-to-end (through the real shell + the real `NextEditHttpBackend`),
+   * not just at `backend.test.ts`'s unit level.
+   */
+  it('CF-24: GENERIC + key + cleartext http:// to a REMOTE host, backend=ollama: key is dropped, fetch DOES happen (parity with backendFactory F4)', async () => {
     const run = await runTriggerCapturingFetch({
       mode: 'generic',
       autocompleteEndpoint: 'http://remote-box.example.test:11434',
       autocompleteBackend: 'ollama',
       autocompleteApiKey: 'sk-live-cleartext',
     });
-    expect(run.fetchCalls, 'egress guards fail toward LESS egress — nothing may leave').toBe(0);
-    expect(run.surfaced.join('\n')).toContain('refusing to send credentials over cleartext HTTP');
+    expect(run.fetchCalls, 'ollama never attaches the key on the wire, so it must not be refused as insecure').toBe(1);
+    expect(run.surfaced.join('\n')).not.toContain('refusing to send credentials over cleartext HTTP');
   });
 
   it('no failure path carries the key — not the toast, not the output channel', async () => {

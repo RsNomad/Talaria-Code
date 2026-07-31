@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { NextEditHttpBackend } from './backend';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { NextEditHttpBackend, clearNextEditBackendWarnings } from './backend';
 import { InsecureTransportError } from '../backends/secureTransport';
 import { BackendHttpError } from '../backends/http';
 import { mintScannedNextEditRequest } from './scan';
@@ -158,6 +158,153 @@ describe('NextEditHttpBackend.predict — pinned guard order (security)', () => 
       InsecureTransportError,
     );
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * CF-24 / L6 I-15: parity with `backendFactory.ts`'s own F4 arm
+ * (`backendFactory.test.ts`'s "warns once when a configured apiKey is
+ * dropped for backend=ollama" describe block, mirrored here almost
+ * verbatim). The next-edit `ollama` transport has no auth story either
+ * (`predictOllama` never reads `apiKey` at all — see the body-shape describe
+ * block below), so a leftover apiKey (e.g. inherited from FIM's credential
+ * via the `generic` next-edit route, `shell.vscode.ts`'s `resolveRoute`)
+ * must be DROPPED with a warn-once instead of tripping
+ * `assertSecureAuthTransport` — which today throws a FALSE
+ * `InsecureTransportError` for a perfectly reachable, intended http Ollama
+ * endpoint that was never going to see the key on the wire. A local Ollama
+ * runner reachable over http on a non-loopback host (LAN, container, remote
+ * runner) is a documented, supported deployment shape — see
+ * `OllamaFimBackend.ts`'s own "loopback-or-remote-runner" comment — so this
+ * is a real, not hypothetical, false positive.
+ */
+describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftover apiKey instead of a false InsecureTransportError', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    clearNextEditBackendWarnings();
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('builds a WORKING backend (key dropped) instead of throwing InsecureTransportError: ollama + http + non-loopback host + leftover apiKey', async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' }));
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = new NextEditHttpBackend({
+      transport: 'ollama',
+      apiBase: 'http://gpu.internal:11434', // remote (non-loopback) http — would trip the guard today if apiKey were treated as present
+      apiKey: 'leftover-fim-key',
+      model: 'test-model',
+      sentinels: [],
+    });
+
+    const out = await backend.predict(minted(), rendered(), new AbortController().signal);
+
+    expect(out.text).toBe('txt');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('warns exactly once (console.warn) that the leftover apiKey was dropped, and the warning NEVER contains the key value', async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' }));
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = new NextEditHttpBackend({
+      transport: 'ollama',
+      apiBase: 'http://gpu.internal:11434',
+      apiKey: 'super-secret-leftover-key',
+      model: 'test-model',
+      sentinels: [],
+    });
+
+    await backend.predict(minted(), rendered(), new AbortController().signal);
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const warned = String(warnSpy.mock.calls[0]?.[0]);
+    expect(warned).toMatch(/ollama/i);
+    expect(warned).not.toContain('super-secret-leftover-key');
+  });
+
+  it('does NOT warn when the ollama transport has no apiKey configured', async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' }));
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = makeBackend('ollama');
+
+    await backend.predict(minted(), rendered(), new AbortController().signal);
+
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT warn when the ollama apiKey is whitespace-only', async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' }));
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = makeBackend('ollama', { apiKey: '   ' });
+
+    await backend.predict(minted(), rendered(), new AbortController().signal);
+
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('warns only ONCE across repeated predict calls until clearNextEditBackendWarnings() re-arms it', async () => {
+    // Each call must get its own fresh `ReadableStream` body — a single
+    // shared response (via `mockResolvedValue`) would be drained by the
+    // first `predict()` call, breaking the second/third with an unrelated
+    // "Unexpected end of JSON input".
+    const fetchSpy = vi
+      .fn()
+      .mockImplementation(() =>
+        Promise.resolve(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' })),
+      );
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = makeBackend('ollama', { apiKey: 'leftover-key' });
+
+    await backend.predict(minted(), rendered(), new AbortController().signal);
+    await backend.predict(minted(), rendered(), new AbortController().signal);
+    await backend.predict(minted(), rendered(), new AbortController().signal);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    clearNextEditBackendWarnings();
+    await backend.predict(minted(), rendered(), new AbortController().signal);
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT drop the apiKey for the openai-compat transport (parity, not weakening): http + remote host + apiKey still throws InsecureTransportError', async () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = new NextEditHttpBackend({
+      transport: 'openai-compat',
+      apiBase: 'http://gpu.internal:8000',
+      apiKey: 'k',
+      model: 'test-model',
+      sentinels: [],
+    });
+
+    await expect(backend.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
+      InsecureTransportError,
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('the loopback carve-out still holds for ollama too: http + loopback + apiKey never throws (already true, unaffected by the drop)', async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' }));
+    vi.stubGlobal('fetch', fetchSpy);
+    const backend = makeBackend('ollama', { apiKey: 'leftover-key' }); // apiBaseFor('ollama') is http://127.0.0.1:11434
+
+    await expect(
+      backend.predict(minted(), rendered(), new AbortController().signal),
+    ).resolves.toBeDefined();
   });
 });
 
