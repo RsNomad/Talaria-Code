@@ -426,7 +426,11 @@ export function App() {
     // the reducer (the draft used to live in Composer's own useState, which
     // `newSession`'s local handler cleared directly — that state is gone now).
     dispatch({ local: { type: 'local.draft.clear', tabId: tab.tabId } });
-    bridge.post({ type: 'newSession' });
+    // W3-T6 (CF-11/D2): rebind ONLY this tab — leaves every sibling tab's
+    // live turn untouched (the old `{type:'newSession'}` restarted the WHOLE
+    // connection, ending every tab). `tab.sessionId` is a hint only; the
+    // host always re-reads this tab's ACTUAL occupant before acting on it.
+    bridge.post({ type: 'tab.newSession', tabId: tab.tabId, sessionId: tab.sessionId });
   };
 
   // Renamed from `selectTab` (W4): this switches a side PANEL, not a

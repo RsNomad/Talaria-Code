@@ -1504,8 +1504,12 @@ export type WebviewToHost =
   | { type: 'diff.open'; sessionId: string; toolId: string; path: string }
 
   /**
-   * Start a fresh session from the composer (clears the transcript and rearms
-   * the backend). Origin → composer "New session" control.
+   * Restart the WHOLE connection (every tab's live turn ends). W3-T6
+   * (CF-11/D2): the composer's "New Session" button no longer sends this — it
+   * posts the per-tab `tab.newSession` above instead. This message is now
+   * reachable only via the `talaria.newSession` palette command (relabeled
+   * "Restart Agent Connection" in package.json for the same reason), kept for
+   * that connection-level affordance and back-compat.
    */
   | { type: 'newSession' }
 
@@ -1606,6 +1610,21 @@ export type WebviewToHost =
    * §2f). `sessionId` is absent for a still-unbound tab.
    */
   | { type: 'tab.activate'; tabId: string; sessionId?: string }
+
+  /**
+   * W3-T6 (CF-11/D2): the composer's per-tab "New Session" — mints a FRESH
+   * session bound to THIS tab, ending only this tab's own live turn, leaving
+   * every sibling tab's live turn untouched. Replaces `newSession` (below) as
+   * the composer's own affordance — that legacy connection-global message now
+   * backs ONLY the `talaria.newSession` palette command's full restart (every
+   * tab's turn ends). Host: `AcpBackend.newSessionInTab`, tail-serialized via
+   * the SAME `runOnStartTail` queue every other topology mutation uses.
+   * `sessionId` mirrors the tab's CURRENT binding at post time — a hint only;
+   * the host always re-reads the tab's ACTUAL occupant (`getByTabId`), never
+   * trusts this field for identity (the tab may have rebound again by the
+   * time this reaches the head of the tail).
+   */
+  | { type: 'tab.newSession'; tabId: string; sessionId?: string }
 
   /**
    * W4 §2d: load a History session INTO a tab (the History panel's row

@@ -127,6 +127,24 @@ export class MockBackend implements AgentBackend {
   }
 
   /**
+   * W3-T6 (CF-11/D2): the composer's per-tab "New Session" — a simple mock
+   * counterpart to the real `AcpBackend.newSessionInTab`. This host mock has
+   * no per-tab registry (§ `openTab`'s own doc — it stays single-scenario-
+   * at-a-time), so it trusts the wire's own `sessionId` hint for which
+   * transcript to clear rather than re-deriving it from a registry that does
+   * not exist here; there is no real turn-lease/root machinery to preserve,
+   * so — unlike the real backend — nothing else needs ending first. Mints a
+   * fresh `mock-tab-session-N` and binds it to the SAME tab, same as
+   * `openTab`.
+   */
+  async newSessionInTab(tabId: string, sessionId?: string): Promise<void> {
+    if (sessionId) this.emit({ type: 'clear', sessionId });
+    this.nextTabSessionSeq += 1;
+    const freshSessionId = `mock-tab-session-${this.nextTabSessionSeq}`;
+    this.emit({ type: 'tab.bound', tabId, sessionId: freshSessionId, rootId: freshSessionId });
+  }
+
+  /**
    * W4 §2d: `sessionId`-first per {@link AgentBackend}. The mock has exactly
    * ONE auto-bound session (`MOCK_SESSION_ID`), so the incoming value is
    * accepted for interface parity but not branched on — the scripted

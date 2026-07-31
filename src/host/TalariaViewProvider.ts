@@ -540,6 +540,23 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         }
         break;
 
+      case 'tab.newSession':
+        // W3-T6 (CF-11/D2): the composer's per-tab "New Session" — routes
+        // directly to the backend's newSessionInTab when the active backend
+        // supports it (same optional-member posture as loadTab above);
+        // no-ops for a backend without one. newSessionInTab itself never
+        // throws/rejects (mirrors tab.open/tab.load's fire-and-forget +
+        // terminal-tab.error discipline) — the `.catch` here is defense in
+        // depth only.
+        if (this.backend.newSessionInTab) {
+          void this.backend
+            .newSessionInTab(message.tabId, message.sessionId)
+            .catch((err) => this.logger?.appendLine(`[tab.newSession] ${message.tabId} failed: ${String(err)}`));
+        } else {
+          this.logger?.appendLine(`[tab.newSession] ${message.tabId} ignored — backend has no newSessionInTab support`);
+        }
+        break;
+
       case 'switchPanel':
         // Side-panel activation → ask the backend for that panel's data. It
         // answers by emitting a `panel.data` message (push-driven, backend

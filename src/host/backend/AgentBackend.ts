@@ -183,4 +183,19 @@ export interface AgentBackend extends vscode.Disposable {
    * only the real `AcpBackend` can (T5a's hardened `loadSessionIntoTab`);
    * `MockBackend` has no session history to load, so this no-ops for it. */
   loadTab?(tabId: string, sessionId: string, cwd: string): Promise<void>;
+
+  /**
+   * W3-T6 (CF-11/D2): the composer's per-tab "New Session" — rebind ONLY
+   * `tabId`: end its own live turn honestly (`status:'cancelled'`), close its
+   * old session, and mint a FRESH one bound to the SAME tab (`tab.bound`),
+   * leaving every sibling tab's controller and live turn completely
+   * untouched. `sessionId` mirrors the tab's current binding at post time
+   * (never trusted for identity — see the wire message's own doc). NEVER
+   * throws/rejects back to the caller — a failed mint emits
+   * `tab.error{kind:'open-failed'}` instead (mirrors {@link openTab}'s
+   * terminal-reply discipline). Only the real `AcpBackend` can do this;
+   * `MockBackend` implements a simpler per-tab reset (no real turn-lease/
+   * root machinery to preserve).
+   */
+  newSessionInTab?(tabId: string, sessionId?: string): Promise<void>;
 }

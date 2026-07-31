@@ -141,6 +141,53 @@ describe('webview MockBackend — W4-T3b B12: two-tab interleave never cross-wir
   });
 });
 
+describe('webview MockBackend — W3-T6 (CF-11/D2): tab.newSession rebinds ONLY the named tab', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function bindTwoTabs(backend: MockBackend, messages: HostToWebview[]) {
+    backend.handle({ type: 'ready' });
+    const bootstrapId = (messages.find((m) => m.type === 'tab.bound') as { sessionId: string }).sessionId;
+    backend.handle({ type: 'tab.open', tabId: 'tab-2' });
+    const tab2Id = (messages.filter((m) => m.type === 'tab.bound')[1] as { sessionId: string }).sessionId;
+    return { bootstrapId, tab2Id };
+  }
+
+  it('clears the OLD session and binds a FRESH one to the SAME tab', () => {
+    const { backend, messages } = makeHarness();
+    const { bootstrapId } = bindTwoTabs(backend, messages);
+
+    backend.handle({ type: 'tab.newSession', tabId: BOOTSTRAP_TAB_ID, sessionId: bootstrapId });
+
+    const clearIdx = messages.findIndex((m) => m.type === 'clear' && (m as { sessionId?: string }).sessionId === bootstrapId);
+    const bounds = messages.filter((m) => m.type === 'tab.bound') as Array<{ tabId: string; sessionId: string }>;
+    const freshBound = bounds.find((b) => b.tabId === BOOTSTRAP_TAB_ID && b.sessionId !== bootstrapId);
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(freshBound).toBeDefined();
+  });
+
+  it('a sibling tab\'s player is untouched — its in-flight turn keeps streaming after the rebind', async () => {
+    vi.useFakeTimers();
+    const { backend, messages } = makeHarness();
+    const { bootstrapId, tab2Id } = bindTwoTabs(backend, messages);
+
+    backend.handle({ type: 'prompt', sessionId: tab2Id, text: 'tab-2 still running', mode: 'default' });
+    await vi.advanceTimersByTimeAsync(50);
+
+    messages.length = 0;
+    backend.handle({ type: 'tab.newSession', tabId: BOOTSTRAP_TAB_ID, sessionId: bootstrapId });
+
+    // Nothing about the rebind ever names tab-2's session.
+    expect(forSession(messages, tab2Id)).toEqual([]);
+
+    // tab-2's own script is still genuinely running — it keeps streaming.
+    messages.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(forSession(messages, tab2Id).length).toBeGreaterThan(0);
+  });
+});
+
 describe('webview MockBackend — W4-T3b B12: per-session policy.setPreset does not cross-wire', () => {
   it('echoes policy.state under the SAME sessionId it was set on', () => {
     const { backend, messages } = makeHarness();

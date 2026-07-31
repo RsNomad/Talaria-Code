@@ -122,6 +122,12 @@ export class MockBackend {
       case 'tab.open':
         this.bindTab(msg.tabId);
         break;
+      case 'tab.newSession':
+        // W3-T6 (CF-11/D2): the composer's per-tab "New Session" — clears
+        // and replaces ONLY this tab's own player, leaving every sibling
+        // tab's player (and its scripted turn) running untouched.
+        this.newSessionInTab(msg.tabId, msg.sessionId);
+        break;
       case 'control.request':
         this.handleControlRequest(msg);
         break;
@@ -180,6 +186,29 @@ export class MockBackend {
     const sessionId = this.mintSession();
     this.registerPlayer(sessionId);
     this.emit({ type: 'tab.bound', tabId, sessionId, rootId: sessionId });
+  }
+
+  /**
+   * W3-T6 (CF-11/D2): rebind ONLY `tabId` — retire its OLD player (if any,
+   * keyed by the wire's own `sessionId` hint; this scaffold has no
+   * tabId-keyed registry to re-derive it from, unlike the real backend's
+   * `getByTabId`) and mint a fresh one bound to the SAME tab. Every OTHER
+   * tab's player is never touched — `players` only ever loses the ONE entry
+   * named here.
+   */
+  private newSessionInTab(tabId: string, sessionId?: string): void {
+    if (sessionId) {
+      const old = this.players.get(sessionId);
+      if (old) {
+        this.clearTimers(old);
+        this.players.delete(sessionId);
+      }
+      this.emit({ type: 'clear', sessionId });
+    }
+    const fresh = this.mintSession();
+    this.registerPlayer(fresh);
+    this.emit({ type: 'tab.bound', tabId, sessionId: fresh, rootId: fresh });
+    if (tabId === BOOTSTRAP_TAB_ID) this.bootstrapSessionId = fresh;
   }
 
   private registerPlayer(sessionId: string): void {

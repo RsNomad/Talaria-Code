@@ -72,7 +72,7 @@
     "commands": [
       {
         "command": "talaria.newSession",
-        "title": "New Session",
+        "title": "Restart Agent Connection",
         "category": "Talaria",
         "icon": "$(add)"
       },

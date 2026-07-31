@@ -445,6 +445,55 @@ describe('TalariaViewProvider — W4-T5b: tab.load routing (§2d wire, not a CON
   });
 });
 
+/** W3-T6 (CF-11/D2): a fake with the real backend's structural
+ * `newSessionInTab` seam. */
+type NewSessionInTabBackend = AgentBackend & {
+  newSessionInTab: (tabId: string, sessionId?: string) => Promise<void>;
+};
+function makeNewSessionInTabBackend(
+  newSessionInTab = vi.fn().mockResolvedValue(undefined),
+): NewSessionInTabBackend {
+  return { ...makeFakeBackend(), newSessionInTab };
+}
+
+describe('TalariaViewProvider — W3-T6 (CF-11/D2): tab.newSession routing (per-tab "New Session")', () => {
+  it('routes tab.newSession to a newSessionInTab-capable backend with {tabId, sessionId}', () => {
+    const backend = makeNewSessionInTabBackend();
+    const { provider } = makeProviderWith(backend);
+
+    seam(provider).handleWebviewMessage({ type: 'tab.newSession', tabId: 'tab-2', sessionId: 'sess-9' });
+
+    expect(backend.newSessionInTab).toHaveBeenCalledWith('tab-2', 'sess-9');
+  });
+
+  it('routes tab.newSession for a not-yet-bound tab (no sessionId on the wire)', () => {
+    const backend = makeNewSessionInTabBackend();
+    const { provider } = makeProviderWith(backend);
+
+    seam(provider).handleWebviewMessage({ type: 'tab.newSession', tabId: 'tab-2' });
+
+    expect(backend.newSessionInTab).toHaveBeenCalledWith('tab-2', undefined);
+  });
+
+  it('ignores tab.newSession when the backend has no newSessionInTab support (mock) — no-op, never throws', () => {
+    // A plain fake lacks newSessionInTab — routing must no-op, never throw (MockBackend has none).
+    const { provider } = makeProviderWith(makeFakeBackend());
+    expect(() =>
+      seam(provider).handleWebviewMessage({ type: 'tab.newSession', tabId: 'tab-2', sessionId: 'sess-9' }),
+    ).not.toThrow();
+  });
+
+  it('a rejecting newSessionInTab is logged, never becomes an unhandled rejection', async () => {
+    const backend = makeNewSessionInTabBackend(vi.fn().mockRejectedValue(new Error('boom')));
+    const { provider } = makeProviderWith(backend);
+
+    expect(() =>
+      seam(provider).handleWebviewMessage({ type: 'tab.newSession', tabId: 'tab-2', sessionId: 'sess-9' }),
+    ).not.toThrow();
+    await flush();
+  });
+});
+
 describe('TalariaViewProvider — W2 T2c: prompt routing threads @-mentions through to the backend', () => {
   it("passes message.mentions through verbatim as sendPrompt's 4th argument", () => {
     const sendPrompt = vi.fn();

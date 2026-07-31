@@ -48,6 +48,55 @@ async function playAndCollect(mentions?: ContextRef[]): Promise<HostToWebviewMes
   return messages;
 }
 
+describe('MockBackend — W3-T6 (CF-11/D2): newSessionInTab (per-tab "New Session" mock)', () => {
+  it('mints a fresh mock-tab-session-N bound to the SAME tab, and clears the OLD sessionId first', async () => {
+    const backend = new MockBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    backend.start(); // MOCK_SESSION_ID @ MOCK_TAB_ID (mock-session-1 / mock-tab-1)
+
+    await backend.newSessionInTab('mock-tab-1', 'mock-session-1');
+
+    const clearIdx = messages.findIndex(
+      (m) => m.type === 'clear' && (m as { sessionId?: string }).sessionId === 'mock-session-1',
+    );
+    const boundIdx = messages.findIndex(
+      (m) => m.type === 'tab.bound' && (m as { tabId?: string }).tabId === 'mock-tab-1' && (m as { sessionId?: string }).sessionId !== 'mock-session-1',
+    );
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(boundIdx).toBeGreaterThan(clearIdx);
+    backend.dispose();
+  });
+
+  it('never clears anything when no sessionId is given (a not-yet-bound tab) — still mints + binds fresh', async () => {
+    const backend = new MockBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.newSessionInTab('tab-2');
+
+    expect(messages.some((m) => m.type === 'clear')).toBe(false);
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.bound', tabId: 'tab-2' }),
+    );
+    backend.dispose();
+  });
+
+  it('two calls for DIFFERENT tabs mint DISTINCT sessionIds', async () => {
+    const backend = new MockBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.newSessionInTab('tab-a');
+    await backend.newSessionInTab('tab-b');
+
+    const bounds = messages.filter((m) => m.type === 'tab.bound') as Array<{ tabId: string; sessionId: string }>;
+    expect(bounds).toHaveLength(2);
+    expect(bounds[0]?.sessionId).not.toBe(bounds[1]?.sessionId);
+    backend.dispose();
+  });
+});
+
 describe('MockBackend — W2 S0: sendPrompt optional `mentions` param', () => {
   it('is a no-op: passing `mentions` emits the identical message sequence as omitting it', async () => {
     vi.useFakeTimers();

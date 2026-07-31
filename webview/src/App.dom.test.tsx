@@ -17,7 +17,7 @@
  * two near-identical inline copies App.tsx carried before), and this file
  * renders that component directly with the same props App.tsx passes it.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { ReactElement } from 'react';
 import { render, screen, within, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -405,5 +405,49 @@ describe('A-3 (audit-3 I-2): persistent mock-mode disclosure strip', () => {
     render(<App />);
     // No hydrate delivered yet: INITIAL_STATE.backendKind boots 'mock'.
     expect(screen.getByRole('note', { name: 'Demo mode notice' })).toBeInTheDocument();
+  });
+});
+
+/**
+ * W3-T6 (CF-11/D2): the composer's "New Session" button now rebinds ONLY
+ * the current tab (`tab.newSession`) instead of restarting the whole
+ * connection (`newSession`, which used to end every tab's live turn). This
+ * proves the WIRING against a real `<App>` render — what actually gets
+ * posted when the button is clicked — mirroring `bridge.test.ts`'s posture
+ * that `bridge.post` is the one true channel to the host.
+ */
+describe('W3-T6 (CF-11/D2): the composer posts tab.newSession, never the old connection-global newSession', () => {
+  function setup(jsx: ReactElement) {
+    return { user: userEvent.setup(), ...render(jsx) };
+  }
+
+  it('clicking "New Session" posts {type:"tab.newSession", tabId, sessionId} for the active tab', async () => {
+    const postSpy = vi.spyOn(bridge, 'post');
+    const { user } = setup(<App />);
+    // Bind the bootstrap tab first — App.tsx reads `tab.sessionId` off the
+    // active tab's CURRENT binding, mirroring what a real host bind gives it.
+    act(() => {
+      bridge.emit({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 's1', rootId: 'root1' });
+    });
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(postSpy).toHaveBeenCalledWith({ type: 'tab.newSession', tabId: BOOTSTRAP_TAB_ID, sessionId: 's1' });
+    expect(postSpy).not.toHaveBeenCalledWith({ type: 'newSession' });
+    postSpy.mockRestore();
+  });
+
+  it('clicking "New Session" before any bind still posts tab.newSession (never the legacy connection-global message)', async () => {
+    const postSpy = vi.spyOn(bridge, 'post');
+    const { user } = setup(<App />);
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    const newSessionCalls = postSpy.mock.calls.filter(([msg]) => msg.type === 'newSession');
+    expect(newSessionCalls).toEqual([]);
+    expect(postSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tab.newSession', tabId: BOOTSTRAP_TAB_ID }),
+    );
+    postSpy.mockRestore();
   });
 });

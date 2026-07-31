@@ -2956,6 +2956,224 @@ describe('AcpBackend — T-1 (V-12 RESTART-STATE): explicit restart fans out end
 });
 
 /**
+ * W3-T6 (CF-11/D2): "New Session" now rebinds ONLY the current tab — mints a
+ * fresh session bound to the SAME tabId, ending only THAT tab's own live
+ * turn (honest `status:'cancelled'` via `SessionController.endForRestart` —
+ * the SAME primitive the describe block above's whole-connection restart
+ * uses, now fired for exactly ONE controller instead of every registered
+ * one), leaving every sibling tab's controller and live turn COMPLETELY
+ * untouched. Contrast with the T-1 (V-12 RESTART-STATE) block directly
+ * above: that is the OLD whole-connection restart `talaria.newSession`
+ * command still drives (unchanged, still fans out to every tab, now
+ * relabeled "Restart Agent Connection" in package.json for honesty);
+ * `newSessionInTab` is the NEW, additional per-tab entry the composer's own
+ * "New Session" button posts instead (`tab.newSession`, §2d wire).
+ */
+describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session" rebind', () => {
+  /** Like the `W4-T2` describe block's own `mintOnCwd`, but ALSO binds an
+   * EXPLICIT tabId — the isolation test below needs two controllers on
+   * DIFFERENT roots (so both can hold a live turn simultaneously — same-root
+   * turns serialize via the shared root lease, an orthogonal, pre-existing
+   * constraint) AND on DIFFERENT named tabs (so `getByTabId` resolves each
+   * one distinctly), which the shared `seam()` sessionId setter alone cannot
+   * do (it always defaults to `BOOTSTRAP_TAB_ID`). */
+  function mintOnCwdForTab(backend: AcpBackend, sessionId: string, cwd: string, tabId: string): void {
+    const b = backend as unknown as {
+      buildSessionPort(sessionId: string, cwd: string): unknown;
+      sessions: { open(id: string, cwd: string, port: unknown, tabId?: string): unknown };
+    };
+    b.sessions.open(sessionId, cwd, b.buildSessionPort(sessionId, cwd), tabId);
+  }
+
+  it('ends the tab\'s own live turn (cancelled), closes the old session, and binds a FRESH session to the SAME tab — the transcript clear lands BEFORE the fresh bind, never as session-lost', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    backend.sendPrompt('session-1', 'work', 'default'); // this tab's OWN turn is live
+    await flushMicrotasks();
+    expect(must(clients[0]).promptCallCount).toBe(1);
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    must(clients[0]).queueSessionId('session-2');
+
+    await backend.newSessionInTab(BOOTSTRAP_TAB_ID, 'session-1');
+
+    // The OLD session's live turn ends CANCELLED — user-intended, never a
+    // failure (endForRestart's own contract, unlike endOnCrash's 'error').
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'turn.end', sessionId: 'session-1', status: 'cancelled' }),
+    );
+    // The OLD session's transcript clears BEFORE the fresh bind — while
+    // 'session-1' is STILL this tab's binding in the webview's own state, so
+    // the reducer's generic `foldSessionScoped` resolves it to THIS tab.
+    const clearIdx = messages.findIndex(
+      (m) => m.type === 'clear' && (m as { sessionId?: string }).sessionId === 'session-1',
+    );
+    const boundIdx = messages.findIndex(
+      (m) => m.type === 'tab.bound' && (m as { tabId?: string }).tabId === BOOTSTRAP_TAB_ID && (m as { sessionId?: string }).sessionId === 'session-2',
+    );
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(boundIdx).toBeGreaterThan(clearIdx);
+    // The fresh session binds to the SAME tabId.
+    expect(messages[boundIdx]).toMatchObject({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 'session-2' });
+    // The OLD controller is genuinely gone; the NEW one occupies the tab.
+    expect(hasController(backend, 'session-1')).toBe(false);
+    expect(sessionIdForTab(backend, BOOTSTRAP_TAB_ID)).toBe('session-2');
+    // Never session-lost — a New Session is user-intended SUCCESS, not the
+    // failure affordance `fanOutRestartSignal` gives an orphaned sibling.
+    expect(messages.some((m) => m.type === 'tab.error')).toBe(false);
+  });
+
+  it('a sibling tab\'s controller + live turn are COMPLETELY untouched — no message ever names it, and it is still genuinely live afterward', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID, root ''
+    // tab-2's own session on a DIFFERENT root, so both can hold a live turn
+    // SIMULTANEOUSLY (v1 production always shares one cwd across tabs — this
+    // is a TEST device to get two independent live turns, not a claim about
+    // production topology; the isolation guarantee under test does not
+    // depend on same- vs cross-root).
+    mintOnCwdForTab(backend, 'session-2', '/root-2', 'tab-2');
+
+    backend.sendPrompt('session-1', 'A work', 'default'); // A: about to be rebound
+    await flushMicrotasks();
+    backend.sendPrompt('session-2', 'B work', 'default'); // B: sibling, must survive untouched
+    await flushMicrotasks();
+    expect(must(clients[0]).promptCallCount).toBe(2); // both genuinely live — independent roots, no lease contention
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    must(clients[0]).queueSessionId('session-3');
+
+    await backend.newSessionInTab(BOOTSTRAP_TAB_ID, 'session-1');
+
+    // B's controller is STILL registered, at its ORIGINAL tab.
+    expect(hasController(backend, 'session-2')).toBe(true);
+    expect(sessionIdForTab(backend, 'tab-2')).toBe('session-2');
+    // No message of ANY kind, for ANY reason, ever named B's session/tab
+    // during the rebind — not a turn.end, not a tab.error, not a clear.
+    expect(
+      messages.some((m) => 'sessionId' in m && (m as { sessionId?: string }).sessionId === 'session-2'),
+    ).toBe(false);
+    expect(messages.some((m) => 'tabId' in m && (m as { tabId?: string }).tabId === 'tab-2')).toBe(false);
+    // B's turn is still genuinely live, not merely "still registered" — its
+    // OWN root's turn lease is still held (the real production signal
+    // `endForRestart`/`dispose` would have released had B's controller been
+    // touched at all — proves it was only ever READ here, never mutated).
+    expect(anyLiveTurnOnRoot(backend, '/root-2')).toBe(true);
+  });
+
+  it('emits tab.error{kind:"open-failed"} instead of throwing when there is no live client', async () => {
+    const config: HermesRuntimeConfig = {};
+    const { AcpBackend: RealAcpBackend } = await import('./AcpBackend');
+    const backend = new RealAcpBackend(config);
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await expect(backend.newSessionInTab('tab-9')).resolves.toBeUndefined(); // never throws/rejects
+
+    expect(messages).toEqual([
+      { type: 'tab.error', tabId: 'tab-9', kind: 'open-failed', message: expect.any(String) },
+    ]);
+  });
+
+  it('emits tab.error{kind:"open-failed"} when the fresh session/new itself rejects — the OLD session is still gone (never a zombie)', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).failNextNewSession(new Error('Hermes refused the cwd'));
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.newSessionInTab(BOOTSTRAP_TAB_ID, 'session-1');
+
+    expect(messages).toContainEqual({
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'open-failed',
+      message: expect.stringContaining('refused the cwd'),
+    });
+    expect(hasController(backend, 'session-1')).toBe(false); // old is gone even though the mint failed — never a zombie
+  });
+
+  it('mints fresh even for a tab with no current controller (never opened, or already gone) — never throws', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    must(clients[0]).queueSessionId('session-2');
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.newSessionInTab('tab-never-opened');
+
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.bound', tabId: 'tab-never-opened', sessionId: 'session-2' }),
+    );
+    expect(messages.some((m) => m.type === 'clear')).toBe(false); // nothing old to clear
+  });
+
+  it('two rapid newSessionInTab calls on the SAME tab serialize on the tail — the second never reaches its own client.newSession until the first fully settles', async () => {
+    const { backend } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
+    const calls: Array<ReturnType<typeof deferred<{ sessionId: string; currentModeId: string }>>> = [];
+    const client = {
+      async newSession(): Promise<{ sessionId: string; currentModeId: string }> {
+        const d = deferred<{ sessionId: string; currentModeId: string }>();
+        calls.push(d);
+        return d.promise;
+      },
+    };
+    seam(backend).client = client;
+
+    const p1 = backend.newSessionInTab(BOOTSTRAP_TAB_ID, 'session-1');
+    const p2 = backend.newSessionInTab(BOOTSTRAP_TAB_ID);
+    await flushMicrotasks();
+
+    // RED (pre-fix): both would reach client.newSession back-to-back — this
+    // would already be 2 here. GREEN (post-fix): the second rebind is
+    // queued behind the first on the SAME `inFlightStart` tail.
+    expect(calls).toHaveLength(1);
+
+    calls[0]?.resolve({ sessionId: 'session-2', currentModeId: 'default' });
+    await p1;
+    await flushMicrotasks();
+
+    // NOW the second rebind's turn on the tail has arrived.
+    expect(calls).toHaveLength(2);
+    calls[1]?.resolve({ sessionId: 'session-3', currentModeId: 'default' });
+    await p2;
+
+    expect(sessionIdForTab(backend, BOOTSTRAP_TAB_ID)).toBe('session-3');
+    expect(hasController(backend, 'session-2')).toBe(false); // the first rebind's own fresh session was itself replaced by the second, in turn
+    expect(hasController(backend, 'session-3')).toBe(true);
+  });
+
+  it('a tab.newSession racing a sibling\'s sendPrompt does not cross-tab-leak — the sibling\'s prompt genuinely reaches the client, untouched by the queued rebind', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).queueSessionId('session-2');
+    await backend.openTab('tab-2'); // session-2, same root as session-1 (v1 posture)
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    must(clients[0]).queueSessionId('session-3');
+
+    // Fire the rebind (queues on the tail) and IMMEDIATELY race a sibling
+    // sendPrompt — sendPrompt is deliberately never tail-wrapped (§2c), so
+    // it is free to run before the queued rebind's own body even starts.
+    const rebindPromise = backend.newSessionInTab(BOOTSTRAP_TAB_ID, 'session-1');
+    backend.sendPrompt('session-2', 'tab-2 work', 'default');
+    await rebindPromise;
+    await flushMicrotasks();
+
+    expect(must(clients[0]).promptCallCount).toBe(1); // tab-2's prompt genuinely reached the client
+    expect(sessionIdForTab(backend, 'tab-2')).toBe('session-2'); // never replaced
+    expect(hasController(backend, 'session-2')).toBe(true);
+    expect(
+      messages.some((m) => m.type === 'tab.error' && (m as { tabId?: string }).tabId === 'tab-2'),
+    ).toBe(false);
+    // The rebind itself still completed correctly, unaffected by the race.
+    expect(sessionIdForTab(backend, BOOTSTRAP_TAB_ID)).toBe('session-3');
+  });
+});
+
+/**
  * W6-FG (folded-in W6-FB review Minor — a pre-existing race in the
  * twice-bitten `recoverOneSession`/`SessionRegistry` zone, HISTORICAL):
  * `recoverOneSession` closes by KEY (`this.sessions.close(sessionId)`) after
