@@ -446,6 +446,19 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         this.backend.setModel(message.sessionId, message.modelId);
         break;
 
+      case 'model.addKey':
+        // CF-13/D1: the key is NEVER on this message (see `WebviewToHost`'s
+        // `model.addKey` doc) — `promptAndSaveProviderKey` prompts for it
+        // directly, host-side. Fire-and-forget from this caller's
+        // perspective (mirrors `tab.open`/`switchPanel`'s own posture);
+        // the method itself never rejects (its own try/catch turns a
+        // `model.save_key` failure into a status-only message), so the
+        // `.catch` here is defense-in-depth only.
+        void this.promptAndSaveProviderKey(message.slug).catch((err) =>
+          this.logger?.appendLine(`[model.addKey] ${message.slug} failed: ${errorMessage(err)}`),
+        );
+        break;
+
       // P7-N10: the legacy `setMode` wire message + its clamp-to-'default'
       // handler were YAGNI-deleted (a sessionId-less fan-out footgun, never
       // actually sent by the webview — presets replaced wire modes; the
@@ -595,6 +608,66 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         { preview: true },
       )
       .then(undefined, (err) => this.logger?.appendLine(`[diff.open] ${String(err)}`));
+  }
+
+  /**
+   * CF-13/D1: the "Add provider key" affordance's host half.
+   *
+   * SECRET DISCIPLINE (load-bearing): the API key is the HARNESS's
+   * credential — it authenticates the harness to the provider and is
+   * persisted by the harness to `~/.hermes/.env` (confirmed harness
+   * contract, `tui_gateway/server.py:12426-12503`), never used by the
+   * extension itself. So this method:
+   *  - prompts for it directly via `showInputBox({password:true})` — the
+   *    key never crosses into the webview (the wire message carries only
+   *    `slug`, see `WebviewToHost`'s `model.addKey`);
+   *  - holds it ONLY in the local `apiKey` binding, for the single
+   *    `model.save_key` dispatch below — never stored in `SecretStorage`,
+   *    never a config value, never re-asserted on connect (unlike
+   *    `autocomplete/index.ts`'s `promptAndStoreApiKey`, whose key IS the
+   *    extension's own to keep — this one is not);
+   *  - never logs the params (`this.backend.invokeControl` is called
+   *    directly here, not through `handleControlRequest`'s generic
+   *    control-response path, and the catch below logs only the
+   *    server-authored failure MESSAGE, never `params`).
+   *
+   * A cancelled (`undefined`) or blank prompt is a silent no-op — nothing
+   * to save. A `model.save_key` failure surfaces a STATUS-ONLY message
+   * (never the key): 4006 (managed install — credentials are read-only)
+   * gets its own honest wording; every other failure (4001/4002/4003/4004,
+   * or a transport error) gets a generic one. On success, `ControlDispatcher
+   * .invokeControl`'s own `model.save_key` branch re-fetches the Models
+   * panel and pushes it — this method does not need to.
+   */
+  private async promptAndSaveProviderKey(slug: string): Promise<void> {
+    const value = await vscode.window.showInputBox({
+      title: `Talaria: Add ${slug} API Key`,
+      prompt:
+        'Sent directly to the Hermes harness, which stores it in ~/.hermes/.env. ' +
+        'Talaria never stores, logs, or re-sends this value.',
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (value === undefined) return; // cancelled
+    const apiKey = value.trim();
+    if (!apiKey) return; // blank — nothing to save
+
+    try {
+      await this.backend.invokeControl('model.save_key', { slug, api_key: apiKey });
+    } catch (err) {
+      // Never log/surface `err`'s raw params — only the server-authored
+      // failure message, which the harness's `model.save_key` never echoes
+      // the submitted key into (`server.py:12426-12503`).
+      const message = errorMessage(err);
+      this.logger?.appendLine(`[model.addKey] ${slug} failed: ${message}`);
+      if (message.includes('[4006]')) {
+        void vscode.window.showWarningMessage(
+          `Talaria: '${slug}' credentials are managed by this install and are read-only.`,
+        );
+      } else {
+        void vscode.window.showErrorMessage(`Talaria: could not save the '${slug}' API key — ${message}`);
+      }
+    }
   }
 
   /**

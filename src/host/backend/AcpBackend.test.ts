@@ -6340,6 +6340,70 @@ describe('AcpBackend.invokeControl — Zone Z3: models/settings reshapers (findi
   });
 });
 
+/**
+ * CF-13/D1: the "Add provider key" harness contract. `model.save_key`
+ * ({slug, api_key}) returns `{provider: <refreshed row>}` on success — this
+ * dispatcher mirrors `reload.mcp`'s "dispatch → refetch panel" branch: a
+ * success re-fetches the Models panel FRESH (`model.options`, not an echo of
+ * the request), a failure (e.g. the 4006 managed-install refusal) re-throws
+ * without ever touching the panel.
+ */
+describe('AcpBackend.invokeControl — CF-13/D1: model.save_key (Add provider key) panel refresh', () => {
+  it('a successful model.save_key dispatches through and re-fetches the models panel exactly once, from a fresh model.options read', async () => {
+    const { backend, messages } = makeBackend();
+    const control = withFakeControl(backend);
+    control.setResultFor('model.save_key', {
+      provider: { slug: 'deepseek', name: 'DeepSeek', authenticated: true, models: ['deepseek-chat'] },
+    });
+    control.setResultFor('model.options', {
+      providers: [{ slug: 'deepseek', name: 'DeepSeek', authenticated: true, models: ['deepseek-chat'] }],
+      model: 'deepseek-chat',
+    });
+
+    const result = await backend.invokeControl('model.save_key', {
+      slug: 'deepseek',
+      api_key: 'sk-super-secret-value',
+    });
+
+    // The key transits ONCE, host-side, to the harness — exactly the params
+    // the caller supplied, verbatim (this dispatcher never touches it).
+    expect(control.dispatchCalls).toEqual([
+      { method: 'model.save_key', params: { slug: 'deepseek', api_key: 'sk-super-secret-value' } },
+      { method: 'model.options', params: undefined },
+    ]);
+    // The resolved value is the harness's own {provider} reply — never
+    // anything fabricated from the request (the key never echoes back).
+    expect(result).toEqual({
+      provider: { slug: 'deepseek', name: 'DeepSeek', authenticated: true, models: ['deepseek-chat'] },
+    });
+    const expectedModels = {
+      providers: [
+        { id: 'deepseek', name: 'DeepSeek', connected: true, models: [{ id: 'deepseek-chat', label: 'deepseek-chat' }] },
+      ],
+      currentModelId: 'deepseek-chat',
+    };
+    expect(messages).toEqual([{ type: 'panel.data', panel: 'models', data: expectedModels }]);
+  });
+
+  it('a failed model.save_key (4006 managed-install) propagates the rejection and does NOT re-fetch the models panel', async () => {
+    const { backend, messages } = makeBackend();
+    const control = withFakeControl(backend);
+    control.setDeferredFor(
+      'model.save_key',
+      Promise.reject(new Error('model.save_key failed [4006]: credentials are managed and read-only')),
+    );
+
+    await expect(
+      backend.invokeControl('model.save_key', { slug: 'deepseek', api_key: 'sk-super-secret-value' }),
+    ).rejects.toThrow('[4006]');
+
+    expect(control.dispatchCalls).toEqual([
+      { method: 'model.save_key', params: { slug: 'deepseek', api_key: 'sk-super-secret-value' } },
+    ]);
+    expect(messages).toEqual([]);
+  });
+});
+
 describe('AcpBackend.registerPanelSource — Open-Closed extension point (dashboard zone)', () => {
   it('routes a panel fetch through a newly-registered source WITHOUT dispatching the default tui_gateway RPC', async () => {
     const { backend, messages } = makeBackend();

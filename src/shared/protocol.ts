@@ -1553,6 +1553,18 @@ export type WebviewToHost =
    */
   | { type: 'setModel'; sessionId: string; modelId: string }
 
+  /**
+   * CF-13/D1: the Models panel's "Add key" affordance. Carries ONLY the
+   * provider `slug` (the same field `ModelProvider.id` is reshaped from,
+   * see `reshapeModelOptions` — the harness's `model.save_key` param) — the
+   * API key itself is a SECRET and NEVER crosses this boundary: the host
+   * prompts for it directly (`showInputBox({password:true})`) and dispatches
+   * `model.save_key({slug, api_key})` on the control channel. The harness
+   * PERSISTS the key to `~/.hermes/.env` (it authenticates to the provider,
+   * not the extension) — Talaria stores nothing and never re-asserts it.
+   */
+  | { type: 'model.addKey'; slug: string }
+
   // P7-N10: the legacy `{ type: 'setMode'; mode: AgentMode }` wire message
   // was YAGNI-deleted from this union — a sessionId-less fan-out that
   // mutated EVERY live session, never actually sent by the webview (presets

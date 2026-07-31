@@ -7,7 +7,7 @@
  * hanging. This is the responder half of the RpcClient tested in
  * `webview/src/rpc.test.ts`.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +30,11 @@ vi.mock('vscode', () => {
       onDidChangeActiveColorTheme: () => ({ dispose() {} }),
       activeColorTheme: { kind: 2 },
       showWarningMessage: vi.fn(),
+      // CF-13/D1: the "Add provider key" masked prompt + status-only error
+      // surfacing (mirrors `autocomplete/index.ts`'s `promptAndStoreApiKey`
+      // posture, minus the SecretStorage store).
+      showInputBox: vi.fn(),
+      showErrorMessage: vi.fn(),
     },
     commands: {
       // Resolved by default (matches real `executeCommand`'s Thenable
@@ -1122,5 +1127,114 @@ describe('TalariaViewProvider — F11 ErrorBoundary Reload (host-driven webview.
     // Once the re-mounted tree re-announces ready, the latched seed flushes.
     seam(provider).handleWebviewMessage({ type: 'ready' });
     expect(posted.some((m) => m.type === 'composer.seed')).toBe(true);
+  });
+});
+
+/**
+ * CF-13/D1: the "Add provider key" wiring. The webview posts ONLY
+ * `{type:'model.addKey', slug}` (no key) — the host prompts for the key
+ * directly (masked) and dispatches `model.save_key({slug, api_key})`.
+ * SECRET DISCIPLINE is load-bearing here: the entered key must never be
+ * logged and never stored by the extension (the harness owns it,
+ * persisting to `~/.hermes/.env` — no SecretStorage, no connect re-assert).
+ */
+describe('TalariaViewProvider — CF-13/D1: model.addKey ("Add provider key")', () => {
+  const mockShowInputBox = vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>;
+  const mockShowWarningMessage = vscode.window.showWarningMessage as unknown as ReturnType<typeof vi.fn>;
+  const mockShowErrorMessage = vscode.window.showErrorMessage as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockShowInputBox.mockReset();
+    mockShowWarningMessage.mockClear();
+    mockShowErrorMessage.mockClear();
+  });
+
+  it('a cancelled prompt (showInputBox resolves undefined) is a no-op — never dispatches model.save_key', async () => {
+    mockShowInputBox.mockResolvedValueOnce(undefined);
+    const invokeControl = vi.fn().mockResolvedValue({ provider: {} });
+    const { provider } = makeProviderWith(makeFakeBackend(invokeControl));
+
+    seam(provider).handleWebviewMessage({ type: 'model.addKey', slug: 'deepseek' });
+    await flush();
+
+    expect(invokeControl).not.toHaveBeenCalled();
+  });
+
+  it('a blank/whitespace-only entry is a no-op — never dispatches model.save_key', async () => {
+    mockShowInputBox.mockResolvedValueOnce('   ');
+    const invokeControl = vi.fn().mockResolvedValue({ provider: {} });
+    const { provider } = makeProviderWith(makeFakeBackend(invokeControl));
+
+    seam(provider).handleWebviewMessage({ type: 'model.addKey', slug: 'deepseek' });
+    await flush();
+
+    expect(invokeControl).not.toHaveBeenCalled();
+  });
+
+  it('a non-empty entry dispatches model.save_key({slug, api_key}) through a MASKED prompt', async () => {
+    mockShowInputBox.mockResolvedValueOnce('sk-super-secret-value');
+    const invokeControl = vi.fn().mockResolvedValue({ provider: { id: 'deepseek' } });
+    const { provider } = makeProviderWith(makeFakeBackend(invokeControl));
+
+    seam(provider).handleWebviewMessage({ type: 'model.addKey', slug: 'deepseek' });
+    await flush();
+
+    expect(mockShowInputBox).toHaveBeenCalledWith(expect.objectContaining({ password: true }));
+    expect(invokeControl).toHaveBeenCalledWith('model.save_key', {
+      slug: 'deepseek',
+      api_key: 'sk-super-secret-value',
+    });
+  });
+
+  it('SECRET DISCIPLINE: the entered key is never logged, on success or on failure', async () => {
+    mockShowInputBox.mockResolvedValueOnce('sk-super-secret-value');
+    const invokeControl = vi
+      .fn()
+      .mockRejectedValue(new Error('model.save_key failed [4002]: unknown provider'));
+    const logged: string[] = [];
+    const logger = { appendLine: (line: string) => logged.push(line) } as unknown as vscode.OutputChannel;
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(invokeControl), logger);
+    seam(provider).view = { webview: { postMessage: () => {} } };
+
+    seam(provider).handleWebviewMessage({ type: 'model.addKey', slug: 'deepseek' });
+    await flush();
+
+    expect(logged.some((line) => line.includes('sk-super-secret-value'))).toBe(false);
+    // and never surfaced back to the user either
+    expect(mockShowErrorMessage.mock.calls.flat().join(' ')).not.toContain('sk-super-secret-value');
+    expect(mockShowWarningMessage.mock.calls.flat().join(' ')).not.toContain('sk-super-secret-value');
+  });
+
+  it('a 4006 (managed install) failure surfaces a STATUS-ONLY read-only message — never the key', async () => {
+    mockShowInputBox.mockResolvedValueOnce('sk-super-secret-value');
+    const invokeControl = vi
+      .fn()
+      .mockRejectedValue(new Error('model.save_key failed [4006]: credentials are managed and read-only'));
+    const { provider } = makeProviderWith(makeFakeBackend(invokeControl));
+
+    seam(provider).handleWebviewMessage({ type: 'model.addKey', slug: 'deepseek' });
+    await flush();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [message] = mockShowWarningMessage.mock.calls[0] as [string];
+    expect(message.toLowerCase()).toContain('read-only');
+    expect(message).not.toContain('sk-super-secret-value');
+    expect(mockShowErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it('a non-4006 failure (e.g. 4002 unknown provider) surfaces a generic status-only error — never the key', async () => {
+    mockShowInputBox.mockResolvedValueOnce('sk-super-secret-value');
+    const invokeControl = vi
+      .fn()
+      .mockRejectedValue(new Error('model.save_key failed [4002]: unknown provider'));
+    const { provider } = makeProviderWith(makeFakeBackend(invokeControl));
+
+    seam(provider).handleWebviewMessage({ type: 'model.addKey', slug: 'deepseek' });
+    await flush();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+    const [message] = mockShowErrorMessage.mock.calls[0] as [string];
+    expect(message).not.toContain('sk-super-secret-value');
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 });

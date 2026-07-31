@@ -19,10 +19,16 @@ interface ModelsPanelProps {
    * authoritative. */
   activeModelId: string | null;
   onSetModel: (modelId: string) => void;
-  onInvoke: (method: string, params?: unknown) => void;
+  /**
+   * CF-13/D1: request the host prompt-and-save this provider's API key.
+   * Called with THAT provider's `id` (the harness's `slug`, see
+   * `reshapeModelOptions`) — never with a key; the key is entered directly
+   * into a host-side masked prompt and never reaches this component.
+   */
+  onAddProviderKey: (slug: string) => void;
 }
 
-export function ModelsPanel({ data, activeModelId, onSetModel, onInvoke }: ModelsPanelProps) {
+export function ModelsPanel({ data, activeModelId, onSetModel, onAddProviderKey }: ModelsPanelProps) {
   // P7-N6 (UI-I2a): read the SAME effective model id the composer chip
   // uses — preferring the tab's optimistic pick over the (possibly stale)
   // panel payload — so selecting a model highlights immediately and never
@@ -68,10 +74,26 @@ export function ModelsPanel({ data, activeModelId, onSetModel, onInvoke }: Model
       {data.providers.map((p) => (
         <div key={p.id}>
           <SectionLabel>
-            {p.name}
-            {!p.connected && (
-              <span className="ml-1.5 text-2xs normal-case text-warn">not connected</span>
-            )}
+            <div className="flex items-center justify-between gap-2">
+              <span>
+                {p.name}
+                {!p.connected && (
+                  <span className="ml-1.5 text-2xs normal-case text-warn">not connected</span>
+                )}
+              </span>
+              {/* CF-13/D1: `p.id` IS the harness's provider `slug`
+                  (`reshapeModelOptions` sets `ModelProvider.id = row.slug`) —
+                  the exact param `model.save_key` expects. */}
+              <button
+                type="button"
+                onClick={() => onAddProviderKey(p.id)}
+                aria-label={`Add key for ${p.name}`}
+                className="flex flex-none items-center gap-1 text-2xs normal-case text-muted hover:text-accent"
+              >
+                <Icon name="key" size={11} />
+                Add key
+              </button>
+            </div>
           </SectionLabel>
           <div className="overflow-hidden rounded-card border border-border">
             {p.models.map((m) => {
@@ -109,15 +131,6 @@ export function ModelsPanel({ data, activeModelId, onSetModel, onInvoke }: Model
           </div>
         </div>
       ))}
-
-      <button
-        type="button"
-        onClick={() => onInvoke('model.save_key')}
-        className="mt-3 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
-      >
-        <Icon name="key" size={13} />
-        Add provider key
-      </button>
     </PanelShell>
   );
 }

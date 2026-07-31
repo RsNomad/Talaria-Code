@@ -9,6 +9,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { ModelsPanel } from './ModelsPanel';
 
 describe('G-10: the Active model header does not claim a connection it cannot see', () => {
@@ -21,7 +22,7 @@ describe('G-10: the Active model header does not claim a connection it cannot se
         }}
         activeModelId="m1"
         onSetModel={async () => undefined}
-        onInvoke={async () => undefined}
+        onAddProviderKey={() => undefined}
       />,
     );
     expect(screen.getByText('Online')).toBeInTheDocument();
@@ -36,7 +37,7 @@ describe('G-10: the Active model header does not claim a connection it cannot se
         }}
         activeModelId="m1"
         onSetModel={async () => undefined}
-        onInvoke={async () => undefined}
+        onAddProviderKey={() => undefined}
       />,
     );
     // The hardcoded pill sat directly above the provider's own "not connected"
@@ -76,7 +77,7 @@ describe('B5: the active model row exposes aria-current (today it is icon+color 
         }}
         activeModelId="m1"
         onSetModel={async () => undefined}
-        onInvoke={async () => undefined}
+        onAddProviderKey={() => undefined}
       />,
     );
 
@@ -104,7 +105,7 @@ describe('B5: the active model row exposes aria-current (today it is icon+color 
         }}
         activeModelId="m2"
         onSetModel={async () => undefined}
-        onInvoke={async () => undefined}
+        onAddProviderKey={() => undefined}
       />,
     );
 
@@ -129,11 +130,64 @@ describe('B5: the active model row exposes aria-current (today it is icon+color 
         }}
         activeModelId="m1"
         onSetModel={async () => undefined}
-        onInvoke={async () => undefined}
+        onAddProviderKey={() => undefined}
       />,
     );
 
     expect(screen.getByRole('button', { name: 'Model One' })).toHaveAttribute('aria-current', 'true');
     expect(screen.getByRole('button', { name: 'Model Two' })).not.toHaveAttribute('aria-current');
+  });
+});
+
+/**
+ * CF-13/D1: the "Add provider key" button used to fire `onInvoke('model.save_key')`
+ * with NO params and NO UI — dead on arrival (the harness requires
+ * `{slug, api_key}`). It is replaced with a PER-PROVIDER "Add key" affordance
+ * that posts only the provider's slug (`ModelProvider.id`, sourced from the
+ * harness's `slug` — see `reshapeModelOptions`); the key itself is entered
+ * host-side and never reaches this component.
+ */
+describe('CF-13/D1: the dead global "Add provider key" button is replaced by a per-provider affordance', () => {
+  function setup(jsx: Parameters<typeof render>[0]) {
+    return { user: userEvent.setup(), ...render(jsx) };
+  }
+
+  it('renders NO dead global "Add provider key" button', () => {
+    render(
+      <ModelsPanel
+        data={{
+          currentModelId: 'm1',
+          providers: [{ id: 'p1', name: 'Ollama', connected: true, models: [{ id: 'm1', label: 'M1' }] }],
+        }}
+        activeModelId="m1"
+        onSetModel={() => undefined}
+        onAddProviderKey={() => undefined}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /^add provider key$/i })).not.toBeInTheDocument();
+  });
+
+  it("each provider's \"Add key\" affordance posts THAT provider's own slug (the id field the harness's model.save_key expects)", async () => {
+    const calls: string[] = [];
+    const { user } = setup(
+      <ModelsPanel
+        data={{
+          currentModelId: 'm1',
+          providers: [
+            { id: 'deepseek', name: 'DeepSeek', connected: false, models: [{ id: 'm1', label: 'M1' }] },
+            { id: 'xai', name: 'xAI', connected: true, models: [{ id: 'm2', label: 'M2' }] },
+          ],
+        }}
+        activeModelId="m1"
+        onSetModel={() => undefined}
+        onAddProviderKey={(slug) => calls.push(slug)}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Add key for DeepSeek' }));
+    await user.click(screen.getByRole('button', { name: 'Add key for xAI' }));
+
+    expect(calls).toEqual(['deepseek', 'xai']);
   });
 });

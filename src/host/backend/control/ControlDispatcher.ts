@@ -235,6 +235,25 @@ export class ControlDispatcher {
       return raw;
     }
 
+    if (method === 'model.save_key') {
+      // CF-13/D1: `params` carries `{slug, api_key}` — the SECOND field is
+      // the provider API key. It is passed straight through to
+      // `this.port.dispatch` (the ONLY thing that needs it — the harness
+      // persists it to `~/.hermes/.env`) and is otherwise untouched by this
+      // branch: never logged, never inspected, never echoed into the
+      // return value below. Mirrors `reload.mcp`'s "dispatch → refetch
+      // panel" shape: on success (`{provider: <refreshed row>}`) the Models
+      // panel is re-fetched FRESH (a real `model.options` read, not
+      // anything fabricated from the request) and pushed; a failure (e.g.
+      // the harness's 4006 "managed install" refusal) rejects this call
+      // and never touches the panel.
+      const raw = await this.port.dispatch(method, params);
+      if (isSaveKeyResult(raw)) {
+        await this.fetchPanelData('models');
+      }
+      return raw;
+    }
+
     return this.port.dispatch(method, params);
   }
 
@@ -705,6 +724,18 @@ function errorMessage(err: unknown): string {
  */
 function isReloadedResult(raw: unknown): boolean {
   return typeof raw === 'object' && raw !== null && (raw as { status?: unknown }).status === 'reloaded';
+}
+
+/**
+ * CF-13/D1: `model.save_key` succeeded — the harness returns
+ * `{provider: <refreshed ModelOptionProvider row>}` (confirmed harness
+ * contract, `server.py:12426-12503`). Mirrors {@link isReloadedResult}'s
+ * shape-check posture: a failure rejects the whole `dispatch` call instead
+ * of resolving here, so this only ever gates the Models panel refetch on an
+ * actual success.
+ */
+function isSaveKeyResult(raw: unknown): boolean {
+  return typeof raw === 'object' && raw !== null && (raw as { provider?: unknown }).provider !== undefined;
 }
 
 /** Zone HIST: pull `{sessionId, cwd}` out of `session.load`'s params (the clicked `SessionSummary`). Moved verbatim. */

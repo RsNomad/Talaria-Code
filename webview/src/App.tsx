@@ -284,6 +284,11 @@ export function App() {
       params: params as Record<string, unknown> | undefined,
     });
 
+  // CF-13/D1: the Models panel's "Add key" affordance — posts ONLY the
+  // provider slug. The host prompts for the key directly (masked) and
+  // dispatches `model.save_key`; the key never enters the webview.
+  const onAddProviderKey = (slug: string) => bridge.post({ type: 'model.addKey', slug });
+
   // W4 §7 B6: the correlated panel fetch carries an EXPLICIT scope key,
   // captured HERE at issue time from the tab that's active RIGHT NOW —
   // never re-resolved from `state.activeTabId` when the promise later
@@ -811,7 +816,7 @@ export function App() {
                   data={data}
                   activeModelId={tab.currentModelId}
                   onSetModel={hostActions.setModel}
-                  onInvoke={invoke}
+                  onAddProviderKey={onAddProviderKey}
                 />
               )}
             </RemotePanel>
