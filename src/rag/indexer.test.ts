@@ -1074,3 +1074,96 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
     indexer.dispose();
   });
 });
+
+describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine read-what-you-checked)', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-a5t11-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer(debounceMs = 5) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  async function readManifest(): Promise<Record<string, string>> {
+    const raw = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8');
+    return JSON.parse(raw) as Record<string, string>;
+  }
+
+  function upsertedPaths(): string[] {
+    return upsertMock.mock.calls.flatMap(([records]) => records.map((r) => r.path));
+  }
+
+  it.skipIf(!canLinkDir)(
+    'RED: a change event through an in-workspace dir-symlink alias READS the confined canonical path and STORES under the alias relPath',
+    async () => {
+      await writeWorkspaceFile('real/doc.txt', 'canonical in-workspace content reached through an alias.\n');
+      linkDirSync(path.join(workspaceRoot, 'real'), path.join(workspaceRoot, 'alias'));
+      const aliasAbs = path.join(workspaceRoot, 'alias', 'doc.txt');
+      // What resolveWithinWorkspaceReal returns for aliasAbs: the FULLY
+      // canonical path — realpath'd via the same fs.realpath the production
+      // code uses, so a tmpdir that itself sits behind a symlink (macOS
+      // /var, /tmp binds) cannot skew the expected string.
+      const canonicalAbs = await fs.realpath(path.join(workspaceRoot, 'real', 'doc.txt'));
+
+      const readFileSpy = vi.spyOn(fs, 'readFile');
+      const indexer = makeIndexer();
+      const disposable = indexer.watch();
+
+      fsWatcherListeners.change[0]!({ fsPath: aliasAbs });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      // (a) THE RED PAIR — the reindex read must hit the CONFINED canonical
+      // path (pathConfine.ts: "read exactly the returned path so the file
+      // that was validated is the file that is read")…
+      const readPaths = readFileSpy.mock.calls.map((call) => call[0]);
+      expect(readPaths).toContain(canonicalAbs);
+      // …and must NEVER hit the unvalidated lexical uri.fsPath — at HEAD
+      // this is exactly the TOCTOU read the Task 1 review flagged.
+      expect(readPaths).not.toContain(aliasAbs);
+
+      // (b) DECOUPLING PIN (green at HEAD — guards the fix's second half):
+      // the store/manifest key stays the ALIAS relPath that the gate/secret/
+      // delete/ARCH-5-sweep branches key on. A naive fix that passed
+      // `confined` straight into the old single-argument reindexFiles would
+      // flip these to 'real/doc.txt' and orphan the row from every purge
+      // branch.
+      expect(upsertedPaths()).toContain('alias/doc.txt');
+      expect(upsertedPaths()).not.toContain('real/doc.txt');
+      const manifest = await readManifest();
+      expect(Object.keys(manifest)).toContain('alias/doc.txt');
+      expect(Object.keys(manifest)).not.toContain('real/doc.txt');
+
+      readFileSpy.mockRestore();
+      disposable.dispose();
+      indexer.dispose();
+    },
+  );
+});

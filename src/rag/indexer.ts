@@ -411,15 +411,31 @@ export function createIndexer(opts: IndexerOptions): Indexer {
    * diff found no files to recompute) — the caller uses this to decide what
    * to persist into the D-2 sidecar.
    *
-   * AUDIT-5 Task 10: `preloaded` is an optional absPath -> Buffer map. When
-   * the caller already has a path's bytes in hand (`runBuild`'s hash pass
-   * reads every candidate once already), pass them here instead of letting
-   * this function `fs.readFile` the same path a second time. The watch path
-   * (`handleFsEvent`) has no such buffer and passes nothing — it keeps its
-   * original single read.
+   * AUDIT-5 Task 10: `preloaded` is an optional readAbsPath -> Buffer map.
+   * When the caller already has a path's bytes in hand (`runBuild`'s hash
+   * pass reads every candidate once already), pass them here instead of
+   * letting this function `fs.readFile` the same path a second time. The
+   * watch path (`handleFsEvent`) has no such buffer and passes nothing — it
+   * keeps its original single read.
    */
+  /**
+   * AUDIT-5 Task 11: one reindex target = the abs path whose BYTES are read,
+   * decoupled from the POSIX rel key the result is stored under. The watch
+   * path reads the realpath-CONFINED result of resolveWithinWorkspaceReal
+   * (pathConfine's contract: "read exactly the returned path so the file
+   * that was validated is the file that is read") while storing under the
+   * ALIAS relPath its gate/secret/delete branches key on. runBuild passes
+   * readAbsPath = join(workspaceRoot, rel) with storeRelPath = rel — the
+   * identical pair the old single-argument shape derived, since walk() skips
+   * symlinks and toCompute keys round-trip losslessly through path.join.
+   */
+  interface ReindexTarget {
+    readAbsPath: string;
+    storeRelPath: string;
+  }
+
   async function reindexFiles(
-    absPaths: string[],
+    targets: ReindexTarget[],
     manifest: Record<string, string>,
     expectedWidth: number | undefined,
     preloaded?: Map<string, Buffer>,
@@ -427,11 +443,10 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     await ensureStoreInitialized();
     const pendingRecords: ChunkRecord[] = [];
 
-    for (const absPath of absPaths) {
-      const relPath = toPosixRelative(path.relative(opts.workspaceRoot, absPath));
+    for (const { readAbsPath, storeRelPath: relPath } of targets) {
       let buf: Buffer;
       try {
-        buf = preloaded?.get(absPath) ?? (await fs.readFile(absPath));
+        buf = preloaded?.get(readAbsPath) ?? (await fs.readFile(readAbsPath));
       } catch {
         continue; // deleted between walk and read; the delete pass handles it.
       }
@@ -573,9 +588,15 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     }
 
     const manifest = { ...stored };
-    const toComputeAbs = toCompute.map((rel) => path.join(opts.workspaceRoot, rel));
+    // AUDIT-5 Task 11: read-path == store-path on the build path by
+    // construction (walk() skips symlinks), so the pair is the identity
+    // round-trip of the old single-argument shape.
+    const toComputeTargets = toCompute.map((rel) => ({
+      readAbsPath: path.join(opts.workspaceRoot, rel),
+      storeRelPath: rel,
+    }));
     const effectiveWidth = computeEffectiveWidth(storedMeta);
-    const observedWidth = await reindexFiles(toComputeAbs, manifest, effectiveWidth, preloaded);
+    const observedWidth = await reindexFiles(toComputeTargets, manifest, effectiveWidth, preloaded);
 
     await writeManifest(manifest);
     // Task 14b: if this build embedded nothing (nothing changed, or a
@@ -683,8 +704,11 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // between event and check) also lands here — purging a gone path is
         // the correct outcome. Accepted residual: a REGULAR file reached
         // through an in-workspace dir-symlink alias may index under the alias
-        // relPath until the next full build drops it — benign (target is
-        // in-workspace) and self-healing.
+        // relPath until the next full build drops it — benign and
+        // self-healing; since Task 11 the BYTES embedded for it are
+        // guaranteed to be the confined canonical target's (reindexFiles
+        // reads `confined`, not the alias path), so only the alias KEY
+        // remains, not a readable race.
         let confined: string | null = null;
         try {
           const leaf = await fs.lstat(uri.fsPath);
@@ -709,7 +733,19 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // to full builds.
         const storedMeta = await readMeta();
         const effectiveWidth = computeEffectiveWidth(storedMeta);
-        await reindexFiles([uri.fsPath], manifest, effectiveWidth);
+        // AUDIT-5 Task 11 (Task-1 review): read the path resolveWithinWorkspaceReal
+        // VALIDATED (pathConfine contract: "read exactly the returned path so the
+        // file that was validated is the file that is read") — a parent-dir
+        // symlink re-pointed outside the workspace between the check above and
+        // this read can no longer swap out-of-workspace bytes into the embed;
+        // the read hits the CAPTURED canonical target instead. Store under the
+        // alias relPath: the gate/secret/delete/dir-sweep branches all key on
+        // it, so a canonical key here would orphan the row from every purge.
+        await reindexFiles(
+          [{ readAbsPath: confined, storeRelPath: relPath }],
+          manifest,
+          effectiveWidth,
+        );
         await writeManifest(manifest);
       });
     }
