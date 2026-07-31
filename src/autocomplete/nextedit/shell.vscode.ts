@@ -34,6 +34,7 @@ import { InsecureTransportError, isLoopbackHost } from '../backends/secureTransp
 import { isSecretForCompletion } from '../../shared/secretPaths';
 import { scanSnippetForSecrets } from '../context/secretScanner';
 import { createEditTrackerAdapter } from '../context/editTrackerAdapter';
+import { isRecordableScheme } from '../context/recordableScheme';
 import type { FimActivityListener } from '../provider';
 import { regionAroundCursor, remapRange, type ContentChangeLite } from './anchors';
 import { NextEditHttpBackend } from './backend';
@@ -1363,9 +1364,20 @@ export function registerTalariaNextEdit(
   };
 
   const changeSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
+    // CF-19 — GATE-4 parity: a non-recordable scheme (Output/SCM/etc.) must
+    // not arm anything at all. Before this guard, `armTrigger()` ran
+    // unconditionally on EVERY `onDidChangeTextDocument` event regardless of
+    // which document changed, so edit-burst noise from an unrelated
+    // Output/SCM document could arm (and eventually fire) a next-edit
+    // request against the CURRENT active editor — a document GATE-4 would
+    // separately have to be scheme-valid on its own, but the arm itself
+    // never checked the document that actually changed.
+    if (!isRecordableScheme(e.document.uri.scheme)) return;
+
     // Source 2 of the ONE trigger path: the debounced edit burst. Armed
-    // unconditionally — `trigger()` itself resolves which editor/document is
-    // current, so no editor lookup is needed (or wanted) this early.
+    // unconditionally (once past the scheme guard above) — `trigger()`
+    // itself resolves which editor/document is current, so no editor lookup
+    // is needed (or wanted) this early.
     armTrigger();
 
     const proposal = currentProposal();

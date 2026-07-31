@@ -19,6 +19,7 @@
  */
 import * as vscode from 'vscode';
 import { EditTracker, rangesOverlap } from './editTracker';
+import { isRecordableScheme } from './recordableScheme';
 import type { EditEvent } from './types';
 
 /**
@@ -171,6 +172,14 @@ export function createEditTrackerAdapter(): EditTrackerAdapter {
   });
 
   const changeSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
+    // CF-19 — GATE-4 parity: a non-recordable scheme (Output/SCM/etc.) never
+    // touches either ring or the shadow cache. Previously EVERY document
+    // change folded into `EditTracker` regardless of scheme, so Output/SCM
+    // text entered the edit ring and shipped as FIM `input_extra` even
+    // though GATE-4 would have refused to trigger against that same
+    // document.
+    if (!isRecordableScheme(e.document.uri.scheme)) return;
+
     const uri = e.document.uri.toString();
     const filepath = toWorkspaceRelativePosixPath(e.document.uri);
     let shadow = docShadow.get(uri);

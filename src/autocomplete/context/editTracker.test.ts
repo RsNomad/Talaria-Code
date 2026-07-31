@@ -12,10 +12,10 @@ import { must } from '../../testing/must';
  * against the fake module.
  */
 interface FakeEditor {
-  document: { uri: { toString(): string }; getText(): string };
+  document: { uri: { scheme: string; toString(): string }; getText(): string };
 }
 interface FakeChangeEvent {
-  document: { uri: { toString(): string } };
+  document: { uri: { scheme: string; toString(): string } };
   contentChanges: {
     range: { start: { line: number; character: number }; end: { line: number; character: number } };
     text: string;
@@ -63,8 +63,8 @@ vi.mock('vscode', () => ({
 
 import { createEditTrackerAdapter, SHADOW_CACHE_CAP } from './editTrackerAdapter';
 
-function makeFakeEditor(uri: string, text: string): FakeEditor {
-  return { document: { uri: { toString: () => uri }, getText: () => text } };
+function makeFakeEditor(uri: string, text: string, scheme = 'file'): FakeEditor {
+  return { document: { uri: { scheme, toString: () => uri }, getText: () => text } };
 }
 
 /** Builds a real `EditTrackerAdapter` (production code) wired to the fake
@@ -89,9 +89,9 @@ function makeAdapterUnderTest(initialDocs: Record<string, string>) {
     openEditor(uri: string, text: string) {
       adapterMockState.visibilityHandler?.([makeFakeEditor(uri, text)]);
     },
-    applyChange(uri: string, change: { startLine: number; endLine: number; newText: string }) {
+    applyChange(uri: string, change: { startLine: number; endLine: number; newText: string; scheme?: string }) {
       adapterMockState.changeHandler?.({
-        document: { uri: { toString: () => uri } },
+        document: { uri: { scheme: change.scheme ?? 'file', toString: () => uri } },
         contentChanges: [
           {
             range: {
@@ -112,7 +112,7 @@ function makeAdapterUnderTest(initialDocs: Record<string, string>) {
       changes: { startLine: number; endLine: number; newText: string; startChar?: number; endChar?: number }[],
     ) {
       adapterMockState.changeHandler?.({
-        document: { uri: { toString: () => uri } },
+        document: { uri: { scheme: 'file', toString: () => uri } },
         contentChanges: changes.map((change) => ({
           range: {
             start: { line: change.startLine, character: change.startChar ?? 0 },
@@ -130,7 +130,7 @@ function makeAdapterUnderTest(initialDocs: Record<string, string>) {
       change: { start: { line: number; character: number }; end: { line: number; character: number }; newText: string },
     ) {
       adapterMockState.changeHandler?.({
-        document: { uri: { toString: () => uri } },
+        document: { uri: { scheme: 'file', toString: () => uri } },
         contentChanges: [{ range: { start: change.start, end: change.end }, text: change.newText }],
       });
     },
@@ -474,6 +474,63 @@ describe('editTrackerAdapter shadow text (W5.1)', () => {
     adapter.applyChange('file:///split.ts', { startLine: 2, endLine: 2, newText: 'SECOND\n' });
     const probe = adapter.tracker.getRecentDiffs().find((d) => d.startLine === 2);
     expect(probe?.before).toBe('second\n');
+  });
+});
+
+/**
+ * CF-19 / W4-T3 — the edit-ring recording site (`editTrackerAdapter.ts`'s
+ * `changeSubscription`, ~173) previously folded EVERY `onDidChangeTextDocument`
+ * event into `EditTracker` regardless of scheme, so Output/SCM text entered
+ * the edit ring, shipped as FIM `input_extra`, and armed next-edit. This now
+ * gates on the shared `isRecordableScheme` predicate (mirrors GATE-4,
+ * `nextedit/shell.vscode.ts`), matching `recordableScheme.test.ts`'s own
+ * unit coverage of the predicate itself.
+ */
+describe('editTrackerAdapter scheme guard (CF-19)', () => {
+  it('an "output"-scheme document change records NOTHING — neither ring, no shadow', () => {
+    const adapter = makeAdapterUnderTest({});
+    adapter.applyChange('output:extension-output-talaria', {
+      startLine: 0,
+      endLine: 0,
+      newText: 'some log line\n',
+      scheme: 'output',
+    });
+
+    expect(adapter.tracker.getRecentEdits()).toHaveLength(0);
+    expect(adapter.tracker.getRecentDiffs()).toHaveLength(0);
+  });
+
+  it('a "vscode-scm"-scheme document change records NOTHING (GATE-4 parity)', () => {
+    const adapter = makeAdapterUnderTest({});
+    adapter.applyChange('vscode-scm:1234/input', {
+      startLine: 0,
+      endLine: 0,
+      newText: 'commit message draft',
+      scheme: 'vscode-scm',
+    });
+
+    expect(adapter.tracker.getRecentEdits()).toHaveLength(0);
+    expect(adapter.tracker.getRecentDiffs()).toHaveLength(0);
+  });
+
+  it('control: an ordinary "file"-scheme change IS still recorded (the guard is not vacuous)', () => {
+    const adapter = makeAdapterUnderTest({ 'file:///a.ts': 'line0\n' });
+    adapter.applyChange('file:///a.ts', { startLine: 0, endLine: 0, newText: 'LINE0\n', scheme: 'file' });
+
+    expect(adapter.tracker.getRecentEdits()).toHaveLength(1);
+    expect(adapter.tracker.getRecentDiffs()).toHaveLength(1);
+  });
+
+  it('control: an "untitled"-scheme change IS still recorded to the edit ring', () => {
+    const adapter = makeAdapterUnderTest({});
+    adapter.applyChange('untitled:Untitled-1', {
+      startLine: 0,
+      endLine: 0,
+      newText: 'draft text\n',
+      scheme: 'untitled',
+    });
+
+    expect(adapter.tracker.getRecentEdits()).toHaveLength(1);
   });
 });
 

@@ -794,6 +794,38 @@ describe('next-edit trigger — the gates, IN ORDER', () => {
     expect(backendSpy.predicts).toHaveLength(0);
   });
 
+  /**
+   * CF-19 / W4-T3 — GATE 4 above proves the TRIGGER side is scheme-filtered
+   * (the active editor's document, read inside `trigger()`). This proves the
+   * separate ARM site (`changeSubscription`, ~1365 — "Source 2 of the ONE
+   * trigger path: the debounced edit burst") is ALSO scheme-filtered: an
+   * edit-burst event for an unrelated `output`-scheme document (e.g. an
+   * extension appending to its Output channel while the user's real active
+   * editor sits untouched) must not arm the debounce at all. Before the
+   * fix, `armTrigger()` ran unconditionally on every `onDidChangeTextDocument`
+   * event regardless of WHICH document changed, so this would eventually
+   * fire `trigger()` against the still-current (file-scheme) active editor —
+   * a next-edit request driven by Output-panel noise, not a real user edit.
+   */
+  it('CF-19 (arm-site scheme filter): an edit-burst event for an "output"-scheme document does NOT arm the trigger, even with a valid file-scheme active editor', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false });
+
+    const outputDoc = makeDoc({ uri: 'output:extension-output-talaria', scheme: 'output', path: '/output' });
+    for (const handler of host.docChangeHandlers) {
+      handler({
+        document: outputDoc,
+        contentChanges: [
+          { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, text: 'log line\n' },
+        ],
+      });
+    }
+    await vi.advanceTimersByTimeAsync(400);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(backendSpy.predicts).toHaveLength(0);
+  });
+
   it('GATE 5 (secret path): /home/u/.env builds nothing — FIM parity, not inherited', async () => {
     host.activeTextEditor = makeEditor(
       makeDoc({ uri: 'file:///home/u/.env', path: '/home/u/.env' }),

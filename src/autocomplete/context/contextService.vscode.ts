@@ -36,6 +36,7 @@ import {
 } from './contextService';
 import { RingBuffer } from './ringBuffer';
 import { createEditTrackerAdapter } from './editTrackerAdapter';
+import { isRecordableScheme } from './recordableScheme';
 import type { Anchor, SnippetSource } from './types';
 
 /** Cap on the focus-history list the "recently-opened" source orders by —
@@ -141,7 +142,13 @@ export function createHermesCrossFileContextService(
   const tabsSub = vscode.window.tabGroups.onDidChangeTabs(() => {
     void service.handleTabsChanged();
   });
-  const textChangeSub = vscode.workspace.onDidChangeTextDocument(() => {
+  const textChangeSub = vscode.workspace.onDidChangeTextDocument((e) => {
+    // CF-19 — GATE-4 parity: only a real, user-owned editable document
+    // (`isRecordableScheme`) bumps the keystroke clock. Output/SCM/etc. text
+    // used to arm the debounced idle-tick gather trigger just like a real
+    // keystroke would, starving it against document text that could never
+    // pass GATE-4 at trigger time anyway.
+    if (!isRecordableScheme(e.document.uri.scheme)) return;
     service.recordKeystroke();
   });
 
