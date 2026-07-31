@@ -788,6 +788,29 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
         ...(msg.kind === 'session-lost' ? { binding: 'unbound' as const, sessionLost: true } : {}),
       }));
 
+    case 'tab.clear':
+      // IMP-2 (W3-T6 3-lens review fix, CF-11): tabId-scoped — NOT routed
+      // through `foldSessionScoped`/`sessionToTab` like the generic `clear`
+      // below, because the whole point is to reach a tab whose session is
+      // already gone (no sessionId left to resolve). Reuses `foldTab`'s own
+      // `clear` reset (transcript/plan/turnActive/error) and ALSO retires
+      // `openFailed`/`sessionLost` — those two markers deliberately OUTLIVE
+      // the dismissible banner (G-9/ARCH-1) and `foldTab`'s generic clear was
+      // never taught to retire them (its only callers until now always
+      // preceded a fresh bind on an already-live tab, never a session-lost
+      // one). Without this, a "New Session" click on a session-lost tab left
+      // the stale "Session lost" banner standing even after the fresh
+      // `tab.bound` that follows.
+      return foldTabScoped(state, msg.tabId, 'tab.clear', (tab) => ({
+        ...tab,
+        transcript: [],
+        plan: [],
+        turnActive: false,
+        error: undefined,
+        openFailed: false,
+        sessionLost: false,
+      }));
+
     // ---- generic session-scoped fold (drop-unknown; §2e reuses foldTab) ----
     case 'clear':
     case 'turn.end':
@@ -852,6 +875,7 @@ function assertReduceHandlesEveryRoutedMessage(
     case 'panel.data':
     case 'tab.bound':
     case 'tab.error':
+    case 'tab.clear':
     case 'clear':
     case 'turn.end':
     case 'user':

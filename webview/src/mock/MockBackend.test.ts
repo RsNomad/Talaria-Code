@@ -160,7 +160,9 @@ describe('webview MockBackend — W3-T6 (CF-11/D2): tab.newSession rebinds ONLY 
 
     backend.handle({ type: 'tab.newSession', tabId: BOOTSTRAP_TAB_ID, sessionId: bootstrapId });
 
-    const clearIdx = messages.findIndex((m) => m.type === 'clear' && (m as { sessionId?: string }).sessionId === bootstrapId);
+    // MIN-B/IMP-2 (3-lens review): tabId-scoped `tab.clear`, not the old
+    // sessionId-keyed `clear` — parity with the real backend + host mock.
+    const clearIdx = messages.findIndex((m) => m.type === 'tab.clear' && (m as { tabId?: string }).tabId === BOOTSTRAP_TAB_ID);
     const bounds = messages.filter((m) => m.type === 'tab.bound') as Array<{ tabId: string; sessionId: string }>;
     const freshBound = bounds.find((b) => b.tabId === BOOTSTRAP_TAB_ID && b.sessionId !== bootstrapId);
     expect(clearIdx).toBeGreaterThanOrEqual(0);

@@ -1576,6 +1576,84 @@ describe('transcript reducer — ARCH-1 (final review, UI I-3): draft survives a
   });
 });
 
+describe('transcript reducer — IMP-2 (W3-T6 3-lens review, CF-11): tab.clear is tabId-scoped + unconditional', () => {
+  /** Build a tab that was bound, held a real turn, and then went session-lost
+   * — a dead transcript still standing, plus the standing "Session lost"
+   * banner markers. `getByTabId` would find NOTHING for this tab anymore (no
+   * live occupant at all) — proving `tab.clear` needs no session->tab
+   * mapping, unlike the generic `clear`. */
+  function sessionLostStateWithDeadTranscript(): AppState {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess-dead',
+      rootId: '/root',
+    });
+    state = reduce(state, { type: 'turn.start', turnId: 't1', sessionId: 'sess-dead' });
+    state = reduce(state, { type: 'user', turnId: 't1', sessionId: 'sess-dead', text: 'hello', mode: 'default' });
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'the session is gone',
+    });
+    return state;
+  }
+
+  it('a session-LOST tab (dead transcript + standing banner) gets a CLEAN slate from tab.clear{tabId} alone', () => {
+    const lost = sessionLostStateWithDeadTranscript();
+    // Precondition: the dead transcript + standing banner really are there.
+    expect(activeTab(lost).transcript.length).toBeGreaterThan(0);
+    expect(activeTab(lost).sessionLost).toBe(true);
+    expect(activeTab(lost).binding).toBe('unbound');
+
+    const cleared = reduce(lost, { type: 'tab.clear', tabId: BOOTSTRAP_TAB_ID });
+
+    expect(cleared.tabs[BOOTSTRAP_TAB_ID]?.transcript).toEqual([]);
+    expect(cleared.tabs[BOOTSTRAP_TAB_ID]?.plan).toEqual([]);
+    expect(cleared.tabs[BOOTSTRAP_TAB_ID]?.error).toBeUndefined();
+    expect(cleared.tabs[BOOTSTRAP_TAB_ID]?.sessionLost).toBe(false);
+    expect(cleared.tabs[BOOTSTRAP_TAB_ID]?.openFailed).toBe(false);
+  });
+
+  it('the clean slate lands BEFORE the fresh tab.bound that follows — no concatenation, no stale banner', () => {
+    const lost = sessionLostStateWithDeadTranscript();
+
+    let state = reduce(lost, { type: 'tab.clear', tabId: BOOTSTRAP_TAB_ID });
+    state = reduce(state, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess-fresh',
+      rootId: '/root',
+    });
+
+    expect(activeTab(state).transcript).toEqual([]);
+    expect(activeTab(state).binding).toBe('bound');
+    expect(activeTab(state).sessionId).toBe('sess-fresh');
+    expect(activeTab(state).sessionLost).toBe(false);
+  });
+
+  it('the normal (session STILL present) rebind path also clears via tab.clear', () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess1',
+      rootId: '/root',
+    });
+    state = reduce(state, { type: 'turn.start', turnId: 't1', sessionId: 'sess1' });
+    state = reduce(state, { type: 'user', turnId: 't1', sessionId: 'sess1', text: 'hi', mode: 'default' });
+    expect(activeTab(state).transcript.length).toBeGreaterThan(0);
+
+    state = reduce(state, { type: 'tab.clear', tabId: BOOTSTRAP_TAB_ID });
+
+    expect(activeTab(state).transcript).toEqual([]);
+  });
+
+  it('tab.clear for an unknown tabId is dropped (dev-log), never throws', () => {
+    expect(() => reduce(INITIAL_STATE, { type: 'tab.clear', tabId: 'no-such-tab' })).not.toThrow();
+  });
+});
+
 describe('transcript reducer — T-A1 (audit-2 Cluster A, M3): webview authoritative fold', () => {
   it('V-5 RED: turn.end{status !== "complete"} folds a still-open tool to interrupted and an unsettled approval to settledOutcome:cancelled', () => {
     let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });

@@ -310,7 +310,15 @@ class FakeAcpClient {
     this.setSessionModeCalls.push({ sessionId, modeId });
   }
   async setSessionModel(_sessionId: string, _modelId: string): Promise<void> {}
-  async cancel(_sessionId: string): Promise<void> {}
+  /** IMP-1 (W3-T6 3-lens review, CF-11): records every wire `session/cancel`
+   *  call — proves `newSessionInTabInternal` issues an EXPLICIT cancel of the
+   *  orphaned turn (gated on `hasLiveTurn()`), and exactly once (not a second
+   *  time from `dispose()`'s own cancel-gate, which `endForRestart` nulling
+   *  `liveTurnId` first makes skip). */
+  cancelCalls: string[] = [];
+  async cancel(sessionId: string): Promise<void> {
+    this.cancelCalls.push(sessionId);
+  }
   /** CF-01/A fix wave: counts calls — proves `handleAcpCrash`'s per-controller
    *  `endOnCrash()` loop guard still reaches the trailing `client.dispose()`
    *  even when an earlier iteration throws (the loop-guard regression test). */
@@ -3003,11 +3011,12 @@ describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session"
     expect(messages).toContainEqual(
       expect.objectContaining({ type: 'turn.end', sessionId: 'session-1', status: 'cancelled' }),
     );
-    // The OLD session's transcript clears BEFORE the fresh bind — while
-    // 'session-1' is STILL this tab's binding in the webview's own state, so
-    // the reducer's generic `foldSessionScoped` resolves it to THIS tab.
+    // The OLD session's transcript clears BEFORE the fresh bind — IMP-2
+    // (3-lens review fix): tabId-scoped `tab.clear`, not the old
+    // sessionId-scoped `clear`, so the SAME emission also reaches a
+    // session-lost tab (see the IMP-2 describe block below).
     const clearIdx = messages.findIndex(
-      (m) => m.type === 'clear' && (m as { sessionId?: string }).sessionId === 'session-1',
+      (m) => m.type === 'tab.clear' && (m as { tabId?: string }).tabId === BOOTSTRAP_TAB_ID,
     );
     const boundIdx = messages.findIndex(
       (m) => m.type === 'tab.bound' && (m as { tabId?: string }).tabId === BOOTSTRAP_TAB_ID && (m as { sessionId?: string }).sessionId === 'session-2',
@@ -3062,6 +3071,36 @@ describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session"
     expect(anyLiveTurnOnRoot(backend, '/root-2')).toBe(true);
   });
 
+  it('IMP-1 (3-lens review, concurrency): a rebind of a tab holding a GENUINELY live turn issues an explicit wire cancel of the orphaned turn — exactly once, never a second time from dispose()', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    backend.sendPrompt('session-1', 'work', 'default'); // this tab's OWN turn is live
+    await flushMicrotasks();
+    expect(must(clients[0]).promptCallCount).toBe(1);
+
+    must(clients[0]).queueSessionId('session-2');
+
+    await backend.newSessionInTab(BOOTSTRAP_TAB_ID, 'session-1');
+
+    // RED (pre-fix): `endForRestart()` nulls `liveTurnId` with no wire
+    // cancel at all, and `dispose()`'s own cancel is gated on `liveTurnId
+    // !== undefined` — already false by the time it runs — so the orphaned
+    // turn kept running on the harness with nothing ever cancelling it
+    // (`cancelCalls` would be `[]`). GREEN (post-fix): the explicit cancel
+    // fires BEFORE `endForRestart`, exactly once, for the OLD session only.
+    expect(must(clients[0]).cancelCalls).toEqual(['session-1']);
+  });
+
+  it('IMP-1: a rebind of an IDLE tab (no live turn) never calls client.cancel', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID — never prompted, genuinely idle
+    must(clients[0]).queueSessionId('session-2');
+
+    await backend.newSessionInTab(BOOTSTRAP_TAB_ID, 'session-1');
+
+    expect(must(clients[0]).cancelCalls).toEqual([]);
+  });
+
   it('emits tab.error{kind:"open-failed"} instead of throwing when there is no live client', async () => {
     const config: HermesRuntimeConfig = {};
     const { AcpBackend: RealAcpBackend } = await import('./AcpBackend');
@@ -3094,7 +3133,7 @@ describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session"
     expect(hasController(backend, 'session-1')).toBe(false); // old is gone even though the mint failed — never a zombie
   });
 
-  it('mints fresh even for a tab with no current controller (never opened, or already gone) — never throws', async () => {
+  it('mints fresh even for a tab with no current controller (never opened, or already gone) — never throws, and STILL clears (IMP-2: unconditional, tabId-scoped)', async () => {
     const { backend, clients } = makeStartableBackend();
     await backend.start();
     must(clients[0]).queueSessionId('session-2');
@@ -3106,7 +3145,16 @@ describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session"
     expect(messages).toContainEqual(
       expect.objectContaining({ type: 'tab.bound', tabId: 'tab-never-opened', sessionId: 'session-2' }),
     );
-    expect(messages.some((m) => m.type === 'clear')).toBe(false); // nothing old to clear
+    // IMP-2 (3-lens review fix, un-pinning the old "clear === false" gap):
+    // `tab.clear` is now UNCONDITIONAL — emitted even with no old occupant —
+    // because a session-LOST tab (no `old` either, but a dead transcript +
+    // standing banner the webview never dropped) needs the exact same
+    // signal. Gating on `old` left that tab's dead conversation standing
+    // forever; the fix unifies both arms so ordering never depends on
+    // whether anything was there to close.
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.clear', tabId: 'tab-never-opened' }),
+    );
   });
 
   it('two rapid newSessionInTab calls on the SAME tab serialize on the tail — the second never reaches its own client.newSession until the first fully settles', async () => {

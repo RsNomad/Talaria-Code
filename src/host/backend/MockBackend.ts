@@ -130,15 +130,24 @@ export class MockBackend implements AgentBackend {
    * W3-T6 (CF-11/D2): the composer's per-tab "New Session" — a simple mock
    * counterpart to the real `AcpBackend.newSessionInTab`. This host mock has
    * no per-tab registry (§ `openTab`'s own doc — it stays single-scenario-
-   * at-a-time), so it trusts the wire's own `sessionId` hint for which
-   * transcript to clear rather than re-deriving it from a registry that does
-   * not exist here; there is no real turn-lease/root machinery to preserve,
-   * so — unlike the real backend — nothing else needs ending first. Mints a
-   * fresh `mock-tab-session-N` and binds it to the SAME tab, same as
-   * `openTab`.
+   * at-a-time): `sessionId` is accepted for interface/wire parity only and
+   * never branched on — MIN-B (3-lens review) closed the two divergences
+   * from the real backend that used to follow from that: (1) the shared
+   * connection-level scripted player kept running after a rebind (nothing
+   * stopped it — a mid-stream step could still land, stamped with the OLD
+   * session, after the tab had moved on); (2) the clear was keyed off the
+   * wire's `sessionId` hint. `reset()` (the SAME stop {@link start}/{@link
+   * sendPrompt} already use) now stops the player first, and the clear is
+   * `tab.clear{tabId}` — tabId-keyed, unconditional, parity with the real
+   * backend + the webview mock. There is still no real turn-lease/root
+   * machinery to preserve, so no wire-level cancel is needed here (unlike
+   * the real backend's IMP-1 fix). Mints a fresh `mock-tab-session-N` and
+   * binds it to the SAME tab, same as `openTab`.
    */
   async newSessionInTab(tabId: string, sessionId?: string): Promise<void> {
-    if (sessionId) this.emit({ type: 'clear', sessionId });
+    void sessionId; // interface/wire parity only — see this method's own doc
+    this.reset();
+    this.emit({ type: 'tab.clear', tabId });
     this.nextTabSessionSeq += 1;
     const freshSessionId = `mock-tab-session-${this.nextTabSessionSeq}`;
     this.emit({ type: 'tab.bound', tabId, sessionId: freshSessionId, rootId: freshSessionId });

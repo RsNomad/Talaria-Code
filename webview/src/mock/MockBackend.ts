@@ -195,6 +195,12 @@ export class MockBackend {
    * `getByTabId`) and mint a fresh one bound to the SAME tab. Every OTHER
    * tab's player is never touched — `players` only ever loses the ONE entry
    * named here.
+   *
+   * IMP-2/MIN-B (3-lens review, parity with the real backend + host mock):
+   * the clear is `tab.clear{tabId}` — tabId-keyed, not the old
+   * sessionId-keyed `clear` — and UNCONDITIONAL (fires even when `sessionId`
+   * is absent/unresolvable), so the same emission reaches a session-lost tab
+   * exactly like the real backend's `newSessionInTabInternal` now does.
    */
   private newSessionInTab(tabId: string, sessionId?: string): void {
     if (sessionId) {
@@ -203,8 +209,8 @@ export class MockBackend {
         this.clearTimers(old);
         this.players.delete(sessionId);
       }
-      this.emit({ type: 'clear', sessionId });
     }
+    this.emit({ type: 'tab.clear', tabId });
     const fresh = this.mintSession();
     this.registerPlayer(fresh);
     this.emit({ type: 'tab.bound', tabId, sessionId: fresh, rootId: fresh });

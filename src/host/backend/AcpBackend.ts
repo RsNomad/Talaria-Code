@@ -908,10 +908,11 @@ export class AcpBackend implements AgentBackend {
   }
 
   /**
-   * The tail-serialized body: end THIS tab's own live turn (honest
-   * `status:'cancelled'` — user-intended, never `endOnCrash`'s `'error'`),
-   * close its old session, clear its transcript, then mint a fresh one bound
-   * to the SAME tab — reusing {@link openSession} whole (the exact same
+   * The tail-serialized body: cancel THIS tab's own live turn on the ACP wire
+   * (if any), end it host-side (honest `status:'cancelled'` — user-intended,
+   * never `endOnCrash`'s `'error'`), close its old session, clear its tab
+   * (transcript + any standing "session lost" banner), then mint a fresh one
+   * bound to the SAME tab — reusing {@link openSession} whole (the exact same
    * `client.newSession` + controller-mint + `announceSessionBound` +
    * `pinWireModeDefault` choreography `openTabInternal` already trusts).
    *
@@ -919,45 +920,70 @@ export class AcpBackend implements AgentBackend {
    * up via `this.sessions.getByTabId(tabId)` — the SAME tabId-keyed
    * authority `loadSessionIntoTabInternal`'s C1 fix re-reads after its own
    * await — never the caller-supplied `sessionId`. There is no await between
-   * this read and the synchronous `endForRestart`/`close`/`clear` trio below
-   * (nothing else can run inside a `runOnStartTail` turn anyway), so no
-   * re-read is needed there; `openSession`'s OWN `sessions.open` still
-   * carries the W6-FB same-sessionId-across-tabs dedup for the FRESH mint,
-   * for free, by reuse.
+   * this read and the synchronous cancel/`endForRestart`/`close`/`clear`
+   * quartet below (nothing else can run inside a `runOnStartTail` turn
+   * anyway), so no re-read is needed there; `openSession`'s OWN
+   * `sessions.open` still carries the W6-FB same-sessionId-across-tabs dedup
+   * for the FRESH mint, for free, by reuse.
    *
    * **Sibling isolation (the whole point of this task, CF-11/D2):** neither
-   * `endForRestart` nor `sessions.close` nor `openSession` ever iterates the
-   * registry or touches any controller OTHER than `old`/the freshly minted
-   * one — contrast `fanOutRestartSignal`, which deliberately loops every
-   * registered controller. A sibling tab's controller instance, live turn,
-   * and root turn-lease are therefore never even READ here, let alone
-   * mutated.
+   * the cancel below, `endForRestart`, `sessions.close`, nor `openSession`
+   * ever iterates the registry or touches any controller OTHER than
+   * `old`/the freshly minted one — contrast `fanOutRestartSignal`, which
+   * deliberately loops every registered controller. A sibling tab's
+   * controller instance, live turn, and root turn-lease are therefore never
+   * even READ here, let alone mutated.
    *
-   * **The transcript clear is NOT `tab.error{session-lost}`.** That signal
-   * is a FAILURE affordance (`ConnectionSupervisor.fanOutRestartSignal`'s own
-   * doc: "the tab about to be re-bound... gets an honest clear{sessionId}";
-   * every OTHER tab gets session-lost because ITS session is simply gone,
-   * with nothing to replace it). A "New Session" click is user-intended
-   * SUCCESS — this tab is getting a replacement, immediately. Emitting a
-   * plain `clear{sessionId: old.sessionId}` HERE, BEFORE the fresh
-   * `openSession` call announces its own `tab.bound`, reuses the reducer's
-   * EXISTING generic fold (`transcript.ts`'s `case 'clear':` routes through
-   * `foldSessionScoped`, which resolves ANY sessionId to whichever tab
-   * currently owns it via `sessionToTab` — not a bootstrap-only special
-   * case, unlike `fanOutRestartSignal`'s OWN `clear`, which only reaches
-   * `BOOTSTRAP_TAB_ID` because every non-bootstrap sibling there is getting
-   * NO replacement, not because `clear` itself is bootstrap-scoped). At the
-   * moment this fires, `old.sessionId` is STILL this tab's binding in the
-   * webview's own state (the fresh `tab.bound` hasn't landed yet), so
-   * `sessionToTab` resolves it to THIS tab, correctly, with no new protocol
-   * surface needed.
+   * **IMP-1 (3-lens review, concurrency) — the wire cancel.** `old.
+   * endForRestart()` nulls `liveTurnId` host-side WITHOUT issuing an ACP wire
+   * cancel; `SessionController.dispose()` (reached via `sessions.close`
+   * below) gates ITS OWN best-effort `client.cancel` on `liveTurnId !==
+   * undefined` — already false by the time dispose runs, since
+   * `endForRestart` nulled it first. Left alone, that orphans the OLD
+   * harness turn: it keeps running server-side, burning tokens, with every
+   * one of its updates now dropped (nothing routes them anywhere once the
+   * tab has moved on). This feature keeps the child ALIVE (unlike
+   * `fanOutRestartSignal`'s whole-connection teardown, which kills the
+   * child outright and makes the point moot) — a plain `closeTab` on a live
+   * turn DOES reach `dispose()` with `liveTurnId` still set and genuinely
+   * cancels, so leaving this rebind path silent would make the milder
+   * action (close) more thorough than the one advertised as a full
+   * replacement (new session). The explicit `client.cancel(old.sessionId)`
+   * below closes that gap: fired FIRST, gated on `old.hasLiveTurn()` (an
+   * idle tab's rebind must never fire a spurious cancel), fire-and-forget
+   * with a swallowed rejection (mirrors `SessionController.dispose`'s own
+   * `void client.cancel(...).catch(...)` idiom). Exactly one wire cancel
+   * ever results: this call fires while `liveTurnId` is still set; the very
+   * next line (`endForRestart`) nulls it, so `dispose`'s own gate is false
+   * by the time it runs and never double-fires.
+   *
+   * **IMP-2 (3-lens review, arch) — the clear is unconditional and
+   * tabId-scoped.** Emits `tab.clear{tabId}` (not the generic
+   * `clear{sessionId}`) for BOTH arms — whether or not `old` exists. A
+   * session-lost tab (its prior occupant already removed by
+   * `fanOutRestartSignal`'s own sibling fan-out, or any other path — `old`
+   * is `undefined`, so there is nothing here to end/close) still owns a DEAD
+   * transcript and a standing "Session lost" banner the webview never
+   * dropped; the generic `clear{sessionId}` cannot reach it at all (no
+   * `sessionId` this tab still maps to — `foldSessionScoped`'s `sessionToTab`
+   * lookup would just drop it, unknown). `tab.clear` needs no such mapping —
+   * identity is the tabId itself — so the SAME emission, unconditionally,
+   * before the fresh `openSession` call announces its own `tab.bound`,
+   * reaches both the live-old-session case and the session-lost case alike,
+   * and the reducer's fold (`transcript.ts`'s `case 'tab.clear'`) resets the
+   * transcript/plan AND retires the standing `error`/`openFailed`/
+   * `sessionLost` banner markers together. This is still NOT
+   * `tab.error{session-lost}` — that signal is a FAILURE affordance
+   * (`fanOutRestartSignal`'s own doc); a "New Session" click is user-intended
+   * SUCCESS, on every arm.
    *
    * No live client, or a mint failure: emits `tab.error{kind:'open-failed'}`
    * (mirrors {@link openTabInternal}'s identical shape) rather than throwing.
    * `old` is undefined for a tab with no current controller (never yet
-   * opened, or already gone) — the endForRestart/close/clear trio is simply
-   * skipped ("if present"), and a fresh session is still minted for it,
-   * mirroring {@link openTabInternal}'s own unconditional-mint posture.
+   * opened, already gone, or session-lost) — the cancel/endForRestart/close
+   * trio is simply skipped ("if present"), the clear still fires, and a
+   * fresh session is still minted for it, mirroring {@link openTabInternal}'s
+   * own unconditional-mint posture.
    */
   private async newSessionInTabInternal(tabId: string, sessionId?: string): Promise<void> {
     void sessionId; // identity hint only — see this method's own doc; getByTabId(tabId) is the sole authority
@@ -974,6 +1000,19 @@ export class AcpBackend implements AgentBackend {
     const old = this.sessions.getByTabId(tabId);
     const cwd = old?.cwd ?? this.cwd ?? this.workspaceRoots()[0] ?? '';
     if (old) {
+      // IMP-1: affirmatively cancel the OLD session's live turn on the wire
+      // BEFORE `endForRestart` nulls `liveTurnId` — see this method's own
+      // doc for why `dispose()`'s own cancel gate would otherwise skip it.
+      // Gated on `hasLiveTurn()` so an idle rebind never fires a spurious
+      // cancel.
+      if (old.hasLiveTurn()) {
+        const deadSessionId = old.sessionId;
+        void client.cancel(deadSessionId).catch((err: unknown) => {
+          this.logger?.append(
+            `[AcpBackend] newSessionInTab: session/cancel failed (sessionId=${deadSessionId}): ${errorMessage(err)}`,
+          );
+        });
+      }
       // Honest, user-intended end of THIS tab's own turn only — never the
       // sibling-wide fan-out `fanOutRestartSignal` performs.
       old.endForRestart();
@@ -981,10 +1020,11 @@ export class AcpBackend implements AgentBackend {
       // pending approvals, best-effort session/close, drops its subagents
       // fold — all scoped to `old` alone.
       this.sessions.close(old.sessionId);
-      // Clear while `old.sessionId` is STILL this tab's binding (see this
-      // method's own doc on why this is SUCCESS, not `session-lost`).
-      this.emitter.fire({ type: 'clear', sessionId: old.sessionId });
     }
+    // IMP-2: unconditional, tabId-scoped clear — reaches a session-lost tab
+    // (`old` undefined) exactly the same as a live-old-session tab. See this
+    // method's own doc.
+    this.emitter.fire({ type: 'tab.clear', tabId });
     try {
       await this.openSession(cwd, tabId);
     } catch (err) {

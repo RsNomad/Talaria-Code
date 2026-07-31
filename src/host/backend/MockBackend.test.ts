@@ -49,7 +49,7 @@ async function playAndCollect(mentions?: ContextRef[]): Promise<HostToWebviewMes
 }
 
 describe('MockBackend — W3-T6 (CF-11/D2): newSessionInTab (per-tab "New Session" mock)', () => {
-  it('mints a fresh mock-tab-session-N bound to the SAME tab, and clears the OLD sessionId first', async () => {
+  it('mints a fresh mock-tab-session-N bound to the SAME tab, and clears the tab (tab.clear, tabId-scoped) first', async () => {
     const backend = new MockBackend();
     const messages: HostToWebviewMessage[] = [];
     backend.onMessage((m) => messages.push(m));
@@ -57,8 +57,11 @@ describe('MockBackend — W3-T6 (CF-11/D2): newSessionInTab (per-tab "New Sessio
 
     await backend.newSessionInTab('mock-tab-1', 'mock-session-1');
 
+    // MIN-B (3-lens review): the host mock now emits the SAME tabId-scoped
+    // `tab.clear` the real backend + webview mock use — not a
+    // sessionId-keyed `clear` trusting the wire hint.
     const clearIdx = messages.findIndex(
-      (m) => m.type === 'clear' && (m as { sessionId?: string }).sessionId === 'mock-session-1',
+      (m) => m.type === 'tab.clear' && (m as { tabId?: string }).tabId === 'mock-tab-1',
     );
     const boundIdx = messages.findIndex(
       (m) => m.type === 'tab.bound' && (m as { tabId?: string }).tabId === 'mock-tab-1' && (m as { sessionId?: string }).sessionId !== 'mock-session-1',
@@ -68,14 +71,41 @@ describe('MockBackend — W3-T6 (CF-11/D2): newSessionInTab (per-tab "New Sessio
     backend.dispose();
   });
 
-  it('never clears anything when no sessionId is given (a not-yet-bound tab) — still mints + binds fresh', async () => {
+  it('MIN-B: stops the mid-stream scripted player on rebind — a step scheduled before the rebind never fires afterward', async () => {
+    vi.useFakeTimers();
+    try {
+      const backend = new MockBackend();
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+      backend.start();
+      backend.sendPrompt('mock-session-1', 'work', 'default'); // scripted player now running
+      await vi.advanceTimersByTimeAsync(50); // some steps have already fired
+
+      messages.length = 0;
+      await backend.newSessionInTab('mock-tab-1', 'mock-session-1');
+      messages.length = 0;
+      // If the OLD player were still scheduled, advancing time would still
+      // emit its remaining scripted steps (stamped with the OLD session's
+      // messages) after the rebind — proving it was genuinely stopped, not
+      // merely superseded on the next sendPrompt.
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(messages).toEqual([]);
+      backend.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still emits tab.clear even when no sessionId is given (IMP-2 parity: unconditional, tabId-scoped) — still mints + binds fresh', async () => {
     const backend = new MockBackend();
     const messages: HostToWebviewMessage[] = [];
     backend.onMessage((m) => messages.push(m));
 
     await backend.newSessionInTab('tab-2');
 
-    expect(messages.some((m) => m.type === 'clear')).toBe(false);
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.clear', tabId: 'tab-2' }),
+    );
     expect(messages).toContainEqual(
       expect.objectContaining({ type: 'tab.bound', tabId: 'tab-2' }),
     );

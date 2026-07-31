@@ -483,14 +483,26 @@ describe('TalariaViewProvider — W3-T6 (CF-11/D2): tab.newSession routing (per-
     ).not.toThrow();
   });
 
-  it('a rejecting newSessionInTab is logged, never becomes an unhandled rejection', async () => {
+  it('IMP-3 (3-lens review, code): a rejecting newSessionInTab is logged via the same [tag] appendLine pattern every other command dispatch in this file uses, instead of becoming an unhandled rejection', async () => {
     const backend = makeNewSessionInTabBackend(vi.fn().mockRejectedValue(new Error('boom')));
-    const { provider } = makeProviderWith(backend);
+    // IMP-3 fix: `makeProviderWith` passes NO logger, so `this.logger` was
+    // `undefined` and the old version of this test could only assert
+    // `.not.toThrow()` — mutation-proven vacuous (deleting the real `.catch`
+    // handler at TalariaViewProvider.ts still passed it). Constructing the
+    // provider directly (the F-3 `diff.open` test's own pattern, above) with
+    // a SPYABLE logger makes the `.catch` handler's effect observable.
+    const logger = { appendLine: vi.fn() } as unknown as vscode.OutputChannel;
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend, logger);
+    seam(provider).view = { webview: { postMessage: () => {} } };
 
     expect(() =>
       seam(provider).handleWebviewMessage({ type: 'tab.newSession', tabId: 'tab-2', sessionId: 'sess-9' }),
     ).not.toThrow();
     await flush();
+
+    // The GENUINE proof: the `.catch` handler actually ran and logged the
+    // failure — not merely that nothing threw synchronously.
+    expect(logger.appendLine).toHaveBeenCalledWith('[tab.newSession] tab-2 failed: Error: boom');
   });
 });
 

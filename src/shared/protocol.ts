@@ -1067,6 +1067,23 @@ export type HostToWebview =
   | { type: 'tab.error'; tabId: string; message: string; kind: 'open-failed' | 'session-lost' }
 
   /**
+   * W3-T6 (CF-11/D2 3-lens review fix, IMP-2): tabId-scoped transcript clear
+   * — the counterpart to the generic `clear` above for the ONE case that
+   * message can't reach: a tab whose occupant is already gone (a
+   * session-lost tab has no resolvable `sessionId -> tabId` mapping left for
+   * `foldSessionScoped` to route through). `AcpBackend.newSessionInTabInternal`
+   * emits this UNCONDITIONALLY on every "New Session" rebind — whether or not
+   * the tab currently holds a live occupant — so the SAME message reaches a
+   * live-old-session rebind and a session-lost rebind alike, and the
+   * webview's fold (`transcript.ts`'s `case 'tab.clear'`) resets the tab to a
+   * genuinely clean slate (transcript, plan, the standing `error`/
+   * `openFailed`/`sessionLost` banner markers) before the fresh `tab.bound`
+   * lands. Never carries a `sessionId` — that is the whole point: identity is
+   * the tabId itself, not a session this tab may no longer even remember.
+   */
+  | { type: 'tab.clear'; tabId: string }
+
+  /**
    * SF-2: the session's active custom mode changed (or is being echoed after
    * a `mode.set`/on tab bind). `available` is the catalog of modes the
    * session may switch to. Origin: §4.
@@ -1623,6 +1640,21 @@ export type WebviewToHost =
    * the host always re-reads the tab's ACTUAL occupant (`getByTabId`), never
    * trusts this field for identity (the tab may have rebound again by the
    * time this reaches the head of the tail).
+   *
+   * MIN-C (3-lens review, arch M-1 — DOCUMENTED, not fixed; a future change
+   * with its own review): the host's `newSessionInTabInternal` mints the
+   * fresh session via `openSession`, which unconditionally adopts the result
+   * onto `AcpBackend`'s CONNECTION-GLOBAL `activeSessionId`/`cwd` (the same
+   * adoption `openTabInternal` already relies on for the composer's "+"
+   * button). That is harmless today because the ONLY caller of this message
+   * is the composer acting on `tabId === state.activeTabId` — the tab this
+   * message names is always ALREADY the connection's active tab, so the
+   * adoption is a no-op observationally. It would stop being harmless the
+   * moment a caller ever posts this for a BACKGROUND (non-active) tab: the
+   * connection-global active session/cwd would silently hijack to that
+   * tab's fresh session, out from under whichever tab the user is actually
+   * looking at. Nothing today constructs that caller — this note exists so
+   * a FUTURE one doesn't ship the hijack by accident.
    */
   | { type: 'tab.newSession'; tabId: string; sessionId?: string }
 
