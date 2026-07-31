@@ -451,3 +451,101 @@ describe('W3-T6 (CF-11/D2): the composer posts tab.newSession, never the old con
     postSpy.mockRestore();
   });
 });
+
+/**
+ * CF-12 review fix (W3-T7, IMP-2): `checkpoint.restore` is wired through an
+ * `App.tsx`-owned `restoreCheckpoint` callback that carries BOTH `rootId`
+ * (params, multi-root routing) and `tab.tabId` (the `bridge.request` "tag"
+ * arg, so `bridge.rejectTab` on tab close rejects an in-flight request
+ * promptly instead of hanging until RPC timeout). The panel's redo/redo-all
+ * originally fired `checkpoint.redo`/`checkpoint.redoAll` directly over a
+ * dynamically-imported `bridge` with NEITHER — an in-flight redo on a
+ * closing tab hung, and a multi-root workspace had no way to disambiguate
+ * the target root. This proves redo now carries the SAME two things restore
+ * does, against a REAL `<App>` render (same idiom as the W3-T6 describe
+ * above): bind a tab to a root, navigate to the Checkpoints panel, push a
+ * `data.redo`, click Redo/Redo all, and assert what `bridge.request` was
+ * actually called with.
+ */
+describe('CF-12 review fix (W3-T7, IMP-2): checkpoint redo carries rootId + the tab tag, same as restore', () => {
+  function setup(jsx: ReactElement) {
+    return { user: userEvent.setup(), ...render(jsx) };
+  }
+
+  /** Binds the bootstrap tab to `rootId`, navigates to the Checkpoints
+   *  panel, and pushes a `data.redo` for that root — the minimum sequence
+   *  needed for the Redo/Redo all buttons to actually render. */
+  async function openCheckpointsWithRedo(user: ReturnType<typeof userEvent.setup>, rootId: string) {
+    act(() => {
+      bridge.emit({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 's1', rootId });
+    });
+
+    const panelsTablist = within(screen.getByRole('tablist', { name: 'Panels' }));
+    await user.click(panelsTablist.getByRole('tab', { name: 'Checkpoints' }));
+
+    act(() => {
+      bridge.emit({
+        type: 'panel.data',
+        panel: 'checkpoints',
+        rootId,
+        data: { checkpoints: [], redo: { anchorId: 'anchor-1', cursorId: 'cursor-1' } },
+      });
+    });
+  }
+
+  it('clicking Redo posts checkpoint.redo with {rootId} tagged to the active tab (mirrors restore)', async () => {
+    const requestSpy = vi
+      .spyOn(bridge, 'request')
+      .mockResolvedValue({ restored: true, filesChanged: 0, changedPaths: [] });
+    const { user } = setup(<App />);
+    await openCheckpointsWithRedo(user, 'root-1');
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+
+    expect(requestSpy).toHaveBeenCalledWith('checkpoint.redo', { rootId: 'root-1' }, BOOTSTRAP_TAB_ID);
+    requestSpy.mockRestore();
+  });
+
+  it('clicking Redo all posts checkpoint.redoAll with {rootId} tagged to the active tab (mirrors restore)', async () => {
+    const requestSpy = vi
+      .spyOn(bridge, 'request')
+      .mockResolvedValue({ restored: true, filesChanged: 0, changedPaths: [] });
+    const { user } = setup(<App />);
+    await openCheckpointsWithRedo(user, 'root-2');
+
+    await user.click(screen.getByRole('button', { name: 'Redo all' }));
+
+    expect(requestSpy).toHaveBeenCalledWith('checkpoint.redoAll', { rootId: 'root-2' }, BOOTSTRAP_TAB_ID);
+    requestSpy.mockRestore();
+  });
+
+  it('a force retry ("Redo anyway") posts {rootId, force: true}, still tagged to the active tab', async () => {
+    // NOT `mockResolvedValueOnce` chaining: the FIRST `bridge.request` call in
+    // this flow is the Checkpoints panel's own `panel.data` fetch (fired when
+    // `openCheckpointsWithRedo` navigates to the tab), so a plain once-chain
+    // would bind its result to that unrelated call instead of the first
+    // `checkpoint.redo`. Branch on the method name instead, and assert
+    // against the SECOND matching call.
+    let redoCallCount = 0;
+    const requestSpy = vi.spyOn(bridge, 'request').mockImplementation(async (method) => {
+      if (method === 'checkpoint.redo') {
+        redoCallCount += 1;
+        return redoCallCount === 1
+          ? { restored: false, reason: 'A turn is still running — wait for it to finish.' }
+          : { restored: true, filesChanged: 0, changedPaths: [] };
+      }
+      return { restored: true, filesChanged: 0, changedPaths: [] };
+    });
+    const { user } = setup(<App />);
+    await openCheckpointsWithRedo(user, 'root-3');
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+    const retry = await screen.findByRole('button', { name: 'Redo anyway' });
+    await user.click(retry);
+
+    const redoCalls = requestSpy.mock.calls.filter(([method]) => method === 'checkpoint.redo');
+    expect(redoCalls).toHaveLength(2);
+    expect(redoCalls[1]).toEqual(['checkpoint.redo', { rootId: 'root-3', force: true }, BOOTSTRAP_TAB_ID]);
+    requestSpy.mockRestore();
+  });
+});

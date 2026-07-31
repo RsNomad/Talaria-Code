@@ -12,13 +12,12 @@
  * instance created BEFORE render) and the `checkpoint()` fixture pattern from
  * `CheckpointsPanel.test.ts`.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import type { ReactElement } from 'react';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { Checkpoint, CheckpointRedoState, CheckpointRestoreResult, CheckpointsData } from '../protocol';
 import { CheckpointsPanel } from './CheckpointsPanel';
-import { bridge } from '../bridge';
 
 /** Documented shape: invoke `userEvent.setup()` BEFORE rendering, and use the
  *  returned instance rather than the direct API. */
@@ -36,11 +35,18 @@ function checkpoint(overrides: Partial<Checkpoint> = {}): Checkpoint {
   };
 }
 
+/** A no-op redo prop for tests that only exercise restore — `data.redo` is
+ *  absent in {@link renderPanel}'s fixture, so neither Redo control ever
+ *  renders and these are never actually invoked. */
+const neverRedo = async () => ({ restored: true as const, filesChanged: 0, changedPaths: [] });
+
 function renderPanel(config: {
   onRestore: (id: string, force?: boolean) => Promise<CheckpointRestoreResult | undefined>;
 }) {
   const data: CheckpointsData = { checkpoints: [checkpoint()] };
-  return <CheckpointsPanel data={data} onRestore={config.onRestore} />;
+  return (
+    <CheckpointsPanel data={data} onRestore={config.onRestore} onRedo={neverRedo} onRedoAll={neverRedo} />
+  );
 }
 
 describe('G-11: restoring the workspace is confirmed, locked and acknowledged', () => {
@@ -199,6 +205,36 @@ describe('G-11: restoring the workspace is confirmed, locked and acknowledged', 
     expect(await screen.findByText(/Restore failed — the host returned no result/i)).toBeInTheDocument();
     expect(screen.queryByText(/Workspace restored/i)).not.toBeInTheDocument();
   });
+
+  /**
+   * CF-12 review fix, IMP-3: the tracker fills `skippedPaths` for TWO
+   * unrelated causes — the symlink-escape guard AND a per-path I/O failure
+   * (ENOSPC/EACCES/EROFS/a since-pruned blob, `CheckpointTracker.ts`
+   * ~668-711) — but the panel's copy used to claim "a symlink pointed
+   * outside the workspace" for every skipped path regardless of which
+   * actually happened. This had NO test before this task (grep
+   * `skippedPaths` across every webview test file: 0 hits), so the false
+   * claim shipped unverified. The fix drops the specific cause claim; this
+   * proves the honest, cause-agnostic copy renders and the paths still list.
+   */
+  it('the skipped-paths notice uses honest, cause-agnostic copy — never a false "symlink" claim', async () => {
+    const { user } = setup(
+      renderPanel({
+        onRestore: async () => ({
+          restored: true,
+          filesChanged: 1,
+          changedPaths: ['a.txt'],
+          skippedPaths: ['b.txt'],
+        }),
+      }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Restore' }));
+    await user.click(screen.getByRole('button', { name: 'Restore workspace' }));
+
+    expect(await screen.findByText(/1 file could not be updated/i)).toBeInTheDocument();
+    expect(screen.getByText('b.txt')).toBeInTheDocument();
+    expect(screen.queryByText(/symlink/i)).not.toBeInTheDocument();
+  });
 });
 
 /**
@@ -257,25 +293,44 @@ describe('F6: checkpoint restore progress/success is carried by a permanently-mo
  * host-dispatcher special-cases (`ControlDispatcher.ts`) taking `{force?,
  * rootId?}` over the CORRELATED `control.request` path — no checkpoint `id`,
  * unlike restore: redo/redoAll act on the tracker's own stored cursor/anchor.
- * The panel fires them directly over `bridge.request` (same seam
- * `ErrorBoundary.tsx`'s Reload button uses for `bridge.post`) rather than a
- * new `onRedo` callback prop threaded through `App.tsx` — this task's scope
- * is this file alone.
+ *
+ * CF-12 REVIEW FIX (this task): the panel originally fired
+ * `checkpoint.redo`/`checkpoint.redoAll` directly over a dynamically-imported
+ * `bridge` — the review found that dropped the tab-close cleanup tag AND the
+ * `rootId` restore already carries (IMP-2), left the redo notices with no
+ * reset when `data.redo` changes under a tab/root switch (IMP-1), and forced
+ * a dynamic `import('../bridge')` hazard. The fix wires `onRedo`/`onRedoAll`
+ * as CALLBACK PROPS from `App.tsx`, exactly mirroring `onRestore` — so these
+ * tests now spy the PROPS, not `bridge.request` directly (App.dom.test.tsx
+ * covers the App.tsx wiring itself: rootId + tab tag).
  */
-describe('CF-12: Redo/Redo-all render from data.redo and fire checkpoint.redo/redoAll directly', () => {
-  function renderWithRedo(
-    config: { redo?: CheckpointRedoState; checkpoints?: Checkpoint[] } = {},
-  ) {
+describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRedoAll props', () => {
+  const defaultRedoResult: CheckpointRestoreResult = { restored: true, filesChanged: 0, changedPaths: [] };
+
+  function redoPanel(
+    config: {
+      redo?: CheckpointRedoState;
+      checkpoints?: Checkpoint[];
+      onRedo?: (force?: boolean) => Promise<CheckpointRestoreResult | undefined>;
+      onRedoAll?: (force?: boolean) => Promise<CheckpointRestoreResult | undefined>;
+    } = {},
+  ): ReactElement {
     const data: CheckpointsData = {
       checkpoints: config.checkpoints ?? [checkpoint()],
       redo: config.redo,
     };
-    return render(
+    return (
       <CheckpointsPanel
         data={data}
         onRestore={async () => ({ restored: true, filesChanged: 0, changedPaths: [] })}
-      />,
+        onRedo={config.onRedo ?? (async () => defaultRedoResult)}
+        onRedoAll={config.onRedoAll ?? (async () => defaultRedoResult)}
+      />
     );
+  }
+
+  function renderWithRedo(config: Parameters<typeof redoPanel>[0] = {}) {
+    return render(redoPanel(config));
   }
 
   it('renders no Redo controls when data.redo is absent (no dead affordance)', () => {
@@ -285,42 +340,48 @@ describe('CF-12: Redo/Redo-all render from data.redo and fire checkpoint.redo/re
     expect(screen.queryByRole('button', { name: 'Redo all' })).not.toBeInTheDocument();
   });
 
-  it('renders Redo and Redo all when data.redo is present, and clicking Redo posts checkpoint.redo with {} (no id, per the host special-case)', async () => {
-    const requestSpy = vi
-      .spyOn(bridge, 'request')
-      .mockResolvedValue({ restored: true, filesChanged: 0, changedPaths: [] });
+  it('renders Redo and Redo all when data.redo is present, and clicking Redo calls onRedo() (no id, per the host special-case)', async () => {
+    const calls: Array<boolean | undefined> = [];
     const user = userEvent.setup();
-    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1', anchorTurnOrdinal: 3 } });
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1', anchorTurnOrdinal: 3 },
+      onRedo: async (force) => {
+        calls.push(force);
+        return defaultRedoResult;
+      },
+    });
 
     await user.click(screen.getByRole('button', { name: 'Redo' }));
 
-    expect(requestSpy).toHaveBeenCalledWith('checkpoint.redo', {});
-    requestSpy.mockRestore();
+    expect(calls).toEqual([undefined]);
   });
 
-  it('clicking Redo all posts checkpoint.redoAll with {}', async () => {
-    const requestSpy = vi
-      .spyOn(bridge, 'request')
-      .mockResolvedValue({ restored: true, filesChanged: 0, changedPaths: [] });
+  it('clicking Redo all calls onRedoAll()', async () => {
+    const calls: Array<boolean | undefined> = [];
     const user = userEvent.setup();
-    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' } });
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+      onRedoAll: async (force) => {
+        calls.push(force);
+        return defaultRedoResult;
+      },
+    });
 
     await user.click(screen.getByRole('button', { name: 'Redo all' }));
 
-    expect(requestSpy).toHaveBeenCalledWith('checkpoint.redoAll', {});
-    requestSpy.mockRestore();
+    expect(calls).toEqual([undefined]);
   });
 
   it('disables both Redo buttons while a request is in flight (honest pending state, no double-fire)', async () => {
     let release: ((v: CheckpointRestoreResult) => void) | undefined;
-    const requestSpy = vi.spyOn(bridge, 'request').mockImplementation(
-      () =>
+    const user = userEvent.setup();
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+      onRedo: () =>
         new Promise((r) => {
           release = r;
         }),
-    );
-    const user = userEvent.setup();
-    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' } });
+    });
 
     await user.click(screen.getByRole('button', { name: 'Redo' }));
 
@@ -328,34 +389,31 @@ describe('CF-12: Redo/Redo-all render from data.redo and fire checkpoint.redo/re
     expect(screen.getByRole('button', { name: 'Redo all' })).toBeDisabled();
 
     release?.({ restored: true, filesChanged: 0, changedPaths: [] });
-    requestSpy.mockRestore();
   });
 
   it('a refused redo surfaces its reason and a force retry, mirroring the restore block/"anyway" pattern', async () => {
-    const requestSpy = vi
-      .spyOn(bridge, 'request')
-      .mockResolvedValue({ restored: false, reason: 'A turn is still running — wait for it to finish.' });
     const user = userEvent.setup();
-    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' } });
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+      onRedo: async () => ({ restored: false, reason: 'A turn is still running — wait for it to finish.' }),
+    });
 
     await user.click(screen.getByRole('button', { name: 'Redo' }));
 
     expect(await screen.findByText('A turn is still running — wait for it to finish.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Redo anyway' })).toBeInTheDocument();
-    requestSpy.mockRestore();
   });
 
   it('a successful redo is acknowledged in the UI', async () => {
-    const requestSpy = vi
-      .spyOn(bridge, 'request')
-      .mockResolvedValue({ restored: true, filesChanged: 2, changedPaths: ['a.txt', 'b.txt'] });
     const user = userEvent.setup();
-    renderWithRedo({ redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' } });
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+      onRedo: async () => ({ restored: true, filesChanged: 2, changedPaths: ['a.txt', 'b.txt'] }),
+    });
 
     await user.click(screen.getByRole('button', { name: 'Redo' }));
 
     expect(await screen.findByText(/redone/i)).toBeInTheDocument();
-    requestSpy.mockRestore();
   });
 
   it('renders the before/after/anchor phase label for rows that carry a phase (folds Minor m-9)', () => {
@@ -378,5 +436,194 @@ describe('CF-12: Redo/Redo-all render from data.redo and fire checkpoint.redo/re
     expect(screen.queryByText('Before')).not.toBeInTheDocument();
     expect(screen.queryByText('After')).not.toBeInTheDocument();
     expect(screen.queryByText('Anchor')).not.toBeInTheDocument();
+  });
+
+  /**
+   * IMP-4 gap #1 (review): the force-retry path — clicking "Redo anyway"
+   * after a refusal — was exercised by NOTHING before this task; nothing
+   * proved the retry actually re-invokes with `force: true` rather than
+   * silently repeating the same (doomed-to-refuse-again) plain call.
+   */
+  it('IMP-4: clicking "Redo anyway" retries with force: true', async () => {
+    const calls: Array<boolean | undefined> = [];
+    const user = userEvent.setup();
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+      onRedo: async (force) => {
+        calls.push(force);
+        if (!force) {
+          return { restored: false, reason: 'A turn is still running — wait for it to finish.' };
+        }
+        return { restored: true, filesChanged: 0, changedPaths: [] };
+      },
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+    const retry = await screen.findByRole('button', { name: 'Redo anyway' });
+    await user.click(retry);
+
+    expect(calls).toEqual([undefined, true]);
+    expect(await screen.findByText(/redone/i)).toBeInTheDocument();
+  });
+
+  /**
+   * IMP-4 gap #4 (review): mirrors `CheckpointsPanel.dom.test.tsx`'s restore
+   * suite's dedicated double-click guard test (the "a second 'Restore
+   * anyway' click..." test above) — the retry button uses `aria-disabled`
+   * (not native `disabled`), so unlike the idle "Redo"/"Redo all" buttons it
+   * stays REACHABLE to a second click while the retry is in flight, and only
+   * `runRedo`'s `if (redoPending !== undefined) return;` guard stops a
+   * second fire.
+   */
+  it('IMP-4: a second "Redo anyway" click while the force-retry is in flight fires no extra redo', async () => {
+    const calls: Array<boolean | undefined> = [];
+    let releaseRetry: ((v: CheckpointRestoreResult) => void) | undefined;
+    const user = userEvent.setup();
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+      onRedo: async (force) => {
+        calls.push(force);
+        if (!force) {
+          return { restored: false, reason: 'A turn is still running — wait for it to finish.' };
+        }
+        return new Promise((r) => {
+          releaseRetry = r;
+        });
+      },
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+    const retry = await screen.findByRole('button', { name: 'Redo anyway' });
+
+    await user.click(retry);
+
+    expect(retry).toHaveAttribute('aria-disabled', 'true');
+    expect(retry).not.toBeDisabled();
+
+    await user.click(retry);
+
+    expect(calls).toHaveLength(2); // the refused first attempt + exactly ONE force retry
+    releaseRetry?.({ restored: true, filesChanged: 0, changedPaths: [] });
+  });
+
+  /**
+   * IMP-4 gap #2 (review): nothing before this task rendered `redoSkipped` —
+   * a redo result carrying `skippedPaths` never had DOM coverage. Also
+   * proves IMP-3's honest, cause-agnostic copy for the redo notice (the
+   * tracker fills `skippedPaths` for a symlink escape AND a per-path I/O
+   * failure alike — see the restore-side twin test above for the same
+   * claim against `CheckpointTracker.ts`).
+   */
+  it('IMP-4: renders the skipped-paths notice with honest, cause-agnostic copy when the redo result carries skippedPaths', async () => {
+    const user = userEvent.setup();
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+      onRedo: async () => ({
+        restored: true,
+        filesChanged: 1,
+        changedPaths: ['a.txt'],
+        skippedPaths: ['b.txt', 'c.txt'],
+      }),
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+
+    expect(await screen.findByText(/2 files could not be updated/i)).toBeInTheDocument();
+    expect(screen.getByText('b.txt')).toBeInTheDocument();
+    expect(screen.getByText('c.txt')).toBeInTheDocument();
+    expect(screen.queryByText(/symlink/i)).not.toBeInTheDocument();
+  });
+
+  /**
+   * IMP-4 gap #3 (review): mirrors the restore suite's `T-C2 (closes V-17)`
+   * test above — `onRedo` resolving a bare `undefined` must never read as a
+   * successful "Workspace redone" acknowledgement.
+   */
+  it('IMP-4 (mirrors T-C2/V-17): onRedo resolving undefined is treated as a failure, never "Workspace redone"', async () => {
+    const user = userEvent.setup();
+    renderWithRedo({
+      redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+      onRedo: async () => undefined,
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+
+    expect(await screen.findByText(/Redo failed — the host returned no result/i)).toBeInTheDocument();
+    expect(screen.queryByText(/redone/i)).not.toBeInTheDocument();
+  });
+
+  /**
+   * IMP-1 (review): the panel is NOT remounted on a tab/root switch — a
+   * single mounted instance can be fed a DIFFERENT root's `data.redo` (e.g.
+   * the active chat tab switches to one bound to a different workspace
+   * root). Before this fix, none of `redoBlocked`/`redoDone`/`redoSkipped`
+   * ever reset on that transition, so a stale notice for a redo the user on
+   * the NEW root never asked for kept showing. The fix: a `useEffect` keyed
+   * on `data.redo`'s identity (`anchorId`+`cursorId`) clears all three
+   * (+`redoPending`) whenever that identity changes.
+   */
+  describe('IMP-1: stale redo state resets when data.redo switches to a different root', () => {
+    it('a success notice from one root does not survive a switch to a DIFFERENT root\'s data.redo', async () => {
+      const user = userEvent.setup();
+      const { rerender } = renderWithRedo({ redo: { anchorId: 'root-x-anchor', cursorId: 'root-x-cursor' } });
+
+      await user.click(screen.getByRole('button', { name: 'Redo' }));
+      expect(await screen.findByText(/redone/i)).toBeInTheDocument();
+
+      rerender(redoPanel({ redo: { anchorId: 'root-y-anchor', cursorId: 'root-y-cursor' } }));
+
+      expect(screen.queryByText(/redone/i)).not.toBeInTheDocument();
+    });
+
+    it('a blocked-redo refusal notice from one root does not survive a switch to a DIFFERENT root\'s data.redo', async () => {
+      const user = userEvent.setup();
+      const { rerender } = renderWithRedo({
+        redo: { anchorId: 'root-x-anchor', cursorId: 'root-x-cursor' },
+        onRedo: async () => ({ restored: false, reason: 'A turn is still running — wait for it to finish.' }),
+      });
+
+      await user.click(screen.getByRole('button', { name: 'Redo' }));
+      expect(await screen.findByText('A turn is still running — wait for it to finish.')).toBeInTheDocument();
+
+      rerender(redoPanel({ redo: { anchorId: 'root-y-anchor', cursorId: 'root-y-cursor' } }));
+
+      expect(screen.queryByText('A turn is still running — wait for it to finish.')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Redo anyway' })).not.toBeInTheDocument();
+    });
+
+    it('a skipped-paths notice from one root does not survive a switch to a DIFFERENT root\'s data.redo', async () => {
+      const user = userEvent.setup();
+      const { rerender } = renderWithRedo({
+        redo: { anchorId: 'root-x-anchor', cursorId: 'root-x-cursor' },
+        onRedo: async () => ({
+          restored: true,
+          filesChanged: 1,
+          changedPaths: ['a.txt'],
+          skippedPaths: ['b.txt'],
+        }),
+      });
+
+      await user.click(screen.getByRole('button', { name: 'Redo' }));
+      expect(await screen.findByText(/could not be updated/i)).toBeInTheDocument();
+
+      rerender(redoPanel({ redo: { anchorId: 'root-y-anchor', cursorId: 'root-y-cursor' } }));
+
+      expect(screen.queryByText(/could not be updated/i)).not.toBeInTheDocument();
+    });
+
+    it('the in-flight pending lock from one root does not survive a switch to a DIFFERENT root\'s data.redo', async () => {
+      const user = userEvent.setup();
+      const { rerender } = renderWithRedo({
+        redo: { anchorId: 'root-x-anchor', cursorId: 'root-x-cursor' },
+        onRedo: () => new Promise<CheckpointRestoreResult>(() => {}), // never resolves
+      });
+
+      await user.click(screen.getByRole('button', { name: 'Redo' }));
+      expect(screen.getByRole('button', { name: 'Redo' })).toBeDisabled();
+
+      rerender(redoPanel({ redo: { anchorId: 'root-y-anchor', cursorId: 'root-y-cursor' } }));
+
+      expect(screen.getByRole('button', { name: 'Redo' })).not.toBeDisabled();
+    });
   });
 });

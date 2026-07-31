@@ -10,7 +10,7 @@
  * `force: true`) rather than ever silently retrying — the data-loss guard
  * the tracker's own review fought for must not be bypassed from the UI.
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { Checkpoint, CheckpointPhase, CheckpointRestoreResult, CheckpointsData } from '../protocol';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
@@ -49,6 +49,21 @@ interface CheckpointsPanelProps {
    * PUSH the panel used to listen for directly.
    */
   onRestore: (id: string, force?: boolean) => Promise<CheckpointRestoreResult | undefined>;
+  /**
+   * CF-12 review fix (W3-T7): correlated `checkpoint.redo`/`checkpoint.redoAll`
+   * round trips, threaded from `App.tsx` exactly like `onRestore` — App.tsx
+   * carries BOTH the params (`rootId`, multi-root parity with restore) AND
+   * the `bridge.request` tab tag (so `bridge.rejectTab` rejects an in-flight
+   * redo promptly on tab close, instead of hanging until RPC timeout). This
+   * replaced an earlier draft that fired `bridge.request` directly from this
+   * panel via a dynamic `import('../bridge')` — that draft had neither the
+   * tag nor `rootId`, and forced the dynamic-import hazard so this file
+   * could stay importable from the PURE, `environment: 'node'`
+   * `CheckpointsPanel.test.ts`. Threading these as props removes the bridge
+   * dependency from this file entirely, so no dynamic import is needed.
+   */
+  onRedo: (force?: boolean) => Promise<CheckpointRestoreResult | undefined>;
+  onRedoAll: (force?: boolean) => Promise<CheckpointRestoreResult | undefined>;
 }
 
 /** A restore that the tracker's dirty-worktree guard refused, pending user confirmation. */
@@ -58,17 +73,23 @@ interface BlockedRestore {
 }
 
 /**
- * A completed restore that left some files untouched: the tracker's symlink
- * guard refused to write/delete paths whose real location escaped the workspace
- * (see {@link CheckpointRestoreResult.skippedPaths}). The restore still
- * succeeded for every other file — this is a notice, not a failure.
+ * A completed restore that left some files untouched (see {@link
+ * CheckpointRestoreResult.skippedPaths}). The restore still succeeded for
+ * every other file — this is a notice, not a failure.
+ *
+ * CF-12 review fix, IMP-3: `skippedPaths` is filled by TWO unrelated causes
+ * host-side (`CheckpointTracker.ts`) — the symlink-escape guard AND a
+ * per-path I/O failure (ENOSPC/EACCES/EROFS, or `git show` dying on a
+ * since-pruned blob) — and the array does not disambiguate which happened
+ * for which path. The rendered copy must stay cause-agnostic; do not name a
+ * specific cause here.
  */
 interface SkippedNotice {
   id: string;
   paths: string[];
 }
 
-export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
+export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: CheckpointsPanelProps) {
   const [blocked, setBlocked] = useState<BlockedRestore | undefined>(undefined);
   const [skipped, setSkipped] = useState<SkippedNotice | undefined>(undefined);
 
@@ -101,6 +122,27 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
   const [redoBlocked, setRedoBlocked] = useState<{ kind: RedoKind; reason: string } | undefined>(undefined);
   const [redoDone, setRedoDone] = useState<RedoKind | undefined>(undefined);
   const [redoSkipped, setRedoSkipped] = useState<{ kind: RedoKind; paths: string[] } | undefined>(undefined);
+
+  /**
+   * CF-12 review fix, IMP-1: this panel is NOT remounted on a tab/root
+   * switch (App.tsx keeps one instance mounted while `activePanel ===
+   * 'checkpoints'`), so switching the active chat tab to one bound to a
+   * DIFFERENT workspace root feeds this SAME mounted panel a different
+   * `data.redo` — while a stale `redoDone`/`redoBlocked`/`redoSkipped`
+   * notice from the PREVIOUS root's redo still showed, for a target the
+   * user on the new root never acted on. `data.redo`'s identity
+   * (`anchorId`+`cursorId`, both possibly `undefined`) is the tracker's own
+   * redo pointer for whichever root is currently feeding this panel — any
+   * change to it (including becoming absent) means "this is a different
+   * redo target than the one the state above was about", so every piece of
+   * that state (including the in-flight lock) is stale and must clear.
+   */
+  useEffect(() => {
+    setRedoPending(undefined);
+    setRedoBlocked(undefined);
+    setRedoDone(undefined);
+    setRedoSkipped(undefined);
+  }, [data.redo?.anchorId, data.redo?.cursorId]);
 
   if (data.available === false) {
     return (
@@ -146,9 +188,10 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
         } else {
           setBlocked((prev) => (prev?.id === id ? undefined : prev));
           setRestored(id);
-          // The restore succeeded, but the symlink guard may have refused to
-          // touch some files (their real path escaped the workspace). Surface
-          // them so "restored" doesn't hide a partial rollback.
+          // The restore succeeded, but the tracker may have refused/failed to
+          // touch some files (symlink escape OR a per-path I/O failure — see
+          // `SkippedNotice`'s doc). Surface them so "restored" doesn't hide a
+          // partial rollback.
           if (result.skippedPaths && result.skippedPaths.length > 0) {
             setSkipped({ id, paths: result.skippedPaths });
           }
@@ -174,31 +217,16 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
   };
 
   /**
-   * CF-12 (W3-T7): fires the correlated `checkpoint.redo`/`checkpoint.redoAll`
-   * request DIRECTLY over `bridge` — the same seam `ErrorBoundary.tsx`'s
-   * Reload button uses for `bridge.post` — rather than a new callback prop
-   * threaded through `App.tsx` (this task's scope is this file alone).
-   * `ControlDispatcher.redoCheckpoint` (host) takes `{force?, rootId?}` — NO
-   * checkpoint id, unlike restore: redo/redoAll step/jump the tracker's own
-   * stored cursor toward its anchor, not a panel-picked row. `rootId` is
-   * intentionally omitted: the panel has no route to the active tab's
-   * `rootId` without that extra wiring; the host's single-root convenience
-   * fallback (`resolveRestoreTargetRoot`) covers the common case, and a
-   * genuinely ambiguous multi-root workspace surfaces its own honest
-   * refusal through the SAME `redoBlocked` UI below, exactly like a restore
-   * would for the same condition.
-   *
-   * `bridge` is loaded via a dynamic `import('../bridge')` rather than a
-   * static top-level import: `../bridge`'s module-level singleton touches
-   * `window` at import time (documented at `bridge.test.ts`/
-   * `ErrorBoundary.test.ts`), and this file is also imported by the PURE,
-   * `environment: 'node'` `CheckpointsPanel.test.ts` (for
-   * `checkpointSessionLabelSuffix`) — a static import would crash that
-   * suite. Deferring the import into this handler means it only evaluates
-   * when a redo is actually invoked (never during the pure test's import),
-   * with zero behavior change for real use: `App.tsx` already imports
-   * `../bridge` statically, so by the time this panel is ever on screen the
-   * module — and its one singleton — is already resolved/cached.
+   * CF-12 (W3-T7), review-fixed: fires the correlated `checkpoint.redo`/
+   * `checkpoint.redoAll` request through the `onRedo`/`onRedoAll` CALLBACK
+   * PROPS — exactly mirroring how `restore` above calls `onRestore` — rather
+   * than the original direct-`bridge`-via-dynamic-`import` design (see
+   * `CheckpointsPanelProps.onRedo`'s doc for why that draft existed and why
+   * it was replaced). `App.tsx`'s implementation of these props supplies
+   * `rootId` (multi-root parity with restore) and tags the request with the
+   * owning tab's id, so this file no longer imports `bridge` at all —
+   * `CheckpointsPanel.test.ts` (the PURE, `environment: 'node'` sibling
+   * suite) needs no special-casing for it.
    */
   const runRedo = (kind: RedoKind, force?: boolean) => {
     if (redoPending !== undefined) return; // in flight — ignore repeat clicks
@@ -206,14 +234,10 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
     setRedoDone(undefined);
     if (!force) setRedoBlocked(undefined);
     setRedoSkipped(undefined);
-    const method = kind === 'redo' ? 'checkpoint.redo' : 'checkpoint.redoAll';
-    const params: Record<string, unknown> = {};
-    if (force) params.force = true;
-    void import('../bridge')
-      .then(({ bridge }) => bridge.request(method, params))
+    const action = kind === 'redo' ? onRedo : onRedoAll;
+    void action(force)
       .then(
-        (raw) => {
-          const result = raw as CheckpointRestoreResult | undefined;
+        (result) => {
           // Mirrors T-C2 (V-17) above: `undefined` is never success.
           if (!result) {
             setRedoBlocked({ kind, reason: 'Redo failed — the host returned no result.' });
@@ -311,8 +335,8 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
               <div className="flex items-start gap-1.5 text-2xs text-fg">
                 <Icon name="info" size={12} className="mt-0.5 flex-none text-faint" />
                 <span>
-                  Redone. {redoSkipped.paths.length} file{redoSkipped.paths.length === 1 ? '' : 's'} skipped
-                  — a symlink pointed outside the workspace.
+                  Redone. {redoSkipped.paths.length} file{redoSkipped.paths.length === 1 ? '' : 's'} could not
+                  be updated.
                 </span>
               </div>
               <ul className="mt-1 list-none space-y-0.5 pl-[18px]">
@@ -503,7 +527,7 @@ export function CheckpointsPanel({ data, onRestore }: CheckpointsPanelProps) {
                       <Icon name="info" size={12} className="mt-0.5 flex-none text-faint" />
                       <span>
                         Restored. {skip.paths.length} file{skip.paths.length === 1 ? '' : 's'}{' '}
-                        skipped — a symlink pointed outside the workspace.
+                        could not be updated.
                       </span>
                     </div>
                     <ul className="mt-1 list-none space-y-0.5 pl-[18px]">

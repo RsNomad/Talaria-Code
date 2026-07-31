@@ -341,6 +341,31 @@ export function App() {
     return result as CheckpointRestoreResult | undefined;
   };
 
+  // CF-12 review fix (W3-T7): correlated `checkpoint.redo`/`checkpoint.redoAll`
+  // — the panel's Redo/Redo-all callback props, wired the SAME way as
+  // `restoreCheckpoint` immediately above (explicit `rootId` in params +
+  // `tab.tabId` as the request tag). This replaced an earlier draft where
+  // the panel fired these directly over a dynamically-imported `bridge`: that
+  // draft omitted the tag entirely (so `bridge.rejectTab` on tab close could
+  // never reject an in-flight redo — it hung until RPC timeout, then
+  // resolved against whatever was on screen) and omitted `rootId` (accepted
+  // only by the host's single-root convenience fallback). No checkpoint
+  // `id`, unlike restore: redo/redoAll step/jump the tracker's own stored
+  // cursor toward its anchor, never a panel-picked row.
+  const redoCheckpoint = async (force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
+    const params: Record<string, unknown> = { rootId: tab.rootId };
+    if (force) params.force = true;
+    const result = await bridge.request('checkpoint.redo', params, tab.tabId);
+    return result as CheckpointRestoreResult | undefined;
+  };
+
+  const redoAllCheckpoint = async (force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
+    const params: Record<string, unknown> = { rootId: tab.rootId };
+    if (force) params.force = true;
+    const result = await bridge.request('checkpoint.redoAll', params, tab.tabId);
+    return result as CheckpointRestoreResult | undefined;
+  };
+
   // A#5: MCP "Reload servers" over the CORRELATED path so the gateway's result
   // (`{status, message?}`) — or a failure — becomes visible in the panel,
   // instead of the old fire-and-forget that dropped both. The host still
@@ -754,7 +779,14 @@ export function App() {
               loadingHint="Loading checkpoints…"
               onRetry={() => requestPanel('checkpoints')}
             >
-              {(data) => <CheckpointsPanel data={data} onRestore={restoreCheckpoint} />}
+              {(data) => (
+                <CheckpointsPanel
+                  data={data}
+                  onRestore={restoreCheckpoint}
+                  onRedo={redoCheckpoint}
+                  onRedoAll={redoAllCheckpoint}
+                />
+              )}
             </RemotePanel>
           </ErrorBoundary>
         </div>
