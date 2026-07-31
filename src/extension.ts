@@ -400,15 +400,30 @@ export function activate(context: vscode.ExtensionContext): void {
     logPrefix: 'Talaria RAG',
     hasWorkspace: () => !!firstWorkspaceRoot(),
     isTrusted: () => vscode.workspace.isTrusted,
-    shouldActivate: shouldActivateRag,
+    // CF-05 / L5 F-6: `shouldActivateRag` now also gates on the backend
+    // KIND — the mock backend has no agent that could ever call
+    // `codebase_search`, so activating RAG under it would walk/embed/index/
+    // watch the workspace for zero consumers. Read `backend` (the outer
+    // `let` above) at CHECK time — same "current, not captured" posture as
+    // the `start()` callback below and the trust-upgrade re-invocation from
+    // `onDidGrantWorkspaceTrust`.
+    shouldActivate: (enabled, hasWorkspace, isTrusted) =>
+      shouldActivateRag(enabled, hasWorkspace, isTrusted, backend instanceof AcpBackend ? 'acp' : 'mock'),
     output,
     start: () => {
       // Zone RAG (pinned contract): register
       // `codebase_search` with whichever backend is CURRENT when this callback
       // fires — `backend` is the outer `let` above, so a trust-triggered
       // mock→real upgrade (below) is already reflected by the time it runs.
+      // Returns whether it actually attached to a live `AcpBackend` — the
+      // caller (`activateCodebaseRag`) uses this to keep its "registered"
+      // log honest (CF-05: never claim registration that didn't happen).
       void activateCodebaseRag(context, output, (server) => {
-        if (backend instanceof AcpBackend) backend.setMcpServer('codebase_search', server);
+        if (backend instanceof AcpBackend) {
+          backend.setMcpServer('codebase_search', server);
+          return true;
+        }
+        return false;
       });
     },
   });
@@ -583,7 +598,10 @@ export async function deactivate(): Promise<void> {
 async function activateCodebaseRag(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
-  registerMcpServer: (server: AcpMcpServerStdio) => void,
+  // CF-05: returns whether the server was ACTUALLY attached to a live
+  // backend — the "registered" log below is conditioned on this, not on
+  // merely having called the callback (see the caller's `start()`).
+  registerMcpServer: (server: AcpMcpServerStdio) => boolean,
 ): Promise<void> {
   const ragCfg = vscode.workspace.getConfiguration('talaria.rag');
   const enabled = ragCfg.get<boolean>('enabled', true);
@@ -641,10 +659,15 @@ async function activateCodebaseRag(
     embedModel,
     dims,
   });
-  registerMcpServer(mcpServer);
-  output.appendLine(
-    `Talaria RAG: registered '${CODEBASE_SEARCH_TOOL_NAME}' MCP server (re-sent on every session/new).`,
-  );
+  // CF-05: log the "registered" claim ONLY when it actually happened — the
+  // caller's callback returns `false` (never registers) whenever `backend`
+  // isn't a live `AcpBackend` at the moment this runs, so this reports the
+  // TRUE state instead of unconditionally claiming success.
+  if (registerMcpServer(mcpServer)) {
+    output.appendLine(
+      `Talaria RAG: registered '${CODEBASE_SEARCH_TOOL_NAME}' MCP server (re-sent on every session/new).`,
+    );
+  }
 
   // The extension's OWN tree-sitter-wasms grammars — never the workspace's
   // (integration checklist #5 / wave-1.md task 5). `context.asAbsolutePath`

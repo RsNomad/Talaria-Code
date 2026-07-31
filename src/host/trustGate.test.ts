@@ -22,17 +22,27 @@ describe('selectBackendKind', () => {
 });
 
 describe('shouldActivateRag', () => {
-  it('activates only when enabled, a workspace is open, and trust is granted', () => {
-    expect(shouldActivateRag(true, true, true)).toBe(true);
+  it('activates only when enabled, a workspace is open, trust is granted, AND the backend is acp', () => {
+    expect(shouldActivateRag(true, true, true, 'acp')).toBe(true);
+  });
+
+  it('does NOT activate under the mock backend (CF-05: mock has no agent to call codebase_search — activating would walk/embed/index/watch the workspace for zero consumers, wasting egress+cost+disk)', () => {
+    expect(shouldActivateRag(true, true, true, 'mock')).toBe(false);
   });
 
   it('does not activate in an untrusted workspace (C1: no file walk / embeddings POST)', () => {
-    expect(shouldActivateRag(true, true, false)).toBe(false);
+    expect(shouldActivateRag(true, true, false, 'acp')).toBe(false);
   });
 
   it('does not activate when disabled or with no workspace', () => {
-    expect(shouldActivateRag(false, true, true)).toBe(false);
-    expect(shouldActivateRag(true, false, true)).toBe(false);
+    expect(shouldActivateRag(false, true, true, 'acp')).toBe(false);
+    expect(shouldActivateRag(true, false, true, 'acp')).toBe(false);
+  });
+
+  it('requires ALL FOUR conditions — acp backend alone is not sufficient without enabled/workspace/trust', () => {
+    expect(shouldActivateRag(false, true, true, 'acp')).toBe(false);
+    expect(shouldActivateRag(true, false, true, 'acp')).toBe(false);
+    expect(shouldActivateRag(true, true, false, 'acp')).toBe(false);
   });
 });
 

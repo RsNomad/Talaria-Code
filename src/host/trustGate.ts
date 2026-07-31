@@ -40,11 +40,27 @@ export function selectBackendKind(backendSetting: string, isTrusted: boolean): B
 
 /**
  * Whether the codebase RAG indexer (workspace file walk + embeddings POST) may
- * run: it requires the feature to be enabled, a workspace to be open, and the
- * workspace to be trusted.
+ * run: it requires the feature to be enabled, a workspace to be open, the
+ * workspace to be trusted, AND the backend to be `acp`.
+ *
+ * ## Why the backend kind gates this too (CF-05 / L5 F-6)
+ * The shipped defaults are `talaria.rag.enabled=true` with
+ * `talaria.backend='mock'`. Without this gate, a default install would walk
+ * the workspace, embed chunks, index them to disk, and run a file watcher —
+ * all with NO possible consumer, since the `mock` backend has no agent that
+ * could ever call `codebase_search`. That is wasted embeddings egress + cost
+ * + disk for a feature nobody can reach. RAG only has a consumer once the
+ * real `acp` backend is actually running (which itself only happens in a
+ * trusted workspace — {@link selectBackendKind}), so this is the second half
+ * of the same "don't do work nobody can use" gate.
  */
-export function shouldActivateRag(enabled: boolean, hasWorkspace: boolean, isTrusted: boolean): boolean {
-  return enabled && hasWorkspace && isTrusted;
+export function shouldActivateRag(
+  enabled: boolean,
+  hasWorkspace: boolean,
+  isTrusted: boolean,
+  backendKind: BackendKind,
+): boolean {
+  return enabled && hasWorkspace && isTrusted && backendKind === 'acp';
 }
 
 /**
