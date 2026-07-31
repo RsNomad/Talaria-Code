@@ -153,13 +153,12 @@ describe('C-5/D-1: the embedder never leaks a body and never sends dimensions bl
   });
 
   it('refuses a vector whose width does not match the index schema, instead of storing it', async () => {
+    // CF-21: `embedBatch` now reads its body via `readJsonBounded`
+    // (`response.body.getReader()`), not `response.json()` — this fixture
+    // must supply a real `ReadableStream` body, matching the LlamaCpp/
+    // next-edit backends' identical D1 fixtures.
     const fetchImpl = async () =>
-      ({
-        ok: true,
-        status: 200,
-        statusText: 'OK',
-        json: async () => ({ data: [{ index: 0, embedding: [1, 2, 3] }] }),
-      }) as unknown as Response;
+      new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 2, 3] }] }), { status: 200 });
 
     const embedder = new HttpEmbedder({
       endpoint: 'http://127.0.0.1:11434',
@@ -220,18 +219,17 @@ describe('C-5/D-1: the embedder never leaks a body and never sends dimensions bl
     // Task 14 fix-wave, Minor: the guard must not check only vectors[0] — a
     // batch whose first vector happens to be correct-width but a later one
     // isn't must still be refused, not partially stored.
+    // CF-21: same body-stream fixture requirement as the test above.
     const fetchImpl = async () =>
-      ({
-        ok: true,
-        status: 200,
-        statusText: 'OK',
-        json: async () => ({
+      new Response(
+        JSON.stringify({
           data: [
             { index: 0, embedding: [1, 2, 3] },
             { index: 1, embedding: [1, 2] },
           ],
         }),
-      }) as unknown as Response;
+        { status: 200 },
+      );
 
     const embedder = new HttpEmbedder({
       endpoint: 'http://127.0.0.1:11434',
@@ -239,5 +237,69 @@ describe('C-5/D-1: the embedder never leaks a body and never sends dimensions bl
       fetchImpl,
     });
     await expect(embedder.embed(['x', 'y'], 3)).rejects.toThrow('embedding width mismatch');
+  });
+});
+
+describe('CF-21: bounded read (4 MiB cap) on the embeddings response', () => {
+  it('rejects a well-over-4-MiB /v1/embeddings response body instead of buffering it without limit', async () => {
+    // 5 x 1 MiB chunks = 5 MiB, past the 4 MiB MAX_STREAM_BYTES cap —
+    // mirrors LlamaCppInfillBackend.test.ts's identical D1 over-cap proof
+    // ("rejects a well-over-4-MiB /infill response body...").
+    const chunk = new Uint8Array(1024 * 1024).fill(0x61);
+    let pulls = 0;
+    const overCapBody = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 5) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    });
+    // Deliberately body-only (no `.json()` method): the OLD unbounded
+    // `res.json()` call has nothing to read from this fixture, while the
+    // NEW `readJsonBounded(res)` call reads via `.body.getReader()` and
+    // must reject once the 4 MiB cap is exceeded — proving today's read is
+    // unbounded and tomorrow's is capped, in one fixture.
+    const fetchImpl = vi.fn(
+      async () => ({ ok: true, status: 200, statusText: 'OK', body: overCapBody }) as unknown as Response,
+    ) as unknown as typeof fetch;
+
+    const embedder = new HttpEmbedder({ endpoint: 'http://127.0.0.1:11434', model: 'm', fetchImpl });
+
+    await expect(embedder.embed(['x'])).rejects.toThrow(
+      /FIM stream exceeded \d+ bytes without completing/,
+    );
+  });
+
+  it('cancels the underlying read once the 4 MiB cap is exceeded, instead of draining a hostile/misbehaving server to completion', async () => {
+    // Mirrors http.test.ts's `endlessGarbageStream`: a stream that NEVER
+    // terminates on its own (the delimiter-free-garbage / never-closes
+    // threat model D1 targets), so cancellation must be driven by
+    // `readJsonBounded`'s own cap check — not race against the stream's
+    // natural close, which a self-closing fixture would (verified: a
+    // finite 5-chunk fixture flaked on this assertion because its own
+    // `controller.close()` could win the race against `reader.cancel()`).
+    let cancelled = false;
+    const chunk = new Uint8Array(1024 * 1024).fill(0x61); // 'a' repeated — no JSON-closing byte anywhere
+    const overCapBody = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetchImpl = vi.fn(
+      async () => ({ ok: true, status: 200, statusText: 'OK', body: overCapBody }) as unknown as Response,
+    ) as unknown as typeof fetch;
+
+    const embedder = new HttpEmbedder({ endpoint: 'http://127.0.0.1:11434', model: 'm', fetchImpl });
+
+    await expect(embedder.embed(['x'])).rejects.toThrow(
+      /FIM stream exceeded \d+ bytes without completing/,
+    );
+    expect(cancelled).toBe(true);
   });
 });

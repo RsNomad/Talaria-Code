@@ -7,6 +7,8 @@
  * `HttpEmbedder` class is the thin fetch-touching wrapper.
  */
 
+import { readJsonBounded } from '../autocomplete/backends/http';
+
 export interface EmbeddingsRequestBody {
   model: string;
   input: string[];
@@ -169,9 +171,15 @@ export class HttpEmbedder implements Embedder {
       // V-16 RAG-2 (review M-1): the deadline stays armed THROUGH the body
       // read — a server that returns 200 + headers then stalls the response
       // body would otherwise re-open the exact "one stalled request freezes
-      // all incremental indexing" freeze this task targets. `res.json()` is
+      // all incremental indexing" freeze this task targets. The read is
       // inside the timed try so the abort signal covers it too.
-      json = (await res.json()) as EmbeddingsResponse;
+      // CF-21: bounded read (4 MiB cap), not the unbounded `res.json()` —
+      // mirrors `readJsonBounded`'s use at LlamaCppInfillBackend.ts and
+      // nextedit/backend.ts (same D1 cap, same "a user-configured server is
+      // free to send anything" rationale). This is the one call site both
+      // `indexer.ts` (host) and `codebase-server.ts` (MCP child) route
+      // through via `HttpEmbedder`, so one change caps both.
+      json = (await readJsonBounded(res)) as EmbeddingsResponse;
     } catch (err) {
       // V-16 RAG-2 (review M-2): a deadline abort surfaces a self-explanatory,
       // body-free message (the indexer log then names the embeddings deadline)
