@@ -202,7 +202,18 @@ function buildList(
     const line = lines[cursor.i];
     if (!line || line.indent < indent) break;
     if (!capped && line.indent > indent) break; // handled by the recursive call below
-    if (line.ordered !== ordered) break; // marker-type switch ends this list
+    // CR-B (re-review): a marker-type switch (bullet <-> ordered) normally
+    // ends the current list so the caller can decide what follows it. But
+    // while capped, there IS no caller left to hand a marker switch off to
+    // — this call is the flat absorber for everything past MAX_LIST_DEPTH.
+    // A mixed-marker deep staircase used to hit this break on the very
+    // first post-cap line, leaving `cursor.i` short of `lines.length`;
+    // `parseListBlock`'s all-or-nothing check then nulled the ENTIRE block
+    // (including the legitimate shallow levels) to a raw-source-dump
+    // fallback. Absorbing mixed markers into one flat capped list — instead
+    // of breaking on the switch — keeps the block a real (if flattened)
+    // list, which is an acceptable degrade; a raw-source dump is not.
+    if (!capped && line.ordered !== ordered) break; // marker-type switch ends this list
     cursor.i++;
     const children: ListNode[] = [];
     const next = lines[cursor.i];
@@ -364,14 +375,25 @@ function renderBlock(block: string, key: string, depth = 0): ReactNode {
     const dedented = lines.map((l) => l.replace(/^\s*>\s?/, '')).join('\n');
     if (depth >= MAX_BLOCK_DEPTH) {
       // At/past the cap: stop descending through the renderBlock <->
-      // renderBlocks cycle entirely. Render the remaining (already-dedented)
-      // content as one plain paragraph with inline formatting only — no
-      // further block-level recursion, no further blockquote descent — so
+      // renderBlocks cycle entirely. Render the remaining content as one
+      // plain paragraph with inline formatting only — no further
+      // block-level recursion, no further blockquote descent — so
       // arbitrarily deep adversarial `>` nesting can never grow the call
       // stack past MAX_BLOCK_DEPTH levels.
+      //
+      // CR-A (re-review): `dedented` above has only had ONE leading `>`
+      // stripped per recursion level, but recursion itself stops here at
+      // MAX_BLOCK_DEPTH — so for input nested deeper than the cap, whatever
+      // `>` markers are left past that one strip-per-level would otherwise
+      // render as literal text in this fallback paragraph (e.g. ~1983 raw
+      // `>` characters for a 2000-deep input). Strip ALL remaining leading
+      // `>`/whitespace quote markers from every line, in one pass, before
+      // handing the text to `inline()` — the degrade must show the user's
+      // real text, never raw markdown source.
+      const flattened = dedented.replace(/^(\s*>\s?)+/gm, '');
       return (
         <p key={key} className="mb-2 last:mb-0">
-          {inline(dedented, key)}
+          {inline(flattened, key)}
         </p>
       );
     }

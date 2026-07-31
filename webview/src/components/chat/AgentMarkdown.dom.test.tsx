@@ -222,6 +222,41 @@ describe('UI#2 review: markdown block/list recursion depth is capped against unt
     const deep = lines.join('\n');
     expect(() => render(<AgentMarkdown text={deep} />)).not.toThrow();
   });
+
+  /*
+   * CR-A (re-review, reproduced): the crash is fixed, but the capped
+   * fallback dedents only ONE leading `>` per recursion level while
+   * recursion itself stops at MAX_BLOCK_DEPTH — so the fallback paragraph
+   * still contained every UN-stripped `>` past the cap (~1983 of them for a
+   * 2000-`>` input). The degrade must show the user's actual text, not a
+   * wall of raw quote markers.
+   */
+  it('CR-A: the capped blockquote fallback shows clean text, not a wall of raw `>` markers', () => {
+    const deep = '>'.repeat(2000) + ' PAYLOAD_TEXT';
+    const { container } = render(<AgentMarkdown text={deep} />);
+    const rendered = container.textContent ?? '';
+    const gtCount = (rendered.match(/>/g) ?? []).length;
+    expect(gtCount).toBeLessThanOrEqual(2);
+    expect(screen.getByText(/PAYLOAD_TEXT/)).toBeInTheDocument();
+  });
+
+  /*
+   * CR-B (re-review, reproduced): while capped, `buildList`'s flatten loop
+   * still broke on a marker-type switch (bullet <-> ordered), so a
+   * MIXED-marker deep staircase left `cursor.i` short of `lines.length`;
+   * `parseListBlock`'s all-or-nothing check then nulled the ENTIRE block
+   * (even the legitimate shallow levels 0-15) to the raw-paragraph
+   * fallback, showing every `-`/`1.` marker as literal source text.
+   */
+  it('CR-B: a mixed bullet/ordered deep staircase still renders as a list, not a raw-source dump', () => {
+    const lines = Array.from(
+      { length: 6000 },
+      (_, i) => `${' '.repeat(i)}${i % 2 === 0 ? '-' : '1.'} level ${i}`,
+    );
+    const deep = lines.join('\n');
+    const { container } = render(<AgentMarkdown text={deep} />);
+    expect(container.querySelectorAll('li').length).toBeGreaterThan(0);
+  });
 });
 
 /**
