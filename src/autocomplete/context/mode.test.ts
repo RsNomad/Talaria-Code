@@ -199,4 +199,28 @@ describe('injectSnippetsAsComments', () => {
     // Output order is preserved (still most-relevant-LAST): middle before most.
     expect(result).toBe(middleBlock + mostBlock + 'const x = ');
   });
+
+  // Salvage regression (§5): an oversized snippet must be SKIPPED, not treated
+  // as a stop signal for the whole backward walk. Array order is
+  // most-relevant-LAST, so `bigMostRelevant` is processed FIRST (it's the
+  // tail) and `smallLessRelevant` is processed SECOND (it's the head). A
+  // `break` on the first (oversized, tail) overflow ends the loop before the
+  // head is ever visited, discarding a smaller snippet that would otherwise
+  // fit in the remaining budget. `continue` skips just the oversized one and
+  // keeps filling from the rest of the (still most-relevant-first, from the
+  // tail) walk.
+  it('salvages a smaller, less-relevant snippet after an earlier oversized, more-relevant one overflows the budget', () => {
+    const smallLessRelevant = snippet({ filepath: 'src/small.ts', content: 'const small = 1;' });
+    const bigMostRelevant = snippet({ filepath: 'src/big.ts', content: 'x'.repeat(600) });
+    const result = injectSnippetsAsComments(
+      'const x = ',
+      [smallLessRelevant, bigMostRelevant],
+      'typescript',
+    );
+    // `bigMostRelevant` alone overflows the default 512-char budget and must
+    // be skipped whole; `smallLessRelevant` still fits in the untouched
+    // budget and must be salvaged rather than discarded along with it.
+    expect(result).toContain('src/small.ts');
+    expect(result).not.toContain('src/big.ts');
+  });
 });

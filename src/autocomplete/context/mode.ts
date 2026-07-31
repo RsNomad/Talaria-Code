@@ -98,7 +98,9 @@ export function injectSnippetsAsComments(
     const block = formatSnippetAsComment(snippet, commentToken);
     const addedChars = block.length + 1; // +1 for the trailing newline separator
     if (usedChars + addedChars > budgetChars) {
-      break; // skip-not-crop: stop at the snippet boundary, never truncate mid-snippet
+      continue; // skip-not-crop: skip this snippet whole (never truncate mid-snippet)
+      // and keep walking — an oversized snippet must not stop the fill of
+      // smaller, less-relevant survivors still ahead in the backward walk.
     }
     survivors.push(block);
     usedChars += addedChars;
