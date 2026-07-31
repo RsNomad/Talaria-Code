@@ -82,15 +82,26 @@ describe('RingBuffer.ingest — path hygiene', () => {
 });
 
 describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — §3.3 item 4 / P7)', () => {
+  // AUDIT-5 SEC M-1 (Task 3): fixture filepaths in this block were renamed
+  // off the `*.env` suffix (formerly e.g. `was-secret-2` + dot-env).
+  // Task 3 added a `*.env` SUFFIX arm to `isSecretForCompletion`, and this
+  // file's `RingBuffer` -> `scanSnippetForSecrets` (secretScanner.ts Layer 1)
+  // ALSO consults `isSecretForCompletion` on `filepath` — so a `.env`-suffixed
+  // fixture is now rejected by PATH alone, independent of the CONTENT these
+  // tests exist to exercise (AWS-key / PEM-header patterns, quarantine
+  // lifecycle). Left as `.env`, every test below would still pass but for the
+  // wrong reason (path-rejection masking content-quarantine logic) — silently
+  // vacuous. Secret CONTENT fixtures (`AKIA...`, `BEGIN PRIVATE KEY`,
+  // base64 fragments) are unchanged; only the path strings moved off `.env`.
   it('quarantines the uri on a secret verdict, and drops ALL later candidates from that uri (canonical split-secret case)', () => {
     const rb = new RingBuffer();
-    const secretUri = 'file:///secret.env';
+    const secretUri = 'file:///secret.ts';
 
     // Window 1: carries a PEM header -> rejected, uri quarantined.
     rb.ingest(
       candidate({
         uri: secretUri,
-        filepath: 'secret.env',
+        filepath: 'secret.ts',
         content: '-----BEGIN PRIVATE KEY-----',
         startLine: 0,
         endLine: 0,
@@ -107,7 +118,7 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
     rb.ingest(
       candidate({
         uri: secretUri,
-        filepath: 'secret.env',
+        filepath: 'secret.ts',
         content: 'totally innocuous body text, no secret here',
         startLine: 1,
         endLine: 1,
@@ -121,10 +132,10 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
 
   it('does NOT auto-clear when the offending window itself is resubmitted edited-clean — no window content lifts the quarantine', () => {
     const rb = new RingBuffer();
-    const uri = 'file:///was-secret.env';
+    const uri = 'file:///was-secret.ts';
 
     rb.ingest(
-      candidate({ uri, filepath: 'was-secret.env', content: 'AKIAABCDEFGHIJKLMNOP', startLine: 0, endLine: 0 }),
+      candidate({ uri, filepath: 'was-secret.ts', content: 'AKIAABCDEFGHIJKLMNOP', startLine: 0, endLine: 0 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -137,7 +148,7 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
     rb.ingest(
       candidate({
         uri,
-        filepath: 'was-secret.env',
+        filepath: 'was-secret.ts',
         content: 'clean content now, nothing sensitive',
         startLine: 0,
         endLine: 0,
@@ -151,11 +162,11 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
 
   it('the clear-then-resubmit sibling window closure: an edited-clean offending window does NOT re-expose a sibling secret window (Opus count=2 leak)', () => {
     const rb = new RingBuffer();
-    const uri = 'file:///split-secret.env';
+    const uri = 'file:///split-secret.ts';
 
     // Header window: rejects, quarantines the uri.
     rb.ingest(
-      candidate({ uri, filepath: 'split-secret.env', content: '-----BEGIN PRIVATE KEY-----', startLine: 0, endLine: 0 }),
+      candidate({ uri, filepath: 'split-secret.ts', content: '-----BEGIN PRIVATE KEY-----', startLine: 0, endLine: 0 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -164,7 +175,7 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
     // Sibling window (different lines), individually innocuous — dropped
     // because the uri is quarantined.
     rb.ingest(
-      candidate({ uri, filepath: 'split-secret.env', content: 'base64-body-fragment-one', startLine: 5, endLine: 5 }),
+      candidate({ uri, filepath: 'split-secret.ts', content: 'base64-body-fragment-one', startLine: 5, endLine: 5 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -172,7 +183,7 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
 
     // The header window is resubmitted, edited clean.
     rb.ingest(
-      candidate({ uri, filepath: 'split-secret.env', content: 'header now clean', startLine: 0, endLine: 0 }),
+      candidate({ uri, filepath: 'split-secret.ts', content: 'header now clean', startLine: 0, endLine: 0 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -183,7 +194,7 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
     // Opus verified). Under the strict design it MUST still drop: only
     // clearQuarantine(uri) lifts the quarantine.
     rb.ingest(
-      candidate({ uri, filepath: 'split-secret.env', content: 'base64-body-fragment-one', startLine: 5, endLine: 5 }),
+      candidate({ uri, filepath: 'split-secret.ts', content: 'base64-body-fragment-one', startLine: 5, endLine: 5 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -193,10 +204,10 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
 
   it('clearQuarantine(uri) re-enables ingestion of a clean window from that uri', () => {
     const rb = new RingBuffer();
-    const uri = 'file:///was-secret-2.env';
+    const uri = 'file:///was-secret-2.ts';
 
     rb.ingest(
-      candidate({ uri, filepath: 'was-secret-2.env', content: 'AKIAABCDEFGHIJKLMNOP', startLine: 0, endLine: 0 }),
+      candidate({ uri, filepath: 'was-secret-2.ts', content: 'AKIAABCDEFGHIJKLMNOP', startLine: 0, endLine: 0 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -207,7 +218,7 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
     rb.ingest(
       candidate({
         uri,
-        filepath: 'was-secret-2.env',
+        filepath: 'was-secret-2.ts',
         content: 'clean content, nothing sensitive',
         startLine: 0,
         endLine: 0,
@@ -222,10 +233,10 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
 
   it('a still-secret file re-quarantines after clearQuarantine(uri) — the clear grants no amnesty beyond "scan again"', () => {
     const rb = new RingBuffer();
-    const uri = 'file:///still-secret.env';
+    const uri = 'file:///still-secret.ts';
 
     rb.ingest(
-      candidate({ uri, filepath: 'still-secret.env', content: '-----BEGIN PRIVATE KEY-----', startLine: 0, endLine: 0 }),
+      candidate({ uri, filepath: 'still-secret.ts', content: '-----BEGIN PRIVATE KEY-----', startLine: 0, endLine: 0 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -235,7 +246,7 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
 
     // Still secret on re-ingest -> rejects again, re-quarantines.
     rb.ingest(
-      candidate({ uri, filepath: 'still-secret.env', content: '-----BEGIN PRIVATE KEY-----', startLine: 0, endLine: 0 }),
+      candidate({ uri, filepath: 'still-secret.ts', content: '-----BEGIN PRIVATE KEY-----', startLine: 0, endLine: 0 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -245,7 +256,7 @@ describe('RingBuffer.ingest — quarantine (strict, uri-scoped, fail-closed — 
     // Prove re-quarantine took effect: a DIFFERENT, individually-innocuous
     // window from the same uri is also dropped without another clear.
     rb.ingest(
-      candidate({ uri, filepath: 'still-secret.env', content: 'innocuous body', startLine: 3, endLine: 3 }),
+      candidate({ uri, filepath: 'still-secret.ts', content: 'innocuous body', startLine: 3, endLine: 3 }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );
@@ -346,7 +357,7 @@ describe('RingBuffer.ingest — epoch bumps only on accept', () => {
 
     // secret-reject drop
     rb.ingest(
-      candidate({ uri: 'file:///s.env', content: '-----BEGIN PRIVATE KEY-----' }),
+      candidate({ uri: 'file:///s.ts', content: '-----BEGIN PRIVATE KEY-----' }),
       ACTIVE_URI,
       DEFAULT_ANCHOR,
     );

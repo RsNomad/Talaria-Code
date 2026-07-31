@@ -433,3 +433,25 @@ describe('isSecretForCompletion — W6-FC: credentials.json + 4 adjacent filenam
     expect(isSecretForCompletion('/repo/CREDENTIALS.JSON')).toBe(true);
   });
 });
+
+describe('AUDIT-5 SEC M-1: the *.env SUFFIX convention (production.env / staging.env / config.env)', () => {
+  it.each(['production.env', 'config/staging.env', 'deploy/config.env', 'local.env', 'PRODUCTION.ENV'])(
+    'isSecretForCompletion(%j) is true — the systemd EnvironmentFile= / Docker naming the standard *.env scanner glob covers',
+    (p) => {
+      expect(isSecretForCompletion(p)).toBe(true);
+    },
+  );
+
+  it('isSecretForEditFloor inherits the arm (it IS the alias — one classifier, three surfaces)', () => {
+    expect(isSecretForEditFloor('production.env')).toBe(true);
+  });
+
+  it('classifyPath stays frozen: the suffix form is deliberately NOT added at the edit_approval.py-parity floor', () => {
+    expect(classifyPath('production.env').secret).toBe(false);
+  });
+
+  it('lookalikes stay allowed — no over-blocking', () => {
+    expect(isSecretForCompletion('src/environment.ts')).toBe(false);
+    expect(isSecretForCompletion('notes/agenda.envy')).toBe(false);
+  });
+});

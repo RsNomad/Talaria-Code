@@ -132,6 +132,9 @@ export function classifyPath(posixPath: string): { secret: boolean; protected: b
  * the default `AZURE_CONFIG_DIR` on Linux/macOS), matching the `.aws`/
  * `.gnupg`/`.kube` directory convention above. Same egress-only shape as
  * W6-FC/P7-N9 — `classifyPath` (the edit-approval floor) is untouched.
+ *
+ * AUDIT-5 SEC M-1: adds the `*.env` suffix arm — see the inline comment.
+ * Same egress-only shape; classifyPath untouched.
  */
 export function isSecretForCompletion(posixPath: string): boolean {
   const lower = posixPath.toLowerCase();
@@ -157,6 +160,22 @@ export function isSecretForCompletion(posixPath: string): boolean {
     basename === 'serviceaccount.json' ||
     basename === '.netrc' || basename === '.npmrc' ||
     basename === '.pgpass' || basename === '.pypirc' || basename === '.envrc' ||
+    // AUDIT-5 SEC M-1: the `*.env` SUFFIX convention (`production.env`,
+    // `staging.env`, `config.env` — systemd `EnvironmentFile=` / Docker /
+    // the standard `*.env` gitleaks/.gitignore glob). classifyPath (frozen)
+    // catches only the dotenv PREFIX forms `.env`/`.env.*`; this superset
+    // arm closes the suffix form for every consumer of
+    // `isSecretForCompletion` at once — active-file FIM egress (provider.ts
+    // — the one path with NO content-scan backstop, secretPaths.ts:90-92),
+    // the edit-floor auto-allow (isSecretForEditFloor alias), commit-gen
+    // diff context (host/context/sanitize.ts isSecretPath), AND the
+    // ring-buffer cross-file secret scanner's Layer 1 path check
+    // (autocomplete/context/secretScanner.ts's scanSnippetForSecrets, "no
+    // drift between the two call sites" per its own doc comment). Not an
+    // exhaustive enumeration by design — ANY future caller of this function
+    // inherits the arm too. Case-insensitive for free — this function
+    // classifies the lowercased path throughout.
+    basename.endsWith('.env') ||
     // W6-FC (IMPORTANT-1): credentials.json + 4 adjacent credential filenames.
     // `secrets.*` matches ANY non-empty extension after the `secrets.` stem
     // (`secrets.json`/`.yaml`/`.yml`/`.txt`/…) but not the bare basename
