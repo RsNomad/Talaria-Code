@@ -231,7 +231,10 @@ export async function resolveHermes(
 ): Promise<ResolvedHermes> {
   const hermesBin = await resolveHermesBin(config, exec);
   const python = config.pythonPath ?? deriveVenvPython(hermesBin);
-  const cwd = config.cwd ?? process.cwd();
+  // AUDIT-5 SEC M-3 (F-2): no workspace open -> the agent runs from $HOME,
+  // matching the manifest copy — never from process.cwd() (the EH inherits
+  // the VS Code install dir).
+  const cwd = config.cwd ?? os.homedir();
 
   return {
     hermesBin,

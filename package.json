@@ -265,7 +265,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Working directory for the Hermes agent process. Leave empty to use the first workspace folder. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: not workspace-overridable (security)."
+          "markdownDescription": "Working directory for the Hermes agent process. Leave empty to use the first workspace folder. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: not workspace-overridable (security). When no workspace folder is open, the user home directory is used."
         },
         "talaria.backend": {
           "type": "string",

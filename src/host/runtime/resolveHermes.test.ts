@@ -108,6 +108,12 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
       'exec /home/u/.venvs/hermes/bin/python -m tui_gateway.entry',
     );
   });
+
+  it('AUDIT-5 SEC M-3: with no workspace open (cwd undefined), resolveHermes falls back to os.homedir() — never process.cwd() (the EH install dir)', async () => {
+    const { exec } = fakeExec('/home/u/.venvs/hermes/bin/hermes\n');
+    const resolved = await resolveHermes({ cwd: undefined, shell: '/bin/bash' }, exec);
+    expect(resolved.cwd).toBe(os.homedir());
+  });
 });
 
 describe('package.json — R-A5: talaria.hermesPath is contributed machine-scoped and trust-restricted', () => {
