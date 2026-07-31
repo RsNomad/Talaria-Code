@@ -624,7 +624,7 @@ describe('NextEditHttpBackend.predict — D1 bounded JSON body reads (unbounded-
     const backend = makeBackend('ollama');
 
     await expect(backend.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
-      /FIM stream exceeded \d+ bytes without completing/,
+      /response exceeded \d+ bytes without completing/,
     );
   });
 
@@ -634,7 +634,7 @@ describe('NextEditHttpBackend.predict — D1 bounded JSON body reads (unbounded-
     const backend = makeBackend('openai-compat');
 
     await expect(backend.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
-      /FIM stream exceeded \d+ bytes without completing/,
+      /response exceeded \d+ bytes without completing/,
     );
   });
 });

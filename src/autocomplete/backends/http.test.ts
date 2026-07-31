@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   BackendHttpError,
   BackendStreamError,
+  StreamByteCapError,
   readNdjsonLines,
   readSseEvents,
   readOpenAiSseText,
@@ -169,8 +170,15 @@ describe('readNdjsonLines — MAX_STREAM_BYTES cap (D1)', () => {
     const { body, wasCancelled } = endlessGarbageStream();
     const iterator = readNdjsonLines({ body })[Symbol.asyncIterator]();
 
-    await expect(iterator.next()).rejects.toThrow(
-      `FIM stream exceeded ${MAX_STREAM_BYTES} bytes without completing`,
+    let caught: unknown;
+    try {
+      await iterator.next();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StreamByteCapError);
+    expect((caught as Error).message).toBe(
+      `response exceeded ${MAX_STREAM_BYTES} bytes without completing`,
     );
     expect(wasCancelled()).toBe(true);
   });
@@ -187,8 +195,15 @@ describe('readSseEvents — MAX_STREAM_BYTES cap (D1)', () => {
     const { body, wasCancelled } = endlessGarbageStream();
     const iterator = readSseEvents({ body })[Symbol.asyncIterator]();
 
-    await expect(iterator.next()).rejects.toThrow(
-      `FIM stream exceeded ${MAX_STREAM_BYTES} bytes without completing`,
+    let caught: unknown;
+    try {
+      await iterator.next();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StreamByteCapError);
+    expect((caught as Error).message).toBe(
+      `response exceeded ${MAX_STREAM_BYTES} bytes without completing`,
     );
     expect(wasCancelled()).toBe(true);
   });
@@ -419,6 +434,25 @@ describe('BackendStreamError', () => {
   });
 });
 
+// §6: the ONE class every byte-cap throw-site (readNdjsonLines,
+// readSseEvents, readJsonBounded) constructs — covering all four real
+// consumers (llama.cpp FIM, next-edit ollama, next-edit openai-compat,
+// embeddings). The message is neutral: it carries the cap number and
+// nothing else — never the word "FIM" (a label that lied for the
+// embeddings consumer), never a backend name, URL, or body fragment.
+describe('StreamByteCapError', () => {
+  it('is instanceof both StreamByteCapError and Error, sets .name, carries .cap, and the message contains only the cap number — never "FIM"', () => {
+    const err = new StreamByteCapError(MAX_STREAM_BYTES);
+
+    expect(err).toBeInstanceOf(StreamByteCapError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe('StreamByteCapError');
+    expect(err.cap).toBe(MAX_STREAM_BYTES);
+    expect(err.message).toBe(`response exceeded ${MAX_STREAM_BYTES} bytes without completing`);
+    expect(err.message).not.toContain('FIM');
+  });
+});
+
 describe('readJsonBounded — bounded non-streaming JSON body reads (D1)', () => {
   it('parses a normal, well-under-cap JSON body', async () => {
     const data = await readJsonBounded(streamFromChunks([JSON.stringify({ content: 'hello' })]));
@@ -427,17 +461,29 @@ describe('readJsonBounded — bounded non-streaming JSON body reads (D1)', () =>
 
   it('rejects an over-cap body without hanging, and the underlying reader observed cancel()', async () => {
     const { body, wasCancelled } = endlessGarbageStream();
-    await expect(readJsonBounded({ body })).rejects.toThrow(
-      `FIM stream exceeded ${MAX_STREAM_BYTES} bytes without completing`,
+    let caught: unknown;
+    try {
+      await readJsonBounded({ body });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StreamByteCapError);
+    expect((caught as Error).message).toBe(
+      `response exceeded ${MAX_STREAM_BYTES} bytes without completing`,
     );
     expect(wasCancelled()).toBe(true);
   });
 
   it('honors a custom cap override', async () => {
     const res = streamFromChunks(['x'.repeat(100)]);
-    await expect(readJsonBounded(res, 10)).rejects.toThrow(
-      'FIM stream exceeded 10 bytes without completing',
-    );
+    let caught: unknown;
+    try {
+      await readJsonBounded(res, 10);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StreamByteCapError);
+    expect((caught as Error).message).toBe('response exceeded 10 bytes without completing');
   });
 
   it('rejects (does not silently succeed) on a null body — matches response.json() throwing on an empty body', async () => {

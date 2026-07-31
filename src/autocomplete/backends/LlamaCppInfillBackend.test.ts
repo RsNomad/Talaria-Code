@@ -338,7 +338,7 @@ describe('LlamaCppInfillBackend.streamFim — D1 bounded JSON body reads (unboun
 
     const iterator = backend.streamFim(cleanReq(), new AbortController().signal)[Symbol.asyncIterator]();
     await expect(iterator.next()).rejects.toThrow(
-      /FIM stream exceeded \d+ bytes without completing/,
+      /response exceeded \d+ bytes without completing/,
     );
   });
 });

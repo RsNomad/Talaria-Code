@@ -269,7 +269,7 @@ describe('CF-21: bounded read (4 MiB cap) on the embeddings response', () => {
     const embedder = new HttpEmbedder({ endpoint: 'http://127.0.0.1:11434', model: 'm', fetchImpl });
 
     await expect(embedder.embed(['x'])).rejects.toThrow(
-      /FIM stream exceeded \d+ bytes without completing/,
+      /response exceeded \d+ bytes without completing/,
     );
   });
 
@@ -298,7 +298,7 @@ describe('CF-21: bounded read (4 MiB cap) on the embeddings response', () => {
     const embedder = new HttpEmbedder({ endpoint: 'http://127.0.0.1:11434', model: 'm', fetchImpl });
 
     await expect(embedder.embed(['x'])).rejects.toThrow(
-      /FIM stream exceeded \d+ bytes without completing/,
+      /response exceeded \d+ bytes without completing/,
     );
     expect(cancelled).toBe(true);
   });

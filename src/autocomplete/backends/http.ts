@@ -83,6 +83,28 @@ interface OpenAiSseChunk {
 export const MAX_STREAM_BYTES = 4 * 1024 * 1024;
 
 /**
+ * §6: the ONE class every byte-cap throw-site below constructs
+ * (`readNdjsonLines`, `readSseEvents`, `readJsonBounded`) — covering all
+ * four real consumers of the cap (llama.cpp FIM, next-edit ollama,
+ * next-edit openai-compat, embeddings). Replaces a per-call string that
+ * hardcoded the word "FIM" even on the embeddings path, where it was a
+ * lying label (the underlying cause — "exceeded the limit" — was honest;
+ * only the name was wrong). The message is a FIXED template naming only
+ * the byte cap itself — never a backend label, endpoint, or response body
+ * — so a shared class can't become a second per-path place to leak detail
+ * into free text.
+ */
+export class StreamByteCapError extends Error {
+  readonly cap: number;
+
+  constructor(cap: number) {
+    super(`response exceeded ${cap} bytes without completing`);
+    this.name = 'StreamByteCapError';
+    this.cap = cap;
+  }
+}
+
+/**
  * Ollama's `/api/generate` streams newline-delimited JSON objects (one per line;
  * the final one carries `"done": true`) — see runner-apis-howto.md §1a.
  */
@@ -109,7 +131,7 @@ export async function* readNdjsonLines(
         // ReadableStreamDefaultReader/cancel) — without this the hostile
         // firehose keeps filling the socket while the error propagates.
         await reader.cancel().catch(() => {});
-        throw new Error(`FIM stream exceeded ${MAX_STREAM_BYTES} bytes without completing`);
+        throw new StreamByteCapError(MAX_STREAM_BYTES);
       }
       buffer += decoder.decode(value, { stream: true });
 
@@ -182,7 +204,7 @@ export async function* readSseEvents(
       received += value.byteLength;
       if (received > MAX_STREAM_BYTES) {
         await reader.cancel().catch(() => {});
-        throw new Error(`FIM stream exceeded ${MAX_STREAM_BYTES} bytes without completing`);
+        throw new StreamByteCapError(MAX_STREAM_BYTES);
       }
       buffer += decoder.decode(value, { stream: true });
 
@@ -271,7 +293,7 @@ export async function readJsonBounded(
         received += value.byteLength;
         if (received > cap) {
           await reader.cancel().catch(() => {});
-          throw new Error(`FIM stream exceeded ${cap} bytes without completing`);
+          throw new StreamByteCapError(cap);
         }
         chunks.push(value);
       }
