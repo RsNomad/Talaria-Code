@@ -673,6 +673,98 @@ describe('CF-02: Enter/Tab are ignored while an IME composition is in flight', (
 });
 
 /**
+ * W4-T6 (UI#8): the textarea's accessible name used to come ONLY from its
+ * `placeholder` (HTML-AAM: an unlabelled `<textarea>`'s accessible name
+ * falls back to the `placeholder` attribute) — and that text CHANGES with
+ * `disabled`/`disabledPlaceholder` state ("Ask Talaria…" / "Connecting…" /
+ * the ARCH-1 session-lost copy), so a screen-reader user's landmark for "the
+ * message box" silently renamed itself across turns — a sub-fragile
+ * accessible name. A STABLE `aria-label="Message Talaria"` fixes it;
+ * `placeholder` stays exactly as it was, as the (secondary) inline hint.
+ */
+function renderComposerForAccessibleName(
+  overrides: { disabled?: boolean; disabledPlaceholder?: string } = {},
+) {
+  return render(
+    <Composer
+      tabId="tab-1"
+      draft=""
+      draftAttachments={[]}
+      onDraftChange={() => undefined}
+      onAttachAdd={() => undefined}
+      onAttachRemove={() => undefined}
+      preset="normal"
+      modelLabel="test-model"
+      busy={false}
+      disabled={overrides.disabled ?? false}
+      disabledPlaceholder={overrides.disabledPlaceholder}
+      activeModeId={null}
+      availableModes={[]}
+      onSetMode={async () => undefined}
+      initialHeight={120}
+      onHeightChange={() => undefined}
+      onSubmit={async () => undefined}
+      onCancel={() => undefined}
+      onSetPreset={async () => undefined}
+      onPickModel={() => undefined}
+      onNewSession={() => undefined}
+      availableCommands={[]}
+      searchFiles={async () => []}
+      pendingSeed={null}
+      onSeedApplied={() => undefined}
+    />,
+  );
+}
+
+describe('W4-T6 (UI#8): the composer textarea carries a STABLE accessible name', () => {
+  it('has aria-label="Message Talaria" in the default (enabled) state', () => {
+    renderComposerForAccessibleName();
+    expect(screen.getByRole('combobox', { name: 'Message Talaria' })).toBeInTheDocument();
+  });
+
+  it('the accessible name stays "Message Talaria" even while disabled with a DIFFERENT placeholder', () => {
+    renderComposerForAccessibleName({
+      disabled: true,
+      disabledPlaceholder: 'Session lost — load it again from History or start a new chat',
+    });
+    const textarea = screen.getByRole('combobox', { name: 'Message Talaria' });
+    expect(textarea).toHaveAttribute(
+      'placeholder',
+      'Session lost — load it again from History or start a new chat',
+    );
+    expect(textarea).toHaveAttribute('aria-label', 'Message Talaria');
+  });
+});
+
+/**
+ * W4-T6 (UI#8): the resize grabber's `aria-valuemax` was computed inline from
+ * `window.innerHeight` on every RENDER — which happened to track the real
+ * viewport for any render caused by SOME OTHER prop/state change, but
+ * nothing re-rendered the composer on an actual `resize` event with no other
+ * trigger, so the announced max lagged behind reality until the next
+ * unrelated re-render. Fixed with a `resize` listener that recomputes it
+ * directly.
+ */
+describe("W4-T6 (UI#8): the resize grabber's aria-valuemax recomputes on an actual window resize", () => {
+  it('updates aria-valuemax after a window resize event, with no other prop/state change', () => {
+    const original = window.innerHeight;
+    try {
+      Object.defineProperty(window, 'innerHeight', { value: 1000, configurable: true, writable: true });
+      renderComposerForAccessibleName();
+      const grabber = screen.getByRole('separator', { name: 'Resize composer' });
+      expect(grabber).toHaveAttribute('aria-valuemax', String(Math.round(1000 * 0.6)));
+
+      Object.defineProperty(window, 'innerHeight', { value: 400, configurable: true, writable: true });
+      fireEvent(window, new Event('resize'));
+
+      expect(grabber).toHaveAttribute('aria-valuemax', String(Math.round(400 * 0.6)));
+    } finally {
+      Object.defineProperty(window, 'innerHeight', { value: original, configurable: true, writable: true });
+    }
+  });
+});
+
+/**
  * CF-07 (L5 F-8): Explorer drag-drop must store an fsPath, not a raw
  * `file://` URI. `Attachment.path`'s contract is "Workspace path" (an
  * fsPath) — host-side `confineAttachmentPaths` (`src/host/backend/acp/

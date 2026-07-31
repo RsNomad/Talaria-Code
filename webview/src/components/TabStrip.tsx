@@ -73,9 +73,32 @@ export interface TabStripProps {
    * `selectBackendKind`); renders nothing for `'acp'`.
    */
   backendKind: BackendKind;
+  /**
+   * W4-T6 (UI#14): whether the shared chat tabpanel (`CHAT_TABPANEL_ID`,
+   * App.tsx) is CURRENTLY mounted — App.tsx only renders that wrapper while
+   * `state.activePanel === 'chat'`; every other side panel (Settings, Tools,
+   * ...) unmounts it. TabStrip itself always renders (it sits above the
+   * side-panel switch), so without this every tab's `aria-controls` would
+   * point at an id with no element in the DOM at all whenever a non-chat
+   * side panel is active — a dangling IDREF (axe `aria-valid-attr-value`).
+   * Gates ALL tabs uniformly (not just the active one): the mounted-ness
+   * depends on which SIDE PANEL is showing, not on which chat session tab is
+   * selected — every tab shares the same single tabpanel (this file's header
+   * doc).
+   */
+  chatPanelMounted: boolean;
 }
 
-export function TabStrip({ tabs, activeTabId, maxTabs, onSelect, onClose, onOpen, backendKind }: TabStripProps) {
+export function TabStrip({
+  tabs,
+  activeTabId,
+  maxTabs,
+  onSelect,
+  onClose,
+  onOpen,
+  backendKind,
+  chatPanelMounted,
+}: TabStripProps) {
   const atCap = tabs.length >= maxTabs;
   const canClose = tabs.length > 1;
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -116,7 +139,7 @@ export function TabStrip({ tabs, activeTabId, maxTabs, onSelect, onClose, onOpen
               id={tabDomId(tab.tabId)}
               role="tab"
               aria-selected={active}
-              aria-controls={CHAT_TABPANEL_ID}
+              aria-controls={chatPanelMounted ? CHAT_TABPANEL_ID : undefined}
               tabIndex={active ? 0 : -1}
               onClick={() => onSelect(tab.tabId)}
               onKeyDown={(e) => onTabKey(pos, e)}

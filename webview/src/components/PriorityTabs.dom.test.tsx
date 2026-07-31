@@ -98,3 +98,39 @@ describe('T-16 F9: the overflow trigger sits OUTSIDE the Panels tablist, not ins
     }
   });
 });
+
+/*
+ * W4-T6 (UI#14): App.tsx mounts each side panel's `role="tabpanel"` wrapper
+ * ONLY while `state.activePanel` equals that panel (`App.tsx`'s
+ * `state.activePanel === 'tools' && ...` chain) — so a PriorityTabs tab
+ * whose panel is NOT the active one points `aria-controls` at an id with no
+ * element in the DOM at all, a dangling IDREF (axe `aria-valid-attr-value`).
+ * Unlike TabStrip's single SHARED tabpanel (gated on a separate
+ * `chatPanelMounted` prop), here `active` already fully determines which
+ * panel is mounted — no new prop needed, just gating `aria-controls` on
+ * `tab.id === active` (the same boolean the row already computes for
+ * `aria-selected`).
+ */
+describe('W4-T6 (UI#14): aria-controls is a dangling IDREF on a PriorityTabs tab whose panel is not mounted', () => {
+  it('only the ACTIVE tab carries aria-controls — every other tab omits it (its panel is not mounted)', () => {
+    render(<PriorityTabs active="chat" onSelect={() => undefined} />);
+
+    const tabs = screen.getAllByRole('tab');
+    const active = tabs.find((t) => t.getAttribute('aria-selected') === 'true');
+    const inactive = tabs.filter((t) => t !== active);
+    expect(active).toHaveAttribute('aria-controls');
+    expect(inactive.length).toBeGreaterThan(0);
+    for (const t of inactive) {
+      expect(t).not.toHaveAttribute('aria-controls');
+    }
+  });
+
+  it('aria-controls tracks WHICH tab is active, not a fixed tab', () => {
+    render(<PriorityTabs active="settings" onSelect={() => undefined} />);
+
+    const chatTab = screen.getByRole('tab', { name: 'Chat' });
+    const settingsTab = screen.getByRole('tab', { name: 'Settings' });
+    expect(chatTab).not.toHaveAttribute('aria-controls');
+    expect(settingsTab).toHaveAttribute('aria-controls');
+  });
+});

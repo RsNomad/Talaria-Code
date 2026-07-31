@@ -274,16 +274,6 @@ export function App() {
     applyStandaloneTheme(state.theme.kind);
   }, [state.theme.kind]);
 
-  // Fire-and-forget control action (no return value awaited) — its effect
-  // surfaces via a server-initiated `panel.data` push. Panels use this for
-  // toggles/reloads/config edits.
-  const invoke = (method: string, params?: unknown) =>
-    bridge.post({
-      type: 'control.invoke',
-      method: method as ControlMethod,
-      params: params as Record<string, unknown> | undefined,
-    });
-
   // CF-13/D1: the Models panel's "Add key" affordance — posts ONLY the
   // provider slug. The host prompts for the key directly (masked) and
   // dispatches `model.save_key`; the key never enters the webview.
@@ -531,6 +521,12 @@ export function App() {
         onClose={closeTab}
         onOpen={openTab}
         backendKind={state.backendKind}
+        // W4-T6 (UI#14): the shared chat tabpanel (`CHAT_TABPANEL_ID`) is
+        // only ever mounted while the chat side-panel itself is the active
+        // one (see the `state.activePanel === 'chat'` wrapper below) — every
+        // OTHER side panel unmounts it. TabStrip needs this to know when its
+        // tabs' `aria-controls` would otherwise be a dangling IDREF.
+        chatPanelMounted={state.activePanel === 'chat'}
       />
 
       {/* Audit-3 I-2 (Task A-3): persistent, non-dismissible mock-mode
@@ -804,7 +800,7 @@ export function App() {
               loadingHint="Loading subagents…"
               onRetry={() => requestPanel('subagents')}
             >
-              {(data) => <SubagentsPanel data={data} onInvoke={invoke} />}
+              {(data) => <SubagentsPanel data={data} />}
             </RemotePanel>
           </ErrorBoundary>
         </div>

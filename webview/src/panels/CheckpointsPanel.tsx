@@ -15,7 +15,7 @@ import type { Checkpoint, CheckpointPhase, CheckpointRestoreResult, CheckpointsD
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
-import { PanelShell } from './PanelShell';
+import { EmptyPanel, PanelShell } from './PanelShell';
 
 /** CF-12/m-9: human label for a checkpoint row's {@link Checkpoint.phase}. */
 const PHASE_LABELS: Record<CheckpointPhase, string> = {
@@ -156,6 +156,21 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
         </div>
       </PanelShell>
     );
+  }
+
+  // W4-T6 (UI#8, state-parity): every other data panel with an emptyable
+  // list renders `EmptyPanel` at zero rows (`SessionsPanel.tsx`,
+  // `SubagentsPanel.tsx`, ...) — this was the one exception, falling through
+  // to a bare, empty `<ol>` with no hint text. Strictly AFTER the
+  // `available === false` branch above: an unavailable tracker still takes
+  // precedence over "genuinely empty" (git works, but no checkpoints have
+  // been captured yet). ALSO gated on `!data.redo`: an empty `checkpoints`
+  // list with a live `data.redo` target (CF-12/W3-T7 — the anchored-redo
+  // state can outlive every tracked checkpoint row) still has real,
+  // actionable content — the Redo/Redo all affordance below — so it must
+  // render that, not a bare "nothing here" hint that would hide it.
+  if (data.checkpoints.length === 0 && !data.redo) {
+    return <EmptyPanel hint="No checkpoints yet — they appear here after each turn." />;
   }
 
   /**

@@ -41,6 +41,7 @@ describe('B2: TabStrip implements APG tabs', () => {
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
@@ -67,6 +68,7 @@ describe('B2: TabStrip implements APG tabs', () => {
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
@@ -90,6 +92,7 @@ describe('B2: TabStrip implements APG tabs', () => {
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
@@ -113,6 +116,7 @@ describe('B2: TabStrip implements APG tabs', () => {
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
@@ -136,6 +140,7 @@ describe('B2: TabStrip implements APG tabs', () => {
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
@@ -162,6 +167,7 @@ describe('B2: TabStrip implements APG tabs', () => {
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
@@ -180,6 +186,7 @@ describe('B2: TabStrip implements APG tabs', () => {
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
@@ -211,6 +218,7 @@ describe('B2 item 4: tabs carry aria-controls + a stable id for the shared chat 
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
@@ -231,10 +239,78 @@ describe('B2 item 4: tabs carry aria-controls + a stable id for the shared chat 
         onClose={() => undefined}
         onOpen={() => undefined}
         backendKind="acp"
+        chatPanelMounted={true}
       />,
     );
 
     const closeAlpha = screen.getByRole('button', { name: 'Close Alpha' });
     expect(closeAlpha).not.toHaveAttribute('aria-controls');
+  });
+});
+
+/*
+ * W4-T6 (UI#14): the shared chat tabpanel (`CHAT_TABPANEL_ID`, App.tsx) is
+ * only ever MOUNTED while `state.activePanel === 'chat'` — TabStrip itself
+ * renders unconditionally (App.tsx:526, above the `PriorityTabs` side-panel
+ * switch), so once the user switches to a different side panel (Settings,
+ * Tools, ...) every chat-session tab's `aria-controls="chat-tabpanel"`
+ * pointed at an id with NO element in the DOM at all — a dangling IDREF (axe
+ * `aria-valid-attr-value`). `chatPanelMounted` (threaded from App.tsx as
+ * `state.activePanel === 'chat'`) makes that mounted-ness explicit: every
+ * tab omits `aria-controls` entirely while it's false, rather than pointing
+ * at a target that doesn't exist.
+ */
+describe('W4-T6 (UI#14): aria-controls is a dangling IDREF when the chat panel is not the mounted target', () => {
+  it('every tab OMITS aria-controls when chatPanelMounted is false (a side panel is active, no chat-tabpanel in the DOM)', () => {
+    render(
+      <TabStrip
+        tabs={THREE_TABS}
+        activeTabId="t2"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={false}
+      />,
+    );
+
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs).toHaveLength(3);
+    for (const tab of tabs) {
+      expect(tab).not.toHaveAttribute('aria-controls');
+    }
+  });
+
+  it('every tab carries aria-controls again once chatPanelMounted flips back to true', () => {
+    const { rerender } = render(
+      <TabStrip
+        tabs={THREE_TABS}
+        activeTabId="t2"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={false}
+      />,
+    );
+
+    rerender(
+      <TabStrip
+        tabs={THREE_TABS}
+        activeTabId="t2"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={true}
+      />,
+    );
+
+    for (const tab of screen.getAllByRole('tab')) {
+      expect(tab).toHaveAttribute('aria-controls', CHAT_TABPANEL_ID);
+    }
   });
 });

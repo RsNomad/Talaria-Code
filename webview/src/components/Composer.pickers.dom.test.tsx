@@ -115,6 +115,27 @@ describe('B3 (UI M-1): preset picker gains the APG menu keyboard contract', () =
 });
 
 /**
+ * W4-T6 (UI#8): both `role="menu"` popups carried no accessible name at all
+ * (no `aria-label`/`aria-labelledby` on the menu element itself) — APG's
+ * Menu pattern (https://www.w3.org/WAI/ARIA/apg/patterns/menu/, fetched live
+ * for this task): "An element with role menu either has: aria-labelledby set
+ * to a value that refers to the menuitem or button that controls its
+ * display[, or] a label provided by aria-label." `AttachMenu.tsx`'s own
+ * `role="menu"` already does this correctly (`aria-label="Attach"`) — these
+ * two were the exception, not the rule.
+ */
+describe('W4-T6 (UI#8): the preset menu carries an accessible name (APG: a menu MUST be labelled)', () => {
+  it('the preset menu is reachable as a NAMED role=menu, not an anonymous one', async () => {
+    const user = userEvent.setup();
+    const { container } = renderComposer();
+
+    await user.click(getPresetTrigger(container));
+
+    expect(screen.getByRole('menu', { name: 'Edit policy' })).toBeInTheDocument();
+  });
+});
+
+/**
  * T-16 F8 (Tier-2 §12.1): both pickers are single-select groups (exactly one
  * preset / one mode active at a time) but claimed plain `role="menuitem"`
  * with selection conveyed ONLY by a `text-accent` vs `text-muted` color class
@@ -257,5 +278,20 @@ describe('B3 (UI M-1): mode picker gains the APG menu keyboard contract', () => 
 
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+});
+
+/**
+ * W4-T6 (UI#8): the mode menu's half of the same unnamed-menu fix — see the
+ * preset menu's twin describe above for the full APG grounding.
+ */
+describe('W4-T6 (UI#8): the mode menu carries an accessible name (APG: a menu MUST be labelled)', () => {
+  it('the mode menu is reachable as a NAMED role=menu, not an anonymous one', async () => {
+    const user = userEvent.setup();
+    const { container } = renderComposer();
+
+    await user.click(getModeTrigger(container));
+
+    expect(screen.getByRole('menu', { name: 'Mode' })).toBeInTheDocument();
   });
 });

@@ -247,7 +247,13 @@ export function PriorityTabs({ active, onSelect }: PriorityTabsProps) {
                 id={panelTabDomId(tab.id)}
                 role="tab"
                 aria-selected={on}
-                aria-controls={panelTabpanelId(tab.id)}
+                // W4-T6 (UI#14): App.tsx mounts each panel's `role="tabpanel"`
+                // wrapper ONLY while it is the active one — a tab for any
+                // OTHER panel pointed `aria-controls` at an id with no
+                // element in the DOM at all, a dangling IDREF (axe
+                // `aria-valid-attr-value`). `on` already tells us exactly
+                // that: it's the same boolean driving `aria-selected`.
+                aria-controls={on ? panelTabpanelId(tab.id) : undefined}
                 tabIndex={on ? 0 : -1}
                 title={form === 'icon' ? tab.label : undefined}
                 aria-label={form === 'icon' ? tab.label : undefined}

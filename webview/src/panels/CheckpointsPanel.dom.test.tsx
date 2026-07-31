@@ -49,6 +49,74 @@ function renderPanel(config: {
   );
 }
 
+/**
+ * W4-T6 (UI#8, state-parity): every OTHER data panel with an emptyable list
+ * renders `EmptyPanel` at zero rows (`SessionsPanel.tsx`: "No past sessions
+ * yet.", `SubagentsPanel.tsx`: "No delegations yet — ..."). `CheckpointsPanel`
+ * was the one exception — at `data.checkpoints.length === 0` it fell through
+ * to `PanelShell` with a bare, empty `<ol>` (no hint text, nothing for a
+ * screen reader to announce). This does NOT touch the W3-T7 redo/restore
+ * logic — it only adds the same empty-state branch the other panels already
+ * have, gated strictly on the list being empty (the `data.available === false`
+ * "unavailable" branch above it is untouched and still takes precedence).
+ */
+describe('W4-T6 (UI#8): CheckpointsPanel renders an EmptyPanel at 0 checkpoints (parity with the other panels)', () => {
+  it('renders an empty-state hint, not a bare empty timeline, when data.checkpoints is []', () => {
+    const data: CheckpointsData = { checkpoints: [] };
+    render(
+      <CheckpointsPanel
+        data={data}
+        onRestore={async () => ({ restored: true, filesChanged: 0, changedPaths: [] })}
+        onRedo={neverRedo}
+        onRedoAll={neverRedo}
+      />,
+    );
+
+    expect(screen.getByText(/no checkpoints/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
+  });
+
+  it('the redo affordance still wins over the empty-state branch when checkpoints is [] but data.redo is present', () => {
+    // CF-12/W3-T7: the anchored-redo target can outlive every tracked
+    // checkpoint row (mirrors App.dom.test.tsx's `openCheckpointsWithRedo`
+    // fixture) — an empty list must NOT hide a genuinely actionable redo.
+    const data: CheckpointsData = {
+      checkpoints: [],
+      redo: { anchorId: 'anchor-1', cursorId: 'cursor-1' },
+    };
+    render(
+      <CheckpointsPanel
+        data={data}
+        onRestore={async () => ({ restored: true, filesChanged: 0, changedPaths: [] })}
+        onRedo={neverRedo}
+        onRedoAll={neverRedo}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Redo' })).toBeInTheDocument();
+    expect(screen.queryByText(/no checkpoints/i)).not.toBeInTheDocument();
+  });
+
+  it('the unavailable branch still wins over the empty-state branch when data.available is false', () => {
+    const data: CheckpointsData = {
+      checkpoints: [],
+      available: false,
+      unavailableReason: 'git not found on PATH',
+    };
+    render(
+      <CheckpointsPanel
+        data={data}
+        onRestore={async () => ({ restored: true, filesChanged: 0, changedPaths: [] })}
+        onRedo={neverRedo}
+        onRedoAll={neverRedo}
+      />,
+    );
+
+    expect(screen.getByText('Checkpoints unavailable')).toBeInTheDocument();
+    expect(screen.queryByText(/no checkpoints/i)).not.toBeInTheDocument();
+  });
+});
+
 describe('G-11: restoring the workspace is confirmed, locked and acknowledged', () => {
   it('the first click asks for confirmation and restores NOTHING', async () => {
     const restores: string[] = [];

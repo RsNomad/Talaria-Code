@@ -13,6 +13,7 @@
  */
 import type { SubagentsData, SubagentStatus } from '../protocol';
 import { totalLookup } from '../lookup';
+import { relativeAge } from '../relativeAge';
 import { Icon } from '../components/Icon';
 import { Pill, type PillTone } from '../components/Pill';
 import { EmptyPanel, PanelShell } from './PanelShell';
@@ -23,7 +24,11 @@ export const STATUS: Record<
   SubagentStatus,
   { tone: PillTone; label: string; icon: string; spin?: boolean }
 > = {
-  running: { tone: 'add', label: 'Running', icon: 'loading', spin: true },
+  // W4-T6 (UI#8): 'run' is the dedicated in-progress tone (`Pill.tsx`,
+  // `ToolCard.tsx`'s identical STATUS entry) — 'add' is 'complete's tone
+  // (success/green); reusing it here made a running delegation and a
+  // finished one visually indistinguishable at a glance.
+  running: { tone: 'run', label: 'Running', icon: 'loading', spin: true },
   complete: { tone: 'add', label: 'Complete', icon: 'check' },
   failed: { tone: 'del', label: 'Failed', icon: 'error' },
   // X4: the delegation's turn was cancelled/interrupted before it reported a
@@ -43,7 +48,6 @@ export const UNKNOWN_SUBAGENT_STATUS: { tone: PillTone; label: string; icon: str
 
 interface SubagentsPanelProps {
   data: SubagentsData;
-  onInvoke: (method: string, params?: unknown) => void;
 }
 
 export function SubagentsPanel({ data }: SubagentsPanelProps) {
@@ -56,6 +60,10 @@ export function SubagentsPanel({ data }: SubagentsPanelProps) {
       <div className="flex flex-col gap-2">
         {data.delegations.map((d) => {
           const st = totalLookup(STATUS, d.status, UNKNOWN_SUBAGENT_STATUS);
+          // W4-T6 (UI#8): relative-age parity with SessionsPanel's History
+          // rows — this used to render `d.startedAt` verbatim (a raw ISO
+          // timestamp) instead of going through the same shared helper.
+          const age = relativeAge(d.startedAt);
           return (
             <div key={d.id} className="rounded-card border border-border bg-surface px-3 py-2">
               <div className="flex items-start gap-2">
@@ -72,8 +80,8 @@ export function SubagentsPanel({ data }: SubagentsPanelProps) {
                   {d.detail && (
                     <div className="mt-1 whitespace-pre-wrap text-2xs text-muted">{d.detail}</div>
                   )}
-                  {d.startedAt && (
-                    <div className="mt-1 font-mono text-2xs text-faint">{d.startedAt}</div>
+                  {age && (
+                    <div className="mt-1 font-mono text-2xs text-faint">{age}</div>
                   )}
                 </div>
               </div>

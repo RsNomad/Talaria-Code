@@ -314,6 +314,21 @@ export function Composer({
   const [dragging, setDragging] = useState(false);
   const [narrow, setNarrow] = useState(false);
   const [height, setHeight] = useState(initialHeight);
+  /**
+   * W4-T6 (UI#8): the resize grabber's `aria-valuemax` (below) used to be a
+   * plain `const` recomputed from `window.innerHeight` inline in the render
+   * body — which happened to track the real viewport whenever SOME OTHER
+   * prop/state change caused a re-render, but nothing re-rendered this
+   * component on an actual window `resize` with no other trigger, so the
+   * announced max silently lagged behind reality (a stale snapshot, not a
+   * live one) until the next unrelated render. State + a `resize` listener
+   * makes it genuinely reactive. `clampH` below is UNCHANGED — it already
+   * reads `window.innerHeight` fresh at drag-time, which was always correct;
+   * only the DISPLAYED `aria-valuemax` was stale.
+   */
+  const [maxH, setMaxH] = useState(() =>
+    Math.round((typeof window !== 'undefined' ? window.innerHeight : 800) * 0.6),
+  );
   /** A2 (UI I-9): oversize-attachment / FileReader-error notice — surfaced
    * through the permanently-mounted `LiveRegion` below (Finding-7 discipline:
    * the region itself is never conditionally mounted, only this text is
@@ -366,6 +381,16 @@ export function Composer({
     ro.observe(el);
     setNarrow(el.getBoundingClientRect().width < NARROW);
     return () => ro.disconnect();
+  }, []);
+
+  // W4-T6 (UI#8): keeps `maxH` (the resize grabber's `aria-valuemax`) in
+  // sync with the ACTUAL viewport on a real window resize — see the state
+  // declaration's doc above for why the old inline-`const` computation went
+  // stale.
+  useEffect(() => {
+    const onResize = () => setMaxH(Math.round(window.innerHeight * 0.6));
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
   }, []);
 
   // Dismiss the preset picker on an outside press.
@@ -856,7 +881,6 @@ export function Composer({
   };
 
   const activePreset = PRESETS.find((p) => p.id === preset) ?? FIRST_PRESET;
-  const maxH = Math.round((typeof window !== 'undefined' ? window.innerHeight : 800) * 0.6);
 
   // W2 T2e (§2b/§7 A7): the chip row is a pure VIEW recomputed from `draft` on
   // every render — never a tracked side-array that could desync from what's
@@ -969,6 +993,15 @@ export function Composer({
           <textarea
             ref={taRef}
             role="combobox"
+            // W4-T6 (UI#8): the accessible name used to come ONLY from
+            // `placeholder` (HTML-AAM: an unlabelled textarea falls back to
+            // it) — but that text CHANGES with `disabled`/
+            // `disabledPlaceholder` state ("Ask Talaria…" / "Connecting…" /
+            // the session-lost copy), so a screen-reader user's landmark for
+            // "the message box" silently renamed itself across turns. A
+            // STABLE name fixes it; `placeholder` stays exactly as it was,
+            // as the (secondary) inline hint.
+            aria-label="Message Talaria"
             aria-expanded={openPopupId !== undefined}
             aria-controls={openPopupId}
             aria-activedescendant={activeOptId}
@@ -1054,6 +1087,14 @@ export function Composer({
             {presetMenu.open && (
               <div
                 role="menu"
+                // W4-T6 (UI#8): APG Menu pattern
+                // (https://www.w3.org/WAI/ARIA/apg/patterns/menu/, fetched
+                // live for this task): "An element with role menu either
+                // has: aria-labelledby ... [or] a label provided by
+                // aria-label." This menu carried neither — unlike
+                // `AttachMenu.tsx`'s own `role="menu"`, which already does
+                // (`aria-label="Attach"`).
+                aria-label="Edit policy"
                 onKeyDown={presetMenu.onMenuKey}
                 className="absolute bottom-full left-0 z-30 mb-1 min-w-[184px] overflow-hidden rounded-card border border-border bg-overlay py-1 shadow-lg"
               >
@@ -1122,6 +1163,9 @@ export function Composer({
               {modeMenu.open && (
                 <div
                   role="menu"
+                  // W4-T6 (UI#8): same unnamed-menu fix as the preset menu
+                  // above — see its comment for the APG grounding.
+                  aria-label="Mode"
                   onKeyDown={modeMenu.onMenuKey}
                   className="absolute bottom-full left-0 z-30 mb-1 min-w-[160px] overflow-hidden rounded-card border border-border bg-overlay py-1 shadow-lg"
                 >

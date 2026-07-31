@@ -13,6 +13,7 @@ import { Icon } from '../components/Icon';
 import { Pill } from '../components/Pill';
 import { EmptyPanel, PanelShell } from './PanelShell';
 import { loadMoreFooterState } from '../state/panels';
+import { relativeAge } from '../relativeAge';
 
 /** W4-T5b: the `tab.load` message a History row's click posts — routes the
  * load through the ACTIVE tab (`tabId`) instead of the legacy tabId-less
@@ -56,28 +57,6 @@ interface SessionsPanelProps {
    *  RemoteData so a failed append never wipes the list above. `undefined`
    *  when idle or after a successful retry. */
   loadMoreError?: string;
-}
-
-/**
- * Best-effort relative-age label. `SessionSummary.updatedAt`'s exact format
- * is NOT contractually pinned (`src/shared/protocol.ts`'s doc) — falls back
- * to the raw string when it doesn't parse as a date.
- */
-function relativeAge(updatedAt: string | undefined): string | undefined {
-  if (!updatedAt) return undefined;
-  const then = Date.parse(updatedAt);
-  if (Number.isNaN(then)) return updatedAt;
-
-  const deltaMs = Date.now() - then;
-  const minutes = Math.round(deltaMs / 60_000);
-  if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.round(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.round(days / 30);
-  return `${months}mo ago`;
 }
 
 export function SessionsPanel({

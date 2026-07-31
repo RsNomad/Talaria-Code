@@ -23,3 +23,17 @@ describe('SubagentsPanel status lookup (UI-I1)', () => {
     expect(result.tone).toBe('neutral');
   });
 });
+
+/**
+ * W4-T6 (UI#8): `running` used to share `tone: 'add'` with `complete` — the
+ * SAME green "success" tone for an in-progress delegation as a finished one.
+ * `ToolCard.tsx`'s STATUS map already established the vocabulary for this
+ * exact situation (`running: { tone: 'run', ... }`, the dedicated
+ * in-progress tone `Pill.tsx` defines); this pins SubagentsPanel onto it.
+ */
+describe('W4-T6: the "Running" status tone is unified with ToolCard.tsx (the dedicated "run" tone)', () => {
+  it('STATUS.running uses the "run" tone, not "add" (which complete already claims)', () => {
+    expect(STATUS.running.tone).toBe('run');
+    expect(STATUS.running.tone).not.toBe(STATUS.complete.tone);
+  });
+});
