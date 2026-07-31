@@ -346,3 +346,97 @@ describe('CF-09: reload prompt when talaria.backend changes', () => {
     expect(state.executedCommands).not.toContain('workbench.action.reloadWindow');
   });
 });
+
+/**
+ * §7 — every `talaria.rag.*` setting is read exactly once, at activation,
+ * and captured into the indexer/MCP-server opts (`extension.ts:606-688`,
+ * `RAG_SETTING_RELOAD` in `./rag/ragReloadSettings`). Flipping any of them
+ * is therefore a silently-broken setting until a manual window reload.
+ * Fix: a SECOND `onDidChangeConfiguration` listener, parallel to CF-09's
+ * `talaria.backend` one above (that listener and its tests are untouched by
+ * this block), that walks `RAG_SETTING_RELOAD` and prompts "reload to
+ * apply" whenever a `'reload'`-classified `talaria.rag.<key>` changes.
+ */
+describe('§7: reload prompt when a reload-gated talaria.rag.* setting changes', () => {
+  beforeEach(() => {
+    resetState();
+  });
+
+  /** Filters `state.infos` down to messages this listener produced (as
+   * opposed to CF-09's `talaria.backend` prompt, which uses different
+   * wording but also lands in the same `state.infos` array). */
+  function ragPrompts(): string[] {
+    return state.infos.filter((m) => /RAG setting changed/i.test(m));
+  }
+
+  it('shows a "reload to apply" prompt when talaria.rag.enabled changes', () => {
+    activate(makeFakeContext());
+
+    fireConfigChange((section) => section === 'talaria.rag.enabled');
+
+    expect(
+      ragPrompts().length,
+      `expected a RAG reload prompt, got infos: ${JSON.stringify(state.infos)}`,
+    ).toBe(1);
+  });
+
+  it('shows a "reload to apply" prompt when talaria.rag.embedEndpoint changes', () => {
+    activate(makeFakeContext());
+
+    fireConfigChange((section) => section === 'talaria.rag.embedEndpoint');
+
+    expect(
+      ragPrompts().length,
+      `expected a RAG reload prompt, got infos: ${JSON.stringify(state.infos)}`,
+    ).toBe(1);
+  });
+
+  it('does not show the RAG prompt when an unrelated setting changes (talaria.backend)', () => {
+    activate(makeFakeContext());
+
+    fireConfigChange((section) => section === 'talaria.backend');
+
+    expect(ragPrompts()).toEqual([]);
+  });
+
+  it('does not show the RAG prompt when an unrelated setting changes (editor.fontSize)', () => {
+    activate(makeFakeContext());
+
+    fireConfigChange((section) => section === 'editor.fontSize');
+
+    expect(ragPrompts()).toEqual([]);
+  });
+
+  it('shows exactly ONE prompt even when multiple rag.* keys are affected by the same event (dedup)', () => {
+    activate(makeFakeContext());
+
+    fireConfigChange(
+      (section) => section === 'talaria.rag.enabled' || section === 'talaria.rag.embedEndpoint',
+    );
+
+    expect(
+      ragPrompts().length,
+      `expected exactly one dedup'd prompt, got infos: ${JSON.stringify(state.infos)}`,
+    ).toBe(1);
+  });
+
+  it('reloads the window when the user accepts the "Reload Window" prompt action', async () => {
+    activate(makeFakeContext());
+    state.infoResponse = 'Reload Window';
+
+    fireConfigChange((section) => section === 'talaria.rag.enabled');
+    await flushMicrotasks();
+
+    expect(state.executedCommands).toContain('workbench.action.reloadWindow');
+  });
+
+  it('does not reload when the user dismisses the prompt without choosing an action', async () => {
+    activate(makeFakeContext());
+    state.infoResponse = undefined;
+
+    fireConfigChange((section) => section === 'talaria.rag.enabled');
+    await flushMicrotasks();
+
+    expect(state.executedCommands).not.toContain('workbench.action.reloadWindow');
+  });
+});

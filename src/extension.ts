@@ -8,6 +8,7 @@ import { AcpBackend } from './host/backend/AcpBackend';
 import type { HermesRuntimeConfig } from './host/runtime/resolveHermes';
 import { registerTalariaAutocomplete } from './autocomplete';
 import { createIndexer, type Indexer } from './rag/indexer';
+import { RAG_SETTING_RELOAD } from './rag/ragReloadSettings';
 import { selectBackendKind, shouldActivateLib, shouldActivateRag } from './host/trustGate';
 import { isHttpUrl } from './shared/url';
 import type { AcpMcpServerStdio } from './host/backend/acp/acpClient';
@@ -215,6 +216,42 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.window
         .showInformationMessage(
           'Talaria: backend setting changed — reload the window to apply.',
+          'Reload Window',
+        )
+        .then((choice) => {
+          if (choice === 'Reload Window') {
+            void vscode.commands.executeCommand('workbench.action.reloadWindow');
+          }
+        });
+    }),
+  );
+
+  // ── §7: prompt "reload to apply" on a reload-gated talaria.rag.* change ──
+  // Mirrors the `talaria.backend` listener directly above: all 8
+  // `talaria.rag.*` settings are read exactly once, at activation
+  // (`activateCodebaseRag` below), and captured into the
+  // indexer/MCP-server opts — see `RAG_SETTING_RELOAD` in
+  // `./rag/ragReloadSettings` for the exhaustive per-key classification and
+  // why each one is currently `'reload'` (none is re-read live). This
+  // listener walks THAT list rather than hardcoding keys, so a future
+  // `talaria.rag.*` addition is forced to be classified there (pinned by
+  // `ragReloadSettings.test.ts` against `package.json`) before it can be
+  // silently skipped here. Only `'reload'`-classified keys trigger the
+  // prompt; a `'live'` key (none exist today) would be intentionally
+  // excluded. A PROMPT ONLY — never an auto-reload, same rationale as the
+  // backend listener above. `.some(...)` collapses a single
+  // `onDidChangeConfiguration` event touching several rag keys at once into
+  // exactly one prompt (no per-key duplicate).
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      const anyReloadKeyAffected = Object.entries(RAG_SETTING_RELOAD).some(
+        ([key, classification]) =>
+          classification === 'reload' && e.affectsConfiguration(`talaria.rag.${key}`),
+      );
+      if (!anyReloadKeyAffected) return;
+      void vscode.window
+        .showInformationMessage(
+          'Talaria: RAG setting changed — reload the window to apply.',
           'Reload Window',
         )
         .then((choice) => {
