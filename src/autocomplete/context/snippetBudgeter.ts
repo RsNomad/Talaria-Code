@@ -17,6 +17,14 @@ import type { CrossFileMode, ScannedSnippet, SnippetSnapshot } from './types';
 const MODE_BUDGET_CHARS: Record<CrossFileMode, number> = {
   'input-extra': 2048,
   template: 1024,
+  // ⚠️ B-11 (budget mismatch — do not fall in the trap): this 512 is RAW content
+  // chars, but the downstream inject formatter's budget (mode.ts
+  // DEFAULT_INJECT_BUDGET_CHARS, ALSO 512) counts FORMATTED chars. The `// Path:` +
+  // per-line-comment overhead (~+55%) is UNACCOUNTED, so this ~512 raw becomes ~800
+  // formatted and the inject stage trims to ~2 snippets — ~40% of the budget this
+  // module hands downstream is discarded there. The two 512s are the same number in
+  // DIFFERENT UNITS; do not treat them as aligned. Kept as-is (O3); align-at-selection
+  // (O1) backlogged, trigger = B-12 live-usage data.
   'comment-inject': 512,
   none: 0,
 };

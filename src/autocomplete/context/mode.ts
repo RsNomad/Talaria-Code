@@ -42,6 +42,16 @@ export function crossFileMode(
   return 'none';
 }
 
+// ⚠️ B-11 (budget mismatch — do not fall in the trap): this 512 is FORMATTED-block
+// chars (the `// Path:` header + a `// ` prefix on every body line). The UPSTREAM
+// budget that SELECTS these snippets — snippetBudgeter.ts's
+// MODE_BUDGET_CHARS['comment-inject'], ALSO 512 — counts RAW content chars. The
+// formatting overhead between them (~+55%) is UNACCOUNTED, so ~512 raw approved
+// upstream arrives here as ~800 formatted and THIS stage trims it down to ~2 snippets.
+// The two 512s LOOK aligned but are in DIFFERENT UNITS — do NOT "sync" them without
+// accounting for the overhead. Kept as-is (decision O3); align-at-selection (O1) is
+// backlogged with an explicit trigger: only if B-12 live-usage logging shows this
+// (default-OFF) channel is actually used.
 const DEFAULT_INJECT_BUDGET_CHARS = 512;
 
 /** `// Path: <filepath>` + comment-prefixed body lines for one snippet. */
