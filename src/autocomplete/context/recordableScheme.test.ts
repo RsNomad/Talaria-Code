@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isRecordableScheme } from './recordableScheme';
+import { isRecordableScheme, isTriggerableScheme, isEditableUserDoc } from './recordableScheme';
 
 /**
  * CF-19 / W4-T3 — RED-first tests for the shared recording-side scheme gate.
@@ -39,5 +39,59 @@ describe('isRecordableScheme', () => {
 
   it('denies the empty string', () => {
     expect(isRecordableScheme('')).toBe(false);
+  });
+});
+
+/**
+ * §4 — `isRecordableScheme` is now the AND-composition
+ * `isTriggerableScheme(scheme) && isEditableUserDoc(scheme)`, so the
+ * subset relationship "record ⊆ trigger" is a structural fact about the
+ * composition, not a coincidence of two independently-maintained literal
+ * lists. `isTriggerableScheme` mirrors GATE-4's denylist shape (deny
+ * `vscode-scm`/`output`, allow everything else); `isEditableUserDoc` is the
+ * allowlist (`file`/`untitled`) that used to be `isRecordableScheme`'s
+ * entire body.
+ *
+ * This table pins the pair (canTrigger, canRecord) for every scheme GATE-4
+ * or the recording sites are known to care about, including three schemes
+ * `isTriggerableScheme` allows through but `isEditableUserDoc` still denies
+ * (`git`, `vscode-notebook-cell`, `search-editor`) plus two more of the same
+ * shape (`vscode-userdata`, `comment`) and the empty-string edge. It is NOT
+ * a test of "will a completion actually fire" — the full trigger path has
+ * additional gates (typed-length, widget focus, …) this table does not
+ * model.
+ */
+describe('isTriggerableScheme / isRecordableScheme — table + subset invariant', () => {
+  const table: ReadonlyArray<{ scheme: string; canTrigger: boolean; canRecord: boolean }> = [
+    { scheme: 'file', canTrigger: true, canRecord: true },
+    { scheme: 'untitled', canTrigger: true, canRecord: true },
+    { scheme: 'vscode-scm', canTrigger: false, canRecord: false },
+    { scheme: 'output', canTrigger: false, canRecord: false },
+    { scheme: 'git', canTrigger: true, canRecord: false },
+    { scheme: 'vscode-notebook-cell', canTrigger: true, canRecord: false },
+    { scheme: 'search-editor', canTrigger: true, canRecord: false },
+    { scheme: 'vscode-userdata', canTrigger: true, canRecord: false },
+    { scheme: 'comment', canTrigger: true, canRecord: false },
+    { scheme: '', canTrigger: true, canRecord: false },
+  ];
+
+  it.each(table)(
+    'scheme "$scheme": isTriggerableScheme=$canTrigger, isRecordableScheme=$canRecord',
+    ({ scheme, canTrigger, canRecord }) => {
+      expect(isTriggerableScheme(scheme)).toBe(canTrigger);
+      expect(isRecordableScheme(scheme)).toBe(canRecord);
+    },
+  );
+
+  it.each(table)('invariant: canRecord ⇒ canTrigger for scheme "$scheme"', ({ scheme }) => {
+    if (isRecordableScheme(scheme)) {
+      expect(isTriggerableScheme(scheme)).toBe(true);
+    }
+  });
+
+  it('isRecordableScheme is exactly isTriggerableScheme AND isEditableUserDoc, on every tabled scheme', () => {
+    for (const { scheme } of table) {
+      expect(isRecordableScheme(scheme)).toBe(isTriggerableScheme(scheme) && isEditableUserDoc(scheme));
+    }
   });
 });

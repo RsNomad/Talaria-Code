@@ -34,7 +34,7 @@ import { InsecureTransportError, isLoopbackHost } from '../backends/secureTransp
 import { isSecretForCompletion } from '../../shared/secretPaths';
 import { scanSnippetForSecrets } from '../context/secretScanner';
 import { createEditTrackerAdapter, type EditTrackerAdapter } from '../context/editTrackerAdapter';
-import { isRecordableScheme } from '../context/recordableScheme';
+import { isRecordableScheme, isTriggerableScheme } from '../context/recordableScheme';
 import type { FimActivityListener } from '../provider';
 import { regionAroundCursor, remapRange, type ContentChangeLite } from './anchors';
 import { NextEditHttpBackend } from './backend';
@@ -1185,7 +1185,7 @@ export function registerTalariaNextEdit(
     if (route.remote && !trusted) return;
 
     // GATE 4 — scheme filter, mirroring `provider.ts`.
-    if (document.uri.scheme === 'vscode-scm' || document.uri.scheme === 'output') return;
+    if (!isTriggerableScheme(document.uri.scheme)) return;
 
     // GATE 5 — secret-path skip, FIM parity (`08` §9.3). Secret-scan is NOT
     // inherited: this is the ACTIVE-FILE gate, and the request-level mint

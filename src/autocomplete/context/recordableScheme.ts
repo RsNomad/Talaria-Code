@@ -31,6 +31,36 @@
  * this is hygiene + correctness for WHICH documents ever reach the edit
  * ring/keystroke clock/next-edit arm at all.
  */
-export function isRecordableScheme(scheme: string): boolean {
+/**
+ * §4 — GATE-4's trigger-side denylist (`provider.ts`, `nextedit/shell.vscode.ts`),
+ * factored out as a predicate instead of two independently-hardcoded literal
+ * comparisons: any scheme other than `vscode-scm` (source-control input box)
+ * or `output` (Output panel) is triggerable. Same two-scheme denylist shape
+ * as before — this function does not change what GATE-4 denies, it just
+ * gives the comparison a name both call sites share.
+ */
+export function isTriggerableScheme(scheme: string): boolean {
+  return scheme !== 'vscode-scm' && scheme !== 'output';
+}
+
+/**
+ * §4 — the allowlist half of the old `isRecordableScheme` body: only `file`
+ * (on-disk) and `untitled` (unsaved new file) denote a real, user-owned
+ * editable document.
+ */
+export function isEditableUserDoc(scheme: string): boolean {
   return scheme === 'file' || scheme === 'untitled';
+}
+
+/**
+ * §4 — now a composition, not an independently-maintained literal list:
+ * "record ⊆ trigger" is a structural fact about AND-ing
+ * {@link isTriggerableScheme} with {@link isEditableUserDoc}, not a
+ * coincidence that has to be kept in sync by hand. Since `file`/`untitled`
+ * are never in GATE-4's denylist, `isTriggerableScheme` is always `true` on
+ * them, so this is behaviorally identical to the old
+ * `scheme === 'file' || scheme === 'untitled'` body on every input.
+ */
+export function isRecordableScheme(scheme: string): boolean {
+  return isTriggerableScheme(scheme) && isEditableUserDoc(scheme);
 }

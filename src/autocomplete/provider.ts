@@ -7,6 +7,7 @@ import type { FimContext } from './types';
 // — this file is an autocomplete leaf, not a host-policy consumer.
 import { isSecretForCompletion } from '../shared/secretPaths';
 import { CrossFileContextService, egressPreconditionsMet } from './context/contextService';
+import { isTriggerableScheme } from './context/recordableScheme';
 // A5: the typed errors this file's catch block narrows on.
 import { BackendHttpError, BackendStreamError } from './backends/http';
 import { InsecureTransportError } from './backends/secureTransport';
@@ -307,7 +308,7 @@ export class TalariaInlineCompletionProvider
     }
 
     // Skip generated/diff/output-ish schemes; only complete in real editable docs.
-    if (document.uri.scheme === 'vscode-scm' || document.uri.scheme === 'output') {
+    if (!isTriggerableScheme(document.uri.scheme)) {
       return null;
     }
 
