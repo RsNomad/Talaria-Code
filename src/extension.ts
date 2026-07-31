@@ -23,6 +23,7 @@ import { TerminalCapture } from './host/context/terminalCapture';
 import type { FindFilesFn } from './host/context/searchFilesResponse';
 import { createGitPort } from './host/scm/gitPort';
 import { registerEditorActions } from './host/commands/editorActions.vscode';
+import type { SeedTarget } from './host/commands/editorActions';
 import { TalariaCodeActionProvider } from './host/commands/TalariaCodeActionProvider';
 import { registerDiffDecisionCommands } from './host/commands/diffDecision.vscode';
 import { EditPreviewRegistry } from './host/preview/EditPreviewRegistry';
@@ -264,44 +265,79 @@ export function activate(context: vscode.ExtensionContext): void {
   updateReadyContext();
 
   // ── W2 T3 (§3.3): F-A code actions — editor submenu + QuickFix ───────────
-  // Registering the (inert until invoked) commands/provider is itself
-  // harmless (no process spawn, no I/O) — gated here anyway so it comes
-  // online/offline in lockstep with `talaria.ready`'s OWN gate (same
-  // trusted-∧-real-backend condition the RAG indexer/dashboard/checkpoint
-  // tracker above already use), never registered twice on a later trust
-  // grant. `TalariaCodeActionProvider` itself only ever SEEDS the composer
-  // (`editorActions.vscode.ts`) — never a `WorkspaceEdit`.
+  // CF-08 fix: these are the FIVE commands `package.json`'s
+  // `contributes.commands` declares (palette-visible — no `when:false`
+  // there), but the shipped DEFAULT is `talaria.backend: 'mock'`. Gating
+  // REGISTRATION itself on `isHermesReady()` (as this used to) left them
+  // palette-visible-but-unregistered on every default install: invoking one
+  // gave VS Code's raw `command 'talaria.addToChat' not found` error on
+  // first contact, instead of any message this extension controls. Fixed by
+  // registering unconditionally, ONCE, at activation — `editorActionsTarget`
+  // below is the actual gate now: it degrades to an honest "needs the real
+  // Hermes backend" notice per invocation instead of seeding the composer,
+  // whenever `isHermesReady()` is false, so a mock-mode invocation is never
+  // silent and never raw-errors. The editor-context SUBMENU's OWN
+  // `when: talaria.ready` (package.json) is UNCHANGED — it still correctly
+  // hides in mock mode; this fix is only about what happens when the
+  // commands are reached some other way (Command Palette, QuickFix).
+  // `editorActionsRegistered` is now a plain idempotency latch (register
+  // once), not an eligibility gate — the second call site below (on trust
+  // grant) is a no-op after the first.
   let editorActionsRegistered = false;
-  const registerEditorActionsIfEligible = (): void => {
-    if (editorActionsRegistered || !isHermesReady()) return;
+  /**
+   * A `SeedTarget` that wraps the real `provider` with the CF-08 degrade —
+   * kept here (not in `editorActions.vscode.ts`) so the fix stays entirely
+   * inside this file: `runSeedAction` (`editorActions.vscode.ts`) still
+   * always finishes its own snapshot/secret-floor work before handing a seed
+   * to `seedComposer`, exactly as before, but a seed only ever reaches the
+   * REAL provider (and therefore the panel) when `isHermesReady()` is true.
+   * `isHermesReady` is read at CALL time (not captured once), so a
+   * trust-triggered mock→real upgrade takes effect on the very next
+   * invocation — the same posture every other `isHermesReady()`/`getBackend`
+   * thunk in this file already has.
+   */
+  const editorActionsTarget: SeedTarget = {
+    seedComposer(seed) {
+      if (!isHermesReady()) {
+        void vscode.window.showWarningMessage(
+          'Talaria: editor actions need the real Hermes backend (talaria.backend = "acp").',
+        );
+        return;
+      }
+      provider.seedComposer(seed);
+    },
+  };
+  const registerEditorActionsOnce = (): void => {
+    if (editorActionsRegistered) return;
     editorActionsRegistered = true;
-    registerEditorActions(context, provider);
+    registerEditorActions(context, editorActionsTarget);
     context.subscriptions.push(
       vscode.languages.registerCodeActionsProvider('*', new TalariaCodeActionProvider(), {
         providedCodeActionKinds: TalariaCodeActionProvider.providedCodeActionKinds,
       }),
     );
   };
-  registerEditorActionsIfEligible();
+  registerEditorActionsOnce();
 
   // ── W2 T5c (F-C, §3.4): commit-gen `scm/title` $(sparkle) command ────────
-  // Same trust-gated latch posture as the editor actions above: registering
-  // the (inert until invoked) command is itself harmless, but it is gated
-  // here so it comes online/offline in lockstep with `talaria.ready`'s SAME
-  // trusted-∧-real-backend condition (`package.json`'s `scm/title` `when`
-  // clause repeats that condition on the button itself) — a real (not mock)
-  // backend is required anyway, since only `AcpBackend` implements the
-  // one-shot surface the command binds to (`generateCommitCommand.vscode.ts`'s
-  // `oneShotCapable` guard). `getBackend` is a thunk so the trust-upgrade
-  // mock→real swap below is reflected at invocation time, same as
-  // `registerDiffDecisionCommands` above.
+  // CF-08 fix: same posture as the editor actions above — register
+  // UNCONDITIONALLY (once) so `talaria.generateCommitMessage` is never
+  // palette-visible-but-unregistered under the default `mock` backend.
+  // `runGenerateCommitMessage` (`generateCommitCommand.vscode.ts`) already
+  // degrades correctly on its own: its `oneShotCapable(backend)` structural
+  // check (only `AcpBackend` implements `oneShot`) reads `getBackend()` at
+  // CALL time and shows the exact same "needs the real Hermes backend"
+  // notice before doing anything else — no change needed there. The
+  // `scm/title` button's OWN `when: talaria.ready` (package.json) is
+  // UNCHANGED — it still correctly hides in mock mode; only reachability via
+  // the Command Palette changes here.
   let generateCommitCommandRegistered = false;
-  const registerGenerateCommitMessageCommandIfEligible = (): void => {
-    if (generateCommitCommandRegistered || !isHermesReady()) return;
+  const registerGenerateCommitMessageCommandOnce = (): void => {
+    if (generateCommitCommandRegistered) return;
     generateCommitCommandRegistered = true;
     registerGenerateCommitMessageCommand(context, () => backend, output);
   };
-  registerGenerateCommitMessageCommandIfEligible();
+  registerGenerateCommitMessageCommandOnce();
 
   // ── Zone AC: inline (FIM) autocomplete ───────────────────────────────────
   // Self-registers its own disposables (config watcher, provider, secret) —
@@ -459,13 +495,18 @@ export function activate(context: vscode.ExtensionContext): void {
       // Mock backend instead of the freshly-upgraded `AcpBackend`.
       startLibIfEligible();
       // W2 T3 (§3.3): re-derive `talaria.ready` now that trust flipped — the
-      // Cody `cody.activated` re-set pattern — and bring the editor
-      // actions/QuickFix online if they weren't already (mirrors the RAG
-      // latch immediately above; both gate on the identical trusted-∧-acp
-      // condition).
+      // Cody `cody.activated` re-set pattern (drives the package.json
+      // `when: talaria.ready` submenu/button clauses, which are still
+      // trust-gated). CF-08: the two `*Once()` calls below are now idempotent
+      // no-ops here — both commands were already registered, unconditionally,
+      // at activation — kept only so a hypothetical future call-order change
+      // can't reintroduce a "registered nowhere" gap; `editorActionsTarget`'s
+      // OWN `isHermesReady()` re-check (evaluated at every invocation, not
+      // captured here) is what actually brings the degrade path online/offline
+      // as trust changes.
       updateReadyContext();
-      registerEditorActionsIfEligible();
-      registerGenerateCommitMessageCommandIfEligible();
+      registerEditorActionsOnce();
+      registerGenerateCommitMessageCommandOnce();
     }),
   );
 
