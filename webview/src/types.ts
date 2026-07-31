@@ -320,6 +320,17 @@ export interface AppState {
    * second store (P-1: never a routing key).
    */
   restoredTitles?: Record<string, string>;
+  /**
+   * AUDIT-5 UI M-2: a READ-ONLY boot-time snapshot of this connection's
+   * persisted, unsent per-tab Composer drafts, restored from
+   * `vscode.getState()` (App.tsx) and consumed exactly once by
+   * `foldHydrateReconcile` (transcript.ts) — same lifecycle/keying posture as
+   * {@link restoredTitles} (keyed by tabId, boot-only, never a second source
+   * of truth for `TabState.draft`). A LIVE draft on the reconciled base
+   * always wins over a restored one (see `foldHydrateReconcile`'s fold);
+   * `draftAttachments` are deliberately NOT restored (see `persist.ts`).
+   */
+  restoredDrafts?: Record<string, string>;
 }
 
 /** W2-F1 boot default — ask-everything until the host's live preset arrives. */
@@ -367,8 +378,14 @@ export { BOOTSTRAP_TAB_ID };
  * boot snapshot (see its doc on {@link AppState}); `restored.nextChatNumber`
  * is threaded straight through (2 = the current bootstrap default — the
  * bootstrap tab already occupies "Chat 1", so the next mint is "Chat 2").
+ * `restored.drafts` (AUDIT-5 UI M-2) becomes the read-only `restoredDrafts`
+ * boot snapshot, same posture as `tabTitles`/`restoredTitles`.
  */
-export function createInitialState(restored?: { tabTitles?: Record<string, string>; nextChatNumber?: number }): AppState {
+export function createInitialState(restored?: {
+  tabTitles?: Record<string, string>;
+  nextChatNumber?: number;
+  drafts?: Record<string, string>;
+}): AppState {
   return {
     tabs: { [BOOTSTRAP_TAB_ID]: makeTabState(BOOTSTRAP_TAB_ID, 'Chat 1') },
     tabOrder: [BOOTSTRAP_TAB_ID],
@@ -395,6 +412,7 @@ export function createInitialState(restored?: { tabTitles?: Record<string, strin
     closeIntents: [],
     nextChatNumber: restored?.nextChatNumber ?? 2,
     restoredTitles: restored?.tabTitles,
+    restoredDrafts: restored?.drafts,
   };
 }
 

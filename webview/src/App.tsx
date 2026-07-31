@@ -30,6 +30,7 @@ import type {
 } from './protocol';
 import { MAX_TABS } from './protocol';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
+import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
 import { errorMessage, fetchPanel, panelData, resolvePanelRequest } from './state/panels';
 import { idle } from './state/remoteData';
@@ -118,11 +119,19 @@ function modelLabel(state: AppState): string {
  * snapshot to also carry per-tab `tabTitles` (keyed by tabId) and
  * `nextChatNumber`, so a recreated view can hand both to `createInitialState`
  * and give a reconciled tab back its real `Chat N` identity instead of a
- * renumbered generic fallback (see `foldHydrateReconcile`). */
+ * renumbered generic fallback (see `foldHydrateReconcile`). AUDIT-5 UI M-2
+ * widens this again with `drafts` (also keyed by tabId) so an unsent Composer
+ * draft survives the same dispose+recreate instead of being silently dropped
+ * (see `state/persist.ts`'s `buildDraftSnapshot`). Every field here is
+ * OPTIONAL and additively versioned — a snapshot persisted by an older build
+ * (missing `drafts`, or missing everything) must restore without crashing;
+ * `createInitialState` and the callers below all treat every field as
+ * possibly absent. */
 interface PersistedState {
   composerHeight?: number;
   tabTitles?: Record<string, string>;
   nextChatNumber?: number;
+  drafts?: Record<string, string>;
 }
 
 export function App() {
@@ -238,7 +247,15 @@ export function App() {
         .filter((t): t is TabState => t !== undefined)
         .map((t) => [t.tabId, t.title]),
     );
-    bridge.setState({ composerHeight, tabTitles, nextChatNumber: state.nextChatNumber });
+    bridge.setState({
+      composerHeight,
+      tabTitles,
+      nextChatNumber: state.nextChatNumber,
+      // AUDIT-5 UI M-2: same per-write-derived-fresh posture as `tabTitles`
+      // above — a closed tab's stale draft is pruned automatically on the
+      // very next write, no separate cleanup path needed.
+      drafts: buildDraftSnapshot(state),
+    });
   }, [composerHeight, state.tabs, state.tabOrder, state.nextChatNumber]);
 
   // §7 B9(c): drain any tabIds `handleSessionChange`'s dedup queued for

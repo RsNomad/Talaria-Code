@@ -620,6 +620,12 @@ function foldHydrateReconcile(state: AppState, seed: WebviewState): AppState {
       // absent falls back to makeTabState's `false` default, same posture
       // as every other optional display field above.
       turnActive: entry.turnActive ?? false,
+      // AUDIT-5 UI M-2: a LIVE draft on `base` (already spread in above) always
+      // wins — `restoredDrafts` only fills a freshly-minted `makeTabState` base
+      // (draft: ''), giving an unsent Composer draft back after a
+      // memory-pressure webview dispose+recreate. Never restores
+      // `draftAttachments` (see `persist.ts`).
+      draft: base.draft || state.restoredDrafts?.[entry.tabId] || '',
     };
     tabOrder.push(entry.tabId);
   });

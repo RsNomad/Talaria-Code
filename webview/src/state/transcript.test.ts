@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { DataPanel, PanelDataMap, ThemeInfo } from '../protocol';
-import { BOOTSTRAP_TAB_ID, INITIAL_STATE, makeTabState, type AppState, type MessageItem } from '../types';
+import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type AppState, type MessageItem } from '../types';
 import { must } from '../testing/must';
 import { assertExhaustivePanel } from './panels';
 import { reduce, reduceLocal } from './transcript';
@@ -2046,5 +2046,49 @@ describe('transcript reducer — audit-3 Code Important: message.end must not du
     expect(msgs).toHaveLength(1);
     expect(msgs[0]?.text).toBe('Hi there');
     expect(msgs[0]?.streaming).toBe(false);
+  });
+});
+
+describe('AUDIT-5 UI M-2: restored drafts survive a webview dispose+recreate', () => {
+  it('RED: a hydrate-reconciled tab picks up its restored draft', () => {
+    const boot = createInitialState({ drafts: { 't-new': 'my unsent prompt' } });
+    const state = reduce(boot, {
+      type: 'hydrate',
+      state: {
+        sessionId: 's1',
+        theme,
+        backendKind: 'mock',
+        mode: 'default',
+        preset: 'manual',
+        currentModelId: null,
+        activePanel: 'chat',
+        tabs: [{ tabId: 't-new', sessionId: 's1', cwd: '/root-a', rootId: 'r1', preset: 'manual' as const }],
+      },
+    });
+    expect(state.tabs['t-new']?.draft).toBe('my unsent prompt');
+  });
+
+  it('a LIVE draft is never overwritten by a stale restored one', () => {
+    const boot = createInitialState({ drafts: { [BOOTSTRAP_TAB_ID]: 'stale restored text' } });
+    const bootTab = boot.tabs[BOOTSTRAP_TAB_ID];
+    if (!bootTab) throw new Error('bootstrap tab missing');
+    const withLiveDraft = {
+      ...boot,
+      tabs: { [BOOTSTRAP_TAB_ID]: { ...bootTab, draft: 'live text the user just typed' } },
+    };
+    const state = reduce(withLiveDraft, {
+      type: 'hydrate',
+      state: {
+        sessionId: 's1',
+        theme,
+        backendKind: 'mock',
+        mode: 'default',
+        preset: 'manual',
+        currentModelId: null,
+        activePanel: 'chat',
+        tabs: [{ tabId: BOOTSTRAP_TAB_ID, sessionId: 's1', cwd: '/root-a', rootId: 'r1', preset: 'manual' as const }],
+      },
+    });
+    expect(state.tabs[BOOTSTRAP_TAB_ID]?.draft).toBe('live text the user just typed');
   });
 });
