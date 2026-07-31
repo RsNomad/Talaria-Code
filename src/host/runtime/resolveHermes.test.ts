@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import {
   resolveHermes,
   resolveHermesBin,
@@ -75,6 +76,17 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
     resetHermesBinCache();
     const relative = fakeExec('hermes: aliased to hx\n');
     await expect(resolveHermesBin({}, relative.exec)).rejects.toThrow(/talaria\.hermesPath/);
+  });
+
+  it('AUDIT-5 SEC M-2: the login-shell discovery pins a NON-workspace cwd (os.homedir) so workspace auto-env hooks (direnv) can never steer PATH', async () => {
+    const seen: Array<{ timeoutMs: number; cwd: string }> = [];
+    const exec: ExecLookup = async (_cmd, _args, opts) => {
+      seen.push(opts);
+      return '/usr/local/bin/hermes\n';
+    };
+    resetHermesBinCache();
+    await resolveHermesBin({ hermesPath: undefined, pythonPath: undefined, cwd: undefined }, exec);
+    expect(seen[0]?.cwd).toBe(os.homedir());
   });
 
   it('resolveHermes derives the sibling venv python and both spawn specs from the discovered bin', async () => {

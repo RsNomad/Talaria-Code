@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { execFile } from 'node:child_process';
 
 /**
@@ -125,16 +126,28 @@ const HERMES_LOOKUP_TIMEOUT_MS = 10_000;
  * Test seam: run a command and resolve its stdout. Default = Node `execFile`
  * (its `timeout` option SIGTERMs the child on expiry — Node child_process
  * docs). Injectable so unit tests never spawn a real shell.
+ *
+ * `cwd` (AUDIT-5 SEC M-2, defensive hardening): pinned by the caller to
+ * `os.homedir()` for the login-shell `hermes` discovery spawn. This is NOT a
+ * fix for a working exploit — the filed direnv-PATH-steering chain does not
+ * reproduce (two independent dead links: the extension host's cwd is not the
+ * workspace, and direnv's auto-env hook only fires for interactive shells,
+ * never for a non-interactive `$SHELL -l -c` lookup). It closes the general
+ * cwd-sensitivity class instead: before this, the lookup child silently
+ * inherited whatever cwd the extension host happened to have, so any
+ * cwd-dependent logic in the user's own profile scripts (not just direnv)
+ * could influence PATH discovery. Pinning a non-workspace cwd converts that
+ * happenstance guarantee into a pinned one.
  */
 export type ExecLookup = (
   command: string,
   args: string[],
-  opts: { timeoutMs: number },
+  opts: { timeoutMs: number; cwd: string },
 ) => Promise<string>;
 
 const defaultExecLookup: ExecLookup = (command, args, opts) =>
   new Promise<string>((resolve, reject) => {
-    execFile(command, args, { timeout: opts.timeoutMs }, (err, stdout) => {
+    execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd }, (err, stdout) => {
       if (err) reject(err);
       else resolve(stdout);
     });
@@ -178,7 +191,12 @@ export async function resolveHermesBin(
   const lookup = loginShellSpawn('command', ['-v', 'hermes'], config, { exec: false });
   let stdout: string;
   try {
-    stdout = await exec(lookup.command, lookup.args, { timeoutMs: HERMES_LOOKUP_TIMEOUT_MS });
+    // AUDIT-5 SEC M-2 (defensive): pin a non-workspace cwd — see the ExecLookup
+    // doc-comment above for the full rationale (exploit chain dead, hardening kept).
+    stdout = await exec(lookup.command, lookup.args, {
+      timeoutMs: HERMES_LOOKUP_TIMEOUT_MS,
+      cwd: os.homedir(),
+    });
   } catch (err) {
     throw new Error(
       `Could not locate 'hermes' on the login-shell PATH ` +
