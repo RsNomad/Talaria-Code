@@ -69,12 +69,29 @@ interface SessionPlayer {
   /** Index in `mockTurn` the player is parked at, waiting on an approval; -1 when free. */
   parkedAt: number;
   preset: EditPolicyPreset;
+  /** W3-T8 (closes L1 m8): the text of the LATEST `prompt` this session
+   * received — restamped onto the scripted `user` step's text at replay
+   * time, in place of `mockTurn`'s canned string. Empty until a first
+   * `prompt` arrives (the scripted `user` step is only ever emitted after
+   * one has). */
+  promptText: string;
 }
 
-/** Shallow-restamp a scripted `HostToWebview` message onto `sessionId` — every
+/**
+ * Shallow-restamp a scripted `HostToWebview` message onto `sessionId` — every
  * `mockTurn` step bakes in a single fixed session id; replaying the SAME
- * script for a second, independent tab must not leak the first tab's id. */
-function restamp(msg: HostToWebview, sessionId: string): HostToWebview {
+ * script for a second, independent tab must not leak the first tab's id.
+ *
+ * W3-T8 (closes L1 m8): the scripted `user` step also bakes in CANNED text
+ * (`mockTurn`'s fixed "Refactor the login()..." string). Replaying that
+ * verbatim makes the F5 mock demo echo a prompt the person never typed —
+ * restamp the step's `text` with `promptText` (the ACTUAL incoming prompt)
+ * too, the same way `sessionId` is restamped. Every other scripted field
+ * (assistant steps, tools, timing, the frozen `mockTurn` data itself) is
+ * untouched.
+ */
+function restamp(msg: HostToWebview, sessionId: string, promptText: string): HostToWebview {
+  if (msg.type === 'user') return { ...msg, sessionId, text: promptText };
   if ('sessionId' in msg) return { ...msg, sessionId };
   return msg;
 }
@@ -108,7 +125,7 @@ export class MockBackend {
         this.hydrate();
         break;
       case 'prompt':
-        this.runTurn(msg.sessionId);
+        this.runTurn(msg.sessionId, msg.text);
         break;
       case 'newSession':
         // Legacy connection-global "start over" affordance (no sessionId on
@@ -218,7 +235,7 @@ export class MockBackend {
   }
 
   private registerPlayer(sessionId: string): void {
-    this.players.set(sessionId, { sessionId, timers: [], parkedAt: -1, preset: 'manual' });
+    this.players.set(sessionId, { sessionId, timers: [], parkedAt: -1, preset: 'manual', promptText: '' });
   }
 
   /** W4 §2d/§7 B12: mint the next scaffold session id (`mock-session-N`). */
@@ -368,24 +385,32 @@ export class MockBackend {
    * unregistered sessionId (a `prompt` for a session the mock never bound,
    * theoretically unreachable through the real App.tsx flow) is dropped
    * silently rather than fabricating a player, mirroring the reducer's own
-   * drop-unknown discipline. */
-  private runTurn(sessionId: string): void {
+   * drop-unknown discipline.
+   *
+   * W3-T8 (closes L1 m8): `text` is the prompt the user actually typed —
+   * stashed on the player so `playFrom` can restamp the scripted `user`
+   * step with it instead of replaying `mockTurn`'s canned string. */
+  private runTurn(sessionId: string, text: string): void {
     const player = this.players.get(sessionId);
     if (!player) return;
     this.clearTimers(player);
     player.parkedAt = -1;
+    player.promptText = text;
     this.playFrom(player, 0);
   }
 
   /** Walk `mockTurn` from step `i` for `player`'s OWN session, sleeping each
    * step's delay, parking on gates. Every emitted message is restamped onto
-   * `player.sessionId` — the P-1 isolation guarantee for the mock itself. */
+   * `player.sessionId` — the P-1 isolation guarantee for the mock itself —
+   * and the scripted `user` step is ALSO restamped onto `player.promptText`
+   * (W3-T8 / L1 m8), so the replayed turn echoes what this session's own
+   * user actually typed rather than `mockTurn`'s canned text. */
   private playFrom(player: SessionPlayer, i: number): void {
     if (i >= mockTurn.length) return;
     const step = mockTurn[i];
     if (step === undefined) return;
     this.at(player, step.delayMs, () => {
-      this.emit(restamp(step.message, player.sessionId));
+      this.emit(restamp(step.message, player.sessionId, player.promptText));
       if (step.gate) {
         player.parkedAt = i;
         return; // wait for the matching user response

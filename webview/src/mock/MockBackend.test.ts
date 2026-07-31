@@ -237,6 +237,59 @@ describe('webview MockBackend — ARCH-1 (final review, UI I-1) / T2: setModel e
 });
 
 /*
+ * W3-T8 (closes L1 m8): the scripted turn's `user` step carries CANNED text
+ * (`mockTurn`'s baked-in "Refactor the login() function..." string). When a
+ * real person types their own prompt into the F5 mock demo and sends it, the
+ * replayed transcript must echo what THEY typed, not the canned scenario
+ * text — otherwise the demo looks disconnected from the user's own input.
+ * Everything else in the scenario (assistant steps, tools, timing, the
+ * frozen `mockTurn` data itself) stays exactly as scripted; only the `user`
+ * step's `text` is restamped at replay time, the same way `sessionId`
+ * already is.
+ */
+describe('webview MockBackend — W3-T8: replays the ACTUALLY TYPED prompt (closes L1 m8)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("restamps the scripted user step's text with the incoming prompt text, not the canned scenario text", async () => {
+    vi.useFakeTimers();
+    const { backend, messages } = makeHarness();
+    backend.handle({ type: 'ready' });
+    const bootstrapId = (messages.find((m) => m.type === 'tab.bound') as { sessionId: string }).sessionId;
+
+    backend.handle({ type: 'prompt', sessionId: bootstrapId, text: 'HELLO FROM THE USER', mode: 'default' });
+    await vi.advanceTimersByTimeAsync(50);
+
+    const userStep = messages.find((m) => m.type === 'user') as { text: string } | undefined;
+    expect(userStep).toBeDefined();
+    expect(userStep?.text).toBe('HELLO FROM THE USER');
+  });
+
+  it('restamps independently per session — a second tab\'s own typed prompt never leaks into the first', async () => {
+    vi.useFakeTimers();
+    const { backend, messages } = makeHarness();
+    backend.handle({ type: 'ready' });
+    const bootstrapId = (messages.find((m) => m.type === 'tab.bound') as { sessionId: string }).sessionId;
+    backend.handle({ type: 'tab.open', tabId: 'tab-2' });
+    const tab2Id = (messages.filter((m) => m.type === 'tab.bound')[1] as { sessionId: string }).sessionId;
+
+    backend.handle({ type: 'prompt', sessionId: bootstrapId, text: 'first tab prompt', mode: 'default' });
+    backend.handle({ type: 'prompt', sessionId: tab2Id, text: 'second tab prompt', mode: 'default' });
+    await vi.advanceTimersByTimeAsync(50);
+
+    const bootstrapUser = messages.find(
+      (m) => m.type === 'user' && (m as { sessionId?: string }).sessionId === bootstrapId,
+    ) as { text: string } | undefined;
+    const tab2User = messages.find(
+      (m) => m.type === 'user' && (m as { sessionId?: string }).sessionId === tab2Id,
+    ) as { text: string } | undefined;
+    expect(bootstrapUser?.text).toBe('first tab prompt');
+    expect(tab2User?.text).toBe('second tab prompt');
+  });
+});
+
+/*
  * W5.1 R5 (Task 13): the standalone scaffold must model the Guard's ONE
  * invariant, not just ack the request. Blindly acking `nextEdit.toggle`
  * (the catch-all branch) let the dev app turn BOTH sources on at once —
