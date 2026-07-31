@@ -245,6 +245,26 @@ vi.mock('./backend', () => ({
   },
 }));
 
+/**
+ * CF-20-lazy — the construction-timing spy. Delegates to the REAL
+ * `createEditTrackerAdapter` (behaviour unchanged everywhere else) and only
+ * counts invocations, the same "spy that wraps the actual implementation"
+ * idiom `./backend` and `./scan` already use elsewhere in this suite.
+ */
+const editTrackerAdapterSpy = { constructCount: 0 };
+
+vi.mock('../context/editTrackerAdapter', async () => {
+  const actual =
+    await vi.importActual<typeof import('../context/editTrackerAdapter')>('../context/editTrackerAdapter');
+  return {
+    ...actual,
+    createEditTrackerAdapter: () => {
+      editTrackerAdapterSpy.constructCount += 1;
+      return actual.createEditTrackerAdapter();
+    },
+  };
+});
+
 import { registerTalariaNextEdit, fimActivityRelay } from './shell.vscode';
 import { NextEditGuard, NEXT_EDIT_TOGGLES_KEY } from './guard';
 import { applyToggleRequest, type ToggleRequest, type ToggleState } from './mode';
@@ -1672,5 +1692,128 @@ describe('the injected-probe technique matches the shared walker contract', () =
       typeof probe.content,
       'a ScannableSource literal content field must be a plain string, matching every real collected source',
     ).toBe('string');
+  });
+});
+
+// ═══════════════════════════════ CF-20-lazy ═══════════════════════════════════
+
+/**
+ * CF-20-lazy — next-edit's `createEditTrackerAdapter()` used to be built
+ * EAGERLY at registration, regardless of whether either next-edit toggle was
+ * ever turned on. It subscribes to `onDidChangeTextDocument` and
+ * `onDidChangeVisibleTextEditors` and folds every edit into a live diff ring
+ * plus a per-document shadow-text cache — real keystroke-hot-path cost a user
+ * who never enables next-edit paid forever, for a feature GATE 1 refuses to
+ * even build a request for. This lock proves construction is deferred to the
+ * Guard's FIRST toggle-on, and memoized so a later toggle never rebuilds it.
+ */
+
+/** Unlike the file's shared `setupShell` (which discards the Guard), these
+ *  tests need to drive `guard.requestToggle` directly. */
+async function setupShellWithGuard(toggles: ToggleState): Promise<{
+  guard: NextEditGuard;
+  disposable: vscodeTypes.Disposable;
+}> {
+  const guard = await NextEditGuard.hydrate(makeRecordingMemento(toggles).memento, {
+    reportFailure: SHELL_DEPS.reportFailure,
+  });
+  const disposable = registerTalariaNextEdit(makeContext(), guard, SHELL_DEPS);
+  return { guard, disposable };
+}
+
+describe('CF-20-lazy LOCK: the next-edit edit-tracker adapter is constructed on first toggle-on, not eagerly', () => {
+  beforeEach(resetR2);
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  beforeEach(() => {
+    editTrackerAdapterSpy.constructCount = 0;
+  });
+
+  /**
+   * NON-VACUITY CONTROL. A Guard already ON at registration (state persisted
+   * from a previous session, so no `onDidChange` fires this session) must
+   * still build the adapter — proving the spy fires for real construction at
+   * all before the "never constructed" assertions below lean on its silence.
+   */
+  it('CONTROL: a Guard already ON at registration builds the adapter immediately', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShellWithGuard({ next: true, generic: false });
+
+    expect(
+      editTrackerAdapterSpy.constructCount,
+      'NON-VACUITY CONTROL failed: a Guard already ON at registration must build the adapter — if this is 0 too, the whole lock below is testing a spy that never fires',
+    ).toBe(1);
+  });
+
+  it('with BOTH toggles OFF, the adapter is NEVER constructed — not at registration, not across a trigger attempt', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShellWithGuard({ next: false, generic: false });
+
+    await fireTrigger();
+
+    expect(
+      editTrackerAdapterSpy.constructCount,
+      'CF-20-lazy failed: with both next-edit toggles OFF, createEditTrackerAdapter must never be invoked',
+    ).toBe(0);
+  });
+
+  it('the Guard\'s FIRST toggle-on constructs the adapter exactly once', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    const { guard } = await setupShellWithGuard({ next: false, generic: false });
+    expect(editTrackerAdapterSpy.constructCount, 'setup: nothing built before any toggle').toBe(0);
+
+    await guard.requestToggle({ source: 'next', on: true });
+
+    expect(
+      editTrackerAdapterSpy.constructCount,
+      'CF-20-lazy failed: the Guard\'s first toggle-on must construct the adapter',
+    ).toBe(1);
+  });
+
+  it('a SECOND toggle-on (off, then on again) REUSES the memoized adapter — built at most once', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    const { guard } = await setupShellWithGuard({ next: false, generic: false });
+
+    await guard.requestToggle({ source: 'next', on: true });
+    expect(editTrackerAdapterSpy.constructCount, 'setup: the first toggle-on must have built it once').toBe(1);
+
+    await guard.requestToggle({ source: 'next', on: false });
+    await guard.requestToggle({ source: 'next', on: true });
+
+    expect(
+      editTrackerAdapterSpy.constructCount,
+      'CF-20-lazy failed: a later toggle-on must REUSE the memoized adapter, not rebuild it',
+    ).toBe(1);
+  });
+
+  it('switching sources (NEXT off, GENERIC on) after the first toggle-on still reuses the memoized adapter', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    const { guard } = await setupShellWithGuard({ next: false, generic: false });
+
+    await guard.requestToggle({ source: 'next', on: true });
+    expect(editTrackerAdapterSpy.constructCount).toBe(1);
+
+    await guard.requestToggle({ source: 'next', on: false });
+    await guard.requestToggle({ source: 'generic', on: true });
+
+    expect(
+      editTrackerAdapterSpy.constructCount,
+      'CF-20-lazy failed: a toggle-on via the OTHER source must also reuse the memoized adapter',
+    ).toBe(1);
+  });
+
+  it('regression: next-edit still builds a request once toggled on — no behavior change when enabled', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    const { guard } = await setupShellWithGuard({ next: false, generic: false });
+
+    await guard.requestToggle({ source: 'next', on: true });
+    await fireTrigger();
+
+    expect(
+      backendSpy.predicts,
+      'CF-20-lazy regression: next-edit must still build a request once toggled on, after the lazily-constructed adapter is in place',
+    ).toHaveLength(1);
   });
 });

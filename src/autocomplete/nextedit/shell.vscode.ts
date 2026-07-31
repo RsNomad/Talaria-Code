@@ -33,7 +33,7 @@ import { BackendHttpError } from '../backends/http';
 import { InsecureTransportError, isLoopbackHost } from '../backends/secureTransport';
 import { isSecretForCompletion } from '../../shared/secretPaths';
 import { scanSnippetForSecrets } from '../context/secretScanner';
-import { createEditTrackerAdapter } from '../context/editTrackerAdapter';
+import { createEditTrackerAdapter, type EditTrackerAdapter } from '../context/editTrackerAdapter';
 import { isRecordableScheme } from '../context/recordableScheme';
 import type { FimActivityListener } from '../provider';
 import { regionAroundCursor, remapRange, type ContentChangeLite } from './anchors';
@@ -45,7 +45,7 @@ import { genericInstructFormat } from './formats/genericInstruct';
 import { sweepV2Format } from './formats/sweepV2';
 import type { NextEditFormat } from './formats/types';
 import { NextEditGuard } from './guard';
-import type { NextEditMode, ToggleRequest, ToggleState } from './mode';
+import { resolveNextEditMode, type NextEditMode, type ToggleRequest, type ToggleState } from './mode';
 import { mintScannedNextEditRequest, NextEditMintRejectionError } from './scan';
 import type {
   AnchoredProposal,
@@ -797,7 +797,51 @@ export function registerTalariaNextEdit(
     return fim.visible || fim.inFlightCount > 0;
   }
   const debouncer = new AutocompleteDebouncer();
-  const editTracker = createEditTrackerAdapter();
+
+  /**
+   * CF-20-lazy — `createEditTrackerAdapter()` is next-edit's HALF of two
+   * complete edit-tracking pipelines that used to run on the keystroke hot
+   * path regardless of whether next-edit was ever reachable: it subscribes
+   * to `onDidChangeTextDocument`/`onDidChangeVisibleTextEditors` and folds
+   * every edit into a live diff ring plus a per-document shadow-text cache
+   * (`editTrackerAdapter.ts`). A user who never enables EITHER next-edit
+   * toggle used to pay that cost forever, for a feature that GATE 1 below
+   * refuses to even build a request for. FIM's own tracker
+   * (`context/contextService.vscode.ts`) is a wholly separate instance and
+   * is unaffected by this — that half was never gated by these toggles.
+   *
+   * Deferred to the Guard's FIRST toggle-on and memoized: built at most
+   * once per registration, and every later toggle reuses the same instance
+   * rather than rebuilding it.
+   *
+   * Why this reads `ToggleState` (via `guard.getState()` / the change
+   * listener's own argument) and resolves it with `resolveNextEditMode`
+   * rather than calling `guard.getMode()`: the read-through-hazard source
+   * lock further down this file (`shell.vscode.test.ts`, "the trigger
+   * snapshots the mode ONCE") pins `guard.getMode()` to EXACTLY one call
+   * site, inside `trigger()`. A second call site here would trip it, and
+   * would also (for the reason that lock exists) risk answering
+   * differently mid-flight from the read `trigger()` already took.
+   */
+  let editTrackerInstance: EditTrackerAdapter | null = null;
+  function ensureEditTracker(): EditTrackerAdapter {
+    if (editTrackerInstance === null) {
+      editTrackerInstance = createEditTrackerAdapter();
+    }
+    return editTrackerInstance;
+  }
+  function buildEditTrackerOnToggleOn(toggles: ToggleState): void {
+    if (resolveNextEditMode(toggles.next, toggles.generic) !== 'off') {
+      ensureEditTracker();
+    }
+  }
+  // Covers a Guard hydrated ALREADY on (state persisted from a previous
+  // session) — no `onDidChange` event fires this session in that case, so
+  // without this check the adapter would never be built at all and
+  // next-edit would run silently inert (no pre-edit shadow, an always-empty
+  // diff ring) until the user toggled it off and back on.
+  buildEditTrackerOnToggleOn(guard.getState());
+  const guardToggleSubscription = guard.onDidChange(buildEditTrackerOnToggleOn);
 
   /**
    * F-4 — the one-shot failure surface, mirroring `provider.ts`'s
@@ -1157,7 +1201,7 @@ export function registerTalariaNextEdit(
       new vscode.Range(span.startLine, 0, span.endLine, regionEndLength),
     );
     const docText = document.getText();
-    const preEditDocText = editTracker.getPreEditText(uri) ?? null;
+    const preEditDocText = ensureEditTracker().getPreEditText(uri) ?? null;
     // C-3 / ADR-018 — `preEditRegion` is extracted from the FULL pre-edit
     // text, BEFORE windowing. The region and the doc-level window are
     // independent (exactly as in the vendor script: `block` is ±10 lines,
@@ -1181,7 +1225,7 @@ export function registerTalariaNextEdit(
     // mint ever sees it. `changesAboveCursor` reads the same kept list, so the
     // structural heuristic and the egressing payload describe one history.
     const ringDiffs = partitionEgressableDiffs(
-      editTracker.tracker.getRecentDiffs(),
+      ensureEditTracker().tracker.getRecentDiffs(),
       route.format.sentinels,
     );
     const diffs = ringDiffs.kept;
@@ -1463,13 +1507,17 @@ export function registerTalariaNextEdit(
     acceptCommand,
     dismissCommand,
     onFimAcceptCommand,
-    editTracker,
+    guardToggleSubscription,
     regionDecoration,
     locatorDecoration,
     {
       dispose: () => {
         disposed = true;
         abortInFlight();
+        // CF-20-lazy: the adapter may never have been built at all (both
+        // toggles stayed off for the whole registration) — `?.` rather than
+        // an unconditional `.dispose()`.
+        editTrackerInstance?.dispose();
         // BF-B's liveness idiom (`SessionController.ts`'s `disposed` re-check),
         // applied to a MODULE-level slot: clear the relay only while THIS
         // registration still owns it. Disposing a registration that a newer
