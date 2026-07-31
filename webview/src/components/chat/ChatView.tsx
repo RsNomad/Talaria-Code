@@ -175,6 +175,43 @@ export function settlementAnnouncement(transcript: TranscriptItem[]): string {
   return '';
 }
 
+/**
+ * W2 T9 (UI#10): one transcript entry, memoized. Before this, every item was
+ * rendered inline inside `transcript.map` — a plain function call with no
+ * component boundary of its own — so a streaming text delta to the NEWEST
+ * item (which replaces that one item's object in the array, per the
+ * reducer's immutable-update discipline) forced React to re-diff every
+ * PRIOR row's subtree too, even though their `item` reference never
+ * changed. Wrapping the row itself in `memo` lets React bail out of a row
+ * whose props are unchanged by reference/value, so only the row that
+ * actually changed re-renders.
+ *
+ * `pending`/`denied` are passed down as plain booleans (not the `Set`s they
+ * were read from) specifically so memo's default shallow-equal prop check
+ * works: the `Set` objects `pendingDiffToolIds`/`deniedToolIds` return are
+ * fresh on every `ChatView` render, but the boolean each row derives from
+ * them is referentially irrelevant — primitives compare by value, so a row
+ * bails out whenever its OWN pending/denied status is unchanged even though
+ * the source `Set` is a new object every time.
+ */
+const TranscriptRow = memo(function TranscriptRow({
+  item,
+  onApproval,
+  onDiff,
+  onOpenDiff,
+  pending,
+  denied,
+}: {
+  item: TranscriptItem;
+  onApproval: ChatViewProps['onApproval'];
+  onDiff: ChatViewProps['onDiff'];
+  onOpenDiff: ChatViewProps['onOpenDiff'];
+  pending: boolean;
+  denied: boolean;
+}) {
+  return <>{renderItem(item, onApproval, onDiff, onOpenDiff, pending, denied)}</>;
+});
+
 /** A tool card plus any diffs it produced. Diffs share one global hunk index space. */
 function ToolWithDiffs({
   item,
@@ -213,13 +250,22 @@ function ToolWithDiffs({
   );
 }
 
+/**
+ * W2 T9 (UI#10): `pending`/`denied` are now plain booleans — ALREADY
+ * resolved against this item's own `toolId` by the caller — rather than the
+ * raw `pendingToolIds`/`deniedIds` Sets. See `TranscriptRow`'s doc comment
+ * for why: passing a fresh-every-render `Set` down would defeat the memo
+ * wrapping this function's result, since every row would see a new prop
+ * identity on every `ChatView` render regardless of whether ITS status
+ * actually changed.
+ */
 function renderItem(
   item: TranscriptItem,
   onApproval: ChatViewProps['onApproval'],
   onDiff: ChatViewProps['onDiff'],
   onOpenDiff: ChatViewProps['onOpenDiff'],
-  pendingToolIds: Set<string>,
-  deniedIds: Set<string>,
+  pending: boolean,
+  denied: boolean,
 ) {
   switch (item.kind) {
     case 'user':
@@ -234,8 +280,8 @@ function renderItem(
           item={item}
           onDiff={onDiff}
           onOpenDiff={onOpenDiff}
-          pending={pendingToolIds.has(item.toolId)}
-          denied={deniedIds.has(item.toolId)}
+          pending={pending}
+          denied={denied}
         />
       );
     case 'approval':
@@ -402,7 +448,14 @@ export const ChatView = memo(function ChatView({
         >
           {transcript.map((item, i) => (
             <div key={itemKey(item, i)}>
-              {renderItem(item, onApproval, onDiff, onOpenDiff, pendingToolIds, deniedIds)}
+              <TranscriptRow
+                item={item}
+                onApproval={onApproval}
+                onDiff={onDiff}
+                onOpenDiff={onOpenDiff}
+                pending={item.kind === 'tool' && pendingToolIds.has(item.toolId)}
+                denied={item.kind === 'tool' && deniedIds.has(item.toolId)}
+              />
             </div>
           ))}
           <div ref={endRef} />

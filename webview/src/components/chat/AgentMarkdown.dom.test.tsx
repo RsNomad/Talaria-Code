@@ -92,3 +92,107 @@ describe('C2: fence gate diverges from CommonMark when settled; links; #{4,6} he
     expect(heading.tagName).toBe('H6');
   });
 });
+
+/**
+ * W2 T9 (UI#2): markdown v2 — italic, nested lists, blockquote, pipe tables.
+ * The renderer previously stopped at bold/code/link/heading, so `*italic*`
+ * showed literal asterisks, nested lists rendered flat (indentation
+ * stripped), and `>` quotes / `|` tables rendered as raw source text. Same
+ * CSP-safe parse-to-React-elements posture as the rest of this file — no
+ * dangerouslySetInnerHTML, no markdown library.
+ */
+describe('W2 T9: markdown v2 — italic, nested lists, blockquote, tables', () => {
+  it('renders *star* italics as a real <em>, not literal asterisks', () => {
+    render(<AgentMarkdown text={'this is *important* text'} />);
+    const em = screen.getByText('important');
+    expect(em.tagName).toBe('EM');
+    expect(screen.queryByText(/\*important\*/)).not.toBeInTheDocument();
+  });
+
+  it('renders _underscore_ italics as a real <em>, not literal underscores', () => {
+    render(<AgentMarkdown text={'this is _important_ text'} />);
+    const em = screen.getByText('important');
+    expect(em.tagName).toBe('EM');
+    expect(screen.queryByText(/_important_/)).not.toBeInTheDocument();
+  });
+
+  it('still renders **bold** as <strong>, not <em>, alongside italics (no regression)', () => {
+    render(<AgentMarkdown text={'*italic* and **bold** together'} />);
+    expect(screen.getByText('italic').tagName).toBe('EM');
+    expect(screen.getByText('bold').tagName).toBe('STRONG');
+  });
+
+  it('renders an indented nested list as a nested <ul> inside the parent <li>', () => {
+    render(
+      <AgentMarkdown
+        text={'- item one\n  - nested a\n  - nested b\n- item two'}
+      />,
+    );
+    const lists = screen.getAllByRole('list');
+    // Outer list + one nested list.
+    expect(lists).toHaveLength(2);
+    const outer = lists[0]!;
+    const nested = outer.querySelector('ul');
+    expect(nested).not.toBeNull();
+    expect(nested?.querySelectorAll('li')).toHaveLength(2);
+    expect(screen.getByText('nested a')).toBeInTheDocument();
+    expect(screen.getByText('nested b')).toBeInTheDocument();
+    // No raw leading-dash/indentation markers leaked into rendered text.
+    expect(screen.queryByText(/^- nested a/)).not.toBeInTheDocument();
+  });
+
+  it('renders a nested ordered list inside a bullet list correctly', () => {
+    render(<AgentMarkdown text={'- outer\n  1. inner one\n  2. inner two'} />);
+    const lists = screen.getAllByRole('list');
+    expect(lists).toHaveLength(2);
+    const outer = lists.find((l) => l.tagName === 'UL');
+    expect(outer).toBeDefined();
+    const nested = outer?.querySelector('ol');
+    expect(nested).not.toBeNull();
+    expect(nested?.querySelectorAll('li')).toHaveLength(2);
+  });
+
+  it('a flat (non-nested) bullet list still renders exactly as before (no regression)', () => {
+    render(<AgentMarkdown text={'Steps:\n\n- first\n- second\n- third'} />);
+    const list = screen.getByRole('list');
+    expect(list).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(3);
+    expect(screen.getByText('first')).toBeInTheDocument();
+  });
+
+  it('renders a `>` line as a real <blockquote>', () => {
+    render(<AgentMarkdown text={'> a quoted remark'} />);
+    const quote = document.querySelector('blockquote');
+    expect(quote).not.toBeNull();
+    expect(quote?.textContent).toBe('a quoted remark');
+    expect(screen.queryByText(/^> a quoted remark/)).not.toBeInTheDocument();
+  });
+
+  it('a multi-line blockquote strips the `>` marker from every line', () => {
+    render(<AgentMarkdown text={'> line one\n> line two'} />);
+    const quote = document.querySelector('blockquote');
+    expect(quote).not.toBeNull();
+    expect(quote?.textContent).toContain('line one');
+    expect(quote?.textContent).toContain('line two');
+    expect(quote?.textContent).not.toMatch(/>/);
+  });
+
+  it('renders a pipe table as a real <table> inside a horizontally-scrollable container', () => {
+    render(
+      <AgentMarkdown
+        text={'| Name | Value |\n| --- | --- |\n| alpha | 1 |\n| beta | 2 |'}
+      />,
+    );
+    const table = screen.getByRole('table');
+    expect(table.tagName).toBe('TABLE');
+    expect(screen.getAllByRole('columnheader')).toHaveLength(2);
+    expect(screen.getByText('alpha')).toBeInTheDocument();
+    expect(screen.getByText('beta')).toBeInTheDocument();
+    // Wide-table safety: the table's own ancestor scrolls, not the page body.
+    const scrollAncestor = table.closest('.overflow-x-auto');
+    expect(scrollAncestor).not.toBeNull();
+    // No raw pipe/dash separator source leaked into the rendered text.
+    expect(screen.queryByText(/---/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\| Name \| Value \|/)).not.toBeInTheDocument();
+  });
+});
