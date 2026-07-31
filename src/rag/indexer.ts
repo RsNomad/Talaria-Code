@@ -20,6 +20,20 @@ import { isSecretForCompletion } from '../shared/secretPaths';
 import { scanSnippetForSecrets } from '../autocomplete/context/secretScanner';
 // T-19 (C1+C2): createIgnoreFilter moved to shared/ignoreFilter.ts; toPosixRelative stayed in ./gitignore.
 import { createIgnoreFilter } from '../shared/ignoreFilter';
+// AUDIT-5 ARCH-2: the SAME symlink-aware containment primitive every other
+// content-ingestion channel uses (readTextFile, attachments, mentions,
+// checkpoints). Imported from its frozen home rather than relocated to
+// shared/ — pathConfine.ts is sha256-frozen-adjacent policy code (do not
+// modify/move), is pure Node (no vscode import), and host/checkpoints +
+// host/context already import it cross-subzone the same way.
+import { resolveWithinWorkspaceReal } from '../host/backend/acp/pathConfine';
+// AUDIT-5 ARCH-3 (F-6): node-ignore's OWN exported path validator — the
+// library's documented contract is that out-of-scope input (absolute,
+// '../…', '', '.') THROWS since 5.0.0, and callers pre-filter with
+// isPathValid (README "Upgrade 4.x -> 5.x": `.filter(isPathValid)`).
+// Same division of labor as ripgrep (the walker guarantees scope; the
+// matcher asserts) — see the F-6 fork record + Appendix 8/P5.
+import { isPathValid } from 'ignore';
 import { chunkFile } from './chunker';
 import { diffContentHashes, hashContent } from './contentHash';
 import { HttpEmbedder } from './embedder';
@@ -136,14 +150,50 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   });
 
   const manifestPath = path.join(opts.indexDir, MANIFEST_FILE);
-  let storeInitialized = false;
+  // AUDIT-5 ARCH-1: the index's own directory must never be walked, watched,
+  // or indexed — the '**/*' watcher sees the manifest/meta/LanceDB writes,
+  // and the manifest stores its own content hash, so without this a custom
+  // in-workspace `talaria.rag.indexDir` becomes a permanent re-embed loop
+  // (the default `.hermes/index` was protected only by the coincidental
+  // literal `.hermes` in DEFAULT_IGNORE_PATTERNS — executed ignore@7 probe).
+  // An explicit string-prefix predicate, NOT an appended ignore pattern:
+  // glob metacharacters in a user-chosen dir name would silently break a
+  // pattern-based exclusion (probe: pattern '/my [index]/' does not match
+  // the literal 'my [index]/' path). Degenerate `indexDir == workspaceRoot`
+  // (relIndexDir === '') adds no exclusion — excluding '' would exclude the
+  // whole workspace; that config keeps today's (broken-by-config) behavior.
+  const relIndexDir = toPosixRelative(path.relative(opts.workspaceRoot, opts.indexDir));
+  const indexDirInsideWorkspace =
+    relIndexDir !== '' && relIndexDir !== '..' && !relIndexDir.startsWith('../') && !path.isAbsolute(relIndexDir);
+  function isUnderIndexDir(relPosixPath: string): boolean {
+    return (
+      indexDirInsideWorkspace &&
+      (relPosixPath === relIndexDir || relPosixPath.startsWith(`${relIndexDir}/`))
+    );
+  }
+
   let disposed = false;
 
-  async function ensureStoreInitialized(): Promise<void> {
-    if (storeInitialized) return;
-    await fs.mkdir(opts.indexDir, { recursive: true });
-    await store.init();
-    storeInitialized = true;
+  // AUDIT-5 CR-B: memoized single-flight init — same idiom as
+  // CheckpointTracker.init (CheckpointTracker.ts:289-297). The old
+  // check-then-act flag (`if (storeInitialized) return; ... await
+  // store.init(); storeInitialized = true;`) let a watcher event racing the
+  // first build() run LanceDBStore.init() twice: the second connect()
+  // reassigned this.db and orphaned the first native Connection un-closed.
+  // A failed init clears the memo so the next caller retries — preserving
+  // the old flag's "failures are retried" semantics exactly.
+  let initPromise: Promise<void> | undefined;
+  function ensureStoreInitialized(): Promise<void> {
+    if (!initPromise) {
+      initPromise = (async () => {
+        await fs.mkdir(opts.indexDir, { recursive: true });
+        await store.init();
+      })().catch((err: unknown) => {
+        initPromise = undefined;
+        throw err;
+      });
+    }
+    return initPromise;
   }
 
   async function readManifest(): Promise<Record<string, string>> {
@@ -296,7 +346,10 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     } catch {
       // optional
     }
-    return createIgnoreFilter(gitignoreContents, opts.extraIgnoreGlobs ?? []);
+    const base = createIgnoreFilter(gitignoreContents, opts.extraIgnoreGlobs ?? []);
+    // AUDIT-5 ARCH-1: fold the indexDir self-exclusion into the ONE filter
+    // both runBuild's walk() and handleFsEvent already share.
+    return (relPosixPath: string): boolean => isUnderIndexDir(relPosixPath) || base(relPosixPath);
   }
 
   async function walk(
@@ -520,6 +573,18 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     async function handleFsEvent(uri: vscode.Uri, kind: 'change' | 'delete'): Promise<void> {
       if (disposed) return;
       const relPath = toPosixRelative(path.relative(opts.workspaceRoot, uri.fsPath));
+      // AUDIT-5 ARCH-3 (F-6): a STRING glob watcher spans ALL workspace
+      // folders ("Providing a string as globPattern is a convenience for
+      // watching all opened workspace folders" — VS Code API doc), but this
+      // indexer serves exactly one root (B-13: folder [0] only). A
+      // sibling-folder event relativizes to '../…' (or an absolute path on a
+      // cross-drive Windows dev box), which ignore@7 rejects with RangeError
+      // BY DOCUMENTED DESIGN — and ships isPathValid for exactly this
+      // caller-side pre-check (executed probe: rejects '', '.', '..',
+      // '../…', '/abs', 'C:/abs'). Not ours — return. Do NOT swallow
+      // out-of-scope paths inside createIgnoreFilter instead: the shared
+      // filter's loud throw is its contract (pinned in ignoreFilter.test.ts).
+      if (!isPathValid(relPath)) return;
       const ignoreFilter = await loadIgnoreFilter();
       if (ignoreFilter(relPath)) return;
 
@@ -537,6 +602,19 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         if (kind === 'delete') {
           await store.deleteByPath(relPath);
           delete manifest[relPath];
+          // AUDIT-5 ARCH-5 (F-1 final): delete-event granularity is platform/
+          // watcher-dependent — a directory delete may arrive as ONE event
+          // for the dir with no per-file events, which used to leave every
+          // row/manifest entry under it stale until the next full build. The
+          // manifest enumerates every indexed path, so sweep it by prefix —
+          // exact-match store deletes per swept key, no LIKE-predicate
+          // escaping needed, idempotent when per-file events also arrive.
+          for (const key of Object.keys(manifest)) {
+            if (key.startsWith(`${relPath}/`)) {
+              await store.deleteByPath(key);
+              delete manifest[key];
+            }
+          }
           await writeManifest(manifest);
           return;
         }
@@ -544,6 +622,35 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // A newly-created/changed secret-path file (e.g. a fresh `.env`)
           // must never be indexed. Best-effort purge in case it was somehow
           // already stored (mirrors build()'s self-heal purge pass).
+          await store.deleteByPath(relPath);
+          delete manifest[relPath];
+          await writeManifest(manifest);
+          return;
+        }
+        // AUDIT-5 ARCH-2: watch/build symmetry + containment. runBuild's
+        // walk() never indexes a symlink (Dirent.isFile()/isDirectory() are
+        // lstat-semantics — both false for a link), but this incremental path
+        // used to fs.readFile straight through one: a workspace-internal link
+        // to $HOME/… got its TARGET chunked, POSTed to the embed endpoint,
+        // and stored agent-searchable. Rule: lstat-refuse a leaf link, then
+        // realpath-confine the path with the same primitive every other
+        // ingestion channel uses; anything unconfinable is skipped AND purged
+        // (mirrors the secret-path branch above). lstat ENOENT (vanished
+        // between event and check) also lands here — purging a gone path is
+        // the correct outcome. Accepted residual: a REGULAR file reached
+        // through an in-workspace dir-symlink alias may index under the alias
+        // relPath until the next full build drops it — benign (target is
+        // in-workspace) and self-healing.
+        let confined: string | null = null;
+        try {
+          const leaf = await fs.lstat(uri.fsPath);
+          confined = leaf.isSymbolicLink()
+            ? null
+            : await resolveWithinWorkspaceReal(uri.fsPath, [opts.workspaceRoot]);
+        } catch {
+          confined = null; // fail closed
+        }
+        if (confined === null) {
           await store.deleteByPath(relPath);
           delete manifest[relPath];
           await writeManifest(manifest);

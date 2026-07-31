@@ -1,4 +1,4 @@
-import { promises as fs, mkdtempSync, rmSync } from 'node:fs';
+import { promises as fs, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -106,6 +106,45 @@ vi.mock('vscode', () => {
   };
   return { Disposable, workspace };
 });
+
+// --- AUDIT-5 Task 1: symlink capability probes (duplicated from
+// pathConfine.test.ts's canLinkDir pattern — module-private there). Junction
+// fallback keeps the dir-link cases running on a Windows dev box without
+// SeCreateSymbolicLinkPrivilege; file links have no junction form, so that
+// one case skips on such a box (always runs on the Fedora target).
+function linkDirSync(target: string, link: string): void {
+  try {
+    symlinkSync(target, link, 'dir');
+  } catch {
+    symlinkSync(target, link, 'junction');
+  }
+}
+const canLinkDir = (() => {
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(path.join(os.tmpdir(), 'talaria-symcap-'));
+    mkdirSync(path.join(dir, 't'));
+    linkDirSync(path.join(dir, 't'), path.join(dir, 'l'));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+  }
+})();
+const canLinkFile = (() => {
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(path.join(os.tmpdir(), 'talaria-symcap-f-'));
+    writeFileSync(path.join(dir, 't.txt'), 'x');
+    symlinkSync(path.join(dir, 't.txt'), path.join(dir, 'l.txt'), 'file');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+  }
+})();
 
 // eslint-disable-next-line import/first -- must follow the vi.mock calls above.
 import { hashContent } from './contentHash';
@@ -728,5 +767,196 @@ describe('RAG-2: the serialize chain accepts the NEXT event after a batch embed 
     await writeWorkspaceFile('src/other.ts', 'export const y = 2;\n');
     await expect(indexer.build()).resolves.toBeUndefined();
     expect(upsertMock).toHaveBeenCalled();
+  });
+});
+
+describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-a5-'));
+    indexDir = path.join(workspaceRoot, 'index'); // CUSTOM in-workspace indexDir — the documented usage ARCH-1 names
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer(debounceMs = 5) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  async function readManifest(): Promise<Record<string, string>> {
+    const raw = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8');
+    return JSON.parse(raw) as Record<string, string>;
+  }
+
+  function upsertedPaths(): string[] {
+    return upsertMock.mock.calls.flatMap(([records]) => records.map((r) => r.path));
+  }
+
+  it('ARCH-1 (build): a second full build never indexes the index directory own files', async () => {
+    await writeWorkspaceFile('src/app.txt', 'ordinary content to chunk and index.\n');
+    const indexer = makeIndexer();
+    await indexer.build(); // writes index/manifest.json + index/manifest.meta.json
+    upsertMock.mockClear();
+
+    await indexer.build(); // at HEAD, walk() now collects index/manifest.json into the corpus
+
+    expect(upsertedPaths()).not.toContain('index/manifest.json');
+    expect(upsertedPaths()).not.toContain('index/manifest.meta.json');
+    const manifest = await readManifest();
+    expect(Object.keys(manifest)).toEqual(['src/app.txt']);
+    indexer.dispose();
+  });
+
+  it('ARCH-1 (watch): a change event on the index own manifest is ignored — no re-embed, no self-feeding loop', async () => {
+    await writeWorkspaceFile('src/app.txt', 'ordinary content to chunk and index.\n');
+    const indexer = makeIndexer();
+    await indexer.build();
+    const disposable = indexer.watch();
+    embedMock.mockClear();
+    upsertMock.mockClear();
+
+    fsWatcherListeners.change[0]!({ fsPath: path.join(indexDir, 'manifest.json') });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(embedMock).not.toHaveBeenCalled();
+    expect(upsertMock).not.toHaveBeenCalled();
+    const manifest = await readManifest();
+    expect(Object.keys(manifest)).toEqual(['src/app.txt']); // no self-entry appeared
+    disposable.dispose();
+    indexer.dispose();
+  });
+
+  it.skipIf(!canLinkDir)(
+    'ARCH-2: a change event on a file behind an in-workspace dir symlink that ESCAPES the workspace is skipped and purged, never embedded',
+    async () => {
+      const outside = mkdtempSync(path.join(os.tmpdir(), 'talaria-outside-'));
+      try {
+        await fs.writeFile(path.join(outside, 'private.txt'), 'PRIVATE out-of-workspace content that must never be embedded.\n');
+        linkDirSync(outside, path.join(workspaceRoot, 'vault'));
+        const indexer = makeIndexer();
+        const disposable = indexer.watch();
+
+        fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'vault', 'private.txt') });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        expect(embedMock).not.toHaveBeenCalled(); // at HEAD: fs.readFile FOLLOWS the link and the content IS embedded
+        expect(upsertMock).not.toHaveBeenCalled();
+        expect(deleteByPathMock.mock.calls.map(([p]) => p)).toContain('vault/private.txt'); // skip-AND-PURGE
+        disposable.dispose();
+        indexer.dispose();
+      } finally {
+        rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!canLinkFile)(
+    'ARCH-2 (leaf): a change event on a leaf file symlink is skipped and purged (walk() never indexes symlinks — build/watch symmetry)',
+    async () => {
+      const outside = mkdtempSync(path.join(os.tmpdir(), 'talaria-outside-f-'));
+      try {
+        await fs.writeFile(path.join(outside, 'target.txt'), 'content behind a leaf symlink.\n');
+        symlinkSync(path.join(outside, 'target.txt'), path.join(workspaceRoot, 'link.txt'), 'file');
+        const indexer = makeIndexer();
+        const disposable = indexer.watch();
+
+        fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'link.txt') });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        expect(embedMock).not.toHaveBeenCalled();
+        expect(deleteByPathMock.mock.calls.map(([p]) => p)).toContain('link.txt');
+        disposable.dispose();
+        indexer.dispose();
+      } finally {
+        rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('ARCH-3: an event from OUTSIDE the workspace root (multi-root sibling) early-returns — no RangeError logged, no store touch', async () => {
+    const sibling = mkdtempSync(path.join(os.tmpdir(), 'talaria-sibling-'));
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const indexer = makeIndexer();
+      const disposable = indexer.watch();
+
+      fsWatcherListeners.change[0]!({ fsPath: path.join(sibling, 'b.ts') });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      // At HEAD: ignore@7 throws RangeError inside the filter, caught by
+      // schedule()'s catch -> console.error('hermes-codebase: incremental reindex failed', ...).
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(initMock).not.toHaveBeenCalled();
+      disposable.dispose();
+      indexer.dispose();
+    } finally {
+      errorSpy.mockRestore();
+      rmSync(sibling, { recursive: true, force: true });
+    }
+  });
+
+  it('CR-B: a watcher event racing the first build() runs store.init() exactly ONCE (memoized single-flight)', async () => {
+    await writeWorkspaceFile('src/app.txt', 'ordinary content to chunk and index.\n');
+    initMock.mockImplementationOnce(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100)); // first native init is slow — the cold-start race window
+    });
+    const indexer = makeIndexer(5);
+    const disposable = indexer.watch();
+
+    const buildPromise = indexer.build(); // enters ensureStoreInitialized, parks on the slow init
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') }); // fires ~5ms in, while init is pending
+    await buildPromise;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expect(initMock).toHaveBeenCalledTimes(1); // at HEAD: 2 — both callers pass the un-set flag
+    disposable.dispose();
+    indexer.dispose();
+  });
+
+  // ARCH-5 rider (F-1 FINAL: in this task). The single dir-delete event this
+  // fires is VS Code's DOCUMENTED granularity (Appendix 9): folder deletes
+  // fold into ONE event for the folder; children get none.
+  it('ARCH-5 rider: a delete event for a DIRECTORY sweeps every indexed row/manifest key under it', async () => {
+    await writeWorkspaceFile('src/a.txt', 'file a content to index.\n');
+    await writeWorkspaceFile('src/b.txt', 'file b content to index.\n');
+    const indexer = makeIndexer();
+    await indexer.build();
+    const disposable = indexer.watch();
+    deleteByPathMock.mockClear();
+
+    fsWatcherListeners.delete[0]!({ fsPath: path.join(workspaceRoot, 'src') }); // ONE event for the dir — the granularity ARCH-5 names
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const deleted = deleteByPathMock.mock.calls.map(([p]) => p);
+    expect(deleted).toContain('src/a.txt');
+    expect(deleted).toContain('src/b.txt');
+    const manifest = await readManifest();
+    expect(Object.keys(manifest)).toEqual([]);
+    disposable.dispose();
+    indexer.dispose();
   });
 });

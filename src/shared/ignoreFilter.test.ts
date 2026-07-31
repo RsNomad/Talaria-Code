@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { isPathValid } from 'ignore';
 
 import { createIgnoreFilter } from './ignoreFilter';
 
@@ -32,5 +33,24 @@ describe('createIgnoreFilter', () => {
     const isIgnored = createIgnoreFilter(['*.tmp\n', 'secrets/\n']);
     expect(isIgnored('a.tmp')).toBe(true);
     expect(isIgnored('secrets/key.pem')).toBe(true);
+  });
+});
+
+describe('createIgnoreFilter — AUDIT-5 F-6: the out-of-scope contract is LOUD (regression pins, not RED)', () => {
+  it('throws on out-of-scope input — the documented node-ignore contract callers must pre-validate against', () => {
+    const filter = createIgnoreFilter([]);
+    expect(() => filter('../sibling/a.ts')).toThrow(RangeError);
+    expect(() => filter('/abs/a.ts')).toThrow(RangeError);
+  });
+
+  it("isPathValid from 'ignore' is the boundary validator (executed probe P5 pinned)", () => {
+    expect(isPathValid('')).toBe(false);
+    expect(isPathValid('.')).toBe(false);
+    expect(isPathValid('..')).toBe(false);
+    expect(isPathValid('../sibling/a.ts')).toBe(false);
+    expect(isPathValid('/abs/a.ts')).toBe(false);
+    expect(isPathValid('C:/abs/a.ts')).toBe(false);
+    expect(isPathValid('src/app.ts')).toBe(true);
+    expect(isPathValid('index/manifest.json')).toBe(true);
   });
 });

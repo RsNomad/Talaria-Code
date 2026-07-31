@@ -71,6 +71,16 @@ export const DEFAULT_IGNORE_PATTERNS: readonly string[] = [
  * returned predicate expects **POSIX-relative** paths from the workspace
  * root (see `toPosixRelative` in `src/rag/gitignore.ts`) — that's what the
  * `ignore` package itself expects.
+ *
+ * CONTRACT (AUDIT-5 F-6): `relPosixPath` MUST be an in-root
+ * `path.relative()`'d posix path — exactly what node-ignore documents.
+ * Out-of-scope input ('', '.', '..', '../…', absolute) THROWS a RangeError
+ * from ignore@7 BY DESIGN (loud, like ripgrep's matcher assert and git's
+ * "outside repository" fatal): scope validation is the CALLER's job — use
+ * `isPathValid` from 'ignore' at the boundary (see rag/indexer.ts's
+ * handleFsEvent). Deliberately NOT swallowed here: a silent "ignored"
+ * answer for out-of-scope input would mask caller bugs. Pinned by
+ * ignoreFilter.test.ts.
  */
 export function createIgnoreFilter(
   gitignoreContents: readonly string[],
