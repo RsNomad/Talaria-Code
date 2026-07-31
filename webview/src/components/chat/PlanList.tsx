@@ -1,15 +1,33 @@
-/* Live execution plan: done / active / pending steps. */
-import type { PlanItemView } from '../../types';
-import type { PlanItem } from '../../protocol';
+/* Live execution plan: done / active / pending / interrupted steps. */
+import type { PlanItemView, PlanStepView } from '../../types';
+import { totalLookup } from '../../lookup';
 import { Icon } from '../Icon';
 
-function StepRow({ step }: { step: PlanItem }) {
-  const mark =
-    step.status === 'done'
-      ? { icon: 'pass-filled', cls: 'text-add' }
-      : step.status === 'active'
-        ? { icon: 'loading', cls: 'text-run', spin: true }
-        : { icon: 'circle-large-outline', cls: 'text-faint' };
+/** Exported (ToolCard's UI-I1 precedent) so `PlanList.test.ts` can exercise
+ * the total lookup directly — this repo's webview tests don't use jsdom.
+ * `Record<PlanStepView['status'], …>` is EXHAUSTIVE by construction: adding
+ * a status member without an icon is a compile error (the F-3 type-surgery
+ * payoff — no silent fall-through for a new status). */
+export const STEP_MARK: Record<PlanStepView['status'], { icon: string; cls: string; spin?: boolean }> = {
+  done: { icon: 'pass-filled', cls: 'text-add' },
+  active: { icon: 'loading', cls: 'text-run', spin: true },
+  pending: { icon: 'circle-large-outline', cls: 'text-faint' },
+  // AUDIT-5 UI I-1 (F-3): webview-only — an `active` step whose turn ended
+  // abnormally (settlePlanSteps). stop-circle = ToolCard's own interrupted
+  // icon (one visual language for "was running, turn died"). NOT spinning.
+  interrupted: { icon: 'stop-circle', cls: 'text-faint' },
+};
+
+/** UI-I1 sibling (ToolCard's UNKNOWN_TOOL_STATUS): an out-of-union status
+ * from a version-skewed host degrades to a neutral glyph instead of
+ * `STEP_MARK[bad]` being `undefined` and `.icon` throwing mid-render. */
+export const UNKNOWN_STEP_MARK: { icon: string; cls: string; spin?: boolean } = {
+  icon: 'question',
+  cls: 'text-faint',
+};
+
+function StepRow({ step }: { step: PlanStepView }) {
+  const mark = totalLookup(STEP_MARK, step.status, UNKNOWN_STEP_MARK);
   return (
     <li className="flex items-center gap-2 py-0.5 text-[12.5px]">
       <Icon name={mark.icon} size={13} spin={mark.spin} className={`flex-none ${mark.cls}`} />

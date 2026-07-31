@@ -1917,7 +1917,31 @@ describe('transcript reducer — CF-06 / R2: settleOpenItems — settling every 
     expect(reasoning).toMatchObject({ blockId: 'r1', streaming: false });
   });
 
-  it('trip-wire: an abnormal turn.end with one OPEN item of every streaming/settleable kind (message, reasoning, tool, approval) leaves NONE streaming/open — a future streaming kind that forgets to plug into settleOpenItems fails HERE, not in a per-kind test nobody wrote', () => {
+  it('RED (AUDIT-5 UI I-1 / F-3): turn.end{status:"cancelled"} folds an "active" plan step to the webview-only "interrupted" — no spinner survives a dead turn', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [
+        { text: 'step one', status: 'done' },
+        { text: 'step two', status: 'active' },
+        { text: 'step three', status: 'pending' },
+      ],
+    });
+    const before = activeTab(state).transcript.find((i) => i.kind === 'plan');
+    expect(before?.kind === 'plan' ? before.items[1]?.status : 'wrong-kind').toBe('active');
+
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'cancelled' });
+
+    const plan = activeTab(state).transcript.find((i) => i.kind === 'plan');
+    expect(plan?.kind === 'plan' ? plan.items.map((s) => s.status) : []).toEqual(['done', 'interrupted', 'pending']);
+    // The tab.plan mirror must not keep a live-looking step either.
+    expect(activeTab(state).plan.map((s) => s.status)).toEqual(['done', 'interrupted', 'pending']);
+    // A 'done'/'pending' step is NOT rewritten — only 'active' is folded.
+  });
+
+  it('trip-wire: an abnormal turn.end with one OPEN item of every streaming/settleable kind (message, reasoning, tool, approval, plan) leaves NONE streaming/open — a future streaming kind that forgets to plug into settleOpenItems fails HERE, not in a per-kind test nobody wrote', () => {
     let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
     // Order matters: each of tool.start/approval.request/reasoning.start
     // closes any PRIOR open message block (closeOpenMessages' mid-turn role,
@@ -1941,22 +1965,30 @@ describe('transcript reducer — CF-06 / R2: settleOpenItems — settling every 
       title: 'Run: npm test',
       options: [{ id: 'allow', label: 'Allow', kind: 'allow_once' }],
     });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'in-flight step', status: 'active' }],
+    });
     state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
     state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'partial answer' });
 
-    // Confirm the precondition non-vacuously: all four ARE open before turn.end.
+    // Confirm the precondition non-vacuously: all five ARE open before turn.end.
     const before = activeTab(state).transcript;
-    expect(before).toHaveLength(4);
+    expect(before).toHaveLength(5);
     const beforeApproval = before.find((i) => i.kind === 'approval');
     expect(before.find((i) => i.kind === 'tool')).toMatchObject({ status: 'running' });
     expect(beforeApproval?.kind === 'approval' ? beforeApproval.settledOutcome : 'wrong-kind').toBeUndefined();
     expect(before.find((i) => i.kind === 'reasoning')).toMatchObject({ streaming: true });
     expect(before.find((i) => i.kind === 'message')).toMatchObject({ streaming: true });
+    const beforePlan = before.find((i) => i.kind === 'plan');
+    expect(beforePlan?.kind === 'plan' ? beforePlan.items[0]?.status : 'wrong-kind').toBe('active');
 
     state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'error' });
 
     const after = activeTab(state).transcript;
-    expect(after).toHaveLength(4);
+    expect(after).toHaveLength(5);
     for (const item of after) {
       if (item.kind === 'message' || item.kind === 'reasoning') {
         expect(item.streaming).toBe(false);
@@ -1967,6 +1999,10 @@ describe('transcript reducer — CF-06 / R2: settleOpenItems — settling every 
       }
       if (item.kind === 'approval') {
         expect(item.settledOutcome).not.toBeUndefined();
+      }
+      if (item.kind === 'plan') {
+        expect(item.items.some((s) => s.status === 'active')).toBe(false);
+        expect(item.items[0]?.status).toBe('interrupted'); // F-3: the honest webview-only fold target
       }
     }
   });

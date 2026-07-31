@@ -18,6 +18,7 @@ import {
   makeTabState,
   type ApprovalItem,
   type AppState,
+  type PlanStepView,
   type TabState,
   type TranscriptItem,
 } from '../types';
@@ -48,6 +49,19 @@ function closeOpenMessages(list: TranscriptItem[]): TranscriptItem[] {
   return changed ? next : list;
 }
 
+/** AUDIT-5 UI I-1 (F-3): a plan step claiming `active` after its turn died
+ * is a card claiming a running state that is not happening — the same CF-06
+ * class as an eternally-streaming reasoning block (PlanList renders `active`
+ * as a perpetually spinning `loading` icon). Fold it to the webview-only
+ * `'interrupted'` (see PlanStepView's doc): honest "was running when the
+ * turn died" — distinct from never-started `pending` — mirroring the tool
+ * fold above (`running` → `'interrupted'`), and non-spinning in PlanList. */
+function settlePlanSteps(items: PlanStepView[]): PlanStepView[] {
+  return items.some((step) => step.status === 'active')
+    ? items.map((step) => (step.status === 'active' ? { ...step, status: 'interrupted' as const } : step))
+    : items;
+}
+
 /**
  * CF-06 (R2 — "settled is enumerated, not derived"): the ONE place every
  * still-open/streaming transcript-item kind is settled, used on an ABNORMAL
@@ -63,7 +77,9 @@ function closeOpenMessages(list: TranscriptItem[]): TranscriptItem[] {
  * miss (see the trip-wire test in transcript.test.ts). `closeOpenMessages`
  * above is UNCHANGED and keeps its own separate MID-TURN role (closing a
  * prior message block when a new reasoning/tool/approval/plan/result block
- * starts) — this function only takes over the turn-END settle.
+ * starts) — this function only takes over the turn-END settle. Settled
+ * kinds: message, reasoning, tool, approval, and a plan's `active` step (→
+ * webview-only `'interrupted'`) alike.
  */
 function settleOpenItems(list: TranscriptItem[]): TranscriptItem[] {
   return list.map((item) => {
@@ -78,6 +94,9 @@ function settleOpenItems(list: TranscriptItem[]): TranscriptItem[] {
     }
     if (item.kind === 'approval' && item.settledOutcome === undefined) {
       return { ...item, settledOutcome: 'cancelled' as const };
+    }
+    if (item.kind === 'plan' && item.items.some((step) => step.status === 'active')) {
+      return { ...item, items: settlePlanSteps(item.items) };
     }
     return item;
   });
@@ -145,7 +164,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       // item — message, reasoning, tool, approval alike — must stop lying
       // about being live. Derived in one place (settleOpenItems) instead of
       // enumerated per-kind here.
-      return { ...tab, turnActive: false, transcript: settleOpenItems(tab.transcript) };
+      return { ...tab, turnActive: false, transcript: settleOpenItems(tab.transcript), plan: settlePlanSteps(tab.plan) };
     }
 
     case 'user': {

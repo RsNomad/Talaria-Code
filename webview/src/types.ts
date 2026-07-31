@@ -129,10 +129,27 @@ export interface ApprovalItem {
   timeoutMs?: number;
 }
 
+/**
+ * AUDIT-5 UI I-1 (F-3 TYPE SURGERY): the webview's plan-step shape. It
+ * DIVERGES from the wire `PlanItem` (src/shared/protocol.ts:96-99) by
+ * exactly one UI-only status member — `'interrupted'` — per this file's
+ * charter ("add UI-only fields the wire protocol doesn't carry"). The wire
+ * union is a structural SUBTYPE of this one, so `plan.update` ingestion
+ * needs no mapping; the ONLY producer of `'interrupted'` is
+ * `settlePlanSteps` (state/transcript.ts) on an abnormal turn end, and the
+ * next real `plan.update` wholesale-replaces the array (M8: no per-step
+ * id), erasing the marker. Never send this type toward the host — the wire
+ * type stays `PlanItem` (nothing does today; `tab.plan` is write-only).
+ */
+export interface PlanStepView {
+  text: string;
+  status: PlanItem['status'] | 'interrupted';
+}
+
 export interface PlanItemView {
   kind: 'plan';
   turnId: string;
-  items: PlanItem[];
+  items: PlanStepView[];
 }
 
 export interface ResultItem {
@@ -167,7 +184,7 @@ export interface TabState {
   binding: 'unbound' | 'pending' | 'bound';
   title: string;
   transcript: TranscriptItem[];
-  plan: PlanItem[];
+  plan: PlanStepView[];
   turnActive: boolean;
   currentModelId: string | null;
   /** Per-tab (Q-7 decided) — W2-F1 edit-policy preset. */
