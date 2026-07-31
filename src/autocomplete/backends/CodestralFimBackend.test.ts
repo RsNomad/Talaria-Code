@@ -373,3 +373,39 @@ describe('CodestralFimBackend.streamFim — F5: trims apiKey before building the
     expect(headers.Authorization).toBe('Bearer sk-clean-key');
   });
 });
+
+/**
+ * AUDIT-5 hygiene: this backend's `model` field precedence was inverted
+ * relative to its three siblings (`OllamaFimBackend.ts:49`,
+ * `OpenAICompatFimBackend.ts:53`, `VllmFimBackend.ts:40` — all
+ * `req.model || this.opts.model`); this class alone read
+ * `this.opts.model || req.model`. Behavior-neutral TODAY: `req.model`
+ * (`FimEngine`'s `this.options.model`, `engine.ts`) and `this.opts.model`
+ * (`cfg.model` via `backendFactory.ts`) both derive from the SAME
+ * `talaria.autocomplete.model` config read, so no real request ever sees
+ * them differ. This test pins the ALIGNED precedence explicitly (with
+ * deliberately-differing dummy values, the only way to distinguish which
+ * operand wins) so a future edit can't silently re-invert it — the wire
+ * shape matches the sibling suites' own precedent.
+ */
+describe('CodestralFimBackend.streamFim — hygiene: model precedence aligned with siblings (AUDIT-5)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('sends req.model on the wire, matching Ollama/OpenAICompat/Vllm precedence (req.model || opts.model)', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(emptyStreamResponse());
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const backend = new CodestralFimBackend({ apiKey: 'k', model: 'cfg-model' });
+    const iterator = backend
+      .streamFim({ ...req(), model: 'req-model' }, new AbortController().signal)
+      [Symbol.asyncIterator]();
+    await iterator.next();
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { model: string };
+    expect(body.model).toBe('req-model');
+  });
+});

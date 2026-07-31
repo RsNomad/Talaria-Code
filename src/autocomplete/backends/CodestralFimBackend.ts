@@ -84,7 +84,16 @@ export class CodestralFimBackend implements FimBackend {
       // `this.opts.model` is always truthy by the time a backend exists. A
       // fallback that cannot fire is a claim about behaviour that does not
       // happen.
-      model: this.opts.model || req.model,
+      // AUDIT-5 hygiene: precedence ALIGNED with the three sibling backends
+      // (`OllamaFimBackend.ts`, `OpenAICompatFimBackend.ts`,
+      // `VllmFimBackend.ts` — all `req.model || this.opts.model`). This
+      // class alone read the operands in the opposite order. Behavior-
+      // neutral today: `req.model` (`FimEngine`'s `this.options.model`) and
+      // `this.opts.model` (`cfg.model`, `backendFactory.ts`) both derive
+      // from the same `talaria.autocomplete.model` config read, so no real
+      // request ever observes a difference — this flip is a consistency
+      // pin, not a behavior change.
+      model: req.model || this.opts.model,
       prompt: req.prefix,
       suffix: req.suffix,
       temperature: req.temperature,

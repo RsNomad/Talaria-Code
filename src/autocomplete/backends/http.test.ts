@@ -490,3 +490,45 @@ describe('readJsonBounded — bounded non-streaming JSON body reads (D1)', () =>
     await expect(readJsonBounded({ body: null })).rejects.toThrow();
   });
 });
+
+// AUDIT-5 hygiene: `readJsonBounded`'s `finally` only called
+// `reader.releaseLock()` — unlike `readNdjsonLines`/`readSseEvents` above
+// (the F7 discipline: `cancel()` BEFORE `releaseLock()` on every exit path),
+// it never told the source to drop the connection when the exit was an
+// ERROR path other than the explicit over-cap throw (which already calls
+// cancel() itself, inline, before rethrowing). A plain `reader.read()`
+// rejection — the shape a dropped connection or a malformed-stream error
+// actually takes — hit the `finally` without ever calling `cancel()`.
+describe('readJsonBounded — F7: reader.cancel() in finally on every exit path (AUDIT-5 hygiene)', () => {
+  it('calls reader.cancel() (not just releaseLock()) when reader.read() itself rejects mid-stream', async () => {
+    let readCalls = 0;
+    let cancelCalls = 0;
+    let releaseLockCalls = 0;
+    const encoder = new TextEncoder();
+    const fakeReader = {
+      read: async () => {
+        readCalls++;
+        if (readCalls === 1) {
+          return { value: encoder.encode('{"partial":'), done: false };
+        }
+        throw new Error('simulated connection drop mid-read');
+      },
+      cancel: async () => {
+        cancelCalls++;
+      },
+      releaseLock: () => {
+        releaseLockCalls++;
+      },
+    };
+    const fakeBody = {
+      getReader: () => fakeReader,
+    } as unknown as ReadableStream<Uint8Array>;
+
+    await expect(readJsonBounded({ body: fakeBody })).rejects.toThrow(
+      'simulated connection drop mid-read',
+    );
+
+    expect(cancelCalls).toBe(1);
+    expect(releaseLockCalls).toBe(1);
+  });
+});

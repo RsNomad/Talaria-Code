@@ -298,6 +298,13 @@ export async function readJsonBounded(
         chunks.push(value);
       }
     } finally {
+      // F7 discipline (AUDIT-5 hygiene): cancel BEFORE releaseLock so an
+      // error-path exit (read() rejection, cap throw) tells the source to
+      // drop the connection instead of leaving the body half-consumed —
+      // matches readNdjsonLines/readSseEvents above. Cancel on an
+      // already-closed/cancelled stream (e.g. the explicit cancel() the D1
+      // over-cap throw above already issued) resolves harmlessly.
+      await reader.cancel().catch(() => {});
       reader.releaseLock();
     }
   }
