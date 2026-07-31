@@ -20,6 +20,25 @@ export function escapeSqlLiteral(value: string): string {
 }
 
 /**
+ * CF-04 / L5 F-7: thrown by `hybridSearch` when the `chunks` table has never
+ * been created — the MCP child's ONE `init()` call at spawn raced the first
+ * index build (registration deliberately precedes it, how-to §7.1) — and the
+ * bounded lazy re-`openTable` attempt below still didn't find it. Exported
+ * so `codebaseSearchHandler.ts` can special-case this into an honest
+ * "(index not ready)" response, instead of either folding it into the
+ * generic D-3 failure text or a `content: []` a caller could misread as "the
+ * search ran and found nothing". Carries no path/detail in its message —
+ * same "status/reason only" rule as the rest of this file's error surface.
+ */
+export class IndexNotReadyError extends Error {
+  constructor() {
+    super('LanceDB codebase index is not ready yet (no chunks table)');
+    this.name = 'IndexNotReadyError';
+    Object.setPrototypeOf(this, IndexNotReadyError.prototype);
+  }
+}
+
+/**
  * LanceDB-backed `VectorStore` (embedded, no daemon — how-to §4 "#2
  * LanceDB", the same engine Continue.dev ships). All native-module usage is
  * confined to this file; everything it delegates to (`fuseHybridRows`,
@@ -51,20 +70,52 @@ export class LanceDBStore implements VectorStore {
   constructor(private readonly indexDir: string) {}
 
   async init(): Promise<void> {
-    this.db = await lancedb.connect(this.indexDir);
-    try {
-      this.table = await this.db.openTable(TABLE_NAME);
-    } catch {
-      // Table doesn't exist yet — created lazily on the first upsert() so
-      // LanceDB can infer the schema from real data (how-to §5.3 pattern:
-      // `db.createTable("myTable", [{ vector: [...], ... }])`).
-      this.table = undefined;
-    }
+    // CF-04: `readConsistencyInterval: 0` is LanceDB's STRONG-consistency
+    // setting — "every read will check for updates from other processes"
+    // (`ConnectionOptions.readConsistencyInterval` doc, grounded against the
+    // installed `@lancedb/lancedb@0.31.0` typings —
+    // `node_modules/@lancedb/lancedb/dist/native.d.ts`). Without it the
+    // default is NO consistency check ("for performance reasons"), so a
+    // long-lived MCP child's `Table` handle never observes the file
+    // watcher's incremental writes (mergeInsert/createTable) made from the
+    // extension host process. Correctness over the (local-filesystem, cheap)
+    // per-read staleness check.
+    this.db = await lancedb.connect(this.indexDir, { readConsistencyInterval: 0 });
+    this.table = await this.openTableIfExists();
   }
 
   private requireDb(): lancedb.Connection {
     if (!this.db) throw new Error('LanceDBStore.init() must be called before use');
     return this.db;
+  }
+
+  /** Table doesn't exist yet — created lazily on the first upsert() so
+   * LanceDB can infer the schema from real data (how-to §5.3 pattern:
+   * `db.createTable("myTable", [{ vector: [...], ... }])`). Returns
+   * `undefined` rather than throwing so both `init()` and the lazy
+   * per-query retry below can share this without their own try/catch. */
+  private async openTableIfExists(): Promise<lancedb.Table | undefined> {
+    if (!this.db) return undefined;
+    try {
+      return await this.db.openTable(TABLE_NAME);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * CF-04: `init()` runs ONCE at MCP-child spawn, before the first index
+   * build necessarily completes — so `this.table` can still be `undefined`
+   * long after a real table exists. BOUNDED: exactly one `openTable` attempt
+   * per call (no loop/spin) — "still undefined → try once, cache success".
+   * A table that appears is cached in `this.table` forever after (LanceDB's
+   * own `readConsistencyInterval` then keeps THAT handle fresh); a table
+   * that's still missing is retried again on the NEXT query, not in a tight
+   * loop within this one.
+   */
+  private async tryReopenTable(): Promise<void> {
+    if (this.table) return;
+    this.table = await this.openTableIfExists();
   }
 
   async upsert(records: ChunkRecord[]): Promise<void> {
@@ -117,7 +168,14 @@ export class LanceDBStore implements VectorStore {
     k: number,
     filter?: SearchFilter,
   ): Promise<SearchHit[]> {
-    if (!this.table) return [];
+    if (!this.table) {
+      // CF-04: the table may have appeared since `init()` (or since the
+      // previous query) — one bounded attempt to pick it up before giving up.
+      await this.tryReopenTable();
+    }
+    if (!this.table) {
+      throw new IndexNotReadyError();
+    }
 
     // Overfetch: `language` is pushed down as SQL, but `path_globs` is
     // applied downstream (src/mcp/pathGlob.ts) after fusion, so fetch extra

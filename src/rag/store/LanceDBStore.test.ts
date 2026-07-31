@@ -24,7 +24,7 @@ vi.mock('@lancedb/lancedb', () => ({
 }));
 
 // eslint-disable-next-line import/first -- must follow the vi.mock call above.
-import { LanceDBStore } from './LanceDBStore';
+import { IndexNotReadyError, LanceDBStore } from './LanceDBStore';
 
 interface FakeQueryChain {
   where: (predicate: string) => FakeQueryChain;
@@ -155,6 +155,101 @@ describe('LanceDBStore.hybridSearch — V-16 RAG-FTS-BLAST', () => {
 
     expect(errSpy).toHaveBeenCalledTimes(1);
     errSpy.mockRestore();
+  });
+});
+
+/**
+ * CF-04 / L5 F-7: the MCP `codebase_search` child calls `store.init()` ONCE
+ * at spawn. Tool registration deliberately precedes the first index build
+ * (how-to §7.1), so on a first-ever run `db.openTable` rejects inside
+ * `init()` and `table` is set `undefined` — and stayed that way for the
+ * WHOLE process lifetime, because `hybridSearch` just checked `!this.table`
+ * and returned `[]` without ever looking again. These tests drive the fix:
+ * a bounded, per-query lazy re-`openTable` attempt (so a table that appears
+ * AFTER `init()` gets picked up), an honest `IndexNotReadyError` instead of
+ * a silent `[]` when it's still missing after that attempt, and a
+ * `readConsistencyInterval` passed to `connect()` so a long-lived child sees
+ * a live file-watcher's incremental writes (a stale `Table` handle
+ * otherwise never observes another process's commits — how-to's own
+ * `ConnectionOptions.readConsistencyInterval` doc: "For performance
+ * reasons, [no consistency check] is the default").
+ */
+describe('LanceDBStore.hybridSearch — CF-04 lazy openTable + honest not-ready', () => {
+  beforeEach(() => {
+    connectMock.mockReset();
+    ftsMock.mockClear();
+  });
+
+  it('retries openTable when a query arrives with table===undefined, and returns hits once the table exists', async () => {
+    const vecRows = [
+      { id: 'v1', path: 'a.ts', startLine: 1, endLine: 2, content: 'const a = 1;', language: 'typescript' },
+    ];
+    const table = makeFakeTable({ vecRows: async () => vecRows, ftsRows: async () => [] });
+    const db = {
+      // init() finds no table yet (first-ever run, index not built)...
+      openTable: vi.fn().mockRejectedValueOnce(new Error('table not found')).mockResolvedValueOnce(table),
+      createTable: vi.fn(),
+      close: vi.fn(),
+    };
+    connectMock.mockResolvedValue(db);
+
+    const store = new LanceDBStore('/fake/index/dir');
+    await store.init();
+
+    // ...but by the time the query runs, the indexer has created it.
+    const hits = await store.hybridSearch('needle', [0.1, 0.2], 5);
+
+    expect(db.openTable).toHaveBeenCalledTimes(2);
+    expect(hits.map((h) => h.id)).toEqual(['v1']);
+  });
+
+  it('throws IndexNotReadyError (not a silent empty array) when the table still does not exist after the retry', async () => {
+    const db = {
+      openTable: vi.fn().mockRejectedValue(new Error('table not found')),
+      createTable: vi.fn(),
+      close: vi.fn(),
+    };
+    connectMock.mockResolvedValue(db);
+
+    const store = new LanceDBStore('/fake/index/dir');
+    await store.init();
+
+    await expect(store.hybridSearch('needle', [0.1, 0.2], 5)).rejects.toBeInstanceOf(IndexNotReadyError);
+    expect(db.openTable).toHaveBeenCalledTimes(2); // init() + exactly one bounded retry
+  });
+
+  it('does not hammer openTable on repeated queries while the table remains missing (bounded retry)', async () => {
+    const db = {
+      openTable: vi.fn().mockRejectedValue(new Error('table not found')),
+      createTable: vi.fn(),
+      close: vi.fn(),
+    };
+    connectMock.mockResolvedValue(db);
+
+    const store = new LanceDBStore('/fake/index/dir');
+    await store.init();
+
+    await expect(store.hybridSearch('needle', [0.1], 5)).rejects.toBeInstanceOf(IndexNotReadyError);
+    await expect(store.hybridSearch('needle', [0.1], 5)).rejects.toBeInstanceOf(IndexNotReadyError);
+    await expect(store.hybridSearch('needle', [0.1], 5)).rejects.toBeInstanceOf(IndexNotReadyError);
+
+    // init() (1) + exactly ONE retry attempt per search (3) = 4 — never a
+    // spin/unbounded retry within a single call.
+    expect(db.openTable).toHaveBeenCalledTimes(4);
+  });
+
+  it('connects with readConsistencyInterval so a live process observes writes made by another process', async () => {
+    const table = makeFakeTable({ vecRows: async () => [], ftsRows: async () => [] });
+    const db = makeFakeDb(table);
+    connectMock.mockResolvedValue(db);
+
+    const store = new LanceDBStore('/fake/index/dir');
+    await store.init();
+
+    expect(connectMock).toHaveBeenCalledWith(
+      '/fake/index/dir',
+      expect.objectContaining({ readConsistencyInterval: 0 }),
+    );
   });
 });
 

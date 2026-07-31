@@ -1,3 +1,4 @@
+import { IndexNotReadyError } from '../rag/store/LanceDBStore';
 import type { SearchHit } from '../rag/store/VectorStore';
 import { mintFrameNonce } from './lsp/frameSanitize';
 import { frameLspResult } from './lsp/resultShaper';
@@ -60,6 +61,15 @@ export function makeCodebaseSearchHandler(deps: {
       // presence) and the LSP-side tools ship no `structuredContent` at all
       // for the identical reason — so it is dropped rather than sanitized:
       // there is nothing here worth a second copy of the frame machinery.
+      // CF-04 / L5 F-7: an empty `hits` array used to become `content: []`
+      // — on the wire, indistinguishable from a request the SDK never
+      // fulfilled at all. Say plainly that the search ran and found
+      // nothing, rather than going silent (the OTHER empty case — the
+      // index not existing yet — is a distinct, thrown condition handled
+      // in the catch block below, never folded into this message).
+      if (hits.length === 0) {
+        return { content: [{ type: 'text' as const, text: '(no results)' }] };
+      }
       const nonce = mintFrameNonce();
       return {
         content: hits.map((h) => ({ type: 'text' as const, text: frameLspResult(formatHitAsText(h), nonce) })),
@@ -73,6 +83,14 @@ export function makeCodebaseSearchHandler(deps: {
         deps.log?.(`codebase_search failed: ${error instanceof Error ? error.message : 'unknown'}`);
       } catch {
         // Intentionally ignored — see comment above.
+      }
+      // CF-04: `LanceDBStore.hybridSearch` throws this specific, detail-free
+      // error when the codebase index hasn't been built yet (first-ever run
+      // racing indexing — see LanceDBStore.ts). That's an honest, EXPECTED
+      // state, not the unexpected-failure case the generic message below is
+      // for — say so plainly instead of collapsing both into one string.
+      if (error instanceof IndexNotReadyError) {
+        return { content: [{ type: 'text' as const, text: '(index not ready)' }] };
       }
       return {
         content: [{ type: 'text' as const, text: '[codebase_search: error] search failed unexpectedly' }],

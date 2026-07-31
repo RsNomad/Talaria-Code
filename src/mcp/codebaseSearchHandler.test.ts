@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { SearchHit } from '../rag/store/VectorStore';
+import { IndexNotReadyError } from '../rag/store/LanceDBStore';
 import { makeCodebaseSearchHandler } from './codebaseSearchHandler';
 import { must } from '../testing/must';
 
@@ -108,5 +109,55 @@ describe('makeCodebaseSearchHandler — no raw hit content on any channel (V-21 
     const result = await handler({ query: 'x' });
 
     expect(JSON.stringify(result)).not.toContain(maliciousContent);
+  });
+});
+
+/**
+ * CF-04 / L5 F-7: an empty `hits` array used to become `content: []` —
+ * indistinguishable, on the wire, from a request the SDK never actually
+ * fulfilled. That's dishonest in two different ways: (1) a genuinely
+ * empty search result should say so, not go silent; (2) a search that
+ * couldn't run at all because the index hasn't been built yet
+ * (`LanceDBStore.hybridSearch` throws `IndexNotReadyError` — see
+ * `LanceDBStore.test.ts`) must say THAT, not be folded into either "no
+ * matches" or the generic D-3 error text.
+ */
+describe('makeCodebaseSearchHandler — honest empty (CF-04)', () => {
+  it('returns an honest "(no results)" text block, not an empty content array, when the search genuinely finds nothing', async () => {
+    const handler = makeCodebaseSearchHandler({ runSearch: async () => ({ hits: [] }) });
+
+    const result = await handler({ query: 'x' });
+
+    expect(result.content).toHaveLength(1);
+    expect(must(result.content[0]).text).toContain('no results');
+  });
+
+  it('returns an honest "(index not ready)" text block when the store has not built its index yet', async () => {
+    const handler = makeCodebaseSearchHandler({
+      runSearch: async () => {
+        throw new IndexNotReadyError();
+      },
+    });
+
+    const result = await handler({ query: 'x' });
+
+    expect(result.content).toHaveLength(1);
+    expect(must(result.content[0]).text).toContain('index not ready');
+    // Distinct from the generic D-3 catch-all — this is an honest, EXPECTED
+    // state (first-ever run before indexing finishes), not an unexpected
+    // failure.
+    expect(must(result.content[0]).text).not.toContain('unexpectedly');
+  });
+
+  it('still returns the generic D-3 failure text for a real, non-readiness error', async () => {
+    const handler = makeCodebaseSearchHandler({
+      runSearch: async () => {
+        throw new Error('boom');
+      },
+    });
+
+    const result = await handler({ query: 'x' });
+
+    expect(must(result.content[0]).text).toBe('[codebase_search: error] search failed unexpectedly');
   });
 });
