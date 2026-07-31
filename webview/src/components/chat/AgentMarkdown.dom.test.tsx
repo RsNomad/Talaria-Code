@@ -196,3 +196,62 @@ describe('W2 T9: markdown v2 — italic, nested lists, blockquote, tables', () =
     expect(screen.queryByText(/\| Name \| Value \|/)).not.toBeInTheDocument();
   });
 });
+
+/**
+ * UI#2 review (security Important, reproduced): `renderBlock` <-> `renderBlocks`
+ * (the mutually-recursive blockquote cycle) and `buildList` (per-indentation-
+ * level recursion) both recursed with NO depth cap. `AgentMarkdown` renders
+ * UNTRUSTED agent/MCP-tool output, and a few thousand leading `>` characters
+ * — or a staircase-indented list — are trivial for that output to contain
+ * (including via prompt injection in echoed tool output), so an attacker
+ * could crash the render with `RangeError: Maximum call stack size
+ * exceeded`. The chat-view ErrorBoundary contains the crash to that region,
+ * but the region becomes unusable, which contradicts the renderer's own
+ * threat model. Both recursions are now bounded (`MAX_BLOCK_DEPTH` /
+ * `MAX_LIST_DEPTH`) and degrade to plain/flat rendering past the cap instead
+ * of continuing to recurse.
+ */
+describe('UI#2 review: markdown block/list recursion depth is capped against untrusted input', () => {
+  it('a pathologically deep blockquote renders without throwing (degrades past the depth cap)', () => {
+    const deep = '>'.repeat(2000) + ' x';
+    expect(() => render(<AgentMarkdown text={deep} />)).not.toThrow();
+  });
+
+  it('a pathologically staircased nested list renders without throwing (degrades past the depth cap)', () => {
+    const lines = Array.from({ length: 6000 }, (_, i) => `${' '.repeat(i)}- level ${i}`);
+    const deep = lines.join('\n');
+    expect(() => render(<AgentMarkdown text={deep} />)).not.toThrow();
+  });
+});
+
+/**
+ * M-1 (review-verified-by-hand, now locked as regression coverage): the C2
+ * link-scheme gate lives in `inline()`'s regex, and every leaf block
+ * (paragraph, table cell, list item, blockquote content) routes its content
+ * through `inline()`. These tests lock that uniformity so a future refactor
+ * that special-cases one of those call sites can't silently reintroduce a
+ * `javascript:`/`data:` anchor bypass in just that one spot.
+ */
+describe('M-1: the C2 link-scheme gate applies uniformly inside table cells, list items, and blockquotes', () => {
+  it('does NOT render a javascript: link as an anchor inside a table cell', () => {
+    render(
+      <AgentMarkdown
+        text={'| Name | Link |\n| --- | --- |\n| a | [x](javascript:alert(1)) |'}
+      />,
+    );
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByText(/javascript:alert\(1\)/)).toBeInTheDocument();
+  });
+
+  it('does NOT render a javascript: link as an anchor inside a list item', () => {
+    render(<AgentMarkdown text={'- [x](javascript:alert(1))'} />);
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByText(/javascript:alert\(1\)/)).toBeInTheDocument();
+  });
+
+  it('does NOT render a javascript: link as an anchor inside a blockquote', () => {
+    render(<AgentMarkdown text={'> [x](javascript:alert(1))'} />);
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByText(/javascript:alert\(1\)/)).toBeInTheDocument();
+  });
+});

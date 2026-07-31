@@ -172,20 +172,42 @@ interface ListNode {
  * ordered) at the SAME indent ends the current list — the caller decides
  * what, if anything, follows.
  */
-function buildList(lines: ListLine[], cursor: { i: number }, indent: number): ListNode {
+/** UI#2 review (security Important): `buildList` recurses once per
+ * indentation level with no bound, so a staircase-indented list (each line
+ * indented one step deeper than the last) in UNTRUSTED agent/tool output —
+ * a few thousand lines is trivial to produce — recursed thousands of levels
+ * deep and overflowed the JS call stack (`RangeError`), crashing the whole
+ * chat-view render. 16 is far beyond any indentation depth a human or a
+ * well-behaved agent would ever produce (3-4 levels is already unusually
+ * deep) and far below typical JS engine stack limits, so legitimate content
+ * never gets near it while adversarial staircase input is stopped cold. */
+const MAX_LIST_DEPTH = 16;
+
+function buildList(
+  lines: ListLine[],
+  cursor: { i: number },
+  indent: number,
+  depth = 0,
+): ListNode {
   const items: { content: string; children: ListNode[] }[] = [];
   const first = lines[cursor.i];
   const ordered = first?.ordered ?? false;
+  // Past MAX_LIST_DEPTH: stop recursing into children entirely. Instead of
+  // breaking on `line.indent > indent` (which would hand the deeper lines to
+  // a recursive call), fold them into THIS list's own flat items — degrading
+  // gracefully to a flatter (but still fully rendered, never-crashing) list
+  // rather than continuing to recurse toward the stack limit.
+  const capped = depth >= MAX_LIST_DEPTH;
   while (cursor.i < lines.length) {
     const line = lines[cursor.i];
     if (!line || line.indent < indent) break;
-    if (line.indent > indent) break; // handled by the recursive call below
+    if (!capped && line.indent > indent) break; // handled by the recursive call below
     if (line.ordered !== ordered) break; // marker-type switch ends this list
     cursor.i++;
     const children: ListNode[] = [];
     const next = lines[cursor.i];
-    if (next && next.indent > indent) {
-      children.push(buildList(lines, cursor, next.indent));
+    if (!capped && next && next.indent > indent) {
+      children.push(buildList(lines, cursor, next.indent, depth + 1));
     }
     items.push({ content: line.content, children });
   }
@@ -285,12 +307,25 @@ function renderTable(table: ParsedTable, key: string): ReactNode {
   );
 }
 
+/** UI#2 review (security Important): `renderBlock` and `renderBlocks` are
+ * mutually recursive through the blockquote branch below with no depth
+ * bound, so UNTRUSTED agent/tool output containing a run of leading `>`
+ * characters (trivial to produce, including via prompt injection in echoed
+ * tool output — e.g. `'>'.repeat(2000)`) recursed once per `>` and
+ * overflowed the JS call stack, crashing the whole chat-view render. 16 is
+ * far beyond any blockquote nesting a human or well-behaved agent would ever
+ * produce (2-3 levels is already unusual) and far below typical JS engine
+ * stack limits, so legitimate content never gets near it while a
+ * few-thousand-deep adversarial input is stopped cold. */
+const MAX_BLOCK_DEPTH = 16;
+
 /** Renders one blank-line-delimited block: heading, table, (nested) list,
  * blockquote, or — the fallback — a paragraph. Recursed into from the
  * blockquote branch below so quoted text still gets the same inline
  * formatting (and, for free, the same block-level structure) as top-level
- * text. */
-function renderBlock(block: string, key: string): ReactNode {
+ * text. `depth` counts how many blockquote levels this call is already
+ * nested inside — see MAX_BLOCK_DEPTH above. */
+function renderBlock(block: string, key: string, depth = 0): ReactNode {
   const heading = /^(#{1,6})\s+(.*)$/.exec(block.trim());
   if (heading) {
     // Audit G-5: this used to be a bold <p>. Visually similar, but
@@ -327,9 +362,22 @@ function renderBlock(block: string, key: string): ReactNode {
   const nonBlank = lines.filter((l) => l.trim().length > 0);
   if (nonBlank.length > 0 && nonBlank.every((l) => /^\s*>/.test(l))) {
     const dedented = lines.map((l) => l.replace(/^\s*>\s?/, '')).join('\n');
+    if (depth >= MAX_BLOCK_DEPTH) {
+      // At/past the cap: stop descending through the renderBlock <->
+      // renderBlocks cycle entirely. Render the remaining (already-dedented)
+      // content as one plain paragraph with inline formatting only — no
+      // further block-level recursion, no further blockquote descent — so
+      // arbitrarily deep adversarial `>` nesting can never grow the call
+      // stack past MAX_BLOCK_DEPTH levels.
+      return (
+        <p key={key} className="mb-2 last:mb-0">
+          {inline(dedented, key)}
+        </p>
+      );
+    }
     return (
       <blockquote key={key} className="mb-2 border-l-2 border-border pl-3 text-muted last:mb-0">
-        {renderBlocks(dedented, `${key}-bq`)}
+        {renderBlocks(dedented, `${key}-bq`, depth + 1)}
       </blockquote>
     );
   }
@@ -343,12 +391,13 @@ function renderBlock(block: string, key: string): ReactNode {
 
 /** Splits `text` on blank lines into blocks and renders each. Shared by the
  * top-level call (per fenced-code-split token) and the blockquote branch
- * above (recursing into its own dedented text). */
-function renderBlocks(text: string, keyPrefix: string): ReactNode {
+ * above (recursing into its own dedented text). `depth` is passed straight
+ * through to `renderBlock` — see MAX_BLOCK_DEPTH above. */
+function renderBlocks(text: string, keyPrefix: string, depth = 0): ReactNode {
   const blocks = text.split(/\n{2,}/).filter((p) => p.trim().length);
   return (
     <Fragment key={keyPrefix}>
-      {blocks.map((block, pi) => renderBlock(block, `${keyPrefix}-${pi}`))}
+      {blocks.map((block, pi) => renderBlock(block, `${keyPrefix}-${pi}`, depth))}
     </Fragment>
   );
 }
