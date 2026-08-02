@@ -1033,7 +1033,7 @@ export function Composer({
             onCompositionEnd={() => {
               composingRef.current = false;
             }}
-            className="w-full resize-none overflow-y-auto bg-transparent px-3 py-2 text-[12.5px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:cursor-not-allowed disabled:opacity-60"
+            className="w-full resize-none overflow-y-auto bg-transparent px-3 py-2 text-[12.5px] leading-relaxed text-fg outline-hidden placeholder:text-faint disabled:cursor-not-allowed disabled:opacity-60"
           />
         </div>
 
