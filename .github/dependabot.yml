@@ -3,19 +3,41 @@ updates:
   # Extension + webview npm dependencies. One root package-lock.json covers the
   # npm workspace (root + webview), so a single "/" entry is enough. Minor/patch
   # bumps are grouped into one PR each (prod vs dev) to cut review noise; every
-  # MAJOR bump still arrives as its own PR so it gets deliberate attention.
+  # MAJOR bump still arrives as its own PR so it gets deliberate attention —
+  # except the peer-coupled react/vite families below, whose members can never
+  # pass CI when bumped in separate PRs, so they move together (any update type).
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: monthly
     open-pull-requests-limit: 10
     groups:
+      # react + react-dom + their types move as ONE PR, any update type.
+      react-family:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      # vite + plugin + vitest move together (peer-coupled).
+      vite-family:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
+          - "vitest"
+          - "@vitest/*"
       prod-minor-patch:
         dependency-type: production
         update-types: [minor, patch]
       dev-minor-patch:
         dependency-type: development
         update-types: [minor, patch]
+    ignore:
+      # @types/node tracks the VS Code extension-host Node runtime (22.x for
+      # the ^1.125.0 engine), not the newest Node — typing APIs the host does
+      # not have is a correctness hazard. Minor/patch updates still flow.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   # Keep the GitHub Actions versions current on their own schedule — this is what
   # prevents an action from silently drifting onto a deprecated runtime (e.g. the
