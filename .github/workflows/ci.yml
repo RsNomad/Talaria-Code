@@ -52,7 +52,7 @@ jobs:
         run: npx @vscode/vsce package --out talaria-code-ci.vsix
 
       - name: Upload .vsix artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: talaria-code-vsix
           path: talaria-code-ci.vsix
