@@ -49,7 +49,16 @@ describe('createIgnoreFilter — AUDIT-5 F-6: the out-of-scope contract is LOUD 
     expect(isPathValid('..')).toBe(false);
     expect(isPathValid('../sibling/a.ts')).toBe(false);
     expect(isPathValid('/abs/a.ts')).toBe(false);
-    expect(isPathValid('C:/abs/a.ts')).toBe(false);
+    // NOT pinned: `isPathValid`'s drive-letter rejection is a Windows-only
+    // code path (`ignore`'s `setupWindows()` swaps in a
+    // `^[a-z]:\//i`-aware `isNotRelative`, gated on `process.platform ===
+    // 'win32'` — node_modules/ignore/index.js). On POSIX (the Fedora ship
+    // target and Linux CI) `'C:/abs/a.ts'` doesn't match the plain
+    // `REGEX_TEST_INVALID_PATH` (`/^\.{0,2}\/|^\.{1,2}$/`), so it's treated
+    // as an ordinary valid relative path — `isPathValid` legitimately
+    // returns `true` there. This is a portable-vs-host-OS distinction in
+    // the third-party library itself, not something `isPathValid` promises
+    // cross-platform, so it isn't a portable "out-of-scope" fixture to pin.
     expect(isPathValid('src/app.ts')).toBe(true);
     expect(isPathValid('index/manifest.json')).toBe(true);
   });

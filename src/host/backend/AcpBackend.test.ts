@@ -818,6 +818,51 @@ function readTextFile(backend: AcpBackend): ReadTextFileHandler {
   );
 }
 
+/**
+ * A `ConfinedReader` that always reports unsupported, as `makeProcFdReader()`
+ * (the real, default one — see `./acp/confinedOpen`) does off-Linux. Its own
+ * `supported()` probe is gated on `process.platform === 'linux'` and, on a
+ * REAL Linux host (e.g. the CI runner), legitimately PASSES — at which point
+ * `handleReadTextFile` reads through the confined O_PATH path instead of the
+ * `else` branch that calls the mocked `vscode.workspace.fs.readFile`. Tests
+ * that assert on `mockWorkspace.__fileBody` are keyed to that `else` branch;
+ * without pinning `supported()` to `false` here, they silently swap to
+ * reading the REAL on-disk bytes on Linux and fail — not because
+ * `handleReadTextFile` is wrong (the confined reader's own real-Linux
+ * behavior is exhaustively covered by `confinedOpen.test.ts`'s
+ * platform-gated "Linux real FS" block), but because the test double for
+ * `vscode.workspace.fs` was silently bypassed. Pin it so the code path under
+ * test is deterministic on every platform.
+ */
+function unsupportedConfinedReader(): ConfinedReader {
+  return {
+    supported: async () => false,
+    readContained: async () => {
+      throw new Error(
+        'unsupportedConfinedReader: readContained must never be called when supported() is false',
+      );
+    },
+  };
+}
+
+/**
+ * Constructs an `AcpBackend` wired with {@link unsupportedConfinedReader} so
+ * `handleReadTextFile` always resolves reads through the mocked
+ * `vscode.workspace.fs`, independent of host platform (see that helper's doc).
+ */
+function backendWithMockedFsRead(config: HermesRuntimeConfig = {} as HermesRuntimeConfig): AcpBackend {
+  return new AcpBackend(
+    config,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    unsupportedConfinedReader(),
+  );
+}
+
 /** Minimal stand-in for `ControlChannel` — only the surface `invokeControl`/`start` touches. */
 class FakeControlChannel {
   dispatchCalls: Array<{ method: string; params?: unknown }> = [];
@@ -4973,7 +5018,10 @@ describe('AcpBackend.handleReadTextFile — workspace confinement (findings M1 /
     await fsp.writeFile(file, 'on-disk body is irrelevant; read is mocked');
     mockWorkspace.workspaceFolders = [{ uri: { fsPath: tmpRoot } }];
     mockWorkspace.__fileBody = 'line1\nline2\nline3';
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    // Pinned to the mocked-fs path (see `backendWithMockedFsRead`) — on a real
+    // Linux host the default confined reader is legitimately `supported()`
+    // and would read the on-disk body above instead of the mock.
+    const backend = backendWithMockedFsRead();
 
     const result = await readTextFile(backend)(file, null, null);
     expect(result).toBe('line1\nline2\nline3');
@@ -5044,44 +5092,51 @@ describe('AcpBackend.handleReadTextFile — wire-integer validation for line/lim
     mockWorkspace.workspaceFolders = undefined;
   });
 
+  // Every test below reads `file` (which exists inside a valid, open
+  // workspace), so every one of them reaches `confinedReader.supported()`.
+  // Use `backendWithMockedFsRead()` throughout so the byte source stays
+  // pinned to the `__fileBody` mock above on every platform — see that
+  // helper's doc for why the default (real) confined reader is unsafe to
+  // leave un-pinned here.
+
   it('rejects a negative limit instead of silently returning an empty window', async () => {
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    const backend = backendWithMockedFsRead();
 
     await expect(readTextFile(backend)(file, 1, -5)).rejects.toThrow(/limit/i);
   });
 
   it('rejects a NaN line instead of silently returning the whole file from the start', async () => {
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    const backend = backendWithMockedFsRead();
 
     await expect(readTextFile(backend)(file, NaN, 1)).rejects.toThrow(/line/i);
   });
 
   it('rejects line below 1 (0 is no longer silently treated as line 1)', async () => {
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    const backend = backendWithMockedFsRead();
 
     await expect(readTextFile(backend)(file, 0, null)).rejects.toThrow(/line/i);
   });
 
   it('rejects a non-integer line', async () => {
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    const backend = backendWithMockedFsRead();
 
     await expect(readTextFile(backend)(file, 1.5, null)).rejects.toThrow(/line/i);
   });
 
   it('rejects a non-integer limit', async () => {
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    const backend = backendWithMockedFsRead();
 
     await expect(readTextFile(backend)(file, 1, 2.5)).rejects.toThrow(/limit/i);
   });
 
   it('allows limit:0 as a legitimate empty-window request (only < 0 is rejected)', async () => {
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    const backend = backendWithMockedFsRead();
 
     await expect(readTextFile(backend)(file, 1, 0)).resolves.toBe('');
   });
 
   it('does not interpolate the rejected wire value into the error message', async () => {
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    const backend = backendWithMockedFsRead();
 
     let caught: unknown;
     try {
@@ -5094,7 +5149,7 @@ describe('AcpBackend.handleReadTextFile — wire-integer validation for line/lim
   });
 
   it('keeps a valid line/limit window unchanged (line:2, limit:1)', async () => {
-    const backend = new AcpBackend({} as HermesRuntimeConfig);
+    const backend = backendWithMockedFsRead();
 
     const result = await readTextFile(backend)(file, 2, 1);
     expect(result).toBe('line2');
