@@ -54,3 +54,54 @@ describe('theme.css — audit-3 A-2: --h-faint reads off descriptionForeground, 
     expect(matches.length).toBe(1);
   });
 });
+
+/**
+ * AUDIT-5 UI M-1 (Task 7 redesign) — the three-tier text ladder must be three
+ * tiers IN-EDITOR. `--h-muted` becomes the color-mix midpoint of the theme's
+ * two text anchors; `--h-faint` stays on descriptionForeground (the safe
+ * floor — audit-3 A-2 above is UNTOUCHED and must stay green). Contrast
+ * grounding: docs_claude/audit5-remediation-architecture.md, Addendum 2.
+ */
+function extractMutedDeclaration(css: string): string {
+  const match = css.match(/^\s*--h-muted:.*;\s*$/m);
+  if (!match) {
+    throw new Error('no `--h-muted:` declaration found in theme.css — has the token been renamed?');
+  }
+  return match[0];
+}
+
+/** All --vscode-* variables referenced by a declaration line, deduped+sorted. */
+function vscodeVarsOf(decl: string): string[] {
+  return [...new Set(decl.match(/--vscode-[a-zA-Z-]+/g) ?? [])].sort();
+}
+
+describe('theme.css — AUDIT-5 UI M-1: --h-muted is a real middle tier, distinct from --h-faint in-editor', () => {
+  it('muted does not resolve to the same --vscode-* variable set as faint (the tier-collapse pin)', () => {
+    const css = readFileSync(THEME_CSS_PATH, 'utf-8');
+    expect(vscodeVarsOf(extractMutedDeclaration(css))).not.toEqual(vscodeVarsOf(extractFaintDeclaration(css)));
+  });
+
+  it('muted is the color-mix(in srgb) midpoint of foreground and descriptionForeground', () => {
+    const css = readFileSync(THEME_CSS_PATH, 'utf-8');
+    const decl = extractMutedDeclaration(css);
+    expect(decl).toContain('color-mix(in srgb');
+    expect(decl).toContain('--vscode-foreground');
+    expect(decl).toContain('--vscode-descriptionForeground');
+  });
+
+  it('regression pin (green both sides): muted never references --vscode-disabledForeground (audit-3 A-2 guarantee extended to the middle tier)', () => {
+    const css = readFileSync(THEME_CSS_PATH, 'utf-8');
+    expect(extractMutedDeclaration(css)).not.toContain('--vscode-disabledForeground');
+  });
+
+  it('regression pin (green both sides): faint stays the plain descriptionForeground floor (no color-mix on the faint tier)', () => {
+    const css = readFileSync(THEME_CSS_PATH, 'utf-8');
+    expect(extractFaintDeclaration(css)).not.toContain('color-mix');
+  });
+
+  it('sanity: exactly one --h-muted declaration exists', () => {
+    const css = readFileSync(THEME_CSS_PATH, 'utf-8');
+    const matches = css.match(/^\s*--h-muted:.*;\s*$/gm) ?? [];
+    expect(matches.length).toBe(1);
+  });
+});

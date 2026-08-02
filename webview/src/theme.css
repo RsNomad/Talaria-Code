@@ -22,8 +22,19 @@
 
   /* ---- text (follow VS Code) ---- */
   --h-fg: var(--vscode-foreground, #e7ecf1);
-  --h-muted: var(--vscode-descriptionForeground, #b4bfc8);
-  /* faint = tertiary ACTIVE text tier; genuinely-disabled controls use
+  /* muted = secondary tier: the color-mix midpoint of the theme's two text
+     anchors, so the 3-tier ladder is three tiers IN-EDITOR (AUDIT-5 UI M-1).
+     Mixing BETWEEN foreground and descriptionForeground keeps the composited
+     contrast bounded below by the theme's own weaker text token — theme-
+     adaptive, no WCAG downside possible. Where a theme ships
+     foreground == descriptionForeground (Light Modern does), the ladder
+     flattens exactly as the host UI itself does. */
+  --h-muted: color-mix(in srgb, var(--vscode-foreground, #e7ecf1) 50%, var(--vscode-descriptionForeground, #8a949e) 50%);
+  /* faint = tertiary ACTIVE text tier = descriptionForeground, the quietest
+     text VS Code itself deems readable (audit-3 A-2: NEVER disabledForeground,
+     which is sub-WCAG by design — ~3.6:1 dark / ~2.2:1 light). There is no
+     safe tier below this one: stock Light+ puts descriptionForeground at
+     4.88:1 against the 4.5:1 AA floor. Genuinely-disabled controls use
      `disabled:opacity-*` modifiers, never this token. */
   --h-faint: var(--vscode-descriptionForeground, #8a949e);
 
