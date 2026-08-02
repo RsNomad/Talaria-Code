@@ -1,0 +1,48 @@
+name: CodeQL
+
+# Static security analysis for the TypeScript/JavaScript sources. Runs on
+# push/PR to main and weekly (to catch newly-published query rules against
+# unchanged code). FREE on public repositories; on a PRIVATE repo it requires
+# GitHub Advanced Security — if this repo is private without GHAS, delete this
+# workflow (it will otherwise fail to upload results).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 3 * * 1" # Mondays 03:27 UTC
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write # upload the analysis results to the Security tab
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          language: ${{ matrix.language }}
+          # `security-and-quality` adds maintainability queries on top of the
+          # default security set — appropriate for a security-focused extension.
+          queries: security-and-quality
+
+      # JS/TS needs no compilation step for CodeQL — analyze the sources directly.
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

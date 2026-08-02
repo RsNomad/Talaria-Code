@@ -8,7 +8,7 @@ Local-first. Your models, your machine.
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](./LICENSE)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.125-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Local-first](https://img.shields.io/badge/Local--first-no%20cloud-2ea44f)](#privacy--security)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%C2%B7%20Fedora-51A2DA?logo=linux&logoColor=white)](#requirements)
+[![Platform](https://img.shields.io/badge/Platform-Linux-51A2DA?logo=linux&logoColor=white)](#requirements)
 
 **English** · [Русский](./README.ru.md) · [中文](./README.zh-CN.md)
 
@@ -63,7 +63,7 @@ This is the whole point of Talaria Code, not an afterthought:
 | Requirement | Notes |
 |---|---|
 | **VS Code** | `^1.125` |
-| **OS** | Primary target **Linux (Fedora)**. The mock UI runs anywhere, but the live backend targets Linux; other platforms are currently untested. |
+| **OS** | Primary target **Linux**. The mock UI runs anywhere, but the live backend targets Linux; other platforms are currently untested. |
 | **Hermes agent** | The backend Talaria Code drives (`hermes acp` + `python -m tui_gateway.entry`). The extension is a Hermes *client*. |
 | **A local model runtime** | **Ollama**, **vLLM**, or **llama.cpp**, serving: a chat/agent model (via Hermes), a FIM completion model (default `qwen2.5-coder:1.5b-base`), and an embedding model for RAG (default `qwen3-embedding:0.6b`). |
 

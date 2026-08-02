@@ -8,7 +8,7 @@
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](./LICENSE)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.125-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Local-first](https://img.shields.io/badge/Local--first-no%20cloud-2ea44f)](#隐私与安全)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%C2%B7%20Fedora-51A2DA?logo=linux&logoColor=white)](#环境要求)
+[![Platform](https://img.shields.io/badge/Platform-Linux-51A2DA?logo=linux&logoColor=white)](#环境要求)
 
 [English](./README.md) · [Русский](./README.ru.md) · **中文**
 
@@ -56,7 +56,7 @@ Talaria Code 在 VS Code 的原生侧边面板中提供一个 **智能体式（a
 | 要求 | 说明 |
 |---|---|
 | **VS Code** | `^1.125` |
-| **操作系统** | 主要目标为 **Linux（Fedora）**。mock 界面可在任意系统运行，但实时后端面向 Linux；其他平台目前未经测试。 |
+| **操作系统** | 主要目标为 **Linux**。mock 界面可在任意系统运行，但实时后端面向 Linux；其他平台目前未经测试。 |
 | **Hermes 代理** | Talaria Code 所驱动的后端（`hermes acp` + `python -m tui_gateway.entry`）。本扩展是 Hermes 的*客户端*。 |
 | **本地模型运行时** | **Ollama**、**vLLM** 或 **llama.cpp**，需提供：对话/代理模型（经由 Hermes）、FIM 补全模型（默认 `qwen2.5-coder:1.5b-base`），以及用于 RAG 的嵌入模型（默认 `qwen3-embedding:0.6b`）。 |
 

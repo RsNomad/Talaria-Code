@@ -8,7 +8,7 @@ Local-first. Ваши модели, ваша машина.
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](./LICENSE)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.125-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Local-first](https://img.shields.io/badge/Local--first-no%20cloud-2ea44f)](#приватность-и-безопасность)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%C2%B7%20Fedora-51A2DA?logo=linux&logoColor=white)](#требования)
+[![Platform](https://img.shields.io/badge/Platform-Linux-51A2DA?logo=linux&logoColor=white)](#требования)
 
 [English](./README.md) · **Русский** · [中文](./README.zh-CN.md)
 
@@ -67,7 +67,7 @@ Talaria Code встраивает **агентного ИИ-ассистента
 | Требование | Примечания |
 |---|---|
 | **VS Code** | `^1.125` |
-| **ОС** | Основная цель — **Linux (Fedora)**. Mock-интерфейс работает где угодно, но живой бэкенд рассчитан на Linux; остальные платформы пока не тестировались. |
+| **ОС** | Основная цель — **Linux**. Mock-интерфейс работает где угодно, но живой бэкенд рассчитан на Linux; остальные платформы пока не тестировались. |
 | **Агент Hermes** | Бэкенд, которым управляет Talaria Code (`hermes acp` + `python -m tui_gateway.entry`). Расширение — это *клиент* Hermes. |
 | **Локальный раннер моделей** | **Ollama**, **vLLM** или **llama.cpp**, обслуживающий: чат/агентную модель (через Hermes), FIM-модель для автодополнения (по умолчанию `qwen2.5-coder:1.5b-base`) и модель эмбеддингов для RAG (по умолчанию `qwen3-embedding:0.6b`). |
 

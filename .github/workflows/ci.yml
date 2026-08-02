@@ -1,0 +1,60 @@
+name: CI
+
+# Runs the full quality gate (host + webview typecheck, the whole vitest suite)
+# and a package smoke (proves a shippable .vsix actually builds) on every push
+# and PR to main. Linux-only on purpose: it is the ship target (Fedora/Linux)
+# and it avoids the Windows-only CheckpointTracker EBUSY test flake.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same ref cancels the older, still-running job.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Typecheck + tests + package smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      # Clean, reproducible install straight from package-lock.json.
+      # npm workspaces: this also installs the webview workspace's deps.
+      - name: Install dependencies
+        run: npm ci
+
+      # npm run gate = npm run check-types:all && npm test
+      #   check-types:all -> tsc (host) + vue-tsc/tsc (webview)
+      #   npm test        -> pretest builds host+webview, then vitest run
+      - name: Gate — typecheck (host + webview) + full test suite
+        run: npm run gate
+
+      # Proves the extension packages into a real .vsix (catches esbuild/vite/
+      # manifest breaks that unit tests can't see). vsce runs vscode:prepublish
+      # (production build) itself; native deps (@lancedb/lancedb, web-tree-sitter)
+      # are included as prod dependencies for the linux-x64 runner.
+      - name: Package smoke — build a .vsix
+        run: npx @vscode/vsce package --out talaria-code-ci.vsix
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: talaria-code-vsix
+          path: talaria-code-ci.vsix
+          if-no-files-found: error
+          retention-days: 14

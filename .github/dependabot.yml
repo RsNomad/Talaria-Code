@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Extension + webview npm dependencies. One root package-lock.json covers the
+  # npm workspace (root + webview), so a single "/" entry is enough. Minor/patch
+  # bumps are grouped into one PR each (prod vs dev) to cut review noise; every
+  # MAJOR bump still arrives as its own PR so it gets deliberate attention.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 10
+    groups:
+      prod-minor-patch:
+        dependency-type: production
+        update-types: [minor, patch]
+      dev-minor-patch:
+        dependency-type: development
+        update-types: [minor, patch]
+
+  # Keep the GitHub Actions versions current on their own schedule — this is what
+  # prevents an action from silently drifting onto a deprecated runtime (e.g. the
+  # Node 20 -> Node 24 runtime move).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5

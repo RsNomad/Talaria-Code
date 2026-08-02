@@ -5,6 +5,10 @@
   "version": "0.0.1",
   "publisher": "syntinal",
   "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/syntinal-co/Talaria-Code.git"
+  },
   "engines": {
     "vscode": "^1.125.0",
     "node": ">=18"
@@ -275,7 +279,7 @@
           ],
           "enumDescriptions": [
             "Canned streaming + panel data. Spawns no process; runs on any OS. Default.",
-            "Real backend: spawns `hermes acp` over JSON-RPC/stdio (Fedora/Linux). Wired later."
+            "Real backend: spawns `hermes acp` over JSON-RPC/stdio (Linux). Wired later."
           ],
           "default": "mock",
           "scope": "machine",
@@ -285,7 +289,7 @@
           "type": "number",
           "default": 9119,
           "scope": "machine",
-          "markdownDescription": "Loopback port for the Hermes dashboard REST server (`http://127.0.0.1:<port>`) that powers the real Skills & Tools panels. If a dashboard is already listening there it is adopted; otherwise the extension spawns `python -m hermes_cli.main serve --port <port>` (Fedora/Linux). Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot repoint it (security)."
+          "markdownDescription": "Loopback port for the Hermes dashboard REST server (`http://127.0.0.1:<port>`) that powers the real Skills & Tools panels. If a dashboard is already listening there it is adopted; otherwise the extension spawns `python -m hermes_cli.main serve --port <port>` (Linux). Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot repoint it (security)."
         },
         "talaria.dashboardAdopt": {
           "type": "string",
