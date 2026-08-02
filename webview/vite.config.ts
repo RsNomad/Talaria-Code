@@ -10,7 +10,7 @@ export default defineConfig({
   base: './',
   // The protocol contract is the single source of truth at
   // `../src/shared/protocol.ts` (host side); `src/protocol.ts` re-exports it.
-  // `vite build` (Rollup) resolves that out-of-root path with no extra config,
+  // `vite build` (Rolldown) resolves that out-of-root path with no extra config,
   // but the dev server's fs guard (server.fs.strict, default on) would 403 it —
   // so allow serving one level up to the repo root for `vite dev`.
   server: {
@@ -27,7 +27,9 @@ export default defineConfig({
       output: {
         // Flat, deterministic filenames so the extension host can hardcode
         // dist/webview/index.js + index.css in its <script>/<link> (no hashes).
-        inlineDynamicImports: true,
+        // Single bundle: Rolldown (Vite 8) deprecated `inlineDynamicImports: true`
+        // in favor of `codeSplitting: false` (same behavior — no chunks).
+        codeSplitting: false,
         entryFileNames: 'index.js',
         chunkFileNames: 'index.js',
         assetFileNames: (info) =>
