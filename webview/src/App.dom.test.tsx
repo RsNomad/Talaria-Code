@@ -294,6 +294,9 @@ describe('B2 item 4: ChatView wrapper carries role=tabpanel + aria-labelledby (A
  * `aria-selected`; `aria-current` is a DIFFERENT semantic (current item in a
  * navigation-style widget, e.g. a breadcrumb or nav menu) and was the wrong
  * attribute here.
+ *
+ * Task 10: PriorityTabs switches between 10 panels now (the Setup /
+ * Talaria Config panel joined the strip) — updated from the original 9.
  */
 describe('T-16 F9: every PriorityTabs tab controls a real role=tabpanel, and none carries aria-current', () => {
   const PANELS: Array<{ label: string }> = [
@@ -305,6 +308,7 @@ describe('T-16 F9: every PriorityTabs tab controls a real role=tabpanel, and non
     { label: 'Subagents' },
     { label: 'History' },
     { label: 'Models' },
+    { label: 'Setup' },
     { label: 'Settings' },
   ];
 

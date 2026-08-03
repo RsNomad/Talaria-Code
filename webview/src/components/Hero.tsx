@@ -15,6 +15,12 @@ interface HeroProps {
    * for the host to attach the prompt to; the message is silently dropped,
    * which otherwise reads as a dead click next to the greyed-out composer). */
   disabled?: boolean;
+  /**
+   * Task 10: deep-link into the Setup / Talaria Config panel. Optional so
+   * Hero still renders standalone without it; `App.tsx` always supplies it
+   * (`openSetup`, threaded through `ChatView`).
+   */
+  onOpenSetup?: () => void;
 }
 
 const STARTERS = [
@@ -23,7 +29,7 @@ const STARTERS = [
   { icon: 'git-pull-request', text: 'Refactor the auth module to async' },
 ];
 
-export function Hero({ onStarter, disabled }: HeroProps) {
+export function Hero({ onStarter, disabled, onOpenSetup }: HeroProps) {
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-5 px-6 py-8 text-center">
       <div className="flex flex-col items-center gap-2.5">
@@ -51,6 +57,21 @@ export function Hero({ onStarter, disabled }: HeroProps) {
           </button>
         ))}
       </div>
+
+      {/* Task 10: a low-key deep-link into the Setup / Talaria Config panel —
+          the empty-chat state is the first thing a fresh install sees, and
+          "set up my backends" is a more likely first move than any starter
+          chip above for that visitor. */}
+      {onOpenSetup && (
+        <button
+          type="button"
+          onClick={onOpenSetup}
+          className="inline-flex items-center gap-1.5 text-2xs text-faint underline-offset-2 hover:text-muted hover:underline"
+        >
+          <Icon name="rocket" size={12} className="flex-none" />
+          Set up backends
+        </button>
+      )}
     </div>
   );
 }

@@ -5,7 +5,8 @@ import { must } from '../testing/must';
 
 /**
  * T-19 (Tier-2 remediation architecture §12.1, C4 — drift lock), RE-BASED by
- * onboarding/setup Task 2 (§5.5/D7).
+ * onboarding/setup Task 2 (§5.5/D7), RE-BASED AGAIN by Task 10 (§6 — the
+ * Setup/Talaria-Config panel).
  *
  * The original lock byte-compared this mock's refusal copy against the real
  * Guard's `NEXT_ROW_LABEL`/`GENERIC_ROW_LABEL`/`REFUSAL_MESSAGES`
@@ -15,10 +16,19 @@ import { must } from '../testing/must';
  * REPLACES the first), and production no longer emits a mutual-exclusion
  * refusal at all — so there is no host copy left to compare against.
  *
+ * Task 10 moved the frozen row LITERAL (`NEXT_EDIT_ROWS`) out of
+ * `SettingsPanel.tsx` into its own module, `panels/nextEditCopy.ts` — the
+ * Setup panel needs the exact same copy, and Task 12 deletes the NEXT rows
+ * from `SettingsPanel.tsx` entirely (NEXT lives in Talaria Config after
+ * that), which would have orphaned this lock's extraction site. This file
+ * (and `MockBackend.ts`'s own import) were re-pointed at `nextEditCopy.ts`
+ * accordingly — the INTENT is unchanged: labels are single-sourced, the mock
+ * derives from them, and no hand-retyped copy is allowed to exist anywhere.
+ *
  * What remains to lock, and why each half matters:
  *
- *  1. The mock's row LABELS are DERIVED from the panel's own frozen row table
- *     (`NEXT_EDIT_ROWS`, `SettingsPanel.tsx` — owner copy, carried
+ *  1. The mock's row LABELS are DERIVED from the single-sourced frozen row
+ *     table (`NEXT_EDIT_ROWS`, `panels/nextEditCopy.ts` — owner copy, carried
  *     character-for-character), never retyped. That derivation is the U-6 fix
  *     that ended the original drift; this file pins it at the source level so
  *     a future edit cannot quietly reintroduce a hand-typed label.
@@ -31,7 +41,7 @@ import { must } from '../testing/must';
  *     behaviour in the meantime.
  */
 
-const SETTINGS_PANEL_PATH = join(__dirname, '..', 'panels', 'SettingsPanel.tsx');
+const NEXT_EDIT_COPY_PATH = join(__dirname, '..', 'panels', 'nextEditCopy.ts');
 const MOCK_BACKEND_PATH = join(__dirname, 'MockBackend.ts');
 
 /** Bracket-matched function body extraction — robust to the function's
@@ -66,24 +76,24 @@ function extractGroup1(re: RegExp, text: string, label: string): string {
 }
 
 describe('T-19 (C4) drift lock, re-based: MockBackend refusal copy derives from the frozen panel rows', () => {
-  const settingsSource = readFileSync(SETTINGS_PANEL_PATH, 'utf8');
+  const nextEditCopySource = readFileSync(NEXT_EDIT_COPY_PATH, 'utf8');
   const mockSource = readFileSync(MOCK_BACKEND_PATH, 'utf8');
 
   it('setup: both files exist and are read (non-vacuous — proves the paths above are right)', () => {
-    expect(settingsSource.length).toBeGreaterThan(0);
+    expect(nextEditCopySource.length).toBeGreaterThan(0);
     expect(mockSource.length).toBeGreaterThan(0);
   });
 
-  it('the frozen NEXT_EDIT_ROWS labels are still present in SettingsPanel.tsx, verbatim (owner copy, untouched by Task 2)', () => {
+  it('the frozen NEXT_EDIT_ROWS labels are still present in nextEditCopy.ts, verbatim (owner copy, single-sourced since Task 10)', () => {
     const nextLabel = extractGroup1(
       /source:\s*'next',\s*label:\s*'([^']+)'/s,
-      settingsSource,
-      "SettingsPanel.tsx 'next' row label",
+      nextEditCopySource,
+      "nextEditCopy.ts 'next' row label",
     );
     const genericLabel = extractGroup1(
       /source:\s*'generic',\s*label:\s*'([^']+)'/s,
-      settingsSource,
-      "SettingsPanel.tsx 'generic' row label",
+      nextEditCopySource,
+      "nextEditCopy.ts 'generic' row label",
     );
     expect(nextLabel).toBe('Next Edit — dedicated model');
     expect(genericLabel).toBe('Next Edit — Generic via your FIM model');
@@ -91,7 +101,7 @@ describe('T-19 (C4) drift lock, re-based: MockBackend refusal copy derives from 
 
   it('MockBackend DERIVES its labels from NEXT_EDIT_ROWS — imported, looked up by row, never retyped', () => {
     // The import — the only legitimate label source for the mock.
-    expect(mockSource).toMatch(/import\s+\{\s*NEXT_EDIT_ROWS\s*\}\s+from\s+'\.\.\/panels\/SettingsPanel';/);
+    expect(mockSource).toMatch(/import\s+\{\s*NEXT_EDIT_ROWS\s*\}\s+from\s+'\.\.\/panels\/nextEditCopy';/);
     // The lookup inside the refusal builder itself.
     const body = extractFunctionBody(mockSource, 'function mockRefusalMessage(');
     expect(body).toContain('NEXT_EDIT_ROWS.find');

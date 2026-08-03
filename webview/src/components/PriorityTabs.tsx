@@ -60,6 +60,11 @@ const TABS: TabDef[] = [
   { id: 'subagents', label: 'Subagents', icon: 'type-hierarchy' },
   { id: 'sessions', label: 'History', icon: 'archive' },
   { id: 'models', label: 'Models', icon: 'chip' },
+  // Task 10: the Setup / Talaria Config panel — placed beside its sibling
+  // "Agent config" tab (mirrors `package.json`'s `view/title` ordering,
+  // where `talaria.openSetup` sits at `navigation@1`, ahead of
+  // `talaria.openSettings` at `navigation@2`).
+  { id: 'setup', label: 'Setup', icon: 'rocket' },
   { id: 'settings', label: 'Settings', icon: 'settings' },
 ];
 

@@ -33,6 +33,7 @@ import type {
   UsageInfo,
 } from './protocol';
 import { BOOTSTRAP_TAB_ID } from './protocol';
+import { EMPTY_SETUP_PROGRESS, type SetupProgressMap } from './panels/setupCards';
 import type { PanelStateMap } from './state/panels';
 import { idle, type RemoteData } from './state/remoteData';
 
@@ -331,6 +332,16 @@ export interface AppState {
    * `draftAttachments` are deliberately NOT restored (see `persist.ts`).
    */
   restoredDrafts?: Record<string, string>;
+  /**
+   * Task 10: the client-side accumulation of `setup.progress` pushes for the
+   * Setup / Talaria Config panel (Agent install log lines, FIM/RAG model
+   * pull bytes), keyed by `${op}:${id}` (`setupCards.ts`'s `progressKey`).
+   * CONNECTION-GLOBAL — installing a backend or pulling a model is not
+   * scoped to any one chat tab, same posture as `nextEditToggles`/
+   * `backendKind` above. Folded by `state/transcript.ts`'s `setup.progress`
+   * case (Task 8 left that case an explicit no-op for this task to replace).
+   */
+  setupProgress: SetupProgressMap;
 }
 
 /** W2-F1 boot default — ask-everything until the host's live preset arrives. */
@@ -413,6 +424,7 @@ export function createInitialState(restored?: {
     nextChatNumber: restored?.nextChatNumber ?? 2,
     restoredTitles: restored?.tabTitles,
     restoredDrafts: restored?.drafts,
+    setupProgress: EMPTY_SETUP_PROGRESS,
   };
 }
 

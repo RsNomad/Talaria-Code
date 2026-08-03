@@ -32,6 +32,7 @@ import type {
 import { LiveRegion } from '../components/LiveRegion';
 import { Toggle } from '../components/Toggle';
 import type { RemoteData } from '../state/remoteData';
+import { NEXT_EDIT_ROWS } from './nextEditCopy';
 import { PanelShell, RemotePanel, SectionLabel } from './PanelShell';
 import {
   commitFieldEdit,
@@ -41,6 +42,14 @@ import {
   reconcileNextEditRowState,
   type FieldValue,
 } from './settingsField';
+
+// Task 10: the frozen row copy now lives in `./nextEditCopy` (the single
+// source both this panel and the Setup/Talaria-Config panel read from — see
+// that module's doc). Re-exported here so existing importers of
+// `NEXT_EDIT_ROWS` from `'./SettingsPanel'` (`SettingsPanel.test.ts`,
+// `SettingsPanel.dom.test.tsx`) keep working unchanged; Task 12 deletes the
+// NEXT rows (and this re-export) from this file entirely.
+export { NEXT_EDIT_ROWS };
 
 interface SettingsPanelProps {
   /**
@@ -75,37 +84,6 @@ interface SettingsPanelProps {
 
 /** The section heading both R5 rows live under (the pinned R5 naming). */
 export const NEXT_EDIT_SECTION_LABEL = 'Next Edit Suggestions';
-
-/**
- * The two R5 rows, NEXT first — the dedicated model is the flagship, Generic
- * is the fallback (`08` §8).
- *
- * This copy is OWNER-APPROVED and FROZEN (`08` §8's table, carried
- * character-for-character) and is locked by `SettingsPanel.test.ts`. The
- * honesty clauses are the point of it, not decoration: NEXT has no published
- * benchmark score and says so outright rather than borrowing a number, and
- * Generic's only number carries the "vendor-reported, unreplicated" qualifier
- * plus the "review every suggestion" instruction. Do not tighten, summarise,
- * or "improve" these strings.
- */
-export const NEXT_EDIT_ROWS: ReadonlyArray<{
-  source: NextEditToggleSource;
-  label: string;
-  description: string;
-}> = [
-  {
-    source: 'next',
-    label: 'Next Edit — dedicated model',
-    description:
-      'Uses sweep-next-edit-v2-7B on its own endpoint (talaria.nextEdit.endpoint). No published benchmark score exists for this model. Mutually exclusive with Generic.',
-  },
-  {
-    source: 'generic',
-    label: 'Next Edit — Generic via your FIM model',
-    description:
-      'Reuses your FIM model and endpoint with a different request shape. Quality ~55.62% (vendor-reported, unreplicated) — review every suggestion. Below 23 GiB VRAM set OLLAMA_CONTEXT_LENGTH=16384 on your server (see docs). Mutually exclusive with NEXT.',
-  },
-];
 
 function FieldRow({
   field,

@@ -30,7 +30,7 @@ import type {
 } from '../protocol';
 import { BOOTSTRAP_TAB_ID, makePanelData } from '../protocol';
 import { mockApprovalId, mockTheme, mockTurn, panelData } from './fixtures';
-import { NEXT_EDIT_ROWS } from '../panels/SettingsPanel';
+import { NEXT_EDIT_ROWS } from '../panels/nextEditCopy';
 
 type Send = (msg: HostToWebview) => void;
 
