@@ -780,10 +780,11 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       // W5.1 R5 (Task 13): `nextEdit.toggle` is HOST-INTERNAL and is
       // special-cased BEFORE backend dispatch (the `'panel.data'` /
       // `'context.searchFiles'` precedent). The NEXT/Generic toggles are
-      // EXTENSION state — the Guard's `globalState` store — not Hermes
-      // config, so this request must NEVER reach `AgentBackend.invokeControl`:
-      // forwarding it would ask the agent to persist a setting it does not
-      // own, cannot validate, and has no way to refuse correctly. Locked by
+      // EXTENSION state — the Guard's `talaria.nextEdit.source` setting
+      // (re-based off `globalState` onto that setting in Task 2, §5.5/D7) —
+      // not Hermes config, so this request must NEVER reach
+      // `AgentBackend.invokeControl`: forwarding it would ask the agent to
+      // persist a setting it does not own and cannot validate. Locked by
       // the zero-`invokeControl`-calls assertions in this file's test.
       const result =
         method === 'nextEdit.toggle'

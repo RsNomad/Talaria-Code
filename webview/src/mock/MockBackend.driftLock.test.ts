@@ -5,8 +5,9 @@ import { must } from '../testing/must';
 
 /**
  * T-19 (Tier-2 remediation architecture §12.1, C4 — drift lock), RE-BASED by
- * onboarding/setup Task 2 (§5.5/D7), RE-BASED AGAIN by Task 10 (§6 — the
- * Setup/Talaria-Config panel).
+ * onboarding/setup Task 2 (§5.5/D7), RE-BASED by Task 10 (§6 — the
+ * Setup/Talaria-Config panel), RE-BASED AGAIN by Task 12 (§5.5/D7 — the mock
+ * moves onto the same structural-replace semantics as the real Guard).
  *
  * The original lock byte-compared this mock's refusal copy against the real
  * Guard's `NEXT_ROW_LABEL`/`GENERIC_ROW_LABEL`/`REFUSAL_MESSAGES`
@@ -14,31 +15,41 @@ import { must } from '../testing/must';
  * from the host: the toggle state moved onto the `talaria.nextEdit.source`
  * enum, mutual exclusion became STRUCTURAL (toggling the second source on
  * REPLACES the first), and production no longer emits a mutual-exclusion
- * refusal at all — so there is no host copy left to compare against.
+ * refusal at all.
  *
  * Task 10 moved the frozen row LITERAL (`NEXT_EDIT_ROWS`) out of
- * `SettingsPanel.tsx` into its own module, `panels/nextEditCopy.ts` — the
- * Setup panel needs the exact same copy, and Task 12 deletes the NEXT rows
- * from `SettingsPanel.tsx` entirely (NEXT lives in Talaria Config after
- * that), which would have orphaned this lock's extraction site. This file
- * (and `MockBackend.ts`'s own import) were re-pointed at `nextEditCopy.ts`
- * accordingly — the INTENT is unchanged: labels are single-sourced, the mock
- * derives from them, and no hand-retyped copy is allowed to exist anywhere.
+ * `SettingsPanel.tsx` into its own module, `panels/nextEditCopy.ts`. Task 12
+ * deleted the NEXT rows from `SettingsPanel.tsx` entirely (NEXT lives in
+ * Talaria Config now, via `SetupPanel.tsx`) AND finally re-based
+ * `MockBackend.ts`'s own toggle handling onto structural-replace — the
+ * "mock-only legacy" refusal this file used to pin (see the old revision)
+ * is gone from the mock too. What is left to lock, and why each half still
+ * matters:
  *
- * What remains to lock, and why each half matters:
- *
- *  1. The mock's row LABELS are DERIVED from the single-sourced frozen row
- *     table (`NEXT_EDIT_ROWS`, `panels/nextEditCopy.ts` — owner copy, carried
- *     character-for-character), never retyped. That derivation is the U-6 fix
- *     that ended the original drift; this file pins it at the source level so
- *     a future edit cannot quietly reintroduce a hand-typed label.
- *  2. The mock's refusal TEMPLATE prose is pinned VERBATIM here. It is now
- *     MOCK-ONLY legacy: the standalone-dev harness still simulates the old
- *     conflict refusal until Task 12 re-bases the panel's rows (and this
- *     mock) onto the structural-replace semantics. Pinning the sentence keeps
- *     the one pre-Fedora driveable surface stable — and this comment is the
- *     recorded reason the mock deliberately diverges from production
- *     behaviour in the meantime.
+ *  1. The frozen `NEXT_EDIT_ROWS` labels in `nextEditCopy.ts` are still
+ *     exactly right — this is the underlying fact every consumer (SetupPanel,
+ *     the mock) depends on staying frozen, independent of who currently
+ *     reads it. (The richer content lock — the full owner-approved copy,
+ *     the vendor-qualifier discipline, the banned-model-name scan — lives in
+ *     `panels/nextEditCopy.test.ts`; this file keeps only the two labels,
+ *     verified by reading the SOURCE TEXT directly rather than importing the
+ *     constant, which is a different verification technique with its own
+ *     value: it would catch a case where the exported value still reads
+ *     correctly through TypeScript but the on-disk literal was hand-edited
+ *     in some way the type system can't see.)
+ *  2. `MockBackend.ts` still DERIVES its valid-source set from
+ *     `NEXT_EDIT_ROWS` (`isNextEditSource`), never hardcoding the
+ *     `'next' | 'generic'` pair as a second, driftable copy of the row
+ *     table's keys — the label-derivation discipline the original T-19 lock
+ *     existed for, now applied to the one thing the mock still needs from
+ *     the row table (which source ids are valid) rather than to refusal
+ *     copy it no longer builds.
+ *  3. `MockBackend.ts` genuinely implements structural REPLACE, not the old
+ *     refusal — proven both by a source-level scan (no `ok: false` path
+ *     keyed off a toggle-on conflict) and RED-first against the old
+ *     refusal shape.
+ *  4. The sanity check that the real host-side refusal surface is really
+ *     gone (`guard.ts` has no `REFUSAL_MESSAGES`) — unchanged, still true.
  */
 
 const NEXT_EDIT_COPY_PATH = join(__dirname, '..', 'panels', 'nextEditCopy.ts');
@@ -75,7 +86,7 @@ function extractGroup1(re: RegExp, text: string, label: string): string {
   return must(m[1], `drift lock setup: capture group 1 empty for ${label}`);
 }
 
-describe('T-19 (C4) drift lock, re-based: MockBackend refusal copy derives from the frozen panel rows', () => {
+describe('T-19 (C4) drift lock, re-based again by Task 12: MockBackend derives from nextEditCopy, no refusal left', () => {
   const nextEditCopySource = readFileSync(NEXT_EDIT_COPY_PATH, 'utf8');
   const mockSource = readFileSync(MOCK_BACKEND_PATH, 'utf8');
 
@@ -99,35 +110,46 @@ describe('T-19 (C4) drift lock, re-based: MockBackend refusal copy derives from 
     expect(genericLabel).toBe('Next Edit — Generic via your FIM model');
   });
 
-  it('MockBackend DERIVES its labels from NEXT_EDIT_ROWS — imported, looked up by row, never retyped', () => {
-    // The import — the only legitimate label source for the mock.
+  it('MockBackend DERIVES its valid toggle sources from NEXT_EDIT_ROWS — imported, never a second hardcoded copy', () => {
+    // The import — the only legitimate source of truth for which `source`
+    // ids the mock accepts.
     expect(mockSource).toMatch(/import\s+\{\s*NEXT_EDIT_ROWS\s*\}\s+from\s+'\.\.\/panels\/nextEditCopy';/);
-    // The lookup inside the refusal builder itself.
-    const body = extractFunctionBody(mockSource, 'function mockRefusalMessage(');
-    expect(body).toContain('NEXT_EDIT_ROWS.find');
-    // And no hand-retyped copy of either label anywhere in the mock: the
-    // exact drift the original T-19 lock existed to prevent.
-    expect(
-      mockSource.includes('Next Edit — dedicated model'),
-      'MockBackend.ts must not hand-retype a row label — labels come from NEXT_EDIT_ROWS only',
-    ).toBe(false);
-    expect(mockSource.includes('Next Edit — Generic via your FIM model')).toBe(false);
+    // The lookup inside the validity check itself.
+    const body = extractFunctionBody(mockSource, 'function isNextEditSource(');
+    expect(body).toContain('NEXT_EDIT_ROWS.some');
   });
 
-  it("MockBackend's refusal template prose is pinned verbatim (mock-only legacy until Task 12 re-bases the panel on structural replace)", () => {
-    const body = extractFunctionBody(mockSource, 'function mockRefusalMessage(');
-    const template = extractGroup1(/return\s+`([^`]+)`;/, body, 'MockBackend.ts mockRefusalMessage return template');
-    expect(template).toBe(
-      'Next Edit: turn off "${otherLabel}" first — the two sources are mutually exclusive.',
+  it("MockBackend's toggle handling implements structural REPLACE — no refusal (ok:false) path keyed off a source conflict", () => {
+    const applyBody = extractFunctionBody(mockSource, 'function applyNextEditToggle(');
+    // The old refusal shape checked the OTHER source's current state before
+    // accepting a toggle-on and could answer `ok: false`. Replace never
+    // reads "the other source is on" as a rejection condition — it always
+    // returns a new state.
+    expect(
+      applyBody,
+      'Task 12: applyNextEditToggle must not contain a conflict/refusal branch — replace is unconditional',
+    ).not.toMatch(/ok:\s*false/);
+
+    // Direct scan of handleNextEditToggle: the only `ok: false` left in the
+    // whole handler is the malformed-request guard, not a conflict refusal.
+    const handlerStart = mockSource.indexOf('private handleNextEditToggle(');
+    const handlerEnd = mockSource.indexOf('\n  }', handlerStart);
+    const handlerSource = mockSource.slice(handlerStart, handlerEnd);
+    const okFalseCount = (handlerSource.match(/ok:\s*false/g) ?? []).length;
+    expect(
+      okFalseCount,
+      'Task 12: handleNextEditToggle must have exactly ONE ok:false path (the malformed-request guard) — a second would be a re-introduced refusal',
+    ).toBe(1);
+    expect(handlerSource).toContain('malformed toggle request');
+  });
+
+  it('RED-first proof: a re-introduced conflict refusal in applyNextEditToggle would be caught', () => {
+    const withReintroducedRefusal = mockSource.replace(
+      'function applyNextEditToggle(',
+      'function applyNextEditTogglePlanted(current: unknown, source: unknown, on: unknown) { return { ok: false }; }\nfunction applyNextEditToggle(',
     );
-  });
-
-  it('RED-first proof: a hand-retyped label planted in the mock source would be caught (in-memory injection, no disk write)', () => {
-    const withRetypedLabel = `${mockSource}\nconst leaked = 'Next Edit — dedicated model';\n`;
-    expect(
-      withRetypedLabel.includes('Next Edit — dedicated model'),
-      'the planted retyped label must be visible to the same predicate the real assertion uses',
-    ).toBe(true);
+    const plantedBody = extractFunctionBody(withReintroducedRefusal, 'function applyNextEditTogglePlanted(');
+    expect(plantedBody).toMatch(/ok:\s*false/);
   });
 
   it('sanity: the real host-side refusal surface is really gone — guard.ts no longer declares REFUSAL_MESSAGES (the reason this lock was re-based)', () => {

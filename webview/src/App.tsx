@@ -918,19 +918,18 @@ export function App() {
         </div>
       )}
 
-      {/* F-7: Settings is the ONE panel not wrapped in a `RemotePanel` here,
-          and deliberately so — it carries two sources with different owners.
-          The «Next Edit Suggestions» toggles are extension `globalState`
-          pushed over `nextEdit.state` and need no agent; the config.yaml
-          sections come from the agent-backed `panel.data` fetch. Wrapping the
-          whole panel gated BOTH on the agent, so a Hermes CLI that failed to
-          start left the user with no way to turn Generic off (and these are
-          not `settings.json` settings, by design).
-
-          So `SettingsPanel` takes the RemoteData itself and applies the gate
-          to the config half only. It is typed to require the un-narrowed
-          union precisely so re-wrapping it here cannot typecheck; the
-          structure is locked in `panels/SettingsPanel.test.ts`. */}
+      {/* Task 12 (§5.1/§5.2): "Agent config" (`'settings'` panel id, unchanged
+          on the wire) is not wrapped in a `RemotePanel` here — `SettingsPanel`
+          still owns its own gate internally, applying it to the config.yaml
+          sections that are now its entire content (the «Next Edit
+          Suggestions» toggles that used to need this split — extension state
+          pushed over `nextEdit.state`, needing no agent, alongside the
+          agent-backed config.yaml half — moved to the Setup/Talaria-Config
+          panel above). Kept this shape deliberately rather than folding it
+          into the ordinary external-`RemotePanel`-wrap pattern the other
+          panels use: `SettingsPanel` is still typed to require the
+          un-narrowed `RemoteData` union, so re-wrapping it here still cannot
+          typecheck; the structure is locked in `panels/SettingsPanel.test.ts`. */}
       {state.activePanel === 'settings' && (
         <div
           id={panelTabpanelId('settings')}
@@ -943,8 +942,6 @@ export function App() {
               config={globalPanels.settings}
               onRetryConfig={() => requestPanel('settings')}
               onSetConfig={setConfig}
-              nextEdit={state.nextEditToggles}
-              onToggleNextEdit={setNextEditToggle}
             />
           </ErrorBoundary>
         </div>

@@ -10,7 +10,6 @@ import type { HostToWebview } from '../protocol';
 import { BOOTSTRAP_TAB_ID } from '../protocol';
 import { MockBackend } from './MockBackend';
 import { mockApprovalId } from './fixtures';
-import { NEXT_EDIT_ROWS } from '../panels/SettingsPanel';
 
 function makeHarness() {
   const messages: HostToWebview[] = [];
@@ -290,15 +289,24 @@ describe('webview MockBackend — W3-T8: replays the ACTUALLY TYPED prompt (clos
 });
 
 /*
- * W5.1 R5 (Task 13): the standalone scaffold must model the Guard's ONE
- * invariant, not just ack the request. Blindly acking `nextEdit.toggle`
- * (the catch-all branch) let the dev app turn BOTH sources on at once —
- * exactly the both-on state `08` §8 says is unrepresentable in the UI by
- * construction. It is the only place this UX is driveable pre-Fedora, so an
- * unfaithful mock here is a scaffold that teaches the wrong thing.
+ * W5.1 R5 (Task 13), RE-BASED by Task 12 (§5.5/D7): the standalone scaffold
+ * must model the Guard's ONE invariant, not just ack the request. Blindly
+ * acking `nextEdit.toggle` (the catch-all branch) let the dev app turn BOTH
+ * sources on at once — exactly the both-on state `08` §8 says is
+ * unrepresentable in the UI by construction. It is the only place this UX is
+ * driveable pre-Fedora, so an unfaithful mock here is a scaffold that teaches
+ * the wrong thing.
+ *
+ * Task 2 re-based the real Guard onto the `talaria.nextEdit.source` enum
+ * setting, making mutual exclusion STRUCTURAL: turning the second source on
+ * REPLACES the first instead of being refused. Task 12 re-bases this mock the
+ * same way — the REFUSAL tests this describe block used to carry (`ok:false`
+ * plus the Guard's refusal copy) tested a code path production has not run
+ * since Task 2; they are replaced below with the structural-replace
+ * equivalents.
  */
-describe('webview MockBackend — R5 nextEdit.toggle (Task 13)', () => {
-  it('accepts a toggle-on and answers with the new state PLUS a nextEdit.state push', () => {
+describe('webview MockBackend — R5 nextEdit.toggle (Task 13, structural-replace since Task 12)', () => {
+  it('accepts a toggle-on from off and answers with the new state PLUS a nextEdit.state push', () => {
     const { backend, messages } = makeHarness();
     backend.handle({ type: 'ready' });
     messages.length = 0;
@@ -314,7 +322,7 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13)', () => {
     });
   });
 
-  it('REFUSES the second source while the first is on — ok:false with the Guard copy, and NO state push', () => {
+  it('turning the second source ON while the first is on REPLACES it — no refusal, ok:true with the new state', () => {
     const { backend, messages } = makeHarness();
     backend.handle({ type: 'ready' });
     backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
@@ -322,32 +330,16 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13)', () => {
 
     backend.handle({ type: 'control.request', requestId: 2, method: 'nextEdit.toggle', params: { source: 'generic', on: true } });
 
-    expect(messages).toEqual([
-      {
-        type: 'control.response',
-        requestId: 2,
-        ok: false,
-        error: {
-          message:
-            'Next Edit: turn off "Next Edit — dedicated model" first — the two sources are mutually exclusive.',
-        },
-      },
-    ]);
+    expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: false, generic: true } });
+    expect(messages).toContainEqual({
+      type: 'control.response',
+      requestId: 2,
+      ok: true,
+      result: { next: false, generic: true },
+    });
   });
 
-  /*
-   * FIX WAVE 2 (wave-1 handoff — U-6 drift). Wave 1 changed the REAL Guard's
-   * refusal (`src/autocomplete/nextedit/guard.ts`) to interpolate the OTHER
-   * ROW'S LABEL per `08` §8; the mock kept the old "turn off NEXT first" /
-   * "turn off Generic first" wording, i.e. the dev scaffold modelled a
-   * DIFFERENT refusal than production — and "NEXT"/"Generic" appear nowhere
-   * on screen, which is the whole reason U-6 was raised.
-   *
-   * Both directions are pinned now. The old suite covered only the
-   * refuse-generic direction, which is exactly how the refuse-next string
-   * ("turn off NEXT first" — the worse of the two) drifted unseen.
-   */
-  it('REFUSES the NEXT source while Generic is on — the opposite direction, which had ZERO coverage while it drifted', () => {
+  it('turning the NEXT source ON while Generic is on REPLACES it too — the mirror direction', () => {
     const { backend, messages } = makeHarness();
     backend.handle({ type: 'ready' });
     backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'generic', on: true } });
@@ -355,66 +347,47 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13)', () => {
 
     backend.handle({ type: 'control.request', requestId: 2, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
 
+    expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: true, generic: false } });
+    expect(messages).toContainEqual({
+      type: 'control.response',
+      requestId: 2,
+      ok: true,
+      result: { next: true, generic: false },
+    });
+  });
+
+  it('turning the active source OFF returns to fully-off', () => {
+    const { backend, messages } = makeHarness();
+    backend.handle({ type: 'ready' });
+    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
+    messages.length = 0;
+
+    backend.handle({ type: 'control.request', requestId: 2, method: 'nextEdit.toggle', params: { source: 'next', on: false } });
+
+    expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: false, generic: false } });
+    expect(messages).toContainEqual({
+      type: 'control.response',
+      requestId: 2,
+      ok: true,
+      result: { next: false, generic: false },
+    });
+  });
+
+  it('a malformed source is rejected ok:false — the one refusal-shaped path left is validation, not conflict', () => {
+    const { backend, messages } = makeHarness();
+    backend.handle({ type: 'ready' });
+    messages.length = 0;
+
+    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'bogus', on: true } });
+
     expect(messages).toEqual([
       {
         type: 'control.response',
-        requestId: 2,
+        requestId: 1,
         ok: false,
-        error: {
-          message:
-            'Next Edit: turn off "Next Edit — Generic via your FIM model" first — the two sources are mutually exclusive.',
-        },
+        error: { message: 'Next Edit: malformed toggle request.' },
       },
     ]);
-  });
-
-  /*
-   * The DRIFT GUARD itself, not just the two strings above: the refusal must
-   * name the other row's label as the panel actually renders it. Pinning the
-   * literals alone would go green again the moment `08` §8's frozen copy is
-   * revised on one side only — this ties the mock's copy to `NEXT_EDIT_ROWS`,
-   * the same table `SettingsPanel` renders and `SettingsPanel.test.ts`
-   * freezes.
-   *
-   * The Guard's TEMPLATE still cannot be cross-checked from here: `guard.ts`
-   * imports `vscode`, so it is unreachable from the webview's module graph
-   * (see this fix wave's report).
-   */
-  it('the refusal names the OTHER row exactly as SettingsPanel renders it — the label half of the drift, tied not retyped', () => {
-    const { backend, messages } = makeHarness();
-    backend.handle({ type: 'ready' });
-    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
-    messages.length = 0;
-    backend.handle({ type: 'control.request', requestId: 2, method: 'nextEdit.toggle', params: { source: 'generic', on: true } });
-
-    const refusal = messages.find((m) => m.type === 'control.response' && m.ok === false);
-    const message = (refusal as { error: { message: string } }).error.message;
-
-    const nextLabel = NEXT_EDIT_ROWS.find((r) => r.source === 'next')?.label ?? '';
-    const genericLabel = NEXT_EDIT_ROWS.find((r) => r.source === 'generic')?.label ?? '';
-    expect(nextLabel, 'setup: NEXT_EDIT_ROWS must carry a non-empty NEXT label').not.toBe('');
-
-    // Refusing GENERIC must name the row the user has to turn off: NEXT.
-    expect(
-      message,
-      'the refusal must quote the OTHER row\'s label verbatim as the panel renders it — never a token like "NEXT" that appears nowhere on screen',
-    ).toContain(`"${nextLabel}"`);
-    expect(
-      message,
-      'the refusal must not name the row the user just tried to turn ON — that is the row they are already looking at',
-    ).not.toContain(`"${genericLabel}"`);
-  });
-
-  it('turning the first source OFF then frees the second (the refusal names a real remedy)', () => {
-    const { backend, messages } = makeHarness();
-    backend.handle({ type: 'ready' });
-    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
-    backend.handle({ type: 'control.request', requestId: 2, method: 'nextEdit.toggle', params: { source: 'next', on: false } });
-    messages.length = 0;
-
-    backend.handle({ type: 'control.request', requestId: 3, method: 'nextEdit.toggle', params: { source: 'generic', on: true } });
-
-    expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: false, generic: true } });
   });
 
   it('pushes the current toggles on ready, so a mounted scaffold panel is never guessing', () => {
