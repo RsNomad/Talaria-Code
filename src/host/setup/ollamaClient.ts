@@ -46,6 +46,35 @@ export interface PullProgress {
  *  supplied; this constant only sizes the probe's abort timer. */
 const DEFAULT_PROBE_TIMEOUT_MS = 1500;
 
+/**
+ * Final review wave, T6 M-1 (unbounded NDJSON buffer -> OOM): {@link
+ * pullModel}'s line buffer has no byte cap of its own — an endpoint that
+ * streams bytes without ever emitting a `\n` would otherwise grow `buffer`
+ * unboundedly. Same value as this codebase's established byte-cap
+ * convention (`autocomplete/backends/http.ts`'s `MAX_STREAM_BYTES`, 4 MiB;
+ * also duplicated locally by `host/transport/JsonRpcStdio.ts`'s
+ * `MAX_LINE_BYTES` for the identical reason) — duplicated locally here too
+ * rather than imported, matching THIS module's own established
+ * self-contained discipline (see `joinUrl`'s doc comment below: "matching
+ * registry.ts's own zero-cross-feature-import discipline one directory
+ * over").
+ */
+const MAX_STREAM_BYTES = 4 * 1024 * 1024;
+
+/** Thrown by {@link pullModel} when the stream exceeds {@link
+ *  MAX_STREAM_BYTES} without completing — mirrors `autocomplete/backends/
+ *  http.ts`'s `StreamByteCapError` shape (fixed template message, no
+ *  endpoint/response-body detail). */
+export class StreamByteCapError extends Error {
+  readonly cap: number;
+
+  constructor(cap: number) {
+    super(`response exceeded ${cap} bytes without completing`);
+    this.name = 'StreamByteCapError';
+    this.cap = cap;
+  }
+}
+
 interface TagsResponseModel {
   name: string;
   size: number;
@@ -130,10 +159,23 @@ export async function pullModel(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let received = 0;
   try {
     for (;;) {
       const { value, done } = await readWithAbort(reader, signal);
       if (done) break;
+      // Count RAW bytes BEFORE decode, so delimiter-free garbage counts too
+      // — a hostile/misbehaving endpoint that never emits a '\n' must not
+      // be able to grow `buffer` unboundedly (T6 M-1).
+      received += value.byteLength;
+      if (received > MAX_STREAM_BYTES) {
+        // Loss of interest: cancel() discards any chunks already queued and
+        // tears the underlying source down (MDN
+        // ReadableStreamDefaultReader/cancel) — without this the hostile
+        // firehose keeps filling the socket while the error propagates.
+        await reader.cancel().catch(() => {});
+        throw new StreamByteCapError(MAX_STREAM_BYTES);
+      }
       buffer += decoder.decode(value, { stream: true });
 
       let newlineIdx: number;

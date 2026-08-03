@@ -67,8 +67,8 @@ import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupMethod, Setup
  * initialize yet / mock backend) ⇒ `'waiting-agent'`; any advertised method
  * id ≠ `hermes-setup` ⇒ `'configured'` with `providerId` = that id; only
  * `hermes-setup` (or nothing) advertised ⇒ `'unconfigured'`. This is what
- * lets the composite `ready`/`talaria.setup.completed` signal genuinely
- * fire once agent + provider + FIM are all green.
+ * lets the composite `ready` signal genuinely fire once agent + provider +
+ * FIM are all green.
  */
 
 // --- Event/Disposable (vscode-free — structurally compatible with
@@ -251,8 +251,12 @@ const PIPX_BOOTSTRAP_COMMAND = 'sudo dnf install pipx';
  *  on `host.isTrusted()` (FM-14). Everything else (`setup.status` — handled
  *  outside `handle()` entirely —, `setup.testRemote`, `setup.recheck`,
  *  `setup.cancel`) is a read-only or best-effort-cancel action that must
- *  keep working in a Restricted Mode workspace (§8). */
-const MUTATING_METHODS = new Set<SetupMethod>([
+ *  keep working in a Restricted Mode workspace (§8). Exported (with {@link
+ *  READ_ONLY_METHODS}) so a lock test can prove the two sets partition the
+ *  FULL {@link SetupMethod} union with no gaps — a future mutating method
+ *  added to the union without being added HERE would otherwise ship
+ *  un-gated (fail-open by omission; final review wave fix). */
+export const MUTATING_METHODS = new Set<SetupMethod>([
   'setup.install',
   'setup.applyAgent',
   'setup.applyFim',
@@ -266,6 +270,16 @@ const MUTATING_METHODS = new Set<SetupMethod>([
   'setup.setRag',
   'setup.setTunable',
 ]);
+
+/** The complement of {@link MUTATING_METHODS}: every read-only (or
+ *  best-effort-cancel) {@link SetupMethod} — see that constant's doc for
+ *  why each one is exempt from the FM-14 trust gate. */
+export const READ_ONLY_METHODS: readonly SetupMethod[] = [
+  'setup.status',
+  'setup.testRemote',
+  'setup.cancel',
+  'setup.recheck',
+];
 
 interface ThrottleState {
   lastEmit: number;
@@ -388,9 +402,6 @@ export class SetupController {
 
     const fimGreen = fimDescriptor.status === 'available' && enabled && fimAuthSatisfied;
     const ready = computeReady(agentPhase, provider.phase, fimGreen);
-    if (ready) {
-      await this.host.globalState.update('talaria.setup.completed', true);
-    }
 
     const data: SetupData = {
       trusted,
@@ -476,10 +487,7 @@ export class SetupController {
       case 'setup.reload':
         return this.handleReload();
       case 'setup.recheck':
-        // Read-only: the caller re-fetches + re-pushes `status()` after any
-        // ok:true result (mirrors ControlDispatcher's reload.mcp/model.save_key
-        // "dispatch -> refetch panel -> push" precedent) — nothing to do here.
-        return { ok: true };
+        return this.handleRecheck();
       case 'setup.setNextEdit':
         return this.handleSetNextEdit(params);
       case 'setup.setRag':
@@ -737,6 +745,41 @@ export class SetupController {
     const id = str(params, 'id');
     if (op && id) {
       this.inFlight.get(`${op}:${id}`)?.abort();
+    }
+    return { ok: true };
+  }
+
+  // --- setup.recheck (read-only, re-probes pipx) --------------------------------
+
+  /**
+   * Final review wave, IMPORTANT (recovery dead-end): `computeAgentPhase`
+   * derives `pipx-missing`/`python-unsuitable` from the STICKY
+   * {@link lastAgentIssue} — set only on a failed {@link handleInstall} and,
+   * before this fix, cleared only at the START of the next one. `status()`
+   * deliberately never re-probes pipx itself (unlike the Ollama card, whose
+   * re-probe is a cheap `fetch` that `status()` already re-runs on every
+   * call — re-locating pipx is a shell spawn, too expensive to repeat on
+   * every panel render). That left the cached issue with no escape short of
+   * a full window reload once the user had, say, opened the bootstrap
+   * terminal and installed pipx. `setup.recheck` is the explicit user
+   * action this belongs on instead: re-run {@link SetupControllerDeps.
+   * locatePipx} (the SAME dep `handleInstall` uses) and refresh
+   * {@link lastAgentIssue} from its outcome — cleared on success (so
+   * `computeAgentPhase` falls through to `'missing'`, making the Install
+   * button actionable again), or refreshed with whatever the CURRENT
+   * failure reason is on continued failure (a user can flip between
+   * `pipx-missing` and `python-unsuitable` across bootstrap-terminal
+   * attempts, so this must overwrite, not merely confirm, the prior
+   * reason). T4 M-2 carry-forward applies here too: `locatePipx` can
+   * REJECT, and that must never become an unhandled rejection out of a
+   * read-only recheck.
+   */
+  private async handleRecheck(): Promise<{ ok: true }> {
+    try {
+      const located = await this.deps.locatePipx();
+      this.lastAgentIssue = located.ok ? undefined : { phase: located.reason, detail: this.redact(located.detail) };
+    } catch (err) {
+      this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
     }
     return { ok: true };
   }
@@ -1009,10 +1052,21 @@ export class SetupController {
  * PATH without `talaria.hermesPath` set reads `missing` there while the wire
  * is genuinely up) — the composite `ready` still requires
  * `agentPhase === 'ready'` regardless, see {@link computeReady}.
+ *
+ * Final review wave, T13 M-1 (null-guard): `methods` reaches this function
+ * through a dep seam whose OWN type (`AdvertisedAuthMethod[] | undefined`)
+ * cannot enforce that every array ELEMENT is non-null at runtime (the
+ * `acpClient.ts` projection this is ultimately sourced from is itself only
+ * defensively — not statically — guarded, see its own doc comment). A null/
+ * undefined entry is dropped rather than dereferenced: `m?.id` reads
+ * `undefined` for such an entry, which never equals
+ * `HERMES_SETUP_AUTH_METHOD_ID` — the `m?.id !== undefined` guard is what
+ * keeps a dropped entry from being mistaken for a "managed" (non-`hermes-
+ * setup`) method.
  */
 function computeProviderCard(methods: AdvertisedAuthMethod[] | undefined): SetupData['provider'] {
   if (methods === undefined) return { phase: 'waiting-agent' };
-  const managed = methods.find((m) => m.id !== HERMES_SETUP_AUTH_METHOD_ID);
+  const managed = methods.find((m) => m?.id !== undefined && m.id !== HERMES_SETUP_AUTH_METHOD_ID);
   return managed ? { phase: 'configured', providerId: managed.id } : { phase: 'unconfigured' };
 }
 

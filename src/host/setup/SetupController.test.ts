@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   SetupController,
   TIER2_TUNABLE_KEYS,
+  MUTATING_METHODS,
+  READ_ONLY_METHODS,
   type SetupHost,
   type SetupControllerDeps,
 } from './SetupController';
@@ -684,6 +686,172 @@ describe('setup.reload: trust-gated (FM-14), modal-free, calls host.reload() dir
   });
 });
 
+// --- FIX 1 (final review wave, IMPORTANT): setup.recheck re-probes pipx -----
+
+describe('setup.recheck re-probes pipx (FIX 1: the pipx-missing/python-unsuitable recovery dead-end)', () => {
+  it('a cached pipx-missing clears after a successful recheck-triggered relocate — Install becomes actionable again', async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: async (): Promise<PipxLocateResult> => {
+          calls++;
+          return calls === 1
+            ? { ok: false, reason: 'pipx-missing', detail: 'no pipx on PATH' }
+            : OK_PIPX_LOCATE;
+        },
+      },
+    );
+
+    // Drive the install into the sticky pipx-missing state (locatePipx call #1).
+    const installResult = await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(installResult).toEqual({ ok: false, reason: 'pipx-missing' });
+    expect((await controller.status()).agent.phase).toBe('pipx-missing');
+
+    // Without a recheck, status() alone never re-probes (this is the bug: it
+    // would stay 'pipx-missing' forever). setup.recheck re-runs locatePipx
+    // (call #2, now ok) and CLEARS the sticky issue.
+    const recheckResult = await controller.handle('setup.recheck', {});
+    expect(recheckResult).toEqual({ ok: true });
+    expect(calls).toBe(2);
+
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('missing'); // Install button is back
+  });
+
+  it('python-unsuitable -> recheck -> still unsuitable refreshes the detail honestly instead of staying stale', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: async (): Promise<PipxLocateResult> => ({
+          ok: false,
+          reason: 'python-unsuitable',
+          detail: 'no suitable python (>=3.11, <3.14) found',
+        }),
+      },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    expect((await controller.status()).agent.phase).toBe('python-unsuitable');
+
+    const recheckResult = await controller.handle('setup.recheck', {});
+    expect(recheckResult).toEqual({ ok: true });
+
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('python-unsuitable');
+    expect(data.agent.detail).toContain('no suitable python');
+  });
+
+  it('pipx-missing can flip to python-unsuitable across recheck attempts (refreshed, not merely confirmed)', async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: async (): Promise<PipxLocateResult> => {
+          calls++;
+          return calls === 1
+            ? { ok: false, reason: 'pipx-missing', detail: 'no pipx' }
+            : { ok: false, reason: 'python-unsuitable', detail: 'pipx found, python too old' };
+        },
+      },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    expect((await controller.status()).agent.phase).toBe('pipx-missing');
+
+    await controller.handle('setup.recheck', {});
+    expect((await controller.status()).agent.phase).toBe('python-unsuitable');
+  });
+
+  it('T4 M-2 carry-forward: a REJECTING locatePipx during recheck never becomes an unhandled rejection', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: async () => {
+          throw new Error('pipx vanished mid-flow');
+        },
+      },
+    );
+    const result = await controller.handle('setup.recheck', {});
+    expect(result).toEqual({ ok: true });
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('error');
+    expect(data.agent.detail).toContain('pipx vanished');
+  });
+
+  it('a successful recheck with no prior issue is a harmless no-op (still missing, not mis-flagged)', async () => {
+    const { controller } = makeController();
+    const result = await controller.handle('setup.recheck', {});
+    expect(result).toEqual({ ok: true });
+    expect((await controller.status()).agent.phase).toBe('missing');
+  });
+});
+
+// --- FIX 3 (final review wave): MUTATING_METHODS exhaustiveness lock --------
+
+describe('MUTATING_METHODS / READ_ONLY_METHODS partition the full SetupMethod union (FIX 3)', () => {
+  // A `Record<SetupMethod, true>` literal: TypeScript refuses to compile
+  // this object if a new value is ever added to the `SetupMethod` union
+  // without a matching key here — a compile-time backstop layered on top of
+  // the runtime Set-equality assertion below. Adding the key here is NOT
+  // enough on its own, though: the runtime assertion is what actually fails
+  // if that new method isn't ALSO placed into MUTATING_METHODS or
+  // READ_ONLY_METHODS — i.e. classified, not just acknowledged.
+  const ALL_SETUP_METHODS_MAP: Record<SetupMethod, true> = {
+    'setup.status': true,
+    'setup.install': true,
+    'setup.applyAgent': true,
+    'setup.applyFim': true,
+    'setup.setApiKey': true,
+    'setup.testRemote': true,
+    'setup.pullModel': true,
+    'setup.cancel': true,
+    'setup.openProviderWizard': true,
+    'setup.openInstallTerminal': true,
+    'setup.openBootstrapTerminal': true,
+    'setup.recheck': true,
+    'setup.reload': true,
+    'setup.setNextEdit': true,
+    'setup.setRag': true,
+    'setup.setTunable': true,
+  };
+  const ALL_SETUP_METHODS = Object.keys(ALL_SETUP_METHODS_MAP) as SetupMethod[];
+
+  it('every SetupMethod appears in exactly one of MUTATING_METHODS / READ_ONLY_METHODS', () => {
+    const combined = [...MUTATING_METHODS, ...READ_ONLY_METHODS];
+    // No duplicates across the two sets (a method classified as BOTH would
+    // pass the "union covers everything" check below without this).
+    expect(new Set(combined).size).toBe(combined.length);
+    expect([...combined].sort()).toEqual([...ALL_SETUP_METHODS].sort());
+  });
+});
+
+// --- FIX 4 (final review wave, T13 M-1): null-guard on malformed authMethods -
+
+describe('computeProviderCard null-guard (FIX 4): a malformed (null) advertised-method entry is dropped, not thrown', () => {
+  it('a null entry mixed with a valid managed method is dropped; the valid one still resolves configured', async () => {
+    // Deliberately malformed input (a null array element) — proves
+    // computeProviderCard's `m?.id` guard drops it instead of throwing on
+    // `m.id` off a null `m`. The dep's declared type can't forbid this at
+    // compile time; only the runtime guard can.
+    const malformed: unknown[] = [null, { id: 'openrouter', name: 'openrouter creds' }];
+    const { controller } = makeController(
+      {},
+      { getAdvertisedAuthMethods: () => malformed as { id: string; name: string }[] },
+    );
+    const data = await controller.status();
+    expect(data.provider).toEqual({ phase: 'configured', providerId: 'openrouter' });
+  });
+
+  it('an array of ONLY malformed entries resolves unconfigured, never throws', async () => {
+    const malformed: unknown[] = [null, undefined];
+    const { controller } = makeController(
+      {},
+      { getAdvertisedAuthMethods: () => malformed as { id: string; name: string }[] },
+    );
+    const data = await controller.status();
+    expect(data.provider).toEqual({ phase: 'unconfigured' });
+  });
+});
+
 // --- status() assembly --------------------------------------------------------
 
 describe('status(): assembles SetupData from registry + settings + secrets + ollama probe', () => {
@@ -784,8 +952,8 @@ describe('Task 13: provider card mapped from the advertised authMethods', () => 
     expect(data.provider).toEqual({ phase: 'unconfigured' });
   });
 
-  it('agent ready + provider configured + FIM green -> ready:true and talaria.setup.completed persisted', async () => {
-    const { host, controller } = makeController(
+  it('agent ready + provider configured + FIM green -> ready:true', async () => {
+    const { controller } = makeController(
       { settings: settingsMap({ 'talaria.hermesPath': '/x/bin/hermes', 'talaria.backend': 'acp' }) },
       { getAdvertisedAuthMethods: () => PROVIDER_AND_SETUP },
     );
@@ -793,15 +961,31 @@ describe('Task 13: provider card mapped from the advertised authMethods', () => 
     expect(data.agent.phase).toBe('ready');
     expect(data.provider).toEqual({ phase: 'configured', providerId: 'openrouter' });
     expect(data.ready).toBe(true);
-    expect(host.globalStateStore.get('talaria.setup.completed')).toBe(true);
   });
 
   it('provider configured but the agent NOT ready keeps the composite ready:false (never provider-only ready)', async () => {
-    const { host, controller } = makeController({}, { getAdvertisedAuthMethods: () => PROVIDER_AND_SETUP });
+    const { controller } = makeController({}, { getAdvertisedAuthMethods: () => PROVIDER_AND_SETUP });
     const data = await controller.status();
     expect(data.agent.phase).toBe('missing');
     expect(data.provider.phase).toBe('configured');
     expect(data.ready).toBe(false);
+  });
+
+  // --- FIX 5 (final review wave, T9 M4): read-path write removed --------------
+  // `status()` used to write `globalState['talaria.setup.completed']=true` on
+  // every read where `ready` was true — a WRITE on a READ path with zero
+  // readers anywhere in `src` (confirmed by grep). Deleted outright rather
+  // than fixed in place; this proves `status()` no longer touches
+  // globalState at all, on either a ready or not-ready computation.
+  it('status() never writes globalState, ready or not (T9 M4: dead read-path write removed)', async () => {
+    const { host, controller } = makeController(
+      { settings: settingsMap({ 'talaria.hermesPath': '/x/bin/hermes', 'talaria.backend': 'acp' }) },
+      { getAdvertisedAuthMethods: () => PROVIDER_AND_SETUP },
+    );
+    const before = host.calls.length;
+    const data = await controller.status();
+    expect(data.ready).toBe(true);
+    expect(host.calls.slice(before).some((c) => c.startsWith('globalState:'))).toBe(false);
     expect(host.globalStateStore.has('talaria.setup.completed')).toBe(false);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { probeOllama, pullModel, type OllamaStatus, type PullProgress } from './ollamaClient';
+import { probeOllama, pullModel, StreamByteCapError, type OllamaStatus, type PullProgress } from './ollamaClient';
 
 /**
  * ollamaClient.test.ts — Task 6 (onboarding-backend-setup-architecture.md
@@ -242,5 +242,77 @@ describe('pullModel — POST /api/pull streaming NDJSON (§2.4)', () => {
       { status: 'pulling sha256:split', totalBytes: 500, completedBytes: 250 },
       { status: 'success', totalBytes: undefined, completedBytes: undefined },
     ]);
+  });
+
+  // --- FIX 2 (final review wave, T6 M-1): unbounded NDJSON buffer -> OOM ----
+
+  it('a stream exceeding the 4 MiB cap WITHOUT a newline rejects with a StreamByteCapError naming the cap', async () => {
+    const MAX_STREAM_BYTES = 4 * 1024 * 1024;
+    // Five 1 MiB chunks of newline-free garbage — same delimiter-free-flood
+    // shape http.ts's own byte-cap tests exercise. Only chunk 5 pushes the
+    // running total past the cap; earlier chunks must NOT throw early.
+    const chunkSize = MAX_STREAM_BYTES / 4;
+    const chunk = new Uint8Array(chunkSize).fill(97); // 'a' * 1 MiB, no '\n'
+    const chunks = [chunk, chunk, chunk, chunk, chunk];
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, body: chunkedBody(chunks) } as unknown as Response);
+    const progress: PullProgress[] = [];
+
+    let caught: unknown;
+    try {
+      await pullModel(ENDPOINT, 'm', fetchImpl, (p) => progress.push(p), new AbortController().signal);
+    } catch (err) {
+      caught = err;
+    }
+
+    // Asserted structurally (name/message/cap), not via `instanceof
+    // StreamByteCapError` — an unexported class would make `instanceof`
+    // with an `undefined` import silently vacuous. Also proves this is NOT
+    // the pre-fix failure mode (a `JSON.parse` SyntaxError once the stream
+    // ends with a non-JSON trailing buffer) — a real regression check, not
+    // just "it threw something".
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).name).toBe('StreamByteCapError');
+    expect((caught as Error).message).toContain(String(MAX_STREAM_BYTES));
+    expect((caught as { cap?: number }).cap).toBe(MAX_STREAM_BYTES);
+    expect(caught).toBeInstanceOf(StreamByteCapError);
+
+    // No progress was ever parsed — the flood never contained a completed line.
+    expect(progress).toEqual([]);
+  });
+
+  it('bails out WHILE reading (does not drain the whole stream first) — the actual unbounded-growth fix', async () => {
+    // 20 MiB across twenty 1 MiB no-newline chunks — five times the 4 MiB
+    // cap. A read-call-count assertion is robust independent of whichever
+    // error type/import resolves: pre-fix, `pullModel` has no cap, so it
+    // drains ALL 20 chunks (plus the terminal `done` read) before doing
+    // anything with the (garbage) trailing buffer — 21 read() calls.
+    // Post-fix, it must stop within a handful of reads, once the running
+    // total first crosses MAX_STREAM_BYTES — proving the fix actually
+    // bounds memory growth, not merely that *some* rejection eventually
+    // happens once the stream ends.
+    const TOTAL_CHUNKS = 20;
+    const chunk = new Uint8Array(1024 * 1024).fill(97); // 1 MiB, no '\n'
+    let calls = 0;
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const reader = {
+      read: vi.fn(async () => {
+        calls += 1;
+        if (calls > TOTAL_CHUNKS) return { value: undefined, done: true };
+        return { value: chunk, done: false };
+      }),
+      cancel,
+      releaseLock: vi.fn(),
+    } as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue({ ok: true, body: { getReader: () => reader } } as unknown as Response);
+
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).rejects.toThrow();
+
+    // 4 MiB / 1 MiB = 4 full chunks is still under the cap; the 5th chunk
+    // (running total 5 MiB) is what crosses it — so read() must be called
+    // AT MOST 5 times, nowhere near all 20 (let alone the 21st done-read).
+    expect(calls).toBeLessThanOrEqual(5);
+    expect(cancel).toHaveBeenCalled();
   });
 });

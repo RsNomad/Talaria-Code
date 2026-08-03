@@ -235,6 +235,35 @@ describe('AcpClient — Task 13: initialize retains the advertised authMethods',
     expect(client.getAdvertisedAuthMethods()).toEqual([]);
   });
 
+  it('FIX 4 (T13 M-1): a null entry inside authMethods is dropped, not dereferenced — no throw', async () => {
+    const { client, respond } = await connectClient();
+    const init = client.initialize();
+    await flush();
+    respond({
+      jsonrpc: '2.0',
+      id: 0,
+      result: {
+        protocolVersion: 1,
+        agentCapabilities: {},
+        // A malformed wire payload (unparsed per this module's own doc
+        // comment) — the null entry must be dropped by the `m?.id`/`m?.name`
+        // filter guard, not dereferenced (`typeof null.id` throws).
+        authMethods: [null, PROVIDER_METHOD],
+      },
+    });
+    await expect(init).resolves.toBeUndefined();
+    expect(client.getAdvertisedAuthMethods()).toEqual([{ id: 'openrouter', name: 'openrouter runtime credentials' }]);
+  });
+
+  it('FIX 4 (T13 M-1): a null `result` never throws reading .authMethods off it — resolves to []', async () => {
+    const { client, respond } = await connectClient();
+    const init = client.initialize();
+    await flush();
+    respond({ jsonrpc: '2.0', id: 0, result: null });
+    await expect(init).resolves.toBeUndefined();
+    expect(client.getAdvertisedAuthMethods()).toEqual([]);
+  });
+
   it('onAuthMethodsChanged fires once initialize has retained the methods (getter already fresh inside the handler)', async () => {
     const { client, respond } = await connectClient();
     const seen: Array<ReturnType<AcpClient['getAdvertisedAuthMethods']>> = [];

@@ -587,10 +587,15 @@ export class AcpClient implements AcpClientLike {
     // belt-and-braces posture as `reshapeSessionsList`): a missing/non-array
     // field reads as "initialized, zero advertised" (`[]`, distinct from the
     // pre-initialize `undefined`), and a malformed entry is dropped rather
-    // than crashing the connect phase.
-    const rawMethods = response.authMethods;
+    // than crashing the connect phase. Final review wave, T13 M-1: `response`
+    // itself is UNPARSED too — a wire `result: null` (or any other falsy
+    // non-object) must not throw reading `.authMethods` off it, hence
+    // `response?.authMethods`; likewise `m?.id`/`m?.name` so a null/
+    // undefined ARRAY ELEMENT is dropped by the filter instead of crashing
+    // it (`typeof null.id` throws, `typeof null?.id` reads `undefined`).
+    const rawMethods = response?.authMethods;
     this.advertisedAuthMethods = (Array.isArray(rawMethods) ? rawMethods : [])
-      .filter((m) => typeof m.id === 'string' && typeof m.name === 'string')
+      .filter((m) => typeof m?.id === 'string' && typeof m?.name === 'string')
       .map((m) => ({ id: m.id, name: m.name }));
     for (const handler of [...this.authMethodsHandlers]) {
       try {
