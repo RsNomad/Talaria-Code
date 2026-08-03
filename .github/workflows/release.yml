@@ -1,0 +1,142 @@
+name: Release
+
+# Builds platform-specific .vsix packages (linux-x64 + linux-arm64) and attaches
+# them to a GitHub Release.
+#
+# Cutting a release:
+#   1. Bump "version" in package.json and merge to main.
+#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+#   The tag push runs the full gate on both architectures, packages both .vsix,
+#   and publishes a GitHub Release for the tag with auto-generated notes.
+#
+# Dry run: Actions -> Release -> "Run workflow" (workflow_dispatch). Builds and
+# uploads both .vsix as workflow artifacts but NEVER creates a Release (the
+# release job only runs on real tag pushes) — safe to run anytime.
+#
+# Arch strategy: each target is built on a runner of its OWN architecture
+# (linux-x64 on ubuntu-latest, linux-arm64 on ubuntu-24.04-arm — GA since
+# 2025-08, free for public repos) so that `npm ci` resolves the matching
+# native binaries (@lancedb/lancedb platform packages) and
+# `vsce package --target` bundles the correct ones into each .vsix.
+# Marketplace / Open VSX publishing is intentionally stubbed out at the bottom.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Queue concurrent runs for the same ref; never cancel a half-finished release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build .vsix (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-latest
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Read package version
+        id: pkg
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # A vX.Y.Z tag must ship a .vsix whose manifest says X.Y.Z — fail fast if
+      # the tag was pushed without bumping package.json first.
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [ "$GITHUB_REF_NAME" != "v${{ steps.pkg.outputs.version }}" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME != package.json version v${{ steps.pkg.outputs.version }} — bump package.json before tagging."
+            exit 1
+          fi
+
+      # Clean, reproducible install straight from package-lock.json. On the
+      # arm64 runner this resolves the arm64 native packages (lancedb, esbuild,
+      # rolldown, tailwind oxide) — the lockfile carries both platforms.
+      - name: Install dependencies
+        run: npm ci
+
+      # Same quality gate as CI (typecheck host + webview, full vitest suite),
+      # here proven on the actual target architecture before packaging.
+      - name: Gate — typecheck (host + webview) + full test suite
+        run: npm run gate
+
+      # vsce runs vscode:prepublish (production build) itself, then packs the
+      # runtime dependencies from node_modules — which are the correct per-arch
+      # binaries because this job runs on matching hardware.
+      - name: Package platform .vsix
+        run: npx @vscode/vsce package --target ${{ matrix.target }} --out "talaria-code-${{ matrix.target }}-${{ steps.pkg.outputs.version }}.vsix"
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vsix-${{ matrix.target }}
+          path: talaria-code-${{ matrix.target }}-${{ steps.pkg.outputs.version }}.vsix
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub Release
+    needs: build
+    # Only a real tag push creates a Release. workflow_dispatch is ALWAYS a
+    # dry-run (even if dispatched from a tag ref) — artifacts only, no Release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform .vsix artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+          path: release-assets
+
+      # Use GitHub's own CLI (pre-installed on runners) instead of a third-party
+      # action — no unpinned supply-chain surface to review (CodeQL
+      # actions/unpinned-tag), one fewer dependency to maintain. --generate-notes
+      # auto-writes release notes; --verify-tag ensures the tag exists; the glob
+      # fails the step if no .vsix is present (upload step already guarantees them).
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/*.vsix --generate-notes --verify-tag
+
+      # ------------------------------------------------------------------
+      # Marketplace publishing — enable when ready to publish to the marketplaces.
+      # Requires repo secrets: VSCE_PAT (Azure DevOps PAT, Marketplace "Manage"
+      # scope) and OVSX_PAT (open-vsx.org access token). Publishes the exact
+      # per-platform .vsix files built above — no rebuild happens here.
+      #
+      # - name: Publish to VS Code Marketplace
+      #   run: npx @vscode/vsce publish --packagePath release-assets/*.vsix
+      #   env:
+      #     VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      #
+      # - name: Publish to Open VSX
+      #   run: |
+      #     for f in release-assets/*.vsix; do
+      #       npx ovsx publish "$f" --pat "$OVSX_PAT"
+      #     done
+      #   env:
+      #     OVSX_PAT: ${{ secrets.OVSX_PAT }}
+      # ------------------------------------------------------------------
