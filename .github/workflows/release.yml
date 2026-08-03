@@ -111,12 +111,15 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      # Use GitHub's own CLI (pre-installed on runners) instead of a third-party
+      # action — no unpinned supply-chain surface to review (CodeQL
+      # actions/unpinned-tag), one fewer dependency to maintain. --generate-notes
+      # auto-writes release notes; --verify-tag ensures the tag exists; the glob
+      # fails the step if no .vsix is present (upload step already guarantees them).
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: release-assets/*.vsix
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/*.vsix --generate-notes --verify-tag
 
       # ------------------------------------------------------------------
       # Marketplace publishing — enable when ready to publish to the marketplaces.
