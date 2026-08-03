@@ -87,7 +87,7 @@ function scriptedFileExists(existingPaths: ReadonlySet<string>): { fileExists: F
 }
 
 const installRule = (opts: { stdout?: string[]; stderr?: string[]; exitCode: number }): SpawnRule => ({
-  match: (cmd, args) => cmd === 'pipx' && args[0] === 'install',
+  match: (cmd, args) => cmd === ENV.pipxPath && args[0] === 'install',
   ...opts,
 });
 
@@ -121,9 +121,9 @@ describe('installHermes — Task 5: pipx install pipeline (§2.2 steps 2–4)', 
       { kind: 'done', paths: EXPECTED_PATHS },
     ]);
 
-    // spawn hygiene: absolute-ish command + args array, cwd = os.homedir(), same signal threaded through.
+    // spawn hygiene: absolute command + args array, cwd = os.homedir(), same signal threaded through.
     expect(spawnCalls).toHaveLength(2);
-    expect(spawnCalls[0]).toMatchObject({ cmd: 'pipx', args: ['install', RECIPE.packageSpec] });
+    expect(spawnCalls[0]).toMatchObject({ cmd: ENV.pipxPath, args: ['install', RECIPE.packageSpec] });
     expect(spawnCalls[0]?.opts.cwd).toBe(os.homedir());
     expect(spawnCalls[0]?.opts.signal).toBe(controller.signal);
     expect(spawnCalls[1]).toMatchObject({ cmd: EXPECTED_PATHS.hermesAcp, args: ['--check'] });

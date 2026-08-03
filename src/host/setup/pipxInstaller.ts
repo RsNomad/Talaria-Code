@@ -108,7 +108,7 @@ export async function installHermes(
     recipe.packageSpec,
     ...(env.pythonOverride ? ['--python', env.pythonOverride] : []),
   ];
-  const installRun = await runAndStream(spawn('pipx', installArgs, { cwd, signal }), onEvent, signal);
+  const installRun = await runAndStream(spawn(env.pipxPath, installArgs, { cwd, signal }), onEvent, signal);
   if (installRun.exitCode !== 0) {
     const detail = tail(installRun.stderrLines);
     onEvent({ kind: 'failed', phase: 'pipx-install', detail });
