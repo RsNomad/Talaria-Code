@@ -336,6 +336,7 @@ export function resolvePanelRequest(panel: DataPanel, tab: PanelRequestTab): Pan
     case 'skills':
     case 'models':
     case 'settings':
+    case 'setup':
       return { params };
     default:
       return assertExhaustivePanel(panel);

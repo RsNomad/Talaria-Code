@@ -98,7 +98,12 @@ export interface PlanItem {
   status: 'done' | 'active' | 'pending';
 }
 
-/** Side panels (tabs) the webview can show. `chat` is the default. */
+/**
+ * Side panels (tabs) the webview can show. `chat` is the default.
+ * `setup` (Task 8 — protocol v2, §6 of the onboarding/backend-setup
+ * architecture doc): the Talaria Config / Backend Setup screen — GLOBAL
+ * scope (see {@link PANEL_SCOPE}), like `settings`.
+ */
 export type Panel =
   | 'chat'
   | 'tools'
@@ -108,7 +113,8 @@ export type Panel =
   | 'subagents'
   | 'sessions'
   | 'models'
-  | 'settings';
+  | 'settings'
+  | 'setup';
 
 /**
  * Turn approval policy / mode. Maps to Hermes approval policy
@@ -585,6 +591,151 @@ export interface SettingsData {
   sections: SettingsSection[];
 }
 
+/* ------------------------------------------------------------------ *
+ * Setup / Talaria Config panel (Task 8 — protocol v2). Ground truth:
+ * `docs_claude/onboarding-backend-setup-architecture.md` §6. These shapes
+ * are a deliberate WEBVIEW-SAFE PROJECTION of the host-side backend
+ * registry (`src/host/setup/registry.ts`'s `BackendDescriptor`) — plain
+ * data only, reproduced verbatim here rather than imported, so this
+ * dependency-free shared module never pulls host code (and therefore
+ * Node/VS Code APIs) into the webview's module graph. The host reshapes
+ * `BackendDescriptor` -> `SetupBackendOption` at the panel-data boundary,
+ * the same way `reshapePanelData.ts` reshapes every other panel's host
+ * state into its wire payload.
+ * ------------------------------------------------------------------ */
+
+/**
+ * One selectable backend option (an agent choice, e.g. Hermes, or a FIM/
+ * autocomplete choice) as rendered by the Setup panel's picker cards.
+ * Registry projection — see this section's header doc.
+ */
+export interface SetupBackendOption {
+  id: string;
+  kind: 'agent' | 'fim';
+  status: 'available' | 'coming-soon';
+  displayName: string;
+  description: string;
+  /** The "Connect to an existing endpoint" tab — present for every remote-capable entry. */
+  remote?: {
+    endpointDefault: string;
+    endpointValue: string;
+    endpointPlaceholder: string;
+    auth: 'none' | 'apiKey-optional' | 'apiKey-required';
+    apiKeySet: boolean;
+    probe: 'ollama-tags' | 'llamacpp-health' | 'openai-models' | 'none';
+  };
+  /** The "Install locally" tab — present only for the local-capable entries. */
+  localInstall?: {
+    flavor: 'pipx' | 'guided-terminal';
+    effort: 'one-script' | 'manual-guided';
+    models?: { role: 'fim' | 'embedding'; model: string; present: boolean }[];
+  };
+  /** Present iff this FIM backend also supports the NEXT card's "generic" (reuse) source. */
+  nextEditTransport?: 'ollama' | 'openai-compat';
+  docsUrl?: string;
+}
+
+/**
+ * Lifecycle phase of the Agent card's selected backend (Hermes today).
+ * Origin: §6 card 1's per-phase UI (pipx-missing -> ... -> ready/error).
+ */
+export type AgentSetupPhase =
+  | 'unknown'
+  | 'pipx-missing'
+  | 'python-unsuitable'
+  | 'missing'
+  | 'installing'
+  | 'installed-inactive'
+  | 'awaiting-reload'
+  | 'ready'
+  | 'error';
+
+/**
+ * Setup / Talaria Config panel payload — one snapshot covering all five
+ * readiness cards (§6): agent, provider, FIM/autocomplete, NEXT, RAG, plus
+ * the Ollama local-daemon status the FIM/NEXT local-install tabs read from.
+ */
+export interface SetupData {
+  /** Mutations disabled + explained when `false` (untrusted workspace). */
+  trusted: boolean;
+  /** Card 1 — agent (Hermes / OpenClaw / Talaria AI). */
+  agent: {
+    options: SetupBackendOption[];
+    selectedId: string;
+    phase: AgentSetupPhase;
+    version?: string;
+    detail?: string;
+    logTail?: string[];
+  };
+  /** Card 2 — provider (chat model for the agent). */
+  provider: {
+    phase: 'waiting-agent' | 'unconfigured' | 'configured' | 'unknown';
+    providerId?: string;
+  };
+  /** Card 3 — autocomplete (FIM). */
+  fim: {
+    options: SetupBackendOption[];
+    selectedId: string;
+    enabled: boolean;
+    model: string;
+    endpointValue: string;
+    tuning: {
+      debounceMs: number;
+      maxPromptTokens: number;
+      temperature: number;
+      crossFileEnabled: boolean;
+      prefixInjection: boolean;
+      prefixInjectionRemote: boolean;
+      warmUp: boolean;
+    };
+    probe?: { ok: boolean; detail: string; models?: string[] };
+  };
+  /** Card 4 — NEXT (multi-line next-edit) info panel + dedicated-setup flow. */
+  nextEdit: {
+    source: 'off' | 'dedicated' | 'generic';
+    backend: 'ollama' | 'openai-compat';
+    endpoint: string;
+    model: string;
+    /** `endpoint`+`model` both non-empty. */
+    dedicatedConfigured: boolean;
+    /** Whether the current FIM backend supports the `generic` (reuse) source. */
+    genericSupported: boolean;
+    refusalDetail?: string;
+  };
+  /** Card 5 — codebase index (RAG). */
+  rag: {
+    enabled: boolean;
+    embedEndpoint: string;
+    embedModel: string;
+    embedModelPresent: boolean;
+    tuning: { dims: number; maxChunkTokens: number; debounceMs: number; excludeGlobs: string[] };
+    indexDir: string;
+    /** `shouldActivateRag` text, populated when RAG is blocked from activating. */
+    preconditionDetail?: string;
+  };
+  /** Local Ollama daemon status, read by the FIM/NEXT local-install tabs. */
+  ollama: { running: boolean; version?: string; models: { name: string; sizeBytes: number }[] };
+  /** Composite "you're ready" banner: agent ready + provider configured + FIM probe OK. */
+  ready: boolean;
+}
+
+/**
+ * Streamed install/pull progress for the Setup panel (§6) — the payload of
+ * the throttled (>=150ms) {@link HostToWebview} `setup.progress` push.
+ * `op` distinguishes an agent/backend install from a model pull; `id` is the
+ * backendId or model name the progress line belongs to.
+ */
+export interface SetupProgress {
+  op: 'install' | 'pull';
+  /** backendId (install) or model name (pull). */
+  id: string;
+  phase?: string;
+  /** One streamed log line, appended to the card's live log tail. */
+  line?: string;
+  totalBytes?: number;
+  completedBytes?: number;
+}
+
 /**
  * Maps each side panel to its data payload type. Used to keep
  * {@link HostToWebview} `panel.data` keyed consistently with the panel it targets.
@@ -598,6 +749,7 @@ export interface PanelDataMap {
   sessions: SessionsData;
   models: ModelsData;
   settings: SettingsData;
+  setup: SetupData;
 }
 
 /** Panels that carry data (everything except `chat`). */
@@ -1015,6 +1167,17 @@ export type HostToWebview =
   | { type: 'nextEdit.state'; state: NextEditToggleState }
 
   /**
+   * Task 8 (§6): streamed install/pull progress for the Setup panel's Agent
+   * (install) and FIM/RAG local-install (model pull) cards — CONNECTION-GLOBAL
+   * (no sessionId), same posture as `theme`/`backend.state`/`nextEdit.state`
+   * above: installing a backend or pulling an Ollama model is not scoped to
+   * any one chat session. Host-side emitter throttles to >=150ms between
+   * pushes for the same `(op, id)` pair so a fast log/byte stream cannot
+   * flood the webview with a message per line/chunk.
+   */
+  | ({ type: 'setup.progress' } & SetupProgress)
+
+  /**
    * W2 F-A: code actions → composer. SEED ONLY — the webview inserts `text` +
    * mention chips into the draft and focuses the textarea; it MUST NOT
    * auto-submit (review-first is the security posture). The webview APPENDS
@@ -1179,6 +1342,7 @@ export const PANEL_SCOPE = {
   skills: 'global',
   models: 'global',
   settings: 'global',
+  setup: 'global',
 } as const satisfies Record<DataPanel, Scope>;
 
 /** Panels whose payload is a fold over one ACP session's update stream. Derived from {@link PANEL_SCOPE}. */
@@ -1415,13 +1579,49 @@ export type ControlMethod = (typeof CONTROL_METHODS)[number];
  * confirmed `reload.mcp`) still push without any request. */
 
 /**
+ * Task 8 (§6): the Setup panel's own correlated control-request methods.
+ * ALL host special-cases — like `'nextEdit.toggle'` above, NONE of these are
+ * forwarded to tui_gateway (`AgentBackend.invokeControl` dispatches each by
+ * name, same pattern as `checkpoint.restore`/`session.list`). Every method is
+ * correlated (`control.request`) and resolves `{ok:true}` on success or
+ * `{ok:false; reason}` on a fail-closed refusal (e.g. `trusted:false`, a
+ * validation failure, an in-flight install/pull already running for that id).
+ *
+ * `setup.setNextEdit` writes the NEXT card's DEDICATED connection
+ * (`{backend, endpoint, model}`, Tier-1) — the source on/off/mode flips
+ * themselves keep riding the EXISTING `'nextEdit.toggle'` correlated method
+ * (post-Task-2 it writes `talaria.nextEdit.source`), NOT this one.
+ * `setup.setRag` writes `{enabled|embedEndpoint|embedModel|indexDir}`
+ * (Tier-1). `setup.setTunable` writes one `{key, value}` pair from the
+ * Tier-2 tunables ALLOWLIST only (D9) — host-validated, never an arbitrary
+ * config write.
+ */
+export type SetupMethod =
+  | 'setup.status'
+  | 'setup.install'
+  | 'setup.applyAgent'
+  | 'setup.applyFim'
+  | 'setup.setApiKey'
+  | 'setup.testRemote'
+  | 'setup.pullModel'
+  | 'setup.cancel'
+  | 'setup.openProviderWizard'
+  | 'setup.openInstallTerminal'
+  | 'setup.recheck'
+  | 'setup.setNextEdit'
+  | 'setup.setRag'
+  | 'setup.setTunable';
+
+/**
  * Method a correlated {@link WebviewToHost} `control.request` may invoke. It is
  * the full {@link ControlMethod} set plus the host-internal `'panel.data'`
  * panel-refresh signal (which {@link AgentBackend.invokeControl} already
  * special-cases) — used by the webview to fetch a panel's snapshot AND learn
- * success/failure of that fetch.
+ * success/failure of that fetch — plus `'nextEdit.toggle'` and, as of Task 8,
+ * the full {@link SetupMethod} set (see that type's doc for why none of these
+ * additions are tui_gateway-forwarded).
  */
-export type ControlRequestMethod = ControlMethod | 'panel.data' | 'nextEdit.toggle';
+export type ControlRequestMethod = ControlMethod | 'panel.data' | 'nextEdit.toggle' | SetupMethod;
 
 /**
  * W5.1 R5 (Task 13): which of the two mutually-exclusive next-edit sources a

@@ -542,6 +542,7 @@ function foldPanelData(state: AppState, msg: Extract<HostToWebview, { type: 'pan
     case 'skills':
     case 'models':
     case 'settings':
+    case 'setup':
       return { ...state, globalPanels: setPanelSuccess(state.globalPanels, msg.panel, msg.data) };
     default:
       return assertExhaustivePanel(panel);
@@ -855,6 +856,16 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
     case 'error':
       return foldSessionScoped(state, msg.sessionId, msg.type, (tab) => foldTab(tab, msg));
 
+    // Task 8 (protocol v2, §6): `setup.progress` is a NEW HostToWebview
+    // variant with no AppState slice yet — the Setup panel (Task 10) owns
+    // designing where install/pull progress lives client-side and will
+    // replace this. Deliberately an EXPLICIT no-op (not a silent
+    // `default:` fallthrough) so `assertReduceHandlesEveryRoutedMessage`
+    // below can still prove every `HostToWebview` variant was consciously
+    // considered here, per that function's own doc.
+    case 'setup.progress':
+      return state;
+
     default:
       return state;
   }
@@ -917,6 +928,9 @@ function assertReduceHandlesEveryRoutedMessage(
     case 'plan.update':
     case 'result.summary':
     case 'error':
+    // Task 8: see the matching `case 'setup.progress'` in `reduce()` above —
+    // explicit no-op, Task 10 owns the real fold.
+    case 'setup.progress':
       return;
     default: {
       const exhaustive: never = msg;
@@ -1009,6 +1023,7 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
     case 'skills':
     case 'models':
     case 'settings':
+    case 'setup':
       return { ...state, globalPanels: reducePanelAction(state.globalPanels, action) };
     default:
       return assertExhaustivePanel(action.panel);

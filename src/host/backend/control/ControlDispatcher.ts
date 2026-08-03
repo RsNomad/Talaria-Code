@@ -367,7 +367,14 @@ export class ControlDispatcher {
         '';
       return makePanelData(panel, data as PanelDataMap['sessions'], { cwd });
     }
-    if (panel === 'tools' || panel === 'mcp' || panel === 'skills' || panel === 'models' || panel === 'settings') {
+    if (
+      panel === 'tools' ||
+      panel === 'mcp' ||
+      panel === 'skills' ||
+      panel === 'models' ||
+      panel === 'settings' ||
+      panel === 'setup'
+    ) {
       return makePanelData(panel, data as PanelDataMap[GlobalPanel]);
     }
     const exhaustive: never = panel;

@@ -259,7 +259,14 @@ export class MockBackend implements AgentBackend {
     if (panel === 'sessions') {
       return makePanelData(panel, data as PanelDataMap['sessions'], { cwd: MOCK_SESSION_ID });
     }
-    if (panel === 'tools' || panel === 'mcp' || panel === 'skills' || panel === 'models' || panel === 'settings') {
+    if (
+      panel === 'tools' ||
+      panel === 'mcp' ||
+      panel === 'skills' ||
+      panel === 'models' ||
+      panel === 'settings' ||
+      panel === 'setup'
+    ) {
       return makePanelData(panel, data as PanelDataMap[GlobalPanel]);
     }
     const exhaustive: never = panel;
