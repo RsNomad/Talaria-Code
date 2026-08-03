@@ -108,6 +108,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        # `gh release create` infers the repo (and verifies the tag) from the
+        # git remote of a checked-out tree; without it the step fails with
+        # "fatal: not a git repository".
+        uses: actions/checkout@v7
+
       - name: Download platform .vsix artifacts
         uses: actions/download-artifact@v7
         with:
