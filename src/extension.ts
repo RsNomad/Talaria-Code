@@ -11,6 +11,8 @@ import { createVsCodeNextEditConfigPort, migrateNextEditToggles } from './autoco
 import { createIndexer, type Indexer } from './rag/indexer';
 import { RAG_SETTING_RELOAD } from './rag/ragReloadSettings';
 import { selectBackendKind, shouldActivateLib, shouldActivateRag } from './host/trustGate';
+import { SetupController } from './host/setup/SetupController';
+import { createSetupControllerDeps, createVsCodeSetupHost } from './host/setupHost.vscode';
 import { isHttpUrl } from './shared/url';
 import type { AcpMcpServerStdio } from './host/backend/acp/acpClient';
 import { CODEBASE_SEARCH_TOOL_NAME } from './mcp/toolSchema';
@@ -279,11 +281,28 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
+  // ── Task 9: Setup / Talaria Config controller ────────────────────────────
+  // Backend-AGNOSTIC by design (works under `mock` AND `acp` — Setup's whole
+  // job is bootstrapping FROM mock): constructed once here from the real
+  // vscode-backed `SetupHost` + Task 3-7 engine deps (`setupHost.vscode.ts`,
+  // deliberately outside `src/host/setup/` — see that file's own doc), wired
+  // into the view provider the same way the nextEdit toggle port is
+  // (`setSetupController`), and disposed via `context.subscriptions` like
+  // every other host-owned resource in this function.
+  const setupController = new SetupController(createVsCodeSetupHost(context), createSetupControllerDeps());
+  context.subscriptions.push({ dispose: () => setupController.dispose() });
+  provider.setSetupController(setupController);
+
   // ── Commands ─────────────────────────────────────────────────────────────
   context.subscriptions.push(
     vscode.commands.registerCommand('talaria.newSession', () =>
       provider.newSession(),
     ),
+    // Task 9 (§6 entry point 3): the ONE state-aware Setup entry — command
+    // palette + the view/title icon (package.json). First time = wizard
+    // mood; later = the same cards as current-config editor (no separate
+    // "restart" concept). Locked by `src/host/commandParity.test.ts`.
+    vscode.commands.registerCommand('talaria.openSetup', () => provider.openSetupPanel()),
     // Audit H-1: both of these were DECLARED in package.json and registered
     // nowhere. `talaria.openSettings` is bound to a permanently visible gear on
     // the panel title (`package.json:197`, view/title, navigation@1), so every
@@ -606,6 +625,26 @@ export function activate(context: vscode.ExtensionContext): void {
       registerGenerateCommitMessageCommandOnce();
     }),
   );
+
+  // ── Task 9 (§6 entry point 1): first-run auto-open once ──────────────────
+  // `globalState['talaria.setup.autoOpened']` unset AND `talaria.backend`
+  // still `mock` -> reveal the panel on the Setup screen, then set the flag.
+  // The flag records the ATTEMPT (not completion) — it is set unconditionally
+  // here, so this never re-fires on a later activation even if the user
+  // closes the panel without finishing setup. `configuredBackend()` reads
+  // the setting fresh (not the resolved `backend` binding, which the trust
+  // gate may have downgraded to mock for an untrusted workspace even when
+  // the SETTING itself already says `acp` — auto-open should only fire for
+  // a genuinely unconfigured install, not a trust-gated one). Routed through
+  // `setupController.shouldAutoOpen()`/`.markAutoOpened()` rather than
+  // `context.globalState` directly — SetupController is the single owner of
+  // the `talaria.setup.*` globalState namespace (coexistence.lock.test.ts's
+  // R5 doc: this keeps direct `globalState.get`/`.update` call sites
+  // confined to SetupController.ts/setupHost.vscode.ts, never extension.ts).
+  if (setupController.shouldAutoOpen() && configuredBackend() === 'mock') {
+    provider.openSetupPanel();
+    void setupController.markAutoOpened();
+  }
 
   output.appendLine(
     `Talaria Code extension activated (${backend instanceof AcpBackend ? 'AcpBackend' : 'MockBackend'}${

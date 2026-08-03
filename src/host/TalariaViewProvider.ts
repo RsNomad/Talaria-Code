@@ -17,8 +17,11 @@ import { buildSearchFilesResponse } from './context/searchFilesResponse';
 import type { FindFilesFn } from './context/searchFilesResponse';
 import { buildDiffUriParts } from './preview/parseDiffUri';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
-import type { NextEditToggleState } from '../shared/protocol';
+import type { NextEditToggleState, Panel, SetupMethod } from '../shared/protocol';
+import { makePanelData } from '../shared/protocol';
 import { redactControlResponse } from './redactControlResponse';
+import type { SetupController } from './setup/SetupController';
+import { SetupPanelSource } from './panels/setupPanelSource';
 
 /** Fixed brand accent (teal), layered over `--vscode-*` surfaces in the view. */
 const BRAND_ACCENT = '#14b8a6';
@@ -134,6 +137,29 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   private nextEditTogglesSub?: vscode.Disposable;
 
   /**
+   * Task 9 (onboarding-backend-setup-architecture.md §7/§8): the Setup /
+   * Talaria Config brain, wired by `extension.ts` via {@link
+   * setSetupController} once its real `vscode`-backed host + engine deps
+   * exist (constructed synchronously at activation — unlike {@link
+   * nextEditToggles}, there is no async hydration to wait on). `undefined`
+   * until then; every `setup.*` request is answered with an honest refusal
+   * in that window rather than being forwarded anywhere (F-7 posture: Setup
+   * must work with NO agent, so it is never routed through `AgentBackend
+   * .invokeControl` — see {@link handleSetupMethod}).
+   */
+  private setupController?: SetupController;
+  /** `PanelSource<'setup'>` wrapper over {@link setupController}, rebuilt
+   *  alongside it — used for the `panel.data{panel:'setup'}` fetch path. */
+  private setupPanelSource?: SetupPanelSource;
+  /** Subscription to {@link setupController}'s `onProgress`; replaced (and
+   *  disposed) if the controller is ever rewired. */
+  private setupProgressSub?: vscode.Disposable;
+  /** First-run auto-open (§6 entry point 1): which panel the NEXT `hydrate`
+   *  should boot into. Stays `'chat'` for every normal boot; {@link
+   *  openSetupPanel} is the only writer. */
+  private initialPanel: Panel = 'chat';
+
+  /**
    * W2 T3 (§2e pending-seed latch): true once the CURRENT webview instance
    * has announced `ready`. Reset on every fresh `resolveWebviewView` (a
    * re-created view's React tree has not mounted yet, even though `this.view`
@@ -203,6 +229,39 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    *  `'ready'` case), so a dropped push can never leave the rows stale. */
   private postNextEditState(state: NextEditToggleState): void {
     this.postToWebview({ type: 'nextEdit.state', state });
+  }
+
+  /**
+   * Task 9: wire the SetupController. Called once by `extension.ts` right
+   * after construction (no async wait needed — unlike {@link
+   * setNextEditToggles}'s Guard hydration). Subscribes to `onProgress` and
+   * relays every throttled push as `setup.progress`; a no-op push when the
+   * view isn't live is fine — `postToWebview` drops it silently, same
+   * posture as every other connection-global push in this class.
+   */
+  setSetupController(controller: SetupController): void {
+    this.setupProgressSub?.dispose();
+    this.setupController = controller;
+    this.setupPanelSource = new SetupPanelSource(controller);
+    const sub = controller.onProgress((progress) => this.postToWebview({ type: 'setup.progress', ...progress }));
+    this.setupProgressSub = { dispose: () => sub.dispose() };
+    this.disposables.push(this.setupProgressSub);
+  }
+
+  /**
+   * First-run auto-open (§6 entry point 1): reveal the panel with 'setup' as
+   * the initial `activePanel` of the NEXT `hydrate` this webview instance
+   * sends. `extension.ts` calls this once, at activation, guarded by its own
+   * `globalState['talaria.setup.autoOpened']` latch. If the view is already
+   * resolved and live (a genuinely rare race — this fires synchronously at
+   * activation, before the user could plausibly have opened the panel
+   * already), this only reveals; it deliberately does NOT force a re-hydrate
+   * (would yank whatever panel the user is already looking at — the same
+   * rule {@link setBackend}'s trust-upgrade swap follows).
+   */
+  openSetupPanel(): void {
+    this.initialPanel = 'setup';
+    this.revealView();
   }
 
   /**
@@ -727,7 +786,11 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
           ? await this.handleNextEditToggle(params)
           : method === 'context.searchFiles'
             ? await this.handleSearchFiles(params)
-            : await this.backend.invokeControl(method, params);
+            : method === 'panel.data' && extractPanelName(params) === 'setup'
+              ? await this.handleSetupPanelFetch()
+              : isSetupMethod(method)
+                ? await this.handleSetupMethod(method, params)
+                : await this.backend.invokeControl(method, params);
       this.postToWebview({ type: 'control.response', requestId, ok: true, result: redactControlResponse(method, result) });
     } catch (err) {
       this.logger?.appendLine(`[control.request] ${method} failed: ${String(err)}`);
@@ -775,6 +838,65 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       throw new Error('Next Edit Suggestions are not available in this window.');
     }
     return this.nextEditToggles.request(source, on);
+  }
+
+  /**
+   * Task 9: `setup.*` methods are HOST-INTERNAL, exactly like `nextEdit
+   * .toggle` above — none of them are ever forwarded to `AgentBackend
+   * .invokeControl`. `setup.status` returns the full `SetupData` directly
+   * (the richer shape `SetupController.status()` produces); every other
+   * `setup.*` method goes through `SetupController.handle()`, and — on an
+   * accepted (`ok:true`) mutation — this ALSO re-fetches + re-pushes fresh
+   * `SetupData` as a `panel.data` message (mirrors `ControlDispatcher`'s
+   * `reload.mcp`/`model.save_key` "dispatch -> refetch panel -> push"
+   * precedent), so the Setup panel reflects its own write immediately
+   * without a second round trip from the webview.
+   */
+  private async handleSetupMethod(
+    method: SetupMethod,
+    params: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    const controller = this.setupController;
+    if (!controller) {
+      throw new Error('Talaria: Backend Setup is not available in this window.');
+    }
+    if (method === 'setup.status') {
+      return controller.status();
+    }
+    const result = await controller.handle(method, params);
+    if (result.ok) {
+      // AWAITED (matches ControlDispatcher's `reload.mcp`/`model.save_key`
+      // "dispatch -> refetch -> push" precedent — not fire-and-forget): the
+      // webview's optimistic write-through would otherwise race the fresh
+      // `panel.data` push against this method's own `control.response`.
+      try {
+        await this.pushSetupPanelData();
+      } catch (err) {
+        this.logger?.appendLine(`[setup] post-mutation panel refresh failed: ${String(err)}`);
+      }
+    }
+    return result;
+  }
+
+  /** `panel.data{panel:'setup'}` — mirrors every other panel's fetch+push
+   *  contract (`ControlDispatcher.fetchPanelData`), reached through {@link
+   *  setupPanelSource} instead of the agent-backend-owned registry (Setup
+   *  must render under the mock backend too — see the field's own doc). */
+  private async handleSetupPanelFetch(): Promise<unknown> {
+    if (!this.setupPanelSource) return undefined;
+    const outcome = await this.setupPanelSource.fetch();
+    if (outcome.data !== undefined) {
+      this.postToWebview(makePanelData('setup', outcome.data));
+    }
+    return outcome.data;
+  }
+
+  private async pushSetupPanelData(): Promise<void> {
+    if (!this.setupPanelSource) return;
+    const outcome = await this.setupPanelSource.fetch();
+    if (outcome.data !== undefined) {
+      this.postToWebview(makePanelData('setup', outcome.data));
+    }
   }
 
   private handleSearchFiles(params: Record<string, unknown> | undefined): Promise<string[]> {
@@ -842,7 +964,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       // when the active backend has no policy engine (mock).
       preset: this.activePreset(),
       currentModelId: null,
-      activePanel: 'chat',
+      activePanel: this.initialPanel,
       // W2 F-S: hydrate carry — a re-created view gets the cached ACP
       // `available_commands` catalog without the adapter replaying it.
       // Absent/undefined until the first catalog arrives, or on a backend
@@ -942,6 +1064,21 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 /** Extract a human-readable message from an unknown thrown value. */
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Task 9: every `SetupMethod` literal starts with `'setup.'` and no other
+ *  `ControlRequestMethod` does (`src/shared/protocol.ts` — checked against
+ *  `CONTROL_METHODS`/`'nextEdit.toggle'`/`'panel.data'`), so this prefix
+ *  check is a sound, dependency-free type guard without hand-listing all 14
+ *  method names here (which would drift against `SetupMethod` silently). */
+function isSetupMethod(method: string): method is SetupMethod {
+  return method.startsWith('setup.');
+}
+
+/** Pull a `{panel}` string out of a `panel.data` request's params, if present. */
+function extractPanelName(params: Record<string, unknown> | undefined): string | undefined {
+  const panel = params?.panel;
+  return typeof panel === 'string' ? panel : undefined;
 }
 
 /** Map VS Code's `ColorThemeKind` enum to the {@link ThemeKind} the webview themes on. */

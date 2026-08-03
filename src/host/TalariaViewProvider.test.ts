@@ -14,6 +14,8 @@ import { fileURLToPath } from 'node:url';
 import * as vscode from 'vscode';
 import { TalariaViewProvider, capSeedText, decideSeedDelivery } from './TalariaViewProvider';
 import type { AgentBackend } from './backend/AgentBackend';
+import { SetupController, type SetupHost, type SetupControllerDeps } from './setup/SetupController';
+import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
 import type {
   ContextRef,
   EditPolicyPreset,
@@ -1118,6 +1120,208 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     expect(calls).toEqual([]);
     expect(posted.find((m) => m.type === 'control.response')).toMatchObject({ requestId: 15, ok: false });
+  });
+});
+
+/*
+ * ── Task 9: `setup.*` is HOST-INTERNAL too (mirrors the nextEdit.toggle
+ * precedent above) — never forwarded to `AgentBackend.invokeControl`,
+ * answered via the injected `SetupController` instead. ──
+ */
+
+/** A minimal FAKE `SetupHost` — trusted by default, records writes/modals.
+ *  Reused from the same shape `SetupController.test.ts` exercises in depth;
+ *  kept intentionally small here since these tests are about ROUTING, not
+ *  SetupController's own behavior contract. */
+class FakeSetupHostForRouting implements SetupHost {
+  trusted = true;
+  settings = new Map<string, unknown>();
+  async showModal(): Promise<boolean> {
+    return true;
+  }
+  async showPasswordInput(): Promise<string | undefined> {
+    return undefined;
+  }
+  createTerminal(): void {}
+  runInTerminal(): void {}
+  getSetting<T>(key: string): T | undefined {
+    return this.settings.get(key) as T | undefined;
+  }
+  async updateSettingGlobal(key: string, value: unknown): Promise<void> {
+    this.settings.set(key, value);
+  }
+  secrets = {
+    store: async (): Promise<void> => {},
+    has: async (): Promise<boolean> => false,
+    delete: async (): Promise<void> => {},
+  };
+  globalState = {
+    get: <T,>(): T | undefined => undefined,
+    update: async (): Promise<void> => {},
+  };
+  isTrusted(): boolean {
+    return this.trusted;
+  }
+  offerReload(): void {}
+}
+
+function makeFakeSetupDeps(): SetupControllerDeps {
+  return {
+    locatePipx: async () => ({ ok: false, reason: 'pipx-missing', detail: 'not used in routing tests' }),
+    installHermes: async () => {
+      throw new Error('not used in routing tests');
+    },
+    probeOllama: async () => ({ running: false, detail: 'not used in routing tests' }),
+    pullModel: async () => {},
+    probeRemote: async () => ({ ok: true, detail: 'not used in routing tests' }),
+    registry: { AGENT_BACKENDS, FIM_BACKENDS, getBackend },
+    getNextEditSource: () => 'off',
+  };
+}
+
+function makeProviderWithSetupController(): {
+  provider: TalariaViewProvider;
+  posted: HostToWebviewMessage[];
+  calls: Array<{ method: string; params: unknown }>;
+  host: FakeSetupHostForRouting;
+  controller: SetupController;
+} {
+  const { calls, invokeControl } = recordingInvokeControl();
+  const backend = makeFakeBackend(invokeControl);
+  const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend);
+  const posted: HostToWebviewMessage[] = [];
+  seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
+  const host = new FakeSetupHostForRouting();
+  const controller = new SetupController(host, makeFakeSetupDeps());
+  provider.setSetupController(controller);
+  return { provider, posted, calls, host, controller };
+}
+
+describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
+  it('setup.status returns the full SetupData and never reaches backend.invokeControl', async () => {
+    const { provider, posted, calls } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 21,
+      method: 'setup.status',
+    } as never);
+    // status() chains several internal awaits (secrets.has, the Ollama
+    // probe, ...) — drain more microtask ticks than the single-hop
+    // nextEdit.toggle tests above need.
+    await flush();
+    await flush();
+    await flush();
+
+    expect(calls).toEqual([]);
+    const reply = posted.find((m) => m.type === 'control.response') as
+      | { type: 'control.response'; ok: true; result: { trusted: boolean } }
+      | undefined;
+    expect(reply?.ok).toBe(true);
+    expect(reply?.result.trusted).toBe(true);
+  });
+
+  it('setup.recheck (a no-op mutation) answers ok:true and never reaches backend.invokeControl', async () => {
+    const { provider, posted, calls } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 22,
+      method: 'setup.recheck',
+    } as never);
+    await flush();
+    await flush();
+    await flush();
+
+    expect(calls).toEqual([]);
+    expect(posted).toContainEqual({ type: 'control.response', requestId: 22, ok: true, result: { ok: true } });
+  });
+
+  it('an accepted setup.* mutation re-pushes fresh SetupData as a panel.data push', async () => {
+    const { provider, posted, host } = makeProviderWithSetupController();
+    host.settings.set('talaria.autocomplete.debounceMs', 350);
+    posted.length = 0;
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 23,
+      method: 'setup.setTunable',
+      params: { key: 'talaria.autocomplete.debounceMs', value: 500 },
+    } as never);
+    await flush();
+    await flush();
+    await flush();
+
+    expect(host.settings.get('talaria.autocomplete.debounceMs')).toBe(500);
+    const push = posted.find((m) => m.type === 'panel.data' && (m as { panel?: string }).panel === 'setup');
+    expect(push).toBeDefined();
+  });
+
+  it("panel.data{panel:'setup'} resolves via the SetupPanelSource and also pushes panel.data", async () => {
+    const { provider, posted, calls } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 24,
+      method: 'panel.data',
+      params: { panel: 'setup' },
+    } as never);
+    await flush();
+    await flush();
+    await flush();
+
+    expect(calls).toEqual([]); // never asked the agent backend for it
+    const reply = posted.find((m) => m.type === 'control.response');
+    expect(reply).toMatchObject({ requestId: 24, ok: true });
+    const push = posted.find((m) => m.type === 'panel.data' && (m as { panel?: string }).panel === 'setup');
+    expect(push).toBeDefined();
+  });
+
+  it('answers honestly (ok:false) when no SetupController is wired yet — never forwards to the agent', async () => {
+    const { calls, invokeControl } = recordingInvokeControl();
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(invokeControl));
+    const posted: HostToWebviewMessage[] = [];
+    seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 25,
+      method: 'setup.status',
+    } as never);
+    await flush();
+
+    expect(calls).toEqual([]);
+    expect(posted.find((m) => m.type === 'control.response')).toMatchObject({ requestId: 25, ok: false });
+  });
+
+  it("onProgress is relayed as a throttled setup.progress push", () => {
+    const { posted, controller } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    (controller as unknown as { pushProgress(p: unknown): void }).pushProgress({
+      op: 'install',
+      id: 'hermes',
+      phase: 'pipx-install',
+    });
+
+    expect(posted).toContainEqual({ type: 'setup.progress', op: 'install', id: 'hermes', phase: 'pipx-install' });
+  });
+
+  it('openSetupPanel() seeds the NEXT hydrate with activePanel:"setup"', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    // Called BEFORE the view is ever resolved — the cold-boot first-run
+    // auto-open case (extension.ts calls this synchronously at activation).
+    provider.openSetupPanel();
+
+    const posted: HostToWebviewMessage[] = [];
+    const { view } = makeFakeWebviewView(posted);
+    provider.resolveWebviewView(view as never, {} as never, {} as never);
+
+    const hydrate = posted.find((m) => m.type === 'hydrate') as { type: 'hydrate'; state: { activePanel: string } } | undefined;
+    expect(hydrate?.state.activePanel).toBe('setup');
   });
 });
 

@@ -1177,11 +1177,27 @@ describe('R3 LOCK: the Tab table — every next-edit keybinding when-clause EQUA
  *  3. The `globalState` handle itself is reached in exactly one non-test
  *     module — `extension.ts`, which does nothing with it but hand it to
  *     `migrateNextEditToggles` once at activation.
+ *
+ * Task 9 widening (onboarding-backend-setup-architecture.md §7): `Setup
+ * Controller.ts` + `setupHost.vscode.ts` now ALSO reach `context.globalState`
+ * — for an entirely DISJOINT key namespace (`talaria.setup.hermesInstall` /
+ * `.completed` / `.autoOpened`, none of which is a NEXT-edit key). This is a
+ * SECOND, independent globalState owner, not a bypass of the Guard's own
+ * `hermes.nextEdit.toggles` memento — the two scans (1)/(2) above still prove
+ * that (unchanged, still pinned to `guard.ts` alone), and `SetupController
+ * .ts` deliberately reads `talaria.nextEdit.source` through the Guard's own
+ * `NextEditConfigPort` accessor (`SetupControllerDeps.getNextEditSource`,
+ * bound in `setupHost.vscode.ts` to `createVsCodeNextEditConfigPort().get()`)
+ * rather than naming the key itself — see that interface's own doc. Scans
+ * (3)/(4) below are widened to the two NEW, named, justified reaches; a
+ * THIRD, unnamed module reaching globalState would still fail them.
  */
 const TOGGLES_KEY_LITERAL = /['"`]hermes\.nextEdit\.toggles['"`]/;
 const SOURCE_KEY_LITERAL = /['"`]talaria\.nextEdit\.source['"`]/;
 const GLOBAL_STATE_HANDLE = /\bglobalState\b/;
 const GLOBAL_STATE_DIRECT_ACCESS = /\bglobalState\s*\.\s*(?:get|update)\s*\(/;
+/** Task 9's two justified `globalState` reaches (disjoint key namespace — see the doc block above), sorted for order-independent comparison. */
+const SETUP_GLOBAL_STATE_MODULES = ['host/setup/SetupController.ts', 'host/setupHost.vscode.ts'];
 
 describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobody', () => {
   it('the SETTING-key literal talaria.nextEdit.source appears in EXACTLY one non-test src/ module, and it is nextedit/guard.ts', () => {
@@ -1217,30 +1233,34 @@ describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobo
     ).toBe(true);
   });
 
-  it('the globalState handle is reached in EXACTLY one non-test src/ module — extension.ts, the migration call site', () => {
+  it('the globalState handle is reached only by extension.ts (the migration call site) and the two named Task-9 Setup modules', () => {
     // `extension.ts` obtains `context.globalState` and passes it straight to
-    // `migrateNextEditToggles` (once, at activation). Any SECOND module
-    // reaching for the store is a bypass route, whether or not it names the
-    // key. (`autocomplete/index.ts` no longer touches it at all: the Guard
-    // hydrates from the config port.)
+    // `migrateNextEditToggles` (once, at activation). `SetupController.ts`/
+    // `setupHost.vscode.ts` reach it too — for the DISJOINT `talaria.setup.*`
+    // key namespace (see the R5 doc block above), not the NEXT-edit one. Any
+    // THIRD, unnamed module reaching for the store is still a bypass route.
     expect(
-      filesMatching(loadStripped(SRC_ROOT), GLOBAL_STATE_HANDLE),
-      'R5 failed: context.globalState must be reached from EXACTLY one non-test module (extension.ts, the one migrateNextEditToggles call site) — a second reach is a bypass route around the Guard',
-    ).toEqual(['extension.ts']);
+      [...filesMatching(loadStripped(SRC_ROOT), GLOBAL_STATE_HANDLE)].sort(),
+      'R5 failed: context.globalState must be reached ONLY from extension.ts (the migration call site) and the two named Task-9 Setup modules — any other reach is a bypass route around the Guard',
+    ).toEqual(['extension.ts', ...SETUP_GLOBAL_STATE_MODULES].sort());
   });
 
-  it('no module calls get/update directly on globalState — the Memento is only ever handed to the Guard', () => {
-    // HONEST NOTE: this predicate matches nothing in the tree TODAY (the
-    // composition root passes the Memento by reference; `guard.ts` calls
-    // `.get`/`.update` on its own injected `state` field, never on a
-    // `globalState`-named expression). It is a FORWARD-LOOKING ban, and it is
-    // recorded as such rather than dressed up as currently load-bearing. Its
-    // predicate is proven to fire by the planted violation below — that proof
-    // is what stops it from being a lock that can never go RED.
+  it('no module OTHER than the named Task-9 Setup modules calls get/update directly on globalState', () => {
+    // ORIGINAL intent (Task 2): the Guard's own `hermes.nextEdit.toggles`
+    // Memento is only ever handed BY REFERENCE to `migrateNextEditToggles` —
+    // nobody calls `.get`/`.update` on it directly, which would bypass the
+    // Guard's mutual-exclusion invariant for THAT key. Task 9's `SetupHost
+    // .globalState.get/update` calls (`SetupController.ts`/`setupHost.vscode
+    // .ts`) are a legitimate, independent direct-access pattern over a
+    // DISJOINT key namespace (`talaria.setup.*`) — there is no Guard over
+    // those keys to bypass. The predicate stays a REAL lock for everyone
+    // else: a THIRD, unnamed module calling `.get`/`.update` on a
+    // `globalState`-named expression still fails this test, proven by the
+    // planted-violation proof below.
     expect(
-      filesMatching(loadStripped(SRC_ROOT), GLOBAL_STATE_DIRECT_ACCESS),
-      'R5 (forward-looking) failed: a module now calls .get/.update directly on a globalState-named expression, bypassing the Guard',
-    ).toEqual([]);
+      [...filesMatching(loadStripped(SRC_ROOT), GLOBAL_STATE_DIRECT_ACCESS)].sort(),
+      'R5 failed: only the two named Task-9 Setup modules may call .get/.update directly on a globalState-named expression — any other module doing so bypasses the Guard',
+    ).toEqual([...SETUP_GLOBAL_STATE_MODULES].sort());
   });
 
   it('RED-first proof: all R5 scans flag violations planted in DISTANT modules', () => {
@@ -1291,10 +1311,15 @@ describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobo
         content: "await context.globalState.update('hermes.nextEdit.toggles', { next: true });",
       },
     ];
+    const directMatches = filesMatching(directViolation, GLOBAL_STATE_DIRECT_ACCESS);
     expect(
-      filesMatching(directViolation, GLOBAL_STATE_DIRECT_ACCESS),
+      directMatches,
       'R5 RED-first proof failed: a planted direct globalState.update(...) call was not flagged by the forward-looking predicate',
-    ).toEqual(['host/__direct_probe__.ts']);
+    ).toContain('host/__direct_probe__.ts');
+    expect(
+      [...directMatches].sort(),
+      'R5 RED-first proof failed: the planted violation must break the exact-membership check (baseline + the probe, nothing else)',
+    ).toEqual([...SETUP_GLOBAL_STATE_MODULES, 'host/__direct_probe__.ts'].sort());
   });
 
   it('negative control: prose about globalState in a comment is not a bypass', () => {
@@ -1310,9 +1335,9 @@ describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobo
       'R5 negative control failed: prose naming the key in a comment must not count as a second key-literal module',
     ).toEqual(['autocomplete/nextedit/guard.ts']);
     expect(
-      filesMatching(commentOnly, GLOBAL_STATE_HANDLE),
-      'R5 negative control failed: prose naming globalState in a comment must not count as a second reach',
-    ).toEqual(['extension.ts']);
+      [...filesMatching(commentOnly, GLOBAL_STATE_HANDLE)].sort(),
+      'R5 negative control failed: prose naming globalState in a comment must not count as an extra reach',
+    ).toEqual(['extension.ts', ...SETUP_GLOBAL_STATE_MODULES].sort());
   });
 });
 

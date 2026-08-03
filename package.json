@@ -88,6 +88,12 @@
         "icon": "$(gear)"
       },
       {
+        "command": "talaria.openSetup",
+        "title": "Talaria: Backend Setup",
+        "category": "Talaria",
+        "icon": "$(rocket)"
+      },
+      {
         "command": "talaria.showLogs",
         "title": "Show Logs",
         "category": "Talaria",
@@ -202,9 +208,14 @@
       ],
       "view/title": [
         {
-          "command": "talaria.openSettings",
+          "command": "talaria.openSetup",
           "when": "view == talaria.panel",
           "group": "navigation@1"
+        },
+        {
+          "command": "talaria.openSettings",
+          "when": "view == talaria.panel",
+          "group": "navigation@2"
         }
       ],
       "editor/context": [
