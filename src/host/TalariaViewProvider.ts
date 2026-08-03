@@ -156,7 +156,11 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   private setupProgressSub?: vscode.Disposable;
   /** First-run auto-open (§6 entry point 1): which panel the NEXT `hydrate`
    *  should boot into. Stays `'chat'` for every normal boot; {@link
-   *  openSetupPanel} is the only writer. */
+   *  openSetupPanel} is the only writer. One-shot: {@link seedState} resets
+   *  it to `'chat'` the moment it is read, so only the hydrate immediately
+   *  following {@link openSetupPanel} boots into `'setup'` — a LATER
+   *  hydrate (e.g. a memory-pressure webview re-create) must not keep
+   *  re-opening 'setup' forever. */
   private initialPanel: Panel = 'chat';
 
   /**
@@ -950,6 +954,12 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 
   /** A clean bootstrap snapshot for `hydrate` on (re)create — scalars only (R-C4). */
   private seedState(): WebviewState {
+    // One-shot consume (see `initialPanel`'s doc): this hydrate gets
+    // whatever was latched, then the latch resets to 'chat' so the NEXT
+    // hydrate (e.g. a later webview re-create) does not keep re-opening
+    // 'setup'.
+    const activePanel = this.initialPanel;
+    this.initialPanel = 'chat';
     return {
       sessionId: null,
       theme: this.currentTheme(),
@@ -964,7 +974,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       // when the active backend has no policy engine (mock).
       preset: this.activePreset(),
       currentModelId: null,
-      activePanel: this.initialPanel,
+      activePanel,
       // W2 F-S: hydrate carry — a re-created view gets the cached ACP
       // `available_commands` catalog without the adapter replaying it.
       // Absent/undefined until the first catalog arrives, or on a backend

@@ -482,15 +482,26 @@ export class SetupController {
       }
 
       // Fail-closed order: installHermes only resolves after its own
-      // `--check` verify passed — writes happen ONLY now, together.
-      await this.host.updateSettingGlobal('talaria.hermesPath', paths.hermes);
-      await this.host.updateSettingGlobal('talaria.pythonPath', paths.python);
-      await this.host.updateSettingGlobal('talaria.backend', 'acp');
-      await this.host.globalState.update('talaria.setup.hermesInstall', {
-        version: recipe.pinnedVersion,
-        venvRoot: paths.venvRoot,
-        installedAt: new Date().toISOString(),
-      });
+      // `--check` verify passed — writes happen ONLY now, together. Wrapped
+      // so an updateSettingGlobal/globalState.update rejection (e.g. VS Code
+      // failing to write User Settings) surfaces as {ok:false} instead of
+      // throwing out of handle() — a partial write leaves `talaria.backend`
+      // unset/'mock' either way (fail-safe per class doc §8), so this is
+      // purely about a graceful error return, not a security change.
+      try {
+        await this.host.updateSettingGlobal('talaria.hermesPath', paths.hermes);
+        await this.host.updateSettingGlobal('talaria.pythonPath', paths.python);
+        await this.host.updateSettingGlobal('talaria.backend', 'acp');
+        await this.host.globalState.update('talaria.setup.hermesInstall', {
+          version: recipe.pinnedVersion,
+          venvRoot: paths.venvRoot,
+          installedAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        const detail = this.redact(errorMessage(err));
+        this.lastAgentIssue = { phase: 'error', detail };
+        return { ok: false, reason: detail };
+      }
       this.awaitingReload = true;
       this.host.offerReload();
       return { ok: true };
@@ -600,7 +611,7 @@ export class SetupController {
       // entry whose probe would actually need one (codestral) has
       // `probe: {kind:'none'}` for exactly this reason.
       const outcome = await this.deps.probeRemote(descriptor.remote.probe, endpoint, undefined);
-      return outcome.ok ? { ok: true } : { ok: false, reason: outcome.detail };
+      return outcome.ok ? { ok: true } : { ok: false, reason: this.redact(outcome.detail) };
     } catch (err) {
       return { ok: false, reason: this.redact(errorMessage(err)) };
     }
@@ -618,15 +629,22 @@ export class SetupController {
     const key = `pull:${model}`;
     if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
 
-    const confirmed = await this.host.showModal(
-      `Pull model '${model}' from the Ollama registry to your local disk?`,
-      'Pull',
-    );
-    if (!confirmed) return { ok: false, reason: 'declined' };
-
+    // Latch BEFORE the modal (mirrors handleInstall) — otherwise two
+    // `setup.pullModel` calls dispatched before the user answers the first
+    // modal both pass the `has()` check above, and if both are approved the
+    // second `inFlight.set` clobbers the first's AbortController, leaving
+    // `setup.cancel` unable to reach the first pull. The `finally` below
+    // still deletes the key on every exit path, including a decline, so a
+    // declined pull never wedges the latch.
     const abort = new AbortController();
     this.inFlight.set(key, abort);
     try {
+      const confirmed = await this.host.showModal(
+        `Pull model '${model}' from the Ollama registry to your local disk?`,
+        'Pull',
+      );
+      if (!confirmed) return { ok: false, reason: 'declined' };
+
       await this.deps.pullModel(
         endpoint,
         model,

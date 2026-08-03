@@ -345,6 +345,29 @@ describe('FM-12: setup.install single-flight', () => {
   });
 });
 
+// --- FM-12: pullModel single-flight (latch BEFORE the modal) ----------------
+
+describe('FM-12: setup.pullModel single-flight', () => {
+  it('a second concurrent pullModel for the same model is refused while the first modal is still pending', async () => {
+    const host = new FakeSetupHost();
+    // Modal never resolves during this test — keeps the first call "in flight".
+    let resolveModal: (v: boolean) => void = () => {};
+    host.showModal = () =>
+      new Promise<boolean>((resolve) => {
+        resolveModal = resolve;
+      });
+    const { deps } = makeFakeDeps();
+    const controller = new SetupController(host, deps);
+
+    const first = controller.handle('setup.pullModel', { model: 'qwen2.5-coder:1.5b-base' });
+    const second = await controller.handle('setup.pullModel', { model: 'qwen2.5-coder:1.5b-base' });
+    expect(second).toEqual({ ok: false, reason: 'pull already running' });
+
+    resolveModal(false); // let the first finish (declined) so the test can end cleanly
+    await first;
+  });
+});
+
 // --- Happy install: full order proof ----------------------------------------
 
 describe('happy install: fail-closed ORDER (locatePipx -> installHermes -> writes together -> globalState -> offerReload)', () => {
@@ -431,6 +454,31 @@ describe('happy install: fail-closed ORDER (locatePipx -> installHermes -> write
     const result = await controller.handle('setup.install', { backendId: 'hermes' });
     expect(result.ok).toBe(false);
     expect(host.settings.size).toBe(0);
+    expect(host.reloadOffers).toBe(0);
+  });
+
+  it('a post-verify updateSettingGlobal rejection returns {ok:false} instead of throwing (fault-tolerant)', async () => {
+    const host = new FakeSetupHost();
+    const realUpdate = host.updateSettingGlobal.bind(host);
+    host.updateSettingGlobal = async (key: string, value: unknown): Promise<void> => {
+      if (key === 'talaria.backend') throw new Error('EBUSY: settings.json is locked');
+      return realUpdate(key, value);
+    };
+    const { deps } = makeFakeDeps();
+    const controller = new SetupController(host, deps);
+
+    // handle() must not throw — a rejecting write is a returned error, not
+    // an unhandled rejection out of the controller.
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('settings.json is locked');
+
+    // Partial write: hermesPath/pythonPath landed before the rejection, but
+    // the backend switch (and everything after it) never happened — the
+    // fail-safe state the finding describes (backend stays unset/'mock').
+    expect(host.settings.get('talaria.hermesPath')).toBe(OK_HERMES_PATHS.hermes);
+    expect(host.settings.get('talaria.backend')).toBeUndefined();
+    expect(host.globalStateStore.has('talaria.setup.hermesInstall')).toBe(false);
     expect(host.reloadOffers).toBe(0);
   });
 });

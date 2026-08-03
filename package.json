@@ -89,7 +89,7 @@
       },
       {
         "command": "talaria.openSetup",
-        "title": "Talaria: Backend Setup",
+        "title": "Backend Setup",
         "category": "Talaria",
         "icon": "$(rocket)"
       },

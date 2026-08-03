@@ -1323,6 +1323,30 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
     const hydrate = posted.find((m) => m.type === 'hydrate') as { type: 'hydrate'; state: { activePanel: string } } | undefined;
     expect(hydrate?.state.activePanel).toBe('setup');
   });
+
+  it('initialPanel is a ONE-SHOT latch: a LATER hydrate (webview re-create) reverts to activePanel:"chat"', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    provider.openSetupPanel();
+
+    const posted1: HostToWebviewMessage[] = [];
+    const { view: view1 } = makeFakeWebviewView(posted1);
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+    const hydrate1 = posted1.find((m) => m.type === 'hydrate') as
+      | { type: 'hydrate'; state: { activePanel: string } }
+      | undefined;
+    expect(hydrate1?.state.activePanel).toBe('setup');
+
+    // A later webview re-create (e.g. memory-pressure dispose + re-resolve)
+    // must NOT keep re-opening 'setup' forever — the latch was already
+    // consumed by the first hydrate above.
+    const posted2: HostToWebviewMessage[] = [];
+    const { view: view2 } = makeFakeWebviewView(posted2);
+    provider.resolveWebviewView(view2 as never, {} as never, {} as never);
+    const hydrate2 = posted2.find((m) => m.type === 'hydrate') as
+      | { type: 'hydrate'; state: { activePanel: string } }
+      | undefined;
+    expect(hydrate2?.state.activePanel).toBe('chat');
+  });
 });
 
 /*
