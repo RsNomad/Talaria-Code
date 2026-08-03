@@ -2,7 +2,7 @@
   "name": "talaria-code",
   "displayName": "Talaria Code",
   "description": "Talaria Code — an in-editor client for the Hermes agent: chat, tools, MCP, skills, checkpoints and more, in a native VS Code panel.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "syntinal",
   "license": "GPL-3.0-or-later",
   "repository": {
