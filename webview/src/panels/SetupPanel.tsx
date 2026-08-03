@@ -41,11 +41,13 @@ import { commitFieldEdit, initNextEditRowState, reconcileNextEditRowState } from
 import {
   agentPhaseLabel,
   agentPrimaryAction,
+  buildCopyLogText,
   fimHasLocalInstall,
   isComingSoon,
   mutationDisabledReason,
   nextEditButtonLabel,
   progressKey,
+  PYTHON_VERSION_HELP_URL,
   pullPercent,
   TRUST_DISABLED_REASON,
   type SetupProgressMap,
@@ -308,6 +310,7 @@ function AgentCard({
   const action = agentPrimaryAction(agent.phase);
   const live = progress[progressKey('install', agent.selectedId)];
   const logTail = live && live.logTail.length > 0 ? live.logTail : (agent.logTail ?? []);
+  const selectedOption = agent.options.find((o) => o.id === agent.selectedId);
   const phaseTone: Tone =
     agent.phase === 'ready' ? 'add' : agent.phase === 'error' ? 'del' : agent.phase === 'installing' ? 'accent' : 'neutral';
   const phaseIcon =
@@ -326,7 +329,12 @@ function AgentCard({
         return dispatch('setup.install', { backendId: agent.selectedId });
       case 'activate':
         return dispatch('setup.applyAgent', { backendId: agent.selectedId });
+      // T11 (host-gap 1): `awaiting-reload`'s persistent [Reload window]
+      // dispatches the NEW `setup.reload` seam — a real host action now,
+      // not the old `setup.recheck` dead-end that never actually reloaded
+      // anything.
       case 'reload':
+        return dispatch('setup.reload');
       case 'recheck':
         return dispatch('setup.recheck');
       case 'none':
@@ -337,11 +345,14 @@ function AgentCard({
 
   // §8: `setup.recheck` (and `setup.cancel`, below) are READ-ONLY —
   // `SetupController`'s `MUTATING_METHODS` set deliberately excludes them so
-  // the status page "stays honest" in Restricted Mode. Only `install`/
-  // `retry`/`activate` actually write settings or spawn installers, so only
-  // those are trust-gated.
+  // the status page "stays honest" in Restricted Mode. `install`/`retry`/
+  // `activate`/`reload` all write settings, spawn installers, or reload the
+  // window, so those are trust-gated (FM-14) — `setup.reload` is MUTATING at
+  // the controller too (T11), so its button must match.
   const actionDisabledReason =
-    action.kind === 'install' || action.kind === 'retry' || action.kind === 'activate' ? disabledReason : undefined;
+    action.kind === 'install' || action.kind === 'retry' || action.kind === 'activate' || action.kind === 'reload'
+      ? disabledReason
+      : undefined;
 
   return (
     <Card title="Agent">
@@ -355,19 +366,59 @@ function AgentCard({
       {agent.version && <div className="mt-0.5 font-mono text-2xs text-faint">{agent.version}</div>}
 
       {agent.phase === 'pipx-missing' && (
-        <p className="mt-1 text-2xs text-muted">
-          pipx was not found on your PATH. Install it (e.g.{' '}
-          <code className="font-mono">sudo dnf install pipx &amp;&amp; pipx ensurepath</code>), then retry.
-        </p>
+        // T11 (IMPORTANT host-gap 2): the honest text remains, but the
+        // dead-end "then retry" is replaced with the two real actions §6
+        // asks for — a pre-typed bootstrap terminal (the user provides
+        // sudo) and a Re-check once it's done. `agentPrimaryAction`
+        // returns `'none'` for this phase specifically so the generic
+        // single-action slot below doesn't ALSO render.
+        <div className="mt-1 flex flex-col gap-1.5">
+          <p className="text-2xs text-muted">
+            pipx was not found on your PATH. Open a terminal to install it, then re-check.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <ActionButton
+              label="Open terminal: sudo dnf install pipx"
+              onRun={() => dispatch('setup.openBootstrapTerminal')}
+              disabledReason={disabledReason}
+            />
+            <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
+          </div>
+        </div>
       )}
-      {agent.phase === 'python-unsuitable' && agent.detail && (
-        <p className="mt-1 text-2xs text-muted">{agent.detail}</p>
+      {agent.phase === 'python-unsuitable' && (
+        // T11 (§6-parity minor): honest text (when the host supplied one)
+        // PLUS a docs link — the descriptor's own `docsUrl` if the
+        // registry ever sets one, else a sensible generic fallback.
+        <div className="mt-1 flex flex-col gap-1">
+          {agent.detail && <p className="text-2xs text-muted">{agent.detail}</p>}
+          <a
+            href={selectedOption?.docsUrl ?? PYTHON_VERSION_HELP_URL}
+            className="text-2xs text-accent underline"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Python version help
+          </a>
+        </div>
       )}
       {agent.phase === 'awaiting-reload' && (
-        <p className="mt-1 text-2xs text-muted">Hermes installed. Reload the window to activate it, then Re-check.</p>
+        <p className="mt-1 text-2xs text-muted">Hermes installed — reload the window to activate it.</p>
       )}
       {agent.phase === 'error' && agent.detail && (
-        <div className="mt-1 rounded border border-del bg-del-soft px-2 py-1.5 text-2xs text-fg">{agent.detail}</div>
+        <div className="mt-1 flex flex-col gap-1.5 rounded border border-del bg-del-soft px-2 py-1.5 text-2xs text-fg">
+          <span>{agent.detail}</span>
+          {/* T11 (§6-parity minor): copies the SAME text this box shows
+              (detail + the accumulated log tail) — a bug report is one
+              paste instead of hand-copying a scrolling <pre>. */}
+          <div>
+            <ActionButton
+              label="Copy log"
+              icon="copy"
+              onRun={() => navigator.clipboard.writeText(buildCopyLogText(agent.detail, logTail))}
+            />
+          </div>
+        </div>
       )}
 
       {agent.phase === 'installing' ? (
@@ -824,18 +875,27 @@ function DedicatedNextForm({
           </div>
           <TextField label="Endpoint" value={endpoint} onChange={setEndpoint} />
           <TextField label="Model" value={model} onChange={setModel} />
-          <ActionButton
-            label="Apply"
-            onRun={() =>
-              dispatch('setup.setNextEdit', {
-                backend: selected?.nextEditTransport ?? 'ollama',
-                endpoint,
-                model,
-              })
-            }
-            disabledReason={disabledReason}
-            tone="accent"
-          />
+          <div className="flex gap-2">
+            {/* T11 (§6-parity minor): reuses the SAME `setup.testRemote`
+                correlated method the FIM Connect tab already dispatches —
+                read-only, never trust-gated (§8). */}
+            <ActionButton
+              label="Test"
+              onRun={() => dispatch('setup.testRemote', { backendId: selected?.id, endpoint })}
+            />
+            <ActionButton
+              label="Apply"
+              onRun={() =>
+                dispatch('setup.setNextEdit', {
+                  backend: selected?.nextEditTransport ?? 'ollama',
+                  endpoint,
+                  model,
+                })
+              }
+              disabledReason={disabledReason}
+              tone="accent"
+            />
+          </div>
         </>
       )}
     </div>
@@ -865,13 +925,23 @@ function RagCard({
         </div>
       )}
 
-      <div className="mb-2 flex items-center gap-2 border-b border-border pb-2">
+      {/* T11 (§6-parity minor): `aria-disabled` on the ROW (the Toggle's own
+          `<button>` stays single-mechanism — native `disabled` only, per
+          `Toggle.tsx`'s tested invariant that native `disabled` and
+          `aria-disabled` are never both engaged on that element) + a
+          `title` reason on the switch itself, matching `ActionButton`'s
+          "always name why" rule. */}
+      <div
+        className="mb-2 flex items-center gap-2 border-b border-border pb-2"
+        aria-disabled={disabledReason !== undefined ? true : undefined}
+      >
         <span className="min-w-0 flex-1 text-xs text-fg">Enable codebase index</span>
         <Toggle
           id="setup-rag-enabled"
           on={rag.enabled}
           label="Enable codebase index"
           disabled={disabledReason !== undefined}
+          title={disabledReason}
           onChange={(next) => void dispatch('setup.setRag', { enabled: next })}
         />
       </div>

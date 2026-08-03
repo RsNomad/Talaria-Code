@@ -205,6 +205,13 @@ export function createVsCodeSetupHost(context: vscode.ExtensionContext): SetupHo
       update: (key, v) => Promise.resolve(context.globalState.update(key, v)),
     },
     isTrusted: () => vscode.workspace.isTrusted,
+    // Task 11 (`setup.reload`): fired directly from a persistent webview
+    // button the user already clicked deliberately — no second native
+    // confirmation (contrast `offerReload` below, which prompts because
+    // nothing the user did was itself a reload request).
+    reload: () => {
+      void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    },
     offerReload: () => {
       void vscode.window
         .showInformationMessage(

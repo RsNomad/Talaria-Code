@@ -31,6 +31,7 @@ class FakeSetupHost implements SetupHost {
   terminalsCreated: { name: string; command: string }[] = [];
   terminalsRun: { name: string; shellPath: string; args: string[] }[] = [];
   reloadOffers = 0;
+  reloadCalls = 0;
 
   async showModal(message: string, _confirmLabel: string): Promise<boolean> {
     this.calls.push(`showModal:${message}`);
@@ -88,6 +89,11 @@ class FakeSetupHost implements SetupHost {
   offerReload(): void {
     this.calls.push('offerReload');
     this.reloadOffers++;
+  }
+
+  reload(): void {
+    this.calls.push('reload');
+    this.reloadCalls++;
   }
 }
 
@@ -156,6 +162,8 @@ describe('FM-14: mutating methods refused when untrusted', () => {
     { method: 'setup.pullModel', params: { model: 'qwen2.5-coder:1.5b-base' } },
     { method: 'setup.openProviderWizard', params: {} },
     { method: 'setup.openInstallTerminal', params: { backendId: 'ollama' } },
+    { method: 'setup.openBootstrapTerminal', params: {} },
+    { method: 'setup.reload', params: {} },
     { method: 'setup.setNextEdit', params: { backend: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'x' } },
     { method: 'setup.setRag', params: { enabled: true } },
     { method: 'setup.setTunable', params: { key: TIER2_TUNABLE_KEYS[0], value: 100 } },
@@ -245,6 +253,13 @@ describe('FM-13: Tier-1 modal decline -> {ok:false, reason:"declined"} with NO s
   it('setup.openInstallTerminal: decline -> createTerminal never called', async () => {
     const { host, controller } = makeController({ modalResponses: [false] });
     const result = await controller.handle('setup.openInstallTerminal', { backendId: 'ollama' });
+    expect(result).toEqual({ ok: false, reason: 'declined' });
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('setup.openBootstrapTerminal: decline -> createTerminal never called', async () => {
+    const { host, controller } = makeController({ modalResponses: [false] });
+    const result = await controller.handle('setup.openBootstrapTerminal', {});
     expect(result).toEqual({ ok: false, reason: 'declined' });
     expect(host.terminalsCreated).toEqual([]);
   });
@@ -620,6 +635,49 @@ describe('setup.openInstallTerminal: createTerminal pre-typed only', () => {
     const { controller } = makeController();
     const result = await controller.handle('setup.openInstallTerminal', { backendId: 'hermes' });
     expect(result.ok).toBe(false);
+  });
+});
+
+// --- setup.openBootstrapTerminal (T11 IMPORTANT host-gap 2) ------------------
+
+describe('setup.openBootstrapTerminal: Tier-1 modal -> createTerminal("Install pipx", "sudo dnf install pipx") pre-typed', () => {
+  it('accept -> creates a terminal with the exact pre-typed pipx bootstrap command', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.openBootstrapTerminal', {});
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'Install pipx', command: 'sudo dnf install pipx' }]);
+  });
+
+  it('shows a modal naming the exact command BEFORE creating the terminal', async () => {
+    const { host, controller } = makeController();
+    await controller.handle('setup.openBootstrapTerminal', {});
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(modalCall).toContain('sudo dnf install pipx');
+    // Modal happens before the terminal is created (write-order proof, same
+    // discipline as `setup.openInstallTerminal`/`setup.applyFim`).
+    expect(host.calls.indexOf(modalCall as string)).toBeLessThan(
+      host.calls.findIndex((c) => c.startsWith('createTerminal:')),
+    );
+  });
+});
+
+// --- setup.reload (T11 IMPORTANT host-gap 1) ---------------------------------
+
+describe('setup.reload: trust-gated (FM-14), modal-free, calls host.reload() directly', () => {
+  it('trusted: calls host.reload() with no modal', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.reload', {});
+    expect(result).toEqual({ ok: true });
+    expect(host.reloadCalls).toBe(1);
+    expect(host.calls).toEqual(['reload']); // no showModal: entry anywhere
+  });
+
+  it('untrusted: refused, host.reload() never called (also covered by the FM-14 table above)', async () => {
+    const { host, controller } = makeController({ trusted: false });
+    const result = await controller.handle('setup.reload', {});
+    expect(result.ok).toBe(false);
+    expect(host.reloadCalls).toBe(0);
   });
 });
 

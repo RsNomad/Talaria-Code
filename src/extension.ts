@@ -13,6 +13,7 @@ import { RAG_SETTING_RELOAD } from './rag/ragReloadSettings';
 import { selectBackendKind, shouldActivateLib, shouldActivateRag } from './host/trustGate';
 import { SetupController } from './host/setup/SetupController';
 import { createSetupControllerDeps, createVsCodeSetupHost } from './host/setupHost.vscode';
+import { wireBackendFailureNudge } from './host/backendFailureNudge';
 import { isHttpUrl } from './shared/url';
 import type { AcpMcpServerStdio } from './host/backend/acp/acpClient';
 import { CODEBASE_SEARCH_TOOL_NAME } from './mcp/toolSchema';
@@ -200,6 +201,23 @@ export function activate(context: vscode.ExtensionContext): void {
       ? makeAcpBackend()
       : new MockBackend();
   context.subscriptions.push(backend);
+
+  // ── Task 11 (A): "Open Backend Setup" nudge on the existing backend- ─────
+  // failure surface. `wireBackendFailureNudge` (pure, `vscode`-free — see
+  // its own doc) taps `backend.onMessage`'s `system.error` case, the ONLY
+  // host-emitted signal that already fires on a `resolveHermes` throw /
+  // spawn failure / `initialize()` failure (`ConnectionSupervisor
+  // .startInternal`'s catch block). Rewired on every trust-upgrade mock→real
+  // swap below (mirrors `setBackend`'s own `backendMessageSub` re-point) so
+  // the nudge always tracks whichever backend is CURRENT.
+  let backendFailureNudgeSub = wireBackendFailureNudge(backend, {
+    showErrorMessage: (message, action) => vscode.window.showErrorMessage(message, action),
+    // The brief's own pin: reuse the `talaria.openSetup` COMMAND path
+    // (registered below) rather than calling `provider.openSetupPanel()`
+    // directly — keeps this nudge decoupled from the view provider.
+    openSetup: () => void vscode.commands.executeCommand('talaria.openSetup'),
+  });
+  context.subscriptions.push({ dispose: () => backendFailureNudgeSub.dispose() });
 
   // ── CF-09 / L5 F-5: prompt "reload to apply" on talaria.backend change ───
   // Backend selection above is resolved ONCE at activate() (re-evaluated
@@ -601,6 +619,16 @@ export function activate(context: vscode.ExtensionContext): void {
         provider.setSearchFiles(searchFilesPort);
         backend.dispose();
         backend = upgraded;
+        // Re-point the Task 11 backend-failure nudge at the freshly-upgraded
+        // backend — mirrors `setBackend`'s own `backendMessageSub` re-point
+        // above; without this, a `system.error` on the NEW `AcpBackend`
+        // (e.g. a respawn losing the connection later) would fire the OLD,
+        // disposed mock's now-dead subscription instead.
+        backendFailureNudgeSub.dispose();
+        backendFailureNudgeSub = wireBackendFailureNudge(backend, {
+          showErrorMessage: (message, action) => vscode.window.showErrorMessage(message, action),
+          openSetup: () => void vscode.commands.executeCommand('talaria.openSetup'),
+        });
         output.appendLine('Talaria: backend upgraded to AcpBackend.');
       }
       startRagIfEligible();

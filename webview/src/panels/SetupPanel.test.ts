@@ -11,6 +11,7 @@ import type { AgentSetupPhase, SetupBackendOption, SetupProgress } from '../prot
 import {
   agentPhaseLabel,
   agentPrimaryAction,
+  buildCopyLogText,
   clampLogTail,
   fimHasLocalInstall,
   foldSetupProgress,
@@ -19,6 +20,7 @@ import {
   mutationDisabledReason,
   nextEditButtonLabel,
   progressKey,
+  PYTHON_VERSION_HELP_URL,
   pullPercent,
   PROGRESS_LOG_TAIL_MAX,
   TRUST_DISABLED_REASON,
@@ -67,10 +69,36 @@ describe('agentPrimaryAction', () => {
   it('python-unsuitable -> none (honest text + docs link only, per §6)', () => {
     expect(agentPrimaryAction('python-unsuitable').kind).toBe('none');
   });
+  it('pipx-missing -> none (T11: bespoke bootstrap-terminal + Re-check buttons render instead of the generic single action)', () => {
+    expect(agentPrimaryAction('pipx-missing').kind).toBe('none');
+  });
   it('every phase maps to SOME action descriptor (exhaustive, no throw)', () => {
     for (const phase of ALL_PHASES) {
       expect(() => agentPrimaryAction(phase)).not.toThrow();
     }
+  });
+});
+
+describe('PYTHON_VERSION_HELP_URL — python-unsuitable docs-link fallback (T11 §6-parity minor)', () => {
+  it('is a real absolute URL', () => {
+    expect(PYTHON_VERSION_HELP_URL).toMatch(/^https:\/\//);
+  });
+});
+
+describe('buildCopyLogText — the error state\'s [Copy log] payload (T11 §6-parity minor)', () => {
+  it('joins detail + log tail lines with newlines', () => {
+    expect(buildCopyLogText('pipx-install failed: network unreachable', ['line 1', 'line 2'])).toBe(
+      'pipx-install failed: network unreachable\nline 1\nline 2',
+    );
+  });
+  it('omits an absent detail (no leading blank line)', () => {
+    expect(buildCopyLogText(undefined, ['line 1'])).toBe('line 1');
+  });
+  it('omits an empty log tail (no trailing blank lines)', () => {
+    expect(buildCopyLogText('boom', [])).toBe('boom');
+  });
+  it('is empty when both are absent (never throws)', () => {
+    expect(buildCopyLogText(undefined, [])).toBe('');
   });
 });
 

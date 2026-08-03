@@ -153,6 +153,18 @@ describe('LOCK: every declared command is registered somewhere under src/', () =
     expect(registered.has('talaria.generateCommitMessage')).toBe(true);
   });
 
+  // Task 11 (A): a dedicated, EXPLICIT pin — `talaria.openSetup` is the one
+  // state-aware Setup entry (§6 entry point 3: command palette + the
+  // view/title icon beside the gear). The loop-based test above already
+  // covers it structurally (every declared command must be registered
+  // somewhere), but this asserts BOTH halves by name, per the task-11-brief
+  // ("a commandParity.test.ts-style assertion that talaria.openSetup is
+  // BOTH contributed in package.json AND registered").
+  it("'talaria.openSetup' is both contributed in package.json and registered under src/", () => {
+    expect(declaredCommandIds()).toContain('talaria.openSetup');
+    expect(registeredCommandIds().has('talaria.openSetup')).toBe(true);
+  });
+
   // M-2 (3-lens review): this file used to carry a third test here,
   // "RED-first proof: an id that is declared but absent from the scan set is
   // reported" — it built its own literal Set/array and asserted

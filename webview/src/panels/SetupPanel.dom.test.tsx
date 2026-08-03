@@ -14,7 +14,7 @@ import userEvent from '@testing-library/user-event';
 import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupMethod } from '../protocol';
 import { NEXT_EDIT_ROWS } from './nextEditCopy';
 import { SetupPanel } from './SetupPanel';
-import { agentPhaseLabel } from './setupCards';
+import { agentPhaseLabel, PYTHON_VERSION_HELP_URL, TRUST_DISABLED_REASON } from './setupCards';
 import { must } from '../testing/must';
 
 function setup(jsx: ReactElement) {
@@ -394,6 +394,131 @@ describe('"You\'re ready" banner (§6)', () => {
   it('does not render when not ready', () => {
     renderPanel(baseData({ ready: false }));
     expect(screen.queryByText(/You.re ready/)).not.toBeInTheDocument();
+  });
+});
+
+describe('Agent card — awaiting-reload gap-state (T11 IMPORTANT host-gap 1)', () => {
+  it('renders a persistent [Reload window] button, not the old dead-end [Re-check]', () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'awaiting-reload' } });
+    renderPanel(data);
+    expect(screen.getByRole('button', { name: 'Reload window' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Re-check' })).not.toBeInTheDocument();
+  });
+
+  it('clicking [Reload window] dispatches setup.reload', async () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'awaiting-reload' } });
+    const { user, dispatch } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Reload window' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.reload');
+  });
+
+  it('is trust-gated: disabled + aria-disabled + reason tooltip when untrusted', () => {
+    const data = baseData({ trusted: false, agent: { ...baseData().agent, phase: 'awaiting-reload' } });
+    renderPanel(data);
+    const button = screen.getByRole('button', { name: 'Reload window' });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+    expect(button.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
+  });
+});
+
+describe('Agent card — pipx-missing gap-state (T11 IMPORTANT host-gap 2)', () => {
+  it('renders the bootstrap-terminal button + [Re-check], not the old [Retry install]', () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing' } });
+    renderPanel(data);
+    expect(screen.getByRole('button', { name: 'Open terminal: sudo dnf install pipx' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry install' })).not.toBeInTheDocument();
+  });
+
+  it('clicking the bootstrap-terminal button dispatches setup.openBootstrapTerminal', async () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing' } });
+    const { user, dispatch } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Open terminal: sudo dnf install pipx' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.openBootstrapTerminal');
+  });
+
+  it('clicking [Re-check] dispatches setup.recheck', async () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing' } });
+    const { user, dispatch } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Re-check' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.recheck');
+  });
+
+  it('the bootstrap-terminal button is trust-gated; [Re-check] stays usable (read-only, §8)', () => {
+    const data = baseData({ trusted: false, agent: { ...baseData().agent, phase: 'pipx-missing' } });
+    renderPanel(data);
+    const terminalButton = screen.getByRole('button', { name: 'Open terminal: sudo dnf install pipx' });
+    expect(terminalButton).toBeDisabled();
+    expect(terminalButton.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
+    expect(screen.getByRole('button', { name: 'Re-check' })).toBeEnabled();
+  });
+});
+
+describe('Agent card — python-unsuitable docs link (T11 §6-parity minor)', () => {
+  it('renders a docs link (falls back to PYTHON_VERSION_HELP_URL when the descriptor has no docsUrl)', () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'python-unsuitable', detail: 'found 3.14; needs 3.11-3.13' } });
+    renderPanel(data);
+    const link = screen.getByRole('link', { name: /python/i });
+    expect(link).toHaveAttribute('href', PYTHON_VERSION_HELP_URL);
+  });
+});
+
+describe('Agent card — error state [Copy log] button (T11 §6-parity minor)', () => {
+  it('copies the detail + log tail to the clipboard', async () => {
+    const data = baseData({
+      agent: {
+        ...baseData().agent,
+        phase: 'error',
+        detail: 'pipx-install failed: network unreachable',
+        logTail: ['Resolving...', 'Connection timed out'],
+      },
+    });
+    const { user } = renderPanel(data);
+    // `renderPanel` calls `userEvent.setup()` internally, which installs ITS
+    // OWN clipboard stub onto `navigator.clipboard` (so it can simulate
+    // real copy/paste) — spying on THAT object's `writeText`, rather than
+    // replacing `navigator.clipboard` beforehand, is what survives: an
+    // earlier replacement gets silently clobbered the moment `setup()` runs.
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: 'Copy log' }));
+    expect(writeText).toHaveBeenCalledWith(
+      'pipx-install failed: network unreachable\nResolving...\nConnection timed out',
+    );
+  });
+});
+
+describe('NEXT card — DedicatedNextForm [Test] button (T11 §6-parity minor)', () => {
+  it('dispatches setup.testRemote with the selected backend + endpoint, reusing the Connect tab\'s method', async () => {
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      nextEdit: { ...baseData().nextEdit, dedicatedConfigured: false, endpoint: 'http://127.0.0.1:11434', model: '' },
+    });
+    const { user, dispatch } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'Test' }));
+    expect(dispatch).toHaveBeenCalledWith(
+      'setup.testRemote',
+      expect.objectContaining({ backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' }),
+    );
+  });
+});
+
+describe('RAG card — "Enable codebase index" toggle trust-gating parity (T11 §6-parity minor)', () => {
+  it('carries aria-disabled + the trust reason as a title when untrusted', () => {
+    renderPanel(baseData({ trusted: false }));
+    const toggle = screen.getByRole('switch', { name: 'Enable codebase index' });
+    const row = must(toggle.closest('[aria-disabled]'));
+    expect(row).toHaveAttribute('aria-disabled', 'true');
+    expect(toggle.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
+  });
+
+  it('carries no aria-disabled / title when trusted', () => {
+    renderPanel(baseData({ trusted: true }));
+    const toggle = screen.getByRole('switch', { name: 'Enable codebase index' });
+    expect(toggle).not.toHaveAttribute('title');
+    expect(toggle.closest('[aria-disabled]')).toBeNull();
   });
 });
 

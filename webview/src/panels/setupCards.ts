@@ -59,7 +59,14 @@ export interface AgentAction {
 export function agentPrimaryAction(phase: AgentSetupPhase): AgentAction {
   switch (phase) {
     case 'pipx-missing':
-      return { kind: 'retry', label: 'Retry install' };
+      // T11 (host-gap 2): `pipx-missing` now renders TWO bespoke buttons —
+      // [Open terminal: sudo dnf install pipx] (dispatches
+      // `setup.openBootstrapTerminal`) + [Re-check] (dispatches
+      // `setup.recheck`) — directly in `SetupPanel.tsx`'s `AgentCard`,
+      // instead of the generic single primary-action slot every other phase
+      // uses. `'none'` here suppresses that generic slot so it doesn't
+      // render a THIRD, redundant button.
+      return { kind: 'none', label: '' };
     case 'python-unsuitable':
       return { kind: 'none', label: '' };
     case 'missing':
@@ -69,7 +76,10 @@ export function agentPrimaryAction(phase: AgentSetupPhase): AgentAction {
     case 'installed-inactive':
       return { kind: 'activate', label: 'Activate + Reload' };
     case 'awaiting-reload':
-      return { kind: 'reload', label: 'Re-check' };
+      // T11 (host-gap 1): a PERSISTENT reload button, not a dead-end
+      // Re-check — `setup.reload` now exists (`SetupController.ts`), so
+      // there is finally a real host seam behind this label.
+      return { kind: 'reload', label: 'Reload window' };
     case 'ready':
       return { kind: 'recheck', label: 'Re-check' };
     case 'error':
@@ -94,6 +104,27 @@ export function fimHasLocalInstall(option: SetupBackendOption): boolean {
 
 export function isComingSoon(option: SetupBackendOption): boolean {
   return option.status === 'coming-soon';
+}
+
+/**
+ * `python-unsuitable`'s docs-link fallback (T11 §6-parity minor): used only
+ * when the selected agent option's own `docsUrl` is absent (true for Hermes
+ * today — its registry entry carries no `docsUrl`, see `registry.ts`). A
+ * generic-but-genuinely-useful landing page for "which Python do I have /
+ * need" rather than inventing a Hermes-specific URL nobody has vetted.
+ */
+export const PYTHON_VERSION_HELP_URL = 'https://www.python.org/downloads/';
+
+/**
+ * The `error` phase's [Copy log] payload (T11 §6-parity minor): the same
+ * text the card already shows (`agent.detail` + the accumulated log tail),
+ * joined so a user reporting a bug can paste ONE block instead of
+ * hand-copying a scrolling `<pre>`. Never fabricates a blank line for an
+ * absent detail or an empty tail.
+ */
+export function buildCopyLogText(detail: string | undefined, logTail: readonly string[]): string {
+  const lines = [detail, ...logTail].filter((line): line is string => Boolean(line && line.length > 0));
+  return lines.join('\n');
 }
 
 // --- NEXT card (§6 card 4) --------------------------------------------------

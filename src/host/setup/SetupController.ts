@@ -115,6 +115,15 @@ export interface SetupHost {
   };
   isTrusted(): boolean;
   offerReload(): void;
+  /**
+   * Task 11 (`setup.reload` — the `awaiting-reload` gap-state fix): reload
+   * the extension host window immediately. Distinct from {@link
+   * offerReload}, which shows an OPTIONAL post-install prompt the user can
+   * dismiss — this seam is invoked from a PERSISTENT webview button the user
+   * already clicked deliberately, so it reloads without a second
+   * confirmation (trust-gated only — see {@link MUTATING_METHODS}).
+   */
+  reload(): void;
 }
 
 // --- D9 Tier-2 allowlist (data, locked by test) --------------------------
@@ -193,6 +202,13 @@ const DEFAULT_OLLAMA_ENDPOINT = 'http://127.0.0.1:11434';
 const DEFAULT_RAG_EMBED_MODEL = 'qwen3-embedding:0.6b';
 const DEFAULT_RAG_INDEX_DIR = '.hermes/index';
 const TRUST_REFUSAL_REASON = 'Workspace is not trusted — Setup changes are disabled in Restricted Mode.';
+/** T11 host-gap 2 (plan §6/§7 FM-1): the well-established Fedora pipx
+ *  bootstrap. Pre-typed into a terminal, never executed by us — the user
+ *  presses Enter and grants sudo themselves. `pipx ensurepath` is
+ *  surfaced as a follow-up HINT in the confirmation modal text (see
+ *  {@link SetupController.handleOpenBootstrapTerminal}), not chained into
+ *  this command — keeps the terminal line exactly what the modal named. */
+const PIPX_BOOTSTRAP_COMMAND = 'sudo dnf install pipx';
 
 /** D9: which {@link SetupMethod}s are consequence-bearing mutations, gated
  *  on `host.isTrusted()` (FM-14). Everything else (`setup.status` — handled
@@ -207,6 +223,8 @@ const MUTATING_METHODS = new Set<SetupMethod>([
   'setup.pullModel',
   'setup.openProviderWizard',
   'setup.openInstallTerminal',
+  'setup.openBootstrapTerminal',
+  'setup.reload',
   'setup.setNextEdit',
   'setup.setRag',
   'setup.setTunable',
@@ -413,6 +431,10 @@ export class SetupController {
         return this.handleOpenProviderWizard();
       case 'setup.openInstallTerminal':
         return this.handleOpenInstallTerminal(params);
+      case 'setup.openBootstrapTerminal':
+        return this.handleOpenBootstrapTerminal();
+      case 'setup.reload':
+        return this.handleReload();
       case 'setup.recheck':
         // Read-only: the caller re-fetches + re-pushes `status()` after any
         // ok:true result (mirrors ControlDispatcher's reload.mcp/model.save_key
@@ -710,6 +732,44 @@ export class SetupController {
     if (!confirmed) return { ok: false, reason: 'declined' };
     // Pre-typed only — createTerminal never executes it (SetupHost's own contract).
     this.host.createTerminal(`${descriptor.displayName} install`, recipe.command);
+    return { ok: true };
+  }
+
+  // --- setup.openBootstrapTerminal (T11 IMPORTANT host-gap 2) ---------------
+
+  /**
+   * The `pipx-missing` gap-state fix (plan §6 card 1 / §7 FM-1): unlike
+   * {@link handleOpenInstallTerminal}, this is unconditional — pipx itself
+   * isn't a registry `BackendDescriptor` with a `guided-terminal` recipe, so
+   * there is no `backendId` to look up. Same Tier-1 discipline: a native
+   * modal names the EXACT command before anything opens; a decline is
+   * `{ok:false,'declined'}` with the terminal never created.
+   */
+  private async handleOpenBootstrapTerminal(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const confirmed = await this.host.showModal(
+      `Open a terminal pre-filled with:\n${PIPX_BOOTSTRAP_COMMAND}\nYou'll need to press Enter to run it — grant sudo yourself if it asks. Once it finishes, also run 'pipx ensurepath' (then restart your terminal) so pipx-installed apps land on PATH.`,
+      'Open Terminal',
+    );
+    if (!confirmed) return { ok: false, reason: 'declined' };
+    // Pre-typed only — createTerminal never executes it (SetupHost's own contract).
+    this.host.createTerminal('Install pipx', PIPX_BOOTSTRAP_COMMAND);
+    return { ok: true };
+  }
+
+  // --- setup.reload (T11 IMPORTANT host-gap 1) -------------------------------
+
+  /**
+   * The `awaiting-reload` gap-state fix (plan §6 card 1 FM-7): trust-gated
+   * (via {@link MUTATING_METHODS}, checked by the caller in {@link handle})
+   * but deliberately MODAL-FREE — it writes no settings and spawns nothing,
+   * so it follows the Tier-2 `setup.setTunable` posture (gated, no
+   * confirmation dialog) rather than Tier-1's native-modal one. The user
+   * already made the one decision that matters (clicking the persistent
+   * [Reload window] button); a second "are you sure you want to reload?"
+   * prompt would just be friction.
+   */
+  private handleReload(): { ok: true } {
+    this.host.reload();
     return { ok: true };
   }
 

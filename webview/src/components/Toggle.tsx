@@ -42,6 +42,18 @@ interface ToggleProps {
    * so omitting it changes nothing for them.
    */
   id?: string;
+  /**
+   * T11 (§6-parity minor — RAG "Enable codebase index" row): a native HTML
+   * tooltip naming WHY the control is disabled (e.g. the trust-gate
+   * reason). Deliberately NOT `aria-disabled` — `toggleInteraction`'s own
+   * invariant (below) is that native `disabled` and `aria-disabled` are
+   * never BOTH engaged on this element; genuine indefinite disablement
+   * already uses the native attribute, which VoiceOver/NVDA/JAWS all
+   * announce correctly on its own. `title` adds the sighted-hover
+   * explanation `ActionButton` gives its own disabled buttons, without
+   * reopening that settled single-mechanism decision.
+   */
+  title?: string;
 }
 
 /**
@@ -84,7 +96,7 @@ export function toggleInteraction(disabled?: boolean, busy?: boolean): ToggleInt
   };
 }
 
-export function Toggle({ on, disabled, busy, label, onChange, id }: ToggleProps) {
+export function Toggle({ on, disabled, busy, label, onChange, id, title }: ToggleProps) {
   const interaction = toggleInteraction(disabled, busy);
   return (
     <button
@@ -93,6 +105,7 @@ export function Toggle({ on, disabled, busy, label, onChange, id }: ToggleProps)
       role="switch"
       aria-checked={on}
       aria-label={label}
+      title={title}
       disabled={interaction.nativeDisabled}
       aria-disabled={interaction.ariaDisabled}
       aria-busy={interaction.ariaBusy}

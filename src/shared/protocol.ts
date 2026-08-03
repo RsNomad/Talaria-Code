@@ -1595,6 +1595,15 @@ export type ControlMethod = (typeof CONTROL_METHODS)[number];
  * (Tier-1). `setup.setTunable` writes one `{key, value}` pair from the
  * Tier-2 tunables ALLOWLIST only (D9) — host-validated, never an arbitrary
  * config write.
+ *
+ * Task 11 (T11 MUST-CLOSE host gaps, plan §6): `setup.reload` reloads the
+ * extension host window — trust-gated (FM-14) but MODAL-FREE (it writes no
+ * settings and spawns nothing, so it follows the Tier-2 `setup.setTunable`
+ * posture: gated, no confirmation dialog). `setup.openBootstrapTerminal`
+ * opens a terminal pre-typed with the Fedora pipx bootstrap (`sudo dnf
+ * install pipx`) — Tier-1 (a terminal-opening action, §8), modal-gated like
+ * `setup.openInstallTerminal`, but unconditional (no registry `backendId` —
+ * pipx itself isn't a registry entry).
  */
 export type SetupMethod =
   | 'setup.status'
@@ -1607,7 +1616,9 @@ export type SetupMethod =
   | 'setup.cancel'
   | 'setup.openProviderWizard'
   | 'setup.openInstallTerminal'
+  | 'setup.openBootstrapTerminal'
   | 'setup.recheck'
+  | 'setup.reload'
   | 'setup.setNextEdit'
   | 'setup.setRag'
   | 'setup.setTunable';

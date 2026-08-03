@@ -1163,6 +1163,7 @@ class FakeSetupHostForRouting implements SetupHost {
     return this.trusted;
   }
   offerReload(): void {}
+  reload(): void {}
 }
 
 function makeFakeSetupDeps(): SetupControllerDeps {
