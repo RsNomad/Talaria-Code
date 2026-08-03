@@ -59,12 +59,16 @@ jobs:
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
       # A vX.Y.Z tag must ship a .vsix whose manifest says X.Y.Z — fail fast if
-      # the tag was pushed without bumping package.json first.
+      # the tag was pushed without bumping package.json first. Pre-release tags
+      # (vX.Y.Z-beta.N / -rc.N / …) are matched on their X.Y.Z core, so e.g.
+      # v0.1.0-beta.1 is valid against package.json version 0.1.0.
       - name: Verify tag matches package.json version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          if [ "$GITHUB_REF_NAME" != "v${{ steps.pkg.outputs.version }}" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME != package.json version v${{ steps.pkg.outputs.version }} — bump package.json before tagging."
+          core="${GITHUB_REF_NAME#v}"   # strip leading v:   v0.1.0-beta.1 -> 0.1.0-beta.1
+          core="${core%%-*}"            # strip -prerelease:  0.1.0-beta.1  -> 0.1.0
+          if [ "$core" != "${{ steps.pkg.outputs.version }}" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (core $core) != package.json version ${{ steps.pkg.outputs.version }} — bump package.json before tagging."
             exit 1
           fi
 
@@ -119,7 +123,12 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release-assets/*.vsix --generate-notes --verify-tag
+        run: |
+          # A SemVer pre-release tag (contains a hyphen, e.g. v0.1.0-beta.1) is
+          # published as a GitHub pre-release so it never shows as "Latest".
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" release-assets/*.vsix --generate-notes --verify-tag $prerelease
 
       # ------------------------------------------------------------------
       # Marketplace publishing — enable when ready to publish to the marketplaces.
