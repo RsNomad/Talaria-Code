@@ -68,16 +68,27 @@ const DEFAULT_PYTHON_ERRORS = {
   },
 };
 
+/**
+ * Escape EVERY RegExp metacharacter (backslash included) so a bin path is
+ * matched literally when interpolated into a `new RegExp(...)`. The earlier
+ * `.replace(/[.]/g, '\\.')` escaped only dots, leaving `\`/`+`/`(`/… unescaped
+ * (CodeQL js/incomplete-sanitization). Inputs here are controlled test
+ * fixtures, but the pattern is fixed at the source so it can't drift.
+ */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function pythonVersion(bin: string, version: string) {
   return {
-    match: new RegExp(`^exec ${bin.replace(/[.]/g, '\\.')} --version$`),
+    match: new RegExp(`^exec ${escapeRegExp(bin)} --version$`),
     respond: () => `Python ${version}\n`,
   };
 }
 
 function pythonMissing(bin: string) {
   return {
-    match: new RegExp(`^exec ${bin.replace(/[.]/g, '\\.')} --version$`),
+    match: new RegExp(`^exec ${escapeRegExp(bin)} --version$`),
     respond: (): string => {
       throw new Error(`ENOENT: ${bin} not found`);
     },
