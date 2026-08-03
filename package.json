@@ -7,7 +7,7 @@
   "license": "GPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "https://github.com/syntinal-co/Talaria-Code.git"
+    "url": "https://github.com/RsNomad/Talaria-Code.git"
   },
   "engines": {
     "vscode": "^1.125.0",
