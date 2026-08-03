@@ -262,6 +262,26 @@
         }
       ]
     },
+    "walkthroughs": [
+      {
+        "id": "talariaBackendSetup",
+        "title": "Set up Talaria Code",
+        "description": "Install the Hermes agent and connect your local models from one panel.",
+        "steps": [
+          {
+            "id": "openBackendSetup",
+            "title": "Open Backend Setup",
+            "description": "Open the Talaria panel, then run Backend Setup to install the agent (via pipx), configure your provider, and pick your autocomplete/RAG models — no hand-edited JSON.\n[Open Backend Setup](command:talaria.openSetup)",
+            "media": {
+              "markdown": "media/walkthrough-setup.md"
+            },
+            "completionEvents": [
+              "onCommand:talaria.openSetup"
+            ]
+          }
+        ]
+      }
+    ],
     "configuration": [
       {
         "title": "Backend & Agent",
