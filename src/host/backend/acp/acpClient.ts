@@ -146,6 +146,28 @@ export interface AcpPromptResult {
 }
 
 /**
+ * Task 13 (onboarding-backend-setup §2.1): ONE advertised auth method off the
+ * `initialize` response, projected down to the two fields the Setup panel's
+ * Provider card consumes. Verified against the INSTALLED
+ * `@agentclientprotocol/sdk@0.17.1`: `InitializeResponse.authMethods?:
+ * Array<AuthMethod>` (`dist/schema/types.gen.d.ts:1506`), where every
+ * `AuthMethod` union variant (`AuthMethodAgent` / `AuthMethodEnvVar &
+ * {type:'env_var'}` / `AuthMethodTerminal & {type:'terminal'}`) carries
+ * required `id: string` + `name: string`. Cross-checked against the adapter
+ * that BUILDS them (`hermes-agent-2026.7.7.2/acp_adapter/auth.py::
+ * build_auth_methods`, attached to the response at `server.py:896`
+ * `auth_methods=...`, serialized to the wire as `authMethods` by the Python
+ * SDK's `by_alias=True` — see {@link AcpListSessionsRawResult}'s casing
+ * note): an agent-managed `AuthMethodAgent(id=<provider>)` iff credentials
+ * already resolve, and ALWAYS the `hermes-setup` TerminalAuthMethod
+ * (`args: ["--setup"]`).
+ */
+export interface AdvertisedAuthMethod {
+  id: string;
+  name: string;
+}
+
+/**
  * An environment variable to set when launching an MCP server — ACP's
  * `EnvVariable`. Re-verified (audit-3 CA-12) against the INSTALLED
  * `@agentclientprotocol/sdk@0.17.1` (`package.json`'s pinned version;
@@ -247,6 +269,23 @@ export interface AcpClientLike {
    * 'disposed' state check (ControlChannel.ts:272).
    */
   onExit(handler: (code: number | null) => void): { dispose(): void };
+  /**
+   * Task 13: the `{id, name}` projection of the `initialize` response's
+   * `authMethods` (see {@link AdvertisedAuthMethod}) — `undefined` until
+   * THIS client's `initialize()` has resolved. OPTIONAL, like
+   * {@link closeSession}: a test double that never implements it reads as
+   * "nothing advertised yet" through the caller's own `?.()` chain
+   * (`AcpBackend.getAdvertisedAuthMethods`), never a crash.
+   */
+  getAdvertisedAuthMethods?(): AdvertisedAuthMethod[] | undefined;
+  /**
+   * Task 13: fires when {@link getAdvertisedAuthMethods}'s value changes —
+   * today exactly once per client lifetime, when `initialize()` retains the
+   * response (this client is single-lifecycle; a `talaria.newSession`
+   * restart mints a whole NEW client whose own initialize fires its own
+   * event). OPTIONAL for the same test-double reason as the getter.
+   */
+  onAuthMethodsChanged?(handler: () => void): { dispose(): void };
   dispose(): void;
 }
 
@@ -257,6 +296,17 @@ export class AcpClient implements AcpClientLike {
   private child: ChildProcess | undefined;
   private connection: ClientSideConnection | undefined;
   private readonly exitHandlers = new Set<(code: number | null) => void>();
+
+  /**
+   * Task 13: the retained `{id, name}` projection of the `initialize`
+   * response's `authMethods` — `undefined` until {@link initialize} resolves
+   * (never cleared afterwards: this instance is single-lifecycle, and the
+   * last advertisement stays honestly readable while `AcpBackend` swaps to
+   * the replacement client on a restart). See {@link AdvertisedAuthMethod}
+   * for the field-name verification trail.
+   */
+  private advertisedAuthMethods: AdvertisedAuthMethod[] | undefined;
+  private readonly authMethodsHandlers = new Set<() => void>();
 
   /**
    * W1-T1 (CF-01/A-2): the central terminate-race primitive. The pinned ACP
@@ -305,6 +355,19 @@ export class AcpClient implements AcpClientLike {
   onExit(handler: (code: number | null) => void): { dispose(): void } {
     this.exitHandlers.add(handler);
     return { dispose: () => void this.exitHandlers.delete(handler) };
+  }
+
+  /** Task 13: see {@link AcpClientLike.getAdvertisedAuthMethods}. Returns a
+   *  defensive copy so no caller can mutate the retained advertisement. */
+  getAdvertisedAuthMethods(): AdvertisedAuthMethod[] | undefined {
+    return this.advertisedAuthMethods?.map((m) => ({ ...m }));
+  }
+
+  /** Task 13: see {@link AcpClientLike.onAuthMethodsChanged}. Same
+   *  subscribe/dispose shape as {@link onExit}. */
+  onAuthMethodsChanged(handler: () => void): { dispose(): void } {
+    this.authMethodsHandlers.add(handler);
+    return { dispose: () => void this.authMethodsHandlers.delete(handler) };
   }
 
   /**
@@ -498,7 +561,7 @@ export class AcpClient implements AcpClientLike {
 
   /** `initialize` advertising the client capabilities pinned by the assignment brief. */
   async initialize(): Promise<void> {
-    await this.requireConnection().initialize({
+    const response = await this.requireConnection().initialize({
       // `PROTOCOL_VERSION` is exported by the SDK (`schema/index.js:31`) and
       // equals `1`, the same value Hermes' Python SDK carries in
       // `acp/meta.py:29`. The previous hard-coded `1` plus its "no exported
@@ -515,6 +578,27 @@ export class AcpClient implements AcpClientLike {
         terminal: false,
       },
     });
+    // Task 13: RETAIN the advertised auth methods (`response.authMethods` —
+    // the SDK-typed field, see {@link AdvertisedAuthMethod}'s verification
+    // trail). The SDK's client-side wrapper hands back the raw JSON-RPC
+    // result WITHOUT zod-parsing it (`dist/acp.js:451-453` — response
+    // validation only exists on the agent-side request dispatch), so the
+    // shape is guarded defensively at this wire boundary (same
+    // belt-and-braces posture as `reshapeSessionsList`): a missing/non-array
+    // field reads as "initialized, zero advertised" (`[]`, distinct from the
+    // pre-initialize `undefined`), and a malformed entry is dropped rather
+    // than crashing the connect phase.
+    const rawMethods = response.authMethods;
+    this.advertisedAuthMethods = (Array.isArray(rawMethods) ? rawMethods : [])
+      .filter((m) => typeof m.id === 'string' && typeof m.name === 'string')
+      .map((m) => ({ id: m.id, name: m.name }));
+    for (const handler of [...this.authMethodsHandlers]) {
+      try {
+        handler();
+      } catch (err) {
+        this.log(`onAuthMethodsChanged handler threw: ${String(err)}`);
+      }
+    }
   }
 
   /**

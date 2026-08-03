@@ -138,6 +138,9 @@ function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: Set
     },
     registry: { AGENT_BACKENDS, FIM_BACKENDS, getBackend },
     getNextEditSource: () => 'off',
+    // Task 13: default = "no ACP initialize has surfaced auth methods yet"
+    // (mock backend / before connect) → provider card 'waiting-agent'.
+    getAdvertisedAuthMethods: () => undefined,
     ...overrides,
   };
   return { deps, calls };
@@ -703,14 +706,17 @@ describe('status(): assembles SetupData from registry + settings + secrets + oll
     expect(data.agent.phase).toBe('installed-inactive');
   });
 
-  it('hermesPath set + backend=acp -> ready (best-effort; provider not yet wired -> ready:false overall)', async () => {
+  it('hermesPath set + backend=acp but NO advertised authMethods yet -> agent ready, provider waiting-agent, ready:false', async () => {
+    // Task 13 update: the provider card is now driven SOLELY by the
+    // ACP-advertised authMethods (dep seam) — settings saying "acp" no longer
+    // flips it off 'waiting-agent'; only a real initialize result does.
     const { controller } = makeController({
       settings: settingsMap({ 'talaria.hermesPath': '/x/bin/hermes', 'talaria.backend': 'acp' }),
     });
     const data = await controller.status();
     expect(data.agent.phase).toBe('ready');
-    expect(data.provider.phase).toBe('unconfigured');
-    expect(data.ready).toBe(false); // provider can never be 'configured' pre-Task-13
+    expect(data.provider.phase).toBe('waiting-agent');
+    expect(data.ready).toBe(false);
   });
 
   it('after a successful install, phase is awaiting-reload (not ready) until a reload actually happens', async () => {
@@ -742,6 +748,61 @@ describe('status(): assembles SetupData from registry + settings + secrets + oll
     );
     const data = await controller.status();
     expect(data.nextEdit.refusalDetail).toBeDefined();
+  });
+});
+
+// --- Task 13: provider card from the ACP-advertised authMethods (§2.1) -------
+
+describe('Task 13: provider card mapped from the advertised authMethods', () => {
+  const SETUP_ONLY = [{ id: 'hermes-setup', name: 'Configure Hermes provider' }];
+  const PROVIDER_AND_SETUP = [
+    { id: 'openrouter', name: 'openrouter runtime credentials' },
+    { id: 'hermes-setup', name: 'Configure Hermes provider' },
+  ];
+
+  it('dep returns undefined (no initialize yet / mock backend) -> waiting-agent, no providerId', async () => {
+    const { controller } = makeController({}, { getAdvertisedAuthMethods: () => undefined });
+    const data = await controller.status();
+    expect(data.provider).toEqual({ phase: 'waiting-agent' });
+  });
+
+  it('ONLY hermes-setup advertised -> unconfigured (the wizard is the way forward), no providerId', async () => {
+    const { controller } = makeController({}, { getAdvertisedAuthMethods: () => SETUP_ONLY });
+    const data = await controller.status();
+    expect(data.provider).toEqual({ phase: 'unconfigured' });
+  });
+
+  it('an agent-managed method (id != hermes-setup) -> configured, providerId = that id', async () => {
+    const { controller } = makeController({}, { getAdvertisedAuthMethods: () => PROVIDER_AND_SETUP });
+    const data = await controller.status();
+    expect(data.provider).toEqual({ phase: 'configured', providerId: 'openrouter' });
+  });
+
+  it('an EMPTY advertisement (agent answered, zero methods) -> unconfigured, never a fabricated configured', async () => {
+    const { controller } = makeController({}, { getAdvertisedAuthMethods: () => [] });
+    const data = await controller.status();
+    expect(data.provider).toEqual({ phase: 'unconfigured' });
+  });
+
+  it('agent ready + provider configured + FIM green -> ready:true and talaria.setup.completed persisted', async () => {
+    const { host, controller } = makeController(
+      { settings: settingsMap({ 'talaria.hermesPath': '/x/bin/hermes', 'talaria.backend': 'acp' }) },
+      { getAdvertisedAuthMethods: () => PROVIDER_AND_SETUP },
+    );
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('ready');
+    expect(data.provider).toEqual({ phase: 'configured', providerId: 'openrouter' });
+    expect(data.ready).toBe(true);
+    expect(host.globalStateStore.get('talaria.setup.completed')).toBe(true);
+  });
+
+  it('provider configured but the agent NOT ready keeps the composite ready:false (never provider-only ready)', async () => {
+    const { host, controller } = makeController({}, { getAdvertisedAuthMethods: () => PROVIDER_AND_SETUP });
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('missing');
+    expect(data.provider.phase).toBe('configured');
+    expect(data.ready).toBe(false);
+    expect(host.globalStateStore.has('talaria.setup.completed')).toBe(false);
   });
 });
 

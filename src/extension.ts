@@ -307,7 +307,17 @@ export function activate(context: vscode.ExtensionContext): void {
   // into the view provider the same way the nextEdit toggle port is
   // (`setSetupController`), and disposed via `context.subscriptions` like
   // every other host-owned resource in this function.
-  const setupController = new SetupController(createVsCodeSetupHost(context), createSetupControllerDeps());
+  // Task 13: the Provider card's authMethods seam — a THUNK over the outer
+  // `backend` binding (not a snapshot), read at every `status()` call, so the
+  // trust-upgrade mock→real swap below (`backend = upgraded`) and every
+  // `talaria.newSession` re-initialize are reflected automatically. Optional
+  // chaining because only the real `AcpBackend` implements the capability
+  // (`AgentBackend.getAdvertisedAuthMethods?`) — under mock this yields
+  // `undefined` and the card honestly reads `waiting-agent`.
+  const setupController = new SetupController(
+    createVsCodeSetupHost(context),
+    createSetupControllerDeps(() => backend.getAdvertisedAuthMethods?.()),
+  );
   context.subscriptions.push({ dispose: () => setupController.dispose() });
   provider.setSetupController(setupController);
 

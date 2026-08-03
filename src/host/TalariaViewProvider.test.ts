@@ -1177,6 +1177,9 @@ function makeFakeSetupDeps(): SetupControllerDeps {
     probeRemote: async () => ({ ok: true, detail: 'not used in routing tests' }),
     registry: { AGENT_BACKENDS, FIM_BACKENDS, getBackend },
     getNextEditSource: () => 'off',
+    // Task 13: routing tests never exercise the provider mapping — undefined
+    // keeps the provider card honestly 'waiting-agent'.
+    getAdvertisedAuthMethods: () => undefined,
   };
 }
 

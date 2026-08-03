@@ -37,6 +37,7 @@ import type {
   AcpClientFactory,
   AcpLoadSessionResult,
   AcpMcpServer,
+  AdvertisedAuthMethod,
 } from './acp/acpClient';
 import { resolveWithinWorkspace, resolveWithinWorkspaceReal } from './acp/pathConfine';
 import { makeProcFdReader, type ConfinedReader, type ConfinedReadDenial } from './acp/confinedOpen';
@@ -177,6 +178,20 @@ export class AcpBackend implements AgentBackend {
 
   private readonly emitter = new vscode.EventEmitter<HostToWebviewMessage>();
   readonly onMessage = this.emitter.event;
+
+  /**
+   * Task 13: fires when the CURRENT client's advertised auth methods change
+   * (in practice: once per connect/respawn, when that client's `initialize()`
+   * retains the response — see {@link AcpClientLike.onAuthMethodsChanged}).
+   * Re-pointed at each fresh client by the {@link ConnectionSupervisorHostPort}
+   * `createClient` wrapper below, so a `talaria.newSession` restart's NEW
+   * advertisement fires this too while the torn-down client's can no longer.
+   */
+  private readonly authMethodsEmitter = new vscode.EventEmitter<void>();
+  readonly onAuthMethodsChanged = this.authMethodsEmitter.event;
+  /** Task 13: the ONE live client-side subscription behind
+   *  {@link onAuthMethodsChanged} — disposed+replaced per minted client. */
+  private clientAuthMethodsSub: { dispose(): void } | undefined;
 
   private readonly control: ControlChannel;
 
@@ -405,7 +420,20 @@ export class AcpBackend implements AgentBackend {
     // `AcpBackend` itself uses.
     const connectionPort: ConnectionSupervisorHostPort = {
       config,
-      createClient: this.createClient,
+      // Task 13: wrap (don't replace) the injected factory so EVERY minted
+      // client — the boot connect and every respawn alike — re-points the
+      // single {@link clientAuthMethodsSub} at the fresh client's own
+      // advertised-auth-methods signal. Disposing the previous subscription
+      // FIRST is what makes a stale (being-torn-down) client's late fire
+      // unobservable through {@link onAuthMethodsChanged}. `?.` on the
+      // subscribe: the member is optional on `AcpClientLike` (older test
+      // doubles), exactly like `closeSession`.
+      createClient: (options) => {
+        const client = this.createClient(options);
+        this.clientAuthMethodsSub?.dispose();
+        this.clientAuthMethodsSub = client.onAuthMethodsChanged?.(() => this.authMethodsEmitter.fire());
+        return client;
+      },
       logger: this.logger,
       callbacks: {
         onSessionUpdate: (sessionId, update) => this.handleSessionUpdate(sessionId, update),
@@ -662,6 +690,21 @@ export class AcpBackend implements AgentBackend {
    */
   async start(): Promise<void> {
     return this.connectionSupervisor.start();
+  }
+
+  /**
+   * Task 13 (onboarding-backend-setup §2.1): the CURRENT live client's
+   * ACP-advertised auth methods — read at CALL TIME through {@link
+   * ConnectionSupervisor.getClient} (never a snapshot), so a
+   * `talaria.newSession` restart or a crash/respawn is reflected the moment
+   * the replacement client's `initialize()` lands. `undefined` before the
+   * first initialize, between connections, and after dispose — the Setup
+   * panel's Provider card reads that as `waiting-agent`. Reaches
+   * `SetupController` ONLY through `extension.ts`'s injected dep thunk
+   * (`createSetupControllerDeps`), preserving the controller's purity.
+   */
+  getAdvertisedAuthMethods(): AdvertisedAuthMethod[] | undefined {
+    return this.connectionSupervisor.getClient()?.getAdvertisedAuthMethods?.();
   }
 
   /**
@@ -1597,6 +1640,11 @@ export class AcpBackend implements AgentBackend {
     // trust-upgrade swap (which disposes the old backend) also tears its
     // dashboard down. Idempotent (`HermesDashboardManager.dispose`).
     this.dashboard?.dispose();
+    // Task 13: drop the per-client auth-methods subscription and its fan-out
+    // emitter with the rest of the event plumbing.
+    this.clientAuthMethodsSub?.dispose();
+    this.clientAuthMethodsSub = undefined;
+    this.authMethodsEmitter.dispose();
     this.emitter.dispose();
   }
 

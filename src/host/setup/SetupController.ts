@@ -58,13 +58,17 @@ import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupMethod, Setup
  *   redacted (`~` for the real home dir) before ever reaching {@link
  *   pushProgress}/`SetupData` (T6 M-3 carry-forward).
  *
- * ## Provider card (Task 13 dependency)
+ * ## Provider card (Task 13 — wired)
  * The Provider card's real signal is the ACP `initialize` result's
- * `authMethods` (Task 13 — not wired yet). Until then this controller
- * reports an honest placeholder: `'waiting-agent'` while the agent isn't
- * `ready`, else `'unconfigured'` (never fabricating `'configured'`) — so the
- * composite `ready`/`talaria.setup.completed` signal can genuinely never
- * fire before Task 13 lands. That is expected, not a bug in this task.
+ * `authMethods`, injected through {@link SetupControllerDeps.
+ * getAdvertisedAuthMethods} (bound by `extension.ts` to a thunk over
+ * `AgentBackend.getAdvertisedAuthMethods?.()` — never a backend import
+ * here). Mapping (§2.1, {@link computeProviderCard}): `undefined` (no
+ * initialize yet / mock backend) ⇒ `'waiting-agent'`; any advertised method
+ * id ≠ `hermes-setup` ⇒ `'configured'` with `providerId` = that id; only
+ * `hermes-setup` (or nothing) advertised ⇒ `'unconfigured'`. This is what
+ * lets the composite `ready`/`talaria.setup.completed` signal genuinely
+ * fire once agent + provider + FIM are all green.
  */
 
 // --- Event/Disposable (vscode-free — structurally compatible with
@@ -149,6 +153,21 @@ export const TIER2_TUNABLE_KEYS: readonly string[] = [
 
 // --- deps (the Task 3-7 engines, bound to their real spawn/fetch/fileExists by the caller) --
 
+/**
+ * Task 13: one ACP-advertised auth method, as it reaches this controller
+ * through the {@link SetupControllerDeps.getAdvertisedAuthMethods} seam.
+ * Deliberately declared HERE, structurally identical to `acp/acpClient.ts`'s
+ * own `AdvertisedAuthMethod`, rather than imported from it — the binding
+ * purity constraint is that this pure controller never imports from
+ * `host/backend/` (authMethods reach it via the injected dep only);
+ * TypeScript's structural typing makes the two interchangeable at the
+ * `extension.ts` wiring boundary.
+ */
+export interface AdvertisedAuthMethod {
+  id: string;
+  name: string;
+}
+
 export interface SetupControllerRegistry {
   AGENT_BACKENDS: readonly BackendDescriptor[];
   FIM_BACKENDS: readonly BackendDescriptor[];
@@ -191,6 +210,17 @@ export interface SetupControllerDeps {
    * never by naming the key itself.
    */
   getNextEditSource(): 'off' | 'dedicated' | 'generic';
+  /**
+   * Task 13 (§2.1): the ACP `initialize` result's advertised auth methods,
+   * read at CALL TIME through the backend seam (`extension.ts` binds this to
+   * `() => backend.getAdvertisedAuthMethods?.()` — a thunk over the CURRENT
+   * backend, so the trust-upgrade mock→real swap and every
+   * `talaria.newSession` re-initialize are reflected on the next
+   * {@link SetupController.status} call). `undefined` = no ACP connection
+   * has initialized (or the active backend is the mock) — the Provider card
+   * reads that as `waiting-agent`; see {@link computeProviderCard}.
+   */
+  getAdvertisedAuthMethods(): AdvertisedAuthMethod[] | undefined;
 }
 
 // --- misc constants -------------------------------------------------------
@@ -202,6 +232,13 @@ const DEFAULT_OLLAMA_ENDPOINT = 'http://127.0.0.1:11434';
 const DEFAULT_RAG_EMBED_MODEL = 'qwen3-embedding:0.6b';
 const DEFAULT_RAG_INDEX_DIR = '.hermes/index';
 const TRUST_REFUSAL_REASON = 'Workspace is not trusted — Setup changes are disabled in Restricted Mode.';
+/**
+ * Task 13: the id of Hermes' ALWAYS-advertised terminal setup-wizard auth
+ * method — pinned by the adapter itself (`acp_adapter/auth.py`:
+ * `TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup"`). Every OTHER advertised
+ * id is an agent-managed provider credential method (§2.1).
+ */
+export const HERMES_SETUP_AUTH_METHOD_ID = 'hermes-setup';
 /** T11 host-gap 2 (plan §6/§7 FM-1): the well-established Fedora pipx
  *  bootstrap. Pre-typed into a terminal, never executed by us — the user
  *  presses Enter and grants sudo themselves. `pipx ensurepath` is
@@ -325,8 +362,11 @@ export class SetupController {
     const fimAuthSatisfied =
       fimDescriptor.remote?.auth.kind !== 'apiKey' || !fimDescriptor.remote.auth.required || apiKeySet;
 
-    // Task 13 dependency — see class doc. Never fabricates 'configured'.
-    const providerPhase: SetupData['provider']['phase'] = agentPhase === 'ready' ? 'unconfigured' : 'waiting-agent';
+    // Task 13 (§2.1): the Provider card is driven SOLELY by the ACP-advertised
+    // auth methods, read through the dep seam at call time — see
+    // computeProviderCard's own doc for the mapping (and why it is
+    // deliberately NOT gated on agentPhase).
+    const provider = computeProviderCard(this.deps.getAdvertisedAuthMethods());
 
     const nextSource = this.deps.getNextEditSource();
     const nextBackend = coerceNextEditTransport(this.host.getSetting<string>('talaria.nextEdit.backend'));
@@ -347,7 +387,7 @@ export class SetupController {
     const ragIndexDir = (this.host.getSetting<string>('talaria.rag.indexDir') ?? '').trim() || DEFAULT_RAG_INDEX_DIR;
 
     const fimGreen = fimDescriptor.status === 'available' && enabled && fimAuthSatisfied;
-    const ready = computeReady(agentPhase, providerPhase, fimGreen);
+    const ready = computeReady(agentPhase, provider.phase, fimGreen);
     if (ready) {
       await this.host.globalState.update('talaria.setup.completed', true);
     }
@@ -362,7 +402,7 @@ export class SetupController {
         ...(this.lastAgentIssue ? { detail: this.lastAgentIssue.detail } : {}),
         ...(this.installLogTail.length > 0 ? { logTail: [...this.installLogTail] } : {}),
       },
-      provider: { phase: providerPhase },
+      provider,
       fim: {
         options: fimOptions,
         selectedId: fimDescriptor.id,
@@ -951,13 +991,39 @@ export class SetupController {
 // --- module-local helpers ---------------------------------------------------
 
 /**
- * `ready` composition, pulled out to its own function so `providerPhase`'s
- * comparison against `'configured'` is checked against its DECLARED type
- * (`SetupData['provider']['phase']`, a function parameter) rather than the
- * narrower control-flow-inferred type a local `const` ternary would carry —
- * today `providerPhase` can only ever be `'waiting-agent'|'unconfigured'`
- * (Task 13 dependency, see the class doc), so this is honestly unreachable
- * until that task lands, not a bug.
+ * Task 13 (§2.1): the Provider card from the ACP-advertised auth methods.
+ * `undefined` = no `initialize` result has been surfaced (agent not
+ * connected yet, or the active backend is the mock) ⇒ `waiting-agent`. Once
+ * an advertisement exists: Hermes' adapter (`acp_adapter/auth.py::
+ * build_auth_methods`) emits an agent-managed `<provider>` method iff
+ * credentials already resolve, and ALWAYS the `hermes-setup` terminal-wizard
+ * method — so any id ≠ `hermes-setup` IS the configured provider
+ * (`providerId` = that id, first match wins: the adapter emits at most one),
+ * and an advertisement of only `hermes-setup` (or, defensively, nothing at
+ * all) means no provider is configured ⇒ `unconfigured`, never a fabricated
+ * `configured`.
+ *
+ * Deliberately NOT gated on `agentPhase`: the advertisement can only exist
+ * at all when a live ACP connection produced it, which is strictly stronger
+ * evidence than the settings-derived `agentPhase` (e.g. Hermes resolved off
+ * PATH without `talaria.hermesPath` set reads `missing` there while the wire
+ * is genuinely up) — the composite `ready` still requires
+ * `agentPhase === 'ready'` regardless, see {@link computeReady}.
+ */
+function computeProviderCard(methods: AdvertisedAuthMethod[] | undefined): SetupData['provider'] {
+  if (methods === undefined) return { phase: 'waiting-agent' };
+  const managed = methods.find((m) => m.id !== HERMES_SETUP_AUTH_METHOD_ID);
+  return managed ? { phase: 'configured', providerId: managed.id } : { phase: 'unconfigured' };
+}
+
+/**
+ * `ready` composition, pulled out to its own function so the provider
+ * phase's comparison against `'configured'` is checked against its DECLARED
+ * type (`SetupData['provider']['phase']`, a function parameter) rather than
+ * the narrower control-flow-inferred type a local `const` ternary would
+ * carry. Reachable since Task 13: {@link computeProviderCard} produces
+ * `'configured'` whenever the agent advertises a provider-managed auth
+ * method.
  */
 function computeReady(
   agentPhase: AgentSetupPhase,

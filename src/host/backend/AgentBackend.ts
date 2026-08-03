@@ -179,6 +179,17 @@ export interface AgentBackend extends vscode.Disposable {
    * real `AcpBackend` has a registry to list; the mock backends have none. */
   listTabs?(): HydrateTabSeed[];
 
+  /** Task 13 (onboarding-backend-setup §2.1): the ACP `initialize` result's
+   * advertised auth methods (`{id, name}` projection), read from the CURRENT
+   * live client — only the real `AcpBackend` has a wire to read them from;
+   * `MockBackend` has none, so the Setup panel's Provider card honestly
+   * stays `waiting-agent` under mock. `undefined` until an ACP connection
+   * has initialized (and again between connections). Declared structurally
+   * (not via `acp/acpClient`'s `AdvertisedAuthMethod`) so this seam file
+   * stays independent of the ACP client module, mirroring how
+   * `SetupControllerDeps` declares the same shape on its side. */
+  getAdvertisedAuthMethods?(): { id: string; name: string }[] | undefined;
+
   /** W4-T5b (§2d): route a History-panel row load into an EXPLICIT tab —
    * only the real `AcpBackend` can (T5a's hardened `loadSessionIntoTab`);
    * `MockBackend` has no session history to load, so this no-ops for it. */

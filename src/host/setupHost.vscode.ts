@@ -7,7 +7,7 @@ import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstal
 import { probeOllama, pullModel } from './setup/ollamaClient';
 import { probeRemote } from './setup/remoteProbe';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
-import type { SetupHost, SetupControllerDeps } from './setup/SetupController';
+import type { AdvertisedAuthMethod, SetupHost, SetupControllerDeps } from './setup/SetupController';
 import { createVsCodeNextEditConfigPort } from '../autocomplete/nextedit/guard';
 
 /**
@@ -136,7 +136,18 @@ export function createNodeFileExists(): FileExists {
  *  same indirection `HermesDashboardClient.ts`'s default `fetchImpl` uses. */
 const boundFetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
 
-export function createSetupControllerDeps(): SetupControllerDeps {
+/**
+ * @param getAdvertisedAuthMethods Task 13: the Provider-card seam — REQUIRED
+ * (not defaulted) so the wiring can never be silently forgotten.
+ * `extension.ts` passes a thunk over the CURRENT backend
+ * (`() => backend.getAdvertisedAuthMethods?.()`), read at every
+ * `SetupController.status()` call — never a construction-time snapshot, so
+ * the trust-upgrade mock→real swap and every `talaria.newSession`
+ * re-initialize are picked up automatically.
+ */
+export function createSetupControllerDeps(
+  getAdvertisedAuthMethods: () => AdvertisedAuthMethod[] | undefined,
+): SetupControllerDeps {
   const exec = createExecLookup();
   const spawn = createNodeSpawnFn();
   const fileExists = createNodeFileExists();
@@ -153,6 +164,7 @@ export function createSetupControllerDeps(): SetupControllerDeps {
     // around the Guard. `createVsCodeNextEditConfigPort()` is a stateless
     // factory (matches its own doc); constructing one per call is cheap.
     getNextEditSource: () => createVsCodeNextEditConfigPort().get(),
+    getAdvertisedAuthMethods,
   };
 }
 

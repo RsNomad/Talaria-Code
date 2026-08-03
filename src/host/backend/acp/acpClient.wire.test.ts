@@ -59,7 +59,7 @@ const NOOP_CALLBACKS: AcpClientCallbacks = {
  * genuine `Duplex`, so `Writable.toWeb(child.stdin)`/`Readable.toWeb(child.stdout)`
  * get real Node stream instances to wrap, not a hand-rolled substitute.
  */
-function makeFakeChild(): { child: ChildProcess; stdin: PassThrough } {
+function makeFakeChild(): { child: ChildProcess; stdin: PassThrough; stdout: PassThrough } {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -74,15 +74,24 @@ function makeFakeChild(): { child: ChildProcess; stdin: PassThrough } {
   // The fake only needs to satisfy the surface AcpClient actually touches
   // (.stdin/.stdout/.stderr, .on('exit'|'error'), .kill()) — not the full
   // ChildProcess interface, hence the cast.
-  return { child: fake as unknown as ChildProcess, stdin };
+  return { child: fake as unknown as ChildProcess, stdin, stdout };
 }
 
 /**
  * Connects a real `AcpClient` over a fake child process and returns a reader
- * for the parsed JSON-RPC frames written to the fake stdin so far.
+ * for the parsed JSON-RPC frames written to the fake stdin so far, plus
+ * (Task 13) a `respond` writer that feeds one JSON-RPC frame back through the
+ * fake child's stdout — the ndjson response path the SDK's request
+ * correlation reads — so a test can let an in-flight request RESOLVE (the
+ * pre-Task-13 tests only ever needed the outbound frame and left every
+ * request pending forever).
  */
-async function connectClient(): Promise<{ client: AcpClient; wireFrames: () => unknown[] }> {
-  const { child, stdin } = makeFakeChild();
+async function connectClient(): Promise<{
+  client: AcpClient;
+  wireFrames: () => unknown[];
+  respond: (frame: unknown) => void;
+}> {
+  const { child, stdin, stdout } = makeFakeChild();
   vi.mocked(spawn).mockReturnValue(child);
 
   const chunks: Buffer[] = [];
@@ -103,6 +112,9 @@ async function connectClient(): Promise<{ client: AcpClient; wireFrames: () => u
         .split('\n')
         .filter((line) => line.trim().length > 0)
         .map((line) => JSON.parse(line) as unknown),
+    respond: (frame) => {
+      stdout.write(`${JSON.stringify(frame)}\n`);
+    },
   };
 }
 
@@ -161,5 +173,82 @@ describe('AcpClient — real client, real stdin bytes (Task 5 review F-1)', () =
         },
       },
     ]);
+  });
+});
+
+/**
+ * Task 13: `initialize()` must RETAIN the response's `authMethods`
+ * (`InitializeResponse.authMethods?: Array<AuthMethod>` — the installed
+ * `@agentclientprotocol/sdk@0.17.1`'s `dist/schema/types.gen.d.ts:1506`;
+ * every `AuthMethod` union variant carries `{id, name}`) and expose the
+ * `{id, name}` projection via `getAdvertisedAuthMethods()`. The fixtures
+ * below mirror what Hermes actually builds in
+ * `acp_adapter/auth.py::build_auth_methods`: an agent-managed `<provider>`
+ * `AuthMethodAgent` (id = the resolved provider) iff credentials resolve,
+ * and ALWAYS the `hermes-setup` TerminalAuthMethod (`type:'terminal'`,
+ * `args:['--setup']`) — extra wire fields (`description`/`type`/`args`)
+ * prove the projection strips down to exactly `{id, name}`.
+ */
+describe('AcpClient — Task 13: initialize retains the advertised authMethods', () => {
+  const PROVIDER_METHOD = {
+    id: 'openrouter',
+    name: 'openrouter runtime credentials',
+    description: 'Authenticate Hermes using the currently configured openrouter runtime credentials.',
+  };
+  const HERMES_SETUP_METHOD = {
+    id: 'hermes-setup',
+    name: 'Configure Hermes provider',
+    description: 'Open Hermes interactive model/provider setup in a terminal.',
+    type: 'terminal',
+    args: ['--setup'],
+  };
+
+  it('getAdvertisedAuthMethods() is undefined before initialize, then the {id, name} projection of the response authMethods', async () => {
+    const { client, respond } = await connectClient();
+    expect(client.getAdvertisedAuthMethods()).toBeUndefined();
+
+    const init = client.initialize();
+    await flush();
+    respond({
+      jsonrpc: '2.0',
+      id: 0,
+      result: {
+        protocolVersion: 1,
+        agentCapabilities: {},
+        authMethods: [PROVIDER_METHOD, HERMES_SETUP_METHOD],
+      },
+    });
+    await init;
+
+    expect(client.getAdvertisedAuthMethods()).toEqual([
+      { id: 'openrouter', name: 'openrouter runtime credentials' },
+      { id: 'hermes-setup', name: 'Configure Hermes provider' },
+    ]);
+  });
+
+  it('a response with NO authMethods field yields [] (initialized, zero advertised) — not undefined', async () => {
+    const { client, respond } = await connectClient();
+    const init = client.initialize();
+    await flush();
+    respond({ jsonrpc: '2.0', id: 0, result: { protocolVersion: 1, agentCapabilities: {} } });
+    await init;
+    expect(client.getAdvertisedAuthMethods()).toEqual([]);
+  });
+
+  it('onAuthMethodsChanged fires once initialize has retained the methods (getter already fresh inside the handler)', async () => {
+    const { client, respond } = await connectClient();
+    const seen: Array<ReturnType<AcpClient['getAdvertisedAuthMethods']>> = [];
+    client.onAuthMethodsChanged(() => seen.push(client.getAdvertisedAuthMethods()));
+
+    const init = client.initialize();
+    await flush();
+    respond({
+      jsonrpc: '2.0',
+      id: 0,
+      result: { protocolVersion: 1, agentCapabilities: {}, authMethods: [HERMES_SETUP_METHOD] },
+    });
+    await init;
+
+    expect(seen).toEqual([[{ id: 'hermes-setup', name: 'Configure Hermes provider' }]]);
   });
 });
