@@ -62,6 +62,12 @@ docs/**
 #   openai, @huggingface/transformers, @huggingface/jinja
 node_modules/**
 !node_modules/@lancedb/**
+# @opentelemetry/api: a NEW runtime dependency of LanceDB 0.33 — dist/otel.js
+# does a top-level require('@opentelemetry/api') (zero-dependency, no further
+# closure). The allow-list closure comment above predates 0.33 (written for
+# 0.31, which had no otel dep); its absence from the .vsix crashed activate()
+# on 0.1.0-beta.1 with "Cannot find module '@opentelemetry/api'".
+!node_modules/@opentelemetry/**
 !node_modules/web-tree-sitter/**
 !node_modules/tree-sitter-wasms/**
 !node_modules/apache-arrow/**
