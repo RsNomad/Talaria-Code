@@ -329,7 +329,7 @@ import {
   genericUnsupportedBackendMessage,
   type NextEditExecutorHost,
 } from './shell.vscode';
-import { NextEditGuard } from './guard';
+import { NextEditGuard, type NextEditConfigPort, type NextEditSource } from './guard';
 import { BackendHttpError } from '../backends/http';
 import { InsecureTransportError } from '../backends/secureTransport';
 import type { ToggleState } from './mode';
@@ -613,17 +613,32 @@ function makeEditor(document: FakeDocument, cursorLine = 10): FakeEditor {
   };
 }
 
-function makeMemento(seed?: ToggleState): vscodeTypes.Memento {
-  const store = new Map<string, unknown>();
-  if (seed) store.set('hermes.nextEdit.toggles', seed);
+/** Task 2 (§5.5): the Guard hydrates from the `talaria.nextEdit.source`
+ *  enum through a config port now — this fake stands in for it. `set()`
+ *  fires the change listeners, exactly as the real port's
+ *  `onDidChangeConfiguration` subscription does for the Guard's own write. */
+function makeSourcePort(initial: NextEditSource = 'off'): NextEditConfigPort {
+  let value = initial;
+  const listeners = new Set<() => void>();
   return {
-    keys: () => [...store.keys()],
-    get: (<T>(key: string, dflt?: T): T | undefined =>
-      (store.has(key) ? (store.get(key) as T) : dflt)) as vscodeTypes.Memento['get'],
-    update: async (key: string, value: unknown): Promise<void> => {
-      store.set(key, value);
+    get: () => value,
+    set: async (v: NextEditSource): Promise<void> => {
+      value = v;
+      for (const listener of [...listeners]) listener();
+    },
+    onDidChange: (cb: () => void) => {
+      listeners.add(cb);
+      return { dispose: () => void listeners.delete(cb) };
     },
   };
+}
+
+/** The legacy `{next, generic}` seeds, mapped onto the enum the store holds
+ *  now — keeps every existing scenario's setup readable as before. */
+function sourceOf(toggles?: ToggleState): NextEditSource {
+  if (toggles?.next) return 'dedicated';
+  if (toggles?.generic) return 'generic';
+  return 'off';
 }
 
 const SHELL_DEPS = {
@@ -653,7 +668,9 @@ async function setupShell(toggles?: ToggleState): Promise<{
   guard: NextEditGuard;
   disposable: vscodeTypes.Disposable;
 }> {
-  const guard = await NextEditGuard.hydrate(makeMemento(toggles), { reportFailure: SHELL_DEPS.reportFailure });
+  const guard = await NextEditGuard.hydrate(makeSourcePort(sourceOf(toggles)), {
+    reportFailure: SHELL_DEPS.reportFailure,
+  });
   const disposable = registerTalariaNextEdit(makeContext(), guard, SHELL_DEPS);
   return { guard, disposable };
 }
@@ -967,7 +984,7 @@ describe('next-edit toggle gate (transport support + the generic setup note)', (
   });
 
   it('the GENERIC setup note fires exactly once, on the ACCEPTED generic toggle-on', async () => {
-    const guard = await NextEditGuard.hydrate(makeMemento(), { reportFailure: SHELL_DEPS.reportFailure });
+    const guard = await NextEditGuard.hydrate(makeSourcePort(), { reportFailure: SHELL_DEPS.reportFailure });
 
     await requestNextEditToggle(guard, { source: 'generic', on: true }, SHELL_DEPS);
 
@@ -975,7 +992,7 @@ describe('next-edit toggle gate (transport support + the generic setup note)', (
   });
 
   it('the setup note does NOT fire for a NEXT toggle-on, nor for a generic toggle-OFF', async () => {
-    const guard = await NextEditGuard.hydrate(makeMemento(), { reportFailure: SHELL_DEPS.reportFailure });
+    const guard = await NextEditGuard.hydrate(makeSourcePort(), { reportFailure: SHELL_DEPS.reportFailure });
 
     await requestNextEditToggle(guard, { source: 'next', on: true }, SHELL_DEPS);
     await requestNextEditToggle(guard, { source: 'next', on: false }, SHELL_DEPS);
@@ -985,21 +1002,25 @@ describe('next-edit toggle gate (transport support + the generic setup note)', (
     expect(host.infos).toEqual([GENERIC_SETUP_NOTE]); // only the one accepted generic toggle-ON
   });
 
-  it('the setup note does NOT fire when the generic toggle-on is REFUSED by the Guard', async () => {
-    const guard = await NextEditGuard.hydrate(makeMemento({ next: true, generic: false }), {
+  it('D7 structural exclusion: a generic toggle-on while NEXT is active REPLACES it (no refusal), and the setup note fires', async () => {
+    const guard = await NextEditGuard.hydrate(makeSourcePort('dedicated'), {
       reportFailure: SHELL_DEPS.reportFailure,
     });
 
     await expect(
       requestNextEditToggle(guard, { source: 'generic', on: true }, SHELL_DEPS),
-    ).rejects.toThrow('mutually exclusive');
+    ).resolves.toEqual({ next: false, generic: true });
 
-    expect(host.infos).toEqual([]);
+    expect(guard.getState()).toEqual({ next: false, generic: true });
+    expect(host.warnings, 'the mutual-exclusion refusal path is GONE — the enum replaces').toEqual([]);
+    expect(host.infos, 'the replace is an ACCEPTED generic toggle-on, so the one-shot note fires').toEqual([
+      GENERIC_SETUP_NOTE,
+    ]);
   });
 
   it('a codestral FIM backend REFUSES the generic toggle-on with an actionable message (ADR-009)', async () => {
     autocompleteConfig.backend = 'codestral';
-    const guard = await NextEditGuard.hydrate(makeMemento(), { reportFailure: SHELL_DEPS.reportFailure });
+    const guard = await NextEditGuard.hydrate(makeSourcePort(), { reportFailure: SHELL_DEPS.reportFailure });
 
     await expect(
       requestNextEditToggle(guard, { source: 'generic', on: true }, SHELL_DEPS),
@@ -1012,7 +1033,7 @@ describe('next-edit toggle gate (transport support + the generic setup note)', (
 
   it('an openai-compat FIM backend REFUSES the generic toggle-on too (Ollama OAI double-templating)', async () => {
     autocompleteConfig.backend = 'openai-compat';
-    const guard = await NextEditGuard.hydrate(makeMemento(), { reportFailure: SHELL_DEPS.reportFailure });
+    const guard = await NextEditGuard.hydrate(makeSourcePort(), { reportFailure: SHELL_DEPS.reportFailure });
 
     await expect(
       requestNextEditToggle(guard, { source: 'generic', on: true }, SHELL_DEPS),
@@ -1023,7 +1044,7 @@ describe('next-edit toggle gate (transport support + the generic setup note)', (
 
   it('an unsupported FIM backend never blocks turning generic OFF, nor the NEXT source', async () => {
     autocompleteConfig.backend = 'codestral';
-    const guard = await NextEditGuard.hydrate(makeMemento({ next: false, generic: true }), {
+    const guard = await NextEditGuard.hydrate(makeSourcePort('generic'), {
       reportFailure: SHELL_DEPS.reportFailure,
     });
 
@@ -2322,12 +2343,21 @@ describe('LOCK: the shell is the only next-edit context-key writer, and register
    */
   const SET_CONTEXT_WRITE_RE = /executeCommand\(\s*['"]setContext['"]/;
 
+  /** Comments are STRIPPED before matching (Task 11's lesson, and Task 2's
+   *  concrete case: `extension.ts` writes its own unrelated `talaria.ready`
+   *  context key AND now DOCUMENTS `talaria.nextEdit.source` in the
+   *  migration comment — prose plus an unrelated write is not a next-edit
+   *  context-key writer). */
+  const stripComments = (content: string): string =>
+    content.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+
   it('no other non-test file under src/ writes talaria.nextEdit.* context keys', async () => {
     const { collectNonTestTsSources } = await import('../../host/purityScan');
     const path = await import('node:path');
 
     const offenders = collectNonTestTsSources(path.join(__dirname, '..', '..'))
-      .filter((f) => SET_CONTEXT_WRITE_RE.test(f.content) && /talaria\.nextEdit\./.test(f.content))
+      .map((f) => ({ file: f.file, stripped: stripComments(f.content) }))
+      .filter((f) => SET_CONTEXT_WRITE_RE.test(f.stripped) && /['"`]talaria\.nextEdit\./.test(f.stripped))
       .map((f) => f.file);
 
     expect(offenders).toEqual(['autocomplete/nextedit/shell.vscode.ts']);

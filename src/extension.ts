@@ -7,6 +7,7 @@ import { MockBackend } from './host/backend/MockBackend';
 import { AcpBackend } from './host/backend/AcpBackend';
 import type { HermesRuntimeConfig } from './host/runtime/resolveHermes';
 import { registerTalariaAutocomplete } from './autocomplete';
+import { createVsCodeNextEditConfigPort, migrateNextEditToggles } from './autocomplete/nextedit/guard';
 import { createIndexer, type Indexer } from './rag/indexer';
 import { RAG_SETTING_RELOAD } from './rag/ragReloadSettings';
 import { selectBackendKind, shouldActivateLib, shouldActivateRag } from './host/trustGate';
@@ -412,6 +413,22 @@ export function activate(context: vscode.ExtensionContext): void {
   // in Restricted Mode a remote (non-loopback) endpoint is skipped entirely
   // (S4.3) — only the default loopback path stays live untrusted. Reads
   // `talaria.autocomplete.*` itself.
+  //
+  // §5.3 one-time NEXT store migration (onboarding/setup Task 2): drain the
+  // legacy `globalState` toggle pair into the `talaria.nextEdit.source`
+  // setting, then delete the memento key — the delete is the latch, so every
+  // later activation is a no-op. Fire-and-forget beside the Guard's own async
+  // hydration: the Guard reads the setting live and reacts to the config
+  // change this write produces, so no ordering between the two is needed. A
+  // failed settings write keeps the memento (the latch is not burned) and
+  // retries on the next activation.
+  void migrateNextEditToggles(context.globalState, createVsCodeNextEditConfigPort()).then(
+    undefined,
+    (err: unknown) =>
+      output.appendLine(
+        `[nextEdit] toggle-store migration failed (will retry next activation): ${String(err)}`,
+      ),
+  );
   //
   // A5: `reportFailure` is the real implementation of provider.ts's injected
   // seam — every surfaced (actionable) autocomplete failure also gets one

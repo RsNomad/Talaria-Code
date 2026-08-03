@@ -445,10 +445,16 @@ describe('initApiKey — the migrating session leaves the durable copy alone', (
     await flushAsync();
 
     host.settings.set('talaria.autocomplete.apiKey', '');
+    // TWO listeners since onboarding/setup Task 2: the autocomplete
+    // `rebuild()` watcher this test drives, plus the NextEditGuard's
+    // `talaria.nextEdit.source` port subscription (§5.5) — the Guard's one is
+    // inert here (the source value never moves off its default, so its
+    // dedupe pushes nothing). ZERO captured listeners is what would make
+    // every assertion below vacuous.
     expect(
       host.configListeners,
-      'no captured listener would make every assertion below vacuous',
-    ).toHaveLength(1);
+      'no captured rebuild listener would make every assertion below vacuous',
+    ).toHaveLength(2);
     for (const listener of host.configListeners) listener({ affectsConfiguration: () => true });
     await flushAsync();
     disposable.dispose();

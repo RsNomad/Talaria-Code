@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type * as vscodeTypes from 'vscode';
-import { NextEditGuard, NEXT_EDIT_RESET_NOTICE } from './guard';
+import { NextEditGuard, type NextEditConfigPort, type NextEditSource } from './guard';
 import type { ToggleState } from './mode';
 import { must } from '../../testing/must';
 
@@ -332,40 +332,54 @@ function makeEditor(document: FakeDocument, cursorLine = 10): FakeEditor {
   };
 }
 
-function makeMemento(seed?: ToggleState): vscodeTypes.Memento {
-  const store = new Map<string, unknown>();
-  if (seed) store.set('hermes.nextEdit.toggles', seed);
+/** Task 2 (§5.5): the Guard hydrates from the `talaria.nextEdit.source` enum
+ *  through a config port now. This RECORDING fake stands in for it: every
+ *  `set()` is captured (so scenarios can assert the store was — or was NOT —
+ *  touched, not merely infer it), and `setExternally` models a NATIVE
+ *  settings-page edit (value moves + the change event fires, exactly what
+ *  `onDidChangeConfiguration` delivers for a settings-UI write). */
+interface RecordingSourcePort {
+  port: NextEditConfigPort;
+  sets: NextEditSource[];
+  setExternally(v: NextEditSource): void;
+  value(): NextEditSource;
+}
+
+function makeRecordingSourcePort(initial: NextEditSource = 'off'): RecordingSourcePort {
+  let value = initial;
+  const sets: NextEditSource[] = [];
+  const listeners = new Set<() => void>();
+  const emit = (): void => {
+    for (const listener of [...listeners]) listener();
+  };
   return {
-    keys: () => [...store.keys()],
-    get: (<T>(key: string, dflt?: T): T | undefined =>
-      (store.has(key) ? (store.get(key) as T) : dflt)) as vscodeTypes.Memento['get'],
-    update: async (key: string, value: unknown): Promise<void> => {
-      store.set(key, value);
+    sets,
+    setExternally: (v) => {
+      value = v;
+      emit();
+    },
+    value: () => value,
+    port: {
+      get: () => value,
+      set: async (v: NextEditSource): Promise<void> => {
+        sets.push(v);
+        value = v;
+        emit();
+      },
+      onDidChange: (cb: () => void) => {
+        listeners.add(cb);
+        return { dispose: () => void listeners.delete(cb) };
+      },
     },
   };
 }
 
-/** A recording Memento — like `makeMemento`, but exposes every write, so the
- *  refusal round-trip and cold-start scenarios can assert the store either
- *  was or was NOT touched, not merely infer it from in-memory state. */
-function makeRecordingMemento(seed?: ToggleState): {
-  memento: vscodeTypes.Memento;
-  updates: { key: string; value: unknown }[];
-  store: Map<string, unknown>;
-} {
-  const store = new Map<string, unknown>();
-  const updates: { key: string; value: unknown }[] = [];
-  if (seed) store.set('hermes.nextEdit.toggles', seed);
-  const memento = {
-    keys: () => [...store.keys()],
-    get: (<T>(key: string, dflt?: T): T | undefined =>
-      (store.has(key) ? (store.get(key) as T) : dflt)) as vscodeTypes.Memento['get'],
-    update: async (key: string, value: unknown): Promise<void> => {
-      updates.push({ key, value });
-      store.set(key, value);
-    },
-  } as vscodeTypes.Memento;
-  return { memento, updates, store };
+/** The legacy `{next, generic}` seeds, mapped onto the enum the store holds
+ *  now — keeps every scenario's setup readable as before. */
+function sourceOf(toggles?: ToggleState): NextEditSource {
+  if (toggles?.next) return 'dedicated';
+  if (toggles?.generic) return 'generic';
+  return 'off';
 }
 
 function makeContext(): vscodeTypes.ExtensionContext {
@@ -392,7 +406,9 @@ const DEPS = {
 };
 
 async function setupShell(toggles: ToggleState): Promise<{ guard: NextEditGuard; disposable: vscodeTypes.Disposable }> {
-  const guard = await NextEditGuard.hydrate(makeMemento(toggles), { reportFailure: DEPS.reportFailure });
+  const guard = await NextEditGuard.hydrate(makeRecordingSourcePort(sourceOf(toggles)).port, {
+    reportFailure: DEPS.reportFailure,
+  });
   const disposable = registerTalariaNextEdit(makeContext(), guard, DEPS);
   return { guard, disposable };
 }
@@ -589,47 +605,48 @@ describe('Scenario 2 (owner: FIM ON, NEXT OFF, Generic OFF — plain FIM only)',
   });
 });
 
-// ══════════════════════ Refusal round-trip ═══════════════════════
+// ══════════════════════ Structural-exclusion round-trip ═══════════════════════
 
-describe('R5 refusal round-trip (owner: turn ONE on, the second is refused, one alert)', () => {
+describe('D7 structural exclusion round-trip (§5.5: the second toggle-on REPLACES the first — no refusal left)', () => {
   beforeEach(resetAll);
 
-  it('NEXT on, then a generic toggle-on request rejects; the store is untouched; one warning; NEXT (and FIM) unaffected', async () => {
-    const { memento, updates, store } = makeRecordingMemento();
-    const guard = await NextEditGuard.hydrate(memento, { reportFailure: DEPS.reportFailure });
+  it('NEXT on, then a generic toggle-on REPLACES it: one enum write each, no warning, the setup note fires, and the trigger now rides the FIM endpoint', async () => {
+    const recording = makeRecordingSourcePort();
+    const guard = await NextEditGuard.hydrate(recording.port, { reportFailure: DEPS.reportFailure });
 
     await requestNextEditToggle(guard, { source: 'next', on: true }, DEPS);
     expect(guard.getState()).toEqual({ next: true, generic: false });
-    expect(updates, 'setup: the NEXT toggle-on must have persisted').toHaveLength(1);
-    const persistedBeforeRefusal = store.get('hermes.nextEdit.toggles');
+    expect(recording.sets, 'setup: the NEXT toggle-on must have written the enum').toEqual(['dedicated']);
 
-    await expect(requestNextEditToggle(guard, { source: 'generic', on: true }, DEPS)).rejects.toThrow(
-      'Next Edit: turn off "Next Edit — dedicated model" first — the two sources are mutually exclusive.',
-    );
+    // The old mutual-exclusion refusal is GONE: the enum replaces. This is
+    // the webview gesture path (`requestNextEditToggle`), so the one-shot
+    // Generic setup note fires — it is an ACCEPTED generic toggle-on now.
+    await expect(requestNextEditToggle(guard, { source: 'generic', on: true }, DEPS)).resolves.toEqual({
+      next: false,
+      generic: true,
+    });
 
-    // The ratified state, in-memory AND on disk, is untouched by the
-    // refusal — no second write.
-    expect(guard.getState()).toEqual({ next: true, generic: false });
-    expect(updates, 'a refusal must persist NOTHING — no second Memento.update call').toHaveLength(1);
-    expect(store.get('hermes.nextEdit.toggles')).toEqual(persistedBeforeRefusal);
-    // One warning — the alert that, at the webview layer (`SettingsPanel.tsx`
-    // / `settingsField.ts`'s `rollbackField`, covered by
-    // `webview/src/rpc.test.ts` and the panel's own suite, out of scope
-    // here), is what makes the Settings row visibly snap back.
-    expect(host.warnings).toHaveLength(1);
-    expect(host.warnings[0]).toBe(
-      'Next Edit: turn off "Next Edit — dedicated model" first — the two sources are mutually exclusive.',
-    );
-    // The setup note must not have fired for a REFUSED generic toggle-on.
-    expect(host.infos).toEqual([]);
+    expect(guard.getState()).toEqual({ next: false, generic: true });
+    expect(recording.sets, 'the replace is ONE more enum write — never an off-then-on pair').toEqual([
+      'dedicated',
+      'generic',
+    ]);
+    expect(recording.value()).toBe('generic');
+    expect(host.warnings, 'no refusal path remains for the conflict case').toEqual([]);
+    expect(host.infos).toEqual([GENERIC_SETUP_NOTE]);
 
-    // NEXT (and, by the same token, FIM) unaffected: the refused Generic
-    // attempt must not have disturbed NEXT's own ability to function.
+    // And the REPLACE is live end-to-end: the very next trigger builds a
+    // GENERIC request against the AUTOCOMPLETE endpoint/model — never
+    // talaria.nextEdit.endpoint, which the replaced NEXT source would have
+    // used.
     const calls = stubFetchAlwaysRewrites();
     host.activeTextEditor = makeEditor(makeDoc());
     registerTalariaNextEdit(makeContext(), guard, DEPS);
     await fireTrigger();
     expect(calls).toHaveLength(1);
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:11434/api/generate');
+    expect(must(calls[0]).url).not.toContain('11435');
+    expect(must(calls[0]).body.model).toBe('qwen2.5-coder:7b');
     expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
 
     expect(() => fimActivityRelay.requestStarted()).not.toThrow();
@@ -637,39 +654,43 @@ describe('R5 refusal round-trip (owner: turn ONE on, the second is refused, one 
   });
 });
 
-// ══════════════════════ Cold-start sanitize ═══════════════════════
+// ══════════════════════ Native-page edit round-trip ═══════════════════════
 
-describe('R5 cold-start sanitize (owner: a hand-edited both-on store is unrepresentable)', () => {
+describe('§5.5 native-page round-trip (a settings-UI edit to talaria.nextEdit.source flips the mode LIVE)', () => {
   beforeEach(resetAll);
 
-  it('a hand-edited both-on store resets to OFF, persists the reset, one notice, zero next-edit activity; FIM unaffected', async () => {
-    const { memento, updates, store } = makeRecordingMemento({ next: true, generic: true });
+  it('hydrated OFF: zero activity; an external config change to "generic" reaches the Guard, arms the lazy edit tracker, and the next edit burst builds a real request', async () => {
+    const recording = makeRecordingSourcePort('off');
+    const guard = await NextEditGuard.hydrate(recording.port, { reportFailure: DEPS.reportFailure });
 
-    const guard = await NextEditGuard.hydrate(memento, { reportFailure: DEPS.reportFailure });
-
-    expect(guard.getState()).toEqual({ next: false, generic: false });
-    expect(guard.getMode()).toBe('off');
-    expect(updates, 'the reset must be PERSISTED (exactly one Memento.update call)').toHaveLength(1);
-    expect(updates[0]?.value).toEqual({ next: false, generic: false });
-    expect(store.get('hermes.nextEdit.toggles')).toEqual({ next: false, generic: false });
-    expect(host.warnings).toHaveLength(1);
-    expect(host.warnings[0]).toBe(NEXT_EDIT_RESET_NOTICE);
-
-    const calls = stubFetchNeverCalled();
+    const offCalls = stubFetchNeverCalled();
     host.activeTextEditor = makeEditor(makeDoc());
     registerTalariaNextEdit(makeContext(), guard, DEPS);
 
     await fireTrigger();
-    expect(calls, 'a sanitized both-off store must build zero next-edit requests').toHaveLength(0);
+    expect(offCalls, 'source=off must build zero next-edit requests').toHaveLength(0);
 
-    // FIM unaffected: the sanitize must not have left the FIM activity relay
-    // in a broken state.
+    // The NATIVE settings-page edit: no requestToggle, no webview — the
+    // value moves in the store and `onDidChangeConfiguration` (modelled by
+    // the port fake) is the only signal. The Guard must push the derived
+    // state so the shell builds its lazy edit tracker, and the trigger must
+    // read the new mode on its next run.
+    recording.setExternally('generic');
+    expect(guard.getState()).toEqual({ next: false, generic: true });
+    expect(recording.sets, 'a native-page edit is not a Guard write — the Guard must not echo it back').toEqual(
+      [],
+    );
+
+    const calls = stubFetchAlwaysRewrites();
+    await fireTrigger();
+    expect(calls, 'the native-page flip must be LIVE — the next edit burst builds a request').toHaveLength(1);
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:11434/api/generate');
+    expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
+
+    // FIM unaffected throughout.
     expect(() => fimActivityRelay.requestStarted()).not.toThrow();
     expect(() => fimActivityRelay.resultShown(true)).not.toThrow();
     expect(() => fimActivityRelay.accepted()).not.toThrow();
-    await vi.advanceTimersByTimeAsync(400);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(calls).toHaveLength(0);
   });
 });
 
