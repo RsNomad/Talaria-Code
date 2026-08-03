@@ -351,14 +351,20 @@ export interface NextEditShellDeps {
  * THE toggle entry point — Task 13's webview `nextEdit.toggle` request calls
  * this, never `guard.requestToggle` directly.
  *
- * Two things wrap the Guard's own (pure, transport-blind) decision:
+ * Two things wrap the Guard's own (transport-blind) decision:
  *
  *  1. A generic toggle-ON against an unsupported FIM backend is refused HERE,
  *     before the Guard ratifies anything — the Guard knows nothing about
  *     transports, and a refusal that persisted first would leave a mode
- *     selected that can never produce a valid prompt.
+ *     selected that can never produce a valid prompt. Since Task 2 (§5.5/D7)
+ *     this is the ONLY refusal left on the webview path: mutual exclusion is
+ *     structural in the `talaria.nextEdit.source` enum, so the old
+ *     second-source conflict now RESOLVES with the replaced state. A
+ *     native-page edit that lands the unsupported combo is deliberately NOT
+ *     reverted — a settings store can always hold it, and the engine no-ops
+ *     with the one-shot `generic-unsupported-backend` warning in `trigger()`.
  *  2. The `08` §6.3 setup note fires on an ACCEPTED generic toggle-on, and
- *     only there: not on a refusal (either kind), not on toggle-off, not on
+ *     only there: not on a refusal, not on toggle-off, not on
  *     the NEXT source. Exactly one note per accepted gesture — it is emitted
  *     from this one site, so there is no second path that could double it.
  */
@@ -760,8 +766,8 @@ function toContentChangeLites(
 
 /**
  * Wires next-edit into VS Code. Called from `index.ts` beside
- * `registerTalariaAutocomplete`, with a Guard already hydrated from
- * `context.globalState`.
+ * `registerTalariaAutocomplete`, with a Guard already hydrated from the
+ * `talaria.nextEdit.source` config port (Task 2 §5.5).
  */
 export function registerTalariaNextEdit(
   context: vscode.ExtensionContext,

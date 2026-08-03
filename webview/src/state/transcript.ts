@@ -12,6 +12,7 @@
  */
 import type { ApprovalOption, Attachment, HostToWebview, Panel, PanelDataMap, PlanItem, WebviewState } from '../protocol';
 import { MAX_TABS } from '../protocol';
+import { foldSetupProgress } from '../panels/setupCards';
 import {
   DEFAULT_PRESET,
   INITIAL_STATE,
@@ -542,6 +543,7 @@ function foldPanelData(state: AppState, msg: Extract<HostToWebview, { type: 'pan
     case 'skills':
     case 'models':
     case 'settings':
+    case 'setup':
       return { ...state, globalPanels: setPanelSuccess(state.globalPanels, msg.panel, msg.data) };
     default:
       return assertExhaustivePanel(panel);
@@ -855,6 +857,15 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
     case 'error':
       return foldSessionScoped(state, msg.sessionId, msg.type, (tab) => foldTab(tab, msg));
 
+    // Task 10: CONNECTION-GLOBAL accumulation of the throttled
+    // `setup.progress` stream (Agent install log lines, FIM/RAG model pull
+    // bytes) — same posture as `nextEdit.state`/`backend.state` above (no
+    // sessionId; there is one Setup panel per connection, not one per chat
+    // tab). `foldSetupProgress` (setupCards.ts) is pure and independently
+    // tested (`SetupPanel.test.ts`); this fold just threads it through.
+    case 'setup.progress':
+      return { ...state, setupProgress: foldSetupProgress(state.setupProgress, msg) };
+
     default:
       return state;
   }
@@ -917,6 +928,9 @@ function assertReduceHandlesEveryRoutedMessage(
     case 'plan.update':
     case 'result.summary':
     case 'error':
+    // Task 10: see the matching `case 'setup.progress'` in `reduce()` above
+    // (folds into `AppState.setupProgress` via `foldSetupProgress`).
+    case 'setup.progress':
       return;
     default: {
       const exhaustive: never = msg;
@@ -1009,6 +1023,7 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
     case 'skills':
     case 'models':
     case 'settings':
+    case 'setup':
       return { ...state, globalPanels: reducePanelAction(state.globalPanels, action) };
     default:
       return assertExhaustivePanel(action.panel);

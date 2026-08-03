@@ -15,7 +15,7 @@ import { isLoopbackHost } from './backends/secureTransport';
 import { getTemplateForModel } from './templates';
 import { crossFileMode } from './context/mode';
 import { createHermesCrossFileContextService } from './context/contextService.vscode';
-import { NextEditGuard } from './nextedit/guard';
+import { createVsCodeNextEditConfigPort, NextEditGuard } from './nextedit/guard';
 import { fimActivityRelay, registerTalariaNextEdit, requestNextEditToggle } from './nextedit/shell.vscode';
 import type { NextEditShellDeps } from './nextedit/shell.vscode';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
@@ -253,12 +253,13 @@ export function registerTalariaAutocomplete(
   );
 
   // ── W5.1 Task 12: Next Edit Suggestions ────────────────────────────────────
-  // This composition root already holds `context`, and `context.globalState` is
-  // the capability's ONE store entry point (R5: the NEXT/Generic toggles are
-  // not settings — `settings.json` carries DATA only). Hydration is async
-  // (`Memento.update` is a Thenable), so registration lands on a later tick;
-  // until then `fimActivityRelay` above is still the no-op it was constructed
-  // as, so FIM behaves exactly as it did pre-next-edit.
+  // Task 2 (§5.5): the on/off state lives in the `talaria.nextEdit.source`
+  // SETTING now — the Guard hydrates from the one config port
+  // (`createVsCodeNextEditConfigPort`), not from `globalState` (whose legacy
+  // key is drained once by `migrateNextEditToggles`, wired in `extension.ts`).
+  // Hydration stays async, so registration lands on a later tick; until then
+  // `fimActivityRelay` above is still the no-op it was constructed as, so FIM
+  // behaves exactly as it did pre-next-edit.
   //
   // The Guard instance is also what Task 13's webview `nextEdit.toggle`
   // request will need — routed through `requestNextEditToggle`
@@ -266,6 +267,7 @@ export function registerTalariaAutocomplete(
   // unsupported-FIM-backend refusal and the Generic setup note cannot be
   // bypassed.
   let nextEditDisposable: vscode.Disposable | undefined;
+  let nextEditGuard: NextEditGuard | undefined;
   let nextEditTornDown = false;
   // Hoisted so the toggle port below and `registerTalariaNextEdit` share ONE
   // deps object: `requestNextEditToggle`'s Generic refusal must be decided
@@ -285,11 +287,16 @@ export function registerTalariaAutocomplete(
     // Generic with no reload and nothing new is loaded, watched, or stored.
     getAutocompleteApiKey: () => pickApiKey(secretApiKey, cfg.apiKey),
   };
-  void NextEditGuard.hydrate(context.globalState, { reportFailure }).then(
+  void NextEditGuard.hydrate(createVsCodeNextEditConfigPort(), { reportFailure }).then(
     (guard) => {
       // Registration lost the race with disposal (deactivate during startup):
-      // do not attach listeners to a torn-down activation.
-      if (nextEditTornDown) return;
+      // do not attach listeners to a torn-down activation — and release the
+      // Guard's own config-change subscription, which its constructor took.
+      if (nextEditTornDown) {
+        guard.dispose();
+        return;
+      }
+      nextEditGuard = guard;
       nextEditDisposable = registerTalariaNextEdit(context, guard, nextEditDeps);
       // W5.1 R5 (Task 13): publish the toggle capability to the webview's
       // view provider. `request` goes through `requestNextEditToggle` — NOT
@@ -322,6 +329,7 @@ export function registerTalariaAutocomplete(
       dispose: () => {
         nextEditTornDown = true;
         nextEditDisposable?.dispose();
+        nextEditGuard?.dispose();
       },
     },
   );

@@ -56,9 +56,9 @@ Talaria Code 在 VS Code 的原生侧边面板中提供一个 **智能体式（a
 | 要求 | 说明 |
 |---|---|
 | **VS Code** | `^1.125` |
-| **操作系统** | 主要目标为 **Linux**。mock 界面可在任意系统运行，但实时后端面向 Linux；其他平台目前未经测试。 |
-| **Hermes 代理** | Talaria Code 所驱动的后端（`hermes acp` + `python -m tui_gateway.entry`）。本扩展是 Hermes 的*客户端*。 |
-| **本地模型运行时** | **Ollama**、**vLLM** 或 **llama.cpp**，需提供：对话/代理模型（经由 Hermes）、FIM 补全模型（默认 `qwen2.5-coder:1.5b-base`），以及用于 RAG 的嵌入模型（默认 `qwen3-embedding:0.6b`）。 |
+| **操作系统** | 主要目标为 **Linux**（在 Fedora 上开发）。mock 界面可在任意系统运行，但实时后端面向 Linux；其他平台目前未经测试。 |
+| **Python + pipx** | `PATH` 中需有 Python **3.11–3.13** 与 **pipx**。**Backend Setup** 面板会通过 pipx 为你安装 Hermes 代理 —— 本扩展仍是 Hermes 的*客户端*。在 Fedora 上：`sudo dnf install pipx`。 |
+| **本地模型运行时** | **Ollama**、**vLLM** 或 **llama.cpp**，需提供：对话/代理模型（经由 Hermes）、FIM 补全模型（默认 `qwen2.5-coder:1.5b-base`），以及用于 RAG 的嵌入模型（默认 `qwen3-embedding:0.6b`）。Ollama 可在 Setup 面板中被检测并拉取其模型。 |
 
 ## 安装
 
@@ -74,22 +74,65 @@ code --install-extension talaria-code-*.vsix
 
 ## 快速开始
 
-1. 安装并运行 **Hermes** 代理与一个 **模型运行时**（例如带上述模型的 Ollama）。
-2. 从活动栏打开 **Talaria** 面板。
-3. 将扩展指向你的 Hermes 安装，然后把 `talaria.backend` 从 `mock` 切换为 `acp`（见「配置」）。
+Talaria Code 从**一个面板**完成后端的安装与接线 —— 无需手改 JSON，也无需手动安装
+Python。
 
-首次运行时，扩展会使用脚本化的 **mock** 后端，让你在不启动 Hermes 进程的情况下浏览界面
-—— 它可在任意系统运行。切换为 `acp` 即可对接你的真实代理进入实时模式。
+1. **安装扩展**（`.vsix` —— 见[「安装」](#安装)）。
+2. **从活动栏打开 Talaria 面板**。首次运行时，**Backend Setup** 会自动打开。之后随时可
+   通过面板标题栏的**火箭图标**或 **`Talaria: Backend Setup`** 命令再次打开。
+3. **依次完成五张卡片** —— 每张都显示其状态、一个主操作，以及可展开的详情/日志：
+   - **Agent** —— 选择 **Hermes** 并点击 **Install Hermes**。面板会通过 pipx 安装
+     `hermes-agent[acp]`、验证安装、写入路径，并提供一键重载窗口以进入实时模式。
+     （OpenClaw 与 Talaria AI 显示为 *coming soon*。）
+   - **Provider** —— 点击 **Configure provider**，在终端中运行 Hermes 自带的设置向导，
+     选择代理所用的对话模型/提供方。Talaria 绝不会替你强制指定某个提供方。
+   - **Autocomplete (FIM)** —— 选择一个后端（Ollama / llama.cpp / vLLM / Codestral /
+     OpenAI 兼容）。对可本地部署的后端，卡片会先问：**「本地安装，还是连接到现有端点？」**
+     对 Ollama，它可检测守护进程并拉取默认模型（`qwen2.5-coder:1.5b-base`），带实时进度条。
+   - **Next Edit** *(可选)* —— 多行下一步编辑建议。**Generic** 复用你刚设好的 FIM 模型
+     （无需额外设置）；**Dedicated** 使用你在此单独设置的模型。
+   - **Codebase index (RAG)** *(可选)* —— 启用本地代码索引，并（在 Ollama 上）拉取嵌入
+     模型（`qwen3-embedding:0.6b`）。
 
-## 配置
+在你安装真实后端之前，扩展会使用脚本化的 **mock** 后端，让你在不启动代理进程的情况下浏览
+界面 —— 它可在任意系统运行。
 
-设置位于 **`talaria.*`** 命名空间下（Talaria Code 是 Hermes 客户端）。你通常会用到的：
+### 如实说明
+
+- **Python 与 pipx 是真实的先决条件。** 面板无法替你 `sudo`：在 Fedora 上，请先运行那条
+  被提示的命令 `sudo dnf install pipx`。Hermes 需要 Python **3.11–3.13**。
+- **安装 Hermes 会从 PyPI 下载约 300–500 MB** 到 `~/.local/share/pipx`。
+- **模型有数 GB 之大且受硬件限制。** FIM 模型约 1 GB，嵌入约 0.7 GB，而代理的对话模型可能
+  大得多。任何下载前都会显示大小，且不会自动拉取 —— 一键让*点击*变简单，却无法让下载变小或
+  凭空变出 GPU。
+- **llama.cpp/vLLM 的本地安装是有引导的，而非静默的。** Ollama 是干净的单脚本安装；
+  llama.cpp 与 vLLM 需要你自己做构建/硬件决策，卡片对此有说明。「一键」是指：我们打开正确的
+  终端命令，并把其后的一切（拉取、配置、探测）都自动化。
+- **重载窗口会激活代理**（首次开启时）。
+
+## 设置
+
+Talaria Code 的配置只有**一个事实来源** —— `talaria.*` 的 VS Code 设置（外加用于 API
+密钥的 VS Code SecretStorage）。每个界面都只是该来源的一个视图，因此**没有任何重复，每一项
+设置都恰好只有一个归属。** 共有两个界面，按*设置的归属者*划分：
+
+### Talaria Config —— 扩展自身的设置
+
+全部 `talaria.*` 键：代理后端与 Hermes 连接、自动补全（FIM）、Next Edit，以及代码库索引
+（RAG）。可用两种等价方式编辑 —— 二者写入的是同一批设置，任选其一：
+
+- **Backend Setup 面板**（友好方式）：上面那五张卡片。
+- **原生设置页** —— 运行 **`Talaria: Open Settings`** 命令，或搜索
+  `@ext:syntinal.talaria-code`。它被组织为五个带标题的分区：**Backend & Agent**、
+  **Autocomplete (FIM)**、**Next Edit**、**RAG (Codebase Index)** 与 **Advanced**。
+
+你通常会用到的设置：
 
 | 设置项 | 默认值 | 作用 |
 |---|---|---|
-| `talaria.backend` | `mock` | 与哪个代理后端通信。设为 `acp` 以使用真实的 Hermes 后端。 |
-| `talaria.hermesPath` | `""` | `hermes` 可执行文件的绝对路径。 |
-| `talaria.pythonPath` | `""` | 用于启动真实 Hermes 后端的 Python 解释器。 |
+| `talaria.backend` | `mock` | 与哪个代理后端通信。设为 `acp` 以使用真实的 Hermes 后端（Setup 面板会替你完成）。 |
+| `talaria.hermesPath` | `""` | `hermes` 可执行文件的绝对路径（由安装器写入）。 |
+| `talaria.pythonPath` | `""` | 用于启动真实 Hermes 后端的 Python 解释器（由安装器写入）。 |
 | `talaria.cwd` | `""` | 代理的工作目录（默认取第一个工作区文件夹）。 |
 | `talaria.autocomplete.enabled` | `true` | 启用行内（FIM）补全。 |
 | `talaria.autocomplete.backend` | `ollama` | 提供补全服务的后端。 |
@@ -99,7 +142,14 @@ code --install-extension talaria-code-*.vsix
 | `talaria.rag.embedEndpoint` | `http://127.0.0.1:11434` | 嵌入后端的基础 URL。 |
 | `talaria.rag.embedModel` | `qwen3-embedding:0.6b` | 用于嵌入代码片段的模型。 |
 
-完整设置见设置界面（搜索 `talaria`）。
+会重定向可执行文件或模型端点的设置为 **machine 作用域**，因此你打开的某个工作区无法悄悄改动
+它们；API 密钥存于 VS Code SecretStorage，绝不以明文写入设置。完整设置见原生设置页。
+
+### Agent Config —— Hermes 代理的运行时设置
+
+Hermes 自身的运行时配置 —— 批准策略、最大回合数、委派、检查点、安全 —— 位于 Talaria 面板内
+的 **「Agent config」** 标签页。这些是*代理*的设置（其 `config.yaml`，经由控制通道编辑），
+而非 `talaria.*` 扩展设置 —— 这正是它们各有归属、绝不与 Talaria Config 界面重复的原因。
 
 ## 工作原理
 
@@ -116,6 +166,23 @@ React 18 的 **webview** 面板（Vite → `dist/webview/`）。二者通过单�
 `postMessage` 协议通信 —— webview 从不直接接触 Node 或 VS Code API。host 通过 ACP
 驱动 Hermes 代理完成对话、编辑、工具与 MCP；而行内补全与代码嵌入则**直接**访问你所
 配置的模型端点。
+
+## 手动设置（进阶）
+
+Backend Setup 面板并非必需 —— 它写入的一切都是普通的 `talaria.*` 设置，若你更愿意自己接线，
+也可手动完成：
+
+1. **自行安装 Hermes 代理**，例如
+   `pipx install "hermes-agent[acp]==0.18.2"`（`[acp]` extra 是必需的，否则 `hermes acp`
+   会在导入时失败），或使用 Hermes 自带的安装器。
+2. **让扩展指向它**：把 `talaria.hermesPath` 设为 `hermes` 可执行文件，把
+   `talaria.pythonPath` 设为对应的解释器。若通过 pipx 安装，二者都位于
+   `~/.local/share/pipx/venvs/hermes-agent/bin/`。
+3. **进入实时模式**：把 `talaria.backend` 设为 `acp` 并重载窗口。
+4. **配置对话模型/提供方**，使用 Hermes 自带的向导：`hermes-acp --setup`。
+5. **运行一个模型运行时**（Ollama / vLLM / llama.cpp），并把 `talaria.autocomplete.*`
+   与 `talaria.rag.*` 各键设为你的端点与模型（默认：FIM `qwen2.5-coder:1.5b-base`，
+   嵌入 `qwen3-embedding:0.6b`）。
 
 ## 参与开发
 

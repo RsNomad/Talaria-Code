@@ -1,26 +1,40 @@
 /**
- * nextedit/guard.ts — Job B Task 12 · THE Guard (R5).
+ * nextedit/guard.ts — THE Guard (R5), re-based onto the setting
+ * (onboarding/setup wave Task 2 · plan §5.5 · decision D7).
  *
- * The NEXT/Generic toggles are NOT VS Code settings (owner: «юзер пишет
- * Endpoint, а не состояние True/False»). `settings.json` carries DATA only
- * (endpoint, model, transport — `config.ts`); the on/off STATE lives in the
- * extension's own store, `ExtensionContext.globalState`, under the one key
- * declared below. This module is the single WRITER and the single READER of
- * that key — nothing else in `src/` may name it (locked exhaustively in Task
- * 14; a lighter version of the same sweep ships in `guard.test.ts`).
+ * The NEXT/Generic on-off state used to live in `ExtensionContext.globalState`
+ * under `hermes.nextEdit.toggles`. That parallel store is gone: the single
+ * source of truth is now the `talaria.nextEdit.source` enum setting
+ * (`'off' | 'dedicated' | 'generic'`, machine scope, default `'off'`,
+ * declared in package.json's "Next Edit" section and trust-restricted). Both
+ * surfaces — the webview toggle rows AND the native settings page — edit that
+ * ONE key; native-page edits flow back into the rows for free through
+ * `onDidChangeConfiguration`.
  *
- * `setKeysForSync` is deliberately NOT called: these toggles are
- * hardware-bound (they select which local model serves next-edit) and must
- * not roam between machines via Settings Sync.
+ * Mutual exclusion is STRUCTURAL now (D7): one enum value cannot hold two
+ * "on" sources, so toggling the second source on REPLACES the first. The old
+ * refusal path (and its copy) is gone from this module. The one refusal that
+ * survives — "Generic on a FIM backend with no generic-NEXT support" — is a
+ * transport concern and stays in `shell.vscode.ts`'s `requestNextEditToggle`
+ * for the webview gesture; a native-page edit that lands that combo is NOT
+ * reverted (a settings store can always hold it) — the engine no-ops with the
+ * existing one-shot warning (`resolveRoute`'s `generic-unsupported-backend`
+ * arm).
  *
- * All decision logic is the pure half in `mode.ts`
- * (`sanitizeStoredToggles`/`applyToggleRequest`/`resolveNextEditMode`) — this
- * class contributes exactly three things a pure function cannot: persistence,
- * SERIALIZATION (the promise queue below), and user-visible alerts.
+ * The Guard talks to the setting through the narrow {@link NextEditConfigPort}
+ * seam, so all of its logic is testable against an in-memory fake with no
+ * live VS Code — and, F-7 by construction, the toggle control needs NO agent
+ * connected: settings need no agent.
  *
- * No re-entrancy exists by construction: `Memento` fires no change events
- * (`index.d.ts:8587-8624` has no listener surface), so a `state.update` here
- * can never loop back into this class.
+ * The legacy `globalState` key survives in exactly one place: the one-time
+ * migration ({@link migrateNextEditToggles}, §5.3), wired once at activation
+ * in `extension.ts`. This module remains the ONLY one allowed to name either
+ * key literal (locked in `guard.test.ts` and `coexistence.lock.test.ts`).
+ *
+ * `setKeysForSync` is still never called anywhere (locked in
+ * `guard.test.ts`): the setting is machine-scoped — VS Code itself does not
+ * roam machine-scoped settings — and nothing may reopen roaming for the
+ * legacy memento key either.
  *
  * Field-by-field object construction only, no object-spread-with-override —
  * this file is in scope for `context/ringBuffer.test.ts`'s repo-wide purity
@@ -28,210 +42,174 @@
  */
 import * as vscode from 'vscode';
 import {
-  applyToggleRequest,
   resolveNextEditMode,
   sanitizeStoredToggles,
   type NextEditMode,
-  type ToggleDecision,
   type ToggleRequest,
   type ToggleState,
 } from './mode';
 
-/** The ONE store key. Exported for the Guard's own tests and Task 14's lock;
- *  no other module may name it. */
+/**
+ * The LEGACY globalState key. Named ONLY for the one-time §5.3 migration —
+ * nothing reads or writes it outside {@link migrateNextEditToggles}. Exported
+ * for the Guard's own tests and the Task-14-style locks; no other module may
+ * name it.
+ */
 export const NEXT_EDIT_TOGGLES_KEY = 'hermes.nextEdit.toggles';
 
 /**
- * First run returns `undefined` from `Memento.get` (`index.d.ts:8602-8612`)
- * ⇒ this hardcoded default. Never persisted on first run: an untouched store
- * and a store explicitly holding both-off mean the same thing, and writing on
- * activation would be a pointless disk touch on every fresh profile.
- *
- * FROZEN (fix wave, Finding 1). `coerceStoredToggles` hands this exact object
- * back BY REFERENCE on every empty-or-malformed-store read below, and
- * `sanitizeStoredToggles` (`mode.ts`) passes a non-conflicting input straight
- * through by reference too — it does NOT always allocate a fresh literal, so
- * this singleton genuinely can reach a caller of `readCurrent()`. `getState()`'s
- * explicit copy is the primary defense against a caller mutating what it gets
- * back; freezing here is the secondary one, so a later edit that drops that
- * copy in good faith cannot corrupt the process-wide default for every Guard
- * that hydrates from an empty store afterward.
+ * The ONE setting key (full dotted name, as `affectsConfiguration` takes it).
+ * Exported for the Guard's own tests and the Task-14-style locks; no other
+ * module may name it — every read/write goes through the port below.
  */
-const DEFAULT_TOGGLES: ToggleState = Object.freeze({ next: false, generic: false });
+export const NEXT_EDIT_SOURCE_SETTING = 'talaria.nextEdit.source';
+
+/** The section/key split of {@link NEXT_EDIT_SOURCE_SETTING}, for
+ *  `getConfiguration(section).get/update(key, …)`. Derived, not restated, so
+ *  the three spellings cannot drift. */
+const SOURCE_SECTION = NEXT_EDIT_SOURCE_SETTING.slice(0, NEXT_EDIT_SOURCE_SETTING.lastIndexOf('.'));
+const SOURCE_KEY = NEXT_EDIT_SOURCE_SETTING.slice(NEXT_EDIT_SOURCE_SETTING.lastIndexOf('.') + 1);
+
+/** The enum the setting holds. Matches package.json's declaration exactly
+ *  (locked by `host/configurationSections.test.ts`). */
+export type NextEditSource = 'off' | 'dedicated' | 'generic';
 
 /**
- * The two Settings-panel row labels, verbatim (`08` §8's row table;
- * `webview/src/panels/SettingsPanel.tsx`). The refusal copy interpolates
- * these and nothing else — see {@link REFUSAL_MESSAGES}.
+ * The seam the Guard (and the §5.3 migration) reads/writes the setting
+ * through. The one production implementation is
+ * {@link createVsCodeNextEditConfigPort}; tests inject in-memory fakes.
  */
-const NEXT_ROW_LABEL = 'Next Edit — dedicated model';
-const GENERIC_ROW_LABEL = 'Next Edit — Generic via your FIM model';
+export interface NextEditConfigPort {
+  get(): NextEditSource;
+  set(value: NextEditSource): Promise<void>;
+  onDidChange(cb: () => void): { dispose(): void };
+}
 
 /**
- * Refusal copy, pinned by the brief:
- * `"Next Edit: turn off <the other toggle> first — the two sources are
- * mutually exclusive."` — `refused-next` means the NEXT toggle-on was
- * refused, so the toggle to turn off is the OTHER one (Generic), and
- * vice-versa.
- *
- * U-6: `<the other toggle>` is the OTHER ROW'S LABEL, exactly as `08` §8
- * specifies ("with `<the other toggle>` filled with the other row's label").
- * It used to read "turn off NEXT first" / "turn off Generic first", and
- * neither "NEXT" nor "Generic" appears anywhere on screen — the rows are
- * titled "Next Edit — dedicated model" and "Next Edit — Generic via your FIM
- * model", so the user had to guess which row was being named. This string is
- * shown in two places at once (the host toast and, verbatim, the refused
- * row's inline error), which is precisely why it must name what the user is
- * looking at.
+ * A settings store can hold anything (`settings.json` is hand-editable), so
+ * the read coerces: anything that is not exactly `'dedicated'` or `'generic'`
+ * degrades to `'off'` — fail-closed, never throwing, and never letting a
+ * truthy garbage value enable a source. The old Memento-era
+ * `coerceStoredToggles` posture, carried to the new store.
  */
-const REFUSAL_MESSAGES: Readonly<Record<'refused-next' | 'refused-generic', string>> = Object.freeze({
-  'refused-next': `Next Edit: turn off "${GENERIC_ROW_LABEL}" first — the two sources are mutually exclusive.`,
-  'refused-generic': `Next Edit: turn off "${NEXT_ROW_LABEL}" first — the two sources are mutually exclusive.`,
-});
+function coerceNextEditSource(raw: unknown): NextEditSource {
+  return raw === 'dedicated' || raw === 'generic' ? raw : 'off';
+}
 
 /**
- * The one notice a cold-start sanitize emits. Copy is this task's own (the
- * brief pins only "plus one notice"): it names what was found, what was done,
- * and why, without blaming the user — a both-on store is only reachable by
- * hand-editing `globalState` or by a future bug, never by the UI.
+ * The real port, over `vscode.workspace`:
+ *  - `get` reads FRESH through `getConfiguration` on every call (a
+ *    `WorkspaceConfiguration` is a snapshot, so caching one would go stale);
+ *  - `set` writes at `ConfigurationTarget.Global` — the key is machine-scoped
+ *    (it steers where editor context is sent), so Global is the only target
+ *    that can hold it;
+ *  - `onDidChange` filters `onDidChangeConfiguration` through
+ *    `affectsConfiguration(NEXT_EDIT_SOURCE_SETTING)`, which fires for BOTH
+ *    our own `set` and a native settings-page edit — one event source for
+ *    every writer, which is what makes native edits reach the webview rows.
  */
-export const NEXT_EDIT_RESET_NOTICE =
-  'Next Edit Suggestions: the stored NEXT/Generic state had both sources on. They are mutually exclusive, so both have been turned off.';
+export function createVsCodeNextEditConfigPort(): NextEditConfigPort {
+  return {
+    get: () =>
+      coerceNextEditSource(
+        vscode.workspace.getConfiguration(SOURCE_SECTION).get<string>(SOURCE_KEY, 'off'),
+      ),
+    set: async (value: NextEditSource): Promise<void> => {
+      await vscode.workspace
+        .getConfiguration(SOURCE_SECTION)
+        .update(SOURCE_KEY, value, vscode.ConfigurationTarget.Global);
+    },
+    onDidChange: (cb: () => void) =>
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration(NEXT_EDIT_SOURCE_SETTING)) {
+          cb();
+        }
+      }),
+  };
+}
+
+/** enum → the `{next, generic}` pair the rest of the feature (and the webview
+ *  protocol) speaks. Always a FRESH object — callers may mutate their copy. */
+function toToggleState(source: NextEditSource): ToggleState {
+  return { next: source === 'dedicated', generic: source === 'generic' };
+}
+
+/**
+ * One toggle gesture as an enum transition — the whole of what used to be
+ * `applyToggleRequest` plus the refusal machinery:
+ *  - toggle-ON simply BECOMES that source (structural exclusion: assigning
+ *    one enum value is what replaces the other — there is no conflict state
+ *    to refuse);
+ *  - toggle-OFF of the ACTIVE source goes to `'off'`;
+ *  - toggle-OFF of an INACTIVE source changes nothing (same as the old
+ *    `withToggle(state, source, false)` on an already-false field).
+ */
+function applyToggleToSource(current: NextEditSource, req: ToggleRequest): NextEditSource {
+  const own: NextEditSource = req.source === 'next' ? 'dedicated' : 'generic';
+  if (req.on) return own;
+  return current === own ? 'off' : current;
+}
 
 export interface NextEditGuardDeps {
   reportFailure(msg: string): void;
 }
 
-/**
- * T-6 sweep pair: derives the {@link REFUSAL_MESSAGES} key for a REFUSED
- * decision. `applyToggleRequest`'s contract (`mode.ts:44-49`) guarantees
- * `decision.alert` is non-null whenever `decision.result === 'refused'` —
- * but `ToggleDecision.alert`'s TYPE (`'refused-next' | 'refused-generic' |
- * null`) can't express that guarantee, since `alert` and `result` are two
- * independent fields on the same object rather than a discriminated union.
- * `applyOne` therefore still needs a defensive fallback for the
- * (structurally-possible, contractually-unreachable) `alert: null` case.
- *
- * The fallback derives from `req.source` using the SAME conditional
- * `applyToggleRequest` itself uses to populate `alert` in the first place
- * (`req.source === 'next' ? 'refused-next' : 'refused-generic'`) — so even
- * that unreachable branch names the row that is ACTUALLY conflicting,
- * rather than a value hardcoded independent of what was being refused. The
- * OLD code hardcoded `'refused-next'` for a null `alert` unconditionally,
- * which — had this branch ever been reached — would have told the user to
- * turn off the WRONG row whenever `req.source` was 'generic'.
- *
- * `Pick`-typed on both parameters so a minimal literal is enough at any
- * call site (including a synthetic one in a test — the real
- * `applyToggleRequest` can never produce the `alert: null` input this
- * fallback exists for).
- */
-export function refusalAlertKey(
-  decision: Pick<ToggleDecision, 'alert'>,
-  req: Pick<ToggleRequest, 'source'>,
-): 'refused-next' | 'refused-generic' {
-  return decision.alert ?? (req.source === 'next' ? 'refused-next' : 'refused-generic');
-}
-
-/**
- * Coerces an unknown stored value into a `ToggleState`. A store that was
- * hand-edited into a non-boolean (or a value written by a future/older
- * schema) degrades field-by-field to `false` rather than throwing on
- * activation or, worse, letting a truthy string enable a source.
- */
-function coerceStoredToggles(stored: unknown): ToggleState {
-  if (typeof stored !== 'object' || stored === null) {
-    return DEFAULT_TOGGLES;
-  }
-  const record = stored as Record<string, unknown>;
-  return { next: record.next === true, generic: record.generic === true };
-}
-
 export class NextEditGuard {
-  /**
-   * The LAST value this Guard wrote — the serialization queue's working
-   * value, and NOT the authority. The authority is the store (see
-   * `readCurrent`): a second window on the same profile can ratify a
-   * different state, and `ExtensionMemento` refreshes its cached value from
-   * an internal storage event, so a re-read is correct where a cached field
-   * is stale. Never make a decision from this field.
-   *
-   * Fix wave, Finding 3: `notify()` no longer reads this field either — it
-   * reads through like every other consumer. `lastWritten` now backs exactly
-   * one thing: `applyOne`'s own return value, the direct answer to THIS
-   * caller's own request.
-   */
-  private lastWritten: ToggleState;
-
   /** The serialization queue. Always settled-and-value-less, so one caller's
-   *  refusal can never reject the NEXT caller's turn (see `requestToggle`). */
+   *  failed settings write can never reject the NEXT caller's turn. */
   private queue: Promise<void> = Promise.resolve();
 
   private readonly listeners = new Set<(s: ToggleState) => void>();
 
+  /**
+   * The last value PUSHED to listeners — a dedupe cursor, NOT an authority.
+   * Every read path (`getState`/`getMode`) goes through `config.get()`
+   * fresh; this field only stops the config-change event from re-pushing a
+   * value the listeners already have (the event can fire for our own write
+   * AND for section-level changes that did not move this key).
+   */
+  private lastPushed: NextEditSource;
+
+  private readonly configSubscription: { dispose(): void };
+
   private constructor(
-    private readonly state: vscode.Memento,
-    accepted: ToggleState,
+    private readonly config: NextEditConfigPort,
+    private readonly deps: NextEditGuardDeps,
   ) {
-    this.lastWritten = accepted;
+    this.lastPushed = config.get();
+    // THE one notification source. Our own `set` and a native-page edit both
+    // land here (the real port's event fires for both), so `applyOne` below
+    // deliberately does NOT push a second time.
+    this.configSubscription = config.onDidChange(() => this.notify());
   }
 
   /**
-   * THE read path. The store is the authority; this class caches nothing for
-   * decisions.
-   *
-   * Sanitizes SILENTLY and persists NOTHING: the alerting, persisting
-   * sanitize belongs to `hydrate` and only to `hydrate`. If this method ever
-   * writes or warns, it has become a second writer and R5's single-writer
-   * invariant is gone.
-   *
-   * `Memento.get` is SYNCHRONOUS (`index.d.ts:8602`, `:8612` — returns
-   * `T | undefined` / `T`, not a Thenable), which is the entire reason this
-   * is affordable: no call site becomes async.
+   * Async for call-site stability (hydration has been a `.then` continuation
+   * since Task 12 and the activation-race guard in `autocomplete/index.ts`
+   * depends on it landing on a later tick) — there is nothing left to await:
+   * the setting needs no sanitize (an enum cannot hold two "on" values, and
+   * the port coerces garbage to `'off'` on read) and no cold-start write.
    */
-  private readCurrent(): ToggleState {
-    const stored = coerceStoredToggles(this.state.get(NEXT_EDIT_TOGGLES_KEY));
-    return sanitizeStoredToggles(stored).accepted;
-  }
-
-  /**
-   * Hydrates through `sanitizeStoredToggles`. If it reports `didReset`, the
-   * reset is PERSISTED («скинет в OFF» — so the next cold start does not
-   * rediscover the same conflict) and reported once, both to the output
-   * channel (`deps.reportFailure`) and to the user (one warning).
-   */
-  static async hydrate(state: vscode.Memento, deps: NextEditGuardDeps): Promise<NextEditGuard> {
-    const stored = coerceStoredToggles(state.get(NEXT_EDIT_TOGGLES_KEY));
-    const { accepted, didReset } = sanitizeStoredToggles(stored);
-
-    if (didReset) {
-      await state.update(NEXT_EDIT_TOGGLES_KEY, accepted);
-      deps.reportFailure(NEXT_EDIT_RESET_NOTICE);
-      void vscode.window.showWarningMessage(NEXT_EDIT_RESET_NOTICE);
-    }
-
-    return new NextEditGuard(state, accepted);
+  static async hydrate(config: NextEditConfigPort, deps: NextEditGuardDeps): Promise<NextEditGuard> {
+    return new NextEditGuard(config, deps);
   }
 
   /**
    * Serialized toggle application. Two callers arriving in the same tick are
    * served in order, and the second decides against the FIRST's ratified
-   * state — without this queue both would read the same pre-decision snapshot
-   * and both could be accepted, persisting exactly the both-on conflict R5
-   * exists to make unreachable.
+   * value — the queue survives the re-base because `config.set` is async and
+   * two interleaved read-then-write pairs could still race each other.
    *
-   * On `'refused'`: nothing is persisted, one warning is shown, and the
-   * returned promise REJECTS with that same message (the correlated webview
-   * request rejects in turn, so the toggle visibly rolls back). One alert per
-   * refusal — a deliberate retry is a NEW user gesture and re-alerts. The
-   * `provider.ts` Set-keyed one-shot is deliberately NOT reused here: it
-   * would silence exactly the retry the user needs feedback on.
+   * No refusal path: mutual exclusion is structural (see the module doc).
+   * The returned promise rejects only if the settings WRITE itself fails —
+   * reported once to the output channel, and propagated so the webview row
+   * visibly rolls back instead of showing a state that never persisted.
    */
   requestToggle(req: ToggleRequest): Promise<ToggleState> {
     const run = this.queue.then(() => this.applyOne(req));
     // The queue itself must stay a RESOLVED chain: swallow the outcome here
-    // (the caller owns `run`'s rejection) so a refusal cannot cascade into
-    // the next caller's turn, and so no unhandled rejection escapes.
+    // (the caller owns `run`'s rejection) so a failed write cannot cascade
+    // into the next caller's turn, and no unhandled rejection escapes.
     this.queue = run.then(
       () => undefined,
       () => undefined,
@@ -240,61 +218,47 @@ export class NextEditGuard {
   }
 
   private async applyOne(req: ToggleRequest): Promise<ToggleState> {
-    const decision = applyToggleRequest(this.readCurrent(), req);
-
-    if (decision.result === 'refused') {
-      // T-6 sweep pair: see `refusalAlertKey`'s doc comment — the fallback
-      // it applies for a (contractually-unreachable) null `decision.alert`
-      // now derives from `req.source`, not a hardcoded row.
-      const message = REFUSAL_MESSAGES[refusalAlertKey(decision, req)];
-      void vscode.window.showWarningMessage(message);
-      throw new Error(message);
+    const current = this.config.get();
+    const next = applyToggleToSource(current, req);
+    if (next !== current) {
+      try {
+        await this.config.set(next);
+      } catch (err) {
+        this.deps.reportFailure(
+          `[nextEdit] could not write ${NEXT_EDIT_SOURCE_SETTING}: ${String(err)}`,
+        );
+        throw err;
+      }
     }
-
-    // `update` returns a Thenable (`index.d.ts:8623`) — awaited so the
-    // ratified state is never ahead of the store.
-    await this.state.update(NEXT_EDIT_TOGGLES_KEY, decision.accepted);
-    this.lastWritten = decision.accepted;
-    this.notify();
-    return this.lastWritten;
+    // Read through, never echo `next` back: the store is the authority, and
+    // by the time the write resolved another window could have moved it.
+    return toToggleState(this.config.get());
   }
 
-  /**
-   * Fix wave, Finding 3: reads through like every other consumer of this
-   * class. `lastWritten` is only THIS transaction's own write; by the time
-   * listeners run, a cross-window race could already have moved the store
-   * further, and pushing `lastWritten` would then hand the panel a value
-   * `getState()` would immediately contradict. Reading through costs one
-   * more `Memento.get` per accepted toggle and keeps the push consistent
-   * with the store, the single authority everywhere else in this class.
-   */
+  /** Push the CURRENT derived state — deduped via `lastPushed` (see its doc). */
   private notify(): void {
-    const current = this.readCurrent();
+    const current = this.config.get();
+    if (current === this.lastPushed) return;
+    this.lastPushed = current;
     for (const listener of [...this.listeners]) {
-      listener(current);
+      // A fresh object per listener: no shared value a callback could mutate
+      // out from under its siblings.
+      listener(toToggleState(current));
     }
   }
 
   getState(): ToggleState {
-    // A copy — LOAD-BEARING, not merely defensive: on an empty or malformed
-    // store, `readCurrent()` returns `DEFAULT_TOGGLES` itself (`coerceStoredToggles`
-    // hands it back by reference; `sanitizeStoredToggles` passes a
-    // non-conflicting input through by reference too — see the field's own
-    // comment). Without this copy, a caller mutating the returned object would
-    // mutate that module-level singleton, and every Guard that ever hydrates
-    // from an empty store afterward would inherit the corruption. Confirmed by
-    // mutation (fix wave, Finding 1): dropping this copy is caught only by the
-    // `getState()` singleton-escape probe in `guard.test.ts`.
-    const current = this.readCurrent();
-    return { next: current.next, generic: current.generic };
+    return toToggleState(this.config.get());
   }
 
   getMode(): NextEditMode {
-    const current = this.readCurrent();
+    const current = this.getState();
     return resolveNextEditMode(current.next, current.generic);
   }
 
-  /** Feeds the webview's state push (Task 13). Fires only on ACCEPTED changes. */
+  /** Feeds the webview's state push and the shell's lazy edit-tracker build.
+   *  Fires on every genuine value change — our own accepted toggles AND
+   *  native-page edits, one event source for both. */
   onDidChange(listener: (s: ToggleState) => void): vscode.Disposable {
     this.listeners.add(listener);
     return {
@@ -303,4 +267,69 @@ export class NextEditGuard {
       },
     };
   }
+
+  /** Releases the config-change subscription. Wired into the autocomplete
+   *  zone's composite disposable at the composition root. */
+  dispose(): void {
+    this.configSubscription.dispose();
+    this.listeners.clear();
+  }
+}
+
+/**
+ * Coerces an unknown stored value into a `ToggleState` — the legacy store was
+ * hand-editable, so a non-boolean degrades field-by-field to `false` rather
+ * than throwing or letting a truthy string enable a source. Kept ONLY for the
+ * migration below.
+ */
+function coerceStoredToggles(stored: unknown): ToggleState {
+  if (typeof stored !== 'object' || stored === null) {
+    return { next: false, generic: false };
+  }
+  const record = stored as Record<string, unknown>;
+  return { next: record.next === true, generic: record.generic === true };
+}
+
+/**
+ * The one-time §5.3 migration: `globalState['hermes.nextEdit.toggles']` →
+ * `talaria.nextEdit.source`. Runs once at activation (`extension.ts`);
+ * idempotent by the LATCH: the memento delete is the latch, so a second run
+ * (and every activation after) finds no memento key and returns immediately.
+ *
+ *  - Memento absent → complete no-op (fresh install, or already migrated).
+ *  - Setting still default `'off'` → write `next ? 'dedicated' : generic ?
+ *    'generic' : 'off'` at Global, then delete the memento key. A computed
+ *    `'off'` skips the write — the setting already reads `'off'`, and writing
+ *    the default explicitly would only churn the user's settings.json.
+ *  - Setting already NON-default → the user has expressed a preference since
+ *    (or another window migrated first): delete the memento WITHOUT
+ *    overwriting the setting.
+ *  - A legacy BOTH-ON store (the old hand-edited conflict) sanitizes to OFF —
+ *    byte-for-byte the outcome the old cold-start reset produced, never a
+ *    silent pick of one source.
+ *
+ * ORDER MATTERS, and it is the fail-safe: the setting is written BEFORE the
+ * memento is deleted, so a failed write leaves the latch intact and the next
+ * activation retries — a burned latch with nothing migrated would silently
+ * turn a beta user's NEXT off forever.
+ *
+ * `Memento.update(key, undefined)` REMOVES the key (API-pinned: "using
+ * `undefined` as value removes the key from the underlying storage").
+ */
+export async function migrateNextEditToggles(
+  state: vscode.Memento,
+  config: NextEditConfigPort,
+): Promise<void> {
+  const stored = state.get(NEXT_EDIT_TOGGLES_KEY);
+  if (stored === undefined) return; // the latch: nothing to migrate
+
+  if (config.get() === 'off') {
+    const { accepted } = sanitizeStoredToggles(coerceStoredToggles(stored));
+    const source: NextEditSource = accepted.next ? 'dedicated' : accepted.generic ? 'generic' : 'off';
+    if (source !== 'off') {
+      await config.set(source);
+    }
+  }
+
+  await state.update(NEXT_EDIT_TOGGLES_KEY, undefined);
 }

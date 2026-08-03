@@ -266,8 +266,14 @@ vi.mock('../context/editTrackerAdapter', async () => {
 });
 
 import { registerTalariaNextEdit, fimActivityRelay } from './shell.vscode';
-import { NextEditGuard, NEXT_EDIT_TOGGLES_KEY } from './guard';
-import { applyToggleRequest, type ToggleRequest, type ToggleState } from './mode';
+import {
+  NextEditGuard,
+  NEXT_EDIT_TOGGLES_KEY,
+  NEXT_EDIT_SOURCE_SETTING,
+  type NextEditConfigPort,
+  type NextEditSource,
+} from './guard';
+import type { ToggleRequest, ToggleState } from './mode';
 import { collectNonTestTsSources, type ScannableSource } from '../../host/purityScan';
 
 // ───────────────────────────── scan infrastructure ───────────────────────────
@@ -518,27 +524,52 @@ function makeEditor(document: FakeDocument, cursorLine = 10): FakeEditor {
   };
 }
 
-interface RecordingMemento {
-  readonly memento: vscodeTypes.Memento;
-  readonly updates: { key: string; value: unknown }[];
-  readonly store: Map<string, unknown>;
+/** Task 2 (§5.5): the Guard hydrates from the `talaria.nextEdit.source` enum
+ *  through a config port now. This RECORDING fake stands in for it — every
+ *  `set()` is captured, and `setExternally` models a native settings-page
+ *  edit (value moves + the change event fires). Plain functions only. */
+interface RecordingSourcePort {
+  readonly port: NextEditConfigPort;
+  readonly sets: NextEditSource[];
+  setExternally(v: NextEditSource): void;
+  value(): NextEditSource;
 }
 
-/** A real in-memory Memento that RECORDS its writes — plain functions only. */
-function makeRecordingMemento(seed?: ToggleState): RecordingMemento {
-  const store = new Map<string, unknown>();
-  const updates: { key: string; value: unknown }[] = [];
-  if (seed) store.set(NEXT_EDIT_TOGGLES_KEY, seed);
-  const memento = {
-    keys: () => [...store.keys()],
-    get: (<T>(key: string, dflt?: T): T | undefined =>
-      (store.has(key) ? (store.get(key) as T) : dflt)) as vscodeTypes.Memento['get'],
-    update: async (key: string, value: unknown): Promise<void> => {
-      updates.push({ key, value });
-      store.set(key, value);
+function makeRecordingSourcePort(initial: NextEditSource = 'off'): RecordingSourcePort {
+  let value = initial;
+  const sets: NextEditSource[] = [];
+  const listeners = new Set<() => void>();
+  const emit = (): void => {
+    for (const listener of [...listeners]) listener();
+  };
+  return {
+    sets,
+    setExternally: (v) => {
+      value = v;
+      emit();
     },
-  } as vscodeTypes.Memento;
-  return { memento, updates, store };
+    value: () => value,
+    port: {
+      get: () => value,
+      set: async (v: NextEditSource): Promise<void> => {
+        sets.push(v);
+        value = v;
+        emit();
+      },
+      onDidChange: (cb: () => void) => {
+        listeners.add(cb);
+        return { dispose: () => void listeners.delete(cb) };
+      },
+    },
+  };
+}
+
+/** The legacy `{next, generic}` seeds, mapped onto the enum the store holds
+ *  now — keeps every scenario's setup readable as before. */
+function sourceOf(toggles?: ToggleState): NextEditSource {
+  if (toggles?.next) return 'dedicated';
+  if (toggles?.generic) return 'generic';
+  return 'off';
 }
 
 function makeContext(): vscodeTypes.ExtensionContext {
@@ -546,7 +577,7 @@ function makeContext(): vscodeTypes.ExtensionContext {
 }
 
 async function setupShell(toggles: ToggleState): Promise<vscodeTypes.Disposable> {
-  const guard = await NextEditGuard.hydrate(makeRecordingMemento(toggles).memento, {
+  const guard = await NextEditGuard.hydrate(makeRecordingSourcePort(sourceOf(toggles)).port, {
     reportFailure: SHELL_DEPS.reportFailure,
   });
   return registerTalariaNextEdit(makeContext(), guard, SHELL_DEPS);
@@ -1133,31 +1164,57 @@ describe('R3 LOCK: the Tab table — every next-edit keybinding when-clause EQUA
 // ══════════════════════════════════ R5 ═══════════════════════════════════════
 
 /**
- * R5 single-writer/single-reader. The toggles are NOT VS Code settings; their
- * state lives in `ExtensionContext.globalState` under ONE key, owned by the
- * Guard. Two independent scans pin that:
+ * R5 single-writer/single-reader, RE-BASED (Task 2, §5.5/D7). The toggle
+ * state lives in the `talaria.nextEdit.source` SETTING now, and the legacy
+ * `globalState` key survives only inside the one-time migration
+ * (`migrateNextEditToggles`, guard.ts). Three independent scans pin that:
  *
- *  1. The key LITERAL appears in exactly one non-test module — `guard.ts`.
- *  2. The `globalState` handle itself is reached in exactly one non-test
- *     module — `autocomplete/index.ts`, the composition root, which does
- *     nothing with it but hand it to `NextEditGuard.hydrate`.
+ *  1. The SETTING-key literal appears in exactly one non-test module —
+ *     `guard.ts` (the port + the locks' constant). Everybody else goes
+ *     through the port, so nobody can read/write the state around the Guard.
+ *  2. The LEGACY memento-key literal still appears in exactly one non-test
+ *     module — `guard.ts` (migration only).
+ *  3. The `globalState` handle itself is reached in exactly one non-test
+ *     module — `extension.ts`, which does nothing with it but hand it to
+ *     `migrateNextEditToggles` once at activation.
  *
- * Together those mean: nobody can read or write the toggle state without going
- * through the Guard, because nobody else can name the key OR obtain the store.
+ * Task 9 widening (onboarding-backend-setup-architecture.md §7): `Setup
+ * Controller.ts` + `setupHost.vscode.ts` now ALSO reach `context.globalState`
+ * — for an entirely DISJOINT key namespace (`talaria.setup.hermesInstall` /
+ * `.completed` / `.autoOpened`, none of which is a NEXT-edit key). This is a
+ * SECOND, independent globalState owner, not a bypass of the Guard's own
+ * `hermes.nextEdit.toggles` memento — the two scans (1)/(2) above still prove
+ * that (unchanged, still pinned to `guard.ts` alone), and `SetupController
+ * .ts` deliberately reads `talaria.nextEdit.source` through the Guard's own
+ * `NextEditConfigPort` accessor (`SetupControllerDeps.getNextEditSource`,
+ * bound in `setupHost.vscode.ts` to `createVsCodeNextEditConfigPort().get()`)
+ * rather than naming the key itself — see that interface's own doc. Scans
+ * (3)/(4) below are widened to the two NEW, named, justified reaches; a
+ * THIRD, unnamed module reaching globalState would still fail them.
  */
 const TOGGLES_KEY_LITERAL = /['"`]hermes\.nextEdit\.toggles['"`]/;
+const SOURCE_KEY_LITERAL = /['"`]talaria\.nextEdit\.source['"`]/;
 const GLOBAL_STATE_HANDLE = /\bglobalState\b/;
 const GLOBAL_STATE_DIRECT_ACCESS = /\bglobalState\s*\.\s*(?:get|update)\s*\(/;
+/** Task 9's two justified `globalState` reaches (disjoint key namespace — see the doc block above), sorted for order-independent comparison. */
+const SETUP_GLOBAL_STATE_MODULES = ['host/setup/SetupController.ts', 'host/setupHost.vscode.ts'];
 
 describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobody', () => {
-  it('the store-key literal appears in EXACTLY one non-test src/ module, and it is nextedit/guard.ts', () => {
+  it('the SETTING-key literal talaria.nextEdit.source appears in EXACTLY one non-test src/ module, and it is nextedit/guard.ts', () => {
     expect(
-      filesMatching(loadStripped(SRC_ROOT), TOGGLES_KEY_LITERAL),
-      'R5 failed: the hermes.nextEdit.toggles key literal must appear in EXACTLY one non-test module (guard.ts) — a second module naming the key is a potential bypass',
+      filesMatching(loadStripped(SRC_ROOT), SOURCE_KEY_LITERAL),
+      'R5 failed: the talaria.nextEdit.source key literal must appear in EXACTLY one non-test module (guard.ts, the one config port) — a second module naming the key is a potential bypass around the Guard',
     ).toEqual(['autocomplete/nextedit/guard.ts']);
   });
 
-  it('the exported constant really IS that literal (the scan and the runtime agree)', () => {
+  it('the LEGACY store-key literal appears in EXACTLY one non-test src/ module, and it is nextedit/guard.ts (migration only)', () => {
+    expect(
+      filesMatching(loadStripped(SRC_ROOT), TOGGLES_KEY_LITERAL),
+      'R5 failed: the hermes.nextEdit.toggles key literal must appear in EXACTLY one non-test module (guard.ts — the §5.3 migration) — a second module naming the key is a potential bypass',
+    ).toEqual(['autocomplete/nextedit/guard.ts']);
+  });
+
+  it('the exported constants really ARE those literals (the scans and the runtime agree)', () => {
     expect(
       NEXT_EDIT_TOGGLES_KEY,
       'R5 setup: the exported NEXT_EDIT_TOGGLES_KEY constant drifted from the literal this scan matches',
@@ -1166,33 +1223,47 @@ describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobo
       TOGGLES_KEY_LITERAL.test(`const k = '${NEXT_EDIT_TOGGLES_KEY}';`),
       'R5 setup: the TOGGLES_KEY_LITERAL regex no longer matches the runtime constant it is meant to scan for',
     ).toBe(true);
-  });
-
-  it('the globalState handle is reached in EXACTLY one non-test src/ module — the composition root', () => {
-    // `autocomplete/index.ts` obtains `context.globalState` and passes it
-    // straight to `NextEditGuard.hydrate`. Any SECOND module reaching for the
-    // store is a bypass route, whether or not it names the key.
     expect(
-      filesMatching(loadStripped(SRC_ROOT), GLOBAL_STATE_HANDLE),
-      'R5 failed: context.globalState must be reached from EXACTLY one non-test module (the composition root, autocomplete/index.ts) — a second reach is a bypass route around the Guard',
-    ).toEqual(['autocomplete/index.ts']);
-  });
-
-  it('no module calls get/update directly on globalState — the Memento is only ever handed to the Guard', () => {
-    // HONEST NOTE: this predicate matches nothing in the tree TODAY (the
-    // composition root passes the Memento by reference; `guard.ts` calls
-    // `.get`/`.update` on its own injected `state` field, never on a
-    // `globalState`-named expression). It is a FORWARD-LOOKING ban, and it is
-    // recorded as such rather than dressed up as currently load-bearing. Its
-    // predicate is proven to fire by the planted violation below — that proof
-    // is what stops it from being a lock that can never go RED.
+      NEXT_EDIT_SOURCE_SETTING,
+      'R5 setup: the exported NEXT_EDIT_SOURCE_SETTING constant drifted from the literal this scan matches',
+    ).toBe('talaria.nextEdit.source');
     expect(
-      filesMatching(loadStripped(SRC_ROOT), GLOBAL_STATE_DIRECT_ACCESS),
-      'R5 (forward-looking) failed: a module now calls .get/.update directly on a globalState-named expression, bypassing the Guard',
-    ).toEqual([]);
+      SOURCE_KEY_LITERAL.test(`const k = '${NEXT_EDIT_SOURCE_SETTING}';`),
+      'R5 setup: the SOURCE_KEY_LITERAL regex no longer matches the runtime constant it is meant to scan for',
+    ).toBe(true);
   });
 
-  it('RED-first proof: both R5 scans flag violations planted in DISTANT modules', () => {
+  it('the globalState handle is reached only by extension.ts (the migration call site) and the two named Task-9 Setup modules', () => {
+    // `extension.ts` obtains `context.globalState` and passes it straight to
+    // `migrateNextEditToggles` (once, at activation). `SetupController.ts`/
+    // `setupHost.vscode.ts` reach it too — for the DISJOINT `talaria.setup.*`
+    // key namespace (see the R5 doc block above), not the NEXT-edit one. Any
+    // THIRD, unnamed module reaching for the store is still a bypass route.
+    expect(
+      [...filesMatching(loadStripped(SRC_ROOT), GLOBAL_STATE_HANDLE)].sort(),
+      'R5 failed: context.globalState must be reached ONLY from extension.ts (the migration call site) and the two named Task-9 Setup modules — any other reach is a bypass route around the Guard',
+    ).toEqual(['extension.ts', ...SETUP_GLOBAL_STATE_MODULES].sort());
+  });
+
+  it('no module OTHER than the named Task-9 Setup modules calls get/update directly on globalState', () => {
+    // ORIGINAL intent (Task 2): the Guard's own `hermes.nextEdit.toggles`
+    // Memento is only ever handed BY REFERENCE to `migrateNextEditToggles` —
+    // nobody calls `.get`/`.update` on it directly, which would bypass the
+    // Guard's mutual-exclusion invariant for THAT key. Task 9's `SetupHost
+    // .globalState.get/update` calls (`SetupController.ts`/`setupHost.vscode
+    // .ts`) are a legitimate, independent direct-access pattern over a
+    // DISJOINT key namespace (`talaria.setup.*`) — there is no Guard over
+    // those keys to bypass. The predicate stays a REAL lock for everyone
+    // else: a THIRD, unnamed module calling `.get`/`.update` on a
+    // `globalState`-named expression still fails this test, proven by the
+    // planted-violation proof below.
+    expect(
+      [...filesMatching(loadStripped(SRC_ROOT), GLOBAL_STATE_DIRECT_ACCESS)].sort(),
+      'R5 failed: only the two named Task-9 Setup modules may call .get/.update directly on a globalState-named expression — any other module doing so bypasses the Guard',
+    ).toEqual([...SETUP_GLOBAL_STATE_MODULES].sort());
+  });
+
+  it('RED-first proof: all R5 scans flag violations planted in DISTANT modules', () => {
     const base = loadStripped(SRC_ROOT);
 
     const keyViolation: StrippedSource[] = [
@@ -1206,6 +1277,22 @@ describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobo
     expect(
       filesMatching(keyViolation, TOGGLES_KEY_LITERAL),
       'R5 RED-first proof failed: the planted key-literal violation must break the sole-module equality check',
+    ).not.toEqual(['autocomplete/nextedit/guard.ts']);
+
+    const sourceKeyViolation: StrippedSource[] = [
+      ...base,
+      {
+        file: 'host/__source_key_probe__.ts',
+        content: "vscode.workspace.getConfiguration().update('talaria.nextEdit.source', 'generic');",
+      },
+    ];
+    expect(
+      filesMatching(sourceKeyViolation, SOURCE_KEY_LITERAL),
+      'R5 RED-first proof failed: a planted SETTING-key literal in a distant module was not flagged',
+    ).toContain('host/__source_key_probe__.ts');
+    expect(
+      filesMatching(sourceKeyViolation, SOURCE_KEY_LITERAL),
+      'R5 RED-first proof failed: the planted setting-key violation must break the sole-module equality check',
     ).not.toEqual(['autocomplete/nextedit/guard.ts']);
 
     const handleViolation: StrippedSource[] = [
@@ -1224,10 +1311,15 @@ describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobo
         content: "await context.globalState.update('hermes.nextEdit.toggles', { next: true });",
       },
     ];
+    const directMatches = filesMatching(directViolation, GLOBAL_STATE_DIRECT_ACCESS);
     expect(
-      filesMatching(directViolation, GLOBAL_STATE_DIRECT_ACCESS),
+      directMatches,
       'R5 RED-first proof failed: a planted direct globalState.update(...) call was not flagged by the forward-looking predicate',
-    ).toEqual(['host/__direct_probe__.ts']);
+    ).toContain('host/__direct_probe__.ts');
+    expect(
+      [...directMatches].sort(),
+      'R5 RED-first proof failed: the planted violation must break the exact-membership check (baseline + the probe, nothing else)',
+    ).toEqual([...SETUP_GLOBAL_STATE_MODULES, 'host/__direct_probe__.ts'].sort());
   });
 
   it('negative control: prose about globalState in a comment is not a bypass', () => {
@@ -1243,186 +1335,99 @@ describe('R5 LOCK (single-writer/single-reader): the Guard is bypassable by nobo
       'R5 negative control failed: prose naming the key in a comment must not count as a second key-literal module',
     ).toEqual(['autocomplete/nextedit/guard.ts']);
     expect(
-      filesMatching(commentOnly, GLOBAL_STATE_HANDLE),
-      'R5 negative control failed: prose naming globalState in a comment must not count as a second reach',
-    ).toEqual(['autocomplete/index.ts']);
+      [...filesMatching(commentOnly, GLOBAL_STATE_HANDLE)].sort(),
+      'R5 negative control failed: prose naming globalState in a comment must not count as an extra reach',
+    ).toEqual(['extension.ts', ...SETUP_GLOBAL_STATE_MODULES].sort());
   });
 });
 
 /**
- * The exhaustive 16-row table (4 accepted-states × 4 requests). CANONICAL HOME
- * is this file; `mode.test.ts` covers the same table for the module it belongs
- * to and that coverage is deliberately kept. The property locked here is
- * narrower and is the security-relevant one: a REFUSAL persists NOTHING.
+ * R5, RE-BASED (Task 2, §5.5/D7) — the exhaustive Guard-level table: every
+ * (store value × toggle request) combination, 3 × 4 = 12 rows. The store is
+ * the `talaria.nextEdit.source` ENUM now, so the security property this table
+ * used to lock through refusals ("a both-on state never persists") is
+ * STRUCTURAL: the type has no both-on value to persist. What the table locks
+ * instead:
+ *
+ *  - the complete transition function (toggle-on BECOMES that source —
+ *    replacing the other; toggle-off of the active source goes to 'off';
+ *    toggle-off of an inactive source changes nothing);
+ *  - a changed value is exactly ONE enum write — never an off-then-on pair a
+ *    concurrent reader could observe as a transient 'off';
+ *  - an unchanged value writes NOTHING;
+ *  - NO row warns and NO row rejects — the refusal path is gone from the
+ *    Guard (the one surviving refusal is transport-level, in
+ *    `requestNextEditToggle`, locked by `shell.vscode.test.ts`).
  */
-const S = (next: boolean, generic: boolean): ToggleState => ({ next, generic });
 const R = (source: 'next' | 'generic', on: boolean): ToggleRequest => ({ source, on });
 
-const TOGGLE_TABLE: readonly (readonly [ToggleState, ToggleRequest, 'accepted' | 'refused'])[] = [
-  [S(false, false), R('next', true), 'accepted'],
-  [S(false, false), R('generic', true), 'accepted'],
-  [S(false, false), R('next', false), 'accepted'],
-  [S(false, false), R('generic', false), 'accepted'],
-  [S(true, false), R('generic', true), 'refused'], // THE refusal
-  [S(true, false), R('next', true), 'accepted'],
-  [S(true, false), R('next', false), 'accepted'],
-  [S(true, false), R('generic', false), 'accepted'],
-  [S(false, true), R('next', true), 'refused'], // the mirror refusal
-  [S(false, true), R('generic', true), 'accepted'],
-  [S(false, true), R('generic', false), 'accepted'],
-  [S(false, true), R('next', false), 'accepted'],
-  // degenerate both-on rows: unreachable post-sanitize, but the function is TOTAL
-  [S(true, true), R('next', false), 'accepted'],
-  [S(true, true), R('generic', false), 'accepted'],
-  [S(true, true), R('next', true), 'accepted'],
-  [S(true, true), R('generic', true), 'accepted'],
+const GUARD_TOGGLE_TABLE: readonly (readonly [NextEditSource, ToggleRequest, NextEditSource])[] = [
+  ['off', R('next', true), 'dedicated'],
+  ['off', R('generic', true), 'generic'],
+  ['off', R('next', false), 'off'],
+  ['off', R('generic', false), 'off'],
+  ['dedicated', R('next', true), 'dedicated'],
+  ['dedicated', R('next', false), 'off'],
+  ['dedicated', R('generic', true), 'generic'], // THE old refusal row — now a structural REPLACE
+  ['dedicated', R('generic', false), 'dedicated'],
+  ['generic', R('next', true), 'dedicated'], // the mirror replace
+  ['generic', R('generic', true), 'generic'],
+  ['generic', R('next', false), 'generic'],
+  ['generic', R('generic', false), 'off'],
 ];
 
-describe('R5 LOCK (refusal persists nothing): applyToggleRequest over all 16 rows', () => {
-  it('the table really is all 16 rows, and really contains refusals (a table of only accepts would be vacuous)', () => {
-    expect(TOGGLE_TABLE, 'setup: the table must have all 16 (state × request) rows').toHaveLength(16);
-    expect(
-      TOGGLE_TABLE.filter(([, , result]) => result === 'refused'),
-      'NON-VACUITY CONTROL failed: the table must contain the 2 real refusal rows, or the refusal-persists-nothing assertion below never actually exercises a refusal',
-    ).toHaveLength(2);
-    // Every (state × request) combination is present exactly once.
-    const keys = TOGGLE_TABLE.map(([s, r]) => `${String(s.next)}${String(s.generic)}:${r.source}:${String(r.on)}`);
-    expect(
-      new Set(keys).size,
-      'setup: the table must cover every (state × request) combination exactly once — a duplicate row would silently under-cover the space',
-    ).toBe(16);
-  });
-
-  it.each(TOGGLE_TABLE)('accepted=%o req=%o -> %s', (accepted, req, expectedResult) => {
-    const decision = applyToggleRequest(accepted, req);
-    expect(
-      decision.result,
-      `R5: applyToggleRequest(${JSON.stringify(accepted)}, ${JSON.stringify(req)}) must resolve to "${expectedResult}"`,
-    ).toBe(expectedResult);
-    if (decision.result === 'refused') {
-      // THE lock: a refusal leaves the ratified state byte-identical to input.
-      expect(
-        decision.accepted,
-        'R5 failed: a REFUSAL must leave the ratified state byte-identical to its input — it must persist NOTHING',
-      ).toEqual(accepted);
-      expect(decision.alert, 'R5 failed: a refusal must surface a user-visible alert').not.toBeNull();
-    }
-  });
-
-  it('every refused row leaves state deep-equal to its input (stated once more, as a whole-table property)', () => {
-    const refused = TOGGLE_TABLE.filter(([, , result]) => result === 'refused');
-    expect(
-      refused.length,
-      'NON-VACUITY CONTROL failed: there must be at least one refused row to exercise the property below',
-    ).toBeGreaterThan(0);
-    for (const [accepted, req] of refused) {
-      const decision = applyToggleRequest(accepted, req);
-      expect(
-        decision.result,
-        `R5: ${JSON.stringify(req)} against ${JSON.stringify(accepted)} must still resolve to "refused"`,
-      ).toBe('refused');
-      expect(
-        decision.accepted,
-        'R5 failed: a refusal must persist NOTHING — the ratified state must equal the input state exactly',
-      ).toEqual(accepted);
-    }
-  });
-});
-
-describe('R5 LOCK (cold-start sanitize): a both-on store hydrates to both-off AND the reset is persisted', () => {
+describe('R5 LOCK (structural exclusion): the Guard over all 12 (enum × request) rows', () => {
   beforeEach(() => {
     resetHost();
     failures.length = 0;
   });
 
-  it('both-on seed: state is both-off, update called EXACTLY once with the reset, and the store now holds it', async () => {
-    const { memento, updates, store } = makeRecordingMemento({ next: true, generic: true });
-
-    const guard = await NextEditGuard.hydrate(memento, { reportFailure: SHELL_DEPS.reportFailure });
-
+  it('the table really is all 12 rows, each combination exactly once, and it contains the two replace rows', () => {
+    expect(GUARD_TOGGLE_TABLE, 'setup: the table must have all 12 (enum × request) rows').toHaveLength(12);
+    const keys = GUARD_TOGGLE_TABLE.map(([s, r]) => `${s}:${r.source}:${String(r.on)}`);
     expect(
-      guard.getState(),
-      'R5 cold-start sanitize failed: a both-on seed must hydrate the in-memory state to both-off',
-    ).toEqual({ next: false, generic: false });
-    // Fix wave, Finding 2 — companion to the assertion above. Under
-    // read-through, `getState()` re-sanitizes on every call via
-    // `readCurrent()`, so by itself it can no longer distinguish "hydrate()
-    // persisted the reset" from "hydrate() left the store both-on and a live
-    // read silently re-sanitized it" — both leave `getState()` reporting
-    // both-off. This reads the RAW store directly, bypassing the Guard
-    // entirely, at the same point in the test, so the pairing proves what the
-    // line above alone no longer can.
-    expect(
-      store.get(NEXT_EDIT_TOGGLES_KEY),
-      'R5: the raw store must already hold the sanitized both-off value immediately after hydrate() — ' +
-        'getState() alone cannot prove this under read-through',
-    ).toEqual({ next: false, generic: false });
-    expect(guard.getMode(), 'R5 cold-start sanitize failed: a both-on seed must hydrate to mode "off"').toBe(
-      'off',
-    );
-    // «скинет в OFF» — the reset is PERSISTED, so the next cold start does not
-    // rediscover the same conflict.
-    expect(
-      updates,
-      'R5: the both-off reset must be PERSISTED (exactly one Memento.update call), not just returned in memory — otherwise the next cold start rediscovers the same conflict',
-    ).toHaveLength(1);
-    expect(
-      updates[0]?.key,
-      'R5: the persisted reset must be written under NEXT_EDIT_TOGGLES_KEY, the one key the Guard owns',
-    ).toBe(NEXT_EDIT_TOGGLES_KEY);
-    expect(
-      updates[0]?.value,
-      'R5: the persisted reset value must be the sanitized both-off state, not the original both-on seed',
-    ).toEqual({ next: false, generic: false });
-    expect(
-      store.get(NEXT_EDIT_TOGGLES_KEY),
-      'R5: the Memento store itself must now hold the sanitized both-off state after hydrate()',
-    ).toEqual({ next: false, generic: false });
-    // ...plus exactly one user-visible notice.
-    expect(
-      host.warnings,
-      'R5: a both-on conflict sanitize must surface exactly ONE user-visible warning',
-    ).toHaveLength(1);
+      new Set(keys).size,
+      'setup: the table must cover every (enum × request) combination exactly once — a duplicate row would silently under-cover the space',
+    ).toBe(12);
+    // NON-VACUITY: the two rows that used to REFUSE must be present and must
+    // now RESOLVE to the replacing source — if they were dropped, the whole
+    // "no refusal path" claim below would never be exercised.
+    expect(keys).toContain('dedicated:generic:true');
+    expect(keys).toContain('generic:next:true');
   });
 
-  /**
-   * NON-VACUITY CONTROL for the write assertion above: if `hydrate` wrote on
-   * EVERY cold start, `updates).toHaveLength(1)` would be satisfied by a
-   * sanitize that does nothing at all. A non-conflicting store must produce
-   * ZERO writes and preserve its state.
-   */
-  it('CONTROL: a NON-conflicting store is preserved and writes NOTHING', async () => {
-    const { memento, updates } = makeRecordingMemento({ next: true, generic: false });
+  it.each(GUARD_TOGGLE_TABLE)('source=%s req=%o -> %s', async (initial, req, expected) => {
+    const recording = makeRecordingSourcePort(initial);
+    const guard = await NextEditGuard.hydrate(recording.port, { reportFailure: SHELL_DEPS.reportFailure });
 
-    const guard = await NextEditGuard.hydrate(memento, { reportFailure: SHELL_DEPS.reportFailure });
+    const result = await guard.requestToggle(req);
 
-    expect(
-      guard.getState(),
-      'NON-VACUITY CONTROL failed: a non-conflicting seed must be preserved exactly, unchanged by hydrate()',
-    ).toEqual({ next: true, generic: false });
-    expect(
-      updates,
-      'NON-VACUITY CONTROL failed: a non-conflicting store must trigger ZERO writes — if this is nonempty, the both-on test above (toHaveLength(1)) would pass even if hydrate() wrote unconditionally on every cold start',
-    ).toEqual([]);
-    expect(
-      host.warnings,
-      'NON-VACUITY CONTROL failed: a non-conflicting store must not surface any warning',
-    ).toEqual([]);
+    expect(recording.value(), 'the ratified enum value must match the table').toBe(expected);
+    expect(result, 'the resolved state must derive from the ratified enum').toEqual({
+      next: expected === 'dedicated',
+      generic: expected === 'generic',
+    });
+    if (expected === initial) {
+      expect(recording.sets, 'an unchanged value must write NOTHING').toEqual([]);
+    } else {
+      expect(
+        recording.sets,
+        'a changed value must be exactly ONE enum write — never an off-then-on pair',
+      ).toEqual([expected]);
+    }
+    // NO row refuses, NO row warns: mutual exclusion is structural now.
+    expect(host.warnings, 'no Guard toggle may warn — the refusal path is gone').toEqual([]);
+    expect(failures).toEqual([]);
   });
 
-  it('CONTROL: a first-run (empty) store hydrates to both-off without writing', async () => {
-    const { memento, updates } = makeRecordingMemento();
-
-    const guard = await NextEditGuard.hydrate(memento, { reportFailure: SHELL_DEPS.reportFailure });
-
-    expect(
-      guard.getState(),
-      'CONTROL failed: a first-run (empty) store must hydrate to both-off by default',
-    ).toEqual({ next: false, generic: false });
-    expect(
-      updates,
-      'CONTROL failed: a first-run empty store already matches the both-off default and must trigger ZERO writes',
-    ).toEqual([]);
+  it('hydrate() writes NOTHING for any seed value — hydration is a pure read (no cold-start sanitize is needed: the enum has no conflict state)', async () => {
+    for (const seed of ['off', 'dedicated', 'generic'] as const) {
+      const recording = makeRecordingSourcePort(seed);
+      const guard = await NextEditGuard.hydrate(recording.port, { reportFailure: SHELL_DEPS.reportFailure });
+      expect(guard.getState()).toEqual({ next: seed === 'dedicated', generic: seed === 'generic' });
+      expect(recording.sets, `hydrate from '${seed}' must not write`).toEqual([]);
+    }
+    expect(host.warnings).toEqual([]);
   });
 });
 
@@ -1714,7 +1719,7 @@ async function setupShellWithGuard(toggles: ToggleState): Promise<{
   guard: NextEditGuard;
   disposable: vscodeTypes.Disposable;
 }> {
-  const guard = await NextEditGuard.hydrate(makeRecordingMemento(toggles).memento, {
+  const guard = await NextEditGuard.hydrate(makeRecordingSourcePort(sourceOf(toggles)).port, {
     reportFailure: SHELL_DEPS.reportFailure,
   });
   const disposable = registerTalariaNextEdit(makeContext(), guard, SHELL_DEPS);

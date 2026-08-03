@@ -50,6 +50,8 @@ interface ChatViewProps {
   onStarter: (text: string) => void;
   /** M1: forwarded straight through to `<Hero>` — see Hero's `disabled` doc. */
   starterDisabled?: boolean;
+  /** Task 10: forwarded straight through to `<Hero>` — see Hero's `onOpenSetup` doc. */
+  onOpenSetup?: () => void;
 }
 
 /**
@@ -348,6 +350,7 @@ export const ChatView = memo(function ChatView({
   onOpenDiff,
   onStarter,
   starterDisabled,
+  onOpenSetup,
 }: ChatViewProps) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -419,7 +422,7 @@ export const ChatView = memo(function ChatView({
   const unseenCount = pinned ? 0 : Math.max(0, transcript.length - unseenBaselineRef.current);
 
   if (transcript.length === 0) {
-    return <Hero onStarter={onStarter} disabled={starterDisabled} />;
+    return <Hero onStarter={onStarter} disabled={starterDisabled} onOpenSetup={onOpenSetup} />;
   }
 
   return (

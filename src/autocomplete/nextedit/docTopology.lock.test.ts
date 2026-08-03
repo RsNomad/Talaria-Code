@@ -55,16 +55,31 @@ const CONFIG_SRC = readRepoFile('src/autocomplete/config.ts');
 const TOPOLOGY_DOC = readRepoFile('docs/user/model-topology.md');
 const NEXT_EDIT_DOC = readRepoFile('docs/user/next-edit.md');
 
+interface RawConfigProperty {
+  readonly default?: unknown;
+  readonly description?: string;
+}
+
+interface RawConfigCategory {
+  readonly properties?: Record<string, RawConfigProperty>;
+}
+
 interface RawPackageJson {
   readonly contributes: {
-    readonly configuration: {
-      readonly properties: Record<string, { readonly default?: unknown; readonly description?: string }>;
-    };
+    readonly configuration: RawConfigCategory | RawConfigCategory[];
   };
 }
 
 const PACKAGE_JSON = JSON.parse(readRepoFile('package.json')) as RawPackageJson;
-const CONFIG_PROPERTIES = PACKAGE_JSON.contributes.configuration.properties;
+// `contributes.configuration` is an array of titled categories
+// (configurationSections.test.ts locks the shape) — flatten to the union.
+const CONFIG_SECTIONS = Array.isArray(PACKAGE_JSON.contributes.configuration)
+  ? PACKAGE_JSON.contributes.configuration
+  : [PACKAGE_JSON.contributes.configuration];
+const CONFIG_PROPERTIES: Record<string, RawConfigProperty> = {};
+for (const section of CONFIG_SECTIONS) {
+  Object.assign(CONFIG_PROPERTIES, section.properties ?? {});
+}
 
 /**
  * FINAL REVIEW — FINDING 3. Every user-facing document, DISCOVERED rather than

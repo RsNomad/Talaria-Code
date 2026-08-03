@@ -12,22 +12,35 @@
  *
  * Fork F-2(A) (owner-ratified): persistent, non-dismissible, text-only.
  * Deliberately no dismiss button (dismissal is an anti-goal — the strip
- * SHOULD keep nagging in demo mode) and no "open settings" affordance
- * (would need a new webview->host message through
- * `ALLOWED_CONTROL_METHODS` for a convenience — out of scope here).
+ * SHOULD keep nagging in demo mode).
  *
- * Mounted by App.tsx directly under `TabStrip`, gated on the SAME
- * connection-global `state.backendKind` the pill already reads
- * (`AppState.backendKind`, types.ts) — no new state, no hydration gating.
+ * Task 10: `onOpenSetup`, when given, adds a "Set up backends" deep-link
+ * into the Setup / Talaria Config panel — the actual remedy for the state
+ * this notice describes (flip `talaria.backend` to `acp` via the Agent
+ * card's install/activate flow, instead of hand-editing settings.json). A
+ * SIBLING of the reason text, not nested inside it, so the informational
+ * `role="note"` text itself stays exactly what it was (its own DOM test
+ * checks the note's full text content, substring-matched, so appending a
+ * trailing action is additive and non-breaking either way — kept as a
+ * sibling anyway for a clean separation between "what's true" and "what you
+ * can do about it"). Optional so this component still renders standalone
+ * (e.g. any future direct usage) without a handler.
  */
-export function MockNotice() {
+export function MockNotice({ onOpenSetup }: { onOpenSetup?: () => void }) {
   return (
-    <div
-      role="note"
-      aria-label="Demo mode notice"
-      className="border-b border-warn bg-warn-soft px-3 py-1.5 text-xs text-muted"
-    >
-      Demo mode — responses are canned. Set <code className="font-mono">talaria.backend</code> to <code className="font-mono">&quot;acp&quot;</code> and trust this workspace to use the real agent.
+    <div className="flex items-center gap-2 border-b border-warn bg-warn-soft px-3 py-1.5 text-xs text-muted">
+      <span role="note" aria-label="Demo mode notice" className="min-w-0 flex-1">
+        Demo mode — responses are canned. Set <code className="font-mono">talaria.backend</code> to <code className="font-mono">&quot;acp&quot;</code> and trust this workspace to use the real agent.
+      </span>
+      {onOpenSetup && (
+        <button
+          type="button"
+          onClick={onOpenSetup}
+          className="flex-none rounded border border-warn px-1.5 py-0.5 font-mono text-2xs text-fg hover:bg-overlay"
+        >
+          Set up backends
+        </button>
+      )}
     </div>
   );
 }

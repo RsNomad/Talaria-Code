@@ -532,6 +532,93 @@ export const panelData: PanelDataMap = {
       },
     ],
   },
+
+  // Task 8 (protocol v2, §6): a "you're ready" snapshot — agent ready,
+  // provider configured, FIM configured and probed OK — so the mock (used
+  // in dev/tests) reflects a plausible steady state rather than a blank one.
+  setup: {
+    trusted: true,
+    agent: {
+      options: [
+        {
+          id: 'hermes',
+          kind: 'agent',
+          status: 'available',
+          displayName: 'Hermes',
+          description: 'The default ACP agent backend.',
+          localInstall: { flavor: 'pipx', effort: 'one-script' },
+          docsUrl: 'https://github.com/hermes-agent/hermes',
+        },
+        { id: 'openclaw', kind: 'agent', status: 'coming-soon', displayName: 'OpenClaw', description: 'Coming soon.' },
+        { id: 'talaria-ai', kind: 'agent', status: 'coming-soon', displayName: 'Talaria AI', description: 'Coming soon.' },
+      ],
+      selectedId: 'hermes',
+      phase: 'ready',
+      version: 'hermes-acp 1.4.0',
+    },
+    provider: { phase: 'configured', providerId: 'anthropic' },
+    fim: {
+      options: [
+        {
+          id: 'ollama',
+          kind: 'fim',
+          status: 'available',
+          displayName: 'Ollama',
+          description: 'Local FIM via Ollama.',
+          remote: {
+            endpointDefault: 'http://127.0.0.1:11434',
+            endpointValue: 'http://127.0.0.1:11434',
+            endpointPlaceholder: 'http://host:port',
+            auth: 'none',
+            apiKeySet: false,
+            probe: 'ollama-tags',
+          },
+          localInstall: {
+            flavor: 'guided-terminal',
+            effort: 'one-script',
+            models: [{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', present: true }],
+          },
+          nextEditTransport: 'ollama',
+        },
+      ],
+      selectedId: 'ollama',
+      enabled: true,
+      model: 'qwen2.5-coder:1.5b-base',
+      endpointValue: 'http://127.0.0.1:11434',
+      tuning: {
+        debounceMs: 250,
+        maxPromptTokens: 2048,
+        temperature: 0.2,
+        crossFileEnabled: true,
+        prefixInjection: true,
+        prefixInjectionRemote: false,
+        warmUp: true,
+      },
+      probe: { ok: true, detail: 'reachable', models: ['qwen2.5-coder:1.5b-base'] },
+    },
+    nextEdit: {
+      source: 'generic',
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:1.5b-base',
+      dedicatedConfigured: false,
+      genericSupported: true,
+    },
+    rag: {
+      enabled: false,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'nomic-embed-text',
+      embedModelPresent: false,
+      tuning: { dims: 768, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: ['node_modules/**', '.git/**'] },
+      indexDir: '.talaria/index',
+    },
+    ollama: {
+      running: true,
+      version: '0.4.1',
+      models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 986_000_000 }],
+    },
+    ready: true,
+  },
 };
 
 /**

@@ -13,6 +13,47 @@ const globalPanelData: { [P in Exclude<DataPanel, 'subagents' | 'checkpoints' | 
   skills: { skills: [], categories: [] },
   models: { providers: [], currentModelId: '' },
   settings: { sections: [] },
+  // Task 8 (protocol v2, §6): minimal-valid SetupData — same "empty but
+  // shape-complete" posture as its siblings above.
+  setup: {
+    trusted: false,
+    agent: { options: [], selectedId: '', phase: 'unknown' },
+    provider: { phase: 'unknown' },
+    fim: {
+      options: [],
+      selectedId: '',
+      enabled: false,
+      model: '',
+      endpointValue: '',
+      tuning: {
+        debounceMs: 0,
+        maxPromptTokens: 0,
+        temperature: 0,
+        crossFileEnabled: false,
+        prefixInjection: false,
+        prefixInjectionRemote: false,
+        warmUp: false,
+      },
+    },
+    nextEdit: {
+      source: 'off',
+      backend: 'ollama',
+      endpoint: '',
+      model: '',
+      dedicatedConfigured: false,
+      genericSupported: false,
+    },
+    rag: {
+      enabled: false,
+      embedEndpoint: '',
+      embedModel: '',
+      embedModelPresent: false,
+      tuning: { dims: 0, maxChunkTokens: 0, debounceMs: 0, excludeGlobs: [] },
+      indexDir: '',
+    },
+    ollama: { running: false, models: [] },
+    ready: false,
+  },
 };
 
 const theme: ThemeInfo = { kind: 'dark', accent: '#14b8a6' };

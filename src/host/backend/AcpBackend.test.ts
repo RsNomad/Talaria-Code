@@ -327,6 +327,29 @@ class FakeAcpClient {
     this.disposeCallCount++;
   }
 
+  /** Task 13: the advertised auth methods this fake "retained at initialize" —
+   * `undefined` (the default) matches a client whose `initialize()` never ran
+   * or a test double predating the surface; `makeStartableBackend`'s
+   * `mutateClient` seeds per-client values for the refresh-across-restart
+   * tests. */
+  advertisedAuthMethods: { id: string; name: string }[] | undefined = undefined;
+  getAdvertisedAuthMethods(): { id: string; name: string }[] | undefined {
+    return this.advertisedAuthMethods;
+  }
+  /** Task 13: registered auth-methods-change handlers + a test trigger. */
+  authMethodsHandlers: Array<() => void> = [];
+  onAuthMethodsChanged(handler: () => void): { dispose(): void } {
+    this.authMethodsHandlers.push(handler);
+    return {
+      dispose: () => {
+        this.authMethodsHandlers = this.authMethodsHandlers.filter((h) => h !== handler);
+      },
+    };
+  }
+  fireAuthMethodsChanged(): void {
+    for (const handler of [...this.authMethodsHandlers]) handler();
+  }
+
   /** W4-T5b: records every `closeSession` call — the best-effort `session/close` seam. */
   closeSessionCalls: string[] = [];
   /** W4-T5b: when set, the NEXT `closeSession()` call REJECTS with this (auto-clears) —
@@ -9960,5 +9983,60 @@ describe('AcpBackend.handleRequestPermission — SF-2 (T4b): the enforcement wir
     const outcome = await callRequestPermission(backend)(makeEditReq('.vscode/settings.json'));
 
     expect(outcome).toEqual({ outcome: { outcome: 'selected', optionId: 'deny' } });
+  });
+});
+
+/**
+ * Task 13 (onboarding-backend-setup §2.1): `AcpBackend` surfaces the CURRENT
+ * client's ACP-advertised auth methods (`getAdvertisedAuthMethods`) plus a
+ * change signal (`onAuthMethodsChanged`), so the Setup panel's Provider card
+ * can be driven through the extension.ts dep seam. The refresh contract:
+ * `talaria.newSession` → `provider.newSession()` → `backend.start()`, which
+ * tears the old client down and mints a FRESH one whose own `initialize()`
+ * re-retains the methods — the getter must always read the CURRENT client,
+ * never a stale snapshot.
+ */
+describe('AcpBackend — Task 13: advertised auth methods surface', () => {
+  const SETUP_ONLY = [{ id: 'hermes-setup', name: 'Configure Hermes provider' }];
+  const PROVIDER_AND_SETUP = [
+    { id: 'openrouter', name: 'openrouter runtime credentials' },
+    { id: 'hermes-setup', name: 'Configure Hermes provider' },
+  ];
+
+  it("undefined before start(); the first client's methods after; a re-start (talaria.newSession) refreshes to the NEW client's", async () => {
+    const { backend, clients } = makeStartableBackend(undefined, (client, index) => {
+      client.advertisedAuthMethods = index === 0 ? SETUP_ONLY : PROVIDER_AND_SETUP;
+    });
+
+    expect(backend.getAdvertisedAuthMethods()).toBeUndefined();
+
+    await backend.start();
+    expect(backend.getAdvertisedAuthMethods()).toEqual(SETUP_ONLY);
+
+    // talaria.newSession → provider.newSession() → backend.start() again:
+    // fresh client, fresh initialize, refreshed advertisement.
+    await backend.start();
+    expect(clients).toHaveLength(2);
+    expect(backend.getAdvertisedAuthMethods()).toEqual(PROVIDER_AND_SETUP);
+  });
+
+  it('onAuthMethodsChanged relays the CURRENT client only — a stale (torn-down) client can no longer fire it', async () => {
+    const { backend, clients } = makeStartableBackend();
+    let fires = 0;
+    const sub = backend.onAuthMethodsChanged(() => {
+      fires += 1;
+    });
+
+    await backend.start();
+    must(clients[0]).fireAuthMethodsChanged();
+    expect(fires).toBe(1);
+
+    await backend.start(); // mints client[1]; client[0]'s subscription must be dropped
+    must(clients[0]).fireAuthMethodsChanged();
+    expect(fires).toBe(1); // stale client: not relayed
+    must(clients[1]).fireAuthMethodsChanged();
+    expect(fires).toBe(2);
+
+    sub.dispose();
   });
 });

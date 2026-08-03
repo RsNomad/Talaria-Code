@@ -30,32 +30,42 @@ import type {
 } from '../protocol';
 import { BOOTSTRAP_TAB_ID, makePanelData } from '../protocol';
 import { mockApprovalId, mockTheme, mockTurn, panelData } from './fixtures';
-import { NEXT_EDIT_ROWS } from '../panels/SettingsPanel';
+import { NEXT_EDIT_ROWS } from '../panels/nextEditCopy';
 
 type Send = (msg: HostToWebview) => void;
 
 /**
- * FIX WAVE 2 (wave-1 handoff — U-6 drift). The scaffold's refusal copy is
- * DERIVED from the same frozen row table the panel renders
- * (`NEXT_EDIT_ROWS`), never retyped, and mirrors the real Guard's
- * `REFUSAL_MESSAGES` (`src/autocomplete/nextedit/guard.ts`): refusing source
- * X names the OTHER row's label, because that is the row the user has to go
- * turn off.
- *
- * It used to read "turn off Generic first" / "turn off NEXT first" — the
- * pre-U-6 wording, naming tokens that appear NOWHERE on screen. Wave 1 fixed
- * the real Guard and the mock was left behind, so the one surface this UX is
- * driveable on pre-Fedora modelled a refusal production no longer emits.
- *
- * Why derived and not imported outright: `guard.ts` imports `vscode`, so its
- * `REFUSAL_MESSAGES` is unreachable from the webview's module graph. Tying
- * the LABELS to `NEXT_EDIT_ROWS` removes the half that actually drifted; the
- * surrounding template is pinned by `MockBackend.test.ts`.
+ * Task 12 (§5.5/D7 re-base): the set of valid `nextEdit.toggle` sources,
+ * DERIVED from the same single-sourced row table the panels render
+ * (`NEXT_EDIT_ROWS`) rather than hardcoded as a second copy of the literal
+ * pair `'next' | 'generic'` — so a future third NEXT source added to
+ * `nextEditCopy.ts` without touching this file fails the malformed-request
+ * check instead of silently validating against a stale set.
  */
-function mockRefusalMessage(refused: NextEditToggleSource): string {
-  const other = refused === 'next' ? 'generic' : 'next';
-  const otherLabel = NEXT_EDIT_ROWS.find((row) => row.source === other)?.label ?? '';
-  return `Next Edit: turn off "${otherLabel}" first — the two sources are mutually exclusive.`;
+function isNextEditSource(value: unknown): value is NextEditToggleSource {
+  return NEXT_EDIT_ROWS.some((row) => row.source === value);
+}
+
+/**
+ * Task 12 (§5.5/D7): structural-replace semantics, mirroring the real
+ * Guard's `applyToggleToSource` (`src/autocomplete/nextedit/guard.ts`) —
+ * unreachable from here since that module imports `vscode`. Turning a
+ * source ON always REPLACES whichever source was on before (an enum cannot
+ * hold two "on" values, so there is no conflict state left to refuse);
+ * turning the ACTIVE source OFF returns to fully-off; turning an already
+ * INACTIVE source off is a no-op. This used to be a refusal (turning the
+ * second source on while the first was ratified rejected the request) — the
+ * refusal is GONE from both the real Guard (since Task 2) and this mock now.
+ */
+function applyNextEditToggle(
+  current: NextEditToggleState,
+  source: NextEditToggleSource,
+  on: boolean,
+): NextEditToggleState {
+  if (on) {
+    return source === 'next' ? { next: true, generic: false } : { next: false, generic: true };
+  }
+  return source === 'next' ? { next: false, generic: current.generic } : { next: current.next, generic: false };
 }
 
 const REDUCED_MOTION =
@@ -301,7 +311,14 @@ export class MockBackend {
     if (panel === 'sessions') {
       return makePanelData(panel, data as PanelDataMap['sessions'], { cwd: sessionId });
     }
-    if (panel === 'tools' || panel === 'mcp' || panel === 'skills' || panel === 'models' || panel === 'settings') {
+    if (
+      panel === 'tools' ||
+      panel === 'mcp' ||
+      panel === 'skills' ||
+      panel === 'models' ||
+      panel === 'settings' ||
+      panel === 'setup'
+    ) {
       return makePanelData(panel, data as PanelDataMap[GlobalPanel]);
     }
     const exhaustive: never = panel;
@@ -341,20 +358,21 @@ export class MockBackend {
   }
 
   /**
-   * R5 (Task 13): the standalone mirror of the host's Guard. Modelled, not
-   * acked: the catch-all above would have confirmed BOTH sources on, which is
-   * precisely the both-on state the real Guard makes unreachable — and this
-   * scaffold is the only place the toggle UX (including the refusal
-   * snap-back) can be driven pre-Fedora, so it has to tell the truth.
+   * R5 (Task 13), RE-BASED by Task 12 (§5.5/D7): the standalone mirror of
+   * the host's Guard. Modelled, not acked: the catch-all above would have
+   * confirmed BOTH sources on, which is precisely the both-on state the
+   * real Guard makes unreachable — and this scaffold is the only place the
+   * toggle UX can be driven pre-Fedora, so it has to tell the truth.
    *
-   * Mirrors `applyToggleRequest`'s rule and `NextEditGuard`'s ordering: a
-   * refusal persists nothing and pushes nothing; an accepted change notifies
-   * BEFORE the response resolves. The refusal copy is the Guard's own.
+   * Mirrors `applyNextEditToggle`'s structural-replace rule and
+   * `NextEditGuard`'s push ordering: the new state is notified BEFORE the
+   * response resolves. There is no refusal path left to model — turning the
+   * second source on REPLACES the first instead of being rejected.
    */
   private handleNextEditToggle(requestId: number, params: Record<string, unknown> | undefined): void {
     const source = params?.source;
     const on = params?.on;
-    if ((source !== 'next' && source !== 'generic') || typeof on !== 'boolean') {
+    if (!isNextEditSource(source) || typeof on !== 'boolean') {
       this.send({
         type: 'control.response',
         requestId,
@@ -363,20 +381,7 @@ export class MockBackend {
       });
       return;
     }
-    const conflict = source === 'next' ? this.nextEditToggles.generic : this.nextEditToggles.next;
-    if (on && conflict) {
-      this.send({
-        type: 'control.response',
-        requestId,
-        ok: false,
-        error: { message: mockRefusalMessage(source) },
-      });
-      return;
-    }
-    this.nextEditToggles =
-      source === 'next'
-        ? { next: on, generic: this.nextEditToggles.generic }
-        : { next: this.nextEditToggles.next, generic: on };
+    this.nextEditToggles = applyNextEditToggle(this.nextEditToggles, source, on);
     this.send({ type: 'nextEdit.state', state: this.nextEditToggles });
     this.send({ type: 'control.response', requestId, ok: true, result: this.nextEditToggles });
   }

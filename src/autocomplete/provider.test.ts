@@ -706,10 +706,23 @@ describe('next-edit contributions shape-lock', () => {
   it('R5: the toggles are NOT settings — no enabled/generic contribution exists, and every nextEdit data key is machine-scoped', async () => {
     const fs = await import('node:fs');
     const path = await import('node:path');
+    type PropertyMap = Record<string, { scope?: string }>;
+    type Category = { properties?: PropertyMap };
     const pkg = JSON.parse(
       fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'),
-    ) as { contributes?: { configuration?: { properties?: Record<string, { scope?: string }> } } };
-    const props = pkg.contributes?.configuration?.properties ?? {};
+    ) as { contributes?: { configuration?: Category | Category[] } };
+    // `contributes.configuration` is an array of titled categories
+    // (configurationSections.test.ts locks the shape) — flatten to the union.
+    const configuration = pkg.contributes?.configuration;
+    const sections = Array.isArray(configuration) ? configuration : [configuration];
+    const props: PropertyMap = {};
+    for (const section of sections) {
+      Object.assign(props, section?.properties ?? {});
+    }
+    expect(
+      Object.keys(props).filter((key) => key.startsWith('talaria.nextEdit.')),
+      'reach: the flatten must surface the nextEdit keys — an empty map would rubber-stamp every assertion below',
+    ).not.toHaveLength(0);
     expect(props['talaria.nextEdit.enabled']).toBeUndefined();   // the toggle lives in the Guard's store
     expect(props['talaria.nextEdit.generic']).toBeUndefined();   // (owner: settings carry DATA, not state)
     for (const [key, def] of Object.entries(props)) {

@@ -1,0 +1,262 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { collectNonTestTsSources, scanLines, VSCODE_IMPORT_BAN } from '../purityScan';
+import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
+import {
+  AGENT_BACKENDS,
+  FIM_BACKENDS,
+  getBackend,
+  HERMES_PIN,
+  type BackendDescriptor,
+  type InstallRecipe,
+} from './registry';
+
+/**
+ * Task 3 (onboarding-backend-setup-architecture.md §4) — the backend
+ * registry's acceptance locks (a)–(h). The registry is PURE DATA: these
+ * tests are the only executable statement of its contract, so every fact
+ * asserted here is grounded in a source the plan names:
+ *
+ *  - Hermes packaging facts (§2.1): pyproject `name="hermes-agent"`,
+ *    `[acp]` extra REQUIRED, console scripts `hermes`/`hermes-acp`,
+ *    `requires-python = ">=3.11,<3.14"`, `hermes-acp --check` printing
+ *    `Hermes ACP check OK`.
+ *  - FIM endpoint defaults: `src/autocomplete/config.ts` DEFAULT_ENDPOINTS
+ *    (drift-locked BOTH ways below — registry vs. the five expected strings,
+ *    AND config.ts source text vs. the same strings, so neither side can
+ *    move without this file going red).
+ *  - SecretStorage key: `src/autocomplete/apiKey.ts`
+ *    AUTOCOMPLETE_API_KEY_SECRET (imported — that module is vscode-free).
+ *  - `talaria.rag.embedModel` default: package.json contributes.configuration.
+ */
+
+const ALL_BACKENDS: readonly BackendDescriptor[] = [...AGENT_BACKENDS, ...FIM_BACKENDS];
+
+function mustGet(id: string): BackendDescriptor {
+  const d = getBackend(id);
+  if (!d) throw new Error(`registry is missing backend '${id}'`);
+  return d;
+}
+
+function pipxRecipe(d: BackendDescriptor): Extract<InstallRecipe, { kind: 'pipx' }> {
+  const recipe = d.localInstall?.recipe;
+  if (!recipe || recipe.kind !== 'pipx') {
+    throw new Error(`'${d.id}' has no pipx recipe (got ${JSON.stringify(recipe?.kind)})`);
+  }
+  return recipe;
+}
+
+describe('registry: roster + pin', () => {
+  it('AGENT_BACKENDS is exactly hermes, openclaw, talaria-ai (in card order)', () => {
+    expect(AGENT_BACKENDS.map((d) => d.id)).toEqual(['hermes', 'openclaw', 'talaria-ai']);
+    for (const d of AGENT_BACKENDS) expect(d.kind).toBe('agent');
+  });
+
+  it('FIM_BACKENDS is exactly ollama, llamacpp, vllm, codestral, openai-compat (in card order)', () => {
+    expect(FIM_BACKENDS.map((d) => d.id)).toEqual([
+      'ollama',
+      'llamacpp',
+      'vllm',
+      'codestral',
+      'openai-compat',
+    ]);
+    for (const d of FIM_BACKENDS) expect(d.kind).toBe('fim');
+  });
+
+  it('getBackend finds every roster id and returns undefined for unknown ids', () => {
+    for (const d of ALL_BACKENDS) expect(getBackend(d.id)).toBe(d);
+    expect(getBackend('no-such-backend')).toBeUndefined();
+  });
+
+  it('HERMES_PIN is the owner-decided D10 pin', () => {
+    expect(HERMES_PIN).toBe('0.18.2');
+  });
+});
+
+describe('registry (a): hermes pipx recipe (§2.1 packaging facts)', () => {
+  it('installs hermes-agent[acp]==HERMES_PIN via pipx — the [acp] extra is REQUIRED', () => {
+    const recipe = pipxRecipe(mustGet('hermes'));
+    expect(recipe.kind).toBe('pipx');
+    expect(recipe.packageSpec).toBe(`hermes-agent[acp]==${HERMES_PIN}`);
+    expect(recipe.pinnedVersion).toBe(HERMES_PIN);
+  });
+
+  it('post-install verification is `hermes-acp --check` expecting the §2.1 marker', () => {
+    const recipe = pipxRecipe(mustGet('hermes'));
+    expect(recipe.postCheck.app).toBe('hermes-acp');
+    expect(recipe.postCheck.args).toEqual(['--check']);
+    expect(recipe.postCheck.expectStdoutIncludes).toBe('Hermes ACP check OK');
+  });
+
+  it('python range mirrors pyproject requires-python ">=3.11,<3.14"', () => {
+    const recipe = pipxRecipe(mustGet('hermes'));
+    expect(recipe.pythonRange).toEqual({ minInclusive: '3.11', maxExclusive: '3.14' });
+  });
+
+  it('console scripts are the pyproject [project.scripts] names', () => {
+    const recipe = pipxRecipe(mustGet('hermes'));
+    expect(recipe.apps).toEqual({ main: 'hermes', acpCheck: 'hermes-acp' });
+  });
+
+  it('hermes is honestly labeled one-script and activates the acp backend', () => {
+    const hermes = mustGet('hermes');
+    expect(hermes.localInstall?.effort).toBe('one-script');
+    expect(hermes.settingsToActivate).toEqual({ 'talaria.backend': 'acp' });
+    expect(hermes.transport).toBe('stdio');
+  });
+});
+
+describe('registry (b): status invariant', () => {
+  it("every 'available' backend has remote or localInstall; every 'coming-soon' has neither", () => {
+    expect(ALL_BACKENDS.length).toBeGreaterThan(0); // non-vacuous
+    for (const d of ALL_BACKENDS) {
+      if (d.status === 'available') {
+        expect(
+          d.remote !== undefined || d.localInstall !== undefined,
+          `'${d.id}' is available but offers neither remote nor localInstall`,
+        ).toBe(true);
+      } else {
+        expect(d.remote, `coming-soon '${d.id}' must not declare remote`).toBeUndefined();
+        expect(d.localInstall, `coming-soon '${d.id}' must not declare localInstall`).toBeUndefined();
+      }
+    }
+  });
+});
+
+/**
+ * (c) — the five endpoint defaults, copied VERBATIM from
+ * `src/autocomplete/config.ts` DEFAULT_ENDPOINTS. Drift-lock direction 1:
+ * the registry must equal these strings. Drift-lock direction 2: config.ts
+ * (module-private, deliberately not exported) must still CONTAIN each
+ * `key: 'value'` pair — so editing either file without the other turns
+ * this suite red.
+ */
+const EXPECTED_ENDPOINTS: Record<string, string> = {
+  ollama: 'http://127.0.0.1:11434',
+  llamacpp: 'http://127.0.0.1:8080',
+  vllm: 'http://127.0.0.1:8000',
+  codestral: 'https://codestral.mistral.ai',
+  'openai-compat': 'http://127.0.0.1:8000',
+};
+
+const CONFIG_TS_PATH = join(__dirname, '..', '..', 'autocomplete', 'config.ts');
+
+describe('registry (c): FIM endpoint defaults === config.ts DEFAULT_ENDPOINTS (drift-lock both ways)', () => {
+  it('every FIM descriptor exposes remote with the verbatim default endpoint', () => {
+    for (const d of FIM_BACKENDS) {
+      const expected = EXPECTED_ENDPOINTS[d.id];
+      expect(expected, `test table is missing FIM id '${d.id}'`).toBeDefined();
+      expect(d.remote, `FIM '${d.id}' must offer a remote (connect) mode`).toBeDefined();
+      expect(d.remote?.endpoint.defaultValue).toBe(expected);
+      expect(d.remote?.endpoint.settingKey).toBe('talaria.autocomplete.endpoint');
+    }
+  });
+
+  it('config.ts on disk still carries the same five pairs (reverse drift-lock)', () => {
+    const source = readFileSync(CONFIG_TS_PATH, 'utf-8');
+    expect(source).toContain("ollama: 'http://127.0.0.1:11434'");
+    expect(source).toContain("llamacpp: 'http://127.0.0.1:8080'");
+    expect(source).toContain("vllm: 'http://127.0.0.1:8000'");
+    expect(source).toContain("codestral: 'https://codestral.mistral.ai'");
+    expect(source).toContain("'openai-compat': 'http://127.0.0.1:8000'");
+    // And no sixth entry the registry would silently miss: the FIM roster
+    // here must cover every DEFAULT_ENDPOINTS key.
+    expect(Object.keys(EXPECTED_ENDPOINTS).sort()).toEqual(FIM_BACKENDS.map((d) => d.id).sort());
+  });
+});
+
+describe('registry (d): codestral auth', () => {
+  it('requires an API key stored under the existing SecretStorage key', () => {
+    const codestral = mustGet('codestral');
+    expect(codestral.remote?.auth).toEqual({
+      kind: 'apiKey',
+      required: true,
+      secretKey: 'talaria.autocomplete.apiKey',
+    });
+    // Drift-lock against the real constant in src/autocomplete/apiKey.ts.
+    expect(codestral.remote?.auth).toMatchObject({ secretKey: AUTOCOMPLETE_API_KEY_SECRET });
+  });
+
+  it('codestral is remote-only with no unauthenticated probe (§2.5)', () => {
+    const codestral = mustGet('codestral');
+    expect(codestral.localInstall).toBeUndefined();
+    expect(codestral.remote?.probe).toEqual({ kind: 'none' });
+  });
+});
+
+describe('registry (e): nextEditTransport mapping (§2.3 NEXT row)', () => {
+  it("ollama → 'ollama'", () => {
+    expect(mustGet('ollama').nextEditTransport).toBe('ollama');
+  });
+
+  it("vllm / llamacpp / openai-compat → 'openai-compat'", () => {
+    expect(mustGet('vllm').nextEditTransport).toBe('openai-compat');
+    expect(mustGet('llamacpp').nextEditTransport).toBe('openai-compat');
+    expect(mustGet('openai-compat').nextEditTransport).toBe('openai-compat');
+  });
+
+  it('codestral and every agent backend are absent from NEXT setup', () => {
+    expect(mustGet('codestral').nextEditTransport).toBeUndefined();
+    for (const d of AGENT_BACKENDS) {
+      expect(d.nextEditTransport, `agent '${d.id}' must not offer a NEXT transport`).toBeUndefined();
+    }
+  });
+});
+
+describe('registry (f): ollama model provisioning', () => {
+  it('maps fim → talaria.autocomplete.model and embedding → talaria.rag.embedModel', () => {
+    const models = mustGet('ollama').localInstall?.models;
+    expect(models?.pull).toBe('ollama-api');
+    expect(models?.defaults).toEqual([
+      { role: 'fim', model: 'qwen2.5-coder:1.5b-base', settingKey: 'talaria.autocomplete.model' },
+      { role: 'embedding', model: 'qwen3-embedding:0.6b', settingKey: 'talaria.rag.embedModel' },
+    ]);
+  });
+
+  it('the fim default model still matches config.ts DEFAULT_MODEL (reverse drift-lock)', () => {
+    const source = readFileSync(CONFIG_TS_PATH, 'utf-8');
+    expect(source).toContain("const DEFAULT_MODEL = 'qwen2.5-coder:1.5b-base'");
+  });
+
+  it('the embedding default still matches package.json talaria.rag.embedModel (reverse drift-lock)', () => {
+    const pkg = JSON.parse(
+      readFileSync(join(__dirname, '..', '..', '..', 'package.json'), 'utf-8'),
+    ) as {
+      contributes?: { configuration?: Array<{ properties?: Record<string, { default?: unknown }> }> };
+    };
+    const sections = pkg.contributes?.configuration ?? [];
+    const embed = sections
+      .map((s) => s.properties?.['talaria.rag.embedModel'])
+      .find((p) => p !== undefined);
+    expect(embed, 'package.json no longer declares talaria.rag.embedModel').toBeDefined();
+    expect(embed?.default).toBe('qwen3-embedding:0.6b');
+  });
+});
+
+describe('registry (g): coming-soon stubs', () => {
+  it("getBackend('openclaw') is a coming-soon stub", () => {
+    expect(mustGet('openclaw').status).toBe('coming-soon');
+  });
+
+  it("getBackend('talaria-ai') is a coming-soon stub", () => {
+    expect(mustGet('talaria-ai').status).toBe('coming-soon');
+  });
+
+  it('every FIM entry activates talaria.autocomplete.backend = <id>; stubs activate nothing', () => {
+    for (const d of FIM_BACKENDS) {
+      expect(d.settingsToActivate).toEqual({ 'talaria.autocomplete.backend': d.id });
+    }
+    expect(mustGet('openclaw').settingsToActivate).toEqual({});
+    expect(mustGet('talaria-ai').settingsToActivate).toEqual({});
+  });
+});
+
+describe('registry (h): purity — zero vscode imports (purityScan discipline)', () => {
+  it('no non-test module under src/host/setup/ imports vscode', () => {
+    const files = collectNonTestTsSources(__dirname);
+    // Non-vacuous: the scan must actually see registry.ts.
+    expect(files.map((f) => f.file)).toContain('registry.ts');
+    expect(scanLines(files, VSCODE_IMPORT_BAN)).toEqual([]);
+  });
+});

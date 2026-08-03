@@ -63,9 +63,9 @@ This is the whole point of Talaria Code, not an afterthought:
 | Requirement | Notes |
 |---|---|
 | **VS Code** | `^1.125` |
-| **OS** | Primary target **Linux**. The mock UI runs anywhere, but the live backend targets Linux; other platforms are currently untested. |
-| **Hermes agent** | The backend Talaria Code drives (`hermes acp` + `python -m tui_gateway.entry`). The extension is a Hermes *client*. |
-| **A local model runtime** | **Ollama**, **vLLM**, or **llama.cpp**, serving: a chat/agent model (via Hermes), a FIM completion model (default `qwen2.5-coder:1.5b-base`), and an embedding model for RAG (default `qwen3-embedding:0.6b`). |
+| **OS** | Primary target **Linux** (developed on Fedora). The mock UI runs anywhere, but the live backend targets Linux; other platforms are currently untested. |
+| **Python + pipx** | Python **3.11–3.13** and **pipx** on your `PATH`. The **Backend Setup** panel installs the Hermes agent for you via pipx — the extension is a Hermes *client*. On Fedora: `sudo dnf install pipx`. |
+| **A local model runtime** | **Ollama**, **vLLM**, or **llama.cpp**, serving: a chat/agent model (via Hermes), a FIM completion model (default `qwen2.5-coder:1.5b-base`), and an embedding model for RAG (default `qwen3-embedding:0.6b`). Ollama can be detected and its models pulled from the Setup panel. |
 
 ## Installation
 
@@ -81,26 +81,79 @@ code --install-extension talaria-code-*.vsix
 
 ## Getting started
 
-1. Install and run the **Hermes** agent and a **model runtime** (e.g. Ollama with
-   the models above).
-2. Open the **Talaria** panel from the activity bar.
-3. Point the extension at your Hermes install, then switch `talaria.backend` from
-   `mock` to `acp` (see Configuration).
+Talaria Code installs and wires up its backend from **one panel** — no
+hand-edited JSON, no manual Python installs.
 
-On first run the extension uses a scripted **mock** backend so you can explore the
-UI with no Hermes process running — it works on any OS. Switch to `acp` to go
-live against your real agent.
+1. **Install the extension** (`.vsix` — see [Installation](#installation)).
+2. **Open the Talaria panel** from the activity bar. On first run, **Backend
+   Setup** opens automatically. Reopen it any time from the **rocket icon** in
+   the panel's title bar, or the **`Talaria: Backend Setup`** command.
+3. **Work through the five cards** — each shows its status, one primary action,
+   and a details/log view:
+   - **Agent** — pick **Hermes** and click **Install Hermes**. The panel
+     installs `hermes-agent[acp]` via pipx, verifies it, writes the paths, and
+     offers a one-click window reload to go live. (OpenClaw and Talaria AI are
+     shown as *coming soon*.)
+   - **Provider** — click **Configure provider** to run Hermes's own setup
+     wizard in a terminal and choose the chat model/provider the agent uses.
+     Talaria never forces a provider on you.
+   - **Autocomplete (FIM)** — pick a backend (Ollama / llama.cpp / vLLM /
+     Codestral / OpenAI-compatible). For local-capable backends the card asks
+     **"Install locally, or connect to an existing endpoint?"** For Ollama it
+     can detect the daemon and pull the default model
+     (`qwen2.5-coder:1.5b-base`) with a live progress bar.
+   - **Next Edit** *(optional)* — multi-line next-edit suggestions. **Generic**
+     reuses the FIM model you just set up (no extra setup); **Dedicated** uses a
+     separate model you set up here.
+   - **Codebase index (RAG)** *(optional)* — enable the local code index and, on
+     Ollama, pull the embedding model (`qwen3-embedding:0.6b`).
 
-## Configuration
+Until you install a real backend, the extension runs a scripted **mock** backend
+so you can explore the UI with no agent process running — it works on any OS.
 
-Settings live under the **`talaria.*`** namespace (Talaria Code is a Hermes
-client). The ones you'll usually touch:
+### Honest caveats
+
+- **Python and pipx are real prerequisites.** The panel can't `sudo` for you: on
+  Fedora, run the one guided command `sudo dnf install pipx` first. Hermes needs
+  Python **3.11–3.13**.
+- **Installing Hermes downloads ≈300–500 MB** from PyPI into
+  `~/.local/share/pipx`.
+- **Models are gigabytes and hardware-bound.** The FIM model is ≈1 GB,
+  embeddings ≈0.7 GB, and your agent's chat model may be far larger. Sizes are
+  shown before any download and nothing is pulled automatically — one click
+  makes the *clicks* easy, it can't make the downloads small or a GPU appear.
+- **Local llama.cpp/vLLM installs are guided, not silent.** Ollama's is a clean
+  one-script install; llama.cpp and vLLM need your own build/hardware decisions,
+  and the cards say so. "One click" means we open the right terminal command and
+  automate everything after it (pull, config, probe).
+- **A window reload activates the agent** the first time you switch it on.
+
+## Settings
+
+Talaria Code has **one source of truth** for its configuration — the `talaria.*`
+VS Code settings (plus VS Code SecretStorage for API keys). Every screen is a
+view over that one source, so **nothing is doubled and each setting has exactly
+one home.** There are two surfaces, split by *who owns the setting*:
+
+### Talaria Config — the extension's own settings
+
+All `talaria.*` keys: the agent backend and Hermes connection, autocomplete
+(FIM), Next Edit, and the codebase index (RAG). Edit these two equivalent ways —
+both write the same settings, so use whichever you prefer:
+
+- **The Backend Setup panel** (friendly): the five cards above.
+- **The native settings page** — run **`Talaria: Open Settings`** or search
+  `@ext:syntinal.talaria-code`. It's organized into five titled sections:
+  **Backend & Agent**, **Autocomplete (FIM)**, **Next Edit**,
+  **RAG (Codebase Index)**, and **Advanced**.
+
+The keys you'll usually touch:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `talaria.backend` | `mock` | Which agent backend to talk to. Set to `acp` for the real Hermes backend. |
-| `talaria.hermesPath` | `""` | Absolute path to the `hermes` executable. |
-| `talaria.pythonPath` | `""` | Python interpreter used to launch the real Hermes backend. |
+| `talaria.backend` | `mock` | Which agent backend to talk to. Set to `acp` for the real Hermes backend (the Setup panel does this for you). |
+| `talaria.hermesPath` | `""` | Absolute path to the `hermes` executable (written by the installer). |
+| `talaria.pythonPath` | `""` | Python interpreter used to launch the real Hermes backend (written by the installer). |
 | `talaria.cwd` | `""` | Working directory for the agent (defaults to the first workspace folder). |
 | `talaria.autocomplete.enabled` | `true` | Enable inline (FIM) autocomplete. |
 | `talaria.autocomplete.backend` | `ollama` | FIM backend serving completions. |
@@ -110,7 +163,18 @@ client). The ones you'll usually touch:
 | `talaria.rag.embedEndpoint` | `http://127.0.0.1:11434` | Embeddings backend base URL. |
 | `talaria.rag.embedModel` | `qwen3-embedding:0.6b` | Model used to embed code chunks. |
 
-The full set is available in the Settings UI (search `talaria`).
+Settings that repoint an executable or a model endpoint are **machine-scoped**,
+so a workspace you open can't silently change them; API keys live in VS Code
+SecretStorage, never in plaintext settings. The full set is in the native
+settings page.
+
+### Agent Config — the Hermes agent's runtime settings
+
+Hermes's own runtime configuration — approval policy, max turns, delegation,
+checkpoints, security — lives in the **"Agent config"** tab inside the Talaria
+panel. These are the *agent's* settings (its `config.yaml`, edited over the
+control channel), not `talaria.*` extension settings — which is why they have
+their own home and are never doubled with the Talaria Config surface.
 
 ## How it works
 
@@ -128,6 +192,25 @@ typed `postMessage` protocol — the webview never touches Node or VS Code APIs
 directly. The host drives the Hermes agent over ACP for chat, edits, tools, and
 MCP; inline completions and codebase embeddings talk **directly** to the model
 endpoints you configure.
+
+## Manual setup (advanced)
+
+The Backend Setup panel is optional — everything it writes is a normal
+`talaria.*` setting you can set by hand if you'd rather wire things up yourself:
+
+1. **Install the Hermes agent yourself**, e.g.
+   `pipx install "hermes-agent[acp]==0.18.2"` (the `[acp]` extra is required, or
+   `hermes acp` fails on import), or via Hermes's own installer.
+2. **Point the extension at it**: set `talaria.hermesPath` to the `hermes`
+   executable and `talaria.pythonPath` to the matching interpreter. For a pipx
+   install both live under `~/.local/share/pipx/venvs/hermes-agent/bin/`.
+3. **Go live**: set `talaria.backend` to `acp` and reload the window.
+4. **Configure the chat model/provider** with Hermes's own wizard:
+   `hermes-acp --setup`.
+5. **Run a model runtime** (Ollama / vLLM / llama.cpp) and set the
+   `talaria.autocomplete.*` and `talaria.rag.*` keys to your endpoints and
+   models (defaults: FIM `qwen2.5-coder:1.5b-base`, embeddings
+   `qwen3-embedding:0.6b`).
 
 ## Development
 

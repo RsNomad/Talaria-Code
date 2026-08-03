@@ -3,7 +3,8 @@
  * is answered from.
  *
  * `TalariaViewProvider` must be able to serve the toggle WITHOUT knowing that
- * a `NextEditGuard` (or an autocomplete tree, or a `vscode.Memento`) exists —
+ * a `NextEditGuard` (or an autocomplete tree, or the `talaria.nextEdit.source`
+ * setting it is backed by since Task 2 §5.5) exists —
  * the view provider is host plumbing, the Guard is the autocomplete zone's.
  * This narrow port is the seam between them, mirroring the `FindFilesFn`
  * injection `context.searchFiles` already uses: `extension.ts` owns the
@@ -34,16 +35,25 @@ import type { NextEditToggleSource, NextEditToggleState } from './protocol';
 export interface NextEditTogglePort {
   /**
    * Apply one toggle gesture. Resolves with the newly RATIFIED state; REJECTS
-   * with the user-facing refusal message when the request is refused (the
-   * mutual-exclusion conflict, or an unsupported FIM backend for Generic).
-   * The rejection message is what the panel row shows inline — it must stay
-   * readable and must never carry a response body or an API key.
+   * with the user-facing refusal message when the request is refused — since
+   * Task 2 (§5.5/D7) that means ONLY the unsupported-FIM-backend refusal for
+   * Generic: the state lives in the `talaria.nextEdit.source` enum now, so
+   * mutual exclusion is structural and turning the second source on RESOLVES
+   * with the replaced state (both rows move via the `onDidChange` push)
+   * instead of rejecting. The rejection message is what the panel row shows
+   * inline — it must stay readable and must never carry a response body or an
+   * API key.
    */
   request(source: NextEditToggleSource, on: boolean): Promise<NextEditToggleState>;
 
   /** The currently ratified state — read on webview mount to seed the rows. */
   getState(): NextEditToggleState;
 
-  /** Fires on every ACCEPTED change (never on a refusal — nothing changed). */
+  /**
+   * Fires on every genuine state change (never on a refusal — nothing
+   * changed). Since Task 2 this rides `onDidChangeConfiguration`, so a NATIVE
+   * settings-page edit of `talaria.nextEdit.source` reaches the rows through
+   * the same push as a webview toggle.
+   */
   onDidChange(listener: (state: NextEditToggleState) => void): { dispose(): void };
 }

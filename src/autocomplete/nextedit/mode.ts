@@ -1,12 +1,27 @@
-// nextedit/mode.ts — the R5 pure halves (the Guard's shell lives in guard.ts, Task 12)
+/*
+ * nextedit/mode.ts — the R5 pure halves.
+ *
+ * Task 12 (T2 M-2 carry-forward): this file used to also hold
+ * `applyToggleRequest`/`ToggleDecision`/`withToggle` — the pre-Task-2
+ * REFUSAL-based toggle-transition half ("turning the second source on while
+ * the first is ratified is REFUSED"). Task 2 (§5.5/D7) re-based the Guard
+ * (`guard.ts`) off `vscode.Memento` onto the `talaria.nextEdit.source` enum
+ * setting, which made mutual exclusion STRUCTURAL — an enum cannot hold two
+ * "on" values, so the second toggle simply BECOMES the new value and
+ * REPLACES the first (`guard.ts`'s own `applyToggleToSource`) — and stopped
+ * calling this trio entirely. Confirmed dead-in-production by grep (no
+ * import anywhere outside this file and its own `mode.test.ts`) before
+ * deletion here, along with the `mode.test.ts` assertions that exercised the
+ * "refused" rows production no longer emits.
+ *
+ * What remains is genuinely still live: `resolveNextEditMode` backs
+ * `NextEditGuard.getMode()`, and `sanitizeStoredToggles` backs the one-time
+ * §5.3 globalState->setting migration (`guard.ts`'s `migrateNextEditToggles`)
+ * — both imported from `./mode` by `guard.ts`.
+ */
 export type NextEditMode = 'off' | 'next' | 'generic' | 'conflict';
 export interface ToggleState { next: boolean; generic: boolean }
 export interface ToggleRequest { source: 'next' | 'generic'; on: boolean }
-export interface ToggleDecision {
-  accepted: ToggleState;                       // the Guard's new ratified state (the shell persists it)
-  result: 'accepted' | 'refused';
-  alert: 'refused-next' | 'refused-generic' | null;
-}
 
 /** The inner half. 'conflict' survives only as sanitizeStoredToggles' input classification. */
 export function resolveNextEditMode(nextEnabled: boolean, genericEnabled: boolean): NextEditMode {
@@ -14,41 +29,6 @@ export function resolveNextEditMode(nextEnabled: boolean, genericEnabled: boolea
   if (nextEnabled) return 'next';
   if (genericEnabled) return 'generic';
   return 'off';
-}
-
-/**
- * Explicit field-by-field construction (no object-spread-with-override) —
- * deliberately avoids the object-spread-plus-overridden-field shape that
- * `ringBuffer.test.ts`'s brand-preserving-spread guard flags anywhere under
- * src/autocomplete/. This function never touches a branded value
- * (`ToggleState` carries no brand), but the guard's regex can't tell that;
- * sidestepping the shape keeps this pure module out of that
- * security-reviewed allowlist entirely.
- */
-function withToggle(state: ToggleState, source: 'next' | 'generic', on: boolean): ToggleState {
-  return source === 'next' ? { next: on, generic: state.generic } : { next: state.next, generic: on };
-}
-
-/**
- * R5 — the Guard's pure transition half. The toggles are NOT VS Code settings
- * (owner: «юзер пишет Endpoint, а не состояние True/False»); state lives in the
- * Guard's store (guard.ts). Turning on the second source while the first is
- * ratified on is REFUSED — nothing persists, the caller alerts. Turning off is
- * always accepted. Refusals never change the ratified state.
- */
-export function applyToggleRequest(accepted: ToggleState, req: ToggleRequest): ToggleDecision {
-  if (!req.on) {
-    return { accepted: withToggle(accepted, req.source, false), result: 'accepted', alert: null };
-  }
-  const other = req.source === 'next' ? 'generic' : 'next';
-  if (accepted[other] && !accepted[req.source]) {
-    return {
-      accepted,
-      result: 'refused',
-      alert: req.source === 'next' ? 'refused-next' : 'refused-generic',
-    };
-  }
-  return { accepted: withToggle(accepted, req.source, true), result: 'accepted', alert: null };
 }
 
 /** Cold-start hygiene: a hand-edited store holding BOTH on resets to BOTH off («скинет в OFF»). */

@@ -7,9 +7,13 @@ import { MockBackend } from './host/backend/MockBackend';
 import { AcpBackend } from './host/backend/AcpBackend';
 import type { HermesRuntimeConfig } from './host/runtime/resolveHermes';
 import { registerTalariaAutocomplete } from './autocomplete';
+import { createVsCodeNextEditConfigPort, migrateNextEditToggles } from './autocomplete/nextedit/guard';
 import { createIndexer, type Indexer } from './rag/indexer';
 import { RAG_SETTING_RELOAD } from './rag/ragReloadSettings';
 import { selectBackendKind, shouldActivateLib, shouldActivateRag } from './host/trustGate';
+import { SetupController } from './host/setup/SetupController';
+import { createSetupControllerDeps, createVsCodeSetupHost } from './host/setupHost.vscode';
+import { wireBackendFailureNudge } from './host/backendFailureNudge';
 import { isHttpUrl } from './shared/url';
 import type { AcpMcpServerStdio } from './host/backend/acp/acpClient';
 import { CODEBASE_SEARCH_TOOL_NAME } from './mcp/toolSchema';
@@ -198,6 +202,23 @@ export function activate(context: vscode.ExtensionContext): void {
       : new MockBackend();
   context.subscriptions.push(backend);
 
+  // ── Task 11 (A): "Open Backend Setup" nudge on the existing backend- ─────
+  // failure surface. `wireBackendFailureNudge` (pure, `vscode`-free — see
+  // its own doc) taps `backend.onMessage`'s `system.error` case, the ONLY
+  // host-emitted signal that already fires on a `resolveHermes` throw /
+  // spawn failure / `initialize()` failure (`ConnectionSupervisor
+  // .startInternal`'s catch block). Rewired on every trust-upgrade mock→real
+  // swap below (mirrors `setBackend`'s own `backendMessageSub` re-point) so
+  // the nudge always tracks whichever backend is CURRENT.
+  let backendFailureNudgeSub = wireBackendFailureNudge(backend, {
+    showErrorMessage: (message, action) => vscode.window.showErrorMessage(message, action),
+    // The brief's own pin: reuse the `talaria.openSetup` COMMAND path
+    // (registered below) rather than calling `provider.openSetupPanel()`
+    // directly — keeps this nudge decoupled from the view provider.
+    openSetup: () => void vscode.commands.executeCommand('talaria.openSetup'),
+  });
+  context.subscriptions.push({ dispose: () => backendFailureNudgeSub.dispose() });
+
   // ── CF-09 / L5 F-5: prompt "reload to apply" on talaria.backend change ───
   // Backend selection above is resolved ONCE at activate() (re-evaluated
   // only via `makeAcpBackend` on a trust grant). The README's onboarding
@@ -278,11 +299,38 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
+  // ── Task 9: Setup / Talaria Config controller ────────────────────────────
+  // Backend-AGNOSTIC by design (works under `mock` AND `acp` — Setup's whole
+  // job is bootstrapping FROM mock): constructed once here from the real
+  // vscode-backed `SetupHost` + Task 3-7 engine deps (`setupHost.vscode.ts`,
+  // deliberately outside `src/host/setup/` — see that file's own doc), wired
+  // into the view provider the same way the nextEdit toggle port is
+  // (`setSetupController`), and disposed via `context.subscriptions` like
+  // every other host-owned resource in this function.
+  // Task 13: the Provider card's authMethods seam — a THUNK over the outer
+  // `backend` binding (not a snapshot), read at every `status()` call, so the
+  // trust-upgrade mock→real swap below (`backend = upgraded`) and every
+  // `talaria.newSession` re-initialize are reflected automatically. Optional
+  // chaining because only the real `AcpBackend` implements the capability
+  // (`AgentBackend.getAdvertisedAuthMethods?`) — under mock this yields
+  // `undefined` and the card honestly reads `waiting-agent`.
+  const setupController = new SetupController(
+    createVsCodeSetupHost(context),
+    createSetupControllerDeps(() => backend.getAdvertisedAuthMethods?.()),
+  );
+  context.subscriptions.push({ dispose: () => setupController.dispose() });
+  provider.setSetupController(setupController);
+
   // ── Commands ─────────────────────────────────────────────────────────────
   context.subscriptions.push(
     vscode.commands.registerCommand('talaria.newSession', () =>
       provider.newSession(),
     ),
+    // Task 9 (§6 entry point 3): the ONE state-aware Setup entry — command
+    // palette + the view/title icon (package.json). First time = wizard
+    // mood; later = the same cards as current-config editor (no separate
+    // "restart" concept). Locked by `src/host/commandParity.test.ts`.
+    vscode.commands.registerCommand('talaria.openSetup', () => provider.openSetupPanel()),
     // Audit H-1: both of these were DECLARED in package.json and registered
     // nowhere. `talaria.openSettings` is bound to a permanently visible gear on
     // the panel title (`package.json:197`, view/title, navigation@1), so every
@@ -412,6 +460,22 @@ export function activate(context: vscode.ExtensionContext): void {
   // in Restricted Mode a remote (non-loopback) endpoint is skipped entirely
   // (S4.3) — only the default loopback path stays live untrusted. Reads
   // `talaria.autocomplete.*` itself.
+  //
+  // §5.3 one-time NEXT store migration (onboarding/setup Task 2): drain the
+  // legacy `globalState` toggle pair into the `talaria.nextEdit.source`
+  // setting, then delete the memento key — the delete is the latch, so every
+  // later activation is a no-op. Fire-and-forget beside the Guard's own async
+  // hydration: the Guard reads the setting live and reacts to the config
+  // change this write produces, so no ordering between the two is needed. A
+  // failed settings write keeps the memento (the latch is not burned) and
+  // retries on the next activation.
+  void migrateNextEditToggles(context.globalState, createVsCodeNextEditConfigPort()).then(
+    undefined,
+    (err: unknown) =>
+      output.appendLine(
+        `[nextEdit] toggle-store migration failed (will retry next activation): ${String(err)}`,
+      ),
+  );
   //
   // A5: `reportFailure` is the real implementation of provider.ts's injected
   // seam — every surfaced (actionable) autocomplete failure also gets one
@@ -565,6 +629,16 @@ export function activate(context: vscode.ExtensionContext): void {
         provider.setSearchFiles(searchFilesPort);
         backend.dispose();
         backend = upgraded;
+        // Re-point the Task 11 backend-failure nudge at the freshly-upgraded
+        // backend — mirrors `setBackend`'s own `backendMessageSub` re-point
+        // above; without this, a `system.error` on the NEW `AcpBackend`
+        // (e.g. a respawn losing the connection later) would fire the OLD,
+        // disposed mock's now-dead subscription instead.
+        backendFailureNudgeSub.dispose();
+        backendFailureNudgeSub = wireBackendFailureNudge(backend, {
+          showErrorMessage: (message, action) => vscode.window.showErrorMessage(message, action),
+          openSetup: () => void vscode.commands.executeCommand('talaria.openSetup'),
+        });
         output.appendLine('Talaria: backend upgraded to AcpBackend.');
       }
       startRagIfEligible();
@@ -589,6 +663,26 @@ export function activate(context: vscode.ExtensionContext): void {
       registerGenerateCommitMessageCommandOnce();
     }),
   );
+
+  // ── Task 9 (§6 entry point 1): first-run auto-open once ──────────────────
+  // `globalState['talaria.setup.autoOpened']` unset AND `talaria.backend`
+  // still `mock` -> reveal the panel on the Setup screen, then set the flag.
+  // The flag records the ATTEMPT (not completion) — it is set unconditionally
+  // here, so this never re-fires on a later activation even if the user
+  // closes the panel without finishing setup. `configuredBackend()` reads
+  // the setting fresh (not the resolved `backend` binding, which the trust
+  // gate may have downgraded to mock for an untrusted workspace even when
+  // the SETTING itself already says `acp` — auto-open should only fire for
+  // a genuinely unconfigured install, not a trust-gated one). Routed through
+  // `setupController.shouldAutoOpen()`/`.markAutoOpened()` rather than
+  // `context.globalState` directly — SetupController is the single owner of
+  // the `talaria.setup.*` globalState namespace (coexistence.lock.test.ts's
+  // R5 doc: this keeps direct `globalState.get`/`.update` call sites
+  // confined to SetupController.ts/setupHost.vscode.ts, never extension.ts).
+  if (setupController.shouldAutoOpen() && configuredBackend() === 'mock') {
+    provider.openSetupPanel();
+    void setupController.markAutoOpened();
+  }
 
   output.appendLine(
     `Talaria Code extension activated (${backend instanceof AcpBackend ? 'AcpBackend' : 'MockBackend'}${

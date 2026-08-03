@@ -26,6 +26,7 @@ import type {
   HostToWebview,
   NextEditToggleSource,
   Panel,
+  SetupMethod,
   ThemeKind,
 } from './protocol';
 import { MAX_TABS } from './protocol';
@@ -52,6 +53,7 @@ import { SubagentsPanel } from './panels/SubagentsPanel';
 import { SessionsPanel } from './panels/SessionsPanel';
 import { ModelsPanel } from './panels/ModelsPanel';
 import { SettingsPanel } from './panels/SettingsPanel';
+import { SetupPanel } from './panels/SetupPanel';
 import { ErrorBanner } from './components/ErrorBanner';
 import { MockNotice } from './components/MockNotice';
 import { Icon } from './components/Icon';
@@ -409,6 +411,23 @@ export function App() {
   const setNextEditToggle = (source: NextEditToggleSource, on: boolean) =>
     bridge.request('nextEdit.toggle', { source, on });
 
+  // Task 10: the Setup / Talaria Config panel's single mutating-action
+  // dispatcher — every `SetupMethod` (install/apply/setApiKey/testRemote/
+  // pullModel/cancel/openProviderWizard/openInstallTerminal/recheck/
+  // setNextEdit/setRag/setTunable) rides this ONE correlated request, mirroring
+  // `setConfig`/`toggle` above. F-1: CONNECTION-GLOBAL (installing a backend
+  // or pulling a model belongs to no one chat tab) — UNTAGGED, so closing an
+  // unrelated tab can never reject an in-flight Setup mutation. The host
+  // re-pushes a fresh `panel.data{panel:'setup'}` on every accepted mutation
+  // (mirrors `reload.mcp`/`model.save_key`'s "dispatch -> refetch -> push"
+  // precedent — see `SetupController.handle`'s own doc), so this panel needs
+  // no manual re-fetch after a successful call.
+  const dispatchSetup = (method: SetupMethod, params?: Record<string, unknown>) =>
+    bridge.request(method, params);
+
+  // Deep-link into the Setup panel (MockNotice / Hero "Set up backends").
+  const openSetup = () => selectPanel('setup');
+
   // A#7/BF-A: Sessions "Load more" over the CORRELATED path (shows a loading
   // state + surfaces failure), replacing the old silent fire-and-forget
   // `session.list` that defeated X2. F-1: `sessions` is the one shared slice
@@ -553,7 +572,7 @@ export function App() {
           'mock' boot default showing this notice is the documented honest-
           boot decision (types.ts D2/A2), self-correcting the instant
           hydrate/backend.state lands. */}
-      {state.backendKind === 'mock' && <MockNotice />}
+      {state.backendKind === 'mock' && <MockNotice onOpenSetup={openSetup} />}
 
       <PriorityTabs active={state.activePanel} onSelect={selectPanel} />
 
@@ -664,6 +683,7 @@ export function App() {
               onDiff={hostActions.resolveDiff}
               onOpenDiff={openDiff}
               onStarter={hostActions.sendPrompt}
+              onOpenSetup={openSetup}
               /* M1: same bound flag the Composer below is gated on (line ~454)
                  — a starter chip posts a prompt just like the composer, so a
                  pending/unbound tab (no session yet) must grey it out the same
@@ -872,19 +892,44 @@ export function App() {
           </ErrorBoundary>
         </div>
       )}
-      {/* F-7: Settings is the ONE panel not wrapped in a `RemotePanel` here,
-          and deliberately so — it carries two sources with different owners.
-          The «Next Edit Suggestions» toggles are extension `globalState`
-          pushed over `nextEdit.state` and need no agent; the config.yaml
-          sections come from the agent-backed `panel.data` fetch. Wrapping the
-          whole panel gated BOTH on the agent, so a Hermes CLI that failed to
-          start left the user with no way to turn Generic off (and these are
-          not `settings.json` settings, by design).
+      {/* Task 10: the Setup / Talaria Config panel — unlike Settings (F-7
+          below), the WHOLE `SetupData` snapshot is host-assembled from
+          settings + the registry + a best-effort Ollama probe, none of it
+          gated on the live agent connection, so it takes the ordinary
+          RemoteData straight through (SetupPanel owns its own `RemotePanel`
+          gate internally, same as every other data panel here). */}
+      {state.activePanel === 'setup' && (
+        <div
+          id={panelTabpanelId('setup')}
+          role="tabpanel"
+          aria-labelledby={panelTabDomId('setup')}
+          className="flex min-h-0 flex-1 flex-col"
+        >
+          <ErrorBoundary region="the Setup panel">
+            <SetupPanel
+              data={globalPanels.setup}
+              onRetry={() => requestPanel('setup')}
+              progress={state.setupProgress}
+              nextEdit={state.nextEditToggles}
+              onToggleNextEdit={setNextEditToggle}
+              dispatch={dispatchSetup}
+            />
+          </ErrorBoundary>
+        </div>
+      )}
 
-          So `SettingsPanel` takes the RemoteData itself and applies the gate
-          to the config half only. It is typed to require the un-narrowed
-          union precisely so re-wrapping it here cannot typecheck; the
-          structure is locked in `panels/SettingsPanel.test.ts`. */}
+      {/* Task 12 (§5.1/§5.2): "Agent config" (`'settings'` panel id, unchanged
+          on the wire) is not wrapped in a `RemotePanel` here — `SettingsPanel`
+          still owns its own gate internally, applying it to the config.yaml
+          sections that are now its entire content (the «Next Edit
+          Suggestions» toggles that used to need this split — extension state
+          pushed over `nextEdit.state`, needing no agent, alongside the
+          agent-backed config.yaml half — moved to the Setup/Talaria-Config
+          panel above). Kept this shape deliberately rather than folding it
+          into the ordinary external-`RemotePanel`-wrap pattern the other
+          panels use: `SettingsPanel` is still typed to require the
+          un-narrowed `RemoteData` union, so re-wrapping it here still cannot
+          typecheck; the structure is locked in `panels/SettingsPanel.test.ts`. */}
       {state.activePanel === 'settings' && (
         <div
           id={panelTabpanelId('settings')}
@@ -897,8 +942,6 @@ export function App() {
               config={globalPanels.settings}
               onRetryConfig={() => requestPanel('settings')}
               onSetConfig={setConfig}
-              nextEdit={state.nextEditToggles}
-              onToggleNextEdit={setNextEditToggle}
             />
           </ErrorBoundary>
         </div>
