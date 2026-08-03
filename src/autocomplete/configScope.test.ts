@@ -68,11 +68,25 @@ interface ConfigProperty {
   scope?: string;
 }
 
+interface ConfigCategory {
+  properties?: Record<string, ConfigProperty>;
+}
+
 function configurationProperties(): Record<string, ConfigProperty> {
   const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as {
-    contributes: { configuration: { properties: Record<string, ConfigProperty> } };
+    contributes: { configuration: ConfigCategory | ConfigCategory[] };
   };
-  return manifest.contributes.configuration.properties;
+  // `contributes.configuration` is an array of titled categories
+  // (configurationSections.test.ts locks the shape); the scope locks here
+  // operate on the UNION of all categories' properties.
+  const sections = Array.isArray(manifest.contributes.configuration)
+    ? manifest.contributes.configuration
+    : [manifest.contributes.configuration];
+  const union: Record<string, ConfigProperty> = {};
+  for (const section of sections) {
+    Object.assign(union, section.properties ?? {});
+  }
+  return union;
 }
 
 /**

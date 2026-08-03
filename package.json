@@ -42,6 +42,7 @@
         "talaria.autocomplete.backend",
         "talaria.autocomplete.endpoint",
         "talaria.autocomplete.apiKey",
+        "talaria.nextEdit.source",
         "talaria.nextEdit.endpoint",
         "talaria.rag.embedEndpoint",
         "talaria.rag.indexDir",
@@ -250,246 +251,321 @@
         }
       ]
     },
-    "configuration": {
-      "title": "Talaria Code",
-      "properties": {
-        "talaria.hermesPath": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "markdownDescription": "Absolute path to the `hermes` executable (e.g. a virtualenv `bin/hermes`). Leave empty to discover it from the login-shell `PATH` (`command -v hermes`). Set this when PATH discovery cannot work — Flatpak VS Code, Remote-SSH with a non-login PATH, or a custom install location. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot override it (prevents a malicious repo from repointing the executable — security)."
-        },
-        "talaria.pythonPath": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "markdownDescription": "Absolute path to the Python interpreter used to launch the real Hermes backend (e.g. a virtualenv `bin/python`). Leave empty to resolve `python` from the login-shell `PATH`. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot override this (prevents a malicious repo from repointing the interpreter — security)."
-        },
-        "talaria.cwd": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "markdownDescription": "Working directory for the Hermes agent process. Leave empty to use the first workspace folder. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: not workspace-overridable (security). When no workspace folder is open, the user home directory is used."
-        },
-        "talaria.backend": {
-          "type": "string",
-          "enum": [
-            "mock",
-            "acp"
-          ],
-          "enumDescriptions": [
-            "Canned streaming + panel data. Spawns no process; runs on any OS. Default.",
-            "Real backend: spawns `hermes acp` over JSON-RPC/stdio (Linux). Wired later."
-          ],
-          "default": "mock",
-          "scope": "machine",
-          "description": "Which agent backend the extension talks to. Machine-scoped: a workspace cannot flip this to `acp` to force a process spawn (security)."
-        },
-        "talaria.dashboardPort": {
-          "type": "number",
-          "default": 9119,
-          "scope": "machine",
-          "markdownDescription": "Loopback port for the Hermes dashboard REST server (`http://127.0.0.1:<port>`) that powers the real Skills & Tools panels. If a dashboard is already listening there it is adopted; otherwise the extension spawns `python -m hermes_cli.main serve --port <port>` (Linux). Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot repoint it (security)."
-        },
-        "talaria.dashboardAdopt": {
-          "type": "string",
-          "enum": [
-            "spawn-only",
-            "shape"
-          ],
-          "enumDescriptions": [
-            "Secure default. Never adopts a pre-existing dashboard: always spawns and provenance-verifies its own child before use.",
-            "Legacy, INSECURE opt-in: adopts any already-running responder whose /api/status body merely LOOKS like Hermes, with no further verification. Only for coexisting with an already-running Hermes desktop holding the port."
-          ],
-          "default": "spawn-only",
-          "scope": "machine",
-          "markdownDescription": "How the extension discovers the Hermes dashboard REST server on `#talaria.dashboardPort#`. `spawn-only` (default, secure) never adopts a foreign peer — it always spawns its own child and verifies the healthy server's served session token has the provenance of that spawn before use (CWE-306/346). `shape` is a legacy, INSECURE opt-in that adopts any responder whose `/api/status` body is merely Hermes-shaped, which a local process could spoof; use it only to coexist with an already-running Hermes desktop instance. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot weaken this (security)."
-        },
-        "talaria.autocomplete.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable Talaria inline (FIM) autocomplete."
-        },
-        "talaria.autocomplete.backend": {
-          "type": "string",
-          "enum": [
-            "ollama",
-            "llamacpp",
-            "vllm",
-            "codestral",
-            "openai-compat"
-          ],
-          "default": "ollama",
-          "scope": "machine",
-          "markdownDescription": "Which FIM backend serves autocomplete requests. Machine-scoped: a workspace cannot flip this to a cloud backend and redirect your code off the machine (security — this setting SELECTS the endpoint). Note on `openai-compat`: a strictly-spec OpenAI server can reject the request with HTTP 400 — Talaria sends more than four `stop` sequences and a `skip_special_tokens` field, which some servers refuse. If yours does, use the `vllm`, `ollama`, or `llamacpp` backend instead, or point `openai-compat` at a lenient gateway."
-        },
-        "talaria.autocomplete.endpoint": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "markdownDescription": "Base URL for the autocomplete backend (may be a remote node). Leave empty to use the backend's default (Ollama `http://127.0.0.1:11434`, llama.cpp `http://127.0.0.1:8080`, vLLM `http://127.0.0.1:8000`). Machine-scoped: a workspace cannot redirect where your code context is sent (security)."
-        },
-        "talaria.autocomplete.model": {
-          "type": "string",
-          "default": "qwen2.5-coder:1.5b-base",
-          "scope": "machine",
-          "description": "Model name/id used for FIM completions. Machine-scoped: a workspace cannot silently repoint completions at a different model (security)."
-        },
-        "talaria.autocomplete.debounceMs": {
-          "type": "number",
-          "default": 350,
-          "description": "Debounce delay (ms) before triggering a completion request."
-        },
-        "talaria.autocomplete.maxPromptTokens": {
-          "type": "number",
-          "default": 1024,
-          "description": "Token budget for the assembled prefix/suffix prompt."
-        },
-        "talaria.autocomplete.temperature": {
-          "type": "number",
-          "default": 0.01,
-          "description": "Sampling temperature for completions."
-        },
-        "talaria.autocomplete.apiKey": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "markdownDescription": "**Deprecated — use the `Talaria: Set Autocomplete API Key` command instead**, which stores the key in the OS keychain (SecretStorage). API key for backends that require auth (e.g. `codestral`, `openai-compat`). A value here is migrated into SecretStorage on activation and then cleared. Machine-scoped: not workspace-overridable (security)."
-        },
-        "talaria.autocomplete.crossFile.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Gather cross-file context (recently-edited and recently-opened files) for autocomplete, when the configured backend/model support a cross-file channel. Has no effect when the backend/model expose none (falls back to single-file completion)."
-        },
-        "talaria.autocomplete.crossFile.prefixInjection": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Inject cross-file snippets as comments into the prompt for backends with no native cross-file channel (Ollama, Codestral, openai-compat). **Loopback-gated by default**: only takes effect when `#talaria.autocomplete.endpoint#` resolves to a loopback host (127.0.0.1/localhost), unless `#talaria.autocomplete.crossFile.prefixInjectionRemote#` is also enabled — so turning this on for a local Ollama does not silently start sending workspace snippets to a remote endpoint. A low-signal channel; default-off."
-        },
-        "talaria.autocomplete.crossFile.prefixInjectionRemote": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "markdownDescription": "**Security-sensitive.** Allows `#talaria.autocomplete.crossFile.prefixInjection#` to take effect for a REMOTE (non-loopback) `#talaria.autocomplete.endpoint#` too, sending workspace code snippets from OTHER files to that endpoint (not just the active file's prefix/suffix, which is already sent). Leave off unless you trust the configured remote endpoint with your workspace's code. Machine-scoped: a workspace cannot enable this on its own (security)."
-        },
-        "talaria.autocomplete.crossFile.warmUp": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Experimental: fire a llama.cpp KV-cache warm-up request (`/infill` with an empty prompt, snippets only) whenever the cross-file snippet set regenerates, so the next real completion hits a warm cache. Only takes effect with the `llamacpp` backend (other backends ignore this setting) and still honors the same untrusted-remote/enabled guards as regular completions. Default-off; a latency optimization, not required for cross-file completions to work."
-        },
-        "talaria.rag.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable the codebase RAG indexer and MCP search server."
-        },
-        "talaria.rag.embedEndpoint": {
-          "type": "string",
-          "default": "http://127.0.0.1:11434",
-          "scope": "machine",
-          "description": "Base URL for the embeddings backend (Ollama/llama.cpp/vLLM-compatible; may be a remote node). Machine-scoped: a workspace cannot redirect where whole-file embeddings are sent (security)."
-        },
-        "talaria.rag.embedModel": {
-          "type": "string",
-          "default": "qwen3-embedding:0.6b",
-          "scope": "machine",
-          "description": "Model name/id used to embed code chunks. Machine-scoped: a workspace cannot silently repoint embeddings at a different model (integrity — same rationale as talaria.autocomplete.model)."
-        },
-        "talaria.rag.dims": {
-          "type": "number",
-          "default": 0,
-          "markdownDescription": "Matryoshka truncation width for embeddings, forwarded as the OpenAI `dimensions` field. **`0` (default) means: do not send the field at all and let the server decide.** Only set a positive value if your model and runner support it — llama.cpp ignores the field, Ollama truncates, and vLLM answers HTTP 400 for a non-Matryoshka model, which fails the whole index build. Changing this value changes the index fingerprint and forces a full rebuild."
-        },
-        "talaria.rag.maxChunkTokens": {
-          "type": "number",
-          "default": 512,
-          "description": "Approximate max tokens per indexed chunk."
-        },
-        "talaria.rag.indexDir": {
-          "type": "string",
-          "default": ".hermes/index",
-          "scope": "machine",
-          "description": "Workspace-relative directory where the vector index is stored. Machine-scoped: not workspace-overridable (security)."
-        },
-        "talaria.rag.debounceMs": {
-          "type": "number",
-          "default": 500,
-          "description": "File-watcher debounce (ms) before incremental reindexing."
-        },
-        "talaria.rag.excludeGlobs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [],
-          "description": "Extra glob patterns to exclude from indexing, beyond .gitignore/.hermesignore."
-        },
-        "talaria.lib.enabled": {
-          "type": "boolean",
-          "default": true,
-          "scope": "machine",
-          "markdownDescription": "Expose the editor's live language-server intelligence (diagnostics, definitions, references, symbols, hover) to the Hermes agent as read-only MCP tools over an authenticated loopback server. Read-only; requires a trusted workspace (ignored in Restricted Mode). Machine-scoped: a workspace cannot enable it (security)."
-        },
-        "talaria.customModes": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": [
-              "id",
-              "name"
+    "configuration": [
+      {
+        "title": "Backend & Agent",
+        "order": 1,
+        "properties": {
+          "talaria.backend": {
+            "order": 1,
+            "type": "string",
+            "enum": [
+              "mock",
+              "acp"
             ],
-            "properties": {
-              "id": {
-                "type": "string",
-                "description": "Stable identifier for this mode (used on the wire and to match it up when re-selected)."
-              },
-              "name": {
-                "type": "string",
-                "description": "Display name shown in the mode picker."
-              },
-              "deny": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "Rules the agent may NOT edit: an exact workspace-relative path, a directory prefix ending '/', or a basename suffix '*.ext'."
-              },
-              "allowOnly": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "If set, ONLY paths matching one of these rules may be edited; everything else is denied (same rule grammar as deny)."
-              }
-            }
+            "enumDescriptions": [
+              "Canned streaming + panel data. Spawns no process; runs on any OS. Default.",
+              "Real backend: spawns `hermes acp` over JSON-RPC/stdio (Linux). Wired later."
+            ],
+            "default": "mock",
+            "scope": "machine",
+            "description": "Which agent backend the extension talks to. Machine-scoped: a workspace cannot flip this to `acp` to force a process spawn (security)."
           },
-          "default": [],
-          "scope": "resource",
-          "markdownDescription": "Custom modes restrict which files the agent may edit on the main edit path (`write_file`/`patch`). Rules: exact workspace-relative path (`src/app.ts`), directory prefix ending `/` (`src/`), or basename suffix (`*.env`). No globs/`**`/negation. A mode is a strong floor on the main edit path, **not a sandbox** — terminal, code execution, subagent, and MCP-tool writes bypass it; recovery for those is the post-turn checkpoint."
-        },
-        "talaria.nextEdit.backend": {
-          "type": "string",
-          "enum": [
-            "ollama",
-            "openai-compat"
-          ],
-          "default": "ollama",
-          "scope": "machine",
-          "description": "Transport for Next Edit Suggestions (the NEXT source). Generic always uses the FIM model on `#talaria.autocomplete.endpoint#`, never this setting. Machine-scoped: a workspace cannot redirect where next-edit context is sent (security)."
-        },
-        "talaria.nextEdit.endpoint": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "markdownDescription": "Base URL for the Next Edit Suggestions (NEXT) backend. Leave empty to use the backend's default. Generic always uses `#talaria.autocomplete.endpoint#` instead of this setting. Machine-scoped: a workspace cannot redirect where next-edit context is sent (security)."
-        },
-        "talaria.nextEdit.model": {
-          "type": "string",
-          "default": "",
-          "scope": "machine",
-          "description": "Model name/id used for Next Edit Suggestions (the NEXT source), e.g. a sweep-v2-7B GGUF import. Machine-scoped: a workspace cannot silently repoint next-edit requests at a different model (security)."
+          "talaria.hermesPath": {
+            "order": 2,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "Absolute path to the `hermes` executable (e.g. a virtualenv `bin/hermes`). Leave empty to discover it from the login-shell `PATH` (`command -v hermes`). Set this when PATH discovery cannot work — Flatpak VS Code, Remote-SSH with a non-login PATH, or a custom install location. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot override it (prevents a malicious repo from repointing the executable — security)."
+          },
+          "talaria.pythonPath": {
+            "order": 3,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "Absolute path to the Python interpreter used to launch the real Hermes backend (e.g. a virtualenv `bin/python`). Leave empty to resolve `python` from the login-shell `PATH`. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot override this (prevents a malicious repo from repointing the interpreter — security)."
+          },
+          "talaria.cwd": {
+            "order": 4,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "Working directory for the Hermes agent process. Leave empty to use the first workspace folder. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: not workspace-overridable (security). When no workspace folder is open, the user home directory is used."
+          }
+        }
+      },
+      {
+        "title": "Autocomplete (FIM)",
+        "order": 2,
+        "properties": {
+          "talaria.autocomplete.enabled": {
+            "order": 1,
+            "type": "boolean",
+            "default": true,
+            "description": "Enable Talaria inline (FIM) autocomplete."
+          },
+          "talaria.autocomplete.backend": {
+            "order": 2,
+            "type": "string",
+            "enum": [
+              "ollama",
+              "llamacpp",
+              "vllm",
+              "codestral",
+              "openai-compat"
+            ],
+            "default": "ollama",
+            "scope": "machine",
+            "markdownDescription": "Which FIM backend serves autocomplete requests. Machine-scoped: a workspace cannot flip this to a cloud backend and redirect your code off the machine (security — this setting SELECTS the endpoint). Note on `openai-compat`: a strictly-spec OpenAI server can reject the request with HTTP 400 — Talaria sends more than four `stop` sequences and a `skip_special_tokens` field, which some servers refuse. If yours does, use the `vllm`, `ollama`, or `llamacpp` backend instead, or point `openai-compat` at a lenient gateway."
+          },
+          "talaria.autocomplete.endpoint": {
+            "order": 3,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "Base URL for the autocomplete backend (may be a remote node). Leave empty to use the backend's default (Ollama `http://127.0.0.1:11434`, llama.cpp `http://127.0.0.1:8080`, vLLM `http://127.0.0.1:8000`). Machine-scoped: a workspace cannot redirect where your code context is sent (security)."
+          },
+          "talaria.autocomplete.model": {
+            "order": 4,
+            "type": "string",
+            "default": "qwen2.5-coder:1.5b-base",
+            "scope": "machine",
+            "description": "Model name/id used for FIM completions. Machine-scoped: a workspace cannot silently repoint completions at a different model (security)."
+          },
+          "talaria.autocomplete.apiKey": {
+            "order": 5,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "**Deprecated — use the `Talaria: Set Autocomplete API Key` command instead**, which stores the key in the OS keychain (SecretStorage). API key for backends that require auth (e.g. `codestral`, `openai-compat`). A value here is migrated into SecretStorage on activation and then cleared. Machine-scoped: not workspace-overridable (security)."
+          },
+          "talaria.autocomplete.debounceMs": {
+            "order": 6,
+            "type": "number",
+            "default": 350,
+            "description": "Debounce delay (ms) before triggering a completion request."
+          },
+          "talaria.autocomplete.maxPromptTokens": {
+            "order": 7,
+            "type": "number",
+            "default": 1024,
+            "description": "Token budget for the assembled prefix/suffix prompt."
+          },
+          "talaria.autocomplete.temperature": {
+            "order": 8,
+            "type": "number",
+            "default": 0.01,
+            "description": "Sampling temperature for completions."
+          },
+          "talaria.autocomplete.crossFile.enabled": {
+            "order": 9,
+            "type": "boolean",
+            "default": true,
+            "description": "Gather cross-file context (recently-edited and recently-opened files) for autocomplete, when the configured backend/model support a cross-file channel. Has no effect when the backend/model expose none (falls back to single-file completion)."
+          },
+          "talaria.autocomplete.crossFile.prefixInjection": {
+            "order": 10,
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "Inject cross-file snippets as comments into the prompt for backends with no native cross-file channel (Ollama, Codestral, openai-compat). **Loopback-gated by default**: only takes effect when `#talaria.autocomplete.endpoint#` resolves to a loopback host (127.0.0.1/localhost), unless `#talaria.autocomplete.crossFile.prefixInjectionRemote#` is also enabled — so turning this on for a local Ollama does not silently start sending workspace snippets to a remote endpoint. A low-signal channel; default-off."
+          },
+          "talaria.autocomplete.crossFile.prefixInjectionRemote": {
+            "order": 11,
+            "type": "boolean",
+            "default": false,
+            "scope": "machine",
+            "markdownDescription": "**Security-sensitive.** Allows `#talaria.autocomplete.crossFile.prefixInjection#` to take effect for a REMOTE (non-loopback) `#talaria.autocomplete.endpoint#` too, sending workspace code snippets from OTHER files to that endpoint (not just the active file's prefix/suffix, which is already sent). Leave off unless you trust the configured remote endpoint with your workspace's code. Machine-scoped: a workspace cannot enable this on its own (security)."
+          },
+          "talaria.autocomplete.crossFile.warmUp": {
+            "order": 12,
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "Experimental: fire a llama.cpp KV-cache warm-up request (`/infill` with an empty prompt, snippets only) whenever the cross-file snippet set regenerates, so the next real completion hits a warm cache. Only takes effect with the `llamacpp` backend (other backends ignore this setting) and still honors the same untrusted-remote/enabled guards as regular completions. Default-off; a latency optimization, not required for cross-file completions to work."
+          }
+        }
+      },
+      {
+        "title": "Next Edit",
+        "order": 3,
+        "properties": {
+          "talaria.nextEdit.source": {
+            "order": 1,
+            "type": "string",
+            "enum": [
+              "off",
+              "dedicated",
+              "generic"
+            ],
+            "enumDescriptions": [
+              "Next Edit disabled. Default.",
+              "A separate, NEXT-specialized model — served via the talaria.nextEdit.backend / .endpoint / .model settings (needs its own setup).",
+              "Reuses your existing FIM autocomplete model and endpoint — no extra setup beyond FIM itself."
+            ],
+            "default": "off",
+            "scope": "machine",
+            "markdownDescription": "Which engine produces Next Edit (NEXT) multi-line suggestions. `off` (default) disables NEXT. `generic` reuses your FIM autocomplete model on `#talaria.autocomplete.endpoint#` — no extra setup beyond FIM itself. `dedicated` uses a separate NEXT model configured via `#talaria.nextEdit.backend#`, `#talaria.nextEdit.endpoint#` and `#talaria.nextEdit.model#`. Only one source can be active at a time. Ignored while `#talaria.autocomplete.enabled#` is off for `generic`-mode suggestions. Machine-scoped: this setting decides whether — and, via `generic` vs `dedicated`, to which configured backend — editor context is sent for next-edit suggestions; a workspace cannot switch it on by itself (security — same rationale as `#talaria.nextEdit.backend#`)."
+          },
+          "talaria.nextEdit.backend": {
+            "order": 2,
+            "type": "string",
+            "enum": [
+              "ollama",
+              "openai-compat"
+            ],
+            "default": "ollama",
+            "scope": "machine",
+            "description": "Transport for Next Edit Suggestions (the NEXT source). Generic always uses the FIM model on `#talaria.autocomplete.endpoint#`, never this setting. Machine-scoped: a workspace cannot redirect where next-edit context is sent (security)."
+          },
+          "talaria.nextEdit.endpoint": {
+            "order": 3,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "Base URL for the Next Edit Suggestions (NEXT) backend. Leave empty to use the backend's default. Generic always uses `#talaria.autocomplete.endpoint#` instead of this setting. Machine-scoped: a workspace cannot redirect where next-edit context is sent (security)."
+          },
+          "talaria.nextEdit.model": {
+            "order": 4,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "description": "Model name/id used for Next Edit Suggestions (the NEXT source), e.g. a sweep-v2-7B GGUF import. Machine-scoped: a workspace cannot silently repoint next-edit requests at a different model (security)."
+          }
+        }
+      },
+      {
+        "title": "RAG (Codebase Index)",
+        "order": 4,
+        "properties": {
+          "talaria.rag.enabled": {
+            "order": 1,
+            "type": "boolean",
+            "default": true,
+            "description": "Enable the codebase RAG indexer and MCP search server."
+          },
+          "talaria.rag.embedEndpoint": {
+            "order": 2,
+            "type": "string",
+            "default": "http://127.0.0.1:11434",
+            "scope": "machine",
+            "description": "Base URL for the embeddings backend (Ollama/llama.cpp/vLLM-compatible; may be a remote node). Machine-scoped: a workspace cannot redirect where whole-file embeddings are sent (security)."
+          },
+          "talaria.rag.embedModel": {
+            "order": 3,
+            "type": "string",
+            "default": "qwen3-embedding:0.6b",
+            "scope": "machine",
+            "description": "Model name/id used to embed code chunks. Machine-scoped: a workspace cannot silently repoint embeddings at a different model (integrity — same rationale as talaria.autocomplete.model)."
+          },
+          "talaria.rag.dims": {
+            "order": 4,
+            "type": "number",
+            "default": 0,
+            "markdownDescription": "Matryoshka truncation width for embeddings, forwarded as the OpenAI `dimensions` field. **`0` (default) means: do not send the field at all and let the server decide.** Only set a positive value if your model and runner support it — llama.cpp ignores the field, Ollama truncates, and vLLM answers HTTP 400 for a non-Matryoshka model, which fails the whole index build. Changing this value changes the index fingerprint and forces a full rebuild."
+          },
+          "talaria.rag.maxChunkTokens": {
+            "order": 5,
+            "type": "number",
+            "default": 512,
+            "description": "Approximate max tokens per indexed chunk."
+          },
+          "talaria.rag.indexDir": {
+            "order": 6,
+            "type": "string",
+            "default": ".hermes/index",
+            "scope": "machine",
+            "description": "Workspace-relative directory where the vector index is stored. Machine-scoped: not workspace-overridable (security)."
+          },
+          "talaria.rag.debounceMs": {
+            "order": 7,
+            "type": "number",
+            "default": 500,
+            "description": "File-watcher debounce (ms) before incremental reindexing."
+          },
+          "talaria.rag.excludeGlobs": {
+            "order": 8,
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "Extra glob patterns to exclude from indexing, beyond .gitignore/.hermesignore."
+          }
+        }
+      },
+      {
+        "title": "Advanced",
+        "order": 5,
+        "properties": {
+          "talaria.dashboardPort": {
+            "order": 1,
+            "type": "number",
+            "default": 9119,
+            "scope": "machine",
+            "markdownDescription": "Loopback port for the Hermes dashboard REST server (`http://127.0.0.1:<port>`) that powers the real Skills & Tools panels. If a dashboard is already listening there it is adopted; otherwise the extension spawns `python -m hermes_cli.main serve --port <port>` (Linux). Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot repoint it (security)."
+          },
+          "talaria.dashboardAdopt": {
+            "order": 2,
+            "type": "string",
+            "enum": [
+              "spawn-only",
+              "shape"
+            ],
+            "enumDescriptions": [
+              "Secure default. Never adopts a pre-existing dashboard: always spawns and provenance-verifies its own child before use.",
+              "Legacy, INSECURE opt-in: adopts any already-running responder whose /api/status body merely LOOKS like Hermes, with no further verification. Only for coexisting with an already-running Hermes desktop holding the port."
+            ],
+            "default": "spawn-only",
+            "scope": "machine",
+            "markdownDescription": "How the extension discovers the Hermes dashboard REST server on `#talaria.dashboardPort#`. `spawn-only` (default, secure) never adopts a foreign peer — it always spawns its own child and verifies the healthy server's served session token has the provenance of that spawn before use (CWE-306/346). `shape` is a legacy, INSECURE opt-in that adopts any responder whose `/api/status` body is merely Hermes-shaped, which a local process could spoof; use it only to coexist with an already-running Hermes desktop instance. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot weaken this (security)."
+          },
+          "talaria.lib.enabled": {
+            "order": 3,
+            "type": "boolean",
+            "default": true,
+            "scope": "machine",
+            "markdownDescription": "Expose the editor's live language-server intelligence (diagnostics, definitions, references, symbols, hover) to the Hermes agent as read-only MCP tools over an authenticated loopback server. Read-only; requires a trusted workspace (ignored in Restricted Mode). Machine-scoped: a workspace cannot enable it (security)."
+          },
+          "talaria.customModes": {
+            "order": 4,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Stable identifier for this mode (used on the wire and to match it up when re-selected)."
+                },
+                "name": {
+                  "type": "string",
+                  "description": "Display name shown in the mode picker."
+                },
+                "deny": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Rules the agent may NOT edit: an exact workspace-relative path, a directory prefix ending '/', or a basename suffix '*.ext'."
+                },
+                "allowOnly": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "If set, ONLY paths matching one of these rules may be edited; everything else is denied (same rule grammar as deny)."
+                }
+              }
+            },
+            "default": [],
+            "scope": "resource",
+            "markdownDescription": "Custom modes restrict which files the agent may edit on the main edit path (`write_file`/`patch`). Rules: exact workspace-relative path (`src/app.ts`), directory prefix ending `/` (`src/`), or basename suffix (`*.env`). No globs/`**`/negation. A mode is a strong floor on the main edit path, **not a sandbox** — terminal, code execution, subagent, and MCP-tool writes bypass it; recovery for those is the post-turn checkpoint."
+          }
         }
       }
-    }
+    ]
   },
   "scripts": {
     "build": "npm run build:host && npm run build:webview",

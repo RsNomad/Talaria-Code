@@ -25,21 +25,28 @@ import { RAG_SETTING_RELOAD } from './ragReloadSettings';
 const REPO_ROOT = join(__dirname, '..', '..');
 const RAG_PREFIX = 'talaria.rag.';
 
+interface ConfigCategory {
+  properties?: Record<string, unknown>;
+}
+
 interface PackageManifest {
   contributes: {
-    configuration: {
-      properties: Record<string, unknown>;
-    };
+    configuration: ConfigCategory | ConfigCategory[];
   };
 }
 
 /** Reads `package.json` fresh (never cached) and returns the `talaria.rag.*`
  * property keys with the `talaria.rag.` prefix stripped — e.g. `'enabled'`,
- * `'embedEndpoint'`. */
+ * `'embedEndpoint'`. `contributes.configuration` is an array of titled
+ * categories (configurationSections.test.ts locks the shape), so the keys
+ * are gathered across ALL categories. */
 function ragSettingKeysFromPackageJson(): string[] {
   const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as PackageManifest;
-  const properties = manifest.contributes.configuration.properties;
-  return Object.keys(properties)
+  const sections = Array.isArray(manifest.contributes.configuration)
+    ? manifest.contributes.configuration
+    : [manifest.contributes.configuration];
+  return sections
+    .flatMap((section) => Object.keys(section.properties ?? {}))
     .filter((key) => key.startsWith(RAG_PREFIX))
     .map((key) => key.slice(RAG_PREFIX.length));
 }

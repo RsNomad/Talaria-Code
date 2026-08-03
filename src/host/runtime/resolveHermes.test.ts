@@ -117,19 +117,26 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
 });
 
 describe('package.json — R-A5: talaria.hermesPath is contributed machine-scoped and trust-restricted', () => {
+  type ManifestProperty = { type: string; scope?: string; default?: unknown };
+  type ManifestCategory = { properties?: Record<string, ManifestProperty> };
   const manifest = JSON.parse(
     readFileSync(path.join(__dirname, '..', '..', '..', 'package.json'), 'utf-8'),
   ) as {
-    contributes: {
-      configuration: {
-        properties: Record<string, { type: string; scope?: string; default?: unknown }>;
-      };
-    };
+    contributes: { configuration: ManifestCategory | ManifestCategory[] };
     capabilities: { untrustedWorkspaces: { restrictedConfigurations: string[] } };
   };
+  // `contributes.configuration` is an array of titled categories
+  // (configurationSections.test.ts locks the shape) — flatten to the union.
+  const configSections = Array.isArray(manifest.contributes.configuration)
+    ? manifest.contributes.configuration
+    : [manifest.contributes.configuration];
+  const configProperties: Record<string, ManifestProperty> = {};
+  for (const section of configSections) {
+    Object.assign(configProperties, section.properties ?? {});
+  }
 
   it('contributes talaria.hermesPath (string, machine scope, empty default)', () => {
-    const prop = must(manifest.contributes.configuration.properties['talaria.hermesPath']);
+    const prop = must(configProperties['talaria.hermesPath']);
     expect(prop.type).toBe('string');
     expect(prop.scope).toBe('machine');
     expect(prop.default).toBe('');
