@@ -26,6 +26,7 @@ import { App } from './App';
 import { bridge } from './bridge';
 import { BOOTSTRAP_TAB_ID } from './types';
 import { tabDomId, CHAT_TABPANEL_ID } from './components/TabStrip';
+import { panelTabpanelId } from './components/PriorityTabs';
 
 /** Mirrors App.tsx's `state.systemError` banner call site. */
 function renderAppWithSystemError({ message }: { message: string }) {
@@ -550,6 +551,91 @@ describe('CF-12 review fix (W3-T7, IMP-2): checkpoint redo carries rootId + the 
     const redoCalls = requestSpy.mock.calls.filter(([method]) => method === 'checkpoint.redo');
     expect(redoCalls).toHaveLength(2);
     expect(redoCalls[1]).toEqual(['checkpoint.redo', { rootId: 'root-3', force: true }, BOOTSTRAP_TAB_ID]);
+    requestSpy.mockRestore();
+  });
+});
+
+/**
+ * Task 2 (P1 entry-point fix, doc §3.3): the webview FETCH half. Task 1's
+ * reducer (`transcript.ts`'s `case 'panel.activate'`) only folds
+ * `activePanel` — a pure reducer cannot itself issue the correlated
+ * `panel.data` request, so the App-layer bridge subscription owns that side
+ * effect and tags it with a `trigger` naming its cause: `'activate'` for a
+ * live `panel.activate` post (the rocket icon / walkthrough / command
+ * palette funnel while the webview is already live), `'hydrate'` for a cold
+ * boot that lands directly on a non-chat GLOBAL-scoped panel (the
+ * `initialPanel` latch — fixes the "Loading setup status… forever" gap, D2
+ * half 2). An ordinary user tab click keeps fetching WITHOUT a `trigger`
+ * key — the host attributes that case to `cause: 'user'` on its own.
+ *
+ * `setup` is the only panel exercised below: it is the sole
+ * GLOBAL-scoped, non-chat panel any entry point in this repo currently
+ * activates or hydrate-boots into (doc §3.4's six-entry audit).
+ */
+describe('Task 2 (P1 §3.3): cause-tagged setup fetch on panel.activate + hydrate boot', () => {
+  it('panel.activate renders the Setup panel AND fetches it with trigger=activate', async () => {
+    const requestSpy = vi.spyOn(bridge, 'request').mockResolvedValue(undefined);
+    render(<App />);
+
+    await act(async () => {
+      bridge.emit({ type: 'panel.activate', panel: 'setup' });
+    });
+
+    // Task 1's reducer half: `activePanel` folded, the Setup tabpanel mounts.
+    expect(document.getElementById(panelTabpanelId('setup'))).toBeTruthy();
+    // Task 2's fetch half: the SAME event also issues a cause-tagged fetch.
+    // `setup` is GLOBAL-scoped (no owning tab), so `resolvePanelRequest`
+    // deliberately leaves `rejectTag` unset (state/panels.ts's
+    // `PanelRequestScope` doc) — `bridge.request`'s third (tag) argument is
+    // `undefined`, unchanged by this task.
+    expect(requestSpy).toHaveBeenCalledWith(
+      'panel.data',
+      expect.objectContaining({ panel: 'setup', trigger: 'activate' }),
+      undefined,
+    );
+    requestSpy.mockRestore();
+  });
+
+  it('a hydrate that boots into a data panel fetches it with trigger=hydrate (cold path)', async () => {
+    const requestSpy = vi.spyOn(bridge, 'request').mockResolvedValue(undefined);
+    render(<App />);
+
+    await act(async () => {
+      bridge.emit({
+        type: 'hydrate',
+        state: {
+          sessionId: null,
+          theme: { kind: 'dark', accent: '#14b8a6' },
+          mode: 'default',
+          backendKind: 'mock',
+          preset: 'manual',
+          currentModelId: null,
+          activePanel: 'setup',
+        },
+      });
+    });
+
+    expect(document.getElementById(panelTabpanelId('setup'))).toBeTruthy();
+    expect(requestSpy).toHaveBeenCalledWith(
+      'panel.data',
+      expect.objectContaining({ panel: 'setup', trigger: 'hydrate' }),
+      undefined,
+    );
+    requestSpy.mockRestore();
+  });
+
+  it('a plain user click fetches WITHOUT a trigger key (cause=user host-side)', async () => {
+    const requestSpy = vi.spyOn(bridge, 'request').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    render(<App />);
+
+    const panelsTablist = within(screen.getByRole('tablist', { name: 'Panels' }));
+    await user.click(panelsTablist.getByRole('tab', { name: 'Setup' }));
+
+    // Same call shape `selectPanel` has always produced (no `trigger` key at
+    // all — not even `trigger: undefined` — since `requestPanel` only ever
+    // spreads it in when a caller passes one).
+    expect(requestSpy).toHaveBeenCalledWith('panel.data', { panel: 'setup' }, undefined);
     requestSpy.mockRestore();
   });
 });
