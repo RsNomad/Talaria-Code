@@ -4,7 +4,11 @@ node_modules/
 # Build output
 dist/
 out/
+out-inttest/
 coverage/
+
+# @vscode/test-electron download + user-data (Task 6 integration test)
+.vscode-test/
 
 # Package artifacts
 *.vsix

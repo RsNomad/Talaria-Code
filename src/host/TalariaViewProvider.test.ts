@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as vscode from 'vscode';
 import { TalariaViewProvider, capSeedText, decideSeedDelivery } from './TalariaViewProvider';
+import type { WebviewSignal } from './TalariaViewProvider';
 import type { AgentBackend } from './backend/AgentBackend';
 import { SetupController, type SetupHost, type SetupControllerDeps } from './setup/SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
@@ -26,7 +27,30 @@ import type {
 } from '../shared/protocol';
 
 vi.mock('vscode', () => {
+  // Task 4 (§4.2): the provider now constructs a `vscode.EventEmitter` at
+  // construction time (`onWebviewSignal`'s backing emitter) — same minimal
+  // shim as `MockBackend.test.ts`/`extension.test.ts` use for the real
+  // `AcpBackend`'s emitters.
+  class EventEmitter<T> {
+    private listeners: Array<(e: T) => void> = [];
+    event = (listener: (e: T) => void) => {
+      this.listeners.push(listener);
+      return {
+        dispose: () => {
+          this.listeners = this.listeners.filter((l) => l !== listener);
+        },
+      };
+    };
+    fire(data: T): void {
+      for (const listener of [...this.listeners]) listener(data);
+    }
+    dispose(): void {
+      this.listeners = [];
+    }
+  }
+
   return {
+    EventEmitter,
     window: {
       // Constructor subscribes to theme changes; return a no-op disposable.
       onDidChangeActiveColorTheme: () => ({ dispose() {} }),
@@ -120,11 +144,31 @@ function makeProviderWith(backend: AgentBackend): {
 } {
   const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend);
   const posted: HostToWebviewMessage[] = [];
-  seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
+  // Task 3 (critic A4): postMessage must return a resolved Thenable<boolean>
+  // — openSetupPanel()'s live branch chains `.then(...)` on the result, and
+  // a fake returning void/undefined would TypeError at runtime.
+  seam(provider).view = {
+    webview: {
+      postMessage: (m) => {
+        posted.push(m);
+        return Promise.resolve(true);
+      },
+    },
+  };
   return { provider, posted };
 }
 
 interface ProviderSeam {
+  // NOTE: kept as `void` (not `Promise<boolean>`) deliberately — this is a
+  // structural type for the CAST `seam()` uses, not something production
+  // code ever reads (production calls `.then()` against the REAL
+  // `vscode.WebviewView` type on `this.view`). Widening this to
+  // `Promise<boolean>` would force EVERY fake assigned to `.view`
+  // throughout this file to also return one, even the many unrelated to
+  // openSetupPanel; a `void`-typed target already accepts a function that
+  // returns more (TS callback-compatibility), so the handful of fakes that
+  // DO need a real Thenable<boolean> (Task 3, critic A4) just return one at
+  // the call site instead.
   view: { webview: { postMessage: (m: HostToWebviewMessage) => void } } | undefined;
   handleWebviewMessage: (msg: WebviewToHostMessage) => void;
 }
@@ -140,7 +184,15 @@ function makeProvider(invokeControl: AgentBackend['invokeControl']): {
   const backend = makeFakeBackend(invokeControl);
   const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend);
   const posted: HostToWebviewMessage[] = [];
-  seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
+  // Task 3 (critic A4): see makeProviderWith's matching comment above.
+  seam(provider).view = {
+    webview: {
+      postMessage: (m) => {
+        posted.push(m);
+        return Promise.resolve(true);
+      },
+    },
+  };
   return { provider, posted };
 }
 
@@ -242,7 +294,15 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     const backend = makeFakeBackend(invokeControl);
     const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, backend, undefined, searchFiles);
     const posted: HostToWebviewMessage[] = [];
-    seam(provider).view = { webview: { postMessage: (m) => posted.push(m) } };
+    // Task 3 (critic A4): see makeProviderWith's matching comment above.
+    seam(provider).view = {
+      webview: {
+        postMessage: (m) => {
+          posted.push(m);
+          return Promise.resolve(true);
+        },
+      },
+    };
     return { provider, posted, invokeControl };
   }
 
@@ -887,7 +947,7 @@ function makeFakeWebviewView(posted: HostToWebviewMessage[]): {
       cspSource: string;
       asWebviewUri: (uri: unknown) => unknown;
       onDidReceiveMessage: (cb: (msg: WebviewToHostMessage) => void) => { dispose(): void };
-      postMessage: (m: HostToWebviewMessage) => void;
+      postMessage: (m: HostToWebviewMessage) => Promise<boolean>;
     };
     onDidDispose: (cb: () => void) => { dispose(): void };
   };
@@ -899,8 +959,13 @@ function makeFakeWebviewView(posted: HostToWebviewMessage[]): {
       cspSource: 'vscode-webview:',
       asWebviewUri: (uri: unknown) => uri,
       onDidReceiveMessage: () => ({ dispose() {} }),
+      // Task 3 (critic A4): postMessage must return a resolved
+      // Thenable<boolean> — openSetupPanel()'s live branch chains
+      // `.then(...)` on the result, and a fake returning void/undefined
+      // would TypeError at runtime.
       postMessage: (m: HostToWebviewMessage) => {
         posted.push(m);
+        return Promise.resolve(true);
       },
     },
     onDidDispose: (cb: () => void) => {
@@ -909,6 +974,54 @@ function makeFakeWebviewView(posted: HostToWebviewMessage[]): {
     },
   };
   return { view, fireDispose: () => disposeCb?.() };
+}
+
+/**
+ * Task 3 (P1 openSetupPanel live/latch races): a fake `WebviewView` whose
+ * `postMessage` returns a MANUALLY-controlled pending promise — lets a test
+ * interleave other host events (a stale dispose, a replacement webview going
+ * `ready`) BETWEEN the post and its settlement, exactly the window
+ * `openSetupPanel`'s `isWebviewLive` re-check races against.
+ */
+function makeDeferredPostMessageView(posted: HostToWebviewMessage[]): {
+  view: {
+    webview: {
+      options?: unknown;
+      html?: string;
+      cspSource: string;
+      asWebviewUri: (uri: unknown) => unknown;
+      onDidReceiveMessage: (cb: (msg: WebviewToHostMessage) => void) => { dispose(): void };
+      postMessage: (m: HostToWebviewMessage) => Promise<boolean>;
+    };
+    onDidDispose: (cb: () => void) => { dispose(): void };
+  };
+  resolvePost: (delivered: boolean) => void;
+  fireDispose: () => void;
+} {
+  let disposeCb: (() => void) | undefined;
+  let settle: ((delivered: boolean) => void) | undefined;
+  const view = {
+    webview: {
+      cspSource: 'vscode-webview:',
+      asWebviewUri: (uri: unknown) => uri,
+      onDidReceiveMessage: () => ({ dispose() {} }),
+      postMessage: (m: HostToWebviewMessage) => {
+        posted.push(m);
+        return new Promise<boolean>((resolve) => {
+          settle = resolve;
+        });
+      },
+    },
+    onDidDispose: (cb: () => void) => {
+      disposeCb = cb;
+      return { dispose() {} };
+    },
+  };
+  return {
+    view,
+    resolvePost: (delivered: boolean) => settle?.(delivered),
+    fireDispose: () => disposeCb?.(),
+  };
 }
 
 describe('TalariaViewProvider — T3 review Minor (deliverable 8): onDidDispose latches instead of leaving a stale live view', () => {
@@ -1314,7 +1427,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
     expect(posted).toContainEqual({ type: 'setup.progress', op: 'install', id: 'hermes', phase: 'pipx-install' });
   });
 
-  it('openSetupPanel() seeds the NEXT hydrate with activePanel:"setup"', () => {
+  it('openSetupPanel() latches the NEXT hydrate with activePanel:"setup" — delivered by the READY handshake, not resolve-time', () => {
     const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
     // Called BEFORE the view is ever resolved — the cold-boot first-run
     // auto-open case (extension.ts calls this synchronously at activation).
@@ -1323,7 +1436,16 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
     const posted: HostToWebviewMessage[] = [];
     const { view } = makeFakeWebviewView(posted);
     provider.resolveWebviewView(view as never, {} as never, {} as never);
+    // Task 3 (D2 fix): resolve-time no longer posts ANYTHING — the old
+    // resolve-time `postTheme()` + `hydrate` seed was DELETED because it
+    // consumed the one-shot `initialPanel` latch one hydrate too soon (the
+    // freshly resolved page has no message listener yet regardless of
+    // whether this seed exists — postMessage is documented-droppable
+    // pre-subscription). The `ready` handler now owns the cold-path hydrate
+    // exclusively.
+    expect(posted).toEqual([]);
 
+    seam(provider).handleWebviewMessage({ type: 'ready' });
     const hydrate = posted.find((m) => m.type === 'hydrate') as { type: 'hydrate'; state: { activePanel: string } } | undefined;
     expect(hydrate?.state.activePanel).toBe('setup');
   });
@@ -1335,6 +1457,9 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
     const posted1: HostToWebviewMessage[] = [];
     const { view: view1 } = makeFakeWebviewView(posted1);
     provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+    // Task 3 (D2 fix): the hydrate arrives only once view1 announces
+    // `ready` — see the reasoning in the test above.
+    seam(provider).handleWebviewMessage({ type: 'ready' });
     const hydrate1 = posted1.find((m) => m.type === 'hydrate') as
       | { type: 'hydrate'; state: { activePanel: string } }
       | undefined;
@@ -1346,10 +1471,240 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
     const posted2: HostToWebviewMessage[] = [];
     const { view: view2 } = makeFakeWebviewView(posted2);
     provider.resolveWebviewView(view2 as never, {} as never, {} as never);
+    seam(provider).handleWebviewMessage({ type: 'ready' });
     const hydrate2 = posted2.find((m) => m.type === 'hydrate') as
       | { type: 'hydrate'; state: { activePanel: string } }
       | undefined;
     expect(hydrate2?.state.activePanel).toBe('chat');
+  });
+});
+
+/*
+ * ── Task 4 (§4.2): `onWebviewSignal` observability seam ──
+ *
+ * Zero response-behavior change — these signals are additive observers a
+ * Task-6 integration test subscribes to, fired BESIDE the existing
+ * `control.response`/`panel.data` traffic these same handlers already send.
+ * `hasData` is the honest oracle (`result !== undefined`): an unwired
+ * `setupPanelSource` resolves `undefined`, so a cold 'setup' fetch is
+ * `ok:true, hasData:false` — never faked to `true` (critic B3).
+ */
+describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §4.2)', () => {
+  it('fires {kind:"ready"} on ready, then an honest hasData:false panelFetch for an unwired setup fetch', async () => {
+    const { provider } = makeProvider(vi.fn().mockResolvedValue(undefined));
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 100,
+      method: 'panel.data',
+      params: { panel: 'setup', trigger: 'hydrate' },
+    } as never);
+    await flush();
+    await flush();
+
+    expect(signals).toEqual([
+      { kind: 'ready' },
+      { kind: 'panelFetch', panel: 'setup', cause: 'hydrate', ok: true, hasData: false },
+    ]);
+  });
+
+  it('reports hasData:true once a SetupController is wired and status() actually assembles a snapshot', async () => {
+    const { provider } = makeProviderWithSetupController();
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 101,
+      method: 'panel.data',
+      params: { panel: 'setup', trigger: 'activate' },
+    } as never);
+    await flush();
+    await flush();
+    await flush();
+
+    expect(signals).toContainEqual({
+      kind: 'panelFetch',
+      panel: 'setup',
+      cause: 'activate',
+      ok: true,
+      hasData: true,
+    });
+  });
+
+  it('attributes a rejected tools fetch (no trigger) as {panel:"tools", cause:"user", ok:false, hasData:false}', async () => {
+    const { provider } = makeProvider(vi.fn().mockRejectedValue(new Error('boom')));
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 102,
+      method: 'panel.data',
+      params: { panel: 'tools' },
+    } as never);
+    await flush();
+
+    expect(signals).toEqual([{ kind: 'panelFetch', panel: 'tools', cause: 'user', ok: false, hasData: false }]);
+  });
+
+  it('fires NO signal for a panel name outside PANEL_SCOPE (the isDataPanel guard, no cast)', async () => {
+    const { provider } = makeProvider(vi.fn().mockResolvedValue({ ok: true }));
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 103,
+      method: 'panel.data',
+      params: { panel: 'nonsense' },
+    } as never);
+    await flush();
+
+    expect(signals).toEqual([]);
+  });
+});
+
+/*
+ * ── Task 3 (P1 entry-point fix, architecture doc §3.1): openSetupPanel()'s
+ * live/latch funnel ──
+ *
+ * D1's fix: a LIVE webview gets an explicit `panel.activate` post instead of
+ * silently keeping the latch armed (which only a NEXT hydrate would ever
+ * consume — never happening while the same webview instance stays live).
+ * The two failure fallbacks (postMessage resolves `false` / rejects) only
+ * re-arm the latch while `isWebviewLive` is STILL false at settlement time —
+ * arming it under an already-live REPLACEMENT webview would plant a
+ * surprise-yank for some unrelated future hydrate (no delayed-yank).
+ */
+describe('openSetupPanel (P1)', () => {
+  it('posts panel.activate when the webview is live', async () => {
+    const { provider, posted } = makeProviderWith(makeFakeBackend());
+    seam(provider).handleWebviewMessage({ type: 'ready' }); // isWebviewLive -> true
+    posted.length = 0; // only openSetupPanel's own output matters below
+
+    provider.openSetupPanel();
+    await flush();
+
+    expect(posted).toContainEqual({ type: 'panel.activate', panel: 'setup' });
+  });
+
+  it('latches when not yet live; the READY hydrate carries setup exactly once', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    provider.openSetupPanel(); // no view resolved — latches
+
+    const posted: HostToWebviewMessage[] = [];
+    const { view } = makeFakeWebviewView(posted);
+    provider.resolveWebviewView(view as never, {} as never, {} as never);
+    // Resolve itself must post NOTHING (the deleted D2 seed).
+    expect(posted).toEqual([]);
+
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    const hydrates = posted.filter((m) => m.type === 'hydrate');
+    expect(hydrates).toHaveLength(1); // resolve-time hydrate is GONE
+    expect(hydrates[0] && hydrates[0].type === 'hydrate' && hydrates[0].state.activePanel).toBe('setup');
+
+    // A second `ready` (e.g. a re-create on the SAME instance) must NOT
+    // keep re-opening 'setup' — the latch is one-shot, already consumed.
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    const hydratesAfterSecondReady = posted.filter((m) => m.type === 'hydrate');
+    expect(hydratesAfterSecondReady).toHaveLength(2);
+    expect(
+      hydratesAfterSecondReady[1] &&
+        hydratesAfterSecondReady[1].type === 'hydrate' &&
+        hydratesAfterSecondReady[1].state.activePanel,
+    ).toBe('chat');
+  });
+
+  it('falls back to the latch on postMessage=false ONLY while no new webview is live (no delayed-yank)', async () => {
+    // Case A: the webview that received the post dies (disposed) BEFORE the
+    // postMessage promise settles — no replacement is live by the time the
+    // fallback runs, so it is the only remaining channel and MUST arm.
+    {
+      const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+      const postedA: HostToWebviewMessage[] = [];
+      const { view: viewA, resolvePost, fireDispose } = makeDeferredPostMessageView(postedA);
+      provider.resolveWebviewView(viewA as never, {} as never, {} as never);
+      seam(provider).handleWebviewMessage({ type: 'ready' }); // A live
+
+      provider.openSetupPanel(); // posts panel.activate; the promise is still pending
+      // Proves this actually took the LIVE-post branch (not a no-op/latch)
+      // before A died — old pre-fix code never posts anything here at all.
+      expect(postedA).toContainEqual({ type: 'panel.activate', panel: 'setup' });
+      fireDispose(); // A dies before settlement (identity guard clears isWebviewLive)
+      resolvePost(false); // delivery failed
+      await flush();
+
+      // A fresh webview resolves later; its READY hydrate must carry the
+      // latched 'setup' — proving the fallback armed the latch.
+      const postedC: HostToWebviewMessage[] = [];
+      const { view: viewC } = makeFakeWebviewView(postedC);
+      provider.resolveWebviewView(viewC as never, {} as never, {} as never);
+      seam(provider).handleWebviewMessage({ type: 'ready' });
+      const hydrate = postedC.find((m) => m.type === 'hydrate') as
+        | { type: 'hydrate'; state: { activePanel: string } }
+        | undefined;
+      expect(hydrate?.state.activePanel).toBe('setup');
+    }
+
+    // Case B: a REPLACEMENT webview goes live BEFORE the original
+    // postMessage promise settles — the fallback must NOT arm the latch
+    // (that would yank the new webview's panel later, out of nowhere).
+    {
+      const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+      const postedA: HostToWebviewMessage[] = [];
+      const { view: viewA, resolvePost } = makeDeferredPostMessageView(postedA);
+      provider.resolveWebviewView(viewA as never, {} as never, {} as never);
+      seam(provider).handleWebviewMessage({ type: 'ready' }); // A live
+
+      provider.openSetupPanel(); // A's postMessage promise is still pending
+      // Proves this actually took the LIVE-post branch on A before B took
+      // over — old pre-fix code never posts anything here at all.
+      expect(postedA).toContainEqual({ type: 'panel.activate', panel: 'setup' });
+
+      const postedB: HostToWebviewMessage[] = [];
+      const { view: viewB } = makeFakeWebviewView(postedB);
+      provider.resolveWebviewView(viewB as never, {} as never, {} as never); // supersedes A
+      seam(provider).handleWebviewMessage({ type: 'ready' }); // B is now live
+
+      resolvePost(false); // A's stale postMessage finally settles false
+      await flush();
+
+      // A LATER ready on B must still hydrate 'chat' — proving the latch
+      // was never armed by A's stale fallback.
+      postedB.length = 0;
+      seam(provider).handleWebviewMessage({ type: 'ready' });
+      const hydrate = postedB.find((m) => m.type === 'hydrate') as
+        | { type: 'hydrate'; state: { activePanel: string } }
+        | undefined;
+      expect(hydrate?.state.activePanel).toBe('chat');
+    }
+  });
+
+  it('a STALE onDidDispose from a superseded view does not null the live view', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+
+    const postedA: HostToWebviewMessage[] = [];
+    const { view: viewA, fireDispose: fireDisposeA } = makeFakeWebviewView(postedA);
+    provider.resolveWebviewView(viewA as never, {} as never, {} as never);
+    seam(provider).handleWebviewMessage({ type: 'ready' }); // A live
+
+    const postedB: HostToWebviewMessage[] = [];
+    const { view: viewB } = makeFakeWebviewView(postedB);
+    provider.resolveWebviewView(viewB as never, {} as never, {} as never); // supersedes A
+    seam(provider).handleWebviewMessage({ type: 'ready' }); // B live
+    postedB.length = 0;
+
+    fireDisposeA(); // STALE dispose from the superseded view A fires late
+
+    // The identity guard means A's dispose must NOT null the CURRENT (B)
+    // view — openSetupPanel's live branch only succeeds if it survived.
+    provider.openSetupPanel();
+
+    expect(postedB).toContainEqual({ type: 'panel.activate', panel: 'setup' });
   });
 });
 

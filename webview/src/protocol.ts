@@ -16,9 +16,12 @@
  * contract. `makePanelData` (W4 §7 B2) is the one genuine runtime VALUE the
  * mock backends need (the typed `panel.data` constructor) — re-exported
  * explicitly below, same pure/no-Node-import posture as everything else here.
+ * `PANEL_SCOPE` (Task 2, P1 entry-point fix §3.3) is the second: App.tsx's
+ * hydrate-boot fetch branch narrows to GLOBAL-scoped panels only, and that
+ * narrowing needs the real runtime lookup table, not just its type.
  *
  * Do NOT re-add type declarations here. Change the contract in
  * `src/shared/protocol.ts` and both sides stay in lockstep by construction.
  */
 export type * from '../../src/shared/protocol';
-export { makePanelData, MAX_TABS, BOOTSTRAP_TAB_ID } from '../../src/shared/protocol';
+export { makePanelData, MAX_TABS, BOOTSTRAP_TAB_ID, PANEL_SCOPE } from '../../src/shared/protocol';

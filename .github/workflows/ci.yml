@@ -22,7 +22,7 @@ jobs:
   gate:
     name: Typecheck + tests + package smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -43,6 +43,24 @@ jobs:
       #   npm test        -> pretest builds host+webview, then vitest run
       - name: Gate — typecheck (host + webview) + full test suite
         run: npm run gate
+
+      # Cache the downloaded VS Code test build (key pinned to the version in
+      # .vscode-test.mjs — bump both together).
+      - name: Cache VS Code 1.125.0 test build
+        uses: actions/cache@v4
+        with:
+          path: .vscode-test/vscode-*
+          key: vscode-test-${{ runner.os }}-1.125.0
+
+      # P2 guard (beta.3 lesson): boots REAL VS Code headless, activates the
+      # extension, runs talaria.openSetup, and asserts the webview actually
+      # processed the switch (cold + live paths, cause-attributed) — the
+      # runtime-webview regression class unit tests and the package smoke
+      # cannot see. xvfb is preinstalled on GitHub ubuntu runners (VS Code's
+      # own CI guide); if an image drop ever removes it:
+      # sudo apt-get update && sudo apt-get install -y xvfb
+      - name: Integration smoke — activation + open-Setup (headless VS Code)
+        run: xvfb-run -a npm run test:integration
 
       # Proves the extension packages into a real .vsix (catches esbuild/vite/
       # manifest breaks that unit tests can't see). vsce runs vscode:prepublish

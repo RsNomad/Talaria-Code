@@ -209,7 +209,19 @@ export function createVsCodeSetupHost(context: vscode.ExtensionContext): SetupHo
     },
     secrets: {
       store: (key, v) => Promise.resolve(context.secrets.store(key, v)),
-      has: async (key) => (await context.secrets.get(key)) !== undefined,
+      // Final review wave, pre-merge defensive fix: `has()`'s contract
+      // (`SetupHost.secrets.has`, `SetupController.ts`) is `Promise<boolean>`
+      // — it must NEVER reject. `context.secrets.get` can reject on a
+      // keychain-less host (e.g. a headless Linux CI runner with no OS
+      // keyring), and `status()` awaits this unguarded — see
+      // `setupHost.vscode.test.ts` for the covering test.
+      has: async (key) => {
+        try {
+          return (await context.secrets.get(key)) !== undefined;
+        } catch {
+          return false;
+        }
+      },
       delete: (key) => Promise.resolve(context.secrets.delete(key)),
     },
     globalState: {

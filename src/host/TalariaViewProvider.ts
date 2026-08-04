@@ -17,8 +17,8 @@ import { buildSearchFilesResponse } from './context/searchFilesResponse';
 import type { FindFilesFn } from './context/searchFilesResponse';
 import { buildDiffUriParts } from './preview/parseDiffUri';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
-import type { NextEditToggleState, Panel, SetupMethod } from '../shared/protocol';
-import { makePanelData } from '../shared/protocol';
+import type { DataPanel, NextEditToggleState, Panel, SetupMethod } from '../shared/protocol';
+import { makePanelData, PANEL_SCOPE } from '../shared/protocol';
 import { redactControlResponse } from './redactControlResponse';
 import type { SetupController } from './setup/SetupController';
 import { SetupPanelSource } from './panels/setupPanelSource';
@@ -72,6 +72,24 @@ export function decideSeedDelivery(isWebviewLive: boolean): 'post' | 'latch' {
  */
 
 /**
+ * Task 4 (onboarding-entrypoint-fix-architecture.md §4.2): always-on
+ * observability of events {@link TalariaViewProvider} ALREADY produces —
+ * this seam adds no new response behavior, it just lets a Task-6 VS Code
+ * integration test (which cannot read the webview's React state directly)
+ * observe that the extension actually reached the webview and fetched the
+ * right panel. `cause` distinguishes the cold hydrate-boot path from the
+ * live `panel.activate` path from an ordinary user click, and `hasData` is
+ * the HONEST oracle (`result !== undefined`) — a `panel.data` fetch that
+ * resolves without a wired data source (e.g. `setup` before
+ * `setSetupController` runs) is `ok:true` but `hasData:false`, never faked
+ * to `true`.
+ */
+export type PanelFetchCause = 'activate' | 'hydrate' | 'user';
+export type WebviewSignal =
+  | { kind: 'ready' }
+  | { kind: 'panelFetch'; panel: DataPanel; cause: PanelFetchCause; ok: boolean; hasData: boolean };
+
+/**
  * Hosts the Talaria React webview and is the ONLY bridge between it and the
  * {@link AgentBackend}. It is deliberately a dumb pipe:
  *
@@ -103,6 +121,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 
   private view?: vscode.WebviewView;
   private readonly disposables: vscode.Disposable[] = [];
+  /** Task 4 (§4.2): backing emitter for {@link onWebviewSignal} — test-only
+   *  observability, inert in production beyond the (harmless) `fire()`
+   *  calls with no subscribers. Joins {@link disposables} in the
+   *  constructor. */
+  private readonly webviewSignalEmitter = new vscode.EventEmitter<WebviewSignal>();
+  /** Task 4 (§4.2): the seam a Task-6 integration test subscribes to, to
+   *  observe the real host pipeline (`ready` handshake, `panel.data`
+   *  fetches) without reaching into the webview's React state. */
+  readonly onWebviewSignal: vscode.Event<WebviewSignal> = this.webviewSignalEmitter.event;
   /** Subscription to the CURRENT backend's `onMessage`; replaced on swap. */
   private backendMessageSub: vscode.Disposable;
   /** R-C4: latch — `ready` arms the backend once; re-created views must not
@@ -192,6 +219,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // Re-broadcast theme changes so the webview restyles instantly.
     this.disposables.push(
       vscode.window.onDidChangeActiveColorTheme(() => this.postTheme()),
+      this.webviewSignalEmitter,
     );
   }
 
@@ -253,19 +281,48 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * First-run auto-open (§6 entry point 1): reveal the panel with 'setup' as
-   * the initial `activePanel` of the NEXT `hydrate` this webview instance
-   * sends. `extension.ts` calls this once, at activation, guarded by its own
-   * `globalState['talaria.setup.autoOpened']` latch. If the view is already
-   * resolved and live (a genuinely rare race — this fires synchronously at
-   * activation, before the user could plausibly have opened the panel
-   * already), this only reveals; it deliberately does NOT force a re-hydrate
-   * (would yank whatever panel the user is already looking at — the same
-   * rule {@link setBackend}'s trust-upgrade swap follows).
+   * P1 entry-point fix (architecture doc §3.1): the single funnel every
+   * "open Setup" entry point (walkthrough button, rocket icon, command
+   * palette, first-run auto-open, failure nudge) drives, directly or via
+   * `talaria.openSetup`. Two EXCLUSIVE delivery states, keyed off {@link
+   * isWebviewLive}:
+   *  - LIVE webview: posts `panel.activate` directly — this is EXPLICIT user
+   *    intent, so a panel yank is CORRECT here (unlike {@link setBackend}'s
+   *    invisible trust-upgrade swap, which must never emit this message). A
+   *    failed/rejected post falls back to the latch below, but ONLY while no
+   *    REPLACEMENT webview has since gone live — arming it unconditionally
+   *    would plant a surprise-yank on some unrelated future hydrate.
+   *  - NOT YET live (never resolved, or resolved-but-pre-`ready`): latches
+   *    {@link initialPanel} so the next `ready`-triggered {@link seedState}
+   *    hydrate carries `'setup'` — the only reliable channel in that window
+   *    (a resolve-time post would be dropped: `postMessage` is documented-
+   *    droppable before the page has subscribed).
    */
   openSetupPanel(): void {
-    this.initialPanel = 'setup';
     this.revealView();
+    if (this.isWebviewLive && this.view) {
+      // Live webview (visible OR retained-hidden — both receive posts).
+      this.view.webview
+        .postMessage({ type: 'panel.activate', panel: 'setup' } satisfies HostToWebviewMessage)
+        .then(
+          (delivered) => {
+            // Fallback ONLY while no replacement webview has come up live
+            // since: arming the latch under an already-live NEW instance
+            // would plant a surprise-yank for some far-future hydrate —
+            // dropping this one click in that ultra-rare window is the
+            // honest trade. (A Thenable has no `.catch` — hence the
+            // two-arg `.then`, critic A4.)
+            if (!delivered && !this.isWebviewLive) this.initialPanel = 'setup';
+          },
+          () => {
+            if (!this.isWebviewLive) this.initialPanel = 'setup';
+          },
+        );
+    } else {
+      // Not resolved yet, or resolved-but-not-ready: the ready-time hydrate
+      // is the reliable channel — latch and let seedState() carry it.
+      this.initialPanel = 'setup';
+    }
   }
 
   /**
@@ -345,16 +402,25 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // Clearing both here on dispose closes that window: the next `ready`
     // (from a freshly (re)resolved view) is what makes the webview live
     // again, exactly like the very first activation.
+    //
+    // Task 3 (critic A9): identity-guarded — a STALE `onDidDispose` firing
+    // late from a SUPERSEDED webview instance (the exact `webviewView`
+    // captured by this closure) must never null out a NEWER `this.view` that
+    // has already replaced it; only a dispose from the CURRENT view may clear.
     this.disposables.push(
       webviewView.onDidDispose(() => {
-        this.view = undefined;
-        this.isWebviewLive = false;
+        if (this.view === webviewView) {
+          this.view = undefined;
+          this.isWebviewLive = false;
+        }
       }),
     );
 
-    // Seed the freshly-(re)created view.
-    this.postTheme();
-    this.postToWebview({ type: 'hydrate', state: this.seedState() });
+    // Deliberately NO seed posts here: a freshly-resolved page has no
+    // listener yet (postMessage is documented-droppable pre-subscription)
+    // and the 'ready' handler re-posts both — an early hydrate's only
+    // reliable effect was consuming the initialPanel latch one hydrate too
+    // soon (beta.3 D2).
   }
 
   /**
@@ -452,6 +518,9 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     switch (message.type) {
       case 'ready':
         this.isWebviewLive = true;
+        // Task 4 (§4.2): observability only — fired beside the existing
+        // handshake below, changes no response behavior.
+        this.webviewSignalEmitter.fire({ kind: 'ready' });
         this.postTheme();
         this.postToWebview({ type: 'hydrate', state: this.seedState() });
         // R-C4: only the FIRST ready arms the backend. A re-created view
@@ -776,6 +845,16 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     method: ControlRequestMethod,
     params: Record<string, unknown> | undefined,
   ): Promise<void> {
+    // Task 4 (§4.2): attribute a `panel.data` fetch for the `onWebviewSignal`
+    // seam BEFORE running it — `isDataPanel` narrows `extractPanelName`'s
+    // bare `string | undefined` to a real {@link DataPanel} via membership
+    // in `PANEL_SCOPE` (no cast); a name outside that map (guard false)
+    // fires no signal at all. `cause` is the params' own `trigger` when it
+    // names one of the two known literals, else an ordinary user action.
+    const rawPanelName = method === 'panel.data' ? extractPanelName(params) : undefined;
+    const panel = isDataPanel(rawPanelName) ? rawPanelName : undefined;
+    const trigger = params?.trigger;
+    const cause: PanelFetchCause = trigger === 'activate' || trigger === 'hydrate' ? trigger : 'user';
     try {
       // W5.1 R5 (Task 13): `nextEdit.toggle` is HOST-INTERNAL and is
       // special-cased BEFORE backend dispatch (the `'panel.data'` /
@@ -796,8 +875,14 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
               : isSetupMethod(method)
                 ? await this.handleSetupMethod(method, params)
                 : await this.backend.invokeControl(method, params);
+      if (panel) {
+        this.webviewSignalEmitter.fire({ kind: 'panelFetch', panel, cause, ok: true, hasData: result !== undefined });
+      }
       this.postToWebview({ type: 'control.response', requestId, ok: true, result: redactControlResponse(method, result) });
     } catch (err) {
+      if (panel) {
+        this.webviewSignalEmitter.fire({ kind: 'panelFetch', panel, cause, ok: false, hasData: false });
+      }
       this.logger?.appendLine(`[control.request] ${method} failed: ${String(err)}`);
       this.postToWebview({
         type: 'control.response',
@@ -1090,6 +1175,17 @@ function isSetupMethod(method: string): method is SetupMethod {
 function extractPanelName(params: Record<string, unknown> | undefined): string | undefined {
   const panel = params?.panel;
   return typeof panel === 'string' ? panel : undefined;
+}
+
+/**
+ * Task 4 (§4.2): narrows `extractPanelName`'s bare `string | undefined` to a
+ * real {@link DataPanel} via membership in {@link PANEL_SCOPE} — no cast
+ * (critics A13/B14). A panel name absent from that map (unknown/malformed)
+ * narrows to `false`, so `handleControlRequest` fires no `onWebviewSignal`
+ * `panelFetch` signal for it.
+ */
+function isDataPanel(name: string | undefined): name is DataPanel {
+  return name != null && name in PANEL_SCOPE;
 }
 
 /** Map VS Code's `ColorThemeKind` enum to the {@link ThemeKind} the webview themes on. */

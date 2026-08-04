@@ -9,12 +9,26 @@ esbuild.js
 tsconfig*.json
 .vscode/**
 .vscode-test/**
+.vscode-test.mjs
 .github/**
+
+# Integration test sources + compiled output (Task 6) — never ship in the .vsix
+test/**
+out-inttest/**
 
 # Docs & meta
 docs/**
 .gitignore
 .vscodeignore
+
+# Internal dev artifacts — never ship in the public .vsix (Task 9): the
+# architecture-doc tree, the SDD ledger (task briefs/reports/reviews), the
+# stray Dependabot `bump` scratch file, and the dev-only benchmark script
+# (not referenced anywhere in dist/** at runtime — grepped clean).
+docs_claude/**
+.superpowers/**
+bump
+scripts/**
 **/.eslintrc*
 **/*.map
 **/*.ts

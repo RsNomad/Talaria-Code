@@ -4,10 +4,16 @@ name: Release
 # them to a GitHub Release.
 #
 # Cutting a release:
-#   1. Bump "version" in package.json and merge to main.
-#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+#   1. Bump "version" in package.json to a NEW x.y.z — every drop, pre-release
+#      AND stable, gets a fresh core; a core is never reused. That means a
+#      beta line's GA lands on the NEXT number (0.1.x betas -> 0.2.0 stable),
+#      which matches the Marketplace odd-minor pre-release convention.
+#   2. Merge.
+#   3. git tag vX.Y.Z-beta.N && git push origin vX.Y.Z-beta.N
 #   The tag push runs the full gate on both architectures, packages both .vsix,
 #   and publishes a GitHub Release for the tag with auto-generated notes.
+#   If a tag's build fails for an unrelated reason: re-run the same tag, or
+#   delete it, or bump again — a failed tag still claims its core.
 #
 # Dry run: Actions -> Release -> "Run workflow" (workflow_dispatch). Builds and
 # uploads both .vsix as workflow artifacts but NEVER creates a Release (the
@@ -47,6 +53,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-tags: true   # guard needs the tag list; if ever flaky, switch to fetch-depth: 0
 
       - name: Set up Node.js 24
         uses: actions/setup-node@v7
@@ -71,6 +79,17 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME (core $core) != package.json version ${{ steps.pkg.outputs.version }} — bump package.json before tagging."
             exit 1
           fi
+          # Fail-closed precondition: the current tag itself is always in the
+          # list after a tag-ref checkout with fetch-tags, so an EMPTY list
+          # means tag fetching silently failed — refuse rather than fail-open.
+          [ -n "$(git tag -l 'v*')" ] || { echo "::error::no v* tags fetched — cannot run the uniqueness guard"; exit 1; }
+          # One manifest version = ONE tag, ever (beta.2/beta.3 collision guard).
+          # Re-running the SAME tag is allowed (self is excluded).
+          dup="$(git tag -l 'v*' | grep -vFx "$GITHUB_REF_NAME" | sed -e 's/^v//' -e 's/-.*//' | grep -Fx "$core" | head -n1 || true)"
+          if [ -n "$dup" ]; then
+            echo "::error::package.json version ${{ steps.pkg.outputs.version }} was already shipped by an earlier tag — every drop (pre-release AND its own GA) gets a fresh x.y.z."
+            exit 1
+          fi
 
       # Clean, reproducible install straight from package-lock.json. On the
       # arm64 runner this resolves the arm64 native packages (lancedb, esbuild,
@@ -83,17 +102,23 @@ jobs:
       - name: Gate — typecheck (host + webview) + full test suite
         run: npm run gate
 
+      - name: Compute artifact name (full tag ⇒ files are never look-alike)
+        id: art
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"   # slash-safe for branch dispatches (dry-runs)
+          echo "vsix=talaria-code-${{ matrix.target }}-${ref}.vsix" >> "$GITHUB_OUTPUT"
+
       # vsce runs vscode:prepublish (production build) itself, then packs the
       # runtime dependencies from node_modules — which are the correct per-arch
       # binaries because this job runs on matching hardware.
       - name: Package platform .vsix
-        run: npx @vscode/vsce package --target ${{ matrix.target }} --out "talaria-code-${{ matrix.target }}-${{ steps.pkg.outputs.version }}.vsix"
+        run: npx @vscode/vsce package --target ${{ matrix.target }} --out "${{ steps.art.outputs.vsix }}"
 
       - name: Upload .vsix artifact
         uses: actions/upload-artifact@v7
         with:
           name: vsix-${{ matrix.target }}
-          path: talaria-code-${{ matrix.target }}-${{ steps.pkg.outputs.version }}.vsix
+          path: ${{ steps.art.outputs.vsix }}
           if-no-files-found: error
           retention-days: 14
 

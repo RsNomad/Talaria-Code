@@ -2,7 +2,7 @@
   "name": "talaria-code",
   "displayName": "Talaria Code",
   "description": "Talaria Code — an in-editor client for the Hermes agent: chat, tools, MCP, skills, checkpoints and more, in a native VS Code panel.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "syntinal",
   "license": "GPL-3.0-or-later",
   "repository": {
@@ -613,6 +613,8 @@
     "vscode:prepublish": "npm run build:host -- --production && npm run build:webview",
     "pretest": "npm run build",
     "test": "vitest run",
+    "pretest:integration": "node -e \"require('fs').rmSync('.vscode-test/user-data',{recursive:true,force:true})\" && npm run build && tsc -p test/integration/tsconfig.json",
+    "test:integration": "vscode-test",
     "gate": "npm run check-types:all && npm test"
   },
   "dependencies": {
@@ -629,8 +631,11 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^22.10.0",
     "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "concurrently": "^10.0.4",
     "esbuild": "^0.28.1",

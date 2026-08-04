@@ -29,7 +29,7 @@ import type {
   SetupMethod,
   ThemeKind,
 } from './protocol';
-import { MAX_TABS } from './protocol';
+import { MAX_TABS, PANEL_SCOPE } from './protocol';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
@@ -136,6 +136,10 @@ interface PersistedState {
   drafts?: Record<string, string>;
 }
 
+/** Task 2 (P1 entry-point fix §3.3): the cause `requestPanel` tags a fetch
+ * with on the wire — absent means a plain user click (`selectPanel`). */
+export type PanelFetchTrigger = 'activate' | 'hydrate';
+
 export function App() {
   // Restore whatever `getState()` carried BEFORE `useReducer` needs it — this
   // read happens once (useMemo, empty deps) and only its value at first
@@ -201,6 +205,16 @@ export function App() {
   const activeTabIdRef = useRef(state.activeTabId);
   activeTabIdRef.current = state.activeTabId;
 
+  // Task 2 (P1 entry-point fix, doc §3.3): lets the once-installed
+  // subscription below call the CURRENT `requestPanel` without
+  // re-subscribing. NOTE (critic A12): assigning a ref during render mirrors
+  // this file's own `activeTabIdRef` idiom immediately above; React 19
+  // discourages render-phase ref writes, and the residual hazard (an aborted
+  // concurrent render leaving `.current` on an uncommitted closure) is inert
+  // here because the handler fires post-commit and the panels fetched
+  // through it are global-scoped (no tab-derived scope key).
+  const requestPanelRef = useRef<(panel: DataPanel, trigger?: PanelFetchTrigger) => void>(() => {});
+
   // Subscribe to host messages + announce readiness once.
   useEffect(() => {
     const off = bridge.onMessage((msg) => {
@@ -217,6 +231,24 @@ export function App() {
         // Capture the ACTIVE tab id at ARRIVAL time. The user may switch tabs
         // before the Composer mounts and applies it (audit C-3).
         setPendingSeed({ tabId: activeTabIdRef.current, text: msg.text, mentions: msg.mentions });
+      }
+      if (msg.type === 'panel.activate' && msg.panel !== 'chat') {
+        requestPanelRef.current(msg.panel, 'activate'); // narrowed to DataPanel
+      }
+      if (
+        msg.type === 'hydrate' &&
+        msg.state.activePanel !== 'chat' &&
+        PANEL_SCOPE[msg.state.activePanel] === 'global'
+      ) {
+        // A hydrate that BOOTS into a data panel (initialPanel latch: cold
+        // openSetup, first-run auto-open) had no selectPanel click to fetch for
+        // it — without this the panel idles on "Loading…" forever (D2 half 2).
+        // Deliberately GLOBAL-scoped panels only (today: only 'setup' can arrive
+        // here — openSetupPanel is initialPanel's sole writer): this branch runs
+        // BEFORE the hydrate folds, so a session/root/cwd-scoped panel would
+        // fetch under the PRE-reconcile tab's scope key (critic A6) — if a future
+        // latch writer targets a scoped panel, move its fetch after the fold.
+        requestPanelRef.current(msg.state.activePanel, 'hydrate');
       }
       dispatch({ host: msg });
     });
@@ -312,7 +344,14 @@ export function App() {
   // — the if-chain this replaced fell through to the global shape for ANY
   // unrecognized panel, which would have silently under-scoped a FUTURE
   // session/root/cwd-scoped panel's fetch too.
-  const requestPanel = (panel: DataPanel) => {
+  //
+  // `trigger` (Task 2, P1 entry-point fix §3.3) is an optional cause the
+  // webview NAMES on the wire — absent means a plain user click; the host
+  // attributes that case to `cause: 'user'` on its own (extension.ts's
+  // `handleSetupPanelFetch`). `params` is already `Record<string, unknown>`
+  // on the `control.request` wire, so spreading `trigger` in needs no
+  // protocol change — the host's `extractPanelName` ignores extra keys.
+  const requestPanel = (panel: DataPanel, trigger?: PanelFetchTrigger) => {
     const scopeTab = tab;
     const { scopeKey, rejectTag, params } = resolvePanelRequest(panel, scopeTab);
     void fetchPanel(
@@ -321,9 +360,10 @@ export function App() {
         request: (method, p) => bridge.request(method, p, rejectTag),
         dispatch: (action) => dispatch({ local: action }),
       },
-      { scopeKey, req: { method: 'panel.data', params } },
+      { scopeKey, req: { method: 'panel.data', params: trigger ? { ...params, trigger } : params } },
     );
   };
+  requestPanelRef.current = requestPanel;
 
   // Correlated toggle (W1.5): the Skills/Tools switches persist through the
   // dashboard REST channel and need the resolved/rejected result so the panel
