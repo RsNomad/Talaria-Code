@@ -34,6 +34,7 @@ import { registerDiffDecisionCommands } from './host/commands/diffDecision.vscod
 import { EditPreviewRegistry } from './host/preview/EditPreviewRegistry';
 import { DiffPreviewProvider, TALARIA_DIFF_SCHEME } from './host/preview/DiffPreviewProvider';
 import { registerGenerateCommitMessageCommand } from './host/scm/generateCommitCommand.vscode';
+import { createTestApi, type TalariaTestApi } from './host/testApi';
 
 /**
  * P7-N12 · I-9 — the shape a trust-gated MCP-server zone (RAG, LIB, and any
@@ -106,12 +107,20 @@ function registerTrustGatedZone(opts: TrustGatedZoneOptions): () => void {
  *
  * Wiring is intentionally tiny: pick a backend, hand it to the view provider,
  * register the view + commands, then bring the two independent zones
- * (autocomplete, codebase RAG) online alongside it. Activation is lazy — VS
- * Code auto-generates the `onView:talaria.panel` activation event for the
- * contributed webview view (package.json, Agent C), so we never use `"*"`
+ * (autocomplete, codebase RAG) online alongside it. Activation is lazy — the
+ * manifest declares the specific `onStartupFinished` event (package.json:25-27),
+ * so activation is deferred until after VS Code's own startup, never `"*"`
  * (best-practices.md).
+ *
+ * Task 5 (onboarding-entrypoint-fix-architecture.md §4.2): returns a
+ * {@link TalariaTestApi} ONLY when `context.extensionMode ===
+ * vscode.ExtensionMode.Test` — a Task-6 `@vscode/test-electron` integration
+ * smoke resolves this from `extensions.getExtension(id).activate()` to await
+ * "webview ready" / "panel fetched with cause X" headlessly. Production
+ * activation (`Production`/`Development` mode) always returns `undefined` —
+ * no test surface leaks to real users.
  */
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): TalariaTestApi | undefined {
   const output = vscode.window.createOutputChannel('Talaria Code');
   context.subscriptions.push(output);
 
@@ -689,6 +698,19 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.workspace.isTrusted ? '' : ', Restricted Mode'
     }).`,
   );
+
+  // Task 5 (§4.2): test-only observability surface, gated at the EXPORT by
+  // ExtensionMode — an INSTALLED (.vsix) extension is always `Production`
+  // (§4.1 limitation (c)), so this branch is unreachable outside a
+  // `@vscode/test-electron` run. `provider.onWebviewSignal` already fires in
+  // every mode (deliberately accepted, inert production emitter — §4.2); only
+  // the export is mode-gated.
+  if (context.extensionMode === vscode.ExtensionMode.Test) {
+    const t = createTestApi(provider.onWebviewSignal);
+    context.subscriptions.push(t);
+    return t.api;
+  }
+  return undefined;
 }
 
 /**

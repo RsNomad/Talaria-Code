@@ -94,6 +94,13 @@ vi.mock('vscode', () => {
         dispose: () => items.forEach((item) => item.dispose()),
       }),
     },
+    // Task 5 (§4.2, critic B12): `activate()`'s new tail reads
+    // `context.extensionMode === vscode.ExtensionMode.Test` — without this,
+    // the comparison throws on `undefined.Test` and every test in this file
+    // fails, not just ones about TalariaTestApi. `makeFakeContext()` below
+    // defaults `extensionMode` to `Production` so the existing tests in this
+    // file keep exercising the `return undefined` path unchanged.
+    ExtensionMode: { Production: 1, Development: 2, Test: 3 },
     CodeActionKind: { QuickFix: 'quickfix' },
     CodeAction: class {
       constructor(
@@ -191,6 +198,10 @@ function makeFakeContext(): vscode.ExtensionContext {
     extensionUri: { fsPath: '/fake/ext', path: '/fake/ext' },
     globalStorageUri: { fsPath: '/fake/storage', path: '/fake/storage' },
     asAbsolutePath: (p: string) => p,
+    // Task 5 (critic B12): defaults to a NON-Test mode so every existing
+    // test in this file keeps exercising `activate()`'s `return undefined`
+    // path — `testApi.test.ts`/Task 6 cover the `ExtensionMode.Test` branch.
+    extensionMode: 1 satisfies vscode.ExtensionMode,
     secrets: {
       get: () => Promise.resolve(undefined),
       store: () => Promise.resolve(undefined),
