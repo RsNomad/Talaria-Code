@@ -79,6 +79,18 @@ npm run package    # produce a .vsix via vsce
 code --install-extension talaria-code-*.vsix
 ```
 
+### Upgrading
+
+From **0.1.1** on, installing a newer `.vsix` **upgrades in place** — no
+uninstall needed. VS Code dedupes an extension by its version, and every drop now
+carries a higher version, so `code --install-extension talaria-code-*.vsix` (or
+**Extensions: Install from VSIX…**) simply replaces the running build. A
+`0.1.0-beta.*` install upgrades cleanly to any `0.1.1+`.
+
+Earlier pre-releases all reported the same `0.1.0` version, so VS Code saw no
+change and kept the old build until you uninstalled it by hand. The per-drop
+versioning below (each release gets its own higher version) retires that step.
+
 ## Getting started
 
 Talaria Code installs and wires up its backend from **one panel** — no
@@ -229,6 +241,43 @@ Host with mock data — no Hermes process is started, so it works on any OS.
 | `npm run watch` | Rebuild both bundles on change |
 | `npm run check-types` | `tsc --noEmit` typecheck of `src/**` |
 | `npm run package` | Produce a `.vsix` via `vsce` |
+
+## Releasing
+
+Releases are cut by **tag push** and built by
+[`.github/workflows/release.yml`](./.github/workflows/release.yml), which packages
+a per-architecture `.vsix` (`linux-x64` + `linux-arm64`) and attaches both to a
+GitHub Release. The rule is **one version core per drop**:
+
+1. **Bump `version` in `package.json` to a new `x.y.z`.** *Every* drop —
+   pre-release and stable alike — gets a fresh core; a core is never reused.
+   Because of that, a beta line's GA lands on the **next** number: the `0.1.x`
+   betas ship, and their stable release is `0.2.0` (the odd-minor pre-release
+   convention VS Code uses on the Marketplace).
+2. **Merge**, then tag and push:
+
+   ```bash
+   git tag v0.1.1-beta.1
+   git push origin v0.1.1-beta.1
+   ```
+
+   The tag push runs the full gate (typecheck + tests) on both architectures,
+   packages each `.vsix` **named by the full tag** (e.g.
+   `talaria-code-linux-x64-v0.1.1-beta.1.vsix`), and publishes a GitHub Release
+   with auto-generated notes. A tag with a hyphen (`-beta.N`, `-rc.N`) is
+   published as a GitHub **pre-release**, so it never shows as *Latest*.
+
+A **fail-closed CI guard** enforces the scheme: the tag's `x.y.z` core must equal
+`package.json`'s version, and that core must not have been shipped by any earlier
+tag — **one core, one tag, ever.** Re-running the *same* tag is allowed (it is
+excluded from its own uniqueness check), so if a build fails for an unrelated
+reason you can **re-run the tag, delete it, or bump again** — but a failed tag
+still claims its core.
+
+To rehearse without publishing, run the workflow by hand (**Actions → Release →
+Run workflow**): it builds and uploads both `.vsix` as workflow artifacts and
+never creates a Release.
+
 ## Contributing
 
 Issues and pull requests are welcome. Please open an issue to discuss substantial

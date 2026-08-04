@@ -72,6 +72,17 @@ npm run package    # 通过 vsce 生成 .vsix
 code --install-extension talaria-code-*.vsix
 ```
 
+### 升级
+
+自 **0.1.1** 起，安装更新的 `.vsix` 会**原地升级** —— 无需先卸载。VS Code 以版本号
+区分扩展，而现在每次发布都携带更高的版本，因此
+`code --install-extension talaria-code-*.vsix`（或 **Extensions: Install from
+VSIX…**）会直接替换正在运行的构建。`0.1.0-beta.*` 的安装可干净地升级到任意
+`0.1.1+`。
+
+此前的预发布都报告同一个 `0.1.0` 版本，VS Code 因看不到版本变化而保留旧构建，直到你
+手动卸载。下文「每次发布一个版本核」的方案（每次发布都获得自己更高的版本）取消了这一步。
+
 ## 快速开始
 
 Talaria Code 从**一个面板**完成后端的安装与接线 —— 无需手改 JSON，也无需手动安装
@@ -201,6 +212,39 @@ Development Host —— 不会启动 Hermes 进程，因此可在任意系统运
 | `npm run watch` | 变更时重新构建两个 bundle |
 | `npm run check-types` | 对 `src/**` 进行 `tsc --noEmit` 类型检查 |
 | `npm run package` | 通过 `vsce` 生成 `.vsix` |
+
+## 发布
+
+发布通过**推送标签（tag）**触发，由
+[`.github/workflows/release.yml`](./.github/workflows/release.yml) 构建：它为每个架构
+（`linux-x64` + `linux-arm64`）打包一个 `.vsix`，并将两者附加到 GitHub Release。
+规则是**每次发布一个版本核（core）**：
+
+1. **将 `package.json` 中的 `version` 提升到新的 `x.y.z`。** *每一次*发布 —— 预发布
+   与稳定版一律如此 —— 都获得一个全新的核；核绝不重用。因此某条 beta 线的 GA 落在
+   **下一个**号上：`0.1.x` 的 beta 先发布，其稳定版则是 `0.2.0`（即 VS Code 在
+   Marketplace 使用的「奇数 minor = 预发布」约定）。
+2. **合并（merge）**，然后打标签并推送：
+
+   ```bash
+   git tag v0.1.1-beta.1
+   git push origin v0.1.1-beta.1
+   ```
+
+   推送标签会在两种架构上运行完整 gate（类型检查 + 测试），把每个 `.vsix`
+   **按完整标签命名**（例如 `talaria-code-linux-x64-v0.1.1-beta.1.vsix`），并发布
+   一个带自动生成说明的 GitHub Release。带连字符的标签（`-beta.N`、`-rc.N`）会作为
+   GitHub **预发布**发布，因此绝不会显示为 *Latest*。
+
+一个 **fail-closed 的 CI 守卫**强制执行该方案：标签的 `x.y.z` 核必须等于
+`package.json` 的版本，且该核不得已被任何更早的标签发布过 —— **一个核，一个标签，
+永久唯一。** 重跑*同一个*标签是允许的（它被排除在自身的唯一性检查之外），因此若构建因
+无关原因失败，你可以**重跑该标签、删除它，或再次提升版本** —— 但失败的标签依然占用其
+版本核。
+
+如需在不发布的情况下预演，请手动运行该工作流（**Actions → Release → Run
+workflow**）：它会构建并把两个 `.vsix` 作为工作流工件上传，但绝不创建 Release。
+
 ## 许可证
 
 Talaria Code 采用 **GPL-3.0-or-later** 许可证。
