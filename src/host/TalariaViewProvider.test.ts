@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as vscode from 'vscode';
 import { TalariaViewProvider, capSeedText, decideSeedDelivery } from './TalariaViewProvider';
+import type { WebviewSignal } from './TalariaViewProvider';
 import type { AgentBackend } from './backend/AgentBackend';
 import { SetupController, type SetupHost, type SetupControllerDeps } from './setup/SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
@@ -26,7 +27,30 @@ import type {
 } from '../shared/protocol';
 
 vi.mock('vscode', () => {
+  // Task 4 (§4.2): the provider now constructs a `vscode.EventEmitter` at
+  // construction time (`onWebviewSignal`'s backing emitter) — same minimal
+  // shim as `MockBackend.test.ts`/`extension.test.ts` use for the real
+  // `AcpBackend`'s emitters.
+  class EventEmitter<T> {
+    private listeners: Array<(e: T) => void> = [];
+    event = (listener: (e: T) => void) => {
+      this.listeners.push(listener);
+      return {
+        dispose: () => {
+          this.listeners = this.listeners.filter((l) => l !== listener);
+        },
+      };
+    };
+    fire(data: T): void {
+      for (const listener of [...this.listeners]) listener(data);
+    }
+    dispose(): void {
+      this.listeners = [];
+    }
+  }
+
   return {
+    EventEmitter,
     window: {
       // Constructor subscribes to theme changes; return a no-op disposable.
       onDidChangeActiveColorTheme: () => ({ dispose() {} }),
@@ -1452,6 +1476,95 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
       | { type: 'hydrate'; state: { activePanel: string } }
       | undefined;
     expect(hydrate2?.state.activePanel).toBe('chat');
+  });
+});
+
+/*
+ * ── Task 4 (§4.2): `onWebviewSignal` observability seam ──
+ *
+ * Zero response-behavior change — these signals are additive observers a
+ * Task-6 integration test subscribes to, fired BESIDE the existing
+ * `control.response`/`panel.data` traffic these same handlers already send.
+ * `hasData` is the honest oracle (`result !== undefined`): an unwired
+ * `setupPanelSource` resolves `undefined`, so a cold 'setup' fetch is
+ * `ok:true, hasData:false` — never faked to `true` (critic B3).
+ */
+describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §4.2)', () => {
+  it('fires {kind:"ready"} on ready, then an honest hasData:false panelFetch for an unwired setup fetch', async () => {
+    const { provider } = makeProvider(vi.fn().mockResolvedValue(undefined));
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 100,
+      method: 'panel.data',
+      params: { panel: 'setup', trigger: 'hydrate' },
+    } as never);
+    await flush();
+    await flush();
+
+    expect(signals).toEqual([
+      { kind: 'ready' },
+      { kind: 'panelFetch', panel: 'setup', cause: 'hydrate', ok: true, hasData: false },
+    ]);
+  });
+
+  it('reports hasData:true once a SetupController is wired and status() actually assembles a snapshot', async () => {
+    const { provider } = makeProviderWithSetupController();
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 101,
+      method: 'panel.data',
+      params: { panel: 'setup', trigger: 'activate' },
+    } as never);
+    await flush();
+    await flush();
+    await flush();
+
+    expect(signals).toContainEqual({
+      kind: 'panelFetch',
+      panel: 'setup',
+      cause: 'activate',
+      ok: true,
+      hasData: true,
+    });
+  });
+
+  it('attributes a rejected tools fetch (no trigger) as {panel:"tools", cause:"user", ok:false, hasData:false}', async () => {
+    const { provider } = makeProvider(vi.fn().mockRejectedValue(new Error('boom')));
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 102,
+      method: 'panel.data',
+      params: { panel: 'tools' },
+    } as never);
+    await flush();
+
+    expect(signals).toEqual([{ kind: 'panelFetch', panel: 'tools', cause: 'user', ok: false, hasData: false }]);
+  });
+
+  it('fires NO signal for a panel name outside PANEL_SCOPE (the isDataPanel guard, no cast)', async () => {
+    const { provider } = makeProvider(vi.fn().mockResolvedValue({ ok: true }));
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 103,
+      method: 'panel.data',
+      params: { panel: 'nonsense' },
+    } as never);
+    await flush();
+
+    expect(signals).toEqual([]);
   });
 });
 
