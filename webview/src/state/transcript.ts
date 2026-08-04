@@ -866,6 +866,14 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
     case 'setup.progress':
       return { ...state, setupProgress: foldSetupProgress(state.setupProgress, msg) };
 
+    // P1 entry-point fix: host-driven panel switch — same connection-global
+    // posture as `setup.progress` above (no sessionId). This folds only the
+    // STATE half (`activePanel`); the App layer owns the FETCH half (a
+    // `trigger`-tagged `requestPanel` call), which the pure reducer cannot
+    // perform as a side effect.
+    case 'panel.activate':
+      return { ...state, activePanel: msg.panel };
+
     default:
       return state;
   }
@@ -931,6 +939,9 @@ function assertReduceHandlesEveryRoutedMessage(
     // Task 10: see the matching `case 'setup.progress'` in `reduce()` above
     // (folds into `AppState.setupProgress` via `foldSetupProgress`).
     case 'setup.progress':
+    // P1 entry-point fix: see the matching `case 'panel.activate'` in
+    // `reduce()` above (folds `AppState.activePanel`).
+    case 'panel.activate':
       return;
     default: {
       const exhaustive: never = msg;

@@ -2133,3 +2133,14 @@ describe('AUDIT-5 UI M-2: restored drafts survive a webview dispose+recreate', (
     expect(state.tabs[BOOTSTRAP_TAB_ID]?.draft).toBe('live text the user just typed');
   });
 });
+
+describe('panel.activate (P1 entry-point fix)', () => {
+  it('folds activePanel — the reducer owns the STATE half (setup.progress precedent)', () => {
+    const next = reduce(INITIAL_STATE, { type: 'panel.activate', panel: 'setup' });
+    expect(next.activePanel).toBe('setup');
+  });
+  it('is a pure fold — no other state is touched', () => {
+    const next = reduce(INITIAL_STATE, { type: 'panel.activate', panel: 'setup' });
+    expect({ ...next, activePanel: INITIAL_STATE.activePanel }).toEqual(INITIAL_STATE);
+  });
+});

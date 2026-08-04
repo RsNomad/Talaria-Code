@@ -1178,6 +1178,20 @@ export type HostToWebview =
   | ({ type: 'setup.progress' } & SetupProgress)
 
   /**
+   * P1 entry-point fix: host-driven panel switch — CONNECTION-GLOBAL (no
+   * sessionId), same posture as `theme`/`backend.state`/`setup.progress`
+   * above: which side panel is showing is not scoped to any one chat
+   * session. EXPLICIT-intent only: this message MAY yank whatever panel the
+   * user currently has open, which is correct for an explicit "open Setup"
+   * action but wrong for anything ambient — the invisible `setBackend`
+   * trust-upgrade swap must never emit it. The reducer folds only the STATE
+   * half (`activePanel`); the FETCH half (requesting the panel's data) is
+   * owned by the App layer, tagged with a `trigger` so it can be told apart
+   * from a user click (see the architecture doc's Part I §3.3).
+   */
+  | { type: 'panel.activate'; panel: Panel }
+
+  /**
    * W2 F-A: code actions → composer. SEED ONLY — the webview inserts `text` +
    * mention chips into the draft and focuses the textarea; it MUST NOT
    * auto-submit (review-first is the security posture). The webview APPENDS
