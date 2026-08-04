@@ -253,19 +253,48 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * First-run auto-open (§6 entry point 1): reveal the panel with 'setup' as
-   * the initial `activePanel` of the NEXT `hydrate` this webview instance
-   * sends. `extension.ts` calls this once, at activation, guarded by its own
-   * `globalState['talaria.setup.autoOpened']` latch. If the view is already
-   * resolved and live (a genuinely rare race — this fires synchronously at
-   * activation, before the user could plausibly have opened the panel
-   * already), this only reveals; it deliberately does NOT force a re-hydrate
-   * (would yank whatever panel the user is already looking at — the same
-   * rule {@link setBackend}'s trust-upgrade swap follows).
+   * P1 entry-point fix (architecture doc §3.1): the single funnel every
+   * "open Setup" entry point (walkthrough button, rocket icon, command
+   * palette, first-run auto-open, failure nudge) drives, directly or via
+   * `talaria.openSetup`. Two EXCLUSIVE delivery states, keyed off {@link
+   * isWebviewLive}:
+   *  - LIVE webview: posts `panel.activate` directly — this is EXPLICIT user
+   *    intent, so a panel yank is CORRECT here (unlike {@link setBackend}'s
+   *    invisible trust-upgrade swap, which must never emit this message). A
+   *    failed/rejected post falls back to the latch below, but ONLY while no
+   *    REPLACEMENT webview has since gone live — arming it unconditionally
+   *    would plant a surprise-yank on some unrelated future hydrate.
+   *  - NOT YET live (never resolved, or resolved-but-pre-`ready`): latches
+   *    {@link initialPanel} so the next `ready`-triggered {@link seedState}
+   *    hydrate carries `'setup'` — the only reliable channel in that window
+   *    (a resolve-time post would be dropped: `postMessage` is documented-
+   *    droppable before the page has subscribed).
    */
   openSetupPanel(): void {
-    this.initialPanel = 'setup';
     this.revealView();
+    if (this.isWebviewLive && this.view) {
+      // Live webview (visible OR retained-hidden — both receive posts).
+      this.view.webview
+        .postMessage({ type: 'panel.activate', panel: 'setup' } satisfies HostToWebviewMessage)
+        .then(
+          (delivered) => {
+            // Fallback ONLY while no replacement webview has come up live
+            // since: arming the latch under an already-live NEW instance
+            // would plant a surprise-yank for some far-future hydrate —
+            // dropping this one click in that ultra-rare window is the
+            // honest trade. (A Thenable has no `.catch` — hence the
+            // two-arg `.then`, critic A4.)
+            if (!delivered && !this.isWebviewLive) this.initialPanel = 'setup';
+          },
+          () => {
+            if (!this.isWebviewLive) this.initialPanel = 'setup';
+          },
+        );
+    } else {
+      // Not resolved yet, or resolved-but-not-ready: the ready-time hydrate
+      // is the reliable channel — latch and let seedState() carry it.
+      this.initialPanel = 'setup';
+    }
   }
 
   /**
@@ -345,16 +374,25 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // Clearing both here on dispose closes that window: the next `ready`
     // (from a freshly (re)resolved view) is what makes the webview live
     // again, exactly like the very first activation.
+    //
+    // Task 3 (critic A9): identity-guarded — a STALE `onDidDispose` firing
+    // late from a SUPERSEDED webview instance (the exact `webviewView`
+    // captured by this closure) must never null out a NEWER `this.view` that
+    // has already replaced it; only a dispose from the CURRENT view may clear.
     this.disposables.push(
       webviewView.onDidDispose(() => {
-        this.view = undefined;
-        this.isWebviewLive = false;
+        if (this.view === webviewView) {
+          this.view = undefined;
+          this.isWebviewLive = false;
+        }
       }),
     );
 
-    // Seed the freshly-(re)created view.
-    this.postTheme();
-    this.postToWebview({ type: 'hydrate', state: this.seedState() });
+    // Deliberately NO seed posts here: a freshly-resolved page has no
+    // listener yet (postMessage is documented-droppable pre-subscription)
+    // and the 'ready' handler re-posts both — an early hydrate's only
+    // reliable effect was consuming the initialPanel latch one hydrate too
+    // soon (beta.3 D2).
   }
 
   /**
