@@ -55,8 +55,19 @@ const REPO_ROOT = join(__dirname, '..');
  * self-evident. Everything else IS walked, including `docs/`, `media/`, and
  * other hidden directories — an orphan hides best somewhere nobody thinks of
  * as a source root, which is exactly why the walk must not be narrowed to `src/`.
+ *
+ * `test/` and `out-inttest/` are the ONE deliberate exception (Task 6,
+ * onboarding-entrypoint-fix-architecture.md): the `@vscode/test-electron`
+ * activation smoke (`test/integration/openSetup.test.ts`, compiled to
+ * `out-inttest/`) is a REAL, wired test — run by its own dedicated
+ * `npm run test:integration` (mocha via `vscode-test`, launched inside a real
+ * VS Code host) — not a vitest project. It cannot match a vitest `include`
+ * glob at all (it needs the live `vscode` API, unavailable under vitest), so
+ * counting it here would flag a covered, intentionally-out-of-band test as an
+ * "orphan" every run. `out-inttest` is gitignored/build output exactly like
+ * `out`/`dist` above; `test` is the checked-in source root for that suite.
  */
-const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'out', 'coverage', '.vscode-test']);
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'out', 'out-inttest', 'coverage', '.vscode-test', 'test']);
 
 /** Vitest's own default test-file shape: `.test.`/`.spec.` in the js/ts family. */
 const TEST_FILE = /\.(test|spec)\.[cm]?[jt]sx?$/;

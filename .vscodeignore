@@ -9,7 +9,12 @@ esbuild.js
 tsconfig*.json
 .vscode/**
 .vscode-test/**
+.vscode-test.mjs
 .github/**
+
+# Integration test sources + compiled output (Task 6) — never ship in the .vsix
+test/**
+out-inttest/**
 
 # Docs & meta
 docs/**
