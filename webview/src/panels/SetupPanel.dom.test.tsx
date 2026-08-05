@@ -159,6 +159,23 @@ function baseData(overrides: Partial<SetupData> = {}): SetupData {
       model: 'qwen2.5-coder:1.5b-base',
       dedicatedConfigured: false,
       genericSupported: true,
+      // T15 (§4.2/§4.3): the dedicated NEXT model block — always populated
+      // by the host since beta.5; `downloadReady: true` here is the
+      // post-publication steady state, overridden per-test for the
+      // pre-publication (R-3) fixtures.
+      dedicated: {
+        displayName: 'Sweep Next-Edit v2 (7B)',
+        modelDefaults: { ollama: 'sweep-next-edit-v2-7b:q4_k_m', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+        downloadReady: true,
+        downloadApproxBytes: 4_680_000_000,
+        warning:
+          'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.',
+        guided: {
+          vllm: 'Run: vllm serve sweepai/sweep-next-edit-v2-7B\n(official Sweep release, ~15 GB download)',
+          llamacpp:
+            'Run: llama-server -hf SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M --port 8012\nVerify the download: sha256sum should print abc123def456',
+        },
+      },
     },
     rag: {
       enabled: false,
@@ -168,7 +185,12 @@ function baseData(overrides: Partial<SetupData> = {}): SetupData {
       tuning: { dims: 768, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: [] },
       indexDir: '.talaria/index',
     },
-    ollama: { running: true, version: '0.4.1', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 986_000_000 }] },
+    ollama: {
+      running: true,
+      version: '0.4.1',
+      endpoint: 'http://127.0.0.1:11434',
+      models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 986_000_000 }],
+    },
     ready: true,
     ...overrides,
   };
@@ -770,6 +792,204 @@ describe('NEXT card — DedicatedNextForm [Test] button (T11 §6-parity minor)',
       'setup.testRemote',
       expect.objectContaining({ backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' }),
     );
+  });
+});
+
+/*
+ * T15 (beta.5 §4.2/§4.3/§6): presence tri-state, the fail-closed Download
+ * button, guided lines, and the card-level warning.
+ */
+
+describe('NEXT card — card-level warning (§4.3 D4, critic C-14)', () => {
+  it('shows the warning at CARD level when the dedicated toggle is ON, even with the form CLOSED', () => {
+    renderPanel(baseData(), { nextEdit: { next: true, generic: false } });
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    expect(within(nextCard).getByText(baseData().nextEdit.dedicated!.warning)).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('textbox', { name: 'Endpoint' })).not.toBeInTheDocument();
+  });
+
+  it('shows the warning when the form is OPEN even if the dedicated toggle is off', async () => {
+    const { user } = renderPanel(baseData(), { nextEdit: { next: false, generic: true } });
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    expect(within(nextCard).getByText(baseData().nextEdit.dedicated!.warning)).toBeInTheDocument();
+  });
+
+  it('renders NOTHING when the toggle is off AND the form is closed', () => {
+    renderPanel(baseData(), { nextEdit: { next: false, generic: true } });
+    expect(screen.queryByText(baseData().nextEdit.dedicated!.warning)).not.toBeInTheDocument();
+  });
+});
+
+describe('NEXT card — Ollama presence + fail-closed Download button (§4.3 D2)', () => {
+  it('shows the Download button when downloadReady + ollama-picked + presence absent, and dispatches setup.pullModel on click', async () => {
+    const { user, dispatch } = renderPanel(baseData());
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    expect(within(nextCard).getByText('not present')).toBeInTheDocument();
+    const button = within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' });
+    await user.click(button);
+    expect(dispatch).toHaveBeenCalledWith('setup.pullModel', {
+      model: 'sweep-next-edit-v2-7b:q4_k_m',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+  });
+
+  it('hides the Download button once the model is already present (green line instead)', async () => {
+    const data = baseData({
+      ollama: { ...baseData().ollama, models: [{ name: 'sweep-next-edit-v2-7b:q4_k_m', sizeBytes: 1 }] },
+    });
+    const { user } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    expect(within(nextCard).getByText('✓ Model present on this Ollama')).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
+  });
+
+  it('recognizes a hand-pulled ollamaPullAlias model as present (rev 5 — not lied to)', async () => {
+    const data = baseData({
+      ollama: {
+        ...baseData().ollama,
+        models: [{ name: 'hf.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M', sizeBytes: 1 }],
+      },
+    });
+    const { user } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    expect(within(nextCard).getByText('✓ Model present on this Ollama')).toBeInTheDocument();
+  });
+
+  it('presence is unknown when the typed endpoint does not match the endpoint status() probed (C-6/S-F11)', async () => {
+    const { user } = renderPanel(baseData());
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    const endpointField = within(nextCard).getByRole('textbox', { name: 'Endpoint' });
+    await user.clear(endpointField);
+    await user.type(endpointField, 'http://127.0.0.1:9999');
+    expect(within(nextCard).getByText('not verified here — Test the endpoint first.')).toBeInTheDocument();
+    // Still offered — an untested endpoint must not strand the user.
+    expect(within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' })).toBeInTheDocument();
+  });
+
+  it('the Download button is trust-gated with the standard disabledReason (S-F14)', async () => {
+    const { user } = renderPanel(baseData({ trusted: false }));
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    const button = within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' });
+    expect(button).toBeDisabled();
+    expect(button.getAttribute('title')).toMatch(/not trusted/i);
+  });
+
+  it('renders the post-download nudge on a successful pull (C-18) — Apply remains a separate, required action', async () => {
+    const { user, dispatch } = renderPanel(baseData());
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' }));
+    expect(await within(nextCard).findByText('✓ Downloaded — press Apply to start using it.')).toBeInTheDocument();
+    expect(dispatch).not.toHaveBeenCalledWith('setup.setNextEdit', expect.anything());
+  });
+});
+
+describe('NEXT card — R-3: ollama picked + modelDefaults.ollama empty (!downloadReady)', () => {
+  function notReadyData(): SetupData {
+    return baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      nextEdit: {
+        ...baseData().nextEdit,
+        dedicatedConfigured: false,
+        endpoint: '',
+        model: '',
+        dedicated: {
+          ...baseData().nextEdit.dedicated!,
+          downloadReady: false,
+          modelDefaults: { ollama: '', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+          guided: { vllm: baseData().nextEdit.dedicated!.guided.vllm }, // no llamacpp key
+        },
+      },
+    });
+  }
+
+  it('the Model field starts EMPTY and the §6 "no vetted build published yet" line renders in the prefill\'s place', async () => {
+    const { user } = renderPanel(notReadyData());
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    const modelField = within(nextCard).getByRole('textbox', { name: 'Model' }) as HTMLInputElement;
+    expect(modelField.value).toBe('');
+    expect(
+      within(nextCard).getByText(
+        "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).",
+      ),
+    ).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
+  });
+
+  it("Apply with the empty field surfaces the controller's 'model is required' refusal via the unwrap", async () => {
+    const { user, dispatch } = renderPanel(notReadyData());
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    dispatch.mockRejectedValueOnce(new Error('model is required.'));
+    await user.click(within(nextCard).getByRole('button', { name: 'Apply' }));
+    expect(await within(nextCard).findByText('✗ model is required.')).toBeInTheDocument();
+  });
+});
+
+describe('NEXT card — llama.cpp guided line (§4.3 point 5, S-F5 digest-verify hint)', () => {
+  it('hidden when !downloadReady (no guided.llamacpp on the wire)', async () => {
+    const data = baseData({
+      fim: {
+        ...baseData().fim,
+        options: [ollamaOption(), llamacppOption({ nextEditTransport: 'openai-compat' })],
+        selectedId: 'llamacpp',
+      },
+      nextEdit: {
+        ...baseData().nextEdit,
+        dedicated: {
+          ...baseData().nextEdit.dedicated!,
+          downloadReady: false,
+          guided: { vllm: baseData().nextEdit.dedicated!.guided.vllm },
+        },
+      },
+    });
+    const { user } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(nextCard).queryByText(/llama-server -hf/)).not.toBeInTheDocument();
+  });
+
+  it('shown with the pinned digest + sha256sum hint when downloadReady', async () => {
+    const data = baseData({
+      fim: {
+        ...baseData().fim,
+        options: [ollamaOption(), llamacppOption({ nextEditTransport: 'openai-compat' })],
+        selectedId: 'llamacpp',
+      },
+    });
+    const { user } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(
+      within(nextCard).getByText('Run: llama-server -hf SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M --port 8012'),
+    ).toBeInTheDocument();
+    expect(within(nextCard).getByText(/Verify the download: sha256sum should print/)).toBeInTheDocument();
+  });
+
+  it('copy-to-clipboard copies the command fragment only (not the caption)', async () => {
+    const data = baseData({
+      fim: {
+        ...baseData().fim,
+        options: [ollamaOption(), vllmOption({ nextEditTransport: 'openai-compat' })],
+        selectedId: 'vllm',
+      },
+    });
+    const { user } = renderPanel(data);
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'vLLM' }));
+    await user.click(within(nextCard).getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith('Run: vllm serve sweepai/sweep-next-edit-v2-7B');
   });
 });
 

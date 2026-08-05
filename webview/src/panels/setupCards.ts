@@ -9,6 +9,19 @@
  * functions — same discipline, new panel).
  */
 import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupProgress } from '../protocol';
+/*
+ * T15: `registry.ts` is PURE DATA with zero imports of any kind (Global
+ * Constraint 5) — safe to pull straight into the webview bundle, exactly
+ * like `webview/src/protocol.ts` already re-exports the shared
+ * `src/shared/protocol.ts` across the same host/webview boundary. Needed
+ * here because `ollamaCreatedName`/`ollamaPullAlias` (the presence-match
+ * targets, §4.2 rev 5) never cross the wire by name — only their RESOLVED
+ * value does, as `dedicated.modelDefaults.ollama`, and only while
+ * `downloadReady` (R-3). A user who `ollama pull`ed the model by hand under
+ * the alias, before ever seeing a Download button, must still be recognized
+ * — so the presence check needs the actual constants, not just the wire.
+ */
+import { NEXT_DEDICATED_MODEL } from '../../../src/host/setup/registry';
 
 // --- Agent card (§6 card 1) -------------------------------------------------
 
@@ -327,4 +340,191 @@ export const PIPX_INSTALL_DOCS_URL = 'https://pipx.pypa.io/stable/installation/'
 export function fimInstallTestEndpoint(selectedId: string, option: SetupBackendOption): string {
   const scoped = selectedId === option.id ? (option.remote?.endpointValue ?? '') : '';
   return scoped || option.remote?.endpointDefault || '';
+}
+
+// --- Card 4 — DedicatedNextForm parity (§4.2/§4.3/§6, T15) -----------------
+
+export type NextPresence = 'present' | 'absent' | 'unknown';
+
+/** Ollama tag equality — case-insensitive, `:latest`-tolerant (critic C-13):
+ *  a bare `name` and `name:latest` name the SAME local model. */
+function normalizeOllamaTag(tag: string): string {
+  const lower = tag.trim().toLowerCase();
+  return lower.endsWith(':latest') ? lower.slice(0, -':latest'.length) : lower;
+}
+
+function ollamaTagsEqual(a: string, b: string): boolean {
+  return normalizeOllamaTag(a) === normalizeOllamaTag(b);
+}
+
+/** Either of the vetted Sweep model's two known local names (rev 5): the
+ *  ingest-created `ollamaCreatedName`, or the hand-pull `ollamaPullAlias`. */
+function isVettedOllamaAlias(tag: string): boolean {
+  return ollamaTagsEqual(tag, NEXT_DEDICATED_MODEL.ollamaCreatedName) || ollamaTagsEqual(tag, NEXT_DEDICATED_MODEL.ollamaPullAlias);
+}
+
+/**
+ * Whether a model on the daemon (`daemonTag`) should count as satisfying
+ * `formModel`: an exact (case/`:latest`-tolerant) match, OR — when
+ * `formModel` names the vetted Sweep model under EITHER of its two known
+ * local names — a match against the OTHER name too. Without this second
+ * branch, a user who `ollama pull`ed the model by hand under the hf.co
+ * alias would be told "not present" forever, because the form still shows
+ * the standard `ollamaCreatedName` prefill (rev 5, "a user who pulled by
+ * hand is not lied to").
+ */
+function isEquivalentOllamaTag(daemonTag: string, formModel: string): boolean {
+  if (ollamaTagsEqual(daemonTag, formModel)) return true;
+  return isVettedOllamaAlias(formModel) && isVettedOllamaAlias(daemonTag);
+}
+
+/**
+ * §4.2: presence is derived CLIENT-SIDE against the live form state — the
+ * host's Ollama probe targets the registry-default endpoint, not whatever
+ * endpoint the user currently has typed into the dedicated NEXT form, so
+ * only the webview can honestly say whether THIS endpoint's daemon has THIS
+ * model. `'present'`/`'absent'` only once the daemon is reachable AND
+ * `formEndpoint` matches the endpoint `status()` actually probed
+ * (`setup.ollama.endpoint`) — any mismatch (including an unprobed
+ * `undefined`, which a string formEndpoint can never equal) is honestly
+ * `'unknown'`, never a guess. Callers gate this to the ollama branch only
+ * (the "picked backend is ollama" half of §4.2 lives at the call site, not
+ * here — a non-ollama backend simply never calls this).
+ */
+export function nextPresence(setup: Pick<SetupData, 'ollama'>, formEndpoint: string, formModel: string): NextPresence {
+  const ollama = setup.ollama;
+  if (!ollama.running || formEndpoint !== ollama.endpoint) return 'unknown';
+  const present = ollama.models.some((m) => isEquivalentOllamaTag(m.name, formModel));
+  return present ? 'present' : 'absent';
+}
+
+/** §6 "NEXT presence (D2)" — verbatim per state. */
+export function nextPresenceText(presence: NextPresence): string {
+  switch (presence) {
+    case 'present':
+      return '✓ Model present on this Ollama';
+    case 'absent':
+      return 'not present';
+    case 'unknown':
+      return 'not verified here — Test the endpoint first.';
+  }
+}
+
+/** §6 "NEXT presence (D2)" — the Download button's own verbatim label. */
+export const NEXT_DOWNLOAD_BUTTON_LABEL = 'Download model (~4.7 GB)';
+
+/** §6 "NEXT post-download nudge" (critic C-18): the pull itself does NOT
+ *  write `talaria.nextEdit.model` — Apply remains the Tier-1 write. */
+export const NEXT_POST_DOWNLOAD_NUDGE = '✓ Downloaded — press Apply to start using it.';
+
+/** §6 "NEXT download unavailable (D3)": renders where the ollama Model
+ *  field's prefill would be while `!downloadReady` (R-3). */
+export const NEXT_DOWNLOAD_UNAVAILABLE_TEXT =
+  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+
+/** §6 "NEXT model line (D1)" — composed from the wire's own `displayName`
+ *  rather than a second hardcoded copy of the same string. */
+export function nextModelLine(displayName: string): string {
+  return `${displayName} — the one supported dedicated model.`;
+}
+
+/**
+ * §4.3 D2: the Download button shows iff the dedicated model has a
+ * published, verified build (`downloadReady`), the picked backend is
+ * ollama, and the model isn't already `'present'` on the daemon. `presence
+ * === 'unknown'` (endpoint untested) still offers the download — refusing
+ * it there would strand a user who simply hasn't hit Test yet.
+ */
+export function nextDownloadButtonVisible(
+  dedicated: SetupData['nextEdit']['dedicated'],
+  backendIsOllama: boolean,
+  presence: NextPresence,
+): boolean {
+  return dedicated !== undefined && dedicated.downloadReady && backendIsOllama && presence !== 'present';
+}
+
+/** One `guided.*` wire string's two §6 fragments (T13 implementer note):
+ *  the runnable command (rendered + copy-to-clipboard payload) and the
+ *  caption/digest-verify hint, newline-joined on the wire. */
+export interface GuidedLine {
+  command: string;
+  caption: string;
+}
+
+export function splitGuidedLine(text: string): GuidedLine {
+  const idx = text.indexOf('\n');
+  if (idx === -1) return { command: text, caption: '' };
+  return { command: text.slice(0, idx), caption: text.slice(idx + 1) };
+}
+
+/** The Endpoint/Model fields' resolved default for ONE candidate backend
+ *  option (§4.3 D1). */
+export interface DedicatedFieldDefaults {
+  endpoint: string;
+  model: string;
+}
+
+/**
+ * Prefer the ALREADY-SAVED endpoint/model when `option` is the ACTIVELY
+ * configured NEXT backend (`dedicatedConfigured` — both endpoint AND model
+ * non-empty — and its transport matches `option`) — editing an existing
+ * dedicated setup must show what's actually saved, not silently overwrite
+ * it with the registry default. Otherwise (first-time setup, an
+ * only-partially-filled `nextEdit` left over from Generic/off, or
+ * Browse-ing a DIFFERENT backend than the one configured) falls back to
+ * that option's own connection default / the registry's per-transport
+ * `modelDefaults`. Gating on `dedicatedConfigured` (not just the transport
+ * string) matters because `nextEdit.model` can carry a leftover value
+ * (e.g. the Generic source's own FIM model) even while dedicated NEXT was
+ * never actually set up — that value must not masquerade as "saved".
+ *
+ * ⚠ R-3: `modelDefaults.ollama` is `''` while `!downloadReady` — this
+ * deliberately produces an EMPTY model default (never a fabricated name
+ * that would resolve to nothing); the openai-compat default is untouched.
+ */
+export function dedicatedFieldDefaults(
+  setup: Pick<SetupData, 'nextEdit'>,
+  option: SetupBackendOption | undefined,
+): DedicatedFieldDefaults {
+  const isCurrentBackend =
+    setup.nextEdit.dedicatedConfigured &&
+    option?.nextEditTransport !== undefined &&
+    option.nextEditTransport === setup.nextEdit.backend;
+  const endpoint = (isCurrentBackend ? setup.nextEdit.endpoint : '') || option?.remote?.endpointDefault || '';
+  const savedModel = isCurrentBackend ? setup.nextEdit.model : '';
+  const dedicated = setup.nextEdit.dedicated;
+  const registryDefault =
+    option?.nextEditTransport === 'ollama' ? dedicated?.modelDefaults.ollama : dedicated?.modelDefaults.openaiCompat;
+  const model = savedModel || registryDefault || '';
+  return { endpoint, model };
+}
+
+/** `DedicatedNextForm`'s Endpoint/Model local state, tagged with the
+ *  `selectedId` it was last reconciled against. */
+export interface DedicatedFormFieldState extends DedicatedFieldDefaults {
+  lastSelectedId: string;
+}
+
+export function initDedicatedFormFieldState(selectedId: string, defaults: DedicatedFieldDefaults): DedicatedFormFieldState {
+  return { lastSelectedId: selectedId, ...defaults };
+}
+
+/**
+ * Reconcile the Endpoint/Model fields when the picked backend changes —
+ * `settingsField.ts`'s own "adjust state while rendering" pattern
+ * (`reconcileFieldEditState`), keyed off `selectedId` (a LOCAL-state
+ * dependency here, not a host push): a no-op while the id hasn't moved
+ * since the last reconcile — an in-flight local edit survives an unrelated
+ * re-render — but the moment the user switches backends, the fields reset
+ * to THAT backend's defaults. Without this, switching from ollama to
+ * llama.cpp would leave ollama's endpoint/model sitting in llama.cpp's
+ * fields.
+ */
+export function reconcileDedicatedFormFields(
+  state: DedicatedFormFieldState,
+  selectedId: string,
+  defaults: DedicatedFieldDefaults,
+): DedicatedFormFieldState {
+  if (selectedId === state.lastSelectedId) return state;
+  return initDedicatedFormFieldState(selectedId, defaults);
 }

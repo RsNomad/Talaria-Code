@@ -43,20 +43,32 @@ import {
   agentPhaseLabel,
   agentPrimaryAction,
   buildCopyLogText,
+  dedicatedFieldDefaults,
   fimDoneLine,
   fimHasLocalInstall,
   fimInstallTestEndpoint,
+  initDedicatedFormFieldState,
   isComingSoon,
   mutationDisabledReason,
+  NEXT_DOWNLOAD_BUTTON_LABEL,
+  NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
+  NEXT_POST_DOWNLOAD_NUDGE,
   nextDoneLine,
+  nextDownloadButtonVisible,
   nextEditButtonLabel,
+  nextModelLine,
+  nextPresence,
+  nextPresenceText,
   PIPX_INSTALL_DOCS_URL,
   progressKey,
   providerDoneLine,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
   ragDoneLine,
+  reconcileDedicatedFormFields,
+  splitGuidedLine,
   TRUST_DISABLED_REASON,
+  type NextPresence,
   type SetupProgressMap,
 } from './setupCards';
 
@@ -146,6 +158,7 @@ function SetupCards({
       <FimCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
       <NextEditCard
         setup={setup}
+        progress={progress}
         nextEdit={nextEdit}
         onToggleNextEdit={onToggleNextEdit}
         dispatch={dispatch}
@@ -883,12 +896,14 @@ function OllamaInstallPanel({
 
 function NextEditCard({
   setup,
+  progress,
   nextEdit,
   onToggleNextEdit,
   dispatch,
   disabledReason,
 }: {
   setup: SetupData;
+  progress: SetupProgressMap;
   nextEdit: NextEditToggleState;
   onToggleNextEdit: SetupPanelProps['onToggleNextEdit'];
   dispatch: SetupPanelProps['dispatch'];
@@ -897,6 +912,11 @@ function NextEditCard({
   const [showForm, setShowForm] = useState(false);
   const next = setup.nextEdit;
   const buttonLabel = nextEditButtonLabel(next.dedicatedConfigured);
+  // T15 (§4.3 D4, critic C-14): the CPU/GPU caveat renders at CARD level
+  // whenever the dedicated toggle is ON or the form is open — a user could
+  // otherwise enable dedicated NEXT without ever seeing it (it used to live
+  // only inside the collapsed form).
+  const showWarning = next.dedicated !== undefined && (nextEdit.next || showForm);
 
   return (
     <Card title="Next Edit (NEXT)">
@@ -925,6 +945,17 @@ function NextEditCard({
         </div>
       )}
 
+      {showWarning && (
+        <div
+          role="note"
+          aria-label="Dedicated NEXT resource warning"
+          className="mb-2 flex items-start gap-2 rounded-card border border-warn bg-warn-soft px-3 py-2 text-2xs text-fg"
+        >
+          <Icon name="warning" size={14} className="mt-0.5 flex-none text-warn" />
+          <span>{next.dedicated?.warning}</span>
+        </div>
+      )}
+
       <button
         type="button"
         onClick={() => setShowForm((s) => !s)}
@@ -933,7 +964,9 @@ function NextEditCard({
         {buttonLabel}
       </button>
 
-      {showForm && <DedicatedNextForm setup={setup} dispatch={dispatch} disabledReason={disabledReason} />}
+      {showForm && (
+        <DedicatedNextForm setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      )}
     </Card>
   );
 }
@@ -977,12 +1010,22 @@ function NextEditToggleRow({
   );
 }
 
+/**
+ * T15 (beta.5 §4.3 D1–D4): the dedicated NEXT setup form. Endpoint/Model
+ * local state is a `DedicatedFormFieldState` (`setupCards.ts`) reconciled
+ * against the picked backend's own defaults on every render via
+ * `reconcileDedicatedFormFields` — the `settingsField.ts` "adjust state
+ * while rendering" pattern, so switching backends resets the fields to
+ * THAT backend's defaults without clobbering an in-flight edit.
+ */
 function DedicatedNextForm({
   setup,
+  progress,
   dispatch,
   disabledReason,
 }: {
   setup: SetupData;
+  progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
 }) {
@@ -990,8 +1033,31 @@ function DedicatedNextForm({
   const preferred = candidates.find((o) => o.nextEditTransport === setup.nextEdit.backend) ?? candidates[0];
   const [selectedId, setSelectedId] = useState(preferred?.id ?? '');
   const selected = candidates.find((o) => o.id === selectedId) ?? preferred;
-  const [endpoint, setEndpoint] = useState(setup.nextEdit.endpoint || selected?.remote?.endpointDefault || '');
-  const [model, setModel] = useState(setup.nextEdit.model);
+  const dedicated = setup.nextEdit.dedicated;
+
+  const defaults = dedicatedFieldDefaults(setup, selected);
+  const [fields, setFields] = useState(() => initDedicatedFormFieldState(selectedId, defaults));
+  const reconciled = reconcileDedicatedFormFields(fields, selectedId, defaults);
+  if (reconciled !== fields) setFields(reconciled);
+  const { endpoint, model } = reconciled;
+  const setEndpoint = (v: string) => setFields((f) => ({ ...f, endpoint: v }));
+  const setModel = (v: string) => setFields((f) => ({ ...f, model: v }));
+
+  const backendIsOllama = selected?.nextEditTransport === 'ollama';
+  const presence: NextPresence = backendIsOllama ? nextPresence(setup, endpoint, model) : 'unknown';
+  const presenceTone: Tone = presence === 'present' ? 'add' : presence === 'absent' ? 'warn' : 'neutral';
+  const presenceIcon = presence === 'present' ? 'pass-filled' : presence === 'absent' ? 'circle-outline' : 'question';
+  const showDownload = nextDownloadButtonVisible(dedicated, backendIsOllama, presence);
+  const pullId = dedicated?.modelDefaults.ollama ?? '';
+  const livePull = pullId ? progress[progressKey('pull', pullId)] : undefined;
+  const pullPct = pullPercent(livePull?.totalBytes, livePull?.completedBytes);
+
+  // §4.3 point 5: llama.cpp / vLLM each get a read-only guided line — ONLY
+  // these two ids carry wire text at all (§4.4: `guided.llamacpp` is absent
+  // while `!downloadReady`, S-F2/S-F5 — the -hf line ships with nothing to
+  // verify against until the pin is published).
+  const guidedText = selected?.id === 'llamacpp' ? dedicated?.guided.llamacpp : selected?.id === 'vllm' ? dedicated?.guided.vllm : undefined;
+  const guided = guidedText !== undefined ? splitGuidedLine(guidedText) : undefined;
 
   return (
     <div className="mt-2 flex flex-col gap-2 rounded border border-border bg-overlay p-2">
@@ -999,6 +1065,7 @@ function DedicatedNextForm({
         <p className="text-2xs text-faint">No backend supports a dedicated NEXT connection.</p>
       ) : (
         <>
+          {dedicated && <p className="text-2xs text-muted">{nextModelLine(dedicated.displayName)}</p>}
           <div className="flex flex-col gap-1.5">
             {candidates.map((o) => (
               <BackendOptionRow key={o.id} option={o} selected={o.id === selectedId} onSelect={setSelectedId} />
@@ -1006,6 +1073,52 @@ function DedicatedNextForm({
           </div>
           <TextField label="Endpoint" value={endpoint} onChange={setEndpoint} />
           <TextField label="Model" value={model} onChange={setModel} />
+
+          {backendIsOllama && dedicated && !dedicated.downloadReady && (
+            <p className="text-2xs text-faint">{NEXT_DOWNLOAD_UNAVAILABLE_TEXT}</p>
+          )}
+
+          {backendIsOllama && dedicated?.downloadReady && (
+            <div className="flex flex-col gap-1.5">
+              <StatusLine icon={presenceIcon} text={nextPresenceText(presence)} tone={presenceTone} />
+              {showDownload && (
+                <div>
+                  <ActionButton
+                    label={NEXT_DOWNLOAD_BUTTON_LABEL}
+                    onRun={() => dispatch('setup.pullModel', { model: dedicated.modelDefaults.ollama, endpoint })}
+                    disabledReason={disabledReason}
+                    successLabel={NEXT_POST_DOWNLOAD_NUDGE}
+                  />
+                </div>
+              )}
+              {pullPct !== undefined && (
+                <div className="flex items-center gap-2" aria-live="polite">
+                  <div
+                    role="progressbar"
+                    aria-valuenow={pullPct}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label={`Pulling ${pullId}`}
+                    className="h-1.5 flex-1 overflow-hidden rounded-full bg-border"
+                  >
+                    <div className="h-full bg-accent" style={{ width: `${pullPct}%` }} />
+                  </div>
+                  <span className="font-mono text-2xs text-faint">{pullPct}%</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {guided && (
+            <div className="flex flex-col gap-1 rounded border border-border bg-surface px-2 py-1.5 text-2xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 flex-1 truncate font-mono text-fg">{guided.command}</span>
+                <ActionButton label="Copy" icon="copy" onRun={() => navigator.clipboard.writeText(guided.command)} />
+              </div>
+              {guided.caption && <span className="text-faint">{guided.caption}</span>}
+            </div>
+          )}
+
           <div className="flex gap-2">
             {/* T11 (§6-parity minor): reuses the SAME `setup.testRemote`
                 correlated method the FIM Connect tab already dispatches —
