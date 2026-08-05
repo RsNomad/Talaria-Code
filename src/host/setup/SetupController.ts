@@ -1,5 +1,11 @@
 import { homedir } from 'node:os';
+import { NEXT_DEDICATED_MODEL } from './registry';
 import type { BackendDescriptor, InstallRecipe, ProbeSpec } from './registry';
+import type { HfDigestVerdict, HfGgufSpec } from './hfDigest';
+import { isLoopbackHost } from '../../autocomplete/backends/secureTransport';
+import { managerFor, parseOsRelease, resolveDistroFamily } from './osDetect';
+import type { DistroFamily, OsRelease, PackageManager } from './osDetect';
+import { installCommand, pythonInstallPlan } from './packageTable';
 import type { PipxEnv, PipxLocateResult } from './pipxLocator';
 import type { HermesPaths, InstallEvent } from './pipxInstaller';
 import type { OllamaStatus, PullProgress } from './ollamaClient';
@@ -174,9 +180,42 @@ export interface SetupControllerRegistry {
   getBackend(id: string): BackendDescriptor | undefined;
 }
 
+/**
+ * T13 (beta.5 §4.4.3d): what the controller hands the T14 ingest engine —
+ * ALWAYS the registry-pinned artifact (`NEXT_DEDICATED_MODEL.gguf` +
+ * `ollamaCreatedName`), never anything webview-derived. The engine's own
+ * io/fs/fetch seams are bound in `setupHost.vscode.ts`, NOT passed here.
+ */
+export interface GgufIngestSpec {
+  gguf: {
+    hfRepo: string;
+    file: string;
+    quant: string;
+    sha256: string;
+    approxBytes: number;
+    allowedRepoFiles: readonly string[];
+  };
+  ollamaCreatedName: string;
+}
+
 export interface SetupControllerDeps {
-  /** Bound to its real `ExecLookup` by the caller. Can REJECT — always try/catch this (T4 M-2). */
-  locatePipx(): Promise<PipxLocateResult>;
+  /** Bound to its real `ExecLookup` by the caller. Can REJECT — always try/catch this (T4 M-2).
+   *  T11 (§3, critic C-11): optional `signal`, checked between `locatePipx`'s
+   *  internal steps — `handleInstall` passes its `AbortController.signal` so
+   *  Cancel can reach a wedged probe. */
+  locatePipx(signal?: AbortSignal): Promise<PipxLocateResult>;
+  /**
+   * beta.5 §1.2 (T5): the os-release read, bound to the real container-
+   * boundary-aware binding by the caller (`setupHost.vscode.ts`'s
+   * `createReadOsRelease` — prefers `/run/host/os-release`, detects the
+   * `/run/.containerenv` / `/.dockerenv` / `$container` markers). The pure
+   * controller only INTERPRETS the result (Global Constraint 5): `text` is
+   * parsed through the T3 engine; `containerMismatch: true` (a marker with
+   * NO host os-release) and an absent `text` both degrade to family
+   * `'unknown'` — fail-closed, never a guessed command. Result is memoized
+   * across `status()` calls and re-read on `setup.recheck`.
+   */
+  readOsRelease(): Promise<{ text?: string; containerMismatch?: boolean }>;
   /** Bound to its real `SpawnFn`/`FileExists` by the caller. */
   installHermes(
     recipe: Extract<InstallRecipe, { kind: 'pipx' }>,
@@ -221,6 +260,31 @@ export interface SetupControllerDeps {
    * reads that as `waiting-agent`; see {@link computeProviderCard}.
    */
   getAdvertisedAuthMethods(): AdvertisedAuthMethod[] | undefined;
+  /**
+   * T13 (beta.5 §4.4.3c): the HF-tree digest pre-flight — bound to the real
+   * `verifyHfDigest(fetch, gguf)` (`src/host/setup/hfDigest.ts`) by the
+   * caller. ANY `{ok:false}` (mismatch, missing lfs.oid, set mismatch, HTTP
+   * error, timeout) maps to the one pinned integrity refusal and aborts the
+   * download BEFORE the modal — the user is never asked to approve an
+   * artifact that already failed verification.
+   */
+  verifyHfDigest(gguf: HfGgufSpec): Promise<HfDigestVerdict>;
+  /**
+   * T13 → T14 (beta.5 §4.4.3d): the digest-enforced ingest engine —
+   * stream-download to a temp file hashing incrementally, refuse on byte
+   * mismatch BEFORE any Ollama call, then `POST /api/blobs/sha256:{pin}`
+   * (server re-verifies) + `POST /api/create`. Declared HERE (the interface
+   * T14's real engine must satisfy); `setupHost.vscode.ts` binds it. Rejects
+   * on any failure; an AbortError rejection = user cancel. `onProgress`
+   * rides the SAME `{op:'pull', id: ollamaCreatedName}` progress stream as
+   * a library pull — zero new UI plumbing.
+   */
+  ingestGguf(
+    spec: GgufIngestSpec,
+    endpoint: string,
+    onProgress: (p: PullProgress) => void,
+    signal: AbortSignal,
+  ): Promise<void>;
 }
 
 // --- misc constants -------------------------------------------------------
@@ -239,13 +303,76 @@ const TRUST_REFUSAL_REASON = 'Workspace is not trusted — Setup changes are dis
  * id is an agent-managed provider credential method (§2.1).
  */
 export const HERMES_SETUP_AUTH_METHOD_ID = 'hermes-setup';
-/** T11 host-gap 2 (plan §6/§7 FM-1): the well-established Fedora pipx
- *  bootstrap. Pre-typed into a terminal, never executed by us — the user
- *  presses Enter and grants sudo themselves. `pipx ensurepath` is
- *  surfaced as a follow-up HINT in the confirmation modal text (see
- *  {@link SetupController.handleOpenBootstrapTerminal}), not chained into
- *  this command — keeps the terminal line exactly what the modal named. */
-const PIPX_BOOTSTRAP_COMMAND = 'sudo dnf install pipx';
+/**
+ * beta.5 §6 copy, verbatim (drift-locked by SetupController.test.ts). The
+ * bootstrap COMMAND itself is no longer a constant here — T5 deleted the old
+ * hardcoded Fedora `PIPX_BOOTSTRAP_COMMAND`; every pre-typed line is now
+ * resolved server-side from the T4 engine ({@link installCommand} /
+ * {@link pythonInstallPlan}) for the DETECTED family, or refused fail-closed.
+ */
+const PIPX_MISSING_KNOWN_DISTRO_GUIDANCE =
+  'pipx was not found on your PATH. Open a terminal to install it, then re-check.';
+const PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE =
+  "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
+const CONTAINER_NOTE =
+  "Talaria can't tell which system your terminal acts on (VS Code appears to run in a sandbox/container) — run the install commands in a terminal on your host system, then re-check.";
+
+// --- T13 (beta.5 §4.4/§6): the verified NEXT download path — copy, verbatim --
+
+/** §6 "host-sourced pull refusal (rev 5)" — kills the S-F1 class outright. */
+const HOST_SOURCED_PULL_REFUSAL =
+  "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
+/** §6 "NEXT download unavailable (D3)" — the sha256 pin is still empty. */
+const NEXT_DOWNLOAD_UNAVAILABLE =
+  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+/** §6 "NEXT download remote-endpoint refusal (S-F3)" — ingest is loopback-only. */
+const NEXT_REMOTE_ENDPOINT_REFUSAL =
+  'Verified downloads only run against a local Ollama (loopback). For a remote server, download and verify the model on that machine — see the guided instructions.';
+/** §4.4.3c — ONE line for every integrity failure mode (no detail leaks what to forge). */
+const NEXT_INTEGRITY_REFUSAL = 'integrity check failed — refusing to download';
+/** §6 "NEXT warning (D4, card-level)" — host-composed, honest CPU caveat. */
+const NEXT_DEDICATED_WARNING =
+  'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.';
+/** §6 "Pull modal (D3, rev 5)" — every word of the strong claim is what the
+ *  engine actually does (Talaria hashes the downloaded bytes; Ollama
+ *  re-verifies at blob ingest). Composed from the registry pins so the modal
+ *  can never name a different artifact than the gate downloads. */
+const NEXT_PULL_MODAL_COPY =
+  `Download '${NEXT_DEDICATED_MODEL.displayName}' (~4.7 GB) and install it into your local Ollama? ` +
+  `Source: huggingface.co/${NEXT_DEDICATED_MODEL.gguf.hfRepo} — Syntinal's build converted from Sweep's official release. ` +
+  "Talaria verifies the file's checksum against its pinned value after downloading, and Ollama verifies it again during install.";
+
+/**
+ * T13 (beta.5 §4.4 "classify", rev 6 — the owner personally corrected the
+ * earlier dot-counting bug): HOST-SOURCED iff the model contains a `/` AND
+ * the substring before the FIRST `/` is host-like — contains a `.` OR a `:`
+ * (port) OR equals `localhost` case-insensitively. A model with NO `/` is
+ * ALWAYS a library name; dots in the name or tag are IRRELEVANT
+ * (`qwen2.5-coder:1.5b-base` / `qwen3-embedding:0.6b` = library;
+ * `ns/name:tag` = library; `hf.co/x`, `huggingface.co/x`,
+ * `registry.example.com/x`, `localhost:11434/x` = host-sourced). Callers
+ * normalize (trim) BEFORE classifying. Exported for the truth-table lock.
+ */
+export function isHostSourcedModel(model: string): boolean {
+  const slash = model.indexOf('/');
+  if (slash === -1) return false;
+  const head = model.slice(0, slash);
+  return head.includes('.') || head.includes(':') || head.toLowerCase() === 'localhost';
+}
+
+/**
+ * S4.3 parity (reused, not reinvented — `src/autocomplete/index.ts`): is the
+ * endpoint's host the loopback interface, per `secureTransport.ts`'s single
+ * source of truth. Malformed URLs fail CLOSED (non-loopback ⇒ refused) —
+ * though `validateEndpointUrl` runs first on this path, so none should reach here.
+ */
+function isLoopbackEndpoint(rawUrl: string): boolean {
+  try {
+    return isLoopbackHost(new URL(rawUrl).hostname);
+  } catch {
+    return false;
+  }
+}
 
 /** D9: which {@link SetupMethod}s are consequence-bearing mutations, gated
  *  on `host.isTrusted()` (FM-14). Everything else (`setup.status` — handled
@@ -287,10 +414,43 @@ interface ThrottleState {
   pending?: SetupProgress;
 }
 
+/**
+ * T5: one interpreted os-release read — everything the §1.2 wiring needs.
+ * `release` keeps the full parsed identity (the Python planner's C-3 gate
+ * needs `id`/`versionId`, never just the collapsed family); `containerNote`
+ * is set ONLY for the S-F10 degrade (container marker with no host
+ * os-release) — a merely unreadable file degrades to `unknown` WITHOUT the
+ * note, because "VS Code appears to run in a sandbox/container" would be a
+ * fabrication there (§1.2's trigger sentence is the authority).
+ */
+interface OsResolution {
+  release: OsRelease;
+  family: DistroFamily;
+  manager: PackageManager;
+  containerNote?: string;
+}
+
 export class SetupController {
   private readonly progressEmitter = new Emitter<SetupProgress>();
   /** Throttled >=150ms between pushes for the same `(op, id)` pair, via a real `setTimeout` — never drops the final value, only delays it. */
   readonly onProgress: Event<SetupProgress> = this.progressEmitter.event;
+
+  /**
+   * T7 (§2.2.2): fired on every mid-flight/outcome state change that a
+   * `SetupData` re-fetch would actually reflect — `TalariaViewProvider
+   * .setSetupController` subscribes this straight to a `pushSetupPanelData()`
+   * re-push. Deliberately narrow: only {@link handleInstall} (after the
+   * modal is CONFIRMED — ⚠ critic C-16, never at the in-flight latch, which
+   * is set BEFORE the modal — and at every {@link lastAgentIssue} write /
+   * the {@link awaitingReload} flip) and {@link handleRecheck} (once, at
+   * completion) fire it. Every OTHER mutating method already gets pushed by
+   * `TalariaViewProvider.handleSetupMethod`'s own unconditional post-`handle
+   * ()` refresh (T7 fix 1) — firing here too would be a redundant push, not
+   * a new one, so this event is intentionally NOT wired to any other method
+   * (and never to a read-only one).
+   */
+  private readonly statusChangedEmitter = new Emitter<void>();
+  readonly onStatusChanged: Event<void> = this.statusChangedEmitter.event;
 
   /** Keyed `${op}:${id}` (`install:<backendId>` / `pull:<model>`) — presence = single-flight latch (FM-12); the held `AbortController` is what `setup.cancel` interrupts. */
   private readonly inFlight = new Map<string, AbortController>();
@@ -300,6 +460,11 @@ export class SetupController {
   private lastAgentIssue?: { phase: AgentSetupPhase; detail: string };
   /** Set once a `setup.install` succeeds THIS session; never cleared here (a real reload replaces the whole extension host, and therefore this controller instance). */
   private awaitingReload = false;
+  /** T5: memoized OS detection (a PROMISE, so concurrent `status()` calls
+   *  share one read) — cleared by `setup.recheck` so the next demand
+   *  re-reads (the user may have installed VS Code outside the sandbox, or
+   *  the file may have become readable). */
+  private osResolution?: Promise<OsResolution>;
 
   constructor(
     private readonly host: SetupHost,
@@ -312,6 +477,7 @@ export class SetupController {
     }
     this.throttle.clear();
     this.progressEmitter.dispose();
+    this.statusChangedEmitter.dispose();
   }
 
   /**
@@ -338,6 +504,9 @@ export class SetupController {
   async status(): Promise<SetupData> {
     const trusted = this.host.isTrusted();
     const apiKeySet = await this.host.secrets.has(AUTOCOMPLETE_API_KEY_SECRET);
+    // T5 §1.2: interpreted (memoized) OS identity — drives the `os` block
+    // and, per phase, the engine-composed bootstrap / python plans below.
+    const osInfo = await this.resolveOs();
 
     const ollamaDescriptor = this.deps.registry.getBackend('ollama');
     const ollamaEndpoint = ollamaDescriptor?.remote?.endpoint.defaultValue ?? DEFAULT_OLLAMA_ENDPOINT;
@@ -388,6 +557,36 @@ export class SetupController {
     const nextModel = (this.host.getSetting<string>('talaria.nextEdit.model') ?? '').trim();
     const genericSupported = fimDescriptor.nextEditTransport !== undefined;
     const dedicatedConfigured = nextEndpoint !== '' && nextModel !== '';
+    // T13 (§4.2): capability + raw facts for the dedicated NEXT card —
+    // computed purely from the registry pins (no await; the CR-002
+    // synchronous tail below stays intact). `downloadReady` is driven by the
+    // sha256 pin and NOTHING else.
+    const downloadReady = (NEXT_DEDICATED_MODEL.gguf.sha256 as string) !== '';
+    const dedicated: NonNullable<SetupData['nextEdit']['dedicated']> = {
+      displayName: NEXT_DEDICATED_MODEL.displayName,
+      // ⚠ R-3: '' while !downloadReady — configuration is fail-closed, not
+      // just the download (see the protocol.ts field doc).
+      modelDefaults: {
+        ollama: downloadReady ? NEXT_DEDICATED_MODEL.ollamaCreatedName : '',
+        openaiCompat: NEXT_DEDICATED_MODEL.upstream.hfRepo,
+      },
+      downloadReady,
+      downloadApproxBytes: NEXT_DEDICATED_MODEL.gguf.approxBytes,
+      warning: NEXT_DEDICATED_WARNING,
+      guided: {
+        // §6 copy: command line + honesty note, newline-separated.
+        vllm: `Run: vllm serve ${NEXT_DEDICATED_MODEL.upstream.hfRepo}\n(official Sweep release, ~15 GB download)`,
+        // llamacpp ONLY when the pin is published (S-F2/S-F5): `-hf` verifies
+        // nothing itself, so the line ships WITH the manual sha256sum hint.
+        ...(downloadReady
+          ? {
+              llamacpp:
+                `Run: llama-server -hf ${NEXT_DEDICATED_MODEL.gguf.hfRepo}:${NEXT_DEDICATED_MODEL.gguf.quant} --port 8012` +
+                `\nVerify the download: sha256sum should print ${NEXT_DEDICATED_MODEL.gguf.sha256}`,
+            }
+          : {}),
+      },
+    };
 
     const ragEnabled = this.host.getSetting<boolean>('talaria.rag.enabled') ?? true;
     const ragEmbedEndpoint = (this.host.getSetting<string>('talaria.rag.embedEndpoint') ?? '').trim() || DEFAULT_OLLAMA_ENDPOINT;
@@ -412,6 +611,12 @@ export class SetupController {
         ...(installRecord?.version ? { version: installRecord.version } : {}),
         ...(this.lastAgentIssue ? { detail: this.lastAgentIssue.detail } : {}),
         ...(this.installLogTail.length > 0 ? { logTail: [...this.installLogTail] } : {}),
+        // T5 §1.2: present iff the phase calls for them — the webview only
+        // ever RENDERS these (it never composes command text, Constraint 1).
+        ...(agentPhase === 'pipx-missing' ? { bootstrap: composeBootstrap(osInfo) } : {}),
+        ...(agentPhase === 'python-unsuitable'
+          ? { pythonInstall: pythonInstallPlan(osInfo.release, osInfo.family) }
+          : {}),
       },
       provider,
       fim: {
@@ -434,6 +639,7 @@ export class SetupController {
               refusalDetail: `The selected FIM backend ('${fimDescriptor.displayName}') does not support Generic Next-Edit.`,
             }
           : {}),
+        dedicated,
       },
       rag: {
         enabled: ragEnabled,
@@ -444,12 +650,51 @@ export class SetupController {
         indexDir: ragIndexDir,
         ...(trusted ? {} : { preconditionDetail: 'The codebase index needs a trusted, open workspace.' }),
       },
+      // T13 (§4.2): `endpoint` = the endpoint this status() ACTUALLY probed
+      // — presence claims are scoped to it (critic C-6).
       ollama: ollamaStatus.running
-        ? { running: true, models: ollamaStatus.models }
-        : { running: false, models: [] },
+        ? { running: true, endpoint: ollamaEndpoint, models: ollamaStatus.models }
+        : { running: false, endpoint: ollamaEndpoint, models: [] },
       ready,
+      os: {
+        family: osInfo.family,
+        manager: osInfo.manager,
+        ...(osInfo.release.prettyName !== undefined ? { prettyName: osInfo.release.prettyName } : {}),
+        ...(osInfo.containerNote !== undefined ? { containerNote: osInfo.containerNote } : {}),
+      },
     };
     return data;
+  }
+
+  // --- T5: OS detection (memoized interpretation of the readOsRelease seam) --
+
+  private resolveOs(): Promise<OsResolution> {
+    this.osResolution ??= this.computeOsResolution();
+    return this.osResolution;
+  }
+
+  private async computeOsResolution(): Promise<OsResolution> {
+    let read: { text?: string; containerMismatch?: boolean };
+    try {
+      read = await this.deps.readOsRelease();
+    } catch {
+      // A rejecting binding must never fail status() — same posture as
+      // safeProbeOllama. Degrades to `unknown` below.
+      read = {};
+    }
+    if (read.containerMismatch === true || read.text === undefined) {
+      return {
+        release: { idLike: [] },
+        family: 'unknown',
+        manager: 'unknown',
+        // §1.2/S-F10: the note ONLY for the container degrade — see
+        // OsResolution's doc for why a plain read failure stays note-less.
+        ...(read.containerMismatch === true ? { containerNote: CONTAINER_NOTE } : {}),
+      };
+    }
+    const release = parseOsRelease(read.text);
+    const family = resolveDistroFamily(release);
+    return { release, family, manager: managerFor(family) };
   }
 
   // --- handle() -------------------------------------------------------------
@@ -483,7 +728,7 @@ export class SetupController {
       case 'setup.openInstallTerminal':
         return this.handleOpenInstallTerminal(params);
       case 'setup.openBootstrapTerminal':
-        return this.handleOpenBootstrapTerminal();
+        return this.handleOpenBootstrapTerminal(params);
       case 'setup.reload':
         return this.handleReload();
       case 'setup.recheck':
@@ -521,20 +766,41 @@ export class SetupController {
         'Install',
       );
       if (!confirmed) return { ok: false, reason: 'declined' };
+      // T7 (§2.2.2, critic C-16): the install visibly "starts" HERE — right
+      // after the user's CONFIRM — never at the in-flight latch above (which
+      // is set BEFORE the modal, so firing there would push a phase the user
+      // hasn't agreed to yet).
+      this.statusChangedEmitter.fire();
 
       let located: PipxLocateResult;
       try {
         // T4 M-2 carry-forward: locatePipx can REJECT (pipx vanishing
-        // mid-flow) — never let that become an unhandled rejection.
-        located = await this.deps.locatePipx();
+        // mid-flow) — never let that become an unhandled rejection. T11
+        // (§3, critic C-11): pass this install's own abort signal so
+        // Cancel can reach a wedged login-shell probe.
+        located = await this.deps.locatePipx(abort.signal);
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
+        this.statusChangedEmitter.fire();
         return { ok: false, reason: detail };
       }
       if (!located.ok) {
-        this.lastAgentIssue = { phase: located.reason, detail: this.redact(located.detail) };
-        return { ok: false, reason: located.reason };
+        const detail = this.redact(located.detail);
+        // The sticky PHASE keeps the enum (computeAgentPhase's contract);
+        // the RETURNED reason is a §6-grade human sentence (T5, critic
+        // C-17): pipx-missing reuses the bootstrap card's own per-family
+        // guidance copy; python-unsuitable / probe-timeout return the
+        // locator's own detail (already a full sentence). T11 (§3, critic
+        // C-8): `probe-timeout` has no dedicated AgentSetupPhase member — a
+        // recheck-time probe timeout is not an install failure, so it maps
+        // to the generic 'error' phase (the detail line carries the specifics).
+        const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
+        this.lastAgentIssue = { phase, detail };
+        this.statusChangedEmitter.fire();
+        const reason =
+          located.reason === 'pipx-missing' ? composeBootstrap(await this.resolveOs()).guidance : detail;
+        return { ok: false, reason };
       }
 
       let paths: HermesPaths;
@@ -548,6 +814,7 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
+        this.statusChangedEmitter.fire();
         return { ok: false, reason: detail };
       }
 
@@ -570,9 +837,11 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
+        this.statusChangedEmitter.fire();
         return { ok: false, reason: detail };
       }
       this.awaitingReload = true;
+      this.statusChangedEmitter.fire();
       this.host.offerReload();
       return { ok: true };
     } finally {
@@ -591,6 +860,13 @@ export class SetupController {
     } else if (event.kind === 'failed') {
       const detail = this.redact(event.detail);
       this.lastAgentIssue = { phase: 'error', detail };
+      // T7 (§2.2.2): the FIRST observable point of a real installHermes-time
+      // failure — the card's "installing" phase flip has already unmounted
+      // the Install button, so a host-pushed `phase:'error'` snapshot is the
+      // only surface (§0.1 ②); `handleInstall`'s own catch below fires again
+      // once the rejection propagates, which the provider's seq guard
+      // safely collapses with this one.
+      this.statusChangedEmitter.fire();
       this.pushProgress({ op: 'install', id: backendId, phase: event.phase, line: detail });
     } else if (event.kind === 'done') {
       this.pushProgress({ op: 'install', id: backendId, phase: 'verify', line: 'Install verified.' });
@@ -689,13 +965,38 @@ export class SetupController {
 
   // --- setup.pullModel ---------------------------------------------------------
 
+  /**
+   * T13 (beta.5 §4.4 — the ALLOWLIST pull gate, refusal order verbatim):
+   * normalize(trim) → classify (rev 6 predicate, {@link isHostSourcedModel})
+   * → (1) `validateEndpointUrl` (⚠ S-F3: this was the only URL-bearing
+   * handler skipping it) → (2) host-sourced? ALWAYS refused (rev 5: the
+   * automated `ollama pull hf.co/…` class is REMOVED, not gated — kills
+   * S-F1 outright, including the `huggingface.co` alias bypass) → (3) the
+   * registry-pinned `ollamaCreatedName` (case-insensitive)? the VETTED
+   * INGEST branch ({@link handleVettedIngest}) → (4) plain `name[:tag]` /
+   * `ns/name` = the pre-existing, ledger-documented library tier (§5.2),
+   * byte-identical to before.
+   */
   private async handlePullModel(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const model = str(params, 'model');
+    // normalize: trim BEFORE classification — ' hf.co/x' must not dodge the gate.
+    const model = str(params, 'model')?.trim();
     if (!model) return { ok: false, reason: 'model is required.' };
     const endpoint =
       str(params, 'endpoint')?.trim() ||
       this.deps.registry.getBackend('ollama')?.remote?.endpoint.defaultValue ||
       DEFAULT_OLLAMA_ENDPOINT;
+    // (1) endpoint validity — before anything else touches it.
+    const validated = validateEndpointUrl(endpoint);
+    if (!validated.ok) return { ok: false, reason: validated.reason };
+    // (2) host-sourced models: ALWAYS refused, no modal, no exceptions.
+    if (isHostSourcedModel(model)) {
+      return { ok: false, reason: HOST_SOURCED_PULL_REFUSAL };
+    }
+    // (3) the ONE vetted artifact installs through the digest-enforced ingest.
+    if (model.toLowerCase() === NEXT_DEDICATED_MODEL.ollamaCreatedName.toLowerCase()) {
+      return this.handleVettedIngest(validated.url);
+    }
+    // (4) plain library `name[:tag]` / `ns/name` — existing behavior, unchanged.
     const key = `pull:${model}`;
     if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
 
@@ -722,6 +1023,69 @@ export class SetupController {
           this.pushProgress({
             op: 'pull',
             id: model,
+            phase: p.status,
+            ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
+            ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
+          });
+        },
+        abort.signal,
+      );
+      return { ok: true };
+    } catch (err) {
+      if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
+      return { ok: false, reason: this.redact(errorMessage(err)) };
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+
+  /**
+   * T13 (beta.5 §4.4.3a-d): the vetted-ingest branch, refusal order EXACT —
+   * (a) unpublished pin → refuse; (b) non-loopback endpoint → refuse (the
+   * ingest engine downloads on THIS machine and uploads to the daemon; a
+   * remote daemon gets the guided/manual path); (c) HF-tree digest
+   * pre-flight → ANY failure refuses; (d) ONLY THEN the Tier-1 modal (§6
+   * verbatim) and, on confirm, the T14 engine. Every refusal lands BEFORE
+   * the modal — the user is never asked to approve something already known
+   * to be unavailable, remote, or unverified.
+   */
+  private async handleVettedIngest(endpoint: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const created = NEXT_DEDICATED_MODEL.ollamaCreatedName;
+    // (a) fail-closed until the out-of-band publication fills the pin (§5.4).
+    if (NEXT_DEDICATED_MODEL.gguf.sha256 === '') {
+      return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
+    }
+    // (b) loopback only — checked on the ALREADY-validated URL.
+    if (!isLoopbackEndpoint(endpoint)) {
+      return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
+    }
+    // Single-flight latch keyed by the CANONICAL created name (the webview's
+    // cancel/progress key), set before the first await — mirrors the library
+    // tier's latch-before-modal discipline; `finally` releases on every path.
+    const key = `pull:${created}`;
+    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
+    const abort = new AbortController();
+    this.inFlight.set(key, abort);
+    try {
+      // (c) integrity pre-flight — dep can also REJECT (a fetch binding
+      // throwing synchronously); that is the same refusal, never a crash.
+      let verdict: HfDigestVerdict;
+      try {
+        verdict = await this.deps.verifyHfDigest(NEXT_DEDICATED_MODEL.gguf);
+      } catch {
+        verdict = { ok: false, reason: 'verify seam rejected' };
+      }
+      if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+      // (d) Tier-1 modal (§6 verbatim) → the T14 ingest engine.
+      const confirmed = await this.host.showModal(NEXT_PULL_MODAL_COPY, 'Download');
+      if (!confirmed) return { ok: false, reason: 'declined' };
+      await this.deps.ingestGguf(
+        { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
+        endpoint,
+        (p) => {
+          this.pushProgress({
+            op: 'pull',
+            id: created,
             phase: p.status,
             ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
             ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
@@ -775,12 +1139,29 @@ export class SetupController {
    * read-only recheck.
    */
   private async handleRecheck(): Promise<{ ok: true }> {
+    // T5: drop the memoized OS detection — the next demand (the status()
+    // this recheck's caller refreshes with, or the next bootstrap-terminal
+    // request) re-reads through the binding, picking up e.g. a container
+    // escape or a newly readable /etc/os-release.
+    this.osResolution = undefined;
     try {
       const located = await this.deps.locatePipx();
-      this.lastAgentIssue = located.ok ? undefined : { phase: located.reason, detail: this.redact(located.detail) };
+      if (located.ok) {
+        this.lastAgentIssue = undefined;
+      } else {
+        // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
+        // — probe-timeout is not a distinct sticky phase.
+        const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
+        this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+      }
     } catch (err) {
       this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
     }
+    // T7 (§2.2.2): fired exactly ONCE at completion (not per lastAgentIssue
+    // write above) — recheck is read-only/no-modal, so "the recheck
+    // completed" is itself the single meaningful state-change signal,
+    // whether it cleared the sticky issue or refreshed it.
+    this.statusChangedEmitter.fire();
     return { ok: true };
   }
 
@@ -808,34 +1189,103 @@ export class SetupController {
     if (!descriptor || !recipe || recipe.kind !== 'guided-terminal') {
       return { ok: false, reason: `'${String(backendId)}' has no guided-terminal install.` };
     }
+
+    let command = recipe.command;
+    if (recipe.packageKey) {
+      // T6 (§1.2 A3): hand command resolution to the OS engine for the
+      // DETECTED family. Fail-open CLOSED (S-F9): a family with no engine
+      // entry for this key NEVER falls back to this recipe's own static
+      // `command` (Fedora-shaped) — it refuses, guidance-only, same
+      // fail-closed posture as `handleOpenBootstrapTerminal`.
+      const osInfo = await this.resolveOs();
+      const spec = installCommand(osInfo.family, recipe.packageKey);
+      if (spec === undefined) {
+        return {
+          ok: false,
+          reason:
+            osInfo.containerNote ??
+            `No verified '${descriptor.displayName}' install command for this system — see ${recipe.docsUrl} for manual install options.`,
+        };
+      }
+      command = spec.command;
+    }
+
     const confirmed = await this.host.showModal(
-      `Open a terminal pre-filled with:\n${recipe.command}\nYou'll need to press Enter to run it — grant sudo yourself if it asks.`,
+      `Open a terminal pre-filled with:\n${command}\nYou'll need to press Enter to run it — grant sudo yourself if it asks.`,
       'Open Terminal',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
     // Pre-typed only — createTerminal never executes it (SetupHost's own contract).
-    this.host.createTerminal(`${descriptor.displayName} install`, recipe.command);
+    this.host.createTerminal(`${descriptor.displayName} install`, command);
     return { ok: true };
   }
 
   // --- setup.openBootstrapTerminal (T11 IMPORTANT host-gap 2) ---------------
 
   /**
-   * The `pipx-missing` gap-state fix (plan §6 card 1 / §7 FM-1): unlike
-   * {@link handleOpenInstallTerminal}, this is unconditional — pipx itself
-   * isn't a registry `BackendDescriptor` with a `guided-terminal` recipe, so
-   * there is no `backendId` to look up. Same Tier-1 discipline: a native
-   * modal names the EXACT command before anything opens; a decline is
+   * The `pipx-missing` gap-state fix (plan §6 card 1 / §7 FM-1), rewired by
+   * beta.5 T5 (§1.2): unlike {@link handleOpenInstallTerminal} there is no
+   * registry `backendId` to look up (pipx itself isn't a
+   * `BackendDescriptor`) — instead the command is resolved SERVER-SIDE from
+   * the T4 engine for the DETECTED family, never from webview-supplied text
+   * (Global Constraint 1; the old hardcoded Fedora `PIPX_BOOTSTRAP_COMMAND`
+   * is deleted). `params.target` selects which engine line: `'pipx'`
+   * (default when absent) or `'python'` (the A2 handoff — the command that
+   * makes `locatePipx`'s existing python3.13/3.12/3.11 probe succeed; no
+   * new `--python` plumbing needed, `pipxInstaller.ts:106-110`). Validated
+   * as a STRICT enum — any other value (or a non-string) is refused before
+   * any engine/modal work.
+   *
+   * FAIL-CLOSED: when the engine yields no command — unknown family, the
+   * S-F10 container degrade, or a GUIDANCE python plan (e.g. Ubuntu 26.04,
+   * the rev-3 case) — the refusal is `{ok:false}` with a §6-grade reason,
+   * the modal is never shown and the terminal is never created. Same Tier-1
+   * discipline as before on the happy path: the native modal names the
+   * EXACT command + its `sourceNote` verbatim; a decline is
    * `{ok:false,'declined'}` with the terminal never created.
    */
-  private async handleOpenBootstrapTerminal(): Promise<{ ok: true } | { ok: false; reason: string }> {
+  private async handleOpenBootstrapTerminal(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const target = validateBootstrapTarget(params);
+    if (target === undefined) {
+      return { ok: false, reason: "target must be 'pipx' or 'python'." };
+    }
+    const osInfo = await this.resolveOs();
+
+    let command: string;
+    let sourceNote: string;
+    let terminalName: string;
+    let followUpHint: string;
+    if (target === 'pipx') {
+      const spec = installCommand(osInfo.family, 'pipx');
+      if (spec === undefined) {
+        return { ok: false, reason: osInfo.containerNote ?? PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
+      }
+      command = spec.command;
+      sourceNote = spec.sourceNote;
+      terminalName = 'Install pipx';
+      followUpHint =
+        " Once it finishes, also run 'pipx ensurepath' (then restart your terminal) so pipx-installed apps land on PATH.";
+    } else {
+      const plan = pythonInstallPlan(osInfo.release, osInfo.family);
+      if (plan.kind !== 'command') {
+        // Guidance-only family (rev 3: Ubuntu 26.04+/Debian/Mint/Pop/Arch/
+        // unknown) — there is no verified line to pre-type. plan.text is
+        // the §6 guidance copy verbatim.
+        return { ok: false, reason: osInfo.containerNote ?? plan.text };
+      }
+      command = plan.command;
+      sourceNote = plan.sourceNote;
+      terminalName = 'Install Python';
+      followUpHint = '';
+    }
+
     const confirmed = await this.host.showModal(
-      `Open a terminal pre-filled with:\n${PIPX_BOOTSTRAP_COMMAND}\nYou'll need to press Enter to run it — grant sudo yourself if it asks. Once it finishes, also run 'pipx ensurepath' (then restart your terminal) so pipx-installed apps land on PATH.`,
+      `Open a terminal pre-filled with:\n${command}\nSource: ${sourceNote}\nYou'll need to press Enter to run it — grant sudo yourself if it asks.${followUpHint}`,
       'Open Terminal',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
     // Pre-typed only — createTerminal never executes it (SetupHost's own contract).
-    this.host.createTerminal('Install pipx', PIPX_BOOTSTRAP_COMMAND);
+    this.host.createTerminal(terminalName, command);
     return { ok: true };
   }
 
@@ -1063,8 +1513,15 @@ export class SetupController {
  * `HERMES_SETUP_AUTH_METHOD_ID` — the `m?.id !== undefined` guard is what
  * keeps a dropped entry from being mistaken for a "managed" (non-`hermes-
  * setup`) method.
+ *
+ * EXPORTED since T8 (beta.5 §2.3, critic C-5): `AcpBackend` wires the
+ * `ConnectionSupervisor`'s `isProviderUnconfigured` thunk to THIS function
+ * over the same advertised-auth-methods accessor, so the no-provider
+ * session-start banner and the Setup Provider card can never disagree
+ * about what "unconfigured" means. (Import direction is backend → setup;
+ * this file still never imports from `src/host/backend/`.)
  */
-function computeProviderCard(methods: AdvertisedAuthMethod[] | undefined): SetupData['provider'] {
+export function computeProviderCard(methods: AdvertisedAuthMethod[] | undefined): SetupData['provider'] {
   if (methods === undefined) return { phase: 'waiting-agent' };
   const managed = methods.find((m) => m?.id !== undefined && m.id !== HERMES_SETUP_AUTH_METHOD_ID);
   return managed ? { phase: 'configured', providerId: managed.id } : { phase: 'unconfigured' };
@@ -1089,6 +1546,36 @@ function computeReady(
 
 function coerceNextEditTransport(raw: string | undefined): 'ollama' | 'openai-compat' {
   return raw === 'openai-compat' ? 'openai-compat' : 'ollama';
+}
+
+/**
+ * T5 §1.2: the `pipx-missing` card's engine-composed bootstrap. A known
+ * family carries the exact pre-typed line + the §6 known-distro copy; an
+ * unknown family (incl. the container degrade) carries ONLY the §6
+ * unknown-distro copy — no command is ever guessed (Global Constraint 1).
+ */
+function composeBootstrap(osInfo: OsResolution): { command?: string; guidance: string } {
+  const spec = installCommand(osInfo.family, 'pipx');
+  return spec !== undefined
+    ? { command: spec.command, guidance: PIPX_MISSING_KNOWN_DISTRO_GUIDANCE }
+    : { guidance: PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
+}
+
+/**
+ * T5: strict server-side enum validation of `setup.openBootstrapTerminal`'s
+ * `{target}` param (SECURITY, Global Constraint 1 — webview input is never
+ * trusted). Absent params / absent key = `'pipx'` (back-compat with the T11
+ * param-less call). A PRESENT key with anything but the two literals —
+ * including a non-string — is `undefined` = refuse; it is NOT coerced to
+ * the default, so a malformed request can never silently open the pipx path.
+ */
+function validateBootstrapTarget(params: unknown): 'pipx' | 'python' | undefined {
+  if (params === undefined || params === null) return 'pipx';
+  if (typeof params !== 'object') return undefined;
+  if (!('target' in params)) return 'pipx';
+  const raw = (params as Record<string, unknown>)['target'];
+  if (raw === undefined) return 'pipx';
+  return raw === 'pipx' || raw === 'python' ? raw : undefined;
 }
 
 function deriveHermesAcpPath(hermesPath: string): string {

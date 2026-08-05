@@ -21,7 +21,7 @@
  * `!trusted` disables every mutating control via `mutationDisabledReason`
  * (setupCards.ts) — same reason text everywhere, never color alone.
  */
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import type {
   NextEditToggleSource,
   NextEditToggleState,
@@ -33,23 +33,42 @@ import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
 import { Toggle } from '../components/Toggle';
-import { errorMessage } from '../state/panels';
+import { DECLINED, errorMessage } from '../state/panels';
 import type { RemoteData } from '../state/remoteData';
 import { type NextEditRowCopy, NEXT_EDIT_ROWS } from './nextEditCopy';
 import { PanelShell, RemotePanel, SectionLabel } from './PanelShell';
 import { commitFieldEdit, initNextEditRowState, reconcileNextEditRowState } from './settingsField';
 import {
+  agentDoneLine,
   agentPhaseLabel,
   agentPrimaryAction,
   buildCopyLogText,
+  dedicatedFieldDefaults,
+  fimDoneLine,
   fimHasLocalInstall,
+  fimInstallTestEndpoint,
+  initDedicatedFormFieldState,
   isComingSoon,
   mutationDisabledReason,
+  NEXT_DOWNLOAD_BUTTON_LABEL,
+  NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
+  NEXT_POST_DOWNLOAD_NUDGE,
+  nextDoneLine,
+  nextDownloadButtonVisible,
   nextEditButtonLabel,
+  nextModelLine,
+  nextPresence,
+  nextPresenceText,
+  PIPX_INSTALL_DOCS_URL,
   progressKey,
+  providerDoneLine,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
+  ragDoneLine,
+  reconcileDedicatedFormFields,
+  splitGuidedLine,
   TRUST_DISABLED_REASON,
+  type NextPresence,
   type SetupProgressMap,
 } from './setupCards';
 
@@ -102,6 +121,17 @@ function SetupCards({
 
   return (
     <>
+      {setup.os?.containerNote && (
+        <div
+          role="note"
+          aria-label="Container/sandbox notice"
+          className="mb-3 flex items-start gap-2 rounded-card border border-warn bg-warn-soft px-3 py-2 text-2xs text-fg"
+        >
+          <Icon name="warning" size={14} className="mt-0.5 flex-none text-warn" />
+          <span>{setup.os.containerNote}</span>
+        </div>
+      )}
+
       {!setup.trusted && (
         <div
           role="note"
@@ -128,6 +158,7 @@ function SetupCards({
       <FimCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
       <NextEditCard
         setup={setup}
+        progress={progress}
         nextEdit={nextEdit}
         onToggleNextEdit={onToggleNextEdit}
         dispatch={dispatch}
@@ -172,11 +203,37 @@ function StatusLine({ icon, text, tone }: { icon: string; text: string; tone: To
 }
 
 /**
+ * T10 (§2.5 B5): the quiet one-line "done / what next" status under a card —
+ * `pass-filled` + `text-add`, icon+text (never color-only). Renders nothing
+ * for an empty line (the `*DoneLine` helpers return `''` while not done).
+ */
+function DoneLine({ text, className = 'mt-1' }: { text: string; className?: string }) {
+  if (!text) return null;
+  return (
+    <div className={className}>
+      <StatusLine icon="pass-filled" text={text} tone="add" />
+    </div>
+  );
+}
+
+/**
  * One async, dispatch-issuing action. Local pending/error state — busy via
  * `aria-disabled` (keeps focus, mirrors `Toggle.tsx`'s F-8 posture);
  * `disabledReason`, when given, is a GENUINE indefinite disablement (the
  * trust gate) and renders NATIVE `disabled` + `aria-disabled` + a `title`
  * tooltip naming why (§6's accessibility rule).
+ *
+ * T9 (§2.4 B4 — "Test (and friends) speak on success"): `successLabel`,
+ * when given, is announced through the SAME always-mounted `LiveRegion`
+ * (polite) on a resolve, in `text-add`, and auto-clears after 4s (the timer
+ * is armed only while `success` is true and is cleaned up on every path out
+ * — a fresh success re-arms it, an unmount clears it — mirroring
+ * `ApprovalCard.tsx`'s local-expiry timer; no leaked timer, no
+ * set-state-after-unmount). No `successLabel` ⇒ today's behavior (nothing).
+ * A resolved value === {@link DECLINED} (the user dismissed a native
+ * confirmation modal, T2/§2.2.4) renders NEITHER success nor failure — the
+ * C-2 lock — regardless of whether `successLabel` was given. A rejection
+ * always renders the `✗ ${message}` failure line.
  */
 function ActionButton({
   label,
@@ -184,23 +241,37 @@ function ActionButton({
   disabledReason,
   tone = 'neutral',
   icon,
+  successLabel,
 }: {
   label: string;
   onRun: () => Promise<unknown>;
   disabledReason?: string;
   tone?: Tone;
   icon?: string;
+  successLabel?: string;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [success, setSuccess] = useState(false);
   const genuinelyDisabled = disabledReason !== undefined;
+
+  useEffect(() => {
+    if (!success) return;
+    const timer = setTimeout(() => setSuccess(false), 4000);
+    return () => clearTimeout(timer);
+  }, [success]);
 
   const onClick = () => {
     if (genuinelyDisabled || pending) return;
     setPending(true);
     setError(undefined);
+    setSuccess(false);
     void onRun().then(
-      () => setPending(false),
+      (result: unknown) => {
+        setPending(false);
+        if (result === DECLINED) return; // C-2 lock: neither success nor failure
+        if (successLabel !== undefined) setSuccess(true);
+      },
       (err: unknown) => {
         setPending(false);
         setError(errorMessage(err));
@@ -214,6 +285,9 @@ function ActionButton({
       : tone === 'warn'
         ? 'border-warn text-warn hover:bg-warn-soft'
         : 'border-border text-muted hover:bg-overlay';
+
+  const liveText = error ? `✗ ${error}` : success && successLabel !== undefined ? successLabel : '';
+  const liveClass = error ? 'text-2xs text-del' : 'text-2xs text-add';
 
   return (
     <div className="flex flex-col items-start gap-1">
@@ -229,7 +303,7 @@ function ActionButton({
         {icon && <Icon name={icon} size={12} spin={pending} />}
         {pending ? 'Working…' : label}
       </button>
-      <LiveRegion text={error ? `Failed: ${error}` : ''} className="text-2xs text-del" title={error} />
+      <LiveRegion text={liveText} className={liveClass} title={error} />
     </div>
   );
 }
@@ -363,43 +437,74 @@ function AgentCard({
       </div>
 
       <StatusLine icon={phaseIcon} text={agentPhaseLabel(agent.phase)} tone={phaseTone} />
+      <DoneLine text={agentDoneLine(agent.phase)} />
       {agent.version && <div className="mt-0.5 font-mono text-2xs text-faint">{agent.version}</div>}
 
       {agent.phase === 'pipx-missing' && (
-        // T11 (IMPORTANT host-gap 2): the honest text remains, but the
-        // dead-end "then retry" is replaced with the two real actions §6
-        // asks for — a pre-typed bootstrap terminal (the user provides
-        // sudo) and a Re-check once it's done. `agentPrimaryAction`
-        // returns `'none'` for this phase specifically so the generic
-        // single-action slot below doesn't ALSO render.
+        // T11 (host-gap 2), T10 (§1.2/§6): the dead-end "then retry" is
+        // replaced with the two real actions §6 asks for — a pre-typed
+        // bootstrap terminal (the user provides sudo) and a Re-check once
+        // it's done. The command itself is HOST-composed for the detected
+        // distro (`agent.bootstrap.command`) — the webview only ever
+        // renders it, never guesses one (Global Constraint 1). An
+        // unrecognized distro carries no `command`: honest guidance + a
+        // docs link takes its place, Re-check still works — never a
+        // dead-end. `agentPrimaryAction` returns `'none'` for this phase
+        // specifically so the generic single-action slot below doesn't
+        // ALSO render.
         <div className="mt-1 flex flex-col gap-1.5">
-          <p className="text-2xs text-muted">
-            pipx was not found on your PATH. Open a terminal to install it, then re-check.
-          </p>
-          <div className="flex flex-wrap gap-2">
-            <ActionButton
-              label="Open terminal: sudo dnf install pipx"
-              onRun={() => dispatch('setup.openBootstrapTerminal')}
-              disabledReason={disabledReason}
-            />
+          {agent.bootstrap?.guidance && <p className="text-2xs text-muted">{agent.bootstrap.guidance}</p>}
+          <div className="flex flex-wrap items-center gap-2">
+            {agent.bootstrap?.command ? (
+              <ActionButton
+                label={`Open terminal: ${agent.bootstrap.command}`}
+                onRun={() => dispatch('setup.openBootstrapTerminal')}
+                disabledReason={disabledReason}
+              />
+            ) : (
+              <a href={PIPX_INSTALL_DOCS_URL} className="text-2xs text-accent underline" target="_blank" rel="noreferrer">
+                pipx install docs
+              </a>
+            )}
             <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
           </div>
         </div>
       )}
       {agent.phase === 'python-unsuitable' && (
-        // T11 (§6-parity minor): honest text (when the host supplied one)
-        // PLUS a docs link — the descriptor's own `docsUrl` if the
-        // registry ever sets one, else a sensible generic fallback.
-        <div className="mt-1 flex flex-col gap-1">
-          {agent.detail && <p className="text-2xs text-muted">{agent.detail}</p>}
-          <a
-            href={selectedOption?.docsUrl ?? PYTHON_VERSION_HELP_URL}
-            className="text-2xs text-accent underline"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Python version help
-          </a>
+        // T10 (§1.2/§6): the engine's `pythonInstall` plan drives TWO
+        // branches, Re-check in BOTH — never a dead-end. `kind === 'command'`
+        // — an in-range Python exists in the distro's own archive — gets a
+        // pre-typed terminal button (host-composed, never guessed) beside
+        // the honest `agent.detail` explanation. Every other case
+        // (`'guidance'`, or no plan at all) shows the §6 guidance text +
+        // docs link instead — no terminal button, because there is no
+        // verified command to offer.
+        <div className="mt-1 flex flex-col gap-1.5">
+          {agent.pythonInstall?.kind === 'command' ? (
+            <>
+              {agent.detail && <p className="text-2xs text-muted">{agent.detail}</p>}
+              <ActionButton
+                label={`Open terminal: ${agent.pythonInstall.command}`}
+                onRun={() => dispatch('setup.openBootstrapTerminal', { target: 'python' })}
+                disabledReason={disabledReason}
+              />
+            </>
+          ) : (
+            <>
+              <p className="text-2xs text-muted">{agent.pythonInstall?.text ?? agent.detail ?? ''}</p>
+              <a
+                href={agent.pythonInstall?.docsUrl ?? selectedOption?.docsUrl ?? PYTHON_VERSION_HELP_URL}
+                className="text-2xs text-accent underline"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Python version help
+              </a>
+            </>
+          )}
+          <div>
+            <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
+          </div>
         </div>
       )}
       {agent.phase === 'awaiting-reload' && (
@@ -482,6 +587,7 @@ function ProviderCard({
   return (
     <Card title="Provider">
       <StatusLine icon={icon} text={text} tone={tone} />
+      <DoneLine text={providerDoneLine(provider.phase)} />
       {provider.phase === 'unconfigured' && (
         <div className="mt-2">
           <ActionButton
@@ -529,6 +635,7 @@ function FimCard({
 
   return (
     <Card title="Autocomplete (FIM)">
+      <DoneLine text={fimDoneLine(fim)} className="mb-2" />
       <div className="mb-2 flex flex-col gap-1.5">
         {fim.options.map((o) => (
           <BackendOptionRow
@@ -609,6 +716,7 @@ function FimConnectTab({
             label={option.remote?.apiKeySet ? 'Change key' : 'Set API key…'}
             onRun={() => dispatch('setup.setApiKey')}
             disabledReason={disabledReason}
+            successLabel="✓ Key stored"
           />
           {option.remote?.apiKeySet && (
             <ActionButton
@@ -621,12 +729,17 @@ function FimConnectTab({
       )}
 
       <div className="flex gap-2">
-        <ActionButton label="Test" onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })} />
+        <ActionButton
+          label="Test"
+          onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })}
+          successLabel="✓ Endpoint reachable"
+        />
         <ActionButton
           label="Apply"
           onRun={() => dispatch('setup.applyFim', { backendId: option.id, endpoint })}
           disabledReason={disabledReason}
           tone="accent"
+          successLabel="✓ Applied"
         />
       </div>
     </div>
@@ -650,23 +763,53 @@ function FimInstallTab({
     return <OllamaInstallPanel option={option} setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />;
   }
 
+  // T10 (§2.6 ⑨⑩ / R-1b): llama.cpp/vLLM have no daemon-presence probe (no
+  // `/api/tags` equivalent `status()` can check), so — unlike Ollama's
+  // Re-check above — the honest affordance here is an ENDPOINT TEST, not a
+  // presence re-check. R-1b: vLLM's `docs-only` flavor has no verified
+  // install source at all (§5.2) — its terminal button is SUPPRESSED and
+  // the effort prose is replaced with vLLM-specific guidance; every other
+  // (`guided-terminal`) backend keeps its terminal button + effort prose
+  // AND gains the same §6 "has no install detection" line + Test button.
+  const isDocsOnly = option.localInstall?.flavor === 'docs-only';
+  const endpoint = fimInstallTestEndpoint(setup.fim.selectedId, option);
+
   return (
     <div className="flex flex-col gap-2 text-2xs text-muted">
-      <p>
-        {option.localInstall?.effort === 'manual-guided'
-          ? 'Manual install — needs your own build/hardware decisions.'
-          : 'Clean one-script install.'}
-      </p>
-      <ActionButton
-        label={`Open terminal: install ${option.displayName}`}
-        onRun={() => dispatch('setup.openInstallTerminal', { backendId: option.id })}
-        disabledReason={disabledReason}
-      />
+      {isDocsOnly ? (
+        <p>vLLM&apos;s install depends on your GPU/CUDA setup — follow the official guide, then test the connection.</p>
+      ) : (
+        <>
+          <p>
+            {option.localInstall?.effort === 'manual-guided'
+              ? 'Manual install — needs your own build/hardware decisions.'
+              : 'Clean one-script install.'}
+          </p>
+          <ActionButton
+            label={`Open terminal: install ${option.displayName}`}
+            onRun={() => dispatch('setup.openInstallTerminal', { backendId: option.id })}
+            disabledReason={disabledReason}
+          />
+        </>
+      )}
+
       {option.docsUrl && (
         <a href={option.docsUrl} className="text-accent underline" target="_blank" rel="noreferrer">
           Setup docs
         </a>
       )}
+
+      {!isDocsOnly && (
+        <p>{`${option.displayName} has no install detection — start your server, then test the connection.`}</p>
+      )}
+      <div>
+        <ActionButton
+          label={`Test connection (${endpoint})`}
+          onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })}
+          successLabel="✓ Endpoint reachable"
+        />
+      </div>
+
       <p>Once it&apos;s running, switch to the Connect tab and Test.</p>
     </div>
   );
@@ -753,12 +896,14 @@ function OllamaInstallPanel({
 
 function NextEditCard({
   setup,
+  progress,
   nextEdit,
   onToggleNextEdit,
   dispatch,
   disabledReason,
 }: {
   setup: SetupData;
+  progress: SetupProgressMap;
   nextEdit: NextEditToggleState;
   onToggleNextEdit: SetupPanelProps['onToggleNextEdit'];
   dispatch: SetupPanelProps['dispatch'];
@@ -767,9 +912,15 @@ function NextEditCard({
   const [showForm, setShowForm] = useState(false);
   const next = setup.nextEdit;
   const buttonLabel = nextEditButtonLabel(next.dedicatedConfigured);
+  // T15 (§4.3 D4, critic C-14): the CPU/GPU caveat renders at CARD level
+  // whenever the dedicated toggle is ON or the form is open — a user could
+  // otherwise enable dedicated NEXT without ever seeing it (it used to live
+  // only inside the collapsed form).
+  const showWarning = next.dedicated !== undefined && (nextEdit.next || showForm);
 
   return (
     <Card title="Next Edit (NEXT)">
+      <DoneLine text={nextDoneLine(next.source)} className="mb-2" />
       <p className="mb-2 text-2xs text-muted">
         Want NEXT (multi-line next-edit)? Two modes: <strong className="text-fg">Generic</strong> reuses your FIM
         model — onboarding already set it up, no extra setup. <strong className="text-fg">Dedicated</strong> uses a
@@ -794,6 +945,17 @@ function NextEditCard({
         </div>
       )}
 
+      {showWarning && (
+        <div
+          role="note"
+          aria-label="Dedicated NEXT resource warning"
+          className="mb-2 flex items-start gap-2 rounded-card border border-warn bg-warn-soft px-3 py-2 text-2xs text-fg"
+        >
+          <Icon name="warning" size={14} className="mt-0.5 flex-none text-warn" />
+          <span>{next.dedicated?.warning}</span>
+        </div>
+      )}
+
       <button
         type="button"
         onClick={() => setShowForm((s) => !s)}
@@ -802,7 +964,9 @@ function NextEditCard({
         {buttonLabel}
       </button>
 
-      {showForm && <DedicatedNextForm setup={setup} dispatch={dispatch} disabledReason={disabledReason} />}
+      {showForm && (
+        <DedicatedNextForm setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      )}
     </Card>
   );
 }
@@ -846,12 +1010,22 @@ function NextEditToggleRow({
   );
 }
 
+/**
+ * T15 (beta.5 §4.3 D1–D4): the dedicated NEXT setup form. Endpoint/Model
+ * local state is a `DedicatedFormFieldState` (`setupCards.ts`) reconciled
+ * against the picked backend's own defaults on every render via
+ * `reconcileDedicatedFormFields` — the `settingsField.ts` "adjust state
+ * while rendering" pattern, so switching backends resets the fields to
+ * THAT backend's defaults without clobbering an in-flight edit.
+ */
 function DedicatedNextForm({
   setup,
+  progress,
   dispatch,
   disabledReason,
 }: {
   setup: SetupData;
+  progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
 }) {
@@ -859,8 +1033,31 @@ function DedicatedNextForm({
   const preferred = candidates.find((o) => o.nextEditTransport === setup.nextEdit.backend) ?? candidates[0];
   const [selectedId, setSelectedId] = useState(preferred?.id ?? '');
   const selected = candidates.find((o) => o.id === selectedId) ?? preferred;
-  const [endpoint, setEndpoint] = useState(setup.nextEdit.endpoint || selected?.remote?.endpointDefault || '');
-  const [model, setModel] = useState(setup.nextEdit.model);
+  const dedicated = setup.nextEdit.dedicated;
+
+  const defaults = dedicatedFieldDefaults(setup, selected);
+  const [fields, setFields] = useState(() => initDedicatedFormFieldState(selectedId, defaults));
+  const reconciled = reconcileDedicatedFormFields(fields, selectedId, defaults);
+  if (reconciled !== fields) setFields(reconciled);
+  const { endpoint, model } = reconciled;
+  const setEndpoint = (v: string) => setFields((f) => ({ ...f, endpoint: v }));
+  const setModel = (v: string) => setFields((f) => ({ ...f, model: v }));
+
+  const backendIsOllama = selected?.nextEditTransport === 'ollama';
+  const presence: NextPresence = backendIsOllama ? nextPresence(setup, endpoint, model) : 'unknown';
+  const presenceTone: Tone = presence === 'present' ? 'add' : presence === 'absent' ? 'warn' : 'neutral';
+  const presenceIcon = presence === 'present' ? 'pass-filled' : presence === 'absent' ? 'circle-outline' : 'question';
+  const showDownload = nextDownloadButtonVisible(dedicated, backendIsOllama, presence);
+  const pullId = dedicated?.modelDefaults.ollama ?? '';
+  const livePull = pullId ? progress[progressKey('pull', pullId)] : undefined;
+  const pullPct = pullPercent(livePull?.totalBytes, livePull?.completedBytes);
+
+  // §4.3 point 5: llama.cpp / vLLM each get a read-only guided line — ONLY
+  // these two ids carry wire text at all (§4.4: `guided.llamacpp` is absent
+  // while `!downloadReady`, S-F2/S-F5 — the -hf line ships with nothing to
+  // verify against until the pin is published).
+  const guidedText = selected?.id === 'llamacpp' ? dedicated?.guided.llamacpp : selected?.id === 'vllm' ? dedicated?.guided.vllm : undefined;
+  const guided = guidedText !== undefined ? splitGuidedLine(guidedText) : undefined;
 
   return (
     <div className="mt-2 flex flex-col gap-2 rounded border border-border bg-overlay p-2">
@@ -868,6 +1065,7 @@ function DedicatedNextForm({
         <p className="text-2xs text-faint">No backend supports a dedicated NEXT connection.</p>
       ) : (
         <>
+          {dedicated && <p className="text-2xs text-muted">{nextModelLine(dedicated.displayName)}</p>}
           <div className="flex flex-col gap-1.5">
             {candidates.map((o) => (
               <BackendOptionRow key={o.id} option={o} selected={o.id === selectedId} onSelect={setSelectedId} />
@@ -875,6 +1073,58 @@ function DedicatedNextForm({
           </div>
           <TextField label="Endpoint" value={endpoint} onChange={setEndpoint} />
           <TextField label="Model" value={model} onChange={setModel} />
+
+          {backendIsOllama && dedicated && !dedicated.downloadReady && (
+            <p className="text-2xs text-faint">{NEXT_DOWNLOAD_UNAVAILABLE_TEXT}</p>
+          )}
+
+          {backendIsOllama && dedicated?.downloadReady && (
+            <div className="flex flex-col gap-1.5">
+              <StatusLine icon={presenceIcon} text={nextPresenceText(presence)} tone={presenceTone} />
+              {showDownload && (
+                <div>
+                  <ActionButton
+                    label={NEXT_DOWNLOAD_BUTTON_LABEL}
+                    onRun={() => dispatch('setup.pullModel', { model: dedicated.modelDefaults.ollama, endpoint })}
+                    disabledReason={disabledReason}
+                    successLabel={NEXT_POST_DOWNLOAD_NUDGE}
+                  />
+                </div>
+              )}
+              {pullPct !== undefined && (
+                <div className="flex items-center gap-2" aria-live="polite">
+                  <div
+                    role="progressbar"
+                    aria-valuenow={pullPct}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label={`Pulling ${pullId}`}
+                    className="h-1.5 flex-1 overflow-hidden rounded-full bg-border"
+                  >
+                    <div className="h-full bg-accent" style={{ width: `${pullPct}%` }} />
+                  </div>
+                  <span className="font-mono text-2xs text-faint">{pullPct}%</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {guided && (
+            <div className="flex flex-col gap-1 rounded border border-border bg-surface px-2 py-1.5 text-2xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 flex-1 truncate font-mono text-fg" title={guided.command}>
+                  {guided.command}
+                </span>
+                <ActionButton
+                  label="Copy"
+                  icon="copy"
+                  onRun={() => navigator.clipboard.writeText(guided.command.replace(/^Run:\s*/, ''))}
+                />
+              </div>
+              {guided.caption && <span className="text-faint">{guided.caption}</span>}
+            </div>
+          )}
+
           <div className="flex gap-2">
             {/* T11 (§6-parity minor): reuses the SAME `setup.testRemote`
                 correlated method the FIM Connect tab already dispatches —
@@ -882,6 +1132,7 @@ function DedicatedNextForm({
             <ActionButton
               label="Test"
               onRun={() => dispatch('setup.testRemote', { backendId: selected?.id, endpoint })}
+              successLabel="✓ Endpoint reachable"
             />
             <ActionButton
               label="Apply"
@@ -894,6 +1145,7 @@ function DedicatedNextForm({
               }
               disabledReason={disabledReason}
               tone="accent"
+              successLabel="✓ Saved"
             />
           </div>
         </>
@@ -919,6 +1171,7 @@ function RagCard({
 
   return (
     <Card title="Codebase index (RAG)">
+      <DoneLine text={ragDoneLine(rag)} className="mb-2" />
       {rag.preconditionDetail && (
         <div className="mb-2 rounded border border-warn bg-warn-soft px-2 py-1.5 text-2xs text-fg">
           {rag.preconditionDetail}

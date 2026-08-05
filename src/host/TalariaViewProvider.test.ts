@@ -17,11 +17,13 @@ import type { WebviewSignal } from './TalariaViewProvider';
 import type { AgentBackend } from './backend/AgentBackend';
 import { SetupController, type SetupHost, type SetupControllerDeps } from './setup/SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
+import type { PanelFetchOutcome, PanelSource } from './panels/PanelSourceRegistry';
 import type {
   ContextRef,
   EditPolicyPreset,
   HostToWebviewMessage,
   HydrateTabSeed,
+  SetupData,
   SlashCommandInfo,
   WebviewToHostMessage,
 } from '../shared/protocol';
@@ -1282,6 +1284,8 @@ class FakeSetupHostForRouting implements SetupHost {
 function makeFakeSetupDeps(): SetupControllerDeps {
   return {
     locatePipx: async () => ({ ok: false, reason: 'pipx-missing', detail: 'not used in routing tests' }),
+    // T5: routing tests never render the os card — {} degrades to 'unknown'.
+    readOsRelease: async () => ({}),
     installHermes: async () => {
       throw new Error('not used in routing tests');
     },
@@ -1293,6 +1297,11 @@ function makeFakeSetupDeps(): SetupControllerDeps {
     // Task 13: routing tests never exercise the provider mapping — undefined
     // keeps the provider card honestly 'waiting-agent'.
     getAdvertisedAuthMethods: () => undefined,
+    // T13 (beta.5 §4.4): routing tests never reach the vetted-ingest branch.
+    verifyHfDigest: async () => ({ ok: false, reason: 'not used in routing tests' }),
+    ingestGguf: async () => {
+      throw new Error('not used in routing tests');
+    },
   };
 }
 
@@ -1313,6 +1322,51 @@ function makeProviderWithSetupController(): {
   provider.setSetupController(controller);
   return { provider, posted, calls, host, controller };
 }
+
+/** T7: a minimal valid {@link SetupData} fixture for the staleness-guard
+ *  test's fake `PanelSource<'setup'>` — mirrors `setupPanelSource.test.ts`'s
+ *  FIXTURE (kept local so this file never cross-imports a sibling test's
+ *  fixture). Individual tests spread + override a distinguishing field
+ *  (`agent.selectedId`) to tell "fresh" and "stale" pushes apart. */
+const SETUP_DATA_FIXTURE: SetupData = {
+  trusted: true,
+  agent: { options: [], selectedId: 'hermes', phase: 'missing' },
+  provider: { phase: 'waiting-agent' },
+  fim: {
+    options: [],
+    selectedId: 'ollama',
+    enabled: true,
+    model: 'qwen2.5-coder:1.5b-base',
+    endpointValue: '',
+    tuning: {
+      debounceMs: 350,
+      maxPromptTokens: 1024,
+      temperature: 0.01,
+      crossFileEnabled: true,
+      prefixInjection: false,
+      prefixInjectionRemote: false,
+      warmUp: false,
+    },
+  },
+  nextEdit: {
+    source: 'off',
+    backend: 'ollama',
+    endpoint: '',
+    model: '',
+    dedicatedConfigured: false,
+    genericSupported: true,
+  },
+  rag: {
+    enabled: true,
+    embedEndpoint: 'http://127.0.0.1:11434',
+    embedModel: 'qwen3-embedding:0.6b',
+    embedModelPresent: false,
+    tuning: { dims: 0, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: [] },
+    indexDir: '.hermes/index',
+  },
+  ollama: { running: false, models: [] },
+  ready: false,
+};
 
 describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
   it('setup.status returns the full SetupData and never reaches backend.invokeControl', async () => {
@@ -1425,6 +1479,111 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
     });
 
     expect(posted).toContainEqual({ type: 'setup.progress', op: 'install', id: 'hermes', phase: 'pipx-install' });
+  });
+
+  // ── T7 (§2.2): the :957 ok-gate is dropped — a REFUSED mutation still
+  // pushes fresh SetupData once; onStatusChanged is subscribed; and
+  // pushSetupPanelData carries a monotonic-seq staleness guard. ──
+
+  it('a REFUSED setup.* mutation (setup.setTunable with an unknown key) still pushes fresh SetupData once (the dropped :957 ok-gate)', async () => {
+    const { provider, posted } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      requestId: 30,
+      method: 'setup.setTunable',
+      params: { key: 'not-a-real-tunable', value: 1 },
+    } as never);
+    await flush();
+    await flush();
+    await flush();
+
+    const reply = posted.find((m) => m.type === 'control.response');
+    expect(reply).toMatchObject({ requestId: 30, ok: true, result: { ok: false, reason: 'not a tunable' } });
+    const pushes = posted.filter((m) => m.type === 'panel.data' && (m as { panel?: string }).panel === 'setup');
+    expect(pushes.length).toBe(1);
+  });
+
+  it('setSetupController subscribes to onStatusChanged: a controller-driven fire (bypassing handleSetupMethod entirely) still pushes fresh SetupData', async () => {
+    const { posted, controller } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    // Calling the controller DIRECTLY (not through handleWebviewMessage) means
+    // handleSetupMethod's own unconditional post-handle push never runs — the
+    // ONLY thing that can produce a push here is the onStatusChanged
+    // subscription wired in setSetupController.
+    await controller.handle('setup.recheck', {});
+    await flush();
+    await flush();
+    await flush();
+
+    const pushes = posted.filter((m) => m.type === 'panel.data' && (m as { panel?: string }).panel === 'setup');
+    expect(pushes.length).toBe(1);
+  });
+
+  it('rewiring setSetupController disposes the OLD onStatusChanged subscription (no leak / no stray push)', async () => {
+    const { provider, posted, controller: oldController } = makeProviderWithSetupController();
+    const newController = new SetupController(new FakeSetupHostForRouting(), makeFakeSetupDeps());
+    provider.setSetupController(newController);
+    posted.length = 0;
+
+    // Fire the OLD controller directly — its subscription must be disposed,
+    // so this must produce NO push through the (now-superseded) provider wiring.
+    await oldController.handle('setup.recheck', {});
+    await flush();
+    await flush();
+    await flush();
+
+    expect(posted.filter((m) => m.type === 'panel.data')).toEqual([]);
+  });
+
+  it('pushSetupPanelData: a STALE fetch resolving after a fresher push has already started is DROPPED (monotonic seq guard)', async () => {
+    const { provider, posted } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    let resolveFirst!: (o: PanelFetchOutcome<'setup'>) => void;
+    let resolveSecond!: (o: PanelFetchOutcome<'setup'>) => void;
+    const first = new Promise<PanelFetchOutcome<'setup'>>((r) => {
+      resolveFirst = r;
+    });
+    const second = new Promise<PanelFetchOutcome<'setup'>>((r) => {
+      resolveSecond = r;
+    });
+    let call = 0;
+    const fakeSource: PanelSource<'setup'> = {
+      fetch: async () => {
+        call++;
+        return call === 1 ? first : second;
+      },
+    };
+    (provider as unknown as { setupPanelSource: PanelSource<'setup'> }).setupPanelSource = fakeSource;
+    const pushImpl = (
+      provider as unknown as { pushSetupPanelData(): Promise<void> }
+    ).pushSetupPanelData.bind(provider);
+
+    // push #1 starts first (seq=1) — its fetch is the SLOW/stale one, and
+    // will resolve SECOND, after push #2 has already started.
+    const stalePush = pushImpl();
+    // push #2 starts second (seq=2) — its fetch is the FAST/fresh one.
+    const freshPush = pushImpl();
+
+    const freshData: SetupData = { ...SETUP_DATA_FIXTURE, agent: { ...SETUP_DATA_FIXTURE.agent, selectedId: 'fresh' } };
+    const staleData: SetupData = { ...SETUP_DATA_FIXTURE, agent: { ...SETUP_DATA_FIXTURE.agent, selectedId: 'stale' } };
+
+    // Fresh resolves first — it is still the CURRENT seq, so it posts.
+    resolveSecond({ data: freshData });
+    await freshPush;
+    expect(posted).toContainEqual({ type: 'panel.data', panel: 'setup', data: freshData });
+    expect(posted.filter((m) => m.type === 'panel.data').length).toBe(1);
+
+    // Stale resolves AFTER — the seq has moved on, so it must be DROPPED:
+    // no additional panel.data post lands for it.
+    resolveFirst({ data: staleData });
+    await stalePush;
+    const panelPushesAfter = posted.filter((m) => m.type === 'panel.data');
+    expect(panelPushesAfter.length).toBe(1);
+    expect(panelPushesAfter[0]).toEqual({ type: 'panel.data', panel: 'setup', data: freshData });
   });
 
   it('openSetupPanel() latches the NEXT hydrate with activePanel:"setup" — delivered by the READY handshake, not resolve-time', () => {

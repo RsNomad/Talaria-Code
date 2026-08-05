@@ -626,7 +626,9 @@ export interface SetupBackendOption {
   };
   /** The "Install locally" tab — present only for the local-capable entries. */
   localInstall?: {
-    flavor: 'pipx' | 'guided-terminal';
+    /** beta.5 T6: `'docs-only'` (additive) — no verified install source, a
+     *  docs link + endpoint Test only (e.g. vLLM, §5.2 rev 3 ⑪). */
+    flavor: 'pipx' | 'guided-terminal' | 'docs-only';
     effort: 'one-script' | 'manual-guided';
     models?: { role: 'fim' | 'embedding'; model: string; present: boolean }[];
   };
@@ -666,6 +668,26 @@ export interface SetupData {
     version?: string;
     detail?: string;
     logTail?: string[];
+    /**
+     * beta.5 §1.2 (T5): the HOST-composed pipx bootstrap for the
+     * `pipx-missing` card — present iff `phase === 'pipx-missing'`.
+     * `command` is the engine's exact pre-typed line for the detected
+     * family; absent `command` = unknown distro, `guidance` (§6 copy) is
+     * then the whole story. The webview renders this text only — it never
+     * composes or submits command text of its own (Global Constraint 1).
+     */
+    bootstrap?: { command?: string; guidance: string };
+    /**
+     * beta.5 §1.2 (T5): the engine's Python install plan for the
+     * `python-unsuitable` card — present iff `phase ===
+     * 'python-unsuitable'`. Structural mirror of the host engine's
+     * `PythonInstallPlan | PythonGuidancePlan` (`src/host/setup/
+     * packageTable.ts`) — reproduced here, not imported, per this module's
+     * webview-safe zero-host-imports rule (section header doc).
+     */
+    pythonInstall?:
+      | { kind: 'command'; command: string; sourceNote: string; docsUrl: string }
+      | { kind: 'guidance'; text: string; docsUrl: string };
   };
   /** Card 2 — provider (chat model for the agent). */
   provider: {
@@ -701,6 +723,40 @@ export interface SetupData {
     /** Whether the current FIM backend supports the `generic` (reuse) source. */
     genericSupported: boolean;
     refusalDetail?: string;
+    /**
+     * beta.5 §4.2 (T13): the dedicated NEXT model block — host-composed
+     * capability + raw facts; the webview DERIVES presence client-side
+     * against its live form state (critics C-6/S-F11). OPTIONAL + additive
+     * (Global Constraint 6) — the host always populates it since beta.5.
+     */
+    dedicated?: {
+      displayName: string;
+      /**
+       * Per-backend prefill (D1). ⚠ R-3: `ollama` is `''` while
+       * `!downloadReady` — a prefill naming a model that resolves to
+       * nothing would let Apply persist silent runtime next-edit failure;
+       * the empty model instead trips `setup.setNextEdit`'s existing
+       * "model is required" refusal (configuration fail-closed, not just
+       * the download). When `downloadReady`, it is the ingest-created
+       * local name (`ollamaCreatedName`).
+       */
+      modelDefaults: { ollama: string; openaiCompat: string };
+      /**
+       * Capability flag ONLY: the code-pinned sha256 is published
+       * (non-empty). The UI additionally requires picked-backend===ollama
+       * and a reachable daemon before showing the Download button.
+       */
+      downloadReady: boolean;
+      downloadApproxBytes: number;
+      /** D4 copy, host-composed (§6), rendered at CARD level (C-14). */
+      warning: string;
+      /**
+       * Guided command lines (§6, newline-separated command + note).
+       * `llamacpp` present ONLY when `downloadReady` — the `-hf` line is
+       * gated by the same pin as the Download button (S-F2/S-F5).
+       */
+      guided: { vllm: string; llamacpp?: string };
+    };
   };
   /** Card 5 — codebase index (RAG). */
   rag: {
@@ -713,10 +769,35 @@ export interface SetupData {
     /** `shouldActivateRag` text, populated when RAG is blocked from activating. */
     preconditionDetail?: string;
   };
-  /** Local Ollama daemon status, read by the FIM/NEXT local-install tabs. */
-  ollama: { running: boolean; version?: string; models: { name: string; sizeBytes: number }[] };
+  /**
+   * Local Ollama daemon status, read by the FIM/NEXT local-install tabs.
+   * `endpoint` (beta.5 §4.2, T13): the endpoint `status()` ACTUALLY probed —
+   * presence claims are scoped to it; the webview must treat any OTHER
+   * endpoint's presence as `'unknown'`, never inherited (critic C-6).
+   * OPTIONAL + additive (Global Constraint 6) — always populated since beta.5.
+   */
+  ollama: { running: boolean; version?: string; endpoint?: string; models: { name: string; sizeBytes: number }[] };
   /** Composite "you're ready" banner: agent ready + provider configured + FIM probe OK. */
   ready: boolean;
+  /**
+   * beta.5 §1.2 (T5): the detected OS identity every pre-typed install
+   * command on this panel was composed FOR. Structural mirror of the host
+   * engine's `DistroFamily`/`PackageManager` (`src/host/setup/osDetect.ts`)
+   * — reproduced here, not imported (webview-safe module, see section
+   * header doc). OPTIONAL + additive (Global Constraint 6).
+   */
+  os?: {
+    family: 'fedora' | 'debian' | 'arch' | 'suse' | 'unknown';
+    manager: 'dnf' | 'apt-get' | 'pacman' | 'zypper' | 'unknown';
+    prettyName?: string;
+    /**
+     * §6 container-note copy (S-F10 honesty), present when detection
+     * degraded to `unknown` because a container/Flatpak boundary hides
+     * which system the integrated terminal actually acts on (a container
+     * marker was found and `/run/host/os-release` was absent).
+     */
+    containerNote?: string;
+  };
 }
 
 /**
@@ -1614,10 +1695,14 @@ export type ControlMethod = (typeof CONTROL_METHODS)[number];
  * extension host window — trust-gated (FM-14) but MODAL-FREE (it writes no
  * settings and spawns nothing, so it follows the Tier-2 `setup.setTunable`
  * posture: gated, no confirmation dialog). `setup.openBootstrapTerminal`
- * opens a terminal pre-typed with the Fedora pipx bootstrap (`sudo dnf
- * install pipx`) — Tier-1 (a terminal-opening action, §8), modal-gated like
- * `setup.openInstallTerminal`, but unconditional (no registry `backendId` —
- * pipx itself isn't a registry entry).
+ * opens a terminal pre-typed with a HOST-resolved install line — Tier-1 (a
+ * terminal-opening action, §8), modal-gated like `setup.openInstallTerminal`
+ * but with no registry `backendId` (pipx itself isn't a registry entry).
+ * beta.5 T5 (§1.2): it takes `{target?: 'pipx' | 'python'}` (absent =
+ * `'pipx'`, strictly validated host-side) and resolves the command from the
+ * OS-detection engine for the DETECTED distro family — refused fail-closed
+ * (`{ok:false}`, no modal, no terminal) when the engine has no verified
+ * line (unknown distro, container degrade, or a guidance-only Python plan).
  */
 export type SetupMethod =
   | 'setup.status'

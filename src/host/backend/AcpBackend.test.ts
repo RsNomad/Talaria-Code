@@ -43,6 +43,8 @@ import type { PanelSource } from '../panels/PanelSourceRegistry';
 import type { DashboardService } from '../dashboard/HermesDashboardManager';
 import type { DashboardClientLike, DashboardToggleResult } from '../dashboard/HermesDashboardClient';
 import type { ConfinedReader } from './acp/confinedOpen';
+import { ConnectionSupervisor, type ConnectionSupervisorHostPort } from './connection/ConnectionSupervisor';
+import { SessionRegistry } from './session/SessionRegistry';
 import { must } from '../../testing/must';
 
 /**
@@ -1665,6 +1667,158 @@ describe('AcpBackend.start — W4-T1b F2: connection/session phase split (critic
       await vi.advanceTimersByTimeAsync(60_000);
       expect(clients).toHaveLength(2); // still just the one — no orphaned duplicate respawn
     });
+  });
+});
+
+/**
+ * T8 (beta.5 setup-hardening §2.3, bug ⑧): the `[object Object]`
+ * session-start banner is replaced by a STRUCTURAL no-provider route.
+ *
+ * Detection is structural, not textual (critic C-5): the Hermes adapter
+ * (`acp_adapter/session.py:652-654`) SWALLOWS `resolve_runtime_provider`
+ * failures (`except Exception: logger.debug(...)`), so the AuthError texts
+ * never reliably reach the wire. At `establishInitialSession`-failure time
+ * the supervisor instead consults the injected `isProviderUnconfigured`
+ * thunk — wired by `AcpBackend` to `computeProviderCard(
+ * getAdvertisedAuthMethods()).phase === 'unconfigured'`, the SAME source
+ * the Setup Provider card reads — with `isAuthRequiredError` (`-32000`) as
+ * a supplement only. The real error text (`describeError`) is ALWAYS
+ * appended, so the routed branch can never hide it.
+ */
+describe('ConnectionSupervisor/AcpBackend — T8 (§2.3 ⑧): structural no-provider banner at session-establish failure', () => {
+  /** §6 copy, VERBATIM (docs_claude/beta5-setup-hardening-architecture.md:451). */
+  const NO_PROVIDER_BANNER =
+    'Hermes has no chat provider configured. Open Setup → Provider → "Configure provider", then try again.';
+
+  it('provider UNCONFIGURED (only hermes-setup advertised) + a raw NON-auth rejection ({code:-32603}) ⇒ the pinned copy WITH the real detail appended (structural detection alone routes it)', async () => {
+    const { backend } = makeStartableBackend(undefined, (client) => {
+      client.advertisedAuthMethods = [{ id: 'hermes-setup', name: 'Hermes setup wizard' }];
+      client.failNextNewSession({
+        code: -32603,
+        message: 'Internal error',
+        data: { details: 'runtime provider resolution failed' },
+      });
+    });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await expect(backend.start()).resolves.toBeUndefined();
+
+    expect(messages.filter((m) => m.type === 'system.error')).toEqual([
+      {
+        type: 'system.error',
+        message: `${NO_PROVIDER_BANNER} (Internal error (runtime provider resolution failed))`,
+      },
+    ]);
+  });
+
+  it('provider CONFIGURED (a managed method advertised) + a raw JSON-RPC object rejection ⇒ "Failed to start…" with the REAL text — never "[object Object]" (the ⑧ regression)', async () => {
+    const { backend } = makeStartableBackend(undefined, (client) => {
+      client.advertisedAuthMethods = [
+        { id: 'openrouter', name: 'openrouter runtime credentials' },
+        { id: 'hermes-setup', name: 'Hermes setup wizard' },
+      ];
+      client.failNextNewSession({ code: -32603, message: 'Internal error', data: { details: 'boom' } });
+    });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.start();
+
+    const errors = messages.filter((m) => m.type === 'system.error');
+    expect(errors).toEqual([
+      { type: 'system.error', message: 'Failed to start a Hermes session: Internal error (boom)' },
+    ]);
+    for (const error of errors) expect(JSON.stringify(error)).not.toContain('[object Object]');
+  });
+
+  it('the -32000 authRequired SUPPLEMENT routes to the pinned copy even when the structural signal reads configured', async () => {
+    const { backend } = makeStartableBackend(undefined, (client) => {
+      client.advertisedAuthMethods = [
+        { id: 'openrouter', name: 'openrouter runtime credentials' },
+        { id: 'hermes-setup', name: 'Hermes setup wizard' },
+      ];
+      client.failNextNewSession({ code: -32000, message: 'Authentication required' });
+    });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.start();
+
+    expect(messages.filter((m) => m.type === 'system.error')).toEqual([
+      { type: 'system.error', message: `${NO_PROVIDER_BANNER} (Authentication required)` },
+    ]);
+  });
+
+  it('a port WITHOUT isProviderUnconfigured (optional member omitted) still routes -32000 to the pinned copy — the supplement works alone', async () => {
+    const emitted: HostToWebviewMessage[] = [];
+    const authRequired: unknown = { code: -32000, message: 'Authentication required' };
+    const port: ConnectionSupervisorHostPort = {
+      config: { hermesPath: '/fake/hermes' },
+      createClient: (options) => new FakeAcpClient(options),
+      callbacks: {
+        onSessionUpdate: () => {},
+        onRequestPermission: () => Promise.reject(new Error('unused in this test')),
+        onReadTextFile: () => Promise.reject(new Error('unused in this test')),
+      },
+      setCwd: () => {},
+      getActiveSessionId: () => undefined,
+      setActiveSessionId: () => {},
+      sessions: new SessionRegistry(),
+      startControl: async () => {},
+      buildSessionPort: () => {
+        throw new Error('unused in this test');
+      },
+      openSession: async () => {
+        throw authRequired;
+      },
+      getMcpServers: () => [],
+      announceSessionBound: () => {},
+      warmCheckpointBaseline: () => {},
+      settleOneShot: () => {},
+      resetSessionsAccumulation: () => {},
+      isPendingClose: () => false,
+      emit: (msg) => emitted.push(msg),
+    };
+    const supervisor = new ConnectionSupervisor(port);
+
+    await supervisor.start();
+
+    expect(emitted).toEqual([
+      { type: 'system.error', message: `${NO_PROVIDER_BANNER} (Authentication required)` },
+    ]);
+  });
+
+  it('host call sites thread the real home into redaction (S-3) — a home-dir path in the failure detail renders as ~', async () => {
+    const home = os.homedir();
+    const { backend } = makeStartableBackend(undefined, (client) => {
+      client.failNextNewSession(new Error(`spawn failed: ${home}/.venvs/hermes/bin/python missing`));
+    });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.start();
+
+    expect(messages.filter((m) => m.type === 'system.error')).toEqual([
+      {
+        type: 'system.error',
+        message: 'Failed to start a Hermes session: spawn failed: ~/.venvs/hermes/bin/python missing',
+      },
+    ]);
+  });
+
+  it('AcpBackend.openTab (the second ⑧ call site): a raw JSON-RPC rejection surfaces as tab.error with the real text, never "[object Object]"', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    must(clients[0]).failNextNewSession({ code: -32603, message: 'Internal error', data: { details: 'boom' } });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.openTab('tab-2');
+
+    expect(messages).toEqual([
+      { type: 'tab.error', tabId: 'tab-2', kind: 'open-failed', message: 'Internal error (boom)' },
+    ]);
   });
 });
 

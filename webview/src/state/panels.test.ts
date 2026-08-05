@@ -14,10 +14,12 @@ import { idle, isError, isLoading, isSuccess } from './remoteData';
 import {
   applyPanelTransition,
   assertExhaustivePanel,
+  DECLINED,
   fetchPanel,
   reducePanelAction,
   resolvePanelRequest,
   setPanelSuccess,
+  unwrapSetupResult,
   type PanelStateMap,
 } from './panels';
 
@@ -317,5 +319,61 @@ describe('assertExhaustivePanel — the compile-time gate `foldPanelData`/`reduc
     expect(() => assertExhaustivePanel('unknown-future-panel' as never)).toThrow(
       'unreachable DataPanel: unknown-future-panel',
     );
+  });
+});
+
+/*
+ * T2 (beta.5, §0.1 ②, §2.2.4): the Setup panel's control.response transport
+ * always RESOLVES (a controller refusal is `ok:true` at the RPC layer,
+ * carrying `result:{ok:false,reason}` — the request itself succeeded, only
+ * the requested action was declined) — so `dispatchSetup`'s raw
+ * `bridge.request(...)` used to resolve on a refusal too, and `ActionButton`
+ * never saw an error. `unwrapSetupResult` is the pure re-shape that restores
+ * the ordinary resolve-on-success/reject-on-refusal contract every OTHER
+ * correlated mutation (`setConfig`, `setNextEditToggle`) already has — with
+ * one deliberate exception: `reason: 'declined'` (the user dismissed a
+ * native confirmation modal) is neither a success nor a failure, so it
+ * resolves to the `DECLINED` sentinel instead of throwing OR silently
+ * resolving the raw `{ok:false,...}` shape (critic C-2 — a silent resolve
+ * would have rendered "cancel the Apply dialog" as "✓ Applied").
+ */
+describe('unwrapSetupResult + DECLINED (T2, §2.2.4)', () => {
+  it('an accepted result (no ok:false) passes through unchanged', () => {
+    const result = { ok: true, data: { installed: true } };
+    expect(unwrapSetupResult(result)).toBe(result);
+  });
+
+  it('a result with no `ok` field at all passes through unchanged (not every SetupMethod result carries an ok flag)', () => {
+    const result = { next: true, generic: false };
+    expect(unwrapSetupResult(result)).toBe(result);
+  });
+
+  it('undefined passes through unchanged', () => {
+    expect(unwrapSetupResult(undefined)).toBeUndefined();
+  });
+
+  it('a refusal throws an Error carrying its `reason` verbatim', () => {
+    expect(() => unwrapSetupResult({ ok: false, reason: 'pipx was not found on your PATH.' })).toThrow(
+      'pipx was not found on your PATH.',
+    );
+  });
+
+  it('a refusal with no `reason` throws the default "The action was refused." message', () => {
+    expect(() => unwrapSetupResult({ ok: false })).toThrow('The action was refused.');
+  });
+
+  it('`reason: "declined"` returns the DECLINED sentinel — NOT a throw', () => {
+    expect(() => unwrapSetupResult({ ok: false, reason: 'declined' })).not.toThrow();
+  });
+
+  it('`reason: "declined"` returns EXACTLY the DECLINED sentinel', () => {
+    expect(unwrapSetupResult({ ok: false, reason: 'declined' })).toBe(DECLINED);
+  });
+
+  it('`reason: "declined"` does NOT resolve the raw `{ok:false,...}` result (the C-2 silent-resolve regression)', () => {
+    const raw = { ok: false, reason: 'declined' };
+    const unwrapped = unwrapSetupResult(raw);
+    expect(unwrapped).not.toBe(raw);
+    expect(unwrapped).not.toEqual(raw);
   });
 });

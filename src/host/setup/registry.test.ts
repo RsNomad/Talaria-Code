@@ -1,13 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { collectNonTestTsSources, scanLines, VSCODE_IMPORT_BAN } from '../purityScan';
+import { collectAllTsAndTsxSources, collectNonTestTsSources, scanLines, VSCODE_IMPORT_BAN } from '../purityScan';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import {
   AGENT_BACKENDS,
   FIM_BACKENDS,
   getBackend,
   HERMES_PIN,
+  NEXT_DEDICATED_MODEL,
+  SYNTINAL_HF_OWNER,
   type BackendDescriptor,
   type InstallRecipe,
 } from './registry';
@@ -258,5 +260,180 @@ describe('registry (h): purity — zero vscode imports (purityScan discipline)',
     // Non-vacuous: the scan must actually see registry.ts.
     expect(files.map((f) => f.file)).toContain('registry.ts');
     expect(scanLines(files, VSCODE_IMPORT_BAN)).toEqual([]);
+  });
+});
+
+/**
+ * (i) — T6 (beta5-setup-hardening-architecture.md §1.2 A3): llama.cpp's
+ * guided-terminal recipe gains `packageKey: 'llamacpp'` so
+ * `SetupController.handleOpenInstallTerminal` can override its `command`
+ * with the OS engine's (`packageTable.ts`) per-family verified line —
+ * fail-open closed (S-F9), never falling back to this static Fedora-shaped
+ * `command` on an unmatched family. Ollama's vendor-script recipe carries no
+ * `packageKey` and stays untouched by that override, on every family.
+ */
+describe('registry (i): llamacpp guided-terminal recipe carries packageKey for OS-engine routing (T6/S-F9)', () => {
+  it("llamacpp's recipe carries packageKey: 'llamacpp'", () => {
+    const recipe = mustGet('llamacpp').localInstall?.recipe;
+    expect(recipe?.kind).toBe('guided-terminal');
+    if (recipe?.kind === 'guided-terminal') {
+      expect(recipe.packageKey).toBe('llamacpp');
+    }
+  });
+
+  it('ollama carries no packageKey — its recipe is never engine-overridden (byte-identical regression lock)', () => {
+    const recipe = mustGet('ollama').localInstall?.recipe;
+    expect(recipe?.kind).toBe('guided-terminal');
+    if (recipe?.kind === 'guided-terminal') {
+      expect(recipe.packageKey).toBeUndefined();
+      expect(recipe.command).toBe('curl -fsSL https://ollama.com/install.sh | sh');
+      expect(recipe.docsUrl).toBe('https://ollama.com/download/linux');
+    }
+  });
+});
+
+/**
+ * (j) — T6 §5.2 rev 3 (⑪): vLLM's local install has no verified source to
+ * compose a command from (the beta.3 pip-based recipe was unpinned,
+ * PEP-668-hostile, and hardware-specific) — the recipe becomes docs-only.
+ * R-1a: `SetupController.projectBackend` projects only DESCRIPTOR-level
+ * `docsUrl` onto the wire (not the recipe's own), so the descriptor must
+ * carry its own copy too, or the docs-only tab would render linkless.
+ */
+describe('registry (j): vLLM local install is docs-only — docsUrl on BOTH the recipe and the descriptor (R-1a)', () => {
+  it("vllm's recipe is exactly {kind:'docs-only', docsUrl:'https://docs.vllm.ai/'}", () => {
+    const vllm = mustGet('vllm');
+    expect(vllm.localInstall?.recipe).toEqual({ kind: 'docs-only', docsUrl: 'https://docs.vllm.ai/' });
+  });
+
+  it('the vllm DESCRIPTOR also carries docsUrl (R-1a)', () => {
+    expect(mustGet('vllm').docsUrl).toBe('https://docs.vllm.ai/');
+  });
+
+  it('vllm is still status:available (docs-only + Test-only is a legitimate offering, not absence)', () => {
+    expect(mustGet('vllm').status).toBe('available');
+    expect(mustGet('vllm').remote).toBeDefined();
+  });
+});
+
+/**
+ * (k) — T6 §5.2 rev 3: the deleted vLLM install line (a `pip` invocation
+ * naming the `vllm` package, unpinned) must never reappear anywhere under
+ * `src/`. Deliberately phrased without ever spelling out the banned two-word
+ * literal in this file's own prose/comments — this scan collects TEST files
+ * too (unlike (h)'s production-only purity scan), so this file is itself
+ * subject to the ban it asserts and must not trip its own lock.
+ */
+describe('registry (k): the deleted vLLM pip-install recipe string is gone from the codebase', () => {
+  it('no .ts/.tsx file under src/ contains the deleted install line', () => {
+    const root = join(__dirname, '..', '..'); // src/host/setup -> src/host -> src
+    const files = collectAllTsAndTsxSources(root);
+    expect(files.length).toBeGreaterThan(0); // non-vacuous
+    const bannedWords = ['pip', 'install', 'vllm'];
+    const banned = new RegExp(bannedWords.join(' '));
+    expect(scanLines(files, banned)).toEqual([]);
+  });
+});
+
+/**
+ * (l) — T12 (beta5-setup-hardening-architecture.md §4.1): the Dedicated NEXT
+ * (Sweep) model registry data. Fail-closed by design: `gguf.sha256` is the
+ * EMPTY-STRING placeholder until the out-of-band GGUF publication lands —
+ * that is intentional, not a defect, and this suite must never demand a
+ * non-empty value. These are drift-locks, not behavior tests: the registry
+ * stays pure data (zero imports — see (h) above, which already scans this
+ * file's directory and would catch a stray import here too).
+ */
+describe('registry (l): NEXT_DEDICATED_MODEL — Dedicated NEXT registry data (T12, §4.1)', () => {
+  it('SYNTINAL_HF_OWNER is the owner-confirmed namespace', () => {
+    expect(SYNTINAL_HF_OWNER).toBe('SyntinalCo');
+  });
+
+  it('matches the §4.1 object exactly (whole-shape drift-lock)', () => {
+    expect(NEXT_DEDICATED_MODEL).toEqual({
+      displayName: 'Sweep Next-Edit v2 (7B)',
+      upstream: {
+        hfRepo: 'sweepai/sweep-next-edit-v2-7B',
+        format: 'safetensors',
+        license: 'Apache-2.0',
+        contextLength: 32768,
+      },
+      gguf: {
+        hfRepo: 'SyntinalCo/sweep-next-edit-v2-7B-GGUF',
+        file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf',
+        quant: 'Q4_K_M',
+        sha256: '',
+        approxBytes: 4_680_000_000,
+        allowedRepoFiles: ['sweep-next-edit-v2-7B-Q4_K_M.gguf', 'README.md', '.gitattributes'],
+      },
+      ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+      ollamaPullAlias: 'hf.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M',
+      vram: { fullGiB: 15, q4GiB: 5 },
+    });
+  });
+
+  it('every derived id starts with the owner constant (critic S-F2)', () => {
+    expect(NEXT_DEDICATED_MODEL.gguf.hfRepo.startsWith(`${SYNTINAL_HF_OWNER}/`)).toBe(true);
+  });
+
+  it('ollamaPullAlias is computed-equal to hf.co/{gguf.hfRepo}:{gguf.quant}', () => {
+    expect(NEXT_DEDICATED_MODEL.ollamaPullAlias).toBe(
+      `hf.co/${NEXT_DEDICATED_MODEL.gguf.hfRepo}:${NEXT_DEDICATED_MODEL.gguf.quant}`,
+    );
+  });
+
+  it('ollamaCreatedName is host-free because it contains NO "/" at all (rev 6 §4.4 predicate)', () => {
+    expect(NEXT_DEDICATED_MODEL.ollamaCreatedName.includes('/')).toBe(false);
+  });
+
+  it('allowedRepoFiles contains exactly the gguf file + README.md + .gitattributes', () => {
+    expect(NEXT_DEDICATED_MODEL.gguf.allowedRepoFiles).toEqual([
+      NEXT_DEDICATED_MODEL.gguf.file,
+      'README.md',
+      '.gitattributes',
+    ]);
+  });
+
+  it('sha256 is the empty-string fail-closed placeholder OR a LOWERCASE 64-hex digest (publication-compatible) — no `i` flag: an uppercase pin must FAIL this pattern', () => {
+    // ⚠ Deliberately lowercase-only, no `i` flag: the shipped
+    // NEXT_DEDICATED_MODEL.gguf.sha256 pin is compared raw against
+    // Ollama's lowercase blob digests (hfDigest.ts/ggufIngest.ts). An
+    // UPPERCASE or mixed-case paste here would still satisfy a
+    // case-insensitive pattern, flip `downloadReady` true, and then
+    // silently fail every digest compare downstream — this pattern is the
+    // CI-time guard against exactly that mis-paste (final-fixwave Fix 1).
+    expect(NEXT_DEDICATED_MODEL.gguf.sha256).toMatch(/^$|^[0-9a-f]{64}$/);
+  });
+
+  it('an UPPERCASE 64-hex value is REJECTED by the pin-format pattern (proves the guard catches a mis-cased pin)', () => {
+    const uppercasePin = 'A'.repeat(64);
+    expect(uppercasePin).not.toMatch(/^$|^[0-9a-f]{64}$/);
+    // Sanity: the same fixture WOULD have passed the old case-insensitive
+    // pattern — this is exactly the gap Fix 1 closes.
+    expect(uppercasePin).toMatch(/^$|^[0-9a-f]{64}$/i);
+  });
+
+  it('sha256 is currently EMPTY — the intentional fail-closed placeholder (NOT a defect; do not fill it here)', () => {
+    expect(NEXT_DEDICATED_MODEL.gguf.sha256).toBe('');
+  });
+});
+
+/**
+ * (m) — final-fixwave Fix 2 (#12): `registry.ts` is now cross-imported into
+ * the webview bundle (`webview/src/panels/setupCards.ts`), so its "zero
+ * imports of ANY kind" header comment is load-bearing, not decorative — a
+ * future stray `node:`/host import here would break the webview build. (h)
+ * above only bans `vscode` imports across the whole directory; this scan is
+ * narrower (registry.ts's own source only) and broader (ANY import/require,
+ * not just `vscode`).
+ */
+describe('registry (m): zero imports of ANY kind — registry.ts stays pure data (#12, webview cross-import lock)', () => {
+  it('registry.ts source has no `import` statement and no `require(...)` call', () => {
+    const source = readFileSync(join(__dirname, 'registry.ts'), 'utf-8');
+    const lines = source.split('\n');
+    const importLines = lines.filter((line) => /^\s*import\b/.test(line));
+    const requireLines = lines.filter((line) => line.includes('require('));
+    expect(importLines, `unexpected import statement(s):\n${importLines.join('\n')}`).toEqual([]);
+    expect(requireLines, `unexpected require(...) call(s):\n${requireLines.join('\n')}`).toEqual([]);
   });
 });

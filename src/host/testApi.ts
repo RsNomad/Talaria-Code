@@ -19,6 +19,15 @@ import type { PanelFetchCause, WebviewSignal } from './TalariaViewProvider';
  * calls `whenWebviewReady`/`waitForPanelFetch` AFTER the signal already
  * fired still resolves immediately — no lost-wakeup race between a fast
  * cold boot and the smoke's own `await`.
+ *
+ * beta.5 T16 (§5.5, S-F15): `getSetupData()` is a second, independent
+ * injected seam (`getStatus`) reaching `SetupController.status()` ONLY —
+ * NEVER `.handle()` (this surface must never let a test mutate host state).
+ * The returned snapshot is untyped (`Promise<unknown>`) on purpose — this
+ * module stays free of `SetupData`/`SetupController` imports, and callers
+ * must NEVER log or assert on the snapshot wholesale: it can carry
+ * user-typed endpoint URLs with embedded userinfo. Extract only the
+ * specific fields you need (see `test/integration/openSetup.test.ts`).
  */
 
 /** Default timeout for every wait below — generous enough to cover a real
@@ -37,6 +46,14 @@ export interface TalariaTestApi {
     panel: string,
     opts?: { minCount?: number; cause?: PanelFetchCause; timeoutMs?: number },
   ): Promise<PanelFetchResult>;
+  /**
+   * beta.5 T16 (§5.5, S-F15): the live `SetupController.status()` snapshot —
+   * NEVER `.handle()`. Untyped on purpose (see module doc). Callers must
+   * extract only the specific fields they assert on and must never log or
+   * assert the whole object — it can carry user-typed endpoint URLs with
+   * embedded userinfo.
+   */
+  getSetupData(): Promise<unknown>;
 }
 
 /** One recorded `panelFetch` signal, flattened for easy filter/count. */
@@ -69,10 +86,18 @@ type Waiter = ReadyWaiter | PanelFetchWaiter;
  * shaped exactly like `vscode.Event<WebviewSignal>` (a function taking a
  * listener and returning a `{dispose(): void}` subscription), so
  * `provider.onWebviewSignal` can be passed directly — see `extension.ts`'s
- * `createTestApi(provider.onWebviewSignal)` call.
+ * `createTestApi(provider.onWebviewSignal, () => setupController.status())`
+ * call.
+ *
+ * `getStatus` (beta.5 T16) is a second, independent injected seam for
+ * {@link TalariaTestApi.getSetupData} — optional so existing callers/tests
+ * that only exercise the ready/panelFetch surface (this module's own
+ * `testApi.test.ts`) need no change; `getSetupData()` throws a diagnosable
+ * error if invoked without it wired.
  */
 export function createTestApi(
   onSignal: (listener: (signal: WebviewSignal) => void) => { dispose(): void },
+  getStatus?: () => Promise<unknown>,
 ): { api: TalariaTestApi; dispose(): void } {
   let ready = false;
   const fetchEvents: PanelFetchEvent[] = [];
@@ -182,6 +207,16 @@ export function createTestApi(
         };
         waiters.add(waiter);
       });
+    },
+
+    getSetupData(): Promise<unknown> {
+      if (!getStatus) {
+        throw new Error(
+          'TalariaTestApi.getSetupData: createTestApi was not given a getStatus() seam — wire ' +
+            "SetupController.status() through createTestApi's second argument.",
+        );
+      }
+      return getStatus();
     },
   };
 

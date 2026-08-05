@@ -283,6 +283,36 @@ describe('RpcClient — per-method timeout override (T-12 RPC deadline)', () => 
     rpc.request('config.show');
     expect(capturedMs()).toBe(100);
   });
+
+  /*
+   * T2 (beta.5, §0.1 ⑦ / §2.1): `setup.install`/`setup.pullModel` are the two
+   * long-running Setup mutations that used to hit the 30s connection default
+   * mid-flight (`control.request 'setup.install' timed out after 30000ms`)
+   * even though the host was still legitimately working (pipx/hermes install,
+   * model pull). `rpc.ts:97`'s `??` lets an override of `0` win over the
+   * default, and `rpc.ts:103`'s `if (effectiveTimeoutMs > 0)` means `0` skips
+   * arming a timer AT ALL — not "a very long timer". `setTimeout` is
+   * therefore never called for these two methods; `capturedMs()` stays
+   * `undefined`. `setup.testRemote` is a bounded network probe, not a
+   * long-running install/pull, and stays on the ordinary 30000ms default.
+   */
+  it('RED: setup.install arms NO timer at all (long-running op exempted from the 30s default)', () => {
+    const { rpc, capturedMs } = captureTimeoutMs();
+    rpc.request('setup.install');
+    expect(capturedMs()).toBeUndefined();
+  });
+
+  it('RED: setup.pullModel arms NO timer at all (long-running op exempted from the 30s default)', () => {
+    const { rpc, capturedMs } = captureTimeoutMs();
+    rpc.request('setup.pullModel');
+    expect(capturedMs()).toBeUndefined();
+  });
+
+  it('setup.testRemote is NOT exempted — it still arms the ordinary 30000ms connection default', () => {
+    const { rpc, capturedMs } = captureTimeoutMs();
+    rpc.request('setup.testRemote');
+    expect(capturedMs()).toBe(30_000);
+  });
 });
 
 describe('App.tsx issues nextEdit.toggle connection-GLOBAL (F-1 source lock, Task 13)', () => {

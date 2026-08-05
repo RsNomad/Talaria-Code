@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 import * as path from 'node:path';
 import type {
   HostToWebviewMessage,
@@ -13,6 +14,11 @@ import type {
   SlashCommandInfo,
 } from '../../shared/protocol';
 import { BOOTSTRAP_TAB_ID } from '../../shared/protocol';
+import { describeError } from '../../shared/errorText';
+// T8 (§2.3 ⑧): the SAME provider-phase mapping the Setup Provider card uses —
+// import direction is backend → setup only (`SetupController` itself never
+// imports from `src/host/backend/`, preserving its purity constraint).
+import { computeProviderCard } from '../setup/SetupController';
 import type { CheckpointTrackerLike } from '../checkpoints/trackerContract';
 import type { RootCoordinator } from '../checkpoints/RootCoordinator';
 import { RootRegistry } from '../checkpoints/rootRegistry';
@@ -460,6 +466,17 @@ export class AcpBackend implements AgentBackend {
       // W6-P7-N11 (3-way ARCH I-4): the shared bind-announcement pair — see
       // `announceSessionBound`'s own doc for the preserved order/shape.
       announceSessionBound: (tabId, sessionId, rootId) => this.announceSessionBound(tabId, sessionId, rootId),
+      // T8 (beta.5 §2.3, bug ⑧ — critic C-5): the STRUCTURAL no-provider
+      // probe for the session-start banner. Reads the SAME accessor
+      // `extension.ts` binds for `SetupControllerDeps.getAdvertisedAuthMethods`
+      // (`() => backend.getAdvertisedAuthMethods?.()` resolves to exactly
+      // this instance's method below, :718) through the SAME
+      // `computeProviderCard` mapping — banner and Provider card can never
+      // disagree. Call-time posture like every other accessor here: reads
+      // the CURRENT client's advertisement at establish-failure time.
+      // `undefined` methods (no initialize yet) ⇒ 'waiting-agent' ⇒ false —
+      // never a fabricated "unconfigured".
+      isProviderUnconfigured: () => computeProviderCard(this.getAdvertisedAuthMethods()).phase === 'unconfigured',
       // W6-FI-c: `warmCheckpointBaseline` moved onto `controlDispatcher` — a
       // lazy closure (only INVOKED after this constructor returns, once the
       // connection actually establishes), so referencing `this
@@ -866,7 +883,7 @@ export class AcpBackend implements AgentBackend {
     try {
       await this.openSession(cwd, tabId);
     } catch (err) {
-      this.emitter.fire({ type: 'tab.error', tabId, kind: 'open-failed', message: errorMessage(err) });
+      this.emitter.fire({ type: 'tab.error', tabId, kind: 'open-failed', message: describeHostError(err) });
     }
   }
 
@@ -909,7 +926,7 @@ export class AcpBackend implements AgentBackend {
   closeTab(sessionId: string): void {
     this.pendingClose.add(sessionId);
     void this.connectionSupervisor.runOnStartTail(() => this.closeTabInternal(sessionId)).catch((err: unknown) => {
-      this.logger?.append(`[AcpBackend] closeTab failed (sessionId=${sessionId}): ${errorMessage(err)}`);
+      this.logger?.append(`[AcpBackend] closeTab failed (sessionId=${sessionId}): ${describeHostError(err)}`);
     });
   }
 
@@ -1052,7 +1069,7 @@ export class AcpBackend implements AgentBackend {
         const deadSessionId = old.sessionId;
         void client.cancel(deadSessionId).catch((err: unknown) => {
           this.logger?.append(
-            `[AcpBackend] newSessionInTab: session/cancel failed (sessionId=${deadSessionId}): ${errorMessage(err)}`,
+            `[AcpBackend] newSessionInTab: session/cancel failed (sessionId=${deadSessionId}): ${describeHostError(err)}`,
           );
         });
       }
@@ -1071,7 +1088,7 @@ export class AcpBackend implements AgentBackend {
     try {
       await this.openSession(cwd, tabId);
     } catch (err) {
-      this.emitter.fire({ type: 'tab.error', tabId, kind: 'open-failed', message: errorMessage(err) });
+      this.emitter.fire({ type: 'tab.error', tabId, kind: 'open-failed', message: describeHostError(err) });
     }
   }
 
@@ -1156,7 +1173,7 @@ export class AcpBackend implements AgentBackend {
       return await this.mentionResolver.resolveAll(mentions);
     } catch (err) {
       this.logger?.append(
-        `[AcpBackend] mention resolution failed — proceeding with no resolved context: ${errorMessage(err)}`,
+        `[AcpBackend] mention resolution failed — proceeding with no resolved context: ${describeHostError(err)}`,
       );
       return [];
     }
@@ -1819,8 +1836,21 @@ export class AcpBackend implements AgentBackend {
 
 // --- module-local helpers ----------------------------------------------------
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+/**
+ * T8 (beta.5 §2.3, bug ⑧): host-side error rendering — the shared
+ * `describeError` with the extension host's REAL home threaded in (folded
+ * hardening S-3: `os.homedir()` works even when `$HOME`/`%USERPROFILE%`
+ * are unset, where `errorText.ts`'s own env fallback would silently skip
+ * redaction). Replaces this file's former naive `err instanceof Error ?
+ * err.message : String(err)` copy, which rendered the ACP SDK's raw
+ * JSON-RPC `{code,message,data}` rejections (`acp.js:886`) as the literal
+ * `"[object Object]"` — `openTabInternal`'s `tab.error{kind:'open-failed'}`
+ * is this file's ⑧ surface. Scope pin (§2.3): only THIS file's and
+ * `ConnectionSupervisor.ts`'s copies convert this wave — the other ~11
+ * naive copies across the codebase are a mechanical follow-up.
+ */
+function describeHostError(err: unknown): string {
+  return describeError(err, homedir());
 }
 
 /**

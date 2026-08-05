@@ -43,7 +43,21 @@ export type InstallRecipe =
       apps: { main: string; acpCheck?: string };  // console-script names
       postCheck: { app: string; args: string[]; expectStdoutIncludes: string } }
   | { kind: 'guided-terminal';   // we OPEN a terminal with the command pre-typed; user runs it
-      command: string; docsUrl: string };
+      command: string; docsUrl: string;
+      /** beta.5 T6 (§1.2 A3): when set, `SetupController.handleOpenInstallTerminal`
+       *  overrides `command` with the OS engine's (`packageTable.ts`) verified
+       *  line for the detected family — fail-open CLOSED (S-F9): a family
+       *  with no engine entry for this key REFUSES instead of falling back
+       *  to this recipe's own static `command` (which is Fedora-shaped and
+       *  would be the wrong line on another distro). Absent (e.g. ollama's
+       *  vendor-script recipe) ⇒ `command` is used as-is, untouched, on
+       *  every family — no OS engine read at all. */
+      packageKey?: 'llamacpp' }
+  | { kind: 'docs-only';         // beta.5 §5.2 rev 3 (⑪): no verified install
+      // source exists to compose a command from — guidance-only, a docs
+      // link plus the endpoint Test affordance. Nothing executes ⇒ nothing
+      // to the §5.2 source ledger.
+      docsUrl: string };
 
 export interface LocalInstallMode {
   recipe: InstallRecipe;
@@ -205,10 +219,15 @@ export const FIM_BACKENDS: readonly BackendDescriptor[] = [
       recipe: {
         kind: 'guided-terminal',
         // §4 table pins only "docs link" for llama.cpp (binary/dnf/build —
-        // we don't build it); the pre-typed command is the Fedora package
-        // path, provisional pending owner confirmation on Fedora.
+        // we don't build it); `packageKey: 'llamacpp'` (T6) hands command
+        // resolution to the OS engine (`packageTable.ts`) for the detected
+        // family — this static `command` is the Fedora value, owner-live-
+        // verified on Fedora 44, and is used ONLY as the engine's own
+        // fedora entry happens to equal it; every other family resolves
+        // through the engine (or refuses fail-closed, never this line).
         command: 'sudo dnf install llama-cpp',
         docsUrl: 'https://github.com/ggml-org/llama.cpp/tree/master/tools/server',
+        packageKey: 'llamacpp',
       },
       effort: 'manual-guided',
     },
@@ -233,16 +252,20 @@ export const FIM_BACKENDS: readonly BackendDescriptor[] = [
       probe: { kind: 'openai-models' },
     },
     localInstall: {
-      recipe: {
-        kind: 'guided-terminal',
-        // docs.vllm.ai's documented install; provisional pending owner
-        // confirmation (PEP 668 on Fedora may require a venv/uv first —
-        // the docs link is the authoritative path, per the §4 table).
-        command: 'pip install vllm',
-        docsUrl: 'https://docs.vllm.ai/',
-      },
+      // §5.2 rev 3 (⑪): the beta.3 pip-based recipe (unpinned, PEP-668-
+      // hostile, hardware-specific, "provisional" since beta.3) had no
+      // verified source to compose a command from — deleted. docs.vllm.ai
+      // is the authoritative path; the tab offers the docs link plus the
+      // endpoint Test affordance only. Nothing executes ⇒ nothing to the
+      // §5.2 source ledger.
+      recipe: { kind: 'docs-only', docsUrl: 'https://docs.vllm.ai/' },
       effort: 'manual-guided',
     },
+    // R-1a: `SetupController.projectBackend` (`SetupController.ts:963-979`)
+    // projects only this DESCRIPTOR-level `docsUrl` onto the wire, never a
+    // recipe-level one — without this the docs-only tab would render
+    // linkless.
+    docsUrl: 'https://docs.vllm.ai/',
     nextEditTransport: 'openai-compat',
   },
   {
@@ -291,3 +314,41 @@ export function getBackend(id: string): BackendDescriptor | undefined {
     AGENT_BACKENDS.find((d) => d.id === id) ?? FIM_BACKENDS.find((d) => d.id === id)
   );
 }
+
+// §4 Block D — Dedicated NEXT parity (beta5-setup-hardening-architecture.md §4.1).
+
+/** ⚠ ONE owner constant — the out-of-band publication uploads to the SAME string; T12 locks every
+ *  derived id to it (critic S-F2). Namespace owner-confirmed (rev 3). */
+export const SYNTINAL_HF_OWNER = 'SyntinalCo';
+
+export const NEXT_DEDICATED_MODEL = {
+  displayName: 'Sweep Next-Edit v2 (7B)',
+  upstream: {
+    hfRepo: 'sweepai/sweep-next-edit-v2-7B', // verified official org (§0.3)
+    format: 'safetensors',
+    license: 'Apache-2.0',
+    contextLength: 32768,
+  },
+  /** OUR artifact, converted from the verified upstream (§5.4). sha256 EMPTY ⇒ every automated
+   *  download surface AND the guided llama.cpp line are DISABLED (fail-closed). */
+  gguf: {
+    hfRepo: `${SYNTINAL_HF_OWNER}/sweep-next-edit-v2-7B-GGUF`,
+    file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf',
+    quant: 'Q4_K_M',
+    sha256: '', // filled by the out-of-band publication (§5.4)
+    approxBytes: 4_680_000_000,
+    /** ⚠ The ONLY files the published repo may contain (critic S-F4): Ollama also ingests
+     *  `template`/`system`/`params` from a pulled repo — the tree check refuses anything unexpected. */
+    allowedRepoFiles: ['sweep-next-edit-v2-7B-Q4_K_M.gguf', 'README.md', '.gitattributes'],
+  },
+  /** rev 5 (Q3): the LOCAL model name our digest-enforced ingest CREATES (`/api/create`) — a plain
+   *  Ollama name, host-free BECAUSE IT CONTAINS NO `/` (rev 6: that, not dot-counting, is the
+   *  library-side of the §4.4 predicate); this is what `talaria.nextEdit.model` gets Applied to
+   *  and what the Download button targets. */
+  ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+  /** What a MANUAL `ollama pull hf.co/…` would name the same artifact — recognized by the presence
+   *  check (a user who pulled by hand is not told "not present"), but NEVER used by any automated
+   *  path (rev 5: no automated `pull` of host-sourced models exists at all). */
+  ollamaPullAlias: `hf.co/${SYNTINAL_HF_OWNER}/sweep-next-edit-v2-7B-GGUF:Q4_K_M`,
+  vram: { fullGiB: 15, q4GiB: 5 },
+} as const;

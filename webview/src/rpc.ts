@@ -65,6 +65,18 @@ const METHOD_TIMEOUT_OVERRIDES_MS: Partial<Record<ControlRequestMethod, number>>
   'checkpoint.restore': 150_000,
   'checkpoint.redo': 150_000,
   'checkpoint.redoAll': 150_000,
+  // beta.5 T2 (§0.1 ⑦ / §2.1): `setup.install`/`setup.pullModel` are the
+  // long-running Setup mutations (pipx/hermes install, model pull) that used
+  // to hit `control.request 'setup.install' timed out after 30000ms` while
+  // the host was still legitimately working. `0` disables the timer
+  // entirely (see `if (effectiveTimeoutMs > 0)` below) rather than arming a
+  // longer one — these ops have no fixed upper bound, and `pagehide ->
+  // rejectAll` (bridge.ts) plus the rendered Cancel affordance during
+  // `installing` already bound the pending-forever risk. `setup.testRemote`
+  // is a bounded network probe, not a long-running install/pull, and stays
+  // on the ordinary 30s default (deliberately absent from this table).
+  'setup.install': 0,
+  'setup.pullModel': 0,
 };
 
 export class RpcClient {

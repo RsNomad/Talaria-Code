@@ -181,6 +181,18 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   /** Subscription to {@link setupController}'s `onProgress`; replaced (and
    *  disposed) if the controller is ever rewired. */
   private setupProgressSub?: vscode.Disposable;
+  /** T7 (§2.2.2): subscription to {@link setupController}'s `onStatusChanged`
+   *  — every mid-flight/outcome state change re-pushes fresh `SetupData`.
+   *  Replaced (and disposed) if the controller is ever rewired, matching
+   *  {@link setupProgressSub}'s posture. */
+  private setupStatusChangedSub?: vscode.Disposable;
+  /** T7 (§2.2.3): monotonic sequence counter — {@link pushSetupPanelData}
+   *  stamps a value before fetching and drops any completed fetch whose
+   *  stamp is no longer current, so two overlapping pushes (e.g. an
+   *  `onStatusChanged` fire racing the post-mutation push in {@link
+   *  handleSetupMethod}) can never repaint a STALE snapshot over a fresher
+   *  one that started later but resolved first. */
+  private setupPushSeq = 0;
   /** First-run auto-open (§6 entry point 1): which panel the NEXT `hydrate`
    *  should boot into. Stays `'chat'` for every normal boot; {@link
    *  openSetupPanel} is the only writer. One-shot: {@link seedState} resets
@@ -270,14 +282,32 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * relays every throttled push as `setup.progress`; a no-op push when the
    * view isn't live is fine — `postToWebview` drops it silently, same
    * posture as every other connection-global push in this class.
+   *
+   * T7 (§2.2.2): ALSO subscribes to `onStatusChanged` — every mid-flight/
+   * outcome state change (confirmed install start, a failure write, a
+   * success, a completed recheck) re-pushes fresh `SetupData` via {@link
+   * pushSetupPanelData}, independent of (and in addition to) {@link
+   * handleSetupMethod}'s own unconditional post-`handle()` push. Both
+   * subscriptions are disposed and replaced together if the controller is
+   * ever rewired, so a stale controller can never leak a push into a NEWER
+   * one's wiring.
    */
   setSetupController(controller: SetupController): void {
     this.setupProgressSub?.dispose();
+    this.setupStatusChangedSub?.dispose();
     this.setupController = controller;
     this.setupPanelSource = new SetupPanelSource(controller);
     const sub = controller.onProgress((progress) => this.postToWebview({ type: 'setup.progress', ...progress }));
     this.setupProgressSub = { dispose: () => sub.dispose() };
     this.disposables.push(this.setupProgressSub);
+
+    const statusSub = controller.onStatusChanged(() => {
+      this.pushSetupPanelData().catch((err) => {
+        this.logger?.appendLine(`[setup] onStatusChanged panel refresh failed: ${String(err)}`);
+      });
+    });
+    this.setupStatusChangedSub = { dispose: () => statusSub.dispose() };
+    this.disposables.push(this.setupStatusChangedSub);
   }
 
   /**
@@ -935,12 +965,20 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * .toggle` above — none of them are ever forwarded to `AgentBackend
    * .invokeControl`. `setup.status` returns the full `SetupData` directly
    * (the richer shape `SetupController.status()` produces); every other
-   * `setup.*` method goes through `SetupController.handle()`, and — on an
-   * accepted (`ok:true`) mutation — this ALSO re-fetches + re-pushes fresh
-   * `SetupData` as a `panel.data` message (mirrors `ControlDispatcher`'s
-   * `reload.mcp`/`model.save_key` "dispatch -> refetch panel -> push"
-   * precedent), so the Setup panel reflects its own write immediately
-   * without a second round trip from the webview.
+   * `setup.*` method goes through `SetupController.handle()`, and this
+   * ALSO re-fetches + re-pushes fresh `SetupData` as a `panel.data` message
+   * (mirrors `ControlDispatcher`'s `reload.mcp`/`model.save_key` "dispatch
+   * -> refetch panel -> push" precedent), so the Setup panel reflects its
+   * own write immediately without a second round trip from the webview.
+   *
+   * T7 (§2.2 fix 1): pushed UNCONDITIONALLY — a refused (`ok:false`)
+   * mutation still pushes fresh `SetupData` too (the dropped ok-gate). A
+   * refusal can itself represent a real state change worth showing (e.g. a
+   * `pipx-missing` refusal that just wrote {@link
+   * SetupController.lastAgentIssue}, surfaced through the card rather than
+   * only the button's `✗` line — §0.1 ②); the read-only `setup.status`
+   * short-circuit above never reaches here, so this never double-pushes for
+   * a plain read.
    */
   private async handleSetupMethod(
     method: SetupMethod,
@@ -954,16 +992,14 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       return controller.status();
     }
     const result = await controller.handle(method, params);
-    if (result.ok) {
-      // AWAITED (matches ControlDispatcher's `reload.mcp`/`model.save_key`
-      // "dispatch -> refetch -> push" precedent — not fire-and-forget): the
-      // webview's optimistic write-through would otherwise race the fresh
-      // `panel.data` push against this method's own `control.response`.
-      try {
-        await this.pushSetupPanelData();
-      } catch (err) {
-        this.logger?.appendLine(`[setup] post-mutation panel refresh failed: ${String(err)}`);
-      }
+    // AWAITED (matches ControlDispatcher's `reload.mcp`/`model.save_key`
+    // "dispatch -> refetch -> push" precedent — not fire-and-forget): the
+    // webview's optimistic write-through would otherwise race the fresh
+    // `panel.data` push against this method's own `control.response`.
+    try {
+      await this.pushSetupPanelData();
+    } catch (err) {
+      this.logger?.appendLine(`[setup] post-mutation panel refresh failed: ${String(err)}`);
     }
     return result;
   }
@@ -981,9 +1017,21 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     return outcome.data;
   }
 
+  /**
+   * T7 (§2.2.3, critic C-1): `SetupPanelSource.fetch()` has no throttle or
+   * serialization and `status()` runs a network Ollama probe per call — two
+   * overlapping pushes (e.g. `handleSetupMethod`'s post-mutation push racing
+   * an `onStatusChanged`-triggered one, or two rapid mid-flight fires) can
+   * resolve OUT OF ORDER. A monotonic sequence guard closes that: stamp
+   * `seq` before fetching, and drop the result if a NEWER push has started
+   * (and therefore bumped `setupPushSeq`) by the time this one resolves —
+   * whichever push started LAST always wins, regardless of resolution order.
+   */
   private async pushSetupPanelData(): Promise<void> {
     if (!this.setupPanelSource) return;
+    const seq = ++this.setupPushSeq;
     const outcome = await this.setupPanelSource.fetch();
+    if (seq !== this.setupPushSeq) return; // a newer push has since started — this one is stale, drop it
     if (outcome.data !== undefined) {
       this.postToWebview(makePanelData('setup', outcome.data));
     }

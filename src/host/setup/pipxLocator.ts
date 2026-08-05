@@ -1,4 +1,5 @@
 import * as os from 'node:os';
+import * as path from 'node:path';
 import { loginShellSpawn, type ExecLookup, type LoginShellSpawnOptions } from '../runtime/resolveHermes';
 
 /**
@@ -77,7 +78,7 @@ export interface PipxEnv {
 
 export type PipxLocateResult =
   | { ok: true; env: PipxEnv }
-  | { ok: false; reason: 'pipx-missing' | 'python-unsuitable'; detail: string };
+  | { ok: false; reason: 'pipx-missing' | 'python-unsuitable' | 'probe-timeout'; detail: string };
 
 /** Hermes's `requires-python = ">=3.11,<3.14"` (pyproject.toml, §2.1) — the
  *  upper bound excludes 3.14 because Rust transitives (pydantic-core et al.)
@@ -92,34 +93,100 @@ const PYTHON_PROBE_CANDIDATES = ['python3.13', 'python3.12', 'python3.11'];
 
 /** Same 10s budget `resolveHermes.ts` uses for its login-shell lookup — long
  *  enough for a slow NFS-homed profile, short enough not to hang the Setup
- *  panel on a wedged shell. */
+ *  panel on a wedged shell. Used for every `runLoginShell` call EXCEPT the
+ *  step-0 pipx lookup, which has its own asymmetric two-tier budget below
+ *  (§3 / T11). */
 const LOOKUP_TIMEOUT_MS = 10_000;
+
+/** T11 (§3): step-0 `command -v pipx` first-attempt budget — shorter than
+ *  {@link LOOKUP_TIMEOUT_MS} so a merely-slow-but-working shell still
+ *  answers well within the panel's patience, while a genuinely wedged shell
+ *  fails fast enough to retry once at the full 10s below. */
+const PIPX_STEP0_TIMEOUT_MS = 5_000;
+
+/** T11 (§3): step-0 retry budget after the first attempt times out — the
+ *  same 10s budget every other login-shell call uses. */
+const PIPX_STEP0_RETRY_TIMEOUT_MS = LOOKUP_TIMEOUT_MS;
+
+/** T11 (§3): absolute-candidate fallback budget — short, because by the time
+ *  we reach this fallback the login shell has ALREADY failed twice (15s
+ *  spent); these are direct `execFile` calls with no shell/profile to wait
+ *  on, so a real pipx binary answers near-instantly. */
+const ABSOLUTE_CANDIDATE_TIMEOUT_MS = 2_000;
+
+/** §6 copy, VERBATIM (drift-locked against
+ *  `docs_claude/beta5-setup-hardening-architecture.md` §6's "probe-timeout
+ *  detail (C1)" row) — surfaced to the user when BOTH the login-shell lookup
+ *  AND every absolute-candidate fallback have failed to answer in time. */
+const PROBE_TIMEOUT_DETAIL =
+  "Your login shell didn't answer in time — a slow shell profile (nvm, conda, a network home directory) can cause this. It's usually transient: press Re-check.";
+
+/**
+ * T11 (§3, critic C-9): classify a rejected `ExecLookup` error as a TIMEOUT
+ * kill specifically — Node's `execFile` sets `err.killed = true` (and
+ * usually `err.signal = 'SIGTERM'`) when the `timeout` option fires, but ALSO
+ * sets `killed: true` when the child is killed for exceeding `maxBuffer` —
+ * that second case must NOT be retried/treated as a login-shell slowness
+ * signal, so it is excluded via Node's own `err.code` for that condition.
+ * Exported so both this module's callers AND its own test suite can pin the
+ * classifier against a REAL `execFile` timeout (Global Constraint 4 — no
+ * mock-theater for this specific gap, since `ExecLookup` itself carries no
+ * error shape).
+ */
+export function isExecTimeout(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { killed?: unknown; signal?: unknown; code?: unknown };
+  const killedOrSigterm = e.killed === true || e.signal === 'SIGTERM';
+  return killedOrSigterm && e.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+}
+
+/** T11 (§3, critic C-11): `locatePipx`'s optional cancellation seam — checked
+ *  BETWEEN the three major steps (pipx lookup / python gate / venvsRoot
+ *  read), matching the `throwIfAborted` pattern `pipxInstaller.ts` already
+ *  uses for its own pipeline. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted.', 'AbortError');
+  }
+}
 
 /**
  * Locate `pipx` and gate its default Python interpreter into Hermes's
  * supported range, resolving the venvs root along the way. Never throws for
  * any of the SCRIPTED failure modes the brief covers (`pipx-missing`,
- * `python-unsuitable`) — those are returned as typed results. An exec
- * failure DURING the final `PIPX_LOCAL_VENVS` read (pipx vanishing between
- * step 0 and step 3 — an unmodeled race) is allowed to propagate as a
- * rejected promise; there is no third reason code for it in this task's
- * interface (that belongs to the later install pipeline's own
- * `resolve-paths` failure mode, §2.2 step 3's file-existence checks).
+ * `python-unsuitable`, `probe-timeout`) — those are returned as typed
+ * results. An exec failure DURING the final `PIPX_LOCAL_VENVS` read (pipx
+ * vanishing between step 0 and step 3 — an unmodeled race) is allowed to
+ * propagate as a rejected promise; there is no reason code for it in this
+ * task's interface (that belongs to the later install pipeline's own
+ * `resolve-paths` failure mode, §2.2 step 3's file-existence checks). An
+ * aborted `signal` also propagates as a rejected `AbortError` (checked
+ * between steps only — see {@link throwIfAborted}).
+ *
+ * @param signal T11 (§3, critic C-11): optional — `handleInstall` passes its
+ *   `AbortController.signal` so Cancel can reach a wedged probe; callers that
+ *   never cancel (e.g. `setup.recheck`) simply omit it.
  */
-export async function locatePipx(exec: ExecLookup): Promise<PipxLocateResult> {
+export async function locatePipx(exec: ExecLookup, signal?: AbortSignal): Promise<PipxLocateResult> {
   const cwd = os.homedir();
 
-  const pipxPath = await findPipxPath(exec, cwd);
-  if (!pipxPath) {
+  throwIfAborted(signal);
+  const lookup = await findPipxPath(exec, cwd);
+  if (lookup.kind === 'probe-timeout') {
+    return { ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_DETAIL };
+  }
+  if (lookup.kind === 'missing') {
     return {
       ok: false,
       reason: 'pipx-missing',
       detail:
         "'command -v pipx' found no pipx on the login-shell PATH. " +
-        'Install it (Fedora: `sudo dnf install pipx`), then `pipx ensurepath`.',
+        "Install it with your distro's package manager, then `pipx ensurepath`.",
     };
   }
+  const pipxPath = lookup.path;
 
+  throwIfAborted(signal);
   const pythonGate = await gatePython(exec, pipxPath, cwd);
   if (!pythonGate) {
     return {
@@ -131,6 +198,7 @@ export async function locatePipx(exec: ExecLookup): Promise<PipxLocateResult> {
     };
   }
 
+  throwIfAborted(signal);
   const venvsRootRaw = await runLoginShell(
     exec,
     pipxPath,
@@ -171,15 +239,74 @@ interface PythonGate {
   pythonOverride?: string;
 }
 
-async function findPipxPath(exec: ExecLookup, cwd: string): Promise<string | undefined> {
+/** T11 (§3): the three outcomes step 0 can resolve to. `probe-timeout` is
+ *  reached ONLY after both the login-shell lookup (5s, then a 10s retry) AND
+ *  every absolute-candidate fallback have failed to answer in time. */
+type PipxLookup = { kind: 'found'; path: string } | { kind: 'missing' } | { kind: 'probe-timeout' };
+
+/**
+ * Step 0 — locate `pipx` on the login-shell PATH. **The login shell remains
+ * the semantic authority for WHICH pipx is used** (§3, critic C-4): absolute
+ * candidates below are consulted ONLY when the login shell itself could not
+ * answer twice in a row (a wedged/slow shell), never as a faster substitute
+ * for it — a fast path there would silently pick a DIFFERENT pipx (different
+ * PATH precedence, different `PIPX_LOCAL_VENVS`) than the one the user's own
+ * terminal would find.
+ *
+ * - First attempt: 5s budget.
+ * - A TIMEOUT (never any other error) retries once at 10s.
+ * - A clean miss (non-timeout error — e.g. `command -v pipx` exiting
+ *   non-zero because pipx genuinely isn't installed) on EITHER attempt ends
+ *   the lookup immediately as `missing` — no retry, no fallback.
+ * - If BOTH timed out, probe absolute candidates directly (no shell, no
+ *   profile to wait on) in PATH-precedence order: `~/.local/bin/pipx` then
+ *   `/usr/bin/pipx`. A candidate that answers `--version` at all is treated
+ *   as present (a hit that reached here proceeds using the login shell's
+ *   PATH having been genuinely too slow to answer, not silently overridden
+ *   — a future task could thread a log-tail note about this through
+ *   `SetupControllerDeps.locatePipx`'s caller if that visibility is wanted).
+ *   Neither candidate answering is the only path to `probe-timeout`.
+ */
+async function findPipxPath(exec: ExecLookup, cwd: string): Promise<PipxLookup> {
+  const spec = loginShellSpawn('command', ['-v', 'pipx'], undefined, { exec: false });
+
   let stdout: string;
   try {
-    stdout = await runLoginShell(exec, 'command', ['-v', 'pipx'], cwd, { exec: false });
-  } catch {
-    return undefined;
+    stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_TIMEOUT_MS, cwd });
+  } catch (firstErr) {
+    if (!isExecTimeout(firstErr)) return { kind: 'missing' };
+    try {
+      stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_RETRY_TIMEOUT_MS, cwd });
+    } catch (secondErr) {
+      if (!isExecTimeout(secondErr)) return { kind: 'missing' };
+      return probeAbsoluteCandidates(exec, cwd);
+    }
   }
+
   const line = lastNonEmptyLine(stdout);
-  return line.startsWith('/') ? line : undefined;
+  return line.startsWith('/') ? { kind: 'found', path: line } : { kind: 'missing' };
+}
+
+/** T11 (§3): PATH-precedence order per critic — a user-local pipx
+ *  (`~/.local/bin`, the `pipx ensurepath` / pip user-install default) wins
+ *  over the distro package (`/usr/bin`) exactly as a real login shell's PATH
+ *  would order them. Called with NO shell — these are direct `execFile`
+ *  probes, so `~` is expanded here rather than relying on shell expansion. */
+function absoluteCandidatePaths(): string[] {
+  return [path.join(os.homedir(), '.local', 'bin', 'pipx'), '/usr/bin/pipx'];
+}
+
+async function probeAbsoluteCandidates(exec: ExecLookup, cwd: string): Promise<PipxLookup> {
+  for (const candidate of absoluteCandidatePaths()) {
+    try {
+      await exec(candidate, ['--version'], { timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS, cwd });
+      return { kind: 'found', path: candidate };
+    } catch {
+      // Try the next candidate; every candidate failing falls through to
+      // 'probe-timeout' below.
+    }
+  }
+  return { kind: 'probe-timeout' };
 }
 
 /** Steps 1: gate the default interpreter, probing overrides if needed. */
@@ -239,8 +366,14 @@ async function tryGetVersion(exec: ExecLookup, command: string, cwd: string): Pr
   }
 }
 
-/** Every OS-touching call in this module funnels through here — one
- *  `loginShellSpawn` + `exec`, matching `resolveHermes.ts`'s own pattern. */
+/** Every OS-touching call in this module (besides step 0's own two-tier
+ *  lookup in {@link findPipxPath}) funnels through here — one
+ *  `loginShellSpawn` + `exec`, matching `resolveHermes.ts`'s own pattern.
+ *
+ *  T11 (§3 point 2): "timeout-only retry everywhere" — a TIMEOUT (per
+ *  {@link isExecTimeout}; a maxBuffer kill does NOT count) gets exactly one
+ *  retry at the same budget; any other error propagates immediately without
+ *  a retry, matching step 0's own no-retry-on-clean-miss rule. */
 async function runLoginShell(
   exec: ExecLookup,
   command: string,
@@ -249,7 +382,12 @@ async function runLoginShell(
   options?: LoginShellSpawnOptions,
 ): Promise<string> {
   const spec = loginShellSpawn(command, args, undefined, options);
-  return exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd });
+  try {
+    return await exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd });
+  } catch (err) {
+    if (!isExecTimeout(err)) throw err;
+    return exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd });
+  }
 }
 
 /** Login shells may echo profile/motd noise before the answer — same

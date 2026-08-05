@@ -1,10 +1,17 @@
 import * as vscode from 'vscode';
 import { execFile, spawn as nodeSpawn } from 'node:child_process';
-import { access } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
+import { createWriteStream, createReadStream } from 'node:fs';
+import { unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
 import type { ExecLookup } from './runtime/resolveHermes';
 import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
+import { verifyHfDigest } from './setup/hfDigest';
+import { ingestGguf, type GgufIngestIo, type TempWriteHandle, type TempReadStream } from './setup/ggufIngest';
 import { probeRemote } from './setup/remoteProbe';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
 import type { AdvertisedAuthMethod, SetupHost, SetupControllerDeps } from './setup/SetupController';
@@ -130,6 +137,152 @@ export function createNodeFileExists(): FileExists {
   };
 }
 
+// --- GgufIngestIo (T14 §4.4.3d: the real temp-file seams for ggufIngest.ts) --
+
+/**
+ * The `GgufIngestIo` binding — real `node:fs`/`node:os`/`node:crypto`-backed
+ * temp file, `fetchImpl` = `boundFetch` (declared below, shared with every
+ * other `SetupControllerDeps` network binding). `ggufIngest.ts` itself stays
+ * disk/socket-free (T14's own module doc); every touch happens here.
+ *
+ * One temp file per {@link createTempWrite} call, named with a `randomUUID`
+ * suffix under `os.tmpdir()` so concurrent installs (impossible today — the
+ * controller's single-flight latch precedes this, `handleVettedIngest`)
+ * could never collide even if that ever changed. `openTempRead` hands back
+ * an `fs.ReadStream` directly: it already satisfies `AsyncIterable<Uint8Array>`
+ * via Node's native `Readable` async iteration, matching the async-iterable
+ * `BodyInit` shape undici documents (see `ggufIngest.ts`'s own doc comment
+ * on {@link GgufIngestIo.openTempRead} for the citation) — no `stream/web`
+ * conversion needed.
+ */
+function createNodeGgufIngestIo(): GgufIngestIo {
+  return {
+    fetchImpl: boundFetch,
+    createTempWrite: async (): Promise<TempWriteHandle> => {
+      const path = joinPath(tmpdir(), `talaria-gguf-${randomUUID()}.tmp`);
+      const stream = createWriteStream(path);
+      await new Promise<void>((resolve, reject) => {
+        stream.once('open', () => resolve());
+        stream.once('error', reject);
+      });
+      return {
+        path,
+        write: (chunk) =>
+          new Promise<void>((resolve, reject) => {
+            stream.write(chunk, (err) => (err ? reject(err) : resolve()));
+          }),
+        // Finding 1 (IMPORTANT, T14 review): `stream.end(callback)`'s
+        // callback fires on the WEAKER 'finish' event ("all data has been
+        // flushed to the underlying system" — Node stream docs), NOT
+        // 'close' ("the stream and any of its underlying resources — a
+        // file descriptor, for example — have been closed"). Resolving on
+        // 'finish' alone raced ahead of the fd actually closing, so
+        // `ingestGguf`'s `removeTemp` unlink could run before the fd was
+        // released — on POSIX, an unlinked-but-still-open file's disk
+        // blocks aren't reclaimed until the fd closes, i.e. leaking disk
+        // space for the process lifetime on every cancel/error. `destroy()`
+        // (not `end()`) is safe here and needs no graceful flush: every
+        // `write()` above is individually awaited to its OWN fs-level
+        // completion callback before the caller ever calls `close()`
+        // (`ggufIngest.ts`'s `downloadToTemp` never has a write in flight
+        // when it closes), so there is nothing buffered left to lose.
+        // Idempotent: a stream already destroyed (e.g. a prior write error
+        // auto-closed it, `autoClose` defaults true) resolves immediately
+        // instead of waiting on a 'close' that already fired before this
+        // listener attached.
+        close: () =>
+          stream.destroyed
+            ? Promise.resolve()
+            : new Promise<void>((resolve) => {
+                stream.once('close', () => resolve());
+                stream.destroy();
+              }),
+      };
+    },
+    // Never rejects: a temp file already gone (e.g. the write handle never
+    // reached open, or a caller mistakenly double-removes) is exactly the
+    // post-condition `removeTemp` promises — "the temp file is gone" — so
+    // ENOENT (and any other unlink failure) is swallowed, matching
+    // `ingestGguf`'s own single unconditional `finally`-cleanup call site.
+    removeTemp: async (path: string): Promise<void> => {
+      try {
+        await unlink(path);
+      } catch {
+        // Already gone — nothing to clean up.
+      }
+    },
+    // Finding 2 (MINOR, T14 review): `fs.ReadStream` already exposes a real
+    // `destroy()` (inherited from `stream.Readable`) satisfying
+    // `TempReadStream`'s optional `destroy` — `putBlob` calls it
+    // unconditionally in a `finally` so this fd is released on every exit
+    // from the blob-POST step too, not just when the body drains fully.
+    openTempRead: async (path: string): Promise<TempReadStream> => createReadStream(path),
+  };
+}
+
+// --- readOsRelease (T5 §1.2 — the container-boundary-aware os-release read) --
+
+/**
+ * Injected seams for {@link createReadOsRelease} — real fs/process by
+ * default; tests inject fakes (the same DI discipline as `SpawnFn`/
+ * `FileExists` above, so the unit tests never touch the real filesystem).
+ */
+export interface OsReleaseReadSeams {
+  readFile(path: string): Promise<string>;
+  fileExists(path: string): Promise<boolean>;
+  platform: string;
+  env: Readonly<Record<string, string | undefined>>;
+}
+
+const CONTAINER_MARKER_FILES = ['/run/.containerenv', '/.dockerenv'];
+
+/**
+ * The `SetupControllerDeps.readOsRelease` binding (beta.5 §1.2, S-F10
+ * container/Flatpak honesty):
+ *
+ *  1. win32 → `{}` (dev-gate host; the controller degrades to `unknown`).
+ *  2. `/run/host/os-release` readable → its text — Flatpak/toolbox expose
+ *     the HOST identity there, which is what install commands should be
+ *     composed for. Preferred unconditionally over `/etc/os-release`.
+ *  3. Else, a container marker present (`/run/.containerenv` (podman),
+ *     `/.dockerenv` (docker), or a non-empty `$container` (Flatpak/systemd-
+ *     nspawn)) → `{ containerMismatch: true }` — the sandbox's own
+ *     `/etc/os-release` is deliberately NOT read: reporting the container
+ *     image's identity would compose commands for a system the user's
+ *     terminal may not act on. Fail-closed, the controller degrades to
+ *     `unknown` + the §6 container note.
+ *  4. Else `/etc/os-release` → its text; unreadable → `{}`.
+ *
+ * Never rejects: every fs failure collapses into the honest-degrade shapes
+ * above (the controller additionally try/catches its side of the seam).
+ */
+export function createReadOsRelease(
+  seams?: Partial<OsReleaseReadSeams>,
+): () => Promise<{ text?: string; containerMismatch?: boolean }> {
+  const readFileImpl = seams?.readFile ?? ((path: string) => readFile(path, 'utf8'));
+  const fileExistsImpl = seams?.fileExists ?? createNodeFileExists();
+  const platform = seams?.platform ?? process.platform;
+  const env = seams?.env ?? process.env;
+  return async () => {
+    if (platform === 'win32') return {};
+    try {
+      return { text: await readFileImpl('/run/host/os-release') };
+    } catch {
+      // Host file absent/unreadable — fall through to marker detection.
+    }
+    for (const marker of CONTAINER_MARKER_FILES) {
+      if (await fileExistsImpl(marker)) return { containerMismatch: true };
+    }
+    const containerEnv = env['container'];
+    if (containerEnv !== undefined && containerEnv !== '') return { containerMismatch: true };
+    try {
+      return { text: await readFileImpl('/etc/os-release') };
+    } catch {
+      return {};
+    }
+  };
+}
+
 // --- SetupControllerDeps (Task 3-7 engines, bound to real adapters) ----------
 
 /** `fetch` reached via `globalThis.fetch(...)` (never a bare reference) —
@@ -151,11 +304,27 @@ export function createSetupControllerDeps(
   const exec = createExecLookup();
   const spawn = createNodeSpawnFn();
   const fileExists = createNodeFileExists();
+  const ggufIo = createNodeGgufIngestIo();
   return {
-    locatePipx: () => locatePipx(exec),
+    // T11 (§3, critic C-11): thread the caller's abort signal through so
+    // `handleInstall`'s Cancel can actually reach a wedged login-shell probe
+    // — without this, the signal SetupController passes would be silently
+    // dropped at this wiring seam despite the plumbing being correct on
+    // both sides of it.
+    locatePipx: (signal) => locatePipx(exec, signal),
+    // T5 §1.2: the container-boundary-aware os-release read (real fs seams).
+    readOsRelease: createReadOsRelease(),
     installHermes: (recipe, env, onEvent, signal) => installHermes(recipe, env, spawn, fileExists, onEvent, signal),
     probeOllama: (endpoint, timeoutMs) => probeOllama(endpoint, boundFetch, timeoutMs),
     pullModel: (endpoint, model, onProgress, signal) => pullModel(endpoint, model, boundFetch, onProgress, signal),
+    // T13 (beta.5 §4.4.3c): the HF-tree digest pre-flight over real fetch.
+    verifyHfDigest: (gguf) => verifyHfDigest(boundFetch, gguf),
+    // T14 (beta.5 §4.4.3d): the digest-enforced ingest ENGINE
+    // (`src/host/setup/ggufIngest.ts`) bound to the real temp-file/fetch
+    // seams (`ggufIo`, above). With the registry's sha256 pin still empty
+    // (§5.4) `handleVettedIngest` refuses at §4.4.3a before this is ever
+    // reached in production — fail-closed either way.
+    ingestGguf: (spec, endpoint, onProgress, signal) => ingestGguf(ggufIo, spec, endpoint, onProgress, signal),
     probeRemote: (spec, endpoint, apiKey) => probeRemote(spec, endpoint, apiKey, boundFetch),
     registry: { AGENT_BACKENDS, FIM_BACKENDS, getBackend },
     // R5 (coexistence.lock.test.ts): reads through the Guard's OWN exported

@@ -704,9 +704,10 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
   // (§4.1 limitation (c)), so this branch is unreachable outside a
   // `@vscode/test-electron` run. `provider.onWebviewSignal` already fires in
   // every mode (deliberately accepted, inert production emitter — §4.2); only
-  // the export is mode-gated.
+  // the export is mode-gated. beta.5 T16 (§5.5, S-F15): also wires
+  // `getSetupData()` to `setupController.status()` ONLY — never `.handle()`.
   if (context.extensionMode === vscode.ExtensionMode.Test) {
-    const t = createTestApi(provider.onWebviewSignal);
+    const t = createTestApi(provider.onWebviewSignal, () => setupController.status());
     context.subscriptions.push(t);
     return t.api;
   }
