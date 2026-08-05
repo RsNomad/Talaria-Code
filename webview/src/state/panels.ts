@@ -210,6 +210,41 @@ export function errorMessage(err: unknown): string {
 }
 
 /**
+ * T2 (beta.5, §0.1 ②, §2.2.4): the sentinel `unwrapSetupResult` resolves to
+ * when a Setup mutation was refused because the USER dismissed a native
+ * confirmation modal (`reason: 'declined'`) — not an error, and not a
+ * success `ActionButton` (T9) should label. A unique symbol (not a string
+ * literal or `null`) so it can never collide with, or be produced by,
+ * `JSON.parse`-derived wire data.
+ */
+export const DECLINED: unique symbol = Symbol('setup-declined');
+
+/**
+ * Re-shape a Setup control.response result into the ordinary
+ * resolve-on-success/reject-on-refusal contract every other correlated
+ * mutation (`setConfig`, `setNextEditToggle`) already has. §0.1 ②: a
+ * controller REFUSAL is `ok:true` at the RPC transport layer (the request
+ * itself succeeded) carrying `result:{ok:false,reason}` — so the raw
+ * `bridge.request(...)` promise RESOLVES on a refusal, and callers that only
+ * `.catch()` never see it. `dispatchSetup` (App.tsx) routes every Setup
+ * mutation through this pure function so a refusal throws instead.
+ *
+ * One reason is neither a success nor a failure: `'declined'` means the user
+ * cancelled a native confirmation modal, and resolves to the {@link DECLINED}
+ * sentinel — deliberately NOT a throw and NOT a plain resolve of the raw
+ * `{ok:false,...}` result (critic C-2 — a silent resolve would render
+ * "cancel the Apply dialog" as "✓ Applied").
+ */
+export function unwrapSetupResult(result: unknown): unknown {
+  const r = result as { ok?: boolean; reason?: string } | undefined;
+  if (r && r.ok === false) {
+    if (r.reason === 'declined') return DECLINED; // user cancelled the native modal — not an error, NOT a success
+    throw new Error(r.reason || 'The action was refused.');
+  }
+  return result;
+}
+
+/**
  * BF-A: the Sessions "Load more" footer's tri-state (+hidden), pure and
  * exported so it is unit-testable without a DOM (this repo's webview tests
  * are no-jsdom — see `SessionsPanel.test.ts`). Mirrors TanStack

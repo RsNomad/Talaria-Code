@@ -33,7 +33,7 @@ import { MAX_TABS, PANEL_SCOPE } from './protocol';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
-import { errorMessage, fetchPanel, panelData, resolvePanelRequest } from './state/panels';
+import { errorMessage, fetchPanel, panelData, resolvePanelRequest, unwrapSetupResult } from './state/panels';
 import { idle } from './state/remoteData';
 import { createInitialState, type AppState, type TabState } from './types';
 import type { ComposerSeed } from './composer/applySeed';
@@ -462,8 +462,20 @@ export function App() {
   // (mirrors `reload.mcp`/`model.save_key`'s "dispatch -> refetch -> push"
   // precedent — see `SetupController.handle`'s own doc), so this panel needs
   // no manual re-fetch after a successful call.
+  //
+  // T2 (§0.1 ②, §2.2.4 — corrects the previous docstring here, which was
+  // silent on refusals): a controller REFUSAL is `ok:true` at the RPC
+  // TRANSPORT layer (the request itself succeeded) carrying `result:
+  // {ok:false, reason}` — so the raw `bridge.request(...)` promise used to
+  // RESOLVE on a refusal, and `ActionButton`'s error state never fired.
+  // Routed through `unwrapSetupResult` so this dispatcher has the SAME
+  // resolve/reject contract as `setConfig`/`setNextEditToggle` above: an
+  // accepted mutation resolves with its result, a refusal REJECTS with
+  // `reason` (or a default message) — except `reason: 'declined'` (the user
+  // dismissed a native confirmation modal), which resolves to the `DECLINED`
+  // sentinel instead of either (not an error, not a success to label).
   const dispatchSetup = (method: SetupMethod, params?: Record<string, unknown>) =>
-    bridge.request(method, params);
+    bridge.request(method, params).then(unwrapSetupResult);
 
   // Deep-link into the Setup panel (MockNotice / Hero "Set up backends").
   const openSetup = () => selectPanel('setup');
