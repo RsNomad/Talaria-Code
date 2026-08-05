@@ -1273,8 +1273,15 @@ export class SetupController {
  * `HERMES_SETUP_AUTH_METHOD_ID` — the `m?.id !== undefined` guard is what
  * keeps a dropped entry from being mistaken for a "managed" (non-`hermes-
  * setup`) method.
+ *
+ * EXPORTED since T8 (beta.5 §2.3, critic C-5): `AcpBackend` wires the
+ * `ConnectionSupervisor`'s `isProviderUnconfigured` thunk to THIS function
+ * over the same advertised-auth-methods accessor, so the no-provider
+ * session-start banner and the Setup Provider card can never disagree
+ * about what "unconfigured" means. (Import direction is backend → setup;
+ * this file still never imports from `src/host/backend/`.)
  */
-function computeProviderCard(methods: AdvertisedAuthMethod[] | undefined): SetupData['provider'] {
+export function computeProviderCard(methods: AdvertisedAuthMethod[] | undefined): SetupData['provider'] {
   if (methods === undefined) return { phase: 'waiting-agent' };
   const managed = methods.find((m) => m?.id !== undefined && m.id !== HERMES_SETUP_AUTH_METHOD_ID);
   return managed ? { phase: 'configured', providerId: managed.id } : { phase: 'unconfigured' };

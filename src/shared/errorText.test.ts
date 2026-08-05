@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { homedir } from 'node:os';
 import { describeError, isAuthRequiredError, redactHomePath } from './errorText';
 
@@ -141,6 +141,62 @@ describe('describeError', () => {
     for (const shape of shapes) {
       expect(describeError(shape)).not.toBe('[object Object]');
     }
+  });
+});
+
+describe('describeError — T8 folded hardening T1-M2: the JSON fallback redacts BEFORE the 300-char cap', () => {
+  it('a home path straddling the char-300 boundary is fully redacted — no partial fragment survives the cut', () => {
+    const home = '/home/alice';
+    // `JSON.stringify({payload: …})` opens with the 12-char prefix
+    // `{"payload":"`. pad=283 places the 11-char home path at raw-JSON
+    // indices 295..305 — STRADDLING index 300. Under the buggy
+    // slice-then-redact order, `slice(0, 300)` cuts mid-path and the
+    // surviving fragment `/home` no longer matches the full home string,
+    // so redaction misses it. Redact-then-slice collapses the whole path
+    // to `~` first — nothing partial can ever survive the cap.
+    const pad = 283;
+    const err = { payload: 'A'.repeat(pad) + `${home}/x` };
+    const result = describeError(err, home);
+    expect(result).not.toContain('/home');
+    expect(result).toContain('~/x');
+    expect(result.length).toBeLessThanOrEqual(300);
+  });
+});
+
+describe('errorText — T8 folded hardening S-3: host-threaded home makes redaction env-independent', () => {
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    delete process.env.HOME;
+    delete process.env.USERPROFILE;
+  });
+  afterEach(() => {
+    if (savedHome !== undefined) process.env.HOME = savedHome;
+    else delete process.env.HOME;
+    if (savedUserProfile !== undefined) process.env.USERPROFILE = savedUserProfile;
+    else delete process.env.USERPROFILE;
+  });
+
+  it('redactHomePath(text, home) redacts with BOTH $HOME and %USERPROFILE% unset', () => {
+    expect(redactHomePath('/home/alice/proj/a.py', '/home/alice')).toBe('~/proj/a.py');
+  });
+
+  it('describeError(err, home) redacts an Error message with $HOME unset (the host call-site contract)', () => {
+    const err = new Error('spawn failed: /home/alice/.venvs/hermes/bin/hermes');
+    expect(describeError(err, '/home/alice')).toBe('spawn failed: ~/.venvs/hermes/bin/hermes');
+  });
+
+  it('no-arg redactHomePath stays a harmless no-op when no env home exists (webview parity preserved)', () => {
+    expect(redactHomePath('/home/alice/proj/a.py')).toBe('/home/alice/proj/a.py');
+  });
+
+  it('an explicit home param wins over the env home', () => {
+    process.env.HOME = '/wrong/env/home';
+    expect(redactHomePath('/home/alice/x and /wrong/env/home/y', '/home/alice')).toBe(
+      '~/x and /wrong/env/home/y',
+    );
   });
 });
 

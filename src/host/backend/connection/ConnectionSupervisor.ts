@@ -1,7 +1,9 @@
+import { homedir } from 'node:os';
 import type { Logger } from '../../transport/JsonRpcStdio';
 import type { HermesRuntimeConfig } from '../../runtime/resolveHermes';
 import { resolveHermes } from '../../runtime/resolveHermes';
 import { respawnBackoffMs } from '../../control/respawnBackoff';
+import { describeError, isAuthRequiredError } from '../../../shared/errorText';
 import { BOOTSTRAP_TAB_ID } from '../../../shared/protocol';
 import type { HostToWebviewMessage } from '../../../shared/protocol';
 import type {
@@ -386,7 +388,7 @@ export class ConnectionSupervisor {
       if (!wasRespawning && (this.acpState as string) !== 'disposed') {
         this.port.emit({
           type: 'system.error',
-          message: `Hermes failed to start: ${errorMessage(err)}`,
+          message: `Hermes failed to start: ${describeHostError(err)}`,
         });
       }
       throw err;
@@ -569,12 +571,29 @@ export class ConnectionSupervisor {
         return;
       }
     } catch (err) {
+      // T8 (beta.5 §2.3, bug ⑧): STRUCTURAL no-provider routing, not
+      // textual (critic C-5) — Hermes' adapter (`acp_adapter/session.py:
+      // 652-654`) swallows `resolve_runtime_provider` failures, so the
+      // AuthError texts never reliably reach the wire. The injected
+      // `isProviderUnconfigured` thunk consults the SAME source the Setup
+      // Provider card reads (`computeProviderCard(getAdvertisedAuthMethods())
+      // .phase === 'unconfigured'` — see `AcpBackend`'s port wiring);
+      // `isAuthRequiredError` (`-32000`, the ACP SDK's authRequired) is a
+      // SUPPLEMENT only. Either way the real error text is ALWAYS appended
+      // — this branch can route the message, never hide it. `describeError`
+      // (not the old naive `String(err)`) is what kills the literal
+      // `"[object Object]"` the SDK's raw `{code,message,data}` rejection
+      // used to render as (§0.1 row ⑧, `acp.js:886`).
+      const detail = describeHostError(err);
       this.port.logger?.append(
-        `[AcpBackend] initial session establish failed — connection stays up (acpState='ready'): ${errorMessage(err)}`,
+        `[AcpBackend] initial session establish failed — connection stays up (acpState='ready'): ${detail}`,
       );
       this.port.emit({
         type: 'system.error',
-        message: `Failed to start a Hermes session: ${errorMessage(err)}`,
+        message:
+          this.port.isProviderUnconfigured?.() === true || isAuthRequiredError(err)
+            ? `Hermes has no chat provider configured. Open Setup → Provider → "Configure provider", then try again. (${detail})`
+            : `Failed to start a Hermes session: ${detail}`,
       });
       return;
     }
@@ -662,9 +681,9 @@ export class ConnectionSupervisor {
         // contract, exactly like `establishInitialSession`'s own try/catch
         // does for the ordinary bootstrap mint.
         this.port.logger?.append(
-          `[AcpBackend] respawn recovery: unexpected failure recovering session '${sessionId}' (tab '${tabId}') — treating as session-lost: ${errorMessage(err)}`,
+          `[AcpBackend] respawn recovery: unexpected failure recovering session '${sessionId}' (tab '${tabId}') — treating as session-lost: ${describeHostError(err)}`,
         );
-        this.port.emit({ type: 'tab.error', tabId, kind: 'session-lost', message: errorMessage(err) });
+        this.port.emit({ type: 'tab.error', tabId, kind: 'session-lost', message: describeHostError(err) });
       }
     }
   }
@@ -1081,7 +1100,7 @@ export class ConnectionSupervisor {
         controller.endOnCrash();
       } catch (err) {
         this.port.logger?.append(
-          `[AcpBackend] crash fan-out: endOnCrash failed for session '${controller.sessionId}' (tab '${controller.tabId}'), continuing: ${errorMessage(err)}`,
+          `[AcpBackend] crash fan-out: endOnCrash failed for session '${controller.sessionId}' (tab '${controller.tabId}'), continuing: ${describeHostError(err)}`,
         );
       }
     }
@@ -1105,7 +1124,7 @@ export class ConnectionSupervisor {
       this.acpRespawnTimer = undefined;
       void this.start().catch((err) => {
         this.port.logger?.append(
-          `[AcpBackend] ACP respawn attempt ${attempt} failed: ${errorMessage(err)}`,
+          `[AcpBackend] ACP respawn attempt ${attempt} failed: ${describeHostError(err)}`,
         );
         if ((this.acpState as string) !== 'disposed') {
           this.acpState = 'respawning'; // stay in-outage: no second UI signal
@@ -1231,6 +1250,21 @@ export interface ConnectionSupervisorHostPort {
   isPendingClose(sessionId: string): boolean;
 
   /**
+   * T8 (beta.5 §2.3, bug ⑧ — critic C-5): OPTIONAL structural "no chat
+   * provider configured" probe, consulted at `establishInitialSession`-
+   * failure time to route the session-start banner. `AcpBackend` wires it
+   * to `computeProviderCard(getAdvertisedAuthMethods()).phase ===
+   * 'unconfigured'` — the SAME advertised-auth-methods source the Setup
+   * Provider card reads (`extension.ts` binds `SetupControllerDeps.
+   * getAdvertisedAuthMethods` to a thunk over the very same
+   * `AgentBackend.getAdvertisedAuthMethods`), so banner and card can never
+   * disagree. Optional (older test doubles omit it, like
+   * `onAuthMethodsChanged`): absent, routing falls back to the
+   * `isAuthRequiredError` (`-32000`) supplement alone.
+   */
+  isProviderUnconfigured?: () => boolean;
+
+  /**
    * Fires a HostToWebview message (mirrors `SessionHostPort.emit`, but
    * unconstrained — connection-level emits are MOSTLY not session-scoped).
    * W6-P7-N11 (doc fix, closes 3-way ARCH Minor-6): `recoverOneSession`'s
@@ -1244,6 +1278,18 @@ export interface ConnectionSupervisorHostPort {
   emit(msg: HostToWebviewMessage): void;
 }
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+/**
+ * T8 (beta.5 §2.3, bug ⑧): host-side error rendering — the shared
+ * `describeError` with the extension host's REAL home threaded in (folded
+ * hardening S-3: `os.homedir()` works even when `$HOME`/`%USERPROFILE%`
+ * are unset, where `errorText.ts`'s own env fallback would silently skip
+ * redaction). Replaces this file's former naive `err instanceof Error ?
+ * err.message : String(err)` copy, which rendered the ACP SDK's raw
+ * JSON-RPC `{code,message,data}` rejections (`acp.js:886`) as the literal
+ * `"[object Object]"`. Scope pin (§2.3): only THIS file's and
+ * `AcpBackend.ts`'s copies convert this wave — the other ~11 naive copies
+ * across the codebase are a mechanical follow-up.
+ */
+function describeHostError(err: unknown): string {
+  return describeError(err, homedir());
 }
