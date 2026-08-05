@@ -569,11 +569,11 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
     return baseData({ fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' } });
   }
 
-  it('resolve + successLabel: announces "✓ Endpoint reachable", auto-clears after 4s, and leaves no timer on unmount (fake timers)', async () => {
+  it('resolve + successLabel: announces "✓ Endpoint reachable" and auto-clears after 4s (fake timers)', async () => {
     vi.useFakeTimers();
     try {
       const dispatch = vi.fn().mockResolvedValue({ ok: true });
-      const { unmount } = render(
+      render(
         <SetupPanel
           data={{ status: 'success', data: fimSetupData() }}
           onRetry={noopRetry}
@@ -599,9 +599,82 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
         vi.advanceTimersByTime(4000);
       });
       expect(screen.queryByText('✓ Endpoint reachable')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolve + successLabel: unmounting WHILE the 4s auto-clear timer is still pending clears it (no leaked timer)', async () => {
+    vi.useFakeTimers();
+    try {
+      const dispatch = vi.fn().mockResolvedValue({ ok: true });
+      const { unmount } = render(
+        <SetupPanel
+          data={{ status: 'success', data: fimSetupData() }}
+          onRetry={noopRetry}
+          progress={{}}
+          nextEdit={{ next: false, generic: true }}
+          onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+          dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+        />,
+      );
+      const button = screen.getByRole('button', { name: 'Test' });
+
+      await act(async () => {
+        button.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getByText('✓ Endpoint reachable')).toBeInTheDocument();
+      // The auto-clear timer must still be pending here — this is the whole
+      // point of the test. Advancing anywhere near the full 4000ms first
+      // would let the timer self-consume before `unmount()` runs, which
+      // would make the `getTimerCount()` assertion below pass trivially even
+      // for a version of the effect with NO cleanup at all.
+      expect(vi.getTimerCount()).toBe(1);
 
       unmount();
       expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('two resolves in succession do not stack auto-clear timers: timer count stays at 1, never 2', async () => {
+    vi.useFakeTimers();
+    try {
+      const dispatch = vi.fn().mockResolvedValue({ ok: true });
+      render(
+        <SetupPanel
+          data={{ status: 'success', data: fimSetupData() }}
+          onRetry={noopRetry}
+          progress={{}}
+          nextEdit={{ next: false, generic: true }}
+          onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+          dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+        />,
+      );
+      const button = screen.getByRole('button', { name: 'Test' });
+
+      await act(async () => {
+        button.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByText('✓ Endpoint reachable')).toBeInTheDocument();
+      expect(vi.getTimerCount()).toBe(1);
+
+      // Click again WHILE the first timer is still pending (well inside the
+      // 4s window) — a fresh success re-arms the timer, it does not stack a
+      // second one alongside the first.
+      await act(async () => {
+        button.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByText('✓ Endpoint reachable')).toBeInTheDocument();
+      expect(vi.getTimerCount()).toBe(1);
     } finally {
       vi.useRealTimers();
     }
