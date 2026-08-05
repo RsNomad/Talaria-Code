@@ -12,6 +12,9 @@ Local-first. Your models, your machine.
 
 **English** · [Русский](./README.ru.md) · [中文](./README.zh-CN.md)
 
+**Supported Linux distros:** Fedora/RHEL · Debian · Ubuntu · Arch · openSUSE
+*Other distros: guided instructions — install the dependencies yourself and Talaria picks them up on Re-check. In a container/Flatpak, run the install commands on your host.*
+
 </div>
 
 ---
