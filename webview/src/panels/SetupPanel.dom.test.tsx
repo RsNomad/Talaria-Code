@@ -14,7 +14,7 @@ import userEvent from '@testing-library/user-event';
 import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupMethod } from '../protocol';
 import { NEXT_EDIT_ROWS } from './nextEditCopy';
 import { SetupPanel } from './SetupPanel';
-import { agentPhaseLabel, PYTHON_VERSION_HELP_URL, TRUST_DISABLED_REASON } from './setupCards';
+import { agentPhaseLabel, PIPX_INSTALL_DOCS_URL, PYTHON_VERSION_HELP_URL, TRUST_DISABLED_REASON } from './setupCards';
 import { DECLINED } from '../state/panels';
 import { must } from '../testing/must';
 
@@ -76,6 +76,47 @@ function codestralOption(overrides: Partial<SetupBackendOption> = {}): SetupBack
       apiKeySet: false,
       probe: 'none',
     },
+    ...overrides,
+  };
+}
+
+function llamacppOption(overrides: Partial<SetupBackendOption> = {}): SetupBackendOption {
+  return {
+    id: 'llamacpp',
+    kind: 'fim',
+    status: 'available',
+    displayName: 'llama.cpp',
+    description: 'Local FIM via llama.cpp.',
+    remote: {
+      endpointDefault: 'http://127.0.0.1:8012',
+      endpointValue: '',
+      endpointPlaceholder: 'http://host:port',
+      auth: 'none',
+      apiKeySet: false,
+      probe: 'llamacpp-health',
+    },
+    localInstall: { flavor: 'guided-terminal', effort: 'manual-guided' },
+    ...overrides,
+  };
+}
+
+function vllmOption(overrides: Partial<SetupBackendOption> = {}): SetupBackendOption {
+  return {
+    id: 'vllm',
+    kind: 'fim',
+    status: 'available',
+    displayName: 'vLLM',
+    description: 'Local FIM via vLLM.',
+    remote: {
+      endpointDefault: 'http://127.0.0.1:8000',
+      endpointValue: '',
+      endpointPlaceholder: 'http://host:port',
+      auth: 'none',
+      apiKeySet: false,
+      probe: 'openai-models',
+    },
+    localInstall: { flavor: 'docs-only', effort: 'manual-guided' },
+    docsUrl: 'https://docs.vllm.ai/',
     ...overrides,
   };
 }
@@ -423,45 +464,271 @@ describe('Agent card — awaiting-reload gap-state (T11 IMPORTANT host-gap 1)', 
   });
 });
 
-describe('Agent card — pipx-missing gap-state (T11 IMPORTANT host-gap 2)', () => {
-  it('renders the bootstrap-terminal button + [Re-check], not the old [Retry install]', () => {
-    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing' } });
+describe('Agent card — pipx-missing gap-state (T10, §6/§1.2): known distro', () => {
+  // A NON-Fedora fixture command deliberately (any distro-specific
+  // package-manager literal in webview SOURCE is banned — see the host-side
+  // scan test) — the button must render whatever the host sends, verbatim,
+  // never a guess.
+  const bootstrap = {
+    command: 'sudo apt-get update && sudo apt-get install pipx',
+    guidance: 'pipx was not found on your PATH. Open a terminal to install it, then re-check.',
+  };
+
+  it('renders the host-composed bootstrap-terminal button + [Re-check], not a dead-end', () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     renderPanel(data);
-    expect(screen.getByRole('button', { name: 'Open terminal: sudo dnf install pipx' })).toBeInTheDocument();
+    expect(screen.getByText(bootstrap.guidance)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Retry install' })).not.toBeInTheDocument();
   });
 
   it('clicking the bootstrap-terminal button dispatches setup.openBootstrapTerminal', async () => {
-    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing' } });
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     const { user, dispatch } = renderPanel(data);
-    await user.click(screen.getByRole('button', { name: 'Open terminal: sudo dnf install pipx' }));
+    await user.click(screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` }));
     expect(dispatch).toHaveBeenCalledWith('setup.openBootstrapTerminal');
   });
 
   it('clicking [Re-check] dispatches setup.recheck', async () => {
-    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing' } });
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     const { user, dispatch } = renderPanel(data);
     await user.click(screen.getByRole('button', { name: 'Re-check' }));
     expect(dispatch).toHaveBeenCalledWith('setup.recheck');
   });
 
   it('the bootstrap-terminal button is trust-gated; [Re-check] stays usable (read-only, §8)', () => {
-    const data = baseData({ trusted: false, agent: { ...baseData().agent, phase: 'pipx-missing' } });
+    const data = baseData({ trusted: false, agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     renderPanel(data);
-    const terminalButton = screen.getByRole('button', { name: 'Open terminal: sudo dnf install pipx' });
+    const terminalButton = screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` });
     expect(terminalButton).toBeDisabled();
     expect(terminalButton.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeEnabled();
   });
 });
 
-describe('Agent card — python-unsuitable docs link (T11 §6-parity minor)', () => {
-  it('renders a docs link (falls back to PYTHON_VERSION_HELP_URL when the descriptor has no docsUrl)', () => {
-    const data = baseData({ agent: { ...baseData().agent, phase: 'python-unsuitable', detail: 'found 3.14; needs 3.11-3.13' } });
+describe('Agent card — pipx-missing gap-state (T10, §6): unknown distro — no dead-end', () => {
+  const unknownBootstrap = {
+    guidance:
+      "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.",
+  };
+
+  it('renders the guidance text + docs link, NO terminal button', () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap: unknownBootstrap } });
+    renderPanel(data);
+    expect(screen.getByText(unknownBootstrap.guidance)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Open terminal:/ })).not.toBeInTheDocument();
+    const link = screen.getByRole('link', { name: /pipx install/i });
+    expect(link).toHaveAttribute('href', PIPX_INSTALL_DOCS_URL);
+  });
+
+  it('[Re-check] still works — never a dead-end', async () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap: unknownBootstrap } });
+    const { user, dispatch } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Re-check' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.recheck');
+  });
+});
+
+describe('Agent card — python-unsuitable (T10, §6): command branch OR guidance branch, Re-check in BOTH', () => {
+  it('command plan: renders {agent.detail} + [Open terminal: {command}] + [Re-check]', async () => {
+    const data = baseData({
+      agent: {
+        ...baseData().agent,
+        phase: 'python-unsuitable',
+        detail: 'Found Python 3.14; Hermes needs 3.11-3.13.',
+        pythonInstall: {
+          kind: 'command',
+          command: 'sudo apt-get install python3.11 python3.11-venv',
+          sourceNote: "Debian/Ubuntu's own official archive.",
+          docsUrl: 'https://packages.debian.org/search?keywords=python3.11',
+        },
+      },
+    });
+    const { user, dispatch } = renderPanel(data);
+    expect(screen.getByText('Found Python 3.14; Hermes needs 3.11-3.13.')).toBeInTheDocument();
+    const button = screen.getByRole('button', {
+      name: 'Open terminal: sudo apt-get install python3.11 python3.11-venv',
+    });
+    expect(button).toBeInTheDocument();
+    await user.click(button);
+    expect(dispatch).toHaveBeenCalledWith('setup.openBootstrapTerminal', { target: 'python' });
+    await user.click(screen.getByRole('button', { name: 'Re-check' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.recheck');
+  });
+
+  it('command plan: the terminal button is trust-gated; [Re-check] stays usable', () => {
+    const data = baseData({
+      trusted: false,
+      agent: {
+        ...baseData().agent,
+        phase: 'python-unsuitable',
+        pythonInstall: {
+          kind: 'command',
+          command: 'sudo apt-get install python3.11',
+          sourceNote: 'source',
+          docsUrl: 'https://example.test',
+        },
+      },
+    });
+    renderPanel(data);
+    const button = screen.getByRole('button', { name: 'Open terminal: sudo apt-get install python3.11' });
+    expect(button).toBeDisabled();
+    expect(button.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
+    expect(screen.getByRole('button', { name: 'Re-check' })).toBeEnabled();
+  });
+
+  it('guidance plan: renders the §6 guidance text + docs link + [Re-check], NO terminal button — never a dead-end', async () => {
+    const guidanceText =
+      "Hermes needs Python 3.11–3.13, and your system's own package archive doesn't carry one in range. Install a supported Python yourself (see your distro's documentation or python.org), then press Re-check — Talaria will find it automatically.";
+    const data = baseData({
+      agent: {
+        ...baseData().agent,
+        phase: 'python-unsuitable',
+        pythonInstall: { kind: 'guidance', text: guidanceText, docsUrl: 'https://www.python.org/downloads/' },
+      },
+    });
+    const { user, dispatch } = renderPanel(data);
+    expect(screen.getByText(guidanceText)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Open terminal:/ })).not.toBeInTheDocument();
+    const link = screen.getByRole('link', { name: /python/i });
+    expect(link).toHaveAttribute('href', 'https://www.python.org/downloads/');
+    await user.click(screen.getByRole('button', { name: 'Re-check' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.recheck');
+  });
+
+  it('falls back to PYTHON_VERSION_HELP_URL when no pythonInstall plan is present at all (defensive)', () => {
+    const data = baseData({
+      agent: { ...baseData().agent, phase: 'python-unsuitable', detail: 'found 3.14; needs 3.11-3.13' },
+    });
     renderPanel(data);
     const link = screen.getByRole('link', { name: /python/i });
     expect(link).toHaveAttribute('href', PYTHON_VERSION_HELP_URL);
+  });
+});
+
+describe('container-note banner (§1.2, T10)', () => {
+  const CONTAINER_NOTE =
+    "Talaria can't tell which system your terminal acts on (VS Code appears to run in a sandbox/container) — run the install commands in a terminal on your host system, then re-check.";
+
+  it('renders the banner text when os.containerNote is present', () => {
+    renderPanel(baseData({ os: { family: 'unknown', manager: 'unknown', containerNote: CONTAINER_NOTE } }));
+    expect(screen.getByText(CONTAINER_NOTE)).toBeInTheDocument();
+  });
+
+  it('renders nothing when os is absent', () => {
+    renderPanel(baseData({ os: undefined }));
+    expect(screen.queryByText(/can't tell which system/)).not.toBeInTheDocument();
+  });
+
+  it('renders nothing when os is present but containerNote is unset (known distro)', () => {
+    renderPanel(baseData({ os: { family: 'debian', manager: 'apt-get', prettyName: 'Debian GNU/Linux 12' } }));
+    expect(screen.queryByText(/can't tell which system/)).not.toBeInTheDocument();
+  });
+});
+
+describe('B5 "done / what next" one-line status under each card (§6, T10)', () => {
+  it('Agent card shows the done line once ready', () => {
+    renderPanel(baseData({ agent: { ...baseData().agent, phase: 'ready' } }));
+    expect(screen.getByText('✓ Hermes is ready. Next: configure a chat provider below.')).toBeInTheDocument();
+  });
+
+  it('Provider card shows the done line once configured', () => {
+    renderPanel(baseData({ provider: { phase: 'configured', providerId: 'anthropic' } }));
+    expect(screen.getByText('✓ Provider connected — chat is ready to use.')).toBeInTheDocument();
+  });
+
+  it('FIM card shows the done line once green', () => {
+    renderPanel(baseData({ fim: { ...baseData().fim, enabled: true } }));
+    expect(screen.getByText('✓ Autocomplete is active — open a file and start typing.')).toBeInTheDocument();
+  });
+
+  it('NEXT card shows the dedicated-on done line', () => {
+    renderPanel(baseData({ nextEdit: { ...baseData().nextEdit, source: 'dedicated' } }));
+    expect(screen.getByText('✓ Next-edit suggestions are on (dedicated Sweep model).')).toBeInTheDocument();
+  });
+
+  it('NEXT card shows the generic-on done line', () => {
+    renderPanel(baseData({ nextEdit: { ...baseData().nextEdit, source: 'generic' } }));
+    expect(screen.getByText('✓ Next-edit suggestions are on (reusing your FIM model).')).toBeInTheDocument();
+  });
+
+  it('RAG card shows the done line once green', () => {
+    renderPanel(baseData({ rag: { ...baseData().rag, enabled: true, embedModelPresent: true } }));
+    expect(screen.getByText('✓ Codebase index is ready — the agent can search your project.')).toBeInTheDocument();
+  });
+
+  it('renders no done line when a card is not done (icon+text is conditional, never a lingering lie)', () => {
+    renderPanel(baseData({ provider: { phase: 'unconfigured' } }));
+    expect(screen.queryByText(/Provider connected/)).not.toBeInTheDocument();
+  });
+});
+
+describe('FimInstallTab — non-Ollama gets an honest Test affordance (⑨⑩, §2.6)', () => {
+  async function openInstallTab(option: SetupBackendOption) {
+    const data = baseData({ fim: { ...baseData().fim, options: [option], selectedId: option.id } });
+    const utils = renderPanel(data);
+    await utils.user.click(screen.getByRole('button', { name: 'Install locally' }));
+    return utils;
+  }
+
+  it('llama.cpp (guided-terminal): keeps [Open terminal: install …] AND adds the §6 copy line + [Test connection ({endpoint})]', async () => {
+    await openInstallTab(llamacppOption());
+    expect(screen.getByRole('button', { name: /^Open terminal: install /i })).toBeInTheDocument();
+    expect(
+      screen.getByText('llama.cpp has no install detection — start your server, then test the connection.'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:8012)' })).toBeInTheDocument();
+  });
+
+  it('clicking [Test connection] dispatches setup.testRemote with the resolved backendId + endpoint', async () => {
+    const { user, dispatch } = await openInstallTab(llamacppOption());
+    await user.click(screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:8012)' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.testRemote', {
+      backendId: 'llamacpp',
+      endpoint: 'http://127.0.0.1:8012',
+    });
+  });
+
+  it('vLLM (docs-only, R-1b): the [Open terminal:] button is ABSENT; the §6 vLLM copy + docs link render; Test still renders', async () => {
+    await openInstallTab(vllmOption());
+    expect(screen.queryByRole('button', { name: /^Open terminal:/ })).not.toBeInTheDocument();
+    expect(
+      screen.getByText("vLLM's install depends on your GPU/CUDA setup — follow the official guide, then test the connection."),
+    ).toBeInTheDocument();
+    const docsLink = screen.getByRole('link', { name: 'Setup docs' });
+    expect(docsLink).toHaveAttribute('href', 'https://docs.vllm.ai/');
+    expect(screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:8000)' })).toBeInTheDocument();
+  });
+
+  it('R-2: this option IS the selected/configured backend — the label shows its OWN saved endpoint', async () => {
+    const option = llamacppOption({
+      remote: { ...must(llamacppOption().remote), endpointValue: 'http://127.0.0.1:9999' },
+    });
+    await openInstallTab(option);
+    expect(screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:9999)' })).toBeInTheDocument();
+  });
+
+  it("R-2: browsing a DIFFERENT backend's Install tab never tests the ACTIVE backend's saved endpoint under this backend's label", async () => {
+    // `talaria.autocomplete.endpoint` is ONE setting — every FIM option
+    // echoes the SAME saved value on the wire. `ollama` is the ACTUALLY
+    // configured backend (`fim.selectedId`); the user merely BROWSES vLLM's
+    // card without having selected it.
+    const sharedSavedValue = 'http://127.0.0.1:11434'; // Ollama's endpoint
+    const ollama = ollamaOption({ remote: { ...must(ollamaOption().remote), endpointValue: sharedSavedValue } });
+    const vllm = vllmOption({ remote: { ...must(vllmOption().remote), endpointValue: sharedSavedValue } });
+    const data = baseData({ fim: { ...baseData().fim, options: [ollama, vllm], selectedId: 'ollama' } });
+    const { user } = renderPanel(data);
+
+    await user.click(screen.getByRole('button', { name: 'vLLM' }));
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+
+    // vLLM's OWN default, never Ollama's foreign saved value. (The RAG
+    // card, unrelated, legitimately shows that same address elsewhere on
+    // the page — its own embed endpoint default — so this scopes to the
+    // FIM card rather than asserting over the whole screen.)
+    const fimCard = must(screen.getByText('Autocomplete (FIM)').closest('section'));
+    expect(within(fimCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8000)' })).toBeInTheDocument();
+    expect(within(fimCard).queryByText(/127\.0\.0\.1:11434/)).not.toBeInTheDocument();
   });
 });
 
@@ -754,8 +1021,12 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
     await user.click(button);
 
     await waitFor(() => expect(button).toHaveTextContent('Clear key'));
-    expect(screen.queryByText(/^✓/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/^✗/)).not.toBeInTheDocument();
+    // Scoped to THIS button's own live region: the page can legitimately
+    // carry OTHER "✓ …" text now (the B5 done-lines, T10) — this assertion
+    // is about what [Clear key] itself announced, not the whole screen.
+    const container = must(button.parentElement);
+    expect(within(container).queryByText(/^✓/)).not.toBeInTheDocument();
+    expect(within(container).queryByText(/^✗/)).not.toBeInTheDocument();
   });
 
   it('pending is unaffected by the success mechanism: shows "Working…" and announces nothing while in flight', async () => {

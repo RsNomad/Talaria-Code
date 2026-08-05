@@ -7,22 +7,29 @@
  * `SetupPanel.dom.test.tsx`.
  */
 import { describe, it, expect } from 'vitest';
-import type { AgentSetupPhase, SetupBackendOption, SetupProgress } from '../protocol';
+import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupProgress } from '../protocol';
 import {
+  agentDoneLine,
   agentPhaseLabel,
   agentPrimaryAction,
   buildCopyLogText,
   clampLogTail,
+  fimDoneLine,
   fimHasLocalInstall,
+  fimInstallTestEndpoint,
   foldSetupProgress,
   formatBytes,
   isComingSoon,
   mutationDisabledReason,
+  nextDoneLine,
   nextEditButtonLabel,
+  PIPX_INSTALL_DOCS_URL,
   progressKey,
+  providerDoneLine,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
   PROGRESS_LOG_TAIL_MAX,
+  ragDoneLine,
   TRUST_DISABLED_REASON,
   type SetupProgressMap,
 } from './setupCards';
@@ -237,5 +244,204 @@ describe('mutationDisabledReason — the !trusted gate (§6, D9 FM-14)', () => {
     const reason = mutationDisabledReason(false);
     expect(reason).toBe(TRUST_DISABLED_REASON);
     expect(reason).toMatch(/not trusted/i);
+  });
+});
+
+/*
+ * T10 (§2.5 B5 — "done / what next" affordances): five pure per-card helpers,
+ * each returning the exact §6-verbatim copy once its card is genuinely
+ * "done", and '' otherwise (never fabricated, never color-only — the DOM
+ * side pairs this string with a `pass-filled` icon, `SetupPanel.dom.test.tsx`).
+ */
+describe('agentDoneLine — B5 done line (§6)', () => {
+  it('is the exact §6 copy once the agent is ready', () => {
+    expect(agentDoneLine('ready')).toBe('✓ Hermes is ready. Next: configure a chat provider below.');
+  });
+  it('is empty for every other phase', () => {
+    for (const phase of ALL_PHASES) {
+      if (phase === 'ready') continue;
+      expect(agentDoneLine(phase)).toBe('');
+    }
+  });
+});
+
+describe('providerDoneLine — B5 done line (§6)', () => {
+  it('is the exact §6 copy once configured', () => {
+    expect(providerDoneLine('configured')).toBe('✓ Provider connected — chat is ready to use.');
+  });
+  it('is empty for waiting-agent/unconfigured/unknown', () => {
+    for (const phase of ['waiting-agent', 'unconfigured', 'unknown'] as const) {
+      expect(providerDoneLine(phase)).toBe('');
+    }
+  });
+});
+
+function fimData(overrides: Partial<SetupData['fim']> = {}): SetupData['fim'] {
+  return {
+    options: [fimOption({ id: 'ollama', status: 'available' })],
+    selectedId: 'ollama',
+    enabled: true,
+    model: 'qwen2.5-coder:1.5b-base',
+    endpointValue: 'http://127.0.0.1:11434',
+    tuning: {
+      debounceMs: 250,
+      maxPromptTokens: 2048,
+      temperature: 0.2,
+      crossFileEnabled: true,
+      prefixInjection: true,
+      prefixInjectionRemote: false,
+      warmUp: true,
+    },
+    ...overrides,
+  };
+}
+
+describe("fimDoneLine — B5 done line (§6), mirrors SetupController's own fimGreen", () => {
+  it('is the exact §6 copy when the selected backend is available + enabled + auth satisfied (no remote entry at all)', () => {
+    expect(fimDoneLine(fimData())).toBe('✓ Autocomplete is active — open a file and start typing.');
+  });
+  it('is empty when the FIM toggle is off', () => {
+    expect(fimDoneLine(fimData({ enabled: false }))).toBe('');
+  });
+  it('is empty when the selected option is coming-soon', () => {
+    const data = fimData({ options: [fimOption({ id: 'ollama', status: 'coming-soon' })] });
+    expect(fimDoneLine(data)).toBe('');
+  });
+  it('is empty when apiKey-required and no key is set', () => {
+    const data = fimData({
+      options: [
+        fimOption({
+          id: 'codestral',
+          remote: {
+            endpointDefault: 'https://codestral.mistral.ai',
+            endpointValue: '',
+            endpointPlaceholder: '',
+            auth: 'apiKey-required',
+            apiKeySet: false,
+            probe: 'none',
+          },
+        }),
+      ],
+      selectedId: 'codestral',
+    });
+    expect(fimDoneLine(data)).toBe('');
+  });
+  it('is green once apiKey-required AND a key IS set', () => {
+    const data = fimData({
+      options: [
+        fimOption({
+          id: 'codestral',
+          remote: {
+            endpointDefault: 'https://codestral.mistral.ai',
+            endpointValue: '',
+            endpointPlaceholder: '',
+            auth: 'apiKey-required',
+            apiKeySet: true,
+            probe: 'none',
+          },
+        }),
+      ],
+      selectedId: 'codestral',
+    });
+    expect(fimDoneLine(data)).toBe('✓ Autocomplete is active — open a file and start typing.');
+  });
+  it('is empty when the selected id matches no option (defensive, never throws)', () => {
+    expect(fimDoneLine(fimData({ selectedId: 'missing' }))).toBe('');
+  });
+});
+
+describe('nextDoneLine — B5 done line (§6)', () => {
+  it('dedicated source -> the dedicated-model copy', () => {
+    expect(nextDoneLine('dedicated')).toBe('✓ Next-edit suggestions are on (dedicated Sweep model).');
+  });
+  it('generic source -> the reusing-FIM-model copy', () => {
+    expect(nextDoneLine('generic')).toBe('✓ Next-edit suggestions are on (reusing your FIM model).');
+  });
+  it('off -> empty', () => {
+    expect(nextDoneLine('off')).toBe('');
+  });
+});
+
+function ragData(overrides: Partial<SetupData['rag']> = {}): SetupData['rag'] {
+  return {
+    enabled: true,
+    embedEndpoint: 'http://127.0.0.1:11434',
+    embedModel: 'nomic-embed-text',
+    embedModelPresent: true,
+    tuning: { dims: 768, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: [] },
+    indexDir: '.talaria/index',
+    ...overrides,
+  };
+}
+
+describe('ragDoneLine — B5 done line (§6)', () => {
+  it('is the exact §6 copy when enabled + the embed model is present + unblocked', () => {
+    expect(ragDoneLine(ragData())).toBe('✓ Codebase index is ready — the agent can search your project.');
+  });
+  it('is empty when disabled', () => {
+    expect(ragDoneLine(ragData({ enabled: false }))).toBe('');
+  });
+  it('is empty when the embed model is not present yet', () => {
+    expect(ragDoneLine(ragData({ embedModelPresent: false }))).toBe('');
+  });
+  it('is empty when blocked by a precondition (never overclaims readiness)', () => {
+    expect(
+      ragDoneLine(ragData({ preconditionDetail: 'The codebase index needs a trusted, open workspace.' })),
+    ).toBe('');
+  });
+});
+
+describe('PIPX_INSTALL_DOCS_URL — the unknown-distro pipx-missing fallback link (§6)', () => {
+  it('is the exact pipx install docs URL', () => {
+    expect(PIPX_INSTALL_DOCS_URL).toBe('https://pipx.pypa.io/stable/installation/');
+  });
+});
+
+/*
+ * T10 (§2.6 ⑨⑩, R-2): `talaria.autocomplete.endpoint` is ONE setting shared
+ * by every FIM backend — `remote.endpointValue` on the wire is the SAME
+ * saved string for every option regardless of which backend it belongs to.
+ * It is only trustworthy for the backend it was saved FOR: the one actually
+ * `selectedId`'d on the wire. Browsing a DIFFERENT backend's Install tab
+ * must fall back to THAT option's own default, never test the foreign value
+ * under this backend's label.
+ */
+function vllmLikeOption(endpointValue: string): SetupBackendOption {
+  return fimOption({
+    id: 'vllm',
+    displayName: 'vLLM',
+    remote: {
+      endpointDefault: 'http://127.0.0.1:8000',
+      endpointValue,
+      endpointPlaceholder: 'http://host:port',
+      auth: 'none',
+      apiKeySet: false,
+      probe: 'openai-models',
+    },
+    localInstall: { flavor: 'docs-only', effort: 'manual-guided' },
+  });
+}
+
+describe('fimInstallTestEndpoint — ⑨⑩ R-2 honest endpoint resolution', () => {
+  it('uses the saved endpointValue when THIS option is the currently selected/configured backend', () => {
+    const option = vllmLikeOption('http://127.0.0.1:8012');
+    expect(fimInstallTestEndpoint('vllm', option)).toBe('http://127.0.0.1:8012');
+  });
+
+  it("R-2: a saved endpointValue belonging to a DIFFERENT selected backend never leaks — falls back to this option's own default", () => {
+    // Saved FOR ollama (the currently selected backend); we are merely
+    // BROWSING vLLM's card.
+    const option = vllmLikeOption('http://127.0.0.1:11434');
+    expect(fimInstallTestEndpoint('ollama', option)).toBe('http://127.0.0.1:8000');
+  });
+
+  it("falls back to the option's own default when it IS selected but has no saved value yet", () => {
+    const option = vllmLikeOption('');
+    expect(fimInstallTestEndpoint('vllm', option)).toBe('http://127.0.0.1:8000');
+  });
+
+  it('falls back to empty when the option carries no remote entry at all (defensive)', () => {
+    const option = fimOption({ id: 'vllm', remote: undefined });
+    expect(fimInstallTestEndpoint('vllm', option)).toBe('');
   });
 });

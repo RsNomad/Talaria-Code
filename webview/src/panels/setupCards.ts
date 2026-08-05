@@ -8,7 +8,7 @@
  * `toggleInteraction` extraction and `settingsField.ts`'s reconcile
  * functions — same discipline, new panel).
  */
-import type { AgentSetupPhase, SetupBackendOption, SetupProgress } from '../protocol';
+import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupProgress } from '../protocol';
 
 // --- Agent card (§6 card 1) -------------------------------------------------
 
@@ -59,9 +59,10 @@ export interface AgentAction {
 export function agentPrimaryAction(phase: AgentSetupPhase): AgentAction {
   switch (phase) {
     case 'pipx-missing':
-      // T11 (host-gap 2): `pipx-missing` now renders TWO bespoke buttons —
-      // [Open terminal: sudo dnf install pipx] (dispatches
-      // `setup.openBootstrapTerminal`) + [Re-check] (dispatches
+      // T11 (host-gap 2), T10 (§1.2): `pipx-missing` now renders TWO
+      // bespoke buttons — [Open terminal: {agent.bootstrap.command}]
+      // (dispatches `setup.openBootstrapTerminal`, command host-composed
+      // for the detected distro) + [Re-check] (dispatches
       // `setup.recheck`) — directly in `SetupPanel.tsx`'s `AgentCard`,
       // instead of the generic single primary-action slot every other phase
       // uses. `'none'` here suppresses that generic slot so it doesn't
@@ -232,4 +233,95 @@ export const TRUST_DISABLED_REASON =
  */
 export function mutationDisabledReason(trusted: boolean): string | undefined {
   return trusted ? undefined : TRUST_DISABLED_REASON;
+}
+
+// --- B5 "done / what next" one-line status affordances (§2.5, §6) ---------
+//
+// Five PURE per-card helpers. Each returns the exact §6-verbatim copy once
+// its card is genuinely done, and `''` otherwise — `SetupPanel.tsx` renders
+// the non-empty case as a quiet icon+text `pass-filled`/`text-add` line
+// under the card (never color-only, Global Constraint 7). None of these
+// booleans cross the wire directly (only the ALL-cards composite `ready`
+// does, mirrored from `SetupController`'s own `computeReady`) — each helper
+// recomputes its OWN card's "green" from wire-visible fields only, scoped to
+// that one card (an agent-ready line must not depend on the provider, etc).
+
+/** Card 1 — Agent: mirrors `AgentSetupPhase === 'ready'`. */
+export function agentDoneLine(phase: AgentSetupPhase): string {
+  return phase === 'ready' ? '✓ Hermes is ready. Next: configure a chat provider below.' : '';
+}
+
+/** Card 2 — Provider: mirrors `provider.phase === 'configured'`. */
+export function providerDoneLine(phase: SetupData['provider']['phase']): string {
+  return phase === 'configured' ? '✓ Provider connected — chat is ready to use.' : '';
+}
+
+/** Auth-satisfied predicate over the WIRE's collapsed `auth` union — the
+ *  same rule `SetupController.status()` applies host-side over its own
+ *  richer `{kind, required}` shape before it gets collapsed onto the wire
+ *  (`fimAuthSatisfied` there): only an `apiKey-required` backend with no key
+ *  set is blocked; `none`/`apiKey-optional`/no `remote` entry at all are
+ *  always satisfied. */
+function fimAuthSatisfied(option: SetupBackendOption | undefined): boolean {
+  if (!option?.remote) return true;
+  return option.remote.auth !== 'apiKey-required' || option.remote.apiKeySet;
+}
+
+/**
+ * Card 3 — Autocomplete (FIM): mirrors `SetupController.status()`'s own
+ * `fimGreen` (`fimDescriptor.status === 'available' && enabled &&
+ * fimAuthSatisfied`), recomputed here purely from the wire's `fim` block —
+ * the boolean itself never crosses the wire (only the ALL-cards composite
+ * `ready` does, and that also folds in agent+provider, which this per-card
+ * line must not).
+ */
+export function fimDoneLine(fim: SetupData['fim']): string {
+  const option = fim.options.find((o) => o.id === fim.selectedId);
+  const green = option !== undefined && option.status === 'available' && fim.enabled && fimAuthSatisfied(option);
+  return green ? '✓ Autocomplete is active — open a file and start typing.' : '';
+}
+
+/** Card 4 — NEXT: one line per active source, empty while `'off'`. */
+export function nextDoneLine(source: SetupData['nextEdit']['source']): string {
+  if (source === 'dedicated') return '✓ Next-edit suggestions are on (dedicated Sweep model).';
+  if (source === 'generic') return '✓ Next-edit suggestions are on (reusing your FIM model).';
+  return '';
+}
+
+/**
+ * Card 5 — RAG: green only once the index is genuinely usable — enabled,
+ * the embed model is actually present on the daemon (not just configured),
+ * and nothing is blocking activation (`preconditionDetail` unset). A
+ * "ready" claim without the embed model present would be a lie the icon
+ * alone couldn't correct (§6, Global Constraint 7).
+ */
+export function ragDoneLine(rag: SetupData['rag']): string {
+  const green = rag.enabled && rag.embedModelPresent && rag.preconditionDetail === undefined;
+  return green ? '✓ Codebase index is ready — the agent can search your project.' : '';
+}
+
+// --- pipx-missing unknown-distro fallback (§6, T10) ------------------------
+
+/** Docs link shown alongside the unknown-distro `pipx-missing` guidance —
+ *  used only when `agent.bootstrap.command` is absent (unrecognized
+ *  distro). */
+export const PIPX_INSTALL_DOCS_URL = 'https://pipx.pypa.io/stable/installation/';
+
+// --- ⑨⑩ non-Ollama install-tab Test endpoint resolution (§2.6, R-2) -------
+
+/**
+ * `talaria.autocomplete.endpoint` is ONE setting shared by every FIM
+ * backend (`FIM_ENDPOINT_KEY` in the host registry) — every
+ * `SetupBackendOption.remote.endpointValue` on the wire echoes that SAME
+ * saved string regardless of which backend the option represents. It is
+ * only trustworthy for the backend it was actually saved FOR — the one
+ * `selectedId`'d on the wire right now. Viewing a DIFFERENT backend's
+ * Install tab (browsing, not configuring) must fall back to THAT option's
+ * own default rather than silently testing a foreign server under this
+ * backend's label (a green result would be a lie about a DIFFERENT
+ * backend's reachability — §2.6 R-2, pinned by test).
+ */
+export function fimInstallTestEndpoint(selectedId: string, option: SetupBackendOption): string {
+  const scoped = selectedId === option.id ? (option.remote?.endpointValue ?? '') : '';
+  return scoped || option.remote?.endpointDefault || '';
 }

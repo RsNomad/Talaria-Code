@@ -39,16 +39,23 @@ import { type NextEditRowCopy, NEXT_EDIT_ROWS } from './nextEditCopy';
 import { PanelShell, RemotePanel, SectionLabel } from './PanelShell';
 import { commitFieldEdit, initNextEditRowState, reconcileNextEditRowState } from './settingsField';
 import {
+  agentDoneLine,
   agentPhaseLabel,
   agentPrimaryAction,
   buildCopyLogText,
+  fimDoneLine,
   fimHasLocalInstall,
+  fimInstallTestEndpoint,
   isComingSoon,
   mutationDisabledReason,
+  nextDoneLine,
   nextEditButtonLabel,
+  PIPX_INSTALL_DOCS_URL,
   progressKey,
+  providerDoneLine,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
+  ragDoneLine,
   TRUST_DISABLED_REASON,
   type SetupProgressMap,
 } from './setupCards';
@@ -102,6 +109,17 @@ function SetupCards({
 
   return (
     <>
+      {setup.os?.containerNote && (
+        <div
+          role="note"
+          aria-label="Container/sandbox notice"
+          className="mb-3 flex items-start gap-2 rounded-card border border-warn bg-warn-soft px-3 py-2 text-2xs text-fg"
+        >
+          <Icon name="warning" size={14} className="mt-0.5 flex-none text-warn" />
+          <span>{setup.os.containerNote}</span>
+        </div>
+      )}
+
       {!setup.trusted && (
         <div
           role="note"
@@ -167,6 +185,20 @@ function StatusLine({ icon, text, tone }: { icon: string; text: string; tone: To
     <div className="flex items-center gap-1.5 text-xs">
       <Icon name={icon} size={13} className={`flex-none ${TONE_TEXT[tone]}`} />
       <span className={TONE_TEXT[tone]}>{text}</span>
+    </div>
+  );
+}
+
+/**
+ * T10 (§2.5 B5): the quiet one-line "done / what next" status under a card —
+ * `pass-filled` + `text-add`, icon+text (never color-only). Renders nothing
+ * for an empty line (the `*DoneLine` helpers return `''` while not done).
+ */
+function DoneLine({ text, className = 'mt-1' }: { text: string; className?: string }) {
+  if (!text) return null;
+  return (
+    <div className={className}>
+      <StatusLine icon="pass-filled" text={text} tone="add" />
     </div>
   );
 }
@@ -392,43 +424,74 @@ function AgentCard({
       </div>
 
       <StatusLine icon={phaseIcon} text={agentPhaseLabel(agent.phase)} tone={phaseTone} />
+      <DoneLine text={agentDoneLine(agent.phase)} />
       {agent.version && <div className="mt-0.5 font-mono text-2xs text-faint">{agent.version}</div>}
 
       {agent.phase === 'pipx-missing' && (
-        // T11 (IMPORTANT host-gap 2): the honest text remains, but the
-        // dead-end "then retry" is replaced with the two real actions §6
-        // asks for — a pre-typed bootstrap terminal (the user provides
-        // sudo) and a Re-check once it's done. `agentPrimaryAction`
-        // returns `'none'` for this phase specifically so the generic
-        // single-action slot below doesn't ALSO render.
+        // T11 (host-gap 2), T10 (§1.2/§6): the dead-end "then retry" is
+        // replaced with the two real actions §6 asks for — a pre-typed
+        // bootstrap terminal (the user provides sudo) and a Re-check once
+        // it's done. The command itself is HOST-composed for the detected
+        // distro (`agent.bootstrap.command`) — the webview only ever
+        // renders it, never guesses one (Global Constraint 1). An
+        // unrecognized distro carries no `command`: honest guidance + a
+        // docs link takes its place, Re-check still works — never a
+        // dead-end. `agentPrimaryAction` returns `'none'` for this phase
+        // specifically so the generic single-action slot below doesn't
+        // ALSO render.
         <div className="mt-1 flex flex-col gap-1.5">
-          <p className="text-2xs text-muted">
-            pipx was not found on your PATH. Open a terminal to install it, then re-check.
-          </p>
-          <div className="flex flex-wrap gap-2">
-            <ActionButton
-              label="Open terminal: sudo dnf install pipx"
-              onRun={() => dispatch('setup.openBootstrapTerminal')}
-              disabledReason={disabledReason}
-            />
+          {agent.bootstrap?.guidance && <p className="text-2xs text-muted">{agent.bootstrap.guidance}</p>}
+          <div className="flex flex-wrap items-center gap-2">
+            {agent.bootstrap?.command ? (
+              <ActionButton
+                label={`Open terminal: ${agent.bootstrap.command}`}
+                onRun={() => dispatch('setup.openBootstrapTerminal')}
+                disabledReason={disabledReason}
+              />
+            ) : (
+              <a href={PIPX_INSTALL_DOCS_URL} className="text-2xs text-accent underline" target="_blank" rel="noreferrer">
+                pipx install docs
+              </a>
+            )}
             <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
           </div>
         </div>
       )}
       {agent.phase === 'python-unsuitable' && (
-        // T11 (§6-parity minor): honest text (when the host supplied one)
-        // PLUS a docs link — the descriptor's own `docsUrl` if the
-        // registry ever sets one, else a sensible generic fallback.
-        <div className="mt-1 flex flex-col gap-1">
-          {agent.detail && <p className="text-2xs text-muted">{agent.detail}</p>}
-          <a
-            href={selectedOption?.docsUrl ?? PYTHON_VERSION_HELP_URL}
-            className="text-2xs text-accent underline"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Python version help
-          </a>
+        // T10 (§1.2/§6): the engine's `pythonInstall` plan drives TWO
+        // branches, Re-check in BOTH — never a dead-end. `kind === 'command'`
+        // — an in-range Python exists in the distro's own archive — gets a
+        // pre-typed terminal button (host-composed, never guessed) beside
+        // the honest `agent.detail` explanation. Every other case
+        // (`'guidance'`, or no plan at all) shows the §6 guidance text +
+        // docs link instead — no terminal button, because there is no
+        // verified command to offer.
+        <div className="mt-1 flex flex-col gap-1.5">
+          {agent.pythonInstall?.kind === 'command' ? (
+            <>
+              {agent.detail && <p className="text-2xs text-muted">{agent.detail}</p>}
+              <ActionButton
+                label={`Open terminal: ${agent.pythonInstall.command}`}
+                onRun={() => dispatch('setup.openBootstrapTerminal', { target: 'python' })}
+                disabledReason={disabledReason}
+              />
+            </>
+          ) : (
+            <>
+              <p className="text-2xs text-muted">{agent.pythonInstall?.text ?? agent.detail ?? ''}</p>
+              <a
+                href={agent.pythonInstall?.docsUrl ?? selectedOption?.docsUrl ?? PYTHON_VERSION_HELP_URL}
+                className="text-2xs text-accent underline"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Python version help
+              </a>
+            </>
+          )}
+          <div>
+            <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
+          </div>
         </div>
       )}
       {agent.phase === 'awaiting-reload' && (
@@ -511,6 +574,7 @@ function ProviderCard({
   return (
     <Card title="Provider">
       <StatusLine icon={icon} text={text} tone={tone} />
+      <DoneLine text={providerDoneLine(provider.phase)} />
       {provider.phase === 'unconfigured' && (
         <div className="mt-2">
           <ActionButton
@@ -558,6 +622,7 @@ function FimCard({
 
   return (
     <Card title="Autocomplete (FIM)">
+      <DoneLine text={fimDoneLine(fim)} className="mb-2" />
       <div className="mb-2 flex flex-col gap-1.5">
         {fim.options.map((o) => (
           <BackendOptionRow
@@ -685,23 +750,53 @@ function FimInstallTab({
     return <OllamaInstallPanel option={option} setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />;
   }
 
+  // T10 (§2.6 ⑨⑩ / R-1b): llama.cpp/vLLM have no daemon-presence probe (no
+  // `/api/tags` equivalent `status()` can check), so — unlike Ollama's
+  // Re-check above — the honest affordance here is an ENDPOINT TEST, not a
+  // presence re-check. R-1b: vLLM's `docs-only` flavor has no verified
+  // install source at all (§5.2) — its terminal button is SUPPRESSED and
+  // the effort prose is replaced with vLLM-specific guidance; every other
+  // (`guided-terminal`) backend keeps its terminal button + effort prose
+  // AND gains the same §6 "has no install detection" line + Test button.
+  const isDocsOnly = option.localInstall?.flavor === 'docs-only';
+  const endpoint = fimInstallTestEndpoint(setup.fim.selectedId, option);
+
   return (
     <div className="flex flex-col gap-2 text-2xs text-muted">
-      <p>
-        {option.localInstall?.effort === 'manual-guided'
-          ? 'Manual install — needs your own build/hardware decisions.'
-          : 'Clean one-script install.'}
-      </p>
-      <ActionButton
-        label={`Open terminal: install ${option.displayName}`}
-        onRun={() => dispatch('setup.openInstallTerminal', { backendId: option.id })}
-        disabledReason={disabledReason}
-      />
+      {isDocsOnly ? (
+        <p>vLLM&apos;s install depends on your GPU/CUDA setup — follow the official guide, then test the connection.</p>
+      ) : (
+        <>
+          <p>
+            {option.localInstall?.effort === 'manual-guided'
+              ? 'Manual install — needs your own build/hardware decisions.'
+              : 'Clean one-script install.'}
+          </p>
+          <ActionButton
+            label={`Open terminal: install ${option.displayName}`}
+            onRun={() => dispatch('setup.openInstallTerminal', { backendId: option.id })}
+            disabledReason={disabledReason}
+          />
+        </>
+      )}
+
       {option.docsUrl && (
         <a href={option.docsUrl} className="text-accent underline" target="_blank" rel="noreferrer">
           Setup docs
         </a>
       )}
+
+      {!isDocsOnly && (
+        <p>{`${option.displayName} has no install detection — start your server, then test the connection.`}</p>
+      )}
+      <div>
+        <ActionButton
+          label={`Test connection (${endpoint})`}
+          onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })}
+          successLabel="✓ Endpoint reachable"
+        />
+      </div>
+
       <p>Once it&apos;s running, switch to the Connect tab and Test.</p>
     </div>
   );
@@ -805,6 +900,7 @@ function NextEditCard({
 
   return (
     <Card title="Next Edit (NEXT)">
+      <DoneLine text={nextDoneLine(next.source)} className="mb-2" />
       <p className="mb-2 text-2xs text-muted">
         Want NEXT (multi-line next-edit)? Two modes: <strong className="text-fg">Generic</strong> reuses your FIM
         model — onboarding already set it up, no extra setup. <strong className="text-fg">Dedicated</strong> uses a
@@ -956,6 +1052,7 @@ function RagCard({
 
   return (
     <Card title="Codebase index (RAG)">
+      <DoneLine text={ragDoneLine(rag)} className="mb-2" />
       {rag.preconditionDetail && (
         <div className="mb-2 rounded border border-warn bg-warn-soft px-2 py-1.5 text-2xs text-fg">
           {rag.preconditionDetail}
