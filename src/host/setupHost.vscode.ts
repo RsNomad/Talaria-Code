@@ -5,6 +5,7 @@ import type { ExecLookup } from './runtime/resolveHermes';
 import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
+import { verifyHfDigest } from './setup/hfDigest';
 import { probeRemote } from './setup/remoteProbe';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
 import type { AdvertisedAuthMethod, SetupHost, SetupControllerDeps } from './setup/SetupController';
@@ -226,6 +227,18 @@ export function createSetupControllerDeps(
     installHermes: (recipe, env, onEvent, signal) => installHermes(recipe, env, spawn, fileExists, onEvent, signal),
     probeOllama: (endpoint, timeoutMs) => probeOllama(endpoint, boundFetch, timeoutMs),
     pullModel: (endpoint, model, onProgress, signal) => pullModel(endpoint, model, boundFetch, onProgress, signal),
+    // T13 (beta.5 §4.4.3c): the HF-tree digest pre-flight over real fetch.
+    verifyHfDigest: (gguf) => verifyHfDigest(boundFetch, gguf),
+    // T13 → T14: the digest-enforced ingest ENGINE ships in T14
+    // (`src/host/setup/ggufIngest.ts` — stream-download + incremental
+    // SHA-256 + `/api/blobs/sha256:{pin}` + `/api/create`); T14 replaces
+    // this stub with the real binding. Until then the vetted branch fails
+    // AFTER all its refusal gates, honestly — and with the registry's
+    // sha256 pin still empty (§5.4), this line is unreachable in production
+    // (the gate refuses at §4.4.3a first). Fail-closed either way.
+    ingestGguf: async () => {
+      throw new Error('The verified download engine is not available yet.');
+    },
     probeRemote: (spec, endpoint, apiKey) => probeRemote(spec, endpoint, apiKey, boundFetch),
     registry: { AGENT_BACKENDS, FIM_BACKENDS, getBackend },
     // R5 (coexistence.lock.test.ts): reads through the Guard's OWN exported

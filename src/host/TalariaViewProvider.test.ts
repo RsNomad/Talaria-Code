@@ -1297,6 +1297,11 @@ function makeFakeSetupDeps(): SetupControllerDeps {
     // Task 13: routing tests never exercise the provider mapping — undefined
     // keeps the provider card honestly 'waiting-agent'.
     getAdvertisedAuthMethods: () => undefined,
+    // T13 (beta.5 §4.4): routing tests never reach the vetted-ingest branch.
+    verifyHfDigest: async () => ({ ok: false, reason: 'not used in routing tests' }),
+    ingestGguf: async () => {
+      throw new Error('not used in routing tests');
+    },
   };
 }
 

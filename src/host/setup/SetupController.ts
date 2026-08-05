@@ -1,5 +1,8 @@
 import { homedir } from 'node:os';
+import { NEXT_DEDICATED_MODEL } from './registry';
 import type { BackendDescriptor, InstallRecipe, ProbeSpec } from './registry';
+import type { HfDigestVerdict, HfGgufSpec } from './hfDigest';
+import { isLoopbackHost } from '../../autocomplete/backends/secureTransport';
 import { managerFor, parseOsRelease, resolveDistroFamily } from './osDetect';
 import type { DistroFamily, OsRelease, PackageManager } from './osDetect';
 import { installCommand, pythonInstallPlan } from './packageTable';
@@ -177,6 +180,24 @@ export interface SetupControllerRegistry {
   getBackend(id: string): BackendDescriptor | undefined;
 }
 
+/**
+ * T13 (beta.5 §4.4.3d): what the controller hands the T14 ingest engine —
+ * ALWAYS the registry-pinned artifact (`NEXT_DEDICATED_MODEL.gguf` +
+ * `ollamaCreatedName`), never anything webview-derived. The engine's own
+ * io/fs/fetch seams are bound in `setupHost.vscode.ts`, NOT passed here.
+ */
+export interface GgufIngestSpec {
+  gguf: {
+    hfRepo: string;
+    file: string;
+    quant: string;
+    sha256: string;
+    approxBytes: number;
+    allowedRepoFiles: readonly string[];
+  };
+  ollamaCreatedName: string;
+}
+
 export interface SetupControllerDeps {
   /** Bound to its real `ExecLookup` by the caller. Can REJECT — always try/catch this (T4 M-2).
    *  T11 (§3, critic C-11): optional `signal`, checked between `locatePipx`'s
@@ -239,6 +260,31 @@ export interface SetupControllerDeps {
    * reads that as `waiting-agent`; see {@link computeProviderCard}.
    */
   getAdvertisedAuthMethods(): AdvertisedAuthMethod[] | undefined;
+  /**
+   * T13 (beta.5 §4.4.3c): the HF-tree digest pre-flight — bound to the real
+   * `verifyHfDigest(fetch, gguf)` (`src/host/setup/hfDigest.ts`) by the
+   * caller. ANY `{ok:false}` (mismatch, missing lfs.oid, set mismatch, HTTP
+   * error, timeout) maps to the one pinned integrity refusal and aborts the
+   * download BEFORE the modal — the user is never asked to approve an
+   * artifact that already failed verification.
+   */
+  verifyHfDigest(gguf: HfGgufSpec): Promise<HfDigestVerdict>;
+  /**
+   * T13 → T14 (beta.5 §4.4.3d): the digest-enforced ingest engine —
+   * stream-download to a temp file hashing incrementally, refuse on byte
+   * mismatch BEFORE any Ollama call, then `POST /api/blobs/sha256:{pin}`
+   * (server re-verifies) + `POST /api/create`. Declared HERE (the interface
+   * T14's real engine must satisfy); `setupHost.vscode.ts` binds it. Rejects
+   * on any failure; an AbortError rejection = user cancel. `onProgress`
+   * rides the SAME `{op:'pull', id: ollamaCreatedName}` progress stream as
+   * a library pull — zero new UI plumbing.
+   */
+  ingestGguf(
+    spec: GgufIngestSpec,
+    endpoint: string,
+    onProgress: (p: PullProgress) => void,
+    signal: AbortSignal,
+  ): Promise<void>;
 }
 
 // --- misc constants -------------------------------------------------------
@@ -270,6 +316,63 @@ const PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE =
   "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
 const CONTAINER_NOTE =
   "Talaria can't tell which system your terminal acts on (VS Code appears to run in a sandbox/container) — run the install commands in a terminal on your host system, then re-check.";
+
+// --- T13 (beta.5 §4.4/§6): the verified NEXT download path — copy, verbatim --
+
+/** §6 "host-sourced pull refusal (rev 5)" — kills the S-F1 class outright. */
+const HOST_SOURCED_PULL_REFUSAL =
+  "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
+/** §6 "NEXT download unavailable (D3)" — the sha256 pin is still empty. */
+const NEXT_DOWNLOAD_UNAVAILABLE =
+  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+/** §6 "NEXT download remote-endpoint refusal (S-F3)" — ingest is loopback-only. */
+const NEXT_REMOTE_ENDPOINT_REFUSAL =
+  'Verified downloads only run against a local Ollama (loopback). For a remote server, download and verify the model on that machine — see the guided instructions.';
+/** §4.4.3c — ONE line for every integrity failure mode (no detail leaks what to forge). */
+const NEXT_INTEGRITY_REFUSAL = 'integrity check failed — refusing to download';
+/** §6 "NEXT warning (D4, card-level)" — host-composed, honest CPU caveat. */
+const NEXT_DEDICATED_WARNING =
+  'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.';
+/** §6 "Pull modal (D3, rev 5)" — every word of the strong claim is what the
+ *  engine actually does (Talaria hashes the downloaded bytes; Ollama
+ *  re-verifies at blob ingest). Composed from the registry pins so the modal
+ *  can never name a different artifact than the gate downloads. */
+const NEXT_PULL_MODAL_COPY =
+  `Download '${NEXT_DEDICATED_MODEL.displayName}' (~4.7 GB) and install it into your local Ollama? ` +
+  `Source: huggingface.co/${NEXT_DEDICATED_MODEL.gguf.hfRepo} — Syntinal's build converted from Sweep's official release. ` +
+  "Talaria verifies the file's checksum against its pinned value after downloading, and Ollama verifies it again during install.";
+
+/**
+ * T13 (beta.5 §4.4 "classify", rev 6 — the owner personally corrected the
+ * earlier dot-counting bug): HOST-SOURCED iff the model contains a `/` AND
+ * the substring before the FIRST `/` is host-like — contains a `.` OR a `:`
+ * (port) OR equals `localhost` case-insensitively. A model with NO `/` is
+ * ALWAYS a library name; dots in the name or tag are IRRELEVANT
+ * (`qwen2.5-coder:1.5b-base` / `qwen3-embedding:0.6b` = library;
+ * `ns/name:tag` = library; `hf.co/x`, `huggingface.co/x`,
+ * `registry.example.com/x`, `localhost:11434/x` = host-sourced). Callers
+ * normalize (trim) BEFORE classifying. Exported for the truth-table lock.
+ */
+export function isHostSourcedModel(model: string): boolean {
+  const slash = model.indexOf('/');
+  if (slash === -1) return false;
+  const head = model.slice(0, slash);
+  return head.includes('.') || head.includes(':') || head.toLowerCase() === 'localhost';
+}
+
+/**
+ * S4.3 parity (reused, not reinvented — `src/autocomplete/index.ts`): is the
+ * endpoint's host the loopback interface, per `secureTransport.ts`'s single
+ * source of truth. Malformed URLs fail CLOSED (non-loopback ⇒ refused) —
+ * though `validateEndpointUrl` runs first on this path, so none should reach here.
+ */
+function isLoopbackEndpoint(rawUrl: string): boolean {
+  try {
+    return isLoopbackHost(new URL(rawUrl).hostname);
+  } catch {
+    return false;
+  }
+}
 
 /** D9: which {@link SetupMethod}s are consequence-bearing mutations, gated
  *  on `host.isTrusted()` (FM-14). Everything else (`setup.status` — handled
@@ -454,6 +557,36 @@ export class SetupController {
     const nextModel = (this.host.getSetting<string>('talaria.nextEdit.model') ?? '').trim();
     const genericSupported = fimDescriptor.nextEditTransport !== undefined;
     const dedicatedConfigured = nextEndpoint !== '' && nextModel !== '';
+    // T13 (§4.2): capability + raw facts for the dedicated NEXT card —
+    // computed purely from the registry pins (no await; the CR-002
+    // synchronous tail below stays intact). `downloadReady` is driven by the
+    // sha256 pin and NOTHING else.
+    const downloadReady = (NEXT_DEDICATED_MODEL.gguf.sha256 as string) !== '';
+    const dedicated: NonNullable<SetupData['nextEdit']['dedicated']> = {
+      displayName: NEXT_DEDICATED_MODEL.displayName,
+      // ⚠ R-3: '' while !downloadReady — configuration is fail-closed, not
+      // just the download (see the protocol.ts field doc).
+      modelDefaults: {
+        ollama: downloadReady ? NEXT_DEDICATED_MODEL.ollamaCreatedName : '',
+        openaiCompat: NEXT_DEDICATED_MODEL.upstream.hfRepo,
+      },
+      downloadReady,
+      downloadApproxBytes: NEXT_DEDICATED_MODEL.gguf.approxBytes,
+      warning: NEXT_DEDICATED_WARNING,
+      guided: {
+        // §6 copy: command line + honesty note, newline-separated.
+        vllm: `Run: vllm serve ${NEXT_DEDICATED_MODEL.upstream.hfRepo}\n(official Sweep release, ~15 GB download)`,
+        // llamacpp ONLY when the pin is published (S-F2/S-F5): `-hf` verifies
+        // nothing itself, so the line ships WITH the manual sha256sum hint.
+        ...(downloadReady
+          ? {
+              llamacpp:
+                `Run: llama-server -hf ${NEXT_DEDICATED_MODEL.gguf.hfRepo}:${NEXT_DEDICATED_MODEL.gguf.quant} --port 8012` +
+                `\nVerify the download: sha256sum should print ${NEXT_DEDICATED_MODEL.gguf.sha256}`,
+            }
+          : {}),
+      },
+    };
 
     const ragEnabled = this.host.getSetting<boolean>('talaria.rag.enabled') ?? true;
     const ragEmbedEndpoint = (this.host.getSetting<string>('talaria.rag.embedEndpoint') ?? '').trim() || DEFAULT_OLLAMA_ENDPOINT;
@@ -506,6 +639,7 @@ export class SetupController {
               refusalDetail: `The selected FIM backend ('${fimDescriptor.displayName}') does not support Generic Next-Edit.`,
             }
           : {}),
+        dedicated,
       },
       rag: {
         enabled: ragEnabled,
@@ -516,9 +650,11 @@ export class SetupController {
         indexDir: ragIndexDir,
         ...(trusted ? {} : { preconditionDetail: 'The codebase index needs a trusted, open workspace.' }),
       },
+      // T13 (§4.2): `endpoint` = the endpoint this status() ACTUALLY probed
+      // — presence claims are scoped to it (critic C-6).
       ollama: ollamaStatus.running
-        ? { running: true, models: ollamaStatus.models }
-        : { running: false, models: [] },
+        ? { running: true, endpoint: ollamaEndpoint, models: ollamaStatus.models }
+        : { running: false, endpoint: ollamaEndpoint, models: [] },
       ready,
       os: {
         family: osInfo.family,
@@ -829,13 +965,38 @@ export class SetupController {
 
   // --- setup.pullModel ---------------------------------------------------------
 
+  /**
+   * T13 (beta.5 §4.4 — the ALLOWLIST pull gate, refusal order verbatim):
+   * normalize(trim) → classify (rev 6 predicate, {@link isHostSourcedModel})
+   * → (1) `validateEndpointUrl` (⚠ S-F3: this was the only URL-bearing
+   * handler skipping it) → (2) host-sourced? ALWAYS refused (rev 5: the
+   * automated `ollama pull hf.co/…` class is REMOVED, not gated — kills
+   * S-F1 outright, including the `huggingface.co` alias bypass) → (3) the
+   * registry-pinned `ollamaCreatedName` (case-insensitive)? the VETTED
+   * INGEST branch ({@link handleVettedIngest}) → (4) plain `name[:tag]` /
+   * `ns/name` = the pre-existing, ledger-documented library tier (§5.2),
+   * byte-identical to before.
+   */
   private async handlePullModel(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const model = str(params, 'model');
+    // normalize: trim BEFORE classification — ' hf.co/x' must not dodge the gate.
+    const model = str(params, 'model')?.trim();
     if (!model) return { ok: false, reason: 'model is required.' };
     const endpoint =
       str(params, 'endpoint')?.trim() ||
       this.deps.registry.getBackend('ollama')?.remote?.endpoint.defaultValue ||
       DEFAULT_OLLAMA_ENDPOINT;
+    // (1) endpoint validity — before anything else touches it.
+    const validated = validateEndpointUrl(endpoint);
+    if (!validated.ok) return { ok: false, reason: validated.reason };
+    // (2) host-sourced models: ALWAYS refused, no modal, no exceptions.
+    if (isHostSourcedModel(model)) {
+      return { ok: false, reason: HOST_SOURCED_PULL_REFUSAL };
+    }
+    // (3) the ONE vetted artifact installs through the digest-enforced ingest.
+    if (model.toLowerCase() === NEXT_DEDICATED_MODEL.ollamaCreatedName.toLowerCase()) {
+      return this.handleVettedIngest(validated.url);
+    }
+    // (4) plain library `name[:tag]` / `ns/name` — existing behavior, unchanged.
     const key = `pull:${model}`;
     if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
 
@@ -862,6 +1023,69 @@ export class SetupController {
           this.pushProgress({
             op: 'pull',
             id: model,
+            phase: p.status,
+            ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
+            ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
+          });
+        },
+        abort.signal,
+      );
+      return { ok: true };
+    } catch (err) {
+      if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
+      return { ok: false, reason: this.redact(errorMessage(err)) };
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+
+  /**
+   * T13 (beta.5 §4.4.3a-d): the vetted-ingest branch, refusal order EXACT —
+   * (a) unpublished pin → refuse; (b) non-loopback endpoint → refuse (the
+   * ingest engine downloads on THIS machine and uploads to the daemon; a
+   * remote daemon gets the guided/manual path); (c) HF-tree digest
+   * pre-flight → ANY failure refuses; (d) ONLY THEN the Tier-1 modal (§6
+   * verbatim) and, on confirm, the T14 engine. Every refusal lands BEFORE
+   * the modal — the user is never asked to approve something already known
+   * to be unavailable, remote, or unverified.
+   */
+  private async handleVettedIngest(endpoint: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const created = NEXT_DEDICATED_MODEL.ollamaCreatedName;
+    // (a) fail-closed until the out-of-band publication fills the pin (§5.4).
+    if (NEXT_DEDICATED_MODEL.gguf.sha256 === '') {
+      return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
+    }
+    // (b) loopback only — checked on the ALREADY-validated URL.
+    if (!isLoopbackEndpoint(endpoint)) {
+      return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
+    }
+    // Single-flight latch keyed by the CANONICAL created name (the webview's
+    // cancel/progress key), set before the first await — mirrors the library
+    // tier's latch-before-modal discipline; `finally` releases on every path.
+    const key = `pull:${created}`;
+    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
+    const abort = new AbortController();
+    this.inFlight.set(key, abort);
+    try {
+      // (c) integrity pre-flight — dep can also REJECT (a fetch binding
+      // throwing synchronously); that is the same refusal, never a crash.
+      let verdict: HfDigestVerdict;
+      try {
+        verdict = await this.deps.verifyHfDigest(NEXT_DEDICATED_MODEL.gguf);
+      } catch {
+        verdict = { ok: false, reason: 'verify seam rejected' };
+      }
+      if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+      // (d) Tier-1 modal (§6 verbatim) → the T14 ingest engine.
+      const confirmed = await this.host.showModal(NEXT_PULL_MODAL_COPY, 'Download');
+      if (!confirmed) return { ok: false, reason: 'declined' };
+      await this.deps.ingestGguf(
+        { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
+        endpoint,
+        (p) => {
+          this.pushProgress({
+            op: 'pull',
+            id: created,
             phase: p.status,
             ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
             ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),

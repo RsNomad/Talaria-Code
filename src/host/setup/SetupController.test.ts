@@ -4,10 +4,11 @@ import {
   TIER2_TUNABLE_KEYS,
   MUTATING_METHODS,
   READ_ONLY_METHODS,
+  isHostSourcedModel,
   type SetupHost,
   type SetupControllerDeps,
 } from './SetupController';
-import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './registry';
+import { AGENT_BACKENDS, FIM_BACKENDS, getBackend, NEXT_DEDICATED_MODEL } from './registry';
 import type { PipxLocateResult } from './pipxLocator';
 import type { HermesPaths } from './pipxInstaller';
 import type { OllamaStatus } from './ollamaClient';
@@ -165,6 +166,16 @@ function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: Set
     // Task 13: default = "no ACP initialize has surfaced auth methods yet"
     // (mock backend / before connect) → provider card 'waiting-agent'.
     getAdvertisedAuthMethods: () => undefined,
+    // T13 (beta.5 §4.4): the vetted-ingest seams. With the REAL registry's
+    // sha256 === '' the gate refuses at (a) — these defaults exist so the
+    // spies can prove they were NEVER reached from this file's tests.
+    verifyHfDigest: async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      calls.push('verifyHfDigest');
+      return { ok: true };
+    },
+    ingestGguf: async (): Promise<void> => {
+      calls.push('ingestGguf');
+    },
     // T5: default = a readable Fedora host — keeps every pre-T5 behavior
     // test (bootstrap-terminal `sudo dnf install pipx` et al.) valid while
     // per-family tests override with their own fixture.
@@ -1666,5 +1677,146 @@ describe('T7: onStatusChanged fires on confirmed-start, failure-write, success, 
     // listener set was actually cleared, not merely unreachable.
     await controller.handle('setup.recheck', {});
     expect(fires.length).toBe(0);
+  });
+});
+
+// --- T13 (beta.5 §4.4): allowlist pull gate — classification + refusal order --
+
+// §6 copy, verbatim (drift-locked).
+const HOST_SOURCED_REFUSAL_COPY =
+  "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
+const DOWNLOAD_UNAVAILABLE_COPY =
+  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+const NEXT_WARNING_COPY =
+  'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.';
+
+describe('T13 classification truth table (rev 6 — the `/`-required predicate)', () => {
+  // A model with NO '/' is ALWAYS a library name — dots in name/tag IRRELEVANT.
+  const LIBRARY = [
+    'qwen2.5-coder:1.5b-base', // the ACTUAL dotted FIM default
+    'qwen3-embedding:0.6b', // the ACTUAL dotted RAG default
+    'ns/name:tag', // namespaced, dotless first segment
+    NEXT_DEDICATED_MODEL.ollamaCreatedName, // no '/' at all — library-shaped by construction
+  ];
+  // HOST-SOURCED iff '/' present AND pre-first-'/' segment is host-like
+  // ('.' OR ':' OR equals 'localhost' case-insensitively).
+  const HOST_SOURCED = [
+    'hf.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M',
+    'huggingface.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF', // the alias (§0.3) — same fate
+    'registry.example.com/foo',
+    'localhost:11434/foo',
+    'LOCALHOST/foo', // case variant of the bare-localhost rule
+    'HF.CO/SyntinalCo/x', // case variant — '.' detection is case-blind anyway
+    NEXT_DEDICATED_MODEL.ollamaPullAlias, // the pinned manual alias itself
+  ];
+
+  for (const model of LIBRARY) {
+    it(`LIBRARY: '${model}'`, () => {
+      expect(isHostSourcedModel(model)).toBe(false);
+    });
+  }
+  for (const model of HOST_SOURCED) {
+    it(`HOST-SOURCED: '${model}'`, () => {
+      expect(isHostSourcedModel(model)).toBe(true);
+    });
+  }
+});
+
+describe('T13 refusal ORDER (real registry — sha256 empty, fail-closed)', () => {
+  it('(1) invalid endpoint refused FIRST — before modal, pull, verify, ingest', async () => {
+    const { host, depCalls, controller } = makeController();
+    const result = await controller.handle('setup.pullModel', {
+      model: 'qwen2.5-coder:1.5b-base',
+      endpoint: 'not-a-url',
+    });
+    expect(result).toEqual({ ok: false, reason: 'Enter a valid http:// or https:// URL.' });
+    expect(host.calls).toEqual([]); // no modal
+    expect(depCalls).toEqual([]); // no pullModel / verifyHfDigest / ingestGguf
+  });
+
+  it('(1) beats (2): bad endpoint + host-sourced model → the URL refusal, not the host-sourced copy', async () => {
+    const { controller } = makeController();
+    const result = await controller.handle('setup.pullModel', {
+      model: 'hf.co/SyntinalCo/x',
+      endpoint: 'not-a-url',
+    });
+    expect(result).toEqual({ ok: false, reason: 'Enter a valid http:// or https:// URL.' });
+  });
+
+  const HOST_SOURCED_VARIANTS = [
+    'hf.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M',
+    'huggingface.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M',
+    'registry.example.com/foo:latest',
+    'localhost:11434/foo',
+    'HF.co/SyntinalCo/x:q4_k_m',
+    '  hf.co/SyntinalCo/x', // leading whitespace — normalize(trim) happens BEFORE classify
+    NEXT_DEDICATED_MODEL.ollamaPullAlias,
+  ];
+  for (const model of HOST_SOURCED_VARIANTS) {
+    it(`(2) host-sourced '${model}' → ALWAYS refused with the §6 copy, before modal/pull/ingest`, async () => {
+      const { host, depCalls, controller } = makeController();
+      const result = await controller.handle('setup.pullModel', { model });
+      expect(result).toEqual({ ok: false, reason: HOST_SOURCED_REFUSAL_COPY });
+      expect(host.calls).toEqual([]);
+      expect(depCalls).toEqual([]);
+    });
+  }
+
+  it('(3a) vetted name with empty sha256 → download-unavailable copy; verify/modal/ingest never reached', async () => {
+    const { host, depCalls, controller } = makeController();
+    const result = await controller.handle('setup.pullModel', {
+      model: NEXT_DEDICATED_MODEL.ollamaCreatedName,
+    });
+    expect(result).toEqual({ ok: false, reason: DOWNLOAD_UNAVAILABLE_COPY });
+    expect(host.calls).toEqual([]);
+    expect(depCalls).toEqual([]);
+  });
+
+  it('(3) vetted-name match is case-insensitive (uppercase variant hits the same (3a) refusal, not the library tier)', async () => {
+    const { host, depCalls, controller } = makeController();
+    const result = await controller.handle('setup.pullModel', {
+      model: NEXT_DEDICATED_MODEL.ollamaCreatedName.toUpperCase(),
+    });
+    expect(result).toEqual({ ok: false, reason: DOWNLOAD_UNAVAILABLE_COPY });
+    expect(host.calls).toEqual([]); // in particular: NOT the library pull modal
+    expect(depCalls).toEqual([]);
+  });
+
+  it('(4) DOTTED library name pulls normally — byte-identical regression (modal copy + deps.pullModel, never ingest)', async () => {
+    const { host, depCalls, controller } = makeController();
+    const result = await controller.handle('setup.pullModel', { model: 'qwen2.5-coder:1.5b-base' });
+    expect(result).toEqual({ ok: true });
+    expect(host.calls).toEqual([
+      "showModal:Pull model 'qwen2.5-coder:1.5b-base' from the Ollama registry to your local disk?",
+    ]);
+    expect(depCalls).toEqual(['pullModel']);
+  });
+});
+
+describe('T13 presence wire (§4.2 — status() facts, real registry sha256=empty)', () => {
+  it('ollama.endpoint carries the endpoint status() actually probed (registry default)', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.ollama.endpoint).toBe('http://127.0.0.1:11434');
+  });
+
+  it('nextEdit.dedicated: fail-closed block — downloadReady=false, R-3 empty ollama prefill, no llamacpp guided line', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.nextEdit.dedicated).toEqual({
+      displayName: 'Sweep Next-Edit v2 (7B)',
+      // ⚠ R-3: '' WHILE !downloadReady — an unpullable prefill would persist
+      // a model that resolves to nothing. openaiCompat (official safetensors)
+      // is unaffected.
+      modelDefaults: { ollama: '', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+      downloadReady: false, // sha256 === '' and NOTHING else drives this
+      downloadApproxBytes: 4_680_000_000,
+      warning: NEXT_WARNING_COPY,
+      guided: {
+        vllm: 'Run: vllm serve sweepai/sweep-next-edit-v2-7B\n(official Sweep release, ~15 GB download)',
+        // llamacpp ABSENT while !downloadReady (S-F2: the -hf line is gated
+        // by the same pin as the Download button).
+      },
+    });
   });
 });

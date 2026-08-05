@@ -723,6 +723,40 @@ export interface SetupData {
     /** Whether the current FIM backend supports the `generic` (reuse) source. */
     genericSupported: boolean;
     refusalDetail?: string;
+    /**
+     * beta.5 §4.2 (T13): the dedicated NEXT model block — host-composed
+     * capability + raw facts; the webview DERIVES presence client-side
+     * against its live form state (critics C-6/S-F11). OPTIONAL + additive
+     * (Global Constraint 6) — the host always populates it since beta.5.
+     */
+    dedicated?: {
+      displayName: string;
+      /**
+       * Per-backend prefill (D1). ⚠ R-3: `ollama` is `''` while
+       * `!downloadReady` — a prefill naming a model that resolves to
+       * nothing would let Apply persist silent runtime next-edit failure;
+       * the empty model instead trips `setup.setNextEdit`'s existing
+       * "model is required" refusal (configuration fail-closed, not just
+       * the download). When `downloadReady`, it is the ingest-created
+       * local name (`ollamaCreatedName`).
+       */
+      modelDefaults: { ollama: string; openaiCompat: string };
+      /**
+       * Capability flag ONLY: the code-pinned sha256 is published
+       * (non-empty). The UI additionally requires picked-backend===ollama
+       * and a reachable daemon before showing the Download button.
+       */
+      downloadReady: boolean;
+      downloadApproxBytes: number;
+      /** D4 copy, host-composed (§6), rendered at CARD level (C-14). */
+      warning: string;
+      /**
+       * Guided command lines (§6, newline-separated command + note).
+       * `llamacpp` present ONLY when `downloadReady` — the `-hf` line is
+       * gated by the same pin as the Download button (S-F2/S-F5).
+       */
+      guided: { vllm: string; llamacpp?: string };
+    };
   };
   /** Card 5 — codebase index (RAG). */
   rag: {
@@ -735,8 +769,14 @@ export interface SetupData {
     /** `shouldActivateRag` text, populated when RAG is blocked from activating. */
     preconditionDetail?: string;
   };
-  /** Local Ollama daemon status, read by the FIM/NEXT local-install tabs. */
-  ollama: { running: boolean; version?: string; models: { name: string; sizeBytes: number }[] };
+  /**
+   * Local Ollama daemon status, read by the FIM/NEXT local-install tabs.
+   * `endpoint` (beta.5 §4.2, T13): the endpoint `status()` ACTUALLY probed —
+   * presence claims are scoped to it; the webview must treat any OTHER
+   * endpoint's presence as `'unknown'`, never inherited (critic C-6).
+   * OPTIONAL + additive (Global Constraint 6) — always populated since beta.5.
+   */
+  ollama: { running: boolean; version?: string; endpoint?: string; models: { name: string; sizeBytes: number }[] };
   /** Composite "you're ready" banner: agent ready + provider configured + FIM probe OK. */
   ready: boolean;
   /**
