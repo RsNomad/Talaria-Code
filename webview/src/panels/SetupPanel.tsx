@@ -21,7 +21,7 @@
  * `!trusted` disables every mutating control via `mutationDisabledReason`
  * (setupCards.ts) — same reason text everywhere, never color alone.
  */
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import type {
   NextEditToggleSource,
   NextEditToggleState,
@@ -33,7 +33,7 @@ import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
 import { Toggle } from '../components/Toggle';
-import { errorMessage } from '../state/panels';
+import { DECLINED, errorMessage } from '../state/panels';
 import type { RemoteData } from '../state/remoteData';
 import { type NextEditRowCopy, NEXT_EDIT_ROWS } from './nextEditCopy';
 import { PanelShell, RemotePanel, SectionLabel } from './PanelShell';
@@ -177,6 +177,18 @@ function StatusLine({ icon, text, tone }: { icon: string; text: string; tone: To
  * `disabledReason`, when given, is a GENUINE indefinite disablement (the
  * trust gate) and renders NATIVE `disabled` + `aria-disabled` + a `title`
  * tooltip naming why (§6's accessibility rule).
+ *
+ * T9 (§2.4 B4 — "Test (and friends) speak on success"): `successLabel`,
+ * when given, is announced through the SAME always-mounted `LiveRegion`
+ * (polite) on a resolve, in `text-add`, and auto-clears after 4s (the timer
+ * is armed only while `success` is true and is cleaned up on every path out
+ * — a fresh success re-arms it, an unmount clears it — mirroring
+ * `ApprovalCard.tsx`'s local-expiry timer; no leaked timer, no
+ * set-state-after-unmount). No `successLabel` ⇒ today's behavior (nothing).
+ * A resolved value === {@link DECLINED} (the user dismissed a native
+ * confirmation modal, T2/§2.2.4) renders NEITHER success nor failure — the
+ * C-2 lock — regardless of whether `successLabel` was given. A rejection
+ * always renders the `✗ ${message}` failure line.
  */
 function ActionButton({
   label,
@@ -184,23 +196,37 @@ function ActionButton({
   disabledReason,
   tone = 'neutral',
   icon,
+  successLabel,
 }: {
   label: string;
   onRun: () => Promise<unknown>;
   disabledReason?: string;
   tone?: Tone;
   icon?: string;
+  successLabel?: string;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [success, setSuccess] = useState(false);
   const genuinelyDisabled = disabledReason !== undefined;
+
+  useEffect(() => {
+    if (!success) return;
+    const timer = setTimeout(() => setSuccess(false), 4000);
+    return () => clearTimeout(timer);
+  }, [success]);
 
   const onClick = () => {
     if (genuinelyDisabled || pending) return;
     setPending(true);
     setError(undefined);
+    setSuccess(false);
     void onRun().then(
-      () => setPending(false),
+      (result: unknown) => {
+        setPending(false);
+        if (result === DECLINED) return; // C-2 lock: neither success nor failure
+        if (successLabel !== undefined) setSuccess(true);
+      },
       (err: unknown) => {
         setPending(false);
         setError(errorMessage(err));
@@ -214,6 +240,9 @@ function ActionButton({
       : tone === 'warn'
         ? 'border-warn text-warn hover:bg-warn-soft'
         : 'border-border text-muted hover:bg-overlay';
+
+  const liveText = error ? `✗ ${error}` : success && successLabel !== undefined ? successLabel : '';
+  const liveClass = error ? 'text-2xs text-del' : 'text-2xs text-add';
 
   return (
     <div className="flex flex-col items-start gap-1">
@@ -229,7 +258,7 @@ function ActionButton({
         {icon && <Icon name={icon} size={12} spin={pending} />}
         {pending ? 'Working…' : label}
       </button>
-      <LiveRegion text={error ? `Failed: ${error}` : ''} className="text-2xs text-del" title={error} />
+      <LiveRegion text={liveText} className={liveClass} title={error} />
     </div>
   );
 }
@@ -609,6 +638,7 @@ function FimConnectTab({
             label={option.remote?.apiKeySet ? 'Change key' : 'Set API key…'}
             onRun={() => dispatch('setup.setApiKey')}
             disabledReason={disabledReason}
+            successLabel="✓ Key stored"
           />
           {option.remote?.apiKeySet && (
             <ActionButton
@@ -621,12 +651,17 @@ function FimConnectTab({
       )}
 
       <div className="flex gap-2">
-        <ActionButton label="Test" onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })} />
+        <ActionButton
+          label="Test"
+          onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })}
+          successLabel="✓ Endpoint reachable"
+        />
         <ActionButton
           label="Apply"
           onRun={() => dispatch('setup.applyFim', { backendId: option.id, endpoint })}
           disabledReason={disabledReason}
           tone="accent"
+          successLabel="✓ Applied"
         />
       </div>
     </div>
@@ -882,6 +917,7 @@ function DedicatedNextForm({
             <ActionButton
               label="Test"
               onRun={() => dispatch('setup.testRemote', { backendId: selected?.id, endpoint })}
+              successLabel="✓ Endpoint reachable"
             />
             <ActionButton
               label="Apply"
@@ -894,6 +930,7 @@ function DedicatedNextForm({
               }
               disabledReason={disabledReason}
               tone="accent"
+              successLabel="✓ Saved"
             />
           </div>
         </>

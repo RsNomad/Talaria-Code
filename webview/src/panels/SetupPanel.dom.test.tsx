@@ -9,12 +9,13 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { ReactElement } from 'react';
-import { render, screen, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupMethod } from '../protocol';
 import { NEXT_EDIT_ROWS } from './nextEditCopy';
 import { SetupPanel } from './SetupPanel';
 import { agentPhaseLabel, PYTHON_VERSION_HELP_URL, TRUST_DISABLED_REASON } from './setupCards';
+import { DECLINED } from '../state/panels';
 import { must } from '../testing/must';
 
 function setup(jsx: ReactElement) {
@@ -552,5 +553,160 @@ describe('RemoteData gate — loading/error render honestly (Part X2 convention)
     expect(screen.getByText('host unreachable')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /Retry/ }));
     expect(onRetry).toHaveBeenCalled();
+  });
+});
+
+/*
+ * T9 (§2.4 B4 — "Test (and friends) speak on success"): `ActionButton` gains
+ * `successLabel?: string`. These tests exercise the mechanism through real
+ * production call sites (never a bespoke test-only ActionButton instance) —
+ * the FIM Connect tab's [Test]/[Apply] (both get a successLabel) and its
+ * [Clear key] (deliberately does NOT, §2.4's "no successLabel ⇒ today's
+ * behavior" clause).
+ */
+describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () => {
+  function fimSetupData(): SetupData {
+    return baseData({ fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' } });
+  }
+
+  it('resolve + successLabel: announces "✓ Endpoint reachable", auto-clears after 4s, and leaves no timer on unmount (fake timers)', async () => {
+    vi.useFakeTimers();
+    try {
+      const dispatch = vi.fn().mockResolvedValue({ ok: true });
+      const { unmount } = render(
+        <SetupPanel
+          data={{ status: 'success', data: fimSetupData() }}
+          onRetry={noopRetry}
+          progress={{}}
+          nextEdit={{ next: false, generic: true }}
+          onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+          dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+        />,
+      );
+      const button = screen.getByRole('button', { name: 'Test' });
+
+      await act(async () => {
+        button.click();
+        // Let the already-resolved `dispatch` promise's `.then` callback run
+        // (and any React state-update microtask it schedules) before we assert.
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getByText('✓ Endpoint reachable')).toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      expect(screen.queryByText('✓ Endpoint reachable')).not.toBeInTheDocument();
+
+      unmount();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reject: renders the ✗-prefixed failure line, not the success label', async () => {
+    const dispatch = vi.fn().mockRejectedValue(new Error('endpoint unreachable'));
+    const { user } = setup(
+      <SetupPanel
+        data={{ status: 'success', data: fimSetupData() }}
+        onRetry={noopRetry}
+        progress={{}}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Apply' }));
+    expect(await screen.findByText('✗ endpoint unreachable')).toBeInTheDocument();
+    expect(screen.queryByText('✓ Applied')).not.toBeInTheDocument();
+  });
+
+  it('focus stays on the button after a successful resolve (no remount, no layout-shifting swap)', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const { user } = setup(
+      <SetupPanel
+        data={{ status: 'success', data: fimSetupData() }}
+        onRetry={noopRetry}
+        progress={{}}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />,
+    );
+    const button = screen.getByRole('button', { name: 'Test' });
+    await user.click(button);
+    expect(await screen.findByText('✓ Endpoint reachable')).toBeInTheDocument();
+    expect(document.activeElement).toBe(button);
+  });
+
+  it('resolve with the DECLINED sentinel renders NEITHER success nor failure (the C-2 lock)', async () => {
+    const dispatch = vi.fn().mockResolvedValue(DECLINED);
+    const { user } = setup(
+      <SetupPanel
+        data={{ status: 'success', data: fimSetupData() }}
+        onRetry={noopRetry}
+        progress={{}}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />,
+    );
+    const button = screen.getByRole('button', { name: 'Apply' });
+    await user.click(button);
+
+    // Back to idle (not stuck on "Working…") once the resolution settles.
+    await waitFor(() => expect(button).toHaveTextContent('Apply'));
+    expect(screen.queryByText('✓ Applied')).not.toBeInTheDocument();
+    expect(screen.queryByText(/^✗/)).not.toBeInTheDocument();
+  });
+
+  it('no successLabel ⇒ resolve announces nothing (Clear key deliberately carries none)', async () => {
+    const dispatch = vi.fn().mockResolvedValue(undefined);
+    const withKey = codestralOption({ remote: { ...must(codestralOption().remote), apiKeySet: true } });
+    const data = baseData({ fim: { ...baseData().fim, options: [withKey], selectedId: 'codestral' } });
+    const { user } = setup(
+      <SetupPanel
+        data={{ status: 'success', data }}
+        onRetry={noopRetry}
+        progress={{}}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />,
+    );
+    const button = screen.getByRole('button', { name: 'Clear key' });
+    await user.click(button);
+
+    await waitFor(() => expect(button).toHaveTextContent('Clear key'));
+    expect(screen.queryByText(/^✓/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^✗/)).not.toBeInTheDocument();
+  });
+
+  it('pending is unaffected by the success mechanism: shows "Working…" and announces nothing while in flight', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(
+      <SetupPanel
+        data={{ status: 'success', data: fimSetupData() }}
+        onRetry={noopRetry}
+        progress={{}}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />,
+    );
+    const button = screen.getByRole('button', { name: 'Test' });
+    await user.click(button);
+
+    expect(screen.getByRole('button', { name: 'Working…' })).toBeInTheDocument();
+    expect(screen.queryByText('✓ Endpoint reachable')).not.toBeInTheDocument();
+    expect(screen.queryByText(/^✗/)).not.toBeInTheDocument();
+
+    // Settle so no unresolved promise / act warning leaks into later tests.
+    resolveDispatch({ ok: true });
+    await screen.findByText('✓ Endpoint reachable');
   });
 });
