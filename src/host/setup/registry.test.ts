@@ -8,6 +8,8 @@ import {
   FIM_BACKENDS,
   getBackend,
   HERMES_PIN,
+  NEXT_DEDICATED_MODEL,
+  SYNTINAL_HF_OWNER,
   type BackendDescriptor,
   type InstallRecipe,
 } from './registry';
@@ -330,5 +332,73 @@ describe('registry (k): the deleted vLLM pip-install recipe string is gone from 
     const bannedWords = ['pip', 'install', 'vllm'];
     const banned = new RegExp(bannedWords.join(' '));
     expect(scanLines(files, banned)).toEqual([]);
+  });
+});
+
+/**
+ * (l) — T12 (beta5-setup-hardening-architecture.md §4.1): the Dedicated NEXT
+ * (Sweep) model registry data. Fail-closed by design: `gguf.sha256` is the
+ * EMPTY-STRING placeholder until the out-of-band GGUF publication lands —
+ * that is intentional, not a defect, and this suite must never demand a
+ * non-empty value. These are drift-locks, not behavior tests: the registry
+ * stays pure data (zero imports — see (h) above, which already scans this
+ * file's directory and would catch a stray import here too).
+ */
+describe('registry (l): NEXT_DEDICATED_MODEL — Dedicated NEXT registry data (T12, §4.1)', () => {
+  it('SYNTINAL_HF_OWNER is the owner-confirmed namespace', () => {
+    expect(SYNTINAL_HF_OWNER).toBe('SyntinalCo');
+  });
+
+  it('matches the §4.1 object exactly (whole-shape drift-lock)', () => {
+    expect(NEXT_DEDICATED_MODEL).toEqual({
+      displayName: 'Sweep Next-Edit v2 (7B)',
+      upstream: {
+        hfRepo: 'sweepai/sweep-next-edit-v2-7B',
+        format: 'safetensors',
+        license: 'Apache-2.0',
+        contextLength: 32768,
+      },
+      gguf: {
+        hfRepo: 'SyntinalCo/sweep-next-edit-v2-7B-GGUF',
+        file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf',
+        quant: 'Q4_K_M',
+        sha256: '',
+        approxBytes: 4_680_000_000,
+        allowedRepoFiles: ['sweep-next-edit-v2-7B-Q4_K_M.gguf', 'README.md', '.gitattributes'],
+      },
+      ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+      ollamaPullAlias: 'hf.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M',
+      vram: { fullGiB: 15, q4GiB: 5 },
+    });
+  });
+
+  it('every derived id starts with the owner constant (critic S-F2)', () => {
+    expect(NEXT_DEDICATED_MODEL.gguf.hfRepo.startsWith(`${SYNTINAL_HF_OWNER}/`)).toBe(true);
+  });
+
+  it('ollamaPullAlias is computed-equal to hf.co/{gguf.hfRepo}:{gguf.quant}', () => {
+    expect(NEXT_DEDICATED_MODEL.ollamaPullAlias).toBe(
+      `hf.co/${NEXT_DEDICATED_MODEL.gguf.hfRepo}:${NEXT_DEDICATED_MODEL.gguf.quant}`,
+    );
+  });
+
+  it('ollamaCreatedName is host-free because it contains NO "/" at all (rev 6 §4.4 predicate)', () => {
+    expect(NEXT_DEDICATED_MODEL.ollamaCreatedName.includes('/')).toBe(false);
+  });
+
+  it('allowedRepoFiles contains exactly the gguf file + README.md + .gitattributes', () => {
+    expect(NEXT_DEDICATED_MODEL.gguf.allowedRepoFiles).toEqual([
+      NEXT_DEDICATED_MODEL.gguf.file,
+      'README.md',
+      '.gitattributes',
+    ]);
+  });
+
+  it('sha256 is the empty-string fail-closed placeholder OR a 64-hex digest (publication-compatible)', () => {
+    expect(NEXT_DEDICATED_MODEL.gguf.sha256).toMatch(/^$|^[0-9a-f]{64}$/i);
+  });
+
+  it('sha256 is currently EMPTY — the intentional fail-closed placeholder (NOT a defect; do not fill it here)', () => {
+    expect(NEXT_DEDICATED_MODEL.gguf.sha256).toBe('');
   });
 });

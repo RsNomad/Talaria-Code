@@ -314,3 +314,41 @@ export function getBackend(id: string): BackendDescriptor | undefined {
     AGENT_BACKENDS.find((d) => d.id === id) ?? FIM_BACKENDS.find((d) => d.id === id)
   );
 }
+
+// §4 Block D — Dedicated NEXT parity (beta5-setup-hardening-architecture.md §4.1).
+
+/** ⚠ ONE owner constant — the out-of-band publication uploads to the SAME string; T12 locks every
+ *  derived id to it (critic S-F2). Namespace owner-confirmed (rev 3). */
+export const SYNTINAL_HF_OWNER = 'SyntinalCo';
+
+export const NEXT_DEDICATED_MODEL = {
+  displayName: 'Sweep Next-Edit v2 (7B)',
+  upstream: {
+    hfRepo: 'sweepai/sweep-next-edit-v2-7B', // verified official org (§0.3)
+    format: 'safetensors',
+    license: 'Apache-2.0',
+    contextLength: 32768,
+  },
+  /** OUR artifact, converted from the verified upstream (§5.4). sha256 EMPTY ⇒ every automated
+   *  download surface AND the guided llama.cpp line are DISABLED (fail-closed). */
+  gguf: {
+    hfRepo: `${SYNTINAL_HF_OWNER}/sweep-next-edit-v2-7B-GGUF`,
+    file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf',
+    quant: 'Q4_K_M',
+    sha256: '', // filled by the out-of-band publication (§5.4)
+    approxBytes: 4_680_000_000,
+    /** ⚠ The ONLY files the published repo may contain (critic S-F4): Ollama also ingests
+     *  `template`/`system`/`params` from a pulled repo — the tree check refuses anything unexpected. */
+    allowedRepoFiles: ['sweep-next-edit-v2-7B-Q4_K_M.gguf', 'README.md', '.gitattributes'],
+  },
+  /** rev 5 (Q3): the LOCAL model name our digest-enforced ingest CREATES (`/api/create`) — a plain
+   *  Ollama name, host-free BECAUSE IT CONTAINS NO `/` (rev 6: that, not dot-counting, is the
+   *  library-side of the §4.4 predicate); this is what `talaria.nextEdit.model` gets Applied to
+   *  and what the Download button targets. */
+  ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+  /** What a MANUAL `ollama pull hf.co/…` would name the same artifact — recognized by the presence
+   *  check (a user who pulled by hand is not told "not present"), but NEVER used by any automated
+   *  path (rev 5: no automated `pull` of host-sourced models exists at all). */
+  ollamaPullAlias: `hf.co/${SYNTINAL_HF_OWNER}/sweep-next-edit-v2-7B-GGUF:Q4_K_M`,
+  vram: { fullGiB: 15, q4GiB: 5 },
+} as const;
