@@ -1,11 +1,17 @@
 import * as vscode from 'vscode';
 import { execFile, spawn as nodeSpawn } from 'node:child_process';
 import { access, readFile } from 'node:fs/promises';
+import { createWriteStream, createReadStream } from 'node:fs';
+import { unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
 import type { ExecLookup } from './runtime/resolveHermes';
 import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
 import { verifyHfDigest } from './setup/hfDigest';
+import { ingestGguf, type GgufIngestIo, type TempWriteHandle } from './setup/ggufIngest';
 import { probeRemote } from './setup/remoteProbe';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
 import type { AdvertisedAuthMethod, SetupHost, SetupControllerDeps } from './setup/SetupController';
@@ -131,6 +137,62 @@ export function createNodeFileExists(): FileExists {
   };
 }
 
+// --- GgufIngestIo (T14 §4.4.3d: the real temp-file seams for ggufIngest.ts) --
+
+/**
+ * The `GgufIngestIo` binding — real `node:fs`/`node:os`/`node:crypto`-backed
+ * temp file, `fetchImpl` = `boundFetch` (declared below, shared with every
+ * other `SetupControllerDeps` network binding). `ggufIngest.ts` itself stays
+ * disk/socket-free (T14's own module doc); every touch happens here.
+ *
+ * One temp file per {@link createTempWrite} call, named with a `randomUUID`
+ * suffix under `os.tmpdir()` so concurrent installs (impossible today — the
+ * controller's single-flight latch precedes this, `handleVettedIngest`)
+ * could never collide even if that ever changed. `openTempRead` hands back
+ * an `fs.ReadStream` directly: it already satisfies `AsyncIterable<Uint8Array>`
+ * via Node's native `Readable` async iteration, matching the async-iterable
+ * `BodyInit` shape undici documents (see `ggufIngest.ts`'s own doc comment
+ * on {@link GgufIngestIo.openTempRead} for the citation) — no `stream/web`
+ * conversion needed.
+ */
+function createNodeGgufIngestIo(): GgufIngestIo {
+  return {
+    fetchImpl: boundFetch,
+    createTempWrite: async (): Promise<TempWriteHandle> => {
+      const path = joinPath(tmpdir(), `talaria-gguf-${randomUUID()}.tmp`);
+      const stream = createWriteStream(path);
+      await new Promise<void>((resolve, reject) => {
+        stream.once('open', () => resolve());
+        stream.once('error', reject);
+      });
+      return {
+        path,
+        write: (chunk) =>
+          new Promise<void>((resolve, reject) => {
+            stream.write(chunk, (err) => (err ? reject(err) : resolve()));
+          }),
+        close: () =>
+          new Promise<void>((resolve, reject) => {
+            stream.end((err?: Error | null) => (err ? reject(err) : resolve()));
+          }),
+      };
+    },
+    // Never rejects: a temp file already gone (e.g. the write handle never
+    // reached open, or a caller mistakenly double-removes) is exactly the
+    // post-condition `removeTemp` promises — "the temp file is gone" — so
+    // ENOENT (and any other unlink failure) is swallowed, matching
+    // `ingestGguf`'s own single unconditional `finally`-cleanup call site.
+    removeTemp: async (path: string): Promise<void> => {
+      try {
+        await unlink(path);
+      } catch {
+        // Already gone — nothing to clean up.
+      }
+    },
+    openTempRead: async (path: string): Promise<AsyncIterable<Uint8Array>> => createReadStream(path),
+  };
+}
+
 // --- readOsRelease (T5 §1.2 — the container-boundary-aware os-release read) --
 
 /**
@@ -215,6 +277,7 @@ export function createSetupControllerDeps(
   const exec = createExecLookup();
   const spawn = createNodeSpawnFn();
   const fileExists = createNodeFileExists();
+  const ggufIo = createNodeGgufIngestIo();
   return {
     // T11 (§3, critic C-11): thread the caller's abort signal through so
     // `handleInstall`'s Cancel can actually reach a wedged login-shell probe
@@ -229,16 +292,12 @@ export function createSetupControllerDeps(
     pullModel: (endpoint, model, onProgress, signal) => pullModel(endpoint, model, boundFetch, onProgress, signal),
     // T13 (beta.5 §4.4.3c): the HF-tree digest pre-flight over real fetch.
     verifyHfDigest: (gguf) => verifyHfDigest(boundFetch, gguf),
-    // T13 → T14: the digest-enforced ingest ENGINE ships in T14
-    // (`src/host/setup/ggufIngest.ts` — stream-download + incremental
-    // SHA-256 + `/api/blobs/sha256:{pin}` + `/api/create`); T14 replaces
-    // this stub with the real binding. Until then the vetted branch fails
-    // AFTER all its refusal gates, honestly — and with the registry's
-    // sha256 pin still empty (§5.4), this line is unreachable in production
-    // (the gate refuses at §4.4.3a first). Fail-closed either way.
-    ingestGguf: async () => {
-      throw new Error('The verified download engine is not available yet.');
-    },
+    // T14 (beta.5 §4.4.3d): the digest-enforced ingest ENGINE
+    // (`src/host/setup/ggufIngest.ts`) bound to the real temp-file/fetch
+    // seams (`ggufIo`, above). With the registry's sha256 pin still empty
+    // (§5.4) `handleVettedIngest` refuses at §4.4.3a before this is ever
+    // reached in production — fail-closed either way.
+    ingestGguf: (spec, endpoint, onProgress, signal) => ingestGguf(ggufIo, spec, endpoint, onProgress, signal),
     probeRemote: (spec, endpoint, apiKey) => probeRemote(spec, endpoint, apiKey, boundFetch),
     registry: { AGENT_BACKENDS, FIM_BACKENDS, getBackend },
     // R5 (coexistence.lock.test.ts): reads through the Guard's OWN exported
