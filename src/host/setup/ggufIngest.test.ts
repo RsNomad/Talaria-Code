@@ -188,6 +188,25 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
     expect(destroySpy).toHaveBeenCalledTimes(1);
   });
 
+  it('normalizes an UPPERCASE registry sha256 pin to lowercase — digest compare, blob URL, and create body all use the lowercase pin (final-fixwave Fix 1)', async () => {
+    const { io, removeTemp } = fakeIo();
+    const upperPin = PIN.toUpperCase();
+    expect(upperPin).not.toBe(PIN); // sanity: PIN carries letters, so this really differs
+    const upperSpec: GgufIngestSpec = { ...SPEC, gguf: { ...SPEC.gguf, sha256: upperPin } };
+    const { fetchImpl, calls } = routedFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await ingestGguf(io, upperSpec, ENDPOINT, () => {}, new AbortController().signal);
+
+    const blobCall = calls.find((c) => c.url.includes('/api/blobs/'));
+    expect(blobCall?.url).toBe(`${ENDPOINT}/api/blobs/sha256:${PIN}`); // lowercase, never the uppercase pin verbatim
+    const createCall = calls.find((c) => c.url.includes('/api/create'));
+    expect(createCall?.init?.body).toBe(
+      JSON.stringify({ model: upperSpec.ollamaCreatedName, files: { [GGUF_FILE]: `sha256:${PIN}` } }),
+    );
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
   it('a byte-mismatch download refuses BEFORE any Ollama call and removes the temp file', async () => {
     const { io, removeTemp, closeSpy } = fakeIo();
     const wrongBytes = new TextEncoder().encode('these are NOT the pinned bytes');

@@ -106,7 +106,12 @@ describe('packageTable: installCommand — verbatim command locks (§0.2/§1.1 t
 // ---------------------------------------------------------------------------
 
 describe('packageTable: security posture — no auto-confirm flags, no add-apt-repository, anywhere', () => {
-  const AUTO_CONFIRM_OR_PPA = /(^|\s)-y(\s|$)|--noconfirm|add-apt-repository/;
+  // final-fixwave Fix 5: broadened beyond the original `-y`/`--noconfirm`/
+  // `add-apt-repository` trio to also catch `--yes`, `--assume-yes`,
+  // `-y`-prefixed short-flag bundles (e.g. `-yq`), `DEBIAN_FRONTEND`
+  // (non-interactive env-var override), and `--noninteractive`.
+  const AUTO_CONFIRM_OR_PPA =
+    /(^|\s)-y[a-zA-Z]*(\s|$)|--yes\b|--assume-yes\b|--noconfirm|--noninteractive|DEBIAN_FRONTEND|add-apt-repository/;
 
   function allInstallCommandStrings(): string[] {
     const families: DistroFamily[] = ['fedora', 'debian', 'arch', 'suse', 'unknown'];
@@ -141,14 +146,14 @@ describe('packageTable: security posture — no auto-confirm flags, no add-apt-r
     return out;
   }
 
-  it('no composed installCommand string contains -y, --noconfirm, or add-apt-repository', () => {
+  it('no composed installCommand string contains any auto-confirm/non-interactive/PPA flag (broadened set)', () => {
     for (const command of allInstallCommandStrings()) {
       expect(command, command).not.toMatch(AUTO_CONFIRM_OR_PPA);
     }
     expect(allInstallCommandStrings().length).toBeGreaterThan(0); // non-vacuous
   });
 
-  it('no composed pythonInstallPlan command string contains -y, --noconfirm, or add-apt-repository', () => {
+  it('no composed pythonInstallPlan command string contains any auto-confirm/non-interactive/PPA flag (broadened set)', () => {
     for (const command of allPythonPlanCommandStrings()) {
       expect(command, command).not.toMatch(AUTO_CONFIRM_OR_PPA);
     }
@@ -158,6 +163,20 @@ describe('packageTable: security posture — no auto-confirm flags, no add-apt-r
   it('pacman commands keep --needed (idempotence, not auto-confirm)', () => {
     expect(installCommand('arch', 'pipx')?.command).toContain('--needed');
     expect(installCommand('arch', 'llamacpp')?.command).toContain('--needed');
+  });
+
+  it('the pattern itself catches --yes, --assume-yes, -y-prefixed short-flag bundles, DEBIAN_FRONTEND, and --noninteractive (final-fixwave Fix 5 — synthetic proof of the broadened guard)', () => {
+    const shouldReject = [
+      'apt-get install -y foo',
+      'apt-get install --yes foo',
+      'apt-get install --assume-yes foo',
+      'apt-get install -yq foo',
+      'DEBIAN_FRONTEND=noninteractive apt-get install foo',
+      'apt-get install --noninteractive foo',
+    ];
+    for (const command of shouldReject) {
+      expect(command, command).toMatch(AUTO_CONFIRM_OR_PPA);
+    }
   });
 });
 

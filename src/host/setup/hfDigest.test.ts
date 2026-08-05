@@ -129,6 +129,13 @@ describe('verifyHfDigest', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('normalizes an UPPERCASE pin to lowercase before comparing to lfs.oid (final-fixwave Fix 1 — a mis-cased publication pin still verifies)', async () => {
+    const upperGguf = { ...GGUF, sha256: PIN.toUpperCase() };
+    expect(upperGguf.sha256).not.toBe(PIN); // sanity: this really is a different string
+    const result = await verifyHfDigest(fetchReturning(goodTree()), upperGguf);
+    expect(result).toEqual({ ok: true });
+  });
+
   it('aborts (and refuses) when the tree API hangs past 10 s', async () => {
     vi.useFakeTimers();
     try {

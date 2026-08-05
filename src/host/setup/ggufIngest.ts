@@ -135,11 +135,16 @@ export async function ingestGguf(
   signal: AbortSignal,
 ): Promise<void> {
   throwIfAborted(signal);
+  // final-fixwave Fix 1: normalize the registry pin to lowercase at point of
+  // use — `hash.digest('hex')` (below) is already lowercase, so the only
+  // case-mismatch risk is a manually-pasted, mis-cased `spec.gguf.sha256`.
+  // `'' → ''` is unchanged (empty-pin fail-closed behavior is untouched).
+  const pin = spec.gguf.sha256.toLowerCase();
   const handle = await io.createTempWrite();
   try {
     const digest = await downloadToTemp(io, handle, spec, onProgress, signal);
-    if (digest !== spec.gguf.sha256) {
-      throw new GgufDigestMismatchError(spec.gguf.sha256, digest);
+    if (digest !== pin) {
+      throw new GgufDigestMismatchError(pin, digest);
     }
     await putBlob(io, handle, spec, endpoint, signal);
     await createModel(io, spec, endpoint, signal);
@@ -224,9 +229,10 @@ async function putBlob(
   signal: AbortSignal,
 ): Promise<void> {
   throwIfAborted(signal);
+  const pin = spec.gguf.sha256.toLowerCase(); // final-fixwave Fix 1 — see ingestGguf's own comment.
   const body = await io.openTempRead(handle.path);
   try {
-    const url = joinUrl(endpoint, `api/blobs/sha256:${spec.gguf.sha256}`);
+    const url = joinUrl(endpoint, `api/blobs/sha256:${pin}`);
     const response = await io.fetchImpl(url, { method: 'POST', body, duplex: 'half', signal });
     if (!response.ok) {
       throw new Error(`Ollama blob upload failed: ${response.status} ${response.statusText}`);
@@ -247,13 +253,14 @@ async function putBlob(
  *  present-until-`finally`) temp file. */
 async function createModel(io: GgufIngestIo, spec: GgufIngestSpec, endpoint: string, signal: AbortSignal): Promise<void> {
   throwIfAborted(signal);
+  const pin = spec.gguf.sha256.toLowerCase(); // final-fixwave Fix 1 — see ingestGguf's own comment.
   const url = joinUrl(endpoint, 'api/create');
   const response = await io.fetchImpl(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: spec.ollamaCreatedName,
-      files: { [spec.gguf.file]: `sha256:${spec.gguf.sha256}` },
+      files: { [spec.gguf.file]: `sha256:${pin}` },
     }),
     signal,
   });

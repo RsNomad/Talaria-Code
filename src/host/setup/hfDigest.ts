@@ -42,6 +42,12 @@ export type HfDigestVerdict = { ok: true } | { ok: false; reason: string };
 const TREE_TIMEOUT_MS = 10_000;
 
 export async function verifyHfDigest(fetchImpl: typeof fetch, gguf: HfGgufSpec): Promise<HfDigestVerdict> {
+  // final-fixwave Fix 1: normalize the pin to lowercase at point of use — HF's
+  // `lfs.oid` is always lowercase hex, but the code-pinned `gguf.sha256` is a
+  // manually-pasted string; an UPPERCASE/mixed-case paste must still verify
+  // rather than silently refusing every download. `'' → ''` is unchanged, so
+  // the empty-pin fail-closed behavior below is untouched.
+  const pin = gguf.sha256.toLowerCase();
   const url = `https://huggingface.co/api/models/${gguf.hfRepo}/tree/main?recursive=true`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TREE_TIMEOUT_MS);
@@ -100,7 +106,7 @@ export async function verifyHfDigest(fetchImpl: typeof fetch, gguf: HfGgufSpec):
   if (ggufLfsOid === undefined) {
     return { ok: false, reason: 'gguf entry carries no lfs.oid (non-LFS entry — git-SHA1 oid is never consulted)' };
   }
-  if (ggufLfsOid !== gguf.sha256) {
+  if (ggufLfsOid !== pin) {
     return { ok: false, reason: 'gguf lfs.oid does not match the pinned sha256' };
   }
   return { ok: true };

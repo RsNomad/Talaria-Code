@@ -975,7 +975,23 @@ describe('NEXT card — llama.cpp guided line (§4.3 point 5, S-F5 digest-verify
     expect(within(nextCard).getByText(/Verify the download: sha256sum should print/)).toBeInTheDocument();
   });
 
-  it('copy-to-clipboard copies the command fragment only (not the caption)', async () => {
+  it('the truncated guided-command span carries a title attribute with the full command, for hover reveal (final-fixwave Fix 4)', async () => {
+    const data = baseData({
+      fim: {
+        ...baseData().fim,
+        options: [ollamaOption(), llamacppOption({ nextEditTransport: 'openai-compat' })],
+        selectedId: 'llamacpp',
+      },
+    });
+    const { user } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    const commandLine = 'Run: llama-server -hf SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M --port 8012';
+    expect(within(nextCard).getByText(commandLine)).toHaveAttribute('title', commandLine);
+  });
+
+  it('copy-to-clipboard copies the command fragment only (not the caption), stripped of the "Run: " display caption (final-fixwave Fix 3)', async () => {
     const data = baseData({
       fim: {
         ...baseData().fim,
@@ -988,8 +1004,11 @@ describe('NEXT card — llama.cpp guided line (§4.3 point 5, S-F5 digest-verify
     await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
     const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
     await user.click(within(nextCard).getByRole('button', { name: 'vLLM' }));
+    // The displayed line still carries the "Run: " caption — only the
+    // CLIPBOARD payload is stripped, so the pasted shell line is runnable.
+    expect(within(nextCard).getByText('Run: vllm serve sweepai/sweep-next-edit-v2-7B')).toBeInTheDocument();
     await user.click(within(nextCard).getByRole('button', { name: 'Copy' }));
-    expect(writeText).toHaveBeenCalledWith('Run: vllm serve sweepai/sweep-next-edit-v2-7B');
+    expect(writeText).toHaveBeenCalledWith('vllm serve sweepai/sweep-next-edit-v2-7B');
   });
 });
 

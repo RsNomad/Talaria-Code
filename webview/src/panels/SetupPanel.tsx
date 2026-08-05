@@ -1112,8 +1112,14 @@ function DedicatedNextForm({
           {guided && (
             <div className="flex flex-col gap-1 rounded border border-border bg-surface px-2 py-1.5 text-2xs">
               <div className="flex items-center justify-between gap-2">
-                <span className="min-w-0 flex-1 truncate font-mono text-fg">{guided.command}</span>
-                <ActionButton label="Copy" icon="copy" onRun={() => navigator.clipboard.writeText(guided.command)} />
+                <span className="min-w-0 flex-1 truncate font-mono text-fg" title={guided.command}>
+                  {guided.command}
+                </span>
+                <ActionButton
+                  label="Copy"
+                  icon="copy"
+                  onRun={() => navigator.clipboard.writeText(guided.command.replace(/^Run:\s*/, ''))}
+                />
               </div>
               {guided.caption && <span className="text-faint">{guided.caption}</span>}
             </div>

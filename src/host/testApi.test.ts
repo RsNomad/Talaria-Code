@@ -85,4 +85,23 @@ describe('createTestApi', () => {
     dispose();
     expect(emitter.disposeCallCount).toBe(1);
   });
+
+  // final-fixwave Fix 6 (#5): getSetupData() unit coverage — the CI-only
+  // method had zero direct test coverage before this wave.
+  it('getSetupData() throws a diagnosable error when createTestApi was not given a getStatus seam (fail-loud unwired path)', () => {
+    const { api } = createTestApi(() => ({ dispose() {} }));
+    // Not `async`: the implementation throws synchronously (before ever
+    // returning a Promise), so the call itself must be wrapped for `toThrow`
+    // to observe it — `.rejects` would not see this.
+    expect(() => api.getSetupData()).toThrow(/getStatus/);
+  });
+
+  it('getSetupData() resolves whatever the injected getStatus() seam returns', async () => {
+    const snapshot = { backend: 'ollama', trusted: true };
+    const { api } = createTestApi(
+      () => ({ dispose() {} }),
+      async () => snapshot,
+    );
+    await expect(api.getSetupData()).resolves.toBe(snapshot);
+  });
 });

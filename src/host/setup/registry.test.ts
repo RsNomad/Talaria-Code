@@ -394,11 +394,46 @@ describe('registry (l): NEXT_DEDICATED_MODEL — Dedicated NEXT registry data (T
     ]);
   });
 
-  it('sha256 is the empty-string fail-closed placeholder OR a 64-hex digest (publication-compatible)', () => {
-    expect(NEXT_DEDICATED_MODEL.gguf.sha256).toMatch(/^$|^[0-9a-f]{64}$/i);
+  it('sha256 is the empty-string fail-closed placeholder OR a LOWERCASE 64-hex digest (publication-compatible) — no `i` flag: an uppercase pin must FAIL this pattern', () => {
+    // ⚠ Deliberately lowercase-only, no `i` flag: the shipped
+    // NEXT_DEDICATED_MODEL.gguf.sha256 pin is compared raw against
+    // Ollama's lowercase blob digests (hfDigest.ts/ggufIngest.ts). An
+    // UPPERCASE or mixed-case paste here would still satisfy a
+    // case-insensitive pattern, flip `downloadReady` true, and then
+    // silently fail every digest compare downstream — this pattern is the
+    // CI-time guard against exactly that mis-paste (final-fixwave Fix 1).
+    expect(NEXT_DEDICATED_MODEL.gguf.sha256).toMatch(/^$|^[0-9a-f]{64}$/);
+  });
+
+  it('an UPPERCASE 64-hex value is REJECTED by the pin-format pattern (proves the guard catches a mis-cased pin)', () => {
+    const uppercasePin = 'A'.repeat(64);
+    expect(uppercasePin).not.toMatch(/^$|^[0-9a-f]{64}$/);
+    // Sanity: the same fixture WOULD have passed the old case-insensitive
+    // pattern — this is exactly the gap Fix 1 closes.
+    expect(uppercasePin).toMatch(/^$|^[0-9a-f]{64}$/i);
   });
 
   it('sha256 is currently EMPTY — the intentional fail-closed placeholder (NOT a defect; do not fill it here)', () => {
     expect(NEXT_DEDICATED_MODEL.gguf.sha256).toBe('');
+  });
+});
+
+/**
+ * (m) — final-fixwave Fix 2 (#12): `registry.ts` is now cross-imported into
+ * the webview bundle (`webview/src/panels/setupCards.ts`), so its "zero
+ * imports of ANY kind" header comment is load-bearing, not decorative — a
+ * future stray `node:`/host import here would break the webview build. (h)
+ * above only bans `vscode` imports across the whole directory; this scan is
+ * narrower (registry.ts's own source only) and broader (ANY import/require,
+ * not just `vscode`).
+ */
+describe('registry (m): zero imports of ANY kind — registry.ts stays pure data (#12, webview cross-import lock)', () => {
+  it('registry.ts source has no `import` statement and no `require(...)` call', () => {
+    const source = readFileSync(join(__dirname, 'registry.ts'), 'utf-8');
+    const lines = source.split('\n');
+    const importLines = lines.filter((line) => /^\s*import\b/.test(line));
+    const requireLines = lines.filter((line) => line.includes('require('));
+    expect(importLines, `unexpected import statement(s):\n${importLines.join('\n')}`).toEqual([]);
+    expect(requireLines, `unexpected require(...) call(s):\n${requireLines.join('\n')}`).toEqual([]);
   });
 });
