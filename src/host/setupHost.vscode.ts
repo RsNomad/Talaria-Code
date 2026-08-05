@@ -11,7 +11,7 @@ import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
 import { verifyHfDigest } from './setup/hfDigest';
-import { ingestGguf, type GgufIngestIo, type TempWriteHandle } from './setup/ggufIngest';
+import { ingestGguf, type GgufIngestIo, type TempWriteHandle, type TempReadStream } from './setup/ggufIngest';
 import { probeRemote } from './setup/remoteProbe';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
 import type { AdvertisedAuthMethod, SetupHost, SetupControllerDeps } from './setup/SetupController';
@@ -171,10 +171,32 @@ function createNodeGgufIngestIo(): GgufIngestIo {
           new Promise<void>((resolve, reject) => {
             stream.write(chunk, (err) => (err ? reject(err) : resolve()));
           }),
+        // Finding 1 (IMPORTANT, T14 review): `stream.end(callback)`'s
+        // callback fires on the WEAKER 'finish' event ("all data has been
+        // flushed to the underlying system" — Node stream docs), NOT
+        // 'close' ("the stream and any of its underlying resources — a
+        // file descriptor, for example — have been closed"). Resolving on
+        // 'finish' alone raced ahead of the fd actually closing, so
+        // `ingestGguf`'s `removeTemp` unlink could run before the fd was
+        // released — on POSIX, an unlinked-but-still-open file's disk
+        // blocks aren't reclaimed until the fd closes, i.e. leaking disk
+        // space for the process lifetime on every cancel/error. `destroy()`
+        // (not `end()`) is safe here and needs no graceful flush: every
+        // `write()` above is individually awaited to its OWN fs-level
+        // completion callback before the caller ever calls `close()`
+        // (`ggufIngest.ts`'s `downloadToTemp` never has a write in flight
+        // when it closes), so there is nothing buffered left to lose.
+        // Idempotent: a stream already destroyed (e.g. a prior write error
+        // auto-closed it, `autoClose` defaults true) resolves immediately
+        // instead of waiting on a 'close' that already fired before this
+        // listener attached.
         close: () =>
-          new Promise<void>((resolve, reject) => {
-            stream.end((err?: Error | null) => (err ? reject(err) : resolve()));
-          }),
+          stream.destroyed
+            ? Promise.resolve()
+            : new Promise<void>((resolve) => {
+                stream.once('close', () => resolve());
+                stream.destroy();
+              }),
       };
     },
     // Never rejects: a temp file already gone (e.g. the write handle never
@@ -189,7 +211,12 @@ function createNodeGgufIngestIo(): GgufIngestIo {
         // Already gone — nothing to clean up.
       }
     },
-    openTempRead: async (path: string): Promise<AsyncIterable<Uint8Array>> => createReadStream(path),
+    // Finding 2 (MINOR, T14 review): `fs.ReadStream` already exposes a real
+    // `destroy()` (inherited from `stream.Readable`) satisfying
+    // `TempReadStream`'s optional `destroy` — `putBlob` calls it
+    // unconditionally in a `finally` so this fd is released on every exit
+    // from the blob-POST step too, not just when the body drains fully.
+    openTempRead: async (path: string): Promise<TempReadStream> => createReadStream(path),
   };
 }
 

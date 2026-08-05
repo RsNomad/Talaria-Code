@@ -39,12 +39,21 @@ const SPEC: GgufIngestSpec = {
 function fakeIo(): {
   io: GgufIngestIo;
   removeTemp: ReturnType<typeof vi.fn>;
+  closeSpy: ReturnType<typeof vi.fn>;
+  destroySpy: ReturnType<typeof vi.fn>;
   tempStore: Map<string, Uint8Array[]>;
 } {
   const tempStore = new Map<string, Uint8Array[]>();
   const removeTemp = vi.fn(async (path: string) => {
     tempStore.delete(path);
   });
+  // Findings 1/2 (T14 review): spies that prove the write handle's `close`
+  // and the read handle's `destroy` are actually invoked on every exit path
+  // — not just the normal-completion one. A single shared spy per `fakeIo()`
+  // call is safe because every test here calls `ingestGguf` (and therefore
+  // `createTempWrite`/`openTempRead`) exactly once.
+  const closeSpy = vi.fn(async () => {});
+  const destroySpy = vi.fn();
   let counter = 0;
   const io: GgufIngestIo = {
     fetchImpl: vi.fn() as unknown as typeof fetch,
@@ -56,18 +65,20 @@ function fakeIo(): {
         write: async (chunk: Uint8Array) => {
           tempStore.get(path)!.push(chunk);
         },
-        close: async () => {},
+        close: closeSpy,
       };
     },
     removeTemp,
-    openTempRead: async (path: string): Promise<AsyncIterable<Uint8Array>> => {
+    openTempRead: async (path: string): Promise<AsyncIterable<Uint8Array> & { destroy?(): void }> => {
       const chunks = tempStore.get(path) ?? [];
-      return (async function* () {
+      const gen = (async function* () {
         for (const c of chunks) yield c;
-      })();
+      })() as AsyncGenerator<Uint8Array> & { destroy?(): void };
+      gen.destroy = destroySpy;
+      return gen;
     },
   };
-  return { io, removeTemp, tempStore };
+  return { io, removeTemp, closeSpy, destroySpy, tempStore };
 }
 
 // --- fetch response fakes ---------------------------------------------------
@@ -151,7 +162,7 @@ function routedFetch(handlers: {
 
 describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
   it('happy path: downloads the registry-pinned spec, and the blob POST URL + create body both carry sha256:{pin} verbatim', async () => {
-    const { io, removeTemp } = fakeIo();
+    const { io, removeTemp, closeSpy, destroySpy } = fakeIo();
     const { fetchImpl, calls } = routedFetch({ download: () => downloadResponse([CONTENT]) });
     io.fetchImpl = fetchImpl;
 
@@ -171,10 +182,14 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
 
     // Temp file removed on the SUCCESS path too.
     expect(removeTemp).toHaveBeenCalledTimes(1);
+    // Finding 1: the write handle's fd is released on success too.
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    // Finding 2: the blob-upload read stream is destroyed after a successful POST too.
+    expect(destroySpy).toHaveBeenCalledTimes(1);
   });
 
   it('a byte-mismatch download refuses BEFORE any Ollama call and removes the temp file', async () => {
-    const { io, removeTemp } = fakeIo();
+    const { io, removeTemp, closeSpy } = fakeIo();
     const wrongBytes = new TextEncoder().encode('these are NOT the pinned bytes');
     const { fetchImpl, calls } = routedFetch({ download: () => downloadResponse([wrongBytes]) });
     io.fetchImpl = fetchImpl;
@@ -183,10 +198,13 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
 
     expect(calls.some((c) => c.url.includes('/api/blobs/') || c.url.includes('/api/create'))).toBe(false);
     expect(removeTemp).toHaveBeenCalledTimes(1);
+    // Finding 1: the download itself completed normally before the digest
+    // compare, so the write handle must already be closed.
+    expect(closeSpy).toHaveBeenCalledTimes(1);
   });
 
   it('a non-2xx blob response refuses, removes the temp file, and never calls /api/create', async () => {
-    const { io, removeTemp } = fakeIo();
+    const { io, removeTemp, closeSpy, destroySpy } = fakeIo();
     const { fetchImpl, calls } = routedFetch({
       download: () => downloadResponse([CONTENT]),
       blob: () => plainResponse(500, 'Internal Server Error'),
@@ -197,10 +215,13 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
 
     expect(calls.some((c) => c.url.includes('/api/create'))).toBe(false);
     expect(removeTemp).toHaveBeenCalledTimes(1);
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    // Finding 2: the blob-upload read stream is destroyed on a non-2xx blob response.
+    expect(destroySpy).toHaveBeenCalledTimes(1);
   });
 
   it('a non-2xx create response refuses and removes the temp file', async () => {
-    const { io, removeTemp } = fakeIo();
+    const { io, removeTemp, closeSpy, destroySpy } = fakeIo();
     const { fetchImpl } = routedFetch({
       download: () => downloadResponse([CONTENT]),
       create: () => plainResponse(400, 'Bad Request'),
@@ -209,10 +230,13 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
 
     await expect(ingestGguf(io, SPEC, ENDPOINT, () => {}, new AbortController().signal)).rejects.toThrow(/400/);
     expect(removeTemp).toHaveBeenCalledTimes(1);
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    // The blob POST succeeded before /api/create failed — its read stream must still be destroyed.
+    expect(destroySpy).toHaveBeenCalledTimes(1);
   });
 
   it('a non-2xx HF download response refuses and removes the temp file, without calling the endpoint at all', async () => {
-    const { io, removeTemp } = fakeIo();
+    const { io, removeTemp, closeSpy } = fakeIo();
     const { fetchImpl, calls } = routedFetch({ download: () => downloadResponse([], { ok: false, status: 404, statusText: 'Not Found' }) });
     io.fetchImpl = fetchImpl;
 
@@ -220,10 +244,13 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
 
     expect(calls.some((c) => c.url.includes('/api/blobs/') || c.url.includes('/api/create'))).toBe(false);
     expect(removeTemp).toHaveBeenCalledTimes(1);
+    // Finding 1 (IMPORTANT): the HTTP-error throw happens BEFORE the old
+    // unconditional `handle.close()` call site — pre-fix this is a fd leak.
+    expect(closeSpy).toHaveBeenCalledTimes(1);
   });
 
   it('aborting mid-download rejects with an AbortError and removes the temp file', async () => {
-    const { io, removeTemp } = fakeIo();
+    const { io, removeTemp, closeSpy } = fakeIo();
     const { reader } = controllableReader();
     io.fetchImpl = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
@@ -247,6 +274,63 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
 
     await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
     expect(removeTemp).toHaveBeenCalledTimes(1);
+    // Finding 1 (IMPORTANT): abort throws from inside the download loop,
+    // BEFORE the old unconditional `handle.close()` call site — pre-fix
+    // this leaks the write-stream fd (and the disk blocks behind it) for
+    // the lifetime of the extension host.
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborting mid-blob-upload destroys the read stream and rejects with AbortError (Finding 2)', async () => {
+    const { io, removeTemp, closeSpy, destroySpy } = fakeIo();
+    const controller = new AbortController();
+    io.fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = String(input);
+      if (url.startsWith('https://huggingface.co/')) return downloadResponse([CONTENT]);
+      if (url.includes('/api/blobs/')) {
+        // Never resolves on its own — mirrors how a real in-flight fetch
+        // reacts to the caller's AbortController#abort() firing mid-POST.
+        return new Promise<Response>((_resolve, reject) => {
+          const sig = init?.signal ?? controller.signal;
+          sig.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')), { once: true });
+        });
+      }
+      throw new Error(`unrouted fetch: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const promise = ingestGguf(io, SPEC, ENDPOINT, () => {}, controller.signal);
+    // Let the download complete and the blob POST start (both are
+    // microtask-only — no real I/O — so a single macrotask tick suffices).
+    await flushMicrotasks();
+    controller.abort();
+
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+    // Finding 2 (MINOR): the read stream to the full ~4.7 GB temp must be
+    // destroyed on an abort mid-blob-POST, not left open until process exit.
+    expect(destroySpy).toHaveBeenCalledTimes(1);
+    // The download phase itself completed normally before the abort landed.
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects once the download exceeds the size ceiling (approxBytes*1.1), aborts, and calls zero endpoints (Finding 3)', async () => {
+    const { io, removeTemp, closeSpy } = fakeIo();
+    // approxBytes=100 -> ceiling = ceil(100*1.1) = 110 bytes. The fake
+    // Content-Length LIES (says 50, well under the ceiling) to prove the
+    // ceiling is derived from the pinned `approxBytes`, never a trusted
+    // response header — a hostile responder controls Content-Length too.
+    const smallSpec: GgufIngestSpec = { ...SPEC, gguf: { ...SPEC.gguf, approxBytes: 100 } };
+    const oversizedChunk = new Uint8Array(200).fill(7);
+    const { fetchImpl, calls } = routedFetch({
+      download: () => downloadResponse([oversizedChunk], { contentLength: 50 }),
+    });
+    io.fetchImpl = fetchImpl;
+
+    await expect(ingestGguf(io, smallSpec, ENDPOINT, () => {}, new AbortController().signal)).rejects.toThrow(/size/i);
+
+    expect(calls.some((c) => c.url.includes('/api/blobs/') || c.url.includes('/api/create'))).toBe(false);
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+    expect(closeSpy).toHaveBeenCalledTimes(1);
   });
 
   it('forwards progress events with monotonically increasing completedBytes across download chunks', async () => {

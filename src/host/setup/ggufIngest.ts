@@ -49,12 +49,26 @@ import type { PullProgress } from './ollamaClient';
  *  returns a fresh one per {@link ingestGguf} call. `path` is opaque to this
  *  module (only ever handed back to `removeTemp`/`openTempRead` verbatim);
  *  `write` appends bytes in call order; `close` flushes and releases the
- *  underlying handle. */
+ *  underlying handle. `close` MUST be safe to call exactly once and MUST be
+ *  idempotent-safe from the caller's side (`downloadToTemp` always wraps it
+ *  in `.catch(() => {})`) — it is invoked from a `finally` on EVERY exit
+ *  from the download phase (success, HTTP-error, digest irrelevant here,
+ *  or abort), so the underlying fd (and the disk blocks behind an unlinked-
+ *  but-still-open partial file, POSIX) is never held past that point. */
 export interface TempWriteHandle {
   readonly path: string;
   write(chunk: Uint8Array): Promise<void>;
   close(): Promise<void>;
 }
+
+/** A temp-file read stream, as handed back by {@link GgufIngestIo.openTempRead}.
+ *  Plain `AsyncIterable<Uint8Array>` is all `putBlob` NEEDS to hand to
+ *  `fetchImpl`'s `BodyInit` (see the doc comment below), but Finding 2 (T14
+ *  review) requires the fd behind it to be released on every exit from the
+ *  blob-POST step — so the real binding's stream (`fs.ReadStream`, which
+ *  already has `.destroy()`) is allowed to expose that optional method, and
+ *  `putBlob` calls it unconditionally in a `finally`. */
+export type TempReadStream = AsyncIterable<Uint8Array> & { destroy?(): void };
 
 /**
  * Injected seams — `setupHost.vscode.ts` binds `fetchImpl` to
@@ -73,7 +87,7 @@ export interface GgufIngestIo {
   fetchImpl: typeof fetch;
   createTempWrite(): Promise<TempWriteHandle>;
   removeTemp(path: string): Promise<void>;
-  openTempRead(path: string): Promise<AsyncIterable<Uint8Array>>;
+  openTempRead(path: string): Promise<TempReadStream>;
 }
 
 /** Thrown when the incrementally-hashed downloaded bytes do not equal the
@@ -85,6 +99,32 @@ export class GgufDigestMismatchError extends Error {
     super(`downloaded GGUF digest mismatch (expected sha256:${expected}, got sha256:${actual}) — refusing to ingest`);
     this.name = 'GgufDigestMismatchError';
   }
+}
+
+/** Finding 3 (T14 review, defense-in-depth): the digest is only checked
+ *  AFTER the full stream drains, so a hostile responder (compromised HF
+ *  account / swapped artifact — exactly the threat the pin defends
+ *  against) could otherwise stream unbounded bytes to disk before the
+ *  mismatch is ever caught. Thrown by {@link downloadToTemp} once
+ *  `completedBytes` exceeds {@link sizeCeilingBytes}'s margin over the
+ *  code-pinned `approxBytes` — deliberately NEVER derived from a
+ *  response's `Content-Length` header, which the same hostile responder
+ *  also controls. */
+export class GgufSizeExceededError extends Error {
+  constructor(limitBytes: number, completedBytes: number) {
+    super(
+      `downloaded GGUF exceeded the size ceiling (${completedBytes} bytes > ${limitBytes} byte limit) — refusing to ingest`,
+    );
+    this.name = 'GgufSizeExceededError';
+  }
+}
+
+/** The hard download-size ceiling, computed from the code-pinned
+ *  `approxBytes` — NEVER from a response header. A 10% margin absorbs
+ *  legitimate rounding between the registry's pinned estimate and the
+ *  artifact's actual byte count without meaningfully weakening the cap. */
+function sizeCeilingBytes(approxBytes: number): number {
+  return Math.ceil(approxBytes * 1.1);
 }
 
 export async function ingestGguf(
@@ -123,34 +163,53 @@ async function downloadToTemp(
   signal: AbortSignal,
 ): Promise<string> {
   throwIfAborted(signal);
-  const url = `https://huggingface.co/${spec.gguf.hfRepo}/resolve/main/${spec.gguf.file}`;
-  const response = await io.fetchImpl(url, { signal });
-  if (!response.ok || !response.body) {
-    throw new Error(`GGUF download failed: ${response.status} ${response.statusText}`);
-  }
-
-  const totalBytes = parseContentLength(response) ?? spec.gguf.approxBytes;
-  const hash = createHash('sha256');
-  const reader = response.body.getReader();
-  let completedBytes = 0;
   try {
-    for (;;) {
-      const { value, done } = await readWithAbort(reader, signal);
-      if (done) break;
-      hash.update(value);
-      await handle.write(value);
-      completedBytes += value.byteLength;
-      onProgress({ status: 'downloading', totalBytes, completedBytes });
+    const url = `https://huggingface.co/${spec.gguf.hfRepo}/resolve/main/${spec.gguf.file}`;
+    const response = await io.fetchImpl(url, { signal });
+    if (!response.ok || !response.body) {
+      throw new Error(`GGUF download failed: ${response.status} ${response.statusText}`);
     }
+
+    const totalBytes = parseContentLength(response) ?? spec.gguf.approxBytes;
+    // Finding 3: the ceiling is derived from the code-pinned `approxBytes`
+    // ONLY — never from `totalBytes` above, which may itself have been
+    // taken from an untrusted `Content-Length` header.
+    const limitBytes = sizeCeilingBytes(spec.gguf.approxBytes);
+    const hash = createHash('sha256');
+    const reader = response.body.getReader();
+    let completedBytes = 0;
+    try {
+      for (;;) {
+        const { value, done } = await readWithAbort(reader, signal);
+        if (done) break;
+        completedBytes += value.byteLength;
+        if (completedBytes > limitBytes) {
+          throw new GgufSizeExceededError(limitBytes, completedBytes);
+        }
+        hash.update(value);
+        await handle.write(value);
+        onProgress({ status: 'downloading', totalBytes, completedBytes });
+      }
+    } finally {
+      // F7 discipline (`ollamaClient.ts pullModel`'s own convention): cancel()
+      // on every exit path, not just releaseLock(), so the underlying
+      // connection is torn down rather than merely orphaned.
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+    return hash.digest('hex');
   } finally {
-    // F7 discipline (`ollamaClient.ts pullModel`'s own convention): cancel()
-    // on every exit path, not just releaseLock(), so the underlying
-    // connection is torn down rather than merely orphaned.
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
+    // Finding 1 (IMPORTANT, T14 review): release the write handle's fd on
+    // EVERY exit from this function — normal completion, the HTTP-error
+    // throw above (before the inner try), a size-ceiling refusal, or an
+    // abort mid-loop. Pre-fix, `handle.close()` sat only after the try/
+    // finally above and was skipped whenever this function threw, leaking
+    // the temp file's fd (and, on POSIX, its disk blocks) past the
+    // `removeTemp` unlink in `ingestGguf`'s own `finally` until the
+    // extension host next exited. `.catch` makes this swallow a close
+    // failure rather than mask whatever error is already propagating.
+    await handle.close().catch(() => {});
   }
-  await handle.close();
-  return hash.digest('hex');
 }
 
 /** Step 3 (§4.4.3d.iii): `POST {endpoint}/api/blobs/sha256:{pin}` with the
@@ -166,10 +225,19 @@ async function putBlob(
 ): Promise<void> {
   throwIfAborted(signal);
   const body = await io.openTempRead(handle.path);
-  const url = joinUrl(endpoint, `api/blobs/sha256:${spec.gguf.sha256}`);
-  const response = await io.fetchImpl(url, { method: 'POST', body, duplex: 'half', signal });
-  if (!response.ok) {
-    throw new Error(`Ollama blob upload failed: ${response.status} ${response.statusText}`);
+  try {
+    const url = joinUrl(endpoint, `api/blobs/sha256:${spec.gguf.sha256}`);
+    const response = await io.fetchImpl(url, { method: 'POST', body, duplex: 'half', signal });
+    if (!response.ok) {
+      throw new Error(`Ollama blob upload failed: ${response.status} ${response.statusText}`);
+    }
+  } finally {
+    // Finding 2 (MINOR, T14 review): release the read stream's fd on EVERY
+    // exit from this step — success, a non-2xx response, or an abort mid-
+    // POST — not just implicitly whenever `fetchImpl` happens to fully
+    // drain it. `destroy()` on an already-exhausted stream is a documented
+    // no-op (Node `Readable`), so calling it unconditionally here is safe.
+    body.destroy?.();
   }
 }
 
