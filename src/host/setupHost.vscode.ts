@@ -215,7 +215,12 @@ export function createSetupControllerDeps(
   const spawn = createNodeSpawnFn();
   const fileExists = createNodeFileExists();
   return {
-    locatePipx: () => locatePipx(exec),
+    // T11 (§3, critic C-11): thread the caller's abort signal through so
+    // `handleInstall`'s Cancel can actually reach a wedged login-shell probe
+    // — without this, the signal SetupController passes would be silently
+    // dropped at this wiring seam despite the plumbing being correct on
+    // both sides of it.
+    locatePipx: (signal) => locatePipx(exec, signal),
     // T5 §1.2: the container-boundary-aware os-release read (real fs seams).
     readOsRelease: createReadOsRelease(),
     installHermes: (recipe, env, onEvent, signal) => installHermes(recipe, env, spawn, fileExists, onEvent, signal),

@@ -127,6 +127,11 @@ const CONTAINER_NOTE_COPY =
 const PIPX_MISSING_KNOWN_COPY = 'pipx was not found on your PATH. Open a terminal to install it, then re-check.';
 const PIPX_MISSING_UNKNOWN_COPY =
   "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
+// T11 (§3): the §6 "probe-timeout detail (C1)" copy, verbatim — this is what
+// the REAL pipxLocator.locatePipx() composes for {reason:'probe-timeout'};
+// the fake deps below just need SOME fixed string to prove the pass-through.
+const PROBE_TIMEOUT_COPY =
+  "Your login shell didn't answer in time — a slow shell profile (nvm, conda, a network home directory) can cause this. It's usually transient: press Re-check.";
 
 function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: SetupControllerDeps; calls: string[] } {
   const calls: string[] = [];
@@ -917,6 +922,55 @@ describe('setup.recheck re-probes pipx (FIX 1: the pipx-missing/python-unsuitabl
 
     await controller.handle('setup.recheck', {});
     expect((await controller.status()).agent.phase).toBe('python-unsuitable');
+  });
+
+  // T11 (§3, critic C-8): a probe-timeout is honest-but-not-fatal — the
+  // AgentSetupPhase carries 'error' (there is no dedicated phase enum member
+  // for it), and the §6 copy is surfaced verbatim as the detail line.
+  it('T11: setup.install maps locatePipx {reason:"probe-timeout"} -> {phase:"error", detail: §6 copy}', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: async (): Promise<PipxLocateResult> => ({ ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_COPY }) },
+    );
+
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe(PROBE_TIMEOUT_COPY);
+
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('error');
+    expect(data.agent.detail).toBe(PROBE_TIMEOUT_COPY);
+  });
+
+  it('T11: setup.recheck maps locatePipx {reason:"probe-timeout"} -> {phase:"error", detail: §6 copy}', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: async (): Promise<PipxLocateResult> => ({ ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_COPY }) },
+    );
+
+    const result = await controller.handle('setup.recheck', {});
+    expect(result).toEqual({ ok: true });
+
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('error');
+    expect(data.agent.detail).toBe(PROBE_TIMEOUT_COPY);
+  });
+
+  it('T11: setup.install passes its AbortController.signal into locatePipx (Cancel reachability, critic C-11)', async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: async (signal?: AbortSignal): Promise<PipxLocateResult> => {
+          receivedSignal = signal;
+          return OK_PIPX_LOCATE;
+        },
+      },
+    );
+
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(receivedSignal).toBeInstanceOf(AbortSignal);
+    expect(receivedSignal?.aborted).toBe(false);
   });
 
   it('T4 M-2 carry-forward: a REJECTING locatePipx during recheck never becomes an unhandled rejection', async () => {

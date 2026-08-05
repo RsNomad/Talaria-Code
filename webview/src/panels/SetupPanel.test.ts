@@ -52,6 +52,13 @@ describe('agentPhaseLabel', () => {
     for (const label of labels) expect(label.length).toBeGreaterThan(0);
     expect(new Set(labels).size).toBe(labels.length);
   });
+
+  // T11 (§3, critic C-8): a recheck-time probe-timeout maps to the 'error'
+  // phase too, but it is NOT an install failure — the old "Install failed"
+  // label overclaimed; the detail line (not this label) carries specifics.
+  it("'error' phase label is honestly generic: 'Failed', not 'Install failed'", () => {
+    expect(agentPhaseLabel('error')).toBe('Failed');
+  });
 });
 
 describe('agentPrimaryAction', () => {

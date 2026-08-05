@@ -22,7 +22,10 @@ const AGENT_PHASE_LABEL: Record<AgentSetupPhase, string> = {
   'installed-inactive': 'Installed — not active',
   'awaiting-reload': 'Installed — reload to activate',
   ready: 'Ready',
-  error: 'Install failed',
+  // T11 (§3, critic C-8): honestly generic — a recheck-time probe-timeout
+  // also lands in this phase and is NOT an install failure; the detail line
+  // (not this label) carries the specifics.
+  error: 'Failed',
 };
 
 export function agentPhaseLabel(phase: AgentSetupPhase): string {

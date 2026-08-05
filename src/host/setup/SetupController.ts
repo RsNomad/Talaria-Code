@@ -178,8 +178,11 @@ export interface SetupControllerRegistry {
 }
 
 export interface SetupControllerDeps {
-  /** Bound to its real `ExecLookup` by the caller. Can REJECT — always try/catch this (T4 M-2). */
-  locatePipx(): Promise<PipxLocateResult>;
+  /** Bound to its real `ExecLookup` by the caller. Can REJECT — always try/catch this (T4 M-2).
+   *  T11 (§3, critic C-11): optional `signal`, checked between `locatePipx`'s
+   *  internal steps — `handleInstall` passes its `AbortController.signal` so
+   *  Cancel can reach a wedged probe. */
+  locatePipx(signal?: AbortSignal): Promise<PipxLocateResult>;
   /**
    * beta.5 §1.2 (T5): the os-release read, bound to the real container-
    * boundary-aware binding by the caller (`setupHost.vscode.ts`'s
@@ -636,8 +639,10 @@ export class SetupController {
       let located: PipxLocateResult;
       try {
         // T4 M-2 carry-forward: locatePipx can REJECT (pipx vanishing
-        // mid-flow) — never let that become an unhandled rejection.
-        located = await this.deps.locatePipx();
+        // mid-flow) — never let that become an unhandled rejection. T11
+        // (§3, critic C-11): pass this install's own abort signal so
+        // Cancel can reach a wedged login-shell probe.
+        located = await this.deps.locatePipx(abort.signal);
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
@@ -649,9 +654,13 @@ export class SetupController {
         // The sticky PHASE keeps the enum (computeAgentPhase's contract);
         // the RETURNED reason is a §6-grade human sentence (T5, critic
         // C-17): pipx-missing reuses the bootstrap card's own per-family
-        // guidance copy; python-unsuitable returns the locator's detail
-        // (already a full sentence naming the range and the probes).
-        this.lastAgentIssue = { phase: located.reason, detail };
+        // guidance copy; python-unsuitable / probe-timeout return the
+        // locator's own detail (already a full sentence). T11 (§3, critic
+        // C-8): `probe-timeout` has no dedicated AgentSetupPhase member — a
+        // recheck-time probe timeout is not an install failure, so it maps
+        // to the generic 'error' phase (the detail line carries the specifics).
+        const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
+        this.lastAgentIssue = { phase, detail };
         this.statusChangedEmitter.fire();
         const reason =
           located.reason === 'pipx-missing' ? composeBootstrap(await this.resolveOs()).guidance : detail;
@@ -913,7 +922,14 @@ export class SetupController {
     this.osResolution = undefined;
     try {
       const located = await this.deps.locatePipx();
-      this.lastAgentIssue = located.ok ? undefined : { phase: located.reason, detail: this.redact(located.detail) };
+      if (located.ok) {
+        this.lastAgentIssue = undefined;
+      } else {
+        // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
+        // — probe-timeout is not a distinct sticky phase.
+        const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
+        this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+      }
     } catch (err) {
       this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
     }
