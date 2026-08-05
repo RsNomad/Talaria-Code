@@ -1282,6 +1282,8 @@ class FakeSetupHostForRouting implements SetupHost {
 function makeFakeSetupDeps(): SetupControllerDeps {
   return {
     locatePipx: async () => ({ ok: false, reason: 'pipx-missing', detail: 'not used in routing tests' }),
+    // T5: routing tests never render the os card — {} degrades to 'unknown'.
+    readOsRelease: async () => ({}),
     installHermes: async () => {
       throw new Error('not used in routing tests');
     },

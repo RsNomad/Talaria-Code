@@ -666,6 +666,26 @@ export interface SetupData {
     version?: string;
     detail?: string;
     logTail?: string[];
+    /**
+     * beta.5 §1.2 (T5): the HOST-composed pipx bootstrap for the
+     * `pipx-missing` card — present iff `phase === 'pipx-missing'`.
+     * `command` is the engine's exact pre-typed line for the detected
+     * family; absent `command` = unknown distro, `guidance` (§6 copy) is
+     * then the whole story. The webview renders this text only — it never
+     * composes or submits command text of its own (Global Constraint 1).
+     */
+    bootstrap?: { command?: string; guidance: string };
+    /**
+     * beta.5 §1.2 (T5): the engine's Python install plan for the
+     * `python-unsuitable` card — present iff `phase ===
+     * 'python-unsuitable'`. Structural mirror of the host engine's
+     * `PythonInstallPlan | PythonGuidancePlan` (`src/host/setup/
+     * packageTable.ts`) — reproduced here, not imported, per this module's
+     * webview-safe zero-host-imports rule (section header doc).
+     */
+    pythonInstall?:
+      | { kind: 'command'; command: string; sourceNote: string; docsUrl: string }
+      | { kind: 'guidance'; text: string; docsUrl: string };
   };
   /** Card 2 — provider (chat model for the agent). */
   provider: {
@@ -717,6 +737,25 @@ export interface SetupData {
   ollama: { running: boolean; version?: string; models: { name: string; sizeBytes: number }[] };
   /** Composite "you're ready" banner: agent ready + provider configured + FIM probe OK. */
   ready: boolean;
+  /**
+   * beta.5 §1.2 (T5): the detected OS identity every pre-typed install
+   * command on this panel was composed FOR. Structural mirror of the host
+   * engine's `DistroFamily`/`PackageManager` (`src/host/setup/osDetect.ts`)
+   * — reproduced here, not imported (webview-safe module, see section
+   * header doc). OPTIONAL + additive (Global Constraint 6).
+   */
+  os?: {
+    family: 'fedora' | 'debian' | 'arch' | 'suse' | 'unknown';
+    manager: 'dnf' | 'apt-get' | 'pacman' | 'zypper' | 'unknown';
+    prettyName?: string;
+    /**
+     * §6 container-note copy (S-F10 honesty), present when detection
+     * degraded to `unknown` because a container/Flatpak boundary hides
+     * which system the integrated terminal actually acts on (a container
+     * marker was found and `/run/host/os-release` was absent).
+     */
+    containerNote?: string;
+  };
 }
 
 /**
@@ -1614,10 +1653,14 @@ export type ControlMethod = (typeof CONTROL_METHODS)[number];
  * extension host window — trust-gated (FM-14) but MODAL-FREE (it writes no
  * settings and spawns nothing, so it follows the Tier-2 `setup.setTunable`
  * posture: gated, no confirmation dialog). `setup.openBootstrapTerminal`
- * opens a terminal pre-typed with the Fedora pipx bootstrap (`sudo dnf
- * install pipx`) — Tier-1 (a terminal-opening action, §8), modal-gated like
- * `setup.openInstallTerminal`, but unconditional (no registry `backendId` —
- * pipx itself isn't a registry entry).
+ * opens a terminal pre-typed with a HOST-resolved install line — Tier-1 (a
+ * terminal-opening action, §8), modal-gated like `setup.openInstallTerminal`
+ * but with no registry `backendId` (pipx itself isn't a registry entry).
+ * beta.5 T5 (§1.2): it takes `{target?: 'pipx' | 'python'}` (absent =
+ * `'pipx'`, strictly validated host-side) and resolves the command from the
+ * OS-detection engine for the DETECTED distro family — refused fail-closed
+ * (`{ok:false}`, no modal, no terminal) when the engine has no verified
+ * line (unknown distro, container degrade, or a guidance-only Python plan).
  */
 export type SetupMethod =
   | 'setup.status'

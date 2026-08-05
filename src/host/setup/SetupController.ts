@@ -1,5 +1,8 @@
 import { homedir } from 'node:os';
 import type { BackendDescriptor, InstallRecipe, ProbeSpec } from './registry';
+import { managerFor, parseOsRelease, resolveDistroFamily } from './osDetect';
+import type { DistroFamily, OsRelease, PackageManager } from './osDetect';
+import { installCommand, pythonInstallPlan } from './packageTable';
 import type { PipxEnv, PipxLocateResult } from './pipxLocator';
 import type { HermesPaths, InstallEvent } from './pipxInstaller';
 import type { OllamaStatus, PullProgress } from './ollamaClient';
@@ -177,6 +180,18 @@ export interface SetupControllerRegistry {
 export interface SetupControllerDeps {
   /** Bound to its real `ExecLookup` by the caller. Can REJECT — always try/catch this (T4 M-2). */
   locatePipx(): Promise<PipxLocateResult>;
+  /**
+   * beta.5 §1.2 (T5): the os-release read, bound to the real container-
+   * boundary-aware binding by the caller (`setupHost.vscode.ts`'s
+   * `createReadOsRelease` — prefers `/run/host/os-release`, detects the
+   * `/run/.containerenv` / `/.dockerenv` / `$container` markers). The pure
+   * controller only INTERPRETS the result (Global Constraint 5): `text` is
+   * parsed through the T3 engine; `containerMismatch: true` (a marker with
+   * NO host os-release) and an absent `text` both degrade to family
+   * `'unknown'` — fail-closed, never a guessed command. Result is memoized
+   * across `status()` calls and re-read on `setup.recheck`.
+   */
+  readOsRelease(): Promise<{ text?: string; containerMismatch?: boolean }>;
   /** Bound to its real `SpawnFn`/`FileExists` by the caller. */
   installHermes(
     recipe: Extract<InstallRecipe, { kind: 'pipx' }>,
@@ -239,13 +254,19 @@ const TRUST_REFUSAL_REASON = 'Workspace is not trusted — Setup changes are dis
  * id is an agent-managed provider credential method (§2.1).
  */
 export const HERMES_SETUP_AUTH_METHOD_ID = 'hermes-setup';
-/** T11 host-gap 2 (plan §6/§7 FM-1): the well-established Fedora pipx
- *  bootstrap. Pre-typed into a terminal, never executed by us — the user
- *  presses Enter and grants sudo themselves. `pipx ensurepath` is
- *  surfaced as a follow-up HINT in the confirmation modal text (see
- *  {@link SetupController.handleOpenBootstrapTerminal}), not chained into
- *  this command — keeps the terminal line exactly what the modal named. */
-const PIPX_BOOTSTRAP_COMMAND = 'sudo dnf install pipx';
+/**
+ * beta.5 §6 copy, verbatim (drift-locked by SetupController.test.ts). The
+ * bootstrap COMMAND itself is no longer a constant here — T5 deleted the old
+ * hardcoded Fedora `PIPX_BOOTSTRAP_COMMAND`; every pre-typed line is now
+ * resolved server-side from the T4 engine ({@link installCommand} /
+ * {@link pythonInstallPlan}) for the DETECTED family, or refused fail-closed.
+ */
+const PIPX_MISSING_KNOWN_DISTRO_GUIDANCE =
+  'pipx was not found on your PATH. Open a terminal to install it, then re-check.';
+const PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE =
+  "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
+const CONTAINER_NOTE =
+  "Talaria can't tell which system your terminal acts on (VS Code appears to run in a sandbox/container) — run the install commands in a terminal on your host system, then re-check.";
 
 /** D9: which {@link SetupMethod}s are consequence-bearing mutations, gated
  *  on `host.isTrusted()` (FM-14). Everything else (`setup.status` — handled
@@ -287,6 +308,22 @@ interface ThrottleState {
   pending?: SetupProgress;
 }
 
+/**
+ * T5: one interpreted os-release read — everything the §1.2 wiring needs.
+ * `release` keeps the full parsed identity (the Python planner's C-3 gate
+ * needs `id`/`versionId`, never just the collapsed family); `containerNote`
+ * is set ONLY for the S-F10 degrade (container marker with no host
+ * os-release) — a merely unreadable file degrades to `unknown` WITHOUT the
+ * note, because "VS Code appears to run in a sandbox/container" would be a
+ * fabrication there (§1.2's trigger sentence is the authority).
+ */
+interface OsResolution {
+  release: OsRelease;
+  family: DistroFamily;
+  manager: PackageManager;
+  containerNote?: string;
+}
+
 export class SetupController {
   private readonly progressEmitter = new Emitter<SetupProgress>();
   /** Throttled >=150ms between pushes for the same `(op, id)` pair, via a real `setTimeout` — never drops the final value, only delays it. */
@@ -300,6 +337,11 @@ export class SetupController {
   private lastAgentIssue?: { phase: AgentSetupPhase; detail: string };
   /** Set once a `setup.install` succeeds THIS session; never cleared here (a real reload replaces the whole extension host, and therefore this controller instance). */
   private awaitingReload = false;
+  /** T5: memoized OS detection (a PROMISE, so concurrent `status()` calls
+   *  share one read) — cleared by `setup.recheck` so the next demand
+   *  re-reads (the user may have installed VS Code outside the sandbox, or
+   *  the file may have become readable). */
+  private osResolution?: Promise<OsResolution>;
 
   constructor(
     private readonly host: SetupHost,
@@ -338,6 +380,9 @@ export class SetupController {
   async status(): Promise<SetupData> {
     const trusted = this.host.isTrusted();
     const apiKeySet = await this.host.secrets.has(AUTOCOMPLETE_API_KEY_SECRET);
+    // T5 §1.2: interpreted (memoized) OS identity — drives the `os` block
+    // and, per phase, the engine-composed bootstrap / python plans below.
+    const osInfo = await this.resolveOs();
 
     const ollamaDescriptor = this.deps.registry.getBackend('ollama');
     const ollamaEndpoint = ollamaDescriptor?.remote?.endpoint.defaultValue ?? DEFAULT_OLLAMA_ENDPOINT;
@@ -412,6 +457,12 @@ export class SetupController {
         ...(installRecord?.version ? { version: installRecord.version } : {}),
         ...(this.lastAgentIssue ? { detail: this.lastAgentIssue.detail } : {}),
         ...(this.installLogTail.length > 0 ? { logTail: [...this.installLogTail] } : {}),
+        // T5 §1.2: present iff the phase calls for them — the webview only
+        // ever RENDERS these (it never composes command text, Constraint 1).
+        ...(agentPhase === 'pipx-missing' ? { bootstrap: composeBootstrap(osInfo) } : {}),
+        ...(agentPhase === 'python-unsuitable'
+          ? { pythonInstall: pythonInstallPlan(osInfo.release, osInfo.family) }
+          : {}),
       },
       provider,
       fim: {
@@ -448,8 +499,45 @@ export class SetupController {
         ? { running: true, models: ollamaStatus.models }
         : { running: false, models: [] },
       ready,
+      os: {
+        family: osInfo.family,
+        manager: osInfo.manager,
+        ...(osInfo.release.prettyName !== undefined ? { prettyName: osInfo.release.prettyName } : {}),
+        ...(osInfo.containerNote !== undefined ? { containerNote: osInfo.containerNote } : {}),
+      },
     };
     return data;
+  }
+
+  // --- T5: OS detection (memoized interpretation of the readOsRelease seam) --
+
+  private resolveOs(): Promise<OsResolution> {
+    this.osResolution ??= this.computeOsResolution();
+    return this.osResolution;
+  }
+
+  private async computeOsResolution(): Promise<OsResolution> {
+    let read: { text?: string; containerMismatch?: boolean };
+    try {
+      read = await this.deps.readOsRelease();
+    } catch {
+      // A rejecting binding must never fail status() — same posture as
+      // safeProbeOllama. Degrades to `unknown` below.
+      read = {};
+    }
+    if (read.containerMismatch === true || read.text === undefined) {
+      return {
+        release: { idLike: [] },
+        family: 'unknown',
+        manager: 'unknown',
+        // §1.2/S-F10: the note ONLY for the container degrade — see
+        // OsResolution's doc for why a plain read failure stays note-less.
+        ...(read.containerMismatch === true ? { containerNote: CONTAINER_NOTE } : {}),
+      };
+    }
+    const release = parseOsRelease(read.text);
+    const family = resolveDistroFamily(release);
+    return { release, family, manager: managerFor(family) };
   }
 
   // --- handle() -------------------------------------------------------------
@@ -483,7 +571,7 @@ export class SetupController {
       case 'setup.openInstallTerminal':
         return this.handleOpenInstallTerminal(params);
       case 'setup.openBootstrapTerminal':
-        return this.handleOpenBootstrapTerminal();
+        return this.handleOpenBootstrapTerminal(params);
       case 'setup.reload':
         return this.handleReload();
       case 'setup.recheck':
@@ -533,8 +621,16 @@ export class SetupController {
         return { ok: false, reason: detail };
       }
       if (!located.ok) {
-        this.lastAgentIssue = { phase: located.reason, detail: this.redact(located.detail) };
-        return { ok: false, reason: located.reason };
+        const detail = this.redact(located.detail);
+        // The sticky PHASE keeps the enum (computeAgentPhase's contract);
+        // the RETURNED reason is a §6-grade human sentence (T5, critic
+        // C-17): pipx-missing reuses the bootstrap card's own per-family
+        // guidance copy; python-unsuitable returns the locator's detail
+        // (already a full sentence naming the range and the probes).
+        this.lastAgentIssue = { phase: located.reason, detail };
+        const reason =
+          located.reason === 'pipx-missing' ? composeBootstrap(await this.resolveOs()).guidance : detail;
+        return { ok: false, reason };
       }
 
       let paths: HermesPaths;
@@ -775,6 +871,11 @@ export class SetupController {
    * read-only recheck.
    */
   private async handleRecheck(): Promise<{ ok: true }> {
+    // T5: drop the memoized OS detection — the next demand (the status()
+    // this recheck's caller refreshes with, or the next bootstrap-terminal
+    // request) re-reads through the binding, picking up e.g. a container
+    // escape or a newly readable /etc/os-release.
+    this.osResolution = undefined;
     try {
       const located = await this.deps.locatePipx();
       this.lastAgentIssue = located.ok ? undefined : { phase: located.reason, detail: this.redact(located.detail) };
@@ -821,21 +922,69 @@ export class SetupController {
   // --- setup.openBootstrapTerminal (T11 IMPORTANT host-gap 2) ---------------
 
   /**
-   * The `pipx-missing` gap-state fix (plan §6 card 1 / §7 FM-1): unlike
-   * {@link handleOpenInstallTerminal}, this is unconditional — pipx itself
-   * isn't a registry `BackendDescriptor` with a `guided-terminal` recipe, so
-   * there is no `backendId` to look up. Same Tier-1 discipline: a native
-   * modal names the EXACT command before anything opens; a decline is
+   * The `pipx-missing` gap-state fix (plan §6 card 1 / §7 FM-1), rewired by
+   * beta.5 T5 (§1.2): unlike {@link handleOpenInstallTerminal} there is no
+   * registry `backendId` to look up (pipx itself isn't a
+   * `BackendDescriptor`) — instead the command is resolved SERVER-SIDE from
+   * the T4 engine for the DETECTED family, never from webview-supplied text
+   * (Global Constraint 1; the old hardcoded Fedora `PIPX_BOOTSTRAP_COMMAND`
+   * is deleted). `params.target` selects which engine line: `'pipx'`
+   * (default when absent) or `'python'` (the A2 handoff — the command that
+   * makes `locatePipx`'s existing python3.13/3.12/3.11 probe succeed; no
+   * new `--python` plumbing needed, `pipxInstaller.ts:106-110`). Validated
+   * as a STRICT enum — any other value (or a non-string) is refused before
+   * any engine/modal work.
+   *
+   * FAIL-CLOSED: when the engine yields no command — unknown family, the
+   * S-F10 container degrade, or a GUIDANCE python plan (e.g. Ubuntu 26.04,
+   * the rev-3 case) — the refusal is `{ok:false}` with a §6-grade reason,
+   * the modal is never shown and the terminal is never created. Same Tier-1
+   * discipline as before on the happy path: the native modal names the
+   * EXACT command + its `sourceNote` verbatim; a decline is
    * `{ok:false,'declined'}` with the terminal never created.
    */
-  private async handleOpenBootstrapTerminal(): Promise<{ ok: true } | { ok: false; reason: string }> {
+  private async handleOpenBootstrapTerminal(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const target = validateBootstrapTarget(params);
+    if (target === undefined) {
+      return { ok: false, reason: "target must be 'pipx' or 'python'." };
+    }
+    const osInfo = await this.resolveOs();
+
+    let command: string;
+    let sourceNote: string;
+    let terminalName: string;
+    let followUpHint: string;
+    if (target === 'pipx') {
+      const spec = installCommand(osInfo.family, 'pipx');
+      if (spec === undefined) {
+        return { ok: false, reason: osInfo.containerNote ?? PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
+      }
+      command = spec.command;
+      sourceNote = spec.sourceNote;
+      terminalName = 'Install pipx';
+      followUpHint =
+        " Once it finishes, also run 'pipx ensurepath' (then restart your terminal) so pipx-installed apps land on PATH.";
+    } else {
+      const plan = pythonInstallPlan(osInfo.release, osInfo.family);
+      if (plan.kind !== 'command') {
+        // Guidance-only family (rev 3: Ubuntu 26.04+/Debian/Mint/Pop/Arch/
+        // unknown) — there is no verified line to pre-type. plan.text is
+        // the §6 guidance copy verbatim.
+        return { ok: false, reason: osInfo.containerNote ?? plan.text };
+      }
+      command = plan.command;
+      sourceNote = plan.sourceNote;
+      terminalName = 'Install Python';
+      followUpHint = '';
+    }
+
     const confirmed = await this.host.showModal(
-      `Open a terminal pre-filled with:\n${PIPX_BOOTSTRAP_COMMAND}\nYou'll need to press Enter to run it — grant sudo yourself if it asks. Once it finishes, also run 'pipx ensurepath' (then restart your terminal) so pipx-installed apps land on PATH.`,
+      `Open a terminal pre-filled with:\n${command}\nSource: ${sourceNote}\nYou'll need to press Enter to run it — grant sudo yourself if it asks.${followUpHint}`,
       'Open Terminal',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
     // Pre-typed only — createTerminal never executes it (SetupHost's own contract).
-    this.host.createTerminal('Install pipx', PIPX_BOOTSTRAP_COMMAND);
+    this.host.createTerminal(terminalName, command);
     return { ok: true };
   }
 
@@ -1089,6 +1238,36 @@ function computeReady(
 
 function coerceNextEditTransport(raw: string | undefined): 'ollama' | 'openai-compat' {
   return raw === 'openai-compat' ? 'openai-compat' : 'ollama';
+}
+
+/**
+ * T5 §1.2: the `pipx-missing` card's engine-composed bootstrap. A known
+ * family carries the exact pre-typed line + the §6 known-distro copy; an
+ * unknown family (incl. the container degrade) carries ONLY the §6
+ * unknown-distro copy — no command is ever guessed (Global Constraint 1).
+ */
+function composeBootstrap(osInfo: OsResolution): { command?: string; guidance: string } {
+  const spec = installCommand(osInfo.family, 'pipx');
+  return spec !== undefined
+    ? { command: spec.command, guidance: PIPX_MISSING_KNOWN_DISTRO_GUIDANCE }
+    : { guidance: PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
+}
+
+/**
+ * T5: strict server-side enum validation of `setup.openBootstrapTerminal`'s
+ * `{target}` param (SECURITY, Global Constraint 1 — webview input is never
+ * trusted). Absent params / absent key = `'pipx'` (back-compat with the T11
+ * param-less call). A PRESENT key with anything but the two literals —
+ * including a non-string — is `undefined` = refuse; it is NOT coerced to
+ * the default, so a malformed request can never silently open the pipx path.
+ */
+function validateBootstrapTarget(params: unknown): 'pipx' | 'python' | undefined {
+  if (params === undefined || params === null) return 'pipx';
+  if (typeof params !== 'object') return undefined;
+  if (!('target' in params)) return 'pipx';
+  const raw = (params as Record<string, unknown>)['target'];
+  if (raw === undefined) return 'pipx';
+  return raw === 'pipx' || raw === 'python' ? raw : undefined;
 }
 
 function deriveHermesAcpPath(hermesPath: string): string {

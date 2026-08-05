@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { execFile, spawn as nodeSpawn } from 'node:child_process';
-import { access } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import type { ExecLookup } from './runtime/resolveHermes';
 import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
@@ -130,6 +130,69 @@ export function createNodeFileExists(): FileExists {
   };
 }
 
+// --- readOsRelease (T5 §1.2 — the container-boundary-aware os-release read) --
+
+/**
+ * Injected seams for {@link createReadOsRelease} — real fs/process by
+ * default; tests inject fakes (the same DI discipline as `SpawnFn`/
+ * `FileExists` above, so the unit tests never touch the real filesystem).
+ */
+export interface OsReleaseReadSeams {
+  readFile(path: string): Promise<string>;
+  fileExists(path: string): Promise<boolean>;
+  platform: string;
+  env: Readonly<Record<string, string | undefined>>;
+}
+
+const CONTAINER_MARKER_FILES = ['/run/.containerenv', '/.dockerenv'];
+
+/**
+ * The `SetupControllerDeps.readOsRelease` binding (beta.5 §1.2, S-F10
+ * container/Flatpak honesty):
+ *
+ *  1. win32 → `{}` (dev-gate host; the controller degrades to `unknown`).
+ *  2. `/run/host/os-release` readable → its text — Flatpak/toolbox expose
+ *     the HOST identity there, which is what install commands should be
+ *     composed for. Preferred unconditionally over `/etc/os-release`.
+ *  3. Else, a container marker present (`/run/.containerenv` (podman),
+ *     `/.dockerenv` (docker), or a non-empty `$container` (Flatpak/systemd-
+ *     nspawn)) → `{ containerMismatch: true }` — the sandbox's own
+ *     `/etc/os-release` is deliberately NOT read: reporting the container
+ *     image's identity would compose commands for a system the user's
+ *     terminal may not act on. Fail-closed, the controller degrades to
+ *     `unknown` + the §6 container note.
+ *  4. Else `/etc/os-release` → its text; unreadable → `{}`.
+ *
+ * Never rejects: every fs failure collapses into the honest-degrade shapes
+ * above (the controller additionally try/catches its side of the seam).
+ */
+export function createReadOsRelease(
+  seams?: Partial<OsReleaseReadSeams>,
+): () => Promise<{ text?: string; containerMismatch?: boolean }> {
+  const readFileImpl = seams?.readFile ?? ((path: string) => readFile(path, 'utf8'));
+  const fileExistsImpl = seams?.fileExists ?? createNodeFileExists();
+  const platform = seams?.platform ?? process.platform;
+  const env = seams?.env ?? process.env;
+  return async () => {
+    if (platform === 'win32') return {};
+    try {
+      return { text: await readFileImpl('/run/host/os-release') };
+    } catch {
+      // Host file absent/unreadable — fall through to marker detection.
+    }
+    for (const marker of CONTAINER_MARKER_FILES) {
+      if (await fileExistsImpl(marker)) return { containerMismatch: true };
+    }
+    const containerEnv = env['container'];
+    if (containerEnv !== undefined && containerEnv !== '') return { containerMismatch: true };
+    try {
+      return { text: await readFileImpl('/etc/os-release') };
+    } catch {
+      return {};
+    }
+  };
+}
+
 // --- SetupControllerDeps (Task 3-7 engines, bound to real adapters) ----------
 
 /** `fetch` reached via `globalThis.fetch(...)` (never a bare reference) —
@@ -153,6 +216,8 @@ export function createSetupControllerDeps(
   const fileExists = createNodeFileExists();
   return {
     locatePipx: () => locatePipx(exec),
+    // T5 §1.2: the container-boundary-aware os-release read (real fs seams).
+    readOsRelease: createReadOsRelease(),
     installHermes: (recipe, env, onEvent, signal) => installHermes(recipe, env, spawn, fileExists, onEvent, signal),
     probeOllama: (endpoint, timeoutMs) => probeOllama(endpoint, boundFetch, timeoutMs),
     pullModel: (endpoint, model, onProgress, signal) => pullModel(endpoint, model, boundFetch, onProgress, signal),

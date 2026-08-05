@@ -28,7 +28,7 @@ import * as vscode from 'vscode';
 
 vi.mock('vscode', () => ({}));
 
-import { createVsCodeSetupHost } from './setupHost.vscode';
+import { createReadOsRelease, createVsCodeSetupHost } from './setupHost.vscode';
 
 function makeFakeContext(secretsGet: (key: string) => Promise<string | undefined>): vscode.ExtensionContext {
   return {
@@ -58,5 +58,75 @@ describe('createVsCodeSetupHost().secrets.has — total, never rejects', () => {
 
     await expect(host.secrets.has('present-key')).resolves.toBe(true);
     await expect(host.secrets.has('missing-key')).resolves.toBe(false);
+  });
+});
+
+// --- T5 §1.2: createReadOsRelease — the container-boundary-aware binding -----
+
+/** In-memory fs seam: `files` maps path -> content; anything else rejects
+ *  (readFile) / resolves false (fileExists) exactly like the real adapters. */
+function makeSeams(files: Record<string, string>, env: Record<string, string | undefined> = {}, platform = 'linux') {
+  const readCalls: string[] = [];
+  const read = createReadOsRelease({
+    readFile: async (path: string) => {
+      readCalls.push(path);
+      const content = files[path];
+      if (content === undefined) throw new Error(`ENOENT: ${path}`);
+      return content;
+    },
+    fileExists: async (path: string) => files[path] !== undefined,
+    platform,
+    env,
+  });
+  return { read, readCalls };
+}
+
+const HOST_OS_RELEASE = 'ID=fedora\nVERSION_ID=44\nPRETTY_NAME="Fedora Linux 44 (Workstation Edition)"\n';
+const CONTAINER_OS_RELEASE = 'ID=freedesktop-sdk\nVERSION_ID=24.08\nPRETTY_NAME="Freedesktop SDK 24.08"\n';
+
+describe('T5: createReadOsRelease (S-F10 container/Flatpak honesty)', () => {
+  it('prefers /run/host/os-release when it exists (Flatpak/toolbox host identity) — even with markers present', async () => {
+    const { read } = makeSeams(
+      { '/run/host/os-release': HOST_OS_RELEASE, '/etc/os-release': CONTAINER_OS_RELEASE, '/run/.containerenv': '' },
+      { container: 'podman' },
+    );
+    await expect(read()).resolves.toEqual({ text: HOST_OS_RELEASE });
+  });
+
+  it('falls back to /etc/os-release when no host file and no container marker', async () => {
+    const { read } = makeSeams({ '/etc/os-release': HOST_OS_RELEASE });
+    await expect(read()).resolves.toEqual({ text: HOST_OS_RELEASE });
+  });
+
+  it('/run/.containerenv marker + NO host file -> { containerMismatch: true } — the container /etc/os-release is NEVER reported', async () => {
+    const { read, readCalls } = makeSeams({ '/etc/os-release': CONTAINER_OS_RELEASE, '/run/.containerenv': '' });
+    await expect(read()).resolves.toEqual({ containerMismatch: true });
+    expect(readCalls).not.toContain('/etc/os-release');
+  });
+
+  it('/.dockerenv marker + NO host file -> { containerMismatch: true }', async () => {
+    const { read } = makeSeams({ '/etc/os-release': CONTAINER_OS_RELEASE, '/.dockerenv': '' });
+    await expect(read()).resolves.toEqual({ containerMismatch: true });
+  });
+
+  it('$container env marker + NO host file -> { containerMismatch: true }', async () => {
+    const { read } = makeSeams({ '/etc/os-release': CONTAINER_OS_RELEASE }, { container: 'flatpak' });
+    await expect(read()).resolves.toEqual({ containerMismatch: true });
+  });
+
+  it('an EMPTY $container is not a marker (unset-but-exported shells) -> /etc/os-release still read', async () => {
+    const { read } = makeSeams({ '/etc/os-release': HOST_OS_RELEASE }, { container: '' });
+    await expect(read()).resolves.toEqual({ text: HOST_OS_RELEASE });
+  });
+
+  it('win32 -> {} without touching the filesystem (the gate runs on Windows)', async () => {
+    const { read, readCalls } = makeSeams({ '/etc/os-release': HOST_OS_RELEASE }, {}, 'win32');
+    await expect(read()).resolves.toEqual({});
+    expect(readCalls).toEqual([]);
+  });
+
+  it('nothing readable anywhere -> {} (controller degrades to unknown)', async () => {
+    const { read } = makeSeams({});
+    await expect(read()).resolves.toEqual({});
   });
 });
