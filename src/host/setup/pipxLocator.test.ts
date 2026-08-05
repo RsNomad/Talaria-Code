@@ -153,6 +153,16 @@ describe('locatePipx — Task 4: pipx presence + python 3.11–3.13 gate + venvs
     expect(calls).toHaveLength(1);
   });
 
+  it('T6: the pipx-missing detail is distro-neutral — no hardcoded Fedora install hint', async () => {
+    const { exec } = scriptedExec([PIPX_MISSING]);
+    const result = await locatePipx(exec);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.detail).not.toContain('Fedora');
+      expect(result.detail).not.toContain('dnf');
+    }
+  });
+
   it('default python 3.14 AND every probe candidate also 3.14 → { ok: false, reason: "python-unsuitable" }', async () => {
     const { exec, calls } = scriptedExec([
       PIPX_FOUND,

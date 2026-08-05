@@ -909,13 +909,34 @@ export class SetupController {
     if (!descriptor || !recipe || recipe.kind !== 'guided-terminal') {
       return { ok: false, reason: `'${String(backendId)}' has no guided-terminal install.` };
     }
+
+    let command = recipe.command;
+    if (recipe.packageKey) {
+      // T6 (§1.2 A3): hand command resolution to the OS engine for the
+      // DETECTED family. Fail-open CLOSED (S-F9): a family with no engine
+      // entry for this key NEVER falls back to this recipe's own static
+      // `command` (Fedora-shaped) — it refuses, guidance-only, same
+      // fail-closed posture as `handleOpenBootstrapTerminal`.
+      const osInfo = await this.resolveOs();
+      const spec = installCommand(osInfo.family, recipe.packageKey);
+      if (spec === undefined) {
+        return {
+          ok: false,
+          reason:
+            osInfo.containerNote ??
+            `No verified '${descriptor.displayName}' install command for this system — see ${recipe.docsUrl} for manual install options.`,
+        };
+      }
+      command = spec.command;
+    }
+
     const confirmed = await this.host.showModal(
-      `Open a terminal pre-filled with:\n${recipe.command}\nYou'll need to press Enter to run it — grant sudo yourself if it asks.`,
+      `Open a terminal pre-filled with:\n${command}\nYou'll need to press Enter to run it — grant sudo yourself if it asks.`,
       'Open Terminal',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
     // Pre-typed only — createTerminal never executes it (SetupHost's own contract).
-    this.host.createTerminal(`${descriptor.displayName} install`, recipe.command);
+    this.host.createTerminal(`${descriptor.displayName} install`, command);
     return { ok: true };
   }
 

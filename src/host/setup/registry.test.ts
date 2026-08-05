@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { collectNonTestTsSources, scanLines, VSCODE_IMPORT_BAN } from '../purityScan';
+import { collectAllTsAndTsxSources, collectNonTestTsSources, scanLines, VSCODE_IMPORT_BAN } from '../purityScan';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import {
   AGENT_BACKENDS,
@@ -258,5 +258,77 @@ describe('registry (h): purity — zero vscode imports (purityScan discipline)',
     // Non-vacuous: the scan must actually see registry.ts.
     expect(files.map((f) => f.file)).toContain('registry.ts');
     expect(scanLines(files, VSCODE_IMPORT_BAN)).toEqual([]);
+  });
+});
+
+/**
+ * (i) — T6 (beta5-setup-hardening-architecture.md §1.2 A3): llama.cpp's
+ * guided-terminal recipe gains `packageKey: 'llamacpp'` so
+ * `SetupController.handleOpenInstallTerminal` can override its `command`
+ * with the OS engine's (`packageTable.ts`) per-family verified line —
+ * fail-open closed (S-F9), never falling back to this static Fedora-shaped
+ * `command` on an unmatched family. Ollama's vendor-script recipe carries no
+ * `packageKey` and stays untouched by that override, on every family.
+ */
+describe('registry (i): llamacpp guided-terminal recipe carries packageKey for OS-engine routing (T6/S-F9)', () => {
+  it("llamacpp's recipe carries packageKey: 'llamacpp'", () => {
+    const recipe = mustGet('llamacpp').localInstall?.recipe;
+    expect(recipe?.kind).toBe('guided-terminal');
+    if (recipe?.kind === 'guided-terminal') {
+      expect(recipe.packageKey).toBe('llamacpp');
+    }
+  });
+
+  it('ollama carries no packageKey — its recipe is never engine-overridden (byte-identical regression lock)', () => {
+    const recipe = mustGet('ollama').localInstall?.recipe;
+    expect(recipe?.kind).toBe('guided-terminal');
+    if (recipe?.kind === 'guided-terminal') {
+      expect(recipe.packageKey).toBeUndefined();
+      expect(recipe.command).toBe('curl -fsSL https://ollama.com/install.sh | sh');
+      expect(recipe.docsUrl).toBe('https://ollama.com/download/linux');
+    }
+  });
+});
+
+/**
+ * (j) — T6 §5.2 rev 3 (⑪): vLLM's local install has no verified source to
+ * compose a command from (the beta.3 pip-based recipe was unpinned,
+ * PEP-668-hostile, and hardware-specific) — the recipe becomes docs-only.
+ * R-1a: `SetupController.projectBackend` projects only DESCRIPTOR-level
+ * `docsUrl` onto the wire (not the recipe's own), so the descriptor must
+ * carry its own copy too, or the docs-only tab would render linkless.
+ */
+describe('registry (j): vLLM local install is docs-only — docsUrl on BOTH the recipe and the descriptor (R-1a)', () => {
+  it("vllm's recipe is exactly {kind:'docs-only', docsUrl:'https://docs.vllm.ai/'}", () => {
+    const vllm = mustGet('vllm');
+    expect(vllm.localInstall?.recipe).toEqual({ kind: 'docs-only', docsUrl: 'https://docs.vllm.ai/' });
+  });
+
+  it('the vllm DESCRIPTOR also carries docsUrl (R-1a)', () => {
+    expect(mustGet('vllm').docsUrl).toBe('https://docs.vllm.ai/');
+  });
+
+  it('vllm is still status:available (docs-only + Test-only is a legitimate offering, not absence)', () => {
+    expect(mustGet('vllm').status).toBe('available');
+    expect(mustGet('vllm').remote).toBeDefined();
+  });
+});
+
+/**
+ * (k) — T6 §5.2 rev 3: the deleted vLLM install line (a `pip` invocation
+ * naming the `vllm` package, unpinned) must never reappear anywhere under
+ * `src/`. Deliberately phrased without ever spelling out the banned two-word
+ * literal in this file's own prose/comments — this scan collects TEST files
+ * too (unlike (h)'s production-only purity scan), so this file is itself
+ * subject to the ban it asserts and must not trip its own lock.
+ */
+describe('registry (k): the deleted vLLM pip-install recipe string is gone from the codebase', () => {
+  it('no .ts/.tsx file under src/ contains the deleted install line', () => {
+    const root = join(__dirname, '..', '..'); // src/host/setup -> src/host -> src
+    const files = collectAllTsAndTsxSources(root);
+    expect(files.length).toBeGreaterThan(0); // non-vacuous
+    const bannedWords = ['pip', 'install', 'vllm'];
+    const banned = new RegExp(bannedWords.join(' '));
+    expect(scanLines(files, banned)).toEqual([]);
   });
 });

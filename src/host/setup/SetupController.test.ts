@@ -666,6 +666,138 @@ describe('setup.openInstallTerminal: createTerminal pre-typed only', () => {
     const result = await controller.handle('setup.openInstallTerminal', { backendId: 'hermes' });
     expect(result.ok).toBe(false);
   });
+
+  it('ollama: packageKey absent — the OS engine is NEVER consulted (byte-identical regression lock)', async () => {
+    let osReads = 0;
+    const { host, controller } = makeController(
+      {},
+      {
+        readOsRelease: async () => {
+          osReads++;
+          return { text: OS_FEDORA_44 };
+        },
+      },
+    );
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'ollama' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([
+      { name: 'Ollama install', command: 'curl -fsSL https://ollama.com/install.sh | sh' },
+    ]);
+    expect(osReads).toBe(0);
+  });
+});
+
+// --- T6: setup.openInstallTerminal(llamacpp) routes through the OS engine ---
+
+describe('T6: setup.openInstallTerminal(llamacpp) — engine-composed command, fail-open CLOSED (S-F9)', () => {
+  it('fedora: the engine value (identical to the Fedora-shaped static command)', async () => {
+    const { host, controller } = makeController(); // default OS_FEDORA_44
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'llama.cpp install', command: 'sudo dnf install llama-cpp' }]);
+  });
+
+  it('arch: the pacman line is used — NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_ARCH }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([
+      { name: 'llama.cpp install', command: 'sudo pacman -S --needed llama-cpp' },
+    ]);
+  });
+
+  it('opensuse tumbleweed: the zypper line is used — NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_TUMBLEWEED }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result).toEqual({ ok: true });
+    expect(host.terminalsCreated).toEqual([{ name: 'llama.cpp install', command: 'sudo zypper install llamacpp' }]);
+  });
+
+  it('debian (no engine entry): refused fail-closed — guidance only, modal never shown, NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: OS_DEBIAN_13 }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).not.toContain('dnf');
+    expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('unknown family (unrecognized os-release): refused fail-closed — NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ text: '' }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).not.toContain('dnf');
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('containerMismatch: refused with the §6 container note as the reason — NEVER the dnf line', async () => {
+    const { host, controller } = makeController({}, { readOsRelease: async () => ({ containerMismatch: true }) });
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    expect(result).toEqual({ ok: false, reason: CONTAINER_NOTE_COPY });
+    expect(host.terminalsCreated).toEqual([]);
+  });
+
+  it('SECURITY sweep: across every non-fedora fixture, the outcome command/reason never contains "dnf"', async () => {
+    const nonFedoraFixtures: { name: string; read: { text?: string; containerMismatch?: boolean } }[] = [
+      { name: 'arch', read: { text: OS_ARCH } },
+      { name: 'suse', read: { text: OS_TUMBLEWEED } },
+      { name: 'debian', read: { text: OS_DEBIAN_13 } },
+      { name: 'ubuntu 24.04', read: { text: OS_UBUNTU_2404 } },
+      { name: 'unknown', read: { text: '' } },
+      { name: 'container', read: { containerMismatch: true } },
+    ];
+    for (const fixture of nonFedoraFixtures) {
+      const { host, controller } = makeController({}, { readOsRelease: async () => fixture.read });
+      const result = await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+      const producedCommand = host.terminalsCreated[0]?.command ?? '';
+      expect(producedCommand, fixture.name).not.toContain('dnf');
+      if (!result.ok) expect(result.reason, fixture.name).not.toContain('dnf');
+    }
+  });
+
+  it('modal names the exact engine command BEFORE creating the terminal (fedora)', async () => {
+    const { host, controller } = makeController();
+    await controller.handle('setup.openInstallTerminal', { backendId: 'llamacpp' });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('sudo dnf install llama-cpp');
+    expect(host.calls.indexOf(modalCall as string)).toBeLessThan(
+      host.calls.findIndex((c) => c.startsWith('createTerminal:')),
+    );
+  });
+});
+
+// --- T6: vllm's docs-only recipe stays refused by the existing guided-terminal guard ---
+
+describe('T6: setup.openInstallTerminal(vllm) — docs-only recipe refused, no engine read, no modal', () => {
+  it("refused: 'docs-only' is not 'guided-terminal' — no modal, no terminal, OS engine never consulted", async () => {
+    let osReads = 0;
+    const { host, controller } = makeController(
+      {},
+      {
+        readOsRelease: async () => {
+          osReads++;
+          return { text: OS_FEDORA_44 };
+        },
+      },
+    );
+    const result = await controller.handle('setup.openInstallTerminal', { backendId: 'vllm' });
+    expect(result.ok).toBe(false);
+    expect(host.terminalsCreated).toEqual([]);
+    expect(host.calls.some((c) => c.startsWith('showModal:'))).toBe(false);
+    expect(osReads).toBe(0);
+  });
+});
+
+// --- T6: status() projects vllm's docs-only recipe onto the wire (R-1a) -----
+
+describe('T6: projectBackend — vllm carries docsUrl + localInstall.flavor === "docs-only" (R-1a)', () => {
+  it('status() projects a wire-visible docsUrl for the docs-only vllm entry', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    const vllm = data.fim.options.find((o) => o.id === 'vllm');
+    expect(vllm?.localInstall?.flavor).toBe('docs-only');
+    expect(vllm?.docsUrl).toBe('https://docs.vllm.ai/');
+  });
 });
 
 // --- setup.openBootstrapTerminal (T11 IMPORTANT host-gap 2) ------------------

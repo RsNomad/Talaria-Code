@@ -626,7 +626,9 @@ export interface SetupBackendOption {
   };
   /** The "Install locally" tab — present only for the local-capable entries. */
   localInstall?: {
-    flavor: 'pipx' | 'guided-terminal';
+    /** beta.5 T6: `'docs-only'` (additive) — no verified install source, a
+     *  docs link + endpoint Test only (e.g. vLLM, §5.2 rev 3 ⑪). */
+    flavor: 'pipx' | 'guided-terminal' | 'docs-only';
     effort: 'one-script' | 'manual-guided';
     models?: { role: 'fim' | 'embedding'; model: string; present: boolean }[];
   };

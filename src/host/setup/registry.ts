@@ -43,7 +43,21 @@ export type InstallRecipe =
       apps: { main: string; acpCheck?: string };  // console-script names
       postCheck: { app: string; args: string[]; expectStdoutIncludes: string } }
   | { kind: 'guided-terminal';   // we OPEN a terminal with the command pre-typed; user runs it
-      command: string; docsUrl: string };
+      command: string; docsUrl: string;
+      /** beta.5 T6 (§1.2 A3): when set, `SetupController.handleOpenInstallTerminal`
+       *  overrides `command` with the OS engine's (`packageTable.ts`) verified
+       *  line for the detected family — fail-open CLOSED (S-F9): a family
+       *  with no engine entry for this key REFUSES instead of falling back
+       *  to this recipe's own static `command` (which is Fedora-shaped and
+       *  would be the wrong line on another distro). Absent (e.g. ollama's
+       *  vendor-script recipe) ⇒ `command` is used as-is, untouched, on
+       *  every family — no OS engine read at all. */
+      packageKey?: 'llamacpp' }
+  | { kind: 'docs-only';         // beta.5 §5.2 rev 3 (⑪): no verified install
+      // source exists to compose a command from — guidance-only, a docs
+      // link plus the endpoint Test affordance. Nothing executes ⇒ nothing
+      // to the §5.2 source ledger.
+      docsUrl: string };
 
 export interface LocalInstallMode {
   recipe: InstallRecipe;
@@ -205,10 +219,15 @@ export const FIM_BACKENDS: readonly BackendDescriptor[] = [
       recipe: {
         kind: 'guided-terminal',
         // §4 table pins only "docs link" for llama.cpp (binary/dnf/build —
-        // we don't build it); the pre-typed command is the Fedora package
-        // path, provisional pending owner confirmation on Fedora.
+        // we don't build it); `packageKey: 'llamacpp'` (T6) hands command
+        // resolution to the OS engine (`packageTable.ts`) for the detected
+        // family — this static `command` is the Fedora value, owner-live-
+        // verified on Fedora 44, and is used ONLY as the engine's own
+        // fedora entry happens to equal it; every other family resolves
+        // through the engine (or refuses fail-closed, never this line).
         command: 'sudo dnf install llama-cpp',
         docsUrl: 'https://github.com/ggml-org/llama.cpp/tree/master/tools/server',
+        packageKey: 'llamacpp',
       },
       effort: 'manual-guided',
     },
@@ -233,16 +252,20 @@ export const FIM_BACKENDS: readonly BackendDescriptor[] = [
       probe: { kind: 'openai-models' },
     },
     localInstall: {
-      recipe: {
-        kind: 'guided-terminal',
-        // docs.vllm.ai's documented install; provisional pending owner
-        // confirmation (PEP 668 on Fedora may require a venv/uv first —
-        // the docs link is the authoritative path, per the §4 table).
-        command: 'pip install vllm',
-        docsUrl: 'https://docs.vllm.ai/',
-      },
+      // §5.2 rev 3 (⑪): the beta.3 pip-based recipe (unpinned, PEP-668-
+      // hostile, hardware-specific, "provisional" since beta.3) had no
+      // verified source to compose a command from — deleted. docs.vllm.ai
+      // is the authoritative path; the tab offers the docs link plus the
+      // endpoint Test affordance only. Nothing executes ⇒ nothing to the
+      // §5.2 source ledger.
+      recipe: { kind: 'docs-only', docsUrl: 'https://docs.vllm.ai/' },
       effort: 'manual-guided',
     },
+    // R-1a: `SetupController.projectBackend` (`SetupController.ts:963-979`)
+    // projects only this DESCRIPTOR-level `docsUrl` onto the wire, never a
+    // recipe-level one — without this the docs-only tab would render
+    // linkless.
+    docsUrl: 'https://docs.vllm.ai/',
     nextEditTransport: 'openai-compat',
   },
   {

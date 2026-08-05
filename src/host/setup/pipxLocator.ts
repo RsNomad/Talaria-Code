@@ -116,7 +116,7 @@ export async function locatePipx(exec: ExecLookup): Promise<PipxLocateResult> {
       reason: 'pipx-missing',
       detail:
         "'command -v pipx' found no pipx on the login-shell PATH. " +
-        'Install it (Fedora: `sudo dnf install pipx`), then `pipx ensurepath`.',
+        "Install it with your distro's package manager, then `pipx ensurepath`.",
     };
   }
 
