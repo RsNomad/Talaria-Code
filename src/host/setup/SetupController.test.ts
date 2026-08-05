@@ -1479,3 +1479,138 @@ describe('T5 C-17: setup.install early-return reasons are human sentences, never
     expect(result).toEqual({ ok: false, reason: detail });
   });
 });
+
+// --- T7 (§2.2.2): onStatusChanged — confirmed-start / failure-write / success / recheck-complete ---
+
+describe('T7: onStatusChanged fires on confirmed-start, failure-write, success, recheck-complete (§2.2.2)', () => {
+  it('never fires before the install modal resolves, and fires once right after a CONFIRM (not at latch-set)', async () => {
+    const host = new FakeSetupHost();
+    let resolveModal: (v: boolean) => void = () => {};
+    host.showModal = () =>
+      new Promise<boolean>((resolve) => {
+        resolveModal = resolve;
+      });
+    const { deps } = makeFakeDeps();
+    const controller = new SetupController(host, deps);
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const resultPromise = controller.handle('setup.install', { backendId: 'hermes' });
+    // Let the call reach (and await) the modal — the in-flight latch is
+    // already set at this point (critic C-16: BEFORE the modal), so this
+    // proves the fire is NOT wired to latch-set.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fires.length).toBe(0);
+
+    resolveModal(true);
+    await resultPromise;
+    expect(fires.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('never fires when the install modal is declined', async () => {
+    const { controller } = makeController({ modalResponses: [false] });
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+
+    expect(result).toEqual({ ok: false, reason: 'declined' });
+    expect(fires.length).toBe(0);
+  });
+
+  it('fires at confirm AND at the lastAgentIssue failure-write when locatePipx reports pipx-missing', async () => {
+    const { controller } = makeController({}, { locatePipx: failingLocate('pipx-missing', 'no pipx') });
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+
+    expect(result.ok).toBe(false);
+    expect(fires.length).toBe(2); // 1: confirm, 2: lastAgentIssue write
+  });
+
+  it('fires at confirm AND at success (awaitingReload flip) for a full successful install', async () => {
+    const { controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.install', { backendId: 'hermes' });
+
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(2); // 1: confirm, 2: success
+  });
+
+  it('fires exactly once when setup.recheck completes (clears a prior issue)', async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: async (): Promise<PipxLocateResult> => {
+          calls++;
+          return calls === 1 ? { ok: false, reason: 'pipx-missing', detail: 'no pipx' } : OK_PIPX_LOCATE;
+        },
+      },
+    );
+    await controller.handle('setup.install', { backendId: 'hermes' });
+
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    const result = await controller.handle('setup.recheck', {});
+
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(1);
+  });
+
+  it('fires exactly once when setup.recheck completes with a continued failure', async () => {
+    const { controller } = makeController(
+      {},
+      { locatePipx: failingLocate('python-unsuitable', 'still unsuitable') },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.recheck', {});
+
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(1);
+  });
+
+  it('never fires for read-only methods (status/testRemote/cancel)', async () => {
+    const { controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    await controller.status();
+    await controller.handle('setup.testRemote', { backendId: 'ollama' });
+    await controller.handle('setup.cancel', { op: 'install', id: 'hermes' });
+
+    expect(fires.length).toBe(0);
+  });
+
+  it('never fires for OTHER mutating methods (e.g. setup.setTunable) — those rely on the provider\'s unconditional post-handle push instead', async () => {
+    const { controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const result = await controller.handle('setup.setTunable', {
+      key: 'talaria.autocomplete.debounceMs',
+      value: 500,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(0);
+  });
+
+  it('dispose() clears onStatusChanged listeners (no leak)', async () => {
+    const { controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    controller.dispose();
+
+    // A recheck after dispose would have fired pre-dispose — proves the
+    // listener set was actually cleared, not merely unreachable.
+    await controller.handle('setup.recheck', {});
+    expect(fires.length).toBe(0);
+  });
+});

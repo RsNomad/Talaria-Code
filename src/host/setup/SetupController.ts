@@ -329,6 +329,23 @@ export class SetupController {
   /** Throttled >=150ms between pushes for the same `(op, id)` pair, via a real `setTimeout` — never drops the final value, only delays it. */
   readonly onProgress: Event<SetupProgress> = this.progressEmitter.event;
 
+  /**
+   * T7 (§2.2.2): fired on every mid-flight/outcome state change that a
+   * `SetupData` re-fetch would actually reflect — `TalariaViewProvider
+   * .setSetupController` subscribes this straight to a `pushSetupPanelData()`
+   * re-push. Deliberately narrow: only {@link handleInstall} (after the
+   * modal is CONFIRMED — ⚠ critic C-16, never at the in-flight latch, which
+   * is set BEFORE the modal — and at every {@link lastAgentIssue} write /
+   * the {@link awaitingReload} flip) and {@link handleRecheck} (once, at
+   * completion) fire it. Every OTHER mutating method already gets pushed by
+   * `TalariaViewProvider.handleSetupMethod`'s own unconditional post-`handle
+   * ()` refresh (T7 fix 1) — firing here too would be a redundant push, not
+   * a new one, so this event is intentionally NOT wired to any other method
+   * (and never to a read-only one).
+   */
+  private readonly statusChangedEmitter = new Emitter<void>();
+  readonly onStatusChanged: Event<void> = this.statusChangedEmitter.event;
+
   /** Keyed `${op}:${id}` (`install:<backendId>` / `pull:<model>`) — presence = single-flight latch (FM-12); the held `AbortController` is what `setup.cancel` interrupts. */
   private readonly inFlight = new Map<string, AbortController>();
   private readonly throttle = new Map<string, ThrottleState>();
@@ -354,6 +371,7 @@ export class SetupController {
     }
     this.throttle.clear();
     this.progressEmitter.dispose();
+    this.statusChangedEmitter.dispose();
   }
 
   /**
@@ -609,6 +627,11 @@ export class SetupController {
         'Install',
       );
       if (!confirmed) return { ok: false, reason: 'declined' };
+      // T7 (§2.2.2, critic C-16): the install visibly "starts" HERE — right
+      // after the user's CONFIRM — never at the in-flight latch above (which
+      // is set BEFORE the modal, so firing there would push a phase the user
+      // hasn't agreed to yet).
+      this.statusChangedEmitter.fire();
 
       let located: PipxLocateResult;
       try {
@@ -618,6 +641,7 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
+        this.statusChangedEmitter.fire();
         return { ok: false, reason: detail };
       }
       if (!located.ok) {
@@ -628,6 +652,7 @@ export class SetupController {
         // guidance copy; python-unsuitable returns the locator's detail
         // (already a full sentence naming the range and the probes).
         this.lastAgentIssue = { phase: located.reason, detail };
+        this.statusChangedEmitter.fire();
         const reason =
           located.reason === 'pipx-missing' ? composeBootstrap(await this.resolveOs()).guidance : detail;
         return { ok: false, reason };
@@ -644,6 +669,7 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
+        this.statusChangedEmitter.fire();
         return { ok: false, reason: detail };
       }
 
@@ -666,9 +692,11 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
+        this.statusChangedEmitter.fire();
         return { ok: false, reason: detail };
       }
       this.awaitingReload = true;
+      this.statusChangedEmitter.fire();
       this.host.offerReload();
       return { ok: true };
     } finally {
@@ -687,6 +715,13 @@ export class SetupController {
     } else if (event.kind === 'failed') {
       const detail = this.redact(event.detail);
       this.lastAgentIssue = { phase: 'error', detail };
+      // T7 (§2.2.2): the FIRST observable point of a real installHermes-time
+      // failure — the card's "installing" phase flip has already unmounted
+      // the Install button, so a host-pushed `phase:'error'` snapshot is the
+      // only surface (§0.1 ②); `handleInstall`'s own catch below fires again
+      // once the rejection propagates, which the provider's seq guard
+      // safely collapses with this one.
+      this.statusChangedEmitter.fire();
       this.pushProgress({ op: 'install', id: backendId, phase: event.phase, line: detail });
     } else if (event.kind === 'done') {
       this.pushProgress({ op: 'install', id: backendId, phase: 'verify', line: 'Install verified.' });
@@ -882,6 +917,11 @@ export class SetupController {
     } catch (err) {
       this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
     }
+    // T7 (§2.2.2): fired exactly ONCE at completion (not per lastAgentIssue
+    // write above) — recheck is read-only/no-modal, so "the recheck
+    // completed" is itself the single meaningful state-change signal,
+    // whether it cleared the sticky issue or refreshed it.
+    this.statusChangedEmitter.fire();
     return { ok: true };
   }
 
