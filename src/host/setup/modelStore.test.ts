@@ -58,6 +58,28 @@ describe('storeRoot — fail-closed XDG/HOME resolution (SC-A-10)', () => {
   });
 });
 
+describe('storeRoot — M-1 rejects a NON-ABSOLUTE $XDG_DATA_HOME/$HOME (treated as unset, per the XDG Base Directory spec)', () => {
+  it('a relative $XDG_DATA_HOME falls through to an absolute $HOME (relative XDG treated as unset)', () => {
+    const result = storeRoot({ XDG_DATA_HOME: 'rel', HOME: '/home/u' });
+    expect(result).toEqual({ ok: true, root: '/home/u/.local/share/talaria/models' });
+  });
+
+  it('a relative $XDG_DATA_HOME with a relative $HOME refuses (neither is a usable absolute path)', () => {
+    const result = storeRoot({ XDG_DATA_HOME: 'rel', HOME: 'also-rel' });
+    expect(result.ok).toBe(false);
+  });
+
+  it('a relative $XDG_DATA_HOME with $HOME unset refuses', () => {
+    const result = storeRoot({ XDG_DATA_HOME: 'rel' });
+    expect(result.ok).toBe(false);
+  });
+
+  it('an absolute $XDG_DATA_HOME is still used as before, even when $HOME is relative (regression)', () => {
+    const result = storeRoot({ XDG_DATA_HOME: '/data/xdg', HOME: 'rel' });
+    expect(result).toEqual({ ok: true, root: '/data/xdg/talaria/models' });
+  });
+});
+
 // --- ggufDest ------------------------------------------------------------------
 
 const ROOT = '/data/xdg/talaria/models';
@@ -182,6 +204,16 @@ describe('lstatCheckedGgufDest — symlink lstat refusals at every level (SC-A-3
     const result = await lstatCheckedGgufDest(io, ROOT, '../repo', 'file.gguf');
     expect(result.ok).toBe(false);
     expect(lstatCalls).toBe(0);
+  });
+
+  it('M-2: normalizes a trailing-slash root before the root-level lstat — a symlinked root is still refused even when `root` is passed with a trailing slash', async () => {
+    // The fake only marks the NORMALIZED (no trailing slash) ROOT as a
+    // symlink. Pre-fix, the root-level check lstats the RAW `root` argument
+    // verbatim (`${ROOT}/`), which never matches this fake's symlink set, so
+    // the refusal is missed and the trailing slash silently bypasses SC-A-3.
+    const io = fakeLstatIo(new Set([ROOT]), new Set([ROOT]));
+    const result = await lstatCheckedGgufDest(io, `${ROOT}/`, 'ggml-org/repo', 'file.gguf');
+    expect(result.ok).toBe(false);
   });
 });
 

@@ -18,15 +18,21 @@ import type { GgufStoreSidecar } from './ggufIngest';
  * layout side of that same store.
  *
  * --- storeRoot (SC-A-10) ------------------------------------------------
- * Linux XDG precedence: `$XDG_DATA_HOME` (when set, non-empty) else
- * `$HOME/.local/share` (when set, non-empty), then the Talaria model
- * subdirectory (`talaria/models` — this module's own naming choice; the
- * architecture doc pins the FAIL-CLOSED rule, not a literal path string).
- * An unset OR EMPTY-STRING var is treated as "not set" (mirrors this
- * codebase's own `container` env-marker convention, `setupHost.vscode.ts`'s
- * `createReadOsRelease`). Neither var set -> a TYPED failure (`{ok:false,
- * reason}`) — NEVER a bare/relative path, and NEVER the hardcoded
- * `/.local/share/…` fallback SC-A-10 explicitly forbids.
+ * Linux XDG precedence: `$XDG_DATA_HOME` (when set, non-empty, ABSOLUTE)
+ * else `$HOME/.local/share` (when set, non-empty, ABSOLUTE), then the
+ * Talaria model subdirectory (`talaria/models` — this module's own naming
+ * choice; the architecture doc pins the FAIL-CLOSED rule, not a literal
+ * path string). An unset OR EMPTY-STRING var is treated as "not set"
+ * (mirrors this codebase's own `container` env-marker convention,
+ * `setupHost.vscode.ts`'s `createReadOsRelease`). M-1 hardening: a var that
+ * does NOT start with `/` is ALSO treated as "not set" — the XDG Base
+ * Directory spec requires both vars to be absolute paths, and resolving a
+ * relative value would silently anchor the store against
+ * `process.cwd()` (whatever directory the extension host happens to be
+ * launched from) rather than a stable, predictable location. Neither var
+ * usable -> a TYPED failure (`{ok:false, reason}`) — NEVER a bare/relative
+ * path, and NEVER the hardcoded `/.local/share/…` fallback SC-A-10
+ * explicitly forbids.
  *
  * --- ggufDest (A-4) -------------------------------------------------------
  * Two-level layout `<root>/<owner>/<repo>/<file>` — owner and repo as
@@ -84,18 +90,27 @@ function nonEmpty(value: string | undefined): string | undefined {
   return value !== undefined && value.length > 0 ? value : undefined;
 }
 
+/** M-1: a usable XDG env var must be non-empty AND POSIX-absolute (leading
+ *  `/`) — the XDG Base Directory spec's own requirement. A relative value
+ *  is treated exactly like unset (falls through / refuses), NEVER resolved
+ *  against `process.cwd()`. */
+function absoluteEnvPath(value: string | undefined): string | undefined {
+  const v = nonEmpty(value);
+  return v !== undefined && v.startsWith('/') ? v : undefined;
+}
+
 export function storeRoot(env: ModelStoreEnv): StoreRootResult {
-  const xdgDataHome = nonEmpty(env.XDG_DATA_HOME);
+  const xdgDataHome = absoluteEnvPath(env.XDG_DATA_HOME);
   if (xdgDataHome !== undefined) {
     return { ok: true, root: joinPosix(xdgDataHome, ...STORE_SUBDIR_SEGMENTS) };
   }
-  const home = nonEmpty(env.HOME);
+  const home = absoluteEnvPath(env.HOME);
   if (home !== undefined) {
     return { ok: true, root: joinPosix(home, '.local', 'share', ...STORE_SUBDIR_SEGMENTS) };
   }
   return {
     ok: false,
-    reason: 'no $XDG_DATA_HOME and no $HOME set — refusing to resolve a model store root',
+    reason: 'no absolute $XDG_DATA_HOME and no absolute $HOME set — refusing to resolve a model store root',
   };
 }
 
@@ -168,7 +183,18 @@ export async function lstatCheckedGgufDest(
   const dest = ggufDest(root, hfRepo, file);
   if (!dest.ok) return dest;
 
-  const rootRefusal = await refuseIfSymlink(io, root, 'store root');
+  // M-2: normalize BEFORE the root-level lstat — `dest.destDir`'s <owner>/
+  // <repo> levels below are already composed through `joinPosix` (which
+  // strips a trailing slash on its base internally), so without this the
+  // root-level check alone would lstat a DIFFERENT string than the other
+  // two levels whenever `root` carries a trailing slash. POSIX `lstat`
+  // treats a trailing slash as "follow the final symlink" on some systems,
+  // so an un-normalized root could dodge this refusal entirely. Not
+  // currently reachable in practice (`storeRoot` never emits a trailing
+  // slash) — defense-in-depth for any other caller of this exported
+  // function.
+  const normalizedRoot = normalizeDirPosix(root);
+  const rootRefusal = await refuseIfSymlink(io, normalizedRoot, 'store root');
   if (rootRefusal) return rootRefusal;
 
   const ownerDir = dirnameOfPosix(dest.destDir);
@@ -220,6 +246,29 @@ export function readSidecar(raw: string): GgufStoreSidecar | null {
   }
   return isWellFormedSidecar(parsed) ? parsed : null;
 }
+
+/**
+ * M-3 drift guard: `Record<keyof GgufStoreSidecar, true>` forces this object
+ * literal to have EXACTLY the current `GgufStoreSidecar` (`ggufIngest.ts`)
+ * key set — both a MISSING property (a field this validator doesn't know
+ * about yet) and an EXCESS property (a stray key not on the type) are
+ * compile errors here. So if `GgufStoreSidecar` ever gains a new required
+ * field, this literal fails to typecheck until {@link isWellFormedSidecar}
+ * below is updated to validate it too — the unchecked `value is
+ * GgufStoreSidecar` assertion below can never silently fall behind the type
+ * it validates. (A `[...] as const satisfies readonly (keyof
+ * GgufStoreSidecar)[]` list would NOT catch this — `satisfies` only checks
+ * that each LISTED key is valid, not that the list is exhaustive; a newly
+ * added field would compile silently. `Record<keyof T, true>` requires
+ * every key, which is the actual guarantee this drift-guard needs.)
+ * Exported so `noUnusedLocals` never flags it as dead code.
+ */
+export const SIDECAR_FIELDS: Record<keyof GgufStoreSidecar, true> = {
+  catalogId: true,
+  sha256: true,
+  bytes: true,
+  verifiedAt: true,
+};
 
 function isWellFormedSidecar(value: unknown): value is GgufStoreSidecar {
   if (typeof value !== 'object' || value === null) return false;
@@ -306,4 +355,13 @@ function joinPosix(base: string, ...rest: string[]): string {
 function dirnameOfPosix(path: string): string {
   const idx = path.lastIndexOf('/');
   return idx === -1 ? '.' : path.slice(0, idx);
+}
+
+/** M-2: mirrors `ggufIngest.ts`'s own local `normalizeDir` exactly (same
+ *  unexported-internals-one-module-over discipline as {@link dirnameOfPosix}
+ *  above) — strips exactly one trailing `/` (never reduces a bare `/` to
+ *  `''`), so a caller-supplied `root` compares/lstats identically whether
+ *  or not it carries a trailing slash. */
+function normalizeDirPosix(dir: string): string {
+  return dir.length > 1 && dir.endsWith('/') ? dir.slice(0, -1) : dir;
 }
