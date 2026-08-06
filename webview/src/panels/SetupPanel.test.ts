@@ -7,14 +7,24 @@
  * `SetupPanel.dom.test.tsx`.
  */
 import { describe, it, expect } from 'vitest';
-import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupProgress } from '../protocol';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupProgress } from '../protocol';
 import { NEXT_DEDICATED_MODEL } from '../../../src/host/setup/registry';
 import {
   agentDoneLine,
   agentPhaseLabel,
   agentPrimaryAction,
+  backendReadyText,
   buildCopyLogText,
+  cancelPullParams,
+  CANCEL_LABEL,
+  CATALOG_DEFAULT_CHIP_LABEL,
+  catalogPresence,
+  catalogPresenceText,
+  catalogPreselectId,
   clampLogTail,
+  configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
   fimDoneLine,
   fimHasLocalInstall,
@@ -23,6 +33,12 @@ import {
   formatBytes,
   initDedicatedFormFieldState,
   isComingSoon,
+  llamacppDownloadButtonLabel,
+  LLAMACPP_CHECKING_TEXT,
+  LLAMACPP_HONEST_ABSENCE_TEXT,
+  LLAMACPP_MISSING_TEXT,
+  LLAMACPP_UNKNOWN_TEXT,
+  llamacppPresenceText,
   mutationDisabledReason,
   NEXT_DOWNLOAD_BUTTON_LABEL,
   NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
@@ -33,15 +49,23 @@ import {
   nextModelLine,
   nextPresence,
   nextPresenceText,
+  OLLAMA_DAEMON_DOWN_PULL_REASON,
+  OLLAMA_MISSING_TEXT,
+  ollamaPullButtonLabel,
   PIPX_INSTALL_DOCS_URL,
   progressKey,
+  provisionModalCopyLiveOid,
+  provisionModalCopyPinned,
   providerDoneLine,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
   PROGRESS_LOG_TAIL_MAX,
   ragDoneLine,
+  recheckScopeParams,
   reconcileDedicatedFormFields,
+  servingLine,
   splitGuidedLine,
+  testConnectionLabel,
   TRUST_DISABLED_REASON,
   type SetupProgressMap,
 } from './setupCards';
@@ -737,5 +761,261 @@ describe("reconcileDedicatedFormFields — field-reconcile on backend switch (se
     const state = initDedicatedFormFieldState('ollama', { endpoint: 'ollama-endpoint', model: 'ollama-model' });
     const result = reconcileDedicatedFormFields(state, 'llamacpp', { endpoint: 'llamacpp-endpoint', model: 'llamacpp-model' });
     expect(result).toEqual({ lastSelectedId: 'llamacpp', endpoint: 'llamacpp-endpoint', model: 'llamacpp-model' });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T10 — LocalModelBlock helpers (§4.1/§6). `localModel.dom.
+ * test.tsx` covers the rendered wiring; these are the pure derivations
+ * every §4.1 cell's TEXT/logic reduces to, generalized from `nextPresence`
+ * (above) the same way `catalogPresence` generalizes it.
+ * ------------------------------------------------------------------ */
+
+function catalogModel(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'qwen25-coder-1.5b',
+    role: 'fim',
+    displayName: 'Qwen2.5-Coder 1.5B (base)',
+    publisher: 'Qwen',
+    license: 'apache-2.0',
+    vramLine: 'any modern GPU (~1–2 GB)',
+    progressId: 'qwen25-coder-1.5b',
+    ollamaTag: 'qwen2.5-coder:1.5b-base',
+    ollamaApproxBytes: 986_000_000,
+    ...overrides,
+  };
+}
+
+function ollamaWire(overrides: Partial<SetupData['ollama']> = {}): SetupData['ollama'] {
+  return { running: true, endpoint: 'http://127.0.0.1:11434', models: [], ...overrides };
+}
+
+describe('catalogPresence — generalizes nextPresence over ANY catalog row (library tag OR hf-ingest createdName)', () => {
+  it('daemon not running -> unknown, regardless of endpoint match', () => {
+    const ollama = ollamaWire({ running: false });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', catalogModel())).toBe('unknown');
+  });
+
+  it('endpoint mismatch -> unknown (never inherits a DIFFERENT endpoint\'s presence)', () => {
+    const ollama = ollamaWire({ endpoint: 'http://127.0.0.1:11434' });
+    expect(catalogPresence(ollama, 'http://10.0.0.5:11434', catalogModel())).toBe('unknown');
+  });
+
+  it('library-tier row: matches on ollamaTag, :latest-tolerant', () => {
+    const ollama = ollamaWire({ models: [{ name: 'qwen2.5-coder:1.5b-base:latest', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', catalogModel())).toBe('present');
+  });
+
+  it('library-tier row: no matching daemon model -> absent', () => {
+    const ollama = ollamaWire({ models: [{ name: 'llama3:8b', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', catalogModel())).toBe('absent');
+  });
+
+  it('hf-ingest-tier row (Devstral/Sweep shape): matches on ollamaCreatedName, NOT ollamaTag (undefined)', () => {
+    const devstral = catalogModel({
+      id: 'devstral-24b',
+      role: 'agent',
+      ollamaTag: undefined,
+      ollamaApproxBytes: 14_333_915_904,
+      ollamaCreatedName: 'devstral-small-2507:24b',
+    });
+    const ollama = ollamaWire({ models: [{ name: 'devstral-small-2507:24b', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', devstral)).toBe('present');
+  });
+
+  it('row with neither ollamaTag nor ollamaCreatedName -> unknown (defensive, no ollama entry to check)', () => {
+    const ollama = ollamaWire({ models: [{ name: 'anything', sizeBytes: 1 }] });
+    const noOllamaEntry = catalogModel({ ollamaTag: undefined, ollamaApproxBytes: undefined });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', noOllamaEntry)).toBe('unknown');
+  });
+});
+
+describe('catalogPresenceText / llamacppPresenceText — §6 verbatim per state', () => {
+  it('ollama present -> "present ✓" (distinct from the NEXT card\'s own D2 wording)', () => {
+    expect(catalogPresenceText('present')).toBe('present ✓');
+  });
+  it('ollama absent -> "not present"', () => {
+    expect(catalogPresenceText('absent')).toBe('not present');
+  });
+  it('ollama unknown -> "not verified here — Test the endpoint first."', () => {
+    expect(catalogPresenceText('unknown')).toBe('not verified here — Test the endpoint first.');
+  });
+  it('llamacpp present -> "present in Talaria\'s model folder ✓" (sidecar-rule honesty, never "verified")', () => {
+    expect(llamacppPresenceText(true)).toBe("present in Talaria's model folder ✓");
+  });
+  it('llamacpp absent -> "not downloaded"', () => {
+    expect(llamacppPresenceText(false)).toBe('not downloaded');
+  });
+});
+
+describe('ollamaPullButtonLabel / llamacppDownloadButtonLabel — §6 "Pull {tag} (~{size})" / "Download {name} (~{size})"', () => {
+  it('library tier: uses ollamaTag', () => {
+    expect(ollamaPullButtonLabel(catalogModel())).toBe('Pull qwen2.5-coder:1.5b-base (~940 MB)');
+  });
+
+  it('hf-ingest tier (no ollamaTag): falls back to ollamaCreatedName', () => {
+    const devstral = catalogModel({ ollamaTag: undefined, ollamaCreatedName: 'devstral-small-2507:24b', ollamaApproxBytes: 14_333_915_904 });
+    expect(ollamaPullButtonLabel(devstral)).toBe('Pull devstral-small-2507:24b (~13 GB)');
+  });
+
+  it('llamacpp: names the model\'s displayName, not the raw GGUF filename', () => {
+    expect(llamacppDownloadButtonLabel(catalogModel({ displayName: 'Qwen2.5-Coder 1.5B (base)' }), 1_646_573_056)).toBe(
+      'Download Qwen2.5-Coder 1.5B (base) (~1.5 GB)',
+    );
+  });
+});
+
+describe('catalogPreselectId — the ONE picker-preselect rule (A-F8): saved wins, else defaultForRole, else first row', () => {
+  const models = [
+    catalogModel({ id: 'ornith-9b', defaultForRole: undefined }),
+    catalogModel({ id: 'devstral-24b', defaultForRole: true }),
+    catalogModel({ id: 'ornith-35b', defaultForRole: undefined }),
+  ];
+
+  it('a saved modelId that exists in the row set wins over the default row', () => {
+    expect(catalogPreselectId(models, 'ornith-35b')).toBe('ornith-35b');
+  });
+
+  it('no saved id -> falls back to the defaultForRole row', () => {
+    expect(catalogPreselectId(models, undefined)).toBe('devstral-24b');
+  });
+
+  it('a saved id that no longer exists in the row set -> falls back to defaultForRole, not a dangling id', () => {
+    expect(catalogPreselectId(models, 'no-such-row')).toBe('devstral-24b');
+  });
+
+  it('no saved id and no defaultForRole row -> falls back to the first row (never undefined for a non-empty set)', () => {
+    const noDefaults = [catalogModel({ id: 'a' }), catalogModel({ id: 'b' })];
+    expect(catalogPreselectId(noDefaults, undefined)).toBe('a');
+  });
+
+  it('empty row set -> undefined (nothing to preselect)', () => {
+    expect(catalogPreselectId([], undefined)).toBeUndefined();
+  });
+});
+
+describe('configuredModelOutsideCatalog — the CC-8 "configured model" row predicate (FIM/RAG free-text tier)', () => {
+  const models = [catalogModel({ ollamaTag: 'qwen2.5-coder:1.5b-base' }), catalogModel({ id: 'qwen25-coder-7b', ollamaTag: 'qwen2.5-coder:7b-base' })];
+
+  it('empty configured model -> false (nothing to show a row for)', () => {
+    expect(configuredModelOutsideCatalog(models, '')).toBe(false);
+  });
+
+  it('configured model matches a catalog row (:latest-tolerant) -> false', () => {
+    expect(configuredModelOutsideCatalog(models, 'qwen2.5-coder:1.5b-base:latest')).toBe(false);
+  });
+
+  it('configured model matches NO catalog row -> true (the free-text row must render)', () => {
+    expect(configuredModelOutsideCatalog(models, 'nomic-embed-text')).toBe(true);
+  });
+});
+
+describe('testConnectionLabel / servingLine — §6 verbatim', () => {
+  it('testConnectionLabel names the endpoint', () => {
+    expect(testConnectionLabel('http://127.0.0.1:8012')).toBe('Test connection (http://127.0.0.1:8012)');
+  });
+  it('servingLine comma-joins the served model names', () => {
+    expect(servingLine(['qwen2.5-coder:1.5b-base'])).toBe('Serving: qwen2.5-coder:1.5b-base');
+    expect(servingLine(['a', 'b'])).toBe('Serving: a, b');
+  });
+});
+
+describe('cancelPullParams / recheckScopeParams — the exact dispatch payload shapes (CC-9 / scoped recheck)', () => {
+  it('cancelPullParams keys the SAME catalogId used for progress (rule 7)', () => {
+    expect(cancelPullParams('devstral-24b')).toEqual({ op: 'pull', id: 'devstral-24b' });
+  });
+  it('recheckScopeParams narrows to ollama or llamacpp only', () => {
+    expect(recheckScopeParams('ollama')).toEqual({ scope: 'ollama' });
+    expect(recheckScopeParams('llamacpp')).toEqual({ scope: 'llamacpp' });
+  });
+});
+
+describe('backendReadyText — §6 "Backend ready" row, shared template', () => {
+  it('ollama, no version', () => {
+    expect(backendReadyText('ollama')).toBe('Ollama: Ready ✓');
+  });
+  it('ollama, with version appends " — {version}"', () => {
+    expect(backendReadyText('ollama', '0.4.1')).toBe('Ollama: Ready ✓ — 0.4.1');
+  });
+  it('llamacpp, with version', () => {
+    expect(backendReadyText('llamacpp', 'b4500')).toBe('llama.cpp: Ready ✓ — b4500');
+  });
+});
+
+describe('§6 static copy constants — verbatim', () => {
+  it('OLLAMA_MISSING_TEXT', () => expect(OLLAMA_MISSING_TEXT).toBe('Ollama daemon not detected.'));
+  it('LLAMACPP_MISSING_TEXT', () =>
+    expect(LLAMACPP_MISSING_TEXT).toBe('llama-server was not found on your PATH. Install llama.cpp, then re-check.'));
+  it('LLAMACPP_CHECKING_TEXT', () => expect(LLAMACPP_CHECKING_TEXT).toBe('Checking for llama-server…'));
+  it('LLAMACPP_UNKNOWN_TEXT', () => expect(LLAMACPP_UNKNOWN_TEXT).toBe("Couldn't check for llama-server here — press Re-check."));
+  it('LLAMACPP_HONEST_ABSENCE_TEXT', () =>
+    expect(LLAMACPP_HONEST_ABSENCE_TEXT).toBe(
+      'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.',
+    ));
+  it('OLLAMA_DAEMON_DOWN_PULL_REASON', () => expect(OLLAMA_DAEMON_DOWN_PULL_REASON).toBe('Install Ollama first — it performs the download.'));
+  it('CATALOG_DEFAULT_CHIP_LABEL', () => expect(CATALOG_DEFAULT_CHIP_LABEL).toBe('Default'));
+  it('CANCEL_LABEL', () => expect(CANCEL_LABEL).toBe('Cancel'));
+});
+
+describe('provisionModalCopyPinned / provisionModalCopyLiveOid — the two verify-mode copies stay DISTINCT (§2.2.5 A-2)', () => {
+  it('for the SAME displayName/bytes/hfRepo/endpoint, the two templates never collapse into the same string', () => {
+    const pinned = provisionModalCopyPinned('Sweep Next-Edit v2 (7B)', 4_680_000_000, 'SyntinalCo/sweep-next-edit-v2-7B-GGUF', 'http://127.0.0.1:11434');
+    const liveOid = provisionModalCopyLiveOid(
+      'Sweep Next-Edit v2 (7B)',
+      'Q4_K_M',
+      4_680_000_000,
+      'SyntinalCo/sweep-next-edit-v2-7B-GGUF',
+      'Syntinal (us)',
+      'Our own publishing account; artifacts additionally self-pinned by code-committed SHA-256.',
+      'http://127.0.0.1:11434',
+    );
+    expect(pinned).not.toBe(liveOid);
+  });
+
+  it('pinned copy makes the STRONG claim ("against its pinned value") — never the weaker manifest wording', () => {
+    const pinned = provisionModalCopyPinned('X', 1_000_000_000, 'Owner/Repo', 'http://127.0.0.1:11434');
+    expect(pinned).toContain("checksum against its pinned value");
+    expect(pinned).not.toContain("publisher's manifest");
+  });
+
+  it("live-oid copy makes the WEAKER claim (\"against the publisher's manifest\") + names the publisher/trustBasis — never the pinned wording", () => {
+    const liveOid = provisionModalCopyLiveOid('X', 'Q4_K_M', 1_000_000_000, 'Owner/Repo', 'Some Publisher', 'a trust sentence.', 'http://127.0.0.1:11434');
+    expect(liveOid).toContain("checksum against the publisher's manifest");
+    expect(liveOid).toContain('Publisher: Some Publisher — a trust sentence.');
+    expect(liveOid).not.toContain('against its pinned value');
+  });
+});
+
+describe('§6 copy — verbatim + single-sourced (SCOPED source-scan: hand-written panel sources only)', () => {
+  // Scoped to the two hand-written files T10 owns — NOT a bundle-wide grep
+  // (which would trip on `registry.ts`'s own `hf.co` alias string, an
+  // unrelated data literal) and NOT `modelCatalog.ts`/`registry.ts`
+  // themselves (pure DATA, not panel copy).
+  const setupCardsSrc = readFileSync(join(__dirname, 'setupCards.ts'), 'utf-8');
+  const localModelSrc = readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8');
+
+  // Every §6 string this task owns — long/distinctive enough that an
+  // accidental substring match elsewhere would itself be suspicious.
+  const OWNED_VERBATIM_STRINGS = [
+    'Ollama daemon not detected.',
+    'llama-server was not found on your PATH. Install llama.cpp, then re-check.',
+    'Checking for llama-server…',
+    "Couldn't check for llama-server here — press Re-check.",
+    "present in Talaria's model folder ✓",
+    'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.',
+    'Install Ollama first — it performs the download.',
+    'not verified here — Test the endpoint first.',
+  ];
+
+  it('every owned §6 string is defined VERBATIM in setupCards.ts (the single source of truth)', () => {
+    for (const s of OWNED_VERBATIM_STRINGS) {
+      expect(setupCardsSrc).toContain(s);
+    }
+  });
+
+  it('localModel.tsx never RESTATES these strings inline — it only references the setupCards.ts helpers/constants', () => {
+    for (const s of OWNED_VERBATIM_STRINGS) {
+      expect(localModelSrc).not.toContain(s);
+    }
   });
 });

@@ -3,12 +3,12 @@
  * (Task 10, plan doc §6). No React, no `vscode`, no bridge — everything here
  * is a plain function over the shared wire types, unit-testable in a plain
  * node environment (`SetupPanel.test.ts`, the `webview-pure` vitest
- * project). `SetupPanel.tsx` is the ONLY consumer of these; keep it that way
- * so the decisions stay provable without a DOM (mirrors `Toggle.tsx`'s
- * `toggleInteraction` extraction and `settingsField.ts`'s reconcile
- * functions — same discipline, new panel).
+ * project). `SetupPanel.tsx` and, as of beta.6 T10, `localModel.tsx` are the
+ * ONLY consumers of these; keep it that way so the decisions stay provable
+ * without a DOM (mirrors `Toggle.tsx`'s `toggleInteraction` extraction and
+ * `settingsField.ts`'s reconcile functions — same discipline, new panel).
  */
-import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupProgress } from '../protocol';
+import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupProgress } from '../protocol';
 /*
  * T15: `registry.ts` is PURE DATA with zero imports of any kind (Global
  * Constraint 5) — safe to pull straight into the webview bundle, exactly
@@ -527,4 +527,201 @@ export function reconcileDedicatedFormFields(
 ): DedicatedFormFieldState {
   if (selectedId === state.lastSelectedId) return state;
   return initDedicatedFormFieldState(selectedId, defaults);
+}
+
+// --- beta.6 T10 (§4.1/§4.2/§6): LocalModelBlock helpers --------------------
+//
+// `catalogPresence` generalizes `nextPresence` above to ANY catalog row
+// (library-tier `ollamaTag` OR hf-ingest-tier `ollamaCreatedName` — Devstral/
+// Sweep) instead of just the one dedicated-NEXT model. Unlike `nextPresence`,
+// there is no alias table here: per §3.1 (A-F5, deliberate divergence),
+// Devstral recognizes NO hand-pull alias — only Sweep's own `nextPresence`
+// carries that special case, and it stays local to that function.
+
+/** A catalog row's ONE local-Ollama match target: the hf-ingest tier's
+ *  created name when present (Devstral/Sweep — `ollamaTag` is undefined
+ *  there), else the library tier's tag. `undefined` only for a
+ *  (unreachable-in-shipping-data) row with no Ollama entry at all. */
+function catalogOllamaTarget(model: Pick<SetupCatalogModel, 'ollamaTag' | 'ollamaCreatedName'>): string | undefined {
+  return model.ollamaCreatedName ?? model.ollamaTag;
+}
+
+/**
+ * §4.2-style client-side presence derivation, generalized over the whole
+ * catalog (not just the dedicated NEXT model): `'present'`/`'absent'` only
+ * once the daemon is reachable AND `formEndpoint` matches the endpoint
+ * `status()` actually probed — any mismatch (including an unprobed
+ * `undefined`) is honestly `'unknown'`, never a guess (same rule
+ * `nextPresence` applies, C-6).
+ */
+export function catalogPresence(
+  ollama: Pick<SetupData['ollama'], 'running' | 'endpoint' | 'models'>,
+  formEndpoint: string,
+  model: Pick<SetupCatalogModel, 'ollamaTag' | 'ollamaCreatedName'>,
+): NextPresence {
+  if (!ollama.running || formEndpoint !== ollama.endpoint) return 'unknown';
+  const target = catalogOllamaTarget(model);
+  if (target === undefined) return 'unknown';
+  const present = ollama.models.some((m) => ollamaTagsEqual(m.name, target));
+  return present ? 'present' : 'absent';
+}
+
+/** §6 "Model row (ollama)" — DISTINCT wording from the NEXT card's own D2
+ *  line (`nextPresenceText`): `'present ✓'`, not `'✓ Model present on this
+ *  Ollama'`. The 'unknown' text is shared verbatim with `nextPresenceText`
+ *  by coincidence of both being the SAME honest sentence, not by reuse. */
+export function catalogPresenceText(presence: NextPresence): string {
+  switch (presence) {
+    case 'present':
+      return 'present ✓';
+    case 'absent':
+      return 'not present';
+    case 'unknown':
+      return 'not verified here — Test the endpoint first.';
+  }
+}
+
+/** §6 "Model row (llamacpp)" — sidecar-rule honesty: "present in Talaria's
+ *  model folder", never "verified" (§2.2.8 — the hash was proven at write
+ *  time; the persistent line only attests the sidecar, it doesn't re-hash). */
+export function llamacppPresenceText(present: boolean): string {
+  return present ? "present in Talaria's model folder ✓" : 'not downloaded';
+}
+
+/** §6 "Backend ready" — shared template for the two backends that have a
+ *  real installed/missing distinction (vLLM never renders this — it has no
+ *  such distinction, §4.1). */
+export function backendReadyText(backend: 'ollama' | 'llamacpp', version?: string): string {
+  const label = backend === 'ollama' ? 'Ollama' : 'llama.cpp';
+  return version ? `${label}: Ready ✓ — ${version}` : `${label}: Ready ✓`;
+}
+
+export const OLLAMA_MISSING_TEXT = 'Ollama daemon not detected.';
+export const LLAMACPP_MISSING_TEXT = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';
+export const LLAMACPP_CHECKING_TEXT = 'Checking for llama-server…';
+export const LLAMACPP_UNKNOWN_TEXT = "Couldn't check for llama-server here — press Re-check.";
+/** rev 3: fixture/future-rows only — NO shipping row renders it (F-3/F-4
+ *  closed). Overridden per-row by the wire's own `unavailableReason` when the
+ *  host provides one. */
+export const LLAMACPP_HONEST_ABSENCE_TEXT =
+  'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.';
+/** §6 "Ollama rows, daemon down" disabled-Pull reason. */
+export const OLLAMA_DAEMON_DOWN_PULL_REASON = 'Install Ollama first — it performs the download.';
+/** §6 "Post-download (llamacpp, immediate)" — role-agnostic (unlike the FIM/
+ *  RAG ollama-pull nudges, which are surface-specific and stay OUT of this
+ *  shared block — callers pass their own via `ollamaPullSuccessLabel`). */
+export const LLAMACPP_DOWNLOAD_SUCCESS_TEXT = '✓ Downloaded and verified — start the server with the command below.';
+/** §6 "Default chip". */
+export const CATALOG_DEFAULT_CHIP_LABEL = 'Default';
+/** §6 "Cancel" — dispatches `setup.cancel {op:'pull', id:<catalogId>}` (CC-9). */
+export const CANCEL_LABEL = 'Cancel';
+
+/** §6 "Pull {tag} (~{size})" — `{tag}` is the library tier's `ollamaTag`,
+ *  falling back to the hf-ingest tier's `ollamaCreatedName` (Devstral has no
+ *  `ollamaTag` at all — F-5, one vintage everywhere via hf-ingest). */
+export function ollamaPullButtonLabel(model: Pick<SetupCatalogModel, 'ollamaTag' | 'ollamaCreatedName' | 'ollamaApproxBytes'>): string {
+  const tag = catalogOllamaTarget(model) ?? '';
+  const size = formatBytes(model.ollamaApproxBytes);
+  return size ? `Pull ${tag} (~${size})` : `Pull ${tag}`;
+}
+
+/** §6 "Download {name} (~{size})" — `{name}` is the model's `displayName`
+ *  (a human-readable label, unlike the Ollama tier's technical `{tag}`). */
+export function llamacppDownloadButtonLabel(model: Pick<SetupCatalogModel, 'displayName'>, approxBytes: number): string {
+  const size = formatBytes(approxBytes);
+  return size ? `Download ${model.displayName} (~${size})` : `Download ${model.displayName}`;
+}
+
+/**
+ * rev 3 (A-F8) — THE ONE picker-preselect rule, used both to initialize a
+ * picker's selection AND by [Change model]'s prefill: the already-saved
+ * model wins when it still names a row in the current set; otherwise the
+ * `defaultForRole` row; otherwise (fixture-only — production catalogs always
+ * carry exactly one `defaultForRole` row per role) the first row. `undefined`
+ * only for an empty row set.
+ */
+export function catalogPreselectId(models: readonly Pick<SetupCatalogModel, 'id' | 'defaultForRole'>[], savedModelId?: string): string | undefined {
+  if (savedModelId !== undefined && models.some((m) => m.id === savedModelId)) return savedModelId;
+  return models.find((m) => m.defaultForRole)?.id ?? models[0]?.id;
+}
+
+/**
+ * CC-8 — the "configured model" free-text row's render predicate: true when
+ * the currently-configured Ollama model (`fim.model` / `rag.embedModel`)
+ * names something OUTSIDE the catalog (`:latest`-tolerant against every
+ * row's `ollamaTag`) — the signal FIM/RAG (T11/T14) use to render their own
+ * legacy free-text pull row above the catalog picker, wired to the existing
+ * `setup.pullModel` library tier (beta.5 capability preserved, unchanged).
+ */
+export function configuredModelOutsideCatalog(models: readonly Pick<SetupCatalogModel, 'ollamaTag'>[], configuredModel: string): boolean {
+  const trimmed = configuredModel.trim();
+  if (!trimmed) return false;
+  return !models.some((m) => m.ollamaTag !== undefined && ollamaTagsEqual(m.ollamaTag, trimmed));
+}
+
+/** §6 "Test button" — shared with the FIM Connect/Install tabs' own inline
+ *  usage; single-sourced here for the block. */
+export function testConnectionLabel(endpoint: string): string {
+  return `Test connection (${endpoint})`;
+}
+
+/** §6 "Serving line (post-Test)" — from the widened `setup.testRemote`
+ *  result's `models` (CC-2). */
+export function servingLine(models: readonly string[]): string {
+  return `Serving: ${models.join(', ')}`;
+}
+
+/** CC-9 — the exact `setup.cancel` payload shape for a catalog row's
+ *  in-flight pull/download, keyed by the SAME id used for progress (rule 7,
+ *  `progressKey('pull', catalogId)`). */
+export function cancelPullParams(catalogId: string): { op: 'pull'; id: string } {
+  return { op: 'pull', id: catalogId };
+}
+
+/** The block's own scoped `setup.recheck` payload — narrower than the full
+ *  `SetupMethod` param validation (T9), since the block only ever re-checks
+ *  the ONE backend pane it renders. */
+export function recheckScopeParams(scope: 'ollama' | 'llamacpp'): { scope: 'ollama' | 'llamacpp' } {
+  return { scope };
+}
+
+/**
+ * §6 "Provision modal — pinned" (ollama-ingest arm), reproduced VERBATIM
+ * from the host's `composePinnedOllamaModal` (`SetupController.ts` — not
+ * webview-safe, so not imported; same "reproduced here" discipline as
+ * `SetupCatalogModel` mirroring the host's `CatalogModel`). The ACTUAL modal
+ * is a native confirmation shown host-side before any download starts — this
+ * webview never renders it — so this function exists purely to keep the two
+ * verify-mode copies SINGLE-SOURCED and provably DISTINCT (§2.2.5 A-2: "T10
+ * must not collapse them"), for any future in-panel preview to reuse.
+ */
+export function provisionModalCopyPinned(displayName: string, approxBytes: number, hfRepo: string, endpoint: string): string {
+  return (
+    `Download '${displayName}' (~${(approxBytes / 1e9).toFixed(1)} GB) and install it into your local Ollama? ` +
+    `Source: huggingface.co/${hfRepo} — Syntinal's build converted from Sweep's official release. ` +
+    "Talaria verifies the file's checksum against its pinned value after downloading, " +
+    `and Ollama verifies it again during install at ${endpoint}.`
+  );
+}
+
+/** §6 "Provision modal — live-oid" (ollama-ingest arm), reproduced VERBATIM
+ *  from the host's `composeLiveOidOllamaModal` — see {@link provisionModalCopyPinned}'s
+ *  doc for why this is a reproduction, not an import. Deliberately the
+ *  WEAKER claim ("against the publisher's manifest", not "its pinned
+ *  value") — the honest basis for the allowlist tier (§2.2.5). */
+export function provisionModalCopyLiveOid(
+  displayName: string,
+  quant: string,
+  approxBytes: number,
+  hfRepo: string,
+  publisherName: string,
+  trustBasis: string,
+  endpoint: string,
+): string {
+  return (
+    `Download '${displayName}' (${quant}, ~${(approxBytes / 1e9).toFixed(1)} GB) from huggingface.co/${hfRepo}? ` +
+    `Publisher: ${publisherName} — ${trustBasis} ` +
+    "Talaria verifies the file's checksum against the publisher's manifest after downloading, " +
+    `and Ollama verifies it again during install at ${endpoint}.`
+  );
 }
