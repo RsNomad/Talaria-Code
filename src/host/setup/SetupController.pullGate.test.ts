@@ -157,6 +157,15 @@ function makeGateController(opts: { tree?: unknown; treeStatus?: number } = {}):
       emitIngestProgress.fn = onProgress;
       if (ingestBehavior.reject) throw ingestBehavior.reject;
     },
+    // T6 (beta.6): the pull-gate suite never calls status() — these exist
+    // only to satisfy the deps shape (and to fail loudly if ever reached).
+    locateLlamaServer: () => new Promise<never>(() => {}),
+    scanStorePresence: async () => new Map<string, boolean>(),
+    storeDest: () => ({ ok: false, reason: 'not used here' }),
+    checkedStoreDest: async () => ({ ok: false, reason: 'not used here' }),
+    downloadGgufToStore: async () => {
+      throw new Error('not used here');
+    },
   };
   const controller = new SetupController(host, deps);
   return { host, controller, calls, ingestArgs, emitIngestProgress, ingestBehavior };

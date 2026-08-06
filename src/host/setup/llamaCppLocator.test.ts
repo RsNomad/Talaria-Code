@@ -275,6 +275,51 @@ describe('locateLlamaServer — §2.4 truth table: found / not-found / probe-tim
   });
 });
 
+describe('locateLlamaServer — optional AbortSignal (doc §2.4 line 308 signature; T5 CR-1 / T6)', () => {
+  it('an ALREADY-aborted signal rejects AbortError before any exec call (throwIfAborted at start)', async () => {
+    const { exec, calls } = scriptedExec([FOUND, VERSION_HIT]);
+    const abort = new AbortController();
+    abort.abort();
+
+    await expect(locateLlamaServer(exec, abort.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a signal aborted DURING step 0 rejects between the two exec steps — the --version probe never runs', async () => {
+    const abort = new AbortController();
+    const { exec, calls } = scriptedExec([
+      {
+        match: /^command -v llama-server$/,
+        respond: () => {
+          // Abort lands while step 0 is in flight (e.g. a scoped recheck
+          // superseding this probe) — the lookup still resolves, but the
+          // between-steps check must refuse before the version exec.
+          abort.abort();
+          return '/usr/local/bin/llama-server\n';
+        },
+      },
+      VERSION_HIT,
+    ]);
+
+    await expect(locateLlamaServer(exec, abort.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(calls).toHaveLength(1);
+    expect(calls.some((c) => c.cmdline.includes('--version'))).toBe(false);
+  });
+
+  it('an unaborted signal changes nothing (back-compat: same result as the signal-less call)', async () => {
+    const { exec } = scriptedExec([FOUND, VERSION_HIT]);
+    const abort = new AbortController();
+
+    const result = await locateLlamaServer(exec, abort.signal);
+
+    expect(result).toEqual({
+      ok: true,
+      path: '/usr/local/bin/llama-server',
+      version: 'version: b4570 (a1b2c3d)',
+    });
+  });
+});
+
 describe('isExecTimeout — classifies a timeout kill, excludes a maxBuffer kill (cloned from pipxLocator)', () => {
   it('killed:true + signal:SIGTERM (a genuine timeout kill) -> true', () => {
     expect(isExecTimeout(execTimeoutError())).toBe(true);

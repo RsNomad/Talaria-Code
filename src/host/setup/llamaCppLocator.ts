@@ -90,14 +90,29 @@ export function isExecTimeout(err: unknown): boolean {
   return killedOrSigterm && e.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
 }
 
+/** T6 (doc §2.4 line 308, `locateLlamaServer(exec, signal?)`):
+ *  `locateLlamaServer`'s optional cancellation seam — checked at the start
+ *  and BETWEEN the two exec steps (the step-0 lookup and the best-effort
+ *  version probe), matching the `throwIfAborted` pattern `pipxLocator.ts`
+ *  already uses for its own three-step pipeline. The controller's settled-
+ *  value memo passes each probe's own `AbortController.signal` so a scoped
+ *  `setup.recheck {scope:'llamacpp'}` can cancel a superseded probe. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted.', 'AbortError');
+  }
+}
+
 /**
  * Locate `llama-server` and (best-effort) its version. Never throws for the
  * two SCRIPTED failure modes (`not-found`, `probe-timeout`) — those are
- * returned as typed results.
+ * returned as typed results. An aborted `signal` propagates as a rejected
+ * `AbortError` (checked between steps only — see {@link throwIfAborted}).
  */
-export async function locateLlamaServer(exec: ExecLookup): Promise<LlamaCppLocateResult> {
+export async function locateLlamaServer(exec: ExecLookup, signal?: AbortSignal): Promise<LlamaCppLocateResult> {
   const cwd = os.homedir();
 
+  throwIfAborted(signal);
   const lookup = await findLlamaServerPath(exec, cwd);
   if (lookup.kind === 'probe-timeout') {
     return { ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_DETAIL };
@@ -112,6 +127,7 @@ export async function locateLlamaServer(exec: ExecLookup): Promise<LlamaCppLocat
     };
   }
 
+  throwIfAborted(signal);
   const version = lookup.version ?? (await tryGetVersion(exec, lookup.path, cwd));
   return { ok: true, path: lookup.path, ...(version ? { version } : {}) };
 }

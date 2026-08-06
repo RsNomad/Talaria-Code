@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { execFile, spawn as nodeSpawn } from 'node:child_process';
-import { access, readFile, mkdir, rename, writeFile } from 'node:fs/promises';
+import { access, readFile, lstat, stat, mkdir, rename, writeFile } from 'node:fs/promises';
 import { createWriteStream, createReadStream } from 'node:fs';
 import { unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -11,8 +11,27 @@ import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
 import { verifyHfDigest } from './setup/hfDigest';
-import { ingestGguf, type GgufIngestIo, type GgufStoreIo, type TempWriteHandle, type TempReadStream } from './setup/ggufIngest';
+import {
+  downloadGgufToStore,
+  ingestGguf,
+  type GgufIngestIo,
+  type GgufStoreIo,
+  type TempWriteHandle,
+  type TempReadStream,
+} from './setup/ggufIngest';
 import { probeRemote } from './setup/remoteProbe';
+import { locateLlamaServer, type LlamaCppLocateResult } from './setup/llamaCppLocator';
+import {
+  ggufDest,
+  lstatCheckedGgufDest,
+  scanPresence,
+  storeRoot,
+  type GgufDestResult,
+  type ModelStoreEnv,
+  type ModelStoreLstatIo,
+  type ModelStorePresenceIo,
+} from './setup/modelStore';
+import { MODEL_CATALOG } from './setup/modelCatalog';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
 import type { AdvertisedAuthMethod, SetupHost, SetupControllerDeps } from './setup/SetupController';
 import { createVsCodeNextEditConfigPort } from '../autocomplete/nextedit/guard';
@@ -331,6 +350,107 @@ export function createReadOsRelease(
   };
 }
 
+// --- T6 (beta.6): llama.cpp locator + modelStore fs bindings ------------------
+
+/**
+ * The `SetupControllerDeps.locateLlamaServer` binding (beta.6 §2.4/§2.5).
+ * On win32 (the dev-gate host — same posture as {@link createReadOsRelease})
+ * NO probe ever spawns: `command -v` via a login shell is a POSIX recipe,
+ * and pretending to run it would fabricate a "not installed" verdict. The
+ * typed `probe-timeout` result maps controller-side to the honest wire
+ * state `'unknown'` ("couldn't check here"), never `'missing'` (CC-5).
+ * `platform` is injectable for tests only; production uses `process.platform`.
+ */
+export function createLocateLlamaServer(
+  exec: ExecLookup,
+  platform: string = process.platform,
+): (signal?: AbortSignal) => Promise<LlamaCppLocateResult> {
+  return (signal) =>
+    platform === 'win32'
+      ? Promise.resolve<LlamaCppLocateResult>({
+          ok: false,
+          reason: 'probe-timeout',
+          detail: 'llama-server detection only runs on Linux/macOS hosts — no probe was attempted here.',
+        })
+      : locateLlamaServer(exec, signal);
+}
+
+/** Narrow errno classifier for the fs bindings below — never throws. */
+function isErrnoCode(err: unknown, codes: readonly string[]): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && codes.includes(code);
+}
+
+/**
+ * The `modelStore.ModelStoreLstatIo` binding (T4→T6, SC-A-3): bound to
+ * `fs.promises.LSTAT — NEVER `stat`, which FOLLOWS the very link the symlink
+ * refusal exists to catch. ONLY `ENOENT` collapses to `null` ("this level
+ * does not exist yet — mkdir -p will legitimately create it"); ANY other
+ * rejection (EACCES, EIO, …) propagates unchanged, so an unreadable store
+ * level refuses instead of silently passing the gate (fail-closed).
+ * `lstatImpl` is injectable for tests only.
+ */
+export function createModelStoreLstatIo(
+  lstatImpl: (path: string) => Promise<{ isSymbolicLink(): boolean }> = lstat,
+): ModelStoreLstatIo {
+  return {
+    lstat: async (path) => {
+      try {
+        return await lstatImpl(path);
+      } catch (err) {
+        if (isErrnoCode(err, ['ENOENT'])) return null;
+        throw err;
+      }
+    },
+  };
+}
+
+/** Injectable seams for {@link createModelStorePresenceIo} — real fs/env by
+ *  default; tests inject fakes (the {@link OsReleaseReadSeams} discipline). */
+export interface ModelStorePresenceSeams {
+  env: ModelStoreEnv;
+  readFileImpl(path: string): Promise<string>;
+  statSizeImpl(path: string): Promise<number>;
+}
+
+/** Codes that mean "the path does not exist" for the presence scan —
+ *  `ENOTDIR` included per the `ModelStorePresenceIo` seam doc (a path
+ *  THROUGH a plain file is a non-existence condition, not a failure). */
+const NONEXISTENCE_CODES = ['ENOENT', 'ENOTDIR'] as const;
+
+/**
+ * The `modelStore.ModelStorePresenceIo` binding (T4→T6, §2.2.8): sidecar
+ * text reads + byte-size stats for `scanPresence`, with non-existence
+ * collapsed to `null` and every REAL failure propagated (the controller's
+ * `safeScanStorePresence` degrades those fail-closed to all-absent).
+ * Nothing here ever hashes — presence is the sidecar's attestation.
+ */
+export function createModelStorePresenceIo(seams?: Partial<ModelStorePresenceSeams>): ModelStorePresenceIo {
+  const env = seams?.env ?? process.env;
+  const readFileImpl = seams?.readFileImpl ?? ((path: string) => readFile(path, 'utf8'));
+  const statSizeImpl = seams?.statSizeImpl ?? ((path: string) => stat(path).then((s) => s.size));
+  return {
+    env,
+    readFile: async (path) => {
+      try {
+        return await readFileImpl(path);
+      } catch (err) {
+        if (isErrnoCode(err, NONEXISTENCE_CODES)) return null;
+        throw err;
+      }
+    },
+    statSize: async (path) => {
+      try {
+        return await statSizeImpl(path);
+      } catch (err) {
+        if (isErrnoCode(err, NONEXISTENCE_CODES)) return null;
+        throw err;
+      }
+    },
+  };
+}
+
 // --- SetupControllerDeps (Task 3-7 engines, bound to real adapters) ----------
 
 /** `fetch` reached via `globalThis.fetch(...)` (never a bare reference) —
@@ -353,6 +473,10 @@ export function createSetupControllerDeps(
   const spawn = createNodeSpawnFn();
   const fileExists = createNodeFileExists();
   const ggufIo = createNodeGgufIngestIo();
+  // T6 (beta.6): the modelStore fs seams + the llama.cpp locator binding.
+  const modelStoreLstatIo = createModelStoreLstatIo();
+  const presenceIo = createModelStorePresenceIo();
+  const boundLocateLlamaServer = createLocateLlamaServer(exec);
   return {
     // T11 (§3, critic C-11): thread the caller's abort signal through so
     // `handleInstall`'s Cancel can actually reach a wedged login-shell probe
@@ -382,6 +506,29 @@ export function createSetupControllerDeps(
     // factory (matches its own doc); constructing one per call is cheap.
     getNextEditSource: () => createVsCodeNextEditConfigPort().get(),
     getAdvertisedAuthMethods,
+    // --- T6 (beta.6): the Phase-0 engines, bound -----------------------------
+    // §2.4/§2.5: the llama-server probe (win32-gated, signal-threaded).
+    locateLlamaServer: boundLocateLlamaServer,
+    // §2.2.8: ONE sidecar-attested presence scan over the whole catalog.
+    scanStorePresence: () => scanPresence(presenceIo, MODEL_CATALOG),
+    // READ-ONLY dest composition (run-command display) — storeRoot + ggufDest.
+    storeDest: (hfRepo, file): GgufDestResult => {
+      const root = storeRoot(presenceIo.env);
+      return root.ok ? ggufDest(root.root, hfRepo, file) : root;
+    },
+    // SC-A-3 (T7's WRITE gate): storeRoot + the lstat-checked, symlink-
+    // refusing dest — callers must use THIS (never `ggufDest`) before any
+    // store write.
+    checkedStoreDest: async (hfRepo, file): Promise<GgufDestResult> => {
+      const root = storeRoot(presenceIo.env);
+      if (!root.ok) return root;
+      return lstatCheckedGgufDest(modelStoreLstatIo, root.root, hfRepo, file);
+    },
+    // §2.4: the T3 atomic file sink over the SAME bound `ggufIo` object
+    // `ingestGguf` rides (it satisfies GgufStoreIo too — see
+    // createNodeGgufIngestIo's doc).
+    downloadGgufToStore: (spec, destDir, destFile, onProgress, signal) =>
+      downloadGgufToStore(ggufIo, spec, destDir, destFile, onProgress, signal),
   };
 }
 

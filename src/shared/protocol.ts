@@ -653,6 +653,57 @@ export type AgentSetupPhase =
   | 'error';
 
 /**
+ * beta.6 §1.3 (T6): one verified-catalog model row as it crosses the wire —
+ * the unified "Local Model" component's per-row data. Structural mirror of
+ * the host engine's `CatalogModel` (`src/host/setup/modelCatalog.ts`) —
+ * reproduced here, not imported, per this module's webview-safe
+ * zero-host-imports rule (section header doc). The webview only ever sends
+ * back `id` (`setup.provisionModel` re-resolves everything host-side); every
+ * command string here is HOST-composed from charset-asserted catalog data —
+ * the webview renders text, never composes it (Global Constraint 1).
+ */
+export interface SetupCatalogModel {
+  /** Catalog id — the ONLY thing the webview may send back. */
+  id: string;
+  role: 'agent' | 'fim' | 'embedding' | 'next';
+  displayName: string;
+  publisher: string;
+  license: string;
+  /** rev 3 — picker preselect, "Default" chip, §3.5 recs strip. EXACTLY one per role. */
+  defaultForRole?: boolean;
+  contextWindow?: number;
+  /** §6 honesty line. */
+  vramLine: string;
+  /** §6 base-build / mmproj / MoE / ctx notes. */
+  note?: string;
+  /** == id — the ONE pull/cancel/progress key (rule 7). */
+  progressId: string;
+  /** Library tier only. Presence is derived CLIENT-side against `setup.ollama.models` (C-6). */
+  ollamaTag?: string;
+  /** rev 2 (CC-3) — renders `Pull {tag} (~{size})` / `Download {name} (~{size})`. */
+  ollamaApproxBytes?: number;
+  /**
+   * hf-ingest tier (sweep AND devstral — rev 3). LOAD-BEARING: the block's
+   * client-side `/api/tags` presence check keys on it.
+   */
+  ollamaCreatedName?: string;
+  llamacpp?: {
+    file: string;
+    approxBytes: number;
+    /** §2.2.8 sidecar rule — "present in Talaria's model folder", never "verified". */
+    present: boolean;
+    available: boolean;
+    /** rev 3: NO shipping row uses it (F-3/F-4 closed) — kept for future
+     *  rows; §6 honest-absence copy, host-composed. */
+    unavailableReason?: string;
+    /** ONLY when present && sidecar-attested (§2.2.8). */
+    runCommand?: string;
+  };
+  /** Composed ONLY after the SC-2 compose-time gate passes (§2.2.6). */
+  vllm?: { runCommand: string };
+}
+
+/**
  * Setup / Talaria Config panel payload — one snapshot covering all five
  * readiness cards (§6): agent, provider, FIM/autocomplete, NEXT, RAG, plus
  * the Ollama local-daemon status the FIM/NEXT local-install tabs read from.
@@ -720,6 +771,15 @@ export interface SetupData {
     model: string;
     /** `endpoint`+`model` both non-empty. */
     dedicatedConfigured: boolean;
+    /**
+     * beta.6 rev 2 (CC-10, §4.2): which unified-block backend pane the NEXT
+     * dedicated setup was configured through (`'ollama'` / `'llamacpp'` /
+     * `'vllm'` / `'openai-compat'` — a new `talaria.nextEdit.
+     * dedicatedBackendId` setting, T8) — restoration source for the block's
+     * selected pane; absent = the existing transport heuristic. Shape pinned
+     * by T6; populated by T8. OPTIONAL + additive.
+     */
+    dedicatedBackendId?: string;
     /** Whether the current FIM backend supports the `generic` (reuse) source. */
     genericSupported: boolean;
     refusalDetail?: string;
@@ -762,6 +822,13 @@ export interface SetupData {
   rag: {
     enabled: boolean;
     embedEndpoint: string;
+    /**
+     * beta.6 rev 2 (CC-10, §3.4/§4.2): which backend the RAG embedder block
+     * is configured against (a new `talaria.rag.embedBackend` setting, T8) —
+     * restoration source for the block's selected pane; absent = ollama.
+     * Shape pinned by T6; populated by T8. OPTIONAL + additive.
+     */
+    embedBackend?: 'ollama' | 'llamacpp' | 'openai-compat';
     embedModel: string;
     embedModelPresent: boolean;
     tuning: { dims: number; maxChunkTokens: number; debounceMs: number; excludeGlobs: string[] };
@@ -777,6 +844,53 @@ export interface SetupData {
    * OPTIONAL + additive (Global Constraint 6) — always populated since beta.5.
    */
   ollama: { running: boolean; version?: string; endpoint?: string; models: { name: string; sizeBytes: number }[] };
+  /**
+   * beta.6 §1.3 (T6): the verified model catalog, projected row-by-row from
+   * `MODEL_CATALOG` (13 rows). OPTIONAL + additive (Global Constraint 6) —
+   * always populated since beta.6.
+   */
+  catalog?: { models: SetupCatalogModel[] };
+  /**
+   * beta.6 §1.3/§2.5 (T6): the llama.cpp `llama-server` runtime state — a
+   * SETTLED-VALUE memo, not an awaited probe: `status()` kicks the probe
+   * lazily and returns `'checking'` immediately; the settle fires ONE
+   * `onStatusChanged` (the seq-guarded push repaints). `probe-timeout` (and
+   * win32, where no probe ever runs) map to `'unknown'`, NEVER `'missing'`
+   * (CC-5 — a timeout is not "not found"). OPTIONAL + additive.
+   */
+  llamacppRuntime?: {
+    binary: 'checking' | 'found' | 'missing' | 'unknown';
+    version?: string;
+    /** `~`-redacted. */
+    path?: string;
+    /**
+     * rev 2 (CC-4) — the `agent.bootstrap` pattern: present iff
+     * `binary === 'missing'`. `command` is the OS engine's exact pre-typed
+     * line for the detected family; absent `command` = guidance-only distro
+     * (debian/unknown/container) — the webview renders text only.
+     */
+    install?: { command?: string; guidance: string; docsUrl: string };
+  };
+  /**
+   * beta.6 §1.3 (T8): the "Configure Local Agent Model" block's wire state —
+   * host-owned endpoint defaults (CC-6), the saved selection (+ a run
+   * command recomposed from the SAVED endpoint's port), and the §6
+   * provider-guidance variant picked per `provider.phase` (CC-7). Shape
+   * pinned by T6; POPULATED by T8 (which owns the three
+   * `talaria.agent.localModel.*` settings). OPTIONAL + additive.
+   */
+  agentLocalModel?: {
+    endpointDefaults: { ollama: string; llamacpp: string; vllm: string };
+    saved?: {
+      modelId: string;
+      backend: 'ollama' | 'llamacpp' | 'vllm';
+      endpoint: string;
+      runCommand?: string;
+      /** What to type into the provider wizard (ollama: the tag/created name; llamacpp: the GGUF model name; vllm: the serveRepo). */
+      servedName: string;
+    };
+    providerGuidance?: string;
+  };
   /** Composite "you're ready" banner: agent ready + provider configured + FIM probe OK. */
   ready: boolean;
   /**

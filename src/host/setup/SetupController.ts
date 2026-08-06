@@ -11,8 +11,20 @@ import type { HermesPaths, InstallEvent } from './pipxInstaller';
 import type { OllamaStatus, PullProgress } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
 import { validateEndpointUrl } from './remoteProbe';
+import { MODEL_CATALOG, TRUSTED_HF_PUBLISHERS, VLLM_ONLY_SERVE_REPOS, assertCatalogSource } from './modelCatalog';
+import type { CatalogModel, CatalogRole } from './modelCatalog';
+import type { LlamaCppLocateResult } from './llamaCppLocator';
+import type { GgufDestResult } from './modelStore';
+import type { GgufStoreSpec } from './ggufIngest';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
-import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupMethod, SetupProgress } from '../../shared/protocol';
+import type {
+  AgentSetupPhase,
+  SetupBackendOption,
+  SetupCatalogModel,
+  SetupData,
+  SetupMethod,
+  SetupProgress,
+} from '../../shared/protocol';
 
 /**
  * SetupController — the host-side brain for Setup / Talaria Config
@@ -289,6 +301,56 @@ export interface SetupControllerDeps {
     onProgress: (p: PullProgress) => void,
     signal: AbortSignal,
   ): Promise<void>;
+  /**
+   * T6 (beta.6 §2.4/§2.5): the T5 `llama-server` locator, bound to
+   * `locateLlamaServer(exec, signal)` by the caller. The binding NEVER
+   * probes on win32 — it resolves `{ok:false, reason:'probe-timeout'}`
+   * there, which this controller maps (like every probe-timeout) to the
+   * honest wire state `'unknown'`, never `'missing'` (CC-5). The `signal`
+   * is each probe attempt's own — a scoped `setup.recheck
+   * {scope:'llamacpp'}` aborts the superseded attempt through it.
+   */
+  locateLlamaServer(signal?: AbortSignal): Promise<LlamaCppLocateResult>;
+  /**
+   * T6 (beta.6 §2.2.8): ONE sidecar-attested presence scan over the whole
+   * `MODEL_CATALOG` — bound to `modelStore.scanPresence(io, MODEL_CATALOG)`
+   * over the real fs/env seams by the caller. Keyed by catalog id; a row
+   * absent from the map reads as not-present. Awaited inside `status()`
+   * BEFORE the CR-002 synchronous tail (a cheap stat pass — §2.5); a
+   * rejection is caught by {@link SetupController.safeScanStorePresence}
+   * and degrades fail-closed to all-absent.
+   */
+  scanStorePresence(): Promise<ReadonlyMap<string, boolean>>;
+  /**
+   * T6 (beta.6 §2.5): READ-ONLY store-dest composition (`storeRoot` +
+   * `ggufDest` over the real env) — used solely to compose the display
+   * `runCommand` for a file the scan already attested present. Never used
+   * ahead of a WRITE — the write path must go through
+   * {@link checkedStoreDest} (symlink-refusing) instead.
+   */
+  storeDest(hfRepo: string, file: string): GgufDestResult;
+  /**
+   * T6→T7 (beta.6 SC-A-3): the WRITE gate — `storeRoot` +
+   * `lstatCheckedGgufDest` (lstat-based, symlink-refusing, ENOENT-tolerant)
+   * over the real fs seams. T7's `handleProvisionModel` MUST resolve its
+   * destination through THIS (never {@link storeDest}) before ever calling
+   * {@link downloadGgufToStore}.
+   */
+  checkedStoreDest(hfRepo: string, file: string): Promise<GgufDestResult>;
+  /**
+   * T6→T7 (beta.6 §2.4): the T3 atomic file sink (`downloadGgufToStore`),
+   * bound to the real `GgufStoreIo` (the same `ggufIo` object `ingestGguf`
+   * rides) by the caller. Consumed by T7's `handleProvisionModel`
+   * llamacpp branch; declared here so the binding lands with the rest of
+   * the T6 wiring.
+   */
+  downloadGgufToStore(
+    spec: GgufStoreSpec,
+    destDir: string,
+    destFile: string,
+    onProgress: (p: PullProgress) => void,
+    signal: AbortSignal,
+  ): Promise<void>;
 }
 
 // --- misc constants -------------------------------------------------------
@@ -470,6 +532,28 @@ export class SetupController {
    *  the file may have become readable). */
   private osResolution?: Promise<OsResolution>;
 
+  /**
+   * T6 (beta.6 §2.5): the llama.cpp runtime SETTLED-VALUE memo — deliberately
+   * NOT the awaited {@link osResolution} pattern (which cannot express
+   * `'checking'`): `status()` kicks the probe once (lazily, {@link
+   * kickLlamaCppProbe}) and returns immediately with `'checking'`; the
+   * probe's settle writes this field and fires {@link onStatusChanged}
+   * exactly ONCE (the seq-guarded push repaints). `undefined` = not settled
+   * yet. The `path` is stored ALREADY `~`-redacted (T6 M-3 discipline).
+   */
+  private llamaCppRuntime?: { binary: 'found' | 'missing' | 'unknown'; version?: string; path?: string };
+  /** True while a probe attempt is in flight — with {@link llamaCppRuntime}
+   *  `undefined` + this false, the next `status()` kicks a fresh probe. */
+  private llamaCppProbeInFlight = false;
+  /** The in-flight probe attempt's AbortController — a scoped recheck (and
+   *  {@link dispose}) aborts it so a superseded login-shell probe dies
+   *  instead of lingering (T5 CR-1 signal threading). */
+  private llamaCppProbeAbort?: AbortController;
+  /** Monotonic supersession guard: bumped by {@link rekickLlamaCppProbe} so a
+   *  SUPERSEDED probe settling late can neither overwrite the fresh state
+   *  nor fire a stray push. */
+  private llamaCppProbeEpoch = 0;
+
   constructor(
     private readonly host: SetupHost,
     private readonly deps: SetupControllerDeps,
@@ -480,6 +564,11 @@ export class SetupController {
       if (state.timer) clearTimeout(state.timer);
     }
     this.throttle.clear();
+    // T6: supersede + cancel any in-flight llama.cpp probe — its late settle
+    // must neither write state nor fire into the (now-cleared) emitter.
+    this.llamaCppProbeEpoch += 1;
+    this.llamaCppProbeAbort?.abort();
+    this.llamaCppProbeAbort = undefined;
     this.progressEmitter.dispose();
     this.statusChangedEmitter.dispose();
   }
@@ -507,6 +596,10 @@ export class SetupController {
 
   async status(): Promise<SetupData> {
     const trusted = this.host.isTrusted();
+    // T6 (§2.5): kick the llama.cpp probe FIRST (lazy, non-blocking — the
+    // settled-value memo, see kickLlamaCppProbe) so it runs concurrently
+    // with the awaits below; this call never waits on it.
+    this.kickLlamaCppProbe();
     const apiKeySet = await this.host.secrets.has(AUTOCOMPLETE_API_KEY_SECRET);
     // T5 §1.2: interpreted (memoized) OS identity — drives the `os` block
     // and, per phase, the engine-composed bootstrap / python plans below.
@@ -515,6 +608,11 @@ export class SetupController {
     const ollamaDescriptor = this.deps.registry.getBackend('ollama');
     const ollamaEndpoint = ollamaDescriptor?.remote?.endpoint.defaultValue ?? DEFAULT_OLLAMA_ENDPOINT;
     const ollamaStatus = await this.safeProbeOllama(ollamaEndpoint);
+    // T6 (§2.5 ordering constraint): the store scan is a cheap stat pass
+    // awaited HERE, alongside safeProbeOllama — strictly BEFORE the CR-002
+    // synchronous tail below, so the emitted snapshot always carries a
+    // RESOLVED presence map (locked by the ordering test).
+    const storePresence = await this.safeScanStorePresence();
 
     const hermesPath = (this.host.getSetting<string>('talaria.hermesPath') ?? '').trim();
     const configuredBackend = this.host.getSetting<string>('talaria.backend') ?? 'mock';
@@ -659,6 +757,13 @@ export class SetupController {
       ollama: ollamaStatus.running
         ? { running: true, endpoint: ollamaEndpoint, models: ollamaStatus.models }
         : { running: false, endpoint: ollamaEndpoint, models: [] },
+      // T6 (beta.6 §1.3): the verified catalog, all 13 rows, projected
+      // against the resolved presence map (llamacpp cells + SC-2-gated vllm
+      // cells composed by the pure helpers below).
+      catalog: { models: MODEL_CATALOG.map((m) => this.projectCatalogModel(m, storePresence)) },
+      // T6 (beta.6 §2.5): the settled-value memo's current truth —
+      // 'checking' until the kicked probe settles.
+      llamacppRuntime: this.composeLlamaCppRuntime(osInfo),
       ready,
       os: {
         family: osInfo.family,
@@ -701,9 +806,138 @@ export class SetupController {
     return { release, family, manager: managerFor(family) };
   }
 
+  // --- T6: llama.cpp runtime settled-value memo (§2.5) ----------------------
+
+  /**
+   * Kick the `llama-server` probe ONCE, lazily — a no-op while a settled
+   * value exists or an attempt is already in flight. The settle writes
+   * {@link llamaCppRuntime} and fires {@link onStatusChanged} exactly once;
+   * a settle whose epoch was superseded (scoped recheck / dispose) is
+   * DROPPED entirely. Mapping (CC-5): found ⇒ `'found'`, `not-found` ⇒
+   * `'missing'`, `probe-timeout` ⇒ `'unknown'` (never `'missing'`); a
+   * REJECTING binding also settles `'unknown'` — a probe failure must never
+   * become an unhandled rejection out of a fire-and-forget kick.
+   */
+  private kickLlamaCppProbe(): void {
+    if (this.llamaCppRuntime !== undefined || this.llamaCppProbeInFlight) return;
+    this.llamaCppProbeInFlight = true;
+    const epoch = this.llamaCppProbeEpoch;
+    const abort = new AbortController();
+    this.llamaCppProbeAbort = abort;
+    void (async () => {
+      let settled: NonNullable<SetupController['llamaCppRuntime']>;
+      try {
+        const result = await this.deps.locateLlamaServer(abort.signal);
+        settled = result.ok
+          ? {
+              binary: 'found',
+              ...(result.version !== undefined ? { version: result.version } : {}),
+              path: this.redact(result.path),
+            }
+          : { binary: result.reason === 'probe-timeout' ? 'unknown' : 'missing' };
+      } catch {
+        // Rejection (incl. an abort racing the settle) ⇒ honest 'unknown';
+        // a superseded epoch is dropped below either way.
+        settled = { binary: 'unknown' };
+      }
+      if (epoch !== this.llamaCppProbeEpoch) return; // superseded — the fresh probe owns the state
+      this.llamaCppRuntime = settled;
+      this.llamaCppProbeInFlight = false;
+      this.llamaCppProbeAbort = undefined;
+      this.statusChangedEmitter.fire();
+    })();
+  }
+
+  /** Clear state + memo, cancel the superseded attempt, and re-kick WITHOUT
+   *  awaiting — `setup.recheck {scope:'llamacpp'}`'s non-blocking re-check
+   *  (the recheck RPC's own budget is untouched). */
+  private rekickLlamaCppProbe(): void {
+    this.llamaCppProbeEpoch += 1;
+    this.llamaCppProbeAbort?.abort();
+    this.llamaCppProbeAbort = undefined;
+    this.llamaCppRuntime = undefined;
+    this.llamaCppProbeInFlight = false;
+    this.kickLlamaCppProbe();
+  }
+
+  /** The wire projection of the memo (§1.3 `llamacppRuntime`): unsettled ⇒
+   *  `'checking'`; `install` present iff `'missing'` (§4.1 — NEVER on
+   *  `'unknown'`, where an install button would assert a fact the probe
+   *  could not establish). */
+  private composeLlamaCppRuntime(osInfo: OsResolution): NonNullable<SetupData['llamacppRuntime']> {
+    const settled = this.llamaCppRuntime;
+    if (settled === undefined) return { binary: 'checking' };
+    return {
+      binary: settled.binary,
+      ...(settled.version !== undefined ? { version: settled.version } : {}),
+      ...(settled.path !== undefined ? { path: settled.path } : {}),
+      ...(settled.binary === 'missing' ? { install: composeLlamacppInstall(osInfo) } : {}),
+    };
+  }
+
+  // --- T6: catalog wire projection (§1.3) -----------------------------------
+
+  /** {@link SetupControllerDeps.scanStorePresence} can reject (a non-ENOENT
+   *  fs failure inside the store) — `status()` must stay total, so that
+   *  degrades FAIL-CLOSED to an empty map: every cell honestly reads
+   *  absent (same posture as {@link safeProbeOllama}). */
+  private async safeScanStorePresence(): Promise<ReadonlyMap<string, boolean>> {
+    try {
+      return await this.deps.scanStorePresence();
+    } catch {
+      return new Map<string, boolean>();
+    }
+  }
+
+  /** One catalog row → its §1.3 wire shape. The llamacpp/vllm cells go
+   *  through the exported pure gates ({@link composeLlamacppCell} /
+   *  {@link composeVllmCell}); the run-command dest is resolved through the
+   *  READ-ONLY {@link SetupControllerDeps.storeDest} and `~`-redacted before
+   *  it ever reaches the composed string. */
+  private projectCatalogModel(model: CatalogModel, presence: ReadonlyMap<string, boolean>): SetupCatalogModel {
+    const present = presence.get(model.id) === true;
+    let redactedDestPath: string | undefined;
+    if (present && model.llamacpp !== undefined) {
+      const dest = this.deps.storeDest(model.llamacpp.gguf.hfRepo, model.llamacpp.gguf.file);
+      if (dest.ok) redactedDestPath = this.redact(dest.destPath);
+    }
+    const llamacpp = composeLlamacppCell(model, present, redactedDestPath);
+    const vllm = composeVllmCell(model);
+    return {
+      id: model.id,
+      role: model.role,
+      displayName: model.displayName,
+      publisher: model.publisher,
+      license: model.license,
+      ...(model.defaultForRole === true ? { defaultForRole: true } : {}),
+      ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+      vramLine: model.vramLine,
+      ...(model.note !== undefined ? { note: model.note } : {}),
+      progressId: model.id, // rule 7: the ONE pull/cancel/progress key
+      ...(model.ollama?.tier === 'library'
+        ? { ollamaTag: model.ollama.tag, ollamaApproxBytes: model.ollama.approxBytes }
+        : {}),
+      ...(model.ollama?.tier === 'hf-ingest'
+        ? { ollamaCreatedName: model.ollama.createdName, ollamaApproxBytes: model.ollama.gguf.approxBytes }
+        : {}),
+      ...(llamacpp !== undefined ? { llamacpp } : {}),
+      ...(vllm !== undefined ? { vllm } : {}),
+    };
+  }
+
   // --- handle() -------------------------------------------------------------
 
-  async handle(method: SetupMethod, params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+  /**
+   * T6 (beta.6 CC-2): the success arm carries an optional `models` list —
+   * populated ONLY by `setup.testRemote` when its `ProbeOutcome` returned
+   * one (the block's quiet `Serving: {models}` line). Additive: every other
+   * arm still resolves a bare `{ok:true}`, and existing callers pass
+   * through `unwrapSetupResult` untouched.
+   */
+  async handle(
+    method: SetupMethod,
+    params: unknown,
+  ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string }> {
     if (MUTATING_METHODS.has(method) && !this.host.isTrusted()) {
       return { ok: false, reason: TRUST_REFUSAL_REASON };
     }
@@ -736,7 +970,7 @@ export class SetupController {
       case 'setup.reload':
         return this.handleReload();
       case 'setup.recheck':
-        return this.handleRecheck();
+        return this.handleRecheck(params);
       case 'setup.setNextEdit':
         return this.handleSetNextEdit(params);
       case 'setup.setRag':
@@ -945,7 +1179,9 @@ export class SetupController {
 
   // --- setup.testRemote (read-only) -------------------------------------------
 
-  private async handleTestRemote(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+  private async handleTestRemote(
+    params: unknown,
+  ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string }> {
     const backendId = str(params, 'backendId');
     const descriptor = backendId ? this.deps.registry.getBackend(backendId) : undefined;
     if (!descriptor || !descriptor.remote) {
@@ -961,7 +1197,13 @@ export class SetupController {
       // entry whose probe would actually need one (codestral) has
       // `probe: {kind:'none'}` for exactly this reason.
       const outcome = await this.deps.probeRemote(descriptor.remote.probe, endpoint, undefined);
-      return outcome.ok ? { ok: true } : { ok: false, reason: this.redact(outcome.detail) };
+      // T6 (beta.6 CC-2): additive widening — the ProbeOutcome's served-model
+      // list rides along when the probe returned one (the block renders a
+      // quiet `Serving: {models}` line after a green Test); a bare success
+      // stays EXACTLY {ok:true} so existing callers are unaffected.
+      return outcome.ok
+        ? { ok: true, ...(outcome.models !== undefined ? { models: outcome.models } : {}) }
+        : { ok: false, reason: this.redact(outcome.detail) };
     } catch (err) {
       return { ok: false, reason: this.redact(errorMessage(err)) };
     }
@@ -1141,25 +1383,50 @@ export class SetupController {
    * reason). T4 M-2 carry-forward applies here too: `locatePipx` can
    * REJECT, and that must never become an unhandled rejection out of a
    * read-only recheck.
+   *
+   * T6 (beta.6 §2.5): gains the optional validated `scope` param — a STRICT
+   * enum (`'all'|'agent'|'os'|'ollama'|'llamacpp'`), absent = `'all'`
+   * (byte-compatible with every existing caller); anything else is refused
+   * before any work. Scopes: `agent` = the pipx relocate above; `os` = drop
+   * the memoized OS detection; `llamacpp` = {@link rekickLlamaCppProbe}
+   * WITHOUT awaiting (the probe settles later and fires its own push);
+   * `ollama` = nothing beyond the completion fire (the daemon probe already
+   * re-runs on every `status()`); `all` = everything. Scoping exists so a
+   * RAG-pane Re-check can never overwrite the Agent card's sticky phase
+   * (rev-2 critic fold).
    */
-  private async handleRecheck(): Promise<{ ok: true }> {
-    // T5: drop the memoized OS detection — the next demand (the status()
-    // this recheck's caller refreshes with, or the next bootstrap-terminal
-    // request) re-reads through the binding, picking up e.g. a container
-    // escape or a newly readable /etc/os-release.
-    this.osResolution = undefined;
-    try {
-      const located = await this.deps.locatePipx();
-      if (located.ok) {
-        this.lastAgentIssue = undefined;
-      } else {
-        // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
-        // — probe-timeout is not a distinct sticky phase.
-        const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
-        this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+  private async handleRecheck(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const scope = validateRecheckScope(params);
+    if (scope === undefined) {
+      return { ok: false, reason: "scope must be one of 'all', 'agent', 'os', 'ollama', 'llamacpp'." };
+    }
+    if (scope === 'all' || scope === 'os') {
+      // T5: drop the memoized OS detection — the next demand (the status()
+      // this recheck's caller refreshes with, or the next bootstrap-terminal
+      // request) re-reads through the binding, picking up e.g. a container
+      // escape or a newly readable /etc/os-release.
+      this.osResolution = undefined;
+    }
+    if (scope === 'all' || scope === 'llamacpp') {
+      // Non-blocking by design: clears the settled memo, cancels the
+      // superseded attempt, and re-kicks — the recheck RPC never waits on a
+      // login-shell probe.
+      this.rekickLlamaCppProbe();
+    }
+    if (scope === 'all' || scope === 'agent') {
+      try {
+        const located = await this.deps.locatePipx();
+        if (located.ok) {
+          this.lastAgentIssue = undefined;
+        } else {
+          // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
+          // — probe-timeout is not a distinct sticky phase.
+          const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
+          this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+        }
+      } catch (err) {
+        this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
       }
-    } catch (err) {
-      this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
     }
     // T7 (§2.2.2): fired exactly ONCE at completion (not per lastAgentIssue
     // write above) — recheck is read-only/no-modal, so "the recheck
@@ -1565,6 +1832,125 @@ function composeBootstrap(osInfo: OsResolution): { command?: string; guidance: s
     : { guidance: PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
 }
 
+// --- T6 (beta.6): llama.cpp install projection + catalog cell gates ----------
+
+/** beta.6 §6 copy, verbatim: the "llama.cpp missing" line (single-sourced —
+ *  the webview renders this string, never restates it). */
+const LLAMACPP_MISSING_GUIDANCE = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';
+/** beta.6 §6 copy, verbatim: the llamacpp honest-absence line — rev 3:
+ *  fixture/future-rows only, NO shipping row renders it (every shipping
+ *  row's gguf source passes the compose-time gate below). */
+const LLAMACPP_HONEST_ABSENCE =
+  'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.';
+/** Docs link for the guidance-only install cells (debian/unknown/container)
+ *  — the same llama-server docs URL the registry's guided-terminal recipe
+ *  pins (`registry.ts`, llamacpp `localInstall.recipe.docsUrl`). */
+const LLAMACPP_SERVER_DOCS_URL = 'https://github.com/ggml-org/llama.cpp/tree/master/tools/server';
+
+/**
+ * T6 (CC-4): the `llamacppRuntime.install` projection — the
+ * {@link composeBootstrap} pattern over `installCommand(family,'llamacpp')`.
+ * A known family (fedora/arch/suse) carries the engine's exact pre-typed
+ * line + that entry's own docsUrl; a guidance-only family (debian — the
+ * archive package name is unconfirmed —, unknown, or the S-F10 container
+ * degrade, whose §6 note then IS the guidance) carries text + the
+ * llama-server docs link only. No command is ever guessed (Constraint 1).
+ */
+function composeLlamacppInstall(osInfo: OsResolution): { command?: string; guidance: string; docsUrl: string } {
+  const spec = installCommand(osInfo.family, 'llamacpp');
+  if (spec !== undefined) {
+    return { command: spec.command, guidance: LLAMACPP_MISSING_GUIDANCE, docsUrl: spec.docsUrl };
+  }
+  return { guidance: osInfo.containerNote ?? LLAMACPP_MISSING_GUIDANCE, docsUrl: LLAMACPP_SERVER_DOCS_URL };
+}
+
+/** §2.5 run-command composition (drift-locked strings): per-role flags for a
+ *  store-resident GGUF. The agent port matches `endpointDefaults.llamacpp`
+ *  (8013 — T8 recomposes from the SAVED endpoint's port); NEXT keeps
+ *  beta.5's 8012. */
+const LLAMACPP_RUN_FLAGS: Readonly<Record<CatalogRole, string>> = {
+  fim: '--port 8080',
+  embedding: '--embeddings --port 8081',
+  agent: '--jinja --port 8013',
+  next: '--port 8012',
+};
+
+function isAllowlistedHfOwner(owner: string): boolean {
+  return TRUSTED_HF_PUBLISHERS.some((p) => p.hfOwner === owner);
+}
+
+/**
+ * T6 (SC-2, §2.2.6): the vLLM `serveRepo` COMPOSE-TIME gate. Order is
+ * load-bearing (T1-M1): `assertCatalogSource` (charset) runs FIRST — a
+ * `..`-traversal, leading `-`/`:`, or any charset violation yields ABSENCE
+ * before any membership check could bless it — then the serve-source
+ * closure: allowlisted publisher OR membership in the ledgered
+ * `VLLM_ONLY_SERVE_REPOS` exception table. Failure ⇒ `undefined` (the cell
+ * renders honest absence) — never a composed command over a bad source.
+ * Exported PURE so a poisoned-fixture test can drive it directly.
+ */
+export function composeVllmCell(model: CatalogModel): { runCommand: string } | undefined {
+  const serveRepo = model.vllm?.serveRepo;
+  if (serveRepo === undefined) return undefined;
+  if (!assertCatalogSource({ serveRepo }).ok) return undefined;
+  const slash = serveRepo.indexOf('/');
+  const owner = slash === -1 ? serveRepo : serveRepo.slice(0, slash);
+  if (!isAllowlistedHfOwner(owner) && !VLLM_ONLY_SERVE_REPOS.includes(serveRepo)) return undefined;
+  return { runCommand: `vllm serve ${serveRepo}` };
+}
+
+/**
+ * T6 (§1.3/§2.2.8): one catalog row's llamacpp wire cell. Runtime
+ * defense-in-depth mirroring the triple-allowlist posture: the gguf source
+ * strings are charset-asserted AND owner-allowlist-checked at compose time —
+ * a failing row (fixture/future only; every shipping row passes, drift-
+ * locked at T1) renders HONEST ABSENCE (`available:false` + the §6 copy)
+ * with no runCommand ever. `available` otherwise tracks the verify pin:
+ * live-oid rows are always downloadable; a pinned row is downloadable iff
+ * its sha256 is published (sweep-next ships `''` ⇒ `false`, fail-closed —
+ * carried WITHOUT an unavailableReason: the NEXT card's wire truth owns the
+ * pinned-disabled copy). `runCommand` composes ONLY for a present
+ * (sidecar-attested by the scan) file whose ~-redacted dest resolved
+ * (§2.2.8) — presence is the scan's verdict, and the scan itself IS the
+ * sidecar attestation.
+ * Exported PURE so poisoned-fixture tests can drive it directly.
+ */
+export function composeLlamacppCell(
+  model: CatalogModel,
+  present: boolean,
+  redactedDestPath: string | undefined,
+): NonNullable<SetupCatalogModel['llamacpp']> | undefined {
+  const cell = model.llamacpp;
+  if (cell === undefined) return undefined;
+  const slash = cell.gguf.hfRepo.indexOf('/');
+  const owner = slash === -1 ? cell.gguf.hfRepo : cell.gguf.hfRepo.slice(0, slash);
+  const sourceOk =
+    assertCatalogSource({ hfRepo: cell.gguf.hfRepo, file: cell.gguf.file }).ok && isAllowlistedHfOwner(owner);
+  if (!sourceOk) {
+    // The file/byte fields are inert display data (the webview only ever
+    // sends back `id`); the AFFORDANCES are what absence kills: forced
+    // not-present, not-available, and no runCommand — never a composed
+    // string over an unasserted source.
+    return {
+      file: cell.gguf.file,
+      approxBytes: cell.gguf.approxBytes,
+      present: false,
+      available: false,
+      unavailableReason: LLAMACPP_HONEST_ABSENCE,
+    };
+  }
+  const available = cell.verify.mode === 'live-oid' || cell.verify.sha256 !== '';
+  return {
+    file: cell.gguf.file,
+    approxBytes: cell.gguf.approxBytes,
+    present,
+    available,
+    ...(present && redactedDestPath !== undefined
+      ? { runCommand: `llama-server -m ${redactedDestPath} ${LLAMACPP_RUN_FLAGS[model.role]}` }
+      : {}),
+  };
+}
+
 /**
  * T5: strict server-side enum validation of `setup.openBootstrapTerminal`'s
  * `{target}` param (SECURITY, Global Constraint 1 — webview input is never
@@ -1580,6 +1966,31 @@ function validateBootstrapTarget(params: unknown): 'pipx' | 'python' | undefined
   const raw = (params as Record<string, unknown>)['target'];
   if (raw === undefined) return 'pipx';
   return raw === 'pipx' || raw === 'python' ? raw : undefined;
+}
+
+/** T6 (beta.6 §2.5): `setup.recheck`'s scope values — validated as a STRICT
+ *  enum, same discipline as {@link validateBootstrapTarget}. */
+const RECHECK_SCOPES = ['all', 'agent', 'os', 'ollama', 'llamacpp'] as const;
+type RecheckScope = (typeof RECHECK_SCOPES)[number];
+
+/**
+ * T6 (beta.6 §2.5): strict server-side validation of `setup.recheck`'s
+ * optional `{scope}` param (webview input is never trusted — Constraint 1).
+ * Absent params / absent key / explicit `undefined` = `'all'` (byte-
+ * compatible with every existing caller). A PRESENT key with anything but
+ * the five literals — including a non-string — is `undefined` = refuse; it
+ * is NOT coerced to the default, so a malformed request can never silently
+ * run the full recheck.
+ */
+function validateRecheckScope(params: unknown): RecheckScope | undefined {
+  if (params === undefined || params === null) return 'all';
+  if (typeof params !== 'object') return undefined;
+  if (!('scope' in params)) return 'all';
+  const raw = (params as Record<string, unknown>)['scope'];
+  if (raw === undefined) return 'all';
+  return typeof raw === 'string' && (RECHECK_SCOPES as readonly string[]).includes(raw)
+    ? (raw as RecheckScope)
+    : undefined;
 }
 
 function deriveHermesAcpPath(hermesPath: string): string {

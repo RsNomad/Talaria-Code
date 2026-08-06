@@ -1,14 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { homedir } from 'node:os';
 import {
   SetupController,
   TIER2_TUNABLE_KEYS,
   MUTATING_METHODS,
   READ_ONLY_METHODS,
   isHostSourcedModel,
+  composeVllmCell,
+  composeLlamacppCell,
   type SetupHost,
   type SetupControllerDeps,
 } from './SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend, NEXT_DEDICATED_MODEL } from './registry';
+import { MODEL_CATALOG } from './modelCatalog';
+import type { CatalogModel } from './modelCatalog';
+import type { LlamaCppLocateResult } from './llamaCppLocator';
+import type { GgufDestResult } from './modelStore';
 import type { PipxLocateResult } from './pipxLocator';
 import type { HermesPaths } from './pipxInstaller';
 import type { OllamaStatus } from './ollamaClient';
@@ -182,6 +189,33 @@ function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: Set
     readOsRelease: async (): Promise<{ text?: string; containerMismatch?: boolean }> => {
       calls.push('readOsRelease');
       return { text: OS_FEDORA_44 };
+    },
+    // T6 (beta.6): the llama.cpp probe default NEVER settles — the memo's
+    // 'checking' state stays deterministic and no legacy onStatusChanged
+    // count is disturbed by a stray settle fire; tests that need a settled
+    // state override with their own scripted resolution.
+    locateLlamaServer: (): Promise<LlamaCppLocateResult> => {
+      calls.push('locateLlamaServer');
+      return new Promise<LlamaCppLocateResult>(() => {});
+    },
+    scanStorePresence: async (): Promise<ReadonlyMap<string, boolean>> => {
+      calls.push('scanStorePresence');
+      return new Map<string, boolean>();
+    },
+    // Composed under the REAL homedir so the controller's `~`-redaction is
+    // provable on the wire (redact splits on `homedir()` exactly).
+    storeDest: (hfRepo: string, file: string): GgufDestResult => {
+      calls.push('storeDest');
+      const destDir = `${homedir()}/.local/share/talaria/models/${hfRepo}`;
+      return { ok: true, destDir, destFile: file, destPath: `${destDir}/${file}` };
+    },
+    checkedStoreDest: async (hfRepo: string, file: string): Promise<GgufDestResult> => {
+      calls.push('checkedStoreDest');
+      const destDir = `${homedir()}/.local/share/talaria/models/${hfRepo}`;
+      return { ok: true, destDir, destFile: file, destPath: `${destDir}/${file}` };
+    },
+    downloadGgufToStore: async (): Promise<void> => {
+      calls.push('downloadGgufToStore');
     },
     ...overrides,
   };
@@ -1818,5 +1852,594 @@ describe('T13 presence wire (§4.2 — status() facts, real registry sha256=empt
         // by the same pin as the Download button).
       },
     });
+  });
+});
+
+// =============================================================================
+// --- T6 (beta.6): controller runtime state + wire ----------------------------
+// =============================================================================
+
+/** One macrotask turn — lets a settled probe's .then body (state write +
+ *  onStatusChanged fire) run before asserting. */
+const tickT6 = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+// §6 copy, verbatim (drift-locked here AND used by assertions below).
+const LLAMACPP_MISSING_COPY = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';
+const LLAMACPP_HONEST_ABSENCE_COPY =
+  'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.';
+const LLAMACPP_SERVER_DOCS_URL = 'https://github.com/ggml-org/llama.cpp/tree/master/tools/server';
+const RECHECK_SCOPE_REFUSAL = "scope must be one of 'all', 'agent', 'os', 'ollama', 'llamacpp'.";
+
+function catalogRow(id: string): CatalogModel {
+  const row = MODEL_CATALOG.find((m) => m.id === id);
+  if (!row) throw new Error(`no catalog row '${id}'`);
+  return row;
+}
+
+const NOT_FOUND_RESULT: LlamaCppLocateResult = { ok: false, reason: 'not-found', detail: 'clean 127 miss' };
+const PROBE_TIMEOUT_RESULT: LlamaCppLocateResult = { ok: false, reason: 'probe-timeout', detail: 'shell wedged' };
+
+describe('T6: llamacppRuntime settled-value memo (§2.5 — NOT the awaited-osResolution pattern)', () => {
+  it("a probe that never resolves ⇒ status() returns binary:'checking' (and keeps returning it)", async () => {
+    const { controller } = makeController();
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+  });
+
+  it('the probe is kicked exactly ONCE across repeated status() calls', async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.status();
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'locateLlamaServer').length).toBe(1);
+  });
+
+  it('settle fires onStatusChanged exactly ONCE; the settled value lands on the next status()', async () => {
+    let resolveProbe: ((r: LlamaCppLocateResult) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        locateLlamaServer: () =>
+          new Promise<LlamaCppLocateResult>((resolve) => {
+            resolveProbe = resolve;
+          }),
+      },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+    expect(fires.length).toBe(0);
+
+    resolveProbe?.({ ok: true, path: '/usr/bin/llama-server', version: 'version: b4570' });
+    await tickT6();
+    expect(fires.length).toBe(1);
+
+    const data = await controller.status();
+    expect(data.llamacppRuntime).toEqual({
+      binary: 'found',
+      version: 'version: b4570',
+      path: '/usr/bin/llama-server',
+    });
+    await tickT6();
+    expect(fires.length).toBe(1); // status() re-reads the memo — no second fire, no re-kick
+  });
+
+  it('found: the wire path is ~-redacted (the redaction discipline applies to the probe path too)', async () => {
+    const { controller } = makeController(
+      {},
+      { locateLlamaServer: async () => ({ ok: true, path: `${homedir()}/.local/bin/llama-server` }) },
+    );
+    await controller.status();
+    await tickT6();
+    const data = await controller.status();
+    expect(data.llamacppRuntime).toEqual({ binary: 'found', path: '~/.local/bin/llama-server' });
+  });
+
+  it("not-found ⇒ binary:'missing' (CC-5)", async () => {
+    const { controller } = makeController({}, { locateLlamaServer: async () => NOT_FOUND_RESULT });
+    await controller.status();
+    await tickT6();
+    expect((await controller.status()).llamacppRuntime?.binary).toBe('missing');
+  });
+
+  it("probe-timeout ⇒ binary:'unknown', NEVER 'missing', and NO install projection (CC-5)", async () => {
+    const { controller } = makeController({}, { locateLlamaServer: async () => PROBE_TIMEOUT_RESULT });
+    await controller.status();
+    await tickT6();
+    const data = await controller.status();
+    expect(data.llamacppRuntime).toEqual({ binary: 'unknown' });
+  });
+
+  it("a REJECTING locateLlamaServer binding settles 'unknown' — never an unhandled rejection out of status()", async () => {
+    const { controller } = makeController(
+      {},
+      {
+        locateLlamaServer: async () => {
+          throw new Error('binding exploded');
+        },
+      },
+    );
+    await controller.status();
+    await tickT6();
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'unknown' });
+  });
+});
+
+describe('T6: llamacppRuntime.install projection (CC-4 — the agent.bootstrap pattern; §6 verbatim)', () => {
+  async function missingOn(
+    osRead: { text?: string; containerMismatch?: boolean },
+  ): Promise<Awaited<ReturnType<SetupController['status']>>['llamacppRuntime']> {
+    const { controller } = makeController(
+      {},
+      {
+        locateLlamaServer: async () => NOT_FOUND_RESULT,
+        readOsRelease: async () => osRead,
+      },
+    );
+    await controller.status();
+    await tickT6();
+    return (await controller.status()).llamacppRuntime;
+  }
+
+  it('fedora: engine command + §6 guidance + the engine docsUrl', async () => {
+    expect(await missingOn({ text: OS_FEDORA_44 })).toEqual({
+      binary: 'missing',
+      install: {
+        command: 'sudo dnf install llama-cpp',
+        guidance: LLAMACPP_MISSING_COPY,
+        docsUrl: 'https://packages.fedoraproject.org/search?query=llama-cpp',
+      },
+    });
+  });
+
+  it('arch: engine command (--needed, no auto-confirm)', async () => {
+    expect(await missingOn({ text: OS_ARCH })).toEqual({
+      binary: 'missing',
+      install: {
+        command: 'sudo pacman -S --needed llama-cpp',
+        guidance: LLAMACPP_MISSING_COPY,
+        docsUrl: 'https://archlinux.org/packages/?q=llama-cpp',
+      },
+    });
+  });
+
+  it('suse: engine command', async () => {
+    expect(await missingOn({ text: OS_TUMBLEWEED })).toEqual({
+      binary: 'missing',
+      install: {
+        command: 'sudo zypper install llamacpp',
+        guidance: LLAMACPP_MISSING_COPY,
+        docsUrl: 'https://software.opensuse.org/package/llamacpp',
+      },
+    });
+  });
+
+  it('debian: GUIDANCE-ONLY — no command is ever guessed (the archive package name is unconfirmed)', async () => {
+    expect(await missingOn({ text: OS_DEBIAN_13 })).toEqual({
+      binary: 'missing',
+      install: { guidance: LLAMACPP_MISSING_COPY, docsUrl: LLAMACPP_SERVER_DOCS_URL },
+    });
+  });
+
+  it('unknown distro: guidance-only', async () => {
+    expect(await missingOn({})).toEqual({
+      binary: 'missing',
+      install: { guidance: LLAMACPP_MISSING_COPY, docsUrl: LLAMACPP_SERVER_DOCS_URL },
+    });
+  });
+
+  it('container degrade: the §6 container note IS the guidance (S-F10 honesty)', async () => {
+    expect(await missingOn({ containerMismatch: true })).toEqual({
+      binary: 'missing',
+      install: { guidance: CONTAINER_NOTE_COPY, docsUrl: LLAMACPP_SERVER_DOCS_URL },
+    });
+  });
+});
+
+describe("T6: scoped recheck (§2.5) — {scope:'llamacpp'} re-kicks WITHOUT awaiting", () => {
+  it('resolves while the probe is still pending (non-blocking), aborts the superseded probe, re-kicks, and state returns to checking', async () => {
+    const signals: AbortSignal[] = [];
+    let locateCalls = 0;
+    const { depCalls, controller } = makeController(
+      {},
+      {
+        locateLlamaServer: (signal?: AbortSignal) => {
+          locateCalls++;
+          if (signal) signals.push(signal);
+          return new Promise<LlamaCppLocateResult>(() => {});
+        },
+      },
+    );
+    await controller.status(); // kick #1
+    expect(locateCalls).toBe(1);
+
+    const result = await controller.handle('setup.recheck', { scope: 'llamacpp' });
+    expect(result).toEqual({ ok: true }); // resolved though the probe never settles
+    expect(locateCalls).toBe(2); // re-kicked without awaiting
+    expect(signals[0]?.aborted).toBe(true); // superseded probe cancelled (T5 CR-1 threading)
+    expect(signals[1]?.aborted).toBe(false);
+    expect(depCalls).not.toContain('locatePipx'); // scoped: the agent card is untouched
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+  });
+
+  it('a superseded probe settling late is DROPPED — no state overwrite, no extra fire', async () => {
+    const resolvers: Array<(r: LlamaCppLocateResult) => void> = [];
+    const { controller } = makeController(
+      {},
+      {
+        locateLlamaServer: () =>
+          new Promise<LlamaCppLocateResult>((resolve) => {
+            resolvers.push(resolve);
+          }),
+      },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    await controller.status(); // kick #1
+    await controller.handle('setup.recheck', { scope: 'llamacpp' }); // supersede + kick #2
+    expect(fires.length).toBe(1); // the recheck completion fire only
+
+    resolvers[0]?.({ ok: true, path: '/stale/llama-server' }); // the SUPERSEDED probe settles late
+    await tickT6();
+    expect(fires.length).toBe(1); // dropped: no settle fire
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+
+    resolvers[1]?.(NOT_FOUND_RESULT); // the CURRENT probe settles
+    await tickT6();
+    expect(fires.length).toBe(2);
+    expect((await controller.status()).llamacppRuntime?.binary).toBe('missing');
+  });
+
+  it("{scope:'llamacpp'} touches NOTHING else — os memo intact, pipx not relocated", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.handle('setup.recheck', { scope: 'llamacpp' });
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(1); // memo NOT cleared
+    expect(depCalls).not.toContain('locatePipx');
+  });
+
+  it("absent scope = 'all' (byte-compatible): relocates pipx AND re-kicks the llamacpp probe", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status(); // kick #1
+    await controller.handle('setup.recheck', {});
+    expect(depCalls).toContain('locatePipx');
+    expect(depCalls.filter((c) => c === 'locateLlamaServer').length).toBe(2);
+  });
+
+  it("{scope:'agent'}: relocates pipx ONLY — no llamacpp re-kick, no os-memo clear", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.handle('setup.recheck', { scope: 'agent' });
+    await controller.status();
+    expect(depCalls).toContain('locatePipx');
+    expect(depCalls.filter((c) => c === 'locateLlamaServer').length).toBe(1);
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(1);
+  });
+
+  it("{scope:'os'}: clears the os memo ONLY — next status() re-reads os-release; pipx untouched", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.handle('setup.recheck', { scope: 'os' });
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(2);
+    expect(depCalls).not.toContain('locatePipx');
+  });
+
+  it("{scope:'ollama'}: fires once (repaint → fresh status re-probes the daemon); nothing else touched", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    const result = await controller.handle('setup.recheck', { scope: 'ollama' });
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(1);
+    await controller.status();
+    expect(depCalls).not.toContain('locatePipx');
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(1);
+    expect(depCalls.filter((c) => c === 'locateLlamaServer').length).toBe(1);
+  });
+
+  it('an invalid scope is REFUSED (validated enum) — nothing runs, nothing fires', async () => {
+    const { depCalls, controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    const result = await controller.handle('setup.recheck', { scope: 'bogus' });
+    expect(result).toEqual({ ok: false, reason: RECHECK_SCOPE_REFUSAL });
+    expect(depCalls).toEqual([]);
+    expect(fires.length).toBe(0);
+  });
+
+  it('a non-string scope is REFUSED, not coerced to the default', async () => {
+    const { controller } = makeController();
+    const result = await controller.handle('setup.recheck', { scope: 42 });
+    expect(result).toEqual({ ok: false, reason: RECHECK_SCOPE_REFUSAL });
+  });
+});
+
+describe('T6: store scan wired + ordering (§2.5 — awaited BEFORE the CR-002 synchronous tail)', () => {
+  it('status() WAITS on the scan; the same snapshot reflects its presence (resolved before the tail emitted)', async () => {
+    let resolveScan: ((m: ReadonlyMap<string, boolean>) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        scanStorePresence: () =>
+          new Promise<ReadonlyMap<string, boolean>>((resolve) => {
+            resolveScan = resolve;
+          }),
+      },
+    );
+    let settled = false;
+    const pending = controller.status().then((d) => {
+      settled = true;
+      return d;
+    });
+    await tickT6();
+    await tickT6();
+    expect(settled).toBe(false); // status() is genuinely awaiting the scan
+
+    resolveScan?.(new Map([['qwen25-coder-1.5b', true]]));
+    const data = await pending;
+    const row = data.catalog?.models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(row?.llamacpp?.present).toBe(true);
+    // The CR-002 tail content is in the SAME snapshot — presence resolved first.
+    expect(data.nextEdit.dedicated?.displayName).toBe('Sweep Next-Edit v2 (7B)');
+  });
+
+  it('a REJECTING scan fails CLOSED: status() still resolves, every cell reads absent', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        scanStorePresence: async () => {
+          throw new Error('EACCES: store unreadable');
+        },
+      },
+    );
+    const data = await controller.status();
+    expect(data.catalog?.models.every((m) => m.llamacpp?.present === false)).toBe(true);
+  });
+
+  it('the scan re-runs on every status() (cheap stat pass — presence stays live)', async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'scanStorePresence').length).toBe(2);
+  });
+});
+
+describe('T6: catalog wire rows (§1.3 — all 13 MODEL_CATALOG rows project completely)', () => {
+  it('13 rows, catalog order, progressId === id on every row (rule 7: the ONE progress key)', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    expect(models.length).toBe(13);
+    expect(models.map((m) => m.id)).toEqual(MODEL_CATALOG.map((m) => m.id));
+    for (const m of models) expect(m.progressId).toBe(m.id);
+  });
+
+  it('exactly ONE defaultForRole per role (rev 3) — devstral/qwen1.5b/qwen-embed-0.6b/sweep', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    const defaults = models.filter((m) => m.defaultForRole === true);
+    expect(defaults.map((m) => `${m.role}:${m.id}`).sort()).toEqual([
+      'agent:devstral-24b',
+      'embedding:qwen3-embedding-0.6b',
+      'fim:qwen25-coder-1.5b',
+      'next:sweep-next',
+    ]);
+  });
+
+  it('library tier: ollamaTag + ollamaApproxBytes on the wire, NO createdName', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    const fim = models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(fim?.ollamaTag).toBe('qwen2.5-coder:1.5b-base');
+    expect(fim?.ollamaApproxBytes).toBe(986_000_000);
+    expect(fim?.ollamaCreatedName).toBeUndefined();
+  });
+
+  it('hf-ingest tier: ollamaCreatedName (LOAD-BEARING for /api/tags presence) + gguf bytes, NO tag', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    const devstral = models.find((m) => m.id === 'devstral-24b');
+    expect(devstral?.ollamaCreatedName).toBe('devstral-small-2507:24b');
+    expect(devstral?.ollamaApproxBytes).toBe(14_333_915_904);
+    expect(devstral?.ollamaTag).toBeUndefined();
+    const sweep = models.find((m) => m.id === 'sweep-next');
+    expect(sweep?.ollamaCreatedName).toBe('sweep-next-edit-v2-7b:q4_k_m');
+  });
+
+  it('identity + honesty fields pass through: displayName/publisher/license/vramLine/note/contextWindow', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    const devstral = models.find((m) => m.id === 'devstral-24b');
+    expect(devstral?.displayName).toBe('Devstral-24B (2507)');
+    expect(devstral?.publisher).toBe('mistralai');
+    expect(devstral?.license).toBe('Apache-2.0');
+    expect(devstral?.contextWindow).toBe(131072);
+    const sevenB = models.find((m) => m.id === 'qwen25-coder-7b');
+    expect(sevenB?.contextWindow).toBeUndefined(); // absent in the catalog stays absent
+    expect(sevenB?.note).toBe(
+      "Base build (Q8) from ggml-org — the llama.cpp project's own packaging of Qwen's base model.",
+    );
+    const embedGemma = models.find((m) => m.id === 'embeddinggemma-300m');
+    expect(embedGemma?.note).toBe('2K context on the Ollama build — fine for Talaria’s chunk sizes (≤512 tokens).');
+  });
+
+  it('llamacpp cells: file/bytes on all 13; available on 12; sweep-next pinned-empty ⇒ available:false; NO shipping row sets unavailableReason', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    expect(models.every((m) => m.llamacpp !== undefined)).toBe(true);
+    for (const m of models) {
+      expect(m.llamacpp?.unavailableReason).toBeUndefined();
+      expect(m.llamacpp?.present).toBe(false); // empty scan
+      expect(m.llamacpp?.available).toBe(m.id === 'sweep-next' ? false : true);
+    }
+    const fim = models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(fim?.llamacpp?.file).toBe('qwen2.5-coder-1.5b-q8_0.gguf');
+    expect(fim?.llamacpp?.approxBytes).toBe(1_646_573_056);
+  });
+
+  it('vllm.runCommand composes on ALL 13 rows — including BOTH ledgered exception rows (SC-2)', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    for (const m of models) {
+      const serveRepo = catalogRow(m.id).vllm?.serveRepo;
+      expect(m.vllm?.runCommand).toBe(`vllm serve ${serveRepo}`);
+    }
+    expect(models.find((m) => m.id === 'gpt-oss-20b')?.vllm?.runCommand).toBe('vllm serve openai/gpt-oss-20b');
+    expect(models.find((m) => m.id === 'sweep-next')?.vllm?.runCommand).toBe(
+      'vllm serve sweepai/sweep-next-edit-v2-7B',
+    );
+  });
+});
+
+describe('T6 (SC-2): the serveRepo compose-time gate — poisoned fixture ⇒ ABSENCE, never a shelled bad source', () => {
+  const base = catalogRow('qwen25-coder-1.5b');
+
+  it('the two VLLM_ONLY_SERVE_REPOS exception rows DO compose (ledgered exceptions)', () => {
+    expect(composeVllmCell(catalogRow('gpt-oss-20b'))).toEqual({ runCommand: 'vllm serve openai/gpt-oss-20b' });
+    expect(composeVllmCell(catalogRow('sweep-next'))).toEqual({
+      runCommand: 'vllm serve sweepai/sweep-next-edit-v2-7B',
+    });
+  });
+
+  it('an allowlisted-publisher serveRepo composes', () => {
+    expect(composeVllmCell(base)).toEqual({ runCommand: 'vllm serve Qwen/Qwen2.5-Coder-1.5B' });
+  });
+
+  const POISONED = [
+    'Qwen/../evil-org', // '..' traversal — charset kills it BEFORE any membership check
+    '-Qwen/x', // leading '-' (option-injection shape)
+    ':Qwen/x', // leading ':'
+    'Qwen//x', // empty segment
+    'Qwen/x/y', // more than one '/'
+    'Qwen/x y', // whitespace
+    'openai/../gpt-oss-20b', // traversal near an exception entry — still absence
+  ];
+  for (const serveRepo of POISONED) {
+    it(`poisoned '${serveRepo}' ⇒ the vllm cell is ABSENT`, () => {
+      expect(composeVllmCell({ ...base, vllm: { serveRepo } })).toBeUndefined();
+    });
+  }
+
+  it('charset-clean but neither allowlisted nor a ledgered exception ⇒ ABSENT (the closure invariant)', () => {
+    expect(composeVllmCell({ ...base, vllm: { serveRepo: 'bartowski/some-model' } })).toBeUndefined();
+  });
+
+  it('a row with no vllm offering ⇒ absent', () => {
+    const { vllm: _vllm, ...noVllm } = base;
+    expect(composeVllmCell(noVllm)).toBeUndefined();
+  });
+});
+
+describe('T6 (§2.2.8): llamacpp cell — runCommand ONLY for attested-present files', () => {
+  async function statusWithPresence(
+    present: ReadonlyMap<string, boolean>,
+    extra: Partial<SetupControllerDeps> = {},
+  ): Promise<Awaited<ReturnType<SetupController['status']>>> {
+    const { controller } = makeController({}, { scanStorePresence: async () => present, ...extra });
+    return controller.status();
+  }
+
+  it('present (sidecar-attested by the scan) ⇒ runCommand with the ~-redacted dest, FIM port 8080', async () => {
+    const data = await statusWithPresence(new Map([['qwen25-coder-1.5b', true]]));
+    const row = data.catalog?.models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(row?.llamacpp?.present).toBe(true);
+    expect(row?.llamacpp?.runCommand).toBe(
+      'llama-server -m ~/.local/share/talaria/models/ggml-org/Qwen2.5-Coder-1.5B-Q8_0-GGUF/qwen2.5-coder-1.5b-q8_0.gguf --port 8080',
+    );
+  });
+
+  it('role flag table (§2.5): embedding --embeddings 8081 · agent --jinja 8013 · NEXT 8012', async () => {
+    const data = await statusWithPresence(
+      new Map([
+        ['qwen3-embedding-0.6b', true],
+        ['devstral-24b', true],
+        ['sweep-next', true],
+      ]),
+    );
+    const models = data.catalog?.models ?? [];
+    expect(models.find((m) => m.id === 'qwen3-embedding-0.6b')?.llamacpp?.runCommand).toBe(
+      'llama-server -m ~/.local/share/talaria/models/Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf --embeddings --port 8081',
+    );
+    expect(models.find((m) => m.id === 'devstral-24b')?.llamacpp?.runCommand).toBe(
+      'llama-server -m ~/.local/share/talaria/models/mistralai/Devstral-Small-2507_gguf/Devstral-Small-2507-Q4_K_M.gguf --jinja --port 8013',
+    );
+    expect(models.find((m) => m.id === 'sweep-next')?.llamacpp?.runCommand).toBe(
+      'llama-server -m ~/.local/share/talaria/models/SyntinalCo/sweep-next-edit-v2-7B-GGUF/sweep-next-edit-v2-7B-Q4_K_M.gguf --port 8012',
+    );
+  });
+
+  it('absent ⇒ NO runCommand', async () => {
+    const data = await statusWithPresence(new Map());
+    expect(data.catalog?.models.every((m) => m.llamacpp?.runCommand === undefined)).toBe(true);
+  });
+
+  it('present but the store dest cannot be composed ⇒ NO runCommand (fail-closed)', async () => {
+    const data = await statusWithPresence(new Map([['qwen25-coder-1.5b', true]]), {
+      storeDest: () => ({ ok: false, reason: 'no store root' }),
+    });
+    const row = data.catalog?.models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(row?.llamacpp?.present).toBe(true);
+    expect(row?.llamacpp?.runCommand).toBeUndefined();
+  });
+
+  it('composeLlamacppCell: a poisoned gguf source (charset) ⇒ honest absence — available:false + §6 copy, NEVER a runCommand', () => {
+    const base = catalogRow('qwen25-coder-1.5b');
+    const poisoned: CatalogModel = {
+      ...base,
+      llamacpp: {
+        gguf: { hfRepo: 'ggml-org/../evil', file: 'x.gguf', quant: 'Q8_0', approxBytes: 1 },
+        verify: { mode: 'live-oid' },
+      },
+    };
+    expect(composeLlamacppCell(poisoned, true, '~/anywhere/x.gguf')).toEqual({
+      file: 'x.gguf',
+      approxBytes: 1,
+      present: false,
+      available: false,
+      unavailableReason: LLAMACPP_HONEST_ABSENCE_COPY,
+    });
+  });
+
+  it('composeLlamacppCell: a non-allowlisted gguf publisher ⇒ the same honest absence (triple-allowlist mirror)', () => {
+    const base = catalogRow('qwen25-coder-1.5b');
+    const foreign: CatalogModel = {
+      ...base,
+      llamacpp: {
+        gguf: { hfRepo: 'bartowski/some-GGUF', file: 'x.gguf', quant: 'Q8_0', approxBytes: 1 },
+        verify: { mode: 'live-oid' },
+      },
+    };
+    expect(composeLlamacppCell(foreign, false, undefined)?.unavailableReason).toBe(LLAMACPP_HONEST_ABSENCE_COPY);
+  });
+
+  it('composeLlamacppCell: a pinned row with a PUBLISHED pin is available (the flag tracks the pin, not the mode)', () => {
+    const base = catalogRow('sweep-next');
+    if (!base.llamacpp) throw new Error('sweep-next must carry a llamacpp cell');
+    const published: CatalogModel = {
+      ...base,
+      llamacpp: { gguf: base.llamacpp.gguf, verify: { mode: 'pinned', sha256: 'a'.repeat(64) } },
+    };
+    expect(composeLlamacppCell(published, false, undefined)?.available).toBe(true);
+  });
+});
+
+describe('T6 (CC-2): setup.testRemote result widening — {ok:true, models} when the probe carries them', () => {
+  it('models pass through', async () => {
+    const { controller } = makeController(
+      {},
+      { probeRemote: async () => ({ ok: true, detail: 'ok', models: ['served-a', 'served-b'] }) },
+    );
+    const result = await controller.handle('setup.testRemote', { backendId: 'ollama' });
+    expect(result).toEqual({ ok: true, models: ['served-a', 'served-b'] });
+  });
+
+  it('stays EXACTLY {ok:true} when the probe has no models (existing callers unaffected)', async () => {
+    const { controller } = makeController({}, { probeRemote: async () => ({ ok: true, detail: 'ok' }) });
+    const result = await controller.handle('setup.testRemote', { backendId: 'ollama' });
+    expect(result).toEqual({ ok: true });
   });
 });

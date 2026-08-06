@@ -25,10 +25,21 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import * as vscode from 'vscode';
+import { mkdtemp, writeFile as fsWriteFile, mkdir, symlink, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { ExecLookup } from './runtime/resolveHermes';
 
 vi.mock('vscode', () => ({}));
 
-import { createReadOsRelease, createVsCodeSetupHost } from './setupHost.vscode';
+import {
+  createLocateLlamaServer,
+  createModelStoreLstatIo,
+  createModelStorePresenceIo,
+  createReadOsRelease,
+  createSetupControllerDeps,
+  createVsCodeSetupHost,
+} from './setupHost.vscode';
 
 function makeFakeContext(secretsGet: (key: string) => Promise<string | undefined>): vscode.ExtensionContext {
   return {
@@ -128,5 +139,148 @@ describe('T5: createReadOsRelease (S-F10 container/Flatpak honesty)', () => {
   it('nothing readable anywhere -> {} (controller degrades to unknown)', async () => {
     const { read } = makeSeams({});
     await expect(read()).resolves.toEqual({});
+  });
+});
+
+// --- T6 (beta.6): createLocateLlamaServer — the win32 gate --------------------
+
+describe("T6: createLocateLlamaServer — win32 ⇒ probe-timeout (wire 'unknown'), NO probe ever spawns", () => {
+  it('win32: resolves probe-timeout without ever calling exec', async () => {
+    let execCalls = 0;
+    const exec: ExecLookup = async () => {
+      execCalls++;
+      return '';
+    };
+    const locate = createLocateLlamaServer(exec, 'win32');
+
+    const result = await locate();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('probe-timeout');
+    expect(execCalls).toBe(0);
+  });
+
+  it('linux: delegates to the real locator over the injected exec (a clean miss reads not-found)', async () => {
+    let execCalls = 0;
+    const exec: ExecLookup = async () => {
+      execCalls++;
+      throw new Error('command failed with exit code 127');
+    };
+    const locate = createLocateLlamaServer(exec, 'linux');
+
+    const result = await locate();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('not-found');
+    expect(execCalls).toBeGreaterThan(0);
+  });
+
+  it('linux: the caller signal is threaded through (pre-aborted ⇒ AbortError before any exec)', async () => {
+    let execCalls = 0;
+    const exec: ExecLookup = async () => {
+      execCalls++;
+      return '';
+    };
+    const locate = createLocateLlamaServer(exec, 'linux');
+    const abort = new AbortController();
+    abort.abort();
+
+    await expect(locate(abort.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(execCalls).toBe(0);
+  });
+});
+
+// --- T6 (beta.6, T4→T6 SC-A-3): the modelStore fs bindings --------------------
+
+describe('T6: createModelStoreLstatIo — fs.promises.LSTAT with only-ENOENT→null', () => {
+  it('real fs: missing → null; a real dir → non-symlink; a symlink/junction REPORTS as one (lstat, never stat)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'talaria-t6-lstat-'));
+    try {
+      const target = join(dir, 'target');
+      await mkdir(target);
+      const link = join(dir, 'link');
+      // 'junction' keeps this runnable on unprivileged Windows dev boxes;
+      // POSIX ignores the type argument entirely.
+      await symlink(target, link, 'junction');
+      const io = createModelStoreLstatIo();
+
+      await expect(io.lstat(join(dir, 'nope'))).resolves.toBeNull();
+      const real = await io.lstat(target);
+      expect(real?.isSymbolicLink()).toBe(false);
+      // The load-bearing distinction: `stat` FOLLOWS the link and would
+      // report the target directory — only `lstat` sees the link itself,
+      // which is exactly what the symlink refusal needs.
+      const linked = await io.lstat(link);
+      expect(linked?.isSymbolicLink()).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ONLY ENOENT is swallowed to null — any other rejection (EACCES) propagates, fail-closed', async () => {
+    const eacces = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    const denied = createModelStoreLstatIo(() => Promise.reject(eacces));
+    await expect(denied.lstat('/store/root')).rejects.toBe(eacces);
+
+    const enoent = Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+    const missing = createModelStoreLstatIo(() => Promise.reject(enoent));
+    await expect(missing.lstat('/store/root')).resolves.toBeNull();
+  });
+});
+
+describe('T6: createModelStorePresenceIo — sidecar-read seams (nonexistent→null, real failures propagate)', () => {
+  it('real fs: readFile utf8 text · statSize byte size · missing paths (incl. a path THROUGH a file) → null', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'talaria-t6-presence-'));
+    try {
+      const file = join(dir, 'model.gguf');
+      await fsWriteFile(file, 'abc', 'utf8');
+      const io = createModelStorePresenceIo();
+
+      await expect(io.readFile(file)).resolves.toBe('abc');
+      await expect(io.statSize(file)).resolves.toBe(3);
+      await expect(io.readFile(join(dir, 'nope.talaria.json'))).resolves.toBeNull();
+      await expect(io.statSize(join(dir, 'nope.gguf'))).resolves.toBeNull();
+      // ENOTDIR shape — "doesn't exist" per the modelStore seam doc.
+      await expect(io.statSize(join(file, 'x'))).resolves.toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an EACCES readFile/statSize PROPAGATES (only non-existence collapses to null)', async () => {
+    const eacces = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    const io = createModelStorePresenceIo({
+      readFileImpl: () => Promise.reject(eacces),
+      statSizeImpl: () => Promise.reject(eacces),
+    });
+    await expect(io.readFile('/x')).rejects.toBe(eacces);
+    await expect(io.statSize('/x')).rejects.toBe(eacces);
+  });
+
+  it('env: defaults to process.env; an injected env is used as-is', () => {
+    expect(createModelStorePresenceIo().env).toBe(process.env);
+    const io = createModelStorePresenceIo({ env: { HOME: '/home/u' } });
+    expect(io.env['HOME']).toBe('/home/u');
+  });
+});
+
+// --- T6 (beta.6): the new SetupControllerDeps bindings exist ------------------
+
+describe('T6: createSetupControllerDeps — beta.6 engine bindings', () => {
+  it('exposes the five new deps as bound functions', () => {
+    const deps = createSetupControllerDeps(() => undefined);
+    expect(typeof deps.locateLlamaServer).toBe('function');
+    expect(typeof deps.scanStorePresence).toBe('function');
+    expect(typeof deps.storeDest).toBe('function');
+    expect(typeof deps.checkedStoreDest).toBe('function');
+    expect(typeof deps.downloadGgufToStore).toBe('function');
+  });
+
+  it('storeDest fails typed (never a composed path) on a poisoned repo string OR an unusable store root', () => {
+    const deps = createSetupControllerDeps(() => undefined);
+    // Portable assertion: on a box with a usable $HOME the charset assert
+    // refuses; on one without, storeRoot refuses first — both are the same
+    // typed {ok:false}, never a path.
+    expect(deps.storeDest('Qwen/../evil', 'x.gguf').ok).toBe(false);
   });
 });
