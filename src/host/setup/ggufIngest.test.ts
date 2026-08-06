@@ -693,6 +693,40 @@ describe('downloadGgufToStore — atomic same-dir file sink (beta.6 T3, §2.4/§
     expect(calls.length).toBe(0);
   });
 
+  it('closes the write handle on the SC-4 placement-violation refusal path (CR-1 defense-in-depth)', async () => {
+    const { io, removeTemp, closeSpy } = fakeStoreIo({ tempDir: '/somewhere/else' });
+    const { fetchImpl, calls } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toThrow(GgufStorePlacementError);
+
+    expect(calls.length).toBe(0); // never reached the network
+    expect(removeTemp).toHaveBeenCalledTimes(1); // .part still cleaned up
+    // CR-1: the write handle's fd must also be released on this exit path —
+    // pre-fix, only removeTemp ran and the fd (plus, on POSIX, the disk
+    // blocks behind an unlinked-but-still-open partial file) leaked.
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a traversing destFile whose composed dest path escapes destDir — before any network work (CR-2 symmetric guard)', async () => {
+    const { io, ensureDir, removeTemp, renameTemp, writeSidecar, closeSpy } = fakeStoreIo();
+    const { fetchImpl, calls } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, '../escape.gguf', () => {}, new AbortController().signal),
+    ).rejects.toThrow(GgufStorePlacementError);
+
+    expect(ensureDir).toHaveBeenCalledTimes(1); // ensureDir still runs before the destPath guard
+    expect(calls.length).toBe(0); // never reached the network — refused BEFORE any download
+    expect(renameTemp).not.toHaveBeenCalled();
+    expect(writeSidecar).not.toHaveBeenCalled();
+    expect(removeTemp).toHaveBeenCalledTimes(1); // .part cleaned up
+    expect(closeSpy).toHaveBeenCalledTimes(1); // handle closed, same failure shape as CR-1
+  });
+
   it('forwards progress events through to the caller during the store download too', async () => {
     const { io } = fakeStoreIo();
     const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });

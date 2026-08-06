@@ -164,8 +164,14 @@ export interface GgufStoreSpec {
     quant: string;
     sha256: string;
     approxBytes: number;
-    /** Optional — this engine never reads it; present only for shape parity
-     *  with `GgufIngestSpec.gguf.allowedRepoFiles` (also optional, T3). */
+    /** Optional — this engine (the placement sink) never reads it. Exact-
+     *  file-set enforcement, when it applies, happens UPSTREAM of this sink:
+     *  `verifyHfDigest` (`hfDigest.ts`), called by the controller in pinned
+     *  mode BEFORE `downloadGgufToStore` ever runs — NOT here. This field
+     *  exists only for shape parity with `GgufIngestSpec.gguf.allowedRepoFiles`
+     *  (also optional, T3) so a `GgufStoreSpec` literal can carry it; a
+     *  caller must not read its presence on THIS type as "the sink enforces
+     *  the exact file set." */
     allowedRepoFiles?: readonly string[];
   };
 }
@@ -320,10 +326,27 @@ export async function downloadGgufToStore(
   // SC-4: the temp file MUST live in the exact same directory as the final
   // destination — a contract violation (a buggy io binding returning a path
   // elsewhere) refuses before any network call, and still cleans up
-  // whatever `createStoreTempWrite` already created on disk.
+  // whatever `createStoreTempWrite` already created on disk. CR-1 (defense-
+  // in-depth): close the handle's fd on THIS exit path too — matching the
+  // close-on-every-exit-path discipline `downloadToTemp` already applies —
+  // so a leaked fd (and, on POSIX, the disk blocks behind it) never
+  // outlives this refusal.
   if (dirnameOf(handle.path) !== normalizedDestDir) {
+    await handle.close().catch(() => {});
     await io.removeTemp(handle.path);
     throw new GgufStorePlacementError(dirnameOf(handle.path), normalizedDestDir);
+  }
+  // CR-2 (defense-in-depth): symmetrically assert the COMPOSED FINAL
+  // destination path also resolves inside `normalizedDestDir` — a
+  // traversing `destFile` (e.g. '../x') would otherwise rename the
+  // verified file to a sibling OUTSIDE the intended <owner>/<repo> folder,
+  // even though the temp file itself landed in the right place. Same
+  // failure shape as the guard above: close the handle, remove the `.part`,
+  // refuse — all still strictly before any network work.
+  if (dirnameOf(destPath) !== normalizedDestDir) {
+    await handle.close().catch(() => {});
+    await io.removeTemp(handle.path);
+    throw new GgufStorePlacementError(dirnameOf(destPath), normalizedDestDir);
   }
 
   let digest: string;
