@@ -22,6 +22,17 @@ import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData,
  * — so the presence check needs the actual constants, not just the wire.
  */
 import { NEXT_DEDICATED_MODEL } from '../../../src/host/setup/registry';
+/*
+ * T12: `modelCatalog.ts` is likewise PURE DATA + a pure charset function with
+ * ZERO imports (its own zero-import drift-lock) — the same webview-bundle-safe
+ * posture as `registry.ts` above. Needed here because the `GGUF by {publisher}`
+ * caption (§3.1 A-F7) turns on "publisher ≠ the model's VENDOR", and the
+ * vendor never crosses the wire — only the catalog's `vllm.serveRepo` (the
+ * vendor's own official repo, §5) carries it. Deriving from the catalog keeps
+ * the rule self-truing on catalog edits instead of hardcoding an org list
+ * here that would silently drift.
+ */
+import { MODEL_CATALOG } from '../../../src/host/setup/modelCatalog';
 
 // --- Agent card (§6 card 1) -------------------------------------------------
 
@@ -735,4 +746,96 @@ export function provisionModalCopyLiveOid(
     "Talaria verifies the file's checksum against the publisher's manifest after downloading, " +
     `and Ollama verifies it again during install at ${endpoint}.`
   );
+}
+
+// --- beta.6 T12 (§3.1/§6): the Agent "Configure Local Agent Model" block ---
+
+/** The Agent block's backend union — structurally identical to
+ *  `localModel.tsx`'s `LocalModelBackend`, restated as a literal union here
+ *  because importing it would close a `setupCards ⇄ localModel` module cycle
+ *  (localModel imports THIS file). */
+export type AgentModelBackend = 'ollama' | 'llamacpp' | 'vllm';
+
+/** §6 "Agent block heading". */
+export const AGENT_BLOCK_HEADING = 'Configure Local Agent Model';
+
+/** §6 "Agent pre-ready note" (CC-7) — rendered whenever `agent.phase !==
+ *  'ready'`: model prep (pull/download/Test/Save) is Hermes-independent and
+ *  legitimately done first; only the PROVIDER step waits for the install. */
+export const AGENT_PRE_READY_NOTE =
+  "Hermes isn't installed yet — you can prepare the model now and configure the provider after the install.";
+
+/** §6 "Devstral default caption" (rev 3, agent picker) — rides the
+ *  `defaultForRole` row beside its `Default` chip. Agent-surface copy, NOT
+ *  emitted by the block itself (T10 report #4): passed via `rowCaption`. */
+export const AGENT_DEFAULT_MODEL_CAPTION = "Recommended — Talaria's agent pipeline is tuned on Devstral-24B (2507).";
+
+/** §6 "Run command caption (agent, pre-save)" — llama.cpp pane ONLY: the
+ *  in-row command is host-composed for the DEFAULT agent port (8013), and
+ *  Save recomposes `saved.runCommand` from the saved endpoint's port (CC-6).
+ *  Deliberately NOT rendered on the vLLM pane — `vllm serve {repo}` carries
+ *  no port for Save to update, so the caption would be a lie there. */
+export const AGENT_PRESAVE_RUN_COMMAND_CAPTION = 'Uses the default port — Save updates this command to your endpoint.';
+
+/** id → the model's VENDOR owner: its `vllm.serveRepo`'s owner segment — §5
+ *  pins serveRepo as the vendor's own official repo (with the two ledgered
+ *  vLLM-only exceptions, `openai`/`sweepai`, which are equally the VENDOR
+ *  orgs). Derived from the imported catalog, never the wire (the wire's vllm
+ *  cell is compose-time-gated and carries only a runCommand). */
+const CATALOG_VENDOR_OWNER: ReadonlyMap<string, string> = new Map(
+  MODEL_CATALOG.flatMap((m) => (m.vllm !== undefined ? [[m.id, m.vllm.serveRepo.split('/')[0] ?? ''] as const] : [])),
+);
+
+/**
+ * §3.1 A-F7 — the quiet `GGUF by {publisher}` caption for rows whose GGUF
+ * publisher ≠ the model's vendor (unsloth/ggml-org surfaced BEFORE the Tier-1
+ * modal, which still states the full trustBasis). Vendor-published rows
+ * (devstral→mistralai, ornith→ornith-ai) get nothing; an id outside the
+ * catalog (fixture rows) gets nothing — never a guess.
+ */
+export function ggufPublisherCaption(model: Pick<SetupCatalogModel, 'id' | 'publisher'>): string | undefined {
+  const vendor = CATALOG_VENDOR_OWNER.get(model.id);
+  if (vendor === undefined || vendor.toLowerCase() === model.publisher.toLowerCase()) return undefined;
+  return `GGUF by ${model.publisher}`;
+}
+
+/**
+ * The Agent picker's per-row caption (`LocalModelBlock`'s `rowCaption` slot):
+ * the `defaultForRole` row carries the §6 Devstral-recommended caption on
+ * EVERY pane (it recommends the MODEL, not a backend artifact); non-default
+ * rows carry the A-F7 GGUF-publisher caption on the llama.cpp pane only —
+ * the pane whose artifact that caption is about.
+ */
+export function agentRowCaption(
+  model: Pick<SetupCatalogModel, 'id' | 'publisher' | 'defaultForRole'>,
+  backend: AgentModelBackend,
+): string | undefined {
+  if (model.defaultForRole) return AGENT_DEFAULT_MODEL_CAPTION;
+  if (backend === 'llamacpp') return ggufPublisherCaption(model);
+  return undefined;
+}
+
+/**
+ * CC-6 — the Agent endpoint field's init value for one backend pane: the
+ * SAVED endpoint when the save names THIS backend, else the host-owned
+ * default for the pane. An absent `agentLocalModel` block degrades to an
+ * empty field — never a webview-fabricated URL (Global Constraint 1).
+ */
+export function agentEndpointInit(local: SetupData['agentLocalModel'], backend: AgentModelBackend): string {
+  const saved = local?.saved;
+  const savedEndpoint = saved !== undefined && saved.backend === backend ? saved.endpoint : '';
+  return savedEndpoint || local?.endpointDefaults[backend] || '';
+}
+
+/** §4.2 restoration — the initially-selected backend pane: `saved.backend`
+ *  when a save exists, else the ollama default. */
+export function agentInitialBackend(local: SetupData['agentLocalModel']): AgentModelBackend {
+  return local?.saved?.backend ?? 'ollama';
+}
+
+/** The collapsed saved-summary line (§4.2/CC-10) — same vocabulary as the
+ *  host's §6 save modal (`Set the local agent model to '{displayName}' via
+ *  {backend} at {endpoint}?`), so the summary reads as the modal's answer. */
+export function agentSavedSummaryLine(displayName: string, backend: string, endpoint: string): string {
+  return `${displayName} via ${backend} at ${endpoint}`;
 }

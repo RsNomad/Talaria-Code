@@ -11,10 +11,20 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupProgress } from '../protocol';
 import { NEXT_DEDICATED_MODEL } from '../../../src/host/setup/registry';
+import { MODEL_CATALOG } from '../../../src/host/setup/modelCatalog';
 import {
+  AGENT_BLOCK_HEADING,
+  AGENT_DEFAULT_MODEL_CAPTION,
+  AGENT_PRE_READY_NOTE,
+  AGENT_PRESAVE_RUN_COMMAND_CAPTION,
   agentDoneLine,
+  agentEndpointInit,
+  agentInitialBackend,
   agentPhaseLabel,
   agentPrimaryAction,
+  agentRowCaption,
+  agentSavedSummaryLine,
+  ggufPublisherCaption,
   backendReadyText,
   buildCopyLogText,
   cancelPullParams,
@@ -1058,5 +1068,155 @@ describe('T11 — the registry `localInstall.models` wire projection: deprecated
 
   it('SetupPanel.tsx no longer consumes localInstall.models (the block reads catalog.models instead)', () => {
     expect(setupPanelSrc).not.toMatch(/localInstall\??\.models/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T12 (§3.1/§6): Agent-block helpers + copy.
+ * ------------------------------------------------------------------ */
+
+describe('§6 Agent-block copy (T12) — verbatim + single-sourced', () => {
+  it('AGENT_BLOCK_HEADING — §6 "Agent block heading"', () => {
+    expect(AGENT_BLOCK_HEADING).toBe('Configure Local Agent Model');
+  });
+
+  it('AGENT_PRE_READY_NOTE — §6 "Agent pre-ready note"', () => {
+    expect(AGENT_PRE_READY_NOTE).toBe(
+      "Hermes isn't installed yet — you can prepare the model now and configure the provider after the install.",
+    );
+  });
+
+  it('AGENT_DEFAULT_MODEL_CAPTION — §6 "Devstral default caption"', () => {
+    expect(AGENT_DEFAULT_MODEL_CAPTION).toBe("Recommended — Talaria's agent pipeline is tuned on Devstral-24B (2507).");
+  });
+
+  it('AGENT_PRESAVE_RUN_COMMAND_CAPTION — §6 "Run command caption (agent, pre-save)"', () => {
+    expect(AGENT_PRESAVE_RUN_COMMAND_CAPTION).toBe('Uses the default port — Save updates this command to your endpoint.');
+  });
+
+  it('SetupPanel.tsx never RESTATES the T12 copy inline — it renders the setupCards.ts constants', () => {
+    const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+    expect(setupPanelSrc).not.toContain('Configure Local Agent Model');
+    expect(setupPanelSrc).not.toContain('you can prepare the model now');
+    expect(setupPanelSrc).not.toContain('tuned on Devstral-24B (2507)');
+    expect(setupPanelSrc).not.toContain('Uses the default port');
+    expect(setupPanelSrc).not.toContain('GGUF by ');
+  });
+
+  it('localModel.tsx never hardcodes the T12 captions either — they arrive via props', () => {
+    const localModelSrc = readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8');
+    expect(localModelSrc).not.toContain('tuned on Devstral-24B (2507)');
+    expect(localModelSrc).not.toContain('Uses the default port');
+    expect(localModelSrc).not.toContain('GGUF by ');
+  });
+});
+
+describe('ggufPublisherCaption (T12, A-F7) — publisher ≠ vendor over the REAL catalog agent rows', () => {
+  const byId = (id: string) => {
+    const row = MODEL_CATALOG.find((m) => m.id === id);
+    if (!row) throw new Error(`catalog row ${id} missing`);
+    return { id: row.id, publisher: row.publisher };
+  };
+
+  it('vendor-published rows carry NO caption (devstral-24b, ornith-9b, ornith-35b)', () => {
+    expect(ggufPublisherCaption(byId('devstral-24b'))).toBeUndefined();
+    expect(ggufPublisherCaption(byId('ornith-9b'))).toBeUndefined();
+    expect(ggufPublisherCaption(byId('ornith-35b'))).toBeUndefined();
+  });
+
+  it('packaging-org rows carry the caption (qwen36-27b/qwen36-35b-a3b → unsloth, gpt-oss-20b → ggml-org)', () => {
+    expect(ggufPublisherCaption(byId('qwen36-27b'))).toBe('GGUF by unsloth');
+    expect(ggufPublisherCaption(byId('qwen36-35b-a3b'))).toBe('GGUF by unsloth');
+    expect(ggufPublisherCaption(byId('gpt-oss-20b'))).toBe('GGUF by ggml-org');
+  });
+
+  it('an id outside the catalog (fixture rows) yields NO caption — never a guess', () => {
+    expect(ggufPublisherCaption({ id: 'not-a-row', publisher: 'unsloth' })).toBeUndefined();
+  });
+
+  it('self-truing: for EVERY agent row, caption presence ⇔ vllm serveRepo owner ≠ publisher', () => {
+    for (const row of MODEL_CATALOG.filter((m) => m.role === 'agent')) {
+      const owner = row.vllm?.serveRepo.split('/')[0];
+      const caption = ggufPublisherCaption({ id: row.id, publisher: row.publisher });
+      if (owner !== undefined && owner.toLowerCase() !== row.publisher.toLowerCase()) {
+        expect(caption).toBe(`GGUF by ${row.publisher}`);
+      } else {
+        expect(caption).toBeUndefined();
+      }
+    }
+  });
+});
+
+describe('agentRowCaption (T12) — Devstral caption on the default row; GGUF caption llamacpp-pane-only', () => {
+  it('the defaultForRole row carries the §6 Devstral caption on EVERY pane', () => {
+    const devstral = { id: 'devstral-24b', publisher: 'mistralai', defaultForRole: true as const };
+    expect(agentRowCaption(devstral, 'ollama')).toBe(AGENT_DEFAULT_MODEL_CAPTION);
+    expect(agentRowCaption(devstral, 'llamacpp')).toBe(AGENT_DEFAULT_MODEL_CAPTION);
+    expect(agentRowCaption(devstral, 'vllm')).toBe(AGENT_DEFAULT_MODEL_CAPTION);
+  });
+
+  it('a packaging-org row carries the GGUF caption on the llamacpp pane ONLY', () => {
+    const qwen = { id: 'qwen36-27b', publisher: 'unsloth' };
+    expect(agentRowCaption(qwen, 'llamacpp')).toBe('GGUF by unsloth');
+    expect(agentRowCaption(qwen, 'ollama')).toBeUndefined();
+    expect(agentRowCaption(qwen, 'vllm')).toBeUndefined();
+  });
+
+  it('a vendor-published non-default row carries nothing anywhere', () => {
+    const ornith = { id: 'ornith-9b', publisher: 'ornith-ai' };
+    expect(agentRowCaption(ornith, 'ollama')).toBeUndefined();
+    expect(agentRowCaption(ornith, 'llamacpp')).toBeUndefined();
+    expect(agentRowCaption(ornith, 'vllm')).toBeUndefined();
+  });
+});
+
+describe('agentEndpointInit (T12, CC-6) — endpointDefaults init, saved wins for ITS backend only', () => {
+  const defaults = { ollama: 'http://127.0.0.1:11434', llamacpp: 'http://127.0.0.1:8013', vllm: 'http://127.0.0.1:8000' };
+
+  it('no saved state: each backend initializes to its own default', () => {
+    const local = { endpointDefaults: defaults };
+    expect(agentEndpointInit(local, 'ollama')).toBe('http://127.0.0.1:11434');
+    expect(agentEndpointInit(local, 'llamacpp')).toBe('http://127.0.0.1:8013');
+    expect(agentEndpointInit(local, 'vllm')).toBe('http://127.0.0.1:8000');
+  });
+
+  it('saved wins for the SAVED backend; the other backends keep their defaults', () => {
+    const local = {
+      endpointDefaults: defaults,
+      saved: { modelId: 'devstral-24b', backend: 'llamacpp' as const, endpoint: 'http://127.0.0.1:9999', servedName: 'x' },
+    };
+    expect(agentEndpointInit(local, 'llamacpp')).toBe('http://127.0.0.1:9999');
+    expect(agentEndpointInit(local, 'ollama')).toBe('http://127.0.0.1:11434');
+    expect(agentEndpointInit(local, 'vllm')).toBe('http://127.0.0.1:8000');
+  });
+
+  it('an absent agentLocalModel wire block degrades to an empty field — never a fabricated URL', () => {
+    expect(agentEndpointInit(undefined, 'ollama')).toBe('');
+  });
+});
+
+describe('agentInitialBackend (T12, §4.2) — saved.backend restores, else the ollama default', () => {
+  it('no save: ollama', () => {
+    expect(agentInitialBackend(undefined)).toBe('ollama');
+    expect(
+      agentInitialBackend({ endpointDefaults: { ollama: 'a', llamacpp: 'b', vllm: 'c' } }),
+    ).toBe('ollama');
+  });
+
+  it('saved: the saved backend', () => {
+    expect(
+      agentInitialBackend({
+        endpointDefaults: { ollama: 'a', llamacpp: 'b', vllm: 'c' },
+        saved: { modelId: 'devstral-24b', backend: 'vllm', endpoint: 'http://127.0.0.1:8000', servedName: 'x' },
+      }),
+    ).toBe('vllm');
+  });
+});
+
+describe('agentSavedSummaryLine (T12) — mirrors the save modal vocabulary', () => {
+  it('composes "{displayName} via {backend} at {endpoint}"', () => {
+    expect(agentSavedSummaryLine('Ornith-1.0 9B', 'ollama', 'http://127.0.0.1:11434')).toBe(
+      'Ornith-1.0 9B via ollama at http://127.0.0.1:11434',
+    );
   });
 });

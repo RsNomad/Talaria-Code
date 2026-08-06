@@ -36,15 +36,24 @@ import { Pill } from '../components/Pill';
 import { Toggle } from '../components/Toggle';
 import { DECLINED, errorMessage } from '../state/panels';
 import type { RemoteData } from '../state/remoteData';
-import { LocalModelBlock } from './localModel';
+import { LocalModelBlock, RunCommandLine, TestAndServingLine } from './localModel';
 import { type NextEditRowCopy, NEXT_EDIT_ROWS } from './nextEditCopy';
 import { PanelShell, RemotePanel, SectionLabel } from './PanelShell';
 import { commitFieldEdit, initNextEditRowState, reconcileNextEditRowState } from './settingsField';
 import {
+  AGENT_BLOCK_HEADING,
+  AGENT_PRE_READY_NOTE,
+  AGENT_PRESAVE_RUN_COMMAND_CAPTION,
   agentDoneLine,
+  agentEndpointInit,
+  agentInitialBackend,
   agentPhaseLabel,
   agentPrimaryAction,
+  agentRowCaption,
+  agentSavedSummaryLine,
   buildCopyLogText,
+  catalogPreselectId,
+  type AgentModelBackend,
   CANCEL_LABEL,
   cancelPullParams,
   catalogPresence,
@@ -565,7 +574,203 @@ function AgentCard({
           </pre>
         </details>
       )}
+
+      <AgentLocalModelSection setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
     </Card>
+  );
+}
+
+/**
+ * beta.6 T12 (§3.1): the Agent card's local-agent-model collapsible section
+ * ({@link AGENT_BLOCK_HEADING}) — the shared `LocalModelBlock` with the 6 agent
+ * catalog rows as a PICKER (`selectedId`/`onSelect`), a 3-pane backend
+ * switch, the CC-6 endpoint field, Save → `setup.saveAgentModel` (Tier-1
+ * modal host-side), and the CC-10 saved summary + [Change model]/[Clear].
+ *
+ * Renders in EVERY `agent.phase` (CC-7 — model prep is Hermes-independent;
+ * the §6 pre-ready note explains the provider step comes after the install).
+ * The guidance line is the HOST-composed `providerGuidance` (variant picked
+ * by `provider.phase` in `composeAgentGuidance`, `SetupController.ts`) — the
+ * webview renders it verbatim and never re-derives the variant. Honesty pin
+ * (§3.1): nothing here ever claims the AGENT is USING the model — the
+ * Provider card's ACP-derived phase stays the only truth about that.
+ */
+function AgentLocalModelSection({
+  setup,
+  progress,
+  dispatch,
+  disabledReason,
+}: {
+  setup: SetupData;
+  progress: SetupProgressMap;
+  dispatch: SetupPanelProps['dispatch'];
+  disabledReason?: string;
+}) {
+  const local = setup.agentLocalModel;
+  const saved = local?.saved;
+  const agentModels = (setup.catalog?.models ?? []).filter((m) => m.role === 'agent');
+  const savedRow = saved === undefined ? undefined : agentModels.find((m) => m.id === saved.modelId);
+
+  // Collapsible via a REAL toggle + conditional render (the NEXT card's
+  // edit-button pattern), NOT a native <details>: closed content must be
+  // genuinely absent — a closed <details>' children stay in the DOM, where
+  // their Re-check/backend-tab buttons would pollute the card's other
+  // queries (and cost renders) while contributing nothing.
+  const [open, setOpen] = useState(false);
+  const [changing, setChanging] = useState(false);
+
+  // A-F8 — THE ONE preselect rule (`catalogPreselectId`): `saved.modelId`
+  // when a save exists, else the `defaultForRole` row. Reconciled while
+  // rendering whenever the SAVED id itself moves (a Save landing, a Clear,
+  // an external settings edit) — the `settingsField.ts` adjust-while-
+  // rendering pattern — so a fresh picker, [Change model]'s prefill, and a
+  // post-Clear reset all share exactly this rule; an in-flight user pick
+  // survives unrelated re-renders (the key doesn't move).
+  const [sel, setSel] = useState(() => ({
+    lastSavedId: saved?.modelId,
+    id: catalogPreselectId(agentModels, saved?.modelId),
+  }));
+  // The second clause re-runs the rule if the catalog arrived AFTER mount
+  // (an old-host wire without `catalog` gaining it on a later push) — it can
+  // fire at most once, because with a non-empty row set `catalogPreselectId`
+  // always names a row.
+  if (sel.lastSavedId !== saved?.modelId || (sel.id === undefined && agentModels.length > 0)) {
+    setSel({ lastSavedId: saved?.modelId, id: catalogPreselectId(agentModels, saved?.modelId) });
+  }
+
+  const [backend, setBackend] = useState<AgentModelBackend>(() => agentInitialBackend(local));
+
+  // CC-6: endpoint init = the saved endpoint (for ITS backend) else the
+  // host-owned default — reset when the backend tab moves or that init value
+  // itself changes (a save landing / external edit), never on an unrelated
+  // re-render (an in-flight edit survives).
+  const endpointInit = agentEndpointInit(local, backend);
+  const endpointKey = `${backend}|${endpointInit}`;
+  const [ep, setEp] = useState(() => ({ key: endpointKey, value: endpointInit }));
+  if (ep.key !== endpointKey) setEp({ key: endpointKey, value: endpointInit });
+
+  const pickerOpen = saved === undefined || changing;
+
+  // [Change model] toggles the picker (the NEXT card's edit-button pattern —
+  // closing it again is the escape route). Re-opening prefills by the SAME
+  // A-F8 rule, discarding any pick left over from a previous open.
+  const toggleChange = () => {
+    const next = !changing;
+    if (next) setSel({ lastSavedId: saved?.modelId, id: catalogPreselectId(agentModels, saved?.modelId) });
+    setChanging(next);
+  };
+
+  const runSave = async (): Promise<unknown> => {
+    const result = await dispatch('setup.saveAgentModel', { modelId: sel.id, backend, endpoint: ep.value });
+    // DECLINED (the user dismissed the host's Tier-1 modal) keeps the picker
+    // open — neither success nor failure (the C-2 lock, same as ActionButton).
+    if (result !== DECLINED) setChanging(false);
+    return result;
+  };
+
+  return (
+    <div className="mt-3 border-t border-border pt-2">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className="inline-flex items-center gap-1.5 rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
+      >
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />
+        {AGENT_BLOCK_HEADING}
+      </button>
+      {open && (
+      <div className="mt-2 flex flex-col gap-2">
+        {setup.agent.phase !== 'ready' && <p className="text-2xs text-muted">{AGENT_PRE_READY_NOTE}</p>}
+
+        {saved !== undefined && (
+          <div className="flex flex-col gap-1.5">
+            <StatusLine
+              icon="pass-filled"
+              text={agentSavedSummaryLine(savedRow?.displayName ?? saved.modelId, saved.backend, saved.endpoint)}
+              tone="add"
+            />
+            {saved.runCommand && <RunCommandLine command={saved.runCommand} />}
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                aria-expanded={changing}
+                onClick={toggleChange}
+                className="rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
+              >
+                Change model
+              </button>
+              <ActionButton
+                label="Clear"
+                onRun={() => dispatch('setup.saveAgentModel', { clear: true })}
+                disabledReason={disabledReason}
+              />
+            </div>
+          </div>
+        )}
+
+        {pickerOpen && (
+          <div className="flex flex-col gap-2">
+            <div className="inline-flex gap-1 self-start rounded border border-border p-0.5">
+              {(['ollama', 'llamacpp', 'vllm'] as const).map((b) => (
+                <button
+                  key={b}
+                  type="button"
+                  aria-pressed={backend === b}
+                  onClick={() => setBackend(b)}
+                  className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
+                    backend === b ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
+                  }`}
+                >
+                  {b === 'ollama' ? 'Ollama' : b === 'llamacpp' ? 'llama.cpp' : 'vLLM'}
+                </button>
+              ))}
+            </div>
+
+            <TextField
+              label="Endpoint"
+              value={ep.value}
+              onChange={(v) => setEp({ key: ep.key, value: v })}
+              placeholder="http://host:port"
+            />
+
+            <LocalModelBlock
+              backend={backend}
+              models={agentModels}
+              ollama={setup.ollama}
+              llamacppRuntime={setup.llamacppRuntime}
+              endpoint={ep.value}
+              progress={progress}
+              dispatch={dispatch}
+              disabledReason={disabledReason}
+              selectedId={sel.id}
+              onSelect={(id) => setSel({ lastSavedId: sel.lastSavedId, id })}
+              rowCaption={(m) => agentRowCaption(m, backend)}
+              runCommandCaption={backend === 'llamacpp' ? AGENT_PRESAVE_RUN_COMMAND_CAPTION : undefined}
+            />
+
+            {/* The Ollama pane has no in-block Test (§4.1) — same surface-level
+                Test + Serving line the FIM ollama pane carries (T10 Minor #4). */}
+            {backend === 'ollama' && <TestAndServingLine backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
+
+            {sel.id !== undefined && (
+              <div>
+                <ActionButton
+                  label="Save"
+                  onRun={runSave}
+                  disabledReason={disabledReason}
+                  tone="accent"
+                  successLabel="✓ Saved"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        <DoneLine text={local?.providerGuidance ?? ''} className="mt-0" />
+      </div>
+      )}
+    </div>
   );
 }
 

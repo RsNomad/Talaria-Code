@@ -1565,3 +1565,527 @@ describe('T11 — vLLM pane: the ⑪ copy verbatim + run-command rows + docs + T
     expect(within(fimCard).queryByRole('button', { name: /Pull|Download/ })).not.toBeInTheDocument();
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T12 (§3.1): the Agent card's "Configure Local Agent Model"
+ * collapsible section — the block with role='agent', the 6-model picker
+ * (ONE preselect rule, A-F8), the §3.1 captions (Devstral default +
+ * `GGUF by {publisher}`, A-F7), endpoint init from `endpointDefaults`
+ * (saved wins), Save/Change/Clear via `setup.saveAgentModel`, and the
+ * host-composed `providerGuidance` line.
+ * ------------------------------------------------------------------ */
+
+const T12_MOE_NOTE = 'MoE ≠ smaller: a 35B MoE still needs ~20 GiB for weights — only compute is light (~3B active per token).';
+const T12_MMPROJ_NOTE =
+  'Vision input is optional — llama-server needs the separate mmproj file (not downloaded here); text works without it.';
+
+function agentCatalogRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'devstral-24b',
+    role: 'agent',
+    defaultForRole: true,
+    displayName: 'Devstral-24B (2507)',
+    publisher: 'mistralai',
+    license: 'Apache-2.0',
+    vramLine: '24GB-comfortable — the sweet spot: ~55K ctx fp16-KV / ~110K Q8-KV; 128K window',
+    progressId: 'devstral-24b',
+    ollamaApproxBytes: 14_333_915_904,
+    ollamaCreatedName: 'devstral-small-2507:24b',
+    llamacpp: { file: 'Devstral-Small-2507-Q4_K_M.gguf', approxBytes: 14_333_915_904, present: false, available: true },
+    vllm: { runCommand: 'vllm serve mistralai/Devstral-Small-2507' },
+    ...overrides,
+  };
+}
+
+/** The six REAL agent rows (ids/names/publishers/notes mirror MODEL_CATALOG)
+ *  + one fim row to prove the role filter. */
+function agentCatalog(): SetupCatalogModel[] {
+  return [
+    agentCatalogRow(),
+    agentCatalogRow({
+      id: 'ornith-9b',
+      defaultForRole: undefined,
+      displayName: 'Ornith-1.0 9B',
+      publisher: 'ornith-ai',
+      vramLine: '24GB-easy (128K+ ctx headroom)',
+      progressId: 'ornith-9b',
+      ollamaCreatedName: undefined,
+      ollamaTag: 'ornith:9b',
+      ollamaApproxBytes: 5_600_000_000,
+      llamacpp: { file: 'ornith-1.0-9b-Q4_K_M.gguf', approxBytes: 5_629_108_704, present: false, available: true },
+      vllm: { runCommand: 'vllm serve ornith-ai/Ornith-1.0-9B' },
+    }),
+    agentCatalogRow({
+      id: 'ornith-35b',
+      defaultForRole: undefined,
+      displayName: 'Ornith-1.0 35B (MoE)',
+      publisher: 'ornith-ai',
+      vramLine: '24GB-stretch (CPU-offload) / 32GB-comfortable',
+      note: T12_MOE_NOTE,
+      progressId: 'ornith-35b',
+      ollamaCreatedName: undefined,
+      ollamaTag: 'ornith:35b',
+      ollamaApproxBytes: 21_000_000_000,
+      llamacpp: { file: 'ornith-1.0-35b-Q4_K_M.gguf', approxBytes: 21_166_757_760, present: false, available: true },
+      vllm: { runCommand: 'vllm serve ornith-ai/Ornith-1.0-35B' },
+    }),
+    agentCatalogRow({
+      id: 'qwen36-27b',
+      defaultForRole: undefined,
+      displayName: 'Qwen3.6-27B',
+      publisher: 'unsloth',
+      vramLine: '24GB-comfortable, tighter ctx (~24–40K)',
+      note: T12_MMPROJ_NOTE,
+      progressId: 'qwen36-27b',
+      ollamaCreatedName: undefined,
+      ollamaTag: 'qwen3.6:27b',
+      ollamaApproxBytes: 17_000_000_000,
+      llamacpp: { file: 'Qwen3.6-27B-Q4_K_M.gguf', approxBytes: 16_817_244_384, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen3.6-27B' },
+    }),
+    agentCatalogRow({
+      id: 'gpt-oss-20b',
+      defaultForRole: undefined,
+      displayName: 'gpt-oss-20b',
+      publisher: 'ggml-org',
+      vramLine: '24GB-easy (100K+ ctx)',
+      progressId: 'gpt-oss-20b',
+      ollamaCreatedName: undefined,
+      ollamaTag: 'gpt-oss:20b',
+      ollamaApproxBytes: 14_000_000_000,
+      llamacpp: { file: 'gpt-oss-20b-MXFP4.gguf', approxBytes: 12_109_566_624, present: false, available: true },
+      vllm: { runCommand: 'vllm serve openai/gpt-oss-20b' },
+    }),
+    agentCatalogRow({
+      id: 'qwen36-35b-a3b',
+      defaultForRole: undefined,
+      displayName: 'Qwen3.6-35B-A3B',
+      publisher: 'unsloth',
+      vramLine: '24GB-stretch (offload) / 32GB-comfortable',
+      note: T12_MOE_NOTE,
+      progressId: 'qwen36-35b-a3b',
+      ollamaCreatedName: undefined,
+      ollamaTag: 'qwen3.6:35b',
+      ollamaApproxBytes: 24_000_000_000,
+      llamacpp: { file: 'Qwen3.6-35B-A3B-UD-Q4_K_S.gguf', approxBytes: 20_893_015_008, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen3.6-35B-A3B' },
+    }),
+    fimCatalogRow(),
+  ];
+}
+
+const T12_ENDPOINT_DEFAULTS = {
+  ollama: 'http://127.0.0.1:11434',
+  llamacpp: 'http://127.0.0.1:8013',
+  vllm: 'http://127.0.0.1:8000',
+};
+
+function agentBlockData(overrides: Partial<SetupData> = {}): SetupData {
+  return baseData({
+    catalog: { models: agentCatalog() },
+    llamacppRuntime: { binary: 'found', version: 'b4500' },
+    ollama: { running: true, version: '0.4.1', endpoint: 'http://127.0.0.1:11434', models: [] },
+    agentLocalModel: { endpointDefaults: T12_ENDPOINT_DEFAULTS },
+    ...overrides,
+  });
+}
+
+/** A `saved` fixture (ollama flavor — no runCommand, per the host: the daemon serves it). */
+function savedOrnith() {
+  return {
+    modelId: 'ornith-9b',
+    backend: 'ollama' as const,
+    endpoint: 'http://127.0.0.1:11434',
+    servedName: 'ornith:9b',
+  };
+}
+
+async function openAgentSection(data: SetupData) {
+  const utils = renderPanel(data);
+  await utils.user.click(screen.getByText('Configure Local Agent Model'));
+  const agentCard = must(screen.getByText('Agent').closest('section'));
+  return { ...utils, agentCard };
+}
+
+describe('T12 — the section renders in EVERY agent.phase (§3.1 CC-7)', () => {
+  const phases: AgentSetupPhase[] = [
+    'unknown',
+    'pipx-missing',
+    'python-unsuitable',
+    'missing',
+    'installing',
+    'installed-inactive',
+    'awaiting-reload',
+    'ready',
+    'error',
+  ];
+
+  for (const phase of phases) {
+    it(`renders the "Configure Local Agent Model" section at phase "${phase}"`, () => {
+      renderPanel(agentBlockData({ agent: { ...baseData().agent, phase } }));
+      expect(screen.getByText('Configure Local Agent Model')).toBeInTheDocument();
+    });
+  }
+
+  it('shows the §6 pre-ready note when agent.phase !== "ready"', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData({ agent: { ...baseData().agent, phase: 'missing' } }));
+    expect(
+      within(agentCard).getByText(
+        "Hermes isn't installed yet — you can prepare the model now and configure the provider after the install.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('does NOT show the pre-ready note at phase "ready"', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(
+      within(agentCard).queryByText(/you can prepare the model now and configure the provider after the install/),
+    ).not.toBeInTheDocument();
+  });
+
+  it('the picker is usable pre-Hermes (model prep is install-independent)', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData({ agent: { ...baseData().agent, phase: 'missing' } }));
+    expect(within(agentCard).getByRole('button', { name: 'Devstral-24B (2507)' })).toBeEnabled();
+  });
+});
+
+describe('T12 — the 6-model picker: buttons, role-filtered, ONE Default chip + Devstral caption (§3.1)', () => {
+  it('renders all six agent rows as PICKER BUTTONS (unlike the FIM surface, where rows are plain text)', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    for (const name of [
+      'Devstral-24B (2507)',
+      'Ornith-1.0 9B',
+      'Ornith-1.0 35B (MoE)',
+      'Qwen3.6-27B',
+      'gpt-oss-20b',
+      'Qwen3.6-35B-A3B',
+    ]) {
+      expect(within(agentCard).getByRole('button', { name })).toBeInTheDocument();
+    }
+  });
+
+  it('the fim-role catalog row does NOT render in the Agent card', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(within(agentCard).queryByText('Qwen2.5-Coder 1.5B (base)')).not.toBeInTheDocument();
+  });
+
+  it('exactly ONE Default chip (devstral-24b is the role default)', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(within(agentCard).getAllByText('Default')).toHaveLength(1);
+  });
+
+  it('the §6 Devstral-recommended caption renders on the default row', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(
+      within(agentCard).getByText("Recommended — Talaria's agent pipeline is tuned on Devstral-24B (2507)."),
+    ).toBeInTheDocument();
+  });
+});
+
+describe('T12 — preselect/prefill = the ONE A-F8 rule (saved.modelId else defaultForRole)', () => {
+  it('no save: the defaultForRole row (devstral) is preselected', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(within(agentCard).getByRole('button', { name: 'Devstral-24B (2507)', pressed: true })).toBeInTheDocument();
+    expect(within(agentCard).getByRole('button', { name: 'Ornith-1.0 9B', pressed: false })).toBeInTheDocument();
+  });
+
+  it('clicking another row moves the selection (onSelect wiring)', async () => {
+    const { agentCard, user } = await openAgentSection(agentBlockData());
+    await user.click(within(agentCard).getByRole('button', { name: 'Ornith-1.0 9B' }));
+    expect(within(agentCard).getByRole('button', { name: 'Ornith-1.0 9B', pressed: true })).toBeInTheDocument();
+    expect(within(agentCard).getByRole('button', { name: 'Devstral-24B (2507)', pressed: false })).toBeInTheDocument();
+  });
+
+  it('[Change model] re-opens the picker prefilled with saved.modelId — the SAME rule', async () => {
+    const data = agentBlockData({
+      agentLocalModel: { endpointDefaults: T12_ENDPOINT_DEFAULTS, saved: savedOrnith() },
+    });
+    const { agentCard, user } = await openAgentSection(data);
+    await user.click(within(agentCard).getByRole('button', { name: 'Change model' }));
+    expect(within(agentCard).getByRole('button', { name: 'Ornith-1.0 9B', pressed: true })).toBeInTheDocument();
+    expect(within(agentCard).getByRole('button', { name: 'Devstral-24B (2507)', pressed: false })).toBeInTheDocument();
+  });
+});
+
+describe('T12 — the §6 MoE + mmproj notes ride the agent rows', () => {
+  it('the MoE honesty note renders on BOTH MoE rows (ornith-35b, qwen36-35b-a3b)', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(within(agentCard).getAllByText(T12_MOE_NOTE)).toHaveLength(2);
+  });
+
+  it('the mmproj note renders on qwen36-27b (exactly once)', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(within(agentCard).getAllByText(T12_MMPROJ_NOTE)).toHaveLength(1);
+  });
+});
+
+describe('T12 — `GGUF by {publisher}` caption on the llama.cpp pane only (A-F7)', () => {
+  it('llama.cpp pane: unsloth ×2 + ggml-org ×1; NEVER on vendor-published rows', async () => {
+    const { agentCard, user } = await openAgentSection(agentBlockData());
+    await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(agentCard).getAllByText('GGUF by unsloth')).toHaveLength(2);
+    expect(within(agentCard).getAllByText('GGUF by ggml-org')).toHaveLength(1);
+    expect(within(agentCard).queryByText('GGUF by mistralai')).not.toBeInTheDocument();
+    expect(within(agentCard).queryByText('GGUF by ornith-ai')).not.toBeInTheDocument();
+  });
+
+  it('ollama pane: NO GGUF-publisher captions at all', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(within(agentCard).queryByText(/^GGUF by /)).not.toBeInTheDocument();
+  });
+});
+
+describe('T12 — endpoint field: init from endpointDefaults, saved wins, per-backend reset (CC-6)', () => {
+  it('no save: the field initializes to the ollama default and follows the backend tab', async () => {
+    const { agentCard, user } = await openAgentSection(agentBlockData());
+    expect(within(agentCard).getByLabelText('Endpoint')).toHaveValue('http://127.0.0.1:11434');
+    await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(agentCard).getByLabelText('Endpoint')).toHaveValue('http://127.0.0.1:8013');
+    await user.click(within(agentCard).getByRole('button', { name: 'vLLM' }));
+    expect(within(agentCard).getByLabelText('Endpoint')).toHaveValue('http://127.0.0.1:8000');
+  });
+
+  it('saved wins for ITS backend; other backends fall back to their defaults', async () => {
+    const data = agentBlockData({
+      agentLocalModel: {
+        endpointDefaults: T12_ENDPOINT_DEFAULTS,
+        saved: {
+          modelId: 'devstral-24b',
+          backend: 'llamacpp',
+          endpoint: 'http://127.0.0.1:9999',
+          servedName: 'Devstral-Small-2507-Q4_K_M.gguf',
+        },
+      },
+    });
+    const { agentCard, user } = await openAgentSection(data);
+    await user.click(within(agentCard).getByRole('button', { name: 'Change model' }));
+    // Restoration (§4.2): the saved backend's tab is active, its endpoint wins.
+    expect(within(agentCard).getByLabelText('Endpoint')).toHaveValue('http://127.0.0.1:9999');
+    await user.click(within(agentCard).getByRole('button', { name: 'Ollama' }));
+    expect(within(agentCard).getByLabelText('Endpoint')).toHaveValue('http://127.0.0.1:11434');
+    await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(agentCard).getByLabelText('Endpoint')).toHaveValue('http://127.0.0.1:9999');
+  });
+
+  it('an in-flight edit survives an unrelated re-render (no reset while the backend is unchanged)', async () => {
+    const { agentCard, user } = await openAgentSection(agentBlockData());
+    const field = within(agentCard).getByLabelText('Endpoint');
+    await user.clear(field);
+    await user.type(field, 'http://127.0.0.1:7777');
+    expect(field).toHaveValue('http://127.0.0.1:7777');
+  });
+});
+
+describe('T12 — pre-save run-command caption (§6, llama.cpp pane)', () => {
+  function withPresentLlamacpp(): SetupData {
+    const models = agentCatalog().map((m) =>
+      m.id === 'devstral-24b'
+        ? {
+            ...m,
+            llamacpp: {
+              file: 'Devstral-Small-2507-Q4_K_M.gguf',
+              approxBytes: 14_333_915_904,
+              present: true,
+              available: true,
+              runCommand:
+                'llama-server -m ~/.local/share/talaria/models/mistralai/Devstral-Small-2507_gguf/Devstral-Small-2507-Q4_K_M.gguf --jinja --port 8013',
+            },
+          }
+        : m,
+    );
+    return agentBlockData({ catalog: { models } });
+  }
+
+  it('a present llama.cpp row shows its run command WITH the §6 default-port caption', async () => {
+    const { agentCard, user } = await openAgentSection(withPresentLlamacpp());
+    await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(agentCard).getByText(/llama-server -m .* --jinja --port 8013/)).toBeInTheDocument();
+    expect(
+      within(agentCard).getByText('Uses the default port — Save updates this command to your endpoint.'),
+    ).toBeInTheDocument();
+  });
+
+  it('the caption does NOT render on the ollama pane', async () => {
+    const { agentCard } = await openAgentSection(withPresentLlamacpp());
+    expect(within(agentCard).queryByText(/Uses the default port/)).not.toBeInTheDocument();
+  });
+
+  it('the caption does NOT render on the vLLM pane (vllm serve carries no port to update)', async () => {
+    const { agentCard, user } = await openAgentSection(withPresentLlamacpp());
+    await user.click(within(agentCard).getByRole('button', { name: 'vLLM' }));
+    expect(within(agentCard).getByText('vllm serve mistralai/Devstral-Small-2507')).toBeInTheDocument();
+    expect(within(agentCard).queryByText(/Uses the default port/)).not.toBeInTheDocument();
+  });
+});
+
+describe('T12 — Save row: setup.saveAgentModel, trust-gated, allowed in any phase', () => {
+  it('Save dispatches {modelId, backend, endpoint} for the current picker state', async () => {
+    const { agentCard, user, dispatch } = await openAgentSection(agentBlockData());
+    await user.click(within(agentCard).getByRole('button', { name: 'Save' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.saveAgentModel', {
+      modelId: 'devstral-24b',
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+    expect(await within(agentCard).findByText('✓ Saved')).toBeInTheDocument();
+  });
+
+  it('Save reflects a changed model + backend + edited endpoint', async () => {
+    const { agentCard, user, dispatch } = await openAgentSection(agentBlockData());
+    await user.click(within(agentCard).getByRole('button', { name: 'Ornith-1.0 9B' }));
+    await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
+    const field = within(agentCard).getByLabelText('Endpoint');
+    await user.clear(field);
+    await user.type(field, 'http://127.0.0.1:9013');
+    await user.click(within(agentCard).getByRole('button', { name: 'Save' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.saveAgentModel', {
+      modelId: 'ornith-9b',
+      backend: 'llamacpp',
+      endpoint: 'http://127.0.0.1:9013',
+    });
+  });
+
+  it('untrusted: Save is disabled and names why; Test stays actionable (read-only)', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData({ trusted: false, ready: false }));
+    const save = within(agentCard).getByRole('button', { name: 'Save' });
+    expect(save).toBeDisabled();
+    expect(save).toHaveAttribute('title', TRUST_DISABLED_REASON);
+    expect(within(agentCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' })).toBeEnabled();
+  });
+
+  it('Save is allowed pre-Hermes (phase "missing") — Talaria-side state', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData({ agent: { ...baseData().agent, phase: 'missing' } }));
+    expect(within(agentCard).getByRole('button', { name: 'Save' })).toBeEnabled();
+  });
+});
+
+describe('T12 — saved state: collapsed summary + [Change model]/[Clear] (§4.2 restoration, CC-10)', () => {
+  it('renders the saved summary (name via backend at endpoint) and NOT the picker', async () => {
+    const data = agentBlockData({
+      agentLocalModel: { endpointDefaults: T12_ENDPOINT_DEFAULTS, saved: savedOrnith() },
+    });
+    const { agentCard } = await openAgentSection(data);
+    expect(within(agentCard).getByText('Ornith-1.0 9B via ollama at http://127.0.0.1:11434')).toBeInTheDocument();
+    expect(within(agentCard).queryByRole('button', { name: 'Devstral-24B (2507)' })).not.toBeInTheDocument();
+    expect(within(agentCard).getByRole('button', { name: 'Change model' })).toBeInTheDocument();
+    expect(within(agentCard).getByRole('button', { name: 'Clear' })).toBeInTheDocument();
+  });
+
+  it('post-save the summary shows saved.runCommand (recomposed for the SAVED endpoint) with a Copy', async () => {
+    const data = agentBlockData({
+      agentLocalModel: {
+        endpointDefaults: T12_ENDPOINT_DEFAULTS,
+        saved: {
+          modelId: 'devstral-24b',
+          backend: 'llamacpp',
+          endpoint: 'http://127.0.0.1:9999',
+          servedName: 'Devstral-Small-2507-Q4_K_M.gguf',
+          runCommand:
+            'llama-server -m ~/.local/share/talaria/models/mistralai/Devstral-Small-2507_gguf/Devstral-Small-2507-Q4_K_M.gguf --jinja --port 9999',
+        },
+      },
+    });
+    const { agentCard } = await openAgentSection(data);
+    expect(within(agentCard).getByText(/--jinja --port 9999/)).toBeInTheDocument();
+    expect(within(agentCard).getByRole('button', { name: 'Copy' })).toBeInTheDocument();
+  });
+
+  it('[Clear] dispatches the modal-gated unset {clear:true}; untrusted disables it with the reason', async () => {
+    const data = agentBlockData({
+      agentLocalModel: { endpointDefaults: T12_ENDPOINT_DEFAULTS, saved: savedOrnith() },
+    });
+    const { agentCard, user, dispatch, unmount } = await openAgentSection(data);
+    await user.click(within(agentCard).getByRole('button', { name: 'Clear' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.saveAgentModel', { clear: true });
+    unmount();
+
+    const untrusted = agentBlockData({
+      trusted: false,
+      ready: false,
+      agentLocalModel: { endpointDefaults: T12_ENDPOINT_DEFAULTS, saved: savedOrnith() },
+    });
+    const { agentCard: card2 } = await openAgentSection(untrusted);
+    const clear = within(card2).getByRole('button', { name: 'Clear' });
+    expect(clear).toBeDisabled();
+    expect(clear).toHaveAttribute('title', TRUST_DISABLED_REASON);
+  });
+
+  it('[Change model] toggles the picker open and closed (escape route, no copy invented)', async () => {
+    const data = agentBlockData({
+      agentLocalModel: { endpointDefaults: T12_ENDPOINT_DEFAULTS, saved: savedOrnith() },
+    });
+    const { agentCard, user } = await openAgentSection(data);
+    await user.click(within(agentCard).getByRole('button', { name: 'Change model' }));
+    expect(within(agentCard).getByRole('button', { name: 'Devstral-24B (2507)' })).toBeInTheDocument();
+    await user.click(within(agentCard).getByRole('button', { name: 'Change model' }));
+    expect(within(agentCard).queryByRole('button', { name: 'Devstral-24B (2507)' })).not.toBeInTheDocument();
+  });
+});
+
+describe('T12 — providerGuidance renders from the wire; the copy never points at an unrendered control (CC-7)', () => {
+  const GUIDANCE_UNCONFIGURED =
+    '✓ Local model ready. Next: press "Configure provider" on the Provider card below → choose the OpenAI-compatible (custom URL) provider → base URL: http://127.0.0.1:11434/v1 · model: ornith:9b. Test shows the served model if unsure.';
+  const GUIDANCE_WAITING =
+    '✓ Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
+  const GUIDANCE_CONFIGURED =
+    '✓ Local model saved. Your provider is already configured — update it to http://127.0.0.1:11434/v1 · ornith:9b if you want the agent on this model.';
+
+  function guidanceData(phase: SetupData['provider']['phase'], guidance: string): SetupData {
+    return agentBlockData({
+      provider: { phase, providerId: phase === 'configured' ? 'custom' : undefined },
+      ready: false,
+      agentLocalModel: {
+        endpointDefaults: T12_ENDPOINT_DEFAULTS,
+        saved: savedOrnith(),
+        providerGuidance: guidance,
+      },
+    });
+  }
+
+  it('unconfigured: the full wizard-pointing §6 line renders AND the wizard button exists', async () => {
+    const { agentCard } = await openAgentSection(guidanceData('unconfigured', GUIDANCE_UNCONFIGURED));
+    expect(within(agentCard).getByText(GUIDANCE_UNCONFIGURED)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Configure provider' })).toBeInTheDocument();
+  });
+
+  it('waiting-agent: the waiting §6 line renders AND no "Configure provider" button is rendered anywhere', async () => {
+    const { agentCard } = await openAgentSection(guidanceData('waiting-agent', GUIDANCE_WAITING));
+    expect(within(agentCard).getByText(GUIDANCE_WAITING)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Configure provider' })).not.toBeInTheDocument();
+  });
+
+  it('unknown: the same waiting line renders AND no wizard button (shares the waiting variant)', async () => {
+    const { agentCard } = await openAgentSection(guidanceData('unknown', GUIDANCE_WAITING));
+    expect(within(agentCard).getByText(GUIDANCE_WAITING)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Configure provider' })).not.toBeInTheDocument();
+  });
+
+  it('configured: the done variant renders', async () => {
+    const { agentCard } = await openAgentSection(guidanceData('configured', GUIDANCE_CONFIGURED));
+    expect(within(agentCard).getByText(GUIDANCE_CONFIGURED)).toBeInTheDocument();
+  });
+
+  it('no guidance on the wire: none of the variants render', async () => {
+    const { agentCard } = await openAgentSection(agentBlockData());
+    expect(within(agentCard).queryByText(/Local model (ready|saved)\./)).not.toBeInTheDocument();
+  });
+});
+
+describe('T12 — Test endpoint in the label + the Serving line (§3.1 flow)', () => {
+  it('ollama pane: surface-level Test names the endpoint, dispatches setup.testRemote, and shows Serving on models', async () => {
+    const { agentCard, user, dispatch } = await openAgentSection(agentBlockData());
+    dispatch.mockResolvedValue({ models: ['devstral-small-2507:24b'] });
+    await user.click(within(agentCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.testRemote', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+    expect(await within(agentCard).findByText('Serving: devstral-small-2507:24b')).toBeInTheDocument();
+  });
+
+  it('llama.cpp pane: the block-rendered Test carries the llamacpp endpoint in its label', async () => {
+    const { agentCard, user } = await openAgentSection(agentBlockData());
+    await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(agentCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8013)' })).toBeInTheDocument();
+  });
+});

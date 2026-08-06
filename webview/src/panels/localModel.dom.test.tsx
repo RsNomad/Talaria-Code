@@ -449,3 +449,45 @@ describe('LocalModelBlock — Default chip + picker preselect', () => {
     expect(screen.getByText('Model A')).toBeInTheDocument();
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T12 — the two additive per-row slots the Agent surface uses
+ * (`rowCaption`, `runCommandCaption`). Both are OPT-IN: omitted props
+ * change nothing (every pre-T12 test above runs unchanged).
+ * ------------------------------------------------------------------ */
+
+describe('LocalModelBlock — rowCaption (T12): a per-row quiet caption slot', () => {
+  it('renders the caption for rows the fn names, and nothing for rows it declines', () => {
+    const models = [
+      catalogModel(),
+      catalogModel({ id: 'qwen25-coder-7b', displayName: 'Qwen2.5-Coder 7B (base)', ollamaTag: 'qwen2.5-coder:7b-base' }),
+    ];
+    renderBlock({ models, rowCaption: (m) => (m.id === 'qwen25-coder-1.5b' ? 'caption for the 1.5b row' : undefined) });
+    expect(screen.getByText('caption for the 1.5b row')).toBeInTheDocument();
+    expect(screen.getAllByText(/caption for the/)).toHaveLength(1);
+  });
+});
+
+describe('LocalModelBlock — runCommandCaption (T12): rendered under a RENDERED run command only', () => {
+  it('a present llamacpp row with a runCommand renders the caption under it', () => {
+    const models = [
+      catalogModel({
+        llamacpp: {
+          file: 'f.gguf',
+          approxBytes: 1_000,
+          present: true,
+          available: true,
+          runCommand: 'llama-server -m f.gguf --jinja --port 8013',
+        },
+      }),
+    ];
+    renderBlock({ backend: 'llamacpp', models, runCommandCaption: 'the pre-save caption' });
+    expect(screen.getByText('llama-server -m f.gguf --jinja --port 8013')).toBeInTheDocument();
+    expect(screen.getByText('the pre-save caption')).toBeInTheDocument();
+  });
+
+  it('an absent row (no run command) renders NO caption', () => {
+    renderBlock({ backend: 'llamacpp', models: [catalogModel()], runCommandCaption: 'the pre-save caption' });
+    expect(screen.queryByText('the pre-save caption')).not.toBeInTheDocument();
+  });
+});

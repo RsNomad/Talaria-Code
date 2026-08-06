@@ -26,6 +26,14 @@
  * behaviorally identical (SetupPanel's extra `tone` prop aside — unused
  * here, identical at `tone='neutral'`), locked by both dom suites; T12-T14
  * inherit the same standing choice unless they extract a shared module.
+ *
+ * T12 (Agent surface) kept that standing choice and made two ADDITIVE
+ * extensions instead: the opt-in per-row `rowCaption`/`runCommandCaption`
+ * slots (§3.1's Devstral-default + A-F7 publisher-provenance + pre-save-port
+ * captions are SURFACE copy, composed in setupCards.ts and passed in — the
+ * block still never hardcodes surface wording), and `RunCommandLine`/
+ * `TestAndServingLine` became exports so the Agent section reuses them in
+ * the SetupPanel → localModel import direction (no cycle, no third copy).
  */
 import { useEffect, useState } from 'react';
 import type { SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
@@ -82,6 +90,21 @@ export interface LocalModelBlockProps {
   ollamaPullSuccessLabel?: string;
   /** vLLM's docs link (host-composed, e.g. the registry option's own `docsUrl`). */
   vllmDocsUrl?: string;
+  /**
+   * T12 (§3.1): a per-row quiet caption, surface-composed (the Agent picker's
+   * Devstral-recommended caption + the A-F7 publisher-provenance caption via
+   * `agentRowCaption`). OPT-IN — omitted, no row renders any caption; the
+   * block itself never composes surface copy (same rule as
+   * `ollamaPullSuccessLabel`).
+   */
+  rowCaption?: (model: SetupCatalogModel) => string | undefined;
+  /**
+   * T12 (§6 "Run command caption (agent, pre-save)"): rendered under each
+   * RENDERED run command. OPT-IN; the caller owns the honesty of passing it
+   * only where it is true (the Agent surface passes it on the llama.cpp pane
+   * only — `vllm serve` carries no port for Save to update).
+   */
+  runCommandCaption?: string;
 }
 
 export function LocalModelBlock(props: LocalModelBlockProps) {
@@ -106,6 +129,8 @@ export function LocalModelBlock(props: LocalModelBlockProps) {
             selected={selectedId === model.id}
             onSelect={onSelect}
             ollamaPullSuccessLabel={props.ollamaPullSuccessLabel}
+            caption={props.rowCaption?.(model)}
+            runCommandCaption={props.runCommandCaption}
           />
         ))}
       </div>
@@ -241,6 +266,8 @@ function ModelRow({
   selected,
   onSelect,
   ollamaPullSuccessLabel,
+  caption,
+  runCommandCaption,
 }: {
   model: SetupCatalogModel;
   backend: LocalModelBackend;
@@ -252,6 +279,8 @@ function ModelRow({
   selected: boolean;
   onSelect?: (id: string) => void;
   ollamaPullSuccessLabel?: string;
+  caption?: string;
+  runCommandCaption?: string;
 }) {
   const live = progress[progressKey('pull', model.id)];
   const percent = pullPercent(live?.totalBytes, live?.completedBytes);
@@ -320,6 +349,7 @@ function ModelRow({
 
       {model.vramLine && <p className="text-2xs text-faint">{model.vramLine}</p>}
       {model.note && <p className="text-2xs text-muted">{model.note}</p>}
+      {caption && <p className="text-2xs text-muted">{caption}</p>}
 
       {presenceText && <StatusLine icon={isPresent ? 'pass-filled' : 'circle-outline'} text={presenceText} tone={isPresent ? 'add' : 'neutral'} />}
       {absenceOnly && <p className="text-2xs text-muted">{absenceOnly}</p>}
@@ -330,7 +360,12 @@ function ModelRow({
         </div>
       )}
 
-      {runCommand && <RunCommandLine command={runCommand} />}
+      {runCommand && (
+        <>
+          <RunCommandLine command={runCommand} />
+          {runCommandCaption && <p className="text-2xs text-faint">{runCommandCaption}</p>}
+        </>
+      )}
 
       {inFlight && (
         <div className="flex flex-col gap-1">
@@ -358,7 +393,10 @@ function ModelRow({
   );
 }
 
-function RunCommandLine({ command }: { command: string }) {
+/** Exported (T12): the Agent section's saved summary renders
+ *  `saved.runCommand` through this same element — same import direction as
+ *  `LocalModelBlock` itself (SetupPanel → localModel), so no module cycle. */
+export function RunCommandLine({ command }: { command: string }) {
   return (
     <div className="flex items-center justify-between gap-2 rounded border border-border bg-surface px-2 py-1 text-2xs">
       <span className="min-w-0 flex-1 truncate font-mono text-fg" title={command}>
@@ -373,7 +411,12 @@ function RunCommandLine({ command }: { command: string }) {
  * Test + Serving line (llama.cpp / vLLM panes)
  * ------------------------------------------------------------------ */
 
-function TestAndServingLine({
+/** Exported (T12): the Agent surface's OLLAMA pane renders its surface-level
+ *  Test + Serving line through this same component (the block only renders it
+ *  for llamacpp/vllm panes) — `backend: 'ollama'` dispatches
+ *  `setup.testRemote {backendId:'ollama'}` exactly like the FIM surface's own
+ *  surface-level Test. Same no-cycle import direction as `RunCommandLine`. */
+export function TestAndServingLine({
   backend,
   endpoint,
   dispatch,
