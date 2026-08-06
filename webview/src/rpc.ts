@@ -77,6 +77,13 @@ const METHOD_TIMEOUT_OVERRIDES_MS: Partial<Record<ControlRequestMethod, number>>
   // on the ordinary 30s default (deliberately absent from this table).
   'setup.install': 0,
   'setup.pullModel': 0,
+  // beta.6 T9 (§1.3/§2.5 RPC rows: `'setup.provisionModel': 0`): the
+  // catalog-provisioning gate (T7) is the same unbounded-download shape as
+  // `setup.install`/`setup.pullModel` above — a multi-GB Devstral download
+  // or a slow llama.cpp GGUF pull must not be killed by the 30s connection
+  // default. `0` disables the timer entirely, same discipline as the two
+  // overrides above (Cancel + `pagehide -> rejectAll` bound the risk).
+  'setup.provisionModel': 0,
 };
 
 export class RpcClient {

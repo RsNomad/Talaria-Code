@@ -5,6 +5,8 @@ import {
   TIER2_TUNABLE_KEYS,
   MUTATING_METHODS,
   READ_ONLY_METHODS,
+  RECHECK_SCOPES,
+  validateRecheckScope,
   isHostSourcedModel,
   composeVllmCell,
   composeLlamacppCell,
@@ -2252,6 +2254,46 @@ describe("T6: scoped recheck (§2.5) — {scope:'llamacpp'} re-kicks WITHOUT awa
     const { controller } = makeController();
     const result = await controller.handle('setup.recheck', { scope: 42 });
     expect(result).toEqual({ ok: false, reason: RECHECK_SCOPE_REFUSAL });
+  });
+});
+
+/*
+ * beta.6 T9 (§1.3/§2.5): the tests above pin `setup.recheck`'s BEHAVIOR
+ * through `controller.handle()` round-trips (a bad scope refused, absent
+ * defaults to 'all', etc.) but never touch the canonical enum ARRAY itself
+ * — `handleRecheck`'s refusal message is a hand-written string literal, not
+ * derived from `RECHECK_SCOPES`, so a silent add/remove/rename to the array
+ * could drift from that message with every existing test still green. This
+ * lock exports `RECHECK_SCOPES` (mirroring the `MUTATING_METHODS` /
+ * `READ_ONLY_METHODS` partition-lock precedent above) and pins its exact
+ * contents directly, plus exercises the validator function itself — not
+ * just the controller's HTTP-shaped response wrapping around it.
+ */
+describe('T9 (beta.6 §1.3/§2.5): setup.recheck scope enum — protocol-level lock', () => {
+  it('RECHECK_SCOPES is EXACTLY the five documented values, in order', () => {
+    expect(RECHECK_SCOPES).toEqual(['all', 'agent', 'os', 'ollama', 'llamacpp']);
+  });
+
+  it('validateRecheckScope: absent params -> "all"', () => {
+    expect(validateRecheckScope(undefined)).toBe('all');
+  });
+
+  it('validateRecheckScope: empty params object -> "all"', () => {
+    expect(validateRecheckScope({})).toBe('all');
+  });
+
+  it('validateRecheckScope: every RECHECK_SCOPES member round-trips to itself', () => {
+    for (const scope of RECHECK_SCOPES) {
+      expect(validateRecheckScope({ scope })).toBe(scope);
+    }
+  });
+
+  it('validateRecheckScope: an unknown string scope is REFUSED (undefined), not coerced', () => {
+    expect(validateRecheckScope({ scope: 'bogus' })).toBeUndefined();
+  });
+
+  it('validateRecheckScope: a non-string scope is REFUSED (undefined), not coerced', () => {
+    expect(validateRecheckScope({ scope: 42 })).toBeUndefined();
   });
 });
 

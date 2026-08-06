@@ -2715,9 +2715,14 @@ function validateBootstrapTarget(params: unknown): 'pipx' | 'python' | undefined
 }
 
 /** T6 (beta.6 §2.5): `setup.recheck`'s scope values — validated as a STRICT
- *  enum, same discipline as {@link validateBootstrapTarget}. */
-const RECHECK_SCOPES = ['all', 'agent', 'os', 'ollama', 'llamacpp'] as const;
-type RecheckScope = (typeof RECHECK_SCOPES)[number];
+ *  enum, same discipline as {@link validateBootstrapTarget}. Exported (T9,
+ *  §1.3) so a protocol-level lock test can pin the exact canonical array —
+ *  `handleRecheck`'s refusal message is a hand-written literal, not derived
+ *  from this array, so nothing else would catch a silent add/remove/rename
+ *  here. Mirrors the {@link MUTATING_METHODS}/{@link READ_ONLY_METHODS}
+ *  export-for-a-lock-test precedent. */
+export const RECHECK_SCOPES = ['all', 'agent', 'os', 'ollama', 'llamacpp'] as const;
+export type RecheckScope = (typeof RECHECK_SCOPES)[number];
 
 /**
  * T6 (beta.6 §2.5): strict server-side validation of `setup.recheck`'s
@@ -2726,9 +2731,11 @@ type RecheckScope = (typeof RECHECK_SCOPES)[number];
  * compatible with every existing caller). A PRESENT key with anything but
  * the five literals — including a non-string — is `undefined` = refuse; it
  * is NOT coerced to the default, so a malformed request can never silently
- * run the full recheck.
+ * run the full recheck. Exported (T9, §1.3) for direct unit-level locking
+ * of the validator itself, distinct from the `controller.handle()`
+ * round-trip behavioral tests.
  */
-function validateRecheckScope(params: unknown): RecheckScope | undefined {
+export function validateRecheckScope(params: unknown): RecheckScope | undefined {
   if (params === undefined || params === null) return 'all';
   if (typeof params !== 'object') return undefined;
   if (!('scope' in params)) return 'all';

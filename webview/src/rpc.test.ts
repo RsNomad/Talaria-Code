@@ -308,6 +308,20 @@ describe('RpcClient — per-method timeout override (T-12 RPC deadline)', () => 
     expect(capturedMs()).toBeUndefined();
   });
 
+  /*
+   * beta.6 T9 (§1.3/§2.5 RPC rows: `'setup.provisionModel': 0`): the
+   * catalog-provisioning gate can drive a multi-GB Devstral download or a
+   * slow llama.cpp GGUF pull — exactly the same unbounded-download shape as
+   * `setup.install`/`setup.pullModel` above, and it must be exempted from
+   * the 30s connection default the SAME way (a `0` override, not a longer
+   * one) or a legitimately slow download reads as a false "failed" mid-pull.
+   */
+  it('RED: setup.provisionModel arms NO timer at all (long-running download exempted from the 30s default)', () => {
+    const { rpc, capturedMs } = captureTimeoutMs();
+    rpc.request('setup.provisionModel');
+    expect(capturedMs()).toBeUndefined();
+  });
+
   it('setup.testRemote is NOT exempted — it still arms the ordinary 30000ms connection default', () => {
     const { rpc, capturedMs } = captureTimeoutMs();
     rpc.request('setup.testRemote');
