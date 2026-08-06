@@ -17,6 +17,15 @@
  * "reproduced here, not imported" discipline `protocol.ts` already uses for
  * `SetupCatalogModel` mirroring the host's `CatalogModel`). Keep the two
  * copies behaviorally identical until that migration retires one of them.
+ *
+ * T11 (FIM migration) evaluated the consolidation and KEPT the reproduction
+ * — a recorded decision, not an oversight: `SetupPanel.tsx` now imports
+ * `LocalModelBlock` from here, so importing its primitives back would make
+ * `SetupPanel.tsx ⇄ localModel.tsx` a module cycle; a third shared file was
+ * judged not worth it for two small primitives. The copies remain
+ * behaviorally identical (SetupPanel's extra `tone` prop aside — unused
+ * here, identical at `tone='neutral'`), locked by both dom suites; T12-T14
+ * inherit the same standing choice unless they extract a shared module.
  */
 import { useEffect, useState } from 'react';
 import type { SetupCatalogModel, SetupData, SetupMethod } from '../protocol';

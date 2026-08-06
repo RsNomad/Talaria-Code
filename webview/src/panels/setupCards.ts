@@ -659,6 +659,17 @@ export function configuredModelOutsideCatalog(models: readonly Pick<SetupCatalog
   return !models.some((m) => m.ollamaTag !== undefined && ollamaTagsEqual(m.ollamaTag, trimmed));
 }
 
+/** §6 "Post-pull nudge (FIM ollama)" (beta.6 T11) — the FIM surface's OWN
+ *  Ollama pull-success wording, passed to the block via
+ *  `ollamaPullSuccessLabel` (the block never hardcodes a surface nudge) and
+ *  reused verbatim by the CC-8 configured-model row's legacy pull. */
+export const FIM_OLLAMA_PULL_NUDGE = '✓ Downloaded — set it as your FIM model in the Connect tab (Apply).';
+
+/** §6 "llama.cpp FIM nudge" (beta.6 T11) — rendered by the FIM llama.cpp
+ *  pane once any FIM row is present in Talaria's model folder (the "what
+ *  next" line after a verified download). */
+export const FIM_LLAMACPP_NUDGE = 'Then switch the Connect tab to llama.cpp and Apply.';
+
 /** §6 "Test button" — shared with the FIM Connect/Install tabs' own inline
  *  usage; single-sourced here for the block. */
 export function testConnectionLabel(endpoint: string): string {

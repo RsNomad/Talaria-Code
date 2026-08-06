@@ -11,7 +11,7 @@ import { describe, it, expect, vi } from 'vitest';
 import type { ReactElement } from 'react';
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupMethod } from '../protocol';
+import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
 import { NEXT_EDIT_ROWS } from './nextEditCopy';
 import { SetupPanel } from './SetupPanel';
 import { agentPhaseLabel, PIPX_INSTALL_DOCS_URL, PYTHON_VERSION_HELP_URL, TRUST_DISABLED_REASON } from './setupCards';
@@ -340,21 +340,16 @@ describe('FIM card — api-key flow (§6 card 3, D6)', () => {
 });
 
 describe('FIM card — pull progress renders a percent (§6)', () => {
-  it('shows a computed percent from setup.progress bytes', async () => {
+  it('shows a computed percent from setup.progress bytes (legacy tag-keyed pull via the configured-model row, T11)', async () => {
+    // beta.6 T11: the Install tab no longer consumes `localInstall.models` —
+    // with no catalog on the wire, `fim.model` (∉ empty catalog) renders the
+    // CC-8 configured-model row, whose pull stays TAG-keyed (`pull:<model>`,
+    // the legacy `handlePullModel` latch) — the same progress key beta.5 used.
     const data = baseData({
-      fim: {
-        ...baseData().fim,
-        options: [
-          ollamaOption({
-            localInstall: {
-              flavor: 'guided-terminal',
-              effort: 'one-script',
-              models: [{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', present: false }],
-            },
-          }),
-        ],
-        selectedId: 'ollama',
-      },
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      // Empty daemon list ⇒ the configured model is honestly 'not present',
+      // so the row shows its Pull affordance + the in-flight bar.
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
     });
     const progress = {
       'pull:qwen2.5-coder:1.5b-base': {
@@ -693,13 +688,25 @@ describe('FimInstallTab — non-Ollama gets an honest Test affordance (⑨⑩, �
     return utils;
   }
 
-  it('llama.cpp (guided-terminal): keeps [Open terminal: install …] AND adds the §6 copy line + [Test connection ({endpoint})]', async () => {
-    await openInstallTab(llamacppOption());
-    expect(screen.getByRole('button', { name: /^Open terminal: install /i })).toBeInTheDocument();
-    expect(
-      screen.getByText('llama.cpp has no install detection — start your server, then test the connection.'),
-    ).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:8012)' })).toBeInTheDocument();
+  it('llama.cpp (T11: the block\'s §4.1 states replace the old "no install detection" prose): missing ⇒ [Open terminal: {command}] + [Re-check] + [Test connection ({endpoint})]', async () => {
+    // llama.cpp HAS install detection since beta.6 (`llamacppRuntime` probe) —
+    // the beta.5 "has no install detection" line is retired for this pane; the
+    // missing-branch renders the CC-4 host-projected install command instead.
+    const data = baseData({
+      fim: { ...baseData().fim, options: [llamacppOption()], selectedId: 'llamacpp' },
+      llamacppRuntime: {
+        binary: 'missing',
+        install: { command: 'sudo pkgmgr install llama-cpp', guidance: 'Install via the detected package manager.', docsUrl: 'https://example.test/llamacpp' },
+      },
+    });
+    const utils = renderPanel(data);
+    await utils.user.click(screen.getByRole('button', { name: 'Install locally' }));
+    const fimCard = must(screen.getByText('Autocomplete (FIM)').closest('section'));
+    expect(within(fimCard).getByText('llama-server was not found on your PATH. Install llama.cpp, then re-check.')).toBeInTheDocument();
+    expect(within(fimCard).getByRole('button', { name: 'Open terminal: sudo pkgmgr install llama-cpp' })).toBeEnabled();
+    // Scoped within the card — the Agent card's own ready-state [Re-check] is a different button.
+    expect(within(fimCard).getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
+    expect(within(fimCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8012)' })).toBeInTheDocument();
   });
 
   it('clicking [Test connection] dispatches setup.testRemote with the resolved backendId + endpoint', async () => {
@@ -1291,5 +1298,270 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
     // Settle so no unresolved promise / act warning leaks into later tests.
     resolveDispatch({ ok: true });
     await screen.findByText('✓ Endpoint reachable');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T11 (§3.2): the FIM Install tab IS the shared LocalModelBlock.
+ * The card's existing 5-option picker is the block's ① (ONE picker);
+ * catalog fim-rows render per pane; the Ollama running branch gains the
+ * §0.3 Re-check; the CC-8 configured-model row keeps the legacy
+ * free-text `setup.pullModel` tier alive.
+ * ------------------------------------------------------------------ */
+
+function fimCatalogRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'qwen25-coder-1.5b',
+    role: 'fim',
+    displayName: 'Qwen2.5-Coder 1.5B (base)',
+    publisher: 'Qwen',
+    license: 'apache-2.0',
+    defaultForRole: true,
+    vramLine: 'any modern GPU (~1–2 GB)',
+    note: 'Base build (Q8) from ggml-org — the llama.cpp project’s own packaging of Qwen’s base model.',
+    progressId: 'qwen25-coder-1.5b',
+    ollamaTag: 'qwen2.5-coder:1.5b-base',
+    ollamaApproxBytes: 986_000_000,
+    llamacpp: { file: 'qwen2.5-coder-1.5b-q8_0.gguf', approxBytes: 1_646_573_056, present: false, available: true },
+    ...overrides,
+  };
+}
+
+/** rev 3: THREE fim rows (1.5b ★ / 7b / 14b), all with llama.cpp cells (no
+ *  absence cells on this surface) — plus one agent-role row to prove the
+ *  role filter. */
+function fimCatalog(): SetupCatalogModel[] {
+  return [
+    fimCatalogRow(),
+    fimCatalogRow({
+      id: 'qwen25-coder-7b',
+      displayName: 'Qwen2.5-Coder 7B (base)',
+      defaultForRole: undefined,
+      vramLine: '~8 GB GPUs',
+      ollamaTag: 'qwen2.5-coder:7b-base',
+      ollamaApproxBytes: 4_700_000_000,
+      llamacpp: { file: 'qwen2.5-coder-7b-q8_0.gguf', approxBytes: 8_100_000_000, present: false, available: true },
+    }),
+    fimCatalogRow({
+      id: 'qwen25-coder-14b',
+      displayName: 'Qwen2.5-Coder 14B (base)',
+      defaultForRole: undefined,
+      vramLine: 'Q8 wants a 24 GB card (the Ollama 14b-base tag is the Q4 build at 9.0 GB)',
+      ollamaTag: 'qwen2.5-coder:14b-base',
+      ollamaApproxBytes: 9_000_000_000,
+      llamacpp: { file: 'qwen2.5-coder-14b-q8_0.gguf', approxBytes: 15_700_000_000, present: false, available: true },
+    }),
+    fimCatalogRow({
+      id: 'devstral-24b',
+      role: 'agent',
+      displayName: 'Devstral-24B (2507)',
+      defaultForRole: true,
+      vramLine: '24 GB',
+      ollamaTag: undefined,
+      ollamaApproxBytes: 14_333_915_904,
+      ollamaCreatedName: 'devstral-small-2507:24b',
+      llamacpp: undefined,
+      note: undefined,
+    }),
+  ];
+}
+
+function fimBlockData(overrides: Partial<SetupData> = {}): SetupData {
+  return baseData({
+    fim: { ...baseData().fim, options: [ollamaOption(), llamacppOption(), vllmOption()], selectedId: 'ollama' },
+    // Empty daemon list by default so catalog rows are honestly 'not present'
+    // (each test overrides as needed).
+    ollama: { running: true, version: '0.4.1', endpoint: 'http://127.0.0.1:11434', models: [] },
+    catalog: { models: fimCatalog() },
+    llamacppRuntime: { binary: 'found', version: 'b4500' },
+    ...overrides,
+  });
+}
+
+async function openFimInstallTab(data: SetupData, pickerName?: string) {
+  const utils = renderPanel(data);
+  if (pickerName !== undefined) {
+    await utils.user.click(screen.getByRole('button', { name: pickerName }));
+  }
+  await utils.user.click(screen.getByRole('button', { name: 'Install locally' }));
+  const fimCard = must(screen.getByText('Autocomplete (FIM)').closest('section'));
+  return { ...utils, fimCard };
+}
+
+describe('T11 — the card picker IS ① (one picker, never a second one inside the Install tab)', () => {
+  it('renders exactly ONE selectable "Ollama" backend row in the FIM card, and catalog rows are NOT buttons', async () => {
+    const { fimCard } = await openFimInstallTab(fimBlockData());
+    expect(within(fimCard).getAllByRole('button', { name: 'Ollama' })).toHaveLength(1);
+    // Informational rows (no in-block picker): the display name is plain text.
+    expect(within(fimCard).getByText('Qwen2.5-Coder 1.5B (base)')).toBeInTheDocument();
+    expect(within(fimCard).queryByRole('button', { name: 'Qwen2.5-Coder 1.5B (base)' })).not.toBeInTheDocument();
+  });
+});
+
+describe('T11 — Ollama running branch has Re-check (the §0.3 regression-lock)', () => {
+  it('running branch: renders "Ollama: Ready ✓ — {version}" AND a [Re-check] button', async () => {
+    const { fimCard } = await openFimInstallTab(fimBlockData());
+    expect(within(fimCard).getByText('Ollama: Ready ✓ — 0.4.1')).toBeInTheDocument();
+    expect(within(fimCard).getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
+  });
+
+  it('[Re-check] dispatches the SCOPED setup.recheck {scope:"ollama"}', async () => {
+    const { fimCard, user, dispatch } = await openFimInstallTab(fimBlockData());
+    await user.click(within(fimCard).getByRole('button', { name: 'Re-check' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.recheck', { scope: 'ollama' });
+  });
+
+  it('not-running branch keeps install + Re-check (unchanged affordances)', async () => {
+    const data = fimBlockData({ ollama: { running: false, models: [] } });
+    const { fimCard } = await openFimInstallTab(data);
+    expect(within(fimCard).getByText('Ollama daemon not detected.')).toBeInTheDocument();
+    expect(within(fimCard).getByRole('button', { name: 'Open terminal: install Ollama' })).toBeInTheDocument();
+    expect(within(fimCard).getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
+  });
+});
+
+describe('T11 — THREE catalog fim rows render (1.5b ★ / 7b / 14b), role-filtered', () => {
+  it('renders all three fim rows with the Default chip on the 1.5b row only', async () => {
+    const { fimCard } = await openFimInstallTab(fimBlockData());
+    expect(within(fimCard).getByText('Qwen2.5-Coder 1.5B (base)')).toBeInTheDocument();
+    expect(within(fimCard).getByText('Qwen2.5-Coder 7B (base)')).toBeInTheDocument();
+    expect(within(fimCard).getByText('Qwen2.5-Coder 14B (base)')).toBeInTheDocument();
+    expect(within(fimCard).getAllByText('Default')).toHaveLength(1);
+  });
+
+  it('the agent-role catalog row does NOT render on the FIM surface', async () => {
+    const { fimCard } = await openFimInstallTab(fimBlockData());
+    expect(within(fimCard).queryByText('Devstral-24B (2507)')).not.toBeInTheDocument();
+  });
+
+  it('present→skip: a row already on the daemon shows "present ✓" and no Pull; absent rows keep Pull {tag} (~{size})', async () => {
+    const data = fimBlockData({
+      ollama: { running: true, version: '0.4.1', endpoint: 'http://127.0.0.1:11434', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] },
+    });
+    const { fimCard } = await openFimInstallTab(data);
+    expect(within(fimCard).getByText('present ✓')).toBeInTheDocument();
+    expect(within(fimCard).queryByRole('button', { name: /Pull qwen2\.5-coder:1\.5b-base/ })).not.toBeInTheDocument();
+    expect(within(fimCard).getByRole('button', { name: 'Pull qwen2.5-coder:7b-base (~4.4 GB)' })).toBeEnabled();
+    expect(within(fimCard).getByRole('button', { name: 'Pull qwen2.5-coder:14b-base (~8.4 GB)' })).toBeEnabled();
+  });
+
+  it('a catalog Pull dispatches setup.provisionModel keyed by catalog id, then flashes the §6 FIM post-pull nudge', async () => {
+    const { fimCard, user, dispatch } = await openFimInstallTab(fimBlockData());
+    await user.click(within(fimCard).getByRole('button', { name: 'Pull qwen2.5-coder:7b-base (~4.4 GB)' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
+      modelId: 'qwen25-coder-7b',
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+    expect(await within(fimCard).findByText('✓ Downloaded — set it as your FIM model in the Connect tab (Apply).')).toBeInTheDocument();
+  });
+});
+
+describe('T11 — the CC-8 configured-model row (legacy free-text tier preserved)', () => {
+  it('renders when fim.model names something OUTSIDE the catalog, with a Pull wired to the legacy setup.pullModel', async () => {
+    const data = fimBlockData({ fim: { ...fimBlockData().fim, model: 'deepseek-coder:6.7b-base' } });
+    const { fimCard, user, dispatch } = await openFimInstallTab(data);
+    expect(within(fimCard).getByText('deepseek-coder:6.7b-base')).toBeInTheDocument();
+    expect(within(fimCard).getByText('Configured')).toBeInTheDocument();
+    await user.click(within(fimCard).getByRole('button', { name: 'Pull deepseek-coder:6.7b-base' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.pullModel', {
+      model: 'deepseek-coder:6.7b-base',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+  });
+
+  it('does NOT render when fim.model IS a catalog row (:latest-tolerant)', async () => {
+    const data = fimBlockData({ fim: { ...fimBlockData().fim, model: 'qwen2.5-coder:1.5b-base:latest' } });
+    const { fimCard } = await openFimInstallTab(data);
+    expect(within(fimCard).queryByText('Configured')).not.toBeInTheDocument();
+  });
+
+  it('does NOT render on the not-running branch (§3.2: it is a running-branch affordance)', async () => {
+    const data = fimBlockData({
+      fim: { ...fimBlockData().fim, model: 'deepseek-coder:6.7b-base' },
+      ollama: { running: false, models: [] },
+    });
+    const { fimCard } = await openFimInstallTab(data);
+    expect(within(fimCard).queryByText('Configured')).not.toBeInTheDocument();
+  });
+});
+
+describe('T11 — Ollama pane surface-level Test (T10 Minor #4: the "Test the endpoint first" copy points here)', () => {
+  it('renders [Test connection ({endpoint})] and dispatches setup.testRemote {backendId:"ollama"}', async () => {
+    const { fimCard, user, dispatch } = await openFimInstallTab(fimBlockData());
+    const test = within(fimCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
+    await user.click(test);
+    expect(dispatch).toHaveBeenCalledWith('setup.testRemote', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+  });
+});
+
+describe('T11 — llama.cpp pane: three downloadable rows, base-build note, no absence cells, nudge on present', () => {
+  it('ready runtime: renders "llama.cpp: Ready ✓ — b4500" + THREE enabled Download buttons + the §6 base-build note; never the honest-absence line', async () => {
+    const { fimCard } = await openFimInstallTab(fimBlockData(), 'llama.cpp');
+    expect(within(fimCard).getByText('llama.cpp: Ready ✓ — b4500')).toBeInTheDocument();
+    const downloads = within(fimCard).getAllByRole('button', { name: /^Download / });
+    expect(downloads).toHaveLength(3);
+    for (const button of downloads) expect(button).toBeEnabled();
+    expect(
+      within(fimCard).getAllByText('Base build (Q8) from ggml-org — the llama.cpp project’s own packaging of Qwen’s base model.').length,
+    ).toBeGreaterThan(0);
+    expect(
+      within(fimCard).queryByText('No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('a Download dispatches setup.provisionModel {backend:"llamacpp"} keyed by catalog id', async () => {
+    const { fimCard, user, dispatch } = await openFimInstallTab(fimBlockData(), 'llama.cpp');
+    await user.click(within(fimCard).getByRole('button', { name: 'Download Qwen2.5-Coder 1.5B (base) (~1.5 GB)' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
+      modelId: 'qwen25-coder-1.5b',
+      backend: 'llamacpp',
+      endpoint: 'http://127.0.0.1:8012',
+    });
+  });
+
+  it('on present: start command + [Copy] + the §6 "Then switch the Connect tab to llama.cpp and Apply." nudge', async () => {
+    const models = fimCatalog();
+    models[0] = fimCatalogRow({
+      llamacpp: {
+        file: 'qwen2.5-coder-1.5b-q8_0.gguf',
+        approxBytes: 1_646_573_056,
+        present: true,
+        available: true,
+        runCommand: 'llama-server -m /store/qwen2.5-coder-1.5b-q8_0.gguf --port 8080',
+      },
+    });
+    const data = fimBlockData({ catalog: { models } });
+    const { fimCard } = await openFimInstallTab(data, 'llama.cpp');
+    expect(within(fimCard).getByText("present in Talaria's model folder ✓")).toBeInTheDocument();
+    expect(within(fimCard).getByText('llama-server -m /store/qwen2.5-coder-1.5b-q8_0.gguf --port 8080')).toBeInTheDocument();
+    expect(within(fimCard).getByRole('button', { name: /copy/i })).toBeInTheDocument();
+    expect(within(fimCard).getByText('Then switch the Connect tab to llama.cpp and Apply.')).toBeInTheDocument();
+  });
+
+  it('no row present ⇒ the nudge does not render (it explains a state that does not exist yet)', async () => {
+    const { fimCard } = await openFimInstallTab(fimBlockData(), 'llama.cpp');
+    expect(within(fimCard).queryByText('Then switch the Connect tab to llama.cpp and Apply.')).not.toBeInTheDocument();
+  });
+});
+
+describe('T11 — vLLM pane: the ⑪ copy verbatim + run-command rows + docs + Test', () => {
+  it('keeps the beta.5 ⑪ string, the Setup docs link, and adds the catalog row run commands', async () => {
+    const models = fimCatalog().map((m) =>
+      m.role === 'fim' ? { ...m, vllm: { runCommand: `vllm serve Qwen/${m.id}` } } : m,
+    );
+    const data = fimBlockData({ catalog: { models } });
+    const { fimCard } = await openFimInstallTab(data, 'vLLM');
+    expect(
+      within(fimCard).getByText("vLLM's install depends on your GPU/CUDA setup — follow the official guide, then test the connection."),
+    ).toBeInTheDocument();
+    expect(within(fimCard).getByRole('link', { name: 'Setup docs' })).toHaveAttribute('href', 'https://docs.vllm.ai/');
+    expect(within(fimCard).getByText('vllm serve Qwen/qwen25-coder-1.5b')).toBeInTheDocument();
+    expect(within(fimCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8000)' })).toBeInTheDocument();
+    // vLLM never pulls/downloads anything.
+    expect(within(fimCard).queryByRole('button', { name: /Pull|Download/ })).not.toBeInTheDocument();
   });
 });

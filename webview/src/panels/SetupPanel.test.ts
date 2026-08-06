@@ -29,6 +29,8 @@ import {
   fimDoneLine,
   fimHasLocalInstall,
   fimInstallTestEndpoint,
+  FIM_LLAMACPP_NUDGE,
+  FIM_OLLAMA_PULL_NUDGE,
   foldSetupProgress,
   formatBytes,
   initDedicatedFormFieldState,
@@ -1017,5 +1019,44 @@ describe('§6 copy — verbatim + single-sourced (SCOPED source-scan: hand-writt
     for (const s of OWNED_VERBATIM_STRINGS) {
       expect(localModelSrc).not.toContain(s);
     }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T11 (§3.2/§6): FIM-surface nudge constants + the
+ * `localInstall.models` deprecation lock.
+ * ------------------------------------------------------------------ */
+
+describe('§6 FIM-surface nudges (T11) — verbatim + single-sourced', () => {
+  it('FIM_OLLAMA_PULL_NUDGE — §6 "Post-pull nudge (FIM ollama)"', () => {
+    expect(FIM_OLLAMA_PULL_NUDGE).toBe('✓ Downloaded — set it as your FIM model in the Connect tab (Apply).');
+  });
+
+  it('FIM_LLAMACPP_NUDGE — §6 "llama.cpp FIM nudge"', () => {
+    expect(FIM_LLAMACPP_NUDGE).toBe('Then switch the Connect tab to llama.cpp and Apply.');
+  });
+
+  it('SetupPanel.tsx never RESTATES the nudges inline — it renders the setupCards.ts constants', () => {
+    const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+    expect(setupPanelSrc).not.toContain('set it as your FIM model in the Connect tab');
+    expect(setupPanelSrc).not.toContain('Then switch the Connect tab to llama.cpp');
+  });
+});
+
+describe('T11 — the registry `localInstall.models` wire projection: deprecated-in-comment, NOT removed', () => {
+  const registrySrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'host', 'setup', 'registry.ts'), 'utf-8');
+  const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+
+  it('registry.ts still carries the models projection (wire compat — never removed by T11)', () => {
+    expect(registrySrc).toContain("{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', settingKey: 'talaria.autocomplete.model' }");
+    expect(registrySrc).toContain("{ role: 'embedding', model: 'qwen3-embedding:0.6b', settingKey: 'talaria.rag.embedModel' }");
+  });
+
+  it('registry.ts marks the projection @deprecated (beta.6 T11 — the unified UI reads catalog.models)', () => {
+    expect(registrySrc).toContain('@deprecated beta.6 T11');
+  });
+
+  it('SetupPanel.tsx no longer consumes localInstall.models (the block reads catalog.models instead)', () => {
+    expect(setupPanelSrc).not.toMatch(/localInstall\??\.models/);
   });
 });

@@ -630,6 +630,9 @@ export interface SetupBackendOption {
      *  docs link + endpoint Test only (e.g. vLLM, §5.2 rev 3 ⑪). */
     flavor: 'pipx' | 'guided-terminal' | 'docs-only';
     effort: 'one-script' | 'manual-guided';
+    /** @deprecated beta.6 T11 — the unified FIM/RAG surfaces read
+     *  `SetupData.catalog.models` instead; still projected for wire compat
+     *  (see `registry.ts` `LocalInstallMode.models`), do NOT remove. */
     models?: { role: 'fim' | 'embedding'; model: string; present: boolean }[];
   };
   /** Present iff this FIM backend also supports the NEXT card's "generic" (reuse) source. */

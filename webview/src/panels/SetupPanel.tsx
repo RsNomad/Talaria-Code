@@ -26,6 +26,7 @@ import type {
   NextEditToggleSource,
   NextEditToggleState,
   SetupBackendOption,
+  SetupCatalogModel,
   SetupData,
   SetupMethod,
 } from '../protocol';
@@ -35,6 +36,7 @@ import { Pill } from '../components/Pill';
 import { Toggle } from '../components/Toggle';
 import { DECLINED, errorMessage } from '../state/panels';
 import type { RemoteData } from '../state/remoteData';
+import { LocalModelBlock } from './localModel';
 import { type NextEditRowCopy, NEXT_EDIT_ROWS } from './nextEditCopy';
 import { PanelShell, RemotePanel, SectionLabel } from './PanelShell';
 import { commitFieldEdit, initNextEditRowState, reconcileNextEditRowState } from './settingsField';
@@ -43,7 +45,14 @@ import {
   agentPhaseLabel,
   agentPrimaryAction,
   buildCopyLogText,
+  CANCEL_LABEL,
+  cancelPullParams,
+  catalogPresence,
+  catalogPresenceText,
+  configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
+  FIM_LLAMACPP_NUDGE,
+  FIM_OLLAMA_PULL_NUDGE,
   fimDoneLine,
   fimHasLocalInstall,
   fimInstallTestEndpoint,
@@ -67,6 +76,7 @@ import {
   ragDoneLine,
   reconcileDedicatedFormFields,
   splitGuidedLine,
+  testConnectionLabel,
   TRUST_DISABLED_REASON,
   type NextPresence,
   type SetupProgressMap,
@@ -746,6 +756,17 @@ function FimConnectTab({
   );
 }
 
+/**
+ * beta.6 T11 (§3.2): the Install tab IS the shared `LocalModelBlock` — one
+ * pane per local-capable backend. The card's OWN 5-option picker above is the
+ * block's ① (ONE picker — this tab never renders a second one); catalog rows
+ * are role-filtered to `'fim'` from the wire's `catalog.models`. The beta.5
+ * models list under `localInstall` is deliberately NOT consumed anymore
+ * (deprecated-in-comment at `registry.ts`, kept on the wire for compat) —
+ * only the CC-8 configured-model row still speaks the legacy free-text
+ * `setup.pullModel` tier. Pulls never write settings: "done" stays presence +
+ * Connect-tab state (§4.2), so switching panes changes nothing but the view.
+ */
 function FimInstallTab({
   option,
   setup,
@@ -759,133 +780,261 @@ function FimInstallTab({
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
 }) {
-  if (option.id === 'ollama') {
-    return <OllamaInstallPanel option={option} setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />;
-  }
-
-  // T10 (§2.6 ⑨⑩ / R-1b): llama.cpp/vLLM have no daemon-presence probe (no
-  // `/api/tags` equivalent `status()` can check), so — unlike Ollama's
-  // Re-check above — the honest affordance here is an ENDPOINT TEST, not a
-  // presence re-check. R-1b: vLLM's `docs-only` flavor has no verified
-  // install source at all (§5.2) — its terminal button is SUPPRESSED and
-  // the effort prose is replaced with vLLM-specific guidance; every other
-  // (`guided-terminal`) backend keeps its terminal button + effort prose
-  // AND gains the same §6 "has no install detection" line + Test button.
-  const isDocsOnly = option.localInstall?.flavor === 'docs-only';
+  // R-2 (§2.6): a browsed-but-not-configured backend tests its OWN default,
+  // never the active backend's saved endpoint under this backend's label.
   const endpoint = fimInstallTestEndpoint(setup.fim.selectedId, option);
+  const fimModels = (setup.catalog?.models ?? []).filter((m) => m.role === 'fim');
+
+  if (option.id === 'ollama') {
+    return (
+      <OllamaInstallPanel
+        setup={setup}
+        models={fimModels}
+        endpoint={endpoint}
+        progress={progress}
+        dispatch={dispatch}
+        disabledReason={disabledReason}
+      />
+    );
+  }
+  if (option.id === 'llamacpp') {
+    return (
+      <FimLlamacppPane
+        setup={setup}
+        models={fimModels}
+        endpoint={endpoint}
+        progress={progress}
+        dispatch={dispatch}
+        disabledReason={disabledReason}
+      />
+    );
+  }
+  // vLLM — the only remaining local-capable entry (docs-only flavor, R-1b).
+  return <FimVllmPane option={option} setup={setup} models={fimModels} endpoint={endpoint} progress={progress} dispatch={dispatch} />;
+}
+
+/**
+ * FIM × Ollama pane (§3.2). The block owns BOTH daemon branches: not-running
+ * keeps the beta.5 affordances (install terminal + Re-check, rows visible
+ * with Pull disabled-with-reason), and the RUNNING branch now has Re-check
+ * too — the §0.3 fix (beta.5's running branch was rows-only, leaving no way
+ * to re-probe a daemon stopped after the panel loaded). Below the block sits
+ * the surface-level [Test connection] the rows' "not verified here — Test
+ * the endpoint first." copy points at (T10 Minor #4 — the Ollama pane has no
+ * in-block Test).
+ */
+function OllamaInstallPanel({
+  setup,
+  models,
+  endpoint,
+  progress,
+  dispatch,
+  disabledReason,
+}: {
+  setup: SetupData;
+  models: readonly SetupCatalogModel[];
+  endpoint: string;
+  progress: SetupProgressMap;
+  dispatch: SetupPanelProps['dispatch'];
+  disabledReason?: string;
+}) {
+  // CC-8 (§3.2): a running-branch affordance — the legacy tier needs a live
+  // daemon to pull onto; the not-running branch's job is installing Ollama.
+  const showConfiguredRow = setup.ollama.running && configuredModelOutsideCatalog(models, setup.fim.model);
 
   return (
-    <div className="flex flex-col gap-2 text-2xs text-muted">
-      {isDocsOnly ? (
-        <p>vLLM&apos;s install depends on your GPU/CUDA setup — follow the official guide, then test the connection.</p>
-      ) : (
-        <>
-          <p>
-            {option.localInstall?.effort === 'manual-guided'
-              ? 'Manual install — needs your own build/hardware decisions.'
-              : 'Clean one-script install.'}
-          </p>
-          <ActionButton
-            label={`Open terminal: install ${option.displayName}`}
-            onRun={() => dispatch('setup.openInstallTerminal', { backendId: option.id })}
-            disabledReason={disabledReason}
-          />
-        </>
+    <div className="flex flex-col gap-2">
+      {showConfiguredRow && (
+        <ConfiguredFimModelRow
+          model={setup.fim.model}
+          ollama={setup.ollama}
+          endpoint={endpoint}
+          progress={progress}
+          dispatch={dispatch}
+          disabledReason={disabledReason}
+        />
       )}
+      <LocalModelBlock
+        backend="ollama"
+        models={models}
+        ollama={setup.ollama}
+        llamacppRuntime={setup.llamacppRuntime}
+        endpoint={endpoint}
+        progress={progress}
+        dispatch={dispatch}
+        disabledReason={disabledReason}
+        ollamaPullSuccessLabel={FIM_OLLAMA_PULL_NUDGE}
+      />
+      <div>
+        <ActionButton
+          label={testConnectionLabel(endpoint)}
+          icon="plug"
+          onRun={() => dispatch('setup.testRemote', { backendId: 'ollama', endpoint })}
+          successLabel="✓ Endpoint reachable"
+        />
+      </div>
+    </div>
+  );
+}
 
+/**
+ * The CC-8 "configured model" row (§3.2) — the legacy free-text tier's one
+ * surviving in-panel affordance, rendered ABOVE the catalog rows whenever the
+ * saved `fim.model` names something outside the catalog. Wired to the
+ * UNCHANGED `setup.pullModel` method; its progress/cancel stay TAG-keyed
+ * (`pull:<model>` — the host's legacy `handlePullModel` latch), unlike the
+ * catalog rows' `pull:<catalogId>`.
+ */
+function ConfiguredFimModelRow({
+  model,
+  ollama,
+  endpoint,
+  progress,
+  dispatch,
+  disabledReason,
+}: {
+  model: string;
+  ollama: SetupData['ollama'];
+  endpoint: string;
+  progress: SetupProgressMap;
+  dispatch: SetupPanelProps['dispatch'];
+  disabledReason?: string;
+}) {
+  // The same endpoint-scoped client-side derivation catalog rows use (C-6) —
+  // the free-text model is just a bare library tag, so `ollamaTag` fits.
+  const presence = catalogPresence(ollama, endpoint, { ollamaTag: model });
+  const present = presence === 'present';
+  const live = progress[progressKey('pull', model)];
+  const percent = pullPercent(live?.totalBytes, live?.completedBytes);
+  const inFlight = live !== undefined && !present;
+
+  return (
+    <div className="flex flex-col gap-1 rounded border border-border bg-overlay px-2 py-1.5">
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{model}</span>
+        <Pill tone="neutral">Configured</Pill>
+      </div>
+      <StatusLine
+        icon={present ? 'pass-filled' : 'circle-outline'}
+        text={catalogPresenceText(presence)}
+        tone={present ? 'add' : 'neutral'}
+      />
+      {!present && (
+        <div>
+          <ActionButton
+            label={`Pull ${model}`}
+            icon="cloud-download"
+            onRun={() => dispatch('setup.pullModel', { model, endpoint })}
+            disabledReason={disabledReason}
+            successLabel={FIM_OLLAMA_PULL_NUDGE}
+          />
+        </div>
+      )}
+      {inFlight && (
+        <div className="flex flex-col gap-1">
+          {percent !== undefined && (
+            <div className="flex items-center gap-2" aria-live="polite">
+              <div
+                role="progressbar"
+                aria-valuenow={percent}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-label={`Pulling ${model}`}
+                className="h-1.5 flex-1 overflow-hidden rounded-full bg-border"
+              >
+                <div className="h-full bg-accent" style={{ width: `${percent}%` }} />
+              </div>
+              <span className="font-mono text-2xs text-faint">{percent}%</span>
+            </div>
+          )}
+          <div>
+            <ActionButton label={CANCEL_LABEL} icon="close" onRun={() => dispatch('setup.cancel', cancelPullParams(model))} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * FIM × llama.cpp pane (§3.2): the block renders the `llamacppRuntime` §4.1
+ * status (incl. the CC-4 install projection), the three FIM rows' verified
+ * ggml-org base-Q8 downloads (rev 3 — no absence cells on this surface; the
+ * base-build note rides each row's wire `note`), and Test. The §6 nudge
+ * renders once any row is actually present — it explains the next step
+ * (Connect-tab Apply), which doesn't exist before a download lands.
+ */
+function FimLlamacppPane({
+  setup,
+  models,
+  endpoint,
+  progress,
+  dispatch,
+  disabledReason,
+}: {
+  setup: SetupData;
+  models: readonly SetupCatalogModel[];
+  endpoint: string;
+  progress: SetupProgressMap;
+  dispatch: SetupPanelProps['dispatch'];
+  disabledReason?: string;
+}) {
+  const anyPresent = models.some((m) => m.llamacpp?.present === true);
+  return (
+    <div className="flex flex-col gap-2">
+      <LocalModelBlock
+        backend="llamacpp"
+        models={models}
+        ollama={setup.ollama}
+        llamacppRuntime={setup.llamacppRuntime}
+        endpoint={endpoint}
+        progress={progress}
+        dispatch={dispatch}
+        disabledReason={disabledReason}
+      />
+      {anyPresent && <p className="text-2xs text-muted">{FIM_LLAMACPP_NUDGE}</p>}
+    </div>
+  );
+}
+
+/**
+ * FIM × vLLM pane (§3.2): the beta.5 ⑪ copy KEPT VERBATIM (locked string —
+ * do not edit) + the docs link + the block's row run-commands and Test.
+ * vLLM serves models from its own command line, so there is never a
+ * Pull/Download here (§4.1) — the run command IS the row.
+ */
+function FimVllmPane({
+  option,
+  setup,
+  models,
+  endpoint,
+  progress,
+  dispatch,
+}: {
+  option: SetupBackendOption;
+  setup: SetupData;
+  models: readonly SetupCatalogModel[];
+  endpoint: string;
+  progress: SetupProgressMap;
+  dispatch: SetupPanelProps['dispatch'];
+}) {
+  return (
+    <div className="flex flex-col gap-2 text-2xs text-muted">
+      <p>vLLM&apos;s install depends on your GPU/CUDA setup — follow the official guide, then test the connection.</p>
       {option.docsUrl && (
         <a href={option.docsUrl} className="text-accent underline" target="_blank" rel="noreferrer">
           Setup docs
         </a>
       )}
-
-      {!isDocsOnly && (
-        <p>{`${option.displayName} has no install detection — start your server, then test the connection.`}</p>
-      )}
-      <div>
-        <ActionButton
-          label={`Test connection (${endpoint})`}
-          onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })}
-          successLabel="✓ Endpoint reachable"
-        />
-      </div>
-
-      <p>Once it&apos;s running, switch to the Connect tab and Test.</p>
-    </div>
-  );
-}
-
-function OllamaInstallPanel({
-  option,
-  setup,
-  progress,
-  dispatch,
-  disabledReason,
-}: {
-  option: SetupBackendOption;
-  setup: SetupData;
-  progress: SetupProgressMap;
-  dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
-}) {
-  if (!setup.ollama.running) {
-    return (
-      <div className="flex flex-col gap-2 text-2xs text-muted">
-        <p>Ollama daemon not detected.</p>
-        <div className="flex gap-2">
-          <ActionButton
-            label="Open terminal: install Ollama"
-            onRun={() => dispatch('setup.openInstallTerminal', { backendId: 'ollama' })}
-            disabledReason={disabledReason}
-          />
-          <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
-        </div>
-      </div>
-    );
-  }
-
-  const endpoint = option.remote?.endpointValue || option.remote?.endpointDefault || '';
-  const models = option.localInstall?.models ?? [];
-
-  return (
-    <div className="flex flex-col gap-2">
-      {models.map((m) => {
-        const live = progress[progressKey('pull', m.model)];
-        const percent = pullPercent(live?.totalBytes, live?.completedBytes);
-        return (
-          <div key={m.model} className="flex flex-col gap-1 rounded border border-border bg-overlay px-2 py-1.5">
-            <div className="flex items-center justify-between gap-2 text-2xs">
-              <span className="font-mono text-fg">
-                {m.model} <span className="text-faint">({m.role})</span>
-              </span>
-              {m.present ? (
-                <span className="text-add">Present</span>
-              ) : (
-                <ActionButton
-                  label={`Pull ${m.model}`}
-                  onRun={() => dispatch('setup.pullModel', { model: m.model, endpoint })}
-                  disabledReason={disabledReason}
-                />
-              )}
-            </div>
-            {percent !== undefined && (
-              <div className="flex items-center gap-2" aria-live="polite">
-                <div
-                  role="progressbar"
-                  aria-valuenow={percent}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-label={`Pulling ${m.model}`}
-                  className="h-1.5 flex-1 overflow-hidden rounded-full bg-border"
-                >
-                  <div className="h-full bg-accent" style={{ width: `${percent}%` }} />
-                </div>
-                <span className="font-mono text-2xs text-faint">{percent}%</span>
-              </div>
-            )}
-          </div>
-        );
-      })}
+      <LocalModelBlock
+        backend="vllm"
+        models={models}
+        ollama={setup.ollama}
+        llamacppRuntime={setup.llamacppRuntime}
+        endpoint={endpoint}
+        progress={progress}
+        dispatch={dispatch}
+      />
     </div>
   );
 }
