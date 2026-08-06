@@ -246,6 +246,7 @@ describe('FM-14: mutating methods refused when untrusted', () => {
     { method: 'setup.applyFim', params: { backendId: 'ollama' } },
     { method: 'setup.setApiKey', params: {} },
     { method: 'setup.pullModel', params: { model: 'qwen2.5-coder:1.5b-base' } },
+    { method: 'setup.saveAgentModel', params: { modelId: 'devstral-24b', backend: 'ollama', endpoint: 'http://127.0.0.1:11434' } },
     { method: 'setup.openProviderWizard', params: {} },
     { method: 'setup.openInstallTerminal', params: { backendId: 'ollama' } },
     { method: 'setup.openBootstrapTerminal', params: {} },
@@ -663,6 +664,32 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     expect(host.settings.get('talaria.nextEdit.backend')).toBe('openai-compat');
     expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:8000');
     expect(host.settings.get('talaria.nextEdit.model')).toBe('qwen2.5-coder:1.5b-base');
+    expect(host.settings.has('talaria.nextEdit.dedicatedBackendId')).toBe(false); // never sent -> never written
+  });
+
+  // beta.6 T8 (CC-10): additive dedicatedBackendId plumbing.
+  it('a valid dedicatedBackendId is written alongside the three keys', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'sweep-next-edit-v2-7b:q4_k_m',
+      dedicatedBackendId: 'llamacpp',
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.get('talaria.nextEdit.dedicatedBackendId')).toBe('llamacpp');
+  });
+
+  it('an invalid dedicatedBackendId is refused before any modal/write', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'x',
+      dedicatedBackendId: 'bogus',
+    });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
   });
 });
 
@@ -676,6 +703,22 @@ describe('setup.setRag: Tier-1 writes', () => {
     expect(host.settings.get('talaria.rag.enabled')).toBe(false);
     expect(host.settings.get('talaria.rag.embedModel')).toBe('qwen3-embedding:0.6b');
     expect(host.settings.has('talaria.rag.indexDir')).toBe(false);
+    expect(host.settings.has('talaria.rag.embedBackend')).toBe(false); // never sent -> never written
+  });
+
+  // beta.6 T8 (CC-10): additive embedBackend plumbing.
+  it('a valid embedBackend is written', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedBackend: 'llamacpp' });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.get('talaria.rag.embedBackend')).toBe('llamacpp');
+  });
+
+  it('an invalid embedBackend is refused with no writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedBackend: 'bogus' });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
   });
 });
 
@@ -1068,6 +1111,7 @@ describe('MUTATING_METHODS / READ_ONLY_METHODS partition the full SetupMethod un
     'setup.testRemote': true,
     'setup.pullModel': true,
     'setup.provisionModel': true,
+    'setup.saveAgentModel': true,
     'setup.cancel': true,
     'setup.openProviderWizard': true,
     'setup.openInstallTerminal': true,
@@ -1118,6 +1162,50 @@ describe('computeProviderCard null-guard (FIX 4): a malformed (null) advertised-
 });
 
 // --- status() assembly --------------------------------------------------------
+
+// --- beta.6 T8 (CC-10): additive restoration settings on the wire -----------
+
+describe('status(): nextEdit.dedicatedBackendId / rag.embedBackend restoration (beta.6 T8)', () => {
+  it('rag.embedBackend defaults to "ollama" and is ALWAYS populated when never set', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.rag.embedBackend).toBe('ollama');
+  });
+
+  it('rag.embedBackend reflects a saved value', async () => {
+    const { controller } = makeController({ settings: settingsMap({ 'talaria.rag.embedBackend': 'openai-compat' }) });
+    const data = await controller.status();
+    expect(data.rag.embedBackend).toBe('openai-compat');
+  });
+
+  it('a corrupted rag.embedBackend degrades to the "ollama" default, never propagates garbage', async () => {
+    const { controller } = makeController({ settings: settingsMap({ 'talaria.rag.embedBackend': 'not-a-backend' }) });
+    const data = await controller.status();
+    expect(data.rag.embedBackend).toBe('ollama');
+  });
+
+  it('nextEdit.dedicatedBackendId is ABSENT from the wire when never set', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.nextEdit.dedicatedBackendId).toBeUndefined();
+  });
+
+  it('nextEdit.dedicatedBackendId reflects a saved value', async () => {
+    const { controller } = makeController({
+      settings: settingsMap({ 'talaria.nextEdit.dedicatedBackendId': 'vllm' }),
+    });
+    const data = await controller.status();
+    expect(data.nextEdit.dedicatedBackendId).toBe('vllm');
+  });
+
+  it('a corrupted nextEdit.dedicatedBackendId is OMITTED, never propagates garbage', async () => {
+    const { controller } = makeController({
+      settings: settingsMap({ 'talaria.nextEdit.dedicatedBackendId': 'bogus-pane' }),
+    });
+    const data = await controller.status();
+    expect(data.nextEdit.dedicatedBackendId).toBeUndefined();
+  });
+});
 
 describe('status(): assembles SetupData from registry + settings + secrets + ollama probe', () => {
   it('defaults: agent missing, fim ollama, rag defaults, ollama not running', async () => {

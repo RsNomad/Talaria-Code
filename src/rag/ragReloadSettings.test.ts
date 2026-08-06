@@ -70,7 +70,7 @@ describe('RAG_SETTING_RELOAD is exhaustive over package.json talaria.rag.* prope
     }
   });
 
-  it('all 8 known rag settings are classified "reload" -- none of them is re-read live (extension.ts:606-688 reads each exactly once at activation, captured into createIndexer/buildRagMcpServer opts; indexer.ts:517 confirms debounceMs is `opts.debounceMs ?? 500`, not a live re-read)', () => {
+  it('all 8 pre-existing rag settings are classified "reload" -- none of them is re-read live (extension.ts:606-688 reads each exactly once at activation, captured into createIndexer/buildRagMcpServer opts; indexer.ts:517 confirms debounceMs is `opts.debounceMs ?? 500`, not a live re-read)', () => {
     const expectedReloadKeys = [
       'enabled',
       'embedEndpoint',
@@ -81,10 +81,18 @@ describe('RAG_SETTING_RELOAD is exhaustive over package.json talaria.rag.* prope
       'debounceMs',
       'excludeGlobs',
     ].sort();
+    const reloadKeys = Object.entries(RAG_SETTING_RELOAD)
+      .filter(([, v]) => v === 'reload')
+      .map(([k]) => k)
+      .sort();
 
-    expect(Object.keys(RAG_SETTING_RELOAD).sort()).toEqual(expectedReloadKeys);
+    expect(reloadKeys).toEqual(expectedReloadKeys);
     for (const key of expectedReloadKeys) {
       expect(RAG_SETTING_RELOAD[key], `key '${key}' expected 'reload'`).toBe('reload');
     }
+  });
+
+  it('embedBackend (beta.6 T8, restoration-only — never captured into indexer/MCP opts) is classified "live"', () => {
+    expect(RAG_SETTING_RELOAD['embedBackend']).toBe('live');
   });
 });

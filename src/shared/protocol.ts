@@ -1831,6 +1831,12 @@ export type SetupMethod =
   // `{modelId, backend, endpoint?}`; the host re-resolves EVERYTHING from
   // `MODEL_CATALOG` (unknown id ⇒ refuse; 'vllm' ⇒ refused, never ignored).
   | 'setup.provisionModel'
+  // beta.6 T8 (§1.3/§2.5): saves (or, `{clear:true}`, unsets) the "Configure
+  // Local Agent Model" block's selection — `{modelId, backend, endpoint}`
+  // (`modelId` must be a role='agent' catalog row) writes the 3
+  // `talaria.agent.localModel.*` settings Global; `status()` recomposes
+  // `agentLocalModel.saved`/`providerGuidance` from them on every read.
+  | 'setup.saveAgentModel'
   | 'setup.cancel'
   | 'setup.openProviderWizard'
   | 'setup.openInstallTerminal'

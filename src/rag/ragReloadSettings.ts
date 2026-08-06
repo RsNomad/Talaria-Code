@@ -14,10 +14,17 @@
  * hardcode a key list of its own. Key = the property suffix after
  * `'talaria.rag.'` (e.g. `'enabled'`, `'embedEndpoint'`); value =
  * `'reload'` (requires a manual window reload to take effect) or `'live'`
- * (re-read on every use — currently none). `ragReloadSettings.test.ts` pins
- * this object's key set against `package.json`'s own
- * `contributes.configuration.properties`, so adding a new `talaria.rag.*`
- * setting without classifying it here fails that test.
+ * (re-read on every use). `ragReloadSettings.test.ts` pins this object's key
+ * set against `package.json`'s own `contributes.configuration.properties`,
+ * so adding a new `talaria.rag.*` setting without classifying it here fails
+ * that test.
+ *
+ * beta.6 T8: `embedBackend` is `'live'` — UNLIKE the 8 keys above, it is
+ * never captured into `activateCodebaseRag`'s indexer/MCP-server opts at
+ * all (it is restoration-only metadata for the Setup panel's RAG block,
+ * consumed solely by `SetupController.status()`, which re-reads it fresh
+ * on every call — there is no captured/stale-opts value for it to go stale
+ * against, so no reload is ever needed for a change to "take effect").
  */
 export const RAG_SETTING_RELOAD: Record<string, 'reload' | 'live'> = {
   enabled: 'reload',
@@ -28,4 +35,5 @@ export const RAG_SETTING_RELOAD: Record<string, 'reload' | 'live'> = {
   indexDir: 'reload',
   debounceMs: 'reload',
   excludeGlobs: 'reload',
+  embedBackend: 'live',
 };

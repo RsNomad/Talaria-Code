@@ -441,6 +441,44 @@ const PROVISION_UNKNOWN_VERIFY_REFUSAL = 'unknown verify mode — refusing to do
  *  runLibraryPull} before the pull dep is ever invoked. */
 const LIBRARY_TAG_DASH_REFUSAL = "model tag must not begin with '-'";
 
+// --- T8 (beta.6 §2.5/§6): setup.saveAgentModel — copy + constants, verbatim --
+
+/** §2.5 role-gate: a fim/embedding/next catalog id is refused outright — this
+ *  method only ever records the AGENT block's selection. */
+const SAVE_AGENT_ROLE_REFUSAL = 'modelId must be an agent-role catalog model.';
+/** Strict-enum refusal — UNLIKE {@link PROVISION_BACKEND_REFUSAL}, 'vllm' IS
+ *  allowed here: this method only RECORDS which backend serves the model, it
+ *  never downloads (that stays `setup.provisionModel`'s job). */
+const SAVE_AGENT_BACKEND_REFUSAL = "backend must be 'ollama', 'llamacpp', or 'vllm'.";
+/** Modal copy for `{clear:true}` — same Tier-1-modal-gated-unset discipline
+ *  as {@link SetupController.handleSetApiKey}'s `clear` branch (the
+ *  established precedent this method's Clear path mirrors exactly). Not §6-
+ *  pinned (the doc pins only the SAVE modal's wording) — chosen to match
+ *  that precedent's phrasing + confirm label ('Clear') verbatim. */
+const CLEAR_AGENT_MODEL_MODAL = 'Clear the saved local agent model?';
+/** §1.3/§2.5 (CC-6): host-owned agent endpoint defaults — the block's
+ *  endpoint field initializes from these (saved wins). `llamacpp` matches
+ *  {@link LLAMACPP_RUN_FLAGS}'s agent port (8013); `vllm` matches vLLM's own
+ *  default port. `ollama` reuses {@link DEFAULT_OLLAMA_ENDPOINT} — ONE
+ *  source for that value, never a second literal. */
+const AGENT_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; vllm: string }> = {
+  ollama: DEFAULT_OLLAMA_ENDPOINT,
+  llamacpp: 'http://127.0.0.1:8013',
+  vllm: 'http://127.0.0.1:8000',
+};
+/** T8 (CC-10): `setup.setNextEdit`'s additive `dedicatedBackendId` enum — the
+ *  4 unified-block backend panes. Shared by the write-side validation and the
+ *  `status()` read-side coercion (never trust settings.json without
+ *  re-checking — same posture as {@link coerceNextEditTransport}). */
+const NEXT_DEDICATED_BACKEND_IDS = ['ollama', 'llamacpp', 'vllm', 'openai-compat'] as const;
+
+/** `undefined` for anything outside the 4-value enum — a malformed/edited
+ *  settings.json value degrades to "no restoration hint" (the panel's
+ *  existing transport-heuristic fallback), never a fabricated pane. */
+function coerceDedicatedBackendId(raw: string | undefined): string | undefined {
+  return raw !== undefined && (NEXT_DEDICATED_BACKEND_IDS as readonly string[]).includes(raw) ? raw : undefined;
+}
+
 /**
  * T13 (beta.5 §4.4 "classify", rev 6 — the owner personally corrected the
  * earlier dot-counting bug): HOST-SOURCED iff the model contains a `/` AND
@@ -490,8 +528,12 @@ export const MUTATING_METHODS = new Set<SetupMethod>([
   'setup.pullModel',
   // beta.6 T7 (§2.5 step 0): the catalog provisioning gate is consequence-
   // bearing (network download + disk/daemon writes) — trust-gated like every
-  // other mutation; membership finalized with T9's `setup.saveAgentModel`.
+  // other mutation.
   'setup.provisionModel',
+  // beta.6 T8 (§2.5): writes (or unsets) the 3 `talaria.agent.localModel.*`
+  // settings — consequence-bearing like every other Tier-1 settings write;
+  // follows `setup.provisionModel`'s exact registration pattern.
+  'setup.saveAgentModel',
   'setup.openProviderWizard',
   'setup.openInstallTerminal',
   'setup.openBootstrapTerminal',
@@ -698,6 +740,16 @@ export class SetupController {
     const nextModel = (this.host.getSetting<string>('talaria.nextEdit.model') ?? '').trim();
     const genericSupported = fimDescriptor.nextEditTransport !== undefined;
     const dedicatedConfigured = nextEndpoint !== '' && nextModel !== '';
+    // T8 (beta.6 CC-10): additive restoration hint — which unified-block pane
+    // configured the dedicated NEXT connection. `undefined` (never set, or a
+    // malformed/edited settings.json value) ⇒ omitted from the wire, so the
+    // panel falls back to its existing transport heuristic.
+    const nextDedicatedBackendIdRaw = (
+      this.host.getSetting<string>('talaria.nextEdit.dedicatedBackendId') ?? ''
+    ).trim();
+    const nextDedicatedBackendId = coerceDedicatedBackendId(
+      nextDedicatedBackendIdRaw === '' ? undefined : nextDedicatedBackendIdRaw,
+    );
     // T13 (§4.2): capability + raw facts for the dedicated NEXT card —
     // computed purely from the registry pins (no await; the CR-002
     // synchronous tail below stays intact). `downloadReady` is driven by the
@@ -731,6 +783,14 @@ export class SetupController {
 
     const ragEnabled = this.host.getSetting<boolean>('talaria.rag.enabled') ?? true;
     const ragEmbedEndpoint = (this.host.getSetting<string>('talaria.rag.embedEndpoint') ?? '').trim() || DEFAULT_OLLAMA_ENDPOINT;
+    // T8 (beta.6 CC-10): additive restoration hint — which backend the RAG
+    // embedder block is configured against. UNLIKE `dedicatedBackendId`, this
+    // has one clean single default ('ollama') and is ALWAYS populated on the
+    // wire (never omitted) — a malformed/edited settings.json value degrades
+    // to that default, same fail-closed coercion as `coerceNextEditTransport`.
+    const ragEmbedBackendRaw = this.host.getSetting<string>('talaria.rag.embedBackend');
+    const ragEmbedBackend: 'ollama' | 'llamacpp' | 'openai-compat' =
+      ragEmbedBackendRaw === 'llamacpp' || ragEmbedBackendRaw === 'openai-compat' ? ragEmbedBackendRaw : 'ollama';
     const ragEmbedModel = (this.host.getSetting<string>('talaria.rag.embedModel') ?? '').trim() || DEFAULT_RAG_EMBED_MODEL;
     const ragTuning = {
       dims: this.host.getSetting<number>('talaria.rag.dims') ?? 0,
@@ -774,6 +834,7 @@ export class SetupController {
         endpoint: nextEndpoint,
         model: nextModel,
         dedicatedConfigured,
+        ...(nextDedicatedBackendId !== undefined ? { dedicatedBackendId: nextDedicatedBackendId } : {}),
         genericSupported,
         ...(nextSource === 'generic' && !genericSupported
           ? {
@@ -785,6 +846,7 @@ export class SetupController {
       rag: {
         enabled: ragEnabled,
         embedEndpoint: ragEmbedEndpoint,
+        embedBackend: ragEmbedBackend,
         embedModel: ragEmbedModel,
         embedModelPresent: ollamaStatus.running ? ollamaStatus.models.some((m) => m.name === ragEmbedModel) : false,
         tuning: ragTuning,
@@ -803,6 +865,10 @@ export class SetupController {
       // T6 (beta.6 §2.5): the settled-value memo's current truth —
       // 'checking' until the kicked probe settles.
       llamacppRuntime: this.composeLlamaCppRuntime(osInfo),
+      // T8 (beta.6 §1.3/§2.5): the "Configure Local Agent Model" block's wire
+      // state — host-owned endpoint defaults + the saved selection recomposed
+      // fresh from the 3 `talaria.agent.localModel.*` settings on every call.
+      agentLocalModel: this.composeAgentLocalModel(provider.phase, storePresence),
       ready,
       os: {
         family: osInfo.family,
@@ -1000,6 +1066,8 @@ export class SetupController {
         return this.handlePullModel(params);
       case 'setup.provisionModel':
         return this.handleProvisionModel(params);
+      case 'setup.saveAgentModel':
+        return this.handleSaveAgentModel(params);
       case 'setup.cancel':
         return this.handleCancel(params);
       case 'setup.openProviderWizard':
@@ -1661,6 +1729,150 @@ export class SetupController {
     });
   }
 
+  // --- setup.saveAgentModel (beta.6 T8 — §2.5/§6) ---------------------------
+
+  /**
+   * T8 (beta.6 §2.5/§6): `setup.saveAgentModel {modelId, backend, endpoint}`
+   * — or `{clear: true}` to unset. Refusal order:
+   *
+   *   1. `clear` branch (checked FIRST, same discipline as {@link
+   *      handleSetApiKey}'s `clear` branch): Tier-1 modal → unset all 3
+   *      `talaria.agent.localModel.*` keys Global. Every other param is
+   *      ignored on this branch.
+   *   2. `modelId` must resolve to a CATALOG row whose `role === 'agent'` —
+   *      an unknown id refuses the same as `setup.provisionModel`'s
+   *      unknown-id case; a fim/embedding/next id is REFUSED (role-gate).
+   *   3. `backend` ∈ {'ollama','llamacpp','vllm'} — the FULL 3-enum
+   *      (UNLIKE `setup.provisionModel`, which refuses 'vllm': this method
+   *      only RECORDS which backend serves the model, it never downloads).
+   *   4. `endpoint` via {@link validateEndpointUrl}.
+   *   5. Tier-1 modal (§6 "Agent save modal", verbatim — names the model,
+   *      backend, and endpoint) → THEN the 3 Global writes.
+   *
+   * `status()` (via {@link composeAgentLocalModel}) recomposes
+   * `saved.runCommand`/`servedName`/`providerGuidance` from these three
+   * settings on every read — this handler only ever writes the raw
+   * selection, never a composed command (Global Constraint 5).
+   */
+  private async handleSaveAgentModel(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (bool(params, 'clear') === true) {
+      const confirmed = await this.host.showModal(CLEAR_AGENT_MODEL_MODAL, 'Clear');
+      if (!confirmed) return { ok: false, reason: 'declined' };
+      await this.host.updateSettingGlobal('talaria.agent.localModel.modelId', undefined);
+      await this.host.updateSettingGlobal('talaria.agent.localModel.backend', undefined);
+      await this.host.updateSettingGlobal('talaria.agent.localModel.endpoint', undefined);
+      return { ok: true };
+    }
+
+    const modelId = str(params, 'modelId');
+    const entry = modelId === undefined ? undefined : MODEL_CATALOG.find((m) => m.id === modelId);
+    if (entry === undefined) return { ok: false, reason: PROVISION_UNKNOWN_ID_REFUSAL };
+    if (entry.role !== 'agent') return { ok: false, reason: SAVE_AGENT_ROLE_REFUSAL };
+
+    const backend = str(params, 'backend');
+    if (backend !== 'ollama' && backend !== 'llamacpp' && backend !== 'vllm') {
+      return { ok: false, reason: SAVE_AGENT_BACKEND_REFUSAL };
+    }
+
+    const endpointRaw = str(params, 'endpoint');
+    if (!endpointRaw) return { ok: false, reason: 'endpoint is required.' };
+    const validated = validateEndpointUrl(endpointRaw);
+    if (!validated.ok) return { ok: false, reason: validated.reason };
+
+    const confirmed = await this.host.showModal(
+      composeSaveAgentModal(entry.displayName, backend, validated.url),
+      'Save',
+    );
+    if (!confirmed) return { ok: false, reason: 'declined' };
+
+    await this.host.updateSettingGlobal('talaria.agent.localModel.modelId', entry.id);
+    await this.host.updateSettingGlobal('talaria.agent.localModel.backend', backend);
+    await this.host.updateSettingGlobal('talaria.agent.localModel.endpoint', validated.url);
+    return { ok: true };
+  }
+
+  /**
+   * T8 (§1.3): the "Configure Local Agent Model" block's wire state, RECOMPUTED
+   * fresh from the 3 settings on EVERY `status()` call (never cached) — a
+   * setting edited outside the panel, or a catalog row that changed shape, is
+   * always reflected honestly. `endpointDefaults` is ALWAYS present;
+   * `saved`/`providerGuidance` are present only once all 3 settings resolve to
+   * a live agent-role catalog row (a stale/corrupted setting degrades to "no
+   * saved state" rather than fabricating one — fail-closed, same posture as
+   * {@link composeLlamacppCell}'s source-gate degrade).
+   */
+  private composeAgentLocalModel(
+    providerPhase: SetupData['provider']['phase'],
+    storePresence: ReadonlyMap<string, boolean>,
+  ): NonNullable<SetupData['agentLocalModel']> {
+    const endpointDefaults = AGENT_ENDPOINT_DEFAULTS;
+    const modelId = (this.host.getSetting<string>('talaria.agent.localModel.modelId') ?? '').trim();
+    const endpoint = (this.host.getSetting<string>('talaria.agent.localModel.endpoint') ?? '').trim();
+    const backendRaw = this.host.getSetting<string>('talaria.agent.localModel.backend');
+    const backend =
+      backendRaw === 'ollama' || backendRaw === 'llamacpp' || backendRaw === 'vllm' ? backendRaw : undefined;
+
+    if (modelId === '' || endpoint === '' || backend === undefined) return { endpointDefaults };
+    const entry = MODEL_CATALOG.find((m) => m.id === modelId && m.role === 'agent');
+    if (entry === undefined) return { endpointDefaults };
+
+    const saved = this.composeSavedAgentEntry(entry, backend, endpoint, storePresence);
+    if (saved === undefined) return { endpointDefaults };
+
+    return {
+      endpointDefaults,
+      saved,
+      providerGuidance: composeAgentGuidance(providerPhase, endpoint, saved.servedName),
+    };
+  }
+
+  /** One (entry, backend) pair -> the `saved` wire shape, or `undefined` for
+   *  a poisoned/fixture row that fails its backend's source gate (defense in
+   *  depth — every shipping row passes, T1's closure). Reuses the SAME
+   *  exported gates {@link handleProvisionModel} relies on
+   *  ({@link assertProvisionSources} for ollama/llamacpp, {@link
+   *  composeVllmCell}'s own SC-2 gate for vllm) rather than re-deriving trust
+   *  logic here. */
+  private composeSavedAgentEntry(
+    entry: CatalogModel,
+    backend: 'ollama' | 'llamacpp' | 'vllm',
+    endpoint: string,
+    storePresence: ReadonlyMap<string, boolean>,
+  ): NonNullable<NonNullable<SetupData['agentLocalModel']>['saved']> | undefined {
+    if (backend === 'vllm') {
+      const vllmCell = composeVllmCell(entry);
+      const servedName = servedNameFor(entry, 'vllm');
+      if (vllmCell === undefined || servedName === undefined) return undefined;
+      return { modelId: entry.id, backend, endpoint, servedName, runCommand: vllmCell.runCommand };
+    }
+
+    const gate = assertProvisionSources(entry, backend);
+    if (!gate.ok) return undefined;
+    const servedName = servedNameFor(entry, backend);
+    if (servedName === undefined) return undefined;
+
+    if (backend === 'ollama') {
+      // Ollama needs no run command — the daemon serves it (§1.1).
+      return { modelId: entry.id, backend, endpoint, servedName };
+    }
+
+    // backend === 'llamacpp': a run command needs a store-resident,
+    // sidecar-attested file (same honesty rule as the catalog cell) — a
+    // saved config for a not-yet-downloaded model renders no runCommand,
+    // never a path to a file that doesn't exist. The port is ALWAYS the
+    // SAVED endpoint's own (CC-6) — never LLAMACPP_RUN_FLAGS's default.
+    const cell = entry.llamacpp;
+    let runCommand: string | undefined;
+    if (cell !== undefined && storePresence.get(entry.id) === true) {
+      const dest = this.deps.storeDest(cell.gguf.hfRepo, cell.gguf.file);
+      const port = extractPort(endpoint);
+      if (dest.ok && port !== undefined) {
+        runCommand = `llama-server -m ${this.redact(dest.destPath)} --jinja --port ${port}`;
+      }
+    }
+    return { modelId: entry.id, backend, endpoint, servedName, ...(runCommand !== undefined ? { runCommand } : {}) };
+  }
+
   // --- setup.cancel (read-only / best-effort) -----------------------------------
 
   private handleCancel(params: unknown): { ok: true } {
@@ -1903,6 +2115,15 @@ export class SetupController {
     if (!validated.ok) return { ok: false, reason: validated.reason };
     const model = str(params, 'model')?.trim();
     if (!model) return { ok: false, reason: 'model is required.' };
+    // T8 (beta.6 CC-10): additive, OPTIONAL `dedicatedBackendId` — a strict
+    // 4-enum when PRESENT (absent stays absent, no clobber — the restoration
+    // fallback stays the existing transport heuristic); a malformed value
+    // refuses outright, same "never trust webview input" discipline as
+    // every other enum param in this file.
+    const dedicatedBackendIdRaw = str(params, 'dedicatedBackendId');
+    if (dedicatedBackendIdRaw !== undefined && coerceDedicatedBackendId(dedicatedBackendIdRaw) === undefined) {
+      return { ok: false, reason: "dedicatedBackendId must be one of 'ollama', 'llamacpp', 'vllm', 'openai-compat'." };
+    }
 
     const oldEndpoint = (this.host.getSetting<string>('talaria.nextEdit.endpoint') ?? '').trim() || '(none)';
     const confirmed = await this.host.showModal(
@@ -1914,6 +2135,9 @@ export class SetupController {
     await this.host.updateSettingGlobal('talaria.nextEdit.backend', backend);
     await this.host.updateSettingGlobal('talaria.nextEdit.endpoint', validated.url);
     await this.host.updateSettingGlobal('talaria.nextEdit.model', model);
+    if (dedicatedBackendIdRaw !== undefined) {
+      await this.host.updateSettingGlobal('talaria.nextEdit.dedicatedBackendId', dedicatedBackendIdRaw);
+    }
     return { ok: true };
   }
 
@@ -1933,6 +2157,14 @@ export class SetupController {
     if (embedModel) patch['talaria.rag.embedModel'] = embedModel;
     const indexDir = str(params, 'indexDir')?.trim();
     if (indexDir) patch['talaria.rag.indexDir'] = indexDir;
+    // T8 (beta.6 CC-10): additive, OPTIONAL `embedBackend` — strict 3-enum.
+    const embedBackend = str(params, 'embedBackend');
+    if (embedBackend !== undefined) {
+      if (embedBackend !== 'ollama' && embedBackend !== 'llamacpp' && embedBackend !== 'openai-compat') {
+        return { ok: false, reason: "embedBackend must be 'ollama', 'llamacpp', or 'openai-compat'." };
+      }
+      patch['talaria.rag.embedBackend'] = embedBackend;
+    }
 
     if (Object.keys(patch).length === 0) {
       return { ok: false, reason: 'no changes supplied.' };
@@ -2392,6 +2624,77 @@ function composeLlamacppDownloadModal(
     `Talaria verifies the file's checksum ${basis} after downloading, ` +
     `then places it in ${redactedDest}.`
   );
+}
+
+// --- T8 (beta.6 §2.5/§6): setup.saveAgentModel pure helpers -------------------
+
+/** §6 "Agent save modal", verbatim. */
+function composeSaveAgentModal(displayName: string, backend: string, endpoint: string): string {
+  return `Set the local agent model to '${displayName}' via ${backend} at ${endpoint}?`;
+}
+
+/**
+ * T8 (§2.5, exported for direct testing): "what to type into the provider
+ * wizard" for one (entry, backend) pair — ollama: the tag (library tier) or
+ * the CREATED name (hf-ingest tier, rev 3 — e.g. Devstral's
+ * `devstral-small-2507:24b`); llamacpp: the GGUF's model name (its filename —
+ * llama-server's `/v1/models` id falls back to the file basename absent a
+ * `--alias`, Context7-grounded against `/ggml-org/llama.cpp`'s server source);
+ * vllm: the serveRepo. `undefined` for a missing/fixture cell (every shipping
+ * agent row carries all three, T1's closure) — never a fabricated guess.
+ */
+export function servedNameFor(entry: CatalogModel, backend: 'ollama' | 'llamacpp' | 'vllm'): string | undefined {
+  if (backend === 'ollama') {
+    if (entry.ollama?.tier === 'library') return entry.ollama.tag;
+    if (entry.ollama?.tier === 'hf-ingest') return entry.ollama.createdName;
+    return undefined;
+  }
+  if (backend === 'llamacpp') return entry.llamacpp?.gguf.file;
+  return entry.vllm?.serveRepo;
+}
+
+/**
+ * T8 (CC-6): the SAVED agent endpoint's own port — NEVER a hardcoded default
+ * (`LLAMACPP_RUN_FLAGS`'s literal is for the pre-save picker cell only).
+ * `undefined` only for a malformed URL — unreachable in practice, since
+ * `saved.endpoint` already passed {@link validateEndpointUrl} at save time.
+ */
+function extractPort(rawUrl: string): string | undefined {
+  try {
+    const url = new URL(rawUrl);
+    if (url.port !== '') return url.port;
+    return url.protocol === 'https:' ? '443' : '80';
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * §6 "Agent guidance — …", the three variants (exported for direct testing —
+ * `'unknown'` is not reachable through {@link computeProviderCard} today, so
+ * the fourth `provider.phase` value can only be exercised by calling this
+ * pure function directly). Gated on `provider.phase` (CC-7): `'unconfigured'`
+ * gets the full wizard-pointing copy; `'configured'` gets the update-if-you-
+ * want-it copy; `'waiting-agent'` AND `'unknown'` share the waiting copy — the
+ * Provider card's wizard button renders at NEITHER phase
+ * (`SetupPanel.tsx` `ProviderCard`), so the copy must not point at it.
+ */
+export function composeAgentGuidance(
+  phase: SetupData['provider']['phase'],
+  endpoint: string,
+  servedName: string,
+): string {
+  if (phase === 'configured') {
+    return `✓ Local model saved. Your provider is already configured — update it to ${endpoint}/v1 · ${servedName} if you want the agent on this model.`;
+  }
+  if (phase === 'unconfigured') {
+    return (
+      `✓ Local model ready. Next: press "Configure provider" on the Provider card below → choose the ` +
+      `OpenAI-compatible (custom URL) provider → base URL: ${endpoint}/v1 · model: ${servedName}. Test shows the served model if unsure.`
+    );
+  }
+  // 'waiting-agent' / 'unknown'
+  return '✓ Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
 }
 
 /**
