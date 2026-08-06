@@ -121,6 +121,58 @@ function vllmOption(overrides: Partial<SetupBackendOption> = {}): SetupBackendOp
   };
 }
 
+function openaiCompatOption(overrides: Partial<SetupBackendOption> = {}): SetupBackendOption {
+  return {
+    id: 'openai-compat',
+    kind: 'fim',
+    status: 'available',
+    displayName: 'OpenAI-compatible server',
+    description: 'Bring your own OpenAI-compatible endpoint.',
+    remote: {
+      endpointDefault: 'http://127.0.0.1:8000',
+      endpointValue: '',
+      endpointPlaceholder: 'http://127.0.0.1:8000',
+      auth: 'apiKey-optional',
+      apiKeySet: false,
+      probe: 'openai-models',
+    },
+    nextEditTransport: 'openai-compat',
+    ...overrides,
+  };
+}
+
+/**
+ * T13 (§3.3): the pinned NEXT catalog row as `projectCatalogModel` ships it —
+ * field values mirror the REAL `modelCatalog.ts` `sweep-next` row (id, names,
+ * bytes, hf-ingest created name). The default cell is the POST-publication
+ * state (`available: true` — pairs with `baseData()`'s `downloadReady: true`
+ * steady state); the empty-pin fixtures override `llamacpp` to the shipping
+ * `available: false` truth `composeLlamacppCell` produces while `sha256: ''`.
+ */
+function sweepNextRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'sweep-next',
+    role: 'next',
+    displayName: 'Sweep Next-Edit v2 (7B)',
+    publisher: 'SyntinalCo',
+    license: 'Apache-2.0',
+    defaultForRole: true,
+    contextWindow: 32768,
+    vramLine: 'Q4 ≈ 5 GB',
+    progressId: 'sweep-next',
+    ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+    ollamaApproxBytes: 4_680_000_000,
+    llamacpp: {
+      file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf',
+      approxBytes: 4_680_000_000,
+      present: false,
+      available: true,
+    },
+    vllm: { runCommand: 'vllm serve sweepai/sweep-next-edit-v2-7B' },
+    ...overrides,
+  };
+}
+
 /** A fully "you're ready" snapshot, overridable per test. */
 function baseData(overrides: Partial<SetupData> = {}): SetupData {
   return {
@@ -191,6 +243,10 @@ function baseData(overrides: Partial<SetupData> = {}): SetupData {
       endpoint: 'http://127.0.0.1:11434',
       models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 986_000_000 }],
     },
+    // T13: the host projects `catalog` UNCONDITIONALLY since T6 — the NEXT
+    // surface reads its pinned row (id/progress key) from here, never from a
+    // webview literal. Role-filtered away by the FIM/Agent/RAG surfaces.
+    catalog: { models: [sweepNextRow()] },
     ready: true,
     ...overrides,
   };
@@ -829,17 +885,24 @@ describe('NEXT card — card-level warning (§4.3 D4, critic C-14)', () => {
 });
 
 describe('NEXT card — Ollama presence + fail-closed Download button (§4.3 D2)', () => {
-  it('shows the Download button when downloadReady + ollama-picked + presence absent, and dispatches setup.pullModel on click', async () => {
+  // T13 (§2.5/T7-M2): the ONE entry point for the pinned artifact is
+  // `setup.provisionModel` keyed `pull:sweep-next` — the legacy
+  // `setup.pullModel` route latches a DIFFERENT key (`pull:<tag>`), so
+  // surfacing both for the same artifact would defeat the single-flight
+  // latch (a possible duplicate 4.7 GB download). One entry, one key.
+  it('shows the Download button when downloadReady + ollama-picked + presence absent, and dispatches setup.provisionModel (id-keyed) — NEVER the legacy setup.pullModel route', async () => {
     const { user, dispatch } = renderPanel(baseData());
     await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
     const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
     expect(within(nextCard).getByText('not present')).toBeInTheDocument();
     const button = within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' });
     await user.click(button);
-    expect(dispatch).toHaveBeenCalledWith('setup.pullModel', {
-      model: 'sweep-next-edit-v2-7b:q4_k_m',
+    expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
+      modelId: 'sweep-next',
+      backend: 'ollama',
       endpoint: 'http://127.0.0.1:11434',
     });
+    expect(dispatch).not.toHaveBeenCalledWith('setup.pullModel', expect.anything());
   });
 
   it('hides the Download button once the model is already present (green line instead)', async () => {
@@ -940,61 +1003,43 @@ describe('NEXT card — R-3: ollama picked + modelDefaults.ollama empty (!downlo
   });
 });
 
-describe('NEXT card — llama.cpp guided line (§4.3 point 5, S-F5 digest-verify hint)', () => {
-  it('hidden when !downloadReady (no guided.llamacpp on the wire)', async () => {
+describe('NEXT card — the llama.cpp -hf guided line is RETIRED from that pane (beta.6 T13, §3.3)', () => {
+  // The beta.5 `-hf` self-download line asked the user to fetch the artifact
+  // OUTSIDE Talaria's verify chain; §3.3 replaces it with the block's
+  // verified Download. The digest-verify hint (S-F5) is RETAINED — it now
+  // rides the downloaded row's run-command caption (see the T13 pinned-cell
+  // suite below). The vLLM guided line is UNCHANGED (§3.3) and keeps the
+  // final-fixwave Fix-4 hover-title lock.
+  it('no -hf line renders even when downloadReady — the verified Download stands in its place', async () => {
     const data = baseData({
       fim: {
         ...baseData().fim,
         options: [ollamaOption(), llamacppOption({ nextEditTransport: 'openai-compat' })],
         selectedId: 'llamacpp',
       },
-      nextEdit: {
-        ...baseData().nextEdit,
-        dedicated: {
-          ...baseData().nextEdit.dedicated!,
-          downloadReady: false,
-          guided: { vllm: baseData().nextEdit.dedicated!.guided.vllm },
-        },
-      },
+      llamacppRuntime: { binary: 'found', version: 'b4500' },
     });
     const { user } = renderPanel(data);
     await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
     const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
     await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
     expect(within(nextCard).queryByText(/llama-server -hf/)).not.toBeInTheDocument();
+    expect(within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' })).toBeEnabled();
   });
 
-  it('shown with the pinned digest + sha256sum hint when downloadReady', async () => {
+  it('the truncated guided-command span carries a title attribute with the full command, for hover reveal (final-fixwave Fix 4 — now locked on the surviving vLLM guided line)', async () => {
     const data = baseData({
       fim: {
         ...baseData().fim,
-        options: [ollamaOption(), llamacppOption({ nextEditTransport: 'openai-compat' })],
-        selectedId: 'llamacpp',
+        options: [ollamaOption(), vllmOption({ nextEditTransport: 'openai-compat' })],
+        selectedId: 'vllm',
       },
     });
     const { user } = renderPanel(data);
     await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
     const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
-    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
-    expect(
-      within(nextCard).getByText('Run: llama-server -hf SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M --port 8012'),
-    ).toBeInTheDocument();
-    expect(within(nextCard).getByText(/Verify the download: sha256sum should print/)).toBeInTheDocument();
-  });
-
-  it('the truncated guided-command span carries a title attribute with the full command, for hover reveal (final-fixwave Fix 4)', async () => {
-    const data = baseData({
-      fim: {
-        ...baseData().fim,
-        options: [ollamaOption(), llamacppOption({ nextEditTransport: 'openai-compat' })],
-        selectedId: 'llamacpp',
-      },
-    });
-    const { user } = renderPanel(data);
-    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
-    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
-    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
-    const commandLine = 'Run: llama-server -hf SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M --port 8012';
+    await user.click(within(nextCard).getByRole('button', { name: 'vLLM' }));
+    const commandLine = 'Run: vllm serve sweepai/sweep-next-edit-v2-7B';
     expect(within(nextCard).getByText(commandLine)).toHaveAttribute('title', commandLine);
   });
 
@@ -2087,5 +2132,258 @@ describe('T12 — Test endpoint in the label + the Serving line (§3.1 flow)', (
     const { agentCard, user } = await openAgentSection(agentBlockData());
     await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
     expect(within(agentCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8013)' })).toBeInTheDocument();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T13 (§3.3/§4.2/§6): the NEXT surface — pinned Sweep row on the
+ * block's NEW llama.cpp pane, provisionModel single entry (T7-M2),
+ * dedicatedBackendId restoration (CC-10). Ollama/vLLM/OpenAI-compatible
+ * panes preserved.
+ * ------------------------------------------------------------------ */
+
+/** The §6 "Pinned-mode disabled (Sweep)" line — beta.5 string unchanged. */
+const NO_VETTED_BUILD_LINE =
+  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+
+/** T13: a NEXT-form fixture with all four candidate backends, a found
+ *  llama-server, and the pinned sweep-next catalog row in a given state. */
+function nextSurfaceData(
+  opts: {
+    row?: SetupCatalogModel;
+    downloadReady?: boolean;
+    dedicatedBackendId?: 'ollama' | 'llamacpp' | 'vllm' | 'openai-compat';
+  } = {},
+): SetupData {
+  const base = baseData();
+  const downloadReady = opts.downloadReady ?? true;
+  return baseData({
+    fim: {
+      ...base.fim,
+      options: [
+        ollamaOption(),
+        llamacppOption({ nextEditTransport: 'openai-compat' }),
+        vllmOption({ nextEditTransport: 'openai-compat' }),
+        openaiCompatOption(),
+      ],
+      selectedId: 'ollama',
+    },
+    llamacppRuntime: { binary: 'found', version: 'b4500' },
+    ...(opts.row !== undefined ? { catalog: { models: [opts.row] } } : {}),
+    nextEdit: {
+      ...base.nextEdit,
+      ...(opts.dedicatedBackendId !== undefined ? { dedicatedBackendId: opts.dedicatedBackendId } : {}),
+      dedicated: downloadReady
+        ? base.nextEdit.dedicated
+        : {
+            ...base.nextEdit.dedicated!,
+            downloadReady: false,
+            modelDefaults: { ollama: '', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+            guided: { vllm: base.nextEdit.dedicated!.guided.vllm },
+          },
+    },
+  });
+}
+
+/** T13: the empty-pin shipping wire truth — `composeLlamacppCell` while
+ *  `sha256: ''` ships `available: false` WITHOUT an `unavailableReason`
+ *  (the NEXT card's wire truth owns the pinned-disabled copy). */
+function emptyPinData(): SetupData {
+  return nextSurfaceData({
+    downloadReady: false,
+    row: sweepNextRow({
+      llamacpp: {
+        file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf',
+        approxBytes: 4_680_000_000,
+        present: false,
+        available: false,
+      },
+    }),
+  });
+}
+
+async function openNextForm(data: SetupData, extra: Partial<Parameters<typeof SetupPanel>[0]> = {}) {
+  const utils = renderPanel(data, extra);
+  await utils.user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+  const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+  return { ...utils, nextCard };
+}
+
+describe('T13 — the pinned model line; NO model picker on any pane (§3.3)', () => {
+  it('the llama.cpp pane renders the sweep row as plain text — never an aria-pressed picker button', async () => {
+    const { user, nextCard } = await openNextForm(nextSurfaceData());
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(
+      within(nextCard).getByText('Sweep Next-Edit v2 (7B) — the one supported dedicated model.'),
+    ).toBeInTheDocument();
+    expect(within(nextCard).getByText('Sweep Next-Edit v2 (7B)')).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: 'Sweep Next-Edit v2 (7B)' })).not.toBeInTheDocument();
+  });
+});
+
+describe('T13 — Ollama pane in-flight: progress + Cancel keyed pull:sweep-next (rule 7/CC-9)', () => {
+  const inFlight = {
+    'pull:sweep-next': { op: 'pull' as const, id: 'sweep-next', logTail: [], totalBytes: 1000, completedBytes: 250 },
+  };
+
+  it('renders the percent from the CATALOG-id key and offers Cancel dispatching setup.cancel {op:pull, id:sweep-next}', async () => {
+    const { user, nextCard, dispatch } = await openNextForm(nextSurfaceData(), { progress: inFlight });
+    expect(within(nextCard).getByText('25%')).toBeInTheDocument();
+    await user.click(within(nextCard).getByRole('button', { name: 'Cancel' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.cancel', { op: 'pull', id: 'sweep-next' });
+  });
+
+  it('progress under the beta.5 TAG key no longer renders a bar — the key moved WITH the route (T7-M2)', async () => {
+    const stale = {
+      'pull:sweep-next-edit-v2-7b:q4_k_m': {
+        op: 'pull' as const,
+        id: 'sweep-next-edit-v2-7b:q4_k_m',
+        logTail: [],
+        totalBytes: 1000,
+        completedBytes: 250,
+      },
+    };
+    const { nextCard } = await openNextForm(nextSurfaceData(), { progress: stale });
+    expect(within(nextCard).queryByRole('progressbar')).not.toBeInTheDocument();
+  });
+});
+
+describe('T13 — llama.cpp pane: the empty-pin cell (§3.3, fail-closed)', () => {
+  it('renders the §6 no-vetted-build line + the Download button DISABLED naming why', async () => {
+    const { user, nextCard } = await openNextForm(emptyPinData());
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(nextCard).getByText(NO_VETTED_BUILD_LINE)).toBeInTheDocument();
+    const button = within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute('title', NO_VETTED_BUILD_LINE);
+  });
+
+  it('NO guided line at all in that state — no -hf command, no sha256sum hint — and never the generic honest-absence misdirect', async () => {
+    const { user, nextCard } = await openNextForm(emptyPinData());
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(nextCard).queryByText(/llama-server -hf/)).not.toBeInTheDocument();
+    expect(within(nextCard).queryByText(/sha256sum/)).not.toBeInTheDocument();
+    expect(within(nextCard).queryByText(/use it via Ollama instead/)).not.toBeInTheDocument();
+  });
+
+  it('the block binary status still renders (§4.1 — the backend cell is pin-independent)', async () => {
+    const { user, nextCard } = await openNextForm(emptyPinData());
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(nextCard).getByText('llama.cpp: Ready ✓ — b4500')).toBeInTheDocument();
+  });
+});
+
+describe('T13 — llama.cpp pane: pinned cell — Download → present → run command + digest hint (§3.3/SC-3)', () => {
+  it('absent + pinned: Download ENABLED, dispatches setup.provisionModel {modelId:sweep-next, backend:llamacpp} — never setup.pullModel', async () => {
+    const { user, nextCard, dispatch } = await openNextForm(nextSurfaceData());
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    const button = within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' });
+    expect(button).toBeEnabled();
+    await user.click(button);
+    expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
+      modelId: 'sweep-next',
+      backend: 'llamacpp',
+      endpoint: 'http://127.0.0.1:8012',
+    });
+    expect(dispatch).not.toHaveBeenCalledWith('setup.pullModel', expect.anything());
+  });
+
+  it('present: the host-composed --port 8012 run command + [Copy] + the RETAINED pinned digest hint; no -hf line', async () => {
+    const runCommand =
+      'llama-server -m ~/.local/share/talaria/models/SyntinalCo/sweep-next-edit-v2-7B-GGUF/sweep-next-edit-v2-7B-Q4_K_M.gguf --port 8012';
+    const data = nextSurfaceData({
+      row: sweepNextRow({
+        llamacpp: {
+          file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf',
+          approxBytes: 4_680_000_000,
+          present: true,
+          available: true,
+          runCommand,
+        },
+      }),
+    });
+    const { user, nextCard } = await openNextForm(data);
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(nextCard).getByText("present in Talaria's model folder ✓")).toBeInTheDocument();
+    expect(within(nextCard).getByText(runCommand)).toBeInTheDocument();
+    expect(within(nextCard).getByRole('button', { name: 'Copy' })).toBeInTheDocument();
+    expect(within(nextCard).getByText('Verify the download: sha256sum should print abc123def456')).toBeInTheDocument();
+    expect(within(nextCard).queryByText(/llama-server -hf/)).not.toBeInTheDocument();
+  });
+
+  it('ONE Test on the pane: the block-rendered "Test connection ({endpoint})" — the generic [Test] does not double it; Apply stays', async () => {
+    const { user, nextCard } = await openNextForm(nextSurfaceData());
+    await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
+    expect(within(nextCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8012)' })).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: 'Test' })).not.toBeInTheDocument();
+    expect(within(nextCard).getByRole('button', { name: 'Apply' })).toBeInTheDocument();
+  });
+});
+
+describe('T13 — vLLM pane unchanged (§3.3): guided line + generic Test; the block never renders here', () => {
+  it('keeps the guided run line + [Test] + [Apply]; no Download, no block Test-connection', async () => {
+    const { user, nextCard } = await openNextForm(nextSurfaceData());
+    await user.click(within(nextCard).getByRole('button', { name: 'vLLM' }));
+    expect(within(nextCard).getByText('Run: vllm serve sweepai/sweep-next-edit-v2-7B')).toBeInTheDocument();
+    expect(within(nextCard).getByRole('button', { name: 'Test' })).toBeInTheDocument();
+    expect(within(nextCard).getByRole('button', { name: 'Apply' })).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: /Download/ })).not.toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: /Test connection/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('T13 — OpenAI-compatible pane KEPT (CC-8): endpoint + model + Test + Apply, no catalog rows', () => {
+  it('renders the two fields (openai-compat prefill) + Test + Apply and none of the catalog affordances', async () => {
+    const { user, nextCard } = await openNextForm(nextSurfaceData());
+    await user.click(within(nextCard).getByRole('button', { name: 'OpenAI-compatible server' }));
+    expect(within(nextCard).getByRole('textbox', { name: 'Endpoint' })).toHaveValue('http://127.0.0.1:8000');
+    expect(within(nextCard).getByRole('textbox', { name: 'Model' })).toHaveValue('sweepai/sweep-next-edit-v2-7B');
+    expect(within(nextCard).getByRole('button', { name: 'Test' })).toBeInTheDocument();
+    expect(within(nextCard).getByRole('button', { name: 'Apply' })).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: /Download/ })).not.toBeInTheDocument();
+    expect(within(nextCard).queryByText('not present')).not.toBeInTheDocument();
+    expect(within(nextCard).queryByText(/llama-server/)).not.toBeInTheDocument();
+  });
+
+  it('Apply from this pane writes backend openai-compat + dedicatedBackendId openai-compat (CC-10)', async () => {
+    const { user, nextCard, dispatch } = await openNextForm(nextSurfaceData());
+    await user.click(within(nextCard).getByRole('button', { name: 'OpenAI-compatible server' }));
+    await user.click(within(nextCard).getByRole('button', { name: 'Apply' }));
+    expect(dispatch).toHaveBeenCalledWith(
+      'setup.setNextEdit',
+      expect.objectContaining({ backend: 'openai-compat', dedicatedBackendId: 'openai-compat' }),
+    );
+  });
+});
+
+describe('T13 — dedicatedBackendId restoration + Apply write-back (CC-10, §4.2)', () => {
+  it('the initial pane is the restored dedicatedBackendId candidate', async () => {
+    const { nextCard } = await openNextForm(nextSurfaceData({ dedicatedBackendId: 'llamacpp' }));
+    expect(within(nextCard).getByRole('button', { name: 'llama.cpp', pressed: true })).toBeInTheDocument();
+    expect(within(nextCard).getByText('llama.cpp: Ready ✓ — b4500')).toBeInTheDocument();
+  });
+
+  it("absent ⇒ today's transport heuristic (backend ollama → the Ollama pane)", async () => {
+    const { nextCard } = await openNextForm(nextSurfaceData());
+    expect(within(nextCard).getByRole('button', { name: 'Ollama', pressed: true })).toBeInTheDocument();
+  });
+
+  it('a dedicatedBackendId naming NO live candidate falls back to the heuristic (stale settings degrade honestly)', async () => {
+    const base = baseData();
+    const data = baseData({
+      fim: { ...base.fim, options: [ollamaOption()], selectedId: 'ollama' },
+      nextEdit: { ...base.nextEdit, dedicatedBackendId: 'llamacpp' },
+    });
+    const { nextCard } = await openNextForm(data);
+    expect(within(nextCard).getByRole('button', { name: 'Ollama', pressed: true })).toBeInTheDocument();
+  });
+
+  it('Apply records the selected pane via the ADDITIVE dedicatedBackendId param', async () => {
+    const { user, nextCard, dispatch } = await openNextForm(nextSurfaceData());
+    await user.click(within(nextCard).getByRole('button', { name: 'Apply' }));
+    expect(dispatch).toHaveBeenCalledWith(
+      'setup.setNextEdit',
+      expect.objectContaining({ backend: 'ollama', dedicatedBackendId: 'ollama' }),
+    );
   });
 });

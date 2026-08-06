@@ -491,3 +491,77 @@ describe('LocalModelBlock — runCommandCaption (T12): rendered under a RENDERED
     expect(screen.queryByText('the pre-save caption')).not.toBeInTheDocument();
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T13 — the additive `pinnedDownload` slot the NEXT surface uses
+ * (§3.3: pinned-model semantics on the llama.cpp pane). OPT-IN: omitted,
+ * every pre-T13 test above runs unchanged.
+ * ------------------------------------------------------------------ */
+
+describe('LocalModelBlock — pinnedDownload (T13, §3.3): the NEXT pinned-model llama.cpp cell', () => {
+  const pinned = { label: 'Download model (~4.7 GB)', unavailableReason: 'No vetted build — fail closed.' };
+  const sweepRow = (llamacpp: NonNullable<SetupCatalogModel['llamacpp']>) =>
+    catalogModel({
+      id: 'sweep-next',
+      role: 'next',
+      displayName: 'Sweep Next-Edit v2 (7B)',
+      ollamaTag: undefined,
+      ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+      llamacpp,
+    });
+
+  it('available:false WITHOUT a wire reason: renders the surface reason + the SAME button disabled-with-reason — never the generic honest-absence text', () => {
+    renderBlock({
+      backend: 'llamacpp',
+      models: [sweepRow({ file: 's.gguf', approxBytes: 4_680_000_000, present: false, available: false })],
+      pinnedDownload: pinned,
+    });
+    expect(screen.getByText('No vetted build — fail closed.')).toBeInTheDocument();
+    const button = screen.getByRole('button', { name: 'Download model (~4.7 GB)' });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute('title', 'No vetted build — fail closed.');
+    expect(screen.queryByText(/use it via Ollama instead/)).not.toBeInTheDocument();
+    expect(screen.queryByText('not downloaded')).not.toBeInTheDocument();
+  });
+
+  it('a wire unavailableReason still WINS over pinnedDownload (host-asserted absence keeps its copy, no button)', () => {
+    renderBlock({
+      backend: 'llamacpp',
+      models: [
+        sweepRow({
+          file: 's.gguf',
+          approxBytes: 4_680_000_000,
+          present: false,
+          available: false,
+          unavailableReason: 'a specific host reason',
+        }),
+      ],
+      pinnedDownload: pinned,
+    });
+    expect(screen.getByText('a specific host reason')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
+  });
+
+  it('available:true + absent: the download button carries the PINNED label and dispatches setup.provisionModel', async () => {
+    const { user, dispatch } = renderBlock({
+      backend: 'llamacpp',
+      models: [sweepRow({ file: 's.gguf', approxBytes: 4_680_000_000, present: false, available: true })],
+      pinnedDownload: pinned,
+      endpoint: 'http://127.0.0.1:8012',
+    });
+    const button = screen.getByRole('button', { name: 'Download model (~4.7 GB)' });
+    expect(button).toBeEnabled();
+    await user.click(button);
+    expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
+      modelId: 'sweep-next',
+      backend: 'llamacpp',
+      endpoint: 'http://127.0.0.1:8012',
+    });
+  });
+
+  it('the OLLAMA pane ignores pinnedDownload (llamacpp-scope lock): Pull keeps its own tag+size label', () => {
+    renderBlock({ backend: 'ollama', models: [catalogModel()], pinnedDownload: pinned });
+    expect(screen.getByRole('button', { name: 'Pull qwen2.5-coder:1.5b-base (~940 MB)' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
+  });
+});

@@ -36,6 +36,7 @@ import {
   clampLogTail,
   configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
+  dedicatedInitialCandidateId,
   fimDoneLine,
   fimHasLocalInstall,
   fimInstallTestEndpoint,
@@ -58,6 +59,7 @@ import {
   nextDoneLine,
   nextDownloadButtonVisible,
   nextEditButtonLabel,
+  nextLlamacppDigestHint,
   nextModelLine,
   nextPresence,
   nextPresenceText,
@@ -1218,5 +1220,87 @@ describe('agentSavedSummaryLine (T12) — mirrors the save modal vocabulary', ()
     expect(agentSavedSummaryLine('Ornith-1.0 9B', 'ollama', 'http://127.0.0.1:11434')).toBe(
       'Ornith-1.0 9B via ollama at http://127.0.0.1:11434',
     );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T13 (§3.3/§4.2): NEXT-surface helpers — pane restoration (CC-10)
+ * and the retained SC-3 digest hint.
+ * ------------------------------------------------------------------ */
+
+describe('dedicatedInitialCandidateId (T13, CC-10) — restored pane wins, else the transport heuristic', () => {
+  const candidates = [
+    { id: 'ollama', nextEditTransport: 'ollama' as const },
+    { id: 'llamacpp', nextEditTransport: 'openai-compat' as const },
+    { id: 'vllm', nextEditTransport: 'openai-compat' as const },
+    { id: 'openai-compat', nextEditTransport: 'openai-compat' as const },
+  ];
+
+  it('a dedicatedBackendId naming a live candidate wins — even over the transport heuristic', () => {
+    expect(dedicatedInitialCandidateId({ backend: 'ollama', dedicatedBackendId: 'vllm' }, candidates)).toBe('vllm');
+    expect(dedicatedInitialCandidateId({ backend: 'openai-compat', dedicatedBackendId: 'ollama' }, candidates)).toBe('ollama');
+  });
+
+  it("absent ⇒ today's heuristic: the FIRST candidate whose transport matches nextEdit.backend", () => {
+    expect(dedicatedInitialCandidateId({ backend: 'ollama' }, candidates)).toBe('ollama');
+    // three candidates share the openai-compat transport — the first wins,
+    // exactly as the pre-T13 `candidates.find(...)` did.
+    expect(dedicatedInitialCandidateId({ backend: 'openai-compat' }, candidates)).toBe('llamacpp');
+  });
+
+  it('an id naming NO live candidate (stale/edited settings) degrades to the heuristic, never a dead selection', () => {
+    const ollamaOnly = [{ id: 'ollama', nextEditTransport: 'ollama' as const }];
+    expect(dedicatedInitialCandidateId({ backend: 'ollama', dedicatedBackendId: 'llamacpp' }, ollamaOnly)).toBe('ollama');
+  });
+
+  it('no transport match either ⇒ the first candidate (pre-T13 fallback preserved)', () => {
+    const ollamaOnly = [{ id: 'ollama', nextEditTransport: 'ollama' as const }];
+    expect(dedicatedInitialCandidateId({ backend: 'openai-compat' }, ollamaOnly)).toBe('ollama');
+  });
+
+  it('empty candidates ⇒ undefined', () => {
+    expect(dedicatedInitialCandidateId({ backend: 'ollama', dedicatedBackendId: 'ollama' }, [])).toBeUndefined();
+  });
+});
+
+describe('nextLlamacppDigestHint (T13, SC-3) — the retained beta.5 manual-verify hint, WIRE-sourced', () => {
+  const dedicatedBase: NonNullable<SetupData['nextEdit']['dedicated']> = {
+    displayName: 'Sweep Next-Edit v2 (7B)',
+    modelDefaults: { ollama: 'sweep-next-edit-v2-7b:q4_k_m', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+    downloadReady: true,
+    downloadApproxBytes: 4_680_000_000,
+    warning: 'w',
+    guided: {
+      vllm: 'Run: vllm serve sweepai/sweep-next-edit-v2-7B\n(official Sweep release, ~15 GB download)',
+      llamacpp:
+        'Run: llama-server -hf SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M --port 8012\n' +
+        'Verify the download: sha256sum should print abc123def456',
+    },
+  };
+
+  it("returns the guided.llamacpp CAPTION line (the host's own digest hint) — never the -hf command", () => {
+    expect(nextLlamacppDigestHint(dedicatedBase)).toBe('Verify the download: sha256sum should print abc123def456');
+  });
+
+  it('undefined while the pin is unpublished (no guided.llamacpp on the wire) — the hint cannot outrun the pin', () => {
+    expect(nextLlamacppDigestHint({ ...dedicatedBase, guided: { vllm: dedicatedBase.guided.vllm } })).toBeUndefined();
+  });
+
+  it('undefined for a caption-less guided line and for an absent dedicated block — never an empty caption', () => {
+    expect(
+      nextLlamacppDigestHint({ ...dedicatedBase, guided: { ...dedicatedBase.guided, llamacpp: 'Run: x --port 8012' } }),
+    ).toBeUndefined();
+    expect(nextLlamacppDigestHint(undefined)).toBeUndefined();
+  });
+});
+
+describe('T13 — the §6 pinned-disabled copy stays single-sourced (scoped source-scan)', () => {
+  it('neither SetupPanel.tsx nor localModel.tsx restates the no-vetted-build line inline — both reference the setupCards constant', () => {
+    const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+    const localModelSrc = readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8');
+    expect(setupPanelSrc).not.toContain('No vetted build of this model is published yet');
+    expect(localModelSrc).not.toContain('No vetted build of this model is published yet');
+    expect(setupPanelSrc).not.toContain('Download model (~4.7 GB)');
+    expect(localModelSrc).not.toContain('Download model (~4.7 GB)');
   });
 });

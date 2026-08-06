@@ -60,6 +60,7 @@ import {
   catalogPresenceText,
   configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
+  dedicatedInitialCandidateId,
   FIM_LLAMACPP_NUDGE,
   FIM_OLLAMA_PULL_NUDGE,
   fimDoneLine,
@@ -74,6 +75,7 @@ import {
   nextDoneLine,
   nextDownloadButtonVisible,
   nextEditButtonLabel,
+  nextLlamacppDigestHint,
   nextModelLine,
   nextPresence,
   nextPresenceText,
@@ -1365,12 +1367,27 @@ function NextEditToggleRow({
 }
 
 /**
- * T15 (beta.5 §4.3 D1–D4): the dedicated NEXT setup form. Endpoint/Model
- * local state is a `DedicatedFormFieldState` (`setupCards.ts`) reconciled
- * against the picked backend's own defaults on every render via
+ * T15 (beta.5 §4.3 D1–D4) re-shaped by beta.6 T13 (§3.3): the dedicated NEXT
+ * setup form — four candidate panes over ONE pinned model (`sweep-next`, the
+ * catalog's only next-role row; there is never a model picker here).
+ * Endpoint/Model local state is a `DedicatedFormFieldState` (`setupCards.ts`)
+ * reconciled against the picked backend's own defaults on every render via
  * `reconcileDedicatedFormFields` — the `settingsField.ts` "adjust state
  * while rendering" pattern, so switching backends resets the fields to
  * THAT backend's defaults without clobbering an in-flight edit.
+ *
+ * T13 pane map: Ollama keeps its beta.5 bespoke tri-state (presence via the
+ * alias-aware `nextPresence`, fail-closed empty-pin text, Apply nudge) with
+ * ONLY the dispatch/key moved to the T7-M2 single entry
+ * (`setup.provisionModel`, latched `pull:sweep-next` — the legacy
+ * `setup.pullModel` route latches a DIFFERENT tag key, so exposing both for
+ * the same artifact would allow a duplicate download); llama.cpp is the NEW
+ * block pane (binary status + verified Download + run command, the -hf
+ * guided line retired, the SC-3 digest hint retained as the run-command
+ * caption); vLLM keeps its guided line + Test unchanged; OpenAI-compatible
+ * keeps fields + Test + Apply (CC-8). Restoration (CC-10): the initial pane
+ * reads `nextEdit.dedicatedBackendId`, Apply writes it back as the additive
+ * `setup.setNextEdit` param.
  */
 function DedicatedNextForm({
   setup,
@@ -1384,10 +1401,16 @@ function DedicatedNextForm({
   disabledReason?: string;
 }) {
   const candidates = setup.fim.options.filter((o) => o.nextEditTransport !== undefined);
-  const preferred = candidates.find((o) => o.nextEditTransport === setup.nextEdit.backend) ?? candidates[0];
+  const preferred = candidates.find((o) => o.id === dedicatedInitialCandidateId(setup.nextEdit, candidates));
   const [selectedId, setSelectedId] = useState(preferred?.id ?? '');
   const selected = candidates.find((o) => o.id === selectedId) ?? preferred;
   const dedicated = setup.nextEdit.dedicated;
+  // T13 (§3.3): the pinned model's CATALOG row — the id the T7-M2 single
+  // entry point + progress/cancel key ride on. Role-filtered from the wire
+  // (never a webview literal); absent catalog ⇒ no provisioning affordance
+  // at all (fail-closed), the rest of the form still renders.
+  const nextModels = setup.catalog?.models.filter((m) => m.role === 'next') ?? [];
+  const pinnedRow = nextModels[0];
 
   const defaults = dedicatedFieldDefaults(setup, selected);
   const [fields, setFields] = useState(() => initDedicatedFormFieldState(selectedId, defaults));
@@ -1398,19 +1421,22 @@ function DedicatedNextForm({
   const setModel = (v: string) => setFields((f) => ({ ...f, model: v }));
 
   const backendIsOllama = selected?.nextEditTransport === 'ollama';
+  const isLlamacppPane = selected?.id === 'llamacpp';
   const presence: NextPresence = backendIsOllama ? nextPresence(setup, endpoint, model) : 'unknown';
   const presenceTone: Tone = presence === 'present' ? 'add' : presence === 'absent' ? 'warn' : 'neutral';
   const presenceIcon = presence === 'present' ? 'pass-filled' : presence === 'absent' ? 'circle-outline' : 'question';
-  const showDownload = nextDownloadButtonVisible(dedicated, backendIsOllama, presence);
-  const pullId = dedicated?.modelDefaults.ollama ?? '';
-  const livePull = pullId ? progress[progressKey('pull', pullId)] : undefined;
+  const showDownload = nextDownloadButtonVisible(dedicated, backendIsOllama, presence) && pinnedRow !== undefined;
+  // T13: progress + cancel key = `pull:<catalogId>` (rule 7/CC-9) — the SAME
+  // key `handleProvisionModel` latches, replacing beta.5's tag-derived key.
+  const livePull = pinnedRow !== undefined ? progress[progressKey('pull', pinnedRow.id)] : undefined;
   const pullPct = pullPercent(livePull?.totalBytes, livePull?.completedBytes);
+  const pullInFlight = livePull !== undefined && presence !== 'present';
 
-  // §4.3 point 5: llama.cpp / vLLM each get a read-only guided line — ONLY
-  // these two ids carry wire text at all (§4.4: `guided.llamacpp` is absent
-  // while `!downloadReady`, S-F2/S-F5 — the -hf line ships with nothing to
-  // verify against until the pin is published).
-  const guidedText = selected?.id === 'llamacpp' ? dedicated?.guided.llamacpp : selected?.id === 'vllm' ? dedicated?.guided.vllm : undefined;
+  // §4.3 point 5, narrowed by T13: ONLY vLLM keeps a read-only guided line
+  // (§3.3 — unchanged). The llama.cpp -hf guided line is retired from that
+  // pane: the block's verified Download replaced the self-download command,
+  // and its digest-hint half survives as the run-command caption below.
+  const guidedText = selected?.id === 'vllm' ? dedicated?.guided.vllm : undefined;
   const guided = guidedText !== undefined ? splitGuidedLine(guidedText) : undefined;
 
   return (
@@ -1435,32 +1461,61 @@ function DedicatedNextForm({
           {backendIsOllama && dedicated?.downloadReady && (
             <div className="flex flex-col gap-1.5">
               <StatusLine icon={presenceIcon} text={nextPresenceText(presence)} tone={presenceTone} />
-              {showDownload && (
+              {showDownload && pinnedRow !== undefined && (
                 <div>
                   <ActionButton
                     label={NEXT_DOWNLOAD_BUTTON_LABEL}
-                    onRun={() => dispatch('setup.pullModel', { model: dedicated.modelDefaults.ollama, endpoint })}
+                    onRun={() => dispatch('setup.provisionModel', { modelId: pinnedRow.id, backend: 'ollama', endpoint })}
                     disabledReason={disabledReason}
                     successLabel={NEXT_POST_DOWNLOAD_NUDGE}
                   />
                 </div>
               )}
-              {pullPct !== undefined && (
-                <div className="flex items-center gap-2" aria-live="polite">
-                  <div
-                    role="progressbar"
-                    aria-valuenow={pullPct}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-label={`Pulling ${pullId}`}
-                    className="h-1.5 flex-1 overflow-hidden rounded-full bg-border"
-                  >
-                    <div className="h-full bg-accent" style={{ width: `${pullPct}%` }} />
+              {pinnedRow !== undefined && pullInFlight && (
+                <div className="flex flex-col gap-1">
+                  {pullPct !== undefined && (
+                    <div className="flex items-center gap-2" aria-live="polite">
+                      <div
+                        role="progressbar"
+                        aria-valuenow={pullPct}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-label={`Pulling ${pinnedRow.id}`}
+                        className="h-1.5 flex-1 overflow-hidden rounded-full bg-border"
+                      >
+                        <div className="h-full bg-accent" style={{ width: `${pullPct}%` }} />
+                      </div>
+                      <span className="font-mono text-2xs text-faint">{pullPct}%</span>
+                    </div>
+                  )}
+                  {/* CC-9: Cancel on every in-flight row — the RPC row for
+                      provisionModel is 0, so this is the only bound on a
+                      wedged download. */}
+                  <div>
+                    <ActionButton
+                      label={CANCEL_LABEL}
+                      icon="close"
+                      onRun={() => dispatch('setup.cancel', cancelPullParams(pinnedRow.id))}
+                    />
                   </div>
-                  <span className="font-mono text-2xs text-faint">{pullPct}%</span>
                 </div>
               )}
             </div>
+          )}
+
+          {isLlamacppPane && (
+            <LocalModelBlock
+              backend="llamacpp"
+              models={nextModels}
+              ollama={setup.ollama}
+              llamacppRuntime={setup.llamacppRuntime}
+              endpoint={endpoint}
+              progress={progress}
+              dispatch={dispatch}
+              disabledReason={disabledReason}
+              pinnedDownload={{ label: NEXT_DOWNLOAD_BUTTON_LABEL, unavailableReason: NEXT_DOWNLOAD_UNAVAILABLE_TEXT }}
+              runCommandCaption={nextLlamacppDigestHint(dedicated)}
+            />
           )}
 
           {guided && (
@@ -1482,12 +1537,16 @@ function DedicatedNextForm({
           <div className="flex gap-2">
             {/* T11 (§6-parity minor): reuses the SAME `setup.testRemote`
                 correlated method the FIM Connect tab already dispatches —
-                read-only, never trust-gated (§8). */}
-            <ActionButton
-              label="Test"
-              onRun={() => dispatch('setup.testRemote', { backendId: selected?.id, endpoint })}
-              successLabel="✓ Endpoint reachable"
-            />
+                read-only, never trust-gated (§8). T13: the llama.cpp pane's
+                Test lives in the block (endpoint-in-label + Serving line) —
+                a second generic [Test] would double the affordance. */}
+            {!isLlamacppPane && (
+              <ActionButton
+                label="Test"
+                onRun={() => dispatch('setup.testRemote', { backendId: selected?.id, endpoint })}
+                successLabel="✓ Endpoint reachable"
+              />
+            )}
             <ActionButton
               label="Apply"
               onRun={() =>
@@ -1495,6 +1554,10 @@ function DedicatedNextForm({
                   backend: selected?.nextEditTransport ?? 'ollama',
                   endpoint,
                   model,
+                  // T13 (CC-10): the additive restoration param — which pane
+                  // configured the connection; `status()` projects it back as
+                  // `nextEdit.dedicatedBackendId`.
+                  ...(selected !== undefined ? { dedicatedBackendId: selected.id } : {}),
                 })
               }
               disabledReason={disabledReason}

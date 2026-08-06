@@ -540,6 +540,47 @@ export function reconcileDedicatedFormFields(
   return initDedicatedFormFieldState(selectedId, defaults);
 }
 
+// --- beta.6 T13 (§3.3/§4.2): NEXT surface — pane restoration + digest hint --
+
+/**
+ * T13 (CC-10, §4.2): the dedicated NEXT form's INITIAL candidate pane.
+ * `nextEdit.dedicatedBackendId` (the pane a previous Apply recorded — its
+ * additive `setup.setNextEdit` param) wins when it still names a live
+ * candidate; a stale/edited value that names none degrades to the pre-T13
+ * transport heuristic (first candidate whose `nextEditTransport` matches
+ * `nextEdit.backend`, else the first candidate) — never a dead selection.
+ * `undefined` only for an empty candidate list.
+ */
+export function dedicatedInitialCandidateId(
+  nextEdit: Pick<SetupData['nextEdit'], 'backend' | 'dedicatedBackendId'>,
+  candidates: readonly Pick<SetupBackendOption, 'id' | 'nextEditTransport'>[],
+): string | undefined {
+  const restored =
+    nextEdit.dedicatedBackendId !== undefined
+      ? candidates.find((o) => o.id === nextEdit.dedicatedBackendId)
+      : undefined;
+  if (restored !== undefined) return restored.id;
+  return (candidates.find((o) => o.nextEditTransport === nextEdit.backend) ?? candidates[0])?.id;
+}
+
+/**
+ * T13 (§3.3/SC-3): the NEXT llama.cpp pane's retained manual-verify caption —
+ * the SECOND line of the wire's `guided.llamacpp` (host-composed
+ * `sha256sum`-hint, split off by {@link splitGuidedLine}), rendered under the
+ * downloaded row's run command via the block's `runCommandCaption` slot. The
+ * `-hf` COMMAND half is deliberately dropped on that pane (the block's
+ * verified Download replaced it); the hint half is beta.5's manual re-check
+ * posture, kept. `undefined` while the pin is unpublished (`guided.llamacpp`
+ * absent — R-3/S-F5: the hint is gated by the SAME pin as the download) or
+ * for a caption-less line — never an empty caption.
+ */
+export function nextLlamacppDigestHint(dedicated: SetupData['nextEdit']['dedicated']): string | undefined {
+  const guided = dedicated?.guided.llamacpp;
+  if (guided === undefined) return undefined;
+  const caption = splitGuidedLine(guided).caption;
+  return caption !== '' ? caption : undefined;
+}
+
 // --- beta.6 T10 (§4.1/§4.2/§6): LocalModelBlock helpers --------------------
 //
 // `catalogPresence` generalizes `nextPresence` above to ANY catalog row

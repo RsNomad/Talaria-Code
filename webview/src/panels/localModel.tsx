@@ -34,6 +34,11 @@
  * block still never hardcodes surface wording), and `RunCommandLine`/
  * `TestAndServingLine` became exports so the Agent section reuses them in
  * the SetupPanel → localModel import direction (no cycle, no third copy).
+ *
+ * T13 (NEXT surface) kept it too and added ONE more opt-in slot the same
+ * way: `pinnedDownload` (§3.3's pinned-model llama.cpp cell — label + the
+ * surface's fail-closed reason live in the NEXT card's own copy, passed in;
+ * see the prop doc). Omitted, the llama.cpp branch is byte-identical.
  */
 import { useEffect, useState } from 'react';
 import type { SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
@@ -105,6 +110,23 @@ export interface LocalModelBlockProps {
    * only — `vllm serve` carries no port for Save to update).
    */
   runCommandCaption?: string;
+  /**
+   * T13 (§3.3): pinned-model semantics for the llama.cpp pane (the NEXT
+   * surface). When set: (a) the pane's Download button carries `label` in
+   * EVERY state — the NEXT card's own §6 button vocabulary, preserved from
+   * beta.5, instead of the generic `Download {name} (~{size})` template;
+   * (b) an `available: false` cell WITHOUT a wire `unavailableReason`
+   * renders `unavailableReason` (the surface's §6 fail-closed line) PLUS the
+   * same button disabled-with-reason, instead of the generic honest-absence
+   * text — `composeLlamacppCell` deliberately ships the pinned-unpublished
+   * cell reason-less because the NEXT card's wire truth owns that copy, and
+   * the generic line ("use it via Ollama") would be a lie for a
+   * pinned-but-unpublished build. A wire `unavailableReason` still WINS
+   * (host-asserted absence keeps its own copy, no button). llama.cpp-pane
+   * scope only; the ollama branch never consults it (NEXT's ollama pane is
+   * not block-rendered). OPT-IN — omitted, behavior is byte-identical.
+   */
+  pinnedDownload?: { label: string; unavailableReason: string };
 }
 
 export function LocalModelBlock(props: LocalModelBlockProps) {
@@ -131,6 +153,7 @@ export function LocalModelBlock(props: LocalModelBlockProps) {
             ollamaPullSuccessLabel={props.ollamaPullSuccessLabel}
             caption={props.rowCaption?.(model)}
             runCommandCaption={props.runCommandCaption}
+            pinnedDownload={props.pinnedDownload}
           />
         ))}
       </div>
@@ -268,6 +291,7 @@ function ModelRow({
   ollamaPullSuccessLabel,
   caption,
   runCommandCaption,
+  pinnedDownload,
 }: {
   model: SetupCatalogModel;
   backend: LocalModelBackend;
@@ -281,6 +305,7 @@ function ModelRow({
   ollamaPullSuccessLabel?: string;
   caption?: string;
   runCommandCaption?: string;
+  pinnedDownload?: LocalModelBlockProps['pinnedDownload'];
 }) {
   const live = progress[progressKey('pull', model.id)];
   const percent = pullPercent(live?.totalBytes, live?.completedBytes);
@@ -307,14 +332,28 @@ function ModelRow({
   } else if (backend === 'llamacpp') {
     const cell = model.llamacpp;
     if (cell === undefined || cell.available === false) {
-      absenceOnly = cell?.unavailableReason ?? LLAMACPP_HONEST_ABSENCE_TEXT;
+      if (cell !== undefined && cell.unavailableReason === undefined && pinnedDownload !== undefined) {
+        // T13 (§3.3): the pinned-unpublished cell — the surface's own
+        // fail-closed line + the SAME download button, disabled naming that
+        // line as the reason (it can never run regardless of trust, so the
+        // pin reason outranks the trust gate's). A wire `unavailableReason`
+        // never reaches this branch (host-asserted absence wins above).
+        absenceOnly = pinnedDownload.unavailableReason;
+        action = {
+          label: pinnedDownload.label,
+          onRun: () => Promise.resolve(undefined),
+          disabledReason: pinnedDownload.unavailableReason,
+        };
+      } else {
+        absenceOnly = cell?.unavailableReason ?? LLAMACPP_HONEST_ABSENCE_TEXT;
+      }
     } else {
       isPresent = cell.present;
       presenceText = llamacppPresenceText(isPresent);
       if (!isPresent) {
         // SC-A-11: NEVER disabled by backend/runtime state — only the trust gate.
         action = {
-          label: llamacppDownloadButtonLabel(model, cell.approxBytes),
+          label: pinnedDownload?.label ?? llamacppDownloadButtonLabel(model, cell.approxBytes),
           onRun: () => dispatch('setup.provisionModel', { modelId: model.id, backend: 'llamacpp', endpoint }),
           disabledReason,
           successLabel: LLAMACPP_DOWNLOAD_SUCCESS_TEXT,
