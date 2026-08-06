@@ -10,7 +10,7 @@ import type { ExecLookup } from './runtime/resolveHermes';
 import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
-import { verifyHfDigest } from './setup/hfDigest';
+import { resolveLfsOid, verifyHfDigest } from './setup/hfDigest';
 import {
   downloadGgufToStore,
   ingestGguf,
@@ -491,6 +491,11 @@ export function createSetupControllerDeps(
     pullModel: (endpoint, model, onProgress, signal) => pullModel(endpoint, model, boundFetch, onProgress, signal),
     // T13 (beta.5 §4.4.3c): the HF-tree digest pre-flight over real fetch.
     verifyHfDigest: (gguf) => verifyHfDigest(boundFetch, gguf),
+    // T7 (beta.6 §2.2.5, T2-N1): the live-oid resolver over the same bound
+    // fetch. It does NOT re-assert charset — the controller's
+    // assertProvisionSources gate runs before every call (see the
+    // SetupControllerDeps doc for the assert-before-resolve contract).
+    resolveLfsOid: (hfRepo, file) => resolveLfsOid(boundFetch, hfRepo, file),
     // T14 (beta.5 §4.4.3d): the digest-enforced ingest ENGINE
     // (`src/host/setup/ggufIngest.ts`) bound to the real temp-file/fetch
     // seams (`ggufIo`, above). With the registry's sha256 pin still empty

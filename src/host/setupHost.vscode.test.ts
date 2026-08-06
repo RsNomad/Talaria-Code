@@ -276,6 +276,11 @@ describe('T6: createSetupControllerDeps — beta.6 engine bindings', () => {
     expect(typeof deps.downloadGgufToStore).toBe('function');
   });
 
+  it('T7: exposes the resolveLfsOid binding as a bound function', () => {
+    const deps = createSetupControllerDeps(() => undefined);
+    expect(typeof deps.resolveLfsOid).toBe('function');
+  });
+
   it('storeDest fails typed (never a composed path) on a poisoned repo string OR an unusable store root', () => {
     const deps = createSetupControllerDeps(() => undefined);
     // Portable assertion: on a box with a usable $HOME the charset assert

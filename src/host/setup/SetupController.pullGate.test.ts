@@ -157,6 +157,9 @@ function makeGateController(opts: { tree?: unknown; treeStatus?: number } = {}):
       emitIngestProgress.fn = onProgress;
       if (ingestBehavior.reject) throw ingestBehavior.reject;
     },
+    // T7 (beta.6): the legacy pull-gate suite never provisions by catalog id
+    // — fails closed if ever reached.
+    resolveLfsOid: async () => ({ ok: false, reason: 'not used here' }),
     // T6 (beta.6): the pull-gate suite never calls status() — these exist
     // only to satisfy the deps shape (and to fail loudly if ever reached).
     locateLlamaServer: () => new Promise<never>(() => {}),

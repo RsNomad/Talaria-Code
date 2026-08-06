@@ -1304,6 +1304,8 @@ function makeFakeSetupDeps(): SetupControllerDeps {
     ingestGguf: async () => {
       throw new Error('not used in routing tests');
     },
+    // T7 (beta.6): routing tests never provision by catalog id.
+    resolveLfsOid: async () => ({ ok: false, reason: 'not used in routing tests' }),
     // T6 (beta.6): status() must stay total for the panel pushes these
     // routing tests exercise — a never-settling probe keeps the memo at
     // 'checking'; an empty scan reads all-absent; dest composition refuses.

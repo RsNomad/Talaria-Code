@@ -1826,6 +1826,11 @@ export type SetupMethod =
   | 'setup.setApiKey'
   | 'setup.testRemote'
   | 'setup.pullModel'
+  // beta.6 T7 (§1.3/§2.5): catalog-id provisioning — the ONE place a verified
+  // catalog model gets pulled/downloaded/ingested. The webview sends
+  // `{modelId, backend, endpoint?}`; the host re-resolves EVERYTHING from
+  // `MODEL_CATALOG` (unknown id ⇒ refuse; 'vllm' ⇒ refused, never ignored).
+  | 'setup.provisionModel'
   | 'setup.cancel'
   | 'setup.openProviderWizard'
   | 'setup.openInstallTerminal'

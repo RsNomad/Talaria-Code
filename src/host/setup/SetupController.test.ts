@@ -183,6 +183,13 @@ function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: Set
     ingestGguf: async (): Promise<void> => {
       calls.push('ingestGguf');
     },
+    // T7 (beta.6): the live-oid resolver seam — never reached from this
+    // file's tests (the provisionModel suites have their own harnesses);
+    // fails closed if it ever is.
+    resolveLfsOid: async (): Promise<{ ok: true; oid: string } | { ok: false; reason: string }> => {
+      calls.push('resolveLfsOid');
+      return { ok: false, reason: 'not used here' };
+    },
     // T5: default = a readable Fedora host — keeps every pre-T5 behavior
     // test (bootstrap-terminal `sudo dnf install pipx` et al.) valid while
     // per-family tests override with their own fixture.
@@ -1060,6 +1067,7 @@ describe('MUTATING_METHODS / READ_ONLY_METHODS partition the full SetupMethod un
     'setup.setApiKey': true,
     'setup.testRemote': true,
     'setup.pullModel': true,
+    'setup.provisionModel': true,
     'setup.cancel': true,
     'setup.openProviderWizard': true,
     'setup.openInstallTerminal': true,
