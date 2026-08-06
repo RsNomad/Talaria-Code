@@ -43,6 +43,36 @@ import type { PullProgress } from './ollamaClient';
  * `io.removeTemp` runs on EVERY exit path (success, any refusal, or abort)
  * via a single `finally` wrapping the whole pipeline — there is exactly one
  * temp file per call and exactly one place that ever deletes it.
+ *
+ * --- beta.6 T3 split (beta6-unified-local-model-onboarding-architecture.md
+ * §2.4 / §2.2.8 / §7 line 509) ------------------------------------------------
+ * The digest-verified download loop above ({@link downloadToTemp}) is now
+ * shared by a SECOND sink, {@link downloadGgufToStore}: the atomic, same-
+ * filesystem file placer for the llama.cpp store path (`modelStore.ts`, T4
+ * is the reader of what this writes). Its pipeline, EXACT order:
+ *  1. digest-shape assert on `spec.gguf.sha256` (SC-A-8 defense-in-depth —
+ *     `hfDigest.ts`'s `resolveLfsOid`/`verifyHfDigest` already shape-assert
+ *     upstream; this is a second, independent gate at the placement layer)
+ *     — BEFORE any fs/network touch.
+ *  2. `io.ensureDir(destDir)` then `io.createStoreTempWrite(destDir)` — the
+ *     `.part` temp file is opened INSIDE `destDir` (never `os.tmpdir()`,
+ *     {@link GgufIngestIo.createTempWrite}'s own binding — SC-4: a cross-
+ *     filesystem tmpfs→destDir rename would EXDEV on Fedora for a multi-
+ *     gigabyte GGUF). `dirname(handle.path) === destDir` is asserted
+ *     immediately — a contract violation refuses before any network call.
+ *  3. `downloadToTemp` (shared, unchanged) — digest mismatch / HTTP error /
+ *     abort / size-ceiling all refuse via one shared `catch` that removes
+ *     the `.part` and rethrows; `renameTemp` is never reached on any of
+ *     these paths.
+ *  4. `io.renameTemp(tempPath, destPath)` — reached ONLY after the digest
+ *     compare passed (spy-order tested, §7 line 509). ANY rejection (EXDEV
+ *     or otherwise) refuses + removes the `.part` — there is no copy-
+ *     fallback method on {@link GgufStoreIo} for this engine to even reach
+ *     for; a copy would leave a partial file at the final name.
+ *  5. `io.writeSidecar` — reached ONLY after a successful rename; writes
+ *     `<destPath>.talaria.json` = {@link GgufStoreSidecar} (`catalogId`,
+ *     `sha256`, `bytes` = the actually-downloaded byte count, `verifiedAt`).
+ *     Never written on any failure path — a `.part` never gets a sidecar.
  */
 
 /** One open temp-file write handle — {@link GgufIngestIo.createTempWrite}
@@ -90,6 +120,70 @@ export interface GgufIngestIo {
   openTempRead(path: string): Promise<TempReadStream>;
 }
 
+/**
+ * The T3 file-sink seam — `setupHost.vscode.ts` binds these on the SAME
+ * object it already returns for {@link GgufIngestIo} (structurally, one
+ * bound object satisfies both interfaces — "io gains" these members, per
+ * the architecture doc's own phrasing, §2.4). `fetchImpl` is shared with
+ * {@link GgufIngestIo}; unit tests inject an independent in-memory fake.
+ */
+export interface GgufStoreIo {
+  fetchImpl: typeof fetch;
+  /** `fs.mkdir(dir, {recursive:true})` — called before `createStoreTempWrite`
+   *  so the `.part` file always has somewhere to land. */
+  ensureDir(dir: string): Promise<void>;
+  /** Opens `<destDir>/<random>.part` — INSIDE `destDir`, never `os.tmpdir()`
+   *  ({@link GgufIngestIo.createTempWrite}'s own binding) — SC-4. */
+  createStoreTempWrite(destDir: string): Promise<TempWriteHandle>;
+  /** Same contract as {@link GgufIngestIo.removeTemp} (never rejects on the
+   *  real binding — ENOENT swallowed); shared by both interfaces. */
+  removeTemp(path: string): Promise<void>;
+  /** `fs.rename(tempPath, destPath)` — same-directory, therefore atomic on
+   *  POSIX. Rejects (EXDEV or otherwise) exactly as `fs.rename` does; this
+   *  engine never catches a rejection here to retry with a copy. */
+  renameTemp(tempPath: string, destPath: string): Promise<void>;
+  /** Writes the post-rename attestation file verbatim (the engine already
+   *  serialized `content` to JSON) — `fs.writeFile(sidecarPath, content)`. */
+  writeSidecar(sidecarPath: string, content: string): Promise<void>;
+}
+
+/**
+ * The store-sink counterpart of `SetupController.ts`'s {@link
+ * GgufIngestSpec} — same registry-pinned-artifact trust discipline (never
+ * webview-derived), but shaped for the file-placement path: no
+ * `ollamaCreatedName` (nothing is created in Ollama on this path); it
+ * carries `catalogId` (`modelCatalog.ts` `CatalogModel.id`) instead, which
+ * `GgufIngestSpec` has no use for — {@link downloadGgufToStore} writes it
+ * into the post-rename sidecar verbatim.
+ */
+export interface GgufStoreSpec {
+  catalogId: string;
+  gguf: {
+    hfRepo: string;
+    file: string;
+    quant: string;
+    sha256: string;
+    approxBytes: number;
+    /** Optional — this engine never reads it; present only for shape parity
+     *  with `GgufIngestSpec.gguf.allowedRepoFiles` (also optional, T3). */
+    allowedRepoFiles?: readonly string[];
+  };
+}
+
+/**
+ * `<destPath>.talaria.json`'s exact shape (§2.2.8) — written ONLY after a
+ * successful rename. `modelStore.ts`'s presence scan (T4) is the reader:
+ * presence = sidecar exists ∧ well-formed ∧ `fs.stat(destPath).size ===
+ * sidecar.bytes`. T4 should IMPORT this type rather than redeclare it, so
+ * the writer and reader can never drift apart.
+ */
+export interface GgufStoreSidecar {
+  catalogId: string;
+  sha256: string;
+  bytes: number;
+  verifiedAt: string;
+}
+
 /** Thrown when the incrementally-hashed downloaded bytes do not equal the
  *  code-pinned digest — the byte-mismatch refusal (§4.4.3d.ii). Named so a
  *  caller (or a test) can distinguish it from a network/HTTP-status
@@ -119,6 +213,40 @@ export class GgufSizeExceededError extends Error {
   }
 }
 
+/** SC-A-8 defense-in-depth (T3): the expected digest handed to {@link
+ *  downloadGgufToStore} doesn't match the required 64-lowercase-hex-char
+ *  SHA-256 shape — refuses before any fs/network touch. Named so a caller
+ *  (or a test) can distinguish it from a byte-mismatch refusal. */
+export class GgufDigestShapeError extends Error {
+  constructor(value: string) {
+    super(`expected digest "${value}" does not match the required sha256 shape (64 lowercase hex chars) — refusing`);
+    this.name = 'GgufDigestShapeError';
+  }
+}
+
+/** SC-4 (T3): {@link GgufStoreIo.createStoreTempWrite} returned a temp file
+ *  outside the destination directory it was asked to write into — a
+ *  contract violation in the io binding itself (never expected from the
+ *  real fs binding; guards a future or test-double regression). */
+export class GgufStorePlacementError extends Error {
+  constructor(tempDir: string, destDir: string) {
+    super(`temp file directory "${tempDir}" does not match the destination directory "${destDir}" — refusing to place`);
+    this.name = 'GgufStorePlacementError';
+  }
+}
+
+/** §2.2.8 (T3): EXDEV or ANY OTHER `renameTemp` failure — refuses and
+ *  removes the `.part`. There is deliberately no copy-fallback path: a copy
+ *  would place a partial (unrenamed-but-present) file at the final name,
+ *  exactly what the atomic same-directory rename exists to prevent. The
+ *  original rejection is preserved as `.cause` for diagnostics. */
+export class GgufStoreRenameError extends Error {
+  constructor(destPath: string, cause: unknown) {
+    super(`failed to place the downloaded GGUF at "${destPath}" — refusing (no copy fallback)`, { cause });
+    this.name = 'GgufStoreRenameError';
+  }
+}
+
 /** The hard download-size ceiling, computed from the code-pinned
  *  `approxBytes` — NEVER from a response header. A 10% margin absorbs
  *  legitimate rounding between the registry's pinned estimate and the
@@ -142,7 +270,7 @@ export async function ingestGguf(
   const pin = spec.gguf.sha256.toLowerCase();
   const handle = await io.createTempWrite();
   try {
-    const digest = await downloadToTemp(io, handle, spec, onProgress, signal);
+    const { digest } = await downloadToTemp(io, handle, spec, onProgress, signal);
     if (digest !== pin) {
       throw new GgufDigestMismatchError(pin, digest);
     }
@@ -155,18 +283,112 @@ export async function ingestGguf(
   }
 }
 
-// --- pipeline steps ----------------------------------------------------------
-
-/** Step 1 (§4.4.3d.i): stream-download, hashing + forwarding progress
- *  incrementally. Returns the lower-hex SHA-256 of the received bytes —
- *  the caller compares it against the pin (step 2, §4.4.3d.ii). */
-async function downloadToTemp(
-  io: GgufIngestIo,
-  handle: TempWriteHandle,
-  spec: GgufIngestSpec,
+/**
+ * The T3 file-sink counterpart of {@link ingestGguf} (see this module's own
+ * top doc comment, "beta.6 T3 split", for the full 5-step pipeline). Places
+ * a digest-verified GGUF at `<destDir>/<destFile>` atomically (same-
+ * filesystem temp + rename) and writes its post-rename sidecar attestation.
+ *
+ * `spec.catalogId` is ALWAYS `modelCatalog.ts`'s `CatalogModel.id` for the
+ * row being downloaded — never anything webview-derived (same trust
+ * discipline `GgufIngestSpec` documents one type up).
+ *
+ * Rejects on any failure (digest-shape assert, digest mismatch, HTTP error,
+ * abort, size ceiling, or a rename failure of ANY kind, EXDEV included) —
+ * every failure removes the `.part` first, and NEVER writes a sidecar. An
+ * `AbortError` rejection = user cancel, matching `ingestGguf`'s own
+ * convention.
+ */
+export async function downloadGgufToStore(
+  io: GgufStoreIo,
+  spec: GgufStoreSpec,
+  destDir: string,
+  destFile: string,
   onProgress: (p: PullProgress) => void,
   signal: AbortSignal,
-): Promise<string> {
+): Promise<void> {
+  throwIfAborted(signal);
+  // SC-A-8: shape-assert BEFORE any fs/network touch — a malformed expected
+  // digest never reaches ensureDir/createStoreTempWrite/fetchImpl.
+  assertDigestShape(spec.gguf.sha256);
+  const pin = spec.gguf.sha256.toLowerCase();
+  const normalizedDestDir = normalizeDir(destDir);
+  const destPath = joinStorePath(normalizedDestDir, destFile);
+
+  await io.ensureDir(destDir);
+  const handle = await io.createStoreTempWrite(destDir);
+  // SC-4: the temp file MUST live in the exact same directory as the final
+  // destination — a contract violation (a buggy io binding returning a path
+  // elsewhere) refuses before any network call, and still cleans up
+  // whatever `createStoreTempWrite` already created on disk.
+  if (dirnameOf(handle.path) !== normalizedDestDir) {
+    await io.removeTemp(handle.path);
+    throw new GgufStorePlacementError(dirnameOf(handle.path), normalizedDestDir);
+  }
+
+  let digest: string;
+  let bytes: number;
+  try {
+    const result = await downloadToTemp(io, handle, spec, onProgress, signal);
+    if (result.digest !== pin) {
+      throw new GgufDigestMismatchError(pin, result.digest);
+    }
+    digest = result.digest;
+    bytes = result.completedBytes;
+  } catch (err) {
+    // Every download-phase failure — mismatch, HTTP error, abort, size
+    // ceiling — removes the `.part` before propagating. `renameTemp` is
+    // never reached on any of these paths (proven by the RED suite).
+    await io.removeTemp(handle.path);
+    throw err;
+  }
+
+  try {
+    await io.renameTemp(handle.path, destPath);
+  } catch (err) {
+    // EXDEV or ANY OTHER rename failure ⇒ refuse + cleanup, NEVER a copy
+    // fallback (a copy would leave a partial file at the final name) — this
+    // engine has no copy method to even reach for.
+    await io.removeTemp(handle.path);
+    throw new GgufStoreRenameError(destPath, err);
+  }
+
+  // Reached ONLY after a successful rename — a `.part` never gets a sidecar.
+  const sidecar: GgufStoreSidecar = {
+    catalogId: spec.catalogId,
+    sha256: digest,
+    bytes,
+    verifiedAt: new Date().toISOString(),
+  };
+  await io.writeSidecar(`${destPath}.talaria.json`, JSON.stringify(sidecar));
+}
+
+// --- pipeline steps ----------------------------------------------------------
+
+/** The minimal shape {@link downloadToTemp} needs from either sink's spec —
+ *  structurally satisfied by both `GgufIngestSpec.gguf` (imported) and
+ *  {@link GgufStoreSpec.gguf} (this module) without either caller adapting
+ *  its own spec shape (T3 split — this is the "shared core" §2.4 names). */
+interface GgufDownloadSource {
+  gguf: { hfRepo: string; file: string; approxBytes: number };
+}
+
+/** Step 1 (§4.4.3d.i): stream-download, hashing + forwarding progress
+ *  incrementally. Returns the lower-hex SHA-256 of the received bytes (the
+ *  caller compares it against the pin — `ingestGguf`'s step 2, §4.4.3d.ii;
+ *  `downloadGgufToStore`'s own compare) AND the total byte count actually
+ *  written (T3: `downloadGgufToStore`'s sidecar needs the real downloaded
+ *  size, not the code-pinned `approxBytes` estimate). `io` is typed to the
+ *  minimal `fetchImpl`-only shape both {@link GgufIngestIo} and {@link
+ *  GgufStoreIo} satisfy — this function never touches either interface's
+ *  sink-specific members. */
+async function downloadToTemp(
+  io: { fetchImpl: typeof fetch },
+  handle: TempWriteHandle,
+  spec: GgufDownloadSource,
+  onProgress: (p: PullProgress) => void,
+  signal: AbortSignal,
+): Promise<{ digest: string; completedBytes: number }> {
   throwIfAborted(signal);
   try {
     const url = `https://huggingface.co/${spec.gguf.hfRepo}/resolve/main/${spec.gguf.file}`;
@@ -202,7 +424,7 @@ async function downloadToTemp(
       await reader.cancel().catch(() => {});
       reader.releaseLock();
     }
-    return hash.digest('hex');
+    return { digest: hash.digest('hex'), completedBytes };
   } finally {
     // Finding 1 (IMPORTANT, T14 review): release the write handle's fd on
     // EVERY exit from this function — normal completion, the HTTP-error
@@ -331,4 +553,39 @@ function joinUrl(base: string, path: string): string {
   const normalizedBase = base.endsWith('/') ? base : `${base}/`;
   const normalizedPath = path.replace(/^\/+/, '');
   return new URL(normalizedPath, normalizedBase).toString();
+}
+
+// --- T3 store-sink internals --------------------------------------------------
+
+/** Fedora/Linux target — POSIX forward-slash paths only; deliberately no
+ *  `node:path` import (this module's own no-ambient-fs/os discipline: every
+ *  path here is a plain string the caller handed in, never resolved against
+ *  the real filesystem). Returns `'.'` for a bare filename with no
+ *  separator, mirroring `path.dirname`'s own convention. */
+function dirnameOf(path: string): string {
+  const idx = path.lastIndexOf('/');
+  return idx === -1 ? '.' : path.slice(0, idx);
+}
+
+/** Strips exactly one trailing '/' (never reduces a bare `'/'` to `''`) so
+ *  a caller-supplied `destDir` with or without a trailing slash compares
+ *  equal to {@link dirnameOf}'s always-trailing-slash-free output. */
+function normalizeDir(dir: string): string {
+  return dir.length > 1 && dir.endsWith('/') ? dir.slice(0, -1) : dir;
+}
+
+function joinStorePath(dir: string, file: string): string {
+  return dir.endsWith('/') ? `${dir}${file}` : `${dir}/${file}`;
+}
+
+/** HF's own `lfs.oid` shape, re-asserted at the placement layer (SC-A-8,
+ *  defense-in-depth): lowercase-normalized SHA-256 hex, always 64 chars.
+ *  `hfDigest.ts`'s `resolveLfsOid`/`verifyHfDigest` already assert this
+ *  upstream — this is a SECOND, independent gate, so a future caller that
+ *  bypasses those (or a resolver bug) still can't hand this engine a
+ *  malformed "verified" digest to trust. */
+function assertDigestShape(sha256: string): void {
+  if (!/^[0-9a-f]{64}$/.test(sha256.toLowerCase())) {
+    throw new GgufDigestShapeError(sha256);
+  }
 }

@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { execFile, spawn as nodeSpawn } from 'node:child_process';
-import { access, readFile } from 'node:fs/promises';
+import { access, readFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import { createWriteStream, createReadStream } from 'node:fs';
 import { unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -11,7 +11,7 @@ import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
 import { verifyHfDigest } from './setup/hfDigest';
-import { ingestGguf, type GgufIngestIo, type TempWriteHandle, type TempReadStream } from './setup/ggufIngest';
+import { ingestGguf, type GgufIngestIo, type GgufStoreIo, type TempWriteHandle, type TempReadStream } from './setup/ggufIngest';
 import { probeRemote } from './setup/remoteProbe';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './setup/registry';
 import type { AdvertisedAuthMethod, SetupHost, SetupControllerDeps } from './setup/SetupController';
@@ -154,8 +154,17 @@ export function createNodeFileExists(): FileExists {
  * `BodyInit` shape undici documents (see `ggufIngest.ts`'s own doc comment
  * on {@link GgufIngestIo.openTempRead} for the citation) — no `stream/web`
  * conversion needed.
+ *
+ * T3 (beta.6 §2.4): the returned object ALSO satisfies {@link GgufStoreIo}
+ * — the SAME bound object is handed to both `ingestGguf` and (once T7 wires
+ * it into `SetupControllerDeps`) `downloadGgufToStore`, matching the
+ * architecture doc's "io gains" phrasing verbatim. The four new members
+ * write INSIDE the caller-given `destDir` (never `os.tmpdir()`) — `rename`
+ * is same-directory, therefore atomic on POSIX; a cross-filesystem rename
+ * (EXDEV) rejects exactly as `fs.rename` does, and `downloadGgufToStore`
+ * itself refuses on any such rejection rather than falling back to a copy.
  */
-function createNodeGgufIngestIo(): GgufIngestIo {
+function createNodeGgufIngestIo(): GgufIngestIo & GgufStoreIo {
   return {
     fetchImpl: boundFetch,
     createTempWrite: async (): Promise<TempWriteHandle> => {
@@ -217,6 +226,45 @@ function createNodeGgufIngestIo(): GgufIngestIo {
     // unconditionally in a `finally` so this fd is released on every exit
     // from the blob-POST step too, not just when the body drains fully.
     openTempRead: async (path: string): Promise<TempReadStream> => createReadStream(path),
+
+    // --- GgufStoreIo (T3, beta.6 §2.4/§2.2.8) --------------------------------
+
+    ensureDir: async (dir: string): Promise<void> => {
+      await mkdir(dir, { recursive: true });
+    },
+    // Same open/write/close discipline as `createTempWrite` above (T14
+    // Finding 1's own comment applies verbatim: `destroy()` + wait for the
+    // 'close' event, never `end()`'s weaker 'finish') — the ONLY difference
+    // is the path: INSIDE `destDir` (a `.part` suffix, not `.tmp`), never
+    // `os.tmpdir()`, so the later same-directory `rename` below is atomic.
+    createStoreTempWrite: async (destDir: string): Promise<TempWriteHandle> => {
+      const path = joinPath(destDir, `talaria-gguf-${randomUUID()}.part`);
+      const stream = createWriteStream(path);
+      await new Promise<void>((resolve, reject) => {
+        stream.once('open', () => resolve());
+        stream.once('error', reject);
+      });
+      return {
+        path,
+        write: (chunk) =>
+          new Promise<void>((resolve, reject) => {
+            stream.write(chunk, (err) => (err ? reject(err) : resolve()));
+          }),
+        close: () =>
+          stream.destroyed
+            ? Promise.resolve()
+            : new Promise<void>((resolve) => {
+                stream.once('close', () => resolve());
+                stream.destroy();
+              }),
+      };
+    },
+    // Same-directory `fs.rename` — atomic on POSIX. Rejects (EXDEV or
+    // otherwise) exactly as `fs.rename` does; `downloadGgufToStore` itself
+    // is the one that refuses-and-cleans-up rather than falling back to a
+    // copy — this binding never catches or retries.
+    renameTemp: (tempPath: string, destPath: string): Promise<void> => rename(tempPath, destPath),
+    writeSidecar: (sidecarPath: string, content: string): Promise<void> => writeFile(sidecarPath, content, 'utf8'),
   };
 }
 

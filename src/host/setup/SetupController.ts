@@ -193,7 +193,11 @@ export interface GgufIngestSpec {
     quant: string;
     sha256: string;
     approxBytes: number;
-    allowedRepoFiles: readonly string[];
+    /** T3 (beta.6 §2.4): optional — meaningful only in `pinned` mode (the
+     *  pinned llama.cpp/Ollama path passes it for `verifyHfDigest`'s exact-
+     *  file-set check upstream of `ingestGguf`; `live-oid` mode passes
+     *  none, since nothing else in the repo is ever read for that file). */
+    allowedRepoFiles?: readonly string[];
   };
   ollamaCreatedName: string;
 }
