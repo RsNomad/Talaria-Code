@@ -32,7 +32,6 @@
 
 import type { ProbeSpec } from './registry';
 import { probeOllama } from './ollamaClient';
-import { isHttpUrl } from '../../shared/url';
 
 export interface ProbeOutcome {
   ok: boolean;
@@ -72,15 +71,48 @@ export async function probeRemote(
 
 /**
  * Shape-only validation that a user-typed endpoint is a well-formed
- * `http(s)` URL — reuses `isHttpUrl`'s discipline (`src/shared/url.ts`):
- * deliberately host-agnostic (a legitimately remote endpoint is not an
- * error), rejecting only malformed input and non-http(s) schemes.
+ * `http(s)` URL — deliberately host-agnostic (a legitimately remote endpoint
+ * is not an error), rejecting only malformed input and non-http(s) schemes.
+ *
+ * beta.6 L1-I-1 (security): this is the ONE chokepoint every `showModal`
+ * confirmation site reads (`SetupController.ts`'s `applyFim`,
+ * `setNextEdit`, `saveAgentModel`, `setRag`, and the three `provisionOllama`
+ * arms) — it MUST return the WHATWG-parser's own canonical serialization
+ * (`parsed.toString()`), never the raw input string. The raw string can
+ * carry control/bidi-override characters (forged modal text, or a host that
+ * *displays* as `127.0.0.1` while a bidi override makes it *resolve*
+ * elsewhere) — re-serializing through `new URL()` is forge-proof by
+ * construction (percent-encodes controls/bidi, punycodes homograph hosts)
+ * rather than depending on a hand-maintained unsafe-character blocklist.
+ * Userinfo (`user:pass@host`) is explicitly REFUSED, not silently stripped:
+ * `.toString()` preserves it (verified), and silently dropping it would
+ * change the endpoint's meaning behind the user's back — credentials belong
+ * in the dedicated keychain-backed API-key field, not the address.
  */
 export function validateEndpointUrl(raw: string): { ok: true; url: string } | { ok: false; reason: string } {
-  if (!isHttpUrl(raw)) {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
     return { ok: false, reason: 'Enter a valid http:// or https:// URL.' };
   }
-  return { ok: true, url: raw };
+  // Same scheme discipline as isHttpUrl (kept as the single source for its
+  // other callers — src/autocomplete/config.ts, rag); inlined here so we can
+  // return the parser's canonical serialization rather than the raw input.
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { ok: false, reason: 'Enter a valid http:// or https:// URL.' };
+  }
+  // Userinfo policy: refuse credentials-in-URL. .toString() PRESERVES them
+  // (verified), they would be written to a plaintext setting AND shown in a
+  // modal, and API keys already have a dedicated keychain-backed field.
+  if (parsed.username !== '' || parsed.password !== '') {
+    return {
+      ok: false,
+      reason: 'Remove the username:password@ part of the URL — credentials go in the API-key field, not the address.',
+    };
+  }
+  // Canonical serialization: forge-proof by construction (see grounding below).
+  return { ok: true, url: parsed.toString() };
 }
 
 // --- internals ---------------------------------------------------------

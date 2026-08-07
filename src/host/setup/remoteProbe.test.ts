@@ -181,14 +181,14 @@ describe('probeRemote — none (§2.5, codestral: no unauthenticated probe)', ()
 // --- validateEndpointUrl -----------------------------------------------------
 
 describe('validateEndpointUrl (reuses isHttpUrl discipline from src/shared/url.ts)', () => {
-  it('accepts a well-formed http URL', () => {
-    expect(validateEndpointUrl('http://127.0.0.1:11434')).toEqual({ ok: true, url: 'http://127.0.0.1:11434' });
+  it('accepts a well-formed http URL, returned WHATWG-canonical (trailing slash)', () => {
+    expect(validateEndpointUrl('http://127.0.0.1:11434')).toEqual({ ok: true, url: 'http://127.0.0.1:11434/' });
   });
 
-  it('accepts a well-formed https URL', () => {
+  it('accepts a well-formed https URL, returned WHATWG-canonical (trailing slash)', () => {
     expect(validateEndpointUrl('https://codestral.mistral.ai')).toEqual({
       ok: true,
-      url: 'https://codestral.mistral.ai',
+      url: 'https://codestral.mistral.ai/',
     });
   });
 
@@ -200,6 +200,40 @@ describe('validateEndpointUrl (reuses isHttpUrl discipline from src/shared/url.t
 
   it('rejects garbage / non-URLs', () => {
     const result = validateEndpointUrl('not a url');
+    expect(result.ok).toBe(false);
+  });
+
+  it('normalizes a newline embedded in the input to the canonical URL (L1-I-1)', () => {
+    // Local escape, no raw control char in source — the WHATWG parser strips
+    // C0 controls (tab/CR/LF) from the input before serializing.
+    const result = validateEndpointUrl('http://127.0.0.1\n:11434');
+    expect(result).toEqual({ ok: true, url: 'http://127.0.0.1:11434/' });
+  });
+
+  it('percent-encodes a bidi override character in the path rather than passing it through raw (L1-I-1)', () => {
+    // Local escape (U+202E RIGHT-TO-LEFT OVERRIDE) — never a raw glyph in source.
+    const bidi = String.fromCharCode(0x202e);
+    const result = validateEndpointUrl(`http://127.0.0.1:11434/${bidi}evil`);
+    expect(result.ok).toBe(true);
+    const url = (result as { ok: true; url: string }).url;
+    expect(url).toContain('%E2%80%AE');
+    expect(url).not.toContain(bidi);
+  });
+
+  it('refuses a URL carrying embedded username:password@ userinfo (L1-I-1)', () => {
+    const result = validateEndpointUrl('http://user:pass@127.0.0.1:11434');
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toBeTruthy();
+  });
+
+  it('refuses a bidi override character embedded in the host (WHATWG throws on parse) (L1-I-1)', () => {
+    const bidi = String.fromCharCode(0x202e);
+    const result = validateEndpointUrl(`http://exam${bidi}ple.com`);
+    expect(result.ok).toBe(false);
+  });
+
+  it('refuses a non-http(s) scheme that is otherwise well-formed (L1-I-1)', () => {
+    const result = validateEndpointUrl('ws://127.0.0.1:11434');
     expect(result.ok).toBe(false);
   });
 });

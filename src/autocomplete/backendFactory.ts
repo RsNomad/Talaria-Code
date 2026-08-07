@@ -75,6 +75,21 @@ function endpointPort(rawEndpoint: string): string | undefined {
   }
 }
 
+/** Slash/canonicalization-tolerant, never-throw endpoint equality —
+ *  `cfg.endpoint` may now be stored WHATWG-canonical (`'…:8000/'`) after
+ *  `setup.applyFim` normalization (beta.6 L1-I-1,
+ *  `src/host/setup/remoteProbe.ts`'s `validateEndpointUrl`), while
+ *  `OPENAI_COMPAT_DEFAULT_ENDPOINT` below is authority-only (never
+ *  re-canonicalized — see that constant's own doc comment for why). Same
+ *  no-throw contract as {@link endpointPort} above. */
+function sameEndpoint(a: string, b: string): boolean {
+  try {
+    return new URL(a).toString() === new URL(b).toString();
+  } catch {
+    return a === b;
+  }
+}
+
 /** Builds the configured `FimBackend` from `talaria.autocomplete.*` settings. */
 export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
   switch (cfg.backend) {
@@ -139,7 +154,7 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
       // was the extension flagging its own default as broken. A DIFFERENT
       // host on port 8000 still gets the heads-up (it's ambiguous whether
       // that's really a vLLM server), only the exact-default case is silent.
-      if (cfg.endpoint !== OPENAI_COMPAT_DEFAULT_ENDPOINT && endpointPort(cfg.endpoint) === VLLM_DEFAULT_PORT) {
+      if (!sameEndpoint(cfg.endpoint, OPENAI_COMPAT_DEFAULT_ENDPOINT) && endpointPort(cfg.endpoint) === VLLM_DEFAULT_PORT) {
         warnOnce(
           'openai-compat-vllm-port',
           `talaria.autocomplete.endpoint (${cfg.endpoint}) uses vLLM's default port with backend=openai-compat — vLLM 400-rejects the "suffix" field this backend sends. If this endpoint really is a vLLM server, switch "talaria.autocomplete.backend" to "vllm" instead.`,
