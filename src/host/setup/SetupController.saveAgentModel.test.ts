@@ -4,6 +4,7 @@ import {
   SetupController,
   servedNameFor,
   composeAgentGuidance,
+  MODAL_UNSAFE_TEXT_PATTERN,
   type SetupHost,
   type SetupControllerDeps,
 } from './SetupController';
@@ -229,7 +230,7 @@ describe('setup.saveAgentModel: Tier-1 modal (verbatim) then 3 Global writes', (
       endpoint: 'http://127.0.0.1:11434',
     });
     expect(result).toEqual({ ok: false, reason: 'declined' });
-    expect(host.calls).toEqual([`showModal:Set the local agent model to '${ORNITH.displayName}' via ollama at http://127.0.0.1:11434?`]);
+    expect(host.calls).toEqual([`showModal:Set the local agent model to '${ORNITH.displayName}' via ollama at http://127.0.0.1:11434/?`]);
   });
 
   it('a confirm writes all 3 settings Global, modal BEFORE any write', async () => {
@@ -241,14 +242,43 @@ describe('setup.saveAgentModel: Tier-1 modal (verbatim) then 3 Global writes', (
     });
     expect(result).toEqual({ ok: true });
     expect(host.calls).toEqual([
-      `showModal:Set the local agent model to '${ORNITH.displayName}' via ollama at http://127.0.0.1:11434?`,
+      `showModal:Set the local agent model to '${ORNITH.displayName}' via ollama at http://127.0.0.1:11434/?`,
       `write:talaria.agent.localModel.modelId=${JSON.stringify('ornith-9b')}`,
       `write:talaria.agent.localModel.backend=${JSON.stringify('ollama')}`,
-      `write:talaria.agent.localModel.endpoint=${JSON.stringify('http://127.0.0.1:11434')}`,
+      `write:talaria.agent.localModel.endpoint=${JSON.stringify('http://127.0.0.1:11434/')}`,
     ]);
     expect(host.settings.get('talaria.agent.localModel.modelId')).toBe('ornith-9b');
     expect(host.settings.get('talaria.agent.localModel.backend')).toBe('ollama');
-    expect(host.settings.get('talaria.agent.localModel.endpoint')).toBe('http://127.0.0.1:11434');
+    expect(host.settings.get('talaria.agent.localModel.endpoint')).toBe('http://127.0.0.1:11434/');
+  });
+
+  // --- L1-I-1 (beta.6 fix-wave T2): unsafe NEW params.endpoint sweep ----------
+
+  it('L1-I-1 T2: a bidi-override NEW endpoint is canonicalized before the modal, and the write is the canonical value', async () => {
+    const bidiOverride = String.fromCharCode(0x202e);
+    const { host, controller } = makeSaveController();
+    const result = await controller.handle('setup.saveAgentModel', {
+      modelId: 'ornith-9b',
+      backend: 'ollama',
+      endpoint: `http://127.0.0.1:11434/${bidiOverride}evil`,
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(host.settings.get('talaria.agent.localModel.endpoint')).toBe('http://127.0.0.1:11434/%E2%80%AEevil');
+  });
+
+  it('L1-I-1 T2: userinfo in the NEW endpoint is refused before any modal/write', async () => {
+    const { host, controller } = makeSaveController();
+    const result = await controller.handle('setup.saveAgentModel', {
+      modelId: 'ornith-9b',
+      backend: 'ollama',
+      endpoint: 'http://user:pass@127.0.0.1:11434',
+    });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+    expect(host.settings.size).toBe(0);
   });
 });
 

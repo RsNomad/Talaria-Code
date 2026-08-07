@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { SetupController, type SetupHost, type SetupControllerDeps } from './SetupController';
+import { SetupController, MODAL_UNSAFE_TEXT_PATTERN, type SetupHost, type SetupControllerDeps } from './SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend, NEXT_DEDICATED_MODEL } from './registry';
 import type { LfsOidVerdict, HfGgufSpec } from './hfDigest';
 import type { PipxLocateResult } from './pipxLocator';
@@ -200,7 +200,7 @@ const PINNED_OLLAMA_MODAL =
   "Download 'Sweep Next-Edit v2 (7B)' (~4.7 GB) and install it into your local Ollama? " +
   "Source: huggingface.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF — Syntinal's build converted from Sweep's official release. " +
   "Talaria verifies the file's checksum against its pinned value after downloading, " +
-  'and Ollama verifies it again during install at http://127.0.0.1:11434.';
+  'and Ollama verifies it again during install at http://127.0.0.1:11434/.';
 
 const PINNED_LLAMACPP_MODAL =
   "Download 'Sweep Next-Edit v2 (7B)' (Q4_K_M, ~4.7 GB) from huggingface.co/SyntinalCo/sweep-next-edit-v2-7B-GGUF? " +
@@ -212,7 +212,7 @@ const LIVE_OID_OLLAMA_MODAL =
   "Download 'Live Row' (Q4_K_M, ~4.7 GB) from huggingface.co/Qwen/live-repo? " +
   'Publisher: Qwen (Alibaba) — Alibaba’s verified Hugging Face organization — the models’ own publisher. ' +
   "Talaria verifies the file's checksum against the publisher's manifest after downloading, " +
-  'and Ollama verifies it again during install at http://127.0.0.1:11434.';
+  'and Ollama verifies it again during install at http://127.0.0.1:11434/.';
 
 const LIVE_OID_LLAMACPP_MODAL =
   "Download 'Live Row' (Q4_K_M, ~4.7 GB) from huggingface.co/Qwen/live-repo? " +
@@ -465,7 +465,7 @@ describe('T7 step 4c (pinned fixture pin published): sweep-next via ollama — t
           },
           ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
         },
-        endpoint: 'http://127.0.0.1:11434',
+        endpoint: 'http://127.0.0.1:11434/',
       },
     ]);
   });
@@ -491,6 +491,41 @@ describe('T7 step 4c (pinned fixture pin published): sweep-next via ollama — t
     const result = await controller.handle('setup.provisionModel', { modelId: 'pinned-foreign', backend: 'ollama' });
     expect(result).toEqual({ ok: false, reason: INTEGRITY_REFUSAL });
     expect(calls).toEqual([]); // refused before ANY verify/fetch — the exact-set spec cannot be assembled
+  });
+});
+
+// --- L1-I-1 (beta.6 fix-wave T2): the pinned arm of the 7-handler
+// unsafe-NEW-endpoint security sweep ------------------------------------------
+
+describe('L1-I-1 T2: unsafe NEW params.endpoint through the pinned provisionOllama arm', () => {
+  const bidiOverride = String.fromCharCode(0x202e);
+  const unsafeNewEndpoint = `http://127.0.0.1:11434/${bidiOverride}evil`;
+  const canonicalUnsafeNewEndpoint = 'http://127.0.0.1:11434/%E2%80%AEevil';
+  const userinfoEndpoint = 'http://user:pass@127.0.0.1:11434';
+
+  it('a bidi-override NEW endpoint is canonicalized before the modal, and ingestGguf gets the canonical endpoint', async () => {
+    const { controller, calls, ingestArgs } = makeFixtureController();
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'sweep-next',
+      backend: 'ollama',
+      endpoint: unsafeNewEndpoint,
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(ingestArgs[0]?.endpoint).toBe(canonicalUnsafeNewEndpoint);
+  });
+
+  it('userinfo in the NEW endpoint is refused before any modal/ingest', async () => {
+    const { controller, calls } = makeFixtureController();
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'sweep-next',
+      backend: 'ollama',
+      endpoint: userinfoEndpoint,
+    });
+    expect(result.ok).toBe(false);
+    expect(calls).toEqual([]);
   });
 });
 

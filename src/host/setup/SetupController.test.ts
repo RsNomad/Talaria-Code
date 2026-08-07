@@ -26,6 +26,7 @@ import type { PipxLocateResult } from './pipxLocator';
 import type { HermesPaths } from './pipxInstaller';
 import type { OllamaStatus } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
+import { validateEndpointUrl } from './remoteProbe';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import type { SetupMethod, SetupProgress } from '../../shared/protocol';
 
@@ -638,7 +639,7 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(modalCall).toContain('http://old-host:9000');
     expect(modalCall).toContain('http://127.0.0.1:11434');
     expect(host.settings.get('talaria.autocomplete.backend')).toBe('ollama');
-    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434');
+    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434/');
   });
 
   it('refuses an invalid endpoint URL before showing any modal', async () => {
@@ -662,11 +663,11 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(result).toEqual({ ok: true });
     const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
     expect(modalCall).toBe(
-      "showModal:Switch autocomplete endpoint from 'http://old-host:9000' to 'http://127.0.0.1:11434' (backend: Ollama, model: qwen2.5-coder:7b-base)?",
+      "showModal:Switch autocomplete endpoint from 'http://old-host:9000' to 'http://127.0.0.1:11434/' (backend: Ollama, model: qwen2.5-coder:7b-base)?",
     );
     expect(host.calls.filter((c) => c.startsWith('write:'))).toEqual([
       'write:talaria.autocomplete.backend="ollama"',
-      'write:talaria.autocomplete.endpoint="http://127.0.0.1:11434"',
+      'write:talaria.autocomplete.endpoint="http://127.0.0.1:11434/"',
       'write:talaria.autocomplete.model="qwen2.5-coder:7b-base"',
     ]);
   });
@@ -678,10 +679,10 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
     expect(result).toEqual({ ok: true });
     const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
-    expect(modalCall).toBe("showModal:Switch autocomplete endpoint from 'http://old-host:9000' to 'http://127.0.0.1:11434' (backend: Ollama)?");
+    expect(modalCall).toBe("showModal:Switch autocomplete endpoint from 'http://old-host:9000' to 'http://127.0.0.1:11434/' (backend: Ollama)?");
     expect(host.calls.filter((c) => c.startsWith('write:'))).toEqual([
       'write:talaria.autocomplete.backend="ollama"',
-      'write:talaria.autocomplete.endpoint="http://127.0.0.1:11434"',
+      'write:talaria.autocomplete.endpoint="http://127.0.0.1:11434/"',
     ]);
     expect(host.settings.has('talaria.autocomplete.model')).toBe(false);
   });
@@ -813,7 +814,7 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(modalCall).toBeDefined();
     expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
     // the write is still the NEW validated.url -- redaction never touches writes.
-    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434');
+    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434/');
   });
 
   it('CR-003 (FIM applyFim): a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
@@ -856,7 +857,7 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     });
     expect(result).toEqual({ ok: true });
     expect(host.settings.get('talaria.nextEdit.backend')).toBe('openai-compat');
-    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:8000');
+    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:8000/');
     expect(host.settings.get('talaria.nextEdit.model')).toBe('qwen2.5-coder:1.5b-base');
     expect(host.settings.has('talaria.nextEdit.dedicatedBackendId')).toBe(false); // never sent -> never written
   });
@@ -918,7 +919,7 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     expect(modalCall).toBeDefined();
     expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
     // the write is still the NEW validated.url -- redaction never touches writes.
-    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:11434');
+    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:11434/');
   });
 
   it('CR-003 (NEXT dedicated setNextEdit): a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
@@ -946,6 +947,128 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
     expect(modalCall).toContain("from '(none)' to");
   });
+});
+
+// --- L1-I-1 (beta.6 fix-wave T2): the 7-handler unsafe-NEW-endpoint security
+// sweep + the modal-safety invariant. T1 already fixed the ONE chokepoint
+// (`validateEndpointUrl`) every `showModal` site reads — these tests prove
+// the 4 handlers living in THIS file (applyFim, setNextEdit, setRag) never
+// let an unsafe NEW `params.endpoint` reach the modal un-neutralized, and
+// that the WRITTEN setting is always the canonical form. `saveAgentModel`
+// and the three `provisionOllama` arms are covered the same way in their own
+// files (`SetupController.saveAgentModel.test.ts`,
+// `SetupController.provisionModel.test.ts`,
+// `SetupController.provisionModel.fixtures.test.ts`). ------------------------
+
+describe('L1-I-1 T2: unsafe NEW params.endpoint never reaches the modal unsanitized', () => {
+  // U+202E is RIGHT-TO-LEFT OVERRIDE — one of the bidi-override class the
+  // WHATWG parser %-encodes into the path during re-serialization (forge-proof
+  // by construction, not by a hand-maintained blocklist).
+  const bidiOverride = String.fromCharCode(0x202e);
+  const unsafeNewEndpoint = `http://127.0.0.1:11434/${bidiOverride}evil`;
+  const canonicalUnsafeNewEndpoint = 'http://127.0.0.1:11434/%E2%80%AEevil';
+  const userinfoEndpoint = 'http://user:pass@127.0.0.1:11434';
+
+  it('setup.applyFim: a bidi-override NEW endpoint is canonicalized before the modal, and the write is the canonical value', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: unsafeNewEndpoint });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe(canonicalUnsafeNewEndpoint);
+  });
+
+  it('setup.applyFim: userinfo in the NEW endpoint is refused before any modal/write', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: userinfoEndpoint });
+    expect(result).toEqual({
+      ok: false,
+      reason: 'Remove the username:password@ part of the URL — credentials go in the API-key field, not the address.',
+    });
+    expect(host.calls).toEqual([]);
+    expect(host.settings.size).toBe(0);
+  });
+
+  it('setup.setNextEdit: a bidi-override NEW endpoint is canonicalized before the modal, and the write is the canonical value', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: unsafeNewEndpoint,
+      model: 'qwen2.5-coder:1.5b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe(canonicalUnsafeNewEndpoint);
+  });
+
+  it('setup.setNextEdit: userinfo in the NEW endpoint is refused before any modal/write', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: userinfoEndpoint,
+      model: 'x',
+    });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+    expect(host.settings.size).toBe(0);
+  });
+
+  it('setup.setRag: a bidi-override NEW embedEndpoint is canonicalized before the modal, and the write is the canonical value', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedEndpoint: unsafeNewEndpoint });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(host.settings.get('talaria.rag.embedEndpoint')).toBe(canonicalUnsafeNewEndpoint);
+  });
+
+  it('setup.setRag: userinfo in the NEW embedEndpoint is refused before any modal/write', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedEndpoint: userinfoEndpoint });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+    expect(host.settings.size).toBe(0);
+  });
+});
+
+// --- L1-I-1 T2: modal-safety invariant ---------------------------------------
+//
+// Moved here (rather than the PURE `remoteProbe.test.ts`) because it needs
+// `MODAL_UNSAFE_TEXT_PATTERN`, which lives in `SetupController.ts` — importing
+// it into `remoteProbe.test.ts` would drag the whole SetupController graph
+// into that file's otherwise-pure test (critic minor A, T1 brief). The
+// invariant: for every raw endpoint `validateEndpointUrl` accepts, the
+// serialized `.url` it returns can NEVER contain a modal-forging character —
+// this holds by construction (WHATWG re-serialization), not because of a
+// hand-maintained blocklist being complete.
+describe('L1-I-1 T2: modal-safety invariant — validateEndpointUrl(raw).url never carries a MODAL_UNSAFE_TEXT_PATTERN character', () => {
+  const bidiOverride = String.fromCharCode(0x202e);
+  const tabChar = String.fromCharCode(0x09);
+  const UNSAFE_CORPUS = [
+    'http://127.0.0.1\n:11434',
+    `http://127.0.0.1:11434${tabChar}/v1`,
+    `http://127.0.0.1:11434/${bidiOverride}evil`,
+    `http://exam${bidiOverride}ple.com`,
+    'http://user:pass@127.0.0.1:11434',
+    'http://аpple.com', // Cyrillic 'а' homograph — punycoded on serialization
+    'not-a-url',
+    'ftp://127.0.0.1:11434',
+  ];
+
+  for (const raw of UNSAFE_CORPUS) {
+    it(`${JSON.stringify(raw)}: ok:true implies .url carries no unsafe modal character`, () => {
+      const r = validateEndpointUrl(raw);
+      if (r.ok) {
+        expect(MODAL_UNSAFE_TEXT_PATTERN.test(r.url)).toBe(false);
+      } else {
+        expect(r.ok).toBe(false);
+      }
+    });
+  }
 });
 
 // --- CR-003: redactForModal ---------------------------------------------------

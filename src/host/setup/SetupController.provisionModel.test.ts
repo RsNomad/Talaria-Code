@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { SetupController, assertProvisionSources, type SetupHost, type SetupControllerDeps } from './SetupController';
+import {
+  SetupController,
+  assertProvisionSources,
+  MODAL_UNSAFE_TEXT_PATTERN,
+  type SetupHost,
+  type SetupControllerDeps,
+} from './SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend } from './registry';
 import { MODEL_CATALOG } from './modelCatalog';
 import type { LfsOidVerdict } from './hfDigest';
@@ -31,14 +37,14 @@ const DOWNLOAD_UNAVAILABLE =
   "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 const TRUST_REFUSAL = 'Workspace is not trusted — Setup changes are disabled in Restricted Mode.';
 
-const LIBRARY_MODAL = "Pull model 'qwen2.5-coder:1.5b-base' from the Ollama registry onto 'http://127.0.0.1:11434'?";
+const LIBRARY_MODAL = "Pull model 'qwen2.5-coder:1.5b-base' from the Ollama registry onto 'http://127.0.0.1:11434/'?";
 
 // live-oid ollama-ingest modal (§6 row "Provision modal — live-oid", endpoint arm).
 const DEVSTRAL_LIVE_OID_MODAL =
   "Download 'Devstral-24B (2507)' (Q4_K_M, ~14.3 GB) from huggingface.co/mistralai/Devstral-Small-2507_gguf? " +
   'Publisher: Mistral AI — Mistral’s verified Hugging Face organization — the models’ own publisher. ' +
   "Talaria verifies the file's checksum against the publisher's manifest after downloading, " +
-  'and Ollama verifies it again during install at http://127.0.0.1:11434.';
+  'and Ollama verifies it again during install at http://127.0.0.1:11434/.';
 
 // live-oid llamacpp-file modal (§6 row "Provision modal — live-oid", dest arm; dest is ~-redacted).
 const EMBED_LLAMACPP_MODAL =
@@ -290,14 +296,14 @@ describe('T7 step 4b: library tier (qwen25-coder-1.5b via ollama)', () => {
     });
     expect(result).toEqual({ ok: true });
     expect(calls).toEqual([`showModal:${LIBRARY_MODAL}`, 'pullModel']);
-    expect(pullArgs).toEqual([{ endpoint: 'http://127.0.0.1:11434', model: 'qwen2.5-coder:1.5b-base' }]);
+    expect(pullArgs).toEqual([{ endpoint: 'http://127.0.0.1:11434/', model: 'qwen2.5-coder:1.5b-base' }]);
   });
 
   it('endpoint defaults to the registry ollama endpoint when absent', async () => {
     const { controller, pullArgs } = makeProvController();
     const result = await controller.handle('setup.provisionModel', { modelId: 'qwen25-coder-1.5b', backend: 'ollama' });
     expect(result).toEqual({ ok: true });
-    expect(pullArgs).toEqual([{ endpoint: 'http://127.0.0.1:11434', model: 'qwen2.5-coder:1.5b-base' }]);
+    expect(pullArgs).toEqual([{ endpoint: 'http://127.0.0.1:11434/', model: 'qwen2.5-coder:1.5b-base' }]);
   });
 
   it('progress rides id = CATALOG id (not the tag); cancel key = pull:<catalog id>', async () => {
@@ -350,6 +356,41 @@ describe('T7 step 4b: library tier (qwen25-coder-1.5b via ollama)', () => {
     });
     await controller.handle('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' });
     await expect(first).resolves.toEqual({ ok: false, reason: 'cancelled' });
+  });
+});
+
+// --- L1-I-1 (beta.6 fix-wave T2): the library-tier arm of the 7-handler
+// unsafe-NEW-endpoint security sweep ------------------------------------------
+
+describe('L1-I-1 T2: unsafe NEW params.endpoint through the library-tier provisionOllama arm', () => {
+  const bidiOverride = String.fromCharCode(0x202e);
+  const unsafeNewEndpoint = `http://127.0.0.1:11434/${bidiOverride}evil`;
+  const canonicalUnsafeNewEndpoint = 'http://127.0.0.1:11434/%E2%80%AEevil';
+  const userinfoEndpoint = 'http://user:pass@127.0.0.1:11434';
+
+  it('a bidi-override NEW endpoint is canonicalized before the modal, and deps.pullModel gets the canonical endpoint', async () => {
+    const { calls, controller, pullArgs } = makeProvController();
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'qwen25-coder-1.5b',
+      backend: 'ollama',
+      endpoint: unsafeNewEndpoint,
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(pullArgs).toEqual([{ endpoint: canonicalUnsafeNewEndpoint, model: 'qwen2.5-coder:1.5b-base' }]);
+  });
+
+  it('userinfo in the NEW endpoint is refused before any modal/pull', async () => {
+    const { calls, controller } = makeProvController();
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'qwen25-coder-1.5b',
+      backend: 'ollama',
+      endpoint: userinfoEndpoint,
+    });
+    expect(result.ok).toBe(false);
+    expect(calls).toEqual([]);
   });
 });
 
@@ -442,7 +483,7 @@ describe('T7 step 4c (live-oid): devstral-24b via ollama', () => {
           },
           ollamaCreatedName: 'devstral-small-2507:24b',
         },
-        endpoint: 'http://127.0.0.1:11434',
+        endpoint: 'http://127.0.0.1:11434/',
       },
     ]);
   });
@@ -481,6 +522,41 @@ describe('T7 step 4c (live-oid): devstral-24b via ollama', () => {
     expect(second).toEqual({ ok: false, reason: 'pull already running' });
     release();
     await expect(first).resolves.toEqual({ ok: true });
+  });
+});
+
+// --- L1-I-1 (beta.6 fix-wave T2): the live-oid arm of the 7-handler
+// unsafe-NEW-endpoint security sweep ------------------------------------------
+
+describe('L1-I-1 T2: unsafe NEW params.endpoint through the live-oid provisionOllama arm', () => {
+  const bidiOverride = String.fromCharCode(0x202e);
+  const unsafeNewEndpoint = `http://127.0.0.1:11434/${bidiOverride}evil`;
+  const canonicalUnsafeNewEndpoint = 'http://127.0.0.1:11434/%E2%80%AEevil';
+  const userinfoEndpoint = 'http://user:pass@127.0.0.1:11434';
+
+  it('a bidi-override NEW endpoint is canonicalized before the modal, and ingestGguf gets the canonical endpoint', async () => {
+    const { calls, controller, ingestArgs } = makeProvController();
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'devstral-24b',
+      backend: 'ollama',
+      endpoint: unsafeNewEndpoint,
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(ingestArgs[0]?.endpoint).toBe(canonicalUnsafeNewEndpoint);
+  });
+
+  it('userinfo in the NEW endpoint is refused before any modal/ingest', async () => {
+    const { calls, controller } = makeProvController();
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'devstral-24b',
+      backend: 'ollama',
+      endpoint: userinfoEndpoint,
+    });
+    expect(result.ok).toBe(false);
+    expect(calls).toEqual([]);
   });
 });
 

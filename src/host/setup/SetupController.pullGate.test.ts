@@ -220,7 +220,7 @@ describe('T13 vetted-ingest branch (§4.4.3, published pin)', () => {
     expect(ingestArgs).toEqual([
       {
         spec: { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: CREATED },
-        endpoint: 'http://127.0.0.1:11434',
+        endpoint: 'http://127.0.0.1:11434/',
       },
     ]);
   });
