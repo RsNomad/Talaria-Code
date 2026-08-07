@@ -1775,6 +1775,23 @@ describe('status(): rag.endpointDefaults (beta.6 panel-fix PT2)', () => {
   });
 });
 
+describe('status(): agentLocalModel.endpointDefaults drift-lock (beta.6 fix-wave T8)', () => {
+  it('drift-lock: the llamacpp default port equals the port inside LLAMACPP_RUN_FLAGS.agent', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+
+    // Reverse drift-lock (mirrors the RAG drift-lock above): read the
+    // run-flags literal off disk rather than exporting it — a change to
+    // EITHER side without the other breaks this test.
+    const source = readFileSync(join(__dirname, 'SetupController.ts'), 'utf-8');
+    const flagsMatch = source.match(/agent: '--jinja --port (\d+)'/);
+    expect(flagsMatch, 'LLAMACPP_RUN_FLAGS.agent literal not found on disk — has it moved?').not.toBeNull();
+    const agentPort = flagsMatch?.[1];
+
+    expect(data.agentLocalModel?.endpointDefaults?.llamacpp).toBe(`http://127.0.0.1:${agentPort}`);
+  });
+});
+
 describe('status(): assembles SetupData from registry + settings + secrets + ollama probe', () => {
   it('defaults: agent missing, fim ollama, rag defaults, ollama not running', async () => {
     const { controller } = makeController();
