@@ -565,3 +565,82 @@ describe('LocalModelBlock — pinnedDownload (T13, §3.3): the NEXT pinned-model
     expect(screen.queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * beta.6 panel-fix T6 — `onOllamaPullSuccess` (opt-in): fires exactly when
+ * an OLLAMA-pane Pull dispatch resolves with a result ≠ DECLINED. Never on
+ * rejection, never on DECLINED, never on llama.cpp/vLLM Download. OPT-IN —
+ * omitted, the ollama Pull path stays byte-identical.
+ * ------------------------------------------------------------------ */
+
+describe('LocalModelBlock — onOllamaPullSuccess (panel-fix T6)', () => {
+  it('ollama Pull resolves non-DECLINED: calls onOllamaPullSuccess once with the row model', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const onOllamaPullSuccess = vi.fn();
+    const { user } = setup(
+      <LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }), onOllamaPullSuccess })} />,
+    );
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(onOllamaPullSuccess).toHaveBeenCalledTimes(1);
+    expect(onOllamaPullSuccess).toHaveBeenCalledWith(expect.objectContaining({ id: 'qwen25-coder-1.5b' }));
+  });
+
+  it('ollama Pull REJECTS: onOllamaPullSuccess is NOT called, and the error still surfaces on the button', async () => {
+    const dispatch = vi.fn().mockRejectedValue(new Error('boom'));
+    const onOllamaPullSuccess = vi.fn();
+    const { user } = setup(
+      <LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }), onOllamaPullSuccess })} />,
+    );
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(onOllamaPullSuccess).not.toHaveBeenCalled();
+    expect(await screen.findByText('✗ boom')).toBeInTheDocument();
+  });
+
+  it('ollama Pull resolves DECLINED: onOllamaPullSuccess is NOT called (C-2 preserved: no success flash either)', async () => {
+    const dispatch = vi.fn().mockResolvedValue(DECLINED);
+    const onOllamaPullSuccess = vi.fn();
+    const { user } = setup(
+      <LocalModelBlock
+        {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }), onOllamaPullSuccess, ollamaPullSuccessLabel: '✓ nudge' })}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(onOllamaPullSuccess).not.toHaveBeenCalled();
+    expect(screen.queryByText('✓ nudge')).not.toBeInTheDocument();
+  });
+
+  it('llama.cpp Download resolves: onOllamaPullSuccess is NOT called (wrong branch)', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const onOllamaPullSuccess = vi.fn();
+    const { user } = renderBlock({ backend: 'llamacpp', dispatch, onOllamaPullSuccess });
+    await user.click(screen.getByRole('button', { name: /Download Qwen2\.5-Coder/ }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(onOllamaPullSuccess).not.toHaveBeenCalled();
+  });
+
+  it('prop omitted: the ollama Pull still works and nothing throws (byte-identical path)', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const { user } = renderBlock({ dispatch, ollama: ollamaWire({ running: true, models: [] }) });
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
+      modelId: 'qwen25-coder-1.5b',
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+  });
+});

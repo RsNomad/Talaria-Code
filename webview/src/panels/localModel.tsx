@@ -134,6 +134,14 @@ export interface LocalModelBlockProps {
    * not block-rendered). OPT-IN — omitted, behavior is byte-identical.
    */
   pinnedDownload?: { label: string; unavailableReason: string };
+  /**
+   * beta.6 panel-fix (T6): fires exactly when an OLLAMA-pane Pull dispatch
+   * resolves with a result ≠ DECLINED (the same condition as the success
+   * flash). Never on rejection, never on DECLINED, never on llama.cpp/vLLM
+   * Download. The surface owns any snapshot/no-clobber rule. Omitted ⇒
+   * byte-identical behavior.
+   */
+  onOllamaPullSuccess?: (model: SetupCatalogModel) => void;
 }
 
 export function LocalModelBlock(props: LocalModelBlockProps) {
@@ -161,6 +169,7 @@ export function LocalModelBlock(props: LocalModelBlockProps) {
             caption={props.rowCaption?.(model)}
             runCommandCaption={props.runCommandCaption}
             pinnedDownload={props.pinnedDownload}
+            onOllamaPullSuccess={props.onOllamaPullSuccess}
           />
         ))}
       </div>
@@ -299,6 +308,7 @@ function ModelRow({
   caption,
   runCommandCaption,
   pinnedDownload,
+  onOllamaPullSuccess,
 }: {
   model: SetupCatalogModel;
   backend: LocalModelBackend;
@@ -313,6 +323,7 @@ function ModelRow({
   caption?: string;
   runCommandCaption?: string;
   pinnedDownload?: LocalModelBlockProps['pinnedDownload'];
+  onOllamaPullSuccess?: LocalModelBlockProps['onOllamaPullSuccess'];
 }) {
   const live = progress[progressKey('pull', model.id)];
   const percent = pullPercent(live?.totalBytes, live?.completedBytes);
@@ -329,7 +340,13 @@ function ModelRow({
     if (!isPresent) {
       action = {
         label: ollamaPullButtonLabel(model),
-        onRun: () => dispatch('setup.provisionModel', { modelId: model.id, backend: 'ollama', endpoint }),
+        onRun: onOllamaPullSuccess
+          ? () =>
+              dispatch('setup.provisionModel', { modelId: model.id, backend: 'ollama', endpoint }).then((result) => {
+                if (result !== DECLINED) onOllamaPullSuccess(model);
+                return result;
+              })
+          : () => dispatch('setup.provisionModel', { modelId: model.id, backend: 'ollama', endpoint }),
         // §4.1: Ollama rows with no daemon are visible, Pull disabled-with-reason —
         // independent of (but additive to) the trust gate.
         disabledReason: disabledReason ?? (!ollama.running ? OLLAMA_DAEMON_DOWN_PULL_REASON : undefined),
