@@ -39,7 +39,7 @@ source code to a third-party service, this is for you.
 - 🔎 **Codebase-aware** — a local RAG index (LanceDB + tree-sitter) so answers are grounded in *your* actual code.
 - 🧩 **Tools & MCP** — connect [Model Context Protocol](https://modelcontextprotocol.io) servers, and expose the editor's own language intelligence (diagnostics, definitions, references) to the agent.
 - 🕘 **Checkpoints** — snapshot and restore workspace state around agent turns.
-- 📦 **Verified local-model setup** — one panel picks a backend (Ollama / llama.cpp / vLLM), downloads a curated model from a verified publisher with its checksum enforced, and wires it into the agent, autocomplete, and codebase index for you.
+- 📦 **Verified local-model setup** — one panel picks a backend (Ollama / llama.cpp / vLLM), downloads a curated model from a verified publisher with its checksum enforced, wires autocomplete and the codebase index in for you, and sets up the agent model ready to point at your provider.
 - 🔒 **Privacy-first by design** — outbound content is scanned for secrets before it ever leaves; approvals fail *closed*; the agent is confined to the workspace.
 
 ## Privacy & Security
@@ -69,7 +69,7 @@ This is the whole point of Talaria Code, not an afterthought:
 | **VS Code** | `^1.125` |
 | **OS** | Primary target **Linux** (developed on Fedora). The mock UI runs anywhere, but the live backend targets Linux; other platforms are currently untested. |
 | **Python + pipx** | Python **3.11–3.13** and **pipx** on your `PATH`. The **Backend Setup** panel installs the Hermes agent for you via pipx — the extension is a Hermes *client*. On Fedora: `sudo dnf install pipx`. |
-| **A local model runtime** | **Ollama**, **vLLM**, or **llama.cpp**, serving: a chat/agent model (via Hermes), a FIM completion model (default `qwen2.5-coder:1.5b-base`), and an embedding model for RAG (default `qwen3-embedding:0.6b`). The Setup panel detects these backends, downloads and verifies models from a curated catalog, and wires them up for you. |
+| **A local model runtime** | **Ollama**, **vLLM**, or **llama.cpp**, serving: a chat/agent model (via Hermes), a FIM completion model (default `qwen2.5-coder:1.5b-base`), and an embedding model for RAG (default `qwen3-embedding:0.6b`). The Setup panel can detect the Ollama daemon, guides you through llama.cpp/vLLM installs, downloads and verifies models from a curated catalog, wires autocomplete and the codebase index up for you, and sets up the agent model ready to point at your provider. |
 
 ## Installation
 
