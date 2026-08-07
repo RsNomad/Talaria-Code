@@ -207,7 +207,7 @@ function OllamaBackendHeader({
   }
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <StatusLine icon="pass-filled" text={backendReadyText('ollama', ollama.version)} tone="add" />
+      <StatusLine icon="pass-filled" text={backendReadyText('ollama')} tone="add" />
       {/* Ready still offers Re-check (unlike the pre-T10 `OllamaInstallPanel`
           running-branch gap, §0.3) — a daemon can be stopped/restarted
           without a webview reload, and there is no other way to force a

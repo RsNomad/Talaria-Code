@@ -100,8 +100,8 @@ describe('LocalModelBlock — Ollama backend missing', () => {
 
 describe('LocalModelBlock — Ollama backend ready', () => {
   it('renders "Ollama: Ready" and the row immediately (no gating)', () => {
-    renderBlock({ ollama: ollamaWire({ running: true, version: '0.4.1' }) });
-    expect(screen.getByText('Ollama: Ready — 0.4.1')).toBeInTheDocument();
+    renderBlock({ ollama: ollamaWire({ running: true }) });
+    expect(screen.getByText('Ollama: Ready')).toBeInTheDocument();
     expect(screen.getByText('Qwen2.5-Coder 1.5B (base)')).toBeInTheDocument();
   });
 });

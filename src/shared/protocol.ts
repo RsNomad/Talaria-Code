@@ -864,7 +864,7 @@ export interface SetupData {
    * endpoint's presence as `'unknown'`, never inherited (critic C-6).
    * OPTIONAL + additive (Global Constraint 6) — always populated since beta.5.
    */
-  ollama: { running: boolean; version?: string; endpoint?: string; models: { name: string; sizeBytes: number }[] };
+  ollama: { running: boolean; endpoint?: string; models: { name: string; sizeBytes: number }[] };
   /**
    * beta.6 §1.3 (T6): the verified model catalog, projected row-by-row from
    * `MODEL_CATALOG` (13 rows). OPTIONAL + additive (Global Constraint 6) —

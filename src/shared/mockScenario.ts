@@ -614,7 +614,6 @@ export const panelData: PanelDataMap = {
     },
     ollama: {
       running: true,
-      version: '0.4.1',
       models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 986_000_000 }],
     },
     ready: true,

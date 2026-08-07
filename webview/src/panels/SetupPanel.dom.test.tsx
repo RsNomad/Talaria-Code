@@ -258,7 +258,6 @@ function baseData(overrides: Partial<SetupData> = {}): SetupData {
     },
     ollama: {
       running: true,
-      version: '0.4.1',
       endpoint: 'http://127.0.0.1:11434',
       models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 986_000_000 }],
     },
@@ -1536,7 +1535,7 @@ function fimBlockData(overrides: Partial<SetupData> = {}): SetupData {
     fim: { ...baseData().fim, options: [ollamaOption(), llamacppOption(), vllmOption()], selectedId: 'ollama' },
     // Empty daemon list by default so catalog rows are honestly 'not present'
     // (each test overrides as needed).
-    ollama: { running: true, version: '0.4.1', endpoint: 'http://127.0.0.1:11434', models: [] },
+    ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
     catalog: { models: fimCatalog() },
     llamacppRuntime: { binary: 'found', version: 'b4500' },
     ...overrides,
@@ -1566,9 +1565,9 @@ describe('T11 — the card picker IS ① (one picker, never a second one inside 
 });
 
 describe('T11 — Ollama running branch has Re-check (the §0.3 regression-lock)', () => {
-  it('running branch: renders "Ollama: Ready — {version}" AND a [Re-check] button', async () => {
+  it('running branch: renders "Ollama: Ready" AND a [Re-check] button', async () => {
     const { fimCard } = await openFimInstallTab(fimBlockData());
-    expect(within(fimCard).getByText('Ollama: Ready — 0.4.1')).toBeInTheDocument();
+    expect(within(fimCard).getByText('Ollama: Ready')).toBeInTheDocument();
     expect(within(fimCard).getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
   });
 
@@ -1603,7 +1602,7 @@ describe('T11 — THREE catalog fim rows render (1.5b ★ / 7b / 14b), role-filt
 
   it('present→skip: a row already on the daemon shows "present" and no Pull; absent rows keep Pull {tag} (~{size})', async () => {
     const data = fimBlockData({
-      ollama: { running: true, version: '0.4.1', endpoint: 'http://127.0.0.1:11434', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] },
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] },
     });
     const { fimCard } = await openFimInstallTab(data);
     expect(within(fimCard).getByText('present')).toBeInTheDocument();
@@ -1853,7 +1852,7 @@ function agentBlockData(overrides: Partial<SetupData> = {}): SetupData {
   return baseData({
     catalog: { models: agentCatalog() },
     llamacppRuntime: { binary: 'found', version: 'b4500' },
-    ollama: { running: true, version: '0.4.1', endpoint: 'http://127.0.0.1:11434', models: [] },
+    ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
     agentLocalModel: { endpointDefaults: T12_ENDPOINT_DEFAULTS },
     ...overrides,
   });
