@@ -39,6 +39,7 @@ source code to a third-party service, this is for you.
 - 🔎 **Codebase-aware** — a local RAG index (LanceDB + tree-sitter) so answers are grounded in *your* actual code.
 - 🧩 **Tools & MCP** — connect [Model Context Protocol](https://modelcontextprotocol.io) servers, and expose the editor's own language intelligence (diagnostics, definitions, references) to the agent.
 - 🕘 **Checkpoints** — snapshot and restore workspace state around agent turns.
+- 📦 **Verified local-model setup** — one panel picks a backend (Ollama / llama.cpp / vLLM), downloads a curated model from a verified publisher with its checksum enforced, and wires it into the agent, autocomplete, and codebase index for you.
 - 🔒 **Privacy-first by design** — outbound content is scanned for secrets before it ever leaves; approvals fail *closed*; the agent is confined to the workspace.
 
 ## Privacy & Security
@@ -68,7 +69,7 @@ This is the whole point of Talaria Code, not an afterthought:
 | **VS Code** | `^1.125` |
 | **OS** | Primary target **Linux** (developed on Fedora). The mock UI runs anywhere, but the live backend targets Linux; other platforms are currently untested. |
 | **Python + pipx** | Python **3.11–3.13** and **pipx** on your `PATH`. The **Backend Setup** panel installs the Hermes agent for you via pipx — the extension is a Hermes *client*. On Fedora: `sudo dnf install pipx`. |
-| **A local model runtime** | **Ollama**, **vLLM**, or **llama.cpp**, serving: a chat/agent model (via Hermes), a FIM completion model (default `qwen2.5-coder:1.5b-base`), and an embedding model for RAG (default `qwen3-embedding:0.6b`). Ollama can be detected and its models pulled from the Setup panel. |
+| **A local model runtime** | **Ollama**, **vLLM**, or **llama.cpp**, serving: a chat/agent model (via Hermes), a FIM completion model (default `qwen2.5-coder:1.5b-base`), and an embedding model for RAG (default `qwen3-embedding:0.6b`). The Setup panel detects these backends, downloads and verifies models from a curated catalog, and wires them up for you. |
 
 ## Installation
 
@@ -108,7 +109,10 @@ hand-edited JSON, no manual Python installs.
    - **Agent** — pick **Hermes** and click **Install Hermes**. The panel
      installs `hermes-agent[acp]` via pipx, verifies it, writes the paths, and
      offers a one-click window reload to go live. (OpenClaw and Talaria AI are
-     shown as *coming soon*.)
+     shown as *coming soon*.) You can also **configure a local agent model**
+     here — pick from a curated set (**Devstral-24B** is the default), let
+     Talaria download and verify it, then follow the pointer to the provider
+     settings to finish.
    - **Provider** — click **Configure provider** to run Hermes's own setup
      wizard in a terminal and choose the chat model/provider the agent uses.
      Talaria never forces a provider on you.
@@ -116,12 +120,16 @@ hand-edited JSON, no manual Python installs.
      Codestral / OpenAI-compatible). For local-capable backends the card asks
      **"Install locally, or connect to an existing endpoint?"** For Ollama it
      can detect the daemon and pull the default model
-     (`qwen2.5-coder:1.5b-base`) with a live progress bar.
+     (`qwen2.5-coder:1.5b-base`) with a live progress bar. Picking or
+     downloading a model **selects** it — press **Apply** to save the endpoint
+     and model together.
    - **Next Edit** *(optional)* — multi-line next-edit suggestions. **Generic**
      reuses the FIM model you just set up (no extra setup); **Dedicated** uses a
      separate model you set up here.
-   - **Codebase index (RAG)** *(optional)* — enable the local code index and, on
-     Ollama, pull the embedding model (`qwen3-embedding:0.6b`).
+   - **Codebase index (RAG)** *(optional)* — enable the local code index, pick an
+     embedding backend and model, and **Apply** them (on Ollama it can pull the
+     default `qwen3-embedding:0.6b`). The *ready* line appears only once the
+     model is actually present on your configured endpoint.
 
 Until you install a real backend, the extension runs a scripted **mock** backend
 so you can explore the UI with no agent process running — it works on any OS.
