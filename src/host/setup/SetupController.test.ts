@@ -643,6 +643,105 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(result.ok).toBe(false);
     expect(host.calls).toEqual([]);
   });
+
+  // --- T1 (beta.6 panel-fix PT1): optional `model` param -----------------------
+
+  it('T1: model present -> modal names it, and a THIRD write follows the two existing writes', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': 'http://old-host:9000' }),
+    });
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:7b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBe(
+      "showModal:Switch autocomplete endpoint from 'http://old-host:9000' to 'http://127.0.0.1:11434' (backend: Ollama, model: qwen2.5-coder:7b-base)?",
+    );
+    expect(host.calls.filter((c) => c.startsWith('write:'))).toEqual([
+      'write:talaria.autocomplete.backend="ollama"',
+      'write:talaria.autocomplete.endpoint="http://127.0.0.1:11434"',
+      'write:talaria.autocomplete.model="qwen2.5-coder:7b-base"',
+    ]);
+  });
+
+  it('T1: absent model -> byte-identical: exactly the two existing writes, unchanged modal, no third write', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': 'http://old-host:9000' }),
+    });
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBe("showModal:Switch autocomplete endpoint from 'http://old-host:9000' to 'http://127.0.0.1:11434' (backend: Ollama)?");
+    expect(host.calls.filter((c) => c.startsWith('write:'))).toEqual([
+      'write:talaria.autocomplete.backend="ollama"',
+      'write:talaria.autocomplete.endpoint="http://127.0.0.1:11434"',
+    ]);
+    expect(host.settings.has('talaria.autocomplete.model')).toBe(false);
+  });
+
+  it('T1: whitespace-only model is treated as absent -> no third write, unchanged modal', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: '   ',
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.has('talaria.autocomplete.model')).toBe(false);
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).not.toContain('model:');
+  });
+
+  it('T1 sanitation sweep: a C0-control-char model is refused BEFORE any modal, naming the param, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u0007evil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a bidi-override model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u202eevil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: an oversize (>200 char) model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'x'.repeat(201),
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 (C2-10a): llamacpp + model -> accepted-and-written, not special-cased', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'llamacpp',
+      endpoint: 'http://127.0.0.1:8080',
+      model: 'qwen2.5-coder:7b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.get('talaria.autocomplete.backend')).toBe('llamacpp');
+    expect(host.settings.get('talaria.autocomplete.model')).toBe('qwen2.5-coder:7b-base');
+  });
 });
 
 // --- setup.setNextEdit ---------------------------------------------------------
@@ -693,6 +792,20 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     expect(result.ok).toBe(false);
     expect(host.calls).toEqual([]);
   });
+
+  // T1 (beta.6 panel-fix PT1): the shared modal-forging sanitation sweep
+  // applies here too — `model` is interpolated into this modal.
+  it('T1 sanitation sweep: a bidi-override model is refused BEFORE any modal, naming the param, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'sweep\u202eevil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
 });
 
 // --- setup.setRag ----------------------------------------------------------
@@ -721,6 +834,63 @@ describe('setup.setRag: Tier-1 writes', () => {
     const result = await controller.handle('setup.setRag', { embedBackend: 'bogus' });
     expect(result.ok).toBe(false);
     expect(host.calls).toEqual([]);
+  });
+
+  // T1 (beta.6 panel-fix PT1): the shared modal-forging sanitation sweep —
+  // both `embedModel` and `indexDir` are interpolated into the Apply modal.
+  it('T1 sanitation sweep: a zero-width-char embedModel is refused BEFORE any modal, naming the param, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedModel: 'qwen3\u200bevil' });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/embedModel/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a control-char indexDir is refused BEFORE any modal, naming the param, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { indexDir: '.hermes\u0007/index' });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/indexDir/i);
+    expect(host.calls).toEqual([]);
+  });
+});
+
+// --- T1 (beta.6 panel-fix PT1): FIM≠RAG write-path guarantee, both directions --
+
+describe('T1: handleApplyFim / handleSetRag write-path guarantee (full-param spy, both directions)', () => {
+  it('handleApplyFim never writes a key outside talaria.autocomplete.* — every backend, with and without model', async () => {
+    for (const backendId of ['ollama', 'llamacpp', 'vllm', 'codestral', 'openai-compat']) {
+      const descriptor = getBackend(backendId);
+      const endpoint = descriptor?.remote?.endpoint.defaultValue;
+      for (const model of [undefined, 'some-model']) {
+        const { host, controller } = makeController();
+        await controller.handle('setup.applyFim', { backendId, endpoint, ...(model ? { model } : {}) });
+        const writeKeys = host.calls
+          .filter((c) => c.startsWith('write:'))
+          .map((c) => c.slice('write:'.length).match(/^[^=]*/)?.[0] ?? '');
+        for (const k of writeKeys) {
+          expect(k.startsWith('talaria.autocomplete.')).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('handleSetRag never writes a key outside talaria.rag.* — full param surface', async () => {
+    const { host, controller } = makeController();
+    await controller.handle('setup.setRag', {
+      enabled: true,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'qwen3-embedding:0.6b',
+      indexDir: '.hermes/index',
+      embedBackend: 'ollama',
+    });
+    const writeKeys = host.calls
+      .filter((c) => c.startsWith('write:'))
+      .map((c) => c.slice('write:'.length).match(/^[^=]*/)?.[0] ?? '');
+    expect(writeKeys.length).toBeGreaterThan(0);
+    for (const k of writeKeys) {
+      expect(k.startsWith('talaria.rag.')).toBe(true);
+    }
   });
 });
 

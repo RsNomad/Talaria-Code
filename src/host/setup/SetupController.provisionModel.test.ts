@@ -377,6 +377,17 @@ describe('T7: legacy setup.pullModel stays behavior-compatible; runLibraryPull r
     expect(result).toEqual({ ok: false, reason: "model tag must not begin with '-'" });
     expect(calls).not.toContain('pullModel');
   });
+
+  // T1 (beta.6 panel-fix PT1): the modal-forging sanitation sweep runs BEFORE
+  // the Pull modal — an EARLIER gate than the leading-dash check above, never
+  // a looser one. A bidi-override character must never reach the native modal.
+  it('T1 sanitation sweep: a bidi-override free-text model is refused BEFORE the Pull modal, naming the param', async () => {
+    const { controller, calls } = makeProvController();
+    const result = await controller.handle('setup.pullModel', { model: 'qwen2.5-coder\u202eevil:1.5b-base' });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(calls).toEqual([]); // no modal shown, deps.pullModel never called
+  });
 });
 
 // --- step 4c live-oid: the Devstral ingest row (rev 3) -----------------------

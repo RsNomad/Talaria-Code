@@ -511,6 +511,33 @@ function isLoopbackEndpoint(rawUrl: string): boolean {
   }
 }
 
+/** T1 (beta.6 panel-fix PT1): the modal-forging character class — C0/C1
+ *  controls, DEL, zero-width characters + directional marks, and bidi
+ *  embedding/override/isolate controls. Any of these can forge extra lines
+ *  or visually reorder a single-line native `showModal` prompt. */
+const MODAL_UNSAFE_TEXT_PATTERN = /[\x00-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/;
+/** §7/§6 T1: the shared length cap for any free-text value that reaches a modal. */
+const MODAL_TEXT_MAX_LEN = 200;
+
+/**
+ * T1 (beta.6 panel-fix PT1): the shared modal-forging SANITATION SWEEP —
+ * applied to EVERY free-text param that reaches {@link SetupHost.showModal}
+ * BEFORE its modal renders (`applyFim.model`, `setRag.embedModel`,
+ * `setRag.indexDir`, `setNextEdit.model`, `pullModel.model`). `label` names
+ * the offending param in the refusal reason so each call site's failure is
+ * traceable to its own field. Purely additive — never touches endpoint/URL
+ * validation ({@link validateEndpointUrl}) or the download-integrity gates.
+ */
+function refuseUnsafeModalText(value: string, label: string): { ok: true } | { ok: false; reason: string } {
+  if (value.length > MODAL_TEXT_MAX_LEN) {
+    return { ok: false, reason: `${label} is too long (max ${MODAL_TEXT_MAX_LEN} characters).` };
+  }
+  if (MODAL_UNSAFE_TEXT_PATTERN.test(value)) {
+    return { ok: false, reason: `${label} contains characters that are not allowed in a confirmation prompt.` };
+  }
+  return { ok: true };
+}
+
 /** D9: which {@link SetupMethod}s are consequence-bearing mutations, gated
  *  on `host.isTrusted()` (FM-14). Everything else (`setup.status` — handled
  *  outside `handle()` entirely —, `setup.testRemote`, `setup.recheck`,
@@ -1263,15 +1290,31 @@ export class SetupController {
     const validated = validateEndpointUrl(rawEndpoint);
     if (!validated.ok) return { ok: false, reason: validated.reason };
 
+    // T1 (beta.6 panel-fix PT1): optional `model` — trim; sanitize BEFORE the
+    // modal that will interpolate it. Absent/empty ⇒ byte-identical prior
+    // behavior (no third write, unchanged modal). A model supplied with
+    // backendId:'llamacpp' is accepted-and-written, never special-cased
+    // (C2-10a) — the setting is shared across FIM backends.
+    const model = str(params, 'model')?.trim();
+    if (model) {
+      const sanitized = refuseUnsafeModalText(model, 'model');
+      if (!sanitized.ok) return sanitized;
+    }
+
     const oldEndpoint = (this.host.getSetting<string>('talaria.autocomplete.endpoint') ?? '').trim() || '(default)';
     const confirmed = await this.host.showModal(
-      `Switch autocomplete endpoint from '${oldEndpoint}' to '${validated.url}' (backend: ${descriptor.displayName})?`,
+      model
+        ? `Switch autocomplete endpoint from '${oldEndpoint}' to '${validated.url}' (backend: ${descriptor.displayName}, model: ${model})?`
+        : `Switch autocomplete endpoint from '${oldEndpoint}' to '${validated.url}' (backend: ${descriptor.displayName})?`,
       'Apply',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
 
     await this.host.updateSettingGlobal('talaria.autocomplete.backend', backendId);
     await this.host.updateSettingGlobal('talaria.autocomplete.endpoint', validated.url);
+    if (model) {
+      await this.host.updateSettingGlobal('talaria.autocomplete.model', model);
+    }
     return { ok: true };
   }
 
@@ -1371,6 +1414,13 @@ export class SetupController {
     const abort = new AbortController();
     this.inFlight.set(key, abort);
     try {
+      // T1 (beta.6 panel-fix PT1): sanitize BEFORE the modal below — a
+      // STRICTER, EARLIER gate than the leading-'-' check inside
+      // {@link runLibraryPull}, never a looser one; that check stays exactly
+      // where it is. The vetted-ingest branch (step 3, above) never reaches
+      // this modal, so it needs no sanitation of its own.
+      const sanitized = refuseUnsafeModalText(model, 'model');
+      if (!sanitized.ok) return sanitized;
       const confirmed = await this.host.showModal(
         `Pull model '${model}' from the Ollama registry to your local disk?`,
         'Pull',
@@ -2121,6 +2171,9 @@ export class SetupController {
     if (!validated.ok) return { ok: false, reason: validated.reason };
     const model = str(params, 'model')?.trim();
     if (!model) return { ok: false, reason: 'model is required.' };
+    // T1 (beta.6 panel-fix PT1): sanitize BEFORE the modal that interpolates it.
+    const sanitizedModel = refuseUnsafeModalText(model, 'model');
+    if (!sanitizedModel.ok) return sanitizedModel;
     // T8 (beta.6 CC-10): additive, OPTIONAL `dedicatedBackendId` — a strict
     // 4-enum when PRESENT (absent stays absent, no clobber — the restoration
     // fallback stays the existing transport heuristic); a malformed value
@@ -2159,10 +2212,20 @@ export class SetupController {
       if (!validated.ok) return { ok: false, reason: validated.reason };
       patch['talaria.rag.embedEndpoint'] = validated.url;
     }
+    // T1 (beta.6 panel-fix PT1): both are interpolated into the Apply modal
+    // below — sanitize BEFORE they enter the patch (and thus the summary).
     const embedModel = str(params, 'embedModel')?.trim();
-    if (embedModel) patch['talaria.rag.embedModel'] = embedModel;
+    if (embedModel) {
+      const sanitized = refuseUnsafeModalText(embedModel, 'embedModel');
+      if (!sanitized.ok) return sanitized;
+      patch['talaria.rag.embedModel'] = embedModel;
+    }
     const indexDir = str(params, 'indexDir')?.trim();
-    if (indexDir) patch['talaria.rag.indexDir'] = indexDir;
+    if (indexDir) {
+      const sanitized = refuseUnsafeModalText(indexDir, 'indexDir');
+      if (!sanitized.ok) return sanitized;
+      patch['talaria.rag.indexDir'] = indexDir;
+    }
     // T8 (beta.6 CC-10): additive, OPTIONAL `embedBackend` — strict 3-enum.
     const embedBackend = str(params, 'embedBackend');
     if (embedBackend !== undefined) {
