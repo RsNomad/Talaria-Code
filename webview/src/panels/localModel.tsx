@@ -100,8 +100,6 @@ export interface LocalModelBlockProps {
   onSelect?: (id: string) => void;
   /** Surface-specific Pull-success nudge (FIM/RAG each have their own §6 wording) — omit for none. */
   ollamaPullSuccessLabel?: string;
-  /** vLLM's docs link (host-composed, e.g. the registry option's own `docsUrl`). */
-  vllmDocsUrl?: string;
   /**
    * T12 (§3.1): a per-row quiet caption, surface-composed (the Agent picker's
    * Devstral-recommended caption + the A-F7 publisher-provenance caption via
@@ -174,9 +172,7 @@ export function LocalModelBlock(props: LocalModelBlockProps) {
         ))}
       </div>
 
-      {backend !== 'ollama' && (
-        <TestAndServingLine backend={backend} endpoint={endpoint} dispatch={dispatch} vllmDocsUrl={props.vllmDocsUrl} />
-      )}
+      {backend !== 'ollama' && <TestAndServingLine backend={backend} endpoint={endpoint} dispatch={dispatch} />}
     </div>
   );
 }
@@ -490,12 +486,10 @@ export function TestAndServingLine({
   backend,
   endpoint,
   dispatch,
-  vllmDocsUrl,
 }: {
   backend: LocalModelBackend;
   endpoint: string;
   dispatch: LocalModelBlockProps['dispatch'];
-  vllmDocsUrl?: string;
 }) {
   const [servingModels, setServingModels] = useState<string[] | undefined>(undefined);
 
@@ -510,11 +504,6 @@ export function TestAndServingLine({
     <div className="flex flex-col gap-1.5">
       <div className="flex flex-wrap items-center gap-2">
         <ActionButton label={testConnectionLabel(endpoint)} icon="plug" onRun={runTest} successLabel="✓ Endpoint reachable" />
-        {backend === 'vllm' && vllmDocsUrl && (
-          <a href={vllmDocsUrl} className="text-2xs text-accent underline" target="_blank" rel="noreferrer">
-            docs
-          </a>
-        )}
       </div>
       {servingModels && <p className="text-2xs text-muted">{servingLine(servingModels)}</p>}
     </div>

@@ -331,11 +331,14 @@ describe('LocalModelBlock — llama.cpp "everything done" (all rows present)', (
  * §4.1 — vLLM backend
  * ------------------------------------------------------------------ */
 
-describe('LocalModelBlock — vLLM backend (stateless: docs + Test, never "missing")', () => {
-  it('renders Test + docs link regardless of any "status" — vLLM has no missing/checking/ready distinction', () => {
-    renderBlock({ backend: 'vllm', vllmDocsUrl: 'https://docs.vllm.ai/' });
+describe('LocalModelBlock — vLLM backend (stateless: Test, never "missing")', () => {
+  it('renders Test regardless of any "status" — vLLM has no missing/checking/ready distinction', () => {
+    // A13 (queued #5): the block's own `vllmDocsUrl` prop was dead (never
+    // populated by any shipping caller) and has been removed — the real
+    // vLLM "Setup docs" link lives on `FimVllmPane` via the wire's own
+    // `option.docsUrl` (covered by `SetupPanel.dom.test.tsx`), not here.
+    renderBlock({ backend: 'vllm' });
     expect(screen.getByRole('button', { name: /Test connection/ })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /docs/i })).toHaveAttribute('href', 'https://docs.vllm.ai/');
     expect(screen.queryByText(/not detected|missing|Checking/)).not.toBeInTheDocument();
   });
 
@@ -403,7 +406,6 @@ describe('LocalModelBlock — disabledReason gates MUTATING actions only', () =>
       llamacppRuntime: { binary: 'found', version: '1' },
       disabledReason: 'Workspace is not trusted — Setup changes are disabled in Restricted Mode.',
       progress: inFlightProgress,
-      vllmDocsUrl: undefined,
     });
     const download = screen.getByRole('button', { name: /Download Qwen2\.5-Coder/ });
     expect(download).toBeDisabled();

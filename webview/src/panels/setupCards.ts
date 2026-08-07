@@ -1227,8 +1227,11 @@ export interface RoleRec {
  *  is missing — a defaultForRole row with no truthful size does not "resolve"
  *  (B-F7). */
 function baseRoleRec(row: SetupCatalogModel): RoleRec | undefined {
-  if (typeof row.ollamaApproxBytes !== 'number') return undefined;
   const bytes = row.ollamaApproxBytes;
+  // A12 (queued #4): a NaN/negative/zero byte count must gate the strip off
+  // exactly like a missing one — never let a non-finite or non-positive
+  // value reach `formatGiB` and print "~NaN GB" / "~0 GB".
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return undefined;
   const sizeGiB = formatGiB(bytes);
   const llamacppBytes = row.llamacpp?.approxBytes;
   const llamacppGiB = llamacppBytes !== undefined ? formatGiB(llamacppBytes) : undefined;

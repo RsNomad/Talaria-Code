@@ -1655,6 +1655,26 @@ describe('T18 — recs strip pure derivation (§3.5, B-F1..B-F8)', () => {
       );
       expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
     });
+    // A12 (queued #4): `NaN`/`-1`/`0` bytes must gate the strip off exactly
+    // like a missing byte count — never print "~NaN GB" / "~0 GB".
+    it('a defaultForRole row with NaN ollamaApproxBytes does not "resolve" (A12 NaN guard)', () => {
+      const models = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: NaN } : m,
+      );
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('a defaultForRole row with -1 ollamaApproxBytes does not "resolve" (A12 non-positive guard)', () => {
+      const models = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: -1 } : m,
+      );
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('a defaultForRole row with 0 ollamaApproxBytes does not "resolve" (A12 non-positive guard)', () => {
+      const models = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: 0 } : m,
+      );
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
     it('all four defaults present -> resolves', () => {
       expect(deriveRecommendations(setupFixture(FULL_CATALOG))).toBeDefined();
     });

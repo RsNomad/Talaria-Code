@@ -381,6 +381,22 @@ function BackendOptionRow({
   onSelect?: (id: string) => void;
 }) {
   const comingSoon = isComingSoon(option);
+  const className = `flex w-full items-center gap-2 rounded border px-2.5 py-1.5 text-left text-xs transition-colors aria-disabled:cursor-default aria-disabled:opacity-50 disabled:cursor-not-allowed disabled:opacity-50 ${
+    selected ? 'border-accent bg-accent-soft text-accent' : 'border-border bg-overlay text-fg hover:border-accent'
+  }`;
+  const content = (
+    <>
+      <span className="min-w-0 flex-1 truncate">{option.displayName}</span>
+      {comingSoon && <Pill tone="neutral">Coming soon</Pill>}
+    </>
+  );
+  // A19 (C1-13): when there is no `onSelect` (identity rows — e.g. the Agent
+  // card's own options), this row isn't a control at all — render the same
+  // non-interactive span `ModelRow` uses (`localModel.tsx`) instead of a
+  // styled, focusable button whose click was always a no-op.
+  if (!onSelect) {
+    return <span className={className}>{content}</span>;
+  }
   return (
     <button
       type="button"
@@ -389,15 +405,12 @@ function BackendOptionRow({
       aria-pressed={selected}
       title={comingSoon ? 'Coming soon' : undefined}
       onClick={() => {
-        if (comingSoon || !onSelect) return;
+        if (comingSoon) return;
         onSelect(option.id);
       }}
-      className={`flex w-full items-center gap-2 rounded border px-2.5 py-1.5 text-left text-xs transition-colors aria-disabled:cursor-default aria-disabled:opacity-50 disabled:cursor-not-allowed disabled:opacity-50 ${
-        selected ? 'border-accent bg-accent-soft text-accent' : 'border-border bg-overlay text-fg hover:border-accent'
-      }`}
+      className={className}
     >
-      <span className="min-w-0 flex-1 truncate">{option.displayName}</span>
-      {comingSoon && <Pill tone="neutral">Coming soon</Pill>}
+      {content}
     </button>
   );
 }
@@ -1290,8 +1303,14 @@ function FimInstallTab({
       />
     );
   }
-  // vLLM — the only remaining local-capable entry (docs-only flavor, R-1b).
-  return <FimVllmPane option={option} setup={setup} models={fimModels} endpoint={endpoint} progress={progress} dispatch={dispatch} />;
+  if (option.id === 'vllm') {
+    return <FimVllmPane option={option} setup={setup} models={fimModels} endpoint={endpoint} progress={progress} dispatch={dispatch} />;
+  }
+  // A14 (queued #6): the pane switch is explicit and total — an unknown/
+  // unexpected `option.id` with `localInstall` set (a future backend, or a
+  // caller bug) renders NO pane, instead of silently falling through to
+  // vLLM's copy.
+  return null;
 }
 
 /**

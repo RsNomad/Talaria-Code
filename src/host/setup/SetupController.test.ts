@@ -798,10 +798,10 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(host.settings.get('talaria.autocomplete.model')).toBe('qwen2.5-coder:7b-base');
   });
 
-  // --- CR-003: oldEndpoint (read from settings, not PT1-covered) is REDACTED,
-  // not refused, before it reaches the modal -----------------------------------
+  // --- CR-003 (FIM): oldEndpoint (read from settings, not PT1-covered) is
+  // REDACTED, not refused, before it reaches the modal -------------------------
 
-  it('CR-003: a saved endpoint with a newline + bidi override cannot forge a line in the modal, and Apply still succeeds', async () => {
+  it('CR-003 (FIM applyFim): a saved endpoint with a newline + bidi override cannot forge a line in the modal, and Apply still succeeds', async () => {
     const bidiOverride = String.fromCharCode(0x202e);
     const forged = `http://real-host:9000\nWARNING: this is FAKE trusted text${bidiOverride}`;
     const { host, controller } = makeController({
@@ -816,7 +816,7 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434');
   });
 
-  it('CR-003: a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
+  it('CR-003 (FIM applyFim): a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
     const { host, controller } = makeController({
       settings: settingsMap({ 'talaria.autocomplete.endpoint': 'http://old-host:9000' }),
     });
@@ -900,10 +900,10 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     expect(host.calls).toEqual([]);
   });
 
-  // --- CR-003: oldEndpoint (read from settings, not PT1-covered) is REDACTED,
-  // not refused, before it reaches the modal -----------------------------------
+  // --- CR-003 (NEXT dedicated): oldEndpoint (read from settings, not
+  // PT1-covered) is REDACTED, not refused, before it reaches the modal --------
 
-  it('CR-003: a saved endpoint with a newline + bidi override cannot forge a line in the modal, and Apply still succeeds', async () => {
+  it('CR-003 (NEXT dedicated setNextEdit): a saved endpoint with a newline + bidi override cannot forge a line in the modal, and Apply still succeeds', async () => {
     const forged = 'http://real-dedicated:9000\nWARNING: this is FAKE trusted text\u202e';
     const { host, controller } = makeController({
       settings: settingsMap({ 'talaria.nextEdit.endpoint': forged }),
@@ -921,7 +921,7 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:11434');
   });
 
-  it('CR-003: a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
+  it('CR-003 (NEXT dedicated setNextEdit): a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
     const { host, controller } = makeController({
       settings: settingsMap({ 'talaria.nextEdit.endpoint': 'http://old-dedicated:8000' }),
     });
@@ -1124,6 +1124,41 @@ describe('setup.openProviderWizard: runInTerminal(name, <hermesAcp>, ["--setup"]
     expect(result.ok).toBe(false);
     expect(host.terminalsRun).toEqual([]);
     expect(host.calls).toEqual([]); // never even shows the modal
+  });
+
+  // --- CR-003b: hermesAcpPath (derived from talaria.hermesPath, not
+  // PT1-covered) is REDACTED in the modal string, never in the actually-
+  // executed runInTerminal call ---------------------------------------------
+
+  it('CR-003b: a hermesPath with a newline + bidi override cannot forge a line in the modal, but runInTerminal still gets the UNREDACTED derived path', async () => {
+    const forged = '/home/u\nWARNING: this is FAKE trusted text\u202e/bin/hermes';
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.hermesPath': forged }),
+    });
+    const result = await controller.handle('setup.openProviderWizard', {});
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    // the launch itself MUST still use the real, unredacted derived path —
+    // redacting what actually runs would break the terminal launch.
+    expect(host.terminalsRun).toEqual([
+      {
+        name: 'Hermes Provider Setup',
+        shellPath: '/home/u\nWARNING: this is FAKE trusted text\u202e/bin/hermes-acp',
+        args: ['--setup'],
+      },
+    ]);
+  });
+
+  it('CR-003b: a clean hermesPath still renders verbatim in the modal (no over-redaction)', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.hermesPath': '/home/u/.local/share/pipx/venvs/hermes-agent/bin/hermes' }),
+    });
+    const result = await controller.handle('setup.openProviderWizard', {});
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('/home/u/.local/share/pipx/venvs/hermes-agent/bin/hermes-acp');
   });
 });
 

@@ -329,20 +329,41 @@ describe('Agent card — renders every AgentSetupPhase fixture (§6 card 1)', ()
   });
 });
 
-describe('Agent card — coming-soon entries are never selectable (§6)', () => {
-  it('OpenClaw/Talaria AI render disabled with a "Coming soon" pill', () => {
+describe('Agent card — identity options are informational, not selectable (§6, A19/C1-13)', () => {
+  // A19 (C1-13): the Agent card never passes `onSelect` to `BackendOptionRow`
+  // (identity here isn't a click-to-pick control) — every row, including the
+  // non-coming-soon "Hermes" entry, must render as a non-interactive element
+  // exposing NO `button` role, instead of a styled/focusable button whose
+  // click was always a no-op.
+  it('Hermes/OpenClaw/Talaria AI expose no button role', () => {
     renderPanel(baseData());
-    const openclaw = screen.getByRole('button', { name: /OpenClaw/ });
-    expect(openclaw).toBeDisabled();
-    expect(openclaw).toHaveAttribute('aria-disabled', 'true');
-    expect(within(openclaw).getByText('Coming soon')).toBeInTheDocument();
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    expect(within(agentSection).queryByRole('button', { name: 'Hermes' })).not.toBeInTheDocument();
+    expect(within(agentSection).queryByRole('button', { name: /OpenClaw/ })).not.toBeInTheDocument();
+    expect(within(agentSection).queryByRole('button', { name: /Talaria AI/ })).not.toBeInTheDocument();
   });
 
-  it('a click on a coming-soon entry produces NO request', async () => {
+  it('OpenClaw/Talaria AI still render their "Coming soon" pill', () => {
+    renderPanel(baseData());
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    expect(within(agentSection).getAllByText('Coming soon')).toHaveLength(2);
+  });
+
+  it('a click anywhere on a non-interactive row produces NO request', async () => {
     const { user, dispatch } = renderPanel(baseData());
-    const openclaw = screen.getByRole('button', { name: /OpenClaw/ });
-    await user.click(openclaw);
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    await user.click(within(agentSection).getByText('OpenClaw'));
     expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('FIM/NEXT backend pickers — the SELECTABLE case (A19 regression lock: onSelect present still exposes + fires a button)', () => {
+  it('FIM Connect-mode backend row (onSelect present) is still a button and still fires it', async () => {
+    const data = baseData({ fim: { ...baseData().fim, options: [ollamaOption(), codestralOption()], selectedId: 'ollama' } });
+    const { user } = renderPanel(data);
+    const codestral = screen.getByRole('button', { name: 'Codestral' });
+    await user.click(codestral);
+    expect(screen.getByRole('button', { name: 'Codestral' })).toHaveAttribute('aria-pressed', 'true');
   });
 });
 
@@ -386,6 +407,19 @@ describe('FIM card — the two-mode question (§6 card 3)', () => {
       expect(screen.getByText(/Install locally, or connect to an existing endpoint\?/)).toBeInTheDocument();
       unmount();
     }
+  });
+});
+
+describe('FIM card — Install tab pane selection is explicit and total (A14, beta.6 panel-fix)', () => {
+  it('an unknown backend id with localInstall renders no pane (nothing thrown, empty render — never the vLLM fall-through)', async () => {
+    // localInstall set (so the Install tab exists) but the id is neither
+    // 'ollama', 'llamacpp', nor 'vllm' — before A14 this silently fell
+    // through to FimVllmPane's copy; now FimInstallTab returns null.
+    const mystery = ollamaOption({ id: 'mystery', displayName: 'Mystery' });
+    const data = baseData({ fim: { ...baseData().fim, options: [mystery], selectedId: 'mystery' } });
+    const { user } = renderPanel(data);
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    expect(screen.queryByText(/vLLM.s install depends on your GPU\/CUDA setup/)).not.toBeInTheDocument();
   });
 });
 

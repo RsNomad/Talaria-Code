@@ -2074,8 +2074,12 @@ export class SetupController {
     const hermesPath = (this.host.getSetting<string>('talaria.hermesPath') ?? '').trim();
     if (!hermesPath) return { ok: false, reason: 'Hermes is not installed yet — install it first.' };
     const hermesAcpPath = deriveHermesAcpPath(hermesPath);
+    // CR-003b: DISPLAY-ONLY redaction, exactly like CR-003 — the modal
+    // string never lets a forged talaria.hermesPath (newline/bidi override)
+    // inject fake lines; the terminal launch below still gets the real,
+    // unredacted path.
     const confirmed = await this.host.showModal(
-      `Open a terminal running '${hermesAcpPath} --setup' to configure your chat provider?`,
+      `Open a terminal running '${redactForModal(hermesAcpPath)} --setup' to configure your chat provider?`,
       'Open Terminal',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
