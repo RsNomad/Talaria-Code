@@ -717,11 +717,16 @@ export function configuredModelOutsideCatalog(models: readonly Pick<SetupCatalog
   return !models.some((m) => m.ollamaTag !== undefined && ollamaTagsEqual(m.ollamaTag, trimmed));
 }
 
-/** §6 "Post-pull nudge (FIM ollama)" (beta.6 T11) — the FIM surface's OWN
- *  Ollama pull-success wording, passed to the block via
- *  `ollamaPullSuccessLabel` (the block never hardcodes a surface nudge) and
- *  reused verbatim by the CC-8 configured-model row's legacy pull. */
-export const FIM_OLLAMA_PULL_NUDGE = '✓ Downloaded — set it as your FIM model in the Connect tab (Apply).';
+/*
+ * §6 "Post-pull nudge (FIM ollama)" (beta.6 T11) — the FIM surface's OWN
+ * Ollama pull-success wording, passed to the block via `ollamaPullSuccessLabel`
+ * (the block never hardcodes a surface nudge) and reused verbatim by the
+ * CC-8 configured-model row's legacy pull. `FIM_OLLAMA_PULL_NUDGE` itself
+ * moved to the "§8 new/changed model-selection copy" section below (beta.6
+ * panel-fix PT3 CHANGED its text) — this comment stays here as the pointer
+ * so a T11-era reader isn't left looking for a declaration that's no longer
+ * on this line.
+ */
 
 /** §6 "llama.cpp FIM nudge" (beta.6 T11) — rendered by the FIM llama.cpp
  *  pane once any FIM row is present in Talaria's model folder (the "what
@@ -939,6 +944,166 @@ export function ragEmbedPresence(
 ): NextPresence {
   return catalogPresence(ollama, rag.embedEndpoint, { ollamaTag: rag.embedModel });
 }
+
+// --- beta.6 panel-fix PT3 (architecture doc T3, §8): pending-model pure ----
+// helpers + new FIM/RAG model-selection copy. FIM and RAG stay on DIFFERENT
+// models — nothing here converges the two; each caller builds its own key
+// and passes its own saved model.
+
+/**
+ * §8 — row-selection derived from the SAME install target `catalogPresence`
+ * already keys presence off (`ollamaCreatedName ?? ollamaTag`, via
+ * {@link catalogOllamaTarget}), `:latest`-tolerant via {@link ollamaTagsEqual}:
+ * keeps the picker's highlighted row and the free-text model field ONE
+ * derived state instead of two that can silently disagree. Empty/whitespace
+ * `model` -> `undefined` (nothing typed, nothing to match); no matching row
+ * -> `undefined` (a free-typed model outside the catalog, honestly
+ * unselected — never a guessed row).
+ */
+export function catalogRowIdForModel(
+  models: readonly Pick<SetupCatalogModel, 'id' | 'ollamaTag' | 'ollamaCreatedName'>[],
+  model: string,
+): string | undefined {
+  const trimmed = model.trim();
+  if (trimmed === '') return undefined;
+  return models.find((m) => {
+    const target = catalogOllamaTarget(m);
+    return target !== undefined && ollamaTagsEqual(target, trimmed);
+  })?.id;
+}
+
+/**
+ * The FIM/RAG Model field's keyed in-flight draft — the SAME `{key, value}`
+ * discipline as `SetupPanel.tsx`'s own `endpointKey`/`ep` state
+ * (`agentEndpointInit`'s caller, `:786-789`) and {@link DedicatedFormFieldState}
+ * above. `key` folds in whatever must reset the draft — the CALLER builds it
+ * (backend-agnostic here by design): FIM uses `` `${selectedId}|${savedModel}` ``,
+ * RAG uses `` `${pane}|${savedModel}` `` — so a backend/pane switch AND a
+ * saved-value move (Apply landing, an external settings edit) both change
+ * the key and both reconcile, while an in-flight draft at the SAME
+ * backend/pane and SAME saved value survives an unrelated re-render.
+ */
+export interface PendingModelState {
+  key: string;
+  value: string;
+}
+
+export function initPendingModel(key: string, saved: string): PendingModelState {
+  return { key, value: saved };
+}
+
+/**
+ * A no-op while `key` hasn't moved since the last reconcile — the same
+ * identity-preserving rule as {@link reconcileDedicatedFormFields} (`result
+ * === state`, so an in-flight edit survives an unrelated re-render); resets
+ * the draft to `saved` the moment `key` has moved.
+ */
+export function reconcilePendingModel(state: PendingModelState, key: string, saved: string): PendingModelState {
+  if (key === state.key) return state;
+  return initPendingModel(key, saved);
+}
+
+/**
+ * §8 — whether the FIM Connect/Install surface should render a Model field
+ * at all: `false` for `'llamacpp'` (its native `/infill` request carries NO
+ * model name — a field there would be a fake affordance); `true` for every
+ * other FIM backend (ollama/vllm/codestral/openai-compat all send a model
+ * name in the request body). `backendId` is a plain string (the wire's
+ * `SetupBackendOption.id`, not a closed union) — any id other than the one
+ * known no-model-name backend is visible.
+ */
+export function fimModelFieldVisible(backendId: string): boolean {
+  return backendId !== 'llamacpp';
+}
+
+/**
+ * §8 — the RAG embedder section's endpoint field init for one pane: the
+ * SAVED `embedEndpoint` when `pane` IS the saved backend (the `?? 'ollama'`
+ * fallback is REQUIRED — an old-host wire without `embedBackend` must still
+ * init the ollama pane from the always-present saved endpoint, mirroring
+ * {@link ragInitialBackend}'s own default), else that pane's own host-owned
+ * default (`rag.endpointDefaults`, always populated post-PT2; `?.` stays
+ * required by the type for an old-host wire that predates the field
+ * entirely).
+ */
+export function ragEndpointInit(
+  rag: Pick<SetupData['rag'], 'embedBackend' | 'embedEndpoint' | 'endpointDefaults'>,
+  pane: RagEmbedBackend,
+): string {
+  if (pane === (rag.embedBackend ?? 'ollama')) return rag.embedEndpoint;
+  return rag.endpointDefaults?.[pane] ?? '';
+}
+
+/**
+ * §8 — the "you picked a model but haven't saved it" line, rendered under
+ * the catalog picker on both surfaces the moment a row is selected but no
+ * Apply has run yet. Each surface names its OWN save action (`fim`: the
+ * Connect tab's Apply; `rag`: the section's own Apply) — deliberately two
+ * templates, not one generic sentence, so the caption always names the
+ * button that is actually there.
+ */
+export function pendingSelectionLine(surface: 'fim' | 'rag', model: string): string {
+  return surface === 'fim'
+    ? `Selected: ${model} — not saved yet. Apply on the Connect tab saves it.`
+    : `Selected: ${model} — not saved yet. Apply below saves it.`;
+}
+
+/** §8 — shared backend-id -> display-name map, consumed by the saved
+ *  summary line and the Agent block's backend tabs (`SetupPanel.tsx:864`'s
+ *  inline ternary, folded in by a later task). */
+export const BACKEND_DISPLAY: Record<'ollama' | 'llamacpp' | 'vllm' | 'openai-compat', string> = {
+  ollama: 'Ollama',
+  llamacpp: 'llama.cpp',
+  vllm: 'vLLM',
+  'openai-compat': 'OpenAI-compatible',
+};
+
+/** §8 — the RAG card's third tab label: `'openai-compat'` renders the
+ *  block's vLLM pane ({@link ragBlockBackend}), so its tab must name BOTH
+ *  routes it actually offers (Test + run command against either kind of
+ *  server) — kept a DISTINCT named constant, deliberately NOT folded into
+ *  {@link BACKEND_DISPLAY} (flattening it would hide the affordance). */
+export const RAG_THIRD_TAB_LABEL = 'vLLM / OpenAI-compatible';
+
+// --- §8 new/changed model-selection copy (FIM/RAG surfaces, placed by later tasks) --
+
+/** §8 "FIM Ollama pull nudge" — CHANGED (beta.6 panel-fix): now names the
+ *  row-selection this pull ALSO performs ({@link catalogRowIdForModel}), not
+ *  just the download. */
+export const FIM_OLLAMA_PULL_NUDGE =
+  '✓ Downloaded and selected — Apply on the Connect tab saves it as your autocomplete model.';
+
+/** §8 "RAG Ollama pull nudge" — NEW: the RAG surface's own pull-success
+ *  wording (parallel to {@link FIM_OLLAMA_PULL_NUDGE}, distinct verb —
+ *  "embedding model", not "autocomplete model"). */
+export const RAG_OLLAMA_PULL_NUDGE = '✓ Downloaded and selected — Apply below saves it as your embedding model.';
+
+/** §8 "FIM Connect-tab pending caption" — NEW: the short inline caption next
+ *  to a picked-but-unsaved model on the Connect tab (distinct placement from
+ *  {@link pendingSelectionLine}'s full sentence, same fact). */
+export const FIM_PENDING_CAPTION = 'not saved yet';
+
+/** §8 "FIM Model field caption" — NEW. */
+export const FIM_MODEL_FIELD_CAPTION = 'Used for inline completions — separate from the embedding model.';
+
+/** §8 "RAG Model field caption" — NEW. */
+export const RAG_MODEL_FIELD_CAPTION = 'Used to index your codebase — separate from the autocomplete model.';
+
+/** §8 "FIM llama.cpp model note" — NEW: rendered in place of the (hidden,
+ *  {@link fimModelFieldVisible}) Model field on the FIM llama.cpp pane. */
+export const FIM_LLAMACPP_MODEL_NOTE =
+  'llama.cpp serves the model you start llama-server with — no model name is sent.';
+
+/** §8 "RAG llama.cpp model note" — NEW: the RAG surface's own llama.cpp
+ *  no-model-name honesty line (parallel to {@link FIM_LLAMACPP_MODEL_NOTE}). */
+export const RAG_LLAMACPP_MODEL_NOTE =
+  'llama.cpp embeds with the model the server was started with — this name is not used to pick it.';
+
+/** §8 "FIM Model field label" — NEW. */
+export const FIM_MODEL_FIELD_LABEL = 'Model';
+
+/** §8 "RAG Model field label" — NEW. */
+export const RAG_MODEL_FIELD_LABEL = 'Embedding model';
 
 // ---------------------------------------------------------------------------
 // beta.6 T18 (§3.5/§6): start-screen model recommendations —

@@ -1511,7 +1511,9 @@ describe('T11 — THREE catalog fim rows render (1.5b ★ / 7b / 14b), role-filt
       backend: 'ollama',
       endpoint: 'http://127.0.0.1:11434',
     });
-    expect(await within(fimCard).findByText('✓ Downloaded — set it as your FIM model in the Connect tab (Apply).')).toBeInTheDocument();
+    expect(
+      await within(fimCard).findByText('✓ Downloaded and selected — Apply on the Connect tab saves it as your autocomplete model.'),
+    ).toBeInTheDocument();
   });
 });
 

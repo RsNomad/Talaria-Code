@@ -26,6 +26,7 @@ import {
   agentSavedSummaryLine,
   ggufPublisherCaption,
   backendReadyText,
+  BACKEND_DISPLAY,
   buildCopyLogText,
   cancelPullParams,
   CANCEL_LABEL,
@@ -33,6 +34,7 @@ import {
   catalogPresence,
   catalogPresenceText,
   catalogPreselectId,
+  catalogRowIdForModel,
   clampLogTail,
   configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
@@ -40,11 +42,17 @@ import {
   fimDoneLine,
   fimHasLocalInstall,
   fimInstallTestEndpoint,
+  FIM_LLAMACPP_MODEL_NOTE,
   FIM_LLAMACPP_NUDGE,
+  FIM_MODEL_FIELD_CAPTION,
+  FIM_MODEL_FIELD_LABEL,
   FIM_OLLAMA_PULL_NUDGE,
+  FIM_PENDING_CAPTION,
+  fimModelFieldVisible,
   foldSetupProgress,
   formatBytes,
   initDedicatedFormFieldState,
+  initPendingModel,
   isComingSoon,
   llamacppDownloadButtonLabel,
   LLAMACPP_CHECKING_TEXT,
@@ -67,6 +75,7 @@ import {
   OLLAMA_MISSING_TEXT,
   ollamaPullButtonLabel,
   PIPX_INSTALL_DOCS_URL,
+  pendingSelectionLine,
   progressKey,
   provisionModalCopyLiveOid,
   provisionModalCopyPinned,
@@ -75,12 +84,19 @@ import {
   pullPercent,
   PROGRESS_LOG_TAIL_MAX,
   RAG_APPLY_NUDGE,
+  RAG_LLAMACPP_MODEL_NOTE,
+  RAG_MODEL_FIELD_CAPTION,
+  RAG_MODEL_FIELD_LABEL,
+  RAG_OLLAMA_PULL_NUDGE,
+  RAG_THIRD_TAB_LABEL,
   ragBlockBackend,
   ragDoneLine,
   ragEmbedPresence,
+  ragEndpointInit,
   ragInitialBackend,
   recheckScopeParams,
   reconcileDedicatedFormFields,
+  reconcilePendingModel,
   servingLine,
   splitGuidedLine,
   testConnectionLabel,
@@ -1064,8 +1080,10 @@ describe('§6 copy — verbatim + single-sourced (SCOPED source-scan: hand-writt
  * ------------------------------------------------------------------ */
 
 describe('§6 FIM-surface nudges (T11) — verbatim + single-sourced', () => {
-  it('FIM_OLLAMA_PULL_NUDGE — §6 "Post-pull nudge (FIM ollama)"', () => {
-    expect(FIM_OLLAMA_PULL_NUDGE).toBe('✓ Downloaded — set it as your FIM model in the Connect tab (Apply).');
+  it('FIM_OLLAMA_PULL_NUDGE — §8 "FIM Ollama pull nudge" (beta.6 panel-fix PT3: CHANGED to name the row-selection too)', () => {
+    expect(FIM_OLLAMA_PULL_NUDGE).toBe(
+      '✓ Downloaded and selected — Apply on the Connect tab saves it as your autocomplete model.',
+    );
   });
 
   it('FIM_LLAMACPP_NUDGE — §6 "llama.cpp FIM nudge"', () => {
@@ -1843,5 +1861,183 @@ describe('T18 — scoped source-scan: ZERO hardcoded model data in the recs stri
     for (const s of FORBIDDEN_HARDCODED_MODEL_DATA) {
       expect(setupPanelSrc, `found forbidden literal "${s}" in SetupPanel.tsx`).not.toContain(s);
     }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 panel-fix PT3 (architecture doc T3, §8): pending-model pure
+ * helpers + new FIM/RAG model-selection copy. PT4 (FIM surface) and PT5
+ * (RAG surface) wire these in; this file locks the pure logic + verbatim
+ * copy only — no rendering here.
+ * ------------------------------------------------------------------ */
+
+describe('catalogRowIdForModel — row-selection derived from the install target (PT3)', () => {
+  const models = [
+    catalogModel({ id: 'qwen25-coder-1.5b', ollamaTag: 'qwen2.5-coder:1.5b-base', ollamaCreatedName: undefined }),
+    catalogModel({ id: 'devstral-24b', role: 'agent', ollamaTag: undefined, ollamaCreatedName: 'devstral-small-2507:24b' }),
+  ];
+
+  it('exact ollamaTag match', () => {
+    expect(catalogRowIdForModel(models, 'qwen2.5-coder:1.5b-base')).toBe('qwen25-coder-1.5b');
+  });
+
+  it(':latest-tolerant via ollamaTagsEqual', () => {
+    expect(catalogRowIdForModel(models, 'qwen2.5-coder:1.5b-base:latest')).toBe('qwen25-coder-1.5b');
+  });
+
+  it('hf-ingest row matches on ollamaCreatedName', () => {
+    expect(catalogRowIdForModel(models, 'devstral-small-2507:24b')).toBe('devstral-24b');
+  });
+
+  it('empty model -> undefined', () => {
+    expect(catalogRowIdForModel(models, '')).toBeUndefined();
+  });
+
+  it('whitespace-only model -> undefined', () => {
+    expect(catalogRowIdForModel(models, '   ')).toBeUndefined();
+  });
+
+  it('no matching row -> undefined', () => {
+    expect(catalogRowIdForModel(models, 'no-such-model')).toBeUndefined();
+  });
+});
+
+describe("initPendingModel / reconcilePendingModel — keyed-draft-state pair (PT3, mirrors SetupPanel.tsx's own endpointKey/ep pattern)", () => {
+  it('init returns the saved value at the given key', () => {
+    expect(initPendingModel('ollama|qwen', 'qwen')).toEqual({ key: 'ollama|qwen', value: 'qwen' });
+  });
+
+  it('same key -> no-op, keeps the in-flight value (identity-preserving, same rule as reconcileDedicatedFormFields)', () => {
+    const state = { key: 'ollama|qwen', value: 'edited-by-hand' };
+    const result = reconcilePendingModel(state, 'ollama|qwen', 'qwen');
+    expect(result).toBe(state);
+    expect(result.value).toBe('edited-by-hand');
+  });
+
+  it('changed key -> resets the draft to the new saved value (a backend/pane switch)', () => {
+    const state = initPendingModel('ollama|qwen', 'qwen');
+    const result = reconcilePendingModel(state, 'llamacpp|other', 'other');
+    expect(result).toEqual({ key: 'llamacpp|other', value: 'other' });
+  });
+
+  it('a saved-value move at the SAME backend/pane changes the key too, and reconciles (Apply landing / external edit)', () => {
+    // FIM key = `${selectedId}|${savedModel}` — the saved model is folded
+    // into the key itself, so a save landing changes the key even though
+    // selectedId never moved.
+    const state = initPendingModel('ollama|old-model', 'old-model');
+    const result = reconcilePendingModel(state, 'ollama|new-model', 'new-model');
+    expect(result).toEqual({ key: 'ollama|new-model', value: 'new-model' });
+  });
+});
+
+describe('fimModelFieldVisible — llama.cpp native /infill sends no model name (PT3)', () => {
+  it('llamacpp -> false (a field there would be a fake affordance)', () => {
+    expect(fimModelFieldVisible('llamacpp')).toBe(false);
+  });
+
+  it.each(['ollama', 'vllm', 'codestral', 'openai-compat'])('%s -> true (sends a model name in the request body)', (id) => {
+    expect(fimModelFieldVisible(id)).toBe(true);
+  });
+});
+
+describe('ragEndpointInit — RAG embedder section endpoint field init per pane (PT3)', () => {
+  const endpointDefaults = { ollama: 'http://127.0.0.1:11434', llamacpp: 'http://127.0.0.1:8081', 'openai-compat': 'http://127.0.0.1:8000' };
+
+  it('pane === the saved backend -> the saved embedEndpoint', () => {
+    const rag = { embedBackend: 'ollama' as const, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    expect(ragEndpointInit(rag, 'ollama')).toBe('http://saved:1234');
+  });
+
+  it("a DIFFERENT pane -> that pane's own default, not the saved endpoint", () => {
+    const rag = { embedBackend: 'ollama' as const, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    expect(ragEndpointInit(rag, 'llamacpp')).toBe('http://127.0.0.1:8081');
+    expect(ragEndpointInit(rag, 'openai-compat')).toBe('http://127.0.0.1:8000');
+  });
+
+  it("old-host wire (embedBackend absent) -> the ollama pane still inits from the always-present saved endpoint (the '?? ollama' branch)", () => {
+    const rag = { embedBackend: undefined, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    expect(ragEndpointInit(rag, 'ollama')).toBe('http://saved:1234');
+  });
+
+  it('old-host wire (embedBackend absent) -> a non-ollama pane falls to its own default', () => {
+    const rag = { embedBackend: undefined, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    expect(ragEndpointInit(rag, 'llamacpp')).toBe('http://127.0.0.1:8081');
+  });
+
+  it('endpointDefaults present (always, post-PT2) -> the correct per-pane default for every pane', () => {
+    const rag = { embedBackend: 'llamacpp' as const, embedEndpoint: 'http://saved:9999', endpointDefaults };
+    expect(ragEndpointInit(rag, 'ollama')).toBe('http://127.0.0.1:11434');
+    expect(ragEndpointInit(rag, 'openai-compat')).toBe('http://127.0.0.1:8000');
+  });
+
+  it("endpointDefaults absent -> '' for a non-matching pane (defensive; the type requires optional-chaining even though the host always populates it)", () => {
+    const rag = { embedBackend: 'ollama' as const, embedEndpoint: 'http://saved:1234', endpointDefaults: undefined };
+    expect(ragEndpointInit(rag, 'llamacpp')).toBe('');
+  });
+});
+
+describe('pendingSelectionLine — verbatim per surface, {model} interpolated (PT3)', () => {
+  it('fim', () => {
+    expect(pendingSelectionLine('fim', 'qwen2.5-coder:1.5b-base')).toBe(
+      'Selected: qwen2.5-coder:1.5b-base — not saved yet. Apply on the Connect tab saves it.',
+    );
+  });
+
+  it('rag', () => {
+    expect(pendingSelectionLine('rag', 'nomic-embed-text')).toBe(
+      'Selected: nomic-embed-text — not saved yet. Apply below saves it.',
+    );
+  });
+});
+
+describe('BACKEND_DISPLAY / RAG_THIRD_TAB_LABEL — §8 backend display copy (PT3)', () => {
+  it('BACKEND_DISPLAY carries the exact four labels', () => {
+    expect(BACKEND_DISPLAY).toEqual({
+      ollama: 'Ollama',
+      llamacpp: 'llama.cpp',
+      vllm: 'vLLM',
+      'openai-compat': 'OpenAI-compatible',
+    });
+  });
+
+  it('RAG_THIRD_TAB_LABEL stays a distinct constant, NOT folded into BACKEND_DISPLAY', () => {
+    expect(RAG_THIRD_TAB_LABEL).toBe('vLLM / OpenAI-compatible');
+    expect(Object.values(BACKEND_DISPLAY)).not.toContain(RAG_THIRD_TAB_LABEL);
+  });
+});
+
+describe('§8 new/changed model-selection copy — verbatim locks (PT3)', () => {
+  it('RAG_OLLAMA_PULL_NUDGE (new)', () => {
+    expect(RAG_OLLAMA_PULL_NUDGE).toBe('✓ Downloaded and selected — Apply below saves it as your embedding model.');
+  });
+
+  it('FIM_PENDING_CAPTION (new)', () => {
+    expect(FIM_PENDING_CAPTION).toBe('not saved yet');
+  });
+
+  it('FIM_MODEL_FIELD_CAPTION', () => {
+    expect(FIM_MODEL_FIELD_CAPTION).toBe('Used for inline completions — separate from the embedding model.');
+  });
+
+  it('RAG_MODEL_FIELD_CAPTION', () => {
+    expect(RAG_MODEL_FIELD_CAPTION).toBe('Used to index your codebase — separate from the autocomplete model.');
+  });
+
+  it('FIM_LLAMACPP_MODEL_NOTE', () => {
+    expect(FIM_LLAMACPP_MODEL_NOTE).toBe('llama.cpp serves the model you start llama-server with — no model name is sent.');
+  });
+
+  it('RAG_LLAMACPP_MODEL_NOTE', () => {
+    expect(RAG_LLAMACPP_MODEL_NOTE).toBe(
+      'llama.cpp embeds with the model the server was started with — this name is not used to pick it.',
+    );
+  });
+
+  it('FIM_MODEL_FIELD_LABEL', () => {
+    expect(FIM_MODEL_FIELD_LABEL).toBe('Model');
+  });
+
+  it('RAG_MODEL_FIELD_LABEL', () => {
+    expect(RAG_MODEL_FIELD_LABEL).toBe('Embedding model');
   });
 });
