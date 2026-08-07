@@ -16,7 +16,9 @@ import { NEXT_EDIT_ROWS } from './nextEditCopy';
 import { SetupPanel } from './SetupPanel';
 import {
   agentPhaseLabel,
+  FIM_LLAMACPP_MODEL_NOTE,
   NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
+  pendingSelectionLine,
   PIPX_INSTALL_DOCS_URL,
   PYTHON_VERSION_HELP_URL,
   TRUST_DISABLED_REASON,
@@ -1447,12 +1449,14 @@ async function openFimInstallTab(data: SetupData, pickerName?: string) {
 }
 
 describe('T11 — the card picker IS ① (one picker, never a second one inside the Install tab)', () => {
-  it('renders exactly ONE selectable "Ollama" backend row in the FIM card, and catalog rows are NOT buttons', async () => {
+  it('renders exactly ONE selectable "Ollama" BACKEND row in the FIM card; catalog rows are MODEL selectors, not a second backend picker', async () => {
     const { fimCard } = await openFimInstallTab(fimBlockData());
     expect(within(fimCard).getAllByRole('button', { name: 'Ollama' })).toHaveLength(1);
-    // Informational rows (no in-block picker): the display name is plain text.
-    expect(within(fimCard).getByText('Qwen2.5-Coder 1.5B (base)')).toBeInTheDocument();
-    expect(within(fimCard).queryByRole('button', { name: 'Qwen2.5-Coder 1.5B (base)' })).not.toBeInTheDocument();
+    // beta.6 panel-fix PT4: catalog rows are now SELECTABLE (the pending-
+    // model draft, §3.2) — a MODEL pick, named by the model's displayName,
+    // never a second backend named 'Ollama'. T11's one-backend-picker rule
+    // holds via the length assertion above.
+    expect(within(fimCard).getByRole('button', { name: 'Qwen2.5-Coder 1.5B (base)' })).toHaveAttribute('aria-pressed');
   });
 });
 
@@ -3035,5 +3039,240 @@ describe('T18 — RecommendationsBlock strip (§3.5)', () => {
       expect(within(nextCard).queryByLabelText('Endpoint')).not.toBeInTheDocument();
       scrollSpy.mockRestore();
     });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 panel-fix PT4 (architecture T4, §3.2): the FIM card's model-
+ * selection surface — Connect-tab Model field, selectable catalog rows,
+ * the one pending draft, and the honest presence-scoped done line.
+ * FIM ≠ RAG: nothing here may ever touch a `talaria.rag.*` write —
+ * `setup.applyFim` is the ONLY save this surface dispatches.
+ * ------------------------------------------------------------------ */
+
+/** A library-tier FIM catalog row matching `baseData()`'s SAVED fim.model. */
+function qwenFimRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'qwen-fim',
+    role: 'fim',
+    displayName: 'Qwen2.5 Coder 1.5B (base)',
+    publisher: 'Qwen',
+    license: 'Apache-2.0',
+    defaultForRole: true,
+    vramLine: '~1 GB',
+    progressId: 'qwen-fim',
+    ollamaTag: 'qwen2.5-coder:1.5b-base',
+    ollamaApproxBytes: 986_000_000,
+    ...overrides,
+  };
+}
+
+/** A second FIM row that is NOT on the fixture daemon — its Pull is live. */
+function deepseekFimRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'deepseek-fim',
+    role: 'fim',
+    displayName: 'DeepSeek Coder 6.7B (base)',
+    publisher: 'DeepSeek',
+    license: 'MIT',
+    vramLine: '~4 GB',
+    progressId: 'deepseek-fim',
+    ollamaTag: 'deepseek-coder:6.7b-base',
+    ollamaApproxBytes: 3_800_000_000,
+    ...overrides,
+  };
+}
+
+/** `baseData` + a role-filtered FIM catalog (qwen = saved/present, deepseek = pullable). */
+function fimSelectionData(overrides: Partial<SetupData> = {}): SetupData {
+  return baseData({
+    catalog: { models: [sweepNextRow(), qwenFimRow(), deepseekFimRow()] },
+    ...overrides,
+  });
+}
+
+function fimCardEl() {
+  return must(screen.getByText('Autocomplete (FIM)').closest('section'));
+}
+
+describe('PT4 — FIM Connect-tab Model field (§3.2)', () => {
+  it('(b) Apply carries the trimmed pending model in params (visible-value rule)', async () => {
+    const { user, dispatch } = renderPanel(fimSelectionData());
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'starcoder2:3b');
+    await user.click(within(fimCardEl()).getByRole('button', { name: 'Apply' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'starcoder2:3b',
+    });
+  });
+
+  it('(c) an EMPTY Model field omits the model key entirely — Apply never writes an empty model', async () => {
+    const { user, dispatch } = renderPanel(fimSelectionData());
+    await user.clear(screen.getByRole('textbox', { name: 'Model' }));
+    await user.click(within(fimCardEl()).getByRole('button', { name: 'Apply' }));
+    const call = dispatch.mock.calls.find((c) => c[0] === 'setup.applyFim');
+    expect(call?.[1]).toEqual({ backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(call?.[1]).not.toHaveProperty('model');
+  });
+
+  it('(e) llamacpp Connect tab: NO Model field — the honest no-model-name note instead', () => {
+    renderPanel(baseData({ fim: { ...baseData().fim, options: [llamacppOption()], selectedId: 'llamacpp' } }));
+    expect(screen.queryByRole('textbox', { name: 'Model' })).not.toBeInTheDocument();
+    expect(screen.getByText(FIM_LLAMACPP_MODEL_NOTE)).toBeInTheDocument();
+  });
+
+  it('(h) after typing a draft, switching to llamacpp and Applying never carries a model key (C1-1)', async () => {
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption(), llamacppOption()], selectedId: 'ollama' },
+    });
+    const { user, dispatch } = renderPanel(data);
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'starcoder2:3b');
+    await user.click(screen.getByRole('button', { name: 'llama.cpp' }));
+    await user.click(within(fimCardEl()).getByRole('button', { name: 'Apply' }));
+    const call = dispatch.mock.calls.find((c) => c[0] === 'setup.applyFim');
+    expect(call?.[1]).toEqual({ backendId: 'llamacpp', endpoint: 'http://127.0.0.1:8012' });
+    expect(call?.[1]).not.toHaveProperty('model');
+  });
+
+  it('(i) a backend switch resets the pending draft to the SAVED model (C1-4)', async () => {
+    const { user } = renderPanel(fimSelectionData());
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'starcoder2:3b');
+    await user.click(screen.getByRole('button', { name: 'Codestral' }));
+    expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('qwen2.5-coder:1.5b-base');
+  });
+
+  it('(g) an EXTERNAL fim.selectedId change re-highlights the backend picker (A6)', () => {
+    const dispatch = vi.fn().mockResolvedValue(undefined);
+    const mk = (d: SetupData) => (
+      <SetupPanel
+        data={{ status: 'success', data: d }}
+        onRetry={noopRetry}
+        progress={{}}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />
+    );
+    const { rerender } = render(mk(fimSelectionData()));
+    expect(screen.getByRole('button', { name: 'Ollama' })).toHaveAttribute('aria-pressed', 'true');
+    rerender(mk(fimSelectionData({ fim: { ...baseData().fim, selectedId: 'codestral' } })));
+    expect(screen.getByRole('button', { name: 'Codestral' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'Ollama' })).toHaveAttribute('aria-pressed', 'false');
+  });
+});
+
+describe('PT4 — FIM Install-tab selectable rows + pending draft (§3.2)', () => {
+  it('(a) catalog Pull success selects the row: highlight + pending line + Connect Model field — and NO settings write (pull ≠ save)', async () => {
+    const { user, dispatch } = renderPanel(fimSelectionData());
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: /^Pull deepseek-coder:6\.7b-base/ }));
+    const row = screen.getByRole('button', { name: 'DeepSeek Coder 6.7B (base)' });
+    await waitFor(() => expect(row).toHaveAttribute('aria-pressed', 'true'));
+    expect(screen.getByText(pendingSelectionLine('fim', 'deepseek-coder:6.7b-base'))).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('deepseek-coder:6.7b-base');
+    // The ONLY dispatch was the pull itself — no applyFim, no settings write.
+    expect(dispatch.mock.calls.map((c) => c[0])).toEqual(['setup.provisionModel']);
+  });
+
+  it('(d) free text un-highlights every catalog row (selection is DERIVED from the draft)', async () => {
+    const { user } = renderPanel(fimSelectionData());
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    // The saved model matches the qwen row — highlighted via the derived rule.
+    expect(screen.getByRole('button', { name: 'Qwen2.5 Coder 1.5B (base)' })).toHaveAttribute('aria-pressed', 'true');
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'my-custom-model');
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    for (const name of ['Qwen2.5 Coder 1.5B (base)', 'DeepSeek Coder 6.7B (base)']) {
+      expect(screen.getByRole('button', { name })).toHaveAttribute('aria-pressed', 'false');
+    }
+  });
+
+  it('(j) a pull completing AFTER a newer free-text edit does NOT overwrite it (C1-6 snapshot/no-clobber)', async () => {
+    let resolvePull: ((v: unknown) => void) | undefined;
+    const dispatch = vi.fn().mockImplementation((method: SetupMethod) =>
+      method === 'setup.provisionModel'
+        ? new Promise((resolve) => {
+            resolvePull = resolve;
+          })
+        : Promise.resolve(undefined),
+    );
+    const { user } = renderPanel(fimSelectionData(), {
+      dispatch: dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>,
+    });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: /^Pull deepseek-coder:6\.7b-base/ }));
+    // A newer edit lands while the multi-GB pull is still in flight.
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'my-newer-choice');
+    await act(async () => {
+      must(resolvePull)(undefined);
+    });
+    expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('my-newer-choice');
+  });
+
+  it("(k) the ConfiguredModelRow's pull success selects ITS (out-of-catalog) model (C1-2)", async () => {
+    const data = fimSelectionData({
+      fim: { ...baseData().fim, model: 'my-legacy-model' },
+      ollama: { ...baseData().ollama, models: [] },
+    });
+    const { user, dispatch } = renderPanel(data);
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'typed-draft');
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull my-legacy-model' }));
+    await waitFor(() =>
+      expect(dispatch).toHaveBeenCalledWith('setup.pullModel', { model: 'my-legacy-model', endpoint: 'http://127.0.0.1:11434' }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('my-legacy-model'));
+  });
+});
+
+describe('PT4 — FIM done line is endpoint-scoped presence for ollama (audit A4)', () => {
+  const FIM_GREEN = '✓ Autocomplete is active — open a file and start typing.';
+
+  it('daemon down ⇒ NO green line', () => {
+    renderPanel(baseData({ ollama: { ...baseData().ollama, running: false } }));
+    expect(screen.queryByText(FIM_GREEN)).not.toBeInTheDocument();
+  });
+
+  it('model absent from the daemon ⇒ NO green line', () => {
+    renderPanel(baseData({ ollama: { ...baseData().ollama, models: [] } }));
+    expect(screen.queryByText(FIM_GREEN)).not.toBeInTheDocument();
+  });
+
+  it('saved endpoint ≠ probed endpoint ⇒ NO green line (unknown, never a guess)', () => {
+    const opt = ollamaOption({ remote: { ...must(ollamaOption().remote), endpointValue: 'http://127.0.0.1:9999' } });
+    renderPanel(baseData({ fim: { ...baseData().fim, options: [opt, codestralOption()], selectedId: 'ollama' } }));
+    expect(screen.queryByText(FIM_GREEN)).not.toBeInTheDocument();
+  });
+
+  it('present at the saved endpoint ⇒ green', () => {
+    renderPanel(baseData());
+    expect(screen.getByText(FIM_GREEN)).toBeInTheDocument();
+  });
+
+  it('non-ollama backend: TODAY\'s auth-based rule, presence never consulted (daemon down stays green)', () => {
+    const withKey = codestralOption({ remote: { ...must(codestralOption().remote), apiKeySet: true } });
+    renderPanel(
+      baseData({
+        fim: { ...baseData().fim, options: [withKey], selectedId: 'codestral' },
+        ollama: { ...baseData().ollama, running: false },
+      }),
+    );
+    expect(screen.getByText(FIM_GREEN)).toBeInTheDocument();
   });
 });

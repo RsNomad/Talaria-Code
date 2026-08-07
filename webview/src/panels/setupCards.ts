@@ -301,11 +301,22 @@ function fimAuthSatisfied(option: SetupBackendOption | undefined): boolean {
  * the boolean itself never crosses the wire (only the ALL-cards composite
  * `ready` does, and that also folds in agent+provider, which this per-card
  * line must not).
+ *
+ * beta.6 panel-fix PT4 (audit A4, the `ragDoneLine` rule): when the SAVED
+ * backend is **ollama**, green additionally requires the configured model
+ * PROVEN `'present'` at the wire's SAVED endpoint (`presence` = the
+ * caller's endpoint-scoped {@link catalogPresence} derivation). `'absent'`
+ * and `'unknown'` both render NO line — an "active" claim the panel can't
+ * verify would be a lie, and an unverifiable state must not claim broken
+ * either. Non-ollama backends keep the auth-based rule unchanged and never
+ * consult `presence` (their call sites may pass `'unknown'`).
  */
-export function fimDoneLine(fim: SetupData['fim']): string {
+export function fimDoneLine(fim: SetupData['fim'], presence: NextPresence): string {
   const option = fim.options.find((o) => o.id === fim.selectedId);
   const green = option !== undefined && option.status === 'available' && fim.enabled && fimAuthSatisfied(option);
-  return green ? '✓ Autocomplete is active — open a file and start typing.' : '';
+  if (!green) return '';
+  if (fim.selectedId === 'ollama' && presence !== 'present') return '';
+  return '✓ Autocomplete is active — open a file and start typing.';
 }
 
 /** Card 4 — NEXT: one line per active source, empty while `'off'`. */
@@ -370,7 +381,11 @@ function normalizeOllamaTag(tag: string): string {
   return lower.endsWith(':latest') ? lower.slice(0, -':latest'.length) : lower;
 }
 
-function ollamaTagsEqual(a: string, b: string): boolean {
+/** Exported since beta.6 panel-fix PT4: the FIM Install pane's pending-vs-
+ *  saved comparison must use the SAME normalization presence/row-matching
+ *  already use — two ad-hoc comparisons would silently disagree on
+ *  `:latest`. */
+export function ollamaTagsEqual(a: string, b: string): boolean {
   return normalizeOllamaTag(a) === normalizeOllamaTag(b);
 }
 

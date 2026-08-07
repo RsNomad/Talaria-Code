@@ -386,19 +386,11 @@ function fimData(overrides: Partial<SetupData['fim']> = {}): SetupData['fim'] {
   };
 }
 
-describe("fimDoneLine — B5 done line (§6), mirrors SetupController's own fimGreen", () => {
-  it('is the exact §6 copy when the selected backend is available + enabled + auth satisfied (no remote entry at all)', () => {
-    expect(fimDoneLine(fimData())).toBe('✓ Autocomplete is active — open a file and start typing.');
-  });
-  it('is empty when the FIM toggle is off', () => {
-    expect(fimDoneLine(fimData({ enabled: false }))).toBe('');
-  });
-  it('is empty when the selected option is coming-soon', () => {
-    const data = fimData({ options: [fimOption({ id: 'ollama', status: 'coming-soon' })] });
-    expect(fimDoneLine(data)).toBe('');
-  });
-  it('is empty when apiKey-required and no key is set', () => {
-    const data = fimData({
+describe("fimDoneLine — B5 done line (§6), presence-honest for ollama (beta.6 panel-fix PT4, audit A4)", () => {
+  const FIM_GREEN = '✓ Autocomplete is active — open a file and start typing.';
+  const ALL_PRESENCES = ['present', 'absent', 'unknown'] as const;
+  const codestralWithKey = (apiKeySet: boolean) =>
+    fimData({
       options: [
         fimOption({
           id: 'codestral',
@@ -407,36 +399,40 @@ describe("fimDoneLine — B5 done line (§6), mirrors SetupController's own fimG
             endpointValue: '',
             endpointPlaceholder: '',
             auth: 'apiKey-required',
-            apiKeySet: false,
+            apiKeySet,
             probe: 'none',
           },
         }),
       ],
       selectedId: 'codestral',
     });
-    expect(fimDoneLine(data)).toBe('');
+
+  it('ollama: green ONLY when presence === present (mirrors ragDoneLine)', () => {
+    expect(fimDoneLine(fimData(), 'present')).toBe(FIM_GREEN);
   });
-  it('is green once apiKey-required AND a key IS set', () => {
-    const data = fimData({
-      options: [
-        fimOption({
-          id: 'codestral',
-          remote: {
-            endpointDefault: 'https://codestral.mistral.ai',
-            endpointValue: '',
-            endpointPlaceholder: '',
-            auth: 'apiKey-required',
-            apiKeySet: true,
-            probe: 'none',
-          },
-        }),
-      ],
-      selectedId: 'codestral',
-    });
-    expect(fimDoneLine(data)).toBe('✓ Autocomplete is active — open a file and start typing.');
+  it("ollama: 'absent' and 'unknown' render NO line — never a green claim the panel can't verify", () => {
+    expect(fimDoneLine(fimData(), 'absent')).toBe('');
+    expect(fimDoneLine(fimData(), 'unknown')).toBe('');
+  });
+  it('ollama: presence present does NOT override the enabled/status gate', () => {
+    expect(fimDoneLine(fimData({ enabled: false }), 'present')).toBe('');
+    const comingSoon = fimData({ options: [fimOption({ id: 'ollama', status: 'coming-soon' })] });
+    expect(fimDoneLine(comingSoon, 'present')).toBe('');
+  });
+  // C2-10b byte-identity pin: non-ollama backends keep TODAY'S auth-based
+  // rule, presence NEVER consulted — same output for every presence value.
+  it('non-ollama: green for EVERY presence value once available + enabled + auth satisfied', () => {
+    for (const presence of ALL_PRESENCES) {
+      expect(fimDoneLine(codestralWithKey(true), presence)).toBe(FIM_GREEN);
+    }
+  });
+  it('non-ollama: empty for EVERY presence value while apiKey-required and no key is set', () => {
+    for (const presence of ALL_PRESENCES) {
+      expect(fimDoneLine(codestralWithKey(false), presence)).toBe('');
+    }
   });
   it('is empty when the selected id matches no option (defensive, never throws)', () => {
-    expect(fimDoneLine(fimData({ selectedId: 'missing' }))).toBe('');
+    expect(fimDoneLine(fimData({ selectedId: 'missing' }), 'present')).toBe('');
   });
 });
 

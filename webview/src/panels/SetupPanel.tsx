@@ -59,18 +59,25 @@ import {
   CATALOG_DEFAULT_CHIP_LABEL,
   catalogPresence,
   catalogPresenceText,
+  catalogRowIdForModel,
   configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
   dedicatedInitialCandidateId,
   // beta.6 T18 (§3.5) — start-screen model recommendations
   deriveRecommendations,
   divergenceCaptionText,
+  FIM_LLAMACPP_MODEL_NOTE,
   FIM_LLAMACPP_NUDGE,
+  FIM_MODEL_FIELD_CAPTION,
+  FIM_MODEL_FIELD_LABEL,
   FIM_OLLAMA_PULL_NUDGE,
+  FIM_PENDING_CAPTION,
   fimDoneLine,
   fimHasLocalInstall,
   fimInstallTestEndpoint,
+  fimModelFieldVisible,
   initDedicatedFormFieldState,
+  initPendingModel,
   isComingSoon,
   meterSegments,
   mutationDisabledReason,
@@ -84,6 +91,8 @@ import {
   nextModelLine,
   nextPresence,
   nextPresenceText,
+  ollamaTagsEqual,
+  pendingSelectionLine,
   PIPX_INSTALL_DOCS_URL,
   progressKey,
   providerDoneLine,
@@ -100,6 +109,7 @@ import {
   RECS_STRIP_HEADING,
   RECS_STRIP_INTRO,
   reconcileDedicatedFormFields,
+  reconcilePendingModel,
   roleLineText,
   splitGuidedLine,
   stackLineText,
@@ -390,11 +400,16 @@ function TextField({
   value,
   onChange,
   placeholder,
+  describedBy,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
+  /** id of an external caption element — `aria-describedby` plumbing
+   *  (beta.6 panel-fix PT4, critic C1-15). The CALLER owns rendering an
+   *  element with this id; omitted ⇒ byte-identical behavior. */
+  describedBy?: string;
 }) {
   return (
     <label className="flex flex-col gap-1 text-2xs text-muted">
@@ -403,6 +418,7 @@ function TextField({
         type="text"
         value={value}
         placeholder={placeholder}
+        aria-describedby={describedBy}
         onChange={(e) => onChange(e.target.value)}
         className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg"
       />
@@ -972,9 +988,44 @@ function FimCard({
   disabledReason?: string;
 }) {
   const fim = setup.fim;
-  const [selectedId, setSelectedId] = useState(fim.selectedId);
+  // A6 (beta.6 panel-fix PT4): the picker highlight is reconciled against
+  // the WIRE's saved `selectedId` with the same keyed adjust-while-rendering
+  // idiom as the endpoint fields — an external settings edit re-highlights
+  // the picker; an in-flight local browse survives unrelated re-renders.
+  const [sel, setSel] = useState(() => ({ wireId: fim.selectedId, id: fim.selectedId }));
+  if (sel.wireId !== fim.selectedId) setSel({ wireId: fim.selectedId, id: fim.selectedId });
+  const selectedId = sel.id;
   const [mode, setMode] = useState<'connect' | 'install'>('connect');
   const option = fim.options.find((o) => o.id === selectedId) ?? fim.options[0];
+
+  // §3.2 (PT4): the card's ONE pending-model draft, shared by the Connect
+  // tab's Model field and the Install tab's row selection/pulls. Keyed
+  // `${selectedId}|${saved}` — a backend switch resets the draft to saved,
+  // an Apply landing / external edit reconciles, an in-flight edit survives
+  // unrelated re-renders (the PT3 pure pair, `setupCards.ts`).
+  const pendingKey = `${selectedId}|${fim.model}`;
+  const [pendingState, setPendingState] = useState(() => initPendingModel(pendingKey, fim.model));
+  const pending = reconcilePendingModel(pendingState, pendingKey, fim.model);
+  if (pending !== pendingState) setPendingState(pending);
+  const pendingModel = pending.value;
+  const setPendingModel = (value: string) => setPendingState({ key: pendingKey, value });
+  // C1-6 snapshot/no-clobber: a pull's success only adopts the pulled target
+  // if the draft is UNCHANGED since the pull was clicked (`snapshot` = the
+  // click-render's value) — a free-text edit typed during a multi-GB pull is
+  // never silently overwritten.
+  const adoptPulledModel = (snapshot: string, target: string) =>
+    setPendingState((prev) => (prev.value === snapshot ? { key: prev.key, value: target } : prev));
+
+  // Audit A4: the done line's presence is computed against the WIRE's SAVED
+  // backend + endpoint (never the Connect tab's live field) — only an
+  // ollama-configured card consults it; `fimDoneLine` ignores it otherwise.
+  const wireOption = fim.options.find((o) => o.id === fim.selectedId);
+  const donePresence: NextPresence =
+    fim.selectedId === 'ollama'
+      ? catalogPresence(setup.ollama, wireOption?.remote?.endpointValue || wireOption?.remote?.endpointDefault || '', {
+          ollamaTag: fim.model,
+        })
+      : 'unknown';
 
   if (!option) {
     return (
@@ -989,7 +1040,7 @@ function FimCard({
 
   return (
     <Card title="Autocomplete (FIM)" id="setup-card-fim">
-      <DoneLine text={fimDoneLine(fim)} className="mb-2" />
+      <DoneLine text={fimDoneLine(fim, donePresence)} className="mb-2" />
       <div className="mb-2 flex flex-col gap-1.5">
         {fim.options.map((o) => (
           <BackendOptionRow
@@ -997,7 +1048,7 @@ function FimCard({
             option={o}
             selected={o.id === option.id}
             onSelect={(id) => {
-              setSelectedId(id);
+              setSel({ wireId: fim.selectedId, id });
               setMode('connect');
             }}
           />
@@ -1033,29 +1084,86 @@ function FimCard({
       )}
 
       {showInstallTab ? (
-        <FimInstallTab key={option.id} option={option} setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+        <FimInstallTab
+          key={option.id}
+          option={option}
+          setup={setup}
+          progress={progress}
+          dispatch={dispatch}
+          disabledReason={disabledReason}
+          pendingModel={pendingModel}
+          onSelectModel={setPendingModel}
+          onPullSuccessModel={adoptPulledModel}
+        />
       ) : (
-        <FimConnectTab key={option.id} option={option} dispatch={dispatch} disabledReason={disabledReason} />
+        <FimConnectTab
+          key={option.id}
+          option={option}
+          dispatch={dispatch}
+          disabledReason={disabledReason}
+          pendingModel={pendingModel}
+          savedModel={fim.model}
+          onPendingModel={setPendingModel}
+        />
       )}
     </Card>
   );
 }
 
+/** The FIM Model field's caption id — `aria-describedby` plumbing (C1-15). */
+const FIM_MODEL_CAPTION_ID = 'fim-model-field-caption';
+
 function FimConnectTab({
   option,
   dispatch,
   disabledReason,
+  pendingModel,
+  savedModel,
+  onPendingModel,
 }: {
   option: SetupBackendOption;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  /** The card-owned pending draft (§3.2 PT4) — survives tab switches. */
+  pendingModel: string;
+  /** The wire's SAVED `fim.model` — the field's placeholder + diff baseline. */
+  savedModel: string;
+  onPendingModel: (next: string) => void;
 }) {
   const [endpoint, setEndpoint] = useState(option.remote?.endpointValue || option.remote?.endpointDefault || '');
   const needsKey = option.remote?.auth === 'apiKey-optional' || option.remote?.auth === 'apiKey-required';
+  const modelFieldVisible = fimModelFieldVisible(option.id);
+  const trimmed = pendingModel.trim();
+  // "not saved yet" gates on a NON-EMPTY differing draft: an empty field
+  // never rides an Apply (visible-value-only rule below), so captioning it
+  // as pending would promise a save that can't happen.
+  const draftDiffers = trimmed !== '' && trimmed !== savedModel;
 
   return (
     <div className="flex flex-col gap-2">
       <TextField label="Endpoint" value={endpoint} onChange={setEndpoint} placeholder={option.remote?.endpointPlaceholder} />
+
+      {modelFieldVisible ? (
+        <div className="flex flex-col gap-1">
+          <TextField
+            label={FIM_MODEL_FIELD_LABEL}
+            value={pendingModel}
+            onChange={onPendingModel}
+            placeholder={savedModel || undefined}
+            describedBy={FIM_MODEL_CAPTION_ID}
+          />
+          <div className="flex flex-wrap items-baseline gap-2">
+            <p id={FIM_MODEL_CAPTION_ID} className="text-2xs text-faint">
+              {FIM_MODEL_FIELD_CAPTION}
+            </p>
+            {draftDiffers && <span className="text-2xs text-warn">{FIM_PENDING_CAPTION}</span>}
+          </div>
+        </div>
+      ) : (
+        // llamacpp: `/infill` sends no model name — a field here would be a
+        // fake affordance; the honest note renders INSTEAD (§8).
+        <p className="text-2xs text-muted">{FIM_LLAMACPP_MODEL_NOTE}</p>
+      )}
 
       {needsKey && (
         <div className="flex flex-wrap items-center gap-2 text-2xs">
@@ -1090,7 +1198,16 @@ function FimConnectTab({
         />
         <ActionButton
           label="Apply"
-          onRun={() => dispatch('setup.applyFim', { backendId: option.id, endpoint })}
+          // C1-1 visible-value-only: `model` rides the params ONLY while the
+          // Model field is actually rendered for this backend AND non-empty —
+          // the llamacpp tab never carries one, even with a draft alive.
+          onRun={() =>
+            dispatch('setup.applyFim', {
+              backendId: option.id,
+              endpoint,
+              ...(modelFieldVisible && trimmed !== '' ? { model: trimmed } : {}),
+            })
+          }
           disabledReason={disabledReason}
           tone="accent"
           successLabel="✓ Applied"
@@ -1117,12 +1234,20 @@ function FimInstallTab({
   progress,
   dispatch,
   disabledReason,
+  pendingModel,
+  onSelectModel,
+  onPullSuccessModel,
 }: {
   option: SetupBackendOption;
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  /** §3.2 PT4 — the card-owned pending draft, consumed by the Ollama pane
+   *  only (llamacpp/vLLM panes carry no model-name selection). */
+  pendingModel: string;
+  onSelectModel: (target: string) => void;
+  onPullSuccessModel: (snapshot: string, target: string) => void;
 }) {
   // R-2 (§2.6): a browsed-but-not-configured backend tests its OWN default,
   // never the active backend's saved endpoint under this backend's label.
@@ -1138,6 +1263,9 @@ function FimInstallTab({
         progress={progress}
         dispatch={dispatch}
         disabledReason={disabledReason}
+        pendingModel={pendingModel}
+        onSelectModel={onSelectModel}
+        onPullSuccessModel={onPullSuccessModel}
       />
     );
   }
@@ -1174,6 +1302,9 @@ function OllamaInstallPanel({
   progress,
   dispatch,
   disabledReason,
+  pendingModel,
+  onSelectModel,
+  onPullSuccessModel,
 }: {
   setup: SetupData;
   models: readonly SetupCatalogModel[];
@@ -1181,22 +1312,39 @@ function OllamaInstallPanel({
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  /** §3.2 PT4 — the card-owned pending draft; row highlight is DERIVED from
+   *  it ({@link catalogRowIdForModel}), never a second selection state. */
+  pendingModel: string;
+  /** Row click → the row's install target becomes the draft. */
+  onSelectModel: (target: string) => void;
+  /** Pull success → `(snapshot, target)`; the card applies the C1-6
+   *  no-clobber rule (`snapshot` = this render's `pendingModel`, i.e. the
+   *  value at pull-CLICK — the in-flight closure pins it). */
+  onPullSuccessModel: (snapshot: string, target: string) => void;
 }) {
+  const saved = setup.fim.model;
   // CC-8 (§3.2): a running-branch affordance — the legacy tier needs a live
   // daemon to pull onto; the not-running branch's job is installing Ollama.
-  const showConfiguredRow = setup.ollama.running && configuredModelOutsideCatalog(models, setup.fim.model);
+  const showConfiguredRow = setup.ollama.running && configuredModelOutsideCatalog(models, saved);
+  // §8: typing free text simply un-highlights every row (no guessed match).
+  const rowSelectedId = catalogRowIdForModel(models, pendingModel);
+  // The pending line announces a picked-but-unsaved model (`:latest`-tolerant
+  // against saved); LiveRegion stays ALWAYS mounted — only `text` swaps.
+  const pendingLine =
+    pendingModel.trim() !== '' && !ollamaTagsEqual(pendingModel, saved) ? pendingSelectionLine('fim', pendingModel) : '';
 
   return (
     <div className="flex flex-col gap-2">
       {showConfiguredRow && (
         <ConfiguredModelRow
-          model={setup.fim.model}
+          model={saved}
           ollama={setup.ollama}
           endpoint={endpoint}
           progress={progress}
           dispatch={dispatch}
           disabledReason={disabledReason}
           pullSuccessLabel={FIM_OLLAMA_PULL_NUDGE}
+          onPullSuccess={() => onPullSuccessModel(pendingModel, saved)}
         />
       )}
       <LocalModelBlock
@@ -1208,8 +1356,19 @@ function OllamaInstallPanel({
         progress={progress}
         dispatch={dispatch}
         disabledReason={disabledReason}
+        selectedId={rowSelectedId}
+        onSelect={(id) => {
+          const row = models.find((m) => m.id === id);
+          const target = row?.ollamaCreatedName ?? row?.ollamaTag; // the catalogOllamaTarget rule
+          if (target !== undefined) onSelectModel(target);
+        }}
         ollamaPullSuccessLabel={FIM_OLLAMA_PULL_NUDGE}
+        onOllamaPullSuccess={(model) => {
+          const target = model.ollamaCreatedName ?? model.ollamaTag;
+          if (target !== undefined) onPullSuccessModel(pendingModel, target);
+        }}
       />
+      <LiveRegion text={pendingLine} className="text-2xs text-muted" />
       <div>
         <ActionButton
           label={testConnectionLabel(endpoint)}
@@ -1240,6 +1399,7 @@ function ConfiguredModelRow({
   dispatch,
   disabledReason,
   pullSuccessLabel,
+  onPullSuccess,
 }: {
   model: string;
   ollama: SetupData['ollama'];
@@ -1248,6 +1408,11 @@ function ConfiguredModelRow({
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
   pullSuccessLabel: string;
+  /** beta.6 panel-fix PT4 (C1-2): fires exactly when the pull dispatch
+   *  resolves with a result ≠ DECLINED (the success-flash condition) —
+   *  never on rejection, never on DECLINED. Mirrors the block's PT6
+   *  `onOllamaPullSuccess`. Omitted ⇒ byte-identical behavior. */
+  onPullSuccess?: () => void;
 }) {
   // The same endpoint-scoped client-side derivation catalog rows use (C-6) —
   // the free-text model is just a bare library tag, so `ollamaTag` fits.
@@ -1273,7 +1438,15 @@ function ConfiguredModelRow({
           <ActionButton
             label={`Pull ${model}`}
             icon="cloud-download"
-            onRun={() => dispatch('setup.pullModel', { model, endpoint })}
+            onRun={
+              onPullSuccess
+                ? () =>
+                    dispatch('setup.pullModel', { model, endpoint }).then((result) => {
+                      if (result !== DECLINED) onPullSuccess();
+                      return result;
+                    })
+                : () => dispatch('setup.pullModel', { model, endpoint })
+            }
             disabledReason={disabledReason}
             successLabel={pullSuccessLabel}
           />
