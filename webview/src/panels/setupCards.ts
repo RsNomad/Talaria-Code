@@ -273,14 +273,17 @@ export function mutationDisabledReason(trusted: boolean): string | undefined {
 // recomputes its OWN card's "green" from wire-visible fields only, scoped to
 // that one card (an agent-ready line must not depend on the provider, etc).
 
-/** Card 1 — Agent: mirrors `AgentSetupPhase === 'ready'`. */
+/** Card 1 — Agent: mirrors `AgentSetupPhase === 'ready'`. beta.6 panel-fix
+ *  PT8 (audit A8, the one-carrier ✓ rule): no leading ✓ — this always
+ *  renders via `DoneLine`, whose `pass-filled` icon already carries the
+ *  check; a literal ✓ beside it would double up. */
 export function agentDoneLine(phase: AgentSetupPhase): string {
-  return phase === 'ready' ? '✓ Hermes is ready. Next: configure a chat provider below.' : '';
+  return phase === 'ready' ? 'Hermes is ready. Next: configure a chat provider below.' : '';
 }
 
-/** Card 2 — Provider: mirrors `provider.phase === 'configured'`. */
+/** Card 2 — Provider: mirrors `provider.phase === 'configured'`. PT8/A8: see {@link agentDoneLine}. */
 export function providerDoneLine(phase: SetupData['provider']['phase']): string {
-  return phase === 'configured' ? '✓ Provider connected — chat is ready to use.' : '';
+  return phase === 'configured' ? 'Provider connected — chat is ready to use.' : '';
 }
 
 /** Auth-satisfied predicate over the WIRE's collapsed `auth` union — the
@@ -316,13 +319,13 @@ export function fimDoneLine(fim: SetupData['fim'], presence: NextPresence): stri
   const green = option !== undefined && option.status === 'available' && fim.enabled && fimAuthSatisfied(option);
   if (!green) return '';
   if (fim.selectedId === 'ollama' && presence !== 'present') return '';
-  return '✓ Autocomplete is active — open a file and start typing.';
+  return 'Autocomplete is active — open a file and start typing.';
 }
 
-/** Card 4 — NEXT: one line per active source, empty while `'off'`. */
+/** Card 4 — NEXT: one line per active source, empty while `'off'`. PT8/A8: see {@link agentDoneLine}. */
 export function nextDoneLine(source: SetupData['nextEdit']['source']): string {
-  if (source === 'dedicated') return '✓ Next-edit suggestions are on (dedicated Sweep model).';
-  if (source === 'generic') return '✓ Next-edit suggestions are on (reusing your FIM model).';
+  if (source === 'dedicated') return 'Next-edit suggestions are on (dedicated Sweep model).';
+  if (source === 'generic') return 'Next-edit suggestions are on (reusing your FIM model).';
   return '';
 }
 
@@ -341,7 +344,7 @@ export function nextDoneLine(source: SetupData['nextEdit']['source']): string {
  */
 export function ragDoneLine(rag: SetupData['rag'], presence: NextPresence): string {
   const green = rag.enabled && presence === 'present' && rag.preconditionDetail === undefined;
-  return green ? '✓ Codebase index is ready — the agent can search your project.' : '';
+  return green ? 'Codebase index is ready — the agent can search your project.' : '';
 }
 
 // --- pipx-missing unknown-distro fallback (§6, T10) ------------------------
@@ -434,7 +437,7 @@ export function nextPresence(setup: Pick<SetupData, 'ollama'>, formEndpoint: str
 export function nextPresenceText(presence: NextPresence): string {
   switch (presence) {
     case 'present':
-      return '✓ Model present on this Ollama';
+      return 'Model present on this Ollama';
     case 'absent':
       return 'not present';
     case 'unknown':
@@ -640,13 +643,13 @@ export function catalogPresence(
 }
 
 /** §6 "Model row (ollama)" — DISTINCT wording from the NEXT card's own D2
- *  line (`nextPresenceText`): `'present ✓'`, not `'✓ Model present on this
+ *  line (`nextPresenceText`): `'present'`, not `'Model present on this
  *  Ollama'`. The 'unknown' text is shared verbatim with `nextPresenceText`
  *  by coincidence of both being the SAME honest sentence, not by reuse. */
 export function catalogPresenceText(presence: NextPresence): string {
   switch (presence) {
     case 'present':
-      return 'present ✓';
+      return 'present';
     case 'absent':
       return 'not present';
     case 'unknown':
@@ -658,7 +661,7 @@ export function catalogPresenceText(presence: NextPresence): string {
  *  model folder", never "verified" (§2.2.8 — the hash was proven at write
  *  time; the persistent line only attests the sidecar, it doesn't re-hash). */
 export function llamacppPresenceText(present: boolean): string {
-  return present ? "present in Talaria's model folder ✓" : 'not downloaded';
+  return present ? "present in Talaria's model folder" : 'not downloaded';
 }
 
 /** §6 "Backend ready" — shared template for the two backends that have a
@@ -666,7 +669,7 @@ export function llamacppPresenceText(present: boolean): string {
  *  such distinction, §4.1). */
 export function backendReadyText(backend: 'ollama' | 'llamacpp', version?: string): string {
   const label = backend === 'ollama' ? 'Ollama' : 'llama.cpp';
-  return version ? `${label}: Ready ✓ — ${version}` : `${label}: Ready ✓`;
+  return version ? `${label}: Ready — ${version}` : `${label}: Ready`;
 }
 
 export const OLLAMA_MISSING_TEXT = 'Ollama daemon not detected.';
@@ -745,8 +748,11 @@ export function configuredModelOutsideCatalog(models: readonly Pick<SetupCatalog
 
 /** §6 "llama.cpp FIM nudge" (beta.6 T11) — rendered by the FIM llama.cpp
  *  pane once any FIM row is present in Talaria's model folder (the "what
- *  next" line after a verified download). */
-export const FIM_LLAMACPP_NUDGE = 'Then switch the Connect tab to llama.cpp and Apply.';
+ *  next" line after a verified download). beta.6 panel-fix PT8 (audit A17,
+ *  critic C1-11): the pane already IS the llama.cpp Install pane — what the
+ *  user actually switches is the Connect/Install MODE toggle, not a
+ *  (nonexistent, from here) backend tab. */
+export const FIM_LLAMACPP_NUDGE = 'Then open the Connect tab and Apply.';
 
 /** §6 "Test button" — shared with the FIM Connect/Install tabs' own inline
  *  usage; single-sourced here for the block. */

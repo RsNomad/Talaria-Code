@@ -345,7 +345,7 @@ describe('mutationDisabledReason — the !trusted gate (§6, D9 FM-14)', () => {
  */
 describe('agentDoneLine — B5 done line (§6)', () => {
   it('is the exact §6 copy once the agent is ready', () => {
-    expect(agentDoneLine('ready')).toBe('✓ Hermes is ready. Next: configure a chat provider below.');
+    expect(agentDoneLine('ready')).toBe('Hermes is ready. Next: configure a chat provider below.');
   });
   it('is empty for every other phase', () => {
     for (const phase of ALL_PHASES) {
@@ -357,7 +357,7 @@ describe('agentDoneLine — B5 done line (§6)', () => {
 
 describe('providerDoneLine — B5 done line (§6)', () => {
   it('is the exact §6 copy once configured', () => {
-    expect(providerDoneLine('configured')).toBe('✓ Provider connected — chat is ready to use.');
+    expect(providerDoneLine('configured')).toBe('Provider connected — chat is ready to use.');
   });
   it('is empty for waiting-agent/unconfigured/unknown', () => {
     for (const phase of ['waiting-agent', 'unconfigured', 'unknown'] as const) {
@@ -387,7 +387,7 @@ function fimData(overrides: Partial<SetupData['fim']> = {}): SetupData['fim'] {
 }
 
 describe("fimDoneLine — B5 done line (§6), presence-honest for ollama (beta.6 panel-fix PT4, audit A4)", () => {
-  const FIM_GREEN = '✓ Autocomplete is active — open a file and start typing.';
+  const FIM_GREEN = 'Autocomplete is active — open a file and start typing.';
   const ALL_PRESENCES = ['present', 'absent', 'unknown'] as const;
   const codestralWithKey = (apiKeySet: boolean) =>
     fimData({
@@ -438,10 +438,10 @@ describe("fimDoneLine — B5 done line (§6), presence-honest for ollama (beta.6
 
 describe('nextDoneLine — B5 done line (§6)', () => {
   it('dedicated source -> the dedicated-model copy', () => {
-    expect(nextDoneLine('dedicated')).toBe('✓ Next-edit suggestions are on (dedicated Sweep model).');
+    expect(nextDoneLine('dedicated')).toBe('Next-edit suggestions are on (dedicated Sweep model).');
   });
   it('generic source -> the reusing-FIM-model copy', () => {
-    expect(nextDoneLine('generic')).toBe('✓ Next-edit suggestions are on (reusing your FIM model).');
+    expect(nextDoneLine('generic')).toBe('Next-edit suggestions are on (reusing your FIM model).');
   });
   it('off -> empty', () => {
     expect(nextDoneLine('off')).toBe('');
@@ -466,7 +466,7 @@ describe('ragDoneLine — B5 done line, T14 endpoint-scoped honesty (§3.4 truth
   // boolean rides along inside `rag` in every case below (`ragData()` pins it
   // TRUE) and must be IGNORED entirely.
   it("is the exact §6 copy when enabled + unblocked + genuinely 'present' at the configured endpoint", () => {
-    expect(ragDoneLine(ragData(), 'present')).toBe('✓ Codebase index is ready — the agent can search your project.');
+    expect(ragDoneLine(ragData(), 'present')).toBe('Codebase index is ready — the agent can search your project.');
   });
   it('is empty when disabled, even with presence proven', () => {
     expect(ragDoneLine(ragData({ enabled: false }), 'present')).toBe('');
@@ -614,7 +614,7 @@ describe('nextPresence — client-side derivation against live form state (§4.2
 
 describe('nextPresenceText — §6 presence copy (D2), verbatim', () => {
   it('present', () => {
-    expect(nextPresenceText('present')).toBe('✓ Model present on this Ollama');
+    expect(nextPresenceText('present')).toBe('Model present on this Ollama');
   });
   it('absent', () => {
     expect(nextPresenceText('absent')).toBe('not present');
@@ -892,8 +892,8 @@ describe('catalogPresence — generalizes nextPresence over ANY catalog row (lib
 });
 
 describe('catalogPresenceText / llamacppPresenceText — §6 verbatim per state', () => {
-  it('ollama present -> "present ✓" (distinct from the NEXT card\'s own D2 wording)', () => {
-    expect(catalogPresenceText('present')).toBe('present ✓');
+  it('ollama present -> "present" (icon carries the check; distinct wording from the NEXT card\'s own D2)', () => {
+    expect(catalogPresenceText('present')).toBe('present');
   });
   it('ollama absent -> "not present"', () => {
     expect(catalogPresenceText('absent')).toBe('not present');
@@ -901,8 +901,8 @@ describe('catalogPresenceText / llamacppPresenceText — §6 verbatim per state'
   it('ollama unknown -> "not verified here — Test the endpoint first."', () => {
     expect(catalogPresenceText('unknown')).toBe('not verified here — Test the endpoint first.');
   });
-  it('llamacpp present -> "present in Talaria\'s model folder ✓" (sidecar-rule honesty, never "verified")', () => {
-    expect(llamacppPresenceText(true)).toBe("present in Talaria's model folder ✓");
+  it('llamacpp present -> "present in Talaria\'s model folder" (sidecar-rule honesty, never "verified")', () => {
+    expect(llamacppPresenceText(true)).toBe("present in Talaria's model folder");
   });
   it('llamacpp absent -> "not downloaded"', () => {
     expect(llamacppPresenceText(false)).toBe('not downloaded');
@@ -993,13 +993,13 @@ describe('cancelPullParams / recheckScopeParams — the exact dispatch payload s
 
 describe('backendReadyText — §6 "Backend ready" row, shared template', () => {
   it('ollama, no version', () => {
-    expect(backendReadyText('ollama')).toBe('Ollama: Ready ✓');
+    expect(backendReadyText('ollama')).toBe('Ollama: Ready');
   });
   it('ollama, with version appends " — {version}"', () => {
-    expect(backendReadyText('ollama', '0.4.1')).toBe('Ollama: Ready ✓ — 0.4.1');
+    expect(backendReadyText('ollama', '0.4.1')).toBe('Ollama: Ready — 0.4.1');
   });
   it('llamacpp, with version', () => {
-    expect(backendReadyText('llamacpp', 'b4500')).toBe('llama.cpp: Ready ✓ — b4500');
+    expect(backendReadyText('llamacpp', 'b4500')).toBe('llama.cpp: Ready — b4500');
   });
 });
 
@@ -1062,7 +1062,7 @@ describe('§6 copy — verbatim + single-sourced (SCOPED source-scan: hand-writt
     'llama-server was not found on your PATH. Install llama.cpp, then re-check.',
     'Checking for llama-server…',
     "Couldn't check for llama-server here — press Re-check.",
-    "present in Talaria's model folder ✓",
+    "present in Talaria's model folder",
     'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.',
     'Install Ollama first — it performs the download.',
     'not verified here — Test the endpoint first.',
@@ -1093,14 +1093,14 @@ describe('§6 FIM-surface nudges (T11) — verbatim + single-sourced', () => {
     );
   });
 
-  it('FIM_LLAMACPP_NUDGE — §6 "llama.cpp FIM nudge"', () => {
-    expect(FIM_LLAMACPP_NUDGE).toBe('Then switch the Connect tab to llama.cpp and Apply.');
+  it('FIM_LLAMACPP_NUDGE — §6 "llama.cpp FIM nudge" (beta.6 panel-fix PT8, audit A17: the MODE toggle is what the user switches, not the Connect tab)', () => {
+    expect(FIM_LLAMACPP_NUDGE).toBe('Then open the Connect tab and Apply.');
   });
 
   it('SetupPanel.tsx never RESTATES the nudges inline — it renders the setupCards.ts constants', () => {
     const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
     expect(setupPanelSrc).not.toContain('set it as your FIM model in the Connect tab');
-    expect(setupPanelSrc).not.toContain('Then switch the Connect tab to llama.cpp');
+    expect(setupPanelSrc).not.toContain('Then open the Connect tab and Apply.');
   });
 });
 

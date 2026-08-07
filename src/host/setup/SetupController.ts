@@ -2772,17 +2772,20 @@ export function composeAgentGuidance(
   endpoint: string,
   servedName: string,
 ): string {
+  // beta.6 panel-fix PT8 (audit A8, the one-carrier ✓ rule): no leading ✓ —
+  // this always renders via the webview's `DoneLine`, whose `pass-filled`
+  // icon already carries the check; a literal ✓ beside it would double up.
   if (phase === 'configured') {
-    return `✓ Local model saved. Your provider is already configured — update it to ${endpoint}/v1 · ${servedName} if you want the agent on this model.`;
+    return `Local model saved. Your provider is already configured — update it to ${endpoint}/v1 · ${servedName} if you want the agent on this model.`;
   }
   if (phase === 'unconfigured') {
     return (
-      `✓ Local model ready. Next: press "Configure provider" on the Provider card below → choose the ` +
+      `Local model ready. Next: press "Configure provider" on the Provider card below → choose the ` +
       `OpenAI-compatible (custom URL) provider → base URL: ${endpoint}/v1 · model: ${servedName}. Test shows the served model if unsure.`
     );
   }
   // 'waiting-agent' / 'unknown'
-  return '✓ Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
+  return 'Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
 }
 
 /**

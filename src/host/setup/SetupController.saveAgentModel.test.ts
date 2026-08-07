@@ -37,14 +37,17 @@ const AGENT_ENDPOINT_DEFAULTS = {
   vllm: 'http://127.0.0.1:8000',
 };
 
-// §6 "Agent guidance — …" — verbatim.
+// §6 "Agent guidance — …" — verbatim. beta.6 panel-fix PT8 (audit A8, the
+// one-carrier ✓ rule): the leading ✓ is stripped — this copy always renders
+// via the webview's `DoneLine` (a `pass-filled` icon already carries the
+// check; a literal ✓ beside it would double up).
 const GUIDANCE_UNCONFIGURED = (endpoint: string, servedName: string): string =>
-  `✓ Local model ready. Next: press "Configure provider" on the Provider card below → choose the ` +
+  `Local model ready. Next: press "Configure provider" on the Provider card below → choose the ` +
   `OpenAI-compatible (custom URL) provider → base URL: ${endpoint}/v1 · model: ${servedName}. Test shows the served model if unsure.`;
 const GUIDANCE_WAITING =
-  '✓ Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
+  'Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
 const GUIDANCE_CONFIGURED = (endpoint: string, servedName: string): string =>
-  `✓ Local model saved. Your provider is already configured — update it to ${endpoint}/v1 · ${servedName} if you want the agent on this model.`;
+  `Local model saved. Your provider is already configured — update it to ${endpoint}/v1 · ${servedName} if you want the agent on this model.`;
 
 // --- fakes -------------------------------------------------------------------
 

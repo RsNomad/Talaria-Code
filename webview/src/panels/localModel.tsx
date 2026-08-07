@@ -425,7 +425,10 @@ function ModelRow({
 
       {runCommand && (
         <>
-          <RunCommandLine command={runCommand} />
+          {/* beta.6 panel-fix PT8 (audit A10): "Start the server:" on
+              llamacpp rows, "Run:" on vllm rows — the only two backends this
+              row's `runCommand` branch above ever populates for. */}
+          <RunCommandLine command={runCommand} label={backend === 'llamacpp' ? 'Start the server:' : 'Run:'} />
           {runCommandCaption && <p className="text-2xs text-faint">{runCommandCaption}</p>}
         </>
       )}
@@ -458,10 +461,14 @@ function ModelRow({
 
 /** Exported (T12): the Agent section's saved summary renders
  *  `saved.runCommand` through this same element — same import direction as
- *  `LocalModelBlock` itself (SetupPanel → localModel), so no module cycle. */
-export function RunCommandLine({ command }: { command: string }) {
+ *  `LocalModelBlock` itself (SetupPanel → localModel), so no module cycle.
+ *  beta.6 panel-fix PT8 (audit A10): the OPTIONAL `label` slot names what the
+ *  command actually does ("Start the server:" / "Run:") — §6 pinned this
+ *  caption but no site rendered it; omitted ⇒ byte-identical (no label). */
+export function RunCommandLine({ command, label }: { command: string; label?: string }) {
   return (
     <div className="flex items-center justify-between gap-2 rounded border border-border bg-surface px-2 py-1 text-2xs">
+      {label && <span className="flex-none text-faint">{label}</span>}
       <span className="min-w-0 flex-1 truncate font-mono text-fg" title={command}>
         {command}
       </span>

@@ -849,10 +849,12 @@ function AgentLocalModelSection({
           <div className="flex flex-col gap-1.5">
             <StatusLine
               icon="pass-filled"
-              text={agentSavedSummaryLine(savedRow?.displayName ?? saved.modelId, saved.backend, saved.endpoint)}
+              text={agentSavedSummaryLine(savedRow?.displayName ?? saved.modelId, BACKEND_DISPLAY[saved.backend], saved.endpoint)}
               tone="add"
             />
-            {saved.runCommand && <RunCommandLine command={saved.runCommand} />}
+            {saved.runCommand && (
+              <RunCommandLine command={saved.runCommand} label={saved.backend === 'llamacpp' ? 'Start the server:' : undefined} />
+            )}
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
@@ -884,7 +886,7 @@ function AgentLocalModelSection({
                     backend === b ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
                   }`}
                 >
-                  {b === 'ollama' ? 'Ollama' : b === 'llamacpp' ? 'llama.cpp' : 'vLLM'}
+                  {BACKEND_DISPLAY[b]}
                 </button>
               ))}
             </div>
@@ -1199,7 +1201,7 @@ function FimConnectTab({
 
       <div className="flex gap-2">
         <ActionButton
-          label="Test"
+          label={testConnectionLabel(endpoint)}
           onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })}
           successLabel="✓ Endpoint reachable"
         />
@@ -1601,7 +1603,7 @@ function NextEditCard({
       <DoneLine text={nextDoneLine(next.source)} className="mb-2" />
       <p className="mb-2 text-2xs text-muted">
         Want NEXT (multi-line next-edit)? Two modes: <strong className="text-fg">Generic</strong> reuses your FIM
-        model — onboarding already set it up, no extra setup. <strong className="text-fg">Dedicated</strong> uses a
+        model — no extra setup if autocomplete is configured. <strong className="text-fg">Dedicated</strong> uses a
         separate Sweep model and needs its own setup.
       </p>
 
@@ -1864,7 +1866,7 @@ function DedicatedNextForm({
                 a second generic [Test] would double the affordance. */}
             {!isLlamacppPane && (
               <ActionButton
-                label="Test"
+                label={testConnectionLabel(endpoint)}
                 onRun={() => dispatch('setup.testRemote', { backendId: selected?.id, endpoint })}
                 successLabel="✓ Endpoint reachable"
               />
@@ -1950,11 +1952,15 @@ function RagCard({
         Embeddings: <span className="font-mono text-fg">{rag.embedModel}</span> via{' '}
         <span className="font-mono text-fg">{rag.embedEndpoint}</span>
         {/* Honest tri-state suffix (T14): provable absence keeps the warn
-            text; an unverifiable endpoint gets the §6 unknown sentence via
-            `catalogPresenceText` — never a color-only or wrong-daemon claim. */}
+            text via `catalogPresenceText`. beta.6 panel-fix PT8 (audit A7):
+            the unverifiable-endpoint case shortens to "not verified here" AT
+            THIS collapsed card level — no Test control sits behind this
+            suffix, so pointing at one here would be a dead-end; the full
+            "— Test the endpoint first." pointer stays at ROW level inside
+            the expanded section below, where a Test button actually is. */}
         {presence !== 'present' && (
           <span className={`ml-2 ${presence === 'absent' ? 'text-warn' : 'text-faint'}`}>
-            {catalogPresenceText(presence)}
+            {presence === 'unknown' ? 'not verified here' : catalogPresenceText(presence)}
           </span>
         )}
       </div>

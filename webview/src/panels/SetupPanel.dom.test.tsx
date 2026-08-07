@@ -473,6 +473,16 @@ describe('NEXT card — info panel + dedicated setup button (§6 card 4)', () =>
       expect.objectContaining({ backend: 'ollama' }),
     );
   });
+
+  it('the Generic-mode description is CONDITIONAL, not presumptuous — "no extra setup if autocomplete is configured" (beta.6 panel-fix PT8, audit A11)', () => {
+    renderPanel(baseData());
+    expect(
+      screen.getByText(
+        (_, node) => node?.textContent === 'Want NEXT (multi-line next-edit)? Two modes: Generic reuses your FIM model — no extra setup if autocomplete is configured. Dedicated uses a separate Sweep model and needs its own setup.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/onboarding already set it up/)).not.toBeInTheDocument();
+  });
 });
 
 describe('RAG card — renders precondition text (§6 card 5)', () => {
@@ -721,27 +731,27 @@ describe('container-note banner (§1.2, T10)', () => {
 describe('B5 "done / what next" one-line status under each card (§6, T10)', () => {
   it('Agent card shows the done line once ready', () => {
     renderPanel(baseData({ agent: { ...baseData().agent, phase: 'ready' } }));
-    expect(screen.getByText('✓ Hermes is ready. Next: configure a chat provider below.')).toBeInTheDocument();
+    expect(screen.getByText('Hermes is ready. Next: configure a chat provider below.')).toBeInTheDocument();
   });
 
   it('Provider card shows the done line once configured', () => {
     renderPanel(baseData({ provider: { phase: 'configured', providerId: 'anthropic' } }));
-    expect(screen.getByText('✓ Provider connected — chat is ready to use.')).toBeInTheDocument();
+    expect(screen.getByText('Provider connected — chat is ready to use.')).toBeInTheDocument();
   });
 
   it('FIM card shows the done line once green', () => {
     renderPanel(baseData({ fim: { ...baseData().fim, enabled: true } }));
-    expect(screen.getByText('✓ Autocomplete is active — open a file and start typing.')).toBeInTheDocument();
+    expect(screen.getByText('Autocomplete is active — open a file and start typing.')).toBeInTheDocument();
   });
 
   it('NEXT card shows the dedicated-on done line', () => {
     renderPanel(baseData({ nextEdit: { ...baseData().nextEdit, source: 'dedicated' } }));
-    expect(screen.getByText('✓ Next-edit suggestions are on (dedicated Sweep model).')).toBeInTheDocument();
+    expect(screen.getByText('Next-edit suggestions are on (dedicated Sweep model).')).toBeInTheDocument();
   });
 
   it('NEXT card shows the generic-on done line', () => {
     renderPanel(baseData({ nextEdit: { ...baseData().nextEdit, source: 'generic' } }));
-    expect(screen.getByText('✓ Next-edit suggestions are on (reusing your FIM model).')).toBeInTheDocument();
+    expect(screen.getByText('Next-edit suggestions are on (reusing your FIM model).')).toBeInTheDocument();
   });
 
   it('RAG card shows the done line once green (T14: green = endpoint-scoped presence, never the deprecated wire boolean)', () => {
@@ -753,12 +763,62 @@ describe('B5 "done / what next" one-line status under each card (§6, T10)', () 
         ollama: { ...baseData().ollama, models: [...baseData().ollama.models, { name: 'nomic-embed-text', sizeBytes: 1 }] },
       }),
     );
-    expect(screen.getByText('✓ Codebase index is ready — the agent can search your project.')).toBeInTheDocument();
+    expect(screen.getByText('Codebase index is ready — the agent can search your project.')).toBeInTheDocument();
   });
 
   it('renders no done line when a card is not done (icon+text is conditional, never a lingering lie)', () => {
     renderPanel(baseData({ provider: { phase: 'unconfigured' } }));
     expect(screen.queryByText(/Provider connected/)).not.toBeInTheDocument();
+  });
+});
+
+describe('one-carrier ✓ rule — structural guard (beta.6 panel-fix PT8, audit A8)', () => {
+  it('no rendered StatusLine/DoneLine text sits beside a pass-filled icon AND still carries a literal ✓', async () => {
+    const AGENT_ROW: SetupCatalogModel = {
+      id: 'agent-sweep-row',
+      role: 'agent',
+      displayName: 'Agent Sweep Row',
+      publisher: 'SyntinalCo',
+      license: 'Apache-2.0',
+      vramLine: '',
+      progressId: 'agent-sweep-row',
+      ollamaTag: 'agent-sweep-row',
+      ollamaApproxBytes: 1,
+      llamacpp: { file: 'agent-sweep-row.gguf', approxBytes: 1, present: true, available: true },
+    };
+    const data = baseData({
+      agent: { ...baseData().agent, phase: 'ready' },
+      provider: { phase: 'configured', providerId: 'anthropic' },
+      fim: { ...baseData().fim, enabled: true },
+      nextEdit: { ...baseData().nextEdit, source: 'dedicated' },
+      rag: { ...baseData().rag, enabled: true },
+      ollama: {
+        ...baseData().ollama,
+        models: [...baseData().ollama.models, { name: 'nomic-embed-text', sizeBytes: 1 }, { name: 'agent-sweep-row', sizeBytes: 1 }],
+      },
+      llamacppRuntime: { binary: 'found', version: 'b4500' },
+      catalog: { models: [sweepNextRow(), AGENT_ROW] },
+      agentLocalModel: {
+        endpointDefaults: { ollama: 'http://127.0.0.1:11434', llamacpp: 'http://127.0.0.1:8013', vllm: 'http://127.0.0.1:8000' },
+        providerGuidance:
+          'Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".',
+      },
+    });
+
+    const { user, container } = renderPanel(data);
+    await user.click(screen.getByText('Configure Local Agent Model'));
+    // Cover the llama.cpp pane's own backendReadyText + llamacppPresenceText
+    // too, not just the ollama pane's.
+    await user.click(screen.getByRole('button', { name: 'llama.cpp' }));
+
+    const icons = container.querySelectorAll('.codicon-pass-filled');
+    // Sanity floor: proves the sweep actually found something to check,
+    // rather than passing vacuously because nothing rendered.
+    expect(icons.length).toBeGreaterThanOrEqual(6);
+    icons.forEach((icon) => {
+      const text = icon.nextElementSibling?.textContent ?? '';
+      expect(text).not.toContain('✓');
+    });
   });
 });
 
@@ -876,7 +936,7 @@ describe('NEXT card — DedicatedNextForm [Test] button (T11 §6-parity minor)',
     const { user, dispatch } = renderPanel(data);
     await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
     const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
-    await user.click(within(nextCard).getByRole('button', { name: 'Test' }));
+    await user.click(within(nextCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' }));
     expect(dispatch).toHaveBeenCalledWith(
       'setup.testRemote',
       expect.objectContaining({ backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' }),
@@ -938,7 +998,7 @@ describe('NEXT card — Ollama presence + fail-closed Download button (§4.3 D2)
     const { user } = renderPanel(data);
     await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
     const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
-    expect(within(nextCard).getByText('✓ Model present on this Ollama')).toBeInTheDocument();
+    expect(within(nextCard).getByText('Model present on this Ollama')).toBeInTheDocument();
     expect(within(nextCard).queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
   });
 
@@ -952,7 +1012,7 @@ describe('NEXT card — Ollama presence + fail-closed Download button (§4.3 D2)
     const { user } = renderPanel(data);
     await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
     const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
-    expect(within(nextCard).getByText('✓ Model present on this Ollama')).toBeInTheDocument();
+    expect(within(nextCard).getByText('Model present on this Ollama')).toBeInTheDocument();
   });
 
   it('presence is unknown when the typed endpoint does not match the endpoint status() probed (C-6/S-F11)', async () => {
@@ -1167,7 +1227,7 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
           dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
         />,
       );
-      const button = screen.getByRole('button', { name: 'Test' });
+      const button = screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
 
       await act(async () => {
         button.click();
@@ -1202,7 +1262,7 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
           dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
         />,
       );
-      const button = screen.getByRole('button', { name: 'Test' });
+      const button = screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
 
       await act(async () => {
         button.click();
@@ -1239,7 +1299,7 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
           dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
         />,
       );
-      const button = screen.getByRole('button', { name: 'Test' });
+      const button = screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
 
       await act(async () => {
         button.click();
@@ -1293,7 +1353,7 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
         dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
       />,
     );
-    const button = screen.getByRole('button', { name: 'Test' });
+    const button = screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
     await user.click(button);
     expect(await screen.findByText('✓ Endpoint reachable')).toBeInTheDocument();
     expect(document.activeElement).toBe(button);
@@ -1359,7 +1419,7 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
         dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
       />,
     );
-    const button = screen.getByRole('button', { name: 'Test' });
+    const button = screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
     await user.click(button);
 
     expect(screen.getByRole('button', { name: 'Working…' })).toBeInTheDocument();
@@ -1472,9 +1532,9 @@ describe('T11 — the card picker IS ① (one picker, never a second one inside 
 });
 
 describe('T11 — Ollama running branch has Re-check (the §0.3 regression-lock)', () => {
-  it('running branch: renders "Ollama: Ready ✓ — {version}" AND a [Re-check] button', async () => {
+  it('running branch: renders "Ollama: Ready — {version}" AND a [Re-check] button', async () => {
     const { fimCard } = await openFimInstallTab(fimBlockData());
-    expect(within(fimCard).getByText('Ollama: Ready ✓ — 0.4.1')).toBeInTheDocument();
+    expect(within(fimCard).getByText('Ollama: Ready — 0.4.1')).toBeInTheDocument();
     expect(within(fimCard).getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
   });
 
@@ -1507,12 +1567,12 @@ describe('T11 — THREE catalog fim rows render (1.5b ★ / 7b / 14b), role-filt
     expect(within(fimCard).queryByText('Devstral-24B (2507)')).not.toBeInTheDocument();
   });
 
-  it('present→skip: a row already on the daemon shows "present ✓" and no Pull; absent rows keep Pull {tag} (~{size})', async () => {
+  it('present→skip: a row already on the daemon shows "present" and no Pull; absent rows keep Pull {tag} (~{size})', async () => {
     const data = fimBlockData({
       ollama: { running: true, version: '0.4.1', endpoint: 'http://127.0.0.1:11434', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] },
     });
     const { fimCard } = await openFimInstallTab(data);
-    expect(within(fimCard).getByText('present ✓')).toBeInTheDocument();
+    expect(within(fimCard).getByText('present')).toBeInTheDocument();
     expect(within(fimCard).queryByRole('button', { name: /Pull qwen2\.5-coder:1\.5b-base/ })).not.toBeInTheDocument();
     expect(within(fimCard).getByRole('button', { name: 'Pull qwen2.5-coder:7b-base (~4.4 GB)' })).toBeEnabled();
     expect(within(fimCard).getByRole('button', { name: 'Pull qwen2.5-coder:14b-base (~8.4 GB)' })).toBeEnabled();
@@ -1574,9 +1634,9 @@ describe('T11 — Ollama pane surface-level Test (T10 Minor #4: the "Test the en
 });
 
 describe('T11 — llama.cpp pane: three downloadable rows, base-build note, no absence cells, nudge on present', () => {
-  it('ready runtime: renders "llama.cpp: Ready ✓ — b4500" + THREE enabled Download buttons + the §6 base-build note; never the honest-absence line', async () => {
+  it('ready runtime: renders "llama.cpp: Ready — b4500" + THREE enabled Download buttons + the §6 base-build note; never the honest-absence line', async () => {
     const { fimCard } = await openFimInstallTab(fimBlockData(), 'llama.cpp');
-    expect(within(fimCard).getByText('llama.cpp: Ready ✓ — b4500')).toBeInTheDocument();
+    expect(within(fimCard).getByText('llama.cpp: Ready — b4500')).toBeInTheDocument();
     const downloads = within(fimCard).getAllByRole('button', { name: /^Download / });
     expect(downloads).toHaveLength(3);
     for (const button of downloads) expect(button).toBeEnabled();
@@ -1598,7 +1658,7 @@ describe('T11 — llama.cpp pane: three downloadable rows, base-build note, no a
     });
   });
 
-  it('on present: start command + [Copy] + the §6 "Then switch the Connect tab to llama.cpp and Apply." nudge', async () => {
+  it('on present: start command + [Copy] + the §6 "Then open the Connect tab and Apply." nudge', async () => {
     const models = fimCatalog();
     models[0] = fimCatalogRow({
       llamacpp: {
@@ -1611,15 +1671,15 @@ describe('T11 — llama.cpp pane: three downloadable rows, base-build note, no a
     });
     const data = fimBlockData({ catalog: { models } });
     const { fimCard } = await openFimInstallTab(data, 'llama.cpp');
-    expect(within(fimCard).getByText("present in Talaria's model folder ✓")).toBeInTheDocument();
+    expect(within(fimCard).getByText("present in Talaria's model folder")).toBeInTheDocument();
     expect(within(fimCard).getByText('llama-server -m /store/qwen2.5-coder-1.5b-q8_0.gguf --port 8080')).toBeInTheDocument();
     expect(within(fimCard).getByRole('button', { name: /copy/i })).toBeInTheDocument();
-    expect(within(fimCard).getByText('Then switch the Connect tab to llama.cpp and Apply.')).toBeInTheDocument();
+    expect(within(fimCard).getByText('Then open the Connect tab and Apply.')).toBeInTheDocument();
   });
 
   it('no row present ⇒ the nudge does not render (it explains a state that does not exist yet)', async () => {
     const { fimCard } = await openFimInstallTab(fimBlockData(), 'llama.cpp');
-    expect(within(fimCard).queryByText('Then switch the Connect tab to llama.cpp and Apply.')).not.toBeInTheDocument();
+    expect(within(fimCard).queryByText('Then open the Connect tab and Apply.')).not.toBeInTheDocument();
   });
 });
 
@@ -1971,10 +2031,11 @@ describe('T12 — pre-save run-command caption (§6, llama.cpp pane)', () => {
     return agentBlockData({ catalog: { models } });
   }
 
-  it('a present llama.cpp row shows its run command WITH the §6 default-port caption', async () => {
+  it('a present llama.cpp row shows its run command WITH the §6 default-port caption AND the "Start the server:" label (beta.6 panel-fix PT8, audit A10)', async () => {
     const { agentCard, user } = await openAgentSection(withPresentLlamacpp());
     await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
     expect(within(agentCard).getByText(/llama-server -m .* --jinja --port 8013/)).toBeInTheDocument();
+    expect(within(agentCard).getByText('Start the server:')).toBeInTheDocument();
     expect(
       within(agentCard).getByText('Uses the default port — Save updates this command to your endpoint.'),
     ).toBeInTheDocument();
@@ -1985,10 +2046,12 @@ describe('T12 — pre-save run-command caption (§6, llama.cpp pane)', () => {
     expect(within(agentCard).queryByText(/Uses the default port/)).not.toBeInTheDocument();
   });
 
-  it('the caption does NOT render on the vLLM pane (vllm serve carries no port to update)', async () => {
+  it('the caption does NOT render on the vLLM pane (vllm serve carries no port to update) — the row instead carries the "Run:" label (beta.6 panel-fix PT8, audit A10)', async () => {
     const { agentCard, user } = await openAgentSection(withPresentLlamacpp());
     await user.click(within(agentCard).getByRole('button', { name: 'vLLM' }));
     expect(within(agentCard).getByText('vllm serve mistralai/Devstral-Small-2507')).toBeInTheDocument();
+    // Every row on this pane carries its own vllm run command + label.
+    expect(within(agentCard).getAllByText('Run:').length).toBeGreaterThan(0);
     expect(within(agentCard).queryByText(/Uses the default port/)).not.toBeInTheDocument();
   });
 });
@@ -2040,13 +2103,13 @@ describe('T12 — saved state: collapsed summary + [Change model]/[Clear] (§4.2
       agentLocalModel: { endpointDefaults: T12_ENDPOINT_DEFAULTS, saved: savedOrnith() },
     });
     const { agentCard } = await openAgentSection(data);
-    expect(within(agentCard).getByText('Ornith-1.0 9B via ollama at http://127.0.0.1:11434')).toBeInTheDocument();
+    expect(within(agentCard).getByText('Ornith-1.0 9B via Ollama at http://127.0.0.1:11434')).toBeInTheDocument();
     expect(within(agentCard).queryByRole('button', { name: 'Devstral-24B (2507)' })).not.toBeInTheDocument();
     expect(within(agentCard).getByRole('button', { name: 'Change model' })).toBeInTheDocument();
     expect(within(agentCard).getByRole('button', { name: 'Clear' })).toBeInTheDocument();
   });
 
-  it('post-save the summary shows saved.runCommand (recomposed for the SAVED endpoint) with a Copy', async () => {
+  it('post-save the summary shows saved.runCommand (recomposed for the SAVED endpoint) with a Copy + the "Start the server:" label for llamacpp (beta.6 panel-fix PT8, audit A10)', async () => {
     const data = agentBlockData({
       agentLocalModel: {
         endpointDefaults: T12_ENDPOINT_DEFAULTS,
@@ -2062,6 +2125,7 @@ describe('T12 — saved state: collapsed summary + [Change model]/[Clear] (§4.2
     });
     const { agentCard } = await openAgentSection(data);
     expect(within(agentCard).getByText(/--jinja --port 9999/)).toBeInTheDocument();
+    expect(within(agentCard).getByText('Start the server:')).toBeInTheDocument();
     expect(within(agentCard).getByRole('button', { name: 'Copy' })).toBeInTheDocument();
   });
 
@@ -2099,11 +2163,11 @@ describe('T12 — saved state: collapsed summary + [Change model]/[Clear] (§4.2
 
 describe('T12 — providerGuidance renders from the wire; the copy never points at an unrendered control (CC-7)', () => {
   const GUIDANCE_UNCONFIGURED =
-    '✓ Local model ready. Next: press "Configure provider" on the Provider card below → choose the OpenAI-compatible (custom URL) provider → base URL: http://127.0.0.1:11434/v1 · model: ornith:9b. Test shows the served model if unsure.';
+    'Local model ready. Next: press "Configure provider" on the Provider card below → choose the OpenAI-compatible (custom URL) provider → base URL: http://127.0.0.1:11434/v1 · model: ornith:9b. Test shows the served model if unsure.';
   const GUIDANCE_WAITING =
-    '✓ Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
+    'Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
   const GUIDANCE_CONFIGURED =
-    '✓ Local model saved. Your provider is already configured — update it to http://127.0.0.1:11434/v1 · ornith:9b if you want the agent on this model.';
+    'Local model saved. Your provider is already configured — update it to http://127.0.0.1:11434/v1 · ornith:9b if you want the agent on this model.';
 
   function guidanceData(phase: SetupData['provider']['phase'], guidance: string): SetupData {
     return agentBlockData({
@@ -2299,7 +2363,7 @@ describe('T13 — llama.cpp pane: the empty-pin cell (§3.3, fail-closed)', () =
   it('the block binary status still renders (§4.1 — the backend cell is pin-independent)', async () => {
     const { user, nextCard } = await openNextForm(emptyPinData());
     await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
-    expect(within(nextCard).getByText('llama.cpp: Ready ✓ — b4500')).toBeInTheDocument();
+    expect(within(nextCard).getByText('llama.cpp: Ready — b4500')).toBeInTheDocument();
   });
 });
 
@@ -2334,7 +2398,7 @@ describe('T13 — llama.cpp pane: pinned cell — Download → present → run c
     });
     const { user, nextCard } = await openNextForm(data);
     await user.click(within(nextCard).getByRole('button', { name: 'llama.cpp' }));
-    expect(within(nextCard).getByText("present in Talaria's model folder ✓")).toBeInTheDocument();
+    expect(within(nextCard).getByText("present in Talaria's model folder")).toBeInTheDocument();
     expect(within(nextCard).getByText(runCommand)).toBeInTheDocument();
     expect(within(nextCard).getByRole('button', { name: 'Copy' })).toBeInTheDocument();
     expect(within(nextCard).getByText('Verify the download: sha256sum should print abc123def456')).toBeInTheDocument();
@@ -2351,24 +2415,26 @@ describe('T13 — llama.cpp pane: pinned cell — Download → present → run c
 });
 
 describe('T13 — vLLM pane unchanged (§3.3): guided line + generic Test; the block never renders here', () => {
-  it('keeps the guided run line + [Test] + [Apply]; no Download, no block Test-connection', async () => {
+  it('keeps the guided run line + [Test connection ({endpoint})] + [Apply]; no Download, no DUPLICATE block Test-connection (beta.6 panel-fix PT8, audit A18)', async () => {
     const { user, nextCard } = await openNextForm(nextSurfaceData());
     await user.click(within(nextCard).getByRole('button', { name: 'vLLM' }));
     expect(within(nextCard).getByText('Run: vllm serve sweepai/sweep-next-edit-v2-7B')).toBeInTheDocument();
-    expect(within(nextCard).getByRole('button', { name: 'Test' })).toBeInTheDocument();
+    expect(within(nextCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8000)' })).toBeInTheDocument();
     expect(within(nextCard).getByRole('button', { name: 'Apply' })).toBeInTheDocument();
     expect(within(nextCard).queryByRole('button', { name: /Download/ })).not.toBeInTheDocument();
-    expect(within(nextCard).queryByRole('button', { name: /Test connection/ })).not.toBeInTheDocument();
+    // ONE Test-connection button — the generic pane-level one, not doubled
+    // by the block (the block never renders on the vLLM pane).
+    expect(within(nextCard).getAllByRole('button', { name: /Test connection/ })).toHaveLength(1);
   });
 });
 
 describe('T13 — OpenAI-compatible pane KEPT (CC-8): endpoint + model + Test + Apply, no catalog rows', () => {
-  it('renders the two fields (openai-compat prefill) + Test + Apply and none of the catalog affordances', async () => {
+  it('renders the two fields (openai-compat prefill) + Test connection ({endpoint}) + Apply and none of the catalog affordances', async () => {
     const { user, nextCard } = await openNextForm(nextSurfaceData());
     await user.click(within(nextCard).getByRole('button', { name: 'OpenAI-compatible server' }));
     expect(within(nextCard).getByRole('textbox', { name: 'Endpoint' })).toHaveValue('http://127.0.0.1:8000');
     expect(within(nextCard).getByRole('textbox', { name: 'Model' })).toHaveValue('sweepai/sweep-next-edit-v2-7B');
-    expect(within(nextCard).getByRole('button', { name: 'Test' })).toBeInTheDocument();
+    expect(within(nextCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8000)' })).toBeInTheDocument();
     expect(within(nextCard).getByRole('button', { name: 'Apply' })).toBeInTheDocument();
     expect(within(nextCard).queryByRole('button', { name: /Download/ })).not.toBeInTheDocument();
     expect(within(nextCard).queryByText('not present')).not.toBeInTheDocument();
@@ -2390,7 +2456,7 @@ describe('T13 — dedicatedBackendId restoration + Apply write-back (CC-10, §4.
   it('the initial pane is the restored dedicatedBackendId candidate', async () => {
     const { nextCard } = await openNextForm(nextSurfaceData({ dedicatedBackendId: 'llamacpp' }));
     expect(within(nextCard).getByRole('button', { name: 'llama.cpp', pressed: true })).toBeInTheDocument();
-    expect(within(nextCard).getByText('llama.cpp: Ready ✓ — b4500')).toBeInTheDocument();
+    expect(within(nextCard).getByText('llama.cpp: Ready — b4500')).toBeInTheDocument();
   });
 
   it("absent ⇒ today's transport heuristic (backend ollama → the Ollama pane)", async () => {
@@ -2570,13 +2636,13 @@ describe('T14 — RAG ollama pane: the three embedding rows + endpoint-scoped pr
     expect(within(ragCard).getByRole('button', { name: 'Qwen3-Embedding 0.6B' })).toHaveAttribute('aria-pressed');
   });
 
-  it('a row on the probed daemon at the matching endpoint shows present ✓ (no Pull); absent rows keep Pull {tag} (~{size})', async () => {
+  it('a row on the probed daemon at the matching endpoint shows present (no Pull); absent rows keep Pull {tag} (~{size})', async () => {
     const { ragCard } = await openRagSection(
       ragSurfaceData({
         ollama: { ...baseData().ollama, models: [{ name: 'qwen3-embedding:0.6b', sizeBytes: 639_000_000 }] },
       }),
     );
-    expect(within(ragCard).getByText('present ✓')).toBeInTheDocument();
+    expect(within(ragCard).getByText('present')).toBeInTheDocument();
     expect(within(ragCard).queryByRole('button', { name: /^Pull qwen3-embedding:0\.6b/ })).not.toBeInTheDocument();
     expect(within(ragCard).getByRole('button', { name: /^Pull qwen3-embedding:4b/ })).toBeEnabled();
     expect(within(ragCard).getByRole('button', { name: /^Pull embeddinggemma:300m/ })).toBeEnabled();
@@ -2685,7 +2751,7 @@ describe('T14 — RAG llama.cpp pane: verified downloads for ALL three rows (F-3
     });
     const { ragCard } = await openLlamacppPane(ragSurfaceData({}, [presentRow, qwen3Embedding4bRow(), embeddingGemmaRow()]));
     expect(within(ragCard).getByText(/--embeddings --port 8081/)).toBeInTheDocument();
-    expect(within(ragCard).getByText("present in Talaria's model folder ✓")).toBeInTheDocument();
+    expect(within(ragCard).getByText("present in Talaria's model folder")).toBeInTheDocument();
     expect(within(ragCard).getByText('Then Apply the endpoint below.')).toBeInTheDocument();
   });
 
@@ -2747,13 +2813,14 @@ describe('T14 — card-level presence honesty (the §3.4 truth table, dom half)'
     renderPanel(
       baseData({ rag: { ...baseData().rag, enabled: true, embedModelPresent: true, embedEndpoint: 'http://10.0.0.9:11434' } }),
     );
-    expect(screen.queryByText('✓ Codebase index is ready — the agent can search your project.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Codebase index is ready — the agent can search your project.')).not.toBeInTheDocument();
   });
 
-  it("an unverifiable configured endpoint surfaces the honest 'not verified here' text at card level — neither a presence lie nor an absence lie", () => {
+  it("an unverifiable configured endpoint surfaces the honest 'not verified here' text at card level — neither a presence lie nor an absence lie (beta.6 panel-fix PT8, audit A7: the card-level suffix shortens; the full pointer stays row-level)", () => {
     renderPanel(baseData({ rag: { ...baseData().rag, embedEndpoint: 'http://10.0.0.9:11434' } }));
     const ragCard = must(screen.getByText('Codebase index (RAG)').closest('section'));
-    expect(within(ragCard).getByText('not verified here — Test the endpoint first.')).toBeInTheDocument();
+    expect(within(ragCard).getByText('not verified here')).toBeInTheDocument();
+    expect(within(ragCard).queryByText('not verified here — Test the endpoint first.')).not.toBeInTheDocument();
     expect(within(ragCard).queryByText('not present')).not.toBeInTheDocument();
   });
 
@@ -2764,7 +2831,7 @@ describe('T14 — card-level presence honesty (the §3.4 truth table, dom half)'
         ollama: { ...baseData().ollama, models: [{ name: 'nomic-embed-text:latest', sizeBytes: 1 }] },
       }),
     );
-    expect(screen.getByText('✓ Codebase index is ready — the agent can search your project.')).toBeInTheDocument();
+    expect(screen.getByText('Codebase index is ready — the agent can search your project.')).toBeInTheDocument();
   });
 
   it("provable absence at the configured endpoint keeps the card-level 'not present' text", () => {
@@ -3263,7 +3330,7 @@ describe('PT4 — FIM Install-tab selectable rows + pending draft (§3.2)', () =
 });
 
 describe('PT4 — FIM done line is endpoint-scoped presence for ollama (audit A4)', () => {
-  const FIM_GREEN = '✓ Autocomplete is active — open a file and start typing.';
+  const FIM_GREEN = 'Autocomplete is active — open a file and start typing.';
 
   it('daemon down ⇒ NO green line', () => {
     renderPanel(baseData({ ollama: { ...baseData().ollama, running: false } }));

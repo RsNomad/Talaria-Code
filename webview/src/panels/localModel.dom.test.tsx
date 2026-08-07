@@ -99,9 +99,9 @@ describe('LocalModelBlock — Ollama backend missing', () => {
 });
 
 describe('LocalModelBlock — Ollama backend ready', () => {
-  it('renders "Ollama: Ready ✓" and the row immediately (no gating)', () => {
+  it('renders "Ollama: Ready" and the row immediately (no gating)', () => {
     renderBlock({ ollama: ollamaWire({ running: true, version: '0.4.1' }) });
-    expect(screen.getByText('Ollama: Ready ✓ — 0.4.1')).toBeInTheDocument();
+    expect(screen.getByText('Ollama: Ready — 0.4.1')).toBeInTheDocument();
     expect(screen.getByText('Qwen2.5-Coder 1.5B (base)')).toBeInTheDocument();
   });
 });
@@ -124,9 +124,9 @@ describe('LocalModelBlock — Ollama model presence', () => {
     });
   });
 
-  it('present: shows "present ✓" and NO Pull button', () => {
+  it('present: shows "present" and NO Pull button', () => {
     renderBlock({ ollama: ollamaWire({ running: true, models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] }) });
-    expect(screen.getByText('present ✓')).toBeInTheDocument();
+    expect(screen.getByText('present')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Pull/ })).not.toBeInTheDocument();
   });
 
@@ -222,9 +222,9 @@ describe('LocalModelBlock — llama.cpp backend unknown (probe-timeout / win32)'
 });
 
 describe('LocalModelBlock — llama.cpp backend ready', () => {
-  it('renders "llama.cpp: Ready ✓ — {version}" and the row immediately', () => {
+  it('renders "llama.cpp: Ready — {version}" and the row immediately', () => {
     renderBlock({ backend: 'llamacpp', llamacppRuntime: { binary: 'found', version: 'b4500' } });
-    expect(screen.getByText('llama.cpp: Ready ✓ — b4500')).toBeInTheDocument();
+    expect(screen.getByText('llama.cpp: Ready — b4500')).toBeInTheDocument();
   });
 });
 
@@ -268,7 +268,7 @@ describe('LocalModelBlock — llama.cpp model presence', () => {
         }),
       ],
     });
-    expect(screen.getByText("present in Talaria's model folder ✓")).toBeInTheDocument();
+    expect(screen.getByText("present in Talaria's model folder")).toBeInTheDocument();
     expect(screen.getByText('llama-server -m /x/x.gguf --port 8080')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /copy/i })).toBeInTheDocument();
   });
@@ -321,8 +321,8 @@ describe('LocalModelBlock — llama.cpp "everything done" (all rows present)', (
         catalogModel({ id: 'b', displayName: 'Model B', llamacpp: { file: 'b.gguf', approxBytes: 1, present: true, available: true, runCommand: 'run b' } }),
       ],
     });
-    expect(screen.getByText('llama.cpp: Ready ✓ — b4500')).toBeInTheDocument();
-    expect(screen.getAllByText("present in Talaria's model folder ✓")).toHaveLength(2);
+    expect(screen.getByText('llama.cpp: Ready — b4500')).toBeInTheDocument();
+    expect(screen.getAllByText("present in Talaria's model folder")).toHaveLength(2);
     expect(screen.queryByRole('button', { name: /Download/ })).not.toBeInTheDocument();
   });
 });
