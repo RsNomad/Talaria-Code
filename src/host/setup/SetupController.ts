@@ -403,7 +403,7 @@ const HOST_SOURCED_PULL_REFUSAL =
   "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
 /** §6 "NEXT download unavailable (D3)" — the sha256 pin is still empty. */
 const NEXT_DOWNLOAD_UNAVAILABLE =
-  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 /** §6 "NEXT download remote-endpoint refusal (S-F3)" — ingest is loopback-only. */
 const NEXT_REMOTE_ENDPOINT_REFUSAL =
   'Verified downloads only run against a local Ollama (loopback). For a remote server, download and verify the model on that machine — see the guided instructions.';

@@ -2069,7 +2069,7 @@ describe('T7: onStatusChanged fires on confirmed-start, failure-write, success, 
 const HOST_SOURCED_REFUSAL_COPY =
   "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
 const DOWNLOAD_UNAVAILABLE_COPY =
-  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 const NEXT_WARNING_COPY =
   'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.';
 

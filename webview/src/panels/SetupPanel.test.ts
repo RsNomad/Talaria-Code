@@ -700,8 +700,19 @@ describe('§6 dedicated-NEXT copy constants — verbatim locks', () => {
   });
   it('NEXT_DOWNLOAD_UNAVAILABLE_TEXT', () => {
     expect(NEXT_DOWNLOAD_UNAVAILABLE_TEXT).toBe(
-      "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).",
+      "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.",
     );
+  });
+  it('NEXT_DOWNLOAD_UNAVAILABLE_TEXT stays byte-identical to the host twin (pair-lock, PT7)', () => {
+    // Host twin: `NEXT_DOWNLOAD_UNAVAILABLE` in src/host/setup/SetupController.ts.
+    // Webview and host are separate builds — this restates (does NOT import)
+    // the same literal. The host side's own verbatim locks live in
+    // SetupController.test.ts and SetupController.provisionModel.test.ts;
+    // this test is the explicit cross-file pairing assertion (critic C2-1/C2-4)
+    // so the two copies can never silently drift.
+    const HOST_TWIN_NEXT_DOWNLOAD_UNAVAILABLE =
+      "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
+    expect(NEXT_DOWNLOAD_UNAVAILABLE_TEXT).toBe(HOST_TWIN_NEXT_DOWNLOAD_UNAVAILABLE);
   });
 });
 

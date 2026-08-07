@@ -452,7 +452,7 @@ export const NEXT_POST_DOWNLOAD_NUDGE = '✓ Downloaded — press Apply to start
 /** §6 "NEXT download unavailable (D3)": renders where the ollama Model
  *  field's prefill would be while `!downloadReady` (R-3). */
 export const NEXT_DOWNLOAD_UNAVAILABLE_TEXT =
-  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 
 /** §6 "NEXT model line (D1)" — composed from the wire's own `displayName`
  *  rather than a second hardcoded copy of the same string. */

@@ -1013,7 +1013,7 @@ describe('NEXT card — R-3: ollama picked + modelDefaults.ollama empty (!downlo
     expect(modelField.value).toBe('');
     expect(
       within(nextCard).getByText(
-        "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).",
+        "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.",
       ),
     ).toBeInTheDocument();
     expect(within(nextCard).queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
@@ -2174,7 +2174,7 @@ describe('T12 — Test endpoint in the label + the Serving line (§3.1 flow)', (
 
 /** The §6 "Pinned-mode disabled (Sweep)" line — beta.5 string unchanged. */
 const NO_VETTED_BUILD_LINE =
-  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 
 /** T13: a NEXT-form fixture with all four candidate backends, a found
  *  llama-server, and the pinned sweep-next catalog row in a given state. */

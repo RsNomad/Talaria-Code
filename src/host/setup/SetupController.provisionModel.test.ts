@@ -28,7 +28,7 @@ const REMOTE_ENDPOINT_REFUSAL =
   'Verified downloads only run against a local Ollama (loopback). For a remote server, download and verify the model on that machine — see the guided instructions.';
 const INTEGRITY_REFUSAL = 'integrity check failed — refusing to download';
 const DOWNLOAD_UNAVAILABLE =
-  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 const TRUST_REFUSAL = 'Workspace is not trusted — Setup changes are disabled in Restricted Mode.';
 
 const LIBRARY_MODAL = "Pull model 'qwen2.5-coder:1.5b-base' from the Ollama registry onto 'http://127.0.0.1:11434'?";
