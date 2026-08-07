@@ -12,6 +12,8 @@ import {
   isHostSourcedModel,
   composeVllmCell,
   composeLlamacppCell,
+  redactForModal,
+  MODAL_UNSAFE_TEXT_PATTERN,
   type SetupHost,
   type SetupControllerDeps,
 } from './SetupController';
@@ -795,6 +797,44 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(host.settings.get('talaria.autocomplete.backend')).toBe('llamacpp');
     expect(host.settings.get('talaria.autocomplete.model')).toBe('qwen2.5-coder:7b-base');
   });
+
+  // --- CR-003: oldEndpoint (read from settings, not PT1-covered) is REDACTED,
+  // not refused, before it reaches the modal -----------------------------------
+
+  it('CR-003: a saved endpoint with a newline + bidi override cannot forge a line in the modal, and Apply still succeeds', async () => {
+    const bidiOverride = String.fromCharCode(0x202e);
+    const forged = `http://real-host:9000\nWARNING: this is FAKE trusted text${bidiOverride}`;
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': forged }),
+    });
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    // the write is still the NEW validated.url -- redaction never touches writes.
+    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434');
+  });
+
+  it('CR-003: a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': 'http://old-host:9000' }),
+    });
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('http://old-host:9000');
+  });
+
+  it('CR-003: a saved endpoint that is ALL unsafe chars redacts to empty -> falls back to (default)', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': `\n${String.fromCharCode(0x202e)}` }),
+    });
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain("from '(default)' to");
+  });
 });
 
 // --- setup.setNextEdit ---------------------------------------------------------
@@ -858,6 +898,118 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     expect(result.ok).toBe(false);
     expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
     expect(host.calls).toEqual([]);
+  });
+
+  // --- CR-003: oldEndpoint (read from settings, not PT1-covered) is REDACTED,
+  // not refused, before it reaches the modal -----------------------------------
+
+  it('CR-003: a saved endpoint with a newline + bidi override cannot forge a line in the modal, and Apply still succeeds', async () => {
+    const forged = 'http://real-dedicated:9000\nWARNING: this is FAKE trusted text\u202e';
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.nextEdit.endpoint': forged }),
+    });
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:1.5b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    // the write is still the NEW validated.url -- redaction never touches writes.
+    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:11434');
+  });
+
+  it('CR-003: a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.nextEdit.endpoint': 'http://old-dedicated:8000' }),
+    });
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:1.5b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('http://old-dedicated:8000');
+  });
+
+  it('CR-003: no saved endpoint -> unchanged "(none)" fallback', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:1.5b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain("from '(none)' to");
+  });
+});
+
+// --- CR-003: redactForModal ---------------------------------------------------
+
+describe('redactForModal (CR-003): neutralizes a saved value for modal display, never refuses', () => {
+  it('strips every member of the unsafe class from a mixed string', () => {
+    const input = 'before\nmid1\u202emid2\u0085mid3\u2028mid4\u200bmid5\u2029after';
+    const out = redactForModal(input);
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(out)).toBe(false);
+    expect(out).toBe('beforemid1mid2mid3mid4mid5after');
+  });
+
+  it('caps the result at 200 characters', () => {
+    const out = redactForModal('a'.repeat(250));
+    expect(out.length).toBe(200);
+    expect(out).toBe('a'.repeat(200));
+  });
+
+  it('leaves a normal endpoint untouched', () => {
+    expect(redactForModal('http://127.0.0.1:11434')).toBe('http://127.0.0.1:11434');
+  });
+
+  it('a value that is ALL unsafe chars redacts to the empty string', () => {
+    expect(redactForModal('\n\u202e')).toBe('');
+  });
+
+  it('a benign multi-codepoint emoji is untouched (no false-positive stripping)', () => {
+    expect(redactForModal('qwen-\u{1f680}-model')).toBe('qwen-\u{1f680}-model');
+  });
+});
+
+describe('CR-003 drift-lock: the REFUSE regex and the REDACT path cover the exact same char class', () => {
+  // one boundary codepoint per sub-range named in the MODAL_UNSAFE_TEXT_PATTERN
+  // doc comment (C0, DEL, C1 incl. NEL, zero-width/bidi marks, LINE/PARAGRAPH
+  // SEPARATOR, bidi override, isolates) -- both ends of each range where the
+  // range has more than one member. All expressed as \u escapes (never a raw
+  // control/bidi/format character in this source file).
+  const BOUNDARY_CODEPOINTS: { name: string; ch: string }[] = [
+    { name: 'C0 start (NUL, U+0000)', ch: '\x00' },
+    { name: 'C0 end (US, U+001F)', ch: '\x1f' },
+    { name: 'DEL (U+007F)', ch: '\x7f' },
+    { name: 'C1 start (U+0080)', ch: '\u0080' },
+    { name: 'NEL (C1, U+0085)', ch: '\u0085' },
+    { name: 'C1 end (U+009F)', ch: '\u009f' },
+    { name: 'zero-width/bidi marks start (U+200B)', ch: '\u200b' },
+    { name: 'zero-width/bidi marks end (U+200F)', ch: '\u200f' },
+    { name: 'LINE SEPARATOR (U+2028)', ch: '\u2028' },
+    { name: 'PARAGRAPH SEPARATOR (U+2029)', ch: '\u2029' },
+    { name: 'bidi override start (U+202A)', ch: '\u202a' },
+    { name: 'bidi override end (U+202E)', ch: '\u202e' },
+    { name: 'isolates start (U+2066)', ch: '\u2066' },
+    { name: 'isolates end (U+2069)', ch: '\u2069' },
+  ];
+
+  it('for every boundary codepoint, the refuse-pattern.test() and redactForModal() output agree', () => {
+    for (const { name, ch } of BOUNDARY_CODEPOINTS) {
+      expect(MODAL_UNSAFE_TEXT_PATTERN.test(ch), `refuse-pattern should flag ${name}`).toBe(true);
+      expect(redactForModal(ch), `redactForModal should strip ${name} to empty`).toBe('');
+    }
+  });
+
+  it('a benign printable ASCII character is untouched by both', () => {
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test('a')).toBe(false);
+    expect(redactForModal('a')).toBe('a');
   });
 });
 

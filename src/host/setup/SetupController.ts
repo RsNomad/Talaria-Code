@@ -529,8 +529,17 @@ function isLoopbackEndpoint(rawUrl: string): boolean {
  *  marks (U+200B-U+200F), the Unicode LINE/PARAGRAPH SEPARATORs
  *  (U+2028/U+2029), and bidi embedding/override (U+202A-U+202E) + isolate
  *  (U+2066-U+2069) controls. Any of these can forge extra lines or
- *  visually reorder a single-line native `showModal` prompt. */
-const MODAL_UNSAFE_TEXT_PATTERN = /[\x00-\x1f\x7f\u0080-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+ *  visually reorder a single-line native `showModal` prompt.
+ *
+ *  T2 (beta.6 panel-fix CR-003): factored into ONE source string so the
+ *  REFUSE regex ({@link MODAL_UNSAFE_TEXT_PATTERN}) and the REDACT regex
+ *  (used by {@link redactForModal}) are built from the exact same class and
+ *  can never silently drift apart. Do NOT hand-duplicate this class as a
+ *  second regex literal anywhere else in this file. */
+const MODAL_UNSAFE_CHARS = '\\x00-\\x1f\\x7f\\u0080-\\u009f\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069';
+export const MODAL_UNSAFE_TEXT_PATTERN = new RegExp(`[${MODAL_UNSAFE_CHARS}]`);
+/** T2 (CR-003): the global (strip-all-occurrences) variant of {@link MODAL_UNSAFE_TEXT_PATTERN} — see {@link redactForModal}. */
+const MODAL_UNSAFE_TEXT_PATTERN_G = new RegExp(`[${MODAL_UNSAFE_CHARS}]`, 'g');
 /** §7/§6 T1: the shared length cap for any free-text value that reaches a modal. */
 const MODAL_TEXT_MAX_LEN = 200;
 
@@ -551,6 +560,25 @@ function refuseUnsafeModalText(value: string, label: string): { ok: true } | { o
     return { ok: false, reason: `${label} contains characters that are not allowed in a confirmation prompt.` };
   }
   return { ok: true };
+}
+
+/**
+ * T2 (beta.6 panel-fix CR-003): NEUTRALIZE (never refuse) a value the user
+ * already has SAVED, before it is interpolated into a Tier-1 confirmation
+ * modal as an 'old' value (e.g. the current `talaria.autocomplete.endpoint`
+ * / `talaria.nextEdit.endpoint`, shown in the 'from X to Y' Apply prompt).
+ * Unlike {@link refuseUnsafeModalText} — which REFUSES a freshly-submitted
+ * param — refusing the whole Apply because a hand-edited settings.json has
+ * an odd character in the OLD value would trap the user out of fixing it.
+ * Strips every character in the same class as {@link MODAL_UNSAFE_TEXT_PATTERN}
+ * (built from the same {@link MODAL_UNSAFE_CHARS} source, so the two can
+ * never drift apart), then caps to {@link MODAL_TEXT_MAX_LEN}.
+ * DISPLAY-ONLY: never touches what gets WRITTEN to a setting — callers
+ * still write the validated/raw value, never this redacted copy.
+ */
+export function redactForModal(value: string): string {
+  const stripped = value.replace(MODAL_UNSAFE_TEXT_PATTERN_G, '');
+  return stripped.length > MODAL_TEXT_MAX_LEN ? stripped.slice(0, MODAL_TEXT_MAX_LEN) : stripped;
 }
 
 /** D9: which {@link SetupMethod}s are consequence-bearing mutations, gated
@@ -1320,7 +1348,11 @@ export class SetupController {
       if (!sanitized.ok) return sanitized;
     }
 
-    const oldEndpoint = (this.host.getSetting<string>('talaria.autocomplete.endpoint') ?? '').trim() || '(default)';
+    // T2 (beta.6 panel-fix CR-003): redact BEFORE the '(default)' fallback --
+    // trim -> redact -> fallback, so an endpoint that's ALL unsafe chars
+    // redacts to empty and correctly falls back to '(default)'. Display-only:
+    // the WRITE below still stores validated.url, never this redacted copy.
+    const oldEndpoint = redactForModal((this.host.getSetting<string>('talaria.autocomplete.endpoint') ?? '').trim()) || '(default)';
     const confirmed = await this.host.showModal(
       model
         ? `Switch autocomplete endpoint from '${oldEndpoint}' to '${validated.url}' (backend: ${descriptor.displayName}, model: ${model})?`
@@ -2203,7 +2235,11 @@ export class SetupController {
       return { ok: false, reason: "dedicatedBackendId must be one of 'ollama', 'llamacpp', 'vllm', 'openai-compat'." };
     }
 
-    const oldEndpoint = (this.host.getSetting<string>('talaria.nextEdit.endpoint') ?? '').trim() || '(none)';
+    // T2 (beta.6 panel-fix CR-003): redact BEFORE the '(none)' fallback --
+    // trim -> redact -> fallback, so an endpoint that's ALL unsafe chars
+    // redacts to empty and correctly falls back to '(none)'. Display-only:
+    // the WRITE below still stores validated.url, never this redacted copy.
+    const oldEndpoint = redactForModal((this.host.getSetting<string>('talaria.nextEdit.endpoint') ?? '').trim()) || '(none)';
     const confirmed = await this.host.showModal(
       `Set dedicated Next-Edit endpoint from '${oldEndpoint}' to '${validated.url}' (model: ${model})?`,
       'Apply',
