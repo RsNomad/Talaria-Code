@@ -511,11 +511,14 @@ function isLoopbackEndpoint(rawUrl: string): boolean {
   }
 }
 
-/** T1 (beta.6 panel-fix PT1): the modal-forging character class — C0/C1
- *  controls, DEL, zero-width characters + directional marks, and bidi
- *  embedding/override/isolate controls. Any of these can forge extra lines
- *  or visually reorder a single-line native `showModal` prompt. */
-const MODAL_UNSAFE_TEXT_PATTERN = /[\x00-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/;
+/** T1 (beta.6 panel-fix PT1, CR-001 fix): the modal-forging character
+ *  class — covers exactly: C0 controls (U+0000-U+001F), DEL (U+007F), C1
+ *  controls incl. NEL (U+0080-U+009F), zero-width characters + directional
+ *  marks (U+200B-U+200F), the Unicode LINE/PARAGRAPH SEPARATORs
+ *  (U+2028/U+2029), and bidi embedding/override (U+202A-U+202E) + isolate
+ *  (U+2066-U+2069) controls. Any of these can forge extra lines or
+ *  visually reorder a single-line native `showModal` prompt. */
+const MODAL_UNSAFE_TEXT_PATTERN = /[\x00-\x1f\x7f\u0080-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
 /** §7/§6 T1: the shared length cap for any free-text value that reaches a modal. */
 const MODAL_TEXT_MAX_LEN = 200;
 

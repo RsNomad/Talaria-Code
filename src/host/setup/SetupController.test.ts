@@ -731,6 +731,57 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(host.calls).toEqual([]);
   });
 
+  // CR-001: the char class must also cover C1 controls (incl. NEL, U+0085)
+  // and the Unicode LINE/PARAGRAPH SEPARATORs (U+2028/U+2029) — VS Code's
+  // Chromium-based modal renders these as forced line breaks, which can
+  // forge an extra line in a native trust modal.
+  it('T1 sanitation sweep: a U+2028 LINE SEPARATOR model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u2028evil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a U+2029 PARAGRAPH SEPARATOR model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u2029evil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a U+0085 NEL (C1 control) model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u0085evil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a benign model name with a multi-codepoint emoji still passes (no false positive)', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen-\u{1f680}-model',
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.get('talaria.autocomplete.model')).toBe('qwen-\u{1f680}-model');
+  });
+
   it('T1 (C2-10a): llamacpp + model -> accepted-and-written, not special-cased', async () => {
     const { host, controller } = makeController();
     const result = await controller.handle('setup.applyFim', {
@@ -868,6 +919,7 @@ describe('T1: handleApplyFim / handleSetRag write-path guarantee (full-param spy
         const writeKeys = host.calls
           .filter((c) => c.startsWith('write:'))
           .map((c) => c.slice('write:'.length).match(/^[^=]*/)?.[0] ?? '');
+        expect(writeKeys.length).toBeGreaterThan(0);
         for (const k of writeKeys) {
           expect(k.startsWith('talaria.autocomplete.')).toBe(true);
         }
