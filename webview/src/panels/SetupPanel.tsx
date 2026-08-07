@@ -56,11 +56,15 @@ import {
   type AgentModelBackend,
   CANCEL_LABEL,
   cancelPullParams,
+  CATALOG_DEFAULT_CHIP_LABEL,
   catalogPresence,
   catalogPresenceText,
   configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
   dedicatedInitialCandidateId,
+  // beta.6 T18 (§3.5) — start-screen model recommendations
+  deriveRecommendations,
+  divergenceCaptionText,
   FIM_LLAMACPP_NUDGE,
   FIM_OLLAMA_PULL_NUDGE,
   fimDoneLine,
@@ -68,6 +72,7 @@ import {
   fimInstallTestEndpoint,
   initDedicatedFormFieldState,
   isComingSoon,
+  meterSegments,
   mutationDisabledReason,
   NEXT_DOWNLOAD_BUTTON_LABEL,
   NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
@@ -89,12 +94,20 @@ import {
   ragDoneLine,
   ragEmbedPresence,
   ragInitialBackend,
+  RECS_DISCLOSURE_SUMMARY,
+  RECS_MOE_NOTE,
+  RECS_ROLE_LABEL,
+  RECS_STRIP_HEADING,
+  RECS_STRIP_INTRO,
   reconcileDedicatedFormFields,
+  roleLineText,
   splitGuidedLine,
+  stackLineText,
   testConnectionLabel,
   TRUST_DISABLED_REASON,
   type NextPresence,
   type RagEmbedBackend,
+  type RoleRec,
   type SetupProgressMap,
 } from './setupCards';
 
@@ -179,6 +192,7 @@ function SetupCards({
         </div>
       )}
 
+      <RecommendationsBlock setup={setup} />
       <AgentCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
       <ProviderCard setup={setup} dispatch={dispatch} disabledReason={disabledReason} />
       <FimCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
@@ -199,10 +213,15 @@ function SetupCards({
  * Shared primitives
  * ------------------------------------------------------------------ */
 
-function Card({ title, children }: { title: string; children: ReactNode }) {
+/**
+ * `id`, when given, becomes BOTH the `<section>`'s own id (the recs strip's
+ * `Set up →` `scrollIntoView` target) and, via `${id}-heading`, the
+ * focusable heading id (beta.6 T18, B-F6). Every pre-T18 caller omits it.
+ */
+function Card({ title, children, id }: { title: string; children: ReactNode; id?: string }) {
   return (
-    <section className="mb-3 rounded-card border border-border bg-surface p-3">
-      <SectionLabel>{title}</SectionLabel>
+    <section id={id} className="mb-3 rounded-card border border-border bg-surface p-3">
+      <SectionLabel id={id !== undefined ? `${id}-heading` : undefined}>{title}</SectionLabel>
       {children}
     </section>
   );
@@ -392,6 +411,119 @@ function TextField({
 }
 
 /* ------------------------------------------------------------------ *
+ * beta.6 T18 (§3.5) — start-screen model recommendations, Home 1
+ * (dynamic strip, mounted ABOVE the Agent card). Pure derivation lives in
+ * `setupCards.ts` (`deriveRecommendations` + friends) — B-F7's render gate
+ * is enforced THERE: an `undefined` result means this component renders
+ * nothing at all, not even the `Card` wrapper. Home 2 (the static
+ * walkthrough markdown, `media/walkthrough-setup.md`) shares the §6 rule
+ * but not this code — see `src/host/walkthroughRecs.test.ts`.
+ * ------------------------------------------------------------------ */
+
+/** The stack meter's three fill colors — the EXISTING semantic tone tokens
+ *  (`bg-accent`/`bg-add`/`bg-warn`, already used elsewhere in this file for
+ *  the pull-progress bar and BackendOptionRow selection state) repurposed
+ *  purely for visual segment separation; no new palette (GC7). */
+const RECS_METER_SEGMENT_CLASS: Record<'agent' | 'fim' | 'embedding', string> = {
+  agent: 'bg-accent',
+  fim: 'bg-add',
+  embedding: 'bg-warn',
+};
+
+/**
+ * B-F6 — the recs strip's `Set up →` jump: IN-PANEL ONLY. Scrolls the
+ * owning card's `<section id={cardId}>` into view and moves focus to its
+ * heading (`${cardId}-heading`, `tabIndex={-1}` via `SectionLabel`/`Card`).
+ * NO dispatch, no expand — the four target cards have no collapsed state.
+ */
+function jumpToCard(cardId: string): void {
+  const section = document.getElementById(cardId);
+  section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.getElementById(`${cardId}-heading`)?.focus();
+}
+
+function RecommendationsBlock({ setup }: { setup: SetupData }) {
+  const recs = deriveRecommendations(setup);
+  if (!recs) return null;
+
+  return (
+    <Card title={RECS_STRIP_HEADING}>
+      <p className="mb-2 text-2xs text-muted">{RECS_STRIP_INTRO}</p>
+      <div className="mb-2.5 flex flex-col gap-2">
+        <RecRoleLine rec={recs.agent} />
+        <RecRoleLine rec={recs.fim} />
+        <RecRoleLine rec={recs.embedding} />
+        <RecRoleLine rec={recs.next} />
+      </div>
+      <p className="mb-1.5 text-2xs text-fg">{stackLineText(recs.agent, recs.fim, recs.embedding, recs.stack)}</p>
+      {/* B-F1/§3.5 signature element: a single segmented bar sharing the
+          stack line's own rounded numbers by construction (one derivation,
+          two renderings). Purely decorative reinforcement of the text line
+          directly above it — `aria-hidden`, never the ONLY carrier of this
+          information (color-not-only). */}
+      <div aria-hidden="true" className="mb-3 flex h-1.5 w-full overflow-hidden rounded-full bg-border">
+        {meterSegments(recs.agent, recs.fim, recs.embedding).map((seg) => (
+          <div
+            key={seg.role}
+            style={{ width: `${seg.pct}%` }}
+            className={`h-full ${RECS_METER_SEGMENT_CLASS[seg.role]}`}
+          />
+        ))}
+      </div>
+      <details>
+        <summary className="cursor-pointer select-none font-mono text-2xs uppercase tracking-wide text-muted hover:text-accent">
+          {RECS_DISCLOSURE_SUMMARY}
+        </summary>
+        <ul className="mt-2 flex flex-col gap-1 pl-4 text-2xs text-muted [list-style-type:disc]">
+          <li>{recs.tiers.tier8}</li>
+          <li>{recs.tiers.tier1216}</li>
+          <li>{recs.tiers.tier24}</li>
+          <li>{recs.tiers.tier32}</li>
+        </ul>
+        <p className="mt-2 text-2xs text-faint">{RECS_MOE_NOTE}</p>
+      </details>
+    </Card>
+  );
+}
+
+/**
+ * One role line: `{Role} · {displayName} — {size} GiB` + `Default` chip +
+ * vramLine + `Set up →` (+ divergence caption). The NEXT/Sweep row is the
+ * one exception (§3.5): while `rec.nextReady === false`, the `Default` chip
+ * and vramLine are REPLACED by the NEXT card's own fail-closed text
+ * (`NEXT_DOWNLOAD_UNAVAILABLE_TEXT`, single-sourced from `setupCards.ts`,
+ * never restated) — the strip must never claim "recommended" for an
+ * unpinned model.
+ */
+function RecRoleLine({ rec }: { rec: RoleRec }) {
+  const caption = divergenceCaptionText(rec);
+  const showDefaultChip = rec.nextReady === undefined || rec.nextReady === true;
+
+  return (
+    <div className="flex flex-col gap-1 border-b border-border pb-2 last:border-0 last:pb-0">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="font-mono text-2xs text-fg">{roleLineText(rec)}</span>
+        {showDefaultChip && <Pill tone="accent">{CATALOG_DEFAULT_CHIP_LABEL}</Pill>}
+      </div>
+      {rec.nextReady === false ? (
+        <p className="text-2xs text-faint">{NEXT_DOWNLOAD_UNAVAILABLE_TEXT}</p>
+      ) : (
+        <span className="text-2xs text-muted">{rec.vramLine}</span>
+      )}
+      {caption && <span className="text-2xs text-faint">{caption}</span>}
+      <button
+        type="button"
+        aria-label={`Set up → ${RECS_ROLE_LABEL[rec.role]} card`}
+        onClick={() => jumpToCard(rec.cardId)}
+        className="self-start font-mono text-2xs text-accent hover:underline"
+      >
+        Set up →
+      </button>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
  * Card 1 — Agent
  * ------------------------------------------------------------------ */
 
@@ -455,7 +587,7 @@ function AgentCard({
       : undefined;
 
   return (
-    <Card title="Agent">
+    <Card title="Agent" id="setup-card-agent">
       <div className="mb-2 flex flex-col gap-1.5">
         {agent.options.map((o) => (
           <BackendOptionRow key={o.id} option={o} selected={o.id === agent.selectedId} />
@@ -846,7 +978,7 @@ function FimCard({
 
   if (!option) {
     return (
-      <Card title="Autocomplete (FIM)">
+      <Card title="Autocomplete (FIM)" id="setup-card-fim">
         <p className="text-2xs text-faint">No autocomplete backends available.</p>
       </Card>
     );
@@ -856,7 +988,7 @@ function FimCard({
   const showInstallTab = hasLocal && mode === 'install';
 
   return (
-    <Card title="Autocomplete (FIM)">
+    <Card title="Autocomplete (FIM)" id="setup-card-fim">
       <DoneLine text={fimDoneLine(fim)} className="mb-2" />
       <div className="mb-2 flex flex-col gap-1.5">
         {fim.options.map((o) => (
@@ -1285,7 +1417,7 @@ function NextEditCard({
   const showWarning = next.dedicated !== undefined && (nextEdit.next || showForm);
 
   return (
-    <Card title="Next Edit (NEXT)">
+    <Card title="Next Edit (NEXT)" id="setup-card-next">
       <DoneLine text={nextDoneLine(next.source)} className="mb-2" />
       <p className="mb-2 text-2xs text-muted">
         Want NEXT (multi-line next-edit)? Two modes: <strong className="text-fg">Generic</strong> reuses your FIM
@@ -1605,7 +1737,7 @@ function RagCard({
   const presence = ragEmbedPresence(setup.ollama, rag);
 
   return (
-    <Card title="Codebase index (RAG)">
+    <Card title="Codebase index (RAG)" id="setup-card-embedding">
       <DoneLine text={ragDoneLine(rag, presence)} className="mb-2" />
       {rag.preconditionDetail && (
         <div className="mb-2 rounded border border-warn bg-warn-soft px-2 py-1.5 text-2xs text-fg">

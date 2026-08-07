@@ -939,3 +939,268 @@ export function ragEmbedPresence(
 ): NextPresence {
   return catalogPresence(ollama, rag.embedEndpoint, { ollamaTag: rag.embedModel });
 }
+
+// ---------------------------------------------------------------------------
+// beta.6 T18 (§3.5/§6): start-screen model recommendations —
+// `RecommendationsBlock`'s pure derivation. Two homes share this rule: the
+// Setup panel's dynamic strip (this module + `SetupPanel.tsx`'s
+// `RecommendationsBlock`) and the static walkthrough markdown (locked
+// against `MODEL_CATALOG` by `src/host/walkthroughRecs.test.ts`, a SEPARATE
+// anchor-based parser — deliberately not sharing code with this module,
+// since one side is host-static-markdown and the other is webview-runtime).
+//
+// B-F1 (load-bearing): every model NAME and NUMBER below is INTERPOLATED
+// from the wire's `SetupCatalogModel` rows — this module owns no catalog
+// facts of its own. Only frame text (labels, punctuation, the tier-bucket
+// prose) is §6-static. `SetupPanel.test.ts`'s scoped source-scan enforces
+// this over `setupCards.ts` + `SetupPanel.tsx` (zero hardcoded byte counts
+// or display-name phrases).
+// ---------------------------------------------------------------------------
+
+/** B-F3 — the pinned "24 GB card, ~22 GiB usable" constant the stack line's
+ *  `{left}` and the meter's track both derive from. */
+export const USABLE_VRAM_24GB_GIB = 22;
+
+const BYTES_PER_GIB = 2 ** 30;
+
+/** §6 rounding rule, core primitive: round-HALF-UP to 1 decimal place. Plain
+ *  `Math.round` already rounds ties toward +Infinity for positive inputs
+ *  (every value this module ever rounds), which IS half-up. */
+function roundHalfUp1dp(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+/** §6 rounding rule: `GiB = bytes / 2^30`, 1 decimal, half-up — computed
+ *  from EXACT wire bytes only, never from an already-rounded value. */
+export function roundGiB(bytes: number): number {
+  return roundHalfUp1dp(bytes / BYTES_PER_GIB);
+}
+
+/** {@link roundGiB}, formatted for display — always exactly one decimal
+ *  (`toFixed(1)`), so a whole-GiB value still prints e.g. `'2.0'`, never `'2'`. */
+export function formatGiB(bytes: number): string {
+  return roundGiB(bytes).toFixed(1);
+}
+
+export const RECS_STRIP_HEADING = 'Recommended local models';
+export const RECS_STRIP_INTRO =
+  'Pick by your GPU — sizes are the download; running adds context memory + ~2 GiB buffers.';
+export const RECS_DISCLOSURE_SUMMARY = 'What fits my hardware?';
+/** §6 MoE honesty note — the same sentence `modelCatalog.ts`'s
+ *  `MOE_HONESTY_NOTE` carries per-row; restated here as static §6 frame text
+ *  (the `<details>` block is not tied to any one wire row), never a second
+ *  paraphrase. */
+export const RECS_MOE_NOTE =
+  'MoE ≠ smaller: a 35B MoE still needs ~20 GiB for weights — only compute is light (~3B active per token).';
+
+/** Exported so `SetupPanel.tsx`'s `RecommendationsBlock` can build a
+ *  per-role accessible name for its four identical-text `Set up →`
+ *  buttons without a second copy of this map. */
+export const RECS_ROLE_LABEL: Record<SetupCatalogModel['role'], string> = {
+  agent: 'Agent',
+  fim: 'FIM',
+  embedding: 'Embedder',
+  next: 'NEXT',
+};
+
+/** B-F6 jump targets — `SetupPanel.tsx`'s four cards each carry one of these
+ *  as their `<Card id>`, with `${id}-heading` on the focusable heading. */
+const RECS_ROLE_CARD_ID: Record<SetupCatalogModel['role'], string> = {
+  agent: 'setup-card-agent',
+  fim: 'setup-card-fim',
+  embedding: 'setup-card-embedding',
+  next: 'setup-card-next',
+};
+
+/** One recs-strip role line's resolved, already-rounded facts (B-F5). */
+export interface RoleRec {
+  role: SetupCatalogModel['role'];
+  /** B-F6 jump target — the owning card's container id. */
+  cardId: string;
+  displayName: string;
+  /** EXACT default-path/Ollama-tier bytes (`ollamaApproxBytes`) — the stack
+   *  line's sum is computed from THESE, never from rounded parts. */
+  bytes: number;
+  /** {@link formatGiB} of `bytes` — the role line's `{size}`. */
+  sizeGiB: string;
+  vramLine: string;
+  /** B-F5: the llama.cpp tier's rounded GiB, present ONLY when it differs
+   *  from `sizeGiB` after rounding (not merely a differing raw byte count). */
+  divergenceGiB?: string;
+  /** ONLY meaningful for `role === 'next'` — mirrors the NEXT card's own
+   *  `nextEdit.dedicated.downloadReady` wire truth. `undefined` for the
+   *  other three roles (their `Default` chip always shows). While `false`,
+   *  the strip renders the NEXT card's own fail-closed text instead of the
+   *  `Default` chip — NEVER "recommended" for an unpinned model (§3.5). */
+  nextReady?: boolean;
+}
+
+/** B-F5: `{size}` = the row's default-path/Ollama-tier bytes (`ollamaApproxBytes`
+ *  — already uniform across the library/hf-ingest tiers at the host, per
+ *  `SetupController.ts`'s wire projection). `undefined` when that byte count
+ *  is missing — a defaultForRole row with no truthful size does not "resolve"
+ *  (B-F7). */
+function baseRoleRec(row: SetupCatalogModel): RoleRec | undefined {
+  if (typeof row.ollamaApproxBytes !== 'number') return undefined;
+  const bytes = row.ollamaApproxBytes;
+  const sizeGiB = formatGiB(bytes);
+  const llamacppBytes = row.llamacpp?.approxBytes;
+  const llamacppGiB = llamacppBytes !== undefined ? formatGiB(llamacppBytes) : undefined;
+  return {
+    role: row.role,
+    cardId: RECS_ROLE_CARD_ID[row.role],
+    displayName: row.displayName,
+    bytes,
+    sizeGiB,
+    vramLine: row.vramLine,
+    divergenceGiB: llamacppGiB !== undefined && llamacppGiB !== sizeGiB ? llamacppGiB : undefined,
+  };
+}
+
+function findDefaultRow(
+  models: readonly SetupCatalogModel[],
+  role: SetupCatalogModel['role'],
+): SetupCatalogModel | undefined {
+  return models.find((m) => m.role === role && m.defaultForRole === true);
+}
+
+function findRow(
+  models: readonly SetupCatalogModel[],
+  role: SetupCatalogModel['role'],
+  id: string,
+): SetupCatalogModel | undefined {
+  return models.find((m) => m.role === role && m.id === id);
+}
+
+/** §6 role-line TEMPLATE: `{Role} · {displayName} — {size} GiB`. */
+export function roleLineText(rec: RoleRec): string {
+  return `${RECS_ROLE_LABEL[rec.role]} · ${rec.displayName} — ${rec.sizeGiB} GiB`;
+}
+
+/** §6 divergence caption, present only where {@link baseRoleRec} found the
+ *  two tiers' ROUNDED sizes actually differ. */
+export function divergenceCaptionText(rec: RoleRec): string | undefined {
+  return rec.divergenceGiB !== undefined ? `llama.cpp build differs: ${rec.divergenceGiB} GiB` : undefined;
+}
+
+/** The stack line's shared numbers (B-F1/B-F3) — sum and leftover, each
+ *  rounded ONCE from an exact byte quantity (never summed from
+ *  already-rounded parts, per the §6 rounding rule). */
+export interface StackRec {
+  sumGiB: string;
+  leftGiB: string;
+}
+
+function stackRecommendation(agent: RoleRec, fim: RoleRec, embedding: RoleRec): StackRec {
+  const exactSumBytes = agent.bytes + fim.bytes + embedding.bytes;
+  const sumGiBExact = exactSumBytes / BYTES_PER_GIB;
+  const leftGiBExact = USABLE_VRAM_24GB_GIB - sumGiBExact;
+  return {
+    sumGiB: roundHalfUp1dp(sumGiBExact).toFixed(1),
+    leftGiB: roundHalfUp1dp(leftGiBExact).toFixed(1),
+  };
+}
+
+/** §6 stack-line TEMPLATE — interpolated from the three non-NEXT
+ *  `defaultForRole` rows; `{left}` is anchored to {@link USABLE_VRAM_24GB_GIB}
+ *  (B-F3), the 45K figure is derivation-anchored prose (Part 0.2), not a
+ *  computed value. */
+export function stackLineText(agent: RoleRec, fim: RoleRec, embedding: RoleRec, stack: StackRec): string {
+  return (
+    `A 24 GB GPU runs the full stack: ${agent.displayName} (${agent.sizeGiB} GiB) + ` +
+    `${fim.displayName} (${fim.sizeGiB} GiB) + ${embedding.displayName} (${embedding.sizeGiB} GiB) ` +
+    `≈ ${stack.sumGiB} GiB — about ${stack.leftGiB} GiB left for context ` +
+    `(roughly 45K tokens at fp16 KV — see Part 0.2's fit model).`
+  );
+}
+
+/** One segment of the stack meter — the signature element (§3.5): a single
+ *  segmented bar sharing the stack line's own rounded numbers, never a
+ *  second derivation. `pct` is against the {@link USABLE_VRAM_24GB_GIB}
+ *  track. */
+export interface MeterSegment {
+  role: 'agent' | 'fim' | 'embedding';
+  pct: number;
+}
+
+export function meterSegments(agent: RoleRec, fim: RoleRec, embedding: RoleRec): MeterSegment[] {
+  return [
+    { role: 'agent', pct: (Number(agent.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'fim', pct: (Number(fim.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'embedding', pct: (Number(embedding.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
+  ];
+}
+
+/** The `<details>` tier lines (B-F1/B-F4) — frame text is §6-static, every
+ *  model name interpolated from the wire. `tier1216` degrades gracefully
+ *  (never a crash, never a literal `undefined`) when the two non-default
+ *  reference rows (`qwen25-coder-7b`, `gpt-oss-20b`) are absent from a
+ *  partial wire fixture — production always ships all 13 rows. */
+export interface RecsTiers {
+  tier8: string;
+  tier1216: string;
+  tier24: string;
+  tier32: string;
+}
+
+const RECS_TIER_1216_FALLBACK = '12–16 GB: larger FIM tiers; at 16 GB: larger agent tiers (tight)';
+
+function recsTiers(models: readonly SetupCatalogModel[], fimDefault: RoleRec, agentDefault: RoleRec): RecsTiers {
+  const fim7b = findRow(models, 'fim', 'qwen25-coder-7b');
+  const gptOss = findRow(models, 'agent', 'gpt-oss-20b');
+  return {
+    tier8: `~8 GB: ${fimDefault.displayName} · all embedders — agent models need more`,
+    tier1216:
+      fim7b && gptOss
+        ? `12–16 GB: + ${fim7b.displayName}; at 16 GB: ${gptOss.displayName} (tight)`
+        : RECS_TIER_1216_FALLBACK,
+    tier24: `24 GB: any single agent model — ${agentDefault.displayName} is the sweet spot; MoE 35Bs need CPU-offload`,
+    tier32: '32 GB+: everything, incl. MoE 35Bs fully resident',
+  };
+}
+
+/** The recs strip's full derived payload (B-F1/B-F7). */
+export interface RecommendationsData {
+  agent: RoleRec;
+  fim: RoleRec;
+  embedding: RoleRec;
+  next: RoleRec;
+  stack: StackRec;
+  tiers: RecsTiers;
+}
+
+/**
+ * B-F7 render gate: `undefined` unless `catalog` is present AND all four
+ * `defaultForRole` rows resolve (role present + a positive `ollamaApproxBytes`
+ * to print) — the ONLY thing `RecommendationsBlock` checks before deciding
+ * whether to render anything at all.
+ */
+export function deriveRecommendations(
+  setup: Pick<SetupData, 'catalog' | 'nextEdit'>,
+): RecommendationsData | undefined {
+  const models = setup.catalog?.models;
+  if (!models) return undefined;
+
+  const agentRow = findDefaultRow(models, 'agent');
+  const fimRow = findDefaultRow(models, 'fim');
+  const embeddingRow = findDefaultRow(models, 'embedding');
+  const nextRow = findDefaultRow(models, 'next');
+  if (!agentRow || !fimRow || !embeddingRow || !nextRow) return undefined;
+
+  const agent = baseRoleRec(agentRow);
+  const fim = baseRoleRec(fimRow);
+  const embedding = baseRoleRec(embeddingRow);
+  const nextBase = baseRoleRec(nextRow);
+  if (!agent || !fim || !embedding || !nextBase) return undefined;
+
+  const next: RoleRec = { ...nextBase, nextReady: setup.nextEdit.dedicated?.downloadReady === true };
+
+  return {
+    agent,
+    fim,
+    embedding,
+    next,
+    stack: stackRecommendation(agent, fim, embedding),
+    tiers: recsTiers(models, fim, agent),
+  };
+}

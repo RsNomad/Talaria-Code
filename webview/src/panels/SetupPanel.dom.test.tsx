@@ -14,7 +14,13 @@ import userEvent from '@testing-library/user-event';
 import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
 import { NEXT_EDIT_ROWS } from './nextEditCopy';
 import { SetupPanel } from './SetupPanel';
-import { agentPhaseLabel, PIPX_INSTALL_DOCS_URL, PYTHON_VERSION_HELP_URL, TRUST_DISABLED_REASON } from './setupCards';
+import {
+  agentPhaseLabel,
+  NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
+  PIPX_INSTALL_DOCS_URL,
+  PYTHON_VERSION_HELP_URL,
+  TRUST_DISABLED_REASON,
+} from './setupCards';
 import { DECLINED } from '../state/panels';
 import { must } from '../testing/must';
 
@@ -2738,5 +2744,294 @@ describe('T14 — card-level presence honesty (the §3.4 truth table, dom half)'
     renderPanel(ragSurfaceData());
     const ragCard = must(screen.getByText('Codebase index (RAG)').closest('section'));
     expect(within(ragCard).getByText('not present')).toBeInTheDocument();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T18 (§3.5): `RecommendationsBlock` — the dynamic Home 1 strip,
+ * mounted above the Agent card. Pure derivation is covered in the pure
+ * `SetupPanel.test.ts`; this file asserts WIRING — that the gate actually
+ * withholds/renders the DOM, that the jump actually scrolls+focuses with
+ * NO dispatch, and that the meter is genuinely `aria-hidden`.
+ * ------------------------------------------------------------------ */
+
+describe('T18 — RecommendationsBlock strip (§3.5)', () => {
+  function recsAgentRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'devstral-24b',
+      role: 'agent',
+      defaultForRole: true,
+      displayName: 'Devstral-24B (2507)',
+      publisher: 'mistralai',
+      license: 'Apache-2.0',
+      vramLine: '24GB-comfortable — the sweet spot: ~55K ctx fp16-KV / ~110K Q8-KV; 128K window',
+      progressId: 'devstral-24b',
+      ollamaCreatedName: 'devstral-small-2507:24b',
+      ollamaApproxBytes: 14_333_915_904,
+      llamacpp: { file: 'Devstral-Small-2507-Q4_K_M.gguf', approxBytes: 14_333_915_904, present: false, available: true },
+      vllm: { runCommand: 'vllm serve mistralai/Devstral-Small-2507' },
+      ...overrides,
+    };
+  }
+  function recsFimRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'qwen25-coder-1.5b',
+      role: 'fim',
+      defaultForRole: true,
+      displayName: 'Qwen2.5-Coder 1.5B (base)',
+      publisher: 'ggml-org',
+      license: 'Apache-2.0',
+      vramLine: 'any modern GPU (~1–2 GB)',
+      progressId: 'qwen25-coder-1.5b',
+      ollamaTag: 'qwen2.5-coder:1.5b-base',
+      ollamaApproxBytes: 986_000_000,
+      llamacpp: { file: 'qwen2.5-coder-1.5b-q8_0.gguf', approxBytes: 1_646_573_056, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen2.5-Coder-1.5B' },
+      ...overrides,
+    };
+  }
+  function recsEmbeddingRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'qwen3-embedding-0.6b',
+      role: 'embedding',
+      defaultForRole: true,
+      displayName: 'Qwen3-Embedding 0.6B',
+      publisher: 'Qwen',
+      license: 'Apache-2.0',
+      vramLine: '< 1.5 GB',
+      progressId: 'qwen3-embedding-0.6b',
+      ollamaTag: 'qwen3-embedding:0.6b',
+      ollamaApproxBytes: 639_000_000,
+      llamacpp: { file: 'Qwen3-Embedding-0.6B-Q8_0.gguf', approxBytes: 639_150_592, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen3-Embedding-0.6B' },
+      ...overrides,
+    };
+  }
+  function recsNextRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'sweep-next',
+      role: 'next',
+      defaultForRole: true,
+      displayName: 'Sweep Next-Edit v2 (7B)',
+      publisher: 'SyntinalCo',
+      license: 'Apache-2.0',
+      vramLine: 'Q4 ≈ 5 GB',
+      progressId: 'sweep-next',
+      ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+      ollamaApproxBytes: 4_680_000_000,
+      llamacpp: { file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf', approxBytes: 4_680_000_000, present: false, available: true },
+      vllm: { runCommand: 'vllm serve sweepai/sweep-next-edit-v2-7B' },
+      ...overrides,
+    };
+  }
+
+  function recsCatalog(): SetupCatalogModel[] {
+    return [recsAgentRow(), recsFimRow(), recsEmbeddingRow(), recsNextRow()];
+  }
+
+  function recsData(overrides: Partial<SetupData> = {}): SetupData {
+    return baseData({ catalog: { models: recsCatalog() }, ...overrides });
+  }
+
+  describe('render gate (B-F7)', () => {
+    // Structural check (not just "no heading text") — the Agent card must
+    // be the VERY FIRST element in the panel body, proving
+    // `RecommendationsBlock` returned `null` (no DOM node at all), not some
+    // OTHER, unlabelled markup. `ready: false` suppresses the (unrelated)
+    // "You're ready" banner, which would otherwise be a legitimate
+    // preceding sibling of its own and mask this check.
+    function agentCardHasNoPrecedingSibling(): void {
+      const agentSection = must(document.getElementById('setup-card-agent'));
+      expect(agentSection.previousElementSibling).toBeNull();
+    }
+
+    it('renders NOTHING when catalog is absent', () => {
+      renderPanel(recsData({ catalog: undefined, ready: false }));
+      expect(screen.queryByText('Recommended local models')).not.toBeInTheDocument();
+      agentCardHasNoPrecedingSibling();
+    });
+
+    it('renders NOTHING when a defaultForRole row is missing (embedding, here)', () => {
+      const models = recsCatalog().filter((m) => m.role !== 'embedding');
+      renderPanel(recsData({ catalog: { models }, ready: false }));
+      expect(screen.queryByText('Recommended local models')).not.toBeInTheDocument();
+      agentCardHasNoPrecedingSibling();
+    });
+
+    it('renders the strip once all four defaults resolve', () => {
+      renderPanel(recsData());
+      expect(screen.getByText('Recommended local models')).toBeInTheDocument();
+    });
+  });
+
+  it('renders the four role lines, each template-derived from the wire (B-F1/B-F5)', () => {
+    renderPanel(recsData());
+    expect(screen.getByText('Agent · Devstral-24B (2507) — 13.3 GiB')).toBeInTheDocument();
+    expect(screen.getByText('FIM · Qwen2.5-Coder 1.5B (base) — 0.9 GiB')).toBeInTheDocument();
+    expect(screen.getByText('Embedder · Qwen3-Embedding 0.6B — 0.6 GiB')).toBeInTheDocument();
+    expect(screen.getByText('NEXT · Sweep Next-Edit v2 (7B) — 4.4 GiB')).toBeInTheDocument();
+  });
+
+  it('a catalog byte/name edit re-renders the strip correctly (B-F1 self-truing, no second drift-lock)', () => {
+    const edited = recsCatalog().map((m) =>
+      m.id === 'devstral-24b' ? { ...m, displayName: 'Mock-Agent-X', ollamaApproxBytes: 10_000_000_000 } : m,
+    );
+    renderPanel(recsData({ catalog: { models: edited } }));
+    expect(screen.getByText(/Mock-Agent-X — 9\.3 GiB/)).toBeInTheDocument();
+    expect(screen.queryByText(/Devstral-24B \(2507\)/)).not.toBeInTheDocument();
+  });
+
+  it('renders the strip ABOVE (before, in DOM order) the Agent card', () => {
+    renderPanel(recsData());
+    const recsHeading = screen.getByText('Recommended local models');
+    const agentHeading = screen.getByText('Agent');
+    // eslint-disable-next-line no-bitwise
+    expect(recsHeading.compareDocumentPosition(agentHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('every role line carries a Default chip (color-not-only: text chip, never color alone)', () => {
+    renderPanel(recsData());
+    const chips = screen.getAllByText('Default');
+    // Four roles; NEXT's chip counts too because downloadReady defaults true in baseData()'s dedicated fixture.
+    expect(chips.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('FIM divergence caption renders where the rounded tiers actually diverge (0.9 vs 1.5)', () => {
+    renderPanel(recsData());
+    expect(screen.getByText('llama.cpp build differs: 1.5 GiB')).toBeInTheDocument();
+  });
+
+  it('Agent/Embedding/NEXT carry NO divergence caption (rounded tiers equal)', () => {
+    renderPanel(recsData());
+    expect(screen.queryAllByText(/llama\.cpp build differs/)).toHaveLength(1);
+  });
+
+  /** The NEXT role line's OUTER row container (role text + chip live in an
+   *  inner flex-wrap div; walking up once more reaches the row that also
+   *  holds the vramLine/fail-closed paragraph + jump button) — scoping here
+   *  is required because `Default`/the fail-closed text are NOT unique
+   *  across the strip's four rows. */
+  function nextRowContainer(): HTMLElement {
+    const roleSpan = screen.getByText('NEXT · Sweep Next-Edit v2 (7B) — 4.4 GiB');
+    const innerDiv = must(roleSpan.closest('div'));
+    return must(innerDiv.parentElement);
+  }
+
+  describe('NEXT/Sweep fail-closed (§3.5) — never "recommended" while unpinned', () => {
+    it('downloadReady: true -> Default chip + vramLine (same vocabulary as the other three roles)', () => {
+      renderPanel(
+        recsData({
+          nextEdit: {
+            ...baseData().nextEdit,
+            dedicated: { ...must(baseData().nextEdit.dedicated), downloadReady: true },
+          },
+        }),
+      );
+      const nextLine = must(nextRowContainer());
+      expect(within(nextLine).getByText('Default')).toBeInTheDocument();
+      expect(within(nextLine).getByText('Q4 ≈ 5 GB')).toBeInTheDocument();
+      expect(screen.queryByText(NEXT_DOWNLOAD_UNAVAILABLE_TEXT)).not.toBeInTheDocument();
+    });
+
+    it("downloadReady: false -> the NEXT card's own fail-closed text, NO Default chip on that row", () => {
+      renderPanel(
+        recsData({
+          nextEdit: {
+            ...baseData().nextEdit,
+            dedicated: { ...must(baseData().nextEdit.dedicated), downloadReady: false },
+          },
+        }),
+      );
+      const nextLine = must(nextRowContainer());
+      expect(within(nextLine).getByText(NEXT_DOWNLOAD_UNAVAILABLE_TEXT)).toBeInTheDocument();
+      expect(within(nextLine).queryByText('Default')).not.toBeInTheDocument();
+      expect(within(nextLine).queryByText(/recommended/i)).not.toBeInTheDocument();
+    });
+  });
+
+  describe('stack line + meter (B-F1/B-F3) — one derivation, two renderings', () => {
+    it('the stack line (text-equivalent) is present', () => {
+      renderPanel(recsData());
+      expect(
+        screen.getByText(
+          'A 24 GB GPU runs the full stack: Devstral-24B (2507) (13.3 GiB) + Qwen2.5-Coder 1.5B (base) (0.9 GiB) + ' +
+            'Qwen3-Embedding 0.6B (0.6 GiB) ≈ 14.9 GiB — about 7.1 GiB left for context (roughly 45K tokens at ' +
+            "fp16 KV — see Part 0.2's fit model).",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('the meter is aria-hidden (decorative only — the stack line above it is the text-equivalent)', () => {
+      renderPanel(recsData());
+      const recsSection = must(screen.getByText('Recommended local models').closest('section'));
+      const meter = recsSection.querySelector('[aria-hidden="true"]');
+      expect(meter).toBeInTheDocument();
+      // Exactly 3 fill segments inside the aria-hidden track (agent/fim/embedding).
+      expect(meter?.children).toHaveLength(3);
+    });
+  });
+
+  describe('<details> disclosure (B-F1/B-F4) — default-closed, tier lines + MoE note', () => {
+    it('is closed by default', () => {
+      renderPanel(recsData());
+      const recsSection = must(screen.getByText('Recommended local models').closest('section'));
+      const details = recsSection.querySelector('details');
+      expect(details?.open).toBe(false);
+    });
+
+    it('contains all four tier lines with gpt-oss-20b in the 16 GB bucket (fallback text when the 7B/gpt-oss rows are absent from this fixture)', () => {
+      renderPanel(recsData());
+      const summary = screen.getByText('What fits my hardware?');
+      const details = must(summary.closest('details'));
+      expect(within(details).getByText(/~8 GB:/)).toBeInTheDocument();
+      expect(within(details).getByText(/12–16 GB:/)).toBeInTheDocument();
+      expect(within(details).getByText(/24 GB:/)).toBeInTheDocument();
+      expect(within(details).getByText(/32 GB\+:/)).toBeInTheDocument();
+    });
+
+    it('carries the MoE honesty note verbatim', () => {
+      renderPanel(recsData());
+      expect(
+        screen.getByText(
+          'MoE ≠ smaller: a 35B MoE still needs ~20 GiB for weights — only compute is light (~3B active per token).',
+        ),
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe('Set up → jump (B-F6) — in-panel scroll + focus, NEVER dispatch/expand', () => {
+    it('clicking the Agent row’s jump scrolls + focuses the Agent card heading, and issues NO dispatch', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user, dispatch } = renderPanel(recsData());
+      const btn = screen.getByRole('button', { name: 'Set up → Agent card' });
+      await user.click(btn);
+      expect(scrollSpy).toHaveBeenCalled();
+      expect(document.activeElement?.id).toBe('setup-card-agent-heading');
+      expect(dispatch).not.toHaveBeenCalled();
+      scrollSpy.mockRestore();
+    });
+
+    it('clicking the NEXT row’s jump targets the NEXT card, not the Agent card', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user, dispatch } = renderPanel(recsData());
+      const btn = screen.getByRole('button', { name: 'Set up → NEXT card' });
+      await user.click(btn);
+      expect(document.activeElement?.id).toBe('setup-card-next-heading');
+      expect(dispatch).not.toHaveBeenCalled();
+      scrollSpy.mockRestore();
+    });
+
+    it('clicking a jump does NOT expand any card (e.g. the NEXT card’s "Manage dedicated setup" form stays collapsed)', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      await user.click(screen.getByRole('button', { name: 'Set up → NEXT card' }));
+      // Scoped to the NEXT card itself (other cards render their OWN,
+      // unrelated "Endpoint" fields unconditionally) — the dedicated-NEXT
+      // form's Endpoint field only renders once the form is expanded, and
+      // must still be absent there after the jump.
+      const nextCard = must(document.getElementById('setup-card-next'));
+      expect(within(nextCard).queryByLabelText('Endpoint')).not.toBeInTheDocument();
+      scrollSpy.mockRestore();
+    });
   });
 });

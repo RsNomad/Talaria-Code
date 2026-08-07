@@ -86,6 +86,19 @@ import {
   testConnectionLabel,
   TRUST_DISABLED_REASON,
   type SetupProgressMap,
+  // beta.6 T18 (§3.5) — start-screen model recommendations
+  deriveRecommendations,
+  divergenceCaptionText,
+  formatGiB,
+  meterSegments,
+  RECS_DISCLOSURE_SUMMARY,
+  RECS_MOE_NOTE,
+  RECS_STRIP_HEADING,
+  RECS_STRIP_INTRO,
+  roleLineText,
+  roundGiB,
+  stackLineText,
+  USABLE_VRAM_24GB_GIB,
 } from './setupCards';
 
 const ALL_PHASES: AgentSetupPhase[] = [
@@ -1415,5 +1428,420 @@ describe('T14 — the beta.5 wrong-daemon presence boolean: webview consumption 
     expect(protocolSrc).toContain('@deprecated beta.6 T14');
     expect(controllerSrc).toContain(`${WIRE_BOOLEAN}: ollamaStatus.running`);
     expect(controllerSrc).toContain('@deprecated beta.6 T14');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T18 (§3.5/§6): start-screen model recommendations —
+ * `RecommendationsBlock`'s pure derivation (the strip's DOM wiring lives
+ * in `SetupPanel.dom.test.tsx`; the walkthrough's anchor-parity lock lives
+ * in `src/host/walkthroughRecs.test.ts`).
+ * ------------------------------------------------------------------ */
+
+describe('T18 — recs strip pure derivation (§3.5, B-F1..B-F8)', () => {
+  // Byte-exact fixtures mirroring MODEL_CATALOG's own rows (test-local copies
+  // are fine here — the "zero hardcoded model data" rule (B-F1) binds the
+  // PRODUCTION sources scanned below, not test fixtures).
+  function agentDefaultRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'devstral-24b',
+      role: 'agent',
+      defaultForRole: true,
+      displayName: 'Devstral-24B (2507)',
+      publisher: 'mistralai',
+      license: 'Apache-2.0',
+      vramLine: '24GB-comfortable — the sweet spot: ~55K ctx fp16-KV / ~110K Q8-KV; 128K window',
+      progressId: 'devstral-24b',
+      ollamaCreatedName: 'devstral-small-2507:24b',
+      ollamaApproxBytes: 14_333_915_904,
+      llamacpp: { file: 'Devstral-Small-2507-Q4_K_M.gguf', approxBytes: 14_333_915_904, present: false, available: true },
+      vllm: { runCommand: 'vllm serve mistralai/Devstral-Small-2507' },
+      ...overrides,
+    };
+  }
+  function fimDefaultRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'qwen25-coder-1.5b',
+      role: 'fim',
+      defaultForRole: true,
+      displayName: 'Qwen2.5-Coder 1.5B (base)',
+      publisher: 'ggml-org',
+      license: 'Apache-2.0',
+      vramLine: 'any modern GPU (~1–2 GB)',
+      progressId: 'qwen25-coder-1.5b',
+      ollamaTag: 'qwen2.5-coder:1.5b-base',
+      ollamaApproxBytes: 986_000_000,
+      llamacpp: { file: 'qwen2.5-coder-1.5b-q8_0.gguf', approxBytes: 1_646_573_056, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen2.5-Coder-1.5B' },
+      ...overrides,
+    };
+  }
+  function fim7bRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'qwen25-coder-7b',
+      role: 'fim',
+      displayName: 'Qwen2.5-Coder 7B (base)',
+      publisher: 'ggml-org',
+      license: 'Apache-2.0',
+      vramLine: 'Ollama Q4 ≈ 6 GB · llama.cpp Q8 ≈ 9–10 GB',
+      progressId: 'qwen25-coder-7b',
+      ollamaTag: 'qwen2.5-coder:7b-base',
+      ollamaApproxBytes: 4_700_000_000,
+      llamacpp: { file: 'qwen2.5-coder-7b-q8_0.gguf', approxBytes: 8_098_525_600, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen2.5-Coder-7B' },
+      ...overrides,
+    };
+  }
+  function embeddingDefaultRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'qwen3-embedding-0.6b',
+      role: 'embedding',
+      defaultForRole: true,
+      displayName: 'Qwen3-Embedding 0.6B',
+      publisher: 'Qwen',
+      license: 'Apache-2.0',
+      vramLine: '< 1.5 GB',
+      progressId: 'qwen3-embedding-0.6b',
+      ollamaTag: 'qwen3-embedding:0.6b',
+      ollamaApproxBytes: 639_000_000,
+      llamacpp: { file: 'Qwen3-Embedding-0.6B-Q8_0.gguf', approxBytes: 639_150_592, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen3-Embedding-0.6B' },
+      ...overrides,
+    };
+  }
+  function gptOssRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'gpt-oss-20b',
+      role: 'agent',
+      displayName: 'gpt-oss-20b',
+      publisher: 'ggml-org',
+      license: 'Apache-2.0',
+      vramLine: '24GB-easy (100K+ ctx)',
+      progressId: 'gpt-oss-20b',
+      ollamaTag: 'gpt-oss:20b',
+      ollamaApproxBytes: 14_000_000_000,
+      llamacpp: { file: 'gpt-oss-20b-MXFP4.gguf', approxBytes: 12_109_566_624, present: false, available: true },
+      vllm: { runCommand: 'vllm serve openai/gpt-oss-20b' },
+      ...overrides,
+    };
+  }
+  function sweepNextDefaultRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'sweep-next',
+      role: 'next',
+      defaultForRole: true,
+      displayName: 'Sweep Next-Edit v2 (7B)',
+      publisher: 'SyntinalCo',
+      license: 'Apache-2.0',
+      vramLine: 'Q4 ≈ 5 GB',
+      progressId: 'sweep-next',
+      ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+      ollamaApproxBytes: 4_680_000_000,
+      llamacpp: { file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf', approxBytes: 4_680_000_000, present: false, available: true },
+      vllm: { runCommand: 'vllm serve sweepai/sweep-next-edit-v2-7B' },
+      ...overrides,
+    };
+  }
+
+  const FULL_CATALOG: SetupCatalogModel[] = [
+    agentDefaultRow(),
+    fimDefaultRow(),
+    fim7bRow(),
+    embeddingDefaultRow(),
+    gptOssRow(),
+    sweepNextDefaultRow(),
+  ];
+
+  function nextEditFixture(overrides: Partial<SetupData['nextEdit']> = {}): SetupData['nextEdit'] {
+    return {
+      source: 'off',
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: '',
+      dedicatedConfigured: false,
+      genericSupported: true,
+      dedicated: {
+        displayName: 'Sweep Next-Edit v2 (7B)',
+        modelDefaults: { ollama: 'sweep-next-edit-v2-7b:q4_k_m', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+        downloadReady: true,
+        downloadApproxBytes: 4_680_000_000,
+        warning: 'warn',
+        guided: { vllm: 'vllm serve x' },
+      },
+      ...overrides,
+    };
+  }
+
+  function setupFixture(
+    catalogModels: SetupCatalogModel[] | undefined,
+    nextEditOverrides: Partial<SetupData['nextEdit']> = {},
+  ): Pick<SetupData, 'catalog' | 'nextEdit'> {
+    return {
+      catalog: catalogModels ? { models: catalogModels } : undefined,
+      nextEdit: nextEditFixture(nextEditOverrides),
+    };
+  }
+
+  describe('§6 rounding rule — bytes/2^30, 1dp, half-up, exact-bytes only', () => {
+    it('USABLE_VRAM_24GB_GIB is the pinned 22 GiB constant (B-F3)', () => {
+      expect(USABLE_VRAM_24GB_GIB).toBe(22);
+    });
+
+    it('roundGiB: Devstral (14_333_915_904) -> 13.3', () => {
+      expect(roundGiB(14_333_915_904)).toBe(13.3);
+    });
+    it('roundGiB: FIM-1.5B ollama bytes (986_000_000) -> 0.9', () => {
+      expect(roundGiB(986_000_000)).toBe(0.9);
+    });
+    it('roundGiB: embed-0.6B (639_000_000) -> 0.6', () => {
+      expect(roundGiB(639_000_000)).toBe(0.6);
+    });
+    it('roundGiB: half-up tie (1.25 GiB exactly) rounds to 1.3, never 1.2', () => {
+      expect(roundGiB(1_342_177_280)).toBe(1.3);
+    });
+    it('formatGiB always prints exactly one decimal, even for a whole number', () => {
+      expect(formatGiB(2 * 2 ** 30)).toBe('2.0');
+    });
+  });
+
+  describe('render gate (B-F7) — nothing unless catalog present AND all four defaults resolve', () => {
+    it('undefined catalog -> undefined (no strip)', () => {
+      expect(deriveRecommendations(setupFixture(undefined))).toBeUndefined();
+    });
+    it('catalog present but missing the agent default -> undefined', () => {
+      const models = FULL_CATALOG.filter((m) => !(m.role === 'agent' && m.defaultForRole));
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('catalog present but missing the fim default -> undefined', () => {
+      const models = FULL_CATALOG.filter((m) => !(m.role === 'fim' && m.defaultForRole));
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('catalog present but missing the embedding default -> undefined', () => {
+      const models = FULL_CATALOG.filter((m) => !(m.role === 'embedding' && m.defaultForRole));
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('catalog present but missing the next default -> undefined', () => {
+      const models = FULL_CATALOG.filter((m) => !(m.role === 'next' && m.defaultForRole));
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('a defaultForRole row with no ollamaApproxBytes does not "resolve" (no truthful size to print)', () => {
+      const models = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: undefined } : m,
+      );
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('all four defaults present -> resolves', () => {
+      expect(deriveRecommendations(setupFixture(FULL_CATALOG))).toBeDefined();
+    });
+  });
+
+  describe('role lines (B-F1/B-F5) — template-derived from the wire, zero hardcoded data', () => {
+    const recs = deriveRecommendations(setupFixture(FULL_CATALOG));
+
+    it('agent line', () => {
+      expect(roleLineText(mustRec(recs).agent)).toBe('Agent · Devstral-24B (2507) — 13.3 GiB');
+    });
+    it('fim line', () => {
+      expect(roleLineText(mustRec(recs).fim)).toBe('FIM · Qwen2.5-Coder 1.5B (base) — 0.9 GiB');
+    });
+    it('embedding line', () => {
+      expect(roleLineText(mustRec(recs).embedding)).toBe('Embedder · Qwen3-Embedding 0.6B — 0.6 GiB');
+    });
+    it('next line', () => {
+      expect(roleLineText(mustRec(recs).next)).toBe('NEXT · Sweep Next-Edit v2 (7B) — 4.4 GiB');
+    });
+
+    it('self-truing (B-F1): editing the catalog byte/name re-derives correctly, no second drift-lock', () => {
+      const edited = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, displayName: 'Mock-Agent-X', ollamaApproxBytes: 10_000_000_000 } : m,
+      );
+      const edRecs = mustRec(deriveRecommendations(setupFixture(edited)));
+      expect(roleLineText(edRecs.agent)).toBe(`Agent · Mock-Agent-X — ${formatGiB(10_000_000_000)} GiB`);
+    });
+  });
+
+  describe('divergence caption (B-F5) — present only where the rounded tiers actually diverge', () => {
+    const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG)));
+
+    it('FIM: 0.9 (ollama) vs 1.5 (llama.cpp Q8) -> caption present', () => {
+      expect(divergenceCaptionText(recs.fim)).toBe('llama.cpp build differs: 1.5 GiB');
+    });
+    it('Agent: identical bytes on both tiers -> no caption', () => {
+      expect(divergenceCaptionText(recs.agent)).toBeUndefined();
+    });
+    it('Embedding: 0.6 vs 0.6 (rounds equal despite differing raw bytes) -> no caption', () => {
+      expect(divergenceCaptionText(recs.embedding)).toBeUndefined();
+    });
+    it('NEXT: identical bytes on both tiers -> no caption', () => {
+      expect(divergenceCaptionText(recs.next)).toBeUndefined();
+    });
+  });
+
+  describe('stack line + meter (B-F1/B-F3) — one derivation, shared by both renderings', () => {
+    const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG)));
+
+    it('sumGiB is the EXACT byte sum, rounded once (not sum-of-rounded-parts)', () => {
+      expect(recs.stack.sumGiB).toBe('14.9');
+    });
+    it('leftGiB = rule-rounded (USABLE_VRAM_24GB_GIB - exact byte sum)', () => {
+      expect(recs.stack.leftGiB).toBe('7.1');
+    });
+    it('stackLineText matches the §6 TEMPLATE verbatim with today’s data', () => {
+      // The architecture doc's inline illustration abbreviates the FIM
+      // display name (drops "(base)"); the real catalog row's displayName
+      // carries it, and B-F1 requires interpolating the REAL wire value —
+      // this expectation matches `MODEL_CATALOG`'s actual `displayName`.
+      expect(stackLineText(recs.agent, recs.fim, recs.embedding, recs.stack)).toBe(
+        'A 24 GB GPU runs the full stack: Devstral-24B (2507) (13.3 GiB) + Qwen2.5-Coder 1.5B (base) (0.9 GiB) + ' +
+          'Qwen3-Embedding 0.6B (0.6 GiB) ≈ 14.9 GiB — about 7.1 GiB left for context (roughly 45K tokens at ' +
+          "fp16 KV — see Part 0.2's fit model).",
+      );
+    });
+    it('meterSegments: three segments, rule-rounded values against the 22 GiB track', () => {
+      const segs = meterSegments(recs.agent, recs.fim, recs.embedding);
+      expect(segs.map((s) => s.role)).toEqual(['agent', 'fim', 'embedding']);
+      expect(segs[0]?.pct).toBeCloseTo((13.3 / 22) * 100, 5);
+      expect(segs[1]?.pct).toBeCloseTo((0.9 / 22) * 100, 5);
+      expect(segs[2]?.pct).toBeCloseTo((0.6 / 22) * 100, 5);
+    });
+  });
+
+  describe('tier lines + MoE note (B-F1/B-F4) — frame text static, names/sizes interpolated', () => {
+    it('all four tier lines + gpt-oss in the 16 GB bucket (never 12 GB)', () => {
+      const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG)));
+      expect(recs.tiers.tier8).toBe('~8 GB: Qwen2.5-Coder 1.5B (base) · all embedders — agent models need more');
+      expect(recs.tiers.tier1216).toBe('12–16 GB: + Qwen2.5-Coder 7B (base); at 16 GB: gpt-oss-20b (tight)');
+      expect(recs.tiers.tier24).toBe(
+        '24 GB: any single agent model — Devstral-24B (2507) is the sweet spot; MoE 35Bs need CPU-offload',
+      );
+      expect(recs.tiers.tier32).toBe('32 GB+: everything, incl. MoE 35Bs fully resident');
+    });
+
+    it('gracefully degrades (no crash) when the non-default 7B/gpt-oss rows are absent from the wire', () => {
+      const minimal = FULL_CATALOG.filter((m) => m.defaultForRole);
+      const recs = mustRec(deriveRecommendations(setupFixture(minimal)));
+      expect(recs.tiers.tier1216).not.toContain('undefined');
+    });
+
+    it('RECS_MOE_NOTE — §6 MoE honesty note, verbatim', () => {
+      expect(RECS_MOE_NOTE).toBe(
+        'MoE ≠ smaller: a 35B MoE still needs ~20 GiB for weights — only compute is light (~3B active per token).',
+      );
+    });
+  });
+
+  describe('NEXT/Sweep fail-closed (B-F5, §3.5) — mirrors the NEXT card, never "recommended" while unpinned', () => {
+    it('absent `dedicated` entirely -> fail-closed by default (R-3 posture), nextReady false', () => {
+      const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG, { dedicated: undefined })));
+      expect(recs.next.nextReady).toBe(false);
+    });
+    it('downloadReady: true (published pin) -> nextReady true', () => {
+      const recs = mustRec(
+        deriveRecommendations(
+          setupFixture(FULL_CATALOG, {
+            dedicated: {
+              displayName: 'Sweep Next-Edit v2 (7B)',
+              modelDefaults: { ollama: 'sweep-next-edit-v2-7b:q4_k_m', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+              downloadReady: true,
+              downloadApproxBytes: 4_680_000_000,
+              warning: 'warn',
+              guided: { vllm: 'vllm serve x' },
+            },
+          }),
+        ),
+      );
+      expect(recs.next.nextReady).toBe(true);
+    });
+    it('downloadReady: false (unpinned, today’s actual state) -> nextReady false', () => {
+      const recs = mustRec(
+        deriveRecommendations(
+          setupFixture(FULL_CATALOG, {
+            dedicated: {
+              displayName: 'Sweep Next-Edit v2 (7B)',
+              modelDefaults: { ollama: '', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+              downloadReady: false,
+              downloadApproxBytes: 4_680_000_000,
+              warning: 'warn',
+              guided: { vllm: 'vllm serve x' },
+            },
+          }),
+        ),
+      );
+      expect(recs.next.nextReady).toBe(false);
+    });
+    it('the strip NEVER hardcodes the word "recommended" for NEXT — it reuses the NEXT card’s own fail-closed text', () => {
+      // NEXT_DOWNLOAD_UNAVAILABLE_TEXT is the single source of truth the NEXT
+      // card itself renders (setupCards.ts) — the recs strip must reuse it,
+      // not restate a second copy.
+      expect(NEXT_DOWNLOAD_UNAVAILABLE_TEXT).not.toMatch(/recommended/i);
+    });
+  });
+
+  describe('strip frame copy (§6) — verbatim + single-sourced', () => {
+    it('RECS_STRIP_HEADING', () => {
+      expect(RECS_STRIP_HEADING).toBe('Recommended local models');
+    });
+    it('RECS_STRIP_INTRO', () => {
+      expect(RECS_STRIP_INTRO).toBe('Pick by your GPU — sizes are the download; running adds context memory + ~2 GiB buffers.');
+    });
+    it('RECS_DISCLOSURE_SUMMARY', () => {
+      expect(RECS_DISCLOSURE_SUMMARY).toBe('What fits my hardware?');
+    });
+  });
+
+  function mustRec(value: RecsResult): NonNullable<RecsResult> {
+    if (value === undefined) throw new Error('fixture bug: deriveRecommendations resolved to undefined');
+    return value;
+  }
+  type RecsResult = ReturnType<typeof deriveRecommendations>;
+});
+
+describe('T18 — scoped source-scan: ZERO hardcoded model data in the recs strip sources (rule 5, B-F1)', () => {
+  // Scoped to the two hand-written files T18 touches — NOT modelCatalog.ts
+  // (pure DATA, the legitimate single source) and NOT the test fixtures
+  // above (which intentionally mirror catalog data to exercise the pure
+  // derivation without a live wire fetch).
+  const setupCardsSrc = readFileSync(join(__dirname, 'setupCards.ts'), 'utf-8');
+  const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+
+  // Long/distinctive catalog facts (exact byte counts + full display-name
+  // phrases) that must NEVER appear as source literals — every one of these
+  // must instead flow from a `SetupCatalogModel` wire row at render time.
+  const FORBIDDEN_HARDCODED_MODEL_DATA = [
+    '14_333_915_904',
+    '14333915904',
+    '986_000_000',
+    '986000000',
+    '1_646_573_056',
+    '1646573056',
+    '639_000_000',
+    '639000000',
+    '639_150_592',
+    '639150592',
+    '4_680_000_000',
+    '4680000000',
+    '8_098_525_600',
+    '8098525600',
+    // NOTE: 'Devstral-24B (2507)' is intentionally NOT in this list — T12's
+    // pre-existing `AGENT_DEFAULT_MODEL_CAPTION` (§6 "Devstral default
+    // caption") already carries it as its own owned, unrelated §6 string;
+    // T18's OWN functions (`roleLineText`/`stackLineText`/`recsTiers`) never
+    // write it as a literal — they interpolate `row.displayName` — so this
+    // list stays scoped to facts T18 alone would ever hardcode.
+    'Qwen2.5-Coder 1.5B (base)',
+    'Qwen2.5-Coder 7B (base)',
+    'Qwen3-Embedding 0.6B',
+    'Sweep Next-Edit v2 (7B)',
+  ];
+
+  it('setupCards.ts carries none of these literals', () => {
+    for (const s of FORBIDDEN_HARDCODED_MODEL_DATA) {
+      expect(setupCardsSrc, `found forbidden literal "${s}" in setupCards.ts`).not.toContain(s);
+    }
+  });
+  it('SetupPanel.tsx carries none of these literals', () => {
+    for (const s of FORBIDDEN_HARDCODED_MODEL_DATA) {
+      expect(setupPanelSrc, `found forbidden literal "${s}" in SetupPanel.tsx`).not.toContain(s);
+    }
   });
 });
