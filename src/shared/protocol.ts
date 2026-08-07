@@ -764,7 +764,6 @@ export interface SetupData {
       prefixInjectionRemote: boolean;
       warmUp: boolean;
     };
-    probe?: { ok: boolean; detail: string; models?: string[] };
   };
   /** Card 4 — NEXT (multi-line next-edit) info panel + dedicated-setup flow. */
   nextEdit: {

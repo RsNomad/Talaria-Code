@@ -537,7 +537,6 @@ export const panelData: PanelDataMap = {
         prefixInjectionRemote: false,
         warmUp: true,
       },
-      probe: { ok: true, detail: 'reachable', models: ['qwen2.5-coder:1.5b-base'] },
     },
     nextEdit: {
       source: 'generic',
