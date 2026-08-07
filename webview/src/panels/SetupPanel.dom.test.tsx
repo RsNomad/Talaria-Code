@@ -725,8 +725,15 @@ describe('B5 "done / what next" one-line status under each card (§6, T10)', () 
     expect(screen.getByText('✓ Next-edit suggestions are on (reusing your FIM model).')).toBeInTheDocument();
   });
 
-  it('RAG card shows the done line once green', () => {
-    renderPanel(baseData({ rag: { ...baseData().rag, enabled: true, embedModelPresent: true } }));
+  it('RAG card shows the done line once green (T14: green = endpoint-scoped presence, never the deprecated wire boolean)', () => {
+    // The daemon at the CONFIGURED embed endpoint genuinely lists the model —
+    // the wire's `embedModelPresent` stays FALSE to prove it is ignored.
+    renderPanel(
+      baseData({
+        rag: { ...baseData().rag, enabled: true },
+        ollama: { ...baseData().ollama, models: [...baseData().ollama.models, { name: 'nomic-embed-text', sizeBytes: 1 }] },
+      }),
+    );
     expect(screen.getByText('✓ Codebase index is ready — the agent can search your project.')).toBeInTheDocument();
   });
 
@@ -2385,5 +2392,351 @@ describe('T13 — dedicatedBackendId restoration + Apply write-back (CC-10, §4.
       'setup.setNextEdit',
       expect.objectContaining({ backend: 'ollama', dedicatedBackendId: 'ollama' }),
     );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T14 (§3.4): RAG surface on LocalModelBlock.
+ * ------------------------------------------------------------------ */
+
+/** T14: the three REAL embedding catalog rows as `projectCatalogModel` ships
+ *  them — field values mirror `modelCatalog.ts` byte-for-byte (T13's
+ *  fixture-fidelity discipline; the ctx note is the row's own wire `note`). */
+function qwen3Embedding06Row(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'qwen3-embedding-0.6b',
+    role: 'embedding',
+    displayName: 'Qwen3-Embedding 0.6B',
+    publisher: 'Qwen',
+    license: 'Apache-2.0',
+    defaultForRole: true,
+    vramLine: '< 1.5 GB',
+    progressId: 'qwen3-embedding-0.6b',
+    ollamaTag: 'qwen3-embedding:0.6b',
+    ollamaApproxBytes: 639_000_000,
+    llamacpp: { file: 'Qwen3-Embedding-0.6B-Q8_0.gguf', approxBytes: 639_150_592, present: false, available: true },
+    vllm: { runCommand: 'vllm serve Qwen/Qwen3-Embedding-0.6B' },
+    ...overrides,
+  };
+}
+
+function qwen3Embedding4bRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'qwen3-embedding-4b',
+    role: 'embedding',
+    displayName: 'Qwen3-Embedding 4B',
+    publisher: 'Qwen',
+    license: 'Apache-2.0',
+    contextWindow: 40960,
+    vramLine: '≈ 3 GB',
+    progressId: 'qwen3-embedding-4b',
+    ollamaTag: 'qwen3-embedding:4b',
+    ollamaApproxBytes: 2_500_000_000,
+    llamacpp: { file: 'Qwen3-Embedding-4B-Q4_K_M.gguf', approxBytes: 2_496_703_776, present: false, available: true },
+    vllm: { runCommand: 'vllm serve Qwen/Qwen3-Embedding-4B' },
+    ...overrides,
+  };
+}
+
+function embeddingGemmaRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'embeddinggemma-300m',
+    role: 'embedding',
+    displayName: 'EmbeddingGemma 300M',
+    publisher: 'ggml-org',
+    license: 'Gemma',
+    contextWindow: 2048,
+    vramLine: '< 1 GB',
+    note: '2K context on the Ollama build — fine for Talaria’s chunk sizes (≤512 tokens).',
+    progressId: 'embeddinggemma-300m',
+    ollamaTag: 'embeddinggemma:300m',
+    ollamaApproxBytes: 622_000_000,
+    llamacpp: { file: 'embeddinggemma-300M-Q8_0.gguf', approxBytes: 333_590_944, present: false, available: true },
+    vllm: { runCommand: 'vllm serve google/embeddinggemma-300m' },
+    ...overrides,
+  };
+}
+
+/** T13 note 4 honored: EXTENDS `baseData()`'s catalog (sweep-next stays in),
+ *  never replaces the array. */
+function ragSurfaceData(overrides: Partial<SetupData> = {}, rows?: SetupCatalogModel[]): SetupData {
+  const base = baseData();
+  return baseData({
+    catalog: {
+      models: [...(base.catalog?.models ?? []), ...(rows ?? [qwen3Embedding06Row(), qwen3Embedding4bRow(), embeddingGemmaRow()])],
+    },
+    ...overrides,
+  });
+}
+
+async function openRagSection(data: SetupData, extra: Partial<Parameters<typeof SetupPanel>[0]> = {}) {
+  const utils = renderPanel(data, extra);
+  await utils.user.click(screen.getByRole('button', { name: 'Configure embedding model' }));
+  const ragCard = must(screen.getByText('Codebase index (RAG)').closest('section'));
+  return { ...utils, ragCard };
+}
+
+describe('T14 — RAG card grows the block: a collapsible section CREATES endpoint field + Test + Apply (§3.4, Part 0.1)', () => {
+  it('default-closed toggle (T12 pattern, not <details>): no tabs / endpoint field / Apply in the DOM until opened', () => {
+    renderPanel(ragSurfaceData());
+    const toggle = screen.getByRole('button', { name: 'Configure embedding model' });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    const ragCard = must(screen.getByText('Codebase index (RAG)').closest('section'));
+    expect(within(ragCard).queryByRole('button', { name: 'llama.cpp' })).not.toBeInTheDocument();
+    expect(within(ragCard).queryByRole('textbox', { name: 'Endpoint' })).not.toBeInTheDocument();
+    expect(within(ragCard).queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
+  });
+
+  it('opening reveals the three-pane switch (aria-pressed), the Endpoint field prefilled from rag.embedEndpoint, and Apply', async () => {
+    const { ragCard } = await openRagSection(ragSurfaceData());
+    expect(within(ragCard).getByRole('button', { name: 'Ollama', pressed: true })).toBeInTheDocument();
+    expect(within(ragCard).getByRole('button', { name: 'llama.cpp', pressed: false })).toBeInTheDocument();
+    expect(within(ragCard).getByRole('button', { name: 'vLLM / OpenAI-compatible', pressed: false })).toBeInTheDocument();
+    expect(within(ragCard).getByRole('textbox', { name: 'Endpoint' })).toHaveValue('http://127.0.0.1:11434');
+    expect(within(ragCard).getByRole('button', { name: 'Apply' })).toBeEnabled();
+  });
+
+  it('Apply dispatches setup.setRag with the edited endpoint + the selected pane as embedBackend (CC-10 rides the same method)', async () => {
+    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    const field = within(ragCard).getByRole('textbox', { name: 'Endpoint' });
+    await user.clear(field);
+    await user.type(field, 'http://127.0.0.1:9999');
+    await user.click(within(ragCard).getByRole('button', { name: 'Apply' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.setRag', { embedEndpoint: 'http://127.0.0.1:9999', embedBackend: 'ollama' });
+  });
+
+  it("Apply on the llama.cpp pane writes embedBackend 'llamacpp'; the third pane writes 'openai-compat'", async () => {
+    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    await user.click(within(ragCard).getByRole('button', { name: 'llama.cpp' }));
+    await user.click(within(ragCard).getByRole('button', { name: 'Apply' }));
+    expect(dispatch).toHaveBeenLastCalledWith('setup.setRag', expect.objectContaining({ embedBackend: 'llamacpp' }));
+    await user.click(within(ragCard).getByRole('button', { name: 'vLLM / OpenAI-compatible' }));
+    await user.click(within(ragCard).getByRole('button', { name: 'Apply' }));
+    expect(dispatch).toHaveBeenLastCalledWith('setup.setRag', expect.objectContaining({ embedBackend: 'openai-compat' }));
+  });
+
+  it('Apply is trust-gated with the shared reason; the pane switch and Test stay usable (read-only, §8)', async () => {
+    const { ragCard } = await openRagSection(ragSurfaceData({ trusted: false }));
+    const apply = within(ragCard).getByRole('button', { name: 'Apply' });
+    expect(apply).toBeDisabled();
+    expect(apply.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
+    expect(within(ragCard).getByRole('button', { name: 'llama.cpp' })).toBeEnabled();
+    expect(within(ragCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' })).toBeEnabled();
+  });
+});
+
+describe('T14 — RAG ollama pane: the three embedding rows + endpoint-scoped presence (C-6)', () => {
+  it('renders all three §3.4 rows with ONE Default chip, the embeddinggemma ctx note, and NO sweep-next row (role-filtered)', async () => {
+    const { ragCard } = await openRagSection(ragSurfaceData());
+    expect(within(ragCard).getByText('Qwen3-Embedding 0.6B')).toBeInTheDocument();
+    expect(within(ragCard).getByText('Qwen3-Embedding 4B')).toBeInTheDocument();
+    expect(within(ragCard).getByText('EmbeddingGemma 300M')).toBeInTheDocument();
+    expect(within(ragCard).getAllByText('Default')).toHaveLength(1);
+    expect(within(ragCard).getByText('2K context on the Ollama build — fine for Talaria’s chunk sizes (≤512 tokens).')).toBeInTheDocument();
+    expect(within(ragCard).queryByText('Sweep Next-Edit v2 (7B)')).not.toBeInTheDocument();
+  });
+
+  it('rows are informational (no picker): model names are NOT buttons, unlike the Agent picker', async () => {
+    const { ragCard } = await openRagSection(ragSurfaceData());
+    expect(within(ragCard).queryByRole('button', { name: 'Qwen3-Embedding 0.6B' })).not.toBeInTheDocument();
+  });
+
+  it('a row on the probed daemon at the matching endpoint shows present ✓ (no Pull); absent rows keep Pull {tag} (~{size})', async () => {
+    const { ragCard } = await openRagSection(
+      ragSurfaceData({
+        ollama: { ...baseData().ollama, models: [{ name: 'qwen3-embedding:0.6b', sizeBytes: 639_000_000 }] },
+      }),
+    );
+    expect(within(ragCard).getByText('present ✓')).toBeInTheDocument();
+    expect(within(ragCard).queryByRole('button', { name: /^Pull qwen3-embedding:0\.6b/ })).not.toBeInTheDocument();
+    expect(within(ragCard).getByRole('button', { name: /^Pull qwen3-embedding:4b/ })).toBeEnabled();
+    expect(within(ragCard).getByRole('button', { name: /^Pull embeddinggemma:300m/ })).toBeEnabled();
+  });
+
+  it("editing the endpoint field away from the probed daemon flips every row to 'not verified here — Test the endpoint first.' with Pull REMAINING", async () => {
+    const { user, ragCard } = await openRagSection(ragSurfaceData());
+    const field = within(ragCard).getByRole('textbox', { name: 'Endpoint' });
+    await user.clear(field);
+    await user.type(field, 'http://10.0.0.9:11434');
+    expect(within(ragCard).getAllByText('not verified here — Test the endpoint first.').length).toBeGreaterThanOrEqual(3);
+    expect(within(ragCard).getByRole('button', { name: /^Pull qwen3-embedding:0\.6b/ })).toBeEnabled();
+  });
+
+  it('a row Pull dispatches setup.provisionModel {modelId, backend: ollama, endpoint: the FIELD value}', async () => {
+    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    await user.click(within(ragCard).getByRole('button', { name: /^Pull embeddinggemma:300m/ }));
+    expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
+      modelId: 'embeddinggemma-300m',
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+  });
+
+  it('exactly ONE Test on the pane — the surface-level Test connection ({endpoint}) dispatching {backendId: ollama}', async () => {
+    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    const tests = within(ragCard).getAllByRole('button', { name: /^Test connection/ });
+    expect(tests).toHaveLength(1);
+    await user.click(must(tests[0]));
+    expect(dispatch).toHaveBeenCalledWith('setup.testRemote', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+  });
+});
+
+describe('T14 — RAG configured-model row (CC-8): free-text rag.embedModel outside the catalog', () => {
+  it('renders with a Configured pill + Pull wired to the legacy setup.pullModel {model, endpoint}', async () => {
+    // `baseData()`'s rag.embedModel ('nomic-embed-text') names no catalog row.
+    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    expect(within(ragCard).getByText('Configured')).toBeInTheDocument();
+    await user.click(within(ragCard).getByRole('button', { name: 'Pull nomic-embed-text' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.pullModel', { model: 'nomic-embed-text', endpoint: 'http://127.0.0.1:11434' });
+  });
+
+  it('tag-keyed progress + Cancel (pull:<model> — the legacy handlePullModel latch, not a catalog id)', async () => {
+    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData(), {
+      progress: {
+        'pull:nomic-embed-text': { op: 'pull', id: 'nomic-embed-text', logTail: [], totalBytes: 100, completedBytes: 25 },
+      },
+    });
+    expect(within(ragCard).getByRole('progressbar', { name: 'Pulling nomic-embed-text' })).toBeInTheDocument();
+    expect(within(ragCard).getByText('25%')).toBeInTheDocument();
+    await user.click(within(ragCard).getByRole('button', { name: 'Cancel' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.cancel', { op: 'pull', id: 'nomic-embed-text' });
+  });
+
+  it('NOT rendered when the configured model IS a catalog row', async () => {
+    const { ragCard } = await openRagSection(ragSurfaceData({ rag: { ...baseData().rag, embedModel: 'qwen3-embedding:0.6b' } }));
+    expect(within(ragCard).queryByText('Configured')).not.toBeInTheDocument();
+  });
+
+  it('NOT rendered while the daemon is down (the legacy tier needs a live daemon to pull onto)', async () => {
+    const { ragCard } = await openRagSection(
+      ragSurfaceData({ ollama: { running: false, endpoint: 'http://127.0.0.1:11434', models: [] } }),
+    );
+    expect(within(ragCard).queryByText('Configured')).not.toBeInTheDocument();
+  });
+});
+
+describe('T14 — RAG llama.cpp pane: verified downloads for ALL three rows (F-3 closed — no absence cells)', () => {
+  async function openLlamacppPane(data: SetupData) {
+    const utils = await openRagSection(data);
+    await utils.user.click(within(utils.ragCard).getByRole('button', { name: 'llama.cpp' }));
+    return utils;
+  }
+
+  it('all three rows offer the generic verified Download — never the honest-absence line, never the NEXT pinned label', async () => {
+    const { ragCard } = await openLlamacppPane(ragSurfaceData({ llamacppRuntime: { binary: 'found', version: 'b4600' } }));
+    expect(within(ragCard).getByRole('button', { name: /^Download Qwen3-Embedding 0\.6B/ })).toBeEnabled();
+    expect(within(ragCard).getByRole('button', { name: /^Download Qwen3-Embedding 4B/ })).toBeEnabled();
+    expect(within(ragCard).getByRole('button', { name: /^Download EmbeddingGemma 300M/ })).toBeEnabled();
+    expect(within(ragCard).queryByText(/use it via Ollama instead/)).not.toBeInTheDocument();
+    expect(within(ragCard).queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
+  });
+
+  it('a Download dispatches provisionModel {modelId, backend: llamacpp, endpoint: the field value}', async () => {
+    const { user, dispatch, ragCard } = await openLlamacppPane(ragSurfaceData());
+    await user.click(within(ragCard).getByRole('button', { name: /^Download EmbeddingGemma 300M/ }));
+    expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
+      modelId: 'embeddinggemma-300m',
+      backend: 'llamacpp',
+      endpoint: 'http://127.0.0.1:11434',
+    });
+  });
+
+  it('a present row renders the host-composed --embeddings run command + the §6 Apply nudge', async () => {
+    const presentRow = qwen3Embedding06Row({
+      llamacpp: {
+        file: 'Qwen3-Embedding-0.6B-Q8_0.gguf',
+        approxBytes: 639_150_592,
+        present: true,
+        available: true,
+        runCommand:
+          'llama-server -m ~/.local/share/talaria/models/Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf --embeddings --port 8081',
+      },
+    });
+    const { ragCard } = await openLlamacppPane(ragSurfaceData({}, [presentRow, qwen3Embedding4bRow(), embeddingGemmaRow()]));
+    expect(within(ragCard).getByText(/--embeddings --port 8081/)).toBeInTheDocument();
+    expect(within(ragCard).getByText("present in Talaria's model folder ✓")).toBeInTheDocument();
+    expect(within(ragCard).getByText('Then Apply the endpoint below.')).toBeInTheDocument();
+  });
+
+  it('the nudge is ABSENT while nothing is downloaded (it explains a next step that does not exist yet)', async () => {
+    const { ragCard } = await openLlamacppPane(ragSurfaceData());
+    expect(within(ragCard).queryByText('Then Apply the endpoint below.')).not.toBeInTheDocument();
+  });
+
+  it("ONE Test on the pane — the block's endpoint-labeled Test dispatching {backendId: llamacpp} (no second surface Test)", async () => {
+    const { user, dispatch, ragCard } = await openLlamacppPane(ragSurfaceData());
+    const tests = within(ragCard).getAllByRole('button', { name: /^Test connection/ });
+    expect(tests).toHaveLength(1);
+    await user.click(must(tests[0]));
+    expect(dispatch).toHaveBeenCalledWith('setup.testRemote', { backendId: 'llamacpp', endpoint: 'http://127.0.0.1:11434' });
+  });
+});
+
+describe('T14 — RAG vLLM / OpenAI-compatible pane: Test + run command only (§3.4)', () => {
+  async function openThirdPane(data: SetupData) {
+    const utils = await openRagSection(data);
+    await utils.user.click(within(utils.ragCard).getByRole('button', { name: 'vLLM / OpenAI-compatible' }));
+    return utils;
+  }
+
+  it("renders each row's vllm run command, no Pull/Download anywhere, and the block's Test ({backendId: vllm})", async () => {
+    const { user, dispatch, ragCard } = await openThirdPane(ragSurfaceData());
+    expect(within(ragCard).getByText('vllm serve Qwen/Qwen3-Embedding-0.6B')).toBeInTheDocument();
+    expect(within(ragCard).getByText('vllm serve google/embeddinggemma-300m')).toBeInTheDocument();
+    expect(within(ragCard).queryByRole('button', { name: /^Pull / })).not.toBeInTheDocument();
+    expect(within(ragCard).queryByRole('button', { name: /^Download / })).not.toBeInTheDocument();
+    const tests = within(ragCard).getAllByRole('button', { name: /^Test connection/ });
+    expect(tests).toHaveLength(1);
+    await user.click(must(tests[0]));
+    expect(dispatch).toHaveBeenCalledWith('setup.testRemote', { backendId: 'vllm', endpoint: 'http://127.0.0.1:11434' });
+  });
+});
+
+describe('T14 — embedBackend restoration (§4.2): the initial pane reads rag.embedBackend, else ollama', () => {
+  it("rag.embedBackend 'llamacpp' opens on the llama.cpp pane", async () => {
+    const { ragCard } = await openRagSection(ragSurfaceData({ rag: { ...baseData().rag, embedBackend: 'llamacpp' } }));
+    expect(within(ragCard).getByRole('button', { name: 'llama.cpp', pressed: true })).toBeInTheDocument();
+  });
+
+  it("'openai-compat' opens on the third pane", async () => {
+    const { ragCard } = await openRagSection(ragSurfaceData({ rag: { ...baseData().rag, embedBackend: 'openai-compat' } }));
+    expect(within(ragCard).getByRole('button', { name: 'vLLM / OpenAI-compatible', pressed: true })).toBeInTheDocument();
+  });
+
+  it('an absent embedBackend (old-host wire) degrades to the Ollama pane', async () => {
+    const { ragCard } = await openRagSection(ragSurfaceData());
+    expect(within(ragCard).getByRole('button', { name: 'Ollama', pressed: true })).toBeInTheDocument();
+  });
+});
+
+describe('T14 — card-level presence honesty (the §3.4 truth table, dom half)', () => {
+  it('the deprecated wire boolean can no longer fake a green line: endpoint mismatch ⇒ NO done line even with the boolean true', () => {
+    renderPanel(
+      baseData({ rag: { ...baseData().rag, enabled: true, embedModelPresent: true, embedEndpoint: 'http://10.0.0.9:11434' } }),
+    );
+    expect(screen.queryByText('✓ Codebase index is ready — the agent can search your project.')).not.toBeInTheDocument();
+  });
+
+  it("an unverifiable configured endpoint surfaces the honest 'not verified here' text at card level — neither a presence lie nor an absence lie", () => {
+    renderPanel(baseData({ rag: { ...baseData().rag, embedEndpoint: 'http://10.0.0.9:11434' } }));
+    const ragCard = must(screen.getByText('Codebase index (RAG)').closest('section'));
+    expect(within(ragCard).getByText('not verified here — Test the endpoint first.')).toBeInTheDocument();
+    expect(within(ragCard).queryByText('not present')).not.toBeInTheDocument();
+  });
+
+  it('a genuinely present model at the configured endpoint (:latest-tolerant) turns the done line green with the boolean FALSE', () => {
+    renderPanel(
+      baseData({
+        rag: { ...baseData().rag, enabled: true },
+        ollama: { ...baseData().ollama, models: [{ name: 'nomic-embed-text:latest', sizeBytes: 1 }] },
+      }),
+    );
+    expect(screen.getByText('✓ Codebase index is ready — the agent can search your project.')).toBeInTheDocument();
+  });
+
+  it("provable absence at the configured endpoint keeps the card-level 'not present' text", () => {
+    renderPanel(ragSurfaceData());
+    const ragCard = must(screen.getByText('Codebase index (RAG)').closest('section'));
+    expect(within(ragCard).getByText('not present')).toBeInTheDocument();
   });
 });

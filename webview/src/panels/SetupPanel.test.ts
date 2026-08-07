@@ -74,7 +74,11 @@ import {
   PYTHON_VERSION_HELP_URL,
   pullPercent,
   PROGRESS_LOG_TAIL_MAX,
+  RAG_APPLY_NUDGE,
+  ragBlockBackend,
   ragDoneLine,
+  ragEmbedPresence,
+  ragInitialBackend,
   recheckScopeParams,
   reconcileDedicatedFormFields,
   servingLine,
@@ -431,20 +435,27 @@ function ragData(overrides: Partial<SetupData['rag']> = {}): SetupData['rag'] {
   };
 }
 
-describe('ragDoneLine — B5 done line (§6)', () => {
-  it('is the exact §6 copy when enabled + the embed model is present + unblocked', () => {
-    expect(ragDoneLine(ragData())).toBe('✓ Codebase index is ready — the agent can search your project.');
+describe('ragDoneLine — B5 done line, T14 endpoint-scoped honesty (§3.4 truth table)', () => {
+  // T14: the second argument is the CLIENT-derived, endpoint-scoped presence
+  // of the configured embed model (`ragEmbedPresence`) — the deprecated wire
+  // boolean rides along inside `rag` in every case below (`ragData()` pins it
+  // TRUE) and must be IGNORED entirely.
+  it("is the exact §6 copy when enabled + unblocked + genuinely 'present' at the configured endpoint", () => {
+    expect(ragDoneLine(ragData(), 'present')).toBe('✓ Codebase index is ready — the agent can search your project.');
   });
-  it('is empty when disabled', () => {
-    expect(ragDoneLine(ragData({ enabled: false }))).toBe('');
+  it('is empty when disabled, even with presence proven', () => {
+    expect(ragDoneLine(ragData({ enabled: false }), 'present')).toBe('');
   });
-  it('is empty when the embed model is not present yet', () => {
-    expect(ragDoneLine(ragData({ embedModelPresent: false }))).toBe('');
+  it("is empty when the embed model is provably 'absent' at the configured endpoint", () => {
+    expect(ragDoneLine(ragData(), 'absent')).toBe('');
   });
   it('is empty when blocked by a precondition (never overclaims readiness)', () => {
     expect(
-      ragDoneLine(ragData({ preconditionDetail: 'The codebase index needs a trusted, open workspace.' })),
+      ragDoneLine(ragData({ preconditionDetail: 'The codebase index needs a trusted, open workspace.' }), 'present'),
     ).toBe('');
+  });
+  it("presence 'unknown' (configured endpoint ≠ the probed daemon) makes NO claim — even while the deprecated wire boolean says true (the beta.5 wrong-daemon lie, pinned dead)", () => {
+    expect(ragDoneLine(ragData({ embedModelPresent: true }), 'unknown')).toBe('');
   });
 });
 
@@ -1302,5 +1313,107 @@ describe('T13 — the §6 pinned-disabled copy stays single-sourced (scoped sour
     expect(localModelSrc).not.toContain('No vetted build of this model is published yet');
     expect(setupPanelSrc).not.toContain('Download model (~4.7 GB)');
     expect(localModelSrc).not.toContain('Download model (~4.7 GB)');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T14 (§3.4/§6): RAG embedding-surface helpers + copy.
+ * ------------------------------------------------------------------ */
+
+describe('T14 — ragInitialBackend (§4.2 restoration: rag.embedBackend, else ollama)', () => {
+  it("returns the wire's embedBackend for each of the 3-enum values", () => {
+    expect(ragInitialBackend({ embedBackend: 'ollama' })).toBe('ollama');
+    expect(ragInitialBackend({ embedBackend: 'llamacpp' })).toBe('llamacpp');
+    expect(ragInitialBackend({ embedBackend: 'openai-compat' })).toBe('openai-compat');
+  });
+  it('degrades an absent embedBackend (old-host wire) to ollama', () => {
+    expect(ragInitialBackend({})).toBe('ollama');
+  });
+});
+
+describe("T14 — ragBlockBackend: the pane→block mapping ('openai-compat' renders the block's vllm pane)", () => {
+  it("maps 'openai-compat' to 'vllm' (§3.4: Test + run command only)", () => {
+    expect(ragBlockBackend('openai-compat')).toBe('vllm');
+  });
+  it('is the identity for ollama and llamacpp', () => {
+    expect(ragBlockBackend('ollama')).toBe('ollama');
+    expect(ragBlockBackend('llamacpp')).toBe('llamacpp');
+  });
+});
+
+describe('T14 — ragEmbedPresence: the CONFIGURED embed model, endpoint-scoped (the C-6 rule — never the wrong daemon)', () => {
+  const daemon = (names: string[], endpoint = 'http://127.0.0.1:11434') => ({
+    running: true,
+    endpoint,
+    models: names.map((name) => ({ name, sizeBytes: 1 })),
+  });
+  const ragCfg = (embedEndpoint: string, embedModel: string) => ({ embedEndpoint, embedModel });
+
+  it("'present' when the daemon at the CONFIGURED endpoint lists the model", () => {
+    expect(ragEmbedPresence(daemon(['nomic-embed-text']), ragCfg('http://127.0.0.1:11434', 'nomic-embed-text'))).toBe('present');
+  });
+  it(":latest-tolerant in BOTH directions (the beta.5 exact-`===` gap, fixed by derivation)", () => {
+    expect(ragEmbedPresence(daemon(['nomic-embed-text:latest']), ragCfg('http://127.0.0.1:11434', 'nomic-embed-text'))).toBe('present');
+    expect(ragEmbedPresence(daemon(['nomic-embed-text']), ragCfg('http://127.0.0.1:11434', 'nomic-embed-text:latest'))).toBe('present');
+  });
+  it("'absent' when the configured endpoint IS the probed daemon but the model is not in its list", () => {
+    expect(ragEmbedPresence(daemon(['qwen2.5-coder:1.5b-base']), ragCfg('http://127.0.0.1:11434', 'nomic-embed-text'))).toBe('absent');
+  });
+  it("'unknown' when the configured endpoint is NOT the probed daemon — even if THAT daemon has the name (the wrong-daemon anti-lie, pinned)", () => {
+    expect(ragEmbedPresence(daemon(['nomic-embed-text']), ragCfg('http://10.0.0.9:11434', 'nomic-embed-text'))).toBe('unknown');
+  });
+  it("'unknown' while the daemon is not running", () => {
+    expect(
+      ragEmbedPresence({ running: false, endpoint: 'http://127.0.0.1:11434', models: [] }, ragCfg('http://127.0.0.1:11434', 'nomic-embed-text')),
+    ).toBe('unknown');
+  });
+});
+
+describe('T14 — §6 RAG copy: verbatim + single-sourced', () => {
+  it('RAG_APPLY_NUDGE — §6 "llama.cpp RAG nudge"', () => {
+    expect(RAG_APPLY_NUDGE).toBe('Then Apply the endpoint below.');
+  });
+  it('the embeddinggemma ctx note is CATALOG data — §6 verbatim at its single source (the wire `note` carries it to the row)', () => {
+    const row = MODEL_CATALOG.find((m) => m.id === 'embeddinggemma-300m');
+    expect(row?.note).toBe('2K context on the Ollama build — fine for Talaria’s chunk sizes (≤512 tokens).');
+  });
+  it('SetupPanel.tsx never RESTATES the nudge inline — it renders the setupCards.ts constant', () => {
+    const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+    expect(setupPanelSrc).not.toContain('Then Apply the endpoint below.');
+  });
+});
+
+describe('T14 — F-3 closed: every embedding row has a verified llama.cpp build (no absence cells on the RAG surface)', () => {
+  const embedRows = MODEL_CATALOG.filter((m) => m.role === 'embedding');
+  it('the catalog carries exactly the three §3.4 rows, 0.6b the role default', () => {
+    expect(embedRows.map((m) => m.id)).toEqual(['qwen3-embedding-0.6b', 'qwen3-embedding-4b', 'embeddinggemma-300m']);
+    expect(embedRows.filter((m) => m.defaultForRole).map((m) => m.id)).toEqual(['qwen3-embedding-0.6b']);
+  });
+  it('all three carry a llamacpp gguf — embeddinggemma via ggml-org (F-3)', () => {
+    for (const row of embedRows) {
+      expect(row.llamacpp).toBeDefined();
+    }
+    expect(embedRows.find((m) => m.id === 'embeddinggemma-300m')?.llamacpp?.gguf.hfRepo).toBe('ggml-org/embeddinggemma-300M-GGUF');
+  });
+});
+
+describe('T14 — the beta.5 wrong-daemon presence boolean: webview consumption REMOVED, wire kept (deprecated-in-comment)', () => {
+  // The identifier is spelled out only HERE (test file) — the three scanned
+  // sources must not carry it at all, comments included.
+  const WIRE_BOOLEAN = 'embedModelPresent';
+
+  it('SetupPanel.tsx / localModel.tsx / setupCards.ts no longer mention the wire boolean (endpoint-scoped derivation replaced it)', () => {
+    expect(readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
+    expect(readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
+    expect(readFileSync(join(__dirname, 'setupCards.ts'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
+  });
+
+  it('the wire field + host computation SURVIVE (compat), marked @deprecated beta.6 T14', () => {
+    const protocolSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'shared', 'protocol.ts'), 'utf-8');
+    const controllerSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'host', 'setup', 'SetupController.ts'), 'utf-8');
+    expect(protocolSrc).toContain(`${WIRE_BOOLEAN}: boolean`);
+    expect(protocolSrc).toContain('@deprecated beta.6 T14');
+    expect(controllerSrc).toContain(`${WIRE_BOOLEAN}: ollamaStatus.running`);
+    expect(controllerSrc).toContain('@deprecated beta.6 T14');
   });
 });

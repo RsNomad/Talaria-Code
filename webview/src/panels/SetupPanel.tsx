@@ -84,12 +84,17 @@ import {
   providerDoneLine,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
+  RAG_APPLY_NUDGE,
+  ragBlockBackend,
   ragDoneLine,
+  ragEmbedPresence,
+  ragInitialBackend,
   reconcileDedicatedFormFields,
   splitGuidedLine,
   testConnectionLabel,
   TRUST_DISABLED_REASON,
   type NextPresence,
+  type RagEmbedBackend,
   type SetupProgressMap,
 } from './setupCards';
 
@@ -185,7 +190,7 @@ function SetupCards({
         dispatch={dispatch}
         disabledReason={disabledReason}
       />
-      <RagCard setup={setup} dispatch={dispatch} disabledReason={disabledReason} />
+      <RagCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
     </>
   );
 }
@@ -1052,13 +1057,14 @@ function OllamaInstallPanel({
   return (
     <div className="flex flex-col gap-2">
       {showConfiguredRow && (
-        <ConfiguredFimModelRow
+        <ConfiguredModelRow
           model={setup.fim.model}
           ollama={setup.ollama}
           endpoint={endpoint}
           progress={progress}
           dispatch={dispatch}
           disabledReason={disabledReason}
+          pullSuccessLabel={FIM_OLLAMA_PULL_NUDGE}
         />
       )}
       <LocalModelBlock
@@ -1085,20 +1091,23 @@ function OllamaInstallPanel({
 }
 
 /**
- * The CC-8 "configured model" row (§3.2) — the legacy free-text tier's one
- * surviving in-panel affordance, rendered ABOVE the catalog rows whenever the
- * saved `fim.model` names something outside the catalog. Wired to the
- * UNCHANGED `setup.pullModel` method; its progress/cancel stay TAG-keyed
- * (`pull:<model>` — the host's legacy `handlePullModel` latch), unlike the
- * catalog rows' `pull:<catalogId>`.
+ * The CC-8 "configured model" row (§3.2 FIM / §3.4 RAG — T14 generalized
+ * T11's FIM-only component with a surface-supplied `pullSuccessLabel`, no
+ * behavior change at the FIM call site) — the legacy free-text tier's one
+ * surviving in-panel affordance, rendered ABOVE the catalog rows whenever
+ * the surface's saved model setting names something outside the catalog.
+ * Wired to the UNCHANGED `setup.pullModel` method; its progress/cancel stay
+ * TAG-keyed (`pull:<model>` — the host's legacy `handlePullModel` latch),
+ * unlike the catalog rows' `pull:<catalogId>`.
  */
-function ConfiguredFimModelRow({
+function ConfiguredModelRow({
   model,
   ollama,
   endpoint,
   progress,
   dispatch,
   disabledReason,
+  pullSuccessLabel,
 }: {
   model: string;
   ollama: SetupData['ollama'];
@@ -1106,6 +1115,7 @@ function ConfiguredFimModelRow({
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  pullSuccessLabel: string;
 }) {
   // The same endpoint-scoped client-side derivation catalog rows use (C-6) —
   // the free-text model is just a bare library tag, so `ollamaTag` fits.
@@ -1133,7 +1143,7 @@ function ConfiguredFimModelRow({
             icon="cloud-download"
             onRun={() => dispatch('setup.pullModel', { model, endpoint })}
             disabledReason={disabledReason}
-            successLabel={FIM_OLLAMA_PULL_NUDGE}
+            successLabel={pullSuccessLabel}
           />
         </div>
       )}
@@ -1577,18 +1587,26 @@ function DedicatedNextForm({
 
 function RagCard({
   setup,
+  progress,
   dispatch,
   disabledReason,
 }: {
   setup: SetupData;
+  progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
 }) {
   const rag = setup.rag;
+  // T14 (§3.4): presence of the CONFIGURED embed model, endpoint-scoped
+  // against the daemon `status()` actually probed (C-6). The done line and
+  // the summary suffix both key off THIS — never the deprecated wire
+  // boolean, which answers for the wrong daemon whenever the configured
+  // endpoint isn't the probed one (the beta.5 lie this card replaced).
+  const presence = ragEmbedPresence(setup.ollama, rag);
 
   return (
     <Card title="Codebase index (RAG)">
-      <DoneLine text={ragDoneLine(rag)} className="mb-2" />
+      <DoneLine text={ragDoneLine(rag, presence)} className="mb-2" />
       {rag.preconditionDetail && (
         <div className="mb-2 rounded border border-warn bg-warn-soft px-2 py-1.5 text-2xs text-fg">
           {rag.preconditionDetail}
@@ -1616,19 +1634,20 @@ function RagCard({
         />
       </div>
 
-      <div className="mb-2 text-2xs text-muted">
+      <div className="text-2xs text-muted">
         Embeddings: <span className="font-mono text-fg">{rag.embedModel}</span> via{' '}
         <span className="font-mono text-fg">{rag.embedEndpoint}</span>
-        {!rag.embedModelPresent && <span className="ml-2 text-warn">not present</span>}
+        {/* Honest tri-state suffix (T14): provable absence keeps the warn
+            text; an unverifiable endpoint gets the §6 unknown sentence via
+            `catalogPresenceText` — never a color-only or wrong-daemon claim. */}
+        {presence !== 'present' && (
+          <span className={`ml-2 ${presence === 'absent' ? 'text-warn' : 'text-faint'}`}>
+            {catalogPresenceText(presence)}
+          </span>
+        )}
       </div>
 
-      {!rag.embedModelPresent && (
-        <ActionButton
-          label={`Pull ${rag.embedModel}`}
-          onRun={() => dispatch('setup.pullModel', { model: rag.embedModel, endpoint: rag.embedEndpoint })}
-          disabledReason={disabledReason}
-        />
-      )}
+      <RagEmbedSection setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
 
       <details className="mt-2">
         <summary className="cursor-pointer text-2xs text-muted">Advanced</summary>
@@ -1641,5 +1660,146 @@ function RagCard({
         </div>
       </details>
     </Card>
+  );
+}
+
+/**
+ * beta.6 T14 (§3.4): the RAG card's collapsible embedding-model section —
+ * the shared `LocalModelBlock` with the three embedding catalog rows, a
+ * 3-pane backend switch persisted as `talaria.rag.embedBackend` (CC-10),
+ * and the controls the card lacked before beta.6 (Part 0.1): an Endpoint
+ * field, Test, and Apply (`setup.setRag`, Tier-1 modal host-side).
+ *
+ * Presence on the Ollama pane is the block's endpoint-scoped client
+ * derivation (`catalogPresence`, C-6) against the live Endpoint FIELD —
+ * rows honestly read as unverifiable the moment the field leaves the
+ * probed daemon. Rows are informational (no `onSelect`; the embed-model
+ * setting stays free text — CC-8, the beta.5 path preserved through the
+ * configured-model row above the block). One Test per pane (T13 note 2):
+ * Ollama gets the surface-level `TestAndServingLine` (the block renders
+ * none there, §4.1); llama.cpp and the third pane use the block's own.
+ * The third pane persists `'openai-compat'` but renders the block's vLLM
+ * pane — run commands + Test only (§3.4). Collapsible = toggle button +
+ * conditional render, NOT `<details>` (T12's jsdom finding: closed-
+ * `<details>` children stay queryable AND ship hidden interactive
+ * controls). No `pinnedDownload` — RAG rows are allowlist/live-oid tier
+ * with generic Download semantics (T13 note 1).
+ */
+function RagEmbedSection({
+  setup,
+  progress,
+  dispatch,
+  disabledReason,
+}: {
+  setup: SetupData;
+  progress: SetupProgressMap;
+  dispatch: SetupPanelProps['dispatch'];
+  disabledReason?: string;
+}) {
+  const rag = setup.rag;
+  const embedModels = (setup.catalog?.models ?? []).filter((m) => m.role === 'embedding');
+  const [open, setOpen] = useState(false);
+  const [pane, setPane] = useState<RagEmbedBackend>(() => ragInitialBackend(rag));
+
+  // Endpoint init = the SAVED endpoint — reset when that saved value itself
+  // moves (an Apply landing / an external settings edit), never on an
+  // unrelated re-render (the T12 keyed-state pattern; an in-flight edit
+  // survives). RAG has ONE saved endpoint across panes — the wire carries
+  // no per-backend endpoint defaults for this surface (unlike CC-6's
+  // agent block), so the field deliberately follows the user across tabs.
+  const endpointInit = rag.embedEndpoint;
+  const [ep, setEp] = useState(() => ({ key: endpointInit, value: endpointInit }));
+  if (ep.key !== endpointInit) setEp({ key: endpointInit, value: endpointInit });
+
+  const blockBackend = ragBlockBackend(pane);
+  // CC-8 (§3.4): running-branch-only — the legacy tier needs a live daemon
+  // to pull onto (T11's FIM rule, reused verbatim).
+  const showConfiguredRow =
+    pane === 'ollama' && setup.ollama.running && configuredModelOutsideCatalog(embedModels, rag.embedModel);
+  const anyLlamacppPresent = embedModels.some((m) => m.llamacpp?.present === true);
+
+  return (
+    <div className="mt-2 border-t border-border pt-2">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className="inline-flex items-center gap-1.5 rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
+      >
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />
+        Configure embedding model
+      </button>
+      {open && (
+        <div className="mt-2 flex flex-col gap-2">
+          <div className="inline-flex gap-1 self-start rounded border border-border p-0.5">
+            {(['ollama', 'llamacpp', 'openai-compat'] as const).map((b) => (
+              <button
+                key={b}
+                type="button"
+                aria-pressed={pane === b}
+                onClick={() => setPane(b)}
+                className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
+                  pane === b ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
+                }`}
+              >
+                {b === 'ollama' ? 'Ollama' : b === 'llamacpp' ? 'llama.cpp' : 'vLLM / OpenAI-compatible'}
+              </button>
+            ))}
+          </div>
+
+          <TextField
+            label="Endpoint"
+            value={ep.value}
+            onChange={(v) => setEp({ key: ep.key, value: v })}
+            placeholder="http://host:port"
+          />
+
+          {showConfiguredRow && (
+            <ConfiguredModelRow
+              model={rag.embedModel}
+              ollama={setup.ollama}
+              endpoint={ep.value}
+              progress={progress}
+              dispatch={dispatch}
+              disabledReason={disabledReason}
+              pullSuccessLabel={RAG_APPLY_NUDGE}
+            />
+          )}
+
+          <LocalModelBlock
+            backend={blockBackend}
+            models={embedModels}
+            ollama={setup.ollama}
+            llamacppRuntime={setup.llamacppRuntime}
+            endpoint={ep.value}
+            progress={progress}
+            dispatch={dispatch}
+            disabledReason={disabledReason}
+            ollamaPullSuccessLabel={RAG_APPLY_NUDGE}
+          />
+
+          {/* §6 nudge, llama.cpp pane: rendered once any embedding row is
+              genuinely present — it names a next step (Apply) that only
+              becomes real after a download lands (T11's placement rule:
+              the block is atomic, so this sits after it). */}
+          {pane === 'llamacpp' && anyLlamacppPresent && <p className="text-2xs text-muted">{RAG_APPLY_NUDGE}</p>}
+
+          {/* The Ollama pane has no in-block Test (§4.1) — the same
+              surface-level Test + Serving line the FIM/Agent ollama panes
+              carry (T10 Minor #4; one Test per pane, T13 note 2). */}
+          {pane === 'ollama' && <TestAndServingLine backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
+
+          <div>
+            <ActionButton
+              label="Apply"
+              onRun={() => dispatch('setup.setRag', { embedEndpoint: ep.value, embedBackend: pane })}
+              disabledReason={disabledReason}
+              tone="accent"
+              successLabel="✓ Applied"
+            />
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

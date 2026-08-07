@@ -848,6 +848,12 @@ export class SetupController {
         embedEndpoint: ragEmbedEndpoint,
         embedBackend: ragEmbedBackend,
         embedModel: ragEmbedModel,
+        // @deprecated beta.6 T14 (wire compat only): the wrong-daemon
+        // computation §3.4 replaced — it answers for the endpoint this
+        // status() probed, not `embedEndpoint`, and the exact `===` misses
+        // `:latest`. The unified UI derives presence client-side instead
+        // (`ragEmbedPresence`, endpoint-scoped per C-6); no webview code
+        // reads this field anymore (source-scan-locked in SetupPanel.test.ts).
         embedModelPresent: ollamaStatus.running ? ollamaStatus.models.some((m) => m.name === ragEmbedModel) : false,
         tuning: ragTuning,
         indexDir: ragIndexDir,

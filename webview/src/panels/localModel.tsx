@@ -39,6 +39,13 @@
  * way: `pinnedDownload` (§3.3's pinned-model llama.cpp cell — label + the
  * surface's fail-closed reason live in the NEXT card's own copy, passed in;
  * see the prop doc). Omitted, the llama.cpp branch is byte-identical.
+ *
+ * T14 (RAG surface) closed the loop with ZERO block changes — all four
+ * surfaces now render through this component. The RAG section passes only
+ * pre-existing props: informational rows (no `selectedId`), its own §6
+ * nudge via `ollamaPullSuccessLabel`, and deliberately NO `pinnedDownload`
+ * (RAG rows are allowlist/live-oid tier — the generic Download +
+ * honest-absence semantics are the right ones there; T13 report note 1).
  */
 import { useEffect, useState } from 'react';
 import type { SetupCatalogModel, SetupData, SetupMethod } from '../protocol';

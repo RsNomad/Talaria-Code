@@ -317,13 +317,19 @@ export function nextDoneLine(source: SetupData['nextEdit']['source']): string {
 
 /**
  * Card 5 — RAG: green only once the index is genuinely usable — enabled,
- * the embed model is actually present on the daemon (not just configured),
- * and nothing is blocking activation (`preconditionDetail` unset). A
- * "ready" claim without the embed model present would be a lie the icon
- * alone couldn't correct (§6, Global Constraint 7).
+ * nothing blocking activation (`preconditionDetail` unset), and the embed
+ * model PROVEN present at the CONFIGURED endpoint (`presence` = the
+ * endpoint-scoped client derivation, {@link ragEmbedPresence}). beta.6 T14
+ * (§3.4 truth table): the wire's own presence boolean is deliberately
+ * ignored — the host computes it against the daemon IT probed, not `rag`'s
+ * configured endpoint, so it lies in both directions the moment the two
+ * differ. `'absent'` and `'unknown'` both render NO line: a "ready" claim
+ * the panel can't verify would be a lie the icon alone couldn't correct
+ * (§6, Global Constraint 7), and an unverifiable state must not claim
+ * broken either — silence + the summary's honest tri-state text carry it.
  */
-export function ragDoneLine(rag: SetupData['rag']): string {
-  const green = rag.enabled && rag.embedModelPresent && rag.preconditionDetail === undefined;
+export function ragDoneLine(rag: SetupData['rag'], presence: NextPresence): string {
+  const green = rag.enabled && presence === 'present' && rag.preconditionDetail === undefined;
   return green ? '✓ Codebase index is ready — the agent can search your project.' : '';
 }
 
@@ -879,4 +885,57 @@ export function agentInitialBackend(local: SetupData['agentLocalModel']): AgentM
  *  {backend} at {endpoint}?`), so the summary reads as the modal's answer. */
 export function agentSavedSummaryLine(displayName: string, backend: string, endpoint: string): string {
   return `${displayName} via ${backend} at ${endpoint}`;
+}
+
+// --- beta.6 T14 (§3.4/§6): the RAG "Configure embedding model" section -----
+
+/** The RAG section's backend union — the `talaria.rag.embedBackend` 3-enum
+ *  (T8's strict validation), NOT the block's: the third pane persists
+ *  `'openai-compat'` while rendering the block's vLLM pane
+ *  ({@link ragBlockBackend}). Restated rather than imported for the same
+ *  no-cycle reason as {@link AgentModelBackend}. */
+export type RagEmbedBackend = 'ollama' | 'llamacpp' | 'openai-compat';
+
+/** §4.2 restoration (CC-10): the section's initial pane — the saved
+ *  `rag.embedBackend` when the wire carries one, else the ollama default
+ *  (mirrors {@link agentInitialBackend}; an old-host wire simply omits the
+ *  field and degrades honestly). */
+export function ragInitialBackend(rag: Pick<SetupData['rag'], 'embedBackend'>): RagEmbedBackend {
+  return rag.embedBackend ?? 'ollama';
+}
+
+/** The pane→block mapping: `'openai-compat'` renders the block's vLLM pane
+ *  (§3.4 — Test + run command only; `setup.testRemote {backendId:'vllm'}`
+ *  probes `/v1/models`, exactly what any OpenAI-compatible embeddings
+ *  server answers — `src/rag/embedder.ts`'s own module doc grounds the
+ *  three backends sharing that one shape). */
+export function ragBlockBackend(backend: RagEmbedBackend): 'ollama' | 'llamacpp' | 'vllm' {
+  return backend === 'openai-compat' ? 'vllm' : backend;
+}
+
+/** §6 "llama.cpp RAG nudge" — rendered under the llama.cpp pane once any
+ *  embedding row is present (the `FIM_LLAMACPP_NUDGE` placement pattern),
+ *  AND reused as the Ollama rows' pull-success flash
+ *  (`ollamaPullSuccessLabel`): §6 pins no separate RAG ollama nudge, and
+ *  this same sentence is the true next step there too — a pull never writes
+ *  settings; Apply is the Tier-1 write (recorded T14 decision: one §6
+ *  string, two honest placements, never new copy). */
+export const RAG_APPLY_NUDGE = 'Then Apply the endpoint below.';
+
+/**
+ * T14 (§3.4): presence of the CONFIGURED embed model at the CONFIGURED
+ * endpoint — {@link catalogPresence}'s endpoint-scoped rule (C-6) over the
+ * free-text `rag.embedModel` (a bare library tag, so `ollamaTag` fits — the
+ * same shape the FIM configured-model row already uses). `'present'`/
+ * `'absent'` only when `rag.embedEndpoint` IS the endpoint `status()`
+ * actually probed; anything else — another daemon, daemon down — is
+ * honestly `'unknown'`, never the wrong daemon's answer. This derivation
+ * (not the wire's own presence boolean, which is host-probe-scoped and
+ * deprecated as of T14) feeds {@link ragDoneLine} and the card summary.
+ */
+export function ragEmbedPresence(
+  ollama: Pick<SetupData['ollama'], 'running' | 'endpoint' | 'models'>,
+  rag: Pick<SetupData['rag'], 'embedEndpoint' | 'embedModel'>,
+): NextPresence {
+  return catalogPresence(ollama, rag.embedEndpoint, { ollamaTag: rag.embedModel });
 }
