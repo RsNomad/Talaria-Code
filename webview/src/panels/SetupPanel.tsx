@@ -51,6 +51,7 @@ import {
   agentPrimaryAction,
   agentRowCaption,
   agentSavedSummaryLine,
+  BACKEND_DISPLAY,
   buildCopyLogText,
   catalogPreselectId,
   type AgentModelBackend,
@@ -99,9 +100,15 @@ import {
   PYTHON_VERSION_HELP_URL,
   pullPercent,
   RAG_APPLY_NUDGE,
+  RAG_LLAMACPP_MODEL_NOTE,
+  RAG_MODEL_FIELD_CAPTION,
+  RAG_MODEL_FIELD_LABEL,
+  RAG_OLLAMA_PULL_NUDGE,
+  RAG_THIRD_TAB_LABEL,
   ragBlockBackend,
   ragDoneLine,
   ragEmbedPresence,
+  ragEndpointInit,
   ragInitialBackend,
   RECS_DISCLOSURE_SUMMARY,
   RECS_MOE_NOTE,
@@ -1990,6 +1997,11 @@ function RagCard({
  * controls). No `pinnedDownload` — RAG rows are allowlist/live-oid tier
  * with generic Download semantics (T13 note 1).
  */
+/** The RAG Embedding-model field's caption id — `aria-describedby` plumbing
+ *  (PT5, C1-15 parity). DISTINCT from {@link FIM_MODEL_CAPTION_ID} — the two
+ *  fields can share a document. */
+const RAG_MODEL_CAPTION_ID = 'rag-model-field-caption';
+
 function RagEmbedSection({
   setup,
   progress,
@@ -2006,15 +2018,38 @@ function RagEmbedSection({
   const [open, setOpen] = useState(false);
   const [pane, setPane] = useState<RagEmbedBackend>(() => ragInitialBackend(rag));
 
-  // Endpoint init = the SAVED endpoint — reset when that saved value itself
-  // moves (an Apply landing / an external settings edit), never on an
-  // unrelated re-render (the T12 keyed-state pattern; an in-flight edit
-  // survives). RAG has ONE saved endpoint across panes — the wire carries
-  // no per-backend endpoint defaults for this surface (unlike CC-6's
-  // agent block), so the field deliberately follows the user across tabs.
-  const endpointInit = rag.embedEndpoint;
-  const [ep, setEp] = useState(() => ({ key: endpointInit, value: endpointInit }));
-  if (ep.key !== endpointInit) setEp({ key: endpointInit, value: endpointInit });
+  // beta.6 panel-fix PT5 (audit A5, C2-5): endpoint init is PER-PANE —
+  // the SAVED `embedEndpoint` when this pane IS the saved backend, that
+  // pane's host-owned default otherwise (`ragEndpointInit`, PT3/PT2). The
+  // key folds in BOTH the pane and the resolved init, so a pane switch AND
+  // an embedBackend-only wire move (external settings edit) re-resolve
+  // while an in-flight edit at the same pane survives unrelated re-renders
+  // (the T12 keyed-state pattern). This closes the bug where Apply on the
+  // llama.cpp pane could save Ollama's :11434 as a llama.cpp endpoint.
+  const endpointInit = ragEndpointInit(rag, pane);
+  const endpointKey = `${pane}|${endpointInit}`;
+  const [ep, setEp] = useState(() => ({ key: endpointKey, value: endpointInit }));
+  if (ep.key !== endpointKey) setEp({ key: endpointKey, value: endpointInit });
+
+  // §3.2 (PT5 — PT4's card idiom, pane-keyed): the section's ONE pending-
+  // model draft, shared by the field on every pane and the Ollama pane's
+  // row selection/pulls. A pane switch resets the draft to saved (C1-4);
+  // an Apply landing / external settings edit reconciles via the saved
+  // half of the key; an in-flight edit survives unrelated re-renders
+  // (the PT3 pure pair, `setupCards.ts`).
+  const pendingKey = `${pane}|${rag.embedModel}`;
+  const [pendingState, setPendingState] = useState(() => initPendingModel(pendingKey, rag.embedModel));
+  const pending = reconcilePendingModel(pendingState, pendingKey, rag.embedModel);
+  if (pending !== pendingState) setPendingState(pending);
+  const pendingModel = pending.value;
+  const setPendingModel = (value: string) => setPendingState({ key: pendingKey, value });
+  // C1-6 snapshot/no-clobber (PT4's rule verbatim): a pull's success only
+  // adopts the pulled target if the draft is UNCHANGED since the pull was
+  // clicked (`snapshot` = the click-render's value, pinned by the click
+  // closure — never read live at resolve). A free-text edit typed during
+  // a multi-GB pull is never silently overwritten.
+  const adoptPulledModel = (snapshot: string, target: string) =>
+    setPendingState((prev) => (prev.value === snapshot ? { key: prev.key, value: target } : prev));
 
   const blockBackend = ragBlockBackend(pane);
   // CC-8 (§3.4): running-branch-only — the legacy tier needs a live daemon
@@ -2022,6 +2057,18 @@ function RagEmbedSection({
   const showConfiguredRow =
     pane === 'ollama' && setup.ollama.running && configuredModelOutsideCatalog(embedModels, rag.embedModel);
   const anyLlamacppPresent = embedModels.some((m) => m.llamacpp?.present === true);
+
+  // §8 (PT5): row highlight DERIVED from the draft — free text outside the
+  // catalog honestly un-highlights every row, never a guessed match. The
+  // pending line is `:latest`-tolerant against saved (`ollamaTagsEqual` —
+  // the same normalization presence/row-matching use); its LiveRegion
+  // stays ALWAYS mounted, only `text` swaps.
+  const rowSelectedId = catalogRowIdForModel(embedModels, pendingModel);
+  const pendingLine =
+    pendingModel.trim() !== '' && !ollamaTagsEqual(pendingModel, rag.embedModel)
+      ? pendingSelectionLine('rag', pendingModel)
+      : '';
+  const trimmed = pendingModel.trim();
 
   return (
     <div className="mt-2 border-t border-border pt-2">
@@ -2047,7 +2094,7 @@ function RagEmbedSection({
                   pane === b ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
                 }`}
               >
-                {b === 'ollama' ? 'Ollama' : b === 'llamacpp' ? 'llama.cpp' : 'vLLM / OpenAI-compatible'}
+                {b === 'openai-compat' ? RAG_THIRD_TAB_LABEL : BACKEND_DISPLAY[b]}
               </button>
             ))}
           </div>
@@ -2059,6 +2106,25 @@ function RagEmbedSection({
             placeholder="http://host:port"
           />
 
+          {/* PT5 §3.2: the Embedding model field renders on EVERY pane — the
+              name rides every /v1/embeddings request body, so hiding it on
+              any pane would make Apply silently carry a value the user can't
+              see. llama.cpp ignores the name for model CHOICE — the honest
+              note below the field says so instead of hiding the field. */}
+          <div className="flex flex-col gap-1">
+            <TextField
+              label={RAG_MODEL_FIELD_LABEL}
+              value={pendingModel}
+              onChange={setPendingModel}
+              placeholder={rag.embedModel || undefined}
+              describedBy={RAG_MODEL_CAPTION_ID}
+            />
+            <p id={RAG_MODEL_CAPTION_ID} className="text-2xs text-faint">
+              {RAG_MODEL_FIELD_CAPTION}
+            </p>
+            {pane === 'llamacpp' && <p className="text-2xs text-muted">{RAG_LLAMACPP_MODEL_NOTE}</p>}
+          </div>
+
           {showConfiguredRow && (
             <ConfiguredModelRow
               model={rag.embedModel}
@@ -2067,7 +2133,8 @@ function RagEmbedSection({
               progress={progress}
               dispatch={dispatch}
               disabledReason={disabledReason}
-              pullSuccessLabel={RAG_APPLY_NUDGE}
+              pullSuccessLabel={RAG_OLLAMA_PULL_NUDGE}
+              onPullSuccess={() => adoptPulledModel(pendingModel, rag.embedModel)}
             />
           )}
 
@@ -2080,8 +2147,27 @@ function RagEmbedSection({
             progress={progress}
             dispatch={dispatch}
             disabledReason={disabledReason}
-            ollamaPullSuccessLabel={RAG_APPLY_NUDGE}
+            // PT5 §3.2: rows are MODEL selectors on the Ollama pane only —
+            // on llama.cpp/vLLM the model choice is expressed by the
+            // run/serve command, not these settings, so rows stay
+            // informational there (no fake affordance).
+            selectedId={pane === 'ollama' ? rowSelectedId : undefined}
+            onSelect={
+              pane === 'ollama'
+                ? (id) => {
+                    const row = embedModels.find((m) => m.id === id);
+                    const target = row?.ollamaCreatedName ?? row?.ollamaTag; // the catalogOllamaTarget rule
+                    if (target !== undefined) setPendingModel(target);
+                  }
+                : undefined
+            }
+            ollamaPullSuccessLabel={RAG_OLLAMA_PULL_NUDGE}
+            onOllamaPullSuccess={(model) => {
+              const target = model.ollamaCreatedName ?? model.ollamaTag;
+              if (target !== undefined) adoptPulledModel(pendingModel, target);
+            }}
           />
+          <LiveRegion text={pendingLine} className="text-2xs text-muted" />
 
           {/* §6 nudge, llama.cpp pane: rendered once any embedding row is
               genuinely present — it names a next step (Apply) that only
@@ -2097,7 +2183,17 @@ function RagEmbedSection({
           <div>
             <ActionButton
               label="Apply"
-              onRun={() => dispatch('setup.setRag', { embedEndpoint: ep.value, embedBackend: pane })}
+              // PT5: Apply persists everything it shows — the model rides
+              // along whenever non-empty; a trimmed-empty field omits the
+              // key entirely (the host keeps the saved value). FIM ≠ RAG:
+              // this is the surface's ONLY save, and it is `setup.setRag`.
+              onRun={() =>
+                dispatch('setup.setRag', {
+                  embedEndpoint: ep.value,
+                  embedBackend: pane,
+                  ...(trimmed !== '' ? { embedModel: trimmed } : {}),
+                })
+              }
               disabledReason={disabledReason}
               tone="accent"
               successLabel="✓ Applied"
