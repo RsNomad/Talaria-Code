@@ -1102,10 +1102,12 @@ describe('redactForModal (CR-003): neutralizes a saved value for modal display, 
 
 describe('CR-003 drift-lock: the REFUSE regex and the REDACT path cover the exact same char class', () => {
   // one boundary codepoint per sub-range named in the MODAL_UNSAFE_TEXT_PATTERN
-  // doc comment (C0, DEL, C1 incl. NEL, zero-width/bidi marks, LINE/PARAGRAPH
-  // SEPARATOR, bidi override, isolates) -- both ends of each range where the
-  // range has more than one member. All expressed as \u escapes (never a raw
-  // control/bidi/format character in this source file).
+  // doc comment (C0, DEL, C1 incl. NEL, ALM, zero-width/bidi marks,
+  // LINE/PARAGRAPH SEPARATOR, bidi override, word joiner, isolates, BOM) --
+  // both ends of each range where the range has more than one member (T4:
+  // U+061C/U+2060/U+FEFF are single-codepoint additions, so one entry each).
+  // All expressed as \u escapes (never a raw control/bidi/format character
+  // in this source file).
   const BOUNDARY_CODEPOINTS: { name: string; ch: string }[] = [
     { name: 'C0 start (NUL, U+0000)', ch: '\x00' },
     { name: 'C0 end (US, U+001F)', ch: '\x1f' },
@@ -1121,6 +1123,9 @@ describe('CR-003 drift-lock: the REFUSE regex and the REDACT path cover the exac
     { name: 'bidi override end (U+202E)', ch: '\u202e' },
     { name: 'isolates start (U+2066)', ch: '\u2066' },
     { name: 'isolates end (U+2069)', ch: '\u2069' },
+    { name: 'ARABIC LETTER MARK (U+061C)', ch: '\u061c' },
+    { name: 'WORD JOINER (U+2060)', ch: '\u2060' },
+    { name: 'ZERO WIDTH NO-BREAK SPACE / BOM (U+FEFF)', ch: '\ufeff' },
   ];
 
   it('for every boundary codepoint, the refuse-pattern.test() and redactForModal() output agree', () => {
