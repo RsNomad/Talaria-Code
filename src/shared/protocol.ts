@@ -846,6 +846,16 @@ export interface SetupData {
     indexDir: string;
     /** `shouldActivateRag` text, populated when RAG is blocked from activating. */
     preconditionDetail?: string;
+    /**
+     * beta.6 panel-fix (T2, audit A5): host-owned per-pane endpoint defaults
+     * — mirrors `agentLocalModel.endpointDefaults` (CC-6) exactly, so the
+     * RAG surface can init each pane's endpoint field without ever
+     * fabricating a URL client-side (Global Constraint 1). `llamacpp` is
+     * drift-locked to `LLAMACPP_RUN_FLAGS.embedding`'s port. OPTIONAL +
+     * additive — the webview degrades to `''` when absent; ALWAYS populated
+     * by the host since this field shipped.
+     */
+    endpointDefaults?: { ollama: string; llamacpp: string; 'openai-compat': string };
   };
   /**
    * Local Ollama daemon status, read by the FIM/NEXT local-install tabs.

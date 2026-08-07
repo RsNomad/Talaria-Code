@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { homedir } from 'node:os';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   SetupController,
   TIER2_TUNABLE_KEYS,
@@ -1428,6 +1430,33 @@ describe('status(): nextEdit.dedicatedBackendId / rag.embedBackend restoration (
     });
     const data = await controller.status();
     expect(data.nextEdit.dedicatedBackendId).toBeUndefined();
+  });
+});
+
+describe('status(): rag.endpointDefaults (beta.6 panel-fix PT2)', () => {
+  it('carries the three host-owned defaults exactly', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.rag.endpointDefaults).toEqual({
+      ollama: 'http://127.0.0.1:11434',
+      llamacpp: 'http://127.0.0.1:8081',
+      'openai-compat': 'http://127.0.0.1:8000',
+    });
+  });
+
+  it('drift-lock: the llamacpp default port equals the port inside LLAMACPP_RUN_FLAGS.embedding', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+
+    // Reverse drift-lock (registry.test.ts's pattern): read the run-flags
+    // literal off disk rather than exporting it — a change to EITHER side
+    // without the other breaks this test.
+    const source = readFileSync(join(__dirname, 'SetupController.ts'), 'utf-8');
+    const flagsMatch = source.match(/embedding: '--embeddings --port (\d+)'/);
+    expect(flagsMatch, 'LLAMACPP_RUN_FLAGS.embedding literal not found on disk — has it moved?').not.toBeNull();
+    const embeddingPort = flagsMatch?.[1];
+
+    expect(data.rag.endpointDefaults?.llamacpp).toBe(`http://127.0.0.1:${embeddingPort}`);
   });
 });
 

@@ -466,6 +466,18 @@ const AGENT_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; vllm
   llamacpp: 'http://127.0.0.1:8013',
   vllm: 'http://127.0.0.1:8000',
 };
+/** §3.2 (audit A5, beta.6 panel-fix T2): host-owned RAG endpoint defaults —
+ *  mirrors {@link AGENT_ENDPOINT_DEFAULTS}'s CC-6 pattern exactly, one const
+ *  per surface. `llamacpp` matches {@link LLAMACPP_RUN_FLAGS}'s embedding
+ *  port (8081 — drift-locked by test); `openai-compat` is the vLLM
+ *  convention port. `ollama` reuses {@link DEFAULT_OLLAMA_ENDPOINT} — ONE
+ *  source for that value, never a second literal. Never webview-fabricated
+ *  (Global Constraint 1). */
+const RAG_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; 'openai-compat': string }> = {
+  ollama: DEFAULT_OLLAMA_ENDPOINT,
+  llamacpp: 'http://127.0.0.1:8081',
+  'openai-compat': 'http://127.0.0.1:8000',
+};
 /** T8 (CC-10): `setup.setNextEdit`'s additive `dedicatedBackendId` enum — the
  *  4 unified-block backend panes. Shared by the write-side validation and the
  *  `status()` read-side coercion (never trust settings.json without
@@ -878,6 +890,10 @@ export class SetupController {
         embedEndpoint: ragEmbedEndpoint,
         embedBackend: ragEmbedBackend,
         embedModel: ragEmbedModel,
+        // beta.6 panel-fix T2 (audit A5): host-owned per-pane endpoint
+        // defaults, ALWAYS populated — mirrors agentLocalModel.endpointDefaults
+        // (CC-6) exactly. Never webview-fabricated (Global Constraint 1).
+        endpointDefaults: RAG_ENDPOINT_DEFAULTS,
         // @deprecated beta.6 T14 (wire compat only): the wrong-daemon
         // computation §3.4 replaced — it answers for the endpoint this
         // status() probed, not `embedEndpoint`, and the exact `===` misses
