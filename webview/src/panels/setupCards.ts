@@ -413,6 +413,21 @@ function isEquivalentOllamaTag(daemonTag: string, formModel: string): boolean {
   return isVettedOllamaAlias(formModel) && isVettedOllamaAlias(daemonTag);
 }
 
+/** Endpoint equality tolerant of WHATWG canonicalization (trailing slash, default
+ *  port, host case/punycode) — mirrors the host's own validateEndpointUrl
+ *  normalization so a saved canonical endpoint still matches the raw registry
+ *  default the host probed. Parse failure falls back to raw compare (keeps the
+ *  honest 'unknown' for genuinely malformed input). `b` may be undefined
+ *  (an unprobed endpoint) → never equal. beta.6 T3 (L1-I-1 companion). */
+export function endpointsEqual(a: string, b: string | undefined): boolean {
+  if (b === undefined) return false;
+  try {
+    return new URL(a).toString() === new URL(b).toString();
+  } catch {
+    return a === b;
+  }
+}
+
 /**
  * §4.2: presence is derived CLIENT-SIDE against the live form state — the
  * host's Ollama probe targets the registry-default endpoint, not whatever
@@ -428,7 +443,7 @@ function isEquivalentOllamaTag(daemonTag: string, formModel: string): boolean {
  */
 export function nextPresence(setup: Pick<SetupData, 'ollama'>, formEndpoint: string, formModel: string): NextPresence {
   const ollama = setup.ollama;
-  if (!ollama.running || formEndpoint !== ollama.endpoint) return 'unknown';
+  if (!ollama.running || !endpointsEqual(formEndpoint, ollama.endpoint)) return 'unknown';
   const present = ollama.models.some((m) => isEquivalentOllamaTag(m.name, formModel));
   return present ? 'present' : 'absent';
 }
@@ -635,7 +650,7 @@ export function catalogPresence(
   formEndpoint: string,
   model: Pick<SetupCatalogModel, 'ollamaTag' | 'ollamaCreatedName'>,
 ): NextPresence {
-  if (!ollama.running || formEndpoint !== ollama.endpoint) return 'unknown';
+  if (!ollama.running || !endpointsEqual(formEndpoint, ollama.endpoint)) return 'unknown';
   const target = catalogOllamaTarget(model);
   if (target === undefined) return 'unknown';
   const present = ollama.models.some((m) => ollamaTagsEqual(m.name, target));

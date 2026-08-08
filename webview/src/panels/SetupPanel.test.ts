@@ -39,6 +39,7 @@ import {
   configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
   dedicatedInitialCandidateId,
+  endpointsEqual,
   fimDoneLine,
   fimHasLocalInstall,
   fimInstallTestEndpoint,
@@ -610,6 +611,21 @@ describe('nextPresence — client-side derivation against live form state (§4.2
     const setup = { ollama: ollamaStatus({ models: [] }) };
     expect(nextPresence(setup, endpoint, '')).toBe('absent');
   });
+
+  // beta.6 T3 (L1-I-1 companion): after an Apply, the saved/configured endpoint
+  // is written CANONICAL (trailing slash) while `ollama.endpoint` is still the
+  // RAW registry default status() probed — same endpoint, different string.
+  // An exact `!==` regresses this to 'unknown'; `endpointsEqual` must keep it
+  // 'present'.
+  it('present when formEndpoint is the canonical (trailing-slash) form of the raw endpoint status() probed', () => {
+    const setup = { ollama: ollamaStatus({ endpoint: 'http://127.0.0.1:11434', models: [{ name: createdName, sizeBytes: 1 }] }) };
+    expect(nextPresence(setup, 'http://127.0.0.1:11434/', createdName)).toBe('present');
+  });
+
+  it('still unknown for a genuinely different endpoint (no false-positive presence)', () => {
+    const setup = { ollama: ollamaStatus({ endpoint: 'http://127.0.0.1:11434', models: [{ name: createdName, sizeBytes: 1 }] }) };
+    expect(nextPresence(setup, 'http://10.0.0.5:11434/', createdName)).toBe('unknown');
+  });
 });
 
 describe('nextPresenceText — §6 presence copy (D2), verbatim', () => {
@@ -888,6 +904,19 @@ describe('catalogPresence — generalizes nextPresence over ANY catalog row (lib
     const ollama = ollamaWire({ models: [{ name: 'anything', sizeBytes: 1 }] });
     const noOllamaEntry = catalogModel({ ollamaTag: undefined, ollamaApproxBytes: undefined });
     expect(catalogPresence(ollama, 'http://127.0.0.1:11434', noOllamaEntry)).toBe('unknown');
+  });
+
+  // beta.6 T3 (L1-I-1 companion): the saved endpoint is written canonical
+  // (trailing slash) but status() probed the raw registry default — same
+  // endpoint, must still resolve 'present', not regress to 'unknown'.
+  it('present for a canonical-vs-raw endpoint pair (same endpoint, different string) — the T3 regression guard', () => {
+    const ollama = ollamaWire({ endpoint: 'http://127.0.0.1:11434', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434/', catalogModel())).toBe('present');
+  });
+
+  it('still unknown for a genuinely different endpoint (no false-positive presence)', () => {
+    const ollama = ollamaWire({ endpoint: 'http://127.0.0.1:11434', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://10.0.0.5:11434/', catalogModel())).toBe('unknown');
   });
 });
 
@@ -1404,6 +1433,36 @@ describe('T14 — ragEmbedPresence: the CONFIGURED embed model, endpoint-scoped 
     expect(
       ragEmbedPresence({ running: false, endpoint: 'http://127.0.0.1:11434', models: [] }, ragCfg('http://127.0.0.1:11434', 'nomic-embed-text')),
     ).toBe('unknown');
+  });
+
+  // beta.6 T3: ragEmbedPresence delegates to catalogPresence (:966), so the
+  // canonical-vs-raw tolerance is covered transitively — pinned here too.
+  it("'present' for a canonical-vs-raw endpoint pair (delegates through catalogPresence, T3)", () => {
+    expect(ragEmbedPresence(daemon(['nomic-embed-text']), ragCfg('http://127.0.0.1:11434/', 'nomic-embed-text'))).toBe('present');
+  });
+});
+
+describe('endpointsEqual — canonicalization-tolerant endpoint comparator (beta.6 T3, L1-I-1 companion)', () => {
+  it('equal after adding a trailing slash', () => {
+    expect(endpointsEqual('http://127.0.0.1:11434/', 'http://127.0.0.1:11434')).toBe(true);
+  });
+  it('equal after dropping an explicit default port', () => {
+    expect(endpointsEqual('http://example.com/', 'http://example.com:80/')).toBe(true);
+  });
+  it('equal after host-case normalization', () => {
+    expect(endpointsEqual('http://EXAMPLE.com/', 'http://example.com/')).toBe(true);
+  });
+  it('b undefined (an unprobed endpoint) is never equal', () => {
+    expect(endpointsEqual('http://127.0.0.1:11434/', undefined)).toBe(false);
+  });
+  it('falls back to raw compare on parse failure — matching malformed strings are still equal', () => {
+    expect(endpointsEqual('not a url', 'not a url')).toBe(true);
+  });
+  it('falls back to raw compare on parse failure — differing malformed strings stay unequal', () => {
+    expect(endpointsEqual('not a url', 'still not a url')).toBe(false);
+  });
+  it('genuinely different endpoints stay unequal (no false-positive presence)', () => {
+    expect(endpointsEqual('http://127.0.0.1:11434/', 'http://10.0.0.5:11434/')).toBe(false);
   });
 });
 
