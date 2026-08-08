@@ -1790,6 +1790,13 @@ describe('T18 — recs strip pure derivation (§3.5, B-F1..B-F8)', () => {
     it('leftGiB = rule-rounded (USABLE_VRAM_24GB_GIB - exact byte sum)', () => {
       expect(recs.stack.leftGiB).toBe('7.1');
     });
+    it('leftGiB floors at "0.0" (never negative) when the defaults sum exceeds USABLE_VRAM_24GB_GIB (M-2)', () => {
+      const oversized = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: 26_843_545_600 } : m,
+      );
+      const oversizedRecs = mustRec(deriveRecommendations(setupFixture(oversized)));
+      expect(oversizedRecs.stack.leftGiB).toBe('0.0');
+    });
     it('stackLineText matches the §6 TEMPLATE verbatim with today’s data', () => {
       // The architecture doc's inline illustration abbreviates the FIM
       // display name (drops "(base)"); the real catalog row's displayName

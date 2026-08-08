@@ -1301,7 +1301,7 @@ function stackRecommendation(agent: RoleRec, fim: RoleRec, embedding: RoleRec): 
   const leftGiBExact = USABLE_VRAM_24GB_GIB - sumGiBExact;
   return {
     sumGiB: roundHalfUp1dp(sumGiBExact).toFixed(1),
-    leftGiB: roundHalfUp1dp(leftGiBExact).toFixed(1),
+    leftGiB: roundHalfUp1dp(Math.max(0, leftGiBExact)).toFixed(1),
   };
 }
 

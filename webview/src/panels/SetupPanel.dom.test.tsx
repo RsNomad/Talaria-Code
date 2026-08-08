@@ -1919,7 +1919,7 @@ describe('T12 — the section renders in EVERY agent.phase (§3.1 CC-7)', () => 
 });
 
 describe('T12 — the 6-model picker: buttons, role-filtered, ONE Default chip + Devstral caption (§3.1)', () => {
-  it('renders all six agent rows as PICKER BUTTONS (unlike the FIM surface, where rows are plain text)', async () => {
+  it('renders all six agent rows as PICKER BUTTONS (role-filtered, §3.1)', async () => {
     const { agentCard } = await openAgentSection(agentBlockData());
     for (const name of [
       'Devstral-24B (2507)',
