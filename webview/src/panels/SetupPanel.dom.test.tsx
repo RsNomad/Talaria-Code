@@ -17,6 +17,7 @@ import { SetupPanel } from './SetupPanel';
 import {
   agentPhaseLabel,
   FIM_LLAMACPP_MODEL_NOTE,
+  FIM_PENDING_CAPTION,
   NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
   pendingSelectionLine,
   PIPX_INSTALL_DOCS_URL,
@@ -3286,6 +3287,73 @@ describe('PT4 — FIM Connect-tab Model field (§3.2)', () => {
     rerender(mk(fimSelectionData({ fim: { ...baseData().fim, selectedId: 'codestral' } })));
     expect(screen.getByRole('button', { name: 'Codestral' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: 'Ollama' })).toHaveAttribute('aria-pressed', 'false');
+  });
+});
+
+describe('L3-I-1 — FIM Connect-tab endpoint scoping (beta.6 fix-wave T5)', () => {
+  it("browsing a FOREIGN backend's Connect tab shows THAT backend's OWN default, never the saved backend's shared endpoint (realistic fixture)", async () => {
+    // Realistic fixture (root cause, §2 L3-I-1): `talaria.autocomplete.endpoint`
+    // is ONE setting — the host projects that SAME saved value onto EVERY FIM
+    // option's `remote.endpointValue`, not just the saved backend's. All FIM
+    // options carry the shared `endpointValue` here — do NOT reset a
+    // non-saved option's `endpointValue` back to '' (the masking fixture
+    // that hid this bug: `codestralOption()`'s default IS `''`, the opposite
+    // of how the host actually populates the wire).
+    const sharedSavedValue = 'http://127.0.0.1:11434'; // Ollama's saved endpoint
+    const ollama = ollamaOption({ remote: { ...must(ollamaOption().remote), endpointValue: sharedSavedValue } });
+    const codestral = codestralOption({ remote: { ...must(codestralOption().remote), endpointValue: sharedSavedValue } });
+    const data = baseData({ fim: { ...baseData().fim, options: [ollama, codestral], selectedId: 'ollama' } });
+    const { user } = renderPanel(data);
+
+    await user.click(screen.getByRole('button', { name: 'Codestral' }));
+
+    // Codestral's OWN default (it is NOT the saved backend), never Ollama's
+    // foreign localhost address riding the shared setting.
+    expect(within(fimCardEl()).getByRole('textbox', { name: 'Endpoint' })).toHaveValue('https://codestral.mistral.ai');
+    expect(within(fimCardEl()).queryByText(/127\.0\.0\.1:11434/)).not.toBeInTheDocument();
+  });
+
+  it('the SAVED backend itself still shows its own real saved endpoint (the fix does not blank it out)', () => {
+    const ollama = ollamaOption({ remote: { ...must(ollamaOption().remote), endpointValue: 'http://127.0.0.1:9999' } });
+    const data = baseData({ fim: { ...baseData().fim, options: [ollama], selectedId: 'ollama' } });
+    renderPanel(data);
+    expect(within(fimCardEl()).getByRole('textbox', { name: 'Endpoint' })).toHaveValue('http://127.0.0.1:9999');
+  });
+});
+
+describe('GATE-M1 — FIM Connect "not saved yet" caption, :latest parity (beta.6 fix-wave T5)', () => {
+  it('a `:latest`-only edit shows NO "not saved yet" (ollamaTagsEqual, parity with the Install tab)', async () => {
+    const { user } = renderPanel(fimSelectionData());
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'qwen2.5-coder:1.5b-base:latest'); // saved model + `:latest`
+    expect(within(fimCardEl()).queryByText(FIM_PENDING_CAPTION)).not.toBeInTheDocument();
+  });
+
+  it('a genuinely different model still shows "not saved yet" (the caption is not disabled outright)', async () => {
+    const { user } = renderPanel(fimSelectionData());
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'starcoder2:3b');
+    expect(within(fimCardEl()).getByText(FIM_PENDING_CAPTION)).toBeInTheDocument();
+  });
+});
+
+describe('PT4-M1 — FIM Connect "not saved yet" is announced to screen readers (beta.6 fix-wave T5)', () => {
+  it('mounted-when-empty: the live region exists even with no differing draft (Finding-7/MDN — never a conditionally-mounted bare span)', () => {
+    renderPanel(fimSelectionData());
+    const region = fimCardEl().querySelector('[role="status"].text-warn');
+    expect(region).not.toBeNull();
+    expect(region).toHaveTextContent('');
+  });
+
+  it('once a differing draft is typed, the "not saved yet" caption text lives inside that live region', async () => {
+    const { user } = renderPanel(fimSelectionData());
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'starcoder2:3b');
+    const caption = within(fimCardEl()).getByText(FIM_PENDING_CAPTION);
+    expect(caption.closest('[role="status"]')).not.toBeNull();
   });
 });
 

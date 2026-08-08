@@ -1125,6 +1125,7 @@ function FimCard({
           disabledReason={disabledReason}
           pendingModel={pendingModel}
           savedModel={fim.model}
+          savedId={fim.selectedId}
           onPendingModel={setPendingModel}
         />
       )}
@@ -1141,6 +1142,7 @@ function FimConnectTab({
   disabledReason,
   pendingModel,
   savedModel,
+  savedId,
   onPendingModel,
 }: {
   option: SetupBackendOption;
@@ -1150,16 +1152,35 @@ function FimConnectTab({
   pendingModel: string;
   /** The wire's SAVED `fim.model` — the field's placeholder + diff baseline. */
   savedModel: string;
+  /**
+   * The wire's SAVED `fim.selectedId` (L3-I-1, beta.6 fix-wave T5) — scopes
+   * the shared `talaria.autocomplete.endpoint` value to the backend it was
+   * actually saved for. Deliberately named `savedId`, NOT `selectedId`:
+   * `FimCard`'s own local `selectedId` (`sel.id`) is the BROWSE highlight, a
+   * different value — overloading the name here would invite passing the
+   * wrong one (critic B7).
+   */
+  savedId: string;
   onPendingModel: (next: string) => void;
 }) {
-  const [endpoint, setEndpoint] = useState(option.remote?.endpointValue || option.remote?.endpointDefault || '');
+  // R-2/L3-I-1 (§2.6, §2 L3-I-1): `talaria.autocomplete.endpoint` is ONE
+  // setting shared by every FIM backend — every option's `remote.endpointValue`
+  // echoes that SAME saved string on the wire regardless of which backend it
+  // represents. `fimInstallTestEndpoint` (already the Install tab's scoping,
+  // `setupCards.ts`) is trustworthy only for the backend it was actually
+  // saved for; browsing a DIFFERENT backend's Connect tab must fall back to
+  // THAT option's own default rather than pre-filling (and later showing/
+  // testing/saving) a foreign, possibly-nonsensical address.
+  const [endpoint, setEndpoint] = useState(() => fimInstallTestEndpoint(savedId, option));
   const needsKey = option.remote?.auth === 'apiKey-optional' || option.remote?.auth === 'apiKey-required';
   const modelFieldVisible = fimModelFieldVisible(option.id);
   const trimmed = pendingModel.trim();
   // "not saved yet" gates on a NON-EMPTY differing draft: an empty field
   // never rides an Apply (visible-value-only rule below), so captioning it
-  // as pending would promise a save that can't happen.
-  const draftDiffers = trimmed !== '' && trimmed !== savedModel;
+  // as pending would promise a save that can't happen. GATE-M1: `:latest`-
+  // tolerant via `ollamaTagsEqual` — parity with the Install tab's pending
+  // line so a `:latest`-only edit never shows a spurious "not saved yet".
+  const draftDiffers = trimmed !== '' && !ollamaTagsEqual(trimmed, savedModel);
 
   return (
     <div className="flex flex-col gap-2">
@@ -1178,7 +1199,11 @@ function FimConnectTab({
             <p id={FIM_MODEL_CAPTION_ID} className="text-2xs text-faint">
               {FIM_MODEL_FIELD_CAPTION}
             </p>
-            {draftDiffers && <span className="text-2xs text-warn">{FIM_PENDING_CAPTION}</span>}
+            {/* PT4-M1: an always-mounted LiveRegion (text swaps, never
+             *  conditionally mounted — Finding-7/MDN), mirroring the Install
+             *  tab's `pendingLine` (`:1399`) so SR users get the same
+             *  announcement Connect's sibling tab already gives them. */}
+            <LiveRegion text={draftDiffers ? FIM_PENDING_CAPTION : ''} className="text-2xs text-warn" />
           </div>
         </div>
       ) : (
