@@ -300,6 +300,21 @@ describe('createBackend — F6: warns once for a self-documented-broken backend/
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
+  /**
+   * beta.6 L1-I-1 companion (CA-8 regression, critic B1): `setup.applyFim`
+   * now writes the WHATWG-canonical form (`validateEndpointUrl`,
+   * `remoteProbe.ts`) — `'http://127.0.0.1:8000'` becomes
+   * `'http://127.0.0.1:8000/'` after a user Applies the openai-compat FIM
+   * endpoint at its default. The exact-string compare against
+   * `OPENAI_COMPAT_DEFAULT_ENDPOINT` (raw, no slash) would then mismatch and
+   * the extension would warn about its own default again. RED before the
+   * `sameEndpoint` fix (`backendFactory.ts:142`), GREEN after.
+   */
+  it('CA-8 companion: does NOT warn when backend=openai-compat is pointed at the CANONICAL form of its own shipped default endpoint (127.0.0.1:8000/, trailing slash)', () => {
+    createBackend(cfg({ backend: 'openai-compat', endpoint: 'http://127.0.0.1:8000/' }));
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
   it('CA-8: still warns when backend=openai-compat is pointed at vLLM\'s default PORT on a DIFFERENT host (not openai-compat\'s own shipped default) — the vLLM heuristic still fires', () => {
     createBackend(cfg({ backend: 'openai-compat', endpoint: 'http://192.168.1.50:8000' }));
     expect(warnSpy).toHaveBeenCalledTimes(1);

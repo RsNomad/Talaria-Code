@@ -1,18 +1,32 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { homedir } from 'node:os';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   SetupController,
   TIER2_TUNABLE_KEYS,
   MUTATING_METHODS,
   READ_ONLY_METHODS,
+  RECHECK_SCOPES,
+  validateRecheckScope,
   isHostSourcedModel,
+  composeVllmCell,
+  composeLlamacppCell,
+  redactForModal,
+  MODAL_UNSAFE_TEXT_PATTERN,
   type SetupHost,
   type SetupControllerDeps,
 } from './SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend, NEXT_DEDICATED_MODEL } from './registry';
+import { MODEL_CATALOG } from './modelCatalog';
+import type { CatalogModel } from './modelCatalog';
+import type { LlamaCppLocateResult } from './llamaCppLocator';
+import type { GgufDestResult } from './modelStore';
 import type { PipxLocateResult } from './pipxLocator';
 import type { HermesPaths } from './pipxInstaller';
 import type { OllamaStatus } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
+import { validateEndpointUrl } from './remoteProbe';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import type { SetupMethod, SetupProgress } from '../../shared/protocol';
 
@@ -176,12 +190,46 @@ function makeFakeDeps(overrides: Partial<SetupControllerDeps> = {}): { deps: Set
     ingestGguf: async (): Promise<void> => {
       calls.push('ingestGguf');
     },
+    // T7 (beta.6): the live-oid resolver seam — never reached from this
+    // file's tests (the provisionModel suites have their own harnesses);
+    // fails closed if it ever is.
+    resolveLfsOid: async (): Promise<{ ok: true; oid: string } | { ok: false; reason: string }> => {
+      calls.push('resolveLfsOid');
+      return { ok: false, reason: 'not used here' };
+    },
     // T5: default = a readable Fedora host — keeps every pre-T5 behavior
     // test (bootstrap-terminal `sudo dnf install pipx` et al.) valid while
     // per-family tests override with their own fixture.
     readOsRelease: async (): Promise<{ text?: string; containerMismatch?: boolean }> => {
       calls.push('readOsRelease');
       return { text: OS_FEDORA_44 };
+    },
+    // T6 (beta.6): the llama.cpp probe default NEVER settles — the memo's
+    // 'checking' state stays deterministic and no legacy onStatusChanged
+    // count is disturbed by a stray settle fire; tests that need a settled
+    // state override with their own scripted resolution.
+    locateLlamaServer: (): Promise<LlamaCppLocateResult> => {
+      calls.push('locateLlamaServer');
+      return new Promise<LlamaCppLocateResult>(() => {});
+    },
+    scanStorePresence: async (): Promise<ReadonlyMap<string, boolean>> => {
+      calls.push('scanStorePresence');
+      return new Map<string, boolean>();
+    },
+    // Composed under the REAL homedir so the controller's `~`-redaction is
+    // provable on the wire (redact splits on `homedir()` exactly).
+    storeDest: (hfRepo: string, file: string): GgufDestResult => {
+      calls.push('storeDest');
+      const destDir = `${homedir()}/.local/share/talaria/models/${hfRepo}`;
+      return { ok: true, destDir, destFile: file, destPath: `${destDir}/${file}` };
+    },
+    checkedStoreDest: async (hfRepo: string, file: string): Promise<GgufDestResult> => {
+      calls.push('checkedStoreDest');
+      const destDir = `${homedir()}/.local/share/talaria/models/${hfRepo}`;
+      return { ok: true, destDir, destFile: file, destPath: `${destDir}/${file}` };
+    },
+    downloadGgufToStore: async (): Promise<void> => {
+      calls.push('downloadGgufToStore');
     },
     ...overrides,
   };
@@ -205,6 +253,7 @@ describe('FM-14: mutating methods refused when untrusted', () => {
     { method: 'setup.applyFim', params: { backendId: 'ollama' } },
     { method: 'setup.setApiKey', params: {} },
     { method: 'setup.pullModel', params: { model: 'qwen2.5-coder:1.5b-base' } },
+    { method: 'setup.saveAgentModel', params: { modelId: 'devstral-24b', backend: 'ollama', endpoint: 'http://127.0.0.1:11434' } },
     { method: 'setup.openProviderWizard', params: {} },
     { method: 'setup.openInstallTerminal', params: { backendId: 'ollama' } },
     { method: 'setup.openBootstrapTerminal', params: {} },
@@ -590,7 +639,7 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(modalCall).toContain('http://old-host:9000');
     expect(modalCall).toContain('http://127.0.0.1:11434');
     expect(host.settings.get('talaria.autocomplete.backend')).toBe('ollama');
-    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434');
+    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434/');
   });
 
   it('refuses an invalid endpoint URL before showing any modal', async () => {
@@ -598,6 +647,194 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'not-a-url' });
     expect(result.ok).toBe(false);
     expect(host.calls).toEqual([]);
+  });
+
+  // --- T1 (beta.6 panel-fix PT1): optional `model` param -----------------------
+
+  it('T1: model present -> modal names it, and a THIRD write follows the two existing writes', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': 'http://old-host:9000' }),
+    });
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:7b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBe(
+      "showModal:Switch autocomplete endpoint from 'http://old-host:9000' to 'http://127.0.0.1:11434/' (backend: Ollama, model: qwen2.5-coder:7b-base)?",
+    );
+    expect(host.calls.filter((c) => c.startsWith('write:'))).toEqual([
+      'write:talaria.autocomplete.backend="ollama"',
+      'write:talaria.autocomplete.endpoint="http://127.0.0.1:11434/"',
+      'write:talaria.autocomplete.model="qwen2.5-coder:7b-base"',
+    ]);
+  });
+
+  it('T1: absent model -> byte-identical: exactly the two existing writes, unchanged modal, no third write', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': 'http://old-host:9000' }),
+    });
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBe("showModal:Switch autocomplete endpoint from 'http://old-host:9000' to 'http://127.0.0.1:11434/' (backend: Ollama)?");
+    expect(host.calls.filter((c) => c.startsWith('write:'))).toEqual([
+      'write:talaria.autocomplete.backend="ollama"',
+      'write:talaria.autocomplete.endpoint="http://127.0.0.1:11434/"',
+    ]);
+    expect(host.settings.has('talaria.autocomplete.model')).toBe(false);
+  });
+
+  it('T1: whitespace-only model is treated as absent -> no third write, unchanged modal', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: '   ',
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.has('talaria.autocomplete.model')).toBe(false);
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).not.toContain('model:');
+  });
+
+  it('T1 sanitation sweep: a C0-control-char model is refused BEFORE any modal, naming the param, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u0007evil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a bidi-override model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u202eevil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: an oversize (>200 char) model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'x'.repeat(201),
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  // CR-001: the char class must also cover C1 controls (incl. NEL, U+0085)
+  // and the Unicode LINE/PARAGRAPH SEPARATORs (U+2028/U+2029) — VS Code's
+  // Chromium-based modal renders these as forced line breaks, which can
+  // forge an extra line in a native trust modal.
+  it('T1 sanitation sweep: a U+2028 LINE SEPARATOR model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u2028evil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a U+2029 PARAGRAPH SEPARATOR model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u2029evil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a U+0085 NEL (C1 control) model is refused BEFORE any modal, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen\u0085evil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a benign model name with a multi-codepoint emoji still passes (no false positive)', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen-\u{1f680}-model',
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.get('talaria.autocomplete.model')).toBe('qwen-\u{1f680}-model');
+  });
+
+  it('T1 (C2-10a): llamacpp + model -> accepted-and-written, not special-cased', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', {
+      backendId: 'llamacpp',
+      endpoint: 'http://127.0.0.1:8080',
+      model: 'qwen2.5-coder:7b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.get('talaria.autocomplete.backend')).toBe('llamacpp');
+    expect(host.settings.get('talaria.autocomplete.model')).toBe('qwen2.5-coder:7b-base');
+  });
+
+  // --- CR-003 (FIM): oldEndpoint (read from settings, not PT1-covered) is
+  // REDACTED, not refused, before it reaches the modal -------------------------
+
+  it('CR-003 (FIM applyFim): a saved endpoint with a newline + bidi override cannot forge a line in the modal, and Apply still succeeds', async () => {
+    const bidiOverride = String.fromCharCode(0x202e);
+    const forged = `http://real-host:9000\nWARNING: this is FAKE trusted text${bidiOverride}`;
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': forged }),
+    });
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    // the write is still the NEW validated.url -- redaction never touches writes.
+    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe('http://127.0.0.1:11434/');
+  });
+
+  it('CR-003 (FIM applyFim): a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': 'http://old-host:9000' }),
+    });
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('http://old-host:9000');
+  });
+
+  it('CR-003: a saved endpoint that is ALL unsafe chars redacts to empty -> falls back to (default)', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.autocomplete.endpoint': `\n${String.fromCharCode(0x202e)}` }),
+    });
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain("from '(default)' to");
   });
 });
 
@@ -620,8 +857,287 @@ describe('setup.setNextEdit: validates URL then Tier-1-writes the three keys', (
     });
     expect(result).toEqual({ ok: true });
     expect(host.settings.get('talaria.nextEdit.backend')).toBe('openai-compat');
-    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:8000');
+    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:8000/');
     expect(host.settings.get('talaria.nextEdit.model')).toBe('qwen2.5-coder:1.5b-base');
+    expect(host.settings.has('talaria.nextEdit.dedicatedBackendId')).toBe(false); // never sent -> never written
+  });
+
+  // beta.6 T8 (CC-10): additive dedicatedBackendId plumbing.
+  it('a valid dedicatedBackendId is written alongside the three keys', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'sweep-next-edit-v2-7b:q4_k_m',
+      dedicatedBackendId: 'llamacpp',
+    });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.get('talaria.nextEdit.dedicatedBackendId')).toBe('llamacpp');
+  });
+
+  it('an invalid dedicatedBackendId is refused before any modal/write', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'x',
+      dedicatedBackendId: 'bogus',
+    });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+  });
+
+  // T1 (beta.6 panel-fix PT1): the shared modal-forging sanitation sweep
+  // applies here too — `model` is interpolated into this modal.
+  it('T1 sanitation sweep: a bidi-override model is refused BEFORE any modal, naming the param, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'sweep\u202eevil',
+    });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/model/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  // --- CR-003 (NEXT dedicated): oldEndpoint (read from settings, not
+  // PT1-covered) is REDACTED, not refused, before it reaches the modal --------
+
+  it('CR-003 (NEXT dedicated setNextEdit): a saved endpoint with a newline + bidi override cannot forge a line in the modal, and Apply still succeeds', async () => {
+    const forged = 'http://real-dedicated:9000\nWARNING: this is FAKE trusted text\u202e';
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.nextEdit.endpoint': forged }),
+    });
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:1.5b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    // the write is still the NEW validated.url -- redaction never touches writes.
+    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe('http://127.0.0.1:11434/');
+  });
+
+  it('CR-003 (NEXT dedicated setNextEdit): a clean saved endpoint still renders verbatim (no over-redaction)', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.nextEdit.endpoint': 'http://old-dedicated:8000' }),
+    });
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:1.5b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('http://old-dedicated:8000');
+  });
+
+  it('CR-003: no saved endpoint -> unchanged "(none)" fallback', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: 'qwen2.5-coder:1.5b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain("from '(none)' to");
+  });
+});
+
+// --- L1-I-1 (beta.6 fix-wave T2): the 7-handler unsafe-NEW-endpoint security
+// sweep + the modal-safety invariant. T1 already fixed the ONE chokepoint
+// (`validateEndpointUrl`) every `showModal` site reads — these tests prove
+// the 4 handlers living in THIS file (applyFim, setNextEdit, setRag) never
+// let an unsafe NEW `params.endpoint` reach the modal un-neutralized, and
+// that the WRITTEN setting is always the canonical form. `saveAgentModel`
+// and the three `provisionOllama` arms are covered the same way in their own
+// files (`SetupController.saveAgentModel.test.ts`,
+// `SetupController.provisionModel.test.ts`,
+// `SetupController.provisionModel.fixtures.test.ts`). ------------------------
+
+describe('L1-I-1 T2: unsafe NEW params.endpoint never reaches the modal unsanitized', () => {
+  // U+202E is RIGHT-TO-LEFT OVERRIDE — one of the bidi-override class the
+  // WHATWG parser %-encodes into the path during re-serialization (forge-proof
+  // by construction, not by a hand-maintained blocklist).
+  const bidiOverride = String.fromCharCode(0x202e);
+  const unsafeNewEndpoint = `http://127.0.0.1:11434/${bidiOverride}evil`;
+  const canonicalUnsafeNewEndpoint = 'http://127.0.0.1:11434/%E2%80%AEevil';
+  const userinfoEndpoint = 'http://user:pass@127.0.0.1:11434';
+
+  it('setup.applyFim: a bidi-override NEW endpoint is canonicalized before the modal, and the write is the canonical value', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: unsafeNewEndpoint });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(host.settings.get('talaria.autocomplete.endpoint')).toBe(canonicalUnsafeNewEndpoint);
+  });
+
+  it('setup.applyFim: userinfo in the NEW endpoint is refused before any modal/write', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: userinfoEndpoint });
+    expect(result).toEqual({
+      ok: false,
+      reason: 'Remove the username:password@ part of the URL — credentials go in the API-key field, not the address.',
+    });
+    expect(host.calls).toEqual([]);
+    expect(host.settings.size).toBe(0);
+  });
+
+  it('setup.setNextEdit: a bidi-override NEW endpoint is canonicalized before the modal, and the write is the canonical value', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: unsafeNewEndpoint,
+      model: 'qwen2.5-coder:1.5b-base',
+    });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(host.settings.get('talaria.nextEdit.endpoint')).toBe(canonicalUnsafeNewEndpoint);
+  });
+
+  it('setup.setNextEdit: userinfo in the NEW endpoint is refused before any modal/write', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setNextEdit', {
+      backend: 'ollama',
+      endpoint: userinfoEndpoint,
+      model: 'x',
+    });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+    expect(host.settings.size).toBe(0);
+  });
+
+  it('setup.setRag: a bidi-override NEW embedEndpoint is canonicalized before the modal, and the write is the canonical value', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedEndpoint: unsafeNewEndpoint });
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    expect(host.settings.get('talaria.rag.embedEndpoint')).toBe(canonicalUnsafeNewEndpoint);
+  });
+
+  it('setup.setRag: userinfo in the NEW embedEndpoint is refused before any modal/write', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedEndpoint: userinfoEndpoint });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+    expect(host.settings.size).toBe(0);
+  });
+});
+
+// --- L1-I-1 T2: modal-safety invariant ---------------------------------------
+//
+// Moved here (rather than the PURE `remoteProbe.test.ts`) because it needs
+// `MODAL_UNSAFE_TEXT_PATTERN`, which lives in `SetupController.ts` — importing
+// it into `remoteProbe.test.ts` would drag the whole SetupController graph
+// into that file's otherwise-pure test (critic minor A, T1 brief). The
+// invariant: for every raw endpoint `validateEndpointUrl` accepts, the
+// serialized `.url` it returns can NEVER contain a modal-forging character —
+// this holds by construction (WHATWG re-serialization), not because of a
+// hand-maintained blocklist being complete.
+describe('L1-I-1 T2: modal-safety invariant — validateEndpointUrl(raw).url never carries a MODAL_UNSAFE_TEXT_PATTERN character', () => {
+  const bidiOverride = String.fromCharCode(0x202e);
+  const tabChar = String.fromCharCode(0x09);
+  const UNSAFE_CORPUS = [
+    'http://127.0.0.1\n:11434',
+    `http://127.0.0.1:11434${tabChar}/v1`,
+    `http://127.0.0.1:11434/${bidiOverride}evil`,
+    `http://exam${bidiOverride}ple.com`,
+    'http://user:pass@127.0.0.1:11434',
+    'http://аpple.com', // Cyrillic 'а' homograph — punycoded on serialization
+    'not-a-url',
+    'ftp://127.0.0.1:11434',
+  ];
+
+  for (const raw of UNSAFE_CORPUS) {
+    it(`${JSON.stringify(raw)}: ok:true implies .url carries no unsafe modal character`, () => {
+      const r = validateEndpointUrl(raw);
+      if (r.ok) {
+        expect(MODAL_UNSAFE_TEXT_PATTERN.test(r.url)).toBe(false);
+      } else {
+        expect(r.ok).toBe(false);
+      }
+    });
+  }
+});
+
+// --- CR-003: redactForModal ---------------------------------------------------
+
+describe('redactForModal (CR-003): neutralizes a saved value for modal display, never refuses', () => {
+  it('strips every member of the unsafe class from a mixed string', () => {
+    const input = 'before\nmid1\u202emid2\u0085mid3\u2028mid4\u200bmid5\u2029after';
+    const out = redactForModal(input);
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(out)).toBe(false);
+    expect(out).toBe('beforemid1mid2mid3mid4mid5after');
+  });
+
+  it('caps the result at 200 characters', () => {
+    const out = redactForModal('a'.repeat(250));
+    expect(out.length).toBe(200);
+    expect(out).toBe('a'.repeat(200));
+  });
+
+  it('leaves a normal endpoint untouched', () => {
+    expect(redactForModal('http://127.0.0.1:11434')).toBe('http://127.0.0.1:11434');
+  });
+
+  it('a value that is ALL unsafe chars redacts to the empty string', () => {
+    expect(redactForModal('\n\u202e')).toBe('');
+  });
+
+  it('a benign multi-codepoint emoji is untouched (no false-positive stripping)', () => {
+    expect(redactForModal('qwen-\u{1f680}-model')).toBe('qwen-\u{1f680}-model');
+  });
+});
+
+describe('CR-003 drift-lock: the REFUSE regex and the REDACT path cover the exact same char class', () => {
+  // one boundary codepoint per sub-range named in the MODAL_UNSAFE_TEXT_PATTERN
+  // doc comment (C0, DEL, C1 incl. NEL, ALM, zero-width/bidi marks,
+  // LINE/PARAGRAPH SEPARATOR, bidi override, word joiner, isolates, BOM) --
+  // both ends of each range where the range has more than one member (T4:
+  // U+061C/U+2060/U+FEFF are single-codepoint additions, so one entry each).
+  // All expressed as \u escapes (never a raw control/bidi/format character
+  // in this source file).
+  const BOUNDARY_CODEPOINTS: { name: string; ch: string }[] = [
+    { name: 'C0 start (NUL, U+0000)', ch: '\x00' },
+    { name: 'C0 end (US, U+001F)', ch: '\x1f' },
+    { name: 'DEL (U+007F)', ch: '\x7f' },
+    { name: 'C1 start (U+0080)', ch: '\u0080' },
+    { name: 'NEL (C1, U+0085)', ch: '\u0085' },
+    { name: 'C1 end (U+009F)', ch: '\u009f' },
+    { name: 'zero-width/bidi marks start (U+200B)', ch: '\u200b' },
+    { name: 'zero-width/bidi marks end (U+200F)', ch: '\u200f' },
+    { name: 'LINE SEPARATOR (U+2028)', ch: '\u2028' },
+    { name: 'PARAGRAPH SEPARATOR (U+2029)', ch: '\u2029' },
+    { name: 'bidi override start (U+202A)', ch: '\u202a' },
+    { name: 'bidi override end (U+202E)', ch: '\u202e' },
+    { name: 'isolates start (U+2066)', ch: '\u2066' },
+    { name: 'isolates end (U+2069)', ch: '\u2069' },
+    { name: 'ARABIC LETTER MARK (U+061C)', ch: '\u061c' },
+    { name: 'WORD JOINER (U+2060)', ch: '\u2060' },
+    { name: 'ZERO WIDTH NO-BREAK SPACE / BOM (U+FEFF)', ch: '\ufeff' },
+  ];
+
+  it('for every boundary codepoint, the refuse-pattern.test() and redactForModal() output agree', () => {
+    for (const { name, ch } of BOUNDARY_CODEPOINTS) {
+      expect(MODAL_UNSAFE_TEXT_PATTERN.test(ch), `refuse-pattern should flag ${name}`).toBe(true);
+      expect(redactForModal(ch), `redactForModal should strip ${name} to empty`).toBe('');
+    }
+  });
+
+  it('a benign printable ASCII character is untouched by both', () => {
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test('a')).toBe(false);
+    expect(redactForModal('a')).toBe('a');
   });
 });
 
@@ -635,6 +1151,80 @@ describe('setup.setRag: Tier-1 writes', () => {
     expect(host.settings.get('talaria.rag.enabled')).toBe(false);
     expect(host.settings.get('talaria.rag.embedModel')).toBe('qwen3-embedding:0.6b');
     expect(host.settings.has('talaria.rag.indexDir')).toBe(false);
+    expect(host.settings.has('talaria.rag.embedBackend')).toBe(false); // never sent -> never written
+  });
+
+  // beta.6 T8 (CC-10): additive embedBackend plumbing.
+  it('a valid embedBackend is written', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedBackend: 'llamacpp' });
+    expect(result).toEqual({ ok: true });
+    expect(host.settings.get('talaria.rag.embedBackend')).toBe('llamacpp');
+  });
+
+  it('an invalid embedBackend is refused with no writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedBackend: 'bogus' });
+    expect(result.ok).toBe(false);
+    expect(host.calls).toEqual([]);
+  });
+
+  // T1 (beta.6 panel-fix PT1): the shared modal-forging sanitation sweep —
+  // both `embedModel` and `indexDir` are interpolated into the Apply modal.
+  it('T1 sanitation sweep: a zero-width-char embedModel is refused BEFORE any modal, naming the param, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { embedModel: 'qwen3\u200bevil' });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/embedModel/i);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('T1 sanitation sweep: a control-char indexDir is refused BEFORE any modal, naming the param, zero writes', async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.setRag', { indexDir: '.hermes\u0007/index' });
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; reason: string }).reason).toMatch(/indexDir/i);
+    expect(host.calls).toEqual([]);
+  });
+});
+
+// --- T1 (beta.6 panel-fix PT1): FIM≠RAG write-path guarantee, both directions --
+
+describe('T1: handleApplyFim / handleSetRag write-path guarantee (full-param spy, both directions)', () => {
+  it('handleApplyFim never writes a key outside talaria.autocomplete.* — every backend, with and without model', async () => {
+    for (const backendId of ['ollama', 'llamacpp', 'vllm', 'codestral', 'openai-compat']) {
+      const descriptor = getBackend(backendId);
+      const endpoint = descriptor?.remote?.endpoint.defaultValue;
+      for (const model of [undefined, 'some-model']) {
+        const { host, controller } = makeController();
+        await controller.handle('setup.applyFim', { backendId, endpoint, ...(model ? { model } : {}) });
+        const writeKeys = host.calls
+          .filter((c) => c.startsWith('write:'))
+          .map((c) => c.slice('write:'.length).match(/^[^=]*/)?.[0] ?? '');
+        expect(writeKeys.length).toBeGreaterThan(0);
+        for (const k of writeKeys) {
+          expect(k.startsWith('talaria.autocomplete.')).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('handleSetRag never writes a key outside talaria.rag.* — full param surface', async () => {
+    const { host, controller } = makeController();
+    await controller.handle('setup.setRag', {
+      enabled: true,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'qwen3-embedding:0.6b',
+      indexDir: '.hermes/index',
+      embedBackend: 'ollama',
+    });
+    const writeKeys = host.calls
+      .filter((c) => c.startsWith('write:'))
+      .map((c) => c.slice('write:'.length).match(/^[^=]*/)?.[0] ?? '');
+    expect(writeKeys.length).toBeGreaterThan(0);
+    for (const k of writeKeys) {
+      expect(k.startsWith('talaria.rag.')).toBe(true);
+    }
   });
 });
 
@@ -662,6 +1252,41 @@ describe('setup.openProviderWizard: runInTerminal(name, <hermesAcp>, ["--setup"]
     expect(result.ok).toBe(false);
     expect(host.terminalsRun).toEqual([]);
     expect(host.calls).toEqual([]); // never even shows the modal
+  });
+
+  // --- CR-003b: hermesAcpPath (derived from talaria.hermesPath, not
+  // PT1-covered) is REDACTED in the modal string, never in the actually-
+  // executed runInTerminal call ---------------------------------------------
+
+  it('CR-003b: a hermesPath with a newline + bidi override cannot forge a line in the modal, but runInTerminal still gets the UNREDACTED derived path', async () => {
+    const forged = '/home/u\nWARNING: this is FAKE trusted text\u202e/bin/hermes';
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.hermesPath': forged }),
+    });
+    const result = await controller.handle('setup.openProviderWizard', {});
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toBeDefined();
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(modalCall as string)).toBe(false);
+    // the launch itself MUST still use the real, unredacted derived path —
+    // redacting what actually runs would break the terminal launch.
+    expect(host.terminalsRun).toEqual([
+      {
+        name: 'Hermes Provider Setup',
+        shellPath: '/home/u\nWARNING: this is FAKE trusted text\u202e/bin/hermes-acp',
+        args: ['--setup'],
+      },
+    ]);
+  });
+
+  it('CR-003b: a clean hermesPath still renders verbatim in the modal (no over-redaction)', async () => {
+    const { host, controller } = makeController({
+      settings: settingsMap({ 'talaria.hermesPath': '/home/u/.local/share/pipx/venvs/hermes-agent/bin/hermes' }),
+    });
+    const result = await controller.handle('setup.openProviderWizard', {});
+    expect(result).toEqual({ ok: true });
+    const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
+    expect(modalCall).toContain('/home/u/.local/share/pipx/venvs/hermes-agent/bin/hermes-acp');
   });
 });
 
@@ -1026,6 +1651,8 @@ describe('MUTATING_METHODS / READ_ONLY_METHODS partition the full SetupMethod un
     'setup.setApiKey': true,
     'setup.testRemote': true,
     'setup.pullModel': true,
+    'setup.provisionModel': true,
+    'setup.saveAgentModel': true,
     'setup.cancel': true,
     'setup.openProviderWizard': true,
     'setup.openInstallTerminal': true,
@@ -1076,6 +1703,94 @@ describe('computeProviderCard null-guard (FIX 4): a malformed (null) advertised-
 });
 
 // --- status() assembly --------------------------------------------------------
+
+// --- beta.6 T8 (CC-10): additive restoration settings on the wire -----------
+
+describe('status(): nextEdit.dedicatedBackendId / rag.embedBackend restoration (beta.6 T8)', () => {
+  it('rag.embedBackend defaults to "ollama" and is ALWAYS populated when never set', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.rag.embedBackend).toBe('ollama');
+  });
+
+  it('rag.embedBackend reflects a saved value', async () => {
+    const { controller } = makeController({ settings: settingsMap({ 'talaria.rag.embedBackend': 'openai-compat' }) });
+    const data = await controller.status();
+    expect(data.rag.embedBackend).toBe('openai-compat');
+  });
+
+  it('a corrupted rag.embedBackend degrades to the "ollama" default, never propagates garbage', async () => {
+    const { controller } = makeController({ settings: settingsMap({ 'talaria.rag.embedBackend': 'not-a-backend' }) });
+    const data = await controller.status();
+    expect(data.rag.embedBackend).toBe('ollama');
+  });
+
+  it('nextEdit.dedicatedBackendId is ABSENT from the wire when never set', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.nextEdit.dedicatedBackendId).toBeUndefined();
+  });
+
+  it('nextEdit.dedicatedBackendId reflects a saved value', async () => {
+    const { controller } = makeController({
+      settings: settingsMap({ 'talaria.nextEdit.dedicatedBackendId': 'vllm' }),
+    });
+    const data = await controller.status();
+    expect(data.nextEdit.dedicatedBackendId).toBe('vllm');
+  });
+
+  it('a corrupted nextEdit.dedicatedBackendId is OMITTED, never propagates garbage', async () => {
+    const { controller } = makeController({
+      settings: settingsMap({ 'talaria.nextEdit.dedicatedBackendId': 'bogus-pane' }),
+    });
+    const data = await controller.status();
+    expect(data.nextEdit.dedicatedBackendId).toBeUndefined();
+  });
+});
+
+describe('status(): rag.endpointDefaults (beta.6 panel-fix PT2)', () => {
+  it('carries the three host-owned defaults exactly', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+    expect(data.rag.endpointDefaults).toEqual({
+      ollama: 'http://127.0.0.1:11434',
+      llamacpp: 'http://127.0.0.1:8081',
+      'openai-compat': 'http://127.0.0.1:8000',
+    });
+  });
+
+  it('drift-lock: the llamacpp default port equals the port inside LLAMACPP_RUN_FLAGS.embedding', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+
+    // Reverse drift-lock (registry.test.ts's pattern): read the run-flags
+    // literal off disk rather than exporting it — a change to EITHER side
+    // without the other breaks this test.
+    const source = readFileSync(join(__dirname, 'SetupController.ts'), 'utf-8');
+    const flagsMatch = source.match(/embedding: '--embeddings --port (\d+)'/);
+    expect(flagsMatch, 'LLAMACPP_RUN_FLAGS.embedding literal not found on disk — has it moved?').not.toBeNull();
+    const embeddingPort = flagsMatch?.[1];
+
+    expect(data.rag.endpointDefaults?.llamacpp).toBe(`http://127.0.0.1:${embeddingPort}`);
+  });
+});
+
+describe('status(): agentLocalModel.endpointDefaults drift-lock (beta.6 fix-wave T8)', () => {
+  it('drift-lock: the llamacpp default port equals the port inside LLAMACPP_RUN_FLAGS.agent', async () => {
+    const { controller } = makeController();
+    const data = await controller.status();
+
+    // Reverse drift-lock (mirrors the RAG drift-lock above): read the
+    // run-flags literal off disk rather than exporting it — a change to
+    // EITHER side without the other breaks this test.
+    const source = readFileSync(join(__dirname, 'SetupController.ts'), 'utf-8');
+    const flagsMatch = source.match(/agent: '--jinja --port (\d+)'/);
+    expect(flagsMatch, 'LLAMACPP_RUN_FLAGS.agent literal not found on disk — has it moved?').not.toBeNull();
+    const agentPort = flagsMatch?.[1];
+
+    expect(data.agentLocalModel?.endpointDefaults?.llamacpp).toBe(`http://127.0.0.1:${agentPort}`);
+  });
+});
 
 describe('status(): assembles SetupData from registry + settings + secrets + ollama probe', () => {
   it('defaults: agent missing, fim ollama, rag defaults, ollama not running', async () => {
@@ -1686,7 +2401,7 @@ describe('T7: onStatusChanged fires on confirmed-start, failure-write, success, 
 const HOST_SOURCED_REFUSAL_COPY =
   "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
 const DOWNLOAD_UNAVAILABLE_COPY =
-  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 const NEXT_WARNING_COPY =
   'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.';
 
@@ -1818,5 +2533,634 @@ describe('T13 presence wire (§4.2 — status() facts, real registry sha256=empt
         // by the same pin as the Download button).
       },
     });
+  });
+});
+
+// =============================================================================
+// --- T6 (beta.6): controller runtime state + wire ----------------------------
+// =============================================================================
+
+/** One macrotask turn — lets a settled probe's .then body (state write +
+ *  onStatusChanged fire) run before asserting. */
+const tickT6 = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+// §6 copy, verbatim (drift-locked here AND used by assertions below).
+const LLAMACPP_MISSING_COPY = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';
+const LLAMACPP_HONEST_ABSENCE_COPY =
+  'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.';
+const LLAMACPP_SERVER_DOCS_URL = 'https://github.com/ggml-org/llama.cpp/tree/master/tools/server';
+const RECHECK_SCOPE_REFUSAL = "scope must be one of 'all', 'agent', 'os', 'ollama', 'llamacpp'.";
+
+function catalogRow(id: string): CatalogModel {
+  const row = MODEL_CATALOG.find((m) => m.id === id);
+  if (!row) throw new Error(`no catalog row '${id}'`);
+  return row;
+}
+
+const NOT_FOUND_RESULT: LlamaCppLocateResult = { ok: false, reason: 'not-found', detail: 'clean 127 miss' };
+const PROBE_TIMEOUT_RESULT: LlamaCppLocateResult = { ok: false, reason: 'probe-timeout', detail: 'shell wedged' };
+
+describe('T6: llamacppRuntime settled-value memo (§2.5 — NOT the awaited-osResolution pattern)', () => {
+  it("a probe that never resolves ⇒ status() returns binary:'checking' (and keeps returning it)", async () => {
+    const { controller } = makeController();
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+  });
+
+  it('the probe is kicked exactly ONCE across repeated status() calls', async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.status();
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'locateLlamaServer').length).toBe(1);
+  });
+
+  it('settle fires onStatusChanged exactly ONCE; the settled value lands on the next status()', async () => {
+    let resolveProbe: ((r: LlamaCppLocateResult) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        locateLlamaServer: () =>
+          new Promise<LlamaCppLocateResult>((resolve) => {
+            resolveProbe = resolve;
+          }),
+      },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+    expect(fires.length).toBe(0);
+
+    resolveProbe?.({ ok: true, path: '/usr/bin/llama-server', version: 'version: b4570' });
+    await tickT6();
+    expect(fires.length).toBe(1);
+
+    const data = await controller.status();
+    expect(data.llamacppRuntime).toEqual({
+      binary: 'found',
+      version: 'version: b4570',
+      path: '/usr/bin/llama-server',
+    });
+    await tickT6();
+    expect(fires.length).toBe(1); // status() re-reads the memo — no second fire, no re-kick
+  });
+
+  it('found: the wire path is ~-redacted (the redaction discipline applies to the probe path too)', async () => {
+    const { controller } = makeController(
+      {},
+      { locateLlamaServer: async () => ({ ok: true, path: `${homedir()}/.local/bin/llama-server` }) },
+    );
+    await controller.status();
+    await tickT6();
+    const data = await controller.status();
+    expect(data.llamacppRuntime).toEqual({ binary: 'found', path: '~/.local/bin/llama-server' });
+  });
+
+  it("not-found ⇒ binary:'missing' (CC-5)", async () => {
+    const { controller } = makeController({}, { locateLlamaServer: async () => NOT_FOUND_RESULT });
+    await controller.status();
+    await tickT6();
+    expect((await controller.status()).llamacppRuntime?.binary).toBe('missing');
+  });
+
+  it("probe-timeout ⇒ binary:'unknown', NEVER 'missing', and NO install projection (CC-5)", async () => {
+    const { controller } = makeController({}, { locateLlamaServer: async () => PROBE_TIMEOUT_RESULT });
+    await controller.status();
+    await tickT6();
+    const data = await controller.status();
+    expect(data.llamacppRuntime).toEqual({ binary: 'unknown' });
+  });
+
+  it("a REJECTING locateLlamaServer binding settles 'unknown' — never an unhandled rejection out of status()", async () => {
+    const { controller } = makeController(
+      {},
+      {
+        locateLlamaServer: async () => {
+          throw new Error('binding exploded');
+        },
+      },
+    );
+    await controller.status();
+    await tickT6();
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'unknown' });
+  });
+});
+
+describe('T6: llamacppRuntime.install projection (CC-4 — the agent.bootstrap pattern; §6 verbatim)', () => {
+  async function missingOn(
+    osRead: { text?: string; containerMismatch?: boolean },
+  ): Promise<Awaited<ReturnType<SetupController['status']>>['llamacppRuntime']> {
+    const { controller } = makeController(
+      {},
+      {
+        locateLlamaServer: async () => NOT_FOUND_RESULT,
+        readOsRelease: async () => osRead,
+      },
+    );
+    await controller.status();
+    await tickT6();
+    return (await controller.status()).llamacppRuntime;
+  }
+
+  it('fedora: engine command + §6 guidance + the engine docsUrl', async () => {
+    expect(await missingOn({ text: OS_FEDORA_44 })).toEqual({
+      binary: 'missing',
+      install: {
+        command: 'sudo dnf install llama-cpp',
+        guidance: LLAMACPP_MISSING_COPY,
+        docsUrl: 'https://packages.fedoraproject.org/search?query=llama-cpp',
+      },
+    });
+  });
+
+  it('arch: engine command (--needed, no auto-confirm)', async () => {
+    expect(await missingOn({ text: OS_ARCH })).toEqual({
+      binary: 'missing',
+      install: {
+        command: 'sudo pacman -S --needed llama-cpp',
+        guidance: LLAMACPP_MISSING_COPY,
+        docsUrl: 'https://archlinux.org/packages/?q=llama-cpp',
+      },
+    });
+  });
+
+  it('suse: engine command', async () => {
+    expect(await missingOn({ text: OS_TUMBLEWEED })).toEqual({
+      binary: 'missing',
+      install: {
+        command: 'sudo zypper install llamacpp',
+        guidance: LLAMACPP_MISSING_COPY,
+        docsUrl: 'https://software.opensuse.org/package/llamacpp',
+      },
+    });
+  });
+
+  it('debian: GUIDANCE-ONLY — no command is ever guessed (the archive package name is unconfirmed)', async () => {
+    expect(await missingOn({ text: OS_DEBIAN_13 })).toEqual({
+      binary: 'missing',
+      install: { guidance: LLAMACPP_MISSING_COPY, docsUrl: LLAMACPP_SERVER_DOCS_URL },
+    });
+  });
+
+  it('unknown distro: guidance-only', async () => {
+    expect(await missingOn({})).toEqual({
+      binary: 'missing',
+      install: { guidance: LLAMACPP_MISSING_COPY, docsUrl: LLAMACPP_SERVER_DOCS_URL },
+    });
+  });
+
+  it('container degrade: the §6 container note IS the guidance (S-F10 honesty)', async () => {
+    expect(await missingOn({ containerMismatch: true })).toEqual({
+      binary: 'missing',
+      install: { guidance: CONTAINER_NOTE_COPY, docsUrl: LLAMACPP_SERVER_DOCS_URL },
+    });
+  });
+});
+
+describe("T6: scoped recheck (§2.5) — {scope:'llamacpp'} re-kicks WITHOUT awaiting", () => {
+  it('resolves while the probe is still pending (non-blocking), aborts the superseded probe, re-kicks, and state returns to checking', async () => {
+    const signals: AbortSignal[] = [];
+    let locateCalls = 0;
+    const { depCalls, controller } = makeController(
+      {},
+      {
+        locateLlamaServer: (signal?: AbortSignal) => {
+          locateCalls++;
+          if (signal) signals.push(signal);
+          return new Promise<LlamaCppLocateResult>(() => {});
+        },
+      },
+    );
+    await controller.status(); // kick #1
+    expect(locateCalls).toBe(1);
+
+    const result = await controller.handle('setup.recheck', { scope: 'llamacpp' });
+    expect(result).toEqual({ ok: true }); // resolved though the probe never settles
+    expect(locateCalls).toBe(2); // re-kicked without awaiting
+    expect(signals[0]?.aborted).toBe(true); // superseded probe cancelled (T5 CR-1 threading)
+    expect(signals[1]?.aborted).toBe(false);
+    expect(depCalls).not.toContain('locatePipx'); // scoped: the agent card is untouched
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+  });
+
+  it('a superseded probe settling late is DROPPED — no state overwrite, no extra fire', async () => {
+    const resolvers: Array<(r: LlamaCppLocateResult) => void> = [];
+    const { controller } = makeController(
+      {},
+      {
+        locateLlamaServer: () =>
+          new Promise<LlamaCppLocateResult>((resolve) => {
+            resolvers.push(resolve);
+          }),
+      },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    await controller.status(); // kick #1
+    await controller.handle('setup.recheck', { scope: 'llamacpp' }); // supersede + kick #2
+    expect(fires.length).toBe(1); // the recheck completion fire only
+
+    resolvers[0]?.({ ok: true, path: '/stale/llama-server' }); // the SUPERSEDED probe settles late
+    await tickT6();
+    expect(fires.length).toBe(1); // dropped: no settle fire
+    expect((await controller.status()).llamacppRuntime).toEqual({ binary: 'checking' });
+
+    resolvers[1]?.(NOT_FOUND_RESULT); // the CURRENT probe settles
+    await tickT6();
+    expect(fires.length).toBe(2);
+    expect((await controller.status()).llamacppRuntime?.binary).toBe('missing');
+  });
+
+  it("{scope:'llamacpp'} touches NOTHING else — os memo intact, pipx not relocated", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.handle('setup.recheck', { scope: 'llamacpp' });
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(1); // memo NOT cleared
+    expect(depCalls).not.toContain('locatePipx');
+  });
+
+  it("absent scope = 'all' (byte-compatible): relocates pipx AND re-kicks the llamacpp probe", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status(); // kick #1
+    await controller.handle('setup.recheck', {});
+    expect(depCalls).toContain('locatePipx');
+    expect(depCalls.filter((c) => c === 'locateLlamaServer').length).toBe(2);
+  });
+
+  it("{scope:'agent'}: relocates pipx ONLY — no llamacpp re-kick, no os-memo clear", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.handle('setup.recheck', { scope: 'agent' });
+    await controller.status();
+    expect(depCalls).toContain('locatePipx');
+    expect(depCalls.filter((c) => c === 'locateLlamaServer').length).toBe(1);
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(1);
+  });
+
+  it("{scope:'os'}: clears the os memo ONLY — next status() re-reads os-release; pipx untouched", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.handle('setup.recheck', { scope: 'os' });
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(2);
+    expect(depCalls).not.toContain('locatePipx');
+  });
+
+  it("{scope:'ollama'}: fires once (repaint → fresh status re-probes the daemon); nothing else touched", async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    const result = await controller.handle('setup.recheck', { scope: 'ollama' });
+    expect(result).toEqual({ ok: true });
+    expect(fires.length).toBe(1);
+    await controller.status();
+    expect(depCalls).not.toContain('locatePipx');
+    expect(depCalls.filter((c) => c === 'readOsRelease').length).toBe(1);
+    expect(depCalls.filter((c) => c === 'locateLlamaServer').length).toBe(1);
+  });
+
+  it('an invalid scope is REFUSED (validated enum) — nothing runs, nothing fires', async () => {
+    const { depCalls, controller } = makeController();
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    const result = await controller.handle('setup.recheck', { scope: 'bogus' });
+    expect(result).toEqual({ ok: false, reason: RECHECK_SCOPE_REFUSAL });
+    expect(depCalls).toEqual([]);
+    expect(fires.length).toBe(0);
+  });
+
+  it('a non-string scope is REFUSED, not coerced to the default', async () => {
+    const { controller } = makeController();
+    const result = await controller.handle('setup.recheck', { scope: 42 });
+    expect(result).toEqual({ ok: false, reason: RECHECK_SCOPE_REFUSAL });
+  });
+});
+
+/*
+ * beta.6 T9 (§1.3/§2.5): the tests above pin `setup.recheck`'s BEHAVIOR
+ * through `controller.handle()` round-trips (a bad scope refused, absent
+ * defaults to 'all', etc.) but never touch the canonical enum ARRAY itself
+ * — `handleRecheck`'s refusal message is a hand-written string literal, not
+ * derived from `RECHECK_SCOPES`, so a silent add/remove/rename to the array
+ * could drift from that message with every existing test still green. This
+ * lock exports `RECHECK_SCOPES` (mirroring the `MUTATING_METHODS` /
+ * `READ_ONLY_METHODS` partition-lock precedent above) and pins its exact
+ * contents directly, plus exercises the validator function itself — not
+ * just the controller's HTTP-shaped response wrapping around it.
+ */
+describe('T9 (beta.6 §1.3/§2.5): setup.recheck scope enum — protocol-level lock', () => {
+  it('RECHECK_SCOPES is EXACTLY the five documented values, in order', () => {
+    expect(RECHECK_SCOPES).toEqual(['all', 'agent', 'os', 'ollama', 'llamacpp']);
+  });
+
+  it('validateRecheckScope: absent params -> "all"', () => {
+    expect(validateRecheckScope(undefined)).toBe('all');
+  });
+
+  it('validateRecheckScope: empty params object -> "all"', () => {
+    expect(validateRecheckScope({})).toBe('all');
+  });
+
+  it('validateRecheckScope: every RECHECK_SCOPES member round-trips to itself', () => {
+    for (const scope of RECHECK_SCOPES) {
+      expect(validateRecheckScope({ scope })).toBe(scope);
+    }
+  });
+
+  it('validateRecheckScope: an unknown string scope is REFUSED (undefined), not coerced', () => {
+    expect(validateRecheckScope({ scope: 'bogus' })).toBeUndefined();
+  });
+
+  it('validateRecheckScope: a non-string scope is REFUSED (undefined), not coerced', () => {
+    expect(validateRecheckScope({ scope: 42 })).toBeUndefined();
+  });
+});
+
+describe('T6: store scan wired + ordering (§2.5 — awaited BEFORE the CR-002 synchronous tail)', () => {
+  it('status() WAITS on the scan; the same snapshot reflects its presence (resolved before the tail emitted)', async () => {
+    let resolveScan: ((m: ReadonlyMap<string, boolean>) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        scanStorePresence: () =>
+          new Promise<ReadonlyMap<string, boolean>>((resolve) => {
+            resolveScan = resolve;
+          }),
+      },
+    );
+    let settled = false;
+    const pending = controller.status().then((d) => {
+      settled = true;
+      return d;
+    });
+    await tickT6();
+    await tickT6();
+    expect(settled).toBe(false); // status() is genuinely awaiting the scan
+
+    resolveScan?.(new Map([['qwen25-coder-1.5b', true]]));
+    const data = await pending;
+    const row = data.catalog?.models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(row?.llamacpp?.present).toBe(true);
+    // The CR-002 tail content is in the SAME snapshot — presence resolved first.
+    expect(data.nextEdit.dedicated?.displayName).toBe('Sweep Next-Edit v2 (7B)');
+  });
+
+  it('a REJECTING scan fails CLOSED: status() still resolves, every cell reads absent', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        scanStorePresence: async () => {
+          throw new Error('EACCES: store unreadable');
+        },
+      },
+    );
+    const data = await controller.status();
+    expect(data.catalog?.models.every((m) => m.llamacpp?.present === false)).toBe(true);
+  });
+
+  it('the scan re-runs on every status() (cheap stat pass — presence stays live)', async () => {
+    const { depCalls, controller } = makeController();
+    await controller.status();
+    await controller.status();
+    expect(depCalls.filter((c) => c === 'scanStorePresence').length).toBe(2);
+  });
+});
+
+describe('T6: catalog wire rows (§1.3 — all 13 MODEL_CATALOG rows project completely)', () => {
+  it('13 rows, catalog order, progressId === id on every row (rule 7: the ONE progress key)', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    expect(models.length).toBe(13);
+    expect(models.map((m) => m.id)).toEqual(MODEL_CATALOG.map((m) => m.id));
+    for (const m of models) expect(m.progressId).toBe(m.id);
+  });
+
+  it('exactly ONE defaultForRole per role (rev 3) — devstral/qwen1.5b/qwen-embed-0.6b/sweep', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    const defaults = models.filter((m) => m.defaultForRole === true);
+    expect(defaults.map((m) => `${m.role}:${m.id}`).sort()).toEqual([
+      'agent:devstral-24b',
+      'embedding:qwen3-embedding-0.6b',
+      'fim:qwen25-coder-1.5b',
+      'next:sweep-next',
+    ]);
+  });
+
+  it('library tier: ollamaTag + ollamaApproxBytes on the wire, NO createdName', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    const fim = models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(fim?.ollamaTag).toBe('qwen2.5-coder:1.5b-base');
+    expect(fim?.ollamaApproxBytes).toBe(986_000_000);
+    expect(fim?.ollamaCreatedName).toBeUndefined();
+  });
+
+  it('hf-ingest tier: ollamaCreatedName (LOAD-BEARING for /api/tags presence) + gguf bytes, NO tag', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    const devstral = models.find((m) => m.id === 'devstral-24b');
+    expect(devstral?.ollamaCreatedName).toBe('devstral-small-2507:24b');
+    expect(devstral?.ollamaApproxBytes).toBe(14_333_915_904);
+    expect(devstral?.ollamaTag).toBeUndefined();
+    const sweep = models.find((m) => m.id === 'sweep-next');
+    expect(sweep?.ollamaCreatedName).toBe('sweep-next-edit-v2-7b:q4_k_m');
+  });
+
+  it('identity + honesty fields pass through: displayName/publisher/license/vramLine/note/contextWindow', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    const devstral = models.find((m) => m.id === 'devstral-24b');
+    expect(devstral?.displayName).toBe('Devstral-24B (2507)');
+    expect(devstral?.publisher).toBe('mistralai');
+    expect(devstral?.license).toBe('Apache-2.0');
+    expect(devstral?.contextWindow).toBe(131072);
+    const sevenB = models.find((m) => m.id === 'qwen25-coder-7b');
+    expect(sevenB?.contextWindow).toBeUndefined(); // absent in the catalog stays absent
+    expect(sevenB?.note).toBe(
+      "Base build (Q8) from ggml-org — the llama.cpp project's own packaging of Qwen's base model.",
+    );
+    const embedGemma = models.find((m) => m.id === 'embeddinggemma-300m');
+    expect(embedGemma?.note).toBe('2K context on the Ollama build — fine for Talaria’s chunk sizes (≤512 tokens).');
+  });
+
+  it('llamacpp cells: file/bytes on all 13; available on 12; sweep-next pinned-empty ⇒ available:false; NO shipping row sets unavailableReason', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    expect(models.every((m) => m.llamacpp !== undefined)).toBe(true);
+    for (const m of models) {
+      expect(m.llamacpp?.unavailableReason).toBeUndefined();
+      expect(m.llamacpp?.present).toBe(false); // empty scan
+      expect(m.llamacpp?.available).toBe(m.id === 'sweep-next' ? false : true);
+    }
+    const fim = models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(fim?.llamacpp?.file).toBe('qwen2.5-coder-1.5b-q8_0.gguf');
+    expect(fim?.llamacpp?.approxBytes).toBe(1_646_573_056);
+  });
+
+  it('vllm.runCommand composes on ALL 13 rows — including BOTH ledgered exception rows (SC-2)', async () => {
+    const { controller } = makeController();
+    const models = (await controller.status()).catalog?.models ?? [];
+    for (const m of models) {
+      const serveRepo = catalogRow(m.id).vllm?.serveRepo;
+      expect(m.vllm?.runCommand).toBe(`vllm serve ${serveRepo}`);
+    }
+    expect(models.find((m) => m.id === 'gpt-oss-20b')?.vllm?.runCommand).toBe('vllm serve openai/gpt-oss-20b');
+    expect(models.find((m) => m.id === 'sweep-next')?.vllm?.runCommand).toBe(
+      'vllm serve sweepai/sweep-next-edit-v2-7B',
+    );
+  });
+});
+
+describe('T6 (SC-2): the serveRepo compose-time gate — poisoned fixture ⇒ ABSENCE, never a shelled bad source', () => {
+  const base = catalogRow('qwen25-coder-1.5b');
+
+  it('the two VLLM_ONLY_SERVE_REPOS exception rows DO compose (ledgered exceptions)', () => {
+    expect(composeVllmCell(catalogRow('gpt-oss-20b'))).toEqual({ runCommand: 'vllm serve openai/gpt-oss-20b' });
+    expect(composeVllmCell(catalogRow('sweep-next'))).toEqual({
+      runCommand: 'vllm serve sweepai/sweep-next-edit-v2-7B',
+    });
+  });
+
+  it('an allowlisted-publisher serveRepo composes', () => {
+    expect(composeVllmCell(base)).toEqual({ runCommand: 'vllm serve Qwen/Qwen2.5-Coder-1.5B' });
+  });
+
+  const POISONED = [
+    'Qwen/../evil-org', // '..' traversal — charset kills it BEFORE any membership check
+    '-Qwen/x', // leading '-' (option-injection shape)
+    ':Qwen/x', // leading ':'
+    'Qwen//x', // empty segment
+    'Qwen/x/y', // more than one '/'
+    'Qwen/x y', // whitespace
+    'openai/../gpt-oss-20b', // traversal near an exception entry — still absence
+  ];
+  for (const serveRepo of POISONED) {
+    it(`poisoned '${serveRepo}' ⇒ the vllm cell is ABSENT`, () => {
+      expect(composeVllmCell({ ...base, vllm: { serveRepo } })).toBeUndefined();
+    });
+  }
+
+  it('charset-clean but neither allowlisted nor a ledgered exception ⇒ ABSENT (the closure invariant)', () => {
+    expect(composeVllmCell({ ...base, vllm: { serveRepo: 'bartowski/some-model' } })).toBeUndefined();
+  });
+
+  it('a row with no vllm offering ⇒ absent', () => {
+    const { vllm: _vllm, ...noVllm } = base;
+    expect(composeVllmCell(noVllm)).toBeUndefined();
+  });
+});
+
+describe('T6 (§2.2.8): llamacpp cell — runCommand ONLY for attested-present files', () => {
+  async function statusWithPresence(
+    present: ReadonlyMap<string, boolean>,
+    extra: Partial<SetupControllerDeps> = {},
+  ): Promise<Awaited<ReturnType<SetupController['status']>>> {
+    const { controller } = makeController({}, { scanStorePresence: async () => present, ...extra });
+    return controller.status();
+  }
+
+  it('present (sidecar-attested by the scan) ⇒ runCommand with the ~-redacted dest, FIM port 8080', async () => {
+    const data = await statusWithPresence(new Map([['qwen25-coder-1.5b', true]]));
+    const row = data.catalog?.models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(row?.llamacpp?.present).toBe(true);
+    expect(row?.llamacpp?.runCommand).toBe(
+      'llama-server -m ~/.local/share/talaria/models/ggml-org/Qwen2.5-Coder-1.5B-Q8_0-GGUF/qwen2.5-coder-1.5b-q8_0.gguf --port 8080',
+    );
+  });
+
+  it('role flag table (§2.5): embedding --embeddings 8081 · agent --jinja 8013 · NEXT 8012', async () => {
+    const data = await statusWithPresence(
+      new Map([
+        ['qwen3-embedding-0.6b', true],
+        ['devstral-24b', true],
+        ['sweep-next', true],
+      ]),
+    );
+    const models = data.catalog?.models ?? [];
+    expect(models.find((m) => m.id === 'qwen3-embedding-0.6b')?.llamacpp?.runCommand).toBe(
+      'llama-server -m ~/.local/share/talaria/models/Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf --embeddings --port 8081',
+    );
+    expect(models.find((m) => m.id === 'devstral-24b')?.llamacpp?.runCommand).toBe(
+      'llama-server -m ~/.local/share/talaria/models/mistralai/Devstral-Small-2507_gguf/Devstral-Small-2507-Q4_K_M.gguf --jinja --port 8013',
+    );
+    expect(models.find((m) => m.id === 'sweep-next')?.llamacpp?.runCommand).toBe(
+      'llama-server -m ~/.local/share/talaria/models/SyntinalCo/sweep-next-edit-v2-7B-GGUF/sweep-next-edit-v2-7B-Q4_K_M.gguf --port 8012',
+    );
+  });
+
+  it('absent ⇒ NO runCommand', async () => {
+    const data = await statusWithPresence(new Map());
+    expect(data.catalog?.models.every((m) => m.llamacpp?.runCommand === undefined)).toBe(true);
+  });
+
+  it('present but the store dest cannot be composed ⇒ NO runCommand (fail-closed)', async () => {
+    const data = await statusWithPresence(new Map([['qwen25-coder-1.5b', true]]), {
+      storeDest: () => ({ ok: false, reason: 'no store root' }),
+    });
+    const row = data.catalog?.models.find((m) => m.id === 'qwen25-coder-1.5b');
+    expect(row?.llamacpp?.present).toBe(true);
+    expect(row?.llamacpp?.runCommand).toBeUndefined();
+  });
+
+  it('composeLlamacppCell: a poisoned gguf source (charset) ⇒ honest absence — available:false + §6 copy, NEVER a runCommand', () => {
+    const base = catalogRow('qwen25-coder-1.5b');
+    const poisoned: CatalogModel = {
+      ...base,
+      llamacpp: {
+        gguf: { hfRepo: 'ggml-org/../evil', file: 'x.gguf', quant: 'Q8_0', approxBytes: 1 },
+        verify: { mode: 'live-oid' },
+      },
+    };
+    expect(composeLlamacppCell(poisoned, true, '~/anywhere/x.gguf')).toEqual({
+      file: 'x.gguf',
+      approxBytes: 1,
+      present: false,
+      available: false,
+      unavailableReason: LLAMACPP_HONEST_ABSENCE_COPY,
+    });
+  });
+
+  it('composeLlamacppCell: a non-allowlisted gguf publisher ⇒ the same honest absence (triple-allowlist mirror)', () => {
+    const base = catalogRow('qwen25-coder-1.5b');
+    const foreign: CatalogModel = {
+      ...base,
+      llamacpp: {
+        gguf: { hfRepo: 'bartowski/some-GGUF', file: 'x.gguf', quant: 'Q8_0', approxBytes: 1 },
+        verify: { mode: 'live-oid' },
+      },
+    };
+    expect(composeLlamacppCell(foreign, false, undefined)?.unavailableReason).toBe(LLAMACPP_HONEST_ABSENCE_COPY);
+  });
+
+  it('composeLlamacppCell: a pinned row with a PUBLISHED pin is available (the flag tracks the pin, not the mode)', () => {
+    const base = catalogRow('sweep-next');
+    if (!base.llamacpp) throw new Error('sweep-next must carry a llamacpp cell');
+    const published: CatalogModel = {
+      ...base,
+      llamacpp: { gguf: base.llamacpp.gguf, verify: { mode: 'pinned', sha256: 'a'.repeat(64) } },
+    };
+    expect(composeLlamacppCell(published, false, undefined)?.available).toBe(true);
+  });
+});
+
+describe('T6 (CC-2): setup.testRemote result widening — {ok:true, models} when the probe carries them', () => {
+  it('models pass through', async () => {
+    const { controller } = makeController(
+      {},
+      { probeRemote: async () => ({ ok: true, detail: 'ok', models: ['served-a', 'served-b'] }) },
+    );
+    const result = await controller.handle('setup.testRemote', { backendId: 'ollama' });
+    expect(result).toEqual({ ok: true, models: ['served-a', 'served-b'] });
+  });
+
+  it('stays EXACTLY {ok:true} when the probe has no models (existing callers unaffected)', async () => {
+    const { controller } = makeController({}, { probeRemote: async () => ({ ok: true, detail: 'ok' }) });
+    const result = await controller.handle('setup.testRemote', { backendId: 'ollama' });
+    expect(result).toEqual({ ok: true });
   });
 });

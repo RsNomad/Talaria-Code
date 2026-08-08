@@ -94,6 +94,9 @@ const EXPECTED_SECTIONS: ReadonlyArray<{
       'talaria.hermesPath': 2,
       'talaria.pythonPath': 3,
       'talaria.cwd': 4,
+      'talaria.agent.localModel.modelId': 5,
+      'talaria.agent.localModel.backend': 6,
+      'talaria.agent.localModel.endpoint': 7,
     },
   },
   {
@@ -122,6 +125,7 @@ const EXPECTED_SECTIONS: ReadonlyArray<{
       'talaria.nextEdit.backend': 2,
       'talaria.nextEdit.endpoint': 3,
       'talaria.nextEdit.model': 4,
+      'talaria.nextEdit.dedicatedBackendId': 5,
     },
   },
   {
@@ -136,6 +140,7 @@ const EXPECTED_SECTIONS: ReadonlyArray<{
       'talaria.rag.indexDir': 6,
       'talaria.rag.debounceMs': 7,
       'talaria.rag.excludeGlobs': 8,
+      'talaria.rag.embedBackend': 9,
     },
   },
   {
@@ -192,6 +197,21 @@ const PRE_REORG_KEYS: readonly string[] = [
 const NEW_KEY = 'talaria.nextEdit.source';
 
 /**
+ * beta.6 T8 (§1.3/§2.5): the 5 additive keys — 3 for the "Configure Local
+ * Agent Model" block's saved selection, 2 restoration-only hints
+ * (`nextEdit.dedicatedBackendId` / `rag.embedBackend`). Same "no key lost,
+ * none renamed" guarantee as {@link PRE_REORG_KEYS} — this list only ever
+ * grows via a reviewed addition, never a rename.
+ */
+const BETA6_T8_NEW_KEYS: readonly string[] = [
+  'talaria.agent.localModel.modelId',
+  'talaria.agent.localModel.backend',
+  'talaria.agent.localModel.endpoint',
+  'talaria.nextEdit.dedicatedBackendId',
+  'talaria.rag.embedBackend',
+];
+
+/**
  * §5.3 security lock, VERBATIM. Every key that repoints an executable
  * (`hermesPath`, `pythonPath`, `cwd`, `backend`), steers a spawn
  * (`dashboardPort`, `dashboardAdopt`, `lib.enabled`) or an egress
@@ -199,7 +219,12 @@ const NEW_KEY = 'talaria.nextEdit.source';
  * entries below) MUST stay `scope: "machine"` so a checked-in
  * `.vscode/settings.json` can never override it. `talaria.nextEdit.source`
  * joins the set (it steers whether — and via generic, where — editor
- * context is sent).
+ * context is sent). beta.6 T8: the 3 `talaria.agent.localModel.*` keys join
+ * for the SAME egress/model-integrity rationale as their `autocomplete.*`/
+ * `nextEdit.*` siblings; `nextEdit.dedicatedBackendId` and `rag.embedBackend`
+ * join by symmetry with every OTHER key in their own category (every
+ * existing `nextEdit.*`/security-relevant `rag.*` key is already
+ * machine-scoped — these restoration hints are no exception).
  */
 const MACHINE_SCOPED_KEYS: readonly string[] = [
   'talaria.backend',
@@ -221,6 +246,11 @@ const MACHINE_SCOPED_KEYS: readonly string[] = [
   'talaria.rag.embedModel',
   'talaria.rag.indexDir',
   'talaria.lib.enabled',
+  'talaria.agent.localModel.modelId',
+  'talaria.agent.localModel.backend',
+  'talaria.agent.localModel.endpoint',
+  'talaria.nextEdit.dedicatedBackendId',
+  'talaria.rag.embedBackend',
 ];
 
 describe('contributes.configuration — five titled sections (§5.4)', () => {
@@ -252,7 +282,7 @@ describe('contributes.configuration — five titled sections (§5.4)', () => {
     }
   });
 
-  it('(b) the union of all category properties = the 31 pre-reorg keys + exactly talaria.nextEdit.source (no key lost, none renamed, none duplicated)', () => {
+  it('(b) the union of all category properties = the 31 pre-reorg keys + talaria.nextEdit.source + the 5 beta.6 T8 keys (no key lost, none renamed, none duplicated)', () => {
     const cats = categories(readManifest());
     const perSectionCounts = cats.map((c) => Object.keys(c.properties ?? {}).length);
     const union = unionOfProperties(cats);
@@ -264,7 +294,7 @@ describe('contributes.configuration — five titled sections (§5.4)', () => {
       totalDeclared,
     );
 
-    expect(Object.keys(union).sort()).toEqual([...PRE_REORG_KEYS, NEW_KEY].sort());
+    expect(Object.keys(union).sort()).toEqual([...PRE_REORG_KEYS, NEW_KEY, ...BETA6_T8_NEW_KEYS].sort());
   });
 
   it('(b′) each section contains exactly its §5.4 properties, each with its §5.4 order', () => {

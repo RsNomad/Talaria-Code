@@ -34,6 +34,7 @@ Talaria Code 在 VS Code 的原生侧边面板中提供一个 **智能体式（a
 - 🔎 **理解你的代码库** —— 本地 RAG 索引（LanceDB + tree-sitter），让回答扎根于*你自己*的真实代码。
 - 🧩 **工具与 MCP** —— 接入 [Model Context Protocol](https://modelcontextprotocol.io) 服务器，并将编辑器自身的语言智能（诊断、定义、引用）开放给代理。
 - 🕘 **检查点（Checkpoints）** —— 围绕代理的每个回合对工作区状态进行快照与恢复。
+- 📦 **经过校验的本地模型设置** —— 一块面板即可选择后端（Ollama / llama.cpp / vLLM），从可信发布方下载精选模型并强制校验其校验和，为你接好行内补全与代码库索引，并把代理模型设置好、就绪以指向你的提供方。
 - 🔒 **隐私优先的设计** —— 外发内容在离开前先扫描敏感信息；批准采用「fail-closed（失败即拒绝）」；代理被限制在工作区内。
 
 ## 隐私与安全
@@ -58,7 +59,7 @@ Talaria Code 在 VS Code 的原生侧边面板中提供一个 **智能体式（a
 | **VS Code** | `^1.125` |
 | **操作系统** | 主要目标为 **Linux**（在 Fedora 上开发）。mock 界面可在任意系统运行，但实时后端面向 Linux；其他平台目前未经测试。 |
 | **Python + pipx** | `PATH` 中需有 Python **3.11–3.13** 与 **pipx**。**Backend Setup** 面板会通过 pipx 为你安装 Hermes 代理 —— 本扩展仍是 Hermes 的*客户端*。在 Fedora 上：`sudo dnf install pipx`。 |
-| **本地模型运行时** | **Ollama**、**vLLM** 或 **llama.cpp**，需提供：对话/代理模型（经由 Hermes）、FIM 补全模型（默认 `qwen2.5-coder:1.5b-base`），以及用于 RAG 的嵌入模型（默认 `qwen3-embedding:0.6b`）。Ollama 可在 Setup 面板中被检测并拉取其模型。 |
+| **本地模型运行时** | **Ollama**、**vLLM** 或 **llama.cpp**，需提供：对话/代理模型（经由 Hermes）、FIM 补全模型（默认 `qwen2.5-coder:1.5b-base`），以及用于 RAG 的嵌入模型（默认 `qwen3-embedding:0.6b`）。Setup 面板可检测 Ollama 守护进程，引导你完成 llama.cpp/vLLM 的安装，从精选目录下载并校验模型，为你接好行内补全与代码库索引，并把代理模型设置好、就绪以指向你的提供方。 |
 
 ## 安装
 
@@ -94,16 +95,20 @@ Python。
 3. **依次完成五张卡片** —— 每张都显示其状态、一个主操作，以及可展开的详情/日志：
    - **Agent** —— 选择 **Hermes** 并点击 **Install Hermes**。面板会通过 pipx 安装
      `hermes-agent[acp]`、验证安装、写入路径，并提供一键重载窗口以进入实时模式。
-     （OpenClaw 与 Talaria AI 显示为 *coming soon*。）
+     （OpenClaw 与 Talaria AI 显示为 *coming soon*。）你也可以在此**配置本地代理
+     模型** —— 从精选集合中选择（默认 **Devstral-24B**），让 Talaria 下载并校验它，
+     然后按提示前往提供方设置以完成配置。
    - **Provider** —— 点击 **Configure provider**，在终端中运行 Hermes 自带的设置向导，
      选择代理所用的对话模型/提供方。Talaria 绝不会替你强制指定某个提供方。
    - **Autocomplete (FIM)** —— 选择一个后端（Ollama / llama.cpp / vLLM / Codestral /
      OpenAI 兼容）。对可本地部署的后端，卡片会先问：**「本地安装，还是连接到现有端点？」**
      对 Ollama，它可检测守护进程并拉取默认模型（`qwen2.5-coder:1.5b-base`），带实时进度条。
+     选择或下载某个模型即会**选中**它 —— 点击 **Apply** 即可将端点与模型一起保存。
    - **Next Edit** *(可选)* —— 多行下一步编辑建议。**Generic** 复用你刚设好的 FIM 模型
      （无需额外设置）；**Dedicated** 使用你在此单独设置的模型。
-   - **Codebase index (RAG)** *(可选)* —— 启用本地代码索引，并（在 Ollama 上）拉取嵌入
-     模型（`qwen3-embedding:0.6b`）。
+   - **Codebase index (RAG)** *(可选)* —— 启用本地代码索引，选择嵌入后端与模型并点击
+     **Apply**（在 Ollama 上可拉取默认模型 `qwen3-embedding:0.6b`）。只有当模型确实存在于
+     你配置的端点上时，*就绪* 提示才会出现。
 
 在你安装真实后端之前，扩展会使用脚本化的 **mock** 后端，让你在不启动代理进程的情况下浏览
 界面 —— 它可在任意系统运行。

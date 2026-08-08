@@ -7,22 +7,60 @@
  * `SetupPanel.dom.test.tsx`.
  */
 import { describe, it, expect } from 'vitest';
-import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupProgress } from '../protocol';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupProgress } from '../protocol';
 import { NEXT_DEDICATED_MODEL } from '../../../src/host/setup/registry';
+import { MODEL_CATALOG } from '../../../src/host/setup/modelCatalog';
 import {
+  AGENT_BLOCK_HEADING,
+  AGENT_DEFAULT_MODEL_CAPTION,
+  AGENT_PRE_READY_NOTE,
+  AGENT_PRESAVE_RUN_COMMAND_CAPTION,
   agentDoneLine,
+  agentEndpointInit,
+  agentInitialBackend,
   agentPhaseLabel,
   agentPrimaryAction,
+  agentRowCaption,
+  agentSavedSummaryLine,
+  ggufPublisherCaption,
+  backendReadyText,
+  BACKEND_DISPLAY,
   buildCopyLogText,
+  cancelPullParams,
+  CANCEL_LABEL,
+  CATALOG_DEFAULT_CHIP_LABEL,
+  catalogPresence,
+  catalogPresenceText,
+  catalogPreselectId,
+  catalogRowIdForModel,
   clampLogTail,
+  configuredModelOutsideCatalog,
   dedicatedFieldDefaults,
+  dedicatedInitialCandidateId,
+  endpointsEqual,
   fimDoneLine,
   fimHasLocalInstall,
   fimInstallTestEndpoint,
+  FIM_LLAMACPP_MODEL_NOTE,
+  FIM_LLAMACPP_NUDGE,
+  FIM_MODEL_FIELD_CAPTION,
+  FIM_MODEL_FIELD_LABEL,
+  FIM_OLLAMA_PULL_NUDGE,
+  FIM_PENDING_CAPTION,
+  fimModelFieldVisible,
   foldSetupProgress,
   formatBytes,
   initDedicatedFormFieldState,
+  initPendingModel,
   isComingSoon,
+  llamacppDownloadButtonLabel,
+  LLAMACPP_CHECKING_TEXT,
+  LLAMACPP_HONEST_ABSENCE_TEXT,
+  LLAMACPP_MISSING_TEXT,
+  LLAMACPP_UNKNOWN_TEXT,
+  llamacppPresenceText,
   mutationDisabledReason,
   NEXT_DOWNLOAD_BUTTON_LABEL,
   NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
@@ -30,20 +68,54 @@ import {
   nextDoneLine,
   nextDownloadButtonVisible,
   nextEditButtonLabel,
+  nextLlamacppDigestHint,
   nextModelLine,
   nextPresence,
   nextPresenceText,
+  OLLAMA_DAEMON_DOWN_PULL_REASON,
+  OLLAMA_MISSING_TEXT,
+  ollamaPullButtonLabel,
   PIPX_INSTALL_DOCS_URL,
+  pendingSelectionLine,
   progressKey,
+  provisionModalCopyLiveOid,
+  provisionModalCopyPinned,
   providerDoneLine,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
   PROGRESS_LOG_TAIL_MAX,
+  RAG_APPLY_NUDGE,
+  RAG_LLAMACPP_MODEL_NOTE,
+  RAG_MODEL_FIELD_CAPTION,
+  RAG_MODEL_FIELD_LABEL,
+  RAG_OLLAMA_PULL_NUDGE,
+  RAG_THIRD_TAB_LABEL,
+  ragBlockBackend,
   ragDoneLine,
+  ragEmbedPresence,
+  ragEndpointInit,
+  ragInitialBackend,
+  recheckScopeParams,
   reconcileDedicatedFormFields,
+  reconcilePendingModel,
+  servingLine,
   splitGuidedLine,
+  testConnectionLabel,
   TRUST_DISABLED_REASON,
   type SetupProgressMap,
+  // beta.6 T18 (§3.5) — start-screen model recommendations
+  deriveRecommendations,
+  divergenceCaptionText,
+  formatGiB,
+  meterSegments,
+  RECS_DISCLOSURE_SUMMARY,
+  RECS_MOE_NOTE,
+  RECS_STRIP_HEADING,
+  RECS_STRIP_INTRO,
+  roleLineText,
+  roundGiB,
+  stackLineText,
+  USABLE_VRAM_24GB_GIB,
 } from './setupCards';
 
 const ALL_PHASES: AgentSetupPhase[] = [
@@ -274,7 +346,7 @@ describe('mutationDisabledReason — the !trusted gate (§6, D9 FM-14)', () => {
  */
 describe('agentDoneLine — B5 done line (§6)', () => {
   it('is the exact §6 copy once the agent is ready', () => {
-    expect(agentDoneLine('ready')).toBe('✓ Hermes is ready. Next: configure a chat provider below.');
+    expect(agentDoneLine('ready')).toBe('Hermes is ready. Next: configure a chat provider below.');
   });
   it('is empty for every other phase', () => {
     for (const phase of ALL_PHASES) {
@@ -286,7 +358,7 @@ describe('agentDoneLine — B5 done line (§6)', () => {
 
 describe('providerDoneLine — B5 done line (§6)', () => {
   it('is the exact §6 copy once configured', () => {
-    expect(providerDoneLine('configured')).toBe('✓ Provider connected — chat is ready to use.');
+    expect(providerDoneLine('configured')).toBe('Provider connected — chat is ready to use.');
   });
   it('is empty for waiting-agent/unconfigured/unknown', () => {
     for (const phase of ['waiting-agent', 'unconfigured', 'unknown'] as const) {
@@ -315,19 +387,11 @@ function fimData(overrides: Partial<SetupData['fim']> = {}): SetupData['fim'] {
   };
 }
 
-describe("fimDoneLine — B5 done line (§6), mirrors SetupController's own fimGreen", () => {
-  it('is the exact §6 copy when the selected backend is available + enabled + auth satisfied (no remote entry at all)', () => {
-    expect(fimDoneLine(fimData())).toBe('✓ Autocomplete is active — open a file and start typing.');
-  });
-  it('is empty when the FIM toggle is off', () => {
-    expect(fimDoneLine(fimData({ enabled: false }))).toBe('');
-  });
-  it('is empty when the selected option is coming-soon', () => {
-    const data = fimData({ options: [fimOption({ id: 'ollama', status: 'coming-soon' })] });
-    expect(fimDoneLine(data)).toBe('');
-  });
-  it('is empty when apiKey-required and no key is set', () => {
-    const data = fimData({
+describe("fimDoneLine — B5 done line (§6), presence-honest for ollama (beta.6 panel-fix PT4, audit A4)", () => {
+  const FIM_GREEN = 'Autocomplete is active — open a file and start typing.';
+  const ALL_PRESENCES = ['present', 'absent', 'unknown'] as const;
+  const codestralWithKey = (apiKeySet: boolean) =>
+    fimData({
       options: [
         fimOption({
           id: 'codestral',
@@ -336,45 +400,49 @@ describe("fimDoneLine — B5 done line (§6), mirrors SetupController's own fimG
             endpointValue: '',
             endpointPlaceholder: '',
             auth: 'apiKey-required',
-            apiKeySet: false,
+            apiKeySet,
             probe: 'none',
           },
         }),
       ],
       selectedId: 'codestral',
     });
-    expect(fimDoneLine(data)).toBe('');
+
+  it('ollama: green ONLY when presence === present (mirrors ragDoneLine)', () => {
+    expect(fimDoneLine(fimData(), 'present')).toBe(FIM_GREEN);
   });
-  it('is green once apiKey-required AND a key IS set', () => {
-    const data = fimData({
-      options: [
-        fimOption({
-          id: 'codestral',
-          remote: {
-            endpointDefault: 'https://codestral.mistral.ai',
-            endpointValue: '',
-            endpointPlaceholder: '',
-            auth: 'apiKey-required',
-            apiKeySet: true,
-            probe: 'none',
-          },
-        }),
-      ],
-      selectedId: 'codestral',
-    });
-    expect(fimDoneLine(data)).toBe('✓ Autocomplete is active — open a file and start typing.');
+  it("ollama: 'absent' and 'unknown' render NO line — never a green claim the panel can't verify", () => {
+    expect(fimDoneLine(fimData(), 'absent')).toBe('');
+    expect(fimDoneLine(fimData(), 'unknown')).toBe('');
+  });
+  it('ollama: presence present does NOT override the enabled/status gate', () => {
+    expect(fimDoneLine(fimData({ enabled: false }), 'present')).toBe('');
+    const comingSoon = fimData({ options: [fimOption({ id: 'ollama', status: 'coming-soon' })] });
+    expect(fimDoneLine(comingSoon, 'present')).toBe('');
+  });
+  // C2-10b byte-identity pin: non-ollama backends keep TODAY'S auth-based
+  // rule, presence NEVER consulted — same output for every presence value.
+  it('non-ollama: green for EVERY presence value once available + enabled + auth satisfied', () => {
+    for (const presence of ALL_PRESENCES) {
+      expect(fimDoneLine(codestralWithKey(true), presence)).toBe(FIM_GREEN);
+    }
+  });
+  it('non-ollama: empty for EVERY presence value while apiKey-required and no key is set', () => {
+    for (const presence of ALL_PRESENCES) {
+      expect(fimDoneLine(codestralWithKey(false), presence)).toBe('');
+    }
   });
   it('is empty when the selected id matches no option (defensive, never throws)', () => {
-    expect(fimDoneLine(fimData({ selectedId: 'missing' }))).toBe('');
+    expect(fimDoneLine(fimData({ selectedId: 'missing' }), 'present')).toBe('');
   });
 });
 
 describe('nextDoneLine — B5 done line (§6)', () => {
   it('dedicated source -> the dedicated-model copy', () => {
-    expect(nextDoneLine('dedicated')).toBe('✓ Next-edit suggestions are on (dedicated Sweep model).');
+    expect(nextDoneLine('dedicated')).toBe('Next-edit suggestions are on (dedicated Sweep model).');
   });
   it('generic source -> the reusing-FIM-model copy', () => {
-    expect(nextDoneLine('generic')).toBe('✓ Next-edit suggestions are on (reusing your FIM model).');
+    expect(nextDoneLine('generic')).toBe('Next-edit suggestions are on (reusing your FIM model).');
   });
   it('off -> empty', () => {
     expect(nextDoneLine('off')).toBe('');
@@ -393,20 +461,27 @@ function ragData(overrides: Partial<SetupData['rag']> = {}): SetupData['rag'] {
   };
 }
 
-describe('ragDoneLine — B5 done line (§6)', () => {
-  it('is the exact §6 copy when enabled + the embed model is present + unblocked', () => {
-    expect(ragDoneLine(ragData())).toBe('✓ Codebase index is ready — the agent can search your project.');
+describe('ragDoneLine — B5 done line, T14 endpoint-scoped honesty (§3.4 truth table)', () => {
+  // T14: the second argument is the CLIENT-derived, endpoint-scoped presence
+  // of the configured embed model (`ragEmbedPresence`) — the deprecated wire
+  // boolean rides along inside `rag` in every case below (`ragData()` pins it
+  // TRUE) and must be IGNORED entirely.
+  it("is the exact §6 copy when enabled + unblocked + genuinely 'present' at the configured endpoint", () => {
+    expect(ragDoneLine(ragData(), 'present')).toBe('Codebase index is ready — the agent can search your project.');
   });
-  it('is empty when disabled', () => {
-    expect(ragDoneLine(ragData({ enabled: false }))).toBe('');
+  it('is empty when disabled, even with presence proven', () => {
+    expect(ragDoneLine(ragData({ enabled: false }), 'present')).toBe('');
   });
-  it('is empty when the embed model is not present yet', () => {
-    expect(ragDoneLine(ragData({ embedModelPresent: false }))).toBe('');
+  it("is empty when the embed model is provably 'absent' at the configured endpoint", () => {
+    expect(ragDoneLine(ragData(), 'absent')).toBe('');
   });
   it('is empty when blocked by a precondition (never overclaims readiness)', () => {
     expect(
-      ragDoneLine(ragData({ preconditionDetail: 'The codebase index needs a trusted, open workspace.' })),
+      ragDoneLine(ragData({ preconditionDetail: 'The codebase index needs a trusted, open workspace.' }), 'present'),
     ).toBe('');
+  });
+  it("presence 'unknown' (configured endpoint ≠ the probed daemon) makes NO claim — even while the deprecated wire boolean says true (the beta.5 wrong-daemon lie, pinned dead)", () => {
+    expect(ragDoneLine(ragData({ embedModelPresent: true }), 'unknown')).toBe('');
   });
 });
 
@@ -536,11 +611,26 @@ describe('nextPresence — client-side derivation against live form state (§4.2
     const setup = { ollama: ollamaStatus({ models: [] }) };
     expect(nextPresence(setup, endpoint, '')).toBe('absent');
   });
+
+  // beta.6 T3 (L1-I-1 companion): after an Apply, the saved/configured endpoint
+  // is written CANONICAL (trailing slash) while `ollama.endpoint` is still the
+  // RAW registry default status() probed — same endpoint, different string.
+  // An exact `!==` regresses this to 'unknown'; `endpointsEqual` must keep it
+  // 'present'.
+  it('present when formEndpoint is the canonical (trailing-slash) form of the raw endpoint status() probed', () => {
+    const setup = { ollama: ollamaStatus({ endpoint: 'http://127.0.0.1:11434', models: [{ name: createdName, sizeBytes: 1 }] }) };
+    expect(nextPresence(setup, 'http://127.0.0.1:11434/', createdName)).toBe('present');
+  });
+
+  it('still unknown for a genuinely different endpoint (no false-positive presence)', () => {
+    const setup = { ollama: ollamaStatus({ endpoint: 'http://127.0.0.1:11434', models: [{ name: createdName, sizeBytes: 1 }] }) };
+    expect(nextPresence(setup, 'http://10.0.0.5:11434/', createdName)).toBe('unknown');
+  });
 });
 
 describe('nextPresenceText — §6 presence copy (D2), verbatim', () => {
   it('present', () => {
-    expect(nextPresenceText('present')).toBe('✓ Model present on this Ollama');
+    expect(nextPresenceText('present')).toBe('Model present on this Ollama');
   });
   it('absent', () => {
     expect(nextPresenceText('absent')).toBe('not present');
@@ -626,8 +716,19 @@ describe('§6 dedicated-NEXT copy constants — verbatim locks', () => {
   });
   it('NEXT_DOWNLOAD_UNAVAILABLE_TEXT', () => {
     expect(NEXT_DOWNLOAD_UNAVAILABLE_TEXT).toBe(
-      "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).",
+      "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.",
     );
+  });
+  it('NEXT_DOWNLOAD_UNAVAILABLE_TEXT stays byte-identical to the host twin (pair-lock, PT7)', () => {
+    // Host twin: `NEXT_DOWNLOAD_UNAVAILABLE` in src/host/setup/SetupController.ts.
+    // Webview and host are separate builds — this restates (does NOT import)
+    // the same literal. The host side's own verbatim locks live in
+    // SetupController.test.ts and SetupController.provisionModel.test.ts;
+    // this test is the explicit cross-file pairing assertion (critic C2-1/C2-4)
+    // so the two copies can never silently drift.
+    const HOST_TWIN_NEXT_DOWNLOAD_UNAVAILABLE =
+      "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
+    expect(NEXT_DOWNLOAD_UNAVAILABLE_TEXT).toBe(HOST_TWIN_NEXT_DOWNLOAD_UNAVAILABLE);
   });
 });
 
@@ -737,5 +838,1299 @@ describe("reconcileDedicatedFormFields — field-reconcile on backend switch (se
     const state = initDedicatedFormFieldState('ollama', { endpoint: 'ollama-endpoint', model: 'ollama-model' });
     const result = reconcileDedicatedFormFields(state, 'llamacpp', { endpoint: 'llamacpp-endpoint', model: 'llamacpp-model' });
     expect(result).toEqual({ lastSelectedId: 'llamacpp', endpoint: 'llamacpp-endpoint', model: 'llamacpp-model' });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T10 — LocalModelBlock helpers (§4.1/§6). `localModel.dom.
+ * test.tsx` covers the rendered wiring; these are the pure derivations
+ * every §4.1 cell's TEXT/logic reduces to, generalized from `nextPresence`
+ * (above) the same way `catalogPresence` generalizes it.
+ * ------------------------------------------------------------------ */
+
+function catalogModel(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+  return {
+    id: 'qwen25-coder-1.5b',
+    role: 'fim',
+    displayName: 'Qwen2.5-Coder 1.5B (base)',
+    publisher: 'Qwen',
+    license: 'apache-2.0',
+    vramLine: 'any modern GPU (~1–2 GB)',
+    progressId: 'qwen25-coder-1.5b',
+    ollamaTag: 'qwen2.5-coder:1.5b-base',
+    ollamaApproxBytes: 986_000_000,
+    ...overrides,
+  };
+}
+
+function ollamaWire(overrides: Partial<SetupData['ollama']> = {}): SetupData['ollama'] {
+  return { running: true, endpoint: 'http://127.0.0.1:11434', models: [], ...overrides };
+}
+
+describe('catalogPresence — generalizes nextPresence over ANY catalog row (library tag OR hf-ingest createdName)', () => {
+  it('daemon not running -> unknown, regardless of endpoint match', () => {
+    const ollama = ollamaWire({ running: false });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', catalogModel())).toBe('unknown');
+  });
+
+  it('endpoint mismatch -> unknown (never inherits a DIFFERENT endpoint\'s presence)', () => {
+    const ollama = ollamaWire({ endpoint: 'http://127.0.0.1:11434' });
+    expect(catalogPresence(ollama, 'http://10.0.0.5:11434', catalogModel())).toBe('unknown');
+  });
+
+  it('library-tier row: matches on ollamaTag, :latest-tolerant', () => {
+    const ollama = ollamaWire({ models: [{ name: 'qwen2.5-coder:1.5b-base:latest', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', catalogModel())).toBe('present');
+  });
+
+  it('library-tier row: no matching daemon model -> absent', () => {
+    const ollama = ollamaWire({ models: [{ name: 'llama3:8b', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', catalogModel())).toBe('absent');
+  });
+
+  it('hf-ingest-tier row (Devstral/Sweep shape): matches on ollamaCreatedName, NOT ollamaTag (undefined)', () => {
+    const devstral = catalogModel({
+      id: 'devstral-24b',
+      role: 'agent',
+      ollamaTag: undefined,
+      ollamaApproxBytes: 14_333_915_904,
+      ollamaCreatedName: 'devstral-small-2507:24b',
+    });
+    const ollama = ollamaWire({ models: [{ name: 'devstral-small-2507:24b', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', devstral)).toBe('present');
+  });
+
+  it('row with neither ollamaTag nor ollamaCreatedName -> unknown (defensive, no ollama entry to check)', () => {
+    const ollama = ollamaWire({ models: [{ name: 'anything', sizeBytes: 1 }] });
+    const noOllamaEntry = catalogModel({ ollamaTag: undefined, ollamaApproxBytes: undefined });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434', noOllamaEntry)).toBe('unknown');
+  });
+
+  // beta.6 T3 (L1-I-1 companion): the saved endpoint is written canonical
+  // (trailing slash) but status() probed the raw registry default — same
+  // endpoint, must still resolve 'present', not regress to 'unknown'.
+  it('present for a canonical-vs-raw endpoint pair (same endpoint, different string) — the T3 regression guard', () => {
+    const ollama = ollamaWire({ endpoint: 'http://127.0.0.1:11434', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://127.0.0.1:11434/', catalogModel())).toBe('present');
+  });
+
+  it('still unknown for a genuinely different endpoint (no false-positive presence)', () => {
+    const ollama = ollamaWire({ endpoint: 'http://127.0.0.1:11434', models: [{ name: 'qwen2.5-coder:1.5b-base', sizeBytes: 1 }] });
+    expect(catalogPresence(ollama, 'http://10.0.0.5:11434/', catalogModel())).toBe('unknown');
+  });
+});
+
+describe('catalogPresenceText / llamacppPresenceText — §6 verbatim per state', () => {
+  it('ollama present -> "present" (icon carries the check; distinct wording from the NEXT card\'s own D2)', () => {
+    expect(catalogPresenceText('present')).toBe('present');
+  });
+  it('ollama absent -> "not present"', () => {
+    expect(catalogPresenceText('absent')).toBe('not present');
+  });
+  it('ollama unknown -> "not verified here — Test the endpoint first."', () => {
+    expect(catalogPresenceText('unknown')).toBe('not verified here — Test the endpoint first.');
+  });
+  it('llamacpp present -> "present in Talaria\'s model folder" (sidecar-rule honesty, never "verified")', () => {
+    expect(llamacppPresenceText(true)).toBe("present in Talaria's model folder");
+  });
+  it('llamacpp absent -> "not downloaded"', () => {
+    expect(llamacppPresenceText(false)).toBe('not downloaded');
+  });
+});
+
+describe('ollamaPullButtonLabel / llamacppDownloadButtonLabel — §6 "Pull {tag} (~{size})" / "Download {name} (~{size})"', () => {
+  it('library tier: uses ollamaTag', () => {
+    expect(ollamaPullButtonLabel(catalogModel())).toBe('Pull qwen2.5-coder:1.5b-base (~940 MB)');
+  });
+
+  it('hf-ingest tier (no ollamaTag): falls back to ollamaCreatedName', () => {
+    const devstral = catalogModel({ ollamaTag: undefined, ollamaCreatedName: 'devstral-small-2507:24b', ollamaApproxBytes: 14_333_915_904 });
+    expect(ollamaPullButtonLabel(devstral)).toBe('Pull devstral-small-2507:24b (~13 GB)');
+  });
+
+  it('llamacpp: names the model\'s displayName, not the raw GGUF filename', () => {
+    expect(llamacppDownloadButtonLabel(catalogModel({ displayName: 'Qwen2.5-Coder 1.5B (base)' }), 1_646_573_056)).toBe(
+      'Download Qwen2.5-Coder 1.5B (base) (~1.5 GB)',
+    );
+  });
+});
+
+describe('catalogPreselectId — the ONE picker-preselect rule (A-F8): saved wins, else defaultForRole, else first row', () => {
+  const models = [
+    catalogModel({ id: 'ornith-9b', defaultForRole: undefined }),
+    catalogModel({ id: 'devstral-24b', defaultForRole: true }),
+    catalogModel({ id: 'ornith-35b', defaultForRole: undefined }),
+  ];
+
+  it('a saved modelId that exists in the row set wins over the default row', () => {
+    expect(catalogPreselectId(models, 'ornith-35b')).toBe('ornith-35b');
+  });
+
+  it('no saved id -> falls back to the defaultForRole row', () => {
+    expect(catalogPreselectId(models, undefined)).toBe('devstral-24b');
+  });
+
+  it('a saved id that no longer exists in the row set -> falls back to defaultForRole, not a dangling id', () => {
+    expect(catalogPreselectId(models, 'no-such-row')).toBe('devstral-24b');
+  });
+
+  it('no saved id and no defaultForRole row -> falls back to the first row (never undefined for a non-empty set)', () => {
+    const noDefaults = [catalogModel({ id: 'a' }), catalogModel({ id: 'b' })];
+    expect(catalogPreselectId(noDefaults, undefined)).toBe('a');
+  });
+
+  it('empty row set -> undefined (nothing to preselect)', () => {
+    expect(catalogPreselectId([], undefined)).toBeUndefined();
+  });
+});
+
+describe('configuredModelOutsideCatalog — the CC-8 "configured model" row predicate (FIM/RAG free-text tier)', () => {
+  const models = [catalogModel({ ollamaTag: 'qwen2.5-coder:1.5b-base' }), catalogModel({ id: 'qwen25-coder-7b', ollamaTag: 'qwen2.5-coder:7b-base' })];
+
+  it('empty configured model -> false (nothing to show a row for)', () => {
+    expect(configuredModelOutsideCatalog(models, '')).toBe(false);
+  });
+
+  it('configured model matches a catalog row (:latest-tolerant) -> false', () => {
+    expect(configuredModelOutsideCatalog(models, 'qwen2.5-coder:1.5b-base:latest')).toBe(false);
+  });
+
+  it('configured model matches NO catalog row -> true (the free-text row must render)', () => {
+    expect(configuredModelOutsideCatalog(models, 'nomic-embed-text')).toBe(true);
+  });
+});
+
+describe('testConnectionLabel / servingLine — §6 verbatim', () => {
+  it('testConnectionLabel names the endpoint', () => {
+    expect(testConnectionLabel('http://127.0.0.1:8012')).toBe('Test connection (http://127.0.0.1:8012)');
+  });
+  it('servingLine comma-joins the served model names', () => {
+    expect(servingLine(['qwen2.5-coder:1.5b-base'])).toBe('Serving: qwen2.5-coder:1.5b-base');
+    expect(servingLine(['a', 'b'])).toBe('Serving: a, b');
+  });
+});
+
+describe('cancelPullParams / recheckScopeParams — the exact dispatch payload shapes (CC-9 / scoped recheck)', () => {
+  it('cancelPullParams keys the SAME catalogId used for progress (rule 7)', () => {
+    expect(cancelPullParams('devstral-24b')).toEqual({ op: 'pull', id: 'devstral-24b' });
+  });
+  it('recheckScopeParams narrows to ollama or llamacpp only', () => {
+    expect(recheckScopeParams('ollama')).toEqual({ scope: 'ollama' });
+    expect(recheckScopeParams('llamacpp')).toEqual({ scope: 'llamacpp' });
+  });
+});
+
+describe('backendReadyText — §6 "Backend ready" row, shared template', () => {
+  it('ollama, no version', () => {
+    expect(backendReadyText('ollama')).toBe('Ollama: Ready');
+  });
+  it('ollama, with version appends " — {version}"', () => {
+    expect(backendReadyText('ollama', '0.4.1')).toBe('Ollama: Ready — 0.4.1');
+  });
+  it('llamacpp, with version', () => {
+    expect(backendReadyText('llamacpp', 'b4500')).toBe('llama.cpp: Ready — b4500');
+  });
+});
+
+describe('§6 static copy constants — verbatim', () => {
+  it('OLLAMA_MISSING_TEXT', () => expect(OLLAMA_MISSING_TEXT).toBe('Ollama daemon not detected.'));
+  it('LLAMACPP_MISSING_TEXT', () =>
+    expect(LLAMACPP_MISSING_TEXT).toBe('llama-server was not found on your PATH. Install llama.cpp, then re-check.'));
+  it('LLAMACPP_CHECKING_TEXT', () => expect(LLAMACPP_CHECKING_TEXT).toBe('Checking for llama-server…'));
+  it('LLAMACPP_UNKNOWN_TEXT', () => expect(LLAMACPP_UNKNOWN_TEXT).toBe("Couldn't check for llama-server here — press Re-check."));
+  it('LLAMACPP_HONEST_ABSENCE_TEXT', () =>
+    expect(LLAMACPP_HONEST_ABSENCE_TEXT).toBe(
+      'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.',
+    ));
+  it('OLLAMA_DAEMON_DOWN_PULL_REASON', () => expect(OLLAMA_DAEMON_DOWN_PULL_REASON).toBe('Install Ollama first — it performs the download.'));
+  it('CATALOG_DEFAULT_CHIP_LABEL', () => expect(CATALOG_DEFAULT_CHIP_LABEL).toBe('Default'));
+  it('CANCEL_LABEL', () => expect(CANCEL_LABEL).toBe('Cancel'));
+});
+
+describe('provisionModalCopyPinned / provisionModalCopyLiveOid — the two verify-mode copies stay DISTINCT (§2.2.5 A-2)', () => {
+  it('for the SAME displayName/bytes/hfRepo/endpoint, the two templates never collapse into the same string', () => {
+    const pinned = provisionModalCopyPinned('Sweep Next-Edit v2 (7B)', 4_680_000_000, 'SyntinalCo/sweep-next-edit-v2-7B-GGUF', 'http://127.0.0.1:11434');
+    const liveOid = provisionModalCopyLiveOid(
+      'Sweep Next-Edit v2 (7B)',
+      'Q4_K_M',
+      4_680_000_000,
+      'SyntinalCo/sweep-next-edit-v2-7B-GGUF',
+      'Syntinal (us)',
+      'Our own publishing account; artifacts additionally self-pinned by code-committed SHA-256.',
+      'http://127.0.0.1:11434',
+    );
+    expect(pinned).not.toBe(liveOid);
+  });
+
+  it('pinned copy makes the STRONG claim ("against its pinned value") — never the weaker manifest wording', () => {
+    const pinned = provisionModalCopyPinned('X', 1_000_000_000, 'Owner/Repo', 'http://127.0.0.1:11434');
+    expect(pinned).toContain("checksum against its pinned value");
+    expect(pinned).not.toContain("publisher's manifest");
+  });
+
+  it("live-oid copy makes the WEAKER claim (\"against the publisher's manifest\") + names the publisher/trustBasis — never the pinned wording", () => {
+    const liveOid = provisionModalCopyLiveOid('X', 'Q4_K_M', 1_000_000_000, 'Owner/Repo', 'Some Publisher', 'a trust sentence.', 'http://127.0.0.1:11434');
+    expect(liveOid).toContain("checksum against the publisher's manifest");
+    expect(liveOid).toContain('Publisher: Some Publisher — a trust sentence.');
+    expect(liveOid).not.toContain('against its pinned value');
+  });
+});
+
+describe('§6 copy — verbatim + single-sourced (SCOPED source-scan: hand-written panel sources only)', () => {
+  // Scoped to the two hand-written files T10 owns — NOT a bundle-wide grep
+  // (which would trip on `registry.ts`'s own `hf.co` alias string, an
+  // unrelated data literal) and NOT `modelCatalog.ts`/`registry.ts`
+  // themselves (pure DATA, not panel copy).
+  const setupCardsSrc = readFileSync(join(__dirname, 'setupCards.ts'), 'utf-8');
+  const localModelSrc = readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8');
+
+  // Every §6 string this task owns — long/distinctive enough that an
+  // accidental substring match elsewhere would itself be suspicious.
+  const OWNED_VERBATIM_STRINGS = [
+    'Ollama daemon not detected.',
+    'llama-server was not found on your PATH. Install llama.cpp, then re-check.',
+    'Checking for llama-server…',
+    "Couldn't check for llama-server here — press Re-check.",
+    "present in Talaria's model folder",
+    'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.',
+    'Install Ollama first — it performs the download.',
+    'not verified here — Test the endpoint first.',
+  ];
+
+  it('every owned §6 string is defined VERBATIM in setupCards.ts (the single source of truth)', () => {
+    for (const s of OWNED_VERBATIM_STRINGS) {
+      expect(setupCardsSrc).toContain(s);
+    }
+  });
+
+  it('localModel.tsx never RESTATES these strings inline — it only references the setupCards.ts helpers/constants', () => {
+    for (const s of OWNED_VERBATIM_STRINGS) {
+      expect(localModelSrc).not.toContain(s);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T11 (§3.2/§6): FIM-surface nudge constants + the
+ * `localInstall.models` deprecation lock.
+ * ------------------------------------------------------------------ */
+
+describe('§6 FIM-surface nudges (T11) — verbatim + single-sourced', () => {
+  it('FIM_OLLAMA_PULL_NUDGE — §8 "FIM Ollama pull nudge" (beta.6 panel-fix PT3: CHANGED to name the row-selection too)', () => {
+    expect(FIM_OLLAMA_PULL_NUDGE).toBe(
+      '✓ Downloaded and selected — Apply on the Connect tab saves it as your autocomplete model.',
+    );
+  });
+
+  it('FIM_LLAMACPP_NUDGE — §6 "llama.cpp FIM nudge" (beta.6 panel-fix PT8, audit A17: the MODE toggle is what the user switches, not the Connect tab)', () => {
+    expect(FIM_LLAMACPP_NUDGE).toBe('Then open the Connect tab and Apply.');
+  });
+
+  it('SetupPanel.tsx never RESTATES the nudges inline — it renders the setupCards.ts constants', () => {
+    const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+    expect(setupPanelSrc).not.toContain('set it as your FIM model in the Connect tab');
+    expect(setupPanelSrc).not.toContain('Then open the Connect tab and Apply.');
+  });
+});
+
+describe('T11 — the registry `localInstall.models` wire projection: deprecated-in-comment, NOT removed', () => {
+  const registrySrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'host', 'setup', 'registry.ts'), 'utf-8');
+  const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+
+  it('registry.ts still carries the models projection (wire compat — never removed by T11)', () => {
+    expect(registrySrc).toContain("{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', settingKey: 'talaria.autocomplete.model' }");
+    expect(registrySrc).toContain("{ role: 'embedding', model: 'qwen3-embedding:0.6b', settingKey: 'talaria.rag.embedModel' }");
+  });
+
+  it('registry.ts marks the projection @deprecated (beta.6 T11 — the unified UI reads catalog.models)', () => {
+    expect(registrySrc).toContain('@deprecated beta.6 T11');
+  });
+
+  it('SetupPanel.tsx no longer consumes localInstall.models (the block reads catalog.models instead)', () => {
+    expect(setupPanelSrc).not.toMatch(/localInstall\??\.models/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T12 (§3.1/§6): Agent-block helpers + copy.
+ * ------------------------------------------------------------------ */
+
+describe('§6 Agent-block copy (T12) — verbatim + single-sourced', () => {
+  it('AGENT_BLOCK_HEADING — §6 "Agent block heading"', () => {
+    expect(AGENT_BLOCK_HEADING).toBe('Configure Local Agent Model');
+  });
+
+  it('AGENT_PRE_READY_NOTE — §6 "Agent pre-ready note"', () => {
+    expect(AGENT_PRE_READY_NOTE).toBe(
+      "Hermes isn't installed yet — you can prepare the model now and configure the provider after the install.",
+    );
+  });
+
+  it('AGENT_DEFAULT_MODEL_CAPTION — §6 "Devstral default caption"', () => {
+    expect(AGENT_DEFAULT_MODEL_CAPTION).toBe("Recommended — Talaria's agent pipeline is tuned on Devstral-24B (2507).");
+  });
+
+  it('AGENT_PRESAVE_RUN_COMMAND_CAPTION — §6 "Run command caption (agent, pre-save)"', () => {
+    expect(AGENT_PRESAVE_RUN_COMMAND_CAPTION).toBe('Uses the default port — Save updates this command to your endpoint.');
+  });
+
+  it('SetupPanel.tsx never RESTATES the T12 copy inline — it renders the setupCards.ts constants', () => {
+    const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+    expect(setupPanelSrc).not.toContain('Configure Local Agent Model');
+    expect(setupPanelSrc).not.toContain('you can prepare the model now');
+    expect(setupPanelSrc).not.toContain('tuned on Devstral-24B (2507)');
+    expect(setupPanelSrc).not.toContain('Uses the default port');
+    expect(setupPanelSrc).not.toContain('GGUF by ');
+  });
+
+  it('localModel.tsx never hardcodes the T12 captions either — they arrive via props', () => {
+    const localModelSrc = readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8');
+    expect(localModelSrc).not.toContain('tuned on Devstral-24B (2507)');
+    expect(localModelSrc).not.toContain('Uses the default port');
+    expect(localModelSrc).not.toContain('GGUF by ');
+  });
+});
+
+describe('ggufPublisherCaption (T12, A-F7) — publisher ≠ vendor over the REAL catalog agent rows', () => {
+  const byId = (id: string) => {
+    const row = MODEL_CATALOG.find((m) => m.id === id);
+    if (!row) throw new Error(`catalog row ${id} missing`);
+    return { id: row.id, publisher: row.publisher };
+  };
+
+  it('vendor-published rows carry NO caption (devstral-24b, ornith-9b, ornith-35b)', () => {
+    expect(ggufPublisherCaption(byId('devstral-24b'))).toBeUndefined();
+    expect(ggufPublisherCaption(byId('ornith-9b'))).toBeUndefined();
+    expect(ggufPublisherCaption(byId('ornith-35b'))).toBeUndefined();
+  });
+
+  it('packaging-org rows carry the caption (qwen36-27b/qwen36-35b-a3b → unsloth, gpt-oss-20b → ggml-org)', () => {
+    expect(ggufPublisherCaption(byId('qwen36-27b'))).toBe('GGUF by unsloth');
+    expect(ggufPublisherCaption(byId('qwen36-35b-a3b'))).toBe('GGUF by unsloth');
+    expect(ggufPublisherCaption(byId('gpt-oss-20b'))).toBe('GGUF by ggml-org');
+  });
+
+  it('an id outside the catalog (fixture rows) yields NO caption — never a guess', () => {
+    expect(ggufPublisherCaption({ id: 'not-a-row', publisher: 'unsloth' })).toBeUndefined();
+  });
+
+  it('self-truing: for EVERY agent row, caption presence ⇔ vllm serveRepo owner ≠ publisher', () => {
+    for (const row of MODEL_CATALOG.filter((m) => m.role === 'agent')) {
+      const owner = row.vllm?.serveRepo.split('/')[0];
+      const caption = ggufPublisherCaption({ id: row.id, publisher: row.publisher });
+      if (owner !== undefined && owner.toLowerCase() !== row.publisher.toLowerCase()) {
+        expect(caption).toBe(`GGUF by ${row.publisher}`);
+      } else {
+        expect(caption).toBeUndefined();
+      }
+    }
+  });
+});
+
+describe('agentRowCaption (T12) — Devstral caption on the default row; GGUF caption llamacpp-pane-only', () => {
+  it('the defaultForRole row carries the §6 Devstral caption on EVERY pane', () => {
+    const devstral = { id: 'devstral-24b', publisher: 'mistralai', defaultForRole: true as const };
+    expect(agentRowCaption(devstral, 'ollama')).toBe(AGENT_DEFAULT_MODEL_CAPTION);
+    expect(agentRowCaption(devstral, 'llamacpp')).toBe(AGENT_DEFAULT_MODEL_CAPTION);
+    expect(agentRowCaption(devstral, 'vllm')).toBe(AGENT_DEFAULT_MODEL_CAPTION);
+  });
+
+  it('a packaging-org row carries the GGUF caption on the llamacpp pane ONLY', () => {
+    const qwen = { id: 'qwen36-27b', publisher: 'unsloth' };
+    expect(agentRowCaption(qwen, 'llamacpp')).toBe('GGUF by unsloth');
+    expect(agentRowCaption(qwen, 'ollama')).toBeUndefined();
+    expect(agentRowCaption(qwen, 'vllm')).toBeUndefined();
+  });
+
+  it('a vendor-published non-default row carries nothing anywhere', () => {
+    const ornith = { id: 'ornith-9b', publisher: 'ornith-ai' };
+    expect(agentRowCaption(ornith, 'ollama')).toBeUndefined();
+    expect(agentRowCaption(ornith, 'llamacpp')).toBeUndefined();
+    expect(agentRowCaption(ornith, 'vllm')).toBeUndefined();
+  });
+});
+
+describe('agentEndpointInit (T12, CC-6) — endpointDefaults init, saved wins for ITS backend only', () => {
+  const defaults = { ollama: 'http://127.0.0.1:11434', llamacpp: 'http://127.0.0.1:8013', vllm: 'http://127.0.0.1:8000' };
+
+  it('no saved state: each backend initializes to its own default', () => {
+    const local = { endpointDefaults: defaults };
+    expect(agentEndpointInit(local, 'ollama')).toBe('http://127.0.0.1:11434');
+    expect(agentEndpointInit(local, 'llamacpp')).toBe('http://127.0.0.1:8013');
+    expect(agentEndpointInit(local, 'vllm')).toBe('http://127.0.0.1:8000');
+  });
+
+  it('saved wins for the SAVED backend; the other backends keep their defaults', () => {
+    const local = {
+      endpointDefaults: defaults,
+      saved: { modelId: 'devstral-24b', backend: 'llamacpp' as const, endpoint: 'http://127.0.0.1:9999', servedName: 'x' },
+    };
+    expect(agentEndpointInit(local, 'llamacpp')).toBe('http://127.0.0.1:9999');
+    expect(agentEndpointInit(local, 'ollama')).toBe('http://127.0.0.1:11434');
+    expect(agentEndpointInit(local, 'vllm')).toBe('http://127.0.0.1:8000');
+  });
+
+  it('an absent agentLocalModel wire block degrades to an empty field — never a fabricated URL', () => {
+    expect(agentEndpointInit(undefined, 'ollama')).toBe('');
+  });
+});
+
+describe('agentInitialBackend (T12, §4.2) — saved.backend restores, else the ollama default', () => {
+  it('no save: ollama', () => {
+    expect(agentInitialBackend(undefined)).toBe('ollama');
+    expect(
+      agentInitialBackend({ endpointDefaults: { ollama: 'a', llamacpp: 'b', vllm: 'c' } }),
+    ).toBe('ollama');
+  });
+
+  it('saved: the saved backend', () => {
+    expect(
+      agentInitialBackend({
+        endpointDefaults: { ollama: 'a', llamacpp: 'b', vllm: 'c' },
+        saved: { modelId: 'devstral-24b', backend: 'vllm', endpoint: 'http://127.0.0.1:8000', servedName: 'x' },
+      }),
+    ).toBe('vllm');
+  });
+});
+
+describe('agentSavedSummaryLine (T12) — mirrors the save modal vocabulary', () => {
+  it('composes "{displayName} via {backend} at {endpoint}"', () => {
+    expect(agentSavedSummaryLine('Ornith-1.0 9B', 'ollama', 'http://127.0.0.1:11434')).toBe(
+      'Ornith-1.0 9B via ollama at http://127.0.0.1:11434',
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T13 (§3.3/§4.2): NEXT-surface helpers — pane restoration (CC-10)
+ * and the retained SC-3 digest hint.
+ * ------------------------------------------------------------------ */
+
+describe('dedicatedInitialCandidateId (T13, CC-10) — restored pane wins, else the transport heuristic', () => {
+  const candidates = [
+    { id: 'ollama', nextEditTransport: 'ollama' as const },
+    { id: 'llamacpp', nextEditTransport: 'openai-compat' as const },
+    { id: 'vllm', nextEditTransport: 'openai-compat' as const },
+    { id: 'openai-compat', nextEditTransport: 'openai-compat' as const },
+  ];
+
+  it('a dedicatedBackendId naming a live candidate wins — even over the transport heuristic', () => {
+    expect(dedicatedInitialCandidateId({ backend: 'ollama', dedicatedBackendId: 'vllm' }, candidates)).toBe('vllm');
+    expect(dedicatedInitialCandidateId({ backend: 'openai-compat', dedicatedBackendId: 'ollama' }, candidates)).toBe('ollama');
+  });
+
+  it("absent ⇒ today's heuristic: the FIRST candidate whose transport matches nextEdit.backend", () => {
+    expect(dedicatedInitialCandidateId({ backend: 'ollama' }, candidates)).toBe('ollama');
+    // three candidates share the openai-compat transport — the first wins,
+    // exactly as the pre-T13 `candidates.find(...)` did.
+    expect(dedicatedInitialCandidateId({ backend: 'openai-compat' }, candidates)).toBe('llamacpp');
+  });
+
+  it('an id naming NO live candidate (stale/edited settings) degrades to the heuristic, never a dead selection', () => {
+    const ollamaOnly = [{ id: 'ollama', nextEditTransport: 'ollama' as const }];
+    expect(dedicatedInitialCandidateId({ backend: 'ollama', dedicatedBackendId: 'llamacpp' }, ollamaOnly)).toBe('ollama');
+  });
+
+  it('no transport match either ⇒ the first candidate (pre-T13 fallback preserved)', () => {
+    const ollamaOnly = [{ id: 'ollama', nextEditTransport: 'ollama' as const }];
+    expect(dedicatedInitialCandidateId({ backend: 'openai-compat' }, ollamaOnly)).toBe('ollama');
+  });
+
+  it('empty candidates ⇒ undefined', () => {
+    expect(dedicatedInitialCandidateId({ backend: 'ollama', dedicatedBackendId: 'ollama' }, [])).toBeUndefined();
+  });
+});
+
+describe('nextLlamacppDigestHint (T13, SC-3) — the retained beta.5 manual-verify hint, WIRE-sourced', () => {
+  const dedicatedBase: NonNullable<SetupData['nextEdit']['dedicated']> = {
+    displayName: 'Sweep Next-Edit v2 (7B)',
+    modelDefaults: { ollama: 'sweep-next-edit-v2-7b:q4_k_m', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+    downloadReady: true,
+    downloadApproxBytes: 4_680_000_000,
+    warning: 'w',
+    guided: {
+      vllm: 'Run: vllm serve sweepai/sweep-next-edit-v2-7B\n(official Sweep release, ~15 GB download)',
+      llamacpp:
+        'Run: llama-server -hf SyntinalCo/sweep-next-edit-v2-7B-GGUF:Q4_K_M --port 8012\n' +
+        'Verify the download: sha256sum should print abc123def456',
+    },
+  };
+
+  it("returns the guided.llamacpp CAPTION line (the host's own digest hint) — never the -hf command", () => {
+    expect(nextLlamacppDigestHint(dedicatedBase)).toBe('Verify the download: sha256sum should print abc123def456');
+  });
+
+  it('undefined while the pin is unpublished (no guided.llamacpp on the wire) — the hint cannot outrun the pin', () => {
+    expect(nextLlamacppDigestHint({ ...dedicatedBase, guided: { vllm: dedicatedBase.guided.vllm } })).toBeUndefined();
+  });
+
+  it('undefined for a caption-less guided line and for an absent dedicated block — never an empty caption', () => {
+    expect(
+      nextLlamacppDigestHint({ ...dedicatedBase, guided: { ...dedicatedBase.guided, llamacpp: 'Run: x --port 8012' } }),
+    ).toBeUndefined();
+    expect(nextLlamacppDigestHint(undefined)).toBeUndefined();
+  });
+});
+
+describe('T13 — the §6 pinned-disabled copy stays single-sourced (scoped source-scan)', () => {
+  it('neither SetupPanel.tsx nor localModel.tsx restates the no-vetted-build line inline — both reference the setupCards constant', () => {
+    const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+    const localModelSrc = readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8');
+    expect(setupPanelSrc).not.toContain('No vetted build of this model is published yet');
+    expect(localModelSrc).not.toContain('No vetted build of this model is published yet');
+    expect(setupPanelSrc).not.toContain('Download model (~4.7 GB)');
+    expect(localModelSrc).not.toContain('Download model (~4.7 GB)');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T14 (§3.4/§6): RAG embedding-surface helpers + copy.
+ * ------------------------------------------------------------------ */
+
+describe('T14 — ragInitialBackend (§4.2 restoration: rag.embedBackend, else ollama)', () => {
+  it("returns the wire's embedBackend for each of the 3-enum values", () => {
+    expect(ragInitialBackend({ embedBackend: 'ollama' })).toBe('ollama');
+    expect(ragInitialBackend({ embedBackend: 'llamacpp' })).toBe('llamacpp');
+    expect(ragInitialBackend({ embedBackend: 'openai-compat' })).toBe('openai-compat');
+  });
+  it('degrades an absent embedBackend (old-host wire) to ollama', () => {
+    expect(ragInitialBackend({})).toBe('ollama');
+  });
+});
+
+describe("T14 — ragBlockBackend: the pane→block mapping ('openai-compat' renders the block's vllm pane)", () => {
+  it("maps 'openai-compat' to 'vllm' (§3.4: Test + run command only)", () => {
+    expect(ragBlockBackend('openai-compat')).toBe('vllm');
+  });
+  it('is the identity for ollama and llamacpp', () => {
+    expect(ragBlockBackend('ollama')).toBe('ollama');
+    expect(ragBlockBackend('llamacpp')).toBe('llamacpp');
+  });
+});
+
+describe('T14 — ragEmbedPresence: the CONFIGURED embed model, endpoint-scoped (the C-6 rule — never the wrong daemon)', () => {
+  const daemon = (names: string[], endpoint = 'http://127.0.0.1:11434') => ({
+    running: true,
+    endpoint,
+    models: names.map((name) => ({ name, sizeBytes: 1 })),
+  });
+  const ragCfg = (embedEndpoint: string, embedModel: string) => ({ embedEndpoint, embedModel });
+
+  it("'present' when the daemon at the CONFIGURED endpoint lists the model", () => {
+    expect(ragEmbedPresence(daemon(['nomic-embed-text']), ragCfg('http://127.0.0.1:11434', 'nomic-embed-text'))).toBe('present');
+  });
+  it(":latest-tolerant in BOTH directions (the beta.5 exact-`===` gap, fixed by derivation)", () => {
+    expect(ragEmbedPresence(daemon(['nomic-embed-text:latest']), ragCfg('http://127.0.0.1:11434', 'nomic-embed-text'))).toBe('present');
+    expect(ragEmbedPresence(daemon(['nomic-embed-text']), ragCfg('http://127.0.0.1:11434', 'nomic-embed-text:latest'))).toBe('present');
+  });
+  it("'absent' when the configured endpoint IS the probed daemon but the model is not in its list", () => {
+    expect(ragEmbedPresence(daemon(['qwen2.5-coder:1.5b-base']), ragCfg('http://127.0.0.1:11434', 'nomic-embed-text'))).toBe('absent');
+  });
+  it("'unknown' when the configured endpoint is NOT the probed daemon — even if THAT daemon has the name (the wrong-daemon anti-lie, pinned)", () => {
+    expect(ragEmbedPresence(daemon(['nomic-embed-text']), ragCfg('http://10.0.0.9:11434', 'nomic-embed-text'))).toBe('unknown');
+  });
+  it("'unknown' while the daemon is not running", () => {
+    expect(
+      ragEmbedPresence({ running: false, endpoint: 'http://127.0.0.1:11434', models: [] }, ragCfg('http://127.0.0.1:11434', 'nomic-embed-text')),
+    ).toBe('unknown');
+  });
+
+  // beta.6 T3: ragEmbedPresence delegates to catalogPresence (:966), so the
+  // canonical-vs-raw tolerance is covered transitively — pinned here too.
+  it("'present' for a canonical-vs-raw endpoint pair (delegates through catalogPresence, T3)", () => {
+    expect(ragEmbedPresence(daemon(['nomic-embed-text']), ragCfg('http://127.0.0.1:11434/', 'nomic-embed-text'))).toBe('present');
+  });
+});
+
+describe('endpointsEqual — canonicalization-tolerant endpoint comparator (beta.6 T3, L1-I-1 companion)', () => {
+  it('equal after adding a trailing slash', () => {
+    expect(endpointsEqual('http://127.0.0.1:11434/', 'http://127.0.0.1:11434')).toBe(true);
+  });
+  it('equal after dropping an explicit default port', () => {
+    expect(endpointsEqual('http://example.com/', 'http://example.com:80/')).toBe(true);
+  });
+  it('equal after host-case normalization', () => {
+    expect(endpointsEqual('http://EXAMPLE.com/', 'http://example.com/')).toBe(true);
+  });
+  it('b undefined (an unprobed endpoint) is never equal', () => {
+    expect(endpointsEqual('http://127.0.0.1:11434/', undefined)).toBe(false);
+  });
+  it('falls back to raw compare on parse failure — matching malformed strings are still equal', () => {
+    expect(endpointsEqual('not a url', 'not a url')).toBe(true);
+  });
+  it('falls back to raw compare on parse failure — differing malformed strings stay unequal', () => {
+    expect(endpointsEqual('not a url', 'still not a url')).toBe(false);
+  });
+  it('genuinely different endpoints stay unequal (no false-positive presence)', () => {
+    expect(endpointsEqual('http://127.0.0.1:11434/', 'http://10.0.0.5:11434/')).toBe(false);
+  });
+});
+
+describe('T14 — §6 RAG copy: verbatim + single-sourced', () => {
+  it('RAG_APPLY_NUDGE — §6 "llama.cpp RAG nudge"', () => {
+    expect(RAG_APPLY_NUDGE).toBe('Then Apply the endpoint below.');
+  });
+  it('the embeddinggemma ctx note is CATALOG data — §6 verbatim at its single source (the wire `note` carries it to the row)', () => {
+    const row = MODEL_CATALOG.find((m) => m.id === 'embeddinggemma-300m');
+    expect(row?.note).toBe('2K context on the Ollama build — fine for Talaria’s chunk sizes (≤512 tokens).');
+  });
+  it('SetupPanel.tsx never RESTATES the nudge inline — it renders the setupCards.ts constant', () => {
+    const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+    expect(setupPanelSrc).not.toContain('Then Apply the endpoint below.');
+  });
+});
+
+describe('T14 — F-3 closed: every embedding row has a verified llama.cpp build (no absence cells on the RAG surface)', () => {
+  const embedRows = MODEL_CATALOG.filter((m) => m.role === 'embedding');
+  it('the catalog carries exactly the three §3.4 rows, 0.6b the role default', () => {
+    expect(embedRows.map((m) => m.id)).toEqual(['qwen3-embedding-0.6b', 'qwen3-embedding-4b', 'embeddinggemma-300m']);
+    expect(embedRows.filter((m) => m.defaultForRole).map((m) => m.id)).toEqual(['qwen3-embedding-0.6b']);
+  });
+  it('all three carry a llamacpp gguf — embeddinggemma via ggml-org (F-3)', () => {
+    for (const row of embedRows) {
+      expect(row.llamacpp).toBeDefined();
+    }
+    expect(embedRows.find((m) => m.id === 'embeddinggemma-300m')?.llamacpp?.gguf.hfRepo).toBe('ggml-org/embeddinggemma-300M-GGUF');
+  });
+});
+
+describe('T14 — the beta.5 wrong-daemon presence boolean: webview consumption REMOVED, wire kept (deprecated-in-comment)', () => {
+  // The identifier is spelled out only HERE (test file) — the three scanned
+  // sources must not carry it at all, comments included.
+  const WIRE_BOOLEAN = 'embedModelPresent';
+
+  it('SetupPanel.tsx / localModel.tsx / setupCards.ts no longer mention the wire boolean (endpoint-scoped derivation replaced it)', () => {
+    expect(readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
+    expect(readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
+    expect(readFileSync(join(__dirname, 'setupCards.ts'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
+  });
+
+  it('the wire field + host computation SURVIVE (compat), marked @deprecated beta.6 T14', () => {
+    const protocolSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'shared', 'protocol.ts'), 'utf-8');
+    const controllerSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'host', 'setup', 'SetupController.ts'), 'utf-8');
+    expect(protocolSrc).toContain(`${WIRE_BOOLEAN}: boolean`);
+    expect(protocolSrc).toContain('@deprecated beta.6 T14');
+    expect(controllerSrc).toContain(`${WIRE_BOOLEAN}: ollamaStatus.running`);
+    expect(controllerSrc).toContain('@deprecated beta.6 T14');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 T18 (§3.5/§6): start-screen model recommendations —
+ * `RecommendationsBlock`'s pure derivation (the strip's DOM wiring lives
+ * in `SetupPanel.dom.test.tsx`; the walkthrough's anchor-parity lock lives
+ * in `src/host/walkthroughRecs.test.ts`).
+ * ------------------------------------------------------------------ */
+
+describe('T18 — recs strip pure derivation (§3.5, B-F1..B-F8)', () => {
+  // Byte-exact fixtures mirroring MODEL_CATALOG's own rows (test-local copies
+  // are fine here — the "zero hardcoded model data" rule (B-F1) binds the
+  // PRODUCTION sources scanned below, not test fixtures).
+  function agentDefaultRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'devstral-24b',
+      role: 'agent',
+      defaultForRole: true,
+      displayName: 'Devstral-24B (2507)',
+      publisher: 'mistralai',
+      license: 'Apache-2.0',
+      vramLine: '24GB-comfortable — the sweet spot: ~55K ctx fp16-KV / ~110K Q8-KV; 128K window',
+      progressId: 'devstral-24b',
+      ollamaCreatedName: 'devstral-small-2507:24b',
+      ollamaApproxBytes: 14_333_915_904,
+      llamacpp: { file: 'Devstral-Small-2507-Q4_K_M.gguf', approxBytes: 14_333_915_904, present: false, available: true },
+      vllm: { runCommand: 'vllm serve mistralai/Devstral-Small-2507' },
+      ...overrides,
+    };
+  }
+  function fimDefaultRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'qwen25-coder-1.5b',
+      role: 'fim',
+      defaultForRole: true,
+      displayName: 'Qwen2.5-Coder 1.5B (base)',
+      publisher: 'ggml-org',
+      license: 'Apache-2.0',
+      vramLine: 'any modern GPU (~1–2 GB)',
+      progressId: 'qwen25-coder-1.5b',
+      ollamaTag: 'qwen2.5-coder:1.5b-base',
+      ollamaApproxBytes: 986_000_000,
+      llamacpp: { file: 'qwen2.5-coder-1.5b-q8_0.gguf', approxBytes: 1_646_573_056, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen2.5-Coder-1.5B' },
+      ...overrides,
+    };
+  }
+  function fim7bRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'qwen25-coder-7b',
+      role: 'fim',
+      displayName: 'Qwen2.5-Coder 7B (base)',
+      publisher: 'ggml-org',
+      license: 'Apache-2.0',
+      vramLine: 'Ollama Q4 ≈ 6 GB · llama.cpp Q8 ≈ 9–10 GB',
+      progressId: 'qwen25-coder-7b',
+      ollamaTag: 'qwen2.5-coder:7b-base',
+      ollamaApproxBytes: 4_700_000_000,
+      llamacpp: { file: 'qwen2.5-coder-7b-q8_0.gguf', approxBytes: 8_098_525_600, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen2.5-Coder-7B' },
+      ...overrides,
+    };
+  }
+  function embeddingDefaultRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'qwen3-embedding-0.6b',
+      role: 'embedding',
+      defaultForRole: true,
+      displayName: 'Qwen3-Embedding 0.6B',
+      publisher: 'Qwen',
+      license: 'Apache-2.0',
+      vramLine: '< 1.5 GB',
+      progressId: 'qwen3-embedding-0.6b',
+      ollamaTag: 'qwen3-embedding:0.6b',
+      ollamaApproxBytes: 639_000_000,
+      llamacpp: { file: 'Qwen3-Embedding-0.6B-Q8_0.gguf', approxBytes: 639_150_592, present: false, available: true },
+      vllm: { runCommand: 'vllm serve Qwen/Qwen3-Embedding-0.6B' },
+      ...overrides,
+    };
+  }
+  function gptOssRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'gpt-oss-20b',
+      role: 'agent',
+      displayName: 'gpt-oss-20b',
+      publisher: 'ggml-org',
+      license: 'Apache-2.0',
+      vramLine: '24GB-easy (100K+ ctx)',
+      progressId: 'gpt-oss-20b',
+      ollamaTag: 'gpt-oss:20b',
+      ollamaApproxBytes: 14_000_000_000,
+      llamacpp: { file: 'gpt-oss-20b-MXFP4.gguf', approxBytes: 12_109_566_624, present: false, available: true },
+      vllm: { runCommand: 'vllm serve openai/gpt-oss-20b' },
+      ...overrides,
+    };
+  }
+  function sweepNextDefaultRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+    return {
+      id: 'sweep-next',
+      role: 'next',
+      defaultForRole: true,
+      displayName: 'Sweep Next-Edit v2 (7B)',
+      publisher: 'SyntinalCo',
+      license: 'Apache-2.0',
+      vramLine: 'Q4 ≈ 5 GB',
+      progressId: 'sweep-next',
+      ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
+      ollamaApproxBytes: 4_680_000_000,
+      llamacpp: { file: 'sweep-next-edit-v2-7B-Q4_K_M.gguf', approxBytes: 4_680_000_000, present: false, available: true },
+      vllm: { runCommand: 'vllm serve sweepai/sweep-next-edit-v2-7B' },
+      ...overrides,
+    };
+  }
+
+  const FULL_CATALOG: SetupCatalogModel[] = [
+    agentDefaultRow(),
+    fimDefaultRow(),
+    fim7bRow(),
+    embeddingDefaultRow(),
+    gptOssRow(),
+    sweepNextDefaultRow(),
+  ];
+
+  function nextEditFixture(overrides: Partial<SetupData['nextEdit']> = {}): SetupData['nextEdit'] {
+    return {
+      source: 'off',
+      backend: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+      model: '',
+      dedicatedConfigured: false,
+      genericSupported: true,
+      dedicated: {
+        displayName: 'Sweep Next-Edit v2 (7B)',
+        modelDefaults: { ollama: 'sweep-next-edit-v2-7b:q4_k_m', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+        downloadReady: true,
+        downloadApproxBytes: 4_680_000_000,
+        warning: 'warn',
+        guided: { vllm: 'vllm serve x' },
+      },
+      ...overrides,
+    };
+  }
+
+  function setupFixture(
+    catalogModels: SetupCatalogModel[] | undefined,
+    nextEditOverrides: Partial<SetupData['nextEdit']> = {},
+  ): Pick<SetupData, 'catalog' | 'nextEdit'> {
+    return {
+      catalog: catalogModels ? { models: catalogModels } : undefined,
+      nextEdit: nextEditFixture(nextEditOverrides),
+    };
+  }
+
+  describe('§6 rounding rule — bytes/2^30, 1dp, half-up, exact-bytes only', () => {
+    it('USABLE_VRAM_24GB_GIB is the pinned 22 GiB constant (B-F3)', () => {
+      expect(USABLE_VRAM_24GB_GIB).toBe(22);
+    });
+
+    it('roundGiB: Devstral (14_333_915_904) -> 13.3', () => {
+      expect(roundGiB(14_333_915_904)).toBe(13.3);
+    });
+    it('roundGiB: FIM-1.5B ollama bytes (986_000_000) -> 0.9', () => {
+      expect(roundGiB(986_000_000)).toBe(0.9);
+    });
+    it('roundGiB: embed-0.6B (639_000_000) -> 0.6', () => {
+      expect(roundGiB(639_000_000)).toBe(0.6);
+    });
+    it('roundGiB: half-up tie (1.25 GiB exactly) rounds to 1.3, never 1.2', () => {
+      expect(roundGiB(1_342_177_280)).toBe(1.3);
+    });
+    it('formatGiB always prints exactly one decimal, even for a whole number', () => {
+      expect(formatGiB(2 * 2 ** 30)).toBe('2.0');
+    });
+  });
+
+  describe('render gate (B-F7) — nothing unless catalog present AND all four defaults resolve', () => {
+    it('undefined catalog -> undefined (no strip)', () => {
+      expect(deriveRecommendations(setupFixture(undefined))).toBeUndefined();
+    });
+    it('catalog present but missing the agent default -> undefined', () => {
+      const models = FULL_CATALOG.filter((m) => !(m.role === 'agent' && m.defaultForRole));
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('catalog present but missing the fim default -> undefined', () => {
+      const models = FULL_CATALOG.filter((m) => !(m.role === 'fim' && m.defaultForRole));
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('catalog present but missing the embedding default -> undefined', () => {
+      const models = FULL_CATALOG.filter((m) => !(m.role === 'embedding' && m.defaultForRole));
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('catalog present but missing the next default -> undefined', () => {
+      const models = FULL_CATALOG.filter((m) => !(m.role === 'next' && m.defaultForRole));
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('a defaultForRole row with no ollamaApproxBytes does not "resolve" (no truthful size to print)', () => {
+      const models = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: undefined } : m,
+      );
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    // A12 (queued #4): `NaN`/`-1`/`0` bytes must gate the strip off exactly
+    // like a missing byte count — never print "~NaN GB" / "~0 GB".
+    it('a defaultForRole row with NaN ollamaApproxBytes does not "resolve" (A12 NaN guard)', () => {
+      const models = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: NaN } : m,
+      );
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('a defaultForRole row with -1 ollamaApproxBytes does not "resolve" (A12 non-positive guard)', () => {
+      const models = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: -1 } : m,
+      );
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('a defaultForRole row with 0 ollamaApproxBytes does not "resolve" (A12 non-positive guard)', () => {
+      const models = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: 0 } : m,
+      );
+      expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
+    });
+    it('all four defaults present -> resolves', () => {
+      expect(deriveRecommendations(setupFixture(FULL_CATALOG))).toBeDefined();
+    });
+  });
+
+  describe('role lines (B-F1/B-F5) — template-derived from the wire, zero hardcoded data', () => {
+    const recs = deriveRecommendations(setupFixture(FULL_CATALOG));
+
+    it('agent line', () => {
+      expect(roleLineText(mustRec(recs).agent)).toBe('Agent · Devstral-24B (2507) — 13.3 GiB');
+    });
+    it('fim line', () => {
+      expect(roleLineText(mustRec(recs).fim)).toBe('FIM · Qwen2.5-Coder 1.5B (base) — 0.9 GiB');
+    });
+    it('embedding line', () => {
+      expect(roleLineText(mustRec(recs).embedding)).toBe('Embedder · Qwen3-Embedding 0.6B — 0.6 GiB');
+    });
+    it('next line', () => {
+      expect(roleLineText(mustRec(recs).next)).toBe('NEXT · Sweep Next-Edit v2 (7B) — 4.4 GiB');
+    });
+
+    it('self-truing (B-F1): editing the catalog byte/name re-derives correctly, no second drift-lock', () => {
+      const edited = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, displayName: 'Mock-Agent-X', ollamaApproxBytes: 10_000_000_000 } : m,
+      );
+      const edRecs = mustRec(deriveRecommendations(setupFixture(edited)));
+      expect(roleLineText(edRecs.agent)).toBe(`Agent · Mock-Agent-X — ${formatGiB(10_000_000_000)} GiB`);
+    });
+  });
+
+  describe('divergence caption (B-F5) — present only where the rounded tiers actually diverge', () => {
+    const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG)));
+
+    it('FIM: 0.9 (ollama) vs 1.5 (llama.cpp Q8) -> caption present', () => {
+      expect(divergenceCaptionText(recs.fim)).toBe('llama.cpp build differs: 1.5 GiB');
+    });
+    it('Agent: identical bytes on both tiers -> no caption', () => {
+      expect(divergenceCaptionText(recs.agent)).toBeUndefined();
+    });
+    it('Embedding: 0.6 vs 0.6 (rounds equal despite differing raw bytes) -> no caption', () => {
+      expect(divergenceCaptionText(recs.embedding)).toBeUndefined();
+    });
+    it('NEXT: identical bytes on both tiers -> no caption', () => {
+      expect(divergenceCaptionText(recs.next)).toBeUndefined();
+    });
+  });
+
+  describe('stack line + meter (B-F1/B-F3) — one derivation, shared by both renderings', () => {
+    const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG)));
+
+    it('sumGiB is the EXACT byte sum, rounded once (not sum-of-rounded-parts)', () => {
+      expect(recs.stack.sumGiB).toBe('14.9');
+    });
+    it('leftGiB = rule-rounded (USABLE_VRAM_24GB_GIB - exact byte sum)', () => {
+      expect(recs.stack.leftGiB).toBe('7.1');
+    });
+    it('leftGiB floors at "0.0" (never negative) when the defaults sum exceeds USABLE_VRAM_24GB_GIB (M-2)', () => {
+      const oversized = FULL_CATALOG.map((m) =>
+        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: 26_843_545_600 } : m,
+      );
+      const oversizedRecs = mustRec(deriveRecommendations(setupFixture(oversized)));
+      expect(oversizedRecs.stack.leftGiB).toBe('0.0');
+    });
+    it('stackLineText matches the §6 TEMPLATE verbatim with today’s data', () => {
+      // The architecture doc's inline illustration abbreviates the FIM
+      // display name (drops "(base)"); the real catalog row's displayName
+      // carries it, and B-F1 requires interpolating the REAL wire value —
+      // this expectation matches `MODEL_CATALOG`'s actual `displayName`.
+      expect(stackLineText(recs.agent, recs.fim, recs.embedding, recs.stack)).toBe(
+        'A 24 GB GPU runs the full stack: Devstral-24B (2507) (13.3 GiB) + Qwen2.5-Coder 1.5B (base) (0.9 GiB) + ' +
+          'Qwen3-Embedding 0.6B (0.6 GiB) ≈ 14.9 GiB — about 7.1 GiB left for context (roughly 45K tokens at ' +
+          "fp16 KV — see Part 0.2's fit model).",
+      );
+    });
+    it('meterSegments: three segments, rule-rounded values against the 22 GiB track', () => {
+      const segs = meterSegments(recs.agent, recs.fim, recs.embedding);
+      expect(segs.map((s) => s.role)).toEqual(['agent', 'fim', 'embedding']);
+      expect(segs[0]?.pct).toBeCloseTo((13.3 / 22) * 100, 5);
+      expect(segs[1]?.pct).toBeCloseTo((0.9 / 22) * 100, 5);
+      expect(segs[2]?.pct).toBeCloseTo((0.6 / 22) * 100, 5);
+    });
+  });
+
+  describe('tier lines + MoE note (B-F1/B-F4) — frame text static, names/sizes interpolated', () => {
+    it('all four tier lines + gpt-oss in the 16 GB bucket (never 12 GB)', () => {
+      const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG)));
+      expect(recs.tiers.tier8).toBe('~8 GB: Qwen2.5-Coder 1.5B (base) · all embedders — agent models need more');
+      expect(recs.tiers.tier1216).toBe('12–16 GB: + Qwen2.5-Coder 7B (base); at 16 GB: gpt-oss-20b (tight)');
+      expect(recs.tiers.tier24).toBe(
+        '24 GB: any single agent model — Devstral-24B (2507) is the sweet spot; MoE 35Bs need CPU-offload',
+      );
+      expect(recs.tiers.tier32).toBe('32 GB+: everything, incl. MoE 35Bs fully resident');
+    });
+
+    it('gracefully degrades (no crash) when the non-default 7B/gpt-oss rows are absent from the wire', () => {
+      const minimal = FULL_CATALOG.filter((m) => m.defaultForRole);
+      const recs = mustRec(deriveRecommendations(setupFixture(minimal)));
+      expect(recs.tiers.tier1216).not.toContain('undefined');
+    });
+
+    it('RECS_MOE_NOTE — §6 MoE honesty note, verbatim', () => {
+      expect(RECS_MOE_NOTE).toBe(
+        'MoE ≠ smaller: a 35B MoE still needs ~20 GiB for weights — only compute is light (~3B active per token).',
+      );
+    });
+  });
+
+  describe('NEXT/Sweep fail-closed (B-F5, §3.5) — mirrors the NEXT card, never "recommended" while unpinned', () => {
+    it('absent `dedicated` entirely -> fail-closed by default (R-3 posture), nextReady false', () => {
+      const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG, { dedicated: undefined })));
+      expect(recs.next.nextReady).toBe(false);
+    });
+    it('downloadReady: true (published pin) -> nextReady true', () => {
+      const recs = mustRec(
+        deriveRecommendations(
+          setupFixture(FULL_CATALOG, {
+            dedicated: {
+              displayName: 'Sweep Next-Edit v2 (7B)',
+              modelDefaults: { ollama: 'sweep-next-edit-v2-7b:q4_k_m', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+              downloadReady: true,
+              downloadApproxBytes: 4_680_000_000,
+              warning: 'warn',
+              guided: { vllm: 'vllm serve x' },
+            },
+          }),
+        ),
+      );
+      expect(recs.next.nextReady).toBe(true);
+    });
+    it('downloadReady: false (unpinned, today’s actual state) -> nextReady false', () => {
+      const recs = mustRec(
+        deriveRecommendations(
+          setupFixture(FULL_CATALOG, {
+            dedicated: {
+              displayName: 'Sweep Next-Edit v2 (7B)',
+              modelDefaults: { ollama: '', openaiCompat: 'sweepai/sweep-next-edit-v2-7B' },
+              downloadReady: false,
+              downloadApproxBytes: 4_680_000_000,
+              warning: 'warn',
+              guided: { vllm: 'vllm serve x' },
+            },
+          }),
+        ),
+      );
+      expect(recs.next.nextReady).toBe(false);
+    });
+    it('the strip NEVER hardcodes the word "recommended" for NEXT — it reuses the NEXT card’s own fail-closed text', () => {
+      // NEXT_DOWNLOAD_UNAVAILABLE_TEXT is the single source of truth the NEXT
+      // card itself renders (setupCards.ts) — the recs strip must reuse it,
+      // not restate a second copy.
+      expect(NEXT_DOWNLOAD_UNAVAILABLE_TEXT).not.toMatch(/recommended/i);
+    });
+  });
+
+  describe('strip frame copy (§6) — verbatim + single-sourced', () => {
+    it('RECS_STRIP_HEADING', () => {
+      expect(RECS_STRIP_HEADING).toBe('Recommended local models');
+    });
+    it('RECS_STRIP_INTRO', () => {
+      expect(RECS_STRIP_INTRO).toBe('Pick by your GPU — sizes are the download; running adds context memory + ~2 GiB buffers.');
+    });
+    it('RECS_DISCLOSURE_SUMMARY', () => {
+      expect(RECS_DISCLOSURE_SUMMARY).toBe('What fits my hardware?');
+    });
+  });
+
+  function mustRec(value: RecsResult): NonNullable<RecsResult> {
+    if (value === undefined) throw new Error('fixture bug: deriveRecommendations resolved to undefined');
+    return value;
+  }
+  type RecsResult = ReturnType<typeof deriveRecommendations>;
+});
+
+describe('T18 — scoped source-scan: ZERO hardcoded model data in the recs strip sources (rule 5, B-F1)', () => {
+  // Scoped to the two hand-written files T18 touches — NOT modelCatalog.ts
+  // (pure DATA, the legitimate single source) and NOT the test fixtures
+  // above (which intentionally mirror catalog data to exercise the pure
+  // derivation without a live wire fetch).
+  const setupCardsSrc = readFileSync(join(__dirname, 'setupCards.ts'), 'utf-8');
+  const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
+
+  // Long/distinctive catalog facts (exact byte counts + full display-name
+  // phrases) that must NEVER appear as source literals — every one of these
+  // must instead flow from a `SetupCatalogModel` wire row at render time.
+  const FORBIDDEN_HARDCODED_MODEL_DATA = [
+    '14_333_915_904',
+    '14333915904',
+    '986_000_000',
+    '986000000',
+    '1_646_573_056',
+    '1646573056',
+    '639_000_000',
+    '639000000',
+    '639_150_592',
+    '639150592',
+    '4_680_000_000',
+    '4680000000',
+    '8_098_525_600',
+    '8098525600',
+    // NOTE: 'Devstral-24B (2507)' is intentionally NOT in this list — T12's
+    // pre-existing `AGENT_DEFAULT_MODEL_CAPTION` (§6 "Devstral default
+    // caption") already carries it as its own owned, unrelated §6 string;
+    // T18's OWN functions (`roleLineText`/`stackLineText`/`recsTiers`) never
+    // write it as a literal — they interpolate `row.displayName` — so this
+    // list stays scoped to facts T18 alone would ever hardcode.
+    'Qwen2.5-Coder 1.5B (base)',
+    'Qwen2.5-Coder 7B (base)',
+    'Qwen3-Embedding 0.6B',
+    'Sweep Next-Edit v2 (7B)',
+  ];
+
+  it('setupCards.ts carries none of these literals', () => {
+    for (const s of FORBIDDEN_HARDCODED_MODEL_DATA) {
+      expect(setupCardsSrc, `found forbidden literal "${s}" in setupCards.ts`).not.toContain(s);
+    }
+  });
+  it('SetupPanel.tsx carries none of these literals', () => {
+    for (const s of FORBIDDEN_HARDCODED_MODEL_DATA) {
+      expect(setupPanelSrc, `found forbidden literal "${s}" in SetupPanel.tsx`).not.toContain(s);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * beta.6 panel-fix PT3 (architecture doc T3, §8): pending-model pure
+ * helpers + new FIM/RAG model-selection copy. PT4 (FIM surface) and PT5
+ * (RAG surface) wire these in; this file locks the pure logic + verbatim
+ * copy only — no rendering here.
+ * ------------------------------------------------------------------ */
+
+describe('catalogRowIdForModel — row-selection derived from the install target (PT3)', () => {
+  const models = [
+    catalogModel({ id: 'qwen25-coder-1.5b', ollamaTag: 'qwen2.5-coder:1.5b-base', ollamaCreatedName: undefined }),
+    catalogModel({ id: 'devstral-24b', role: 'agent', ollamaTag: undefined, ollamaCreatedName: 'devstral-small-2507:24b' }),
+  ];
+
+  it('exact ollamaTag match', () => {
+    expect(catalogRowIdForModel(models, 'qwen2.5-coder:1.5b-base')).toBe('qwen25-coder-1.5b');
+  });
+
+  it(':latest-tolerant via ollamaTagsEqual', () => {
+    expect(catalogRowIdForModel(models, 'qwen2.5-coder:1.5b-base:latest')).toBe('qwen25-coder-1.5b');
+  });
+
+  it('hf-ingest row matches on ollamaCreatedName', () => {
+    expect(catalogRowIdForModel(models, 'devstral-small-2507:24b')).toBe('devstral-24b');
+  });
+
+  it('empty model -> undefined', () => {
+    expect(catalogRowIdForModel(models, '')).toBeUndefined();
+  });
+
+  it('whitespace-only model -> undefined', () => {
+    expect(catalogRowIdForModel(models, '   ')).toBeUndefined();
+  });
+
+  it('no matching row -> undefined', () => {
+    expect(catalogRowIdForModel(models, 'no-such-model')).toBeUndefined();
+  });
+});
+
+describe("initPendingModel / reconcilePendingModel — keyed-draft-state pair (PT3, mirrors SetupPanel.tsx's own endpointKey/ep pattern)", () => {
+  it('init returns the saved value at the given key', () => {
+    expect(initPendingModel('ollama|qwen', 'qwen')).toEqual({ key: 'ollama|qwen', value: 'qwen' });
+  });
+
+  it('same key -> no-op, keeps the in-flight value (identity-preserving, same rule as reconcileDedicatedFormFields)', () => {
+    const state = { key: 'ollama|qwen', value: 'edited-by-hand' };
+    const result = reconcilePendingModel(state, 'ollama|qwen', 'qwen');
+    expect(result).toBe(state);
+    expect(result.value).toBe('edited-by-hand');
+  });
+
+  it('changed key -> resets the draft to the new saved value (a backend/pane switch)', () => {
+    const state = initPendingModel('ollama|qwen', 'qwen');
+    const result = reconcilePendingModel(state, 'llamacpp|other', 'other');
+    expect(result).toEqual({ key: 'llamacpp|other', value: 'other' });
+  });
+
+  it('a saved-value move at the SAME backend/pane changes the key too, and reconciles (Apply landing / external edit)', () => {
+    // FIM key = `${selectedId}|${savedModel}` — the saved model is folded
+    // into the key itself, so a save landing changes the key even though
+    // selectedId never moved.
+    const state = initPendingModel('ollama|old-model', 'old-model');
+    const result = reconcilePendingModel(state, 'ollama|new-model', 'new-model');
+    expect(result).toEqual({ key: 'ollama|new-model', value: 'new-model' });
+  });
+});
+
+describe('fimModelFieldVisible — llama.cpp native /infill sends no model name (PT3)', () => {
+  it('llamacpp -> false (a field there would be a fake affordance)', () => {
+    expect(fimModelFieldVisible('llamacpp')).toBe(false);
+  });
+
+  it.each(['ollama', 'vllm', 'codestral', 'openai-compat'])('%s -> true (sends a model name in the request body)', (id) => {
+    expect(fimModelFieldVisible(id)).toBe(true);
+  });
+});
+
+describe('ragEndpointInit — RAG embedder section endpoint field init per pane (PT3)', () => {
+  const endpointDefaults = { ollama: 'http://127.0.0.1:11434', llamacpp: 'http://127.0.0.1:8081', 'openai-compat': 'http://127.0.0.1:8000' };
+
+  it('pane === the saved backend -> the saved embedEndpoint', () => {
+    const rag = { embedBackend: 'ollama' as const, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    expect(ragEndpointInit(rag, 'ollama')).toBe('http://saved:1234');
+  });
+
+  it("a DIFFERENT pane -> that pane's own default, not the saved endpoint", () => {
+    const rag = { embedBackend: 'ollama' as const, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    expect(ragEndpointInit(rag, 'llamacpp')).toBe('http://127.0.0.1:8081');
+    expect(ragEndpointInit(rag, 'openai-compat')).toBe('http://127.0.0.1:8000');
+  });
+
+  it("old-host wire (embedBackend absent) -> the ollama pane still inits from the always-present saved endpoint (the '?? ollama' branch)", () => {
+    const rag = { embedBackend: undefined, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    expect(ragEndpointInit(rag, 'ollama')).toBe('http://saved:1234');
+  });
+
+  it('old-host wire (embedBackend absent) -> a non-ollama pane falls to its own default', () => {
+    const rag = { embedBackend: undefined, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    expect(ragEndpointInit(rag, 'llamacpp')).toBe('http://127.0.0.1:8081');
+  });
+
+  it('endpointDefaults present (always, post-PT2) -> the correct per-pane default for every pane', () => {
+    const rag = { embedBackend: 'llamacpp' as const, embedEndpoint: 'http://saved:9999', endpointDefaults };
+    expect(ragEndpointInit(rag, 'ollama')).toBe('http://127.0.0.1:11434');
+    expect(ragEndpointInit(rag, 'openai-compat')).toBe('http://127.0.0.1:8000');
+  });
+
+  it("endpointDefaults absent -> '' for a non-matching pane (defensive; the type requires optional-chaining even though the host always populates it)", () => {
+    const rag = { embedBackend: 'ollama' as const, embedEndpoint: 'http://saved:1234', endpointDefaults: undefined };
+    expect(ragEndpointInit(rag, 'llamacpp')).toBe('');
+  });
+});
+
+describe('pendingSelectionLine — verbatim per surface, {model} interpolated (PT3)', () => {
+  it('fim', () => {
+    expect(pendingSelectionLine('fim', 'qwen2.5-coder:1.5b-base')).toBe(
+      'Selected: qwen2.5-coder:1.5b-base — not saved yet. Apply on the Connect tab saves it.',
+    );
+  });
+
+  it('rag', () => {
+    expect(pendingSelectionLine('rag', 'nomic-embed-text')).toBe(
+      'Selected: nomic-embed-text — not saved yet. Apply below saves it.',
+    );
+  });
+});
+
+describe('BACKEND_DISPLAY / RAG_THIRD_TAB_LABEL — §8 backend display copy (PT3)', () => {
+  it('BACKEND_DISPLAY carries the exact four labels', () => {
+    expect(BACKEND_DISPLAY).toEqual({
+      ollama: 'Ollama',
+      llamacpp: 'llama.cpp',
+      vllm: 'vLLM',
+      'openai-compat': 'OpenAI-compatible',
+    });
+  });
+
+  it('RAG_THIRD_TAB_LABEL stays a distinct constant, NOT folded into BACKEND_DISPLAY', () => {
+    expect(RAG_THIRD_TAB_LABEL).toBe('vLLM / OpenAI-compatible');
+    expect(Object.values(BACKEND_DISPLAY)).not.toContain(RAG_THIRD_TAB_LABEL);
+  });
+});
+
+describe('§8 new/changed model-selection copy — verbatim locks (PT3)', () => {
+  it('RAG_OLLAMA_PULL_NUDGE (new)', () => {
+    expect(RAG_OLLAMA_PULL_NUDGE).toBe('✓ Downloaded and selected — Apply below saves it as your embedding model.');
+  });
+
+  it('FIM_PENDING_CAPTION (new)', () => {
+    expect(FIM_PENDING_CAPTION).toBe('not saved yet');
+  });
+
+  it('FIM_MODEL_FIELD_CAPTION', () => {
+    expect(FIM_MODEL_FIELD_CAPTION).toBe('Used for inline completions — separate from the embedding model.');
+  });
+
+  it('RAG_MODEL_FIELD_CAPTION', () => {
+    expect(RAG_MODEL_FIELD_CAPTION).toBe('Used to index your codebase — separate from the autocomplete model.');
+  });
+
+  it('FIM_LLAMACPP_MODEL_NOTE', () => {
+    expect(FIM_LLAMACPP_MODEL_NOTE).toBe('llama.cpp serves the model you start llama-server with — no model name is sent.');
+  });
+
+  it('RAG_LLAMACPP_MODEL_NOTE', () => {
+    expect(RAG_LLAMACPP_MODEL_NOTE).toBe(
+      'llama.cpp embeds with the model the server was started with — this name is not used to pick it.',
+    );
+  });
+
+  it('FIM_MODEL_FIELD_LABEL', () => {
+    expect(FIM_MODEL_FIELD_LABEL).toBe('Model');
+  });
+
+  it('RAG_MODEL_FIELD_LABEL', () => {
+    expect(RAG_MODEL_FIELD_LABEL).toBe('Embedding model');
   });
 });

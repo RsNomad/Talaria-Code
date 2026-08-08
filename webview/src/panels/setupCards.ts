@@ -3,12 +3,12 @@
  * (Task 10, plan doc §6). No React, no `vscode`, no bridge — everything here
  * is a plain function over the shared wire types, unit-testable in a plain
  * node environment (`SetupPanel.test.ts`, the `webview-pure` vitest
- * project). `SetupPanel.tsx` is the ONLY consumer of these; keep it that way
- * so the decisions stay provable without a DOM (mirrors `Toggle.tsx`'s
- * `toggleInteraction` extraction and `settingsField.ts`'s reconcile
- * functions — same discipline, new panel).
+ * project). `SetupPanel.tsx` and, as of beta.6 T10, `localModel.tsx` are the
+ * ONLY consumers of these; keep it that way so the decisions stay provable
+ * without a DOM (mirrors `Toggle.tsx`'s `toggleInteraction` extraction and
+ * `settingsField.ts`'s reconcile functions — same discipline, new panel).
  */
-import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupProgress } from '../protocol';
+import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupProgress } from '../protocol';
 /*
  * T15: `registry.ts` is PURE DATA with zero imports of any kind (Global
  * Constraint 5) — safe to pull straight into the webview bundle, exactly
@@ -22,6 +22,17 @@ import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupProgress } fr
  * — so the presence check needs the actual constants, not just the wire.
  */
 import { NEXT_DEDICATED_MODEL } from '../../../src/host/setup/registry';
+/*
+ * T12: `modelCatalog.ts` is likewise PURE DATA + a pure charset function with
+ * ZERO imports (its own zero-import drift-lock) — the same webview-bundle-safe
+ * posture as `registry.ts` above. Needed here because the `GGUF by {publisher}`
+ * caption (§3.1 A-F7) turns on "publisher ≠ the model's VENDOR", and the
+ * vendor never crosses the wire — only the catalog's `vllm.serveRepo` (the
+ * vendor's own official repo, §5) carries it. Deriving from the catalog keeps
+ * the rule self-truing on catalog edits instead of hardcoding an org list
+ * here that would silently drift.
+ */
+import { MODEL_CATALOG } from '../../../src/host/setup/modelCatalog';
 
 // --- Agent card (§6 card 1) -------------------------------------------------
 
@@ -262,14 +273,17 @@ export function mutationDisabledReason(trusted: boolean): string | undefined {
 // recomputes its OWN card's "green" from wire-visible fields only, scoped to
 // that one card (an agent-ready line must not depend on the provider, etc).
 
-/** Card 1 — Agent: mirrors `AgentSetupPhase === 'ready'`. */
+/** Card 1 — Agent: mirrors `AgentSetupPhase === 'ready'`. beta.6 panel-fix
+ *  PT8 (audit A8, the one-carrier ✓ rule): no leading ✓ — this always
+ *  renders via `DoneLine`, whose `pass-filled` icon already carries the
+ *  check; a literal ✓ beside it would double up. */
 export function agentDoneLine(phase: AgentSetupPhase): string {
-  return phase === 'ready' ? '✓ Hermes is ready. Next: configure a chat provider below.' : '';
+  return phase === 'ready' ? 'Hermes is ready. Next: configure a chat provider below.' : '';
 }
 
-/** Card 2 — Provider: mirrors `provider.phase === 'configured'`. */
+/** Card 2 — Provider: mirrors `provider.phase === 'configured'`. PT8/A8: see {@link agentDoneLine}. */
 export function providerDoneLine(phase: SetupData['provider']['phase']): string {
-  return phase === 'configured' ? '✓ Provider connected — chat is ready to use.' : '';
+  return phase === 'configured' ? 'Provider connected — chat is ready to use.' : '';
 }
 
 /** Auth-satisfied predicate over the WIRE's collapsed `auth` union — the
@@ -290,30 +304,47 @@ function fimAuthSatisfied(option: SetupBackendOption | undefined): boolean {
  * the boolean itself never crosses the wire (only the ALL-cards composite
  * `ready` does, and that also folds in agent+provider, which this per-card
  * line must not).
+ *
+ * beta.6 panel-fix PT4 (audit A4, the `ragDoneLine` rule): when the SAVED
+ * backend is **ollama**, green additionally requires the configured model
+ * PROVEN `'present'` at the wire's SAVED endpoint (`presence` = the
+ * caller's endpoint-scoped {@link catalogPresence} derivation). `'absent'`
+ * and `'unknown'` both render NO line — an "active" claim the panel can't
+ * verify would be a lie, and an unverifiable state must not claim broken
+ * either. Non-ollama backends keep the auth-based rule unchanged and never
+ * consult `presence` (their call sites may pass `'unknown'`).
  */
-export function fimDoneLine(fim: SetupData['fim']): string {
+export function fimDoneLine(fim: SetupData['fim'], presence: NextPresence): string {
   const option = fim.options.find((o) => o.id === fim.selectedId);
   const green = option !== undefined && option.status === 'available' && fim.enabled && fimAuthSatisfied(option);
-  return green ? '✓ Autocomplete is active — open a file and start typing.' : '';
+  if (!green) return '';
+  if (fim.selectedId === 'ollama' && presence !== 'present') return '';
+  return 'Autocomplete is active — open a file and start typing.';
 }
 
-/** Card 4 — NEXT: one line per active source, empty while `'off'`. */
+/** Card 4 — NEXT: one line per active source, empty while `'off'`. PT8/A8: see {@link agentDoneLine}. */
 export function nextDoneLine(source: SetupData['nextEdit']['source']): string {
-  if (source === 'dedicated') return '✓ Next-edit suggestions are on (dedicated Sweep model).';
-  if (source === 'generic') return '✓ Next-edit suggestions are on (reusing your FIM model).';
+  if (source === 'dedicated') return 'Next-edit suggestions are on (dedicated Sweep model).';
+  if (source === 'generic') return 'Next-edit suggestions are on (reusing your FIM model).';
   return '';
 }
 
 /**
  * Card 5 — RAG: green only once the index is genuinely usable — enabled,
- * the embed model is actually present on the daemon (not just configured),
- * and nothing is blocking activation (`preconditionDetail` unset). A
- * "ready" claim without the embed model present would be a lie the icon
- * alone couldn't correct (§6, Global Constraint 7).
+ * nothing blocking activation (`preconditionDetail` unset), and the embed
+ * model PROVEN present at the CONFIGURED endpoint (`presence` = the
+ * endpoint-scoped client derivation, {@link ragEmbedPresence}). beta.6 T14
+ * (§3.4 truth table): the wire's own presence boolean is deliberately
+ * ignored — the host computes it against the daemon IT probed, not `rag`'s
+ * configured endpoint, so it lies in both directions the moment the two
+ * differ. `'absent'` and `'unknown'` both render NO line: a "ready" claim
+ * the panel can't verify would be a lie the icon alone couldn't correct
+ * (§6, Global Constraint 7), and an unverifiable state must not claim
+ * broken either — silence + the summary's honest tri-state text carry it.
  */
-export function ragDoneLine(rag: SetupData['rag']): string {
-  const green = rag.enabled && rag.embedModelPresent && rag.preconditionDetail === undefined;
-  return green ? '✓ Codebase index is ready — the agent can search your project.' : '';
+export function ragDoneLine(rag: SetupData['rag'], presence: NextPresence): string {
+  const green = rag.enabled && presence === 'present' && rag.preconditionDetail === undefined;
+  return green ? 'Codebase index is ready — the agent can search your project.' : '';
 }
 
 // --- pipx-missing unknown-distro fallback (§6, T10) ------------------------
@@ -353,7 +384,11 @@ function normalizeOllamaTag(tag: string): string {
   return lower.endsWith(':latest') ? lower.slice(0, -':latest'.length) : lower;
 }
 
-function ollamaTagsEqual(a: string, b: string): boolean {
+/** Exported since beta.6 panel-fix PT4: the FIM Install pane's pending-vs-
+ *  saved comparison must use the SAME normalization presence/row-matching
+ *  already use — two ad-hoc comparisons would silently disagree on
+ *  `:latest`. */
+export function ollamaTagsEqual(a: string, b: string): boolean {
   return normalizeOllamaTag(a) === normalizeOllamaTag(b);
 }
 
@@ -378,6 +413,21 @@ function isEquivalentOllamaTag(daemonTag: string, formModel: string): boolean {
   return isVettedOllamaAlias(formModel) && isVettedOllamaAlias(daemonTag);
 }
 
+/** Endpoint equality tolerant of WHATWG canonicalization (trailing slash, default
+ *  port, host case/punycode) — mirrors the host's own validateEndpointUrl
+ *  normalization so a saved canonical endpoint still matches the raw registry
+ *  default the host probed. Parse failure falls back to raw compare (keeps the
+ *  honest 'unknown' for genuinely malformed input). `b` may be undefined
+ *  (an unprobed endpoint) → never equal. beta.6 T3 (L1-I-1 companion). */
+export function endpointsEqual(a: string, b: string | undefined): boolean {
+  if (b === undefined) return false;
+  try {
+    return new URL(a).toString() === new URL(b).toString();
+  } catch {
+    return a === b;
+  }
+}
+
 /**
  * §4.2: presence is derived CLIENT-SIDE against the live form state — the
  * host's Ollama probe targets the registry-default endpoint, not whatever
@@ -393,7 +443,7 @@ function isEquivalentOllamaTag(daemonTag: string, formModel: string): boolean {
  */
 export function nextPresence(setup: Pick<SetupData, 'ollama'>, formEndpoint: string, formModel: string): NextPresence {
   const ollama = setup.ollama;
-  if (!ollama.running || formEndpoint !== ollama.endpoint) return 'unknown';
+  if (!ollama.running || !endpointsEqual(formEndpoint, ollama.endpoint)) return 'unknown';
   const present = ollama.models.some((m) => isEquivalentOllamaTag(m.name, formModel));
   return present ? 'present' : 'absent';
 }
@@ -402,7 +452,7 @@ export function nextPresence(setup: Pick<SetupData, 'ollama'>, formEndpoint: str
 export function nextPresenceText(presence: NextPresence): string {
   switch (presence) {
     case 'present':
-      return '✓ Model present on this Ollama';
+      return 'Model present on this Ollama';
     case 'absent':
       return 'not present';
     case 'unknown':
@@ -420,7 +470,7 @@ export const NEXT_POST_DOWNLOAD_NUDGE = '✓ Downloaded — press Apply to start
 /** §6 "NEXT download unavailable (D3)": renders where the ollama Model
  *  field's prefill would be while `!downloadReady` (R-3). */
 export const NEXT_DOWNLOAD_UNAVAILABLE_TEXT =
-  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 
 /** §6 "NEXT model line (D1)" — composed from the wire's own `displayName`
  *  rather than a second hardcoded copy of the same string. */
@@ -527,4 +577,834 @@ export function reconcileDedicatedFormFields(
 ): DedicatedFormFieldState {
   if (selectedId === state.lastSelectedId) return state;
   return initDedicatedFormFieldState(selectedId, defaults);
+}
+
+// --- beta.6 T13 (§3.3/§4.2): NEXT surface — pane restoration + digest hint --
+
+/**
+ * T13 (CC-10, §4.2): the dedicated NEXT form's INITIAL candidate pane.
+ * `nextEdit.dedicatedBackendId` (the pane a previous Apply recorded — its
+ * additive `setup.setNextEdit` param) wins when it still names a live
+ * candidate; a stale/edited value that names none degrades to the pre-T13
+ * transport heuristic (first candidate whose `nextEditTransport` matches
+ * `nextEdit.backend`, else the first candidate) — never a dead selection.
+ * `undefined` only for an empty candidate list.
+ */
+export function dedicatedInitialCandidateId(
+  nextEdit: Pick<SetupData['nextEdit'], 'backend' | 'dedicatedBackendId'>,
+  candidates: readonly Pick<SetupBackendOption, 'id' | 'nextEditTransport'>[],
+): string | undefined {
+  const restored =
+    nextEdit.dedicatedBackendId !== undefined
+      ? candidates.find((o) => o.id === nextEdit.dedicatedBackendId)
+      : undefined;
+  if (restored !== undefined) return restored.id;
+  return (candidates.find((o) => o.nextEditTransport === nextEdit.backend) ?? candidates[0])?.id;
+}
+
+/**
+ * T13 (§3.3/SC-3): the NEXT llama.cpp pane's retained manual-verify caption —
+ * the SECOND line of the wire's `guided.llamacpp` (host-composed
+ * `sha256sum`-hint, split off by {@link splitGuidedLine}), rendered under the
+ * downloaded row's run command via the block's `runCommandCaption` slot. The
+ * `-hf` COMMAND half is deliberately dropped on that pane (the block's
+ * verified Download replaced it); the hint half is beta.5's manual re-check
+ * posture, kept. `undefined` while the pin is unpublished (`guided.llamacpp`
+ * absent — R-3/S-F5: the hint is gated by the SAME pin as the download) or
+ * for a caption-less line — never an empty caption.
+ */
+export function nextLlamacppDigestHint(dedicated: SetupData['nextEdit']['dedicated']): string | undefined {
+  const guided = dedicated?.guided.llamacpp;
+  if (guided === undefined) return undefined;
+  const caption = splitGuidedLine(guided).caption;
+  return caption !== '' ? caption : undefined;
+}
+
+// --- beta.6 T10 (§4.1/§4.2/§6): LocalModelBlock helpers --------------------
+//
+// `catalogPresence` generalizes `nextPresence` above to ANY catalog row
+// (library-tier `ollamaTag` OR hf-ingest-tier `ollamaCreatedName` — Devstral/
+// Sweep) instead of just the one dedicated-NEXT model. Unlike `nextPresence`,
+// there is no alias table here: per §3.1 (A-F5, deliberate divergence),
+// Devstral recognizes NO hand-pull alias — only Sweep's own `nextPresence`
+// carries that special case, and it stays local to that function.
+
+/** A catalog row's ONE local-Ollama match target: the hf-ingest tier's
+ *  created name when present (Devstral/Sweep — `ollamaTag` is undefined
+ *  there), else the library tier's tag. `undefined` only for a
+ *  (unreachable-in-shipping-data) row with no Ollama entry at all. */
+function catalogOllamaTarget(model: Pick<SetupCatalogModel, 'ollamaTag' | 'ollamaCreatedName'>): string | undefined {
+  return model.ollamaCreatedName ?? model.ollamaTag;
+}
+
+/**
+ * §4.2-style client-side presence derivation, generalized over the whole
+ * catalog (not just the dedicated NEXT model): `'present'`/`'absent'` only
+ * once the daemon is reachable AND `formEndpoint` matches the endpoint
+ * `status()` actually probed — any mismatch (including an unprobed
+ * `undefined`) is honestly `'unknown'`, never a guess (same rule
+ * `nextPresence` applies, C-6).
+ */
+export function catalogPresence(
+  ollama: Pick<SetupData['ollama'], 'running' | 'endpoint' | 'models'>,
+  formEndpoint: string,
+  model: Pick<SetupCatalogModel, 'ollamaTag' | 'ollamaCreatedName'>,
+): NextPresence {
+  if (!ollama.running || !endpointsEqual(formEndpoint, ollama.endpoint)) return 'unknown';
+  const target = catalogOllamaTarget(model);
+  if (target === undefined) return 'unknown';
+  const present = ollama.models.some((m) => ollamaTagsEqual(m.name, target));
+  return present ? 'present' : 'absent';
+}
+
+/** §6 "Model row (ollama)" — DISTINCT wording from the NEXT card's own D2
+ *  line (`nextPresenceText`): `'present'`, not `'Model present on this
+ *  Ollama'`. The 'unknown' text is shared verbatim with `nextPresenceText`
+ *  by coincidence of both being the SAME honest sentence, not by reuse. */
+export function catalogPresenceText(presence: NextPresence): string {
+  switch (presence) {
+    case 'present':
+      return 'present';
+    case 'absent':
+      return 'not present';
+    case 'unknown':
+      return 'not verified here — Test the endpoint first.';
+  }
+}
+
+/** §6 "Model row (llamacpp)" — sidecar-rule honesty: "present in Talaria's
+ *  model folder", never "verified" (§2.2.8 — the hash was proven at write
+ *  time; the persistent line only attests the sidecar, it doesn't re-hash). */
+export function llamacppPresenceText(present: boolean): string {
+  return present ? "present in Talaria's model folder" : 'not downloaded';
+}
+
+/** §6 "Backend ready" — shared template for the two backends that have a
+ *  real installed/missing distinction (vLLM never renders this — it has no
+ *  such distinction, §4.1). */
+export function backendReadyText(backend: 'ollama' | 'llamacpp', version?: string): string {
+  const label = backend === 'ollama' ? 'Ollama' : 'llama.cpp';
+  return version ? `${label}: Ready — ${version}` : `${label}: Ready`;
+}
+
+export const OLLAMA_MISSING_TEXT = 'Ollama daemon not detected.';
+export const LLAMACPP_MISSING_TEXT = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';
+export const LLAMACPP_CHECKING_TEXT = 'Checking for llama-server…';
+export const LLAMACPP_UNKNOWN_TEXT = "Couldn't check for llama-server here — press Re-check.";
+/** rev 3: fixture/future-rows only — NO shipping row renders it (F-3/F-4
+ *  closed). Overridden per-row by the wire's own `unavailableReason` when the
+ *  host provides one. */
+export const LLAMACPP_HONEST_ABSENCE_TEXT =
+  'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.';
+/** §6 "Ollama rows, daemon down" disabled-Pull reason. */
+export const OLLAMA_DAEMON_DOWN_PULL_REASON = 'Install Ollama first — it performs the download.';
+/** §6 "Post-download (llamacpp, immediate)" — role-agnostic (unlike the FIM/
+ *  RAG ollama-pull nudges, which are surface-specific and stay OUT of this
+ *  shared block — callers pass their own via `ollamaPullSuccessLabel`). */
+export const LLAMACPP_DOWNLOAD_SUCCESS_TEXT = '✓ Downloaded and verified — start the server with the command below.';
+/** §6 "Default chip". */
+export const CATALOG_DEFAULT_CHIP_LABEL = 'Default';
+/** §6 "Cancel" — dispatches `setup.cancel {op:'pull', id:<catalogId>}` (CC-9). */
+export const CANCEL_LABEL = 'Cancel';
+
+/** §6 "Pull {tag} (~{size})" — `{tag}` is the library tier's `ollamaTag`,
+ *  falling back to the hf-ingest tier's `ollamaCreatedName` (Devstral has no
+ *  `ollamaTag` at all — F-5, one vintage everywhere via hf-ingest). */
+export function ollamaPullButtonLabel(model: Pick<SetupCatalogModel, 'ollamaTag' | 'ollamaCreatedName' | 'ollamaApproxBytes'>): string {
+  const tag = catalogOllamaTarget(model) ?? '';
+  const size = formatBytes(model.ollamaApproxBytes);
+  return size ? `Pull ${tag} (~${size})` : `Pull ${tag}`;
+}
+
+/** §6 "Download {name} (~{size})" — `{name}` is the model's `displayName`
+ *  (a human-readable label, unlike the Ollama tier's technical `{tag}`). */
+export function llamacppDownloadButtonLabel(model: Pick<SetupCatalogModel, 'displayName'>, approxBytes: number): string {
+  const size = formatBytes(approxBytes);
+  return size ? `Download ${model.displayName} (~${size})` : `Download ${model.displayName}`;
+}
+
+/**
+ * rev 3 (A-F8) — THE ONE picker-preselect rule, used both to initialize a
+ * picker's selection AND by [Change model]'s prefill: the already-saved
+ * model wins when it still names a row in the current set; otherwise the
+ * `defaultForRole` row; otherwise (fixture-only — production catalogs always
+ * carry exactly one `defaultForRole` row per role) the first row. `undefined`
+ * only for an empty row set.
+ */
+export function catalogPreselectId(models: readonly Pick<SetupCatalogModel, 'id' | 'defaultForRole'>[], savedModelId?: string): string | undefined {
+  if (savedModelId !== undefined && models.some((m) => m.id === savedModelId)) return savedModelId;
+  return models.find((m) => m.defaultForRole)?.id ?? models[0]?.id;
+}
+
+/**
+ * CC-8 — the "configured model" free-text row's render predicate: true when
+ * the currently-configured Ollama model (`fim.model` / `rag.embedModel`)
+ * names something OUTSIDE the catalog (`:latest`-tolerant against every
+ * row's `ollamaTag`) — the signal FIM/RAG (T11/T14) use to render their own
+ * legacy free-text pull row above the catalog picker, wired to the existing
+ * `setup.pullModel` library tier (beta.5 capability preserved, unchanged).
+ */
+export function configuredModelOutsideCatalog(models: readonly Pick<SetupCatalogModel, 'ollamaTag'>[], configuredModel: string): boolean {
+  const trimmed = configuredModel.trim();
+  if (!trimmed) return false;
+  return !models.some((m) => m.ollamaTag !== undefined && ollamaTagsEqual(m.ollamaTag, trimmed));
+}
+
+/*
+ * §6 "Post-pull nudge (FIM ollama)" (beta.6 T11) — the FIM surface's OWN
+ * Ollama pull-success wording, passed to the block via `ollamaPullSuccessLabel`
+ * (the block never hardcodes a surface nudge) and reused verbatim by the
+ * CC-8 configured-model row's legacy pull. `FIM_OLLAMA_PULL_NUDGE` itself
+ * moved to the "§8 new/changed model-selection copy" section below (beta.6
+ * panel-fix PT3 CHANGED its text) — this comment stays here as the pointer
+ * so a T11-era reader isn't left looking for a declaration that's no longer
+ * on this line.
+ */
+
+/** §6 "llama.cpp FIM nudge" (beta.6 T11) — rendered by the FIM llama.cpp
+ *  pane once any FIM row is present in Talaria's model folder (the "what
+ *  next" line after a verified download). beta.6 panel-fix PT8 (audit A17,
+ *  critic C1-11): the pane already IS the llama.cpp Install pane — what the
+ *  user actually switches is the Connect/Install MODE toggle, not a
+ *  (nonexistent, from here) backend tab. */
+export const FIM_LLAMACPP_NUDGE = 'Then open the Connect tab and Apply.';
+
+/** §6 "Test button" — shared with the FIM Connect/Install tabs' own inline
+ *  usage; single-sourced here for the block. */
+export function testConnectionLabel(endpoint: string): string {
+  return `Test connection (${endpoint})`;
+}
+
+/** §6 "Serving line (post-Test)" — from the widened `setup.testRemote`
+ *  result's `models` (CC-2). */
+export function servingLine(models: readonly string[]): string {
+  return `Serving: ${models.join(', ')}`;
+}
+
+/** CC-9 — the exact `setup.cancel` payload shape for a catalog row's
+ *  in-flight pull/download, keyed by the SAME id used for progress (rule 7,
+ *  `progressKey('pull', catalogId)`). */
+export function cancelPullParams(catalogId: string): { op: 'pull'; id: string } {
+  return { op: 'pull', id: catalogId };
+}
+
+/** The block's own scoped `setup.recheck` payload — narrower than the full
+ *  `SetupMethod` param validation (T9), since the block only ever re-checks
+ *  the ONE backend pane it renders. */
+export function recheckScopeParams(scope: 'ollama' | 'llamacpp'): { scope: 'ollama' | 'llamacpp' } {
+  return { scope };
+}
+
+/**
+ * §6 "Provision modal — pinned" (ollama-ingest arm), reproduced VERBATIM
+ * from the host's `composePinnedOllamaModal` (`SetupController.ts` — not
+ * webview-safe, so not imported; same "reproduced here" discipline as
+ * `SetupCatalogModel` mirroring the host's `CatalogModel`). The ACTUAL modal
+ * is a native confirmation shown host-side before any download starts — this
+ * webview never renders it — so this function exists purely to keep the two
+ * verify-mode copies SINGLE-SOURCED and provably DISTINCT (§2.2.5 A-2: "T10
+ * must not collapse them"), for any future in-panel preview to reuse.
+ */
+export function provisionModalCopyPinned(displayName: string, approxBytes: number, hfRepo: string, endpoint: string): string {
+  return (
+    `Download '${displayName}' (~${(approxBytes / 1e9).toFixed(1)} GB) and install it into your local Ollama? ` +
+    `Source: huggingface.co/${hfRepo} — Syntinal's build converted from Sweep's official release. ` +
+    "Talaria verifies the file's checksum against its pinned value after downloading, " +
+    `and Ollama verifies it again during install at ${endpoint}.`
+  );
+}
+
+/** §6 "Provision modal — live-oid" (ollama-ingest arm), reproduced VERBATIM
+ *  from the host's `composeLiveOidOllamaModal` — see {@link provisionModalCopyPinned}'s
+ *  doc for why this is a reproduction, not an import. Deliberately the
+ *  WEAKER claim ("against the publisher's manifest", not "its pinned
+ *  value") — the honest basis for the allowlist tier (§2.2.5). */
+export function provisionModalCopyLiveOid(
+  displayName: string,
+  quant: string,
+  approxBytes: number,
+  hfRepo: string,
+  publisherName: string,
+  trustBasis: string,
+  endpoint: string,
+): string {
+  return (
+    `Download '${displayName}' (${quant}, ~${(approxBytes / 1e9).toFixed(1)} GB) from huggingface.co/${hfRepo}? ` +
+    `Publisher: ${publisherName} — ${trustBasis} ` +
+    "Talaria verifies the file's checksum against the publisher's manifest after downloading, " +
+    `and Ollama verifies it again during install at ${endpoint}.`
+  );
+}
+
+// --- beta.6 T12 (§3.1/§6): the Agent "Configure Local Agent Model" block ---
+
+/** The Agent block's backend union — structurally identical to
+ *  `localModel.tsx`'s `LocalModelBackend`, restated as a literal union here
+ *  because importing it would close a `setupCards ⇄ localModel` module cycle
+ *  (localModel imports THIS file). */
+export type AgentModelBackend = 'ollama' | 'llamacpp' | 'vllm';
+
+/** §6 "Agent block heading". */
+export const AGENT_BLOCK_HEADING = 'Configure Local Agent Model';
+
+/** §6 "Agent pre-ready note" (CC-7) — rendered whenever `agent.phase !==
+ *  'ready'`: model prep (pull/download/Test/Save) is Hermes-independent and
+ *  legitimately done first; only the PROVIDER step waits for the install. */
+export const AGENT_PRE_READY_NOTE =
+  "Hermes isn't installed yet — you can prepare the model now and configure the provider after the install.";
+
+/** §6 "Devstral default caption" (rev 3, agent picker) — rides the
+ *  `defaultForRole` row beside its `Default` chip. Agent-surface copy, NOT
+ *  emitted by the block itself (T10 report #4): passed via `rowCaption`. */
+export const AGENT_DEFAULT_MODEL_CAPTION = "Recommended — Talaria's agent pipeline is tuned on Devstral-24B (2507).";
+
+/** §6 "Run command caption (agent, pre-save)" — llama.cpp pane ONLY: the
+ *  in-row command is host-composed for the DEFAULT agent port (8013), and
+ *  Save recomposes `saved.runCommand` from the saved endpoint's port (CC-6).
+ *  Deliberately NOT rendered on the vLLM pane — `vllm serve {repo}` carries
+ *  no port for Save to update, so the caption would be a lie there. */
+export const AGENT_PRESAVE_RUN_COMMAND_CAPTION = 'Uses the default port — Save updates this command to your endpoint.';
+
+/** id → the model's VENDOR owner: its `vllm.serveRepo`'s owner segment — §5
+ *  pins serveRepo as the vendor's own official repo (with the two ledgered
+ *  vLLM-only exceptions, `openai`/`sweepai`, which are equally the VENDOR
+ *  orgs). Derived from the imported catalog, never the wire (the wire's vllm
+ *  cell is compose-time-gated and carries only a runCommand). */
+const CATALOG_VENDOR_OWNER: ReadonlyMap<string, string> = new Map(
+  MODEL_CATALOG.flatMap((m) => (m.vllm !== undefined ? [[m.id, m.vllm.serveRepo.split('/')[0] ?? ''] as const] : [])),
+);
+
+/**
+ * §3.1 A-F7 — the quiet `GGUF by {publisher}` caption for rows whose GGUF
+ * publisher ≠ the model's vendor (unsloth/ggml-org surfaced BEFORE the Tier-1
+ * modal, which still states the full trustBasis). Vendor-published rows
+ * (devstral→mistralai, ornith→ornith-ai) get nothing; an id outside the
+ * catalog (fixture rows) gets nothing — never a guess.
+ */
+export function ggufPublisherCaption(model: Pick<SetupCatalogModel, 'id' | 'publisher'>): string | undefined {
+  const vendor = CATALOG_VENDOR_OWNER.get(model.id);
+  if (vendor === undefined || vendor.toLowerCase() === model.publisher.toLowerCase()) return undefined;
+  return `GGUF by ${model.publisher}`;
+}
+
+/**
+ * The Agent picker's per-row caption (`LocalModelBlock`'s `rowCaption` slot):
+ * the `defaultForRole` row carries the §6 Devstral-recommended caption on
+ * EVERY pane (it recommends the MODEL, not a backend artifact); non-default
+ * rows carry the A-F7 GGUF-publisher caption on the llama.cpp pane only —
+ * the pane whose artifact that caption is about.
+ */
+export function agentRowCaption(
+  model: Pick<SetupCatalogModel, 'id' | 'publisher' | 'defaultForRole'>,
+  backend: AgentModelBackend,
+): string | undefined {
+  if (model.defaultForRole) return AGENT_DEFAULT_MODEL_CAPTION;
+  if (backend === 'llamacpp') return ggufPublisherCaption(model);
+  return undefined;
+}
+
+/**
+ * CC-6 — the Agent endpoint field's init value for one backend pane: the
+ * SAVED endpoint when the save names THIS backend, else the host-owned
+ * default for the pane. An absent `agentLocalModel` block degrades to an
+ * empty field — never a webview-fabricated URL (Global Constraint 1).
+ */
+export function agentEndpointInit(local: SetupData['agentLocalModel'], backend: AgentModelBackend): string {
+  const saved = local?.saved;
+  const savedEndpoint = saved !== undefined && saved.backend === backend ? saved.endpoint : '';
+  return savedEndpoint || local?.endpointDefaults[backend] || '';
+}
+
+/** §4.2 restoration — the initially-selected backend pane: `saved.backend`
+ *  when a save exists, else the ollama default. */
+export function agentInitialBackend(local: SetupData['agentLocalModel']): AgentModelBackend {
+  return local?.saved?.backend ?? 'ollama';
+}
+
+/** The collapsed saved-summary line (§4.2/CC-10) — same vocabulary as the
+ *  host's §6 save modal (`Set the local agent model to '{displayName}' via
+ *  {backend} at {endpoint}?`), so the summary reads as the modal's answer. */
+export function agentSavedSummaryLine(displayName: string, backend: string, endpoint: string): string {
+  return `${displayName} via ${backend} at ${endpoint}`;
+}
+
+// --- beta.6 T14 (§3.4/§6): the RAG "Configure embedding model" section -----
+
+/** The RAG section's backend union — the `talaria.rag.embedBackend` 3-enum
+ *  (T8's strict validation), NOT the block's: the third pane persists
+ *  `'openai-compat'` while rendering the block's vLLM pane
+ *  ({@link ragBlockBackend}). Restated rather than imported for the same
+ *  no-cycle reason as {@link AgentModelBackend}. */
+export type RagEmbedBackend = 'ollama' | 'llamacpp' | 'openai-compat';
+
+/** §4.2 restoration (CC-10): the section's initial pane — the saved
+ *  `rag.embedBackend` when the wire carries one, else the ollama default
+ *  (mirrors {@link agentInitialBackend}; an old-host wire simply omits the
+ *  field and degrades honestly). */
+export function ragInitialBackend(rag: Pick<SetupData['rag'], 'embedBackend'>): RagEmbedBackend {
+  return rag.embedBackend ?? 'ollama';
+}
+
+/** The pane→block mapping: `'openai-compat'` renders the block's vLLM pane
+ *  (§3.4 — Test + run command only; `setup.testRemote {backendId:'vllm'}`
+ *  probes `/v1/models`, exactly what any OpenAI-compatible embeddings
+ *  server answers — `src/rag/embedder.ts`'s own module doc grounds the
+ *  three backends sharing that one shape). */
+export function ragBlockBackend(backend: RagEmbedBackend): 'ollama' | 'llamacpp' | 'vllm' {
+  return backend === 'openai-compat' ? 'vllm' : backend;
+}
+
+/** §6 "llama.cpp RAG nudge" — rendered under the llama.cpp pane once any
+ *  embedding row is present (the `FIM_LLAMACPP_NUDGE` placement pattern),
+ *  AND reused as the Ollama rows' pull-success flash
+ *  (`ollamaPullSuccessLabel`): §6 pins no separate RAG ollama nudge, and
+ *  this same sentence is the true next step there too — a pull never writes
+ *  settings; Apply is the Tier-1 write (recorded T14 decision: one §6
+ *  string, two honest placements, never new copy). */
+export const RAG_APPLY_NUDGE = 'Then Apply the endpoint below.';
+
+/**
+ * T14 (§3.4): presence of the CONFIGURED embed model at the CONFIGURED
+ * endpoint — {@link catalogPresence}'s endpoint-scoped rule (C-6) over the
+ * free-text `rag.embedModel` (a bare library tag, so `ollamaTag` fits — the
+ * same shape the FIM configured-model row already uses). `'present'`/
+ * `'absent'` only when `rag.embedEndpoint` IS the endpoint `status()`
+ * actually probed; anything else — another daemon, daemon down — is
+ * honestly `'unknown'`, never the wrong daemon's answer. This derivation
+ * (not the wire's own presence boolean, which is host-probe-scoped and
+ * deprecated as of T14) feeds {@link ragDoneLine} and the card summary.
+ */
+export function ragEmbedPresence(
+  ollama: Pick<SetupData['ollama'], 'running' | 'endpoint' | 'models'>,
+  rag: Pick<SetupData['rag'], 'embedEndpoint' | 'embedModel'>,
+): NextPresence {
+  return catalogPresence(ollama, rag.embedEndpoint, { ollamaTag: rag.embedModel });
+}
+
+// --- beta.6 panel-fix PT3 (architecture doc T3, §8): pending-model pure ----
+// helpers + new FIM/RAG model-selection copy. FIM and RAG stay on DIFFERENT
+// models — nothing here converges the two; each caller builds its own key
+// and passes its own saved model.
+
+/**
+ * §8 — row-selection derived from the SAME install target `catalogPresence`
+ * already keys presence off (`ollamaCreatedName ?? ollamaTag`, via
+ * {@link catalogOllamaTarget}), `:latest`-tolerant via {@link ollamaTagsEqual}:
+ * keeps the picker's highlighted row and the free-text model field ONE
+ * derived state instead of two that can silently disagree. Empty/whitespace
+ * `model` -> `undefined` (nothing typed, nothing to match); no matching row
+ * -> `undefined` (a free-typed model outside the catalog, honestly
+ * unselected — never a guessed row).
+ */
+export function catalogRowIdForModel(
+  models: readonly Pick<SetupCatalogModel, 'id' | 'ollamaTag' | 'ollamaCreatedName'>[],
+  model: string,
+): string | undefined {
+  const trimmed = model.trim();
+  if (trimmed === '') return undefined;
+  return models.find((m) => {
+    const target = catalogOllamaTarget(m);
+    return target !== undefined && ollamaTagsEqual(target, trimmed);
+  })?.id;
+}
+
+/**
+ * The FIM/RAG Model field's keyed in-flight draft — the SAME `{key, value}`
+ * discipline as `SetupPanel.tsx`'s own `endpointKey`/`ep` state
+ * (`agentEndpointInit`'s caller, `:786-789`) and {@link DedicatedFormFieldState}
+ * above. `key` folds in whatever must reset the draft — the CALLER builds it
+ * (backend-agnostic here by design): FIM uses `` `${selectedId}|${savedModel}` ``,
+ * RAG uses `` `${pane}|${savedModel}` `` — so a backend/pane switch AND a
+ * saved-value move (Apply landing, an external settings edit) both change
+ * the key and both reconcile, while an in-flight draft at the SAME
+ * backend/pane and SAME saved value survives an unrelated re-render.
+ */
+export interface PendingModelState {
+  key: string;
+  value: string;
+}
+
+export function initPendingModel(key: string, saved: string): PendingModelState {
+  return { key, value: saved };
+}
+
+/**
+ * A no-op while `key` hasn't moved since the last reconcile — the same
+ * identity-preserving rule as {@link reconcileDedicatedFormFields} (`result
+ * === state`, so an in-flight edit survives an unrelated re-render); resets
+ * the draft to `saved` the moment `key` has moved.
+ */
+export function reconcilePendingModel(state: PendingModelState, key: string, saved: string): PendingModelState {
+  if (key === state.key) return state;
+  return initPendingModel(key, saved);
+}
+
+/**
+ * §8 — whether the FIM Connect/Install surface should render a Model field
+ * at all: `false` for `'llamacpp'` (its native `/infill` request carries NO
+ * model name — a field there would be a fake affordance); `true` for every
+ * other FIM backend (ollama/vllm/codestral/openai-compat all send a model
+ * name in the request body). `backendId` is a plain string (the wire's
+ * `SetupBackendOption.id`, not a closed union) — any id other than the one
+ * known no-model-name backend is visible.
+ */
+export function fimModelFieldVisible(backendId: string): boolean {
+  return backendId !== 'llamacpp';
+}
+
+/**
+ * §8 — the RAG embedder section's endpoint field init for one pane: the
+ * SAVED `embedEndpoint` when `pane` IS the saved backend (the `?? 'ollama'`
+ * fallback is REQUIRED — an old-host wire without `embedBackend` must still
+ * init the ollama pane from the always-present saved endpoint, mirroring
+ * {@link ragInitialBackend}'s own default), else that pane's own host-owned
+ * default (`rag.endpointDefaults`, always populated post-PT2; `?.` stays
+ * required by the type for an old-host wire that predates the field
+ * entirely).
+ */
+export function ragEndpointInit(
+  rag: Pick<SetupData['rag'], 'embedBackend' | 'embedEndpoint' | 'endpointDefaults'>,
+  pane: RagEmbedBackend,
+): string {
+  if (pane === (rag.embedBackend ?? 'ollama')) return rag.embedEndpoint;
+  return rag.endpointDefaults?.[pane] ?? '';
+}
+
+/**
+ * §8 — the "you picked a model but haven't saved it" line, rendered under
+ * the catalog picker on both surfaces the moment a row is selected but no
+ * Apply has run yet. Each surface names its OWN save action (`fim`: the
+ * Connect tab's Apply; `rag`: the section's own Apply) — deliberately two
+ * templates, not one generic sentence, so the caption always names the
+ * button that is actually there.
+ */
+export function pendingSelectionLine(surface: 'fim' | 'rag', model: string): string {
+  return surface === 'fim'
+    ? `Selected: ${model} — not saved yet. Apply on the Connect tab saves it.`
+    : `Selected: ${model} — not saved yet. Apply below saves it.`;
+}
+
+/** §8 — shared backend-id -> display-name map, consumed by the saved
+ *  summary line and the Agent block's backend tabs (`SetupPanel.tsx:864`'s
+ *  inline ternary, folded in by a later task). */
+export const BACKEND_DISPLAY: Record<'ollama' | 'llamacpp' | 'vllm' | 'openai-compat', string> = {
+  ollama: 'Ollama',
+  llamacpp: 'llama.cpp',
+  vllm: 'vLLM',
+  'openai-compat': 'OpenAI-compatible',
+};
+
+/** §8 — the RAG card's third tab label: `'openai-compat'` renders the
+ *  block's vLLM pane ({@link ragBlockBackend}), so its tab must name BOTH
+ *  routes it actually offers (Test + run command against either kind of
+ *  server) — kept a DISTINCT named constant, deliberately NOT folded into
+ *  {@link BACKEND_DISPLAY} (flattening it would hide the affordance). */
+export const RAG_THIRD_TAB_LABEL = 'vLLM / OpenAI-compatible';
+
+// --- §8 new/changed model-selection copy (FIM/RAG surfaces, placed by later tasks) --
+
+/** §8 "FIM Ollama pull nudge" — CHANGED (beta.6 panel-fix): now names the
+ *  row-selection this pull ALSO performs ({@link catalogRowIdForModel}), not
+ *  just the download. */
+export const FIM_OLLAMA_PULL_NUDGE =
+  '✓ Downloaded and selected — Apply on the Connect tab saves it as your autocomplete model.';
+
+/** §8 "RAG Ollama pull nudge" — NEW: the RAG surface's own pull-success
+ *  wording (parallel to {@link FIM_OLLAMA_PULL_NUDGE}, distinct verb —
+ *  "embedding model", not "autocomplete model"). */
+export const RAG_OLLAMA_PULL_NUDGE = '✓ Downloaded and selected — Apply below saves it as your embedding model.';
+
+/** §8 "FIM Connect-tab pending caption" — NEW: the short inline caption next
+ *  to a picked-but-unsaved model on the Connect tab (distinct placement from
+ *  {@link pendingSelectionLine}'s full sentence, same fact). */
+export const FIM_PENDING_CAPTION = 'not saved yet';
+
+/** §8 "FIM Model field caption" — NEW. */
+export const FIM_MODEL_FIELD_CAPTION = 'Used for inline completions — separate from the embedding model.';
+
+/** §8 "RAG Model field caption" — NEW. */
+export const RAG_MODEL_FIELD_CAPTION = 'Used to index your codebase — separate from the autocomplete model.';
+
+/** §8 "FIM llama.cpp model note" — NEW: rendered in place of the (hidden,
+ *  {@link fimModelFieldVisible}) Model field on the FIM llama.cpp pane. */
+export const FIM_LLAMACPP_MODEL_NOTE =
+  'llama.cpp serves the model you start llama-server with — no model name is sent.';
+
+/** §8 "RAG llama.cpp model note" — NEW: the RAG surface's own llama.cpp
+ *  no-model-name honesty line (parallel to {@link FIM_LLAMACPP_MODEL_NOTE}). */
+export const RAG_LLAMACPP_MODEL_NOTE =
+  'llama.cpp embeds with the model the server was started with — this name is not used to pick it.';
+
+/** §8 "FIM Model field label" — NEW. */
+export const FIM_MODEL_FIELD_LABEL = 'Model';
+
+/** §8 "RAG Model field label" — NEW. */
+export const RAG_MODEL_FIELD_LABEL = 'Embedding model';
+
+// ---------------------------------------------------------------------------
+// beta.6 T18 (§3.5/§6): start-screen model recommendations —
+// `RecommendationsBlock`'s pure derivation. Two homes share this rule: the
+// Setup panel's dynamic strip (this module + `SetupPanel.tsx`'s
+// `RecommendationsBlock`) and the static walkthrough markdown (locked
+// against `MODEL_CATALOG` by `src/host/walkthroughRecs.test.ts`, a SEPARATE
+// anchor-based parser — deliberately not sharing code with this module,
+// since one side is host-static-markdown and the other is webview-runtime).
+//
+// B-F1 (load-bearing): every model NAME and NUMBER below is INTERPOLATED
+// from the wire's `SetupCatalogModel` rows — this module owns no catalog
+// facts of its own. Only frame text (labels, punctuation, the tier-bucket
+// prose) is §6-static. `SetupPanel.test.ts`'s scoped source-scan enforces
+// this over `setupCards.ts` + `SetupPanel.tsx` (zero hardcoded byte counts
+// or display-name phrases).
+// ---------------------------------------------------------------------------
+
+/** B-F3 — the pinned "24 GB card, ~22 GiB usable" constant the stack line's
+ *  `{left}` and the meter's track both derive from. */
+export const USABLE_VRAM_24GB_GIB = 22;
+
+const BYTES_PER_GIB = 2 ** 30;
+
+/** §6 rounding rule, core primitive: round-HALF-UP to 1 decimal place. Plain
+ *  `Math.round` already rounds ties toward +Infinity for positive inputs
+ *  (every value this module ever rounds), which IS half-up. */
+function roundHalfUp1dp(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+/** §6 rounding rule: `GiB = bytes / 2^30`, 1 decimal, half-up — computed
+ *  from EXACT wire bytes only, never from an already-rounded value. */
+export function roundGiB(bytes: number): number {
+  return roundHalfUp1dp(bytes / BYTES_PER_GIB);
+}
+
+/** {@link roundGiB}, formatted for display — always exactly one decimal
+ *  (`toFixed(1)`), so a whole-GiB value still prints e.g. `'2.0'`, never `'2'`. */
+export function formatGiB(bytes: number): string {
+  return roundGiB(bytes).toFixed(1);
+}
+
+export const RECS_STRIP_HEADING = 'Recommended local models';
+export const RECS_STRIP_INTRO =
+  'Pick by your GPU — sizes are the download; running adds context memory + ~2 GiB buffers.';
+export const RECS_DISCLOSURE_SUMMARY = 'What fits my hardware?';
+/** §6 MoE honesty note — the same sentence `modelCatalog.ts`'s
+ *  `MOE_HONESTY_NOTE` carries per-row; restated here as static §6 frame text
+ *  (the `<details>` block is not tied to any one wire row), never a second
+ *  paraphrase. */
+export const RECS_MOE_NOTE =
+  'MoE ≠ smaller: a 35B MoE still needs ~20 GiB for weights — only compute is light (~3B active per token).';
+
+/** Exported so `SetupPanel.tsx`'s `RecommendationsBlock` can build a
+ *  per-role accessible name for its four identical-text `Set up →`
+ *  buttons without a second copy of this map. */
+export const RECS_ROLE_LABEL: Record<SetupCatalogModel['role'], string> = {
+  agent: 'Agent',
+  fim: 'FIM',
+  embedding: 'Embedder',
+  next: 'NEXT',
+};
+
+/** B-F6 jump targets — `SetupPanel.tsx`'s four cards each carry one of these
+ *  as their `<Card id>`, with `${id}-heading` on the focusable heading. */
+const RECS_ROLE_CARD_ID: Record<SetupCatalogModel['role'], string> = {
+  agent: 'setup-card-agent',
+  fim: 'setup-card-fim',
+  embedding: 'setup-card-embedding',
+  next: 'setup-card-next',
+};
+
+/** One recs-strip role line's resolved, already-rounded facts (B-F5). */
+export interface RoleRec {
+  role: SetupCatalogModel['role'];
+  /** B-F6 jump target — the owning card's container id. */
+  cardId: string;
+  displayName: string;
+  /** EXACT default-path/Ollama-tier bytes (`ollamaApproxBytes`) — the stack
+   *  line's sum is computed from THESE, never from rounded parts. */
+  bytes: number;
+  /** {@link formatGiB} of `bytes` — the role line's `{size}`. */
+  sizeGiB: string;
+  vramLine: string;
+  /** B-F5: the llama.cpp tier's rounded GiB, present ONLY when it differs
+   *  from `sizeGiB` after rounding (not merely a differing raw byte count). */
+  divergenceGiB?: string;
+  /** ONLY meaningful for `role === 'next'` — mirrors the NEXT card's own
+   *  `nextEdit.dedicated.downloadReady` wire truth. `undefined` for the
+   *  other three roles (their `Default` chip always shows). While `false`,
+   *  the strip renders the NEXT card's own fail-closed text instead of the
+   *  `Default` chip — NEVER "recommended" for an unpinned model (§3.5). */
+  nextReady?: boolean;
+}
+
+/** B-F5: `{size}` = the row's default-path/Ollama-tier bytes (`ollamaApproxBytes`
+ *  — already uniform across the library/hf-ingest tiers at the host, per
+ *  `SetupController.ts`'s wire projection). `undefined` when that byte count
+ *  is missing — a defaultForRole row with no truthful size does not "resolve"
+ *  (B-F7). */
+function baseRoleRec(row: SetupCatalogModel): RoleRec | undefined {
+  const bytes = row.ollamaApproxBytes;
+  // A12 (queued #4): a NaN/negative/zero byte count must gate the strip off
+  // exactly like a missing one — never let a non-finite or non-positive
+  // value reach `formatGiB` and print "~NaN GB" / "~0 GB".
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return undefined;
+  const sizeGiB = formatGiB(bytes);
+  const llamacppBytes = row.llamacpp?.approxBytes;
+  const llamacppGiB = llamacppBytes !== undefined ? formatGiB(llamacppBytes) : undefined;
+  return {
+    role: row.role,
+    cardId: RECS_ROLE_CARD_ID[row.role],
+    displayName: row.displayName,
+    bytes,
+    sizeGiB,
+    vramLine: row.vramLine,
+    divergenceGiB: llamacppGiB !== undefined && llamacppGiB !== sizeGiB ? llamacppGiB : undefined,
+  };
+}
+
+function findDefaultRow(
+  models: readonly SetupCatalogModel[],
+  role: SetupCatalogModel['role'],
+): SetupCatalogModel | undefined {
+  return models.find((m) => m.role === role && m.defaultForRole === true);
+}
+
+function findRow(
+  models: readonly SetupCatalogModel[],
+  role: SetupCatalogModel['role'],
+  id: string,
+): SetupCatalogModel | undefined {
+  return models.find((m) => m.role === role && m.id === id);
+}
+
+/** §6 role-line TEMPLATE: `{Role} · {displayName} — {size} GiB`. */
+export function roleLineText(rec: RoleRec): string {
+  return `${RECS_ROLE_LABEL[rec.role]} · ${rec.displayName} — ${rec.sizeGiB} GiB`;
+}
+
+/** §6 divergence caption, present only where {@link baseRoleRec} found the
+ *  two tiers' ROUNDED sizes actually differ. */
+export function divergenceCaptionText(rec: RoleRec): string | undefined {
+  return rec.divergenceGiB !== undefined ? `llama.cpp build differs: ${rec.divergenceGiB} GiB` : undefined;
+}
+
+/** The stack line's shared numbers (B-F1/B-F3) — sum and leftover, each
+ *  rounded ONCE from an exact byte quantity (never summed from
+ *  already-rounded parts, per the §6 rounding rule). */
+export interface StackRec {
+  sumGiB: string;
+  leftGiB: string;
+}
+
+function stackRecommendation(agent: RoleRec, fim: RoleRec, embedding: RoleRec): StackRec {
+  const exactSumBytes = agent.bytes + fim.bytes + embedding.bytes;
+  const sumGiBExact = exactSumBytes / BYTES_PER_GIB;
+  const leftGiBExact = USABLE_VRAM_24GB_GIB - sumGiBExact;
+  return {
+    sumGiB: roundHalfUp1dp(sumGiBExact).toFixed(1),
+    leftGiB: roundHalfUp1dp(Math.max(0, leftGiBExact)).toFixed(1),
+  };
+}
+
+/** §6 stack-line TEMPLATE — interpolated from the three non-NEXT
+ *  `defaultForRole` rows; `{left}` is anchored to {@link USABLE_VRAM_24GB_GIB}
+ *  (B-F3), the 45K figure is derivation-anchored prose (Part 0.2), not a
+ *  computed value. */
+export function stackLineText(agent: RoleRec, fim: RoleRec, embedding: RoleRec, stack: StackRec): string {
+  return (
+    `A 24 GB GPU runs the full stack: ${agent.displayName} (${agent.sizeGiB} GiB) + ` +
+    `${fim.displayName} (${fim.sizeGiB} GiB) + ${embedding.displayName} (${embedding.sizeGiB} GiB) ` +
+    `≈ ${stack.sumGiB} GiB — about ${stack.leftGiB} GiB left for context ` +
+    `(roughly 45K tokens at fp16 KV — see Part 0.2's fit model).`
+  );
+}
+
+/** One segment of the stack meter — the signature element (§3.5): a single
+ *  segmented bar sharing the stack line's own rounded numbers, never a
+ *  second derivation. `pct` is against the {@link USABLE_VRAM_24GB_GIB}
+ *  track. */
+export interface MeterSegment {
+  role: 'agent' | 'fim' | 'embedding';
+  pct: number;
+}
+
+export function meterSegments(agent: RoleRec, fim: RoleRec, embedding: RoleRec): MeterSegment[] {
+  return [
+    { role: 'agent', pct: (Number(agent.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'fim', pct: (Number(fim.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'embedding', pct: (Number(embedding.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
+  ];
+}
+
+/** The `<details>` tier lines (B-F1/B-F4) — frame text is §6-static, every
+ *  model name interpolated from the wire. `tier1216` degrades gracefully
+ *  (never a crash, never a literal `undefined`) when the two non-default
+ *  reference rows (`qwen25-coder-7b`, `gpt-oss-20b`) are absent from a
+ *  partial wire fixture — production always ships all 13 rows. */
+export interface RecsTiers {
+  tier8: string;
+  tier1216: string;
+  tier24: string;
+  tier32: string;
+}
+
+const RECS_TIER_1216_FALLBACK = '12–16 GB: larger FIM tiers; at 16 GB: larger agent tiers (tight)';
+
+function recsTiers(models: readonly SetupCatalogModel[], fimDefault: RoleRec, agentDefault: RoleRec): RecsTiers {
+  const fim7b = findRow(models, 'fim', 'qwen25-coder-7b');
+  const gptOss = findRow(models, 'agent', 'gpt-oss-20b');
+  return {
+    tier8: `~8 GB: ${fimDefault.displayName} · all embedders — agent models need more`,
+    tier1216:
+      fim7b && gptOss
+        ? `12–16 GB: + ${fim7b.displayName}; at 16 GB: ${gptOss.displayName} (tight)`
+        : RECS_TIER_1216_FALLBACK,
+    tier24: `24 GB: any single agent model — ${agentDefault.displayName} is the sweet spot; MoE 35Bs need CPU-offload`,
+    tier32: '32 GB+: everything, incl. MoE 35Bs fully resident',
+  };
+}
+
+/** The recs strip's full derived payload (B-F1/B-F7). */
+export interface RecommendationsData {
+  agent: RoleRec;
+  fim: RoleRec;
+  embedding: RoleRec;
+  next: RoleRec;
+  stack: StackRec;
+  tiers: RecsTiers;
+}
+
+/**
+ * B-F7 render gate: `undefined` unless `catalog` is present AND all four
+ * `defaultForRole` rows resolve (role present + a positive `ollamaApproxBytes`
+ * to print) — the ONLY thing `RecommendationsBlock` checks before deciding
+ * whether to render anything at all.
+ */
+export function deriveRecommendations(
+  setup: Pick<SetupData, 'catalog' | 'nextEdit'>,
+): RecommendationsData | undefined {
+  const models = setup.catalog?.models;
+  if (!models) return undefined;
+
+  const agentRow = findDefaultRow(models, 'agent');
+  const fimRow = findDefaultRow(models, 'fim');
+  const embeddingRow = findDefaultRow(models, 'embedding');
+  const nextRow = findDefaultRow(models, 'next');
+  if (!agentRow || !fimRow || !embeddingRow || !nextRow) return undefined;
+
+  const agent = baseRoleRec(agentRow);
+  const fim = baseRoleRec(fimRow);
+  const embedding = baseRoleRec(embeddingRow);
+  const nextBase = baseRoleRec(nextRow);
+  if (!agent || !fim || !embedding || !nextBase) return undefined;
+
+  const next: RoleRec = { ...nextBase, nextReady: setup.nextEdit.dedicated?.downloadReady === true };
+
+  return {
+    agent,
+    fim,
+    embedding,
+    next,
+    stack: stackRecommendation(agent, fim, embedding),
+    tiers: recsTiers(models, fim, agent),
+  };
 }

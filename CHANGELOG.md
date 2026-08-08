@@ -9,6 +9,116 @@ Talaria Code is **local-first**, licensed **GPL-3.0-or-later**, targets
 
 ---
 
+## v0.1.3-beta.6 — 2026-08-08
+
+Local-model onboarding drop. beta.5 fixed setup one surface at a time; beta.6
+replaces those point-fixes with **one coherent way to configure a local model**
+across every role the extension uses — the agent, autocomplete, next-edit, and
+the codebase index — backed by a fixed catalog of curated models and a
+verified-download tier from a small, named publisher allowlist. It also closes
+the panel gap where downloading a model didn't actually let you *select* it, and
+tightens honesty throughout — all under the same verified-sources-only rule as
+beta.5.
+
+### Unified "Configure local model"
+
+- **One setup component, four surfaces.** Agent, Autocomplete (FIM), Next-Edit,
+  and Codebase index (RAG) now share the same flow: pick a backend
+  (**Ollama** / **llama.cpp** / **vLLM**), see whether it's installed, see which
+  model is present, download and verify it, and test the endpoint — the same
+  affordances everywhere, and idempotent (a model already present shows a green
+  line, not a download button).
+- **New: a local agent model.** The Agent card gains a **"Configure Local Agent
+  Model"** picker — six agent models to choose from, with **Devstral-24B (2507)**
+  as the recommended default. You can prepare the model before Hermes is even
+  installed; once it is, the card points you to the exact provider settings to
+  finish wiring it up.
+- **Start-screen recommendations.** The setup walkthrough and panel now suggest a
+  model stack sized to your hardware — what fits your GPU (from ~8 GB up to
+  32 GB+), the verified 24 GB working stack, and an honest note that a
+  mixture-of-experts model isn't smaller on disk just because fewer parameters
+  are active per token.
+- **A fixed, curated catalog.** Thirteen models across the four roles, each with
+  its size, context window, and a plain VRAM-fit line. The catalog is the *only*
+  source of an automated download; an unknown model is refused rather than
+  fetched.
+
+### Verified downloads, trusted publishers
+
+- **Downloads come only from a named, seven-publisher allowlist** — Qwen,
+  Mistral AI, Google, DeepReinforce (Ornith), ggml.ai (llama.cpp), Unsloth, and
+  our own Syntinal account — never an unaudited community re-upload. Each
+  publisher carries an honest one-line trust basis, shown in the confirmation
+  dialog before anything downloads.
+- **Every download is integrity-checked before it is used.** Talaria hashes the
+  received bytes and checks them against the publisher's own published checksum
+  (SHA-256); llama.cpp files are written to a temporary file in the destination
+  folder and renamed into place atomically, with a small attestation recorded
+  next to them; Ollama verifies the digest again as it ingests the file.
+- **Presence is reported honestly.** A model reads *present* only when it is
+  genuinely on the server or in the folder Talaria actually probed — never
+  inferred from a default it might not match.
+- **Devstral-24B (2507) is the default agent model on both Ollama and
+  llama.cpp**, installed through the verified download so it's the same 2507 build
+  everywhere. Talaria deliberately does **not** use Ollama's plain `devstral`
+  library tag — that tag is still the older 2505 build — so the version can't
+  quietly drift between backends.
+- **vLLM is treated honestly.** For a vLLM target Talaria composes the
+  `vllm serve` command but downloads nothing itself — vLLM fetches the weights —
+  so its integrity basis is the publisher's repo identity over TLS, and that
+  weaker basis is stated plainly. Two named repositories (the official upstream
+  Sweep model and gpt-oss) are the *only* serve targets allowed from outside the
+  download allowlist, recorded as explicit exceptions.
+- **llama.cpp autocomplete uses base-model builds** — Q8 packages from ggml.ai,
+  the llama.cpp project's own packaging of the base model. An instruct-tuned GGUF
+  remains a documented manual fallback if you prefer one.
+
+### Select and apply a model in the panel
+
+- **Picking or downloading a model now actually selects it.** On Autocomplete and
+  Codebase index, choosing a model row — or finishing a download — marks it as
+  your pending choice with a *"not saved yet"* line; pressing **Apply** then saves
+  the endpoint **and** the model together, and the confirmation names both.
+  Previously a download changed nothing about which model was used.
+- **Autocomplete and the codebase index keep separate models — by design.** They
+  are different jobs, so they never share a model; nothing lets one card
+  overwrite the other's setting. (Typed free-text model names still work; the one
+  honest exception is the llama.cpp completion server, which serves whatever you
+  launched it with and says so instead of showing a model box.)
+- **Each embedding backend remembers its own endpoint.** Switching the
+  Codebase-index tab to llama.cpp no longer risks saving Ollama's port as a
+  llama.cpp endpoint — every tab shows the right default for its backend.
+- **The "it's working" lines are honest.** *"Autocomplete is active"* and
+  *"Codebase index is ready"* now appear only when the model is genuinely present
+  on the configured server, not merely because a setting is filled in.
+- **Clearer copy.** The "no vetted build yet" message now names what to do by
+  function — the vLLM backend in the dedicated Next-Edit setup, or Generic mode —
+  instead of pointing "below" at instructions that no longer exist; there's one
+  check-mark per line (no doubled ✓); commands carry a **"Start the server:"**
+  caption; every Test button names the address it tests; and internal names like
+  `llamacpp` display as **llama.cpp**.
+- **Confirmation dialogs can't be forged.** Every free-text or saved value shown
+  in a confirmation popup is sanitized so it can't smuggle in extra lines.
+
+### Known residuals (honest limits of this build)
+
+- **The dedicated Sweep Next-Edit download is still disabled.** Our vetted build
+  of that model isn't published yet, so its integrity pin is empty and the
+  fail-closed gate keeps **both** the download button **and** the guided
+  `llama.cpp` line off. The card says so and offers the **vLLM** path (official
+  Sweep release) instead; it lights up in a later drop once the build ships and
+  its checksum is filled. (Carried forward from beta.5.)
+- **The model catalog is final for this release.** Its download sources,
+  publishers, and per-role defaults are locked; adding a model or a publisher is
+  a deliberate, reviewed change in a future drop.
+
+### Requirements (unchanged)
+
+Linux (developed on Fedora) · VS Code `^1.125` · Python **3.11–3.13** + `pipx` ·
+a local model runtime (Ollama / vLLM / llama.cpp). License: **GPL-3.0-or-later**.
+
+---
+
 ## v0.1.2-beta.5 — 2026-08-06
 
 Setup-hardening drop. The beta.4 Fedora live test exposed a batch of setup-flow

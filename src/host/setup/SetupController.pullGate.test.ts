@@ -157,6 +157,18 @@ function makeGateController(opts: { tree?: unknown; treeStatus?: number } = {}):
       emitIngestProgress.fn = onProgress;
       if (ingestBehavior.reject) throw ingestBehavior.reject;
     },
+    // T7 (beta.6): the legacy pull-gate suite never provisions by catalog id
+    // — fails closed if ever reached.
+    resolveLfsOid: async () => ({ ok: false, reason: 'not used here' }),
+    // T6 (beta.6): the pull-gate suite never calls status() — these exist
+    // only to satisfy the deps shape (and to fail loudly if ever reached).
+    locateLlamaServer: () => new Promise<never>(() => {}),
+    scanStorePresence: async () => new Map<string, boolean>(),
+    storeDest: () => ({ ok: false, reason: 'not used here' }),
+    checkedStoreDest: async () => ({ ok: false, reason: 'not used here' }),
+    downloadGgufToStore: async () => {
+      throw new Error('not used here');
+    },
   };
   const controller = new SetupController(host, deps);
   return { host, controller, calls, ingestArgs, emitIngestProgress, ingestBehavior };
@@ -208,7 +220,7 @@ describe('T13 vetted-ingest branch (§4.4.3, published pin)', () => {
     expect(ingestArgs).toEqual([
       {
         spec: { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: CREATED },
-        endpoint: 'http://127.0.0.1:11434',
+        endpoint: 'http://127.0.0.1:11434/',
       },
     ]);
   });

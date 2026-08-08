@@ -130,14 +130,33 @@ const EGRESS_DESTINATION_EXCEPTIONS = new Set<string>([
  */
 const MODEL_INTEGRITY_PATTERN = /model/i;
 
+/**
+ * beta.6 T8: `talaria.agent.localModel.backend`/`.endpoint` match
+ * `MODEL_INTEGRITY_PATTERN` only because they live under the `localModel`
+ * NAMESPACE segment (architecture-pinned key shape,
+ * `beta6-unified-local-model-onboarding-architecture.md` §2.5) — neither is
+ * itself a model-IDENTIFIER key the way `autocomplete.model`/`nextEdit.
+ * model`/`rag.embedModel` are (their OWN leaf concept is "which backend" /
+ * "which URL"). Both are already required machine-scoped by
+ * `EGRESS_DESTINATION_PATTERN` (they match on `backend`/`endpoint`) — this
+ * exception only removes the REDUNDANT model-integrity classification so
+ * the two-pattern disjointness check below stays meaningful; it does not
+ * relax either key's actual machine-scope requirement.
+ * `talaria.agent.localModel.modelId` is NOT excepted — it IS a genuine
+ * model-identifier key, same as its `autocomplete.model`/`nextEdit.model`/
+ * `rag.embedModel` siblings.
+ */
+const MODEL_INTEGRITY_EXCEPTIONS = new Set<string>([
+  'talaria.agent.localModel.backend',
+  'talaria.agent.localModel.endpoint',
+]);
+
 function eligibleFor(pattern: RegExp, exceptions: ReadonlySet<string>) {
   return (props: Record<string, ConfigProperty>): string[] =>
     Object.keys(props)
       .filter((key) => pattern.test(key))
       .filter((key) => !exceptions.has(key));
 }
-
-const EMPTY_EXCEPTIONS = new Set<string>();
 
 describe('LOCK: every egress-DESTINATION-steering setting is machine-scoped (I-2: open-ended pattern, not a fixed list)', () => {
   const eligibleKeys = eligibleFor(EGRESS_DESTINATION_PATTERN, EGRESS_DESTINATION_EXCEPTIONS);
@@ -213,7 +232,7 @@ describe('LOCK: every egress-DESTINATION-steering setting is machine-scoped (I-2
 });
 
 describe('LOCK: every model-integrity setting is machine-scoped (I-1/I-3: a separate rationale from egress-destination)', () => {
-  const eligibleKeys = eligibleFor(MODEL_INTEGRITY_PATTERN, EMPTY_EXCEPTIONS);
+  const eligibleKeys = eligibleFor(MODEL_INTEGRITY_PATTERN, MODEL_INTEGRITY_EXCEPTIONS);
 
   it('every model-named key is scope: "machine"', () => {
     const props = configurationProperties();

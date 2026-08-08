@@ -1,7 +1,7 @@
 import { homedir } from 'node:os';
 import { NEXT_DEDICATED_MODEL } from './registry';
 import type { BackendDescriptor, InstallRecipe, ProbeSpec } from './registry';
-import type { HfDigestVerdict, HfGgufSpec } from './hfDigest';
+import type { HfDigestVerdict, HfGgufSpec, LfsOidVerdict } from './hfDigest';
 import { isLoopbackHost } from '../../autocomplete/backends/secureTransport';
 import { managerFor, parseOsRelease, resolveDistroFamily } from './osDetect';
 import type { DistroFamily, OsRelease, PackageManager } from './osDetect';
@@ -11,8 +11,20 @@ import type { HermesPaths, InstallEvent } from './pipxInstaller';
 import type { OllamaStatus, PullProgress } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
 import { validateEndpointUrl } from './remoteProbe';
+import { MODEL_CATALOG, TRUSTED_HF_PUBLISHERS, VLLM_ONLY_SERVE_REPOS, assertCatalogSource } from './modelCatalog';
+import type { CatalogGguf, CatalogModel, CatalogRole, TrustedPublisher } from './modelCatalog';
+import type { LlamaCppLocateResult } from './llamaCppLocator';
+import type { GgufDestResult } from './modelStore';
+import type { GgufStoreSpec } from './ggufIngest';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
-import type { AgentSetupPhase, SetupBackendOption, SetupData, SetupMethod, SetupProgress } from '../../shared/protocol';
+import type {
+  AgentSetupPhase,
+  SetupBackendOption,
+  SetupCatalogModel,
+  SetupData,
+  SetupMethod,
+  SetupProgress,
+} from '../../shared/protocol';
 
 /**
  * SetupController — the host-side brain for Setup / Talaria Config
@@ -193,7 +205,11 @@ export interface GgufIngestSpec {
     quant: string;
     sha256: string;
     approxBytes: number;
-    allowedRepoFiles: readonly string[];
+    /** T3 (beta.6 §2.4): optional — meaningful only in `pinned` mode (the
+     *  pinned llama.cpp/Ollama path passes it for `verifyHfDigest`'s exact-
+     *  file-set check upstream of `ingestGguf`; `live-oid` mode passes
+     *  none, since nothing else in the repo is ever read for that file). */
+    allowedRepoFiles?: readonly string[];
   };
   ollamaCreatedName: string;
 }
@@ -270,6 +286,19 @@ export interface SetupControllerDeps {
    */
   verifyHfDigest(gguf: HfGgufSpec): Promise<HfDigestVerdict>;
   /**
+   * T2→T7 (beta.6 §2.2.5, carried obligation T2-N1): the `live-oid` resolver
+   * for the allowlist tier — bound to the real
+   * `resolveLfsOid(fetch, hfRepo, file)` (`src/host/setup/hfDigest.ts`) by
+   * the caller. Resolves ONE file's live `lfs.oid` (lfs-only, 10 s,
+   * pagination-refuse, 64-hex shape assert). ⚠ `resolveLfsOid` does NOT
+   * re-assert the charset of its inputs — the controller MUST pass strings
+   * that already cleared {@link assertProvisionSources} (SC-1,
+   * assert-before-resolve ordering; spy-order-locked by the T7 poisoned-
+   * fixture tests). ANY `{ok:false}` (or a rejecting seam) maps to the one
+   * pinned integrity refusal BEFORE the Tier-1 modal.
+   */
+  resolveLfsOid(hfRepo: string, file: string): Promise<LfsOidVerdict>;
+  /**
    * T13 → T14 (beta.5 §4.4.3d): the digest-enforced ingest engine —
    * stream-download to a temp file hashing incrementally, refuse on byte
    * mismatch BEFORE any Ollama call, then `POST /api/blobs/sha256:{pin}`
@@ -282,6 +311,56 @@ export interface SetupControllerDeps {
   ingestGguf(
     spec: GgufIngestSpec,
     endpoint: string,
+    onProgress: (p: PullProgress) => void,
+    signal: AbortSignal,
+  ): Promise<void>;
+  /**
+   * T6 (beta.6 §2.4/§2.5): the T5 `llama-server` locator, bound to
+   * `locateLlamaServer(exec, signal)` by the caller. The binding NEVER
+   * probes on win32 — it resolves `{ok:false, reason:'probe-timeout'}`
+   * there, which this controller maps (like every probe-timeout) to the
+   * honest wire state `'unknown'`, never `'missing'` (CC-5). The `signal`
+   * is each probe attempt's own — a scoped `setup.recheck
+   * {scope:'llamacpp'}` aborts the superseded attempt through it.
+   */
+  locateLlamaServer(signal?: AbortSignal): Promise<LlamaCppLocateResult>;
+  /**
+   * T6 (beta.6 §2.2.8): ONE sidecar-attested presence scan over the whole
+   * `MODEL_CATALOG` — bound to `modelStore.scanPresence(io, MODEL_CATALOG)`
+   * over the real fs/env seams by the caller. Keyed by catalog id; a row
+   * absent from the map reads as not-present. Awaited inside `status()`
+   * BEFORE the CR-002 synchronous tail (a cheap stat pass — §2.5); a
+   * rejection is caught by {@link SetupController.safeScanStorePresence}
+   * and degrades fail-closed to all-absent.
+   */
+  scanStorePresence(): Promise<ReadonlyMap<string, boolean>>;
+  /**
+   * T6 (beta.6 §2.5): READ-ONLY store-dest composition (`storeRoot` +
+   * `ggufDest` over the real env) — used solely to compose the display
+   * `runCommand` for a file the scan already attested present. Never used
+   * ahead of a WRITE — the write path must go through
+   * {@link checkedStoreDest} (symlink-refusing) instead.
+   */
+  storeDest(hfRepo: string, file: string): GgufDestResult;
+  /**
+   * T6→T7 (beta.6 SC-A-3): the WRITE gate — `storeRoot` +
+   * `lstatCheckedGgufDest` (lstat-based, symlink-refusing, ENOENT-tolerant)
+   * over the real fs seams. T7's `handleProvisionModel` MUST resolve its
+   * destination through THIS (never {@link storeDest}) before ever calling
+   * {@link downloadGgufToStore}.
+   */
+  checkedStoreDest(hfRepo: string, file: string): Promise<GgufDestResult>;
+  /**
+   * T6→T7 (beta.6 §2.4): the T3 atomic file sink (`downloadGgufToStore`),
+   * bound to the real `GgufStoreIo` (the same `ggufIo` object `ingestGguf`
+   * rides) by the caller. Consumed by T7's `handleProvisionModel`
+   * llamacpp branch; declared here so the binding lands with the rest of
+   * the T6 wiring.
+   */
+  downloadGgufToStore(
+    spec: GgufStoreSpec,
+    destDir: string,
+    destFile: string,
     onProgress: (p: PullProgress) => void,
     signal: AbortSignal,
   ): Promise<void>;
@@ -324,7 +403,7 @@ const HOST_SOURCED_PULL_REFUSAL =
   "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
 /** §6 "NEXT download unavailable (D3)" — the sha256 pin is still empty. */
 const NEXT_DOWNLOAD_UNAVAILABLE =
-  "No vetted build of this model is published yet — it can't be downloaded automatically. Use the guided instructions below, or the vLLM path (official release).";
+  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
 /** §6 "NEXT download remote-endpoint refusal (S-F3)" — ingest is loopback-only. */
 const NEXT_REMOTE_ENDPOINT_REFUSAL =
   'Verified downloads only run against a local Ollama (loopback). For a remote server, download and verify the model on that machine — see the guided instructions.';
@@ -341,6 +420,76 @@ const NEXT_PULL_MODAL_COPY =
   `Download '${NEXT_DEDICATED_MODEL.displayName}' (~4.7 GB) and install it into your local Ollama? ` +
   `Source: huggingface.co/${NEXT_DEDICATED_MODEL.gguf.hfRepo} — Syntinal's build converted from Sweep's official release. ` +
   "Talaria verifies the file's checksum against its pinned value after downloading, and Ollama verifies it again during install.";
+
+// --- T7 (beta.6 §2.5/§6): setup.provisionModel — copy, verbatim --------------
+
+/** §6 "provision refusal: unknown id". */
+const PROVISION_UNKNOWN_ID_REFUSAL = 'Unknown model — the catalog is fixed in this release.';
+/** §6 "provision refusal: vllm backend" — refused, never ignored. */
+const PROVISION_VLLM_REFUSAL =
+  'vLLM serves models from its own command line — nothing to download here. Copy the run command instead.';
+/** Strict-enum refusal for anything outside the two provisionable backends. */
+const PROVISION_BACKEND_REFUSAL = "backend must be 'ollama' or 'llamacpp'.";
+/** §2.5 4a — fixture/future rows only (every shipping row carries an ollama
+ *  cell): the ollama-side honest-absence line, mirroring the §6 llamacpp one. */
+const PROVISION_OLLAMA_HONEST_ABSENCE =
+  'No build of this model from a verified publisher exists for Ollama — use it via llama.cpp instead.';
+/** SC-A-9: the exhaustive-VerifySpec default arm — a future third mode
+ *  refuses, it never falls through permissively. */
+const PROVISION_UNKNOWN_VERIFY_REFUSAL = 'unknown verify mode — refusing to download';
+/** T1-M1 (carried): an option-shaped tag is refused in {@link SetupController.
+ *  runLibraryPull} before the pull dep is ever invoked. */
+const LIBRARY_TAG_DASH_REFUSAL = "model tag must not begin with '-'";
+
+// --- T8 (beta.6 §2.5/§6): setup.saveAgentModel — copy + constants, verbatim --
+
+/** §2.5 role-gate: a fim/embedding/next catalog id is refused outright — this
+ *  method only ever records the AGENT block's selection. */
+const SAVE_AGENT_ROLE_REFUSAL = 'modelId must be an agent-role catalog model.';
+/** Strict-enum refusal — UNLIKE {@link PROVISION_BACKEND_REFUSAL}, 'vllm' IS
+ *  allowed here: this method only RECORDS which backend serves the model, it
+ *  never downloads (that stays `setup.provisionModel`'s job). */
+const SAVE_AGENT_BACKEND_REFUSAL = "backend must be 'ollama', 'llamacpp', or 'vllm'.";
+/** Modal copy for `{clear:true}` — same Tier-1-modal-gated-unset discipline
+ *  as {@link SetupController.handleSetApiKey}'s `clear` branch (the
+ *  established precedent this method's Clear path mirrors exactly). Not §6-
+ *  pinned (the doc pins only the SAVE modal's wording) — chosen to match
+ *  that precedent's phrasing + confirm label ('Clear') verbatim. */
+const CLEAR_AGENT_MODEL_MODAL = 'Clear the saved local agent model?';
+/** §1.3/§2.5 (CC-6): host-owned agent endpoint defaults — the block's
+ *  endpoint field initializes from these (saved wins). `llamacpp` matches
+ *  {@link LLAMACPP_RUN_FLAGS}'s agent port (8013); `vllm` matches vLLM's own
+ *  default port. `ollama` reuses {@link DEFAULT_OLLAMA_ENDPOINT} — ONE
+ *  source for that value, never a second literal. */
+const AGENT_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; vllm: string }> = {
+  ollama: DEFAULT_OLLAMA_ENDPOINT,
+  llamacpp: 'http://127.0.0.1:8013',
+  vllm: 'http://127.0.0.1:8000',
+};
+/** §3.2 (audit A5, beta.6 panel-fix T2): host-owned RAG endpoint defaults —
+ *  mirrors {@link AGENT_ENDPOINT_DEFAULTS}'s CC-6 pattern exactly, one const
+ *  per surface. `llamacpp` matches {@link LLAMACPP_RUN_FLAGS}'s embedding
+ *  port (8081 — drift-locked by test); `openai-compat` is the vLLM
+ *  convention port. `ollama` reuses {@link DEFAULT_OLLAMA_ENDPOINT} — ONE
+ *  source for that value, never a second literal. Never webview-fabricated
+ *  (Global Constraint 1). */
+const RAG_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; 'openai-compat': string }> = {
+  ollama: DEFAULT_OLLAMA_ENDPOINT,
+  llamacpp: 'http://127.0.0.1:8081',
+  'openai-compat': 'http://127.0.0.1:8000',
+};
+/** T8 (CC-10): `setup.setNextEdit`'s additive `dedicatedBackendId` enum — the
+ *  4 unified-block backend panes. Shared by the write-side validation and the
+ *  `status()` read-side coercion (never trust settings.json without
+ *  re-checking — same posture as {@link coerceNextEditTransport}). */
+const NEXT_DEDICATED_BACKEND_IDS = ['ollama', 'llamacpp', 'vllm', 'openai-compat'] as const;
+
+/** `undefined` for anything outside the 4-value enum — a malformed/edited
+ *  settings.json value degrades to "no restoration hint" (the panel's
+ *  existing transport-heuristic fallback), never a fabricated pane. */
+function coerceDedicatedBackendId(raw: string | undefined): string | undefined {
+  return raw !== undefined && (NEXT_DEDICATED_BACKEND_IDS as readonly string[]).includes(raw) ? raw : undefined;
+}
 
 /**
  * T13 (beta.5 §4.4 "classify", rev 6 — the owner personally corrected the
@@ -374,6 +523,70 @@ function isLoopbackEndpoint(rawUrl: string): boolean {
   }
 }
 
+/** T1 (beta.6 panel-fix PT1, CR-001 fix): the modal-forging character
+ *  class — covers exactly: C0 controls (U+0000-U+001F), DEL (U+007F), C1
+ *  controls incl. NEL (U+0080-U+009F), the ARABIC LETTER MARK (U+061C),
+ *  zero-width characters + directional marks (U+200B-U+200F), the Unicode
+ *  LINE/PARAGRAPH SEPARATORs (U+2028/U+2029), bidi embedding/override
+ *  (U+202A-U+202E), the WORD JOINER (U+2060), isolate (U+2066-U+2069)
+ *  controls, and ZERO WIDTH NO-BREAK SPACE / BOM (U+FEFF). Any of these can
+ *  forge extra lines or visually reorder a single-line native `showModal`
+ *  prompt.
+ *
+ *  T4 (beta.6 fix-wave L1-M2): U+061C/U+2060/U+FEFF added as
+ *  defense-in-depth for modal free-text (model/dir names) — endpoints
+ *  already neutralize them via T1's canonicalization chokepoint.
+ *
+ *  T2 (beta.6 panel-fix CR-003): factored into ONE source string so the
+ *  REFUSE regex ({@link MODAL_UNSAFE_TEXT_PATTERN}) and the REDACT regex
+ *  (used by {@link redactForModal}) are built from the exact same class and
+ *  can never silently drift apart. Do NOT hand-duplicate this class as a
+ *  second regex literal anywhere else in this file. */
+const MODAL_UNSAFE_CHARS = '\\x00-\\x1f\\x7f\\u0080-\\u009f\\u061c\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2060\\u2066-\\u2069\\ufeff';
+export const MODAL_UNSAFE_TEXT_PATTERN = new RegExp(`[${MODAL_UNSAFE_CHARS}]`);
+/** T2 (CR-003): the global (strip-all-occurrences) variant of {@link MODAL_UNSAFE_TEXT_PATTERN} — see {@link redactForModal}. */
+const MODAL_UNSAFE_TEXT_PATTERN_G = new RegExp(`[${MODAL_UNSAFE_CHARS}]`, 'g');
+/** §7/§6 T1: the shared length cap for any free-text value that reaches a modal. */
+const MODAL_TEXT_MAX_LEN = 200;
+
+/**
+ * T1 (beta.6 panel-fix PT1): the shared modal-forging SANITATION SWEEP —
+ * applied to EVERY free-text param that reaches {@link SetupHost.showModal}
+ * BEFORE its modal renders (`applyFim.model`, `setRag.embedModel`,
+ * `setRag.indexDir`, `setNextEdit.model`, `pullModel.model`). `label` names
+ * the offending param in the refusal reason so each call site's failure is
+ * traceable to its own field. Purely additive — never touches endpoint/URL
+ * validation ({@link validateEndpointUrl}) or the download-integrity gates.
+ */
+function refuseUnsafeModalText(value: string, label: string): { ok: true } | { ok: false; reason: string } {
+  if (value.length > MODAL_TEXT_MAX_LEN) {
+    return { ok: false, reason: `${label} is too long (max ${MODAL_TEXT_MAX_LEN} characters).` };
+  }
+  if (MODAL_UNSAFE_TEXT_PATTERN.test(value)) {
+    return { ok: false, reason: `${label} contains characters that are not allowed in a confirmation prompt.` };
+  }
+  return { ok: true };
+}
+
+/**
+ * T2 (beta.6 panel-fix CR-003): NEUTRALIZE (never refuse) a value the user
+ * already has SAVED, before it is interpolated into a Tier-1 confirmation
+ * modal as an 'old' value (e.g. the current `talaria.autocomplete.endpoint`
+ * / `talaria.nextEdit.endpoint`, shown in the 'from X to Y' Apply prompt).
+ * Unlike {@link refuseUnsafeModalText} — which REFUSES a freshly-submitted
+ * param — refusing the whole Apply because a hand-edited settings.json has
+ * an odd character in the OLD value would trap the user out of fixing it.
+ * Strips every character in the same class as {@link MODAL_UNSAFE_TEXT_PATTERN}
+ * (built from the same {@link MODAL_UNSAFE_CHARS} source, so the two can
+ * never drift apart), then caps to {@link MODAL_TEXT_MAX_LEN}.
+ * DISPLAY-ONLY: never touches what gets WRITTEN to a setting — callers
+ * still write the validated/raw value, never this redacted copy.
+ */
+export function redactForModal(value: string): string {
+  const stripped = value.replace(MODAL_UNSAFE_TEXT_PATTERN_G, '');
+  return stripped.length > MODAL_TEXT_MAX_LEN ? stripped.slice(0, MODAL_TEXT_MAX_LEN) : stripped;
+}
+
 /** D9: which {@link SetupMethod}s are consequence-bearing mutations, gated
  *  on `host.isTrusted()` (FM-14). Everything else (`setup.status` — handled
  *  outside `handle()` entirely —, `setup.testRemote`, `setup.recheck`,
@@ -389,6 +602,14 @@ export const MUTATING_METHODS = new Set<SetupMethod>([
   'setup.applyFim',
   'setup.setApiKey',
   'setup.pullModel',
+  // beta.6 T7 (§2.5 step 0): the catalog provisioning gate is consequence-
+  // bearing (network download + disk/daemon writes) — trust-gated like every
+  // other mutation.
+  'setup.provisionModel',
+  // beta.6 T8 (§2.5): writes (or unsets) the 3 `talaria.agent.localModel.*`
+  // settings — consequence-bearing like every other Tier-1 settings write;
+  // follows `setup.provisionModel`'s exact registration pattern.
+  'setup.saveAgentModel',
   'setup.openProviderWizard',
   'setup.openInstallTerminal',
   'setup.openBootstrapTerminal',
@@ -447,7 +668,9 @@ export class SetupController {
    * `TalariaViewProvider.handleSetupMethod`'s own unconditional post-`handle
    * ()` refresh (T7 fix 1) — firing here too would be a redundant push, not
    * a new one, so this event is intentionally NOT wired to any other method
-   * (and never to a read-only one).
+   * (and never to a read-only one). beta.6 T7 adds ONE more fire site:
+   * {@link provisionLlamacpp} after a successful store download (§2.5 5d —
+   * the sidecar just landed, so the presence scan's verdict flips).
    */
   private readonly statusChangedEmitter = new Emitter<void>();
   readonly onStatusChanged: Event<void> = this.statusChangedEmitter.event;
@@ -466,6 +689,28 @@ export class SetupController {
    *  the file may have become readable). */
   private osResolution?: Promise<OsResolution>;
 
+  /**
+   * T6 (beta.6 §2.5): the llama.cpp runtime SETTLED-VALUE memo — deliberately
+   * NOT the awaited {@link osResolution} pattern (which cannot express
+   * `'checking'`): `status()` kicks the probe once (lazily, {@link
+   * kickLlamaCppProbe}) and returns immediately with `'checking'`; the
+   * probe's settle writes this field and fires {@link onStatusChanged}
+   * exactly ONCE (the seq-guarded push repaints). `undefined` = not settled
+   * yet. The `path` is stored ALREADY `~`-redacted (T6 M-3 discipline).
+   */
+  private llamaCppRuntime?: { binary: 'found' | 'missing' | 'unknown'; version?: string; path?: string };
+  /** True while a probe attempt is in flight — with {@link llamaCppRuntime}
+   *  `undefined` + this false, the next `status()` kicks a fresh probe. */
+  private llamaCppProbeInFlight = false;
+  /** The in-flight probe attempt's AbortController — a scoped recheck (and
+   *  {@link dispose}) aborts it so a superseded login-shell probe dies
+   *  instead of lingering (T5 CR-1 signal threading). */
+  private llamaCppProbeAbort?: AbortController;
+  /** Monotonic supersession guard: bumped by {@link rekickLlamaCppProbe} so a
+   *  SUPERSEDED probe settling late can neither overwrite the fresh state
+   *  nor fire a stray push. */
+  private llamaCppProbeEpoch = 0;
+
   constructor(
     private readonly host: SetupHost,
     private readonly deps: SetupControllerDeps,
@@ -476,6 +721,11 @@ export class SetupController {
       if (state.timer) clearTimeout(state.timer);
     }
     this.throttle.clear();
+    // T6: supersede + cancel any in-flight llama.cpp probe — its late settle
+    // must neither write state nor fire into the (now-cleared) emitter.
+    this.llamaCppProbeEpoch += 1;
+    this.llamaCppProbeAbort?.abort();
+    this.llamaCppProbeAbort = undefined;
     this.progressEmitter.dispose();
     this.statusChangedEmitter.dispose();
   }
@@ -503,6 +753,10 @@ export class SetupController {
 
   async status(): Promise<SetupData> {
     const trusted = this.host.isTrusted();
+    // T6 (§2.5): kick the llama.cpp probe FIRST (lazy, non-blocking — the
+    // settled-value memo, see kickLlamaCppProbe) so it runs concurrently
+    // with the awaits below; this call never waits on it.
+    this.kickLlamaCppProbe();
     const apiKeySet = await this.host.secrets.has(AUTOCOMPLETE_API_KEY_SECRET);
     // T5 §1.2: interpreted (memoized) OS identity — drives the `os` block
     // and, per phase, the engine-composed bootstrap / python plans below.
@@ -511,6 +765,11 @@ export class SetupController {
     const ollamaDescriptor = this.deps.registry.getBackend('ollama');
     const ollamaEndpoint = ollamaDescriptor?.remote?.endpoint.defaultValue ?? DEFAULT_OLLAMA_ENDPOINT;
     const ollamaStatus = await this.safeProbeOllama(ollamaEndpoint);
+    // T6 (§2.5 ordering constraint): the store scan is a cheap stat pass
+    // awaited HERE, alongside safeProbeOllama — strictly BEFORE the CR-002
+    // synchronous tail below, so the emitted snapshot always carries a
+    // RESOLVED presence map (locked by the ordering test).
+    const storePresence = await this.safeScanStorePresence();
 
     const hermesPath = (this.host.getSetting<string>('talaria.hermesPath') ?? '').trim();
     const configuredBackend = this.host.getSetting<string>('talaria.backend') ?? 'mock';
@@ -557,6 +816,16 @@ export class SetupController {
     const nextModel = (this.host.getSetting<string>('talaria.nextEdit.model') ?? '').trim();
     const genericSupported = fimDescriptor.nextEditTransport !== undefined;
     const dedicatedConfigured = nextEndpoint !== '' && nextModel !== '';
+    // T8 (beta.6 CC-10): additive restoration hint — which unified-block pane
+    // configured the dedicated NEXT connection. `undefined` (never set, or a
+    // malformed/edited settings.json value) ⇒ omitted from the wire, so the
+    // panel falls back to its existing transport heuristic.
+    const nextDedicatedBackendIdRaw = (
+      this.host.getSetting<string>('talaria.nextEdit.dedicatedBackendId') ?? ''
+    ).trim();
+    const nextDedicatedBackendId = coerceDedicatedBackendId(
+      nextDedicatedBackendIdRaw === '' ? undefined : nextDedicatedBackendIdRaw,
+    );
     // T13 (§4.2): capability + raw facts for the dedicated NEXT card —
     // computed purely from the registry pins (no await; the CR-002
     // synchronous tail below stays intact). `downloadReady` is driven by the
@@ -590,6 +859,14 @@ export class SetupController {
 
     const ragEnabled = this.host.getSetting<boolean>('talaria.rag.enabled') ?? true;
     const ragEmbedEndpoint = (this.host.getSetting<string>('talaria.rag.embedEndpoint') ?? '').trim() || DEFAULT_OLLAMA_ENDPOINT;
+    // T8 (beta.6 CC-10): additive restoration hint — which backend the RAG
+    // embedder block is configured against. UNLIKE `dedicatedBackendId`, this
+    // has one clean single default ('ollama') and is ALWAYS populated on the
+    // wire (never omitted) — a malformed/edited settings.json value degrades
+    // to that default, same fail-closed coercion as `coerceNextEditTransport`.
+    const ragEmbedBackendRaw = this.host.getSetting<string>('talaria.rag.embedBackend');
+    const ragEmbedBackend: 'ollama' | 'llamacpp' | 'openai-compat' =
+      ragEmbedBackendRaw === 'llamacpp' || ragEmbedBackendRaw === 'openai-compat' ? ragEmbedBackendRaw : 'ollama';
     const ragEmbedModel = (this.host.getSetting<string>('talaria.rag.embedModel') ?? '').trim() || DEFAULT_RAG_EMBED_MODEL;
     const ragTuning = {
       dims: this.host.getSetting<number>('talaria.rag.dims') ?? 0,
@@ -633,6 +910,7 @@ export class SetupController {
         endpoint: nextEndpoint,
         model: nextModel,
         dedicatedConfigured,
+        ...(nextDedicatedBackendId !== undefined ? { dedicatedBackendId: nextDedicatedBackendId } : {}),
         genericSupported,
         ...(nextSource === 'generic' && !genericSupported
           ? {
@@ -644,7 +922,18 @@ export class SetupController {
       rag: {
         enabled: ragEnabled,
         embedEndpoint: ragEmbedEndpoint,
+        embedBackend: ragEmbedBackend,
         embedModel: ragEmbedModel,
+        // beta.6 panel-fix T2 (audit A5): host-owned per-pane endpoint
+        // defaults, ALWAYS populated — mirrors agentLocalModel.endpointDefaults
+        // (CC-6) exactly. Never webview-fabricated (Global Constraint 1).
+        endpointDefaults: RAG_ENDPOINT_DEFAULTS,
+        // @deprecated beta.6 T14 (wire compat only): the wrong-daemon
+        // computation §3.4 replaced — it answers for the endpoint this
+        // status() probed, not `embedEndpoint`, and the exact `===` misses
+        // `:latest`. The unified UI derives presence client-side instead
+        // (`ragEmbedPresence`, endpoint-scoped per C-6); no webview code
+        // reads this field anymore (source-scan-locked in SetupPanel.test.ts).
         embedModelPresent: ollamaStatus.running ? ollamaStatus.models.some((m) => m.name === ragEmbedModel) : false,
         tuning: ragTuning,
         indexDir: ragIndexDir,
@@ -655,6 +944,17 @@ export class SetupController {
       ollama: ollamaStatus.running
         ? { running: true, endpoint: ollamaEndpoint, models: ollamaStatus.models }
         : { running: false, endpoint: ollamaEndpoint, models: [] },
+      // T6 (beta.6 §1.3): the verified catalog, all 13 rows, projected
+      // against the resolved presence map (llamacpp cells + SC-2-gated vllm
+      // cells composed by the pure helpers below).
+      catalog: { models: MODEL_CATALOG.map((m) => this.projectCatalogModel(m, storePresence)) },
+      // T6 (beta.6 §2.5): the settled-value memo's current truth —
+      // 'checking' until the kicked probe settles.
+      llamacppRuntime: this.composeLlamaCppRuntime(osInfo),
+      // T8 (beta.6 §1.3/§2.5): the "Configure Local Agent Model" block's wire
+      // state — host-owned endpoint defaults + the saved selection recomposed
+      // fresh from the 3 `talaria.agent.localModel.*` settings on every call.
+      agentLocalModel: this.composeAgentLocalModel(provider.phase, storePresence),
       ready,
       os: {
         family: osInfo.family,
@@ -697,9 +997,138 @@ export class SetupController {
     return { release, family, manager: managerFor(family) };
   }
 
+  // --- T6: llama.cpp runtime settled-value memo (§2.5) ----------------------
+
+  /**
+   * Kick the `llama-server` probe ONCE, lazily — a no-op while a settled
+   * value exists or an attempt is already in flight. The settle writes
+   * {@link llamaCppRuntime} and fires {@link onStatusChanged} exactly once;
+   * a settle whose epoch was superseded (scoped recheck / dispose) is
+   * DROPPED entirely. Mapping (CC-5): found ⇒ `'found'`, `not-found` ⇒
+   * `'missing'`, `probe-timeout` ⇒ `'unknown'` (never `'missing'`); a
+   * REJECTING binding also settles `'unknown'` — a probe failure must never
+   * become an unhandled rejection out of a fire-and-forget kick.
+   */
+  private kickLlamaCppProbe(): void {
+    if (this.llamaCppRuntime !== undefined || this.llamaCppProbeInFlight) return;
+    this.llamaCppProbeInFlight = true;
+    const epoch = this.llamaCppProbeEpoch;
+    const abort = new AbortController();
+    this.llamaCppProbeAbort = abort;
+    void (async () => {
+      let settled: NonNullable<SetupController['llamaCppRuntime']>;
+      try {
+        const result = await this.deps.locateLlamaServer(abort.signal);
+        settled = result.ok
+          ? {
+              binary: 'found',
+              ...(result.version !== undefined ? { version: result.version } : {}),
+              path: this.redact(result.path),
+            }
+          : { binary: result.reason === 'probe-timeout' ? 'unknown' : 'missing' };
+      } catch {
+        // Rejection (incl. an abort racing the settle) ⇒ honest 'unknown';
+        // a superseded epoch is dropped below either way.
+        settled = { binary: 'unknown' };
+      }
+      if (epoch !== this.llamaCppProbeEpoch) return; // superseded — the fresh probe owns the state
+      this.llamaCppRuntime = settled;
+      this.llamaCppProbeInFlight = false;
+      this.llamaCppProbeAbort = undefined;
+      this.statusChangedEmitter.fire();
+    })();
+  }
+
+  /** Clear state + memo, cancel the superseded attempt, and re-kick WITHOUT
+   *  awaiting — `setup.recheck {scope:'llamacpp'}`'s non-blocking re-check
+   *  (the recheck RPC's own budget is untouched). */
+  private rekickLlamaCppProbe(): void {
+    this.llamaCppProbeEpoch += 1;
+    this.llamaCppProbeAbort?.abort();
+    this.llamaCppProbeAbort = undefined;
+    this.llamaCppRuntime = undefined;
+    this.llamaCppProbeInFlight = false;
+    this.kickLlamaCppProbe();
+  }
+
+  /** The wire projection of the memo (§1.3 `llamacppRuntime`): unsettled ⇒
+   *  `'checking'`; `install` present iff `'missing'` (§4.1 — NEVER on
+   *  `'unknown'`, where an install button would assert a fact the probe
+   *  could not establish). */
+  private composeLlamaCppRuntime(osInfo: OsResolution): NonNullable<SetupData['llamacppRuntime']> {
+    const settled = this.llamaCppRuntime;
+    if (settled === undefined) return { binary: 'checking' };
+    return {
+      binary: settled.binary,
+      ...(settled.version !== undefined ? { version: settled.version } : {}),
+      ...(settled.path !== undefined ? { path: settled.path } : {}),
+      ...(settled.binary === 'missing' ? { install: composeLlamacppInstall(osInfo) } : {}),
+    };
+  }
+
+  // --- T6: catalog wire projection (§1.3) -----------------------------------
+
+  /** {@link SetupControllerDeps.scanStorePresence} can reject (a non-ENOENT
+   *  fs failure inside the store) — `status()` must stay total, so that
+   *  degrades FAIL-CLOSED to an empty map: every cell honestly reads
+   *  absent (same posture as {@link safeProbeOllama}). */
+  private async safeScanStorePresence(): Promise<ReadonlyMap<string, boolean>> {
+    try {
+      return await this.deps.scanStorePresence();
+    } catch {
+      return new Map<string, boolean>();
+    }
+  }
+
+  /** One catalog row → its §1.3 wire shape. The llamacpp/vllm cells go
+   *  through the exported pure gates ({@link composeLlamacppCell} /
+   *  {@link composeVllmCell}); the run-command dest is resolved through the
+   *  READ-ONLY {@link SetupControllerDeps.storeDest} and `~`-redacted before
+   *  it ever reaches the composed string. */
+  private projectCatalogModel(model: CatalogModel, presence: ReadonlyMap<string, boolean>): SetupCatalogModel {
+    const present = presence.get(model.id) === true;
+    let redactedDestPath: string | undefined;
+    if (present && model.llamacpp !== undefined) {
+      const dest = this.deps.storeDest(model.llamacpp.gguf.hfRepo, model.llamacpp.gguf.file);
+      if (dest.ok) redactedDestPath = this.redact(dest.destPath);
+    }
+    const llamacpp = composeLlamacppCell(model, present, redactedDestPath);
+    const vllm = composeVllmCell(model);
+    return {
+      id: model.id,
+      role: model.role,
+      displayName: model.displayName,
+      publisher: model.publisher,
+      license: model.license,
+      ...(model.defaultForRole === true ? { defaultForRole: true } : {}),
+      ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+      vramLine: model.vramLine,
+      ...(model.note !== undefined ? { note: model.note } : {}),
+      progressId: model.id, // rule 7: the ONE pull/cancel/progress key
+      ...(model.ollama?.tier === 'library'
+        ? { ollamaTag: model.ollama.tag, ollamaApproxBytes: model.ollama.approxBytes }
+        : {}),
+      ...(model.ollama?.tier === 'hf-ingest'
+        ? { ollamaCreatedName: model.ollama.createdName, ollamaApproxBytes: model.ollama.gguf.approxBytes }
+        : {}),
+      ...(llamacpp !== undefined ? { llamacpp } : {}),
+      ...(vllm !== undefined ? { vllm } : {}),
+    };
+  }
+
   // --- handle() -------------------------------------------------------------
 
-  async handle(method: SetupMethod, params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+  /**
+   * T6 (beta.6 CC-2): the success arm carries an optional `models` list —
+   * populated ONLY by `setup.testRemote` when its `ProbeOutcome` returned
+   * one (the block's quiet `Serving: {models}` line). Additive: every other
+   * arm still resolves a bare `{ok:true}`, and existing callers pass
+   * through `unwrapSetupResult` untouched.
+   */
+  async handle(
+    method: SetupMethod,
+    params: unknown,
+  ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string }> {
     if (MUTATING_METHODS.has(method) && !this.host.isTrusted()) {
       return { ok: false, reason: TRUST_REFUSAL_REASON };
     }
@@ -721,6 +1150,10 @@ export class SetupController {
         return this.handleTestRemote(params);
       case 'setup.pullModel':
         return this.handlePullModel(params);
+      case 'setup.provisionModel':
+        return this.handleProvisionModel(params);
+      case 'setup.saveAgentModel':
+        return this.handleSaveAgentModel(params);
       case 'setup.cancel':
         return this.handleCancel(params);
       case 'setup.openProviderWizard':
@@ -732,7 +1165,7 @@ export class SetupController {
       case 'setup.reload':
         return this.handleReload();
       case 'setup.recheck':
-        return this.handleRecheck();
+        return this.handleRecheck(params);
       case 'setup.setNextEdit':
         return this.handleSetNextEdit(params);
       case 'setup.setRag':
@@ -910,15 +1343,35 @@ export class SetupController {
     const validated = validateEndpointUrl(rawEndpoint);
     if (!validated.ok) return { ok: false, reason: validated.reason };
 
-    const oldEndpoint = (this.host.getSetting<string>('talaria.autocomplete.endpoint') ?? '').trim() || '(default)';
+    // T1 (beta.6 panel-fix PT1): optional `model` — trim; sanitize BEFORE the
+    // modal that will interpolate it. Absent/empty ⇒ byte-identical prior
+    // behavior (no third write, unchanged modal). A model supplied with
+    // backendId:'llamacpp' is accepted-and-written, never special-cased
+    // (C2-10a) — the setting is shared across FIM backends.
+    const model = str(params, 'model')?.trim();
+    if (model) {
+      const sanitized = refuseUnsafeModalText(model, 'model');
+      if (!sanitized.ok) return sanitized;
+    }
+
+    // T2 (beta.6 panel-fix CR-003): redact BEFORE the '(default)' fallback --
+    // trim -> redact -> fallback, so an endpoint that's ALL unsafe chars
+    // redacts to empty and correctly falls back to '(default)'. Display-only:
+    // the WRITE below still stores validated.url, never this redacted copy.
+    const oldEndpoint = redactForModal((this.host.getSetting<string>('talaria.autocomplete.endpoint') ?? '').trim()) || '(default)';
     const confirmed = await this.host.showModal(
-      `Switch autocomplete endpoint from '${oldEndpoint}' to '${validated.url}' (backend: ${descriptor.displayName})?`,
+      model
+        ? `Switch autocomplete endpoint from '${oldEndpoint}' to '${validated.url}' (backend: ${descriptor.displayName}, model: ${model})?`
+        : `Switch autocomplete endpoint from '${oldEndpoint}' to '${validated.url}' (backend: ${descriptor.displayName})?`,
       'Apply',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
 
     await this.host.updateSettingGlobal('talaria.autocomplete.backend', backendId);
     await this.host.updateSettingGlobal('talaria.autocomplete.endpoint', validated.url);
+    if (model) {
+      await this.host.updateSettingGlobal('talaria.autocomplete.model', model);
+    }
     return { ok: true };
   }
 
@@ -941,7 +1394,9 @@ export class SetupController {
 
   // --- setup.testRemote (read-only) -------------------------------------------
 
-  private async handleTestRemote(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+  private async handleTestRemote(
+    params: unknown,
+  ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string }> {
     const backendId = str(params, 'backendId');
     const descriptor = backendId ? this.deps.registry.getBackend(backendId) : undefined;
     if (!descriptor || !descriptor.remote) {
@@ -957,7 +1412,13 @@ export class SetupController {
       // entry whose probe would actually need one (codestral) has
       // `probe: {kind:'none'}` for exactly this reason.
       const outcome = await this.deps.probeRemote(descriptor.remote.probe, endpoint, undefined);
-      return outcome.ok ? { ok: true } : { ok: false, reason: this.redact(outcome.detail) };
+      // T6 (beta.6 CC-2): additive widening — the ProbeOutcome's served-model
+      // list rides along when the probe returned one (the block renders a
+      // quiet `Serving: {models}` line after a green Test); a bare success
+      // stays EXACTLY {ok:true} so existing callers are unaffected.
+      return outcome.ok
+        ? { ok: true, ...(outcome.models !== undefined ? { models: outcome.models } : {}) }
+        : { ok: false, reason: this.redact(outcome.detail) };
     } catch (err) {
       return { ok: false, reason: this.redact(errorMessage(err)) };
     }
@@ -1010,26 +1471,23 @@ export class SetupController {
     const abort = new AbortController();
     this.inFlight.set(key, abort);
     try {
+      // T1 (beta.6 panel-fix PT1): sanitize BEFORE the modal below — a
+      // STRICTER, EARLIER gate than the leading-'-' check inside
+      // {@link runLibraryPull}, never a looser one; that check stays exactly
+      // where it is. The vetted-ingest branch (step 3, above) never reaches
+      // this modal, so it needs no sanitation of its own.
+      const sanitized = refuseUnsafeModalText(model, 'model');
+      if (!sanitized.ok) return sanitized;
       const confirmed = await this.host.showModal(
         `Pull model '${model}' from the Ollama registry to your local disk?`,
         'Pull',
       );
       if (!confirmed) return { ok: false, reason: 'declined' };
 
-      await this.deps.pullModel(
-        endpoint,
-        model,
-        (p) => {
-          this.pushProgress({
-            op: 'pull',
-            id: model,
-            phase: p.status,
-            ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
-            ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
-          });
-        },
-        abort.signal,
-      );
+      // T7 (beta.6): the pull body is the EXTRACTED {@link runLibraryPull} —
+      // shared with the catalog tier. Behavior here is unchanged: same modal
+      // (above), same latch, tag-keyed progress id.
+      await this.runLibraryPull(model, endpoint, model, abort.signal);
       return { ok: true };
     } catch (err) {
       if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
@@ -1102,6 +1560,432 @@ export class SetupController {
     }
   }
 
+  // --- setup.provisionModel (beta.6 T7 — the §2.5 refusal-order engine) ---------
+
+  /**
+   * T7 (beta.6 §2.5): `setup.provisionModel {modelId, backend, endpoint?}` —
+   * the ONE place a catalog model gets pulled/downloaded/ingested. Refusal
+   * order is LOCKED by spy-ordering tests (an out-of-order check is a
+   * security hole):
+   *
+   *   0. trust gate (MUTATING_METHODS) — caller-enforced in {@link handle}.
+   *   1. params: `modelId` ∈ MODEL_CATALOG (strict); backend ∈
+   *      {'ollama','llamacpp'}; 'vllm' REFUSED with the §6 line, never
+   *      ignored.
+   *   2. {@link assertProvisionSources} (SC-1): charset assert on EVERY
+   *      string the branch will use + publisher ∈ allowlist + hfRepo-prefix
+   *      re-assert — BEFORE any latch/network/fs work (assert-before-resolve:
+   *      `resolveLfsOid` does not re-assert charset, so nothing may reach it
+   *      unasserted).
+   *   3. single-flight latch `pull:<modelId>` BEFORE the modal (rule 7);
+   *      `finally`-released on every exit path. `<modelId>` is the ONE
+   *      progress/cancel key on every branch (CC-1/CC-9).
+   *   4/5. the backend branches ({@link provisionOllama} /
+   *      {@link provisionLlamacpp}) — every remaining refusal lands BEFORE
+   *      the Tier-1 modal.
+   *
+   * The NEXT re-route rides this handler: `{modelId:'sweep-next',
+   * backend:'ollama'}` reaches the SAME vetted-ingest engine semantics as
+   * beta.5's {@link handleVettedIngest}, latched/keyed `pull:sweep-next`.
+   * The legacy `setup.pullModel` route stays byte-compatible (its own modal,
+   * its own tag-derived key) and refusal-equivalent.
+   */
+  private async handleProvisionModel(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    // (1) strict params — the webview only ever sends a catalog id back.
+    const modelId = str(params, 'modelId');
+    const entry = modelId === undefined ? undefined : MODEL_CATALOG.find((m) => m.id === modelId);
+    if (entry === undefined) return { ok: false, reason: PROVISION_UNKNOWN_ID_REFUSAL };
+    const backend = str(params, 'backend');
+    if (backend === 'vllm') return { ok: false, reason: PROVISION_VLLM_REFUSAL };
+    if (backend !== 'ollama' && backend !== 'llamacpp') return { ok: false, reason: PROVISION_BACKEND_REFUSAL };
+    // (2) SC-1 — refuse on ANY unasserted source string BEFORE any other work.
+    const sources = assertProvisionSources(entry, backend);
+    if (!sources.ok) return { ok: false, reason: sources.reason };
+    // (3) latch BEFORE the modal; finally-release on every exit path.
+    const key = `pull:${entry.id}`;
+    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
+    const abort = new AbortController();
+    this.inFlight.set(key, abort);
+    try {
+      return backend === 'ollama'
+        ? await this.provisionOllama(entry, params, abort.signal)
+        : await this.provisionLlamacpp(entry, abort.signal);
+    } catch (err) {
+      if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
+      return { ok: false, reason: this.redact(errorMessage(err)) };
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+
+  /** §2.5 step 4 — the ollama branch (library tier + both hf-ingest modes).
+   *  Runs INSIDE the `pull:<modelId>` latch; the caller owns catch/finally. */
+  private async provisionOllama(
+    entry: CatalogModel,
+    params: unknown,
+    signal: AbortSignal,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const cell = entry.ollama;
+    // (4a) honest absence — fixture/future rows only.
+    if (cell === undefined) return { ok: false, reason: PROVISION_OLLAMA_HONEST_ABSENCE };
+    const endpoint =
+      str(params, 'endpoint')?.trim() ||
+      this.deps.registry.getBackend('ollama')?.remote?.endpoint.defaultValue ||
+      DEFAULT_OLLAMA_ENDPOINT;
+    const validated = validateEndpointUrl(endpoint);
+    if (!validated.ok) return { ok: false, reason: validated.reason };
+
+    // (4b) library tier — ONE modal (§6 copy NAMES the endpoint, SC-A-7),
+    // then the EXTRACTED pull body under progress id = the catalog id.
+    if (cell.tier === 'library') {
+      const confirmed = await this.host.showModal(
+        `Pull model '${cell.tag}' from the Ollama registry onto '${validated.url}'?`,
+        'Pull',
+      );
+      if (!confirmed) return { ok: false, reason: 'declined' };
+      await this.runLibraryPull(cell.tag, validated.url, entry.id, signal);
+      return { ok: true };
+    }
+
+    // (4c) hf-ingest — exhaustive over VerifySpec, default-REFUSE (SC-A-9).
+    switch (cell.verify.mode) {
+      case 'pinned': {
+        // EXACT beta.5 vetted order: empty pin → loopback → exact-set verify
+        // → Tier-1 modal → ingest. Every refusal BEFORE the modal.
+        if (cell.verify.sha256 === '') return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
+        if (!isLoopbackEndpoint(validated.url)) return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
+        const pinnedSpec = pinnedVerifySpec(cell.gguf, cell.verify.sha256);
+        if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        let verdict: HfDigestVerdict;
+        try {
+          verdict = await this.deps.verifyHfDigest(pinnedSpec.spec);
+        } catch {
+          verdict = { ok: false, reason: 'verify seam rejected' };
+        }
+        if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        const confirmed = await this.host.showModal(
+          composePinnedOllamaModal(entry.displayName, cell.gguf, validated.url),
+          'Download',
+        );
+        if (!confirmed) return { ok: false, reason: 'declined' };
+        await this.deps.ingestGguf(
+          {
+            gguf: {
+              hfRepo: cell.gguf.hfRepo,
+              file: cell.gguf.file,
+              quant: cell.gguf.quant,
+              sha256: cell.verify.sha256,
+              approxBytes: cell.gguf.approxBytes,
+              allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles,
+            },
+            ollamaCreatedName: cell.createdName,
+          },
+          validated.url,
+          (p) => this.pushPullProgress(entry.id, p),
+          signal,
+        );
+        return { ok: true };
+      }
+      case 'live-oid': {
+        // loopback → resolveLfsOid → refuse on ANY failure — all BEFORE the
+        // DISTINCT live-oid modal (A-2). The resolved oid IS the expected
+        // digest the ingest engine hashes the received bytes against, and
+        // Ollama re-verifies it server-side at blob ingest.
+        if (!isLoopbackEndpoint(validated.url)) return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
+        let oid: LfsOidVerdict;
+        try {
+          oid = await this.deps.resolveLfsOid(cell.gguf.hfRepo, cell.gguf.file);
+        } catch {
+          oid = { ok: false, reason: 'resolve seam rejected' };
+        }
+        if (!oid.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        const publisher = trustedPublisherFor(entry.publisher);
+        if (publisher === undefined) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        const confirmed = await this.host.showModal(
+          composeLiveOidOllamaModal(entry.displayName, cell.gguf, publisher, validated.url),
+          'Download',
+        );
+        if (!confirmed) return { ok: false, reason: 'declined' };
+        await this.deps.ingestGguf(
+          {
+            gguf: {
+              hfRepo: cell.gguf.hfRepo,
+              file: cell.gguf.file,
+              quant: cell.gguf.quant,
+              sha256: oid.oid,
+              approxBytes: cell.gguf.approxBytes,
+            },
+            ollamaCreatedName: cell.createdName,
+          },
+          validated.url,
+          (p) => this.pushPullProgress(entry.id, p),
+          signal,
+        );
+        return { ok: true };
+      }
+      default:
+        return { ok: false, reason: PROVISION_UNKNOWN_VERIFY_REFUSAL };
+    }
+  }
+
+  /** §2.5 step 5 — the llamacpp branch: expected digest (mode-exhaustive,
+   *  default-REFUSE) → WRITE-gated dest (SC-A-3: {@link SetupControllerDeps.
+   *  checkedStoreDest}, NEVER the read-only `storeDest`) → mode-distinct
+   *  Tier-1 modal naming the ~-redacted dest → the T3 atomic file sink.
+   *  Runs INSIDE the `pull:<modelId>` latch; the caller owns catch/finally. */
+  private async provisionLlamacpp(
+    entry: CatalogModel,
+    signal: AbortSignal,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const cell = entry.llamacpp;
+    // (5a) honest absence — the §6 unavailableReason copy.
+    if (cell === undefined) return { ok: false, reason: LLAMACPP_HONEST_ABSENCE };
+    // (5b) the expected digest, per verify mode — every failure refuses here,
+    // BEFORE dest resolution and BEFORE the modal.
+    let expected: string;
+    switch (cell.verify.mode) {
+      case 'pinned': {
+        if (cell.verify.sha256 === '') return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
+        const pinnedSpec = pinnedVerifySpec(cell.gguf, cell.verify.sha256);
+        if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        // SC-5: the FULL beta.5 chain on EVERY backend — the exact-file-set
+        // pre-flight runs on the file path too, not just the Ollama ingest.
+        let verdict: HfDigestVerdict;
+        try {
+          verdict = await this.deps.verifyHfDigest(pinnedSpec.spec);
+        } catch {
+          verdict = { ok: false, reason: 'verify seam rejected' };
+        }
+        if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        expected = cell.verify.sha256;
+        break;
+      }
+      case 'live-oid': {
+        let oid: LfsOidVerdict;
+        try {
+          oid = await this.deps.resolveLfsOid(cell.gguf.hfRepo, cell.gguf.file);
+        } catch {
+          oid = { ok: false, reason: 'resolve seam rejected' };
+        }
+        if (!oid.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        expected = oid.oid;
+        break;
+      }
+      default:
+        return { ok: false, reason: PROVISION_UNKNOWN_VERIFY_REFUSAL };
+    }
+    // (5c) the WRITE gate (T6 SC-A-3): lstat-checked, symlink-refusing dest —
+    // a refusal here lands BEFORE the modal, and the modal below names the
+    // ~-redacted destination this exact result resolved.
+    const dest = await this.deps.checkedStoreDest(cell.gguf.hfRepo, cell.gguf.file);
+    if (!dest.ok) return { ok: false, reason: this.redact(dest.reason) };
+    const publisher = trustedPublisherFor(entry.publisher);
+    if (publisher === undefined) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+    const confirmed = await this.host.showModal(
+      composeLlamacppDownloadModal(cell.verify.mode, entry.displayName, cell.gguf, publisher, this.redact(dest.destPath)),
+      'Download',
+    );
+    if (!confirmed) return { ok: false, reason: 'declined' };
+    // (5d) the T3 atomic sink: same-dir `.part` → digest equality → rename →
+    // sidecar. Progress rides the ONE `pull:<modelId>` key.
+    await this.deps.downloadGgufToStore(
+      {
+        catalogId: entry.id,
+        gguf: {
+          hfRepo: cell.gguf.hfRepo,
+          file: cell.gguf.file,
+          quant: cell.gguf.quant,
+          sha256: expected,
+          approxBytes: cell.gguf.approxBytes,
+        },
+      },
+      dest.destDir,
+      dest.destFile,
+      (p) => this.pushPullProgress(entry.id, p),
+      signal,
+    );
+    // Presence flips: the sidecar now exists, so the next status() scan reads
+    // present — fire so the panel re-fetches without waiting for a user poke.
+    this.statusChangedEmitter.fire();
+    return { ok: true };
+  }
+
+  /**
+   * T7 (§2.5 4b): the EXTRACTED library-pull body — ONE implementation shared
+   * by the legacy free-text tier ({@link handlePullModel}, tag-keyed progress)
+   * and the catalog tier ({@link provisionOllama}, catalog-id-keyed progress).
+   * Modal and latch stay with each CALLER (one modal total per route).
+   *
+   * T1-M1 (carried obligation): an option-shaped tag (leading '-') is refused
+   * before the pull dep is invoked. Defense-in-depth — the pull itself is an
+   * HTTP `POST /api/pull` with a JSON body ({@link SetupControllerDeps.
+   * pullModel} → `ollamaClient.pullModel`), never a composed shell string,
+   * and no catalog tag can carry a leading '-' past T1's drift-lock — but a
+   * tag that LOOKS like a CLI flag must never reach any pull surface.
+   */
+  private async runLibraryPull(tag: string, endpoint: string, progressId: string, signal: AbortSignal): Promise<void> {
+    if (tag.startsWith('-')) {
+      throw new Error(LIBRARY_TAG_DASH_REFUSAL);
+    }
+    await this.deps.pullModel(endpoint, tag, (p) => this.pushPullProgress(progressId, p), signal);
+  }
+
+  /** One `{op:'pull'}` progress push under the given key — the shared
+   *  projection every pull/ingest/download branch rides (rule 7). */
+  private pushPullProgress(id: string, p: PullProgress): void {
+    this.pushProgress({
+      op: 'pull',
+      id,
+      phase: p.status,
+      ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
+      ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
+    });
+  }
+
+  // --- setup.saveAgentModel (beta.6 T8 — §2.5/§6) ---------------------------
+
+  /**
+   * T8 (beta.6 §2.5/§6): `setup.saveAgentModel {modelId, backend, endpoint}`
+   * — or `{clear: true}` to unset. Refusal order:
+   *
+   *   1. `clear` branch (checked FIRST, same discipline as {@link
+   *      handleSetApiKey}'s `clear` branch): Tier-1 modal → unset all 3
+   *      `talaria.agent.localModel.*` keys Global. Every other param is
+   *      ignored on this branch.
+   *   2. `modelId` must resolve to a CATALOG row whose `role === 'agent'` —
+   *      an unknown id refuses the same as `setup.provisionModel`'s
+   *      unknown-id case; a fim/embedding/next id is REFUSED (role-gate).
+   *   3. `backend` ∈ {'ollama','llamacpp','vllm'} — the FULL 3-enum
+   *      (UNLIKE `setup.provisionModel`, which refuses 'vllm': this method
+   *      only RECORDS which backend serves the model, it never downloads).
+   *   4. `endpoint` via {@link validateEndpointUrl}.
+   *   5. Tier-1 modal (§6 "Agent save modal", verbatim — names the model,
+   *      backend, and endpoint) → THEN the 3 Global writes.
+   *
+   * `status()` (via {@link composeAgentLocalModel}) recomposes
+   * `saved.runCommand`/`servedName`/`providerGuidance` from these three
+   * settings on every read — this handler only ever writes the raw
+   * selection, never a composed command (Global Constraint 5).
+   */
+  private async handleSaveAgentModel(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (bool(params, 'clear') === true) {
+      const confirmed = await this.host.showModal(CLEAR_AGENT_MODEL_MODAL, 'Clear');
+      if (!confirmed) return { ok: false, reason: 'declined' };
+      await this.host.updateSettingGlobal('talaria.agent.localModel.modelId', undefined);
+      await this.host.updateSettingGlobal('talaria.agent.localModel.backend', undefined);
+      await this.host.updateSettingGlobal('talaria.agent.localModel.endpoint', undefined);
+      return { ok: true };
+    }
+
+    const modelId = str(params, 'modelId');
+    const entry = modelId === undefined ? undefined : MODEL_CATALOG.find((m) => m.id === modelId);
+    if (entry === undefined) return { ok: false, reason: PROVISION_UNKNOWN_ID_REFUSAL };
+    if (entry.role !== 'agent') return { ok: false, reason: SAVE_AGENT_ROLE_REFUSAL };
+
+    const backend = str(params, 'backend');
+    if (backend !== 'ollama' && backend !== 'llamacpp' && backend !== 'vllm') {
+      return { ok: false, reason: SAVE_AGENT_BACKEND_REFUSAL };
+    }
+
+    const endpointRaw = str(params, 'endpoint');
+    if (!endpointRaw) return { ok: false, reason: 'endpoint is required.' };
+    const validated = validateEndpointUrl(endpointRaw);
+    if (!validated.ok) return { ok: false, reason: validated.reason };
+
+    const confirmed = await this.host.showModal(
+      composeSaveAgentModal(entry.displayName, backend, validated.url),
+      'Save',
+    );
+    if (!confirmed) return { ok: false, reason: 'declined' };
+
+    await this.host.updateSettingGlobal('talaria.agent.localModel.modelId', entry.id);
+    await this.host.updateSettingGlobal('talaria.agent.localModel.backend', backend);
+    await this.host.updateSettingGlobal('talaria.agent.localModel.endpoint', validated.url);
+    return { ok: true };
+  }
+
+  /**
+   * T8 (§1.3): the "Configure Local Agent Model" block's wire state, RECOMPUTED
+   * fresh from the 3 settings on EVERY `status()` call (never cached) — a
+   * setting edited outside the panel, or a catalog row that changed shape, is
+   * always reflected honestly. `endpointDefaults` is ALWAYS present;
+   * `saved`/`providerGuidance` are present only once all 3 settings resolve to
+   * a live agent-role catalog row (a stale/corrupted setting degrades to "no
+   * saved state" rather than fabricating one — fail-closed, same posture as
+   * {@link composeLlamacppCell}'s source-gate degrade).
+   */
+  private composeAgentLocalModel(
+    providerPhase: SetupData['provider']['phase'],
+    storePresence: ReadonlyMap<string, boolean>,
+  ): NonNullable<SetupData['agentLocalModel']> {
+    const endpointDefaults = AGENT_ENDPOINT_DEFAULTS;
+    const modelId = (this.host.getSetting<string>('talaria.agent.localModel.modelId') ?? '').trim();
+    const endpoint = (this.host.getSetting<string>('talaria.agent.localModel.endpoint') ?? '').trim();
+    const backendRaw = this.host.getSetting<string>('talaria.agent.localModel.backend');
+    const backend =
+      backendRaw === 'ollama' || backendRaw === 'llamacpp' || backendRaw === 'vllm' ? backendRaw : undefined;
+
+    if (modelId === '' || endpoint === '' || backend === undefined) return { endpointDefaults };
+    const entry = MODEL_CATALOG.find((m) => m.id === modelId && m.role === 'agent');
+    if (entry === undefined) return { endpointDefaults };
+
+    const saved = this.composeSavedAgentEntry(entry, backend, endpoint, storePresence);
+    if (saved === undefined) return { endpointDefaults };
+
+    return {
+      endpointDefaults,
+      saved,
+      providerGuidance: composeAgentGuidance(providerPhase, endpoint, saved.servedName),
+    };
+  }
+
+  /** One (entry, backend) pair -> the `saved` wire shape, or `undefined` for
+   *  a poisoned/fixture row that fails its backend's source gate (defense in
+   *  depth — every shipping row passes, T1's closure). Reuses the SAME
+   *  exported gates {@link handleProvisionModel} relies on
+   *  ({@link assertProvisionSources} for ollama/llamacpp, {@link
+   *  composeVllmCell}'s own SC-2 gate for vllm) rather than re-deriving trust
+   *  logic here. */
+  private composeSavedAgentEntry(
+    entry: CatalogModel,
+    backend: 'ollama' | 'llamacpp' | 'vllm',
+    endpoint: string,
+    storePresence: ReadonlyMap<string, boolean>,
+  ): NonNullable<NonNullable<SetupData['agentLocalModel']>['saved']> | undefined {
+    if (backend === 'vllm') {
+      const vllmCell = composeVllmCell(entry);
+      const servedName = servedNameFor(entry, 'vllm');
+      if (vllmCell === undefined || servedName === undefined) return undefined;
+      return { modelId: entry.id, backend, endpoint, servedName, runCommand: vllmCell.runCommand };
+    }
+
+    const gate = assertProvisionSources(entry, backend);
+    if (!gate.ok) return undefined;
+    const servedName = servedNameFor(entry, backend);
+    if (servedName === undefined) return undefined;
+
+    if (backend === 'ollama') {
+      // Ollama needs no run command — the daemon serves it (§1.1).
+      return { modelId: entry.id, backend, endpoint, servedName };
+    }
+
+    // backend === 'llamacpp': a run command needs a store-resident,
+    // sidecar-attested file (same honesty rule as the catalog cell) — a
+    // saved config for a not-yet-downloaded model renders no runCommand,
+    // never a path to a file that doesn't exist. The port is ALWAYS the
+    // SAVED endpoint's own (CC-6) — never LLAMACPP_RUN_FLAGS's default.
+    const cell = entry.llamacpp;
+    let runCommand: string | undefined;
+    if (cell !== undefined && storePresence.get(entry.id) === true) {
+      const dest = this.deps.storeDest(cell.gguf.hfRepo, cell.gguf.file);
+      const port = extractPort(endpoint);
+      if (dest.ok && port !== undefined) {
+        runCommand = `llama-server -m ${this.redact(dest.destPath)} --jinja --port ${port}`;
+      }
+    }
+    return { modelId: entry.id, backend, endpoint, servedName, ...(runCommand !== undefined ? { runCommand } : {}) };
+  }
+
   // --- setup.cancel (read-only / best-effort) -----------------------------------
 
   private handleCancel(params: unknown): { ok: true } {
@@ -1137,25 +2021,50 @@ export class SetupController {
    * reason). T4 M-2 carry-forward applies here too: `locatePipx` can
    * REJECT, and that must never become an unhandled rejection out of a
    * read-only recheck.
+   *
+   * T6 (beta.6 §2.5): gains the optional validated `scope` param — a STRICT
+   * enum (`'all'|'agent'|'os'|'ollama'|'llamacpp'`), absent = `'all'`
+   * (byte-compatible with every existing caller); anything else is refused
+   * before any work. Scopes: `agent` = the pipx relocate above; `os` = drop
+   * the memoized OS detection; `llamacpp` = {@link rekickLlamaCppProbe}
+   * WITHOUT awaiting (the probe settles later and fires its own push);
+   * `ollama` = nothing beyond the completion fire (the daemon probe already
+   * re-runs on every `status()`); `all` = everything. Scoping exists so a
+   * RAG-pane Re-check can never overwrite the Agent card's sticky phase
+   * (rev-2 critic fold).
    */
-  private async handleRecheck(): Promise<{ ok: true }> {
-    // T5: drop the memoized OS detection — the next demand (the status()
-    // this recheck's caller refreshes with, or the next bootstrap-terminal
-    // request) re-reads through the binding, picking up e.g. a container
-    // escape or a newly readable /etc/os-release.
-    this.osResolution = undefined;
-    try {
-      const located = await this.deps.locatePipx();
-      if (located.ok) {
-        this.lastAgentIssue = undefined;
-      } else {
-        // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
-        // — probe-timeout is not a distinct sticky phase.
-        const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
-        this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+  private async handleRecheck(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const scope = validateRecheckScope(params);
+    if (scope === undefined) {
+      return { ok: false, reason: "scope must be one of 'all', 'agent', 'os', 'ollama', 'llamacpp'." };
+    }
+    if (scope === 'all' || scope === 'os') {
+      // T5: drop the memoized OS detection — the next demand (the status()
+      // this recheck's caller refreshes with, or the next bootstrap-terminal
+      // request) re-reads through the binding, picking up e.g. a container
+      // escape or a newly readable /etc/os-release.
+      this.osResolution = undefined;
+    }
+    if (scope === 'all' || scope === 'llamacpp') {
+      // Non-blocking by design: clears the settled memo, cancels the
+      // superseded attempt, and re-kicks — the recheck RPC never waits on a
+      // login-shell probe.
+      this.rekickLlamaCppProbe();
+    }
+    if (scope === 'all' || scope === 'agent') {
+      try {
+        const located = await this.deps.locatePipx();
+        if (located.ok) {
+          this.lastAgentIssue = undefined;
+        } else {
+          // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
+          // — probe-timeout is not a distinct sticky phase.
+          const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
+          this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+        }
+      } catch (err) {
+        this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
       }
-    } catch (err) {
-      this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
     }
     // T7 (§2.2.2): fired exactly ONCE at completion (not per lastAgentIssue
     // write above) — recheck is read-only/no-modal, so "the recheck
@@ -1171,8 +2080,12 @@ export class SetupController {
     const hermesPath = (this.host.getSetting<string>('talaria.hermesPath') ?? '').trim();
     if (!hermesPath) return { ok: false, reason: 'Hermes is not installed yet — install it first.' };
     const hermesAcpPath = deriveHermesAcpPath(hermesPath);
+    // CR-003b: DISPLAY-ONLY redaction, exactly like CR-003 — the modal
+    // string never lets a forged talaria.hermesPath (newline/bidi override)
+    // inject fake lines; the terminal launch below still gets the real,
+    // unredacted path.
     const confirmed = await this.host.showModal(
-      `Open a terminal running '${hermesAcpPath} --setup' to configure your chat provider?`,
+      `Open a terminal running '${redactForModal(hermesAcpPath)} --setup' to configure your chat provider?`,
       'Open Terminal',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
@@ -1319,8 +2232,24 @@ export class SetupController {
     if (!validated.ok) return { ok: false, reason: validated.reason };
     const model = str(params, 'model')?.trim();
     if (!model) return { ok: false, reason: 'model is required.' };
+    // T1 (beta.6 panel-fix PT1): sanitize BEFORE the modal that interpolates it.
+    const sanitizedModel = refuseUnsafeModalText(model, 'model');
+    if (!sanitizedModel.ok) return sanitizedModel;
+    // T8 (beta.6 CC-10): additive, OPTIONAL `dedicatedBackendId` — a strict
+    // 4-enum when PRESENT (absent stays absent, no clobber — the restoration
+    // fallback stays the existing transport heuristic); a malformed value
+    // refuses outright, same "never trust webview input" discipline as
+    // every other enum param in this file.
+    const dedicatedBackendIdRaw = str(params, 'dedicatedBackendId');
+    if (dedicatedBackendIdRaw !== undefined && coerceDedicatedBackendId(dedicatedBackendIdRaw) === undefined) {
+      return { ok: false, reason: "dedicatedBackendId must be one of 'ollama', 'llamacpp', 'vllm', 'openai-compat'." };
+    }
 
-    const oldEndpoint = (this.host.getSetting<string>('talaria.nextEdit.endpoint') ?? '').trim() || '(none)';
+    // T2 (beta.6 panel-fix CR-003): redact BEFORE the '(none)' fallback --
+    // trim -> redact -> fallback, so an endpoint that's ALL unsafe chars
+    // redacts to empty and correctly falls back to '(none)'. Display-only:
+    // the WRITE below still stores validated.url, never this redacted copy.
+    const oldEndpoint = redactForModal((this.host.getSetting<string>('talaria.nextEdit.endpoint') ?? '').trim()) || '(none)';
     const confirmed = await this.host.showModal(
       `Set dedicated Next-Edit endpoint from '${oldEndpoint}' to '${validated.url}' (model: ${model})?`,
       'Apply',
@@ -1330,6 +2259,9 @@ export class SetupController {
     await this.host.updateSettingGlobal('talaria.nextEdit.backend', backend);
     await this.host.updateSettingGlobal('talaria.nextEdit.endpoint', validated.url);
     await this.host.updateSettingGlobal('talaria.nextEdit.model', model);
+    if (dedicatedBackendIdRaw !== undefined) {
+      await this.host.updateSettingGlobal('talaria.nextEdit.dedicatedBackendId', dedicatedBackendIdRaw);
+    }
     return { ok: true };
   }
 
@@ -1345,10 +2277,28 @@ export class SetupController {
       if (!validated.ok) return { ok: false, reason: validated.reason };
       patch['talaria.rag.embedEndpoint'] = validated.url;
     }
+    // T1 (beta.6 panel-fix PT1): both are interpolated into the Apply modal
+    // below — sanitize BEFORE they enter the patch (and thus the summary).
     const embedModel = str(params, 'embedModel')?.trim();
-    if (embedModel) patch['talaria.rag.embedModel'] = embedModel;
+    if (embedModel) {
+      const sanitized = refuseUnsafeModalText(embedModel, 'embedModel');
+      if (!sanitized.ok) return sanitized;
+      patch['talaria.rag.embedModel'] = embedModel;
+    }
     const indexDir = str(params, 'indexDir')?.trim();
-    if (indexDir) patch['talaria.rag.indexDir'] = indexDir;
+    if (indexDir) {
+      const sanitized = refuseUnsafeModalText(indexDir, 'indexDir');
+      if (!sanitized.ok) return sanitized;
+      patch['talaria.rag.indexDir'] = indexDir;
+    }
+    // T8 (beta.6 CC-10): additive, OPTIONAL `embedBackend` — strict 3-enum.
+    const embedBackend = str(params, 'embedBackend');
+    if (embedBackend !== undefined) {
+      if (embedBackend !== 'ollama' && embedBackend !== 'llamacpp' && embedBackend !== 'openai-compat') {
+        return { ok: false, reason: "embedBackend must be 'ollama', 'llamacpp', or 'openai-compat'." };
+      }
+      patch['talaria.rag.embedBackend'] = embedBackend;
+    }
 
     if (Object.keys(patch).length === 0) {
       return { ok: false, reason: 'no changes supplied.' };
@@ -1561,6 +2511,329 @@ function composeBootstrap(osInfo: OsResolution): { command?: string; guidance: s
     : { guidance: PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
 }
 
+// --- T6 (beta.6): llama.cpp install projection + catalog cell gates ----------
+
+/** beta.6 §6 copy, verbatim: the "llama.cpp missing" line (single-sourced —
+ *  the webview renders this string, never restates it). */
+const LLAMACPP_MISSING_GUIDANCE = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';
+/** beta.6 §6 copy, verbatim: the llamacpp honest-absence line — rev 3:
+ *  fixture/future-rows only, NO shipping row renders it (every shipping
+ *  row's gguf source passes the compose-time gate below). */
+const LLAMACPP_HONEST_ABSENCE =
+  'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.';
+/** Docs link for the guidance-only install cells (debian/unknown/container)
+ *  — the same llama-server docs URL the registry's guided-terminal recipe
+ *  pins (`registry.ts`, llamacpp `localInstall.recipe.docsUrl`). */
+const LLAMACPP_SERVER_DOCS_URL = 'https://github.com/ggml-org/llama.cpp/tree/master/tools/server';
+
+/**
+ * T6 (CC-4): the `llamacppRuntime.install` projection — the
+ * {@link composeBootstrap} pattern over `installCommand(family,'llamacpp')`.
+ * A known family (fedora/arch/suse) carries the engine's exact pre-typed
+ * line + that entry's own docsUrl; a guidance-only family (debian — the
+ * archive package name is unconfirmed —, unknown, or the S-F10 container
+ * degrade, whose §6 note then IS the guidance) carries text + the
+ * llama-server docs link only. No command is ever guessed (Constraint 1).
+ */
+function composeLlamacppInstall(osInfo: OsResolution): { command?: string; guidance: string; docsUrl: string } {
+  const spec = installCommand(osInfo.family, 'llamacpp');
+  if (spec !== undefined) {
+    return { command: spec.command, guidance: LLAMACPP_MISSING_GUIDANCE, docsUrl: spec.docsUrl };
+  }
+  return { guidance: osInfo.containerNote ?? LLAMACPP_MISSING_GUIDANCE, docsUrl: LLAMACPP_SERVER_DOCS_URL };
+}
+
+/** §2.5 run-command composition (drift-locked strings): per-role flags for a
+ *  store-resident GGUF. The agent port matches `endpointDefaults.llamacpp`
+ *  (8013 — T8 recomposes from the SAVED endpoint's port); NEXT keeps
+ *  beta.5's 8012. */
+const LLAMACPP_RUN_FLAGS: Readonly<Record<CatalogRole, string>> = {
+  fim: '--port 8080',
+  embedding: '--embeddings --port 8081',
+  agent: '--jinja --port 8013',
+  next: '--port 8012',
+};
+
+function isAllowlistedHfOwner(owner: string): boolean {
+  return TRUSTED_HF_PUBLISHERS.some((p) => p.hfOwner === owner);
+}
+
+/**
+ * T6 (SC-2, §2.2.6): the vLLM `serveRepo` COMPOSE-TIME gate. Order is
+ * load-bearing (T1-M1): `assertCatalogSource` (charset) runs FIRST — a
+ * `..`-traversal, leading `-`/`:`, or any charset violation yields ABSENCE
+ * before any membership check could bless it — then the serve-source
+ * closure: allowlisted publisher OR membership in the ledgered
+ * `VLLM_ONLY_SERVE_REPOS` exception table. Failure ⇒ `undefined` (the cell
+ * renders honest absence) — never a composed command over a bad source.
+ * Exported PURE so a poisoned-fixture test can drive it directly.
+ */
+export function composeVllmCell(model: CatalogModel): { runCommand: string } | undefined {
+  const serveRepo = model.vllm?.serveRepo;
+  if (serveRepo === undefined) return undefined;
+  if (!assertCatalogSource({ serveRepo }).ok) return undefined;
+  const slash = serveRepo.indexOf('/');
+  const owner = slash === -1 ? serveRepo : serveRepo.slice(0, slash);
+  if (!isAllowlistedHfOwner(owner) && !VLLM_ONLY_SERVE_REPOS.includes(serveRepo)) return undefined;
+  return { runCommand: `vllm serve ${serveRepo}` };
+}
+
+/**
+ * T6 (§1.3/§2.2.8): one catalog row's llamacpp wire cell. Runtime
+ * defense-in-depth mirroring the triple-allowlist posture: the gguf source
+ * strings are charset-asserted AND owner-allowlist-checked at compose time —
+ * a failing row (fixture/future only; every shipping row passes, drift-
+ * locked at T1) renders HONEST ABSENCE (`available:false` + the §6 copy)
+ * with no runCommand ever. `available` otherwise tracks the verify pin:
+ * live-oid rows are always downloadable; a pinned row is downloadable iff
+ * its sha256 is published (sweep-next ships `''` ⇒ `false`, fail-closed —
+ * carried WITHOUT an unavailableReason: the NEXT card's wire truth owns the
+ * pinned-disabled copy). `runCommand` composes ONLY for a present
+ * (sidecar-attested by the scan) file whose ~-redacted dest resolved
+ * (§2.2.8) — presence is the scan's verdict, and the scan itself IS the
+ * sidecar attestation.
+ * Exported PURE so poisoned-fixture tests can drive it directly.
+ */
+export function composeLlamacppCell(
+  model: CatalogModel,
+  present: boolean,
+  redactedDestPath: string | undefined,
+): NonNullable<SetupCatalogModel['llamacpp']> | undefined {
+  const cell = model.llamacpp;
+  if (cell === undefined) return undefined;
+  const slash = cell.gguf.hfRepo.indexOf('/');
+  const owner = slash === -1 ? cell.gguf.hfRepo : cell.gguf.hfRepo.slice(0, slash);
+  const sourceOk =
+    assertCatalogSource({ hfRepo: cell.gguf.hfRepo, file: cell.gguf.file }).ok && isAllowlistedHfOwner(owner);
+  if (!sourceOk) {
+    // The file/byte fields are inert display data (the webview only ever
+    // sends back `id`); the AFFORDANCES are what absence kills: forced
+    // not-present, not-available, and no runCommand — never a composed
+    // string over an unasserted source.
+    return {
+      file: cell.gguf.file,
+      approxBytes: cell.gguf.approxBytes,
+      present: false,
+      available: false,
+      unavailableReason: LLAMACPP_HONEST_ABSENCE,
+    };
+  }
+  const available = cell.verify.mode === 'live-oid' || cell.verify.sha256 !== '';
+  return {
+    file: cell.gguf.file,
+    approxBytes: cell.gguf.approxBytes,
+    present,
+    available,
+    ...(present && redactedDestPath !== undefined
+      ? { runCommand: `llama-server -m ${redactedDestPath} ${LLAMACPP_RUN_FLAGS[model.role]}` }
+      : {}),
+  };
+}
+
+// --- T7 (beta.6 §2.5): provisionModel pure helpers ---------------------------
+
+/**
+ * T7 (§2.5 step 2, SC-1): the runtime source assert for ONE `(row, backend)`
+ * provisioning branch — charset assert on EVERY string the branch will use +
+ * publisher ∈ {@link TRUSTED_HF_PUBLISHERS} + hfRepo-prefix re-assert
+ * (`owner/… === publisher/…`). Unreachable for shipping data (T1's
+ * drift-locks close it at build time) but REQUIRED at runtime: a poisoned
+ * catalog edit has to defeat a reviewed data diff AND this independent
+ * check, and `resolveLfsOid`/`verifyHfDigest` never see an unasserted
+ * string (assert-before-resolve). An absent backend cell asserts vacuously —
+ * its branch refuses with the honest-absence copy instead (steps 4a/5a).
+ * Exported PURE so the closure test can drive every catalog row directly.
+ */
+export function assertProvisionSources(
+  model: CatalogModel,
+  backend: 'ollama' | 'llamacpp',
+): { ok: true } | { ok: false; reason: string } {
+  if (!isAllowlistedHfOwner(model.publisher)) {
+    return { ok: false, reason: `publisher '${model.publisher}' is not on the trusted-publisher allowlist` };
+  }
+  if (backend === 'ollama') {
+    const cell = model.ollama;
+    if (cell === undefined) return { ok: true };
+    if (cell.tier === 'library') {
+      return assertCatalogSource({ tag: cell.tag });
+    }
+    // hf-ingest cells also hand the created name to the daemon (`/api/create`)
+    // — asserted under the tag charset (no '/', no '.'/'..').
+    const charset = assertCatalogSource({ hfRepo: cell.gguf.hfRepo, file: cell.gguf.file, tag: cell.createdName });
+    if (!charset.ok) return charset;
+    if (!cell.gguf.hfRepo.startsWith(`${model.publisher}/`)) {
+      return { ok: false, reason: "hfRepo owner does not match the row's publisher" };
+    }
+    return { ok: true };
+  }
+  const cell = model.llamacpp;
+  if (cell === undefined) return { ok: true };
+  const charset = assertCatalogSource({ hfRepo: cell.gguf.hfRepo, file: cell.gguf.file });
+  if (!charset.ok) return charset;
+  if (!cell.gguf.hfRepo.startsWith(`${model.publisher}/`)) {
+    return { ok: false, reason: "hfRepo owner does not match the row's publisher" };
+  }
+  return { ok: true };
+}
+
+/** The allowlist row for a catalog publisher — modal copy (name + trustBasis)
+ *  comes from HERE, never from the webview. */
+function trustedPublisherFor(owner: string): TrustedPublisher | undefined {
+  return TRUSTED_HF_PUBLISHERS.find((p) => p.hfOwner === owner);
+}
+
+/**
+ * T7 (§2.5 4c/5b, SC-5): the pinned-mode verify input. The FULL beta.5 chain
+ * needs `allowedRepoFiles` (exact-file-set equality, both directions), which
+ * catalog rows don't carry — it comes from the registry's own Sweep pin,
+ * drift-locked equal to the catalog's pinned row (T1: sweep≡registry,
+ * pinned⇔SyntinalCo). A pinned row naming any OTHER artifact cannot be
+ * exact-set-verified and refuses outright — fail-closed, unreachable for
+ * shipping data, fixture-tested.
+ */
+function pinnedVerifySpec(gguf: CatalogGguf, sha256: string): { ok: true; spec: HfGgufSpec } | { ok: false } {
+  if (gguf.hfRepo !== NEXT_DEDICATED_MODEL.gguf.hfRepo || gguf.file !== NEXT_DEDICATED_MODEL.gguf.file) {
+    return { ok: false };
+  }
+  return {
+    ok: true,
+    spec: {
+      hfRepo: gguf.hfRepo,
+      file: gguf.file,
+      sha256,
+      allowedRepoFiles: NEXT_DEDICATED_MODEL.gguf.allowedRepoFiles,
+    },
+  };
+}
+
+/** Modal size rendering: decimal GB to one decimal from the EXACT catalog
+ *  bytes (beta.5 precedent — 4 680 000 000 renders `4.7 GB`). */
+function formatApproxGb(bytes: number): string {
+  return `${(bytes / 1e9).toFixed(1)} GB`;
+}
+
+/** §6 "Provision modal — pinned", ollama-ingest arm: the beta.5 strong-claim
+ *  wording UNCHANGED + the endpoint clause (SC-A-7 — the modal names the
+ *  daemon it installs onto). DISTINCT from the live-oid copy (A-2): "against
+ *  its pinned value" is the strong claim only this mode may make. */
+function composePinnedOllamaModal(displayName: string, gguf: CatalogGguf, endpoint: string): string {
+  return (
+    `Download '${displayName}' (~${formatApproxGb(gguf.approxBytes)}) and install it into your local Ollama? ` +
+    `Source: huggingface.co/${gguf.hfRepo} — Syntinal's build converted from Sweep's official release. ` +
+    "Talaria verifies the file's checksum against its pinned value after downloading, " +
+    `and Ollama verifies it again during install at ${endpoint}.`
+  );
+}
+
+/** §6 "Provision modal — live-oid", ollama-ingest arm (verbatim template):
+ *  names the artifact, the publisher + trustBasis, the honest (weaker)
+ *  verification basis, and the ingest endpoint. */
+function composeLiveOidOllamaModal(
+  displayName: string,
+  gguf: CatalogGguf,
+  publisher: TrustedPublisher,
+  endpoint: string,
+): string {
+  return (
+    `Download '${displayName}' (${gguf.quant}, ~${formatApproxGb(gguf.approxBytes)}) from huggingface.co/${gguf.hfRepo}? ` +
+    `Publisher: ${publisher.name} — ${publisher.trustBasis} ` +
+    "Talaria verifies the file's checksum against the publisher's manifest after downloading, " +
+    `and Ollama verifies it again during install at ${endpoint}.`
+  );
+}
+
+/** §2.5 5c: the llamacpp download modal — mode-distinct copy (A-2) naming
+ *  publisher + trustBasis + repo + size + the ~-redacted destination. */
+function composeLlamacppDownloadModal(
+  mode: 'pinned' | 'live-oid',
+  displayName: string,
+  gguf: CatalogGguf,
+  publisher: TrustedPublisher,
+  redactedDest: string,
+): string {
+  const basis = mode === 'pinned' ? 'against its pinned value' : "against the publisher's manifest";
+  return (
+    `Download '${displayName}' (${gguf.quant}, ~${formatApproxGb(gguf.approxBytes)}) from huggingface.co/${gguf.hfRepo}? ` +
+    `Publisher: ${publisher.name} — ${publisher.trustBasis} ` +
+    `Talaria verifies the file's checksum ${basis} after downloading, ` +
+    `then places it in ${redactedDest}.`
+  );
+}
+
+// --- T8 (beta.6 §2.5/§6): setup.saveAgentModel pure helpers -------------------
+
+/** §6 "Agent save modal", verbatim. */
+function composeSaveAgentModal(displayName: string, backend: string, endpoint: string): string {
+  return `Set the local agent model to '${displayName}' via ${backend} at ${endpoint}?`;
+}
+
+/**
+ * T8 (§2.5, exported for direct testing): "what to type into the provider
+ * wizard" for one (entry, backend) pair — ollama: the tag (library tier) or
+ * the CREATED name (hf-ingest tier, rev 3 — e.g. Devstral's
+ * `devstral-small-2507:24b`); llamacpp: the GGUF's model name (its filename —
+ * llama-server's `/v1/models` id falls back to the file basename absent a
+ * `--alias`, Context7-grounded against `/ggml-org/llama.cpp`'s server source);
+ * vllm: the serveRepo. `undefined` for a missing/fixture cell (every shipping
+ * agent row carries all three, T1's closure) — never a fabricated guess.
+ */
+export function servedNameFor(entry: CatalogModel, backend: 'ollama' | 'llamacpp' | 'vllm'): string | undefined {
+  if (backend === 'ollama') {
+    if (entry.ollama?.tier === 'library') return entry.ollama.tag;
+    if (entry.ollama?.tier === 'hf-ingest') return entry.ollama.createdName;
+    return undefined;
+  }
+  if (backend === 'llamacpp') return entry.llamacpp?.gguf.file;
+  return entry.vllm?.serveRepo;
+}
+
+/**
+ * T8 (CC-6): the SAVED agent endpoint's own port — NEVER a hardcoded default
+ * (`LLAMACPP_RUN_FLAGS`'s literal is for the pre-save picker cell only).
+ * `undefined` only for a malformed URL — unreachable in practice, since
+ * `saved.endpoint` already passed {@link validateEndpointUrl} at save time.
+ */
+function extractPort(rawUrl: string): string | undefined {
+  try {
+    const url = new URL(rawUrl);
+    if (url.port !== '') return url.port;
+    return url.protocol === 'https:' ? '443' : '80';
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * §6 "Agent guidance — …", the three variants (exported for direct testing —
+ * `'unknown'` is not reachable through {@link computeProviderCard} today, so
+ * the fourth `provider.phase` value can only be exercised by calling this
+ * pure function directly). Gated on `provider.phase` (CC-7): `'unconfigured'`
+ * gets the full wizard-pointing copy; `'configured'` gets the update-if-you-
+ * want-it copy; `'waiting-agent'` AND `'unknown'` share the waiting copy — the
+ * Provider card's wizard button renders at NEITHER phase
+ * (`SetupPanel.tsx` `ProviderCard`), so the copy must not point at it.
+ */
+export function composeAgentGuidance(
+  phase: SetupData['provider']['phase'],
+  endpoint: string,
+  servedName: string,
+): string {
+  // beta.6 panel-fix PT8 (audit A8, the one-carrier ✓ rule): no leading ✓ —
+  // this always renders via the webview's `DoneLine`, whose `pass-filled`
+  // icon already carries the check; a literal ✓ beside it would double up.
+  if (phase === 'configured') {
+    return `Local model saved. Your provider is already configured — update it to ${endpoint}/v1 · ${servedName} if you want the agent on this model.`;
+  }
+  if (phase === 'unconfigured') {
+    return (
+      `Local model ready. Next: press "Configure provider" on the Provider card below → choose the ` +
+      `OpenAI-compatible (custom URL) provider → base URL: ${endpoint}/v1 · model: ${servedName}. Test shows the served model if unsure.`
+    );
+  }
+  // 'waiting-agent' / 'unknown'
+  return 'Local model ready. The provider step unlocks once Hermes is installed and connected — the Provider card below will show "Configure provider".';
+}
+
 /**
  * T5: strict server-side enum validation of `setup.openBootstrapTerminal`'s
  * `{target}` param (SECURITY, Global Constraint 1 — webview input is never
@@ -1576,6 +2849,38 @@ function validateBootstrapTarget(params: unknown): 'pipx' | 'python' | undefined
   const raw = (params as Record<string, unknown>)['target'];
   if (raw === undefined) return 'pipx';
   return raw === 'pipx' || raw === 'python' ? raw : undefined;
+}
+
+/** T6 (beta.6 §2.5): `setup.recheck`'s scope values — validated as a STRICT
+ *  enum, same discipline as {@link validateBootstrapTarget}. Exported (T9,
+ *  §1.3) so a protocol-level lock test can pin the exact canonical array —
+ *  `handleRecheck`'s refusal message is a hand-written literal, not derived
+ *  from this array, so nothing else would catch a silent add/remove/rename
+ *  here. Mirrors the {@link MUTATING_METHODS}/{@link READ_ONLY_METHODS}
+ *  export-for-a-lock-test precedent. */
+export const RECHECK_SCOPES = ['all', 'agent', 'os', 'ollama', 'llamacpp'] as const;
+export type RecheckScope = (typeof RECHECK_SCOPES)[number];
+
+/**
+ * T6 (beta.6 §2.5): strict server-side validation of `setup.recheck`'s
+ * optional `{scope}` param (webview input is never trusted — Constraint 1).
+ * Absent params / absent key / explicit `undefined` = `'all'` (byte-
+ * compatible with every existing caller). A PRESENT key with anything but
+ * the five literals — including a non-string — is `undefined` = refuse; it
+ * is NOT coerced to the default, so a malformed request can never silently
+ * run the full recheck. Exported (T9, §1.3) for direct unit-level locking
+ * of the validator itself, distinct from the `controller.handle()`
+ * round-trip behavioral tests.
+ */
+export function validateRecheckScope(params: unknown): RecheckScope | undefined {
+  if (params === undefined || params === null) return 'all';
+  if (typeof params !== 'object') return undefined;
+  if (!('scope' in params)) return 'all';
+  const raw = (params as Record<string, unknown>)['scope'];
+  if (raw === undefined) return 'all';
+  return typeof raw === 'string' && (RECHECK_SCOPES as readonly string[]).includes(raw)
+    ? (raw as RecheckScope)
+    : undefined;
 }
 
 function deriveHermesAcpPath(hermesPath: string): string {

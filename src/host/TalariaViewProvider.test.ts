@@ -199,9 +199,11 @@ function makeProvider(invokeControl: AgentBackend['invokeControl']): {
 }
 
 async function flush(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
+  // One macrotask turn: drains the ENTIRE pending microtask queue however
+  // deep the await chain runs (counting bare Promise.resolve() ticks broke
+  // every time a handler legitimately gained an await — beta.6 T6's
+  // status() store-scan being the latest). No fake timers in this file.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
 describe('TalariaViewProvider — control.request responder (Part A2)', () => {
@@ -1300,6 +1302,18 @@ function makeFakeSetupDeps(): SetupControllerDeps {
     // T13 (beta.5 §4.4): routing tests never reach the vetted-ingest branch.
     verifyHfDigest: async () => ({ ok: false, reason: 'not used in routing tests' }),
     ingestGguf: async () => {
+      throw new Error('not used in routing tests');
+    },
+    // T7 (beta.6): routing tests never provision by catalog id.
+    resolveLfsOid: async () => ({ ok: false, reason: 'not used in routing tests' }),
+    // T6 (beta.6): status() must stay total for the panel pushes these
+    // routing tests exercise — a never-settling probe keeps the memo at
+    // 'checking'; an empty scan reads all-absent; dest composition refuses.
+    locateLlamaServer: () => new Promise<never>(() => {}),
+    scanStorePresence: async () => new Map<string, boolean>(),
+    storeDest: () => ({ ok: false, reason: 'not used in routing tests' }),
+    checkedStoreDest: async () => ({ ok: false, reason: 'not used in routing tests' }),
+    downloadGgufToStore: async () => {
       throw new Error('not used in routing tests');
     },
   };

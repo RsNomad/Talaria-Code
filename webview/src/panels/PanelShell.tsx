@@ -25,8 +25,19 @@ export function EmptyPanel({ hint }: { hint: string }) {
   return <div className="px-1 py-6 text-center text-xs text-faint">{hint}</div>;
 }
 
-export function SectionLabel({ children }: { children: ReactNode }) {
-  return <div className="h-eyebrow mb-1.5 mt-3 first:mt-0">{children}</div>;
+/**
+ * `id`, when given, is ALSO applied as `tabIndex={-1}` — beta.6 T18 (§3.5,
+ * B-F6): the recs strip's `Set up →` jump moves focus to the owning card's
+ * heading after `scrollIntoView`, and a heading needs to be programmatically
+ * focusable to receive it. Every existing caller omits `id` and is
+ * byte-for-byte unaffected (optional, defaults to `undefined`).
+ */
+export function SectionLabel({ children, id }: { children: ReactNode; id?: string }) {
+  return (
+    <div id={id} tabIndex={id !== undefined ? -1 : undefined} className="h-eyebrow mb-1.5 mt-3 first:mt-0">
+      {children}
+    </div>
+  );
 }
 
 interface RemotePanelProps<T> {

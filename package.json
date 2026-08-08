@@ -2,7 +2,7 @@
   "name": "talaria-code",
   "displayName": "Talaria Code",
   "description": "Talaria Code — an in-editor client for the Hermes agent: chat, tools, MCP, skills, checkpoints and more, in a native VS Code panel.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "syntinal",
   "license": "GPL-3.0-or-later",
   "repository": {
@@ -322,6 +322,32 @@
             "default": "",
             "scope": "machine",
             "markdownDescription": "Working directory for the Hermes agent process. Leave empty to use the first workspace folder. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: not workspace-overridable (security). When no workspace folder is open, the user home directory is used."
+          },
+          "talaria.agent.localModel.modelId": {
+            "order": 5,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "Catalog id of the local model saved for the agent via the Setup panel's \"Configure Local Agent Model\" block (e.g. `devstral-24b`). Leave empty when no local agent model has been saved. Set through the panel, not hand-edited. Machine-scoped: a workspace cannot silently repoint the agent at a different local model (security — same rationale as `#talaria.autocomplete.model#`)."
+          },
+          "talaria.agent.localModel.backend": {
+            "order": 6,
+            "type": "string",
+            "enum": [
+              "ollama",
+              "llamacpp",
+              "vllm"
+            ],
+            "default": "ollama",
+            "scope": "machine",
+            "markdownDescription": "Which backend serves the saved local agent model (`#talaria.agent.localModel.modelId#`). Only meaningful once a model has been saved. Machine-scoped: a workspace cannot flip this to redirect where agent-model traffic goes (security)."
+          },
+          "talaria.agent.localModel.endpoint": {
+            "order": 7,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "Base URL for the saved local agent model's backend. Leave empty when no local agent model has been saved. Set through the Setup panel's Save action, not hand-edited. Machine-scoped: a workspace cannot redirect where agent-model requests are sent (security)."
           }
         }
       },
@@ -460,6 +486,13 @@
             "default": "",
             "scope": "machine",
             "description": "Model name/id used for Next Edit Suggestions (the NEXT source), e.g. a sweep-v2-7B GGUF import. Machine-scoped: a workspace cannot silently repoint next-edit requests at a different model (security)."
+          },
+          "talaria.nextEdit.dedicatedBackendId": {
+            "order": 5,
+            "type": "string",
+            "default": "",
+            "scope": "machine",
+            "markdownDescription": "Which unified Local Model pane (`ollama` / `llamacpp` / `vllm` / `openai-compat`) the dedicated Next Edit connection was last configured through — restoration-only, read by the Setup panel to reopen the same pane. Leave empty to fall back to the existing transport heuristic. Set through the panel, not hand-edited. Machine-scoped: not workspace-overridable (security — consistent with every other `#talaria.nextEdit#` key)."
           }
         }
       },
@@ -520,6 +553,18 @@
             },
             "default": [],
             "description": "Extra glob patterns to exclude from indexing, beyond .gitignore/.hermesignore."
+          },
+          "talaria.rag.embedBackend": {
+            "order": 9,
+            "type": "string",
+            "enum": [
+              "ollama",
+              "llamacpp",
+              "openai-compat"
+            ],
+            "default": "ollama",
+            "scope": "machine",
+            "markdownDescription": "Which backend the RAG embedder block (`#talaria.rag.embedEndpoint#` / `#talaria.rag.embedModel#`) is configured against — restoration-only, read by the Setup panel to reopen the same pane. Set through the panel, not hand-edited. Machine-scoped: a workspace cannot redirect where whole-file embeddings are sent (security — same rationale as `#talaria.rag.embedEndpoint#`)."
           }
         }
       },
