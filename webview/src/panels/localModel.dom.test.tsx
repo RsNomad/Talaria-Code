@@ -376,6 +376,29 @@ describe('LocalModelBlock — Serving line from the widened testRemote result', 
     });
     expect(screen.queryByText(/^Serving:/)).not.toBeInTheDocument();
   });
+
+  // beta.6 fix-wave T9 (M-1): `TestAndServingLine`'s `servingModels` state must
+  // NOT survive a pane switch. A non-ollama <-> non-ollama switch (RAG/Agent
+  // llamacpp<->vllm) keeps `LocalModelBlock` mounted at the same tree
+  // position, so without a reset the PREVIOUS pane's "Serving: ..." list would
+  // render under the NEW pane's label until re-tested — a staleness/honesty
+  // bug (a vLLM endpoint would appear to be "serving" a model it never
+  // reported).
+  it('switching pane (backend + endpoint) after a green Test clears the stale Serving list', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, models: ['qwen2.5-coder:1.5b-base'] });
+    const { user, rerender } = setup(
+      <LocalModelBlock {...baseProps({ backend: 'llamacpp', endpoint: 'http://127.0.0.1:8012', dispatch })} />,
+    );
+    await user.click(screen.getByRole('button', { name: /Test connection/ }));
+    expect(await screen.findByText('Serving: qwen2.5-coder:1.5b-base')).toBeInTheDocument();
+
+    // Pane switch: llamacpp -> vllm, same mount position (component NOT
+    // unmounted/remounted by the caller — this is exactly the RAG/Agent
+    // dropdown-switch scenario).
+    rerender(<LocalModelBlock {...baseProps({ backend: 'vllm', endpoint: 'http://127.0.0.1:8000', dispatch })} />);
+
+    expect(screen.queryByText(/^Serving:/)).not.toBeInTheDocument();
+  });
 });
 
 /* ------------------------------------------------------------------ *

@@ -172,7 +172,9 @@ export function LocalModelBlock(props: LocalModelBlockProps) {
         ))}
       </div>
 
-      {backend !== 'ollama' && <TestAndServingLine backend={backend} endpoint={endpoint} dispatch={dispatch} />}
+      {backend !== 'ollama' && (
+        <TestAndServingLine key={`${backend}|${endpoint}`} backend={backend} endpoint={endpoint} dispatch={dispatch} />
+      )}
     </div>
   );
 }
@@ -481,7 +483,17 @@ export function RunCommandLine({ command, label }: { command: string; label?: st
  *  Test + Serving line through this same component (the block only renders it
  *  for llamacpp/vllm panes) — `backend: 'ollama'` dispatches
  *  `setup.testRemote {backendId:'ollama'}` exactly like the FIM surface's own
- *  surface-level Test. Same no-cycle import direction as `RunCommandLine`. */
+ *  surface-level Test. Same no-cycle import direction as `RunCommandLine`.
+ *
+ *  `servingModels` (below) is local `useState` — it is NOT reset just
+ *  because `backend`/`endpoint` change as props. The block's own render
+ *  site (`:175`) keys this component by `` `${backend}|${endpoint}` `` so a
+ *  pane switch (e.g. RAG/Agent llama.cpp<->vLLM, which keeps the parent
+ *  mounted at the same tree position) remounts it fresh instead of leaking
+ *  the PREVIOUS pane's "Serving: …" list under the NEW pane's label (beta.6
+ *  fix-wave T9, M-1). The Agent surface's ollama-pane call sites
+ *  (`SetupPanel.tsx`) pass a fixed `backend="ollama"` and never switch
+ *  panes on that instance, so they need no key. */
 export function TestAndServingLine({
   backend,
   endpoint,
