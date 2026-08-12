@@ -90,4 +90,23 @@ describe('ToolsPanel V-11 TOGGLE-HONESTY', () => {
       ).toHaveAttribute('aria-checked', 'false');
     });
   });
+
+  it('beta.7 C1: the persist note renders ABOVE every toolset group — a panel-level note, not the last group’s caption', () => {
+    const data: ToolsData = {
+      toolsets: [
+        { name: 'web', enabled: true, toolCount: 1 },
+        { name: 'computer_use', enabled: true, toolCount: 1 },
+      ],
+      tools: [
+        { name: 'fetch_url', description: 'Fetch a URL.', enabled: true, kind: 'fetch', toolset: 'web', source: 'core' },
+        { name: 'screenshot', description: 'Take a screenshot.', enabled: true, kind: 'other', toolset: 'computer_use', source: 'core' },
+      ],
+    };
+    setup(<ToolsPanel data={data} onToggle={async () => undefined} />);
+    const note = screen.getByText('Toggles persist immediately and apply to new sessions.');
+    const firstGroupToggle = screen.getByRole('switch', { name: 'Enable web toolset' });
+    const lastGroupToggle = screen.getByRole('switch', { name: 'Enable computer_use toolset' });
+    expect(note.compareDocumentPosition(firstGroupToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(note.compareDocumentPosition(lastGroupToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
 });

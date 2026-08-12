@@ -49,6 +49,12 @@ export function ToolsPanel({ data, onToggle }: ToolsPanelProps) {
 
   return (
     <PanelShell title="Tools" meta={`${data.tools.length} available`}>
+      {/* C1: panel-level note lives ABOVE the toolset loop — after the loop it
+          visually attached to the LAST group (computer_use) and read like
+          that group's own caption. */}
+      <p className="mb-2 px-1 text-2xs leading-snug text-faint">
+        Toggles persist immediately and apply to new sessions.
+      </p>
       {data.toolsets.map((ts) => {
         const on = isOn(ts.name, ts.enabled);
         const err = lastError(ts.name);
@@ -91,10 +97,6 @@ export function ToolsPanel({ data, onToggle }: ToolsPanelProps) {
           </div>
         );
       })}
-
-      <p className="mt-1 px-1 text-2xs leading-snug text-faint">
-        Toggles persist immediately and apply to new sessions.
-      </p>
     </PanelShell>
   );
 }
