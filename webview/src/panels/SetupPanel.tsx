@@ -97,6 +97,7 @@ import {
   PIPX_INSTALL_DOCS_URL,
   progressKey,
   providerDoneLine,
+  PROVIDER_RECHECK_CAPTION,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
   RAG_APPLY_NUDGE,
@@ -1043,6 +1044,20 @@ function ProviderCard({
             disabledReason={disabledReason}
             tone="accent"
           />
+        </div>
+      )}
+      {provider.phase !== 'waiting-agent' && (
+        <div className="mt-2 flex flex-col gap-1.5">
+          <p className="text-2xs text-faint">{PROVIDER_RECHECK_CAPTION}</p>
+          <div>
+            <ActionButton
+              label="Re-check provider"
+              icon="refresh"
+              successLabel="Reconnected"
+              onRun={() => dispatch('setup.reconnectAgent')}
+              disabledReason={disabledReason}
+            />
+          </div>
         </div>
       )}
     </Card>

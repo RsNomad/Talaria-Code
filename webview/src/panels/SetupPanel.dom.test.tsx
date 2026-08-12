@@ -806,6 +806,35 @@ describe('B5 "done / what next" one-line status under each card (§6, T10)', () 
   });
 });
 
+/** A tiny fixture over `baseData()` for the Provider card's own phase — B3's
+ *  Re-check tests only vary this one field. */
+function withProviderPhase(phase: SetupData['provider']['phase']): SetupData {
+  return baseData({ provider: { phase, providerId: phase === 'configured' ? 'anthropic' : undefined } });
+}
+
+describe('Provider card — Re-check provider (beta.7 B3)', () => {
+  it('unconfigured: renders the caption + button, and clicking dispatches setup.reconnectAgent', async () => {
+    const { user, dispatch } = renderPanel(withProviderPhase('unconfigured'));
+    expect(
+      screen.getByText(
+        'Changed the provider (wizard or config.yaml)? Re-check restarts the agent connection and picks it up — open chats reload automatically, no window reload.',
+      ),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Re-check provider' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.reconnectAgent');
+  });
+
+  it('configured: the button is still offered (switching providers has the identical staleness)', () => {
+    renderPanel(withProviderPhase('configured'));
+    expect(screen.getByRole('button', { name: 'Re-check provider' })).toBeInTheDocument();
+  });
+
+  it('waiting-agent: absent — there is no connection to re-check', () => {
+    renderPanel(withProviderPhase('waiting-agent'));
+    expect(screen.queryByRole('button', { name: 'Re-check provider' })).not.toBeInTheDocument();
+  });
+});
+
 describe('one-carrier ✓ rule — structural guard (beta.6 panel-fix PT8, audit A8)', () => {
   it('no rendered StatusLine/DoneLine text sits beside a pass-filled icon AND still carries a literal ✓', async () => {
     const AGENT_ROW: SetupCatalogModel = {

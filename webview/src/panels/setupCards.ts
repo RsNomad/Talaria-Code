@@ -286,6 +286,10 @@ export function providerDoneLine(phase: SetupData['provider']['phase']): string 
   return phase === 'configured' ? 'Provider connected — chat is ready to use.' : '';
 }
 
+/** beta.7 B3 — Provider card re-check caption (single-sourced). */
+export const PROVIDER_RECHECK_CAPTION =
+  'Changed the provider (wizard or config.yaml)? Re-check restarts the agent connection and picks it up — open chats reload automatically, no window reload.';
+
 /** Auth-satisfied predicate over the WIRE's collapsed `auth` union — the
  *  same rule `SetupController.status()` applies host-side over its own
  *  richer `{kind, required}` shape before it gets collapsed onto the wire
