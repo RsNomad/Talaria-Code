@@ -66,7 +66,12 @@ export interface ControlDispatcherHostPort {
    * branch and from {@link ControlDispatcher.loadTab}) — it never
    * re-implements any part of that choreography.
    */
-  loadSessionIntoTab(sessionId: string, cwd: string, tabId?: string): Promise<AcpLoadSessionResult | undefined>;
+  loadSessionIntoTab(
+    sessionId: string,
+    cwd: string,
+    tabId?: string,
+    title?: string,
+  ): Promise<AcpLoadSessionResult | undefined>;
 }
 
 /**
@@ -685,9 +690,9 @@ export class ControlDispatcher {
    * `AcpBackend` (too entangled, see this class's own header doc) and is
    * reached through the injected port.
    */
-  async loadTab(tabId: string, sessionId: string, cwd: string): Promise<void> {
+  async loadTab(tabId: string, sessionId: string, cwd: string, title?: string): Promise<void> {
     try {
-      await this.port.loadSessionIntoTab(sessionId, cwd, tabId);
+      await this.port.loadSessionIntoTab(sessionId, cwd, tabId, title);
     } catch (err) {
       this.port.logger?.append(
         `[AcpBackend] loadTab failed (tabId=${tabId}, sessionId=${sessionId}): ${errorMessage(err)}`,

@@ -4319,6 +4319,35 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
   });
 });
 
+describe('beta.7 B1: loadTab threads the History title into tab.bound', () => {
+  it('a titled load emits tab.bound carrying that title', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    must(clients[0]).setLoadSessionResult({ found: true, currentModeId: 'default' });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.loadTab('tab-2', 'history-session', '/ws', 'Fix the bug');
+
+    const bound = messages.find((m) => m.type === 'tab.bound' && m.tabId === 'tab-2');
+    expect(bound).toMatchObject({ sessionId: 'history-session', title: 'Fix the bug' });
+  });
+
+  it('a title-less load (legacy session.load posture) emits tab.bound WITHOUT the key — never title: undefined', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    must(clients[0]).setLoadSessionResult({ found: true, currentModeId: 'default' });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.loadTab('tab-2', 'history-session', '/ws');
+
+    const bound = messages.find((m) => m.type === 'tab.bound' && m.tabId === 'tab-2');
+    expect(bound).toBeDefined();
+    expect(bound && 'title' in bound).toBe(false);
+  });
+});
+
 describe('AcpBackend.invokeControl — Zone HIST: sessions panel refresh (ACP session/list, NOT tui_gateway)', () => {
   it("switchTab('sessions') calls client.listSessions (not this.control), reshapes the result into SessionsData, and emits panel.data", async () => {
     const { backend, client, messages } = makeBackend();

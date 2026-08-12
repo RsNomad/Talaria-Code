@@ -695,7 +695,12 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         // the `.catch` here is defense in depth only.
         if (this.backend.loadTab) {
           void this.backend
-            .loadTab(message.tabId, message.sessionId, message.cwd)
+            .loadTab(
+              message.tabId,
+              message.sessionId,
+              message.cwd,
+              ...(message.title !== undefined ? ([message.title] as const) : ([] as const)),
+            )
             .catch((err) => this.logger?.appendLine(`[tab.load] ${message.tabId} failed: ${String(err)}`));
         } else {
           this.logger?.appendLine(`[tab.load] ${message.tabId} ignored — backend has no loadTab support`);

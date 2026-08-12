@@ -193,7 +193,7 @@ export interface AgentBackend extends vscode.Disposable {
   /** W4-T5b (§2d): route a History-panel row load into an EXPLICIT tab —
    * only the real `AcpBackend` can (T5a's hardened `loadSessionIntoTab`);
    * `MockBackend` has no session history to load, so this no-ops for it. */
-  loadTab?(tabId: string, sessionId: string, cwd: string): Promise<void>;
+  loadTab?(tabId: string, sessionId: string, cwd: string, title?: string): Promise<void>;
 
   /**
    * W3-T6 (CF-11/D2): the composer's per-tab "New Session" — rebind ONLY

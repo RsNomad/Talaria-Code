@@ -476,7 +476,7 @@ describe('TalariaViewProvider — SF-2 (T4b): mode.set routing', () => {
 
 /** W4-T5b: a fake with the real backend's structural `loadTab` seam. */
 type LoadTabBackend = AgentBackend & {
-  loadTab: (tabId: string, sessionId: string, cwd: string) => Promise<void>;
+  loadTab: (tabId: string, sessionId: string, cwd: string, title?: string) => Promise<void>;
 };
 function makeLoadTabBackend(loadTab = vi.fn().mockResolvedValue(undefined)): LoadTabBackend {
   return { ...makeFakeBackend(), loadTab };
@@ -508,6 +508,19 @@ describe('TalariaViewProvider — W4-T5b: tab.load routing (§2d wire, not a CON
       seam(provider).handleWebviewMessage({ type: 'tab.load', tabId: 'tab-2', sessionId: 'sess-9', cwd: '/ws' }),
     ).not.toThrow();
     await flush();
+  });
+
+  it('beta.7 B1: forwards the title as loadTab’s 4th arg when present — and keeps the TRUE 3-arg call when absent', () => {
+    const backend = makeLoadTabBackend();
+    const { provider } = makeProviderWith(backend);
+
+    seam(provider).handleWebviewMessage({
+      type: 'tab.load', tabId: 'tab-2', sessionId: 'sess-9', cwd: '/ws', title: 'Fix the bug',
+    });
+    expect(backend.loadTab).toHaveBeenCalledWith('tab-2', 'sess-9', '/ws', 'Fix the bug');
+
+    seam(provider).handleWebviewMessage({ type: 'tab.load', tabId: 'tab-2', sessionId: 'sess-9', cwd: '/ws' });
+    expect(backend.loadTab).toHaveBeenLastCalledWith('tab-2', 'sess-9', '/ws');
   });
 });
 

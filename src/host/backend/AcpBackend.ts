@@ -508,7 +508,7 @@ export class AcpBackend implements AgentBackend {
       showWarningMessage: (message) => {
         void vscode.window.showWarningMessage(message);
       },
-      loadSessionIntoTab: (sessionId, cwd, tabId) => this.loadSessionIntoTab(sessionId, cwd, tabId),
+      loadSessionIntoTab: (sessionId, cwd, tabId, title) => this.loadSessionIntoTab(sessionId, cwd, tabId, title),
     };
     this.controlDispatcher = new ControlDispatcher(controlPort);
     // W4-T4b (§4.3 mitigation 2 — the self-widening close's second leg): a
@@ -744,8 +744,14 @@ export class AcpBackend implements AgentBackend {
    * NOT part of this pair and stays inline at that one call site, ordered
    * strictly AFTER this call returns (unchanged from before the extract).
    */
-  private announceSessionBound(tabId: string, sessionId: string, rootId: string): void {
-    this.emitter.fire({ type: 'tab.bound', tabId, sessionId, rootId });
+  private announceSessionBound(tabId: string, sessionId: string, rootId: string, title?: string): void {
+    this.emitter.fire({
+      type: 'tab.bound',
+      tabId,
+      sessionId,
+      rootId,
+      ...(title !== undefined ? { title } : {}),
+    });
     this.emitter.fire({
       type: 'mode.state',
       sessionId,
@@ -1416,8 +1422,8 @@ export class AcpBackend implements AgentBackend {
    * THIS class's {@link loadSessionIntoTab} (not extracted) through the
    * injected port.
    */
-  async loadTab(tabId: string, sessionId: string, cwd: string): Promise<void> {
-    return this.controlDispatcher.loadTab(tabId, sessionId, cwd);
+  async loadTab(tabId: string, sessionId: string, cwd: string, title?: string): Promise<void> {
+    return this.controlDispatcher.loadTab(tabId, sessionId, cwd, title);
   }
 
   /**
@@ -1449,9 +1455,10 @@ export class AcpBackend implements AgentBackend {
     sessionId: string,
     cwd: string,
     tabId: string = BOOTSTRAP_TAB_ID,
+    title?: string,
   ): Promise<AcpLoadSessionResult | undefined> {
     return this.connectionSupervisor.runOnStartTail(() =>
-      this.loadSessionIntoTabInternal(sessionId, cwd, tabId),
+      this.loadSessionIntoTabInternal(sessionId, cwd, tabId, title),
     );
   }
 
@@ -1459,6 +1466,7 @@ export class AcpBackend implements AgentBackend {
     sessionId: string,
     cwd: string,
     tabId: string,
+    title?: string,
   ): Promise<AcpLoadSessionResult | undefined> {
     if (!this.connectionSupervisor.getClient()) {
       this.logger?.append(`[AcpBackend] session.load: no live client (sessionId=${sessionId}, cwd=${cwd})`);
@@ -1584,7 +1592,12 @@ export class AcpBackend implements AgentBackend {
     // carry, closed): via the shared {@link announceSessionBound}
     // (W6-P7-N11) — mirrors openSession's emission set, a History-loaded tab
     // starts with no custom mode, so its picker populates.
-    this.announceSessionBound(tabId, sessionId, controller.getRootId());
+    this.announceSessionBound(
+      tabId,
+      sessionId,
+      controller.getRootId(),
+      ...(title !== undefined ? ([title] as const) : ([] as const)),
+    );
 
     // CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
     // commit): `client.loadSession` (inside `loadReplay`) had NO wall-clock
