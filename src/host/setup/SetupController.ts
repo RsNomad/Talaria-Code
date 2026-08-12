@@ -364,6 +364,19 @@ export interface SetupControllerDeps {
     onProgress: (p: PullProgress) => void,
     signal: AbortSignal,
   ): Promise<void>;
+  /**
+   * beta.7 B3: the deliberate teardown+respawn+re-`initialize()` reconnect —
+   * bound to `() => backend.reconnectAgent?.() ?? Promise.resolve({ok:false,
+   * reason:...})` (a thunk over the CURRENT backend, `extension.ts`) so the
+   * trust-upgrade mock→real swap is reflected on the next call. OPTIONAL
+   * (posture of `loadTab?`/`getAdvertisedAuthMethods?` above) — NOT a
+   * required member: a required member would break `check-types:all` in
+   * every existing deps-literal/factory-call test site. `undefined` = no
+   * ACP backend bound (mock backend) — {@link SetupController.
+   * handleReconnectAgent} fails closed with an honest reason rather than
+   * throwing.
+   */
+  reconnectAgent?(): Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
 // --- misc constants -------------------------------------------------------
@@ -614,6 +627,7 @@ export const MUTATING_METHODS = new Set<SetupMethod>([
   'setup.openInstallTerminal',
   'setup.openBootstrapTerminal',
   'setup.reload',
+  'setup.reconnectAgent',
   'setup.setNextEdit',
   'setup.setRag',
   'setup.setTunable',
@@ -1164,6 +1178,8 @@ export class SetupController {
         return this.handleOpenBootstrapTerminal(params);
       case 'setup.reload':
         return this.handleReload();
+      case 'setup.reconnectAgent':
+        return this.handleReconnectAgent();
       case 'setup.recheck':
         return this.handleRecheck(params);
       case 'setup.setNextEdit':
@@ -2217,6 +2233,23 @@ export class SetupController {
   private handleReload(): { ok: true } {
     this.host.reload();
     return { ok: true };
+  }
+
+  // --- setup.reconnectAgent (beta.7 B3) --------------------------------------
+
+  private async handleReconnectAgent(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const reconnect = this.deps.reconnectAgent;
+    if (!reconnect) {
+      return { ok: false, reason: 'The agent connection is not running yet.' };
+    }
+    try {
+      const result = await reconnect();
+      this.statusChangedEmitter.fire(); // handleRecheck's single completion-fire posture (:2069-2073)
+      return result;
+    } catch (err) {
+      this.statusChangedEmitter.fire();
+      return { ok: false, reason: this.redact(errorMessage(err)) };
+    }
   }
 
   // --- setup.setNextEdit ------------------------------------------------------

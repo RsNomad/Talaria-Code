@@ -258,6 +258,7 @@ describe('FM-14: mutating methods refused when untrusted', () => {
     { method: 'setup.openInstallTerminal', params: { backendId: 'ollama' } },
     { method: 'setup.openBootstrapTerminal', params: {} },
     { method: 'setup.reload', params: {} },
+    { method: 'setup.reconnectAgent', params: {} },
     { method: 'setup.setNextEdit', params: { backend: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'x' } },
     { method: 'setup.setRag', params: { enabled: true } },
     { method: 'setup.setTunable', params: { key: TIER2_TUNABLE_KEYS[0], value: 100 } },
@@ -1484,6 +1485,42 @@ describe('setup.reload: trust-gated (FM-14), modal-free, calls host.reload() dir
   });
 });
 
+// --- setup.reconnectAgent (beta.7 B3, setup half) ----------------------------
+
+describe('setup.reconnectAgent (beta.7 B3)', () => {
+  it('is MUTATING: refused outright when untrusted — the deps thunk is never called', async () => {
+    const reconnectAgent = vi.fn();
+    const { controller } = makeController({ trusted: false }, { reconnectAgent });
+    const result = await controller.handle('setup.reconnectAgent', {});
+    expect(result.ok).toBe(false);
+    expect(reconnectAgent).not.toHaveBeenCalled();
+  });
+
+  it('refuses honestly when the dep is absent (mock-backend wiring) — fail-closed, no throw', async () => {
+    const { controller } = makeController(); // makeFakeDeps supplies no reconnectAgent — the optional dep is absent
+    const result = await controller.handle('setup.reconnectAgent', {});
+    expect(result).toMatchObject({ ok: false, reason: expect.any(String) });
+  });
+
+  it('delegates to deps.reconnectAgent, returns its outcome, fires ONE statusChanged at completion', async () => {
+    const reconnectAgent = vi.fn().mockResolvedValue({ ok: true });
+    const { controller } = makeController({}, { reconnectAgent });
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    const result = await controller.handle('setup.reconnectAgent', {});
+    expect(result).toEqual({ ok: true });
+    expect(reconnectAgent).toHaveBeenCalledTimes(1);
+    expect(fires.length).toBe(1);
+  });
+
+  it('a rejected thunk maps to an honest {ok:false} — never an unhandled rejection', async () => {
+    const reconnectAgent = vi.fn().mockRejectedValue(new Error('spawn ENOENT'));
+    const { controller } = makeController({}, { reconnectAgent });
+    const result = await controller.handle('setup.reconnectAgent', {});
+    expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('spawn ENOENT') });
+  });
+});
+
 // --- FIX 1 (final review wave, IMPORTANT): setup.recheck re-probes pipx -----
 
 describe('setup.recheck re-probes pipx (FIX 1: the pipx-missing/python-unsuitable recovery dead-end)', () => {
@@ -1659,6 +1696,7 @@ describe('MUTATING_METHODS / READ_ONLY_METHODS partition the full SetupMethod un
     'setup.openBootstrapTerminal': true,
     'setup.recheck': true,
     'setup.reload': true,
+    'setup.reconnectAgent': true,
     'setup.setNextEdit': true,
     'setup.setRag': true,
     'setup.setTunable': true,

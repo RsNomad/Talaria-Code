@@ -1863,6 +1863,9 @@ export type SetupMethod =
   | 'setup.openBootstrapTerminal'
   | 'setup.recheck'
   | 'setup.reload'
+  // beta.7 B3: re-advertise auth methods after `hermes model` — Hermes
+  // builds them only inside `initialize()`, acp_adapter/server.py:875.
+  | 'setup.reconnectAgent'
   | 'setup.setNextEdit'
   | 'setup.setRag'
   | 'setup.setTunable';

@@ -325,7 +325,12 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
   // `undefined` and the card honestly reads `waiting-agent`.
   const setupController = new SetupController(
     createVsCodeSetupHost(context),
-    createSetupControllerDeps(() => backend.getAdvertisedAuthMethods?.()),
+    createSetupControllerDeps(
+      () => backend.getAdvertisedAuthMethods?.(),
+      () =>
+        backend.reconnectAgent?.() ??
+        Promise.resolve({ ok: false as const, reason: 'The agent connection is not running yet.' }),
+    ),
   );
   context.subscriptions.push({ dispose: () => setupController.dispose() });
   provider.setSetupController(setupController);

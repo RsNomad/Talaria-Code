@@ -465,9 +465,15 @@ const boundFetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
  * `SetupController.status()` call — never a construction-time snapshot, so
  * the trust-upgrade mock→real swap and every `talaria.newSession`
  * re-initialize are picked up automatically.
+ * @param reconnectAgent beta.7 B3: OPTIONAL — mirrors
+ * {@link SetupControllerDeps.reconnectAgent}'s optionality exactly so every
+ * existing zero-second-arg factory call site keeps compiling unchanged.
+ * `extension.ts` passes a thunk over the CURRENT backend
+ * (`() => backend.reconnectAgent?.() ?? Promise.resolve({ok:false,...})`).
  */
 export function createSetupControllerDeps(
   getAdvertisedAuthMethods: () => AdvertisedAuthMethod[] | undefined,
+  reconnectAgent?: () => Promise<{ ok: true } | { ok: false; reason: string }>,
 ): SetupControllerDeps {
   const exec = createExecLookup();
   const spawn = createNodeSpawnFn();
@@ -534,6 +540,10 @@ export function createSetupControllerDeps(
     // createNodeGgufIngestIo's doc).
     downloadGgufToStore: (spec, destDir, destFile, onProgress, signal) =>
       downloadGgufToStore(ggufIo, spec, destDir, destFile, onProgress, signal),
+    // beta.7 B3: conditional spread — an absent second arg omits the key
+    // entirely (never `reconnectAgent: undefined`), so every existing
+    // zero-second-arg factory call keeps compiling and behaving unchanged.
+    ...(reconnectAgent !== undefined ? { reconnectAgent } : {}),
   };
 }
 
