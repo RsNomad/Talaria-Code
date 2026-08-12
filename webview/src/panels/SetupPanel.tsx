@@ -21,7 +21,7 @@
  * `!trusted` disables every mutating control via `mutationDisabledReason`
  * (setupCards.ts) — same reason text everywhere, never color alone.
  */
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type {
   NextEditToggleSource,
   NextEditToggleState,
@@ -160,6 +160,41 @@ export function SetupPanel({ data, onRetry, progress, nextEdit, onToggleNextEdit
   );
 }
 
+/** beta.7 B2: one "Set up →" click's expand request. `seq` makes every
+ *  click distinct so re-jumping to the same card re-fires. */
+interface JumpSignal {
+  cardId: string;
+  seq: number;
+}
+
+/** beta.7 B2: expand-on-jump. Effect 1 opens the section the moment a NEW
+ *  signal names `cardId`; effect 2 — which can only run AFTER the expand's
+ *  own commit (`isOpen` true) — scrolls the toggle into view and focuses it
+ *  (preventScroll so focus doesn't cancel the smooth scroll). Two effects,
+ *  not one: the DOM the scroll lands on only exists after the first commit. */
+function useExpandOnJump(
+  jump: JumpSignal | undefined,
+  cardId: string,
+  isOpen: boolean,
+  expand: () => void,
+  toggleRef: RefObject<HTMLButtonElement | null>,
+): void {
+  const [pendingSeq, setPendingSeq] = useState(0);
+  const handledSeq = useRef(0);
+  useEffect(() => {
+    if (!jump || jump.cardId !== cardId || jump.seq === handledSeq.current) return;
+    handledSeq.current = jump.seq;
+    expand();
+    setPendingSeq(jump.seq);
+  }, [jump, cardId, expand]);
+  useEffect(() => {
+    if (pendingSeq === 0 || !isOpen) return;
+    setPendingSeq(0);
+    toggleRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    toggleRef.current?.focus({ preventScroll: true });
+  }, [pendingSeq, isOpen, toggleRef]);
+}
+
 function SetupCards({
   setup,
   progress,
@@ -174,6 +209,8 @@ function SetupCards({
   dispatch: SetupPanelProps['dispatch'];
 }) {
   const disabledReason = mutationDisabledReason(setup.trusted);
+  const [jump, setJump] = useState<JumpSignal | undefined>(undefined);
+  const requestJump = (cardId: string) => setJump((prev) => ({ cardId, seq: (prev?.seq ?? 0) + 1 }));
 
   return (
     <>
@@ -209,8 +246,8 @@ function SetupCards({
         </div>
       )}
 
-      <RecommendationsBlock setup={setup} />
-      <AgentCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      <RecommendationsBlock setup={setup} onJump={requestJump} />
+      <AgentCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} jump={jump} />
       <ProviderCard setup={setup} dispatch={dispatch} disabledReason={disabledReason} />
       <FimCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
       <NextEditCard
@@ -220,8 +257,9 @@ function SetupCards({
         onToggleNextEdit={onToggleNextEdit}
         dispatch={dispatch}
         disabledReason={disabledReason}
+        jump={jump}
       />
-      <RagCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      <RagCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} jump={jump} />
     </>
   );
 }
@@ -467,10 +505,12 @@ const RECS_METER_SEGMENT_CLASS: Record<'agent' | 'fim' | 'embedding', string> = 
 };
 
 /**
- * B-F6 — the recs strip's `Set up →` jump: IN-PANEL ONLY. Scrolls the
- * owning card's `<section id={cardId}>` into view and moves focus to its
- * heading (`${cardId}-heading`, `tabIndex={-1}` via `SectionLabel`/`Card`).
- * NO dispatch, no expand — the four target cards have no collapsed state.
+ * B-F6 — the recs strip's `Set up →` jump for the FIM row: IN-PANEL ONLY.
+ * Scrolls the owning card's `<section id={cardId}>` into view and moves
+ * focus to its heading (`${cardId}-heading`, `tabIndex={-1}` via
+ * `SectionLabel`/`Card`). NO dispatch, no expand — the FIM card's picker
+ * has no collapsed state to expand (beta.7 B2: the other three roles route
+ * through `useExpandOnJump` instead, via `onJump`/`RecRoleLine`).
  */
 function jumpToCard(cardId: string): void {
   const section = document.getElementById(cardId);
@@ -478,7 +518,7 @@ function jumpToCard(cardId: string): void {
   document.getElementById(`${cardId}-heading`)?.focus();
 }
 
-function RecommendationsBlock({ setup }: { setup: SetupData }) {
+function RecommendationsBlock({ setup, onJump }: { setup: SetupData; onJump: (cardId: string) => void }) {
   const recs = deriveRecommendations(setup);
   if (!recs) return null;
 
@@ -486,10 +526,10 @@ function RecommendationsBlock({ setup }: { setup: SetupData }) {
     <Card title={RECS_STRIP_HEADING}>
       <p className="mb-2 text-2xs text-muted">{RECS_STRIP_INTRO}</p>
       <div className="mb-2.5 flex flex-col gap-2">
-        <RecRoleLine rec={recs.agent} />
-        <RecRoleLine rec={recs.fim} />
-        <RecRoleLine rec={recs.embedding} />
-        <RecRoleLine rec={recs.next} />
+        <RecRoleLine rec={recs.agent} onJump={onJump} />
+        <RecRoleLine rec={recs.fim} onJump={onJump} />
+        <RecRoleLine rec={recs.embedding} onJump={onJump} />
+        <RecRoleLine rec={recs.next} onJump={onJump} />
       </div>
       <p className="mb-1.5 text-2xs text-fg">{stackLineText(recs.agent, recs.fim, recs.embedding, recs.stack)}</p>
       {/* B-F1/§3.5 signature element: a single segmented bar sharing the
@@ -531,7 +571,7 @@ function RecommendationsBlock({ setup }: { setup: SetupData }) {
  * never restated) — the strip must never claim "recommended" for an
  * unpinned model.
  */
-function RecRoleLine({ rec }: { rec: RoleRec }) {
+function RecRoleLine({ rec, onJump }: { rec: RoleRec; onJump: (cardId: string) => void }) {
   const caption = divergenceCaptionText(rec);
   const showDefaultChip = rec.nextReady === undefined || rec.nextReady === true;
 
@@ -550,7 +590,7 @@ function RecRoleLine({ rec }: { rec: RoleRec }) {
       <button
         type="button"
         aria-label={`Set up → ${RECS_ROLE_LABEL[rec.role]} card`}
-        onClick={() => jumpToCard(rec.cardId)}
+        onClick={() => (rec.role === 'fim' ? jumpToCard(rec.cardId) : onJump(rec.cardId))}
         className="self-start font-mono text-2xs text-accent hover:underline"
       >
         Set up →
@@ -568,11 +608,13 @@ function AgentCard({
   progress,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const agent = setup.agent;
   const action = agentPrimaryAction(agent.phase);
@@ -750,7 +792,13 @@ function AgentCard({
         </details>
       )}
 
-      <AgentLocalModelSection setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      <AgentLocalModelSection
+        setup={setup}
+        progress={progress}
+        dispatch={dispatch}
+        disabledReason={disabledReason}
+        jump={jump}
+      />
     </Card>
   );
 }
@@ -775,11 +823,13 @@ function AgentLocalModelSection({
   progress,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const local = setup.agentLocalModel;
   const saved = local?.saved;
@@ -793,6 +843,10 @@ function AgentLocalModelSection({
   // queries (and cost renders) while contributing nothing.
   const [open, setOpen] = useState(false);
   const [changing, setChanging] = useState(false);
+  // beta.7 B2: the recs strip's "Set up →" jump expands this section and
+  // focuses this toggle — see `useExpandOnJump`.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  useExpandOnJump(jump, 'setup-card-agent', open, () => setOpen(true), toggleRef);
 
   // A-F8 — THE ONE preselect rule (`catalogPreselectId`): `saved.modelId`
   // when a save exists, else the `defaultForRole` row. Reconciled while
@@ -847,6 +901,7 @@ function AgentLocalModelSection({
     <div className="mt-3 border-t border-border pt-2">
       <button
         type="button"
+        ref={toggleRef}
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
         className="inline-flex items-center gap-1.5 rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
@@ -1625,6 +1680,7 @@ function NextEditCard({
   onToggleNextEdit,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
@@ -1632,6 +1688,7 @@ function NextEditCard({
   onToggleNextEdit: SetupPanelProps['onToggleNextEdit'];
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const [showForm, setShowForm] = useState(false);
   const next = setup.nextEdit;
@@ -1641,6 +1698,10 @@ function NextEditCard({
   // otherwise enable dedicated NEXT without ever seeing it (it used to live
   // only inside the collapsed form).
   const showWarning = next.dedicated !== undefined && (nextEdit.next || showForm);
+  // beta.7 B2: the recs strip's "Set up →" jump expands this form and
+  // focuses this toggle — see `useExpandOnJump`.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  useExpandOnJump(jump, 'setup-card-next', showForm, () => setShowForm(true), toggleRef);
 
   return (
     <Card title="Next Edit (NEXT)" id="setup-card-next">
@@ -1682,6 +1743,8 @@ function NextEditCard({
 
       <button
         type="button"
+        ref={toggleRef}
+        aria-expanded={showForm}
         onClick={() => setShowForm((s) => !s)}
         className="rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
       >
@@ -1948,11 +2011,13 @@ function RagCard({
   progress,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const rag = setup.rag;
   // T14 (§3.4): presence of the CONFIGURED embed model, endpoint-scoped
@@ -2009,7 +2074,13 @@ function RagCard({
         )}
       </div>
 
-      <RagEmbedSection setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      <RagEmbedSection
+        setup={setup}
+        progress={progress}
+        dispatch={dispatch}
+        disabledReason={disabledReason}
+        jump={jump}
+      />
 
       <details className="mt-2">
         <summary className="cursor-pointer text-2xs text-muted">Advanced</summary>
@@ -2057,16 +2128,22 @@ function RagEmbedSection({
   progress,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const rag = setup.rag;
   const embedModels = (setup.catalog?.models ?? []).filter((m) => m.role === 'embedding');
   const [open, setOpen] = useState(false);
   const [pane, setPane] = useState<RagEmbedBackend>(() => ragInitialBackend(rag));
+  // beta.7 B2: the recs strip's "Set up →" jump expands this section and
+  // focuses this toggle — see `useExpandOnJump`.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  useExpandOnJump(jump, 'setup-card-embedding', open, () => setOpen(true), toggleRef);
 
   // beta.6 panel-fix PT5 (audit A5, C2-5): endpoint init is PER-PANE —
   // the SAVED `embedEndpoint` when this pane IS the saved backend, that
@@ -2124,6 +2201,7 @@ function RagEmbedSection({
     <div className="mt-2 border-t border-border pt-2">
       <button
         type="button"
+        ref={toggleRef}
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
         className="inline-flex items-center gap-1.5 rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"

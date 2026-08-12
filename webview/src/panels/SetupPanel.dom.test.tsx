@@ -3127,38 +3127,72 @@ describe('T18 — RecommendationsBlock strip (§3.5)', () => {
     });
   });
 
-  describe('Set up → jump (B-F6) — in-panel scroll + focus, NEVER dispatch/expand', () => {
-    it('clicking the Agent row’s jump scrolls + focuses the Agent card heading, and issues NO dispatch', async () => {
+  describe('Set up → jump (B-F6/B2) — in-panel jump: no dispatch; expands the target picker', () => {
+    it('clicking the Agent row’s jump expands the Local Agent Model picker and focuses its toggle, and issues NO dispatch', async () => {
       const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
       const { user, dispatch } = renderPanel(recsData());
       const btn = screen.getByRole('button', { name: 'Set up → Agent card' });
       await user.click(btn);
       expect(scrollSpy).toHaveBeenCalled();
-      expect(document.activeElement?.id).toBe('setup-card-agent-heading');
+      const toggle = screen.getByRole('button', { name: 'Configure Local Agent Model' });
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      expect(document.activeElement).toBe(toggle);
       expect(dispatch).not.toHaveBeenCalled();
       scrollSpy.mockRestore();
     });
 
-    it('clicking the NEXT row’s jump targets the NEXT card, not the Agent card', async () => {
+    it('clicking the NEXT row’s jump targets the NEXT card, not the Agent card, and expands its dedicated-NEXT toggle', async () => {
       const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
       const { user, dispatch } = renderPanel(recsData());
       const btn = screen.getByRole('button', { name: 'Set up → NEXT card' });
       await user.click(btn);
-      expect(document.activeElement?.id).toBe('setup-card-next-heading');
+      const toggle = screen.getByRole('button', { name: 'Set up dedicated NEXT' });
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      expect(document.activeElement).toBe(toggle);
       expect(dispatch).not.toHaveBeenCalled();
       scrollSpy.mockRestore();
     });
 
-    it('clicking a jump does NOT expand any card (e.g. the NEXT card’s "Manage dedicated setup" form stays collapsed)', async () => {
+    it('clicking the NEXT row’s jump EXPANDS its dedicated-NEXT form (the target picker becomes visible)', async () => {
       const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
       const { user } = renderPanel(recsData());
       await user.click(screen.getByRole('button', { name: 'Set up → NEXT card' }));
       // Scoped to the NEXT card itself (other cards render their OWN,
       // unrelated "Endpoint" fields unconditionally) — the dedicated-NEXT
       // form's Endpoint field only renders once the form is expanded, and
-      // must still be absent there after the jump.
+      // must now be present there after the jump.
       const nextCard = must(document.getElementById('setup-card-next'));
-      expect(within(nextCard).queryByLabelText('Endpoint')).not.toBeInTheDocument();
+      expect(within(nextCard).getByLabelText('Endpoint')).toBeInTheDocument();
+      scrollSpy.mockRestore();
+    });
+
+    it('the FIM row’s jump keeps the plain scroll+focus (the FIM card has no collapsed picker)', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      await user.click(screen.getByRole('button', { name: 'Set up → FIM card' }));
+      expect(document.activeElement?.id).toBe('setup-card-fim-heading');
+      scrollSpy.mockRestore();
+    });
+
+    it('clicking the Embedder row’s jump expands the embedding picker', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      await user.click(screen.getByRole('button', { name: 'Set up → Embedder card' }));
+      expect(screen.getByRole('button', { name: 'Configure embedding model' })).toHaveAttribute('aria-expanded', 'true');
+      scrollSpy.mockRestore();
+    });
+
+    it('jump → hand-collapse → jump again re-expands (seq re-fires)', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      const jumpBtn = screen.getByRole('button', { name: 'Set up → Agent card' });
+      await user.click(jumpBtn);
+      const toggle = screen.getByRole('button', { name: 'Configure Local Agent Model' });
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      await user.click(toggle); // collapse by hand
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      await user.click(jumpBtn);
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
       scrollSpy.mockRestore();
     });
   });
