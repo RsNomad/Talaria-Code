@@ -10223,3 +10223,55 @@ describe('AcpBackend — Task 13: advertised auth methods surface', () => {
     sub.dispose();
   });
 });
+
+describe('beta.7 B3: user-triggered reconnect (backend.reconnectAgent)', () => {
+  it('tears down the child, mints a NEW client (fresh initialize ⇒ fresh authMethods), and re-loads every live session into its tab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    expect(clients).toHaveLength(1);
+
+    const result = await backend.reconnectAgent();
+
+    expect(result).toEqual({ ok: true });
+    expect(clients).toHaveLength(2);
+    expect(must(clients[1]).loadSessionCalls.map((c) => c.sessionId)).toEqual(['session-1']);
+  });
+
+  it('refuses while a turn is live — never kills an in-flight session prompt', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    // The fake client's prompt() returns a HELD-OPEN deferred (:369-374) —
+    // nothing auto-resolves it, so hasLiveTurn() is genuinely true at the
+    // moment reconnectAgent() runs (finding-11 guard: the turn must not be
+    // able to settle out from under the test).
+    backend.sendPrompt('session-1', 'work', 'default');
+    await flushMicrotasks();
+
+    const result = await backend.reconnectAgent();
+
+    expect(result.ok).toBe(false);
+    expect(clients).toHaveLength(1); // no teardown happened
+    must(clients[0]).resolveInFlightPrompt({ stopReason: 'end_turn' }); // hygiene: settle the held turn
+    await flushMicrotasks();
+  });
+
+  it('refuses honestly when the connection was never started', async () => {
+    const { backend } = makeStartableBackend();
+    const result = await backend.reconnectAgent();
+    expect(result).toMatchObject({ ok: false, reason: expect.any(String) });
+  });
+
+  it('B1 interplay: recovery re-binds WITHOUT a title key, so History-set chips survive a reconnect', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    expect(clients).toHaveLength(1);
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.reconnectAgent();
+
+    const rebinds = messages.filter((m) => m.type === 'tab.bound');
+    expect(rebinds.length).toBeGreaterThan(0);
+    for (const b of rebinds) expect('title' in b).toBe(false);
+  });
+});

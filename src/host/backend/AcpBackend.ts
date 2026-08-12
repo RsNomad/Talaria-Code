@@ -62,7 +62,7 @@ import type { SessionHostPort } from './session/types';
 import type { EditPreviewRegistry } from '../preview/EditPreviewRegistry';
 import { readCustomModes, toCatalog } from './customModes';
 import { OneShotRunner, type OneShotHostPort } from './oneshot/OneShotRunner';
-import { ConnectionSupervisor, type ConnectionSupervisorHostPort } from './connection/ConnectionSupervisor';
+import { ConnectionSupervisor, type ConnectionSupervisorHostPort, type ReconnectOutcome } from './connection/ConnectionSupervisor';
 import { ControlDispatcher, type ControlDispatcherHostPort } from './control/ControlDispatcher';
 
 /**
@@ -722,6 +722,13 @@ export class AcpBackend implements AgentBackend {
    */
   getAdvertisedAuthMethods(): AdvertisedAuthMethod[] | undefined {
     return this.connectionSupervisor.getClient()?.getAdvertisedAuthMethods?.();
+  }
+
+  /** beta.7 B3: thin passthrough to {@link ConnectionSupervisor.reconnect} —
+   * see that method's own doc for the full tail-serialized teardown +
+   * respawn + re-`initialize()` rationale. */
+  async reconnectAgent(): Promise<ReconnectOutcome> {
+    return this.connectionSupervisor.reconnect();
   }
 
   /**

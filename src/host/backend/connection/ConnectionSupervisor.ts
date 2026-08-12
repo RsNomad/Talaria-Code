@@ -46,6 +46,9 @@ const SESSION_ESTABLISH_DEADLINE_MS = 120_000;
 /** Outcome of {@link ConnectionSupervisor.raceConnectPhase}'s internal race. */
 type ConnectPhaseOutcome = { kind: 'connected' } | { kind: 'deadline' } | { kind: 'exit'; code: number | null };
 
+/** beta.7 B3: outcome of a user-triggered reconnect. */
+export type ReconnectOutcome = { ok: true } | { ok: false; reason: string };
+
 /**
  * W6-FI-b (3-way ARCH I-4, part 2 of 3) — the connection LIFECYCLE
  * subsystem, EXTRACTED VERBATIM off `AcpBackend` (behavior-preserving MOVE +
@@ -1110,6 +1113,77 @@ export class ConnectionSupervisor {
     this.client = undefined;
     this.acpState = 'respawning';
     this.scheduleAcpRespawn();
+  }
+
+  /**
+   * beta.7 B3: DELIBERATE teardown + respawn + re-`initialize()` — so a
+   * provider configured via `hermes model` (auth methods are built only
+   * inside Hermes' `initialize()`, acp_adapter/server.py:875) is re-advertised
+   * without a window reload. Reuses {@link handleAcpCrash}'s exact sequence
+   * minus the crash logging/backoff, then runs {@link startInternal} in the
+   * SAME tail link — so a reconnect can never interleave with an in-flight
+   * start/openTab/tab.load/close (runOnStartTail's whole point), and the
+   * fn calls startInternal DIRECTLY (never start()) per the tail's
+   * self-deadlock rule. Session continuity rides the EXISTING
+   * pendingRecovery → establishInitialSession → recoverSessions pipeline.
+   * Guards run INSIDE the link (state can change while queued):
+   *  - not 'ready' → honest refusal (never interrupts an in-progress start,
+   *    an outage respawn, or a disposed supervisor);
+   *  - any live turn → refusal (a reconnect must never kill a running turn).
+   * On startInternal rejection: same stay-in-outage posture as a failed
+   * scheduled respawn attempt (:1129-1131) — hand the outage to the existing
+   * backoff machinery AND refuse honestly, so a failed reconnect still heals.
+   */
+  async reconnect(): Promise<ReconnectOutcome> {
+    return this.runOnStartTail(async () => {
+      if (this.acpState !== 'ready') {
+        return {
+          ok: false as const,
+          reason:
+            this.acpState === 'starting' || this.acpState === 'respawning'
+              ? 'The agent is already (re)connecting — wait a moment, then re-check.'
+              : 'The agent connection is not running.',
+        };
+      }
+      for (const controller of this.port.sessions.values()) {
+        if (controller.hasLiveTurn()) {
+          return {
+            ok: false as const,
+            reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
+          };
+        }
+      }
+      // handleAcpCrash's teardown, verbatim order — exit-sub FIRST so the
+      // child's exit cannot ALSO schedule a crash respawn (double-start).
+      this.clientExitSub?.dispose();
+      this.clientExitSub = undefined;
+      this.pendingRecovery = [...this.port.sessions.values()]
+        .filter((c) => !this.port.isPendingClose(c.sessionId))
+        .map((c) => ({ sessionId: c.sessionId, cwd: c.cwd, tabId: c.tabId }));
+      this.port.settleOneShot('agent reconnecting');
+      for (const controller of this.port.sessions.values()) {
+        try {
+          controller.endOnCrash();
+        } catch (err) {
+          this.port.logger?.append(
+            `[AcpBackend] reconnect fan-out: endOnCrash failed for session '${controller.sessionId}', continuing: ${describeHostError(err)}`,
+          );
+        }
+      }
+      this.client?.dispose();
+      this.client = undefined;
+      this.acpState = 'respawning';
+      try {
+        await this.startInternal();
+        return { ok: true as const };
+      } catch (err) {
+        if ((this.acpState as string) !== 'disposed') {
+          this.acpState = 'respawning';
+          this.scheduleAcpRespawn();
+        }
+        return { ok: false as const, reason: `Reconnect failed: ${describeHostError(err)}` };
+      }
+    });
   }
 
   /** Mirrors ControlChannel.scheduleRespawn/attemptRespawn: retry

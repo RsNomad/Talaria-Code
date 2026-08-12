@@ -190,6 +190,17 @@ export interface AgentBackend extends vscode.Disposable {
    * `SetupControllerDeps` declares the same shape on its side. */
   getAdvertisedAuthMethods?(): { id: string; name: string }[] | undefined;
 
+  /** beta.7 B3: user-triggered DELIBERATE reconnect — tears down the ACP
+   * child and re-`initialize()`s a fresh one (Hermes rebuilds auth methods
+   * only inside `initialize()`), reusing the crash-recovery pipeline so
+   * every live session reloads itself. Only the real `AcpBackend` has a
+   * connection to reconnect; `MockBackend` has none, so callers fall back to
+   * an honest `{ok:false}` refusal when this is absent (mirrors the
+   * `getAdvertisedAuthMethods?`/`loadTab?` optional-capability posture
+   * above). Refuses (never kills) while a turn is live or before the
+   * connection has ever started. */
+  reconnectAgent?(): Promise<{ ok: true } | { ok: false; reason: string }>;
+
   /** W4-T5b (§2d): route a History-panel row load into an EXPLICIT tab —
    * only the real `AcpBackend` can (T5a's hardened `loadSessionIntoTab`);
    * `MockBackend` has no session history to load, so this no-ops for it. */
