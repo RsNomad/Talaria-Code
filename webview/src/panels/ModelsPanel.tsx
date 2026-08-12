@@ -83,16 +83,21 @@ export function ModelsPanel({ data, activeModelId, onSetModel, onAddProviderKey 
               </span>
               {/* CF-13/D1: `p.id` IS the harness's provider `slug`
                   (`reshapeModelOptions` sets `ModelProvider.id = row.slug`) —
-                  the exact param `model.save_key` expects. */}
-              <button
-                type="button"
-                onClick={() => onAddProviderKey(p.id)}
-                aria-label={`Add key for ${p.name}`}
-                className="flex flex-none items-center gap-1 text-2xs normal-case text-muted hover:text-accent"
-              >
-                <Icon name="key" size={11} />
-                Add key
-              </button>
+                  the exact param `model.save_key` expects.
+                  beta.7 B4: virtual rows (MoA) have no PROVIDER_REGISTRY
+                  entry — `model.save_key` refuses `unknown provider: moa` —
+                  so they get no "Add key" affordance at all. */}
+              {p.virtual !== true && (
+                <button
+                  type="button"
+                  onClick={() => onAddProviderKey(p.id)}
+                  aria-label={`Add key for ${p.name}`}
+                  className="flex flex-none items-center gap-1 text-2xs normal-case text-muted hover:text-accent"
+                >
+                  <Icon name="key" size={11} />
+                  Add key
+                </button>
+              )}
             </div>
           </SectionLabel>
           <div className="overflow-hidden rounded-card border border-border">

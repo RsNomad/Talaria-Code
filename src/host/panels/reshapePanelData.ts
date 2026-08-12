@@ -447,6 +447,8 @@ export interface RawModelProviderRow {
   is_current?: boolean;
   models?: string[];
   total_models?: number;
+  /** beta.7 B4: `'virtual'` for synthetic rows (MoA) — grounded `inventory.py:509`. */
+  source?: string;
   [key: string]: unknown;
 }
 
@@ -478,6 +480,7 @@ export function reshapeModelOptions(raw: RawModelOptionsResult): ModelsData {
       name: row.name ?? row.slug ?? '',
       connected: Boolean(row.authenticated),
       models,
+      ...(row.source === 'virtual' ? { virtual: true } : {}),
     };
   });
   return { providers, currentModelId: raw.model ?? '' };

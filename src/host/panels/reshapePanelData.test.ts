@@ -604,6 +604,18 @@ describe('reshapeModelOptions', () => {
   it('tolerates a missing providers array / missing model (defensive raw-input handling)', () => {
     expect(reshapeModelOptions({})).toEqual({ providers: [], currentModelId: '' });
   });
+
+  it('beta.7 B4: a source:"virtual" row (MoA, inventory.py _moa_provider_row) maps to virtual:true; real rows carry NO virtual key', () => {
+    const data = reshapeModelOptions({
+      providers: [
+        { slug: 'moa', name: 'Mixture of Agents', authenticated: true, source: 'virtual', models: ['balanced'] },
+        { slug: 'deepseek', name: 'DeepSeek', authenticated: false, models: ['deepseek-chat'] },
+      ],
+      model: 'balanced',
+    });
+    expect(must(data.providers[0]).virtual).toBe(true);
+    expect('virtual' in must(data.providers[1])).toBe(false);
+  });
 });
 
 /**

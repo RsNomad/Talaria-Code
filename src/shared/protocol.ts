@@ -559,6 +559,14 @@ export interface ModelProvider {
   /** Whether an API key / credential is configured for this provider. */
   connected: boolean;
   models: ModelInfo[];
+  /**
+   * beta.7 B4: true for synthetic rows that are not a real credentialed
+   * provider (today only Hermes' MoA row — inventory.py `_moa_provider_row`,
+   * `source:'virtual'`). Virtual rows get NO "Add key" affordance:
+   * `model.save_key` has no PROVIDER_REGISTRY entry for them and refuses
+   * (`unknown provider: moa`, server.py 4002).
+   */
+  virtual?: boolean;
 }
 
 /** Models panel payload. Origin: TUI `model.options` + ACP `session/set_model`. */

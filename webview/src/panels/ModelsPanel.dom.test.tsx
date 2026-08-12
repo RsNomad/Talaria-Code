@@ -190,4 +190,23 @@ describe('CF-13/D1: the dead global "Add provider key" button is replaced by a p
 
     expect(calls).toEqual(['deepseek', 'xai']);
   });
+
+  it('beta.7 B4: the virtual MoA row renders NO "Add key" (model.save_key would refuse: unknown provider); real rows keep theirs', () => {
+    render(
+      <ModelsPanel
+        data={{
+          currentModelId: 'm1',
+          providers: [
+            { id: 'moa', name: 'Mixture of Agents', connected: true, virtual: true, models: [{ id: 'balanced', label: 'balanced' }] },
+            { id: 'deepseek', name: 'DeepSeek', connected: false, models: [{ id: 'm1', label: 'M1' }] },
+          ],
+        }}
+        activeModelId="m1"
+        onSetModel={() => undefined}
+        onAddProviderKey={() => undefined}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Add key for Mixture of Agents' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add key for DeepSeek' })).toBeInTheDocument();
+  });
 });
