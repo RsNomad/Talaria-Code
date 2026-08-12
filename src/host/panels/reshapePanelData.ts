@@ -437,8 +437,9 @@ export function reshapeSessionsList(raw: RawSessionListResult): SessionsData {
  *  - `authenticated` — set by `_apply_picker_hints` (`:350-369`), which
  *    `model.options` always runs (`picker_hints=True`, `server.py:12413`);
  *    maps to {@link ModelProvider.connected}.
- * `is_current`/`total_models`/`source`/`capabilities`/`pricing` exist too but
- * are not needed for the frozen `ModelsData` shape.
+ * `is_current`/`total_models`/`capabilities`/`pricing` exist too but are not
+ * needed for the frozen `ModelsData` shape. (`source` IS now used — beta.7 B4,
+ * mapped to {@link ModelProvider.virtual} below.)
  */
 export interface RawModelProviderRow {
   slug?: string;
