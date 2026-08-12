@@ -101,4 +101,34 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
       ).toHaveAttribute('aria-checked', 'false');
     });
   });
+
+  it('beta.7 C3: the persist note renders ABOVE every skill row — a panel-level note, not the last group’s caption', () => {
+    const data: SkillsData = {
+      skills: [
+        {
+          id: 'web-search',
+          name: 'web-search',
+          category: 'research',
+          description: 'Search the web for current information.',
+          enabled: true,
+        },
+        {
+          id: 'code-review',
+          name: 'code-review',
+          category: 'engineering',
+          description: 'Review code for issues.',
+          enabled: true,
+        },
+      ],
+      categories: ['research', 'engineering'],
+    };
+    setup(<SkillsPanel data={data} onToggle={async () => undefined} onRefresh={noop} />);
+    const note = screen.getByText(
+      'Toggles persist immediately and apply to new sessions; a chat already running may keep its current skills until its next session.',
+    );
+    const firstToggle = screen.getByRole('switch', { name: 'Enable web-search' });
+    const lastToggle = screen.getByRole('switch', { name: 'Enable code-review' });
+    expect(note.compareDocumentPosition(firstToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(note.compareDocumentPosition(lastToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
 });
