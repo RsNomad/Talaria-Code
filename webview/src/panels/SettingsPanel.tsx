@@ -143,7 +143,18 @@ function FieldRow({
 
 export function SettingsPanel({ config, onRetryConfig, onSetConfig }: SettingsPanelProps) {
   return (
-    <PanelShell title="Agent config">
+    <PanelShell title="Agent config" meta="read-only">
+      {/* beta.7 C2: this panel's data is Hermes' `config.show` — a
+          pre-stringified display dump (`tui_gateway/server.py:13400-13434`;
+          `reshapeConfigShow` at `reshapePanelData.ts:519-533` deliberately
+          types every field `'string'`), so every `FieldRow` below falls to
+          the plain-span branch: functionally read-only, but visually a
+          settings editor. The caption sits OUTSIDE/ABOVE the `RemotePanel`
+          gate so it stays visible even while the config is loading or
+          errored — it describes the panel, not the resolved data. */}
+      <p className="mb-2 px-1 text-2xs leading-snug text-faint">
+        Read-only mirror of the Hermes agent&rsquo;s config.yaml — values can&rsquo;t be edited here yet.
+      </p>
       {/* Task 12 (§5.1/§5.2): this panel now holds Hermes agent-runtime
           config.yaml sections ONLY — the «Next Edit Suggestions» rows that
           used to render here (unconditionally, ahead of this gate, because

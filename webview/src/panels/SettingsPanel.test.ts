@@ -118,8 +118,9 @@ describe('Task 12: SettingsPanel is "Agent config" — title, no NEXT content, c
   it('the panel is titled "Agent config" (Task 12 retitle — agent-runtime config only, NEXT moved to Talaria Config)', () => {
     expect(
       settingsPanelSource,
-      'Task 12: SettingsPanel must render <PanelShell title="Agent config"> — the panel id (\'settings\') stays unchanged on the wire, only the title changes',
-    ).toContain('<PanelShell title="Agent config">');
+      'Task 12: SettingsPanel must render <PanelShell title="Agent config" …> — the panel id (\'settings\') stays unchanged on the wire, only the title changes. ' +
+        'beta.7 C2 additionally marks it `meta="read-only"` (see the dedicated C2 describe block in SettingsPanel.dom.test.tsx).',
+    ).toContain('<PanelShell title="Agent config" meta="read-only">');
   });
 
   it('renders NO Next-Edit content — Task 12 removed it entirely (NEXT now lives in SetupPanel, via nextEditCopy.ts)', () => {

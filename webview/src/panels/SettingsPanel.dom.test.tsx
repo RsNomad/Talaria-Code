@@ -474,3 +474,28 @@ describe('G-3: clicking a settings row error must not toggle the switch', () => 
     release?.();
   });
 });
+
+/**
+ * beta.7 C2: the gear tab's data is Hermes' `config.show` — a pre-stringified
+ * display dump (every `FieldRow` therefore falls to the plain-span branch) —
+ * so the panel LOOKS like a settings editor but every field is actually
+ * read-only. Two additive labels announce that honestly: the panel's `meta`
+ * slot and a caption that must be visible even before the config resolves,
+ * since it describes the panel itself, not the loaded data.
+ */
+describe('beta.7 C2: the config.show mirror announces itself read-only', () => {
+  it('renders the read-only meta and caption alongside the loaded sections', () => {
+    renderPanel(successConfig(true));
+    expect(screen.getByText('read-only')).toBeInTheDocument();
+    expect(
+      screen.getByText('Read-only mirror of the Hermes agent’s config.yaml — values can’t be edited here yet.'),
+    ).toBeInTheDocument();
+  });
+
+  it('the caption is visible even while the config is still loading (it describes the panel, not the data)', () => {
+    renderPanel({ status: 'loading' });
+    expect(
+      screen.getByText('Read-only mirror of the Hermes agent’s config.yaml — values can’t be edited here yet.'),
+    ).toBeInTheDocument();
+  });
+});
