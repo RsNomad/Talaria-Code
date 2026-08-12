@@ -2118,8 +2118,12 @@ export type WebviewToHost =
    * click, generalized from the old single-session `session.load`). Host
    * announces `tab.bound` BEFORE replaying (§7 B9 race rule (b)), then
    * streams the replay through the normal pipeline.
+   *
+   * B1: `title` is display-only — the row's title (or its own
+   * "Untitled session" fallback), echoed back on `tab.bound` so the tab
+   * chip can show it. The host never interpolates it anywhere else.
    */
-  | { type: 'tab.load'; tabId: string; sessionId: string; cwd: string }
+  | { type: 'tab.load'; tabId: string; sessionId: string; cwd: string; title?: string }
 
   /**
    * SF-2: switch (or clear, `null`) the session's active custom mode. Host

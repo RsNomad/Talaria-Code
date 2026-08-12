@@ -15,15 +15,26 @@ import { EmptyPanel, PanelShell } from './PanelShell';
 import { loadMoreFooterState } from '../state/panels';
 import { relativeAge } from '../relativeAge';
 
+/** beta.7 B1: the one untitled-session display string — the row render AND
+ *  loadTabMessage send the SAME text, so the tab chip always shows exactly
+ *  what the user clicked. */
+const UNTITLED_SESSION_LABEL = 'Untitled session';
+
 /** W4-T5b: the `tab.load` message a History row's click posts — routes the
  * load through the ACTIVE tab (`tabId`) instead of the legacy tabId-less
  * `session.load` invocation, so History-load-into-a-CHOSEN-tab is reachable.
  * Pure (no host calls) so the click's payload is unit-testable without a DOM. */
 export function loadTabMessage(
   tabId: string,
-  session: Pick<SessionSummary, 'id' | 'cwd'>,
+  session: Pick<SessionSummary, 'id' | 'cwd' | 'title'>,
 ): Extract<WebviewToHost, { type: 'tab.load' }> {
-  return { type: 'tab.load', tabId, sessionId: session.id, cwd: session.cwd };
+  return {
+    type: 'tab.load',
+    tabId,
+    sessionId: session.id,
+    cwd: session.cwd,
+    title: session.title || UNTITLED_SESSION_LABEL,
+  };
 }
 
 interface SessionsPanelProps {
@@ -119,7 +130,7 @@ export function SessionsPanel({
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="min-w-0 truncate text-[12.5px] font-semibold text-fg">
-                    {s.title || 'Untitled session'}
+                    {s.title || UNTITLED_SESSION_LABEL}
                   </span>
                   {isBound && (
                     <span className="ml-auto flex-none">

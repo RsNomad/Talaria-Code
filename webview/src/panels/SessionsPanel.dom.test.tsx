@@ -85,7 +85,9 @@ describe('C4: History rows carry a bound marker and confirm before replacing a l
 
     await user.click(screen.getByRole('button', { name: /Fix the bug/ }));
 
-    expect(loads).toEqual([{ type: 'tab.load', tabId: 'tab-1', sessionId: 'sess-1', cwd: '/ws' }]);
+    expect(loads).toEqual([
+      { type: 'tab.load', tabId: 'tab-1', sessionId: 'sess-1', cwd: '/ws', title: 'Fix the bug' },
+    ]);
     expect(screen.queryByRole('button', { name: 'Load anyway' })).not.toBeInTheDocument();
   });
 
@@ -106,7 +108,9 @@ describe('C4: History rows carry a bound marker and confirm before replacing a l
     await user.click(screen.getByRole('button', { name: /Fix the bug/ }));
     await user.click(screen.getByRole('button', { name: 'Load anyway' }));
 
-    expect(loads).toEqual([{ type: 'tab.load', tabId: 'tab-1', sessionId: 'sess-1', cwd: '/ws' }]);
+    expect(loads).toEqual([
+      { type: 'tab.load', tabId: 'tab-1', sessionId: 'sess-1', cwd: '/ws', title: 'Fix the bug' },
+    ]);
   });
 
   it('Cancel dismisses the confirm strip without loading', async () => {
