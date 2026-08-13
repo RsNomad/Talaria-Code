@@ -401,6 +401,11 @@ describe('DashboardAdminClient — T1 endpoints', () => {
     expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ enabled: false });
   });
 
+  it('authMcpServer resolves the ok:false 200-envelope instead of throwing', async () => {
+    const { fetchImpl } = stubFetch(() => json({ ok: false, error: 'oauth denied', tools: [] }));
+    await expect(makeClient(fetchImpl).authMcpServer('gh')).resolves.toEqual({ ok: false, error: 'oauth denied', tools: [] });
+  });
+
   it('authMcpServer POSTs .../auth and an external AbortSignal cancels the call', async () => {
     const controller = new AbortController();
     const { fetchImpl } = stubFetch((_url, init) => new Promise((_res, rej) => {
@@ -418,16 +423,22 @@ describe('DashboardAdminClient — T1 endpoints', () => {
     expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'n8n', env: { N8N_KEY: 'v' }, enable: true });
   });
 
-  it('anySignal: native path delegates; fallback path (anyImpl undefined, pre-Node-20.3) composes via once-listeners', () => {
+  it('anySignal: native path delegates; fallback path (anyImpl falsy, pre-Node-20.3) composes via once-listeners', () => {
+    // `anyImpl` is a DEFAULT param — passing `undefined` would re-trigger the
+    // default initializer and resolve to the NATIVE `AbortSignal.any` on this
+    // repo's Node (24), giving the fallback branch zero coverage. Pass a
+    // falsy-but-NOT-undefined value so default substitution does not kick in
+    // and the manual once-listener `else` branch genuinely runs.
+    const noNativeAny = null as unknown as typeof AbortSignal.any;
     const a = new AbortController();
     const b = new AbortController();
-    const composed = anySignal([a.signal, b.signal], undefined); // force the fallback branch
+    const composed = anySignal([a.signal, b.signal], noNativeAny); // force the fallback branch
     expect(composed.aborted).toBe(false);
     b.abort(new Error('caller cancelled'));
     expect(composed.aborted).toBe(true);
     const already = new AbortController();
     already.abort();
-    expect(anySignal([already.signal], undefined).aborted).toBe(true); // pre-aborted input propagates immediately
+    expect(anySignal([already.signal], noNativeAny).aborted).toBe(true); // pre-aborted input propagates immediately
   });
 
   it('actionStatus GETs /api/actions/{name}/status and returns the pinned shape', async () => {
