@@ -17,6 +17,8 @@ import type {
   CheckpointsData,
   ContextRef,
   HostToWebviewMessage,
+  McpCatalogData,
+  McpTestResult,
   SessionsData,
   SubagentsData,
 } from '../../shared/protocol';
@@ -41,11 +43,12 @@ import type { RestoreResult } from '../checkpoints/CheckpointTracker';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
 import type { PanelSource } from '../panels/PanelSourceRegistry';
 import type { DashboardService } from '../dashboard/HermesDashboardManager';
-import type { DashboardClientLike, DashboardToggleResult } from '../dashboard/HermesDashboardClient';
+import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../dashboard/HermesDashboardClient';
 import type { ConfinedReader } from './acp/confinedOpen';
 import { ConnectionSupervisor, type ConnectionSupervisorHostPort } from './connection/ConnectionSupervisor';
 import { SessionRegistry } from './session/SessionRegistry';
 import { must } from '../../testing/must';
+import { TRUST_GATED_METHODS } from './control/ControlDispatcher';
 
 /**
  * `vscode` isn't resolvable outside the extension host; `AcpBackend` only
@@ -94,6 +97,10 @@ vi.mock('vscode', () => {
     __customModesWorkspaceValue: unknown;
     __customModesFolderValue: unknown;
     __configChangeListeners: ConfigChangeListener[];
+    // Task A5: mutable like `workspaceFolders` — tests flip this to prove the
+    // dispatcher's trust gate (`ControlDispatcherHostPort.isTrusted`), then
+    // restore it so later tests in the file are unaffected.
+    isTrusted: boolean;
     getConfiguration: (section?: string) => {
       inspect: (key: string) => Record<string, unknown> | undefined;
     };
@@ -107,6 +114,7 @@ vi.mock('vscode', () => {
     __customModesWorkspaceValue: undefined,
     __customModesFolderValue: undefined,
     __configChangeListeners: [],
+    isTrusted: true,
     getConfiguration: () => ({
       inspect: (key: string) => {
         if (key !== 'talaria.customModes') return undefined;
@@ -7065,6 +7073,82 @@ function makeBackendWithDashboard(): {
   return { backend, messages, client };
 }
 
+/**
+ * Task A5 harness extension (explicit, cited — not fabricated): a
+ * `DashboardClientLike` fake that ALSO implements the T1 `DashboardAdminClient`
+ * admin surface (`HermesDashboardClient.ts:137-167`), with a call-recording
+ * array per member so tests can assert exactly what reached the "dashboard"
+ * — mirrors `FakeDashboardClient`'s own `toggleSkillCalls`/`toggleToolsetCalls`
+ * idiom, extended to the 8 admin methods `hasDashboardAdmin` structurally
+ * checks for.
+ */
+class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardAdminClient {
+  addCalls: Array<{ name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> }> = [];
+  removeCalls: string[] = [];
+  setEnabledCalls: Array<{ name: string; enabled: boolean }> = [];
+  testCalls: string[] = [];
+  authCalls: string[] = [];
+  /** Settable canned envelope `testMcpServer`/`authMcpServer` resolve with. */
+  testResult: McpTestResult = { ok: true, tools: [] };
+
+  async addMcpServer(body: {
+    name: string;
+    url?: string;
+    command?: string;
+    args?: string[];
+    env?: Record<string, string>;
+  }): Promise<unknown> {
+    this.addCalls.push(body);
+    return { ok: true, name: body.name };
+  }
+
+  async removeMcpServer(name: string): Promise<{ ok: boolean }> {
+    this.removeCalls.push(name);
+    return { ok: true };
+  }
+
+  async testMcpServer(name: string): Promise<McpTestResult> {
+    this.testCalls.push(name);
+    return this.testResult;
+  }
+
+  async setMcpServerEnabled(name: string, enabled: boolean): Promise<{ ok: boolean; name: string; enabled: boolean }> {
+    this.setEnabledCalls.push({ name, enabled });
+    return { ok: true, name, enabled };
+  }
+
+  async authMcpServer(name: string): Promise<McpTestResult> {
+    this.authCalls.push(name);
+    return this.testResult;
+  }
+
+  async listMcpCatalog(): Promise<McpCatalogData> {
+    return { entries: [] };
+  }
+
+  async installCatalogEntry(): Promise<{ ok: boolean; name: string; background: boolean; action?: string }> {
+    return { ok: true, name: '', background: false };
+  }
+
+  async actionStatus(): Promise<{ running: boolean; exit_code: number | null; lines: string[] }> {
+    return { running: false, exit_code: 0, lines: [] };
+  }
+}
+
+/** Task A5 harness extension: a twin of {@link makeBackendWithDashboard} that injects {@link FakeAdminDashboardClient}. */
+function makeBackendWithAdminDashboard(): {
+  backend: AcpBackend;
+  messages: HostToWebviewMessage[];
+  client: FakeAdminDashboardClient;
+} {
+  const client = new FakeAdminDashboardClient();
+  const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+  const backend = new AcpBackend({}, undefined, undefined, undefined, dashboard);
+  const messages: HostToWebviewMessage[] = [];
+  backend.onMessage((m) => messages.push(m));
+  return { backend, messages, client };
+}
+
 describe('AcpBackend — W1.5 dashboard channel (Skills & Tools)', () => {
   it('routes skills.toggle to the dashboard client (NOT tui_gateway) and returns the {ok,name,enabled} round-trip', async () => {
     const { backend, client } = makeBackendWithDashboard();
@@ -7204,6 +7288,145 @@ describe('AcpBackend — W1.5 dashboard channel (Skills & Tools)', () => {
 
     client.resolveNext();
     await expect(second).resolves.toEqual({ ok: true, name: 'b', enabled: true });
+  });
+});
+
+// =============================================================================
+// Task A5 (features-add-mcp-skills-architecture.md §4.5): ControlDispatcher's
+// T1 MCP admin core — add/remove/setEnabled/test + trust gate + the
+// fail-closed last-listed-name guard (critic IMPORTANT-2).
+// =============================================================================
+
+// A `Record<..., true>` literal mirroring `SetupController.test.ts:1675-1712`'s
+// "MUTATING_METHODS / READ_ONLY_METHODS partition the full SetupMethod union"
+// lock idiom: TypeScript refuses to compile this object if a key is
+// mistyped/renamed, and the runtime equality assertion below is what
+// actually fails if `TRUST_GATED_METHODS` ever drifts from the brief's
+// pinned 9-method set (§4.5 item 1) — e.g. a future task adding a new
+// mutating MCP/skills method without also classifying it here.
+const PINNED_TRUST_GATED_METHODS: Record<
+  | 'mcp.add'
+  | 'mcp.remove'
+  | 'mcp.setEnabled'
+  | 'mcp.test'
+  | 'mcp.auth'
+  | 'mcp.catalogInstall'
+  | 'skills.create'
+  | 'skills.hubInstall'
+  | 'skills.hubUninstall',
+  true
+> = {
+  'mcp.add': true,
+  'mcp.remove': true,
+  'mcp.setEnabled': true,
+  'mcp.test': true,
+  'mcp.auth': true,
+  'mcp.catalogInstall': true,
+  'skills.create': true,
+  'skills.hubInstall': true,
+  'skills.hubUninstall': true,
+};
+
+describe('TRUST_GATED_METHODS (Task A5 §4.5 item 1): pinned 9-method lock', () => {
+  it('is exactly the 9 methods the brief pins — no silent drift', () => {
+    expect([...TRUST_GATED_METHODS].sort()).toEqual(Object.keys(PINNED_TRUST_GATED_METHODS).sort());
+  });
+});
+
+describe('ControlDispatcher — Task A5 MCP admin core', () => {
+  it('mcp.add happy path: validate -> host modal -> POST -> reload.mcp{confirm:true} -> mcp refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    mockShowWarningMessage.mockResolvedValueOnce('Add server'); // user confirms the native modal
+
+    const result = await backend.invokeControl('mcp.add', {
+      name: 'gh',
+      transport: 'stdio',
+      command: 'npx',
+      args: ['-y', 'x'],
+      env: {},
+    });
+
+    expect(client.addCalls).toEqual([{ name: 'gh', command: 'npx', args: ['-y', 'x'], env: {} }]);
+    expect(control.dispatchCalls.map((c) => c.method)).toEqual(['reload.mcp', 'config.get', 'tools.list']);
+    expect(result).toMatchObject({ ok: true, name: 'gh' });
+  });
+
+  it('mcp.add: a declined modal sends NOTHING to the dashboard client', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); // user hit Cancel
+    await expect(
+      backend.invokeControl('mcp.add', { name: 'gh', transport: 'stdio', command: 'npx', args: [], env: {} }),
+    ).rejects.toThrow(/declined|cancel/i);
+    expect(client.addCalls).toEqual([]);
+  });
+
+  it('mcp.add: untrusted workspace is refused before validation or any modal', async () => {
+    const { backend } = makeBackendWithAdminDashboard();
+    // Earlier tests in this describe block leave `mockShowWarningMessage`
+    // with a non-zero call count (it's a module-level spy, never
+    // auto-reset) — mirrors the existing `mockClear()` discipline at
+    // AcpBackend.test.ts:10186/:10196/:10223/:10234.
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      await expect(
+        backend.invokeControl('mcp.add', { name: 'gh', transport: 'stdio', command: 'npx', args: [], env: {} }),
+      ).rejects.toThrow(/trust/i);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('mcp.remove refuses a name outside lastListedNames (S-M4)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache
+    await expect(backend.invokeControl('mcp.remove', { name: 'evil' })).rejects.toThrow(/not in the last-listed/);
+    expect(client.removeCalls).toEqual([]);
+  });
+
+  it('IMPORTANT-2: every name-keyed mutation is FAIL-CLOSED when the panel was never fetched (cache undefined)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    // No panel.data fetch — lastListedNames() is undefined. The modal-less
+    // mcp.setEnabled is the critical case: without this rule a compromised
+    // webview's FIRST message could toggle any server.
+    await expect(backend.invokeControl('mcp.setEnabled', { name: 'anything', enabled: false })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    await expect(backend.invokeControl('mcp.remove', { name: 'anything' })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    await expect(backend.invokeControl('mcp.test', { name: 'anything' })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    await expect(backend.invokeControl('mcp.auth', { name: 'anything' })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    expect(client.setEnabledCalls).toEqual([]);
+    expect(client.removeCalls).toEqual([]);
+    expect(client.testCalls).toEqual([]);
+    expect(client.authCalls).toEqual([]);
+  });
+
+  it('mcp.test resolves the ok:false envelope verbatim, with NO reload and NO modal', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' });
+    client.testResult = { ok: false, error: 'boom', tools: [] };
+    mockShowWarningMessage.mockClear(); // see the untrusted-workspace test's own note above
+    const res = await backend.invokeControl('mcp.test', { name: 'gh' });
+    expect(res).toEqual({ ok: false, error: 'boom', tools: [] });
+    expect(control.dispatchCalls.filter((c) => c.method === 'reload.mcp')).toEqual([]);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 });
 

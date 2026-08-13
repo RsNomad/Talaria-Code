@@ -508,6 +508,20 @@ export class AcpBackend implements AgentBackend {
       showWarningMessage: (message) => {
         void vscode.window.showWarningMessage(message);
       },
+      // Task A5 (§3 Layer 5, §4.5): the dispatcher-side trust gate — a
+      // call-time read (never cached), so a mid-session trust upgrade
+      // (`workspace.onDidGrantWorkspaceTrust`) is picked up immediately.
+      isTrusted: () => vscode.workspace.isTrusted,
+      // Task A5 (§3 Layer 3, §4.5): the native consent modal. Context7-pinned
+      // overload — `showWarningMessage<T extends string>(message, options:
+      // MessageOptions, ...items: T[]): Thenable<T | undefined>`; `detail`
+      // renders only for `modal: true`. Resolves `true` only when the user
+      // picked the exact `actionLabel` item (Cancel/dismiss/any other choice
+      // is a decline).
+      confirm: async (message, detail, actionLabel) => {
+        const choice = await vscode.window.showWarningMessage(message, { modal: true, detail }, actionLabel);
+        return choice === actionLabel;
+      },
       loadSessionIntoTab: (sessionId, cwd, tabId, title) => this.loadSessionIntoTab(sessionId, cwd, tabId, title),
     };
     this.controlDispatcher = new ControlDispatcher(controlPort);

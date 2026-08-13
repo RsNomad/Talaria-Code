@@ -7,6 +7,8 @@ import type {
   EditPolicyPreset,
   HydrateTabSeed,
   SlashCommandInfo,
+  McpAddParams,
+  McpAddResult,
 } from '../../../shared/protocol';
 import { CONTROL_METHODS, makePanelData } from '../../../shared/protocol';
 import type { RestoreResult } from '../../checkpoints/CheckpointTracker';
@@ -17,12 +19,57 @@ import type { Logger } from '../../transport/JsonRpcStdio';
 import type { PanelSourceRegistry } from '../../panels/PanelSourceRegistry';
 import { extractCwd, extractRootId, extractSessionId } from '../../panels/panelSources';
 import type { DashboardService } from '../../dashboard/HermesDashboardManager';
-import type { DashboardToggleResult } from '../../dashboard/HermesDashboardClient';
+import type { DashboardAdminClient, DashboardToggleResult } from '../../dashboard/HermesDashboardClient';
+import { hasDashboardAdmin } from '../../dashboard/HermesDashboardClient';
 import { hasToggleNameCache } from '../../dashboard/dashboardPanelSources';
 import type { AcpLoadSessionResult } from '../acp/acpClient';
 import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
 import type { SessionController } from '../session/SessionController';
 import type { SessionRegistry } from '../session/SessionRegistry';
+import { validateMcpAdd, describeAddForModal, stripModalControls } from './mcpEntryValidation';
+
+/**
+ * Task A5 (features-add-mcp-skills-architecture.md §3 Layer 5, §4.5 item 1):
+ * the FULL trust-gated method set for T1 (MCP admin) + T2 (skills admin) —
+ * checked FIRST, before any network call or modal, for every method in this
+ * set. Mirrors `SetupController.MUTATING_METHODS` + its `handle()` check
+ * (`SetupController.ts:612-634, :1146-1148`) as a SECOND, independent gate
+ * on the control-method surface (defense-in-depth over `trustGate.ts`'s
+ * "no ACP backend in an untrusted workspace" gate).
+ *
+ * Pinned as the FULL 9-method set even though this task (A5) only ROUTES
+ * `mcp.add`/`mcp.remove`/`mcp.setEnabled`/`mcp.test`/`mcp.auth` (the guard
+ * for `mcp.auth`; its body is task A6) — `mcp.catalogInstall` and the three
+ * `skills.*` admin methods are routed by A6/B4/B5, but the trust-gate SET
+ * itself is defined here, once, so no later task can silently add a
+ * mutating method without also classifying it here (the
+ * `SetupController.test.ts:1675-1712` partition-lock idiom, mirrored in
+ * `AcpBackend.test.ts`'s `PINNED_TRUST_GATED_METHODS` lock test).
+ */
+export const TRUST_GATED_METHODS: ReadonlySet<string> = new Set([
+  'mcp.add',
+  'mcp.remove',
+  'mcp.setEnabled',
+  'mcp.test',
+  'mcp.auth',
+  'mcp.catalogInstall',
+  'skills.create',
+  'skills.hubInstall',
+  'skills.hubUninstall',
+]);
+
+/** The 5 MCP admin methods {@link ControlDispatcher.handleMcpAdmin} routes (A5+A6). */
+type McpAdminMethod = 'mcp.add' | 'mcp.remove' | 'mcp.setEnabled' | 'mcp.test' | 'mcp.auth';
+
+function isMcpAdminMethod(method: string): method is McpAdminMethod {
+  return (
+    method === 'mcp.add' ||
+    method === 'mcp.remove' ||
+    method === 'mcp.setEnabled' ||
+    method === 'mcp.test' ||
+    method === 'mcp.auth'
+  );
+}
 
 /**
  * W6-FI-c (3-way ARCH I-4, part 3 of 3): the dependencies {@link
@@ -58,6 +105,22 @@ export interface ControlDispatcherHostPort {
   getDashboard(): DashboardService | undefined;
   /** Surface a non-blocking warning to the user (`vscode.window.showWarningMessage`) — injected so this module stays vscode-free, mirroring every other extracted subsystem's DI posture. */
   showWarningMessage(message: string): void;
+  /**
+   * Task A5 (§3 Layer 5, §4.5): `() => vscode.workspace.isTrusted` — the
+   * dispatcher-side trust gate for {@link TRUST_GATED_METHODS}, defense-in-
+   * depth over `trustGate.ts`'s existing "no ACP backend in an untrusted
+   * workspace" gate (a SECOND, independent check on the control-method
+   * surface itself).
+   */
+  isTrusted(): boolean;
+  /**
+   * Task A5 (§3 Layer 3, §4.5): the native consent modal —
+   * `vscode.window.showWarningMessage(message, { modal: true, detail },
+   * actionLabel) === actionLabel` (Context7-pinned `MessageOptions.detail`
+   * renders only for modal messages). A compromised webview can at most
+   * summon this dialog; it can never answer it.
+   */
+  confirm(message: string, detail: string, actionLabel: string): Promise<boolean>;
   /**
    * The C1/W6-FB entangled History-load choreography (`AcpBackend
    * .loadSessionIntoTab`) — too entangled with `openSession`/session-minting
@@ -136,8 +199,14 @@ export class ControlDispatcher {
   private static readonly UNKNOWN_SESSION_ID = 'unknown-session';
 
   /**
-   * AH5: HOST-SIDE serialization tail for {@link toggleDashboard}. Moved
-   * verbatim off `AcpBackend` — see the original field doc (unchanged).
+   * AH5: HOST-SIDE serialization tail, originally for {@link toggleDashboard}
+   * alone (moved verbatim off `AcpBackend`). Task A5 (§4.5) widened its use
+   * to EVERY dashboard-mutating control method — {@link handleMcpAdmin} now
+   * chains onto this SAME queue — so `skills.toggle`/`toolsets.toggle`/
+   * `mcp.add`/`mcp.remove`/`mcp.setEnabled`/`mcp.test`/`mcp.auth` (and A6/B4/
+   * B5's `mcp.catalogInstall`/`skills.*`) can never interleave two writes to
+   * the same underlying `~/.hermes/config.yaml` — one shared tail, not one
+   * per method family.
    */
   private dashboardToggleTail: Promise<unknown> = Promise.resolve();
 
@@ -230,6 +299,13 @@ export class ControlDispatcher {
 
     if (method === 'skills.toggle' || method === 'toolsets.toggle') {
       return this.toggleDashboard(method, params);
+    }
+
+    // Task A5 (§4.5): the T1 MCP admin core — add/remove/setEnabled/test,
+    // plus the trust+fail-closed-cache GUARD for auth (its body is A6).
+    // `mcp.catalog`/`mcp.catalogInstall` are NOT routed here (A6).
+    if (isMcpAdminMethod(method)) {
+      return this.handleMcpAdmin(method, params);
     }
 
     if (method === 'reload.mcp') {
@@ -431,6 +507,164 @@ export class ControlDispatcher {
     return method === 'skills.toggle'
       ? client.toggleSkill(name, enabled)
       : client.toggleToolset(name, enabled);
+  }
+
+  /**
+   * Task A5 (§4.5): the T1 MCP admin core, riding the SAME host-side
+   * serialization tail as {@link toggleDashboard} ({@link
+   * dashboardToggleTail}) — the plan is explicit that every dashboard
+   * mutation (skills/toolsets toggle, and now `mcp.add`/`remove`/
+   * `setEnabled`/`test`/`auth`) shares ONE queue, so a compromised or buggy
+   * webview firing parallel `control.request`s can't interleave two writes
+   * to the same underlying `~/.hermes/config.yaml`.
+   */
+  private async handleMcpAdmin(method: McpAdminMethod, params: unknown): Promise<unknown> {
+    const run = () => this.handleMcpAdminInner(method, params);
+    const result = this.dashboardToggleTail.then(run, run);
+    this.dashboardToggleTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  /**
+   * Task A5 (§3 Layer 5, §4.5 items 1-3): trust gate -> admin-client
+   * resolution -> (name-keyed methods only) the FAIL-CLOSED last-listed-name
+   * guard -> the per-method route. `mcp.add` is the one method here with no
+   * name to validate against the cache (it's creating a NEW name).
+   */
+  private async handleMcpAdminInner(method: McpAdminMethod, params: unknown): Promise<unknown> {
+    if (TRUST_GATED_METHODS.has(method) && !this.port.isTrusted()) {
+      throw new Error(`Refusing '${method}': the workspace is not trusted — trust this workspace to manage MCP servers.`);
+    }
+
+    const client = await this.resolveMcpAdminClient(method);
+
+    if (method === 'mcp.add') {
+      return this.mcpAdd(client, params);
+    }
+
+    const name = extractMcpName(params);
+    this.requireListedMcpName(method, name);
+
+    switch (method) {
+      case 'mcp.remove':
+        return this.mcpRemove(client, name);
+      case 'mcp.setEnabled':
+        return this.mcpSetEnabled(client, name, extractMcpEnabled(params));
+      case 'mcp.test':
+        // F-8 CONFIRMED (§4.5 item 7): no modal, no reload — the envelope
+        // (including an `{ok:false}` connect failure) is a RESOLVED result
+        // the panel renders, never a rejection.
+        return client.testMcpServer(name);
+      case 'mcp.auth':
+        // TASK A6 owns the OAuth body (withProgress + single-flight, §4.8).
+        // No A5 test reaches this line — every A5 `mcp.auth` assertion
+        // refuses at the `requireListedMcpName` guard above (the panel-fetch
+        // cache is undefined until a successful `mcp` panel fetch — task
+        // A4's `McpPanelSource.lastListedNames()`).
+        throw new Error('mcp.auth handler is implemented in task A6');
+      default: {
+        const exhaustive: never = method;
+        throw new Error(`unhandled MCP admin method: ${String(exhaustive)}`);
+      }
+    }
+  }
+
+  /**
+   * Task A5 (§4.5 item 2): `dashboard.ensure()` then the `hasDashboardAdmin`
+   * structural narrowing (the `hasToggleNameCache` idiom) — a dashboard
+   * client without the T1 admin surface (or no dashboard at all) fails
+   * closed rather than silently no-op-ing.
+   */
+  private async resolveMcpAdminClient(method: string): Promise<DashboardAdminClient> {
+    const dashboard = this.port.getDashboard();
+    if (!dashboard) {
+      throw new Error(`Refusing '${method}': the Hermes dashboard channel is not configured.`);
+    }
+    const client = await dashboard.ensure();
+    if (!hasDashboardAdmin(client)) {
+      throw new Error(`Refusing '${method}': the dashboard client does not support MCP admin actions.`);
+    }
+    return client;
+  }
+
+  /**
+   * Task A5 (§3 Layer 5 critic IMPORTANT-2, §4.5 item 3): the FAIL-CLOSED
+   * name-cache guard for `mcp.remove`/`mcp.setEnabled`/`mcp.test`/`mcp.auth`.
+   * DELIBERATELY diverges from {@link toggleDashboardInner}'s lenient
+   * `if (known && !known.has(name))` idiom: an UNFETCHED cache
+   * (`lastListedNames()` returns `undefined` — the `mcp` panel was never
+   * listed this host session) is a REFUSAL here, not a skip. `mcp.setEnabled`
+   * has no modal, so this cache is its ONLY gate — without the fail-closed
+   * rule a compromised webview's FIRST message could toggle an arbitrary
+   * server before any panel render ever populated the cache.
+   */
+  private requireListedMcpName(method: string, name: string | undefined): asserts name is string {
+    if (!name) {
+      throw new Error(`'${method}' requires a { name } payload.`);
+    }
+    const source = this.port.panelSources.get('mcp');
+    const known = hasToggleNameCache(source) ? source.lastListedNames() : undefined;
+    if (known === undefined) {
+      throw new Error(`Refusing '${method}': the MCP panel has not been listed yet — open it first.`);
+    }
+    if (!known.has(name)) {
+      throw new Error(`${method}: '${name}' is not in the last-listed MCP servers.`);
+    }
+  }
+
+  /**
+   * Task A5 (§4.5 item 4): `validateMcpAdd` -> `describeAddForModal` (an
+   * `ok:false` ceiling refusal REJECTS here, before any modal) -> the native
+   * consent modal -> `addMcpServer` -> `reload.mcp{confirm:true}` -> an `mcp`
+   * panel refetch -> `{ok:true, name, transport}` (`transport` is the
+   * VALIDATED discriminant — see the `McpAddResult` doc, protocol.ts). `env`
+   * VALUES pass through `validated.body` exactly once and are never logged.
+   */
+  private async mcpAdd(client: DashboardAdminClient, params: unknown): Promise<McpAddResult> {
+    const validated = validateMcpAdd(params);
+    if (!validated.ok) {
+      throw new Error(validated.reason);
+    }
+    const transport = extractValidatedAddTransport(params);
+    const described = describeAddForModal(toMcpAddParams(validated.body, transport));
+    if (!described.ok) {
+      throw new Error(described.reason);
+    }
+    const confirmed = await this.port.confirm(described.message, described.detail, 'Add server');
+    if (!confirmed) {
+      throw new Error(`Adding MCP server "${validated.body.name}" was declined or cancelled.`);
+    }
+    await client.addMcpServer(validated.body);
+    await this.port.dispatch('reload.mcp', { confirm: true });
+    await this.fetchPanelData('mcp');
+    return { ok: true, name: validated.body.name, transport };
+  }
+
+  /** Task A5 (§4.5 item 5): confirm -> `removeMcpServer` -> reload -> refetch. */
+  private async mcpRemove(client: DashboardAdminClient, name: string): Promise<unknown> {
+    const message = stripModalControls(`Remove MCP server "${name}"?`);
+    const confirmed = await this.port.confirm(message, MCP_RELOAD_LINE, 'Remove');
+    if (!confirmed) {
+      throw new Error(`Removing MCP server "${name}" was declined or cancelled.`);
+    }
+    const result = await client.removeMcpServer(name);
+    await this.port.dispatch('reload.mcp', { confirm: true });
+    await this.fetchPanelData('mcp');
+    return result;
+  }
+
+  /**
+   * Task A5 (§4.5 item 6): NO modal (toggle class — consent already happened
+   * at add/install time) -> `setMcpServerEnabled` -> reload -> refetch.
+   */
+  private async mcpSetEnabled(client: DashboardAdminClient, name: string, enabled: boolean): Promise<unknown> {
+    const result = await client.setMcpServerEnabled(name, enabled);
+    await this.port.dispatch('reload.mcp', { confirm: true });
+    await this.fetchPanelData('mcp');
+    return result;
   }
 
   /**
@@ -769,6 +1003,53 @@ function extractToggleParams(params: unknown): { name?: string; enabled: boolean
     enabled: p.enabled === true,
   };
 }
+
+/** Task A5: pull `{name}` out of an `mcp.remove`/`mcp.setEnabled`/`mcp.test`/`mcp.auth` payload. */
+function extractMcpName(params: unknown): string | undefined {
+  if (!params || typeof params !== 'object') return undefined;
+  const p = params as { name?: unknown };
+  return typeof p.name === 'string' ? p.name : undefined;
+}
+
+/** Task A5: pull `{enabled}` out of an `mcp.setEnabled` payload. */
+function extractMcpEnabled(params: unknown): boolean {
+  if (!params || typeof params !== 'object') return false;
+  return (params as { enabled?: unknown }).enabled === true;
+}
+
+/**
+ * Task A5: `validateMcpAdd` already confirmed `params.transport` is exactly
+ * `'stdio'` or `'http'` before returning `ok:true` — this reads that SAME
+ * validated discriminant off the original (still-`unknown`) params object,
+ * for the `McpAddResult.transport` field and for reconstructing a typed
+ * `McpAddParams` to hand `describeAddForModal` (§4.2's own doc: "`transport`
+ * is threaded from the VALIDATED McpAddParams discriminant").
+ */
+function extractValidatedAddTransport(params: unknown): 'stdio' | 'http' {
+  const p = params as { transport?: unknown };
+  return p.transport === 'http' ? 'http' : 'stdio';
+}
+
+/**
+ * Task A5: rebuild a typed `McpAddParams` from `validateMcpAdd`'s already-
+ * trimmed/validated `body` (which deliberately drops `transport` — the REST
+ * wire body has no such field) plus the separately-read discriminant, so the
+ * modal text (`describeAddForModal`) reflects the SAME validated bytes that
+ * go on the wire (§3 Layer 3: "the modal text derives from the same
+ * validated object that goes on the wire").
+ */
+function toMcpAddParams(
+  body: { name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> },
+  transport: 'stdio' | 'http',
+): McpAddParams {
+  return transport === 'http'
+    ? { name: body.name, transport: 'http', url: body.url ?? '' }
+    : { name: body.name, transport: 'stdio', command: body.command ?? '', args: body.args ?? [], env: body.env ?? {} };
+}
+
+/** Task A5 (§4.6 modal copy, pinned verbatim): the reload/prompt-cache-invalidation line shared by every MCP consent modal. */
+const MCP_RELOAD_LINE =
+  'Applying the change reloads MCP servers and invalidates the prompt cache (the next message re-sends full input tokens).';
 
 /**
  * P3 (arch A3): pinned refusal returned by {@link ControlDispatcher
