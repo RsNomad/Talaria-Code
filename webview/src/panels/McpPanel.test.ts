@@ -6,7 +6,16 @@
  */
 import { describe, it, expect } from 'vitest';
 import { totalLookup } from '../lookup';
-import { STATUS, UNKNOWN_MCP_STATUS, parseArgsLines, parseEnvLines, testNotice } from './McpPanel';
+import type { McpCatalogEntry } from '../protocol';
+import {
+  STATUS,
+  UNKNOWN_MCP_STATUS,
+  parseArgsLines,
+  parseEnvLines,
+  testNotice,
+  catalogRowBadges,
+  authNotice,
+} from './McpPanel';
 
 describe('McpPanel status lookup (UI-I1)', () => {
   it('resolves every known McpStatus to its real entry (behavior-preserving)', () => {
@@ -40,5 +49,44 @@ describe('McpPanel Add-server helpers (A7)', () => {
       tone: 'error',
       text: expect.stringContaining('boom'),
     });
+  });
+});
+
+/* Task A8 (§4.7/§4.8): pure helpers behind the Catalog disclosure + Login
+ * button. Exercised directly (no jsdom), same style as the A7 helpers above —
+ * the wiring is covered separately in `McpPanel.dom.test.tsx`. */
+const catalogRowFixture: McpCatalogEntry = {
+  name: 'builder',
+  description: 'Builds things from source.',
+  source: 'nous',
+  transport: 'stdio',
+  auth_type: 'none',
+  required_env: [],
+  command: 'npx',
+  args: ['-y', 'builder-mcp'],
+  url: null,
+  install_url: null,
+  install_ref: null,
+  bootstrap: [],
+  default_enabled: null,
+  post_install: '',
+  needs_install: false,
+  installed: false,
+  enabled: false,
+};
+
+describe('McpPanel Catalog + Login helpers (A8)', () => {
+  it('catalogRowBadges flags needs_install rows and installed rows', () => {
+    expect(catalogRowBadges({ ...catalogRowFixture, needs_install: true }).build).toBe(true);
+    expect(catalogRowBadges({ ...catalogRowFixture, installed: true }).installed).toBe(true);
+    expect(catalogRowBadges(catalogRowFixture)).toEqual({ build: false, installed: false });
+  });
+
+  it('authNotice maps the auth envelope (ok / error / cancel text passthrough)', () => {
+    expect(authNotice({ ok: true, tools: [{ name: 't', description: '' }] }).tone).toBe('ok');
+    const cancelText = 'Cancelled. The browser sign-in may still be completing — run Test after finishing it.';
+    const result = authNotice({ ok: false, error: cancelText, tools: [] });
+    expect(result.tone).toBe('error');
+    expect(result.text).toBe(cancelText);
   });
 });

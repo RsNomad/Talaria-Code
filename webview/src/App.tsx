@@ -26,6 +26,9 @@ import type {
   HostToWebview,
   McpAddParams,
   McpAddResult,
+  McpCatalogData,
+  McpCatalogInstallParams,
+  McpCatalogInstallResult,
   McpTestResult,
   NextEditToggleSource,
   Panel,
@@ -443,11 +446,29 @@ export function App() {
   const removeMcpServer = (name: string) => bridge.request('mcp.remove', { name });
   const setMcpServerEnabled = (name: string, enabled: boolean) =>
     bridge.request('mcp.setEnabled', { name, enabled });
-  // A8 wires this into the panel's per-row `Login` button; wired here now so
-  // the correlated handler exists ahead of that task landing.
+  // Task A8 (§4.8): drives the panel's per-row `Login` button.
   const authMcpServer = async (name: string): Promise<McpTestResult> => {
     const result = await bridge.request('mcp.auth', { name });
     return result as McpTestResult;
+  };
+  // Task A8 (§4.7): the Catalog disclosure's fetch (read-only, not trust-
+  // gated — fired at most once per panel mount, on first expand) and its
+  // `Install` action. Same untagged/cast posture as the other MCP admin RPCs
+  // above — `mcp` is connection-global.
+  const mcpCatalog = async (): Promise<McpCatalogData> => {
+    const result = await bridge.request('mcp.catalog', {});
+    return result as McpCatalogData;
+  };
+  const mcpCatalogInstall = async (p: McpCatalogInstallParams): Promise<McpCatalogInstallResult> => {
+    // `bridge.request` wants `Record<string, unknown>`; unlike `McpAddParams`
+    // (a `type` alias, structurally weak against an index signature),
+    // `McpCatalogInstallParams` is an `interface` — TS never infers an
+    // implicit index signature for those, so the params are rebuilt as a
+    // fresh object literal here (the same posture `restoreCheckpoint` above
+    // uses for its own `Record<string, unknown>` params).
+    const wireParams: Record<string, unknown> = { name: p.name, env: p.env };
+    const result = await bridge.request('mcp.catalogInstall', wireParams);
+    return result as McpCatalogInstallResult;
   };
 
   // D3/N13: SettingsPanel's `config.set` over the CORRELATED path (the same
@@ -863,6 +884,8 @@ export function App() {
                   onRemove={removeMcpServer}
                   onSetEnabled={setMcpServerEnabled}
                   onAuth={authMcpServer}
+                  onCatalog={mcpCatalog}
+                  onCatalogInstall={mcpCatalogInstall}
                 />
               )}
             </RemotePanel>

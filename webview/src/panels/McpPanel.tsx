@@ -10,7 +10,17 @@
  * a fire-and-forget invoke. The click is still the confirmation (the host sends
  * `confirm:true`); we only make the RESULT visible. */
 import { useState, type FormEvent } from 'react';
-import type { McpAddParams, McpAddResult, McpData, McpStatus, McpTestResult } from '../protocol';
+import type {
+  McpAddParams,
+  McpAddResult,
+  McpCatalogData,
+  McpCatalogEntry,
+  McpCatalogInstallParams,
+  McpCatalogInstallResult,
+  McpData,
+  McpStatus,
+  McpTestResult,
+} from '../protocol';
 import { totalLookup } from '../lookup';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
@@ -102,6 +112,29 @@ export function testNotice(result: McpTestResult): TestNotice {
   return { tone: 'error', text: result.error ?? 'Test failed.' };
 }
 
+/**
+ * Task A8 (§4.8): maps the `mcp.auth` envelope honestly — same shape and
+ * same "pass the Hermes-authored `error` text through verbatim" posture as
+ * {@link testNotice} (Invariant #3's 200-envelope exemption), including the
+ * honest cancel text (`ControlDispatcher.ts`'s `AbortSignal` branch) which
+ * must reach the user unmodified, not just its `{ok:false}` siblings.
+ */
+export function authNotice(result: McpTestResult): TestNotice {
+  if (result.ok) return { tone: 'ok', text: `Authorized — ${result.tools.length} tools` };
+  return { tone: 'error', text: result.error ?? 'Sign-in failed.' };
+}
+
+/**
+ * Task A8 (§4.7): the two badges a catalog row renders beyond its name/
+ * description/transport — `needs_install` (renamed `build` here to match the
+ * amber "builds from source" pill it drives) and `installed`. Kept as a pure
+ * mapping (not inlined in JSX) so `McpPanel.test.ts` can exercise the
+ * decision without jsdom, same posture as `testNotice`/`authNotice`.
+ */
+export function catalogRowBadges(entry: McpCatalogEntry): { build: boolean; installed: boolean } {
+  return { build: entry.needs_install, installed: entry.installed };
+}
+
 interface McpPanelProps {
   data: McpData;
   /** Correlated reload — resolves with the gateway's reload result, or rejects. */
@@ -114,8 +147,12 @@ interface McpPanelProps {
   onRemove: (name: string) => Promise<unknown>;
   /** Correlated `mcp.setEnabled`, driven through {@link useToggle} for optimistic+rollback. */
   onSetEnabled: (name: string, enabled: boolean) => Promise<unknown>;
-  /** Correlated `mcp.auth` — accepted here so `App.tsx` can wire it ahead of task A8, which adds the per-row Login button that calls it. */
+  /** Correlated `mcp.auth` — drives the per-row `Login` button (task A8, §4.8) on `transport === 'http'` rows. */
   onAuth: (name: string) => Promise<McpTestResult>;
+  /** Correlated `mcp.catalog` (task A8, §4.7) — read-only, not trust-gated. Fired exactly once, on the Catalog disclosure's first expand. */
+  onCatalog: () => Promise<McpCatalogData>;
+  /** Correlated `mcp.catalogInstall` (task A8, §4.7) — the HOST renders the build-consent modal; this call only summons it. */
+  onCatalogInstall: (params: McpCatalogInstallParams) => Promise<McpCatalogInstallResult>;
 }
 
 /** A user-facing notice derived from the reload outcome. */
@@ -398,14 +435,157 @@ function RowNoticeCard({ notice }: { notice: TestNotice | undefined }) {
   );
 }
 
-export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled, onAuth: _onAuth }: McpPanelProps) {
-  // `_onAuth`: not yet called from this panel — task A8 wires it into the
-  // per-row `Login` button for `transport === 'http'` rows. Accepted now so
-  // `App.tsx` can hand the correlated handler down ahead of that task.
+/**
+ * Task A8 (§4.7): the "Catalog" disclosure at the bottom of `McpPanel` —
+ * collapsed by default. The FIRST expand fires `onCatalog` exactly once
+ * (guarded by `fetched`, set synchronously in the SAME click handler that
+ * starts the request, before the `await` — a second click inside the same
+ * render can't race past it); later collapse/expand cycles reuse the already-
+ * fetched `entries`, never refetching. Each row renders one `TextField` per
+ * `required_env` var (env VALUES live only in this component's own state —
+ * collected, never logged, sent once on `Install`) and surfaces the install
+ * outcome through the same `RowNoticeCard` + `LiveRegion` pattern the server
+ * rows use for Test/Remove, addressed by the catalog entry's own name.
+ */
+function CatalogDisclosure({
+  onCatalog,
+  onCatalogInstall,
+}: {
+  onCatalog: McpPanelProps['onCatalog'];
+  onCatalogInstall: McpPanelProps['onCatalogInstall'];
+}) {
+  const [open, setOpen] = useState(false);
+  const [fetched, setFetched] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [entries, setEntries] = useState<McpCatalogEntry[]>([]);
+  const [fetchError, setFetchError] = useState<string | undefined>();
+  const [envValues, setEnvValues] = useState<Record<string, Record<string, string>>>({});
+  const [installing, setInstalling] = useState<Record<string, boolean>>({});
+  const [rowNotice, setRowNotice] = useState<Record<string, TestNotice>>({});
+
+  const handleToggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (!next || fetched) return;
+    setFetched(true);
+    setLoading(true);
+    void onCatalog()
+      .then(
+        (result) => setEntries(result.entries),
+        (err: unknown) => setFetchError(errorMessage(err, 'Failed to load the catalog.')),
+      )
+      .finally(() => setLoading(false));
+  };
+
+  const setEnvValue = (entryName: string, envKey: string, value: string) => {
+    setEnvValues((all) => ({ ...all, [entryName]: { ...all[entryName], [envKey]: value } }));
+  };
+
+  const handleInstall = (entry: McpCatalogEntry) => {
+    const env: Record<string, string> = {};
+    for (const v of entry.required_env) {
+      env[v.name] = envValues[entry.name]?.[v.name] ?? '';
+    }
+    setInstalling((m) => ({ ...m, [entry.name]: true }));
+    void onCatalogInstall({ name: entry.name, env })
+      .then(
+        (result) => setRowNotice((n) => ({ ...n, [entry.name]: { tone: 'ok', text: `Installed "${result.name}".` } })),
+        (err: unknown) =>
+          setRowNotice((n) => ({ ...n, [entry.name]: { tone: 'error', text: errorMessage(err, 'Install failed.') } })),
+      )
+      .finally(() => setInstalling((m) => ({ ...m, [entry.name]: false })));
+  };
+
+  return (
+    <div className="mt-2 overflow-hidden rounded-card border border-dashed border-border">
+      <button
+        type="button"
+        onClick={handleToggle}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-3 py-2 font-mono text-2xs uppercase tracking-wide text-muted hover:text-accent"
+      >
+        <Icon name="package" size={13} />
+        Catalog
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} className="ml-auto" />
+      </button>
+      {open && (
+        <div className="flex flex-col gap-2 border-t border-border px-3 py-3">
+          {loading && <div className="font-mono text-2xs text-muted">Loading catalog…</div>}
+          {fetchError && (
+            <div className="flex items-start gap-1.5 rounded border border-del bg-del-soft px-2 py-1 text-2xs text-fg">
+              <Icon name="error" size={11} className="mt-0.5 flex-none text-del" />
+              <span className="min-w-0 flex-1 break-words">{fetchError}</span>
+            </div>
+          )}
+          {!loading && !fetchError && entries.length === 0 && (
+            <div className="font-mono text-2xs text-faint">No catalog entries.</div>
+          )}
+          {entries.map((entry) => {
+            const badges = catalogRowBadges(entry);
+            const rowInstalling = installing[entry.name] === true;
+            return (
+              <div key={entry.name} className="rounded-card border border-border bg-surface px-3 py-2.5">
+                <div className="flex items-center gap-2">
+                  <Icon name="package" size={15} className="flex-none text-accent" />
+                  <span className="min-w-0 truncate font-mono text-xs text-fg">{entry.name}</span>
+                  <span className="ml-auto flex flex-none items-center gap-1.5">
+                    <Pill>{entry.transport}</Pill>
+                    {badges.installed && (
+                      <Pill tone="add" icon="check">
+                        Installed
+                      </Pill>
+                    )}
+                    {badges.build && (
+                      <Pill tone="warn" icon="tools">
+                        builds from source
+                      </Pill>
+                    )}
+                  </span>
+                </div>
+                {entry.description && (
+                  <div className="mt-1 font-mono text-2xs text-faint">{entry.description}</div>
+                )}
+
+                {entry.required_env.length > 0 && (
+                  <div className="mt-2 flex flex-col gap-1.5">
+                    {entry.required_env.map((v) => (
+                      <div key={v.name} className="flex flex-col gap-0.5">
+                        <TextField
+                          label={v.prompt}
+                          value={envValues[entry.name]?.[v.name] ?? ''}
+                          onChange={(next) => setEnvValue(entry.name, v.name, next)}
+                        />
+                        <span className="font-mono text-2xs text-faint">Saved to Hermes' .env</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => handleInstall(entry)}
+                  disabled={rowInstalling}
+                  className="mt-2 flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50"
+                >
+                  <Icon name={rowInstalling ? 'loading' : 'cloud-download'} size={12} spin={rowInstalling} />
+                  {rowInstalling ? 'Installing…' : 'Install'}
+                </button>
+                <RowNoticeCard notice={rowNotice[entry.name]} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled, onAuth, onCatalog, onCatalogInstall }: McpPanelProps) {
   const [reloading, setReloading] = useState(false);
   const [notice, setNotice] = useState<ReloadNotice | undefined>();
   const [testing, setTesting] = useState<Record<string, boolean>>({});
   const [removing, setRemoving] = useState<Record<string, boolean>>({});
+  const [authing, setAuthing] = useState<Record<string, boolean>>({});
   const [rowNotice, setRowNotice] = useState<Record<string, TestNotice>>({});
   const { isOn, toggle, lastError } = useToggle(onSetEnabled);
 
@@ -468,12 +648,37 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
       .finally(() => setRemoving((r) => ({ ...r, [name]: false })));
   };
 
+  /** Task A8 (§4.8): the per-row `Login` button on `transport === 'http'`
+   *  rows. Same LiveRegion + `RowNoticeCard` addressing as Test/Remove above
+   *  — the resolved envelope (`{ok:true}` or the honest `{ok:false, error}`,
+   *  including a cancel) lands in the SAME row notice, mapped through
+   *  {@link authNotice}. The host's `withProgress` owns the actual
+   *  "waiting for the browser" UX; this button's own pending label is the
+   *  panel-local echo of that wait. */
+  const handleAuth = (name: string) => {
+    setAuthing((a) => ({ ...a, [name]: true }));
+    setRowNotice((n) => {
+      if (!(name in n)) return n;
+      const next = { ...n };
+      delete next[name];
+      return next;
+    });
+    void onAuth(name)
+      .then(
+        (result) => setRowNotice((n) => ({ ...n, [name]: authNotice(result) })),
+        (err: unknown) =>
+          setRowNotice((n) => ({ ...n, [name]: { tone: 'error', text: errorMessage(err, 'Sign-in failed.') } })),
+      )
+      .finally(() => setAuthing((a) => ({ ...a, [name]: false })));
+  };
+
   return (
     <PanelShell title="Active MCP servers" meta={`${data.servers.length} configured`}>
       {data.servers.map((srv) => {
         const s = totalLookup(STATUS, srv.status, UNKNOWN_MCP_STATUS);
         const rowTesting = testing[srv.name] === true;
         const rowRemoving = removing[srv.name] === true;
+        const rowAuthing = authing[srv.name] === true;
         const toggleErr = lastError(srv.name);
         return (
           <div key={srv.id} className="mb-2 rounded-card border border-border bg-surface px-3 py-2.5">
@@ -526,6 +731,23 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
                 <Icon name={rowRemoving ? 'loading' : 'trash'} size={12} spin={rowRemoving} />
                 {rowRemoving ? 'Removing…' : 'Remove'}
               </button>
+              {/* Task A8 (§4.8): OAuth login only makes sense for HTTP-transport
+                  servers — stdio servers "authenticate via env keys, not OAuth"
+                  (`web_server.py:10568-10572`), which is exactly why the
+                  dispatcher itself 400s a stdio `mcp.auth` call; gating the
+                  button here keeps the panel from ever offering an action the
+                  host would refuse. */}
+              {srv.transport === 'http' && (
+                <button
+                  type="button"
+                  onClick={() => handleAuth(srv.name)}
+                  disabled={rowAuthing}
+                  className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50"
+                >
+                  <Icon name={rowAuthing ? 'loading' : 'sign-in'} size={12} spin={rowAuthing} />
+                  {rowAuthing ? 'Waiting for browser sign-in…' : 'Login'}
+                </button>
+              )}
             </div>
             <RowNoticeCard notice={rowNotice[srv.name]} />
           </div>
@@ -533,6 +755,7 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
       })}
 
       <AddServerDisclosure onAdd={onAdd} onAdded={handleTest} />
+      <CatalogDisclosure onCatalog={onCatalog} onCatalogInstall={onCatalogInstall} />
 
       {/* `display:contents` (Tailwind `contents`): this `<section>` takes no
           part in layout — every child still lays out directly inside

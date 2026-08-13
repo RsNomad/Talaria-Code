@@ -17,7 +17,15 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { McpAddResult, McpData, McpTestResult } from '../protocol';
+import type {
+  McpAddResult,
+  McpCatalogData,
+  McpCatalogEntry,
+  McpCatalogInstallParams,
+  McpCatalogInstallResult,
+  McpData,
+  McpTestResult,
+} from '../protocol';
 import { McpPanel } from './McpPanel';
 import { must } from '../testing/must';
 
@@ -27,6 +35,52 @@ function mcpData(): McpData {
       { id: 'srv-1', name: 'filesystem', status: 'connected', command: 'npx mcp-fs', toolCount: 4, enabled: true, transport: 'stdio' },
     ],
   };
+}
+
+/* Task A8: a second fixture with an HTTP-transport row — the Login button
+ * only renders for `transport === 'http'`. Kept SEPARATE from `mcpData()`
+ * (rather than adding a second row to it) so every pre-existing single-row
+ * query in this file (`getByRole('button', { name: /^Test$/i })` etc.) keeps
+ * matching exactly one element. */
+function httpServerData(): McpData {
+  return {
+    servers: [
+      { id: 'srv-2', name: 'remote', status: 'connected', command: 'https://x.example/mcp', toolCount: 2, enabled: true, transport: 'http' },
+    ],
+  };
+}
+
+/* Task A8 (§4.7): one `GET /api/mcp/catalog` entry, verbatim shape
+ * (`McpCatalogEntry`, `src/shared/protocol.ts:314-332`) with one required env
+ * var — enough to exercise the env `TextField` + `Install` wiring. */
+function catalogEntryFixture(overrides?: Partial<McpCatalogEntry>): McpCatalogEntry {
+  return {
+    name: 'builder',
+    description: 'Builds things from source.',
+    source: 'nous',
+    transport: 'stdio',
+    auth_type: 'none',
+    required_env: [{ name: 'API_KEY', prompt: 'API Key', required: true }],
+    command: 'npx',
+    args: ['-y', 'builder-mcp'],
+    url: null,
+    install_url: null,
+    install_ref: null,
+    bootstrap: [],
+    default_enabled: null,
+    post_install: '',
+    needs_install: false,
+    installed: false,
+    enabled: false,
+    ...overrides,
+  };
+}
+
+/* A request issued and never answered — the only honest model of "still in
+ * flight at the instant we assert the pending state" (same idiom
+ * `SkillsPanel.dom.test.tsx:38-41` uses for the toggle race). */
+function neverSettles<T>(): Promise<T> {
+  return new Promise<T>(() => undefined);
 }
 
 /* Task A7: stub admin handlers for the 3 pre-existing reload-only tests
@@ -42,6 +96,11 @@ function noopMcpAdminProps() {
     onRemove: async () => ({ ok: true }),
     onSetEnabled: async () => ({ ok: true, name: 'x', enabled: true }),
     onAuth: async (): Promise<McpTestResult> => ({ ok: true, tools: [] }),
+    onCatalog: async (): Promise<McpCatalogData> => ({ entries: [] }),
+    onCatalogInstall: async (params: McpCatalogInstallParams): Promise<McpCatalogInstallResult> => ({
+      ok: true,
+      name: params.name,
+    }),
   };
 }
 
@@ -136,6 +195,8 @@ describe('A7: MCP panel row actions + Add server form', () => {
         onRemove={async () => ({ ok: true })}
         onSetEnabled={async () => ({ ok: true, name: 'x', enabled: true })}
         onAuth={async () => ({ ok: true, tools: [] })}
+        onCatalog={async () => ({ entries: [] })}
+        onCatalogInstall={async (p) => ({ ok: true, name: p.name })}
       />,
     );
     await user.click(screen.getByRole('button', { name: /Add server/i }));
@@ -169,6 +230,8 @@ describe('A7: MCP panel row actions + Add server form', () => {
           return { ok: true, name, enabled };
         }}
         onAuth={async () => ({ ok: true, tools: [] })}
+        onCatalog={async () => ({ entries: [] })}
+        onCatalogInstall={async (p) => ({ ok: true, name: p.name })}
       />,
     );
 
@@ -185,5 +248,79 @@ describe('A7: MCP panel row actions + Add server form', () => {
 
     await user.click(screen.getByRole('button', { name: /^Remove$/i }));
     await waitFor(() => expect(removedCalls).toEqual(['filesystem']));
+  });
+});
+
+/* Task A8 (§4.7/§4.8): the Catalog disclosure + the per-row Login button.
+ * Same harness as A7 above. */
+describe('A8: MCP panel Catalog disclosure + Login button', () => {
+  it('expanding Catalog fetches once, renders an env TextField per required_env, and Install fires onCatalogInstall with the collected env', async () => {
+    const user = userEvent.setup();
+    const catalogCalls: number[] = [];
+    const installCalls: McpCatalogInstallParams[] = [];
+    render(
+      <McpPanel
+        data={mcpData()}
+        onReload={async () => ({ status: 'reloaded' })}
+        onAdd={async () => ({ ok: true, name: 'x', transport: 'stdio' })}
+        onTest={async () => ({ ok: true, tools: [] })}
+        onRemove={async () => ({ ok: true })}
+        onSetEnabled={async () => ({ ok: true, name: 'x', enabled: true })}
+        onAuth={async () => ({ ok: true, tools: [] })}
+        onCatalog={async () => {
+          catalogCalls.push(1);
+          return { entries: [catalogEntryFixture()] };
+        }}
+        onCatalogInstall={async (p) => {
+          installCalls.push(p);
+          return { ok: true, name: p.name };
+        }}
+      />,
+    );
+
+    // Not fetched before the disclosure is ever opened.
+    expect(catalogCalls).toHaveLength(0);
+
+    await user.click(screen.getByRole('button', { name: /^Catalog$/i }));
+    await screen.findByText('builder');
+    await waitFor(() => expect(catalogCalls).toHaveLength(1));
+
+    await user.type(screen.getByLabelText(/API Key/i), 'secret-value');
+    await user.click(screen.getByRole('button', { name: /^Install$/i }));
+
+    await waitFor(() =>
+      expect(installCalls).toEqual([{ name: 'builder', env: { API_KEY: 'secret-value' } }]),
+    );
+
+    // Collapsing and re-expanding must NOT refetch — only the FIRST expand
+    // fires onCatalog (§4.7).
+    await user.click(screen.getByRole('button', { name: /^Catalog$/i })); // collapse
+    await user.click(screen.getByRole('button', { name: /^Catalog$/i })); // expand again
+    expect(catalogCalls).toHaveLength(1);
+  });
+
+  it('a transport:"http" server row shows a Login button that fires onAuth and shows the waiting state while pending', async () => {
+    const user = userEvent.setup();
+    const authCalls: string[] = [];
+    render(
+      <McpPanel
+        data={httpServerData()}
+        onReload={async () => ({ status: 'reloaded' })}
+        onAdd={async () => ({ ok: true, name: 'x', transport: 'stdio' })}
+        onTest={async () => ({ ok: true, tools: [] })}
+        onRemove={async () => ({ ok: true })}
+        onSetEnabled={async () => ({ ok: true, name: 'x', enabled: true })}
+        onAuth={(name) => {
+          authCalls.push(name);
+          return neverSettles<McpTestResult>();
+        }}
+        onCatalog={async () => ({ entries: [] })}
+        onCatalogInstall={async (p) => ({ ok: true, name: p.name })}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /^Login$/i }));
+    expect(authCalls).toEqual(['remote']);
+    expect(await screen.findByText('Waiting for browser sign-in…')).toBeInTheDocument();
   });
 });
