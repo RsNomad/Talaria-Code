@@ -6,7 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { totalLookup } from '../lookup';
-import { STATUS, UNKNOWN_MCP_STATUS } from './McpPanel';
+import { STATUS, UNKNOWN_MCP_STATUS, parseArgsLines, parseEnvLines, testNotice } from './McpPanel';
 
 describe('McpPanel status lookup (UI-I1)', () => {
   it('resolves every known McpStatus to its real entry (behavior-preserving)', () => {
@@ -19,5 +19,26 @@ describe('McpPanel status lookup (UI-I1)', () => {
     expect(result).toBe(UNKNOWN_MCP_STATUS);
     expect(() => result.tone).not.toThrow();
     expect(result.tone).toBe('neutral');
+  });
+});
+
+/* Task A7 (§4.9): pure helpers behind the Add-server form + Test button.
+ * Exercised directly (no jsdom) per this file's own `totalLookup` style —
+ * the wiring is covered separately in `McpPanel.dom.test.tsx`. */
+describe('McpPanel Add-server helpers (A7)', () => {
+  it('parseArgsLines: one arg per line, trimmed, empties dropped, never shell-split', () =>
+    expect(parseArgsLines(' -y \n @scope/pkg \n\n')).toEqual(['-y', '@scope/pkg']));
+
+  it('parseEnvLines: KEY=VALUE per line; first "=" splits; malformed lines reported', () => {
+    expect(parseEnvLines('A=1\nB=x=y')).toEqual({ ok: true, env: { A: '1', B: 'x=y' } });
+    expect(parseEnvLines('noequals').ok).toBe(false);
+  });
+
+  it('testNotice maps envelopes honestly', () => {
+    expect(testNotice({ ok: true, tools: [{ name: 't', description: '' }] })).toMatchObject({ tone: 'ok' });
+    expect(testNotice({ ok: false, error: 'boom', tools: [] })).toMatchObject({
+      tone: 'error',
+      text: expect.stringContaining('boom'),
+    });
   });
 });

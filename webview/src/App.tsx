@@ -24,6 +24,9 @@ import type {
   ControlMethod,
   DataPanel,
   HostToWebview,
+  McpAddParams,
+  McpAddResult,
+  McpTestResult,
   NextEditToggleSource,
   Panel,
   SetupMethod,
@@ -421,6 +424,31 @@ export function App() {
   // re-fetches + re-pushes the server list when the reload actually
   // confirmed. F-1: `mcp` is connection-global (owns no tab) — UNTAGGED.
   const reloadMcp = () => bridge.request('reload.mcp', { confirm: true });
+
+  // Task A7 (§4.9): the MCP admin RPCs `McpPanel`'s row actions + Add-server
+  // form drive. All correlated (`bridge.request`), same F-1 posture as
+  // `reloadMcp`/`toggle` above — `mcp` is connection-global, so these are
+  // UNTAGGED. `addMcpServer`/`testMcpServer`/`authMcpServer` cast the
+  // resolved value to its known shape, the same `restoreCheckpoint`/
+  // `redoCheckpoint` idiom above (`bridge.request` itself only promises
+  // `unknown` — the host's real return shape is the wire contract).
+  const addMcpServer = async (params: McpAddParams): Promise<McpAddResult> => {
+    const result = await bridge.request('mcp.add', params);
+    return result as McpAddResult;
+  };
+  const testMcpServer = async (name: string): Promise<McpTestResult> => {
+    const result = await bridge.request('mcp.test', { name });
+    return result as McpTestResult;
+  };
+  const removeMcpServer = (name: string) => bridge.request('mcp.remove', { name });
+  const setMcpServerEnabled = (name: string, enabled: boolean) =>
+    bridge.request('mcp.setEnabled', { name, enabled });
+  // A8 wires this into the panel's per-row `Login` button; wired here now so
+  // the correlated handler exists ahead of that task landing.
+  const authMcpServer = async (name: string): Promise<McpTestResult> => {
+    const result = await bridge.request('mcp.auth', { name });
+    return result as McpTestResult;
+  };
 
   // D3/N13: SettingsPanel's `config.set` over the CORRELATED path (the same
   // `toggle` pattern above) so a rejected/failed write resolves/rejects and
@@ -826,7 +854,17 @@ export function App() {
         >
           <ErrorBoundary region="the MCP panel">
             <RemotePanel remote={globalPanels.mcp} loadingHint="Loading servers…" onRetry={() => requestPanel('mcp')}>
-              {(data) => <McpPanel data={data} onReload={reloadMcp} />}
+              {(data) => (
+                <McpPanel
+                  data={data}
+                  onReload={reloadMcp}
+                  onAdd={addMcpServer}
+                  onTest={testMcpServer}
+                  onRemove={removeMcpServer}
+                  onSetEnabled={setMcpServerEnabled}
+                  onAuth={authMcpServer}
+                />
+              )}
             </RemotePanel>
           </ErrorBoundary>
         </div>
