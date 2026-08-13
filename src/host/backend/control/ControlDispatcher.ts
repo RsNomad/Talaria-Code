@@ -229,13 +229,16 @@ export class ControlDispatcher {
 
   /**
    * AH5: HOST-SIDE serialization tail, originally for {@link toggleDashboard}
-   * alone (moved verbatim off `AcpBackend`). Task A5 (§4.5) widened its use
-   * to EVERY dashboard-mutating control method — {@link handleMcpAdmin} now
-   * chains onto this SAME queue — so `skills.toggle`/`toolsets.toggle`/
-   * `mcp.add`/`mcp.remove`/`mcp.setEnabled`/`mcp.test`/`mcp.auth` (and A6/B4/
-   * B5's `mcp.catalogInstall`/`skills.*`) can never interleave two writes to
-   * the same underlying `~/.hermes/config.yaml` — one shared tail, not one
-   * per method family.
+   * alone (moved verbatim off `AcpBackend`). Task A5 (§4.5) widened its use to
+   * every dashboard-mutating control method; F3 NARROWED that again — this
+   * tail now serializes every SHORT config-mutating method only
+   * (`skills.toggle`/`toolsets.toggle`/`mcp.add`/`mcp.remove`/
+   * `mcp.setEnabled`, and A6/B4/B5's `skills.*`), so two of OUR requests can
+   * never interleave two read-modify-write cycles on the same underlying
+   * `~/.hermes/config.yaml`. The four `TAIL_EXEMPT_MCP_METHODS`
+   * (`mcp.catalog`/`mcp.test`/`mcp.auth`/`mcp.catalogInstall`) run OFF this
+   * tail instead — none of them performs a client-bracketable config write —
+   * with same-name exclusion carried by {@link busyMcpNames} instead.
    */
   private dashboardToggleTail: Promise<unknown> = Promise.resolve();
 
@@ -276,21 +279,14 @@ export class ControlDispatcher {
   private lastCatalogEntries: McpCatalogEntry[] | undefined;
 
   /**
-   * Task A6 (§4.7 item 2, FM-12 precedent): single-flight per catalog entry
-   * name — a re-click while installing is refused. Test-and-set/release both
-   * live in {@link acquireMcpSingleFlight}/{@link handleMcpAdmin}, checked
-   * SYNCHRONOUSLY before the call joins {@link dashboardToggleTail} (see
-   * that method's own doc for why it can't be checked inside the queued
-   * handler).
+   * F3 (widens A6 §4.7-item-3 / §4.8 IMPORTANT-3): per-NAME busy registry across ALL
+   * name-scoped MCP mutations. Kind drives the refusal message and preserves the two
+   * pinned duplicate messages verbatim. Test-and-set/release both live in {@link
+   * acquireMcpSingleFlight}/{@link handleMcpAdmin}, checked SYNCHRONOUSLY before the
+   * call joins {@link dashboardToggleTail} (see that method's own doc for why it
+   * can't be checked inside the queued handler).
    */
-  private readonly inFlightCatalogInstalls = new Set<string>();
-
-  /**
-   * Task A6 (§4.8 critic IMPORTANT-3): single-flight per MCP name for
-   * `mcp.auth` — same test-and-set/release posture as {@link
-   * inFlightCatalogInstalls}.
-   */
-  private readonly inFlightAuthNames = new Set<string>();
+  private readonly busyMcpNames = new Map<string, 'auth' | 'install' | 'change'>();
 
   constructor(private readonly port: ControlDispatcherHostPort) {}
 
@@ -564,33 +560,42 @@ export class ControlDispatcher {
   }
 
   /**
-   * Task A5+A6 (§4.5, §4.7): the T1 MCP admin core, riding the SAME host-side
-   * serialization tail as {@link toggleDashboard} ({@link
-   * dashboardToggleTail}) — the plan is explicit that every dashboard
-   * mutation (skills/toolsets toggle, and `mcp.add`/`remove`/`setEnabled`/
-   * `test`/`auth`/`catalogInstall`) shares ONE queue, so a compromised or
-   * buggy webview firing parallel `control.request`s can't interleave two
-   * writes to the same underlying `~/.hermes/config.yaml`. `mcp.catalog`
-   * (a plain read) rides the same tail purely for routing uniformity — it
-   * never mutates anything, so it can never be the cause of an interleave.
+   * Task A5+A6 (§4.5, §4.7), branched by F3: the T1 MCP admin core. Every
+   * SHORT config-mutating method (`mcp.add`/`remove`/`setEnabled`) still rides
+   * the SAME host-side serialization tail as {@link toggleDashboard} ({@link
+   * dashboardToggleTail}), so a compromised or buggy webview firing parallel
+   * `control.request`s can't interleave two writes to the same underlying
+   * `~/.hermes/config.yaml`. The four {@link TAIL_EXEMPT_MCP_METHODS}
+   * (`mcp.catalog`/`mcp.test`/`mcp.auth`/`mcp.catalogInstall`) run
+   * `handleMcpAdminInner` DIRECTLY, off the tail — none of them performs a
+   * client-bracketable config write (see that const's own doc) — with
+   * same-name exclusion carried by {@link busyMcpNames} instead of the tail.
    */
   private async handleMcpAdmin(method: McpAdminMethod, params: unknown): Promise<unknown> {
-    // Task A6 (§4.7 item 3, §4.8 critic IMPORTANT-3): the `mcp.auth`/
-    // `mcp.catalogInstall` single-flight test-and-set MUST happen here,
-    // synchronously, BEFORE this call ever joins `dashboardToggleTail` —
-    // that tail serializes a handler's FULL execution (including
-    // `mcp.auth`'s possible multi-minute OAuth wait), so a duplicate call
-    // gated INSIDE the queued handler would simply queue silently behind
-    // the in-flight one: by the time it ran, the first would already be
-    // done and the guard would never observe the overlap. A synchronous
-    // pre-check makes the refusal immediate instead of a silent wait.
+    // Task A6 (§4.7 item 3, §4.8 critic IMPORTANT-3): the per-name
+    // single-flight test-and-set MUST happen here, synchronously, BEFORE this
+    // call ever joins `dashboardToggleTail` — that tail serializes a queued
+    // handler's FULL execution, so a duplicate call gated INSIDE the queued
+    // handler would simply queue silently behind the in-flight one: by the
+    // time it ran, the first would already be done and the guard would never
+    // observe the overlap. A synchronous pre-check makes the refusal
+    // immediate instead of a silent wait. This holds for BOTH branches below
+    // — the exempt branch never queues at all, so the same reasoning applies
+    // even more directly there.
     const releaseSingleFlight = this.acquireMcpSingleFlight(method, params);
-    const run = () => this.handleMcpAdminInner(method, params);
-    const result = this.dashboardToggleTail.then(run, run);
-    this.dashboardToggleTail = result.then(
-      () => undefined,
-      () => undefined,
-    );
+    let result: Promise<unknown>;
+    if (TAIL_EXEMPT_MCP_METHODS.has(method)) {
+      // F3: no client-bracketable config write (see the const's doc) — never
+      // joins, never holds, never reassigns the tail.
+      result = this.handleMcpAdminInner(method, params);
+    } else {
+      const run = () => this.handleMcpAdminInner(method, params);
+      result = this.dashboardToggleTail.then(run, run);
+      this.dashboardToggleTail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+    }
     if (releaseSingleFlight) {
       // Release regardless of outcome — a declined modal, a validation
       // refusal, or a real failure must free the name exactly like success.
@@ -600,28 +605,35 @@ export class ControlDispatcher {
   }
 
   /**
-   * Task A6 (§4.7 item 3, §4.8 IMPORTANT-3): the single-flight test-and-set
-   * for `mcp.auth`/`mcp.catalogInstall` — see {@link handleMcpAdmin}'s own
-   * doc for why this runs synchronously, before queueing. Returns a release
-   * callback for the two guarded methods; `undefined` for every other
-   * method (nothing to release) or when the payload carries no usable name
+   * Task A6 (§4.7 item 3, §4.8 IMPORTANT-3), widened by F3: the single-flight
+   * test-and-set for every name-scoped MCP mutation — see {@link
+   * handleMcpAdmin}'s own doc for why this runs synchronously, before
+   * queueing. `mcp.catalog` has no name and is never guarded; `mcp.test` only
+   * CHECKS (probes never block each other, but a probe mid-auth/install would
+   * read Hermes's deliberately-wiped token store and report a false
+   * negative); every other name-scoped method acquires the name and returns a
+   * release callback. `undefined` when the payload carries no usable name
    * (the real per-method handler rejects with a clearer validation message
    * once it runs).
    */
   private acquireMcpSingleFlight(method: McpAdminMethod, params: unknown): (() => void) | undefined {
-    if (method !== 'mcp.auth' && method !== 'mcp.catalogInstall') return undefined;
+    if (method === 'mcp.catalog') return undefined; // no name, never guarded
     const name = extractMcpName(params);
-    if (!name) return undefined;
-    const inFlight = method === 'mcp.auth' ? this.inFlightAuthNames : this.inFlightCatalogInstalls;
-    if (inFlight.has(name)) {
+    if (!name) return undefined; // unchanged posture: real handler rejects with the clearer validation message
+    const busy = this.busyMcpNames.get(name);
+    if (busy !== undefined) {
       throw new Error(
-        method === 'mcp.auth'
-          ? `Sign-in for "${name}" is already in progress.`
-          : `Installing "${name}" is already in progress.`,
+        busy === 'auth'
+          ? `Sign-in for "${name}" is already in progress.` // pinned (IMPORTANT-3 test)
+          : busy === 'install'
+            ? `Installing "${name}" is already in progress.` // pinned (F1 test)
+            : `Another change to MCP server "${name}" is still in progress.`,
       );
     }
-    inFlight.add(name);
-    return () => inFlight.delete(name);
+    if (method === 'mcp.test') return undefined; // check-only: probes never block each other
+    const kind = method === 'mcp.auth' ? 'auth' : method === 'mcp.catalogInstall' ? 'install' : 'change';
+    this.busyMcpNames.set(name, kind);
+    return () => this.busyMcpNames.delete(name);
   }
 
   /**
@@ -1307,6 +1319,24 @@ function toMcpAddParams(
 const CATALOG_POLL_FIRST_DELAY_MS = 1_000;
 const CATALOG_POLL_STEP_DELAY_MS = 2_000;
 const CATALOG_POLL_CAP_MS = 180_000;
+
+/**
+ * F3: MCP admin methods EXEMPT from the `dashboardToggleTail` serialization.
+ * Membership rule — an op is exempt iff it performs NO client-bracketable
+ * config.yaml write:
+ *  - 'mcp.catalog'        read-only (web_server.py:10682-10756)
+ *  - 'mcp.test'           read-only probe, no save call (web_server.py:10485-10542)
+ *  - 'mcp.auth'           only write = server-side, at END of the browser flow (web_server.py:10629)
+ *  - 'mcp.catalogInstall' only config write = server-side, end of install/subprocess (web_server.py:10795-10828)
+ * Everything NOT listed rides the tail (fail-safe default for future methods).
+ * Same-name exclusion for the exempt mutators is carried by busyMcpNames.
+ */
+const TAIL_EXEMPT_MCP_METHODS: ReadonlySet<McpAdminMethod> = new Set([
+  'mcp.catalog',
+  'mcp.test',
+  'mcp.auth',
+  'mcp.catalogInstall',
+]);
 
 /** Task A6: a plain `setTimeout` wait — {@link pollCatalogInstall}'s backoff step. Real timers in production; `vi.useFakeTimers()` in tests. */
 function sleep(ms: number): Promise<void> {

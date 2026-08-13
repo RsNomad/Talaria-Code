@@ -7748,11 +7748,13 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     );
 
     // A DIFFERENT name is never refused by the SAME-name guard — accepted
-    // and queued WHILE 'n8n' is still in flight (the shared
-    // `dashboardToggleTail` still serializes its ACTUAL execution behind
-    // 'n8n', so it only runs AFTER `release` below — awaiting it here,
-    // before releasing 'n8n', would deadlock the test, mirroring the
-    // `mcp.auth` IMPORTANT-3 test's own comment).
+    // and runs CONCURRENTLY with 'n8n' (F3: mcp.catalogInstall is
+    // tail-exempt, so it no longer queues behind 'n8n' on
+    // `dashboardToggleTail`). It still can't RESOLVE until `release` below,
+    // because this fake's `installDeferred` is one shared promise both
+    // calls return — awaiting it here, before releasing 'n8n', would
+    // deadlock the test, mirroring the `mcp.auth` IMPORTANT-3 test's own
+    // comment.
     const other = backend.invokeControl('mcp.catalogInstall', { name: 'other', env: {} });
 
     release({ ok: true, name: 'n8n', background: false });
@@ -7906,10 +7908,12 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
     await expect(backend.invokeControl('mcp.auth', { name: 'remote' })).rejects.toThrow(/already in progress/i);
 
     // A DIFFERENT name is never REFUSED by the SAME-name single-flight
-    // guard — accepted and queued WHILE 'remote' is still in flight (the
-    // shared `dashboardToggleTail` still serializes its ACTUAL execution
-    // behind 'remote', so it's only awaited AFTER `release` below — awaiting
-    // it here, before releasing 'remote', would deadlock the test).
+    // guard — accepted and runs CONCURRENTLY with 'remote' (F3: mcp.auth is
+    // tail-exempt, so it no longer queues behind 'remote' on
+    // `dashboardToggleTail`). It still can't RESOLVE until `release` below,
+    // because this fake's `authDeferred` is one shared promise both calls
+    // return — awaiting it here, before releasing 'remote', would deadlock
+    // the test.
     const other = backend.invokeControl('mcp.auth', { name: 'other' });
 
     release({ ok: true, tools: [] }); // Hermes-side token snapshot/restore (web_server.py:10592-10629) never sees a second racer
@@ -7917,6 +7921,226 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
     await expect(other).resolves.toMatchObject({ ok: true });
     expect(client.authCalls).toEqual(['remote', 'other']);
   });
+});
+
+// =============================================================================
+// F3 (docs_claude/features-f3-concurrency-fix-architecture.md): long MCP admin
+// ops (`mcp.auth`, `mcp.catalogInstall`, and the read-only `mcp.catalog`/
+// `mcp.test`) must not monopolize `dashboardToggleTail` — they run OFF the
+// tail (`TAIL_EXEMPT_MCP_METHODS`), and same-name exclusion across ALL
+// name-scoped MCP mutations is now carried by the widened `busyMcpNames`
+// per-name registry instead of the tail itself.
+//
+// A short per-test timeout (1s, well under vitest's 5s default) is pinned on
+// the tests whose PRE-FIX behavior is an unresolved hang (queued forever
+// behind a long op that this test deliberately never releases before
+// asserting) — post-fix every one of them resolves in a handful of
+// microtask ticks, so the tight timeout costs nothing once green.
+// =============================================================================
+describe('ControlDispatcher — F3 concurrency (long MCP ops off the serialization tail)', () => {
+  it(
+    'T1: skills.toggle proceeds while mcp.auth is in flight (core fix)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed the fail-closed name cache
+
+      let release!: (v: McpTestResult) => void;
+      client.authDeferred = new Promise<McpTestResult>((r) => {
+        release = r;
+      });
+
+      const auth = backend.invokeControl('mcp.auth', { name: 'gh' }); // do NOT await — must still be pending below
+
+      // No skills-panel seed needed — toggleDashboardInner's guard is the
+      // lenient `known &&` idiom (unlike MCP's fail-closed cache).
+      await backend.invokeControl('skills.toggle', { name: 'tdd', enabled: false });
+
+      expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: false }]);
+      expect(client.authCalls).toEqual(['gh']);
+
+      release({ ok: true, tools: [] });
+      await auth;
+    },
+    1000,
+  );
+
+  it(
+    'T2: mcp.setEnabled on an UNRELATED name proceeds while a catalogInstall is in flight (core fix)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed 'gh'
+
+      client.catalogEntries = [catalogRow({ name: 'n8n' })];
+      await backend.invokeControl('mcp.catalog', {});
+
+      let release!: (v: { ok: boolean; name: string; background: boolean; action?: string }) => void;
+      client.installDeferred = new Promise((r) => {
+        release = r;
+      });
+
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockResolvedValueOnce('Install');
+
+      const install = backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} }); // do NOT await
+
+      control.setResultFor('reload.mcp', { status: 'reloaded' });
+      await backend.invokeControl('mcp.setEnabled', { name: 'gh', enabled: false });
+
+      expect(client.setEnabledCalls).toEqual([{ name: 'gh', enabled: false }]);
+
+      release({ ok: true, name: 'n8n', background: false });
+      await install;
+    },
+    1000,
+  );
+
+  it(
+    'T3: mcp.catalog browse resolves while an auth is in flight (core fix, read)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+      let release!: (v: McpTestResult) => void;
+      client.authDeferred = new Promise<McpTestResult>((r) => {
+        release = r;
+      });
+      const auth = backend.invokeControl('mcp.auth', { name: 'gh' }); // do NOT await
+
+      client.catalogEntries = [catalogRow({ name: 'n8n' })];
+      const res = await backend.invokeControl('mcp.catalog', {});
+
+      expect(res).toEqual({ entries: [catalogRow({ name: 'n8n' })] });
+
+      release({ ok: true, tools: [] });
+      await auth;
+    },
+    1000,
+  );
+
+  it(
+    'T4: same-name cross-method exclusion — busyMcpNames refuses a same-name op, not a different one',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', {
+        mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } },
+      });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+      let release!: (v: McpTestResult) => void;
+      client.authDeferred = new Promise<McpTestResult>((r) => {
+        release = r;
+      });
+      const auth = backend.invokeControl('mcp.auth', { name: 'gh' }); // do NOT await
+
+      await expect(backend.invokeControl('mcp.setEnabled', { name: 'gh', enabled: false })).rejects.toThrow(
+        /Sign-in .* already in progress/i,
+      );
+      expect(client.setEnabledCalls).toEqual([]);
+
+      await expect(backend.invokeControl('mcp.test', { name: 'gh' })).rejects.toThrow(/in progress/i);
+      expect(client.testCalls).toEqual([]);
+
+      // A DIFFERENT name is never refused by the same-name guard.
+      const otherTest = await backend.invokeControl('mcp.test', { name: 'other' });
+      expect(otherTest).toEqual(client.testResult);
+      expect(client.testCalls).toEqual(['other']);
+
+      release({ ok: true, tools: [] });
+      await auth;
+
+      // Guard released on settle — the SAME name now succeeds.
+      control.setResultFor('reload.mcp', { status: 'reloaded' });
+      const result = await backend.invokeControl('mcp.setEnabled', { name: 'gh', enabled: false });
+      expect(result).toMatchObject({ name: 'gh', enabled: false });
+      expect(client.setEnabledCalls).toEqual([{ name: 'gh', enabled: false }]);
+    },
+    1000,
+  );
+
+  it(
+    'T5: a pending short mutation blocks a same-name auth (guard symmetry)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+      mockShowWarningMessage.mockClear();
+      // The mcp.remove modal never settles — 'gh' stays busy for the rest of
+      // this test (deliberately never released; nothing awaits it).
+      mockShowWarningMessage.mockReturnValueOnce(new Promise(() => {}));
+
+      const remove = backend.invokeControl('mcp.remove', { name: 'gh' }); // do NOT await
+      void remove; // left permanently pending by design — its modal never settles
+
+      await expect(backend.invokeControl('mcp.auth', { name: 'gh' })).rejects.toThrow(
+        /Another change .* in progress/i,
+      );
+      expect(client.authCalls).toEqual([]);
+    },
+    1000,
+  );
+
+  it(
+    'T6: two short mutations still cannot interleave — the tail still serializes config writes (regression)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' });
+      control.setResultFor('reload.mcp', { status: 'reloaded' });
+
+      // Shared call-order log (same override-and-delegate idiom the C1
+      // "snapshot precedes prompt" ordering test above already uses).
+      const order: string[] = [];
+      const realRemove = client.removeMcpServer.bind(client);
+      client.removeMcpServer = (name: string) => {
+        order.push('remove');
+        return realRemove(name);
+      };
+      const realToggleSkill = client.toggleSkill.bind(client);
+      client.toggleSkill = (name: string, enabled: boolean) => {
+        order.push('toggle');
+        return realToggleSkill(name, enabled);
+      };
+
+      let resolveModal!: (v: string | undefined) => void;
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockReturnValueOnce(
+        new Promise<string | undefined>((r) => {
+          resolveModal = r;
+        }),
+      );
+
+      const remove = backend.invokeControl('mcp.remove', { name: 'gh' }); // held at its modal
+      const toggle = backend.invokeControl('skills.toggle', { name: 'tdd', enabled: true });
+
+      await flushMicrotasks();
+      expect(client.toggleSkillCalls).toEqual([]); // still queued behind the held remove
+
+      resolveModal('Remove');
+      await toggle;
+      await remove;
+
+      expect(order).toEqual(['remove', 'toggle']); // remove's write recorded before toggle's
+      expect(client.removeCalls).toEqual(['gh']);
+      expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: true }]);
+    },
+    1000,
+  );
 });
 
 // =============================================================================
