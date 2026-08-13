@@ -139,7 +139,7 @@ describe('McpPanelSource — 2-RPC join (config.get + tools.list), no raw result
     expect(dispatch).toHaveBeenNthCalledWith(1, 'config.get', { key: 'full' });
     expect(dispatch).toHaveBeenNthCalledWith(2, 'tools.list', {});
     expect(outcome.data).toEqual({
-      servers: [{ id: 'filesystem', name: 'filesystem', status: 'connected', command: 'npx -y server-fs', toolCount: 4 }],
+      servers: [{ id: 'filesystem', name: 'filesystem', status: 'connected', command: 'npx -y server-fs', toolCount: 4, enabled: true, transport: 'stdio' }],
     });
   });
 });

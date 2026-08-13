@@ -7,6 +7,7 @@ import type {
 } from '../../shared/protocol';
 import type { AcpClientLike, AcpListSessionsRawResult } from '../backend/acp/acpClient';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
+import type { ToggleNameCache } from '../dashboard/dashboardPanelSources';
 import type {
   PanelFetchOutcome,
   PanelSource,
@@ -102,7 +103,10 @@ export class SettingsPanelSource implements PanelSource<'settings'> {
  * tui_gateway channel (global config), just two RPCs — dispatched in order so
  * `config.get` precedes `tools.list` on the wire.
  */
-export class McpPanelSource implements PanelSource<'mcp'> {
+export class McpPanelSource implements PanelSource<'mcp'>, ToggleNameCache {
+  /** Server names from the last successful `config.get` (the toggle key set, S-M4). */
+  private knownNames: Set<string> | undefined;
+
   constructor(private readonly ctx: PanelSourceContext) {}
 
   async fetch(): Promise<PanelFetchOutcome<'mcp'>> {
@@ -110,8 +114,14 @@ export class McpPanelSource implements PanelSource<'mcp'> {
       this.ctx.dispatch('config.get', { key: 'full' }),
       this.ctx.dispatch('tools.list', {}),
     ]);
-    const data: McpData = reshapeMcpServers(config as RawConfigFullResult, tools as RawToolsListResult);
+    const rawConfig = config as RawConfigFullResult;
+    this.knownNames = new Set(Object.keys(rawConfig.mcp_servers ?? {}));
+    const data: McpData = reshapeMcpServers(rawConfig, tools as RawToolsListResult);
     return { data };
+  }
+
+  lastListedNames(): ReadonlySet<string> | undefined {
+    return this.knownNames;
   }
 }
 

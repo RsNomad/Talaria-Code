@@ -8,6 +8,8 @@ import {
   reshapeConfigShow,
 } from './reshapePanelData';
 import { must } from '../../testing/must';
+import { McpPanelSource } from './panelSources';
+import type { PanelSourceContext } from './PanelSourceRegistry';
 import type {
   RawToolsListResult,
   RawSkillsManageListResult,
@@ -307,6 +309,8 @@ describe('reshapeMcpServers', () => {
       status: 'connected',
       command: 'npx -y @modelcontextprotocol/server-filesystem /tmp',
       toolCount: 4,
+      enabled: true,
+      transport: 'stdio',
     });
   });
 
@@ -318,6 +322,8 @@ describe('reshapeMcpServers', () => {
       status: 'connected',
       command: 'npx -y @modelcontextprotocol/server-github',
       toolCount: 2,
+      enabled: true,
+      transport: 'stdio',
     });
   });
 
@@ -329,6 +335,8 @@ describe('reshapeMcpServers', () => {
       status: 'disconnected',
       command: 'https://my-mcp-server.example.com/mcp',
       toolCount: 0,
+      enabled: true,
+      transport: 'http',
     });
   });
 
@@ -343,6 +351,8 @@ describe('reshapeMcpServers', () => {
       status: 'disconnected',
       command: 'npx -y something',
       toolCount: 0,
+      enabled: false,
+      transport: 'stdio',
     });
   });
 
@@ -360,6 +370,24 @@ describe('reshapeMcpServers', () => {
   it('tolerates a missing `toolsets` array on the tools.list side (every server disconnected)', () => {
     const result = reshapeMcpServers(MCP_CONFIG_FIXTURE, {});
     expect(result.servers.every((s) => s.status === 'disconnected' && s.toolCount === 0)).toBe(true);
+  });
+
+  it('maps enabled (absent => true, false => false) and transport (url=>http, command=>stdio)', () => {
+    const data = reshapeMcpServers(MCP_CONFIG_FIXTURE, MCP_TOOLS_FIXTURE);
+    const byName = new Map(data.servers.map((s) => [s.name, s]));
+    expect(must(byName.get('filesystem')).enabled).toBe(true);
+    expect(must(byName.get('disabled_server')).enabled).toBe(false);
+    expect(must(byName.get('filesystem')).transport).toBe('stdio');
+    expect(must(byName.get('remote_api')).transport).toBe('http');
+  });
+
+  it('McpPanelSource caches last-listed server names (S-M4 key set)', async () => {
+    const src = new McpPanelSource({
+      dispatch: async (method: string) =>
+        method === 'config.get' ? MCP_CONFIG_FIXTURE : MCP_TOOLS_FIXTURE,
+    } as unknown as PanelSourceContext);
+    await src.fetch();
+    expect([...must(src.lastListedNames())].sort()).toEqual(['disabled_server', 'filesystem', 'github', 'remote_api']);
   });
 });
 

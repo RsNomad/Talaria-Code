@@ -1206,7 +1206,7 @@ describe('AcpBackend.invokeControl — Zone CFG: MCP-hub panel refresh (multi-RP
     ]);
     const expected = {
       servers: [
-        { id: 'filesystem', name: 'filesystem', status: 'connected', command: 'npx -y @modelcontextprotocol/server-filesystem /tmp', toolCount: 4 },
+        { id: 'filesystem', name: 'filesystem', status: 'connected', command: 'npx -y @modelcontextprotocol/server-filesystem /tmp', toolCount: 4, enabled: true, transport: 'stdio' },
       ],
     };
     expect(result).toEqual(expected);

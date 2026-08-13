@@ -304,6 +304,8 @@ export function reshapeMcpServers(config: RawConfigFullResult, tools: RawToolsLi
       status,
       command: formatCommand(cfg),
       toolCount: toolset?.tool_count ?? 0,
+      enabled: cfg.enabled !== false,
+      transport: cfg.url ? 'http' : cfg.command ? 'stdio' : 'unknown',
     });
   }
 

@@ -23,7 +23,7 @@ import { McpPanel } from './McpPanel';
 function mcpData(): McpData {
   return {
     servers: [
-      { id: 'srv-1', name: 'filesystem', status: 'connected', command: 'npx mcp-fs', toolCount: 4 },
+      { id: 'srv-1', name: 'filesystem', status: 'connected', command: 'npx mcp-fs', toolCount: 4, enabled: true, transport: 'stdio' },
     ],
   };
 }
