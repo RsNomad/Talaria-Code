@@ -9,6 +9,10 @@ import type {
   SlashCommandInfo,
   McpAddParams,
   McpAddResult,
+  McpCatalogData,
+  McpCatalogEntry,
+  McpCatalogInstallResult,
+  McpTestResult,
 } from '../../../shared/protocol';
 import { CONTROL_METHODS, makePanelData } from '../../../shared/protocol';
 import type { RestoreResult } from '../../checkpoints/CheckpointTracker';
@@ -26,7 +30,7 @@ import type { AcpLoadSessionResult } from '../acp/acpClient';
 import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
 import type { SessionController } from '../session/SessionController';
 import type { SessionRegistry } from '../session/SessionRegistry';
-import { validateMcpAdd, describeAddForModal, stripModalControls } from './mcpEntryValidation';
+import { validateMcpAdd, describeAddForModal, stripModalControls, validateCatalogInstall, describeCatalogForModal, RELOAD_LINE } from './mcpEntryValidation';
 
 /**
  * Task A5 (features-add-mcp-skills-architecture.md §3 Layer 5, §4.5 item 1):
@@ -37,14 +41,16 @@ import { validateMcpAdd, describeAddForModal, stripModalControls } from './mcpEn
  * on the control-method surface (defense-in-depth over `trustGate.ts`'s
  * "no ACP backend in an untrusted workspace" gate).
  *
- * Pinned as the FULL 9-method set even though this task (A5) only ROUTES
- * `mcp.add`/`mcp.remove`/`mcp.setEnabled`/`mcp.test`/`mcp.auth` (the guard
- * for `mcp.auth`; its body is task A6) — `mcp.catalogInstall` and the three
- * `skills.*` admin methods are routed by A6/B4/B5, but the trust-gate SET
+ * Pinned as the FULL 9-method set: A5 routes `mcp.add`/`mcp.remove`/
+ * `mcp.setEnabled`/`mcp.test`/`mcp.auth`'s trust+fail-closed-cache guard;
+ * A6 routes `mcp.auth`'s body + `mcp.catalogInstall`; the three
+ * `skills.*` admin methods are routed by B4/B5 — but the trust-gate SET
  * itself is defined here, once, so no later task can silently add a
  * mutating method without also classifying it here (the
  * `SetupController.test.ts:1675-1712` partition-lock idiom, mirrored in
  * `AcpBackend.test.ts`'s `PINNED_TRUST_GATED_METHODS` lock test).
+ * `mcp.catalog` (listing) is deliberately ABSENT — §4.7 pins it read-only,
+ * same class as `tools.list`, not trust-gated.
  */
 export const TRUST_GATED_METHODS: ReadonlySet<string> = new Set([
   'mcp.add',
@@ -58,8 +64,18 @@ export const TRUST_GATED_METHODS: ReadonlySet<string> = new Set([
   'skills.hubUninstall',
 ]);
 
-/** The 5 MCP admin methods {@link ControlDispatcher.handleMcpAdmin} routes (A5+A6). */
-type McpAdminMethod = 'mcp.add' | 'mcp.remove' | 'mcp.setEnabled' | 'mcp.test' | 'mcp.auth';
+/**
+ * Task A6 (§4.8): the narrowed `CancellationToken` shape {@link
+ * ControlDispatcherHostPort.withProgress} hands `mcp.auth`'s task callback —
+ * exactly the two members that callback reads.
+ */
+export interface McpAuthCancellationToken {
+  isCancellationRequested: boolean;
+  onCancellationRequested(cb: () => void): { dispose(): void };
+}
+
+/** The 7 MCP admin methods {@link ControlDispatcher.handleMcpAdmin} routes (A5: add/remove/setEnabled/test/auth; A6: catalog/catalogInstall). */
+type McpAdminMethod = 'mcp.add' | 'mcp.remove' | 'mcp.setEnabled' | 'mcp.test' | 'mcp.auth' | 'mcp.catalog' | 'mcp.catalogInstall';
 
 function isMcpAdminMethod(method: string): method is McpAdminMethod {
   return (
@@ -67,7 +83,9 @@ function isMcpAdminMethod(method: string): method is McpAdminMethod {
     method === 'mcp.remove' ||
     method === 'mcp.setEnabled' ||
     method === 'mcp.test' ||
-    method === 'mcp.auth'
+    method === 'mcp.auth' ||
+    method === 'mcp.catalog' ||
+    method === 'mcp.catalogInstall'
   );
 }
 
@@ -121,6 +139,17 @@ export interface ControlDispatcherHostPort {
    * summon this dialog; it can never answer it.
    */
   confirm(message: string, detail: string, actionLabel: string): Promise<boolean>;
+  /**
+   * Task A6 (§4.8, Context7-pinned `window.withProgress<R>(options, task:
+   * (progress, token: CancellationToken) => Thenable<R>): Thenable<R>` —
+   * only `ProgressLocation.Notification` supports the cancel button): the
+   * F-4 OAuth blocking-wait UX. `token` is narrowed to exactly the two
+   * members `mcp.auth` reads (`isCancellationRequested` +
+   * `onCancellationRequested`) — the real `vscode.CancellationToken` is a
+   * strict superset, so `AcpBackend`'s implementation satisfies this
+   * structurally without re-exporting a `vscode` type here.
+   */
+  withProgress<T>(title: string, task: (token: McpAuthCancellationToken) => Promise<T>): Promise<T>;
   /**
    * The C1/W6-FB entangled History-load choreography (`AcpBackend
    * .loadSessionIntoTab`) — too entangled with `openSession`/session-minting
@@ -237,6 +266,32 @@ export class ControlDispatcher {
    */
   private readonly panelFetchSeq = new Map<string, number>();
 
+  /**
+   * Task A6 (§4.7 item 1): the last catalog LISTED this session — the
+   * fail-closed guard `mcp.catalogInstall`'s {@link validateCatalogInstall}
+   * checks a requested name against. `undefined` until this session's first
+   * `mcp.catalog` call (mirrors the `mcp` panel's own `lastListedNames()`
+   * fail-closed posture, {@link requireListedMcpName}).
+   */
+  private lastCatalogEntries: McpCatalogEntry[] | undefined;
+
+  /**
+   * Task A6 (§4.7 item 2, FM-12 precedent): single-flight per catalog entry
+   * name — a re-click while installing is refused. Test-and-set/release both
+   * live in {@link acquireMcpSingleFlight}/{@link handleMcpAdmin}, checked
+   * SYNCHRONOUSLY before the call joins {@link dashboardToggleTail} (see
+   * that method's own doc for why it can't be checked inside the queued
+   * handler).
+   */
+  private readonly inFlightCatalogInstalls = new Set<string>();
+
+  /**
+   * Task A6 (§4.8 critic IMPORTANT-3): single-flight per MCP name for
+   * `mcp.auth` — same test-and-set/release posture as {@link
+   * inFlightCatalogInstalls}.
+   */
+  private readonly inFlightAuthNames = new Set<string>();
+
   constructor(private readonly port: ControlDispatcherHostPort) {}
 
   /**
@@ -301,9 +356,8 @@ export class ControlDispatcher {
       return this.toggleDashboard(method, params);
     }
 
-    // Task A5 (§4.5): the T1 MCP admin core — add/remove/setEnabled/test,
-    // plus the trust+fail-closed-cache GUARD for auth (its body is A6).
-    // `mcp.catalog`/`mcp.catalogInstall` are NOT routed here (A6).
+    // Task A5+A6 (§4.5, §4.7, §4.8): the full T1 MCP admin core —
+    // add/remove/setEnabled/test/auth (A5) plus catalog/catalogInstall (A6).
     if (isMcpAdminMethod(method)) {
       return this.handleMcpAdmin(method, params);
     }
@@ -510,29 +564,72 @@ export class ControlDispatcher {
   }
 
   /**
-   * Task A5 (§4.5): the T1 MCP admin core, riding the SAME host-side
+   * Task A5+A6 (§4.5, §4.7): the T1 MCP admin core, riding the SAME host-side
    * serialization tail as {@link toggleDashboard} ({@link
    * dashboardToggleTail}) — the plan is explicit that every dashboard
-   * mutation (skills/toolsets toggle, and now `mcp.add`/`remove`/
-   * `setEnabled`/`test`/`auth`) shares ONE queue, so a compromised or buggy
-   * webview firing parallel `control.request`s can't interleave two writes
-   * to the same underlying `~/.hermes/config.yaml`.
+   * mutation (skills/toolsets toggle, and `mcp.add`/`remove`/`setEnabled`/
+   * `test`/`auth`/`catalogInstall`) shares ONE queue, so a compromised or
+   * buggy webview firing parallel `control.request`s can't interleave two
+   * writes to the same underlying `~/.hermes/config.yaml`. `mcp.catalog`
+   * (a plain read) rides the same tail purely for routing uniformity — it
+   * never mutates anything, so it can never be the cause of an interleave.
    */
   private async handleMcpAdmin(method: McpAdminMethod, params: unknown): Promise<unknown> {
+    // Task A6 (§4.7 item 3, §4.8 critic IMPORTANT-3): the `mcp.auth`/
+    // `mcp.catalogInstall` single-flight test-and-set MUST happen here,
+    // synchronously, BEFORE this call ever joins `dashboardToggleTail` —
+    // that tail serializes a handler's FULL execution (including
+    // `mcp.auth`'s possible multi-minute OAuth wait), so a duplicate call
+    // gated INSIDE the queued handler would simply queue silently behind
+    // the in-flight one: by the time it ran, the first would already be
+    // done and the guard would never observe the overlap. A synchronous
+    // pre-check makes the refusal immediate instead of a silent wait.
+    const releaseSingleFlight = this.acquireMcpSingleFlight(method, params);
     const run = () => this.handleMcpAdminInner(method, params);
     const result = this.dashboardToggleTail.then(run, run);
     this.dashboardToggleTail = result.then(
       () => undefined,
       () => undefined,
     );
+    if (releaseSingleFlight) {
+      // Release regardless of outcome — a declined modal, a validation
+      // refusal, or a real failure must free the name exactly like success.
+      result.then(releaseSingleFlight, releaseSingleFlight);
+    }
     return result;
   }
 
   /**
-   * Task A5 (§3 Layer 5, §4.5 items 1-3): trust gate -> admin-client
-   * resolution -> (name-keyed methods only) the FAIL-CLOSED last-listed-name
-   * guard -> the per-method route. `mcp.add` is the one method here with no
-   * name to validate against the cache (it's creating a NEW name).
+   * Task A6 (§4.7 item 3, §4.8 IMPORTANT-3): the single-flight test-and-set
+   * for `mcp.auth`/`mcp.catalogInstall` — see {@link handleMcpAdmin}'s own
+   * doc for why this runs synchronously, before queueing. Returns a release
+   * callback for the two guarded methods; `undefined` for every other
+   * method (nothing to release) or when the payload carries no usable name
+   * (the real per-method handler rejects with a clearer validation message
+   * once it runs).
+   */
+  private acquireMcpSingleFlight(method: McpAdminMethod, params: unknown): (() => void) | undefined {
+    if (method !== 'mcp.auth' && method !== 'mcp.catalogInstall') return undefined;
+    const name = extractMcpName(params);
+    if (!name) return undefined;
+    const inFlight = method === 'mcp.auth' ? this.inFlightAuthNames : this.inFlightCatalogInstalls;
+    if (inFlight.has(name)) {
+      throw new Error(
+        method === 'mcp.auth'
+          ? `Sign-in for "${name}" is already in progress.`
+          : `Installing "${name}" is already in progress.`,
+      );
+    }
+    inFlight.add(name);
+    return () => inFlight.delete(name);
+  }
+
+  /**
+   * Task A5+A6 (§3 Layer 5, §4.5 items 1-3, §4.7): trust gate -> admin-client
+   * resolution -> the per-method route. `mcp.catalog` (no trust gate, §4.7)
+   * and `mcp.add` (creating a NEW name) are the two methods with no name to
+   * validate against the last-listed cache; every other method runs the
+   * FAIL-CLOSED last-listed-name guard first.
    */
   private async handleMcpAdminInner(method: McpAdminMethod, params: unknown): Promise<unknown> {
     if (TRUST_GATED_METHODS.has(method) && !this.port.isTrusted()) {
@@ -541,8 +638,16 @@ export class ControlDispatcher {
 
     const client = await this.resolveMcpAdminClient(method);
 
+    if (method === 'mcp.catalog') {
+      return this.mcpCatalog(client);
+    }
+
     if (method === 'mcp.add') {
       return this.mcpAdd(client, params);
+    }
+
+    if (method === 'mcp.catalogInstall') {
+      return this.mcpCatalogInstall(client, params);
     }
 
     const name = extractMcpName(params);
@@ -559,12 +664,7 @@ export class ControlDispatcher {
         // the panel renders, never a rejection.
         return client.testMcpServer(name);
       case 'mcp.auth':
-        // TASK A6 owns the OAuth body (withProgress + single-flight, §4.8).
-        // No A5 test reaches this line — every A5 `mcp.auth` assertion
-        // refuses at the `requireListedMcpName` guard above (the panel-fetch
-        // cache is undefined until a successful `mcp` panel fetch — task
-        // A4's `McpPanelSource.lastListedNames()`).
-        throw new Error('mcp.auth handler is implemented in task A6');
+        return this.mcpAuth(client, name);
       default: {
         const exhaustive: never = method;
         throw new Error(`unhandled MCP admin method: ${String(exhaustive)}`);
@@ -646,13 +746,164 @@ export class ControlDispatcher {
   /** Task A5 (§4.5 item 5): confirm -> `removeMcpServer` -> reload -> refetch. */
   private async mcpRemove(client: DashboardAdminClient, name: string): Promise<unknown> {
     const message = stripModalControls(`Remove MCP server "${name}"?`);
-    const confirmed = await this.port.confirm(message, MCP_RELOAD_LINE, 'Remove');
+    const confirmed = await this.port.confirm(message, RELOAD_LINE, 'Remove');
     if (!confirmed) {
       throw new Error(`Removing MCP server "${name}" was declined or cancelled.`);
     }
     const result = await client.removeMcpServer(name);
     await this.port.dispatch('reload.mcp', { confirm: true });
     await this.fetchPanelData('mcp');
+    return result;
+  }
+
+  /**
+   * Task A6 (§4.7 item 1): read-only, NOT trust-gated — "same class as
+   * `tools.list`" (§4.7). Caches the returned rows on {@link
+   * lastCatalogEntries} so `mcp.catalogInstall`'s fail-closed name guard has
+   * a session-scoped, server-authored set to check against (never the
+   * webview's own claim).
+   */
+  private async mcpCatalog(client: DashboardAdminClient): Promise<McpCatalogData> {
+    const data = await client.listMcpCatalog();
+    this.lastCatalogEntries = data.entries;
+    return data;
+  }
+
+  /**
+   * Task A6 (§4.7 items 2-4): `validateCatalogInstall` against the last-
+   * LISTED catalog (fail-closed — `mcp.catalog` was never called this
+   * session -> `lastCatalogEntries` is `undefined` -> the entry lookup finds
+   * nothing) -> `describeCatalogForModal`, passing the VALIDATED submitted
+   * env as the 2nd arg (A3-IMP2 binding: the "Credentials are saved…" line
+   * must reflect what the user actually submitted, never the entry's
+   * `required_env` schema) -> native consent -> `installCatalogEntry`. A
+   * synchronous (`background:false`) install resolves immediately; a
+   * background (git-bootstrap) install is handed to {@link
+   * pollCatalogInstall} for the ground-truth-verified wait (Layer 6).
+   * Single-flight per entry name is enforced by the CALLER ({@link
+   * handleMcpAdmin}'s synchronous {@link acquireMcpSingleFlight}) — this
+   * method never re-checks it.
+   */
+  private async mcpCatalogInstall(client: DashboardAdminClient, params: unknown): Promise<McpCatalogInstallResult> {
+    const validated = validateCatalogInstall(params, this.lastCatalogEntries ?? []);
+    if (!validated.ok) {
+      throw new Error(validated.reason);
+    }
+    const { entry, env } = validated;
+    const described = describeCatalogForModal(entry, env);
+    if (!described.ok) {
+      throw new Error(described.reason);
+    }
+    const confirmed = await this.port.confirm(
+      described.message,
+      described.detail,
+      entry.needs_install ? 'Install & build' : 'Install',
+    );
+    if (!confirmed) {
+      throw new Error(`Installing MCP "${entry.name}" was declined or cancelled.`);
+    }
+    const result = await client.installCatalogEntry({ name: entry.name, env, enable: true });
+    if (!result.background) {
+      await this.port.dispatch('reload.mcp', { confirm: true });
+      await this.fetchPanelData('mcp');
+      return { ok: true, name: entry.name };
+    }
+    if (!result.action) {
+      throw new Error(`Catalog install of "${entry.name}" started in the background but returned no action id.`);
+    }
+    return await this.pollCatalogInstall(client, entry.name, result.action);
+  }
+
+  /**
+   * Task A6 (§4.7 item 2, background branch): poll `actionStatus` at a
+   * 1s -> 2s backoff, capped at 180s total (clone+build headroom). On
+   * `running:false`, GROUND-TRUTH verify (Layer 6, unexecuted-assurance
+   * doctrine): a FRESH `listMcpCatalog()` must show this row's `installed
+   * === true` — the exit code alone is never trusted. On a timeout or a
+   * still-`installed:false` row, the action's tail `lines` go to the
+   * output-channel logger ONLY; the thrown message never carries them.
+   */
+  private async pollCatalogInstall(
+    client: DashboardAdminClient,
+    name: string,
+    action: string,
+  ): Promise<McpCatalogInstallResult> {
+    const deadline = Date.now() + CATALOG_POLL_CAP_MS;
+    let delay = CATALOG_POLL_FIRST_DELAY_MS;
+    let lastLines: string[] = [];
+    for (;;) {
+      const status = await client.actionStatus(action);
+      lastLines = status.lines;
+      if (!status.running) break;
+      if (Date.now() >= deadline) {
+        this.rejectCatalogInstall(name, lastLines);
+      }
+      await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
+      delay = CATALOG_POLL_STEP_DELAY_MS;
+    }
+
+    const verify = await client.listMcpCatalog();
+    this.lastCatalogEntries = verify.entries;
+    const row = verify.entries.find((entry) => entry.name === name);
+    if (!row || row.installed !== true) {
+      this.rejectCatalogInstall(name, lastLines);
+    }
+
+    await this.port.dispatch('reload.mcp', { confirm: true });
+    await this.fetchPanelData('mcp');
+    return { ok: true, name };
+  }
+
+  /**
+   * Task A6 (§4.7 item 2, §3 Layer 6): the shared timeout/ground-truth-
+   * failure refusal. `tailLines` goes to the output-channel logger only —
+   * never into the thrown message (the constraint the reject-message test
+   * proves).
+   */
+  private rejectCatalogInstall(name: string, tailLines: string[]): never {
+    this.port.logger?.append(
+      `[AcpBackend] catalog install "${name}" did not verify as installed — action tail:\n${tailLines.join('\n')}`,
+    );
+    throw new Error('Catalog install did not complete — see the Talaria output log.');
+  }
+
+  /**
+   * Task A6 (§4.8): OAuth login. No modal — the plan calls this "self-
+   * evident" (user-initiated browser handoff; the only persisted
+   * consequence, `auth: oauth`, is written server-side only on verified
+   * success). Cancellation only abandons OUR wait via `AbortSignal`; the
+   * Hermes-side flow continues until ITS OWN timeout — the returned
+   * envelope's copy says exactly that. Single-flight per name (critic
+   * IMPORTANT-3, Hermes's own token snapshot/remove/restore dance,
+   * `web_server.py:10592-10629`, is not safe under a concurrent same-name
+   * call) is enforced by the CALLER ({@link handleMcpAdmin}'s synchronous
+   * {@link acquireMcpSingleFlight}) — this method never re-checks it.
+   */
+  private async mcpAuth(client: DashboardAdminClient, name: string): Promise<McpTestResult> {
+    const result = await this.port.withProgress<McpTestResult>(
+      `MCP "${name}" — complete the sign-in in your browser`,
+      async (token) => {
+        const controller = new AbortController();
+        const sub = token.onCancellationRequested(() => controller.abort());
+        try {
+          return await client.authMcpServer(name, controller.signal);
+        } catch (err) {
+          if (token.isCancellationRequested) {
+            return {
+              ok: false,
+              error: 'Cancelled. The browser sign-in may still be completing — run Test after finishing it.',
+              tools: [],
+            };
+          }
+          throw err;
+        } finally {
+          sub.dispose();
+        }
+      },
+    );
+    if (result.ok) {
+      await this.fetchPanelData('mcp');
+    }
     return result;
   }
 
@@ -1047,9 +1298,20 @@ function toMcpAddParams(
     : { name: body.name, transport: 'stdio', command: body.command ?? '', args: body.args ?? [], env: body.env ?? {} };
 }
 
-/** Task A5 (§4.6 modal copy, pinned verbatim): the reload/prompt-cache-invalidation line shared by every MCP consent modal. */
-const MCP_RELOAD_LINE =
-  'Applying the change reloads MCP servers and invalidates the prompt cache (the next message re-sends full input tokens).';
+/**
+ * Task A6 (§4.7 item 2): background catalog-install poll cadence — the
+ * FIRST wait is 1s, every wait after that is 2s, and the total elapsed poll
+ * time (first `actionStatus` call to the last) is capped at 180s (clone +
+ * build headroom).
+ */
+const CATALOG_POLL_FIRST_DELAY_MS = 1_000;
+const CATALOG_POLL_STEP_DELAY_MS = 2_000;
+const CATALOG_POLL_CAP_MS = 180_000;
+
+/** Task A6: a plain `setTimeout` wait — {@link pollCatalogInstall}'s backoff step. Real timers in production; `vi.useFakeTimers()` in tests. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * P3 (arch A3): pinned refusal returned by {@link ControlDispatcher

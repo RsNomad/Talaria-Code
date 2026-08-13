@@ -522,6 +522,23 @@ export class AcpBackend implements AgentBackend {
         const choice = await vscode.window.showWarningMessage(message, { modal: true, detail }, actionLabel);
         return choice === actionLabel;
       },
+      // Task A6 (§4.8, Context7-pinned `window.withProgress`): the F-4 OAuth
+      // blocking-wait UX — a cancellable Notification progress. `token` is
+      // handed straight through to the dispatcher's `task` callback; only
+      // `isCancellationRequested`/`onCancellationRequested` are ever read on
+      // it (the port's own narrowed shape), so the REAL `CancellationToken`
+      // (a strict superset) satisfies it structurally.
+      // `vscode.window.withProgress` returns a `Thenable`, not a real
+      // `Promise` — `Promise.resolve(...)` adapts it (a `Thenable` is
+      // assignable to `PromiseLike`, which `Promise.resolve` accepts) so
+      // this satisfies the port's `Promise<T>` return type.
+      withProgress: (title, task) =>
+        Promise.resolve(
+          vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title, cancellable: true },
+            (_progress, token) => task(token),
+          ),
+        ),
       loadSessionIntoTab: (sessionId, cwd, tabId, title) => this.loadSessionIntoTab(sessionId, cwd, tabId, title),
     };
     this.controlDispatcher = new ControlDispatcher(controlPort);

@@ -18,6 +18,7 @@ import type {
   ContextRef,
   HostToWebviewMessage,
   McpCatalogData,
+  McpCatalogEntry,
   McpTestResult,
   SessionsData,
   SubagentsData,
@@ -49,6 +50,7 @@ import { ConnectionSupervisor, type ConnectionSupervisorHostPort } from './conne
 import { SessionRegistry } from './session/SessionRegistry';
 import { must } from '../../testing/must';
 import { TRUST_GATED_METHODS } from './control/ControlDispatcher';
+import { RELOAD_LINE } from './control/mcpEntryValidation';
 
 /**
  * `vscode` isn't resolvable outside the extension host; `AcpBackend` only
@@ -133,9 +135,32 @@ vi.mock('vscode', () => {
       };
     },
   };
-  const window = { showWarningMessage: vi.fn() };
+  // Task A6 harness extension (explicit, cited — features-add-mcp-skills-
+  // architecture.md task A6 "Harness extension" bullet): `window.withProgress`
+  // defaults to invoking `task` with a NEVER-cancelled token — matches the
+  // real `vscode.window.withProgress(options, (progress, token) => ...)`
+  // shape (Context7-pinned, `generateCommitCommand.vscode.ts:121-131`'s own
+  // real-API precedent). Individual tests override this mock (`mockImplementationOnce`)
+  // to simulate cancellation.
+  const window = {
+    showWarningMessage: vi.fn(),
+    withProgress: vi.fn(
+      async (
+        _opts: unknown,
+        task: (
+          progress: { report: () => void },
+          token: { isCancellationRequested: boolean; onCancellationRequested: (cb: () => void) => { dispose: () => void } },
+        ) => Promise<unknown>,
+      ) => task({ report: () => {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose: () => {} }) }),
+    ),
+  };
+  // Task A6 harness extension: `ProgressLocation.Notification` — the only
+  // location `withProgress` renders a cancel button for (§4.8); the real
+  // enum's numeric value is irrelevant to these tests (never asserted on),
+  // only its presence as a property `AcpBackend`'s port construction reads.
+  const ProgressLocation = { Notification: 15 };
   const Uri = { file: (p: string) => ({ fsPath: p }) };
-  return { EventEmitter, workspace, window, Uri };
+  return { EventEmitter, workspace, window, Uri, ProgressLocation };
 });
 
 /**
@@ -7088,8 +7113,42 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
   setEnabledCalls: Array<{ name: string; enabled: boolean }> = [];
   testCalls: string[] = [];
   authCalls: string[] = [];
-  /** Settable canned envelope `testMcpServer`/`authMcpServer` resolve with. */
+  /** Settable canned envelope `testMcpServer` resolves with. */
   testResult: McpTestResult = { ok: true, tools: [] };
+
+  // --- Task A6 harness extension (explicit, cited — features-add-mcp-
+  // skills-architecture.md task A6 "Harness extension" bullet) ---------------
+
+  /** `listMcpCatalog()`'s FIRST-call answer (e.g. the row `mcp.catalog` first lists). */
+  catalogEntries: McpCatalogEntry[] = [];
+  /**
+   * `listMcpCatalog()`'s answer on every call AFTER the first, when set —
+   * lets a test drive the Layer-6 ground-truth-verify re-list with a
+   * DIFFERENT (post-install) `installed` flag than the pre-install listing.
+   * `undefined` (the default) means every call keeps returning
+   * {@link catalogEntries} unchanged.
+   */
+  catalogEntriesAfterInstall: McpCatalogEntry[] | undefined;
+  private listCatalogCalls = 0;
+  installCalls: Array<{ name: string; env: Record<string, string>; enable: boolean }> = [];
+  /** Settable canned envelope `installCatalogEntry` resolves with. */
+  installResult: { ok: boolean; name: string; background: boolean; action?: string } = {
+    ok: true,
+    name: '',
+    background: false,
+  };
+  actionStatusCalls: string[] = [];
+  /** FIFO queue `actionStatus` consumes one entry per call; once empty, repeats the last-shifted entry (defaults to not-running). */
+  statusSeq: Array<{ running: boolean; exit_code: number | null; lines: string[] }> = [];
+  private lastStatus: { running: boolean; exit_code: number | null; lines: string[] } = {
+    running: false,
+    exit_code: 0,
+    lines: [],
+  };
+  /** Settable canned envelope `authMcpServer` resolves with (signal ignored — the happy-path default). */
+  authResult: McpTestResult = { ok: true, tools: [] };
+  /** When set, `authMcpServer` returns THIS promise verbatim (ignoring `authResult`/signal) — the IMPORTANT-3 single-flight test's controllable in-flight call. */
+  authDeferred: Promise<McpTestResult> | undefined;
 
   async addMcpServer(body: {
     name: string;
@@ -7117,21 +7176,32 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
     return { ok: true, name, enabled };
   }
 
-  async authMcpServer(name: string): Promise<McpTestResult> {
+  async authMcpServer(name: string, _signal?: AbortSignal): Promise<McpTestResult> {
     this.authCalls.push(name);
-    return this.testResult;
+    if (this.authDeferred) return this.authDeferred;
+    return this.authResult;
   }
 
   async listMcpCatalog(): Promise<McpCatalogData> {
-    return { entries: [] };
+    this.listCatalogCalls += 1;
+    const entries = this.listCatalogCalls > 1 && this.catalogEntriesAfterInstall ? this.catalogEntriesAfterInstall : this.catalogEntries;
+    return { entries };
   }
 
-  async installCatalogEntry(): Promise<{ ok: boolean; name: string; background: boolean; action?: string }> {
-    return { ok: true, name: '', background: false };
+  async installCatalogEntry(body: {
+    name: string;
+    env: Record<string, string>;
+    enable: boolean;
+  }): Promise<{ ok: boolean; name: string; background: boolean; action?: string }> {
+    this.installCalls.push(body);
+    return this.installResult;
   }
 
-  async actionStatus(): Promise<{ running: boolean; exit_code: number | null; lines: string[] }> {
-    return { running: false, exit_code: 0, lines: [] };
+  async actionStatus(name: string): Promise<{ running: boolean; exit_code: number | null; lines: string[] }> {
+    this.actionStatusCalls.push(name);
+    const next = this.statusSeq.shift();
+    if (next) this.lastStatus = next;
+    return this.lastStatus;
   }
 }
 
@@ -7427,6 +7497,329 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     expect(res).toEqual({ ok: false, error: 'boom', tools: [] });
     expect(control.dispatchCalls.filter((c) => c.method === 'reload.mcp')).toEqual([]);
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------
+  // A5-M1 review fold-in: `mcp.remove`'s modal detail is the single-
+  // sourced `RELOAD_LINE` EXPORTED from `mcpEntryValidation.ts` — no more
+  // byte-duplicated local `MCP_RELOAD_LINE` in `ControlDispatcher.ts`.
+  // ---------------------------------------------------------------------
+  it('A5-M1 dedupe: mcp.remove modal detail is the single-sourced RELOAD_LINE, byte-identical', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Remove');
+
+    await backend.invokeControl('mcp.remove', { name: 'gh' });
+
+    const detail = (mockShowWarningMessage.mock.calls[0] as unknown[])[1] as { detail: string };
+    expect(detail.detail).toBe(RELOAD_LINE);
+    expect(client.removeCalls).toEqual(['gh']);
+  });
+
+  // ---------------------------------------------------------------------
+  // A5-M2 review fold-in: a REJECTED MCP handler must not wedge the
+  // `dashboardToggleTail` serialization queue — a subsequent handler on the
+  // SAME backend still executes to completion.
+  // ---------------------------------------------------------------------
+  it('A5-M2 concurrency: a rejected mcp.add does not wedge the serialization tail — a subsequent mcp.remove still runs', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache with 'gh'
+
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); // user declines the mcp.add modal
+    await expect(
+      backend.invokeControl('mcp.add', { name: 'new-server', transport: 'stdio', command: 'npx', args: [], env: {} }),
+    ).rejects.toThrow(/declined|cancel/i);
+    expect(client.addCalls).toEqual([]);
+
+    mockShowWarningMessage.mockResolvedValueOnce('Remove'); // user confirms the FOLLOWING mcp.remove
+    const result = await backend.invokeControl('mcp.remove', { name: 'gh' });
+
+    expect(result).toEqual({ ok: true });
+    expect(client.removeCalls).toEqual(['gh']);
+  });
+});
+
+// =============================================================================
+// Task A6 (features-add-mcp-skills-architecture.md §4.7/§4.8): the Nous
+// catalog install (ground-truth verified) + OAuth login dispatcher core.
+// =============================================================================
+
+/** Same builder as `mcpEntryValidation.test.ts` (local copy — the harness-honesty rule forbids importing a `.test.ts` fixture). */
+const catalogRow = (over: Record<string, unknown> = {}): McpCatalogEntry =>
+  ({
+    name: 'n8n',
+    description: 'd',
+    source: '',
+    transport: 'stdio',
+    auth_type: 'api_key',
+    required_env: [{ name: 'N8N_KEY', prompt: 'key', required: true }],
+    command: 'npx',
+    args: ['-y', 'x'],
+    url: null,
+    install_url: null,
+    install_ref: null,
+    bootstrap: [],
+    default_enabled: null,
+    post_install: '',
+    needs_install: false,
+    installed: false,
+    enabled: false,
+    ...over,
+  }) as McpCatalogEntry;
+
+describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('mcp.catalog lists entries and arms the install guard', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    client.catalogEntries = [catalogRow()];
+
+    const res = await backend.invokeControl('mcp.catalog', {});
+
+    expect(res).toEqual({ entries: [catalogRow()] });
+  });
+
+  it('mcp.catalog is NOT trust-gated (same class as tools.list)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    client.catalogEntries = [catalogRow()];
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      const res = await backend.invokeControl('mcp.catalog', {});
+      expect(res).toEqual({ entries: [catalogRow()] });
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('mcp.catalogInstall refuses a name that was never listed (fail-closed, no modal)', async () => {
+    const { backend } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    mockShowWarningMessage.mockClear();
+
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'ghost', env: {} })).rejects.toThrow(/catalog/i);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it('mcp.catalogInstall (background/git entry): modal -> install -> poll -> installed-flag verify -> reload -> refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [
+      catalogRow({ name: 'builder', needs_install: true, install_url: 'https://github.com/x/y', install_ref: 'v1', bootstrap: ['npm ci'] }),
+    ];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'mcp-install-builder-ab12cd34' };
+    client.statusSeq = [
+      { running: true, exit_code: null, lines: [] },
+      { running: false, exit_code: 0, lines: ['done'] },
+    ];
+    client.catalogEntriesAfterInstall = [catalogRow({ name: 'builder', needs_install: true, installed: true })];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    const resultPromise = backend.invokeControl('mcp.catalogInstall', { name: 'builder', env: {} });
+    // The poll loop's first `actionStatus` sees `running:true` and sleeps
+    // (1s) before the SECOND `actionStatus` call — advance past that wait.
+    await vi.advanceTimersByTimeAsync(1_000);
+    const res = await resultPromise;
+
+    expect(res).toMatchObject({ ok: true, name: 'builder' });
+    // the modal carried the build consent text
+    const detail = (mockShowWarningMessage.mock.calls[0] as unknown[])[1] as { detail: string };
+    expect(detail.detail).toContain('Clones: https://github.com/x/y @ v1 (pinned)');
+    expect(detail.detail).toContain('$ npm ci');
+    expect(control.dispatchCalls.some((c) => c.method === 'reload.mcp')).toBe(true);
+    expect(client.actionStatusCalls).toEqual(['mcp-install-builder-ab12cd34', 'mcp-install-builder-ab12cd34']);
+  });
+
+  it('mcp.catalogInstall: action finished but installed-flag still false -> generic reject, tail to logger only', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+    withFakeControl(backend);
+
+    client.catalogEntries = [
+      catalogRow({ name: 'builder', needs_install: true, install_url: 'https://github.com/x/y', install_ref: 'v1', bootstrap: ['npm ci'] }),
+    ];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'mcp-install-builder-ab12cd34' };
+    client.statusSeq = [{ running: false, exit_code: 1, lines: ['npm ci failed: EACCES permission denied'] }];
+    client.catalogEntriesAfterInstall = [catalogRow({ name: 'builder', needs_install: true, installed: false })];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('mcp.catalogInstall', { name: 'builder', env: {} });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toBe('Catalog install did not complete — see the Talaria output log.');
+    expect(message).not.toContain('EACCES'); // the tail must NEVER leak into the reject message
+    expect(logs.some((l) => l.includes('EACCES permission denied'))).toBe(true); // ...only into the output-channel logger
+  });
+
+  it('describeCatalogForModal receives the VALIDATED submitted env (A3-IMP2 binding) — not the entry schema', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow()]; // needs_install: false -> synchronous install
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'n8n', background: false };
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install');
+
+    await backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: { N8N_KEY: 'submitted-value' } });
+
+    const detail = (mockShowWarningMessage.mock.calls[0] as unknown[])[1] as { detail: string };
+    // §4.7 honesty line only appears because env WAS actually submitted —
+    // proving `env` (not the entry's `required_env` schema) drove the modal.
+    expect(detail.detail).toContain("Credentials are saved to Hermes' .env store (~/.hermes/.env).");
+    expect(detail.detail).not.toContain('submitted-value'); // the VALUE itself never renders
+    expect(client.installCalls).toEqual([{ name: 'n8n', env: { N8N_KEY: 'submitted-value' }, enable: true }]);
+  });
+});
+
+describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
+  it('mcp.auth resolves the envelope and refetches the mcp panel on ok:true', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // cache 'remote'
+    client.authResult = { ok: true, tools: [{ name: 't', description: '' }] };
+    const configGetCallsBefore = control.dispatchCalls.filter((c) => c.method === 'config.get').length;
+
+    const res = await backend.invokeControl('mcp.auth', { name: 'remote' });
+
+    expect(res).toEqual({ ok: true, tools: [{ name: 't', description: '' }] });
+    expect(client.authCalls).toEqual(['remote']);
+    const configGetCallsAfter = control.dispatchCalls.filter((c) => c.method === 'config.get').length;
+    expect(configGetCallsAfter).toBeGreaterThan(configGetCallsBefore); // proves the post-auth mcp refetch happened
+  });
+
+  it('mcp.auth: an {ok:false} envelope resolves as-is (Hermes-authored guidance) with NO refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' });
+    client.authResult = { ok: false, error: 'only allows pre-approved OAuth clients', tools: [] };
+    const configGetCallsBefore = control.dispatchCalls.filter((c) => c.method === 'config.get').length;
+
+    const res = await backend.invokeControl('mcp.auth', { name: 'remote' });
+
+    expect(res).toEqual({ ok: false, error: 'only allows pre-approved OAuth clients', tools: [] });
+    const configGetCallsAfter = control.dispatchCalls.filter((c) => c.method === 'config.get').length;
+    expect(configGetCallsAfter).toBe(configGetCallsBefore); // no refetch on a failed envelope
+  });
+
+  it('mcp.auth cancellation yields the HONEST cancel envelope (never a rejection) — abandons OUR wait only', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+    // The Hermes-side call never resolves on its own here — only when the
+    // AbortSignal fires, mirroring a real in-flight request being aborted.
+    client.authMcpServer = (_name: string, signal?: AbortSignal) =>
+      new Promise<McpTestResult>((_resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new Error('aborted by caller'));
+          return;
+        }
+        signal?.addEventListener('abort', () => reject(new Error('aborted by caller')));
+      });
+
+    // Simulate the user cancelling the progress notification immediately:
+    // the mock reports the token cancelled and fires the registered
+    // `onCancellationRequested` callback synchronously, mirroring how a
+    // real VS Code cancellation would arrive before the network call settles.
+    (vscode.window.withProgress as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (
+        _opts: unknown,
+        task: (
+          progress: { report: () => void },
+          token: { isCancellationRequested: boolean; onCancellationRequested: (cb: () => void) => { dispose: () => void } },
+        ) => Promise<unknown>,
+      ) => {
+        const token = {
+          isCancellationRequested: false,
+          onCancellationRequested: (cb: () => void) => {
+            token.isCancellationRequested = true;
+            cb();
+            return { dispose: () => {} };
+          },
+        };
+        return task({ report: () => {} }, token);
+      },
+    );
+
+    const res = await backend.invokeControl('mcp.auth', { name: 'remote' });
+
+    expect(res).toEqual({
+      ok: false,
+      error: 'Cancelled. The browser sign-in may still be completing — run Test after finishing it.',
+      tools: [],
+    });
+    expect(control.dispatchCalls.filter((c) => c.method === 'reload.mcp')).toEqual([]);
+  });
+
+  it('IMPORTANT-3: mcp.auth is single-flight per name — a concurrent same-name call is refused, a different name is not', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', {
+      mcp_servers: { remote: { url: 'https://x/mcp' }, other: { url: 'https://y/mcp' } },
+    });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+    let release!: (v: McpTestResult) => void;
+    client.authDeferred = new Promise<McpTestResult>((res) => {
+      release = res;
+    }); // FakeAdmin: authMcpServer returns this when set
+
+    const first = backend.invokeControl('mcp.auth', { name: 'remote' });
+    await expect(backend.invokeControl('mcp.auth', { name: 'remote' })).rejects.toThrow(/already in progress/i);
+
+    // A DIFFERENT name is never REFUSED by the SAME-name single-flight
+    // guard — accepted and queued WHILE 'remote' is still in flight (the
+    // shared `dashboardToggleTail` still serializes its ACTUAL execution
+    // behind 'remote', so it's only awaited AFTER `release` below — awaiting
+    // it here, before releasing 'remote', would deadlock the test).
+    const other = backend.invokeControl('mcp.auth', { name: 'other' });
+
+    release({ ok: true, tools: [] }); // Hermes-side token snapshot/restore (web_server.py:10592-10629) never sees a second racer
+    await expect(first).resolves.toMatchObject({ ok: true });
+    await expect(other).resolves.toMatchObject({ ok: true });
+    expect(client.authCalls).toEqual(['remote', 'other']);
   });
 });
 

@@ -216,7 +216,13 @@ export const MODAL_DETAIL_MAX = 4000;
 // describeAddForModal (§4.6 modal copy, pinned verbatim)
 // ---------------------------------------------------------------------------
 
-const RELOAD_LINE =
+/**
+ * A5-M1 (review fold-in, task A6): EXPORTED so `ControlDispatcher.ts`'s own
+ * `mcp.remove`/catalog-install modal copy imports this SAME constant instead
+ * of hand-duplicating it (the byte-identical `MCP_RELOAD_LINE` this used to
+ * shadow there) — single-source, per the file's own CR-003 discipline.
+ */
+export const RELOAD_LINE =
   'Applying the change reloads MCP servers and invalidates the prompt cache (the next message re-sends full input tokens).';
 const RUNS_ON_MACHINE_LINE = 'This command will run on your machine every time the agent starts.';
 const PLAINTEXT_ENV_LINE = "Env values will be stored in PLAIN TEXT in Hermes' ~/.hermes/config.yaml.";
