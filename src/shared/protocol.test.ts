@@ -1,6 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { PANEL_SCOPE } from './protocol';
-import type { DataPanel, Scope, SetupData, HostToWebview, SetupMethod, ControlRequestMethod } from './protocol';
+import { PANEL_SCOPE, CONTROL_METHODS } from './protocol';
+import type {
+  DataPanel,
+  Scope,
+  SetupData,
+  HostToWebview,
+  SetupMethod,
+  ControlRequestMethod,
+  ControlMethod,
+  McpServer,
+  McpCatalogEntry,
+} from './protocol';
 
 /**
  * W6-FE Part 2 (3-way ARCH I-3a) — proves the explicit `PANEL_SCOPE` map
@@ -237,5 +247,26 @@ describe('protocol — Setup panel contract (Task 8)', () => {
     // carries on the wire.
     const asControlRequest: ControlRequestMethod[] = methods;
     expect(asControlRequest).toHaveLength(3);
+  });
+});
+
+describe('T1 MCP admin protocol surface', () => {
+  it('the seven mcp.* methods are ControlMethods and flow into ControlRequestMethod', () => {
+    const methods: ControlMethod[] = ['mcp.add', 'mcp.remove', 'mcp.test', 'mcp.setEnabled', 'mcp.auth', 'mcp.catalog', 'mcp.catalogInstall'];
+    const asControlRequest: ControlRequestMethod[] = methods; // compile-time flow (protocol.test.ts:231-238 pattern)
+    expect(asControlRequest).toHaveLength(7);
+    expect(CONTROL_METHODS).toEqual(expect.arrayContaining(methods));
+  });
+  it('McpServer carries enabled + transport', () => {
+    const s: McpServer = { id: 'x', name: 'x', status: 'disconnected', command: 'npx y', toolCount: 0, enabled: true, transport: 'stdio' };
+    expect(s.enabled).toBe(true);
+    expect(s.transport).toBe('stdio');
+  });
+  it('McpCatalogEntry pins the verbatim server row shape (web_server.py:10710-10740)', () => {
+    const e: McpCatalogEntry = { name: 'n8n', description: 'd', source: 's', transport: 'stdio', auth_type: 'api_key',
+      required_env: [{ name: 'N8N_KEY', prompt: 'API key', required: true }], command: 'npx', args: ['-y', 'x'],
+      url: null, install_url: null, install_ref: null, bootstrap: [], default_enabled: null, post_install: '', needs_install: false,
+      installed: false, enabled: false };
+    expect(e.needs_install).toBe(false);
   });
 });

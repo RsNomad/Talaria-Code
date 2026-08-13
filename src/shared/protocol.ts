@@ -285,12 +285,55 @@ export interface McpServer {
   command: string;
   /** Tools exposed by this server once connected. */
   toolCount: number;
+  /** `cfg.enabled !== false`. */
+  enabled: boolean;
+  /** `cfg.url ? 'http' : cfg.command ? 'stdio' : 'unknown'` (mirrors web_server.py:10382). */
+  transport: 'stdio' | 'http' | 'unknown';
 }
 
 /** MCP panel payload. Origin: TUI `reload.mcp` snapshot. */
 export interface McpData {
   servers: McpServer[];
 }
+
+/** `mcp.add` params — discriminated on `transport` (§4.2). */
+export type McpAddParams =
+  | { name: string; transport: 'stdio'; command: string; args: string[]; env: Record<string, string> }
+  | { name: string; transport: 'http'; url: string };
+
+/** `transport` is threaded from the VALIDATED McpAddParams discriminant (the request's own
+ *  `params.transport` after `validateMcpAdd` accepted it) — `validateMcpAdd`'s wire `body`
+ *  deliberately drops it (the REST body has no transport field), so the §4.5 handler returns
+ *  `{ ok: true, name: body.name, transport: params.transport }`. */
+export interface McpAddResult { ok: true; name: string; transport: 'stdio' | 'http' }
+
+/** Envelope of mcp.test AND mcp.auth — verbatim server shape (web_server.py:10537-10542, :10630-10652). */
+export interface McpTestResult { ok: boolean; error?: string; tools: { name: string; description: string }[] }
+
+/** One GET /api/mcp/catalog entry, verbatim server shape (web_server.py:10710-10740, incl. default_enabled :10732-10735). */
+export interface McpCatalogEntry {
+  name: string;
+  description: string;
+  source: string;
+  transport: string;
+  auth_type: string;
+  required_env: { name: string; prompt: string; required: boolean }[];
+  command: string | null;
+  args: string[];
+  url: string | null;
+  install_url: string | null;
+  install_ref: string | null;
+  bootstrap: string[];
+  default_enabled: string[] | null;
+  post_install: string;
+  needs_install: boolean;
+  installed: boolean;
+  enabled: boolean;
+}
+export interface McpCatalogData { entries: McpCatalogEntry[] }
+
+export interface McpCatalogInstallParams { name: string; env: Record<string, string> }
+export interface McpCatalogInstallResult { ok: true; name: string }
 
 /**
  * One skill row. Origin (W1.5): the dashboard REST surface `GET /api/skills`
@@ -1786,6 +1829,15 @@ export const CONTROL_METHODS = [
   // user-supplied glob), results filtered through `isSecretForCompletion`
   // (no free secret-path enumeration for a compromised webview). See §2e.
   'context.searchFiles',
+  // T1 — MCP admin + Nous catalog surface (add/remove/test/enable/auth over
+  // the dashboard REST channel; §4.2 of the MCP/skills architecture brief).
+  'mcp.add',
+  'mcp.remove',
+  'mcp.test',
+  'mcp.setEnabled',
+  'mcp.auth',
+  'mcp.catalog',
+  'mcp.catalogInstall',
 ] as const;
 
 /** A control-plane RPC name the webview may invoke. Derived from {@link CONTROL_METHODS}. */
