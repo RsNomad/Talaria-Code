@@ -7137,6 +7137,13 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
     name: '',
     background: false,
   };
+  /**
+   * F1 harness extension (test-only — mirrors {@link authDeferred}'s exact
+   * idiom below): when set, `installCatalogEntry` returns THIS promise
+   * verbatim (ignoring `installResult`), giving the `mcp.catalogInstall`
+   * single-flight test a controllable in-flight call.
+   */
+  installDeferred: Promise<{ ok: boolean; name: string; background: boolean; action?: string }> | undefined;
   actionStatusCalls: string[] = [];
   /** FIFO queue `actionStatus` consumes one entry per call; once empty, repeats the last-shifted entry (defaults to not-running). */
   statusSeq: Array<{ running: boolean; exit_code: number | null; lines: string[] }> = [];
@@ -7194,6 +7201,7 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
     enable: boolean;
   }): Promise<{ ok: boolean; name: string; background: boolean; action?: string }> {
     this.installCalls.push(body);
+    if (this.installDeferred) return this.installDeferred;
     return this.installResult;
   }
 
@@ -7703,6 +7711,94 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     expect(detail.detail).toContain("Credentials are saved to Hermes' .env store (~/.hermes/.env).");
     expect(detail.detail).not.toContain('submitted-value'); // the VALUE itself never renders
     expect(client.installCalls).toEqual([{ name: 'n8n', env: { N8N_KEY: 'submitted-value' }, enable: true }]);
+  });
+
+  // ---------------------------------------------------------------------
+  // Review fold-in (F1, Important): §4.7 item 4 mandates "single-flight per
+  // entry name (re-click while installing refused)" for `mcp.catalogInstall`
+  // — only `mcp.auth`'s IMPORTANT-3 test covered this before. Structural
+  // template: the `mcp.auth` IMPORTANT-3 test above (`AcpBackend.test.ts`,
+  // "is single-flight per name"), swapping `authDeferred`/`authCalls` for
+  // this fake's own `installDeferred`/`installCalls`.
+  // ---------------------------------------------------------------------
+  it('F1: mcp.catalogInstall is single-flight per entry name — a concurrent same-name call is refused, a different name is not', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'n8n' }), catalogRow({ name: 'other', required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {}); // arms the fail-closed catalog-name guard for BOTH rows
+
+    let release!: (v: { ok: boolean; name: string; background: boolean; action?: string }) => void;
+    client.installDeferred = new Promise((res) => {
+      release = res;
+    }); // FakeAdmin: installCatalogEntry returns this when set
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Install'); // every modal this test opens is confirmed
+
+    const first = backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} });
+
+    // The guard is a synchronous test-and-set BEFORE `first` ever joins the
+    // queue (`handleMcpAdmin`'s own doc) — the refusal below does not depend
+    // on how far `first`'s modal/install chain has progressed.
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} })).rejects.toThrow(
+      /already in progress/i,
+    );
+
+    // A DIFFERENT name is never refused by the SAME-name guard — accepted
+    // and queued WHILE 'n8n' is still in flight (the shared
+    // `dashboardToggleTail` still serializes its ACTUAL execution behind
+    // 'n8n', so it only runs AFTER `release` below — awaiting it here,
+    // before releasing 'n8n', would deadlock the test, mirroring the
+    // `mcp.auth` IMPORTANT-3 test's own comment).
+    const other = backend.invokeControl('mcp.catalogInstall', { name: 'other', env: {} });
+
+    release({ ok: true, name: 'n8n', background: false });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'n8n' });
+    await expect(other).resolves.toMatchObject({ ok: true, name: 'other' });
+
+    // The refused re-click reached NEITHER the modal NOR installCatalogEntry
+    // a second time: exactly one modal + one install call for 'n8n', plus
+    // 'other's own pair — never a third of either.
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+    expect(client.installCalls).toEqual([
+      { name: 'n8n', env: {}, enable: true },
+      { name: 'other', env: {}, enable: true },
+    ]);
+  });
+
+  // ---------------------------------------------------------------------
+  // Review fold-in (F2, Minor): proves the single-flight slot is FREED on a
+  // refusal path (a declined modal), not leaked — the same name can be
+  // retried immediately afterward.
+  // ---------------------------------------------------------------------
+  it('F2: a declined mcp.catalogInstall modal frees the single-flight slot — the SAME name can be retried immediately', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'n8n', required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {});
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); // user hits Cancel — a REFUSAL path
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} })).rejects.toThrow(
+      /declined|cancel/i,
+    );
+    expect(client.installCalls).toEqual([]); // the decline never reached installCatalogEntry
+
+    // Retry the SAME name. If the slot leaked on the refusal path, this
+    // would be refused with "already in progress" instead of reaching a
+    // second modal/install.
+    client.installResult = { ok: true, name: 'n8n', background: false };
+    mockShowWarningMessage.mockResolvedValueOnce('Install');
+    const result = await backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} });
+
+    expect(result).toMatchObject({ ok: true, name: 'n8n' });
+    expect(client.installCalls).toEqual([{ name: 'n8n', env: {}, enable: true }]);
   });
 });
 
