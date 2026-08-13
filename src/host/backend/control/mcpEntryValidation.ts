@@ -130,6 +130,9 @@ function checkEnv(value: unknown, allowedKeys?: ReadonlySet<string>): Checked<Re
   const seen = new Set<string>();
   const out: Record<string, string> = {};
   for (const [key, v] of entries) {
+    // Unreachable via Object.entries() on a JS object (duplicate keys can't
+    // coexist there) — kept as defense-in-depth for a future wire shape that
+    // isn't parsed through JSON.parse (e.g. a list-of-pairs format).
     if (seen.has(key)) return { ok: false, reason: `duplicate env key "${key}".` };
     seen.add(key);
     if (allowedKeys && !allowedKeys.has(key)) return { ok: false, reason: `env key "${key}" is not accepted here.` };
@@ -282,7 +285,10 @@ const CATALOG_SOURCE_LINE = 'Nous-approved catalog entry (ships with Hermes, PR-
 const CATALOG_ENV_LINE = "Credentials are saved to Hermes' .env store (~/.hermes/.env).";
 const BOOTSTRAP_HEADER_LINE = 'Then runs these build commands IN A SHELL on your machine:';
 
-export function describeCatalogForModal(entry: McpCatalogEntry): ModalDescription {
+export function describeCatalogForModal(
+  entry: McpCatalogEntry,
+  submittedEnv: Record<string, string> = {},
+): ModalDescription {
   const message = `Install MCP "${entry.name}" from the Hermes catalog?`;
   const lines: string[] = [CATALOG_SOURCE_LINE];
 
@@ -291,9 +297,14 @@ export function describeCatalogForModal(entry: McpCatalogEntry): ModalDescriptio
   } else if (entry.command !== null) {
     const argsStr = entry.args.length > 0 ? ` ${entry.args.join(' ')}` : '';
     lines.push(`Runs: ${entry.command}${argsStr}`);
+  } else {
+    return {
+      ok: false,
+      reason: `Catalog entry "${entry.name}" has no usable transport — refusing to build a consent modal.`,
+    };
   }
 
-  if (entry.required_env.length > 0) lines.push(CATALOG_ENV_LINE);
+  if (Object.keys(submittedEnv).length > 0) lines.push(CATALOG_ENV_LINE);
   lines.push(RELOAD_LINE);
 
   if (entry.needs_install) {
