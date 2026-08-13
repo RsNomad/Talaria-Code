@@ -10,6 +10,7 @@ import type {
   ControlMethod,
   McpServer,
   McpCatalogEntry,
+  HubScan,
 } from './protocol';
 
 /**
@@ -268,5 +269,31 @@ describe('T1 MCP admin protocol surface', () => {
       url: null, install_url: null, install_ref: null, bootstrap: [], default_enabled: null, post_install: '', needs_install: false,
       installed: false, enabled: false };
     expect(e.needs_install).toBe(false);
+  });
+});
+
+describe('T2 skills admin protocol surface (B1)', () => {
+  it('the five skills.* hub/create methods are ControlMethods and flow into ControlRequestMethod', () => {
+    const methods: ControlMethod[] = ['skills.create', 'skills.hubPreview', 'skills.hubScan', 'skills.hubInstall', 'skills.hubUninstall'];
+    const asControlRequest: ControlRequestMethod[] = methods; // compile-time flow (protocol.test.ts:254-258 T1 pattern)
+    expect(asControlRequest).toHaveLength(5);
+    expect(CONTROL_METHODS).toEqual(expect.arrayContaining(methods));
+  });
+  it('HubScan pins the verbatim scan response shape, incl. source/policy_reason/severity_counts (web_server.py:12162-12173)', () => {
+    const scan: HubScan = {
+      name: 'my-skill',
+      identifier: 'org/my-skill',
+      source: 'github.com/org/skills-repo',
+      trust_level: 'trusted',
+      verdict: 'safe',
+      summary: 'No issues found.',
+      policy: 'allow',
+      policy_reason: 'trusted source, no findings',
+      findings: [{ severity: 'low', category: 'style', file: 'SKILL.md', line: 3, description: 'minor nit' }],
+      severity_counts: { critical: 0, high: 0, medium: 0, low: 1 },
+    };
+    expect(scan.source).toBe('github.com/org/skills-repo');
+    expect(scan.policy_reason).toBe('trusted source, no findings');
+    expect(scan.severity_counts).toEqual({ critical: 0, high: 0, medium: 0, low: 1 });
   });
 });

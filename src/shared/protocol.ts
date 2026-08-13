@@ -378,6 +378,44 @@ export interface SkillsData {
   categories: string[];
 }
 
+/** `skills.create` params — user-authored skill (§5.2 of the MCP/skills architecture brief). */
+export interface SkillCreateParams {
+  name: string;
+  content: string;
+  category?: string;
+}
+
+/** One Skill Hub search-result preview, verbatim server shape (§5.2). */
+export interface HubPreview {
+  name: string;
+  description: string;
+  source: string;
+  identifier: string;
+  trust_level: string;
+  skill_md: string;
+  files: string[];
+}
+
+/** Verbatim scan response shape (web_server.py:12162-12173). */
+export interface HubScan {
+  name: string;
+  identifier: string;
+  source: string;
+  trust_level: string;
+  verdict: 'safe' | 'caution' | 'dangerous';
+  summary: string;
+  policy: 'allow' | 'ask' | 'block';
+  policy_reason: string;
+  findings: { severity: string; category: string; file: string; line: number; description: string }[];
+  severity_counts: { critical: number; high: number; medium: number; low: number };
+}
+
+/** `skills.hubInstall` result — resolved ONLY after presence re-check. */
+export interface HubInstallResult {
+  ok: true;
+  name: string;
+}
+
 /**
  * One checkpoint row. Origin: the extension-side `CheckpointTracker`
  * (shadow-git; `src/host/checkpoints/CheckpointTracker.ts`) — NOT TUI
@@ -1838,6 +1876,15 @@ export const CONTROL_METHODS = [
   'mcp.auth',
   'mcp.catalog',
   'mcp.catalogInstall',
+  // T2 — skills admin + Hub surface (create/preview/scan/install/uninstall
+  // over the dashboard REST channel; §5.2 of the MCP/skills architecture
+  // brief). Additions only — the pre-existing `skills.toggle` above is
+  // untouched.
+  'skills.create',
+  'skills.hubPreview',
+  'skills.hubScan',
+  'skills.hubInstall',
+  'skills.hubUninstall',
 ] as const;
 
 /** A control-plane RPC name the webview may invoke. Derived from {@link CONTROL_METHODS}. */
