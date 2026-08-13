@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   HermesDashboardClient,
   isHermesStatusShape,
+  anySignal,
   type FetchLike,
 } from './HermesDashboardClient';
 import { must } from '../../testing/must';
@@ -361,5 +362,78 @@ describe('isHermesStatusShape — Hermes identity signature', () => {
     void gateway_drainable;
     expect(isHermesStatusShape(noDrainable)).toBe(false); // missing field
     expect(isHermesStatusShape(hermesStatusBody({ nous_session_valid: 123 }))).toBe(false); // wrong type
+  });
+});
+
+/**
+ * A2 — `DashboardAdminClient` (T1 members): MCP admin CRUD + catalog + auth.
+ * `actionStatus` is included here too (controller-decided scope note): it
+ * visually groups under "T2" in the architecture doc (§4.3), but A6 (catalog
+ * background-install polling) needs it before B2 lands, and it is shared
+ * polling infra with no T2-specific shape.
+ */
+describe('DashboardAdminClient — T1 endpoints', () => {
+  it('addMcpServer POSTs the exact body to /api/mcp/servers with the token header', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ name: 'gh', transport: 'stdio' }));
+    await makeClient(fetchImpl, 'tkn').addMcpServer({ name: 'gh', command: 'npx', args: ['-y', 'server-github'], env: { GITHUB_TOKEN: 'x' } });
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/mcp/servers');
+    expect(must(calls[0]).init?.method).toBe('POST');
+    expect((must(calls[0]).init?.headers as Record<string, string>)['X-Hermes-Session-Token']).toBe('tkn');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'gh', command: 'npx', args: ['-y', 'server-github'], env: { GITHUB_TOKEN: 'x' } });
+  });
+
+  it('testMcpServer resolves the ok:false 200-envelope instead of throwing', async () => {
+    const { fetchImpl } = stubFetch(() => json({ ok: false, error: 'connect refused', tools: [] }));
+    await expect(makeClient(fetchImpl).testMcpServer('gh')).resolves.toEqual({ ok: false, error: 'connect refused', tools: [] });
+  });
+
+  it('removeMcpServer DELETEs the encoded name path and a 404 rejects with a generic (body-free) message', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ detail: 'secret-path-leak' }, 404));
+    await expect(makeClient(fetchImpl).removeMcpServer('a b')).rejects.toThrow(/404/);
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/mcp/servers/a%20b');
+    await expect(makeClient(fetchImpl).removeMcpServer('a b')).rejects.not.toThrow(/secret-path-leak/);
+  });
+
+  it('setMcpServerEnabled PUTs {enabled} to /api/mcp/servers/{name}/enabled', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, name: 'gh', enabled: false }));
+    await makeClient(fetchImpl).setMcpServerEnabled('gh', false);
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/mcp/servers/gh/enabled');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ enabled: false });
+  });
+
+  it('authMcpServer POSTs .../auth and an external AbortSignal cancels the call', async () => {
+    const controller = new AbortController();
+    const { fetchImpl } = stubFetch((_url, init) => new Promise((_res, rej) => {
+      init?.signal?.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')));
+    }) as unknown as Response);
+    const pending = makeClient(fetchImpl).authMcpServer('remote', controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+  });
+
+  it('listMcpCatalog GETs /api/mcp/catalog and installCatalogEntry POSTs {name, env, enable}', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, name: 'n8n', background: true, action: 'mcp-install-n8n-ab12cd34' }));
+    await makeClient(fetchImpl).installCatalogEntry({ name: 'n8n', env: { N8N_KEY: 'v' }, enable: true });
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/mcp/catalog/install');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'n8n', env: { N8N_KEY: 'v' }, enable: true });
+  });
+
+  it('anySignal: native path delegates; fallback path (anyImpl undefined, pre-Node-20.3) composes via once-listeners', () => {
+    const a = new AbortController();
+    const b = new AbortController();
+    const composed = anySignal([a.signal, b.signal], undefined); // force the fallback branch
+    expect(composed.aborted).toBe(false);
+    b.abort(new Error('caller cancelled'));
+    expect(composed.aborted).toBe(true);
+    const already = new AbortController();
+    already.abort();
+    expect(anySignal([already.signal], undefined).aborted).toBe(true); // pre-aborted input propagates immediately
+  });
+
+  it('actionStatus GETs /api/actions/{name}/status and returns the pinned shape', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ name: 'a', running: false, exit_code: 0, pid: 1, lines: ['Installed: pdf'] }));
+    const res = await makeClient(fetchImpl).actionStatus('a');
+    expect(must(calls[0]).url).toContain('/api/actions/a/status');
+    expect(res).toMatchObject({ running: false, exit_code: 0 });
   });
 });
