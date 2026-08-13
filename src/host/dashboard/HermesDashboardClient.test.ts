@@ -448,3 +448,52 @@ describe('DashboardAdminClient — T1 endpoints', () => {
     expect(res).toMatchObject({ running: false, exit_code: 0 });
   });
 });
+
+describe('DashboardAdminClient — T2 skills endpoints', () => {
+  it('createSkill POSTs the exact body to /api/skills', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true }));
+    await makeClient(fetchImpl).createSkill({ name: 'x', content: '---\n---\nbody', category: 'custom' });
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills');
+    expect(must(calls[0]).init?.method).toBe('POST');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'x', content: '---\n---\nbody', category: 'custom' });
+  });
+
+  it('createSkill surfaces a 400 as a generic error (detail never in the thrown message)', async () => {
+    const { fetchImpl } = stubFetch(() => json({ detail: 'Invalid name: /etc/passwd' }, 400));
+    await expect(makeClient(fetchImpl).createSkill({ name: 'x', content: '---\n---\nb' })).rejects.toThrow(/400/);
+    await expect(makeClient(fetchImpl).createSkill({ name: 'x', content: '---\n---\nb' })).rejects.not.toThrow(/passwd/);
+  });
+
+  it('previewHubSkill GETs /api/skills/hub/preview with an ENCODED identifier and resolves the body', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({
+      name: 'pdf', description: 'PDF tools', source: 'anthropics/skills', identifier: 'anthropics/skills/pdf',
+      trust_level: 'trusted', skill_md: '# PDF', files: ['SKILL.md'],
+    }));
+    const res = await makeClient(fetchImpl).previewHubSkill('anthropics/skills/pdf tools');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/preview?identifier=anthropics%2Fskills%2Fpdf%20tools');
+    expect(must(calls[0]).init?.method).toBe('GET');
+    expect(res).toMatchObject({ name: 'pdf', identifier: 'anthropics/skills/pdf' });
+  });
+
+  it('scanHubSkill GETs with an ENCODED identifier', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ name: 'x', identifier: 'a/b', trust_level: 'trusted', verdict: 'safe', summary: '', policy: 'allow', findings: [] }));
+    await makeClient(fetchImpl).scanHubSkill('anthropics/skills/pdf tools');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/scan?identifier=anthropics%2Fskills%2Fpdf%20tools');
+  });
+
+  it('installHubSkill POSTs {identifier} and returns the action name', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, pid: 1, name: 'skills-install-anthropics-pdf-ab12cd34' }));
+    const res = await makeClient(fetchImpl).installHubSkill('anthropics/skills/pdf');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/install');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ identifier: 'anthropics/skills/pdf' });
+    expect(res.name).toBe('skills-install-anthropics-pdf-ab12cd34');
+  });
+
+  it('uninstallHubSkill POSTs {name} to /api/skills/hub/uninstall', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, name: 'pdf' }));
+    const res = await makeClient(fetchImpl).uninstallHubSkill('pdf');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/uninstall');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'pdf' });
+    expect(res).toEqual({ ok: true, name: 'pdf' });
+  });
+});

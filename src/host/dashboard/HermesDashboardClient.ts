@@ -1,7 +1,7 @@
 import type { Logger } from '../transport/JsonRpcStdio';
 import { extractInjectedDashboardToken } from './servedToken';
 import { httpFailureMessage } from '../../shared/httpFailure';
-import type { McpTestResult, McpCatalogData } from '../../shared/protocol';
+import type { McpTestResult, McpCatalogData, HubPreview, HubScan } from '../../shared/protocol';
 
 /**
  * `HermesDashboardClient` — the THIRD Hermes client channel (W1.5).
@@ -131,8 +131,7 @@ export interface AdoptableDashboardClient extends DashboardClientLike {
  * (`dashboardPanelSources.ts:39-45`).
  *
  * T2 skill-admin members (`createSkill`, `previewHubSkill`, `scanHubSkill`,
- * `installHubSkill`, `uninstallHubSkill`) are NOT part of this interface yet
- * — task B2 adds them here.
+ * `installHubSkill`, `uninstallHubSkill`) added by task B2.
  */
 export interface DashboardAdminClient {
   /** `POST /api/mcp/servers` (`web_server.py:10410-10452`). */
@@ -164,6 +163,16 @@ export interface DashboardAdminClient {
   }): Promise<{ ok: boolean; name: string; background: boolean; action?: string }>;
   /** `GET /api/actions/{name}/status?lines=N` (`:3728-3763`). */
   actionStatus(name: string, lines?: number): Promise<{ running: boolean; exit_code: number | null; lines: string[] }>;
+  /** `POST /api/skills` — validated write path (`:13012-13028`). */
+  createSkill(body: { name: string; content: string; category?: string }): Promise<unknown>;
+  /** `GET /api/skills/hub/preview?identifier=` (`:12025-12087`). */
+  previewHubSkill(identifier: string): Promise<HubPreview>;
+  /** `GET /api/skills/hub/scan?identifier=` (`:12090-12169`). */
+  scanHubSkill(identifier: string): Promise<HubScan>;
+  /** `POST /api/skills/hub/install` body `{identifier}` (`:11762-11794`). */
+  installHubSkill(identifier: string): Promise<{ ok: boolean; name: string }>;
+  /** `POST /api/skills/hub/uninstall` body `{name}` (`:11802-11818`). */
+  uninstallHubSkill(name: string): Promise<{ ok: boolean; name: string }>;
 }
 
 /** Structural check: does this client expose the {@link DashboardAdminClient} admin surface? */
@@ -178,7 +187,12 @@ export function hasDashboardAdmin(c: unknown): c is DashboardAdminClient {
     typeof o.authMcpServer === 'function' &&
     typeof o.listMcpCatalog === 'function' &&
     typeof o.installCatalogEntry === 'function' &&
-    typeof o.actionStatus === 'function'
+    typeof o.actionStatus === 'function' &&
+    typeof o.createSkill === 'function' &&
+    typeof o.previewHubSkill === 'function' &&
+    typeof o.scanHubSkill === 'function' &&
+    typeof o.installHubSkill === 'function' &&
+    typeof o.uninstallHubSkill === 'function'
   );
 }
 
@@ -354,6 +368,31 @@ export class HermesDashboardClient implements AdoptableDashboardClient, Dashboar
   actionStatus(name: string, lines?: number): Promise<{ running: boolean; exit_code: number | null; lines: string[] }> {
     const query = lines !== undefined ? `?lines=${encodeURIComponent(String(lines))}` : '';
     return this.json('GET', `/api/actions/${encodeURIComponent(name)}/status${query}`);
+  }
+
+  createSkill(body: { name: string; content: string; category?: string }): Promise<unknown> {
+    return this.json('POST', '/api/skills', body);
+  }
+
+  previewHubSkill(identifier: string): Promise<HubPreview> {
+    // Query param — encode so an identifier with URL-special chars can't break out.
+    return this.json('GET', `/api/skills/hub/preview?identifier=${encodeURIComponent(identifier)}`, undefined, {
+      timeoutMs: 30_000,
+    });
+  }
+
+  scanHubSkill(identifier: string): Promise<HubScan> {
+    return this.json('GET', `/api/skills/hub/scan?identifier=${encodeURIComponent(identifier)}`, undefined, {
+      timeoutMs: 60_000,
+    });
+  }
+
+  installHubSkill(identifier: string): Promise<{ ok: boolean; name: string }> {
+    return this.json('POST', '/api/skills/hub/install', { identifier });
+  }
+
+  uninstallHubSkill(name: string): Promise<{ ok: boolean; name: string }> {
+    return this.json('POST', '/api/skills/hub/uninstall', { name });
   }
 
   // --- internals -------------------------------------------------------------

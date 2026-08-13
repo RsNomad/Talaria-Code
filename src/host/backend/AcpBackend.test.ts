@@ -17,6 +17,8 @@ import type {
   CheckpointsData,
   ContextRef,
   HostToWebviewMessage,
+  HubPreview,
+  HubScan,
   McpCatalogData,
   McpCatalogEntry,
   McpTestResult,
@@ -7210,6 +7212,52 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
     const next = this.statusSeq.shift();
     if (next) this.lastStatus = next;
     return this.lastStatus;
+  }
+
+  // --- Task B2 harness extension (explicit, cited — features-add-mcp-
+  // skills-architecture.md task B2 adds these 5 members to DashboardAdminClient;
+  // no T2 dispatcher routing exists yet, so these are minimal call-recording
+  // stubs — same idiom as the T1 members above — kept ready for the C-task
+  // that wires skills.create/hubPreview/hubScan/hubInstall/hubUninstall.) ------
+
+  createSkillCalls: Array<{ name: string; content: string; category?: string }> = [];
+  previewHubSkillCalls: string[] = [];
+  scanHubSkillCalls: string[] = [];
+  installHubSkillCalls: string[] = [];
+  uninstallHubSkillCalls: string[] = [];
+  previewHubSkillResult: HubPreview = {
+    name: '', description: '', source: '', identifier: '', trust_level: '', skill_md: '', files: [],
+  };
+  scanHubSkillResult: HubScan = {
+    name: '', identifier: '', source: '', trust_level: '', verdict: 'safe', summary: '', policy: 'allow',
+    policy_reason: '', findings: [], severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+  };
+  installHubSkillResult: { ok: boolean; name: string } = { ok: true, name: '' };
+  uninstallHubSkillResult: { ok: boolean; name: string } = { ok: true, name: '' };
+
+  async createSkill(body: { name: string; content: string; category?: string }): Promise<unknown> {
+    this.createSkillCalls.push(body);
+    return { ok: true };
+  }
+
+  async previewHubSkill(identifier: string): Promise<HubPreview> {
+    this.previewHubSkillCalls.push(identifier);
+    return this.previewHubSkillResult;
+  }
+
+  async scanHubSkill(identifier: string): Promise<HubScan> {
+    this.scanHubSkillCalls.push(identifier);
+    return this.scanHubSkillResult;
+  }
+
+  async installHubSkill(identifier: string): Promise<{ ok: boolean; name: string }> {
+    this.installHubSkillCalls.push(identifier);
+    return this.installHubSkillResult;
+  }
+
+  async uninstallHubSkill(name: string): Promise<{ ok: boolean; name: string }> {
+    this.uninstallHubSkillCalls.push(name);
+    return this.uninstallHubSkillResult;
   }
 }
 
