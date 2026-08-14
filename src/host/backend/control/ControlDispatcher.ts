@@ -26,7 +26,7 @@ import { extractCwd, extractRootId, extractSessionId } from '../../panels/panelS
 import type { DashboardService } from '../../dashboard/HermesDashboardManager';
 import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../../dashboard/HermesDashboardClient';
 import { hasDashboardAdmin } from '../../dashboard/HermesDashboardClient';
-import { hasToggleNameCache } from '../../dashboard/dashboardPanelSources';
+import { hasToggleNameCache, hasHubNameCache } from '../../dashboard/dashboardPanelSources';
 import type { AcpLoadSessionResult } from '../acp/acpClient';
 import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
 import type { SessionController } from '../session/SessionController';
@@ -101,20 +101,24 @@ function isMcpAdminMethod(method: string): method is McpAdminMethod {
 }
 
 /**
- * Task B4 (§5.4): the 4 T2 skills admin methods this task routes —
- * `skills.hubUninstall` (the 5th `TRUST_GATED_METHODS` skills entry) is
- * B5's, deliberately excluded here so it keeps falling through
- * {@link ControlDispatcher.invokeControl}'s default `this.port.dispatch`
- * passthrough (unchanged pre-B4 behaviour) until that task wires it.
+ * Task B4 (create/hubPreview/hubScan/hubInstall) + Task B5 (`skills.
+ * hubUninstall`, the 5th `TRUST_GATED_METHODS` skills entry): the full 5 T2
+ * skills admin methods {@link ControlDispatcher.handleSkillsAdmin} routes.
  */
-type SkillsAdminMethod = 'skills.create' | 'skills.hubPreview' | 'skills.hubScan' | 'skills.hubInstall';
+type SkillsAdminMethod =
+  | 'skills.create'
+  | 'skills.hubPreview'
+  | 'skills.hubScan'
+  | 'skills.hubInstall'
+  | 'skills.hubUninstall';
 
 function isSkillsAdminMethod(method: string): method is SkillsAdminMethod {
   return (
     method === 'skills.create' ||
     method === 'skills.hubPreview' ||
     method === 'skills.hubScan' ||
-    method === 'skills.hubInstall'
+    method === 'skills.hubInstall' ||
+    method === 'skills.hubUninstall'
   );
 }
 
@@ -265,16 +269,17 @@ export class ControlDispatcher {
    * `mcp.setEnabled`, and Task B4's `skills.create`), so two of OUR requests
    * can never interleave two read-modify-write cycles on the same underlying
    * `~/.hermes/config.yaml`. The four {@link TAIL_EXEMPT_MCP_METHODS}
-   * (`mcp.catalog`/`mcp.test`/`mcp.auth`/`mcp.catalogInstall`) and the three
+   * (`mcp.catalog`/`mcp.test`/`mcp.auth`/`mcp.catalogInstall`) and the four
    * {@link SKILLS_TAIL_EXEMPT_METHODS} (`skills.hubPreview`/`skills.hubScan`/
-   * `skills.hubInstall` — Task B4) run OFF this tail instead — none of them
-   * performs a client-bracketable config write of its own (`hubInstall`'s
-   * only write happens server-side, at the END of the install action, same
-   * membership rule as the MCP set) — with same-name/same-identifier
-   * exclusion carried by {@link busyMcpNames}/{@link busySkillIds} instead.
-   * Tail-exempting the up-to-120s `skills.hubInstall` poll is the whole
-   * point: holding the tail for it would freeze every other short config
-   * mutation behind a single slow install — the exact regression this
+   * `skills.hubInstall` — Task B4; `skills.hubUninstall` — Task B5) run OFF
+   * this tail instead — none of them performs a client-bracketable config
+   * write of its own (`hubInstall`/`hubUninstall`'s only write happens
+   * server-side, at the END of the action, same membership rule as the MCP
+   * set) — with same-name/same-identifier exclusion carried by {@link
+   * busyMcpNames}/{@link busySkillIds} instead. Tail-exempting the up-to-120s
+   * `skills.hubInstall`/`skills.hubUninstall` polls is the whole point:
+   * holding the tail for one would freeze every other short config mutation
+   * behind a single slow install/uninstall — the exact regression this
    * mirrors away from.
    */
   private dashboardToggleTail: Promise<unknown> = Promise.resolve();
@@ -326,17 +331,21 @@ export class ControlDispatcher {
   private readonly busyMcpNames = new Map<string, 'auth' | 'install' | 'change'>();
 
   /**
-   * Task B4 (§5.4 "Single-flight per identifier"): the skills-side twin of
-   * {@link busyMcpNames}, keyed by hub `identifier` (a disjoint key space
-   * from `busyMcpNames`'s MCP `name`s — the two maps never need to agree on
-   * a shared key). Only `skills.hubInstall` SETS an entry (kind `'install'`,
-   * the only kind that currently exists — B5 may widen this union when it
-   * adds `skills.hubUninstall`'s own guard); `skills.hubPreview`/
-   * `skills.hubScan` only CHECK (mirrors `mcp.test`'s check-only posture —
-   * see {@link acquireSkillSingleFlight}). `skills.create` has no
-   * `identifier` and never touches this map.
+   * Task B4 (§5.4 "Single-flight per identifier"), widened by Task B5: the
+   * skills-side twin of {@link busyMcpNames}. `skills.hubInstall` SETS an
+   * entry keyed by hub `identifier` (kind `'install'`); `skills.hubUninstall`
+   * SETS an entry keyed by the skill `name` (kind `'uninstall'`) — a
+   * DISJOINT key space from install's identifiers (an identifier always
+   * extends a pinned trusted prefix segment, so it always contains at least
+   * one `/`; a skill `name` never does, S-1 charset), so the two mutation
+   * kinds coexist in one map without ever needing to agree on a shared key —
+   * same reasoning as this map never needing to agree with `busyMcpNames`'s
+   * MCP `name`s. `skills.hubPreview`/`skills.hubScan` only CHECK the
+   * identifier space (mirrors `mcp.test`'s check-only posture — see {@link
+   * acquireSkillSingleFlight}). `skills.create` has no identifier/name key
+   * and never touches this map.
    */
-  private readonly busySkillIds = new Map<string, 'install'>();
+  private readonly busySkillIds = new Map<string, 'install' | 'uninstall'>();
 
   constructor(private readonly port: ControlDispatcherHostPort) {}
 
@@ -409,8 +418,7 @@ export class ControlDispatcher {
     }
 
     // Task B4 (§5.4): the T2 skills admin core — create/hubPreview/hubScan/
-    // hubInstall. `skills.hubUninstall` stays unrouted (falls through to the
-    // default `this.port.dispatch` passthrough below) until B5.
+    // hubInstall. Task B5 adds `skills.hubUninstall` to the same core.
     if (isSkillsAdminMethod(method)) {
       return this.handleSkillsAdmin(method, params);
     }
@@ -997,18 +1005,20 @@ export class ControlDispatcher {
   }
 
   // ---------------------------------------------------------------------
-  // Task B4 (§5.4/§5.5): the T2 skills admin core — mirrors the MCP admin
-  // core immediately above (handleMcpAdmin/acquireMcpSingleFlight/
-  // handleMcpAdminInner/mcpCatalogInstall/pollCatalogInstall/
-  // rejectCatalogInstall) member-for-member, at the skills-specific shape
-  // (identifier-keyed single-flight, 120s poll cap, scan-first double gate).
+  // Task B4 (§5.4/§5.5) + Task B5 (`skills.hubUninstall`): the T2 skills
+  // admin core — mirrors the MCP admin core immediately above
+  // (handleMcpAdmin/acquireMcpSingleFlight/handleMcpAdminInner/
+  // mcpCatalogInstall/pollCatalogInstall/rejectCatalogInstall) member-for-
+  // member, at the skills-specific shape (identifier- or name-keyed single-
+  // flight, 120s poll cap, scan-first double gate for install / hub-
+  // provenance name gate for uninstall).
   // ---------------------------------------------------------------------
 
   /**
    * Task B4, mirroring {@link handleMcpAdmin} exactly (F3 idiom): per-
-   * identifier single-flight acquired SYNCHRONOUSLY (see {@link
+   * identifier/per-name single-flight acquired SYNCHRONOUSLY (see {@link
    * acquireSkillSingleFlight}'s own doc for why), then routed either OFF
-   * {@link dashboardToggleTail} (the three {@link SKILLS_TAIL_EXEMPT_METHODS})
+   * {@link dashboardToggleTail} (the four {@link SKILLS_TAIL_EXEMPT_METHODS})
    * or ON it (`skills.create` — a short `POST /api/skills`, same bucket as
    * `mcp.add`).
    */
@@ -1038,18 +1048,36 @@ export class ControlDispatcher {
   }
 
   /**
-   * Task B4 (§5.4 "Single-flight per identifier"), mirroring {@link
-   * acquireMcpSingleFlight} exactly — see that method's own doc for why the
-   * test-and-set MUST run synchronously, before this call ever joins {@link
-   * dashboardToggleTail}. `skills.create` has no `identifier` (it creates a
-   * NEW skill by `name`, a disjoint key space) and is never guarded here.
-   * `skills.hubPreview`/`skills.hubScan` only CHECK — a preview/scan racing
-   * a same-identifier install is refused, but two concurrent previews/scans
-   * of the SAME identifier never block each other (mirrors `mcp.test`'s
-   * check-only posture). Only `skills.hubInstall` SETS the busy flag.
+   * Task B4 (§5.4 "Single-flight per identifier"), widened by Task B5 for
+   * `skills.hubUninstall` (keyed on the skill `name` — its param is `{name}`,
+   * NOT `{identifier}`; `extractSkillIdentifier` does not apply). Mirrors
+   * {@link acquireMcpSingleFlight} exactly — see that method's own doc for
+   * why the test-and-set MUST run synchronously, before this call ever joins
+   * {@link dashboardToggleTail}. `skills.create` has no `identifier`/`name`
+   * key (it creates a NEW skill by `name`, but that's a create-time payload
+   * field, not a busy-lock key) and is never guarded here.
+   * `skills.hubPreview`/`skills.hubScan` only CHECK the identifier space — a
+   * preview/scan racing a same-identifier install is refused, but two
+   * concurrent previews/scans of the SAME identifier never block each other
+   * (mirrors `mcp.test`'s check-only posture). `skills.hubInstall` SETS the
+   * identifier-keyed busy flag; `skills.hubUninstall` SETS the disjoint
+   * name-keyed one (see {@link busySkillIds}'s own doc for why the two key
+   * spaces never collide).
    */
   private acquireSkillSingleFlight(method: SkillsAdminMethod, params: unknown): (() => void) | undefined {
-    if (method === 'skills.create') return undefined; // no identifier — disjoint key space
+    if (method === 'skills.create') return undefined; // no identifier/name lock key — disjoint from both busy key spaces
+
+    if (method === 'skills.hubUninstall') {
+      const name = extractSkillName(params);
+      if (!name) return undefined; // the real handler rejects with a clearer validation message
+      const busy = this.busySkillIds.get(name);
+      if (busy !== undefined) {
+        throw new Error(`Uninstalling skill "${name}" is already in progress.`);
+      }
+      this.busySkillIds.set(name, 'uninstall');
+      return () => this.busySkillIds.delete(name);
+    }
+
     const identifier = extractSkillIdentifier(params);
     if (!identifier) return undefined; // the real handler rejects with a clearer validation message
     const busy = this.busySkillIds.get(identifier);
@@ -1062,12 +1090,12 @@ export class ControlDispatcher {
   }
 
   /**
-   * Task B4 (§5.4): trust gate (the `TRUST_GATED_METHODS` skills entries
-   * `skills.create`/`skills.hubInstall`) -> the per-method route.
-   * `skills.hubPreview`/`skills.hubScan` are read-only and NOT trust-gated
-   * (§4.7-class read methods), but still run {@link assertSkillIdentifier}
-   * BEFORE resolving a dashboard client at all — a bad/URL identifier never
-   * reaches the network fan-out, read-only or not.
+   * Task B4 (§5.4) + Task B5: trust gate (the `TRUST_GATED_METHODS` skills
+   * entries `skills.create`/`skills.hubInstall`/`skills.hubUninstall`) -> the
+   * per-method route. `skills.hubPreview`/`skills.hubScan` are read-only and
+   * NOT trust-gated (§4.7-class read methods), but still run {@link
+   * assertSkillIdentifier} BEFORE resolving a dashboard client at all — a
+   * bad/URL identifier never reaches the network fan-out, read-only or not.
    */
   private async handleSkillsAdminInner(method: SkillsAdminMethod, params: unknown): Promise<unknown> {
     if (TRUST_GATED_METHODS.has(method) && !this.port.isTrusted()) {
@@ -1091,6 +1119,10 @@ export class ControlDispatcher {
 
     if (method === 'skills.create') {
       return this.skillsCreate(client, params);
+    }
+
+    if (method === 'skills.hubUninstall') {
+      return this.skillsHubUninstall(client, params);
     }
 
     return this.skillsHubInstall(client, params);
@@ -1231,6 +1263,118 @@ export class ControlDispatcher {
       `[AcpBackend] skill install "${name}" did not verify as installed — action tail:\n${tailLines.join('\n')}`,
     );
     throw new Error('Install did not complete — see the Talaria output log.');
+  }
+
+  /**
+   * Task B5 (§3 Layer 5 critic IMPORTANT-2, §5.4 last bullet): the FAIL-
+   * CLOSED hub-provenance name-cache guard for `skills.hubUninstall` —
+   * mirrors {@link requireListedMcpName} exactly, at the skills-specific
+   * shape. An UNFETCHED cache (`lastListedHubNames()` returns `undefined` —
+   * the skills panel was never listed this host session) is a REFUSAL here,
+   * not a skip — same deliberate divergence from the lenient
+   * `toggleDashboardInner` idiom. A single `!hub.has(name)` check covers BOTH
+   * a listed-but-non-hub row (bundled/agent provenance — Hermes never
+   * exposes an uninstall path for those) AND a name outside the last-listed
+   * set entirely: the hub set IS exactly "listed names whose provenance is
+   * hub" ({@link HubNameCache}'s own doc), so there is no separate provenance
+   * check to write.
+   */
+  private requireListedHubSkillName(method: string, name: string | undefined): asserts name is string {
+    if (!name) {
+      throw new Error(`'${method}' requires a { name } payload.`);
+    }
+    const source = this.port.panelSources.get('skills');
+    const hub = hasHubNameCache(source) ? source.lastListedHubNames() : undefined;
+    if (hub === undefined) {
+      throw new Error(`Refusing '${method}': the skills panel has not been listed yet — open it first.`);
+    }
+    if (!hub.has(name)) {
+      throw new Error(`${method}: '${name}' is not a hub-installed skill in the last-listed skills.`);
+    }
+  }
+
+  /**
+   * Task B5 (§5.4 last bullet, §5.5): {@link requireListedHubSkillName}
+   * (fail-closed hub-provenance gate, BEFORE any modal) -> the §5.5 uninstall
+   * modal -> `uninstallHubSkill` (its `{ok, name}` result's `name` is the
+   * ACTION id to poll — same shape as `installHubSkill`, NOT the skill name)
+   * -> {@link pollSkillUninstall} (ABSENCE ground-truth, §3 Layer 6).
+   * Single-flight per NAME is enforced by the CALLER ({@link
+   * handleSkillsAdmin}'s synchronous {@link acquireSkillSingleFlight}) — this
+   * method never re-checks it.
+   */
+  private async skillsHubUninstall(
+    client: DashboardAdminClient & DashboardClientLike,
+    params: unknown,
+  ): Promise<{ ok: true; name: string }> {
+    const name = extractSkillName(params);
+    this.requireListedHubSkillName('skills.hubUninstall', name);
+
+    const message = `Remove skill "${name}"?`;
+    const lines = ['Deletes its files from ~/.hermes/skills.'];
+    const described = composeSkillsModalDetail(message, lines);
+    if (!described.ok) {
+      throw new Error(described.reason);
+    }
+    const confirmed = await this.port.confirm(described.message, described.detail, 'Remove skill');
+    if (!confirmed) {
+      throw new Error(`Removing skill "${name}" was declined or cancelled.`);
+    }
+
+    const result = await client.uninstallHubSkill(name);
+    return this.pollSkillUninstall(client, name, result.name);
+  }
+
+  /**
+   * Task B5 (§5.4 last bullet, §3 Layer 6): the ABSENCE mirror of {@link
+   * pollSkillInstall} — identical 1s -> 2s backoff cadence and the SAME
+   * {@link SKILLS_INSTALL_POLL_CAP_MS} cap (an uninstall never clones/builds
+   * either — no reason to invent a different ceiling). On `running:false`,
+   * GROUND-TRUTH verify: a FRESH `listSkills()` must NOT contain a row named
+   * `skillName` — the mirror image of the install path's presence check. On
+   * a timeout or the row still being present, the action's tail `lines` go
+   * to the output-channel logger ONLY; the thrown message never carries them
+   * (Invariant #3).
+   */
+  private async pollSkillUninstall(
+    client: DashboardAdminClient & DashboardClientLike,
+    skillName: string,
+    action: string,
+  ): Promise<{ ok: true; name: string }> {
+    const deadline = Date.now() + SKILLS_INSTALL_POLL_CAP_MS;
+    let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
+    let lastLines: string[] = [];
+    for (;;) {
+      const status = await client.actionStatus(action);
+      lastLines = status.lines;
+      if (!status.running) break;
+      if (Date.now() >= deadline) {
+        this.rejectSkillUninstall(skillName, lastLines);
+      }
+      await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
+      delay = BACKGROUND_POLL_STEP_DELAY_MS;
+    }
+
+    const rows = await client.listSkills();
+    const stillPresent = rows.some((row) => row.name === skillName);
+    if (stillPresent) {
+      this.rejectSkillUninstall(skillName, lastLines);
+    }
+
+    await this.fetchPanelData('skills');
+    return { ok: true, name: skillName };
+  }
+
+  /**
+   * Task B5 (§3 Layer 6): the shared timeout/ground-truth-failure refusal for
+   * uninstall — mirrors {@link rejectSkillInstall} exactly. `tailLines` goes
+   * to the output-channel logger only — never into the thrown message.
+   */
+  private rejectSkillUninstall(name: string, tailLines: string[]): never {
+    this.port.logger?.append(
+      `[AcpBackend] skill uninstall "${name}" did not verify as removed — action tail:\n${tailLines.join('\n')}`,
+    );
+    throw new Error('Uninstall did not complete — see the Talaria output log.');
   }
 
   /**
@@ -1590,6 +1734,13 @@ function extractSkillIdentifier(params: unknown): string | undefined {
   return typeof p.identifier === 'string' ? p.identifier : undefined;
 }
 
+/** Task B5: pull `{name}` out of a `skills.hubUninstall` payload (mirrors {@link extractMcpName}). */
+function extractSkillName(params: unknown): string | undefined {
+  if (!params || typeof params !== 'object') return undefined;
+  const p = params as { name?: unknown };
+  return typeof p.name === 'string' ? p.name : undefined;
+}
+
 /**
  * Task B4 (§5.5), mirroring `mcpEntryValidation.ts`'s private `composeModal`
  * using the SAME exported primitives ({@link stripModalControls}, {@link
@@ -1700,25 +1851,30 @@ const TAIL_EXEMPT_MCP_METHODS: ReadonlySet<McpAdminMethod> = new Set([
 ]);
 
 /**
- * Task B4: the skills-side twin of {@link TAIL_EXEMPT_MCP_METHODS}, same
- * membership rule (no client-bracketable config.yaml write of its own):
- *  - 'skills.hubPreview' read-only (`GET /api/skills/hub/preview`)
- *  - 'skills.hubScan'    read-only (`GET /api/skills/hub/scan`)
- *  - 'skills.hubInstall' only write = server-side, at END of the (up to
- *                        120s) install action (`POST /api/skills/hub/install`
- *                        + `skills_hub.py:634-713`) — exempting this is the
- *                        whole point (§5.4): holding the tail for a slow
- *                        install would freeze every other short config
- *                        mutation behind it.
+ * Task B4 + Task B5 (`skills.hubUninstall`): the skills-side twin of
+ * {@link TAIL_EXEMPT_MCP_METHODS}, same membership rule (no client-
+ * bracketable config.yaml write of its own):
+ *  - 'skills.hubPreview'   read-only (`GET /api/skills/hub/preview`)
+ *  - 'skills.hubScan'      read-only (`GET /api/skills/hub/scan`)
+ *  - 'skills.hubInstall'   only write = server-side, at END of the (up to
+ *                          120s) install action (`POST /api/skills/hub/install`
+ *                          + `skills_hub.py:634-713`) — exempting this is the
+ *                          whole point (§5.4): holding the tail for a slow
+ *                          install would freeze every other short config
+ *                          mutation behind it.
+ *  - 'skills.hubUninstall' same reasoning as `hubInstall`, mirrored: only
+ *                          write = server-side, at END of the (up to 120s)
+ *                          uninstall action (`POST /api/skills/hub/uninstall`).
  * `skills.create` (a short, synchronous `POST /api/skills` write) is
  * deliberately NOT listed — same bucket as `mcp.add`, rides the tail.
- * Same-identifier exclusion for the exempt methods is carried by
+ * Same-identifier/same-name exclusion for the exempt methods is carried by
  * {@link busySkillIds}.
  */
 const SKILLS_TAIL_EXEMPT_METHODS: ReadonlySet<SkillsAdminMethod> = new Set([
   'skills.hubPreview',
   'skills.hubScan',
   'skills.hubInstall',
+  'skills.hubUninstall',
 ]);
 
 /** Task A6: a plain `setTimeout` wait — {@link pollCatalogInstall}'s backoff step. Real timers in production; `vi.useFakeTimers()` in tests. */

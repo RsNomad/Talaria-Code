@@ -44,10 +44,42 @@ export function hasToggleNameCache(source: unknown): source is ToggleNameCache {
   );
 }
 
+/**
+ * Task B5 (features-add-mcp-skills-architecture.md §5.4 last bullet, §3
+ * Layer 5): the hub-provenance SUBSET of the skills panel's last-listed
+ * names, so `ControlDispatcher`'s `skills.hubUninstall` name gate
+ * (`requireListedHubSkillName`, the `requireListedMcpName` mirror) can refuse
+ * a listed-but-non-hub row (bundled/agent provenance) in the SAME check as an
+ * unknown name — the hub set IS exactly "listed names whose provenance is
+ * hub", so `!hub.has(name)` alone covers both cases. `undefined` = never
+ * fetched = FAIL-CLOSED downstream, same rule as {@link ToggleNameCache}.
+ */
+export interface HubNameCache {
+  /** Hub-provenance names seen in the last successful list fetch, or `undefined` if never fetched. */
+  lastListedHubNames(): ReadonlySet<string> | undefined;
+}
+
+/** Structural check: does this panel source cache its last-listed hub-provenance names? */
+export function hasHubNameCache(source: unknown): source is HubNameCache {
+  return (
+    typeof source === 'object' &&
+    source !== null &&
+    typeof (source as HubNameCache).lastListedHubNames === 'function'
+  );
+}
+
 /** `GET /api/skills` → `SkillsData` (`SkillsPanel.tsx`). */
-export class DashboardSkillsPanelSource implements PanelSource<'skills'>, ToggleNameCache {
+export class DashboardSkillsPanelSource implements PanelSource<'skills'>, ToggleNameCache, HubNameCache {
   /** Skill names from the last successful `GET /api/skills` (the toggle key set). */
   private knownNames: Set<string> | undefined;
+  /**
+   * Task B5: the hub-provenance SUBSET of {@link knownNames} from that SAME
+   * last successful fetch — set alongside it, never independently, so the
+   * two caches can never disagree about "was this fetched" (both `undefined`
+   * until the first successful `fetch()`, both updated together, only on a
+   * fully-successful fetch — never a partial one).
+   */
+  private knownHubNames: Set<string> | undefined;
 
   constructor(private readonly ensure: () => Promise<DashboardClientLike>) {}
 
@@ -55,11 +87,16 @@ export class DashboardSkillsPanelSource implements PanelSource<'skills'>, Toggle
     const client = await this.ensure();
     const raw = await client.listSkills();
     this.knownNames = new Set(raw.map((s) => s.name));
+    this.knownHubNames = new Set(raw.filter((s) => s.provenance === 'hub').map((s) => s.name));
     return { data: reshapeDashboardSkills(raw) };
   }
 
   lastListedNames(): ReadonlySet<string> | undefined {
     return this.knownNames;
+  }
+
+  lastListedHubNames(): ReadonlySet<string> | undefined {
+    return this.knownHubNames;
   }
 }
 

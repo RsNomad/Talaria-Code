@@ -7245,6 +7245,13 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
    * in-flight call.
    */
   hubInstallDeferred: Promise<{ ok: boolean; name: string }> | undefined;
+  /**
+   * Task B5 harness extension (mirrors {@link hubInstallDeferred}'s exact
+   * idiom): when set, `uninstallHubSkill` returns THIS promise verbatim
+   * (ignoring `uninstallHubSkillResult`), giving the `skills.hubUninstall`
+   * single-flight regression test a controllable in-flight call.
+   */
+  uninstallHubSkillDeferred: Promise<{ ok: boolean; name: string }> | undefined;
 
   async createSkill(body: { name: string; content: string; category?: string }): Promise<unknown> {
     this.createCalls.push(body);
@@ -7269,6 +7276,7 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
 
   async uninstallHubSkill(name: string): Promise<{ ok: boolean; name: string }> {
     this.uninstallHubSkillCalls.push(name);
+    if (this.uninstallHubSkillDeferred) return this.uninstallHubSkillDeferred;
     return this.uninstallHubSkillResult;
   }
 }
@@ -8573,6 +8581,239 @@ describe('ControlDispatcher — Task B4 skills concurrency (F3 mirror)', () => {
       expect(order).toEqual(['create', 'toggle']);
       expect(client.createCalls).toEqual([{ name: 'demo', content: '---\nname: demo\n---\n\nx' }]);
       expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: true }]);
+    },
+    1000,
+  );
+});
+
+// =============================================================================
+// Task B5 (features-add-mcp-skills-architecture.md §5.4 last bullet, §5.5
+// third bullet): ControlDispatcher's `skills.hubUninstall` flow — the
+// fail-closed hub-provenance name gate (mirrors `requireListedMcpName`), the
+// §5.5 uninstall modal, and ABSENCE ground-truth verification (the mirror
+// image of `skills.hubInstall`'s presence check).
+// =============================================================================
+describe('ControlDispatcher — Task B5 skills.hubUninstall (§5.4 last bullet, §5.5)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('skills.hubUninstall refuses non-hub rows, names outside the last list, AND an unfetched cache (fail-closed)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+
+    // (1) no prior skills panel fetch => lastListedHubNames() undefined =>
+    // FAIL-CLOSED refusal, before any modal — same rule as
+    // requireListedMcpName's IMPORTANT-2 divergence from the lenient
+    // toggleDashboardInner idiom.
+    await expect(backend.invokeControl('skills.hubUninstall', { name: 'pdf' })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.uninstallHubSkillCalls).toEqual([]);
+
+    // (2) after a fetch listing a BUNDLED 'tdd' (FakeDashboardClient's
+    // default row, no hub rows at all) — the provenance guard refuses even
+    // though 'tdd' IS in the panel's full last-listed set.
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches {'tdd'} (bundled) — no hub names
+    await expect(backend.invokeControl('skills.hubUninstall', { name: 'tdd' })).rejects.toThrow(
+      /not a hub-installed/i,
+    );
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.uninstallHubSkillCalls).toEqual([]);
+
+    // (3) an unknown name — never listed at all — is refused the same way.
+    await expect(backend.invokeControl('skills.hubUninstall', { name: 'does-not-exist' })).rejects.toThrow(
+      /not a hub-installed/i,
+    );
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.uninstallHubSkillCalls).toEqual([]);
+  });
+
+  it('skills.hubUninstall happy path: modal -> uninstall -> poll -> ABSENCE re-check -> refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.uninstallHubSkillResult = { ok: true, name: 'skills-uninstall-pdf-ab12cd34' };
+    client.statusSeq = [
+      { running: true, exit_code: null, lines: [] },
+      { running: false, exit_code: 0, lines: ['Removed: pdf'] },
+    ];
+    // Ground truth for the ABSENCE re-check: the FRESH listSkills() call the
+    // poller makes after `running:false` must no longer contain 'pdf'.
+    client.listSkillsResult = [];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Remove skill');
+
+    const resultPromise = backend.invokeControl('skills.hubUninstall', { name: 'pdf' });
+    // First actionStatus sees running:true and sleeps (1s) before the second
+    // call — same cadence as pollSkillInstall (1s -> 2s backoff).
+    await vi.advanceTimersByTimeAsync(1_000);
+    const res = await resultPromise;
+
+    expect(res).toMatchObject({ ok: true, name: 'pdf' });
+    expect(client.uninstallHubSkillCalls).toEqual(['pdf']);
+    expect(client.actionStatusCalls).toEqual([
+      'skills-uninstall-pdf-ab12cd34',
+      'skills-uninstall-pdf-ab12cd34',
+    ]);
+  });
+
+  it('skills.hubUninstall: still-present after the action rejects generically; tail goes to the logger only', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.uninstallHubSkillResult = { ok: true, name: 'skills-uninstall-pdf-ab12cd34' };
+    client.statusSeq = [{ running: false, exit_code: 0, lines: ['uninstall failed: permission denied'] }];
+    // 'pdf' is STILL present after the action — the removal never actually
+    // took effect server-side, so the ABSENCE re-check must fail closed.
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Remove skill');
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubUninstall', { name: 'pdf' });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toBe('Uninstall did not complete — see the Talaria output log.');
+    expect(message).not.toContain('permission denied'); // the tail must NEVER leak into the reject message
+    expect(logs.some((l) => l.includes('uninstall failed: permission denied'))).toBe(true); // ...only into the output-channel logger
+  });
+
+  it('skills.hubUninstall: untrusted workspace is refused before the name gate or any modal', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      await expect(backend.invokeControl('skills.hubUninstall', { name: 'pdf' })).rejects.toThrow(/trust/i);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(client.uninstallHubSkillCalls).toEqual([]);
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('skills.hubUninstall modal copy is byte-exact (§5.5)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+    client.uninstallHubSkillResult = { ok: true, name: 'skills-uninstall-pdf-ab12cd34' };
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }];
+    client.listSkillsResult = []; // absence re-check passes
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Remove skill');
+
+    await backend.invokeControl('skills.hubUninstall', { name: 'pdf' });
+
+    const [message, options, label] = mockShowWarningMessage.mock.calls[0] as [string, { modal: boolean; detail: string }, string];
+    expect(message).toBe('Remove skill "pdf"?');
+    expect(options.detail).toBe('Deletes its files from ~/.hermes/skills.');
+    expect(label).toBe('Remove skill');
+  });
+});
+
+// =============================================================================
+// Task B5 (§5.4 last bullet "Single-flight" + F3/B4 mirror): the skills
+// concurrency machinery widened for uninstall — `busySkillIds` now also keys
+// `skills.hubUninstall` on the skill NAME (a disjoint key space from
+// `skills.hubInstall`'s identifier keys — identifiers always contain a `/`
+// segment separator per the trusted-prefix allowlist, skill names never do).
+// =============================================================================
+describe('ControlDispatcher — Task B5 skills.hubUninstall concurrency (F3/B4 mirror)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('B5-SF: skills.hubUninstall is single-flight per NAME — a concurrent same-name call is refused, a different name is not', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [
+      { name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' },
+      { name: 'other', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' },
+    ];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub names {'pdf','other'}
+
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // both pollers see running:false on their first check — no timer advance needed
+    client.listSkillsResult = []; // absence ground truth for both names after either action
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.uninstallHubSkillDeferred = new Promise((res) => {
+      release = res;
+    }); // FakeAdmin: uninstallHubSkill returns this when set
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Remove skill'); // every modal this test opens is confirmed
+
+    const first = backend.invokeControl('skills.hubUninstall', { name: 'pdf' });
+
+    // The guard is a synchronous test-and-set BEFORE `first` ever joins any
+    // queue (`handleSkillsAdmin`'s own doc, mirroring `handleMcpAdmin`'s) —
+    // the refusal below does not depend on how far `first`'s modal/uninstall
+    // chain has progressed.
+    await expect(
+      backend.invokeControl('skills.hubUninstall', { name: 'pdf' }),
+    ).rejects.toThrow(/already in progress/i);
+
+    // A DIFFERENT name is never refused by the SAME-name guard — accepted
+    // and runs CONCURRENTLY with 'pdf' (skills.hubUninstall is tail-exempt,
+    // so it never queues behind it on `dashboardToggleTail` either).
+    const other = backend.invokeControl('skills.hubUninstall', { name: 'other' });
+
+    release({ ok: true, name: 'skills-uninstall-action-1' });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'pdf' });
+    await expect(other).resolves.toMatchObject({ ok: true, name: 'other' });
+
+    // The refused re-click reached NEITHER the modal NOR uninstallHubSkill a
+    // second time: exactly one modal + one uninstall call per name, never a
+    // third of either.
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+    expect(client.uninstallHubSkillCalls).toEqual(['pdf', 'other']);
+  });
+
+  it(
+    'skills.toggle proceeds while skills.hubUninstall is in flight (F3 tail-exemption mirror for skills)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+      await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+      let release!: (v: { ok: boolean; name: string }) => void;
+      client.uninstallHubSkillDeferred = new Promise((res) => {
+        release = res;
+      });
+
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockResolvedValueOnce('Remove skill');
+
+      const uninstall = backend.invokeControl('skills.hubUninstall', { name: 'pdf' }); // do NOT await — must still be pending below
+
+      await backend.invokeControl('skills.toggle', { name: 'pdf', enabled: false });
+
+      expect(client.toggleSkillCalls).toEqual([{ name: 'pdf', enabled: false }]);
+      expect(client.uninstallHubSkillCalls).toEqual(['pdf']);
+
+      client.statusSeq = [{ running: false, exit_code: 0, lines: [] }];
+      client.listSkillsResult = [];
+      release({ ok: true, name: 'skills-uninstall-action-2' });
+      await uninstall;
     },
     1000,
   );
