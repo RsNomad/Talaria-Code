@@ -251,6 +251,41 @@ describe('A7: MCP panel row actions + Add server form', () => {
   });
 });
 
+/* Task A7-M2: DOM-level rollback-on-rejection parity test — the McpPanel
+ * analogue of `SkillsPanel.dom.test.tsx`'s "a rejected toggle rolls the
+ * switch back AND announces the reason through a live region" test. Both
+ * panels drive their Toggle through the SAME shared `useToggle` hook and
+ * render the SAME `Not saved: {reason}` `LiveRegion` grammar (see
+ * `McpPanel.tsx`'s "V-11 (TOGGLE-HONESTY)" comment right above its per-row
+ * `LiveRegion`) — this closes the coverage-parity gap between the two
+ * panels' DOM suites for that shared behavior. */
+describe('A7-M2: MCP panel Toggle rollback-on-rejection parity', () => {
+  it('a rejected onSetEnabled rolls the switch back AND announces the reason through a live region', async () => {
+    const user = userEvent.setup();
+    render(
+      <McpPanel
+        data={mcpData()}
+        onReload={async () => ({ status: 'reloaded' })}
+        {...noopMcpAdminProps()}
+        onSetEnabled={() => Promise.reject(new Error('dashboard unreachable'))}
+      />,
+    );
+
+    const toggle = screen.getByRole('switch', { name: /Enable filesystem/i });
+    expect(toggle).toHaveAttribute('aria-checked', 'true');
+
+    await user.click(toggle);
+
+    // Today (pre-fix, mirroring SkillsPanel's own comment) this text would
+    // never appear anywhere if the rollback were silent.
+    expect(await screen.findByText('Not saved: dashboard unreachable')).toBeInTheDocument();
+    expect(toggle, 'the switch rolls back to the live server value on rejection').toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
+  });
+});
+
 /* Task A8 (§4.7/§4.8): the Catalog disclosure + the per-row Login button.
  * Same harness as A7 above. */
 describe('A8: MCP panel Catalog disclosure + Login button', () => {
