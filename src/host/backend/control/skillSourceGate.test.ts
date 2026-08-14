@@ -64,6 +64,16 @@ describe('assertSkillIdentifier', () => {
     'anthropics/skills/../x',
     'anthropics/skills',
     'official',
+    // Segment-anchored prefix guards (B3 review Important): each of these
+    // is charset-clean and would be WRONGLY accepted by a naive
+    // `id.startsWith(prefix)` refactor or a case-insensitive segment
+    // compare, but MUST be refused by the exact per-segment equality match
+    // (skillSourceGate.ts:91-96). Pin them so that regression fails the
+    // suite — mutation-proven non-vacuous against both bypass forms.
+    'officialX/evil', // prefix is a substring of the first segment, not the whole segment
+    'official-evil/x', // ditto, hyphenated
+    'anthropics/skillsX/y', // second prefix segment is a substring, not equal
+    'OFFICIAL/x', // case flip — exact match is case-sensitive
     '',
   ])('refuses %s fail-closed', (id) => {
     const r = assertSkillIdentifier(id);
