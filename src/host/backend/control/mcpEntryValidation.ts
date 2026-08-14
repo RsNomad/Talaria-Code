@@ -231,7 +231,16 @@ type ModalDescription = { ok: true; message: string; detail: string } | { ok: fa
 
 function composeModal(message: string, lines: string[]): ModalDescription {
   const strippedMessage = stripModalControls(message);
-  const detail = stripModalControls(lines.join('\n\n'));
+  // Strip control bytes from each line's CONTENT individually, THEN join with
+  // the trusted `\n\n` paragraph separator. Stripping after the join would be
+  // a bug: `stripModalControls` removes `\x00-\x1f` (which includes `\n`/`\r`)
+  // and the Unicode line separators U+2028/U+2029, so joining-then-stripping
+  // erases the very separators the join added, collapsing the disclosure into
+  // one run-on line. Per-line stripping keeps the structural breaks (added by
+  // trusted code, never passed back through the strip) while still neutralizing
+  // any control byte -- including an injected paragraph break -- inside an
+  // untrusted field, so no field value can forge an extra modal paragraph.
+  const detail = lines.map(stripModalControls).join('\n\n');
   if (detail.length > MODAL_DETAIL_MAX) {
     return { ok: false, reason: `The details for this action are too large to review in a dialog.` };
   }

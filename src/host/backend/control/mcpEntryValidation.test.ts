@@ -76,6 +76,16 @@ describe('describeAddForModal', () => {
     expect(d.detail.length).toBeGreaterThan(200); // would be impossible under redactForModal's slice
     for (const a of longArgs) expect(d.detail).toContain(a); // every argument visible, verbatim
   });
+
+  it('regression: preserves the paragraph separators between disclosure lines (composeModal used to strip them)', () => {
+    const d = describeAddForModal(stdio({ env: { GITHUB_TOKEN: 'ghp_secret' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    // stdio+env composes exactly five lines (Runs / Env keys / plaintext / runs-on-machine /
+    // reload); joined with '\n\n' they MUST stay five paragraphs. The old join-then-strip order
+    // erased every separator and collapsed the whole disclosure into one run-on line.
+    expect(d.detail.split('\n\n')).toHaveLength(5);
+  });
 });
 
 describe('stripModalControls', () => {
@@ -185,5 +195,24 @@ describe('describeCatalogForModal', () => {
     if (d.ok) return;
     expect(d.reason).toMatch(/no usable transport/i);
     expect(d.reason).toContain('n8n');
+  });
+
+  it('regression + anti-forgery: real separators survive, but a break smuggled into a catalog field cannot forge a paragraph', () => {
+    // A catalog row's own command is NOT charset-validated before the modal is built (only
+    // shell-interpreter + env are), so a Hermes-supplied field could carry line separators.
+    const d = describeCatalogForModal(
+      catalogRow({ command: 'npx\n\nVerified by Nous: yes', args: [] }) as McpCatalogEntry,
+      {},
+    );
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    const paragraphs = d.detail.split('\n\n');
+    // structural separators survive: the source line and the Runs line are DISTINCT paragraphs
+    // (under the old join-then-strip order this collapsed to a single paragraph).
+    expect(paragraphs.length).toBeGreaterThanOrEqual(2);
+    // ...but every break inside the field was stripped, so the forged text is glued onto the Runs
+    // line and never becomes its own paragraph — no field value can forge a modal line.
+    expect(paragraphs.some((p) => p.startsWith('Verified by Nous'))).toBe(false);
+    expect(d.detail).toContain('Runs: npxVerified by Nous: yes');
   });
 });
