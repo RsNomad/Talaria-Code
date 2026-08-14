@@ -13,6 +13,7 @@ import type {
   McpCatalogEntry,
   McpCatalogInstallResult,
   McpTestResult,
+  HubInstallResult,
 } from '../../../shared/protocol';
 import { CONTROL_METHODS, makePanelData } from '../../../shared/protocol';
 import type { RestoreResult } from '../../checkpoints/CheckpointTracker';
@@ -23,14 +24,24 @@ import type { Logger } from '../../transport/JsonRpcStdio';
 import type { PanelSourceRegistry } from '../../panels/PanelSourceRegistry';
 import { extractCwd, extractRootId, extractSessionId } from '../../panels/panelSources';
 import type { DashboardService } from '../../dashboard/HermesDashboardManager';
-import type { DashboardAdminClient, DashboardToggleResult } from '../../dashboard/HermesDashboardClient';
+import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../../dashboard/HermesDashboardClient';
 import { hasDashboardAdmin } from '../../dashboard/HermesDashboardClient';
 import { hasToggleNameCache } from '../../dashboard/dashboardPanelSources';
 import type { AcpLoadSessionResult } from '../acp/acpClient';
 import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
 import type { SessionController } from '../session/SessionController';
 import type { SessionRegistry } from '../session/SessionRegistry';
-import { validateMcpAdd, describeAddForModal, stripModalControls, validateCatalogInstall, describeCatalogForModal, RELOAD_LINE } from './mcpEntryValidation';
+import {
+  validateMcpAdd,
+  describeAddForModal,
+  stripModalControls,
+  validateCatalogInstall,
+  describeCatalogForModal,
+  RELOAD_LINE,
+  MODAL_DETAIL_MAX,
+} from './mcpEntryValidation';
+import { assertSkillIdentifier, validateSkillCreate, TRUSTED_SKILL_PREFIXES } from './skillSourceGate';
+import { redactForModal } from '../../setup/SetupController';
 
 /**
  * Task A5 (features-add-mcp-skills-architecture.md §3 Layer 5, §4.5 item 1):
@@ -86,6 +97,24 @@ function isMcpAdminMethod(method: string): method is McpAdminMethod {
     method === 'mcp.auth' ||
     method === 'mcp.catalog' ||
     method === 'mcp.catalogInstall'
+  );
+}
+
+/**
+ * Task B4 (§5.4): the 4 T2 skills admin methods this task routes —
+ * `skills.hubUninstall` (the 5th `TRUST_GATED_METHODS` skills entry) is
+ * B5's, deliberately excluded here so it keeps falling through
+ * {@link ControlDispatcher.invokeControl}'s default `this.port.dispatch`
+ * passthrough (unchanged pre-B4 behaviour) until that task wires it.
+ */
+type SkillsAdminMethod = 'skills.create' | 'skills.hubPreview' | 'skills.hubScan' | 'skills.hubInstall';
+
+function isSkillsAdminMethod(method: string): method is SkillsAdminMethod {
+  return (
+    method === 'skills.create' ||
+    method === 'skills.hubPreview' ||
+    method === 'skills.hubScan' ||
+    method === 'skills.hubInstall'
   );
 }
 
@@ -233,12 +262,20 @@ export class ControlDispatcher {
    * every dashboard-mutating control method; F3 NARROWED that again — this
    * tail now serializes every SHORT config-mutating method only
    * (`skills.toggle`/`toolsets.toggle`/`mcp.add`/`mcp.remove`/
-   * `mcp.setEnabled`, and A6/B4/B5's `skills.*`), so two of OUR requests can
-   * never interleave two read-modify-write cycles on the same underlying
-   * `~/.hermes/config.yaml`. The four `TAIL_EXEMPT_MCP_METHODS`
-   * (`mcp.catalog`/`mcp.test`/`mcp.auth`/`mcp.catalogInstall`) run OFF this
-   * tail instead — none of them performs a client-bracketable config write —
-   * with same-name exclusion carried by {@link busyMcpNames} instead.
+   * `mcp.setEnabled`, and Task B4's `skills.create`), so two of OUR requests
+   * can never interleave two read-modify-write cycles on the same underlying
+   * `~/.hermes/config.yaml`. The four {@link TAIL_EXEMPT_MCP_METHODS}
+   * (`mcp.catalog`/`mcp.test`/`mcp.auth`/`mcp.catalogInstall`) and the three
+   * {@link SKILLS_TAIL_EXEMPT_METHODS} (`skills.hubPreview`/`skills.hubScan`/
+   * `skills.hubInstall` — Task B4) run OFF this tail instead — none of them
+   * performs a client-bracketable config write of its own (`hubInstall`'s
+   * only write happens server-side, at the END of the install action, same
+   * membership rule as the MCP set) — with same-name/same-identifier
+   * exclusion carried by {@link busyMcpNames}/{@link busySkillIds} instead.
+   * Tail-exempting the up-to-120s `skills.hubInstall` poll is the whole
+   * point: holding the tail for it would freeze every other short config
+   * mutation behind a single slow install — the exact regression this
+   * mirrors away from.
    */
   private dashboardToggleTail: Promise<unknown> = Promise.resolve();
 
@@ -287,6 +324,19 @@ export class ControlDispatcher {
    * can't be checked inside the queued handler).
    */
   private readonly busyMcpNames = new Map<string, 'auth' | 'install' | 'change'>();
+
+  /**
+   * Task B4 (§5.4 "Single-flight per identifier"): the skills-side twin of
+   * {@link busyMcpNames}, keyed by hub `identifier` (a disjoint key space
+   * from `busyMcpNames`'s MCP `name`s — the two maps never need to agree on
+   * a shared key). Only `skills.hubInstall` SETS an entry (kind `'install'`,
+   * the only kind that currently exists — B5 may widen this union when it
+   * adds `skills.hubUninstall`'s own guard); `skills.hubPreview`/
+   * `skills.hubScan` only CHECK (mirrors `mcp.test`'s check-only posture —
+   * see {@link acquireSkillSingleFlight}). `skills.create` has no
+   * `identifier` and never touches this map.
+   */
+  private readonly busySkillIds = new Map<string, 'install'>();
 
   constructor(private readonly port: ControlDispatcherHostPort) {}
 
@@ -356,6 +406,13 @@ export class ControlDispatcher {
     // add/remove/setEnabled/test/auth (A5) plus catalog/catalogInstall (A6).
     if (isMcpAdminMethod(method)) {
       return this.handleMcpAdmin(method, params);
+    }
+
+    // Task B4 (§5.4): the T2 skills admin core — create/hubPreview/hubScan/
+    // hubInstall. `skills.hubUninstall` stays unrouted (falls through to the
+    // default `this.port.dispatch` passthrough below) until B5.
+    if (isSkillsAdminMethod(method)) {
+      return this.handleSkillsAdmin(method, params);
     }
 
     if (method === 'reload.mcp') {
@@ -648,7 +705,7 @@ export class ControlDispatcher {
       throw new Error(`Refusing '${method}': the workspace is not trusted — trust this workspace to manage MCP servers.`);
     }
 
-    const client = await this.resolveMcpAdminClient(method);
+    const client = await this.resolveDashboardAdminClient(method);
 
     if (method === 'mcp.catalog') {
       return this.mcpCatalog(client);
@@ -685,19 +742,28 @@ export class ControlDispatcher {
   }
 
   /**
-   * Task A5 (§4.5 item 2): `dashboard.ensure()` then the `hasDashboardAdmin`
-   * structural narrowing (the `hasToggleNameCache` idiom) — a dashboard
-   * client without the T1 admin surface (or no dashboard at all) fails
-   * closed rather than silently no-op-ing.
+   * Task A5 (§4.5 item 2), widened by Task B4: `dashboard.ensure()` then the
+   * `hasDashboardAdmin` structural narrowing (the `hasToggleNameCache`
+   * idiom) — a dashboard client without the full T1+T2 admin surface (or no
+   * dashboard at all) fails closed rather than silently no-op-ing. The
+   * return type is intersected with `DashboardClientLike` (NOT re-declared
+   * on `DashboardAdminClient` itself — `HermesDashboardClient.ts` is
+   * B2-owned, untouched here): `client` above is typed `DashboardClientLike`
+   * BEFORE the `hasDashboardAdmin` guard, so TypeScript's own type-predicate
+   * narrowing already widens it to `DashboardClientLike & DashboardAdminClient`
+   * inside this function — this signature just carries that same width to
+   * every caller, so Task B4's `skills.hubInstall` ground-truth `listSkills()`
+   * re-check (a `DashboardClientLike` member) is reachable off the SAME
+   * resolved client the T1 MCP methods use.
    */
-  private async resolveMcpAdminClient(method: string): Promise<DashboardAdminClient> {
+  private async resolveDashboardAdminClient(method: string): Promise<DashboardAdminClient & DashboardClientLike> {
     const dashboard = this.port.getDashboard();
     if (!dashboard) {
       throw new Error(`Refusing '${method}': the Hermes dashboard channel is not configured.`);
     }
     const client = await dashboard.ensure();
     if (!hasDashboardAdmin(client)) {
-      throw new Error(`Refusing '${method}': the dashboard client does not support MCP admin actions.`);
+      throw new Error(`Refusing '${method}': the dashboard client does not support admin actions.`);
     }
     return client;
   }
@@ -841,7 +907,7 @@ export class ControlDispatcher {
     action: string,
   ): Promise<McpCatalogInstallResult> {
     const deadline = Date.now() + CATALOG_POLL_CAP_MS;
-    let delay = CATALOG_POLL_FIRST_DELAY_MS;
+    let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
     let lastLines: string[] = [];
     for (;;) {
       const status = await client.actionStatus(action);
@@ -851,7 +917,7 @@ export class ControlDispatcher {
         this.rejectCatalogInstall(name, lastLines);
       }
       await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
-      delay = CATALOG_POLL_STEP_DELAY_MS;
+      delay = BACKGROUND_POLL_STEP_DELAY_MS;
     }
 
     const verify = await client.listMcpCatalog();
@@ -928,6 +994,243 @@ export class ControlDispatcher {
     await this.port.dispatch('reload.mcp', { confirm: true });
     await this.fetchPanelData('mcp');
     return result;
+  }
+
+  // ---------------------------------------------------------------------
+  // Task B4 (§5.4/§5.5): the T2 skills admin core — mirrors the MCP admin
+  // core immediately above (handleMcpAdmin/acquireMcpSingleFlight/
+  // handleMcpAdminInner/mcpCatalogInstall/pollCatalogInstall/
+  // rejectCatalogInstall) member-for-member, at the skills-specific shape
+  // (identifier-keyed single-flight, 120s poll cap, scan-first double gate).
+  // ---------------------------------------------------------------------
+
+  /**
+   * Task B4, mirroring {@link handleMcpAdmin} exactly (F3 idiom): per-
+   * identifier single-flight acquired SYNCHRONOUSLY (see {@link
+   * acquireSkillSingleFlight}'s own doc for why), then routed either OFF
+   * {@link dashboardToggleTail} (the three {@link SKILLS_TAIL_EXEMPT_METHODS})
+   * or ON it (`skills.create` — a short `POST /api/skills`, same bucket as
+   * `mcp.add`).
+   */
+  private async handleSkillsAdmin(method: SkillsAdminMethod, params: unknown): Promise<unknown> {
+    const releaseSingleFlight = this.acquireSkillSingleFlight(method, params);
+    let result: Promise<unknown>;
+    if (SKILLS_TAIL_EXEMPT_METHODS.has(method)) {
+      // F3 membership rule (mirrors TAIL_EXEMPT_MCP_METHODS): no client-
+      // bracketable config write of its own — never joins, never holds,
+      // never reassigns the tail.
+      result = this.handleSkillsAdminInner(method, params);
+    } else {
+      const run = () => this.handleSkillsAdminInner(method, params);
+      result = this.dashboardToggleTail.then(run, run);
+      this.dashboardToggleTail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+    }
+    if (releaseSingleFlight) {
+      // Release regardless of outcome — a declined modal, a scan-gate
+      // refusal, or a real failure must free the identifier exactly like
+      // success (mirrors handleMcpAdmin's own release discipline).
+      result.then(releaseSingleFlight, releaseSingleFlight);
+    }
+    return result;
+  }
+
+  /**
+   * Task B4 (§5.4 "Single-flight per identifier"), mirroring {@link
+   * acquireMcpSingleFlight} exactly — see that method's own doc for why the
+   * test-and-set MUST run synchronously, before this call ever joins {@link
+   * dashboardToggleTail}. `skills.create` has no `identifier` (it creates a
+   * NEW skill by `name`, a disjoint key space) and is never guarded here.
+   * `skills.hubPreview`/`skills.hubScan` only CHECK — a preview/scan racing
+   * a same-identifier install is refused, but two concurrent previews/scans
+   * of the SAME identifier never block each other (mirrors `mcp.test`'s
+   * check-only posture). Only `skills.hubInstall` SETS the busy flag.
+   */
+  private acquireSkillSingleFlight(method: SkillsAdminMethod, params: unknown): (() => void) | undefined {
+    if (method === 'skills.create') return undefined; // no identifier — disjoint key space
+    const identifier = extractSkillIdentifier(params);
+    if (!identifier) return undefined; // the real handler rejects with a clearer validation message
+    const busy = this.busySkillIds.get(identifier);
+    if (busy !== undefined) {
+      throw new Error(`Installing skill "${identifier}" is already in progress.`);
+    }
+    if (method !== 'skills.hubInstall') return undefined; // check-only: previews/scans never block each other
+    this.busySkillIds.set(identifier, 'install');
+    return () => this.busySkillIds.delete(identifier);
+  }
+
+  /**
+   * Task B4 (§5.4): trust gate (the `TRUST_GATED_METHODS` skills entries
+   * `skills.create`/`skills.hubInstall`) -> the per-method route.
+   * `skills.hubPreview`/`skills.hubScan` are read-only and NOT trust-gated
+   * (§4.7-class read methods), but still run {@link assertSkillIdentifier}
+   * BEFORE resolving a dashboard client at all — a bad/URL identifier never
+   * reaches the network fan-out, read-only or not.
+   */
+  private async handleSkillsAdminInner(method: SkillsAdminMethod, params: unknown): Promise<unknown> {
+    if (TRUST_GATED_METHODS.has(method) && !this.port.isTrusted()) {
+      throw new Error(`Refusing '${method}': the workspace is not trusted — trust this workspace to manage skills.`);
+    }
+
+    if (method === 'skills.hubPreview' || method === 'skills.hubScan') {
+      const identifier = extractSkillIdentifier(params);
+      if (!identifier) {
+        throw new Error(`'${method}' requires an { identifier } payload.`);
+      }
+      const gate = assertSkillIdentifier(identifier);
+      if (!gate.ok) {
+        throw new Error(gate.reason);
+      }
+      const client = await this.resolveDashboardAdminClient(method);
+      return method === 'skills.hubPreview' ? client.previewHubSkill(identifier) : client.scanHubSkill(identifier);
+    }
+
+    const client = await this.resolveDashboardAdminClient(method);
+
+    if (method === 'skills.create') {
+      return this.skillsCreate(client, params);
+    }
+
+    return this.skillsHubInstall(client, params);
+  }
+
+  /**
+   * Task B4 (§5.4 item 2, §5.5): `validateSkillCreate` (throws its own
+   * `reason` on `!ok`, before any modal) -> the §5.5 create modal ->
+   * `createSkill` -> a `skills` panel refetch -> `{ok:true}`. A `createSkill`
+   * REJECTION (Hermes 400 etc.) is Invariant #3: the server's error detail
+   * goes to the output-channel logger ONLY, a generic message is thrown to
+   * the caller/webview.
+   */
+  private async skillsCreate(client: DashboardAdminClient, params: unknown): Promise<{ ok: true }> {
+    const validated = validateSkillCreate(params);
+    if (!validated.ok) {
+      throw new Error(validated.reason);
+    }
+    const { body } = validated;
+    const message = `Create skill "${body.name}"?`;
+    const lines = [
+      `Category: ${body.category ?? '(none)'}`,
+      'The agent will follow these instructions in future sessions.',
+      redactForModal(body.content),
+    ];
+    const described = composeSkillsModalDetail(message, lines);
+    if (!described.ok) {
+      throw new Error(described.reason);
+    }
+    const confirmed = await this.port.confirm(described.message, described.detail, 'Create skill');
+    if (!confirmed) {
+      throw new Error(`Creating skill "${body.name}" was declined or cancelled.`);
+    }
+    try {
+      await client.createSkill(body);
+    } catch (err) {
+      this.port.logger?.append(`[AcpBackend] skills.create "${body.name}" was rejected by Hermes: ${errorMessage(err)}`);
+      throw new Error('Creating the skill failed — see the Talaria output log.');
+    }
+    await this.fetchPanelData('skills');
+    return { ok: true };
+  }
+
+  /**
+   * Task B4 (§5.4 item 3, §5.5): `assertSkillIdentifier` -> `scanHubSkill`
+   * -> the DOUBLE GATE (fail-closed: `policy !== 'allow'` OR `verdict ===
+   * 'dangerous'` refuses BEFORE any modal or install — `installHubSkill` is
+   * NEVER called on this path) -> the §5.5 install modal -> `installHubSkill`
+   * -> {@link pollSkillInstall} (ground-truth verified, §3 Layer 6). Single-
+   * flight per identifier is enforced by the CALLER ({@link
+   * handleSkillsAdmin}'s synchronous {@link acquireSkillSingleFlight}) —
+   * this method never re-checks it.
+   */
+  private async skillsHubInstall(client: DashboardAdminClient & DashboardClientLike, params: unknown): Promise<HubInstallResult> {
+    const identifier = extractSkillIdentifier(params);
+    if (!identifier) {
+      throw new Error(`'skills.hubInstall' requires an { identifier } payload.`);
+    }
+    const gate = assertSkillIdentifier(identifier);
+    if (!gate.ok) {
+      throw new Error(gate.reason);
+    }
+
+    const scan = await client.scanHubSkill(identifier);
+    if (scan.policy !== 'allow' || scan.verdict === 'dangerous') {
+      throw new Error(
+        `Refusing to install skill "${scan.name}": scan policy is "${scan.policy}", verdict "${scan.verdict}" — blocked.`,
+      );
+    }
+
+    const prefixRow = findSkillPrefixRow(identifier);
+    const tierLabel = prefixRow ? `${gate.tier} — ${prefixRow.label}` : gate.tier;
+    const message = `Install skill "${scan.name}" from ${identifier}?`;
+    const lines = [
+      `Source tier: ${tierLabel}`,
+      `Scan verdict: ${scan.verdict} (${scan.findings.length} findings)`,
+      'Files are copied to ~/.hermes/skills; nothing executes at install time.',
+    ];
+    const described = composeSkillsModalDetail(message, lines);
+    if (!described.ok) {
+      throw new Error(described.reason);
+    }
+    const confirmed = await this.port.confirm(described.message, described.detail, 'Install skill');
+    if (!confirmed) {
+      throw new Error(`Installing skill "${scan.name}" was declined or cancelled.`);
+    }
+
+    const result = await client.installHubSkill(identifier);
+    return this.pollSkillInstall(client, scan.name, result.name);
+  }
+
+  /**
+   * Task B4 (§5.4 item 3, §3 Layer 6), mirroring {@link pollCatalogInstall}
+   * exactly, at the skills-specific cadence: 1s -> 2s backoff, capped at
+   * {@link SKILLS_INSTALL_POLL_CAP_MS} (120s — NOT the catalog's 180s, §5.4).
+   * On `running:false`, GROUND-TRUTH verify: a FRESH `listSkills()` must
+   * contain a row named `skillName` — blocked installs exit 0
+   * (`skills_hub.py:634-713`), so the exit code alone is never trusted. On a
+   * timeout or a still-absent row, the action's tail `lines` go to the
+   * output-channel logger ONLY; the thrown message never carries them.
+   */
+  private async pollSkillInstall(
+    client: DashboardAdminClient & DashboardClientLike,
+    skillName: string,
+    action: string,
+  ): Promise<HubInstallResult> {
+    const deadline = Date.now() + SKILLS_INSTALL_POLL_CAP_MS;
+    let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
+    let lastLines: string[] = [];
+    for (;;) {
+      const status = await client.actionStatus(action);
+      lastLines = status.lines;
+      if (!status.running) break;
+      if (Date.now() >= deadline) {
+        this.rejectSkillInstall(skillName, lastLines);
+      }
+      await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
+      delay = BACKGROUND_POLL_STEP_DELAY_MS;
+    }
+
+    const rows = await client.listSkills();
+    const found = rows.some((row) => row.name === skillName);
+    if (!found) {
+      this.rejectSkillInstall(skillName, lastLines);
+    }
+
+    await this.fetchPanelData('skills');
+    return { ok: true, name: skillName };
+  }
+
+  /**
+   * Task B4 (§3 Layer 6): the shared timeout/ground-truth-failure refusal —
+   * mirrors {@link rejectCatalogInstall} exactly. `tailLines` goes to the
+   * output-channel logger only — never into the thrown message.
+   */
+  private rejectSkillInstall(name: string, tailLines: string[]): never {
+    this.port.logger?.append(
+      `[AcpBackend] skill install "${name}" did not verify as installed — action tail:\n${tailLines.join('\n')}`,
+    );
+    throw new Error('Install did not complete — see the Talaria output log.');
   }
 
   /**
@@ -1280,6 +1583,60 @@ function extractMcpEnabled(params: unknown): boolean {
   return (params as { enabled?: unknown }).enabled === true;
 }
 
+/** Task B4: pull `{identifier}` out of a `skills.hubPreview`/`skills.hubScan`/`skills.hubInstall` payload. */
+function extractSkillIdentifier(params: unknown): string | undefined {
+  if (!params || typeof params !== 'object') return undefined;
+  const p = params as { identifier?: unknown };
+  return typeof p.identifier === 'string' ? p.identifier : undefined;
+}
+
+/**
+ * Task B4 (§5.5), mirroring `mcpEntryValidation.ts`'s private `composeModal`
+ * using the SAME exported primitives ({@link stripModalControls}, {@link
+ * MODAL_DETAIL_MAX}) — that function itself isn't exported (A3/B3's file,
+ * not touched here) — with ONE deliberate ordering fix: each `lines` entry
+ * is stripped INDIVIDUALLY, and only THEN joined with `\n\n`. `stripModalControls`
+ * strips every `\x00-\x1f` byte, which includes `\n`/`\r` — stripping AFTER
+ * `lines.join('\n\n')` (as `composeModal` does) would erase the very
+ * separators that give the modal its line structure; stripping each
+ * (already-validated/constant or `redactForModal`-flattened) line first,
+ * then joining with a joiner introduced by THIS trusted code (never itself
+ * passed back through the strip), keeps the multi-line §5.5 layout intact
+ * while still neutralizing any control byte that made it into an individual
+ * line's own content. FAIL-CLOSED: a composed detail exceeding the shared
+ * ceiling is REFUSED, never truncated.
+ */
+function composeSkillsModalDetail(
+  message: string,
+  lines: string[],
+): { ok: true; message: string; detail: string } | { ok: false; reason: string } {
+  const strippedMessage = stripModalControls(message);
+  const detail = lines.map((line) => stripModalControls(line)).join('\n\n');
+  if (detail.length > MODAL_DETAIL_MAX) {
+    return { ok: false, reason: 'The details for this action are too large to review in a dialog.' };
+  }
+  return { ok: true, message: strippedMessage, detail };
+}
+
+/**
+ * Task B4 (§5.5 "Source tier" modal line): re-derive WHICH {@link
+ * TRUSTED_SKILL_PREFIXES} row an already-gate-approved identifier matched,
+ * for DISPLAY only — `assertSkillIdentifier` already made the actual
+ * security decision (this is only ever called after `gate.ok === true`, so
+ * a match is guaranteed; the `undefined` fallback below is unreachable in
+ * practice, kept as defense-in-depth). Mirrors that function's own
+ * segment-prefix matching loop verbatim.
+ */
+function findSkillPrefixRow(identifier: string): { prefix: string; tier: 'official' | 'trusted'; label: string } | undefined {
+  const segments = identifier.split('/');
+  for (const row of TRUSTED_SKILL_PREFIXES) {
+    const prefixSegments = row.prefix.split('/');
+    if (segments.length <= prefixSegments.length) continue;
+    if (prefixSegments.every((seg, i) => segments[i] === seg)) return row;
+  }
+  return undefined;
+}
+
 /**
  * Task A5: `validateMcpAdd` already confirmed `params.transport` is exactly
  * `'stdio'` or `'http'` before returning `ok:true` — this reads that SAME
@@ -1311,14 +1668,18 @@ function toMcpAddParams(
 }
 
 /**
- * Task A6 (§4.7 item 2): background catalog-install poll cadence — the
- * FIRST wait is 1s, every wait after that is 2s, and the total elapsed poll
- * time (first `actionStatus` call to the last) is capped at 180s (clone +
- * build headroom).
+ * Task A6 (§4.7 item 2), widened by Task B4: the shared background-poll
+ * cadence — the FIRST wait is 1s, every wait after that is 2s — reused by
+ * BOTH {@link pollCatalogInstall} (cap {@link CATALOG_POLL_CAP_MS}, 180s:
+ * clone + build headroom) and {@link pollSkillInstall} (cap
+ * {@link SKILLS_INSTALL_POLL_CAP_MS}, 120s per §5.4 — NOT the catalog's
+ * 180s; skill installs never clone/build, they only copy files).
  */
-const CATALOG_POLL_FIRST_DELAY_MS = 1_000;
-const CATALOG_POLL_STEP_DELAY_MS = 2_000;
+const BACKGROUND_POLL_FIRST_DELAY_MS = 1_000;
+const BACKGROUND_POLL_STEP_DELAY_MS = 2_000;
 const CATALOG_POLL_CAP_MS = 180_000;
+/** Task B4 (§5.4 "cap 120s"): the skills-hub-install-specific poll cap. */
+const SKILLS_INSTALL_POLL_CAP_MS = 120_000;
 
 /**
  * F3: MCP admin methods EXEMPT from the `dashboardToggleTail` serialization.
@@ -1336,6 +1697,28 @@ const TAIL_EXEMPT_MCP_METHODS: ReadonlySet<McpAdminMethod> = new Set([
   'mcp.test',
   'mcp.auth',
   'mcp.catalogInstall',
+]);
+
+/**
+ * Task B4: the skills-side twin of {@link TAIL_EXEMPT_MCP_METHODS}, same
+ * membership rule (no client-bracketable config.yaml write of its own):
+ *  - 'skills.hubPreview' read-only (`GET /api/skills/hub/preview`)
+ *  - 'skills.hubScan'    read-only (`GET /api/skills/hub/scan`)
+ *  - 'skills.hubInstall' only write = server-side, at END of the (up to
+ *                        120s) install action (`POST /api/skills/hub/install`
+ *                        + `skills_hub.py:634-713`) — exempting this is the
+ *                        whole point (§5.4): holding the tail for a slow
+ *                        install would freeze every other short config
+ *                        mutation behind it.
+ * `skills.create` (a short, synchronous `POST /api/skills` write) is
+ * deliberately NOT listed — same bucket as `mcp.add`, rides the tail.
+ * Same-identifier exclusion for the exempt methods is carried by
+ * {@link busySkillIds}.
+ */
+const SKILLS_TAIL_EXEMPT_METHODS: ReadonlySet<SkillsAdminMethod> = new Set([
+  'skills.hubPreview',
+  'skills.hubScan',
+  'skills.hubInstall',
 ]);
 
 /** Task A6: a plain `setTimeout` wait — {@link pollCatalogInstall}'s backoff step. Real timers in production; `vi.useFakeTimers()` in tests. */

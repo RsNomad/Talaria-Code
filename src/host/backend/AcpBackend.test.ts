@@ -7106,8 +7106,9 @@ function makeBackendWithDashboard(): {
  * admin surface (`HermesDashboardClient.ts:137-167`), with a call-recording
  * array per member so tests can assert exactly what reached the "dashboard"
  * — mirrors `FakeDashboardClient`'s own `toggleSkillCalls`/`toggleToolsetCalls`
- * idiom, extended to the 8 admin methods `hasDashboardAdmin` structurally
- * checks for.
+ * idiom, extended to the 13 admin methods `hasDashboardAdmin` structurally
+ * checks for (B2-M1 cleanup: was 8 before the T2 skills-admin members were
+ * added).
  */
 class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardAdminClient {
   addCalls: Array<{ name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> }> = [];
@@ -7220,39 +7221,50 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
   // stubs — same idiom as the T1 members above — kept ready for the C-task
   // that wires skills.create/hubPreview/hubScan/hubInstall/hubUninstall.) ------
 
-  createSkillCalls: Array<{ name: string; content: string; category?: string }> = [];
-  previewHubSkillCalls: string[] = [];
-  scanHubSkillCalls: string[] = [];
-  installHubSkillCalls: string[] = [];
+  createCalls: Array<{ name: string; content: string; category?: string }> = [];
+  previewCalls: string[] = [];
+  scanCalls: string[] = [];
+  hubInstallCalls: string[] = [];
   uninstallHubSkillCalls: string[] = [];
   previewHubSkillResult: HubPreview = {
     name: '', description: '', source: '', identifier: '', trust_level: '', skill_md: '', files: [],
   };
-  scanHubSkillResult: HubScan = {
+  /** Task B4 harness field (doc-pinned name, `features-add-mcp-skills-architecture.md` Task B4). */
+  scanResult: HubScan = {
     name: '', identifier: '', source: '', trust_level: '', verdict: 'safe', summary: '', policy: 'allow',
     policy_reason: '', findings: [], severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
   };
-  installHubSkillResult: { ok: boolean; name: string } = { ok: true, name: '' };
+  /** Task B4 harness field (doc-pinned name). `installHubSkill`'s `name` is the ACTION id to poll. */
+  hubInstallResult: { ok: boolean; name: string } = { ok: true, name: '' };
   uninstallHubSkillResult: { ok: boolean; name: string } = { ok: true, name: '' };
+  /**
+   * Task B4 harness extension (mirrors {@link installDeferred}/{@link
+   * authDeferred}'s exact idiom): when set, `installHubSkill` returns THIS
+   * promise verbatim (ignoring `hubInstallResult`), giving the
+   * `skills.hubInstall` single-flight regression test a controllable
+   * in-flight call.
+   */
+  hubInstallDeferred: Promise<{ ok: boolean; name: string }> | undefined;
 
   async createSkill(body: { name: string; content: string; category?: string }): Promise<unknown> {
-    this.createSkillCalls.push(body);
+    this.createCalls.push(body);
     return { ok: true };
   }
 
   async previewHubSkill(identifier: string): Promise<HubPreview> {
-    this.previewHubSkillCalls.push(identifier);
+    this.previewCalls.push(identifier);
     return this.previewHubSkillResult;
   }
 
   async scanHubSkill(identifier: string): Promise<HubScan> {
-    this.scanHubSkillCalls.push(identifier);
-    return this.scanHubSkillResult;
+    this.scanCalls.push(identifier);
+    return this.scanResult;
   }
 
   async installHubSkill(identifier: string): Promise<{ ok: boolean; name: string }> {
-    this.installHubSkillCalls.push(identifier);
-    return this.installHubSkillResult;
+    this.hubInstallCalls.push(identifier);
+    if (this.hubInstallDeferred) return this.hubInstallDeferred;
+    return this.hubInstallResult;
   }
 
   async uninstallHubSkill(name: string): Promise<{ ok: boolean; name: string }> {
@@ -8185,6 +8197,381 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
 
       expect(order).toEqual(['remove', 'toggle']); // remove's write recorded before toggle's
       expect(client.removeCalls).toEqual(['gh']);
+      expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: true }]);
+    },
+    1000,
+  );
+});
+
+// =============================================================================
+// Task B4 (features-add-mcp-skills-architecture.md §5.4/§5.5): ControlDispatcher's
+// T2 skills admin core — create/hubPreview/hubScan/hubInstall + trust gate +
+// the scan-first double gate (fail-closed) + ground-truth-verified install.
+// =============================================================================
+
+/** Task B4 harness helper (R-b reconciliation): a full `HubScan` fixture — every §5.2-required field present, so a test never trips tsc by omitting one. */
+const hubScanRow = (over: Partial<HubScan> = {}): HubScan => ({
+  name: 'pdf',
+  identifier: 'anthropics/skills/pdf',
+  source: '',
+  trust_level: 'trusted',
+  verdict: 'safe',
+  summary: '',
+  policy: 'allow',
+  policy_reason: '',
+  findings: [],
+  severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+  ...over,
+});
+
+describe('ControlDispatcher — Task B4 skills admin core (§5.4)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('skills.hubInstall: scan-first; policy!=allow is refused BEFORE any modal or install', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({ name: 'x', identifier: 'anthropics/skills/x', trust_level: 'community', verdict: 'caution', policy: 'block' });
+    mockShowWarningMessage.mockClear();
+
+    await expect(backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/x' })).rejects.toThrow(/blocked|refused/i);
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.hubInstallCalls).toEqual([]);
+  });
+
+  it('skills.hubInstall: dangerous verdict refused even when policy says allow (double gate)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({ name: 'x', identifier: 'anthropics/skills/x', verdict: 'dangerous', policy: 'allow' });
+    mockShowWarningMessage.mockClear();
+
+    await expect(backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/x' })).rejects.toThrow(/blocked|refused/i);
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.hubInstallCalls).toEqual([]);
+  });
+
+  it('skills.hubInstall happy path: scan -> modal -> install -> poll -> PRESENCE re-check -> refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', verdict: 'safe', policy: 'allow' });
+    client.hubInstallResult = { ok: true, name: 'skills-install-anthropics-pdf-ab12cd34' };
+    client.statusSeq = [
+      { running: true, exit_code: null, lines: [] },
+      { running: false, exit_code: 0, lines: ['Installed: pdf'] },
+    ];
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install skill');
+
+    const resultPromise = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' });
+    // The poll loop's first `actionStatus` sees `running:true` and sleeps
+    // (1s) before the SECOND `actionStatus` call — advance past that wait
+    // (§5.4: 1s -> 2s backoff, cap 120s — mirrors `pollCatalogInstall`).
+    await vi.advanceTimersByTimeAsync(1_000);
+    const res = await resultPromise;
+
+    expect(res).toMatchObject({ ok: true, name: 'pdf' });
+    expect(client.hubInstallCalls).toEqual(['anthropics/skills/pdf']);
+    expect(client.actionStatusCalls).toEqual([
+      'skills-install-anthropics-pdf-ab12cd34',
+      'skills-install-anthropics-pdf-ab12cd34',
+    ]);
+  });
+
+  it('exit-0-but-BLOCKED install (skill absent after the action) rejects generically; tail goes to the logger only', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+
+    client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', policy: 'allow', verdict: 'safe' });
+    client.hubInstallResult = { ok: true, name: 'skills-install-anthropics-pdf-ab12cd34' };
+    client.statusSeq = [{ running: false, exit_code: 0, lines: ['Installation blocked: publisher not verified'] }];
+    client.listSkillsResult = []; // 'pdf' absent — a BLOCKED install exits 0 but never lands (skills_hub.py:634-713)
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install skill');
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toBe('Install did not complete — see the Talaria output log.');
+    expect(message).not.toContain('blocked:'); // the tail must NEVER leak into the reject message
+    expect(logs.some((l) => l.includes('Installation blocked: publisher not verified'))).toBe(true); // ...only into the output-channel logger
+  });
+
+  it('skills.hubInstall refuses a community identifier fail-closed before any network call', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+
+    await expect(backend.invokeControl('skills.hubInstall', { identifier: 'clawhub/x' })).rejects.toThrow(/official|trusted/i);
+
+    expect(client.scanCalls).toEqual([]);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it('skills.create: trust -> validate -> modal -> POST -> refetch; declined modal sends nothing', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const content = '---\nname: demo\ndescription: one line\n---\n\nDo the thing.';
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Create skill');
+
+    const result = await backend.invokeControl('skills.create', { name: 'demo', content, category: 'coding' });
+
+    expect(result).toEqual({ ok: true });
+    expect(client.createCalls).toEqual([{ name: 'demo', content, category: 'coding' }]);
+
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); // user hit Cancel
+    await expect(
+      backend.invokeControl('skills.create', { name: 'other', content: '---\nname: other\n---\n\nx' }),
+    ).rejects.toThrow(/declined|cancel/i);
+    expect(client.createCalls).toEqual([{ name: 'demo', content, category: 'coding' }]); // unchanged — nothing sent
+  });
+
+  it('skills.hubPreview runs the identifier gate even though read-only', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+
+    await expect(backend.invokeControl('skills.hubPreview', { identifier: 'https://x' })).rejects.toThrow();
+
+    expect(client.previewCalls).toEqual([]);
+  });
+
+  it('skills.hubScan runs the identifier gate even though read-only', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+
+    await expect(backend.invokeControl('skills.hubScan', { identifier: '../etc/passwd' })).rejects.toThrow();
+
+    expect(client.scanCalls).toEqual([]);
+  });
+
+  it('skills.hubPreview/skills.hubScan are NOT trust-gated (same class as mcp.catalog)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.previewHubSkillResult = {
+      name: 'pdf', description: '', source: '', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', skill_md: '', files: [],
+    };
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      const res = await backend.invokeControl('skills.hubPreview', { identifier: 'anthropics/skills/pdf' });
+      expect(res).toEqual(client.previewHubSkillResult);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('skills.create: untrusted workspace is refused before validation or any modal', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      await expect(backend.invokeControl('skills.create', { name: 'demo', content: '---\nx' })).rejects.toThrow(/trust/i);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(client.createCalls).toEqual([]);
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('skills.hubInstall: untrusted workspace is refused before scan or any modal', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      await expect(
+        backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' }),
+      ).rejects.toThrow(/trust/i);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(client.scanCalls).toEqual([]);
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('skills.create modal copy is byte-exact (§5.5)', async () => {
+    const { backend } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Create skill');
+
+    await backend.invokeControl('skills.create', { name: 'demo', content: '---\nname: demo\n---\n\nBody text here.' });
+
+    const [message, options, label] = mockShowWarningMessage.mock.calls[0] as [string, { modal: boolean; detail: string }, string];
+    expect(message).toBe('Create skill "demo"?');
+    // The content slice is `redactForModal`-flattened (its designed
+    // single-line display behaviour strips control bytes — including the
+    // content's OWN embedded newlines — before the 200-char cap; §5.5 pins
+    // exactly this helper for the content piece). The two STRUCTURAL lines
+    // this method itself composes (Category / the fixed instructions
+    // sentence) keep their `\n\n` separators.
+    expect(options.detail).toBe(
+      'Category: (none)\n\nThe agent will follow these instructions in future sessions.\n\n---name: demo---Body text here.',
+    );
+    expect(label).toBe('Create skill');
+  });
+
+  it('skills.hubInstall modal copy is byte-exact (§5.5) — Source tier + Scan verdict + findings count', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({
+      name: 'pdf',
+      identifier: 'anthropics/skills/pdf',
+      trust_level: 'trusted',
+      verdict: 'caution',
+      policy: 'allow',
+      findings: [{ severity: 'medium', category: 'x', file: 'SKILL.md', line: 1, description: 'y' }],
+    });
+    client.hubInstallResult = { ok: true, name: 'skills-install-anthropics-pdf-ab12cd34' };
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install skill');
+
+    await backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' });
+
+    const [message, options, label] = mockShowWarningMessage.mock.calls[0] as [string, { modal: boolean; detail: string }, string];
+    expect(message).toBe('Install skill "pdf" from anthropics/skills/pdf?');
+    expect(options.detail).toBe(
+      'Source tier: trusted — anthropics/skills (Hermes TRUSTED_REPOS)\n\nScan verdict: caution (1 findings)\n\nFiles are copied to ~/.hermes/skills; nothing executes at install time.',
+    );
+    expect(label).toBe('Install skill');
+  });
+});
+
+// =============================================================================
+// Task B4 (§5.4 "Single-flight per identifier" + F3 mirror): the skills
+// concurrency machinery — `busySkillIds` (parallel to `busyMcpNames`) and
+// `SKILLS_TAIL_EXEMPT_METHODS` (parallel to `TAIL_EXEMPT_MCP_METHODS`). The
+// A6 review flagged the ANALOGOUS missing single-flight regression test as
+// an Important finding (F1, `mcp.catalogInstall`) — this closes the same gap
+// for `skills.hubInstall` up front.
+// =============================================================================
+describe('ControlDispatcher — Task B4 skills concurrency (F3 mirror)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('B4-SF: skills.hubInstall is single-flight per identifier — a concurrent same-identifier call is refused, a different identifier is not', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', verdict: 'safe', policy: 'allow' });
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // both pollers see running:false on their first check — no timer advance needed
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.hubInstallDeferred = new Promise((res) => {
+      release = res;
+    }); // FakeAdmin: installHubSkill returns this when set
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Install skill'); // every modal this test opens is confirmed
+
+    const first = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' });
+
+    // The guard is a synchronous test-and-set BEFORE `first` ever joins any
+    // queue (`handleSkillsAdmin`'s own doc, mirroring `handleMcpAdmin`'s) —
+    // the refusal below does not depend on how far `first`'s scan/modal/
+    // install chain has progressed.
+    await expect(
+      backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' }),
+    ).rejects.toThrow(/already in progress/i);
+
+    // A DIFFERENT identifier is never refused by the SAME-identifier guard —
+    // accepted and runs CONCURRENTLY with 'anthropics/skills/pdf' (skills.
+    // hubInstall is tail-exempt, so it never queues behind it on
+    // `dashboardToggleTail` either). This fake's `scanResult`/
+    // `hubInstallResult` are single shared fixtures (not keyed per
+    // identifier, per the doc-pinned harness shape) — 'other' resolves to
+    // the SAME canned skill row ('pdf') as a result, a fixture quirk, not a
+    // guard bug: this assertion is about the single-flight KEY (the raw
+    // `identifier` string), not the resolved name.
+    const other = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/other' });
+
+    release({ ok: true, name: 'skills-install-action-1' });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'pdf' });
+    await expect(other).resolves.toMatchObject({ ok: true, name: 'pdf' });
+
+    // The refused re-click reached NEITHER the modal NOR installHubSkill a
+    // second time: exactly one modal + one install call per identifier,
+    // never a third of either.
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+    expect(client.hubInstallCalls).toEqual(['anthropics/skills/pdf', 'anthropics/skills/other']);
+    expect(client.scanCalls).toEqual(['anthropics/skills/pdf', 'anthropics/skills/other']);
+  });
+
+  it(
+    'skills.toggle proceeds while skills.hubInstall is in flight (F3 tail-exemption mirror for skills)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', verdict: 'safe', policy: 'allow' });
+
+      let release!: (v: { ok: boolean; name: string }) => void;
+      client.hubInstallDeferred = new Promise((res) => {
+        release = res;
+      });
+
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockResolvedValueOnce('Install skill');
+
+      const install = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' }); // do NOT await — must still be pending below
+
+      await backend.invokeControl('skills.toggle', { name: 'tdd', enabled: false });
+
+      expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: false }]);
+      expect(client.hubInstallCalls).toEqual(['anthropics/skills/pdf']);
+
+      client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+      client.statusSeq = [{ running: false, exit_code: 0, lines: [] }];
+      release({ ok: true, name: 'skills-install-action-2' });
+      await install;
+    },
+    1000,
+  );
+
+  it(
+    'skills.create still serializes on the tail with skills.toggle (short-mutator ordering, mirrors F3 T6)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+
+      const order: string[] = [];
+      const realCreateSkill = client.createSkill.bind(client);
+      client.createSkill = (body: { name: string; content: string; category?: string }) => {
+        order.push('create');
+        return realCreateSkill(body);
+      };
+      const realToggleSkill = client.toggleSkill.bind(client);
+      client.toggleSkill = (name: string, enabled: boolean) => {
+        order.push('toggle');
+        return realToggleSkill(name, enabled);
+      };
+
+      let resolveModal!: (v: string | undefined) => void;
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockReturnValueOnce(
+        new Promise<string | undefined>((r) => {
+          resolveModal = r;
+        }),
+      );
+
+      const create = backend.invokeControl('skills.create', { name: 'demo', content: '---\nname: demo\n---\n\nx' }); // held at its modal
+      const toggle = backend.invokeControl('skills.toggle', { name: 'tdd', enabled: true });
+
+      await flushMicrotasks();
+      expect(client.toggleSkillCalls).toEqual([]); // still queued behind the held create
+
+      resolveModal('Create skill');
+      await toggle;
+      await create;
+
+      expect(order).toEqual(['create', 'toggle']);
+      expect(client.createCalls).toEqual([{ name: 'demo', content: '---\nname: demo\n---\n\nx' }]);
       expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: true }]);
     },
     1000,
