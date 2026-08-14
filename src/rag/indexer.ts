@@ -222,7 +222,19 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   const metaPath = path.join(opts.indexDir, 'manifest.meta.json');
 
   interface IndexMeta {
-    schema: 1;
+    /**
+     * TA-1 (AU-1, Critical): bumped 1 -> 2 for the pinned-Arrow-schema +
+     * init-time self-heal fix. A stored sidecar with the pre-bump value
+     * (including a legacy sidecar predating this field's existence, which
+     * `JSON.parse`s to `undefined !== 2`) makes `fingerprintMatches` fail
+     * exactly once, forcing a full recompute of every current path — the
+     * same established `scannerVersion` one-time-full-re-embed precedent
+     * below. This is required, not cosmetic: `LanceDBStore.init()`'s
+     * self-heal drops a legacy language-less table on disk, and without
+     * this bump an intact manifest would keep claiming those paths are
+     * indexed while the recreated table is actually empty.
+     */
+    schema: 2;
     embedModel: string;
     dims: number;
     /**
@@ -263,7 +275,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   }
 
   function currentMeta(): IndexMeta {
-    return { schema: 1, embedModel: opts.embedModel, dims: opts.dims ?? 0, scannerVersion: SCANNER_VERSION };
+    return { schema: 2, embedModel: opts.embedModel, dims: opts.dims ?? 0, scannerVersion: SCANNER_VERSION };
   }
 
   async function readMeta(): Promise<IndexMeta | undefined> {
@@ -277,7 +289,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   function fingerprintMatches(stored: IndexMeta | undefined): boolean {
     const want = currentMeta();
     return (
-      stored?.schema === 1 &&
+      stored?.schema === 2 &&
       stored.embedModel === want.embedModel &&
       stored.dims === want.dims &&
       stored.scannerVersion === want.scannerVersion
@@ -484,7 +496,22 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           endLine: chunk.endLine,
           content: chunk.headeredContent,
           contentHash,
-          language: languageId,
+          // TA-1 (AU-1, Critical): `language` must NEVER be undefined in a
+          // ChunkRecord — an extension with no `EXTENSION_TO_LANGUAGE_ID`
+          // entry (md/json/yml/txt/… — a docs-first repo's FIRST files in
+          // walk order) used to leave every one of its chunks' `language`
+          // undefined. A docs-first first upsert batch, all-undefined, makes
+          // LanceDB's schema INFERENCE at `createTable` drop the `language`
+          // column entirely (V1) — every later real-language upsert then
+          // throws `Found field not in schema: language` and every
+          // `hybridSearch` throws too, forever. `'text'` is also a better
+          // retrieval value than absent: `hybridSearch`'s language filter
+          // and `formatHitAsText`'s fence tag both consume it. Deliberately
+          // `languageId` (the raw, possibly-undefined lookup) rather than a
+          // defaulted variable — `chunkFile`'s `languageId`/`parser`
+          // arguments just above keep their CURRENT semantics (unmapped
+          // extensions still skip AST parsing) unaffected by this default.
+          language: languageId ?? 'text',
           vector: [],
         });
       });

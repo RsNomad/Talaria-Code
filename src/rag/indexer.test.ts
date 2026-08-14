@@ -498,8 +498,9 @@ describe('D-2: the index carries a model/dimension fingerprint', () => {
     // text — width 3 — so a fresh build that embeds real content must record
     // that observed width alongside the existing schema/embedModel/dims
     // fingerprint fields. SEC-1/F-3b extends this fixture: `scannerVersion`
-    // must be stamped too, the same way `width` already is.
-    expect(meta).toEqual({ schema: 1, embedModel: 'test-embed-model', dims: 0, width: 3, scannerVersion: 1 });
+    // must be stamped too, the same way `width` already is. TA-1: `schema`
+    // is now 2 (bumped from 1) — see the schema-bump test below.
+    expect(meta).toEqual({ schema: 2, embedModel: 'test-embed-model', dims: 0, width: 3, scannerVersion: 1 });
   });
 
   it('rebuilds from scratch when the stored fingerprint names a DIFFERENT model', async () => {
@@ -509,7 +510,8 @@ describe('D-2: the index carries a model/dimension fingerprint', () => {
     // recomputed it anyway, that would prove nothing except that the fixture
     // hash was stale — this fixture is deliberately fresh so ONLY the
     // fingerprint-mismatch discard can be the reason a recompute happens.
-    await writeMetaFixture({ schema: 1, embedModel: 'some-other-model', dims: 0 });
+    // `schema: 2` matches current (TA-1) so only the model name differs.
+    await writeMetaFixture({ schema: 2, embedModel: 'some-other-model', dims: 0 });
     await writeManifestFixture({ 'src/app.ts': hashContent(APP_TS_CONTENT) });
 
     const indexer = makeMetaIndexer();
@@ -529,8 +531,9 @@ describe('D-2: the index carries a model/dimension fingerprint', () => {
     // run through a content scan at all. The stored hash matches the file's
     // actual on-disk content exactly (same "deliberately fresh" fixture
     // shape as the sibling test above), so only the missing-scannerVersion
-    // mismatch can be the reason a recompute happens here.
-    await writeMetaFixture({ schema: 1, embedModel: 'test-embed-model', dims: 0 });
+    // mismatch can be the reason a recompute happens here. `schema: 2`
+    // matches current (TA-1) so it isolates ONLY the scannerVersion gap.
+    await writeMetaFixture({ schema: 2, embedModel: 'test-embed-model', dims: 0 });
     await writeManifestFixture({ 'src/app.ts': hashContent(APP_TS_CONTENT) });
 
     const indexer = makeMetaIndexer();
@@ -540,6 +543,26 @@ describe('D-2: the index carries a model/dimension fingerprint', () => {
     // scanned; reusing it silently would leave that gap open forever, since
     // an unchanged content hash alone gives the ordinary diff no reason to
     // ever look at this file's content again.
+    expect(recomputedPaths()).toContain('src/app.ts');
+  });
+
+  it('TA-1 (AU-1): rebuilds from scratch when the stored fingerprint predates the schema bump (legacy sidecar, MUST fail at HEAD)', async () => {
+    // A legacy sidecar: embedModel/dims/scannerVersion all MATCH current
+    // exactly, but `schema` is the pre-TA-1 value (1) — modelling an index
+    // built before the pinned-schema/self-heal fix existed, whose on-disk
+    // LanceDB table may have been born via schema INFERENCE and be missing
+    // the `language` column entirely (V1). The stored hash matches the
+    // file's actual on-disk content exactly, so only the schema-version
+    // mismatch can be the reason a recompute happens here — this is the
+    // meta-bump half of TA-1's self-heal (`indexer.ts` `IndexMeta.schema`
+    // 1 -> 2): without it, a dropped/self-healed table plus an intact
+    // manifest would claim files indexed while the table is actually empty.
+    await writeMetaFixture({ schema: 1, embedModel: 'test-embed-model', dims: 0, scannerVersion: 1 });
+    await writeManifestFixture({ 'src/app.ts': hashContent(APP_TS_CONTENT) });
+
+    const indexer = makeMetaIndexer();
+    await indexer.build();
+
     expect(recomputedPaths()).toContain('src/app.ts');
   });
 });
@@ -1166,4 +1189,62 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
       indexer.dispose();
     },
   );
+});
+
+describe('TA-1 (AU-1, Critical): unmapped extensions never reach the store with an undefined language', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-ta1-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer() {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+    });
+  }
+
+  function upsertedRecords(): Array<{ path: string; language?: string }> {
+    return upsertMock.mock.calls.flatMap(([records]) => records as Array<{ path: string; language?: string }>);
+  }
+
+  it('a README.md (no grammar mapping) is indexed with language "text", never undefined', async () => {
+    await fs.mkdir(workspaceRoot, { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'README.md'), '# Hello\n\nSome docs content here.\n', 'utf8');
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    const mdRecord = upsertedRecords().find((r) => r.path === 'README.md');
+    expect(mdRecord).toBeDefined();
+    // Root cause (indexer.ts EXTENSION_TO_LANGUAGE_ID has no 'md' entry):
+    // at HEAD this record's `language` is `undefined`, which is exactly the
+    // input that bricks a docs-first LanceDB index (V1).
+    expect(mdRecord?.language).toBe('text');
+  });
+
+  it('a mapped extension (e.g. .ts) still gets its real language id, unaffected by the default', async () => {
+    await fs.mkdir(workspaceRoot, { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'a.ts'), 'export const x = 1;\n', 'utf8');
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    const tsRecord = upsertedRecords().find((r) => r.path === 'a.ts');
+    expect(tsRecord?.language).toBe('typescript');
+  });
 });

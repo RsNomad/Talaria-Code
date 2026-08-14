@@ -180,7 +180,8 @@ describe('Task 14b: the D-2 sidecar records the OBSERVED vector width and enforc
 
     await expect(indexer.build()).resolves.toBeUndefined();
     const meta = await readMetaFixture();
-    expect(meta).toMatchObject({ schema: 1, embedModel: 'qwen3-embedding:0.6b', dims: 0, width: 4 });
+    // TA-1: `schema` bumped 1 -> 2 (pinned-Arrow-schema + init-time self-heal).
+    expect(meta).toMatchObject({ schema: 2, embedModel: 'qwen3-embedding:0.6b', dims: 0, width: 4 });
 
     // Build 2: SAME model name, SAME dims=0 — the D-2 fingerprint (model +
     // dims) still matches, so nothing forces a full rebuild. Change the

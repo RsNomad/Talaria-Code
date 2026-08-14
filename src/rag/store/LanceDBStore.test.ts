@@ -43,6 +43,11 @@ function makeChain(resolveRows: () => Promise<unknown[]>): FakeQueryChain {
   return chain;
 }
 
+// TA-1 (AU-1): every column `LanceDBStore.init()`'s self-heal check
+// requires present on a HEALTHY table — see `REQUIRED_COLUMNS` in
+// `LanceDBStore.ts`. Kept in sync manually (small, stable, closed list).
+const HEALTHY_SCHEMA_FIELD_NAMES = ['id', 'path', 'startLine', 'endLine', 'content', 'language', 'contentHash', 'vector'];
+
 interface FakeTable {
   query: () => {
     nearestTo: (vector: number[]) => FakeQueryChain;
@@ -50,6 +55,7 @@ interface FakeTable {
   };
   createIndex: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
+  schema: ReturnType<typeof vi.fn>;
 }
 
 function makeFakeTable(opts: {
@@ -63,6 +69,10 @@ function makeFakeTable(opts: {
     }),
     createIndex: vi.fn(async () => {}),
     close: vi.fn(),
+    // TA-1: a HEALTHY table by default — these tests exercise hybridSearch/
+    // close behavior, not the schema self-heal, so `init()` must never drop
+    // this fake table out from under them.
+    schema: vi.fn(async () => ({ fields: HEALTHY_SCHEMA_FIELD_NAMES.map((name) => ({ name })) })),
   };
 }
 
