@@ -8453,7 +8453,8 @@ describe('ControlDispatcher — Task B4 skills admin core (§5.4)', () => {
 
 // =============================================================================
 // Task B4 (§5.4 "Single-flight per identifier" + F3 mirror): the skills
-// concurrency machinery — `busySkillIds` (parallel to `busyMcpNames`) and
+// concurrency machinery — `busySkillInstallIds`/`busySkillUninstallNames`
+// (kind-scoped twins of `busyMcpNames`, split by B5-KS) and
 // `SKILLS_TAIL_EXEMPT_METHODS` (parallel to `TAIL_EXEMPT_MCP_METHODS`). The
 // A6 review flagged the ANALOGOUS missing single-flight regression test as
 // an Important finding (F1, `mcp.catalogInstall`) — this closes the same gap
@@ -8730,10 +8731,13 @@ describe('ControlDispatcher — Task B5 skills.hubUninstall (§5.4 last bullet, 
 
 // =============================================================================
 // Task B5 (§5.4 last bullet "Single-flight" + F3/B4 mirror): the skills
-// concurrency machinery widened for uninstall — `busySkillIds` now also keys
-// `skills.hubUninstall` on the skill NAME (a disjoint key space from
-// `skills.hubInstall`'s identifier keys — identifiers always contain a `/`
-// segment separator per the trusted-prefix allowlist, skill names never do).
+// concurrency machinery widened for uninstall — B5-KS split the old single
+// shared busy map into two kind-scoped collections,
+// `busySkillInstallIds`/`busySkillUninstallNames`: `skills.hubInstall` locks
+// the hub identifier, `skills.hubUninstall` locks the skill NAME, each in
+// its OWN `Set` — cross-kind collision is structurally impossible; keys may
+// transiently be raw pre-validation strings (see ControlDispatcher's field
+// doc).
 // =============================================================================
 describe('ControlDispatcher — Task B5 skills.hubUninstall concurrency (F3/B4 mirror)', () => {
   beforeEach(() => {
@@ -8817,6 +8821,152 @@ describe('ControlDispatcher — Task B5 skills.hubUninstall concurrency (F3/B4 m
     },
     1000,
   );
+});
+
+// =============================================================================
+// B5-KS (docs_claude/features-b5-singleflight-keyspace-fix-architecture.md):
+// the single-flight busy registry split into two kind-scoped collections
+// (`busySkillInstallIds`/`busySkillUninstallNames`) so a same-string
+// cross-kind pair (an install typo colliding with an in-flight uninstall of
+// the same raw string, or the reverse) can no longer be masked behind the
+// wrong-kind "already in progress" busy message — the caller gets the
+// accurate downstream validation refusal instead.
+// =============================================================================
+describe('ControlDispatcher — B5-KS single-flight key-space (cross-kind non-collision)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('T-1: an install typo is not masked by an in-flight uninstall of the same raw string', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // the uninstall poller sees running:false on its first check
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.uninstallHubSkillDeferred = new Promise((res) => {
+      release = res;
+    });
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Remove skill');
+
+    const first = backend.invokeControl('skills.hubUninstall', { name: 'pdf' }); // in flight, keyed on the NAME 'pdf'
+
+    // A same-STRING install typo (identifier 'pdf', missing its publisher
+    // prefix) must get the accurate allowlist refusal, never the uninstall's
+    // busy message.
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: 'pdf' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toMatch(/not under an allowlisted publisher/i);
+    expect(message).not.toMatch(/already in progress/i);
+    expect(client.scanCalls).not.toContain('pdf'); // the invalid identifier never reached the network
+
+    client.listSkillsResult = []; // absence ground truth for the still-in-flight uninstall
+    release({ ok: true, name: 'skills-uninstall-action-1' });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'pdf' }); // the in-flight uninstall was unaffected
+  });
+
+  it('T-2: an uninstall of a slashed name is not masked by an in-flight install of the same raw string', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', verdict: 'safe', policy: 'allow' });
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // the install poller sees running:false on its first check
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.hubInstallDeferred = new Promise((res) => {
+      release = res;
+    });
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Install skill');
+
+    const install = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' }); // in flight, keyed on the IDENTIFIER
+
+    // A same-STRING uninstall (name 'anthropics/skills/pdf' — not a real hub
+    // name) must get the accurate hub-provenance refusal, never the
+    // install's busy message.
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubUninstall', { name: 'anthropics/skills/pdf' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toMatch(/not a hub-installed skill/i);
+    expect(message).not.toMatch(/already in progress/i);
+
+    release({ ok: true, name: 'skills-install-action-2' });
+    await expect(install).resolves.toMatchObject({ ok: true, name: 'pdf' }); // the in-flight install was unaffected
+  });
+
+  it('T-3: skills.hubPreview (check-only) is not masked by an in-flight uninstall of the same raw string', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // the uninstall poller sees running:false on its first check
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.uninstallHubSkillDeferred = new Promise((res) => {
+      release = res;
+    });
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Remove skill');
+
+    const first = backend.invokeControl('skills.hubUninstall', { name: 'pdf' }); // in flight, keyed on the NAME 'pdf'
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubPreview', { identifier: 'pdf' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toMatch(/not under an allowlisted publisher/i);
+    expect(message).not.toMatch(/already in progress/i);
+
+    client.listSkillsResult = []; // absence ground truth for the still-in-flight uninstall
+    release({ ok: true, name: 'skills-uninstall-action-3' });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'pdf' }); // the in-flight uninstall was unaffected
+  });
+
+  it('T-4 (invariant pin — expected green both before and after B5-KS): a raw pre-validation install key is released on the validation refusal, so an identical retry gets the SAME allowlist refusal, never a busy one', async () => {
+    const { backend } = makeBackendWithAdminDashboard();
+
+    let firstCaught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: 'pdf' });
+    } catch (err) {
+      firstCaught = err;
+    }
+    expect((firstCaught as Error).message).toMatch(/not under an allowlisted publisher/i);
+
+    let secondCaught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: 'pdf' });
+    } catch (err) {
+      secondCaught = err;
+    }
+    const secondMessage = (secondCaught as Error).message;
+    expect(secondMessage).toMatch(/not under an allowlisted publisher/i);
+    expect(secondMessage).not.toMatch(/already in progress/i);
+  });
 });
 
 // =============================================================================

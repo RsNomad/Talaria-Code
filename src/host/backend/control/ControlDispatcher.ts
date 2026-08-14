@@ -276,7 +276,8 @@ export class ControlDispatcher {
    * write of its own (`hubInstall`/`hubUninstall`'s only write happens
    * server-side, at the END of the action, same membership rule as the MCP
    * set) — with same-name/same-identifier exclusion carried by {@link
-   * busyMcpNames}/{@link busySkillIds} instead. Tail-exempting the up-to-120s
+   * busyMcpNames}/{@link busySkillInstallIds}/{@link busySkillUninstallNames}
+   * instead. Tail-exempting the up-to-120s
    * `skills.hubInstall`/`skills.hubUninstall` polls is the whole point:
    * holding the tail for one would freeze every other short config mutation
    * behind a single slow install/uninstall — the exact regression this
@@ -331,21 +332,31 @@ export class ControlDispatcher {
   private readonly busyMcpNames = new Map<string, 'auth' | 'install' | 'change'>();
 
   /**
-   * Task B4 (§5.4 "Single-flight per identifier"), widened by Task B5: the
-   * skills-side twin of {@link busyMcpNames}. `skills.hubInstall` SETS an
-   * entry keyed by hub `identifier` (kind `'install'`); `skills.hubUninstall`
-   * SETS an entry keyed by the skill `name` (kind `'uninstall'`) — a
-   * DISJOINT key space from install's identifiers (an identifier always
-   * extends a pinned trusted prefix segment, so it always contains at least
-   * one `/`; a skill `name` never does, S-1 charset), so the two mutation
-   * kinds coexist in one map without ever needing to agree on a shared key —
-   * same reasoning as this map never needing to agree with `busyMcpNames`'s
-   * MCP `name`s. `skills.hubPreview`/`skills.hubScan` only CHECK the
-   * identifier space (mirrors `mcp.test`'s check-only posture — see {@link
-   * acquireSkillSingleFlight}). `skills.create` has no identifier/name key
-   * and never touches this map.
+   * Task B4/B5, reshaped by B5-KS: the skills-side counterpart of {@link
+   * busyMcpNames}, as TWO kind-scoped collections instead of one shared
+   * map. `skills.hubInstall` locks the hub `identifier` in
+   * `busySkillInstallIds` (`skills.hubPreview`/`skills.hubScan` CHECK it,
+   * mirroring `mcp.test`'s check-only posture); `skills.hubUninstall`
+   * locks the skill `name` in `busySkillUninstallNames`. The old single
+   * map claimed the two key spaces were disjoint "because identifiers
+   * always contain '/' and names never do" — TRUE only post-validation,
+   * but the map was written pre-validation (acquire is synchronous; the
+   * identifier/name gates run later, inside the routed handler), so a raw
+   * slash-free install key could collide with a real uninstall name and
+   * vice versa, producing a wrong-kind "already in progress" refusal that
+   * masked the accurate validation refusal for up to 120s. Separate
+   * collections make cross-kind collision structurally impossible for ANY
+   * strings and each branch's pinned refusal message accurate by
+   * construction; entries may still TRANSIENTLY hold raw pre-validation
+   * strings, released ms later by {@link handleSkillsAdmin}'s settled-
+   * release when the downstream gate refuses. Install-vs-uninstall of the
+   * same REAL skill was never mutually excluded (identifier and name are
+   * different strings) and still is not — Hermes plus the ground-truth
+   * presence/absence re-checks arbitrate that (see the B5-KS brief, R-1).
+   * `skills.create` has no identifier/name lock key and touches neither.
    */
-  private readonly busySkillIds = new Map<string, 'install' | 'uninstall'>();
+  private readonly busySkillInstallIds = new Set<string>();
+  private readonly busySkillUninstallNames = new Set<string>();
 
   constructor(private readonly port: ControlDispatcherHostPort) {}
 
@@ -1059,34 +1070,31 @@ export class ControlDispatcher {
    * `skills.hubPreview`/`skills.hubScan` only CHECK the identifier space — a
    * preview/scan racing a same-identifier install is refused, but two
    * concurrent previews/scans of the SAME identifier never block each other
-   * (mirrors `mcp.test`'s check-only posture). `skills.hubInstall` SETS the
-   * identifier-keyed busy flag; `skills.hubUninstall` SETS the disjoint
-   * name-keyed one (see {@link busySkillIds}'s own doc for why the two key
-   * spaces never collide).
+   * (mirrors `mcp.test`'s check-only posture). B5-KS: each kind now locks
+   * its OWN collection — see {@link busySkillInstallIds}'s field doc for why
+   * that makes cross-kind collision structurally impossible.
    */
   private acquireSkillSingleFlight(method: SkillsAdminMethod, params: unknown): (() => void) | undefined {
-    if (method === 'skills.create') return undefined; // no identifier/name lock key — disjoint from both busy key spaces
+    if (method === 'skills.create') return undefined; // no identifier/name lock key — never guarded
 
     if (method === 'skills.hubUninstall') {
       const name = extractSkillName(params);
       if (!name) return undefined; // the real handler rejects with a clearer validation message
-      const busy = this.busySkillIds.get(name);
-      if (busy !== undefined) {
+      if (this.busySkillUninstallNames.has(name)) {
         throw new Error(`Uninstalling skill "${name}" is already in progress.`);
       }
-      this.busySkillIds.set(name, 'uninstall');
-      return () => this.busySkillIds.delete(name);
+      this.busySkillUninstallNames.add(name);
+      return () => this.busySkillUninstallNames.delete(name);
     }
 
     const identifier = extractSkillIdentifier(params);
     if (!identifier) return undefined; // the real handler rejects with a clearer validation message
-    const busy = this.busySkillIds.get(identifier);
-    if (busy !== undefined) {
+    if (this.busySkillInstallIds.has(identifier)) {
       throw new Error(`Installing skill "${identifier}" is already in progress.`);
     }
     if (method !== 'skills.hubInstall') return undefined; // check-only: previews/scans never block each other
-    this.busySkillIds.set(identifier, 'install');
-    return () => this.busySkillIds.delete(identifier);
+    this.busySkillInstallIds.add(identifier);
+    return () => this.busySkillInstallIds.delete(identifier);
   }
 
   /**
@@ -1829,7 +1837,11 @@ function toMcpAddParams(
 const BACKGROUND_POLL_FIRST_DELAY_MS = 1_000;
 const BACKGROUND_POLL_STEP_DELAY_MS = 2_000;
 const CATALOG_POLL_CAP_MS = 180_000;
-/** Task B4 (§5.4 "cap 120s"): the skills-hub-install-specific poll cap. */
+/**
+ * Task B4 (§5.4 "cap 120s") + Task B5 reuse: the shared skills-hub ACTION
+ * poll cap — {@link pollSkillInstall} AND {@link pollSkillUninstall} (see
+ * the latter's doc for why the caps are identical).
+ */
 const SKILLS_INSTALL_POLL_CAP_MS = 120_000;
 
 /**
@@ -1868,7 +1880,7 @@ const TAIL_EXEMPT_MCP_METHODS: ReadonlySet<McpAdminMethod> = new Set([
  * `skills.create` (a short, synchronous `POST /api/skills` write) is
  * deliberately NOT listed — same bucket as `mcp.add`, rides the tail.
  * Same-identifier/same-name exclusion for the exempt methods is carried by
- * {@link busySkillIds}.
+ * {@link busySkillInstallIds}/{@link busySkillUninstallNames}.
  */
 const SKILLS_TAIL_EXEMPT_METHODS: ReadonlySet<SkillsAdminMethod> = new Set([
   'skills.hubPreview',
