@@ -11,13 +11,17 @@ import { describe, it, expect } from 'vitest';
 import type { ReactElement } from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { SkillsData } from '../protocol';
+import type { HubInstallResult, HubPreview, HubScan, SkillsData } from '../protocol';
 import { SkillsPanel } from './SkillsPanel';
+import { must } from '../testing/must';
 
 function setup(jsx: ReactElement) {
   return { user: userEvent.setup(), ...render(jsx) };
 }
 
+/** Task B6: extended with a `provenance: 'hub'` row (§Task B6) — the row the
+ *  hub-Remove-button tests exercise, alongside the pre-existing plain
+ *  `web-search` row every earlier test in this file already keys off. */
 function skillsData(enabled: boolean): SkillsData {
   return {
     skills: [
@@ -28,8 +32,17 @@ function skillsData(enabled: boolean): SkillsData {
         description: 'Search the web for current information.',
         enabled,
       },
+      {
+        id: 'pdf-tools',
+        name: 'pdf-tools',
+        category: 'official/pdf',
+        description: 'PDF utilities installed from the skill hub.',
+        enabled: true,
+        provenance: 'hub',
+        usage: 3,
+      },
     ],
-    categories: ['research'],
+    categories: ['research', 'official/pdf'],
   };
 }
 
@@ -40,10 +53,47 @@ const noop = () => undefined;
  *  would settle the row through confirm/rollback and destroy the race. */
 const neverSettles = () => new Promise<unknown>(() => undefined);
 
+/* Task B6: stub admin handlers for the pre-existing toggle-only tests below,
+ * now that `SkillsPanelProps` carries the full Create/Install-from-hub/
+ * hub-Remove surface — none of those tests exercise this new surface, so
+ * trivial resolves are enough to satisfy the (required, non-optional — every
+ * real caller always provides them) prop contract. Same posture as
+ * `McpPanel.dom.test.tsx`'s `noopMcpAdminProps()`. */
+function noopSkillsAdminProps() {
+  return {
+    onCreate: async () => ({ ok: true }),
+    onHubPreview: async (identifier: string): Promise<HubPreview> => ({
+      name: 'x',
+      description: '',
+      source: 'x',
+      identifier,
+      trust_level: 'trusted',
+      skill_md: '',
+      files: [],
+    }),
+    onHubScan: async (identifier: string): Promise<HubScan> => ({
+      name: 'x',
+      identifier,
+      source: 'x',
+      trust_level: 'trusted',
+      verdict: 'safe' as const,
+      summary: '',
+      policy: 'allow' as const,
+      policy_reason: '',
+      findings: [],
+      severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+    }),
+    onHubInstall: async (identifier: string): Promise<HubInstallResult> => ({ ok: true as const, name: identifier }),
+    onHubUninstall: async () => ({ ok: true }),
+  };
+}
+
 describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
   it('a rejected toggle rolls the switch back AND announces the reason through a live region', async () => {
     const onToggle = () => Promise.reject(new Error('dashboard unreachable'));
-    const { user } = setup(<SkillsPanel data={skillsData(true)} onToggle={onToggle} onRefresh={noop} />);
+    const { user } = setup(
+      <SkillsPanel data={skillsData(true)} onToggle={onToggle} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
 
     const toggle = screen.getByRole('switch', { name: 'Enable web-search' });
     expect(toggle).toHaveAttribute('aria-checked', 'true');
@@ -60,7 +110,7 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
 
   it('an IN-FLIGHT toggle stands against a disagreeing serverValue push (never clobbered while pending)', async () => {
     const { user, rerender } = setup(
-      <SkillsPanel data={skillsData(false)} onToggle={neverSettles} onRefresh={noop} />,
+      <SkillsPanel data={skillsData(false)} onToggle={neverSettles} onRefresh={noop} {...noopSkillsAdminProps()} />,
     );
     const toggle = () => screen.getByRole('switch', { name: 'Enable web-search' });
 
@@ -69,7 +119,9 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
 
     // A host push lands while our own toggle is still in flight — the server
     // side still disagrees (still reports false).
-    rerender(<SkillsPanel data={skillsData(false)} onToggle={neverSettles} onRefresh={noop} />);
+    rerender(
+      <SkillsPanel data={skillsData(false)} onToggle={neverSettles} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
 
     expect(
       toggle(),
@@ -81,7 +133,7 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
     let resolveToggle: (() => void) | undefined;
     const onToggle = () => new Promise<void>((res) => { resolveToggle = res; });
     const { user, rerender } = setup(
-      <SkillsPanel data={skillsData(false)} onToggle={onToggle} onRefresh={noop} />,
+      <SkillsPanel data={skillsData(false)} onToggle={onToggle} onRefresh={noop} {...noopSkillsAdminProps()} />,
     );
     const toggle = () => screen.getByRole('switch', { name: 'Enable web-search' });
 
@@ -94,7 +146,9 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
     // Today (pre-fix) `overrides[id]` never expires once confirmed, so this
     // push would be masked forever and the switch would stay stuck ON.
     await waitFor(() => {
-      rerender(<SkillsPanel data={skillsData(false)} onToggle={onToggle} onRefresh={noop} />);
+      rerender(
+        <SkillsPanel data={skillsData(false)} onToggle={onToggle} onRefresh={noop} {...noopSkillsAdminProps()} />,
+      );
       expect(
         toggle(),
         'once settled, a later disagreeing serverValue push must win over a confirmed optimistic value',
@@ -122,7 +176,9 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
       ],
       categories: ['research', 'engineering'],
     };
-    setup(<SkillsPanel data={data} onToggle={async () => undefined} onRefresh={noop} />);
+    setup(
+      <SkillsPanel data={data} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
     const note = screen.getByText(
       'Toggles persist immediately and apply to new sessions; a chat already running may keep its current skills until its next session.',
     );
@@ -130,5 +186,168 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
     const lastToggle = screen.getByRole('switch', { name: 'Enable code-review' });
     expect(note.compareDocumentPosition(firstToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(note.compareDocumentPosition(lastToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+/*
+ * Task B6 (§5.6): the Create-skill disclosure, the Install-from-hub
+ * disclosure (Check -> preview+scan card -> Install), and the hub-row
+ * Remove button. Same harness as the V-11 tests above (`render`/`screen`/
+ * `waitFor` + `userEvent`), `skillsData()`'s extended fixture (a plain
+ * `web-search` row + a `provenance: 'hub'` `pdf-tools` row).
+ */
+describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
+  it('the Check flow fires BOTH onHubPreview and onHubScan and renders the trust + verdict pills from the resolved result', async () => {
+    const user = userEvent.setup();
+    const previewed: string[] = [];
+    const scanned: string[] = [];
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubPreview={async (identifier) => {
+          previewed.push(identifier);
+          return {
+            name: 'pdf',
+            description: 'PDF utilities.',
+            source: 'github',
+            identifier,
+            trust_level: 'trusted',
+            skill_md: '# PDF skill\n\ndoes pdf things',
+            files: ['SKILL.md'],
+          };
+        }}
+        onHubScan={async (identifier) => {
+          scanned.push(identifier);
+          return {
+            name: 'pdf',
+            identifier,
+            source: 'github',
+            trust_level: 'trusted',
+            verdict: 'caution',
+            summary: 'One low finding.',
+            policy: 'allow',
+            policy_reason: '',
+            findings: [{ severity: 'low', category: 'network', file: 'a.py', line: 3, description: 'net call' }],
+            severity_counts: { critical: 0, high: 0, medium: 0, low: 1 },
+          };
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    await user.type(screen.getByLabelText(/Identifier/i), 'anthropics/skills/pdf');
+    await user.click(screen.getByRole('button', { name: /^Check$/i }));
+
+    await screen.findByText('pdf');
+    await waitFor(() => expect(previewed).toEqual(['anthropics/skills/pdf']));
+    await waitFor(() => expect(scanned).toEqual(['anthropics/skills/pdf']));
+    expect(screen.getByText('trusted')).toBeInTheDocument();
+    expect(screen.getByText('caution')).toBeInTheDocument();
+  });
+
+  it('Install stays disabled while onHubInstall is pending (neverSettles)', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubInstall={() => new Promise<HubInstallResult>(() => undefined)}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    await user.type(screen.getByLabelText(/Identifier/i), 'anthropics/skills/pdf');
+    await user.click(screen.getByRole('button', { name: /^Check$/i }));
+    await screen.findByText('x'); // the noop preview/scan fixture's name
+
+    const install = screen.getByRole('button', { name: /^Install$/i });
+    expect(install).not.toBeDisabled();
+    await user.click(install);
+
+    expect(await screen.findByText('Installing…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Installing…/i })).toBeDisabled();
+  });
+
+  it('a provenance:"hub" row shows Remove and firing it calls onHubUninstall(name); the non-hub row never gets one', async () => {
+    const user = userEvent.setup();
+    const uninstalled: string[] = [];
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubUninstall={async (name) => {
+          uninstalled.push(name);
+          return { ok: true };
+        }}
+      />,
+    );
+
+    // Exactly one Remove button — only the hub-provenance 'pdf-tools' row.
+    const removeButtons = screen.getAllByRole('button', { name: /^Remove$/i });
+    expect(removeButtons).toHaveLength(1);
+
+    await user.click(must(removeButtons[0]));
+    await waitFor(() => expect(uninstalled).toEqual(['pdf-tools']));
+  });
+
+  it('the Create-skill form fires onCreate with {name, content, category?}, seeded content, and a submitting state', async () => {
+    const user = userEvent.setup();
+    const created: Array<{ name: string; content: string; category?: string }> = [];
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onCreate={async (params) => {
+          created.push(params);
+          return { ok: true };
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    await user.type(screen.getByLabelText(/^Name$/i), 'my-skill');
+    await user.type(screen.getByLabelText(/Category/i), 'research');
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    await waitFor(() => expect(created).toHaveLength(1));
+    const params = must(created[0]);
+    expect(params.name).toBe('my-skill');
+    expect(params.category).toBe('research');
+    expect(params.content.startsWith('---\nname: my-skill\n')).toBe(true);
+  });
+
+  it('a declined/rejected create surfaces a neutral notice instead of crashing', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onCreate={async () => {
+          throw new Error('Creating skill "my-skill" was declined or cancelled.');
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    await user.type(screen.getByLabelText(/^Name$/i), 'my-skill');
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    // The notice renders through BOTH the sr-only LiveRegion and the
+    // sighted-user card (same by-design duplication `McpPanel.dom.test.tsx`
+    // already documents for its own row notices) — two matches is correct.
+    await waitFor(() =>
+      expect(screen.getAllByText('Creating skill "my-skill" was declined or cancelled.')).toHaveLength(2),
+    );
   });
 });

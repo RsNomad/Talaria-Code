@@ -24,6 +24,9 @@ import type {
   ControlMethod,
   DataPanel,
   HostToWebview,
+  HubInstallResult,
+  HubPreview,
+  HubScan,
   McpAddParams,
   McpAddResult,
   McpCatalogData,
@@ -33,6 +36,7 @@ import type {
   NextEditToggleSource,
   Panel,
   SetupMethod,
+  SkillCreateParams,
   ThemeKind,
 } from './protocol';
 import { MAX_TABS, PANEL_SCOPE } from './protocol';
@@ -471,6 +475,33 @@ export function App() {
     return result as McpCatalogInstallResult;
   };
 
+  // Task B6 (§5.6): the T2 skills admin RPCs `SkillsPanel`'s Create/Install-
+  // from-hub disclosures and hub-row Remove button drive. Same untagged/cast
+  // posture as the MCP admin RPCs above — `skills` is connection-global
+  // (`skills.toggle` above already is untagged), so these are UNTAGGED too.
+  // `createSkill` rebuilds `params` as a fresh `Record<string, unknown>`
+  // object literal (the same `mcpCatalogInstall` posture immediately above)
+  // — `SkillCreateParams` is an `interface`, so TS never infers an implicit
+  // index signature for it the way it does for `McpAddParams`'s `type` alias.
+  const createSkill = (params: SkillCreateParams) => {
+    const wireParams: Record<string, unknown> = { name: params.name, content: params.content };
+    if (params.category !== undefined) wireParams.category = params.category;
+    return bridge.request('skills.create', wireParams);
+  };
+  const previewHubSkill = async (identifier: string): Promise<HubPreview> => {
+    const result = await bridge.request('skills.hubPreview', { identifier });
+    return result as HubPreview;
+  };
+  const scanHubSkill = async (identifier: string): Promise<HubScan> => {
+    const result = await bridge.request('skills.hubScan', { identifier });
+    return result as HubScan;
+  };
+  const installHubSkill = async (identifier: string): Promise<HubInstallResult> => {
+    const result = await bridge.request('skills.hubInstall', { identifier });
+    return result as HubInstallResult;
+  };
+  const uninstallHubSkill = (name: string) => bridge.request('skills.hubUninstall', { name });
+
   // D3/N13: SettingsPanel's `config.set` over the CORRELATED path (the same
   // `toggle` pattern above) so a rejected/failed write resolves/rejects and
   // the row can roll back instead of lying — replaces the old fire-and-
@@ -906,6 +937,11 @@ export function App() {
                   data={data}
                   onToggle={(name, enabled) => toggle('skills.toggle', { name, enabled })}
                   onRefresh={() => requestPanel('skills')}
+                  onCreate={createSkill}
+                  onHubPreview={previewHubSkill}
+                  onHubScan={scanHubSkill}
+                  onHubInstall={installHubSkill}
+                  onHubUninstall={uninstallHubSkill}
                 />
               )}
             </RemotePanel>

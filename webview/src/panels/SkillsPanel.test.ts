@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { totalLookup } from '../lookup';
-import { PROVENANCE_LABEL, UNKNOWN_PROVENANCE_LABEL } from './SkillsPanel';
+import { PROVENANCE_LABEL, UNKNOWN_PROVENANCE_LABEL, verdictTone, identifierHint, skillTemplate } from './SkillsPanel';
 
 describe('SkillsPanel provenance label lookup (UI-I1 sibling)', () => {
   it('resolves every known provenance to its real label (behavior-preserving)', () => {
@@ -22,4 +22,37 @@ describe('SkillsPanel provenance label lookup (UI-I1 sibling)', () => {
       UNKNOWN_PROVENANCE_LABEL,
     );
   });
+});
+
+/*
+ * Task B6 (§5.6): pure helpers behind the Create/Install-from-hub
+ * disclosures + hub-row Remove. Exercised directly (no jsdom), same posture
+ * as the provenance-lookup tests above and `McpPanel.test.ts`'s A7/A8
+ * helpers — the wiring is covered separately in `SkillsPanel.dom.test.tsx`.
+ */
+describe('SkillsPanel hub helpers (B6)', () => {
+  it('verdictTone is total: safe->add, caution->neutral, dangerous->del, unknown->neutral', () => {
+    expect(verdictTone('safe')).toBe('add');
+    expect(verdictTone('caution')).toBe('neutral');
+    expect(verdictTone('dangerous')).toBe('del');
+    expect(verdictTone('quarantined')).toBe('neutral');
+  });
+
+  it('identifierHint explains the allowlist for unknown prefixes and stays silent for trusted ones', () => {
+    expect(identifierHint('clawhub/x')).toMatch(/official|trusted/i);
+    expect(identifierHint('anthropics/skills/pdf')).toBeUndefined();
+  });
+
+  it('identifierHint matches trusted prefixes by anchored segment, not substring', () => {
+    // 'officialX/foo' must NOT be treated as trusted merely because it starts
+    // with the literal characters 'official' — same segment-anchoring the
+    // host's own `assertSkillIdentifier` uses (mirrored here as a hint only).
+    expect(identifierHint('officialX/foo')).toMatch(/official|trusted/i);
+    // A bare prefix with nothing after it names a repo, not a skill — also
+    // not trusted for the hint's purposes.
+    expect(identifierHint('anthropics/skills')).toMatch(/official|trusted/i);
+  });
+
+  it('skillTemplate seeds valid frontmatter with the typed name', () =>
+    expect(skillTemplate('my-skill').startsWith('---\nname: my-skill\n')).toBe(true));
 });
