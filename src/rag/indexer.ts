@@ -454,6 +454,18 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   ): Promise<number | undefined> {
     await ensureStoreInitialized();
     const pendingRecords: ChunkRecord[] = [];
+    // TA-3 (AU-3, Rev-1 A3) / INV-3: "old rows for a path are deleted only
+    // after their replacement vectors exist." Per-path swap bookkeeping for
+    // the bounded per-BATCH embed-then-swap below: `deleted` flips true the
+    // moment this path's stale rows are actually purged (at most once, at
+    // its FIRST batch); `remaining` counts this path's records not yet
+    // upserted and reaches 0 exactly when every one of its replacement
+    // chunks is safely in the store — that is the ONLY moment
+    // `manifest[relPath]` is written (below). A path that throws mid-swap
+    // (deleted but remaining > 0) is scrubbed from `manifest` in the catch
+    // below instead of being left to claim rows that are gone — HEAD's bug
+    // was exactly that stale claim surviving a partial/transient failure.
+    const pathState = new Map<string, { contentHash: string; remaining: number; deleted: boolean }>();
 
     for (const { readAbsPath, storeRelPath: relPath } of targets) {
       let buf: Buffer;
@@ -470,7 +482,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       const extension = path.extname(relPath).slice(1);
       const languageId = EXTENSION_TO_LANGUAGE_ID[extension];
 
-      await store.deleteByPath(relPath);
+      // TA-3 (AU-3): no delete here anymore — purging a path's stale rows is
+      // now deferred to the embed-then-swap step below, so they survive
+      // until THIS path's replacement vectors actually exist. HEAD deleted
+      // here, unconditionally, before any embedding was even attempted — a
+      // transient embed failure on a byte-identical watch re-save then left
+      // the rows gone with no replacement and an unchanged manifest hash,
+      // making the file invisible to search forever.
       const chunks = await chunkFile({
         relPath,
         contents,
@@ -480,6 +498,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         maxChunkTokens: opts.maxChunkTokens,
       });
 
+      let recordCount = 0;
       chunks.forEach((chunk, i) => {
         // SEC-1 (audit-3): Layer-2 CONTENT gate, mirroring the completion
         // path. Drop the POSITIVE CHUNK ONLY (not the whole file) so index
@@ -514,55 +533,119 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           language: languageId ?? 'text',
           vector: [],
         });
+        recordCount++;
       });
 
-      manifest[relPath] = contentHash;
+      if (recordCount === 0) {
+        // TA-3: no chunk survived the content gate (or the file has no
+        // indexable content) — there is nothing for a future batch to
+        // replace, so this path never enters the deferred swap below. Purge
+        // any stale rows now and record the hash immediately: this mirrors
+        // HEAD's behavior for this exact case (which also never reaches the
+        // embed step, so there is no failure window to protect against).
+        await store.deleteByPath(relPath);
+        manifest[relPath] = contentHash;
+      } else {
+        pathState.set(relPath, { contentHash, remaining: recordCount, deleted: false });
+      }
     }
 
-    // Embed in batches (how-to §2.4: ~64-200 per request) and upsert.
+    // Embed in batches (how-to §2.4: ~64-200 per request); per batch, swap:
+    // a path's stale rows are purged only once ITS replacement vectors exist
+    // (this batch), then the batch is upserted. TA-3 (AU-3, Rev-1 A3):
+    // bounded to ONE batch of pending vectors resident at a time — NOT an
+    // all-batches-first buffer (which would hold every vector in memory,
+    // 300+MB on a large repo).
     let observedWidth: number | undefined;
-    for (let i = 0; i < pendingRecords.length; i += EMBED_BATCH_SIZE) {
-      const batch = pendingRecords.slice(i, i + EMBED_BATCH_SIZE);
-      const vectors = await embedder.embed(
-        batch.map((r) => r.content),
-        // TA-2 (AU-5, Rev-1 A2) / INV-2 (restated): "one BUILD = one width
-        // once first observed". `expectedWidth` alone is only the width
-        // DECLARED before this build started (`computeEffectiveWidth`) —
-        // when that's undefined (first-ever build, dims=0), every batch used
-        // to be called with `expectedWidth` unchanged, so batch 2 could
-        // return a different-but-internally-consistent width than batch 1
-        // and slip past `embedBatch`'s intra-batch check silently (V2's
-        // corruption). Once batch 1's width has been OBSERVED (below), it
-        // becomes the enforced width for every remaining batch of this same
-        // build — `expectedWidth` (a real caller decision) still wins if the
-        // caller declared one.
-        expectedWidth ?? observedWidth,
-      );
-      // Task 14b: record the width of the very first vector this build
-      // actually produced, before any upsert — this is the value the NEXT
-      // build's `computeEffectiveWidth` will enforce (and, per the above,
-      // the value THIS build enforces on every later batch).
-      if (observedWidth === undefined) {
-        const first = vectors[0];
-        if (first !== undefined) observedWidth = first.length;
-      }
-      batch.forEach((record, idx) => {
-        // TA-2 (AU-5): `embedder.embed` already validated (parseEmbeddingsResponse's
-        // count check + embedBatch's per-row shape check) that it returns
-        // exactly one well-formed vector per input, in order — `vectors[idx]`
-        // is therefore always defined here. The old `?? []` fallback let a
-        // missing vector attach an empty one instead of failing loudly; that
-        // silent path IS the bug (V2) and must die, not be preserved as a
-        // defensive default.
-        const vector = vectors[idx];
-        if (vector === undefined) {
-          throw new Error(
-            'hermes-codebase: embedder returned fewer vectors than requested — refusing to upsert a record without a vector',
-          );
+    try {
+      for (let i = 0; i < pendingRecords.length; i += EMBED_BATCH_SIZE) {
+        const batch = pendingRecords.slice(i, i + EMBED_BATCH_SIZE);
+        const vectors = await embedder.embed(
+          batch.map((r) => r.content),
+          // TA-2 (AU-5, Rev-1 A2) / INV-2 (restated): "one BUILD = one width
+          // once first observed". `expectedWidth` alone is only the width
+          // DECLARED before this build started (`computeEffectiveWidth`) —
+          // when that's undefined (first-ever build, dims=0), every batch used
+          // to be called with `expectedWidth` unchanged, so batch 2 could
+          // return a different-but-internally-consistent width than batch 1
+          // and slip past `embedBatch`'s intra-batch check silently (V2's
+          // corruption). Once batch 1's width has been OBSERVED (below), it
+          // becomes the enforced width for every remaining batch of this same
+          // build — `expectedWidth` (a real caller decision) still wins if the
+          // caller declared one.
+          expectedWidth ?? observedWidth,
+        );
+        // Task 14b: record the width of the very first vector this build
+        // actually produced, before any upsert — this is the value the NEXT
+        // build's `computeEffectiveWidth` will enforce (and, per the above,
+        // the value THIS build enforces on every later batch).
+        if (observedWidth === undefined) {
+          const first = vectors[0];
+          if (first !== undefined) observedWidth = first.length;
         }
-        record.vector = vector;
-      });
-      await store.upsert(batch);
+        batch.forEach((record, idx) => {
+          // TA-2 (AU-5): `embedder.embed` already validated (parseEmbeddingsResponse's
+          // count check + embedBatch's per-row shape check) that it returns
+          // exactly one well-formed vector per input, in order — `vectors[idx]`
+          // is therefore always defined here. The old `?? []` fallback let a
+          // missing vector attach an empty one instead of failing loudly; that
+          // silent path IS the bug (V2) and must die, not be preserved as a
+          // defensive default.
+          const vector = vectors[idx];
+          if (vector === undefined) {
+            throw new Error(
+              'hermes-codebase: embedder returned fewer vectors than requested — refusing to upsert a record without a vector',
+            );
+          }
+          record.vector = vector;
+        });
+
+        // TA-3 (AU-3) / INV-3: this batch's replacement vectors now exist —
+        // safe to purge each represented path's stale rows, exactly once (a
+        // path whose chunks span multiple batches is purged at its FIRST
+        // batch only; `LanceDBStore.upsert`'s `mergeInsert('id')` keeps a
+        // later batch's upsert idempotent — new ids insert, nothing to
+        // update — against the now-emptied path).
+        for (const relPath of new Set(batch.map((r) => r.path))) {
+          const state = pathState.get(relPath);
+          if (state && !state.deleted) {
+            await store.deleteByPath(relPath);
+            state.deleted = true;
+          }
+        }
+
+        await store.upsert(batch);
+
+        for (const record of batch) {
+          const state = pathState.get(record.path);
+          if (state) {
+            state.remaining -= 1;
+            // Every one of this path's replacement chunks is now safely in
+            // the store — only NOW is it safe to claim it in the manifest.
+            if (state.remaining === 0) {
+              manifest[record.path] = state.contentHash;
+            }
+          }
+          // Rev-1 A3 honest-memory note: release this record's (large)
+          // vector now that the upsert has consumed it, so peak vector
+          // residency stays ~one batch instead of the whole call.
+          record.vector = [];
+        }
+      }
+    } catch (err) {
+      // TA-3 (AU-3) scrub: a path whose stale rows were already deleted but
+      // whose replacement records did NOT all land must not keep (or gain) a
+      // manifest entry — that would tell the next build's diff "no change,
+      // skip" while its rows are gone/incomplete, exactly AU-3's
+      // invisible-file bug. Paths this call never reached (delete never ran)
+      // are left untouched here: their old rows are still intact, so
+      // whatever `manifest` already held for them stays consistent.
+      for (const [relPath, state] of pathState) {
+        if (state.deleted && state.remaining > 0) {
+          delete manifest[relPath];
+        }
+      }
+      throw err;
     }
     return observedWidth;
   }
@@ -648,7 +731,21 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       storeRelPath: rel,
     }));
     const effectiveWidth = computeEffectiveWidth(storedMeta);
-    const observedWidth = await reindexFiles(toComputeTargets, manifest, effectiveWidth, preloaded);
+    let observedWidth: number | undefined;
+    try {
+      observedWidth = await reindexFiles(toComputeTargets, manifest, effectiveWidth, preloaded);
+    } catch (err) {
+      // TA-3 (AU-3): persist whatever scrub `reindexFiles` already applied
+      // to `manifest` even though this build failed — otherwise a
+      // partial-failure path's stale manifest entry (claiming rows that are
+      // now gone) would survive on disk untouched until some LATER build
+      // happens to recompute it, or forever if its content hash never
+      // changes again. `writeMeta` is intentionally NOT called on this arm
+      // — it records what THIS build observed, and this build did not
+      // complete.
+      await writeManifest(manifest);
+      throw err;
+    }
 
     await writeManifest(manifest);
     // Task 14b: if this build embedded nothing (nothing changed, or a
@@ -793,11 +890,23 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // the read hits the CAPTURED canonical target instead. Store under the
         // alias relPath: the gate/secret/delete/dir-sweep branches all key on
         // it, so a canonical key here would orphan the row from every purge.
-        await reindexFiles(
-          [{ readAbsPath: confined, storeRelPath: relPath }],
-          manifest,
-          effectiveWidth,
-        );
+        try {
+          await reindexFiles(
+            [{ readAbsPath: confined, storeRelPath: relPath }],
+            manifest,
+            effectiveWidth,
+          );
+        } catch (err) {
+          // TA-3 (AU-3): persist the scrub `reindexFiles` already applied to
+          // `manifest` even though this incremental reindex failed — see
+          // `runBuild`'s matching catch arm for the full rationale. Without
+          // this write, a transient failure on a byte-identical re-save
+          // would otherwise leave rows gone and the on-disk manifest
+          // unchanged (same hash) — the file would look "unchanged, no
+          // recompute needed" forever.
+          await writeManifest(manifest);
+          throw err;
+        }
         await writeManifest(manifest);
       });
     }

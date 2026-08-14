@@ -1248,3 +1248,176 @@ describe('TA-1 (AU-1, Critical): unmapped extensions never reach the store with 
     expect(tsRecord?.language).toBe('typescript');
   });
 });
+
+describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a file', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-ta3-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    // TA-3 tests each override embedMock's implementation per-scenario —
+    // restore the file's shared default afterward so later describe blocks
+    // (which run in the same module/mock instance) aren't affected.
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer(debounceMs = 10) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  /** Mirrors the production `readManifest`'s own missing-file semantics
+   * (indexer.ts: `catch { return {}; }`) so assertions read cleanly whether
+   * or not a manifest.json has ever been written yet. */
+  async function readManifest(): Promise<Record<string, string>> {
+    try {
+      const raw = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8');
+      return JSON.parse(raw) as Record<string, string>;
+    } catch {
+      return {};
+    }
+  }
+
+  it('a transient embed failure during a watch re-save of UNCHANGED bytes must not delete the old rows', async () => {
+    await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
+    const indexer = makeIndexer();
+    await indexer.build(); // baseline: fully indexed, manifest entry + rows exist.
+    expect(upsertMock).toHaveBeenCalledTimes(1);
+    deleteByPathMock.mockClear();
+
+    const disposable = indexer.watch();
+    // Models the embed endpoint being transiently down for exactly the next
+    // call — the watch-triggered re-embed of this SAME, byte-identical file
+    // (e.g. autosave / formatter / `git checkout` re-touching it).
+    embedMock.mockRejectedValueOnce(new Error('embeddings request timed out'));
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'src', 'app.ts') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    errorSpy.mockRestore();
+
+    // HEAD's bug: reindexFiles deletes the path's OLD rows unconditionally,
+    // BEFORE any embedding is even attempted. The fix must never purge a
+    // path's rows until ITS replacement vectors actually exist — an embed
+    // failure here means they never will, this cycle.
+    expect(deleteByPathMock).not.toHaveBeenCalledWith('src/app.ts');
+
+    disposable.dispose();
+    indexer.dispose();
+
+    // The next full build: content is genuinely unchanged, so a HONEST
+    // manifest (this failed cycle wrote nothing new for this path) says "no
+    // recompute needed" — which is only safe because the old rows are still
+    // actually there.
+    upsertMock.mockClear();
+    const indexer2 = makeIndexer();
+    await indexer2.build();
+    expect(upsertMock).not.toHaveBeenCalled(); // no spurious recompute…
+    const manifest = await readManifest();
+    expect(manifest['src/app.ts']).toBeDefined(); // …and the file is still present in the index.
+    indexer2.dispose();
+  });
+
+  it('upsert failing AFTER the swap delete scrubs the manifest entry (no silent invisible-file lie)', async () => {
+    await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
+    const indexer = makeIndexer();
+    await indexer.build(); // baseline: file indexed, manifest entry exists.
+    const before = await readManifest();
+    expect(before['src/app.ts']).toBeDefined();
+
+    const disposable = indexer.watch();
+    upsertMock.mockRejectedValueOnce(new Error('upsert failed after delete'));
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'src', 'app.ts') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    errorSpy.mockRestore();
+
+    // Embed succeeded (default mock), so the swap's delete DID run for this
+    // path — but the immediately-following upsert failed, so the
+    // replacement rows never landed. A manifest entry claiming this path is
+    // indexed at its current hash would be a lie (its rows are gone); it
+    // must be scrubbed so the next build recomputes it.
+    expect(deleteByPathMock).toHaveBeenCalledWith('src/app.ts');
+    const after = await readManifest();
+    expect(after['src/app.ts']).toBeUndefined();
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+
+  it('Rev-1 A3: a file whose OWN chunks span two embed batches is deleted exactly once, and loses its manifest entry only when the SECOND batch fails', async () => {
+    // EMBED_BATCH_SIZE (indexer.ts) = 64. A big-enough single file forces
+    // >64 chunks out of the line-window fallback chunker (40-line window /
+    // 10-line overlap -> 30-line step, chunker.ts), so THIS ONE file's own
+    // records straddle the batch boundary — deterministic regardless of
+    // walk() traversal order (there is only one target).
+    const bigLines = Array.from({ length: 3000 }, (_, i) => `const bigLine${i} = ${i};`);
+    await writeWorkspaceFile('big.ts', bigLines.join('\n') + '\n');
+
+    const indexer = makeIndexer();
+    await indexer.build(); // baseline: fully indexed (both batches succeed here).
+    const before = await readManifest();
+    expect(before['big.ts']).toBeDefined();
+    deleteByPathMock.mockClear();
+    upsertMock.mockClear();
+
+    const disposable = indexer.watch();
+    let callCount = 0;
+    embedMock.mockImplementation(async (texts: string[]) => {
+      callCount += 1;
+      if (callCount === 2) throw new Error('batch 2 embed failed');
+      return texts.map(() => [0.1, 0.2, 0.3]);
+    });
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Identical-bytes resave of the SAME unchanged big file.
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'big.ts') });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    errorSpy.mockRestore();
+
+    // Batch 1's swap ran to completion (one delete, one upsert) before
+    // batch 2 threw on its embed call.
+    expect(deleteByPathMock.mock.calls.filter(([p]) => p === 'big.ts').length).toBe(1);
+    expect(upsertMock.mock.calls.length).toBe(1);
+
+    // Batch 2 never landed — the file's rows are now INCOMPLETE (only
+    // batch 1's chunks survive) even though its content hash is unchanged
+    // from the baseline. A manifest entry here would tell the next build
+    // "no change, skip" while rows are missing — AU-3's exact bug, reached
+    // via the batch-spanning path instead of the single-batch path.
+    const after = await readManifest();
+    expect(after['big.ts']).toBeUndefined();
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+});
