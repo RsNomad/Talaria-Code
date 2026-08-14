@@ -67,7 +67,40 @@ export function parseEmbeddingsResponse(
       `/v1/embeddings response returned ${sorted.length} vectors, expected ${expectedCount}`,
     );
   }
+  // TA-2 (AU-5) / AU-36:R11: `index` is caller-controlled wire data — a
+  // duplicate or out-of-range value used to sort/align silently (the count
+  // check above is the only thing that used to be checked), misattributing
+  // one embedding to the wrong input text or letting a duplicate mask a
+  // missing row, with no error at all. Checked AFTER the count check so that
+  // message stays the more specific ("N vectors, expected M") diagnostic
+  // when both are wrong.
+  const seenIndices = new Set<number>();
+  for (const datum of sorted) {
+    if (!Number.isInteger(datum.index) || datum.index < 0 || datum.index >= expectedCount) {
+      throw new Error(
+        `/v1/embeddings response returned an invalid index (${datum.index}); expected an integer in [0, ${expectedCount})`,
+      );
+    }
+    if (seenIndices.has(datum.index)) {
+      throw new Error(`/v1/embeddings response returned a duplicate index (${datum.index})`);
+    }
+    seenIndices.add(datum.index);
+  }
   return sorted.map((d) => d.embedding);
+}
+
+/**
+ * TA-2 (AU-5): the per-row shape check `embedBatch` runs on every vector
+ * before it can reach `store.upsert` — V2 (reproduced) showed LanceDB's
+ * `mergeInsert(...).execute()` does NOT reject an empty (`[]`) or
+ * non-numeric-element vector; it silently writes it, and every subsequent
+ * `nearestTo` query on the WHOLE table then throws `Invalid encoding:
+ * per-row byte width must be greater than 0`. `response.data[].embedding` is
+ * typed `number[]` only at compile time — it is untrusted wire JSON at
+ * runtime, so this checks the actual runtime shape, not just the width.
+ */
+function isWellFormedVector(v: number[]): boolean {
+  return Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'number' && Number.isFinite(x));
 }
 
 /**
@@ -193,6 +226,22 @@ export class HttpEmbedder implements Embedder {
       clearTimeout(timer);
     }
     const vectors = parseEmbeddingsResponse(json, batch.length);
+    // TA-2 (AU-5): per-row shape validation — V2 (reproduced, worse than
+    // filed) showed LanceDB's `mergeInsert(...).execute()` silently accepts
+    // an empty or malformed vector into the table, and every later
+    // `nearestTo` on the WHOLE table then throws. Every row must be a
+    // non-empty array of finite numbers BEFORE anything from this batch can
+    // reach `store.upsert` — checked unconditionally (not gated on
+    // `expectedWidth`), since an empty/malformed row is never valid at any
+    // width. Checks every vector, not just the first, so a batch whose first
+    // row happens to be well-formed but a later one isn't is still refused
+    // wholesale.
+    const malformedIdx = vectors.findIndex((v) => !isWellFormedVector(v));
+    if (malformedIdx !== -1) {
+      throw new Error(
+        `/v1/embeddings response returned a malformed embedding vector at batch position ${malformedIdx} (must be a non-empty array of finite numbers)`,
+      );
+    }
     // Audit D-1 / Task 14b: the LanceDB schema has a FIXED vector width.
     // Verified empirically against the installed @lancedb/lancedb: a
     // wrong-width upsert via `mergeInsert(...).execute()` does NOT error —
@@ -212,6 +261,26 @@ export class HttpEmbedder implements Embedder {
         throw new Error(
           `embedding width mismatch: server returned ${mismatched.length}, index schema expects ${expectedWidth}. Set talaria.rag.dims to match your model, or delete the index directory and rebuild.`,
         );
+      }
+    } else {
+      // TA-2 (Rev-1 A2) / INV-2 (restated): nothing was DECLARED to enforce
+      // yet (first build, dims=0), but the rows of THIS batch must still
+      // agree with each other — indexer.ts's `reindexFiles` records
+      // `vectors[0].length` as the build's `observedWidth` the moment this
+      // call returns, and that value becomes trustworthy only if every row
+      // in the batch that produced it actually shares it. Cross-BATCH
+      // consistency (batch 2 vs batch 1's observedWidth) is the caller's
+      // job — see `reindexFiles`'s `expectedWidth ?? observedWidth` — this
+      // is the single width-check site (embedder.ts:88-94 doctrine); the
+      // caller only decides what value to pass, never re-checks itself.
+      const first = vectors[0];
+      if (first !== undefined) {
+        const mismatched = vectors.find((v) => v.length !== first.length);
+        if (mismatched !== undefined) {
+          throw new Error(
+            `embedding width mismatch: server returned inconsistent vector widths within one batch (${first.length} vs ${mismatched.length}) — a single batch must produce vectors of one consistent width.`,
+          );
+        }
       }
     }
     return vectors;

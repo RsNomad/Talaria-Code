@@ -525,17 +525,42 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       const batch = pendingRecords.slice(i, i + EMBED_BATCH_SIZE);
       const vectors = await embedder.embed(
         batch.map((r) => r.content),
-        expectedWidth,
+        // TA-2 (AU-5, Rev-1 A2) / INV-2 (restated): "one BUILD = one width
+        // once first observed". `expectedWidth` alone is only the width
+        // DECLARED before this build started (`computeEffectiveWidth`) —
+        // when that's undefined (first-ever build, dims=0), every batch used
+        // to be called with `expectedWidth` unchanged, so batch 2 could
+        // return a different-but-internally-consistent width than batch 1
+        // and slip past `embedBatch`'s intra-batch check silently (V2's
+        // corruption). Once batch 1's width has been OBSERVED (below), it
+        // becomes the enforced width for every remaining batch of this same
+        // build — `expectedWidth` (a real caller decision) still wins if the
+        // caller declared one.
+        expectedWidth ?? observedWidth,
       );
       // Task 14b: record the width of the very first vector this build
       // actually produced, before any upsert — this is the value the NEXT
-      // build's `computeEffectiveWidth` will enforce.
+      // build's `computeEffectiveWidth` will enforce (and, per the above,
+      // the value THIS build enforces on every later batch).
       if (observedWidth === undefined) {
         const first = vectors[0];
         if (first !== undefined) observedWidth = first.length;
       }
       batch.forEach((record, idx) => {
-        record.vector = vectors[idx] ?? [];
+        // TA-2 (AU-5): `embedder.embed` already validated (parseEmbeddingsResponse's
+        // count check + embedBatch's per-row shape check) that it returns
+        // exactly one well-formed vector per input, in order — `vectors[idx]`
+        // is therefore always defined here. The old `?? []` fallback let a
+        // missing vector attach an empty one instead of failing loudly; that
+        // silent path IS the bug (V2) and must die, not be preserved as a
+        // defensive default.
+        const vector = vectors[idx];
+        if (vector === undefined) {
+          throw new Error(
+            'hermes-codebase: embedder returned fewer vectors than requested — refusing to upsert a record without a vector',
+          );
+        }
+        record.vector = vector;
       });
       await store.upsert(batch);
     }
