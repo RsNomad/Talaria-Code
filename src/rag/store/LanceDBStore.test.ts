@@ -80,6 +80,11 @@ function makeFakeDb(table: FakeTable) {
   return {
     openTable: vi.fn(async () => table),
     createTable: vi.fn(),
+    // TA-4 (AU-22 routed review finding): a no-op default so the self-heal
+    // block's `await this.db.dropTable(...)` call has somewhere to land in
+    // suites that don't otherwise exercise it; overridden per-test below to
+    // simulate a drop failure.
+    dropTable: vi.fn(async () => undefined),
     close: vi.fn(),
   };
 }
@@ -196,8 +201,14 @@ describe('LanceDBStore.hybridSearch — CF-04 lazy openTable + honest not-ready'
     ];
     const table = makeFakeTable({ vecRows: async () => vecRows, ftsRows: async () => [] });
     const db = {
-      // init() finds no table yet (first-ever run, index not built)...
-      openTable: vi.fn().mockRejectedValueOnce(new Error('table not found')).mockResolvedValueOnce(table),
+      // init() finds no table yet (first-ever run, index not built) —
+      // TA-4 (AU-22): message must match the real not-found shape
+      // (`isTableNotFoundError`, pinned against the installed package in
+      // `LanceDBStore.schema.test.ts`) or `openTableIfExists` now rethrows.
+      openTable: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("Table 'chunks' was not found"))
+        .mockResolvedValueOnce(table),
       createTable: vi.fn(),
       close: vi.fn(),
     };
@@ -215,7 +226,8 @@ describe('LanceDBStore.hybridSearch — CF-04 lazy openTable + honest not-ready'
 
   it('throws IndexNotReadyError (not a silent empty array) when the table still does not exist after the retry', async () => {
     const db = {
-      openTable: vi.fn().mockRejectedValue(new Error('table not found')),
+      // TA-4 (AU-22): real not-found shape — see comment above.
+      openTable: vi.fn().mockRejectedValue(new Error("Table 'chunks' was not found")),
       createTable: vi.fn(),
       close: vi.fn(),
     };
@@ -230,7 +242,8 @@ describe('LanceDBStore.hybridSearch — CF-04 lazy openTable + honest not-ready'
 
   it('does not hammer openTable on repeated queries while the table remains missing (bounded retry)', async () => {
     const db = {
-      openTable: vi.fn().mockRejectedValue(new Error('table not found')),
+      // TA-4 (AU-22): real not-found shape — see comment above.
+      openTable: vi.fn().mockRejectedValue(new Error("Table 'chunks' was not found")),
       createTable: vi.fn(),
       close: vi.fn(),
     };
@@ -290,6 +303,54 @@ describe('LanceDBStore.close — RAG-3', () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await expect(store.close()).resolves.toBeUndefined();
+    errSpy.mockRestore();
+  });
+});
+
+/**
+ * TA-4 (AU-22) routed review finding: TA-1's init-time self-heal
+ * (`await this.table.schema()` / `await this.db.dropTable(...)`) had NO
+ * try/catch. `src/mcp/codebase-server.ts` awaits `store.init()` unguarded at
+ * MCP-child spawn (`main().catch()` only logs and sets an exit code AFTER
+ * the fact — the stdio transport never connects), so a probe/drop RPC
+ * failure (disk permission, unrelated corruption) would abort the WHOLE
+ * MCP-child startup instead of degrading. These tests drive the fix:
+ * neither failure point may throw out of `init()` — degrade (log once,
+ * continue) per INV-4 and this module's fail-degrade posture.
+ */
+describe('LanceDBStore.init — TA-4 (routed review finding): self-heal failure degrades, does not abort startup', () => {
+  beforeEach(() => {
+    connectMock.mockReset();
+  });
+
+  it('does not reject when the self-heal schema() probe itself throws', async () => {
+    const table = makeFakeTable({ vecRows: async () => [], ftsRows: async () => [] });
+    table.schema.mockRejectedValue(new Error('EACCES: permission denied'));
+    const db = makeFakeDb(table);
+    connectMock.mockResolvedValue(db);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const store = new LanceDBStore('/fake/index/dir');
+
+    await expect(store.init()).resolves.toBeUndefined();
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('does not reject when dropTable() throws after the probe finds a missing column', async () => {
+    const table = makeFakeTable({ vecRows: async () => [], ftsRows: async () => [] });
+    // Missing required columns (only 'id' present) — the probe finds
+    // something to repair and attempts the drop.
+    table.schema.mockResolvedValue({ fields: [{ name: 'id' }] });
+    const db = makeFakeDb(table);
+    db.dropTable.mockRejectedValue(new Error('disk error: EIO'));
+    connectMock.mockResolvedValue(db);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const store = new LanceDBStore('/fake/index/dir');
+
+    await expect(store.init()).resolves.toBeUndefined();
+    expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
   });
 });

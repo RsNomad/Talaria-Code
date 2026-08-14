@@ -5,7 +5,7 @@ import path from 'node:path';
 import * as lancedb from '@lancedb/lancedb';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { LanceDBStore } from './LanceDBStore';
+import { isTableNotFoundError, LanceDBStore } from './LanceDBStore';
 import type { ChunkRecord } from './VectorStore';
 
 /**
@@ -142,5 +142,53 @@ describe('LanceDBStore — TA-1 (AU-1): pinned schema, real @lancedb/lancedb', (
 
     const db = await lancedb.connect(dir, { readConsistencyInterval: 0 });
     expect(await db.tableNames()).not.toContain('chunks');
+  });
+});
+
+/**
+ * TA-4 (AU-22, Med) — `openTableIfExists`'s bare catch converted ANY open
+ * failure (permissions, corruption, version mismatch) into "table doesn't
+ * exist yet". Real `@lancedb/lancedb`, real tmp dir for the not-found
+ * predicate pin (mirrors the file's own top-of-file rationale for staying
+ * unmocked); the real-failure-propagates case is driven through the
+ * `connectImpl` seam (Rev-1 A5) with a FAKE connection so this file's OTHER
+ * describe block above keeps exercising the real package undisturbed in the
+ * same suite.
+ */
+describe('LanceDBStore — TA-4 (AU-22): openTableIfExists distinguishes not-found from real failures', () => {
+  it('pins the not-found predicate against the installed @lancedb/lancedb package (V9/Rev-1 A4)', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'talaria-lancedb-ta4-pin-'));
+    const db = await lancedb.connect(dir, { readConsistencyInterval: 0 });
+    let caught: unknown;
+    try {
+      await db.openTable('chunks');
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    // The pin: a future lancedb bump that rewords this message fails HERE,
+    // not by silently misclassifying a real error as not-found.
+    expect(isTableNotFoundError(caught)).toBe(true);
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('propagates a real (non-not-found) openTable failure out of init(), instead of swallowing it into an undefined table', async () => {
+    const permissionError = new Error("EACCES: permission denied, open 'chunks.lance'");
+    const fakeDb = {
+      openTable: async () => {
+        throw permissionError;
+      },
+      dropTable: async () => undefined,
+      createTable: async () => {
+        throw new Error('createTable must not be called — init() should have rejected first');
+      },
+      close: () => undefined,
+    };
+    const connectImpl = async () => fakeDb as unknown as lancedb.Connection;
+
+    const store = new LanceDBStore('/fake/dir/irrelevant-connectImpl-takes-over', { connectImpl });
+
+    await expect(store.init()).rejects.toThrow(permissionError.message);
   });
 });

@@ -97,6 +97,32 @@ export function escapeSqlLiteral(value: string): string {
 }
 
 /**
+ * TA-4 (AU-22, Med) — distinguishes a genuine "table doesn't exist yet"
+ * rejection from every other native `openTable` failure (permissions,
+ * corruption, version mismatch). `openTableIfExists`'s bare catch used to
+ * convert ANY of these into "not created yet", so the next `upsert()` would
+ * call `createTable` over a table that might actually exist (a confusing
+ * failure far from the real cause), and `hybridSearch` would report the
+ * honest-sounding lie `IndexNotReadyError` instead of the real fault.
+ *
+ * Settled Rev-1 A4, pinned at write-time against the installed
+ * `@lancedb/lancedb@0.33.0`: opening a nonexistent table rejects with a
+ * plain `Error` whose message contains `Table 'X' was not found` — there is
+ * no exported `TableNotFoundError` class in this version to `instanceof`
+ * against instead (checked: not present in the installed package's
+ * typings), so message matching is the only signal available. See the
+ * pinning test in `LanceDBStore.schema.test.ts` (opens a nonexistent table
+ * against the REAL package and asserts this predicate matches the actual
+ * rejection) — a future lancedb bump that rewords the message fails that
+ * PIN, not silently misclassifies a real error as not-found.
+ *
+ * Exported for test (mirrors `escapeSqlLiteral` above).
+ */
+export function isTableNotFoundError(err: unknown): boolean {
+  return err instanceof Error && /was not found/i.test(err.message);
+}
+
+/**
  * CF-04 / L5 F-7: thrown by `hybridSearch` when the `chunks` table has never
  * been created — the MCP child's ONE `init()` call at spawn raced the first
  * index build (registration deliberately precedes it, how-to §7.1) — and the
@@ -143,8 +169,25 @@ export class LanceDBStore implements VectorStore {
    * once the first failure has been recorded.
    */
   private ftsRepairAttempted = false;
+  private readonly connectImpl: typeof lancedb.connect;
 
-  constructor(private readonly indexDir: string) {}
+  /**
+   * TA-4 (AU-22, Med) / Rev-1 A5 — named seam: `LanceDBStore` built its own
+   * connection inline with no injection point, so the RED test proving a
+   * real (non-not-found) `openTable` failure propagates out of `init()`
+   * could only be driven by mocking the entire `@lancedb/lancedb` module —
+   * which would stop this file's OTHER real-package tests
+   * (`LanceDBStore.schema.test.ts`, TA-1's) from running against the REAL
+   * package in the same suite. `connectImpl` defaults to the real
+   * `lancedb.connect`, the repo's established injectable-seam idiom
+   * (`ExecLookup`, `fetchImpl`).
+   */
+  constructor(
+    private readonly indexDir: string,
+    options: { connectImpl?: typeof lancedb.connect } = {},
+  ) {
+    this.connectImpl = options.connectImpl ?? lancedb.connect;
+  }
 
   async init(): Promise<void> {
     // CF-04: `readConsistencyInterval: 0` is LanceDB's STRONG-consistency
@@ -157,7 +200,7 @@ export class LanceDBStore implements VectorStore {
     // watcher's incremental writes (mergeInsert/createTable) made from the
     // extension host process. Correctness over the (local-filesystem, cheap)
     // per-read staleness check.
-    this.db = await lancedb.connect(this.indexDir, { readConsistencyInterval: 0 });
+    this.db = await this.connectImpl(this.indexDir, { readConsistencyInterval: 0 });
     this.table = await this.openTableIfExists();
     // TA-1 (AU-1, Critical) self-heal: a table built by a PRE-FIX version of
     // this store (or otherwise missing a required column) is bricked forever
@@ -170,14 +213,35 @@ export class LanceDBStore implements VectorStore {
     // Checking types too would risk a false-positive drop of a healthy table
     // (design doc, Top risk #1) for no added protection.
     if (this.table) {
-      const fields = (await this.table.schema()).fields.map((f) => f.name);
-      const missing = REQUIRED_COLUMNS.filter((name) => !fields.includes(name));
-      if (missing.length > 0) {
+      try {
+        const fields = (await this.table.schema()).fields.map((f) => f.name);
+        const missing = REQUIRED_COLUMNS.filter((name) => !fields.includes(name));
+        if (missing.length > 0) {
+          console.error(
+            `hermes-codebase: dropping a legacy '${TABLE_NAME}' table missing required column(s) [${missing.join(', ')}] — the next index build recreates it with the current pinned schema`,
+          );
+          await this.db.dropTable(TABLE_NAME);
+          this.table = undefined;
+        }
+      } catch (err) {
+        // TA-4 (AU-22) routed review finding: a schema()/dropTable() RPC
+        // failure here (disk permission, unrelated corruption) must NOT
+        // propagate out of init() and abort the whole MCP-child startup —
+        // `codebase-server.ts` awaits `store.init()` unguarded at spawn
+        // (`main().catch()` only logs and sets an exit code AFTER the fact;
+        // the stdio transport never connects, so Hermes gets a dead child
+        // instead of a degraded-but-alive one). Degrade gracefully instead:
+        // log once and leave `table` exactly as the probe found it — the
+        // self-heal simply did not run this time — consistent with INV-4
+        // ("a store error is never converted into 'not created yet'"; this
+        // is the same shape in reverse: a self-heal-probe error is never
+        // converted into a fatal startup abort) and this module's
+        // fail-degrade posture (`hybridSearch`'s FTS leg below is the same
+        // shape: log once, don't kill the caller).
         console.error(
-          `hermes-codebase: dropping a legacy '${TABLE_NAME}' table missing required column(s) [${missing.join(', ')}] — the next index build recreates it with the current pinned schema`,
+          `hermes-codebase: schema self-heal probe for '${TABLE_NAME}' failed — continuing without repairing it this run`,
+          err,
         );
-        await this.db.dropTable(TABLE_NAME);
-        this.table = undefined;
       }
     }
   }
@@ -195,8 +259,19 @@ export class LanceDBStore implements VectorStore {
     if (!this.db) return undefined;
     try {
       return await this.db.openTable(TABLE_NAME);
-    } catch {
-      return undefined;
+    } catch (err) {
+      // TA-4 (AU-22, Med) / INV-4: a genuine not-found (the ordinary
+      // first-run case, table never created yet) resolves `undefined`, same
+      // as before. Anything else — permissions, corruption, version
+      // mismatch — must NOT be swallowed into "not created yet": the
+      // caller's next `upsert()` would otherwise call `createTable` over a
+      // table that may actually exist (a confusing failure far from the
+      // real cause), and `hybridSearch` would report the honest-sounding
+      // lie `IndexNotReadyError` instead of the real fault. Rethrow so
+      // `init()` fails loudly and `tryReopenTable()`'s per-query retry
+      // (below) only ever retries genuine not-found.
+      if (isTableNotFoundError(err)) return undefined;
+      throw err;
     }
   }
 
