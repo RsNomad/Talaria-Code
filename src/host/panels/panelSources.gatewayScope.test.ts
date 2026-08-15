@@ -59,12 +59,26 @@ function makeSpyContext(): { ctx: PanelSourceContext; calls: DispatchCall[] } {
   return { ctx, calls };
 }
 
-/** No dispatched call's params may carry a `sessionId` key (F10). */
+/**
+ * No dispatched call's params may carry a session-scoping key (F10). Checks
+ * BOTH spellings on purpose:
+ *  - `sessionId` — the webview/PanelSource-side camelCase (e.g.
+ *    `SessionsPanelSource`/`SubagentsPanelSource`'s `extractSessionId`);
+ *  - `session_id` — the SNAKE_CASE key the Python gateway actually
+ *    destructures (`tui_gateway/server.py`: `params.get("session_id")`), and
+ *    the spelling this repo's OWN gateway dispatches already use
+ *    (`AcpBackend.ts` `dispatch('session.delete', { session_id })`). A future
+ *    edit that threads a session id into one of these five sources via EITHER
+ *    spelling — the snake_case one is the more likely copy-paste of the
+ *    existing in-repo convention — must turn this lock red.
+ */
 function assertNoSessionIdForwarded(calls: readonly DispatchCall[]): void {
   for (const call of calls) {
     const params = call.params;
     if (params && typeof params === 'object') {
-      expect('sessionId' in (params as Record<string, unknown>)).toBe(false);
+      const keys = params as Record<string, unknown>;
+      expect('sessionId' in keys).toBe(false);
+      expect('session_id' in keys).toBe(false);
     }
   }
 }

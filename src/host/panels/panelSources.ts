@@ -59,17 +59,26 @@ import {
  * namespace (`acp_adapter/session.py`). A dispatch that has no matching key in
  * `_sessions` falls back to the gateway's own unknown-session global handling,
  * which is exactly the behavior these config RPCs want (there is only ever
- * one gateway-side config to read). Threading an acp `sessionId` into one of
- * these dispatches expecting it to SCOPE the result would be a category
- * error — the id means nothing on this wire — so no source here should ever
- * be edited to add that.
+ * one gateway-side config to read). Some of these gateway RPCs DO destructure a
+ * `session_id` param and look it up (`server.py`: `_sessions.get(params.get(
+ * "session_id"))`) — but `_sessions` is keyed by the gateway's OWN
+ * caller-supplied ids and is never populated with an acp-child id, so such a
+ * lookup always misses and still lands in the global fallback (it is the
+ * NAMESPACE split that guarantees this, not any id-format check — the gateway
+ * does not constrain the key's shape). Threading an acp session id into one of
+ * these dispatches expecting it to SCOPE the result would therefore be a
+ * category error — the id means nothing on this wire — so no source here should
+ * ever be edited to add that (in EITHER spelling: the wire key is snake_case
+ * `session_id`, which is also what this repo's own `AcpBackend` gateway
+ * dispatches use, so a copy-paste of that convention is the likely accident).
  *
  * GROUNDING NOTE (do not remove without re-verifying): `ToolsPanelSource`,
  * `ModelsPanelSource`, and `SettingsPanelSource` forward their `fetch(params)`
  * argument to `ctx.dispatch` UNFILTERED; `SkillsPanelSource` spreads it too
  * (merging in `action:'list'`) — none of the four inspects or strips a
- * `sessionId` key if one is present in `params`. Today no caller ever puts one
- * there: `webview/src/state/panels.ts`'s `resolvePanelRequest` exhaustively
+ * `sessionId`/`session_id` key if one is present in `params`. Today no caller
+ * ever puts one there: `webview/src/state/panels.ts`'s `resolvePanelRequest`
+ * exhaustively
  * switches on `DataPanel` and only adds `sessionId` for the `subagents`/
  * `sessions` branches (`tools`/`mcp`/`skills`/`models`/`settings`/`setup`
  * return bare `{panel}`), and every host-internal `fetchPanelData('mcp'|
