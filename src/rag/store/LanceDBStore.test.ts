@@ -308,36 +308,40 @@ describe('LanceDBStore.close — RAG-3', () => {
 });
 
 /**
- * TA-4 (AU-22) routed review finding: TA-1's init-time self-heal
- * (`await this.table.schema()` / `await this.db.dropTable(...)`) had NO
- * try/catch. `src/mcp/codebase-server.ts` awaits `store.init()` unguarded at
- * MCP-child spawn (`main().catch()` only logs and sets an exit code AFTER
- * the fact — the stdio transport never connects), so a probe/drop RPC
- * failure (disk permission, unrelated corruption) would abort the WHOLE
- * MCP-child startup instead of degrading. These tests drive the fix:
- * neither failure point may throw out of `init()` — degrade (log once,
- * continue) per INV-4 and this module's fail-degrade posture.
+ * TA-4 (AU-22) Rev-2 (overrides the Rev-1/routed-review "degrade, don't
+ * abort" decision, INV-4-grounded): a self-heal probe/drop RPC failure
+ * (`await this.table.schema()` / `await this.db.dropTable(...)`) must now
+ * RETHROW from `init()`, not swallow. Swallowing let the indexer's
+ * `ensureStoreInitialized` memoize a "successful" init over a table that is
+ * STILL malformed, so it never retried the heal — stuck forever, worse than
+ * the old bricked-table symptom it was meant to fix. Rethrowing makes
+ * `init()` reject, which clears that memo on the next build's
+ * `ensureStoreInitialized` call; the next build retries `init()`, retries
+ * the heal, and self-heals once the transient blocker (permission/disk/
+ * lock) clears. `this.table` is left exactly as `openTableIfExists()` found
+ * it in both sub-cases reached by this catch — the `schema()`-throws
+ * sub-case (we don't yet know if the table is malformed) and the
+ * `dropTable()`-throws sub-case (we DO know it's malformed but couldn't
+ * remove it) — never forced to `undefined` here: a later `upsert()` would
+ * otherwise `createTable` OVER the still-on-disk table dir, AU-22 reborn.
  */
-describe('LanceDBStore.init — TA-4 (routed review finding): self-heal failure degrades, does not abort startup', () => {
+describe('LanceDBStore.init — TA-4 Rev-2: self-heal probe/drop failure rethrows from init()', () => {
   beforeEach(() => {
     connectMock.mockReset();
   });
 
-  it('does not reject when the self-heal schema() probe itself throws', async () => {
+  it('rejects with a status-only message when the self-heal schema() probe itself throws', async () => {
     const table = makeFakeTable({ vecRows: async () => [], ftsRows: async () => [] });
     table.schema.mockRejectedValue(new Error('EACCES: permission denied'));
     const db = makeFakeDb(table);
     connectMock.mockResolvedValue(db);
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     const store = new LanceDBStore('/fake/index/dir');
 
-    await expect(store.init()).resolves.toBeUndefined();
-    expect(errSpy).toHaveBeenCalled();
-    errSpy.mockRestore();
+    await expect(store.init()).rejects.toThrow(/failed to reset malformed/i);
   });
 
-  it('does not reject when dropTable() throws after the probe finds a missing column', async () => {
+  it('rejects with a status-only message when dropTable() throws after the probe finds a missing column', async () => {
     const table = makeFakeTable({ vecRows: async () => [], ftsRows: async () => [] });
     // Missing required columns (only 'id' present) — the probe finds
     // something to repair and attempts the drop.
@@ -345,12 +349,9 @@ describe('LanceDBStore.init — TA-4 (routed review finding): self-heal failure 
     const db = makeFakeDb(table);
     db.dropTable.mockRejectedValue(new Error('disk error: EIO'));
     connectMock.mockResolvedValue(db);
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     const store = new LanceDBStore('/fake/index/dir');
 
-    await expect(store.init()).resolves.toBeUndefined();
-    expect(errSpy).toHaveBeenCalled();
-    errSpy.mockRestore();
+    await expect(store.init()).rejects.toThrow(/failed to reset malformed/i);
   });
 });

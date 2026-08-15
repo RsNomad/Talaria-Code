@@ -105,21 +105,38 @@ export function escapeSqlLiteral(value: string): string {
  * failure far from the real cause), and `hybridSearch` would report the
  * honest-sounding lie `IndexNotReadyError` instead of the real fault.
  *
- * Settled Rev-1 A4, pinned at write-time against the installed
- * `@lancedb/lancedb@0.33.0`: opening a nonexistent table rejects with a
- * plain `Error` whose message contains `Table 'X' was not found` — there is
- * no exported `TableNotFoundError` class in this version to `instanceof`
- * against instead (checked: not present in the installed package's
- * typings), so message matching is the only signal available. See the
- * pinning test in `LanceDBStore.schema.test.ts` (opens a nonexistent table
- * against the REAL package and asserts this predicate matches the actual
- * rejection) — a future lancedb bump that rewords the message fails that
- * PIN, not silently misclassifies a real error as not-found.
+ * Rev-2 correction (supersedes Rev-1 A4's "`/was not found/i` is safe"):
+ * binary-grounded review + fresh write-time probes against the installed
+ * `@lancedb/lancedb@0.33.0` showed the broad regex OVER-matches — the native
+ * layer and even the pure-JS layer emit several OTHER "was not found"
+ * messages that are real failures, not "table doesn't exist yet" (`The
+ * column X was not found in the Arrow Table` from `dist/arrow.js` on the
+ * createTable path; `Some requested entity was not found`; `Embedding
+ * function '…' was not found.`) — and no typed error is catchable in
+ * 0.33.0 today (`openTable` rejects a plain `Error`, `name: "Error"`, zero
+ * exported error classes; probe-verified). The predicate below is a
+ * forward-compat name-arm (a no-op today, but catches a future lancedb that
+ * surfaces a typed `TableNotFoundError`) plus an ANCHORED message match —
+ * anchored at position 0 to the exact native rendering (`Table '<name>' was
+ * not found`, write-time-probe-verified against the installed package,
+ * including its trailing `Caused by: …` detail) so it excludes every other
+ * "was not found" message shape. See the pinning test in
+ * `LanceDBStore.schema.test.ts` (opens a nonexistent table against the REAL
+ * package and asserts this predicate matches the actual rejection) — a
+ * future lancedb bump that rewords the message fails that PIN, not silently
+ * misclassifies a real error as not-found.
  *
  * Exported for test (mirrors `escapeSqlLiteral` above).
  */
 export function isTableNotFoundError(err: unknown): boolean {
-  return err instanceof Error && /was not found/i.test(err.message);
+  if (!(err instanceof Error)) return false;
+  // Forward-compat: no-op in 0.33.0 (openTable rejects a plain Error today),
+  // catches a future lancedb that surfaces the typed error.
+  if (err.name === 'TableNotFoundError') return true;
+  // Anchored @pos0 to the exact native rendering; excludes every other "was
+  // not found" message (column-not-found, generic-entity, embedding-
+  // function, …).
+  return /^table\s+'[^']*'\s+was not found/i.test(err.message);
 }
 
 /**
@@ -224,23 +241,29 @@ export class LanceDBStore implements VectorStore {
           this.table = undefined;
         }
       } catch (err) {
-        // TA-4 (AU-22) routed review finding: a schema()/dropTable() RPC
-        // failure here (disk permission, unrelated corruption) must NOT
-        // propagate out of init() and abort the whole MCP-child startup —
-        // `codebase-server.ts` awaits `store.init()` unguarded at spawn
-        // (`main().catch()` only logs and sets an exit code AFTER the fact;
-        // the stdio transport never connects, so Hermes gets a dead child
-        // instead of a degraded-but-alive one). Degrade gracefully instead:
-        // log once and leave `table` exactly as the probe found it — the
-        // self-heal simply did not run this time — consistent with INV-4
-        // ("a store error is never converted into 'not created yet'"; this
-        // is the same shape in reverse: a self-heal-probe error is never
-        // converted into a fatal startup abort) and this module's
-        // fail-degrade posture (`hybridSearch`'s FTS leg below is the same
-        // shape: log once, don't kill the caller).
-        console.error(
-          `hermes-codebase: schema self-heal probe for '${TABLE_NAME}' failed — continuing without repairing it this run`,
-          err,
+        // TA-4 (AU-22) Rev-2 (overrides the Rev-1/routed-review "degrade,
+        // don't abort" decision above — INV-4-grounded): RETHROW, do not
+        // swallow. This catch is reached by two different sub-cases —
+        // (a) `schema()` itself throws (we don't yet know whether the table
+        // is malformed; e.g. a permission/corruption error reading it) and
+        // (b) `dropTable()` throws AFTER the probe already found missing
+        // columns (we DO know it's a malformed table, but removing it
+        // failed — e.g. a transient filesystem lock) — but both are handled
+        // identically here: `this.table` is left exactly as
+        // `openTableIfExists()` set it above (never forced to `undefined`
+        // in this catch); only a SUCCESSFUL `dropTable()` earlier in the
+        // `try` clears it. Forcing `undefined` on a failed drop would be
+        // worse than doing nothing: a later `upsert()` would `createTable`
+        // OVER the still-on-disk malformed table directory — AU-22 reborn.
+        // Swallowing (the old behavior) is also wrong: it let the indexer's
+        // `ensureStoreInitialized` memoize a "successful" init over a table
+        // that is STILL malformed, so it never retried the heal — stuck
+        // forever. Rethrowing makes `init()` reject, which clears that memo;
+        // the next build retries `init()`, retries the heal, and self-heals
+        // once the transient blocker clears. Status-only context (no
+        // record/path content) per this file's error-surface rule.
+        throw new Error(
+          `failed to reset malformed '${TABLE_NAME}' table: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }

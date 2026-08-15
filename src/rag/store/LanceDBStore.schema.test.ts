@@ -191,4 +191,84 @@ describe('LanceDBStore — TA-4 (AU-22): openTableIfExists distinguishes not-fou
 
     await expect(store.init()).rejects.toThrow(permissionError.message);
   });
+
+  // Rev-2: the broad `/was not found/i` regex OVER-matched — the installed
+  // `@lancedb/lancedb@0.33.0` emits several OTHER "was not found" messages
+  // that are real failures, not "table doesn't exist yet". Each of these
+  // three must RETHROW out of init() via `openTableIfExists`, driven through
+  // the same `connectImpl` seam as the permission-error case above. Under the
+  // pre-Rev-2 broad regex every one of these was wrongly swallowed into
+  // `table: undefined` (init() resolved instead of rejecting) — these fail
+  // for that reason against the broad-regex implementation.
+  it('rethrows a column-not-found message from the Arrow Table layer (createTable path), not a genuine missing-table', async () => {
+    const columnError = new Error('The column language was not found in the Arrow Table');
+    const fakeDb = {
+      openTable: async () => {
+        throw columnError;
+      },
+      dropTable: async () => undefined,
+      createTable: async () => {
+        throw new Error('createTable must not be called — init() should have rejected first');
+      },
+      close: () => undefined,
+    };
+    const connectImpl = async () => fakeDb as unknown as lancedb.Connection;
+
+    const store = new LanceDBStore('/fake/dir/irrelevant-connectImpl-takes-over', { connectImpl });
+
+    await expect(store.init()).rejects.toThrow(columnError.message);
+  });
+
+  it('rethrows a generic "Some requested entity was not found" message, not a genuine missing-table', async () => {
+    const genericError = new Error('Some requested entity was not found');
+    const fakeDb = {
+      openTable: async () => {
+        throw genericError;
+      },
+      dropTable: async () => undefined,
+      createTable: async () => {
+        throw new Error('createTable must not be called — init() should have rejected first');
+      },
+      close: () => undefined,
+    };
+    const connectImpl = async () => fakeDb as unknown as lancedb.Connection;
+
+    const store = new LanceDBStore('/fake/dir/irrelevant-connectImpl-takes-over', { connectImpl });
+
+    await expect(store.init()).rejects.toThrow(genericError.message);
+  });
+
+  it('rethrows an embedding-function-not-found message, not a genuine missing-table', async () => {
+    const embeddingError = new Error("Embedding function 'x' was not found.");
+    const fakeDb = {
+      openTable: async () => {
+        throw embeddingError;
+      },
+      dropTable: async () => undefined,
+      createTable: async () => {
+        throw new Error('createTable must not be called — init() should have rejected first');
+      },
+      close: () => undefined,
+    };
+    const connectImpl = async () => fakeDb as unknown as lancedb.Connection;
+
+    const store = new LanceDBStore('/fake/dir/irrelevant-connectImpl-takes-over', { connectImpl });
+
+    await expect(store.init()).rejects.toThrow(embeddingError.message);
+  });
+
+  // Rev-2 predicate-level checks (isTableNotFoundError exported for test,
+  // same as escapeSqlLiteral above). These pin the two "must classify as
+  // not-found" arms of the tightened predicate directly.
+  it('classifies the real native not-found rendering, including its trailing "Caused by" detail, as not-found', () => {
+    const nativeShaped = new Error(
+      "Table 'chunks' was not found  Caused by: Dataset at path /x was not found",
+    );
+    expect(isTableNotFoundError(nativeShaped)).toBe(true);
+  });
+
+  it('classifies a future typed TableNotFoundError (by name, forward-compat) as not-found even with an unrelated message', () => {
+    const typedShaped = Object.assign(new Error('x'), { name: 'TableNotFoundError' });
+    expect(isTableNotFoundError(typedShaped)).toBe(true);
+  });
 });
