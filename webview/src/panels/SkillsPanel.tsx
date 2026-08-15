@@ -531,7 +531,14 @@ function InstallFromHubDisclosure({
   // native, so TH-1's stale test keeps asserting `toBeDisabled()`);
   // `installing` is in-flight (goes busy). `handleInstall` already guards
   // both conditions.
-  const installInteraction = busyInteraction(stale, installing);
+  // FR-L1a: while an install is in flight the button is IN-FLIGHT first (F-8:
+  // busy keeps it focusable; the click-guard blocks re-fire) — `stale` may only
+  // engage its native-disable once the round trip has settled. handleInstall's
+  // top-guard (`installing || stale`) is untouched and still blocks every path.
+  // staleNative drives BOTH the native disable AND its explanatory tooltip —
+  // TH-1 introduced them as a pair, and they must stay in lockstep (critic 2).
+  const staleNative = stale && !installing;
+  const installInteraction = busyInteraction(staleNative, installing);
 
   const handleCheck = () => {
     if (!trimmedIdentifier || checking) return;
@@ -731,7 +738,7 @@ function InstallFromHubDisclosure({
                 disabled={installInteraction.nativeDisabled}
                 aria-disabled={installInteraction.ariaDisabled}
                 aria-busy={installInteraction.ariaBusy}
-                title={stale ? 'Identifier changed — run Check again' : undefined}
+                title={staleNative ? 'Identifier changed — run Check again' : undefined}
                 className="mt-2 flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
               >
                 <Icon name={installing ? 'loading' : 'cloud-download'} size={12} spin={installing} />

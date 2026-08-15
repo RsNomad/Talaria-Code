@@ -400,6 +400,36 @@ describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
     await waitFor(() => expect(installed).toEqual(['myorg/tools/a']));
   });
 
+  it('FR-L1a: editing the identifier MID-INSTALL keeps Install busy-focusable (never natively disabled), and the guard still blocks clicks', async () => {
+    const user = userEvent.setup();
+    const installed: string[] = [];
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubInstall={(identifier) => {
+          installed.push(identifier);
+          return new Promise<HubInstallResult>(() => undefined); // never settles — stays mid-flight
+        }}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    await user.type(screen.getByLabelText(/Identifier/i), 'anthropics/skills/pdf');
+    await user.click(screen.getByRole('button', { name: /^Check$/i }));
+    await screen.findByText('x'); // the noop preview/scan fixture's name (same anchor :283 uses)
+    await user.click(screen.getByRole('button', { name: /^Install$/i })); // in flight → 'Installing…'
+    await user.type(screen.getByLabelText(/Identifier/i), '-edited');     // stale flips true MID-FLIGHT
+    const installing = screen.getByRole('button', { name: /Installing…/i });
+    expect(installing, 'FR-L1a: an in-flight Install must stay focusable even when stale').not.toBeDisabled(); // RED at HEAD
+    expect(installing).toHaveAttribute('aria-busy', 'true');
+    expect(installing).toHaveAttribute('aria-disabled', 'true');
+    expect(installing).not.toHaveAttribute('title'); // tooltip is staleNative-gated too (critic-2 lockstep)
+    await user.click(installing);                    // guard (interactive=false), not the attribute, blocks
+    expect(installed).toEqual(['anthropics/skills/pdf']);  // exactly the ONE captured identifier (TH-1)
+  });
+
   it('TH-2 (AU-38): a fresh scan result surfaces summary, policy verdict + reason, and severity counts — not just a bare finding count', async () => {
     const user = userEvent.setup();
     render(
