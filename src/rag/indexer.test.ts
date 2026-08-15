@@ -1,4 +1,12 @@
-import { promises as fs, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  promises as fs,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -1435,6 +1443,13 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
     closeMock.mockClear();
     embedMock.mockClear();
     embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    // CRITICAL remediation: reset to the plain (non-throwing, non-closing)
+    // defaults every test in this block starts from — the new CRITICAL RED
+    // test below installs a closed-state-aware override on both of these to
+    // reproduce the real `LanceDBStore.upsert`'s `requireDb()` throw once
+    // the store is closed, and must not leak into any other test.
+    closeMock.mockImplementation(async () => {});
+    upsertMock.mockImplementation(async () => {});
     fsWatcherListeners.create.length = 0;
     fsWatcherListeners.change.length = 0;
     fsWatcherListeners.delete.length = 0;
@@ -1442,6 +1457,8 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
   afterEach(() => {
     embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    closeMock.mockImplementation(async () => {});
+    upsertMock.mockImplementation(async () => {});
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
@@ -1529,5 +1546,103 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
     // not out-live the store it initialized once that store is closed).
     await indexer.build();
     expect(initMock).toHaveBeenCalledTimes(1); // fails at HEAD: 0 — the stale resolved memo short-circuits store.init().
+  });
+
+  it('CRITICAL RED: dispose() firing mid-flight during reindexFiles\' embed await, on the ordinary (non-secret) incremental change path, must not persist a scrubbed manifest', async () => {
+    // Review finding on TA-5's first pass: the ORDINARY file-change path
+    // (not delete, not secret) reindexes via `reindexFiles`, whose
+    // `embedder.embed` await is exactly where `dispose()` races in — and
+    // this path had NO post-await `disposed` re-check at all, on the
+    // COMMONEST path (every ordinary file change).
+    //
+    // The unconditional `upsertMock`/`deleteByPathMock` doubles used
+    // elsewhere in this file resolve successfully even after the mock
+    // store's `close()` has "run" — that does NOT reproduce the real
+    // `LanceDBStore.upsert`'s `requireDb()` throw once `this.db` is
+    // `undefined` (`LanceDBStore.ts:272-274`, cleared by `close()` at
+    // `LanceDBStore.ts:476-477`). Reproduce that here: a local `closed`
+    // flag, flipped by `closeMock` (mirrors `store.close()` being invoked
+    // from `dispose()`, `indexer.ts:996`), makes `upsertMock` throw exactly
+    // the way `requireDb()` does once the store is actually closed.
+    let closed = false;
+    closeMock.mockImplementation(async () => {
+      closed = true;
+    });
+    upsertMock.mockImplementation(async () => {
+      if (closed) throw new Error('LanceDBStore.init() must be called before use');
+    });
+
+    await writeWorkspaceFile('src/app.txt', 'an ordinary file with real content to chunk, v1.\n');
+    const indexer = makeIndexer();
+    // Seed a REAL manifest entry for this path via a normal, pre-dispose
+    // full build — upsert/close both still run their default (non-throwing/
+    // non-closing) behavior at this point.
+    await indexer.build();
+    const seedManifest = await readManifest();
+    expect(seedManifest['src/app.txt']).toBeDefined();
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+
+    const disposable = indexer.watch();
+
+    // Change the file so the incremental watch path reindexes it, then fire
+    // `dispose()` from INSIDE the mocked `embedder.embed` call — the exact
+    // "dispose() fires while `embedder.embed` is still in flight" race this
+    // fix targets. Returning the vectors normally afterward means
+    // `reindexFiles`'s embed-batch loop resumes exactly as if the network
+    // call had genuinely completed WHILE `disposed` flipped true underneath
+    // it.
+    await writeWorkspaceFile('src/app.txt', 'an ordinary file with real content to chunk, v2.\n');
+    embedMock.mockImplementation(async (texts: string[]) => {
+      indexer.dispose();
+      return texts.map(() => [0.1, 0.2, 0.3]);
+    });
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'src/app.txt') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Fails at HEAD: `store.upsert` throws (closed), `reindexFiles`'s catch
+    // block scrubs `manifest['src/app.txt']` (TA-3), and `handleFsEvent`'s
+    // catch arm unconditionally `writeManifest`s that STRIPPED manifest to
+    // disk — even though `dispose()` already fired. The on-disk manifest
+    // ends up EMPTY even though the store's original row (from the real,
+    // pre-dispose build above) was never actually re-deleted (a no-op
+    // against the by-then-closed table, `LanceDBStore.ts:362-364`) — an
+    // orphan row, resurrectable later. Exactly AU-23's defect, on the
+    // commonest path.
+    const manifestAfter = await readManifest();
+    expect(manifestAfter).toEqual(seedManifest);
+
+    disposable.dispose();
+  });
+
+  it('RED: dispose() firing mid-flight during runBuild\'s embed await must not write manifest.json or manifest.meta.json (clean bail, no throw)', async () => {
+    await writeWorkspaceFile('src/app.txt', 'an ordinary first-build file with real content to chunk.\n');
+
+    const indexer = makeIndexer();
+    embedMock.mockImplementation(async (texts: string[]) => {
+      indexer.dispose();
+      return texts.map(() => [0.1, 0.2, 0.3]);
+    });
+
+    // The FIRST-EVER build on this workspace — no manifest.json exists yet.
+    // `dispose()` fires from inside the awaited `embedder.embed` call, deep
+    // inside `reindexFiles`'s embed-batch loop (`runBuild` -> `reindexFiles`
+    // -> `embedder.embed`), the same race as the incremental test above but
+    // on the full-build path. Unlike that test, `upsert`/`deleteByPath` here
+    // keep their DEFAULT (non-throwing) behavior — this is the clean,
+    // non-throwing bail arm, not the throw-and-scrub arm.
+    await indexer.build();
+
+    // Fails at HEAD: nothing in `reindexFiles`'s embed-batch loop or
+    // `runBuild` re-checks `disposed` after this await, so the batch's
+    // `store.deleteByPath`/`store.upsert` run to completion and `runBuild`
+    // writes a real `manifest.json`/`manifest.meta.json` to disk — mutating
+    // AFTER dispose() fired, INV-5's violation.
+    expect(upsertMock).not.toHaveBeenCalled();
+    expect(deleteByPathMock).not.toHaveBeenCalled();
+    expect(existsSync(path.join(indexDir, 'manifest.json'))).toBe(false);
+    expect(existsSync(path.join(indexDir, 'manifest.meta.json'))).toBe(false);
   });
 });

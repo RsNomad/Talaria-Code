@@ -582,6 +582,19 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // caller declared one.
           expectedWidth ?? observedWidth,
         );
+        // TA-5 (AU-23, Critical remediation) / INV-5: `embedder.embed` above
+        // is a network await — `dispose()` may have fired while it was in
+        // flight. Re-check before this batch's mutations
+        // (`store.deleteByPath`/`store.upsert` below, and the manifest
+        // writes in the per-record loop that follows them). Do NOT rely on
+        // `requireDb()` throwing when the store is closed to catch this —
+        // that's a different module's implementation detail, not this
+        // function's contract. An earlier, already-embedded batch (if any)
+        // already committed before dispose fired, which is fine — INV-5
+        // only forbids mutations AFTER dispose. Bail with whatever width has
+        // been observed so far, matching this function's real return
+        // contract (`Promise<number | undefined>`).
+        if (disposed) return observedWidth;
         // Task 14b: record the width of the very first vector this build
         // actually produced, before any upsert — this is the value the NEXT
         // build's `computeEffectiveWidth` will enforce (and, per the above,
@@ -692,6 +705,15 @@ export function createIndexer(opts: IndexerOptions): Indexer {
 
     const stored = await readManifest();
 
+    // TA-5 (AU-23, Critical remediation) / INV-5: `readManifest()` above is
+    // an await — `dispose()` may have fired while it was pending. `runBuild`
+    // is an equally-long HTTP-embedding op as the incremental watch path
+    // (e.g. deactivation mid-initial-index can race it exactly the same
+    // way), so it gets the same "re-check after every await, before the
+    // next mutation" discipline. Re-check here, before the self-heal
+    // purge's first `store.deleteByPath`.
+    if (disposed) return;
+
     // Self-heal purge (W5-T6): an index built BEFORE the secret-path filter
     // existed may still have a `.env`/`credentials`-class path embedded and
     // sitting in the manifest. Purge any such stored entry unconditionally
@@ -724,6 +746,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     const fingerprintOk = fingerprintMatches(storedMeta);
     const toCompute = fingerprintOk ? diff.toCompute : Object.keys(current);
 
+    // TA-5 (AU-23, Critical remediation) / INV-5: `readMeta()` above is
+    // another await, and the self-heal purge loop above it ran its own
+    // per-iteration `store.deleteByPath` awaits too — re-check before this
+    // next purge's mutations.
+    if (disposed) return;
+
     for (const relPath of diff.toDelete) {
       await store.deleteByPath(relPath);
       delete stored[relPath];
@@ -750,10 +778,21 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // changes again. `writeMeta` is intentionally NOT called on this arm
       // — it records what THIS build observed, and this build did not
       // complete.
+      //
+      // TA-5 (AU-23, Critical remediation) / INV-5: `reindexFiles` above
+      // awaits `embedder.embed` per batch — `dispose()` can fire mid-flight
+      // and the embed loop bails cleanly, possibly after an earlier batch's
+      // scrub already stripped a manifest entry. Writing that stripped
+      // `manifest` to disk AFTER dispose is the same orphan/drift defect as
+      // the incremental path's — skip the write, still propagate the error.
+      if (disposed) throw err;
       await writeManifest(manifest);
       throw err;
     }
 
+    // TA-5 (AU-23, Critical remediation) / INV-5: same hazard as the catch
+    // arm above, for the non-throwing (success) case.
+    if (disposed) return;
     await writeManifest(manifest);
     // Task 14b: if this build embedded nothing (nothing changed, or a
     // fingerprint mismatch found zero files to recompute), there is no NEW
@@ -761,6 +800,10 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     // sidecar already held rather than dropping it. Dropping it here would
     // silently re-open the dims=0 protection gap on the very next no-op
     // build, since `writeMeta` always overwrites the whole sidecar file.
+    //
+    // TA-5 (AU-23, Critical remediation) / INV-5: `writeManifest` above is
+    // itself an await — re-check once more before this last mutation too.
+    if (disposed) return;
     await writeMeta(observedWidth ?? (fingerprintOk ? storedMeta?.width : undefined));
   }
 
@@ -911,11 +954,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         const storedMeta = await readMeta();
         const effectiveWidth = computeEffectiveWidth(storedMeta);
         // TA-5 (AU-23, Med) / INV-5: `readMeta()` above is an await too —
-        // re-check once more before the last remaining mutation path
-        // (`reindexFiles` + the `writeManifest` calls below it).
-        // `reindexFiles` itself ALSO re-checks at its own entry (its own
-        // `ensureStoreInitialized()` await is one more yield point), so both
-        // of this incremental path's mutation steps are covered.
+        // re-check once more before entering `reindexFiles`. This only
+        // covers `reindexFiles`'s OWN entry point (and, since the CRITICAL
+        // remediation below, its internal embed-batch loop too) — it says
+        // nothing about dispose state once `reindexFiles` returns back HERE,
+        // so the two `writeManifest` calls that follow are each re-checked
+        // independently right below, not assumed covered by this one.
         if (disposed) return;
         // AUDIT-5 Task 11 (Task-1 review): read the path resolveWithinWorkspaceReal
         // VALIDATED (pathConfine contract: "read exactly the returned path so the
@@ -939,9 +983,24 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // would otherwise leave rows gone and the on-disk manifest
           // unchanged (same hash) — the file would look "unchanged, no
           // recompute needed" forever.
+          //
+          // TA-5 (AU-23, Critical remediation) / INV-5: `reindexFiles` above
+          // AWAITS `embedder.embed` per batch — `dispose()` can fire while
+          // that network call is in flight. If it does, TA-3's scrub above
+          // may already have deleted this path's manifest entry (its stale
+          // rows were purged but the replacement never fully landed).
+          // Writing that stripped `manifest` to disk AFTER dispose is the
+          // exact orphan/drift defect AU-23 named — on the commonest path
+          // (every ordinary file change). Skip the write, still propagate.
+          if (disposed) throw err;
           await writeManifest(manifest);
           throw err;
         }
+        // TA-5 (AU-23, Critical remediation) / INV-5: same hazard as the
+        // catch arm above, for the non-throwing (success) case — dispose()
+        // firing during reindexFiles's embed await must not let this
+        // continuation write `manifest` afterward.
+        if (disposed) return;
         await writeManifest(manifest);
       });
     }
