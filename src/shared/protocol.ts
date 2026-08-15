@@ -1045,6 +1045,9 @@ export interface SetupProgress {
   line?: string;
   totalBytes?: number;
   completedBytes?: number;
+  /** §7.2.2: terminal marker — the (op,id) stream has SETTLED (success, failure,
+   *  or cancel); the webview deletes its accumulated entry. Carries no other payload. */
+  done?: true;
 }
 
 /**

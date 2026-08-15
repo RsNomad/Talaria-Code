@@ -234,6 +234,14 @@ export function progressKey(op: 'install' | 'pull', id: string): string {
  */
 export function foldSetupProgress(map: SetupProgressMap, msg: SetupProgress): SetupProgressMap {
   const key = progressKey(msg.op, msg.id);
+  if (msg.done === true) {
+    // §7.2.2: terminal marker — the (op,id) stream has settled; delete the
+    // accumulated entry so the UI stops rendering a frozen bar + dead Cancel.
+    if (!(key in map)) return map; // no-op, same reference — no spurious re-render
+    const next = { ...map };
+    delete next[key];
+    return next;
+  }
   const prev = map[key];
   const logTail = msg.line !== undefined ? clampLogTail([...(prev?.logTail ?? []), msg.line]) : (prev?.logTail ?? []);
   const entry: SetupProgressEntry = {

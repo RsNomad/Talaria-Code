@@ -24,7 +24,7 @@ import type { LlamaCppLocateResult } from './llamaCppLocator';
 import type { GgufDestResult } from './modelStore';
 import type { PipxLocateResult } from './pipxLocator';
 import type { HermesPaths } from './pipxInstaller';
-import type { OllamaStatus } from './ollamaClient';
+import type { OllamaStatus, PullProgress } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
 import { validateEndpointUrl } from './remoteProbe';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
@@ -2041,6 +2041,152 @@ describe('onProgress: throttled >=150ms per (op, id) via a real timer', () => {
   });
 });
 
+// --- §7.2.2 (extra-a, AU-61 round T4): terminal `done` on pull settle -------
+//
+// "cancelled/failed Setup pull leaves frozen progress + dead Cancel" — every
+// settle path (cancel, dep-rejection, success) must push a terminal
+// `{op:'pull', id, done:true}` for its own progress id, AFTER the `inFlight`
+// latch release; a progress tick that arrives from the dep AFTER its own
+// promise has settled must never land (the settled-flag guard, required at
+// all four dep-callback call sites in `SetupController.ts` — see that file's
+// `runLibraryPull`/`handleVettedIngest`/`provisionOllama`/`provisionLlamacpp`).
+// Fake timers throughout (this suite's own `PROGRESS_THROTTLE_MS` idiom,
+// mirroring the "onProgress: throttled" describe above) — `flushMicrotasks`
+// (defined in the helper section below) drains the plain-Promise chain
+// (modal confirm -> runLibraryPull -> the dep call) WITHOUT depending on any
+// timer, since fake timers never touch Promise/microtask scheduling; only
+// `pushProgress`'s throttle uses a REAL `setTimeout`, which needs an explicit
+// `vi.advanceTimersByTimeAsync` to actually deliver a queued push.
+describe('§7.2.2 (extra-a, T4): a terminal `done` push on every pull settle path + straggler guard', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a CANCELLED pull emits a terminal done push for its progress id', async () => {
+    let signal: AbortSignal | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        // Streams one tick synchronously, then hangs until the signal
+        // aborts — mirrors the real `pullModel`'s abort-rejects-in-flight
+        // contract (`ollamaClient.ts`'s `readWithAbort`).
+        pullModel: (_endpoint, _model, onProgress, sig): Promise<void> => {
+          signal = sig;
+          onProgress({ status: 'downloading', totalBytes: 10, completedBytes: 1 });
+          return new Promise<void>((_resolve, reject) => {
+            sig.addEventListener('abort', () => {
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          });
+        },
+      },
+    );
+    const received: SetupProgress[] = [];
+    controller.onProgress((p) => received.push(p));
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks();
+    expect(signal).toBeDefined();
+    expect(signal?.aborted).toBe(false);
+
+    // `handleCancel` is synchronous and aborts the latch's AbortController
+    // synchronously — the fake dep's 'abort' listener rejects immediately.
+    void controller.handle('setup.cancel', { op: 'pull', id: 'llama3:8b' });
+    await flushMicrotasks();
+    // The `done` push lands inside the 150ms throttle window right after the
+    // first (immediate) tick — it is queued in the single `pending` slot
+    // until the timer fires.
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    const result = await pullPromise;
+
+    expect(result).toEqual({ ok: false, reason: 'cancelled' });
+    expect(received[received.length - 1]).toEqual({ op: 'pull', id: 'llama3:8b', done: true });
+  });
+
+  it('a FAILED pull (dep rejects) emits the terminal done push', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        pullModel: async (_endpoint, _model, onProgress): Promise<void> => {
+          onProgress({ status: 'downloading', totalBytes: 10, completedBytes: 1 });
+          throw new Error('network down');
+        },
+      },
+    );
+    const received: SetupProgress[] = [];
+    controller.onProgress((p) => received.push(p));
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    const result = await pullPromise;
+
+    expect(result).toEqual({ ok: false, reason: 'network down' });
+    expect(received[received.length - 1]).toEqual({ op: 'pull', id: 'llama3:8b', done: true });
+  });
+
+  it('a SUCCESSFUL pull also emits it (uniform settle contract)', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        pullModel: async (_endpoint, _model, onProgress): Promise<void> => {
+          onProgress({ status: 'success' });
+        },
+      },
+    );
+    const received: SetupProgress[] = [];
+    controller.onProgress((p) => received.push(p));
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    const result = await pullPromise;
+
+    expect(result).toEqual({ ok: true });
+    expect(received[received.length - 1]).toEqual({ op: 'pull', id: 'llama3:8b', done: true });
+  });
+
+  it('a STRAGGLER progress tick after settle is silenced — it can neither overwrite a pending done nor resurrect the entry', async () => {
+    let captured: ((p: PullProgress) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        // Resolves immediately after ONE synchronous tick — `captured` is
+        // the settled-flag-guarded callback `runLibraryPull` actually hands
+        // the dep, not the raw dep-internal one.
+        pullModel: async (_endpoint, _model, onProgress): Promise<void> => {
+          captured = onProgress;
+          onProgress({ status: 'downloading', totalBytes: 10, completedBytes: 1 });
+        },
+      },
+    );
+    const received: SetupProgress[] = [];
+    controller.onProgress((p) => received.push(p));
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    await pullPromise;
+    expect(captured).toBeDefined();
+
+    // The straggler: invoke the CAPTURED callback directly, simulating a
+    // dep progress tick that fires AFTER its own promise already resolved
+    // (and after the handler's `settled` flag flipped in its finally).
+    captured?.({ status: 'downloading', totalBytes: 10, completedBytes: 9 });
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+
+    expect(received[received.length - 1]).toEqual({ op: 'pull', id: 'llama3:8b', done: true });
+    // The straggler's distinguishing byte count must never have landed —
+    // neither by overwriting the pending `done` slot nor by a later push.
+    expect(received.some((p) => p.completedBytes === 9)).toBe(false);
+  });
+});
+
 // --- helper ------------------------------------------------------------------
 
 function settingsMap(entries: Record<string, unknown>): Map<string, unknown> {
@@ -2598,6 +2744,26 @@ describe('T13 presence wire (§4.2 — status() facts, real registry sha256=empt
 /** One macrotask turn — lets a settled probe's .then body (state write +
  *  onStatusChanged fire) run before asserting. */
 const tickT6 = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * §7.2.2 (T4): drains a chain of plain `await`s (e.g. modal-confirm ->
+ * runLibraryPull -> a dep call) WITHOUT depending on any timer — safe under
+ * `vi.useFakeTimers()` because Promise/microtask scheduling is never faked
+ * (only macrotasks — setTimeout/setInterval — are), unlike {@link tickT6}
+ * above, which would hang under fake timers until the clock is advanced.
+ * `turns` is generous on purpose: extra iterations past an already-drained
+ * queue are no-ops.
+ */
+async function flushMicrotasks(turns = 10): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    await Promise.resolve();
+  }
+}
+
+/** §7.2.2 (T4): a real-ms value safely past `PROGRESS_THROTTLE_MS` (150,
+ *  private to `SetupController.ts`) — used to flush a queued throttled push
+ *  (e.g. the terminal `done`) under `vi.advanceTimersByTimeAsync`. */
+const THROTTLE_FLUSH_MS = 200;
 
 // §6 copy, verbatim (drift-locked here AND used by assertions below).
 const LLAMACPP_MISSING_COPY = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';

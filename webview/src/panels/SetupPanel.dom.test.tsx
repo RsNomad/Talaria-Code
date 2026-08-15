@@ -18,14 +18,17 @@ import {
   agentPhaseLabel,
   FIM_LLAMACPP_MODEL_NOTE,
   FIM_PENDING_CAPTION,
+  foldSetupProgress,
   NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
   pendingSelectionLine,
   PIPX_INSTALL_DOCS_URL,
+  progressKey,
   PYTHON_VERSION_HELP_URL,
   RAG_LLAMACPP_MODEL_NOTE,
   RAG_MODEL_FIELD_CAPTION,
   RAG_OLLAMA_PULL_NUDGE,
   TRUST_DISABLED_REASON,
+  type SetupProgressMap,
 } from './setupCards';
 import { DECLINED } from '../state/panels';
 import { must } from '../testing/must';
@@ -473,6 +476,53 @@ describe('FIM card — pull progress renders a percent (§6)', () => {
     // The percent lives under the "Install locally" tab.
     await user.click(screen.getByRole('button', { name: 'Install locally' }));
     expect(screen.getByText('25%')).toBeInTheDocument();
+  });
+});
+
+describe('§7.2.2 extra-a (T4): a `done` fold clears the frozen pull-progress bar + dead Cancel', () => {
+  it('folding a done push removes the progressbar and Cancel — the Pull button REMAINS (it never hid)', async () => {
+    const model = 'qwen2.5-coder:1.5b-base';
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
+    });
+    const dispatch = vi.fn().mockResolvedValue(undefined);
+    const withEntry: SetupProgressMap = {
+      [progressKey('pull', model)]: { op: 'pull', id: model, logTail: [], totalBytes: 1000, completedBytes: 250 },
+    };
+    const mk = (progress: SetupProgressMap) => (
+      <SetupPanel
+        data={{ status: 'success', data }}
+        onRetry={noopRetry}
+        progress={progress}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />
+    );
+
+    const { user, rerender } = setup(mk(withEntry));
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    // Before the fold: frozen bar + Cancel are both up, AND the Pull button
+    // is ALREADY visible (it gates on `!present` alone — SetupPanel.tsx
+    // ConfiguredModelRow — never on the progress entry).
+    expect(screen.getByRole('progressbar')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: `Pull ${model}` })).toBeInTheDocument();
+
+    // §7.2.2: fold the terminal `done` push exactly as the webview's real
+    // `setup.progress` reducer does, then re-render with the folded map —
+    // this is the end-to-end lock on the dead-Cancel symptom (RED at HEAD:
+    // `done` deletes nothing yet, so the bar + Cancel stay frozen forever).
+    const folded = foldSetupProgress(withEntry, { op: 'pull', id: model, done: true });
+    rerender(mk(folded));
+
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
+    // §3.2 critic-2 ordering-trace pin: nothing "reappears" — the Pull
+    // button was visible throughout and stays visible, in its own
+    // ActionButton settled state.
+    expect(screen.getByRole('button', { name: `Pull ${model}` })).toBeInTheDocument();
   });
 });
 

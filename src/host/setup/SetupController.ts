@@ -1600,6 +1600,10 @@ export class SetupController {
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
       this.inFlight.delete(key);
+      // §7.2.2: terminal marker on EVERY settle path (success, failure,
+      // cancel, or a post-latch decline) — the webview deletes its
+      // accumulated progress entry, clearing a frozen bar + dead Cancel.
+      this.pushProgress({ op: 'pull', id: model, done: true });
     }
   }
 
@@ -1676,26 +1680,39 @@ export class SetupController {
       // (d) Tier-1 modal (§6 verbatim) → the T14 ingest engine.
       const confirmed = await this.host.showModal(NEXT_PULL_MODAL_COPY, 'Download');
       if (!confirmed) return { ok: false, reason: 'declined' };
-      await this.deps.ingestGguf(
-        { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
-        endpoint,
-        (p) => {
-          this.pushProgress({
-            op: 'pull',
-            id: created,
-            phase: p.status,
-            ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
-            ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
-          });
-        },
-        abort.signal,
-      );
+      // §7.2.2: settled-flag straggler guard around ingestGguf's own await —
+      // same discipline as {@link runLibraryPull}; required regardless of
+      // the (verified-by-inspection) FROZEN dep's actual timing contract.
+      let settled = false;
+      try {
+        await this.deps.ingestGguf(
+          { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
+          endpoint,
+          (p) => {
+            if (settled) return;
+            this.pushProgress({
+              op: 'pull',
+              id: created,
+              phase: p.status,
+              ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
+              ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
+            });
+          },
+          abort.signal,
+        );
+      } finally {
+        settled = true;
+      }
       return { ok: true };
     } catch (err) {
       if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
       this.inFlight.delete(key);
+      // §7.2.2: terminal marker on EVERY settle path — see handlePullModel's
+      // own finally for the full rationale; progress rides the `created`
+      // name here (T13 `pullGate.test.ts` drift-lock).
+      this.pushProgress({ op: 'pull', id: created, done: true });
     }
   }
 
@@ -1754,6 +1771,10 @@ export class SetupController {
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
       this.inFlight.delete(key);
+      // §7.2.2: terminal marker on EVERY settle path — `entry.id` is the
+      // ONE progress/cancel key on every branch (CC-1/CC-9), so this single
+      // finally covers both `provisionOllama` and `provisionLlamacpp`.
+      this.pushProgress({ op: 'pull', id: entry.id, done: true });
     }
   }
 
@@ -1807,22 +1828,36 @@ export class SetupController {
           'Download',
         );
         if (!confirmed) return { ok: false, reason: 'declined' };
-        await this.deps.ingestGguf(
-          {
-            gguf: {
-              hfRepo: cell.gguf.hfRepo,
-              file: cell.gguf.file,
-              quant: cell.gguf.quant,
-              sha256: cell.verify.sha256,
-              approxBytes: cell.gguf.approxBytes,
-              allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles,
-            },
-            ollamaCreatedName: cell.createdName,
-          },
-          validated.url,
-          (p) => this.pushPullProgress(entry.id, p),
-          signal,
-        );
+        // §7.2.2: settled-flag straggler guard around ingestGguf's own
+        // await — same discipline as {@link runLibraryPull}; the shared
+        // `entry.id`-keyed terminal `done` push lives in the CALLER's
+        // (`handleProvisionModel`'s) finally, which runs strictly after
+        // this flag flips.
+        {
+          let settled = false;
+          try {
+            await this.deps.ingestGguf(
+              {
+                gguf: {
+                  hfRepo: cell.gguf.hfRepo,
+                  file: cell.gguf.file,
+                  quant: cell.gguf.quant,
+                  sha256: cell.verify.sha256,
+                  approxBytes: cell.gguf.approxBytes,
+                  allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles,
+                },
+                ollamaCreatedName: cell.createdName,
+              },
+              validated.url,
+              (p) => {
+                if (!settled) this.pushPullProgress(entry.id, p);
+              },
+              signal,
+            );
+          } finally {
+            settled = true;
+          }
+        }
         return { ok: true };
       }
       case 'live-oid': {
@@ -1845,21 +1880,39 @@ export class SetupController {
           'Download',
         );
         if (!confirmed) return { ok: false, reason: 'declined' };
-        await this.deps.ingestGguf(
-          {
-            gguf: {
-              hfRepo: cell.gguf.hfRepo,
-              file: cell.gguf.file,
-              quant: cell.gguf.quant,
-              sha256: oid.oid,
-              approxBytes: cell.gguf.approxBytes,
-            },
-            ollamaCreatedName: cell.createdName,
-          },
-          validated.url,
-          (p) => this.pushPullProgress(entry.id, p),
-          signal,
-        );
+        // §7.2.2: settled-flag straggler guard — same discipline as the
+        // 'pinned' branch above (this file's own doc for that branch has
+        // the full rationale). NOTE beyond the round's doc's literal 4-site
+        // list: this is the SAME `ingestGguf` dep, the SAME shared
+        // `entry.id`-keyed `done` push, and is in fact the LIVE/reachable
+        // path today (12 of 14 ollama-tier catalog rows use `live-oid`;
+        // `pinned` is currently dormant, sha256 `''`) — so it gets the
+        // identical guard for consistency and genuine safety, not just the
+        // dormant sibling.
+        {
+          let settled = false;
+          try {
+            await this.deps.ingestGguf(
+              {
+                gguf: {
+                  hfRepo: cell.gguf.hfRepo,
+                  file: cell.gguf.file,
+                  quant: cell.gguf.quant,
+                  sha256: oid.oid,
+                  approxBytes: cell.gguf.approxBytes,
+                },
+                ollamaCreatedName: cell.createdName,
+              },
+              validated.url,
+              (p) => {
+                if (!settled) this.pushPullProgress(entry.id, p);
+              },
+              signal,
+            );
+          } finally {
+            settled = true;
+          }
+        }
         return { ok: true };
       }
       default:
@@ -1939,22 +1992,34 @@ export class SetupController {
     // the FRESHLY re-asserted destination (`reassert`), not the stale
     // pre-modal one — the same "read exactly the path that was validated"
     // discipline `pathConfine.ts`'s own doc establishes for reads.
-    await this.deps.downloadGgufToStore(
-      {
-        catalogId: entry.id,
-        gguf: {
-          hfRepo: cell.gguf.hfRepo,
-          file: cell.gguf.file,
-          quant: cell.gguf.quant,
-          sha256: expected,
-          approxBytes: cell.gguf.approxBytes,
+    // §7.2.2: settled-flag straggler guard around downloadGgufToStore's own
+    // await — same discipline as {@link runLibraryPull}; the shared
+    // `entry.id`-keyed terminal `done` push lives in the CALLER's
+    // (`handleProvisionModel`'s) finally, which runs strictly after this
+    // flag flips.
+    let settled = false;
+    try {
+      await this.deps.downloadGgufToStore(
+        {
+          catalogId: entry.id,
+          gguf: {
+            hfRepo: cell.gguf.hfRepo,
+            file: cell.gguf.file,
+            quant: cell.gguf.quant,
+            sha256: expected,
+            approxBytes: cell.gguf.approxBytes,
+          },
         },
-      },
-      reassert.destDir,
-      reassert.destFile,
-      (p) => this.pushPullProgress(entry.id, p),
-      signal,
-    );
+        reassert.destDir,
+        reassert.destFile,
+        (p) => {
+          if (!settled) this.pushPullProgress(entry.id, p);
+        },
+        signal,
+      );
+    } finally {
+      settled = true;
+    }
     // Presence flips: the sidecar now exists, so the next status() scan reads
     // present — fire so the panel re-fetches without waiting for a user poke.
     this.statusChangedEmitter.fire();
@@ -1978,7 +2043,20 @@ export class SetupController {
     if (tag.startsWith('-')) {
       throw new Error(LIBRARY_TAG_DASH_REFUSAL);
     }
-    await this.deps.pullModel(endpoint, tag, (p) => this.pushPullProgress(progressId, p), signal);
+    // §7.2.2: silence a straggler progress tick that fires AFTER
+    // `deps.pullModel`'s own promise has settled — it must never race the
+    // terminal `done` push the caller's `finally` emits right after this
+    // returns (throttle single-pending-slot hazard, SetupController.ts's
+    // `pushProgress`). Verified by inspection: the real `pullModel`
+    // (`ollamaClient.ts`) streams every `onProgress` call from a fully
+    // awaited read loop, strictly before its own promise settles — this
+    // guard is required regardless, since a FROZEN dep is not a contract.
+    let settled = false;
+    try {
+      await this.deps.pullModel(endpoint, tag, (p) => { if (!settled) this.pushPullProgress(progressId, p); }, signal);
+    } finally {
+      settled = true;
+    }
   }
 
   /** One `{op:'pull'}` progress push under the given key — the shared

@@ -3,7 +3,7 @@ import { SetupController, type SetupHost, type SetupControllerDeps } from './Set
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend, NEXT_DEDICATED_MODEL } from './registry';
 import { verifyHfDigest } from './hfDigest';
 import type { PipxLocateResult } from './pipxLocator';
-import type { OllamaStatus } from './ollamaClient';
+import type { OllamaStatus, PullProgress } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
 import type { SetupProgress } from '../../shared/protocol';
 
@@ -120,13 +120,19 @@ function makeGateController(opts: { tree?: unknown; treeStatus?: number } = {}):
   calls: string[];
   ingestArgs: Array<{ spec: unknown; endpoint: string }>;
   emitIngestProgress: { fn?: (p: { status: string; totalBytes?: number; completedBytes?: number }) => void };
-  ingestBehavior: { reject?: Error };
+  ingestBehavior: { reject?: Error; emitDuring?: PullProgress };
 } {
   const calls: string[] = [];
   const host = new FakeHost(calls);
   const ingestArgs: Array<{ spec: unknown; endpoint: string }> = [];
   const emitIngestProgress: { fn?: (p: { status: string; totalBytes?: number; completedBytes?: number }) => void } = {};
-  const ingestBehavior: { reject?: Error } = {};
+  // §7.2.2 (T4): `emitDuring`, when set BEFORE `controller.handle(...)` is
+  // awaited, makes `ingestGguf` call `onProgress` SYNCHRONOUSLY, mid-stream
+  // — needed because `emitIngestProgress.fn` (the captured callback) is now
+  // wrapped in a settled-flag straggler guard (`handleVettedIngest`'s own
+  // doc has the full rationale); firing it AFTER `handle()` has already
+  // resolved is now silently dropped by design.
+  const ingestBehavior: { reject?: Error; emitDuring?: PullProgress } = {};
   const fetchImpl = treeFetch(opts.tree ?? goodTree(), opts.treeStatus ?? 200);
   const deps: SetupControllerDeps = {
     locatePipx: async (): Promise<PipxLocateResult> => ({
@@ -155,6 +161,7 @@ function makeGateController(opts: { tree?: unknown; treeStatus?: number } = {}):
       calls.push('ingestGguf');
       ingestArgs.push({ spec, endpoint });
       emitIngestProgress.fn = onProgress;
+      if (ingestBehavior.emitDuring) onProgress(ingestBehavior.emitDuring);
       if (ingestBehavior.reject) throw ingestBehavior.reject;
     },
     // T7 (beta.6): the legacy pull-gate suite never provisions by catalog id
@@ -242,11 +249,11 @@ describe('T13 vetted-ingest branch (§4.4.3, published pin)', () => {
   });
 
   it('ingest progress rides the existing pull progress stream (op:pull, id: ollamaCreatedName)', async () => {
-    const { controller, emitIngestProgress } = makeGateController();
+    const { controller, ingestBehavior } = makeGateController();
+    ingestBehavior.emitDuring = { status: 'downloading', totalBytes: 10, completedBytes: 5 };
     const events: SetupProgress[] = [];
     controller.onProgress((e) => events.push(e));
     await controller.handle('setup.pullModel', { model: CREATED });
-    emitIngestProgress.fn?.({ status: 'downloading', totalBytes: 10, completedBytes: 5 });
     expect(events).toContainEqual({
       op: 'pull',
       id: CREATED,

@@ -134,6 +134,17 @@ function makeProvController(
     resolve?: LfsOidVerdict | 'reject';
     hang?: 'pull' | 'ingest' | 'store';
     destRefusal?: string;
+    /**
+     * §7.2.2 (T4): when set, the matching dep calls `onProgress` with this
+     * payload SYNCHRONOUSLY, mid-stream (before its own promise settles) —
+     * needed because `emitPullProgress.fn` (below) now wraps a
+     * settled-flag straggler guard (`runLibraryPull`/`provisionOllama`/
+     * `provisionLlamacpp`'s own docs have the full rationale): a manual
+     * POST-hoc invocation of the captured callback, AFTER `await
+     * controller.handle(...)` has already resolved, is now silently
+     * dropped by design — exactly the hazard the guard exists to close.
+     */
+    emitDuring?: { on: 'pull' | 'ingest' | 'store'; progress: PullProgress };
   } = {},
 ): Recorded {
   const calls: string[] = [];
@@ -154,6 +165,7 @@ function makeProvController(
       calls.push('pullModel');
       pullArgs.push({ endpoint, model });
       emitPullProgress.fn = onProgress;
+      if (behaviors.emitDuring?.on === 'pull') onProgress(behaviors.emitDuring.progress);
       if (behaviors.hang === 'pull') await hangUntilAbort(signal);
     },
     probeRemote: async (): Promise<ProbeOutcome> => ({ ok: true, detail: 'ok' }),
@@ -168,6 +180,7 @@ function makeProvController(
       calls.push('ingestGguf');
       ingestArgs.push({ spec, endpoint });
       emitPullProgress.fn = onProgress;
+      if (behaviors.emitDuring?.on === 'ingest') onProgress(behaviors.emitDuring.progress);
       if (behaviors.hang === 'ingest') await hangUntilAbort(signal);
     },
     resolveLfsOid: async (hfRepo, file): Promise<LfsOidVerdict> => {
@@ -191,6 +204,7 @@ function makeProvController(
       calls.push('downloadGgufToStore');
       storeArgs.push({ spec, destDir, destFile });
       emitPullProgress.fn = onProgress;
+      if (behaviors.emitDuring?.on === 'store') onProgress(behaviors.emitDuring.progress);
       if (behaviors.hang === 'store') await hangUntilAbort(signal);
     },
     ...overrides,
@@ -307,11 +321,13 @@ describe('T7 step 4b: library tier (qwen25-coder-1.5b via ollama)', () => {
   });
 
   it('progress rides id = CATALOG id (not the tag); cancel key = pull:<catalog id>', async () => {
-    const { controller, emitPullProgress } = makeProvController();
+    const { controller } = makeProvController(
+      {},
+      { emitDuring: { on: 'pull', progress: { status: 'downloading', totalBytes: 10, completedBytes: 5 } } },
+    );
     const events: SetupProgress[] = [];
     controller.onProgress((e) => events.push(e));
     await controller.handle('setup.provisionModel', { modelId: 'qwen25-coder-1.5b', backend: 'ollama' });
-    emitPullProgress.fn?.({ status: 'downloading', totalBytes: 10, completedBytes: 5 });
     expect(events).toContainEqual({
       op: 'pull',
       id: 'qwen25-coder-1.5b',
@@ -398,7 +414,10 @@ describe('L1-I-1 T2: unsafe NEW params.endpoint through the library-tier provisi
 
 describe('T7: legacy setup.pullModel stays behavior-compatible; runLibraryPull rejects option-shaped tags', () => {
   it("legacy free-text library pull is unchanged (modal copy + pull, tag-keyed progress id)", async () => {
-    const { controller, calls, pullArgs, emitPullProgress } = makeProvController();
+    const { controller, calls, pullArgs } = makeProvController(
+      {},
+      { emitDuring: { on: 'pull', progress: { status: 'downloading' } } },
+    );
     const events: SetupProgress[] = [];
     controller.onProgress((e) => events.push(e));
     const result = await controller.handle('setup.pullModel', { model: 'qwen2.5-coder:1.5b-base' });
@@ -408,7 +427,6 @@ describe('T7: legacy setup.pullModel stays behavior-compatible; runLibraryPull r
       'pullModel',
     ]);
     expect(pullArgs).toEqual([{ endpoint: 'http://127.0.0.1:11434', model: 'qwen2.5-coder:1.5b-base' }]);
-    emitPullProgress.fn?.({ status: 'downloading' });
     expect(events).toContainEqual({ op: 'pull', id: 'qwen2.5-coder:1.5b-base', phase: 'downloading' });
   });
 
