@@ -21,6 +21,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { bridge as BridgeSingleton } from './bridge';
+import type { WebviewToHost } from './protocol';
 
 let bridge: typeof BridgeSingleton;
 
@@ -47,5 +48,30 @@ describe('bridge.post — must never be passed as an unbound method reference (P
   it('bridge.post.bind(bridge) is an equally valid fix shape (same underlying cause)', () => {
     const bound = bridge.post.bind(bridge);
     expect(() => bound({ type: 'ready' })).not.toThrow();
+  });
+});
+
+/*
+ * AU-9/INV-13 (TE-2): the bridge's per-page `instanceId` (minted once, where
+ * this singleton is built) must ride on every `control.request` the RPC
+ * client sends, so a late `control.response` from a PRIOR page instance
+ * (webview reload/re-create) can be told apart from this one — see
+ * `rpc.test.ts` for the correlation-drop mechanism this wiring feeds.
+ */
+describe('bridge.request — AU-9/INV-13: stamps every outgoing control.request with a per-page instanceId', () => {
+  it('RED: the posted control.request carries a non-empty instanceId string', async () => {
+    const outbound: WebviewToHost[] = [];
+    bridge.attachMock((msg) => outbound.push(msg));
+
+    void bridge.request('tools.list');
+    // `Bridge.post` defers mock delivery via `queueMicrotask` — flush it.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const req = outbound.find((m) => m.type === 'control.request');
+    expect(req, 'bridge.request must post a control.request message').toBeDefined();
+    const instanceId = (req as { instanceId?: unknown } | undefined)?.instanceId;
+    expect(typeof instanceId).toBe('string');
+    expect((instanceId as string).length).toBeGreaterThan(0);
   });
 });

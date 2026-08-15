@@ -329,6 +329,120 @@ describe('RpcClient — per-method timeout override (T-12 RPC deadline)', () => 
   });
 });
 
+/*
+ * AU-9/INV-13 (TE-2): "A `control.response` resolves a pending request only
+ * in the page instance that issued it." Root cause at HEAD: `seq` (the
+ * numeric `requestId` counter) is a fresh 0-based counter PER `RpcClient`
+ * instance, and `handleResponse` correlates by `requestId` ALONE within its
+ * own `pending` map — it has no notion of which page instance a response was
+ * actually meant for. After a webview reload/re-create (VS Code disposes and
+ * rebuilds the webview, e.g. tab hidden->shown), a late `control.response`
+ * from the OLD page instance (e.g. an in-flight `setup.install`, whose 30s
+ * timeout is DISABLED — see `METHOD_TIMEOUT_OVERRIDES_MS`) can arrive at the
+ * NEW page instance and resolve a DIFFERENT, unrelated pending request that
+ * happened to reuse the same small `requestId` — wrong data to the wrong
+ * caller. The fix: every `RpcClient` carries a per-instance `instanceId`,
+ * stamps it on every outgoing request, and DROPS any response whose
+ * `instanceId` differs from its own — before ever touching `pending`.
+ */
+describe('RpcClient — AU-9/INV-13: a stale control.response from a PRIOR page instance must never resolve a fresh instance\'s pending request', () => {
+  it('RED: a response stamped with a PRIOR instanceId is dropped — it does NOT resolve a same-requestId pending request created by a NEW instance (webview reload/re-create)', async () => {
+    // Client A = the OLD page instance (before a reload). Advance its `seq`
+    // a few requests deep so its 4th request lands on the SAME numeric
+    // requestId a freshly reloaded page will also reach after a few of its
+    // own requests — `seq` restarts at 0 per NEW RpcClient instance, so this
+    // small-id collision across DIFFERENT page instances is the exact AU-9
+    // precondition.
+    const sentA: ControlRequest[] = [];
+    const clientA = new RpcClient((req) => sentA.push(req), { instanceId: 'instance-A' });
+    clientA.request('tools.list');
+    clientA.request('tools.list');
+    clientA.request('tools.list');
+    clientA.request('setup.install'); // A's #4 — the timeout-DISABLED long op this bug hits hardest
+    const staleRequestId = must(sentA[3]).requestId;
+    expect(staleRequestId).toBe(4);
+
+    // Client B = the NEW page instance after the reload — a FRESH RpcClient
+    // (own `pending` map, own `seq` restarting at 0), a DIFFERENT instanceId.
+    const sentB: ControlRequest[] = [];
+    const clientB = new RpcClient((req) => sentB.push(req), { instanceId: 'instance-B' });
+    clientB.request('tools.list');
+    clientB.request('tools.list');
+    clientB.request('tools.list');
+    const freshPending = clientB.request('setup.install'); // B's own, UNRELATED #4
+    const freshRequestId = must(sentB[3]).requestId;
+    expect(freshRequestId).toBe(staleRequestId); // the exact numeric-id collision this bug exploits
+
+    // A's late settle is delivered to B (the OLD page's JS context is gone —
+    // only B's listeners are live anymore). It must be DROPPED, never
+    // resolving B's unrelated pending #4.
+    clientB.handleResponse({
+      type: 'control.response',
+      requestId: freshRequestId,
+      ok: true,
+      result: 'A-result',
+      instanceId: 'instance-A',
+    });
+
+    // B's own request must still be pending — prove it by now answering it
+    // FOR REAL, stamped with B's own instanceId, and confirming THAT is what
+    // resolves it (at HEAD, the stale delivery above already resolved+
+    // consumed the pending entry with 'A-result', so this second, correctly-
+    // stamped response would land on nothing and 'A-result' would win).
+    clientB.handleResponse({
+      type: 'control.response',
+      requestId: freshRequestId,
+      ok: true,
+      result: 'B-result',
+      instanceId: 'instance-B',
+    });
+
+    await expect(freshPending).resolves.toBe('B-result');
+  });
+
+  it('a response carrying the CURRENT instanceId resolves normally (the non-stale case)', async () => {
+    const sent: ControlRequest[] = [];
+    const rpc = new RpcClient((req) => sent.push(req), { instanceId: 'instance-A' });
+    const pending = rpc.request('tools.list');
+    const requestId = must(sent[0]).requestId;
+
+    rpc.handleResponse({ type: 'control.response', requestId, ok: true, result: 'ok', instanceId: 'instance-A' });
+
+    await expect(pending).resolves.toBe('ok');
+  });
+
+  it('a response with NO instanceId at all (e.g. the standalone MockBackend, which never echoes one) is trusted and resolves normally — additive/defensive same-vsix rollout', async () => {
+    const sent: ControlRequest[] = [];
+    const rpc = new RpcClient((req) => sent.push(req), { instanceId: 'instance-A' });
+    const pending = rpc.request('tools.list');
+    const requestId = must(sent[0]).requestId;
+
+    rpc.handleResponse({ type: 'control.response', requestId, ok: true, result: 'ok' });
+
+    await expect(pending).resolves.toBe('ok');
+  });
+
+  it('stamps a fresh, non-empty instanceId string on outgoing requests by default, stable within one instance, distinct across two instances', () => {
+    const sentA: ControlRequest[] = [];
+    const a = new RpcClient((req) => sentA.push(req));
+    a.request('tools.list');
+    a.request('config.show');
+
+    const sentB: ControlRequest[] = [];
+    const b = new RpcClient((req) => sentB.push(req));
+    b.request('tools.list');
+
+    const idA0 = must(sentA[0]).instanceId;
+    const idA1 = must(sentA[1]).instanceId;
+    const idB0 = must(sentB[0]).instanceId;
+
+    expect(typeof idA0).toBe('string');
+    expect(idA0.length).toBeGreaterThan(0);
+    expect(idA1).toBe(idA0); // stable within the SAME instance
+    expect(idB0).not.toBe(idA0); // distinct across DIFFERENT instances
+  });
+});
+
 describe('App.tsx issues nextEdit.toggle connection-GLOBAL (F-1 source lock, Task 13)', () => {
   const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf-8');
 

@@ -2022,10 +2022,20 @@ export interface NextEditToggleState {
  * arrives via the `panel.data` push, per that method's contract); `ok:false`
  * carries the rejection message so the requester can reject its pending
  * promise (and, for panels, render an Error+Retry state).
+ *
+ * `instanceId` (AU-9/INV-13, TE-2): the requesting page instance's id,
+ * echoed back VERBATIM from the {@link WebviewToHost} `control.request` that
+ * carried it — lets `RpcClient.handleResponse` drop a stale response from a
+ * PRIOR webview instance (reload/re-create) instead of resolving a
+ * same-`requestId` pending request a fresh instance's `seq` counter happens
+ * to have reused. OPTIONAL (unlike the request's own required `instanceId`)
+ * so an older/defensive producer of this envelope (e.g. the standalone
+ * `MockBackend`, which never echoes one) is still a valid, TRUSTED response —
+ * additive, same-vsix-lockstep wire field, no compat shim needed.
  */
 export type ControlResponse =
-  | { ok: true; result: unknown }
-  | { ok: false; error: { message: string } };
+  | { ok: true; result: unknown; instanceId?: string }
+  | { ok: false; error: { message: string }; instanceId?: string };
 
 /**
  * Result payload of a `checkpoint.restore` correlated request (Zone CKPT).
@@ -2256,12 +2266,20 @@ export type WebviewToHost =
    * data fetch (drives Loading/Error+Retry) and `checkpoint.restore` (learns
    * the dirty-worktree-guard outcome). `requestId` is monotonic per webview
    * session.
+   *
+   * `instanceId` (AU-9/INV-13, TE-2): the issuing page instance's id (minted
+   * once per webview (re)creation — see `bridge.ts`). The host echoes it back
+   * verbatim on the `control.response`, and `RpcClient.handleResponse` uses
+   * it to drop a late reply from a PRIOR, now-disposed page instance rather
+   * than let it resolve an unrelated pending request a fresh instance's own
+   * `requestId` counter happens to have reused.
    */
   | {
       type: 'control.request';
       requestId: number;
       method: ControlRequestMethod;
       params?: Record<string, unknown>;
+      instanceId: string;
     };
 
 /* ------------------------------------------------------------------ *

@@ -213,6 +213,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 42,
       method: 'tools.list',
       params: { panel: 'tools' },
@@ -220,7 +221,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
     await flush();
 
     expect(invokeControl).toHaveBeenCalledWith('tools.list', { panel: 'tools' });
-    expect(posted).toEqual([{ type: 'control.response', requestId: 42, ok: true, result: { tools: [] } }]);
+    expect(posted).toEqual([{ type: 'control.response', instanceId: 'test-instance', requestId: 42, ok: true, result: { tools: [] } }]);
   });
 
   it('SEC-4 (audit-3 B-3): redacts credential-shaped fields in a config.show result before posting to the webview', async () => {
@@ -231,6 +232,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 9,
       method: 'config.show',
       params: undefined,
@@ -240,6 +242,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
     expect(posted).toEqual([
       {
         type: 'control.response',
+        instanceId: 'test-instance',
         requestId: 9,
         ok: true,
         result: { mcp_servers: [{ name: 'x', env: '[redacted]' }], theme: 'dark' },
@@ -253,6 +256,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 7,
       method: 'panel.data',
       params: { panel: 'mcp' },
@@ -262,6 +266,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
     expect(posted).toEqual([
       {
         type: 'control.response',
+        instanceId: 'test-instance',
         requestId: 7,
         ok: false,
         error: { message: 'The agent session is not started yet.' },
@@ -275,6 +280,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 3,
       method: 'checkpoint.restore',
       params: { id: 'ckpt-1' },
@@ -283,7 +289,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     expect(invokeControl).toHaveBeenCalledWith('checkpoint.restore', { id: 'ckpt-1' });
     expect(posted).toEqual([
-      { type: 'control.response', requestId: 3, ok: true, result: { restored: false, reason: 'worktree dirty' } },
+      { type: 'control.response', instanceId: 'test-instance', requestId: 3, ok: true, result: { restored: false, reason: 'worktree dirty' } },
     ]);
   });
 });
@@ -316,6 +322,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 1,
       method: 'context.searchFiles',
       params: { query: 'a', maxResults: 10 },
@@ -325,7 +332,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     expect(searchFiles).toHaveBeenCalledWith('a', 10);
     expect(invokeControl).not.toHaveBeenCalled();
     expect(posted).toEqual([
-      { type: 'control.response', requestId: 1, ok: true, result: ['/repo/src/a.ts', '/repo/src/b.ts'] },
+      { type: 'control.response', instanceId: 'test-instance', requestId: 1, ok: true, result: ['/repo/src/a.ts', '/repo/src/b.ts'] },
     ]);
   });
 
@@ -334,6 +341,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 2,
       method: 'context.searchFiles',
       params: { query: 'a' },
@@ -341,7 +349,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     await flush();
 
     expect(invokeControl).not.toHaveBeenCalled();
-    expect(posted).toEqual([{ type: 'control.response', requestId: 2, ok: true, result: [] }]);
+    expect(posted).toEqual([{ type: 'control.response', instanceId: 'test-instance', requestId: 2, ok: true, result: [] }]);
   });
 
   it('setSearchFiles rewires the source at runtime (the mock→real trust-upgrade path)', async () => {
@@ -351,6 +359,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     provider.setSearchFiles(upgraded);
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 3,
       method: 'context.searchFiles',
       params: {},
@@ -358,7 +367,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     await flush();
 
     expect(upgraded).toHaveBeenCalledWith('', 50);
-    expect(posted).toEqual([{ type: 'control.response', requestId: 3, ok: true, result: ['/repo/only.ts'] }]);
+    expect(posted).toEqual([{ type: 'control.response', instanceId: 'test-instance', requestId: 3, ok: true, result: ['/repo/only.ts'] }]);
   });
 });
 
@@ -1156,6 +1165,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 11,
       method: 'nextEdit.toggle',
       params: { source: 'next', on: true },
@@ -1168,6 +1178,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
     expect(calls).toEqual([]);
     expect(posted).toContainEqual({
       type: 'control.response',
+      instanceId: 'test-instance',
       requestId: 11,
       ok: true,
       result: { next: true, generic: false },
@@ -1180,6 +1191,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 12,
       method: 'nextEdit.toggle',
       params: { source: 'generic', on: true },
@@ -1195,6 +1207,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 13,
       method: 'nextEdit.toggle',
       params: { source: 'generic', on: true },
@@ -1203,7 +1216,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     expect(calls).toEqual([]);
     expect(posted).toEqual([
-      { type: 'control.response', requestId: 13, ok: false, error: { message: REFUSE_GENERIC } },
+      { type: 'control.response', instanceId: 'test-instance', requestId: 13, ok: false, error: { message: REFUSE_GENERIC } },
     ]);
   });
 
@@ -1222,6 +1235,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 14,
       method: 'nextEdit.toggle',
       params: { source: 'both', on: 'yes' },
@@ -1242,6 +1256,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 15,
       method: 'nextEdit.toggle',
       params: { source: 'next', on: true },
@@ -1402,6 +1417,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 21,
       method: 'setup.status',
     } as never);
@@ -1426,6 +1442,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 22,
       method: 'setup.recheck',
     } as never);
@@ -1434,7 +1451,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
     await flush();
 
     expect(calls).toEqual([]);
-    expect(posted).toContainEqual({ type: 'control.response', requestId: 22, ok: true, result: { ok: true } });
+    expect(posted).toContainEqual({ type: 'control.response', instanceId: 'test-instance', requestId: 22, ok: true, result: { ok: true } });
   });
 
   it('an accepted setup.* mutation re-pushes fresh SetupData as a panel.data push', async () => {
@@ -1444,6 +1461,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 23,
       method: 'setup.setTunable',
       params: { key: 'talaria.autocomplete.debounceMs', value: 500 },
@@ -1463,6 +1481,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 24,
       method: 'panel.data',
       params: { panel: 'setup' },
@@ -1486,6 +1505,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 25,
       method: 'setup.status',
     } as never);
@@ -1518,6 +1538,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 30,
       method: 'setup.setTunable',
       params: { key: 'not-a-real-tunable', value: 1 },
@@ -1684,6 +1705,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
     seam(provider).handleWebviewMessage({ type: 'ready' });
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 100,
       method: 'panel.data',
       params: { panel: 'setup', trigger: 'hydrate' },
@@ -1704,6 +1726,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 101,
       method: 'panel.data',
       params: { panel: 'setup', trigger: 'activate' },
@@ -1728,6 +1751,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 102,
       method: 'panel.data',
       params: { panel: 'tools' },
@@ -1744,6 +1768,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 103,
       method: 'panel.data',
       params: { panel: 'nonsense' },

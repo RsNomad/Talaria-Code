@@ -756,7 +756,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         // the webview's pending promise resolves (ok:true) or rejects
         // (ok:false) — never hangs. This is the reference path checkpoint
         // restore + every panel fetch now use.
-        void this.handleControlRequest(message.requestId, message.method, message.params);
+        void this.handleControlRequest(message.requestId, message.method, message.params, message.instanceId);
         break;
 
       default:
@@ -874,11 +874,21 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * forever. `invokeControl` results are plain JSON (RPC results, a
    * `RestoreResult`, or `undefined`), so they are structured-clone-safe for
    * `postMessage`.
+   *
+   * `instanceId` (AU-9/INV-13, TE-2) is echoed back VERBATIM on both the
+   * ok:true and ok:false replies — it is opaque to the host, which never
+   * inspects or validates it, only relays it so the webview's `RpcClient` can
+   * tell a fresh reply from a stale one after a reload. Typed
+   * `string | undefined` rather than trusting the wire type's `string`: a
+   * `postMessage` payload is never actually type-checked at runtime, and
+   * echoing `undefined` straight through is harmless (the additive/defensive
+   * rollout posture this field is designed for).
    */
   private async handleControlRequest(
     requestId: number,
     method: ControlRequestMethod,
     params: Record<string, unknown> | undefined,
+    instanceId: string | undefined,
   ): Promise<void> {
     // Task 4 (§4.2): attribute a `panel.data` fetch for the `onWebviewSignal`
     // seam BEFORE running it — `isDataPanel` narrows `extractPanelName`'s
@@ -913,7 +923,13 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       if (panel) {
         this.webviewSignalEmitter.fire({ kind: 'panelFetch', panel, cause, ok: true, hasData: result !== undefined });
       }
-      this.postToWebview({ type: 'control.response', requestId, ok: true, result: redactControlResponse(method, result) });
+      this.postToWebview({
+        type: 'control.response',
+        requestId,
+        ok: true,
+        result: redactControlResponse(method, result),
+        instanceId,
+      });
     } catch (err) {
       if (panel) {
         this.webviewSignalEmitter.fire({ kind: 'panelFetch', panel, cause, ok: false, hasData: false });
@@ -924,6 +940,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         requestId,
         ok: false,
         error: { message: errorMessage(err) },
+        instanceId,
       });
     }
   }

@@ -41,9 +41,30 @@ export interface RpcOptions {
   /** Injectable timers (default: globals) — tests drive the timeout deterministically. */
   setTimeout?: (fn: () => void, ms: number) => unknown;
   clearTimeout?: (handle: unknown) => void;
+  /**
+   * AU-9/INV-13 (TE-2): this client's page-instance id — stamped on every
+   * outgoing `control.request` and checked against every inbound
+   * `control.response` (see {@link RpcClient.handleResponse}). Injectable for
+   * tests; the production caller (`bridge.ts`) mints one fresh id per page
+   * (re)construction. Defaults to a fresh {@link generateInstanceId} id here
+   * so direct `new RpcClient(...)` callers (most of this file's own tests)
+   * keep working unmodified.
+   */
+  instanceId?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * AU-9/INV-13: fallback per-instance id generator — mirrors the
+ * `crypto.randomUUID?.() ?? Math.random()…` shape `Composer.tsx` already uses
+ * for its per-attachment ids (this codebase's established "mint a fresh id,
+ * prefer the CSPRNG when present" pattern), reused here rather than invented
+ * fresh.
+ */
+function generateInstanceId(): string {
+  return crypto.randomUUID?.() ?? `rpc-${Math.random().toString(36).slice(2)}`;
+}
 
 /**
  * T-12 (Tier-2 remediation, RPC deadline): `DEFAULT_TIMEOUT_MS` is shorter
@@ -92,6 +113,8 @@ export class RpcClient {
   private readonly timeoutMs: number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
+  /** AU-9/INV-13: this client's page-instance id — see {@link RpcOptions.instanceId}. */
+  private readonly instanceId: string;
 
   constructor(
     private readonly send: (req: ControlRequest) => void,
@@ -100,6 +123,7 @@ export class RpcClient {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.setTimer = opts.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = opts.clearTimeout ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+    this.instanceId = opts.instanceId ?? generateInstanceId();
   }
 
   /**
@@ -127,7 +151,7 @@ export class RpcClient {
         }, effectiveTimeoutMs);
       }
       this.pending.set(requestId, { resolve, reject, clearTimer: clearTimerFn, tag });
-      this.send({ type: 'control.request', requestId, method, params });
+      this.send({ type: 'control.request', requestId, method, params, instanceId: this.instanceId });
     });
   }
 
@@ -137,9 +161,21 @@ export class RpcClient {
    * uses that to withhold responses from ordinary app listeners. A response
    * with no matching pending id (stale/duplicate) is still "consumed" (returns
    * `true`) but silently dropped.
+   *
+   * AU-9/INV-13 (TE-2): a response stamped with a PRIOR page instance's id is
+   * a late settle from a webview that was reloaded/re-created out from under
+   * it — its numeric `requestId` may collide with an unrelated pending
+   * request THIS (new) instance's own `seq` (which restarts at 0 per
+   * instance) happens to have reused. That response is dropped here, BEFORE
+   * ever touching `pending`, so it can never resolve/reject the wrong
+   * caller. An ABSENT `instanceId` (e.g. the standalone `MockBackend`, which
+   * never echoes one) is NOT treated as a mismatch — it is trusted and
+   * resolved normally, so that additive, defensive rollout path needs no
+   * change.
    */
   handleResponse(msg: HostToWebview): boolean {
     if (msg.type !== 'control.response') return false;
+    if (msg.instanceId !== undefined && msg.instanceId !== this.instanceId) return true;
     const entry = this.pending.get(msg.requestId);
     if (!entry) return true;
     this.pending.delete(msg.requestId);
