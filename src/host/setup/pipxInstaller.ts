@@ -135,7 +135,14 @@ export async function installHermes(
   const installRun = await runAndStream(spawn(env.pipxPath, installArgs, { cwd, signal }), onEvent, signal);
   const alreadyInstalled = hasAlreadyInstalledMarker(installRun.stdoutLines, installRun.stderrLines);
   if (installRun.exitCode !== 0 && !alreadyInstalled) {
-    const detail = tail(installRun.stderrLines);
+    // TC-4/AU-29 belt: `SpawnFn` normally guarantees a non-empty stderr tail
+    // for any nonzero exit (a spawn-level 'error' now synthesizes one — see
+    // `createNodeSpawnFn`), but this module never assumes its own seam —
+    // an empty tail still falls back to the exit code so no future
+    // zero-output failure ever renders the blank
+    // `hermes install failed at phase "pipx-install": ` AU-29 reported.
+    const stderrTail = tail(installRun.stderrLines);
+    const detail = stderrTail.length > 0 ? stderrTail : `exit code ${installRun.exitCode}`;
     onEvent({ kind: 'failed', phase: 'pipx-install', detail });
     throw new InstallFailedError('pipx-install', detail);
   }

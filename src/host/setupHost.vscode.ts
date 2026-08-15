@@ -86,6 +86,18 @@ export function createNodeSpawnFn(): SpawnFn {
       settleExit = resolve;
     });
 
+    // TC-4/AU-29: stderr is routed through a locally pushable/endable
+    // channel (never `child.stderr` directly) so the `'error'` handler
+    // below can inject a synthetic diagnostic line BEFORE the channel ends.
+    // A spawn-level failure (e.g. ENOENT — the pipx binary itself missing)
+    // never carries real stderr bytes (confirmed ordering: `'error'` fires,
+    // THEN `child.stderr` closes empty) — without this every consumer
+    // (`pipxInstaller.ts`'s `tail(stderrLines)`) built its failure detail
+    // from nothing, rendering `hermes install failed at phase "…": ` with
+    // nothing after the colon. Real stderr bytes are still forwarded
+    // through unchanged for every ordinary (non-spawn-error) failure.
+    const stderrChannel = createPushableLineChannel(child.stderr);
+
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     const onAbort = (): void => {
       child.kill('SIGTERM');
@@ -111,19 +123,80 @@ export function createNodeSpawnFn(): SpawnFn {
       // `exitCode: Promise<number>`, no rejection case modeled).
       settleExit(code ?? (signal ? -1 : 0));
     });
-    child.once('error', () => {
+    child.once('error', (err: NodeJS.ErrnoException) => {
       cleanup();
       // A spawn-level error (e.g. ENOENT) still must SETTLE, not reject —
       // surfaced as a clearly-non-zero code so `exitCode !== 0` checks fire.
+      // TC-4/AU-29: push the real reason onto stderr — native stdio never
+      // carries anything for a process that never actually started, so
+      // without this every downstream failure detail built from stderr
+      // alone came out blank.
+      stderrChannel.push(`spawn failed: ${err.code ?? err.name}: ${err.message}`);
+      stderrChannel.end();
       settleExit(-1);
     });
 
     return {
       stdout: lineIterable(child.stdout),
-      stderr: lineIterable(child.stderr),
+      stderr: stderrChannel.iterable,
       exitCode,
     };
   };
+}
+
+/**
+ * TC-4/AU-29: a push/end-controllable async line channel for `stderr` —
+ * real bytes from `source` are forwarded into the SAME channel (via {@link
+ * lineIterable} in the background), so ordinary stderr output passes
+ * through unaffected; `push`/`end` additionally let `createNodeSpawnFn`'s
+ * `'error'` handler inject one synthetic diagnostic line and terminate the
+ * channel immediately, without waiting on (or racing against) the
+ * underlying Readable's own completion. `push` after `end` is a silent
+ * no-op — the channel is already closed, so there is no consumer left to
+ * deliver it to; `end` itself is idempotent (the background forwarder
+ * above also calls it when the real stream finishes).
+ */
+function createPushableLineChannel(source: NodeJS.ReadableStream | null): {
+  iterable: AsyncGenerator<string>;
+  push(line: string): void;
+  end(): void;
+} {
+  const queue: string[] = [];
+  let ended = false;
+  let wake: (() => void) | undefined;
+
+  const push = (line: string): void => {
+    if (ended) return;
+    queue.push(line);
+    wake?.();
+    wake = undefined;
+  };
+  const end = (): void => {
+    if (ended) return;
+    ended = true;
+    wake?.();
+    wake = undefined;
+  };
+
+  async function* generate(): AsyncGenerator<string> {
+    for (;;) {
+      if (queue.length > 0) {
+        yield queue.shift() as string;
+        continue;
+      }
+      if (ended) return;
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  }
+
+  void (async () => {
+    for await (const line of lineIterable(source)) push(line);
+    end();
+  })();
+
+  return { iterable: generate(), push, end };
 }
 
 /** Splits a Node readable byte stream into UTF-8 lines (CRLF-tolerant),

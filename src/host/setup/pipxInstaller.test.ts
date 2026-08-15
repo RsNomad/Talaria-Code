@@ -210,6 +210,23 @@ describe('installHermes — Task 5: pipx install pipeline (§2.2 steps 2–4)', 
     expect(spawnCalls).toHaveLength(1);
   });
 
+  it('AU-29/TC-4 belt: pipx install exits nonzero with NO stderr → detail falls back to the exit code, never blank', async () => {
+    const { spawn } = scriptedSpawn([installRule({ exitCode: 1 })]); // no stdout/stderr lines at all.
+    const { fileExists } = allPathsExist();
+    const events: InstallEvent[] = [];
+
+    const err = await installHermes(RECIPE, ENV, spawn, fileExists, (e) => events.push(e), new AbortController().signal).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(Error);
+    const failedEvent = events.find((e) => e.kind === 'failed');
+    // Fails at HEAD: `detail` is `tail([])` === '' — the exact blank AU-29
+    // describes (`hermes install failed at phase "pipx-install": ` with
+    // nothing after the colon).
+    expect(failedEvent).toEqual({ kind: 'failed', phase: 'pipx-install', detail: 'exit code 1' });
+  });
+
   it('stderr tail is capped at the last 40 lines when the failing spawn produced more', async () => {
     const stderrLines = Array.from({ length: 45 }, (_, i) => `line-${String(i + 1).padStart(2, '0')}`);
     const { spawn } = scriptedSpawn([installRule({ stderr: stderrLines, exitCode: 1 })]);

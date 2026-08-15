@@ -36,6 +36,7 @@ import {
   createLocateLlamaServer,
   createModelStoreLstatIo,
   createModelStorePresenceIo,
+  createNodeSpawnFn,
   createReadOsRelease,
   createSetupControllerDeps,
   createVsCodeSetupHost,
@@ -287,5 +288,47 @@ describe('T6: createSetupControllerDeps — beta.6 engine bindings', () => {
     // refuses; on one without, storeRoot refuses first — both are the same
     // typed {ok:false}, never a path.
     expect(deps.storeDest('Qwen/../evil', 'x.gguf').ok).toBe(false);
+  });
+});
+
+// --- TC-4/AU-29: createNodeSpawnFn — spawn-level 'error' must not leave -------
+// stderr blank (e.g. an ENOENT when the pipx binary itself is missing) --------
+
+describe("TC-4/AU-29: createNodeSpawnFn — spawn 'error' (e.g. ENOENT) synthesizes a real stderr line", () => {
+  it('a real ENOENT spawn (nonexistent binary) yields a non-empty stderr naming ENOENT, never blank', async () => {
+    const spawn = createNodeSpawnFn();
+    const proc = spawn('/definitely/not/a/real/binary-talaria-tc4-au29', [], {
+      cwd: tmpdir(),
+      signal: new AbortController().signal,
+    });
+
+    const stderrLines: string[] = [];
+    for await (const line of proc.stderr) stderrLines.push(line);
+    const exitCode = await proc.exitCode;
+
+    // Fails at HEAD: `child.once('error', ...)` settles exitCode without
+    // ever touching stderr, so `stderrLines` is `[]` and the join below is
+    // `''` — the exact "blank failure detail" AU-29 reports.
+    expect(exitCode).not.toBe(0);
+    expect(stderrLines.length).toBeGreaterThan(0);
+    expect(stderrLines.join('\n')).toContain('ENOENT');
+  });
+
+  it('non-regression: a REAL process that writes stderr and exits nonzero still streams its actual lines unchanged', async () => {
+    const spawn = createNodeSpawnFn();
+    const script = "console.error('real-line-1'); console.error('real-line-2'); process.exit(1);";
+    const proc = spawn(process.execPath, ['-e', script], {
+      cwd: tmpdir(),
+      signal: new AbortController().signal,
+    });
+
+    const stderrLines: string[] = [];
+    for await (const line of proc.stderr) stderrLines.push(line);
+    const exitCode = await proc.exitCode;
+
+    expect(exitCode).toBe(1);
+    // Real stderr content passes through the new channel verbatim — no
+    // synthetic line is injected when the process actually spawned.
+    expect(stderrLines).toEqual(['real-line-1', 'real-line-2']);
   });
 });
