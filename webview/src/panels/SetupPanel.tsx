@@ -700,21 +700,37 @@ function AgentCard({
         // ALSO render.
         <div className="mt-1 flex flex-col gap-1.5">
           {agent.bootstrap?.guidance && <p className="text-2xs text-muted">{agent.bootstrap.guidance}</p>}
-          <div className="flex flex-wrap items-center gap-2">
-            {agent.bootstrap?.command ? (
-              <ActionButton
-                label={`Open terminal: ${agent.bootstrap.command}`}
-                pendingLabel="Installing…"
-                onRun={() => dispatch('setup.openBootstrapTerminal')}
-                disabledReason={disabledReason}
-              />
-            ) : (
+          {agent.bootstrap?.command ? (
+            <div className="flex flex-col gap-1.5">
+              {/* AU-44b: the raw command used to be interpolated INSIDE the
+                  uppercase button label (`Open terminal: ${command}`) — the
+                  `uppercase` CSS class then rendered a case-sensitive shell
+                  command in all-caps, both hard to read and actively
+                  misleading (the real command isn't upper-case). The label
+                  is now the ACTION; the command renders as its own mono
+                  caption underneath, exactly as typed — mirrors the
+                  llama.cpp install button (`localModel.tsx`). */}
+              <div className="flex flex-wrap items-center gap-2">
+                <ActionButton
+                  label="Open terminal"
+                  pendingLabel="Installing…"
+                  onRun={() => dispatch('setup.openBootstrapTerminal')}
+                  disabledReason={disabledReason}
+                />
+                <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
+              </div>
+              <p className="font-mono text-2xs text-muted" title={agent.bootstrap.command}>
+                {agent.bootstrap.command}
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
               <a href={PIPX_INSTALL_DOCS_URL} className="text-2xs text-accent underline" target="_blank" rel="noreferrer">
                 pipx install docs
               </a>
-            )}
-            <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
-          </div>
+              <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
+            </div>
+          )}
         </div>
       )}
       {agent.phase === 'python-unsuitable' && (
@@ -730,12 +746,20 @@ function AgentCard({
           {agent.pythonInstall?.kind === 'command' ? (
             <>
               {agent.detail && <p className="text-2xs text-muted">{agent.detail}</p>}
+              {/* AU-44b: mirrors the pipx-bootstrap terminal button above and
+                  the llama.cpp install button (`localModel.tsx`) — the label
+                  is the ACTION ("Open terminal"), the raw shell command
+                  renders as its own mono caption, never uppercased inside
+                  the label. */}
               <ActionButton
-                label={`Open terminal: ${agent.pythonInstall.command}`}
+                label="Open terminal"
                 pendingLabel="Installing…"
                 onRun={() => dispatch('setup.openBootstrapTerminal', { target: 'python' })}
                 disabledReason={disabledReason}
               />
+              <p className="font-mono text-2xs text-muted" title={agent.pythonInstall.command}>
+                {agent.pythonInstall.command}
+              </p>
             </>
           ) : (
             <>
@@ -1329,6 +1353,7 @@ function FimConnectTab({
       <div className="flex gap-2">
         <ActionButton
           label={testConnectionLabel(endpoint)}
+          pendingLabel="Testing…"
           onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })}
           successLabel="✓ Endpoint reachable"
         />
@@ -1514,6 +1539,7 @@ function OllamaInstallPanel({
       <div>
         <ActionButton
           label={testConnectionLabel(endpoint)}
+          pendingLabel="Testing…"
           icon="plug"
           onRun={() => dispatch('setup.testRemote', { backendId: 'ollama', endpoint })}
           successLabel="✓ Endpoint reachable"
@@ -2010,6 +2036,7 @@ function DedicatedNextForm({
             {!isLlamacppPane && (
               <ActionButton
                 label={testConnectionLabel(endpoint)}
+                pendingLabel="Testing…"
                 onRun={() => dispatch('setup.testRemote', { backendId: selected?.id, endpoint })}
                 successLabel="✓ Endpoint reachable"
               />

@@ -614,14 +614,17 @@ describe('Agent card — pipx-missing gap-state (T10, §6/§1.2): known distro',
     const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     renderPanel(data);
     expect(screen.getByText(bootstrap.guidance)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` })).toBeInTheDocument();
+    // AU-44b: the command is a caption UNDER the button, not inside its label
+    // (mirrors the llama.cpp install button, `localModel.tsx`).
+    expect(screen.getByRole('button', { name: 'Open terminal' })).toBeInTheDocument();
+    expect(screen.getByText(bootstrap.command)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
   });
 
   it('clicking the bootstrap-terminal button dispatches setup.openBootstrapTerminal', async () => {
     const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     const { user, dispatch } = renderPanel(data);
-    await user.click(screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` }));
+    await user.click(screen.getByRole('button', { name: 'Open terminal' }));
     expect(dispatch).toHaveBeenCalledWith('setup.openBootstrapTerminal');
   });
 
@@ -635,7 +638,7 @@ describe('Agent card — pipx-missing gap-state (T10, §6/§1.2): known distro',
   it('the bootstrap-terminal button is trust-gated; [Re-check] stays usable (read-only, §8)', () => {
     const data = baseData({ trusted: false, agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     renderPanel(data);
-    const terminalButton = screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` });
+    const terminalButton = screen.getByRole('button', { name: 'Open terminal' });
     expect(terminalButton).toBeDisabled();
     expect(terminalButton.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeEnabled();
@@ -653,7 +656,7 @@ describe('Agent card — pipx-missing gap-state (T10, §6/§1.2): known distro',
     ) => Promise<unknown>;
     const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     const { user } = renderPanel(data, { dispatch });
-    await user.click(screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` }));
+    await user.click(screen.getByRole('button', { name: 'Open terminal' }));
     expect(screen.getByRole('button', { name: 'Installing…' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
     resolveDispatch({ ok: true });
@@ -687,7 +690,7 @@ describe('Agent card — pipx-missing gap-state (T10, §6): unknown distro — n
 });
 
 describe('Agent card — python-unsuitable (T10, §6): command branch OR guidance branch, Re-check in BOTH', () => {
-  it('command plan: renders {agent.detail} + [Open terminal: {command}] + [Re-check]', async () => {
+  it('command plan: renders {agent.detail} + [Open terminal] + the command as a caption + [Re-check]', async () => {
     const data = baseData({
       agent: {
         ...baseData().agent,
@@ -703,10 +706,12 @@ describe('Agent card — python-unsuitable (T10, §6): command branch OR guidanc
     });
     const { user, dispatch } = renderPanel(data);
     expect(screen.getByText('Found Python 3.14; Hermes needs 3.11-3.13.')).toBeInTheDocument();
-    const button = screen.getByRole('button', {
-      name: 'Open terminal: sudo apt-get install python3.11 python3.11-venv',
-    });
+    // AU-44b: the command is a caption UNDER the button, not inside its label
+    // (mirrors the pipx-bootstrap button above + the llama.cpp install
+    // button, `localModel.tsx`).
+    const button = screen.getByRole('button', { name: 'Open terminal' });
     expect(button).toBeInTheDocument();
+    expect(screen.getByText('sudo apt-get install python3.11 python3.11-venv')).toBeInTheDocument();
     await user.click(button);
     expect(dispatch).toHaveBeenCalledWith('setup.openBootstrapTerminal', { target: 'python' });
     await user.click(screen.getByRole('button', { name: 'Re-check' }));
@@ -728,7 +733,7 @@ describe('Agent card — python-unsuitable (T10, §6): command branch OR guidanc
       },
     });
     renderPanel(data);
-    const button = screen.getByRole('button', { name: 'Open terminal: sudo apt-get install python3.11' });
+    const button = screen.getByRole('button', { name: 'Open terminal' });
     expect(button).toBeDisabled();
     expect(button.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeEnabled();
@@ -1044,6 +1049,31 @@ describe('NEXT card — DedicatedNextForm [Test] button (T11 §6-parity minor)',
       'setup.testRemote',
       expect.objectContaining({ backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' }),
     );
+  });
+
+  // AU-44a: sibling of the FimConnectTab / OllamaInstallPanel Test buttons —
+  // this one dispatches the SAME `setup.testRemote` method and must give the
+  // same action-specific feedback while in flight, not the generic "Working…".
+  it('AU-44a: shows "Testing…" while pending, not the generic "Working…"', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      nextEdit: { ...baseData().nextEdit, dedicatedConfigured: false, endpoint: 'http://127.0.0.1:11434', model: '' },
+    });
+    const { user } = renderPanel(data, { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' }));
+    expect(within(nextCard).getByRole('button', { name: 'Testing…' })).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
   });
 });
 
@@ -1528,7 +1558,9 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
     expect(within(container).queryByText(/^✗/)).not.toBeInTheDocument();
   });
 
-  it('pending is unaffected by the success mechanism: shows "Working…" and announces nothing while in flight', async () => {
+  it('pending is unaffected by the success mechanism: shows "Testing…" and announces nothing while in flight', async () => {
+    // AU-44a: this Test button is a migrated site (`pendingLabel="Testing…"`)
+    // — it no longer falls back to the generic "Working…" while pending.
     let resolveDispatch!: (v: unknown) => void;
     const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
     const { user } = setup(
@@ -1544,7 +1576,8 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
     const button = screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
     await user.click(button);
 
-    expect(screen.getByRole('button', { name: 'Working…' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Testing…' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
     expect(screen.queryByText('✓ Endpoint reachable')).not.toBeInTheDocument();
     expect(screen.queryByText(/^✗/)).not.toBeInTheDocument();
 
@@ -1751,6 +1784,28 @@ describe('T11 — Ollama pane surface-level Test (T10 Minor #4: the "Test the en
     expect(dispatch).toHaveBeenCalledWith('setup.testRemote', {
       backendId: 'ollama',
       endpoint: 'http://127.0.0.1:11434',
+    });
+  });
+
+  // AU-44a: sibling of the FimConnectTab / DedicatedNextForm Test buttons —
+  // this one dispatches the SAME `setup.testRemote` method and must give the
+  // same action-specific feedback while in flight, not the generic "Working…".
+  it('AU-44a: shows "Testing…" while pending, not the generic "Working…"', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(fimBlockData(), { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    const fimCard = must(screen.getByText('Autocomplete (FIM)').closest('section'));
+    const test = within(fimCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
+    await user.click(test);
+    expect(within(fimCard).getByRole('button', { name: 'Testing…' })).toBeInTheDocument();
+    expect(within(fimCard).queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
     });
   });
 });
