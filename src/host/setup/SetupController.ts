@@ -777,6 +777,21 @@ export class SetupController {
       if (state.timer) clearTimeout(state.timer);
     }
     this.throttle.clear();
+    // TC-6 (AU-6): abort every install/pull/provision still latched in
+    // `inFlight` — at HEAD this map was never iterated here, so a
+    // window-reload mid-install left the pipx child / multi-GB GGUF fetch
+    // running detached from a disposed controller. Placed BEFORE the emitter
+    // disposals below (mirrors the llama.cpp probe ordering just after) so
+    // any synchronous abort-path progress a caller emits still finds a live
+    // emitter or is dropped harmlessly; the existing `finally {
+    // this.inFlight.delete(key) }` blocks in every handler make a late
+    // delete here (once those handlers' own catch/finally runs) a no-op.
+    // `AbortController#abort()` never throws — even a listener that throws
+    // is reported asynchronously (Node/DOM event-dispatch semantics), never
+    // synchronously out of `abort()` — so this loop cannot abort disposal
+    // partway through, keeping `dispose()` safe/idempotent by construction.
+    for (const abort of this.inFlight.values()) abort.abort();
+    this.inFlight.clear();
     // T6: supersede + cancel any in-flight llama.cpp probe — its late settle
     // must neither write state nor fire into the (now-cleared) emitter.
     this.llamaCppProbeEpoch += 1;

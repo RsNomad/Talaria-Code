@@ -2999,6 +2999,109 @@ describe('TC-3 (AU-8/INV-11): setup-phase truth aligns with runtime PATH discove
   });
 });
 
+describe('TC-6 (AU-6): dispose() aborts in-flight installs/pulls', () => {
+  it('aborts EVERY registered inFlight AbortController on dispose (install + pull), alongside the pre-existing llama.cpp probe abort (fails at HEAD: install/pull signals stay un-aborted)', async () => {
+    let installSignal: AbortSignal | undefined;
+    let pullSignal: AbortSignal | undefined;
+    let probeSignal: AbortSignal | undefined;
+
+    const { controller } = makeController(
+      {},
+      {
+        // Signal-aware, never-resolving — simulates a real pipx child still
+        // running when the window reloads mid-install (AU-6's exact scenario).
+        installHermes: (_recipe, _env, _onEvent, signal): Promise<HermesPaths> => {
+          installSignal = signal;
+          return new Promise<HermesPaths>(() => {});
+        },
+        // Same shape for a GGUF fetch still streaming mid-pull.
+        pullModel: (_endpoint, _model, _onProgress, signal): Promise<void> => {
+          pullSignal = signal;
+          return new Promise<void>(() => {});
+        },
+        locateLlamaServer: (signal?: AbortSignal): Promise<LlamaCppLocateResult> => {
+          probeSignal = signal;
+          return new Promise<LlamaCppLocateResult>(() => {});
+        },
+      },
+    );
+
+    // Kick the pre-existing (T6) llama.cpp probe.
+    await controller.status();
+
+    // Start an install and a pull — neither ever resolves (the fakes hang),
+    // but each registers its AbortController in `inFlight` synchronously
+    // before the hang — exactly what `dispose()` must reach.
+    void controller.handle('setup.install', { backendId: 'hermes' });
+    void controller.handle('setup.pullModel', { model: 'qwen2.5-coder:1.5b-base' });
+    // Flush the microtask chains (showModal -> locatePipx -> installHermes /
+    // showModal -> runLibraryPull -> pullModel) up to the hanging call.
+    await tickT6();
+    await tickT6();
+
+    expect(installSignal).toBeDefined();
+    expect(pullSignal).toBeDefined();
+    expect(probeSignal).toBeDefined();
+    // Sanity: nothing is aborted yet — proves the assertions below actually
+    // exercise dispose(), not a pre-aborted default.
+    expect(installSignal?.aborted).toBe(false);
+    expect(pullSignal?.aborted).toBe(false);
+    expect(probeSignal?.aborted).toBe(false);
+
+    controller.dispose();
+
+    // AU-6: dispose() must abort every operation still latched in `inFlight`
+    // — at HEAD it aborts only the llama.cpp probe, leaving install/pull
+    // running detached (a pipx child / multi-GB GGUF fetch orphaned).
+    expect(installSignal?.aborted).toBe(true);
+    expect(pullSignal?.aborted).toBe(true);
+    // The pre-existing (T6) llama.cpp probe abort must still fire alongside it.
+    expect(probeSignal?.aborted).toBe(true);
+  });
+
+  it('is idempotent — a second dispose() call does not throw, and inFlight stays aborted', async () => {
+    let installSignal: AbortSignal | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        installHermes: (_recipe, _env, _onEvent, signal): Promise<HermesPaths> => {
+          installSignal = signal;
+          return new Promise<HermesPaths>(() => {});
+        },
+      },
+    );
+    void controller.handle('setup.install', { backendId: 'hermes' });
+    await tickT6();
+
+    expect(() => controller.dispose()).not.toThrow();
+    expect(() => controller.dispose()).not.toThrow();
+    expect(installSignal?.aborted).toBe(true);
+  });
+
+  it("does not regress TC-3's discovery-memo dispose supersession — a late-settling discovery probe after dispose still cannot overwrite state", async () => {
+    let resolveDiscover: ((bin: string) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: () =>
+          new Promise<string>((resolve) => {
+            resolveDiscover = resolve;
+          }),
+      },
+    );
+
+    expect((await controller.status()).agent.phase).toBe('missing'); // kicks the discovery probe
+    controller.dispose();
+
+    resolveDiscover?.('/usr/bin/hermes'); // the SUPERSEDED probe settles late
+    await tickT6();
+
+    // The epoch bump inside dispose() (pre-existing TC-3 behavior) must still
+    // drop this late settle — the memo is never written.
+    expect((await controller.status()).agent.phase).toBe('missing');
+  });
+});
+
 /*
  * beta.6 T9 (§1.3/§2.5): the tests above pin `setup.recheck`'s BEHAVIOR
  * through `controller.handle()` round-trips (a bad scope refused, absent
