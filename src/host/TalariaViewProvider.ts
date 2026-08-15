@@ -18,10 +18,11 @@ import type { FindFilesFn } from './context/searchFilesResponse';
 import { buildDiffUriParts } from './preview/parseDiffUri';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
 import type { DataPanel, NextEditToggleState, Panel, SetupMethod } from '../shared/protocol';
-import { makePanelData, PANEL_SCOPE } from '../shared/protocol';
+import { KNOWN_REQUEST_METHODS, makePanelData, PANEL_SCOPE } from '../shared/protocol';
 import { redactControlResponse } from './redactControlResponse';
 import type { SetupController } from './setup/SetupController';
 import { SetupPanelSource } from './panels/setupPanelSource';
+import { PanelUnavailableError } from './panels/PanelSourceRegistry';
 
 /** Fixed brand accent (teal), layered over `--vscode-*` surfaces in the view. */
 const BRAND_ACCENT = '#14b8a6';
@@ -121,6 +122,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 
   private view?: vscode.WebviewView;
   private readonly disposables: vscode.Disposable[] = [];
+  /** TE-7 (AU-31): per-VIEW scope — `resolveWebviewView`'s own subscriptions
+   *  (`onDidReceiveMessage`, `onDidDispose`), as opposed to {@link
+   *  disposables} which lives for the whole provider. Every VS Code-driven
+   *  re-resolve (tab hidden→shown, memory-pressure re-create) DRAINS this
+   *  array first (belt: also inside the identity-guarded `onDidDispose`
+   *  handler below) instead of appending to it, so a long-lived window that
+   *  keeps re-creating the view never accumulates disposed husks. {@link
+   *  dispose} drains both scopes. */
+  private readonly viewDisposables: vscode.Disposable[] = [];
   /** Task 4 (§4.2): backing emitter for {@link onWebviewSignal} — test-only
    *  observability, inert in production beyond the (harmless) `fire()`
    *  calls with no subscribers. Joins {@link disposables} in the
@@ -258,13 +268,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * rather than left showing the both-off boot default forever.
    */
   setNextEditToggles(port: NextEditTogglePort | undefined): void {
+    // TE-7 (AU-31): dispose-old-then-REPLACE the single slot — never pushed
+    // into {@link disposables} (that used to leave a disposed husk behind on
+    // every rewire); {@link dispose} disposes this field directly.
     this.nextEditTogglesSub?.dispose();
     this.nextEditTogglesSub = undefined;
     this.nextEditToggles = port;
     if (!port) return;
     const sub = port.onDidChange((state) => this.postNextEditState(state));
     this.nextEditTogglesSub = { dispose: () => sub.dispose() };
-    this.disposables.push(this.nextEditTogglesSub);
     this.postNextEditState(port.getState());
   }
 
@@ -293,13 +305,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * one's wiring.
    */
   setSetupController(controller: SetupController): void {
+    // TE-7 (AU-31): dispose-old-then-REPLACE each single slot — never pushed
+    // into {@link disposables} (that used to leave two disposed husks behind
+    // on every rewire); {@link dispose} disposes both fields directly.
     this.setupProgressSub?.dispose();
     this.setupStatusChangedSub?.dispose();
     this.setupController = controller;
     this.setupPanelSource = new SetupPanelSource(controller);
     const sub = controller.onProgress((progress) => this.postToWebview({ type: 'setup.progress', ...progress }));
     this.setupProgressSub = { dispose: () => sub.dispose() };
-    this.disposables.push(this.setupProgressSub);
 
     const statusSub = controller.onStatusChanged(() => {
       this.pushSetupPanelData().catch((err) => {
@@ -307,7 +321,6 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       });
     });
     this.setupStatusChangedSub = { dispose: () => statusSub.dispose() };
-    this.disposables.push(this.setupStatusChangedSub);
   }
 
   /**
@@ -394,6 +407,14 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken,
   ): void {
+    // TE-7 (AU-31): drain the PREVIOUS resolution's per-view scope before
+    // wiring the new one — belt against a re-resolve that arrives without an
+    // intervening `onDidDispose` (the exact re-create path this fixes; the
+    // identity-guarded `onDidDispose` handler below is the other belt, for a
+    // genuine dispose-with-no-reopen). Draining is idempotent: an already-
+    // empty array is a no-op.
+    this.drainViewDisposables();
+
     this.view = webviewView;
     // W2 T3: a freshly-(re)resolved view's React tree has not mounted/sent
     // `ready` yet, even though `this.view` is now non-null — keep the
@@ -417,8 +438,11 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this.buildHtml(webviewView.webview);
 
-    // Webview → backend: decode and dispatch.
-    this.disposables.push(
+    // Webview → backend: decode and dispatch. TE-7 (AU-31): per-VIEW scope
+    // ({@link viewDisposables}), not the provider-lifetime {@link
+    // disposables} — this is what gets drained/replaced on the next resolve
+    // instead of accumulating across re-creates.
+    this.viewDisposables.push(
       webviewView.webview.onDidReceiveMessage((raw: WebviewToHostMessage) =>
         this.handleWebviewMessage(raw),
       ),
@@ -437,11 +461,20 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // late from a SUPERSEDED webview instance (the exact `webviewView`
     // captured by this closure) must never null out a NEWER `this.view` that
     // has already replaced it; only a dispose from the CURRENT view may clear.
-    this.disposables.push(
+    //
+    // TE-7 (AU-31): that SAME identity guard also gates the belt-drain of
+    // {@link viewDisposables} here — a stale/superseded view's dispose must
+    // NEVER drain the scope, since by the time it fires a NEWER
+    // `resolveWebviewView` may already own it (draining here would then tear
+    // down the CURRENT live view's listeners out from under it). Only a
+    // dispose from the CURRENT view drains — the genuine memory-pressure
+    // dispose-with-no-reopen case.
+    this.viewDisposables.push(
       webviewView.onDidDispose(() => {
         if (this.view === webviewView) {
           this.view = undefined;
           this.isWebviewLive = false;
+          this.drainViewDisposables();
         }
       }),
     );
@@ -527,6 +560,22 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** TE-7 (AU-31): dispose + clear {@link viewDisposables} — the CURRENT
+   *  view's own scope only (never the provider-lifetime {@link
+   *  disposables}). Called at the top of every {@link resolveWebviewView}
+   *  (replacing the prior resolution's scope), from the identity-guarded
+   *  `onDidDispose` handler (a genuine dispose-with-no-reopen), and from
+   *  {@link dispose} (final teardown). Idempotent on an empty array. */
+  private drainViewDisposables(): void {
+    for (const d of this.viewDisposables.splice(0)) {
+      try {
+        d.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   dispose(): void {
     try {
       this.backendMessageSub.dispose();
@@ -539,6 +588,26 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       } catch {
         /* ignore */
       }
+    }
+    this.drainViewDisposables();
+    // TE-7 (AU-31): the setter-slot fields ({@link setNextEditToggles}/
+    // {@link setSetupController}) own their current subscription directly
+    // and are no longer pushed into {@link disposables} — dispose them here
+    // instead so final teardown still reaches them.
+    try {
+      this.nextEditTogglesSub?.dispose();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.setupProgressSub?.dispose();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.setupStatusChangedSub?.dispose();
+    } catch {
+      /* ignore */
     }
   }
 
@@ -695,7 +764,12 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         // the `.catch` here is defense in depth only.
         if (this.backend.loadTab) {
           void this.backend
-            .loadTab(message.tabId, message.sessionId, message.cwd)
+            .loadTab(
+              message.tabId,
+              message.sessionId,
+              message.cwd,
+              ...(message.title !== undefined ? ([message.title] as const) : ([] as const)),
+            )
             .catch((err) => this.logger?.appendLine(`[tab.load] ${message.tabId} failed: ${String(err)}`));
         } else {
           this.logger?.appendLine(`[tab.load] ${message.tabId} ignored — backend has no loadTab support`);
@@ -751,7 +825,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         // the webview's pending promise resolves (ok:true) or rejects
         // (ok:false) — never hangs. This is the reference path checkpoint
         // restore + every panel fetch now use.
-        void this.handleControlRequest(message.requestId, message.method, message.params);
+        void this.handleControlRequest(message.requestId, message.method, message.params, message.instanceId);
         break;
 
       default:
@@ -869,12 +943,50 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * forever. `invokeControl` results are plain JSON (RPC results, a
    * `RestoreResult`, or `undefined`), so they are structured-clone-safe for
    * `postMessage`.
+   *
+   * `instanceId` (AU-9/INV-13, TE-2) is echoed back VERBATIM on both the
+   * ok:true and ok:false replies — it is opaque to the host, which never
+   * inspects or validates it, only relays it so the webview's `RpcClient` can
+   * tell a fresh reply from a stale one after a reload. Typed
+   * `string | undefined` rather than trusting the wire type's `string`: a
+   * `postMessage` payload is never actually type-checked at runtime, and
+   * echoing `undefined` straight through is harmless (the additive/defensive
+   * rollout posture this field is designed for).
    */
   private async handleControlRequest(
     requestId: number,
     method: ControlRequestMethod,
     params: Record<string, unknown> | undefined,
+    instanceId: string | undefined,
   ): Promise<void> {
+    // TE-4 (AU-11, INV-15): the boundary allowlist chokepoint — checked
+    // FIRST, before panel-signal attribution, `setup.*`/`nextEdit.toggle`/
+    // `context.searchFiles` special-casing, or any backend dispatch.
+    // `method` is typed `ControlRequestMethod` at compile time, but a
+    // `postMessage` payload is never actually type-checked at runtime (a
+    // compromised/XSS'd webview can post ANY string) — `KNOWN_REQUEST_
+    // METHODS` (derived from the SAME `CONTROL_METHODS`/`SETUP_METHODS`
+    // source arrays the types come from) is the one RUNTIME gate that makes
+    // the type honest. Refusing here — before either backend is reached —
+    // covers the mock AND the real backend identically (the prior gate lived
+    // only inside `ControlDispatcher`, the real-backend-only path); an
+    // unknown `setup.*` name in particular no longer falls through
+    // `isSetupMethod`'s bare prefix check into `SetupController.handle`, so
+    // it can never fire the `pushSetupPanelData` status-probe push either.
+    // CF-14 no-echo: the posted name is NOT sent back to the webview — only
+    // a capped, control-char-stripped copy reaches the host log.
+    if (!KNOWN_REQUEST_METHODS.has(method)) {
+      const detail = String(method).replace(/[\x00-\x1f]/g, '').slice(0, 128);
+      this.logger?.appendLine(`[control.request] refused unknown method '${detail}'`);
+      this.postToWebview({
+        type: 'control.response',
+        requestId,
+        ok: false,
+        error: { message: 'unknown method' },
+        instanceId,
+      });
+      return;
+    }
     // Task 4 (§4.2): attribute a `panel.data` fetch for the `onWebviewSignal`
     // seam BEFORE running it — `isDataPanel` narrows `extractPanelName`'s
     // bare `string | undefined` to a real {@link DataPanel} via membership
@@ -908,7 +1020,13 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       if (panel) {
         this.webviewSignalEmitter.fire({ kind: 'panelFetch', panel, cause, ok: true, hasData: result !== undefined });
       }
-      this.postToWebview({ type: 'control.response', requestId, ok: true, result: redactControlResponse(method, result) });
+      this.postToWebview({
+        type: 'control.response',
+        requestId,
+        ok: true,
+        result: redactControlResponse(method, result),
+        instanceId,
+      });
     } catch (err) {
       if (panel) {
         this.webviewSignalEmitter.fire({ kind: 'panelFetch', panel, cause, ok: false, hasData: false });
@@ -919,6 +1037,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         requestId,
         ok: false,
         error: { message: errorMessage(err) },
+        instanceId,
       });
     }
   }
@@ -1007,13 +1126,27 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   /** `panel.data{panel:'setup'}` — mirrors every other panel's fetch+push
    *  contract (`ControlDispatcher.fetchPanelData`), reached through {@link
    *  setupPanelSource} instead of the agent-backend-owned registry (Setup
-   *  must render under the mock backend too — see the field's own doc). */
+   *  must render under the mock backend too — see the field's own doc).
+   *
+   *  AU-10: the tiny pre-`setSetupController` window (no {@link
+   *  setupPanelSource} wired yet) now REJECTS with a {@link
+   *  PanelUnavailableError} — mirroring `ControlDispatcher.fetchPanelData`'s
+   *  own `unavailable` handling — instead of silently resolving `undefined`
+   *  with no push. The old shape left the webview's correlated request
+   *  resolved-with-nothing (`ok:true, hasData:false`) and its `RemoteData`
+   *  stuck in `loading` forever (INV-14); `handleControlRequest`'s catch
+   *  turns this throw into an honest `control.response{ok:false}`, which the
+   *  webview's existing `fetchPanel` catch path already renders as a
+   *  retryable error. */
   private async handleSetupPanelFetch(): Promise<unknown> {
-    if (!this.setupPanelSource) return undefined;
-    const outcome = await this.setupPanelSource.fetch();
-    if (outcome.data !== undefined) {
-      this.postToWebview(makePanelData('setup', outcome.data));
+    if (!this.setupPanelSource) {
+      throw new PanelUnavailableError('Talaria: Backend Setup is not available in this window.');
     }
+    const outcome = await this.setupPanelSource.fetch();
+    if ('unavailable' in outcome) {
+      throw new PanelUnavailableError(outcome.unavailable);
+    }
+    this.postToWebview(makePanelData('setup', outcome.data));
     return outcome.data;
   }
 
@@ -1032,9 +1165,13 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     const seq = ++this.setupPushSeq;
     const outcome = await this.setupPanelSource.fetch();
     if (seq !== this.setupPushSeq) return; // a newer push has since started — this one is stale, drop it
-    if (outcome.data !== undefined) {
-      this.postToWebview(makePanelData('setup', outcome.data));
-    }
+    // AU-10: this is a fire-and-forget PUSH, not a correlated request — no
+    // caller is waiting to be rejected, so an `unavailable` outcome (never
+    // produced by `SetupPanelSource.fetch()` today; `SetupController.status()`
+    // always resolves real data) just best-effort drops the push, same as
+    // the pre-existing staleness drop above.
+    if ('unavailable' in outcome) return;
+    this.postToWebview(makePanelData('setup', outcome.data));
   }
 
   private handleSearchFiles(params: Record<string, unknown> | undefined): Promise<string[]> {

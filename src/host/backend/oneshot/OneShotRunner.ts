@@ -189,6 +189,14 @@ export class OneShotRunner {
       prompt,
       (id) => {
         ephemeralId = id;
+        // TG-5 (AU-51) layer 1: record EVERY minted ephemeral id here, at the
+        // earliest point it's known — unconditionally, regardless of what
+        // happens to this one-shot afterward (success/timeout/tripwire/a
+        // later `newSession`-resolved-but-deadline-already-fired abort with
+        // no collector ever created, below). This is the deterministic
+        // guarantee INV-20 relies on; `deleteOneShotSession` (layer 2,
+        // wired at every settle point) is only best-effort on top of it.
+        this.port.recordOneShotSessionId(id);
       },
       () => hasTimedOut,
     );
@@ -244,6 +252,15 @@ export class OneShotRunner {
           });
         },
         this.port.logger,
+        // TG-5 (AU-51) layer 2: best-effort server-side cleanup, fired
+        // exactly once (guarded by `OneShotCollector`'s own `settled` flag)
+        // whichever way this one-shot settles — success (below), timeout
+        // (the deadline handler / `abortOneShotIfTimedOut`'s collector
+        // branch), the tool-call tripwire (`OneShotCollector.collect`), or a
+        // teardown/crash bulk-settle (`settleAll`). `deleteOneShotSession`
+        // itself is fire-and-forget (log-only failures) — never throws back
+        // into this synchronous callback.
+        (sid) => this.port.deleteOneShotSession(sid),
       );
       createdCollector = collector;
       this.ephemeral.set(id, collector);
@@ -273,6 +290,15 @@ export class OneShotRunner {
       return await collector.result;
     } catch (err) {
       if (ephemeralId && this.ephemeral.get(ephemeralId) === createdCollector) this.ephemeral.delete(ephemeralId);
+      // TG-5 (AU-51) layer 2: a genuine (non-timeout) error here — e.g.
+      // `client.setSessionMode` rejecting — can land AFTER a session was
+      // minted (`ephemeralId` set) but BEFORE `collector.settle()` is ever
+      // reachable (this `catch` returns directly, bypassing the
+      // `client.prompt`/`collector.result` tail where settle normally
+      // fires). Dispatch the best-effort cleanup here too so this path
+      // isn't silently exempt from it; a no-op when `ephemeralId` was never
+      // set (e.g. `client.newSession` itself threw — nothing was minted).
+      if (ephemeralId) this.port.deleteOneShotSession(ephemeralId);
       return { ok: false, error: errorMessage(err) };
     }
   }
@@ -300,6 +326,18 @@ export class OneShotRunner {
       this.port.logger?.append(`[AcpBackend] one-shot deadline cancel failed: ${errorMessage(err)}`);
     });
     if (collector && this.ephemeral.get(id) === collector) this.ephemeral.delete(id); // M4: identity-guarded
+    // TG-5 (AU-51) layer 2: `collector === undefined` here means the deadline
+    // fired WHILE `client.newSession()` was still pending — no
+    // `OneShotCollector` was ever created for `id` (it's created a few lines
+    // after this checkpoint's ONE call site with an undefined collector,
+    // `runOneShotBody`'s `abortedAfterNewSession` branch), so
+    // `collector.settle()`'s own cleanup dispatch (above, at construction)
+    // will NEVER fire for this id. Dispatch it directly here instead — the
+    // OTHER two call sites always pass an already-registered `collector`, so
+    // by the time timedOut() is true there, the deadline handler already
+    // routed through `collector.settle()` (which already dispatched); this
+    // guard keeps this a single dispatch either way.
+    if (!collector) this.port.deleteOneShotSession(id);
     return { ok: false, error: 'timed out' };
   }
 
@@ -361,6 +399,26 @@ export interface OneShotHostPort {
    */
   resolveRoot(cwd: string): RootCoordinatorLike;
   logger?: Logger;
+  /**
+   * TG-5 (AU-51) layer 1: record `id` — a just-minted ephemeral one-shot
+   * session id — into `AcpBackend`'s `OneShotSessionRegistry` (a bounded,
+   * `workspaceState`-persisted LRU). Called unconditionally, exactly once
+   * per minted id, at the earliest point it's known (`client.newSession`
+   * resolving) — never gated on how the one-shot goes on to settle. This is
+   * the DETERMINISTIC half of the fix: `reshapeSessionsList` drops any id
+   * this registry knows about before the panel ever sees it, regardless of
+   * whether {@link deleteOneShotSession} (best-effort) ever succeeds.
+   */
+  recordOneShotSessionId(id: string): void;
+  /**
+   * TG-5 (AU-51) layer 2: best-effort server-side cleanup — dispatch
+   * `session.delete {session_id: id}` on the tui_gateway control plane once
+   * this one-shot has settled (success/timeout/cancel). Fire-and-forget by
+   * contract (`void`, not `Promise<void>`): the host implementation owns
+   * catching/logging its own failure — a `session.delete` rejection must
+   * NEVER propagate back into (or fail) the one-shot's own result.
+   */
+  deleteOneShotSession(id: string): void;
 }
 
 /**
@@ -381,6 +439,11 @@ class OneShotCollector {
     private readonly sessionId: string,
     private readonly cancelSession: () => void,
     private readonly logger?: Logger,
+    /** TG-5 (AU-51) layer 2: fired from {@link settle} exactly once — see
+     *  that method's doc. `undefined` in contexts that don't need the
+     *  cleanup dispatch (none today; kept optional so a future headless
+     *  caller/test can construct a collector without it). */
+    private readonly onSettled?: (sessionId: string) => void,
   ) {
     let resolve!: (result: OneShotResult) => void;
     this.result = new Promise<OneShotResult>((res) => {
@@ -418,10 +481,18 @@ class OneShotCollector {
     }
   }
 
+  /**
+   * TG-5 (AU-51) layer 2: settling — whichever way (success, prompt error,
+   * timeout, tripwire cancel, or a bulk `settleAll` teardown) — fires
+   * {@link onSettled} exactly once (guarded by the SAME `settled` flag that
+   * already made every OTHER effect here idempotent), dispatching the
+   * best-effort `session.delete` cleanup.
+   */
   settle(result: OneShotResult): void {
     if (this.settled) return;
     this.settled = true;
     this.resolveResult(result);
+    this.onSettled?.(this.sessionId);
   }
 }
 

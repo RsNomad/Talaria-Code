@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { execFile } from 'node:child_process';
+import { promises as fs } from 'node:fs';
 
 /**
  * Linux-first resolution of the Hermes runtime.
@@ -69,6 +70,16 @@ export interface SpawnSpec {
  *
  * This is pure string logic (no FS access) so it is safe to run anywhere,
  * including the Windows dev box. Returns the POSIX sibling path.
+ *
+ * **AU-7 / INV-9 / ADR-3: callers must hand this a REAL path.** Console
+ * scripts installed by pipx (the extension's documented install mechanism —
+ * V5) — and many other installers — are SYMLINKS into a versioned venv dir
+ * (`~/.local/bin/hermes` → `~/.local/share/pipx/venvs/hermes-agent/bin/
+ * hermes`), and pipx puts no `python` next to the symlink itself. Deriving
+ * the sibling off the symlink's own directory yields a path that does not
+ * exist. Callers realpath-resolve the discovered binary FIRST (see
+ * {@link resolveHermes}) and pass the resolved target here — never the
+ * as-discovered path.
  */
 export function deriveVenvPython(hermesBin: string): string {
   const binDir = path.posix.dirname(toPosix(hermesBin));
@@ -138,16 +149,33 @@ const HERMES_LOOKUP_TIMEOUT_MS = 10_000;
  * cwd-dependent logic in the user's own profile scripts (not just direnv)
  * could influence PATH discovery. Pinning a non-workspace cwd converts that
  * happenstance guarantee into a pinned one.
+ *
+ * `signal` (TC-5/AU-28): OPTIONAL — when a caller passes one (e.g.
+ * `pipxLocator.ts`/`llamaCppLocator.ts` threading `locatePipx`/
+ * `locateLlamaServer`'s own `AbortSignal` parameter down into every exec()
+ * call, not just checking it BETWEEN steps), the default implementation
+ * below hands it straight to Node `execFile`'s own `signal` option, which
+ * kills the in-flight child and rejects with an `AbortError` (Node
+ * child_process docs: "the signal option allows aborting the child process
+ * using an AbortController... results in an AbortError"). Before this field
+ * existed, Cancel could only ever be observed BETWEEN steps — an in-flight
+ * 5-10s login-shell probe kept running to its own timeout regardless.
  */
 export type ExecLookup = (
   command: string,
   args: string[],
-  opts: { timeoutMs: number; cwd: string },
+  opts: { timeoutMs: number; cwd: string; signal?: AbortSignal },
 ) => Promise<string>;
 
-const defaultExecLookup: ExecLookup = (command, args, opts) =>
+/** Exported (TC-5/AU-28): the real, `execFile`-backed default — tested
+ *  directly against a REAL `execFile` abort (Global Constraint 4: the
+ *  `ExecLookup` seam carries no error shape of its own, so the actual signal
+ *  wiring is pinned against Node's real behavior, not a hand-rolled fixture —
+ *  same discipline `pipxLocator.test.ts`'s real-timeout `isExecTimeout` test
+ *  already uses). */
+export const defaultExecLookup: ExecLookup = (command, args, opts) =>
   new Promise<string>((resolve, reject) => {
-    execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd }, (err, stdout) => {
+    execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd, signal: opts.signal }, (err, stdout) => {
       if (err) reject(err);
       else resolve(stdout);
     });
@@ -222,15 +250,73 @@ export async function resolveHermesBin(
 }
 
 /**
+ * Test seam: resolve the real (symlink-free) path a discovered binary points
+ * to. Default = `fs.promises.realpath`. Injectable alongside {@link ExecLookup}
+ * so unit tests never touch the real FS (same seam idiom).
+ */
+export type RealpathLookup = (p: string) => Promise<string>;
+
+const defaultRealpathLookup: RealpathLookup = (p) => fs.realpath(p);
+
+/**
+ * Test seam: verify a path exists. Default = `fs.promises.access`.
+ * Injectable alongside {@link RealpathLookup} — same rationale.
+ */
+export type AccessCheck = (p: string) => Promise<void>;
+
+const defaultAccessCheck: AccessCheck = (p) => fs.access(p);
+
+/**
+ * AU-7 / INV-9 / ADR-3: derive + verify the sibling venv interpreter for a
+ * discovered `hermes` binary.
+ *
+ * 1. Realpath the binary FIRST — pipx (and most installers) expose console
+ *    scripts as SYMLINKS into a versioned venv dir, so deriving off the
+ *    symlink's own directory instead of its real target yields a path that
+ *    does not exist (the AU-7 mechanism). A realpath failure (dangling
+ *    link, permission denied) falls back to the lexical path rather than
+ *    giving up — the existence check below still catches a bad result.
+ * 2. Existence-check the derived interpreter before it is ever spawned. A
+ *    miss throws an actionable error naming the `talaria.pythonPath`
+ *    escape hatch instead of failing later as a cryptic exit-127.
+ */
+async function deriveAndVerifyPython(
+  hermesBin: string,
+  realpathImpl: RealpathLookup,
+  accessImpl: AccessCheck,
+): Promise<string> {
+  let realBin: string;
+  try {
+    realBin = await realpathImpl(hermesBin);
+  } catch {
+    realBin = hermesBin;
+  }
+  const python = deriveVenvPython(realBin);
+  try {
+    await accessImpl(python);
+  } catch {
+    throw new Error(
+      `Derived Python interpreter '${python}' (the venv sibling of 'hermes' at its real ` +
+        `location '${realBin}') was not found. Set the 'talaria.pythonPath' setting to the ` +
+        `absolute path of the interpreter that has Hermes installed (its venv 'bin/python').`,
+    );
+  }
+  return python;
+}
+
+/**
  * Full resolution: binary → sibling python → both channel spawn specs, each
  * wrapped in the login shell. `MockBackend` never calls this.
  */
 export async function resolveHermes(
   config: HermesRuntimeConfig,
   exec?: ExecLookup,
+  realpathImpl: RealpathLookup = defaultRealpathLookup,
+  accessImpl: AccessCheck = defaultAccessCheck,
 ): Promise<ResolvedHermes> {
   const hermesBin = await resolveHermesBin(config, exec);
-  const python = config.pythonPath ?? deriveVenvPython(hermesBin);
+  const python =
+    config.pythonPath ?? (await deriveAndVerifyPython(hermesBin, realpathImpl, accessImpl));
   // AUDIT-5 SEC M-3 (F-2): no workspace open -> the agent runs from $HOME,
   // matching the manifest copy — never from process.cwd() (the EH inherits
   // the VS Code install dir).
@@ -240,7 +326,9 @@ export async function resolveHermes(
     hermesBin,
     python,
     cwd,
-    // ACP channel: `hermes acp` (spec §3.1).
+    // ACP channel: `hermes acp` (spec §3.1). Spawned via the ORIGINAL
+    // discovered path (not the realpath target) — the user-visible path
+    // works either way, and this stays what the user configured/PATH found.
     acp: loginShellSpawn(hermesBin, ['acp'], config),
     // Control channel: `python -m tui_gateway.entry` (spec §4.1).
     control: loginShellSpawn(python, ['-m', 'tui_gateway.entry'], config),

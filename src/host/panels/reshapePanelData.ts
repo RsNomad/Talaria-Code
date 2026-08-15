@@ -304,6 +304,8 @@ export function reshapeMcpServers(config: RawConfigFullResult, tools: RawToolsLi
       status,
       command: formatCommand(cfg),
       toolCount: toolset?.tool_count ?? 0,
+      enabled: cfg.enabled !== false,
+      transport: cfg.url ? 'http' : cfg.command ? 'stdio' : 'unknown',
     });
   }
 
@@ -400,18 +402,32 @@ function normalizeUpdatedAt(raw: string | number | null | undefined): string | u
  * (not nullable) fields. `updated_at` may also arrive as a stringified epoch
  * float (or a raw epoch number) rather than ISO-8601 — see
  * {@link normalizeUpdatedAt} (CA-17).
+ *
+ * TG-5 (AU-51, INV-20): `excludeIds` — when supplied — drops any session
+ * whose RESHAPED `id` is a member, keyed post-normalization (so it matches
+ * regardless of whether the raw entry used `session_id` or `sessionId`).
+ * `SessionsPanelSource` passes `ctx.getOneShotSessionIds()` here so
+ * `OneShotRunner`'s ephemeral one-shot ids never reach the panel — the
+ * deterministic layer-1 guarantee (`OneShotSessionRegistry`'s own doc);
+ * every OTHER caller omits it and behaves exactly as before (nothing
+ * dropped).
  */
-export function reshapeSessionsList(raw: RawSessionListResult): SessionsData {
-  const sessions: SessionSummary[] = (raw.sessions ?? []).map((s) => {
-    const id = s.session_id ?? s.sessionId ?? '';
-    const updatedAtRaw = s.updated_at ?? s.updatedAt;
-    return {
-      id,
-      cwd: s.cwd ?? '',
-      title: s.title ?? undefined,
-      updatedAt: normalizeUpdatedAt(updatedAtRaw),
-    };
-  });
+export function reshapeSessionsList(
+  raw: RawSessionListResult,
+  excludeIds?: ReadonlySet<string>,
+): SessionsData {
+  const sessions: SessionSummary[] = (raw.sessions ?? [])
+    .map((s) => {
+      const id = s.session_id ?? s.sessionId ?? '';
+      const updatedAtRaw = s.updated_at ?? s.updatedAt;
+      return {
+        id,
+        cwd: s.cwd ?? '',
+        title: s.title ?? undefined,
+        updatedAt: normalizeUpdatedAt(updatedAtRaw),
+      };
+    })
+    .filter((s) => !excludeIds?.has(s.id));
   const nextCursor = raw.next_cursor ?? raw.nextCursor ?? undefined;
   return { sessions, nextCursor: nextCursor ?? undefined };
 }
@@ -437,8 +453,9 @@ export function reshapeSessionsList(raw: RawSessionListResult): SessionsData {
  *  - `authenticated` — set by `_apply_picker_hints` (`:350-369`), which
  *    `model.options` always runs (`picker_hints=True`, `server.py:12413`);
  *    maps to {@link ModelProvider.connected}.
- * `is_current`/`total_models`/`source`/`capabilities`/`pricing` exist too but
- * are not needed for the frozen `ModelsData` shape.
+ * `is_current`/`total_models`/`capabilities`/`pricing` exist too but are not
+ * needed for the frozen `ModelsData` shape. (`source` IS now used — beta.7 B4,
+ * mapped to {@link ModelProvider.virtual} below.)
  */
 export interface RawModelProviderRow {
   slug?: string;
@@ -447,6 +464,8 @@ export interface RawModelProviderRow {
   is_current?: boolean;
   models?: string[];
   total_models?: number;
+  /** beta.7 B4: `'virtual'` for synthetic rows (MoA) — grounded `inventory.py:509`. */
+  source?: string;
   [key: string]: unknown;
 }
 
@@ -478,6 +497,7 @@ export function reshapeModelOptions(raw: RawModelOptionsResult): ModelsData {
       name: row.name ?? row.slug ?? '',
       connected: Boolean(row.authenticated),
       models,
+      ...(row.source === 'virtual' ? { virtual: true } : {}),
     };
   });
   return { providers, currentModelId: raw.model ?? '' };

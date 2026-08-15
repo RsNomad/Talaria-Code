@@ -352,9 +352,9 @@ export const panelData: PanelDataMap = {
 
   mcp: {
     servers: [
-      { id: 'mcp-github', name: 'github', status: 'connected', command: 'npx -y @modelcontextprotocol/server-github', toolCount: 14 },
-      { id: 'mcp-postgres', name: 'postgres', status: 'connected', command: 'npx -y @modelcontextprotocol/server-postgres postgres://localhost/app', toolCount: 6 },
-      { id: 'mcp-filesystem', name: 'filesystem', status: 'disconnected', command: 'npx -y @modelcontextprotocol/server-filesystem /srv/data', toolCount: 0 },
+      { id: 'mcp-github', name: 'github', status: 'connected', command: 'npx -y @modelcontextprotocol/server-github', toolCount: 14, enabled: true, transport: 'stdio' },
+      { id: 'mcp-postgres', name: 'postgres', status: 'connected', command: 'npx -y @modelcontextprotocol/server-postgres postgres://localhost/app', toolCount: 6, enabled: true, transport: 'stdio' },
+      { id: 'mcp-filesystem', name: 'filesystem', status: 'disconnected', command: 'npx -y @modelcontextprotocol/server-filesystem /srv/data', toolCount: 0, enabled: true, transport: 'stdio' },
     ],
   },
 

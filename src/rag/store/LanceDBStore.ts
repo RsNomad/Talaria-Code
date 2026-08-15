@@ -1,10 +1,87 @@
 import * as lancedb from '@lancedb/lancedb';
+// TA-1 (AU-1, Critical) / V9 (settled, Rev-1 A4): the installed
+// `@lancedb/lancedb@0.33.0` exposes NO `./arrow` subpath in its `package.json`
+// `exports` map (only `.`, `./embedding`, `./embedding/*`) — its own
+// `dist/arrow.d.ts` merely does `export * from "apache-arrow"` (a TYPE
+// re-export, not a value one), so the Arrow constructors below MUST come
+// from `apache-arrow` directly, lancedb's own hoisted dependency (confirmed
+// installed, `apache-arrow@18.1.0`). esbuild bundles it — only lancedb and
+// web-tree-sitter are externals (`esbuild.js`) — and lancedb's own
+// `SchemaLike`/`FieldLike` inputs are duck-typed, so this cross-copy import
+// identity is safe by design.
+import { Field, FixedSizeList, Float32, Int32, Schema, Utf8 } from 'apache-arrow';
 
 import { fuseHybridRows, type StoredRow } from './fuseHybridRows';
 import type { ChunkRecord, SearchFilter, SearchHit, VectorStore } from './VectorStore';
 
 const TABLE_NAME = 'chunks';
 const RESULT_COLUMNS = ['id', 'path', 'startLine', 'endLine', 'content', 'language'];
+// TA-1: the store-boundary invariant (INV-1) is "every RESULT_COLUMNS name +
+// contentHash + vector must exist on the table" — used by both the schema
+// this file pins at createTable and the init()-time self-heal check below.
+const REQUIRED_COLUMNS = [...RESULT_COLUMNS, 'contentHash', 'vector'];
+
+/**
+ * TA-1 (AU-1, Critical): the explicit Arrow schema pinned at `createTable` —
+ * never inferred. Root cause (V1, reproduced): `db.createTable(name, rows)`
+ * with no schema INFERS one from the first batch, and LanceDB drops a column
+ * whose value is `undefined` (JS) in every row of that batch. A docs-first
+ * repo (README sorts first in the walk) makes the first upsert batch
+ * all-undefined `language` (no `EXTENSION_TO_LANGUAGE_ID` entry for md/json/
+ * yml/…) — the table is born without `language`, and every later
+ * real-language upsert throws `Found field not in schema: language` forever.
+ *
+ * Verified empirically against the installed package (this task's own
+ * write-time probe, mirroring V1/V7): passing an explicit `schema` option to
+ * `createTable` is NOT by itself sufficient — `makeArrowTable`'s internal
+ * `inferSchema` still walks the ROW DATA to decide which of the schema's
+ * fields actually ended up in the table, and treats a JS `undefined` value
+ * as "field absent from this row" for every row it sees (`arrow.js`'s own
+ * comment: "Skip undefined values - they should be treated the same as
+ * missing fields"). A field with an all-`undefined` value across the WHOLE
+ * create batch is therefore still dropped even with this schema passed,
+ * unless every row supplies an explicit value for it. `toStoreRow` below
+ * closes that gap by coercing a missing `language` to `null` (a real, typed,
+ * schema-observed value meaning "no language"), not `undefined`.
+ *
+ * `language` stays nullable — the STORE must not assume the indexer's own
+ * `?? 'text'` default (indexer.ts) always ran; this is TA-1's own,
+ * independent layer of defense-in-depth (Rev-1 A1's framing).
+ */
+function buildChunksSchema(vectorWidth: number): Schema {
+  return new Schema([
+    new Field('id', new Utf8(), false),
+    new Field('path', new Utf8(), false),
+    new Field('content', new Utf8(), false),
+    new Field('contentHash', new Utf8(), false),
+    new Field('language', new Utf8(), true),
+    new Field('startLine', new Int32(), false),
+    new Field('endLine', new Int32(), false),
+    // `item` is the Arrow list-child field name LanceDB's own examples and
+    // internal vector-column construction use (`arrow.js`:
+    // `new Field("item", floatType, true)`) — matched here for consistency.
+    new Field('vector', new FixedSizeList(vectorWidth, new Field('item', new Float32(), true)), false),
+  ]);
+}
+
+/**
+ * TA-1: the one place a `ChunkRecord` becomes a row object sent to the
+ * native binding. `language` is coerced `undefined -> null` — see
+ * `buildChunksSchema`'s doc comment for why that coercion (not a bare
+ * `record.language`) is load-bearing for the create-batch path.
+ */
+function toStoreRow(record: ChunkRecord): Record<string, unknown> {
+  return {
+    id: record.id,
+    path: record.path,
+    startLine: record.startLine,
+    endLine: record.endLine,
+    content: record.content,
+    contentHash: record.contentHash,
+    language: record.language ?? null,
+    vector: record.vector,
+  };
+}
 
 /**
  * SQL string-literal escaping for the two predicates this store builds by
@@ -17,6 +94,49 @@ const RESULT_COLUMNS = ['id', 'path', 'startLine', 'endLine', 'content', 'langua
  */
 export function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
+}
+
+/**
+ * TA-4 (AU-22, Med) — distinguishes a genuine "table doesn't exist yet"
+ * rejection from every other native `openTable` failure (permissions,
+ * corruption, version mismatch). `openTableIfExists`'s bare catch used to
+ * convert ANY of these into "not created yet", so the next `upsert()` would
+ * call `createTable` over a table that might actually exist (a confusing
+ * failure far from the real cause), and `hybridSearch` would report the
+ * honest-sounding lie `IndexNotReadyError` instead of the real fault.
+ *
+ * Rev-2 correction (supersedes Rev-1 A4's "`/was not found/i` is safe"):
+ * binary-grounded review + fresh write-time probes against the installed
+ * `@lancedb/lancedb@0.33.0` showed the broad regex OVER-matches — the native
+ * layer and even the pure-JS layer emit several OTHER "was not found"
+ * messages that are real failures, not "table doesn't exist yet" (`The
+ * column X was not found in the Arrow Table` from `dist/arrow.js` on the
+ * createTable path; `Some requested entity was not found`; `Embedding
+ * function '…' was not found.`) — and no typed error is catchable in
+ * 0.33.0 today (`openTable` rejects a plain `Error`, `name: "Error"`, zero
+ * exported error classes; probe-verified). The predicate below is a
+ * forward-compat name-arm (a no-op today, but catches a future lancedb that
+ * surfaces a typed `TableNotFoundError`) plus an ANCHORED message match —
+ * anchored at position 0 to the exact native rendering (`Table '<name>' was
+ * not found`, write-time-probe-verified against the installed package,
+ * including its trailing `Caused by: …` detail) so it excludes every other
+ * "was not found" message shape. See the pinning test in
+ * `LanceDBStore.schema.test.ts` (opens a nonexistent table against the REAL
+ * package and asserts this predicate matches the actual rejection) — a
+ * future lancedb bump that rewords the message fails that PIN, not silently
+ * misclassifies a real error as not-found.
+ *
+ * Exported for test (mirrors `escapeSqlLiteral` above).
+ */
+export function isTableNotFoundError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  // Forward-compat: no-op in 0.33.0 (openTable rejects a plain Error today),
+  // catches a future lancedb that surfaces the typed error.
+  if (err.name === 'TableNotFoundError') return true;
+  // Anchored @pos0 to the exact native rendering; excludes every other "was
+  // not found" message (column-not-found, generic-entity, embedding-
+  // function, …).
+  return /^table\s+'[^']*'\s+was not found/i.test(err.message);
 }
 
 /**
@@ -66,8 +186,25 @@ export class LanceDBStore implements VectorStore {
    * once the first failure has been recorded.
    */
   private ftsRepairAttempted = false;
+  private readonly connectImpl: typeof lancedb.connect;
 
-  constructor(private readonly indexDir: string) {}
+  /**
+   * TA-4 (AU-22, Med) / Rev-1 A5 — named seam: `LanceDBStore` built its own
+   * connection inline with no injection point, so the RED test proving a
+   * real (non-not-found) `openTable` failure propagates out of `init()`
+   * could only be driven by mocking the entire `@lancedb/lancedb` module —
+   * which would stop this file's OTHER real-package tests
+   * (`LanceDBStore.schema.test.ts`, TA-1's) from running against the REAL
+   * package in the same suite. `connectImpl` defaults to the real
+   * `lancedb.connect`, the repo's established injectable-seam idiom
+   * (`ExecLookup`, `fetchImpl`).
+   */
+  constructor(
+    private readonly indexDir: string,
+    options: { connectImpl?: typeof lancedb.connect } = {},
+  ) {
+    this.connectImpl = options.connectImpl ?? lancedb.connect;
+  }
 
   async init(): Promise<void> {
     // CF-04: `readConsistencyInterval: 0` is LanceDB's STRONG-consistency
@@ -80,8 +217,56 @@ export class LanceDBStore implements VectorStore {
     // watcher's incremental writes (mergeInsert/createTable) made from the
     // extension host process. Correctness over the (local-filesystem, cheap)
     // per-read staleness check.
-    this.db = await lancedb.connect(this.indexDir, { readConsistencyInterval: 0 });
+    this.db = await this.connectImpl(this.indexDir, { readConsistencyInterval: 0 });
     this.table = await this.openTableIfExists();
+    // TA-1 (AU-1, Critical) self-heal: a table built by a PRE-FIX version of
+    // this store (or otherwise missing a required column) is bricked forever
+    // — every upsert into it throws `Found field not in schema`, every
+    // `hybridSearch` throws too, and nothing before this fix ever detected
+    // or repaired it (V1). Column-NAME-only check (never types): the inline
+    // width guard in `upsert()` below makes a 0-width `vector` column
+    // unreachable going forward, so the only malformed shape that can exist
+    // on disk is a MISSING column — name presence is sufficient (Rev-1 A1).
+    // Checking types too would risk a false-positive drop of a healthy table
+    // (design doc, Top risk #1) for no added protection.
+    if (this.table) {
+      try {
+        const fields = (await this.table.schema()).fields.map((f) => f.name);
+        const missing = REQUIRED_COLUMNS.filter((name) => !fields.includes(name));
+        if (missing.length > 0) {
+          console.error(
+            `hermes-codebase: dropping a legacy '${TABLE_NAME}' table missing required column(s) [${missing.join(', ')}] — the next index build recreates it with the current pinned schema`,
+          );
+          await this.db.dropTable(TABLE_NAME);
+          this.table = undefined;
+        }
+      } catch (err) {
+        // TA-4 (AU-22) Rev-2 (overrides the Rev-1/routed-review "degrade,
+        // don't abort" decision above — INV-4-grounded): RETHROW, do not
+        // swallow. This catch is reached by two different sub-cases —
+        // (a) `schema()` itself throws (we don't yet know whether the table
+        // is malformed; e.g. a permission/corruption error reading it) and
+        // (b) `dropTable()` throws AFTER the probe already found missing
+        // columns (we DO know it's a malformed table, but removing it
+        // failed — e.g. a transient filesystem lock) — but both are handled
+        // identically here: `this.table` is left exactly as
+        // `openTableIfExists()` set it above (never forced to `undefined`
+        // in this catch); only a SUCCESSFUL `dropTable()` earlier in the
+        // `try` clears it. Forcing `undefined` on a failed drop would be
+        // worse than doing nothing: a later `upsert()` would `createTable`
+        // OVER the still-on-disk malformed table directory — AU-22 reborn.
+        // Swallowing (the old behavior) is also wrong: it let the indexer's
+        // `ensureStoreInitialized` memoize a "successful" init over a table
+        // that is STILL malformed, so it never retried the heal — stuck
+        // forever. Rethrowing makes `init()` reject, which clears that memo;
+        // the next build retries `init()`, retries the heal, and self-heals
+        // once the transient blocker clears. Status-only context (no
+        // record/path content) per this file's error-surface rule.
+        throw new Error(
+          `failed to reset malformed '${TABLE_NAME}' table: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   private requireDb(): lancedb.Connection {
@@ -89,17 +274,27 @@ export class LanceDBStore implements VectorStore {
     return this.db;
   }
 
-  /** Table doesn't exist yet — created lazily on the first upsert() so
-   * LanceDB can infer the schema from real data (how-to §5.3 pattern:
-   * `db.createTable("myTable", [{ vector: [...], ... }])`). Returns
-   * `undefined` rather than throwing so both `init()` and the lazy
+  /** Table doesn't exist yet — created lazily on the first upsert(), with an
+   * explicit PINNED schema (TA-1 — never inferred, see `buildChunksSchema`).
+   * Returns `undefined` rather than throwing so both `init()` and the lazy
    * per-query retry below can share this without their own try/catch. */
   private async openTableIfExists(): Promise<lancedb.Table | undefined> {
     if (!this.db) return undefined;
     try {
       return await this.db.openTable(TABLE_NAME);
-    } catch {
-      return undefined;
+    } catch (err) {
+      // TA-4 (AU-22, Med) / INV-4: a genuine not-found (the ordinary
+      // first-run case, table never created yet) resolves `undefined`, same
+      // as before. Anything else — permissions, corruption, version
+      // mismatch — must NOT be swallowed into "not created yet": the
+      // caller's next `upsert()` would otherwise call `createTable` over a
+      // table that may actually exist (a confusing failure far from the
+      // real cause), and `hybridSearch` would report the honest-sounding
+      // lie `IndexNotReadyError` instead of the real fault. Rethrow so
+      // `init()` fails loudly and `tryReopenTable()`'s per-query retry
+      // (below) only ever retries genuine not-found.
+      if (isTableNotFoundError(err)) return undefined;
+      throw err;
     }
   }
 
@@ -121,15 +316,31 @@ export class LanceDBStore implements VectorStore {
   async upsert(records: ChunkRecord[]): Promise<void> {
     if (records.length === 0) return;
     const db = this.requireDb();
-    // `@lancedb/lancedb`'s `Data` type is `Record<string, unknown>[] | TableLike`;
-    // `ChunkRecord` is a closed interface (no index signature) so it isn't
-    // structurally assignable even though every field is plain JSON-safe
-    // data the native binding accepts fine at runtime. Narrow cast confined
-    // to this file (the sole place that touches the native module).
-    const rows = records as unknown as Record<string, unknown>[];
 
     if (!this.table) {
-      this.table = await db.createTable(TABLE_NAME, rows);
+      // TA-1 (AU-1, Critical) / Rev-1 A1 — load-bearing, THIS guard's own,
+      // NOT delegated to TA-2's later per-row validation: refuse to create
+      // the table at all from a first (create) batch whose vectors are
+      // empty or non-uniform width, BEFORE building/pinning a schema from
+      // that width. A pinned `FixedSizeList(0)` column would be a table the
+      // init() self-heal above CANNOT repair by name-presence alone (the
+      // column exists) — V2 showed a wrong/empty-width vector is then
+      // accepted silently and kills every subsequent `nearestTo`, strictly
+      // WORSE than HEAD (where an empty first-batch vector at least fails
+      // `createTable` loudly, V1). This is the order-independent
+      // defense-in-depth belt under INV-1 that makes a 0-width pinned
+      // column unreachable regardless of task sequencing or future
+      // refactors — see `docs_claude/audit-fix-architecture.md` TA-1.
+      const width = records[0]?.vector.length ?? 0;
+      if (width === 0 || records.some((r) => r.vector.length !== width)) {
+        // Status/reason only (this file's error-surface rule, see
+        // `IndexNotReadyError`'s doc comment) — no record content/path.
+        throw new Error(
+          'LanceDBStore.upsert: refused to create the chunks table — every vector in the first (create) batch must be non-empty and the same width',
+        );
+      }
+      const schema = buildChunksSchema(width);
+      this.table = await db.createTable(TABLE_NAME, records.map(toStoreRow), { schema });
       try {
         await this.table.createIndex('content', { config: lancedb.Index.fts() });
       } catch (err) {
@@ -141,7 +352,11 @@ export class LanceDBStore implements VectorStore {
       return;
     }
 
-    await this.table.mergeInsert('id').whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(rows);
+    await this.table
+      .mergeInsert('id')
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .execute(records.map(toStoreRow));
   }
 
   async deleteByPath(path: string): Promise<void> {

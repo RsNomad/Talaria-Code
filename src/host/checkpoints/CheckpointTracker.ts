@@ -11,6 +11,7 @@ import type {
 // T-19 (C1+C2): moved out of rag/ — host/checkpoints/ importing from rag/ was a zone-crossing edge.
 import { createIgnoreFilter } from '../../shared/ignoreFilter';
 import { resolveWithinWorkspaceReal } from '../backend/acp/pathConfine';
+import { writeFileNoFollow } from '../backend/acp/safeWrite';
 import { sanitizeGitEnv } from './gitEnv';
 import { runGit, runGitBinary, type RunGitOptions } from './gitProcess';
 import { missingObjects, type RunGit } from './objectClosure';
@@ -650,6 +651,16 @@ export class CheckpointTracker {
       this.markLocalizeNeeded(); // the fresh tree may borrow alternate objects
     }
 
+    // AU-4/INV-12: ONE batched mode read for the whole restore (not per-file
+    // — see {@link readTreeModes}'s doc for the rejected alternative), used
+    // below to reapply the executable bit `git show` (content-only) can't
+    // carry. Skipped entirely when there is nothing to WRITE (an all-delete
+    // or empty diff — the common no-op-restore case): a deletion never reads
+    // a mode, so there is no reason to pay for the extra `git` child.
+    const targetModes = changes.some((c) => c.status !== 'deleted')
+      ? await this.readTreeModes(target.tree)
+      : new Map<string, string>();
+
     const changedPaths: string[] = [];
     const skippedPaths: string[] = [];
     for (const change of changes) {
@@ -690,15 +701,57 @@ export class CheckpointTracker {
         if (change.status === 'deleted') {
           await fs.rm(absPath, { force: true });
         } else {
-          // Never write THROUGH an in-worktree symlink at the leaf: drop the link
-          // first so we write a fresh regular file at the intended in-tree path.
-          await removeIfSymlink(absPath);
+          // AU-14/TD-2 (INV-7/ADR-7 — check-to-write re-assertion): `git show`
+          // runs FIRST, content into memory, so no awaited subprocess remains
+          // between the leaf symlink cleanup below and the write itself. The
+          // OLD order (`removeIfSymlink` → mkdir → awaited `git show` → write)
+          // left exactly that subprocess as a check-to-write gap: a concurrent
+          // local actor planting a symlink at `absPath` DURING the awaited
+          // `git show` made the write below FOLLOW it, landing content outside
+          // the worktree.
           await fs.mkdir(path.dirname(absPath), { recursive: true });
           const content = await runGitBinary(
             ['show', `${target.tree}:${change.path}`],
             this.shadowOpts(),
           );
-          await fs.writeFile(absPath, content);
+          // Never write THROUGH an in-worktree symlink at the leaf: drop the
+          // link (whether stale from a prior state, or raced in above) so a
+          // fresh regular file lands at the intended in-tree path.
+          await removeIfSymlink(absPath);
+          // `writeFileNoFollow` (`../backend/acp/safeWrite.ts`) is the belt-
+          // and-suspenders backstop for the tiny remaining gap between the
+          // cleanup above and this open: on Linux it opens with `O_NOFOLLOW`,
+          // so a symlink raced in even AFTER `removeIfSymlink` ran makes the
+          // open FAIL (`ELOOP`) rather than follow it — refused via the SAME
+          // per-path catch below (`skippedPaths`), never silently escaping.
+          //
+          // AU-4/INV-12: `git show` above returned CONTENT ONLY, so the write
+          // always lands at the platform default — set the mode EXPLICITLY in
+          // BOTH directions from the batched `ls-tree` read, via the SAME open
+          // handle (`fchmod`, never a second path-based `fs.chmod` — that would
+          // reopen a TOCTOU of its own between this write and a later chmod
+          // call). BOTH directions matter: 100755 needs the exec bit SET, and
+          // 100644 needs it CLEARED. Writing non-executable content over a file
+          // that already exists at 0o755 (an undo back to a pre-`chmod +x`
+          // checkpoint) would otherwise leave a STALE exec bit, because
+          // `open(O_CREAT|O_TRUNC)` preserves an existing file's mode — the
+          // `mode` arg only applies on CREATE. That stale bit makes the live
+          // worktree tree differ from the just-restored baseline in MODE ONLY,
+          // so the very next `redo()`/restore is falsely refused by the
+          // dirty-guard (the exact Linux-only regression the redo test pins —
+          // invisible on win32, where the exec bit cannot exist, so every gate
+          // that ran there skipped it). 120000/160000 (symlink/gitlink) cannot
+          // occur in a tree this class wrote (`writeTreeFromWorktree` stages via
+          // `git add -f` over real files only), and `git show` reads the git
+          // OBJECT DATABASE (never the worktree path), so a worktree symlink
+          // cannot affect the content it returns. A chmod failure here rides the
+          // SAME per-path catch below as the write — one disclosure channel
+          // (`skippedPaths`) for every reason, per the T-C3 comment above.
+          await writeFileNoFollow(
+            absPath,
+            content,
+            { mode: targetModes.get(change.path) === '100755' ? 0o755 : 0o644 },
+          );
         }
         changedPaths.push(change.path);
       } catch (err: unknown) {
@@ -811,7 +864,19 @@ export class CheckpointTracker {
     return run;
   }
 
-  /** Run `fn` while holding the cross-process advisory lock; always releases. */
+  /**
+   * Run `fn` while holding the cross-process advisory lock; always releases.
+   *
+   * NOT re-entrant: `acquireLock` is a plain file-lock with no owner-thread
+   * awareness, so a caller that already holds it and calls `withLock` again
+   * would poll for its OWN release and eventually throw
+   * {@link CheckpointLockTimeoutError}. Every current call site
+   * (`snapshot`/`restore`/`redo`/`redoAll`/`diff`/`cleanup`/
+   * `flushLocalization`, plus `initInternal`'s creation branch — AU-25/TD-3)
+   * awaits `init()` to fully resolve BEFORE calling `withLock`, and none
+   * calls `init()`/`withLock` from inside another `withLock` callback — so
+   * no nesting occurs today. Preserve that ordering in any new call site.
+   */
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     const handle = await acquireLock(this.shadowDir, {
       staleMs: this.lockStaleMs,
@@ -883,16 +948,41 @@ export class CheckpointTracker {
     }, this.localizeDebounceMs);
   }
 
+  /**
+   * AU-25/TD-3: `init()`'s in-process promise memo ({@link init}) only
+   * serializes calls WITHIN one `CheckpointTracker` instance. Two VS Code
+   * windows (two separate instances/processes) cold-opening the SAME fresh
+   * workspace root both reach this point with the shadow repo not yet
+   * created, and without a cross-process guard would race `git init` + the
+   * four `git config` calls against each other — the loser can lose git's
+   * own `config.lock` and throw (self-healing, since {@link init} clears the
+   * memo on rejection so a retry succeeds, but it contradicts the
+   * cross-process guarantee `withLock` gives every mutator below).
+   *
+   * Fix: take the SAME cross-process lock around ONLY the creation branch,
+   * with a double-check re-read of `pathExists(gitDir)` AFTER acquiring it —
+   * the loser wakes up, sees the winner already created `.git`, and no-ops
+   * instead of re-running `git init`/`git config`. `syncAlternates`/
+   * `loadIndex` stay OUTSIDE the lock (read-mostly). This cannot nest inside
+   * an already-held lock: every mutator below (`snapshot`/`restore`/`redo`/
+   * `redoAll`/`diff`/`cleanup`/`flushLocalization`) awaits `init()` BEFORE
+   * calling `withLock`, never the reverse (verified by inspection — see the
+   * re-entrancy note on {@link withLock}), so `initInternal` never runs while
+   * this instance already holds the lock.
+   */
   private async initInternal(): Promise<void> {
     await fs.mkdir(this.shadowDir, { recursive: true });
     await this.preflightGitAvailable();
 
     if (!(await pathExists(this.gitDir))) {
-      await runGit(['init', '--quiet'], this.shadowOpts());
-      await runGit(['config', 'user.name', 'Hermes Checkpoints'], this.shadowOpts());
-      await runGit(['config', 'user.email', 'checkpoints@hermes.local'], this.shadowOpts());
-      await runGit(['config', 'commit.gpgsign', 'false'], this.shadowOpts());
-      await runGit(['config', 'gc.auto', '0'], this.shadowOpts()); // we gc explicitly via cleanup()
+      await this.withLock(async () => {
+        if (await pathExists(this.gitDir)) return; // another window already won the race
+        await runGit(['init', '--quiet'], this.shadowOpts());
+        await runGit(['config', 'user.name', 'Hermes Checkpoints'], this.shadowOpts());
+        await runGit(['config', 'user.email', 'checkpoints@hermes.local'], this.shadowOpts());
+        await runGit(['config', 'commit.gpgsign', 'false'], this.shadowOpts());
+        await runGit(['config', 'gc.auto', '0'], this.shadowOpts()); // we gc explicitly via cleanup()
+      });
     }
 
     await this.syncAlternates();
@@ -1225,6 +1315,38 @@ export class CheckpointTracker {
   }
 
   /**
+   * AU-4/INV-12: batched executable-bit read for a restore. `git show
+   * <tree>:<path>` (the restore write path, below) returns blob CONTENT
+   * ONLY — the mode lives on the TREE ENTRY, not the blob — so this is the
+   * one place `restoreInternal` learns what each restored path's mode
+   * should be. `git ls-tree -r -z <tree>` emits one NUL-terminated record
+   * per leaf: `<mode> SP <type> SP <sha>\t<path>` (mode is always the fixed
+   * 6-digit git constant — `100644` regular, `100755` executable, `120000`
+   * symlink, `160000` gitlink — verified against a real git tree; `-z`
+   * disables path C-quoting exactly like {@link diffTrees}'s own `-z`, so a
+   * non-ASCII/control-char path round-trips intact here too). ONE
+   * subprocess for the whole restore, run before the per-path loop, keeps
+   * the git-child count unchanged from before this fix (rejected
+   * alternative: a `ls-tree` per changed file).
+   */
+  private async readTreeModes(tree: string): Promise<Map<string, string>> {
+    const result = await runGit(['ls-tree', '-r', '-z', tree], this.shadowOpts());
+    const modes = new Map<string, string>();
+    for (const record of result.stdout.split('\0')) {
+      if (record.length === 0) continue;
+      // Exactly one tab separates `<mode> <type> <sha>` from `<path>` — take
+      // the FIRST tab only, since `-z` leaves the path itself un-escaped and
+      // it may (rarely) contain further raw tab bytes of its own.
+      const tab = record.indexOf('\t');
+      if (tab === -1) continue;
+      const mode = record.slice(0, tab).split(' ')[0];
+      const filePath = record.slice(tab + 1);
+      if (mode) modes.set(filePath, mode);
+    }
+    return modes;
+  }
+
+  /**
    * Recursively enumerates workspace files, applying the shared ignore filter +
    * size cutoff, under a WALL-CLOCK DEADLINE (I-1 / arch A#1).
    *
@@ -1465,8 +1587,21 @@ function formatAge(timestampIso: string): string {
  * Parse `git diff-tree --name-status -z` output. The `-z` stream is a flat run
  * of NUL-terminated tokens: `STATUS\0PATH\0` per change, except renames/copies
  * (`R###`/`C###`) which carry `STATUS\0OLDPATH\0NEWPATH\0`. Rename detection is
- * NOT enabled here, but we parse it defensively so a future `-M` can't corrupt
- * the walk.
+ * NOT enabled here (the {@link CheckpointTracker.diffTrees} call passes no
+ * `-M`/`-C`), but we parse it defensively so a future `-M` can't corrupt the
+ * walk (i.e. misinterpret the 3-token record as two 2-token ones).
+ *
+ * AU-36:CP-rename landmine (deferred — dead code today, no live call site
+ * passes `-M`/`-C`): the R/C branch below records ONLY the NEW path as
+ * `modified` and silently drops OLDPATH — no `deleted` entry is ever emitted
+ * for it. That is correct AS LONG AS rename detection stays off (git's own
+ * `--name-status`, undetected, already reports a rename as a plain D+A pair
+ * that this function handles fine). But the moment a future change enables
+ * `-M`/`-C` on the `diff-tree` call, a genuine rename would restore the
+ * content at NEWPATH while leaving OLDPATH's file untouched on disk — a
+ * stale duplicate `restoreInternal` never deletes, silently corrupting the
+ * restore. Fix-on-enable: also push `{ path: OLDPATH, status: 'deleted' }`
+ * for the R/C case.
  */
 function parseNameStatusZ(output: string): CheckpointDiffEntry[] {
   const tokens = output.split('\0');

@@ -196,6 +196,118 @@ describe('createLibServerHost — dispose() (matrix item (h))', () => {
   });
 });
 
+describe('createLibServerHost — AU-32: start() after dispose()/permanent-down must reject, not resolve with a stale advertisement', () => {
+  it('a start() call after dispose() rejects (fails at HEAD: resolves with the pre-dispose advertisement — only advertisement() burns)', async () => {
+    const host = createLibServerHost({ buildMcpServer: buildStubMcpServer });
+    const first = await host.start();
+    expect(first).toBeDefined();
+    host.dispose();
+    await expect(host.start()).rejects.toThrow();
+  });
+
+  it('a start() call after dispose() rejects even when start() was never called before dispose() (no fresh bind attempt either)', async () => {
+    let bindAttempts = 0;
+    const host = createLibServerHost({
+      buildMcpServer: buildStubMcpServer,
+      createServer: () => {
+        bindAttempts += 1;
+        return http.createServer();
+      },
+    });
+    host.dispose();
+    await expect(host.start()).rejects.toThrow();
+    expect(bindAttempts).toBe(0);
+  });
+
+  it('a start() call after the host goes permanently down (post-bind rebind failure) rejects too', async () => {
+    const log = vi.fn();
+    let capturedServer: http.Server | undefined;
+    const host = track(
+      createLibServerHost({
+        buildMcpServer: buildStubMcpServer,
+        log,
+        createServer: () => {
+          capturedServer = http.createServer();
+          return capturedServer;
+        },
+      }),
+    );
+    const ad = await host.start();
+    if (ad === undefined || capturedServer === undefined) {
+      throw new Error('unreachable — start() must succeed and capture the real server here');
+    }
+    const server = capturedServer;
+
+    // Drive the real one-rebind-then-permanent-down sequence (same pattern
+    // as the "one-rebind-then-permanent-down" describe block below).
+    server.emit('error', new Error('simulated post-bind listener error'));
+    await vi.waitFor(() => expect(server.listening).toBe(true));
+    server.emit('error', new Error('simulated post-bind listener error #2'));
+    await vi.waitFor(() =>
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('permanently down')),
+    );
+
+    await expect(host.start()).rejects.toThrow();
+  });
+});
+
+describe('createLibServerHost — AU-36 S3/S4: bind failure / non-loopback bind fail closed with a thrown startup error', () => {
+  it('S3: an initial bind failure REJECTS start() instead of silently resolving undefined', async () => {
+    let capturedServer: http.Server | undefined;
+    const host = track(
+      createLibServerHost({
+        buildMcpServer: buildStubMcpServer,
+        createServer: () => {
+          capturedServer = http.createServer();
+          const server = capturedServer;
+          // Force the very first `listen()` call `listenAsync` makes to
+          // fail closed instead of attempting a real OS bind — mirrors a
+          // genuine EADDRINUSE/port-exhaustion outcome without depending on
+          // an actually-exhausted OS port range.
+          vi.spyOn(server, 'listen').mockImplementation(
+            (() => {
+              queueMicrotask(() => server.emit('error', new Error('simulated EADDRINUSE')));
+              return server;
+            }) as unknown as typeof server.listen,
+          );
+          return server;
+        },
+      }),
+    );
+    await expect(host.start()).rejects.toThrow();
+  });
+
+  it('S4: a bind that does not yield an IPv4 loopback address REJECTS start() instead of silently resolving undefined', async () => {
+    let capturedServer: http.Server | undefined;
+    const host = track(
+      createLibServerHost({
+        buildMcpServer: buildStubMcpServer,
+        createServer: () => {
+          capturedServer = http.createServer();
+          const server = capturedServer;
+          vi.spyOn(server, 'listen').mockImplementation(
+            (() => {
+              queueMicrotask(() => server.emit('listening'));
+              return server;
+            }) as unknown as typeof server.listen,
+          );
+          // Simulate a bind that succeeded but landed on a non-IPv4-loopback
+          // address (e.g. an IPv6-only or all-interfaces address) — the
+          // guard's rule 1 premise (every accepted request is loopback-only)
+          // would otherwise be silently unverifiable.
+          vi.spyOn(server, 'address').mockReturnValue({
+            address: '::1',
+            family: 'IPv6',
+            port: 12345,
+          });
+          return server;
+        },
+      }),
+    );
+    await expect(host.start()).rejects.toThrow();
+  });
+});
+
 describe('createLibServerHost — dispose() races a pending start() (I-1: bind-window leak)', () => {
   it('a dispose() that lands while start() is still awaiting the bind closes the server, not just makes start() report undefined', async () => {
     let capturedServer: http.Server | undefined;

@@ -134,7 +134,7 @@ describe('chunkAst', () => {
     expect(methodBChunk.symbolPath).toEqual(['Foo', 'methodB']);
   });
 
-  it('still reaches a small handled descendant through an oversized, unhandled ancestor', () => {
+  it('still reaches a small handled descendant through an oversized, unhandled ancestor, AND keeps the unhandled sibling (AU-36:R8)', () => {
     const filler = 'z'.repeat(3000);
     const small = 'function tiny() { return 1; }';
     const source = `// ${filler}\n${small}\n`;
@@ -146,13 +146,109 @@ describe('chunkAst', () => {
 
     const chunks = chunkAst(program, source, 50);
 
-    expect(chunks).toHaveLength(1);
-    expect(must(chunks[0]).content).toBe(small);
+    // Pre-R8, the oversized `comment` sibling was silently dropped (only
+    // the small function ever got a chunk). Post-R8, its content survives
+    // as a line-window interstitial chunk ahead of the function's own.
+    expect(chunks).toHaveLength(2);
+    const commentChunk = must(chunks[0]);
+    expect(commentChunk.content).toBe(`// ${filler}`);
+    expect(commentChunk.symbolPath).toBeUndefined();
+    const fnChunk = must(chunks[1]);
+    expect(fnChunk.content).toBe(small);
   });
 
   it('buildSymbolPath returns [] for a node with no class/function ancestors', () => {
     const source = 'const x = 1;';
     const root = mkNode(source, 'program', 0, source.length, []);
     expect(buildSymbolPath(root)).toEqual([]);
+  });
+
+  // AU-36:R8 — the AST chunker dropped top-level content that sits before,
+  // between, or after captured (function/class) nodes: `program`'s
+  // non-capturable direct children (imports, module docs, top-level
+  // constants) never fit `maybeYieldChunk`'s `root ||`-gated check and are
+  // never a `collapsedNodeConstructors` type, so the recursive walk emitted
+  // nothing for them at all. Fix: back-fill any run of uncaptured top-level
+  // children with `chunkByLines`-derived interstitial chunks (no
+  // symbolPath), so every source line survives into some chunk (T-B tail
+  // invariant).
+  it('R8: preserves leading and trailing top-level content around a captured function', () => {
+    const leadingLine1 = '// leading top-level comment';
+    const leadingLine2 = 'const A = 1;';
+    const fnLine = 'function mid() { return 2; }';
+    const trailingLine1 = 'const B = 2;';
+    const trailingLine2 = '// trailing note';
+    const source = [leadingLine1, leadingLine2, fnLine, trailingLine1, trailingLine2, ''].join('\n');
+
+    const fnStart = source.indexOf(fnLine);
+    const fnEnd = fnStart + fnLine.length; // excludes the following newline
+    const trailingStart = source.indexOf(trailingLine1);
+
+    const leadingNode = mkNode(source, 'comment', 0, fnStart, []);
+    const fnNode = mkNode(source, 'function_declaration', fnStart, fnEnd, []);
+    const trailingNode = mkNode(source, 'comment', fnEnd, source.length, []);
+    const program = mkNode(source, 'program', 0, source.length, [leadingNode, fnNode, trailingNode]);
+    // Sanity-check the fixture: trailingNode really does start where the
+    // function node ends (no gap introduced by fixture construction itself).
+    expect(trailingStart).toBeGreaterThanOrEqual(fnEnd);
+
+    const chunks = chunkAst(program, source, 10);
+
+    const allContent = chunks.map((c) => c.content).join('\n');
+    expect(allContent).toContain('leading top-level comment');
+    expect(allContent).toContain('const A = 1;');
+    expect(allContent).toContain('function mid()');
+    expect(allContent).toContain('const B = 2;');
+    expect(allContent).toContain('trailing note');
+
+    // Every real source line (0..4; line 5 is the trailing phantom '') is
+    // covered by at least one chunk's [startLine, endLine] range.
+    for (let line = 0; line <= 4; line++) {
+      const covered = chunks.some((c) => c.startLine <= line && line <= c.endLine);
+      expect(covered).toBe(true);
+    }
+  });
+
+  // AU-36:R12 — `collapseChildren`'s trim loop used `working.lastIndexOf(childCode)
+  // > 0` to decide whether a match was "found"; `String.lastIndexOf` returns
+  // `0` for a match at the very start of the string, and `0 > 0` is false —
+  // so a collapsed child whose text sits at offset 0 of `working` was never
+  // actually removed, even though it was found and needed trimming.
+  it('R12: collapseChildren removes a collapsed child whose match sits at offset 0', () => {
+    const filler = 'z'.repeat(3000);
+    const source = `method() {\n  ${filler}\n}`;
+
+    const bodyStart = source.indexOf('{');
+    const bodyEnd = source.lastIndexOf('}') + 1;
+    // The method — and therefore its class — both start at index 0: after
+    // the body is collapsed to "{ ... }", the resulting `working` string
+    // (the class's own rendered text) is now IDENTICAL to the collapsed
+    // child's text, so `lastIndexOf` finds it at offset 0 exactly.
+    const bodyBlock = mkNode(source, 'statement_block', bodyStart, bodyEnd, []);
+    const method = mkNode(source, 'method_definition', 0, bodyEnd, [bodyBlock]);
+    const classBody = mkNode(source, 'class_body', 0, bodyEnd, [method]);
+    const classNode = mkNode(source, 'class_declaration', 0, bodyEnd, [classBody]);
+
+    // maxChunkTokens=2 is smaller than even the collapsed "method() { ... }"
+    // form (~4 tokens), so the trim loop must fire and remove it.
+    const chunks = chunkAst(classNode, source, 2);
+
+    const classChunk = must(chunks[0]);
+    expect(classChunk.content).toBe('');
+  });
+
+  // AU-36:R15 — `maybeYieldChunk` used a strict `<` while every other
+  // fits-the-budget check in this file (`collapseChildren`'s trim-loop
+  // condition, `constructFunctionDefinitionChunk`'s fallbacks) uses `<=`. A
+  // node whose estimated token count lands EXACTLY on `maxChunkTokens` was
+  // therefore refused a whole-node chunk even though it "fits" by every
+  // other comparison in the module.
+  it('R15: yields a node whole when its token estimate exactly equals maxChunkTokens', () => {
+    const source = 'x'.repeat(40); // ceil(40 / 4) = 10 tokens, exactly.
+    const root = mkNode(source, 'program', 0, source.length, []);
+
+    const chunks = chunkAst(root, source, 10);
+
+    expect(chunks).toEqual([{ content: source, startLine: 0, endLine: 0, symbolPath: [] }]);
   });
 });

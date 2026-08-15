@@ -24,7 +24,7 @@ import type { LlamaCppLocateResult } from './llamaCppLocator';
 import type { GgufDestResult } from './modelStore';
 import type { PipxLocateResult } from './pipxLocator';
 import type { HermesPaths } from './pipxInstaller';
-import type { OllamaStatus } from './ollamaClient';
+import type { OllamaStatus, PullProgress } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
 import { validateEndpointUrl } from './remoteProbe';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
@@ -258,6 +258,7 @@ describe('FM-14: mutating methods refused when untrusted', () => {
     { method: 'setup.openInstallTerminal', params: { backendId: 'ollama' } },
     { method: 'setup.openBootstrapTerminal', params: {} },
     { method: 'setup.reload', params: {} },
+    { method: 'setup.reconnectAgent', params: {} },
     { method: 'setup.setNextEdit', params: { backend: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'x' } },
     { method: 'setup.setRag', params: { enabled: true } },
     { method: 'setup.setTunable', params: { key: TIER2_TUNABLE_KEYS[0], value: 100 } },
@@ -297,6 +298,23 @@ describe('FM-14: mutating methods refused when untrusted', () => {
     const { controller } = makeController({ trusted: false });
     const data = await controller.status();
     expect(data.trusted).toBe(false);
+  });
+});
+
+// --- TE-4 (AU-11, INV-15): unknown-method belt ------------------------------
+
+describe('TE-4 (AU-11 / INV-15): SetupController.handle refuses an unknown setup method', () => {
+  it("returns {ok:false} for a method outside the SetupMethod union, with no side effect — never falls through the switch to an implicit undefined", async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.bogus' as SetupMethod, {});
+    expect(result).toEqual({ ok: false, reason: 'unknown setup method' });
+    expect(host.calls).toEqual([]);
+  });
+
+  it('the refusal is checked BEFORE the trust gate — still {ok:false, reason: unknown} (not the trust-refusal text) when untrusted', async () => {
+    const { controller } = makeController({ trusted: false });
+    const result = await controller.handle('setup.bogus' as SetupMethod, {});
+    expect(result).toEqual({ ok: false, reason: 'unknown setup method' });
   });
 });
 
@@ -1484,6 +1502,42 @@ describe('setup.reload: trust-gated (FM-14), modal-free, calls host.reload() dir
   });
 });
 
+// --- setup.reconnectAgent (beta.7 B3, setup half) ----------------------------
+
+describe('setup.reconnectAgent (beta.7 B3)', () => {
+  it('is MUTATING: refused outright when untrusted — the deps thunk is never called', async () => {
+    const reconnectAgent = vi.fn();
+    const { controller } = makeController({ trusted: false }, { reconnectAgent });
+    const result = await controller.handle('setup.reconnectAgent', {});
+    expect(result.ok).toBe(false);
+    expect(reconnectAgent).not.toHaveBeenCalled();
+  });
+
+  it('refuses honestly when the dep is absent (mock-backend wiring) — fail-closed, no throw', async () => {
+    const { controller } = makeController(); // makeFakeDeps supplies no reconnectAgent — the optional dep is absent
+    const result = await controller.handle('setup.reconnectAgent', {});
+    expect(result).toMatchObject({ ok: false, reason: expect.any(String) });
+  });
+
+  it('delegates to deps.reconnectAgent, returns its outcome, fires ONE statusChanged at completion', async () => {
+    const reconnectAgent = vi.fn().mockResolvedValue({ ok: true });
+    const { controller } = makeController({}, { reconnectAgent });
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+    const result = await controller.handle('setup.reconnectAgent', {});
+    expect(result).toEqual({ ok: true });
+    expect(reconnectAgent).toHaveBeenCalledTimes(1);
+    expect(fires.length).toBe(1);
+  });
+
+  it('a rejected thunk maps to an honest {ok:false} — never an unhandled rejection', async () => {
+    const reconnectAgent = vi.fn().mockRejectedValue(new Error('spawn ENOENT'));
+    const { controller } = makeController({}, { reconnectAgent });
+    const result = await controller.handle('setup.reconnectAgent', {});
+    expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('spawn ENOENT') });
+  });
+});
+
 // --- FIX 1 (final review wave, IMPORTANT): setup.recheck re-probes pipx -----
 
 describe('setup.recheck re-probes pipx (FIX 1: the pipx-missing/python-unsuitable recovery dead-end)', () => {
@@ -1659,6 +1713,7 @@ describe('MUTATING_METHODS / READ_ONLY_METHODS partition the full SetupMethod un
     'setup.openBootstrapTerminal': true,
     'setup.recheck': true,
     'setup.reload': true,
+    'setup.reconnectAgent': true,
     'setup.setNextEdit': true,
     'setup.setRag': true,
     'setup.setTunable': true,
@@ -1983,6 +2038,152 @@ describe('onProgress: throttled >=150ms per (op, id) via a real timer', () => {
       { op: 'pull', id: 'model-x', phase: 'a' },
       { op: 'pull', id: 'model-x', phase: 'c' },
     ]);
+  });
+});
+
+// --- §7.2.2 (extra-a, AU-61 round T4): terminal `done` on pull settle -------
+//
+// "cancelled/failed Setup pull leaves frozen progress + dead Cancel" — every
+// settle path (cancel, dep-rejection, success) must push a terminal
+// `{op:'pull', id, done:true}` for its own progress id, AFTER the `inFlight`
+// latch release; a progress tick that arrives from the dep AFTER its own
+// promise has settled must never land (the settled-flag guard, required at
+// all four dep-callback call sites in `SetupController.ts` — see that file's
+// `runLibraryPull`/`handleVettedIngest`/`provisionOllama`/`provisionLlamacpp`).
+// Fake timers throughout (this suite's own `PROGRESS_THROTTLE_MS` idiom,
+// mirroring the "onProgress: throttled" describe above) — `flushMicrotasks`
+// (defined in the helper section below) drains the plain-Promise chain
+// (modal confirm -> runLibraryPull -> the dep call) WITHOUT depending on any
+// timer, since fake timers never touch Promise/microtask scheduling; only
+// `pushProgress`'s throttle uses a REAL `setTimeout`, which needs an explicit
+// `vi.advanceTimersByTimeAsync` to actually deliver a queued push.
+describe('§7.2.2 (extra-a, T4): a terminal `done` push on every pull settle path + straggler guard', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a CANCELLED pull emits a terminal done push for its progress id', async () => {
+    let signal: AbortSignal | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        // Streams one tick synchronously, then hangs until the signal
+        // aborts — mirrors the real `pullModel`'s abort-rejects-in-flight
+        // contract (`ollamaClient.ts`'s `readWithAbort`).
+        pullModel: (_endpoint, _model, onProgress, sig): Promise<void> => {
+          signal = sig;
+          onProgress({ status: 'downloading', totalBytes: 10, completedBytes: 1 });
+          return new Promise<void>((_resolve, reject) => {
+            sig.addEventListener('abort', () => {
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          });
+        },
+      },
+    );
+    const received: SetupProgress[] = [];
+    controller.onProgress((p) => received.push(p));
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks();
+    expect(signal).toBeDefined();
+    expect(signal?.aborted).toBe(false);
+
+    // `handleCancel` is synchronous and aborts the latch's AbortController
+    // synchronously — the fake dep's 'abort' listener rejects immediately.
+    void controller.handle('setup.cancel', { op: 'pull', id: 'llama3:8b' });
+    await flushMicrotasks();
+    // The `done` push lands inside the 150ms throttle window right after the
+    // first (immediate) tick — it is queued in the single `pending` slot
+    // until the timer fires.
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    const result = await pullPromise;
+
+    expect(result).toEqual({ ok: false, reason: 'cancelled' });
+    expect(received[received.length - 1]).toEqual({ op: 'pull', id: 'llama3:8b', done: true });
+  });
+
+  it('a FAILED pull (dep rejects) emits the terminal done push', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        pullModel: async (_endpoint, _model, onProgress): Promise<void> => {
+          onProgress({ status: 'downloading', totalBytes: 10, completedBytes: 1 });
+          throw new Error('network down');
+        },
+      },
+    );
+    const received: SetupProgress[] = [];
+    controller.onProgress((p) => received.push(p));
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    const result = await pullPromise;
+
+    expect(result).toEqual({ ok: false, reason: 'network down' });
+    expect(received[received.length - 1]).toEqual({ op: 'pull', id: 'llama3:8b', done: true });
+  });
+
+  it('a SUCCESSFUL pull also emits it (uniform settle contract)', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        pullModel: async (_endpoint, _model, onProgress): Promise<void> => {
+          onProgress({ status: 'success' });
+        },
+      },
+    );
+    const received: SetupProgress[] = [];
+    controller.onProgress((p) => received.push(p));
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    const result = await pullPromise;
+
+    expect(result).toEqual({ ok: true });
+    expect(received[received.length - 1]).toEqual({ op: 'pull', id: 'llama3:8b', done: true });
+  });
+
+  it('a STRAGGLER progress tick after settle is silenced — it can neither overwrite a pending done nor resurrect the entry', async () => {
+    let captured: ((p: PullProgress) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        // Resolves immediately after ONE synchronous tick — `captured` is
+        // the settled-flag-guarded callback `runLibraryPull` actually hands
+        // the dep, not the raw dep-internal one.
+        pullModel: async (_endpoint, _model, onProgress): Promise<void> => {
+          captured = onProgress;
+          onProgress({ status: 'downloading', totalBytes: 10, completedBytes: 1 });
+        },
+      },
+    );
+    const received: SetupProgress[] = [];
+    controller.onProgress((p) => received.push(p));
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    await pullPromise;
+    expect(captured).toBeDefined();
+
+    // The straggler: invoke the CAPTURED callback directly, simulating a
+    // dep progress tick that fires AFTER its own promise already resolved
+    // (and after the handler's `settled` flag flipped in its finally).
+    captured?.({ status: 'downloading', totalBytes: 10, completedBytes: 9 });
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+
+    expect(received[received.length - 1]).toEqual({ op: 'pull', id: 'llama3:8b', done: true });
+    // The straggler's distinguishing byte count must never have landed —
+    // neither by overwriting the pending `done` slot nor by a later push.
+    expect(received.some((p) => p.completedBytes === 9)).toBe(false);
   });
 });
 
@@ -2544,6 +2745,26 @@ describe('T13 presence wire (§4.2 — status() facts, real registry sha256=empt
  *  onStatusChanged fire) run before asserting. */
 const tickT6 = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
+/**
+ * §7.2.2 (T4): drains a chain of plain `await`s (e.g. modal-confirm ->
+ * runLibraryPull -> a dep call) WITHOUT depending on any timer — safe under
+ * `vi.useFakeTimers()` because Promise/microtask scheduling is never faked
+ * (only macrotasks — setTimeout/setInterval — are), unlike {@link tickT6}
+ * above, which would hang under fake timers until the clock is advanced.
+ * `turns` is generous on purpose: extra iterations past an already-drained
+ * queue are no-ops.
+ */
+async function flushMicrotasks(turns = 10): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    await Promise.resolve();
+  }
+}
+
+/** §7.2.2 (T4): a real-ms value safely past `PROGRESS_THROTTLE_MS` (150,
+ *  private to `SetupController.ts`) — used to flush a queued throttled push
+ *  (e.g. the terminal `done`) under `vi.advanceTimersByTimeAsync`. */
+const THROTTLE_FLUSH_MS = 200;
+
 // §6 copy, verbatim (drift-locked here AND used by assertions below).
 const LLAMACPP_MISSING_COPY = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';
 const LLAMACPP_HONEST_ABSENCE_COPY =
@@ -2837,6 +3058,230 @@ describe("T6: scoped recheck (§2.5) — {scope:'llamacpp'} re-kicks WITHOUT awa
     const { controller } = makeController();
     const result = await controller.handle('setup.recheck', { scope: 42 });
     expect(result).toEqual({ ok: false, reason: RECHECK_SCOPE_REFUSAL });
+  });
+});
+
+describe('TC-3 (AU-8/INV-11): setup-phase truth aligns with runtime PATH discovery', () => {
+  it('empty settings + a PATH-discoverable hermes: status() reads missing until the probe settles, then installed-inactive (fails at HEAD: stays missing forever)', async () => {
+    let resolveDiscover: ((bin: string) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: () =>
+          new Promise<string>((resolve) => {
+            resolveDiscover = resolve;
+          }),
+      },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    // First status() kicks the probe (lazy, non-blocking) and reads missing
+    // for now — same as the pre-AU-8 settings-only truth, just not stuck.
+    expect((await controller.status()).agent.phase).toBe('missing');
+    expect(fires.length).toBe(0);
+
+    resolveDiscover?.('/home/u/.local/bin/hermes');
+    await tickT6();
+    expect(fires.length).toBe(1); // settle repaints, same posture as kickLlamaCppProbe
+
+    // Runtime truth == setup-phase truth: a discoverable hermes now reads
+    // exactly what a configured talaria.hermesPath would (installed-inactive,
+    // default backend 'mock' — matches the existing hermesPath-set fixture).
+    expect((await controller.status()).agent.phase).toBe('installed-inactive');
+  });
+
+  it('the discovery probe is kicked exactly ONCE across repeated status() calls', async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: () => {
+          calls++;
+          return new Promise<string>(() => {}); // never settles
+        },
+      },
+    );
+    await controller.status();
+    await controller.status();
+    await controller.status();
+    expect(calls).toBe(1);
+  });
+
+  it('a configured talaria.hermesPath is authoritative — PATH discovery is never even kicked', async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      { settings: settingsMap({ 'talaria.hermesPath': '/x/bin/hermes' }) },
+      {
+        discoverHermes: () => {
+          calls++;
+          return new Promise<string>(() => {});
+        },
+      },
+    );
+    await controller.status();
+    expect(calls).toBe(0);
+  });
+
+  it('discovery failure (rejecting binding) settles missing — the honest outcome, never an unhandled rejection out of status()', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: async () => {
+          throw new Error('not on PATH');
+        },
+      },
+    );
+    await controller.status();
+    await tickT6();
+    expect((await controller.status()).agent.phase).toBe('missing');
+  });
+
+  it('no discoverHermes binding at all: phase truth stays settings-only — unchanged pre-AU-8 behavior', async () => {
+    const { controller } = makeController();
+    expect((await controller.status()).agent.phase).toBe('missing');
+  });
+
+  it("setup.recheck {scope:'agent'} clears the discovery memo — a hermes installed after the first probe settled becomes visible on the very next status(), no reload needed", async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: async () => {
+          calls++;
+          throw new Error('not yet installed');
+        },
+      },
+    );
+    expect((await controller.status()).agent.phase).toBe('missing');
+    await tickT6();
+    expect((await controller.status()).agent.phase).toBe('missing');
+    expect(calls).toBe(1); // memoized — status() alone never re-probes a settled memo
+
+    await controller.handle('setup.recheck', { scope: 'agent' });
+    await controller.status();
+    expect(calls).toBe(2); // recheck cleared the memo — the next status() re-probes
+  });
+
+  it("setup.recheck {scope:'llamacpp'} does NOT touch the Hermes discovery memo (scoping — mirrors the {scope:'agent'} vs os/llamacpp isolation above)", async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: async () => {
+          calls++;
+          throw new Error('not yet installed');
+        },
+      },
+    );
+    await controller.status();
+    await tickT6();
+    await controller.handle('setup.recheck', { scope: 'llamacpp' });
+    await controller.status();
+    expect(calls).toBe(1); // untouched by the llamacpp-scoped recheck
+  });
+});
+
+describe('TC-6 (AU-6): dispose() aborts in-flight installs/pulls', () => {
+  it('aborts EVERY registered inFlight AbortController on dispose (install + pull), alongside the pre-existing llama.cpp probe abort (fails at HEAD: install/pull signals stay un-aborted)', async () => {
+    let installSignal: AbortSignal | undefined;
+    let pullSignal: AbortSignal | undefined;
+    let probeSignal: AbortSignal | undefined;
+
+    const { controller } = makeController(
+      {},
+      {
+        // Signal-aware, never-resolving — simulates a real pipx child still
+        // running when the window reloads mid-install (AU-6's exact scenario).
+        installHermes: (_recipe, _env, _onEvent, signal): Promise<HermesPaths> => {
+          installSignal = signal;
+          return new Promise<HermesPaths>(() => {});
+        },
+        // Same shape for a GGUF fetch still streaming mid-pull.
+        pullModel: (_endpoint, _model, _onProgress, signal): Promise<void> => {
+          pullSignal = signal;
+          return new Promise<void>(() => {});
+        },
+        locateLlamaServer: (signal?: AbortSignal): Promise<LlamaCppLocateResult> => {
+          probeSignal = signal;
+          return new Promise<LlamaCppLocateResult>(() => {});
+        },
+      },
+    );
+
+    // Kick the pre-existing (T6) llama.cpp probe.
+    await controller.status();
+
+    // Start an install and a pull — neither ever resolves (the fakes hang),
+    // but each registers its AbortController in `inFlight` synchronously
+    // before the hang — exactly what `dispose()` must reach.
+    void controller.handle('setup.install', { backendId: 'hermes' });
+    void controller.handle('setup.pullModel', { model: 'qwen2.5-coder:1.5b-base' });
+    // Flush the microtask chains (showModal -> locatePipx -> installHermes /
+    // showModal -> runLibraryPull -> pullModel) up to the hanging call.
+    await tickT6();
+    await tickT6();
+
+    expect(installSignal).toBeDefined();
+    expect(pullSignal).toBeDefined();
+    expect(probeSignal).toBeDefined();
+    // Sanity: nothing is aborted yet — proves the assertions below actually
+    // exercise dispose(), not a pre-aborted default.
+    expect(installSignal?.aborted).toBe(false);
+    expect(pullSignal?.aborted).toBe(false);
+    expect(probeSignal?.aborted).toBe(false);
+
+    controller.dispose();
+
+    // AU-6: dispose() must abort every operation still latched in `inFlight`
+    // — at HEAD it aborts only the llama.cpp probe, leaving install/pull
+    // running detached (a pipx child / multi-GB GGUF fetch orphaned).
+    expect(installSignal?.aborted).toBe(true);
+    expect(pullSignal?.aborted).toBe(true);
+    // The pre-existing (T6) llama.cpp probe abort must still fire alongside it.
+    expect(probeSignal?.aborted).toBe(true);
+  });
+
+  it('is idempotent — a second dispose() call does not throw, and inFlight stays aborted', async () => {
+    let installSignal: AbortSignal | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        installHermes: (_recipe, _env, _onEvent, signal): Promise<HermesPaths> => {
+          installSignal = signal;
+          return new Promise<HermesPaths>(() => {});
+        },
+      },
+    );
+    void controller.handle('setup.install', { backendId: 'hermes' });
+    await tickT6();
+
+    expect(() => controller.dispose()).not.toThrow();
+    expect(() => controller.dispose()).not.toThrow();
+    expect(installSignal?.aborted).toBe(true);
+  });
+
+  it("does not regress TC-3's discovery-memo dispose supersession — a late-settling discovery probe after dispose still cannot overwrite state", async () => {
+    let resolveDiscover: ((bin: string) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: () =>
+          new Promise<string>((resolve) => {
+            resolveDiscover = resolve;
+          }),
+      },
+    );
+
+    expect((await controller.status()).agent.phase).toBe('missing'); // kicks the discovery probe
+    controller.dispose();
+
+    resolveDiscover?.('/usr/bin/hermes'); // the SUPERSEDED probe settles late
+    await tickT6();
+
+    // The epoch bump inside dispose() (pre-existing TC-3 behavior) must still
+    // drop this late settle — the memo is never written.
+    expect((await controller.status()).agent.phase).toBe('missing');
   });
 });
 

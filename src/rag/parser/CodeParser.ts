@@ -12,4 +12,10 @@ export interface CodeParser {
   /** Parses `contents` and returns the syntax tree root, or `undefined` if
    * the grammar isn't available / failed to load for this language. */
   parse(languageId: string, contents: string): Promise<SyntaxNodeLike | undefined>;
+  /**
+   * AU-35: frees any native/WASM handles this parser holds. Optional
+   * because a `CodeParser` that owns no native resources (e.g. a test
+   * stand-in) has nothing to free.
+   */
+  dispose?(): void;
 }

@@ -10,16 +10,18 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { DataPanel, PanelDataMap } from '../protocol';
-import { idle, isError, isLoading, isSuccess } from './remoteData';
+import { idle, isError, isLoading, isSuccess, success } from './remoteData';
 import {
   applyPanelTransition,
   assertExhaustivePanel,
   DECLINED,
   fetchPanel,
+  readScopedRefreshError,
   reducePanelAction,
   resolvePanelRequest,
   setPanelSuccess,
   unwrapSetupResult,
+  type PanelAction,
   type PanelStateMap,
 } from './panels';
 
@@ -58,6 +60,40 @@ describe('panel RemoteData reducer helpers (Part X2)', () => {
   });
 
   /*
+   * TI-3 (AU-42 Part B): the SYSTEMIC fix — a background-refresh failure
+   * (a Reload that fails, a push-triggered refetch that errors) must NEVER
+   * wipe already-loaded data. RED at HEAD: `local.panelError` replaced
+   * `success` with `failure(...)` unconditionally, so this asserted
+   * `next.tools` was `{status:'error',...}`, not the preserved success data.
+   */
+  it('TI-3: a background-refresh error over ALREADY-success data KEEPS the data — never replaces it with a failure card', () => {
+    const loaded: PanelStateMap = setPanelSuccess({}, 'tools', toolsData);
+    const next = reducePanelAction(loaded, {
+      type: 'local.panelError',
+      panel: 'tools',
+      message: 'refresh failed',
+      retryable: true,
+    });
+    expect(next.tools).toEqual({ status: 'success', data: toolsData });
+    // Same object reference, not just equal — no new RemoteData allocated
+    // for a slot that didn't change.
+    expect(next.tools).toBe(loaded.tools);
+  });
+
+  /*
+   * Companion to the test above: a FIRST-load failure (no data yet — idle,
+   * or loading as pinned by the pre-existing 'panelError moves a panel...'
+   * test just above) still becomes `failure` — the error card stays correct
+   * there. Pinned explicitly for the idle case too (loading already covered).
+   */
+  it('TI-3 companion: a first-load error (current is idle, no data to preserve) still becomes failure', () => {
+    const next = reducePanelAction({}, { type: 'local.panelError', panel: 'mcp', message: 'boom', retryable: false });
+    const entry = next.mcp;
+    expect(entry && isError(entry)).toBe(true);
+    if (entry && isError(entry)) expect(entry.error).toEqual({ message: 'boom', retryable: false });
+  });
+
+  /*
    * CF-10: an unbound tab's subagents request can never receive its push (the
    * host stamps it `unknown-session`; `foldSessionScoped` drops it — see
    * `fetchPanel`'s short-circuit below), so `fetchPanel` announces it via a
@@ -82,6 +118,38 @@ describe('panel RemoteData reducer helpers (Part X2)', () => {
     const next = applyPanelTransition(idle, { type: 'local.panelLoading', panel: 'subagents', scopeKey: 'tab-1' });
     expect(isLoading(next)).toBe(true);
   });
+
+  /*
+   * TI-3 (AU-42 Part B): the re-scoped panels (subagents/checkpoints/
+   * sessions — everything that folds through `applyPanelTransition` rather
+   * than the map-keyed `reducePanelAction` above) get the SAME keep-data
+   * rule — assessed clean to extend (panel-agnostic, no new state shape) and
+   * done; only the refreshError side-map/banner is scoped OUT for these
+   * three (see this file's `RefreshErrorPanel` doc for why).
+   */
+  it('TI-3: applyPanelTransition ALSO keeps success data on a background-refresh error (subagents/checkpoints/sessions share the reducePanelAction rule)', () => {
+    const loaded = success<PanelDataMap['subagents']>({ delegations: [] });
+    const next = applyPanelTransition(loaded, {
+      type: 'local.panelError',
+      panel: 'subagents',
+      scopeKey: 'tab-1',
+      message: 'refresh failed',
+      retryable: true,
+    });
+    expect(next).toBe(loaded); // unchanged reference — no new RemoteData allocated
+  });
+
+  it('TI-3 companion: applyPanelTransition — a first-load error (idle, no data yet) still becomes failure', () => {
+    const next = applyPanelTransition(idle, {
+      type: 'local.panelError',
+      panel: 'checkpoints',
+      scopeKey: '/root-a',
+      message: 'lock timeout',
+      retryable: true,
+    });
+    expect(isError(next)).toBe(true);
+    if (isError(next)) expect(next.error).toEqual({ message: 'lock timeout', retryable: true });
+  });
 });
 
 describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
@@ -101,6 +169,36 @@ describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
     });
   });
 
+  /*
+   * AU-10: the host-side companion fix (`ControlDispatcher.fetchPanelData`)
+   * now REJECTS a `panel.data{panel:'sessions'}` request with a reasoned
+   * `PanelUnavailableError` (e.g. "Agent is not connected yet.") instead of
+   * silently resolving with no data and no push. This test proves the
+   * webview HALF of INV-14 end-to-end through the REAL reducer (not just the
+   * dispatched action): once that rejection lands, `RemoteData` moves fully
+   * OUT of `loading` into a retryable `error` state — a spinner that would
+   * otherwise have no bounded lifetime now surfaces Retry. `fetchPanel`'s
+   * generic catch-on-invoke path (proven above) is what does this; nothing
+   * webview-side needed a NEW code path for the AU-10 scenario specifically
+   * — it was already sound, the host was just never rejecting.
+   */
+  it('AU-10: a rejected sessions fetch ("Agent is not connected yet.") folds through the REAL reducer into a retryable error RemoteData — never stuck in loading', async () => {
+    const dispatched: PanelAction[] = [];
+    const dispatch = vi.fn((action: PanelAction) => dispatched.push(action));
+    const request = vi.fn().mockRejectedValue(new Error('Agent is not connected yet.'));
+
+    await fetchPanel('sessions', { request, dispatch });
+
+    let state = reducePanelAction({}, dispatched[0] as PanelAction);
+    expect(state.sessions && isLoading(state.sessions)).toBe(true); // passes through loading...
+    state = reducePanelAction(state, dispatched[1] as PanelAction);
+    // ...but settles on a retryable error, not stuck.
+    expect(state.sessions && isError(state.sessions)).toBe(true);
+    if (state.sessions && isError(state.sessions)) {
+      expect(state.sessions.error).toEqual({ message: 'Agent is not connected yet.', retryable: true });
+    }
+  });
+
   it('issues a correlated panel.data request for the panel', async () => {
     const dispatch = vi.fn();
     const request = vi.fn().mockResolvedValue(undefined);
@@ -118,6 +216,31 @@ describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
 
     expect(dispatch).toHaveBeenCalledTimes(1); // loading only
     expect(dispatch).toHaveBeenCalledWith({ type: 'local.panelLoading', panel: 'tools' });
+  });
+
+  /*
+   * TI-3 (AU-42 Part A): `fetchPanel` now resolves to a `FetchPanelOutcome`
+   * (was bare `Promise<void>`) — purely additive, still never REJECTS (a
+   * rejection is still caught and folded into `local.panelError` exactly as
+   * before, proven by the dispatch-focused tests above/below). This is what
+   * lets a caller that wants the settled outcome — SkillsPanel's "Reload
+   * skills" busy+notice (TI-3 Part A) — react without a second request.
+   */
+  it('TI-3: resolves {ok:true} when the invoke resolves', async () => {
+    const dispatch = vi.fn();
+    const request = vi.fn().mockResolvedValue(undefined);
+
+    await expect(fetchPanel('skills', { request, dispatch })).resolves.toEqual({ ok: true });
+  });
+
+  it('TI-3: resolves {ok:false, message} — never rejects — when the invoke rejects', async () => {
+    const dispatch = vi.fn();
+    const request = vi.fn().mockRejectedValue(new Error('dashboard unreachable'));
+
+    await expect(fetchPanel('skills', { request, dispatch })).resolves.toEqual({
+      ok: false,
+      message: 'dashboard unreachable',
+    });
   });
 
   it('Retry re-invokes: calling fetchPanel again issues a second request', async () => {
@@ -375,5 +498,59 @@ describe('unwrapSetupResult + DECLINED (T2, §2.2.4)', () => {
     const unwrapped = unwrapSetupResult(raw);
     expect(unwrapped).not.toBe(raw);
     expect(unwrapped).not.toEqual(raw);
+  });
+});
+
+/*
+ * AU-61 (T2): `readScopedRefreshError` is the pure read half of the three
+ * re-scoped panels' banners — the App-level counterpart to `refreshErrorProp`
+ * (App.tsx) for `sessions`/`checkpoints`/`subagents`, which do NOT live in
+ * `AppState.refreshError` (that map is `RefreshErrorPanel`-only — see this
+ * file's own doc). Keyed exactly like each store's own App-level read:
+ * checkpoints by the ACTIVE tab's `rootId` (mirrors `App.tsx`'s
+ * `checkpointsRemote = state.rootPanels[tab.rootId]`), subagents from the
+ * active tab's own slice, sessions from the single shared slot. Returns
+ * `undefined` whenever no banner should show, so callers can render
+ * `refreshError={read && {...}}` directly.
+ */
+describe('readScopedRefreshError (AU-61 T2) — the scoped-panel banner read', () => {
+  it('sessions: returns the message + a sessions dismiss target when set', () => {
+    const read = readScopedRefreshError('sessions', { sessionsRefreshError: 'net down' }, { tabId: 't1', rootId: 'root-1' });
+    expect(read).toEqual({ message: 'net down', dismiss: { panel: 'sessions' } });
+  });
+
+  it('sessions: returns undefined when unset', () => {
+    expect(readScopedRefreshError('sessions', {}, { tabId: 't1', rootId: 'root-1' })).toBeUndefined();
+  });
+
+  it('checkpoints: keys by the ACTIVE tab rootId and returns the right dismiss target', () => {
+    const read = readScopedRefreshError(
+      'checkpoints',
+      { checkpointsRefreshError: { 'root-1': 'net down' } },
+      { tabId: 't1', rootId: 'root-1' },
+    );
+    expect(read).toEqual({ message: 'net down', dismiss: { panel: 'checkpoints', rootId: 'root-1' } });
+  });
+
+  it('checkpoints: an entry for a DIFFERENT root (pre-bind "" or a sibling root) never bleeds into this tab\'s banner', () => {
+    expect(
+      readScopedRefreshError('checkpoints', { checkpointsRefreshError: { 'root-1': 'net down' } }, { tabId: 't1', rootId: 'root-2' }),
+    ).toBeUndefined();
+    expect(
+      readScopedRefreshError('checkpoints', { checkpointsRefreshError: { '': 'net down' } }, { tabId: 't1', rootId: 'root-1' }),
+    ).toBeUndefined();
+  });
+
+  it('checkpoints: returns undefined when the map itself is absent', () => {
+    expect(readScopedRefreshError('checkpoints', {}, { tabId: 't1', rootId: 'root-1' })).toBeUndefined();
+  });
+
+  it('subagents: returns the message + a tabId-scoped dismiss target when set on the active tab', () => {
+    const read = readScopedRefreshError('subagents', {}, { tabId: 'tab-2', rootId: 'root-1', subagentsRefreshError: 'x' });
+    expect(read).toEqual({ message: 'x', dismiss: { panel: 'subagents', tabId: 'tab-2' } });
+  });
+
+  it('subagents: returns undefined when unset on the active tab', () => {
+    expect(readScopedRefreshError('subagents', {}, { tabId: 'tab-2', rootId: 'root-1' })).toBeUndefined();
   });
 });

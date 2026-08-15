@@ -13,8 +13,33 @@
  * Kept dependency-light (no React, no bridge import) so it is unit-testable in
  * a plain node environment and free of import cycles with the reducer.
  */
-import type { ControlRequestMethod, DataPanel, PanelDataMap } from '../protocol';
+import type { ControlRequestMethod, DataPanel, GlobalPanel, PanelDataMap } from '../protocol';
 import { failure, idle, loading, success, isSuccess, type RemoteData } from './remoteData';
+
+/**
+ * TI-3 (AU-42 Part B, scope decision): the global panels this task's
+ * `refreshError` side-map + dismissible banner cover — {@link GlobalPanel}
+ * minus `'setup'`. `'setup'` is deliberately excluded: unlike
+ * `tools`/`mcp`/`skills`/`models`/`settings`, it is never wrapped by
+ * App.tsx's EXTERNAL `RemotePanel` (SetupPanel owns its own internal gate
+ * over a materially different, progress-driven snapshot — see
+ * `SetupPanel.tsx`'s module doc and App.tsx's Task-10 comment on the
+ * `'setup'` branch) and its many discrete mutations already have their own
+ * per-action error surfaces. It still gets the keep-data reducer rule below
+ * (a background refresh failure never wipes its data either — that rule is
+ * panel-agnostic, applied uniformly), just no refreshError entry/banner.
+ * Flagged as a follow-up if the owner wants parity later.
+ *
+ * `GlobalPanel` was never a superset of `subagents`/`checkpoints`/`sessions`
+ * in the first place ({@link PANEL_SCOPE} classifies them `'session'`/
+ * `'root'`/`'cwd'`, not `'global'`) — so this type's exclusion is `'setup'`
+ * only, not those three. AU-61 (T1/T2) shipped THEIR banner via a SEPARATE
+ * mechanism instead of widening this map: `AppState.sessionsRefreshError` /
+ * `.checkpointsRefreshError` / `TabState.subagentsRefreshError`, read by
+ * {@link readScopedRefreshError} below. `'setup'` alone remains without any
+ * banner.
+ */
+export type RefreshErrorPanel = Exclude<GlobalPanel, 'setup'>;
 
 /** Every data panel's current RemoteData; absent = never activated (idle). */
 export type PanelStateMap = { [P in DataPanel]?: RemoteData<PanelDataMap[P]> };
@@ -75,10 +100,34 @@ export function setPanelSuccess<P extends DataPanel>(
  * a silent background refresh (mirrors TanStack Query's success +
  * isFetching) rather than flashing back to a loading spinner.
  *
+ * TI-3 (AU-42 Part B): the SAME no-flash posture now applies to a
+ * background-refresh FAILURE too — a slot already showing `success` data
+ * KEEPS it on `local.panelError` (returns `current` unchanged) instead of
+ * being replaced by a `failure(...)` error card; only a first-load failure
+ * (idle/loading, no data yet) still becomes `failure`. Mirrors TanStack
+ * Query's `data` staying intact across a background `error` (query stays
+ * `status: 'success'`, `isError` is a separate flag) — the analogous
+ * `refreshError` side-map (`AppState.refreshError`, `state/transcript.ts`)
+ * is what a caller reads to know a background refresh failed; this function
+ * only owns the RemoteData half.
+ *
  * Extracted (W4 §2f) so the three re-scoped panels — `TabState.subagents`,
  * `AppState.rootPanels[rootId]`, `AppState.sessionsPanel` — which do NOT live
  * in a {@link PanelStateMap}, share the exact same transition rule as the
- * map-keyed global panels below instead of re-deriving it.
+ * map-keyed global panels below instead of re-deriving it. TI-3 originally
+ * scoped the BANNER out for these three (each needs its own differently-
+ * shaped side-map — tabId-keyed for subagents, rootId-keyed for checkpoints,
+ * a single shared slot for sessions — plus separate UI wiring per panel) and
+ * left it a follow-up. AU-61 (T1/T2) SHIPPED that follow-up: each of the
+ * three now has its own signal (`AppState.sessionsRefreshError` /
+ * `.checkpointsRefreshError` / `TabState.subagentsRefreshError`, set by
+ * `state/transcript.ts`'s `reducePanelActionScoped`) and its own dismissible
+ * banner, wired through `RemotePanel`'s existing `refreshError` prop via
+ * {@link readScopedRefreshError} (App.tsx's three `RemotePanel` sites) —
+ * distinct from, and additive to, the map-keyed `RefreshErrorPanel` banner
+ * below (see that type's own doc for the still-excluded `'setup'`). The
+ * keep-data RULE this function owns was always panel-agnostic and needed no
+ * change for that to land.
  */
 export function applyPanelTransition<T>(current: RemoteData<T>, action: PanelAction): RemoteData<T> {
   if (action.type === 'local.panelLoading') {
@@ -89,6 +138,8 @@ export function applyPanelTransition<T>(current: RemoteData<T>, action: PanelAct
     if (action.emptyData !== undefined) return success(action.emptyData as T);
     return current.status === 'success' ? current : loading;
   }
+  // local.panelError — TI-3 (AU-42 Part B): keep already-loaded data intact.
+  if (current.status === 'success') return current;
   return failure({ message: action.message, retryable: action.retryable });
 }
 
@@ -110,11 +161,23 @@ export function reducePanelAction(panels: PanelStateMap, action: PanelAction): P
       if (current && current.status === 'success') return panels;
       return { ...panels, [action.panel]: loading };
     }
-    case 'local.panelError':
+    case 'local.panelError': {
+      // TI-3 (AU-42 Part B): mirrors `applyPanelTransition`'s sibling rule —
+      // a background-refresh failure over data already showing must KEEP it
+      // (return `panels` unchanged for this slot) rather than replacing it
+      // with a `failure(...)` card. Only a first-load failure (current is
+      // idle/loading/error — no data to preserve) still becomes `failure`.
+      // `state/transcript.ts`'s `reducePanelActionScoped` is what records the
+      // parallel `refreshError` side-map entry for the 5 in-scope panels —
+      // this function only owns the RemoteData half, same split as
+      // `applyPanelTransition`.
+      const current = panels[action.panel];
+      if (current && current.status === 'success') return panels;
       return {
         ...panels,
         [action.panel]: failure({ message: action.message, retryable: action.retryable }),
       };
+    }
   }
 }
 
@@ -166,6 +229,16 @@ export interface FetchPanelDeps {
  * signal — an honest empty success is dispatched instead, and `deps.request`
  * is never called. Bound tabs (`req.params` carries `sessionId`) and every
  * other panel fall through to the unchanged fetch path below.
+ *
+ * TI-3 (AU-42 Part A): resolves to a {@link FetchPanelOutcome} — purely
+ * ADDITIVE (was `Promise<void>`, always resolving; still never REJECTS, a
+ * rejection is still caught and folded into `local.panelError` exactly as
+ * before). Every existing caller (`void fetchPanel(...)`, every `await
+ * fetchPanel(...)` in `panels.test.ts`) ignores the resolved value and is
+ * unaffected; App.tsx's `requestPanel` now forwards it so a caller that DOES
+ * care about the settled outcome (SkillsPanel's "Reload skills" busy+notice
+ * — unlike McpPanel's dedicated `reload.mcp` RPC, a Skills reload IS this
+ * same `panel.data` refetch) can react without a second, duplicate request.
  */
 export function fetchPanel(
   panel: DataPanel,
@@ -174,32 +247,42 @@ export function fetchPanel(
     scopeKey?: string;
     req?: { method: ControlRequestMethod; params?: Record<string, unknown> };
   } = {},
-): Promise<void> {
+): Promise<FetchPanelOutcome> {
   const { scopeKey } = opts;
   const req = opts.req ?? { method: 'panel.data' as const, params: { panel } };
 
   if (panel === 'subagents' && !(req.params && 'sessionId' in req.params)) {
     const emptySubagents: PanelDataMap['subagents'] = { delegations: [] };
     deps.dispatch({ type: 'local.panelLoading', panel, scopeKey, emptyData: emptySubagents });
-    return Promise.resolve();
+    return Promise.resolve({ ok: true });
   }
 
   deps.dispatch({ type: 'local.panelLoading', panel, scopeKey });
   return deps.request(req.method, req.params).then(
-    () => {
+    (): FetchPanelOutcome => {
       /* success data arrives via the `panel.data` push; nothing to do here. */
+      return { ok: true };
     },
-    (err: unknown) => {
+    (err: unknown): FetchPanelOutcome => {
+      const message = errorMessage(err);
       deps.dispatch({
         type: 'local.panelError',
         panel,
         scopeKey,
-        message: errorMessage(err),
+        message,
         retryable: true,
       });
+      return { ok: false, message };
     },
   );
 }
+
+/**
+ * TI-3 (AU-42 Part A): the settled outcome of one {@link fetchPanel} call —
+ * see that function's doc for why this is a purely additive resolve-value
+ * change (`fetchPanel` still never rejects).
+ */
+export type FetchPanelOutcome = { ok: true } | { ok: false; message: string };
 
 /** Exported (BF-A) so `App.tsx`'s `loadMoreSessions` rejection handler reuses
  * this stringify instead of duplicating it — the SAME shape `fetchPanel`
@@ -267,6 +350,56 @@ export function loadMoreFooterState(
   if (loadingMore) return 'loading';
   if (loadMoreError) return 'error';
   return 'idle';
+}
+
+/**
+ * AU-61 (T1 state / T2 read): the App-level read for one of the three
+ * re-scoped panels' OWN refreshError signal — `AppState.sessionsRefreshError`
+ * / `AppState.checkpointsRefreshError` / `TabState.subagentsRefreshError`.
+ * These live OUTSIDE `AppState.refreshError` (that map is
+ * {@link RefreshErrorPanel}-only — `tools`/`mcp`/`skills`/`models`/`settings`
+ * — see that type's own doc), so `App.tsx`'s `refreshErrorProp` closure
+ * cannot read them; this is their counterpart, pure so the App-level mapping
+ * onto `RemotePanel`'s `refreshError` prop is unit-testable without React/
+ * jsdom (mirrors `resolvePanelRequest`'s extraction rationale).
+ *
+ * Keyed exactly like each store's own App-level read: `checkpoints` by the
+ * ACTIVE tab's `rootId` (mirrors `App.tsx`'s `checkpointsRemote =
+ * state.rootPanels[tab.rootId]`) — an entry recorded under a DIFFERENT root
+ * (a sibling root, or the pre-bind `''` key) never bleeds into this tab's
+ * banner, byte-consistent with how `checkpointsRemote` itself reads;
+ * `subagents` from the active tab's own slice (P-1: a sibling tab's signal
+ * is structurally unreachable here — the caller passes only ITS tab);
+ * `sessions` from the single shared slot (no keying).
+ *
+ * Returns `undefined` whenever no banner should show, so callers can render
+ * `refreshError={readScopedRefreshError(panel, state, tab) && {...}}`
+ * directly without a separate presence check.
+ */
+export interface ScopedRefreshErrorRead {
+  message: string;
+  dismiss: { panel: 'sessions' } | { panel: 'checkpoints'; rootId: string } | { panel: 'subagents'; tabId: string };
+}
+
+export function readScopedRefreshError(
+  panel: 'sessions' | 'checkpoints' | 'subagents',
+  s: { sessionsRefreshError?: string; checkpointsRefreshError?: Partial<Record<string, string>> },
+  tab: { tabId: string; rootId: string; subagentsRefreshError?: string },
+): ScopedRefreshErrorRead | undefined {
+  switch (panel) {
+    case 'sessions': {
+      const message = s.sessionsRefreshError;
+      return message ? { message, dismiss: { panel: 'sessions' } } : undefined;
+    }
+    case 'checkpoints': {
+      const message = s.checkpointsRefreshError?.[tab.rootId];
+      return message ? { message, dismiss: { panel: 'checkpoints', rootId: tab.rootId } } : undefined;
+    }
+    case 'subagents': {
+      const message = tab.subagentsRefreshError;
+      return message ? { message, dismiss: { panel: 'subagents', tabId: tab.tabId } } : undefined;
+    }
+  }
 }
 
 /*

@@ -40,6 +40,41 @@ describe('parseEmbeddingsResponse', () => {
     const response: EmbeddingsResponse = { data: [{ index: 0, embedding: [1] }] };
     expect(() => parseEmbeddingsResponse(response, 2)).toThrow(/expected 2/);
   });
+
+  // TA-2 (AU-5) / AU-36:R11: a duplicate or out-of-range `index` currently
+  // sorts/aligns silently (the count check above passes, and Array#sort's
+  // ties keep wire order) — the caller then mis-attributes one embedding to
+  // the wrong input text, or a legitimate row is dropped in favor of a
+  // duplicate, with no error at all.
+  it('throws on a duplicate index instead of silently misaligning rows', () => {
+    const response: EmbeddingsResponse = {
+      data: [
+        { index: 0, embedding: [1, 1] },
+        { index: 0, embedding: [2, 2] },
+      ],
+    };
+    expect(() => parseEmbeddingsResponse(response, 2)).toThrow(/duplicate index/i);
+  });
+
+  it('throws on an index at or beyond expectedCount', () => {
+    const response: EmbeddingsResponse = {
+      data: [
+        { index: 0, embedding: [1, 1] },
+        { index: 5, embedding: [2, 2] },
+      ],
+    };
+    expect(() => parseEmbeddingsResponse(response, 2)).toThrow(/invalid index/i);
+  });
+
+  it('throws on a negative index', () => {
+    const response: EmbeddingsResponse = {
+      data: [
+        { index: 0, embedding: [1, 1] },
+        { index: -1, embedding: [2, 2] },
+      ],
+    };
+    expect(() => parseEmbeddingsResponse(response, 2)).toThrow(/invalid index/i);
+  });
 });
 
 describe('HttpEmbedder', () => {
@@ -118,6 +153,59 @@ describe('HttpEmbedder', () => {
     const embedder = new HttpEmbedder({ endpoint: 'http://x', model: 'm', fetchImpl });
 
     await expect(embedder.embed(['a'])).rejects.toThrow(/500/);
+  });
+});
+
+describe('TA-2 (AU-5): per-row embedding vector validation at the embedder seam', () => {
+  // V2 (reproduced): `mergeInsert` silently accepts an empty or wrong-width
+  // vector into an existing fixed-width LanceDB table, and every later
+  // `nearestTo` query on the WHOLE table then throws — one bad row kills all
+  // vector search. These assert the seam refuses BEFORE that point, matching
+  // HEAD's actual behavior first (must resolve, not reject) so the failure
+  // is provably about the missing validation and nothing else.
+
+  it('rejects an empty embedding vector instead of silently letting it reach store.upsert', async () => {
+    const fetchImpl = async () =>
+      new Response(JSON.stringify({ data: [{ index: 0, embedding: [] }] }), { status: 200 });
+    const embedder = new HttpEmbedder({ endpoint: 'http://127.0.0.1:11434', model: 'm', fetchImpl });
+    await expect(embedder.embed(['x'])).rejects.toThrow(/malformed embedding vector/i);
+  });
+
+  it('rejects a non-numeric element in an embedding vector', async () => {
+    const fetchImpl = async () =>
+      new Response(JSON.stringify({ data: [{ index: 0, embedding: ['x'] }] }), { status: 200 });
+    const embedder = new HttpEmbedder({ endpoint: 'http://127.0.0.1:11434', model: 'm', fetchImpl });
+    await expect(embedder.embed(['x'])).rejects.toThrow(/malformed embedding vector/i);
+  });
+
+  it('rejects a non-finite element (Infinity via wire numeric overflow) in an embedding vector', async () => {
+    // Raw wire text, not JSON.stringify of a JS object: `JSON.stringify`
+    // itself special-cases Infinity/NaN to `null` before serialization, so
+    // this constructs the literal JSON-number-overflow case a real server's
+    // response bytes could contain (`JSON.parse('1e400')` === `Infinity`).
+    const fetchImpl = async () =>
+      new Response('{"data":[{"index":0,"embedding":[1,1e400,2]}]}', { status: 200 });
+    const embedder = new HttpEmbedder({ endpoint: 'http://127.0.0.1:11434', model: 'm', fetchImpl });
+    await expect(embedder.embed(['x'])).rejects.toThrow(/malformed embedding vector/i);
+  });
+
+  it('enforces intra-batch width consistency when expectedWidth is undefined (first build, dims=0)', async () => {
+    // Rev-1 A2 premise: on a first build nothing has been DECLARED to
+    // enforce, but the two rows of the SAME batch must still agree with each
+    // other — otherwise `observedWidth` (indexer.ts) records whichever width
+    // happened to come first and the other row corrupts the table silently.
+    const fetchImpl = async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            { index: 0, embedding: [1, 2, 3] },
+            { index: 1, embedding: [1, 2, 3, 4] },
+          ],
+        }),
+        { status: 200 },
+      );
+    const embedder = new HttpEmbedder({ endpoint: 'http://127.0.0.1:11434', model: 'm', fetchImpl });
+    await expect(embedder.embed(['x', 'y'])).rejects.toThrow(/embedding width mismatch/i);
   });
 });
 

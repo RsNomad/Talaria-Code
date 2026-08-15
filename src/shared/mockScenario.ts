@@ -394,6 +394,8 @@ export const panelData: PanelDataMap = {
         status: 'connected',
         command: 'npx -y @modelcontextprotocol/server-github',
         toolCount: 14,
+        enabled: true,
+        transport: 'stdio',
       },
       {
         id: 'mcp-postgres',
@@ -401,6 +403,8 @@ export const panelData: PanelDataMap = {
         status: 'connected',
         command: 'npx -y @modelcontextprotocol/server-postgres postgres://localhost/app',
         toolCount: 6,
+        enabled: true,
+        transport: 'stdio',
       },
       {
         id: 'mcp-filesystem',
@@ -408,6 +412,8 @@ export const panelData: PanelDataMap = {
         status: 'disconnected',
         command: 'npx -y @modelcontextprotocol/server-filesystem /srv/data',
         toolCount: 0,
+        enabled: true,
+        transport: 'stdio',
       },
     ],
   },

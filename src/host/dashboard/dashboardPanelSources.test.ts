@@ -109,4 +109,21 @@ describe('DashboardSkillsPanelSource / DashboardToolsPanelSource', () => {
     );
     await expect(src.fetch()).rejects.toThrow(/500/);
   });
+
+  // Task B5 (§5.4 last bullet): `skills.hubUninstall`'s fail-closed name gate
+  // checks THIS cache — the hub-provenance SUBSET of the last-listed skill
+  // names, not the full `lastListedNames()` set (a bundled/agent row must
+  // never be uninstallable via the hub-uninstall path).
+  it('DashboardSkillsPanelSource caches the hub-provenance subset of the last list', async () => {
+    const src = new DashboardSkillsPanelSource(async () =>
+      client({
+        listSkills: async () => [
+          { name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' },
+          { name: 'tdd', description: '', category: '', enabled: true, usage: 0, provenance: 'bundled' },
+        ],
+      }),
+    );
+    await src.fetch();
+    expect([...must(src.lastListedHubNames())]).toEqual(['pdf']);
+  });
 });

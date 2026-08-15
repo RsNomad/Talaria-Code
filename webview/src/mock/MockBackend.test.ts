@@ -311,7 +311,7 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13, structural-replac
     backend.handle({ type: 'ready' });
     messages.length = 0;
 
-    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
+    backend.handle({ type: 'control.request', instanceId: 'test-instance', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
 
     expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: true, generic: false } });
     expect(messages).toContainEqual({
@@ -325,10 +325,10 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13, structural-replac
   it('turning the second source ON while the first is on REPLACES it — no refusal, ok:true with the new state', () => {
     const { backend, messages } = makeHarness();
     backend.handle({ type: 'ready' });
-    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
+    backend.handle({ type: 'control.request', instanceId: 'test-instance', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
     messages.length = 0;
 
-    backend.handle({ type: 'control.request', requestId: 2, method: 'nextEdit.toggle', params: { source: 'generic', on: true } });
+    backend.handle({ type: 'control.request', instanceId: 'test-instance', requestId: 2, method: 'nextEdit.toggle', params: { source: 'generic', on: true } });
 
     expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: false, generic: true } });
     expect(messages).toContainEqual({
@@ -342,10 +342,10 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13, structural-replac
   it('turning the NEXT source ON while Generic is on REPLACES it too — the mirror direction', () => {
     const { backend, messages } = makeHarness();
     backend.handle({ type: 'ready' });
-    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'generic', on: true } });
+    backend.handle({ type: 'control.request', instanceId: 'test-instance', requestId: 1, method: 'nextEdit.toggle', params: { source: 'generic', on: true } });
     messages.length = 0;
 
-    backend.handle({ type: 'control.request', requestId: 2, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
+    backend.handle({ type: 'control.request', instanceId: 'test-instance', requestId: 2, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
 
     expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: true, generic: false } });
     expect(messages).toContainEqual({
@@ -359,10 +359,10 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13, structural-replac
   it('turning the active source OFF returns to fully-off', () => {
     const { backend, messages } = makeHarness();
     backend.handle({ type: 'ready' });
-    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
+    backend.handle({ type: 'control.request', instanceId: 'test-instance', requestId: 1, method: 'nextEdit.toggle', params: { source: 'next', on: true } });
     messages.length = 0;
 
-    backend.handle({ type: 'control.request', requestId: 2, method: 'nextEdit.toggle', params: { source: 'next', on: false } });
+    backend.handle({ type: 'control.request', instanceId: 'test-instance', requestId: 2, method: 'nextEdit.toggle', params: { source: 'next', on: false } });
 
     expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: false, generic: false } });
     expect(messages).toContainEqual({
@@ -378,7 +378,7 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13, structural-replac
     backend.handle({ type: 'ready' });
     messages.length = 0;
 
-    backend.handle({ type: 'control.request', requestId: 1, method: 'nextEdit.toggle', params: { source: 'bogus', on: true } });
+    backend.handle({ type: 'control.request', instanceId: 'test-instance', requestId: 1, method: 'nextEdit.toggle', params: { source: 'bogus', on: true } });
 
     expect(messages).toEqual([
       {

@@ -18,14 +18,17 @@ import {
   agentPhaseLabel,
   FIM_LLAMACPP_MODEL_NOTE,
   FIM_PENDING_CAPTION,
+  foldSetupProgress,
   NEXT_DOWNLOAD_UNAVAILABLE_TEXT,
   pendingSelectionLine,
   PIPX_INSTALL_DOCS_URL,
+  progressKey,
   PYTHON_VERSION_HELP_URL,
   RAG_LLAMACPP_MODEL_NOTE,
   RAG_MODEL_FIELD_CAPTION,
   RAG_OLLAMA_PULL_NUDGE,
   TRUST_DISABLED_REASON,
+  type SetupProgressMap,
 } from './setupCards';
 import { DECLINED } from '../state/panels';
 import { must } from '../testing/must';
@@ -476,6 +479,53 @@ describe('FIM card — pull progress renders a percent (§6)', () => {
   });
 });
 
+describe('§7.2.2 extra-a (T4): a `done` fold clears the frozen pull-progress bar + dead Cancel', () => {
+  it('folding a done push removes the progressbar and Cancel — the Pull button REMAINS (it never hid)', async () => {
+    const model = 'qwen2.5-coder:1.5b-base';
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
+    });
+    const dispatch = vi.fn().mockResolvedValue(undefined);
+    const withEntry: SetupProgressMap = {
+      [progressKey('pull', model)]: { op: 'pull', id: model, logTail: [], totalBytes: 1000, completedBytes: 250 },
+    };
+    const mk = (progress: SetupProgressMap) => (
+      <SetupPanel
+        data={{ status: 'success', data }}
+        onRetry={noopRetry}
+        progress={progress}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />
+    );
+
+    const { user, rerender } = setup(mk(withEntry));
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    // Before the fold: frozen bar + Cancel are both up, AND the Pull button
+    // is ALREADY visible (it gates on `!present` alone — SetupPanel.tsx
+    // ConfiguredModelRow — never on the progress entry).
+    expect(screen.getByRole('progressbar')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: `Pull ${model}` })).toBeInTheDocument();
+
+    // §7.2.2: fold the terminal `done` push exactly as the webview's real
+    // `setup.progress` reducer does, then re-render with the folded map —
+    // this is the end-to-end lock on the dead-Cancel symptom (RED at HEAD:
+    // `done` deletes nothing yet, so the bar + Cancel stay frozen forever).
+    const folded = foldSetupProgress(withEntry, { op: 'pull', id: model, done: true });
+    rerender(mk(folded));
+
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
+    // §3.2 critic-2 ordering-trace pin: nothing "reappears" — the Pull
+    // button was visible throughout and stays visible, in its own
+    // ActionButton settled state.
+    expect(screen.getByRole('button', { name: `Pull ${model}` })).toBeInTheDocument();
+  });
+});
+
 describe('NEXT card — info panel + dedicated setup button (§6 card 4)', () => {
   it('renders the frozen row copy and the [Set up dedicated NEXT] button when not configured', () => {
     renderPanel(baseData({ nextEdit: { ...baseData().nextEdit, dedicatedConfigured: false } }));
@@ -614,14 +664,17 @@ describe('Agent card — pipx-missing gap-state (T10, §6/§1.2): known distro',
     const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     renderPanel(data);
     expect(screen.getByText(bootstrap.guidance)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` })).toBeInTheDocument();
+    // AU-44b: the command is a caption UNDER the button, not inside its label
+    // (mirrors the llama.cpp install button, `localModel.tsx`).
+    expect(screen.getByRole('button', { name: 'Open terminal' })).toBeInTheDocument();
+    expect(screen.getByText(bootstrap.command)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
   });
 
   it('clicking the bootstrap-terminal button dispatches setup.openBootstrapTerminal', async () => {
     const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     const { user, dispatch } = renderPanel(data);
-    await user.click(screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` }));
+    await user.click(screen.getByRole('button', { name: 'Open terminal' }));
     expect(dispatch).toHaveBeenCalledWith('setup.openBootstrapTerminal');
   });
 
@@ -635,10 +688,31 @@ describe('Agent card — pipx-missing gap-state (T10, §6/§1.2): known distro',
   it('the bootstrap-terminal button is trust-gated; [Re-check] stays usable (read-only, §8)', () => {
     const data = baseData({ trusted: false, agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
     renderPanel(data);
-    const terminalButton = screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` });
+    const terminalButton = screen.getByRole('button', { name: 'Open terminal' });
     expect(terminalButton).toBeDisabled();
     expect(terminalButton.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeEnabled();
+  });
+
+  // AU-44a: this button sits right next to [Re-check] — without an
+  // action-specific pending label, clicking one while the other is still
+  // resolving leaves two buttons both reading the generic "Working…" with no
+  // way to tell which action is in flight.
+  it('AU-44a: shows "Installing…" while pending, not the generic "Working…"', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
+    const { user } = renderPanel(data, { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Open terminal' }));
+    expect(screen.getByRole('button', { name: 'Installing…' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
   });
 });
 
@@ -666,7 +740,7 @@ describe('Agent card — pipx-missing gap-state (T10, §6): unknown distro — n
 });
 
 describe('Agent card — python-unsuitable (T10, §6): command branch OR guidance branch, Re-check in BOTH', () => {
-  it('command plan: renders {agent.detail} + [Open terminal: {command}] + [Re-check]', async () => {
+  it('command plan: renders {agent.detail} + [Open terminal] + the command as a caption + [Re-check]', async () => {
     const data = baseData({
       agent: {
         ...baseData().agent,
@@ -682,10 +756,12 @@ describe('Agent card — python-unsuitable (T10, §6): command branch OR guidanc
     });
     const { user, dispatch } = renderPanel(data);
     expect(screen.getByText('Found Python 3.14; Hermes needs 3.11-3.13.')).toBeInTheDocument();
-    const button = screen.getByRole('button', {
-      name: 'Open terminal: sudo apt-get install python3.11 python3.11-venv',
-    });
+    // AU-44b: the command is a caption UNDER the button, not inside its label
+    // (mirrors the pipx-bootstrap button above + the llama.cpp install
+    // button, `localModel.tsx`).
+    const button = screen.getByRole('button', { name: 'Open terminal' });
     expect(button).toBeInTheDocument();
+    expect(screen.getByText('sudo apt-get install python3.11 python3.11-venv')).toBeInTheDocument();
     await user.click(button);
     expect(dispatch).toHaveBeenCalledWith('setup.openBootstrapTerminal', { target: 'python' });
     await user.click(screen.getByRole('button', { name: 'Re-check' }));
@@ -707,7 +783,7 @@ describe('Agent card — python-unsuitable (T10, §6): command branch OR guidanc
       },
     });
     renderPanel(data);
-    const button = screen.getByRole('button', { name: 'Open terminal: sudo apt-get install python3.11' });
+    const button = screen.getByRole('button', { name: 'Open terminal' });
     expect(button).toBeDisabled();
     expect(button.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeEnabled();
@@ -806,6 +882,35 @@ describe('B5 "done / what next" one-line status under each card (§6, T10)', () 
   });
 });
 
+/** A tiny fixture over `baseData()` for the Provider card's own phase — B3's
+ *  Re-check tests only vary this one field. */
+function withProviderPhase(phase: SetupData['provider']['phase']): SetupData {
+  return baseData({ provider: { phase, providerId: phase === 'configured' ? 'anthropic' : undefined } });
+}
+
+describe('Provider card — Re-check provider (beta.7 B3)', () => {
+  it('unconfigured: renders the caption + button, and clicking dispatches setup.reconnectAgent', async () => {
+    const { user, dispatch } = renderPanel(withProviderPhase('unconfigured'));
+    expect(
+      screen.getByText(
+        'Changed the provider (wizard or config.yaml)? Re-check restarts the agent connection and picks it up — open chats reload automatically, no window reload.',
+      ),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Re-check provider' }));
+    expect(dispatch).toHaveBeenCalledWith('setup.reconnectAgent');
+  });
+
+  it('configured: the button is still offered (switching providers has the identical staleness)', () => {
+    renderPanel(withProviderPhase('configured'));
+    expect(screen.getByRole('button', { name: 'Re-check provider' })).toBeInTheDocument();
+  });
+
+  it('waiting-agent: absent — there is no connection to re-check', () => {
+    renderPanel(withProviderPhase('waiting-agent'));
+    expect(screen.queryByRole('button', { name: 'Re-check provider' })).not.toBeInTheDocument();
+  });
+});
+
 describe('one-carrier ✓ rule — structural guard (beta.6 panel-fix PT8, audit A8)', () => {
   it('no rendered StatusLine/DoneLine text sits beside a pass-filled icon AND still carries a literal ✓', async () => {
     const AGENT_ROW: SetupCatalogModel = {
@@ -864,7 +969,7 @@ describe('FimInstallTab — non-Ollama gets an honest Test affordance (⑨⑩, �
     return utils;
   }
 
-  it('llama.cpp (T11: the block\'s §4.1 states replace the old "no install detection" prose): missing ⇒ [Open terminal: {command}] + [Re-check] + [Test connection ({endpoint})]', async () => {
+  it('llama.cpp (T11: the block\'s §4.1 states replace the old "no install detection" prose): missing ⇒ [Open terminal] + the command as a caption + [Re-check] + [Test connection ({endpoint})]', async () => {
     // llama.cpp HAS install detection since beta.6 (`llamacppRuntime` probe) —
     // the beta.5 "has no install detection" line is retired for this pane; the
     // missing-branch renders the CC-4 host-projected install command instead.
@@ -879,7 +984,9 @@ describe('FimInstallTab — non-Ollama gets an honest Test affordance (⑨⑩, �
     await utils.user.click(screen.getByRole('button', { name: 'Install locally' }));
     const fimCard = must(screen.getByText('Autocomplete (FIM)').closest('section'));
     expect(within(fimCard).getByText('llama-server was not found on your PATH. Install llama.cpp, then re-check.')).toBeInTheDocument();
-    expect(within(fimCard).getByRole('button', { name: 'Open terminal: sudo pkgmgr install llama-cpp' })).toBeEnabled();
+    // AU-44b: the command is a caption UNDER the button, not inside its label.
+    expect(within(fimCard).getByRole('button', { name: 'Open terminal' })).toBeEnabled();
+    expect(within(fimCard).getByText('sudo pkgmgr install llama-cpp')).toBeInTheDocument();
     // Scoped within the card — the Agent card's own ready-state [Re-check] is a different button.
     expect(within(fimCard).getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
     expect(within(fimCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8012)' })).toBeInTheDocument();
@@ -959,6 +1066,23 @@ describe('Agent card — error state [Copy log] button (T11 §6-parity minor)', 
       'pipx-install failed: network unreachable\nResolving...\nConnection timed out',
     );
   });
+
+  // AU-45: [Copy log] omitted `successLabel`, so a resolved clipboard write
+  // rendered/announced nothing.
+  it('AU-45: renders/announces "✓ Copied" once the write resolves', async () => {
+    const data = baseData({
+      agent: {
+        ...baseData().agent,
+        phase: 'error',
+        detail: 'pipx-install failed: network unreachable',
+        logTail: ['Resolving...', 'Connection timed out'],
+      },
+    });
+    const { user } = renderPanel(data);
+    vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: 'Copy log' }));
+    expect(await screen.findByText('✓ Copied')).toBeInTheDocument();
+  });
 });
 
 describe('NEXT card — DedicatedNextForm [Test] button (T11 §6-parity minor)', () => {
@@ -975,6 +1099,31 @@ describe('NEXT card — DedicatedNextForm [Test] button (T11 §6-parity minor)',
       'setup.testRemote',
       expect.objectContaining({ backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' }),
     );
+  });
+
+  // AU-44a: sibling of the FimConnectTab / OllamaInstallPanel Test buttons —
+  // this one dispatches the SAME `setup.testRemote` method and must give the
+  // same action-specific feedback while in flight, not the generic "Working…".
+  it('AU-44a: shows "Testing…" while pending, not the generic "Working…"', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      nextEdit: { ...baseData().nextEdit, dedicatedConfigured: false, endpoint: 'http://127.0.0.1:11434', model: '' },
+    });
+    const { user } = renderPanel(data, { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' }));
+    expect(within(nextCard).getByRole('button', { name: 'Testing…' })).toBeInTheDocument();
+    expect(within(nextCard).queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
   });
 });
 
@@ -1181,6 +1330,25 @@ describe('NEXT card — the llama.cpp -hf guided line is RETIRED from that pane 
     expect(within(nextCard).getByText('Run: vllm serve sweepai/sweep-next-edit-v2-7B')).toBeInTheDocument();
     await user.click(within(nextCard).getByRole('button', { name: 'Copy' }));
     expect(writeText).toHaveBeenCalledWith('vllm serve sweepai/sweep-next-edit-v2-7B');
+  });
+
+  // AU-45: this [Copy] omitted `successLabel`, so a resolved clipboard write
+  // rendered/announced nothing.
+  it('AU-45: [Copy] renders/announces "✓ Copied" once the write resolves', async () => {
+    const data = baseData({
+      fim: {
+        ...baseData().fim,
+        options: [ollamaOption(), vllmOption({ nextEditTransport: 'openai-compat' })],
+        selectedId: 'vllm',
+      },
+    });
+    const { user } = renderPanel(data);
+    vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'vLLM' }));
+    await user.click(within(nextCard).getByRole('button', { name: 'Copy' }));
+    expect(await within(nextCard).findByText('✓ Copied')).toBeInTheDocument();
   });
 });
 
@@ -1440,7 +1608,9 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
     expect(within(container).queryByText(/^✗/)).not.toBeInTheDocument();
   });
 
-  it('pending is unaffected by the success mechanism: shows "Working…" and announces nothing while in flight', async () => {
+  it('pending is unaffected by the success mechanism: shows "Testing…" and announces nothing while in flight', async () => {
+    // AU-44a: this Test button is a migrated site (`pendingLabel="Testing…"`)
+    // — it no longer falls back to the generic "Working…" while pending.
     let resolveDispatch!: (v: unknown) => void;
     const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
     const { user } = setup(
@@ -1456,7 +1626,8 @@ describe('ActionButton — success labels + the DECLINED lock (T9, §2.4)', () =
     const button = screen.getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
     await user.click(button);
 
-    expect(screen.getByRole('button', { name: 'Working…' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Testing…' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
     expect(screen.queryByText('✓ Endpoint reachable')).not.toBeInTheDocument();
     expect(screen.queryByText(/^✗/)).not.toBeInTheDocument();
 
@@ -1663,6 +1834,28 @@ describe('T11 — Ollama pane surface-level Test (T10 Minor #4: the "Test the en
     expect(dispatch).toHaveBeenCalledWith('setup.testRemote', {
       backendId: 'ollama',
       endpoint: 'http://127.0.0.1:11434',
+    });
+  });
+
+  // AU-44a: sibling of the FimConnectTab / DedicatedNextForm Test buttons —
+  // this one dispatches the SAME `setup.testRemote` method and must give the
+  // same action-specific feedback while in flight, not the generic "Working…".
+  it('AU-44a: shows "Testing…" while pending, not the generic "Working…"', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(fimBlockData(), { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    const fimCard = must(screen.getByText('Autocomplete (FIM)').closest('section'));
+    const test = within(fimCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' });
+    await user.click(test);
+    expect(within(fimCard).getByRole('button', { name: 'Testing…' })).toBeInTheDocument();
+    expect(within(fimCard).queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
     });
   });
 });
@@ -2260,6 +2453,26 @@ describe('T12 — Test endpoint in the label + the Serving line (§3.1 flow)', (
     const { agentCard, user } = await openAgentSection(agentBlockData());
     await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
     expect(within(agentCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8013)' })).toBeInTheDocument();
+  });
+
+  // AU-43: `TestAndServingLine`'s `servingModels` state is local `useState` —
+  // without a `key={endpoint}` at this (Agent Ollama) call site, editing the
+  // endpoint field after a green Test leaves the STALE "Serving: …" list
+  // rendered under the now-different endpoint (it describes a daemon the
+  // field no longer points at). The existing T9/M-1 idiom (`localModel.tsx`
+  // block's own pane-switch call site) fixes this by remounting the
+  // component whenever the endpoint prop changes.
+  it('AU-43: editing the endpoint after a successful Test clears the stale Serving line', async () => {
+    const { agentCard, user, dispatch } = await openAgentSection(agentBlockData());
+    dispatch.mockResolvedValue({ models: ['devstral-small-2507:24b'] });
+    await user.click(within(agentCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' }));
+    expect(await within(agentCard).findByText('Serving: devstral-small-2507:24b')).toBeInTheDocument();
+
+    const endpointField = within(agentCard).getByLabelText('Endpoint');
+    await user.clear(endpointField);
+    await user.type(endpointField, 'http://127.0.0.1:22222');
+
+    expect(within(agentCard).queryByText('Serving: devstral-small-2507:24b')).not.toBeInTheDocument();
   });
 });
 
@@ -3127,38 +3340,72 @@ describe('T18 — RecommendationsBlock strip (§3.5)', () => {
     });
   });
 
-  describe('Set up → jump (B-F6) — in-panel scroll + focus, NEVER dispatch/expand', () => {
-    it('clicking the Agent row’s jump scrolls + focuses the Agent card heading, and issues NO dispatch', async () => {
+  describe('Set up → jump (B-F6/B2) — in-panel jump: no dispatch; expands the target picker', () => {
+    it('clicking the Agent row’s jump expands the Local Agent Model picker and focuses its toggle, and issues NO dispatch', async () => {
       const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
       const { user, dispatch } = renderPanel(recsData());
       const btn = screen.getByRole('button', { name: 'Set up → Agent card' });
       await user.click(btn);
       expect(scrollSpy).toHaveBeenCalled();
-      expect(document.activeElement?.id).toBe('setup-card-agent-heading');
+      const toggle = screen.getByRole('button', { name: 'Configure Local Agent Model' });
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      expect(document.activeElement).toBe(toggle);
       expect(dispatch).not.toHaveBeenCalled();
       scrollSpy.mockRestore();
     });
 
-    it('clicking the NEXT row’s jump targets the NEXT card, not the Agent card', async () => {
+    it('clicking the NEXT row’s jump targets the NEXT card, not the Agent card, and expands its dedicated-NEXT toggle', async () => {
       const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
       const { user, dispatch } = renderPanel(recsData());
       const btn = screen.getByRole('button', { name: 'Set up → NEXT card' });
       await user.click(btn);
-      expect(document.activeElement?.id).toBe('setup-card-next-heading');
+      const toggle = screen.getByRole('button', { name: 'Set up dedicated NEXT' });
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      expect(document.activeElement).toBe(toggle);
       expect(dispatch).not.toHaveBeenCalled();
       scrollSpy.mockRestore();
     });
 
-    it('clicking a jump does NOT expand any card (e.g. the NEXT card’s "Manage dedicated setup" form stays collapsed)', async () => {
+    it('clicking the NEXT row’s jump EXPANDS its dedicated-NEXT form (the target picker becomes visible)', async () => {
       const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
       const { user } = renderPanel(recsData());
       await user.click(screen.getByRole('button', { name: 'Set up → NEXT card' }));
       // Scoped to the NEXT card itself (other cards render their OWN,
       // unrelated "Endpoint" fields unconditionally) — the dedicated-NEXT
       // form's Endpoint field only renders once the form is expanded, and
-      // must still be absent there after the jump.
+      // must now be present there after the jump.
       const nextCard = must(document.getElementById('setup-card-next'));
-      expect(within(nextCard).queryByLabelText('Endpoint')).not.toBeInTheDocument();
+      expect(within(nextCard).getByLabelText('Endpoint')).toBeInTheDocument();
+      scrollSpy.mockRestore();
+    });
+
+    it('the FIM row’s jump keeps the plain scroll+focus (the FIM card has no collapsed picker)', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      await user.click(screen.getByRole('button', { name: 'Set up → FIM card' }));
+      expect(document.activeElement?.id).toBe('setup-card-fim-heading');
+      scrollSpy.mockRestore();
+    });
+
+    it('clicking the Embedder row’s jump expands the embedding picker', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      await user.click(screen.getByRole('button', { name: 'Set up → Embedder card' }));
+      expect(screen.getByRole('button', { name: 'Configure embedding model' })).toHaveAttribute('aria-expanded', 'true');
+      scrollSpy.mockRestore();
+    });
+
+    it('jump → hand-collapse → jump again re-expands (seq re-fires)', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      const jumpBtn = screen.getByRole('button', { name: 'Set up → Agent card' });
+      await user.click(jumpBtn);
+      const toggle = screen.getByRole('button', { name: 'Configure Local Agent Model' });
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      await user.click(toggle); // collapse by hand
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      await user.click(jumpBtn);
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
       scrollSpy.mockRestore();
     });
   });

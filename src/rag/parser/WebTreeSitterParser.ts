@@ -17,7 +17,12 @@ import type { CodeParser } from './CodeParser';
  * `loadLanguageForFileExt`). See the report for exactly how to obtain these
  * `.wasm` files.
  */
-const GRAMMAR_FILE_BY_LANGUAGE: Record<string, string> = {
+// Exported (not just module-local) so the real-load smoke test
+// (`WebTreeSitterParser.real.test.ts` — TB-1/AU-2/ADR-2) can enumerate the
+// SAME set this class actually uses at runtime, instead of hand-duplicating
+// the language→file mapping in the test and risking silent drift between
+// the two lists.
+export const GRAMMAR_FILE_BY_LANGUAGE: Record<string, string> = {
   typescript: 'tree-sitter-typescript.wasm',
   typescriptreact: 'tree-sitter-tsx.wasm',
   javascript: 'tree-sitter-javascript.wasm',
@@ -37,9 +42,24 @@ export interface WebTreeSitterParserOptions {
 }
 
 let parserInitPromise: Promise<void> | undefined;
+
+/** Test-only: clear the module-level `Parser.init()` memo. */
+export function resetParserInitForTests(): void {
+  parserInitPromise = undefined;
+}
+
 function ensureParserInit(): Promise<void> {
   if (!parserInitPromise) {
-    parserInitPromise = Parser.init();
+    // AU-35: same clear-on-reject idiom as `indexer.ts`'s
+    // `ensureStoreInitialized` (`:222-234`). Without this, one transient
+    // `Parser.init()` failure (e.g. a momentary FS/wasm hiccup) memoizes the
+    // REJECTED promise forever — every later `parse()` call, for the
+    // process lifetime, reuses that dead rejection instead of retrying,
+    // even once whatever caused the failure has cleared.
+    parserInitPromise = Parser.init().catch((err: unknown) => {
+      parserInitPromise = undefined;
+      throw err;
+    });
   }
   return parserInitPromise;
 }
@@ -132,5 +152,30 @@ export class WebTreeSitterParser implements CodeParser {
       this.languageCache.set(languageId, null);
       return null;
     }
+  }
+
+  /**
+   * AU-35 (TA-5 deferred this here): frees every native handle this instance
+   * holds — the still-outstanding parsed tree and every cached per-language
+   * `Parser` — and clears both caches. `Language` (`web-tree-sitter.d.ts`)
+   * exposes no `delete()`/dispose method of its own (confirmed at
+   * write-time: only `Parser`, `Tree`, `Node`, and `Query` do), so clearing
+   * `languageCache` is the only disposal action available for it.
+   *
+   * Deliberately does NOT touch the module-level `parserInitPromise` — that
+   * memo models the singleton `Parser.init()` call, which is process-wide,
+   * not owned by this instance. A later `parse()` call on this (still-live)
+   * instance after `dispose()` is safe, not a crash: `languageCache` and
+   * `parserCache` being empty just means it re-loads the language and
+   * constructs a fresh `Parser`, exactly like a brand-new instance would.
+   */
+  dispose(): void {
+    this.pendingTree?.delete();
+    this.pendingTree = null;
+    for (const parser of this.parserCache.values()) {
+      parser.delete();
+    }
+    this.parserCache.clear();
+    this.languageCache.clear();
   }
 }

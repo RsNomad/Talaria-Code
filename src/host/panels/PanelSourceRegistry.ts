@@ -51,14 +51,38 @@ import { registerDefaultPanelSources } from './panelSources';
  */
 
 /**
- * What one {@link PanelSource.fetch} resolves to.
+ * What one {@link PanelSource.fetch} resolves to — a TERMINAL, honest
+ * two-member outcome (AU-10 fix): either the reshaped, typed snapshot the
+ * backend broadcasts as a `panel.data` push, or a reasoned `unavailable`
+ * (e.g. the Sessions source before an ACP client exists). There is
+ * deliberately NO bare-`undefined`-data third possibility — a source that
+ * cannot answer right now must SAY SO, never resolve silently with nothing.
  *
- * `data` is the reshaped, typed snapshot the backend broadcasts as a
- * `panel.data` push (`undefined` SUPPRESSES the push — e.g. the Sessions source
- * before an ACP client exists, mirroring the old `refreshSessionsPanel`'s
- * `if (!this.client) return undefined`).
+ * ## AU-10 (Med) — the eternal-spinner-with-no-retry class this closes
+ * The OLD shape was `{ data: PanelDataMap[P] | undefined }`, and `undefined`
+ * SUPPRESSED the push (the Sessions source before an ACP client exists used
+ * to `return { data: undefined }`, mirroring the even older
+ * `refreshSessionsPanel`'s `if (!this.client) return undefined`). That
+ * two-state type modeled a THREE-state reality: `fetchPanelData` swallowed
+ * the `undefined` (no push, no throw), so the webview's correlated request
+ * RESOLVED successfully with nothing — never rejecting, never getting a
+ * push — and `RemoteData` stuck in `loading` forever with NO retry
+ * affordance (INV-14: "a panel fetch terminates in data or a retryable
+ * reasoned error"). `unavailable` makes the "no source available right now"
+ * state a REAL terminal: {@link ControlDispatcher.fetchPanelData} rejects the
+ * correlated request with a {@link PanelUnavailableError} carrying the
+ * reason, which the webview's existing `fetchPanel` catch path (Part X2)
+ * already turns into an honest `error` + Retry — no webview change needed,
+ * the mechanism was already there, it just never fired for this case.
  *
- * A#6: this used to carry a second `result?: unknown` field so single-RPC
+ * A genuine EMPTY result (an empty list, a disabled-but-known panel like
+ * Checkpoints' `available:false`) is NOT this — it is just DATA (the
+ * `{data: ...}` branch), never `unavailable`. `unavailable` is reserved for
+ * "this source cannot even attempt to answer right now" (YAGNI: a third
+ * `empty` outcome member was considered and rejected — empty data already
+ * has a home in `data`).
+ *
+ * A#6: this used to also carry a second `result?: unknown` field so single-RPC
  * sources could resolve `invokeControl` with the RAW upstream RPC result. That
  * split was DEAD WEIGHT — the sole consumer (`fetchPanel` in
  * `webview/state/panels.ts`) ignores the resolved value entirely (the reshaped
@@ -66,8 +90,25 @@ import { registerDefaultPanelSources } from './panelSources';
  * had zero observable effect. Collapsed to just `data`; `fetchPanelData` now
  * resolves with `data` for every source.
  */
-export interface PanelFetchOutcome<P extends DataPanel> {
-  readonly data: PanelDataMap[P] | undefined;
+export type PanelFetchOutcome<P extends DataPanel> =
+  | { readonly data: PanelDataMap[P] }
+  | { readonly data?: undefined; readonly unavailable: string };
+
+/**
+ * AU-10: the reasoned, typed error {@link ControlDispatcher.fetchPanelData}
+ * throws when a {@link PanelSource} resolves `{unavailable}` — the correlated
+ * `panel.data`/`session.list` request REJECTS with this instead of silently
+ * resolving with no data, so the webview's `fetchPanel` catch path (which
+ * already exists, Part X2) flips the panel to an honest, retryable `error`
+ * state rather than spinning on `loading` forever. `message` carries the
+ * source's own reason verbatim (e.g. "Agent is not connected yet.") — the
+ * webview shows it as-is, matching every other panel-fetch rejection.
+ */
+export class PanelUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PanelUnavailableError';
+  }
 }
 
 /**
@@ -140,6 +181,17 @@ export interface PanelSourceContext {
    * `rootId` is absent/unregistered (checkpoints unavailable for it).
    */
   getRootTracker(rootId: string): CheckpointTrackerLike | undefined;
+  /**
+   * TG-5 (AU-51, INV-20): the live set of ephemeral one-shot session ids
+   * `OneShotRunner` has minted this install (`OneShotSessionRegistry`,
+   * bounded + `workspaceState`-persisted) — the `sessions` source passes
+   * this to `reshapeSessionsList`'s `excludeIds` so a one-shot utility call
+   * (commit-message generation etc.) never surfaces in the History panel,
+   * even though the ACP wire has no close and the id persists server-side
+   * forever. Connection-level, like `getAcpClient`/`dispatch` — read at
+   * fetch time, never a construction-time snapshot.
+   */
+  getOneShotSessionIds(): ReadonlySet<string>;
   readonly logger?: Logger;
 }
 

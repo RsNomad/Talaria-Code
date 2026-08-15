@@ -222,11 +222,37 @@ export function clampNonNegativeInt(n: number): number {
 }
 
 /**
+ * L9: backs a UTF-16 string-index cut point off by one code unit when it
+ * would land BETWEEN a surrogate pair's high and low halves. JS strings are
+ * UTF-16 code-unit sequences (MDN `String.prototype.slice`/`charCodeAt`) —
+ * `.slice()` is encoding-unaware and will happily bisect an astral character
+ * (anything outside the BMP, U+10000+ — many emoji, CJK-extension code
+ * points), leaving a lone (unpaired) surrogate in the output: invalid UTF-16
+ * that corrupts a unit of meaning rather than degrading by omission (INV-17).
+ * The code unit immediately before `cut` is checked: a HIGH surrogate
+ * (0xD800-0xDBFF) there means its LOW-surrogate partner (0xDC00-0xDFFF) is
+ * exactly the code unit this cut would drop — back off by one so the whole
+ * pair is dropped together instead of the high half surviving alone. Total:
+ * never throws, and a `cut` at/before 0 or at/beyond `s.length` (nothing to
+ * bisect) passes through unchanged.
+ */
+function backOffSurrogateBoundary(s: string, cut: number): number {
+  if (cut <= 0 || cut >= s.length) {
+    return cut;
+  }
+  const before = s.charCodeAt(cut - 1);
+  return before >= 0xd800 && before <= 0xdbff ? cut - 1 : cut;
+}
+
+/**
  * Truncates `s` to at most `cap` characters, appending `marker` when
  * truncation occurs. Total: any cap (including 0, negative, NaN, Infinity)
  * yields a result of length <= max(0, floor(cap)), never throws. When `cap`
  * is smaller than the marker itself, the result is a prefix of the marker
- * (never a mix of marker + content, so no accidental broken output).
+ * (never a mix of marker + content, so no accidental broken output) — the
+ * marker itself is ASCII-only by every call site's own convention (see
+ * `resultShaper.ts`'s `PER_FIELD_TRUNCATION_MARKER` doc), so only the
+ * content-slice branch below needs the surrogate-boundary guard (L9).
  */
 export function capWithMarker(s: string, cap: number, marker: string): string {
   const safeCap = clampNonNegativeInt(cap);
@@ -236,7 +262,8 @@ export function capWithMarker(s: string, cap: number, marker: string): string {
   if (safeCap <= marker.length) {
     return marker.slice(0, safeCap);
   }
-  return s.slice(0, safeCap - marker.length) + marker;
+  const cut = backOffSurrogateBoundary(s, safeCap - marker.length);
+  return s.slice(0, cut) + marker;
 }
 
 /**

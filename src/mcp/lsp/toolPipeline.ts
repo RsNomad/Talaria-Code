@@ -351,19 +351,28 @@ export type RealpathConfiner = (target: string, roots: string[]) => Promise<stri
  * confiner's already-canonical result against the (as-given) `roots` array.
  * T6b's real `confine`/`toRelative` are expected to operate over
  * consistently realpath'd roots, so this lexical match lines up with
- * `canonical` in practice. If no root lexically matches (a caller/test
- * artifact), falls back to the first root — never throws. A `relPath`
- * computed against the "wrong" root at that point is a display nit, not a
- * confinement decision: `inRoot: true` was already decided by the confiner
- * having returned non-null.
+ * `canonical` in practice.
+ *
+ * S7 fix: among every root that lexically contains `canonicalPath`, picks
+ * the LONGEST match — i.e. the most specific/nested containing root — never
+ * just the first one array order happens to list. Overlapping/nested
+ * workspace roots (e.g. `/workspace` and `/workspace/nested-project` both
+ * open) used to let the array-order-first root win even when a more
+ * specific one also matched, rendering a `relPath` with a spurious extra
+ * leading segment. Returns `undefined` when NO root lexically matches (a
+ * caller/test artifact — `buildConfinementVerdict` only reaches this helper
+ * after `confine` already proved containment in ONE of `roots`) — the
+ * caller refuses to fabricate a relPath against an unrelated root rather
+ * than falling back to `roots[0]` (S7's "refuse cross-root fallback").
  */
-function findContainingRoot(canonicalPath: string, roots: readonly string[]): string {
+function findContainingRoot(canonicalPath: string, roots: readonly string[]): string | undefined {
+  let best: string | undefined;
   for (const root of roots) {
-    if (isRootPrefixOf(root, canonicalPath)) {
-      return root;
+    if (isRootPrefixOf(root, canonicalPath) && (best === undefined || root.length > best.length)) {
+      best = root;
     }
   }
-  return roots[0] ?? canonicalPath;
+  return best;
 }
 
 /** `root` is a path-boundary-respecting prefix of `canonicalPath`: either an
@@ -392,7 +401,11 @@ function isRootPrefixOf(root: string, canonicalPath: string): boolean {
  *   decides refuse-vs-external for its own tool semantics (research doc
  *   §5.2).
  * - `confine` resolves a canonical path ⇒ `{inRoot:true, relPath}`, where
- *   `relPath = toRelative(<containing root>, canonical)`.
+ *   `relPath = toRelative(<containing root>, canonical)` — or, when
+ *   {@link findContainingRoot} finds no lexically-containing root at all
+ *   (S7: "refuse cross-root fallback"), `relPath = canonical` (the raw
+ *   absolute path) rather than a `path.relative` computed against an
+ *   unrelated root, which could render a confusing/misleading value.
  * - `confine` THROWS ⇒ fail-closed: treated identically to a `null`
  *   resolution, `{inRoot:false, externalUri: rawFsPath}` — **never**
  *   `inRoot:true`. This `catch` is an explicit, documented fail-closed
@@ -418,5 +431,10 @@ export async function buildConfinementVerdict(
     return { inRoot: false, externalUri: rawFsPath };
   }
   const containingRoot = findContainingRoot(canonical, roots);
-  return { inRoot: true, relPath: toRelative(containingRoot, canonical) };
+  // S7: refuse a cross-root fallback — when no given root lexically
+  // contains `canonical`, fall back to the absolute canonical path itself
+  // (an honest value) instead of computing `toRelative` against an
+  // unrelated root (which could render a confusing/misleading relPath).
+  const relPath = containingRoot !== undefined ? toRelative(containingRoot, canonical) : canonical;
+  return { inRoot: true, relPath };
 }

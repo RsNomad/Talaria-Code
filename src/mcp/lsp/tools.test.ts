@@ -393,8 +393,11 @@ describe('confinement — lsp_diagnostics workspace scope', () => {
     expect(text).not.toContain('/usr/lib/external.ts');
   });
 
-  it('a single-path diagnostics call needs no classifyUri call (already confined by resolvePathArg)', async () => {
-    const classifyUri = vi.fn(async (): Promise<ConfinementVerdict> => ({ inRoot: true, relPath: 'a.ts' }));
+  it('L10: a single-path diagnostics call renders the classifyUri-confined relPath, not the raw args.path', async () => {
+    // Reuses the SAME confinement helper (`classifyUri`) every other tool
+    // already renders `relPath` through, instead of the raw, unconfined
+    // `args.path` string as typed by the caller.
+    const classifyUri = vi.fn(async (): Promise<ConfinementVerdict> => ({ inRoot: true, relPath: 'confined/a.ts' }));
     const getDiagnostics = vi.fn(
       (): readonly RawDiagnosticsGroup[] => [
         { uri: 'file:///workspace/a.ts', diagnostics: [rawDiag('some problem')] },
@@ -402,16 +405,28 @@ describe('confinement — lsp_diagnostics workspace scope', () => {
     );
     const deps = makeFakeDeps({ classifyUri, gateway: makeFakeGateway({ getDiagnostics }) });
 
-    const { text } = await callTool(deps, 'lsp_diagnostics', { path: 'a.ts' });
+    const { text } = await callTool(deps, 'lsp_diagnostics', { path: './weird/../a.ts' });
 
     expect(text).toContain('some problem');
-    expect(classifyUri).not.toHaveBeenCalled();
+    expect(classifyUri).toHaveBeenCalledWith('file:///workspace/a.ts');
+    expect(text).toContain('confined/a.ts');
+    expect(text).not.toContain('./weird/../a.ts');
   });
 
   it('refuses when neither path nor scope is given', async () => {
     const deps = makeFakeDeps();
     const { text } = await callTool(deps, 'lsp_diagnostics', {});
     expect(text).toContain('[lsp: refused]');
+  });
+
+  it('L11: passing BOTH path and scope:"workspace" refuses explicitly instead of silently preferring path', async () => {
+    const getDiagnostics = vi.fn((): readonly RawDiagnosticsGroup[] => []);
+    const deps = makeFakeDeps({ gateway: makeFakeGateway({ getDiagnostics }) });
+
+    const { text } = await callTool(deps, 'lsp_diagnostics', { path: 'a.ts', scope: 'workspace' });
+
+    expect(text).toContain('[lsp: refused]');
+    expect(getDiagnostics).not.toHaveBeenCalled();
   });
 });
 
@@ -492,6 +507,41 @@ describe('maybe-indexing — first-empty retry policy', () => {
       await cleanup();
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // AU-18 — the first-empty retry budget used to be keyed on the BARE
+  // languageId, shared across all 5 retrying tools: an empty hover for
+  // 'typescript' burned the SAME budget lsp_definition would need for its
+  // own retry on the same language.
+  // ---------------------------------------------------------------------------
+
+  it('AU-18: an empty hover does not burn a DIFFERENT tool\'s (lsp_definition\'s) first-empty retry for the same language', async () => {
+    const getHover = vi.fn(async (): Promise<readonly string[]> => []); // always empty
+    const getDefinition = vi.fn(
+      async (): Promise<readonly (PlainLocation | PlainLocationLink)[]> => [],
+    ); // always empty
+    const sleep = vi.fn(async () => undefined);
+    const deps = makeFakeDeps({ sleep, gateway: makeFakeGateway({ getHover, getDefinition }) });
+    const { client, cleanup } = await connectClient(deps);
+    try {
+      // hover first: at HEAD, this burns the SHARED 'typescript' budget.
+      await client.callTool({ name: 'lsp_hover', arguments: { path: 'a.ts', line: 1, character: 1 } });
+
+      // definition next, same language: must STILL get its own first-empty
+      // retry — a separate budget, keyed per (tool, language).
+      const definitionResult = await client.callTool({
+        name: 'lsp_definition',
+        arguments: { path: 'a.ts', line: 1, character: 1 },
+      });
+      const text = extractText(definitionResult.content);
+
+      expect(text.startsWith('[lsp: maybe-indexing]')).toBe(true);
+      expect(getDefinition).toHaveBeenCalledTimes(2); // first-empty + its own retry
+      expect(sleep).toHaveBeenCalledTimes(2); // one for hover's retry, one for definition's
+    } finally {
+      await cleanup();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -565,6 +615,53 @@ describe('lsp_document_symbols — an empty (still-indexing) result is not cache
 });
 
 // ---------------------------------------------------------------------------
+// L4 — the doc-symbols LRU used to key ENTIRELY by `${uri}@${version}`, so
+// multiple versions of the SAME uri could linger in the cache side by side
+// under different composite keys. A document close+reopen legitimately
+// RESETS `TextDocument.version` (per `@types/vscode`'s own doc comment: "A
+// closed document isn't synchronized anymore and won't be re-used when the
+// same resource is opened again"), so a version that moves DOWN can collide
+// with an old, still-resident key from a PRIOR document generation and serve
+// its stale content.
+// ---------------------------------------------------------------------------
+
+describe('L4: doc-symbols LRU must not serve a stale entry after a document-version reset', () => {
+  it('a version that resets DOWN (close+reopen) after climbing higher is a cache miss, not a stale hit from the earlier generation', async () => {
+    const getDocumentSymbols = vi
+      .fn<() => Promise<readonly RawDocumentSymbolEntry[]>>()
+      .mockResolvedValueOnce([docSymbol('Gen1V1')]) // query #1: v1
+      .mockResolvedValueOnce([docSymbol('Gen1V3')]) // query #2: v3 (edited)
+      .mockResolvedValueOnce([docSymbol('Gen2V1')]); // query #3: v1 again (reopened — a NEW generation)
+    let version = 1;
+    const resolvePathArg = vi.fn(
+      async (): Promise<ResolvedPathArg> => ({ uri: 'file:///workspace/a.ts', languageId: 'typescript', version }),
+    );
+    const deps = makeFakeDeps({ resolvePathArg, gateway: makeFakeGateway({ getDocumentSymbols }) });
+    const { client, cleanup } = await connectClient(deps);
+    try {
+      const first = await client.callTool({ name: 'lsp_document_symbols', arguments: { path: 'a.ts' } });
+      expect(JSON.stringify(first.content)).toContain('Gen1V1');
+
+      version = 3;
+      const second = await client.callTool({ name: 'lsp_document_symbols', arguments: { path: 'a.ts' } });
+      expect(JSON.stringify(second.content)).toContain('Gen1V3');
+
+      // Document closed then reopened: version legitimately restarts,
+      // landing back on a version number (1) this cache already has an
+      // entry for from the PRIOR generation.
+      version = 1;
+      const third = await client.callTool({ name: 'lsp_document_symbols', arguments: { path: 'a.ts' } });
+
+      expect(getDocumentSymbols).toHaveBeenCalledTimes(3);
+      expect(JSON.stringify(third.content)).toContain('Gen2V1');
+      expect(JSON.stringify(third.content)).not.toContain('Gen1V1');
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Concurrency — pool bounds in-flight gateway calls (light)
 // ---------------------------------------------------------------------------
 
@@ -607,6 +704,113 @@ describe('concurrency pool — bounds in-flight gateway calls', () => {
     } finally {
       await cleanup();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AU-20 — post-gateway classification (classifyUri/readFullText realpath
+// fan-out) used to run as a raw `Promise.all` OUTSIDE the 4-slot pool, so a
+// single tool call with many raw targets could fan out unboundedly
+// concurrent realpath work. Each of the three call sites (locations targets,
+// workspace-diagnostics filtering, code-actions file resolution) must route
+// through the SAME pool primitive the gateway calls already use.
+// ---------------------------------------------------------------------------
+
+/** Builds a counting/pending-release `classifyUri` fake — same "counting
+ * seam" shape as the concurrency-pool test above, reused for AU-20's three
+ * scenarios. */
+function makeCountingClassifyUri(): {
+  classifyUri: (uri: string) => Promise<ConfinementVerdict>;
+  pending: Array<() => void>;
+  getPeak: () => number;
+} {
+  let active = 0;
+  let peak = 0;
+  const pending: Array<() => void> = [];
+  const classifyUri = vi.fn(
+    (uri: string): Promise<ConfinementVerdict> =>
+      new Promise<ConfinementVerdict>((resolve) => {
+        active++;
+        peak = Math.max(peak, active);
+        pending.push(() => {
+          active--;
+          resolve({ inRoot: false, externalUri: uri });
+        });
+      }),
+  );
+  return { classifyUri, pending, getPeak: () => peak };
+}
+
+/** Drains a counting seam's pending releases until `promise` settles — same
+ * loop shape used by the concurrency-pool test above. */
+async function drainUntilSettled(promise: Promise<unknown>, pending: Array<() => void>): Promise<void> {
+  let settled = false;
+  void promise.then(() => {
+    settled = true;
+  });
+  for (let guard = 0; guard < 100 && !settled; guard++) {
+    await flushMicrotasks();
+    const toRelease = pending.splice(0, pending.length);
+    for (const release of toRelease) release();
+  }
+  await promise;
+}
+
+describe('AU-20: post-gateway classifyUri realpath fan-out is bounded by the pool, not a raw Promise.all', () => {
+  it('lsp_definition: 50 raw targets never run more than MAX_IN_FLIGHT concurrent classifyUri calls', async () => {
+    const { classifyUri, pending, getPeak } = makeCountingClassifyUri();
+    const targets: PlainLocation[] = Array.from({ length: 50 }, (_, i) => ({
+      uri: `file:///usr/lib/f${i}.ts`,
+      range: range(0, 0, 0, 1),
+    }));
+    const getDefinition = vi.fn(async (): Promise<readonly (PlainLocation | PlainLocationLink)[]> => targets);
+    const deps = makeFakeDeps({ classifyUri, gateway: makeFakeGateway({ getDefinition }) });
+
+    const promise = callTool(deps, 'lsp_definition', { path: 'a.ts', line: 1, character: 1 });
+    await drainUntilSettled(promise, pending);
+    await promise;
+
+    expect(getPeak()).toBeLessThanOrEqual(MAX_IN_FLIGHT);
+    expect(classifyUri).toHaveBeenCalledTimes(50);
+  });
+
+  it('lsp_diagnostics (workspace scope): 50 raw groups never run more than MAX_IN_FLIGHT concurrent classifyUri calls', async () => {
+    const { classifyUri, pending, getPeak } = makeCountingClassifyUri();
+    const groups: RawDiagnosticsGroup[] = Array.from({ length: 50 }, (_, i) => ({
+      uri: `file:///usr/lib/f${i}.ts`,
+      diagnostics: [rawDiag(`problem ${i}`)],
+    }));
+    const getDiagnostics = vi.fn((): readonly RawDiagnosticsGroup[] => groups);
+    const deps = makeFakeDeps({ classifyUri, gateway: makeFakeGateway({ getDiagnostics }) });
+
+    const promise = callTool(deps, 'lsp_diagnostics', { scope: 'workspace' });
+    await drainUntilSettled(promise, pending);
+    await promise;
+
+    expect(getPeak()).toBeLessThanOrEqual(MAX_IN_FLIGHT);
+    expect(classifyUri).toHaveBeenCalledTimes(50);
+  });
+
+  it('lsp_code_actions: 50 raw actions (1 file each) never run more than MAX_IN_FLIGHT concurrent classifyUri calls', async () => {
+    const { classifyUri, pending, getPeak } = makeCountingClassifyUri();
+    const actions: RawCodeAction[] = Array.from({ length: 50 }, (_, i) => ({
+      title: `Fix ${i}`,
+      hasCommand: false,
+      edit: {
+        allEntriesAvailable: true,
+        hasNonTextEntry: false,
+        files: [{ uri: `file:///usr/lib/f${i}.ts`, edits: [textEdit(0, 0, 0, 0, 'x')] }],
+      },
+    }));
+    const getCodeActions = vi.fn(async (): Promise<readonly RawCodeAction[]> => actions);
+    const deps = makeFakeDeps({ classifyUri, gateway: makeFakeGateway({ getCodeActions }) });
+
+    const promise = callTool(deps, 'lsp_code_actions', CODE_ACTIONS_ARGS);
+    await drainUntilSettled(promise, pending);
+    await promise;
+
+    expect(getPeak()).toBeLessThanOrEqual(MAX_IN_FLIGHT);
+    expect(classifyUri).toHaveBeenCalledTimes(50);
   });
 });
 

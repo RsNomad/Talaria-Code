@@ -17,6 +17,11 @@ import type {
   CheckpointsData,
   ContextRef,
   HostToWebviewMessage,
+  HubPreview,
+  HubScan,
+  McpCatalogData,
+  McpCatalogEntry,
+  McpTestResult,
   SessionsData,
   SubagentsData,
 } from '../../shared/protocol';
@@ -41,11 +46,15 @@ import type { RestoreResult } from '../checkpoints/CheckpointTracker';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
 import type { PanelSource } from '../panels/PanelSourceRegistry';
 import type { DashboardService } from '../dashboard/HermesDashboardManager';
-import type { DashboardClientLike, DashboardToggleResult } from '../dashboard/HermesDashboardClient';
+import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../dashboard/HermesDashboardClient';
 import type { ConfinedReader } from './acp/confinedOpen';
 import { ConnectionSupervisor, type ConnectionSupervisorHostPort } from './connection/ConnectionSupervisor';
+import type { WorkspaceStateLike } from './oneshot/OneShotSessionRegistry';
+import { ONESHOT_SESSION_IDS_STORAGE_KEY } from './oneshot/OneShotSessionRegistry';
 import { SessionRegistry } from './session/SessionRegistry';
 import { must } from '../../testing/must';
+import { TRUST_GATED_METHODS } from './control/ControlDispatcher';
+import { RELOAD_LINE } from './control/mcpEntryValidation';
 
 /**
  * `vscode` isn't resolvable outside the extension host; `AcpBackend` only
@@ -94,6 +103,10 @@ vi.mock('vscode', () => {
     __customModesWorkspaceValue: unknown;
     __customModesFolderValue: unknown;
     __configChangeListeners: ConfigChangeListener[];
+    // Task A5: mutable like `workspaceFolders` — tests flip this to prove the
+    // dispatcher's trust gate (`ControlDispatcherHostPort.isTrusted`), then
+    // restore it so later tests in the file are unaffected.
+    isTrusted: boolean;
     getConfiguration: (section?: string) => {
       inspect: (key: string) => Record<string, unknown> | undefined;
     };
@@ -107,6 +120,7 @@ vi.mock('vscode', () => {
     __customModesWorkspaceValue: undefined,
     __customModesFolderValue: undefined,
     __configChangeListeners: [],
+    isTrusted: true,
     getConfiguration: () => ({
       inspect: (key: string) => {
         if (key !== 'talaria.customModes') return undefined;
@@ -125,9 +139,38 @@ vi.mock('vscode', () => {
       };
     },
   };
-  const window = { showWarningMessage: vi.fn() };
+  // Task A6 harness extension (explicit, cited — features-add-mcp-skills-
+  // architecture.md task A6 "Harness extension" bullet): `window.withProgress`
+  // defaults to invoking `task` with a NEVER-cancelled token — matches the
+  // real `vscode.window.withProgress(options, (progress, token) => ...)`
+  // shape (Context7-pinned, `generateCommitCommand.vscode.ts:121-131`'s own
+  // real-API precedent). Individual tests override this mock (`mockImplementationOnce`)
+  // to simulate cancellation.
+  const window = {
+    showWarningMessage: vi.fn(),
+    // Rev-1 B4 (CF-13 parity, TH-4) harness extension: `window.showInputBox`
+    // backs the masked host-side credential prompt (`ControlDispatcherHostPort
+    // .promptSecret`). Defaults to `undefined` (an unconfigured call reads as
+    // a dismissed prompt, the fail-closed direction) — tests that need a
+    // real value configure it explicitly via `mockShowInputBox.mockResolvedValueOnce(...)`.
+    showInputBox: vi.fn(),
+    withProgress: vi.fn(
+      async (
+        _opts: unknown,
+        task: (
+          progress: { report: () => void },
+          token: { isCancellationRequested: boolean; onCancellationRequested: (cb: () => void) => { dispose: () => void } },
+        ) => Promise<unknown>,
+      ) => task({ report: () => {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose: () => {} }) }),
+    ),
+  };
+  // Task A6 harness extension: `ProgressLocation.Notification` — the only
+  // location `withProgress` renders a cancel button for (§4.8); the real
+  // enum's numeric value is irrelevant to these tests (never asserted on),
+  // only its presence as a property `AcpBackend`'s port construction reads.
+  const ProgressLocation = { Notification: 15 };
   const Uri = { file: (p: string) => ({ fsPath: p }) };
-  return { EventEmitter, workspace, window, Uri };
+  return { EventEmitter, workspace, window, Uri, ProgressLocation };
 });
 
 /**
@@ -818,6 +861,9 @@ const mockWorkspace = vscode.workspace as unknown as {
 /** W4-T4b: the mocked `vscode.window.showWarningMessage` spy. */
 const mockShowWarningMessage = vscode.window.showWarningMessage as unknown as ReturnType<typeof vi.fn>;
 
+/** Rev-1 B4 (CF-13 parity, TH-4): the mocked `vscode.window.showInputBox` spy — backs `ControlDispatcherHostPort.promptSecret`. */
+const mockShowInputBox = vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>;
+
 /**
  * W4-T4b: the `onDidChangeConfiguration` listener registered by the MOST
  * RECENTLY constructed `AcpBackend` — call immediately after constructing
@@ -1206,7 +1252,7 @@ describe('AcpBackend.invokeControl — Zone CFG: MCP-hub panel refresh (multi-RP
     ]);
     const expected = {
       servers: [
-        { id: 'filesystem', name: 'filesystem', status: 'connected', command: 'npx -y @modelcontextprotocol/server-filesystem /tmp', toolCount: 4 },
+        { id: 'filesystem', name: 'filesystem', status: 'connected', command: 'npx -y @modelcontextprotocol/server-filesystem /tmp', toolCount: 4, enabled: true, transport: 'stdio' },
       ],
     };
     expect(result).toEqual(expected);
@@ -1262,7 +1308,15 @@ function makeStartableBackend(
   backend: AcpBackend;
   clients: FakeAcpClient[];
 } {
-  const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes', ...configOverrides };
+  // pythonPath pinned alongside hermesPath: AU-7's realpath+existence-check
+  // derivation (unset pythonPath) would otherwise reject this fake path
+  // against the real FS — these tests exercise ConnectionSupervisor/ACP
+  // wiring, not python derivation (covered by resolveHermes.test.ts).
+  const config: HermesRuntimeConfig = {
+    hermesPath: '/fake/hermes',
+    pythonPath: '/fake/python',
+    ...configOverrides,
+  };
   const clients: FakeAcpClient[] = [];
   const createClient: AcpClientFactory = (options) => {
     const client = new FakeAcpClient(options);
@@ -1754,7 +1808,7 @@ describe('ConnectionSupervisor/AcpBackend — T8 (§2.3 ⑧): structural no-prov
     const emitted: HostToWebviewMessage[] = [];
     const authRequired: unknown = { code: -32000, message: 'Authentication required' };
     const port: ConnectionSupervisorHostPort = {
-      config: { hermesPath: '/fake/hermes' },
+      config: { hermesPath: '/fake/hermes', pythonPath: '/fake/python' },
       createClient: (options) => new FakeAcpClient(options),
       callbacks: {
         onSessionUpdate: () => {},
@@ -2761,7 +2815,7 @@ describe('AcpBackend — W4-T1b §3: a crash releases the (bridge) root turn-lea
     backend: AcpBackend;
     clients: FakeAcpClient[];
   } {
-    const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes' };
+    const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes', pythonPath: '/fake/python' };
     const clients: FakeAcpClient[] = [];
     const createClient: AcpClientFactory = (options) => {
       const client = new FakeAcpClient(options);
@@ -4282,6 +4336,67 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
     ]);
   });
 
+  /**
+   * TI-5 (AU-60, TI-1-review-flagged gap): unlike the CF-14 test right
+   * above — which catches "no client at ENTRY" — this proves the OTHER,
+   * previously genuinely-silent branch: the client disappearing in the
+   * window AFTER this method's own entry-check (a real ACP-child crash
+   * while the `resolveWithinWorkspaceReal` confinement `await` is in flight
+   * is the realistic trigger) but BEFORE `controller.loadReplay` actually
+   * runs. `announceSessionBound` has ALREADY fired `tab.bound` by that
+   * point, so pre-fix this tab was left silently "bound" with an empty
+   * transcript and no failure affordance at all: `SessionController
+   * .loadReplay`'s own `!client` early-guard returns `undefined` with no
+   * `clear`/`turn.start`/`error`/`turn.end` of its own, and (pre-fix)
+   * `loadSessionIntoTabInternal` just forwarded that bare `undefined`
+   * straight through with no emission of its own — unlike
+   * `recoverOneSession`'s crash-recovery path, which already turns ANY
+   * `loadReplay` `undefined` (including this exact cause) into
+   * `tab.error{kind:'session-lost'}` unconditionally.
+   *
+   * A call-counting `getClient` stub simulates the crash deterministically
+   * (no real fs interleaving needed): the FIRST call is this method's own
+   * entry-check (must see the live client, or the test would exercise
+   * CF-14's branch instead); every call after that — this fix's own
+   * pre-`loadReplay` check, and `loadReplay`'s internal check if ever
+   * reached — sees the client gone, exactly as an ACP crash mid-await
+   * would leave it.
+   */
+  it('TI-5 (AU-60): a client that disappears AFTER tab.bound fires but BEFORE loadReplay runs surfaces tab.error{session-lost} — not a silent no-op', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID, client alive
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    const supervisor = (backend as unknown as { connectionSupervisor: { getClient(): unknown } })
+      .connectionSupervisor;
+    const originalGetClient = supervisor.getClient.bind(supervisor);
+    let calls = 0;
+    supervisor.getClient = () => {
+      calls += 1;
+      return calls === 1 ? originalGetClient() : undefined;
+    };
+
+    const result = await backend.loadTab('tab-2', 'history-session', '/ws');
+
+    expect(result).toBeUndefined();
+    // RED (pre-fix): messages would contain ONLY tab.bound/mode.state (the
+    // mint's own emissions) — no tab.error at all; the genuinely-silent gap.
+    expect(messages).toContainEqual({
+      type: 'tab.error',
+      tabId: 'tab-2',
+      kind: 'session-lost',
+      message: expect.any(String),
+    });
+    // Never reached the ACP client — loadReplay's own `!client` guard (or
+    // this fix's short-circuit ahead of it) refused before that.
+    expect(must(clients[0]).loadSessionCalls).toEqual([]);
+    // No leaked controller — mirrors the timeout branch's identity-guarded
+    // cleanup immediately below this fix in the source.
+    expect(hasController(backend, 'history-session')).toBe(false);
+    expect(calls).toBeGreaterThanOrEqual(2); // entry-check + this fix's own check both ran
+  });
+
   it('CF-14: emits tab.error{kind:"open-failed"} (message never echoes the path) when the load cwd is outside every open workspace folder', async () => {
     const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'hermes-acp-loadtab-outside-'));
     try {
@@ -4319,6 +4434,35 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
   });
 });
 
+describe('beta.7 B1: loadTab threads the History title into tab.bound', () => {
+  it('a titled load emits tab.bound carrying that title', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    must(clients[0]).setLoadSessionResult({ found: true, currentModeId: 'default' });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.loadTab('tab-2', 'history-session', '/ws', 'Fix the bug');
+
+    const bound = messages.find((m) => m.type === 'tab.bound' && m.tabId === 'tab-2');
+    expect(bound).toMatchObject({ sessionId: 'history-session', title: 'Fix the bug' });
+  });
+
+  it('a title-less load (legacy session.load posture) emits tab.bound WITHOUT the key — never title: undefined', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    must(clients[0]).setLoadSessionResult({ found: true, currentModeId: 'default' });
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.loadTab('tab-2', 'history-session', '/ws');
+
+    const bound = messages.find((m) => m.type === 'tab.bound' && m.tabId === 'tab-2');
+    expect(bound).toBeDefined();
+    expect(bound && 'title' in bound).toBe(false);
+  });
+});
+
 describe('AcpBackend.invokeControl — Zone HIST: sessions panel refresh (ACP session/list, NOT tui_gateway)', () => {
   it("switchTab('sessions') calls client.listSessions (not this.control), reshapes the result into SessionsData, and emits panel.data", async () => {
     const { backend, client, messages } = makeBackend();
@@ -4342,6 +4486,18 @@ describe('AcpBackend.invokeControl — Zone HIST: sessions panel refresh (ACP se
 
     const control = seam(backend).control as { dispatchCalls: unknown[] };
     expect(control.dispatchCalls).toEqual([]);
+  });
+
+  it('AU-10: a sessions fetch with NO ACP client connected REJECTS with a reasoned message and emits no push (instead of resolving with no data forever)', async () => {
+    const config: HermesRuntimeConfig = {};
+    const backend = new AcpBackend(config); // never start()ed — no client wired
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await expect(backend.invokeControl('panel.data', { panel: 'sessions' })).rejects.toThrow(
+      'Agent is not connected yet.',
+    );
+    expect(messages).toEqual([]); // no silent push either — a real terminal, not a hidden hold
   });
 
   it("a direct 'session.list' control.invoke call (pagination 'load more') also refreshes the panel, passing params.cursor through", async () => {
@@ -7036,6 +7192,201 @@ function makeBackendWithDashboard(): {
   return { backend, messages, client };
 }
 
+/**
+ * Task A5 harness extension (explicit, cited — not fabricated): a
+ * `DashboardClientLike` fake that ALSO implements the T1 `DashboardAdminClient`
+ * admin surface (`HermesDashboardClient.ts:137-167`), with a call-recording
+ * array per member so tests can assert exactly what reached the "dashboard"
+ * — mirrors `FakeDashboardClient`'s own `toggleSkillCalls`/`toggleToolsetCalls`
+ * idiom, extended to the 13 admin methods `hasDashboardAdmin` structurally
+ * checks for (B2-M1 cleanup: was 8 before the T2 skills-admin members were
+ * added).
+ */
+class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardAdminClient {
+  addCalls: Array<{ name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> }> = [];
+  removeCalls: string[] = [];
+  setEnabledCalls: Array<{ name: string; enabled: boolean }> = [];
+  testCalls: string[] = [];
+  authCalls: string[] = [];
+  /** Settable canned envelope `testMcpServer` resolves with. */
+  testResult: McpTestResult = { ok: true, tools: [] };
+
+  // --- Task A6 harness extension (explicit, cited — features-add-mcp-
+  // skills-architecture.md task A6 "Harness extension" bullet) ---------------
+
+  /** `listMcpCatalog()`'s FIRST-call answer (e.g. the row `mcp.catalog` first lists). */
+  catalogEntries: McpCatalogEntry[] = [];
+  /**
+   * `listMcpCatalog()`'s answer on every call AFTER the first, when set —
+   * lets a test drive the Layer-6 ground-truth-verify re-list with a
+   * DIFFERENT (post-install) `installed` flag than the pre-install listing.
+   * `undefined` (the default) means every call keeps returning
+   * {@link catalogEntries} unchanged.
+   */
+  catalogEntriesAfterInstall: McpCatalogEntry[] | undefined;
+  private listCatalogCalls = 0;
+  installCalls: Array<{ name: string; env: Record<string, string>; enable: boolean }> = [];
+  /** Settable canned envelope `installCatalogEntry` resolves with. */
+  installResult: { ok: boolean; name: string; background: boolean; action?: string } = {
+    ok: true,
+    name: '',
+    background: false,
+  };
+  /**
+   * F1 harness extension (test-only — mirrors {@link authDeferred}'s exact
+   * idiom below): when set, `installCatalogEntry` returns THIS promise
+   * verbatim (ignoring `installResult`), giving the `mcp.catalogInstall`
+   * single-flight test a controllable in-flight call.
+   */
+  installDeferred: Promise<{ ok: boolean; name: string; background: boolean; action?: string }> | undefined;
+  actionStatusCalls: string[] = [];
+  /** FIFO queue `actionStatus` consumes one entry per call; once empty, repeats the last-shifted entry (defaults to not-running). */
+  statusSeq: Array<{ running: boolean; exit_code: number | null; lines: string[] }> = [];
+  private lastStatus: { running: boolean; exit_code: number | null; lines: string[] } = {
+    running: false,
+    exit_code: 0,
+    lines: [],
+  };
+  /** Settable canned envelope `authMcpServer` resolves with (signal ignored — the happy-path default). */
+  authResult: McpTestResult = { ok: true, tools: [] };
+  /** When set, `authMcpServer` returns THIS promise verbatim (ignoring `authResult`/signal) — the IMPORTANT-3 single-flight test's controllable in-flight call. */
+  authDeferred: Promise<McpTestResult> | undefined;
+
+  async addMcpServer(body: {
+    name: string;
+    url?: string;
+    command?: string;
+    args?: string[];
+    env?: Record<string, string>;
+  }): Promise<unknown> {
+    this.addCalls.push(body);
+    return { ok: true, name: body.name };
+  }
+
+  async removeMcpServer(name: string): Promise<{ ok: boolean }> {
+    this.removeCalls.push(name);
+    return { ok: true };
+  }
+
+  async testMcpServer(name: string): Promise<McpTestResult> {
+    this.testCalls.push(name);
+    return this.testResult;
+  }
+
+  async setMcpServerEnabled(name: string, enabled: boolean): Promise<{ ok: boolean; name: string; enabled: boolean }> {
+    this.setEnabledCalls.push({ name, enabled });
+    return { ok: true, name, enabled };
+  }
+
+  async authMcpServer(name: string, _signal?: AbortSignal): Promise<McpTestResult> {
+    this.authCalls.push(name);
+    if (this.authDeferred) return this.authDeferred;
+    return this.authResult;
+  }
+
+  async listMcpCatalog(): Promise<McpCatalogData> {
+    this.listCatalogCalls += 1;
+    const entries = this.listCatalogCalls > 1 && this.catalogEntriesAfterInstall ? this.catalogEntriesAfterInstall : this.catalogEntries;
+    return { entries };
+  }
+
+  async installCatalogEntry(body: {
+    name: string;
+    env: Record<string, string>;
+    enable: boolean;
+  }): Promise<{ ok: boolean; name: string; background: boolean; action?: string }> {
+    this.installCalls.push(body);
+    if (this.installDeferred) return this.installDeferred;
+    return this.installResult;
+  }
+
+  async actionStatus(name: string): Promise<{ running: boolean; exit_code: number | null; lines: string[] }> {
+    this.actionStatusCalls.push(name);
+    const next = this.statusSeq.shift();
+    if (next) this.lastStatus = next;
+    return this.lastStatus;
+  }
+
+  // --- Task B2 harness extension (explicit, cited — features-add-mcp-
+  // skills-architecture.md task B2 adds these 5 members to DashboardAdminClient;
+  // no T2 dispatcher routing exists yet, so these are minimal call-recording
+  // stubs — same idiom as the T1 members above — kept ready for the C-task
+  // that wires skills.create/hubPreview/hubScan/hubInstall/hubUninstall.) ------
+
+  createCalls: Array<{ name: string; content: string; category?: string }> = [];
+  previewCalls: string[] = [];
+  scanCalls: string[] = [];
+  hubInstallCalls: string[] = [];
+  uninstallHubSkillCalls: string[] = [];
+  previewHubSkillResult: HubPreview = {
+    name: '', description: '', source: '', identifier: '', trust_level: '', skill_md: '', files: [],
+  };
+  /** Task B4 harness field (doc-pinned name, `features-add-mcp-skills-architecture.md` Task B4). */
+  scanResult: HubScan = {
+    name: '', identifier: '', source: '', trust_level: '', verdict: 'safe', summary: '', policy: 'allow',
+    policy_reason: '', findings: [], severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+  };
+  /** Task B4 harness field (doc-pinned name). `installHubSkill`'s `name` is the ACTION id to poll. */
+  hubInstallResult: { ok: boolean; name: string } = { ok: true, name: '' };
+  uninstallHubSkillResult: { ok: boolean; name: string } = { ok: true, name: '' };
+  /**
+   * Task B4 harness extension (mirrors {@link installDeferred}/{@link
+   * authDeferred}'s exact idiom): when set, `installHubSkill` returns THIS
+   * promise verbatim (ignoring `hubInstallResult`), giving the
+   * `skills.hubInstall` single-flight regression test a controllable
+   * in-flight call.
+   */
+  hubInstallDeferred: Promise<{ ok: boolean; name: string }> | undefined;
+  /**
+   * Task B5 harness extension (mirrors {@link hubInstallDeferred}'s exact
+   * idiom): when set, `uninstallHubSkill` returns THIS promise verbatim
+   * (ignoring `uninstallHubSkillResult`), giving the `skills.hubUninstall`
+   * single-flight regression test a controllable in-flight call.
+   */
+  uninstallHubSkillDeferred: Promise<{ ok: boolean; name: string }> | undefined;
+
+  async createSkill(body: { name: string; content: string; category?: string }): Promise<unknown> {
+    this.createCalls.push(body);
+    return { ok: true };
+  }
+
+  async previewHubSkill(identifier: string): Promise<HubPreview> {
+    this.previewCalls.push(identifier);
+    return this.previewHubSkillResult;
+  }
+
+  async scanHubSkill(identifier: string): Promise<HubScan> {
+    this.scanCalls.push(identifier);
+    return this.scanResult;
+  }
+
+  async installHubSkill(identifier: string): Promise<{ ok: boolean; name: string }> {
+    this.hubInstallCalls.push(identifier);
+    if (this.hubInstallDeferred) return this.hubInstallDeferred;
+    return this.hubInstallResult;
+  }
+
+  async uninstallHubSkill(name: string): Promise<{ ok: boolean; name: string }> {
+    this.uninstallHubSkillCalls.push(name);
+    if (this.uninstallHubSkillDeferred) return this.uninstallHubSkillDeferred;
+    return this.uninstallHubSkillResult;
+  }
+}
+
+/** Task A5 harness extension: a twin of {@link makeBackendWithDashboard} that injects {@link FakeAdminDashboardClient}. */
+function makeBackendWithAdminDashboard(): {
+  backend: AcpBackend;
+  messages: HostToWebviewMessage[];
+  client: FakeAdminDashboardClient;
+} {
+  const client = new FakeAdminDashboardClient();
+  const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+  const backend = new AcpBackend({}, undefined, undefined, undefined, dashboard);
+  const messages: HostToWebviewMessage[] = [];
+  backend.onMessage((m) => messages.push(m));
+  return { backend, messages, client };
+}
+
 describe('AcpBackend — W1.5 dashboard channel (Skills & Tools)', () => {
   it('routes skills.toggle to the dashboard client (NOT tui_gateway) and returns the {ok,name,enabled} round-trip', async () => {
     const { backend, client } = makeBackendWithDashboard();
@@ -7175,6 +7526,1673 @@ describe('AcpBackend — W1.5 dashboard channel (Skills & Tools)', () => {
 
     client.resolveNext();
     await expect(second).resolves.toEqual({ ok: true, name: 'b', enabled: true });
+  });
+});
+
+// =============================================================================
+// Task A5 (features-add-mcp-skills-architecture.md §4.5): ControlDispatcher's
+// T1 MCP admin core — add/remove/setEnabled/test + trust gate + the
+// fail-closed last-listed-name guard (critic IMPORTANT-2).
+// =============================================================================
+
+// A `Record<..., true>` literal mirroring `SetupController.test.ts:1675-1712`'s
+// "MUTATING_METHODS / READ_ONLY_METHODS partition the full SetupMethod union"
+// lock idiom: TypeScript refuses to compile this object if a key is
+// mistyped/renamed, and the runtime equality assertion below is what
+// actually fails if `TRUST_GATED_METHODS` ever drifts from the brief's
+// pinned 9-method set (§4.5 item 1) — e.g. a future task adding a new
+// mutating MCP/skills method without also classifying it here.
+const PINNED_TRUST_GATED_METHODS: Record<
+  | 'mcp.add'
+  | 'mcp.remove'
+  | 'mcp.setEnabled'
+  | 'mcp.test'
+  | 'mcp.auth'
+  | 'mcp.catalogInstall'
+  | 'skills.create'
+  | 'skills.hubInstall'
+  | 'skills.hubUninstall',
+  true
+> = {
+  'mcp.add': true,
+  'mcp.remove': true,
+  'mcp.setEnabled': true,
+  'mcp.test': true,
+  'mcp.auth': true,
+  'mcp.catalogInstall': true,
+  'skills.create': true,
+  'skills.hubInstall': true,
+  'skills.hubUninstall': true,
+};
+
+describe('TRUST_GATED_METHODS (Task A5 §4.5 item 1): pinned 9-method lock', () => {
+  it('is exactly the 9 methods the brief pins — no silent drift', () => {
+    expect([...TRUST_GATED_METHODS].sort()).toEqual(Object.keys(PINNED_TRUST_GATED_METHODS).sort());
+  });
+});
+
+describe('ControlDispatcher — Task A5 MCP admin core', () => {
+  it('mcp.add happy path: validate -> host modal -> POST -> reload.mcp{confirm:true} -> mcp refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    mockShowWarningMessage.mockResolvedValueOnce('Add server'); // user confirms the native modal
+
+    const result = await backend.invokeControl('mcp.add', {
+      name: 'gh',
+      transport: 'stdio',
+      command: 'npx',
+      args: ['-y', 'x'],
+      env: {},
+    });
+
+    expect(client.addCalls).toEqual([{ name: 'gh', command: 'npx', args: ['-y', 'x'], env: {} }]);
+    expect(control.dispatchCalls.map((c) => c.method)).toEqual(['reload.mcp', 'config.get', 'tools.list']);
+    expect(result).toMatchObject({ ok: true, name: 'gh' });
+  });
+
+  it('mcp.add: a declined modal sends NOTHING to the dashboard client', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); // user hit Cancel
+    await expect(
+      backend.invokeControl('mcp.add', { name: 'gh', transport: 'stdio', command: 'npx', args: [], env: {} }),
+    ).rejects.toThrow(/declined|cancel/i);
+    expect(client.addCalls).toEqual([]);
+  });
+
+  it('mcp.add: untrusted workspace is refused before validation or any modal', async () => {
+    const { backend } = makeBackendWithAdminDashboard();
+    // Earlier tests in this describe block leave `mockShowWarningMessage`
+    // with a non-zero call count (it's a module-level spy, never
+    // auto-reset) — mirrors the existing `mockClear()` discipline at
+    // AcpBackend.test.ts:10186/:10196/:10223/:10234.
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      await expect(
+        backend.invokeControl('mcp.add', { name: 'gh', transport: 'stdio', command: 'npx', args: [], env: {} }),
+      ).rejects.toThrow(/trust/i);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('mcp.remove refuses a name outside lastListedNames (S-M4)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache
+    await expect(backend.invokeControl('mcp.remove', { name: 'evil' })).rejects.toThrow(/not in the last-listed/);
+    expect(client.removeCalls).toEqual([]);
+  });
+
+  it('IMPORTANT-2: every name-keyed mutation is FAIL-CLOSED when the panel was never fetched (cache undefined)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    // No panel.data fetch — lastListedNames() is undefined. The modal-less
+    // mcp.setEnabled is the critical case: without this rule a compromised
+    // webview's FIRST message could toggle any server.
+    await expect(backend.invokeControl('mcp.setEnabled', { name: 'anything', enabled: false })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    await expect(backend.invokeControl('mcp.remove', { name: 'anything' })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    await expect(backend.invokeControl('mcp.test', { name: 'anything' })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    await expect(backend.invokeControl('mcp.auth', { name: 'anything' })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    expect(client.setEnabledCalls).toEqual([]);
+    expect(client.removeCalls).toEqual([]);
+    expect(client.testCalls).toEqual([]);
+    expect(client.authCalls).toEqual([]);
+  });
+
+  it('mcp.test resolves the ok:false envelope verbatim, with NO reload and NO modal', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' });
+    client.testResult = { ok: false, error: 'boom', tools: [] };
+    mockShowWarningMessage.mockClear(); // see the untrusted-workspace test's own note above
+    const res = await backend.invokeControl('mcp.test', { name: 'gh' });
+    expect(res).toEqual({ ok: false, error: 'boom', tools: [] });
+    expect(control.dispatchCalls.filter((c) => c.method === 'reload.mcp')).toEqual([]);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------
+  // A5-M1 review fold-in: `mcp.remove`'s modal detail is the single-
+  // sourced `RELOAD_LINE` EXPORTED from `mcpEntryValidation.ts` — no more
+  // byte-duplicated local `MCP_RELOAD_LINE` in `ControlDispatcher.ts`.
+  // ---------------------------------------------------------------------
+  it('A5-M1 dedupe: mcp.remove modal detail is the single-sourced RELOAD_LINE, byte-identical', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Remove');
+
+    await backend.invokeControl('mcp.remove', { name: 'gh' });
+
+    const detail = (mockShowWarningMessage.mock.calls[0] as unknown[])[1] as { detail: string };
+    expect(detail.detail).toBe(RELOAD_LINE);
+    expect(client.removeCalls).toEqual(['gh']);
+  });
+
+  // ---------------------------------------------------------------------
+  // A5-M2 review fold-in: a REJECTED MCP handler must not wedge the
+  // `dashboardToggleTail` serialization queue — a subsequent handler on the
+  // SAME backend still executes to completion.
+  // ---------------------------------------------------------------------
+  it('A5-M2 concurrency: a rejected mcp.add does not wedge the serialization tail — a subsequent mcp.remove still runs', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache with 'gh'
+
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); // user declines the mcp.add modal
+    await expect(
+      backend.invokeControl('mcp.add', { name: 'new-server', transport: 'stdio', command: 'npx', args: [], env: {} }),
+    ).rejects.toThrow(/declined|cancel/i);
+    expect(client.addCalls).toEqual([]);
+
+    mockShowWarningMessage.mockResolvedValueOnce('Remove'); // user confirms the FOLLOWING mcp.remove
+    const result = await backend.invokeControl('mcp.remove', { name: 'gh' });
+
+    expect(result).toEqual({ ok: true });
+    expect(client.removeCalls).toEqual(['gh']);
+  });
+});
+
+// =============================================================================
+// Task A6 (features-add-mcp-skills-architecture.md §4.7/§4.8): the Nous
+// catalog install (ground-truth verified) + OAuth login dispatcher core.
+// =============================================================================
+
+/** Same builder as `mcpEntryValidation.test.ts` (local copy — the harness-honesty rule forbids importing a `.test.ts` fixture). */
+const catalogRow = (over: Record<string, unknown> = {}): McpCatalogEntry =>
+  ({
+    name: 'n8n',
+    description: 'd',
+    source: '',
+    transport: 'stdio',
+    auth_type: 'api_key',
+    required_env: [{ name: 'N8N_KEY', prompt: 'key', required: true }],
+    command: 'npx',
+    args: ['-y', 'x'],
+    url: null,
+    install_url: null,
+    install_ref: null,
+    bootstrap: [],
+    default_enabled: null,
+    post_install: '',
+    needs_install: false,
+    installed: false,
+    enabled: false,
+    ...over,
+  }) as McpCatalogEntry;
+
+describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('mcp.catalog lists entries and arms the install guard', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    client.catalogEntries = [catalogRow()];
+
+    const res = await backend.invokeControl('mcp.catalog', {});
+
+    expect(res).toEqual({ entries: [catalogRow()] });
+  });
+
+  it('mcp.catalog is NOT trust-gated (same class as tools.list)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    client.catalogEntries = [catalogRow()];
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      const res = await backend.invokeControl('mcp.catalog', {});
+      expect(res).toEqual({ entries: [catalogRow()] });
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('mcp.catalogInstall refuses a name that was never listed (fail-closed, no modal)', async () => {
+    const { backend } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    mockShowWarningMessage.mockClear();
+
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'ghost' })).rejects.toThrow(/catalog/i);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it('mcp.catalogInstall (background/git entry): modal -> install -> poll -> installed-flag verify -> reload -> refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [
+      catalogRow({
+        name: 'builder',
+        needs_install: true,
+        install_url: 'https://github.com/x/y',
+        install_ref: 'v1',
+        bootstrap: ['npm ci'],
+        required_env: [], // not exercising the credential-prompt flow here — see the dedicated Rev-1 B4 tests below
+      }),
+    ];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'mcp-install-builder-ab12cd34' };
+    client.statusSeq = [
+      { running: true, exit_code: null, lines: [] },
+      { running: false, exit_code: 0, lines: ['done'] },
+    ];
+    client.catalogEntriesAfterInstall = [catalogRow({ name: 'builder', needs_install: true, installed: true })];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    const resultPromise = backend.invokeControl('mcp.catalogInstall', { name: 'builder' });
+    // The poll loop's first `actionStatus` sees `running:true` and sleeps
+    // (1s) before the SECOND `actionStatus` call — advance past that wait.
+    await vi.advanceTimersByTimeAsync(1_000);
+    const res = await resultPromise;
+
+    expect(res).toMatchObject({ ok: true, name: 'builder' });
+    // the modal carried the build consent text
+    const detail = (mockShowWarningMessage.mock.calls[0] as unknown[])[1] as { detail: string };
+    expect(detail.detail).toContain('Clones: https://github.com/x/y @ v1 (pinned)');
+    expect(detail.detail).toContain('$ npm ci');
+    expect(control.dispatchCalls.some((c) => c.method === 'reload.mcp')).toBe(true);
+    expect(client.actionStatusCalls).toEqual(['mcp-install-builder-ab12cd34', 'mcp-install-builder-ab12cd34']);
+  });
+
+  it('mcp.catalogInstall: action finished but installed-flag still false -> generic reject, tail to logger only', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+    withFakeControl(backend);
+
+    client.catalogEntries = [
+      catalogRow({
+        name: 'builder',
+        needs_install: true,
+        install_url: 'https://github.com/x/y',
+        install_ref: 'v1',
+        bootstrap: ['npm ci'],
+        required_env: [], // not exercising the credential-prompt flow here — see the dedicated Rev-1 B4 tests below
+      }),
+    ];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'mcp-install-builder-ab12cd34' };
+    client.statusSeq = [{ running: false, exit_code: 1, lines: ['npm ci failed: EACCES permission denied'] }];
+    client.catalogEntriesAfterInstall = [catalogRow({ name: 'builder', needs_install: true, installed: false })];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('mcp.catalogInstall', { name: 'builder' });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toBe('Catalog install did not complete — see the Talaria output log.');
+    expect(message).not.toContain('EACCES'); // the tail must NEVER leak into the reject message
+    expect(logs.some((l) => l.includes('EACCES permission denied'))).toBe(true); // ...only into the output-channel logger
+  });
+
+  // ---------------------------------------------------------------------
+  // Rev-1 B4 (CF-13 parity, TH-4) — SUPERSEDES the test above (old name:
+  // "describeCatalogForModal receives the VALIDATED submitted env (A3-IMP2
+  // binding) — not the entry schema"): the webview no longer submits ANY
+  // env at all. Credentials are now collected HOST-side, masked
+  // (`promptSecret` -> `vscode.window.showInputBox({password:true})`),
+  // ONLY AFTER the install consent modal is confirmed — CF-13 ("keys never
+  // enter the webview; the host prompts for them, masked").
+  // ---------------------------------------------------------------------
+  it('Rev-1 B4/CF-13: consent-first ordering — the modal fires future-tense disclosure, THEN promptSecret collects each required_env var, and the value flows into installCatalogEntry', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow()]; // needs_install: false -> synchronous install; required_env: [{N8N_KEY}]
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'n8n', background: false };
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install'); // consent FIRST
+    mockShowInputBox.mockClear();
+    mockShowInputBox.mockResolvedValueOnce('sekrit-value'); // THEN the masked prompt
+
+    await backend.invokeControl('mcp.catalogInstall', { name: 'n8n' });
+
+    // The modal's disclosure is FUTURE-TENSE, driven by the entry's OWN
+    // required_env schema — never a submitted value (there is none yet).
+    const detail = (mockShowWarningMessage.mock.calls[0] as unknown[])[1] as { detail: string };
+    expect(detail.detail).toContain("Will prompt for: N8N_KEY — saved to Hermes' .env store (~/.hermes/.env).");
+    expect(detail.detail).not.toContain('sekrit-value');
+
+    // Consent-first ordering: the modal fired, and promptSecret was called
+    // exactly once — AFTER it (a compromised webview can at most summon the
+    // modal; the credential prompt only ever follows a genuine confirm).
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+    const [options] = mockShowInputBox.mock.calls[0] as [{ password?: boolean; ignoreFocusOut?: boolean; prompt?: string }];
+    expect(options.password).toBe(true);
+    expect(options.ignoreFocusOut).toBe(true);
+
+    // The value collected by the masked prompt — never typed in the webview
+    // — is what reaches `installCatalogEntry`.
+    expect(client.installCalls).toEqual([{ name: 'n8n', env: { N8N_KEY: 'sekrit-value' }, enable: true }]);
+  });
+
+  it('Rev-1 B4/CF-13: a DISMISSED promptSecret answer (undefined) declines the WHOLE install — installCatalogEntry is never called', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    client.catalogEntries = [catalogRow()];
+    await backend.invokeControl('mcp.catalog', {});
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install');
+    mockShowInputBox.mockClear();
+    mockShowInputBox.mockResolvedValueOnce(undefined); // user hit Escape
+
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n' })).rejects.toThrow(
+      'Installing MCP "n8n" was declined or cancelled.',
+    );
+
+    expect(client.installCalls).toEqual([]); // NO partial install
+  });
+
+  it('Rev-1 B4/CF-13: a BLANK promptSecret answer also declines — an empty string is not a valid credential', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    client.catalogEntries = [catalogRow()];
+    await backend.invokeControl('mcp.catalog', {});
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install');
+    mockShowInputBox.mockClear();
+    mockShowInputBox.mockResolvedValueOnce(''); // user cleared the field and hit Enter
+
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n' })).rejects.toThrow(
+      'Installing MCP "n8n" was declined or cancelled.',
+    );
+
+    expect(client.installCalls).toEqual([]);
+  });
+
+  // ---------------------------------------------------------------------
+  // Review fold-in (F1, Important): §4.7 item 4 mandates "single-flight per
+  // entry name (re-click while installing refused)" for `mcp.catalogInstall`
+  // — only `mcp.auth`'s IMPORTANT-3 test covered this before. Structural
+  // template: the `mcp.auth` IMPORTANT-3 test above (`AcpBackend.test.ts`,
+  // "is single-flight per name"), swapping `authDeferred`/`authCalls` for
+  // this fake's own `installDeferred`/`installCalls`.
+  // ---------------------------------------------------------------------
+  it('F1: mcp.catalogInstall is single-flight per entry name — a concurrent same-name call is refused, a different name is not', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('tools.list', { toolsets: [] });
+    // required_env: [] on BOTH rows — this test exercises single-flight
+    // concurrency, not the credential-prompt flow (see the dedicated Rev-1
+    // B4 tests above for that).
+    client.catalogEntries = [catalogRow({ name: 'n8n', required_env: [] }), catalogRow({ name: 'other', required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {}); // arms the fail-closed catalog-name guard for BOTH rows
+
+    let release!: (v: { ok: boolean; name: string; background: boolean; action?: string }) => void;
+    client.installDeferred = new Promise((res) => {
+      release = res;
+    }); // FakeAdmin: installCatalogEntry returns this when set
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Install'); // every modal this test opens is confirmed
+
+    const first = backend.invokeControl('mcp.catalogInstall', { name: 'n8n' });
+
+    // The guard is a synchronous test-and-set BEFORE `first` ever joins the
+    // queue (`handleMcpAdmin`'s own doc) — the refusal below does not depend
+    // on how far `first`'s modal/install chain has progressed.
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n' })).rejects.toThrow(
+      /already in progress/i,
+    );
+
+    // A DIFFERENT name is never refused by the SAME-name guard — accepted
+    // and runs CONCURRENTLY with 'n8n' (F3: mcp.catalogInstall is
+    // tail-exempt, so it no longer queues behind 'n8n' on
+    // `dashboardToggleTail`). It still can't RESOLVE until `release` below,
+    // because this fake's `installDeferred` is one shared promise both
+    // calls return — awaiting it here, before releasing 'n8n', would
+    // deadlock the test, mirroring the `mcp.auth` IMPORTANT-3 test's own
+    // comment.
+    const other = backend.invokeControl('mcp.catalogInstall', { name: 'other' });
+
+    release({ ok: true, name: 'n8n', background: false });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'n8n' });
+    await expect(other).resolves.toMatchObject({ ok: true, name: 'other' });
+
+    // The refused re-click reached NEITHER the modal NOR installCatalogEntry
+    // a second time: exactly one modal + one install call for 'n8n', plus
+    // 'other's own pair — never a third of either.
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+    expect(client.installCalls).toEqual([
+      { name: 'n8n', env: {}, enable: true },
+      { name: 'other', env: {}, enable: true },
+    ]);
+  });
+
+  // ---------------------------------------------------------------------
+  // Review fold-in (F2, Minor): proves the single-flight slot is FREED on a
+  // refusal path (a declined modal), not leaked — the same name can be
+  // retried immediately afterward.
+  // ---------------------------------------------------------------------
+  it('F2: a declined mcp.catalogInstall modal frees the single-flight slot — the SAME name can be retried immediately', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'n8n', required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {});
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); // user hits Cancel — a REFUSAL path
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n' })).rejects.toThrow(
+      /declined|cancel/i,
+    );
+    expect(client.installCalls).toEqual([]); // the decline never reached installCatalogEntry
+
+    // Retry the SAME name. If the slot leaked on the refusal path, this
+    // would be refused with "already in progress" instead of reaching a
+    // second modal/install.
+    client.installResult = { ok: true, name: 'n8n', background: false };
+    mockShowWarningMessage.mockResolvedValueOnce('Install');
+    const result = await backend.invokeControl('mcp.catalogInstall', { name: 'n8n' });
+
+    expect(result).toMatchObject({ ok: true, name: 'n8n' });
+    expect(client.installCalls).toEqual([{ name: 'n8n', env: {}, enable: true }]);
+  });
+});
+
+describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
+  it('mcp.auth resolves the envelope and refetches the mcp panel on ok:true', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // cache 'remote'
+    client.authResult = { ok: true, tools: [{ name: 't', description: '' }] };
+    const configGetCallsBefore = control.dispatchCalls.filter((c) => c.method === 'config.get').length;
+
+    const res = await backend.invokeControl('mcp.auth', { name: 'remote' });
+
+    expect(res).toEqual({ ok: true, tools: [{ name: 't', description: '' }] });
+    expect(client.authCalls).toEqual(['remote']);
+    const configGetCallsAfter = control.dispatchCalls.filter((c) => c.method === 'config.get').length;
+    expect(configGetCallsAfter).toBeGreaterThan(configGetCallsBefore); // proves the post-auth mcp refetch happened
+  });
+
+  it('mcp.auth: an {ok:false} envelope resolves as-is (Hermes-authored guidance) with NO refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' });
+    client.authResult = { ok: false, error: 'only allows pre-approved OAuth clients', tools: [] };
+    const configGetCallsBefore = control.dispatchCalls.filter((c) => c.method === 'config.get').length;
+
+    const res = await backend.invokeControl('mcp.auth', { name: 'remote' });
+
+    expect(res).toEqual({ ok: false, error: 'only allows pre-approved OAuth clients', tools: [] });
+    const configGetCallsAfter = control.dispatchCalls.filter((c) => c.method === 'config.get').length;
+    expect(configGetCallsAfter).toBe(configGetCallsBefore); // no refetch on a failed envelope
+  });
+
+  it('mcp.auth cancellation yields the HONEST cancel envelope (never a rejection) — abandons OUR wait only', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+    // The Hermes-side call never resolves on its own here — only when the
+    // AbortSignal fires, mirroring a real in-flight request being aborted.
+    client.authMcpServer = (_name: string, signal?: AbortSignal) =>
+      new Promise<McpTestResult>((_resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new Error('aborted by caller'));
+          return;
+        }
+        signal?.addEventListener('abort', () => reject(new Error('aborted by caller')));
+      });
+
+    // Simulate the user cancelling the progress notification immediately:
+    // the mock reports the token cancelled and fires the registered
+    // `onCancellationRequested` callback synchronously, mirroring how a
+    // real VS Code cancellation would arrive before the network call settles.
+    (vscode.window.withProgress as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (
+        _opts: unknown,
+        task: (
+          progress: { report: () => void },
+          token: { isCancellationRequested: boolean; onCancellationRequested: (cb: () => void) => { dispose: () => void } },
+        ) => Promise<unknown>,
+      ) => {
+        const token = {
+          isCancellationRequested: false,
+          onCancellationRequested: (cb: () => void) => {
+            token.isCancellationRequested = true;
+            cb();
+            return { dispose: () => {} };
+          },
+        };
+        return task({ report: () => {} }, token);
+      },
+    );
+
+    const res = await backend.invokeControl('mcp.auth', { name: 'remote' });
+
+    expect(res).toEqual({
+      ok: false,
+      error: 'Cancelled. The browser sign-in may still be completing — run Test after finishing it.',
+      tools: [],
+    });
+    expect(control.dispatchCalls.filter((c) => c.method === 'reload.mcp')).toEqual([]);
+  });
+
+  it('IMPORTANT-3: mcp.auth is single-flight per name — a concurrent same-name call is refused, a different name is not', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', {
+      mcp_servers: { remote: { url: 'https://x/mcp' }, other: { url: 'https://y/mcp' } },
+    });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+    let release!: (v: McpTestResult) => void;
+    client.authDeferred = new Promise<McpTestResult>((res) => {
+      release = res;
+    }); // FakeAdmin: authMcpServer returns this when set
+
+    const first = backend.invokeControl('mcp.auth', { name: 'remote' });
+    await expect(backend.invokeControl('mcp.auth', { name: 'remote' })).rejects.toThrow(/already in progress/i);
+
+    // A DIFFERENT name is never REFUSED by the SAME-name single-flight
+    // guard — accepted and runs CONCURRENTLY with 'remote' (F3: mcp.auth is
+    // tail-exempt, so it no longer queues behind 'remote' on
+    // `dashboardToggleTail`). It still can't RESOLVE until `release` below,
+    // because this fake's `authDeferred` is one shared promise both calls
+    // return — awaiting it here, before releasing 'remote', would deadlock
+    // the test.
+    const other = backend.invokeControl('mcp.auth', { name: 'other' });
+
+    release({ ok: true, tools: [] }); // Hermes-side token snapshot/restore (web_server.py:10592-10629) never sees a second racer
+    await expect(first).resolves.toMatchObject({ ok: true });
+    await expect(other).resolves.toMatchObject({ ok: true });
+    expect(client.authCalls).toEqual(['remote', 'other']);
+  });
+});
+
+// =============================================================================
+// F3 (docs_claude/features-f3-concurrency-fix-architecture.md): long MCP admin
+// ops (`mcp.auth`, `mcp.catalogInstall`, and the read-only `mcp.catalog`/
+// `mcp.test`) must not monopolize `dashboardToggleTail` — they run OFF the
+// tail (`TAIL_EXEMPT_MCP_METHODS`), and same-name exclusion across ALL
+// name-scoped MCP mutations is now carried by the widened `busyMcpNames`
+// per-name registry instead of the tail itself.
+//
+// A short per-test timeout (1s, well under vitest's 5s default) is pinned on
+// the tests whose PRE-FIX behavior is an unresolved hang (queued forever
+// behind a long op that this test deliberately never releases before
+// asserting) — post-fix every one of them resolves in a handful of
+// microtask ticks, so the tight timeout costs nothing once green.
+// =============================================================================
+describe('ControlDispatcher — F3 concurrency (long MCP ops off the serialization tail)', () => {
+  it(
+    'T1: skills.toggle proceeds while mcp.auth is in flight (core fix)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed the fail-closed name cache
+
+      let release!: (v: McpTestResult) => void;
+      client.authDeferred = new Promise<McpTestResult>((r) => {
+        release = r;
+      });
+
+      const auth = backend.invokeControl('mcp.auth', { name: 'gh' }); // do NOT await — must still be pending below
+
+      // No skills-panel seed needed — toggleDashboardInner's guard is the
+      // lenient `known &&` idiom (unlike MCP's fail-closed cache).
+      await backend.invokeControl('skills.toggle', { name: 'tdd', enabled: false });
+
+      expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: false }]);
+      expect(client.authCalls).toEqual(['gh']);
+
+      release({ ok: true, tools: [] });
+      await auth;
+    },
+    1000,
+  );
+
+  it(
+    'T2: mcp.setEnabled on an UNRELATED name proceeds while a catalogInstall is in flight (core fix)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed 'gh'
+
+      // required_env: [] — this test exercises tail concurrency, not the
+      // credential-prompt flow (see the dedicated Rev-1 B4 tests above).
+      client.catalogEntries = [catalogRow({ name: 'n8n', required_env: [] })];
+      await backend.invokeControl('mcp.catalog', {});
+
+      let release!: (v: { ok: boolean; name: string; background: boolean; action?: string }) => void;
+      client.installDeferred = new Promise((r) => {
+        release = r;
+      });
+
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockResolvedValueOnce('Install');
+
+      const install = backend.invokeControl('mcp.catalogInstall', { name: 'n8n' }); // do NOT await
+
+      control.setResultFor('reload.mcp', { status: 'reloaded' });
+      await backend.invokeControl('mcp.setEnabled', { name: 'gh', enabled: false });
+
+      expect(client.setEnabledCalls).toEqual([{ name: 'gh', enabled: false }]);
+
+      release({ ok: true, name: 'n8n', background: false });
+      await install;
+    },
+    1000,
+  );
+
+  it(
+    'T3: mcp.catalog browse resolves while an auth is in flight (core fix, read)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+      let release!: (v: McpTestResult) => void;
+      client.authDeferred = new Promise<McpTestResult>((r) => {
+        release = r;
+      });
+      const auth = backend.invokeControl('mcp.auth', { name: 'gh' }); // do NOT await
+
+      client.catalogEntries = [catalogRow({ name: 'n8n' })];
+      const res = await backend.invokeControl('mcp.catalog', {});
+
+      expect(res).toEqual({ entries: [catalogRow({ name: 'n8n' })] });
+
+      release({ ok: true, tools: [] });
+      await auth;
+    },
+    1000,
+  );
+
+  it(
+    'T4: same-name cross-method exclusion — busyMcpNames refuses a same-name op, not a different one',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', {
+        mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } },
+      });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+      let release!: (v: McpTestResult) => void;
+      client.authDeferred = new Promise<McpTestResult>((r) => {
+        release = r;
+      });
+      const auth = backend.invokeControl('mcp.auth', { name: 'gh' }); // do NOT await
+
+      await expect(backend.invokeControl('mcp.setEnabled', { name: 'gh', enabled: false })).rejects.toThrow(
+        /Sign-in .* already in progress/i,
+      );
+      expect(client.setEnabledCalls).toEqual([]);
+
+      await expect(backend.invokeControl('mcp.test', { name: 'gh' })).rejects.toThrow(/in progress/i);
+      expect(client.testCalls).toEqual([]);
+
+      // A DIFFERENT name is never refused by the same-name guard.
+      const otherTest = await backend.invokeControl('mcp.test', { name: 'other' });
+      expect(otherTest).toEqual(client.testResult);
+      expect(client.testCalls).toEqual(['other']);
+
+      release({ ok: true, tools: [] });
+      await auth;
+
+      // Guard released on settle — the SAME name now succeeds.
+      control.setResultFor('reload.mcp', { status: 'reloaded' });
+      const result = await backend.invokeControl('mcp.setEnabled', { name: 'gh', enabled: false });
+      expect(result).toMatchObject({ name: 'gh', enabled: false });
+      expect(client.setEnabledCalls).toEqual([{ name: 'gh', enabled: false }]);
+    },
+    1000,
+  );
+
+  it(
+    'T5: a pending short mutation blocks a same-name auth (guard symmetry)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' });
+
+      mockShowWarningMessage.mockClear();
+      // The mcp.remove modal never settles — 'gh' stays busy for the rest of
+      // this test (deliberately never released; nothing awaits it).
+      mockShowWarningMessage.mockReturnValueOnce(new Promise(() => {}));
+
+      const remove = backend.invokeControl('mcp.remove', { name: 'gh' }); // do NOT await
+      void remove; // left permanently pending by design — its modal never settles
+
+      await expect(backend.invokeControl('mcp.auth', { name: 'gh' })).rejects.toThrow(
+        /Another change .* in progress/i,
+      );
+      expect(client.authCalls).toEqual([]);
+    },
+    1000,
+  );
+
+  it(
+    'T6: two short mutations still cannot interleave — the tail still serializes config writes (regression)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      const control = withFakeControl(backend);
+      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('tools.list', { toolsets: [] });
+      await backend.invokeControl('panel.data', { panel: 'mcp' });
+      control.setResultFor('reload.mcp', { status: 'reloaded' });
+
+      // Shared call-order log (same override-and-delegate idiom the C1
+      // "snapshot precedes prompt" ordering test above already uses).
+      const order: string[] = [];
+      const realRemove = client.removeMcpServer.bind(client);
+      client.removeMcpServer = (name: string) => {
+        order.push('remove');
+        return realRemove(name);
+      };
+      const realToggleSkill = client.toggleSkill.bind(client);
+      client.toggleSkill = (name: string, enabled: boolean) => {
+        order.push('toggle');
+        return realToggleSkill(name, enabled);
+      };
+
+      let resolveModal!: (v: string | undefined) => void;
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockReturnValueOnce(
+        new Promise<string | undefined>((r) => {
+          resolveModal = r;
+        }),
+      );
+
+      const remove = backend.invokeControl('mcp.remove', { name: 'gh' }); // held at its modal
+      const toggle = backend.invokeControl('skills.toggle', { name: 'tdd', enabled: true });
+
+      await flushMicrotasks();
+      expect(client.toggleSkillCalls).toEqual([]); // still queued behind the held remove
+
+      resolveModal('Remove');
+      await toggle;
+      await remove;
+
+      expect(order).toEqual(['remove', 'toggle']); // remove's write recorded before toggle's
+      expect(client.removeCalls).toEqual(['gh']);
+      expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: true }]);
+    },
+    1000,
+  );
+});
+
+// =============================================================================
+// Task B4 (features-add-mcp-skills-architecture.md §5.4/§5.5): ControlDispatcher's
+// T2 skills admin core — create/hubPreview/hubScan/hubInstall + trust gate +
+// the scan-first double gate (fail-closed) + ground-truth-verified install.
+// =============================================================================
+
+/** Task B4 harness helper (R-b reconciliation): a full `HubScan` fixture — every §5.2-required field present, so a test never trips tsc by omitting one. */
+const hubScanRow = (over: Partial<HubScan> = {}): HubScan => ({
+  name: 'pdf',
+  identifier: 'anthropics/skills/pdf',
+  source: '',
+  trust_level: 'trusted',
+  verdict: 'safe',
+  summary: '',
+  policy: 'allow',
+  policy_reason: '',
+  findings: [],
+  severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+  ...over,
+});
+
+describe('ControlDispatcher — Task B4 skills admin core (§5.4)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('skills.hubInstall: scan-first; policy!=allow is refused BEFORE any modal or install', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({ name: 'x', identifier: 'anthropics/skills/x', trust_level: 'community', verdict: 'caution', policy: 'block' });
+    mockShowWarningMessage.mockClear();
+
+    await expect(backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/x' })).rejects.toThrow(/blocked|refused/i);
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.hubInstallCalls).toEqual([]);
+  });
+
+  it('skills.hubInstall: dangerous verdict refused even when policy says allow (double gate)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({ name: 'x', identifier: 'anthropics/skills/x', verdict: 'dangerous', policy: 'allow' });
+    mockShowWarningMessage.mockClear();
+
+    await expect(backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/x' })).rejects.toThrow(/blocked|refused/i);
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.hubInstallCalls).toEqual([]);
+  });
+
+  it('skills.hubInstall happy path: scan -> modal -> install -> poll -> PRESENCE re-check -> refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', verdict: 'safe', policy: 'allow' });
+    client.hubInstallResult = { ok: true, name: 'skills-install-anthropics-pdf-ab12cd34' };
+    client.statusSeq = [
+      { running: true, exit_code: null, lines: [] },
+      { running: false, exit_code: 0, lines: ['Installed: pdf'] },
+    ];
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install skill');
+
+    const resultPromise = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' });
+    // The poll loop's first `actionStatus` sees `running:true` and sleeps
+    // (1s) before the SECOND `actionStatus` call — advance past that wait
+    // (§5.4: 1s -> 2s backoff, cap 120s — mirrors `pollCatalogInstall`).
+    await vi.advanceTimersByTimeAsync(1_000);
+    const res = await resultPromise;
+
+    expect(res).toMatchObject({ ok: true, name: 'pdf' });
+    expect(client.hubInstallCalls).toEqual(['anthropics/skills/pdf']);
+    expect(client.actionStatusCalls).toEqual([
+      'skills-install-anthropics-pdf-ab12cd34',
+      'skills-install-anthropics-pdf-ab12cd34',
+    ]);
+  });
+
+  it('exit-0-but-BLOCKED install (skill absent after the action) rejects generically; tail goes to the logger only', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+
+    client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', policy: 'allow', verdict: 'safe' });
+    client.hubInstallResult = { ok: true, name: 'skills-install-anthropics-pdf-ab12cd34' };
+    client.statusSeq = [{ running: false, exit_code: 0, lines: ['Installation blocked: publisher not verified'] }];
+    client.listSkillsResult = []; // 'pdf' absent — a BLOCKED install exits 0 but never lands (skills_hub.py:634-713)
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install skill');
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toBe('Install did not complete — see the Talaria output log.');
+    expect(message).not.toContain('blocked:'); // the tail must NEVER leak into the reject message
+    expect(logs.some((l) => l.includes('Installation blocked: publisher not verified'))).toBe(true); // ...only into the output-channel logger
+  });
+
+  it('skills.hubInstall refuses a community identifier fail-closed before any network call', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+
+    await expect(backend.invokeControl('skills.hubInstall', { identifier: 'clawhub/x' })).rejects.toThrow(/official|trusted/i);
+
+    expect(client.scanCalls).toEqual([]);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  // Task TE-6 (AU-27, CF-14 no-echo): `assertSkillIdentifier`'s refusal must
+  // not echo the raw, unbounded webview-supplied identifier into the
+  // `control.response` (the thrown Error's message, per
+  // TalariaViewProvider's `errorMessage(err)` wire-out) — only a capped,
+  // control-char-stripped form may reach the host output-channel logger.
+  // Mirrors the "tail goes to the logger only" idiom used by the
+  // exit-0-but-BLOCKED / still-present tests above.
+  it('skills.hubInstall: a huge identifier refuses with a short generic wire message; the raw form never reaches it, only a capped form reaches the logger', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+
+    const marker = 'UNIQUE_MARKER_hub_install_zzz999';
+    const huge = marker + 'y'.repeat(5_000_000);
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: huge });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message.length).toBeLessThan(256);
+    expect(message).not.toContain(marker);
+    expect(client.scanCalls).toEqual([]); // refused before any network call, same as the short-identifier case
+    // ...only into the output-channel logger, and only a capped fragment of it.
+    expect(logs.some((l) => l.includes(marker))).toBe(true);
+    expect(logs.every((l) => l.length < message.length + 200 || !l.includes('y'.repeat(1000)))).toBe(true);
+  });
+
+  it('skills.hubPreview: a control-char/injection-shaped identifier is not reflected raw in the wire message; the logger gets a sanitised capped detail', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+
+    const hostile = 'evil\x00\x1b[31mFAKE-LOG-LINE\x1b[0m\ninjected/segment';
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubPreview', { identifier: hostile });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).not.toContain('\x00');
+    expect(message).not.toContain('\x1b');
+    expect(message).not.toContain('\n');
+    expect(message).not.toContain('FAKE-LOG-LINE');
+    expect(client.previewCalls).toEqual([]);
+    // logger may see the identifier (host-only, capped+sanitised) — but never raw control bytes.
+    expect(logs.every((l) => !/[\x00-\x1f]/.test(l))).toBe(true);
+  });
+
+  it('skills.create: trust -> validate -> modal -> POST -> refetch; declined modal sends nothing', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const content = '---\nname: demo\ndescription: one line\n---\n\nDo the thing.';
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Create skill');
+
+    const result = await backend.invokeControl('skills.create', { name: 'demo', content, category: 'coding' });
+
+    expect(result).toEqual({ ok: true });
+    expect(client.createCalls).toEqual([{ name: 'demo', content, category: 'coding' }]);
+
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); // user hit Cancel
+    await expect(
+      backend.invokeControl('skills.create', { name: 'other', content: '---\nname: other\n---\n\nx' }),
+    ).rejects.toThrow(/declined|cancel/i);
+    expect(client.createCalls).toEqual([{ name: 'demo', content, category: 'coding' }]); // unchanged — nothing sent
+  });
+
+  it('skills.hubPreview runs the identifier gate even though read-only', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+
+    await expect(backend.invokeControl('skills.hubPreview', { identifier: 'https://x' })).rejects.toThrow();
+
+    expect(client.previewCalls).toEqual([]);
+  });
+
+  it('skills.hubScan runs the identifier gate even though read-only', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+
+    await expect(backend.invokeControl('skills.hubScan', { identifier: '../etc/passwd' })).rejects.toThrow();
+
+    expect(client.scanCalls).toEqual([]);
+  });
+
+  it('skills.hubPreview/skills.hubScan are NOT trust-gated (same class as mcp.catalog)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.previewHubSkillResult = {
+      name: 'pdf', description: '', source: '', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', skill_md: '', files: [],
+    };
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      const res = await backend.invokeControl('skills.hubPreview', { identifier: 'anthropics/skills/pdf' });
+      expect(res).toEqual(client.previewHubSkillResult);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('skills.create: untrusted workspace is refused before validation or any modal', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      await expect(backend.invokeControl('skills.create', { name: 'demo', content: '---\nx' })).rejects.toThrow(/trust/i);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(client.createCalls).toEqual([]);
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('skills.hubInstall: untrusted workspace is refused before scan or any modal', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      await expect(
+        backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' }),
+      ).rejects.toThrow(/trust/i);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(client.scanCalls).toEqual([]);
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('skills.create modal copy is byte-exact (§5.5)', async () => {
+    const { backend } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Create skill');
+
+    await backend.invokeControl('skills.create', { name: 'demo', content: '---\nname: demo\n---\n\nBody text here.' });
+
+    const [message, options, label] = mockShowWarningMessage.mock.calls[0] as [string, { modal: boolean; detail: string }, string];
+    expect(message).toBe('Create skill "demo"?');
+    // The content slice is `redactForModal`-flattened (its designed
+    // single-line display behaviour strips control bytes — including the
+    // content's OWN embedded newlines — before the 200-char cap; §5.5 pins
+    // exactly this helper for the content piece). The two STRUCTURAL lines
+    // this method itself composes (Category / the fixed instructions
+    // sentence) keep their `\n\n` separators.
+    expect(options.detail).toBe(
+      'Category: (none)\n\nThe agent will follow these instructions in future sessions.\n\n---name: demo---Body text here.',
+    );
+    expect(label).toBe('Create skill');
+  });
+
+  it('skills.hubInstall modal copy is byte-exact (§5.5) — Source tier + Scan verdict + findings count', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({
+      name: 'pdf',
+      identifier: 'anthropics/skills/pdf',
+      trust_level: 'trusted',
+      verdict: 'caution',
+      policy: 'allow',
+      findings: [{ severity: 'medium', category: 'x', file: 'SKILL.md', line: 1, description: 'y' }],
+    });
+    client.hubInstallResult = { ok: true, name: 'skills-install-anthropics-pdf-ab12cd34' };
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install skill');
+
+    await backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' });
+
+    const [message, options, label] = mockShowWarningMessage.mock.calls[0] as [string, { modal: boolean; detail: string }, string];
+    expect(message).toBe('Install skill "pdf" from anthropics/skills/pdf?');
+    expect(options.detail).toBe(
+      'Source tier: trusted — anthropics/skills (Hermes TRUSTED_REPOS)\n\nScan verdict: caution (1 findings)\n\nFiles are copied to ~/.hermes/skills; nothing executes at install time.',
+    );
+    expect(label).toBe('Install skill');
+  });
+});
+
+// =============================================================================
+// Task B4 (§5.4 "Single-flight per identifier" + F3 mirror): the skills
+// concurrency machinery — `busySkillInstallIds`/`busySkillUninstallNames`
+// (kind-scoped twins of `busyMcpNames`, split by B5-KS) and
+// `SKILLS_TAIL_EXEMPT_METHODS` (parallel to `TAIL_EXEMPT_MCP_METHODS`). The
+// A6 review flagged the ANALOGOUS missing single-flight regression test as
+// an Important finding (F1, `mcp.catalogInstall`) — this closes the same gap
+// for `skills.hubInstall` up front.
+// =============================================================================
+describe('ControlDispatcher — Task B4 skills concurrency (F3 mirror)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('B4-SF: skills.hubInstall is single-flight per identifier — a concurrent same-identifier call is refused, a different identifier is not', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', verdict: 'safe', policy: 'allow' });
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // both pollers see running:false on their first check — no timer advance needed
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.hubInstallDeferred = new Promise((res) => {
+      release = res;
+    }); // FakeAdmin: installHubSkill returns this when set
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Install skill'); // every modal this test opens is confirmed
+
+    const first = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' });
+
+    // The guard is a synchronous test-and-set BEFORE `first` ever joins any
+    // queue (`handleSkillsAdmin`'s own doc, mirroring `handleMcpAdmin`'s) —
+    // the refusal below does not depend on how far `first`'s scan/modal/
+    // install chain has progressed.
+    await expect(
+      backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' }),
+    ).rejects.toThrow(/already in progress/i);
+
+    // A DIFFERENT identifier is never refused by the SAME-identifier guard —
+    // accepted and runs CONCURRENTLY with 'anthropics/skills/pdf' (skills.
+    // hubInstall is tail-exempt, so it never queues behind it on
+    // `dashboardToggleTail` either). This fake's `scanResult`/
+    // `hubInstallResult` are single shared fixtures (not keyed per
+    // identifier, per the doc-pinned harness shape) — 'other' resolves to
+    // the SAME canned skill row ('pdf') as a result, a fixture quirk, not a
+    // guard bug: this assertion is about the single-flight KEY (the raw
+    // `identifier` string), not the resolved name.
+    const other = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/other' });
+
+    release({ ok: true, name: 'skills-install-action-1' });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'pdf' });
+    await expect(other).resolves.toMatchObject({ ok: true, name: 'pdf' });
+
+    // The refused re-click reached NEITHER the modal NOR installHubSkill a
+    // second time: exactly one modal + one install call per identifier,
+    // never a third of either.
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+    expect(client.hubInstallCalls).toEqual(['anthropics/skills/pdf', 'anthropics/skills/other']);
+    expect(client.scanCalls).toEqual(['anthropics/skills/pdf', 'anthropics/skills/other']);
+  });
+
+  it(
+    'skills.toggle proceeds while skills.hubInstall is in flight (F3 tail-exemption mirror for skills)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', verdict: 'safe', policy: 'allow' });
+
+      let release!: (v: { ok: boolean; name: string }) => void;
+      client.hubInstallDeferred = new Promise((res) => {
+        release = res;
+      });
+
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockResolvedValueOnce('Install skill');
+
+      const install = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' }); // do NOT await — must still be pending below
+
+      await backend.invokeControl('skills.toggle', { name: 'tdd', enabled: false });
+
+      expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: false }]);
+      expect(client.hubInstallCalls).toEqual(['anthropics/skills/pdf']);
+
+      client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+      client.statusSeq = [{ running: false, exit_code: 0, lines: [] }];
+      release({ ok: true, name: 'skills-install-action-2' });
+      await install;
+    },
+    1000,
+  );
+
+  it(
+    'skills.create still serializes on the tail with skills.toggle (short-mutator ordering, mirrors F3 T6)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+
+      const order: string[] = [];
+      const realCreateSkill = client.createSkill.bind(client);
+      client.createSkill = (body: { name: string; content: string; category?: string }) => {
+        order.push('create');
+        return realCreateSkill(body);
+      };
+      const realToggleSkill = client.toggleSkill.bind(client);
+      client.toggleSkill = (name: string, enabled: boolean) => {
+        order.push('toggle');
+        return realToggleSkill(name, enabled);
+      };
+
+      let resolveModal!: (v: string | undefined) => void;
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockReturnValueOnce(
+        new Promise<string | undefined>((r) => {
+          resolveModal = r;
+        }),
+      );
+
+      const create = backend.invokeControl('skills.create', { name: 'demo', content: '---\nname: demo\n---\n\nx' }); // held at its modal
+      const toggle = backend.invokeControl('skills.toggle', { name: 'tdd', enabled: true });
+
+      await flushMicrotasks();
+      expect(client.toggleSkillCalls).toEqual([]); // still queued behind the held create
+
+      resolveModal('Create skill');
+      await toggle;
+      await create;
+
+      expect(order).toEqual(['create', 'toggle']);
+      expect(client.createCalls).toEqual([{ name: 'demo', content: '---\nname: demo\n---\n\nx' }]);
+      expect(client.toggleSkillCalls).toEqual([{ name: 'tdd', enabled: true }]);
+    },
+    1000,
+  );
+});
+
+// =============================================================================
+// Task B5 (features-add-mcp-skills-architecture.md §5.4 last bullet, §5.5
+// third bullet): ControlDispatcher's `skills.hubUninstall` flow — the
+// fail-closed hub-provenance name gate (mirrors `requireListedMcpName`), the
+// §5.5 uninstall modal, and ABSENCE ground-truth verification (the mirror
+// image of `skills.hubInstall`'s presence check).
+// =============================================================================
+describe('ControlDispatcher — Task B5 skills.hubUninstall (§5.4 last bullet, §5.5)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('skills.hubUninstall refuses non-hub rows, names outside the last list, AND an unfetched cache (fail-closed)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    mockShowWarningMessage.mockClear();
+
+    // (1) no prior skills panel fetch => lastListedHubNames() undefined =>
+    // FAIL-CLOSED refusal, before any modal — same rule as
+    // requireListedMcpName's IMPORTANT-2 divergence from the lenient
+    // toggleDashboardInner idiom.
+    await expect(backend.invokeControl('skills.hubUninstall', { name: 'pdf' })).rejects.toThrow(
+      /open it first|not been listed/i,
+    );
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.uninstallHubSkillCalls).toEqual([]);
+
+    // (2) after a fetch listing a BUNDLED 'tdd' (FakeDashboardClient's
+    // default row, no hub rows at all) — the provenance guard refuses even
+    // though 'tdd' IS in the panel's full last-listed set.
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches {'tdd'} (bundled) — no hub names
+    await expect(backend.invokeControl('skills.hubUninstall', { name: 'tdd' })).rejects.toThrow(
+      /not a hub-installed/i,
+    );
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.uninstallHubSkillCalls).toEqual([]);
+
+    // (3) an unknown name — never listed at all — is refused the same way.
+    await expect(backend.invokeControl('skills.hubUninstall', { name: 'does-not-exist' })).rejects.toThrow(
+      /not a hub-installed/i,
+    );
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(client.uninstallHubSkillCalls).toEqual([]);
+  });
+
+  it('skills.hubUninstall happy path: modal -> uninstall -> poll -> ABSENCE re-check -> refetch', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.uninstallHubSkillResult = { ok: true, name: 'skills-uninstall-pdf-ab12cd34' };
+    client.statusSeq = [
+      { running: true, exit_code: null, lines: [] },
+      { running: false, exit_code: 0, lines: ['Removed: pdf'] },
+    ];
+    // Ground truth for the ABSENCE re-check: the FRESH listSkills() call the
+    // poller makes after `running:false` must no longer contain 'pdf'.
+    client.listSkillsResult = [];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Remove skill');
+
+    const resultPromise = backend.invokeControl('skills.hubUninstall', { name: 'pdf' });
+    // First actionStatus sees running:true and sleeps (1s) before the second
+    // call — same cadence as pollSkillInstall (1s -> 2s backoff).
+    await vi.advanceTimersByTimeAsync(1_000);
+    const res = await resultPromise;
+
+    expect(res).toMatchObject({ ok: true, name: 'pdf' });
+    expect(client.uninstallHubSkillCalls).toEqual(['pdf']);
+    expect(client.actionStatusCalls).toEqual([
+      'skills-uninstall-pdf-ab12cd34',
+      'skills-uninstall-pdf-ab12cd34',
+    ]);
+  });
+
+  it('skills.hubUninstall: still-present after the action rejects generically; tail goes to the logger only', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.uninstallHubSkillResult = { ok: true, name: 'skills-uninstall-pdf-ab12cd34' };
+    client.statusSeq = [{ running: false, exit_code: 0, lines: ['uninstall failed: permission denied'] }];
+    // 'pdf' is STILL present after the action — the removal never actually
+    // took effect server-side, so the ABSENCE re-check must fail closed.
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Remove skill');
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubUninstall', { name: 'pdf' });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toBe('Uninstall did not complete — see the Talaria output log.');
+    expect(message).not.toContain('permission denied'); // the tail must NEVER leak into the reject message
+    expect(logs.some((l) => l.includes('uninstall failed: permission denied'))).toBe(true); // ...only into the output-channel logger
+  });
+
+  it('skills.hubUninstall: untrusted workspace is refused before the name gate or any modal', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+    mockShowWarningMessage.mockClear();
+    (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = false;
+    try {
+      await expect(backend.invokeControl('skills.hubUninstall', { name: 'pdf' })).rejects.toThrow(/trust/i);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(client.uninstallHubSkillCalls).toEqual([]);
+    } finally {
+      (vscode.workspace as unknown as { isTrusted: boolean }).isTrusted = true;
+    }
+  });
+
+  it('skills.hubUninstall modal copy is byte-exact (§5.5)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+    client.uninstallHubSkillResult = { ok: true, name: 'skills-uninstall-pdf-ab12cd34' };
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }];
+    client.listSkillsResult = []; // absence re-check passes
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Remove skill');
+
+    await backend.invokeControl('skills.hubUninstall', { name: 'pdf' });
+
+    const [message, options, label] = mockShowWarningMessage.mock.calls[0] as [string, { modal: boolean; detail: string }, string];
+    expect(message).toBe('Remove skill "pdf"?');
+    expect(options.detail).toBe('Deletes its files from ~/.hermes/skills.');
+    expect(label).toBe('Remove skill');
+  });
+});
+
+// =============================================================================
+// Task B5 (§5.4 last bullet "Single-flight" + F3/B4 mirror): the skills
+// concurrency machinery widened for uninstall — B5-KS split the old single
+// shared busy map into two kind-scoped collections,
+// `busySkillInstallIds`/`busySkillUninstallNames`: `skills.hubInstall` locks
+// the hub identifier, `skills.hubUninstall` locks the skill NAME, each in
+// its OWN `Set` — cross-kind collision is structurally impossible; keys may
+// transiently be raw pre-validation strings (see ControlDispatcher's field
+// doc).
+// =============================================================================
+describe('ControlDispatcher — Task B5 skills.hubUninstall concurrency (F3/B4 mirror)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('B5-SF: skills.hubUninstall is single-flight per NAME — a concurrent same-name call is refused, a different name is not', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [
+      { name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' },
+      { name: 'other', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' },
+    ];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub names {'pdf','other'}
+
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // both pollers see running:false on their first check — no timer advance needed
+    client.listSkillsResult = []; // absence ground truth for both names after either action
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.uninstallHubSkillDeferred = new Promise((res) => {
+      release = res;
+    }); // FakeAdmin: uninstallHubSkill returns this when set
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Remove skill'); // every modal this test opens is confirmed
+
+    const first = backend.invokeControl('skills.hubUninstall', { name: 'pdf' });
+
+    // The guard is a synchronous test-and-set BEFORE `first` ever joins any
+    // queue (`handleSkillsAdmin`'s own doc, mirroring `handleMcpAdmin`'s) —
+    // the refusal below does not depend on how far `first`'s modal/uninstall
+    // chain has progressed.
+    await expect(
+      backend.invokeControl('skills.hubUninstall', { name: 'pdf' }),
+    ).rejects.toThrow(/already in progress/i);
+
+    // A DIFFERENT name is never refused by the SAME-name guard — accepted
+    // and runs CONCURRENTLY with 'pdf' (skills.hubUninstall is tail-exempt,
+    // so it never queues behind it on `dashboardToggleTail` either).
+    const other = backend.invokeControl('skills.hubUninstall', { name: 'other' });
+
+    release({ ok: true, name: 'skills-uninstall-action-1' });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'pdf' });
+    await expect(other).resolves.toMatchObject({ ok: true, name: 'other' });
+
+    // The refused re-click reached NEITHER the modal NOR uninstallHubSkill a
+    // second time: exactly one modal + one uninstall call per name, never a
+    // third of either.
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+    expect(client.uninstallHubSkillCalls).toEqual(['pdf', 'other']);
+  });
+
+  it(
+    'skills.toggle proceeds while skills.hubUninstall is in flight (F3 tail-exemption mirror for skills)',
+    async () => {
+      const { backend, client } = makeBackendWithAdminDashboard();
+      client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+      await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+      let release!: (v: { ok: boolean; name: string }) => void;
+      client.uninstallHubSkillDeferred = new Promise((res) => {
+        release = res;
+      });
+
+      mockShowWarningMessage.mockClear();
+      mockShowWarningMessage.mockResolvedValueOnce('Remove skill');
+
+      const uninstall = backend.invokeControl('skills.hubUninstall', { name: 'pdf' }); // do NOT await — must still be pending below
+
+      await backend.invokeControl('skills.toggle', { name: 'pdf', enabled: false });
+
+      expect(client.toggleSkillCalls).toEqual([{ name: 'pdf', enabled: false }]);
+      expect(client.uninstallHubSkillCalls).toEqual(['pdf']);
+
+      client.statusSeq = [{ running: false, exit_code: 0, lines: [] }];
+      client.listSkillsResult = [];
+      release({ ok: true, name: 'skills-uninstall-action-2' });
+      await uninstall;
+    },
+    1000,
+  );
+});
+
+// =============================================================================
+// B5-KS (docs_claude/features-b5-singleflight-keyspace-fix-architecture.md):
+// the single-flight busy registry split into two kind-scoped collections
+// (`busySkillInstallIds`/`busySkillUninstallNames`) so a same-string
+// cross-kind pair (an install typo colliding with an in-flight uninstall of
+// the same raw string, or the reverse) can no longer be masked behind the
+// wrong-kind "already in progress" busy message — the caller gets the
+// accurate downstream validation refusal instead.
+// =============================================================================
+describe('ControlDispatcher — B5-KS single-flight key-space (cross-kind non-collision)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('T-1: an install typo is not masked by an in-flight uninstall of the same raw string', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // the uninstall poller sees running:false on its first check
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.uninstallHubSkillDeferred = new Promise((res) => {
+      release = res;
+    });
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Remove skill');
+
+    const first = backend.invokeControl('skills.hubUninstall', { name: 'pdf' }); // in flight, keyed on the NAME 'pdf'
+
+    // A same-STRING install typo (identifier 'pdf', missing its publisher
+    // prefix) must get the accurate allowlist refusal, never the uninstall's
+    // busy message.
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: 'pdf' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toMatch(/not under an allowlisted publisher/i);
+    expect(message).not.toMatch(/already in progress/i);
+    expect(client.scanCalls).not.toContain('pdf'); // the invalid identifier never reached the network
+
+    client.listSkillsResult = []; // absence ground truth for the still-in-flight uninstall
+    release({ ok: true, name: 'skills-uninstall-action-1' });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'pdf' }); // the in-flight uninstall was unaffected
+  });
+
+  it('T-2: an uninstall of a slashed name is not masked by an in-flight install of the same raw string', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.scanResult = hubScanRow({ name: 'pdf', identifier: 'anthropics/skills/pdf', trust_level: 'trusted', verdict: 'safe', policy: 'allow' });
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // the install poller sees running:false on its first check
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.hubInstallDeferred = new Promise((res) => {
+      release = res;
+    });
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Install skill');
+
+    const install = backend.invokeControl('skills.hubInstall', { identifier: 'anthropics/skills/pdf' }); // in flight, keyed on the IDENTIFIER
+
+    // A same-STRING uninstall (name 'anthropics/skills/pdf' — not a real hub
+    // name) must get the accurate hub-provenance refusal, never the
+    // install's busy message.
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubUninstall', { name: 'anthropics/skills/pdf' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toMatch(/not a hub-installed skill/i);
+    expect(message).not.toMatch(/already in progress/i);
+
+    release({ ok: true, name: 'skills-install-action-2' });
+    await expect(install).resolves.toMatchObject({ ok: true, name: 'pdf' }); // the in-flight install was unaffected
+  });
+
+  it('T-3: skills.hubPreview (check-only) is not masked by an in-flight uninstall of the same raw string', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    client.listSkillsResult = [{ name: 'pdf', description: '', category: '', enabled: true, usage: 0, provenance: 'hub' }];
+    await backend.invokeControl('panel.data', { panel: 'skills' }); // caches hub name {'pdf'}
+
+    client.statusSeq = [{ running: false, exit_code: 0, lines: [] }]; // the uninstall poller sees running:false on its first check
+
+    let release!: (v: { ok: boolean; name: string }) => void;
+    client.uninstallHubSkillDeferred = new Promise((res) => {
+      release = res;
+    });
+
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue('Remove skill');
+
+    const first = backend.invokeControl('skills.hubUninstall', { name: 'pdf' }); // in flight, keyed on the NAME 'pdf'
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubPreview', { identifier: 'pdf' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toMatch(/not under an allowlisted publisher/i);
+    expect(message).not.toMatch(/already in progress/i);
+
+    client.listSkillsResult = []; // absence ground truth for the still-in-flight uninstall
+    release({ ok: true, name: 'skills-uninstall-action-3' });
+    await expect(first).resolves.toMatchObject({ ok: true, name: 'pdf' }); // the in-flight uninstall was unaffected
+  });
+
+  it('T-4 (invariant pin — expected green both before and after B5-KS): a raw pre-validation install key is released on the validation refusal, so an identical retry gets the SAME allowlist refusal, never a busy one', async () => {
+    const { backend } = makeBackendWithAdminDashboard();
+
+    let firstCaught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: 'pdf' });
+    } catch (err) {
+      firstCaught = err;
+    }
+    expect((firstCaught as Error).message).toMatch(/not under an allowlisted publisher/i);
+
+    let secondCaught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: 'pdf' });
+    } catch (err) {
+      secondCaught = err;
+    }
+    const secondMessage = (secondCaught as Error).message;
+    expect(secondMessage).toMatch(/not under an allowlisted publisher/i);
+    expect(secondMessage).not.toMatch(/already in progress/i);
   });
 });
 
@@ -7952,7 +9970,7 @@ describe('AcpBackend — W2 T4 F-D: EditPreviewRegistry wiring (SECURITY: ask-pa
 
 /** Like {@link makeStartableBackend} but seeds each client's reported `newSession` mode (drift scenario). */
 function makeStartableWithMode(modeId: string): { backend: AcpBackend; clients: FakeAcpClient[] } {
-  const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes' };
+  const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes', pythonPath: '/fake/python' };
   const clients: FakeAcpClient[] = [];
   const createClient: AcpClientFactory = (options) => {
     const client = new FakeAcpClient(options);
@@ -9017,6 +11035,249 @@ describe('AcpBackend.oneShot — §2c one-shot utility-model surface (T5b)', () 
       client.resolveInFlightPrompt({ stopReason: 'cancelled' }); // the real prompt() finally settles
       await flushMicrotasks();
       expect(seam(backend).ephemeral.has('ephemeral-1')).toBe(false);
+    });
+  });
+});
+
+/**
+ * TG-5 (AU-51, `docs_claude/audit-fix-architecture.md` ADR-4, INV-20):
+ * one-shot utility sessions (`OneShotRunner`'s ephemeral `session/new`
+ * mints — commit-message generation etc.) persist server-side forever (the
+ * ACP wire has no close) and would otherwise pollute `session.list` +
+ * `~/.hermes/state.db` + accumulate AIAgents in the acp child over time.
+ * Two independent layers:
+ *  - layer 1 (deterministic): every minted id is recorded into
+ *    `OneShotSessionRegistry` (a bounded, `workspaceState`-persisted LRU) —
+ *    `reshapeSessionsList` drops those ids before the panel ever sees them.
+ *  - layer 2 (best-effort): once the one-shot settles (success/timeout/
+ *    cancel), `AcpBackend` dispatches `session.delete {session_id}` on the
+ *    tui_gateway control plane — CONFIRMED viable (harness `server.py
+ *    :5973-5980`'s active-guard only ever sees the GATEWAY's own
+ *    `_sessions`, never an acp-child id, so it passes the guard and
+ *    `db.delete_session` removes the row from the SHARED `state.db`).
+ *    Failures are LOG-ONLY (control channel down != one-shot failure).
+ */
+describe('AcpBackend.oneShot — TG-5 (AU-51): ephemeral session cleanup', () => {
+  /** {@link makeOneShotBackend} + a {@link FakeControlChannel} swapped in
+   *  (the `withFakeControl` escape hatch), so `session.delete` dispatches
+   *  are observable/controllable. */
+  function makeOneShotBackendWithControl(): {
+    backend: AcpBackend;
+    client: FakeAcpClient;
+    control: FakeControlChannel;
+    logs: string[];
+  } {
+    const base = makeOneShotBackend();
+    const control = withFakeControl(base.backend);
+    return { ...base, control };
+  }
+
+  describe('layer 1 (deterministic): the panel never sees a minted ephemeral id', () => {
+    it("a one-shot's minted ephemeral session id is absent from session.list WHILE the one-shot is still in flight (recorded at mint, not at settle)", async () => {
+      const { backend, client } = makeOneShotBackend();
+      client.queueSessionId('ephemeral-1');
+      const resultPromise = backend.oneShot('Generate commit message', { cwd: '/ws' });
+      await flushMicrotasks();
+
+      client.setListSessionsResult({
+        sessions: [
+          { session_id: 'ephemeral-1', cwd: '/ws', title: 'One-shot' },
+          { session_id: 'session-1', cwd: '/ws', title: 'Real chat' },
+        ],
+        next_cursor: null,
+      });
+      const page = (await backend.invokeControl('session.list', {})) as SessionsData;
+      expect(page.sessions.map((s) => s.id)).toEqual(['session-1']);
+
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+      await resultPromise;
+    });
+
+    it("stays absent from session.list AFTER the one-shot has settled", async () => {
+      const { backend, client } = makeOneShotBackend();
+      client.queueSessionId('ephemeral-1');
+      const resultPromise = backend.oneShot('Generate commit message', { cwd: '/ws' });
+      await flushMicrotasks();
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+      await resultPromise;
+
+      client.setListSessionsResult({
+        sessions: [
+          { session_id: 'ephemeral-1', cwd: '/ws', title: 'One-shot' },
+          { session_id: 'session-1', cwd: '/ws', title: 'Real chat' },
+        ],
+        next_cursor: null,
+      });
+      const page = (await backend.invokeControl('session.list', {})) as SessionsData;
+      expect(page.sessions.map((s) => s.id)).toEqual(['session-1']);
+    });
+  });
+
+  describe('layer 2 (best-effort): session.delete dispatches once the one-shot settles', () => {
+    it('a successful settle dispatches session.delete {session_id} on the control plane', async () => {
+      const { backend, client, control } = makeOneShotBackendWithControl();
+      client.queueSessionId('ephemeral-1');
+      const resultPromise = backend.oneShot('hi', { cwd: '/ws' });
+      await flushMicrotasks();
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+      await resultPromise;
+
+      expect(control.dispatchCalls).toEqual(
+        expect.arrayContaining([{ method: 'session.delete', params: { session_id: 'ephemeral-1' } }]),
+      );
+    });
+
+    it('a tool-call-tripwire cancel settle also dispatches session.delete', async () => {
+      const { backend, client, control } = makeOneShotBackendWithControl();
+      client.queueSessionId('ephemeral-1');
+      const resultPromise = backend.oneShot('hi', { cwd: '/ws' });
+      await flushMicrotasks();
+
+      fireSessionUpdate(backend)('ephemeral-1', {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc-1',
+        title: 'write_file',
+        kind: 'edit',
+      });
+      await flushMicrotasks();
+
+      expect(await resultPromise).toEqual({ ok: false, error: 'unexpected tool call' });
+      expect(control.dispatchCalls).toEqual(
+        expect.arrayContaining([{ method: 'session.delete', params: { session_id: 'ephemeral-1' } }]),
+      );
+    });
+
+    describe('timeout settle', () => {
+      beforeEach(() => {
+        vi.useFakeTimers();
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it('a deadline timeout (session already created) also dispatches session.delete', async () => {
+        const { backend, client, control } = makeOneShotBackendWithControl();
+        client.queueSessionId('ephemeral-1');
+        client.newSessionModeId = 'accept_edits'; // forces setSessionMode -> hangs -> deadline fires with a known id
+        client.setSessionMode = () => new Promise<void>(() => {});
+
+        const resultPromise = backend.oneShot('hi', { cwd: '/ws', timeoutMs: 5_000 });
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(await resultPromise).toEqual({ ok: false, error: 'timed out' });
+        expect(control.dispatchCalls).toEqual(
+          expect.arrayContaining([{ method: 'session.delete', params: { session_id: 'ephemeral-1' } }]),
+        );
+      });
+    });
+
+    it('a session.delete failure is LOG-ONLY — the one-shot itself still resolves ok:true (control channel down != one-shot failure)', async () => {
+      const { backend, client, control, logs } = makeOneShotBackendWithControl();
+      control.setDeferredFor('session.delete', Promise.reject(new Error('control channel down')));
+      client.queueSessionId('ephemeral-1');
+
+      const resultPromise = backend.oneShot('hi', { cwd: '/ws' });
+      await flushMicrotasks();
+      fireSessionUpdate(backend)('ephemeral-1', {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'feat: add x' },
+      });
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+
+      expect(await resultPromise).toEqual({ ok: true, text: 'feat: add x' });
+      await flushMicrotasks(); // let the rejected session.delete dispatch's .catch(log) settle
+      expect(logs.some((l) => l.includes('session.delete') && l.includes('control channel down'))).toBe(true);
+    });
+  });
+
+  describe('layer 1 persistence: the LRU registry survives a simulated window reload', () => {
+    /** A minimal in-memory {@link WorkspaceStateLike} — `updateCalls` is what
+     *  the persistence-on-record tests assert on; `state` (the same Map) is
+     *  what a SECOND `AcpBackend` construction (the "reload") reads from. */
+    function makeFakeWorkspaceState(initial: Record<string, unknown> = {}): {
+      state: WorkspaceStateLike;
+      updateCalls: Array<{ key: string; value: unknown }>;
+    } {
+      const store = new Map<string, unknown>(Object.entries(initial));
+      const updateCalls: Array<{ key: string; value: unknown }> = [];
+      const state: WorkspaceStateLike = {
+        get: <T,>(key: string) => store.get(key) as T | undefined,
+        update: (key: string, value: unknown) => {
+          updateCalls.push({ key, value });
+          store.set(key, value);
+          return Promise.resolve();
+        },
+      };
+      return { state, updateCalls };
+    }
+
+    /** Like {@link makeOneShotBackend}, but with an explicit `workspaceState`
+     *  wired through the (last, defaulted) constructor param — the only way
+     *  to prove persist/reload without reaching into a private field. */
+    function makeOneShotBackendWithWorkspaceState(workspaceState: WorkspaceStateLike): {
+      backend: AcpBackend;
+      client: FakeAcpClient;
+    } {
+      const backend = new AcpBackend(
+        {} as HermesRuntimeConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        workspaceState,
+      );
+      const client = new FakeAcpClient();
+      seam(backend).client = client;
+      seam(backend).cwd = '/ws';
+      seam(backend).sessionId = 'session-1';
+      return { backend, client };
+    }
+
+    it('a minted one-shot id is persisted to workspaceState under the pinned storage key', async () => {
+      const { state, updateCalls } = makeFakeWorkspaceState();
+      const { backend, client } = makeOneShotBackendWithWorkspaceState(state);
+      client.queueSessionId('ephemeral-1');
+
+      const resultPromise = backend.oneShot('hi', { cwd: '/ws' });
+      await flushMicrotasks();
+
+      expect(
+        updateCalls.some(
+          (c) =>
+            c.key === ONESHOT_SESSION_IDS_STORAGE_KEY &&
+            Array.isArray(c.value) &&
+            (c.value as string[]).includes('ephemeral-1'),
+        ),
+      ).toBe(true);
+
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+      await resultPromise;
+    });
+
+    it('a SECOND AcpBackend sharing the same workspaceState (a simulated reload) already excludes the persisted id from session.list — before minting anything new', async () => {
+      const { state } = makeFakeWorkspaceState({
+        [ONESHOT_SESSION_IDS_STORAGE_KEY]: ['stale-ephemeral-1'],
+      });
+      const { backend, client } = makeOneShotBackendWithWorkspaceState(state);
+
+      client.setListSessionsResult({
+        sessions: [
+          { session_id: 'stale-ephemeral-1', cwd: '/ws' },
+          { session_id: 'session-1', cwd: '/ws' },
+        ],
+        next_cursor: null,
+      });
+      const page = (await backend.invokeControl('session.list', {})) as SessionsData;
+      expect(page.sessions.map((s) => s.id)).toEqual(['session-1']);
     });
   });
 });
@@ -10192,5 +12453,57 @@ describe('AcpBackend — Task 13: advertised auth methods surface', () => {
     expect(fires).toBe(2);
 
     sub.dispose();
+  });
+});
+
+describe('beta.7 B3: user-triggered reconnect (backend.reconnectAgent)', () => {
+  it('tears down the child, mints a NEW client (fresh initialize ⇒ fresh authMethods), and re-loads every live session into its tab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    expect(clients).toHaveLength(1);
+
+    const result = await backend.reconnectAgent();
+
+    expect(result).toEqual({ ok: true });
+    expect(clients).toHaveLength(2);
+    expect(must(clients[1]).loadSessionCalls.map((c) => c.sessionId)).toEqual(['session-1']);
+  });
+
+  it('refuses while a turn is live — never kills an in-flight session prompt', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    // The fake client's prompt() returns a HELD-OPEN deferred (:369-374) —
+    // nothing auto-resolves it, so hasLiveTurn() is genuinely true at the
+    // moment reconnectAgent() runs (finding-11 guard: the turn must not be
+    // able to settle out from under the test).
+    backend.sendPrompt('session-1', 'work', 'default');
+    await flushMicrotasks();
+
+    const result = await backend.reconnectAgent();
+
+    expect(result.ok).toBe(false);
+    expect(clients).toHaveLength(1); // no teardown happened
+    must(clients[0]).resolveInFlightPrompt({ stopReason: 'end_turn' }); // hygiene: settle the held turn
+    await flushMicrotasks();
+  });
+
+  it('refuses honestly when the connection was never started', async () => {
+    const { backend } = makeStartableBackend();
+    const result = await backend.reconnectAgent();
+    expect(result).toMatchObject({ ok: false, reason: expect.any(String) });
+  });
+
+  it('B1 interplay: recovery re-binds WITHOUT a title key, so History-set chips survive a reconnect', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    expect(clients).toHaveLength(1);
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.reconnectAgent();
+
+    const rebinds = messages.filter((m) => m.type === 'tab.bound');
+    expect(rebinds.length).toBeGreaterThan(0);
+    for (const b of rebinds) expect('title' in b).toBe(false);
   });
 });

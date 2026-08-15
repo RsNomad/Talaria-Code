@@ -459,6 +459,41 @@ describe('createLibServer — T1 carry-note #2: Origin extraction honesty (absen
   });
 });
 
+describe('createLibServer — AU-21: a buildMcpServer() throw is caught, never an unhandled rejection', () => {
+  it(
+    'answers 500 within a tick and never fires process "unhandledRejection" (fails at HEAD: hangs — the constructor throw escapes the void-shaped caller uncaught)',
+    async () => {
+      const { port, expect: exp } = await startTestServer({}, () => {
+        throw new Error('AU-21 RED: buildMcpServer boom');
+      });
+
+      const unhandled: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown): void => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandledRejection);
+      try {
+        const res = await httpRequest({
+          port,
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${exp.token}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json, text/event-stream',
+          },
+          body: '{}',
+        });
+        expect(res.status).toBe(500);
+        expect(JSON.parse(res.body)).toEqual({ error: 'internal error' });
+      } finally {
+        process.off('unhandledRejection', onUnhandledRejection);
+      }
+      expect(unhandled).toEqual([]);
+    },
+    3000,
+  );
+});
+
 describe('createLibServer — malformed JSON body on the accept path', () => {
   it('answers a JSON-RPC parse error instead of hanging or crashing', async () => {
     const { port, expect: exp } = await startTestServer();

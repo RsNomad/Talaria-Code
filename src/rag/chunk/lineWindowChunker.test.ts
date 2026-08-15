@@ -36,4 +36,35 @@ describe('chunkByLines', () => {
     expect(must(chunks[1]).startLine).toBe(30);
     expect(must(chunks[chunks.length - 1]).endLine).toBe(99);
   });
+
+  // AU-33: a trailing newline must not manufacture a phantom extra line —
+  // `"a\nb\n".split('\n')` yields `["a","b",""]`; the phantom `''` must be
+  // dropped before chunking so `endLine` never points past the real EOF.
+  it('drops the phantom trailing element from a trailing-newline file', () => {
+    const chunks = chunkByLines('a\nb\n', 40, 10);
+    expect(chunks).toEqual([{ content: 'a\nb', startLine: 0, endLine: 1 }]);
+  });
+
+  it('a single line with a trailing newline is not counted as two lines', () => {
+    const chunks = chunkByLines('a\n', 40, 10);
+    expect(chunks).toEqual([{ content: 'a', startLine: 0, endLine: 0 }]);
+  });
+
+  it('a file without a trailing newline is unchanged', () => {
+    const chunks = chunkByLines('a\nb', 40, 10);
+    expect(chunks).toEqual([{ content: 'a\nb', startLine: 0, endLine: 1 }]);
+  });
+
+  it('windows spanning the trailing-newline boundary keep overlap math intact', () => {
+    const lines = Array.from({ length: 10 }, (_, i) => `line${i}`);
+    const contents = `${lines.join('\n')}\n`; // trailing newline
+
+    const chunks = chunkByLines(contents, 4, 1);
+
+    expect(chunks).toEqual([
+      { content: lines.slice(0, 4).join('\n'), startLine: 0, endLine: 3 },
+      { content: lines.slice(3, 7).join('\n'), startLine: 3, endLine: 6 },
+      { content: lines.slice(6, 10).join('\n'), startLine: 6, endLine: 9 },
+    ]);
+  });
 });

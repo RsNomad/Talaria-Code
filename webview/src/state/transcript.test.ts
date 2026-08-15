@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import type { DataPanel, PanelDataMap, ThemeInfo } from '../protocol';
+import type { CheckpointsData, DataPanel, PanelDataMap, ThemeInfo } from '../protocol';
 import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type AppState, type MessageItem } from '../types';
 import { must } from '../testing/must';
 import { assertExhaustivePanel } from './panels';
@@ -925,6 +925,282 @@ describe('transcript reducer — W4-T3b B6: panel-loading/error actions key on t
   );
 });
 
+/*
+ * TI-3 (AU-42 Part B): the SYSTEMIC fix, at the AppState level.
+ * `reducePanelAction`/`applyPanelTransition` (state/panels.ts) own the
+ * RemoteData-keep half (panels.test.ts); this reducer owns the
+ * `refreshError` side-map half — recording/clearing the per-panel message
+ * kept OUTSIDE RemoteData, exactly mirroring BF-A's `sessionsLoadMoreError`.
+ */
+describe('transcript reducer — TI-3 (AU-42 Part B): refreshError side-map for the 5 in-scope global panels', () => {
+  it('a local.panelError while a global panel (skills) is already success KEEPS the data and records refreshError', () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'skills', data: globalPanelData.skills });
+    state = reduceLocal(state, {
+      type: 'local.panelError',
+      panel: 'skills',
+      message: 'refresh failed',
+      retryable: true,
+    });
+    expect(state.globalPanels.skills).toEqual({ status: 'success', data: globalPanelData.skills });
+    expect(state.refreshError?.skills).toBe('refresh failed');
+  });
+
+  it('a local.panelError while a global panel (mcp) is idle/first-load records NO refreshError (the error card is the correct UI there)', () => {
+    const state = reduceLocal(INITIAL_STATE, {
+      type: 'local.panelError',
+      panel: 'mcp',
+      message: 'not connected',
+      retryable: true,
+    });
+    expect(state.globalPanels.mcp).toMatchObject({ status: 'error' });
+    expect(state.refreshError?.mcp).toBeUndefined();
+  });
+
+  it("the panel's NEXT success push clears its refreshError (BF-A loadMoreError parity)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'tools', data: globalPanelData.tools });
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'tools', message: 'boom', retryable: true });
+    expect(state.refreshError?.tools).toBe('boom');
+
+    state = reduce(state, { type: 'panel.data', panel: 'tools', data: globalPanelData.tools });
+    expect(state.refreshError?.tools).toBeUndefined();
+    expect(state.globalPanels.tools).toEqual({ status: 'success', data: globalPanelData.tools });
+  });
+
+  it('local.refreshError.dismiss clears a panel\'s refreshError without touching its RemoteData', () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'models', data: globalPanelData.models });
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'models', message: 'boom', retryable: true });
+    expect(state.refreshError?.models).toBe('boom');
+
+    state = reduceLocal(state, { type: 'local.refreshError.dismiss', panel: 'models' });
+    expect(state.refreshError?.models).toBeUndefined();
+    expect(state.globalPanels.models).toEqual({ status: 'success', data: globalPanelData.models });
+  });
+
+  it('a SECOND background-refresh failure overwrites the FIRST message (latest wins), never accumulates', () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'settings', data: globalPanelData.settings });
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'settings', message: 'first', retryable: true });
+    expect(state.refreshError?.settings).toBe('first');
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'settings', message: 'second', retryable: true });
+    expect(state.refreshError?.settings).toBe('second');
+    expect(state.globalPanels.settings).toEqual({ status: 'success', data: globalPanelData.settings });
+  });
+
+  it("scope decision: 'setup' KEEPS its data on a background-refresh error (the panel-agnostic reducer rule) but records NO refreshError entry (excluded — see RefreshErrorPanel's doc)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'setup', data: globalPanelData.setup });
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'setup', message: 'boom', retryable: true });
+    expect(state.globalPanels.setup).toEqual({ status: 'success', data: globalPanelData.setup }); // kept, not wiped
+    expect(state.refreshError).toBeUndefined(); // no side-map entry at all — 'setup' is out of scope
+  });
+
+  it('scope decision: subagents/checkpoints/sessions ALSO keep their success data on a background-refresh error (reducer rule extended — panels.test.ts pins applyPanelTransition itself); no refreshError side-map exists for them (scoped out, tabId/rootId-shaped side-maps would need their own design)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    const tabId = state.activeTabId;
+    state = reduce(state, { type: 'panel.data', panel: 'subagents', sessionId: 's1', data: { delegations: [] } });
+    state = reduceLocal(state, {
+      type: 'local.panelError',
+      panel: 'subagents',
+      scopeKey: tabId,
+      message: 'refresh failed',
+      retryable: true,
+    });
+    expect(must(state.tabs[tabId]).subagents).toEqual({ status: 'success', data: { delegations: [] } });
+    // No AppState.refreshError entry exists for a non-RefreshErrorPanel scope
+    // (subagents isn't even a valid key of the type) — nothing to assert
+    // beyond "the data survived", which is the actual defect this fixes.
+    // Addendum (AU-61, T1): "no refreshError side-map exists for them" above
+    // described the state at the time this test was written — it is no
+    // longer the whole story. The `describe` block immediately below this
+    // one adds each of the three panels its OWN scoped signal
+    // (`sessionsRefreshError`/`checkpointsRefreshError`/
+    // `subagentsRefreshError`); this test's title and assertions stay
+    // correct as written (still true of THIS map specifically) and are left
+    // untouched — this note only points a future reader at where the
+    // "scoped out" follow-up landed.
+  });
+});
+
+/*
+ * AU-61 (T1): the state core for the three RE-SCOPED panels TI-3 left with no
+ * signal — sessions (single slot), checkpoints (rootId-keyed), subagents
+ * (tab-resident). Mirrors the TI-3 describe block immediately above: same
+ * SET/CLEAR/dismiss lifecycle, applied per-scope instead of per-map-key.
+ */
+describe('transcript reducer — AU-61: scoped refreshError state core (sessions/checkpoints/subagents)', () => {
+  describe('sessions (AppState.sessionsRefreshError — single slot)', () => {
+    it('a sessions background-refresh failure keeps the loaded list AND records sessionsRefreshError', () => {
+      let s = reduce(INITIAL_STATE, {
+        type: 'panel.data',
+        panel: 'sessions',
+        cwd: '/w',
+        data: { sessions: [{ id: 's1', cwd: '/w', title: 'A' }], nextCursor: undefined },
+      });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
+      expect(s.sessionsPanel.status).toBe('success'); // keep-data (TI-3) — already green at HEAD
+      expect(s.sessionsRefreshError).toBe('boom');
+    });
+
+    it('a sessions FIRST-LOAD failure still shows the error card and sets NO refreshError (AU-10 intact)', () => {
+      const s = reduceLocal(INITIAL_STATE, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
+      expect(s.sessionsPanel).toEqual({ status: 'error', error: { message: 'boom', retryable: true } });
+      expect(s.sessionsRefreshError).toBeUndefined();
+    });
+
+    it('the next sessions success push clears sessionsRefreshError', () => {
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
+      expect(s.sessionsRefreshError).toBe('boom');
+
+      s = reduce(s, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      expect(s.sessionsRefreshError).toBeUndefined();
+      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [], nextCursor: undefined } });
+    });
+
+    it('local.scopedRefreshError.dismiss{sessions} clears the slot (and is a no-op when unset)', () => {
+      const untouched = reduceLocal(INITIAL_STATE, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'sessions' } });
+      expect(untouched).toBe(INITIAL_STATE); // no-op — same reference
+
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
+      expect(s.sessionsRefreshError).toBe('boom');
+
+      s = reduceLocal(s, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'sessions' } });
+      expect(s.sessionsRefreshError).toBeUndefined();
+      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [], nextCursor: undefined } });
+    });
+
+    it('local.panelLoading (a plain background refetch) does NOT clear a standing sessionsRefreshError — it survives until success or dismiss', () => {
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
+      s = reduceLocal(s, { type: 'local.panelLoading', panel: 'sessions' });
+      expect(s.sessionsRefreshError).toBe('boom');
+    });
+  });
+
+  describe('checkpoints (AppState.checkpointsRefreshError — rootId-keyed)', () => {
+    // Critic-1 finding 16: no checkpoints fixture exists elsewhere in this file
+    // (globalPanelData deliberately excludes it) — minimal CheckpointsData shape.
+    const ckpt: CheckpointsData = { checkpoints: [] };
+
+    it('a checkpoints refresh failure records under ITS rootId only, data kept, sibling root untouched', () => {
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-1', data: ckpt });
+      s = reduce(s, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-2', data: ckpt });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'checkpoints', scopeKey: 'root-1', message: 'net down', retryable: true });
+
+      expect(s.rootPanels['root-1']?.status).toBe('success'); // keep-data — already green at HEAD
+      expect(s.checkpointsRefreshError?.['root-1']).toBe('net down');
+      expect(s.checkpointsRefreshError?.['root-2']).toBeUndefined(); // sibling root untouched
+    });
+
+    it("a checkpoints success push for root-1 clears ONLY root-1's entry", () => {
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-1', data: ckpt });
+      s = reduce(s, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-2', data: ckpt });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'checkpoints', scopeKey: 'root-1', message: 'a', retryable: true });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'checkpoints', scopeKey: 'root-2', message: 'b', retryable: true });
+
+      s = reduce(s, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-1', data: ckpt });
+      expect(s.checkpointsRefreshError?.['root-1']).toBeUndefined();
+      expect(s.checkpointsRefreshError?.['root-2']).toBe('b'); // sibling untouched
+      expect(s.rootPanels['root-1']).toEqual({ status: 'success', data: ckpt });
+    });
+
+    it('a checkpoints success push for a root that never had a refreshError entry is a true no-op (same reference, no spurious empty map)', () => {
+      const s0 = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-1', data: ckpt });
+      const before = s0.checkpointsRefreshError;
+      const s1 = reduce(s0, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-1', data: ckpt });
+      expect(s1.checkpointsRefreshError).toBe(before);
+    });
+
+    it("local.scopedRefreshError.dismiss{checkpoints} clears only that root's entry (no-op when absent)", () => {
+      const untouched = reduceLocal(INITIAL_STATE, {
+        type: 'local.scopedRefreshError.dismiss',
+        target: { panel: 'checkpoints', rootId: 'root-1' },
+      });
+      expect(untouched).toBe(INITIAL_STATE); // no-op — same reference
+
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-1', data: ckpt });
+      s = reduce(s, { type: 'panel.data', panel: 'checkpoints', rootId: 'root-2', data: ckpt });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'checkpoints', scopeKey: 'root-1', message: 'a', retryable: true });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'checkpoints', scopeKey: 'root-2', message: 'b', retryable: true });
+
+      s = reduceLocal(s, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'checkpoints', rootId: 'root-1' } });
+      expect(s.checkpointsRefreshError?.['root-1']).toBeUndefined();
+      expect(s.checkpointsRefreshError?.['root-2']).toBe('b'); // sibling untouched
+    });
+  });
+
+  describe('subagents (TabState.subagentsRefreshError — tab-resident, P-1)', () => {
+    /** A second, real, bound tab (session sB / root /root-b) alongside the
+     * bootstrap tab — mirrors the B6 describe block's `twoBoundTabs` idiom
+     * above, but that helper is scoped to its own describe callback. */
+    function openSecondTab(state: AppState): { state: AppState; tabId: string } {
+      let next = reduceLocal(state, { type: 'local.tab.open', tabId: 'tab-2' });
+      next = reduce(next, { type: 'tab.bound', tabId: 'tab-2', sessionId: 'sB', rootId: '/root-b' });
+      return { state: next, tabId: 'tab-2' };
+    }
+
+    it('a subagents refresh failure lands on the ISSUING tab (scopeKey), data kept, sibling (bootstrap) tab clean', () => {
+      const { state: bound, tabId } = openSecondTab(INITIAL_STATE);
+      const s1 = reduce(bound, { type: 'panel.data', panel: 'subagents', sessionId: 'sB', data: { delegations: [] } });
+
+      const s2 = reduceLocal(s1, { type: 'local.panelError', panel: 'subagents', scopeKey: tabId, message: 'x', retryable: true });
+      expect(s2.tabs[tabId]?.subagents).toEqual({ status: 'success', data: { delegations: [] } }); // keep-data — already green at HEAD
+      expect(s2.tabs[tabId]?.subagentsRefreshError).toBe('x');
+      expect(s2.tabs[BOOTSTRAP_TAB_ID]?.subagentsRefreshError).toBeUndefined(); // sibling tab clean (P-1)
+    });
+
+    it('an unknown/absent scopeKey drops the action without writing any refreshError', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const unchanged = reduceLocal(INITIAL_STATE, {
+        type: 'local.panelError',
+        panel: 'subagents',
+        message: 'x',
+        retryable: true,
+      });
+      expect(unchanged).toBe(INITIAL_STATE); // no scopeKey at all — dropped, same reference
+      expect(warn).toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('the CF-10 empty-landing (local.panelLoading + emptyData) clears a standing subagentsRefreshError', () => {
+      const { state: bound, tabId } = openSecondTab(INITIAL_STATE);
+      let s = reduce(bound, { type: 'panel.data', panel: 'subagents', sessionId: 'sB', data: { delegations: [] } });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'subagents', scopeKey: tabId, message: 'x', retryable: true });
+      expect(s.tabs[tabId]?.subagentsRefreshError).toBe('x');
+
+      s = reduceLocal(s, { type: 'local.panelLoading', panel: 'subagents', scopeKey: tabId, emptyData: { delegations: [] } });
+      expect(s.tabs[tabId]?.subagents).toEqual({ status: 'success', data: { delegations: [] } });
+      expect(s.tabs[tabId]?.subagentsRefreshError).toBeUndefined();
+    });
+
+    it('tab close removes the signal with the tab (no leak) — structural, residence-in-TabState', () => {
+      const { state: bound, tabId } = openSecondTab(INITIAL_STATE);
+      let s = reduce(bound, { type: 'panel.data', panel: 'subagents', sessionId: 'sB', data: { delegations: [] } });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'subagents', scopeKey: tabId, message: 'x', retryable: true });
+      expect(s.tabs[tabId]?.subagentsRefreshError).toBe('x');
+
+      s = reduceLocal(s, { type: 'local.tab.close', tabId });
+      expect(s.tabs[tabId]).toBeUndefined();
+    });
+
+    it('local.scopedRefreshError.dismiss{subagents} clears on the named tab only (unknown tab -> drop, same reference)', () => {
+      const { state: bound, tabId } = openSecondTab(INITIAL_STATE);
+      let s = reduce(bound, { type: 'panel.data', panel: 'subagents', sessionId: 'sB', data: { delegations: [] } });
+      s = reduceLocal(s, { type: 'local.panelError', panel: 'subagents', scopeKey: tabId, message: 'x', retryable: true });
+      expect(s.tabs[tabId]?.subagentsRefreshError).toBe('x');
+
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const unchanged = reduceLocal(s, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'subagents', tabId: 'ghost-tab' } });
+      expect(unchanged).toBe(s);
+      expect(warn).toHaveBeenCalled();
+      warn.mockRestore();
+
+      s = reduceLocal(s, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'subagents', tabId } });
+      expect(s.tabs[tabId]?.subagentsRefreshError).toBeUndefined();
+      expect(s.tabs[tabId]?.subagents).toEqual({ status: 'success', data: { delegations: [] } }); // RemoteData untouched
+    });
+  });
+});
+
 describe('transcript reducer — W4 §2d: tab.bound / tab.error fold into the NAMED tab, drop-unknown otherwise', () => {
   it('tab.bound sets sessionId/binding/title/rootId on the named tab', () => {
     const state = reduce(INITIAL_STATE, {
@@ -963,6 +1239,52 @@ describe('transcript reducer — W4 §2d: tab.bound / tab.error fold into the NA
       kind: 'open-failed',
     });
     expect(activeTab(state).error).toEqual({ message: 'session/new rejected', kind: 'open-failed' });
+  });
+});
+
+describe('transcript reducer — TI-1 (AU-39): pendingSessionLoad clears on the SAME tab\'s tab.bound/tab.error', () => {
+  it('local.sessionLoad.start marks a row loading', () => {
+    const state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    expect(state.pendingSessionLoad).toEqual({ tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1' });
+  });
+
+  it('a tab.bound for the SAME tabId clears it — the committed load resolved', () => {
+    let state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    state = reduce(state, { type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1', rootId: '/r' });
+    expect(state.pendingSessionLoad).toBeUndefined();
+  });
+
+  it('a tab.error for the SAME tabId clears it — the committed load failed (protocol\'s tab.error carries no sessionId, so this matches on tabId alone)', () => {
+    let state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    state = reduce(state, { type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, message: 'nope', kind: 'open-failed' });
+    expect(state.pendingSessionLoad).toBeUndefined();
+  });
+
+  it('P-1 isolation: a tab.bound/tab.error for a DIFFERENT tab leaves an in-flight load on the ORIGINAL tab untouched', () => {
+    let state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    state = reduceLocal(state, { type: 'local.tab.open', tabId: 'tab-b' });
+
+    state = reduce(state, { type: 'tab.bound', tabId: 'tab-b', sessionId: 'sB', rootId: '/r' });
+    expect(state.pendingSessionLoad).toEqual({ tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1' });
+
+    state = reduce(state, { type: 'tab.error', tabId: 'tab-b', message: 'nope', kind: 'open-failed' });
+    expect(state.pendingSessionLoad).toEqual({ tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1' });
   });
 });
 

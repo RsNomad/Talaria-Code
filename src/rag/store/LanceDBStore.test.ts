@@ -43,6 +43,11 @@ function makeChain(resolveRows: () => Promise<unknown[]>): FakeQueryChain {
   return chain;
 }
 
+// TA-1 (AU-1): every column `LanceDBStore.init()`'s self-heal check
+// requires present on a HEALTHY table — see `REQUIRED_COLUMNS` in
+// `LanceDBStore.ts`. Kept in sync manually (small, stable, closed list).
+const HEALTHY_SCHEMA_FIELD_NAMES = ['id', 'path', 'startLine', 'endLine', 'content', 'language', 'contentHash', 'vector'];
+
 interface FakeTable {
   query: () => {
     nearestTo: (vector: number[]) => FakeQueryChain;
@@ -50,6 +55,7 @@ interface FakeTable {
   };
   createIndex: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
+  schema: ReturnType<typeof vi.fn>;
 }
 
 function makeFakeTable(opts: {
@@ -63,6 +69,10 @@ function makeFakeTable(opts: {
     }),
     createIndex: vi.fn(async () => {}),
     close: vi.fn(),
+    // TA-1: a HEALTHY table by default — these tests exercise hybridSearch/
+    // close behavior, not the schema self-heal, so `init()` must never drop
+    // this fake table out from under them.
+    schema: vi.fn(async () => ({ fields: HEALTHY_SCHEMA_FIELD_NAMES.map((name) => ({ name })) })),
   };
 }
 
@@ -70,6 +80,11 @@ function makeFakeDb(table: FakeTable) {
   return {
     openTable: vi.fn(async () => table),
     createTable: vi.fn(),
+    // TA-4 (AU-22 routed review finding): a no-op default so the self-heal
+    // block's `await this.db.dropTable(...)` call has somewhere to land in
+    // suites that don't otherwise exercise it; overridden per-test below to
+    // simulate a drop failure.
+    dropTable: vi.fn(async () => undefined),
     close: vi.fn(),
   };
 }
@@ -186,8 +201,14 @@ describe('LanceDBStore.hybridSearch — CF-04 lazy openTable + honest not-ready'
     ];
     const table = makeFakeTable({ vecRows: async () => vecRows, ftsRows: async () => [] });
     const db = {
-      // init() finds no table yet (first-ever run, index not built)...
-      openTable: vi.fn().mockRejectedValueOnce(new Error('table not found')).mockResolvedValueOnce(table),
+      // init() finds no table yet (first-ever run, index not built) —
+      // TA-4 (AU-22): message must match the real not-found shape
+      // (`isTableNotFoundError`, pinned against the installed package in
+      // `LanceDBStore.schema.test.ts`) or `openTableIfExists` now rethrows.
+      openTable: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("Table 'chunks' was not found"))
+        .mockResolvedValueOnce(table),
       createTable: vi.fn(),
       close: vi.fn(),
     };
@@ -205,7 +226,8 @@ describe('LanceDBStore.hybridSearch — CF-04 lazy openTable + honest not-ready'
 
   it('throws IndexNotReadyError (not a silent empty array) when the table still does not exist after the retry', async () => {
     const db = {
-      openTable: vi.fn().mockRejectedValue(new Error('table not found')),
+      // TA-4 (AU-22): real not-found shape — see comment above.
+      openTable: vi.fn().mockRejectedValue(new Error("Table 'chunks' was not found")),
       createTable: vi.fn(),
       close: vi.fn(),
     };
@@ -220,7 +242,8 @@ describe('LanceDBStore.hybridSearch — CF-04 lazy openTable + honest not-ready'
 
   it('does not hammer openTable on repeated queries while the table remains missing (bounded retry)', async () => {
     const db = {
-      openTable: vi.fn().mockRejectedValue(new Error('table not found')),
+      // TA-4 (AU-22): real not-found shape — see comment above.
+      openTable: vi.fn().mockRejectedValue(new Error("Table 'chunks' was not found")),
       createTable: vi.fn(),
       close: vi.fn(),
     };
@@ -281,5 +304,54 @@ describe('LanceDBStore.close — RAG-3', () => {
 
     await expect(store.close()).resolves.toBeUndefined();
     errSpy.mockRestore();
+  });
+});
+
+/**
+ * TA-4 (AU-22) Rev-2 (overrides the Rev-1/routed-review "degrade, don't
+ * abort" decision, INV-4-grounded): a self-heal probe/drop RPC failure
+ * (`await this.table.schema()` / `await this.db.dropTable(...)`) must now
+ * RETHROW from `init()`, not swallow. Swallowing let the indexer's
+ * `ensureStoreInitialized` memoize a "successful" init over a table that is
+ * STILL malformed, so it never retried the heal — stuck forever, worse than
+ * the old bricked-table symptom it was meant to fix. Rethrowing makes
+ * `init()` reject, which clears that memo on the next build's
+ * `ensureStoreInitialized` call; the next build retries `init()`, retries
+ * the heal, and self-heals once the transient blocker (permission/disk/
+ * lock) clears. `this.table` is left exactly as `openTableIfExists()` found
+ * it in both sub-cases reached by this catch — the `schema()`-throws
+ * sub-case (we don't yet know if the table is malformed) and the
+ * `dropTable()`-throws sub-case (we DO know it's malformed but couldn't
+ * remove it) — never forced to `undefined` here: a later `upsert()` would
+ * otherwise `createTable` OVER the still-on-disk table dir, AU-22 reborn.
+ */
+describe('LanceDBStore.init — TA-4 Rev-2: self-heal probe/drop failure rethrows from init()', () => {
+  beforeEach(() => {
+    connectMock.mockReset();
+  });
+
+  it('rejects with a status-only message when the self-heal schema() probe itself throws', async () => {
+    const table = makeFakeTable({ vecRows: async () => [], ftsRows: async () => [] });
+    table.schema.mockRejectedValue(new Error('EACCES: permission denied'));
+    const db = makeFakeDb(table);
+    connectMock.mockResolvedValue(db);
+
+    const store = new LanceDBStore('/fake/index/dir');
+
+    await expect(store.init()).rejects.toThrow(/failed to reset malformed/i);
+  });
+
+  it('rejects with a status-only message when dropTable() throws after the probe finds a missing column', async () => {
+    const table = makeFakeTable({ vecRows: async () => [], ftsRows: async () => [] });
+    // Missing required columns (only 'id' present) — the probe finds
+    // something to repair and attempts the drop.
+    table.schema.mockResolvedValue({ fields: [{ name: 'id' }] });
+    const db = makeFakeDb(table);
+    db.dropTable.mockRejectedValue(new Error('disk error: EIO'));
+    connectMock.mockResolvedValue(db);
+
+    const store = new LanceDBStore('/fake/index/dir');
+
+    await expect(store.init()).rejects.toThrow(/failed to reset malformed/i);
   });
 });

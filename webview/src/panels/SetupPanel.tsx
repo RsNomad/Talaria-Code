@@ -21,7 +21,7 @@
  * `!trusted` disables every mutating control via `mutationDisabledReason`
  * (setupCards.ts) — same reason text everywhere, never color alone.
  */
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type {
   NextEditToggleSource,
   NextEditToggleState,
@@ -97,6 +97,7 @@ import {
   PIPX_INSTALL_DOCS_URL,
   progressKey,
   providerDoneLine,
+  PROVIDER_RECHECK_CAPTION,
   PYTHON_VERSION_HELP_URL,
   pullPercent,
   RAG_APPLY_NUDGE,
@@ -160,6 +161,41 @@ export function SetupPanel({ data, onRetry, progress, nextEdit, onToggleNextEdit
   );
 }
 
+/** beta.7 B2: one "Set up →" click's expand request. `seq` makes every
+ *  click distinct so re-jumping to the same card re-fires. */
+interface JumpSignal {
+  cardId: string;
+  seq: number;
+}
+
+/** beta.7 B2: expand-on-jump. Effect 1 opens the section the moment a NEW
+ *  signal names `cardId`; effect 2 — which can only run AFTER the expand's
+ *  own commit (`isOpen` true) — scrolls the toggle into view and focuses it
+ *  (preventScroll so focus doesn't cancel the smooth scroll). Two effects,
+ *  not one: the DOM the scroll lands on only exists after the first commit. */
+function useExpandOnJump(
+  jump: JumpSignal | undefined,
+  cardId: string,
+  isOpen: boolean,
+  expand: () => void,
+  toggleRef: RefObject<HTMLButtonElement | null>,
+): void {
+  const [pendingSeq, setPendingSeq] = useState(0);
+  const handledSeq = useRef(0);
+  useEffect(() => {
+    if (!jump || jump.cardId !== cardId || jump.seq === handledSeq.current) return;
+    handledSeq.current = jump.seq;
+    expand();
+    setPendingSeq(jump.seq);
+  }, [jump, cardId, expand]);
+  useEffect(() => {
+    if (pendingSeq === 0 || !isOpen) return;
+    setPendingSeq(0);
+    toggleRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    toggleRef.current?.focus({ preventScroll: true });
+  }, [pendingSeq, isOpen, toggleRef]);
+}
+
 function SetupCards({
   setup,
   progress,
@@ -174,6 +210,8 @@ function SetupCards({
   dispatch: SetupPanelProps['dispatch'];
 }) {
   const disabledReason = mutationDisabledReason(setup.trusted);
+  const [jump, setJump] = useState<JumpSignal | undefined>(undefined);
+  const requestJump = (cardId: string) => setJump((prev) => ({ cardId, seq: (prev?.seq ?? 0) + 1 }));
 
   return (
     <>
@@ -209,8 +247,8 @@ function SetupCards({
         </div>
       )}
 
-      <RecommendationsBlock setup={setup} />
-      <AgentCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      <RecommendationsBlock setup={setup} onJump={requestJump} />
+      <AgentCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} jump={jump} />
       <ProviderCard setup={setup} dispatch={dispatch} disabledReason={disabledReason} />
       <FimCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
       <NextEditCard
@@ -220,8 +258,9 @@ function SetupCards({
         onToggleNextEdit={onToggleNextEdit}
         dispatch={dispatch}
         disabledReason={disabledReason}
+        jump={jump}
       />
-      <RagCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      <RagCard setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} jump={jump} />
     </>
   );
 }
@@ -296,6 +335,13 @@ function DoneLine({ text, className = 'mt-1' }: { text: string; className?: stri
  * confirmation modal, T2/§2.2.4) renders NEITHER success nor failure — the
  * C-2 lock — regardless of whether `successLabel` was given. A rejection
  * always renders the `✗ ${message}` failure line.
+ *
+ * AU-44a: `pendingLabel`, when given, replaces the generic "Working…" text
+ * while `pending` is true — two buttons on the same screen (e.g. an install
+ * action beside its neighboring Re-check) could otherwise BOTH read the
+ * identical generic "Working…" with no way to tell which is in flight.
+ * OPTIONAL — omitted, the default "Working…" renders exactly as before (any
+ * unmigrated caller degrades gracefully).
  */
 function ActionButton({
   label,
@@ -304,6 +350,7 @@ function ActionButton({
   tone = 'neutral',
   icon,
   successLabel,
+  pendingLabel,
 }: {
   label: string;
   onRun: () => Promise<unknown>;
@@ -311,6 +358,7 @@ function ActionButton({
   tone?: Tone;
   icon?: string;
   successLabel?: string;
+  pendingLabel?: string;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
@@ -363,7 +411,7 @@ function ActionButton({
         className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide transition-colors aria-disabled:cursor-default aria-disabled:opacity-50 disabled:cursor-not-allowed disabled:opacity-50 ${toneClass}`}
       >
         {icon && <Icon name={icon} size={12} spin={pending} />}
-        {pending ? 'Working…' : label}
+        {pending ? (pendingLabel ?? 'Working…') : label}
       </button>
       <LiveRegion text={liveText} className={liveClass} title={error} />
     </div>
@@ -467,10 +515,12 @@ const RECS_METER_SEGMENT_CLASS: Record<'agent' | 'fim' | 'embedding', string> = 
 };
 
 /**
- * B-F6 — the recs strip's `Set up →` jump: IN-PANEL ONLY. Scrolls the
- * owning card's `<section id={cardId}>` into view and moves focus to its
- * heading (`${cardId}-heading`, `tabIndex={-1}` via `SectionLabel`/`Card`).
- * NO dispatch, no expand — the four target cards have no collapsed state.
+ * B-F6 — the recs strip's `Set up →` jump for the FIM row: IN-PANEL ONLY.
+ * Scrolls the owning card's `<section id={cardId}>` into view and moves
+ * focus to its heading (`${cardId}-heading`, `tabIndex={-1}` via
+ * `SectionLabel`/`Card`). NO dispatch, no expand — the FIM card's picker
+ * has no collapsed state to expand (beta.7 B2: the other three roles route
+ * through `useExpandOnJump` instead, via `onJump`/`RecRoleLine`).
  */
 function jumpToCard(cardId: string): void {
   const section = document.getElementById(cardId);
@@ -478,7 +528,7 @@ function jumpToCard(cardId: string): void {
   document.getElementById(`${cardId}-heading`)?.focus();
 }
 
-function RecommendationsBlock({ setup }: { setup: SetupData }) {
+function RecommendationsBlock({ setup, onJump }: { setup: SetupData; onJump: (cardId: string) => void }) {
   const recs = deriveRecommendations(setup);
   if (!recs) return null;
 
@@ -486,10 +536,10 @@ function RecommendationsBlock({ setup }: { setup: SetupData }) {
     <Card title={RECS_STRIP_HEADING}>
       <p className="mb-2 text-2xs text-muted">{RECS_STRIP_INTRO}</p>
       <div className="mb-2.5 flex flex-col gap-2">
-        <RecRoleLine rec={recs.agent} />
-        <RecRoleLine rec={recs.fim} />
-        <RecRoleLine rec={recs.embedding} />
-        <RecRoleLine rec={recs.next} />
+        <RecRoleLine rec={recs.agent} onJump={onJump} />
+        <RecRoleLine rec={recs.fim} onJump={onJump} />
+        <RecRoleLine rec={recs.embedding} onJump={onJump} />
+        <RecRoleLine rec={recs.next} onJump={onJump} />
       </div>
       <p className="mb-1.5 text-2xs text-fg">{stackLineText(recs.agent, recs.fim, recs.embedding, recs.stack)}</p>
       {/* B-F1/§3.5 signature element: a single segmented bar sharing the
@@ -531,7 +581,7 @@ function RecommendationsBlock({ setup }: { setup: SetupData }) {
  * never restated) — the strip must never claim "recommended" for an
  * unpinned model.
  */
-function RecRoleLine({ rec }: { rec: RoleRec }) {
+function RecRoleLine({ rec, onJump }: { rec: RoleRec; onJump: (cardId: string) => void }) {
   const caption = divergenceCaptionText(rec);
   const showDefaultChip = rec.nextReady === undefined || rec.nextReady === true;
 
@@ -550,7 +600,7 @@ function RecRoleLine({ rec }: { rec: RoleRec }) {
       <button
         type="button"
         aria-label={`Set up → ${RECS_ROLE_LABEL[rec.role]} card`}
-        onClick={() => jumpToCard(rec.cardId)}
+        onClick={() => (rec.role === 'fim' ? jumpToCard(rec.cardId) : onJump(rec.cardId))}
         className="self-start font-mono text-2xs text-accent hover:underline"
       >
         Set up →
@@ -568,11 +618,13 @@ function AgentCard({
   progress,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const agent = setup.agent;
   const action = agentPrimaryAction(agent.phase);
@@ -648,20 +700,37 @@ function AgentCard({
         // ALSO render.
         <div className="mt-1 flex flex-col gap-1.5">
           {agent.bootstrap?.guidance && <p className="text-2xs text-muted">{agent.bootstrap.guidance}</p>}
-          <div className="flex flex-wrap items-center gap-2">
-            {agent.bootstrap?.command ? (
-              <ActionButton
-                label={`Open terminal: ${agent.bootstrap.command}`}
-                onRun={() => dispatch('setup.openBootstrapTerminal')}
-                disabledReason={disabledReason}
-              />
-            ) : (
+          {agent.bootstrap?.command ? (
+            <div className="flex flex-col gap-1.5">
+              {/* AU-44b: the raw command used to be interpolated INSIDE the
+                  uppercase button label (`Open terminal: ${command}`) — the
+                  `uppercase` CSS class then rendered a case-sensitive shell
+                  command in all-caps, both hard to read and actively
+                  misleading (the real command isn't upper-case). The label
+                  is now the ACTION; the command renders as its own mono
+                  caption underneath, exactly as typed — mirrors the
+                  llama.cpp install button (`localModel.tsx`). */}
+              <div className="flex flex-wrap items-center gap-2">
+                <ActionButton
+                  label="Open terminal"
+                  pendingLabel="Installing…"
+                  onRun={() => dispatch('setup.openBootstrapTerminal')}
+                  disabledReason={disabledReason}
+                />
+                <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
+              </div>
+              <p className="font-mono text-2xs text-muted" title={agent.bootstrap.command}>
+                {agent.bootstrap.command}
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
               <a href={PIPX_INSTALL_DOCS_URL} className="text-2xs text-accent underline" target="_blank" rel="noreferrer">
                 pipx install docs
               </a>
-            )}
-            <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
-          </div>
+              <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck')} />
+            </div>
+          )}
         </div>
       )}
       {agent.phase === 'python-unsuitable' && (
@@ -677,11 +746,20 @@ function AgentCard({
           {agent.pythonInstall?.kind === 'command' ? (
             <>
               {agent.detail && <p className="text-2xs text-muted">{agent.detail}</p>}
+              {/* AU-44b: mirrors the pipx-bootstrap terminal button above and
+                  the llama.cpp install button (`localModel.tsx`) — the label
+                  is the ACTION ("Open terminal"), the raw shell command
+                  renders as its own mono caption, never uppercased inside
+                  the label. */}
               <ActionButton
-                label={`Open terminal: ${agent.pythonInstall.command}`}
+                label="Open terminal"
+                pendingLabel="Installing…"
                 onRun={() => dispatch('setup.openBootstrapTerminal', { target: 'python' })}
                 disabledReason={disabledReason}
               />
+              <p className="font-mono text-2xs text-muted" title={agent.pythonInstall.command}>
+                {agent.pythonInstall.command}
+              </p>
             </>
           ) : (
             <>
@@ -714,6 +792,8 @@ function AgentCard({
             <ActionButton
               label="Copy log"
               icon="copy"
+              pendingLabel="Copying…"
+              successLabel="✓ Copied"
               onRun={() => navigator.clipboard.writeText(buildCopyLogText(agent.detail, logTail))}
             />
           </div>
@@ -750,7 +830,13 @@ function AgentCard({
         </details>
       )}
 
-      <AgentLocalModelSection setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      <AgentLocalModelSection
+        setup={setup}
+        progress={progress}
+        dispatch={dispatch}
+        disabledReason={disabledReason}
+        jump={jump}
+      />
     </Card>
   );
 }
@@ -775,11 +861,13 @@ function AgentLocalModelSection({
   progress,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const local = setup.agentLocalModel;
   const saved = local?.saved;
@@ -793,6 +881,10 @@ function AgentLocalModelSection({
   // queries (and cost renders) while contributing nothing.
   const [open, setOpen] = useState(false);
   const [changing, setChanging] = useState(false);
+  // beta.7 B2: the recs strip's "Set up →" jump expands this section and
+  // focuses this toggle — see `useExpandOnJump`.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  useExpandOnJump(jump, 'setup-card-agent', open, () => setOpen(true), toggleRef);
 
   // A-F8 — THE ONE preselect rule (`catalogPreselectId`): `saved.modelId`
   // when a save exists, else the `defaultForRole` row. Reconciled while
@@ -847,6 +939,7 @@ function AgentLocalModelSection({
     <div className="mt-3 border-t border-border pt-2">
       <button
         type="button"
+        ref={toggleRef}
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
         className="inline-flex items-center gap-1.5 rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
@@ -927,8 +1020,14 @@ function AgentLocalModelSection({
             />
 
             {/* The Ollama pane has no in-block Test (§4.1) — same surface-level
-                Test + Serving line the FIM ollama pane carries (T10 Minor #4). */}
-            {backend === 'ollama' && <TestAndServingLine backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
+                Test + Serving line the FIM ollama pane carries (T10 Minor #4).
+                AU-43: `key={ep.value}` remounts on an endpoint edit (the
+                existing T9/M-1 idiom, `localModel.tsx`'s own pane-switch call
+                site) so `TestAndServingLine`'s local `servingModels` state
+                doesn't survive to describe a daemon the field no longer
+                points at — the backend is fixed here, so keying on the
+                endpoint alone is correct. */}
+            {backend === 'ollama' && <TestAndServingLine key={ep.value} backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
 
             {sel.id !== undefined && (
               <div>
@@ -988,6 +1087,20 @@ function ProviderCard({
             disabledReason={disabledReason}
             tone="accent"
           />
+        </div>
+      )}
+      {provider.phase !== 'waiting-agent' && (
+        <div className="mt-2 flex flex-col gap-1.5">
+          <p className="text-2xs text-faint">{PROVIDER_RECHECK_CAPTION}</p>
+          <div>
+            <ActionButton
+              label="Re-check provider"
+              icon="refresh"
+              successLabel="Reconnected"
+              onRun={() => dispatch('setup.reconnectAgent')}
+              disabledReason={disabledReason}
+            />
+          </div>
         </div>
       )}
     </Card>
@@ -1240,6 +1353,7 @@ function FimConnectTab({
       <div className="flex gap-2">
         <ActionButton
           label={testConnectionLabel(endpoint)}
+          pendingLabel="Testing…"
           onRun={() => dispatch('setup.testRemote', { backendId: option.id, endpoint })}
           successLabel="✓ Endpoint reachable"
         />
@@ -1425,6 +1539,7 @@ function OllamaInstallPanel({
       <div>
         <ActionButton
           label={testConnectionLabel(endpoint)}
+          pendingLabel="Testing…"
           icon="plug"
           onRun={() => dispatch('setup.testRemote', { backendId: 'ollama', endpoint })}
           successLabel="✓ Endpoint reachable"
@@ -1625,6 +1740,7 @@ function NextEditCard({
   onToggleNextEdit,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
@@ -1632,6 +1748,7 @@ function NextEditCard({
   onToggleNextEdit: SetupPanelProps['onToggleNextEdit'];
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const [showForm, setShowForm] = useState(false);
   const next = setup.nextEdit;
@@ -1641,6 +1758,10 @@ function NextEditCard({
   // otherwise enable dedicated NEXT without ever seeing it (it used to live
   // only inside the collapsed form).
   const showWarning = next.dedicated !== undefined && (nextEdit.next || showForm);
+  // beta.7 B2: the recs strip's "Set up →" jump expands this form and
+  // focuses this toggle — see `useExpandOnJump`.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  useExpandOnJump(jump, 'setup-card-next', showForm, () => setShowForm(true), toggleRef);
 
   return (
     <Card title="Next Edit (NEXT)" id="setup-card-next">
@@ -1682,6 +1803,8 @@ function NextEditCard({
 
       <button
         type="button"
+        ref={toggleRef}
+        aria-expanded={showForm}
         onClick={() => setShowForm((s) => !s)}
         className="rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
       >
@@ -1895,6 +2018,8 @@ function DedicatedNextForm({
                 <ActionButton
                   label="Copy"
                   icon="copy"
+                  pendingLabel="Copying…"
+                  successLabel="✓ Copied"
                   onRun={() => navigator.clipboard.writeText(guided.command.replace(/^Run:\s*/, ''))}
                 />
               </div>
@@ -1911,6 +2036,7 @@ function DedicatedNextForm({
             {!isLlamacppPane && (
               <ActionButton
                 label={testConnectionLabel(endpoint)}
+                pendingLabel="Testing…"
                 onRun={() => dispatch('setup.testRemote', { backendId: selected?.id, endpoint })}
                 successLabel="✓ Endpoint reachable"
               />
@@ -1948,11 +2074,13 @@ function RagCard({
   progress,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const rag = setup.rag;
   // T14 (§3.4): presence of the CONFIGURED embed model, endpoint-scoped
@@ -2009,7 +2137,13 @@ function RagCard({
         )}
       </div>
 
-      <RagEmbedSection setup={setup} progress={progress} dispatch={dispatch} disabledReason={disabledReason} />
+      <RagEmbedSection
+        setup={setup}
+        progress={progress}
+        dispatch={dispatch}
+        disabledReason={disabledReason}
+        jump={jump}
+      />
 
       <details className="mt-2">
         <summary className="cursor-pointer text-2xs text-muted">Advanced</summary>
@@ -2057,16 +2191,22 @@ function RagEmbedSection({
   progress,
   dispatch,
   disabledReason,
+  jump,
 }: {
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
   disabledReason?: string;
+  jump?: JumpSignal;
 }) {
   const rag = setup.rag;
   const embedModels = (setup.catalog?.models ?? []).filter((m) => m.role === 'embedding');
   const [open, setOpen] = useState(false);
   const [pane, setPane] = useState<RagEmbedBackend>(() => ragInitialBackend(rag));
+  // beta.7 B2: the recs strip's "Set up →" jump expands this section and
+  // focuses this toggle — see `useExpandOnJump`.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  useExpandOnJump(jump, 'setup-card-embedding', open, () => setOpen(true), toggleRef);
 
   // beta.6 panel-fix PT5 (audit A5, C2-5): endpoint init is PER-PANE —
   // the SAVED `embedEndpoint` when this pane IS the saved backend, that
@@ -2124,6 +2264,7 @@ function RagEmbedSection({
     <div className="mt-2 border-t border-border pt-2">
       <button
         type="button"
+        ref={toggleRef}
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
         className="inline-flex items-center gap-1.5 rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
@@ -2227,8 +2368,10 @@ function RagEmbedSection({
 
           {/* The Ollama pane has no in-block Test (§4.1) — the same
               surface-level Test + Serving line the FIM/Agent ollama panes
-              carry (T10 Minor #4; one Test per pane, T13 note 2). */}
-          {pane === 'ollama' && <TestAndServingLine backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
+              carry (T10 Minor #4; one Test per pane, T13 note 2). AU-43:
+              `key={ep.value}` — same remount-on-endpoint-edit idiom as the
+              Agent Ollama surface above. */}
+          {pane === 'ollama' && <TestAndServingLine key={ep.value} backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
 
           <div>
             <ActionButton

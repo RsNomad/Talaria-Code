@@ -25,6 +25,7 @@ describe('loadTabMessage', () => {
       tabId: 'tab-2',
       sessionId: 'sess-9',
       cwd: '/repo',
+      title: 'Fix the bug',
     });
   });
 
@@ -35,7 +36,12 @@ describe('loadTabMessage', () => {
   it('never carries a session.load-shaped payload (no stray sessionId/cwd-only object)', () => {
     const msg = loadTabMessage('tab-1', session());
     expect(msg.type).toBe('tab.load');
-    expect(Object.keys(msg).sort()).toEqual(['cwd', 'sessionId', 'tabId', 'type']);
+    expect(Object.keys(msg).sort()).toEqual(['cwd', 'sessionId', 'tabId', 'title', 'type']);
+  });
+
+  it('an untitled session sends the SAME fallback label the row displays', () => {
+    const msg = loadTabMessage('tab-1', session({ title: undefined }));
+    expect(msg.title).toBe('Untitled session');
   });
 });
 

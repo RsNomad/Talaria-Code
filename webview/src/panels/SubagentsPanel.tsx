@@ -52,7 +52,11 @@ interface SubagentsPanelProps {
 
 export function SubagentsPanel({ data }: SubagentsPanelProps) {
   if (data.delegations.length === 0) {
-    return <EmptyPanel hint="No delegations yet — they appear here when Talaria delegates a task." />;
+    return (
+      <PanelShell title="Subagents">
+        <EmptyPanel hint="No delegations yet — they appear here when Talaria delegates a task." />
+      </PanelShell>
+    );
   }
 
   return (

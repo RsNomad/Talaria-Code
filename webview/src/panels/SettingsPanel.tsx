@@ -27,7 +27,7 @@ import type { SettingsData, SettingField } from '../protocol';
 import { LiveRegion } from '../components/LiveRegion';
 import { Toggle } from '../components/Toggle';
 import type { RemoteData } from '../state/remoteData';
-import { PanelShell, RemotePanel, SectionLabel } from './PanelShell';
+import { PanelShell, RemotePanel, SectionLabel, type RefreshErrorBanner } from './PanelShell';
 import { commitFieldEdit, initFieldEditState, reconcileFieldEditState, type FieldValue } from './settingsField';
 
 interface SettingsPanelProps {
@@ -50,6 +50,16 @@ interface SettingsPanelProps {
   onRetryConfig: () => void;
   /** Persist a config edit (correlated → resolves ok / rejects). */
   onSetConfig: (key: string, value: FieldValue) => Promise<unknown>;
+  /**
+   * TI-3 (AU-42 Part B): forwarded straight through to this panel's own
+   * internal `RemotePanel` gate below — `settings` is one of the five
+   * map-keyed global panels this task's refresh-failure banner covers
+   * (`state/panels.ts`'s `RefreshErrorPanel`), but unlike
+   * tools/mcp/skills/models it is never wrapped by App.tsx's EXTERNAL
+   * `RemotePanel` (see the module doc's F-7 note), so App.tsx hands it down
+   * as a plain prop instead.
+   */
+  refreshError?: RefreshErrorBanner;
 }
 
 function FieldRow({
@@ -141,9 +151,20 @@ function FieldRow({
   );
 }
 
-export function SettingsPanel({ config, onRetryConfig, onSetConfig }: SettingsPanelProps) {
+export function SettingsPanel({ config, onRetryConfig, onSetConfig, refreshError }: SettingsPanelProps) {
   return (
-    <PanelShell title="Agent config">
+    <PanelShell title="Agent config" meta="read-only">
+      {/* beta.7 C2: this panel's data is Hermes' `config.show` — a
+          pre-stringified display dump (`tui_gateway/server.py:13400-13434`;
+          `reshapeConfigShow` at `reshapePanelData.ts:519-533` deliberately
+          types every field `'string'`), so every `FieldRow` below falls to
+          the plain-span branch: functionally read-only, but visually a
+          settings editor. The caption sits OUTSIDE/ABOVE the `RemotePanel`
+          gate so it stays visible even while the config is loading or
+          errored — it describes the panel, not the resolved data. */}
+      <p className="mb-2 px-1 text-2xs leading-snug text-faint">
+        Read-only mirror of the Hermes agent&rsquo;s config.yaml — values can&rsquo;t be edited here yet.
+      </p>
       {/* Task 12 (§5.1/§5.2): this panel now holds Hermes agent-runtime
           config.yaml sections ONLY — the «Next Edit Suggestions» rows that
           used to render here (unconditionally, ahead of this gate, because
@@ -160,7 +181,7 @@ export function SettingsPanel({ config, onRetryConfig, onSetConfig }: SettingsPa
           (Part X2): deliberately NOT a second, hand-rolled loading/error
           path, so there is still exactly one place in the app that decides
           what an unresolved panel looks like. */}
-      <RemotePanel remote={config} loadingHint="Loading settings…" onRetry={onRetryConfig}>
+      <RemotePanel remote={config} loadingHint="Loading settings…" onRetry={onRetryConfig} refreshError={refreshError}>
         {(data) =>
           data.sections.map((section) => (
             <div key={section.name}>

@@ -1,5 +1,6 @@
 import type { ChunkWithoutHeader, SyntaxNodeLike } from './types';
 import { estimateTokenCount } from './tokenEstimate';
+import { chunkByLines } from './lineWindowChunker';
 
 /**
  * AST-aware chunking — a synchronous, dependency-free port of Continue.dev's
@@ -70,7 +71,12 @@ function collapseChildren(
     removedChild = true;
     const childCode = collapsedChildren.pop() as string;
     const index = working.lastIndexOf(childCode);
-    if (index > 0) {
+    // AU-36:R12 — a match at offset 0 (`working.lastIndexOf` returns `0`)
+    // is a legitimate find; `index > 0` silently skipped it (0 is not
+    // `> 0`), leaving that collapsed child un-trimmed even though it was
+    // located and needed removing. `-1` (genuinely not found) is the only
+    // value that must be excluded.
+    if (index >= 0) {
       working = working.slice(0, index) + working.slice(index + childCode.length);
     }
   }
@@ -204,7 +210,13 @@ function maybeYieldChunk(
   root: boolean,
 ): ChunkWithoutHeader | undefined {
   if (root || node.type in collapsedNodeConstructors) {
-    if (estimateTokenCount(node.text) < maxChunkTokens) {
+    // AU-36:R15 — every other "does this fit the budget" comparison in this
+    // file (`collapseChildren`'s trim-loop condition, every fallback in
+    // `constructFunctionDefinitionChunk`) uses `<=` — a node whose estimate
+    // lands EXACTLY on `maxChunkTokens` fits. This check used a strict `<`,
+    // refusing that same boundary node a whole-node chunk for no reason
+    // consistent with the rest of the module.
+    if (estimateTokenCount(node.text) <= maxChunkTokens) {
       return {
         content: node.text,
         startLine: node.startPosition.row,
@@ -253,13 +265,66 @@ function* smartCollapsedChunks(
  * Chunks one already-parsed AST (`rootNode`) into retrieval units at
  * function/class granularity, collapsing oversized nodes and recursing into
  * their children.
+ *
+ * AU-36:R8 — when the root doesn't fit whole and isn't itself a
+ * function/class node, `smartCollapsedChunks` used to walk straight into
+ * `rootNode.children` and yield only from the ones that are (or contain) a
+ * captured function/class node. Every OTHER top-level child — imports,
+ * module docstrings, top-level constants, and any blank/comment stretch
+ * between two functions — is neither `root` (only the true root gets that
+ * check) nor a `collapsedNodeConstructors` type, so nothing was ever
+ * emitted for it or its descendants: that content silently vanished from
+ * every chunk. Below, we walk `rootNode`'s direct children ourselves so we
+ * can tell which ones produced zero chunks of their own, and back-fill
+ * exactly those gaps with `chunkByLines`-derived interstitial chunks (no
+ * `symbolPath` — there's no AST symbol for "the bit between two
+ * functions"), merged back in line order. This keeps the T-B tail
+ * invariant: every source line of a chunked file is covered by at least
+ * one chunk.
  */
 export function chunkAst(
   rootNode: SyntaxNodeLike,
   sourceCode: string,
   maxChunkTokens: number,
 ): ChunkWithoutHeader[] {
-  return [...smartCollapsedChunks(rootNode, sourceCode, maxChunkTokens, true)];
+  const whole = maybeYieldChunk(rootNode, maxChunkTokens, true);
+  if (whole) {
+    return [{ ...whole, symbolPath: buildSymbolPath(rootNode) }];
+  }
+
+  if (rootNode.type in collapsedNodeConstructors) {
+    // The root itself is a function/class node (e.g. a caller chunking a
+    // single already-extracted node) — it has no top-level siblings to
+    // create gaps between, and `collapseChildren`'s string-slicing already
+    // retains every non-collapsed byte of its own span. The plain
+    // recursive walk is correct as-is.
+    return [...smartCollapsedChunks(rootNode, sourceCode, maxChunkTokens, true)];
+  }
+
+  const sourceLines = sourceCode.split('\n');
+  const results: ChunkWithoutHeader[] = [];
+  let coveredThroughRow = -1; // last row already covered by a captured child
+
+  const fillGapThroughRow = (gapEndRow: number): void => {
+    const gapStartRow = coveredThroughRow + 1;
+    if (gapEndRow < gapStartRow) return; // no gap: children were contiguous
+    const gapText = sourceLines.slice(gapStartRow, gapEndRow + 1).join('\n');
+    for (const c of chunkByLines(gapText)) {
+      results.push({ content: c.content, startLine: gapStartRow + c.startLine, endLine: gapStartRow + c.endLine });
+    }
+  };
+
+  for (const child of rootNode.children) {
+    const childChunks = [...smartCollapsedChunks(child, sourceCode, maxChunkTokens, false)];
+    if (childChunks.length === 0) continue; // still an open gap; keep accumulating
+
+    fillGapThroughRow(child.startPosition.row - 1);
+    results.push(...childChunks);
+    coveredThroughRow = Math.max(coveredThroughRow, child.endPosition.row);
+  }
+  fillGapThroughRow(rootNode.endPosition.row);
+
+  return results;
 }
 
 export const AST_FUNCTION_NODE_TYPES = FUNCTION_DECLARATION_NODE_TYPES;

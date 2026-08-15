@@ -120,6 +120,43 @@ function looksBinary(buf: Buffer): boolean {
 }
 
 /**
+ * TA-7 (AU-34) / INV-6: a nested per-directory ignore matcher scoped to
+ * `dirRel` (POSIX-relative to `workspaceRoot`). `matches` is a
+ * `createIgnoreFilter`-produced predicate built from that directory's OWN
+ * `.gitignore`/`.hermesignore` contents.
+ */
+interface NestedIgnoreEntry {
+  dirRel: string;
+  matches: (relToDir: string) => boolean;
+}
+
+/**
+ * Tests `relPosixPath` against every nested matcher whose directory it falls
+ * under, mirroring git's per-directory `.gitignore` scoping: a nested file's
+ * rules govern only paths INSIDE its own directory, tested RELATIVE to that
+ * directory — the `ignore` package's documented relative-path contract
+ * (pinned by `shared/ignoreFilter.test.ts`). `relPosixPath === dirRel` (the
+ * directory entry itself, as seen from its PARENT) is deliberately not
+ * tested against that directory's own matcher — a nested ignore file governs
+ * its directory's contents, not whether the directory itself is excluded
+ * from its parent (that is the parent's/ancestor's/default-excludes' call).
+ * Exact git precedence ACROSS multiple nested files (e.g. a child directory
+ * re-including something an ancestor excluded) is intentionally NOT
+ * replicated — each nested file's rules apply independently (TA-7's
+ * rejected "full git-parity precedence engine" alternative — YAGNI for an
+ * indexer).
+ */
+function matchesNestedIgnore(entries: readonly NestedIgnoreEntry[], relPosixPath: string): boolean {
+  for (const { dirRel, matches } of entries) {
+    if (relPosixPath === dirRel) continue;
+    if (relPosixPath.startsWith(`${dirRel}/`) && matches(relPosixPath.slice(dirRel.length + 1))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Extension-host indexer: owns the workspace walk, file watcher, chunking,
  * embedding calls, and `VectorStore` writes (how-to §6/§7 — "the extension
  * host owns indexing ... the MCP process only queries"). All native/HTTP
@@ -206,6 +243,22 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   // whose own path IS one of the ignore files (see `handleFsEvent`).
   let cachedIgnoreFilter: ((relPosixPath: string) => boolean) | undefined;
 
+  // TA-7 (AU-34) / INV-6: directories (POSIX-relative to `workspaceRoot`,
+  // excluding the root itself) that `walk()` found to contain their own
+  // `.gitignore`/`.hermesignore` during the LAST completed full build.
+  // `loadIgnoreFilter()` re-reads each of these fresh from disk on every
+  // rebuild (same discipline as the root files below), so an EDIT to an
+  // ALREADY-known nested ignore file is honored immediately on the watch
+  // path — `walk()` itself never relies on this list (it discovers nested
+  // ignore files live, on every full build, independent of what a PRIOR
+  // build knew). A nested ignore file created in a directory NOT yet in
+  // this list only takes effect starting with the NEXT full build (bounded
+  // staleness — walk() will discover it then); this is the documented,
+  // accepted YAGNI-scoped tradeoff (TA-7's rejected "shell out to `git
+  // check-ignore` per event" alternative would close this gap at the cost
+  // of a subprocess per watch event and breaking non-git workspaces).
+  let knownNestedIgnoreDirs: string[] = [];
+
   async function readManifest(): Promise<Record<string, string>> {
     try {
       const raw = await fs.readFile(manifestPath, 'utf8');
@@ -222,7 +275,19 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   const metaPath = path.join(opts.indexDir, 'manifest.meta.json');
 
   interface IndexMeta {
-    schema: 1;
+    /**
+     * TA-1 (AU-1, Critical): bumped 1 -> 2 for the pinned-Arrow-schema +
+     * init-time self-heal fix. A stored sidecar with the pre-bump value
+     * (including a legacy sidecar predating this field's existence, which
+     * `JSON.parse`s to `undefined !== 2`) makes `fingerprintMatches` fail
+     * exactly once, forcing a full recompute of every current path — the
+     * same established `scannerVersion` one-time-full-re-embed precedent
+     * below. This is required, not cosmetic: `LanceDBStore.init()`'s
+     * self-heal drops a legacy language-less table on disk, and without
+     * this bump an intact manifest would keep claiming those paths are
+     * indexed while the recreated table is actually empty.
+     */
+    schema: 2;
     embedModel: string;
     dims: number;
     /**
@@ -263,7 +328,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   }
 
   function currentMeta(): IndexMeta {
-    return { schema: 1, embedModel: opts.embedModel, dims: opts.dims ?? 0, scannerVersion: SCANNER_VERSION };
+    return { schema: 2, embedModel: opts.embedModel, dims: opts.dims ?? 0, scannerVersion: SCANNER_VERSION };
   }
 
   async function readMeta(): Promise<IndexMeta | undefined> {
@@ -277,7 +342,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   function fingerprintMatches(stored: IndexMeta | undefined): boolean {
     const want = currentMeta();
     return (
-      stored?.schema === 1 &&
+      stored?.schema === 2 &&
       stored.embedModel === want.embedModel &&
       stored.dims === want.dims &&
       stored.scannerVersion === want.scannerVersion
@@ -360,9 +425,36 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // optional
     }
     const base = createIgnoreFilter(gitignoreContents, opts.extraIgnoreGlobs ?? []);
+
+    // TA-7 (AU-34) / INV-6: layer in nested per-directory ignore files
+    // discovered during the LAST full build's walk (`knownNestedIgnoreDirs`
+    // above) — re-read fresh from disk on every rebuild of this predicate so
+    // an edit to an already-known nested `.gitignore`/`.hermesignore` is
+    // honored immediately on the watch path (handleFsEvent never calls
+    // walk(), so this is the ONLY place the watch path learns nested rules).
+    const nested: NestedIgnoreEntry[] = [];
+    for (const dirRel of knownNestedIgnoreDirs) {
+      const nestedContents: string[] = [];
+      try {
+        nestedContents.push(await fs.readFile(path.join(opts.workspaceRoot, dirRel, '.gitignore'), 'utf8'));
+      } catch {
+        // deleted since the last build — fall through to .hermesignore/empty.
+      }
+      try {
+        nestedContents.push(
+          await fs.readFile(path.join(opts.workspaceRoot, dirRel, '.hermesignore'), 'utf8'),
+        );
+      } catch {
+        // optional
+      }
+      if (nestedContents.length === 0) continue;
+      nested.push({ dirRel, matches: createIgnoreFilter(nestedContents) });
+    }
+
     // AUDIT-5 ARCH-1: fold the indexDir self-exclusion into the ONE filter
     // both runBuild's walk() and handleFsEvent already share.
-    const filter = (relPosixPath: string): boolean => isUnderIndexDir(relPosixPath) || base(relPosixPath);
+    const filter = (relPosixPath: string): boolean =>
+      isUnderIndexDir(relPosixPath) || base(relPosixPath) || matchesNestedIgnore(nested, relPosixPath);
     cachedIgnoreFilter = filter;
     return filter;
   }
@@ -371,6 +463,8 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     dir: string,
     ignoreFilter: (p: string) => boolean,
     out: string[],
+    ancestors: readonly NestedIgnoreEntry[] = [],
+    discoveredNestedDirs?: string[],
   ): Promise<void> {
     let entries: Dirent[];
     try {
@@ -378,6 +472,35 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     } catch {
       return;
     }
+
+    // TA-7 (AU-34) / INV-6: discover THIS directory's own nested ignore
+    // file(s) fresh, live, on every full build — independent of whatever
+    // `ignoreFilter`'s (possibly stale, prior-build) nested knowledge
+    // already contains, so a brand-new nested `.gitignore` is honored
+    // starting with the VERY build that walks past it. The workspace ROOT
+    // is excluded here: its `.gitignore`/`.hermesignore` are already folded
+    // into `ignoreFilter` via `loadIgnoreFilter()`, so re-reading them here
+    // too would just be a redundant duplicate check.
+    let localAncestors = ancestors;
+    if (dir !== opts.workspaceRoot) {
+      const dirRel = toPosixRelative(path.relative(opts.workspaceRoot, dir));
+      const dirContents: string[] = [];
+      try {
+        dirContents.push(await fs.readFile(path.join(dir, '.gitignore'), 'utf8'));
+      } catch {
+        // no nested .gitignore in this directory.
+      }
+      try {
+        dirContents.push(await fs.readFile(path.join(dir, '.hermesignore'), 'utf8'));
+      } catch {
+        // optional
+      }
+      if (dirContents.length > 0) {
+        localAncestors = [...ancestors, { dirRel, matches: createIgnoreFilter(dirContents) }];
+        discoveredNestedDirs?.push(dirRel);
+      }
+    }
+
     for (const entry of entries) {
       const abs = path.join(dir, entry.name);
       const rel = toPosixRelative(path.relative(opts.workspaceRoot, abs));
@@ -390,9 +513,15 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // for files that pass this path filter — see the `scanSnippetForSecrets`
       // call in `reindexFiles` below, the two layers together now mirror the
       // completion path's path+content gate.
-      if (ignoreFilter(rel) || isSecretForCompletion(rel)) continue;
+      if (
+        ignoreFilter(rel) ||
+        isSecretForCompletion(rel) ||
+        matchesNestedIgnore(localAncestors, rel)
+      ) {
+        continue;
+      }
       if (entry.isDirectory()) {
-        await walk(abs, ignoreFilter, out);
+        await walk(abs, ignoreFilter, out, localAncestors, discoveredNestedDirs);
       } else if (entry.isFile()) {
         out.push(abs);
       }
@@ -441,7 +570,26 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     preloaded?: Map<string, Buffer>,
   ): Promise<number | undefined> {
     await ensureStoreInitialized();
+    // TA-5 (AU-23, Med) / INV-5: `ensureStoreInitialized` above is itself an
+    // await — `dispose()` may have fired while it was pending (this function
+    // is reached both from the watch-path debounce body below and from
+    // `runBuild`, either of which can race a shutdown). Re-check here, at
+    // this function's own entry, so no chunk from `targets` reaches
+    // `store.deleteByPath`/`store.upsert` once disposed.
+    if (disposed) return undefined;
     const pendingRecords: ChunkRecord[] = [];
+    // TA-3 (AU-3, Rev-1 A3) / INV-3: "old rows for a path are deleted only
+    // after their replacement vectors exist." Per-path swap bookkeeping for
+    // the bounded per-BATCH embed-then-swap below: `deleted` flips true the
+    // moment this path's stale rows are actually purged (at most once, at
+    // its FIRST batch); `remaining` counts this path's records not yet
+    // upserted and reaches 0 exactly when every one of its replacement
+    // chunks is safely in the store — that is the ONLY moment
+    // `manifest[relPath]` is written (below). A path that throws mid-swap
+    // (deleted but remaining > 0) is scrubbed from `manifest` in the catch
+    // below instead of being left to claim rows that are gone — HEAD's bug
+    // was exactly that stale claim surviving a partial/transient failure.
+    const pathState = new Map<string, { contentHash: string; remaining: number; deleted: boolean }>();
 
     for (const { readAbsPath, storeRelPath: relPath } of targets) {
       let buf: Buffer;
@@ -451,6 +599,24 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         continue; // deleted between walk and read; the delete pass handles it.
       }
       if (buf.byteLength > MAX_FILE_BYTES || looksBinary(buf)) {
+        // TA-6 (AU-24, Med) / INV-3: at HEAD this `continue` fired BEFORE any
+        // purge — a previously-indexed file that grows past the size cap or
+        // turns binary kept its OLD (now-wrong) chunks in the store, and its
+        // manifest entry kept claiming it indexed, forever. The single-target
+        // watch call has no diff pass to self-heal this the way `runBuild`
+        // does (oversize/binary files simply drop out of `current`, and
+        // `diff.toDelete` purges them there, `:539-549,585-588`). Purge this
+        // path's stale rows and its manifest entry NOW, in the same op as the
+        // bail — idempotent and harmless on the build path too (these rows
+        // would be purged by the diff anyway).
+        await store.deleteByPath(relPath);
+        // TA-5 / INV-5: the purge above is an await — `dispose()` may have
+        // fired while it was in flight. Re-check before the manifest mutation
+        // that follows it (same discipline as every other await-then-mutate
+        // site in this function); bail with no observed width yet, matching
+        // this loop's own entry guard above (`if (disposed) return undefined;`).
+        if (disposed) return undefined;
+        delete manifest[relPath];
         continue;
       }
       const contents = buf.toString('utf8');
@@ -458,7 +624,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       const extension = path.extname(relPath).slice(1);
       const languageId = EXTENSION_TO_LANGUAGE_ID[extension];
 
-      await store.deleteByPath(relPath);
+      // TA-3 (AU-3): no delete here anymore — purging a path's stale rows is
+      // now deferred to the embed-then-swap step below, so they survive
+      // until THIS path's replacement vectors actually exist. HEAD deleted
+      // here, unconditionally, before any embedding was even attempted — a
+      // transient embed failure on a byte-identical watch re-save then left
+      // the rows gone with no replacement and an unchanged manifest hash,
+      // making the file invisible to search forever.
       const chunks = await chunkFile({
         relPath,
         contents,
@@ -468,6 +640,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         maxChunkTokens: opts.maxChunkTokens,
       });
 
+      let recordCount = 0;
       chunks.forEach((chunk, i) => {
         // SEC-1 (audit-3): Layer-2 CONTENT gate, mirroring the completion
         // path. Drop the POSITIVE CHUNK ONLY (not the whole file) so index
@@ -484,33 +657,150 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           endLine: chunk.endLine,
           content: chunk.headeredContent,
           contentHash,
-          language: languageId,
+          // TA-1 (AU-1, Critical): `language` must NEVER be undefined in a
+          // ChunkRecord — an extension with no `EXTENSION_TO_LANGUAGE_ID`
+          // entry (md/json/yml/txt/… — a docs-first repo's FIRST files in
+          // walk order) used to leave every one of its chunks' `language`
+          // undefined. A docs-first first upsert batch, all-undefined, makes
+          // LanceDB's schema INFERENCE at `createTable` drop the `language`
+          // column entirely (V1) — every later real-language upsert then
+          // throws `Found field not in schema: language` and every
+          // `hybridSearch` throws too, forever. `'text'` is also a better
+          // retrieval value than absent: `hybridSearch`'s language filter
+          // and `formatHitAsText`'s fence tag both consume it. Deliberately
+          // `languageId` (the raw, possibly-undefined lookup) rather than a
+          // defaulted variable — `chunkFile`'s `languageId`/`parser`
+          // arguments just above keep their CURRENT semantics (unmapped
+          // extensions still skip AST parsing) unaffected by this default.
+          language: languageId ?? 'text',
           vector: [],
         });
+        recordCount++;
       });
 
-      manifest[relPath] = contentHash;
+      if (recordCount === 0) {
+        // TA-3: no chunk survived the content gate (or the file has no
+        // indexable content) — there is nothing for a future batch to
+        // replace, so this path never enters the deferred swap below. Purge
+        // any stale rows now and record the hash immediately: this mirrors
+        // HEAD's behavior for this exact case (which also never reaches the
+        // embed step, so there is no failure window to protect against).
+        await store.deleteByPath(relPath);
+        manifest[relPath] = contentHash;
+      } else {
+        pathState.set(relPath, { contentHash, remaining: recordCount, deleted: false });
+      }
     }
 
-    // Embed in batches (how-to §2.4: ~64-200 per request) and upsert.
+    // Embed in batches (how-to §2.4: ~64-200 per request); per batch, swap:
+    // a path's stale rows are purged only once ITS replacement vectors exist
+    // (this batch), then the batch is upserted. TA-3 (AU-3, Rev-1 A3):
+    // bounded to ONE batch of pending vectors resident at a time — NOT an
+    // all-batches-first buffer (which would hold every vector in memory,
+    // 300+MB on a large repo).
     let observedWidth: number | undefined;
-    for (let i = 0; i < pendingRecords.length; i += EMBED_BATCH_SIZE) {
-      const batch = pendingRecords.slice(i, i + EMBED_BATCH_SIZE);
-      const vectors = await embedder.embed(
-        batch.map((r) => r.content),
-        expectedWidth,
-      );
-      // Task 14b: record the width of the very first vector this build
-      // actually produced, before any upsert — this is the value the NEXT
-      // build's `computeEffectiveWidth` will enforce.
-      if (observedWidth === undefined) {
-        const first = vectors[0];
-        if (first !== undefined) observedWidth = first.length;
+    try {
+      for (let i = 0; i < pendingRecords.length; i += EMBED_BATCH_SIZE) {
+        const batch = pendingRecords.slice(i, i + EMBED_BATCH_SIZE);
+        const vectors = await embedder.embed(
+          batch.map((r) => r.content),
+          // TA-2 (AU-5, Rev-1 A2) / INV-2 (restated): "one BUILD = one width
+          // once first observed". `expectedWidth` alone is only the width
+          // DECLARED before this build started (`computeEffectiveWidth`) —
+          // when that's undefined (first-ever build, dims=0), every batch used
+          // to be called with `expectedWidth` unchanged, so batch 2 could
+          // return a different-but-internally-consistent width than batch 1
+          // and slip past `embedBatch`'s intra-batch check silently (V2's
+          // corruption). Once batch 1's width has been OBSERVED (below), it
+          // becomes the enforced width for every remaining batch of this same
+          // build — `expectedWidth` (a real caller decision) still wins if the
+          // caller declared one.
+          expectedWidth ?? observedWidth,
+        );
+        // TA-5 (AU-23, Critical remediation) / INV-5: `embedder.embed` above
+        // is a network await — `dispose()` may have fired while it was in
+        // flight. Re-check before this batch's mutations
+        // (`store.deleteByPath`/`store.upsert` below, and the manifest
+        // writes in the per-record loop that follows them). Do NOT rely on
+        // `requireDb()` throwing when the store is closed to catch this —
+        // that's a different module's implementation detail, not this
+        // function's contract. An earlier, already-embedded batch (if any)
+        // already committed before dispose fired, which is fine — INV-5
+        // only forbids mutations AFTER dispose. Bail with whatever width has
+        // been observed so far, matching this function's real return
+        // contract (`Promise<number | undefined>`).
+        if (disposed) return observedWidth;
+        // Task 14b: record the width of the very first vector this build
+        // actually produced, before any upsert — this is the value the NEXT
+        // build's `computeEffectiveWidth` will enforce (and, per the above,
+        // the value THIS build enforces on every later batch).
+        if (observedWidth === undefined) {
+          const first = vectors[0];
+          if (first !== undefined) observedWidth = first.length;
+        }
+        batch.forEach((record, idx) => {
+          // TA-2 (AU-5): `embedder.embed` already validated (parseEmbeddingsResponse's
+          // count check + embedBatch's per-row shape check) that it returns
+          // exactly one well-formed vector per input, in order — `vectors[idx]`
+          // is therefore always defined here. The old `?? []` fallback let a
+          // missing vector attach an empty one instead of failing loudly; that
+          // silent path IS the bug (V2) and must die, not be preserved as a
+          // defensive default.
+          const vector = vectors[idx];
+          if (vector === undefined) {
+            throw new Error(
+              'hermes-codebase: embedder returned fewer vectors than requested — refusing to upsert a record without a vector',
+            );
+          }
+          record.vector = vector;
+        });
+
+        // TA-3 (AU-3) / INV-3: this batch's replacement vectors now exist —
+        // safe to purge each represented path's stale rows, exactly once (a
+        // path whose chunks span multiple batches is purged at its FIRST
+        // batch only; `LanceDBStore.upsert`'s `mergeInsert('id')` keeps a
+        // later batch's upsert idempotent — new ids insert, nothing to
+        // update — against the now-emptied path).
+        for (const relPath of new Set(batch.map((r) => r.path))) {
+          const state = pathState.get(relPath);
+          if (state && !state.deleted) {
+            await store.deleteByPath(relPath);
+            state.deleted = true;
+          }
+        }
+
+        await store.upsert(batch);
+
+        for (const record of batch) {
+          const state = pathState.get(record.path);
+          if (state) {
+            state.remaining -= 1;
+            // Every one of this path's replacement chunks is now safely in
+            // the store — only NOW is it safe to claim it in the manifest.
+            if (state.remaining === 0) {
+              manifest[record.path] = state.contentHash;
+            }
+          }
+          // Rev-1 A3 honest-memory note: release this record's (large)
+          // vector now that the upsert has consumed it, so peak vector
+          // residency stays ~one batch instead of the whole call.
+          record.vector = [];
+        }
       }
-      batch.forEach((record, idx) => {
-        record.vector = vectors[idx] ?? [];
-      });
-      await store.upsert(batch);
+    } catch (err) {
+      // TA-3 (AU-3) scrub: a path whose stale rows were already deleted but
+      // whose replacement records did NOT all land must not keep (or gain) a
+      // manifest entry — that would tell the next build's diff "no change,
+      // skip" while its rows are gone/incomplete, exactly AU-3's
+      // invisible-file bug. Paths this call never reached (delete never ran)
+      // are left untouched here: their old rows are still intact, so
+      // whatever `manifest` already held for them stays consistent.
+      for (const [relPath, state] of pathState) {
+        if (state.deleted && state.remaining > 0) {
+          delete manifest[relPath];
+        }
+      }
+      throw err;
     }
     return observedWidth;
   }
@@ -526,7 +816,14 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     const ignoreFilter = await loadIgnoreFilter();
 
     const absPaths: string[] = [];
-    await walk(opts.workspaceRoot, ignoreFilter, absPaths);
+    // TA-7 (AU-34) / INV-6: `walk()` discovers every nested
+    // `.gitignore`/`.hermesignore` fresh as it descends this build (see its
+    // own comment) — `discoveredNestedDirs` collects that discovery so the
+    // watch path (which never calls `walk()`) can re-consult the SAME
+    // directories on its own cache rebuilds until the next full build.
+    const discoveredNestedDirs: string[] = [];
+    await walk(opts.workspaceRoot, ignoreFilter, absPaths, [], discoveredNestedDirs);
+    knownNestedIgnoreDirs = discoveredNestedDirs;
 
     const current: Record<string, string> = {};
     // AUDIT-5 Task 10: read each candidate's bytes ONCE here for the hash
@@ -549,6 +846,15 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     }
 
     const stored = await readManifest();
+
+    // TA-5 (AU-23, Critical remediation) / INV-5: `readManifest()` above is
+    // an await — `dispose()` may have fired while it was pending. `runBuild`
+    // is an equally-long HTTP-embedding op as the incremental watch path
+    // (e.g. deactivation mid-initial-index can race it exactly the same
+    // way), so it gets the same "re-check after every await, before the
+    // next mutation" discipline. Re-check here, before the self-heal
+    // purge's first `store.deleteByPath`.
+    if (disposed) return;
 
     // Self-heal purge (W5-T6): an index built BEFORE the secret-path filter
     // existed may still have a `.env`/`credentials`-class path embedded and
@@ -582,6 +888,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     const fingerprintOk = fingerprintMatches(storedMeta);
     const toCompute = fingerprintOk ? diff.toCompute : Object.keys(current);
 
+    // TA-5 (AU-23, Critical remediation) / INV-5: `readMeta()` above is
+    // another await, and the self-heal purge loop above it ran its own
+    // per-iteration `store.deleteByPath` awaits too — re-check before this
+    // next purge's mutations.
+    if (disposed) return;
+
     for (const relPath of diff.toDelete) {
       await store.deleteByPath(relPath);
       delete stored[relPath];
@@ -596,8 +908,33 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       storeRelPath: rel,
     }));
     const effectiveWidth = computeEffectiveWidth(storedMeta);
-    const observedWidth = await reindexFiles(toComputeTargets, manifest, effectiveWidth, preloaded);
+    let observedWidth: number | undefined;
+    try {
+      observedWidth = await reindexFiles(toComputeTargets, manifest, effectiveWidth, preloaded);
+    } catch (err) {
+      // TA-3 (AU-3): persist whatever scrub `reindexFiles` already applied
+      // to `manifest` even though this build failed — otherwise a
+      // partial-failure path's stale manifest entry (claiming rows that are
+      // now gone) would survive on disk untouched until some LATER build
+      // happens to recompute it, or forever if its content hash never
+      // changes again. `writeMeta` is intentionally NOT called on this arm
+      // — it records what THIS build observed, and this build did not
+      // complete.
+      //
+      // TA-5 (AU-23, Critical remediation) / INV-5: `reindexFiles` above
+      // awaits `embedder.embed` per batch — `dispose()` can fire mid-flight
+      // and the embed loop bails cleanly, possibly after an earlier batch's
+      // scrub already stripped a manifest entry. Writing that stripped
+      // `manifest` to disk AFTER dispose is the same orphan/drift defect as
+      // the incremental path's — skip the write, still propagate the error.
+      if (disposed) throw err;
+      await writeManifest(manifest);
+      throw err;
+    }
 
+    // TA-5 (AU-23, Critical remediation) / INV-5: same hazard as the catch
+    // arm above, for the non-throwing (success) case.
+    if (disposed) return;
     await writeManifest(manifest);
     // Task 14b: if this build embedded nothing (nothing changed, or a
     // fingerprint mismatch found zero files to recompute), there is no NEW
@@ -605,6 +942,10 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     // sidecar already held rather than dropping it. Dropping it here would
     // silently re-open the dims=0 protection gap on the very next no-op
     // build, since `writeMeta` always overwrites the whole sidecar file.
+    //
+    // TA-5 (AU-23, Critical remediation) / INV-5: `writeManifest` above is
+    // itself an await — re-check once more before this last mutation too.
+    if (disposed) return;
     await writeMeta(observedWidth ?? (fingerprintOk ? storedMeta?.width : undefined));
   }
 
@@ -643,11 +984,23 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // out-of-scope paths inside createIgnoreFilter instead: the shared
       // filter's loud throw is its contract (pinned in ignoreFilter.test.ts).
       if (!isPathValid(relPath)) return;
-      // AUDIT-5 Task 10: the cached ignore filter goes stale the moment one
-      // of the ignore files itself changes (edit OR delete) — invalidate
-      // BEFORE this event's own loadIgnoreFilter() call so this event, and
-      // every event after it, sees the new rules immediately.
-      if (relPath === '.gitignore' || relPath === '.hermesignore') {
+      // AUDIT-5 Task 10 (extended by TA-7/AU-34): the cached ignore filter
+      // goes stale the moment one of the ignore files itself changes (edit
+      // OR delete) — invalidate BEFORE this event's own loadIgnoreFilter()
+      // call so this event, and every event after it, sees the new rules
+      // immediately. Originally root-only; TA-7 extends this to any NESTED
+      // `.gitignore`/`.hermesignore` too (INV-6) — `loadIgnoreFilter()`
+      // re-reads every directory in `knownNestedIgnoreDirs` fresh on rebuild,
+      // so this correctly picks up an edit to an already-known nested ignore
+      // file. A nested ignore file in a directory NOT yet known (never
+      // walked) is a no-op here either way — see `knownNestedIgnoreDirs`'s
+      // own comment for the documented bounded staleness.
+      if (
+        relPath === '.gitignore' ||
+        relPath === '.hermesignore' ||
+        relPath.endsWith('/.gitignore') ||
+        relPath.endsWith('/.hermesignore')
+      ) {
         cachedIgnoreFilter = undefined;
       }
       const ignoreFilter = await loadIgnoreFilter();
@@ -663,8 +1016,22 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // lose an entry. Route through the SAME `serialize()` queue as `build()`
       // so every manifest mutation, incremental or full, is totally ordered.
       await serialize(async () => {
+        // TA-5 (AU-23, Med) / INV-5: this callback runs on the shared
+        // `buildChain` — it may sit queued for a while after `serialize()`
+        // enqueues it (a prior build/event may still be running), so
+        // `disposed` can already be true by the time this body actually
+        // starts. Bail before even reading the manifest.
+        if (disposed) return;
         const manifest = await readManifest();
         if (kind === 'delete') {
+          // TA-5 (AU-23, Med) / INV-5: `readManifest()` above is an await —
+          // `dispose()` may have fired while it was pending. Re-check right
+          // before this branch's first mutation so a post-dispose
+          // continuation neither calls `store.deleteByPath` (a no-op on the
+          // by-then-closed store, `LanceDBStore.ts:362-364`) NOR removes this
+          // path's manifest entry — the exact orphan-row/manifest-drift
+          // AU-23 named.
+          if (disposed) return;
           await store.deleteByPath(relPath);
           delete manifest[relPath];
           // AUDIT-5 ARCH-5 (F-1 final): delete-event granularity is platform/
@@ -680,15 +1047,28 @@ export function createIndexer(opts: IndexerOptions): Indexer {
               delete manifest[key];
             }
           }
+          // AU-23 re-review (TA-5 completion) / INV-5: the loop above awaits
+          // `store.deleteByPath` per swept key — `dispose()` can fire during
+          // any one of those awaits, same hazard as every other await in
+          // this function. The entry guard above only covers what precedes
+          // the loop; re-check once more, after it, right before the write.
+          if (disposed) return;
           await writeManifest(manifest);
           return;
         }
         if (isSecretForCompletion(relPath)) {
+          // TA-5 (AU-23, Med) / INV-5: see the delete-kind branch above —
+          // same re-check, same reason.
+          if (disposed) return;
           // A newly-created/changed secret-path file (e.g. a fresh `.env`)
           // must never be indexed. Best-effort purge in case it was somehow
           // already stored (mirrors build()'s self-heal purge pass).
           await store.deleteByPath(relPath);
           delete manifest[relPath];
+          // AU-23 re-review (TA-5 completion) / INV-5: the entry guard above
+          // covers what precedes `store.deleteByPath`, not the await itself
+          // — re-check once more before the write.
+          if (disposed) return;
           await writeManifest(manifest);
           return;
         }
@@ -719,8 +1099,16 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           confined = null; // fail closed
         }
         if (confined === null) {
+          // TA-5 (AU-23, Med) / INV-5: `fs.lstat`/`resolveWithinWorkspaceReal`
+          // above both await — same re-check, same reason as the two
+          // branches above.
+          if (disposed) return;
           await store.deleteByPath(relPath);
           delete manifest[relPath];
+          // AU-23 re-review (TA-5 completion) / INV-5: the entry guard above
+          // covers what precedes `store.deleteByPath`, not the await itself
+          // — re-check once more before the write.
+          if (disposed) return;
           await writeManifest(manifest);
           return;
         }
@@ -733,6 +1121,14 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // to full builds.
         const storedMeta = await readMeta();
         const effectiveWidth = computeEffectiveWidth(storedMeta);
+        // TA-5 (AU-23, Med) / INV-5: `readMeta()` above is an await too —
+        // re-check once more before entering `reindexFiles`. This only
+        // covers `reindexFiles`'s OWN entry point (and, since the CRITICAL
+        // remediation below, its internal embed-batch loop too) — it says
+        // nothing about dispose state once `reindexFiles` returns back HERE,
+        // so the two `writeManifest` calls that follow are each re-checked
+        // independently right below, not assumed covered by this one.
+        if (disposed) return;
         // AUDIT-5 Task 11 (Task-1 review): read the path resolveWithinWorkspaceReal
         // VALIDATED (pathConfine contract: "read exactly the returned path so the
         // file that was validated is the file that is read") — a parent-dir
@@ -741,11 +1137,38 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // the read hits the CAPTURED canonical target instead. Store under the
         // alias relPath: the gate/secret/delete/dir-sweep branches all key on
         // it, so a canonical key here would orphan the row from every purge.
-        await reindexFiles(
-          [{ readAbsPath: confined, storeRelPath: relPath }],
-          manifest,
-          effectiveWidth,
-        );
+        try {
+          await reindexFiles(
+            [{ readAbsPath: confined, storeRelPath: relPath }],
+            manifest,
+            effectiveWidth,
+          );
+        } catch (err) {
+          // TA-3 (AU-3): persist the scrub `reindexFiles` already applied to
+          // `manifest` even though this incremental reindex failed — see
+          // `runBuild`'s matching catch arm for the full rationale. Without
+          // this write, a transient failure on a byte-identical re-save
+          // would otherwise leave rows gone and the on-disk manifest
+          // unchanged (same hash) — the file would look "unchanged, no
+          // recompute needed" forever.
+          //
+          // TA-5 (AU-23, Critical remediation) / INV-5: `reindexFiles` above
+          // AWAITS `embedder.embed` per batch — `dispose()` can fire while
+          // that network call is in flight. If it does, TA-3's scrub above
+          // may already have deleted this path's manifest entry (its stale
+          // rows were purged but the replacement never fully landed).
+          // Writing that stripped `manifest` to disk AFTER dispose is the
+          // exact orphan/drift defect AU-23 named — on the commonest path
+          // (every ordinary file change). Skip the write, still propagate.
+          if (disposed) throw err;
+          await writeManifest(manifest);
+          throw err;
+        }
+        // TA-5 (AU-23, Critical remediation) / INV-5: same hazard as the
+        // catch arm above, for the non-throwing (success) case — dispose()
+        // firing during reindexFiles's embed await must not let this
+        // continuation write `manifest` afterward.
+        if (disposed) return;
         await writeManifest(manifest);
       });
     }
@@ -790,7 +1213,19 @@ export function createIndexer(opts: IndexerOptions): Indexer {
 
   function dispose(): void {
     disposed = true;
+    // TA-5 (AU-23, Med) / INV-5: symmetry with `ensureStoreInitialized`'s own
+    // clear-on-reject (`:191-194` above). Without this, a resolved
+    // `initPromise` from before this dispose() memo-hits forever — any later
+    // call that still reaches `ensureStoreInitialized()` would silently skip
+    // `store.init()` instead of genuinely reinitializing against a fresh
+    // (post-close) store.
+    initPromise = undefined;
     void store.close();
+    // AU-35 (TA-9): the parser's cached `Parser`/`Tree` native handles were
+    // never freed on indexer teardown before this — deferred here from
+    // TA-5. Optional per `CodeParser` (a test stand-in owns no native
+    // resources to free).
+    parser.dispose?.();
   }
 
   return { build, watch, dispose };

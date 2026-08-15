@@ -7,6 +7,7 @@ import type {
 } from '../../shared/protocol';
 import type { AcpClientLike, AcpListSessionsRawResult } from '../backend/acp/acpClient';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
+import type { ToggleNameCache } from '../dashboard/dashboardPanelSources';
 import type {
   PanelFetchOutcome,
   PanelSource,
@@ -44,6 +45,50 @@ import {
  * `result: raw` split (RAW upstream result on the resolve) was dropped — its
  * sole consumer (the webview's `fetchPanel`) ignored the resolved value, so it
  * had zero observable effect (finding A#6).
+ *
+ * F10 (TG-6, AU-OBS-L3) — FROZEN CONTRACT: these five sources (`ToolsPanelSource`,
+ * `SkillsPanelSource`, `ModelsPanelSource`, `SettingsPanelSource`, and
+ * `McpPanelSource`'s two dispatches) deliberately ride the gateway's global
+ * config channel with NO session scoping of their own — none of them reads,
+ * resolves, or constructs an acp `sessionId` (contrast `SessionsPanelSource`/
+ * `SubagentsPanelSource`, which explicitly do via `ctx.getSessionCwd`/
+ * `extractSessionId`). This is not an oversight to "helpfully" fix later: the
+ * gateway process routes by ITS OWN `_sessions` dict
+ * (`tui_gateway/server.py:5949-5988`, keyed at `:5966-5980`), which NEVER
+ * contains an acp-child session id — that id lives in a completely different
+ * namespace (`acp_adapter/session.py`). A dispatch that has no matching key in
+ * `_sessions` falls back to the gateway's own unknown-session global handling,
+ * which is exactly the behavior these config RPCs want (there is only ever
+ * one gateway-side config to read). Some of these gateway RPCs DO destructure a
+ * `session_id` param and look it up (`server.py`: `_sessions.get(params.get(
+ * "session_id"))`) — but `_sessions` is keyed by the gateway's OWN
+ * caller-supplied ids and is never populated with an acp-child id, so such a
+ * lookup always misses and still lands in the global fallback (it is the
+ * NAMESPACE split that guarantees this, not any id-format check — the gateway
+ * does not constrain the key's shape). Threading an acp session id into one of
+ * these dispatches expecting it to SCOPE the result would therefore be a
+ * category error — the id means nothing on this wire — so no source here should
+ * ever be edited to add that (in EITHER spelling: the wire key is snake_case
+ * `session_id`, which is also what this repo's own `AcpBackend` gateway
+ * dispatches use, so a copy-paste of that convention is the likely accident).
+ *
+ * GROUNDING NOTE (do not remove without re-verifying): `ToolsPanelSource`,
+ * `ModelsPanelSource`, and `SettingsPanelSource` forward their `fetch(params)`
+ * argument to `ctx.dispatch` UNFILTERED; `SkillsPanelSource` spreads it too
+ * (merging in `action:'list'`) — none of the four inspects or strips a
+ * `sessionId`/`session_id` key if one is present in `params`. Today no caller
+ * ever puts one there: `webview/src/state/panels.ts`'s `resolvePanelRequest`
+ * exhaustively
+ * switches on `DataPanel` and only adds `sessionId` for the `subagents`/
+ * `sessions` branches (`tools`/`mcp`/`skills`/`models`/`settings`/`setup`
+ * return bare `{panel}`), and every host-internal `fetchPanelData('mcp'|
+ * 'skills'|'models', …)` call site (`ControlDispatcher.ts`) passes no params
+ * at all. So the "no session scoping" guarantee these four sources enjoy
+ * today is a CALLER-CONVENTION guarantee, not a defense in this file — only
+ * `McpPanelSource` is structurally immune (its `fetch` takes no params at
+ * all). Locked (the source-side half — no source may start EXPLICITLY
+ * threading a session id into its own dispatch) by
+ * `panelSources.gatewayScope.test.ts`.
  * -------------------------------------------------------------------------- */
 
 /** `tools.list` -> `ToolsData` (`tui_gateway/server.py:13439-13465`). */
@@ -102,7 +147,10 @@ export class SettingsPanelSource implements PanelSource<'settings'> {
  * tui_gateway channel (global config), just two RPCs — dispatched in order so
  * `config.get` precedes `tools.list` on the wire.
  */
-export class McpPanelSource implements PanelSource<'mcp'> {
+export class McpPanelSource implements PanelSource<'mcp'>, ToggleNameCache {
+  /** Server names from the last successful `config.get` (the toggle key set, S-M4). */
+  private knownNames: Set<string> | undefined;
+
   constructor(private readonly ctx: PanelSourceContext) {}
 
   async fetch(): Promise<PanelFetchOutcome<'mcp'>> {
@@ -110,8 +158,14 @@ export class McpPanelSource implements PanelSource<'mcp'> {
       this.ctx.dispatch('config.get', { key: 'full' }),
       this.ctx.dispatch('tools.list', {}),
     ]);
-    const data: McpData = reshapeMcpServers(config as RawConfigFullResult, tools as RawToolsListResult);
+    const rawConfig = config as RawConfigFullResult;
+    this.knownNames = new Set(Object.keys(rawConfig.mcp_servers ?? {}));
+    const data: McpData = reshapeMcpServers(rawConfig, tools as RawToolsListResult);
     return { data };
+  }
+
+  lastListedNames(): ReadonlySet<string> | undefined {
+    return this.knownNames;
   }
 }
 
@@ -202,9 +256,12 @@ export class SessionsPanelSource implements PanelSource<'sessions'> {
 
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'sessions'>> {
     const client = this.ctx.getAcpClient();
-    // No client yet -> `{ data: undefined }` suppresses the push and resolves
-    // `undefined`, exactly like the old `refreshSessionsPanel`.
-    if (!client) return { data: undefined };
+    // AU-10: no client yet is a TERMINAL "unavailable" outcome, not a silent
+    // `{data: undefined}` hold — `ControlDispatcher.fetchPanelData` rejects
+    // the correlated request with this reason, which the webview's existing
+    // `fetchPanel` catch path renders as an honest, retryable error instead
+    // of spinning on "Loading…" forever (see `PanelFetchOutcome`'s own doc).
+    if (!client) return { unavailable: 'Agent is not connected yet.' };
 
     // The bucket MAP needs a concrete string key; the CLIENT call keeps
     // `cwd` as `string | undefined` (an unresolved cwd is passed through
@@ -244,7 +301,10 @@ export class SessionsPanelSource implements PanelSource<'sessions'> {
     }
 
     const raw: AcpListSessionsRawResult = await client.listSessions(cwd, cursor);
-    const page: SessionsData = reshapeSessionsList(raw as RawSessionListResult);
+    // TG-5 (AU-51, INV-20): drop any ephemeral one-shot session id
+    // (`OneShotRunner`'s `session/new` mints) before it ever enters the
+    // accumulated page — see `reshapeSessionsList`'s own doc.
+    const page: SessionsData = reshapeSessionsList(raw as RawSessionListResult, this.ctx.getOneShotSessionIds());
 
     for (const session of page.sessions) {
       if (bucket.seenIds.has(session.id)) continue;

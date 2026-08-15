@@ -314,6 +314,9 @@ export function Composer({
   const [dragging, setDragging] = useState(false);
   const [narrow, setNarrow] = useState(false);
   const [height, setHeight] = useState(initialHeight);
+  // T5 (§7.2.3): owns the drag-resize AbortController — see `startResize`
+  // and the unmount-cleanup `useEffect` below.
+  const resizeAbortRef = useRef<AbortController | null>(null);
   /**
    * W4-T6 (UI#8): the resize grabber's `aria-valuemax` (below) used to be a
    * plain `const` recomputed from `window.innerHeight` inline in the render
@@ -850,25 +853,62 @@ export function Composer({
 
   const clampH = (h: number) => Math.max(MIN_H, Math.min(h, Math.round(window.innerHeight * 0.6)));
 
+  /**
+   * T5 (§7.2.3, AU-61 extra-b): one `AbortController` owns BOTH window
+   * listeners (MDN: `abort()` removes every listener registered with that
+   * signal), so the unmount path (below) and the pointerup path share ONE
+   * teardown and neither can forget the other's listener. Before this fix,
+   * teardown lived ONLY inside `up`: unmounting mid-drag (e.g. a host
+   * panel-switch away from 'chat') leaked both window listeners until the
+   * NEXT pointerup anywhere, left `document.body` stuck at
+   * `user-select: none`, kept calling `setHeight` on an unmounted
+   * component, and later fired `onHeightChange` through a stale closure.
+   */
   const startResize = (e: React.PointerEvent) => {
     e.preventDefault();
     const startY = e.clientY;
     const startH = height;
     let latest = startH;
+    const controller = new AbortController();
+    resizeAbortRef.current = controller;
     document.body.style.userSelect = 'none';
-    const move = (ev: PointerEvent) => {
-      latest = clampH(startH + (startY - ev.clientY));
-      setHeight(latest);
-    };
-    const up = () => {
-      document.body.style.userSelect = '';
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      onHeightChange(latest);
-    };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    window.addEventListener(
+      'pointermove',
+      (ev) => {
+        latest = clampH(startH + (startY - ev.clientY));
+        setHeight(latest);
+      },
+      { signal: controller.signal },
+    );
+    window.addEventListener(
+      'pointerup',
+      () => {
+        controller.abort(); // removes both listeners
+        resizeAbortRef.current = null;
+        document.body.style.userSelect = '';
+        onHeightChange(latest);
+      },
+      { signal: controller.signal },
+    );
   };
+
+  // T5 (§7.2.3): unmount-only cleanup — ends an in-progress drag exactly as
+  // `pointerup` would, EXCEPT it does NOT call `onHeightChange` (no persist
+  // for a drag the unmount cancelled — a deliberate cancel-vs-commit
+  // choice). Guarded on the ref so it only touches `userSelect` when a drag
+  // was actually active, never clobbering an unrelated future writer of that
+  // style. Idempotent: React 19 StrictMode's double-invoke finds the ref
+  // already null on its second pass.
+  useEffect(
+    () => () => {
+      if (resizeAbortRef.current) {
+        resizeAbortRef.current.abort();
+        resizeAbortRef.current = null;
+        document.body.style.userSelect = '';
+      }
+    },
+    [],
+  );
 
   const resizeByKey = (e: React.KeyboardEvent) => {
     let next: number | null = null;

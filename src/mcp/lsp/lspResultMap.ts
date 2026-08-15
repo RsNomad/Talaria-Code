@@ -302,10 +302,17 @@ export function mapWorkspaceSymbols(raw: readonly SymbolInformationLike[]): Plai
  * and `{language,value}` (MarkedString) ⇒ `.value`. Defensive `typeof`
  * guard on `.value` (not just the structural type) — totality never trusts
  * that adversarial/malformed runtime input actually matches the duck type it
- * was declared against. */
+ * was declared against.
+ *
+ * L8 (same INV-17 class as AU-17): a `null` content item used to reach
+ * `item.value` and throw (`typeof null === 'object'`) — guarded here
+ * alongside the pre-existing `.value` defensiveness. */
 function flattenHoverContentItem(item: HoverLike['contents'][number]): string | undefined {
   if (typeof item === 'string') {
     return item;
+  }
+  if (item === null || item === undefined) {
+    return undefined;
   }
   return typeof item.value === 'string' ? item.value : undefined;
 }
@@ -321,7 +328,12 @@ function flattenHoverContentItem(item: HoverLike['contents'][number]): string | 
 export function mapHover(raw: readonly HoverLike[]): string[] {
   const out: string[] = [];
   for (const hover of raw) {
-    for (const item of hover.contents) {
+    // L8: `contents` is declared non-optional on `HoverLike`, but totality
+    // never trusts the declared type over adversarial/malformed runtime
+    // input — a `null`/`undefined` `contents` used to throw ("not
+    // iterable") instead of contributing zero entries.
+    const contents = hover.contents ?? [];
+    for (const item of contents) {
       const text = flattenHoverContentItem(item);
       if (text !== undefined && text.length > 0) {
         out.push(text);
@@ -337,9 +349,22 @@ export function mapHover(raw: readonly HoverLike[]): string[] {
 
 /** Normalizes `Diagnostic.code` to `string | undefined`: absent ⇒
  * `undefined`; a bare number/string ⇒ `String(code)`/itself; the
- * `{value, target?}` object form ⇒ `String(value)`. Never throws. */
+ * `{value, target?}` object form ⇒ `String(value)`. Never throws.
+ *
+ * AU-17: `code: null` used to reach the object branch below (`typeof null
+ * === 'object'`) and crash on `null.value` — a TypeError that killed
+ * diagnostics for the WHOLE result, violating this module's "mappers never
+ * throw" totality contract. `null` is guarded alongside `undefined` here
+ * (VS Code's own `Diagnostic.code` type never declares `null`, but totality
+ * never trusts that adversarial/malformed runtime input actually matches the
+ * duck type it was declared against — see this file's header). The object
+ * branch also defensively `typeof`-guards `.value` itself (not just the
+ * declared structural type) so a malformed `{}` (no `value` field) or
+ * `{value: null}` normalizes to `undefined` instead of the misleading
+ * literal strings `String(undefined)`/`String(null)` would otherwise
+ * produce. */
 function normalizeDiagnosticCode(code: DiagnosticLike['code']): string | undefined {
-  if (code === undefined) {
+  if (code === null || code === undefined) {
     return undefined;
   }
   if (typeof code === 'string') {
@@ -348,7 +373,8 @@ function normalizeDiagnosticCode(code: DiagnosticLike['code']): string | undefin
   if (typeof code === 'number') {
     return String(code);
   }
-  return String(code.value);
+  const value: unknown = code.value;
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : undefined;
 }
 
 /** Maps one `DiagnosticLike` to its plain mirror. `severity` is kept as the

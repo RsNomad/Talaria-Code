@@ -303,12 +303,15 @@ async function handleAcceptedBody(
     return;
   }
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless — see module doc
-    enableJsonResponse: true, // plain JSON reply, never SSE — see module doc
-  });
-  const mcpServer = buildMcpServer();
-
+  // AU-21: `transport`/`mcpServer` construction moved INSIDE the try below
+  // (was previously OUTSIDE it) — a constructor throw here used to escape
+  // uncaught, and the `void`-shaped caller in `createLibRequestListener`
+  // had no `.catch`, so it became an unhandled promise rejection instead of
+  // an answered request (the client hangs to its own ~300s read-timeout).
+  // Declared here (not `const` inside the try) so the catch below can close
+  // whichever of the two got constructed before a later step threw.
+  let transport: StreamableHTTPServerTransport | undefined;
+  let mcpServer: McpServer | undefined;
   let closed = false;
   const closeBoth = (): void => {
     if (closed) return;
@@ -318,30 +321,44 @@ async function handleAcceptedBody(
     // a fixed, non-secret string only (never the error's own message —
     // token discipline applies to every log line in this module, not just
     // the reject path).
-    mcpServer.close().catch(() => logDebug(log, 'mcp-server-close-error'));
-    transport.close().catch(() => logDebug(log, 'transport-close-error'));
+    mcpServer?.close().catch(() => logDebug(log, 'mcp-server-close-error'));
+    transport?.close().catch(() => logDebug(log, 'transport-close-error'));
   };
-  // "Closed on response finish" (research doc §3.5) — 'close' is an extra,
-  // defensive net for an abnormally dropped connection (client vanishes
-  // mid-handling, before 'finish' would ever fire), so a per-request pair
-  // can never leak past an aborted request either.
-  res.once('finish', closeBoth);
-  res.once('close', closeBoth);
 
   try {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless — see module doc
+      enableJsonResponse: true, // plain JSON reply, never SSE — see module doc
+    });
+    mcpServer = buildMcpServer();
+
+    // "Closed on response finish" (research doc §3.5) — 'close' is an
+    // extra, defensive net for an abnormally dropped connection (client
+    // vanishes mid-handling, before 'finish' would ever fire), so a
+    // per-request pair can never leak past an aborted request either.
+    // Registered only once both objects exist — a construction throw above
+    // never reaches here, so `closeBoth()` in the catch below is the only
+    // cleanup path for that case.
+    res.once('finish', closeBoth);
+    res.once('close', closeBoth);
+
     await mcpServer.connect(transport);
     await transport.handleRequest(req, res, parsedBody);
   } catch {
-    // The SDK itself answers ordinary protocol errors with a proper
-    // JSON-RPC error response; this only fires for a genuinely unexpected
-    // failure (e.g. `connect()` throwing before any response was sent).
-    // Fail closed with a generic response rather than leaving the request
-    // hanging — never echo the caught error's message (could in principle
-    // wrap request content).
+    // S2 (AU-36 tail): this is the genuine-defect catch — the SDK itself
+    // answers ordinary protocol errors with a proper JSON-RPC error
+    // response, so reaching here means something genuinely unexpected
+    // failed (a construction throw, or `connect()`/`handleRequest()`
+    // throwing before any response was sent). This used to log nothing at
+    // all; now it logs a fixed, non-secret line — never the caught error's
+    // own message (could in principle wrap request content).
+    logDebug(log, 'handle-accepted-body-error');
+    // Close whatever got constructed before the throw (AU-21) — explicit,
+    // not left to the 'finish'/'close' listeners above, because a
+    // construction-time throw means those listeners were never registered.
+    closeBoth();
     if (!res.headersSent) {
       sendJsonAndClose(res, 500, undefined, 'internal error');
-    } else {
-      closeBoth();
     }
   }
 }
@@ -372,7 +389,22 @@ export function createLibRequestListener(deps: LibServerDeps): http.RequestListe
 
     // Only an accepted request (headers passed all 7 rules) ever reaches
     // body consumption or the SDK — the guard runs BEFORE both.
-    void handleAcceptedBody(req, res, expect, buildMcpServer, log);
+    //
+    // AU-21 last-resort net: `handleAcceptedBody` already fails closed with
+    // its own 500 on every caught error (see its own try/catch), but this
+    // call site is fire-and-forget by design (no caller ever awaits a
+    // `http.RequestListener`) — without this `.catch`, ANY escape from that
+    // function would surface as an unhandled promise rejection instead of
+    // an answered request, hanging the client to its own read-timeout.
+    // Logs a fixed, non-secret string only — never the caught error's own
+    // message (token discipline, same as every other log line in this
+    // module).
+    handleAcceptedBody(req, res, expect, buildMcpServer, log).catch(() => {
+      logDebug(log, 'handle-accepted-body-unhandled');
+      if (!res.headersSent) {
+        sendJsonAndClose(res, 500, undefined, 'internal error');
+      }
+    });
   };
 }
 

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Composer } from './Composer';
@@ -883,5 +883,111 @@ describe('CF-07: Explorer drag-drop of a file:// URI is parsed to an fsPath', ()
     // Unlike localhost, a genuine remote host is left on the pre-fix
     // behavior: the raw URI is stored verbatim (caller's fallback branch).
     expect(added[0]!.path).toBe('file://otherhost/home/user/app.ts');
+  });
+});
+
+/**
+ * T5 (§7.2.3, AU-61 extra-b, `docs_claude/au61-round-architecture.md` §4).
+ * `startResize` registered `window.addEventListener('pointermove', move)` +
+ * `('pointerup', up)` and set `document.body.style.userSelect = 'none'`, with
+ * ALL teardown living inside `up`. If the Composer unmounted mid-drag (a
+ * host panel-switch away from 'chat' unmounts the chat subtree — reachable,
+ * not hypothetical), both window listeners leaked until the NEXT pointerup
+ * ANYWHERE: `document.body` stayed `user-select: none` (text selection dead
+ * panel-wide), the orphaned `move` kept calling `setHeight` on an unmounted
+ * component, and the orphaned `up` later fired `onHeightChange` through a
+ * stale prop closure. Fixed with one `AbortController` shared by both
+ * listeners plus an unmount-only cleanup effect that ends an in-progress
+ * drag exactly as `pointerup` would, MINUS the `onHeightChange` persist (a
+ * deliberate cancel-vs-commit choice — an unmount-cancelled drag is not a
+ * committed resize).
+ *
+ * jsdom `^29.1.1` (root `package.json`) ships a real, working `PointerEvent`
+ * constructor that carries `clientY` (critic-2-verified — executed against
+ * this repo's jsdom), so the window-level dispatches below use it directly
+ * rather than a bare `new Event(...)` (which would leave `clientY`
+ * `undefined` and mask the very listener-leak this suite exists to catch).
+ */
+function renderComposerForResize(onHeightChange: (height: number) => void = () => undefined) {
+  return render(
+    <Composer
+      tabId="tab-1"
+      draft=""
+      draftAttachments={[]}
+      onDraftChange={() => undefined}
+      onAttachAdd={() => undefined}
+      onAttachRemove={() => undefined}
+      preset="normal"
+      modelLabel="test-model"
+      busy={false}
+      disabled={false}
+      activeModeId={null}
+      availableModes={[]}
+      onSetMode={async () => undefined}
+      initialHeight={120}
+      onHeightChange={onHeightChange}
+      onSubmit={async () => undefined}
+      onCancel={() => undefined}
+      onSetPreset={async () => undefined}
+      onPickModel={() => undefined}
+      onNewSession={() => undefined}
+      availableCommands={[]}
+      searchFiles={async () => []}
+      pendingSeed={null}
+      onSeedApplied={() => undefined}
+    />,
+  );
+}
+
+describe('T5 (§7.2.3): Composer drag-resize window-listener leak on unmount', () => {
+  // Defense-in-depth: `document.body` is shared across every test in this
+  // file (RTL's `cleanup()` unmounts React trees but never touches
+  // `document.body.style` itself — `webview/test/dom-setup.ts`). Restoring
+  // it here keeps a RED failure in this block (which, pre-fix, leaves
+  // `userSelect` stuck at `'none'`) from bleeding into unrelated tests.
+  afterEach(() => {
+    document.body.style.userSelect = '';
+  });
+
+  it('unmounting mid-drag restores document.body user-select', () => {
+    const { unmount } = renderComposerForResize();
+    fireEvent.pointerDown(screen.getByRole('separator', { name: 'Resize composer' }), { clientY: 200 });
+    expect(document.body.style.userSelect).toBe('none'); // drag engaged
+
+    unmount();
+
+    expect(document.body.style.userSelect).toBe(''); // RED at HEAD: stays 'none'
+  });
+
+  it('window listeners are gone after unmount — a later pointerup neither throws nor persists a height', () => {
+    const onHeightChange = vi.fn();
+    const { unmount } = renderComposerForResize(onHeightChange);
+    fireEvent.pointerDown(screen.getByRole('separator', { name: 'Resize composer' }), { clientY: 200 });
+
+    unmount();
+
+    // The stale `move`/`up` from before this fix ran against an unmounted
+    // component's closed-over `setHeight`; the assertion below is on
+    // `onHeightChange` (the externally-observable half of that leak) rather
+    // than on internal `setHeight` calls, but a throw here would ALSO fail
+    // the test, so a leaked `move` crashing post-unmount is caught too.
+    expect(() => {
+      fireEvent(window, new PointerEvent('pointermove', { clientY: 150 }));
+      fireEvent(window, new PointerEvent('pointerup'));
+    }).not.toThrow();
+
+    expect(onHeightChange).not.toHaveBeenCalled(); // RED at HEAD: stale `up` fires it
+  });
+
+  it('regression lock — a NORMAL drag still commits: pointerup calls onHeightChange once and restores user-select', () => {
+    const onHeightChange = vi.fn();
+    renderComposerForResize(onHeightChange);
+    fireEvent.pointerDown(screen.getByRole('separator', { name: 'Resize composer' }), { clientY: 200 });
+
+    fireEvent(window, new PointerEvent('pointermove', { clientY: 150 }));
+    fireEvent(window, new PointerEvent('pointerup'));
+
+    expect(onHeightChange).toHaveBeenCalledTimes(1);
+    expect(document.body.style.userSelect).toBe('');
   });
 });

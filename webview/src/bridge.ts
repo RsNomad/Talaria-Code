@@ -26,12 +26,24 @@ class Bridge {
   private listeners = new Set<Listener>();
   private mockHandler: ((msg: WebviewToHost) => void) | undefined;
   /**
+   * AU-9/INV-13 (TE-2): a fresh id minted once per PAGE INSTANCE — this
+   * module's top-level `bridge` singleton (below) is re-constructed every
+   * time VS Code (re)loads the webview page (a tab going hidden->shown can
+   * dispose and recreate it, exactly like the CSP nonce's fresh-per-load
+   * mint in `TalariaViewProvider.ts`'s `buildHtml`). Stamped on every
+   * outgoing `control.request` and used by {@link RpcClient} to drop a stale
+   * `control.response` from a PRIOR page instance that settles late (e.g. a
+   * long-running `setup.install`, whose 30s timeout is disabled) after this
+   * new instance's own request-id counter has reused the same small id.
+   */
+  private readonly instanceId = crypto.randomUUID?.() ?? `page-${Math.random().toString(36).slice(2)}`;
+  /**
    * The id-correlated request/response client (Part A2). Its `send` posts
    * `control.request` messages through this same bridge; inbound
    * `control.response` messages are routed to it in {@link emit} and NOT
    * broadcast to app listeners (they're RPC plumbing, not renderable state).
    */
-  private readonly rpc = new RpcClient((req) => this.post(req));
+  private readonly rpc = new RpcClient((req) => this.post(req), { instanceId: this.instanceId });
 
   constructor() {
     try {

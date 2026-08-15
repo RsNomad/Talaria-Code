@@ -161,6 +161,21 @@ function assertLoopbackIPv4(server: http.Server): { address: string; port: numbe
   return { address: addr.address, port: addr.port };
 }
 
+/** AU-32: a rejected, pre-settled `startPromise` used to poison every FUTURE
+ * `start()` call once the host is disposed/permanently-down (module doc
+ * §AU-32 — see the two call sites below). Attaching a no-op `.catch` to the
+ * INTERNAL reference right away is what keeps this from tripping Node's
+ * `unhandledRejection` detector on its own — a caller's own `await`/`.catch()`
+ * on the SAME promise object still observes the rejection normally, since a
+ * settled promise supports any number of independent handlers. */
+function makePoisonedStartPromise(message: string): Promise<AcpMcpServerHttp | undefined> {
+  const poisoned = Promise.reject<AcpMcpServerHttp | undefined>(new Error(message));
+  poisoned.catch(() => {
+    // Intentionally empty — see doc comment above.
+  });
+  return poisoned;
+}
+
 export function createLibServerHost(deps: LibServerHostDeps): LibServerHost {
   const serverName = deps.serverName ?? DEFAULT_SERVER_NAME;
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
@@ -217,6 +232,14 @@ export function createLibServerHost(deps: LibServerHostDeps): LibServerHost {
       // strictly safer than resurrecting a server whose token a squatter
       // may have captured during the outage window (module doc :14-18).
       cachedAdvertisement = undefined;
+      // AU-32: poison the cached start() promise too — otherwise a LATER
+      // start() call (startPromise already cached from the earlier
+      // successful bind) would keep returning that SAME resolved promise,
+      // handing back a stale advertisement for a token/port this host no
+      // longer owns (only the advertisement() accessor used to burn).
+      startPromise = makePoisonedStartPromise(
+        'LibServerHost: permanently down after a failed rebind',
+      );
       // T-9: withdraw the registration for FUTURE sessions too — the
       // accessor above only protects a read AFTER this point; without this,
       // extension.ts's already-captured advertisement copy keeps being
@@ -238,6 +261,10 @@ export function createLibServerHost(deps: LibServerHostDeps): LibServerHost {
       // onServerError can fire) — but keep the permanent-down invariant
       // consistent: a burned host never advertises a reusable token (review E1-M).
       cachedAdvertisement = undefined;
+      // AU-32: same reasoning as the other permanent-down transition above —
+      startPromise = makePoisonedStartPromise(
+        'LibServerHost: permanently down after a failed rebind',
+      );
       // T-9: same reasoning as the other permanent-down transition above —
       // consistent even on this defensively-unreachable branch.
       firePermanentDown();
@@ -256,17 +283,31 @@ export function createLibServerHost(deps: LibServerHostDeps): LibServerHost {
     const bareServer = (deps.createServer ?? (() => http.createServer()))();
     try {
       await listenAsync(bareServer, 0);
-    } catch {
-      // Initial bind failed outright (e.g. port exhaustion) — no
-      // advertisement is ever produced; nothing to clean up beyond the
-      // (never-listening) server object itself.
-      return undefined;
+    } catch (err) {
+      // S3 (AU-36 tail): an initial bind failure (e.g. port exhaustion)
+      // used to resolve `start()` to `undefined` silently — no throw, no
+      // log, indistinguishable from "trust not granted yet". Fail closed
+      // and LOUD instead, matching `transportSecurity`'s own fail-closed
+      // posture without touching that file: nothing to clean up beyond the
+      // (never-listening) server object itself, but the caller must never
+      // be able to miss this. The original error is preserved as `.cause`
+      // for diagnostics; the message itself stays a fixed, non-secret
+      // string (token discipline — same posture as every `log?.()` line in
+      // this module).
+      log?.('[debug] LIB initial bind failed — startup aborted.');
+      throw new Error('LibServerHost: initial bind failed', { cause: err });
     }
 
     const loopback = assertLoopbackIPv4(bareServer);
     if (loopback === undefined) {
       bareServer.close();
-      return undefined;
+      // S4 (AU-36 tail): same fail-closed-and-loud posture as S3 above — a
+      // bind that somehow did not yield an IPv4 loopback address must never
+      // silently resolve `start()` to `undefined`; the transport guard's
+      // rule 1 premise (every accepted request is loopback-only) would
+      // otherwise be unverifiable with nothing to show for it.
+      log?.('[debug] LIB bind did not yield an IPv4 loopback address — startup aborted.');
+      throw new Error('LibServerHost: bind did not yield an IPv4 loopback address');
     }
 
     // I-1: a dispose() that lands while the bind above was pending sees
@@ -346,6 +387,17 @@ export function createLibServerHost(deps: LibServerHostDeps): LibServerHost {
     // for a port that is no longer bound (or that another process may go
     // on to claim).
     cachedAdvertisement = undefined;
+    // AU-32: poison the cached start() promise so a LATER start() call —
+    // whether start() already ran before dispose() (previously: kept
+    // returning the SAME resolved promise, handing back a stale
+    // advertisement) or never ran at all (previously: `doStart()` would run
+    // afresh, performing a real bind attempt only to discard it via the I-1
+    // disposed-check deep inside `doStart()`) — REJECTS immediately
+    // instead, matching `advertisement()`'s own post-dispose fail-closed
+    // posture above. A pending start() already in flight when dispose()
+    // lands is unaffected (I-1): its own already-returned promise reference
+    // still resolves via `doStart()`'s own disposed-check.
+    startPromise = makePoisonedStartPromise('LibServerHost: start() called after dispose()');
     if (server !== undefined) {
       // Stop the rebind machinery — this is an intentional shutdown, not a
       // listener error to react to.

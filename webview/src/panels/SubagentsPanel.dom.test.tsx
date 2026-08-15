@@ -22,6 +22,24 @@ function data(overrides: Partial<SubagentsData> = {}): SubagentsData {
   return { delegations: [], ...overrides };
 }
 
+/**
+ * AU-46: the empty state (`data.delegations.length === 0`) used to return a
+ * BARE `EmptyPanel` — dropping the panel's `PanelShell` header, so an empty
+ * Subagents panel lost its "Subagents" title (and the tabpanel's accessible
+ * label along with it). The non-empty path already wraps in
+ * `<PanelShell title="Subagents" ...>`; the empty path now does too.
+ */
+describe('AU-46: the empty state keeps the "Subagents" panel header', () => {
+  it('renders the "Subagents" title alongside the empty-state hint when there are no delegations', () => {
+    render(<SubagentsPanel data={data({ delegations: [] })} />);
+
+    expect(screen.getByText('Subagents')).toBeInTheDocument();
+    expect(
+      screen.getByText('No delegations yet — they appear here when Talaria delegates a task.'),
+    ).toBeInTheDocument();
+  });
+});
+
 describe('W4-T6: SubagentsPanel relative-age parity with SessionsPanel', () => {
   it('renders a relative age, not the raw ISO timestamp, for a delegation with startedAt', () => {
     render(

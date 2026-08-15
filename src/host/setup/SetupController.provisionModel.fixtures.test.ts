@@ -540,6 +540,9 @@ describe('T7 step 5b (pinned fixture pin published): sweep-next via llamacpp', (
       'verifyHfDigest',
       'checkedStoreDest',
       `showModal:${PINNED_LLAMACPP_MODAL}`,
+      // AU-13/TD-2: the write gate re-asserts AFTER the modal, immediately
+      // before the write — a second checkedStoreDest call, not a regression.
+      'checkedStoreDest',
       'downloadGgufToStore',
     ]);
     expect(verifyArgs).toEqual([

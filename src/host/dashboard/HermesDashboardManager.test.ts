@@ -303,14 +303,27 @@ describe('HermesDashboardManager.ensure — spawn-only default (S3, CWE-306/346)
     expect(h.makeClientCalls).toEqual([MINTED_TOKEN, 'regenerated-token']);
   });
 
-  it('served token !== spawn token AND child DEAD → FOREIGN: refuses (throws); ensure() rejects and the memo clears', async () => {
+  it('served token !== spawn token AND child DEAD → FOREIGN: refuses (throws), naming the recovery escapes (F9/TG-6/AU-OBS-L3)', async () => {
     const h = makeSpawnOnlyManager({
       healthyProbe: [true],
       servedToken: 'squatter-token',
       childAlive: false,
     });
 
-    await expect(h.manager.ensure()).rejects.toThrow(/we did not spawn/i);
+    // F9: the refusal must name BOTH config escapes so the user isn't left
+    // guessing — talaria.dashboardPort (move off the squatted port) and,
+    // security-second (it's the riskier option), talaria.dashboardAdopt.
+    let caught: unknown;
+    try {
+      await h.manager.ensure();
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toMatch(/we did not spawn/i);
+    expect(message).toContain('talaria.dashboardPort');
+    expect(message).toContain('talaria.dashboardAdopt');
 
     // Memo cleared: a second ensure() re-attempts (spawns again) rather than
     // caching the refusal forever — this is what powers panel Retry.
@@ -689,9 +702,12 @@ describe('HermesDashboardManager — T-B2: dashboard liveness fail-open (V-9, re
     vi.mocked(spawn).mockReturnValue(proc as unknown as ChildProcess);
 
     // `hermesPath` set -> resolveHermesBin short-circuits the login-shell PATH
-    // lookup (no real OS access), so the REAL spawnServe runs end to end.
+    // lookup (no real OS access); `pythonPath` also pinned so the AU-7
+    // realpath+existence-check derivation (which would fail against this
+    // fake path on the real FS) never runs either — the REAL spawnServe runs
+    // end to end regardless.
     const manager = new HermesDashboardManager({
-      config: { hermesPath: '/fake/hermes' },
+      config: { hermesPath: '/fake/hermes', pythonPath: '/fake/python' },
       port: 9119,
     });
     // Reach past `private` to unit-test spawnServe's own contract in isolation
@@ -726,7 +742,10 @@ describe('HermesDashboardManager — T-B2: dashboard liveness fail-open (V-9, re
     const spawnedClient = fakeClient({ probeSeq: [true], servedToken: 'squatter-token' });
 
     const manager = new HermesDashboardManager({
-      config: { hermesPath: '/fake/hermes' },
+      // pythonPath pinned alongside hermesPath — see the sibling T-B2 test
+      // above for why (AU-7 realpath+existence-check derivation would
+      // otherwise reject this fake path against the real FS).
+      config: { hermesPath: '/fake/hermes', pythonPath: '/fake/python' },
       port: 9119,
       probeBackoffMs: [1],
       deps: {

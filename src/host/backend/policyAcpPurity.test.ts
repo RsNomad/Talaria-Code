@@ -44,11 +44,13 @@ const ROOTS = ['policy', 'acp', 'connection', 'control'];
 
 /**
  * Files allowed to import `node:fs` — the sanctioned OS-seam boundaries:
- * `pathConfine.ts` (realpath confinement) and `confinedOpen.ts` (the O_PATH
- * confined-read unit + its runtime probe). Both are the small, reviewed FS
- * boundary the rest of the pure `acp/` core routes through.
+ * `pathConfine.ts` (realpath confinement), `confinedOpen.ts` (the O_PATH
+ * confined-read unit + its runtime probe), and `safeWrite.ts` (AU-14/TD-2:
+ * the `O_NOFOLLOW` confined-WRITE unit — the write-side mirror of
+ * `confinedOpen.ts`'s read-side confinement). All three are the small,
+ * reviewed FS boundary the rest of the pure `acp/` core routes through.
  */
-const FS_ALLOW = new Set(['acp/pathConfine.ts', 'acp/confinedOpen.ts']);
+const FS_ALLOW = new Set(['acp/pathConfine.ts', 'acp/confinedOpen.ts', 'acp/safeWrite.ts']);
 /** Files allowed to import `node:child_process` — the one sanctioned ACP transport. */
 const CHILD_PROCESS_ALLOW = new Set(['acp/acpClient.ts']);
 

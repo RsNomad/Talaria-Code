@@ -202,6 +202,17 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
       createDashboard(),
       new ContextResolver(ports),
       editPreviewRegistry,
+      undefined,
+      // TG-5 (AU-51): the one-shot ephemeral-session-id registry's
+      // persistence port — same `{get, update}` shape + `Promise.resolve`
+      // wrap `setupHost.vscode.ts`'s `SetupHost.globalState` wiring already
+      // uses for `context.globalState`, scoped to `workspaceState` instead
+      // (a one-shot registry is workspace-scoped, matching every other piece
+      // of this connection's state).
+      {
+        get: <T,>(key: string) => context.workspaceState.get<T>(key),
+        update: (key, v) => Promise.resolve(context.workspaceState.update(key, v)),
+      },
     );
   };
 
@@ -325,7 +336,12 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
   // `undefined` and the card honestly reads `waiting-agent`.
   const setupController = new SetupController(
     createVsCodeSetupHost(context),
-    createSetupControllerDeps(() => backend.getAdvertisedAuthMethods?.()),
+    createSetupControllerDeps(
+      () => backend.getAdvertisedAuthMethods?.(),
+      () =>
+        backend.reconnectAgent?.() ??
+        Promise.resolve({ ok: false as const, reason: 'The agent connection is not running yet.' }),
+    ),
   );
   context.subscriptions.push({ dispose: () => setupController.dispose() });
   provider.setSetupController(setupController);

@@ -213,6 +213,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 42,
       method: 'tools.list',
       params: { panel: 'tools' },
@@ -220,7 +221,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
     await flush();
 
     expect(invokeControl).toHaveBeenCalledWith('tools.list', { panel: 'tools' });
-    expect(posted).toEqual([{ type: 'control.response', requestId: 42, ok: true, result: { tools: [] } }]);
+    expect(posted).toEqual([{ type: 'control.response', instanceId: 'test-instance', requestId: 42, ok: true, result: { tools: [] } }]);
   });
 
   it('SEC-4 (audit-3 B-3): redacts credential-shaped fields in a config.show result before posting to the webview', async () => {
@@ -231,6 +232,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 9,
       method: 'config.show',
       params: undefined,
@@ -240,6 +242,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
     expect(posted).toEqual([
       {
         type: 'control.response',
+        instanceId: 'test-instance',
         requestId: 9,
         ok: true,
         result: { mcp_servers: [{ name: 'x', env: '[redacted]' }], theme: 'dark' },
@@ -253,6 +256,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 7,
       method: 'panel.data',
       params: { panel: 'mcp' },
@@ -262,6 +266,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
     expect(posted).toEqual([
       {
         type: 'control.response',
+        instanceId: 'test-instance',
         requestId: 7,
         ok: false,
         error: { message: 'The agent session is not started yet.' },
@@ -275,6 +280,7 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 3,
       method: 'checkpoint.restore',
       params: { id: 'ckpt-1' },
@@ -283,8 +289,71 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
 
     expect(invokeControl).toHaveBeenCalledWith('checkpoint.restore', { id: 'ckpt-1' });
     expect(posted).toEqual([
-      { type: 'control.response', requestId: 3, ok: true, result: { restored: false, reason: 'worktree dirty' } },
+      { type: 'control.response', instanceId: 'test-instance', requestId: 3, ok: true, result: { restored: false, reason: 'worktree dirty' } },
     ]);
+  });
+});
+
+describe('TalariaViewProvider — TE-4 (AU-11 / INV-15): central boundary allowlist refuses an unknown control.request method', () => {
+  it('an unknown control method is refused (ok:false), never reaches backend.invokeControl, and does not echo the method name', async () => {
+    const invokeControl = vi.fn().mockResolvedValue({ ok: true });
+    const { provider, posted } = makeProvider(invokeControl);
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      instanceId: 'test-instance',
+      requestId: 50,
+      method: 'totally.bogus.method',
+    } as never);
+    await flush();
+
+    expect(invokeControl).not.toHaveBeenCalled();
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({ type: 'control.response', instanceId: 'test-instance', requestId: 50, ok: false });
+    const reply = posted[0] as { error?: { message?: string } };
+    expect(reply.error?.message).not.toContain('totally.bogus.method');
+  });
+
+  it("an unknown 'setup.*'-shaped method is refused (ok:false) and fires NO spurious setup status-probe push", async () => {
+    const { provider, posted } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      instanceId: 'test-instance',
+      requestId: 51,
+      method: 'setup.bogus',
+    } as never);
+    await flush();
+    await flush();
+    await flush();
+
+    const reply = posted.find((m) => m.type === 'control.response');
+    expect(reply).toMatchObject({ requestId: 51, ok: false });
+    // The pre-TE-4 bug: `isSetupMethod`'s bare prefix check let this through
+    // to `SetupController.handle`, which fell off its switch with no runtime
+    // default, and `handleSetupMethod` then unconditionally re-pushed fresh
+    // SetupData as a `panel.data` probe even though nothing was handled.
+    const spuriousPush = posted.find((m) => m.type === 'panel.data' && (m as { panel?: string }).panel === 'setup');
+    expect(spuriousPush).toBeUndefined();
+  });
+
+  it('every real CONTROL_METHODS / SetupMethod entry still passes the allowlist (no false-deny)', async () => {
+    const invokeControl = vi.fn().mockResolvedValue({ ok: true });
+    const { provider, posted } = makeProvider(invokeControl);
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      instanceId: 'test-instance',
+      requestId: 52,
+      method: 'tools.list',
+      params: { panel: 'tools' },
+    });
+    await flush();
+
+    expect(posted).toContainEqual(
+      expect.objectContaining({ type: 'control.response', requestId: 52, ok: true }),
+    );
   });
 });
 
@@ -316,6 +385,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 1,
       method: 'context.searchFiles',
       params: { query: 'a', maxResults: 10 },
@@ -325,7 +395,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     expect(searchFiles).toHaveBeenCalledWith('a', 10);
     expect(invokeControl).not.toHaveBeenCalled();
     expect(posted).toEqual([
-      { type: 'control.response', requestId: 1, ok: true, result: ['/repo/src/a.ts', '/repo/src/b.ts'] },
+      { type: 'control.response', instanceId: 'test-instance', requestId: 1, ok: true, result: ['/repo/src/a.ts', '/repo/src/b.ts'] },
     ]);
   });
 
@@ -334,6 +404,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 2,
       method: 'context.searchFiles',
       params: { query: 'a' },
@@ -341,7 +412,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     await flush();
 
     expect(invokeControl).not.toHaveBeenCalled();
-    expect(posted).toEqual([{ type: 'control.response', requestId: 2, ok: true, result: [] }]);
+    expect(posted).toEqual([{ type: 'control.response', instanceId: 'test-instance', requestId: 2, ok: true, result: [] }]);
   });
 
   it('setSearchFiles rewires the source at runtime (the mock→real trust-upgrade path)', async () => {
@@ -351,6 +422,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     provider.setSearchFiles(upgraded);
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 3,
       method: 'context.searchFiles',
       params: {},
@@ -358,7 +430,7 @@ describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
     await flush();
 
     expect(upgraded).toHaveBeenCalledWith('', 50);
-    expect(posted).toEqual([{ type: 'control.response', requestId: 3, ok: true, result: ['/repo/only.ts'] }]);
+    expect(posted).toEqual([{ type: 'control.response', instanceId: 'test-instance', requestId: 3, ok: true, result: ['/repo/only.ts'] }]);
   });
 });
 
@@ -476,7 +548,7 @@ describe('TalariaViewProvider — SF-2 (T4b): mode.set routing', () => {
 
 /** W4-T5b: a fake with the real backend's structural `loadTab` seam. */
 type LoadTabBackend = AgentBackend & {
-  loadTab: (tabId: string, sessionId: string, cwd: string) => Promise<void>;
+  loadTab: (tabId: string, sessionId: string, cwd: string, title?: string) => Promise<void>;
 };
 function makeLoadTabBackend(loadTab = vi.fn().mockResolvedValue(undefined)): LoadTabBackend {
   return { ...makeFakeBackend(), loadTab };
@@ -508,6 +580,19 @@ describe('TalariaViewProvider — W4-T5b: tab.load routing (§2d wire, not a CON
       seam(provider).handleWebviewMessage({ type: 'tab.load', tabId: 'tab-2', sessionId: 'sess-9', cwd: '/ws' }),
     ).not.toThrow();
     await flush();
+  });
+
+  it('beta.7 B1: forwards the title as loadTab’s 4th arg when present — and keeps the TRUE 3-arg call when absent', () => {
+    const backend = makeLoadTabBackend();
+    const { provider } = makeProviderWith(backend);
+
+    seam(provider).handleWebviewMessage({
+      type: 'tab.load', tabId: 'tab-2', sessionId: 'sess-9', cwd: '/ws', title: 'Fix the bug',
+    });
+    expect(backend.loadTab).toHaveBeenCalledWith('tab-2', 'sess-9', '/ws', 'Fix the bug');
+
+    seam(provider).handleWebviewMessage({ type: 'tab.load', tabId: 'tab-2', sessionId: 'sess-9', cwd: '/ws' });
+    expect(backend.loadTab).toHaveBeenLastCalledWith('tab-2', 'sess-9', '/ws');
   });
 });
 
@@ -1143,6 +1228,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 11,
       method: 'nextEdit.toggle',
       params: { source: 'next', on: true },
@@ -1155,6 +1241,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
     expect(calls).toEqual([]);
     expect(posted).toContainEqual({
       type: 'control.response',
+      instanceId: 'test-instance',
       requestId: 11,
       ok: true,
       result: { next: true, generic: false },
@@ -1167,6 +1254,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 12,
       method: 'nextEdit.toggle',
       params: { source: 'generic', on: true },
@@ -1182,6 +1270,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 13,
       method: 'nextEdit.toggle',
       params: { source: 'generic', on: true },
@@ -1190,7 +1279,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     expect(calls).toEqual([]);
     expect(posted).toEqual([
-      { type: 'control.response', requestId: 13, ok: false, error: { message: REFUSE_GENERIC } },
+      { type: 'control.response', instanceId: 'test-instance', requestId: 13, ok: false, error: { message: REFUSE_GENERIC } },
     ]);
   });
 
@@ -1209,6 +1298,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 14,
       method: 'nextEdit.toggle',
       params: { source: 'both', on: 'yes' },
@@ -1229,6 +1319,7 @@ describe('TalariaViewProvider — nextEdit.toggle is HOST-INTERNAL (R5, Task 13)
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 15,
       method: 'nextEdit.toggle',
       params: { source: 'next', on: true },
@@ -1389,6 +1480,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 21,
       method: 'setup.status',
     } as never);
@@ -1413,6 +1505,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 22,
       method: 'setup.recheck',
     } as never);
@@ -1421,7 +1514,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
     await flush();
 
     expect(calls).toEqual([]);
-    expect(posted).toContainEqual({ type: 'control.response', requestId: 22, ok: true, result: { ok: true } });
+    expect(posted).toContainEqual({ type: 'control.response', instanceId: 'test-instance', requestId: 22, ok: true, result: { ok: true } });
   });
 
   it('an accepted setup.* mutation re-pushes fresh SetupData as a panel.data push', async () => {
@@ -1431,6 +1524,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 23,
       method: 'setup.setTunable',
       params: { key: 'talaria.autocomplete.debounceMs', value: 500 },
@@ -1450,6 +1544,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 24,
       method: 'panel.data',
       params: { panel: 'setup' },
@@ -1473,6 +1568,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 25,
       method: 'setup.status',
     } as never);
@@ -1505,6 +1601,7 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 30,
       method: 'setup.setTunable',
       params: { key: 'not-a-real-tunable', value: 1 },
@@ -1658,12 +1755,19 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
  * Zero response-behavior change — these signals are additive observers a
  * Task-6 integration test subscribes to, fired BESIDE the existing
  * `control.response`/`panel.data` traffic these same handlers already send.
- * `hasData` is the honest oracle (`result !== undefined`): an unwired
- * `setupPanelSource` resolves `undefined`, so a cold 'setup' fetch is
- * `ok:true, hasData:false` — never faked to `true` (critic B3).
+ *
+ * AU-10 (fix-wave TE-3): the doc/test below used to read "`hasData` is the
+ * honest oracle (`result !== undefined`): an unwired `setupPanelSource`
+ * resolves `undefined`, so a cold 'setup' fetch is `ok:true, hasData:false`
+ * — never faked to `true`" — but `ok:true, hasData:false` is EXACTLY the
+ * eternal-spinner-with-no-retry shape INV-14 forbids (the webview's
+ * correlated request resolved successfully with nothing, and no push ever
+ * follows). `handleSetupPanelFetch` now REJECTS that pre-`setSetupController`
+ * window with a `PanelUnavailableError` instead, so this fetch is honestly
+ * `ok:false` (still `hasData:false` — nothing changes there).
  */
 describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §4.2)', () => {
-  it('fires {kind:"ready"} on ready, then an honest hasData:false panelFetch for an unwired setup fetch', async () => {
+  it('fires {kind:"ready"} on ready, then an honest ok:false panelFetch for an unwired setup fetch (AU-10: rejected, not silently held at hasData:false)', async () => {
     const { provider } = makeProvider(vi.fn().mockResolvedValue(undefined));
     const signals: WebviewSignal[] = [];
     provider.onWebviewSignal((s) => signals.push(s));
@@ -1671,6 +1775,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
     seam(provider).handleWebviewMessage({ type: 'ready' });
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 100,
       method: 'panel.data',
       params: { panel: 'setup', trigger: 'hydrate' },
@@ -1680,7 +1785,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     expect(signals).toEqual([
       { kind: 'ready' },
-      { kind: 'panelFetch', panel: 'setup', cause: 'hydrate', ok: true, hasData: false },
+      { kind: 'panelFetch', panel: 'setup', cause: 'hydrate', ok: false, hasData: false },
     ]);
   });
 
@@ -1691,6 +1796,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 101,
       method: 'panel.data',
       params: { panel: 'setup', trigger: 'activate' },
@@ -1715,6 +1821,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 102,
       method: 'panel.data',
       params: { panel: 'tools' },
@@ -1731,6 +1838,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     seam(provider).handleWebviewMessage({
       type: 'control.request',
+      instanceId: 'test-instance',
       requestId: 103,
       method: 'panel.data',
       params: { panel: 'nonsense' },
@@ -2091,5 +2199,156 @@ describe('TalariaViewProvider — CF-13/D1: model.addKey ("Add provider key")', 
     const [message] = mockShowErrorMessage.mock.calls[0] as [string];
     expect(message).not.toContain('sk-super-secret-value');
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * ── TE-7 (AU-31, Low): per-view disposable scope does not accumulate ──
+ *
+ * `resolveWebviewView` used to push its per-view subscriptions
+ * (`onDidReceiveMessage`, `onDidDispose`) straight into the PROVIDER-lifetime
+ * `disposables` array, and `setNextEditToggles`/`setSetupController` pushed
+ * their rewired subscription's wrapper there too — on top of their own,
+ * already-correct dispose-old-then-replace single-slot field. Every VS
+ * Code-driven re-resolve (tab hidden→shown, memory-pressure re-create) or
+ * capability rewire therefore left a disposed HUSK behind in that array
+ * forever — freed only at provider `dispose()`. Bounded per call, unbounded
+ * across a long-lived window. `disposablesOf` reaches into the private
+ * provider-lifetime array the same way `seam()` reaches into other private
+ * state elsewhere in this file.
+ */
+function disposablesOf(p: TalariaViewProvider): unknown[] {
+  return (p as unknown as { disposables: unknown[] }).disposables;
+}
+
+describe('TalariaViewProvider — TE-7 (AU-31): per-view disposable scope does not accumulate', () => {
+  it('resolveWebviewView does not grow the provider-lifetime disposables array across re-creates (subscription count stable)', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const baseline = disposablesOf(provider).length;
+
+    const { view: view1 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+    const afterFirst = disposablesOf(provider).length;
+
+    const { view: view2 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view2 as never, {} as never, {} as never);
+    const afterSecond = disposablesOf(provider).length;
+
+    // A THIRD resolve (a long-lived window keeps re-creating) must not grow
+    // it further either — proves the scope REPLACES, not just "caps at 2".
+    const { view: view3 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view3 as never, {} as never, {} as never);
+    const afterThird = disposablesOf(provider).length;
+
+    expect(afterFirst).toBe(baseline);
+    expect(afterSecond).toBe(baseline);
+    expect(afterThird).toBe(baseline);
+  });
+
+  it("resolving a NEW view disposes the PREVIOUS view's onDidReceiveMessage/onDidDispose subscriptions instead of leaving them registered", () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+
+    const disposeMessageSub = vi.fn();
+    const disposeDisposeSub = vi.fn();
+    const view1 = {
+      webview: {
+        cspSource: 'vscode-webview:',
+        asWebviewUri: (uri: unknown) => uri,
+        onDidReceiveMessage: () => ({ dispose: disposeMessageSub }),
+        postMessage: () => Promise.resolve(true),
+      },
+      onDidDispose: () => ({ dispose: disposeDisposeSub }),
+    };
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+
+    expect(disposeMessageSub).not.toHaveBeenCalled();
+    expect(disposeDisposeSub).not.toHaveBeenCalled();
+
+    const { view: view2 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view2 as never, {} as never, {} as never);
+
+    expect(disposeMessageSub).toHaveBeenCalledTimes(1);
+    expect(disposeDisposeSub).toHaveBeenCalledTimes(1);
+  });
+
+  it("the NEW view's onDidReceiveMessage listener is wired end-to-end after a re-create (message handling not lost by the fix)", () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+
+    const { view: view1 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+
+    const posted2: HostToWebviewMessage[] = [];
+    let capturedCb: ((msg: WebviewToHostMessage) => void) | undefined;
+    const view2 = {
+      webview: {
+        cspSource: 'vscode-webview:',
+        asWebviewUri: (uri: unknown) => uri,
+        onDidReceiveMessage: (cb: (msg: WebviewToHostMessage) => void) => {
+          capturedCb = cb;
+          return { dispose() {} };
+        },
+        postMessage: (m: HostToWebviewMessage) => {
+          posted2.push(m);
+          return Promise.resolve(true);
+        },
+      },
+      onDidDispose: () => ({ dispose() {} }),
+    };
+    provider.resolveWebviewView(view2 as never, {} as never, {} as never);
+
+    expect(capturedCb).toBeDefined();
+    capturedCb?.({ type: 'ready' });
+
+    expect(posted2.some((m) => m.type === 'hydrate')).toBe(true);
+  });
+
+  it('setNextEditToggles rewiring does not leave a disposed husk in the provider-lifetime disposables array', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const baseline = disposablesOf(provider).length;
+
+    provider.setNextEditToggles(makeFakeTogglePort({ next: false, generic: false }).port);
+    const afterFirst = disposablesOf(provider).length;
+
+    provider.setNextEditToggles(makeFakeTogglePort({ next: false, generic: false }).port);
+    const afterSecond = disposablesOf(provider).length;
+
+    expect(afterFirst).toBe(baseline);
+    expect(afterSecond).toBe(baseline);
+  });
+
+  it('setSetupController rewiring does not leave disposed husks in the provider-lifetime disposables array', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const baseline = disposablesOf(provider).length;
+
+    provider.setSetupController(new SetupController(new FakeSetupHostForRouting(), makeFakeSetupDeps()));
+    const afterFirst = disposablesOf(provider).length;
+
+    provider.setSetupController(new SetupController(new FakeSetupHostForRouting(), makeFakeSetupDeps()));
+    const afterSecond = disposablesOf(provider).length;
+
+    expect(afterFirst).toBe(baseline);
+    expect(afterSecond).toBe(baseline);
+  });
+
+  it("provider.dispose() still disposes the CURRENT view's per-view subscriptions (drains both the provider and view scopes)", () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+
+    const disposeMessageSub = vi.fn();
+    const disposeDisposeSub = vi.fn();
+    const view1 = {
+      webview: {
+        cspSource: 'vscode-webview:',
+        asWebviewUri: (uri: unknown) => uri,
+        onDidReceiveMessage: () => ({ dispose: disposeMessageSub }),
+        postMessage: () => Promise.resolve(true),
+      },
+      onDidDispose: () => ({ dispose: disposeDisposeSub }),
+    };
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+
+    provider.dispose();
+
+    expect(disposeMessageSub).toHaveBeenCalledTimes(1);
+    expect(disposeDisposeSub).toHaveBeenCalledTimes(1);
   });
 });

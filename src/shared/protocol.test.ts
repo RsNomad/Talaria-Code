@@ -1,6 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { PANEL_SCOPE } from './protocol';
-import type { DataPanel, Scope, SetupData, HostToWebview, SetupMethod, ControlRequestMethod } from './protocol';
+import { PANEL_SCOPE, CONTROL_METHODS, SETUP_METHODS, KNOWN_REQUEST_METHODS } from './protocol';
+import type {
+  DataPanel,
+  Scope,
+  SetupData,
+  HostToWebview,
+  SetupMethod,
+  ControlRequestMethod,
+  ControlMethod,
+  McpServer,
+  McpCatalogEntry,
+  HubScan,
+} from './protocol';
 
 /**
  * W6-FE Part 2 (3-way ARCH I-3a) — proves the explicit `PANEL_SCOPE` map
@@ -237,5 +248,91 @@ describe('protocol — Setup panel contract (Task 8)', () => {
     // carries on the wire.
     const asControlRequest: ControlRequestMethod[] = methods;
     expect(asControlRequest).toHaveLength(3);
+  });
+});
+
+describe('KNOWN_REQUEST_METHODS (TE-4 / AU-11 / INV-15) — boundary allowlist derived from the source arrays', () => {
+  it('accepts every CONTROL_METHODS entry (no false-deny of a real control method)', () => {
+    for (const m of CONTROL_METHODS) {
+      expect(KNOWN_REQUEST_METHODS.has(m)).toBe(true);
+    }
+  });
+
+  it('accepts every SETUP_METHODS entry (no false-deny of a real setup method)', () => {
+    for (const m of SETUP_METHODS) {
+      expect(KNOWN_REQUEST_METHODS.has(m)).toBe(true);
+    }
+  });
+
+  it('accepts the three provider-level special-cases (panel.data, nextEdit.toggle, context.searchFiles)', () => {
+    expect(KNOWN_REQUEST_METHODS.has('panel.data')).toBe(true);
+    expect(KNOWN_REQUEST_METHODS.has('nextEdit.toggle')).toBe(true);
+    expect(KNOWN_REQUEST_METHODS.has('context.searchFiles')).toBe(true);
+  });
+
+  it('refuses an unknown method name, including one that merely LOOKS like a setup method', () => {
+    expect(KNOWN_REQUEST_METHODS.has('setup.bogus')).toBe(false);
+    expect(KNOWN_REQUEST_METHODS.has('totally.unknown.method')).toBe(false);
+  });
+
+  it('is EXACTLY CONTROL_METHODS ∪ SETUP_METHODS ∪ the three extras — a drift lock, not a superset', () => {
+    const expected = new Set<string>([
+      ...CONTROL_METHODS,
+      ...SETUP_METHODS,
+      'panel.data',
+      'nextEdit.toggle',
+      'context.searchFiles',
+    ]);
+    expect(KNOWN_REQUEST_METHODS.size).toBe(expected.size);
+    for (const m of expected) {
+      expect(KNOWN_REQUEST_METHODS.has(m)).toBe(true);
+    }
+  });
+});
+
+describe('T1 MCP admin protocol surface', () => {
+  it('the seven mcp.* methods are ControlMethods and flow into ControlRequestMethod', () => {
+    const methods: ControlMethod[] = ['mcp.add', 'mcp.remove', 'mcp.test', 'mcp.setEnabled', 'mcp.auth', 'mcp.catalog', 'mcp.catalogInstall'];
+    const asControlRequest: ControlRequestMethod[] = methods; // compile-time flow (protocol.test.ts:231-238 pattern)
+    expect(asControlRequest).toHaveLength(7);
+    expect(CONTROL_METHODS).toEqual(expect.arrayContaining(methods));
+  });
+  it('McpServer carries enabled + transport', () => {
+    const s: McpServer = { id: 'x', name: 'x', status: 'disconnected', command: 'npx y', toolCount: 0, enabled: true, transport: 'stdio' };
+    expect(s.enabled).toBe(true);
+    expect(s.transport).toBe('stdio');
+  });
+  it('McpCatalogEntry pins the verbatim server row shape (web_server.py:10710-10740)', () => {
+    const e: McpCatalogEntry = { name: 'n8n', description: 'd', source: 's', transport: 'stdio', auth_type: 'api_key',
+      required_env: [{ name: 'N8N_KEY', prompt: 'API key', required: true }], command: 'npx', args: ['-y', 'x'],
+      url: null, install_url: null, install_ref: null, bootstrap: [], default_enabled: null, post_install: '', needs_install: false,
+      installed: false, enabled: false };
+    expect(e.needs_install).toBe(false);
+  });
+});
+
+describe('T2 skills admin protocol surface (B1)', () => {
+  it('the five skills.* hub/create methods are ControlMethods and flow into ControlRequestMethod', () => {
+    const methods: ControlMethod[] = ['skills.create', 'skills.hubPreview', 'skills.hubScan', 'skills.hubInstall', 'skills.hubUninstall'];
+    const asControlRequest: ControlRequestMethod[] = methods; // compile-time flow (protocol.test.ts:254-258 T1 pattern)
+    expect(asControlRequest).toHaveLength(5);
+    expect(CONTROL_METHODS).toEqual(expect.arrayContaining(methods));
+  });
+  it('HubScan pins the verbatim scan response shape, incl. source/policy_reason/severity_counts (web_server.py:12162-12173)', () => {
+    const scan: HubScan = {
+      name: 'my-skill',
+      identifier: 'org/my-skill',
+      source: 'github.com/org/skills-repo',
+      trust_level: 'trusted',
+      verdict: 'safe',
+      summary: 'No issues found.',
+      policy: 'allow',
+      policy_reason: 'trusted source, no findings',
+      findings: [{ severity: 'low', category: 'style', file: 'SKILL.md', line: 3, description: 'minor nit' }],
+      severity_counts: { critical: 0, high: 0, medium: 0, low: 1 },
+    };
+    expect(scan.source).toBe('github.com/org/skills-repo');
+    expect(scan.policy_reason).toBe('trusted source, no findings');
+    expect(scan.severity_counts).toEqual({ critical: 0, high: 0, medium: 0, low: 1 });
   });
 });

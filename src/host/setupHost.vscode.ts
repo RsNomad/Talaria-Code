@@ -6,7 +6,7 @@ import { unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
-import type { ExecLookup } from './runtime/resolveHermes';
+import { resolveHermesBin, type ExecLookup } from './runtime/resolveHermes';
 import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
@@ -52,11 +52,22 @@ import { createVsCodeNextEditConfigPort } from '../autocomplete/nextedit/guard';
 
 // --- SpawnFn (installHermes's subprocess seam) ------------------------------
 
-/** Same 10s login-shell lookup timeout `resolveHermes.ts`/`pipxLocator.ts` use. */
-function createExecLookup(): ExecLookup {
+/**
+ * Same 10s login-shell lookup timeout `resolveHermes.ts`/`pipxLocator.ts`
+ * use. Exported (TC-5/AU-28) so its `signal` wiring can be pinned directly
+ * against a REAL `execFile` abort (Global Constraint 4 — the `ExecLookup`
+ * seam carries no error shape of its own), matching `resolveHermes.ts`'s own
+ * `defaultExecLookup` — this is the SECOND of the two `ExecLookup`
+ * implementations the AU-28 fix names; it is the one actually reachable in
+ * production (bound into `locatePipx`/`discoverHermes`/
+ * `createLocateLlamaServer` below), so before this fix Cancel could only
+ * ever be observed BETWEEN a locator's steps, never during an in-flight
+ * probe.
+ */
+export function createExecLookup(): ExecLookup {
   return (command, args, opts) =>
     new Promise<string>((resolve, reject) => {
-      execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd }, (err, stdout) => {
+      execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd, signal: opts.signal }, (err, stdout) => {
         if (err) reject(err);
         else resolve(stdout);
       });
@@ -86,6 +97,18 @@ export function createNodeSpawnFn(): SpawnFn {
       settleExit = resolve;
     });
 
+    // TC-4/AU-29: stderr is routed through a locally pushable/endable
+    // channel (never `child.stderr` directly) so the `'error'` handler
+    // below can inject a synthetic diagnostic line BEFORE the channel ends.
+    // A spawn-level failure (e.g. ENOENT — the pipx binary itself missing)
+    // never carries real stderr bytes (confirmed ordering: `'error'` fires,
+    // THEN `child.stderr` closes empty) — without this every consumer
+    // (`pipxInstaller.ts`'s `tail(stderrLines)`) built its failure detail
+    // from nothing, rendering `hermes install failed at phase "…": ` with
+    // nothing after the colon. Real stderr bytes are still forwarded
+    // through unchanged for every ordinary (non-spawn-error) failure.
+    const stderrChannel = createPushableLineChannel(child.stderr);
+
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     const onAbort = (): void => {
       child.kill('SIGTERM');
@@ -111,19 +134,80 @@ export function createNodeSpawnFn(): SpawnFn {
       // `exitCode: Promise<number>`, no rejection case modeled).
       settleExit(code ?? (signal ? -1 : 0));
     });
-    child.once('error', () => {
+    child.once('error', (err: NodeJS.ErrnoException) => {
       cleanup();
       // A spawn-level error (e.g. ENOENT) still must SETTLE, not reject —
       // surfaced as a clearly-non-zero code so `exitCode !== 0` checks fire.
+      // TC-4/AU-29: push the real reason onto stderr — native stdio never
+      // carries anything for a process that never actually started, so
+      // without this every downstream failure detail built from stderr
+      // alone came out blank.
+      stderrChannel.push(`spawn failed: ${err.code ?? err.name}: ${err.message}`);
+      stderrChannel.end();
       settleExit(-1);
     });
 
     return {
       stdout: lineIterable(child.stdout),
-      stderr: lineIterable(child.stderr),
+      stderr: stderrChannel.iterable,
       exitCode,
     };
   };
+}
+
+/**
+ * TC-4/AU-29: a push/end-controllable async line channel for `stderr` —
+ * real bytes from `source` are forwarded into the SAME channel (via {@link
+ * lineIterable} in the background), so ordinary stderr output passes
+ * through unaffected; `push`/`end` additionally let `createNodeSpawnFn`'s
+ * `'error'` handler inject one synthetic diagnostic line and terminate the
+ * channel immediately, without waiting on (or racing against) the
+ * underlying Readable's own completion. `push` after `end` is a silent
+ * no-op — the channel is already closed, so there is no consumer left to
+ * deliver it to; `end` itself is idempotent (the background forwarder
+ * above also calls it when the real stream finishes).
+ */
+function createPushableLineChannel(source: NodeJS.ReadableStream | null): {
+  iterable: AsyncGenerator<string>;
+  push(line: string): void;
+  end(): void;
+} {
+  const queue: string[] = [];
+  let ended = false;
+  let wake: (() => void) | undefined;
+
+  const push = (line: string): void => {
+    if (ended) return;
+    queue.push(line);
+    wake?.();
+    wake = undefined;
+  };
+  const end = (): void => {
+    if (ended) return;
+    ended = true;
+    wake?.();
+    wake = undefined;
+  };
+
+  async function* generate(): AsyncGenerator<string> {
+    for (;;) {
+      if (queue.length > 0) {
+        yield queue.shift() as string;
+        continue;
+      }
+      if (ended) return;
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  }
+
+  void (async () => {
+    for await (const line of lineIterable(source)) push(line);
+    end();
+  })();
+
+  return { iterable: generate(), push, end };
 }
 
 /** Splits a Node readable byte stream into UTF-8 lines (CRLF-tolerant),
@@ -465,9 +549,15 @@ const boundFetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
  * `SetupController.status()` call — never a construction-time snapshot, so
  * the trust-upgrade mock→real swap and every `talaria.newSession`
  * re-initialize are picked up automatically.
+ * @param reconnectAgent beta.7 B3: OPTIONAL — mirrors
+ * {@link SetupControllerDeps.reconnectAgent}'s optionality exactly so every
+ * existing zero-second-arg factory call site keeps compiling unchanged.
+ * `extension.ts` passes a thunk over the CURRENT backend
+ * (`() => backend.reconnectAgent?.() ?? Promise.resolve({ok:false,...})`).
  */
 export function createSetupControllerDeps(
   getAdvertisedAuthMethods: () => AdvertisedAuthMethod[] | undefined,
+  reconnectAgent?: () => Promise<{ ok: true } | { ok: false; reason: string }>,
 ): SetupControllerDeps {
   const exec = createExecLookup();
   const spawn = createNodeSpawnFn();
@@ -484,6 +574,13 @@ export function createSetupControllerDeps(
     // dropped at this wiring seam despite the plumbing being correct on
     // both sides of it.
     locatePipx: (signal) => locatePipx(exec, signal),
+    // TC-3 (AU-8/INV-11): the SAME settings-OR-PATH resolution the runtime
+    // uses (resolveHermes.ts's resolveHermesBin) — `{}` means no
+    // `hermesPath` override, so this always runs the login-shell PATH
+    // lookup. SetupController only ever calls this when `talaria.hermesPath`
+    // is empty (see kickHermesDiscovery), so the empty-config call here is
+    // never redundant with a configured setting.
+    discoverHermes: () => resolveHermesBin({}, exec),
     // T5 §1.2: the container-boundary-aware os-release read (real fs seams).
     readOsRelease: createReadOsRelease(),
     installHermes: (recipe, env, onEvent, signal) => installHermes(recipe, env, spawn, fileExists, onEvent, signal),
@@ -534,6 +631,10 @@ export function createSetupControllerDeps(
     // createNodeGgufIngestIo's doc).
     downloadGgufToStore: (spec, destDir, destFile, onProgress, signal) =>
       downloadGgufToStore(ggufIo, spec, destDir, destFile, onProgress, signal),
+    // beta.7 B3: conditional spread — an absent second arg omits the key
+    // entirely (never `reconnectAgent: undefined`), so every existing
+    // zero-second-arg factory call keeps compiling and behaving unchanged.
+    ...(reconnectAgent !== undefined ? { reconnectAgent } : {}),
   };
 }
 

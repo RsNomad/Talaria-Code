@@ -285,12 +285,62 @@ export interface McpServer {
   command: string;
   /** Tools exposed by this server once connected. */
   toolCount: number;
+  /** `cfg.enabled !== false`. */
+  enabled: boolean;
+  /** `cfg.url ? 'http' : cfg.command ? 'stdio' : 'unknown'` (mirrors web_server.py:10382). */
+  transport: 'stdio' | 'http' | 'unknown';
 }
 
 /** MCP panel payload. Origin: TUI `reload.mcp` snapshot. */
 export interface McpData {
   servers: McpServer[];
 }
+
+/** `mcp.add` params — discriminated on `transport` (§4.2). */
+export type McpAddParams =
+  | { name: string; transport: 'stdio'; command: string; args: string[]; env: Record<string, string> }
+  | { name: string; transport: 'http'; url: string };
+
+/** `transport` is threaded from the VALIDATED McpAddParams discriminant (the request's own
+ *  `params.transport` after `validateMcpAdd` accepted it) — `validateMcpAdd`'s wire `body`
+ *  deliberately drops it (the REST body has no transport field), so the §4.5 handler returns
+ *  `{ ok: true, name: body.name, transport: params.transport }`. */
+export interface McpAddResult { ok: true; name: string; transport: 'stdio' | 'http' }
+
+/** Envelope of mcp.test AND mcp.auth — verbatim server shape (web_server.py:10537-10542, :10630-10652). */
+export interface McpTestResult { ok: boolean; error?: string; tools: { name: string; description: string }[] }
+
+/** One GET /api/mcp/catalog entry, verbatim server shape (web_server.py:10710-10740, incl. default_enabled :10732-10735). */
+export interface McpCatalogEntry {
+  name: string;
+  description: string;
+  source: string;
+  transport: string;
+  auth_type: string;
+  required_env: { name: string; prompt: string; required: boolean }[];
+  command: string | null;
+  args: string[];
+  url: string | null;
+  install_url: string | null;
+  install_ref: string | null;
+  bootstrap: string[];
+  default_enabled: string[] | null;
+  post_install: string;
+  needs_install: boolean;
+  installed: boolean;
+  enabled: boolean;
+}
+export interface McpCatalogData { entries: McpCatalogEntry[] }
+
+/**
+ * Rev-1 B4 (CF-13 parity, TH-4): `env` is deliberately ABSENT — the webview
+ * never submits a credential value. The host prompts for each of the
+ * catalog entry's OWN `required_env` vars itself, masked
+ * (`vscode.window.showInputBox({password:true})`), AFTER the install
+ * consent modal is confirmed (`ControlDispatcher.mcpCatalogInstall`).
+ */
+export interface McpCatalogInstallParams { name: string }
+export interface McpCatalogInstallResult { ok: true; name: string }
 
 /**
  * One skill row. Origin (W1.5): the dashboard REST surface `GET /api/skills`
@@ -333,6 +383,44 @@ export interface SkillInfo {
 export interface SkillsData {
   skills: SkillInfo[];
   categories: string[];
+}
+
+/** `skills.create` params — user-authored skill (§5.2 of the MCP/skills architecture brief). */
+export interface SkillCreateParams {
+  name: string;
+  content: string;
+  category?: string;
+}
+
+/** One Skill Hub search-result preview, verbatim server shape (§5.2). */
+export interface HubPreview {
+  name: string;
+  description: string;
+  source: string;
+  identifier: string;
+  trust_level: string;
+  skill_md: string;
+  files: string[];
+}
+
+/** Verbatim scan response shape (web_server.py:12162-12173). */
+export interface HubScan {
+  name: string;
+  identifier: string;
+  source: string;
+  trust_level: string;
+  verdict: 'safe' | 'caution' | 'dangerous';
+  summary: string;
+  policy: 'allow' | 'ask' | 'block';
+  policy_reason: string;
+  findings: { severity: string; category: string; file: string; line: number; description: string }[];
+  severity_counts: { critical: number; high: number; medium: number; low: number };
+}
+
+/** `skills.hubInstall` result — resolved ONLY after presence re-check. */
+export interface HubInstallResult {
+  ok: true;
+  name: string;
 }
 
 /**
@@ -559,6 +647,14 @@ export interface ModelProvider {
   /** Whether an API key / credential is configured for this provider. */
   connected: boolean;
   models: ModelInfo[];
+  /**
+   * beta.7 B4: true for synthetic rows that are not a real credentialed
+   * provider (today only Hermes' MoA row — inventory.py `_moa_provider_row`,
+   * `source:'virtual'`). Virtual rows get NO "Add key" affordance:
+   * `model.save_key` has no PROVIDER_REGISTRY entry for them and refuses
+   * (`unknown provider: moa`, server.py 4002).
+   */
+  virtual?: boolean;
 }
 
 /** Models panel payload. Origin: TUI `model.options` + ACP `session/set_model`. */
@@ -949,6 +1045,9 @@ export interface SetupProgress {
   line?: string;
   totalBytes?: number;
   completedBytes?: number;
+  /** §7.2.2: terminal marker — the (op,id) stream has SETTLED (success, failure,
+   *  or cancel); the webview deletes its accumulated entry. Carries no other payload. */
+  done?: true;
 }
 
 /**
@@ -1778,6 +1877,24 @@ export const CONTROL_METHODS = [
   // user-supplied glob), results filtered through `isSecretForCompletion`
   // (no free secret-path enumeration for a compromised webview). See §2e.
   'context.searchFiles',
+  // T1 — MCP admin + Nous catalog surface (add/remove/test/enable/auth over
+  // the dashboard REST channel; §4.2 of the MCP/skills architecture brief).
+  'mcp.add',
+  'mcp.remove',
+  'mcp.test',
+  'mcp.setEnabled',
+  'mcp.auth',
+  'mcp.catalog',
+  'mcp.catalogInstall',
+  // T2 — skills admin + Hub surface (create/preview/scan/install/uninstall
+  // over the dashboard REST channel; §5.2 of the MCP/skills architecture
+  // brief). Additions only — the pre-existing `skills.toggle` above is
+  // untouched.
+  'skills.create',
+  'skills.hubPreview',
+  'skills.hubScan',
+  'skills.hubInstall',
+  'skills.hubUninstall',
 ] as const;
 
 /** A control-plane RPC name the webview may invoke. Derived from {@link CONTROL_METHODS}. */
@@ -1837,35 +1954,47 @@ export type ControlMethod = (typeof CONTROL_METHODS)[number];
  * OS-detection engine for the DETECTED distro family — refused fail-closed
  * (`{ok:false}`, no modal, no terminal) when the engine has no verified
  * line (unknown distro, container degrade, or a guidance-only Python plan).
+ *
+ * TE-4 (AU-11, INV-15): a `const` array — same `as const` inversion {@link
+ * CONTROL_METHODS} already got (finding A#2) — so {@link SetupMethod} and the
+ * runtime boundary allowlist ({@link KNOWN_REQUEST_METHODS}) are BOTH derived
+ * from this ONE source and can never drift against each other.
  */
-export type SetupMethod =
-  | 'setup.status'
-  | 'setup.install'
-  | 'setup.applyAgent'
-  | 'setup.applyFim'
-  | 'setup.setApiKey'
-  | 'setup.testRemote'
-  | 'setup.pullModel'
+export const SETUP_METHODS = [
+  'setup.status',
+  'setup.install',
+  'setup.applyAgent',
+  'setup.applyFim',
+  'setup.setApiKey',
+  'setup.testRemote',
+  'setup.pullModel',
   // beta.6 T7 (§1.3/§2.5): catalog-id provisioning — the ONE place a verified
   // catalog model gets pulled/downloaded/ingested. The webview sends
   // `{modelId, backend, endpoint?}`; the host re-resolves EVERYTHING from
   // `MODEL_CATALOG` (unknown id ⇒ refuse; 'vllm' ⇒ refused, never ignored).
-  | 'setup.provisionModel'
+  'setup.provisionModel',
   // beta.6 T8 (§1.3/§2.5): saves (or, `{clear:true}`, unsets) the "Configure
   // Local Agent Model" block's selection — `{modelId, backend, endpoint}`
   // (`modelId` must be a role='agent' catalog row) writes the 3
   // `talaria.agent.localModel.*` settings Global; `status()` recomposes
   // `agentLocalModel.saved`/`providerGuidance` from them on every read.
-  | 'setup.saveAgentModel'
-  | 'setup.cancel'
-  | 'setup.openProviderWizard'
-  | 'setup.openInstallTerminal'
-  | 'setup.openBootstrapTerminal'
-  | 'setup.recheck'
-  | 'setup.reload'
-  | 'setup.setNextEdit'
-  | 'setup.setRag'
-  | 'setup.setTunable';
+  'setup.saveAgentModel',
+  'setup.cancel',
+  'setup.openProviderWizard',
+  'setup.openInstallTerminal',
+  'setup.openBootstrapTerminal',
+  'setup.recheck',
+  'setup.reload',
+  // beta.7 B3: re-advertise auth methods after `hermes model` — Hermes
+  // builds them only inside `initialize()`, acp_adapter/server.py:875.
+  'setup.reconnectAgent',
+  'setup.setNextEdit',
+  'setup.setRag',
+  'setup.setTunable',
+] as const;
+
+/** A Setup-panel control-request method. Derived from {@link SETUP_METHODS}. */
+export type SetupMethod = (typeof SETUP_METHODS)[number];
 
 /**
  * Method a correlated {@link WebviewToHost} `control.request` may invoke. It is
@@ -1877,6 +2006,28 @@ export type SetupMethod =
  * additions are tui_gateway-forwarded).
  */
 export type ControlRequestMethod = ControlMethod | 'panel.data' | 'nextEdit.toggle' | SetupMethod;
+
+/**
+ * TE-4 (AU-11, INV-15): the CLOSED set of every method name a `control.request`
+ * may legitimately carry — the boundary allowlist `TalariaViewProvider
+ * .handleControlRequest` checks FIRST, before any dispatch. DERIVED from the
+ * same `as const` arrays {@link ControlMethod}/{@link SetupMethod} come from
+ * (never a second hand-maintained list — the exact drift this closes: before
+ * this Set existed, the gate lived ONLY inside `ControlDispatcher`
+ * (`AcpBackend`'s path), so a name that slipped past `isSetupMethod`'s bare
+ * prefix check, or reached `MockBackend` directly, was never checked at all).
+ * `'panel.data'` / `'nextEdit.toggle'` / `'context.searchFiles'` are the three
+ * provider-level special-cases {@link ControlRequestMethod} already carries
+ * outside {@link ControlMethod}/{@link SetupMethod} — enumerated here so the
+ * allowlist covers the FULL wire type, not just the two backing arrays.
+ */
+export const KNOWN_REQUEST_METHODS: ReadonlySet<string> = new Set<ControlRequestMethod>([
+  ...CONTROL_METHODS,
+  ...SETUP_METHODS,
+  'panel.data',
+  'nextEdit.toggle',
+  'context.searchFiles',
+]);
 
 /**
  * W5.1 R5 (Task 13): which of the two mutually-exclusive next-edit sources a
@@ -1912,10 +2063,20 @@ export interface NextEditToggleState {
  * arrives via the `panel.data` push, per that method's contract); `ok:false`
  * carries the rejection message so the requester can reject its pending
  * promise (and, for panels, render an Error+Retry state).
+ *
+ * `instanceId` (AU-9/INV-13, TE-2): the requesting page instance's id,
+ * echoed back VERBATIM from the {@link WebviewToHost} `control.request` that
+ * carried it — lets `RpcClient.handleResponse` drop a stale response from a
+ * PRIOR webview instance (reload/re-create) instead of resolving a
+ * same-`requestId` pending request a fresh instance's `seq` counter happens
+ * to have reused. OPTIONAL (unlike the request's own required `instanceId`)
+ * so an older/defensive producer of this envelope (e.g. the standalone
+ * `MockBackend`, which never echoes one) is still a valid, TRUSTED response —
+ * additive, same-vsix-lockstep wire field, no compat shim needed.
  */
 export type ControlResponse =
-  | { ok: true; result: unknown }
-  | { ok: false; error: { message: string } };
+  | { ok: true; result: unknown; instanceId?: string }
+  | { ok: false; error: { message: string }; instanceId?: string };
 
 /**
  * Result payload of a `checkpoint.restore` correlated request (Zone CKPT).
@@ -2118,8 +2279,12 @@ export type WebviewToHost =
    * click, generalized from the old single-session `session.load`). Host
    * announces `tab.bound` BEFORE replaying (§7 B9 race rule (b)), then
    * streams the replay through the normal pipeline.
+   *
+   * B1: `title` is display-only — the row's title (or its own
+   * "Untitled session" fallback), echoed back on `tab.bound` so the tab
+   * chip can show it. The host never interpolates it anywhere else.
    */
-  | { type: 'tab.load'; tabId: string; sessionId: string; cwd: string }
+  | { type: 'tab.load'; tabId: string; sessionId: string; cwd: string; title?: string }
 
   /**
    * SF-2: switch (or clear, `null`) the session's active custom mode. Host
@@ -2142,12 +2307,20 @@ export type WebviewToHost =
    * data fetch (drives Loading/Error+Retry) and `checkpoint.restore` (learns
    * the dirty-worktree-guard outcome). `requestId` is monotonic per webview
    * session.
+   *
+   * `instanceId` (AU-9/INV-13, TE-2): the issuing page instance's id (minted
+   * once per webview (re)creation — see `bridge.ts`). The host echoes it back
+   * verbatim on the `control.response`, and `RpcClient.handleResponse` uses
+   * it to drop a late reply from a PRIOR, now-disposed page instance rather
+   * than let it resolve an unrelated pending request a fresh instance's own
+   * `requestId` counter happens to have reused.
    */
   | {
       type: 'control.request';
       requestId: number;
       method: ControlRequestMethod;
       params?: Record<string, unknown>;
+      instanceId: string;
     };
 
 /* ------------------------------------------------------------------ *

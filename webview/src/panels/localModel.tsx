@@ -199,6 +199,7 @@ function OllamaBackendHeader({
         <div className="flex flex-wrap items-center gap-2">
           <ActionButton
             label="Open terminal: install Ollama"
+            pendingLabel="Installing…"
             onRun={() => dispatch('setup.openInstallTerminal', { backendId: 'ollama' })}
             disabledReason={disabledReason}
           />
@@ -254,13 +255,26 @@ function LlamacppBackendHeader({
       <div className="flex flex-col gap-1.5">
         <StatusLine icon="circle-outline" text={LLAMACPP_MISSING_TEXT} tone="neutral" />
         {install?.command ? (
-          <div className="flex flex-wrap items-center gap-2">
-            <ActionButton
-              label={`Open terminal: ${install.command}`}
-              onRun={() => dispatch('setup.openInstallTerminal', { backendId: 'llamacpp' })}
-              disabledReason={disabledReason}
-            />
-            <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck', recheckScopeParams('llamacpp'))} />
+          <div className="flex flex-col gap-1.5">
+            {/* AU-44b: the raw command used to be interpolated INSIDE the
+                uppercase button label (`Open terminal: ${command}`) — the
+                `uppercase` CSS class then rendered a case-sensitive shell
+                command in all-caps, both hard to read and actively
+                misleading (the real command isn't upper-case). The label
+                is now the ACTION; the command renders as its own mono
+                caption underneath, exactly as typed. */}
+            <div className="flex flex-wrap items-center gap-2">
+              <ActionButton
+                label="Open terminal"
+                pendingLabel="Installing…"
+                onRun={() => dispatch('setup.openInstallTerminal', { backendId: 'llamacpp' })}
+                disabledReason={disabledReason}
+              />
+              <ActionButton label="Re-check" onRun={() => dispatch('setup.recheck', recheckScopeParams('llamacpp'))} />
+            </div>
+            <p className="font-mono text-2xs text-muted" title={install.command}>
+              {install.command}
+            </p>
           </div>
         ) : (
           <div className="flex flex-col gap-1.5">
@@ -470,7 +484,13 @@ export function RunCommandLine({ command, label }: { command: string; label?: st
       <span className="min-w-0 flex-1 truncate font-mono text-fg" title={command}>
         {command}
       </span>
-      <ActionButton label="Copy" icon="copy" onRun={() => navigator.clipboard.writeText(command)} />
+      <ActionButton
+        label="Copy"
+        icon="copy"
+        pendingLabel="Copying…"
+        successLabel="✓ Copied"
+        onRun={() => navigator.clipboard.writeText(command)}
+      />
     </div>
   );
 }
@@ -515,7 +535,13 @@ export function TestAndServingLine({
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex flex-wrap items-center gap-2">
-        <ActionButton label={testConnectionLabel(endpoint)} icon="plug" onRun={runTest} successLabel="✓ Endpoint reachable" />
+        <ActionButton
+          label={testConnectionLabel(endpoint)}
+          icon="plug"
+          pendingLabel="Testing…"
+          onRun={runTest}
+          successLabel="✓ Endpoint reachable"
+        />
       </div>
       {servingModels && <p className="text-2xs text-muted">{servingLine(servingModels)}</p>}
     </div>
@@ -551,12 +577,14 @@ function ActionButton({
   disabledReason,
   icon,
   successLabel,
+  pendingLabel,
 }: {
   label: string;
   onRun: () => Promise<unknown>;
   disabledReason?: string;
   icon?: string;
   successLabel?: string;
+  pendingLabel?: string;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
@@ -602,7 +630,7 @@ function ActionButton({
         className="inline-flex items-center gap-1.5 rounded border border-border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide text-muted transition-colors hover:bg-overlay aria-disabled:cursor-default aria-disabled:opacity-50 disabled:cursor-not-allowed disabled:opacity-50"
       >
         {icon && <Icon name={icon} size={12} spin={pending} />}
-        {pending ? 'Working…' : label}
+        {pending ? (pendingLabel ?? 'Working…') : label}
       </button>
       <LiveRegion text={liveText} className={liveClass} title={error} />
     </div>

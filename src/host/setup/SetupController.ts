@@ -25,6 +25,7 @@ import type {
   SetupMethod,
   SetupProgress,
 } from '../../shared/protocol';
+import { SETUP_METHODS } from '../../shared/protocol';
 
 /**
  * SetupController — the host-side brain for Setup / Talaria Config
@@ -364,6 +365,35 @@ export interface SetupControllerDeps {
     onProgress: (p: PullProgress) => void,
     signal: AbortSignal,
   ): Promise<void>;
+  /**
+   * beta.7 B3: the deliberate teardown+respawn+re-`initialize()` reconnect —
+   * bound to `() => backend.reconnectAgent?.() ?? Promise.resolve({ok:false,
+   * reason:...})` (a thunk over the CURRENT backend, `extension.ts`) so the
+   * trust-upgrade mock→real swap is reflected on the next call. OPTIONAL
+   * (posture of `loadTab?`/`getAdvertisedAuthMethods?` above) — NOT a
+   * required member: a required member would break `check-types:all` in
+   * every existing deps-literal/factory-call test site. `undefined` = no
+   * ACP backend bound (mock backend) — {@link SetupController.
+   * handleReconnectAgent} fails closed with an honest reason rather than
+   * throwing.
+   */
+  reconnectAgent?(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * TC-3 (AU-8 / INV-11): the SAME settings-OR-PATH resolution the runtime
+   * uses to find `hermes` — bound to `resolveHermesBin({}, exec)`
+   * (`src/host/runtime/resolveHermes.ts`) by the caller. Called ONLY when
+   * `talaria.hermesPath` is empty (a configured setting is authoritative and
+   * is never second-guessed by a PATH probe); resolves the discovered
+   * absolute path, or REJECTS if the login-shell PATH lookup fails —
+   * {@link SetupController.kickHermesDiscovery} maps a rejection to the
+   * honest "not found" memo state, mirroring {@link
+   * SetupControllerDeps.locateLlamaServer}'s reject→settle posture. OPTIONAL
+   * (same idiom as {@link reconnectAgent} above, same reason: a required
+   * member would break every existing deps-literal/factory-call test site);
+   * `undefined` binding = the phase truth stays settings-only, i.e. the
+   * pre-AU-8 behavior, never a crash.
+   */
+  discoverHermes?(): Promise<string>;
 }
 
 // --- misc constants -------------------------------------------------------
@@ -614,6 +644,7 @@ export const MUTATING_METHODS = new Set<SetupMethod>([
   'setup.openInstallTerminal',
   'setup.openBootstrapTerminal',
   'setup.reload',
+  'setup.reconnectAgent',
   'setup.setNextEdit',
   'setup.setRag',
   'setup.setTunable',
@@ -628,6 +659,20 @@ export const READ_ONLY_METHODS: readonly SetupMethod[] = [
   'setup.cancel',
   'setup.recheck',
 ];
+
+/** TE-4 (AU-11, INV-15) belt: derived from the SAME `SETUP_METHODS` `as
+ *  const` array {@link SetupMethod} comes from — checked at RUNTIME by
+ *  {@link SetupController.handle} before its switch. The switch itself is
+ *  exhaustive only at COMPILE time (`method: SetupMethod`); a `postMessage`
+ *  payload is never actually type-checked, so a name outside this Set fell
+ *  through every `case` with no runtime `default`, implicitly returning
+ *  `undefined` — which the caller (`TalariaViewProvider.handleSetupMethod`)
+ *  then read as a success (`ok:true`) AND used as the trigger to push a
+ *  fresh `SetupData` status probe. `TalariaViewProvider.handleControlRequest`
+ *  now refuses an unknown method before `handle` is ever reached (the
+ *  primary chokepoint) — this Set is the second, independent belt for any
+ *  other caller of `handle` directly. */
+const SETUP_METHOD_SET: ReadonlySet<string> = new Set<SetupMethod>(SETUP_METHODS);
 
 interface ThrottleState {
   lastEmit: number;
@@ -711,6 +756,32 @@ export class SetupController {
    *  nor fire a stray push. */
   private llamaCppProbeEpoch = 0;
 
+  /**
+   * TC-3 (AU-8 / INV-11): the Hermes PATH-discovery settled-value memo —
+   * SAME posture as {@link llamaCppRuntime} above. `undefined` = never
+   * probed; `{found: string | null}` = settled (`found` = the discovered
+   * absolute path, `null` = the login-shell PATH lookup came up empty or
+   * rejected — the honest "not found" outcome, never a thrown error out of
+   * `status()`). `status()` kicks the probe lazily ({@link
+   * kickHermesDiscovery}) ONLY when `talaria.hermesPath` is unset, and only
+   * while `this.deps.discoverHermes` is bound — an unbound dep (older/
+   * partial wiring) leaves this memo permanently `undefined`, which {@link
+   * computeAgentPhase} reads exactly like the pre-AU-8 settings-only truth.
+   */
+  private hermesPathDiscovery?: { found: string | null };
+  /** True while a discovery attempt is in flight — with {@link
+   *  hermesPathDiscovery} `undefined` + this false, the next `status()`
+   *  kicks a fresh probe. */
+  private hermesDiscoveryProbeInFlight = false;
+  /** Monotonic supersession guard, mirroring {@link llamaCppProbeEpoch}:
+   *  bumped by {@link dispose} and by `setup.recheck`'s memo-clear so a
+   *  superseded probe's late settle can neither overwrite fresher state nor
+   *  fire a stray push. Unlike {@link llamaCppProbeAbort}, there is no
+   *  cancellation seam here — {@link SetupControllerDeps.discoverHermes}
+   *  takes no `AbortSignal` — so a superseded attempt keeps running in the
+   *  background; the epoch just makes ITS eventual settle inert. */
+  private hermesDiscoveryEpoch = 0;
+
   constructor(
     private readonly host: SetupHost,
     private readonly deps: SetupControllerDeps,
@@ -721,11 +792,31 @@ export class SetupController {
       if (state.timer) clearTimeout(state.timer);
     }
     this.throttle.clear();
+    // TC-6 (AU-6): abort every install/pull/provision still latched in
+    // `inFlight` — at HEAD this map was never iterated here, so a
+    // window-reload mid-install left the pipx child / multi-GB GGUF fetch
+    // running detached from a disposed controller. Placed BEFORE the emitter
+    // disposals below (mirrors the llama.cpp probe ordering just after) so
+    // any synchronous abort-path progress a caller emits still finds a live
+    // emitter or is dropped harmlessly; the existing `finally {
+    // this.inFlight.delete(key) }` blocks in every handler make a late
+    // delete here (once those handlers' own catch/finally runs) a no-op.
+    // `AbortController#abort()` never throws — even a listener that throws
+    // is reported asynchronously (Node/DOM event-dispatch semantics), never
+    // synchronously out of `abort()` — so this loop cannot abort disposal
+    // partway through, keeping `dispose()` safe/idempotent by construction.
+    for (const abort of this.inFlight.values()) abort.abort();
+    this.inFlight.clear();
     // T6: supersede + cancel any in-flight llama.cpp probe — its late settle
     // must neither write state nor fire into the (now-cleared) emitter.
     this.llamaCppProbeEpoch += 1;
     this.llamaCppProbeAbort?.abort();
     this.llamaCppProbeAbort = undefined;
+    // TC-3 (AU-8/INV-11): supersede any in-flight Hermes discovery probe too
+    // — no abort seam exists (discoverHermes takes no signal), so bumping the
+    // epoch is the only guard; its late settle is dropped (epoch mismatch)
+    // instead of writing state or firing into the disposed emitter.
+    this.hermesDiscoveryEpoch += 1;
     this.progressEmitter.dispose();
     this.statusChangedEmitter.dispose();
   }
@@ -757,6 +848,12 @@ export class SetupController {
     // settled-value memo, see kickLlamaCppProbe) so it runs concurrently
     // with the awaits below; this call never waits on it.
     this.kickLlamaCppProbe();
+    const hermesPath = (this.host.getSetting<string>('talaria.hermesPath') ?? '').trim();
+    // TC-3 (AU-8/INV-11): kick the Hermes PATH-discovery probe too, same lazy
+    // non-blocking posture — ONLY when the setting is empty (a configured
+    // talaria.hermesPath is authoritative and is never second-guessed by a
+    // PATH probe). See kickHermesDiscovery.
+    if (!hermesPath) this.kickHermesDiscovery();
     const apiKeySet = await this.host.secrets.has(AUTOCOMPLETE_API_KEY_SECRET);
     // T5 §1.2: interpreted (memoized) OS identity — drives the `os` block
     // and, per phase, the engine-composed bootstrap / python plans below.
@@ -771,9 +868,10 @@ export class SetupController {
     // RESOLVED presence map (locked by the ordering test).
     const storePresence = await this.safeScanStorePresence();
 
-    const hermesPath = (this.host.getSetting<string>('talaria.hermesPath') ?? '').trim();
     const configuredBackend = this.host.getSetting<string>('talaria.backend') ?? 'mock';
-    const agentPhase = this.computeAgentPhase(hermesPath, configuredBackend);
+    // TC-3 (AU-8/INV-11): the discovered PATH fallback — `null`/unsettled
+    // both read as "nothing found yet", exactly like a settings-only miss.
+    const agentPhase = this.computeAgentPhase(hermesPath, configuredBackend, this.hermesPathDiscovery?.found);
     const installRecord = this.host.globalState.get<{ version: string; venvRoot: string; installedAt: string }>(
       'talaria.setup.hermesInstall',
     );
@@ -1129,6 +1227,12 @@ export class SetupController {
     method: SetupMethod,
     params: unknown,
   ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string }> {
+    // TE-4 (AU-11, INV-15) belt — see SETUP_METHOD_SET's doc: a method
+    // outside the known set fails closed HERE, before the trust gate or the
+    // switch, instead of silently falling through to an unhandled `undefined`.
+    if (!SETUP_METHOD_SET.has(method)) {
+      return { ok: false, reason: 'unknown setup method' };
+    }
     if (MUTATING_METHODS.has(method) && !this.host.isTrusted()) {
       return { ok: false, reason: TRUST_REFUSAL_REASON };
     }
@@ -1164,6 +1268,8 @@ export class SetupController {
         return this.handleOpenBootstrapTerminal(params);
       case 'setup.reload':
         return this.handleReload();
+      case 'setup.reconnectAgent':
+        return this.handleReconnectAgent();
       case 'setup.recheck':
         return this.handleRecheck(params);
       case 'setup.setNextEdit':
@@ -1494,6 +1600,10 @@ export class SetupController {
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
       this.inFlight.delete(key);
+      // §7.2.2: terminal marker on EVERY settle path (success, failure,
+      // cancel, or a post-latch decline) — the webview deletes its
+      // accumulated progress entry, clearing a frozen bar + dead Cancel.
+      this.pushProgress({ op: 'pull', id: model, done: true });
     }
   }
 
@@ -1507,6 +1617,34 @@ export class SetupController {
    * the modal — the user is never asked to approve something already known
    * to be unavailable, remote, or unverified.
    */
+  /**
+   * AU-30 (TC-7) + follow-up: the created-name → catalog-id resolution the
+   * `pull:` latch is keyed by. `setup.provisionModel`'s route to the Sweep
+   * artifact (`handleProvisionModel` → `provisionOllama`, ~:1690) latches
+   * `pull:<catalog id>`; {@link handleVettedIngest} (the legacy `setup.
+   * pullModel` route to the SAME artifact) derives the identical id here so
+   * both RPCs join ONE latch instead of each winning its own and starting a
+   * duplicate multi-GB download. `handleCancel` resolves through this SAME
+   * method before its `inFlight.get` lookup — a second, divergent copy of
+   * this lookup there would just re-open the exact class of bug this
+   * closes (a cancel key that doesn't match what the latch is actually
+   * keyed under). Resolved from MODEL_CATALOG by created-name match rather
+   * than hardcoded a second time — `modelCatalog.test.ts` locks `sweep-
+   * next`'s `createdName` to `NEXT_DEDICATED_MODEL.ollamaCreatedName`, so
+   * the lookup always hits for the shipping row; the `?? created` fallback
+   * covers a fixture/test catalog that omits the row, AND any id that was
+   * never an hf-ingest created name to begin with (e.g. a plain library
+   * tag like `llama3:8b`) — those pass through unchanged, exactly what
+   * `handleCancel` needs for the non-canonical `pull:<tag>` latches
+   * {@link handlePullModel}'s library branch and {@link runLibraryPull}
+   * use.
+   */
+  private canonicalPullLatchId(created: string): string {
+    return (
+      MODEL_CATALOG.find((m) => m.ollama?.tier === 'hf-ingest' && m.ollama.createdName === created)?.id ?? created
+    );
+  }
+
   private async handleVettedIngest(endpoint: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     const created = NEXT_DEDICATED_MODEL.ollamaCreatedName;
     // (a) fail-closed until the out-of-band publication fills the pin (§5.4).
@@ -1517,10 +1655,15 @@ export class SetupController {
     if (!isLoopbackEndpoint(endpoint)) {
       return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
     }
-    // Single-flight latch keyed by the CANONICAL created name (the webview's
-    // cancel/progress key), set before the first await — mirrors the library
-    // tier's latch-before-modal discipline; `finally` releases on every path.
-    const key = `pull:${created}`;
+    // Single-flight latch keyed by the CATALOG id (AU-30 fix, {@link
+    // canonicalPullLatchId}) — see that method's doc for why. Progress/
+    // cancel stay keyed by `created` on the wire (unchanged, T13 `pullGate.
+    // test.ts` drift-lock); only the LATCH's internal key is canonical —
+    // `handleCancel` resolves the SAME canonical id before its lookup so a
+    // cancel dispatched with the wire-level `created` name still finds it.
+    // `finally` still releases under this SAME key on every exit path.
+    const canonicalId = this.canonicalPullLatchId(created);
+    const key = `pull:${canonicalId}`;
     if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
     const abort = new AbortController();
     this.inFlight.set(key, abort);
@@ -1537,26 +1680,39 @@ export class SetupController {
       // (d) Tier-1 modal (§6 verbatim) → the T14 ingest engine.
       const confirmed = await this.host.showModal(NEXT_PULL_MODAL_COPY, 'Download');
       if (!confirmed) return { ok: false, reason: 'declined' };
-      await this.deps.ingestGguf(
-        { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
-        endpoint,
-        (p) => {
-          this.pushProgress({
-            op: 'pull',
-            id: created,
-            phase: p.status,
-            ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
-            ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
-          });
-        },
-        abort.signal,
-      );
+      // §7.2.2: settled-flag straggler guard around ingestGguf's own await —
+      // same discipline as {@link runLibraryPull}; required regardless of
+      // the (verified-by-inspection) FROZEN dep's actual timing contract.
+      let settled = false;
+      try {
+        await this.deps.ingestGguf(
+          { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
+          endpoint,
+          (p) => {
+            if (settled) return;
+            this.pushProgress({
+              op: 'pull',
+              id: created,
+              phase: p.status,
+              ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
+              ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
+            });
+          },
+          abort.signal,
+        );
+      } finally {
+        settled = true;
+      }
       return { ok: true };
     } catch (err) {
       if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
       this.inFlight.delete(key);
+      // §7.2.2: terminal marker on EVERY settle path — see handlePullModel's
+      // own finally for the full rationale; progress rides the `created`
+      // name here (T13 `pullGate.test.ts` drift-lock).
+      this.pushProgress({ op: 'pull', id: created, done: true });
     }
   }
 
@@ -1615,6 +1771,10 @@ export class SetupController {
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
       this.inFlight.delete(key);
+      // §7.2.2: terminal marker on EVERY settle path — `entry.id` is the
+      // ONE progress/cancel key on every branch (CC-1/CC-9), so this single
+      // finally covers both `provisionOllama` and `provisionLlamacpp`.
+      this.pushProgress({ op: 'pull', id: entry.id, done: true });
     }
   }
 
@@ -1668,22 +1828,36 @@ export class SetupController {
           'Download',
         );
         if (!confirmed) return { ok: false, reason: 'declined' };
-        await this.deps.ingestGguf(
-          {
-            gguf: {
-              hfRepo: cell.gguf.hfRepo,
-              file: cell.gguf.file,
-              quant: cell.gguf.quant,
-              sha256: cell.verify.sha256,
-              approxBytes: cell.gguf.approxBytes,
-              allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles,
-            },
-            ollamaCreatedName: cell.createdName,
-          },
-          validated.url,
-          (p) => this.pushPullProgress(entry.id, p),
-          signal,
-        );
+        // §7.2.2: settled-flag straggler guard around ingestGguf's own
+        // await — same discipline as {@link runLibraryPull}; the shared
+        // `entry.id`-keyed terminal `done` push lives in the CALLER's
+        // (`handleProvisionModel`'s) finally, which runs strictly after
+        // this flag flips.
+        {
+          let settled = false;
+          try {
+            await this.deps.ingestGguf(
+              {
+                gguf: {
+                  hfRepo: cell.gguf.hfRepo,
+                  file: cell.gguf.file,
+                  quant: cell.gguf.quant,
+                  sha256: cell.verify.sha256,
+                  approxBytes: cell.gguf.approxBytes,
+                  allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles,
+                },
+                ollamaCreatedName: cell.createdName,
+              },
+              validated.url,
+              (p) => {
+                if (!settled) this.pushPullProgress(entry.id, p);
+              },
+              signal,
+            );
+          } finally {
+            settled = true;
+          }
+        }
         return { ok: true };
       }
       case 'live-oid': {
@@ -1706,21 +1880,41 @@ export class SetupController {
           'Download',
         );
         if (!confirmed) return { ok: false, reason: 'declined' };
-        await this.deps.ingestGguf(
-          {
-            gguf: {
-              hfRepo: cell.gguf.hfRepo,
-              file: cell.gguf.file,
-              quant: cell.gguf.quant,
-              sha256: oid.oid,
-              approxBytes: cell.gguf.approxBytes,
-            },
-            ollamaCreatedName: cell.createdName,
-          },
-          validated.url,
-          (p) => this.pushPullProgress(entry.id, p),
-          signal,
-        );
+        // §7.2.2: settled-flag straggler guard — same discipline as the
+        // 'pinned' branch above (this file's own doc for that branch has
+        // the full rationale). NOTE beyond the round's doc's literal 4-site
+        // list: this is the SAME `ingestGguf` dep, the SAME shared
+        // `entry.id`-keyed `done` push, and is a genuinely reachable
+        // path today (the `devstral-24b` catalog row hits this `live-oid`
+        // arm; the sibling `pinned` arm is currently dormant, sha256 `''`;
+        // the 11 `library`-tier rows route through the already-guarded
+        // `runLibraryPull` site, not here) — so it gets the identical
+        // guard for consistency and genuine safety, not just the
+        // dormant sibling.
+        {
+          let settled = false;
+          try {
+            await this.deps.ingestGguf(
+              {
+                gguf: {
+                  hfRepo: cell.gguf.hfRepo,
+                  file: cell.gguf.file,
+                  quant: cell.gguf.quant,
+                  sha256: oid.oid,
+                  approxBytes: cell.gguf.approxBytes,
+                },
+                ollamaCreatedName: cell.createdName,
+              },
+              validated.url,
+              (p) => {
+                if (!settled) this.pushPullProgress(entry.id, p);
+              },
+              signal,
+            );
+          } finally {
+            settled = true;
+          }
+        }
         return { ok: true };
       }
       default:
@@ -1786,24 +1980,48 @@ export class SetupController {
       'Download',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
+    // AU-13/TD-2 (INV-7/ADR-7 — check-to-write re-assertion): `showModal`
+    // above is an UNBOUNDED, human-speed await — a local attacker has that
+    // whole window to swap `<owner>`/`<repo>` for a symlink after the FIRST
+    // `checkedStoreDest` call (5c) but before the write. Re-run the SAME
+    // write gate now, immediately before `downloadGgufToStore`, and refuse on
+    // any change (the lstat re-check now fails) rather than let `ensureDir`
+    // (which follows symlinks) + the write proceed through a raced-in link.
+    const reassert = await this.deps.checkedStoreDest(cell.gguf.hfRepo, cell.gguf.file);
+    if (!reassert.ok) return { ok: false, reason: this.redact(reassert.reason) };
     // (5d) the T3 atomic sink: same-dir `.part` → digest equality → rename →
-    // sidecar. Progress rides the ONE `pull:<modelId>` key.
-    await this.deps.downloadGgufToStore(
-      {
-        catalogId: entry.id,
-        gguf: {
-          hfRepo: cell.gguf.hfRepo,
-          file: cell.gguf.file,
-          quant: cell.gguf.quant,
-          sha256: expected,
-          approxBytes: cell.gguf.approxBytes,
+    // sidecar. Progress rides the ONE `pull:<modelId>` key. Writes through
+    // the FRESHLY re-asserted destination (`reassert`), not the stale
+    // pre-modal one — the same "read exactly the path that was validated"
+    // discipline `pathConfine.ts`'s own doc establishes for reads.
+    // §7.2.2: settled-flag straggler guard around downloadGgufToStore's own
+    // await — same discipline as {@link runLibraryPull}; the shared
+    // `entry.id`-keyed terminal `done` push lives in the CALLER's
+    // (`handleProvisionModel`'s) finally, which runs strictly after this
+    // flag flips.
+    let settled = false;
+    try {
+      await this.deps.downloadGgufToStore(
+        {
+          catalogId: entry.id,
+          gguf: {
+            hfRepo: cell.gguf.hfRepo,
+            file: cell.gguf.file,
+            quant: cell.gguf.quant,
+            sha256: expected,
+            approxBytes: cell.gguf.approxBytes,
+          },
         },
-      },
-      dest.destDir,
-      dest.destFile,
-      (p) => this.pushPullProgress(entry.id, p),
-      signal,
-    );
+        reassert.destDir,
+        reassert.destFile,
+        (p) => {
+          if (!settled) this.pushPullProgress(entry.id, p);
+        },
+        signal,
+      );
+    } finally {
+      settled = true;
+    }
     // Presence flips: the sidecar now exists, so the next status() scan reads
     // present — fire so the panel re-fetches without waiting for a user poke.
     this.statusChangedEmitter.fire();
@@ -1827,7 +2045,20 @@ export class SetupController {
     if (tag.startsWith('-')) {
       throw new Error(LIBRARY_TAG_DASH_REFUSAL);
     }
-    await this.deps.pullModel(endpoint, tag, (p) => this.pushPullProgress(progressId, p), signal);
+    // §7.2.2: silence a straggler progress tick that fires AFTER
+    // `deps.pullModel`'s own promise has settled — it must never race the
+    // terminal `done` push the caller's `finally` emits right after this
+    // returns (throttle single-pending-slot hazard, SetupController.ts's
+    // `pushProgress`). Verified by inspection: the real `pullModel`
+    // (`ollamaClient.ts`) streams every `onProgress` call from a fully
+    // awaited read loop, strictly before its own promise settles — this
+    // guard is required regardless, since a FROZEN dep is not a contract.
+    let settled = false;
+    try {
+      await this.deps.pullModel(endpoint, tag, (p) => { if (!settled) this.pushPullProgress(progressId, p); }, signal);
+    } finally {
+      settled = true;
+    }
   }
 
   /** One `{op:'pull'}` progress push under the given key — the shared
@@ -1992,7 +2223,16 @@ export class SetupController {
     const op = str(params, 'op');
     const id = str(params, 'id');
     if (op && id) {
-      this.inFlight.get(`${op}:${id}`)?.abort();
+      // AU-30 follow-up: `pull:` latches may be keyed by the CANONICAL
+      // catalog id ({@link canonicalPullLatchId} — the Sweep NEXT artifact,
+      // TC-7), while the wire-level cancel payload (`cancelPullParams`,
+      // `ConfiguredModelRow` in SetupPanel.tsx) always sends the raw
+      // created/tag name. Resolve through the SAME method
+      // `handleVettedIngest` uses before looking the latch up, or a cancel
+      // for that row silently no-ops (dedup itself still holds; only
+      // Cancel was missing it). Every other `op` (`install`) is unaffected.
+      const latchId = op === 'pull' ? this.canonicalPullLatchId(id) : id;
+      this.inFlight.get(`${op}:${latchId}`)?.abort();
     }
     return { ok: true };
   }
@@ -2052,6 +2292,18 @@ export class SetupController {
       this.rekickLlamaCppProbe();
     }
     if (scope === 'all' || scope === 'agent') {
+      // TC-3 (AU-8/INV-11): drop the settled Hermes PATH-discovery memo too
+      // — mirrors osResolution's clear-only posture above (not
+      // rekickLlamaCppProbe's immediate re-kick): the next status() call
+      // re-probes lazily through kickHermesDiscovery, picking up e.g. a
+      // hermes the user just pipx-installed in a terminal. Reset the
+      // in-flight flag too (not just bump the epoch) — a superseded probe's
+      // late settle is dropped by the epoch check BEFORE it would ever clear
+      // the flag itself, so leaving it `true` here would wedge every future
+      // kick into a permanent no-op.
+      this.hermesDiscoveryEpoch += 1;
+      this.hermesPathDiscovery = undefined;
+      this.hermesDiscoveryProbeInFlight = false;
       try {
         const located = await this.deps.locatePipx();
         if (located.ok) {
@@ -2219,6 +2471,23 @@ export class SetupController {
     return { ok: true };
   }
 
+  // --- setup.reconnectAgent (beta.7 B3) --------------------------------------
+
+  private async handleReconnectAgent(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const reconnect = this.deps.reconnectAgent;
+    if (!reconnect) {
+      return { ok: false, reason: 'The agent connection is not running yet.' };
+    }
+    try {
+      const result = await reconnect();
+      this.statusChangedEmitter.fire(); // handleRecheck's single completion-fire posture (:2069-2073)
+      return result;
+    } catch (err) {
+      this.statusChangedEmitter.fire();
+      return { ok: false, reason: this.redact(errorMessage(err)) };
+    }
+  }
+
   // --- setup.setNextEdit ------------------------------------------------------
 
   private async handleSetNextEdit(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
@@ -2330,12 +2599,61 @@ export class SetupController {
     return { ok: true };
   }
 
+  // --- TC-3 (AU-8/INV-11): Hermes PATH-discovery settled-value memo ---------
+
+  /**
+   * Kick the Hermes PATH-discovery probe ONCE, lazily — mirrors {@link
+   * kickLlamaCppProbe}'s settled-value posture exactly. A no-op when {@link
+   * SetupControllerDeps.discoverHermes} isn't bound (keeps every existing
+   * deps literal — real or fake — compiling and behaving unchanged, same
+   * optionality idiom as {@link SetupControllerDeps.reconnectAgent}), when a
+   * settled value already exists, or while an attempt is in flight.
+   * `discoverHermes` (bound to `resolveHermesBin` in `setupHost.vscode.ts`)
+   * module-caches SUCCESS for the extension-host lifetime and NEVER caches
+   * failure (`resolveHermes.ts` `cachedHermesBin`) — so a hermes installed
+   * after a failed probe becomes visible the moment this memo is cleared
+   * (`setup.recheck {scope:'agent'}`), without a window reload.
+   * `discoverHermes` offers no cancellation seam (unlike {@link
+   * SetupControllerDeps.locateLlamaServer}'s `signal`), so a superseded
+   * attempt keeps running in the background — {@link hermesDiscoveryEpoch}
+   * just makes ITS eventual settle inert, mirroring {@link
+   * llamaCppProbeEpoch}'s supersession guard.
+   */
+  private kickHermesDiscovery(): void {
+    const discover = this.deps.discoverHermes;
+    if (!discover) return;
+    if (this.hermesPathDiscovery !== undefined || this.hermesDiscoveryProbeInFlight) return;
+    this.hermesDiscoveryProbeInFlight = true;
+    const epoch = this.hermesDiscoveryEpoch;
+    void (async () => {
+      let settled: NonNullable<SetupController['hermesPathDiscovery']>;
+      try {
+        settled = { found: await discover() };
+      } catch {
+        // Rejection (login-shell lookup failed) ⇒ honest "not found"; a
+        // superseded epoch is dropped below either way.
+        settled = { found: null };
+      }
+      if (epoch !== this.hermesDiscoveryEpoch) return; // superseded — the fresh probe (or a recheck clear) owns the state
+      this.hermesPathDiscovery = settled;
+      this.hermesDiscoveryProbeInFlight = false;
+      this.statusChangedEmitter.fire();
+    })();
+  }
+
   // --- helpers --------------------------------------------------------------
 
-  private computeAgentPhase(hermesPath: string, configuredBackend: string): AgentSetupPhase {
+  private computeAgentPhase(
+    hermesPath: string,
+    configuredBackend: string,
+    discoveredHermesPath?: string | null,
+  ): AgentSetupPhase {
     if (this.inFlight.has(`install:hermes`)) return 'installing';
     if (this.awaitingReload) return 'awaiting-reload';
-    if (hermesPath) return configuredBackend === 'acp' ? 'ready' : 'installed-inactive';
+    // TC-3 (AU-8/INV-11): a configured setting is authoritative; PATH
+    // discovery is only ever a FALLBACK when it's empty — mirrors the
+    // runtime's own settings-OR-PATH order (resolveHermes.ts resolveHermesBin).
+    if (hermesPath || discoveredHermesPath) return configuredBackend === 'acp' ? 'ready' : 'installed-inactive';
     if (this.lastAgentIssue) return this.lastAgentIssue.phase;
     return 'missing';
   }

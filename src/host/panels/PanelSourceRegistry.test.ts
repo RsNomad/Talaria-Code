@@ -37,6 +37,7 @@ function makeContext(overrides: Partial<PanelSourceContext> = {}): PanelSourceCo
     getSessionCwd: () => undefined,
     getSessionSubagentsSnapshot: () => undefined,
     getRootTracker: () => undefined,
+    getOneShotSessionIds: () => new Set(),
     logger: undefined,
     ...overrides,
   };
@@ -139,14 +140,15 @@ describe('McpPanelSource — 2-RPC join (config.get + tools.list), no raw result
     expect(dispatch).toHaveBeenNthCalledWith(1, 'config.get', { key: 'full' });
     expect(dispatch).toHaveBeenNthCalledWith(2, 'tools.list', {});
     expect(outcome.data).toEqual({
-      servers: [{ id: 'filesystem', name: 'filesystem', status: 'connected', command: 'npx -y server-fs', toolCount: 4 }],
+      servers: [{ id: 'filesystem', name: 'filesystem', status: 'connected', command: 'npx -y server-fs', toolCount: 4, enabled: true, transport: 'stdio' }],
     });
   });
 });
 
 describe('SessionsPanelSource — ACP channel (NOT tui_gateway), two-channel invariant', () => {
-  it('suppresses the push (data: undefined) when no ACP client exists yet', async () => {
+  it('AU-10: resolves a reasoned `unavailable` outcome (not a silent data:undefined hold) when no ACP client exists yet', async () => {
     const outcome = await new SessionsPanelSource(makeContext({ getAcpClient: () => undefined })).fetch();
+    expect(outcome).toEqual({ unavailable: 'Agent is not connected yet.' });
     expect(outcome.data).toBeUndefined();
   });
 
@@ -169,6 +171,44 @@ describe('SessionsPanelSource — ACP channel (NOT tui_gateway), two-channel inv
     expect(outcome.data).toEqual({
       sessions: [{ id: 's1', cwd: '/ws', title: 'Fix', updatedAt: '2026-07-10T12:00:00Z' }],
       nextCursor: 'c2',
+    });
+  });
+
+  /**
+   * TG-5 (AU-51, INV-20): `SessionsPanelSource` must pass
+   * `ctx.getOneShotSessionIds()` through to `reshapeSessionsList`'s
+   * `excludeIds` — this is the wiring proof; `reshapePanelData.test.ts`
+   * covers the filter's own logic exhaustively.
+   */
+  describe('TG-5 (AU-51): one-shot ephemeral session ids are excluded from the reshaped page', () => {
+    it('a session id present in ctx.getOneShotSessionIds() is absent from the fetched page', async () => {
+      const listSessions = vi.fn(async () => ({
+        sessions: [
+          { session_id: 'real-1', cwd: '/ws' },
+          { session_id: 'ephemeral-1', cwd: '/ws' },
+        ],
+        next_cursor: null,
+      }));
+      const ctx = makeContext({
+        getAcpClient: () => ({ listSessions }) as never,
+        getOneShotSessionIds: () => new Set(['ephemeral-1']),
+      });
+
+      const outcome = await new SessionsPanelSource(ctx).fetch();
+
+      expect(outcome.data?.sessions.map((s) => s.id)).toEqual(['real-1']);
+    });
+
+    it('an empty getOneShotSessionIds() (the default) drops nothing — existing behavior unchanged', async () => {
+      const listSessions = vi.fn(async () => ({
+        sessions: [{ session_id: 's1', cwd: '/ws' }],
+        next_cursor: null,
+      }));
+      const ctx = makeContext({ getAcpClient: () => ({ listSessions }) as never });
+
+      const outcome = await new SessionsPanelSource(ctx).fetch();
+
+      expect(outcome.data?.sessions.map((s) => s.id)).toEqual(['s1']);
     });
   });
 

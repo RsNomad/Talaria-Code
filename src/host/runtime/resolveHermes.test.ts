@@ -6,7 +6,10 @@ import {
   resolveHermes,
   resolveHermesBin,
   resetHermesBinCache,
+  defaultExecLookup,
   type ExecLookup,
+  type RealpathLookup,
+  type AccessCheck,
 } from './resolveHermes';
 import { must } from '../../testing/must';
 
@@ -21,6 +24,20 @@ function fakeExec(stdout: string): {
   };
   return { exec, calls };
 }
+
+/**
+ * Fake seams for the AU-7 realpath-then-derive path (INV-9/ADR-3). Every
+ * pre-existing `resolveHermes(...)` call below that expects a SUCCESSFUL
+ * resolution (not testing AU-7 itself) must inject these — the new default
+ * behavior is real `fs.promises.realpath`/`fs.promises.access` against a
+ * fake `/home/u/.venvs/...` path that does not exist on the test runner's
+ * real disk, which would otherwise throw the new AU-7 not-found error.
+ * `identityRealpath` models a plain (non-symlinked) venv `bin/hermes` —
+ * realpath is a no-op — and `alwaysAccessible` models the sibling `python`
+ * actually existing next to it.
+ */
+const identityRealpath: RealpathLookup = async (p) => p;
+const alwaysAccessible: AccessCheck = async () => {};
 
 describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
   beforeEach(() => resetHermesBinCache());
@@ -91,7 +108,12 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
 
   it('resolveHermes derives the sibling venv python and both spawn specs from the discovered bin', async () => {
     const { exec } = fakeExec('/home/u/.venvs/hermes/bin/hermes\n');
-    const resolved = await resolveHermes({ cwd: '/ws', shell: '/bin/bash' }, exec);
+    const resolved = await resolveHermes(
+      { cwd: '/ws', shell: '/bin/bash' },
+      exec,
+      identityRealpath,
+      alwaysAccessible,
+    );
     expect(resolved.hermesBin).toBe('/home/u/.venvs/hermes/bin/hermes');
     expect(resolved.python).toBe('/home/u/.venvs/hermes/bin/python');
     expect(resolved.acp.command).toBe('/bin/bash');
@@ -100,7 +122,12 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
 
   it('the long-lived children (hermes acp, python -m tui_gateway) still spawn via `exec` — signal propagation must not regress', async () => {
     const { exec } = fakeExec('/home/u/.venvs/hermes/bin/hermes\n');
-    const resolved = await resolveHermes({ cwd: '/ws', shell: '/bin/bash' }, exec);
+    const resolved = await resolveHermes(
+      { cwd: '/ws', shell: '/bin/bash' },
+      exec,
+      identityRealpath,
+      alwaysAccessible,
+    );
     // `exec` replaces the login shell so SIGTERM/SIGKILL from disposal reaches
     // the real child. Only the one-shot `command -v hermes` lookup should skip it.
     expect(resolved.acp.args[2]).toBe('exec /home/u/.venvs/hermes/bin/hermes acp');
@@ -111,8 +138,92 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
 
   it('AUDIT-5 SEC M-3: with no workspace open (cwd undefined), resolveHermes falls back to os.homedir() — never process.cwd() (the EH install dir)', async () => {
     const { exec } = fakeExec('/home/u/.venvs/hermes/bin/hermes\n');
-    const resolved = await resolveHermes({ cwd: undefined, shell: '/bin/bash' }, exec);
+    const resolved = await resolveHermes(
+      { cwd: undefined, shell: '/bin/bash' },
+      exec,
+      identityRealpath,
+      alwaysAccessible,
+    );
     expect(resolved.cwd).toBe(os.homedir());
+  });
+});
+
+describe('resolveHermes — AU-7: symlink-blind interpreter derivation (INV-9 / ADR-3)', () => {
+  beforeEach(() => resetHermesBinCache());
+
+  it('a pipx-shim symlink derives python from the REALPATH TARGET, not the symlink\'s own sibling (fails at HEAD: string-sibling math never realpaths)', async () => {
+    // pipx layout (V5): `~/.local/bin/hermes` is a SYMLINK into
+    // `~/.local/share/pipx/venvs/hermes-agent/bin/`; pipx puts no `python` in
+    // `~/.local/bin` — the symlink's own sibling does not exist. Only the
+    // REALPATH TARGET's sibling (`…/venvs/hermes-agent/bin/python`) exists.
+    const { exec } = fakeExec('/home/u/.local/bin/hermes\n');
+    const realTarget = '/home/u/.local/share/pipx/venvs/hermes-agent/bin/hermes';
+    const seenRealpathArgs: string[] = [];
+    const realpathImpl: RealpathLookup = async (p) => {
+      seenRealpathArgs.push(p);
+      return p === '/home/u/.local/bin/hermes' ? realTarget : p;
+    };
+    const seenAccessArgs: string[] = [];
+    const accessImpl: AccessCheck = async (p) => {
+      seenAccessArgs.push(p);
+      // Only the realpath-target's sibling exists — mirrors the real pipx
+      // filesystem (no `python` next to the shim in `~/.local/bin`).
+      if (p !== '/home/u/.local/share/pipx/venvs/hermes-agent/bin/python') {
+        throw new Error('ENOENT');
+      }
+    };
+
+    const resolved = await resolveHermes({}, exec, realpathImpl, accessImpl);
+
+    expect(resolved.python).toBe('/home/u/.local/share/pipx/venvs/hermes-agent/bin/python');
+    expect(resolved.python).not.toBe('/home/u/.local/bin/python'); // the symlink's own (nonexistent) sibling
+    expect(seenRealpathArgs).toEqual(['/home/u/.local/bin/hermes']); // realpath ran on the DISCOVERED bin
+    expect(seenAccessArgs).toEqual([
+      '/home/u/.local/share/pipx/venvs/hermes-agent/bin/python',
+    ]); // existence-checked the REALPATH-derived sibling
+  });
+
+  it('a derived interpreter that does not exist throws an actionable error naming talaria.pythonPath (broken-link realpath falls back to the lexical sibling, which also misses)', async () => {
+    const { exec } = fakeExec('/home/u/.local/bin/hermes\n');
+    const realpathImpl: RealpathLookup = async () => {
+      throw new Error('ENOENT: broken symlink');
+    };
+    const seenAccessArgs: string[] = [];
+    const accessImpl: AccessCheck = async (p) => {
+      seenAccessArgs.push(p);
+      throw new Error('ENOENT');
+    };
+
+    await expect(resolveHermes({}, exec, realpathImpl, accessImpl)).rejects.toThrow(
+      /talaria\.pythonPath/,
+    );
+    // realpath failure fell back to the LEXICAL sibling (still attempted a
+    // derivation, never silently gave up before the existence check).
+    expect(seenAccessArgs).toEqual(['/home/u/.local/bin/python']);
+  });
+
+  it('an explicit talaria.pythonPath short-circuits BOTH the realpath and existence checks (unchanged behavior)', async () => {
+    const { exec } = fakeExec('/home/u/.local/bin/hermes\n');
+    let realpathCalls = 0;
+    let accessCalls = 0;
+    const realpathImpl: RealpathLookup = async (p) => {
+      realpathCalls += 1;
+      return p;
+    };
+    const accessImpl: AccessCheck = async () => {
+      accessCalls += 1;
+    };
+
+    const resolved = await resolveHermes(
+      { pythonPath: '/opt/custom/bin/python' },
+      exec,
+      realpathImpl,
+      accessImpl,
+    );
+
+    expect(resolved.python).toBe('/opt/custom/bin/python');
+    expect(realpathCalls).toBe(0);
+    expect(accessCalls).toBe(0);
   });
 });
 
@@ -147,4 +258,26 @@ describe('package.json — R-A5: talaria.hermesPath is contributed machine-scope
       'talaria.hermesPath',
     );
   });
+});
+
+// --- TC-5 (AU-28): AbortSignal never wired into the ExecLookup execFile calls ---
+
+describe('defaultExecLookup — TC-5 (AU-28): AbortSignal actually kills the in-flight execFile child', () => {
+  // Global Constraint 4 (no mock-theater): the `ExecLookup` seam carries no
+  // error shape of its own, so this is pinned against a REAL `execFile`
+  // abort — the actual Node behavior (Node child_process docs: the `signal`
+  // option lets an AbortController kill the child, rejecting with an
+  // AbortError), not a hand-rolled fixture. Cloned discipline from
+  // `pipxLocator.test.ts`'s real-timeout `isExecTimeout` test.
+  it('aborting mid-probe rejects promptly instead of letting the child run to completion (fails at HEAD: resolves after the full sleep)', async () => {
+    const abort = new AbortController();
+    const promise = defaultExecLookup('node', ['-e', 'setTimeout(() => {}, 2000)'], {
+      timeoutMs: 10_000,
+      cwd: os.homedir(),
+      signal: abort.signal,
+    });
+    setTimeout(() => abort.abort(), 50);
+
+    await expect(promise).rejects.toThrow();
+  }, 3_000);
 });

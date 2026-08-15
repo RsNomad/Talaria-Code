@@ -234,6 +234,14 @@ export function progressKey(op: 'install' | 'pull', id: string): string {
  */
 export function foldSetupProgress(map: SetupProgressMap, msg: SetupProgress): SetupProgressMap {
   const key = progressKey(msg.op, msg.id);
+  if (msg.done === true) {
+    // §7.2.2: terminal marker — the (op,id) stream has settled; delete the
+    // accumulated entry so the UI stops rendering a frozen bar + dead Cancel.
+    if (!(key in map)) return map; // no-op, same reference — no spurious re-render
+    const next = { ...map };
+    delete next[key];
+    return next;
+  }
   const prev = map[key];
   const logTail = msg.line !== undefined ? clampLogTail([...(prev?.logTail ?? []), msg.line]) : (prev?.logTail ?? []);
   const entry: SetupProgressEntry = {
@@ -285,6 +293,10 @@ export function agentDoneLine(phase: AgentSetupPhase): string {
 export function providerDoneLine(phase: SetupData['provider']['phase']): string {
   return phase === 'configured' ? 'Provider connected — chat is ready to use.' : '';
 }
+
+/** beta.7 B3 — Provider card re-check caption (single-sourced). */
+export const PROVIDER_RECHECK_CAPTION =
+  'Changed the provider (wizard or config.yaml)? Re-check restarts the agent connection and picks it up — open chats reload automatically, no window reload.';
 
 /** Auth-satisfied predicate over the WIRE's collapsed `auth` union — the
  *  same rule `SetupController.status()` applies host-side over its own

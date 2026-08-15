@@ -107,13 +107,16 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
  * Locate `llama-server` and (best-effort) its version. Never throws for the
  * two SCRIPTED failure modes (`not-found`, `probe-timeout`) — those are
  * returned as typed results. An aborted `signal` propagates as a rejected
- * `AbortError` (checked between steps only — see {@link throwIfAborted}).
+ * `AbortError` — both checked between steps (see {@link throwIfAborted}) AND,
+ * since TC-5/AU-28, threaded into EVERY exec() call's own opts, so an
+ * in-flight 5-10s login-shell probe is actually killed instead of running to
+ * its own timeout regardless of a scoped `setup.recheck` cancel.
  */
 export async function locateLlamaServer(exec: ExecLookup, signal?: AbortSignal): Promise<LlamaCppLocateResult> {
   const cwd = os.homedir();
 
   throwIfAborted(signal);
-  const lookup = await findLlamaServerPath(exec, cwd);
+  const lookup = await findLlamaServerPath(exec, cwd, signal);
   if (lookup.kind === 'probe-timeout') {
     return { ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_DETAIL };
   }
@@ -128,7 +131,7 @@ export async function locateLlamaServer(exec: ExecLookup, signal?: AbortSignal):
   }
 
   throwIfAborted(signal);
-  const version = lookup.version ?? (await tryGetVersion(exec, lookup.path, cwd));
+  const version = lookup.version ?? (await tryGetVersion(exec, lookup.path, cwd, signal));
   return { ok: true, path: lookup.path, ...(version ? { version } : {}) };
 }
 
@@ -152,19 +155,30 @@ type LlamaServerLookup =
  * candidates are consulted ONLY when the login shell itself could not
  * answer twice in a row, never as a faster substitute for it.
  */
-async function findLlamaServerPath(exec: ExecLookup, cwd: string): Promise<LlamaServerLookup> {
+async function findLlamaServerPath(
+  exec: ExecLookup,
+  cwd: string,
+  signal: AbortSignal | undefined,
+): Promise<LlamaServerLookup> {
   const spec = loginShellSpawn('command', ['-v', 'llama-server'], undefined, { exec: false });
 
   let stdout: string;
   try {
-    stdout = await exec(spec.command, spec.args, { timeoutMs: STEP0_TIMEOUT_MS, cwd });
+    stdout = await exec(spec.command, spec.args, { timeoutMs: STEP0_TIMEOUT_MS, cwd, signal });
   } catch (firstErr) {
+    // TC-5/AU-28: an abort takes priority over the timeout classifier — Node
+    // sets `killed`/`signal` on an abort-driven kill too (the same shape a
+    // genuine timeout produces), so without this check a scoped recheck
+    // cancel could be misread as "the login shell was merely slow" and
+    // silently retried instead of propagating the cancellation.
+    if (signal?.aborted) throw firstErr;
     if (!isExecTimeout(firstErr)) return { kind: 'missing' };
     try {
-      stdout = await exec(spec.command, spec.args, { timeoutMs: STEP0_RETRY_TIMEOUT_MS, cwd });
+      stdout = await exec(spec.command, spec.args, { timeoutMs: STEP0_RETRY_TIMEOUT_MS, cwd, signal });
     } catch (secondErr) {
+      if (signal?.aborted) throw secondErr;
       if (!isExecTimeout(secondErr)) return { kind: 'missing' };
-      return probeAbsoluteCandidates(exec, cwd);
+      return probeAbsoluteCandidates(exec, cwd, signal);
     }
   }
 
@@ -184,13 +198,20 @@ function absoluteCandidatePaths(): string[] {
   ];
 }
 
-async function probeAbsoluteCandidates(exec: ExecLookup, cwd: string): Promise<LlamaServerLookup> {
+async function probeAbsoluteCandidates(
+  exec: ExecLookup,
+  cwd: string,
+  signal: AbortSignal | undefined,
+): Promise<LlamaServerLookup> {
   for (const candidate of absoluteCandidatePaths()) {
     try {
-      const raw = await exec(candidate, ['--version'], { timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS, cwd });
+      const raw = await exec(candidate, ['--version'], { timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS, cwd, signal });
       const version = lastNonEmptyLine(raw);
       return { kind: 'found', path: candidate, ...(version ? { version } : {}) };
-    } catch {
+    } catch (err) {
+      // TC-5/AU-28: an abort must propagate, not be swallowed as "try the
+      // next candidate" — the whole point of a cancel is to stop probing.
+      if (signal?.aborted) throw err;
       // Try the next candidate; every candidate failing falls through to
       // 'probe-timeout' below.
     }
@@ -202,14 +223,23 @@ async function probeAbsoluteCandidates(exec: ExecLookup, cwd: string): Promise<L
  *  step 0 — routed through the login shell (matching every other non-
  *  builtin call in this module), single-shot (no retry: a slow/failing
  *  version call must never turn an already-confirmed `found` into anything
- *  else). */
-async function tryGetVersion(exec: ExecLookup, binPath: string, cwd: string): Promise<string | undefined> {
+ *  else). TC-5/AU-28: "best-effort" covers an ordinary probe failure (the
+ *  binary not supporting `--version`, etc.) — an explicit Cancel is not that;
+ *  it still propagates rather than being silently swallowed into "found, no
+ *  version". */
+async function tryGetVersion(
+  exec: ExecLookup,
+  binPath: string,
+  cwd: string,
+  signal: AbortSignal | undefined,
+): Promise<string | undefined> {
   try {
     const spec = loginShellSpawn(binPath, ['--version']);
-    const raw = await exec(spec.command, spec.args, { timeoutMs: VERSION_PROBE_TIMEOUT_MS, cwd });
+    const raw = await exec(spec.command, spec.args, { timeoutMs: VERSION_PROBE_TIMEOUT_MS, cwd, signal });
     const line = lastNonEmptyLine(raw);
     return line || undefined;
-  } catch {
+  } catch (err) {
+    if (signal?.aborted) throw err;
     return undefined;
   }
 }

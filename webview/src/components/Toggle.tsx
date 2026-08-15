@@ -1,4 +1,16 @@
 /* Accessible on/off switch used by Tools / Skills / Settings panels. */
+import { toggleInteraction, type ToggleInteraction } from './busyInteraction';
+
+/**
+ * AU-40: `toggleInteraction` + `ToggleInteraction` moved to
+ * `busyInteraction.ts` (single source of the F-8 decision, now shared with
+ * every swept panel button) — re-exported here so `Toggle.test.ts` and any
+ * other existing importer of `./Toggle` keep resolving both unchanged. See
+ * `busyInteraction.ts`'s module doc for the full decision + the
+ * SettingsPanel `<select>` carve-out.
+ */
+export { toggleInteraction, type ToggleInteraction };
+
 interface ToggleProps {
   on: boolean;
   /**
@@ -57,45 +69,13 @@ interface ToggleProps {
 }
 
 /**
- * The rendered form of {@link ToggleProps.disabled} / {@link ToggleProps.busy}.
- * Exactly one disablement MECHANISM is ever engaged: the native attribute for
- * genuine disablement, ARIA for in-flight.
- */
-export interface ToggleInteraction {
-  /** The native `disabled` attribute — removes the control from the tab order. */
-  readonly nativeDisabled: boolean;
-  /** `aria-disabled`, for the busy case that must stay focusable. Omitted when unset. */
-  readonly ariaDisabled: true | undefined;
-  /** `aria-busy`, whenever a request from this control is in flight. Omitted when unset. */
-  readonly ariaBusy: true | undefined;
-  /** Whether a click should be forwarded to `onChange`. */
-  readonly interactive: boolean;
-}
-
-/**
- * F-8's decision, extracted so it is provable without a DOM. `Toggle` renders
- * nothing but this result, so `Toggle.test.ts` exercises the real code path.
- *
  * The repo gained jsdom + testing-library in wave 5.2 (ADR-015), and
- * `SettingsPanel.dom.test.tsx` now locks the RENDERED half — that the busy
+ * `SettingsPanel.dom.test.tsx` locks the RENDERED half — that the busy
  * control keeps keyboard focus across the round trip and carries `aria-busy`.
- * This pure extraction is still the right home for the DECISION and must not
- * be moved there: a DOM test earns its cost only for wiring, never for a
- * decision (`docs/testing/dom-tests.md`).
+ * The pure decision itself lives in `busyInteraction.ts` (AU-40) and must not
+ * move here: a DOM test earns its cost only for wiring, never for a decision
+ * (`docs/testing/dom-tests.md`).
  */
-export function toggleInteraction(disabled?: boolean, busy?: boolean): ToggleInteraction {
-  const isDisabled = disabled === true;
-  const isBusy = busy === true;
-  return {
-    // Never `|| isBusy` — that is the F-8 bug, and it is the one line this
-    // whole extraction exists to keep honest.
-    nativeDisabled: isDisabled,
-    ariaDisabled: !isDisabled && isBusy ? true : undefined,
-    ariaBusy: isBusy ? true : undefined,
-    interactive: !isDisabled && !isBusy,
-  };
-}
-
 export function Toggle({ on, disabled, busy, label, onChange, id, title }: ToggleProps) {
   const interaction = toggleInteraction(disabled, busy);
   return (

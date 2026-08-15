@@ -5,12 +5,13 @@ import type {
   AgentMode,
   Attachment,
   ContextRef,
+  ControlMethod,
   DiffAction,
   DataPanel,
   GlobalPanel,
   PanelDataMap,
 } from '../../shared/protocol';
-import { makePanelData } from '../../shared/protocol';
+import { CONTROL_METHODS, makePanelData } from '../../shared/protocol';
 import { mockScenario } from '../../shared/mockScenario';
 import type { MockScenario, MockStep } from '../../shared/mockScenario';
 import { AgentBackend } from './AgentBackend';
@@ -60,6 +61,23 @@ const MOCK_TAB_ID = 'mock-tab-1';
 export class MockBackend implements AgentBackend {
   /** D2 (A2): this is the mock — see `AgentBackend.kind`'s doc. */
   readonly kind = 'mock' as const;
+
+  /**
+   * TE-4 (AU-11, INV-15) belt: mirrors `ControlDispatcher.
+   * ALLOWED_CONTROL_METHODS` exactly — same construction, same source array
+   * — so the mock backend's runtime gate can never drift against the real
+   * backend's. Before this fix, ANY method reaching {@link invokeControl}
+   * other than `'panel.data'` fell through to a "courtesy" `ok:true` ack —
+   * including a name that was never a real control method at all, which is
+   * the exact "unknown method silently accepted" gap this closes. A method
+   * genuinely IN this set but with no scripted mock behavior still gets the
+   * courtesy ack (that part is unchanged and correct); only a name OUTSIDE
+   * it is now refused.
+   */
+  private static readonly KNOWN_CONTROL_METHODS: ReadonlySet<string> = new Set<ControlMethod | 'panel.data'>([
+    ...CONTROL_METHODS,
+    'panel.data',
+  ]);
 
   private readonly emitter = new vscode.EventEmitter<HostToWebviewMessage>();
   readonly onMessage = this.emitter.event;
@@ -237,7 +255,13 @@ export class MockBackend implements AgentBackend {
       }
       return data ?? null;
     }
-    // Unknown control method: ack so the UI doesn't hang awaiting a reply.
+    // TE-4 (AU-11, INV-15): a method outside the known control-method set is
+    // refused, not courtesy-acked — see KNOWN_CONTROL_METHODS's doc.
+    if (!MockBackend.KNOWN_CONTROL_METHODS.has(method)) {
+      return { ok: false, error: 'unknown method' };
+    }
+    // Known control method with no scripted mock behavior: ack so the UI
+    // doesn't hang awaiting a reply.
     return { ok: true, mock: true, method };
   }
 

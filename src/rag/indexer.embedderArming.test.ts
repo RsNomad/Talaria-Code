@@ -16,10 +16,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * not a mocked stand-in for it.
  */
 
+// TA-2 (AU-5): the two describe blocks near the end of this file need to
+// assert what actually reached `store.upsert` (not just that `build()`
+// rejected) — a spy tracking call sizes, added without changing the mock's
+// no-op behavior for every other describe block in this file.
+const { upsertCallSizes } = vi.hoisted(() => ({ upsertCallSizes: [] as number[] }));
+
 vi.mock('./store/LanceDBStore', () => ({
   LanceDBStore: class {
     async init() {}
-    async upsert() {}
+    async upsert(records: unknown[]) {
+      upsertCallSizes.push(records.length);
+    }
     async deleteByPath() {}
     async listFileHashes() {
       return {};
@@ -180,7 +188,8 @@ describe('Task 14b: the D-2 sidecar records the OBSERVED vector width and enforc
 
     await expect(indexer.build()).resolves.toBeUndefined();
     const meta = await readMetaFixture();
-    expect(meta).toMatchObject({ schema: 1, embedModel: 'qwen3-embedding:0.6b', dims: 0, width: 4 });
+    // TA-1: `schema` bumped 1 -> 2 (pinned-Arrow-schema + init-time self-heal).
+    expect(meta).toMatchObject({ schema: 2, embedModel: 'qwen3-embedding:0.6b', dims: 0, width: 4 });
 
     // Build 2: SAME model name, SAME dims=0 — the D-2 fingerprint (model +
     // dims) still matches, so nothing forces a full rebuild. Change the
@@ -295,5 +304,119 @@ describe('Final-review Finding 1: computeEffectiveWidth must gate on the stored 
     });
     await expect(indexer2.build()).rejects.toThrow('embedding width mismatch');
     expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('TA-2 (AU-5): a malformed row in the embedder response is refused before anything from that batch reaches store.upsert', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-malformed-ws-'));
+    indexDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-malformed-idx-'));
+    upsertCallSizes.length = 0;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(indexDir, { recursive: true, force: true });
+  });
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  it('refuses the whole build and upserts nothing when the endpoint returns one empty embedding vector', async () => {
+    await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
+
+    // V2 (reproduced): at HEAD this resolves (`vectors[idx] ?? []` swallows
+    // the empty row) and `store.upsert` receives a record with `vector: []`
+    // — the exact shape that then kills every later `nearestTo` on the
+    // whole table.
+    const fetchSpy = vi.fn(
+      async () => new Response(JSON.stringify({ data: [{ index: 0, embedding: [] }] }), { status: 200 }),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const indexer = createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      dims: 0,
+    });
+
+    await expect(indexer.build()).rejects.toThrow(/malformed embedding vector/i);
+    expect(upsertCallSizes).toEqual([]);
+  });
+});
+
+describe('TA-2 (AU-5, Rev-1 A2): cross-batch width threading within ONE build', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-crossbatch-ws-'));
+    indexDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-crossbatch-idx-'));
+    upsertCallSizes.length = 0;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(indexDir, { recursive: true, force: true });
+  });
+
+  it('refuses batch 2 of a first build when it returns a different (but internally consistent) width than batch 1 observed, at dims=0', async () => {
+    // EMBED_BATCH_SIZE (indexer.ts) is 64 — 65 single-chunk files force
+    // reindexFiles to call embedder.embed() TWICE within this ONE build,
+    // which is the only way to exercise the cross-batch threading fix
+    // (intra-batch consistency alone cannot catch this — each batch is
+    // internally consistent on its own).
+    for (let i = 0; i < 65; i++) {
+      const abs = path.join(workspaceRoot, `src/f${i}.ts`);
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, `export const f${i} = ${i};\n`, 'utf8');
+    }
+
+    let call = 0;
+    const fetchSpy = vi.fn(async (_url: string, init?: RequestInit) => {
+      call += 1;
+      const body = JSON.parse(init?.body as string) as { input: string[] };
+      // Batch 1 (call 1, 64 inputs): internally-consistent width 3.
+      // Batch 2 (call 2, 1 input): internally-consistent width 4 — a
+      // DIFFERENT width than batch 1 observed, the corruption V2 showed
+      // LanceDB silently accepts (killing every later `nearestTo`).
+      const width = call === 1 ? 3 : 4;
+      return new Response(
+        JSON.stringify({
+          data: body.input.map((_t, i) => ({ index: i, embedding: Array(width).fill(0.1) })),
+        }),
+        { status: 200 },
+      );
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const indexer = createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      dims: 0,
+    });
+
+    await expect(indexer.build()).rejects.toThrow('embedding width mismatch');
+    // Both batches were actually attempted — proves this is a CROSS-batch
+    // refusal (batch 2, on the strength of batch 1's observed width), not
+    // batch 1 failing on its own.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    // Batch 1's 64 records were upserted before batch 2's embed call threw;
+    // batch 2's 1 record never reached store.upsert at all.
+    expect(upsertCallSizes).toEqual([64]);
   });
 });

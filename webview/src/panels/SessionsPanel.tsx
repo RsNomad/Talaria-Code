@@ -9,11 +9,17 @@
  */
 import { useState } from 'react';
 import type { SessionSummary, SessionsData, WebviewToHost } from '../protocol';
+import { busyInteraction } from '../components/busyInteraction';
 import { Icon } from '../components/Icon';
 import { Pill } from '../components/Pill';
 import { EmptyPanel, PanelShell } from './PanelShell';
 import { loadMoreFooterState } from '../state/panels';
 import { relativeAge } from '../relativeAge';
+
+/** beta.7 B1: the one untitled-session display string — the row render AND
+ *  loadTabMessage send the SAME text, so the tab chip always shows exactly
+ *  what the user clicked. */
+const UNTITLED_SESSION_LABEL = 'Untitled session';
 
 /** W4-T5b: the `tab.load` message a History row's click posts — routes the
  * load through the ACTIVE tab (`tabId`) instead of the legacy tabId-less
@@ -21,9 +27,15 @@ import { relativeAge } from '../relativeAge';
  * Pure (no host calls) so the click's payload is unit-testable without a DOM. */
 export function loadTabMessage(
   tabId: string,
-  session: Pick<SessionSummary, 'id' | 'cwd'>,
+  session: Pick<SessionSummary, 'id' | 'cwd' | 'title'>,
 ): Extract<WebviewToHost, { type: 'tab.load' }> {
-  return { type: 'tab.load', tabId, sessionId: session.id, cwd: session.cwd };
+  return {
+    type: 'tab.load',
+    tabId,
+    sessionId: session.id,
+    cwd: session.cwd,
+    title: session.title || UNTITLED_SESSION_LABEL,
+  };
 }
 
 interface SessionsPanelProps {
@@ -49,6 +61,15 @@ interface SessionsPanelProps {
   activeTabHasLiveTurn: boolean;
   /** Row click -> `tab.load` for {@link activeTabId} (fire-and-forget; the transcript replays via streaming). */
   onLoad: (message: Extract<WebviewToHost, { type: 'tab.load' }>) => void;
+  /**
+   * TI-1 (AU-39): the session id of the ONE row currently mid-load
+   * (`AppState.pendingSessionLoad.sessionId`), or `undefined` when nothing is
+   * loading. Drives that row's `busyInteraction` posture — set the moment
+   * `onLoad` actually fires (never on just opening the confirm strip below),
+   * cleared by the App-level reducer once the host's terminal `tab.bound`/
+   * `tab.error` for that load's tabId lands.
+   */
+  loadingSessionId?: string;
   /** A#7: "Load more" over the CORRELATED path (loading state + failure surfaces). */
   onLoadMore: (cursor: string) => void;
   /** Whether a "Load more" request is currently in flight. */
@@ -65,6 +86,7 @@ export function SessionsPanel({
   boundSessionIds,
   activeTabHasLiveTurn,
   onLoad,
+  loadingSessionId,
   onLoadMore,
   loadingMore,
   loadMoreError,
@@ -77,7 +99,13 @@ export function SessionsPanel({
    */
   const [confirmingId, setConfirmingId] = useState<string | undefined>(undefined);
 
-  if (data.sessions.length === 0) return <EmptyPanel hint="No past sessions yet." />;
+  if (data.sessions.length === 0) {
+    return (
+      <PanelShell title="History">
+        <EmptyPanel hint="No past sessions yet." />
+      </PanelShell>
+    );
+  }
 
   const loadSession = (session: SessionSummary) => onLoad(loadTabMessage(activeTabId, session));
 
@@ -107,19 +135,37 @@ export function SessionsPanel({
         const age = relativeAge(s.updatedAt);
         const isBound = boundSessionIds.has(s.id);
         const isConfirming = confirmingId === s.id;
+        // TI-1 (AU-39): busy, never natively disabled — a loading row must
+        // stay focusable (busyInteraction.ts's own rationale) and the
+        // click-guard below (`interactive`) is what actually blocks a
+        // double-post, not the native attribute (which stays permanently
+        // `false` here, mirroring the "Load more" footer button above).
+        const isLoading = loadingSessionId === s.id;
+        const rowInteraction = busyInteraction(false, isLoading);
         return (
           <div key={s.id} className="mb-1.5">
             <button
               type="button"
-              onClick={() => handleRowClick(s)}
+              onClick={() => {
+                if (!rowInteraction.interactive) return;
+                handleRowClick(s);
+              }}
+              disabled={rowInteraction.nativeDisabled}
+              aria-disabled={rowInteraction.ariaDisabled}
+              aria-busy={rowInteraction.ariaBusy}
               aria-current={isBound ? 'true' : undefined}
-              className="flex w-full items-start gap-2 rounded-card border border-border bg-surface px-3 py-2 text-left transition-colors hover:border-accent"
+              className="flex w-full items-start gap-2 rounded-card border border-border bg-surface px-3 py-2 text-left transition-colors hover:border-accent disabled:cursor-default disabled:opacity-60 aria-disabled:cursor-default aria-disabled:opacity-60"
             >
-              <Icon name="comment-discussion" size={15} className="mt-0.5 flex-none text-muted" />
+              <Icon
+                name={isLoading ? 'loading' : 'comment-discussion'}
+                size={15}
+                spin={isLoading}
+                className="mt-0.5 flex-none text-muted"
+              />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="min-w-0 truncate text-[12.5px] font-semibold text-fg">
-                    {s.title || 'Untitled session'}
+                    {s.title || UNTITLED_SESSION_LABEL}
                   </span>
                   {isBound && (
                     <span className="ml-auto flex-none">
@@ -193,12 +239,23 @@ export function SessionsPanel({
         }
 
         const loading = footer === 'loading';
+        // AU-40: purely in-flight — nothing genuinely-indefinite gates this
+        // button (the footer's `hidden`/`error` states render different JSX
+        // entirely, above).
+        const loadMoreInteraction = busyInteraction(false, loading);
         return (
           <button
             type="button"
-            disabled={loading}
-            onClick={() => data.nextCursor && onLoadMore(data.nextCursor)}
-            className="mt-1 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 disabled:hover:border-border disabled:hover:text-muted"
+            disabled={loadMoreInteraction.nativeDisabled}
+            aria-disabled={loadMoreInteraction.ariaDisabled}
+            aria-busy={loadMoreInteraction.ariaBusy}
+            onClick={() => {
+              // AU-40: guard replacing the native `disabled` this button
+              // used to rely on to block a second click while in flight.
+              if (!loadMoreInteraction.interactive) return;
+              if (data.nextCursor) onLoadMore(data.nextCursor);
+            }}
+            className="mt-1 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 disabled:hover:border-border disabled:hover:text-muted aria-disabled:cursor-default aria-disabled:opacity-60 aria-disabled:hover:border-border aria-disabled:hover:text-muted"
           >
             <Icon name={loading ? 'loading' : 'chevron-down'} size={13} spin={loading} />
             {loading ? 'Loading…' : 'Load more'}

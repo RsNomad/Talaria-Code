@@ -24,16 +24,34 @@ import type {
   ControlMethod,
   DataPanel,
   HostToWebview,
+  HubInstallResult,
+  HubPreview,
+  HubScan,
+  McpAddParams,
+  McpAddResult,
+  McpCatalogData,
+  McpCatalogInstallParams,
+  McpCatalogInstallResult,
+  McpTestResult,
   NextEditToggleSource,
   Panel,
   SetupMethod,
+  SkillCreateParams,
   ThemeKind,
 } from './protocol';
 import { MAX_TABS, PANEL_SCOPE } from './protocol';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
-import { errorMessage, fetchPanel, panelData, resolvePanelRequest, unwrapSetupResult } from './state/panels';
+import {
+  errorMessage,
+  fetchPanel,
+  panelData,
+  readScopedRefreshError,
+  resolvePanelRequest,
+  unwrapSetupResult,
+  type RefreshErrorPanel,
+} from './state/panels';
 import { idle } from './state/remoteData';
 import { createInitialState, type AppState, type TabState } from './types';
 import type { ComposerSeed } from './composer/applySeed';
@@ -44,7 +62,7 @@ import { TabStrip, tabDomId, CHAT_TABPANEL_ID } from './components/TabStrip';
 import { Composer } from './components/Composer';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ChatView } from './components/chat/ChatView';
-import { RemotePanel } from './panels/PanelShell';
+import { RemotePanel, type RefreshErrorBanner } from './panels/PanelShell';
 import { ToolsPanel } from './panels/ToolsPanel';
 import { McpPanel } from './panels/McpPanel';
 import { SkillsPanel } from './panels/SkillsPanel';
@@ -351,10 +369,20 @@ export function App() {
   // `handleSetupPanelFetch`). `params` is already `Record<string, unknown>`
   // on the `control.request` wire, so spreading `trigger` in needs no
   // protocol change — the host's `extractPanelName` ignores extra keys.
+  //
+  // TI-3 (AU-42 Part A): returns `fetchPanel`'s promise (was `void
+  // fetchPanel(...)`, discarding it) — purely additive, since `fetchPanel`
+  // itself still never rejects (see its own doc). Every existing bare-
+  // statement caller (`requestPanel(panel)`) and every `() => requestPanel(
+  // panel)` handed to `onRetry: () => void` is unaffected (a function
+  // returning `Promise<X>` is assignable where `() => void` is expected);
+  // this only adds a settled outcome for a caller that wants one — the
+  // Skills "Reload skills" button (SkillsPanel's `onRefresh`), which unlike
+  // McpPanel's dedicated `reload.mcp` RPC has no envelope of its own to read.
   const requestPanel = (panel: DataPanel, trigger?: PanelFetchTrigger) => {
     const scopeTab = tab;
     const { scopeKey, rejectTag, params } = resolvePanelRequest(panel, scopeTab);
-    void fetchPanel(
+    return fetchPanel(
       panel,
       {
         request: (method, p) => bridge.request(method, p, rejectTag),
@@ -421,6 +449,79 @@ export function App() {
   // re-fetches + re-pushes the server list when the reload actually
   // confirmed. F-1: `mcp` is connection-global (owns no tab) — UNTAGGED.
   const reloadMcp = () => bridge.request('reload.mcp', { confirm: true });
+
+  // Task A7 (§4.9): the MCP admin RPCs `McpPanel`'s row actions + Add-server
+  // form drive. All correlated (`bridge.request`), same F-1 posture as
+  // `reloadMcp`/`toggle` above — `mcp` is connection-global, so these are
+  // UNTAGGED. `addMcpServer`/`testMcpServer`/`authMcpServer` cast the
+  // resolved value to its known shape, the same `restoreCheckpoint`/
+  // `redoCheckpoint` idiom above (`bridge.request` itself only promises
+  // `unknown` — the host's real return shape is the wire contract).
+  const addMcpServer = async (params: McpAddParams): Promise<McpAddResult> => {
+    const result = await bridge.request('mcp.add', params);
+    return result as McpAddResult;
+  };
+  const testMcpServer = async (name: string): Promise<McpTestResult> => {
+    const result = await bridge.request('mcp.test', { name });
+    return result as McpTestResult;
+  };
+  const removeMcpServer = (name: string) => bridge.request('mcp.remove', { name });
+  const setMcpServerEnabled = (name: string, enabled: boolean) =>
+    bridge.request('mcp.setEnabled', { name, enabled });
+  // Task A8 (§4.8): drives the panel's per-row `Login` button.
+  const authMcpServer = async (name: string): Promise<McpTestResult> => {
+    const result = await bridge.request('mcp.auth', { name });
+    return result as McpTestResult;
+  };
+  // Task A8 (§4.7): the Catalog disclosure's fetch (read-only, not trust-
+  // gated — fired at most once per panel mount, on first expand) and its
+  // `Install` action. Same untagged/cast posture as the other MCP admin RPCs
+  // above — `mcp` is connection-global.
+  const mcpCatalog = async (): Promise<McpCatalogData> => {
+    const result = await bridge.request('mcp.catalog', {});
+    return result as McpCatalogData;
+  };
+  const mcpCatalogInstall = async (p: McpCatalogInstallParams): Promise<McpCatalogInstallResult> => {
+    // `bridge.request` wants `Record<string, unknown>`; unlike `McpAddParams`
+    // (a `type` alias, structurally weak against an index signature),
+    // `McpCatalogInstallParams` is an `interface` — TS never infers an
+    // implicit index signature for those, so the params are rebuilt as a
+    // fresh object literal here (the same posture `restoreCheckpoint` above
+    // uses for its own `Record<string, unknown>` params).
+    // Rev-1 B4 (CF-13 parity): no `env` field at all — the webview never
+    // collects a credential value; the host prompts for each of the entry's
+    // `required_env` vars itself, masked, after the consent modal.
+    const wireParams: Record<string, unknown> = { name: p.name };
+    const result = await bridge.request('mcp.catalogInstall', wireParams);
+    return result as McpCatalogInstallResult;
+  };
+
+  // Task B6 (§5.6): the T2 skills admin RPCs `SkillsPanel`'s Create/Install-
+  // from-hub disclosures and hub-row Remove button drive. Same untagged/cast
+  // posture as the MCP admin RPCs above — `skills` is connection-global
+  // (`skills.toggle` above already is untagged), so these are UNTAGGED too.
+  // `createSkill` rebuilds `params` as a fresh `Record<string, unknown>`
+  // object literal (the same `mcpCatalogInstall` posture immediately above)
+  // — `SkillCreateParams` is an `interface`, so TS never infers an implicit
+  // index signature for it the way it does for `McpAddParams`'s `type` alias.
+  const createSkill = (params: SkillCreateParams) => {
+    const wireParams: Record<string, unknown> = { name: params.name, content: params.content };
+    if (params.category !== undefined) wireParams.category = params.category;
+    return bridge.request('skills.create', wireParams);
+  };
+  const previewHubSkill = async (identifier: string): Promise<HubPreview> => {
+    const result = await bridge.request('skills.hubPreview', { identifier });
+    return result as HubPreview;
+  };
+  const scanHubSkill = async (identifier: string): Promise<HubScan> => {
+    const result = await bridge.request('skills.hubScan', { identifier });
+    return result as HubScan;
+  };
+  const installHubSkill = async (identifier: string): Promise<HubInstallResult> => {
+    const result = await bridge.request('skills.hubInstall', { identifier });
+    return result as HubInstallResult;
+  };
+  const uninstallHubSkill = (name: string) => bridge.request('skills.hubUninstall', { name });
 
   // D3/N13: SettingsPanel's `config.set` over the CORRELATED path (the same
   // `toggle` pattern above) so a rejected/failed write resolves/rejects and
@@ -598,6 +699,40 @@ export function App() {
   // timeline per workspace root (keyed by the active tab's `rootId`);
   // sessions share one cwd-filtered slice across every tab.
   const checkpointsRemote = state.rootPanels[tab.rootId] ?? idle;
+
+  // TI-3 (AU-42 Part B): the `RemotePanel`/`SettingsPanel` `refreshError` prop
+  // for one of the 5 in-scope global panels (`state/panels.ts`'s
+  // `RefreshErrorPanel`) — `undefined` when that panel has no standing
+  // refresh failure (the ordinary case), so every existing render is
+  // unaffected until `state.refreshError[panel]` is actually set. `onRetry`
+  // reuses the SAME handler each `RemotePanel` call already wires to its own
+  // `onRetry` prop — a refresh-error Retry IS an ordinary panel refetch.
+  const refreshErrorProp = (panel: RefreshErrorPanel): RefreshErrorBanner | undefined => {
+    const message = state.refreshError?.[panel];
+    if (!message) return undefined;
+    return {
+      message,
+      onRetry: () => requestPanel(panel),
+      onDismiss: () => dispatch({ local: { type: 'local.refreshError.dismiss', panel } }),
+    };
+  };
+
+  // AU-61 (T2): the scoped counterpart of `refreshErrorProp` above, for the
+  // three re-scoped panels (`sessions`/`checkpoints`/`subagents`) whose own
+  // refreshError signal does NOT live in `state.refreshError` (see
+  // `readScopedRefreshError`'s doc, `state/panels.ts`). `onRetry` reuses the
+  // SAME `requestPanel` handler each of those `RemotePanel` calls already
+  // wires to its own `onRetry` prop — a refresh-error Retry IS an ordinary
+  // panel refetch, same posture as `refreshErrorProp`.
+  const scopedRefreshErrorProp = (panel: 'sessions' | 'checkpoints' | 'subagents'): RefreshErrorBanner | undefined => {
+    const read = readScopedRefreshError(panel, state, tab);
+    if (!read) return undefined;
+    return {
+      message: read.message,
+      onRetry: () => requestPanel(panel),
+      onDismiss: () => dispatch({ local: { type: 'local.scopedRefreshError.dismiss', target: read.dismiss } }),
+    };
+  };
 
   return (
     <>
@@ -806,7 +941,12 @@ export function App() {
           className="flex min-h-0 flex-1 flex-col"
         >
           <ErrorBoundary region="the Tools panel">
-            <RemotePanel remote={globalPanels.tools} loadingHint="Loading tools…" onRetry={() => requestPanel('tools')}>
+            <RemotePanel
+              remote={globalPanels.tools}
+              loadingHint="Loading tools…"
+              onRetry={() => requestPanel('tools')}
+              refreshError={refreshErrorProp('tools')}
+            >
               {(data) => (
                 <ToolsPanel
                   data={data}
@@ -825,8 +965,25 @@ export function App() {
           className="flex min-h-0 flex-1 flex-col"
         >
           <ErrorBoundary region="the MCP panel">
-            <RemotePanel remote={globalPanels.mcp} loadingHint="Loading servers…" onRetry={() => requestPanel('mcp')}>
-              {(data) => <McpPanel data={data} onReload={reloadMcp} />}
+            <RemotePanel
+              remote={globalPanels.mcp}
+              loadingHint="Loading servers…"
+              onRetry={() => requestPanel('mcp')}
+              refreshError={refreshErrorProp('mcp')}
+            >
+              {(data) => (
+                <McpPanel
+                  data={data}
+                  onReload={reloadMcp}
+                  onAdd={addMcpServer}
+                  onTest={testMcpServer}
+                  onRemove={removeMcpServer}
+                  onSetEnabled={setMcpServerEnabled}
+                  onAuth={authMcpServer}
+                  onCatalog={mcpCatalog}
+                  onCatalogInstall={mcpCatalogInstall}
+                />
+              )}
             </RemotePanel>
           </ErrorBoundary>
         </div>
@@ -839,12 +996,22 @@ export function App() {
           className="flex min-h-0 flex-1 flex-col"
         >
           <ErrorBoundary region="the Skills panel">
-            <RemotePanel remote={globalPanels.skills} loadingHint="Loading skills…" onRetry={() => requestPanel('skills')}>
+            <RemotePanel
+              remote={globalPanels.skills}
+              loadingHint="Loading skills…"
+              onRetry={() => requestPanel('skills')}
+              refreshError={refreshErrorProp('skills')}
+            >
               {(data) => (
                 <SkillsPanel
                   data={data}
                   onToggle={(name, enabled) => toggle('skills.toggle', { name, enabled })}
                   onRefresh={() => requestPanel('skills')}
+                  onCreate={createSkill}
+                  onHubPreview={previewHubSkill}
+                  onHubScan={scanHubSkill}
+                  onHubInstall={installHubSkill}
+                  onHubUninstall={uninstallHubSkill}
                 />
               )}
             </RemotePanel>
@@ -863,6 +1030,7 @@ export function App() {
               remote={checkpointsRemote}
               loadingHint="Loading checkpoints…"
               onRetry={() => requestPanel('checkpoints')}
+              refreshError={scopedRefreshErrorProp('checkpoints')}
             >
               {(data) => (
                 <CheckpointsPanel
@@ -888,6 +1056,7 @@ export function App() {
               remote={tab.subagents}
               loadingHint="Loading subagents…"
               onRetry={() => requestPanel('subagents')}
+              refreshError={scopedRefreshErrorProp('subagents')}
             >
               {(data) => <SubagentsPanel data={data} />}
             </RemotePanel>
@@ -906,6 +1075,7 @@ export function App() {
               remote={state.sessionsPanel}
               loadingHint="Loading sessions…"
               onRetry={() => requestPanel('sessions')}
+              refreshError={scopedRefreshErrorProp('sessions')}
             >
               {(data) => (
                 <SessionsPanel
@@ -914,6 +1084,7 @@ export function App() {
                   boundSessionIds={boundSessionIds}
                   activeTabHasLiveTurn={tab.turnActive}
                   onLoad={hostActions.loadSession}
+                  loadingSessionId={state.pendingSessionLoad?.sessionId}
                   onLoadMore={loadMoreSessions}
                   loadingMore={sessionsLoadingMore}
                   loadMoreError={sessionsLoadMoreError}
@@ -931,7 +1102,12 @@ export function App() {
           className="flex min-h-0 flex-1 flex-col"
         >
           <ErrorBoundary region="the Models panel">
-            <RemotePanel remote={globalPanels.models} loadingHint="Loading models…" onRetry={() => requestPanel('models')}>
+            <RemotePanel
+              remote={globalPanels.models}
+              loadingHint="Loading models…"
+              onRetry={() => requestPanel('models')}
+              refreshError={refreshErrorProp('models')}
+            >
               {(data) => (
                 <ModelsPanel
                   data={data}
@@ -994,6 +1170,7 @@ export function App() {
               config={globalPanels.settings}
               onRetryConfig={() => requestPanel('settings')}
               onSetConfig={setConfig}
+              refreshError={refreshErrorProp('settings')}
             />
           </ErrorBoundary>
         </div>

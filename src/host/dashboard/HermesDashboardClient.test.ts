@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   HermesDashboardClient,
   isHermesStatusShape,
+  anySignal,
   type FetchLike,
 } from './HermesDashboardClient';
 import { must } from '../../testing/must';
@@ -361,5 +362,138 @@ describe('isHermesStatusShape — Hermes identity signature', () => {
     void gateway_drainable;
     expect(isHermesStatusShape(noDrainable)).toBe(false); // missing field
     expect(isHermesStatusShape(hermesStatusBody({ nous_session_valid: 123 }))).toBe(false); // wrong type
+  });
+});
+
+/**
+ * A2 — `DashboardAdminClient` (T1 members): MCP admin CRUD + catalog + auth.
+ * `actionStatus` is included here too (controller-decided scope note): it
+ * visually groups under "T2" in the architecture doc (§4.3), but A6 (catalog
+ * background-install polling) needs it before B2 lands, and it is shared
+ * polling infra with no T2-specific shape.
+ */
+describe('DashboardAdminClient — T1 endpoints', () => {
+  it('addMcpServer POSTs the exact body to /api/mcp/servers with the token header', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ name: 'gh', transport: 'stdio' }));
+    await makeClient(fetchImpl, 'tkn').addMcpServer({ name: 'gh', command: 'npx', args: ['-y', 'server-github'], env: { GITHUB_TOKEN: 'x' } });
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/mcp/servers');
+    expect(must(calls[0]).init?.method).toBe('POST');
+    expect((must(calls[0]).init?.headers as Record<string, string>)['X-Hermes-Session-Token']).toBe('tkn');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'gh', command: 'npx', args: ['-y', 'server-github'], env: { GITHUB_TOKEN: 'x' } });
+  });
+
+  it('testMcpServer resolves the ok:false 200-envelope instead of throwing', async () => {
+    const { fetchImpl } = stubFetch(() => json({ ok: false, error: 'connect refused', tools: [] }));
+    await expect(makeClient(fetchImpl).testMcpServer('gh')).resolves.toEqual({ ok: false, error: 'connect refused', tools: [] });
+  });
+
+  it('removeMcpServer DELETEs the encoded name path and a 404 rejects with a generic (body-free) message', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ detail: 'secret-path-leak' }, 404));
+    await expect(makeClient(fetchImpl).removeMcpServer('a b')).rejects.toThrow(/404/);
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/mcp/servers/a%20b');
+    await expect(makeClient(fetchImpl).removeMcpServer('a b')).rejects.not.toThrow(/secret-path-leak/);
+  });
+
+  it('setMcpServerEnabled PUTs {enabled} to /api/mcp/servers/{name}/enabled', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, name: 'gh', enabled: false }));
+    await makeClient(fetchImpl).setMcpServerEnabled('gh', false);
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/mcp/servers/gh/enabled');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ enabled: false });
+  });
+
+  it('authMcpServer resolves the ok:false 200-envelope instead of throwing', async () => {
+    const { fetchImpl } = stubFetch(() => json({ ok: false, error: 'oauth denied', tools: [] }));
+    await expect(makeClient(fetchImpl).authMcpServer('gh')).resolves.toEqual({ ok: false, error: 'oauth denied', tools: [] });
+  });
+
+  it('authMcpServer POSTs .../auth and an external AbortSignal cancels the call', async () => {
+    const controller = new AbortController();
+    const { fetchImpl } = stubFetch((_url, init) => new Promise((_res, rej) => {
+      init?.signal?.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')));
+    }) as unknown as Response);
+    const pending = makeClient(fetchImpl).authMcpServer('remote', controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+  });
+
+  it('listMcpCatalog GETs /api/mcp/catalog and installCatalogEntry POSTs {name, env, enable}', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, name: 'n8n', background: true, action: 'mcp-install-n8n-ab12cd34' }));
+    await makeClient(fetchImpl).installCatalogEntry({ name: 'n8n', env: { N8N_KEY: 'v' }, enable: true });
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/mcp/catalog/install');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'n8n', env: { N8N_KEY: 'v' }, enable: true });
+  });
+
+  it('anySignal: native path delegates; fallback path (anyImpl falsy, pre-Node-20.3) composes via once-listeners', () => {
+    // `anyImpl` is a DEFAULT param — passing `undefined` would re-trigger the
+    // default initializer and resolve to the NATIVE `AbortSignal.any` on this
+    // repo's Node (24), giving the fallback branch zero coverage. Pass a
+    // falsy-but-NOT-undefined value so default substitution does not kick in
+    // and the manual once-listener `else` branch genuinely runs.
+    const noNativeAny = null as unknown as typeof AbortSignal.any;
+    const a = new AbortController();
+    const b = new AbortController();
+    const composed = anySignal([a.signal, b.signal], noNativeAny); // force the fallback branch
+    expect(composed.aborted).toBe(false);
+    b.abort(new Error('caller cancelled'));
+    expect(composed.aborted).toBe(true);
+    const already = new AbortController();
+    already.abort();
+    expect(anySignal([already.signal], noNativeAny).aborted).toBe(true); // pre-aborted input propagates immediately
+  });
+
+  it('actionStatus GETs /api/actions/{name}/status and returns the pinned shape', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ name: 'a', running: false, exit_code: 0, pid: 1, lines: ['Installed: pdf'] }));
+    const res = await makeClient(fetchImpl).actionStatus('a');
+    expect(must(calls[0]).url).toContain('/api/actions/a/status');
+    expect(res).toMatchObject({ running: false, exit_code: 0 });
+  });
+});
+
+describe('DashboardAdminClient — T2 skills endpoints', () => {
+  it('createSkill POSTs the exact body to /api/skills', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true }));
+    await makeClient(fetchImpl).createSkill({ name: 'x', content: '---\n---\nbody', category: 'custom' });
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills');
+    expect(must(calls[0]).init?.method).toBe('POST');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'x', content: '---\n---\nbody', category: 'custom' });
+  });
+
+  it('createSkill surfaces a 400 as a generic error (detail never in the thrown message)', async () => {
+    const { fetchImpl } = stubFetch(() => json({ detail: 'Invalid name: /etc/passwd' }, 400));
+    await expect(makeClient(fetchImpl).createSkill({ name: 'x', content: '---\n---\nb' })).rejects.toThrow(/400/);
+    await expect(makeClient(fetchImpl).createSkill({ name: 'x', content: '---\n---\nb' })).rejects.not.toThrow(/passwd/);
+  });
+
+  it('previewHubSkill GETs /api/skills/hub/preview with an ENCODED identifier and resolves the body', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({
+      name: 'pdf', description: 'PDF tools', source: 'anthropics/skills', identifier: 'anthropics/skills/pdf',
+      trust_level: 'trusted', skill_md: '# PDF', files: ['SKILL.md'],
+    }));
+    const res = await makeClient(fetchImpl).previewHubSkill('anthropics/skills/pdf tools');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/preview?identifier=anthropics%2Fskills%2Fpdf%20tools');
+    expect(must(calls[0]).init?.method).toBe('GET');
+    expect(res).toMatchObject({ name: 'pdf', identifier: 'anthropics/skills/pdf' });
+  });
+
+  it('scanHubSkill GETs with an ENCODED identifier', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ name: 'x', identifier: 'a/b', trust_level: 'trusted', verdict: 'safe', summary: '', policy: 'allow', findings: [] }));
+    await makeClient(fetchImpl).scanHubSkill('anthropics/skills/pdf tools');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/scan?identifier=anthropics%2Fskills%2Fpdf%20tools');
+  });
+
+  it('installHubSkill POSTs {identifier} and returns the action name', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, pid: 1, name: 'skills-install-anthropics-pdf-ab12cd34' }));
+    const res = await makeClient(fetchImpl).installHubSkill('anthropics/skills/pdf');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/install');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ identifier: 'anthropics/skills/pdf' });
+    expect(res.name).toBe('skills-install-anthropics-pdf-ab12cd34');
+  });
+
+  it('uninstallHubSkill POSTs {name} to /api/skills/hub/uninstall', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, name: 'pdf' }));
+    const res = await makeClient(fetchImpl).uninstallHubSkill('pdf');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/uninstall');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'pdf' });
+    expect(res).toEqual({ ok: true, name: 'pdf' });
   });
 });
