@@ -689,9 +689,12 @@ describe('HermesDashboardManager — T-B2: dashboard liveness fail-open (V-9, re
     vi.mocked(spawn).mockReturnValue(proc as unknown as ChildProcess);
 
     // `hermesPath` set -> resolveHermesBin short-circuits the login-shell PATH
-    // lookup (no real OS access), so the REAL spawnServe runs end to end.
+    // lookup (no real OS access); `pythonPath` also pinned so the AU-7
+    // realpath+existence-check derivation (which would fail against this
+    // fake path on the real FS) never runs either — the REAL spawnServe runs
+    // end to end regardless.
     const manager = new HermesDashboardManager({
-      config: { hermesPath: '/fake/hermes' },
+      config: { hermesPath: '/fake/hermes', pythonPath: '/fake/python' },
       port: 9119,
     });
     // Reach past `private` to unit-test spawnServe's own contract in isolation
@@ -726,7 +729,10 @@ describe('HermesDashboardManager — T-B2: dashboard liveness fail-open (V-9, re
     const spawnedClient = fakeClient({ probeSeq: [true], servedToken: 'squatter-token' });
 
     const manager = new HermesDashboardManager({
-      config: { hermesPath: '/fake/hermes' },
+      // pythonPath pinned alongside hermesPath — see the sibling T-B2 test
+      // above for why (AU-7 realpath+existence-check derivation would
+      // otherwise reject this fake path against the real FS).
+      config: { hermesPath: '/fake/hermes', pythonPath: '/fake/python' },
       port: 9119,
       probeBackoffMs: [1],
       deps: {

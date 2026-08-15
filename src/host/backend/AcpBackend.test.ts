@@ -1297,7 +1297,15 @@ function makeStartableBackend(
   backend: AcpBackend;
   clients: FakeAcpClient[];
 } {
-  const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes', ...configOverrides };
+  // pythonPath pinned alongside hermesPath: AU-7's realpath+existence-check
+  // derivation (unset pythonPath) would otherwise reject this fake path
+  // against the real FS — these tests exercise ConnectionSupervisor/ACP
+  // wiring, not python derivation (covered by resolveHermes.test.ts).
+  const config: HermesRuntimeConfig = {
+    hermesPath: '/fake/hermes',
+    pythonPath: '/fake/python',
+    ...configOverrides,
+  };
   const clients: FakeAcpClient[] = [];
   const createClient: AcpClientFactory = (options) => {
     const client = new FakeAcpClient(options);
@@ -1789,7 +1797,7 @@ describe('ConnectionSupervisor/AcpBackend — T8 (§2.3 ⑧): structural no-prov
     const emitted: HostToWebviewMessage[] = [];
     const authRequired: unknown = { code: -32000, message: 'Authentication required' };
     const port: ConnectionSupervisorHostPort = {
-      config: { hermesPath: '/fake/hermes' },
+      config: { hermesPath: '/fake/hermes', pythonPath: '/fake/python' },
       createClient: (options) => new FakeAcpClient(options),
       callbacks: {
         onSessionUpdate: () => {},
@@ -2796,7 +2804,7 @@ describe('AcpBackend — W4-T1b §3: a crash releases the (bridge) root turn-lea
     backend: AcpBackend;
     clients: FakeAcpClient[];
   } {
-    const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes' };
+    const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes', pythonPath: '/fake/python' };
     const clients: FakeAcpClient[] = [];
     const createClient: AcpClientFactory = (options) => {
       const client = new FakeAcpClient(options);
@@ -9743,7 +9751,7 @@ describe('AcpBackend — W2 T4 F-D: EditPreviewRegistry wiring (SECURITY: ask-pa
 
 /** Like {@link makeStartableBackend} but seeds each client's reported `newSession` mode (drift scenario). */
 function makeStartableWithMode(modeId: string): { backend: AcpBackend; clients: FakeAcpClient[] } {
-  const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes' };
+  const config: HermesRuntimeConfig = { hermesPath: '/fake/hermes', pythonPath: '/fake/python' };
   const clients: FakeAcpClient[] = [];
   const createClient: AcpClientFactory = (options) => {
     const client = new FakeAcpClient(options);

@@ -51,8 +51,16 @@ class FakeTransport implements ControlTransport {
 }
 
 /** `resolveHermes` resolves real fields with no OS calls as long as
- * `hermesPath` is set — see `runtime/resolveHermes.ts`. */
-const CONFIG: HermesRuntimeConfig = { hermesPath: '/fake/venv/bin/hermes' };
+ * `hermesPath` AND `pythonPath` are both set — see `runtime/resolveHermes.ts`.
+ * (AU-7/INV-9: an unset `pythonPath` now derives via realpath + an
+ * existence-check against the real FS, which a fake path would fail; these
+ * tests are about respawn/timer/disposal behavior, not python derivation, so
+ * `pythonPath` is pinned to opt out of that new codepath entirely — the same
+ * "pin both settings" shape Setup-flow installs use in production.) */
+const CONFIG: HermesRuntimeConfig = {
+  hermesPath: '/fake/venv/bin/hermes',
+  pythonPath: '/fake/venv/bin/python',
+};
 
 function makeFactory(): { factory: ControlTransportFactory; transports: FakeTransport[] } {
   const transports: FakeTransport[] = [];

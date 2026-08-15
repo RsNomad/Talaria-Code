@@ -314,7 +314,7 @@
             "type": "string",
             "default": "",
             "scope": "machine",
-            "markdownDescription": "Absolute path to the Python interpreter used to launch the real Hermes backend (e.g. a virtualenv `bin/python`). Leave empty to resolve `python` from the login-shell `PATH`. Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot override this (prevents a malicious repo from repointing the interpreter — security)."
+            "markdownDescription": "Absolute path to the Python interpreter used to launch the real Hermes backend (e.g. a virtualenv `bin/python`). Leave empty to derive it from the discovered `hermes` executable's own environment (its venv `bin/python`, following symlinks — works for pipx installs). Set this when that derivation cannot work (Flatpak VS Code, Remote-SSH, or a custom install layout). Ignored while `#talaria.backend#` is `mock`. Machine-scoped: a workspace cannot override this (prevents a malicious repo from repointing the interpreter — security)."
           },
           "talaria.cwd": {
             "order": 4,
