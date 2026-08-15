@@ -104,6 +104,9 @@ export class JsonRpcStdio implements Disposable {
   /** Partial-line buffer for stdout (frames may straddle chunk boundaries). */
   private stdoutBuffer = '';
   private disposed = false;
+  /** TE-1 (AU-12): guards {@link terminate} so 'error' and 'exit' — whichever
+   * fires first, or both — fan `exitHandlers` exactly once. */
+  private terminated = false;
 
   constructor(options: JsonRpcStdioOptions) {
     this.logger = options.logger;
@@ -134,14 +137,19 @@ export class JsonRpcStdio implements Disposable {
       this.log(`[warn] stdin error: ${err.code ?? ''} ${err.message}`.trim()),
     );
 
+    // TE-1 (AU-12, mirrors acpClient.ts's T-B1 `terminate`): 'exit' and a
+    // spawn/runtime 'error' both terminate this child and must fan out the
+    // SAME `exitHandlers` — Node's own docs warn 'error' may fire WITHOUT a
+    // following 'exit' at all (e.g. an ENOENT'd command, or a post-ready
+    // transport failure), which previously left every `onExit` subscriber
+    // (`ControlChannel`'s `transportExitSub` -> `handleCrash`, its
+    // crash-respawn trigger) silently unnotified: no respawn, `ControlChannel`
+    // wedged in 'ready' state on a dead transport forever. Both events now
+    // route through the SAME idempotent `terminate()` choke.
     this.child.on('error', (err) =>
-      this.rejectAll(new Error(`child process error: ${String(err)}`)),
+      this.terminate(null, `error: ${String(err)}`),
     );
-    this.child.on('exit', (code) => {
-      this.log(`child exited with code ${code}`);
-      this.rejectAll(new Error(`child exited (code ${code}) before reply`));
-      for (const h of this.exitHandlers) h(code);
-    });
+    this.child.on('exit', (code) => this.terminate(code, 'exit'));
   }
 
   // --- public API -----------------------------------------------------------
@@ -192,7 +200,20 @@ export class JsonRpcStdio implements Disposable {
     return { dispose: () => this.exitHandlers.delete(handler) };
   }
 
-  /** SIGTERM the child, escalate to SIGKILL after a grace period, drop state. */
+  /**
+   * SIGTERM the child, escalate to SIGKILL after a grace period, drop state.
+   *
+   * TE-1 (AU-12): deliberately does NOT route through {@link terminate} —
+   * unlike `AcpClient.dispose()`, this intentional teardown must NOT
+   * pre-empt the exitHandlers fan-out. `dispose()` doesn't remove the
+   * constructor's 'exit'/'error' listeners, so once the killed child
+   * actually dies, the natural exit -> `terminate()` -> exitHandlers chain
+   * still fires (see `onStdout`'s oversized-frame teardown, which reuses
+   * `dispose()` for exactly this reason: the eventual real exit is what an
+   * upstream supervisor's `onExit` respawn subscription needs to observe).
+   * `rejectAll` here is the one piece dispose() shares with `terminate` —
+   * pending in-flight requests must fail fast either way.
+   */
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -317,6 +338,22 @@ export class JsonRpcStdio implements Disposable {
         }
       }
     }
+  }
+
+  /**
+   * TE-1 (AU-12): the single choke point `'exit'` and a child `'error'` both
+   * route through — rejects every pending request AND fans `exitHandlers`,
+   * exactly once regardless of which event fires first or if both fire
+   * (mirrors `acpClient.ts`'s T-B1 `terminate`). `code` is `null` for an
+   * `'error'`-only termination (no exit code was ever produced), matching
+   * `onExit`'s existing `number | null` signature.
+   */
+  private terminate(code: number | null, reason: string): void {
+    if (this.terminated) return;
+    this.terminated = true;
+    this.log(`child terminated (${reason}); code=${code}`);
+    this.rejectAll(new Error(`child terminated (${reason}, code ${code}) before reply`));
+    for (const h of this.exitHandlers) h(code);
   }
 
   private rejectAll(reason: unknown): void {

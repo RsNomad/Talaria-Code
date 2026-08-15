@@ -291,3 +291,66 @@ describe('JsonRpcStdio traffic tap — SECRET DISCIPLINE: redact secret-shaped f
     transport.dispose();
   });
 });
+
+/**
+ * TE-1 (AU-12): `'error'` never fanned to `onExit` subscribers — only
+ * `rejectAll`'d pending requests. Node's own docs warn `'error'` may fire
+ * WITHOUT a following `'exit'` at all (e.g. a post-ready transport failure),
+ * which previously left every `onExit` subscriber (`ControlChannel`'s
+ * `transportExitSub` -> `handleCrash`, its respawn trigger) silently
+ * unnotified: no respawn, `ControlChannel` wedged in `'ready'` state on a
+ * dead transport forever. The SAME class was already fixed at the
+ * `AcpClient` seam (T-B1, `acpClient.ts`'s `terminate()`); this mirrors that
+ * shape: a private `terminated` guard makes `'error'` and `'exit'` both fan
+ * out through the SAME idempotent `terminate()` choke, exactly once,
+ * regardless of which fires first or if both fire.
+ *
+ * RED (pre-fix): the first case's `onExitSpy` is never called (`'error'`
+ * only calls `rejectAll`) — fails at HEAD.
+ */
+describe("JsonRpcStdio — AU-12/TE-1: child 'error' fans to onExit (mirrors AcpClient's T-B1 terminate)", () => {
+  it("a bare child 'error' event (no following 'exit') still notifies onExit subscribers exactly once, with a null code", () => {
+    const { transport, fakeChild } = makeTransport();
+    const onExitSpy = vi.fn();
+    transport.onExit(onExitSpy);
+
+    fakeChild.emit('error', new Error('spawn ENOENT'));
+
+    expect(onExitSpy).toHaveBeenCalledTimes(1);
+    expect(onExitSpy).toHaveBeenCalledWith(null);
+  });
+
+  it("'error' then 'exit' fires onExit exactly ONCE (idempotent terminate, error wins the race)", () => {
+    const { transport, fakeChild } = makeTransport();
+    const onExitSpy = vi.fn();
+    transport.onExit(onExitSpy);
+
+    fakeChild.emit('error', new Error('spawn ENOENT'));
+    fakeChild.emit('exit', 1);
+
+    expect(onExitSpy).toHaveBeenCalledTimes(1);
+    expect(onExitSpy).toHaveBeenCalledWith(null);
+  });
+
+  it("'exit' then a late 'error' fires onExit exactly ONCE (idempotent terminate, exit wins the race)", () => {
+    const { transport, fakeChild } = makeTransport();
+    const onExitSpy = vi.fn();
+    transport.onExit(onExitSpy);
+
+    fakeChild.emit('exit', 0);
+    fakeChild.emit('error', new Error('EPIPE after exit'));
+
+    expect(onExitSpy).toHaveBeenCalledTimes(1);
+    expect(onExitSpy).toHaveBeenCalledWith(0);
+  });
+
+  it('a pending request still rejects when the child errors (rejectAll unaffected by the onExit fix)', async () => {
+    const { transport, fakeChild } = makeTransport();
+    const pending = transport.request('some.method', {});
+    pending.catch(() => {});
+
+    fakeChild.emit('error', new Error('spawn ENOENT'));
+
+    await expect(pending).rejects.toThrow(/error/i);
+  });
+});
