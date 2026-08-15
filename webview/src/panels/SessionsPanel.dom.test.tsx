@@ -44,8 +44,11 @@ function renderPanel(config: {
   boundSessionIds?: ReadonlySet<string>;
   activeTabHasLiveTurn?: boolean;
   onLoad?: (message: TabLoadMessage) => void;
+  nextCursor?: string;
+  onLoadMore?: (cursor: string) => void;
+  loadingMore?: boolean;
 }) {
-  const data: SessionsData = { sessions: config.sessions ?? [session()] };
+  const data: SessionsData = { sessions: config.sessions ?? [session()], nextCursor: config.nextCursor };
   return (
     <SessionsPanel
       data={data}
@@ -53,8 +56,8 @@ function renderPanel(config: {
       boundSessionIds={config.boundSessionIds ?? new Set()}
       activeTabHasLiveTurn={config.activeTabHasLiveTurn ?? false}
       onLoad={config.onLoad ?? (() => {})}
-      onLoadMore={() => {}}
-      loadingMore={false}
+      onLoadMore={config.onLoadMore ?? (() => {})}
+      loadingMore={config.loadingMore ?? false}
     />
   );
 }
@@ -122,5 +125,47 @@ describe('C4: History rows carry a bound marker and confirm before replacing a l
 
     expect(loads).toEqual([]);
     expect(screen.queryByRole('button', { name: 'Load anyway' })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * AU-40 — F-8 doctrine sweep, SessionsPanel representative.
+ *
+ * RED at HEAD (⟐ Rev-1 B1): the "Load more" footer button used to render
+ * `disabled={loading}` — natively disabled the instant a request went in
+ * flight. The load-bearing assertion is ATTRIBUTE POSTURE, not focus
+ * retention: jsdom does not emulate the browser's blur-on-disable (probed —
+ * focusing a button then setting `disabled` leaves `document.activeElement`
+ * on it), so a focus-retention check alone would falsely pass even against
+ * the pre-fix native-`disabled` code. `toBeDisabled()` (jest-dom) does not
+ * consider `aria-disabled` at all, so `.not.toBeDisabled()` genuinely
+ * distinguishes the two mechanisms.
+ */
+describe('AU-40: "Load more" goes BUSY, not natively disabled, while a request is in flight', () => {
+  it('while loadingMore is true: not natively disabled, aria-busy + aria-disabled both true, and focus survives the click', async () => {
+    const { user, rerender } = setup(
+      renderPanel({ nextCursor: 'cursor-1', loadingMore: false }),
+    );
+
+    const idle = screen.getByRole('button', { name: /Load more/i });
+    expect(idle, 'fixture integrity: not already focused before the click').not.toHaveFocus();
+    await user.click(idle);
+
+    // `loadingMore` is a PROP driven by the parent (App.tsx's own in-flight
+    // state), not local state this component owns — so "the request this
+    // click started is now in flight" is modeled by re-rendering with it
+    // flipped, exactly what the real parent does once its correlated
+    // `sessions.loadMore` request is issued.
+    rerender(renderPanel({ nextCursor: 'cursor-1', loadingMore: true }));
+
+    const pending = screen.getByRole('button', { name: /Loading…/i });
+    expect(pending, 'AU-40: an in-flight "Load more" must stay focusable — never natively disabled').not.toBeDisabled();
+    expect(pending).toHaveAttribute('aria-busy', 'true');
+    expect(pending).toHaveAttribute('aria-disabled', 'true');
+    // Secondary lock (browser-vs-jsdom gap, see this describe block's doc):
+    // true in real browsers per W3C-APG/MDN's disabled-elements-drop-focus
+    // rule; jsdom witnesses it only indirectly, through the attribute
+    // posture above, since it never actually blurs a disabled element.
+    expect(pending).toHaveFocus();
   });
 });

@@ -23,6 +23,7 @@ import type {
 } from '../protocol';
 import { APPLIES_NEXT_SESSION } from '../copy';
 import { totalLookup } from '../lookup';
+import { busyInteraction } from '../components/busyInteraction';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill, type PillTone } from '../components/Pill';
@@ -330,6 +331,11 @@ function AddServerDisclosure({
     );
   };
 
+  // AU-40: `adding` is purely in-flight (nothing genuinely-indefinite gates
+  // this form) — `handleSubmit` already guards `if (adding) return;` above,
+  // equivalent to `!addInteraction.interactive`.
+  const addInteraction = busyInteraction(false, adding);
+
   return (
     <div className="mt-2 overflow-hidden rounded-card border border-dashed border-border">
       <button
@@ -398,8 +404,10 @@ function AddServerDisclosure({
 
           <button
             type="submit"
-            disabled={adding}
-            className="mt-1 flex items-center justify-center gap-1.5 self-start rounded border border-border px-3 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60"
+            disabled={addInteraction.nativeDisabled}
+            aria-disabled={addInteraction.ariaDisabled}
+            aria-busy={addInteraction.ariaBusy}
+            className="mt-1 flex items-center justify-center gap-1.5 self-start rounded border border-border px-3 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 aria-disabled:cursor-default aria-disabled:opacity-60"
           >
             <Icon name={adding ? 'loading' : 'add'} size={12} spin={adding} />
             {adding ? 'Adding…' : 'Add'}
@@ -483,6 +491,10 @@ function CatalogDisclosure({
   };
 
   const handleInstall = (entry: McpCatalogEntry) => {
+    // AU-40: the button lost its native `disabled` (a busy control must stay
+    // focusable), so this guard is now the only thing stopping a second
+    // click from firing a second install while one is in flight.
+    if (installing[entry.name] === true) return;
     const env: Record<string, string> = {};
     for (const v of entry.required_env) {
       env[v.name] = envValues[entry.name]?.[v.name] ?? '';
@@ -533,6 +545,7 @@ function CatalogDisclosure({
           {entries.map((entry) => {
             const badges = catalogRowBadges(entry);
             const rowInstalling = installing[entry.name] === true;
+            const installInteraction = busyInteraction(false, rowInstalling);
             return (
               <div key={entry.name} className="rounded-card border border-border bg-surface px-3 py-2.5">
                 <div className="flex items-center gap-2">
@@ -574,8 +587,10 @@ function CatalogDisclosure({
                 <button
                   type="button"
                   onClick={() => handleInstall(entry)}
-                  disabled={rowInstalling}
-                  className="mt-2 flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50"
+                  disabled={installInteraction.nativeDisabled}
+                  aria-disabled={installInteraction.ariaDisabled}
+                  aria-busy={installInteraction.ariaBusy}
+                  className="mt-2 flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
                 >
                   <Icon name={rowInstalling ? 'loading' : 'cloud-download'} size={12} spin={rowInstalling} />
                   {rowInstalling ? 'Installing…' : 'Install'}
@@ -598,8 +613,13 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
   const [authing, setAuthing] = useState<Record<string, boolean>>({});
   const [rowNotice, setRowNotice] = useState<Record<string, TestNotice>>({});
   const { isOn, toggle, lastError } = useToggle(onSetEnabled);
+  // AU-40: purely in-flight — nothing genuinely-indefinite gates reload.
+  const reloadInteraction = busyInteraction(false, reloading);
 
   const handleReload = () => {
+    // AU-40: guard replacing the native `disabled` this button used to rely
+    // on to block a second click while a reload is in flight.
+    if (reloading) return;
     setReloading(true);
     setNotice(undefined);
     void onReload()
@@ -617,6 +637,9 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
    *  server, before the next `panel.data` push lands it) still shows the
    *  instant that row appears — `rowNotice` outlives this render. */
   const handleTest = (name: string) => {
+    // AU-40: guard replacing the native `disabled` this button used to rely
+    // on to block a second click while a test is in flight.
+    if (testing[name] === true) return;
     setTesting((t) => ({ ...t, [name]: true }));
     setRowNotice((n) => {
       if (!(name in n)) return n;
@@ -641,6 +664,9 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
    *  already pushed the row's absence, so the row disappearing IS the
    *  confirmation. */
   const handleRemove = (name: string) => {
+    // AU-40: guard replacing the native `disabled` this button used to rely
+    // on to block a second click while a remove is in flight.
+    if (removing[name] === true) return;
     setRemoving((r) => ({ ...r, [name]: true }));
     void onRemove(name)
       .then(
@@ -666,6 +692,9 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
    *  "waiting for the browser" UX; this button's own pending label is the
    *  panel-local echo of that wait. */
   const handleAuth = (name: string) => {
+    // AU-40: guard replacing the native `disabled` this button used to rely
+    // on to block a second click while a sign-in is in flight.
+    if (authing[name] === true) return;
     setAuthing((a) => ({ ...a, [name]: true }));
     setRowNotice((n) => {
       if (!(name in n)) return n;
@@ -689,6 +718,11 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
         const rowTesting = testing[srv.name] === true;
         const rowRemoving = removing[srv.name] === true;
         const rowAuthing = authing[srv.name] === true;
+        // AU-40: none of these three is genuinely-indefinite — each is
+        // purely "a request from THIS button is in flight".
+        const testInteraction = busyInteraction(false, rowTesting);
+        const removeInteraction = busyInteraction(false, rowRemoving);
+        const authInteraction = busyInteraction(false, rowAuthing);
         const toggleErr = lastError(srv.name);
         return (
           <div key={srv.id} className="mb-2 rounded-card border border-border bg-surface px-3 py-2.5">
@@ -726,8 +760,10 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
               <button
                 type="button"
                 onClick={() => handleTest(srv.name)}
-                disabled={rowTesting}
-                className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50"
+                disabled={testInteraction.nativeDisabled}
+                aria-disabled={testInteraction.ariaDisabled}
+                aria-busy={testInteraction.ariaBusy}
+                className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
               >
                 <Icon name={rowTesting ? 'loading' : 'beaker'} size={12} spin={rowTesting} />
                 {rowTesting ? 'Testing…' : 'Test'}
@@ -735,8 +771,10 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
               <button
                 type="button"
                 onClick={() => handleRemove(srv.name)}
-                disabled={rowRemoving}
-                className="flex items-center gap-1.5 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50"
+                disabled={removeInteraction.nativeDisabled}
+                aria-disabled={removeInteraction.ariaDisabled}
+                aria-busy={removeInteraction.ariaBusy}
+                className="flex items-center gap-1.5 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
               >
                 <Icon name={rowRemoving ? 'loading' : 'trash'} size={12} spin={rowRemoving} />
                 {rowRemoving ? 'Removing…' : 'Remove'}
@@ -751,8 +789,10 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
                 <button
                   type="button"
                   onClick={() => handleAuth(srv.name)}
-                  disabled={rowAuthing}
-                  className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50"
+                  disabled={authInteraction.nativeDisabled}
+                  aria-disabled={authInteraction.ariaDisabled}
+                  aria-busy={authInteraction.ariaBusy}
+                  className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
                 >
                   <Icon name={rowAuthing ? 'loading' : 'sign-in'} size={12} spin={rowAuthing} />
                   {rowAuthing ? 'Waiting for browser sign-in…' : 'Login'}
@@ -809,8 +849,10 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
         <button
           type="button"
           onClick={handleReload}
-          disabled={reloading}
-          className="mt-1 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 disabled:hover:border-border disabled:hover:text-muted"
+          disabled={reloadInteraction.nativeDisabled}
+          aria-disabled={reloadInteraction.ariaDisabled}
+          aria-busy={reloadInteraction.ariaBusy}
+          className="mt-1 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 disabled:hover:border-border disabled:hover:text-muted aria-disabled:cursor-default aria-disabled:opacity-60 aria-disabled:hover:border-border aria-disabled:hover:text-muted"
         >
           <Icon name={reloading ? 'loading' : 'refresh'} size={13} spin={reloading} />
           {reloading ? 'Reloading…' : 'Reload servers'}

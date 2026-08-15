@@ -9,6 +9,7 @@
  */
 import { useState } from 'react';
 import type { SessionSummary, SessionsData, WebviewToHost } from '../protocol';
+import { busyInteraction } from '../components/busyInteraction';
 import { Icon } from '../components/Icon';
 import { Pill } from '../components/Pill';
 import { EmptyPanel, PanelShell } from './PanelShell';
@@ -204,12 +205,23 @@ export function SessionsPanel({
         }
 
         const loading = footer === 'loading';
+        // AU-40: purely in-flight — nothing genuinely-indefinite gates this
+        // button (the footer's `hidden`/`error` states render different JSX
+        // entirely, above).
+        const loadMoreInteraction = busyInteraction(false, loading);
         return (
           <button
             type="button"
-            disabled={loading}
-            onClick={() => data.nextCursor && onLoadMore(data.nextCursor)}
-            className="mt-1 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 disabled:hover:border-border disabled:hover:text-muted"
+            disabled={loadMoreInteraction.nativeDisabled}
+            aria-disabled={loadMoreInteraction.ariaDisabled}
+            aria-busy={loadMoreInteraction.ariaBusy}
+            onClick={() => {
+              // AU-40: guard replacing the native `disabled` this button
+              // used to rely on to block a second click while in flight.
+              if (!loadMoreInteraction.interactive) return;
+              if (data.nextCursor) onLoadMore(data.nextCursor);
+            }}
+            className="mt-1 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 disabled:hover:border-border disabled:hover:text-muted aria-disabled:cursor-default aria-disabled:opacity-60 aria-disabled:hover:border-border aria-disabled:hover:text-muted"
           >
             <Icon name={loading ? 'loading' : 'chevron-down'} size={13} spin={loading} />
             {loading ? 'Loading…' : 'Load more'}

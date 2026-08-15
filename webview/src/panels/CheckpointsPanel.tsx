@@ -12,6 +12,7 @@
  */
 import { useEffect, useState } from 'react';
 import type { Checkpoint, CheckpointPhase, CheckpointRestoreResult, CheckpointsData } from '../protocol';
+import { busyInteraction } from '../components/busyInteraction';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
@@ -273,6 +274,24 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
       .finally(() => setRedoPending(undefined));
   };
 
+  /**
+   * AU-40: shared by every Redo/Redo-all/"Redo anyway" button below —
+   * `redoPending` is a single panel-scoped state (not per-row), and every
+   * one of these three buttons already disabled on it, so ONE computed
+   * posture covers all three mutually-exclusive branches. Purely in-flight —
+   * nothing genuinely-indefinite gates redo.
+   */
+  const redoInteraction = busyInteraction(false, redoPending !== undefined);
+  /**
+   * AU-40: shared by every "Restore anyway"/"Restore workspace"/"Restore"
+   * button across EVERY row below — `restoringId` is a single panel-scoped
+   * state, and a row NOT being restored still bounded-in-flight-disables its
+   * own Restore controls while another row's restore is running (the brief's
+   * own call-out: focus preservation matters most exactly on the non-clicked
+   * rows). Purely in-flight — nothing genuinely-indefinite gates restore.
+   */
+  const restoreInteraction = busyInteraction(false, restoringId !== undefined);
+
   const redoStatusText = redoBlocked
     ? ''
     : redoPending
@@ -307,8 +326,15 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
               <div className="mt-1.5 flex gap-2">
                 <button
                   type="button"
-                  aria-disabled={redoPending !== undefined ? true : undefined}
-                  onClick={() => runRedo(redoBlocked.kind, true)}
+                  disabled={redoInteraction.nativeDisabled}
+                  aria-disabled={redoInteraction.ariaDisabled}
+                  aria-busy={redoInteraction.ariaBusy}
+                  onClick={() => {
+                    // AU-40: belt-and-suspenders — `runRedo` already guards
+                    // `if (redoPending !== undefined) return;` itself.
+                    if (!redoInteraction.interactive) return;
+                    runRedo(redoBlocked.kind, true);
+                  }}
                   className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay aria-disabled:cursor-default aria-disabled:opacity-50"
                 >
                   {redoBlocked.kind === 'redo' ? 'Redo anyway' : 'Redo all anyway'}
@@ -326,17 +352,27 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
             <div className="mt-1.5 flex items-center gap-2">
               <button
                 type="button"
-                disabled={redoPending !== undefined}
-                onClick={() => runRedo('redo')}
-                className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:opacity-50"
+                disabled={redoInteraction.nativeDisabled}
+                aria-disabled={redoInteraction.ariaDisabled}
+                aria-busy={redoInteraction.ariaBusy}
+                onClick={() => {
+                  if (!redoInteraction.interactive) return;
+                  runRedo('redo');
+                }}
+                className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
               >
                 Redo
               </button>
               <button
                 type="button"
-                disabled={redoPending !== undefined}
-                onClick={() => runRedo('redoAll')}
-                className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:opacity-50"
+                disabled={redoInteraction.nativeDisabled}
+                aria-disabled={redoInteraction.ariaDisabled}
+                aria-busy={redoInteraction.ariaBusy}
+                onClick={() => {
+                  if (!redoInteraction.interactive) return;
+                  runRedo('redoAll');
+                }}
+                className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
               >
                 Redo all
               </button>
@@ -467,8 +503,16 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
                     <div className="mt-1.5 flex gap-2">
                       <button
                         type="button"
-                        aria-disabled={restoringId !== undefined ? true : undefined}
-                        onClick={() => confirmRestore(cp.id, true)}
+                        disabled={restoreInteraction.nativeDisabled}
+                        aria-disabled={restoreInteraction.ariaDisabled}
+                        aria-busy={restoreInteraction.ariaBusy}
+                        onClick={() => {
+                          // AU-40: belt-and-suspenders — `confirmRestore`
+                          // already guards `if (restoringId !== undefined)
+                          // return;` itself.
+                          if (!restoreInteraction.interactive) return;
+                          confirmRestore(cp.id, true);
+                        }}
                         className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay aria-disabled:cursor-default aria-disabled:opacity-50"
                       >
                         Restore anyway
@@ -494,9 +538,14 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
                     <div className="mt-1.5 flex gap-2">
                       <button
                         type="button"
-                        disabled={restoringId !== undefined}
-                        onClick={() => confirmRestore(cp.id)}
-                        className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay disabled:opacity-50"
+                        disabled={restoreInteraction.nativeDisabled}
+                        aria-disabled={restoreInteraction.ariaDisabled}
+                        aria-busy={restoreInteraction.ariaBusy}
+                        onClick={() => {
+                          if (!restoreInteraction.interactive) return;
+                          confirmRestore(cp.id);
+                        }}
+                        className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
                       >
                         Restore workspace
                       </button>
@@ -513,9 +562,19 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
                   <div className="mt-2 flex items-center gap-2">
                     <button
                       type="button"
-                      disabled={restoringId !== undefined}
-                      onClick={() => requestRestore(cp.id)}
-                      className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:opacity-50"
+                      disabled={restoreInteraction.nativeDisabled}
+                      aria-disabled={restoreInteraction.ariaDisabled}
+                      aria-busy={restoreInteraction.ariaBusy}
+                      onClick={() => {
+                        // AU-40: unlike confirmRestore, requestRestore has no
+                        // internal guard of its own — this is the ONLY thing
+                        // stopping a click from opening a confirm prompt for
+                        // a different row while another row's restore is in
+                        // flight.
+                        if (!restoreInteraction.interactive) return;
+                        requestRestore(cp.id);
+                      }}
+                      className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
                     >
                       Restore
                     </button>

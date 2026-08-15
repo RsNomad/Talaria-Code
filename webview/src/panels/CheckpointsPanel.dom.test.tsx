@@ -440,7 +440,27 @@ describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRed
     expect(calls).toEqual([undefined]);
   });
 
-  it('disables both Redo buttons while a request is in flight (honest pending state, no double-fire)', async () => {
+  /**
+   * AU-40: rewritten from a `toBeDisabled()` pair to the aria posture — the
+   * OLD assertion encoded exactly the F-8 regression this sweep fixes
+   * (native `disabled` mid-flight blurs a keyboard user to `<body>`). Both
+   * buttons key off the SAME panel-scoped `redoPending` state, so both go
+   * busy together — never natively disabled, per `SettingsPanel.dom.test.tsx`'s
+   * own "F-8: the toggle keeps keyboard focus" lock. Doubles as this file's
+   * AU-40 representative-button RED test (⟐ Rev-1 B1): the load-bearing
+   * assertion is ATTRIBUTE POSTURE, not focus retention — jsdom does not
+   * emulate the browser's blur-on-disable (probed — focusing a button then
+   * setting `disabled` leaves `document.activeElement` on it), so a
+   * focus-retention check alone would falsely pass even against the pre-fix
+   * native-`disabled` code; `toBeDisabled()` (jest-dom) does not consider
+   * `aria-disabled` at all, so `.not.toBeDisabled()` genuinely distinguishes
+   * the two mechanisms. Focus retention itself is kept below as a SECONDARY
+   * post-fix lock: true in real browsers per W3C-APG/MDN's
+   * disabled-elements-drop-focus rule; jsdom witnesses it only indirectly,
+   * through the attribute posture above, since it never actually blurs a
+   * disabled element.
+   */
+  it('both Redo buttons go BUSY (not natively disabled) while a request is in flight — honest pending state, no double-fire', async () => {
     let release: ((v: CheckpointRestoreResult) => void) | undefined;
     const user = userEvent.setup();
     renderWithRedo({
@@ -451,10 +471,19 @@ describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRed
         }),
     });
 
-    await user.click(screen.getByRole('button', { name: 'Redo' }));
+    const idle = screen.getByRole('button', { name: 'Redo' });
+    expect(idle, 'fixture integrity: not already focused before the click').not.toHaveFocus();
+    await user.click(idle);
 
-    expect(screen.getByRole('button', { name: 'Redo' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Redo all' })).toBeDisabled();
+    const redo = screen.getByRole('button', { name: 'Redo' });
+    const redoAll = screen.getByRole('button', { name: 'Redo all' });
+    expect(redo, 'AU-40: an in-flight Redo button must stay focusable — never natively disabled').not.toBeDisabled();
+    expect(redo).toHaveAttribute('aria-busy', 'true');
+    expect(redo).toHaveAttribute('aria-disabled', 'true');
+    expect(redo, 'secondary lock: focus survives the round trip').toHaveFocus();
+    expect(redoAll, 'AU-40: Redo all shares the same panel-scoped redoPending state').not.toBeDisabled();
+    expect(redoAll).toHaveAttribute('aria-busy', 'true');
+    expect(redoAll).toHaveAttribute('aria-disabled', 'true');
 
     release?.({ restored: true, filesChanged: 0, changedPaths: [] });
   });
@@ -538,9 +567,11 @@ describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRed
    * IMP-4 gap #4 (review): mirrors `CheckpointsPanel.dom.test.tsx`'s restore
    * suite's dedicated double-click guard test (the "a second 'Restore
    * anyway' click..." test above) — the retry button uses `aria-disabled`
-   * (not native `disabled`), so unlike the idle "Redo"/"Redo all" buttons it
-   * stays REACHABLE to a second click while the retry is in flight, and only
-   * `runRedo`'s `if (redoPending !== undefined) return;` guard stops a
+   * (not native `disabled`), so it stays REACHABLE to a second click while
+   * the retry is in flight, and (AU-40: same as every OTHER redo button
+   * now, since none of them are natively disabled anymore either) only
+   * `runRedo`'s `if (redoPending !== undefined) return;` guard — mirrored by
+   * this button's own `!redoInteraction.interactive` click-guard — stops a
    * second fire.
    */
   it('IMP-4: a second "Redo anyway" click while the force-retry is in flight fires no extra redo', async () => {
@@ -679,6 +710,11 @@ describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRed
       expect(screen.queryByText(/could not be updated/i)).not.toBeInTheDocument();
     });
 
+    /** AU-40: rewritten from `toBeDisabled()` to the aria posture — see the
+     *  sibling rewrite above ("both Redo buttons go BUSY..."). The `.not
+     *  .toBeDisabled()` half after the reset stays valid unchanged: the
+     *  reset clears `redoPending`, which was already `false` for
+     *  `nativeDisabled` even while pending. */
     it('the in-flight pending lock from one root does not survive a switch to a DIFFERENT root\'s data.redo', async () => {
       const user = userEvent.setup();
       const { rerender } = renderWithRedo({
@@ -687,11 +723,15 @@ describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRed
       });
 
       await user.click(screen.getByRole('button', { name: 'Redo' }));
-      expect(screen.getByRole('button', { name: 'Redo' })).toBeDisabled();
+      const redo = screen.getByRole('button', { name: 'Redo' });
+      expect(redo, 'AU-40: an in-flight Redo button must stay focusable — never natively disabled').not.toBeDisabled();
+      expect(redo).toHaveAttribute('aria-busy', 'true');
 
       rerender(redoPanel({ redo: { anchorId: 'root-y-anchor', cursorId: 'root-y-cursor' } }));
 
-      expect(screen.getByRole('button', { name: 'Redo' })).not.toBeDisabled();
+      const redoAfterReset = screen.getByRole('button', { name: 'Redo' });
+      expect(redoAfterReset).not.toBeDisabled();
+      expect(redoAfterReset).not.toHaveAttribute('aria-busy');
     });
   });
 });

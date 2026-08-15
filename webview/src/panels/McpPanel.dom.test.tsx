@@ -396,3 +396,45 @@ describe('A8: MCP panel Catalog disclosure + Login button', () => {
     expect(await screen.findByText('Waiting for browser sign-in…')).toBeInTheDocument();
   });
 });
+
+/**
+ * AU-40 — F-8 doctrine sweep, McpPanel representative (the brief's own
+ * example: an MCP row "Test" button).
+ *
+ * RED at HEAD (⟐ Rev-1 B1): `Test` used to render `disabled={rowTesting}` —
+ * natively disabled the instant `mcp.test` went in flight. The load-bearing
+ * assertion is ATTRIBUTE POSTURE, not focus retention: jsdom does not
+ * emulate the browser's blur-on-disable (probed — focusing a button then
+ * setting `disabled` leaves `document.activeElement` on it), so a
+ * focus-retention check alone would falsely pass even against the pre-fix
+ * native-`disabled` code. `toBeDisabled()` (jest-dom) does not consider
+ * `aria-disabled` at all, so `.not.toBeDisabled()` genuinely distinguishes
+ * the two mechanisms.
+ */
+describe('AU-40: row "Test" goes BUSY, not natively disabled, while mcp.test is in flight', () => {
+  it('while pending: not natively disabled, aria-busy + aria-disabled both true, and focus survives the click', async () => {
+    const user = userEvent.setup();
+    render(
+      <McpPanel
+        data={mcpData()}
+        onReload={async () => ({ status: 'reloaded' })}
+        {...noopMcpAdminProps()}
+        onTest={() => neverSettles<McpTestResult>()}
+      />,
+    );
+
+    const test = screen.getByRole('button', { name: /^Test$/i });
+    expect(test, 'fixture integrity: not already focused before the click').not.toHaveFocus();
+    await user.click(test);
+
+    const pending = screen.getByRole('button', { name: /Testing…/i });
+    expect(pending, 'AU-40: an in-flight Test button must stay focusable — never natively disabled').not.toBeDisabled();
+    expect(pending).toHaveAttribute('aria-busy', 'true');
+    expect(pending).toHaveAttribute('aria-disabled', 'true');
+    // Secondary lock (browser-vs-jsdom gap, see this describe block's doc):
+    // true in real browsers per W3C-APG/MDN's disabled-elements-drop-focus
+    // rule; jsdom witnesses it only indirectly, through the attribute
+    // posture above, since it never actually blurs a disabled element.
+    expect(pending).toHaveFocus();
+  });
+});

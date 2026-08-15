@@ -254,7 +254,14 @@ describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
     expect(screen.getByText('caution')).toBeInTheDocument();
   });
 
-  it('Install stays disabled while onHubInstall is pending (neverSettles)', async () => {
+  /**
+   * AU-40: rewritten from `toBeDisabled()` to the aria posture — the OLD
+   * assertion encoded exactly the F-8 regression this sweep fixes (native
+   * `disabled` mid-flight blurs a keyboard user to `<body>`). `installing`
+   * is purely in-flight here (the identifier was never edited after Check,
+   * so `stale` is false) — busy, not natively disabled.
+   */
+  it('Install goes BUSY (stays focusable, not natively disabled) while onHubInstall is pending (neverSettles)', async () => {
     const user = userEvent.setup();
     render(
       <SkillsPanel
@@ -275,8 +282,13 @@ describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
     expect(install).not.toBeDisabled();
     await user.click(install);
 
-    expect(await screen.findByText('Installing…')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Installing…/i })).toBeDisabled();
+    const installing = await screen.findByRole('button', { name: /Installing…/i });
+    expect(
+      installing,
+      'AU-40: an in-flight Install must stay focusable — never natively disabled',
+    ).not.toBeDisabled();
+    expect(installing).toHaveAttribute('aria-busy', 'true');
+    expect(installing).toHaveAttribute('aria-disabled', 'true');
   });
 
   it('AU-58 (INV-18): a successful hub-install notice states the effect-latency copy — installing a skill affects only future sessions, not chats already open', async () => {
@@ -608,5 +620,55 @@ describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
     await waitFor(() =>
       expect(screen.getAllByText('Creating skill "my-skill" was declined or cancelled.')).toHaveLength(2),
     );
+  });
+});
+
+/**
+ * AU-40 — F-8 doctrine sweep, SkillsPanel representative: the hub "Check"
+ * button, the sweep's MIXED site companion to the already-rewritten Install
+ * lock above ("Install goes BUSY..."). `!trimmedIdentifier` stays FALSE
+ * throughout this test (the field is filled) — only `checking` drives the
+ * posture, isolating the in-flight half of the mixed decision.
+ *
+ * RED at HEAD (⟐ Rev-1 B1): `Check` used to render
+ * `disabled={checking || !trimmedIdentifier}` — natively disabled the
+ * instant the Check round trip went in flight. The load-bearing assertion is
+ * ATTRIBUTE POSTURE, not focus retention: jsdom does not emulate the
+ * browser's blur-on-disable (probed — focusing a button then setting
+ * `disabled` leaves `document.activeElement` on it), so a focus-retention
+ * check alone would falsely pass even against the pre-fix native-`disabled`
+ * code. `toBeDisabled()` (jest-dom) does not consider `aria-disabled` at
+ * all, so `.not.toBeDisabled()` genuinely distinguishes the two mechanisms.
+ */
+describe('AU-40: hub "Check" goes BUSY, not natively disabled, while the preview/scan round trip is in flight', () => {
+  it('while pending: not natively disabled, aria-busy + aria-disabled both true, and focus survives the click', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubPreview={() => new Promise<HubPreview>(() => undefined)}
+        onHubScan={() => new Promise<HubScan>(() => undefined)}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    await user.type(screen.getByLabelText(/Identifier/i), 'anthropics/skills/pdf');
+
+    const check = screen.getByRole('button', { name: /^Check$/i });
+    expect(check, 'fixture integrity: not already focused before the click').not.toHaveFocus();
+    await user.click(check);
+
+    const pending = screen.getByRole('button', { name: /Checking…/i });
+    expect(pending, 'AU-40: an in-flight Check button must stay focusable — never natively disabled').not.toBeDisabled();
+    expect(pending).toHaveAttribute('aria-busy', 'true');
+    expect(pending).toHaveAttribute('aria-disabled', 'true');
+    // Secondary lock (browser-vs-jsdom gap, see this describe block's doc):
+    // true in real browsers per W3C-APG/MDN's disabled-elements-drop-focus
+    // rule; jsdom witnesses it only indirectly, through the attribute
+    // posture above, since it never actually blurs a disabled element.
+    expect(pending).toHaveFocus();
   });
 });

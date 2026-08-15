@@ -18,6 +18,7 @@ import { useState, type FormEvent } from 'react';
 import type { HubInstallResult, HubPreview, HubScan, SkillCreateParams, SkillInfo, SkillsData } from '../protocol';
 import { APPLIES_NEXT_SESSION } from '../copy';
 import { totalLookup } from '../lookup';
+import { busyInteraction } from '../components/busyInteraction';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill, type PillTone } from '../components/Pill';
@@ -376,6 +377,10 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
     );
   };
 
+  // AU-40: purely in-flight — `handleSubmit` already guards
+  // `if (creating) return;` above, equivalent to `!createInteraction.interactive`.
+  const createInteraction = busyInteraction(false, creating);
+
   return (
     <div className="mt-2 overflow-hidden rounded-card border border-dashed border-border">
       <button
@@ -415,8 +420,10 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
 
           <button
             type="submit"
-            disabled={creating}
-            className="mt-1 flex items-center justify-center gap-1.5 self-start rounded border border-border px-3 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60"
+            disabled={createInteraction.nativeDisabled}
+            aria-disabled={createInteraction.ariaDisabled}
+            aria-busy={createInteraction.ariaBusy}
+            className="mt-1 flex items-center justify-center gap-1.5 self-start rounded border border-border px-3 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 aria-disabled:cursor-default aria-disabled:opacity-60"
           >
             <Icon name={creating ? 'loading' : 'add'} size={12} spin={creating} />
             {creating ? 'Creating…' : 'Create'}
@@ -475,6 +482,16 @@ function InstallFromHubDisclosure({
   // from that identifier, the shown preview/scan no longer describes what
   // Install would act on — a consent-integrity gap, not just a stale cache.
   const stale = result !== undefined && trimmedIdentifier !== result.forIdentifier;
+  // AU-40: MIXED site. `!trimmedIdentifier` is genuine indefinite
+  // disablement (nothing typed, nothing to check — stays native); `checking`
+  // is in-flight (goes busy). `handleCheck` already guards both conditions.
+  const checkInteraction = busyInteraction(!trimmedIdentifier, checking);
+  // AU-40: MIXED site (TH-1). `stale` is genuine indefinite disablement (the
+  // shown preview/scan no longer describes what Install would act on — stays
+  // native, so TH-1's stale test keeps asserting `toBeDisabled()`);
+  // `installing` is in-flight (goes busy). `handleInstall` already guards
+  // both conditions.
+  const installInteraction = busyInteraction(stale, installing);
 
   const handleCheck = () => {
     if (!trimmedIdentifier || checking) return;
@@ -538,8 +555,10 @@ function InstallFromHubDisclosure({
           <button
             type="button"
             onClick={handleCheck}
-            disabled={checking || !trimmedIdentifier}
-            className="flex items-center justify-center gap-1.5 self-start rounded border border-border px-3 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60"
+            disabled={checkInteraction.nativeDisabled}
+            aria-disabled={checkInteraction.ariaDisabled}
+            aria-busy={checkInteraction.ariaBusy}
+            className="flex items-center justify-center gap-1.5 self-start rounded border border-border px-3 py-1 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 aria-disabled:cursor-default aria-disabled:opacity-60"
           >
             <Icon name={checking ? 'loading' : 'beaker'} size={12} spin={checking} />
             {checking ? 'Checking…' : 'Check'}
@@ -669,9 +688,11 @@ function InstallFromHubDisclosure({
               <button
                 type="button"
                 onClick={handleInstall}
-                disabled={installing || stale}
+                disabled={installInteraction.nativeDisabled}
+                aria-disabled={installInteraction.ariaDisabled}
+                aria-busy={installInteraction.ariaBusy}
                 title={stale ? 'Identifier changed — run Check again' : undefined}
-                className="mt-2 flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50"
+                className="mt-2 flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
               >
                 <Icon name={installing ? 'loading' : 'cloud-download'} size={12} spin={installing} />
                 {installing ? 'Installing…' : 'Install'}
@@ -706,6 +727,9 @@ export function SkillsPanel({
    *  has already pushed the row's absence, so the row disappearing IS the
    *  confirmation (same posture as McpPanel's `handleRemove`). */
   const handleHubUninstall = (name: string) => {
+    // AU-40: guard replacing the native `disabled` this button used to rely
+    // on to block a second click while a remove is in flight.
+    if (uninstalling[name] === true) return;
     setUninstalling((u) => ({ ...u, [name]: true }));
     void onHubUninstall(name)
       .then(
@@ -741,6 +765,8 @@ export function SkillsPanel({
         const err = lastError(sk.id);
         const isHub = sk.provenance === 'hub';
         const rowUninstalling = uninstalling[sk.name] === true;
+        // AU-40: purely in-flight — nothing genuinely-indefinite gates uninstall.
+        const uninstallInteraction = busyInteraction(false, rowUninstalling);
         return (
           <div
             key={sk.id}
@@ -784,8 +810,10 @@ export function SkillsPanel({
                 <button
                   type="button"
                   onClick={() => handleHubUninstall(sk.name)}
-                  disabled={rowUninstalling}
-                  className="flex items-center gap-1 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50"
+                  disabled={uninstallInteraction.nativeDisabled}
+                  aria-disabled={uninstallInteraction.ariaDisabled}
+                  aria-busy={uninstallInteraction.ariaBusy}
+                  className="flex items-center gap-1 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
                 >
                   <Icon name={rowUninstalling ? 'loading' : 'trash'} size={12} spin={rowUninstalling} />
                   {rowUninstalling ? 'Removing…' : 'Remove'}
