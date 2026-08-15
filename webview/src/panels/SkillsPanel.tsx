@@ -387,13 +387,20 @@ function InstallFromHubDisclosure({
   const [identifier, setIdentifier] = useState('');
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | undefined>();
-  const [result, setResult] = useState<{ preview: HubPreview; scan: HubScan } | undefined>();
+  const [result, setResult] = useState<{ preview: HubPreview; scan: HubScan; forIdentifier: string } | undefined>();
   const [mdOpen, setMdOpen] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [installNotice, setInstallNotice] = useState<HubNotice | undefined>();
 
   const trimmedIdentifier = identifier.trim();
   const hint = trimmedIdentifier ? identifierHint(trimmedIdentifier) : undefined;
+  // TH-1 (AU-37): `result` is a verdict for `result.forIdentifier`, captured
+  // from the TYPED `trimmedIdentifier` at Check time — never from
+  // `preview.identifier` (server-side canonicalization could mask a user
+  // edit and defeat this check). If the field has since been edited away
+  // from that identifier, the shown preview/scan no longer describes what
+  // Install would act on — a consent-integrity gap, not just a stale cache.
+  const stale = result !== undefined && trimmedIdentifier !== result.forIdentifier;
 
   const handleCheck = () => {
     if (!trimmedIdentifier || checking) return;
@@ -402,13 +409,16 @@ function InstallFromHubDisclosure({
     setResult(undefined);
     setInstallNotice(undefined);
     void Promise.all([onHubPreview(trimmedIdentifier), onHubScan(trimmedIdentifier)])
-      .then(([preview, scan]) => setResult({ preview, scan }))
+      .then(([preview, scan]) => setResult({ preview, scan, forIdentifier: trimmedIdentifier }))
       .catch((err: unknown) => setCheckError(errorMessage(err, 'Check failed.')))
       .finally(() => setChecking(false));
   };
 
   const handleInstall = () => {
-    if (!trimmedIdentifier || installing) return;
+    // `stale` is belt-and-suspenders here — the button is also natively
+    // `disabled` while stale (see below) — so a click can't reach this at
+    // all through the UI; this guard only matters if that ever changes.
+    if (!trimmedIdentifier || installing || stale) return;
     setInstalling(true);
     setInstallNotice(undefined);
     void onHubInstall(trimmedIdentifier)
@@ -444,7 +454,7 @@ function InstallFromHubDisclosure({
             placeholder="anthropics/skills/pdf"
           />
 
-          {hint && !result && (
+          {hint && (!result || stale) && (
             <div className="flex items-start gap-1.5 rounded border border-border bg-overlay px-2 py-1 text-2xs text-muted">
               <Icon name="info" size={11} className="mt-0.5 flex-none text-accent" />
               <span className="min-w-0 flex-1 break-words">{hint}</span>
@@ -474,37 +484,57 @@ function InstallFromHubDisclosure({
               <div className="flex items-center gap-2">
                 <Icon name="package" size={15} className="flex-none text-accent" />
                 <span className="min-w-0 truncate font-mono text-xs text-fg">{result.preview.name}</span>
-                <span className="ml-auto flex flex-none items-center gap-1.5">
-                  <Pill tone="accent">{result.preview.trust_level}</Pill>
-                  <Pill tone={verdictTone(result.scan.verdict)}>{result.scan.verdict}</Pill>
-                </span>
-              </div>
-              {result.preview.description && (
-                <div className="mt-1 font-mono text-2xs text-faint">{result.preview.description}</div>
-              )}
-              <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
-                {result.scan.findings.length} finding{result.scan.findings.length === 1 ? '' : 's'}
+                {!stale && (
+                  <span className="ml-auto flex flex-none items-center gap-1.5">
+                    <Pill tone="accent">{result.preview.trust_level}</Pill>
+                    <Pill tone={verdictTone(result.scan.verdict)}>{result.scan.verdict}</Pill>
+                  </span>
+                )}
               </div>
 
-              <button
-                type="button"
-                onClick={() => setMdOpen((v) => !v)}
-                aria-expanded={mdOpen}
-                className="mt-2 flex items-center gap-1 font-mono text-2xs text-muted hover:text-accent"
-              >
-                <Icon name={mdOpen ? 'chevron-down' : 'chevron-right'} size={11} />
-                SKILL.md preview
-              </button>
-              {mdOpen && (
-                <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-border bg-overlay px-2 py-1.5 font-mono text-2xs text-muted">
-                  {result.preview.skill_md}
-                </pre>
+              {stale ? (
+                // TH-1 (AU-37): the identifier was edited after Check ran —
+                // the trust/verdict pills above and the detail below describe
+                // a DIFFERENT artifact than what Install would now act on.
+                // Neutral caption tone (not del/warn): this is staleness, not
+                // an error.
+                <div className="mt-1.5 flex items-start gap-1.5 rounded border border-border bg-overlay px-2 py-1 text-2xs text-muted">
+                  <Icon name="info" size={11} className="mt-0.5 flex-none text-accent" />
+                  <span className="min-w-0 flex-1 break-words">
+                    Identifier changed — result no longer applies. Run Check again.
+                  </span>
+                </div>
+              ) : (
+                <>
+                  {result.preview.description && (
+                    <div className="mt-1 font-mono text-2xs text-faint">{result.preview.description}</div>
+                  )}
+                  <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
+                    {result.scan.findings.length} finding{result.scan.findings.length === 1 ? '' : 's'}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setMdOpen((v) => !v)}
+                    aria-expanded={mdOpen}
+                    className="mt-2 flex items-center gap-1 font-mono text-2xs text-muted hover:text-accent"
+                  >
+                    <Icon name={mdOpen ? 'chevron-down' : 'chevron-right'} size={11} />
+                    SKILL.md preview
+                  </button>
+                  {mdOpen && (
+                    <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-border bg-overlay px-2 py-1.5 font-mono text-2xs text-muted">
+                      {result.preview.skill_md}
+                    </pre>
+                  )}
+                </>
               )}
 
               <button
                 type="button"
                 onClick={handleInstall}
-                disabled={installing}
+                disabled={installing || stale}
+                title={stale ? 'Identifier changed — run Check again' : undefined}
                 className="mt-2 flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50"
               >
                 <Icon name={installing ? 'loading' : 'cloud-download'} size={12} spin={installing} />

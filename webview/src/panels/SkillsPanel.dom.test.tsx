@@ -311,6 +311,79 @@ describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
     );
   });
 
+  it('TH-1 (AU-37): editing the identifier after Check makes Install stale — it must not install against a mismatched result, and the allowlist hint returns', async () => {
+    const user = userEvent.setup();
+    const installed: string[] = [];
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubPreview={async (identifier) => ({
+          name: identifier,
+          description: '',
+          source: 'github',
+          identifier,
+          trust_level: 'trusted',
+          skill_md: '',
+          files: [],
+        })}
+        onHubScan={async (identifier) => ({
+          name: identifier,
+          identifier,
+          source: 'github',
+          trust_level: 'trusted',
+          verdict: 'safe',
+          summary: '',
+          policy: 'allow',
+          policy_reason: '',
+          findings: [],
+          severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+        })}
+        onHubInstall={async (identifier) => {
+          installed.push(identifier);
+          return { ok: true as const, name: identifier };
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    const input = screen.getByLabelText(/Identifier/i);
+    // an untrusted-prefix identifier so the allowlist hint is in play.
+    await user.type(input, 'myorg/tools/a');
+    await user.click(screen.getByRole('button', { name: /^Check$/i }));
+
+    await screen.findByText('myorg/tools/a'); // the resolved preview name === identifier A
+    // Check succeeded against a trusted-looking result — the hint is gone.
+    expect(screen.queryByText(/Only official or trusted publishers/i)).not.toBeInTheDocument();
+
+    // Edit the field to a DIFFERENT identifier WITHOUT re-running Check —
+    // the card still shows A's verdict.
+    await user.clear(input);
+    await user.type(input, 'myorg/tools/b');
+
+    const install = screen.getByRole('button', { name: /^Install$/i });
+    expect(install, 'a stale result must disable Install natively (indefinite, not in-flight)').toBeDisabled();
+    expect(install).toHaveAttribute('title', expect.stringMatching(/run Check again/i));
+
+    // Belt-and-suspenders: clicking the (disabled) button must not fire onHubInstall with B.
+    await user.click(install);
+    expect(installed, "must NOT install against B while the shown verdict was computed for A").toEqual([]);
+
+    expect(screen.getByText(/Identifier changed.*Run Check again/i)).toBeInTheDocument();
+    // the allowlist hint returns once the shown result no longer matches the typed identifier.
+    expect(screen.getByText(/Only official or trusted publishers/i)).toBeInTheDocument();
+
+    // Companion (not over-broad): editing BACK to the identifier Check ran for
+    // makes the result fresh again — Install fires normally with A.
+    await user.clear(input);
+    await user.type(input, 'myorg/tools/a');
+    expect(screen.getByRole('button', { name: /^Install$/i })).not.toBeDisabled();
+    await user.click(screen.getByRole('button', { name: /^Install$/i }));
+    await waitFor(() => expect(installed).toEqual(['myorg/tools/a']));
+  });
+
   it('a provenance:"hub" row shows Remove and firing it calls onHubUninstall(name); the non-hub row never gets one', async () => {
     const user = userEvent.setup();
     const uninstalled: string[] = [];
