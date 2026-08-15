@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { applyTextEdits, renderUnifiedDiff, classifyCodeAction, shapeCodeActions } from './codeActionSerialize';
+import {
+  applyTextEdits,
+  renderUnifiedDiff,
+  classifyCodeAction,
+  shapeCodeActions,
+  computeEditWindow,
+} from './codeActionSerialize';
 import type { PlainTextEdit, TextEditFile, ResolvedCodeAction } from './codeActionSerialize';
 import type { PlainPosition, PlainRange, ConfinementVerdict, ShaperCaps } from './resultShaper';
 import { DEFAULT_SHAPER_CAPS } from './resultShaper';
@@ -110,6 +116,19 @@ describe('applyTextEdits', () => {
     const result = applyTextEdits(docText, edits);
     expect(result).toBe('X bbb Z\n');
   });
+
+  // AU-15: stable DESC sort + sequential same-offset splices used to REVERSE
+  // same-position ties (each later splice landed BEFORE the earlier one's
+  // text). Fix: tie-break the DESC comparator on ORIGINAL INDEX DESCENDING.
+  it('AU-15: two same-position inserts "A" then "B" apply as "AB" (order-faithful to input array order), not "BA"', () => {
+    const result = applyTextEdits('', [edit(0, 0, 0, 0, 'A'), edit(0, 0, 0, 0, 'B')]);
+    expect(result).toBe('AB');
+  });
+
+  it('AU-15: three same-position inserts apply in their original array order', () => {
+    const result = applyTextEdits('', [edit(0, 0, 0, 0, 'A'), edit(0, 0, 0, 0, 'B'), edit(0, 0, 0, 0, 'C')]);
+    expect(result).toBe('ABC');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -166,6 +185,18 @@ describe('renderUnifiedDiff', () => {
     const oldText = Array.from({ length: 500 }, (_, i) => `line ${i}`).join('\n') + '\n';
     const newText = Array.from({ length: 500 }, (_, i) => (i === 250 ? 'CHANGED' : `line ${i}`)).join('\n') + '\n';
     expect(() => renderUnifiedDiff(oldText, newText, 'f.ts')).not.toThrow();
+  });
+
+  // AU-36 L12: the two line-splitters (`computeLineSpans`/position math and
+  // `splitIntoLines`/diff-line-array) used to be two INDEPENDENT scans that
+  // could silently drift — `splitIntoLines` only ever split on bare `\n`,
+  // so a CRLF document leaked a literal trailing `\r` into every diff
+  // content line. Unified onto one shared EOL-aware scan (`splitLines`).
+  it('AU-36 L12: does not leak a trailing \\r into diff content lines for a CRLF document', () => {
+    const oldText = 'a\r\nb\r\nc\r\n';
+    const newText = 'a\r\nX\r\nc\r\n';
+    const out = renderUnifiedDiff(oldText, newText, 'f.ts');
+    expect(out).toBe(['--- a/f.ts', '+++ b/f.ts', '@@ -1,3 +1,3 @@', ' a', '-b', '+X', ' c'].join('\n'));
   });
 });
 
@@ -403,6 +434,79 @@ describe('classifyCodeAction — over-cap (never a truncated edit)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// AU-16 — window-scoped diff/caps (not whole-doc-sized)
+// ---------------------------------------------------------------------------
+
+describe('computeEditWindow — AU-16 size-limit seam', () => {
+  it('windows a single 1-line edit deep inside a 5,000-line document to a small range around it, not the whole document', () => {
+    const window = computeEditWindow([edit(2500, 0, 2500, 1, 'x')], 5000);
+    expect(window.start).toBeGreaterThan(0);
+    expect(window.end).toBeLessThan(4999);
+    expect(window.end - window.start).toBeLessThan(20);
+  });
+
+  it('falls back to the whole document when there are no edits', () => {
+    const window = computeEditWindow([], 5000);
+    expect(window).toEqual({ start: 0, end: 4999 });
+  });
+
+  it('clamps into the document for an edit near the very end', () => {
+    const window = computeEditWindow([edit(4999, 0, 4999, 1, 'x')], 5000);
+    expect(window.end).toBe(4999);
+    expect(window.start).toBeGreaterThan(0);
+  });
+});
+
+describe('classifyCodeAction — AU-16: window-scoped diff (huge doc, tiny edit)', () => {
+  it('5,000-line doc + 1-char edit ⇒ NOT too-large; the diff/allocation stays edit-window-sized, not document-sized', () => {
+    const lines = Array.from({ length: 5000 }, (_, i) => `line ${i}`);
+    const docText = lines.join('\n') + '\n';
+    const targetLine = lines[2500] ?? '';
+    const startChar = targetLine.length;
+    const file = textFile(
+      'file:///ws/big.ts',
+      inRootVerdict('big.ts'),
+      [edit(2500, startChar, 2500, startChar, 'X')],
+      docText,
+    );
+    const result = classifyCodeAction(actionWithEdit({ allEntriesAvailable: true, files: [file] }), DEFAULT_SHAPER_CAPS);
+    expect(result.status).toBe('edit');
+    expect(result.reason).toBeUndefined();
+    // Size-limit proof: a whole-document fallback dump (the pre-fix
+    // behavior once n*m exceeds the DP cell limit) would be tens of
+    // thousands of characters (every one of the 5,000 lines, twice). A
+    // correctly windowed diff is a handful of context lines.
+    expect((result.preview ?? '').length).toBeLessThan(500);
+    expect(result.preview).toContain('@@');
+    expect(result.preview).toContain('line 2500X');
+    // Lines far from the edit must NOT appear in the preview at all (proof
+    // the diff never considered them).
+    expect(result.preview).not.toContain('line 0\n');
+    expect(result.preview).not.toContain('line 4999');
+  });
+
+  it('the windowed preview still reports TRUE document line numbers, not window-relative ones', () => {
+    const lines = Array.from({ length: 5000 }, (_, i) => `line ${i}`);
+    const docText = lines.join('\n') + '\n';
+    const targetLine = lines[2500] ?? '';
+    const startChar = targetLine.length;
+    const file = textFile(
+      'file:///ws/big.ts',
+      inRootVerdict('big.ts'),
+      [edit(2500, startChar, 2500, startChar, 'X')],
+      docText,
+    );
+    const result = classifyCodeAction(actionWithEdit({ allEntriesAvailable: true, files: [file] }), DEFAULT_SHAPER_CAPS);
+    // The changed line is 0-based 2500 ⇒ 1-based 2501; the hunk header's
+    // `oldStart`/`newStart` must reflect that TRUE position, not "1" (which
+    // is what a naive window-relative renderer would report).
+    const hunkHeader = (result.preview ?? '').split('\n').find((l) => l.startsWith('@@'));
+    expect(hunkHeader).toBeDefined();
+    expect(hunkHeader).not.toMatch(/^@@ -1,/);
+  });
+});
+
 describe('classifyCodeAction — edit vs edit-incomplete (golden: 1-based end-exclusive DESC edits + preview)', () => {
   it('in-root single-file all-text, no command ⇒ edit with correct wire shape + preview', () => {
     const docText = 'const a = 1;\n';
@@ -424,6 +528,28 @@ describe('classifyCodeAction — edit vs edit-incomplete (golden: 1-based end-ex
     expect(result.edits).toHaveLength(2);
     expect(result.edits?.[0]?.startLine).toBe(2); // editB (line1, 0-based) comes first (DESC)
     expect(result.edits?.[1]?.startLine).toBe(1); // editA (line0, 0-based) comes second
+  });
+
+  // AU-15 (Rev-1 A6): the wire `edits[]` order is the SAME shared DESC sort
+  // used at the apply site (`sortEditsDescByStart`) — apply-order === wire-
+  // order is the module's actual promise. For same-position ties, the tie-
+  // broken DESC order must match what sequential apply needs to reconstruct
+  // the original array order ("A" then "B" ⇒ applied text "AB").
+  it('AU-15: two same-position inserts ⇒ wire edits[] is in the SAME tie-broken DESC order that reconstructs "AB" when applied', () => {
+    const docText = '';
+    const editA = edit(0, 0, 0, 0, 'A');
+    const editB = edit(0, 0, 0, 0, 'B');
+    const file = textFile('file:///ws/a.ts', inRootVerdict('a.ts'), [editA, editB], docText);
+    const result = classifyCodeAction(actionWithEdit({ allEntriesAvailable: true, files: [file] }), DEFAULT_SHAPER_CAPS);
+    expect(result.status).toBe('edit');
+    // editB (originally LATER in the array, higher original index) sorts
+    // BEFORE editA in the tie-broken DESC order — that is the order that,
+    // applied sequentially (splice at the shared offset), reconstructs "AB".
+    expect(result.edits).toEqual([
+      { startLine: 1, startChar: 1, endLine: 1, endChar: 1, newText: 'B' },
+      { startLine: 1, startChar: 1, endLine: 1, endChar: 1, newText: 'A' },
+    ]);
+    expect(applyTextEdits(docText, [editA, editB])).toBe('AB');
   });
 });
 
@@ -575,13 +701,79 @@ describe('shapeCodeActions', () => {
     expect(out).not.toContain('\x01');
   });
 
-  it('total-caps the assembled body across actions', () => {
-    const docText = 'a'.repeat(50) + '\n';
-    const file = textFile('file:///ws/a.ts', inRootVerdict('a.ts'), [edit(0, 0, 0, 1, 'X'.repeat(50))], docText);
-    const action = classifyCodeAction(actionWithEdit({ allEntriesAvailable: true, files: [file] }), DEFAULT_SHAPER_CAPS);
-    const tinyCaps: ShaperCaps = { perField: 300, total: 20 };
-    const out = shapeCodeActions([action], tinyCaps);
-    expect(out).toContain('truncated');
+  // AU-19 (Fix): one 8000 cap used to serve BOTH the per-action too-large
+  // decision AND the whole-response body cap via a single `capTotalBody`
+  // char-count truncation — which could cut an `[edit]` action's edit list
+  // mid-way while its header still promised `[edit]`. Fix: the whole-
+  // response cap now drops WHOLE trailing actions and replaces them with an
+  // honest "[+N more actions omitted]" marker; a unit that would have to be
+  // cut mid-edit-list is omitted ENTIRELY instead. AU-36 S6: the marker's
+  // own length is counted in the SAME budget as the included actions.
+  describe('AU-19 / S6: whole-response cap drops WHOLE actions, never truncates an edit list', () => {
+    it('a single oversized action alone exceeding the total cap is omitted ENTIRELY (never a truncated edit list, never the old char-count "truncated" marker)', () => {
+      const docText = 'a'.repeat(50) + '\n';
+      const file = textFile('file:///ws/a.ts', inRootVerdict('a.ts'), [edit(0, 0, 0, 1, 'X'.repeat(50))], docText);
+      const action = classifyCodeAction(actionWithEdit({ allEntriesAvailable: true, files: [file] }), DEFAULT_SHAPER_CAPS);
+      // Large enough to fit the omission marker for 1 action, too small for
+      // the action's own rendered text (title+status+edits+preview).
+      const tinyCaps: ShaperCaps = { perField: 300, total: 30 };
+      const out = shapeCodeActions([action], tinyCaps);
+      const { body } = parseFrame(out);
+      expect(body).toContain('[+1 more actions omitted]');
+      expect(body).not.toContain('truncated');
+      // No fragment of the dropped action's own content survives.
+      expect(body).not.toContain('edits:');
+      expect(body).not.toContain('X'.repeat(10));
+      expect(body.length).toBeLessThanOrEqual(30); // S6: marker's own length counted in the budget
+    });
+
+    it('response over cap with MULTIPLE actions ⇒ every surviving [edit] action`s edit list is COMPLETE and a "[+N more actions omitted]" marker replaces the rest', () => {
+      const docText = 'const a = 1;\n';
+      const file = textFile('file:///ws/a.ts', inRootVerdict('a.ts'), [edit(0, 10, 0, 11, '2')], docText);
+      const oneAction = classifyCodeAction(actionWithEdit({ allEntriesAvailable: true, files: [file] }), DEFAULT_SHAPER_CAPS);
+
+      // Self-calibrate the exact rendered length of ONE action (under a cap
+      // that triggers no capping at all) so this test never hard-codes a
+      // brittle byte count.
+      const singleBody = parseFrame(shapeCodeActions([oneAction], DEFAULT_SHAPER_CAPS)).body;
+      const singleActionLength = singleBody.length;
+
+      const actionsCount = 5;
+      const actions = Array.from({ length: actionsCount }, () => oneAction);
+      const keepCount = 2;
+      const omittedCount = actionsCount - keepCount;
+      const marker = `[+${omittedCount} more actions omitted]`;
+      // Budget for exactly `keepCount` full actions + separators + the
+      // omission marker for the rest — deliberately NOT enough for a
+      // (keepCount+1)th full action.
+      const total = singleActionLength * keepCount + 2 * keepCount + marker.length;
+      const caps: ShaperCaps = { perField: 300, total };
+
+      const out = shapeCodeActions(actions, caps);
+      const { body } = parseFrame(out);
+
+      // Every surviving action's edit list is COMPLETE: exactly `keepCount`
+      // "edits: 1" headers, and exactly `keepCount` fully-formed edit lines
+      // (never a partial/truncated JSON-escaped newText).
+      const editsHeaderCount = (body.match(/ {3}edits: 1$/gm) ?? []).length;
+      const editLineCount = (body.match(/-> "2"$/gm) ?? []).length;
+      expect(editsHeaderCount).toBe(keepCount);
+      expect(editLineCount).toBe(keepCount);
+
+      expect(body).toContain(marker);
+      expect(body).not.toContain('...(truncated');
+      expect(body.length).toBeLessThanOrEqual(total); // S6: marker length counted in the same budget
+    });
+
+    it('everything fits under the cap ⇒ no marker at all (cap is a no-op)', () => {
+      const docText = 'const a = 1;\n';
+      const file = textFile('file:///ws/a.ts', inRootVerdict('a.ts'), [edit(0, 10, 0, 11, '2')], docText);
+      const action = classifyCodeAction(actionWithEdit({ allEntriesAvailable: true, files: [file] }), DEFAULT_SHAPER_CAPS);
+      const out = shapeCodeActions([action, action], DEFAULT_SHAPER_CAPS);
+      const { body } = parseFrame(out);
+      expect(body).not.toContain('omitted');
+      expect(body).not.toContain('truncated');
+    });
   });
 
   it('is total: never throws with many actions of mixed status', () => {
