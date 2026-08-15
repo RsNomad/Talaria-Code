@@ -1602,10 +1602,22 @@ export class SetupController {
     if (!isLoopbackEndpoint(endpoint)) {
       return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
     }
-    // Single-flight latch keyed by the CANONICAL created name (the webview's
-    // cancel/progress key), set before the first await — mirrors the library
-    // tier's latch-before-modal discipline; `finally` releases on every path.
-    const key = `pull:${created}`;
+    // Single-flight latch keyed by the CATALOG id (AU-30 fix): `setup.
+    // provisionModel`'s route to this SAME artifact (`handleProvisionModel`
+    // → `provisionOllama`, ~:1690) latches `pull:<catalog id>` — deriving
+    // this route's latch from the created name instead diverged from that
+    // key, so two concurrent triggers (one per RPC) each won their own
+    // latch and BOTH started a multi-GB download. Resolved from
+    // MODEL_CATALOG by created-name match rather than hardcoded a second
+    // time — `modelCatalog.test.ts` locks `sweep-next`'s `createdName` to
+    // this constant, so the lookup always hits for the shipping row; the
+    // `?? created` fallback only guards a fixture/test catalog that omits
+    // the row. Progress/cancel stay keyed by `created` (unchanged, T13
+    // `pullGate.test.ts` drift-lock) — only the LATCH unifies; `finally`
+    // still releases under this SAME key on every exit path.
+    const canonicalId =
+      MODEL_CATALOG.find((m) => m.ollama?.tier === 'hf-ingest' && m.ollama.createdName === created)?.id ?? created;
+    const key = `pull:${canonicalId}`;
     if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
     const abort = new AbortController();
     this.inFlight.set(key, abort);
