@@ -21,6 +21,7 @@ import type {
   McpStatus,
   McpTestResult,
 } from '../protocol';
+import { APPLIES_NEXT_SESSION } from '../copy';
 import { totalLookup } from '../lookup';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
@@ -489,7 +490,16 @@ function CatalogDisclosure({
     setInstalling((m) => ({ ...m, [entry.name]: true }));
     void onCatalogInstall({ name: entry.name, env })
       .then(
-        (result) => setRowNotice((n) => ({ ...n, [entry.name]: { tone: 'ok', text: `Installed "${result.name}".` } })),
+        // TG-2 (AU-49, ADR-4): the gateway reload this triggers is real for
+        // the config plane + gateway sessions, but the LIVE editor chat only
+        // picks up `config.mcp_servers` at its next agent build — the panel
+        // refetch showing this server "Installed" must not imply the open
+        // chat sees it too.
+        (result) =>
+          setRowNotice((n) => ({
+            ...n,
+            [entry.name]: { tone: 'ok', text: `Installed "${result.name}". ${APPLIES_NEXT_SESSION}` },
+          })),
         (err: unknown) =>
           setRowNotice((n) => ({ ...n, [entry.name]: { tone: 'error', text: errorMessage(err, 'Install failed.') } })),
       )

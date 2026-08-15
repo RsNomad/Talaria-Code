@@ -8,9 +8,101 @@
  * abstract.
  */
 import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ModelsPanel } from './ModelsPanel';
+import { must } from '../testing/must';
+
+/** The "Active model" header card — scoped so a query for the active
+ *  model's own label text never collides with the SAME label rendered again
+ *  as a row button below it in the provider list. Two `closest('div')` hops:
+ *  the eyebrow span's immediate parent is the `flex items-center
+ *  justify-between` row; ITS parent is the outer rounded-card. */
+function activeModelHeader() {
+  const eyebrowRow = must(screen.getByText('Active model').closest('div'));
+  return within(must(eyebrowRow.parentElement));
+}
+
+/**
+ * TG-3 (AU-53, T-G architecture): audit seed CORRECTED — `ModelsPanel.tsx`
+ * ALREADY prefers the active tab's live `activeModelId` (ACP-side truth,
+ * the same source the composer chip trusts) over the config-plane
+ * `data.currentModelId` via `resolveEffectiveModelId` (`modelSelection.ts`).
+ * This is a LOCK, not a RED — it pins EXISTING-correct behavior so a future
+ * refactor can't regress the precedence back to config-plane-first (the
+ * Lens-3 F7 scenario the audit originally flagged). The pure decision is
+ * already unit-locked in `modelSelection.test.ts`; this is the DOM-level
+ * lock on its ACTUAL USAGE inside the panel — header label, provider slug,
+ * and row `aria-current` must all follow the diverging `activeModelId`, not
+ * the stale `data.currentModelId`.
+ */
+describe('TG-3 (AU-53): resolveEffectiveModelId precedence is LOCKED at its ModelsPanel call site', () => {
+  it('the active-model header and row highlight follow the ACTIVE TAB\'s live model, not a diverging config-plane currentModelId', () => {
+    render(
+      <ModelsPanel
+        data={{
+          // Config-plane snapshot still says m1 (e.g. the default at mint) —
+          // a live in-chat switch to m2 has already happened server-side.
+          currentModelId: 'm1',
+          providers: [
+            {
+              id: 'p1',
+              name: 'Ollama',
+              connected: true,
+              models: [
+                { id: 'm1', label: 'Model One' },
+                { id: 'm2', label: 'Model Two' },
+              ],
+            },
+          ],
+        }}
+        activeModelId="m2"
+        onSetModel={() => undefined}
+        onAddProviderKey={() => undefined}
+      />,
+    );
+
+    // Header must show the TAB's live model (Model Two), never the
+    // config-plane snapshot (Model One) — a config-plane-first regression
+    // would show "Model One" here instead.
+    const header = activeModelHeader();
+    expect(header.getByText('Model Two')).toBeInTheDocument();
+    expect(header.queryByText('Model One')).not.toBeInTheDocument();
+
+    // Row highlight must agree with the header — both derive from the SAME
+    // `resolveEffectiveModelId` call, so they can never disagree with each
+    // other or with the composer chip.
+    expect(screen.getByRole('button', { name: 'Model Two' })).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByRole('button', { name: 'Model One' })).not.toHaveAttribute('aria-current');
+  });
+
+  it('falls back to the config-plane currentModelId only when the tab has never picked/bound a model (activeModelId === null)', () => {
+    render(
+      <ModelsPanel
+        data={{
+          currentModelId: 'm1',
+          providers: [
+            {
+              id: 'p1',
+              name: 'Ollama',
+              connected: true,
+              models: [
+                { id: 'm1', label: 'Model One' },
+                { id: 'm2', label: 'Model Two' },
+              ],
+            },
+          ],
+        }}
+        activeModelId={null}
+        onSetModel={() => undefined}
+        onAddProviderKey={() => undefined}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Model One' })).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByRole('button', { name: 'Model Two' })).not.toHaveAttribute('aria-current');
+  });
+});
 
 describe('G-10: the Active model header does not claim a connection it cannot see', () => {
   it('shows "Online" only when the active model\'s provider reports connected', () => {

@@ -16,6 +16,7 @@
  */
 import { useState, type FormEvent } from 'react';
 import type { HubInstallResult, HubPreview, HubScan, SkillCreateParams, SkillInfo, SkillsData } from '../protocol';
+import { APPLIES_NEXT_SESSION } from '../copy';
 import { totalLookup } from '../lookup';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
@@ -556,10 +557,15 @@ export function SkillsPanel({
     <PanelShell title="Skills" meta={`${data.skills.length} skills`}>
       {/* C3: panel-level note lives ABOVE the skill list — after the list it
           visually attached to the LAST skill row and read like that row's
-          own caption (same misread as ToolsPanel's C1). */}
+          own caption (same misread as ToolsPanel's C1).
+          TG-4 (AU-54, INV-18): adopts the ONE canonical effect-latency
+          sentence shared with the MCP admin notices (Rev-1 B6) — an
+          intentional, announced copy change from the original shipped C3
+          wording ("...apply to new sessions; a chat already running may keep
+          its current skills until its next session."), not accidental
+          drift. */}
       <p className="mb-2 px-1 text-2xs leading-snug text-faint">
-        Toggles persist immediately and apply to new sessions; a chat already running may keep its
-        current skills until its next session.
+        {`Toggles persist immediately. ${APPLIES_NEXT_SESSION}`}
       </p>
       {data.skills.map((sk) => {
         const err = lastError(sk.id);

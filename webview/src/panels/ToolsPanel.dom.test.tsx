@@ -91,7 +91,7 @@ describe('ToolsPanel V-11 TOGGLE-HONESTY', () => {
     });
   });
 
-  it('beta.7 C1: the persist note renders ABOVE every toolset group — a panel-level note, not the last group’s caption', () => {
+  it('TG-1 (AU-47), was beta.7 C1: the scope note renders ABOVE every toolset group — a panel-level note, not the last group’s caption', () => {
     const data: ToolsData = {
       toolsets: [
         { name: 'web', enabled: true, toolCount: 1 },
@@ -103,10 +103,33 @@ describe('ToolsPanel V-11 TOGGLE-HONESTY', () => {
       ],
     };
     setup(<ToolsPanel data={data} onToggle={async () => undefined} />);
-    const note = screen.getByText('Toggles persist immediately and apply to new sessions.');
+    // TG-1 (AU-47, ADR-4 "bless the reality"): the note used to describe
+    // PERSIST-LATENCY only ("Toggles persist immediately and apply to new
+    // sessions.") — honest about timing but silent about the bigger gap:
+    // this panel is a PLACEBO for the editor chat (it writes
+    // `platform_toolsets.cli`, which the acp chat agent never reads). The
+    // note now states that SCOPE plainly, an intentional, announced copy
+    // change (not accidental drift).
+    const note = screen.getByText(
+      "These toggles govern Hermes' CLI and desktop sessions. The editor chat uses Hermes' fixed editor toolset and is not affected.",
+    );
     const firstGroupToggle = screen.getByRole('switch', { name: 'Enable web toolset' });
     const lastGroupToggle = screen.getByRole('switch', { name: 'Enable computer_use toolset' });
     expect(note.compareDocumentPosition(firstGroupToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(note.compareDocumentPosition(lastGroupToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('TG-1 (AU-47): the panel caption states its true scope ("Hermes CLI & desktop sessions"), not a bare tool count — the C2 read-only-caption precedent', () => {
+    const data: ToolsData = {
+      toolsets: [{ name: 'web', enabled: true, toolCount: 1 }],
+      tools: [
+        { name: 'fetch_url', description: 'Fetch a URL.', enabled: true, kind: 'fetch', toolset: 'web', source: 'core' },
+      ],
+    };
+    setup(<ToolsPanel data={data} onToggle={async () => undefined} />);
+    expect(screen.getByText('Hermes CLI & desktop sessions')).toBeInTheDocument();
+    // The old count-only caption is gone — the header no longer implies "this
+    // is what's available to the chat".
+    expect(screen.queryByText(/\d+ available/)).not.toBeInTheDocument();
   });
 });

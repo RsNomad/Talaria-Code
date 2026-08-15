@@ -156,7 +156,7 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
     });
   });
 
-  it('beta.7 C3: the persist note renders ABOVE every skill row — a panel-level note, not the last group’s caption', () => {
+  it('TG-4 (AU-54), was beta.7 C3: the persist note renders ABOVE every skill row — a panel-level note, not the last group’s caption', () => {
     const data: SkillsData = {
       skills: [
         {
@@ -179,8 +179,14 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
     setup(
       <SkillsPanel data={data} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
     );
+    // TG-4 (AU-54, INV-18, Rev-1 B6): adopts the ONE canonical effect-latency
+    // sentence shared with the MCP admin notices — an intentional, announced
+    // copy change from the shipped C3 wording ("...apply to new sessions; a
+    // chat already running may keep its current skills until its next
+    // session."), not accidental drift. Generic "setup" replaces the
+    // skills-specific "skills" tail deliberately — one string everywhere.
     const note = screen.getByText(
-      'Toggles persist immediately and apply to new sessions; a chat already running may keep its current skills until its next session.',
+      'Toggles persist immediately. Takes effect in new chats; chats already open keep their current setup.',
     );
     const firstToggle = screen.getByRole('switch', { name: 'Enable web-search' });
     const lastToggle = screen.getByRole('switch', { name: 'Enable code-review' });

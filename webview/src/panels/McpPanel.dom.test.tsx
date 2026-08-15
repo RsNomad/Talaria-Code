@@ -334,6 +334,43 @@ describe('A8: MCP panel Catalog disclosure + Login button', () => {
     expect(catalogCalls).toHaveLength(1);
   });
 
+  it('TG-2 (AU-49): a successful catalog install notice states the effect-latency copy — the panel refetch showing the server active must not imply the LIVE chat picked it up immediately', async () => {
+    const user = userEvent.setup();
+    render(
+      <McpPanel
+        data={mcpData()}
+        onReload={async () => ({ status: 'reloaded' })}
+        onAdd={async () => ({ ok: true, name: 'x', transport: 'stdio' })}
+        onTest={async () => ({ ok: true, tools: [] })}
+        onRemove={async () => ({ ok: true })}
+        onSetEnabled={async () => ({ ok: true, name: 'x', enabled: true })}
+        onAuth={async () => ({ ok: true, tools: [] })}
+        onCatalog={async () => ({ entries: [catalogEntryFixture()] })}
+        onCatalogInstall={async (p) => ({ ok: true, name: p.name })}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /^Catalog$/i }));
+    await screen.findByText('builder');
+    await user.type(screen.getByLabelText(/API Key/i), 'secret-value');
+    await user.click(screen.getByRole('button', { name: /^Install$/i }));
+
+    // RED today: the notice reads only `Installed "builder".` — nothing tells
+    // the user the LIVE editor chat won't see this server until its next
+    // session (the acp child snapshots `config.mcp_servers` at agent build,
+    // ADR-4). Two matches is the expected, correct outcome — the sr-only
+    // LiveRegion announcement and the sighted-user card both carry the same
+    // text (same by-design duplication as this file's other row notices, see
+    // `reloadStatusRegion`'s comment above).
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          'Installed "builder". Takes effect in new chats; chats already open keep their current setup.',
+        ),
+      ).toHaveLength(2),
+    );
+  });
+
   it('a transport:"http" server row shows a Login button that fires onAuth and shows the waiting state while pending', async () => {
     const user = userEvent.setup();
     const authCalls: string[] = [];

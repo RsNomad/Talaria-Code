@@ -48,12 +48,21 @@ export function ToolsPanel({ data, onToggle }: ToolsPanelProps) {
   const grouped = toolsByToolset(data.tools);
 
   return (
-    <PanelShell title="Tools" meta={`${data.tools.length} available`}>
-      {/* C1: panel-level note lives ABOVE the toolset loop — after the loop it
-          visually attached to the LAST group (computer_use) and read like
-          that group's own caption. */}
+    <PanelShell title="Tools" meta="Hermes CLI & desktop sessions">
+      {/* TG-1 (AU-47, ADR-4 "bless the reality"): this panel writes
+          `platform_toolsets.cli`, which the editor chat's `hermes acp` agent
+          NEVER reads — its toolset is a hardcoded constant, built once at
+          session mint. The toggles below are real (they govern Hermes' CLI
+          and desktop sessions), so the fix is honest relabeling, not hiding:
+          the caption above states the TRUE scope (C2 read-only-caption
+          precedent, `SettingsPanel.tsx`'s `meta="read-only"`), and this note
+          (C1/C3 relocated-note precedent — lives ABOVE the toolset loop so it
+          reads as a panel-level note, not the last group's own caption)
+          spells it out. Intentional, announced copy change — supersedes the
+          prior persist-latency-only wording. */}
       <p className="mb-2 px-1 text-2xs leading-snug text-faint">
-        Toggles persist immediately and apply to new sessions.
+        These toggles govern Hermes' CLI and desktop sessions. The editor chat uses Hermes' fixed editor
+        toolset and is not affected.
       </p>
       {data.toolsets.map((ts) => {
         const on = isOn(ts.name, ts.enabled);
