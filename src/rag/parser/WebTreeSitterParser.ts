@@ -17,7 +17,12 @@ import type { CodeParser } from './CodeParser';
  * `loadLanguageForFileExt`). See the report for exactly how to obtain these
  * `.wasm` files.
  */
-const GRAMMAR_FILE_BY_LANGUAGE: Record<string, string> = {
+// Exported (not just module-local) so the real-load smoke test
+// (`WebTreeSitterParser.real.test.ts` — TB-1/AU-2/ADR-2) can enumerate the
+// SAME set this class actually uses at runtime, instead of hand-duplicating
+// the language→file mapping in the test and risking silent drift between
+// the two lists.
+export const GRAMMAR_FILE_BY_LANGUAGE: Record<string, string> = {
   typescript: 'tree-sitter-typescript.wasm',
   typescriptreact: 'tree-sitter-tsx.wasm',
   javascript: 'tree-sitter-javascript.wasm',
