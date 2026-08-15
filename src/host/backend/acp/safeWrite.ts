@@ -82,12 +82,15 @@ export interface WriteFileNoFollowOptions {
 }
 
 /**
- * Linux `O_NOFOLLOW` value (0o400000 — stable across Linux architectures,
- * asm-generic `fcntl.h`; the same "fall back to the known Linux literal"
+ * Linux `O_NOFOLLOW` fallback literal (0o400000 — the x86-64/asm-generic value;
+ * NOT uniform across Linux arches: aarch64 defines its OWN `O_NOFOLLOW =
+ * 0o100000` ahead of the asm-generic `#ifndef`, so this literal is a
+ * last-resort fallback only, never used on a real POSIX open; the same
+ * "fall back to the known Linux literal"
  * precedent {@link ./confinedOpen}'s `O_PATH`/`O_NOFOLLOW` constants already
- * use). Node's own `fs.constants.O_NOFOLLOW` already resolves to this exact
- * value whenever it exists (confirmed against the installed Node's own
- * constants at write-time). The fallback only matters when this module runs
+ * use). Node's own `fs.constants.O_NOFOLLOW` resolves to the correct per-arch
+ * value whenever it exists (and the code always PREFERS it via `?? `), so the
+ * literal above is only ever reached on a host lacking the constant. The fallback only matters when this module runs
  * on a dev host where the real constant happens to be absent — decided per
  * PORT (see {@link nofollowSupported}), never by "does THIS machine happen to
  * have the constant".
