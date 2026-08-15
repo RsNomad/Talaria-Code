@@ -2201,3 +2201,154 @@ describe('TalariaViewProvider — CF-13/D1: model.addKey ("Add provider key")', 
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 });
+
+/*
+ * ── TE-7 (AU-31, Low): per-view disposable scope does not accumulate ──
+ *
+ * `resolveWebviewView` used to push its per-view subscriptions
+ * (`onDidReceiveMessage`, `onDidDispose`) straight into the PROVIDER-lifetime
+ * `disposables` array, and `setNextEditToggles`/`setSetupController` pushed
+ * their rewired subscription's wrapper there too — on top of their own,
+ * already-correct dispose-old-then-replace single-slot field. Every VS
+ * Code-driven re-resolve (tab hidden→shown, memory-pressure re-create) or
+ * capability rewire therefore left a disposed HUSK behind in that array
+ * forever — freed only at provider `dispose()`. Bounded per call, unbounded
+ * across a long-lived window. `disposablesOf` reaches into the private
+ * provider-lifetime array the same way `seam()` reaches into other private
+ * state elsewhere in this file.
+ */
+function disposablesOf(p: TalariaViewProvider): unknown[] {
+  return (p as unknown as { disposables: unknown[] }).disposables;
+}
+
+describe('TalariaViewProvider — TE-7 (AU-31): per-view disposable scope does not accumulate', () => {
+  it('resolveWebviewView does not grow the provider-lifetime disposables array across re-creates (subscription count stable)', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const baseline = disposablesOf(provider).length;
+
+    const { view: view1 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+    const afterFirst = disposablesOf(provider).length;
+
+    const { view: view2 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view2 as never, {} as never, {} as never);
+    const afterSecond = disposablesOf(provider).length;
+
+    // A THIRD resolve (a long-lived window keeps re-creating) must not grow
+    // it further either — proves the scope REPLACES, not just "caps at 2".
+    const { view: view3 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view3 as never, {} as never, {} as never);
+    const afterThird = disposablesOf(provider).length;
+
+    expect(afterFirst).toBe(baseline);
+    expect(afterSecond).toBe(baseline);
+    expect(afterThird).toBe(baseline);
+  });
+
+  it("resolving a NEW view disposes the PREVIOUS view's onDidReceiveMessage/onDidDispose subscriptions instead of leaving them registered", () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+
+    const disposeMessageSub = vi.fn();
+    const disposeDisposeSub = vi.fn();
+    const view1 = {
+      webview: {
+        cspSource: 'vscode-webview:',
+        asWebviewUri: (uri: unknown) => uri,
+        onDidReceiveMessage: () => ({ dispose: disposeMessageSub }),
+        postMessage: () => Promise.resolve(true),
+      },
+      onDidDispose: () => ({ dispose: disposeDisposeSub }),
+    };
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+
+    expect(disposeMessageSub).not.toHaveBeenCalled();
+    expect(disposeDisposeSub).not.toHaveBeenCalled();
+
+    const { view: view2 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view2 as never, {} as never, {} as never);
+
+    expect(disposeMessageSub).toHaveBeenCalledTimes(1);
+    expect(disposeDisposeSub).toHaveBeenCalledTimes(1);
+  });
+
+  it("the NEW view's onDidReceiveMessage listener is wired end-to-end after a re-create (message handling not lost by the fix)", () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+
+    const { view: view1 } = makeFakeWebviewView([]);
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+
+    const posted2: HostToWebviewMessage[] = [];
+    let capturedCb: ((msg: WebviewToHostMessage) => void) | undefined;
+    const view2 = {
+      webview: {
+        cspSource: 'vscode-webview:',
+        asWebviewUri: (uri: unknown) => uri,
+        onDidReceiveMessage: (cb: (msg: WebviewToHostMessage) => void) => {
+          capturedCb = cb;
+          return { dispose() {} };
+        },
+        postMessage: (m: HostToWebviewMessage) => {
+          posted2.push(m);
+          return Promise.resolve(true);
+        },
+      },
+      onDidDispose: () => ({ dispose() {} }),
+    };
+    provider.resolveWebviewView(view2 as never, {} as never, {} as never);
+
+    expect(capturedCb).toBeDefined();
+    capturedCb?.({ type: 'ready' });
+
+    expect(posted2.some((m) => m.type === 'hydrate')).toBe(true);
+  });
+
+  it('setNextEditToggles rewiring does not leave a disposed husk in the provider-lifetime disposables array', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const baseline = disposablesOf(provider).length;
+
+    provider.setNextEditToggles(makeFakeTogglePort({ next: false, generic: false }).port);
+    const afterFirst = disposablesOf(provider).length;
+
+    provider.setNextEditToggles(makeFakeTogglePort({ next: false, generic: false }).port);
+    const afterSecond = disposablesOf(provider).length;
+
+    expect(afterFirst).toBe(baseline);
+    expect(afterSecond).toBe(baseline);
+  });
+
+  it('setSetupController rewiring does not leave disposed husks in the provider-lifetime disposables array', () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+    const baseline = disposablesOf(provider).length;
+
+    provider.setSetupController(new SetupController(new FakeSetupHostForRouting(), makeFakeSetupDeps()));
+    const afterFirst = disposablesOf(provider).length;
+
+    provider.setSetupController(new SetupController(new FakeSetupHostForRouting(), makeFakeSetupDeps()));
+    const afterSecond = disposablesOf(provider).length;
+
+    expect(afterFirst).toBe(baseline);
+    expect(afterSecond).toBe(baseline);
+  });
+
+  it("provider.dispose() still disposes the CURRENT view's per-view subscriptions (drains both the provider and view scopes)", () => {
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
+
+    const disposeMessageSub = vi.fn();
+    const disposeDisposeSub = vi.fn();
+    const view1 = {
+      webview: {
+        cspSource: 'vscode-webview:',
+        asWebviewUri: (uri: unknown) => uri,
+        onDidReceiveMessage: () => ({ dispose: disposeMessageSub }),
+        postMessage: () => Promise.resolve(true),
+      },
+      onDidDispose: () => ({ dispose: disposeDisposeSub }),
+    };
+    provider.resolveWebviewView(view1 as never, {} as never, {} as never);
+
+    provider.dispose();
+
+    expect(disposeMessageSub).toHaveBeenCalledTimes(1);
+    expect(disposeDisposeSub).toHaveBeenCalledTimes(1);
+  });
+});

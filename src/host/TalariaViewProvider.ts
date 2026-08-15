@@ -122,6 +122,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 
   private view?: vscode.WebviewView;
   private readonly disposables: vscode.Disposable[] = [];
+  /** TE-7 (AU-31): per-VIEW scope — `resolveWebviewView`'s own subscriptions
+   *  (`onDidReceiveMessage`, `onDidDispose`), as opposed to {@link
+   *  disposables} which lives for the whole provider. Every VS Code-driven
+   *  re-resolve (tab hidden→shown, memory-pressure re-create) DRAINS this
+   *  array first (belt: also inside the identity-guarded `onDidDispose`
+   *  handler below) instead of appending to it, so a long-lived window that
+   *  keeps re-creating the view never accumulates disposed husks. {@link
+   *  dispose} drains both scopes. */
+  private readonly viewDisposables: vscode.Disposable[] = [];
   /** Task 4 (§4.2): backing emitter for {@link onWebviewSignal} — test-only
    *  observability, inert in production beyond the (harmless) `fire()`
    *  calls with no subscribers. Joins {@link disposables} in the
@@ -259,13 +268,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * rather than left showing the both-off boot default forever.
    */
   setNextEditToggles(port: NextEditTogglePort | undefined): void {
+    // TE-7 (AU-31): dispose-old-then-REPLACE the single slot — never pushed
+    // into {@link disposables} (that used to leave a disposed husk behind on
+    // every rewire); {@link dispose} disposes this field directly.
     this.nextEditTogglesSub?.dispose();
     this.nextEditTogglesSub = undefined;
     this.nextEditToggles = port;
     if (!port) return;
     const sub = port.onDidChange((state) => this.postNextEditState(state));
     this.nextEditTogglesSub = { dispose: () => sub.dispose() };
-    this.disposables.push(this.nextEditTogglesSub);
     this.postNextEditState(port.getState());
   }
 
@@ -294,13 +305,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * one's wiring.
    */
   setSetupController(controller: SetupController): void {
+    // TE-7 (AU-31): dispose-old-then-REPLACE each single slot — never pushed
+    // into {@link disposables} (that used to leave two disposed husks behind
+    // on every rewire); {@link dispose} disposes both fields directly.
     this.setupProgressSub?.dispose();
     this.setupStatusChangedSub?.dispose();
     this.setupController = controller;
     this.setupPanelSource = new SetupPanelSource(controller);
     const sub = controller.onProgress((progress) => this.postToWebview({ type: 'setup.progress', ...progress }));
     this.setupProgressSub = { dispose: () => sub.dispose() };
-    this.disposables.push(this.setupProgressSub);
 
     const statusSub = controller.onStatusChanged(() => {
       this.pushSetupPanelData().catch((err) => {
@@ -308,7 +321,6 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       });
     });
     this.setupStatusChangedSub = { dispose: () => statusSub.dispose() };
-    this.disposables.push(this.setupStatusChangedSub);
   }
 
   /**
@@ -395,6 +407,14 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken,
   ): void {
+    // TE-7 (AU-31): drain the PREVIOUS resolution's per-view scope before
+    // wiring the new one — belt against a re-resolve that arrives without an
+    // intervening `onDidDispose` (the exact re-create path this fixes; the
+    // identity-guarded `onDidDispose` handler below is the other belt, for a
+    // genuine dispose-with-no-reopen). Draining is idempotent: an already-
+    // empty array is a no-op.
+    this.drainViewDisposables();
+
     this.view = webviewView;
     // W2 T3: a freshly-(re)resolved view's React tree has not mounted/sent
     // `ready` yet, even though `this.view` is now non-null — keep the
@@ -418,8 +438,11 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this.buildHtml(webviewView.webview);
 
-    // Webview → backend: decode and dispatch.
-    this.disposables.push(
+    // Webview → backend: decode and dispatch. TE-7 (AU-31): per-VIEW scope
+    // ({@link viewDisposables}), not the provider-lifetime {@link
+    // disposables} — this is what gets drained/replaced on the next resolve
+    // instead of accumulating across re-creates.
+    this.viewDisposables.push(
       webviewView.webview.onDidReceiveMessage((raw: WebviewToHostMessage) =>
         this.handleWebviewMessage(raw),
       ),
@@ -438,11 +461,20 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // late from a SUPERSEDED webview instance (the exact `webviewView`
     // captured by this closure) must never null out a NEWER `this.view` that
     // has already replaced it; only a dispose from the CURRENT view may clear.
-    this.disposables.push(
+    //
+    // TE-7 (AU-31): that SAME identity guard also gates the belt-drain of
+    // {@link viewDisposables} here — a stale/superseded view's dispose must
+    // NEVER drain the scope, since by the time it fires a NEWER
+    // `resolveWebviewView` may already own it (draining here would then tear
+    // down the CURRENT live view's listeners out from under it). Only a
+    // dispose from the CURRENT view drains — the genuine memory-pressure
+    // dispose-with-no-reopen case.
+    this.viewDisposables.push(
       webviewView.onDidDispose(() => {
         if (this.view === webviewView) {
           this.view = undefined;
           this.isWebviewLive = false;
+          this.drainViewDisposables();
         }
       }),
     );
@@ -528,6 +560,22 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /** TE-7 (AU-31): dispose + clear {@link viewDisposables} — the CURRENT
+   *  view's own scope only (never the provider-lifetime {@link
+   *  disposables}). Called at the top of every {@link resolveWebviewView}
+   *  (replacing the prior resolution's scope), from the identity-guarded
+   *  `onDidDispose` handler (a genuine dispose-with-no-reopen), and from
+   *  {@link dispose} (final teardown). Idempotent on an empty array. */
+  private drainViewDisposables(): void {
+    for (const d of this.viewDisposables.splice(0)) {
+      try {
+        d.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   dispose(): void {
     try {
       this.backendMessageSub.dispose();
@@ -540,6 +588,26 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       } catch {
         /* ignore */
       }
+    }
+    this.drainViewDisposables();
+    // TE-7 (AU-31): the setter-slot fields ({@link setNextEditToggles}/
+    // {@link setSetupController}) own their current subscription directly
+    // and are no longer pushed into {@link disposables} — dispose them here
+    // instead so final teardown still reaches them.
+    try {
+      this.nextEditTogglesSub?.dispose();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.setupProgressSub?.dispose();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.setupStatusChangedSub?.dispose();
+    } catch {
+      /* ignore */
     }
   }
 
