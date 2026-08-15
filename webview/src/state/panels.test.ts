@@ -16,6 +16,7 @@ import {
   assertExhaustivePanel,
   DECLINED,
   fetchPanel,
+  readScopedRefreshError,
   reducePanelAction,
   resolvePanelRequest,
   setPanelSuccess,
@@ -497,5 +498,59 @@ describe('unwrapSetupResult + DECLINED (T2, §2.2.4)', () => {
     const unwrapped = unwrapSetupResult(raw);
     expect(unwrapped).not.toBe(raw);
     expect(unwrapped).not.toEqual(raw);
+  });
+});
+
+/*
+ * AU-61 (T2): `readScopedRefreshError` is the pure read half of the three
+ * re-scoped panels' banners — the App-level counterpart to `refreshErrorProp`
+ * (App.tsx) for `sessions`/`checkpoints`/`subagents`, which do NOT live in
+ * `AppState.refreshError` (that map is `RefreshErrorPanel`-only — see this
+ * file's own doc). Keyed exactly like each store's own App-level read:
+ * checkpoints by the ACTIVE tab's `rootId` (mirrors `App.tsx`'s
+ * `checkpointsRemote = state.rootPanels[tab.rootId]`), subagents from the
+ * active tab's own slice, sessions from the single shared slot. Returns
+ * `undefined` whenever no banner should show, so callers can render
+ * `refreshError={read && {...}}` directly.
+ */
+describe('readScopedRefreshError (AU-61 T2) — the scoped-panel banner read', () => {
+  it('sessions: returns the message + a sessions dismiss target when set', () => {
+    const read = readScopedRefreshError('sessions', { sessionsRefreshError: 'net down' }, { tabId: 't1', rootId: 'root-1' });
+    expect(read).toEqual({ message: 'net down', dismiss: { panel: 'sessions' } });
+  });
+
+  it('sessions: returns undefined when unset', () => {
+    expect(readScopedRefreshError('sessions', {}, { tabId: 't1', rootId: 'root-1' })).toBeUndefined();
+  });
+
+  it('checkpoints: keys by the ACTIVE tab rootId and returns the right dismiss target', () => {
+    const read = readScopedRefreshError(
+      'checkpoints',
+      { checkpointsRefreshError: { 'root-1': 'net down' } },
+      { tabId: 't1', rootId: 'root-1' },
+    );
+    expect(read).toEqual({ message: 'net down', dismiss: { panel: 'checkpoints', rootId: 'root-1' } });
+  });
+
+  it('checkpoints: an entry for a DIFFERENT root (pre-bind "" or a sibling root) never bleeds into this tab\'s banner', () => {
+    expect(
+      readScopedRefreshError('checkpoints', { checkpointsRefreshError: { 'root-1': 'net down' } }, { tabId: 't1', rootId: 'root-2' }),
+    ).toBeUndefined();
+    expect(
+      readScopedRefreshError('checkpoints', { checkpointsRefreshError: { '': 'net down' } }, { tabId: 't1', rootId: 'root-1' }),
+    ).toBeUndefined();
+  });
+
+  it('checkpoints: returns undefined when the map itself is absent', () => {
+    expect(readScopedRefreshError('checkpoints', {}, { tabId: 't1', rootId: 'root-1' })).toBeUndefined();
+  });
+
+  it('subagents: returns the message + a tabId-scoped dismiss target when set on the active tab', () => {
+    const read = readScopedRefreshError('subagents', {}, { tabId: 'tab-2', rootId: 'root-1', subagentsRefreshError: 'x' });
+    expect(read).toEqual({ message: 'x', dismiss: { panel: 'subagents', tabId: 'tab-2' } });
+  });
+
+  it('subagents: returns undefined when unset on the active tab', () => {
+    expect(readScopedRefreshError('subagents', {}, { tabId: 'tab-2', rootId: 'root-1' })).toBeUndefined();
   });
 });

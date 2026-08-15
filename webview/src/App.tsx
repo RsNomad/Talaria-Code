@@ -47,6 +47,7 @@ import {
   errorMessage,
   fetchPanel,
   panelData,
+  readScopedRefreshError,
   resolvePanelRequest,
   unwrapSetupResult,
   type RefreshErrorPanel,
@@ -716,6 +717,23 @@ export function App() {
     };
   };
 
+  // AU-61 (T2): the scoped counterpart of `refreshErrorProp` above, for the
+  // three re-scoped panels (`sessions`/`checkpoints`/`subagents`) whose own
+  // refreshError signal does NOT live in `state.refreshError` (see
+  // `readScopedRefreshError`'s doc, `state/panels.ts`). `onRetry` reuses the
+  // SAME `requestPanel` handler each of those `RemotePanel` calls already
+  // wires to its own `onRetry` prop — a refresh-error Retry IS an ordinary
+  // panel refetch, same posture as `refreshErrorProp`.
+  const scopedRefreshErrorProp = (panel: 'sessions' | 'checkpoints' | 'subagents'): RefreshErrorBanner | undefined => {
+    const read = readScopedRefreshError(panel, state, tab);
+    if (!read) return undefined;
+    return {
+      message: read.message,
+      onRetry: () => requestPanel(panel),
+      onDismiss: () => dispatch({ local: { type: 'local.scopedRefreshError.dismiss', target: read.dismiss } }),
+    };
+  };
+
   return (
     <>
       <TabStrip
@@ -1012,6 +1030,7 @@ export function App() {
               remote={checkpointsRemote}
               loadingHint="Loading checkpoints…"
               onRetry={() => requestPanel('checkpoints')}
+              refreshError={scopedRefreshErrorProp('checkpoints')}
             >
               {(data) => (
                 <CheckpointsPanel
@@ -1037,6 +1056,7 @@ export function App() {
               remote={tab.subagents}
               loadingHint="Loading subagents…"
               onRetry={() => requestPanel('subagents')}
+              refreshError={scopedRefreshErrorProp('subagents')}
             >
               {(data) => <SubagentsPanel data={data} />}
             </RemotePanel>
@@ -1055,6 +1075,7 @@ export function App() {
               remote={state.sessionsPanel}
               loadingHint="Loading sessions…"
               onRetry={() => requestPanel('sessions')}
+              refreshError={scopedRefreshErrorProp('sessions')}
             >
               {(data) => (
                 <SessionsPanel

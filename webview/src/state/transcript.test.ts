@@ -1007,6 +1007,15 @@ describe('transcript reducer — TI-3 (AU-42 Part B): refreshError side-map for 
     // No AppState.refreshError entry exists for a non-RefreshErrorPanel scope
     // (subagents isn't even a valid key of the type) — nothing to assert
     // beyond "the data survived", which is the actual defect this fixes.
+    // Addendum (AU-61, T1): "no refreshError side-map exists for them" above
+    // described the state at the time this test was written — it is no
+    // longer the whole story. The `describe` block immediately below this
+    // one adds each of the three panels its OWN scoped signal
+    // (`sessionsRefreshError`/`checkpointsRefreshError`/
+    // `subagentsRefreshError`); this test's title and assertions stay
+    // correct as written (still true of THIS map specifically) and are left
+    // untouched — this note only points a future reader at where the
+    // "scoped out" follow-up landed.
   });
 });
 

@@ -378,11 +378,15 @@ export interface AppState {
    * list, just drives a dismissible banner over it (`RemotePanel`'s
    * `refreshError` prop, `panels/PanelShell.tsx`). Scoped to
    * {@link RefreshErrorPanel} (`tools`/`mcp`/`skills`/`models`/`settings` —
-   * see that type's own doc for why `'setup'` and the three re-scoped
-   * panels are excluded). Set by `state/transcript.ts`'s
-   * `reducePanelActionScoped` on a `local.panelError` over already-success
-   * data; cleared by that SAME panel's next success push (`foldPanelData`)
-   * or a user dismiss (`local.refreshError.dismiss`).
+   * see that type's own doc for why `'setup'` alone is excluded). Set by
+   * `state/transcript.ts`'s `reducePanelActionScoped` on a `local.panelError`
+   * over already-success data; cleared by that SAME panel's next success
+   * push (`foldPanelData`) or a user dismiss (`local.refreshError.dismiss`).
+   * The three re-scoped panels (subagents/checkpoints/sessions) are NOT
+   * members of {@link RefreshErrorPanel} (they're session/root/cwd-scoped,
+   * not global) and so can never live in this map — AU-61 gave each its OWN
+   * signal instead: {@link sessionsRefreshError}, {@link
+   * checkpointsRefreshError} below, and `TabState.subagentsRefreshError`.
    */
   refreshError?: Partial<Record<RefreshErrorPanel, string>>;
   /**
