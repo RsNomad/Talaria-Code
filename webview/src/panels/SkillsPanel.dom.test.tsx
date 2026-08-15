@@ -279,6 +279,38 @@ describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
     expect(screen.getByRole('button', { name: /Installing…/i })).toBeDisabled();
   });
 
+  it('AU-58 (INV-18): a successful hub-install notice states the effect-latency copy — installing a skill affects only future sessions, not chats already open', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubInstall={async (identifier) => ({ ok: true as const, name: identifier })}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    await user.type(screen.getByLabelText(/Identifier/i), 'anthropics/skills/pdf');
+    await user.click(screen.getByRole('button', { name: /^Check$/i }));
+    await screen.findByText('x'); // the noop preview/scan fixture's name
+    await user.click(screen.getByRole('button', { name: /^Install$/i }));
+
+    // RED today: the notice reads only `Installed "anthropics/skills/pdf".` —
+    // nothing tells the user the skill only takes effect in a NEW chat, same
+    // gap TG-2 closed for the MCP catalog-install notice. Two matches is the
+    // expected, correct outcome — the sr-only LiveRegion announcement and the
+    // sighted-user card both carry the same text (`HubNoticeCard`).
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          'Installed "anthropics/skills/pdf". Takes effect in new chats; chats already open keep their current setup.',
+        ),
+      ).toHaveLength(2),
+    );
+  });
+
   it('a provenance:"hub" row shows Remove and firing it calls onHubUninstall(name); the non-hub row never gets one', async () => {
     const user = userEvent.setup();
     const uninstalled: string[] = [];

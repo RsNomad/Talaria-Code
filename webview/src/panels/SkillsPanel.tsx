@@ -413,7 +413,11 @@ function InstallFromHubDisclosure({
     setInstallNotice(undefined);
     void onHubInstall(trimmedIdentifier)
       .then(
-        (res) => setInstallNotice({ tone: 'ok', text: `Installed "${res.name}".` }),
+        // AU-58 (INV-18), mirrors McpPanel's TG-2 (AU-49): installing a skill
+        // only affects future agent builds — a chat already open won't see
+        // it, so the panel refetch showing this skill "Installed" must not
+        // imply otherwise.
+        (res) => setInstallNotice({ tone: 'ok', text: `Installed "${res.name}". ${APPLIES_NEXT_SESSION}` }),
         (err: unknown) => setInstallNotice({ tone: 'error', text: errorMessage(err, 'Install failed.') }),
       )
       .finally(() => setInstalling(false));
