@@ -23,7 +23,22 @@ import type { PipxEnv } from './pipxLocator';
  * Pipeline (§2.2 steps 2–4):
  *   1. `pipx install "<packageSpec>" [--python <override>]` — stdout/stderr
  *      streamed to `onEvent({kind:'log', line})` as they arrive; non-zero
- *      exit ⇒ `failed@pipx-install` with a ≤40-line stderr tail (§7 FM-3).
+ *      exit WITHOUT the "already seems to be installed" marker ⇒
+ *      `failed@pipx-install` with a ≤40-line stderr tail (§7 FM-3).
+ *   1a. TC-2/AU-50 (INV-10): modern pipx silently exits 0 as a no-op when ANY
+ *      version of the package is already installed — a pinned UPGRADE would
+ *      never apply. So on BOTH the exit-0 path AND the nonzero-exit path that
+ *      carries the "already seems to be installed" marker (Rev-1 A7: the
+ *      skip's exit code has historically flipped 0→1→0 across pipx versions,
+ *      V10 — the marker only gates whether this step runs, never the
+ *      decision itself), read back the actually-installed version via
+ *      `pipx list --json` through the SAME spawn seam. A match proceeds
+ *      (covers the fresh-install case for free). A mismatch logs an honest
+ *      "existing hermes-agent <v> found; reinstalling pinned <pin>" line,
+ *      runs ONE `pipx install --force <spec>` (same seam/streaming), and
+ *      re-verifies; still mismatched ⇒ `failed@pipx-install` — the caller
+ *      (`SetupController`) only ever records `pinnedVersion` after this
+ *      resolves, so this is the whole of INV-10's enforcement.
  *   2. Derive `<venvsRoot>/hermes-agent/bin/{hermes,hermes-acp,python}` and
  *      existence-check each via `fileExists` (no JSON parsing — §2.2 step 3
  *      v2 correction). The `hermes`/`hermes-acp` console-script basenames
@@ -90,6 +105,14 @@ export interface HermesPaths {
  *  from a spawned process's collected output. */
 const TAIL_MAX_LINES = 40;
 
+/** TC-2/AU-50 + INV-10 (V10): pipx's verbatim skip message is "'X' already
+ *  seems to be installed. Not modifying existing installation …" — matched
+ *  as a plain substring against every collected stdout AND stderr line
+ *  (case-sensitive; the exit code carrying it has flipped across pipx
+ *  versions, so the marker — not the exit code — decides whether the
+ *  version read-back below runs on a nonzero exit). */
+const ALREADY_INSTALLED_MARKER = 'already seems to be installed';
+
 export async function installHermes(
   recipe: Extract<InstallRecipe, { kind: 'pipx' }>,
   env: PipxEnv,
@@ -100,6 +123,7 @@ export async function installHermes(
 ): Promise<HermesPaths> {
   throwIfAborted(signal);
   const cwd = os.homedir();
+  const paths = derivePaths(recipe, env);
 
   // --- Step 2 (§2.2): pipx install -----------------------------------------
   onEvent({ kind: 'phase', phase: 'pipx-install' });
@@ -109,16 +133,19 @@ export async function installHermes(
     ...(env.pythonOverride ? ['--python', env.pythonOverride] : []),
   ];
   const installRun = await runAndStream(spawn(env.pipxPath, installArgs, { cwd, signal }), onEvent, signal);
-  if (installRun.exitCode !== 0) {
+  const alreadyInstalled = hasAlreadyInstalledMarker(installRun.stdoutLines, installRun.stderrLines);
+  if (installRun.exitCode !== 0 && !alreadyInstalled) {
     const detail = tail(installRun.stderrLines);
     onEvent({ kind: 'failed', phase: 'pipx-install', detail });
     throw new InstallFailedError('pipx-install', detail);
   }
 
+  // --- Step 1a (TC-2/AU-50, INV-10, Rev-1 A7): pinned-version read-back ----
+  await verifyPinnedVersion(recipe, env, paths, spawn, cwd, onEvent, signal);
+
   // --- Step 3 (§2.2 v2): resolve + existence-check paths -------------------
   throwIfAborted(signal);
   onEvent({ kind: 'phase', phase: 'resolve-paths' });
-  const paths = derivePaths(recipe, env);
   for (const candidate of [paths.hermes, paths.hermesAcp, paths.python]) {
     throwIfAborted(signal);
     if (!(await fileExists(candidate))) {
@@ -163,6 +190,123 @@ function derivePaths(recipe: Extract<InstallRecipe, { kind: 'pipx' }>, env: Pipx
     hermesAcp: path.posix.join(venvRoot, 'bin', hermesAcpBin),
     python: path.posix.join(venvRoot, 'bin', 'python'),
   };
+}
+
+function hasAlreadyInstalledMarker(stdoutLines: readonly string[], stderrLines: readonly string[]): boolean {
+  return (
+    stdoutLines.some((line) => line.includes(ALREADY_INSTALLED_MARKER)) ||
+    stderrLines.some((line) => line.includes(ALREADY_INSTALLED_MARKER))
+  );
+}
+
+/** TC-2/AU-50 (INV-10): read back the actually-installed hermes-agent
+ *  version via `pipx list --json` and reconcile it against
+ *  `recipe.pinnedVersion`. A match returns (covers the fresh-install case
+ *  for free — no `--force` run). A mismatch logs the old→new version
+ *  honestly, runs ONE `pipx install --force <spec>` through the same
+ *  streaming seam as the original install, and re-verifies; a
+ *  still-mismatched re-verify throws so the caller (`SetupController`)
+ *  never records `pinnedVersion` for a version that isn't actually
+ *  installed. `--force` is scoped to this single explicit-Install-action
+ *  call path — it never runs on a passive status check. */
+async function verifyPinnedVersion(
+  recipe: Extract<InstallRecipe, { kind: 'pipx' }>,
+  env: PipxEnv,
+  paths: HermesPaths,
+  spawn: SpawnFn,
+  cwd: string,
+  onEvent: (e: InstallEvent) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const venvName = path.posix.basename(paths.venvRoot);
+
+  const first = await readInstalledVersion(spawn, env, cwd, signal, venvName);
+  if (first.version === recipe.pinnedVersion) return;
+
+  onEvent({
+    kind: 'log',
+    line: `existing hermes-agent ${first.version ?? 'unknown'} found; reinstalling pinned ${recipe.pinnedVersion}`,
+  });
+
+  throwIfAborted(signal);
+  const forceArgs = [
+    'install',
+    '--force',
+    recipe.packageSpec,
+    ...(env.pythonOverride ? ['--python', env.pythonOverride] : []),
+  ];
+  await runAndStream(spawn(env.pipxPath, forceArgs, { cwd, signal }), onEvent, signal);
+
+  const second = await readInstalledVersion(spawn, env, cwd, signal, venvName);
+  if (second.version !== recipe.pinnedVersion) {
+    const detail =
+      second.version !== undefined
+        ? `installed ${second.version}, expected ${recipe.pinnedVersion}`
+        : `could not verify installed version from pipx list --json output: ${second.rawTail}`;
+    onEvent({ kind: 'failed', phase: 'pipx-install', detail });
+    throw new InstallFailedError('pipx-install', detail);
+  }
+}
+
+interface InstalledVersionRead {
+  version: string | undefined;
+  rawTail: string;
+}
+
+async function readInstalledVersion(
+  spawn: SpawnFn,
+  env: PipxEnv,
+  cwd: string,
+  signal: AbortSignal,
+  venvName: string,
+): Promise<InstalledVersionRead> {
+  throwIfAborted(signal);
+  const proc = spawn(env.pipxPath, ['list', '--json'], { cwd, signal });
+  const { stdout, stderr } = await collectQuiet(proc, signal);
+  return { version: parsePipxListVersion(stdout, venvName), rawTail: tail((stdout || stderr).split('\n')) };
+}
+
+/**
+ * V10 settled shape: `{pipx_spec_version:"0.1",
+ * venvs:{<name>:{metadata:{main_package:{package_version}}}}}`. Parsed
+ * defensively — any missing/malformed key (including a future
+ * `pipx_spec_version` bump) resolves to `undefined` (unverifiable), which
+ * the caller treats exactly like a version mismatch, never a crash.
+ */
+function parsePipxListVersion(stdoutText: string, venvName: string): string | undefined {
+  try {
+    const parsed = JSON.parse(stdoutText) as {
+      venvs?: Record<string, { metadata?: { main_package?: { package_version?: unknown } } }>;
+    };
+    const version = parsed.venvs?.[venvName]?.metadata?.main_package?.package_version;
+    return typeof version === 'string' ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Like `runAndStream` but does not forward lines as `'log'` events — `pipx
+ *  list --json`'s raw JSON is plumbing for the version reconciliation, not
+ *  user-facing install progress (the one user-facing line this flow adds is
+ *  the synthetic "existing … reinstalling …" message in
+ *  `verifyPinnedVersion`). Exit code is drained, not inspected: V10 pins the
+ *  read-back version as the decision signal, never `pipx list`'s own exit
+ *  code. */
+async function collectQuiet(proc: ReturnType<SpawnFn>, signal: AbortSignal): Promise<{ stdout: string; stderr: string }> {
+  const stdoutLines: string[] = [];
+  const stderrLines: string[] = [];
+
+  const consume = async (iter: AsyncIterable<string>, sink: string[]): Promise<void> => {
+    for await (const line of iter) {
+      throwIfAborted(signal);
+      sink.push(line);
+    }
+  };
+
+  await Promise.all([consume(proc.stdout, stdoutLines), consume(proc.stderr, stderrLines)]);
+  throwIfAborted(signal);
+  await proc.exitCode;
+  return { stdout: stdoutLines.join('\n'), stderr: stderrLines.join('\n') };
 }
 
 interface StreamRun {
