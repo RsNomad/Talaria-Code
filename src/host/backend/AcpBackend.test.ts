@@ -4336,6 +4336,67 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
     ]);
   });
 
+  /**
+   * TI-5 (AU-60, TI-1-review-flagged gap): unlike the CF-14 test right
+   * above — which catches "no client at ENTRY" — this proves the OTHER,
+   * previously genuinely-silent branch: the client disappearing in the
+   * window AFTER this method's own entry-check (a real ACP-child crash
+   * while the `resolveWithinWorkspaceReal` confinement `await` is in flight
+   * is the realistic trigger) but BEFORE `controller.loadReplay` actually
+   * runs. `announceSessionBound` has ALREADY fired `tab.bound` by that
+   * point, so pre-fix this tab was left silently "bound" with an empty
+   * transcript and no failure affordance at all: `SessionController
+   * .loadReplay`'s own `!client` early-guard returns `undefined` with no
+   * `clear`/`turn.start`/`error`/`turn.end` of its own, and (pre-fix)
+   * `loadSessionIntoTabInternal` just forwarded that bare `undefined`
+   * straight through with no emission of its own — unlike
+   * `recoverOneSession`'s crash-recovery path, which already turns ANY
+   * `loadReplay` `undefined` (including this exact cause) into
+   * `tab.error{kind:'session-lost'}` unconditionally.
+   *
+   * A call-counting `getClient` stub simulates the crash deterministically
+   * (no real fs interleaving needed): the FIRST call is this method's own
+   * entry-check (must see the live client, or the test would exercise
+   * CF-14's branch instead); every call after that — this fix's own
+   * pre-`loadReplay` check, and `loadReplay`'s internal check if ever
+   * reached — sees the client gone, exactly as an ACP crash mid-await
+   * would leave it.
+   */
+  it('TI-5 (AU-60): a client that disappears AFTER tab.bound fires but BEFORE loadReplay runs surfaces tab.error{session-lost} — not a silent no-op', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID, client alive
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    const supervisor = (backend as unknown as { connectionSupervisor: { getClient(): unknown } })
+      .connectionSupervisor;
+    const originalGetClient = supervisor.getClient.bind(supervisor);
+    let calls = 0;
+    supervisor.getClient = () => {
+      calls += 1;
+      return calls === 1 ? originalGetClient() : undefined;
+    };
+
+    const result = await backend.loadTab('tab-2', 'history-session', '/ws');
+
+    expect(result).toBeUndefined();
+    // RED (pre-fix): messages would contain ONLY tab.bound/mode.state (the
+    // mint's own emissions) — no tab.error at all; the genuinely-silent gap.
+    expect(messages).toContainEqual({
+      type: 'tab.error',
+      tabId: 'tab-2',
+      kind: 'session-lost',
+      message: expect.any(String),
+    });
+    // Never reached the ACP client — loadReplay's own `!client` guard (or
+    // this fix's short-circuit ahead of it) refused before that.
+    expect(must(clients[0]).loadSessionCalls).toEqual([]);
+    // No leaked controller — mirrors the timeout branch's identity-guarded
+    // cleanup immediately below this fix in the source.
+    expect(hasController(backend, 'history-session')).toBe(false);
+    expect(calls).toBeGreaterThanOrEqual(2); // entry-check + this fix's own check both ran
+  });
+
   it('CF-14: emits tab.error{kind:"open-failed"} (message never echoes the path) when the load cwd is outside every open workspace folder', async () => {
     const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'hermes-acp-loadtab-outside-'));
     try {

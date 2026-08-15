@@ -1744,6 +1744,47 @@ export class AcpBackend implements AgentBackend {
       ...(title !== undefined ? ([title] as const) : ([] as const)),
     );
 
+    // TI-5 (AU-60, closes a TI-1-review-flagged gap): `tab.bound` just fired
+    // above — the webview now believes this tab is loaded. An `await` (the
+    // confinement check above, a real fs call) sat open between this
+    // method's own entry-check and here; if the ACP child crashed during
+    // that window, `this.connectionSupervisor.getClient()` now reads
+    // `undefined` again. `SessionController.loadReplay`'s OWN `!client`
+    // early-guard (before ANY `clear`/`turn.start`/turnId exists) would then
+    // return `undefined` completely silently — unlike the reject/
+    // `found:false` branches further inside `loadReplay`, which emit their
+    // own session-scoped `error`+`turn.end` before resolving `undefined`,
+    // that specific branch emits NOTHING at all. Left alone, the tab would
+    // sit "bound" with an empty transcript and no failure affordance —
+    // exactly what `recoverOneSession`'s crash-recovery path already guards
+    // against via its own unconditional `result === undefined` check (see
+    // that method's own doc); this router never had the equivalent.
+    //
+    // Checked HERE, synchronously, with NO `await` between this read and
+    // `loadReplay`'s own identical `getClient()` read (both resolve through
+    // the SAME `connectionSupervisor.getClient()` accessor — see
+    // `buildSessionPort`) — so this can never disagree with what
+    // `loadReplay` is about to see: if this finds a client, `loadReplay`'s
+    // own check is GUARANTEED to also find one (same JS tick, nothing else
+    // runs in between), so an eventual `undefined` from `loadReplay` can
+    // only be the reject/`found:false` branches, which already emitted
+    // their own signal — this short-circuit can never fire alongside them
+    // (no double-signal). If this finds NO client, `loadReplay` is about to
+    // take its silent path — short-circuit before ever calling it and reuse
+    // the SAME tab-chrome restart affordance the timeout branch below fires
+    // (`tab.error{kind:'session-lost'}`, existing taxonomy, no new `kind`),
+    // including its identical identity-guarded controller cleanup.
+    if (!this.connectionSupervisor.getClient()) {
+      if (this.sessions.get(sessionId) === controller) this.sessions.close(sessionId);
+      this.emitter.fire({
+        type: 'tab.error',
+        tabId,
+        kind: 'session-lost',
+        message: 'The agent disconnected while loading this session — try again.',
+      });
+      return undefined;
+    }
+
     // CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
     // commit): `client.loadSession` (inside `loadReplay`) had NO wall-clock
     // deadline at all — only `AcpClient.raceTermination`'s child-EXIT-only
