@@ -1592,6 +1592,34 @@ export class SetupController {
    * the modal — the user is never asked to approve something already known
    * to be unavailable, remote, or unverified.
    */
+  /**
+   * AU-30 (TC-7) + follow-up: the created-name → catalog-id resolution the
+   * `pull:` latch is keyed by. `setup.provisionModel`'s route to the Sweep
+   * artifact (`handleProvisionModel` → `provisionOllama`, ~:1690) latches
+   * `pull:<catalog id>`; {@link handleVettedIngest} (the legacy `setup.
+   * pullModel` route to the SAME artifact) derives the identical id here so
+   * both RPCs join ONE latch instead of each winning its own and starting a
+   * duplicate multi-GB download. `handleCancel` resolves through this SAME
+   * method before its `inFlight.get` lookup — a second, divergent copy of
+   * this lookup there would just re-open the exact class of bug this
+   * closes (a cancel key that doesn't match what the latch is actually
+   * keyed under). Resolved from MODEL_CATALOG by created-name match rather
+   * than hardcoded a second time — `modelCatalog.test.ts` locks `sweep-
+   * next`'s `createdName` to `NEXT_DEDICATED_MODEL.ollamaCreatedName`, so
+   * the lookup always hits for the shipping row; the `?? created` fallback
+   * covers a fixture/test catalog that omits the row, AND any id that was
+   * never an hf-ingest created name to begin with (e.g. a plain library
+   * tag like `llama3:8b`) — those pass through unchanged, exactly what
+   * `handleCancel` needs for the non-canonical `pull:<tag>` latches
+   * {@link handlePullModel}'s library branch and {@link runLibraryPull}
+   * use.
+   */
+  private canonicalPullLatchId(created: string): string {
+    return (
+      MODEL_CATALOG.find((m) => m.ollama?.tier === 'hf-ingest' && m.ollama.createdName === created)?.id ?? created
+    );
+  }
+
   private async handleVettedIngest(endpoint: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     const created = NEXT_DEDICATED_MODEL.ollamaCreatedName;
     // (a) fail-closed until the out-of-band publication fills the pin (§5.4).
@@ -1602,21 +1630,14 @@ export class SetupController {
     if (!isLoopbackEndpoint(endpoint)) {
       return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
     }
-    // Single-flight latch keyed by the CATALOG id (AU-30 fix): `setup.
-    // provisionModel`'s route to this SAME artifact (`handleProvisionModel`
-    // → `provisionOllama`, ~:1690) latches `pull:<catalog id>` — deriving
-    // this route's latch from the created name instead diverged from that
-    // key, so two concurrent triggers (one per RPC) each won their own
-    // latch and BOTH started a multi-GB download. Resolved from
-    // MODEL_CATALOG by created-name match rather than hardcoded a second
-    // time — `modelCatalog.test.ts` locks `sweep-next`'s `createdName` to
-    // this constant, so the lookup always hits for the shipping row; the
-    // `?? created` fallback only guards a fixture/test catalog that omits
-    // the row. Progress/cancel stay keyed by `created` (unchanged, T13
-    // `pullGate.test.ts` drift-lock) — only the LATCH unifies; `finally`
-    // still releases under this SAME key on every exit path.
-    const canonicalId =
-      MODEL_CATALOG.find((m) => m.ollama?.tier === 'hf-ingest' && m.ollama.createdName === created)?.id ?? created;
+    // Single-flight latch keyed by the CATALOG id (AU-30 fix, {@link
+    // canonicalPullLatchId}) — see that method's doc for why. Progress/
+    // cancel stay keyed by `created` on the wire (unchanged, T13 `pullGate.
+    // test.ts` drift-lock); only the LATCH's internal key is canonical —
+    // `handleCancel` resolves the SAME canonical id before its lookup so a
+    // cancel dispatched with the wire-level `created` name still finds it.
+    // `finally` still releases under this SAME key on every exit path.
+    const canonicalId = this.canonicalPullLatchId(created);
     const key = `pull:${canonicalId}`;
     if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
     const abort = new AbortController();
@@ -2089,7 +2110,16 @@ export class SetupController {
     const op = str(params, 'op');
     const id = str(params, 'id');
     if (op && id) {
-      this.inFlight.get(`${op}:${id}`)?.abort();
+      // AU-30 follow-up: `pull:` latches may be keyed by the CANONICAL
+      // catalog id ({@link canonicalPullLatchId} — the Sweep NEXT artifact,
+      // TC-7), while the wire-level cancel payload (`cancelPullParams`,
+      // `ConfiguredModelRow` in SetupPanel.tsx) always sends the raw
+      // created/tag name. Resolve through the SAME method
+      // `handleVettedIngest` uses before looking the latch up, or a cancel
+      // for that row silently no-ops (dedup itself still holds; only
+      // Cancel was missing it). Every other `op` (`install`) is unaffected.
+      const latchId = op === 'pull' ? this.canonicalPullLatchId(id) : id;
+      this.inFlight.get(`${op}:${latchId}`)?.abort();
     }
     return { ok: true };
   }

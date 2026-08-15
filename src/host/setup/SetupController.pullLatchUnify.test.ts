@@ -91,7 +91,18 @@ class FakeHost implements SetupHost {
   reload(): void {}
 }
 
-function makeController(): {
+/** AU-30 cancel-latch fix: a real `AbortError` (name-shaped, matches the
+ *  controller's own {@link isAbortError} check) — used by the ingestGguf
+ *  overrides below so a `setup.cancel` that reaches the right
+ *  `AbortController` produces the SAME `{ok:false, reason:'cancelled'}`
+ *  the real ingest engine would on a genuine user cancel. */
+function abortError(): Error {
+  const err = new Error('aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
+function makeController(overrides: Partial<SetupControllerDeps> = {}): {
   host: FakeHost;
   controller: SetupController;
   ingestArgs: Array<{ spec: unknown; endpoint: string }>;
@@ -124,10 +135,40 @@ function makeController(): {
     downloadGgufToStore: async () => {
       throw new Error('not used here');
     },
+    ...overrides,
   };
   const controller = new SetupController(host, deps);
   return { host, controller, ingestArgs };
 }
+
+/** An `ingestGguf` that never resolves on its own — it hangs until its
+ *  `signal` aborts, then rejects with {@link abortError}, exactly like the
+ *  real download engine reacting to a genuine `setup.cancel`. Lets these
+ *  tests observe cancellation through the SAME `{ok:false,
+ *  reason:'cancelled'}` path production code takes, rather than reaching
+ *  into controller internals. */
+function hangingIngestGguf(
+  ingestArgs: Array<{ spec: unknown; endpoint: string }>,
+): SetupControllerDeps['ingestGguf'] {
+  return (spec, endpoint, _onProgress, signal) => {
+    ingestArgs.push({ spec, endpoint });
+    return new Promise<void>((_resolve, reject) => {
+      if (signal.aborted) {
+        reject(abortError());
+        return;
+      }
+      signal.addEventListener('abort', () => reject(abortError()));
+    });
+  };
+}
+
+/** Races `promise` against a bounded timeout so a still-unfixed regression
+ *  fails FAST with a clear assertion mismatch instead of hanging the run
+ *  out to vitest's default per-test timeout. */
+async function raceTimeout<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  return Promise.race([promise, new Promise<typeof TIMED_OUT>((resolve) => setTimeout(() => resolve(TIMED_OUT), ms))]);
+}
+const TIMED_OUT = Symbol('timed-out');
 
 describe('AU-30 (TC-7): pull latch unification — setup.pullModel vs setup.provisionModel, SAME Sweep artifact', () => {
   it('two concurrent triggers for the same artifact: ingestGguf runs exactly once (the second joins the latch)', async () => {
@@ -157,5 +198,51 @@ describe('AU-30 (TC-7): pull latch unification — setup.pullModel vs setup.prov
     const results = [firstResult, secondResult];
     expect(results.filter((r) => r.ok === true)).toHaveLength(1);
     expect(results.filter((r) => !r.ok && r.reason === 'pull already running')).toHaveLength(1);
+  });
+});
+
+/**
+ * AU-30 follow-up (review-caught regression): TC-7 unified the LATCH key
+ * `handleVettedIngest` sets to the canonical catalog id (`pull:sweep-next`)
+ * but left `handleCancel`'s latch LOOKUP keyed on the raw `created` name it
+ * receives over the wire. The webview's ONLY cancel affordance for this row
+ * (`cancelPullParams`, `ConfiguredModelRow` in `SetupPanel.tsx`) dispatches
+ * `{op:'pull', id: model}` where `model` is the created-name string the user
+ * typed/saved — never the canonical id — so `handleCancel` was looking up a
+ * key nothing ever latches under. Cancel silently no-op'd; dedup itself
+ * still held (this file's block above) and `dispose()` still aborted it
+ * (TC-6), so this was narrow but real: the Cancel button did nothing.
+ */
+describe('AU-30 follow-up: setup.cancel latch-lookup canonicalization', () => {
+  it('setup.cancel({op:"pull", id: createdName}) cancels the in-flight setup.pullModel vetted-ingest pull', async () => {
+    const ingestArgs: Array<{ spec: unknown; endpoint: string }> = [];
+    const { controller } = makeController({ ingestGguf: hangingIngestGguf(ingestArgs) });
+
+    const first = controller.handle('setup.pullModel', { model: CREATED });
+    await vi.waitFor(() => {
+      expect(ingestArgs).toHaveLength(1);
+    });
+
+    // The exact payload `cancelPullParams(model)` sends: `id` is the raw
+    // created name, NOT the canonical catalog id the latch is keyed under.
+    await controller.handle('setup.cancel', { op: 'pull', id: CREATED });
+
+    const result = await raceTimeout(first, 300);
+    expect(result).toEqual({ ok: false, reason: 'cancelled' });
+  });
+
+  it('setup.cancel({op:"pull", id: catalogId}) still cancels the setup.provisionModel pull path (id already canonical)', async () => {
+    const ingestArgs: Array<{ spec: unknown; endpoint: string }> = [];
+    const { controller } = makeController({ ingestGguf: hangingIngestGguf(ingestArgs) });
+
+    const first = controller.handle('setup.provisionModel', { modelId: 'sweep-next', backend: 'ollama' });
+    await vi.waitFor(() => {
+      expect(ingestArgs).toHaveLength(1);
+    });
+
+    await controller.handle('setup.cancel', { op: 'pull', id: 'sweep-next' });
+
+    const result = await raceTimeout(first, 300);
+    expect(result).toEqual({ ok: false, reason: 'cancelled' });
   });
 });
