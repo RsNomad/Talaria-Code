@@ -1421,3 +1421,113 @@ describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a 
     indexer.dispose();
   });
 });
+
+describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manifest or mutate the store', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-ta5-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer(debounceMs = 10) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  async function readManifest(): Promise<Record<string, string>> {
+    const raw = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8');
+    return JSON.parse(raw) as Record<string, string>;
+  }
+
+  it('RED: dispose() firing mid-body (after the entry guard, during the debounced callback\'s own manifest read) leaves the manifest byte-for-byte unchanged and attempts no store mutation', async () => {
+    // A legacy manifest entry for a secret path (as if it was indexed before
+    // the secret-path filter existed) — this event routes into the
+    // secret-path branch (`isSecretForCompletion('.env') === true`), which
+    // would otherwise delete this exact entry and call writeManifest: the
+    // mutation AU-23 says must never happen once dispose() has fired.
+    await fs.mkdir(indexDir, { recursive: true });
+    const seedManifest = { '.env': 'deadbeef-legacy-hash' };
+    await fs.writeFile(path.join(indexDir, 'manifest.json'), JSON.stringify(seedManifest), 'utf8');
+    await writeWorkspaceFile('.env', 'SECRET=shhh\n');
+
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    // Hook the ONE await inside the debounce body's serialized callback that
+    // reads manifest.json (`readManifest()`) — this happens AFTER the
+    // debounce timer has already passed handleFsEvent's own top-level
+    // `disposed` entry guard (disposed is still false when the timer
+    // fires), so this models exactly "let it pass the entry guard ...
+    // dispose() mid-body (hook an await)": dispose() flips `disposed` to
+    // true WHILE this specific await is in flight, before the callback's own
+    // post-await re-check for this branch has had a chance to run.
+    const manifestFilePath = path.join(indexDir, 'manifest.json');
+    const realReadFile = fs.readFile.bind(fs);
+    const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (file, ...rest) => {
+      if (String(file) === manifestFilePath) {
+        indexer.dispose();
+      }
+      return realReadFile(file as never, ...(rest as unknown as never[]));
+    });
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, '.env') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    readFileSpy.mockRestore();
+
+    // Fails at HEAD: the secret-path branch runs to completion regardless of
+    // `disposed` — `store.deleteByPath('.env')` gets called (a no-op on the
+    // by-then-closed real LanceDBStore, `LanceDBStore.ts:362-364`) and
+    // `writeManifest` strips the entry, so the manifest ends up EMPTY even
+    // though the store's row was never actually removed — an orphan row
+    // resurrectable later, exactly AU-23's bug.
+    expect(deleteByPathMock).not.toHaveBeenCalledWith('.env');
+    const manifest = await readManifest();
+    expect(manifest).toEqual(seedManifest);
+
+    disposable.dispose();
+  });
+
+  it('RED: dispose() clears the memoized initPromise so a later reinitialize on the same indexer actually re-runs store.init(), not a stale resolved memo', async () => {
+    await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
+    const indexer = makeIndexer();
+    await indexer.build(); // memoizes initPromise (resolved) via ensureStoreInitialized.
+    expect(initMock).toHaveBeenCalledTimes(1);
+
+    indexer.dispose();
+    initMock.mockClear();
+
+    // A later call that reaches `ensureStoreInitialized()` again (mirrors the
+    // existing failure-clear symmetry at `:191-194` — a resolved memo must
+    // not out-live the store it initialized once that store is closed).
+    await indexer.build();
+    expect(initMock).toHaveBeenCalledTimes(1); // fails at HEAD: 0 — the stale resolved memo short-circuits store.init().
+  });
+});

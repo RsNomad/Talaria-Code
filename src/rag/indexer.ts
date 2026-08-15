@@ -453,6 +453,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     preloaded?: Map<string, Buffer>,
   ): Promise<number | undefined> {
     await ensureStoreInitialized();
+    // TA-5 (AU-23, Med) / INV-5: `ensureStoreInitialized` above is itself an
+    // await — `dispose()` may have fired while it was pending (this function
+    // is reached both from the watch-path debounce body below and from
+    // `runBuild`, either of which can race a shutdown). Re-check here, at
+    // this function's own entry, so no chunk from `targets` reaches
+    // `store.deleteByPath`/`store.upsert` once disposed.
+    if (disposed) return undefined;
     const pendingRecords: ChunkRecord[] = [];
     // TA-3 (AU-3, Rev-1 A3) / INV-3: "old rows for a path are deleted only
     // after their replacement vectors exist." Per-path swap bookkeeping for
@@ -812,8 +819,22 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // lose an entry. Route through the SAME `serialize()` queue as `build()`
       // so every manifest mutation, incremental or full, is totally ordered.
       await serialize(async () => {
+        // TA-5 (AU-23, Med) / INV-5: this callback runs on the shared
+        // `buildChain` — it may sit queued for a while after `serialize()`
+        // enqueues it (a prior build/event may still be running), so
+        // `disposed` can already be true by the time this body actually
+        // starts. Bail before even reading the manifest.
+        if (disposed) return;
         const manifest = await readManifest();
         if (kind === 'delete') {
+          // TA-5 (AU-23, Med) / INV-5: `readManifest()` above is an await —
+          // `dispose()` may have fired while it was pending. Re-check right
+          // before this branch's first mutation so a post-dispose
+          // continuation neither calls `store.deleteByPath` (a no-op on the
+          // by-then-closed store, `LanceDBStore.ts:362-364`) NOR removes this
+          // path's manifest entry — the exact orphan-row/manifest-drift
+          // AU-23 named.
+          if (disposed) return;
           await store.deleteByPath(relPath);
           delete manifest[relPath];
           // AUDIT-5 ARCH-5 (F-1 final): delete-event granularity is platform/
@@ -833,6 +854,9 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           return;
         }
         if (isSecretForCompletion(relPath)) {
+          // TA-5 (AU-23, Med) / INV-5: see the delete-kind branch above —
+          // same re-check, same reason.
+          if (disposed) return;
           // A newly-created/changed secret-path file (e.g. a fresh `.env`)
           // must never be indexed. Best-effort purge in case it was somehow
           // already stored (mirrors build()'s self-heal purge pass).
@@ -868,6 +892,10 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           confined = null; // fail closed
         }
         if (confined === null) {
+          // TA-5 (AU-23, Med) / INV-5: `fs.lstat`/`resolveWithinWorkspaceReal`
+          // above both await — same re-check, same reason as the two
+          // branches above.
+          if (disposed) return;
           await store.deleteByPath(relPath);
           delete manifest[relPath];
           await writeManifest(manifest);
@@ -882,6 +910,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // to full builds.
         const storedMeta = await readMeta();
         const effectiveWidth = computeEffectiveWidth(storedMeta);
+        // TA-5 (AU-23, Med) / INV-5: `readMeta()` above is an await too —
+        // re-check once more before the last remaining mutation path
+        // (`reindexFiles` + the `writeManifest` calls below it).
+        // `reindexFiles` itself ALSO re-checks at its own entry (its own
+        // `ensureStoreInitialized()` await is one more yield point), so both
+        // of this incremental path's mutation steps are covered.
+        if (disposed) return;
         // AUDIT-5 Task 11 (Task-1 review): read the path resolveWithinWorkspaceReal
         // VALIDATED (pathConfine contract: "read exactly the returned path so the
         // file that was validated is the file that is read") — a parent-dir
@@ -951,6 +986,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
 
   function dispose(): void {
     disposed = true;
+    // TA-5 (AU-23, Med) / INV-5: symmetry with `ensureStoreInitialized`'s own
+    // clear-on-reject (`:191-194` above). Without this, a resolved
+    // `initPromise` from before this dispose() memo-hits forever — any later
+    // call that still reaches `ensureStoreInitialized()` would silently skip
+    // `store.init()` instead of genuinely reinitializing against a fresh
+    // (post-close) store.
+    initPromise = undefined;
     void store.close();
   }
 
