@@ -322,6 +322,38 @@ describe('ControlChannel crash-respawn', () => {
     channel.dispose();
   });
 
+  /**
+   * Review follow-up on TE-1 (AU-12): every other exit/respawn test here
+   * drives `exit(1)` — a numeric exit code. `JsonRpcStdio`'s `'error'`-only
+   * termination path (no following `'exit'` at all — e.g. a post-ready
+   * transport failure) fans `onExit` with `code = null` instead. This pins
+   * that `ControlChannel.handleCrash(null)` treats a null code exactly like
+   * a numeric one: it schedules a respawn rather than staying wedged in
+   * `'ready'` on a dead transport. Test-only — no ControlChannel production
+   * code changed; `FakeTransport.exit()` already accepts `number | null`.
+   */
+  it('respawns after a null-code (error-only) termination, same as a numeric exit code', async () => {
+    const { factory, transports } = makeFactory();
+    const channel = new ControlChannel(CONFIG, undefined, factory);
+
+    const startPromise = channel.start();
+    await flushMicrotasksFake();
+    must(transports[0]).emit('event', GATEWAY_READY);
+    await startPromise;
+
+    // Error-only termination: no exit code was ever produced.
+    must(transports[0]).exit(null);
+    expect(transports).toHaveLength(1); // respawn is scheduled, not immediate
+
+    // First backoff attempt is 500ms (respawnBackoffMs(1)).
+    await vi.advanceTimersByTimeAsync(500);
+    expect(transports).toHaveLength(2);
+
+    must(transports[1]).emit('event', GATEWAY_READY);
+    await flushMicrotasksFake();
+    channel.dispose();
+  });
+
   it('backs off exponentially across repeated failed respawn attempts', async () => {
     const { factory, transports } = makeFactory();
     const channel = new ControlChannel(CONFIG, undefined, factory);

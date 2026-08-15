@@ -353,4 +353,29 @@ describe("JsonRpcStdio — AU-12/TE-1: child 'error' fans to onExit (mirrors Acp
 
     await expect(pending).rejects.toThrow(/error/i);
   });
+
+  /**
+   * Review follow-up on TE-1 (AU-12): `terminate()`'s `exitHandlers` fan-out
+   * (`for (const h of this.exitHandlers) h(code);`) has no try/catch, unlike
+   * this SAME class's `eventHandlers` fan-out (`handleFrame`, guarded) and
+   * the T-B1 mirror this fix was modeled on (`acpClient.ts`'s `terminate`,
+   * also guarded). A throwing `onExit` subscriber propagates synchronously
+   * out of a `child.on('error'|'exit', ...)` listener — an uncaught
+   * exception that can crash the extension host. Also proves the OTHER
+   * (non-throwing) subscribers still run.
+   */
+  it("a throwing onExit subscriber does not propagate out of terminate(), and other subscribers still fire", () => {
+    const { transport, fakeChild } = makeTransport();
+    const throwing = vi.fn(() => {
+      throw new Error('boom from onExit subscriber');
+    });
+    const other = vi.fn();
+    transport.onExit(throwing);
+    transport.onExit(other);
+
+    expect(() => fakeChild.emit('error', new Error('spawn ENOENT'))).not.toThrow();
+
+    expect(throwing).toHaveBeenCalledWith(null);
+    expect(other).toHaveBeenCalledWith(null);
+  });
 });

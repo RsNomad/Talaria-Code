@@ -353,7 +353,13 @@ export class JsonRpcStdio implements Disposable {
     this.terminated = true;
     this.log(`child terminated (${reason}); code=${code}`);
     this.rejectAll(new Error(`child terminated (${reason}, code ${code}) before reply`));
-    for (const h of this.exitHandlers) h(code);
+    for (const h of this.exitHandlers) {
+      try {
+        h(code);
+      } catch (err) {
+        this.log(`[warn] onExit handler threw: ${String(err)}`);
+      }
+    }
   }
 
   private rejectAll(reason: unknown): void {
