@@ -11,6 +11,7 @@ import type {
 // T-19 (C1+C2): moved out of rag/ — host/checkpoints/ importing from rag/ was a zone-crossing edge.
 import { createIgnoreFilter } from '../../shared/ignoreFilter';
 import { resolveWithinWorkspaceReal } from '../backend/acp/pathConfine';
+import { writeFileNoFollow } from '../backend/acp/safeWrite';
 import { sanitizeGitEnv } from './gitEnv';
 import { runGit, runGitBinary, type RunGitOptions } from './gitProcess';
 import { missingObjects, type RunGit } from './objectClosure';
@@ -700,31 +701,51 @@ export class CheckpointTracker {
         if (change.status === 'deleted') {
           await fs.rm(absPath, { force: true });
         } else {
-          // Never write THROUGH an in-worktree symlink at the leaf: drop the link
-          // first so we write a fresh regular file at the intended in-tree path.
-          await removeIfSymlink(absPath);
+          // AU-14/TD-2 (INV-7/ADR-7 — check-to-write re-assertion): `git show`
+          // runs FIRST, content into memory, so no awaited subprocess remains
+          // between the leaf symlink cleanup below and the write itself. The
+          // OLD order (`removeIfSymlink` → mkdir → awaited `git show` → write)
+          // left exactly that subprocess as a check-to-write gap: a concurrent
+          // local actor planting a symlink at `absPath` DURING the awaited
+          // `git show` made the write below FOLLOW it, landing content outside
+          // the worktree.
           await fs.mkdir(path.dirname(absPath), { recursive: true });
           const content = await runGitBinary(
             ['show', `${target.tree}:${change.path}`],
             this.shadowOpts(),
           );
-          await fs.writeFile(absPath, content);
-          // AU-4/INV-12: `git show` above returned CONTENT ONLY, so a plain
-          // writeFile always lands at the platform default (non-executable)
-          // — reapply the bit from the batched `ls-tree` read. Only 100755
-          // needs correcting: 100644 needs no action, and 120000/160000
-          // (symlink/gitlink) are left alone on purpose — `writeTreeFromWorktree`
-          // stages via `git add -f` over real files only, so neither mode can
-          // occur in a tree this class wrote; if one somehow did, `git show`
-          // already read it as a plain content blob (not followed as a link —
-          // that hardening is AU-14/TD-2's job, not this fix's), so chmod-ing
-          // it to 0o755 would be actively wrong. A chmod failure here rides
-          // the SAME per-path catch below as the write — one disclosure
-          // channel (`skippedPaths`) for both reasons, per the T-C3 comment
-          // above.
-          if (targetModes.get(change.path) === '100755') {
-            await fs.chmod(absPath, 0o755);
-          }
+          // Never write THROUGH an in-worktree symlink at the leaf: drop the
+          // link (whether stale from a prior state, or raced in above) so a
+          // fresh regular file lands at the intended in-tree path.
+          await removeIfSymlink(absPath);
+          // `writeFileNoFollow` (`../backend/acp/safeWrite.ts`) is the belt-
+          // and-suspenders backstop for the tiny remaining gap between the
+          // cleanup above and this open: on Linux it opens with `O_NOFOLLOW`,
+          // so a symlink raced in even AFTER `removeIfSymlink` ran makes the
+          // open FAIL (`ELOOP`) rather than follow it — refused via the SAME
+          // per-path catch below (`skippedPaths`), never silently escaping.
+          //
+          // AU-4/INV-12: `git show` above returned CONTENT ONLY, so the write
+          // always lands at the platform default (non-executable) — reapply
+          // the bit from the batched `ls-tree` read via the SAME open handle
+          // (`fchmod`, never a second path-based `fs.chmod` — that would
+          // reopen a TOCTOU of its own between this write and a later chmod
+          // call). Only 100755 needs correcting: 100644 needs no action, and
+          // 120000/160000 (symlink/gitlink) are left alone on purpose —
+          // `writeTreeFromWorktree` stages via `git add -f` over real files
+          // only, so neither mode can occur in a tree this class wrote; if one
+          // somehow did, `git show` reads the git OBJECT DATABASE (never the
+          // worktree path), so a worktree symlink cannot affect what content
+          // it returns — it would still read a plain content blob, and
+          // chmod-ing that to 0o755 would be actively wrong. A refusal/chmod
+          // failure here rides the SAME per-path catch below as the write —
+          // one disclosure channel (`skippedPaths`) for every reason, per the
+          // T-C3 comment above.
+          await writeFileNoFollow(
+            absPath,
+            content,
+            targetModes.get(change.path) === '100755' ? { mode: 0o755 } : {},
+          );
         }
         changedPaths.push(change.path);
       } catch (err: unknown) {

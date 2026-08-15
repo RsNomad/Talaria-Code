@@ -1904,8 +1904,20 @@ export class SetupController {
       'Download',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
+    // AU-13/TD-2 (INV-7/ADR-7 — check-to-write re-assertion): `showModal`
+    // above is an UNBOUNDED, human-speed await — a local attacker has that
+    // whole window to swap `<owner>`/`<repo>` for a symlink after the FIRST
+    // `checkedStoreDest` call (5c) but before the write. Re-run the SAME
+    // write gate now, immediately before `downloadGgufToStore`, and refuse on
+    // any change (the lstat re-check now fails) rather than let `ensureDir`
+    // (which follows symlinks) + the write proceed through a raced-in link.
+    const reassert = await this.deps.checkedStoreDest(cell.gguf.hfRepo, cell.gguf.file);
+    if (!reassert.ok) return { ok: false, reason: this.redact(reassert.reason) };
     // (5d) the T3 atomic sink: same-dir `.part` → digest equality → rename →
-    // sidecar. Progress rides the ONE `pull:<modelId>` key.
+    // sidecar. Progress rides the ONE `pull:<modelId>` key. Writes through
+    // the FRESHLY re-asserted destination (`reassert`), not the stale
+    // pre-modal one — the same "read exactly the path that was validated"
+    // discipline `pathConfine.ts`'s own doc establishes for reads.
     await this.deps.downloadGgufToStore(
       {
         catalogId: entry.id,
@@ -1917,8 +1929,8 @@ export class SetupController {
           approxBytes: cell.gguf.approxBytes,
         },
       },
-      dest.destDir,
-      dest.destFile,
+      reassert.destDir,
+      reassert.destFile,
       (p) => this.pushPullProgress(entry.id, p),
       signal,
     );

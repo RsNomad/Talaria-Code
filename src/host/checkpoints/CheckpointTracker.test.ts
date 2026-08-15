@@ -442,19 +442,23 @@ describe('CheckpointTracker', () => {
     );
 
     // Platform-independent companion to the two tests above: those prove the
-    // OS-visible OUTCOME (skipped on win32, where `fs.chmod` cannot represent
-    // the exec bit at all — verified: Node's fs.chmod is a no-op for the exec
-    // bits on Windows, so the assertion would be meaningless there either
-    // way). This test instead proves the CALL — that restoreInternal reads
-    // the target's real `git ls-tree` mode and invokes `fs.chmod(path, 0o755)`
-    // only for a 100755 entry — without depending on the OS honoring it. Mode
-    // is forced onto the shadow repo's tree via `update-index --chmod=+x`
+    // OS-visible OUTCOME (skipped on win32, where the exec bit cannot be
+    // represented at all — verified: Node's chmod/fchmod is a no-op for the
+    // exec bits on Windows, so the assertion would be meaningless there
+    // either way). This test instead proves the CALL — that restoreInternal
+    // reads the target's real `git ls-tree` mode and applies 0o755 only for a
+    // 100755 entry — without depending on the OS honoring it. AU-14/TD-2
+    // moved the chmod from a path-based `fs.chmod` to `FileHandle#chmod`
+    // (`fchmod`) on the SAME handle `writeFileNoFollow` writes through (never
+    // a second path-based re-open — that would reopen a TOCTOU of its own),
+    // so this spies on `fs.open`'s returned handle instead of `fs.chmod`.
+    // Mode is forced onto the shadow repo's tree via `update-index --chmod=+x`
     // (which sets the git-tracked mode bit directly, independent of the real
     // FS attribute) with `core.fileMode=false` set on the shadow repo so the
     // tracker's own subsequent `git add -f` (inside snapshot(2)) does not
     // re-derive the mode from the OS and clobber the forced bit — runs
     // identically on every platform, including this suite's Windows dev box.
-    it('applies fs.chmod(path, 0o755) only for a target whose git tree entry mode is 100755', async () => {
+    it('applies handle.chmod(0o755) (fchmod, same fd as the write) only for a target whose git tree entry mode is 100755', async () => {
       await writeFile('deploy.sh', 'content-v1');
       await writeFile('readme.txt', 'hello');
       const tracker = new CheckpointTracker(storageDir, workspaceRoot);
@@ -469,25 +473,33 @@ describe('CheckpointTracker', () => {
 
       // Drop BOTH files from the live worktree so restoring c2 must
       // materialize them FRESH (an unambiguous 'added' status) — the exact
-      // `fs.writeFile` path that loses the mode — independent of any
+      // `writeFileNoFollow` path that loses the mode — independent of any
       // git-index mode residue left by the forced-chmod staging above.
       const deployPath = path.join(workspaceRoot, 'deploy.sh');
       const readmePath = path.join(workspaceRoot, 'readme.txt');
       await fs.rm(deployPath);
       await fs.rm(readmePath);
 
-      const realChmod = fs.chmod.bind(fs);
-      const chmodSpy = vi.spyOn(fs, 'chmod').mockImplementation(
-        (...args: Parameters<typeof fs.chmod>) => realChmod(...args),
-      );
+      const chmodCalls: Array<{ path: string; mode: number }> = [];
+      const realOpen = fs.open.bind(fs);
+      const openSpy = vi.spyOn(fs, 'open').mockImplementation(async (p, ...rest) => {
+        const handle = await realOpen(p as never, ...(rest as unknown as never[]));
+        const pStr = String(p);
+        const realHandleChmod = handle.chmod.bind(handle);
+        handle.chmod = (async (mode: number) => {
+          chmodCalls.push({ path: pStr, mode });
+          return realHandleChmod(mode);
+        }) as typeof handle.chmod;
+        return handle;
+      });
 
       try {
         const result = await tracker.restore(c2.id, { force: true });
         expect(result.restored).toBe(true);
-        expect(chmodSpy).toHaveBeenCalledWith(deployPath, 0o755);
-        expect(chmodSpy).not.toHaveBeenCalledWith(readmePath, expect.anything());
+        expect(chmodCalls).toContainEqual({ path: deployPath, mode: 0o755 });
+        expect(chmodCalls.some((c) => c.path === readmePath)).toBe(false);
       } finally {
-        chmodSpy.mockRestore();
+        openSpy.mockRestore();
       }
     });
   });
@@ -965,6 +977,148 @@ describe('CheckpointTracker', () => {
     });
   });
 
+  describe('restore check-to-write TOCTOU (AU-14/TD-2)', () => {
+    afterEach(() => {
+      __setSpawnForTests(null);
+    });
+
+    it(
+      'fetches content via `git show` BEFORE the leaf symlink cleanup/write — no awaited subprocess remains inside the check-to-write window',
+      async () => {
+        await writeFile('keep.txt', 'keep');
+        const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+        await tracker.init();
+        const ckpt1 = (await tracker.snapshot(1, 'first'))!;
+
+        await writeFile('new.txt', 'V1');
+        const ckpt2 = (await tracker.snapshot(2, 'second'))!;
+        await fs.rm(path.join(workspaceRoot, 'new.txt'), { force: true }); // live worktree lacks it again
+
+        const order: string[] = [];
+        const leafPath = path.join(workspaceRoot, 'new.txt');
+        const realLstat = fs.lstat.bind(fs);
+        const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (p, ...rest) => {
+          if (String(p) === leafPath) order.push('lstat-leaf');
+          return realLstat(p as never, ...(rest as unknown as never[]));
+        });
+        __setSpawnForTests(
+          ((command: string, args: string[], options: unknown) => {
+            if (Array.isArray(args) && args[0] === 'show' && String(args[1]).endsWith(':new.txt')) {
+              order.push('git-show');
+            }
+            return realSpawn(command as never, args as never, options as never);
+          }) as unknown as Parameters<typeof __setSpawnForTests>[0],
+        );
+
+        try {
+          void ckpt1;
+          const res = await tracker.restore(ckpt2.id, { force: true });
+          expect(res.restored).toBe(true);
+        } finally {
+          lstatSpy.mockRestore();
+        }
+
+        // The OLD order was `lstat-leaf` (removeIfSymlink) THEN `git-show`,
+        // leaving the awaited subprocess as a check-to-write gap (AU-14's
+        // root cause). The fix reorders so content is fetched FIRST — every
+        // leaf touch (removeIfSymlink's lstat, and on a platform with no
+        // O_NOFOLLOW — this dev box included — `writeFileNoFollow`'s own
+        // pre-open lstat re-assert) happens strictly AFTER it, never before.
+        expect(order.length).toBeGreaterThanOrEqual(2);
+        expect(order[0]).toBe('git-show');
+        expect(order.slice(1)).toEqual(order.slice(1).map(() => 'lstat-leaf'));
+      },
+    );
+
+    /**
+     * Can this platform create a symlink to a FILE (not a directory) without
+     * elevation? Distinct from {@link detectSymlinkSupport} above, which only
+     * proves a directory JUNCTION works (no privilege needed on Windows) — a
+     * FILE-type symlink needs `SeCreateSymbolicLinkPrivilege` (admin or
+     * Developer Mode), which a stock CI/dev Windows box does not grant. Gates
+     * the one test below that needs a real leaf-level symlink; `confinedOpen.
+     * test.ts` hits the identical platform wall for the read-side equivalent
+     * and resolves it the same way (fake-port unit tests + a gated real-FS
+     * test) — see `safeWrite.test.ts`.
+     */
+    function detectFileSymlinkSupport(): boolean {
+      let dir: string | undefined;
+      try {
+        dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-filesym-'));
+        const target = path.join(dir, 't.txt');
+        writeFileSync(target, 'x');
+        symlinkSync(target, path.join(dir, 'l.txt'), 'file');
+        return true;
+      } catch {
+        return false;
+      } finally {
+        if (dir) {
+          try {
+            rmSync(dir, { recursive: true, force: true });
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+    const CAN_FILE_SYMLINK = detectFileSymlinkSupport();
+
+    (CAN_FILE_SYMLINK ? it : it.skip)(
+      'a symlink planted in the check-to-write gap (during the awaited `git show`) is never followed — the write lands inside the worktree, never through the link',
+      async () => {
+        const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'hermes-ckpt-outside-'));
+        const victim = path.join(outside, 'victim.txt');
+        try {
+          await writeFile('keep.txt', 'keep');
+          const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+          await tracker.init();
+          const ckpt1 = (await tracker.snapshot(1, 'first'))!;
+
+          await writeFile('new.txt', 'RESTORED-CONTENT');
+          const ckpt2 = (await tracker.snapshot(2, 'second'))!;
+          await fs.rm(path.join(workspaceRoot, 'new.txt'), { force: true });
+
+          let planted = false;
+          __setSpawnForTests(
+            ((command: string, args: string[], options: unknown) => {
+              if (!planted && Array.isArray(args) && args[0] === 'show' && String(args[1]).endsWith(':new.txt')) {
+                planted = true;
+                // Simulate a concurrent local actor planting a symlink at the
+                // restore leaf WHILE `git show` is in flight — exactly AU-14's
+                // check-to-write gap.
+                symlinkSync(victim, path.join(workspaceRoot, 'new.txt'), 'file');
+              }
+              return realSpawn(command as never, args as never, options as never);
+            }) as unknown as Parameters<typeof __setSpawnForTests>[0],
+          );
+
+          const res = await tracker.restore(ckpt2.id, { force: true });
+          expect(res.restored).toBe(true);
+
+          // The attacker's target outside the worktree must NEVER be written.
+          await expect(fs.access(victim)).rejects.toThrow();
+
+          // The restored file must land INSIDE the worktree as a real file
+          // with the correct content — never left as the attacker's dangling
+          // symlink (either the write succeeded on a fresh regular file after
+          // `removeIfSymlink` swept the planted link, or it was refused into
+          // `skippedPaths` — either outcome is safe; a write THROUGH the link
+          // is the only unsafe one).
+          const leafPath = path.join(workspaceRoot, 'new.txt');
+          const leafStat = await fs.lstat(leafPath).catch(() => null);
+          if (leafStat === null || leafStat.isSymbolicLink()) {
+            if (res.restored) expect(res.skippedPaths ?? []).toContain('new.txt');
+          } else {
+            await expect(readFile('new.txt')).resolves.toBe('RESTORED-CONTENT');
+          }
+          void ckpt1;
+        } finally {
+          await fs.rm(outside, { recursive: true, force: true });
+        }
+      },
+    );
+  });
+
   describe('restore — partial I/O failure honesty (T-C3, closes V-3)', () => {
     it('a write failure on one of several paths is disclosed via skippedPaths (not thrown), and the baseline still persists', async () => {
       await writeFile('a.txt', 'A1');
@@ -984,14 +1138,17 @@ describe('CheckpointTracker', () => {
       // ENOSPC/EACCES mid-apply — WITHOUT creating any real FS contention (per
       // T-C3's test-hygiene constraint: this file has a KNOWN Windows EBUSY
       // flake from real locking elsewhere; new tests must inject, never create,
-      // a write failure).
+      // a write failure). AU-14/TD-2 moved the restore leaf write from a plain
+      // `fs.writeFile` to `writeFileNoFollow`'s `fs.open` + handle-write, so
+      // the injection site moves with it — same simulated-failure discipline,
+      // new call site.
       const bPath = path.join(workspaceRoot, 'b.txt');
-      const realWriteFile = fs.writeFile.bind(fs);
-      const spy = vi.spyOn(fs, 'writeFile').mockImplementation(async (file, data, ...rest) => {
-        if (String(file) === bPath) {
+      const realOpen = fs.open.bind(fs);
+      const spy = vi.spyOn(fs, 'open').mockImplementation(async (p, ...rest) => {
+        if (String(p) === bPath) {
           throw new Error("simulated EACCES: permission denied, open 'b.txt'");
         }
-        return realWriteFile(file as never, data as never, ...(rest as unknown as never[]));
+        return realOpen(p as never, ...(rest as unknown as never[]));
       });
 
       let result: Awaited<ReturnType<typeof tracker.restore>>;

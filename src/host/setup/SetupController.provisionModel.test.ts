@@ -601,6 +601,43 @@ describe('T7 step 5: llamacpp file downloads (live-oid rows)', () => {
     expect(calls).toEqual(['resolveLfsOid', 'checkedStoreDest']);
   });
 
+  it('AU-13/TD-2: a symlink swapped into the store path WHILE the modal is open is caught by a re-assert immediately before the write (refused, never written)', async () => {
+    let symlinkPlanted = false;
+    const raceRefusal = '<owner> directory ("/store/Qwen") is a symlink — refusing';
+    const { host, controller, calls, storeArgs } = makeProvController({
+      checkedStoreDest: async (hfRepo: string, file: string) => {
+        calls.push('checkedStoreDest');
+        if (symlinkPlanted) {
+          return { ok: false as const, reason: raceRefusal };
+        }
+        const destDir = `${homedir()}/.local/share/talaria/models/${hfRepo}`;
+        return { ok: true as const, destDir, destFile: file, destPath: `${destDir}/${file}` };
+      },
+    });
+    // Simulate a local attacker swapping <owner>/<repo> for a symlink WHILE
+    // the unbounded native consent modal is open — the human-speed await
+    // between the FIRST checkedStoreDest (write-gate) check and the actual
+    // write. By the time showModal resolves, the race has already happened.
+    const originalShowModal = host.showModal.bind(host);
+    host.showModal = async (message: string, confirmLabel: string): Promise<boolean> => {
+      const result = await originalShowModal(message, confirmLabel);
+      symlinkPlanted = true;
+      return result;
+    };
+
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'qwen3-embedding-0.6b',
+      backend: 'llamacpp',
+    });
+
+    expect(result).toEqual({ ok: false, reason: raceRefusal });
+    // checkedStoreDest re-ran AFTER the modal (the re-assert) — never just once.
+    expect(calls.filter((c) => c === 'checkedStoreDest')).toHaveLength(2);
+    // The write itself must NEVER have been reached.
+    expect(calls).not.toContain('downloadGgufToStore');
+    expect(storeArgs).toEqual([]);
+  });
+
   it('happy path: resolve → WRITE-gated dest → mode-distinct modal naming the ~-redacted dest → downloadGgufToStore', async () => {
     const { controller, calls, storeArgs } = makeProvController();
     const result = await controller.handle('setup.provisionModel', {
@@ -612,6 +649,9 @@ describe('T7 step 5: llamacpp file downloads (live-oid rows)', () => {
       'resolveLfsOid',
       'checkedStoreDest',
       `showModal:${EMBED_LLAMACPP_MODAL}`,
+      // AU-13/TD-2: the write gate re-asserts AFTER the modal, immediately
+      // before the write — a second checkedStoreDest call, not a regression.
+      'checkedStoreDest',
       'downloadGgufToStore',
     ]);
     expect(storeArgs).toEqual([
