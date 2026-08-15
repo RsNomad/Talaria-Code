@@ -65,7 +65,7 @@ export function ModelsPanel({ data, activeModelId, onSetModel, onAddProviderKey 
         <div className="mt-1.5 min-w-0">
           <div className="truncate font-mono text-sm text-fg">{active?.label ?? effectiveModelId}</div>
           <div className="truncate text-2xs text-faint">
-            {active?.provider ?? 'unknown'}
+            {active?.provider ?? 'provider not listed'}
             {active?.contextWindow ? ` · ${(active.contextWindow / 1000).toFixed(0)}k context` : ''}
           </div>
         </div>

@@ -104,6 +104,31 @@ describe('TG-3 (AU-53): resolveEffectiveModelId precedence is LOCKED at its Mode
   });
 });
 
+/**
+ * AU-44c: the header's provider fallback was the literal string `'unknown'`
+ * — technically true (no provider WAS found) but reads like a system error
+ * rather than an honest, plain-language state. `'provider not listed'` says
+ * the same thing without sounding broken.
+ */
+describe('AU-44c: the header provider fallback reads "provider not listed", not "unknown"', () => {
+  it('an active model id matching no known provider renders "provider not listed"', () => {
+    render(
+      <ModelsPanel
+        data={{
+          currentModelId: 'ghost-model',
+          providers: [{ id: 'p1', name: 'Ollama', connected: true, models: [{ id: 'm1', label: 'M1' }] }],
+        }}
+        activeModelId={null}
+        onSetModel={() => undefined}
+        onAddProviderKey={() => undefined}
+      />,
+    );
+    const header = activeModelHeader();
+    expect(header.getByText('provider not listed')).toBeInTheDocument();
+    expect(header.queryByText('unknown')).not.toBeInTheDocument();
+  });
+});
+
 describe('G-10: the Active model header does not claim a connection it cannot see', () => {
   it('shows "Online" only when the active model\'s provider reports connected', () => {
     render(

@@ -90,6 +90,24 @@ describe('LocalModelBlock — Ollama backend missing', () => {
     expect(dispatch).toHaveBeenCalledWith('setup.recheck', { scope: 'ollama' });
   });
 
+  // AU-44a: the generic "Working…" pending label loses the action name — two
+  // buttons (e.g. this Install and the neighboring Re-check) can both read
+  // "Working…" at once with no way to tell which is in flight. `ActionButton`
+  // gains an OPTIONAL `pendingLabel`; this call site migrates to
+  // "Installing…".
+  it('AU-44a: [Install] shows "Installing…" while pending, not the generic "Working…"', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: false }) })} />);
+    await user.click(screen.getByRole('button', { name: /install ollama/i }));
+    expect(screen.getByRole('button', { name: 'Installing…' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
   it('daemon-down-disabled-Pull: the row Pull button is disabled WITH a reason (title names why)', () => {
     renderBlock({ ollama: ollamaWire({ running: false }) });
     const pull = screen.getByRole('button', { name: /Pull qwen2\.5-coder/ });
@@ -168,17 +186,51 @@ describe('LocalModelBlock — Ollama in-flight pull (CC-9)', () => {
  * ------------------------------------------------------------------ */
 
 describe('LocalModelBlock — llama.cpp backend missing', () => {
-  it('command available: renders the missing text + "Open terminal: {command}" + Re-check, rows render, Download stays ENABLED (SC-A-11)', () => {
+  it('command available: renders the missing text + [Open terminal] + the command as a caption + Re-check, rows render, Download stays ENABLED (SC-A-11)', () => {
     renderBlock({
       backend: 'llamacpp',
       llamacppRuntime: { binary: 'missing', install: { command: 'sudo pkgmgr install llama-cpp', guidance: 'Install via the detected package manager.', docsUrl: 'https://example.test/llamacpp' } },
     });
     expect(screen.getByText('llama-server was not found on your PATH. Install llama.cpp, then re-check.')).toBeInTheDocument();
-    const install = screen.getByRole('button', { name: 'Open terminal: sudo pkgmgr install llama-cpp' });
+    // AU-44b: the command is a caption UNDER the button, not inside its label.
+    const install = screen.getByRole('button', { name: 'Open terminal' });
+    expect(screen.getByText('sudo pkgmgr install llama-cpp')).toBeInTheDocument();
     expect(install).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
     const download = screen.getByRole('button', { name: /Download Qwen2\.5-Coder/ });
     expect(download).toBeEnabled();
+  });
+
+  // AU-44b: the install command was embedded INSIDE the uppercase button
+  // label (`Open terminal: ${command}`) — the `uppercase` CSS class then
+  // renders a case-sensitive shell command in all-caps, which both reads
+  // badly and is actively misleading (the command is not actually
+  // upper-case). Fix: the button label becomes the ACTION ("Open terminal"),
+  // pending gets its own "Installing…" label, and the raw command moves to a
+  // mono caption UNDER the button.
+  it('AU-44b: the label is the ACTION ("Open terminal") + "Installing…" while pending; the raw command renders as a mono caption, never inside the label', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(
+      <LocalModelBlock
+        {...baseProps({
+          dispatch,
+          backend: 'llamacpp',
+          llamacppRuntime: { binary: 'missing', install: { command: 'sudo pkgmgr install llama-cpp', guidance: 'Install via the detected package manager.', docsUrl: 'https://example.test/llamacpp' } },
+        })}
+      />,
+    );
+    const install = screen.getByRole('button', { name: 'Open terminal' });
+    expect(install).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /sudo pkgmgr install llama-cpp/ })).not.toBeInTheDocument();
+    expect(screen.getByText('sudo pkgmgr install llama-cpp')).toBeInTheDocument();
+
+    await user.click(install);
+    expect(screen.getByRole('button', { name: 'Installing…' })).toBeInTheDocument();
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
   });
 
   it('no command (guidance-only distro): shows guidance text + docs link, NO install button', () => {
@@ -285,6 +337,23 @@ describe('LocalModelBlock — llama.cpp model presence', () => {
     });
     await user.click(screen.getByRole('button', { name: /copy/i }));
     expect(writeText).toHaveBeenCalledWith('llama-server -m /x/x.gguf --port 8080');
+  });
+
+  // AU-45: the Copy button omitted `successLabel`, so a resolved clipboard
+  // write rendered/announced nothing — the ONLY feedback the mechanism
+  // already exists for (`ActionButton`'s 4s `LiveRegion`-announced success).
+  it('AU-45: [Copy] renders/announces "✓ Copied" once the write resolves', async () => {
+    vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    const { user } = renderBlock({
+      backend: 'llamacpp',
+      models: [
+        catalogModel({
+          llamacpp: { file: 'x.gguf', approxBytes: 1, present: true, available: true, runCommand: 'llama-server -m /x/x.gguf --port 8080' },
+        }),
+      ],
+    });
+    await user.click(screen.getByRole('button', { name: /copy/i }));
+    expect(await screen.findByText('✓ Copied')).toBeInTheDocument();
   });
 
   it('renders the wire\'s §6 note (base-build / mmproj / MoE / ctx) verbatim when present', () => {
@@ -443,7 +512,7 @@ describe('LocalModelBlock — disabledReason gates MUTATING actions only', () =>
       llamacppRuntime: { binary: 'missing', install: { command: 'install it', guidance: 'x', docsUrl: 'https://example.test' } },
       disabledReason: 'Workspace is not trusted.',
     });
-    expect(screen.getByRole('button', { name: 'Open terminal: install it' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Open terminal' })).toBeDisabled();
   });
 });
 

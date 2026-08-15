@@ -640,6 +640,27 @@ describe('Agent card — pipx-missing gap-state (T10, §6/§1.2): known distro',
     expect(terminalButton.getAttribute('title')).toBe(TRUST_DISABLED_REASON);
     expect(screen.getByRole('button', { name: 'Re-check' })).toBeEnabled();
   });
+
+  // AU-44a: this button sits right next to [Re-check] — without an
+  // action-specific pending label, clicking one while the other is still
+  // resolving leaves two buttons both reading the generic "Working…" with no
+  // way to tell which action is in flight.
+  it('AU-44a: shows "Installing…" while pending, not the generic "Working…"', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const data = baseData({ agent: { ...baseData().agent, phase: 'pipx-missing', bootstrap } });
+    const { user } = renderPanel(data, { dispatch });
+    await user.click(screen.getByRole('button', { name: `Open terminal: ${bootstrap.command}` }));
+    expect(screen.getByRole('button', { name: 'Installing…' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Working…' })).not.toBeInTheDocument();
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
 });
 
 describe('Agent card — pipx-missing gap-state (T10, §6): unknown distro — no dead-end', () => {
@@ -893,7 +914,7 @@ describe('FimInstallTab — non-Ollama gets an honest Test affordance (⑨⑩, �
     return utils;
   }
 
-  it('llama.cpp (T11: the block\'s §4.1 states replace the old "no install detection" prose): missing ⇒ [Open terminal: {command}] + [Re-check] + [Test connection ({endpoint})]', async () => {
+  it('llama.cpp (T11: the block\'s §4.1 states replace the old "no install detection" prose): missing ⇒ [Open terminal] + the command as a caption + [Re-check] + [Test connection ({endpoint})]', async () => {
     // llama.cpp HAS install detection since beta.6 (`llamacppRuntime` probe) —
     // the beta.5 "has no install detection" line is retired for this pane; the
     // missing-branch renders the CC-4 host-projected install command instead.
@@ -908,7 +929,9 @@ describe('FimInstallTab — non-Ollama gets an honest Test affordance (⑨⑩, �
     await utils.user.click(screen.getByRole('button', { name: 'Install locally' }));
     const fimCard = must(screen.getByText('Autocomplete (FIM)').closest('section'));
     expect(within(fimCard).getByText('llama-server was not found on your PATH. Install llama.cpp, then re-check.')).toBeInTheDocument();
-    expect(within(fimCard).getByRole('button', { name: 'Open terminal: sudo pkgmgr install llama-cpp' })).toBeEnabled();
+    // AU-44b: the command is a caption UNDER the button, not inside its label.
+    expect(within(fimCard).getByRole('button', { name: 'Open terminal' })).toBeEnabled();
+    expect(within(fimCard).getByText('sudo pkgmgr install llama-cpp')).toBeInTheDocument();
     // Scoped within the card — the Agent card's own ready-state [Re-check] is a different button.
     expect(within(fimCard).getByRole('button', { name: 'Re-check' })).toBeInTheDocument();
     expect(within(fimCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8012)' })).toBeInTheDocument();
@@ -987,6 +1010,23 @@ describe('Agent card — error state [Copy log] button (T11 §6-parity minor)', 
     expect(writeText).toHaveBeenCalledWith(
       'pipx-install failed: network unreachable\nResolving...\nConnection timed out',
     );
+  });
+
+  // AU-45: [Copy log] omitted `successLabel`, so a resolved clipboard write
+  // rendered/announced nothing.
+  it('AU-45: renders/announces "✓ Copied" once the write resolves', async () => {
+    const data = baseData({
+      agent: {
+        ...baseData().agent,
+        phase: 'error',
+        detail: 'pipx-install failed: network unreachable',
+        logTail: ['Resolving...', 'Connection timed out'],
+      },
+    });
+    const { user } = renderPanel(data);
+    vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: 'Copy log' }));
+    expect(await screen.findByText('✓ Copied')).toBeInTheDocument();
   });
 });
 
@@ -1210,6 +1250,25 @@ describe('NEXT card — the llama.cpp -hf guided line is RETIRED from that pane 
     expect(within(nextCard).getByText('Run: vllm serve sweepai/sweep-next-edit-v2-7B')).toBeInTheDocument();
     await user.click(within(nextCard).getByRole('button', { name: 'Copy' }));
     expect(writeText).toHaveBeenCalledWith('vllm serve sweepai/sweep-next-edit-v2-7B');
+  });
+
+  // AU-45: this [Copy] omitted `successLabel`, so a resolved clipboard write
+  // rendered/announced nothing.
+  it('AU-45: [Copy] renders/announces "✓ Copied" once the write resolves', async () => {
+    const data = baseData({
+      fim: {
+        ...baseData().fim,
+        options: [ollamaOption(), vllmOption({ nextEditTransport: 'openai-compat' })],
+        selectedId: 'vllm',
+      },
+    });
+    const { user } = renderPanel(data);
+    vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    await user.click(within(nextCard).getByRole('button', { name: 'vLLM' }));
+    await user.click(within(nextCard).getByRole('button', { name: 'Copy' }));
+    expect(await within(nextCard).findByText('✓ Copied')).toBeInTheDocument();
   });
 });
 
@@ -2289,6 +2348,26 @@ describe('T12 — Test endpoint in the label + the Serving line (§3.1 flow)', (
     const { agentCard, user } = await openAgentSection(agentBlockData());
     await user.click(within(agentCard).getByRole('button', { name: 'llama.cpp' }));
     expect(within(agentCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:8013)' })).toBeInTheDocument();
+  });
+
+  // AU-43: `TestAndServingLine`'s `servingModels` state is local `useState` —
+  // without a `key={endpoint}` at this (Agent Ollama) call site, editing the
+  // endpoint field after a green Test leaves the STALE "Serving: …" list
+  // rendered under the now-different endpoint (it describes a daemon the
+  // field no longer points at). The existing T9/M-1 idiom (`localModel.tsx`
+  // block's own pane-switch call site) fixes this by remounting the
+  // component whenever the endpoint prop changes.
+  it('AU-43: editing the endpoint after a successful Test clears the stale Serving line', async () => {
+    const { agentCard, user, dispatch } = await openAgentSection(agentBlockData());
+    dispatch.mockResolvedValue({ models: ['devstral-small-2507:24b'] });
+    await user.click(within(agentCard).getByRole('button', { name: 'Test connection (http://127.0.0.1:11434)' }));
+    expect(await within(agentCard).findByText('Serving: devstral-small-2507:24b')).toBeInTheDocument();
+
+    const endpointField = within(agentCard).getByLabelText('Endpoint');
+    await user.clear(endpointField);
+    await user.type(endpointField, 'http://127.0.0.1:22222');
+
+    expect(within(agentCard).queryByText('Serving: devstral-small-2507:24b')).not.toBeInTheDocument();
   });
 });
 

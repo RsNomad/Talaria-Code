@@ -335,6 +335,13 @@ function DoneLine({ text, className = 'mt-1' }: { text: string; className?: stri
  * confirmation modal, T2/§2.2.4) renders NEITHER success nor failure — the
  * C-2 lock — regardless of whether `successLabel` was given. A rejection
  * always renders the `✗ ${message}` failure line.
+ *
+ * AU-44a: `pendingLabel`, when given, replaces the generic "Working…" text
+ * while `pending` is true — two buttons on the same screen (e.g. an install
+ * action beside its neighboring Re-check) could otherwise BOTH read the
+ * identical generic "Working…" with no way to tell which is in flight.
+ * OPTIONAL — omitted, the default "Working…" renders exactly as before (any
+ * unmigrated caller degrades gracefully).
  */
 function ActionButton({
   label,
@@ -343,6 +350,7 @@ function ActionButton({
   tone = 'neutral',
   icon,
   successLabel,
+  pendingLabel,
 }: {
   label: string;
   onRun: () => Promise<unknown>;
@@ -350,6 +358,7 @@ function ActionButton({
   tone?: Tone;
   icon?: string;
   successLabel?: string;
+  pendingLabel?: string;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
@@ -402,7 +411,7 @@ function ActionButton({
         className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 font-mono text-2xs uppercase tracking-wide transition-colors aria-disabled:cursor-default aria-disabled:opacity-50 disabled:cursor-not-allowed disabled:opacity-50 ${toneClass}`}
       >
         {icon && <Icon name={icon} size={12} spin={pending} />}
-        {pending ? 'Working…' : label}
+        {pending ? (pendingLabel ?? 'Working…') : label}
       </button>
       <LiveRegion text={liveText} className={liveClass} title={error} />
     </div>
@@ -695,6 +704,7 @@ function AgentCard({
             {agent.bootstrap?.command ? (
               <ActionButton
                 label={`Open terminal: ${agent.bootstrap.command}`}
+                pendingLabel="Installing…"
                 onRun={() => dispatch('setup.openBootstrapTerminal')}
                 disabledReason={disabledReason}
               />
@@ -722,6 +732,7 @@ function AgentCard({
               {agent.detail && <p className="text-2xs text-muted">{agent.detail}</p>}
               <ActionButton
                 label={`Open terminal: ${agent.pythonInstall.command}`}
+                pendingLabel="Installing…"
                 onRun={() => dispatch('setup.openBootstrapTerminal', { target: 'python' })}
                 disabledReason={disabledReason}
               />
@@ -757,6 +768,8 @@ function AgentCard({
             <ActionButton
               label="Copy log"
               icon="copy"
+              pendingLabel="Copying…"
+              successLabel="✓ Copied"
               onRun={() => navigator.clipboard.writeText(buildCopyLogText(agent.detail, logTail))}
             />
           </div>
@@ -983,8 +996,14 @@ function AgentLocalModelSection({
             />
 
             {/* The Ollama pane has no in-block Test (§4.1) — same surface-level
-                Test + Serving line the FIM ollama pane carries (T10 Minor #4). */}
-            {backend === 'ollama' && <TestAndServingLine backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
+                Test + Serving line the FIM ollama pane carries (T10 Minor #4).
+                AU-43: `key={ep.value}` remounts on an endpoint edit (the
+                existing T9/M-1 idiom, `localModel.tsx`'s own pane-switch call
+                site) so `TestAndServingLine`'s local `servingModels` state
+                doesn't survive to describe a daemon the field no longer
+                points at — the backend is fixed here, so keying on the
+                endpoint alone is correct. */}
+            {backend === 'ollama' && <TestAndServingLine key={ep.value} backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
 
             {sel.id !== undefined && (
               <div>
@@ -1973,6 +1992,8 @@ function DedicatedNextForm({
                 <ActionButton
                   label="Copy"
                   icon="copy"
+                  pendingLabel="Copying…"
+                  successLabel="✓ Copied"
                   onRun={() => navigator.clipboard.writeText(guided.command.replace(/^Run:\s*/, ''))}
                 />
               </div>
@@ -2320,8 +2341,10 @@ function RagEmbedSection({
 
           {/* The Ollama pane has no in-block Test (§4.1) — the same
               surface-level Test + Serving line the FIM/Agent ollama panes
-              carry (T10 Minor #4; one Test per pane, T13 note 2). */}
-          {pane === 'ollama' && <TestAndServingLine backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
+              carry (T10 Minor #4; one Test per pane, T13 note 2). AU-43:
+              `key={ep.value}` — same remount-on-endpoint-edit idiom as the
+              Agent Ollama surface above. */}
+          {pane === 'ollama' && <TestAndServingLine key={ep.value} backend="ollama" endpoint={ep.value} dispatch={dispatch} />}
 
           <div>
             <ActionButton
