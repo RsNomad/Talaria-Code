@@ -353,6 +353,26 @@ describe('mapDiagnosticsForUri / mapDiagnosticsDump — I-1(e) correct resource 
     const group = mapDiagnosticsForUri(diags, 'file:///s.ts');
     expect(group.diagnostics.map((d) => d.severity)).toEqual([0, 1, 2, 3]);
   });
+
+  // -------------------------------------------------------------------------
+  // AU-17 — `code: null` must never reach `String(code.value)` (TypeError,
+  // `typeof null === 'object'`, killing diagnostics for the WHOLE result —
+  // violates INV-17 "mappers never throw"). Fuzzed against a few other
+  // malformed object-shaped codes too (guard `.value` presence, not just the
+  // declared structural type).
+  // -------------------------------------------------------------------------
+
+  it('AU-17: normalizes a null/malformed code to undefined instead of throwing (totality)', () => {
+    const diags: DiagnosticLike[] = [
+      { range: range(0, 0, 0, 1), message: 'null-code', severity: 0, code: null as unknown as DiagnosticLike['code'] },
+      { range: range(0, 0, 0, 1), message: 'empty-object-code', severity: 0, code: {} as unknown as DiagnosticLike['code'] },
+      { range: range(0, 0, 0, 1), message: 'null-value-code', severity: 0, code: { value: null } as unknown as DiagnosticLike['code'] },
+    ];
+
+    expect(() => mapDiagnosticsForUri(diags, 'file:///n.ts')).not.toThrow();
+    const group = mapDiagnosticsForUri(diags, 'file:///n.ts');
+    expect(group.diagnostics.map((d) => d.code)).toEqual([undefined, undefined, undefined]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -386,6 +406,29 @@ describe('mapHover — I-1(f) contents flatten', () => {
       { contents: [{ value: 'second' }, { language: 'ts', value: 'third' }] },
     ];
     expect(mapHover(hovers)).toEqual(['first', 'second', 'third']);
+  });
+
+  // -------------------------------------------------------------------------
+  // L8 — hover null-contents guard (same INV-17 class as AU-17): a `null`
+  // entry inside `contents`, or a `null`/`undefined` `contents` field itself,
+  // must never throw.
+  // -------------------------------------------------------------------------
+
+  it('L8: a null entry inside Hover.contents is skipped, never throws (totality)', () => {
+    const hover: HoverLike = {
+      contents: ['before', null as unknown as HoverLike['contents'][number], 'after'],
+    };
+    expect(() => mapHover([hover])).not.toThrow();
+    expect(mapHover([hover])).toEqual(['before', 'after']);
+  });
+
+  it('L8: a Hover with contents: null/undefined never throws (totality)', () => {
+    const nullContents = { contents: null } as unknown as HoverLike;
+    const undefinedContents = { contents: undefined } as unknown as HoverLike;
+    expect(() => mapHover([nullContents])).not.toThrow();
+    expect(() => mapHover([undefinedContents])).not.toThrow();
+    expect(mapHover([nullContents])).toEqual([]);
+    expect(mapHover([undefinedContents])).toEqual([]);
   });
 });
 

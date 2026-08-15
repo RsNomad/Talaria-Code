@@ -71,6 +71,24 @@ export interface RawDiagnosticsGroup {
 export type RawDocumentSymbolEntry = PlainDocumentSymbol | PlainSymbolInformation;
 
 /**
+ * L4 fix — the doc-symbols LRU's stored value: the RESOLVED VERSION the
+ * entries were fetched at, alongside the entries themselves. Keyed by `uri`
+ * ALONE (one slot per uri, not the old `${uri}@${version}` composite key —
+ * `tools.ts`'s `handleDocumentSymbols`) so a version RESET (e.g. the
+ * document is closed then reopened — `TextDocument.version` legitimately
+ * restarts, per `@types/vscode`'s own doc comment: "A closed document isn't
+ * synchronized anymore and won't be re-used when the same resource is
+ * opened again") can never leave a STALE entry from a prior generation
+ * lingering under a still-resident old composite key: any version mismatch
+ * (higher OR lower than what is currently cached) is a plain miss, which
+ * OVERWRITES this single slot rather than accumulating a second one.
+ */
+export interface CachedDocumentSymbols {
+  readonly version: number;
+  readonly entries: readonly RawDocumentSymbolEntry[];
+}
+
+/**
  * W3 (LIB) · T8b — one file's raw text edits within a `RawCodeAction`'s
  * `WorkspaceEdit`, exactly as the adapter's `_allEntries` feature-detect
  * extracted them (grouped by uri, adapter's job — see
@@ -178,7 +196,7 @@ export interface LspToolDeps {
    */
   readonly pool: Pool;
   readonly tracker: IndexingTracker;
-  readonly docSymbolsCache: LruCache<readonly RawDocumentSymbolEntry[]>;
+  readonly docSymbolsCache: LruCache<CachedDocumentSymbols>;
 }
 
 /**
@@ -190,5 +208,5 @@ export interface LspToolDeps {
 export interface SharedLspToolState {
   readonly pool: Pool;
   readonly tracker: IndexingTracker;
-  readonly docSymbolsCache: LruCache<readonly RawDocumentSymbolEntry[]>;
+  readonly docSymbolsCache: LruCache<CachedDocumentSymbols>;
 }

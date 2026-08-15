@@ -209,7 +209,57 @@ describe('capWithMarker', () => {
     expect(() => capWithMarker('abc', Number.NaN, '...')).not.toThrow();
     expect(() => capWithMarker('abc', Number.POSITIVE_INFINITY, '...')).not.toThrow();
   });
+
+  // -------------------------------------------------------------------------
+  // L9 — per-field truncation must never split a UTF-16 surrogate pair. JS
+  // strings are UTF-16 code-unit sequences; `.slice()` is encoding-unaware
+  // and happily cuts between an astral character's high/low surrogate
+  // halves, leaving a lone (unpaired) surrogate in the output — invalid
+  // UTF-16 that corrupts a unit of meaning (INV-17: caps degrade by
+  // omission, never by corrupting a unit of meaning).
+  // -------------------------------------------------------------------------
+
+  describe('L9: never splits a UTF-16 surrogate pair at the truncation boundary', () => {
+    it('backs the cut off by one code unit instead of emitting a lone high surrogate', () => {
+      // U+1F600 (😀) is a 2-code-unit surrogate pair (0xD83D, 0xDE00).
+      // 'ab' + the pair + 'cd' — cap=3 with an empty marker lands the naive
+      // cut EXACTLY between the pair's two halves.
+      const astral = '\u{1F600}';
+      const s = `ab${astral}cd`;
+      const out = capWithMarker(s, 3, '');
+      expect(out).toBe('ab');
+      expect(hasLoneSurrogate(out)).toBe(false);
+    });
+
+    it('never leaves a lone surrogate in the output, fuzzed across every cap value around several astral characters', () => {
+      const astral = '\u{1F600}\u{1F601}\u{1F602}';
+      const s = `prefix-${astral}-suffix`;
+      for (let cap = 0; cap <= s.length + 2; cap++) {
+        const out = capWithMarker(s, cap, '~');
+        expect(hasLoneSurrogate(out)).toBe(false);
+      }
+    });
+  });
 });
+
+/** True iff `s` contains a UTF-16 surrogate code unit without its pair
+ * partner immediately adjacent — i.e. invalid UTF-16 that would have come
+ * from bisecting an astral character. */
+function hasLoneSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = s.charCodeAt(i + 1);
+      if (Number.isNaN(next) || next < 0xdc00 || next > 0xdfff) {
+        return true;
+      }
+      i++; // skip the paired low surrogate
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true; // a low surrogate with no preceding high surrogate
+    }
+  }
+  return false;
+}
 
 describe('capTotalBody', () => {
   it('leaves body unchanged when within the total cap', () => {

@@ -526,4 +526,42 @@ describe('buildConfinementVerdict', () => {
     expect(seenTarget).toBe('/some/path');
     expect(seenRoots).toEqual(['/root1', '/root2']);
   });
+
+  // -------------------------------------------------------------------------
+  // S7 — multi-root root selection: pick the LONGEST matching prefix (the
+  // most specific containing root), never array order; when NO given root
+  // actually contains the canonical target, refuse a fabricated cross-root
+  // relPath rather than silently falling back to an unrelated root.
+  // -------------------------------------------------------------------------
+
+  it('S7: with overlapping/nested roots, picks the LONGEST matching prefix, not array order', async () => {
+    const confine: RealpathConfiner = async () => '/workspace/nested/src/a.ts';
+    const toRelative = (root: string, canonical: string): string => `${root}::${canonical}`;
+    // '/workspace' is listed FIRST but '/workspace/nested' is the more
+    // specific containing root — array order must not win.
+    const verdict = await buildConfinementVerdict(
+      'anything',
+      ['/workspace', '/workspace/nested'],
+      confine,
+      toRelative,
+    );
+    expect(verdict).toEqual({
+      inRoot: true,
+      relPath: '/workspace/nested::/workspace/nested/src/a.ts',
+    });
+  });
+
+  it('S7: when no given root actually contains the canonical target, refuses a fabricated cross-root relPath (falls back to the absolute canonical path, never an unrelated root\'s path.relative)', async () => {
+    // A caller/test artifact per this module's own doc comment: `confine`
+    // has already proven containment against its OWN internal roots, but
+    // the `roots` array handed to `buildConfinementVerdict` here (display
+    // purposes only) does not lexically match at all — e.g. a stale root
+    // list. The old behavior fell back to `roots[0]`, fabricating a
+    // confusing relative path against a root that does not contain the
+    // target.
+    const confine: RealpathConfiner = async () => '/completely/unrelated/dir/a.ts';
+    const toRelative = (root: string, canonical: string): string => `${root}::${canonical}`;
+    const verdict = await buildConfinementVerdict('anything', ['/ws1', '/ws2'], confine, toRelative);
+    expect(verdict).toEqual({ inRoot: true, relPath: '/completely/unrelated/dir/a.ts' });
+  });
 });

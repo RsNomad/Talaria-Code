@@ -113,6 +113,7 @@ import type {
 import { classifyCodeAction, shapeCodeActions } from './codeActionSerialize';
 import type { ResolvedCodeAction, TextEditFile } from './codeActionSerialize';
 import type {
+  CachedDocumentSymbols,
   LspToolDeps,
   LspToolGateway,
   Pool,
@@ -593,18 +594,26 @@ interface DiagnosticsArgs {
   readonly limit?: number;
 }
 
+/** AU-20: routes each group's `classifyUri` realpath call through the SAME
+ * 4-slot pool the gateway calls already use — a raw `Promise.all` here would
+ * fan out unboundedly (a workspace dump can return one group per resource VS
+ * Code currently knows about). By the time this runs, the pool's earlier
+ * gateway-call task has already resolved (see `handleDiagnostics`'s sync
+ * verb + this async post-step), so there is no re-entrant `pool.run` nesting. */
 async function filterDiagnosticsToInRoot(
   deps: LspToolDeps,
   groups: readonly RawDiagnosticsGroup[],
 ): Promise<PlainDiagnosticEntry[]> {
   const perGroup = await Promise.all(
-    groups.map(async (group) => {
-      const verdict = await deps.classifyUri(group.uri);
-      if (!verdict.inRoot) {
-        return [] as PlainDiagnosticEntry[];
-      }
-      return group.diagnostics.map((d) => toDiagnosticEntry(verdict.relPath, d));
-    }),
+    groups.map((group) =>
+      deps.pool.run(async () => {
+        const verdict = await deps.classifyUri(group.uri);
+        if (!verdict.inRoot) {
+          return [] as PlainDiagnosticEntry[];
+        }
+        return group.diagnostics.map((d) => toDiagnosticEntry(verdict.relPath, d));
+      }),
+    ),
   );
   return perGroup.flat();
 }
@@ -617,6 +626,13 @@ async function handleDiagnostics(
   if (args.path === undefined && args.scope === undefined) {
     return refusalResult("either 'path' or scope:'workspace' is required");
   }
+  // L11: `path` + `scope:'workspace'` together used to silently prefer
+  // `path` and drop the `scope` argument with no signal at all — an honest
+  // refusal beats a silent drop (INV-17: degrade by omission, never by
+  // silently ignoring part of the input).
+  if (args.path !== undefined && args.scope !== undefined) {
+    return refusalResult("pass either 'path' or scope:'workspace', not both");
+  }
 
   if (args.path !== undefined) {
     const arg = await deps.resolvePathArg(args.path);
@@ -624,10 +640,23 @@ async function handleDiagnostics(
       deps.log?.('[lsp_diagnostics] resolvePathArg refused: path outside the workspace or not found');
       return refusalResult('path is outside the workspace or was not found');
     }
-    const relPath = args.path;
+    // L10: render the CONFINED relative path (reusing the same confinement
+    // helper every other tool renders `relPath` through), not the raw,
+    // unconfined `args.path` as typed by the caller (which could contain
+    // `./`/`../` segments or otherwise not match the canonical, confined
+    // display form). `resolvePathArg` already confirmed containment, so an
+    // `inRoot:false` verdict here would only be a same-tick race (root
+    // removed between resolve and classify) — degrade to the raw arg rather
+    // than refuse a file that was legitimately just opened.
+    const verdict = await deps.classifyUri(arg.uri);
+    const relPath = verdict.inRoot ? verdict.relPath : args.path;
     const run = await runSyncVerbWithRetry({
       tracker,
-      languageKey: arg.languageId,
+      // AU-18: keyed per (tool, language) — a bare `languageId` key was
+      // shared across all 5 retrying tools, so an empty result from a
+      // DIFFERENT tool for the same language could burn this tool's
+      // one-time first-empty retry budget.
+      languageKey: `lsp_diagnostics:${arg.languageId}`,
       isEmpty: (groups: readonly RawDiagnosticsGroup[]) => sumDiagnostics(groups) === 0,
       sleep: deps.sleep,
       work: () => deps.gateway.getDiagnostics(arg.uri),
@@ -664,13 +693,25 @@ interface LocationsToolOptions {
   readonly deadlineMs: number;
   readonly capLimit: number;
   readonly snippetMaxLines: number;
+  /** AU-18: the registered tool name (`'lsp_definition'`/`'lsp_references'`)
+   * — folded into the first-empty retry's `languageKey` so the two tools
+   * sharing this handler never share a retry budget with each other (or
+   * with the other 3 retrying tools) for the same language. */
+  readonly toolName: string;
   readonly verb: (gateway: LspToolGateway, uri: string, position: PlainPosition) => Promise<readonly (PlainLocation | PlainLocationLink)[]>;
 }
 
 /** Classifies EVERY raw target (needed for the shaper's accurate "N
  * external" summary count over the FULL result set) but only reads a
  * snippet for the entries that will actually be shown after capping AND are
- * in-root — never for an external target, never for a beyond-cap entry. */
+ * in-root — never for an external target, never for a beyond-cap entry.
+ *
+ * AU-20: each target's `classifyUri`/`readSnippet` pair runs through the
+ * SAME 4-slot pool the gateway call already used — a raw `Promise.all` here
+ * would fan out unboundedly (a symbol with hundreds of references). The
+ * gateway call that produced `raw` has already resolved and released its
+ * pool slot by the time this function runs (`handleLocationsTool` awaits it
+ * first), so there is no re-entrant `pool.run` nesting. */
 async function buildLocationTargets(
   deps: LspToolDeps,
   raw: readonly (PlainLocation | PlainLocationLink)[],
@@ -679,15 +720,17 @@ async function buildLocationTargets(
 ): Promise<LocationTarget[]> {
   const coalesced = raw.map(coalesceTarget);
   return Promise.all(
-    coalesced.map(async (target, index) => {
-      const verdict = await deps.classifyUri(target.uri);
-      const withinCap = index < capLimit;
-      if (verdict.inRoot && withinCap) {
-        const snippet = await deps.readSnippet(target.uri, target.range, snippetMaxLines);
-        return { range: target.range, verdict: snippet === undefined ? verdict : { ...verdict, snippet } };
-      }
-      return { range: target.range, verdict };
-    }),
+    coalesced.map((target, index) =>
+      deps.pool.run(async () => {
+        const verdict = await deps.classifyUri(target.uri);
+        const withinCap = index < capLimit;
+        if (verdict.inRoot && withinCap) {
+          const snippet = await deps.readSnippet(target.uri, target.range, snippetMaxLines);
+          return { range: target.range, verdict: snippet === undefined ? verdict : { ...verdict, snippet } };
+        }
+        return { range: target.range, verdict };
+      }),
+    ),
   );
 }
 
@@ -708,7 +751,7 @@ async function handleLocationsTool(
     pool,
     tracker,
     deadlineMs: opts.deadlineMs,
-    languageKey: arg.languageId,
+    languageKey: `${opts.toolName}:${arg.languageId}`,
     isEmpty: (rows: readonly (PlainLocation | PlainLocationLink)[]) => rows.length === 0,
     sleep: deps.sleep,
     work: () => opts.verb(deps.gateway, arg.uri, position),
@@ -739,6 +782,7 @@ async function handleDefinition(
     deadlineMs: DEADLINE_DEFINITION_MS,
     capLimit: DEFAULT_LOCATIONS_CAP,
     snippetMaxLines: DEFINITION_SNIPPET_MAX_LINES,
+    toolName: 'lsp_definition',
     verb: (gateway, uri, position) => gateway.getDefinition(uri, position),
   });
 }
@@ -753,6 +797,7 @@ async function handleReferences(
     deadlineMs: DEADLINE_REFERENCES_MS,
     capLimit: DEFAULT_LOCATIONS_CAP,
     snippetMaxLines: REFERENCES_SNIPPET_MAX_LINES,
+    toolName: 'lsp_references',
     verb: (gateway, uri, position) => gateway.getReferences(uri, position),
   });
 }
@@ -769,7 +814,7 @@ async function handleDocumentSymbols(
   deps: LspToolDeps,
   pool: Pool,
   tracker: IndexingTracker,
-  cache: LruCache<readonly RawDocumentSymbolEntry[]>,
+  cache: LruCache<CachedDocumentSymbols>,
   args: DocumentSymbolsArgs,
 ): Promise<ToolResult> {
   const arg = await deps.resolvePathArg(args.path);
@@ -778,10 +823,16 @@ async function handleDocumentSymbols(
     return refusalResult('path is outside the workspace or was not found');
   }
 
-  const cacheKey = `${arg.uri}@${arg.version}`;
-  const cached = cache.get(cacheKey);
-  if (cached !== undefined) {
-    const framed = shapeDocumentSymbols(cached.map(normalizeDocumentSymbol), args.path, DEFAULT_SHAPER_CAPS);
+  // L4: keyed by uri ALONE (one slot per uri) — a hit requires the cached
+  // entry's OWN version to match `arg.version` exactly. Any mismatch,
+  // including a version that moved DOWN (a document close+reopen reset —
+  // `TextDocument.version` legitimately restarts), is a miss that overwrites
+  // this single slot below, rather than the old `${uri}@${version}`
+  // composite key letting a stale entry from a prior document generation
+  // linger under its own still-resident key.
+  const cached = cache.get(arg.uri);
+  if (cached !== undefined && cached.version === arg.version) {
+    const framed = shapeDocumentSymbols(cached.entries.map(normalizeDocumentSymbol), args.path, DEFAULT_SHAPER_CAPS);
     return textResult(framed);
   }
 
@@ -789,7 +840,9 @@ async function handleDocumentSymbols(
     pool,
     tracker,
     deadlineMs: DEADLINE_DOCUMENT_SYMBOLS_MS,
-    languageKey: arg.languageId,
+    // AU-18: keyed per (tool, language) — see the file-header note on the
+    // 5-tool shared-budget bug this closes.
+    languageKey: `lsp_document_symbols:${arg.languageId}`,
     isEmpty: (rows: readonly RawDocumentSymbolEntry[]) => rows.length === 0,
     sleep: deps.sleep,
     work: () => deps.gateway.getDocumentSymbols(arg.uri),
@@ -812,9 +865,10 @@ async function handleDocumentSymbols(
   // call. Leaving an empty result uncached means the NEXT call for the same
   // (uri, version) is a genuine cache miss, re-runs the gateway call (and
   // the first-empty retry/status policy), and can recover once indexing
-  // finishes. A real non-empty result still caches normally.
+  // finishes. A real non-empty result still caches normally (overwriting
+  // whatever was previously cached for this uri, at any version — L4).
   if (run.value.length > 0) {
-    cache.set(cacheKey, run.value);
+    cache.set(arg.uri, { version: arg.version, entries: run.value });
   }
   const framed = shapeDocumentSymbols(run.value.map(normalizeDocumentSymbol), args.path, DEFAULT_SHAPER_CAPS);
   return textResult(withStatus(run.status, framed));
@@ -902,7 +956,7 @@ async function handleHover(
     pool,
     tracker,
     deadlineMs: DEADLINE_HOVER_MS,
-    languageKey: arg.languageId,
+    languageKey: `lsp_hover:${arg.languageId}`,
     isEmpty: (rows: readonly string[]) => rows.length === 0,
     sleep: deps.sleep,
     work: () => deps.gateway.getHover(arg.uri, position),
@@ -965,6 +1019,13 @@ function clampMaxActionsK(userValue: number | undefined): number {
  * unconditionally (even for what will turn out to be a multi-file action) —
  * T8a's `classifyCodeAction` is the single place that decides single- vs
  * multi-file; this function does not special-case that decision.
+ *
+ * AU-20: each file's `classifyUri`/`readFullText` pair runs through the
+ * SAME 4-slot pool the gateway call already used — a raw `Promise.all` here
+ * would fan out unboundedly for a multi-file action. The gateway call that
+ * produced `raw` has already resolved and released its pool slot by the
+ * time this function runs (`handleCodeActions` awaits it first), so there
+ * is no re-entrant `pool.run` nesting.
  */
 async function buildResolvedCodeAction(
   deps: LspToolDeps,
@@ -974,11 +1035,13 @@ async function buildResolvedCodeAction(
     return { title: raw.title, hasCommand: raw.hasCommand };
   }
   const files: TextEditFile[] = await Promise.all(
-    raw.edit.files.map(async (f) => {
-      const verdict = await deps.classifyUri(f.uri);
-      const docText = verdict.inRoot ? await deps.readFullText(f.uri) : undefined;
-      return { uri: f.uri, verdict, edits: f.edits, docText };
-    }),
+    raw.edit.files.map((f) =>
+      deps.pool.run(async () => {
+        const verdict = await deps.classifyUri(f.uri);
+        const docText = verdict.inRoot ? await deps.readFullText(f.uri) : undefined;
+        return { uri: f.uri, verdict, edits: f.edits, docText };
+      }),
+    ),
   );
   return {
     title: raw.title,
@@ -1054,7 +1117,7 @@ export function createSharedLspToolState(): SharedLspToolState {
   return {
     pool: createConcurrencyPool(MAX_IN_FLIGHT),
     tracker: createIndexingTracker(),
-    docSymbolsCache: new LruCache<readonly RawDocumentSymbolEntry[]>(DOC_SYMBOLS_LRU_MAX),
+    docSymbolsCache: new LruCache<CachedDocumentSymbols>(DOC_SYMBOLS_LRU_MAX),
   };
 }
 
