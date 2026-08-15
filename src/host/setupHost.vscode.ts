@@ -52,11 +52,22 @@ import { createVsCodeNextEditConfigPort } from '../autocomplete/nextedit/guard';
 
 // --- SpawnFn (installHermes's subprocess seam) ------------------------------
 
-/** Same 10s login-shell lookup timeout `resolveHermes.ts`/`pipxLocator.ts` use. */
-function createExecLookup(): ExecLookup {
+/**
+ * Same 10s login-shell lookup timeout `resolveHermes.ts`/`pipxLocator.ts`
+ * use. Exported (TC-5/AU-28) so its `signal` wiring can be pinned directly
+ * against a REAL `execFile` abort (Global Constraint 4 — the `ExecLookup`
+ * seam carries no error shape of its own), matching `resolveHermes.ts`'s own
+ * `defaultExecLookup` — this is the SECOND of the two `ExecLookup`
+ * implementations the AU-28 fix names; it is the one actually reachable in
+ * production (bound into `locatePipx`/`discoverHermes`/
+ * `createLocateLlamaServer` below), so before this fix Cancel could only
+ * ever be observed BETWEEN a locator's steps, never during an in-flight
+ * probe.
+ */
+export function createExecLookup(): ExecLookup {
   return (command, args, opts) =>
     new Promise<string>((resolve, reject) => {
-      execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd }, (err, stdout) => {
+      execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd, signal: opts.signal }, (err, stdout) => {
         if (err) reject(err);
         else resolve(stdout);
       });

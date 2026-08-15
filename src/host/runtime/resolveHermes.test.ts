@@ -6,6 +6,7 @@ import {
   resolveHermes,
   resolveHermesBin,
   resetHermesBinCache,
+  defaultExecLookup,
   type ExecLookup,
   type RealpathLookup,
   type AccessCheck,
@@ -257,4 +258,26 @@ describe('package.json — R-A5: talaria.hermesPath is contributed machine-scope
       'talaria.hermesPath',
     );
   });
+});
+
+// --- TC-5 (AU-28): AbortSignal never wired into the ExecLookup execFile calls ---
+
+describe('defaultExecLookup — TC-5 (AU-28): AbortSignal actually kills the in-flight execFile child', () => {
+  // Global Constraint 4 (no mock-theater): the `ExecLookup` seam carries no
+  // error shape of its own, so this is pinned against a REAL `execFile`
+  // abort — the actual Node behavior (Node child_process docs: the `signal`
+  // option lets an AbortController kill the child, rejecting with an
+  // AbortError), not a hand-rolled fixture. Cloned discipline from
+  // `pipxLocator.test.ts`'s real-timeout `isExecTimeout` test.
+  it('aborting mid-probe rejects promptly instead of letting the child run to completion (fails at HEAD: resolves after the full sleep)', async () => {
+    const abort = new AbortController();
+    const promise = defaultExecLookup('node', ['-e', 'setTimeout(() => {}, 2000)'], {
+      timeoutMs: 10_000,
+      cwd: os.homedir(),
+      signal: abort.signal,
+    });
+    setTimeout(() => abort.abort(), 50);
+
+    await expect(promise).rejects.toThrow();
+  }, 3_000);
 });

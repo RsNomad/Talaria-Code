@@ -160,8 +160,11 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
  * propagate as a rejected promise; there is no reason code for it in this
  * task's interface (that belongs to the later install pipeline's own
  * `resolve-paths` failure mode, §2.2 step 3's file-existence checks). An
- * aborted `signal` also propagates as a rejected `AbortError` (checked
- * between steps only — see {@link throwIfAborted}).
+ * aborted `signal` also propagates as a rejected `AbortError` — both checked
+ * between steps (see {@link throwIfAborted}) AND, since TC-5/AU-28, threaded
+ * into EVERY exec() call's own opts, so an in-flight 5-10s login-shell probe
+ * is actually killed instead of running to its own timeout regardless of
+ * Cancel.
  *
  * @param signal T11 (§3, critic C-11): optional — `handleInstall` passes its
  *   `AbortController.signal` so Cancel can reach a wedged probe; callers that
@@ -171,7 +174,7 @@ export async function locatePipx(exec: ExecLookup, signal?: AbortSignal): Promis
   const cwd = os.homedir();
 
   throwIfAborted(signal);
-  const lookup = await findPipxPath(exec, cwd);
+  const lookup = await findPipxPath(exec, cwd, signal);
   if (lookup.kind === 'probe-timeout') {
     return { ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_DETAIL };
   }
@@ -187,7 +190,7 @@ export async function locatePipx(exec: ExecLookup, signal?: AbortSignal): Promis
   const pipxPath = lookup.path;
 
   throwIfAborted(signal);
-  const pythonGate = await gatePython(exec, pipxPath, cwd);
+  const pythonGate = await gatePython(exec, pipxPath, cwd, signal);
   if (!pythonGate) {
     return {
       ok: false,
@@ -204,6 +207,7 @@ export async function locatePipx(exec: ExecLookup, signal?: AbortSignal): Promis
     pipxPath,
     ['environment', '--value', 'PIPX_LOCAL_VENVS'],
     cwd,
+    signal,
   );
   const venvsRoot = lastNonEmptyLine(venvsRootRaw);
 
@@ -267,19 +271,26 @@ type PipxLookup = { kind: 'found'; path: string } | { kind: 'missing' } | { kind
  *   `SetupControllerDeps.locatePipx`'s caller if that visibility is wanted).
  *   Neither candidate answering is the only path to `probe-timeout`.
  */
-async function findPipxPath(exec: ExecLookup, cwd: string): Promise<PipxLookup> {
+async function findPipxPath(exec: ExecLookup, cwd: string, signal: AbortSignal | undefined): Promise<PipxLookup> {
   const spec = loginShellSpawn('command', ['-v', 'pipx'], undefined, { exec: false });
 
   let stdout: string;
   try {
-    stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_TIMEOUT_MS, cwd });
+    stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_TIMEOUT_MS, cwd, signal });
   } catch (firstErr) {
+    // TC-5/AU-28: an abort takes priority over the timeout classifier — Node
+    // sets `killed`/`signal` on an abort-driven kill too (the same shape a
+    // genuine timeout produces), so without this check an in-flight Cancel
+    // could be misread as "the login shell was merely slow" and silently
+    // retried instead of propagating the cancellation.
+    if (signal?.aborted) throw firstErr;
     if (!isExecTimeout(firstErr)) return { kind: 'missing' };
     try {
-      stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_RETRY_TIMEOUT_MS, cwd });
+      stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_RETRY_TIMEOUT_MS, cwd, signal });
     } catch (secondErr) {
+      if (signal?.aborted) throw secondErr;
       if (!isExecTimeout(secondErr)) return { kind: 'missing' };
-      return probeAbsoluteCandidates(exec, cwd);
+      return probeAbsoluteCandidates(exec, cwd, signal);
     }
   }
 
@@ -296,12 +307,19 @@ function absoluteCandidatePaths(): string[] {
   return [path.join(os.homedir(), '.local', 'bin', 'pipx'), '/usr/bin/pipx'];
 }
 
-async function probeAbsoluteCandidates(exec: ExecLookup, cwd: string): Promise<PipxLookup> {
+async function probeAbsoluteCandidates(
+  exec: ExecLookup,
+  cwd: string,
+  signal: AbortSignal | undefined,
+): Promise<PipxLookup> {
   for (const candidate of absoluteCandidatePaths()) {
     try {
-      await exec(candidate, ['--version'], { timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS, cwd });
+      await exec(candidate, ['--version'], { timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS, cwd, signal });
       return { kind: 'found', path: candidate };
-    } catch {
+    } catch (err) {
+      // TC-5/AU-28: an abort must propagate, not be swallowed as "try the
+      // next candidate" — the whole point of Cancel is to stop probing.
+      if (signal?.aborted) throw err;
       // Try the next candidate; every candidate failing falls through to
       // 'probe-timeout' below.
     }
@@ -310,14 +328,19 @@ async function probeAbsoluteCandidates(exec: ExecLookup, cwd: string): Promise<P
 }
 
 /** Steps 1: gate the default interpreter, probing overrides if needed. */
-async function gatePython(exec: ExecLookup, pipxPath: string, cwd: string): Promise<PythonGate | undefined> {
-  const defaultPythonVersion = await getDefaultPythonVersion(exec, pipxPath, cwd);
+async function gatePython(
+  exec: ExecLookup,
+  pipxPath: string,
+  cwd: string,
+  signal: AbortSignal | undefined,
+): Promise<PythonGate | undefined> {
+  const defaultPythonVersion = await getDefaultPythonVersion(exec, pipxPath, cwd, signal);
   if (defaultPythonVersion && isVersionInRange(defaultPythonVersion, PYTHON_MIN_INCLUSIVE, PYTHON_MAX_EXCLUSIVE)) {
     return { defaultPythonVersion };
   }
 
   for (const candidate of PYTHON_PROBE_CANDIDATES) {
-    const version = await tryGetVersion(exec, candidate, cwd);
+    const version = await tryGetVersion(exec, candidate, cwd, signal);
     if (version && isVersionInRange(version, PYTHON_MIN_INCLUSIVE, PYTHON_MAX_EXCLUSIVE)) {
       return {
         // Preserve whatever the ACTUAL default was (even out-of-range) —
@@ -338,6 +361,7 @@ async function getDefaultPythonVersion(
   exec: ExecLookup,
   pipxPath: string,
   cwd: string,
+  signal: AbortSignal | undefined,
 ): Promise<string | undefined> {
   try {
     const raw = await runLoginShell(
@@ -345,23 +369,38 @@ async function getDefaultPythonVersion(
       pipxPath,
       ['environment', '--value', 'PIPX_DEFAULT_PYTHON'],
       cwd,
+      signal,
     );
     const pythonBin = lastNonEmptyLine(raw);
     if (!pythonBin) throw new Error('empty PIPX_DEFAULT_PYTHON value');
-    const version = await tryGetVersion(exec, pythonBin, cwd);
+    const version = await tryGetVersion(exec, pythonBin, cwd, signal);
     if (!version) throw new Error(`'${pythonBin} --version' did not resolve`);
     return version;
-  } catch {
-    return tryGetVersion(exec, 'python3', cwd);
+  } catch (err) {
+    // TC-5/AU-28: an abort must propagate out of this fallback try/catch too
+    // — otherwise Cancel would be silently swallowed into "fall back to
+    // plain python3", masking the cancellation as an ordinary probe result.
+    if (signal?.aborted) throw err;
+    return tryGetVersion(exec, 'python3', cwd, signal);
   }
 }
 
-async function tryGetVersion(exec: ExecLookup, command: string, cwd: string): Promise<string | undefined> {
+async function tryGetVersion(
+  exec: ExecLookup,
+  command: string,
+  cwd: string,
+  signal: AbortSignal | undefined,
+): Promise<string | undefined> {
   try {
-    const raw = await runLoginShell(exec, command, ['--version'], cwd);
+    const raw = await runLoginShell(exec, command, ['--version'], cwd, signal);
     const line = lastNonEmptyLine(raw);
     return line ? stripPythonPrefix(line) : undefined;
-  } catch {
+  } catch (err) {
+    // TC-5/AU-28: an abort must propagate — this function's "best-effort,
+    // undefined on any failure" contract is for a candidate genuinely not
+    // being present, not for Cancel being silently reinterpreted as "keep
+    // probing the next candidate".
+    if (signal?.aborted) throw err;
     return undefined;
   }
 }
@@ -379,14 +418,19 @@ async function runLoginShell(
   command: string,
   args: string[],
   cwd: string,
+  signal: AbortSignal | undefined,
   options?: LoginShellSpawnOptions,
 ): Promise<string> {
   const spec = loginShellSpawn(command, args, undefined, options);
   try {
-    return await exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd });
+    return await exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd, signal });
   } catch (err) {
+    // TC-5/AU-28: an abort takes priority over the timeout classifier (see
+    // {@link findPipxPath}'s identical guard) — propagate immediately
+    // instead of retrying into an already-aborted signal.
+    if (signal?.aborted) throw err;
     if (!isExecTimeout(err)) throw err;
-    return exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd });
+    return exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd, signal });
   }
 }
 

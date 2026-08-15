@@ -33,6 +33,7 @@ import type { ExecLookup } from './runtime/resolveHermes';
 vi.mock('vscode', () => ({}));
 
 import {
+  createExecLookup,
   createLocateLlamaServer,
   createModelStoreLstatIo,
   createModelStorePresenceIo,
@@ -189,6 +190,28 @@ describe("T6: createLocateLlamaServer — win32 ⇒ probe-timeout (wire 'unknown
     await expect(locate(abort.signal)).rejects.toMatchObject({ name: 'AbortError' });
     expect(execCalls).toBe(0);
   });
+});
+
+// --- TC-5 (AU-28): createExecLookup — the production ExecLookup binding -------
+
+describe('createExecLookup — TC-5 (AU-28): AbortSignal actually kills the in-flight execFile child', () => {
+  // Global Constraint 4 (no mock-theater): pinned against a REAL `execFile`
+  // abort (Node child_process docs: the `signal` option lets an
+  // AbortController kill the child, rejecting with an AbortError) — this is
+  // the ACTUAL production `ExecLookup` bound into `locatePipx`/
+  // `discoverHermes`/`createLocateLlamaServer` via `createSetupControllerDeps`.
+  it('aborting mid-probe rejects promptly instead of letting the child run to completion (fails at HEAD: resolves after the full sleep)', async () => {
+    const exec = createExecLookup();
+    const abort = new AbortController();
+    const promise = exec('node', ['-e', 'setTimeout(() => {}, 2000)'], {
+      timeoutMs: 10_000,
+      cwd: tmpdir(),
+      signal: abort.signal,
+    });
+    setTimeout(() => abort.abort(), 50);
+
+    await expect(promise).rejects.toThrow();
+  }, 3_000);
 });
 
 // --- T6 (beta.6, T4→T6 SC-A-3): the modelStore fs bindings --------------------

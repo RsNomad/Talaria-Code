@@ -19,6 +19,9 @@ interface ExecLookupCallLine {
   command: string;
   cmdline: string;
   timeoutMs: number;
+  /** TC-5 (AU-28): the `AbortSignal` (if any) `locateLlamaServer` threaded
+   *  into THIS specific exec() call's opts — not just checked between steps. */
+  signal: AbortSignal | undefined;
 }
 
 function scriptedExec(
@@ -27,7 +30,7 @@ function scriptedExec(
   const calls: ExecLookupCallLine[] = [];
   const exec: ExecLookup = async (command, args, opts) => {
     const cmdline = args[2] ?? `${command} ${args.join(' ')}`;
-    calls.push({ command, cmdline, timeoutMs: opts.timeoutMs });
+    calls.push({ command, cmdline, timeoutMs: opts.timeoutMs, signal: opts.signal });
     for (const rule of rules) {
       if (rule.match.test(cmdline)) return rule.respond();
     }
@@ -317,6 +320,62 @@ describe('locateLlamaServer — optional AbortSignal (doc §2.4 line 308 signatu
       path: '/usr/local/bin/llama-server',
       version: 'version: b4570 (a1b2c3d)',
     });
+  });
+});
+
+describe('locateLlamaServer — TC-5 (AU-28): AbortSignal threaded into every exec() call, not just checked between steps', () => {
+  it('an aborted signal rejects an in-flight probe promptly, not by waiting for the exec to resolve (fails at HEAD: hangs — exec never sees the signal)', async () => {
+    const controller = new AbortController();
+    // A never-resolving exec that ONLY settles if it was handed the signal —
+    // exactly the AU-28 mechanism: at HEAD, `opts.signal` is never populated,
+    // so this promise would hang forever (bounded by the test's own timeout
+    // below) instead of rejecting shortly after abort() fires.
+    const exec: ExecLookup = (_command, _args, opts) =>
+      new Promise<string>((_resolve, reject) => {
+        opts.signal?.addEventListener(
+          'abort',
+          () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+          { once: true },
+        );
+      });
+
+    const promise = locateLlamaServer(exec, controller.signal);
+    setTimeout(() => controller.abort(), 20);
+
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+  }, 1_500);
+
+  it('passes the caller signal into every exec() call across the main pipeline (step 0 + version probe)', async () => {
+    const controller = new AbortController();
+    const { exec, calls } = scriptedExec([FOUND, VERSION_HIT]);
+
+    await locateLlamaServer(exec, controller.signal);
+
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.signal).toBe(controller.signal);
+  });
+
+  it('passes the caller signal into the absolute-candidate fallback probes too (double-timeout path)', async () => {
+    const controller = new AbortController();
+    const { exec, calls } = scriptedExec([
+      DOUBLE_TIMEOUT,
+      HOME_CANDIDATE_MISS,
+      USR_LOCAL_BIN_CANDIDATE_HIT,
+    ]);
+
+    await locateLlamaServer(exec, controller.signal);
+
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.signal).toBe(controller.signal);
+  });
+
+  it('a signal-less call still omits opts.signal everywhere (back-compat: unchanged for non-cancelling callers)', async () => {
+    const { exec, calls } = scriptedExec([FOUND, VERSION_HIT]);
+
+    await locateLlamaServer(exec);
+
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.signal).toBeUndefined();
   });
 });
 

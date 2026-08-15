@@ -149,16 +149,33 @@ const HERMES_LOOKUP_TIMEOUT_MS = 10_000;
  * cwd-dependent logic in the user's own profile scripts (not just direnv)
  * could influence PATH discovery. Pinning a non-workspace cwd converts that
  * happenstance guarantee into a pinned one.
+ *
+ * `signal` (TC-5/AU-28): OPTIONAL — when a caller passes one (e.g.
+ * `pipxLocator.ts`/`llamaCppLocator.ts` threading `locatePipx`/
+ * `locateLlamaServer`'s own `AbortSignal` parameter down into every exec()
+ * call, not just checking it BETWEEN steps), the default implementation
+ * below hands it straight to Node `execFile`'s own `signal` option, which
+ * kills the in-flight child and rejects with an `AbortError` (Node
+ * child_process docs: "the signal option allows aborting the child process
+ * using an AbortController... results in an AbortError"). Before this field
+ * existed, Cancel could only ever be observed BETWEEN steps — an in-flight
+ * 5-10s login-shell probe kept running to its own timeout regardless.
  */
 export type ExecLookup = (
   command: string,
   args: string[],
-  opts: { timeoutMs: number; cwd: string },
+  opts: { timeoutMs: number; cwd: string; signal?: AbortSignal },
 ) => Promise<string>;
 
-const defaultExecLookup: ExecLookup = (command, args, opts) =>
+/** Exported (TC-5/AU-28): the real, `execFile`-backed default — tested
+ *  directly against a REAL `execFile` abort (Global Constraint 4: the
+ *  `ExecLookup` seam carries no error shape of its own, so the actual signal
+ *  wiring is pinned against Node's real behavior, not a hand-rolled fixture —
+ *  same discipline `pipxLocator.test.ts`'s real-timeout `isExecTimeout` test
+ *  already uses). */
+export const defaultExecLookup: ExecLookup = (command, args, opts) =>
   new Promise<string>((resolve, reject) => {
-    execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd }, (err, stdout) => {
+    execFile(command, args, { timeout: opts.timeoutMs, cwd: opts.cwd, signal: opts.signal }, (err, stdout) => {
       if (err) reject(err);
       else resolve(stdout);
     });
