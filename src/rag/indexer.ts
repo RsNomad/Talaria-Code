@@ -893,6 +893,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
               delete manifest[key];
             }
           }
+          // AU-23 re-review (TA-5 completion) / INV-5: the loop above awaits
+          // `store.deleteByPath` per swept key — `dispose()` can fire during
+          // any one of those awaits, same hazard as every other await in
+          // this function. The entry guard above only covers what precedes
+          // the loop; re-check once more, after it, right before the write.
+          if (disposed) return;
           await writeManifest(manifest);
           return;
         }
@@ -905,6 +911,10 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // already stored (mirrors build()'s self-heal purge pass).
           await store.deleteByPath(relPath);
           delete manifest[relPath];
+          // AU-23 re-review (TA-5 completion) / INV-5: the entry guard above
+          // covers what precedes `store.deleteByPath`, not the await itself
+          // — re-check once more before the write.
+          if (disposed) return;
           await writeManifest(manifest);
           return;
         }
@@ -941,6 +951,10 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           if (disposed) return;
           await store.deleteByPath(relPath);
           delete manifest[relPath];
+          // AU-23 re-review (TA-5 completion) / INV-5: the entry guard above
+          // covers what precedes `store.deleteByPath`, not the await itself
+          // — re-check once more before the write.
+          if (disposed) return;
           await writeManifest(manifest);
           return;
         }

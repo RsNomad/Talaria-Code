@@ -1450,6 +1450,12 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
     // the store is closed, and must not leak into any other test.
     closeMock.mockImplementation(async () => {});
     upsertMock.mockImplementation(async () => {});
+    // AU-23 re-review remediation (below): the 3 new RED tests each install
+    // a per-path dispose()-triggering override on deleteByPathMock — reset
+    // to the plain default here so it never leaks into an earlier-declared
+    // test in this block (declaration order, not source order, is what
+    // matters once vitest runs them).
+    deleteByPathMock.mockImplementation(async () => {});
     fsWatcherListeners.create.length = 0;
     fsWatcherListeners.change.length = 0;
     fsWatcherListeners.delete.length = 0;
@@ -1459,6 +1465,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
     embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
     closeMock.mockImplementation(async () => {});
     upsertMock.mockImplementation(async () => {});
+    deleteByPathMock.mockImplementation(async () => {});
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
@@ -1645,4 +1652,160 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
     expect(existsSync(path.join(indexDir, 'manifest.json'))).toBe(false);
     expect(existsSync(path.join(indexDir, 'manifest.meta.json'))).toBe(false);
   });
+
+  // AU-23 re-review: a systematic sweep of every manifest-write site in
+  // `handleFsEvent` found 3 MORE unguarded post-await `writeManifest` calls
+  // beyond the ones the two passes above already closed. Each branch's own
+  // `if (disposed) return;` guards its ENTRY (covering the awaits that
+  // precede the branch, e.g. `readManifest`/`loadIgnoreFilter`) but not the
+  // awaited `store.deleteByPath` the branch itself performs — dispose()
+  // racing THAT await still reaches an unconditional `writeManifest` right
+  // after. All three tests below fire dispose() from inside the mocked
+  // `deleteByPathMock`, i.e. while that specific await is in flight, then
+  // assert the on-disk manifest is byte-for-byte unchanged (the write never
+  // happened) rather than a mutated/stripped version of it.
+  it('RED: dispose() firing during the delete-branch directory sweep leaves the manifest unchanged', async () => {
+    await fs.mkdir(indexDir, { recursive: true });
+    // Two children under the deleted directory so the sweep loop
+    // (indexer.ts ~888-895) genuinely iterates more than once — a directory
+    // delete arrives as ONE watcher event; the sweep is what finds and
+    // purges its indexed children by manifest-key prefix.
+    const seedManifest = { 'dir/a.txt': 'hash-a', 'dir/b.txt': 'hash-b' };
+    await fs.writeFile(path.join(indexDir, 'manifest.json'), JSON.stringify(seedManifest), 'utf8');
+
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    // Fire dispose() from INSIDE the sweep loop's own awaited
+    // `store.deleteByPath('dir/a.txt')` — the loop's first iteration, not
+    // the entry guard's `readManifest`/first `deleteByPath('dir')` the
+    // earlier TA-5 pass already covers (indexer.ts:880). The loop has no
+    // per-iteration `disposed` check by design (deleteByPath no-ops on a
+    // closed store — `LanceDBStore.ts:362-364`), so it keeps running; the
+    // fix under test is the WRITE after it.
+    deleteByPathMock.mockImplementation(async (p: string) => {
+      if (p === 'dir/a.txt') indexer.dispose();
+    });
+
+    const onDelete = fsWatcherListeners.delete[0]!;
+    onDelete({ fsPath: path.join(workspaceRoot, 'dir') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Fails at HEAD: the loop purges both children from the in-memory
+    // manifest object regardless of `disposed`, then `writeManifest` at
+    // indexer.ts:896 runs unconditionally, persisting the now-empty
+    // manifest to disk even though dispose() fired mid-sweep.
+    expect(deleteByPathMock.mock.calls.map(([p]) => p)).toEqual(
+      expect.arrayContaining(['dir/a.txt', 'dir/b.txt']),
+    );
+    const manifestAfter = await readManifest();
+    expect(manifestAfter).toEqual(seedManifest);
+
+    disposable.dispose();
+  });
+
+  it("RED: dispose() firing during the secret-path branch's store.deleteByPath leaves the manifest unchanged", async () => {
+    await fs.mkdir(indexDir, { recursive: true });
+    const seedManifest = { '.env': 'legacy-hash' };
+    await fs.writeFile(path.join(indexDir, 'manifest.json'), JSON.stringify(seedManifest), 'utf8');
+    await writeWorkspaceFile('.env', 'SECRET=shhh\n');
+
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    // Unlike the existing Med test above (which disposes during the
+    // BRANCH-ENTRY `readManifest` read, before indexer.ts:902's guard even
+    // runs), this fires INSIDE the branch's own awaited
+    // `store.deleteByPath('.env')` — the gap indexer.ts:902's guard does not
+    // cover, since it only re-checks once, on entry.
+    deleteByPathMock.mockImplementation(async (p: string) => {
+      if (p === '.env') indexer.dispose();
+    });
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, '.env') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Fails at HEAD: `writeManifest` at indexer.ts:908 runs unconditionally
+    // after the awaited deleteByPath, stripping `.env` from the on-disk
+    // manifest even though dispose() fired mid-await.
+    const manifestAfter = await readManifest();
+    expect(manifestAfter).toEqual(seedManifest);
+
+    disposable.dispose();
+  });
+
+  it("RED: dispose() firing during the unconfinable-path branch's store.deleteByPath (lstat ENOENT, e.g. a vanished file) leaves the manifest unchanged", async () => {
+    // A cross-platform way to reach the SAME `confined === null` branch as
+    // the symlink test below, without needing symlink-creation privilege on
+    // this dev box: `fs.lstat` throwing is caught and fails closed to
+    // `confined = null` too (indexer.ts:928-936 — "lstat ENOENT (vanished
+    // between event and check) also lands here"). This is the variant that
+    // actually RUNS (and is watched fail -> pass) on a symlink-privilege-less
+    // box; the `it.skipIf(!canLinkFile)` test right below proves the real
+    // symlink trigger on a capable one (e.g. the Fedora target).
+    await fs.mkdir(indexDir, { recursive: true });
+    const seedManifest = { 'ghost.txt': 'legacy-hash' };
+    await fs.writeFile(path.join(indexDir, 'manifest.json'), JSON.stringify(seedManifest), 'utf8');
+    // Deliberately never written to disk — the watcher fires a change event
+    // for a path that no longer (or never did) exist under workspaceRoot.
+
+    const indexer = makeIndexer();
+    const disposable = indexer.watch();
+
+    deleteByPathMock.mockImplementation(async (p: string) => {
+      if (p === 'ghost.txt') indexer.dispose();
+    });
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'ghost.txt') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Fails at HEAD: `writeManifest` at indexer.ts:944 runs unconditionally
+    // after the awaited deleteByPath.
+    const manifestAfter = await readManifest();
+    expect(manifestAfter).toEqual(seedManifest);
+
+    disposable.dispose();
+  });
+
+  it.skipIf(!canLinkFile)(
+    "RED: dispose() firing during the unconfinable/symlink branch's store.deleteByPath leaves the manifest unchanged",
+    async () => {
+      const outside = mkdtempSync(path.join(os.tmpdir(), 'talaria-ta5-outside-'));
+      try {
+        await fs.writeFile(path.join(outside, 'target.txt'), 'content behind a leaf symlink.\n');
+        symlinkSync(path.join(outside, 'target.txt'), path.join(workspaceRoot, 'link.txt'), 'file');
+
+        await fs.mkdir(indexDir, { recursive: true });
+        const seedManifest = { 'link.txt': 'legacy-hash' };
+        await fs.writeFile(path.join(indexDir, 'manifest.json'), JSON.stringify(seedManifest), 'utf8');
+
+        const indexer = makeIndexer();
+        const disposable = indexer.watch();
+
+        // `leaf.isSymbolicLink()` makes `confined` null (indexer.ts:930-936)
+        // without ever awaiting `resolveWithinWorkspaceReal` — the awaited
+        // call this branch's own `store.deleteByPath` races dispose()
+        // against is the one at indexer.ts:942, the same gap as the two
+        // tests above.
+        deleteByPathMock.mockImplementation(async (p: string) => {
+          if (p === 'link.txt') indexer.dispose();
+        });
+
+        const onChange = fsWatcherListeners.change[0]!;
+        onChange({ fsPath: path.join(workspaceRoot, 'link.txt') });
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        // Fails at HEAD: `writeManifest` at indexer.ts:944 runs
+        // unconditionally after the awaited deleteByPath.
+        const manifestAfter = await readManifest();
+        expect(manifestAfter).toEqual(seedManifest);
+
+        disposable.dispose();
+      } finally {
+        rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
 });
