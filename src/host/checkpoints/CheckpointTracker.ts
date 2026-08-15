@@ -650,6 +650,16 @@ export class CheckpointTracker {
       this.markLocalizeNeeded(); // the fresh tree may borrow alternate objects
     }
 
+    // AU-4/INV-12: ONE batched mode read for the whole restore (not per-file
+    // — see {@link readTreeModes}'s doc for the rejected alternative), used
+    // below to reapply the executable bit `git show` (content-only) can't
+    // carry. Skipped entirely when there is nothing to WRITE (an all-delete
+    // or empty diff — the common no-op-restore case): a deletion never reads
+    // a mode, so there is no reason to pay for the extra `git` child.
+    const targetModes = changes.some((c) => c.status !== 'deleted')
+      ? await this.readTreeModes(target.tree)
+      : new Map<string, string>();
+
     const changedPaths: string[] = [];
     const skippedPaths: string[] = [];
     for (const change of changes) {
@@ -699,6 +709,22 @@ export class CheckpointTracker {
             this.shadowOpts(),
           );
           await fs.writeFile(absPath, content);
+          // AU-4/INV-12: `git show` above returned CONTENT ONLY, so a plain
+          // writeFile always lands at the platform default (non-executable)
+          // — reapply the bit from the batched `ls-tree` read. Only 100755
+          // needs correcting: 100644 needs no action, and 120000/160000
+          // (symlink/gitlink) are left alone on purpose — `writeTreeFromWorktree`
+          // stages via `git add -f` over real files only, so neither mode can
+          // occur in a tree this class wrote; if one somehow did, `git show`
+          // already read it as a plain content blob (not followed as a link —
+          // that hardening is AU-14/TD-2's job, not this fix's), so chmod-ing
+          // it to 0o755 would be actively wrong. A chmod failure here rides
+          // the SAME per-path catch below as the write — one disclosure
+          // channel (`skippedPaths`) for both reasons, per the T-C3 comment
+          // above.
+          if (targetModes.get(change.path) === '100755') {
+            await fs.chmod(absPath, 0o755);
+          }
         }
         changedPaths.push(change.path);
       } catch (err: unknown) {
@@ -1225,6 +1251,38 @@ export class CheckpointTracker {
   }
 
   /**
+   * AU-4/INV-12: batched executable-bit read for a restore. `git show
+   * <tree>:<path>` (the restore write path, below) returns blob CONTENT
+   * ONLY — the mode lives on the TREE ENTRY, not the blob — so this is the
+   * one place `restoreInternal` learns what each restored path's mode
+   * should be. `git ls-tree -r -z <tree>` emits one NUL-terminated record
+   * per leaf: `<mode> SP <type> SP <sha>\t<path>` (mode is always the fixed
+   * 6-digit git constant — `100644` regular, `100755` executable, `120000`
+   * symlink, `160000` gitlink — verified against a real git tree; `-z`
+   * disables path C-quoting exactly like {@link diffTrees}'s own `-z`, so a
+   * non-ASCII/control-char path round-trips intact here too). ONE
+   * subprocess for the whole restore, run before the per-path loop, keeps
+   * the git-child count unchanged from before this fix (rejected
+   * alternative: a `ls-tree` per changed file).
+   */
+  private async readTreeModes(tree: string): Promise<Map<string, string>> {
+    const result = await runGit(['ls-tree', '-r', '-z', tree], this.shadowOpts());
+    const modes = new Map<string, string>();
+    for (const record of result.stdout.split('\0')) {
+      if (record.length === 0) continue;
+      // Exactly one tab separates `<mode> <type> <sha>` from `<path>` — take
+      // the FIRST tab only, since `-z` leaves the path itself un-escaped and
+      // it may (rarely) contain further raw tab bytes of its own.
+      const tab = record.indexOf('\t');
+      if (tab === -1) continue;
+      const mode = record.slice(0, tab).split(' ')[0];
+      const filePath = record.slice(tab + 1);
+      if (mode) modes.set(filePath, mode);
+    }
+    return modes;
+  }
+
+  /**
    * Recursively enumerates workspace files, applying the shared ignore filter +
    * size cutoff, under a WALL-CLOCK DEADLINE (I-1 / arch A#1).
    *
@@ -1465,8 +1523,21 @@ function formatAge(timestampIso: string): string {
  * Parse `git diff-tree --name-status -z` output. The `-z` stream is a flat run
  * of NUL-terminated tokens: `STATUS\0PATH\0` per change, except renames/copies
  * (`R###`/`C###`) which carry `STATUS\0OLDPATH\0NEWPATH\0`. Rename detection is
- * NOT enabled here, but we parse it defensively so a future `-M` can't corrupt
- * the walk.
+ * NOT enabled here (the {@link CheckpointTracker.diffTrees} call passes no
+ * `-M`/`-C`), but we parse it defensively so a future `-M` can't corrupt the
+ * walk (i.e. misinterpret the 3-token record as two 2-token ones).
+ *
+ * AU-36:CP-rename landmine (deferred — dead code today, no live call site
+ * passes `-M`/`-C`): the R/C branch below records ONLY the NEW path as
+ * `modified` and silently drops OLDPATH — no `deleted` entry is ever emitted
+ * for it. That is correct AS LONG AS rename detection stays off (git's own
+ * `--name-status`, undetected, already reports a rename as a plain D+A pair
+ * that this function handles fine). But the moment a future change enables
+ * `-M`/`-C` on the `diff-tree` call, a genuine rename would restore the
+ * content at NEWPATH while leaving OLDPATH's file untouched on disk — a
+ * stale duplicate `restoreInternal` never deletes, silently corrupting the
+ * restore. Fix-on-enable: also push `{ path: OLDPATH, status: 'deleted' }`
+ * for the R/C case.
  */
 function parseNameStatusZ(output: string): CheckpointDiffEntry[] {
   const tokens = output.split('\0');

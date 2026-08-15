@@ -375,6 +375,123 @@ describe('CheckpointTracker', () => {
     });
   });
 
+  // AU-4 / INV-12: `git show <tree>:<path>` returns CONTENT ONLY — the
+  // executable bit lives on the TREE ENTRY, not the blob — so a restore that
+  // only ever does `fs.writeFile(absPath, content)` always lands at the
+  // platform default (non-executable), even for a path snapshotted at 0o755.
+  // Real chmod bits are meaningless on non-POSIX filesystems (Windows dev
+  // boxes), so this is gated to run only where the target platform (Fedora/
+  // Linux) actually applies — mirrors this suite's own CAN_SYMLINK/
+  // CAN_NEWLINE_FILENAME capability-gated idiom above.
+  const posixModeIt = it.skipIf(process.platform === 'win32');
+
+  describe('restore — AU-4/INV-12: executable bit', () => {
+    posixModeIt(
+      'restores the owner-exec bit for a path snapshotted at 0o755, and leaves a 0o644 path non-executable',
+      async () => {
+        await writeFile('deploy.sh', '#!/bin/sh\necho hi\n');
+        await fs.chmod(path.join(workspaceRoot, 'deploy.sh'), 0o755);
+        await writeFile('readme.txt', 'hello');
+        const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+        await tracker.init();
+        const ckpt1 = (await tracker.snapshot(1, 'first'))!;
+
+        // Move the worktree forward: drop deploy.sh entirely (so restoring
+        // ckpt1 must materialize it FRESH — the exact `fs.writeFile` path
+        // that loses the mode) and change readme.txt's content (so it is
+        // also rewritten by the restore, as a non-executable control).
+        await fs.rm(path.join(workspaceRoot, 'deploy.sh'));
+        await writeFile('readme.txt', 'goodbye');
+        await tracker.snapshot(2, 'second');
+
+        const result = await tracker.restore(ckpt1.id);
+
+        expect(result.restored).toBe(true);
+        const deployMode = (await fs.stat(path.join(workspaceRoot, 'deploy.sh'))).mode;
+        const readmeMode = (await fs.stat(path.join(workspaceRoot, 'readme.txt'))).mode;
+        // Owner/group/other exec bit restored for the 0o755 snapshot.
+        expect(deployMode & 0o111).not.toBe(0);
+        // A path snapshotted at 0o644 stays non-executable.
+        expect(readmeMode & 0o111).toBe(0);
+      },
+    );
+
+    posixModeIt(
+      'redo() reuses restoreInternal, so the executable bit is reapplied on the redo direction too',
+      async () => {
+        await writeFile('deploy.sh', 'v1 (not executable yet)');
+        const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+        await tracker.init();
+        const before = (await tracker.snapshot(1, 'before'))!;
+
+        await writeFile('deploy.sh', '#!/bin/sh\necho hi\n');
+        await fs.chmod(path.join(workspaceRoot, 'deploy.sh'), 0o755);
+        await tracker.snapshot(2, 'after'); // captures the 0o755 mode
+
+        // Undo back to the non-executable version — establishes the redo pointer.
+        const undone = await tracker.restore(before.id);
+        expect(undone.restored).toBe(true);
+
+        // Redo forward: restoreInternal must reapply the 0o755 bit exactly
+        // like a plain restore() would — same code path, same fix.
+        const redone = await tracker.redo();
+        expect(redone.restored).toBe(true);
+        const deployMode = (await fs.stat(path.join(workspaceRoot, 'deploy.sh'))).mode;
+        expect(deployMode & 0o111).not.toBe(0);
+      },
+    );
+
+    // Platform-independent companion to the two tests above: those prove the
+    // OS-visible OUTCOME (skipped on win32, where `fs.chmod` cannot represent
+    // the exec bit at all — verified: Node's fs.chmod is a no-op for the exec
+    // bits on Windows, so the assertion would be meaningless there either
+    // way). This test instead proves the CALL — that restoreInternal reads
+    // the target's real `git ls-tree` mode and invokes `fs.chmod(path, 0o755)`
+    // only for a 100755 entry — without depending on the OS honoring it. Mode
+    // is forced onto the shadow repo's tree via `update-index --chmod=+x`
+    // (which sets the git-tracked mode bit directly, independent of the real
+    // FS attribute) with `core.fileMode=false` set on the shadow repo so the
+    // tracker's own subsequent `git add -f` (inside snapshot(2)) does not
+    // re-derive the mode from the OS and clobber the forced bit — runs
+    // identically on every platform, including this suite's Windows dev box.
+    it('applies fs.chmod(path, 0o755) only for a target whose git tree entry mode is 100755', async () => {
+      await writeFile('deploy.sh', 'content-v1');
+      await writeFile('readme.txt', 'hello');
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+      await tracker.init();
+      await tracker.snapshot(1, 'stage'); // stages both paths into the warm index first
+
+      execFileSync('git', ['--git-dir', tracker.shadowGitDir, 'config', 'core.fileMode', 'false']);
+      execFileSync('git', ['--git-dir', tracker.shadowGitDir, 'update-index', '--chmod=+x', 'deploy.sh'], {
+        cwd: workspaceRoot,
+      });
+      const c2 = (await tracker.snapshot(2, 'mode-755'))!; // same content, tree now records 100755 for deploy.sh
+
+      // Drop BOTH files from the live worktree so restoring c2 must
+      // materialize them FRESH (an unambiguous 'added' status) — the exact
+      // `fs.writeFile` path that loses the mode — independent of any
+      // git-index mode residue left by the forced-chmod staging above.
+      const deployPath = path.join(workspaceRoot, 'deploy.sh');
+      const readmePath = path.join(workspaceRoot, 'readme.txt');
+      await fs.rm(deployPath);
+      await fs.rm(readmePath);
+
+      const realChmod = fs.chmod.bind(fs);
+      const chmodSpy = vi.spyOn(fs, 'chmod').mockImplementation(
+        (...args: Parameters<typeof fs.chmod>) => realChmod(...args),
+      );
+
+      try {
+        const result = await tracker.restore(c2.id, { force: true });
+        expect(result.restored).toBe(true);
+        expect(chmodSpy).toHaveBeenCalledWith(deployPath, 0o755);
+        expect(chmodSpy).not.toHaveBeenCalledWith(readmePath, expect.anything());
+      } finally {
+        chmodSpy.mockRestore();
+      }
+    });
+  });
+
   describe('restore — P4 (C5, corr-M3): baseline persist is disk-first', () => {
     it('a failed baseline persist leaves the cache consistent with DISK — the next restore still dirty-guards', async () => {
       const tracker = new CheckpointTracker(storageDir, workspaceRoot);
@@ -1205,6 +1322,18 @@ describe('CheckpointTracker', () => {
       const res = await tracker.restore(ckpt1.id, { force: true });
       expect(res.restored).toBe(true);
       await expect(readFile('foo.txt')).resolves.toBe('V1-BORROWED-AUTO');
+      // AU-4 fix note: this `restore()` re-parents the pre-restore worktree as
+      // a fresh anchor row (P1), which re-arms the `localizeDebounceMs: 30`
+      // timer via `markLocalizeNeeded()` — and the AU-4 fix's own added
+      // `ls-tree` read (plus the per-path `git show`) is enough real subprocess
+      // wall-clock time for that 30ms timer to FIRE before `restore()` even
+      // returns, queuing an un-awaited background `repack` that plain
+      // `dispose()` (cancel-if-still-PENDING) cannot stop once it has already
+      // fired. Explicitly draining it here — same as this file's OTHER
+      // localization tests already do — avoids that orphaned repack racing
+      // this test's own `afterEach` cleanup of `workspaceRoot` (an
+      // intermittent Windows EBUSY on rmdir; not a correctness assertion here).
+      await tracker.flushLocalization();
       tracker.dispose();
     });
   });
