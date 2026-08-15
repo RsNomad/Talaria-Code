@@ -858,7 +858,19 @@ export class CheckpointTracker {
     return run;
   }
 
-  /** Run `fn` while holding the cross-process advisory lock; always releases. */
+  /**
+   * Run `fn` while holding the cross-process advisory lock; always releases.
+   *
+   * NOT re-entrant: `acquireLock` is a plain file-lock with no owner-thread
+   * awareness, so a caller that already holds it and calls `withLock` again
+   * would poll for its OWN release and eventually throw
+   * {@link CheckpointLockTimeoutError}. Every current call site
+   * (`snapshot`/`restore`/`redo`/`redoAll`/`diff`/`cleanup`/
+   * `flushLocalization`, plus `initInternal`'s creation branch — AU-25/TD-3)
+   * awaits `init()` to fully resolve BEFORE calling `withLock`, and none
+   * calls `init()`/`withLock` from inside another `withLock` callback — so
+   * no nesting occurs today. Preserve that ordering in any new call site.
+   */
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     const handle = await acquireLock(this.shadowDir, {
       staleMs: this.lockStaleMs,
@@ -930,16 +942,41 @@ export class CheckpointTracker {
     }, this.localizeDebounceMs);
   }
 
+  /**
+   * AU-25/TD-3: `init()`'s in-process promise memo ({@link init}) only
+   * serializes calls WITHIN one `CheckpointTracker` instance. Two VS Code
+   * windows (two separate instances/processes) cold-opening the SAME fresh
+   * workspace root both reach this point with the shadow repo not yet
+   * created, and without a cross-process guard would race `git init` + the
+   * four `git config` calls against each other — the loser can lose git's
+   * own `config.lock` and throw (self-healing, since {@link init} clears the
+   * memo on rejection so a retry succeeds, but it contradicts the
+   * cross-process guarantee `withLock` gives every mutator below).
+   *
+   * Fix: take the SAME cross-process lock around ONLY the creation branch,
+   * with a double-check re-read of `pathExists(gitDir)` AFTER acquiring it —
+   * the loser wakes up, sees the winner already created `.git`, and no-ops
+   * instead of re-running `git init`/`git config`. `syncAlternates`/
+   * `loadIndex` stay OUTSIDE the lock (read-mostly). This cannot nest inside
+   * an already-held lock: every mutator below (`snapshot`/`restore`/`redo`/
+   * `redoAll`/`diff`/`cleanup`/`flushLocalization`) awaits `init()` BEFORE
+   * calling `withLock`, never the reverse (verified by inspection — see the
+   * re-entrancy note on {@link withLock}), so `initInternal` never runs while
+   * this instance already holds the lock.
+   */
   private async initInternal(): Promise<void> {
     await fs.mkdir(this.shadowDir, { recursive: true });
     await this.preflightGitAvailable();
 
     if (!(await pathExists(this.gitDir))) {
-      await runGit(['init', '--quiet'], this.shadowOpts());
-      await runGit(['config', 'user.name', 'Hermes Checkpoints'], this.shadowOpts());
-      await runGit(['config', 'user.email', 'checkpoints@hermes.local'], this.shadowOpts());
-      await runGit(['config', 'commit.gpgsign', 'false'], this.shadowOpts());
-      await runGit(['config', 'gc.auto', '0'], this.shadowOpts()); // we gc explicitly via cleanup()
+      await this.withLock(async () => {
+        if (await pathExists(this.gitDir)) return; // another window already won the race
+        await runGit(['init', '--quiet'], this.shadowOpts());
+        await runGit(['config', 'user.name', 'Hermes Checkpoints'], this.shadowOpts());
+        await runGit(['config', 'user.email', 'checkpoints@hermes.local'], this.shadowOpts());
+        await runGit(['config', 'commit.gpgsign', 'false'], this.shadowOpts());
+        await runGit(['config', 'gc.auto', '0'], this.shadowOpts()); // we gc explicitly via cleanup()
+      });
     }
 
     await this.syncAlternates();

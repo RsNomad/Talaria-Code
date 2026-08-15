@@ -196,6 +196,94 @@ describe('CheckpointTracker', () => {
     });
   });
 
+  describe('init — AU-25/TD-3: cross-process shadow lock serializes creation', () => {
+    afterEach(() => {
+      __setSpawnForTests(null);
+    });
+
+    it(
+      'two concurrent init() calls on the same fresh root (simulating two windows cold-opening it) never both run git init/config — the loser double-checks under the lock and no-ops',
+      async () => {
+        const trackerA = new CheckpointTracker(storageDir, workspaceRoot);
+        const trackerB = new CheckpointTracker(storageDir, workspaceRoot);
+        // Sanity: both "windows" share the same on-disk shadow repo (same
+        // storageDir+workspaceRoot hash) — the whole premise of the race.
+        const gitDirPath = trackerA.shadowGitDir;
+        expect(trackerB.shadowGitDir).toBe(gitDirPath);
+
+        // Force BOTH trackers' `pathExists(gitDir)` check to observe
+        // "not yet initialized" AT THE SAME INSTANT — the exact TOCTOU
+        // window AU-25 describes (two windows both reading "no .git yet"
+        // before either has created it). Without this forced simultaneity
+        // one tracker could race ahead and fully finish before the other
+        // even checks, masking the bug.
+        const realAccess = fs.access.bind(fs);
+        let accessCount = 0;
+        let releaseFirst: (() => void) | undefined;
+        const accessSpy = vi.spyOn(fs, 'access').mockImplementation(async (p, ...rest) => {
+          if (String(p) !== gitDirPath) {
+            return realAccess(p as never, ...(rest as unknown as never[]));
+          }
+          accessCount++;
+          if (accessCount === 1) {
+            await new Promise<void>((resolve) => {
+              releaseFirst = resolve;
+            });
+          } else {
+            releaseFirst?.();
+          }
+          return realAccess(p as never, ...(rest as unknown as never[]));
+        });
+
+        // Detect any overlap between concurrent `git init`/`git config`
+        // invocations. On overlap, fail that spawn deterministically —
+        // mirroring the REAL `config.lock` collision AU-25 describes —
+        // instead of leaving the outcome to OS-level scheduling luck.
+        const initCalls: string[] = [];
+        let inFlight = 0;
+        let overlapDetected = false;
+        __setSpawnForTests(
+          ((command: string, args: string[], options: unknown) => {
+            const cmd = Array.isArray(args) ? String(args[0]) : '';
+            if (cmd !== 'init' && cmd !== 'config') {
+              return realSpawn(command as never, args as never, options as never);
+            }
+            if (inFlight > 0) {
+              overlapDetected = true;
+              const fake = new FakeGitChild();
+              queueMicrotask(() => fake.emit('close', 128)); // git's own config.lock exit code
+              return fake;
+            }
+            initCalls.push(cmd);
+            inFlight++;
+            const child = realSpawn(command as never, args as never, options as never);
+            const clear = (): void => {
+              inFlight--;
+            };
+            child.once('close', clear);
+            child.once('error', clear);
+            return child;
+          }) as unknown as Parameters<typeof __setSpawnForTests>[0],
+        );
+
+        try {
+          await Promise.all([trackerA.init(), trackerB.init()]);
+        } finally {
+          accessSpy.mockRestore();
+        }
+
+        // The cross-process lock + double-check serialize creation: the
+        // git init/config sequence never overlaps, and only ONE full
+        // sequence (1x init + 4x config) ever runs — the second tracker's
+        // double-check (re-read AFTER acquiring the lock) sees the repo
+        // already initialized by the first and no-ops instead of re-running
+        // `git init`/`git config`.
+        expect(overlapDetected).toBe(false);
+        expect(initCalls).toEqual(['init', 'config', 'config', 'config', 'config']);
+      },
+    );
+  });
+
   describe('snapshot + diff', () => {
     it('excludes ignored files and oversized files from the snapshot (invisible to diff)', async () => {
       await writeFile('src/index.ts', 'export const x = 1;');
