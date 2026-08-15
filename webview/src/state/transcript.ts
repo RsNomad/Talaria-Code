@@ -537,14 +537,35 @@ function foldPanelData(state: AppState, msg: Extract<HostToWebview, { type: 'pan
   const panel = msg.panel;
   switch (panel) {
     case 'subagents':
+      // AU-61: the SAME fold step that lands the fresh success also clears
+      // this tab's own standing refresh-failure signal — error is
+      // scopeKey(tabId)-routed (reducePanelActionScoped), success here is
+      // sessionId-routed (foldSessionScoped), both land on the same
+      // TabState, so a single updater keeps them lockstep.
       return foldSessionScoped(state, msg.sessionId, 'panel.data:subagents', (tab) => ({
         ...tab,
         subagents: success(msg.data),
+        subagentsRefreshError: undefined,
       }));
-    case 'checkpoints':
-      return { ...state, rootPanels: { ...state.rootPanels, [msg.rootId]: success(msg.data) } };
-    case 'sessions':
-      return { ...state, sessionsPanel: success(msg.data) };
+    case 'checkpoints': {
+      const rootPanels = { ...state.rootPanels, [msg.rootId]: success(msg.data) };
+      // AU-61: a fresh success push is one of the two ways THIS root's
+      // checkpointsRefreshError entry clears (the other is a user dismiss).
+      // No-op (same `state.checkpointsRefreshError` reference) when nothing
+      // was set, mirroring the global-5 case below (:559-567) — a root that
+      // never had a background-refresh failure never grows a spurious empty
+      // entry.
+      if (!state.checkpointsRefreshError?.[msg.rootId]) return { ...state, rootPanels };
+      const checkpointsRefreshError = { ...state.checkpointsRefreshError };
+      delete checkpointsRefreshError[msg.rootId];
+      return { ...state, rootPanels, checkpointsRefreshError };
+    }
+    case 'sessions': {
+      const sessionsPanel = success(msg.data);
+      // AU-61: same no-op-when-unset posture as checkpoints above.
+      if (!state.sessionsRefreshError) return { ...state, sessionsPanel };
+      return { ...state, sessionsPanel, sessionsRefreshError: undefined };
+    }
     // TI-3 (AU-42 Part B, scope decision): 'setup' stays on the plain path —
     // see `RefreshErrorPanel`'s doc (state/panels.ts) for why it carries no
     // `refreshError` side-map entry to clear here.
@@ -1030,6 +1051,23 @@ export type LocalAction =
   // panel outside this task's scope (e.g. `'setup'`) would be meaningless
   // (no entry to clear) and this keeps that a compile-time impossibility.
   | { type: 'local.refreshError.dismiss'; panel: RefreshErrorPanel }
+  // AU-61: dismisses ONE of the three re-scoped panels' own refreshError
+  // signal (`AppState.sessionsRefreshError` / `.checkpointsRefreshError` /
+  // `TabState.subagentsRefreshError`) — the scoped counterpart to
+  // `local.refreshError.dismiss` above. A SEPARATE action, not a reuse of
+  // that one, because it is TYPE-MANDATORY (Critic-1): `RefreshErrorPanel`
+  // is `Exclude<GlobalPanel,'setup'>` and `GlobalPanel` derives from
+  // `PANEL_SCOPE` (`protocol.ts`), where subagents/checkpoints/sessions are
+  // 'session'/'root'/'cwd'-scoped, NOT members of `GlobalPanel` — they
+  // cannot type-check as a `RefreshErrorPanel`. `target` carries each
+  // scope's own key shape (none for sessions' single slot, `rootId` for
+  // checkpoints, `tabId` for subagents) so a dismiss for the wrong shape is
+  // a compile-time impossibility, same discipline `scopeKey` uses on the
+  // fetch side (B6).
+  | {
+      type: 'local.scopedRefreshError.dismiss';
+      target: { panel: 'sessions' } | { panel: 'checkpoints'; rootId: string } | { panel: 'subagents'; tabId: string };
+    }
   // Part X2: a panel's own loading/error transitions (fed by fetchPanel).
   | PanelAction;
 
@@ -1077,15 +1115,54 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
         console.warn(`transcript: dropping subagents panel action for unknown tab "${tabId}"`);
         return state;
       }
-      return { ...state, tabs: { ...state.tabs, [tabId]: { ...tab, subagents: applyPanelTransition(tab.subagents, action) } } };
+      // AU-61: captured BEFORE the fold below — the same pre-fold `wasSuccess`
+      // capture the global-5 case makes below (this function, the
+      // tools/mcp/skills/models/settings case) — tells whether this tab's
+      // subagents were already `success` (a background refresh) as opposed
+      // to a first load (idle/loading/error), which never writes the signal
+      // (AU-10: a first-load failure gets the visible error card instead).
+      const wasSuccess = tab.subagents.status === 'success';
+      const subagents = applyPanelTransition(tab.subagents, action);
+      if (action.type === 'local.panelError' && wasSuccess) {
+        return { ...state, tabs: { ...state.tabs, [tabId]: { ...tab, subagents, subagentsRefreshError: action.message } } };
+      }
+      // CF-10: an honest empty landing (unbound-tab short-circuit) also
+      // retires a standing signal — a stale "couldn't refresh" banner over a
+      // fresh empty SUCCESS would lie (see `PanelAction.emptyData`'s doc).
+      if (action.type === 'local.panelLoading' && action.emptyData !== undefined) {
+        return { ...state, tabs: { ...state.tabs, [tabId]: { ...tab, subagents, subagentsRefreshError: undefined } } };
+      }
+      // A plain `local.panelLoading` (background refetch in flight) does NOT
+      // clear a standing signal — it survives until success or dismiss,
+      // byte-consistent with the global-5 case's early return below.
+      return { ...state, tabs: { ...state.tabs, [tabId]: { ...tab, subagents } } };
     }
     case 'checkpoints': {
       const rootId = action.scopeKey ?? '';
       const current: RemoteData<PanelDataMap['checkpoints']> = state.rootPanels[rootId] ?? { status: 'idle' };
-      return { ...state, rootPanels: { ...state.rootPanels, [rootId]: applyPanelTransition(current, action) } };
+      // AU-61: same pre-fold `wasSuccess` capture as the subagents/global-5
+      // cases — see that case's doc.
+      const wasSuccess = current.status === 'success';
+      const next = applyPanelTransition(current, action);
+      if (action.type === 'local.panelError' && wasSuccess) {
+        return {
+          ...state,
+          rootPanels: { ...state.rootPanels, [rootId]: next },
+          checkpointsRefreshError: { ...state.checkpointsRefreshError, [rootId]: action.message },
+        };
+      }
+      return { ...state, rootPanels: { ...state.rootPanels, [rootId]: next } };
     }
-    case 'sessions':
-      return { ...state, sessionsPanel: applyPanelTransition(state.sessionsPanel, action) };
+    case 'sessions': {
+      // AU-61: same pre-fold `wasSuccess` capture as the subagents/
+      // checkpoints/global-5 cases — see the subagents case's doc.
+      const wasSuccess = state.sessionsPanel.status === 'success';
+      const sessionsPanel = applyPanelTransition(state.sessionsPanel, action);
+      if (action.type === 'local.panelError' && wasSuccess) {
+        return { ...state, sessionsPanel, sessionsRefreshError: action.message };
+      }
+      return { ...state, sessionsPanel };
+    }
     // TI-3 (AU-42 Part B, scope decision): 'setup' stays on the plain path —
     // `reducePanelAction` above already applies the keep-data rule to it
     // (panel-agnostic), it just never gains a `refreshError` side-map entry.
@@ -1200,6 +1277,29 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
       const refreshError = { ...state.refreshError };
       delete refreshError[action.panel];
       return { ...state, refreshError };
+    }
+
+    // AU-61: the scoped counterpart above — see `LocalAction`'s doc for why
+    // this is a separate, discriminated action.
+    case 'local.scopedRefreshError.dismiss': {
+      const { target } = action;
+      switch (target.panel) {
+        case 'sessions':
+          if (!state.sessionsRefreshError) return state; // nothing to clear
+          return { ...state, sessionsRefreshError: undefined };
+        case 'checkpoints': {
+          if (!state.checkpointsRefreshError?.[target.rootId]) return state; // nothing to clear
+          const checkpointsRefreshError = { ...state.checkpointsRefreshError };
+          delete checkpointsRefreshError[target.rootId];
+          return { ...state, checkpointsRefreshError };
+        }
+        case 'subagents':
+          // foldTabScoped's own drop-unknown discipline (dev-log + unchanged
+          // state) covers the "unknown tab" case for free — same posture the
+          // design doc calls for (mirrors transcript.ts's subagents
+          // drop-unknown path).
+          return foldTabScoped(state, target.tabId, action.type, (tab) => ({ ...tab, subagentsRefreshError: undefined }));
+      }
     }
 
     case 'local.tab.open': {

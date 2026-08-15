@@ -205,6 +205,19 @@ export interface TabState {
   /** The ONLY genuinely per-tab panel (§2f) — a fold over THIS session's stream. */
   subagents: RemoteData<SubagentsData>;
   /**
+   * AU-61: a background-refresh failure's MESSAGE for THIS tab's subagents
+   * panel, kept OUTSIDE `subagents` (same posture as {@link AppState.
+   * refreshError} for the 5 map-keyed global panels) so the failure never
+   * wipes the loaded delegation tree, just drives a dismissible banner over
+   * it. Lives IN `TabState` (not a top-level `Record<tabId,string>`) so it
+   * closes for free on `local.tab.close` — no separate GC pass needed (see
+   * `state/transcript.ts`'s AU-61 doc for the full lifecycle: set by
+   * `reducePanelActionScoped`'s `subagents` case, cleared by that same tab's
+   * next success push, a CF-10 empty landing, or a
+   * `local.scopedRefreshError.dismiss{panel:'subagents'}`).
+   */
+  subagentsRefreshError?: string;
+  /**
    * `kind` (W4-T3b, §7 B8) is present only for a `tab.error` (never for the
    * generic session-scoped `error`) — `'open-failed'` drives the in-place
    * retry affordance (re-post `tab.open` for this SAME tabId); `'session-lost'`
@@ -372,6 +385,35 @@ export interface AppState {
    * or a user dismiss (`local.refreshError.dismiss`).
    */
   refreshError?: Partial<Record<RefreshErrorPanel, string>>;
+  /**
+   * AU-61: the sessions/History panel's own background-refresh-failure
+   * signal — same TI-3 posture as {@link refreshError} above but a single
+   * slot, mirroring `sessionsPanel`'s own single-slot shape (History is
+   * filtered by cwd but shared, never per-tab). Distinct from BF-A's
+   * `sessionsLoadMoreError` (App.tsx `useState`, footer-scoped to a failed
+   * "Load more" page — OQ-1 Option A keeps that untouched): this signal is
+   * for the WHOLE-LIST background refresh failing, driving the banner ABOVE
+   * the list via `RemotePanel`'s `refreshError` prop. Set by
+   * `state/transcript.ts`'s `reducePanelActionScoped` `'sessions'` case on a
+   * `local.panelError` over already-success data; cleared by the next
+   * success push (`foldPanelData`) or `local.scopedRefreshError.dismiss{
+   * panel:'sessions'}`.
+   */
+  sessionsRefreshError?: string;
+  /**
+   * AU-61: the checkpoints panel's background-refresh-failure signal,
+   * rootId-keyed to mirror `rootPanels`' own keying (one shadow-git timeline
+   * shared by every same-root tab, so the failure/banner is shared the same
+   * way). Same TI-3 posture as {@link refreshError}. Set by
+   * `state/transcript.ts`'s `reducePanelActionScoped` `'checkpoints'` case
+   * on a `local.panelError` over already-success data (keyed by
+   * `action.scopeKey` — the root captured at fetch-issue time, B6); cleared
+   * by that root's next success push or `local.scopedRefreshError.dismiss{
+   * panel:'checkpoints', rootId}`. Like `rootPanels` itself, entries are
+   * never GC'd when a root's last tab closes (small cardinality — workspace
+   * roots; inherited accepted pattern, not a new leak class).
+   */
+  checkpointsRefreshError?: Partial<Record<string, string>>;
 }
 
 /** W2-F1 boot default — ask-everything until the host's live preset arrives. */
@@ -393,6 +435,7 @@ export function makeTabState(tabId: string, title: string): TabState {
     rootId: '',
     availableModes: [],
     subagents: idle,
+    subagentsRefreshError: undefined,
     error: undefined,
     availableCommands: [],
     draft: '',
