@@ -164,9 +164,27 @@ export function useHostActions(
   // N2 fix: a bound wrapper (no reactive reads -> empty deps, stable
   // forever) around `bridge.post`, replacing the raw `onLoad={bridge.post}`
   // method reference that lost `this` on every History-row click.
-  const loadSession = useCallback((message: Extract<WebviewToHost, { type: 'tab.load' }>) => {
-    bridge.post(message);
-  }, []);
+  //
+  // TI-1 (AU-39): only reached on a COMMITTED load — `SessionsPanel` calls
+  // this from `loadSession`, never from just opening its live-turn confirm
+  // strip — so both effects below are exactly "the click that actually
+  // loads":
+  //  (a) reveal the chat surface, same idiom as `sendPrompt` above: the
+  //      transcript replay that streams in right after IS the load's visible
+  //      feedback (a History click issued from the History panel itself
+  //      otherwise never shows it landing).
+  //  (b) mark the row busy (`AppState.pendingSessionLoad`) so
+  //      `SessionsPanel`'s `busyInteraction` click-guard blocks a double-post
+  //      until the terminal `tab.bound`/`tab.error` for THIS tabId clears it
+  //      (`state/transcript.ts`'s `clearResolvedSessionLoad`).
+  const loadSession = useCallback(
+    (message: Extract<WebviewToHost, { type: 'tab.load' }>) => {
+      if (activePanel !== 'chat') dispatchLocal({ type: 'local.setPanel', panel: 'chat' });
+      dispatchLocal({ type: 'local.sessionLoad.start', tabId: message.tabId, sessionId: message.sessionId });
+      bridge.post(message);
+    },
+    [activePanel, dispatchLocal],
+  );
 
   return { sendPrompt, sendDraft, setModel, setPreset, setMode, respondApproval, resolveDiff, loadSession };
 }

@@ -1014,6 +1014,7 @@ export function App() {
                   boundSessionIds={boundSessionIds}
                   activeTabHasLiveTurn={tab.turnActive}
                   onLoad={hostActions.loadSession}
+                  loadingSessionId={state.pendingSessionLoad?.sessionId}
                   onLoadMore={loadMoreSessions}
                   loadingMore={sessionsLoadingMore}
                   loadMoreError={sessionsLoadMoreError}

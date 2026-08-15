@@ -342,6 +342,21 @@ export interface AppState {
    * case (Task 8 left that case an explicit no-op for this task to replace).
    */
   setupProgress: SetupProgressMap;
+  /**
+   * TI-1 (AU-39): the History-panel row currently mid-load, set the moment a
+   * committed row click posts `tab.load` (`useHostActions.loadSession`) and
+   * cleared by that SAME `tabId`'s next `tab.bound` (success) or `tab.error`
+   * (failure) — the terminal signal `AcpBackend.loadSessionIntoTab` already
+   * emits on every branch (see that method's own doc; extensively pinned in
+   * `AcpBackend.test.ts`). Carries BOTH ids: `tabId` is what the clearing
+   * fold matches on (`tab.error` carries no `sessionId` on the wire —
+   * `protocol.ts`'s `tab.error` shape), `sessionId` is what SessionsPanel's
+   * row lookup needs to render the busy posture. CONNECTION-GLOBAL-shaped
+   * like `systemError` above — at most one History-panel load is ever in
+   * flight at a time (mirrors `SessionsPanel`'s own `confirmingId` "at most
+   * one" local-state posture).
+   */
+  pendingSessionLoad?: { tabId: string; sessionId: string };
 }
 
 /** W2-F1 boot default — ask-everything until the host's live preset arrives. */
@@ -420,6 +435,7 @@ export function createInitialState(restored?: {
     rootPanels: {},
     sessionsPanel: idle,
     systemError: undefined,
+    pendingSessionLoad: undefined,
     closeIntents: [],
     nextChatNumber: restored?.nextChatNumber ?? 2,
     restoredTitles: restored?.tabTitles,

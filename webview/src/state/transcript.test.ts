@@ -966,6 +966,52 @@ describe('transcript reducer — W4 §2d: tab.bound / tab.error fold into the NA
   });
 });
 
+describe('transcript reducer — TI-1 (AU-39): pendingSessionLoad clears on the SAME tab\'s tab.bound/tab.error', () => {
+  it('local.sessionLoad.start marks a row loading', () => {
+    const state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    expect(state.pendingSessionLoad).toEqual({ tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1' });
+  });
+
+  it('a tab.bound for the SAME tabId clears it — the committed load resolved', () => {
+    let state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    state = reduce(state, { type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1', rootId: '/r' });
+    expect(state.pendingSessionLoad).toBeUndefined();
+  });
+
+  it('a tab.error for the SAME tabId clears it — the committed load failed (protocol\'s tab.error carries no sessionId, so this matches on tabId alone)', () => {
+    let state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    state = reduce(state, { type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, message: 'nope', kind: 'open-failed' });
+    expect(state.pendingSessionLoad).toBeUndefined();
+  });
+
+  it('P-1 isolation: a tab.bound/tab.error for a DIFFERENT tab leaves an in-flight load on the ORIGINAL tab untouched', () => {
+    let state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    state = reduceLocal(state, { type: 'local.tab.open', tabId: 'tab-b' });
+
+    state = reduce(state, { type: 'tab.bound', tabId: 'tab-b', sessionId: 'sB', rootId: '/r' });
+    expect(state.pendingSessionLoad).toEqual({ tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1' });
+
+    state = reduce(state, { type: 'tab.error', tabId: 'tab-b', message: 'nope', kind: 'open-failed' });
+    expect(state.pendingSessionLoad).toEqual({ tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1' });
+  });
+});
+
 describe('transcript reducer — W4-T3b D1: the checkpoints eternal-spinner fix (App-read <-> push-key consistency)', () => {
   it('fetch-loading -> tab.bound{rootId} -> checkpoints push{rootId} resolves the ACTIVE tab\'s rootPanels slice to success, not a stuck idle/loading', () => {
     // 1. The panel is opened BEFORE the tab is bound — a `local.panelLoading`

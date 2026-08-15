@@ -61,6 +61,15 @@ interface SessionsPanelProps {
   activeTabHasLiveTurn: boolean;
   /** Row click -> `tab.load` for {@link activeTabId} (fire-and-forget; the transcript replays via streaming). */
   onLoad: (message: Extract<WebviewToHost, { type: 'tab.load' }>) => void;
+  /**
+   * TI-1 (AU-39): the session id of the ONE row currently mid-load
+   * (`AppState.pendingSessionLoad.sessionId`), or `undefined` when nothing is
+   * loading. Drives that row's `busyInteraction` posture — set the moment
+   * `onLoad` actually fires (never on just opening the confirm strip below),
+   * cleared by the App-level reducer once the host's terminal `tab.bound`/
+   * `tab.error` for that load's tabId lands.
+   */
+  loadingSessionId?: string;
   /** A#7: "Load more" over the CORRELATED path (loading state + failure surfaces). */
   onLoadMore: (cursor: string) => void;
   /** Whether a "Load more" request is currently in flight. */
@@ -77,6 +86,7 @@ export function SessionsPanel({
   boundSessionIds,
   activeTabHasLiveTurn,
   onLoad,
+  loadingSessionId,
   onLoadMore,
   loadingMore,
   loadMoreError,
@@ -119,15 +129,33 @@ export function SessionsPanel({
         const age = relativeAge(s.updatedAt);
         const isBound = boundSessionIds.has(s.id);
         const isConfirming = confirmingId === s.id;
+        // TI-1 (AU-39): busy, never natively disabled — a loading row must
+        // stay focusable (busyInteraction.ts's own rationale) and the
+        // click-guard below (`interactive`) is what actually blocks a
+        // double-post, not the native attribute (which stays permanently
+        // `false` here, mirroring the "Load more" footer button above).
+        const isLoading = loadingSessionId === s.id;
+        const rowInteraction = busyInteraction(false, isLoading);
         return (
           <div key={s.id} className="mb-1.5">
             <button
               type="button"
-              onClick={() => handleRowClick(s)}
+              onClick={() => {
+                if (!rowInteraction.interactive) return;
+                handleRowClick(s);
+              }}
+              disabled={rowInteraction.nativeDisabled}
+              aria-disabled={rowInteraction.ariaDisabled}
+              aria-busy={rowInteraction.ariaBusy}
               aria-current={isBound ? 'true' : undefined}
-              className="flex w-full items-start gap-2 rounded-card border border-border bg-surface px-3 py-2 text-left transition-colors hover:border-accent"
+              className="flex w-full items-start gap-2 rounded-card border border-border bg-surface px-3 py-2 text-left transition-colors hover:border-accent disabled:cursor-default disabled:opacity-60 aria-disabled:cursor-default aria-disabled:opacity-60"
             >
-              <Icon name="comment-discussion" size={15} className="mt-0.5 flex-none text-muted" />
+              <Icon
+                name={isLoading ? 'loading' : 'comment-discussion'}
+                size={15}
+                spin={isLoading}
+                className="mt-0.5 flex-none text-muted"
+              />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="min-w-0 truncate text-[12.5px] font-semibold text-fg">

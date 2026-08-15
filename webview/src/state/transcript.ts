@@ -785,35 +785,41 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // push carries, so `AppState.rootPanels[tab.rootId]` (the App-level
       // read) can never resolve. This is the ONE place `TabState.rootId`
       // ever changes.
-      return foldTabScoped(state, msg.tabId, 'tab.bound', (tab) => ({
-        ...tab,
-        sessionId: msg.sessionId,
-        binding: 'bound',
-        rootId: msg.rootId,
-        title: msg.title ?? tab.title,
-        // Audit G-9: a successful bind is the one thing that retires the marker.
-        openFailed: false,
-        // ARCH-1 (final review, UI I-3): a successful bind is likewise the
-        // one thing that retires the session-lost marker (G-9 parity).
-        sessionLost: false,
-      }));
+      return clearResolvedSessionLoad(
+        foldTabScoped(state, msg.tabId, 'tab.bound', (tab) => ({
+          ...tab,
+          sessionId: msg.sessionId,
+          binding: 'bound',
+          rootId: msg.rootId,
+          title: msg.title ?? tab.title,
+          // Audit G-9: a successful bind is the one thing that retires the marker.
+          openFailed: false,
+          // ARCH-1 (final review, UI I-3): a successful bind is likewise the
+          // one thing that retires the session-lost marker (G-9 parity).
+          sessionLost: false,
+        })),
+        msg.tabId,
+      );
 
     case 'tab.error':
       // §7 B8: `kind` drives the retry affordance (App.tsx re-posts `tab.open`
       // for `open-failed`). Audit G-9: `openFailed` outlives the banner so the
       // route back survives a dismissal.
-      return foldTabScoped(state, msg.tabId, 'tab.error', (tab) => ({
-        ...tab,
-        error: { message: msg.message, kind: msg.kind },
-        ...(msg.kind === 'open-failed' ? { openFailed: true } : {}),
-        // ARCH-1 (final review, UI I-3): a lost session is a terminal
-        // transition — regress `binding` so the composer (App.tsx
-        // `disabled={tab.binding !== 'bound'}`) stops accepting sends that
-        // have nowhere to go. `sessionLost` outlives the dismissible banner
-        // exactly like `openFailed` does (G-9 pattern); cleared by the next
-        // successful `tab.bound` above.
-        ...(msg.kind === 'session-lost' ? { binding: 'unbound' as const, sessionLost: true } : {}),
-      }));
+      return clearResolvedSessionLoad(
+        foldTabScoped(state, msg.tabId, 'tab.error', (tab) => ({
+          ...tab,
+          error: { message: msg.message, kind: msg.kind },
+          ...(msg.kind === 'open-failed' ? { openFailed: true } : {}),
+          // ARCH-1 (final review, UI I-3): a lost session is a terminal
+          // transition — regress `binding` so the composer (App.tsx
+          // `disabled={tab.binding !== 'bound'}`) stops accepting sends that
+          // have nowhere to go. `sessionLost` outlives the dismissible banner
+          // exactly like `openFailed` does (G-9 pattern); cleared by the next
+          // successful `tab.bound` above.
+          ...(msg.kind === 'session-lost' ? { binding: 'unbound' as const, sessionLost: true } : {}),
+        })),
+        msg.tabId,
+      );
 
     case 'tab.clear':
       // IMP-2 (W3-T6 3-lens review fix, CF-11): tabId-scoped — NOT routed
@@ -990,8 +996,31 @@ export type LocalAction =
   | { type: 'local.draft.attach.add'; tabId: string; attachment: Attachment }
   | { type: 'local.draft.attach.remove'; tabId: string; attachmentId: string }
   | { type: 'local.draft.clear'; tabId: string }
+  // TI-1 (AU-39): the History row's committed load — dispatched by
+  // `useHostActions.loadSession` the moment it posts `tab.load` (never on
+  // just opening the live-turn confirm strip). See `AppState
+  // .pendingSessionLoad`'s own doc for the clearing half (the `tab.bound`/
+  // `tab.error` cases below).
+  | { type: 'local.sessionLoad.start'; tabId: string; sessionId: string }
   // Part X2: a panel's own loading/error transitions (fed by fetchPanel).
   | PanelAction;
+
+/**
+ * TI-1 (AU-39): clears `AppState.pendingSessionLoad` once the load it
+ * tracks has resolved — called from BOTH the `tab.bound` and `tab.error`
+ * cases below, which is why it takes the already-folded `next` state rather
+ * than folding itself. Matches on `tabId` alone (never `sessionId`):
+ * `tab.error` carries no `sessionId` on the wire (`protocol.ts`'s `tab.error`
+ * shape has no such field), and a `tab.bound` for the loading tab is always
+ * the SAME load resolving (P3's target-tab-busy refusal means a second load
+ * can never be issued into a tab that already has one in flight). A
+ * `tab.bound`/`tab.error` for any OTHER tabId leaves it untouched (P-1
+ * isolation — an unrelated tab's own bind/error must never clear a DIFFERENT
+ * tab's still-in-flight History load).
+ */
+function clearResolvedSessionLoad(next: AppState, tabId: string): AppState {
+  return next.pendingSessionLoad?.tabId === tabId ? { ...next, pendingSessionLoad: undefined } : next;
+}
 
 /** Route a scoped-panel loading/error transition (Part X2 no-flash rule) to
  * its real scope (§2f/§7 B6): subagents -> the tab named by `action.scopeKey`
@@ -1106,6 +1135,8 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
       return { ...state, activePanel: action.panel };
     case 'local.dismissError':
       return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, error: undefined }));
+    case 'local.sessionLoad.start':
+      return { ...state, pendingSessionLoad: { tabId: action.tabId, sessionId: action.sessionId } };
     case 'local.dismissSystemError':
       return { ...state, systemError: undefined };
     case 'local.panelLoading':
