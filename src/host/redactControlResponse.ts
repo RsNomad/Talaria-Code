@@ -23,16 +23,25 @@ const REDACTED = '[redacted]';
  * exact method string) and each entry carries its own justification — no
  * entry may be added without one:
  *
- *  - `'panel.data'` — every panel payload is a host-shaped PROJECTION
- *    (`reshapePanelData.ts` / `SetupController.status()`), never the raw
- *    backend config the walker exists to catch (audit lens-1C read,
- *    re-verified for TE-5: `reshapeMcpServers`/`reshapeConfigShow`/
- *    `SetupData` all emit typed, enumerated fields — no passthrough of an
- *    unknown raw object). Its correlated `control.response` copy is also,
- *    independently, never read by the webview (`panels.ts`'s `fetchPanel`:
- *    "the resolved RPC value is deliberately ignored — the reshaped
- *    snapshot only ever rides the [separate, unredacted] push"), so gating
- *    it here would be redaction theater over a value nothing consumes.
+ *  - `'panel.data'` — the exemption's safety does NOT rest on every payload
+ *    being typed. MOST reshapers are typed, enumerated projections
+ *    (`reshapeMcpServers`/`reshapeModelOptions`/`reshapeToolsList`/
+ *    `reshapeSkillsList`/`reshapeSessionsList`), but `reshapeConfigShow` (the
+ *    Settings panel) is a GENERIC, untyped `{key,value,type}` passthrough of
+ *    Hermes' `config.show` label/value dump — exactly the raw-shape class the
+ *    walker exists to catch (TE-5 review correction: the earlier "all typed,
+ *    enumerated" claim was inaccurate for `reshapeConfigShow`). It is exempt
+ *    anyway because the exemption gates only the correlated `control.response`
+ *    copy, which the webview NEVER reads (`panels.ts`'s `fetchPanel`: "the
+ *    resolved RPC value is deliberately ignored — the reshaped snapshot only
+ *    ever rides the separate push"), so gating it HERE is redaction theater
+ *    over a value nothing consumes.
+ *    ⚠️ The actual render path — the `panel.data` PUSH (`ControlDispatcher` →
+ *    `buildPanelDataMessage` → `port.emit`) — bypasses this belt entirely.
+ *    That gap is PRE-EXISTING and out of TE-5's scope; Settings-row credential
+ *    safety rests on Hermes masking `config.show` server-side (observed:
+ *    `****`-prefixed values), NOT on this belt. Tracked as an audit
+ *    observation (AU-OBS-TE5: panel.data push-channel redaction gap).
  *  - `'setup.status'` — `TalariaViewProvider.handleSetupMethod` returns
  *    `SetupController.status()` verbatim: the IDENTICAL `SetupData`
  *    projection `panel.data{panel:'setup'}` pushes (same justification as
