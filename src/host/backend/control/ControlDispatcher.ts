@@ -1131,6 +1131,10 @@ export class ControlDispatcher {
       }
       const gate = assertSkillIdentifier(identifier);
       if (!gate.ok) {
+        // Task TE-6 (AU-27, CF-14 no-echo): the raw identifier goes ONLY to
+        // the output-channel logger, capped — `gate.reason` (thrown below)
+        // is already generic and never carries it into `control.response`.
+        this.port.logger?.append(`[AcpBackend] '${method}' refused skill identifier: ${gate.detail}`);
         throw new Error(gate.reason);
       }
       const client = await this.resolveDashboardAdminClient(method);
@@ -1205,6 +1209,8 @@ export class ControlDispatcher {
     }
     const gate = assertSkillIdentifier(identifier);
     if (!gate.ok) {
+      // Task TE-6 (AU-27, CF-14 no-echo): raw identifier -> logger only, capped.
+      this.port.logger?.append(`[AcpBackend] 'skills.hubInstall' refused skill identifier: ${gate.detail}`);
       throw new Error(gate.reason);
     }
 

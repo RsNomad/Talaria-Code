@@ -8346,6 +8346,65 @@ describe('ControlDispatcher — Task B4 skills admin core (§5.4)', () => {
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
+  // Task TE-6 (AU-27, CF-14 no-echo): `assertSkillIdentifier`'s refusal must
+  // not echo the raw, unbounded webview-supplied identifier into the
+  // `control.response` (the thrown Error's message, per
+  // TalariaViewProvider's `errorMessage(err)` wire-out) — only a capped,
+  // control-char-stripped form may reach the host output-channel logger.
+  // Mirrors the "tail goes to the logger only" idiom used by the
+  // exit-0-but-BLOCKED / still-present tests above.
+  it('skills.hubInstall: a huge identifier refuses with a short generic wire message; the raw form never reaches it, only a capped form reaches the logger', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+
+    const marker = 'UNIQUE_MARKER_hub_install_zzz999';
+    const huge = marker + 'y'.repeat(5_000_000);
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubInstall', { identifier: huge });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message.length).toBeLessThan(256);
+    expect(message).not.toContain(marker);
+    expect(client.scanCalls).toEqual([]); // refused before any network call, same as the short-identifier case
+    // ...only into the output-channel logger, and only a capped fragment of it.
+    expect(logs.some((l) => l.includes(marker))).toBe(true);
+    expect(logs.every((l) => l.length < message.length + 200 || !l.includes('y'.repeat(1000)))).toBe(true);
+  });
+
+  it('skills.hubPreview: a control-char/injection-shaped identifier is not reflected raw in the wire message; the logger gets a sanitised capped detail', async () => {
+    const logs: string[] = [];
+    const client = new FakeAdminDashboardClient();
+    const dashboard: DashboardService = { ensure: async () => client, dispose: () => {} };
+    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, undefined, dashboard);
+
+    const hostile = 'evil\x00\x1b[31mFAKE-LOG-LINE\x1b[0m\ninjected/segment';
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('skills.hubPreview', { identifier: hostile });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).not.toContain('\x00');
+    expect(message).not.toContain('\x1b');
+    expect(message).not.toContain('\n');
+    expect(message).not.toContain('FAKE-LOG-LINE');
+    expect(client.previewCalls).toEqual([]);
+    // logger may see the identifier (host-only, capped+sanitised) — but never raw control bytes.
+    expect(logs.every((l) => !/[\x00-\x1f]/.test(l))).toBe(true);
+  });
+
   it('skills.create: trust -> validate -> modal -> POST -> refetch; declined modal sends nothing', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const content = '---\nname: demo\ndescription: one line\n---\n\nDo the thing.';

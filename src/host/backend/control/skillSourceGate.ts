@@ -58,7 +58,27 @@ function isValidSegment(value: string): boolean {
   return !isDotOrDotDot(value) && SEGMENT_CHARSET.test(value);
 }
 
-export type SkillIdentifierResult = { ok: true; tier: 'official' | 'trusted' } | { ok: false; reason: string };
+/**
+ * Task TE-6 (AU-27, CF-14 no-echo): the raw webview-supplied `id` is
+ * UNBOUNDED and unsanitised — it must never reach the `control.response`
+ * (see the two `refusal()` call sites below, which used to interpolate
+ * `id` straight into `reason`) or a log line uncapped. `detail` is the
+ * ONLY place the identifier survives a refusal, for host-logger
+ * consumption exclusively (the caller in `ControlDispatcher` is
+ * responsible for actually logging it — this module stays framework-free,
+ * no `vscode`/logger import). Capped to 128 chars, then control chars
+ * (`\x00`-`\x1f`, e.g. NUL/ESC/CR/LF — a log-injection vector) stripped,
+ * matching `rejectCatalogInstall`'s detail-to-logger discipline.
+ */
+const DETAIL_MAX_LENGTH = 128;
+
+function cappedDetail(id: string): string {
+  return id.slice(0, DETAIL_MAX_LENGTH).replace(/[\x00-\x1f]/g, '');
+}
+
+export type SkillIdentifierResult =
+  | { ok: true; tier: 'official' | 'trusted' }
+  | { ok: false; reason: string; detail: string };
 
 /**
  * Every '/'-separated segment must pass {@link isValidSegment}; the
@@ -73,7 +93,11 @@ export type SkillIdentifierResult = { ok: true; tier: 'official' | 'trusted' } |
  * allowlisted prefix and is refused fail-closed.
  */
 export function assertSkillIdentifier(id: string): SkillIdentifierResult {
-  const refusal = (reason: string): { ok: false; reason: string } => ({ ok: false, reason });
+  const refusal = (reason: string): { ok: false; reason: string; detail: string } => ({
+    ok: false,
+    reason,
+    detail: cappedDetail(id),
+  });
 
   if (typeof id !== 'string' || id.length === 0) {
     return refusal('Skill identifier is required.');
@@ -83,7 +107,7 @@ export function assertSkillIdentifier(id: string): SkillIdentifierResult {
   for (const segment of segments) {
     if (!isValidSegment(segment)) {
       return refusal(
-        `Skill identifier "${id}" contains a segment outside the allowed charset (letters, digits, '.', '_', '-'; must not be '.' or '..').`,
+        "Skill identifier contains a segment outside the allowed charset (letters, digits, '.', '_', '-'; must not be '.' or '..').",
       );
     }
   }
@@ -96,7 +120,7 @@ export function assertSkillIdentifier(id: string): SkillIdentifierResult {
   }
 
   return refusal(
-    `Skill identifier "${id}" is not under an allowlisted publisher (official/, openai/skills, anthropics/skills, huggingface/skills, NVIDIA/skills). Community and direct-URL sources are refused.`,
+    'Skill identifier is not under an allowlisted publisher (official/, openai/skills, anthropics/skills, huggingface/skills, NVIDIA/skills). Community and direct-URL sources are refused.',
   );
 }
 

@@ -97,6 +97,53 @@ describe('assertSkillIdentifier', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toMatch(/official|trusted|allow/i);
   });
+
+  // Task TE-6 (AU-27, CF-14 no-echo): a refusal must not reflect the raw,
+  // unbounded webview-supplied identifier back into `reason` (which reaches
+  // both the host log and, unmodified through ControlDispatcher, the
+  // `control.response` sent back over the wire). The full identifier is
+  // still available, CAPPED and control-char-stripped, on a separate
+  // `detail` field for host-logger-only consumption (mirrors
+  // `rejectCatalogInstall`'s detail-to-logger discipline).
+  describe('AU-27 — refusal never echoes the raw identifier; capped detail for the logger only', () => {
+    it('a 5MB identifier produces a short generic reason with no fragment of the input', () => {
+      const marker = 'UNIQUE_MARKER_zzz999';
+      const huge = marker + 'x'.repeat(5_000_000);
+      const r = assertSkillIdentifier(huge);
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.reason.length).toBeLessThan(256);
+      expect(r.reason).not.toContain(marker);
+      expect(r.reason).not.toContain('x'.repeat(50)); // no run of the input body either
+      // The capped detail is bounded and still traceable to the input (for
+      // the logger only — never returned to the caller as `reason`).
+      expect(r.detail.length).toBeLessThanOrEqual(128);
+      expect(r.detail.startsWith(marker)).toBe(true);
+    });
+
+    it('a control-char / newline identifier is not reflected raw on the wire message; the logger detail is stripped + capped', () => {
+      const hostile = 'evil\x00\x1b[31mFAKE-LOG-LINE\x1b[0m\ninjected/segment';
+      const r = assertSkillIdentifier(hostile);
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.reason).not.toContain('\x00');
+      expect(r.reason).not.toContain('\x1b');
+      expect(r.reason).not.toContain('\n');
+      expect(r.reason).not.toContain('FAKE-LOG-LINE');
+      // detail is capped+sanitised, never containing raw control bytes.
+      expect(r.detail).not.toMatch(/[\x00-\x1f]/);
+      expect(r.detail.length).toBeLessThanOrEqual(128);
+    });
+
+    it('the allow/refuse DECISION is unchanged by the message-shape fix', () => {
+      // A valid trusted identifier still passes...
+      const ok = assertSkillIdentifier('anthropics/skills/pdf');
+      expect(ok).toMatchObject({ ok: true, tier: 'trusted' });
+      // ...and an invalid one still refuses, generically.
+      const refused = assertSkillIdentifier('clawhub/thing');
+      expect(refused.ok).toBe(false);
+    });
+  });
 });
 
 describe('validateSkillCreate', () => {
