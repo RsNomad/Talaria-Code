@@ -1221,6 +1221,11 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     // (post-close) store.
     initPromise = undefined;
     void store.close();
+    // AU-35 (TA-9): the parser's cached `Parser`/`Tree` native handles were
+    // never freed on indexer teardown before this — deferred here from
+    // TA-5. Optional per `CodeParser` (a test stand-in owns no native
+    // resources to free).
+    parser.dispose?.();
   }
 
   return { build, watch, dispose };
