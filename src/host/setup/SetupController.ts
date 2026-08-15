@@ -1884,10 +1884,12 @@ export class SetupController {
         // 'pinned' branch above (this file's own doc for that branch has
         // the full rationale). NOTE beyond the round's doc's literal 4-site
         // list: this is the SAME `ingestGguf` dep, the SAME shared
-        // `entry.id`-keyed `done` push, and is in fact the LIVE/reachable
-        // path today (12 of 14 ollama-tier catalog rows use `live-oid`;
-        // `pinned` is currently dormant, sha256 `''`) — so it gets the
-        // identical guard for consistency and genuine safety, not just the
+        // `entry.id`-keyed `done` push, and is a genuinely reachable
+        // path today (the `devstral-24b` catalog row hits this `live-oid`
+        // arm; the sibling `pinned` arm is currently dormant, sha256 `''`;
+        // the 11 `library`-tier rows route through the already-guarded
+        // `runLibraryPull` site, not here) — so it gets the identical
+        // guard for consistency and genuine safety, not just the
         // dormant sibling.
         {
           let settled = false;
