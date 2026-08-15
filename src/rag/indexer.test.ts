@@ -1921,3 +1921,147 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
     },
   );
 });
+
+describe('TA-7 (AU-34): nested .gitignore/.hermesignore files are honored, not just the workspace root (INV-6)', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-ta7-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer(debounceMs = 10) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  /** Mirrors the production `readManifest`'s own missing-file semantics. */
+  async function readManifest(): Promise<Record<string, string>> {
+    try {
+      const raw = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8');
+      return JSON.parse(raw) as Record<string, string>;
+    } catch {
+      return {};
+    }
+  }
+
+  function upsertedPaths(): string[] {
+    return upsertMock.mock.calls.flatMap(([records]) => records.map((r) => r.path));
+  }
+
+  function embeddedTexts(): string[] {
+    return embedMock.mock.calls.flatMap(([texts]) => texts);
+  }
+
+  it('RED: a file excluded by a NESTED .gitignore is neither indexed nor sent to the embed endpoint on a full build', async () => {
+    await writeWorkspaceFile('sub/.gitignore', 'secret.txt\n');
+    await writeWorkspaceFile('sub/secret.txt', 'export const excludedMarker = "sub-nested-secret-marker";\n');
+    await writeWorkspaceFile('sub/keep.ts', 'export const keptMarker = "sub-nested-keep-marker";\n');
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    // AU-34 (fails at HEAD): `loadIgnoreFilter()`/`walk()` only ever consult
+    // the WORKSPACE-ROOT `.gitignore`/`.hermesignore` — a nested
+    // `sub/.gitignore` is never read at all, so `sub/secret.txt` gets
+    // indexed AND its content is POSTed to the embed endpoint even though a
+    // nested rule explicitly excludes it.
+    const manifest = await readManifest();
+    expect(manifest['sub/secret.txt']).toBeUndefined();
+    expect(manifest['sub/keep.ts']).toBeDefined();
+
+    expect(upsertedPaths()).not.toContain('sub/secret.txt');
+    expect(upsertedPaths()).toContain('sub/keep.ts');
+
+    const texts = embeddedTexts();
+    expect(texts.some((t) => t.includes('sub-nested-secret-marker'))).toBe(false);
+    expect(texts.some((t) => t.includes('sub-nested-keep-marker'))).toBe(true);
+
+    indexer.dispose();
+  });
+
+  it('RED: a file excluded by a NESTED .hermesignore is neither indexed nor sent to the embed endpoint on a full build', async () => {
+    await writeWorkspaceFile('pkg/.hermesignore', 'internal.ts\n');
+    await writeWorkspaceFile(
+      'pkg/internal.ts',
+      'export const excludedMarker = "pkg-nested-hermesignore-marker";\n',
+    );
+    await writeWorkspaceFile('pkg/public.ts', 'export const keptMarker = "pkg-nested-public-marker";\n');
+
+    const indexer = makeIndexer();
+    await indexer.build();
+
+    const manifest = await readManifest();
+    expect(manifest['pkg/internal.ts']).toBeUndefined();
+    expect(manifest['pkg/public.ts']).toBeDefined();
+    expect(upsertedPaths()).not.toContain('pkg/internal.ts');
+
+    indexer.dispose();
+  });
+
+  it('RED: an edit to an already-known nested .gitignore is honored immediately on the watch path (no full rebuild needed)', async () => {
+    // Establish 'sub' as a KNOWN nested-ignore directory via a full build
+    // FIRST — TA-7's design only re-reads NESTED ignore files the watch
+    // path already discovered on a prior build (bounded staleness for a
+    // BRAND-NEW nested ignore file is documented/expected); an EDIT to an
+    // ALREADY-known one must take effect immediately, mirroring the
+    // existing root-level regression pin (AUDIT-5 Task 10).
+    await writeWorkspaceFile('sub/.gitignore', '# no rule for target.ts yet\n');
+    await writeWorkspaceFile('sub/target.ts', 'export const watchMarker = "sub-nested-watch-marker";\n');
+
+    const indexer = makeIndexer();
+    await indexer.build();
+    const beforeEdit = await readManifest();
+    expect(beforeEdit['sub/target.ts']).toBeDefined();
+
+    const disposable = indexer.watch();
+
+    // Edit the nested .gitignore to now exclude target.ts, and fire ITS OWN
+    // change event.
+    await writeWorkspaceFile('sub/.gitignore', 'target.ts\n');
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'sub', '.gitignore') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    embedMock.mockClear();
+    upsertMock.mockClear();
+
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'sub', 'target.ts') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // AU-34 (fails at HEAD): the pre-fix invalidation check only matches
+    // `relPath === '.gitignore'` (workspace root, exact match) — a nested
+    // `sub/.gitignore`'s own change event never invalidates anything, and
+    // `loadIgnoreFilter()` never reads nested files at all, so target.ts is
+    // re-embedded/re-upserted regardless of the edit.
+    expect(embedMock).not.toHaveBeenCalled();
+    expect(upsertMock).not.toHaveBeenCalled();
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+});

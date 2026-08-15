@@ -120,6 +120,43 @@ function looksBinary(buf: Buffer): boolean {
 }
 
 /**
+ * TA-7 (AU-34) / INV-6: a nested per-directory ignore matcher scoped to
+ * `dirRel` (POSIX-relative to `workspaceRoot`). `matches` is a
+ * `createIgnoreFilter`-produced predicate built from that directory's OWN
+ * `.gitignore`/`.hermesignore` contents.
+ */
+interface NestedIgnoreEntry {
+  dirRel: string;
+  matches: (relToDir: string) => boolean;
+}
+
+/**
+ * Tests `relPosixPath` against every nested matcher whose directory it falls
+ * under, mirroring git's per-directory `.gitignore` scoping: a nested file's
+ * rules govern only paths INSIDE its own directory, tested RELATIVE to that
+ * directory — the `ignore` package's documented relative-path contract
+ * (pinned by `shared/ignoreFilter.test.ts`). `relPosixPath === dirRel` (the
+ * directory entry itself, as seen from its PARENT) is deliberately not
+ * tested against that directory's own matcher — a nested ignore file governs
+ * its directory's contents, not whether the directory itself is excluded
+ * from its parent (that is the parent's/ancestor's/default-excludes' call).
+ * Exact git precedence ACROSS multiple nested files (e.g. a child directory
+ * re-including something an ancestor excluded) is intentionally NOT
+ * replicated — each nested file's rules apply independently (TA-7's
+ * rejected "full git-parity precedence engine" alternative — YAGNI for an
+ * indexer).
+ */
+function matchesNestedIgnore(entries: readonly NestedIgnoreEntry[], relPosixPath: string): boolean {
+  for (const { dirRel, matches } of entries) {
+    if (relPosixPath === dirRel) continue;
+    if (relPosixPath.startsWith(`${dirRel}/`) && matches(relPosixPath.slice(dirRel.length + 1))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Extension-host indexer: owns the workspace walk, file watcher, chunking,
  * embedding calls, and `VectorStore` writes (how-to §6/§7 — "the extension
  * host owns indexing ... the MCP process only queries"). All native/HTTP
@@ -205,6 +242,22 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   // up edits made outside the watcher, e.g. `git pull`), and any watch event
   // whose own path IS one of the ignore files (see `handleFsEvent`).
   let cachedIgnoreFilter: ((relPosixPath: string) => boolean) | undefined;
+
+  // TA-7 (AU-34) / INV-6: directories (POSIX-relative to `workspaceRoot`,
+  // excluding the root itself) that `walk()` found to contain their own
+  // `.gitignore`/`.hermesignore` during the LAST completed full build.
+  // `loadIgnoreFilter()` re-reads each of these fresh from disk on every
+  // rebuild (same discipline as the root files below), so an EDIT to an
+  // ALREADY-known nested ignore file is honored immediately on the watch
+  // path — `walk()` itself never relies on this list (it discovers nested
+  // ignore files live, on every full build, independent of what a PRIOR
+  // build knew). A nested ignore file created in a directory NOT yet in
+  // this list only takes effect starting with the NEXT full build (bounded
+  // staleness — walk() will discover it then); this is the documented,
+  // accepted YAGNI-scoped tradeoff (TA-7's rejected "shell out to `git
+  // check-ignore` per event" alternative would close this gap at the cost
+  // of a subprocess per watch event and breaking non-git workspaces).
+  let knownNestedIgnoreDirs: string[] = [];
 
   async function readManifest(): Promise<Record<string, string>> {
     try {
@@ -372,9 +425,36 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // optional
     }
     const base = createIgnoreFilter(gitignoreContents, opts.extraIgnoreGlobs ?? []);
+
+    // TA-7 (AU-34) / INV-6: layer in nested per-directory ignore files
+    // discovered during the LAST full build's walk (`knownNestedIgnoreDirs`
+    // above) — re-read fresh from disk on every rebuild of this predicate so
+    // an edit to an already-known nested `.gitignore`/`.hermesignore` is
+    // honored immediately on the watch path (handleFsEvent never calls
+    // walk(), so this is the ONLY place the watch path learns nested rules).
+    const nested: NestedIgnoreEntry[] = [];
+    for (const dirRel of knownNestedIgnoreDirs) {
+      const nestedContents: string[] = [];
+      try {
+        nestedContents.push(await fs.readFile(path.join(opts.workspaceRoot, dirRel, '.gitignore'), 'utf8'));
+      } catch {
+        // deleted since the last build — fall through to .hermesignore/empty.
+      }
+      try {
+        nestedContents.push(
+          await fs.readFile(path.join(opts.workspaceRoot, dirRel, '.hermesignore'), 'utf8'),
+        );
+      } catch {
+        // optional
+      }
+      if (nestedContents.length === 0) continue;
+      nested.push({ dirRel, matches: createIgnoreFilter(nestedContents) });
+    }
+
     // AUDIT-5 ARCH-1: fold the indexDir self-exclusion into the ONE filter
     // both runBuild's walk() and handleFsEvent already share.
-    const filter = (relPosixPath: string): boolean => isUnderIndexDir(relPosixPath) || base(relPosixPath);
+    const filter = (relPosixPath: string): boolean =>
+      isUnderIndexDir(relPosixPath) || base(relPosixPath) || matchesNestedIgnore(nested, relPosixPath);
     cachedIgnoreFilter = filter;
     return filter;
   }
@@ -383,6 +463,8 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     dir: string,
     ignoreFilter: (p: string) => boolean,
     out: string[],
+    ancestors: readonly NestedIgnoreEntry[] = [],
+    discoveredNestedDirs?: string[],
   ): Promise<void> {
     let entries: Dirent[];
     try {
@@ -390,6 +472,35 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     } catch {
       return;
     }
+
+    // TA-7 (AU-34) / INV-6: discover THIS directory's own nested ignore
+    // file(s) fresh, live, on every full build — independent of whatever
+    // `ignoreFilter`'s (possibly stale, prior-build) nested knowledge
+    // already contains, so a brand-new nested `.gitignore` is honored
+    // starting with the VERY build that walks past it. The workspace ROOT
+    // is excluded here: its `.gitignore`/`.hermesignore` are already folded
+    // into `ignoreFilter` via `loadIgnoreFilter()`, so re-reading them here
+    // too would just be a redundant duplicate check.
+    let localAncestors = ancestors;
+    if (dir !== opts.workspaceRoot) {
+      const dirRel = toPosixRelative(path.relative(opts.workspaceRoot, dir));
+      const dirContents: string[] = [];
+      try {
+        dirContents.push(await fs.readFile(path.join(dir, '.gitignore'), 'utf8'));
+      } catch {
+        // no nested .gitignore in this directory.
+      }
+      try {
+        dirContents.push(await fs.readFile(path.join(dir, '.hermesignore'), 'utf8'));
+      } catch {
+        // optional
+      }
+      if (dirContents.length > 0) {
+        localAncestors = [...ancestors, { dirRel, matches: createIgnoreFilter(dirContents) }];
+        discoveredNestedDirs?.push(dirRel);
+      }
+    }
+
     for (const entry of entries) {
       const abs = path.join(dir, entry.name);
       const rel = toPosixRelative(path.relative(opts.workspaceRoot, abs));
@@ -402,9 +513,15 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // for files that pass this path filter — see the `scanSnippetForSecrets`
       // call in `reindexFiles` below, the two layers together now mirror the
       // completion path's path+content gate.
-      if (ignoreFilter(rel) || isSecretForCompletion(rel)) continue;
+      if (
+        ignoreFilter(rel) ||
+        isSecretForCompletion(rel) ||
+        matchesNestedIgnore(localAncestors, rel)
+      ) {
+        continue;
+      }
       if (entry.isDirectory()) {
-        await walk(abs, ignoreFilter, out);
+        await walk(abs, ignoreFilter, out, localAncestors, discoveredNestedDirs);
       } else if (entry.isFile()) {
         out.push(abs);
       }
@@ -699,7 +816,14 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     const ignoreFilter = await loadIgnoreFilter();
 
     const absPaths: string[] = [];
-    await walk(opts.workspaceRoot, ignoreFilter, absPaths);
+    // TA-7 (AU-34) / INV-6: `walk()` discovers every nested
+    // `.gitignore`/`.hermesignore` fresh as it descends this build (see its
+    // own comment) — `discoveredNestedDirs` collects that discovery so the
+    // watch path (which never calls `walk()`) can re-consult the SAME
+    // directories on its own cache rebuilds until the next full build.
+    const discoveredNestedDirs: string[] = [];
+    await walk(opts.workspaceRoot, ignoreFilter, absPaths, [], discoveredNestedDirs);
+    knownNestedIgnoreDirs = discoveredNestedDirs;
 
     const current: Record<string, string> = {};
     // AUDIT-5 Task 10: read each candidate's bytes ONCE here for the hash
@@ -860,11 +984,23 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // out-of-scope paths inside createIgnoreFilter instead: the shared
       // filter's loud throw is its contract (pinned in ignoreFilter.test.ts).
       if (!isPathValid(relPath)) return;
-      // AUDIT-5 Task 10: the cached ignore filter goes stale the moment one
-      // of the ignore files itself changes (edit OR delete) — invalidate
-      // BEFORE this event's own loadIgnoreFilter() call so this event, and
-      // every event after it, sees the new rules immediately.
-      if (relPath === '.gitignore' || relPath === '.hermesignore') {
+      // AUDIT-5 Task 10 (extended by TA-7/AU-34): the cached ignore filter
+      // goes stale the moment one of the ignore files itself changes (edit
+      // OR delete) — invalidate BEFORE this event's own loadIgnoreFilter()
+      // call so this event, and every event after it, sees the new rules
+      // immediately. Originally root-only; TA-7 extends this to any NESTED
+      // `.gitignore`/`.hermesignore` too (INV-6) — `loadIgnoreFilter()`
+      // re-reads every directory in `knownNestedIgnoreDirs` fresh on rebuild,
+      // so this correctly picks up an edit to an already-known nested ignore
+      // file. A nested ignore file in a directory NOT yet known (never
+      // walked) is a no-op here either way — see `knownNestedIgnoreDirs`'s
+      // own comment for the documented bounded staleness.
+      if (
+        relPath === '.gitignore' ||
+        relPath === '.hermesignore' ||
+        relPath.endsWith('/.gitignore') ||
+        relPath.endsWith('/.hermesignore')
+      ) {
         cachedIgnoreFilter = undefined;
       }
       const ignoreFilter = await loadIgnoreFilter();
