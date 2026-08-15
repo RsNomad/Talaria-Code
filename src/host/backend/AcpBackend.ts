@@ -62,6 +62,11 @@ import type { SessionHostPort } from './session/types';
 import type { EditPreviewRegistry } from '../preview/EditPreviewRegistry';
 import { readCustomModes, toCatalog } from './customModes';
 import { OneShotRunner, type OneShotHostPort } from './oneshot/OneShotRunner';
+import {
+  OneShotSessionRegistry,
+  ONESHOT_SESSION_IDS_STORAGE_KEY,
+  type WorkspaceStateLike,
+} from './oneshot/OneShotSessionRegistry';
 import { ConnectionSupervisor, type ConnectionSupervisorHostPort, type ReconnectOutcome } from './connection/ConnectionSupervisor';
 import { ControlDispatcher, type ControlDispatcherHostPort } from './control/ControlDispatcher';
 
@@ -273,6 +278,20 @@ export class AcpBackend implements AgentBackend {
   private readonly oneShotRunner: OneShotRunner;
 
   /**
+   * TG-5 (AU-51, ADR-4 layer 1): the bounded (≤200), `workspaceState`-
+   * persisted registry of every ephemeral one-shot session id
+   * {@link oneShotRunner} has ever minted — see {@link OneShotSessionRegistry}'s
+   * own doc. Seeded in the constructor from
+   * `workspaceState.get(ONESHOT_SESSION_IDS_STORAGE_KEY)` so a window reload
+   * doesn't resurface every past one-shot id in `session.list` until each is
+   * individually re-minted. Read by {@link buildPanelSourceContext}'s
+   * `getOneShotSessionIds` (the `sessions` panel source's exclusion set) and
+   * written by {@link recordOneShotSessionId} (the {@link OneShotHostPort}
+   * accessor `oneShotRunner` calls at mint time).
+   */
+  private readonly oneShotSessionRegistry: OneShotSessionRegistry;
+
+  /**
    * W6-FI-b (3-way ARCH I-4, part 2 of 3): the connection lifecycle
    * subsystem — spawn/connect/`acpState`/`inFlightStart`/crash+respawn/
    * per-session recovery, EXTRACTED off this class (behavior-preserving
@@ -406,8 +425,30 @@ export class AcpBackend implements AgentBackend {
      * Linux-only and platform-gated, `confinedOpen.ts`'s own doc).
      */
     private readonly confinedReader: ConfinedReader = makeProcFdReader(),
+    /**
+     * TG-5 (AU-51): the host-only `workspaceState` port
+     * {@link oneShotSessionRegistry} persists through — mirrors
+     * `checkpointTracker`/`dashboard`/`editPreviewRegistry` above (host-only,
+     * constructed + injected by `extension.ts`, optional so tests never need
+     * to wire it). The no-op default (`get` always `undefined`, `update` a
+     * resolved no-op) makes every pre-existing test behave exactly as
+     * before: the registry starts empty and every `update` is a harmless
+     * fire-and-forget, matching "no workspaceState wired" degrading to
+     * "layer 1 starts fresh every session" rather than throwing.
+     */
+    private readonly workspaceState: WorkspaceStateLike = {
+      get: () => undefined,
+      update: () => Promise.resolve(),
+    },
   ) {
     this.control = new ControlChannel(config, logger);
+    // TG-5 (AU-51): seeded from the persisted array (oldest-first,
+    // `undefined` when nothing was ever stored — a fresh registry) so a
+    // window reload doesn't resurface every one-shot id ever minted this
+    // install (INV-20).
+    this.oneShotSessionRegistry = new OneShotSessionRegistry(
+      this.workspaceState.get<string[]>(ONESHOT_SESSION_IDS_STORAGE_KEY) ?? [],
+    );
     // W6-FI-a: every accessor closes over `this`, read at CALL TIME (not
     // construction time) — mirrors `buildSessionPort`'s own posture, so the
     // runner always sees the CURRENT client/cwd/root, even across a respawn.
@@ -416,6 +457,8 @@ export class AcpBackend implements AgentBackend {
       getConnectionCwd: () => this.cwd,
       resolveRoot: (cwd) => this.resolveRootCoordinator(cwd),
       logger: this.logger,
+      recordOneShotSessionId: (id) => this.recordOneShotSessionId(id),
+      deleteOneShotSession: (id) => this.deleteOneShotSession(id),
     };
     this.oneShotRunner = new OneShotRunner(oneShotPort);
     // W6-FI-b: same accessor-at-call-time posture as `oneShotPort` above —
@@ -692,6 +735,9 @@ export class AcpBackend implements AgentBackend {
       getSessionCwd: (sessionId) => this.sessions.get(sessionId)?.cwd,
       getSessionSubagentsSnapshot: (sessionId) => this.sessions.get(sessionId)?.getSubagentsSnapshot(),
       getRootTracker: (rootId) => this.rootRegistry.get(rootId)?.tracker,
+      // TG-5 (AU-51, INV-20): the `sessions` source's exclusion set — see
+      // `OneShotSessionRegistry`'s own doc.
+      getOneShotSessionIds: () => this.oneShotSessionRegistry.ids(),
       logger: this.logger,
     };
   }
@@ -1246,6 +1292,60 @@ export class AcpBackend implements AgentBackend {
    */
   async oneShot(prompt: string, opts: { cwd: string; timeoutMs?: number }): Promise<OneShotResult> {
     return this.oneShotRunner.oneShot(prompt, opts);
+  }
+
+  /**
+   * TG-5 (AU-51) layer 1: the {@link OneShotHostPort.recordOneShotSessionId}
+   * accessor {@link oneShotRunner} calls the moment a one-shot's ephemeral
+   * `session/new` resolves. `OneShotSessionRegistry.record` returns `false`
+   * for an already-known id (shouldn't happen — ids are fresh UUIDs — but
+   * skips a redundant `workspaceState.update` either way); only a genuinely
+   * NEW id triggers a persist.
+   */
+  private recordOneShotSessionId(id: string): void {
+    if (!this.oneShotSessionRegistry.record(id)) return;
+    void this.persistOneShotSessionIds();
+  }
+
+  /** TG-5 (AU-51): persist the registry's current (bounded, oldest-first)
+   *  snapshot to `workspaceState` — best-effort; a write failure only means
+   *  a future reload re-surfaces one already-cleaned-up id in the panel
+   *  until it ages out again, never a functional break, so it's logged, not
+   *  thrown. */
+  private async persistOneShotSessionIds(): Promise<void> {
+    try {
+      await this.workspaceState.update(ONESHOT_SESSION_IDS_STORAGE_KEY, this.oneShotSessionRegistry.toArray());
+    } catch (err) {
+      this.logger?.append(`[AcpBackend] failed to persist one-shot session id registry (log-only): ${describeHostError(err)}`);
+    }
+  }
+
+  /**
+   * TG-5 (AU-51) layer 2: the {@link OneShotHostPort.deleteOneShotSession}
+   * accessor — best-effort server-side cleanup once a one-shot settles.
+   * Dispatches `session.delete {session_id: id}` on the SAME tui_gateway
+   * control plane every other host-internal `dispatch` call uses (the
+   * `config.get`/`tools.list` MCP-hub-join precedent, `PanelSourceContext
+   * .dispatch`'s own doc) — deliberately NOT a webview-nameable
+   * `CONTROL_METHODS` entry (`src/shared/protocol.ts`'s TE-4 boundary
+   * allowlist governs methods the WEBVIEW may invoke; this dispatch never
+   * originates from the webview, so it correctly bypasses that allowlist,
+   * exactly like the MCP-hub join's `config.get`/`tools.list` calls do).
+   * Confirmed safe against an acp-child id (harness `tui_gateway/server.py
+   * :5973-5980`): the active-guard only ever checks the GATEWAY's OWN
+   * `_sessions`, which never contains an acp-child id, so the delete
+   * proceeds and removes the row from the SHARED `~/.hermes/state.db`.
+   * Fire-and-forget by contract (`void` return, `OneShotHostPort`'s doc): a
+   * rejection here is caught and LOGGED, never propagated — a control
+   * channel outage must never fail (or even delay) the one-shot's own
+   * result.
+   */
+  private deleteOneShotSession(id: string): void {
+    void this.control.dispatch('session.delete', { session_id: id }).catch((err) => {
+      this.logger?.append(
+        `[AcpBackend] one-shot session.delete failed (log-only, best-effort cleanup — TG-5/AU-51): ${describeHostError(err)}`,
+      );
+    });
   }
 
   /** §2c routing table: `respondApproval` routes as `this.sessions.get(sessionId)?.respondApproval(...)`. */

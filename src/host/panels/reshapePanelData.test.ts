@@ -552,6 +552,73 @@ describe('reshapeSessionsList', () => {
       expect(result.sessions[1]?.updatedAt).toBe('2026-07-10T12:00:00Z');
     });
   });
+
+  /**
+   * TG-5 (AU-51): one-shot utility sessions (`OneShotRunner`'s ephemeral
+   * `session/new` mints) persist server-side (the ACP wire has no close) and
+   * would otherwise surface in `session.list` alongside real conversations —
+   * INV-20 ("Utility (one-shot) sessions never surface in user-facing
+   * history"). `reshapeSessionsList` is the projection that drops them:
+   * an optional second `excludeIds` set, checked by the reshaped `id`
+   * (post session_id/sessionId normalization — the exclusion set is keyed
+   * by the SAME id shape the panel ends up seeing, not the raw wire field).
+   */
+  describe('TG-5 (AU-51): excludeIds drops one-shot ephemeral session ids', () => {
+    it('drops a session whose reshaped id is in excludeIds — absent from the result entirely', () => {
+      const result = reshapeSessionsList(
+        {
+          sessions: [
+            { session_id: 'real-1', cwd: '/ws', title: 'Real chat' },
+            { session_id: 'ephemeral-1', cwd: '/ws', title: 'One-shot commit msg' },
+          ],
+        },
+        new Set(['ephemeral-1']),
+      );
+      expect(result.sessions.map((s) => s.id)).toEqual(['real-1']);
+    });
+
+    it('drops every matching id, keeps every non-matching one, preserving original order', () => {
+      const result = reshapeSessionsList(
+        {
+          sessions: [
+            { session_id: 's1', cwd: '/ws' },
+            { session_id: 'e1', cwd: '/ws' },
+            { session_id: 's2', cwd: '/ws' },
+            { session_id: 'e2', cwd: '/ws' },
+          ],
+        },
+        new Set(['e1', 'e2']),
+      );
+      expect(result.sessions.map((s) => s.id)).toEqual(['s1', 's2']);
+    });
+
+    it('an empty excludeIds set drops nothing (same result as omitting the param)', () => {
+      const withEmptySet = reshapeSessionsList(SESSIONS_RAW_FIXTURE, new Set());
+      const withoutParam = reshapeSessionsList(SESSIONS_RAW_FIXTURE);
+      expect(withEmptySet).toEqual(withoutParam);
+    });
+
+    it('omitting excludeIds entirely (existing 1-arg call sites) drops nothing — backward compatible', () => {
+      const result = reshapeSessionsList(SESSIONS_RAW_FIXTURE);
+      expect(result.sessions.map((s) => s.id)).toEqual(['sess-1', 'sess-2']);
+    });
+
+    it('also matches against the camelCase-derived id (excludeIds is keyed by the RESHAPED id, not the raw field spelling)', () => {
+      const result = reshapeSessionsList(
+        { sessions: [{ sessionId: 'ephemeral-camel', cwd: '/ws' }] },
+        new Set(['ephemeral-camel']),
+      );
+      expect(result.sessions).toEqual([]);
+    });
+
+    it('a nextCursor is preserved unchanged even when every session on the page is dropped', () => {
+      const result = reshapeSessionsList(
+        { sessions: [{ session_id: 'ephemeral-1', cwd: '/ws' }], next_cursor: 'more' },
+        new Set(['ephemeral-1']),
+      );
+      expect(result).toEqual({ sessions: [], nextCursor: 'more' });
+    });
+  });
 });
 
 /**

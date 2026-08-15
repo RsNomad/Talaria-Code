@@ -257,7 +257,10 @@ export class SessionsPanelSource implements PanelSource<'sessions'> {
     }
 
     const raw: AcpListSessionsRawResult = await client.listSessions(cwd, cursor);
-    const page: SessionsData = reshapeSessionsList(raw as RawSessionListResult);
+    // TG-5 (AU-51, INV-20): drop any ephemeral one-shot session id
+    // (`OneShotRunner`'s `session/new` mints) before it ever enters the
+    // accumulated page — see `reshapeSessionsList`'s own doc.
+    const page: SessionsData = reshapeSessionsList(raw as RawSessionListResult, this.ctx.getOneShotSessionIds());
 
     for (const session of page.sessions) {
       if (bucket.seenIds.has(session.id)) continue;

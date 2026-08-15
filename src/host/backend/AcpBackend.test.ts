@@ -49,6 +49,8 @@ import type { DashboardService } from '../dashboard/HermesDashboardManager';
 import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../dashboard/HermesDashboardClient';
 import type { ConfinedReader } from './acp/confinedOpen';
 import { ConnectionSupervisor, type ConnectionSupervisorHostPort } from './connection/ConnectionSupervisor';
+import type { WorkspaceStateLike } from './oneshot/OneShotSessionRegistry';
+import { ONESHOT_SESSION_IDS_STORAGE_KEY } from './oneshot/OneShotSessionRegistry';
 import { SessionRegistry } from './session/SessionRegistry';
 import { must } from '../../testing/must';
 import { TRUST_GATED_METHODS } from './control/ControlDispatcher';
@@ -10887,6 +10889,249 @@ describe('AcpBackend.oneShot — §2c one-shot utility-model surface (T5b)', () 
       client.resolveInFlightPrompt({ stopReason: 'cancelled' }); // the real prompt() finally settles
       await flushMicrotasks();
       expect(seam(backend).ephemeral.has('ephemeral-1')).toBe(false);
+    });
+  });
+});
+
+/**
+ * TG-5 (AU-51, `docs_claude/audit-fix-architecture.md` ADR-4, INV-20):
+ * one-shot utility sessions (`OneShotRunner`'s ephemeral `session/new`
+ * mints — commit-message generation etc.) persist server-side forever (the
+ * ACP wire has no close) and would otherwise pollute `session.list` +
+ * `~/.hermes/state.db` + accumulate AIAgents in the acp child over time.
+ * Two independent layers:
+ *  - layer 1 (deterministic): every minted id is recorded into
+ *    `OneShotSessionRegistry` (a bounded, `workspaceState`-persisted LRU) —
+ *    `reshapeSessionsList` drops those ids before the panel ever sees them.
+ *  - layer 2 (best-effort): once the one-shot settles (success/timeout/
+ *    cancel), `AcpBackend` dispatches `session.delete {session_id}` on the
+ *    tui_gateway control plane — CONFIRMED viable (harness `server.py
+ *    :5973-5980`'s active-guard only ever sees the GATEWAY's own
+ *    `_sessions`, never an acp-child id, so it passes the guard and
+ *    `db.delete_session` removes the row from the SHARED `state.db`).
+ *    Failures are LOG-ONLY (control channel down != one-shot failure).
+ */
+describe('AcpBackend.oneShot — TG-5 (AU-51): ephemeral session cleanup', () => {
+  /** {@link makeOneShotBackend} + a {@link FakeControlChannel} swapped in
+   *  (the `withFakeControl` escape hatch), so `session.delete` dispatches
+   *  are observable/controllable. */
+  function makeOneShotBackendWithControl(): {
+    backend: AcpBackend;
+    client: FakeAcpClient;
+    control: FakeControlChannel;
+    logs: string[];
+  } {
+    const base = makeOneShotBackend();
+    const control = withFakeControl(base.backend);
+    return { ...base, control };
+  }
+
+  describe('layer 1 (deterministic): the panel never sees a minted ephemeral id', () => {
+    it("a one-shot's minted ephemeral session id is absent from session.list WHILE the one-shot is still in flight (recorded at mint, not at settle)", async () => {
+      const { backend, client } = makeOneShotBackend();
+      client.queueSessionId('ephemeral-1');
+      const resultPromise = backend.oneShot('Generate commit message', { cwd: '/ws' });
+      await flushMicrotasks();
+
+      client.setListSessionsResult({
+        sessions: [
+          { session_id: 'ephemeral-1', cwd: '/ws', title: 'One-shot' },
+          { session_id: 'session-1', cwd: '/ws', title: 'Real chat' },
+        ],
+        next_cursor: null,
+      });
+      const page = (await backend.invokeControl('session.list', {})) as SessionsData;
+      expect(page.sessions.map((s) => s.id)).toEqual(['session-1']);
+
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+      await resultPromise;
+    });
+
+    it("stays absent from session.list AFTER the one-shot has settled", async () => {
+      const { backend, client } = makeOneShotBackend();
+      client.queueSessionId('ephemeral-1');
+      const resultPromise = backend.oneShot('Generate commit message', { cwd: '/ws' });
+      await flushMicrotasks();
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+      await resultPromise;
+
+      client.setListSessionsResult({
+        sessions: [
+          { session_id: 'ephemeral-1', cwd: '/ws', title: 'One-shot' },
+          { session_id: 'session-1', cwd: '/ws', title: 'Real chat' },
+        ],
+        next_cursor: null,
+      });
+      const page = (await backend.invokeControl('session.list', {})) as SessionsData;
+      expect(page.sessions.map((s) => s.id)).toEqual(['session-1']);
+    });
+  });
+
+  describe('layer 2 (best-effort): session.delete dispatches once the one-shot settles', () => {
+    it('a successful settle dispatches session.delete {session_id} on the control plane', async () => {
+      const { backend, client, control } = makeOneShotBackendWithControl();
+      client.queueSessionId('ephemeral-1');
+      const resultPromise = backend.oneShot('hi', { cwd: '/ws' });
+      await flushMicrotasks();
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+      await resultPromise;
+
+      expect(control.dispatchCalls).toEqual(
+        expect.arrayContaining([{ method: 'session.delete', params: { session_id: 'ephemeral-1' } }]),
+      );
+    });
+
+    it('a tool-call-tripwire cancel settle also dispatches session.delete', async () => {
+      const { backend, client, control } = makeOneShotBackendWithControl();
+      client.queueSessionId('ephemeral-1');
+      const resultPromise = backend.oneShot('hi', { cwd: '/ws' });
+      await flushMicrotasks();
+
+      fireSessionUpdate(backend)('ephemeral-1', {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc-1',
+        title: 'write_file',
+        kind: 'edit',
+      });
+      await flushMicrotasks();
+
+      expect(await resultPromise).toEqual({ ok: false, error: 'unexpected tool call' });
+      expect(control.dispatchCalls).toEqual(
+        expect.arrayContaining([{ method: 'session.delete', params: { session_id: 'ephemeral-1' } }]),
+      );
+    });
+
+    describe('timeout settle', () => {
+      beforeEach(() => {
+        vi.useFakeTimers();
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it('a deadline timeout (session already created) also dispatches session.delete', async () => {
+        const { backend, client, control } = makeOneShotBackendWithControl();
+        client.queueSessionId('ephemeral-1');
+        client.newSessionModeId = 'accept_edits'; // forces setSessionMode -> hangs -> deadline fires with a known id
+        client.setSessionMode = () => new Promise<void>(() => {});
+
+        const resultPromise = backend.oneShot('hi', { cwd: '/ws', timeoutMs: 5_000 });
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(await resultPromise).toEqual({ ok: false, error: 'timed out' });
+        expect(control.dispatchCalls).toEqual(
+          expect.arrayContaining([{ method: 'session.delete', params: { session_id: 'ephemeral-1' } }]),
+        );
+      });
+    });
+
+    it('a session.delete failure is LOG-ONLY — the one-shot itself still resolves ok:true (control channel down != one-shot failure)', async () => {
+      const { backend, client, control, logs } = makeOneShotBackendWithControl();
+      control.setDeferredFor('session.delete', Promise.reject(new Error('control channel down')));
+      client.queueSessionId('ephemeral-1');
+
+      const resultPromise = backend.oneShot('hi', { cwd: '/ws' });
+      await flushMicrotasks();
+      fireSessionUpdate(backend)('ephemeral-1', {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'feat: add x' },
+      });
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+
+      expect(await resultPromise).toEqual({ ok: true, text: 'feat: add x' });
+      await flushMicrotasks(); // let the rejected session.delete dispatch's .catch(log) settle
+      expect(logs.some((l) => l.includes('session.delete') && l.includes('control channel down'))).toBe(true);
+    });
+  });
+
+  describe('layer 1 persistence: the LRU registry survives a simulated window reload', () => {
+    /** A minimal in-memory {@link WorkspaceStateLike} — `updateCalls` is what
+     *  the persistence-on-record tests assert on; `state` (the same Map) is
+     *  what a SECOND `AcpBackend` construction (the "reload") reads from. */
+    function makeFakeWorkspaceState(initial: Record<string, unknown> = {}): {
+      state: WorkspaceStateLike;
+      updateCalls: Array<{ key: string; value: unknown }>;
+    } {
+      const store = new Map<string, unknown>(Object.entries(initial));
+      const updateCalls: Array<{ key: string; value: unknown }> = [];
+      const state: WorkspaceStateLike = {
+        get: <T,>(key: string) => store.get(key) as T | undefined,
+        update: (key: string, value: unknown) => {
+          updateCalls.push({ key, value });
+          store.set(key, value);
+          return Promise.resolve();
+        },
+      };
+      return { state, updateCalls };
+    }
+
+    /** Like {@link makeOneShotBackend}, but with an explicit `workspaceState`
+     *  wired through the (last, defaulted) constructor param — the only way
+     *  to prove persist/reload without reaching into a private field. */
+    function makeOneShotBackendWithWorkspaceState(workspaceState: WorkspaceStateLike): {
+      backend: AcpBackend;
+      client: FakeAcpClient;
+    } {
+      const backend = new AcpBackend(
+        {} as HermesRuntimeConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        workspaceState,
+      );
+      const client = new FakeAcpClient();
+      seam(backend).client = client;
+      seam(backend).cwd = '/ws';
+      seam(backend).sessionId = 'session-1';
+      return { backend, client };
+    }
+
+    it('a minted one-shot id is persisted to workspaceState under the pinned storage key', async () => {
+      const { state, updateCalls } = makeFakeWorkspaceState();
+      const { backend, client } = makeOneShotBackendWithWorkspaceState(state);
+      client.queueSessionId('ephemeral-1');
+
+      const resultPromise = backend.oneShot('hi', { cwd: '/ws' });
+      await flushMicrotasks();
+
+      expect(
+        updateCalls.some(
+          (c) =>
+            c.key === ONESHOT_SESSION_IDS_STORAGE_KEY &&
+            Array.isArray(c.value) &&
+            (c.value as string[]).includes('ephemeral-1'),
+        ),
+      ).toBe(true);
+
+      client.resolveInFlightPrompt({ stopReason: 'end_turn' });
+      await flushMicrotasks();
+      await resultPromise;
+    });
+
+    it('a SECOND AcpBackend sharing the same workspaceState (a simulated reload) already excludes the persisted id from session.list — before minting anything new', async () => {
+      const { state } = makeFakeWorkspaceState({
+        [ONESHOT_SESSION_IDS_STORAGE_KEY]: ['stale-ephemeral-1'],
+      });
+      const { backend, client } = makeOneShotBackendWithWorkspaceState(state);
+
+      client.setListSessionsResult({
+        sessions: [
+          { session_id: 'stale-ephemeral-1', cwd: '/ws' },
+          { session_id: 'session-1', cwd: '/ws' },
+        ],
+        next_cursor: null,
+      });
+      const page = (await backend.invokeControl('session.list', {})) as SessionsData;
+      expect(page.sessions.map((s) => s.id)).toEqual(['session-1']);
     });
   });
 });

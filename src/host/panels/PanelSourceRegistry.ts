@@ -181,6 +181,17 @@ export interface PanelSourceContext {
    * `rootId` is absent/unregistered (checkpoints unavailable for it).
    */
   getRootTracker(rootId: string): CheckpointTrackerLike | undefined;
+  /**
+   * TG-5 (AU-51, INV-20): the live set of ephemeral one-shot session ids
+   * `OneShotRunner` has minted this install (`OneShotSessionRegistry`,
+   * bounded + `workspaceState`-persisted) — the `sessions` source passes
+   * this to `reshapeSessionsList`'s `excludeIds` so a one-shot utility call
+   * (commit-message generation etc.) never surfaces in the History panel,
+   * even though the ACP wire has no close and the id persists server-side
+   * forever. Connection-level, like `getAcpClient`/`dispatch` — read at
+   * fetch time, never a construction-time snapshot.
+   */
+  getOneShotSessionIds(): ReadonlySet<string>;
   readonly logger?: Logger;
 }
 

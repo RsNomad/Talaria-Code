@@ -402,18 +402,32 @@ function normalizeUpdatedAt(raw: string | number | null | undefined): string | u
  * (not nullable) fields. `updated_at` may also arrive as a stringified epoch
  * float (or a raw epoch number) rather than ISO-8601 — see
  * {@link normalizeUpdatedAt} (CA-17).
+ *
+ * TG-5 (AU-51, INV-20): `excludeIds` — when supplied — drops any session
+ * whose RESHAPED `id` is a member, keyed post-normalization (so it matches
+ * regardless of whether the raw entry used `session_id` or `sessionId`).
+ * `SessionsPanelSource` passes `ctx.getOneShotSessionIds()` here so
+ * `OneShotRunner`'s ephemeral one-shot ids never reach the panel — the
+ * deterministic layer-1 guarantee (`OneShotSessionRegistry`'s own doc);
+ * every OTHER caller omits it and behaves exactly as before (nothing
+ * dropped).
  */
-export function reshapeSessionsList(raw: RawSessionListResult): SessionsData {
-  const sessions: SessionSummary[] = (raw.sessions ?? []).map((s) => {
-    const id = s.session_id ?? s.sessionId ?? '';
-    const updatedAtRaw = s.updated_at ?? s.updatedAt;
-    return {
-      id,
-      cwd: s.cwd ?? '',
-      title: s.title ?? undefined,
-      updatedAt: normalizeUpdatedAt(updatedAtRaw),
-    };
-  });
+export function reshapeSessionsList(
+  raw: RawSessionListResult,
+  excludeIds?: ReadonlySet<string>,
+): SessionsData {
+  const sessions: SessionSummary[] = (raw.sessions ?? [])
+    .map((s) => {
+      const id = s.session_id ?? s.sessionId ?? '';
+      const updatedAtRaw = s.updated_at ?? s.updatedAt;
+      return {
+        id,
+        cwd: s.cwd ?? '',
+        title: s.title ?? undefined,
+        updatedAt: normalizeUpdatedAt(updatedAtRaw),
+      };
+    })
+    .filter((s) => !excludeIds?.has(s.id));
   const nextCursor = raw.next_cursor ?? raw.nextCursor ?? undefined;
   return { sessions, nextCursor: nextCursor ?? undefined };
 }
