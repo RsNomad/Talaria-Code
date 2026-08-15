@@ -726,25 +726,31 @@ export class CheckpointTracker {
           // per-path catch below (`skippedPaths`), never silently escaping.
           //
           // AU-4/INV-12: `git show` above returned CONTENT ONLY, so the write
-          // always lands at the platform default (non-executable) — reapply
-          // the bit from the batched `ls-tree` read via the SAME open handle
-          // (`fchmod`, never a second path-based `fs.chmod` — that would
+          // always lands at the platform default — set the mode EXPLICITLY in
+          // BOTH directions from the batched `ls-tree` read, via the SAME open
+          // handle (`fchmod`, never a second path-based `fs.chmod` — that would
           // reopen a TOCTOU of its own between this write and a later chmod
-          // call). Only 100755 needs correcting: 100644 needs no action, and
-          // 120000/160000 (symlink/gitlink) are left alone on purpose —
-          // `writeTreeFromWorktree` stages via `git add -f` over real files
-          // only, so neither mode can occur in a tree this class wrote; if one
-          // somehow did, `git show` reads the git OBJECT DATABASE (never the
-          // worktree path), so a worktree symlink cannot affect what content
-          // it returns — it would still read a plain content blob, and
-          // chmod-ing that to 0o755 would be actively wrong. A refusal/chmod
-          // failure here rides the SAME per-path catch below as the write —
-          // one disclosure channel (`skippedPaths`) for every reason, per the
-          // T-C3 comment above.
+          // call). BOTH directions matter: 100755 needs the exec bit SET, and
+          // 100644 needs it CLEARED. Writing non-executable content over a file
+          // that already exists at 0o755 (an undo back to a pre-`chmod +x`
+          // checkpoint) would otherwise leave a STALE exec bit, because
+          // `open(O_CREAT|O_TRUNC)` preserves an existing file's mode — the
+          // `mode` arg only applies on CREATE. That stale bit makes the live
+          // worktree tree differ from the just-restored baseline in MODE ONLY,
+          // so the very next `redo()`/restore is falsely refused by the
+          // dirty-guard (the exact Linux-only regression the redo test pins —
+          // invisible on win32, where the exec bit cannot exist, so every gate
+          // that ran there skipped it). 120000/160000 (symlink/gitlink) cannot
+          // occur in a tree this class wrote (`writeTreeFromWorktree` stages via
+          // `git add -f` over real files only), and `git show` reads the git
+          // OBJECT DATABASE (never the worktree path), so a worktree symlink
+          // cannot affect the content it returns. A chmod failure here rides the
+          // SAME per-path catch below as the write — one disclosure channel
+          // (`skippedPaths`) for every reason, per the T-C3 comment above.
           await writeFileNoFollow(
             absPath,
             content,
-            targetModes.get(change.path) === '100755' ? { mode: 0o755 } : {},
+            { mode: targetModes.get(change.path) === '100755' ? 0o755 : 0o644 },
           );
         }
         changedPaths.push(change.path);

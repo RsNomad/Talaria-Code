@@ -529,12 +529,39 @@ describe('CheckpointTracker', () => {
       },
     );
 
+    posixModeIt(
+      'restore CLEARS a stale executable bit when the target checkpoint is non-executable (both-directions normalize — root cause of the redo dirty-guard refusal)',
+      async () => {
+        // Node's `open(O_CREAT|O_TRUNC)` mode arg applies ONLY on create, so
+        // rewriting content over an existing 0o755 file leaves the exec bit
+        // stale unless restore chmods it DOWN. A stale bit makes the worktree
+        // differ from the just-restored baseline in mode only → the dirty-guard
+        // then falsely refuses the next redo/restore. Pin the clear direction
+        // directly (the redo test above catches it only via that side effect).
+        await writeFile('deploy.sh', 'v1 (not executable yet)');
+        const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+        await tracker.init();
+        const nonExec = (await tracker.snapshot(1, 'non-exec'))!;
+
+        // Make it executable + change content, capture that, then undo back.
+        await writeFile('deploy.sh', '#!/bin/sh\necho hi\n');
+        await fs.chmod(path.join(workspaceRoot, 'deploy.sh'), 0o755);
+        await tracker.snapshot(2, 'exec');
+
+        const restored = await tracker.restore(nonExec.id);
+        expect(restored.restored).toBe(true);
+        const mode = (await fs.stat(path.join(workspaceRoot, 'deploy.sh'))).mode;
+        // The 0o755 bit must be CLEARED — the file is non-executable again.
+        expect(mode & 0o111).toBe(0);
+      },
+    );
+
     // Platform-independent companion to the two tests above: those prove the
     // OS-visible OUTCOME (skipped on win32, where the exec bit cannot be
     // represented at all — verified: Node's chmod/fchmod is a no-op for the
     // exec bits on Windows, so the assertion would be meaningless there
     // either way). This test instead proves the CALL — that restoreInternal
-    // reads the target's real `git ls-tree` mode and applies 0o755 only for a
+    // reads the target's real `git ls-tree` mode and applies the exact tree mode in both directions, not just for a
     // 100755 entry — without depending on the OS honoring it. AU-14/TD-2
     // moved the chmod from a path-based `fs.chmod` to `FileHandle#chmod`
     // (`fchmod`) on the SAME handle `writeFileNoFollow` writes through (never
@@ -546,7 +573,7 @@ describe('CheckpointTracker', () => {
     // tracker's own subsequent `git add -f` (inside snapshot(2)) does not
     // re-derive the mode from the OS and clobber the forced bit — runs
     // identically on every platform, including this suite's Windows dev box.
-    it('applies handle.chmod(0o755) (fchmod, same fd as the write) only for a target whose git tree entry mode is 100755', async () => {
+    it('applies handle.chmod (fchmod, same fd as the write) with the exact tree mode in both directions — 0o755 for 100755, 0o644 for 100644 (clears a stale exec bit)', async () => {
       await writeFile('deploy.sh', 'content-v1');
       await writeFile('readme.txt', 'hello');
       const tracker = new CheckpointTracker(storageDir, workspaceRoot);
@@ -585,7 +612,9 @@ describe('CheckpointTracker', () => {
         const result = await tracker.restore(c2.id, { force: true });
         expect(result.restored).toBe(true);
         expect(chmodCalls).toContainEqual({ path: deployPath, mode: 0o755 });
-        expect(chmodCalls.some((c) => c.path === readmePath)).toBe(false);
+        // Both directions: the 100644 entry is chmod'd DOWN to 0o644 (clears a
+        // stale exec bit) — not left untouched (the old one-way-only contract).
+        expect(chmodCalls).toContainEqual({ path: readmePath, mode: 0o644 });
       } finally {
         openSpy.mockRestore();
       }
