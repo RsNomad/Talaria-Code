@@ -384,6 +384,105 @@ describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
     await waitFor(() => expect(installed).toEqual(['myorg/tools/a']));
   });
 
+  it('TH-2 (AU-38): a fresh scan result surfaces summary, policy verdict + reason, and severity counts — not just a bare finding count', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubScan={async (identifier) => ({
+          name: identifier,
+          identifier,
+          source: 'github',
+          trust_level: 'trusted',
+          verdict: 'caution',
+          summary: 'Two findings need review before install.',
+          policy: 'ask',
+          policy_reason: 'Requests outbound network access from an unverified publisher.',
+          findings: [
+            {
+              severity: 'high',
+              category: 'network',
+              file: 'src/fetch.py',
+              line: 12,
+              description: 'Makes an outbound HTTP call.',
+            },
+            {
+              severity: 'low',
+              category: 'filesystem',
+              file: 'src/util.py',
+              line: 3,
+              description: 'Reads a local config file.',
+            },
+          ],
+          severity_counts: { critical: 0, high: 1, medium: 0, low: 1 },
+        })}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    await user.type(screen.getByLabelText(/Identifier/i), 'anthropics/skills/pdf');
+    await user.click(screen.getByRole('button', { name: /^Check$/i }));
+
+    // RED today: only a Pill + "2 finding(s)" render — the summary/policy
+    // reason/per-bucket counts are dropped entirely.
+    await screen.findByText('Two findings need review before install.');
+    expect(screen.getByText('ask')).toBeInTheDocument();
+    expect(
+      screen.getByText('Requests outbound network access from an unverified publisher.'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('1 high · 1 low')).toBeInTheDocument();
+    expect(screen.queryByText(/^\d+ findings?$/)).not.toBeInTheDocument();
+
+    // The findings themselves stay collapsed until the chevron is opened —
+    // same disclosure grammar as the SKILL.md preview in this same card.
+    expect(screen.queryByText('Makes an outbound HTTP call.')).not.toBeInTheDocument();
+    const findingsToggle = screen.getByRole('button', { name: /Findings \(2\)/i });
+    expect(findingsToggle).toHaveAttribute('aria-expanded', 'false');
+    await user.click(findingsToggle);
+    expect(findingsToggle).toHaveAttribute('aria-expanded', 'true');
+
+    expect(screen.getByText('network')).toBeInTheDocument();
+    expect(screen.getByText('src/fetch.py:12')).toBeInTheDocument();
+    expect(screen.getByText('Makes an outbound HTTP call.')).toBeInTheDocument();
+    expect(screen.getByText('filesystem')).toBeInTheDocument();
+    expect(screen.getByText('src/util.py:3')).toBeInTheDocument();
+    expect(screen.getByText('Reads a local config file.')).toBeInTheDocument();
+  });
+
+  it('TH-2 (AU-38): an all-clear scan (zero severity_counts) renders an honest "No findings" line, not a blank', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubScan={async (identifier) => ({
+          name: identifier,
+          identifier,
+          source: 'github',
+          trust_level: 'trusted',
+          verdict: 'safe',
+          summary: 'No issues detected.',
+          policy: 'allow',
+          policy_reason: '',
+          findings: [],
+          severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+        })}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    await user.type(screen.getByLabelText(/Identifier/i), 'anthropics/skills/pdf');
+    await user.click(screen.getByRole('button', { name: /^Check$/i }));
+
+    await screen.findByText('No issues detected.');
+    expect(screen.getByText('No findings')).toBeInTheDocument();
+  });
+
   it('a provenance:"hub" row shows Remove and firing it calls onHubUninstall(name); the non-hub row never gets one', async () => {
     const user = userEvent.setup();
     const uninstalled: string[] = [];

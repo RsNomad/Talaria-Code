@@ -79,6 +79,63 @@ export function verdictTone(verdict: string): PillTone {
   return totalLookup(VERDICT_TONE, verdict, 'neutral');
 }
 
+/** `HubScan.policy` -> the `Pill` tone that renders it: `allow` is the
+ * uncontested default (neutral), `ask` wants a decision (warn), `block` is
+ * a refusal (del). */
+const POLICY_TONE: Record<HubScan['policy'], PillTone> = {
+  allow: 'neutral',
+  ask: 'warn',
+  block: 'del',
+};
+
+/**
+ * Task TH-2 (AU-38): total map from a scan `policy` to its `Pill` tone, same
+ * `totalLookup` posture as {@link verdictTone} — an out-of-contract policy
+ * (a version-skewed/buggy host) falls back to `'neutral'` rather than
+ * `<Pill tone={undefined}>` degrading silently.
+ */
+export function policyTone(policy: string): PillTone {
+  return totalLookup(POLICY_TONE, policy, 'neutral');
+}
+
+/** Per-finding `severity` -> the `Pill` tone that renders it in the
+ * Findings disclosure. `dangerous`/`high` read as del (the two scanner
+ * vocabularies this repo has seen — `HubScan.verdict` and per-finding
+ * `severity` — don't share one enum), `medium`/`caution` as warn, `low` as
+ * neutral. */
+const FINDING_SEVERITY_TONE: Record<string, PillTone> = {
+  dangerous: 'del',
+  high: 'del',
+  medium: 'warn',
+  caution: 'warn',
+  low: 'neutral',
+};
+
+/**
+ * Task TH-2 (AU-38): total map from a per-finding `severity` string to its
+ * `Pill` tone — any other/unknown severity (including a version-skewed
+ * host) falls back to `'neutral'`, never `undefined`.
+ */
+export function findingSeverityTone(severity: string): PillTone {
+  return totalLookup(FINDING_SEVERITY_TONE, severity, 'neutral');
+}
+
+/** Display order for the severity-counts line — worst first. */
+const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'] as const;
+
+/**
+ * Task TH-2 (AU-38): renders `HubScan.severity_counts` as an honest,
+ * consent-relevant summary — e.g. `"1 critical · 2 high"` — replacing the
+ * bare finding count the card used to show. Zero buckets are omitted so the
+ * line stays short; when EVERY bucket is zero this returns the literal
+ * `'No findings'` (an explicit all-clear, never a blank string that could
+ * read as "nothing rendered" rather than "nothing found").
+ */
+export function severityCountsSummary(counts: HubScan['severity_counts']): string {
+  const parts = SEVERITY_ORDER.filter((sev) => counts[sev] > 0).map((sev) => `${counts[sev]} ${sev}`);
+  return parts.length > 0 ? parts.join(' · ') : 'No findings';
+}
+
 /**
  * Task B6 (§5.6) UX-hint mirror of the HOST's `skillSourceGate.ts`
  * `TRUSTED_SKILL_PREFIXES` (read-only, never edited from here — that file is
@@ -389,6 +446,10 @@ function InstallFromHubDisclosure({
   const [checkError, setCheckError] = useState<string | undefined>();
   const [result, setResult] = useState<{ preview: HubPreview; scan: HubScan; forIdentifier: string } | undefined>();
   const [mdOpen, setMdOpen] = useState(false);
+  // TH-2 (AU-38): the per-finding detail disclosure, same collapsed-by-default
+  // posture as `mdOpen` above — not reset on a new Check, matching that
+  // sibling's own behavior.
+  const [findingsOpen, setFindingsOpen] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [installNotice, setInstallNotice] = useState<HubNotice | undefined>();
 
@@ -509,9 +570,71 @@ function InstallFromHubDisclosure({
                   {result.preview.description && (
                     <div className="mt-1 font-mono text-2xs text-faint">{result.preview.description}</div>
                   )}
-                  <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
-                    {result.scan.findings.length} finding{result.scan.findings.length === 1 ? '' : 's'}
+
+                  {/* TH-2 (AU-38): the scanner's own one-line human verdict —
+                      dropped entirely before this fix. Untrusted scanner
+                      text, rendered as plain JSX text content only (no
+                      markdown/HTML interpretation). */}
+                  {result.scan.summary && (
+                    <p className="mt-1.5 text-2xs leading-snug text-muted break-words">{result.scan.summary}</p>
+                  )}
+
+                  {/* TH-2 (AU-38): the policy verdict (allow/ask/block) the
+                      HOST will itself act on, plus its reason — the user
+                      used to approve an install with neither in view. */}
+                  <div className="mt-1.5 flex items-start gap-1.5">
+                    <Pill tone={policyTone(result.scan.policy)}>{result.scan.policy}</Pill>
+                    {result.scan.policy_reason && (
+                      <span className="min-w-0 flex-1 text-2xs text-faint break-words">
+                        {result.scan.policy_reason}
+                      </span>
+                    )}
                   </div>
+
+                  {/* TH-2 (AU-38): replaces the old bare
+                      `{findings.length} finding(s)` line — a per-severity
+                      breakdown (worst first), or an explicit "No findings"
+                      all-clear rather than a blank. */}
+                  <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
+                    {severityCountsSummary(result.scan.severity_counts)}
+                  </div>
+
+                  {result.scan.findings.length > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setFindingsOpen((v) => !v)}
+                        aria-expanded={findingsOpen}
+                        className="mt-2 flex items-center gap-1 font-mono text-2xs text-muted hover:text-accent"
+                      >
+                        <Icon name={findingsOpen ? 'chevron-down' : 'chevron-right'} size={11} />
+                        {`Findings (${result.scan.findings.length})`}
+                      </button>
+                      {findingsOpen && (
+                        <div className="mt-1 max-h-48 overflow-auto rounded border border-border bg-overlay px-2 py-1.5">
+                          {result.scan.findings.map((finding, i) => (
+                            <div
+                              key={i}
+                              className="flex flex-col gap-0.5 border-b border-border py-1.5 first:pt-0 last:border-0 last:pb-0"
+                            >
+                              <div className="flex items-center gap-1.5">
+                                <Pill tone={findingSeverityTone(finding.severity)}>{finding.severity}</Pill>
+                                <span className="min-w-0 truncate font-mono text-2xs text-muted">
+                                  {finding.category}
+                                </span>
+                              </div>
+                              {/* Untrusted scanner strings — plain text nodes
+                                  only, same posture as `summary` above. */}
+                              <div className="font-mono text-2xs text-faint">{`${finding.file}:${finding.line}`}</div>
+                              <div className="text-2xs leading-snug text-muted break-words">
+                                {finding.description}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
 
                   <button
                     type="button"
