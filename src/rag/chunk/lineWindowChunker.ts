@@ -14,6 +14,10 @@ export function chunkByLines(
   if (contents.trim().length === 0) return [];
 
   const lines = contents.split('\n');
+  // AU-33: a trailing newline (`"a\nb\n"`) makes `split('\n')` emit a
+  // phantom trailing '' element — that's not a real line, just where the
+  // string ended. Drop it so `endLine` never points one line past EOF.
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
   const step = Math.max(1, windowLines - overlapLines);
   const chunks: ChunkWithoutHeader[] = [];
 
