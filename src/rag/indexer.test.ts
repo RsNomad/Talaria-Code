@@ -1430,6 +1430,118 @@ describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a 
   });
 });
 
+describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch event loses its stale rows + manifest entry', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-ta6-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  function makeIndexer(debounceMs = 10) {
+    return createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs,
+    });
+  }
+
+  async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(workspaceRoot, relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+  }
+
+  /** Mirrors the production `readManifest`'s own missing-file semantics
+   * (indexer.ts: `catch { return {}; }`) so assertions read cleanly whether
+   * or not a manifest.json has ever been written yet. */
+  async function readManifest(): Promise<Record<string, string>> {
+    try {
+      const raw = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8');
+      return JSON.parse(raw) as Record<string, string>;
+    } catch {
+      return {};
+    }
+  }
+
+  it('RED: a previously-indexed file that GROWS past MAX_FILE_BYTES on a watch event is purged from the store AND the manifest', async () => {
+    await writeWorkspaceFile('big.ts', 'export const x = 1;\n');
+    const indexer = makeIndexer();
+    await indexer.build(); // baseline: fully indexed, manifest entry + rows exist.
+    const before = await readManifest();
+    expect(before['big.ts']).toBeDefined();
+    deleteByPathMock.mockClear();
+    upsertMock.mockClear();
+
+    const disposable = indexer.watch();
+    // Grow the SAME path well past the 1MB cap (indexer.ts's MAX_FILE_BYTES)
+    // — the watch path's SINGLE-target `reindexFiles` call has no diff pass
+    // to self-heal this the way `runBuild` does (oversize files simply drop
+    // out of `current`, and `diff.toDelete` purges them there).
+    await writeWorkspaceFile('big.ts', 'a'.repeat(1_100_000));
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'big.ts') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // AU-24: at HEAD, the oversize `continue` fires BEFORE any purge — the
+    // file's OLD (now-wrong) chunks stay in the store and the manifest still
+    // claims it indexed, so the agent keeps retrieving stale content that no
+    // longer matches the file (it is now 1.1MB of `a`s, unindexable).
+    expect(deleteByPathMock).toHaveBeenCalledWith('big.ts');
+    expect(upsertMock).not.toHaveBeenCalled(); // oversize: never re-embedded/re-inserted.
+    const after = await readManifest();
+    expect(after['big.ts']).toBeUndefined();
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+
+  it('RED: a previously-indexed file that TURNS BINARY on a watch event is purged from the store AND the manifest', async () => {
+    await writeWorkspaceFile('data.ts', 'export const x = 1;\n');
+    const indexer = makeIndexer();
+    await indexer.build(); // baseline: fully indexed, manifest entry + rows exist.
+    const before = await readManifest();
+    expect(before['data.ts']).toBeDefined();
+    deleteByPathMock.mockClear();
+    upsertMock.mockClear();
+
+    const disposable = indexer.watch();
+    // A NUL byte in the first 8000 bytes is indexer.ts's `looksBinary` test —
+    // the same path (still small, still under the byte cap) now reads as
+    // binary instead of text.
+    await writeWorkspaceFile('data.ts', 'const x = 1;\x00\nexport {};\n');
+
+    const onChange = fsWatcherListeners.change[0]!;
+    onChange({ fsPath: path.join(workspaceRoot, 'data.ts') });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expect(deleteByPathMock).toHaveBeenCalledWith('data.ts');
+    expect(upsertMock).not.toHaveBeenCalled();
+    const after = await readManifest();
+    expect(after['data.ts']).toBeUndefined();
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+});
+
 describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manifest or mutate the store', () => {
   let workspaceRoot: string;
   let indexDir: string;

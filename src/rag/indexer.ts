@@ -482,6 +482,24 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         continue; // deleted between walk and read; the delete pass handles it.
       }
       if (buf.byteLength > MAX_FILE_BYTES || looksBinary(buf)) {
+        // TA-6 (AU-24, Med) / INV-3: at HEAD this `continue` fired BEFORE any
+        // purge — a previously-indexed file that grows past the size cap or
+        // turns binary kept its OLD (now-wrong) chunks in the store, and its
+        // manifest entry kept claiming it indexed, forever. The single-target
+        // watch call has no diff pass to self-heal this the way `runBuild`
+        // does (oversize/binary files simply drop out of `current`, and
+        // `diff.toDelete` purges them there, `:539-549,585-588`). Purge this
+        // path's stale rows and its manifest entry NOW, in the same op as the
+        // bail — idempotent and harmless on the build path too (these rows
+        // would be purged by the diff anyway).
+        await store.deleteByPath(relPath);
+        // TA-5 / INV-5: the purge above is an await — `dispose()` may have
+        // fired while it was in flight. Re-check before the manifest mutation
+        // that follows it (same discipline as every other await-then-mutate
+        // site in this function); bail with no observed width yet, matching
+        // this loop's own entry guard above (`if (disposed) return undefined;`).
+        if (disposed) return undefined;
+        delete manifest[relPath];
         continue;
       }
       const contents = buf.toString('utf8');
