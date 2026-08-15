@@ -20,6 +20,7 @@ import {
   resolvePanelRequest,
   setPanelSuccess,
   unwrapSetupResult,
+  type PanelAction,
   type PanelStateMap,
 } from './panels';
 
@@ -99,6 +100,36 @@ describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
       message: 'The agent session is not started yet.',
       retryable: true,
     });
+  });
+
+  /*
+   * AU-10: the host-side companion fix (`ControlDispatcher.fetchPanelData`)
+   * now REJECTS a `panel.data{panel:'sessions'}` request with a reasoned
+   * `PanelUnavailableError` (e.g. "Agent is not connected yet.") instead of
+   * silently resolving with no data and no push. This test proves the
+   * webview HALF of INV-14 end-to-end through the REAL reducer (not just the
+   * dispatched action): once that rejection lands, `RemoteData` moves fully
+   * OUT of `loading` into a retryable `error` state — a spinner that would
+   * otherwise have no bounded lifetime now surfaces Retry. `fetchPanel`'s
+   * generic catch-on-invoke path (proven above) is what does this; nothing
+   * webview-side needed a NEW code path for the AU-10 scenario specifically
+   * — it was already sound, the host was just never rejecting.
+   */
+  it('AU-10: a rejected sessions fetch ("Agent is not connected yet.") folds through the REAL reducer into a retryable error RemoteData — never stuck in loading', async () => {
+    const dispatched: PanelAction[] = [];
+    const dispatch = vi.fn((action: PanelAction) => dispatched.push(action));
+    const request = vi.fn().mockRejectedValue(new Error('Agent is not connected yet.'));
+
+    await fetchPanel('sessions', { request, dispatch });
+
+    let state = reducePanelAction({}, dispatched[0] as PanelAction);
+    expect(state.sessions && isLoading(state.sessions)).toBe(true); // passes through loading...
+    state = reducePanelAction(state, dispatched[1] as PanelAction);
+    // ...but settles on a retryable error, not stuck.
+    expect(state.sessions && isError(state.sessions)).toBe(true);
+    if (state.sessions && isError(state.sessions)) {
+      expect(state.sessions.error).toEqual({ message: 'Agent is not connected yet.', retryable: true });
+    }
   });
 
   it('issues a correlated panel.data request for the panel', async () => {

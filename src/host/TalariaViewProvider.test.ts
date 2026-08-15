@@ -1692,12 +1692,19 @@ describe('TalariaViewProvider — setup.* is HOST-INTERNAL (Task 9)', () => {
  * Zero response-behavior change — these signals are additive observers a
  * Task-6 integration test subscribes to, fired BESIDE the existing
  * `control.response`/`panel.data` traffic these same handlers already send.
- * `hasData` is the honest oracle (`result !== undefined`): an unwired
- * `setupPanelSource` resolves `undefined`, so a cold 'setup' fetch is
- * `ok:true, hasData:false` — never faked to `true` (critic B3).
+ *
+ * AU-10 (fix-wave TE-3): the doc/test below used to read "`hasData` is the
+ * honest oracle (`result !== undefined`): an unwired `setupPanelSource`
+ * resolves `undefined`, so a cold 'setup' fetch is `ok:true, hasData:false`
+ * — never faked to `true`" — but `ok:true, hasData:false` is EXACTLY the
+ * eternal-spinner-with-no-retry shape INV-14 forbids (the webview's
+ * correlated request resolved successfully with nothing, and no push ever
+ * follows). `handleSetupPanelFetch` now REJECTS that pre-`setSetupController`
+ * window with a `PanelUnavailableError` instead, so this fetch is honestly
+ * `ok:false` (still `hasData:false` — nothing changes there).
  */
 describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §4.2)', () => {
-  it('fires {kind:"ready"} on ready, then an honest hasData:false panelFetch for an unwired setup fetch', async () => {
+  it('fires {kind:"ready"} on ready, then an honest ok:false panelFetch for an unwired setup fetch (AU-10: rejected, not silently held at hasData:false)', async () => {
     const { provider } = makeProvider(vi.fn().mockResolvedValue(undefined));
     const signals: WebviewSignal[] = [];
     provider.onWebviewSignal((s) => signals.push(s));
@@ -1715,7 +1722,7 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     expect(signals).toEqual([
       { kind: 'ready' },
-      { kind: 'panelFetch', panel: 'setup', cause: 'hydrate', ok: true, hasData: false },
+      { kind: 'panelFetch', panel: 'setup', cause: 'hydrate', ok: false, hasData: false },
     ]);
   });
 

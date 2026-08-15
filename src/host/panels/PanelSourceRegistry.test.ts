@@ -145,8 +145,9 @@ describe('McpPanelSource — 2-RPC join (config.get + tools.list), no raw result
 });
 
 describe('SessionsPanelSource — ACP channel (NOT tui_gateway), two-channel invariant', () => {
-  it('suppresses the push (data: undefined) when no ACP client exists yet', async () => {
+  it('AU-10: resolves a reasoned `unavailable` outcome (not a silent data:undefined hold) when no ACP client exists yet', async () => {
     const outcome = await new SessionsPanelSource(makeContext({ getAcpClient: () => undefined })).fetch();
+    expect(outcome).toEqual({ unavailable: 'Agent is not connected yet.' });
     expect(outcome.data).toBeUndefined();
   });
 

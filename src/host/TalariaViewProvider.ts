@@ -22,6 +22,7 @@ import { makePanelData, PANEL_SCOPE } from '../shared/protocol';
 import { redactControlResponse } from './redactControlResponse';
 import type { SetupController } from './setup/SetupController';
 import { SetupPanelSource } from './panels/setupPanelSource';
+import { PanelUnavailableError } from './panels/PanelSourceRegistry';
 
 /** Fixed brand accent (teal), layered over `--vscode-*` surfaces in the view. */
 const BRAND_ACCENT = '#14b8a6';
@@ -1029,13 +1030,27 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   /** `panel.data{panel:'setup'}` — mirrors every other panel's fetch+push
    *  contract (`ControlDispatcher.fetchPanelData`), reached through {@link
    *  setupPanelSource} instead of the agent-backend-owned registry (Setup
-   *  must render under the mock backend too — see the field's own doc). */
+   *  must render under the mock backend too — see the field's own doc).
+   *
+   *  AU-10: the tiny pre-`setSetupController` window (no {@link
+   *  setupPanelSource} wired yet) now REJECTS with a {@link
+   *  PanelUnavailableError} — mirroring `ControlDispatcher.fetchPanelData`'s
+   *  own `unavailable` handling — instead of silently resolving `undefined`
+   *  with no push. The old shape left the webview's correlated request
+   *  resolved-with-nothing (`ok:true, hasData:false`) and its `RemoteData`
+   *  stuck in `loading` forever (INV-14); `handleControlRequest`'s catch
+   *  turns this throw into an honest `control.response{ok:false}`, which the
+   *  webview's existing `fetchPanel` catch path already renders as a
+   *  retryable error. */
   private async handleSetupPanelFetch(): Promise<unknown> {
-    if (!this.setupPanelSource) return undefined;
-    const outcome = await this.setupPanelSource.fetch();
-    if (outcome.data !== undefined) {
-      this.postToWebview(makePanelData('setup', outcome.data));
+    if (!this.setupPanelSource) {
+      throw new PanelUnavailableError('Talaria: Backend Setup is not available in this window.');
     }
+    const outcome = await this.setupPanelSource.fetch();
+    if ('unavailable' in outcome) {
+      throw new PanelUnavailableError(outcome.unavailable);
+    }
+    this.postToWebview(makePanelData('setup', outcome.data));
     return outcome.data;
   }
 
@@ -1054,9 +1069,13 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     const seq = ++this.setupPushSeq;
     const outcome = await this.setupPanelSource.fetch();
     if (seq !== this.setupPushSeq) return; // a newer push has since started — this one is stale, drop it
-    if (outcome.data !== undefined) {
-      this.postToWebview(makePanelData('setup', outcome.data));
-    }
+    // AU-10: this is a fire-and-forget PUSH, not a correlated request — no
+    // caller is waiting to be rejected, so an `unavailable` outcome (never
+    // produced by `SetupPanelSource.fetch()` today; `SetupController.status()`
+    // always resolves real data) just best-effort drops the push, same as
+    // the pre-existing staleness drop above.
+    if ('unavailable' in outcome) return;
+    this.postToWebview(makePanelData('setup', outcome.data));
   }
 
   private handleSearchFiles(params: Record<string, unknown> | undefined): Promise<string[]> {

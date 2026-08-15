@@ -212,9 +212,12 @@ export class SessionsPanelSource implements PanelSource<'sessions'> {
 
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'sessions'>> {
     const client = this.ctx.getAcpClient();
-    // No client yet -> `{ data: undefined }` suppresses the push and resolves
-    // `undefined`, exactly like the old `refreshSessionsPanel`.
-    if (!client) return { data: undefined };
+    // AU-10: no client yet is a TERMINAL "unavailable" outcome, not a silent
+    // `{data: undefined}` hold — `ControlDispatcher.fetchPanelData` rejects
+    // the correlated request with this reason, which the webview's existing
+    // `fetchPanel` catch path renders as an honest, retryable error instead
+    // of spinning on "Loading…" forever (see `PanelFetchOutcome`'s own doc).
+    if (!client) return { unavailable: 'Agent is not connected yet.' };
 
     // The bucket MAP needs a concrete string key; the CLIENT call keeps
     // `cwd` as `string | undefined` (an unresolved cwd is passed through

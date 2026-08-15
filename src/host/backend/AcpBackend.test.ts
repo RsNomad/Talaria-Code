@@ -4416,6 +4416,18 @@ describe('AcpBackend.invokeControl — Zone HIST: sessions panel refresh (ACP se
     expect(control.dispatchCalls).toEqual([]);
   });
 
+  it('AU-10: a sessions fetch with NO ACP client connected REJECTS with a reasoned message and emits no push (instead of resolving with no data forever)', async () => {
+    const config: HermesRuntimeConfig = {};
+    const backend = new AcpBackend(config); // never start()ed — no client wired
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await expect(backend.invokeControl('panel.data', { panel: 'sessions' })).rejects.toThrow(
+      'Agent is not connected yet.',
+    );
+    expect(messages).toEqual([]); // no silent push either — a real terminal, not a hidden hold
+  });
+
   it("a direct 'session.list' control.invoke call (pagination 'load more') also refreshes the panel, passing params.cursor through", async () => {
     const { backend, client, messages } = makeBackend();
     client.setListSessionsResult({ sessions: [], next_cursor: null });

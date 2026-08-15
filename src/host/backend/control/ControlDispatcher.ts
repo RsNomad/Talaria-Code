@@ -22,6 +22,7 @@ import type { RootCoordinator } from '../../checkpoints/RootCoordinator';
 import type { RootRegistry } from '../../checkpoints/rootRegistry';
 import type { Logger } from '../../transport/JsonRpcStdio';
 import type { PanelSourceRegistry } from '../../panels/PanelSourceRegistry';
+import { PanelUnavailableError } from '../../panels/PanelSourceRegistry';
 import { extractCwd, extractRootId, extractSessionId } from '../../panels/panelSources';
 import type { DashboardService } from '../../dashboard/HermesDashboardManager';
 import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../../dashboard/HermesDashboardClient';
@@ -474,6 +475,15 @@ export class ControlDispatcher {
    * closing over it directly — was removed by W6-FI-c Part 2, which folds
    * that call through {@link refreshCheckpointsPanel} instead, so the
    * implementation now lives in, and is reached through, exactly one place.
+   *
+   * AU-10: an `unavailable` outcome REJECTS this call with a
+   * {@link PanelUnavailableError} instead of resolving with no data — the
+   * old `outcome.data !== undefined` gate silently swallowed BOTH the push
+   * AND the resolve for exactly this case, leaving the webview's correlated
+   * request resolved-with-nothing and its `RemoteData` stuck in `loading`
+   * forever (INV-14). The reject is UNCONDITIONAL (never staleness-gated,
+   * unlike the push below) — same "the caller's own correlated answer is
+   * always honest" posture the staleness comment already documents.
    */
   private async fetchPanelData<P extends DataPanel>(panel: P, params?: unknown): Promise<unknown> {
     const scopedParams = this.withDefaultCheckpointsScope(panel, params);
@@ -487,12 +497,16 @@ export class ControlDispatcher {
 
     const outcome = await this.port.panelSources.get(panel).fetch(scopedParams);
 
+    if ('unavailable' in outcome) {
+      throw new PanelUnavailableError(outcome.unavailable);
+    }
+
     // The CALLER's own correlated return value is always honest — a caller
     // that explicitly asked for this fetch gets its own answer regardless of
     // races. Only the BROADCAST push (shared, ambient webview state) has the
     // overwrite hazard, so only it is gated: a superseded attempt (a newer
     // fetch for the SAME scope has since landed) drops its push silently.
-    if (outcome.data !== undefined && this.panelFetchSeq.get(scopeKey) === seq) {
+    if (this.panelFetchSeq.get(scopeKey) === seq) {
       this.port.emit(this.buildPanelDataMessage(panel, outcome.data, scopedParams));
     }
     return outcome.data;
