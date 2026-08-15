@@ -45,6 +45,41 @@ import {
  * `result: raw` split (RAW upstream result on the resolve) was dropped — its
  * sole consumer (the webview's `fetchPanel`) ignored the resolved value, so it
  * had zero observable effect (finding A#6).
+ *
+ * F10 (TG-6, AU-OBS-L3) — FROZEN CONTRACT: these five sources (`ToolsPanelSource`,
+ * `SkillsPanelSource`, `ModelsPanelSource`, `SettingsPanelSource`, and
+ * `McpPanelSource`'s two dispatches) deliberately ride the gateway's global
+ * config channel with NO session scoping of their own — none of them reads,
+ * resolves, or constructs an acp `sessionId` (contrast `SessionsPanelSource`/
+ * `SubagentsPanelSource`, which explicitly do via `ctx.getSessionCwd`/
+ * `extractSessionId`). This is not an oversight to "helpfully" fix later: the
+ * gateway process routes by ITS OWN `_sessions` dict
+ * (`tui_gateway/server.py:5949-5988`, keyed at `:5966-5980`), which NEVER
+ * contains an acp-child session id — that id lives in a completely different
+ * namespace (`acp_adapter/session.py`). A dispatch that has no matching key in
+ * `_sessions` falls back to the gateway's own unknown-session global handling,
+ * which is exactly the behavior these config RPCs want (there is only ever
+ * one gateway-side config to read). Threading an acp `sessionId` into one of
+ * these dispatches expecting it to SCOPE the result would be a category
+ * error — the id means nothing on this wire — so no source here should ever
+ * be edited to add that.
+ *
+ * GROUNDING NOTE (do not remove without re-verifying): `ToolsPanelSource`,
+ * `ModelsPanelSource`, and `SettingsPanelSource` forward their `fetch(params)`
+ * argument to `ctx.dispatch` UNFILTERED; `SkillsPanelSource` spreads it too
+ * (merging in `action:'list'`) — none of the four inspects or strips a
+ * `sessionId` key if one is present in `params`. Today no caller ever puts one
+ * there: `webview/src/state/panels.ts`'s `resolvePanelRequest` exhaustively
+ * switches on `DataPanel` and only adds `sessionId` for the `subagents`/
+ * `sessions` branches (`tools`/`mcp`/`skills`/`models`/`settings`/`setup`
+ * return bare `{panel}`), and every host-internal `fetchPanelData('mcp'|
+ * 'skills'|'models', …)` call site (`ControlDispatcher.ts`) passes no params
+ * at all. So the "no session scoping" guarantee these four sources enjoy
+ * today is a CALLER-CONVENTION guarantee, not a defense in this file — only
+ * `McpPanelSource` is structurally immune (its `fetch` takes no params at
+ * all). Locked (the source-side half — no source may start EXPLICITLY
+ * threading a session id into its own dispatch) by
+ * `panelSources.gatewayScope.test.ts`.
  * -------------------------------------------------------------------------- */
 
 /** `tools.list` -> `ToolsData` (`tui_gateway/server.py:13439-13465`). */

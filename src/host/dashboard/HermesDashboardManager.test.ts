@@ -303,14 +303,27 @@ describe('HermesDashboardManager.ensure — spawn-only default (S3, CWE-306/346)
     expect(h.makeClientCalls).toEqual([MINTED_TOKEN, 'regenerated-token']);
   });
 
-  it('served token !== spawn token AND child DEAD → FOREIGN: refuses (throws); ensure() rejects and the memo clears', async () => {
+  it('served token !== spawn token AND child DEAD → FOREIGN: refuses (throws), naming the recovery escapes (F9/TG-6/AU-OBS-L3)', async () => {
     const h = makeSpawnOnlyManager({
       healthyProbe: [true],
       servedToken: 'squatter-token',
       childAlive: false,
     });
 
-    await expect(h.manager.ensure()).rejects.toThrow(/we did not spawn/i);
+    // F9: the refusal must name BOTH config escapes so the user isn't left
+    // guessing — talaria.dashboardPort (move off the squatted port) and,
+    // security-second (it's the riskier option), talaria.dashboardAdopt.
+    let caught: unknown;
+    try {
+      await h.manager.ensure();
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toMatch(/we did not spawn/i);
+    expect(message).toContain('talaria.dashboardPort');
+    expect(message).toContain('talaria.dashboardAdopt');
 
     // Memo cleared: a second ensure() re-attempts (spawns again) rather than
     // caching the refusal forever — this is what powers panel Retry.

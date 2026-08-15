@@ -264,8 +264,16 @@ export class HermesDashboardManager implements DashboardService {
         throw new Error('HermesDashboardManager: disposed while starting');
       }
       if (isForeignBackendToken({ servedToken, spawnToken: token, childAlive: child.alive() })) {
+        // F9 (TG-6, AU-OBS-L3): name the cause AND the two recovery escapes —
+        // the responder squatting on the port isn't ours, so either move us
+        // off it (talaria.dashboardPort), or — mentioned security-second
+        // because it is the riskier trade-off — adopt the squatter anyway
+        // (talaria.dashboardAdopt: 'shape'). Keep OS/token detail out of this
+        // string (token discipline); the CWE marker stays for grep-ability.
         throw new Error(
-          `dashboard at ${this.describeTarget()} is served by a process we did not spawn — refusing (CWE-306/346)`,
+          `dashboard at ${this.describeTarget()} is served by a process we did not spawn — refusing ` +
+            `(CWE-306/346). Either free talaria.dashboardPort so we can own it, or — accepting the ` +
+            `security trade-off — set talaria.dashboardAdopt to 'shape' to adopt it.`,
         );
       }
 
