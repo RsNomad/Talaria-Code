@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { DataPanel, PanelDataMap } from '../protocol';
-import { idle, isError, isLoading, isSuccess } from './remoteData';
+import { idle, isError, isLoading, isSuccess, success } from './remoteData';
 import {
   applyPanelTransition,
   assertExhaustivePanel,
@@ -59,6 +59,40 @@ describe('panel RemoteData reducer helpers (Part X2)', () => {
   });
 
   /*
+   * TI-3 (AU-42 Part B): the SYSTEMIC fix — a background-refresh failure
+   * (a Reload that fails, a push-triggered refetch that errors) must NEVER
+   * wipe already-loaded data. RED at HEAD: `local.panelError` replaced
+   * `success` with `failure(...)` unconditionally, so this asserted
+   * `next.tools` was `{status:'error',...}`, not the preserved success data.
+   */
+  it('TI-3: a background-refresh error over ALREADY-success data KEEPS the data — never replaces it with a failure card', () => {
+    const loaded: PanelStateMap = setPanelSuccess({}, 'tools', toolsData);
+    const next = reducePanelAction(loaded, {
+      type: 'local.panelError',
+      panel: 'tools',
+      message: 'refresh failed',
+      retryable: true,
+    });
+    expect(next.tools).toEqual({ status: 'success', data: toolsData });
+    // Same object reference, not just equal — no new RemoteData allocated
+    // for a slot that didn't change.
+    expect(next.tools).toBe(loaded.tools);
+  });
+
+  /*
+   * Companion to the test above: a FIRST-load failure (no data yet — idle,
+   * or loading as pinned by the pre-existing 'panelError moves a panel...'
+   * test just above) still becomes `failure` — the error card stays correct
+   * there. Pinned explicitly for the idle case too (loading already covered).
+   */
+  it('TI-3 companion: a first-load error (current is idle, no data to preserve) still becomes failure', () => {
+    const next = reducePanelAction({}, { type: 'local.panelError', panel: 'mcp', message: 'boom', retryable: false });
+    const entry = next.mcp;
+    expect(entry && isError(entry)).toBe(true);
+    if (entry && isError(entry)) expect(entry.error).toEqual({ message: 'boom', retryable: false });
+  });
+
+  /*
    * CF-10: an unbound tab's subagents request can never receive its push (the
    * host stamps it `unknown-session`; `foldSessionScoped` drops it — see
    * `fetchPanel`'s short-circuit below), so `fetchPanel` announces it via a
@@ -82,6 +116,38 @@ describe('panel RemoteData reducer helpers (Part X2)', () => {
   it('a plain panelLoading action (no emptyData) still transitions to loading, unaffected', () => {
     const next = applyPanelTransition(idle, { type: 'local.panelLoading', panel: 'subagents', scopeKey: 'tab-1' });
     expect(isLoading(next)).toBe(true);
+  });
+
+  /*
+   * TI-3 (AU-42 Part B): the re-scoped panels (subagents/checkpoints/
+   * sessions — everything that folds through `applyPanelTransition` rather
+   * than the map-keyed `reducePanelAction` above) get the SAME keep-data
+   * rule — assessed clean to extend (panel-agnostic, no new state shape) and
+   * done; only the refreshError side-map/banner is scoped OUT for these
+   * three (see this file's `RefreshErrorPanel` doc for why).
+   */
+  it('TI-3: applyPanelTransition ALSO keeps success data on a background-refresh error (subagents/checkpoints/sessions share the reducePanelAction rule)', () => {
+    const loaded = success<PanelDataMap['subagents']>({ delegations: [] });
+    const next = applyPanelTransition(loaded, {
+      type: 'local.panelError',
+      panel: 'subagents',
+      scopeKey: 'tab-1',
+      message: 'refresh failed',
+      retryable: true,
+    });
+    expect(next).toBe(loaded); // unchanged reference — no new RemoteData allocated
+  });
+
+  it('TI-3 companion: applyPanelTransition — a first-load error (idle, no data yet) still becomes failure', () => {
+    const next = applyPanelTransition(idle, {
+      type: 'local.panelError',
+      panel: 'checkpoints',
+      scopeKey: '/root-a',
+      message: 'lock timeout',
+      retryable: true,
+    });
+    expect(isError(next)).toBe(true);
+    if (isError(next)) expect(next.error).toEqual({ message: 'lock timeout', retryable: true });
   });
 });
 
@@ -149,6 +215,31 @@ describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
 
     expect(dispatch).toHaveBeenCalledTimes(1); // loading only
     expect(dispatch).toHaveBeenCalledWith({ type: 'local.panelLoading', panel: 'tools' });
+  });
+
+  /*
+   * TI-3 (AU-42 Part A): `fetchPanel` now resolves to a `FetchPanelOutcome`
+   * (was bare `Promise<void>`) — purely additive, still never REJECTS (a
+   * rejection is still caught and folded into `local.panelError` exactly as
+   * before, proven by the dispatch-focused tests above/below). This is what
+   * lets a caller that wants the settled outcome — SkillsPanel's "Reload
+   * skills" busy+notice (TI-3 Part A) — react without a second request.
+   */
+  it('TI-3: resolves {ok:true} when the invoke resolves', async () => {
+    const dispatch = vi.fn();
+    const request = vi.fn().mockResolvedValue(undefined);
+
+    await expect(fetchPanel('skills', { request, dispatch })).resolves.toEqual({ ok: true });
+  });
+
+  it('TI-3: resolves {ok:false, message} — never rejects — when the invoke rejects', async () => {
+    const dispatch = vi.fn();
+    const request = vi.fn().mockRejectedValue(new Error('dashboard unreachable'));
+
+    await expect(fetchPanel('skills', { request, dispatch })).resolves.toEqual({
+      ok: false,
+      message: 'dashboard unreachable',
+    });
   });
 
   it('Retry re-invokes: calling fetchPanel again issues a second request', async () => {

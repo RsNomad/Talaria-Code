@@ -34,7 +34,7 @@ import type {
 } from './protocol';
 import { BOOTSTRAP_TAB_ID } from './protocol';
 import { EMPTY_SETUP_PROGRESS, type SetupProgressMap } from './panels/setupCards';
-import type { PanelStateMap } from './state/panels';
+import type { PanelStateMap, RefreshErrorPanel } from './state/panels';
 import { idle, type RemoteData } from './state/remoteData';
 
 export interface UserItem {
@@ -357,6 +357,21 @@ export interface AppState {
    * one" local-state posture).
    */
   pendingSessionLoad?: { tabId: string; sessionId: string };
+  /**
+   * TI-3 (AU-42 Part B): a background-refresh failure's MESSAGE for a
+   * map-keyed global panel that was already showing `success` data — kept
+   * OUTSIDE `globalPanels`' `RemoteData` (same posture as BF-A's
+   * `sessionsLoadMoreError`, App.tsx) so the failure never wipes the loaded
+   * list, just drives a dismissible banner over it (`RemotePanel`'s
+   * `refreshError` prop, `panels/PanelShell.tsx`). Scoped to
+   * {@link RefreshErrorPanel} (`tools`/`mcp`/`skills`/`models`/`settings` —
+   * see that type's own doc for why `'setup'` and the three re-scoped
+   * panels are excluded). Set by `state/transcript.ts`'s
+   * `reducePanelActionScoped` on a `local.panelError` over already-success
+   * data; cleared by that SAME panel's next success push (`foldPanelData`)
+   * or a user dismiss (`local.refreshError.dismiss`).
+   */
+  refreshError?: Partial<Record<RefreshErrorPanel, string>>;
 }
 
 /** W2-F1 boot default — ask-everything until the host's live preset arrives. */

@@ -40,6 +40,19 @@ export function SectionLabel({ children, id }: { children: ReactNode; id?: strin
   );
 }
 
+/**
+ * TI-3 (AU-42 Part B): a background-refresh failure over data already
+ * showing — never a first-load failure (that's still `PanelError` below).
+ * `message` is the failure text (`AppState.refreshError[panel]`); `onRetry`
+ * re-runs the panel fetch (the SAME handler `RemotePanelProps.onRetry`
+ * already carries — callers reuse it); `onDismiss` clears the side-map entry.
+ */
+export interface RefreshErrorBanner {
+  message: string;
+  onRetry: () => void;
+  onDismiss: () => void;
+}
+
 interface RemotePanelProps<T> {
   /** The panel's RemoteData; `undefined` is treated as idle (not yet fetched). */
   remote: RemoteData<T> | undefined;
@@ -47,6 +60,14 @@ interface RemotePanelProps<T> {
   loadingHint: string;
   /** Re-invoke the fetch (wired to `fetchPanel` for this panel). */
   onRetry: () => void;
+  /**
+   * TI-3 (AU-42 Part B): when set AND `remote.status === 'success'`, renders
+   * a dismissible banner above the resolved children instead of silently
+   * showing nothing about the background failure. Omitted (or `undefined`)
+   * renders exactly as before — every existing caller that doesn't pass this
+   * prop is byte-for-byte unaffected.
+   */
+  refreshError?: RefreshErrorBanner;
   /** Rendered ONLY in the success state, with the resolved data. */
   children: (data: T) => ReactNode;
 }
@@ -60,13 +81,24 @@ interface RemotePanelProps<T> {
  * `matchQueryStatus`). Success delegates entirely to `children(data)`, so each
  * panel keeps its own `PanelShell` header/meta.
  */
-export function RemotePanel<T>({ remote, loadingHint, onRetry, children }: RemotePanelProps<T>) {
+export function RemotePanel<T>({ remote, loadingHint, onRetry, refreshError, children }: RemotePanelProps<T>) {
   const status = remote?.status ?? 'idle';
   if (status === 'error' && remote?.status === 'error') {
     return <PanelError message={remote.error.message} retryable={remote.error.retryable} onRetry={onRetry} />;
   }
   if (remote?.status === 'success') {
-    return <>{children(remote.data)}</>;
+    return (
+      <>
+        {refreshError && (
+          <RefreshErrorNotice
+            message={refreshError.message}
+            onRetry={refreshError.onRetry}
+            onDismiss={refreshError.onDismiss}
+          />
+        )}
+        {children(remote.data)}
+      </>
+    );
   }
   // idle | loading
   // B5 (M-4): announce "busy" for screen readers while the fetch is in
@@ -76,6 +108,47 @@ export function RemotePanel<T>({ remote, loadingHint, onRetry, children }: Remot
   return (
     <div role="status" aria-busy="true">
       <EmptyPanel hint={loadingHint} />
+    </div>
+  );
+}
+
+/**
+ * TI-3 (AU-42 Part B): the dismissible "stale data, refresh failed" banner —
+ * same tokens-only vocabulary as `PanelError` below (border-del/bg-del-soft
+ * for the message, a bordered Retry button), not a restyle. `role="status"`
+ * directly on the container (no separate `LiveRegion`, matching this file's
+ * own loading-branch idiom just above) — the banner mounts/unmounts with
+ * `refreshError` itself, so there is no stable "permanently mounted" slot to
+ * route through a text-swapping LiveRegion the way a per-row notice does.
+ */
+function RefreshErrorNotice({ message, onRetry, onDismiss }: RefreshErrorBanner) {
+  return (
+    <div
+      role="status"
+      className="mx-3 mb-2 mt-2 flex flex-none items-start gap-2 rounded-card border border-del bg-del-soft px-3 py-2 text-2xs text-fg"
+    >
+      <Icon name="error" size={13} className="mt-0.5 flex-none text-del" />
+      <span className="min-w-0 flex-1">
+        <div className="break-words">Couldn’t refresh — showing last loaded data.</div>
+        {/* The underlying reason, same "never hide the real message" posture
+            as `PanelError`'s own two-line headline+detail grammar below. */}
+        <div className="mt-0.5 font-mono text-2xs text-faint break-words">{message}</div>
+      </span>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="flex-none rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:border-accent hover:text-accent"
+      >
+        Retry
+      </button>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss"
+        className="flex-none rounded border border-border px-1.5 py-0.5 font-mono text-2xs text-muted hover:border-accent hover:text-accent"
+      >
+        <Icon name="close" size={11} />
+      </button>
     </div>
   );
 }

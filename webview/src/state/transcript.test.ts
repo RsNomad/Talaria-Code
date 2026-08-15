@@ -925,6 +925,91 @@ describe('transcript reducer — W4-T3b B6: panel-loading/error actions key on t
   );
 });
 
+/*
+ * TI-3 (AU-42 Part B): the SYSTEMIC fix, at the AppState level.
+ * `reducePanelAction`/`applyPanelTransition` (state/panels.ts) own the
+ * RemoteData-keep half (panels.test.ts); this reducer owns the
+ * `refreshError` side-map half — recording/clearing the per-panel message
+ * kept OUTSIDE RemoteData, exactly mirroring BF-A's `sessionsLoadMoreError`.
+ */
+describe('transcript reducer — TI-3 (AU-42 Part B): refreshError side-map for the 5 in-scope global panels', () => {
+  it('a local.panelError while a global panel (skills) is already success KEEPS the data and records refreshError', () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'skills', data: globalPanelData.skills });
+    state = reduceLocal(state, {
+      type: 'local.panelError',
+      panel: 'skills',
+      message: 'refresh failed',
+      retryable: true,
+    });
+    expect(state.globalPanels.skills).toEqual({ status: 'success', data: globalPanelData.skills });
+    expect(state.refreshError?.skills).toBe('refresh failed');
+  });
+
+  it('a local.panelError while a global panel (mcp) is idle/first-load records NO refreshError (the error card is the correct UI there)', () => {
+    const state = reduceLocal(INITIAL_STATE, {
+      type: 'local.panelError',
+      panel: 'mcp',
+      message: 'not connected',
+      retryable: true,
+    });
+    expect(state.globalPanels.mcp).toMatchObject({ status: 'error' });
+    expect(state.refreshError?.mcp).toBeUndefined();
+  });
+
+  it("the panel's NEXT success push clears its refreshError (BF-A loadMoreError parity)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'tools', data: globalPanelData.tools });
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'tools', message: 'boom', retryable: true });
+    expect(state.refreshError?.tools).toBe('boom');
+
+    state = reduce(state, { type: 'panel.data', panel: 'tools', data: globalPanelData.tools });
+    expect(state.refreshError?.tools).toBeUndefined();
+    expect(state.globalPanels.tools).toEqual({ status: 'success', data: globalPanelData.tools });
+  });
+
+  it('local.refreshError.dismiss clears a panel\'s refreshError without touching its RemoteData', () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'models', data: globalPanelData.models });
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'models', message: 'boom', retryable: true });
+    expect(state.refreshError?.models).toBe('boom');
+
+    state = reduceLocal(state, { type: 'local.refreshError.dismiss', panel: 'models' });
+    expect(state.refreshError?.models).toBeUndefined();
+    expect(state.globalPanels.models).toEqual({ status: 'success', data: globalPanelData.models });
+  });
+
+  it('a SECOND background-refresh failure overwrites the FIRST message (latest wins), never accumulates', () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'settings', data: globalPanelData.settings });
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'settings', message: 'first', retryable: true });
+    expect(state.refreshError?.settings).toBe('first');
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'settings', message: 'second', retryable: true });
+    expect(state.refreshError?.settings).toBe('second');
+    expect(state.globalPanels.settings).toEqual({ status: 'success', data: globalPanelData.settings });
+  });
+
+  it("scope decision: 'setup' KEEPS its data on a background-refresh error (the panel-agnostic reducer rule) but records NO refreshError entry (excluded — see RefreshErrorPanel's doc)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'setup', data: globalPanelData.setup });
+    state = reduceLocal(state, { type: 'local.panelError', panel: 'setup', message: 'boom', retryable: true });
+    expect(state.globalPanels.setup).toEqual({ status: 'success', data: globalPanelData.setup }); // kept, not wiped
+    expect(state.refreshError).toBeUndefined(); // no side-map entry at all — 'setup' is out of scope
+  });
+
+  it('scope decision: subagents/checkpoints/sessions ALSO keep their success data on a background-refresh error (reducer rule extended — panels.test.ts pins applyPanelTransition itself); no refreshError side-map exists for them (scoped out, tabId/rootId-shaped side-maps would need their own design)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    const tabId = state.activeTabId;
+    state = reduce(state, { type: 'panel.data', panel: 'subagents', sessionId: 's1', data: { delegations: [] } });
+    state = reduceLocal(state, {
+      type: 'local.panelError',
+      panel: 'subagents',
+      scopeKey: tabId,
+      message: 'refresh failed',
+      retryable: true,
+    });
+    expect(must(state.tabs[tabId]).subagents).toEqual({ status: 'success', data: { delegations: [] } });
+    // No AppState.refreshError entry exists for a non-RefreshErrorPanel scope
+    // (subagents isn't even a valid key of the type) — nothing to assert
+    // beyond "the data survived", which is the actual defect this fixes.
+  });
+});
+
 describe('transcript reducer — W4 §2d: tab.bound / tab.error fold into the NAMED tab, drop-unknown otherwise', () => {
   it('tab.bound sets sessionId/binding/title/rootId on the named tab', () => {
     const state = reduce(INITIAL_STATE, {

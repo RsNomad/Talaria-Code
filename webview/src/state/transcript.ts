@@ -23,7 +23,14 @@ import {
   type TabState,
   type TranscriptItem,
 } from '../types';
-import { applyPanelTransition, assertExhaustivePanel, reducePanelAction, setPanelSuccess, type PanelAction } from './panels';
+import {
+  applyPanelTransition,
+  assertExhaustivePanel,
+  reducePanelAction,
+  setPanelSuccess,
+  type PanelAction,
+  type RefreshErrorPanel,
+} from './panels';
 import { success, type RemoteData } from './remoteData';
 import { handleSessionChange, sessionToTab } from './tabs';
 
@@ -538,13 +545,27 @@ function foldPanelData(state: AppState, msg: Extract<HostToWebview, { type: 'pan
       return { ...state, rootPanels: { ...state.rootPanels, [msg.rootId]: success(msg.data) } };
     case 'sessions':
       return { ...state, sessionsPanel: success(msg.data) };
+    // TI-3 (AU-42 Part B, scope decision): 'setup' stays on the plain path —
+    // see `RefreshErrorPanel`'s doc (state/panels.ts) for why it carries no
+    // `refreshError` side-map entry to clear here.
+    case 'setup':
+      return { ...state, globalPanels: setPanelSuccess(state.globalPanels, msg.panel, msg.data) };
     case 'tools':
     case 'mcp':
     case 'skills':
     case 'models':
-    case 'settings':
-    case 'setup':
-      return { ...state, globalPanels: setPanelSuccess(state.globalPanels, msg.panel, msg.data) };
+    case 'settings': {
+      const globalPanels = setPanelSuccess(state.globalPanels, msg.panel, msg.data);
+      // TI-3 (AU-42 Part B): a fresh success push is one of the two ways a
+      // panel's `refreshError` clears (the other is a user dismiss — see
+      // `local.refreshError.dismiss` below). No-op (same `state.refreshError`
+      // reference) when nothing was set, so a panel that never had a
+      // background-refresh failure never grows a spurious empty entry.
+      if (!state.refreshError?.[msg.panel]) return { ...state, globalPanels };
+      const refreshError = { ...state.refreshError };
+      delete refreshError[msg.panel];
+      return { ...state, globalPanels, refreshError };
+    }
     default:
       return assertExhaustivePanel(panel);
   }
@@ -1002,6 +1023,13 @@ export type LocalAction =
   // .pendingSessionLoad`'s own doc for the clearing half (the `tab.bound`/
   // `tab.error` cases below).
   | { type: 'local.sessionLoad.start'; tabId: string; sessionId: string }
+  // TI-3 (AU-42 Part B): dismisses one panel's `refreshError` banner — the
+  // OTHER way it clears besides that panel's next success push (see
+  // `AppState.refreshError`'s own doc). `panel` is scoped to
+  // {@link RefreshErrorPanel}, never a bare `DataPanel` — a dismiss for a
+  // panel outside this task's scope (e.g. `'setup'`) would be meaningless
+  // (no entry to clear) and this keeps that a compile-time impossibility.
+  | { type: 'local.refreshError.dismiss'; panel: RefreshErrorPanel }
   // Part X2: a panel's own loading/error transitions (fed by fetchPanel).
   | PanelAction;
 
@@ -1058,13 +1086,37 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
     }
     case 'sessions':
       return { ...state, sessionsPanel: applyPanelTransition(state.sessionsPanel, action) };
+    // TI-3 (AU-42 Part B, scope decision): 'setup' stays on the plain path —
+    // `reducePanelAction` above already applies the keep-data rule to it
+    // (panel-agnostic), it just never gains a `refreshError` side-map entry.
+    // See `RefreshErrorPanel`'s doc (state/panels.ts).
+    case 'setup':
+      return { ...state, globalPanels: reducePanelAction(state.globalPanels, action) };
     case 'tools':
     case 'mcp':
     case 'skills':
     case 'models':
-    case 'settings':
-    case 'setup':
-      return { ...state, globalPanels: reducePanelAction(state.globalPanels, action) };
+    case 'settings': {
+      // Captured BEFORE the fold below — this is what tells whether the
+      // panel was already `success` (a background refresh) as opposed to a
+      // first load (idle/loading/error), the same distinction
+      // `reducePanelAction`'s own keep-data rule makes.
+      const wasSuccess = state.globalPanels[action.panel]?.status === 'success';
+      const globalPanels = reducePanelAction(state.globalPanels, action);
+      if (action.type !== 'local.panelError' || !wasSuccess) {
+        return { ...state, globalPanels };
+      }
+      // TI-3 (AU-42 Part B): the SAME fold step that just kept the
+      // RemoteData (above) records the refresh-failure MESSAGE in the
+      // side-map — mirrors BF-A's `sessionsLoadMoreError` (App.tsx), kept
+      // OUTSIDE RemoteData so a background refresh failure never wipes the
+      // loaded list, just surfaces a dismissible banner over it.
+      return {
+        ...state,
+        globalPanels,
+        refreshError: { ...state.refreshError, [action.panel]: action.message },
+      };
+    }
     default:
       return assertExhaustivePanel(action.panel);
   }
@@ -1142,6 +1194,13 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
     case 'local.panelLoading':
     case 'local.panelError':
       return reducePanelActionScoped(state, action);
+
+    case 'local.refreshError.dismiss': {
+      if (!state.refreshError?.[action.panel]) return state; // nothing to clear
+      const refreshError = { ...state.refreshError };
+      delete refreshError[action.panel];
+      return { ...state, refreshError };
+    }
 
     case 'local.tab.open': {
       // MAX_TABS is primarily a UI admission check (the tab strip's "+"

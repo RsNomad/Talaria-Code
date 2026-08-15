@@ -9,10 +9,11 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { ReactElement } from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { HubInstallResult, HubPreview, HubScan, SkillsData } from '../protocol';
 import { SkillsPanel } from './SkillsPanel';
+import { RemotePanel } from './PanelShell';
 import { must } from '../testing/must';
 
 function setup(jsx: ReactElement) {
@@ -46,7 +47,10 @@ function skillsData(enabled: boolean): SkillsData {
   };
 }
 
-const noop = () => undefined;
+// TI-3 (AU-42 Part A): `onRefresh` is now correlated (resolves to
+// `fetchPanel`'s `FetchPanelOutcome` shape) — every pre-existing test below
+// that doesn't exercise Reload itself just needs SOME resolved promise.
+const noop = () => Promise.resolve({ ok: true });
 
 /** A request issued and never answered — the only honest model of "the user's
  *  toggle is STILL IN FLIGHT at the instant a host push lands". Resolving it
@@ -670,5 +674,127 @@ describe('AU-40: hub "Check" goes BUSY, not natively disabled, while the preview
     // rule; jsdom witnesses it only indirectly, through the attribute
     // posture above, since it never actually blurs a disabled element.
     expect(pending).toHaveFocus();
+  });
+});
+
+/**
+ * Task TI-3 (AU-42 Part A): "Reload skills" gets the McpPanel `handleReload`
+ * treatment — busy posture (`busyInteraction`, TH-3/AU-40 posture: stays
+ * focusable, `aria-busy`/`aria-disabled`, never native `disabled`) + a
+ * `LiveRegion`-announced outcome notice. Same `role="status"`-inside-
+ * `section.contents` scoping idiom `McpPanel.dom.test.tsx`'s own Reload
+ * tests use (this panel also has per-row `role="status"` regions —
+ * toggle-rollback + hub notices — so an unscoped `getByRole('status')` would
+ * find more than one match).
+ */
+function reloadStatusRegion() {
+  const section = must(screen.getByRole('button', { name: /Reload skills/i }).closest('section'));
+  return within(section).getByRole('status');
+}
+
+describe('TI-3 (AU-42 Part A): "Reload skills" goes busy + announces its outcome', () => {
+  it('the status live region is present — and empty — before any reload is triggered', () => {
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+    expect(reloadStatusRegion()).toHaveTextContent('');
+  });
+
+  it('a click goes BUSY (stays focusable, never natively disabled) while onRefresh is pending, then announces "Reload requested." on success', async () => {
+    const user = userEvent.setup();
+    let resolveRefresh: (() => void) | undefined;
+    const onRefresh = () => new Promise<unknown>((res) => { resolveRefresh = () => res({ ok: true }); });
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={onRefresh} {...noopSkillsAdminProps()} />,
+    );
+
+    const button = screen.getByRole('button', { name: /Reload skills/i });
+    expect(button).not.toHaveFocus();
+    await user.click(button);
+
+    const pending = screen.getByRole('button', { name: /Reloading…/i });
+    expect(pending, 'AU-40: an in-flight Reload must stay focusable — never natively disabled').not.toBeDisabled();
+    expect(pending).toHaveAttribute('aria-busy', 'true');
+    expect(pending).toHaveAttribute('aria-disabled', 'true');
+    expect(pending).toHaveFocus();
+
+    resolveRefresh?.();
+    await waitFor(() => expect(reloadStatusRegion()).toHaveTextContent('Reload requested.'));
+    expect(screen.getByRole('button', { name: /^Reload skills$/i })).not.toHaveAttribute('aria-busy', 'true');
+  });
+
+  it('a rejection surfaces "Reload failed." (no rich envelope to read, unlike McpPanel\'s reload.mcp)', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={() => Promise.reject(new Error('dashboard unreachable'))}
+        {...noopSkillsAdminProps()}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Reload skills/i }));
+    await waitFor(() => expect(reloadStatusRegion()).toHaveTextContent('dashboard unreachable'));
+  });
+
+  it('an honest {ok:false} outcome (the ordinary fetchPanel path — never rejects) surfaces its own message, falling back to "Reload failed." with none', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={async () => ({ ok: false })}
+        {...noopSkillsAdminProps()}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Reload skills/i }));
+    await waitFor(() => expect(reloadStatusRegion()).toHaveTextContent('Reload failed.'));
+  });
+});
+
+/**
+ * Task TI-3 (AU-42 Part B): the SYSTEMIC fix — a background-refresh failure
+ * over a panel already showing `success` data must KEEP the data and surface
+ * a dismissible banner, never wipe it back to a bare error card. Rendered
+ * through the REAL `RemotePanel` + `SkillsPanel` pairing (App.tsx's own
+ * wiring shape), not a synthetic stand-in, to prove the plumbing actually
+ * reaches this panel.
+ */
+describe('TI-3 (AU-42 Part B): a refreshError renders a dismissible banner over SkillsPanel, WITHOUT wiping the loaded data', () => {
+  it('renders "Couldn\'t refresh" + the message, with the skill rows still visible; dismiss clears it', async () => {
+    const user = userEvent.setup();
+    const dismissed: boolean[] = [];
+    const retried: boolean[] = [];
+    render(
+      <RemotePanel<SkillsData>
+        remote={{ status: 'success', data: skillsData(true) }}
+        loadingHint="Loading skills…"
+        onRetry={() => undefined}
+        refreshError={{
+          message: 'Agent is not connected yet.',
+          onRetry: () => retried.push(true),
+          onDismiss: () => dismissed.push(true),
+        }}
+      >
+        {(data) => (
+          <SkillsPanel data={data} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />
+        )}
+      </RemotePanel>,
+    );
+
+    // The banner AND the previously-loaded row both render — the defect
+    // this task fixes replaced the row with a full-panel error card instead.
+    expect(screen.getByText(/Couldn.t refresh/i)).toBeInTheDocument();
+    expect(screen.getByText('Agent is not connected yet.')).toBeInTheDocument();
+    expect(screen.getByText('web-search')).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'Enable web-search' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(retried).toEqual([true]);
+
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(dismissed).toEqual([true]);
   });
 });

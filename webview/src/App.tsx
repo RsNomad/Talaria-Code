@@ -43,7 +43,14 @@ import { MAX_TABS, PANEL_SCOPE } from './protocol';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
-import { errorMessage, fetchPanel, panelData, resolvePanelRequest, unwrapSetupResult } from './state/panels';
+import {
+  errorMessage,
+  fetchPanel,
+  panelData,
+  resolvePanelRequest,
+  unwrapSetupResult,
+  type RefreshErrorPanel,
+} from './state/panels';
 import { idle } from './state/remoteData';
 import { createInitialState, type AppState, type TabState } from './types';
 import type { ComposerSeed } from './composer/applySeed';
@@ -54,7 +61,7 @@ import { TabStrip, tabDomId, CHAT_TABPANEL_ID } from './components/TabStrip';
 import { Composer } from './components/Composer';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ChatView } from './components/chat/ChatView';
-import { RemotePanel } from './panels/PanelShell';
+import { RemotePanel, type RefreshErrorBanner } from './panels/PanelShell';
 import { ToolsPanel } from './panels/ToolsPanel';
 import { McpPanel } from './panels/McpPanel';
 import { SkillsPanel } from './panels/SkillsPanel';
@@ -361,10 +368,20 @@ export function App() {
   // `handleSetupPanelFetch`). `params` is already `Record<string, unknown>`
   // on the `control.request` wire, so spreading `trigger` in needs no
   // protocol change — the host's `extractPanelName` ignores extra keys.
+  //
+  // TI-3 (AU-42 Part A): returns `fetchPanel`'s promise (was `void
+  // fetchPanel(...)`, discarding it) — purely additive, since `fetchPanel`
+  // itself still never rejects (see its own doc). Every existing bare-
+  // statement caller (`requestPanel(panel)`) and every `() => requestPanel(
+  // panel)` handed to `onRetry: () => void` is unaffected (a function
+  // returning `Promise<X>` is assignable where `() => void` is expected);
+  // this only adds a settled outcome for a caller that wants one — the
+  // Skills "Reload skills" button (SkillsPanel's `onRefresh`), which unlike
+  // McpPanel's dedicated `reload.mcp` RPC has no envelope of its own to read.
   const requestPanel = (panel: DataPanel, trigger?: PanelFetchTrigger) => {
     const scopeTab = tab;
     const { scopeKey, rejectTag, params } = resolvePanelRequest(panel, scopeTab);
-    void fetchPanel(
+    return fetchPanel(
       panel,
       {
         request: (method, p) => bridge.request(method, p, rejectTag),
@@ -682,6 +699,23 @@ export function App() {
   // sessions share one cwd-filtered slice across every tab.
   const checkpointsRemote = state.rootPanels[tab.rootId] ?? idle;
 
+  // TI-3 (AU-42 Part B): the `RemotePanel`/`SettingsPanel` `refreshError` prop
+  // for one of the 5 in-scope global panels (`state/panels.ts`'s
+  // `RefreshErrorPanel`) — `undefined` when that panel has no standing
+  // refresh failure (the ordinary case), so every existing render is
+  // unaffected until `state.refreshError[panel]` is actually set. `onRetry`
+  // reuses the SAME handler each `RemotePanel` call already wires to its own
+  // `onRetry` prop — a refresh-error Retry IS an ordinary panel refetch.
+  const refreshErrorProp = (panel: RefreshErrorPanel): RefreshErrorBanner | undefined => {
+    const message = state.refreshError?.[panel];
+    if (!message) return undefined;
+    return {
+      message,
+      onRetry: () => requestPanel(panel),
+      onDismiss: () => dispatch({ local: { type: 'local.refreshError.dismiss', panel } }),
+    };
+  };
+
   return (
     <>
       <TabStrip
@@ -889,7 +923,12 @@ export function App() {
           className="flex min-h-0 flex-1 flex-col"
         >
           <ErrorBoundary region="the Tools panel">
-            <RemotePanel remote={globalPanels.tools} loadingHint="Loading tools…" onRetry={() => requestPanel('tools')}>
+            <RemotePanel
+              remote={globalPanels.tools}
+              loadingHint="Loading tools…"
+              onRetry={() => requestPanel('tools')}
+              refreshError={refreshErrorProp('tools')}
+            >
               {(data) => (
                 <ToolsPanel
                   data={data}
@@ -908,7 +947,12 @@ export function App() {
           className="flex min-h-0 flex-1 flex-col"
         >
           <ErrorBoundary region="the MCP panel">
-            <RemotePanel remote={globalPanels.mcp} loadingHint="Loading servers…" onRetry={() => requestPanel('mcp')}>
+            <RemotePanel
+              remote={globalPanels.mcp}
+              loadingHint="Loading servers…"
+              onRetry={() => requestPanel('mcp')}
+              refreshError={refreshErrorProp('mcp')}
+            >
               {(data) => (
                 <McpPanel
                   data={data}
@@ -934,7 +978,12 @@ export function App() {
           className="flex min-h-0 flex-1 flex-col"
         >
           <ErrorBoundary region="the Skills panel">
-            <RemotePanel remote={globalPanels.skills} loadingHint="Loading skills…" onRetry={() => requestPanel('skills')}>
+            <RemotePanel
+              remote={globalPanels.skills}
+              loadingHint="Loading skills…"
+              onRetry={() => requestPanel('skills')}
+              refreshError={refreshErrorProp('skills')}
+            >
               {(data) => (
                 <SkillsPanel
                   data={data}
@@ -1032,7 +1081,12 @@ export function App() {
           className="flex min-h-0 flex-1 flex-col"
         >
           <ErrorBoundary region="the Models panel">
-            <RemotePanel remote={globalPanels.models} loadingHint="Loading models…" onRetry={() => requestPanel('models')}>
+            <RemotePanel
+              remote={globalPanels.models}
+              loadingHint="Loading models…"
+              onRetry={() => requestPanel('models')}
+              refreshError={refreshErrorProp('models')}
+            >
               {(data) => (
                 <ModelsPanel
                   data={data}
@@ -1095,6 +1149,7 @@ export function App() {
               config={globalPanels.settings}
               onRetryConfig={() => requestPanel('settings')}
               onSetConfig={setConfig}
+              refreshError={refreshErrorProp('settings')}
             />
           </ErrorBoundary>
         </div>

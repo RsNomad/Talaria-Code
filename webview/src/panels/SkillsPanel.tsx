@@ -30,8 +30,18 @@ interface SkillsPanelProps {
   data: SkillsData;
   /** Persist a skill enable/disable (correlated → resolves/rejects). */
   onToggle: (name: string, enabled: boolean) => Promise<unknown>;
-  /** Re-fetch the list from the dashboard (Reload). */
-  onRefresh: () => void;
+  /**
+   * Re-fetch the list from the dashboard (Reload). TI-3 (AU-42 Part A):
+   * correlated (was `() => void`, fire-and-forget) so the button can show a
+   * busy posture + an outcome notice, mirroring McpPanel's `handleReload`.
+   * Unlike McpPanel's `onReload` — a dedicated `reload.mcp` RPC with its own
+   * `{status,message}` envelope — this IS the ordinary panel refetch
+   * (`requestPanel('skills')`, App.tsx), which resolves to `fetchPanel`'s
+   * `FetchPanelOutcome` shape (`{ok:true}`/`{ok:false,message}`,
+   * `state/panels.ts`) and never rejects; `interpretRefresh` below duck-types
+   * that shape without importing it (panels stay dumb components).
+   */
+  onRefresh: () => Promise<unknown>;
   /** Correlated `skills.create` — the HOST renders the create-consent modal; this call only summons it. */
   onCreate: (params: SkillCreateParams) => Promise<unknown>;
   /** Correlated `skills.hubPreview` — read-only, not trust-gated. */
@@ -301,6 +311,36 @@ function HubNoticeCard({ notice }: { notice: HubNotice | undefined }) {
       )}
     </>
   );
+}
+
+/** A user-facing notice derived from the reload outcome — mirrors McpPanel's
+ *  own `ReloadNotice` (not exported there — copied locally, same "no shared
+ *  component" posture as every other local UI primitive this file already
+ *  copies from McpPanel). */
+interface ReloadNotice {
+  tone: 'ok' | 'error';
+  text: string;
+}
+
+/**
+ * Task TI-3 (AU-42 Part A): "Reload skills" IS the ordinary `panel.data`
+ * refetch (unlike McpPanel's dedicated `reload.mcp` RPC), so there is no
+ * server-authored `{status,message}` envelope to surface here — `onRefresh`
+ * resolves to `fetchPanel`'s `FetchPanelOutcome` shape
+ * (`{ok:true}`/`{ok:false,message}`, `state/panels.ts`), duck-typed below
+ * (no cross-layer type import — panels stay dumb components, App.tsx owns
+ * the wiring) the same way McpPanel's `interpretReload` duck-types the
+ * gateway's envelope. A7 "each action names itself": the honest default
+ * copy is "Reload requested."/"Reload failed." since there's nothing richer
+ * to say for this panel's reload.
+ */
+function interpretRefresh(result: unknown): ReloadNotice {
+  const r = (result ?? {}) as { ok?: unknown; message?: unknown };
+  if (r.ok === false) {
+    const message = typeof r.message === 'string' && r.message ? r.message : undefined;
+    return { tone: 'error', text: message ?? 'Reload failed.' };
+  }
+  return { tone: 'ok', text: 'Reload requested.' };
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +759,32 @@ export function SkillsPanel({
   const { isOn, toggle, lastError } = useToggle(onToggle);
   const [uninstalling, setUninstalling] = useState<Record<string, boolean>>({});
   const [hubNotice, setHubNotice] = useState<Record<string, HubNotice>>({});
+  // TI-3 (AU-42 Part A): "Reload skills" busy + outcome notice — same shape
+  // as McpPanel's `reloading`/`notice` pair.
+  const [reloading, setReloading] = useState(false);
+  const [reloadNotice, setReloadNotice] = useState<ReloadNotice | undefined>();
+  // AU-40: purely in-flight — nothing genuinely-indefinite gates reload.
+  const reloadInteraction = busyInteraction(false, reloading);
+
+  /**
+   * TI-3 (AU-42 Part A): mirrors McpPanel's `handleReload` exactly (busy
+   * guard, clear-then-await, `.finally` resets busy) — the only difference
+   * is `interpretRefresh` above reading `onRefresh`'s honest-default outcome
+   * instead of a server envelope.
+   */
+  const handleReload = () => {
+    // AU-40: guard replacing the native `disabled` this button used to rely
+    // on to block a second click while a reload is in flight.
+    if (reloading) return;
+    setReloading(true);
+    setReloadNotice(undefined);
+    void onRefresh()
+      .then(
+        (result) => setReloadNotice(interpretRefresh(result)),
+        (err: unknown) => setReloadNotice({ tone: 'error', text: errorMessage(err, 'Reload failed.') }),
+      )
+      .finally(() => setReloading(false));
+  };
 
   /** Task B6 (§5.4 `skills.hubUninstall`): the click only SUMMONS the host's
    *  native remove-consent modal — a decline resolves as a rejection and is
@@ -827,14 +893,43 @@ export function SkillsPanel({
       <CreateSkillDisclosure onCreate={onCreate} />
       <InstallFromHubDisclosure onHubPreview={onHubPreview} onHubScan={onHubScan} onHubInstall={onHubInstall} />
 
-      <button
-        type="button"
-        onClick={onRefresh}
-        className="mt-1 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent"
-      >
-        <Icon name="refresh" size={13} />
-        Reload skills
-      </button>
+      {/* `display:contents`: same query-scoping-only wrapper McpPanel's own
+          Reload region uses (`section.contents` — invisible to layout) so a
+          test can find THIS `role="status"` region unambiguously among the
+          per-row LiveRegions (toggle rollback, hub notices) also on this
+          panel. TI-3 (AU-42 Part A): the notice is now a REAL outcome
+          (busy + ok/error), not a bare fire-and-forget click. */}
+      <section className="contents">
+        <LiveRegion text={reloadNotice?.text ?? ''} className="sr-only" />
+        {reloadNotice && (
+          <div
+            className={`mt-1 flex items-start gap-2 rounded-card border px-3 py-2 text-2xs ${
+              reloadNotice.tone === 'ok'
+                ? 'border-border bg-surface text-muted'
+                : 'border-del bg-del-soft text-fg'
+            }`}
+          >
+            <Icon
+              name={reloadNotice.tone === 'ok' ? 'check' : 'error'}
+              size={13}
+              className={`mt-0.5 flex-none ${reloadNotice.tone === 'ok' ? 'text-accent' : 'text-del'}`}
+            />
+            <span className="min-w-0 flex-1 break-words">{reloadNotice.text}</span>
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={handleReload}
+          disabled={reloadInteraction.nativeDisabled}
+          aria-disabled={reloadInteraction.ariaDisabled}
+          aria-busy={reloadInteraction.ariaBusy}
+          className="mt-1 flex w-full items-center justify-center gap-2 rounded-card border border-dashed border-border py-2.5 font-mono text-2xs uppercase tracking-wide text-muted hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-60 disabled:hover:border-border disabled:hover:text-muted aria-disabled:cursor-default aria-disabled:opacity-60 aria-disabled:hover:border-border aria-disabled:hover:text-muted"
+        >
+          <Icon name={reloading ? 'loading' : 'refresh'} size={13} spin={reloading} />
+          {reloading ? 'Reloading…' : 'Reload skills'}
+        </button>
+      </section>
     </PanelShell>
   );
 }
