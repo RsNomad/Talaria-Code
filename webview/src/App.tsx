@@ -470,7 +470,10 @@ export function App() {
     // implicit index signature for those, so the params are rebuilt as a
     // fresh object literal here (the same posture `restoreCheckpoint` above
     // uses for its own `Record<string, unknown>` params).
-    const wireParams: Record<string, unknown> = { name: p.name, env: p.env };
+    // Rev-1 B4 (CF-13 parity): no `env` field at all — the webview never
+    // collects a credential value; the host prompts for each of the entry's
+    // `required_env` vars itself, masked, after the consent modal.
+    const wireParams: Record<string, unknown> = { name: p.name };
     const result = await bridge.request('mcp.catalogInstall', wireParams);
     return result as McpCatalogInstallResult;
   };

@@ -148,6 +148,12 @@ vi.mock('vscode', () => {
   // to simulate cancellation.
   const window = {
     showWarningMessage: vi.fn(),
+    // Rev-1 B4 (CF-13 parity, TH-4) harness extension: `window.showInputBox`
+    // backs the masked host-side credential prompt (`ControlDispatcherHostPort
+    // .promptSecret`). Defaults to `undefined` (an unconfigured call reads as
+    // a dismissed prompt, the fail-closed direction) — tests that need a
+    // real value configure it explicitly via `mockShowInputBox.mockResolvedValueOnce(...)`.
+    showInputBox: vi.fn(),
     withProgress: vi.fn(
       async (
         _opts: unknown,
@@ -854,6 +860,9 @@ const mockWorkspace = vscode.workspace as unknown as {
 
 /** W4-T4b: the mocked `vscode.window.showWarningMessage` spy. */
 const mockShowWarningMessage = vscode.window.showWarningMessage as unknown as ReturnType<typeof vi.fn>;
+
+/** Rev-1 B4 (CF-13 parity, TH-4): the mocked `vscode.window.showInputBox` spy — backs `ControlDispatcherHostPort.promptSecret`. */
+const mockShowInputBox = vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>;
 
 /**
  * W4-T4b: the `onDidChangeConfiguration` listener registered by the MOST
@@ -7712,7 +7721,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     withFakeControl(backend);
     mockShowWarningMessage.mockClear();
 
-    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'ghost', env: {} })).rejects.toThrow(/catalog/i);
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'ghost' })).rejects.toThrow(/catalog/i);
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
@@ -7723,7 +7732,14 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     control.setResultFor('config.get', { mcp_servers: {} });
     control.setResultFor('tools.list', { toolsets: [] });
     client.catalogEntries = [
-      catalogRow({ name: 'builder', needs_install: true, install_url: 'https://github.com/x/y', install_ref: 'v1', bootstrap: ['npm ci'] }),
+      catalogRow({
+        name: 'builder',
+        needs_install: true,
+        install_url: 'https://github.com/x/y',
+        install_ref: 'v1',
+        bootstrap: ['npm ci'],
+        required_env: [], // not exercising the credential-prompt flow here — see the dedicated Rev-1 B4 tests below
+      }),
     ];
     await backend.invokeControl('mcp.catalog', {});
     client.installResult = { ok: true, name: 'builder', background: true, action: 'mcp-install-builder-ab12cd34' };
@@ -7735,7 +7751,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     mockShowWarningMessage.mockClear();
     mockShowWarningMessage.mockResolvedValueOnce('Install & build');
 
-    const resultPromise = backend.invokeControl('mcp.catalogInstall', { name: 'builder', env: {} });
+    const resultPromise = backend.invokeControl('mcp.catalogInstall', { name: 'builder' });
     // The poll loop's first `actionStatus` sees `running:true` and sleeps
     // (1s) before the SECOND `actionStatus` call — advance past that wait.
     await vi.advanceTimersByTimeAsync(1_000);
@@ -7758,7 +7774,14 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     withFakeControl(backend);
 
     client.catalogEntries = [
-      catalogRow({ name: 'builder', needs_install: true, install_url: 'https://github.com/x/y', install_ref: 'v1', bootstrap: ['npm ci'] }),
+      catalogRow({
+        name: 'builder',
+        needs_install: true,
+        install_url: 'https://github.com/x/y',
+        install_ref: 'v1',
+        bootstrap: ['npm ci'],
+        required_env: [], // not exercising the credential-prompt flow here — see the dedicated Rev-1 B4 tests below
+      }),
     ];
     await backend.invokeControl('mcp.catalog', {});
     client.installResult = { ok: true, name: 'builder', background: true, action: 'mcp-install-builder-ab12cd34' };
@@ -7769,7 +7792,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
 
     let caught: unknown;
     try {
-      await backend.invokeControl('mcp.catalogInstall', { name: 'builder', env: {} });
+      await backend.invokeControl('mcp.catalogInstall', { name: 'builder' });
     } catch (err) {
       caught = err;
     }
@@ -7781,26 +7804,83 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     expect(logs.some((l) => l.includes('EACCES permission denied'))).toBe(true); // ...only into the output-channel logger
   });
 
-  it('describeCatalogForModal receives the VALIDATED submitted env (A3-IMP2 binding) — not the entry schema', async () => {
+  // ---------------------------------------------------------------------
+  // Rev-1 B4 (CF-13 parity, TH-4) — SUPERSEDES the test above (old name:
+  // "describeCatalogForModal receives the VALIDATED submitted env (A3-IMP2
+  // binding) — not the entry schema"): the webview no longer submits ANY
+  // env at all. Credentials are now collected HOST-side, masked
+  // (`promptSecret` -> `vscode.window.showInputBox({password:true})`),
+  // ONLY AFTER the install consent modal is confirmed — CF-13 ("keys never
+  // enter the webview; the host prompts for them, masked").
+  // ---------------------------------------------------------------------
+  it('Rev-1 B4/CF-13: consent-first ordering — the modal fires future-tense disclosure, THEN promptSecret collects each required_env var, and the value flows into installCatalogEntry', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
     control.setResultFor('config.get', { mcp_servers: {} });
     control.setResultFor('tools.list', { toolsets: [] });
-    client.catalogEntries = [catalogRow()]; // needs_install: false -> synchronous install
+    client.catalogEntries = [catalogRow()]; // needs_install: false -> synchronous install; required_env: [{N8N_KEY}]
     await backend.invokeControl('mcp.catalog', {});
     client.installResult = { ok: true, name: 'n8n', background: false };
     mockShowWarningMessage.mockClear();
-    mockShowWarningMessage.mockResolvedValueOnce('Install');
+    mockShowWarningMessage.mockResolvedValueOnce('Install'); // consent FIRST
+    mockShowInputBox.mockClear();
+    mockShowInputBox.mockResolvedValueOnce('sekrit-value'); // THEN the masked prompt
 
-    await backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: { N8N_KEY: 'submitted-value' } });
+    await backend.invokeControl('mcp.catalogInstall', { name: 'n8n' });
 
+    // The modal's disclosure is FUTURE-TENSE, driven by the entry's OWN
+    // required_env schema — never a submitted value (there is none yet).
     const detail = (mockShowWarningMessage.mock.calls[0] as unknown[])[1] as { detail: string };
-    // §4.7 honesty line only appears because env WAS actually submitted —
-    // proving `env` (not the entry's `required_env` schema) drove the modal.
-    expect(detail.detail).toContain("Credentials are saved to Hermes' .env store (~/.hermes/.env).");
-    expect(detail.detail).not.toContain('submitted-value'); // the VALUE itself never renders
-    expect(client.installCalls).toEqual([{ name: 'n8n', env: { N8N_KEY: 'submitted-value' }, enable: true }]);
+    expect(detail.detail).toContain("Will prompt for: N8N_KEY — saved to Hermes' .env store (~/.hermes/.env).");
+    expect(detail.detail).not.toContain('sekrit-value');
+
+    // Consent-first ordering: the modal fired, and promptSecret was called
+    // exactly once — AFTER it (a compromised webview can at most summon the
+    // modal; the credential prompt only ever follows a genuine confirm).
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+    const [options] = mockShowInputBox.mock.calls[0] as [{ password?: boolean; ignoreFocusOut?: boolean; prompt?: string }];
+    expect(options.password).toBe(true);
+    expect(options.ignoreFocusOut).toBe(true);
+
+    // The value collected by the masked prompt — never typed in the webview
+    // — is what reaches `installCatalogEntry`.
+    expect(client.installCalls).toEqual([{ name: 'n8n', env: { N8N_KEY: 'sekrit-value' }, enable: true }]);
+  });
+
+  it('Rev-1 B4/CF-13: a DISMISSED promptSecret answer (undefined) declines the WHOLE install — installCatalogEntry is never called', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    client.catalogEntries = [catalogRow()];
+    await backend.invokeControl('mcp.catalog', {});
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install');
+    mockShowInputBox.mockClear();
+    mockShowInputBox.mockResolvedValueOnce(undefined); // user hit Escape
+
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n' })).rejects.toThrow(
+      'Installing MCP "n8n" was declined or cancelled.',
+    );
+
+    expect(client.installCalls).toEqual([]); // NO partial install
+  });
+
+  it('Rev-1 B4/CF-13: a BLANK promptSecret answer also declines — an empty string is not a valid credential', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    withFakeControl(backend);
+    client.catalogEntries = [catalogRow()];
+    await backend.invokeControl('mcp.catalog', {});
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install');
+    mockShowInputBox.mockClear();
+    mockShowInputBox.mockResolvedValueOnce(''); // user cleared the field and hit Enter
+
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n' })).rejects.toThrow(
+      'Installing MCP "n8n" was declined or cancelled.',
+    );
+
+    expect(client.installCalls).toEqual([]);
   });
 
   // ---------------------------------------------------------------------
@@ -7817,7 +7897,10 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     control.setResultFor('reload.mcp', { status: 'reloaded' });
     control.setResultFor('config.get', { mcp_servers: {} });
     control.setResultFor('tools.list', { toolsets: [] });
-    client.catalogEntries = [catalogRow({ name: 'n8n' }), catalogRow({ name: 'other', required_env: [] })];
+    // required_env: [] on BOTH rows — this test exercises single-flight
+    // concurrency, not the credential-prompt flow (see the dedicated Rev-1
+    // B4 tests above for that).
+    client.catalogEntries = [catalogRow({ name: 'n8n', required_env: [] }), catalogRow({ name: 'other', required_env: [] })];
     await backend.invokeControl('mcp.catalog', {}); // arms the fail-closed catalog-name guard for BOTH rows
 
     let release!: (v: { ok: boolean; name: string; background: boolean; action?: string }) => void;
@@ -7828,12 +7911,12 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     mockShowWarningMessage.mockClear();
     mockShowWarningMessage.mockResolvedValue('Install'); // every modal this test opens is confirmed
 
-    const first = backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} });
+    const first = backend.invokeControl('mcp.catalogInstall', { name: 'n8n' });
 
     // The guard is a synchronous test-and-set BEFORE `first` ever joins the
     // queue (`handleMcpAdmin`'s own doc) — the refusal below does not depend
     // on how far `first`'s modal/install chain has progressed.
-    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} })).rejects.toThrow(
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n' })).rejects.toThrow(
       /already in progress/i,
     );
 
@@ -7845,7 +7928,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     // calls return — awaiting it here, before releasing 'n8n', would
     // deadlock the test, mirroring the `mcp.auth` IMPORTANT-3 test's own
     // comment.
-    const other = backend.invokeControl('mcp.catalogInstall', { name: 'other', env: {} });
+    const other = backend.invokeControl('mcp.catalogInstall', { name: 'other' });
 
     release({ ok: true, name: 'n8n', background: false });
     await expect(first).resolves.toMatchObject({ ok: true, name: 'n8n' });
@@ -7877,7 +7960,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
 
     mockShowWarningMessage.mockClear();
     mockShowWarningMessage.mockResolvedValueOnce(undefined); // user hits Cancel — a REFUSAL path
-    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} })).rejects.toThrow(
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'n8n' })).rejects.toThrow(
       /declined|cancel/i,
     );
     expect(client.installCalls).toEqual([]); // the decline never reached installCatalogEntry
@@ -7887,7 +7970,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     // second modal/install.
     client.installResult = { ok: true, name: 'n8n', background: false };
     mockShowWarningMessage.mockResolvedValueOnce('Install');
-    const result = await backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} });
+    const result = await backend.invokeControl('mcp.catalogInstall', { name: 'n8n' });
 
     expect(result).toMatchObject({ ok: true, name: 'n8n' });
     expect(client.installCalls).toEqual([{ name: 'n8n', env: {}, enable: true }]);
@@ -8066,7 +8149,9 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed 'gh'
 
-      client.catalogEntries = [catalogRow({ name: 'n8n' })];
+      // required_env: [] — this test exercises tail concurrency, not the
+      // credential-prompt flow (see the dedicated Rev-1 B4 tests above).
+      client.catalogEntries = [catalogRow({ name: 'n8n', required_env: [] })];
       await backend.invokeControl('mcp.catalog', {});
 
       let release!: (v: { ok: boolean; name: string; background: boolean; action?: string }) => void;
@@ -8077,7 +8162,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
       mockShowWarningMessage.mockClear();
       mockShowWarningMessage.mockResolvedValueOnce('Install');
 
-      const install = backend.invokeControl('mcp.catalogInstall', { name: 'n8n', env: {} }); // do NOT await
+      const install = backend.invokeControl('mcp.catalogInstall', { name: 'n8n' }); // do NOT await
 
       control.setResultFor('reload.mcp', { status: 'reloaded' });
       await backend.invokeControl('mcp.setEnabled', { name: 'gh', enabled: false });

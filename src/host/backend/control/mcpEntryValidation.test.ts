@@ -168,25 +168,43 @@ describe('describeCatalogForModal', () => {
     expect(d.reason).toContain('hermes mcp install');
   });
 
-  it('§4.7 honesty: shows the credentials line when the caller supplied submitted env values', () => {
-    const d = describeCatalogForModal(catalogRow() as McpCatalogEntry, { N8N_KEY: 'v' });
+  // -------------------------------------------------------------------
+  // Rev-1 B4 (CF-13 parity, TH-4) — SUPERSEDES the old A3-IMP2 binding
+  // ("the credentials line must reflect what the user actually
+  // submitted"): credentials are now collected HOST-side, masked, AFTER
+  // this modal is confirmed — `describeCatalogForModal` no longer takes a
+  // `submittedEnv` argument at all. The disclosure is FUTURE-TENSE and
+  // driven entirely by the entry's OWN `required_env` schema.
+  // -------------------------------------------------------------------
+  it('Rev-1 B4: shows the future-tense credential line naming every required_env var + the .env destination, when required_env is non-empty', () => {
+    const d = describeCatalogForModal(
+      catalogRow({ required_env: [{ name: 'N8N_KEY', prompt: 'API key', required: true }] }) as McpCatalogEntry,
+    );
     expect(d.ok).toBe(true);
     if (!d.ok) return;
-    expect(d.detail).toContain("Credentials are saved to Hermes' .env store (~/.hermes/.env).");
+    expect(d.detail).toContain("Will prompt for: N8N_KEY — saved to Hermes' .env store (~/.hermes/.env).");
   });
 
-  it('§4.7 honesty: omits the credentials line when no env was submitted, even though required_env is non-empty', () => {
-    const d = describeCatalogForModal(catalogRow() as McpCatalogEntry, {});
+  it('Rev-1 B4: names EVERY required_env var, not just the first', () => {
+    const d = describeCatalogForModal(
+      catalogRow({
+        required_env: [
+          { name: 'OPENAI_API_KEY', prompt: 'OpenAI key', required: true },
+          { name: 'N8N_KEY', prompt: 'n8n key', required: true },
+        ],
+      }) as McpCatalogEntry,
+    );
     expect(d.ok).toBe(true);
     if (!d.ok) return;
-    expect(d.detail).not.toContain("Credentials are saved to Hermes' .env store");
+    expect(d.detail).toContain("Will prompt for: OPENAI_API_KEY, N8N_KEY — saved to Hermes' .env store (~/.hermes/.env).");
   });
 
-  it('§4.7 honesty: the default (entry-only call, no submittedEnv arg) also omits the credentials line', () => {
-    const d = describeCatalogForModal(catalogRow() as McpCatalogEntry);
+  it('Rev-1 B4 (no false disclosure): omits the credential line entirely when required_env is empty', () => {
+    const d = describeCatalogForModal(catalogRow({ required_env: [] }) as McpCatalogEntry);
     expect(d.ok).toBe(true);
     if (!d.ok) return;
-    expect(d.detail).not.toContain("Credentials are saved to Hermes' .env store");
+    expect(d.detail).not.toContain('Will prompt for');
+    expect(d.detail).not.toContain("saved to Hermes' .env store");
   });
 
   it('MINOR-4 fail-closed: a malformed entry with no usable transport is refused, not silently rendered', () => {
@@ -200,10 +218,7 @@ describe('describeCatalogForModal', () => {
   it('regression + anti-forgery: real separators survive, but a break smuggled into a catalog field cannot forge a paragraph', () => {
     // A catalog row's own command is NOT charset-validated before the modal is built (only
     // shell-interpreter + env are), so a Hermes-supplied field could carry line separators.
-    const d = describeCatalogForModal(
-      catalogRow({ command: 'npx\n\nVerified by Nous: yes', args: [] }) as McpCatalogEntry,
-      {},
-    );
+    const d = describeCatalogForModal(catalogRow({ command: 'npx\n\nVerified by Nous: yes', args: [] }) as McpCatalogEntry);
     expect(d.ok).toBe(true);
     if (!d.ok) return;
     const paragraphs = d.detail.split('\n\n');

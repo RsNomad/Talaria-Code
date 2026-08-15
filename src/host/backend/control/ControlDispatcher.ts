@@ -174,6 +174,22 @@ export interface ControlDispatcherHostPort {
    */
   confirm(message: string, detail: string, actionLabel: string): Promise<boolean>;
   /**
+   * Rev-1 B4 (CF-13 parity, TH-4): the masked, host-side credential prompt —
+   * `vscode.window.showInputBox({ prompt, password: true, ignoreFocusOut:
+   * true })`, the SAME masked-seam idiom `promptAndSaveProviderKey`
+   * (`TalariaViewProvider.ts`) and `setupHost.vscode.ts`'s
+   * `showPasswordInput` already use. Resolves the entered secret, or
+   * `undefined` when the user dismisses the prompt (Escape / clicks away)
+   * — {@link ControlDispatcher.mcpCatalogInstall} treats BOTH an
+   * `undefined` answer AND an empty string as a decline of the WHOLE
+   * install (no partial install). Called ONLY after the install's native
+   * consent modal ({@link confirm}) is confirmed, once per
+   * `entry.required_env` var — MCP catalog API keys must never be typed
+   * into the webview (CF-13: "keys never enter the webview; the host
+   * prompts for them, masked").
+   */
+  promptSecret(prompt: string): Promise<string | undefined>;
+  /**
    * Task A6 (§4.8, Context7-pinned `window.withProgress<R>(options, task:
    * (progress, token: CancellationToken) => Thenable<R>): Thenable<R>` —
    * only `ProgressLocation.Notification` supports the cancel button): the
@@ -881,27 +897,34 @@ export class ControlDispatcher {
   }
 
   /**
-   * Task A6 (§4.7 items 2-4): `validateCatalogInstall` against the last-
-   * LISTED catalog (fail-closed — `mcp.catalog` was never called this
-   * session -> `lastCatalogEntries` is `undefined` -> the entry lookup finds
-   * nothing) -> `describeCatalogForModal`, passing the VALIDATED submitted
-   * env as the 2nd arg (A3-IMP2 binding: the "Credentials are saved…" line
-   * must reflect what the user actually submitted, never the entry's
-   * `required_env` schema) -> native consent -> `installCatalogEntry`. A
-   * synchronous (`background:false`) install resolves immediately; a
-   * background (git-bootstrap) install is handed to {@link
-   * pollCatalogInstall} for the ground-truth-verified wait (Layer 6).
-   * Single-flight per entry name is enforced by the CALLER ({@link
-   * handleMcpAdmin}'s synchronous {@link acquireMcpSingleFlight}) — this
-   * method never re-checks it.
+   * Task A6 (§4.7 items 2-4), reworked by Rev-1 B4 (CF-13 parity, TH-4 —
+   * SUPERSEDES the old A3-IMP2 binding): `validateCatalogInstall` against
+   * the last-LISTED catalog (fail-closed — `mcp.catalog` was never called
+   * this session -> `lastCatalogEntries` is `undefined` -> the entry lookup
+   * finds nothing) -> `describeCatalogForModal(entry)` (a FUTURE-TENSE
+   * disclosure driven by the entry's OWN `required_env` schema — the
+   * webview submits NO env at all anymore, so there is nothing "submitted"
+   * left to reflect) -> native consent ({@link ControlDispatcherHostPort
+   * .confirm}). ONLY AFTER `confirmed`: for EACH `entry.required_env` var,
+   * the masked host-side prompt ({@link ControlDispatcherHostPort
+   * .promptSecret}) — a dismissed OR blank answer for ANY var is a DECLINE
+   * of the WHOLE install (no partial install, `installCatalogEntry` never
+   * called) — THEN `installCatalogEntry` with the collected values. CF-13:
+   * keys never enter the webview; this method is the host-side gate that
+   * collects them, masked, after consent. A synchronous (`background:
+   * false`) install resolves immediately; a background (git-bootstrap)
+   * install is handed to {@link pollCatalogInstall} for the ground-truth-
+   * verified wait (Layer 6). Single-flight per entry name is enforced by
+   * the CALLER ({@link handleMcpAdmin}'s synchronous {@link
+   * acquireMcpSingleFlight}) — this method never re-checks it.
    */
   private async mcpCatalogInstall(client: DashboardAdminClient, params: unknown): Promise<McpCatalogInstallResult> {
     const validated = validateCatalogInstall(params, this.lastCatalogEntries ?? []);
     if (!validated.ok) {
       throw new Error(validated.reason);
     }
-    const { entry, env } = validated;
-    const described = describeCatalogForModal(entry, env);
+    const { entry } = validated;
+    const described = describeCatalogForModal(entry);
     if (!described.ok) {
       throw new Error(described.reason);
     }
@@ -912,6 +935,18 @@ export class ControlDispatcher {
     );
     if (!confirmed) {
       throw new Error(`Installing MCP "${entry.name}" was declined or cancelled.`);
+    }
+    // CF-13: keys never enter the webview — collected HERE, host-side and
+    // masked, ONLY after consent. A dismissed or blank answer for ANY
+    // required var declines the WHOLE install; nothing partial ever reaches
+    // `installCatalogEntry`.
+    const env: Record<string, string> = {};
+    for (const v of entry.required_env) {
+      const value = await this.port.promptSecret(`"${entry.name}": ${v.prompt} (${v.name})`);
+      if (value === undefined || value === '') {
+        throw new Error(`Installing MCP "${entry.name}" was declined or cancelled.`);
+      }
+      env[v.name] = value;
     }
     const result = await client.installCatalogEntry({ name: entry.name, env, enable: true });
     if (!result.background) {

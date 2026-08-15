@@ -297,13 +297,26 @@ export function validateCatalogInstall(params: unknown, listed: readonly McpCata
 // ---------------------------------------------------------------------------
 
 const CATALOG_SOURCE_LINE = 'Nous-approved catalog entry (ships with Hermes, PR-gated, pinned versions).';
-const CATALOG_ENV_LINE = "Credentials are saved to Hermes' .env store (~/.hermes/.env).";
 const BOOTSTRAP_HEADER_LINE = 'Then runs these build commands IN A SHELL on your machine:';
 
-export function describeCatalogForModal(
-  entry: McpCatalogEntry,
-  submittedEnv: Record<string, string> = {},
-): ModalDescription {
+/**
+ * Rev-1 B4 (CF-13 parity, TH-4) — SUPERSEDES the old A3-IMP2 binding
+ * ("the credential line must reflect what the user actually submitted"):
+ * credential collection now happens HOST-side, masked, AFTER this modal is
+ * confirmed (`ControlDispatcher.mcpCatalogInstall`'s `promptSecret` loop),
+ * so nothing has been "submitted" yet at describe-time — there is no
+ * `submittedEnv` to reflect. The new binding is FUTURE-TENSE and driven
+ * entirely by the entry's OWN `required_env` schema (var NAMES only, never
+ * a value): names what WILL be asked and where it persists. `undefined`
+ * when `required_env` is empty — no false disclosure.
+ */
+function catalogCredentialLine(requiredEnv: McpCatalogEntry['required_env']): string | undefined {
+  if (requiredEnv.length === 0) return undefined;
+  const names = requiredEnv.map((v) => v.name).join(', ');
+  return `Will prompt for: ${names} — saved to Hermes' .env store (~/.hermes/.env).`;
+}
+
+export function describeCatalogForModal(entry: McpCatalogEntry): ModalDescription {
   const message = `Install MCP "${entry.name}" from the Hermes catalog?`;
   const lines: string[] = [CATALOG_SOURCE_LINE];
 
@@ -319,7 +332,8 @@ export function describeCatalogForModal(
     };
   }
 
-  if (Object.keys(submittedEnv).length > 0) lines.push(CATALOG_ENV_LINE);
+  const credentialLine = catalogCredentialLine(entry.required_env);
+  if (credentialLine !== undefined) lines.push(credentialLine);
   lines.push(RELOAD_LINE);
 
   if (entry.needs_install) {

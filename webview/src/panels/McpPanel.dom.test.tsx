@@ -52,7 +52,8 @@ function httpServerData(): McpData {
 
 /* Task A8 (§4.7): one `GET /api/mcp/catalog` entry, verbatim shape
  * (`McpCatalogEntry`, `src/shared/protocol.ts:314-332`) with one required env
- * var — enough to exercise the env `TextField` + `Install` wiring. */
+ * var — enough to exercise the required_env caption + `Install` wiring
+ * (Rev-1 B4: no env TextField exists anymore, CF-13 parity). */
 function catalogEntryFixture(overrides?: Partial<McpCatalogEntry>): McpCatalogEntry {
   return {
     name: 'builder',
@@ -289,7 +290,13 @@ describe('A7-M2: MCP panel Toggle rollback-on-rejection parity', () => {
 /* Task A8 (§4.7/§4.8): the Catalog disclosure + the per-row Login button.
  * Same harness as A7 above. */
 describe('A8: MCP panel Catalog disclosure + Login button', () => {
-  it('expanding Catalog fetches once, renders an env TextField per required_env, and Install fires onCatalogInstall with the collected env', async () => {
+  /* Rev-1 B4 (CF-13 parity, TH-4) — SUPERSEDES the old test of the same
+   * area (was: "…renders an env TextField per required_env, and Install
+   * fires onCatalogInstall with the collected env"): API keys never enter
+   * the webview at all now. A required_env row renders a CAPTION, never a
+   * text input, and `Install` dispatches ONLY `{name}` — the host prompts
+   * for each var itself, masked, after its own consent modal. */
+  it('expanding Catalog fetches once, shows a caption per required_env var (NO text input), and Install fires onCatalogInstall with just the name', async () => {
     const user = userEvent.setup();
     const catalogCalls: number[] = [];
     const installCalls: McpCatalogInstallParams[] = [];
@@ -320,12 +327,14 @@ describe('A8: MCP panel Catalog disclosure + Login button', () => {
     await screen.findByText('builder');
     await waitFor(() => expect(catalogCalls).toHaveLength(1));
 
-    await user.type(screen.getByLabelText(/API Key/i), 'secret-value');
+    // CF-13: no textbox anywhere in the row — only a caption naming what the
+    // HOST will ask for.
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.getByText(/You'll be prompted for API Key/i)).toBeInTheDocument();
+
     await user.click(screen.getByRole('button', { name: /^Install$/i }));
 
-    await waitFor(() =>
-      expect(installCalls).toEqual([{ name: 'builder', env: { API_KEY: 'secret-value' } }]),
-    );
+    await waitFor(() => expect(installCalls).toEqual([{ name: 'builder' }]));
 
     // Collapsing and re-expanding must NOT refetch — only the FIRST expand
     // fires onCatalog (§4.7).
@@ -352,7 +361,6 @@ describe('A8: MCP panel Catalog disclosure + Login button', () => {
 
     await user.click(screen.getByRole('button', { name: /^Catalog$/i }));
     await screen.findByText('builder');
-    await user.type(screen.getByLabelText(/API Key/i), 'secret-value');
     await user.click(screen.getByRole('button', { name: /^Install$/i }));
 
     // RED today: the notice reads only `Installed "builder".` — nothing tells

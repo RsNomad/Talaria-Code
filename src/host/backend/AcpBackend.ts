@@ -565,6 +565,13 @@ export class AcpBackend implements AgentBackend {
         const choice = await vscode.window.showWarningMessage(message, { modal: true, detail }, actionLabel);
         return choice === actionLabel;
       },
+      // Rev-1 B4 (CF-13 parity, TH-4): the masked, host-side credential
+      // prompt — the SAME `showInputBox({password:true, ignoreFocusOut:
+      // true})` idiom `TalariaViewProvider.ts`'s `promptAndSaveProviderKey`
+      // (`model.save_key`'s own masked seam) and `setupHost.vscode.ts`'s
+      // `showPasswordInput` already use. `ControlDispatcher.mcpCatalogInstall`
+      // is the only caller — `undefined` on dismiss is passed straight through.
+      promptSecret: async (prompt) => vscode.window.showInputBox({ prompt, password: true, ignoreFocusOut: true }),
       // Task A6 (§4.8, Context7-pinned `window.withProgress`): the F-4 OAuth
       // blocking-wait UX — a cancellable Notification progress. `token` is
       // handed straight through to the dispatcher's `task` callback; only

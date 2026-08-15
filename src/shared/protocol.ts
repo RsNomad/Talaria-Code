@@ -332,7 +332,14 @@ export interface McpCatalogEntry {
 }
 export interface McpCatalogData { entries: McpCatalogEntry[] }
 
-export interface McpCatalogInstallParams { name: string; env: Record<string, string> }
+/**
+ * Rev-1 B4 (CF-13 parity, TH-4): `env` is deliberately ABSENT — the webview
+ * never submits a credential value. The host prompts for each of the
+ * catalog entry's OWN `required_env` vars itself, masked
+ * (`vscode.window.showInputBox({password:true})`), AFTER the install
+ * consent modal is confirmed (`ControlDispatcher.mcpCatalogInstall`).
+ */
+export interface McpCatalogInstallParams { name: string }
 export interface McpCatalogInstallResult { ok: true; name: string }
 
 /**

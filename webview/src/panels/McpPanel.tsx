@@ -450,11 +450,20 @@ function RowNoticeCard({ notice }: { notice: TestNotice | undefined }) {
  * (guarded by `fetched`, set synchronously in the SAME click handler that
  * starts the request, before the `await` — a second click inside the same
  * render can't race past it); later collapse/expand cycles reuse the already-
- * fetched `entries`, never refetching. Each row renders one `TextField` per
- * `required_env` var (env VALUES live only in this component's own state —
- * collected, never logged, sent once on `Install`) and surfaces the install
- * outcome through the same `RowNoticeCard` + `LiveRegion` pattern the server
- * rows use for Test/Remove, addressed by the catalog entry's own name.
+ * fetched `entries`, never refetching.
+ *
+ * Rev-1 B4 (CF-13 parity, TH-4): a catalog row NEVER renders a text input
+ * for its `required_env` vars — a plaintext webview `TextField` retaining a
+ * typed API key in this component's own state (surviving in JS heap, riding
+ * the postMessage channel) is exactly the CF-13 violation this fix removes.
+ * Each var instead renders a CAPTION naming what will be asked and where it
+ * lands; `Install` dispatches `onCatalogInstall({name})` with no env at
+ * all — the HOST prompts for every `required_env` var, masked
+ * (`vscode.window.showInputBox({password:true})`), AFTER the user confirms
+ * the native install-consent modal (`ControlDispatcher.mcpCatalogInstall`).
+ * The install outcome still surfaces through the same `RowNoticeCard` +
+ * `LiveRegion` pattern the server rows use for Test/Remove, addressed by the
+ * catalog entry's own name.
  */
 function CatalogDisclosure({
   onCatalog,
@@ -468,7 +477,6 @@ function CatalogDisclosure({
   const [loading, setLoading] = useState(false);
   const [entries, setEntries] = useState<McpCatalogEntry[]>([]);
   const [fetchError, setFetchError] = useState<string | undefined>();
-  const [envValues, setEnvValues] = useState<Record<string, Record<string, string>>>({});
   const [installing, setInstalling] = useState<Record<string, boolean>>({});
   const [rowNotice, setRowNotice] = useState<Record<string, TestNotice>>({});
 
@@ -486,21 +494,16 @@ function CatalogDisclosure({
       .finally(() => setLoading(false));
   };
 
-  const setEnvValue = (entryName: string, envKey: string, value: string) => {
-    setEnvValues((all) => ({ ...all, [entryName]: { ...all[entryName], [envKey]: value } }));
-  };
-
   const handleInstall = (entry: McpCatalogEntry) => {
     // AU-40: the button lost its native `disabled` (a busy control must stay
     // focusable), so this guard is now the only thing stopping a second
     // click from firing a second install while one is in flight.
     if (installing[entry.name] === true) return;
-    const env: Record<string, string> = {};
-    for (const v of entry.required_env) {
-      env[v.name] = envValues[entry.name]?.[v.name] ?? '';
-    }
+    // Rev-1 B4 (CF-13 parity): no `env` in this message — the webview never
+    // collects or holds a credential value. The host prompts for each
+    // `entry.required_env` var itself, masked, AFTER the consent modal.
     setInstalling((m) => ({ ...m, [entry.name]: true }));
-    void onCatalogInstall({ name: entry.name, env })
+    void onCatalogInstall({ name: entry.name })
       .then(
         // TG-2 (AU-49, ADR-4): the gateway reload this triggers is real for
         // the config plane + gateway sessions, but the LIVE editor chat only
@@ -570,15 +573,13 @@ function CatalogDisclosure({
                 )}
 
                 {entry.required_env.length > 0 && (
-                  <div className="mt-2 flex flex-col gap-1.5">
+                  <div className="mt-2 flex flex-col gap-1">
+                    {/* Rev-1 B4 (CF-13 parity): a CAPTION, never an input — the
+                        HOST prompts for this value (masked) after the install
+                        consent modal is confirmed; the webview never sees it. */}
                     {entry.required_env.map((v) => (
-                      <div key={v.name} className="flex flex-col gap-0.5">
-                        <TextField
-                          label={v.prompt}
-                          value={envValues[entry.name]?.[v.name] ?? ''}
-                          onChange={(next) => setEnvValue(entry.name, v.name, next)}
-                        />
-                        <span className="font-mono text-2xs text-faint">Saved to Hermes' .env</span>
+                      <div key={v.name} className="font-mono text-2xs text-faint">
+                        You'll be prompted for {v.prompt || v.name} · saved to Hermes' .env
                       </div>
                     ))}
                   </div>
