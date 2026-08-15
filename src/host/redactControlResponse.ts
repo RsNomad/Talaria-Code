@@ -53,12 +53,15 @@ const REDACTED = '[redacted]';
  *    `api[_-]?key`/`token` — corrupting the Setup panel's rendered state.
  *  - `'mcp.catalog'` — `McpCatalogEntry.required_env` is a read-only schema
  *    of credential NAMES/prompts to collect (`{name, prompt, required}[]`,
- *    `McpPanel.tsx` renders one TextField per entry), never a secret VALUE;
- *    the actual submitted values ride `mcp.catalogInstall`'s PARAMS
- *    (webview→host, never redacted — redaction only applies to results
- *    crossing host→webview) and are never echoed back in a result. Whole-
- *    value redaction here (the `env` match hits the `required_env` key)
- *    would zero out the catalog install form for every entry.
+ *    `McpPanel.tsx` renders one caption per entry naming what will be
+ *    prompted for), never a secret VALUE. The actual credential VALUES never
+ *    cross this boundary at all: since TH-4 (AU-41, CF-13 parity) they are
+ *    collected HOST-SIDE via a masked `promptSecret` prompt AFTER consent
+ *    (`ControlDispatcher.mcpCatalogInstall`), so they never enter the webview
+ *    nor ride `mcp.catalogInstall`'s params — the exemption is, if anything,
+ *    safer now than when this belt was written. Whole-value redaction here
+ *    (the `env` match hits the `required_env` key) would zero out the
+ *    catalog install form's field NAMES for every entry.
  *
  * `mcp.catalogInstall` (params-shaped, no `env`/`required_env` in its
  * result — {@link McpCatalogInstallResult}) is deliberately NOT exempt: a
