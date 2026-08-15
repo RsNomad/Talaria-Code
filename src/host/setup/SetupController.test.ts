@@ -2878,6 +2878,127 @@ describe("T6: scoped recheck (§2.5) — {scope:'llamacpp'} re-kicks WITHOUT awa
   });
 });
 
+describe('TC-3 (AU-8/INV-11): setup-phase truth aligns with runtime PATH discovery', () => {
+  it('empty settings + a PATH-discoverable hermes: status() reads missing until the probe settles, then installed-inactive (fails at HEAD: stays missing forever)', async () => {
+    let resolveDiscover: ((bin: string) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: () =>
+          new Promise<string>((resolve) => {
+            resolveDiscover = resolve;
+          }),
+      },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    // First status() kicks the probe (lazy, non-blocking) and reads missing
+    // for now — same as the pre-AU-8 settings-only truth, just not stuck.
+    expect((await controller.status()).agent.phase).toBe('missing');
+    expect(fires.length).toBe(0);
+
+    resolveDiscover?.('/home/u/.local/bin/hermes');
+    await tickT6();
+    expect(fires.length).toBe(1); // settle repaints, same posture as kickLlamaCppProbe
+
+    // Runtime truth == setup-phase truth: a discoverable hermes now reads
+    // exactly what a configured talaria.hermesPath would (installed-inactive,
+    // default backend 'mock' — matches the existing hermesPath-set fixture).
+    expect((await controller.status()).agent.phase).toBe('installed-inactive');
+  });
+
+  it('the discovery probe is kicked exactly ONCE across repeated status() calls', async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: () => {
+          calls++;
+          return new Promise<string>(() => {}); // never settles
+        },
+      },
+    );
+    await controller.status();
+    await controller.status();
+    await controller.status();
+    expect(calls).toBe(1);
+  });
+
+  it('a configured talaria.hermesPath is authoritative — PATH discovery is never even kicked', async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      { settings: settingsMap({ 'talaria.hermesPath': '/x/bin/hermes' }) },
+      {
+        discoverHermes: () => {
+          calls++;
+          return new Promise<string>(() => {});
+        },
+      },
+    );
+    await controller.status();
+    expect(calls).toBe(0);
+  });
+
+  it('discovery failure (rejecting binding) settles missing — the honest outcome, never an unhandled rejection out of status()', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: async () => {
+          throw new Error('not on PATH');
+        },
+      },
+    );
+    await controller.status();
+    await tickT6();
+    expect((await controller.status()).agent.phase).toBe('missing');
+  });
+
+  it('no discoverHermes binding at all: phase truth stays settings-only — unchanged pre-AU-8 behavior', async () => {
+    const { controller } = makeController();
+    expect((await controller.status()).agent.phase).toBe('missing');
+  });
+
+  it("setup.recheck {scope:'agent'} clears the discovery memo — a hermes installed after the first probe settled becomes visible on the very next status(), no reload needed", async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: async () => {
+          calls++;
+          throw new Error('not yet installed');
+        },
+      },
+    );
+    expect((await controller.status()).agent.phase).toBe('missing');
+    await tickT6();
+    expect((await controller.status()).agent.phase).toBe('missing');
+    expect(calls).toBe(1); // memoized — status() alone never re-probes a settled memo
+
+    await controller.handle('setup.recheck', { scope: 'agent' });
+    await controller.status();
+    expect(calls).toBe(2); // recheck cleared the memo — the next status() re-probes
+  });
+
+  it("setup.recheck {scope:'llamacpp'} does NOT touch the Hermes discovery memo (scoping — mirrors the {scope:'agent'} vs os/llamacpp isolation above)", async () => {
+    let calls = 0;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: async () => {
+          calls++;
+          throw new Error('not yet installed');
+        },
+      },
+    );
+    await controller.status();
+    await tickT6();
+    await controller.handle('setup.recheck', { scope: 'llamacpp' });
+    await controller.status();
+    expect(calls).toBe(1); // untouched by the llamacpp-scoped recheck
+  });
+});
+
 /*
  * beta.6 T9 (§1.3/§2.5): the tests above pin `setup.recheck`'s BEHAVIOR
  * through `controller.handle()` round-trips (a bad scope refused, absent

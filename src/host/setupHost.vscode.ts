@@ -6,7 +6,7 @@ import { unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
-import type { ExecLookup } from './runtime/resolveHermes';
+import { resolveHermesBin, type ExecLookup } from './runtime/resolveHermes';
 import { locatePipx } from './setup/pipxLocator';
 import { installHermes, type SpawnFn, type FileExists } from './setup/pipxInstaller';
 import { probeOllama, pullModel } from './setup/ollamaClient';
@@ -490,6 +490,13 @@ export function createSetupControllerDeps(
     // dropped at this wiring seam despite the plumbing being correct on
     // both sides of it.
     locatePipx: (signal) => locatePipx(exec, signal),
+    // TC-3 (AU-8/INV-11): the SAME settings-OR-PATH resolution the runtime
+    // uses (resolveHermes.ts's resolveHermesBin) — `{}` means no
+    // `hermesPath` override, so this always runs the login-shell PATH
+    // lookup. SetupController only ever calls this when `talaria.hermesPath`
+    // is empty (see kickHermesDiscovery), so the empty-config call here is
+    // never redundant with a configured setting.
+    discoverHermes: () => resolveHermesBin({}, exec),
     // T5 §1.2: the container-boundary-aware os-release read (real fs seams).
     readOsRelease: createReadOsRelease(),
     installHermes: (recipe, env, onEvent, signal) => installHermes(recipe, env, spawn, fileExists, onEvent, signal),

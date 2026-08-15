@@ -377,6 +377,22 @@ export interface SetupControllerDeps {
    * throwing.
    */
   reconnectAgent?(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * TC-3 (AU-8 / INV-11): the SAME settings-OR-PATH resolution the runtime
+   * uses to find `hermes` — bound to `resolveHermesBin({}, exec)`
+   * (`src/host/runtime/resolveHermes.ts`) by the caller. Called ONLY when
+   * `talaria.hermesPath` is empty (a configured setting is authoritative and
+   * is never second-guessed by a PATH probe); resolves the discovered
+   * absolute path, or REJECTS if the login-shell PATH lookup fails —
+   * {@link SetupController.kickHermesDiscovery} maps a rejection to the
+   * honest "not found" memo state, mirroring {@link
+   * SetupControllerDeps.locateLlamaServer}'s reject→settle posture. OPTIONAL
+   * (same idiom as {@link reconnectAgent} above, same reason: a required
+   * member would break every existing deps-literal/factory-call test site);
+   * `undefined` binding = the phase truth stays settings-only, i.e. the
+   * pre-AU-8 behavior, never a crash.
+   */
+  discoverHermes?(): Promise<string>;
 }
 
 // --- misc constants -------------------------------------------------------
@@ -725,6 +741,32 @@ export class SetupController {
    *  nor fire a stray push. */
   private llamaCppProbeEpoch = 0;
 
+  /**
+   * TC-3 (AU-8 / INV-11): the Hermes PATH-discovery settled-value memo —
+   * SAME posture as {@link llamaCppRuntime} above. `undefined` = never
+   * probed; `{found: string | null}` = settled (`found` = the discovered
+   * absolute path, `null` = the login-shell PATH lookup came up empty or
+   * rejected — the honest "not found" outcome, never a thrown error out of
+   * `status()`). `status()` kicks the probe lazily ({@link
+   * kickHermesDiscovery}) ONLY when `talaria.hermesPath` is unset, and only
+   * while `this.deps.discoverHermes` is bound — an unbound dep (older/
+   * partial wiring) leaves this memo permanently `undefined`, which {@link
+   * computeAgentPhase} reads exactly like the pre-AU-8 settings-only truth.
+   */
+  private hermesPathDiscovery?: { found: string | null };
+  /** True while a discovery attempt is in flight — with {@link
+   *  hermesPathDiscovery} `undefined` + this false, the next `status()`
+   *  kicks a fresh probe. */
+  private hermesDiscoveryProbeInFlight = false;
+  /** Monotonic supersession guard, mirroring {@link llamaCppProbeEpoch}:
+   *  bumped by {@link dispose} and by `setup.recheck`'s memo-clear so a
+   *  superseded probe's late settle can neither overwrite fresher state nor
+   *  fire a stray push. Unlike {@link llamaCppProbeAbort}, there is no
+   *  cancellation seam here — {@link SetupControllerDeps.discoverHermes}
+   *  takes no `AbortSignal` — so a superseded attempt keeps running in the
+   *  background; the epoch just makes ITS eventual settle inert. */
+  private hermesDiscoveryEpoch = 0;
+
   constructor(
     private readonly host: SetupHost,
     private readonly deps: SetupControllerDeps,
@@ -740,6 +782,11 @@ export class SetupController {
     this.llamaCppProbeEpoch += 1;
     this.llamaCppProbeAbort?.abort();
     this.llamaCppProbeAbort = undefined;
+    // TC-3 (AU-8/INV-11): supersede any in-flight Hermes discovery probe too
+    // — no abort seam exists (discoverHermes takes no signal), so bumping the
+    // epoch is the only guard; its late settle is dropped (epoch mismatch)
+    // instead of writing state or firing into the disposed emitter.
+    this.hermesDiscoveryEpoch += 1;
     this.progressEmitter.dispose();
     this.statusChangedEmitter.dispose();
   }
@@ -771,6 +818,12 @@ export class SetupController {
     // settled-value memo, see kickLlamaCppProbe) so it runs concurrently
     // with the awaits below; this call never waits on it.
     this.kickLlamaCppProbe();
+    const hermesPath = (this.host.getSetting<string>('talaria.hermesPath') ?? '').trim();
+    // TC-3 (AU-8/INV-11): kick the Hermes PATH-discovery probe too, same lazy
+    // non-blocking posture — ONLY when the setting is empty (a configured
+    // talaria.hermesPath is authoritative and is never second-guessed by a
+    // PATH probe). See kickHermesDiscovery.
+    if (!hermesPath) this.kickHermesDiscovery();
     const apiKeySet = await this.host.secrets.has(AUTOCOMPLETE_API_KEY_SECRET);
     // T5 §1.2: interpreted (memoized) OS identity — drives the `os` block
     // and, per phase, the engine-composed bootstrap / python plans below.
@@ -785,9 +838,10 @@ export class SetupController {
     // RESOLVED presence map (locked by the ordering test).
     const storePresence = await this.safeScanStorePresence();
 
-    const hermesPath = (this.host.getSetting<string>('talaria.hermesPath') ?? '').trim();
     const configuredBackend = this.host.getSetting<string>('talaria.backend') ?? 'mock';
-    const agentPhase = this.computeAgentPhase(hermesPath, configuredBackend);
+    // TC-3 (AU-8/INV-11): the discovered PATH fallback — `null`/unsettled
+    // both read as "nothing found yet", exactly like a settings-only miss.
+    const agentPhase = this.computeAgentPhase(hermesPath, configuredBackend, this.hermesPathDiscovery?.found);
     const installRecord = this.host.globalState.get<{ version: string; venvRoot: string; installedAt: string }>(
       'talaria.setup.hermesInstall',
     );
@@ -2068,6 +2122,18 @@ export class SetupController {
       this.rekickLlamaCppProbe();
     }
     if (scope === 'all' || scope === 'agent') {
+      // TC-3 (AU-8/INV-11): drop the settled Hermes PATH-discovery memo too
+      // — mirrors osResolution's clear-only posture above (not
+      // rekickLlamaCppProbe's immediate re-kick): the next status() call
+      // re-probes lazily through kickHermesDiscovery, picking up e.g. a
+      // hermes the user just pipx-installed in a terminal. Reset the
+      // in-flight flag too (not just bump the epoch) — a superseded probe's
+      // late settle is dropped by the epoch check BEFORE it would ever clear
+      // the flag itself, so leaving it `true` here would wedge every future
+      // kick into a permanent no-op.
+      this.hermesDiscoveryEpoch += 1;
+      this.hermesPathDiscovery = undefined;
+      this.hermesDiscoveryProbeInFlight = false;
       try {
         const located = await this.deps.locatePipx();
         if (located.ok) {
@@ -2363,12 +2429,61 @@ export class SetupController {
     return { ok: true };
   }
 
+  // --- TC-3 (AU-8/INV-11): Hermes PATH-discovery settled-value memo ---------
+
+  /**
+   * Kick the Hermes PATH-discovery probe ONCE, lazily — mirrors {@link
+   * kickLlamaCppProbe}'s settled-value posture exactly. A no-op when {@link
+   * SetupControllerDeps.discoverHermes} isn't bound (keeps every existing
+   * deps literal — real or fake — compiling and behaving unchanged, same
+   * optionality idiom as {@link SetupControllerDeps.reconnectAgent}), when a
+   * settled value already exists, or while an attempt is in flight.
+   * `discoverHermes` (bound to `resolveHermesBin` in `setupHost.vscode.ts`)
+   * module-caches SUCCESS for the extension-host lifetime and NEVER caches
+   * failure (`resolveHermes.ts` `cachedHermesBin`) — so a hermes installed
+   * after a failed probe becomes visible the moment this memo is cleared
+   * (`setup.recheck {scope:'agent'}`), without a window reload.
+   * `discoverHermes` offers no cancellation seam (unlike {@link
+   * SetupControllerDeps.locateLlamaServer}'s `signal`), so a superseded
+   * attempt keeps running in the background — {@link hermesDiscoveryEpoch}
+   * just makes ITS eventual settle inert, mirroring {@link
+   * llamaCppProbeEpoch}'s supersession guard.
+   */
+  private kickHermesDiscovery(): void {
+    const discover = this.deps.discoverHermes;
+    if (!discover) return;
+    if (this.hermesPathDiscovery !== undefined || this.hermesDiscoveryProbeInFlight) return;
+    this.hermesDiscoveryProbeInFlight = true;
+    const epoch = this.hermesDiscoveryEpoch;
+    void (async () => {
+      let settled: NonNullable<SetupController['hermesPathDiscovery']>;
+      try {
+        settled = { found: await discover() };
+      } catch {
+        // Rejection (login-shell lookup failed) ⇒ honest "not found"; a
+        // superseded epoch is dropped below either way.
+        settled = { found: null };
+      }
+      if (epoch !== this.hermesDiscoveryEpoch) return; // superseded — the fresh probe (or a recheck clear) owns the state
+      this.hermesPathDiscovery = settled;
+      this.hermesDiscoveryProbeInFlight = false;
+      this.statusChangedEmitter.fire();
+    })();
+  }
+
   // --- helpers --------------------------------------------------------------
 
-  private computeAgentPhase(hermesPath: string, configuredBackend: string): AgentSetupPhase {
+  private computeAgentPhase(
+    hermesPath: string,
+    configuredBackend: string,
+    discoveredHermesPath?: string | null,
+  ): AgentSetupPhase {
     if (this.inFlight.has(`install:hermes`)) return 'installing';
     if (this.awaitingReload) return 'awaiting-reload';
-    if (hermesPath) return configuredBackend === 'acp' ? 'ready' : 'installed-inactive';
+    // TC-3 (AU-8/INV-11): a configured setting is authoritative; PATH
+    // discovery is only ever a FALLBACK when it's empty — mirrors the
+    // runtime's own settings-OR-PATH order (resolveHermes.ts resolveHermesBin).
+    if (hermesPath || discoveredHermesPath) return configuredBackend === 'acp' ? 'ready' : 'installed-inactive';
     if (this.lastAgentIssue) return this.lastAgentIssue.phase;
     return 'missing';
   }
