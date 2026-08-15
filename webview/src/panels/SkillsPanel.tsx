@@ -126,14 +126,27 @@ const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'] as const;
 /**
  * Task TH-2 (AU-38): renders `HubScan.severity_counts` as an honest,
  * consent-relevant summary — e.g. `"1 critical · 2 high"` — replacing the
- * bare finding count the card used to show. Zero buckets are omitted so the
- * line stays short; when EVERY bucket is zero this returns the literal
- * `'No findings'` (an explicit all-clear, never a blank string that could
- * read as "nothing rendered" rather than "nothing found").
+ * bare finding count the card used to show. `findingsCount` (i.e.
+ * `scan.findings.length`) is the source of truth for the all-clear, NOT the
+ * four fixed `severity_counts` buckets: `HubScan.findings[].severity` is a
+ * free-form string while `severity_counts` only tallies
+ * critical/high/medium/low, so a finding with an out-of-vocabulary severity
+ * (e.g. `'info'`) inflates none of the four buckets — an all-zero-buckets
+ * result with real findings present must never read as the all-clear.
+ *  - `findingsCount === 0` -> the literal `'No findings'` (a genuine
+ *    all-clear, never a blank string that could read as "nothing rendered"
+ *    rather than "nothing found").
+ *  - otherwise, non-zero buckets render worst-first, zero buckets omitted so
+ *    the line stays short.
+ *  - findings exist but every bucket is still zero (every severity was
+ *    out-of-vocabulary) -> falls back to the honest bare count, e.g.
+ *    `"2 findings"` — never the misleading `'No findings'`.
  */
-export function severityCountsSummary(counts: HubScan['severity_counts']): string {
+export function severityCountsSummary(counts: HubScan['severity_counts'], findingsCount: number): string {
+  if (findingsCount === 0) return 'No findings';
   const parts = SEVERITY_ORDER.filter((sev) => counts[sev] > 0).map((sev) => `${counts[sev]} ${sev}`);
-  return parts.length > 0 ? parts.join(' · ') : 'No findings';
+  if (parts.length > 0) return parts.join(' · ');
+  return `${findingsCount} finding${findingsCount === 1 ? '' : 's'}`;
 }
 
 /**
@@ -596,7 +609,7 @@ function InstallFromHubDisclosure({
                       breakdown (worst first), or an explicit "No findings"
                       all-clear rather than a blank. */}
                   <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
-                    {severityCountsSummary(result.scan.severity_counts)}
+                    {severityCountsSummary(result.scan.severity_counts, result.scan.findings.length)}
                   </div>
 
                   {result.scan.findings.length > 0 && (

@@ -483,6 +483,55 @@ describe('B6: SkillsPanel Create + Install-from-hub + hub-row Remove', () => {
     expect(screen.getByText('No findings')).toBeInTheDocument();
   });
 
+  it('Fix 5a (TH-2 follow-up): an out-of-vocabulary finding severity leaves severity_counts all-zero — the card must not read "No findings" while findings exist', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel
+        data={skillsData(true)}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+        onHubScan={async (identifier) => ({
+          name: identifier,
+          identifier,
+          source: 'github',
+          trust_level: 'trusted',
+          verdict: 'caution',
+          summary: 'Two findings need review.',
+          policy: 'ask',
+          policy_reason: '',
+          // `severity` is free-form (protocol.ts: `{ severity: string; ... }`)
+          // while `severity_counts` only tallies critical/high/medium/low —
+          // an out-of-vocabulary severity like 'info' inflates none of the
+          // four fixed buckets even though findings.length === 2.
+          findings: [
+            { severity: 'info', category: 'network', file: 'a.py', line: 1, description: 'informational note' },
+            { severity: 'info', category: 'filesystem', file: 'b.py', line: 2, description: 'another note' },
+          ],
+          severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+        })}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Install from hub/i }));
+    await user.type(screen.getByLabelText(/Identifier/i), 'anthropics/skills/pdf');
+    await user.click(screen.getByRole('button', { name: /^Check$/i }));
+
+    await screen.findByText('Two findings need review.');
+
+    // RED today: severityCountsSummary looks only at the all-zero
+    // severity_counts buckets and returns the literal "No findings" even
+    // though 2 real findings are one disclosure-click away — a misleading
+    // all-clear directly above the "Findings (2)" disclosure that lists them.
+    expect(screen.queryByText('No findings')).not.toBeInTheDocument();
+    expect(screen.getByText('2 findings')).toBeInTheDocument();
+
+    const findingsToggle = screen.getByRole('button', { name: /Findings \(2\)/i });
+    expect(findingsToggle).toHaveAttribute('aria-expanded', 'false');
+    await user.click(findingsToggle);
+    expect(screen.getByText('informational note')).toBeInTheDocument();
+  });
+
   it('a provenance:"hub" row shows Remove and firing it calls onHubUninstall(name); the non-hub row never gets one', async () => {
     const user = userEvent.setup();
     const uninstalled: string[] = [];
