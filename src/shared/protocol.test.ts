@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { PANEL_SCOPE, CONTROL_METHODS } from './protocol';
+import { PANEL_SCOPE, CONTROL_METHODS, SETUP_METHODS, KNOWN_REQUEST_METHODS } from './protocol';
 import type {
   DataPanel,
   Scope,
@@ -248,6 +248,45 @@ describe('protocol — Setup panel contract (Task 8)', () => {
     // carries on the wire.
     const asControlRequest: ControlRequestMethod[] = methods;
     expect(asControlRequest).toHaveLength(3);
+  });
+});
+
+describe('KNOWN_REQUEST_METHODS (TE-4 / AU-11 / INV-15) — boundary allowlist derived from the source arrays', () => {
+  it('accepts every CONTROL_METHODS entry (no false-deny of a real control method)', () => {
+    for (const m of CONTROL_METHODS) {
+      expect(KNOWN_REQUEST_METHODS.has(m)).toBe(true);
+    }
+  });
+
+  it('accepts every SETUP_METHODS entry (no false-deny of a real setup method)', () => {
+    for (const m of SETUP_METHODS) {
+      expect(KNOWN_REQUEST_METHODS.has(m)).toBe(true);
+    }
+  });
+
+  it('accepts the three provider-level special-cases (panel.data, nextEdit.toggle, context.searchFiles)', () => {
+    expect(KNOWN_REQUEST_METHODS.has('panel.data')).toBe(true);
+    expect(KNOWN_REQUEST_METHODS.has('nextEdit.toggle')).toBe(true);
+    expect(KNOWN_REQUEST_METHODS.has('context.searchFiles')).toBe(true);
+  });
+
+  it('refuses an unknown method name, including one that merely LOOKS like a setup method', () => {
+    expect(KNOWN_REQUEST_METHODS.has('setup.bogus')).toBe(false);
+    expect(KNOWN_REQUEST_METHODS.has('totally.unknown.method')).toBe(false);
+  });
+
+  it('is EXACTLY CONTROL_METHODS ∪ SETUP_METHODS ∪ the three extras — a drift lock, not a superset', () => {
+    const expected = new Set<string>([
+      ...CONTROL_METHODS,
+      ...SETUP_METHODS,
+      'panel.data',
+      'nextEdit.toggle',
+      'context.searchFiles',
+    ]);
+    expect(KNOWN_REQUEST_METHODS.size).toBe(expected.size);
+    for (const m of expected) {
+      expect(KNOWN_REQUEST_METHODS.has(m)).toBe(true);
+    }
   });
 });
 

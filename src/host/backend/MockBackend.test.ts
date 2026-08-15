@@ -148,3 +148,17 @@ describe('MockBackend — W2 S0: sendPrompt optional `mentions` param', () => {
     backend.dispose();
   });
 });
+
+describe('MockBackend.invokeControl — TE-4 (AU-11 / INV-15): unknown method is refused, not courtesy-acked', () => {
+  it('a method outside CONTROL_METHODS resolves {ok:false} — no more courtesy ok:true ack', async () => {
+    const backend = new MockBackend();
+    const result = await backend.invokeControl('totally.unknown.method');
+    expect(result).toEqual({ ok: false, error: 'unknown method' });
+  });
+
+  it('a real CONTROL_METHODS entry the mock has no scripted behavior for still gets the courtesy ok:true ack (no regression)', async () => {
+    const backend = new MockBackend();
+    const result = await backend.invokeControl('tools.list');
+    expect(result).toEqual({ ok: true, mock: true, method: 'tools.list' });
+  });
+});

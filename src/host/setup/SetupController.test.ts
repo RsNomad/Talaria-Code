@@ -301,6 +301,23 @@ describe('FM-14: mutating methods refused when untrusted', () => {
   });
 });
 
+// --- TE-4 (AU-11, INV-15): unknown-method belt ------------------------------
+
+describe('TE-4 (AU-11 / INV-15): SetupController.handle refuses an unknown setup method', () => {
+  it("returns {ok:false} for a method outside the SetupMethod union, with no side effect — never falls through the switch to an implicit undefined", async () => {
+    const { host, controller } = makeController();
+    const result = await controller.handle('setup.bogus' as SetupMethod, {});
+    expect(result).toEqual({ ok: false, reason: 'unknown setup method' });
+    expect(host.calls).toEqual([]);
+  });
+
+  it('the refusal is checked BEFORE the trust gate — still {ok:false, reason: unknown} (not the trust-refusal text) when untrusted', async () => {
+    const { controller } = makeController({ trusted: false });
+    const result = await controller.handle('setup.bogus' as SetupMethod, {});
+    expect(result).toEqual({ ok: false, reason: 'unknown setup method' });
+  });
+});
+
 // --- FM-13: Tier-1 modal decline -> no side effect --------------------------
 
 describe('FM-13: Tier-1 modal decline -> {ok:false, reason:"declined"} with NO side effect', () => {

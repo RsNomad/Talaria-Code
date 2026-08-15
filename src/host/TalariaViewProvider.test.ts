@@ -294,6 +294,69 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
   });
 });
 
+describe('TalariaViewProvider — TE-4 (AU-11 / INV-15): central boundary allowlist refuses an unknown control.request method', () => {
+  it('an unknown control method is refused (ok:false), never reaches backend.invokeControl, and does not echo the method name', async () => {
+    const invokeControl = vi.fn().mockResolvedValue({ ok: true });
+    const { provider, posted } = makeProvider(invokeControl);
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      instanceId: 'test-instance',
+      requestId: 50,
+      method: 'totally.bogus.method',
+    } as never);
+    await flush();
+
+    expect(invokeControl).not.toHaveBeenCalled();
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({ type: 'control.response', instanceId: 'test-instance', requestId: 50, ok: false });
+    const reply = posted[0] as { error?: { message?: string } };
+    expect(reply.error?.message).not.toContain('totally.bogus.method');
+  });
+
+  it("an unknown 'setup.*'-shaped method is refused (ok:false) and fires NO spurious setup status-probe push", async () => {
+    const { provider, posted } = makeProviderWithSetupController();
+    posted.length = 0;
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      instanceId: 'test-instance',
+      requestId: 51,
+      method: 'setup.bogus',
+    } as never);
+    await flush();
+    await flush();
+    await flush();
+
+    const reply = posted.find((m) => m.type === 'control.response');
+    expect(reply).toMatchObject({ requestId: 51, ok: false });
+    // The pre-TE-4 bug: `isSetupMethod`'s bare prefix check let this through
+    // to `SetupController.handle`, which fell off its switch with no runtime
+    // default, and `handleSetupMethod` then unconditionally re-pushed fresh
+    // SetupData as a `panel.data` probe even though nothing was handled.
+    const spuriousPush = posted.find((m) => m.type === 'panel.data' && (m as { panel?: string }).panel === 'setup');
+    expect(spuriousPush).toBeUndefined();
+  });
+
+  it('every real CONTROL_METHODS / SetupMethod entry still passes the allowlist (no false-deny)', async () => {
+    const invokeControl = vi.fn().mockResolvedValue({ ok: true });
+    const { provider, posted } = makeProvider(invokeControl);
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      instanceId: 'test-instance',
+      requestId: 52,
+      method: 'tools.list',
+      params: { panel: 'tools' },
+    });
+    await flush();
+
+    expect(posted).toContainEqual(
+      expect.objectContaining({ type: 'control.response', requestId: 52, ok: true }),
+    );
+  });
+});
+
 describe('TalariaViewProvider — W2 T2d: context.searchFiles wiring', () => {
   function makeProviderWithSearch(searchFiles?: (query: string, maxResults: number) => Promise<string[]>): {
     provider: TalariaViewProvider;

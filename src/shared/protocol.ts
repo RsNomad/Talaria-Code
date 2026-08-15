@@ -1944,38 +1944,47 @@ export type ControlMethod = (typeof CONTROL_METHODS)[number];
  * OS-detection engine for the DETECTED distro family — refused fail-closed
  * (`{ok:false}`, no modal, no terminal) when the engine has no verified
  * line (unknown distro, container degrade, or a guidance-only Python plan).
+ *
+ * TE-4 (AU-11, INV-15): a `const` array — same `as const` inversion {@link
+ * CONTROL_METHODS} already got (finding A#2) — so {@link SetupMethod} and the
+ * runtime boundary allowlist ({@link KNOWN_REQUEST_METHODS}) are BOTH derived
+ * from this ONE source and can never drift against each other.
  */
-export type SetupMethod =
-  | 'setup.status'
-  | 'setup.install'
-  | 'setup.applyAgent'
-  | 'setup.applyFim'
-  | 'setup.setApiKey'
-  | 'setup.testRemote'
-  | 'setup.pullModel'
+export const SETUP_METHODS = [
+  'setup.status',
+  'setup.install',
+  'setup.applyAgent',
+  'setup.applyFim',
+  'setup.setApiKey',
+  'setup.testRemote',
+  'setup.pullModel',
   // beta.6 T7 (§1.3/§2.5): catalog-id provisioning — the ONE place a verified
   // catalog model gets pulled/downloaded/ingested. The webview sends
   // `{modelId, backend, endpoint?}`; the host re-resolves EVERYTHING from
   // `MODEL_CATALOG` (unknown id ⇒ refuse; 'vllm' ⇒ refused, never ignored).
-  | 'setup.provisionModel'
+  'setup.provisionModel',
   // beta.6 T8 (§1.3/§2.5): saves (or, `{clear:true}`, unsets) the "Configure
   // Local Agent Model" block's selection — `{modelId, backend, endpoint}`
   // (`modelId` must be a role='agent' catalog row) writes the 3
   // `talaria.agent.localModel.*` settings Global; `status()` recomposes
   // `agentLocalModel.saved`/`providerGuidance` from them on every read.
-  | 'setup.saveAgentModel'
-  | 'setup.cancel'
-  | 'setup.openProviderWizard'
-  | 'setup.openInstallTerminal'
-  | 'setup.openBootstrapTerminal'
-  | 'setup.recheck'
-  | 'setup.reload'
+  'setup.saveAgentModel',
+  'setup.cancel',
+  'setup.openProviderWizard',
+  'setup.openInstallTerminal',
+  'setup.openBootstrapTerminal',
+  'setup.recheck',
+  'setup.reload',
   // beta.7 B3: re-advertise auth methods after `hermes model` — Hermes
   // builds them only inside `initialize()`, acp_adapter/server.py:875.
-  | 'setup.reconnectAgent'
-  | 'setup.setNextEdit'
-  | 'setup.setRag'
-  | 'setup.setTunable';
+  'setup.reconnectAgent',
+  'setup.setNextEdit',
+  'setup.setRag',
+  'setup.setTunable',
+] as const;
+
+/** A Setup-panel control-request method. Derived from {@link SETUP_METHODS}. */
+export type SetupMethod = (typeof SETUP_METHODS)[number];
 
 /**
  * Method a correlated {@link WebviewToHost} `control.request` may invoke. It is
@@ -1987,6 +1996,28 @@ export type SetupMethod =
  * additions are tui_gateway-forwarded).
  */
 export type ControlRequestMethod = ControlMethod | 'panel.data' | 'nextEdit.toggle' | SetupMethod;
+
+/**
+ * TE-4 (AU-11, INV-15): the CLOSED set of every method name a `control.request`
+ * may legitimately carry — the boundary allowlist `TalariaViewProvider
+ * .handleControlRequest` checks FIRST, before any dispatch. DERIVED from the
+ * same `as const` arrays {@link ControlMethod}/{@link SetupMethod} come from
+ * (never a second hand-maintained list — the exact drift this closes: before
+ * this Set existed, the gate lived ONLY inside `ControlDispatcher`
+ * (`AcpBackend`'s path), so a name that slipped past `isSetupMethod`'s bare
+ * prefix check, or reached `MockBackend` directly, was never checked at all).
+ * `'panel.data'` / `'nextEdit.toggle'` / `'context.searchFiles'` are the three
+ * provider-level special-cases {@link ControlRequestMethod} already carries
+ * outside {@link ControlMethod}/{@link SetupMethod} — enumerated here so the
+ * allowlist covers the FULL wire type, not just the two backing arrays.
+ */
+export const KNOWN_REQUEST_METHODS: ReadonlySet<string> = new Set<ControlRequestMethod>([
+  ...CONTROL_METHODS,
+  ...SETUP_METHODS,
+  'panel.data',
+  'nextEdit.toggle',
+  'context.searchFiles',
+]);
 
 /**
  * W5.1 R5 (Task 13): which of the two mutually-exclusive next-edit sources a

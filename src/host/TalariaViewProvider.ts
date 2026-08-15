@@ -18,7 +18,7 @@ import type { FindFilesFn } from './context/searchFilesResponse';
 import { buildDiffUriParts } from './preview/parseDiffUri';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
 import type { DataPanel, NextEditToggleState, Panel, SetupMethod } from '../shared/protocol';
-import { makePanelData, PANEL_SCOPE } from '../shared/protocol';
+import { KNOWN_REQUEST_METHODS, makePanelData, PANEL_SCOPE } from '../shared/protocol';
 import { redactControlResponse } from './redactControlResponse';
 import type { SetupController } from './setup/SetupController';
 import { SetupPanelSource } from './panels/setupPanelSource';
@@ -891,6 +891,34 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     params: Record<string, unknown> | undefined,
     instanceId: string | undefined,
   ): Promise<void> {
+    // TE-4 (AU-11, INV-15): the boundary allowlist chokepoint — checked
+    // FIRST, before panel-signal attribution, `setup.*`/`nextEdit.toggle`/
+    // `context.searchFiles` special-casing, or any backend dispatch.
+    // `method` is typed `ControlRequestMethod` at compile time, but a
+    // `postMessage` payload is never actually type-checked at runtime (a
+    // compromised/XSS'd webview can post ANY string) — `KNOWN_REQUEST_
+    // METHODS` (derived from the SAME `CONTROL_METHODS`/`SETUP_METHODS`
+    // source arrays the types come from) is the one RUNTIME gate that makes
+    // the type honest. Refusing here — before either backend is reached —
+    // covers the mock AND the real backend identically (the prior gate lived
+    // only inside `ControlDispatcher`, the real-backend-only path); an
+    // unknown `setup.*` name in particular no longer falls through
+    // `isSetupMethod`'s bare prefix check into `SetupController.handle`, so
+    // it can never fire the `pushSetupPanelData` status-probe push either.
+    // CF-14 no-echo: the posted name is NOT sent back to the webview — only
+    // a capped, control-char-stripped copy reaches the host log.
+    if (!KNOWN_REQUEST_METHODS.has(method)) {
+      const detail = String(method).replace(/[\x00-\x1f]/g, '').slice(0, 128);
+      this.logger?.appendLine(`[control.request] refused unknown method '${detail}'`);
+      this.postToWebview({
+        type: 'control.response',
+        requestId,
+        ok: false,
+        error: { message: 'unknown method' },
+        instanceId,
+      });
+      return;
+    }
     // Task 4 (§4.2): attribute a `panel.data` fetch for the `onWebviewSignal`
     // seam BEFORE running it — `isDataPanel` narrows `extractPanelName`'s
     // bare `string | undefined` to a real {@link DataPanel} via membership

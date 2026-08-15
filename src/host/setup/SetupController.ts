@@ -25,6 +25,7 @@ import type {
   SetupMethod,
   SetupProgress,
 } from '../../shared/protocol';
+import { SETUP_METHODS } from '../../shared/protocol';
 
 /**
  * SetupController — the host-side brain for Setup / Talaria Config
@@ -659,6 +660,20 @@ export const READ_ONLY_METHODS: readonly SetupMethod[] = [
   'setup.recheck',
 ];
 
+/** TE-4 (AU-11, INV-15) belt: derived from the SAME `SETUP_METHODS` `as
+ *  const` array {@link SetupMethod} comes from — checked at RUNTIME by
+ *  {@link SetupController.handle} before its switch. The switch itself is
+ *  exhaustive only at COMPILE time (`method: SetupMethod`); a `postMessage`
+ *  payload is never actually type-checked, so a name outside this Set fell
+ *  through every `case` with no runtime `default`, implicitly returning
+ *  `undefined` — which the caller (`TalariaViewProvider.handleSetupMethod`)
+ *  then read as a success (`ok:true`) AND used as the trigger to push a
+ *  fresh `SetupData` status probe. `TalariaViewProvider.handleControlRequest`
+ *  now refuses an unknown method before `handle` is ever reached (the
+ *  primary chokepoint) — this Set is the second, independent belt for any
+ *  other caller of `handle` directly. */
+const SETUP_METHOD_SET: ReadonlySet<string> = new Set<SetupMethod>(SETUP_METHODS);
+
 interface ThrottleState {
   lastEmit: number;
   timer?: ReturnType<typeof setTimeout>;
@@ -1212,6 +1227,12 @@ export class SetupController {
     method: SetupMethod,
     params: unknown,
   ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string }> {
+    // TE-4 (AU-11, INV-15) belt — see SETUP_METHOD_SET's doc: a method
+    // outside the known set fails closed HERE, before the trust gate or the
+    // switch, instead of silently falling through to an unhandled `undefined`.
+    if (!SETUP_METHOD_SET.has(method)) {
+      return { ok: false, reason: 'unknown setup method' };
+    }
     if (MUTATING_METHODS.has(method) && !this.host.isTrusted()) {
       return { ok: false, reason: TRUST_REFUSAL_REASON };
     }
