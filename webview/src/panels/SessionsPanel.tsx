@@ -99,7 +99,13 @@ export function SessionsPanel({
    */
   const [confirmingId, setConfirmingId] = useState<string | undefined>(undefined);
 
-  if (data.sessions.length === 0) return <EmptyPanel hint="No past sessions yet." />;
+  if (data.sessions.length === 0) {
+    return (
+      <PanelShell title="History">
+        <EmptyPanel hint="No past sessions yet." />
+      </PanelShell>
+    );
+  }
 
   const loadSession = (session: SessionSummary) => onLoad(loadTabMessage(activeTabId, session));
 

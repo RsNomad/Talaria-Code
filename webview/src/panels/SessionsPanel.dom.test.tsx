@@ -232,3 +232,19 @@ describe('AU-40: "Load more" goes BUSY, not natively disabled, while a request i
     expect(pending).toHaveFocus();
   });
 });
+
+/**
+ * AU-46: the empty state used to return a BARE `EmptyPanel` — dropping the
+ * panel's `PanelShell` header entirely, so an empty History panel lost its
+ * "History" title (and the tabpanel's accessible label along with it). The
+ * non-empty path already wraps in `<PanelShell title="History" ...>`; the
+ * empty path now does too, so the title survives at zero sessions.
+ */
+describe('AU-46: the empty state keeps the "History" panel header', () => {
+  it('renders the "History" title alongside the empty-state hint when there are no sessions', () => {
+    setup(renderPanel({ sessions: [] }));
+
+    expect(screen.getByText('History')).toBeInTheDocument();
+    expect(screen.getByText('No past sessions yet.')).toBeInTheDocument();
+  });
+});

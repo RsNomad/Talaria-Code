@@ -76,6 +76,29 @@ describe('W4-T6 (UI#8): CheckpointsPanel renders an EmptyPanel at 0 checkpoints 
     expect(screen.queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
   });
 
+  /**
+   * AU-46: the empty-state branch above used to return a BARE `EmptyPanel` —
+   * dropping the panel's `PanelShell` header, so an empty Checkpoints panel
+   * lost its "Checkpoints" title (and the tabpanel's accessible label along
+   * with it). The non-empty path (and the `available === false` branch
+   * above) already wrap in `<PanelShell title="Checkpoints" ...>`; the
+   * empty path now does too.
+   */
+  it('renders the "Checkpoints" title alongside the empty-state hint', () => {
+    const data: CheckpointsData = { checkpoints: [] };
+    render(
+      <CheckpointsPanel
+        data={data}
+        onRestore={async () => ({ restored: true, filesChanged: 0, changedPaths: [] })}
+        onRedo={neverRedo}
+        onRedoAll={neverRedo}
+      />,
+    );
+
+    expect(screen.getByText('Checkpoints')).toBeInTheDocument();
+    expect(screen.getByText(/no checkpoints/i)).toBeInTheDocument();
+  });
+
   it('the redo affordance still wins over the empty-state branch when checkpoints is [] but data.redo is present', () => {
     // CF-12/W3-T7: the anchored-redo target can outlive every tracked
     // checkpoint row (mirrors App.dom.test.tsx's `openCheckpointsWithRedo`

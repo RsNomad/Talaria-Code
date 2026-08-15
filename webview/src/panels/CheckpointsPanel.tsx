@@ -171,7 +171,11 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
   // actionable content — the Redo/Redo all affordance below — so it must
   // render that, not a bare "nothing here" hint that would hide it.
   if (data.checkpoints.length === 0 && !data.redo) {
-    return <EmptyPanel hint="No checkpoints yet — they appear here after each turn." />;
+    return (
+      <PanelShell title="Checkpoints">
+        <EmptyPanel hint="No checkpoints yet — they appear here after each turn." />
+      </PanelShell>
+    );
   }
 
   /**
