@@ -512,6 +512,66 @@ async function createModel(io: GgufIngestIo, spec: GgufIngestSpec, endpoint: str
   if (!response.ok) {
     throw new Error(`Ollama model create failed: ${response.status} ${response.statusText}`);
   }
+  if (!response.body) {
+    throw new Error(`Ollama model create failed: ${response.status} ${response.statusText}`);
+  }
+  // AU-52: `/api/create` streams NDJSON and can report a failure MID-STREAM
+  // on an otherwise-200 response — "the response status code will not
+  // change" (Context7 /ollama/ollama docs/api/errors.mdx, V6). `response.ok`
+  // ALONE is therefore not proof of success; the stream must be consumed to
+  // its terminal chunk, mirroring `ollamaClient.ts pullModel`'s own
+  // established NDJSON-line parsing (`:209-219`) one module over.
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    for (;;) {
+      const { value, done } = await readWithAbort(reader, signal);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIdx: number;
+      while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, newlineIdx).trim();
+        buffer = buffer.slice(newlineIdx + 1);
+        if (!line) continue;
+        if (handleCreateChunkLine(line)) return;
+      }
+    }
+    const trailing = buffer.trim();
+    if (trailing) {
+      handleCreateChunkLine(trailing);
+    }
+    // Stream ended without hitting an explicit terminal chunk either way.
+    // `handleCreateChunkLine` above already threw on any `{"error":…}` chunk
+    // observed along the way, so reaching here means none was seen — treat
+    // as success (defensive: some Ollama versions end quietly), exactly
+    // `pullModel`'s own fall-through behavior one module over.
+  } finally {
+    // Same F7 discipline as `pullModel`/`downloadToTemp`: cancel() on every
+    // exit path (success, mid-stream error, or abort), not just
+    // releaseLock().
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+interface CreateResponseChunk {
+  status?: string;
+  error?: string;
+}
+
+/** Parses one `/api/create` NDJSON line. Throws on an `{"error":…}` chunk —
+ *  the text is Ollama's own runner-generated operational message, not a
+ *  secret (same discipline `ollamaClient.ts pullModel`'s `handlePullChunkLine`
+ *  applies to the pull stream), prefixed to match `createModel`'s existing
+ *  HTTP-status failure message. Returns `true` once the stream has reached
+ *  its terminal `{"status":"success"}`. */
+function handleCreateChunkLine(line: string): boolean {
+  const chunk = JSON.parse(line) as CreateResponseChunk;
+  if (chunk.error) {
+    throw new Error(`Ollama model create failed: ${chunk.error}`);
+  }
+  return chunk.status === 'success';
 }
 
 // --- internals ---------------------------------------------------------------

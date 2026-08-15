@@ -132,6 +132,19 @@ function plainResponse(status: number, statusText = 'OK'): Response {
   return { ok: status >= 200 && status < 300, status, statusText } as unknown as Response;
 }
 
+/** A `/api/create`-shaped NDJSON stream response — each `lines[]` entry is
+ *  emitted as its own chunk (closer to real streaming than one giant
+ *  buffer), reusing {@link chunkedBody} exactly like {@link downloadResponse}
+ *  does. AU-52 (TC-8): Ollama reports a create failure MID-STREAM on an
+ *  otherwise-200 response ("the response status code will not change" —
+ *  Context7 `/ollama/ollama` docs/api/errors.mdx, V6) — this helper is what
+ *  lets tests encode that shape instead of the old body-free `plainResponse`. */
+function createResponse(lines: string[], opts: { ok?: boolean; status?: number; statusText?: string } = {}): Response {
+  const { ok = true, status = 200, statusText = 'OK' } = opts;
+  const chunks = lines.map((line) => new TextEncoder().encode(`${line}\n`));
+  return { ok, status, statusText, body: ok ? chunkedBody(chunks) : null } as unknown as Response;
+}
+
 /** A body whose reader's `read()` never resolves on its own — lets a test
  *  hold `ingestGguf` mid-download so it can assert abort behavior
  *  deterministically (identical shape to ollamaClient.test.ts's helper). */
@@ -162,7 +175,7 @@ function routedFetch(handlers: {
     calls.push({ url, init });
     if (url.startsWith('https://huggingface.co/')) return handlers.download(url);
     if (url.includes('/api/blobs/')) return (handlers.blob ?? (() => plainResponse(200)))(url);
-    if (url.includes('/api/create')) return (handlers.create ?? (() => plainResponse(200)))(url);
+    if (url.includes('/api/create')) return (handlers.create ?? (() => createResponse(['{"status":"success"}'])))(url);
     throw new Error(`unrouted fetch: ${url}`);
   }) as unknown as typeof fetch;
   return { fetchImpl, calls };
@@ -262,6 +275,61 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
     expect(closeSpy).toHaveBeenCalledTimes(1);
     // The blob POST succeeded before /api/create failed — its read stream must still be destroyed.
     expect(destroySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('AU-52: a 200 /api/create response with a mid-stream {"error"} chunk still REJECTS — the status code never changes on a mid-stream Ollama failure (V6)', async () => {
+    const { io, removeTemp, closeSpy, destroySpy } = fakeIo();
+    const { fetchImpl } = routedFetch({
+      download: () => downloadResponse([CONTENT]),
+      create: () => createResponse(['{"status":"reading model metadata"}', '{"error":"unsupported architecture \\"llama-next\\""}']),
+    });
+    io.fetchImpl = fetchImpl;
+
+    await expect(ingestGguf(io, SPEC, ENDPOINT, () => {}, new AbortController().signal)).rejects.toThrow(/unsupported architecture "llama-next"/);
+
+    // Refusal rides the SAME cleanup surface as every other create failure.
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(destroySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('a 200 /api/create response streaming progress then a terminal {"status":"success"} chunk resolves', async () => {
+    const { io, removeTemp } = fakeIo();
+    const { fetchImpl, calls } = routedFetch({
+      download: () => downloadResponse([CONTENT]),
+      create: () => createResponse(['{"status":"reading model metadata"}', '{"status":"writing manifest"}', '{"status":"success"}']),
+    });
+    io.fetchImpl = fetchImpl;
+
+    await expect(ingestGguf(io, SPEC, ENDPOINT, () => {}, new AbortController().signal)).resolves.toBeUndefined();
+
+    expect(calls.some((c) => c.url.includes('/api/create'))).toBe(true);
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborting mid-create-stream cancels the reader and rejects with AbortError', async () => {
+    const { io, removeTemp } = fakeIo();
+    const { reader } = controllableReader();
+    const cancelSpy = vi.spyOn(reader, 'cancel');
+    const controller = new AbortController();
+    io.fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith('https://huggingface.co/')) return downloadResponse([CONTENT]);
+      if (url.includes('/api/blobs/')) return plainResponse(200);
+      if (url.includes('/api/create')) {
+        return { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response;
+      }
+      throw new Error(`unrouted fetch: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const promise = ingestGguf(io, SPEC, ENDPOINT, () => {}, controller.signal);
+    // Let ingestGguf reach the create stream's (permanently pending) reader.read() before aborting.
+    await flushMicrotasks();
+    controller.abort();
+
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+    expect(cancelSpy).toHaveBeenCalled();
+    expect(removeTemp).toHaveBeenCalledTimes(1);
   });
 
   it('a non-2xx HF download response refuses and removes the temp file, without calling the endpoint at all', async () => {
