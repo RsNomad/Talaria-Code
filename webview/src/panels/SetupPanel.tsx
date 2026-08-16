@@ -1947,8 +1947,27 @@ function DedicatedNextForm({
           <TextField label="Endpoint" value={endpoint} onChange={setEndpoint} />
           <TextField label="Model" value={model} onChange={setModel} />
 
+          {/* livefix F2 (§3.3 parity): the empty-pin fail-closed state shows
+              the SAME affordance as the llama.cpp pane's pinned-unpublished
+              cell (localModel.tsx pinnedDownload branch): the reason line +
+              the Download button DISABLED naming that reason (pin reason
+              outranks the trust gate — it can never run regardless of trust).
+              PRESENTATION ONLY: onRun is a resolved no-op, so NO dispatch is
+              reachable from this branch, and the host independently refuses
+              empty-pin provisioning (SetupController NEXT_DOWNLOAD_UNAVAILABLE
+              guards). The downloadReady:true block below stays byte-unchanged. */}
           {backendIsOllama && dedicated && !dedicated.downloadReady && (
-            <p className="text-2xs text-faint">{NEXT_DOWNLOAD_UNAVAILABLE_TEXT}</p>
+            <div className="flex flex-col gap-1.5">
+              <p className="text-2xs text-muted">{NEXT_DOWNLOAD_UNAVAILABLE_TEXT}</p>
+              <div>
+                <ActionButton
+                  label={NEXT_DOWNLOAD_BUTTON_LABEL}
+                  icon="cloud-download"
+                  onRun={() => Promise.resolve(undefined)}
+                  disabledReason={NEXT_DOWNLOAD_UNAVAILABLE_TEXT}
+                />
+              </div>
+            </div>
           )}
 
           {backendIsOllama && dedicated?.downloadReady && (
