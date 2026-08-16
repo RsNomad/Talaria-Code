@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -55,7 +55,13 @@ function fakePort(cfg: {
   return { port, opens, written, chmods, closed };
 }
 
-const O_NOFOLLOW_LINUX = 0o400000; // asm-generic value; only used to sanity-check the flag bit is present when expected
+// x86-64/asm-generic `O_NOFOLLOW` literal (0o400000) — the win32 fallback only.
+// The value is NOT uniform across Linux arches: aarch64 defines its own
+// `O_NOFOLLOW = 0o100000` (arch/arm64/.../fcntl.h, before including asm-generic),
+// so a test must NEVER assert against this literal on a host whose real
+// constant differs — assert against `fsConstants.O_NOFOLLOW ?? O_NOFOLLOW_LINUX`
+// (the exact value the code uses) instead, or it breaks on the arm64 release leg.
+const O_NOFOLLOW_LINUX = 0o400000;
 
 describe('writeFileNoFollow — real FS happy paths', () => {
   async function withTmpDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -117,7 +123,13 @@ describe('writeFileNoFollow — fake port (every branch provable on any host)', 
     const { port, opens } = fakePort({ platform: 'linux' });
     await writeFileNoFollow('/ws/a.txt', Buffer.from('x'), { port });
     expect(opens).toHaveLength(1);
-    expect(must(opens[0]).flags & O_NOFOLLOW_LINUX).not.toBe(0);
+    // The code requests the HOST's real O_NOFOLLOW (arch-specific on Linux —
+    // aarch64 = 0o100000 vs x86-64 = 0o400000 — and absent on win32, where it
+    // falls back to the literal). Assert against the SAME value the code
+    // computes, never a hardcoded arch literal, so this passes on every
+    // release-matrix runner (ubuntu-latest x64 AND ubuntu-24.04-arm).
+    const expectedNoFollow = fsConstants.O_NOFOLLOW ?? O_NOFOLLOW_LINUX;
+    expect(must(opens[0]).flags & expectedNoFollow).not.toBe(0);
   });
 
   it('win32: O_NOFOLLOW is not requested (the flag does not exist there)', async () => {
