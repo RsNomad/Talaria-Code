@@ -520,12 +520,14 @@ const RECS_METER_SEGMENT_CLASS: Record<'agent' | 'fim' | 'embedding', string> = 
  * focus to its heading (`${cardId}-heading`, `tabIndex={-1}` via
  * `SectionLabel`/`Card`). NO dispatch, no expand — the FIM card's picker
  * has no collapsed state to expand (beta.7 B2: the other three roles route
- * through `useExpandOnJump` instead, via `onJump`/`RecRoleLine`).
+ * through `useExpandOnJump` instead, via `onJump`/`RecRoleLine`). Same
+ * `preventScroll` as `useExpandOnJump` — a bare focus() auto-scrolls and
+ * pre-empts the in-flight smooth scrollIntoView (livefix F1).
  */
 function jumpToCard(cardId: string): void {
   const section = document.getElementById(cardId);
   section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  document.getElementById(`${cardId}-heading`)?.focus();
+  document.getElementById(`${cardId}-heading`)?.focus({ preventScroll: true });
 }
 
 function RecommendationsBlock({ setup, onJump }: { setup: SetupData; onJump: (cardId: string) => void }) {

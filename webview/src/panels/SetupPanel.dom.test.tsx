@@ -3387,6 +3387,16 @@ describe('T18 — RecommendationsBlock strip (§3.5)', () => {
       scrollSpy.mockRestore();
     });
 
+    it('the FIM row focus carries preventScroll:true so it cannot pre-empt the smooth scroll (livefix F1)', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      const heading = must(document.getElementById('setup-card-fim-heading'));
+      const focusSpy = vi.spyOn(heading as HTMLElement, 'focus');
+      await user.click(screen.getByRole('button', { name: 'Set up → FIM card' }));
+      expect(focusSpy).toHaveBeenCalledWith({ preventScroll: true });
+      scrollSpy.mockRestore();
+    });
+
     it('clicking the Embedder row’s jump expands the embedding picker', async () => {
       const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
       const { user } = renderPanel(recsData());
