@@ -520,12 +520,14 @@ const RECS_METER_SEGMENT_CLASS: Record<'agent' | 'fim' | 'embedding', string> = 
  * focus to its heading (`${cardId}-heading`, `tabIndex={-1}` via
  * `SectionLabel`/`Card`). NO dispatch, no expand — the FIM card's picker
  * has no collapsed state to expand (beta.7 B2: the other three roles route
- * through `useExpandOnJump` instead, via `onJump`/`RecRoleLine`).
+ * through `useExpandOnJump` instead, via `onJump`/`RecRoleLine`). Same
+ * `preventScroll` as `useExpandOnJump` — a bare focus() auto-scrolls and
+ * pre-empts the in-flight smooth scrollIntoView (livefix F1).
  */
 function jumpToCard(cardId: string): void {
   const section = document.getElementById(cardId);
   section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  document.getElementById(`${cardId}-heading`)?.focus();
+  document.getElementById(`${cardId}-heading`)?.focus({ preventScroll: true });
 }
 
 function RecommendationsBlock({ setup, onJump }: { setup: SetupData; onJump: (cardId: string) => void }) {
@@ -1945,8 +1947,27 @@ function DedicatedNextForm({
           <TextField label="Endpoint" value={endpoint} onChange={setEndpoint} />
           <TextField label="Model" value={model} onChange={setModel} />
 
+          {/* livefix F2 (§3.3 parity): the empty-pin fail-closed state shows
+              the SAME affordance as the llama.cpp pane's pinned-unpublished
+              cell (localModel.tsx pinnedDownload branch): the reason line +
+              the Download button DISABLED naming that reason (pin reason
+              outranks the trust gate — it can never run regardless of trust).
+              PRESENTATION ONLY: onRun is a resolved no-op, so NO dispatch is
+              reachable from this branch, and the host independently refuses
+              empty-pin provisioning (SetupController NEXT_DOWNLOAD_UNAVAILABLE
+              guards). The downloadReady:true block below stays byte-unchanged. */}
           {backendIsOllama && dedicated && !dedicated.downloadReady && (
-            <p className="text-2xs text-faint">{NEXT_DOWNLOAD_UNAVAILABLE_TEXT}</p>
+            <div className="flex flex-col gap-1.5">
+              <p className="text-2xs text-muted">{NEXT_DOWNLOAD_UNAVAILABLE_TEXT}</p>
+              <div>
+                <ActionButton
+                  label={NEXT_DOWNLOAD_BUTTON_LABEL}
+                  icon="cloud-download"
+                  onRun={() => Promise.resolve(undefined)}
+                  disabledReason={NEXT_DOWNLOAD_UNAVAILABLE_TEXT}
+                />
+              </div>
+            </div>
           )}
 
           {backendIsOllama && dedicated?.downloadReady && (

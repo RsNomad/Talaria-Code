@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { ReactElement } from 'react';
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
 import { NEXT_EDIT_ROWS } from './nextEditCopy';
@@ -1248,7 +1248,7 @@ describe('NEXT card — R-3: ollama picked + modelDefaults.ollama empty (!downlo
     });
   }
 
-  it('the Model field starts EMPTY and the §6 "no vetted build published yet" line renders in the prefill\'s place', async () => {
+  it('the Model field starts EMPTY; the §6 "no vetted build published yet" line renders WITH the llama.cpp-parity Download button, DISABLED naming that reason (livefix F2)', async () => {
     const { user } = renderPanel(notReadyData());
     await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
     const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
@@ -1259,7 +1259,26 @@ describe('NEXT card — R-3: ollama picked + modelDefaults.ollama empty (!downlo
         "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.",
       ),
     ).toBeInTheDocument();
-    expect(within(nextCard).queryByRole('button', { name: 'Download model (~4.7 GB)' })).not.toBeInTheDocument();
+    const button = within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute('title', NEXT_DOWNLOAD_UNAVAILABLE_TEXT);
+  });
+
+  it('livefix F2: the fail-closed Download button can NEVER dispatch — disabled attribute AND a dispatch-free handler (empty sha256 stays fail-closed)', async () => {
+    const { user, dispatch } = renderPanel(notReadyData());
+    await user.click(screen.getByRole('button', { name: 'Set up dedicated NEXT' }));
+    const nextCard = must(screen.getByText('Next Edit (NEXT)').closest('section'));
+    const button = within(nextCard).getByRole('button', { name: 'Download model (~4.7 GB)' });
+    expect(button).toBeDisabled();
+    // Layer 1: a real user click on a disabled control is suppressed by the browser.
+    await user.click(button);
+    // Layer 2: even a synthetic click FORCED past the disabled suppression
+    // reaches a handler with no dispatch in it (onRun is a resolved no-op).
+    fireEvent.click(button);
+    expect(dispatch).not.toHaveBeenCalledWith('setup.provisionModel', expect.anything());
+    // The working-download chrome stays absent while !downloadReady (the
+    // downloadReady:true block at SetupPanel.tsx:1952 is untouched).
+    expect(within(nextCard).queryByRole('progressbar')).not.toBeInTheDocument();
   });
 
   it("Apply with the empty field surfaces the controller's 'model is required' refusal via the unwrap", async () => {
@@ -3384,6 +3403,16 @@ describe('T18 — RecommendationsBlock strip (§3.5)', () => {
       const { user } = renderPanel(recsData());
       await user.click(screen.getByRole('button', { name: 'Set up → FIM card' }));
       expect(document.activeElement?.id).toBe('setup-card-fim-heading');
+      scrollSpy.mockRestore();
+    });
+
+    it('the FIM row focus carries preventScroll:true so it cannot pre-empt the smooth scroll (livefix F1)', async () => {
+      const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => undefined);
+      const { user } = renderPanel(recsData());
+      const heading = must(document.getElementById('setup-card-fim-heading'));
+      const focusSpy = vi.spyOn(heading as HTMLElement, 'focus');
+      await user.click(screen.getByRole('button', { name: 'Set up → FIM card' }));
+      expect(focusSpy).toHaveBeenCalledWith({ preventScroll: true });
       scrollSpy.mockRestore();
     });
 
