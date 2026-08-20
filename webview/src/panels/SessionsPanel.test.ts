@@ -14,8 +14,26 @@ import { loadTabMessage } from './SessionsPanel';
 import { loadMoreFooterState } from '../state/panels';
 import type { SessionSummary } from '../protocol';
 
-function session(overrides: Partial<SessionSummary> = {}): SessionSummary {
-  return { id: 'sess-1', cwd: '/ws', title: 'Fix the bug', ...overrides };
+/**
+ * `title` defaults to a real string below, so the one test that wants the
+ * "no title" fallback-label path needs to say so explicitly — `{ title:
+ * undefined }` — rather than merely omitting the key (which would keep the
+ * default). `Partial<SessionSummary>` cannot express that under
+ * `exactOptionalPropertyTypes` (see the identical `catalogModel` pattern in
+ * `localModel.dom.test.tsx`); this test-only override type widens JUST
+ * `title` to accept an explicit `undefined` signal, resolved via `'title' in
+ * overrides` + conditional spread so the returned `SessionSummary` never
+ * carries an explicit-undefined key.
+ */
+function session(overrides: Partial<Omit<SessionSummary, 'title'>> & { title?: string | undefined } = {}): SessionSummary {
+  const { title, ...rest } = overrides;
+  const resolvedTitle = 'title' in overrides ? title : 'Fix the bug';
+  return {
+    id: 'sess-1',
+    cwd: '/ws',
+    ...rest,
+    ...(resolvedTitle !== undefined ? { title: resolvedTitle } : {}),
+  };
 }
 
 describe('loadTabMessage', () => {

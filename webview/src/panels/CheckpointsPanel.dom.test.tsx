@@ -213,7 +213,7 @@ describe('G-11: restoring the workspace is confirmed, locked and acknowledged', 
     const { user } = setup(
       renderPanel({
         onRestore: async (id, force) => {
-          calls.push({ id, force });
+          calls.push({ id, ...(force !== undefined ? { force } : {}) });
           if (!force) {
             return { restored: false, reason: 'Uncommitted changes would be overwritten.' };
           }
@@ -408,7 +408,7 @@ describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRed
   ): ReactElement {
     const data: CheckpointsData = {
       checkpoints: config.checkpoints ?? [checkpoint()],
-      redo: config.redo,
+      ...(config.redo !== undefined ? { redo: config.redo } : {}),
     };
     return (
       <CheckpointsPanel

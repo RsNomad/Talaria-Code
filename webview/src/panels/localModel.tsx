@@ -190,7 +190,7 @@ function OllamaBackendHeader({
 }: {
   ollama: SetupData['ollama'];
   dispatch: LocalModelBlockProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
 }) {
   if (!ollama.running) {
     return (
@@ -227,7 +227,7 @@ function LlamacppBackendHeader({
 }: {
   runtime: SetupData['llamacppRuntime'];
   dispatch: LocalModelBlockProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
 }) {
   const binary = runtime?.binary ?? 'checking';
 
@@ -328,12 +328,12 @@ function ModelRow({
   endpoint: string;
   progress: SetupProgressMap;
   dispatch: LocalModelBlockProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   selected: boolean;
-  onSelect?: (id: string) => void;
-  ollamaPullSuccessLabel?: string;
-  caption?: string;
-  runCommandCaption?: string;
+  onSelect?: ((id: string) => void) | undefined;
+  ollamaPullSuccessLabel?: string | undefined;
+  caption?: string | undefined;
+  runCommandCaption?: string | undefined;
   pinnedDownload?: LocalModelBlockProps['pinnedDownload'];
   onOllamaPullSuccess?: LocalModelBlockProps['onOllamaPullSuccess'];
 }) {
@@ -342,7 +342,7 @@ function ModelRow({
 
   let presenceText: string | undefined;
   let isPresent = false;
-  let action: { label: string; onRun: () => Promise<unknown>; disabledReason?: string; successLabel?: string } | undefined;
+  let action: { label: string; onRun: () => Promise<unknown>; disabledReason?: string | undefined; successLabel?: string | undefined } | undefined;
   let absenceOnly: string | undefined; // llama.cpp honest-absence: no action at all
 
   if (backend === 'ollama') {
@@ -581,9 +581,9 @@ function ActionButton({
 }: {
   label: string;
   onRun: () => Promise<unknown>;
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   icon?: string;
-  successLabel?: string;
+  successLabel?: string | undefined;
   pendingLabel?: string;
 }) {
   const [pending, setPending] = useState(false);

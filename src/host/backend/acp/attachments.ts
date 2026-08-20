@@ -39,7 +39,7 @@ function attachmentToContentBlock(attachment: Attachment): AcpOutboundContentBlo
         type: 'resource_link',
         uri: pathToFileUri(attachment.path),
         name: attachment.name,
-        mimeType: attachment.mime,
+        ...(attachment.mime !== undefined ? { mimeType: attachment.mime } : {}),
       };
     }
     return undefined;
@@ -51,7 +51,7 @@ function attachmentToContentBlock(attachment: Attachment): AcpOutboundContentBlo
       type: 'resource_link',
       uri: pathToFileUri(attachment.path),
       name: attachment.name,
-      mimeType: attachment.mime,
+      ...(attachment.mime !== undefined ? { mimeType: attachment.mime } : {}),
     };
   }
   if (parsed) {

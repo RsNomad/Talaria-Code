@@ -43,7 +43,7 @@ export interface FieldEditState {
   /** True while a `config.set` request issued from this edit is in flight. */
   pending: boolean;
   /** The last rollback's error reason, if any (surfaced as a subtle row affordance). */
-  lastError?: string;
+  lastError?: string | undefined;
   /**
    * `NextEditRow` ONLY (fix wave Finding 1): the OTHER Next Edit source's
    * on/off state this row's reconcile was last checked against. Stays

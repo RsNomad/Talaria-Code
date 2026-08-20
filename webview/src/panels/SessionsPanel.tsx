@@ -69,7 +69,7 @@ interface SessionsPanelProps {
    * cleared by the App-level reducer once the host's terminal `tab.bound`/
    * `tab.error` for that load's tabId lands.
    */
-  loadingSessionId?: string;
+  loadingSessionId?: string | undefined;
   /** A#7: "Load more" over the CORRELATED path (loading state + failure surfaces). */
   onLoadMore: (cursor: string) => void;
   /** Whether a "Load more" request is currently in flight. */

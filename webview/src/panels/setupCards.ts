@@ -244,13 +244,16 @@ export function foldSetupProgress(map: SetupProgressMap, msg: SetupProgress): Se
   }
   const prev = map[key];
   const logTail = msg.line !== undefined ? clampLogTail([...(prev?.logTail ?? []), msg.line]) : (prev?.logTail ?? []);
+  const phase = msg.phase ?? prev?.phase;
+  const totalBytes = msg.totalBytes ?? prev?.totalBytes;
+  const completedBytes = msg.completedBytes ?? prev?.completedBytes;
   const entry: SetupProgressEntry = {
     op: msg.op,
     id: msg.id,
-    phase: msg.phase ?? prev?.phase,
     logTail,
-    totalBytes: msg.totalBytes ?? prev?.totalBytes,
-    completedBytes: msg.completedBytes ?? prev?.completedBytes,
+    ...(phase !== undefined ? { phase } : {}),
+    ...(totalBytes !== undefined ? { totalBytes } : {}),
+    ...(completedBytes !== undefined ? { completedBytes } : {}),
   };
   return { ...map, [key]: entry };
 }
@@ -1276,7 +1279,7 @@ function baseRoleRec(row: SetupCatalogModel): RoleRec | undefined {
     sizeGiB,
     sizeGiBNum,
     vramLine: row.vramLine,
-    divergenceGiB: llamacppGiB !== undefined && llamacppGiB !== sizeGiB ? llamacppGiB : undefined,
+    ...(llamacppGiB !== undefined && llamacppGiB !== sizeGiB ? { divergenceGiB: llamacppGiB } : {}),
   };
 }
 

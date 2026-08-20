@@ -49,7 +49,10 @@ function renderPanel(config: {
   onLoadMore?: (cursor: string) => void;
   loadingMore?: boolean;
 }) {
-  const data: SessionsData = { sessions: config.sessions ?? [session()], nextCursor: config.nextCursor };
+  const data: SessionsData = {
+    sessions: config.sessions ?? [session()],
+    ...(config.nextCursor !== undefined ? { nextCursor: config.nextCursor } : {}),
+  };
   return (
     <SessionsPanel
       data={data}

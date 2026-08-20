@@ -67,7 +67,7 @@ interface RemotePanelProps<T> {
    * renders exactly as before — every existing caller that doesn't pass this
    * prop is byte-for-byte unaffected.
    */
-  refreshError?: RefreshErrorBanner;
+  refreshError?: RefreshErrorBanner | undefined;
   /** Rendered ONLY in the success state, with the resolved data. */
   children: (data: T) => ReactNode;
 }

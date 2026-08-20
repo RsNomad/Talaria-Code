@@ -20,7 +20,38 @@ function setup(jsx: ReactElement) {
   return { user: userEvent.setup(), ...render(jsx) };
 }
 
-function catalogModel(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+const DEFAULT_LLAMACPP: NonNullable<SetupCatalogModel['llamacpp']> = {
+  file: 'qwen2.5-coder-1.5b-q8_0.gguf',
+  approxBytes: 1_646_573_056,
+  present: false,
+  available: true,
+};
+
+/**
+ * `llamacpp`/`ollamaTag`/`vllm`/`defaultForRole` default to a present value
+ * below, so a caller that wants to test the "field is absent" render path
+ * (e.g. F-3/F-4 honest-absence) needs to say so explicitly — `{ llamacpp:
+ * undefined }` — rather than merely omitting the key (which would keep the
+ * default). `Partial<SetupCatalogModel>` cannot express that under
+ * `exactOptionalPropertyTypes` (an optional field's value type excludes
+ * `undefined`), so this test-only override type widens JUST those four
+ * fields to accept an explicit `undefined` override signal; the
+ * `SetupCatalogModel` this function RETURNS never carries an explicit-
+ * undefined key (arm 1: resolved via `'field' in overrides` + conditional
+ * spread) — the widening is confined to this local builder's input, not the
+ * shared protocol type.
+ */
+function catalogModel(
+  overrides: Partial<Omit<SetupCatalogModel, 'llamacpp' | 'vllm' | 'defaultForRole' | 'ollamaTag'>> & {
+    llamacpp?: SetupCatalogModel['llamacpp'] | undefined;
+    vllm?: SetupCatalogModel['vllm'] | undefined;
+    defaultForRole?: boolean | undefined;
+    ollamaTag?: string | undefined;
+  } = {},
+): SetupCatalogModel {
+  const { llamacpp, vllm, defaultForRole, ollamaTag, ...rest } = overrides;
+  const resolvedLlamacpp = 'llamacpp' in overrides ? llamacpp : DEFAULT_LLAMACPP;
+  const resolvedOllamaTag = 'ollamaTag' in overrides ? ollamaTag : 'qwen2.5-coder:1.5b-base';
   return {
     id: 'qwen25-coder-1.5b',
     role: 'fim',
@@ -29,15 +60,12 @@ function catalogModel(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogM
     license: 'apache-2.0',
     vramLine: 'any modern GPU (~1–2 GB)',
     progressId: 'qwen25-coder-1.5b',
-    ollamaTag: 'qwen2.5-coder:1.5b-base',
     ollamaApproxBytes: 986_000_000,
-    llamacpp: {
-      file: 'qwen2.5-coder-1.5b-q8_0.gguf',
-      approxBytes: 1_646_573_056,
-      present: false,
-      available: true,
-    },
-    ...overrides,
+    ...rest,
+    ...(resolvedOllamaTag !== undefined ? { ollamaTag: resolvedOllamaTag } : {}),
+    ...(resolvedLlamacpp !== undefined ? { llamacpp: resolvedLlamacpp } : {}),
+    ...(vllm !== undefined ? { vllm } : {}),
+    ...(defaultForRole !== undefined ? { defaultForRole } : {}),
   };
 }
 
