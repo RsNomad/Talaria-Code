@@ -33,9 +33,12 @@ export function fuseHybridRows(
 
   const fused = rrfFuse([vecRows, ftsRows], { k: rrfK });
 
-  return fused.slice(0, k).map((f) => {
-    const row = byId.get(f.id) as StoredRow;
-    return {
+  return fused.slice(0, k).flatMap((f) => {
+    // Unreachable-skip: every fused id came from vecRows/ftsRows, which
+    // populated byId above — total instead of a cast (WV3-MIN-SYN).
+    const row = byId.get(f.id);
+    if (!row) return [];
+    return [{
       id: row.id,
       path: row.path,
       startLine: row.startLine,
@@ -43,6 +46,6 @@ export function fuseHybridRows(
       content: row.content,
       language: row.language,
       score: f.score,
-    };
+    }];
   });
 }

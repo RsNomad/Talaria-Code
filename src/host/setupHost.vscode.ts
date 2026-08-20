@@ -192,7 +192,9 @@ function createPushableLineChannel(source: NodeJS.ReadableStream | null): {
   async function* generate(): AsyncGenerator<string> {
     for (;;) {
       if (queue.length > 0) {
-        yield queue.shift() as string;
+        const line = queue.shift();
+        // length > 0 was just checked; `undefined` is unreachable (typed-total).
+        if (line !== undefined) yield line;
         continue;
       }
       if (ended) return;
