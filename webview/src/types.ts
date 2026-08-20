@@ -425,9 +425,11 @@ export const DEFAULT_PRESET: EditPolicyPreset = 'manual';
 
 /** A freshly-minted, fully-idle tab (unbound, empty transcript, idle panels). */
 export function makeTabState(tabId: string, title: string): TabState {
+  // exactOptional prep (arm 1): `sessionId`/`subagentsRefreshError`/`error`
+  // are all optional (`?:`) on `TabState` — a fresh tab has none of them, so
+  // the keys are simply absent rather than present-with-`undefined`.
   return {
     tabId,
-    sessionId: undefined,
     binding: 'unbound',
     title,
     transcript: [],
@@ -439,8 +441,6 @@ export function makeTabState(tabId: string, title: string): TabState {
     rootId: '',
     availableModes: [],
     subagents: idle,
-    subagentsRefreshError: undefined,
-    error: undefined,
     availableCommands: [],
     draft: '',
     draftAttachments: [],
@@ -496,12 +496,16 @@ export function createInitialState(restored?: {
     globalPanels: {},
     rootPanels: {},
     sessionsPanel: idle,
-    systemError: undefined,
-    pendingSessionLoad: undefined,
+    // exactOptional prep (arm 1): `systemError`/`pendingSessionLoad` are
+    // optional on `AppState` — boot has neither, so the keys are absent
+    // rather than present-with-`undefined`.
     closeIntents: [],
     nextChatNumber: restored?.nextChatNumber ?? 2,
-    restoredTitles: restored?.tabTitles,
-    restoredDrafts: restored?.drafts,
+    // `restored?.tabTitles`/`restored?.drafts` are themselves `T | undefined`
+    // (an optional field read off an optional param) — spread each key in
+    // only when the caller actually supplied one.
+    ...(restored?.tabTitles !== undefined ? { restoredTitles: restored.tabTitles } : {}),
+    ...(restored?.drafts !== undefined ? { restoredDrafts: restored.drafts } : {}),
     setupProgress: EMPTY_SETUP_PROGRESS,
   };
 }

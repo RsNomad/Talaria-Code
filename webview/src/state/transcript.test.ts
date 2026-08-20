@@ -1334,7 +1334,14 @@ describe('transcript reducer — W4-T3b Deliverable 5: local tab lifecycle actio
     const state = reduceLocal(INITIAL_STATE, { type: 'local.tab.open', tabId: 'tab-2' });
     expect(state.tabOrder).toEqual([BOOTSTRAP_TAB_ID, 'tab-2']);
     expect(state.activeTabId).toBe('tab-2');
-    expect(state.tabs['tab-2']).toMatchObject({ binding: 'pending', sessionId: undefined });
+    // `toMatchObject` requires the key to literally EXIST on the received
+    // object (Jest/Vitest `subsetEquality`'s `hasPropertyInObject` check), so
+    // since exactOptional prep made `TabState.sessionId` absent (not
+    // present-with-`undefined`) for a fresh tab (`types.ts`'s
+    // `makeTabState`), asserting its absence needs its own check rather than
+    // `{ sessionId: undefined }` inside `toMatchObject`.
+    expect(state.tabs['tab-2']).toMatchObject({ binding: 'pending' });
+    expect(state.tabs['tab-2']?.sessionId).toBeUndefined();
   });
 
   it('local.tab.select switches the active tab', () => {

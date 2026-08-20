@@ -166,7 +166,14 @@ describe('handleSessionChange — B9 race rules (gating, §7 B9)', () => {
     // NOT adopted into 'a' (would clobber the in-flight bind of 'a').
     expect(result.activeTabId).toBe('b');
     expect(result.tabs.b).toMatchObject({ sessionId: 's-history', binding: 'pending' });
-    expect(result.tabs.a).toMatchObject({ binding: 'pending', sessionId: undefined }); // untouched
+    // untouched — `toMatchObject` requires the key to literally EXIST on the
+    // received object (Jest/Vitest `subsetEquality`'s `hasPropertyInObject`
+    // check), so since exactOptional prep made `TabState.sessionId` absent
+    // (not present-with-`undefined`) for a fresh/untouched tab
+    // (`types.ts`'s `makeTabState`), asserting its absence needs its own
+    // check rather than `{ sessionId: undefined }` inside `toMatchObject`.
+    expect(result.tabs.a).toMatchObject({ binding: 'pending' });
+    expect(result.tabs.a?.sessionId).toBeUndefined();
   });
 
   it('B9(b): tab.bound / tab.load announces the binding — folding a subsequent message for the same session no longer drop-unknowns it', () => {

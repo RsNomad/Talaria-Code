@@ -150,8 +150,25 @@ export class RpcClient {
           }
         }, effectiveTimeoutMs);
       }
-      this.pending.set(requestId, { resolve, reject, clearTimer: clearTimerFn, tag });
-      this.send({ type: 'control.request', requestId, method, params, instanceId: this.instanceId });
+      // exactOptional prep (arm 1): `tag`/`params` are `string | undefined` /
+      // `Record<string, unknown> | undefined`; `PendingRequest.tag` is a plain
+      // data field (`?: string`) and `ControlRequest.params` is a WIRE field
+      // (`?: Record<string, unknown>`) — spread each key in only when present
+      // rather than widening either declaration (the wire type especially:
+      // absent-vs-undefined on the wire is exactly what this flag protects).
+      this.pending.set(requestId, {
+        resolve,
+        reject,
+        clearTimer: clearTimerFn,
+        ...(tag !== undefined ? { tag } : {}),
+      });
+      this.send({
+        type: 'control.request',
+        requestId,
+        method,
+        ...(params !== undefined ? { params } : {}),
+        instanceId: this.instanceId,
+      });
     });
   }
 

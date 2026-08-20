@@ -248,7 +248,15 @@ export function App() {
         dispatch({ local: { type: 'local.setPanel', panel: 'chat' } });
         // Capture the ACTIVE tab id at ARRIVAL time. The user may switch tabs
         // before the Composer mounts and applies it (audit C-3).
-        setPendingSeed({ tabId: activeTabIdRef.current, text: msg.text, mentions: msg.mentions });
+        // exactOptional prep (arm 1): `msg.mentions` is `ContextRef[] |
+        // undefined`; `ComposerSeed.mentions` (composer/applySeed.ts, outside
+        // this batch) is `mentions?: ContextRef[]` — spread the key in only
+        // when present rather than widening that declaration.
+        setPendingSeed({
+          tabId: activeTabIdRef.current,
+          text: msg.text,
+          ...(msg.mentions !== undefined ? { mentions: msg.mentions } : {}),
+        });
       }
       if (msg.type === 'panel.activate' && msg.panel !== 'chat') {
         requestPanelRef.current(msg.panel, 'activate'); // narrowed to DataPanel
@@ -388,7 +396,12 @@ export function App() {
         request: (method, p) => bridge.request(method, p, rejectTag),
         dispatch: (action) => dispatch({ local: action }),
       },
-      { scopeKey, req: { method: 'panel.data', params: trigger ? { ...params, trigger } : params } },
+      {
+        // exactOptional prep (arm 1): `scopeKey` is `string | undefined`;
+        // the target's `scopeKey?: string` — spread it in only when present.
+        ...(scopeKey !== undefined ? { scopeKey } : {}),
+        req: { method: 'panel.data', params: trigger ? { ...params, trigger } : params },
+      },
     );
   };
   requestPanelRef.current = requestPanel;
@@ -634,7 +647,15 @@ export function App() {
     // live turn untouched (the old `{type:'newSession'}` restarted the WHOLE
     // connection, ending every tab). `tab.sessionId` is a hint only; the
     // host always re-reads this tab's ACTUAL occupant before acting on it.
-    bridge.post({ type: 'tab.newSession', tabId: tab.tabId, sessionId: tab.sessionId });
+    // exactOptional prep (arm 1): `tab.sessionId` is `string | undefined`;
+    // `WebviewToHost`'s `tab.newSession.sessionId?: string` is a WIRE field —
+    // absent-vs-undefined is exactly what this flag protects, so spread the
+    // key in only when present rather than widening the protocol type.
+    bridge.post({
+      type: 'tab.newSession',
+      tabId: tab.tabId,
+      ...(tab.sessionId !== undefined ? { sessionId: tab.sessionId } : {}),
+    });
   };
 
   // Renamed from `selectTab` (W4): this switches a side PANEL, not a
@@ -670,7 +691,12 @@ export function App() {
   const selectTab = (tabId: string) => {
     const target = state.tabs[tabId];
     dispatch({ local: { type: 'local.tab.select', tabId } });
-    bridge.post({ type: 'tab.activate', tabId, sessionId: target?.sessionId });
+    // exactOptional prep (arm 1): wire field, same posture as `tab.newSession` above.
+    bridge.post({
+      type: 'tab.activate',
+      tabId,
+      ...(target?.sessionId !== undefined ? { sessionId: target.sessionId } : {}),
+    });
   };
 
   // Close a chat tab: reject its in-flight RPCs (Deliverable 5 — a per-tab
@@ -681,7 +707,12 @@ export function App() {
     const target = state.tabs[tabId];
     bridge.rejectTab(tabId, 'Tab was closed.');
     dispatch({ local: { type: 'local.tab.close', tabId } });
-    bridge.post({ type: 'tab.close', tabId, sessionId: target?.sessionId });
+    // exactOptional prep (arm 1): wire field, same posture as `tab.newSession` above.
+    bridge.post({
+      type: 'tab.close',
+      tabId,
+      ...(target?.sessionId !== undefined ? { sessionId: target.sessionId } : {}),
+    });
   };
 
   // W2 T4 (F-D): open the read-only, both-virtual editor diff preview for a
@@ -733,6 +764,19 @@ export function App() {
       onDismiss: () => dispatch({ local: { type: 'local.scopedRefreshError.dismiss', target: read.dismiss } }),
     };
   };
+
+  // exactOptional prep (arm 1): every `RemotePanel`/`SettingsPanel` call below
+  // hands its `refreshError` prop the RESULT of `refreshErrorProp`/
+  // `scopedRefreshErrorProp`, which is `RefreshErrorBanner | undefined` — but
+  // `RemotePanelProps.refreshError` (`panels/PanelShell.tsx`, outside this
+  // batch) and `SettingsPanelProps.refreshError` (`panels/SettingsPanel.tsx`,
+  // also outside this batch) are both `refreshError?: RefreshErrorBanner`.
+  // Takes the ALREADY-COMPUTED value (not the getter) so spreading it never
+  // invokes `refreshErrorProp`/`scopedRefreshErrorProp` a second time — both
+  // mint a fresh object literal per call, so a double-call would hand two
+  // distinct (if structurally equal) object identities into the same render.
+  const withRefreshError = (banner: RefreshErrorBanner | undefined): { refreshError?: RefreshErrorBanner } =>
+    banner !== undefined ? { refreshError: banner } : {};
 
   return (
     <>
@@ -945,7 +989,7 @@ export function App() {
               remote={globalPanels.tools}
               loadingHint="Loading tools…"
               onRetry={() => requestPanel('tools')}
-              refreshError={refreshErrorProp('tools')}
+              {...withRefreshError(refreshErrorProp('tools'))}
             >
               {(data) => (
                 <ToolsPanel
@@ -969,7 +1013,7 @@ export function App() {
               remote={globalPanels.mcp}
               loadingHint="Loading servers…"
               onRetry={() => requestPanel('mcp')}
-              refreshError={refreshErrorProp('mcp')}
+              {...withRefreshError(refreshErrorProp('mcp'))}
             >
               {(data) => (
                 <McpPanel
@@ -1000,7 +1044,7 @@ export function App() {
               remote={globalPanels.skills}
               loadingHint="Loading skills…"
               onRetry={() => requestPanel('skills')}
-              refreshError={refreshErrorProp('skills')}
+              {...withRefreshError(refreshErrorProp('skills'))}
             >
               {(data) => (
                 <SkillsPanel
@@ -1030,7 +1074,7 @@ export function App() {
               remote={checkpointsRemote}
               loadingHint="Loading checkpoints…"
               onRetry={() => requestPanel('checkpoints')}
-              refreshError={scopedRefreshErrorProp('checkpoints')}
+              {...withRefreshError(scopedRefreshErrorProp('checkpoints'))}
             >
               {(data) => (
                 <CheckpointsPanel
@@ -1056,7 +1100,7 @@ export function App() {
               remote={tab.subagents}
               loadingHint="Loading subagents…"
               onRetry={() => requestPanel('subagents')}
-              refreshError={scopedRefreshErrorProp('subagents')}
+              {...withRefreshError(scopedRefreshErrorProp('subagents'))}
             >
               {(data) => <SubagentsPanel data={data} />}
             </RemotePanel>
@@ -1075,7 +1119,7 @@ export function App() {
               remote={state.sessionsPanel}
               loadingHint="Loading sessions…"
               onRetry={() => requestPanel('sessions')}
-              refreshError={scopedRefreshErrorProp('sessions')}
+              {...withRefreshError(scopedRefreshErrorProp('sessions'))}
             >
               {(data) => (
                 <SessionsPanel
@@ -1084,10 +1128,15 @@ export function App() {
                   boundSessionIds={boundSessionIds}
                   activeTabHasLiveTurn={tab.turnActive}
                   onLoad={hostActions.loadSession}
-                  loadingSessionId={state.pendingSessionLoad?.sessionId}
+                  /* exactOptional prep (arm 1): `SessionsPanelProps`
+                     (`panels/SessionsPanel.tsx`, outside this batch) declares
+                     both as `?: string` — spread each key in only when present. */
+                  {...(state.pendingSessionLoad?.sessionId !== undefined
+                    ? { loadingSessionId: state.pendingSessionLoad.sessionId }
+                    : {})}
                   onLoadMore={loadMoreSessions}
                   loadingMore={sessionsLoadingMore}
-                  loadMoreError={sessionsLoadMoreError}
+                  {...(sessionsLoadMoreError !== undefined ? { loadMoreError: sessionsLoadMoreError } : {})}
                 />
               )}
             </RemotePanel>
@@ -1106,7 +1155,7 @@ export function App() {
               remote={globalPanels.models}
               loadingHint="Loading models…"
               onRetry={() => requestPanel('models')}
-              refreshError={refreshErrorProp('models')}
+              {...withRefreshError(refreshErrorProp('models'))}
             >
               {(data) => (
                 <ModelsPanel
@@ -1170,7 +1219,7 @@ export function App() {
               config={globalPanels.settings}
               onRetryConfig={() => requestPanel('settings')}
               onSetConfig={setConfig}
-              refreshError={refreshErrorProp('settings')}
+              {...withRefreshError(refreshErrorProp('settings'))}
             />
           </ErrorBoundary>
         </div>

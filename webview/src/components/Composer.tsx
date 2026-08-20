@@ -101,8 +101,12 @@ interface ComposerProps {
    * be a lie there (nothing is connecting; the route back is History/New
    * Chat, never a passive wait). `undefined` (every other disabled reason —
    * a fresh/pending tab) keeps the original copy.
+   *
+   * exactOptional prep (arm 3): widened to `?: string | undefined` — the real
+   * caller (`App.tsx`) hands this a ternary (`cond ? '...' : undefined`),
+   * which is `string | undefined`, not merely "absent when unused".
    */
-  disabledPlaceholder?: string;
+  disabledPlaceholder?: string | undefined;
   /**
    * SF-2 (T4 populates `availableModes`/owns the engine — T3b wires only
    * this picker UI SHELL, reading `mode.state`). `null` = no custom mode
