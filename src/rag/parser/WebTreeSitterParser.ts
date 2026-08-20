@@ -22,7 +22,7 @@ import type { CodeParser } from './CodeParser';
 // SAME set this class actually uses at runtime, instead of hand-duplicating
 // the language→file mapping in the test and risking silent drift between
 // the two lists.
-export const GRAMMAR_FILE_BY_LANGUAGE: Record<string, string> = {
+export const GRAMMAR_FILE_BY_LANGUAGE: Readonly<Record<string, string>> = Object.freeze({
   typescript: 'tree-sitter-typescript.wasm',
   typescriptreact: 'tree-sitter-tsx.wasm',
   javascript: 'tree-sitter-javascript.wasm',
@@ -34,7 +34,7 @@ export const GRAMMAR_FILE_BY_LANGUAGE: Record<string, string> = {
   csharp: 'tree-sitter-c_sharp.wasm',
   c: 'tree-sitter-c.wasm',
   cpp: 'tree-sitter-cpp.wasm',
-};
+});
 
 export interface WebTreeSitterParserOptions {
   /** Directory containing the `tree-sitter-*.wasm` grammar files. */

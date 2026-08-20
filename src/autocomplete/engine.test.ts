@@ -337,7 +337,7 @@ describe('FimEngine', () => {
       expect(must(backend.calls[0]).stop.length).toBeGreaterThan(0);
       // Sanity: it's not just the newline guard — the template's own FIM/EOT
       // tokens (what actually halts generation at the hole boundary) are present.
-      expect(must(backend.calls[0]).stop).toEqual(expect.arrayContaining(template.stop));
+      expect(must(backend.calls[0]).stop).toEqual(expect.arrayContaining([...template.stop]));
     });
   });
 

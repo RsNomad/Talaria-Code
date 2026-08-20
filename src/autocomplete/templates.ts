@@ -18,7 +18,7 @@ function toRelativePath(uriOrPath: string, workspaceUris: string[]): string {
   return uriOrPath;
 }
 
-const QWEN_STOP = [
+const QWEN_STOP: readonly string[] = Object.freeze([
   '<|endoftext|>',
   '<|fim_prefix|>',
   '<|fim_middle|>',
@@ -28,7 +28,7 @@ const QWEN_STOP = [
   '<|file_sep|>',
   '<|im_start|>',
   '<|im_end|>',
-];
+]);
 
 /**
  * Qwen2.5-Coder — repo-level (cross-file) FIM. Falls back to the plain
@@ -71,7 +71,7 @@ export const starcoder2FimTemplate: FimTemplate = {
         : `<file_sep>${ctx.snippets.map((s) => s.content).join('<file_sep>')}<file_sep>`;
     return `${otherFiles}<fim_prefix>${prefix}<fim_suffix>${suffix}<fim_middle>`;
   },
-  stop: [
+  stop: Object.freeze([
     '<fim_prefix>',
     '<fim_suffix>',
     '<fim_middle>',
@@ -81,7 +81,7 @@ export const starcoder2FimTemplate: FimTemplate = {
     // includes "starcoder2"; kept here as well so this template is self-contained).
     't.',
     '\nt',
-  ],
+  ]),
   supportsSnippets: true,
 };
 
@@ -89,7 +89,7 @@ export const starcoder2FimTemplate: FimTemplate = {
 export const stableCodeFimTemplate: FimTemplate = {
   render: (prefix, suffix) =>
     `<fim_prefix>${prefix}<fim_suffix>${suffix}<fim_middle>`,
-  stop: [
+  stop: Object.freeze([
     '<fim_prefix>',
     '<fim_suffix>',
     '<fim_middle>',
@@ -97,43 +97,43 @@ export const stableCodeFimTemplate: FimTemplate = {
     '<|endoftext|>',
     '</fim_middle>',
     '</code>',
-  ],
+  ]),
 };
 
 /** Codestral — raw template form. Prefer `CodestralFimBackend`'s native endpoint instead. */
 export const codestralFimTemplate: FimTemplate = {
   render: (prefix, suffix) => `[SUFFIX]${suffix}[PREFIX]${prefix}`,
-  stop: ['[PREFIX]', '[SUFFIX]'],
+  stop: Object.freeze(['[PREFIX]', '[SUFFIX]']),
 };
 
 export const codeLlamaFimTemplate: FimTemplate = {
   render: (prefix, suffix) => `<PRE> ${prefix} <SUF>${suffix} <MID>`,
-  stop: ['<PRE>', '<SUF>', '<MID>', '<EOT>'],
+  stop: Object.freeze(['<PRE>', '<SUF>', '<MID>', '<EOT>']),
 };
 
 export const deepseekFimTemplate: FimTemplate = {
   render: (prefix, suffix) =>
     `<｜fim▁begin｜>${prefix}<｜fim▁hole｜>${suffix}<｜fim▁end｜>`,
-  stop: [
+  stop: Object.freeze([
     '<｜fim▁begin｜>',
     '<｜fim▁hole｜>',
     '<｜fim▁end｜>',
     '//',
     '<｜end▁of▁sentence｜>',
-  ],
+  ]),
 };
 
 export const codegemmaFimTemplate: FimTemplate = {
   render: (prefix, suffix) =>
     `<|fim_prefix|>${prefix}<|fim_suffix|>${suffix}<|fim_middle|>`,
-  stop: [
+  stop: Object.freeze([
     '<|fim_prefix|>',
     '<|fim_suffix|>',
     '<|fim_middle|>',
     '<|file_separator|>',
     '<end_of_turn>',
     '<eos>',
-  ],
+  ]),
 };
 
 /** Instruct "hole filler" fallback for chat-only models (gpt/claude) with no FIM tokens. */
@@ -142,7 +142,7 @@ export const holeFillerTemplate: FimTemplate = {
     'You are a HOLE FILLER. Complete the code where {{FILL_HERE}} appears, replying with ' +
     'only the replacement text inside a <COMPLETION/> tag.\n\n<QUERY>\n' +
     `${prefix}{{FILL_HERE}}${suffix}\n</QUERY>\n<COMPLETION>`,
-  stop: ['</COMPLETION>'],
+  stop: Object.freeze(['</COMPLETION>']),
 };
 
 /**

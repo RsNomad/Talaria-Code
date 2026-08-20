@@ -95,4 +95,8 @@ describe('RAG_SETTING_RELOAD is exhaustive over package.json talaria.rag.* prope
   it('embedBackend (beta.6 T8, restoration-only — never captured into indexer/MCP opts) is classified "live"', () => {
     expect(RAG_SETTING_RELOAD['embedBackend']).toBe('live');
   });
+
+  it('WV3-MIN-SYN: RAG_SETTING_RELOAD is frozen — importers cannot flip a key\'s reload class', () => {
+    expect(Object.isFrozen(RAG_SETTING_RELOAD)).toBe(true);
+  });
 });

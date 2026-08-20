@@ -200,3 +200,21 @@ describe('isKnownFimModel', () => {
     expect(getTemplateForModel('qwen2.5-coder:7b-base')).toBe(qwenMultifileFimTemplate);
   });
 });
+
+describe('WV3-MIN-SYN: template stop lists are frozen (mutable-export class)', () => {
+  const all = [
+    qwenMultifileFimTemplate,
+    starcoder2FimTemplate,
+    stableCodeFimTemplate,
+    codestralFimTemplate,
+    codeLlamaFimTemplate,
+    deepseekFimTemplate,
+    codegemmaFimTemplate,
+    holeFillerTemplate,
+  ];
+  it('all 8 singleton stop arrays are frozen', () => {
+    for (const t of all) {
+      expect(Object.isFrozen(t.stop)).toBe(true);
+    }
+  });
+});

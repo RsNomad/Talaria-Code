@@ -111,7 +111,7 @@ export interface FimBackend {
 /** Builds the raw FIM prompt string for a model family; unused by native-FIM backends. */
 export interface FimTemplate {
   render(prefix: string, suffix: string, ctx: FimContext): string;
-  stop: string[];
+  stop: readonly string[];
   /** Optional (single-owner boundary — see W5-T0 report): `true` on templates that
    *  know how to render `ctx.snippets` into the prompt (set by T4 on the two
    *  snippet-aware templates). `undefined`/absent = not snippet-aware = safe
