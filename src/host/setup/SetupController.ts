@@ -676,8 +676,8 @@ const SETUP_METHOD_SET: ReadonlySet<string> = new Set<SetupMethod>(SETUP_METHODS
 
 interface ThrottleState {
   lastEmit: number;
-  timer?: ReturnType<typeof setTimeout>;
-  pending?: SetupProgress;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  pending: SetupProgress | undefined;
 }
 
 /**
@@ -725,14 +725,14 @@ export class SetupController {
   private readonly throttle = new Map<string, ThrottleState>();
 
   private installLogTail: string[] = [];
-  private lastAgentIssue?: { phase: AgentSetupPhase; detail: string };
+  private lastAgentIssue: { phase: AgentSetupPhase; detail: string } | undefined;
   /** Set once a `setup.install` succeeds THIS session; never cleared here (a real reload replaces the whole extension host, and therefore this controller instance). */
   private awaitingReload = false;
   /** T5: memoized OS detection (a PROMISE, so concurrent `status()` calls
    *  share one read) — cleared by `setup.recheck` so the next demand
    *  re-reads (the user may have installed VS Code outside the sandbox, or
    *  the file may have become readable). */
-  private osResolution?: Promise<OsResolution>;
+  private osResolution: Promise<OsResolution> | undefined;
 
   /**
    * T6 (beta.6 §2.5): the llama.cpp runtime SETTLED-VALUE memo — deliberately
@@ -743,14 +743,14 @@ export class SetupController {
    * exactly ONCE (the seq-guarded push repaints). `undefined` = not settled
    * yet. The `path` is stored ALREADY `~`-redacted (T6 M-3 discipline).
    */
-  private llamaCppRuntime?: { binary: 'found' | 'missing' | 'unknown'; version?: string; path?: string };
+  private llamaCppRuntime: { binary: 'found' | 'missing' | 'unknown'; version?: string; path?: string } | undefined;
   /** True while a probe attempt is in flight — with {@link llamaCppRuntime}
    *  `undefined` + this false, the next `status()` kicks a fresh probe. */
   private llamaCppProbeInFlight = false;
   /** The in-flight probe attempt's AbortController — a scoped recheck (and
    *  {@link dispose}) aborts it so a superseded login-shell probe dies
    *  instead of lingering (T5 CR-1 signal threading). */
-  private llamaCppProbeAbort?: AbortController;
+  private llamaCppProbeAbort: AbortController | undefined;
   /** Monotonic supersession guard: bumped by {@link rekickLlamaCppProbe} so a
    *  SUPERSEDED probe settling late can neither overwrite the fresh state
    *  nor fire a stray push. */
@@ -768,7 +768,7 @@ export class SetupController {
    * partial wiring) leaves this memo permanently `undefined`, which {@link
    * computeAgentPhase} reads exactly like the pre-AU-8 settings-only truth.
    */
-  private hermesPathDiscovery?: { found: string | null };
+  private hermesPathDiscovery: { found: string | null } | undefined;
   /** True while a discovery attempt is in flight — with {@link
    *  hermesPathDiscovery} `undefined` + this false, the next `status()`
    *  kicks a fresh probe. */
@@ -2719,7 +2719,7 @@ export class SetupController {
     const now = Date.now();
     let state = this.throttle.get(key);
     if (!state) {
-      state = { lastEmit: -Infinity };
+      state = { lastEmit: -Infinity, timer: undefined, pending: undefined };
       this.throttle.set(key, state);
     }
     const elapsed = now - state.lastEmit;

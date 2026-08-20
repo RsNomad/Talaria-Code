@@ -212,7 +212,11 @@ function handlePullChunkLine(line: string, onProgress: (p: PullProgress) => void
     throw new Error(chunk.error);
   }
   if (chunk.status) {
-    onProgress({ status: chunk.status, totalBytes: chunk.total, completedBytes: chunk.completed });
+    onProgress({
+      status: chunk.status,
+      ...(chunk.total !== undefined ? { totalBytes: chunk.total } : {}),
+      ...(chunk.completed !== undefined ? { completedBytes: chunk.completed } : {}),
+    });
     if (chunk.status === 'success') return true;
   }
   return false;

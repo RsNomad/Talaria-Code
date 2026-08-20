@@ -276,7 +276,11 @@ async function findPipxPath(exec: ExecLookup, cwd: string, signal: AbortSignal |
 
   let stdout: string;
   try {
-    stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_TIMEOUT_MS, cwd, signal });
+    stdout = await exec(spec.command, spec.args, {
+      timeoutMs: PIPX_STEP0_TIMEOUT_MS,
+      cwd,
+      ...(signal !== undefined ? { signal } : {}),
+    });
   } catch (firstErr) {
     // TC-5/AU-28: an abort takes priority over the timeout classifier — Node
     // sets `killed`/`signal` on an abort-driven kill too (the same shape a
@@ -286,7 +290,11 @@ async function findPipxPath(exec: ExecLookup, cwd: string, signal: AbortSignal |
     if (signal?.aborted) throw firstErr;
     if (!isExecTimeout(firstErr)) return { kind: 'missing' };
     try {
-      stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_RETRY_TIMEOUT_MS, cwd, signal });
+      stdout = await exec(spec.command, spec.args, {
+        timeoutMs: PIPX_STEP0_RETRY_TIMEOUT_MS,
+        cwd,
+        ...(signal !== undefined ? { signal } : {}),
+      });
     } catch (secondErr) {
       if (signal?.aborted) throw secondErr;
       if (!isExecTimeout(secondErr)) return { kind: 'missing' };
@@ -314,7 +322,11 @@ async function probeAbsoluteCandidates(
 ): Promise<PipxLookup> {
   for (const candidate of absoluteCandidatePaths()) {
     try {
-      await exec(candidate, ['--version'], { timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS, cwd, signal });
+      await exec(candidate, ['--version'], {
+        timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS,
+        cwd,
+        ...(signal !== undefined ? { signal } : {}),
+      });
       return { kind: 'found', path: candidate };
     } catch (err) {
       // TC-5/AU-28: an abort must propagate, not be swallowed as "try the
@@ -423,14 +435,22 @@ async function runLoginShell(
 ): Promise<string> {
   const spec = loginShellSpawn(command, args, undefined, options);
   try {
-    return await exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd, signal });
+    return await exec(spec.command, spec.args, {
+      timeoutMs: LOOKUP_TIMEOUT_MS,
+      cwd,
+      ...(signal !== undefined ? { signal } : {}),
+    });
   } catch (err) {
     // TC-5/AU-28: an abort takes priority over the timeout classifier (see
     // {@link findPipxPath}'s identical guard) — propagate immediately
     // instead of retrying into an already-aborted signal.
     if (signal?.aborted) throw err;
     if (!isExecTimeout(err)) throw err;
-    return exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd, signal });
+    return exec(spec.command, spec.args, {
+      timeoutMs: LOOKUP_TIMEOUT_MS,
+      cwd,
+      ...(signal !== undefined ? { signal } : {}),
+    });
   }
 }
 

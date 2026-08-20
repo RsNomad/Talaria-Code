@@ -63,7 +63,7 @@ function unquote(rawValue: string): string {
  * {@link resolveDistroFamily} maps to `'unknown'`).
  */
 export function parseOsRelease(text: string): OsRelease {
-  const release: OsRelease = { id: undefined, idLike: [], versionId: undefined, prettyName: undefined };
+  const release: OsRelease = { idLike: [] };
 
   for (const rawLine of text.split(/\r\n|\n/)) {
     const line = rawLine.trim();

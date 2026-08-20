@@ -235,7 +235,6 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
       instanceId: 'test-instance',
       requestId: 9,
       method: 'config.show',
-      params: undefined,
     });
     await flush();
 

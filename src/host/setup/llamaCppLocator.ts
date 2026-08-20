@@ -164,7 +164,11 @@ async function findLlamaServerPath(
 
   let stdout: string;
   try {
-    stdout = await exec(spec.command, spec.args, { timeoutMs: STEP0_TIMEOUT_MS, cwd, signal });
+    stdout = await exec(spec.command, spec.args, {
+      timeoutMs: STEP0_TIMEOUT_MS,
+      cwd,
+      ...(signal !== undefined ? { signal } : {}),
+    });
   } catch (firstErr) {
     // TC-5/AU-28: an abort takes priority over the timeout classifier — Node
     // sets `killed`/`signal` on an abort-driven kill too (the same shape a
@@ -174,7 +178,11 @@ async function findLlamaServerPath(
     if (signal?.aborted) throw firstErr;
     if (!isExecTimeout(firstErr)) return { kind: 'missing' };
     try {
-      stdout = await exec(spec.command, spec.args, { timeoutMs: STEP0_RETRY_TIMEOUT_MS, cwd, signal });
+      stdout = await exec(spec.command, spec.args, {
+        timeoutMs: STEP0_RETRY_TIMEOUT_MS,
+        cwd,
+        ...(signal !== undefined ? { signal } : {}),
+      });
     } catch (secondErr) {
       if (signal?.aborted) throw secondErr;
       if (!isExecTimeout(secondErr)) return { kind: 'missing' };
@@ -205,7 +213,11 @@ async function probeAbsoluteCandidates(
 ): Promise<LlamaServerLookup> {
   for (const candidate of absoluteCandidatePaths()) {
     try {
-      const raw = await exec(candidate, ['--version'], { timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS, cwd, signal });
+      const raw = await exec(candidate, ['--version'], {
+        timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS,
+        cwd,
+        ...(signal !== undefined ? { signal } : {}),
+      });
       const version = lastNonEmptyLine(raw);
       return { kind: 'found', path: candidate, ...(version ? { version } : {}) };
     } catch (err) {
@@ -235,7 +247,11 @@ async function tryGetVersion(
 ): Promise<string | undefined> {
   try {
     const spec = loginShellSpawn(binPath, ['--version']);
-    const raw = await exec(spec.command, spec.args, { timeoutMs: VERSION_PROBE_TIMEOUT_MS, cwd, signal });
+    const raw = await exec(spec.command, spec.args, {
+      timeoutMs: VERSION_PROBE_TIMEOUT_MS,
+      cwd,
+      ...(signal !== undefined ? { signal } : {}),
+    });
     const line = lastNonEmptyLine(raw);
     return line || undefined;
   } catch (err) {

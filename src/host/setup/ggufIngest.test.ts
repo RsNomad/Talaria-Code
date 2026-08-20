@@ -172,7 +172,7 @@ function routedFetch(handlers: {
   const calls: { url: string; init?: RequestInit }[] = [];
   const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = String(input);
-    calls.push({ url, init });
+    calls.push({ url, ...(init !== undefined ? { init } : {}) });
     if (url.startsWith('https://huggingface.co/')) return handlers.download(url);
     if (url.includes('/api/blobs/')) return (handlers.blob ?? (() => plainResponse(200)))(url);
     if (url.includes('/api/create')) return (handlers.create ?? (() => createResponse(['{"status":"success"}'])))(url);

@@ -120,7 +120,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   /** View id contributed in package.json (Agent C) and used in `activate`. */
   public static readonly viewId = 'talaria.panel';
 
-  private view?: vscode.WebviewView;
+  private view: vscode.WebviewView | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   /** TE-7 (AU-31): per-VIEW scope — `resolveWebviewView`'s own subscriptions
    *  (`onDidReceiveMessage`, `onDidDispose`), as opposed to {@link
@@ -157,7 +157,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * parameter property) so {@link setSearchFiles} can rewire it on a
    * mock→real backend upgrade, mirroring {@link setBackend}'s swap seam.
    */
-  private searchFiles?: FindFilesFn;
+  private searchFiles: FindFilesFn | undefined;
 
   /**
    * W5.1 R5 (Task 13): the «Next Edit Suggestions» toggle capability, wired by
@@ -168,10 +168,10 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * answered with an honest refusal instead of being forwarded to an agent
    * that does not own this state.
    */
-  private nextEditToggles?: NextEditTogglePort;
+  private nextEditToggles: NextEditTogglePort | undefined;
   /** Subscription to {@link nextEditToggles}'s `onDidChange`; replaced (and
    *  disposed) if the port is ever rewired, so one push never becomes two. */
-  private nextEditTogglesSub?: vscode.Disposable;
+  private nextEditTogglesSub: vscode.Disposable | undefined;
 
   /**
    * Task 9 (onboarding-backend-setup-architecture.md §7/§8): the Setup /
@@ -227,7 +227,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * one seed is held — a second `seedComposer` before delivery overwrites
    * the first (last-wins; matches `postToWebview`'s no-queueing posture for
    * every other message type). */
-  private pendingSeed?: { text: string; mentions?: ContextRef[] };
+  private pendingSeed: { text: string; mentions?: ContextRef[] } | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -516,12 +516,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         'Talaria: the seeded prompt exceeded the 64 KB limit and was truncated.',
       );
     }
-    const payload = { text: capped.text, mentions: seed.mentions };
+    const payload = {
+      text: capped.text,
+      ...(seed.mentions !== undefined ? { mentions: seed.mentions } : {}),
+    };
 
     this.revealView();
 
     if (decideSeedDelivery(this.isWebviewLive) === 'post') {
-      this.postToWebview({ type: 'composer.seed', text: payload.text, mentions: payload.mentions });
+      this.postToWebview({ type: 'composer.seed', ...payload });
     } else {
       this.pendingSeed = payload;
     }
@@ -983,7 +986,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         requestId,
         ok: false,
         error: { message: 'unknown method' },
-        instanceId,
+        ...(instanceId !== undefined ? { instanceId } : {}),
       });
       return;
     }
@@ -1025,7 +1028,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         requestId,
         ok: true,
         result: redactControlResponse(method, result),
-        instanceId,
+        ...(instanceId !== undefined ? { instanceId } : {}),
       });
     } catch (err) {
       if (panel) {
@@ -1037,7 +1040,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         requestId,
         ok: false,
         error: { message: errorMessage(err) },
-        instanceId,
+        ...(instanceId !== undefined ? { instanceId } : {}),
       });
     }
   }
@@ -1209,7 +1212,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     const seed = this.pendingSeed;
     if (!seed) return;
     this.pendingSeed = undefined;
-    this.postToWebview({ type: 'composer.seed', text: seed.text, mentions: seed.mentions });
+    this.postToWebview({ type: 'composer.seed', ...seed });
   }
 
   private postTheme(): void {
@@ -1231,6 +1234,8 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // 'setup'.
     const activePanel = this.initialPanel;
     this.initialPanel = 'chat';
+    const availableCommands = this.availableCommands();
+    const tabs = this.liveTabs();
     return {
       sessionId: null,
       theme: this.currentTheme(),
@@ -1250,14 +1255,14 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       // `available_commands` catalog without the adapter replaying it.
       // Absent/undefined until the first catalog arrives, or on a backend
       // with no commands seam (mock).
-      availableCommands: this.availableCommands(),
+      ...(availableCommands !== undefined ? { availableCommands } : {}),
       // W6-FF (3-way ARCH I-1): every LIVE session the registry currently
       // holds — lets the webview reconcile its WHOLE tab model on a
       // memory-pressure webview re-create (`retainContextWhenHidden` is
       // best-effort, :366) instead of orphaning them (drop-unknown). Absent
       // on a genuine cold boot (empty registry) or a backend with no
       // multi-tab registry (mock) — see {@link liveTabs}.
-      tabs: this.liveTabs(),
+      ...(tabs !== undefined ? { tabs } : {}),
     };
   }
 
