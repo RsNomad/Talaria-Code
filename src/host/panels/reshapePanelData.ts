@@ -17,6 +17,7 @@ import type {
   ToolsData,
   ToolsetInfo,
 } from '../../shared/protocol';
+import { isRecord } from '../../shared/typeGuards';
 
 /**
  * The Zone S reshaping seam: PURE functions that turn a raw control-plane RPC
@@ -248,6 +249,38 @@ export interface RawMcpServerConfig {
 /** Raw `config.get({key:"full"})` result — only the `mcp_servers` slice is used here. */
 export interface RawConfigFullResult {
   mcp_servers?: Record<string, RawMcpServerConfig>;
+}
+
+/**
+ * A-01 (lens-dorabotok 🔴): unwrap the `config.get({key:"full"})` ENVELOPE.
+ *
+ * The shipped Hermes gateway returns `{"config": <full config dict>}` —
+ * `tui_gateway/server.py:10868-10869` (`if key == "full": return _ok(rid,
+ * {"config": _load_cfg()})`) — so `mcp_servers` lives at
+ * `result.config.mcp_servers`, one level BELOW where the pre-fix code read
+ * it (`panelSources.ts` old :161-162), which left `knownNames` empty and
+ * made `requireListedMcpName` (`ControlDispatcher.ts:831-843`) refuse every
+ * MCP admin op.
+ *
+ * Tolerant legacy-flat fallback: an older Hermes build (NOT-VERIFIED
+ * register) may have returned the flat payload — if there is no record
+ * `config` key but the value itself is a record, use it as-is. Anything
+ * else (null / undefined / primitive / array) unwraps to `{}` — null-safe
+ * by construction, killing the `rawConfig.mcp_servers` TypeError on a wire
+ * `result: null` (the SYN-BOUNDARY flagship sub-site).
+ *
+ * This is the ONLY sanctioned ingress for `config.get{full}`; the guarded
+ * `as` below is the codebase's documented assert-after-guard posture at an
+ * untyped wire boundary (WS-BG later makes the class uniform).
+ */
+export function unwrapConfigFull(raw: unknown): RawConfigFullResult {
+  if (isRecord(raw)) {
+    if (isRecord(raw.config)) {
+      return raw.config as RawConfigFullResult;
+    }
+    return raw as RawConfigFullResult;
+  }
+  return {};
 }
 
 /**

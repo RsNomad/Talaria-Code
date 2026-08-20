@@ -6,6 +6,7 @@ import {
   reshapeSessionsList,
   reshapeModelOptions,
   reshapeConfigShow,
+  unwrapConfigFull,
 } from './reshapePanelData';
 import { must } from '../../testing/must';
 import { McpPanelSource } from './panelSources';
@@ -771,5 +772,65 @@ describe('reshapeConfigShow', () => {
     const result = reshapeConfigShow({ sections: [{ title: 'Empty' }, { title: 'Odd', rows: [['soloKey']] }] });
     expect(result.sections[0]).toEqual({ name: 'Empty', fields: [] });
     expect(must(must(result.sections[1]).fields[0])).toEqual({ key: 'soloKey', value: '', type: 'string' });
+  });
+});
+
+describe('unwrapConfigFull (A-01 — the config.get{key:"full"} envelope)', () => {
+  /**
+   * CONTRACT TEST (unexecuted-assurance guard): this fixture is shaped from
+   * the on-disk Hermes 2026.7.7.2 gateway source —
+   * `tui_gateway/server.py:10868-10869`:
+   *
+   *     if key == "full":
+   *         return _ok(rid, {"config": _load_cfg()})
+   *
+   * i.e. the JSON-RPC `result` is `{"config": <the full config.yaml dict>}`,
+   * with `mcp_servers` INSIDE `config`, next to unrelated top-level config
+   * keys. The old flat fixtures enshrined the wrong shape precisely because
+   * nobody pinned the wire; this test is that pin. Do not "simplify" it to
+   * the bare `{mcp_servers}` payload.
+   */
+  const HERMES_CONFIG_FULL_WIRE_RESULT = {
+    config: {
+      model: 'ollama/qwen3:14b',
+      custom_prompt: '',
+      terminal: { cwd: '/home/user/project' },
+      mcp_servers: {
+        filesystem: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] },
+        remote_api: { url: 'https://my-mcp-server.example.com/mcp' },
+      },
+    },
+  };
+
+  it('contract: unwraps the {config:{…}} envelope Hermes actually sends (server.py:10868)', () => {
+    const unwrapped = unwrapConfigFull(HERMES_CONFIG_FULL_WIRE_RESULT);
+    expect(Object.keys(unwrapped.mcp_servers ?? {}).sort()).toEqual(['filesystem', 'remote_api']);
+  });
+
+  it('contract: the unwrapped payload feeds reshapeMcpServers unchanged', () => {
+    const data = reshapeMcpServers(unwrapConfigFull(HERMES_CONFIG_FULL_WIRE_RESULT), { toolsets: [] });
+    expect(data.servers.map((s) => s.name).sort()).toEqual(['filesystem', 'remote_api']);
+    expect(data.servers.every((s) => s.status === 'disconnected')).toBe(true);
+  });
+
+  it('tolerates the legacy FLAT shape (older Hermes builds — NOT-VERIFIED register; delete this arm once they are ruled out)', () => {
+    const flat = { mcp_servers: { gh: { command: 'npx' } } };
+    expect(unwrapConfigFull(flat)).toBe(flat);
+  });
+
+  it('unwraps a wire `result: null` / non-record to {} — null-safe by construction (SYN-BOUNDARY flagship)', () => {
+    expect(unwrapConfigFull(null)).toEqual({});
+    expect(unwrapConfigFull(undefined)).toEqual({});
+    expect(unwrapConfigFull('nonsense')).toEqual({});
+    expect(unwrapConfigFull([{ mcp_servers: {} }])).toEqual({});
+  });
+
+  it('a record with a non-record `config` key falls back to the flat arm (mcp_servers simply absent)', () => {
+    expect(unwrapConfigFull({ config: null }).mcp_servers).toBeUndefined();
+  });
+
+  it('the envelope wins when both `config` and a top-level `mcp_servers` are present', () => {
+    const both = { config: { mcp_servers: { inner: {} } }, mcp_servers: { outer: {} } };
+    expect(Object.keys(unwrapConfigFull(both).mcp_servers ?? {})).toEqual(['inner']);
   });
 });
