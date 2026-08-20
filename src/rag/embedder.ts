@@ -184,6 +184,9 @@ export class HttpEmbedder implements Embedder {
       timedOut = true;
       controller.abort();
     }, EMBED_TIMEOUT_MS);
+    // Invariant (WV3-MIN-SYN): at runtime this is Node's Timeout (unref
+    // exists); the double cast only bridges the DOM-flavored setTimeout
+    // typing, and the optional-call makes any non-Node environment a no-op.
     (timer as unknown as { unref?: () => void }).unref?.();
     let json: EmbeddingsResponse;
     try {
