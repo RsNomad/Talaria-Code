@@ -390,6 +390,25 @@ describe('reshapeMcpServers', () => {
     await src.fetch();
     expect([...must(src.lastListedNames())].sort()).toEqual(['disabled_server', 'filesystem', 'github', 'remote_api']);
   });
+
+  it('A-01: McpPanelSource unwraps the ENVELOPED config.get result (the real Hermes shape)', async () => {
+    const src = new McpPanelSource({
+      dispatch: async (method: string) =>
+        method === 'config.get' ? { config: MCP_CONFIG_FIXTURE } : MCP_TOOLS_FIXTURE,
+    } as unknown as PanelSourceContext);
+    const outcome = await src.fetch();
+    expect([...must(src.lastListedNames())].sort()).toEqual(['disabled_server', 'filesystem', 'github', 'remote_api']);
+    expect(must(outcome.data).servers.length).toBe(4);
+  });
+
+  it('A-01: a wire `result: null` from config.get resolves to zero servers instead of throwing', async () => {
+    const src = new McpPanelSource({
+      dispatch: async (method: string) => (method === 'config.get' ? null : MCP_TOOLS_FIXTURE),
+    } as unknown as PanelSourceContext);
+    const outcome = await src.fetch();
+    expect(must(outcome.data).servers).toEqual([]);
+    expect(must(src.lastListedNames()).size).toBe(0);
+  });
 });
 
 /**

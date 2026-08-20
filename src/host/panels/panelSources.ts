@@ -21,7 +21,7 @@ import {
   reshapeSessionsList,
   reshapeSkillsList,
   reshapeToolsList,
-  type RawConfigFullResult,
+  unwrapConfigFull,
   type RawConfigShowResult,
   type RawModelOptionsResult,
   type RawSessionListResult,
@@ -141,11 +141,13 @@ export class SettingsPanelSource implements PanelSource<'settings'> {
 /* ---- join / fold / native sources (resolve with the reshaped data) ------- */
 
 /**
- * The Zone CFG MCP-hub join: `config.get({key:"full"}).mcp_servers` +
- * `tools.list`'s per-toolset `tool_count` -> `McpData`. No single tui_gateway
- * RPC returns this shape (`contracts-tui-gateway.md` §3 GAPS #1). Still the
- * tui_gateway channel (global config), just two RPCs — dispatched in order so
- * `config.get` precedes `tools.list` on the wire.
+ * The Zone CFG MCP-hub join: `config.get({key:"full"})` → `{config:
+ * {…, mcp_servers}}` (ENVELOPED — `tui_gateway/server.py:10868-10869`;
+ * unwrapped via {@link unwrapConfigFull}) + `tools.list`'s per-toolset
+ * `tool_count` -> `McpData`. No single tui_gateway RPC returns this shape
+ * (`contracts-tui-gateway.md` §3 GAPS #1). Still the tui_gateway channel
+ * (global config), just two RPCs — dispatched in order so `config.get`
+ * precedes `tools.list` on the wire.
  */
 export class McpPanelSource implements PanelSource<'mcp'>, ToggleNameCache {
   /** Server names from the last successful `config.get` (the toggle key set, S-M4). */
@@ -158,7 +160,10 @@ export class McpPanelSource implements PanelSource<'mcp'>, ToggleNameCache {
       this.ctx.dispatch('config.get', { key: 'full' }),
       this.ctx.dispatch('tools.list', {}),
     ]);
-    const rawConfig = config as RawConfigFullResult;
+    // A-01: the wire result is `{config: <full config dict>}`
+    // (`tui_gateway/server.py:10868-10869`) — unwrap ONCE here, so both the
+    // toggle-name cache and the reshaper read the same unwrapped payload.
+    const rawConfig = unwrapConfigFull(config);
     this.knownNames = new Set(Object.keys(rawConfig.mcp_servers ?? {}));
     const data: McpData = reshapeMcpServers(rawConfig, tools as RawToolsListResult);
     return { data };
