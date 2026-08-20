@@ -217,7 +217,7 @@ describe('fimHasLocalInstall — drives the two-mode question (§6 card 3)', () 
     expect(fimHasLocalInstall(withLocal)).toBe(true);
   });
   it('false for codestral/openai-compat-shaped entries (remote-only, no localInstall)', () => {
-    const remoteOnly = fimOption({ id: 'codestral', localInstall: undefined });
+    const remoteOnly = fimOption({ id: 'codestral' });
     expect(fimHasLocalInstall(remoteOnly)).toBe(false);
   });
 });
@@ -535,7 +535,7 @@ describe('fimInstallTestEndpoint — ⑨⑩ R-2 honest endpoint resolution', () 
   });
 
   it('falls back to empty when the option carries no remote entry at all (defensive)', () => {
-    const option = fimOption({ id: 'vllm', remote: undefined });
+    const option = fimOption({ id: 'vllm' });
     expect(fimInstallTestEndpoint('vllm', option)).toBe('');
   });
 });
@@ -568,7 +568,11 @@ describe('nextPresence — client-side derivation against live form state (§4.2
   });
 
   it('unknown when ollama.endpoint was never probed (undefined) — a string can never equal undefined', () => {
-    const setup = { ollama: ollamaStatus({ endpoint: undefined, models: [{ name: createdName, sizeBytes: 1 }] }) };
+    // `endpoint` is genuinely ABSENT here (not explicit undefined) — the
+    // `ollamaStatus` default sets it, so this bypasses the helper and omits
+    // the key entirely (arm 1: absent-key, same runtime shape `.endpoint`
+    // reads as before under `exactOptionalPropertyTypes`).
+    const setup = { ollama: { running: true, models: [{ name: createdName, sizeBytes: 1 }] } };
     expect(nextPresence(setup, endpoint, createdName)).toBe('unknown');
   });
 
@@ -892,17 +896,23 @@ describe('catalogPresence — generalizes nextPresence over ANY catalog row (lib
     const devstral = catalogModel({
       id: 'devstral-24b',
       role: 'agent',
-      ollamaTag: undefined,
       ollamaApproxBytes: 14_333_915_904,
       ollamaCreatedName: 'devstral-small-2507:24b',
     });
+    // hf-ingest-tier rows carry no `ollamaTag` — the base fixture sets one,
+    // so it must be genuinely DELETED (absent), not just left un-overridden.
+    delete devstral.ollamaTag;
     const ollama = ollamaWire({ models: [{ name: 'devstral-small-2507:24b', sizeBytes: 1 }] });
     expect(catalogPresence(ollama, 'http://127.0.0.1:11434', devstral)).toBe('present');
   });
 
   it('row with neither ollamaTag nor ollamaCreatedName -> unknown (defensive, no ollama entry to check)', () => {
     const ollama = ollamaWire({ models: [{ name: 'anything', sizeBytes: 1 }] });
-    const noOllamaEntry = catalogModel({ ollamaTag: undefined, ollamaApproxBytes: undefined });
+    const noOllamaEntry = catalogModel();
+    // The base fixture sets both `ollamaTag` and `ollamaApproxBytes` — delete
+    // them to genuinely simulate a row with no ollama entry at all.
+    delete noOllamaEntry.ollamaTag;
+    delete noOllamaEntry.ollamaApproxBytes;
     expect(catalogPresence(ollama, 'http://127.0.0.1:11434', noOllamaEntry)).toBe('unknown');
   });
 
@@ -944,7 +954,8 @@ describe('ollamaPullButtonLabel / llamacppDownloadButtonLabel — §6 "Pull {tag
   });
 
   it('hf-ingest tier (no ollamaTag): falls back to ollamaCreatedName', () => {
-    const devstral = catalogModel({ ollamaTag: undefined, ollamaCreatedName: 'devstral-small-2507:24b', ollamaApproxBytes: 14_333_915_904 });
+    const devstral = catalogModel({ ollamaCreatedName: 'devstral-small-2507:24b', ollamaApproxBytes: 14_333_915_904 });
+    delete devstral.ollamaTag; // hf-ingest-tier rows carry no ollamaTag — the base fixture sets one.
     expect(ollamaPullButtonLabel(devstral)).toBe('Pull devstral-small-2507:24b (~13 GB)');
   });
 
@@ -957,9 +968,9 @@ describe('ollamaPullButtonLabel / llamacppDownloadButtonLabel — §6 "Pull {tag
 
 describe('catalogPreselectId — the ONE picker-preselect rule (A-F8): saved wins, else defaultForRole, else first row', () => {
   const models = [
-    catalogModel({ id: 'ornith-9b', defaultForRole: undefined }),
+    catalogModel({ id: 'ornith-9b' }),
     catalogModel({ id: 'devstral-24b', defaultForRole: true }),
-    catalogModel({ id: 'ornith-35b', defaultForRole: undefined }),
+    catalogModel({ id: 'ornith-35b' }),
   ];
 
   it('a saved modelId that exists in the row set wins over the default row', () => {
@@ -1661,7 +1672,7 @@ describe('T18 — recs strip pure derivation (§3.5, B-F1..B-F8)', () => {
     nextEditOverrides: Partial<SetupData['nextEdit']> = {},
   ): Pick<SetupData, 'catalog' | 'nextEdit'> {
     return {
-      catalog: catalogModels ? { models: catalogModels } : undefined,
+      ...(catalogModels ? { catalog: { models: catalogModels } } : {}),
       nextEdit: nextEditFixture(nextEditOverrides),
     };
   }
@@ -1709,9 +1720,12 @@ describe('T18 — recs strip pure derivation (§3.5, B-F1..B-F8)', () => {
       expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
     });
     it('a defaultForRole row with no ollamaApproxBytes does not "resolve" (no truthful size to print)', () => {
-      const models = FULL_CATALOG.map((m) =>
-        m.id === 'devstral-24b' ? { ...m, ollamaApproxBytes: undefined } : m,
-      );
+      const models = FULL_CATALOG.map((m) => {
+        if (m.id !== 'devstral-24b') return m;
+        const clone = { ...m };
+        delete clone.ollamaApproxBytes; // genuinely absent, not present-as-undefined
+        return clone;
+      });
       expect(deriveRecommendations(setupFixture(models))).toBeUndefined();
     });
     // A12 (queued #4): `NaN`/`-1`/`0` bytes must gate the strip off exactly
@@ -1853,7 +1867,11 @@ describe('T18 — recs strip pure derivation (§3.5, B-F1..B-F8)', () => {
 
   describe('NEXT/Sweep fail-closed (B-F5, §3.5) — mirrors the NEXT card, never "recommended" while unpinned', () => {
     it('absent `dedicated` entirely -> fail-closed by default (R-3 posture), nextReady false', () => {
-      const recs = mustRec(deriveRecommendations(setupFixture(FULL_CATALOG, { dedicated: undefined })));
+      // The base `nextEditFixture` sets `dedicated` — genuinely DELETE it
+      // (not present-as-undefined) to simulate the field truly absent.
+      const fixture = setupFixture(FULL_CATALOG);
+      delete fixture.nextEdit.dedicated;
+      const recs = mustRec(deriveRecommendations(fixture));
       expect(recs.next.nextReady).toBe(false);
     });
     it('downloadReady: true (published pin) -> nextReady true', () => {
@@ -1975,9 +1993,11 @@ describe('T18 — scoped source-scan: ZERO hardcoded model data in the recs stri
  * ------------------------------------------------------------------ */
 
 describe('catalogRowIdForModel — row-selection derived from the install target (PT3)', () => {
+  const devstralRow = catalogModel({ id: 'devstral-24b', role: 'agent', ollamaCreatedName: 'devstral-small-2507:24b' });
+  delete devstralRow.ollamaTag; // hf-ingest-tier row carries no ollamaTag — the base fixture sets one.
   const models = [
-    catalogModel({ id: 'qwen25-coder-1.5b', ollamaTag: 'qwen2.5-coder:1.5b-base', ollamaCreatedName: undefined }),
-    catalogModel({ id: 'devstral-24b', role: 'agent', ollamaTag: undefined, ollamaCreatedName: 'devstral-small-2507:24b' }),
+    catalogModel({ id: 'qwen25-coder-1.5b', ollamaTag: 'qwen2.5-coder:1.5b-base' }),
+    devstralRow,
   ];
 
   it('exact ollamaTag match', () => {
@@ -2058,12 +2078,12 @@ describe('ragEndpointInit — RAG embedder section endpoint field init per pane 
   });
 
   it("old-host wire (embedBackend absent) -> the ollama pane still inits from the always-present saved endpoint (the '?? ollama' branch)", () => {
-    const rag = { embedBackend: undefined, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    const rag = { embedEndpoint: 'http://saved:1234', endpointDefaults };
     expect(ragEndpointInit(rag, 'ollama')).toBe('http://saved:1234');
   });
 
   it('old-host wire (embedBackend absent) -> a non-ollama pane falls to its own default', () => {
-    const rag = { embedBackend: undefined, embedEndpoint: 'http://saved:1234', endpointDefaults };
+    const rag = { embedEndpoint: 'http://saved:1234', endpointDefaults };
     expect(ragEndpointInit(rag, 'llamacpp')).toBe('http://127.0.0.1:8081');
   });
 
@@ -2074,7 +2094,7 @@ describe('ragEndpointInit — RAG embedder section endpoint field init per pane 
   });
 
   it("endpointDefaults absent -> '' for a non-matching pane (defensive; the type requires optional-chaining even though the host always populates it)", () => {
-    const rag = { embedBackend: 'ollama' as const, embedEndpoint: 'http://saved:1234', endpointDefaults: undefined };
+    const rag = { embedBackend: 'ollama' as const, embedEndpoint: 'http://saved:1234' };
     expect(ragEndpointInit(rag, 'llamacpp')).toBe('');
   });
 });

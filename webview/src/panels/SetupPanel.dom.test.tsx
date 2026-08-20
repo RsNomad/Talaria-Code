@@ -579,7 +579,8 @@ describe('RAG card — renders precondition text (§6 card 5)', () => {
   });
 
   it('renders nothing precondition-ish when unset', () => {
-    renderPanel(baseData({ rag: { ...baseData().rag, preconditionDetail: undefined } }));
+    // Base `rag` fixture already carries no `preconditionDetail` key.
+    renderPanel(baseData());
     expect(screen.queryByText(/needs a trusted/)).not.toBeInTheDocument();
   });
 });
@@ -828,7 +829,8 @@ describe('container-note banner (§1.2, T10)', () => {
   });
 
   it('renders nothing when os is absent', () => {
-    renderPanel(baseData({ os: undefined }));
+    // Base fixture already carries no `os` key.
+    renderPanel(baseData());
     expect(screen.queryByText(/can't tell which system/)).not.toBeInTheDocument();
   });
 
@@ -885,7 +887,7 @@ describe('B5 "done / what next" one-line status under each card (§6, T10)', () 
 /** A tiny fixture over `baseData()` for the Provider card's own phase — B3's
  *  Re-check tests only vary this one field. */
 function withProviderPhase(phase: SetupData['provider']['phase']): SetupData {
-  return baseData({ provider: { phase, providerId: phase === 'configured' ? 'anthropic' : undefined } });
+  return baseData({ provider: { phase, ...(phase === 'configured' ? { providerId: 'anthropic' } : {}) } });
 }
 
 describe('Provider card — Re-check provider (beta.7 B3)', () => {
@@ -1686,39 +1688,46 @@ function fimCatalogRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalog
  *  absence cells on this surface) — plus one agent-role row to prove the
  *  role filter. */
 function fimCatalog(): SetupCatalogModel[] {
-  return [
-    fimCatalogRow(),
-    fimCatalogRow({
-      id: 'qwen25-coder-7b',
-      displayName: 'Qwen2.5-Coder 7B (base)',
-      defaultForRole: undefined,
-      vramLine: '~8 GB GPUs',
-      ollamaTag: 'qwen2.5-coder:7b-base',
-      ollamaApproxBytes: 4_700_000_000,
-      llamacpp: { file: 'qwen2.5-coder-7b-q8_0.gguf', approxBytes: 8_100_000_000, present: false, available: true },
-    }),
-    fimCatalogRow({
-      id: 'qwen25-coder-14b',
-      displayName: 'Qwen2.5-Coder 14B (base)',
-      defaultForRole: undefined,
-      vramLine: 'Q8 wants a 24 GB card (the Ollama 14b-base tag is the Q4 build at 9.0 GB)',
-      ollamaTag: 'qwen2.5-coder:14b-base',
-      ollamaApproxBytes: 9_000_000_000,
-      llamacpp: { file: 'qwen2.5-coder-14b-q8_0.gguf', approxBytes: 15_700_000_000, present: false, available: true },
-    }),
-    fimCatalogRow({
-      id: 'devstral-24b',
-      role: 'agent',
-      displayName: 'Devstral-24B (2507)',
-      defaultForRole: true,
-      vramLine: '24 GB',
-      ollamaTag: undefined,
-      ollamaApproxBytes: 14_333_915_904,
-      ollamaCreatedName: 'devstral-small-2507:24b',
-      llamacpp: undefined,
-      note: undefined,
-    }),
-  ];
+  // The base `fimCatalogRow()` sets `defaultForRole: true` — only the first
+  // (1.5b) row keeps it; these two are genuinely NOT the role default, so
+  // the key must be DELETED (not left present-as-undefined).
+  const qwen7b = fimCatalogRow({
+    id: 'qwen25-coder-7b',
+    displayName: 'Qwen2.5-Coder 7B (base)',
+    vramLine: '~8 GB GPUs',
+    ollamaTag: 'qwen2.5-coder:7b-base',
+    ollamaApproxBytes: 4_700_000_000,
+    llamacpp: { file: 'qwen2.5-coder-7b-q8_0.gguf', approxBytes: 8_100_000_000, present: false, available: true },
+  });
+  delete qwen7b.defaultForRole;
+
+  const qwen14b = fimCatalogRow({
+    id: 'qwen25-coder-14b',
+    displayName: 'Qwen2.5-Coder 14B (base)',
+    vramLine: 'Q8 wants a 24 GB card (the Ollama 14b-base tag is the Q4 build at 9.0 GB)',
+    ollamaTag: 'qwen2.5-coder:14b-base',
+    ollamaApproxBytes: 9_000_000_000,
+    llamacpp: { file: 'qwen2.5-coder-14b-q8_0.gguf', approxBytes: 15_700_000_000, present: false, available: true },
+  });
+  delete qwen14b.defaultForRole;
+
+  // hf-ingest-tier row (Devstral): no ollamaTag/llamacpp/note — the base
+  // fixture sets each, so genuinely delete them rather than pass explicit
+  // `undefined`.
+  const devstral = fimCatalogRow({
+    id: 'devstral-24b',
+    role: 'agent',
+    displayName: 'Devstral-24B (2507)',
+    defaultForRole: true,
+    vramLine: '24 GB',
+    ollamaApproxBytes: 14_333_915_904,
+    ollamaCreatedName: 'devstral-small-2507:24b',
+  });
+  delete devstral.ollamaTag;
+  delete devstral.llamacpp;
+  delete devstral.note;
+
+  return [fimCatalogRow(), qwen7b, qwen14b, devstral];
 }
 
 function fimBlockData(overrides: Partial<SetupData> = {}): SetupData {
@@ -1978,74 +1987,76 @@ function agentCatalogRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatal
   };
 }
 
+/** library-tier agent row builder: the base `agentCatalogRow()` fixture sets
+ *  `defaultForRole: true` and `ollamaCreatedName` (the hf-ingest-tier
+ *  Devstral shape) — every OTHER row here is library-tier (ollamaTag) and
+ *  never the role default, so both keys are genuinely DELETED (not left
+ *  present-as-undefined). */
+function libraryTierAgentRow(overrides: Partial<SetupCatalogModel>): SetupCatalogModel {
+  const row = agentCatalogRow(overrides);
+  delete row.defaultForRole;
+  delete row.ollamaCreatedName;
+  return row;
+}
+
 /** The six REAL agent rows (ids/names/publishers/notes mirror MODEL_CATALOG)
  *  + one fim row to prove the role filter. */
 function agentCatalog(): SetupCatalogModel[] {
   return [
     agentCatalogRow(),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'ornith-9b',
-      defaultForRole: undefined,
       displayName: 'Ornith-1.0 9B',
       publisher: 'ornith-ai',
       vramLine: '24GB-easy (128K+ ctx headroom)',
       progressId: 'ornith-9b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'ornith:9b',
       ollamaApproxBytes: 5_600_000_000,
       llamacpp: { file: 'ornith-1.0-9b-Q4_K_M.gguf', approxBytes: 5_629_108_704, present: false, available: true },
       vllm: { runCommand: 'vllm serve ornith-ai/Ornith-1.0-9B' },
     }),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'ornith-35b',
-      defaultForRole: undefined,
       displayName: 'Ornith-1.0 35B (MoE)',
       publisher: 'ornith-ai',
       vramLine: '24GB-stretch (CPU-offload) / 32GB-comfortable',
       note: T12_MOE_NOTE,
       progressId: 'ornith-35b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'ornith:35b',
       ollamaApproxBytes: 21_000_000_000,
       llamacpp: { file: 'ornith-1.0-35b-Q4_K_M.gguf', approxBytes: 21_166_757_760, present: false, available: true },
       vllm: { runCommand: 'vllm serve ornith-ai/Ornith-1.0-35B' },
     }),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'qwen36-27b',
-      defaultForRole: undefined,
       displayName: 'Qwen3.6-27B',
       publisher: 'unsloth',
       vramLine: '24GB-comfortable, tighter ctx (~24–40K)',
       note: T12_MMPROJ_NOTE,
       progressId: 'qwen36-27b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'qwen3.6:27b',
       ollamaApproxBytes: 17_000_000_000,
       llamacpp: { file: 'Qwen3.6-27B-Q4_K_M.gguf', approxBytes: 16_817_244_384, present: false, available: true },
       vllm: { runCommand: 'vllm serve Qwen/Qwen3.6-27B' },
     }),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'gpt-oss-20b',
-      defaultForRole: undefined,
       displayName: 'gpt-oss-20b',
       publisher: 'ggml-org',
       vramLine: '24GB-easy (100K+ ctx)',
       progressId: 'gpt-oss-20b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'gpt-oss:20b',
       ollamaApproxBytes: 14_000_000_000,
       llamacpp: { file: 'gpt-oss-20b-MXFP4.gguf', approxBytes: 12_109_566_624, present: false, available: true },
       vllm: { runCommand: 'vllm serve openai/gpt-oss-20b' },
     }),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'qwen36-35b-a3b',
-      defaultForRole: undefined,
       displayName: 'Qwen3.6-35B-A3B',
       publisher: 'unsloth',
       vramLine: '24GB-stretch (offload) / 32GB-comfortable',
       note: T12_MOE_NOTE,
       progressId: 'qwen36-35b-a3b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'qwen3.6:35b',
       ollamaApproxBytes: 24_000_000_000,
       llamacpp: { file: 'Qwen3.6-35B-A3B-UD-Q4_K_S.gguf', approxBytes: 20_893_015_008, present: false, available: true },
@@ -2417,7 +2428,7 @@ describe('T12 — providerGuidance renders from the wire; the copy never points 
 
   function guidanceData(phase: SetupData['provider']['phase'], guidance: string): SetupData {
     return agentBlockData({
-      provider: { phase, providerId: phase === 'configured' ? 'custom' : undefined },
+      provider: { phase, ...(phase === 'configured' ? { providerId: 'custom' } : {}) },
       ready: false,
       agentLocalModel: {
         endpointDefaults: T12_ENDPOINT_DEFAULTS,
@@ -2534,7 +2545,7 @@ function nextSurfaceData(
       ...base.nextEdit,
       ...(opts.dedicatedBackendId !== undefined ? { dedicatedBackendId: opts.dedicatedBackendId } : {}),
       dedicated: downloadReady
-        ? base.nextEdit.dedicated
+        ? base.nextEdit.dedicated!
         : {
             ...base.nextEdit.dedicated!,
             downloadReady: false,
@@ -3206,7 +3217,11 @@ describe('T18 — RecommendationsBlock strip (§3.5)', () => {
     }
 
     it('renders NOTHING when catalog is absent', () => {
-      renderPanel(recsData({ catalog: undefined, ready: false }));
+      // `recsData`'s own default sets `catalog` — genuinely DELETE it rather
+      // than pass explicit `undefined`.
+      const data = recsData({ ready: false });
+      delete data.catalog;
+      renderPanel(data);
       expect(screen.queryByText('Recommended local models')).not.toBeInTheDocument();
       agentCardHasNoPrecedingSibling();
     });
