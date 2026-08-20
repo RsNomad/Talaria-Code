@@ -1236,8 +1236,10 @@ describe('AcpBackend.invokeControl — Zone CFG: MCP-hub panel refresh (multi-RP
     const { backend, messages } = makeBackend();
     const control = withFakeControl(backend);
     control.setResultFor('config.get', {
-      mcp_servers: {
-        filesystem: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] },
+      config: {
+        mcp_servers: {
+          filesystem: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] },
+        },
       },
     });
     control.setResultFor('tools.list', {
@@ -1263,7 +1265,7 @@ describe('AcpBackend.invokeControl — Zone CFG: MCP-hub panel refresh (multi-RP
     const { backend, messages } = makeBackend();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
 
     const result = await backend.invokeControl('reload.mcp', { confirm: true });
@@ -7576,7 +7578,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     mockShowWarningMessage.mockResolvedValueOnce('Add server'); // user confirms the native modal
 
@@ -7623,7 +7625,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
   it('mcp.remove refuses a name outside lastListedNames (S-M4)', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache
     await expect(backend.invokeControl('mcp.remove', { name: 'evil' })).rejects.toThrow(/not in the last-listed/);
@@ -7656,7 +7658,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
   it('mcp.test resolves the ok:false envelope verbatim, with NO reload and NO modal', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' });
     client.testResult = { ok: false, error: 'boom', tools: [] };
@@ -7676,7 +7678,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache
     mockShowWarningMessage.mockClear();
@@ -7698,7 +7700,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache with 'gh'
 
@@ -7790,7 +7792,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
     client.catalogEntries = [
       catalogRow({
@@ -7878,7 +7880,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
     client.catalogEntries = [catalogRow()]; // needs_install: false -> synchronous install; required_env: [{N8N_KEY}]
     await backend.invokeControl('mcp.catalog', {});
@@ -7956,7 +7958,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
     // required_env: [] on BOTH rows — this test exercises single-flight
     // concurrency, not the credential-prompt flow (see the dedicated Rev-1
@@ -8014,7 +8016,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
     client.catalogEntries = [catalogRow({ name: 'n8n', required_env: [] })];
     await backend.invokeControl('mcp.catalog', {});
@@ -8042,7 +8044,7 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
   it('mcp.auth resolves the envelope and refetches the mcp panel on ok:true', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { remote: { url: 'https://x/mcp' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' }); // cache 'remote'
     client.authResult = { ok: true, tools: [{ name: 't', description: '' }] };
@@ -8059,7 +8061,7 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
   it('mcp.auth: an {ok:false} envelope resolves as-is (Hermes-authored guidance) with NO refetch', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { remote: { url: 'https://x/mcp' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' });
     client.authResult = { ok: false, error: 'only allows pre-approved OAuth clients', tools: [] };
@@ -8075,7 +8077,7 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
   it('mcp.auth cancellation yields the HONEST cancel envelope (never a rejection) — abandons OUR wait only', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { remote: { url: 'https://x/mcp' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' });
 
@@ -8128,7 +8130,9 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('config.get', {
-      mcp_servers: { remote: { url: 'https://x/mcp' }, other: { url: 'https://y/mcp' } },
+      config: {
+        mcp_servers: { remote: { url: 'https://x/mcp' }, other: { url: 'https://y/mcp' } },
+      },
     });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' });
@@ -8177,7 +8181,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed the fail-closed name cache
 
@@ -8206,7 +8210,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed 'gh'
 
@@ -8241,7 +8245,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' });
 
@@ -8268,7 +8272,9 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
       control.setResultFor('config.get', {
-        mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } },
+        config: {
+          mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } },
+        },
       });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' });
@@ -8309,7 +8315,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' });
 
@@ -8334,7 +8340,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' });
       control.setResultFor('reload.mcp', { status: 'reloaded' });

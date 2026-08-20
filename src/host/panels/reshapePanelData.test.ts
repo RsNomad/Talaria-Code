@@ -385,7 +385,7 @@ describe('reshapeMcpServers', () => {
   it('McpPanelSource caches last-listed server names (S-M4 key set)', async () => {
     const src = new McpPanelSource({
       dispatch: async (method: string) =>
-        method === 'config.get' ? MCP_CONFIG_FIXTURE : MCP_TOOLS_FIXTURE,
+        method === 'config.get' ? { config: MCP_CONFIG_FIXTURE } : MCP_TOOLS_FIXTURE,
     } as unknown as PanelSourceContext);
     await src.fetch();
     expect([...must(src.lastListedNames())].sort()).toEqual(['disabled_server', 'filesystem', 'github', 'remote_api']);

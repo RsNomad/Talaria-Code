@@ -224,13 +224,17 @@ export function reshapeSkillsList(raw: RawSkillsManageListResult): SkillsData {
 /* ------------------------------------------------------------------ *
  * Raw MCP sources — grounded in contracts-tui-gateway.md §3 (GAPS #1: no
  * single RPC returns server list + status + tool counts). Joined from
- * `config.get({key:"full"}).mcp_servers` (server list + launch command,
- * `tools/mcp_tool.py:13-60` schema) and `tools.list`'s per-toolset
- * `tool_count` (`tui_gateway/server.py:13439-13467`).
+ * `config.get({key:"full"})` → `{config:{…, mcp_servers}}` (ENVELOPED,
+ * `tui_gateway/server.py:10868-10869`; unwrapped by `unwrapConfigFull` —
+ * server list + launch command per the `tools/mcp_tool.py:13-60` schema)
+ * and `tools.list`'s per-toolset `tool_count`
+ * (`tui_gateway/server.py:13439-13467`).
  * ------------------------------------------------------------------ */
 
 /**
- * One `mcp_servers.<name>` entry from `config.get({key:"full"})`. The
+ * One `mcp_servers.<name>` entry from the UNWRAPPED `config.get({key:"full"})`
+ * payload (the wire nests it under a `config` envelope — see
+ * {@link unwrapConfigFull}). The
  * docstring example (`tools/mcp_tool.py:13-60`) shows `command`/`args`/`env`
  * for stdio transport or `url`/`headers` for HTTP/SSE transport, plus
  * optional `timeout`/`connect_timeout`. `enabled` is NOT in that example but
@@ -246,7 +250,13 @@ export interface RawMcpServerConfig {
   [key: string]: unknown;
 }
 
-/** Raw `config.get({key:"full"})` result — only the `mcp_servers` slice is used here. */
+/**
+ * The UNWRAPPED `config.get({key:"full"})` payload — only the `mcp_servers`
+ * slice is used here. NOT the wire shape: the gateway envelopes it as
+ * `{config: <this>}` (`tui_gateway/server.py:10868-10869`); the only
+ * sanctioned ingress is {@link unwrapConfigFull}, which also tolerates the
+ * legacy flat form and unwraps junk to `{}`.
+ */
 export interface RawConfigFullResult {
   mcp_servers?: Record<string, RawMcpServerConfig>;
 }
@@ -304,7 +314,9 @@ function formatCommand(cfg: RawMcpServerConfig): string {
 }
 
 /**
- * Join `config.get({key:"full"}).mcp_servers` with `tools.list`'s toolset
+ * Join the UNWRAPPED `config.get({key:"full"})` payload's `mcp_servers`
+ * (see {@link unwrapConfigFull} — this function never sees the envelope)
+ * with `tools.list`'s toolset
  * `tool_count` into `McpData` (`McpPanel.tsx`).
  *
  * `reload.mcp` (the third source the original design suggested
