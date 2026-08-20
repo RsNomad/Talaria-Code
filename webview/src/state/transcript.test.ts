@@ -339,7 +339,12 @@ describe('transcript reducer — W2 T4 F-D: approval.request carries toolId into
     });
 
     const item = activeTab(state).transcript.find((i) => i.kind === 'approval');
-    expect(item).toMatchObject({ kind: 'approval', id: 'appr-1', toolId: undefined });
+    expect(item).toMatchObject({ kind: 'approval', id: 'appr-1' });
+    // exactOptional prep (arm 1): the fold now OMITS `toolId` entirely when
+    // the wire didn't carry one (absent, not an explicit `undefined` key) —
+    // `toMatchObject({ toolId: undefined })` no longer matches an absent
+    // key, so presence is asserted directly.
+    expect(item).not.toHaveProperty('toolId');
   });
 });
 
@@ -1032,7 +1037,7 @@ describe('transcript reducer — AU-61: scoped refreshError state core (sessions
         type: 'panel.data',
         panel: 'sessions',
         cwd: '/w',
-        data: { sessions: [{ id: 's1', cwd: '/w', title: 'A' }], nextCursor: undefined },
+        data: { sessions: [{ id: 's1', cwd: '/w', title: 'A' }] },
       });
       s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
       expect(s.sessionsPanel.status).toBe('success'); // keep-data (TI-3) — already green at HEAD
@@ -1046,30 +1051,30 @@ describe('transcript reducer — AU-61: scoped refreshError state core (sessions
     });
 
     it('the next sessions success push clears sessionsRefreshError', () => {
-      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [] } });
       s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
       expect(s.sessionsRefreshError).toBe('boom');
 
-      s = reduce(s, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      s = reduce(s, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [] } });
       expect(s.sessionsRefreshError).toBeUndefined();
-      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [], nextCursor: undefined } });
+      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [] } });
     });
 
     it('local.scopedRefreshError.dismiss{sessions} clears the slot (and is a no-op when unset)', () => {
       const untouched = reduceLocal(INITIAL_STATE, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'sessions' } });
       expect(untouched).toBe(INITIAL_STATE); // no-op — same reference
 
-      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [] } });
       s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
       expect(s.sessionsRefreshError).toBe('boom');
 
       s = reduceLocal(s, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'sessions' } });
       expect(s.sessionsRefreshError).toBeUndefined();
-      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [], nextCursor: undefined } });
+      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [] } });
     });
 
     it('local.panelLoading (a plain background refetch) does NOT clear a standing sessionsRefreshError — it survives until success or dismiss', () => {
-      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [] } });
       s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
       s = reduceLocal(s, { type: 'local.panelLoading', panel: 'sessions' });
       expect(s.sessionsRefreshError).toBe('boom');
