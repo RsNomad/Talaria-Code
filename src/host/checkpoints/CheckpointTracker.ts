@@ -467,13 +467,14 @@ export class CheckpointTracker {
     await this.init();
     return this.enqueue(() => this.withLock(async () => {
       const index = await this.loadIndex();
-      if (!index.redo) return { restored: false, reason: 'No redo available.' };
+      const redo = index.redo;
+      if (!redo) return { restored: false, reason: 'No redo available.' };
       const gone = await this.clearRedoIfAnchorMissing(index);
       if (gone) return gone;
-      const cursorIdx = index.checkpoints.findIndex((c) => c.id === index.redo!.cursorId);
+      const cursorIdx = index.checkpoints.findIndex((c) => c.id === redo.cursorId);
       const stepTarget = cursorIdx >= 0 ? index.checkpoints[cursorIdx + 1] : undefined;
       // Degenerate cursor (missing row / already at the tip): fall through to the anchor.
-      return this.restoreInternal(stepTarget ? stepTarget.id : index.redo.anchorId, opts);
+      return this.restoreInternal(stepTarget ? stepTarget.id : redo.anchorId, opts);
     }));
   }
 
@@ -497,7 +498,12 @@ export class CheckpointTracker {
    * MUST already hold the lock (`redo`/`redoAll`).
    */
   private async clearRedoIfAnchorMissing(index: CheckpointIndexFile): Promise<RestoreResult | undefined> {
-    const anchorRow = index.checkpoints.find((c) => c.id === index.redo!.anchorId);
+    const redo = index.redo;
+    // Callers (`redo`/`redoAll`) already refuse when no redo pointer exists;
+    // this arm is unreachable today and simply makes the invariant local
+    // instead of a `!` assertion (WV3-MIN-SYN).
+    if (!redo) return undefined;
+    const anchorRow = index.checkpoints.find((c) => c.id === redo.anchorId);
     const anchorTree = anchorRow?.tree;
     // F1 closure check (not just the top tree): an anchor whose closure has a
     // pruned blob/sub-tree can never be redone, so clear the pointer honestly.

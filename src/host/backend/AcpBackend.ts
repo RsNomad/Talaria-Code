@@ -606,7 +606,8 @@ export class AcpBackend implements AgentBackend {
     // only when no dashboard is wired. A fetch made while the dashboard is
     // unreachable REJECTS (retryable panel error), never a fake success.
     if (this.dashboard) {
-      const ensure = () => this.dashboard!.ensure();
+      const dashboard = this.dashboard;
+      const ensure = () => dashboard.ensure();
       this.panelSources.register('skills', new DashboardSkillsPanelSource(ensure));
       this.panelSources.register('tools', new DashboardToolsPanelSource(ensure));
     }
