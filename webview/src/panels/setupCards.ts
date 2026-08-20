@@ -1236,6 +1236,11 @@ export interface RoleRec {
   bytes: number;
   /** {@link formatGiB} of `bytes` — the role line's `{size}`. */
   sizeGiB: string;
+  /** The SAME rounded 1-dp number `sizeGiB` prints ({@link roundGiB} of
+   *  `bytes`) — the numeric twin, so the meter never round-trips through
+   *  the display string (WV3-MIN-SYN). `sizeGiB === sizeGiBNum.toFixed(1)`
+   *  by construction. */
+  sizeGiBNum: number;
   vramLine: string;
   /** B-F5: the llama.cpp tier's rounded GiB, present ONLY when it differs
    *  from `sizeGiB` after rounding (not merely a differing raw byte count). */
@@ -1259,7 +1264,8 @@ function baseRoleRec(row: SetupCatalogModel): RoleRec | undefined {
   // exactly like a missing one — never let a non-finite or non-positive
   // value reach `formatGiB` and print "~NaN GB" / "~0 GB".
   if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return undefined;
-  const sizeGiB = formatGiB(bytes);
+  const sizeGiBNum = roundGiB(bytes);
+  const sizeGiB = sizeGiBNum.toFixed(1);
   const llamacppBytes = row.llamacpp?.approxBytes;
   const llamacppGiB = llamacppBytes !== undefined ? formatGiB(llamacppBytes) : undefined;
   return {
@@ -1268,6 +1274,7 @@ function baseRoleRec(row: SetupCatalogModel): RoleRec | undefined {
     displayName: row.displayName,
     bytes,
     sizeGiB,
+    sizeGiBNum,
     vramLine: row.vramLine,
     divergenceGiB: llamacppGiB !== undefined && llamacppGiB !== sizeGiB ? llamacppGiB : undefined,
   };
@@ -1341,9 +1348,9 @@ export interface MeterSegment {
 
 export function meterSegments(agent: RoleRec, fim: RoleRec, embedding: RoleRec): MeterSegment[] {
   return [
-    { role: 'agent', pct: (Number(agent.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
-    { role: 'fim', pct: (Number(fim.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
-    { role: 'embedding', pct: (Number(embedding.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'agent', pct: (agent.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'fim', pct: (fim.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'embedding', pct: (embedding.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100 },
   ];
 }
 

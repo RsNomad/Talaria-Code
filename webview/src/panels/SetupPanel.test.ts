@@ -1815,6 +1815,16 @@ describe('T18 — recs strip pure derivation (§3.5, B-F1..B-F8)', () => {
       expect(segs[1]?.pct).toBeCloseTo((0.9 / 22) * 100, 5);
       expect(segs[2]?.pct).toBeCloseTo((0.6 / 22) * 100, 5);
     });
+    it('meterSegments derives pct from the rounded NUMERIC twin, never Number(displayString) (WV3-MIN-SYN)', () => {
+      const segs = meterSegments(recs.agent, recs.fim, recs.embedding);
+      expect(segs.map((s) => s.pct)).toEqual([
+        (recs.agent.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100,
+        (recs.fim.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100,
+        (recs.embedding.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100,
+      ]);
+      // the twin IS the display number — one rounding, two faces
+      expect(recs.agent.sizeGiB).toBe(recs.agent.sizeGiBNum.toFixed(1));
+    });
   });
 
   describe('tier lines + MoE note (B-F1/B-F4) — frame text static, names/sizes interpolated', () => {
