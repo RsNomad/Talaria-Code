@@ -11,7 +11,7 @@ import type {
   ThemeKind,
   WebviewState,
 } from '../shared/protocol';
-import { AgentBackend } from './backend/AgentBackend';
+import type { AgentBackend } from './backend/AgentBackend';
 import { getNonce } from './util/nonce';
 import { buildSearchFilesResponse } from './context/searchFilesResponse';
 import type { FindFilesFn } from './context/searchFilesResponse';

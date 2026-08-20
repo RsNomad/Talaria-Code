@@ -2,7 +2,7 @@ import * as path from 'node:path';
 
 import * as vscode from 'vscode';
 import { TalariaViewProvider } from './host/TalariaViewProvider';
-import { AgentBackend } from './host/backend/AgentBackend';
+import type { AgentBackend } from './host/backend/AgentBackend';
 import { MockBackend } from './host/backend/MockBackend';
 import { AcpBackend } from './host/backend/AcpBackend';
 import type { HermesRuntimeConfig } from './host/runtime/resolveHermes';

@@ -37,7 +37,7 @@ import {
   DashboardSkillsPanelSource,
   DashboardToolsPanelSource,
 } from '../dashboard/dashboardPanelSources';
-import { AgentBackend } from './AgentBackend';
+import type { AgentBackend } from './AgentBackend';
 import { AcpClient } from './acp/acpClient';
 import type {
   AcpClientFactory,
