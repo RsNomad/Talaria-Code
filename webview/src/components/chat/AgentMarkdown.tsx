@@ -55,14 +55,14 @@ function tokenize(
   let m: RegExpExecArray | null;
   while ((m = re.exec(src))) {
     if (m.index > last) out.push({ code: false, body: src.slice(last, m.index) });
-    out.push({ code: true, lang: m[1] || undefined, body: m[2] ?? '' });
+    out.push({ code: true, ...(m[1] ? { lang: m[1] } : {}), body: m[2] ?? '' });
     last = re.lastIndex;
   }
   const rest = src.slice(last);
   const open = streaming ? /```([\w-]*)\n?([\s\S]*)$/.exec(rest) : null;
   if (open) {
     if (open.index > 0) out.push({ code: false, body: rest.slice(0, open.index) });
-    out.push({ code: true, lang: open[1] || undefined, body: open[2] ?? '' });
+    out.push({ code: true, ...(open[1] ? { lang: open[1] } : {}), body: open[2] ?? '' });
   } else if (rest.length > 0) {
     out.push({ code: false, body: rest });
   }

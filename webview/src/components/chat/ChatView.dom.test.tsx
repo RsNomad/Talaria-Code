@@ -110,7 +110,7 @@ describe('ChatView accessibility (B1)', () => {
   it('SC1: does not (re-)announce an approval that has already settled (expired), even though resolvedOptionId is unset', () => {
     const { getByRole } = renderChatView([
       messageItem(),
-      approvalItem({ settledOutcome: 'expired', resolvedOptionId: undefined }),
+      approvalItem({ settledOutcome: 'expired' }),
     ]);
 
     const alert = getByRole('alert');
@@ -120,7 +120,7 @@ describe('ChatView accessibility (B1)', () => {
   it('SC1: does not (re-)announce a cancelled approval either', () => {
     const { getByRole } = renderChatView([
       messageItem(),
-      approvalItem({ settledOutcome: 'cancelled', resolvedOptionId: undefined }),
+      approvalItem({ settledOutcome: 'cancelled' }),
     ]);
 
     const alert = getByRole('alert');
@@ -143,7 +143,7 @@ describe('ChatView accessibility (T-A2-SC4): polite settlement announcement', ()
   it('announces an expired settlement via a polite status region, distinct from the assertive approval announcer', () => {
     const { getByRole } = renderChatView([
       messageItem(),
-      approvalItem({ settledOutcome: 'expired', resolvedOptionId: undefined, title: 'Edit: src/a.ts' }),
+      approvalItem({ settledOutcome: 'expired', title: 'Edit: src/a.ts' }),
     ]);
 
     const status = getByRole('status');
@@ -155,7 +155,7 @@ describe('ChatView accessibility (T-A2-SC4): polite settlement announcement', ()
   it('announces a cancelled settlement distinctly from an expired one', () => {
     const { getByRole } = renderChatView([
       messageItem(),
-      approvalItem({ settledOutcome: 'cancelled', resolvedOptionId: undefined, title: 'Run: npm test' }),
+      approvalItem({ settledOutcome: 'cancelled', title: 'Run: npm test' }),
     ]);
 
     expect(getByRole('status')).toHaveTextContent('Approval cancelled: Run: npm test');
@@ -164,7 +164,7 @@ describe('ChatView accessibility (T-A2-SC4): polite settlement announcement', ()
   it('announces a superseded settlement distinctly', () => {
     const { getByRole } = renderChatView([
       messageItem(),
-      approvalItem({ settledOutcome: 'superseded', resolvedOptionId: undefined, title: 'Edit: src/b.ts' }),
+      approvalItem({ settledOutcome: 'superseded', title: 'Edit: src/b.ts' }),
     ]);
 
     expect(getByRole('status')).toHaveTextContent('Approval no longer pending: Edit: src/b.ts');

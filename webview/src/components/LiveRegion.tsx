@@ -28,7 +28,7 @@ export function LiveRegion({
   text: string;
   assertive?: boolean;
   className?: string;
-  title?: string;
+  title?: string | undefined;
 }) {
   return assertive ? (
     <div role="alert" className={className} title={title}>

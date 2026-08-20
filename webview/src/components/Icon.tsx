@@ -8,7 +8,7 @@ interface IconProps {
   className?: string;
   /** px size; defaults to inherit (16px from CSS). */
   size?: number;
-  spin?: boolean;
+  spin?: boolean | undefined;
   title?: string;
 }
 

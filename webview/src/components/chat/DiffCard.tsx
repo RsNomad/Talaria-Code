@@ -28,7 +28,7 @@ import { Pill, type PillTone } from '../Pill';
 
 interface DiffCardProps {
   diff: ToolDiff;
-  resolvedHunks?: Record<number, 'accept' | 'reject'>;
+  resolvedHunks?: Record<number, 'accept' | 'reject'> | undefined;
   /** Global index of this diff's first hunk within the tool's hunk sequence. */
   hunkOffset: number;
   onResolve: (hunkIndex: number, action: 'accept' | 'reject') => void;
@@ -73,7 +73,7 @@ function HunkView({
   path,
 }: {
   hunk: DiffHunk;
-  resolution?: 'accept' | 'reject';
+  resolution?: 'accept' | 'reject' | undefined;
   pending: boolean;
   denied: boolean;
   onResolve: (action: 'accept' | 'reject') => void;

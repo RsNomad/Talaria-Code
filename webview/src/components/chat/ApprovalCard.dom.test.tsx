@@ -94,7 +94,7 @@ describe('ApprovalCard — settled-card copy (V-4/V-5) and expiry (V-6)', () => 
   });
 
   it('renders live buttons with NO deadline line when timeoutMs is absent (never fabricate a deadline the wire did not state)', () => {
-    render(<ApprovalCard item={approval({ timeoutMs: undefined })} onRespond={() => undefined} />);
+    render(<ApprovalCard item={approval()} onRespond={() => undefined} />);
     expect(screen.getByRole('button', { name: 'Allow' })).toBeInTheDocument();
     expect(screen.queryByText(/Auto-denies/)).not.toBeInTheDocument();
   });
