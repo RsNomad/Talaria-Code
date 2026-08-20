@@ -53,7 +53,7 @@ export function parseGatewayEvent(
 
   const sessionId =
     typeof obj.session_id === 'string' ? obj.session_id : undefined;
-  return { type, sessionId, payload: obj.payload };
+  return { type, ...(sessionId !== undefined ? { sessionId } : {}), payload: obj.payload };
 }
 
 /** Whether a parsed frame is the startup handshake (`entry.py:349`). */

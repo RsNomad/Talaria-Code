@@ -119,7 +119,7 @@ export function mapPermissionRequest(
     id: approvalId,
     kind,
     title: toolCall.title ?? 'Approval required',
-    detail,
+    ...(detail !== undefined ? { detail } : {}),
     toolId: toolCall.toolCallId,
     options: req.options.map(mapApprovalOption),
     timeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS,

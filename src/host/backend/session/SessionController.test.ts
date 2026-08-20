@@ -83,7 +83,6 @@ function makePort(ws: string): { port: SessionHostPort; emitted: unknown[]; logs
     workspaceRoots: () => [ws],
     logger: { append: (l) => logs.push(l) },
     refreshCheckpointsPanel: () => {},
-    editPreviewRegistry: undefined,
     resolveMentions: async () => [],
   };
   return { port, emitted, logs };
@@ -200,7 +199,6 @@ describe('SessionController.setModel — ARCH-1 (final review, UI I-1): terminal
       root: makeRoot(),
       workspaceRoots: () => [],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted };
@@ -416,7 +414,6 @@ describe('SessionController.setModel — ARCH-1 (final review, UI I-1): terminal
       root: makeRoot(),
       workspaceRoots: () => [],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controller = new SessionController('session-1', '/tmp/ws', port);
@@ -534,7 +531,6 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
       workspaceRoots: () => ['/tmp/ws-a0'],
       logger: { append: (l) => logs.push(l) },
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted, logs };
@@ -735,7 +731,6 @@ describe('SessionController.sendPrompt — ARCH-1 (final review, UI I-4): result
       root: makeRoot(),
       workspaceRoots: () => ['/tmp/ws'],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted };
@@ -891,7 +886,6 @@ describe('SessionController.sendPrompt — V-18 STEER-QUEUE: mid-turn control ut
       root: makeRoot(),
       workspaceRoots: () => ['/tmp/ws-v18'],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted };
@@ -1066,7 +1060,6 @@ describe('SessionController.sendPrompt — V-18 STEER-QUEUE: mid-turn control ut
       root: sharedRoot,
       workspaceRoots: () => ['/tmp/ws-v18-shared'],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controllerA = new SessionController('session-A', '/tmp/ws-v18-shared', portA);
@@ -1083,7 +1076,6 @@ describe('SessionController.sendPrompt — V-18 STEER-QUEUE: mid-turn control ut
       root: sharedRoot,
       workspaceRoots: () => ['/tmp/ws-v18-shared'],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controllerB = new SessionController('session-B', '/tmp/ws-v18-shared', portB);
@@ -1233,7 +1225,6 @@ describe('SessionController.sendPrompt — V-19: attachment path confinement', (
       root: makeRoot(),
       workspaceRoots: () => [ws],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted };
@@ -1378,7 +1369,6 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
       workspaceRoots: () => [],
       logger: { append: () => {} },
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controller = new SessionController('bootstrap', '/ws', port);
@@ -1483,7 +1473,6 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
       workspaceRoots: () => [],
       logger: { append: () => {} },
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controller = new SessionController('bootstrap', '/ws', port);

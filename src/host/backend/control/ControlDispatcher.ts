@@ -1515,7 +1515,7 @@ export class ControlDispatcher {
         this.port.logger?.append('[AcpBackend] checkpoint.restore: missing id in params');
         return MALFORMED_RESTORE_REFUSAL;
       }
-      const result = await root.tracker.restore(id, { force });
+      const result = await root.tracker.restore(id, { ...(force !== undefined ? { force } : {}) });
       if (result.restored) {
         await this.fetchPanelData('checkpoints', { rootId: root.rootId }).catch((err: unknown) => {
           this.port.logger?.append(`[AcpBackend] post-restore checkpoints refresh failed: ${errorMessage(err)}`);
@@ -1550,8 +1550,8 @@ export class ControlDispatcher {
     try {
       const result =
         method === 'checkpoint.redo'
-          ? await root.tracker.redo({ force })
-          : await root.tracker.redoAll({ force });
+          ? await root.tracker.redo({ ...(force !== undefined ? { force } : {}) })
+          : await root.tracker.redoAll({ ...(force !== undefined ? { force } : {}) });
       if (result.restored) {
         await this.fetchPanelData('checkpoints', { rootId: root.rootId }).catch((err: unknown) => {
           this.port.logger?.append(`[AcpBackend] post-redo checkpoints refresh failed: ${errorMessage(err)}`);
@@ -1614,19 +1614,24 @@ export class ControlDispatcher {
    * `availableCommands`'s existing `undefined`-when-unset shape).
    */
   listTabs(): HydrateTabSeed[] {
-    return [...this.port.sessions.values()].map((controller) => ({
-      tabId: controller.tabId,
-      sessionId: controller.sessionId,
-      cwd: controller.cwd,
-      rootId: controller.getRootId(),
-      preset: controller.getPreset(),
-      currentModelId: controller.currentModelId,
-      activeModeId: controller.activeCustomModeId ?? undefined,
-      availableCommands: controller.getAvailableCommands(),
-      // A5 (T-1 V-12 seed fold-in): this tab's OWN live-turn status, so a
-      // post-recreate reconcile regains the Stop affordance immediately.
-      turnActive: controller.hasLiveTurn(),
-    }));
+    return [...this.port.sessions.values()].map((controller) => {
+      const currentModelId = controller.currentModelId;
+      const activeModeId = controller.activeCustomModeId ?? undefined;
+      const availableCommands = controller.getAvailableCommands();
+      return {
+        tabId: controller.tabId,
+        sessionId: controller.sessionId,
+        cwd: controller.cwd,
+        rootId: controller.getRootId(),
+        preset: controller.getPreset(),
+        ...(currentModelId !== undefined ? { currentModelId } : {}),
+        ...(activeModeId !== undefined ? { activeModeId } : {}),
+        ...(availableCommands !== undefined ? { availableCommands } : {}),
+        // A5 (T-1 V-12 seed fold-in): this tab's OWN live-turn status, so a
+        // post-recreate reconcile regains the Stop affordance immediately.
+        turnActive: controller.hasLiveTurn(),
+      };
+    });
   }
 
   /**
@@ -1761,9 +1766,11 @@ function isSaveKeyResult(raw: unknown): boolean {
 function extractLoadParams(params: unknown): { sessionId?: string; cwd?: string } {
   if (!params || typeof params !== 'object') return {};
   const p = params as { sessionId?: unknown; cwd?: unknown };
+  const sessionId = typeof p.sessionId === 'string' ? p.sessionId : undefined;
+  const cwd = typeof p.cwd === 'string' ? p.cwd : undefined;
   return {
-    sessionId: typeof p.sessionId === 'string' ? p.sessionId : undefined,
-    cwd: typeof p.cwd === 'string' ? p.cwd : undefined,
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(cwd !== undefined ? { cwd } : {}),
   };
 }
 
@@ -1771,8 +1778,9 @@ function extractLoadParams(params: unknown): { sessionId?: string; cwd?: string 
 function extractToggleParams(params: unknown): { name?: string; enabled: boolean } {
   if (!params || typeof params !== 'object') return { enabled: false };
   const p = params as { name?: unknown; enabled?: unknown };
+  const name = typeof p.name === 'string' ? p.name : undefined;
   return {
-    name: typeof p.name === 'string' ? p.name : undefined,
+    ...(name !== undefined ? { name } : {}),
     enabled: p.enabled === true,
   };
 }
@@ -2007,10 +2015,13 @@ const MALFORMED_RESTORE_REFUSAL: RestoreResult = {
 function extractRestoreParams(params: unknown): { id?: string; force?: boolean; rootId?: string } {
   if (!params || typeof params !== 'object') return {};
   const p = params as { id?: unknown; force?: unknown; rootId?: unknown };
+  const id = typeof p.id === 'string' ? p.id : undefined;
+  const force = typeof p.force === 'boolean' ? p.force : undefined;
+  const rootId = typeof p.rootId === 'string' ? p.rootId : undefined;
   return {
-    id: typeof p.id === 'string' ? p.id : undefined,
-    force: typeof p.force === 'boolean' ? p.force : undefined,
-    rootId: typeof p.rootId === 'string' ? p.rootId : undefined,
+    ...(id !== undefined ? { id } : {}),
+    ...(force !== undefined ? { force } : {}),
+    ...(rootId !== undefined ? { rootId } : {}),
   };
 }
 

@@ -635,7 +635,9 @@ export class AcpClient implements AcpClientLike {
       // A7: surface the harness-bound model at session start — kills the
       // generic "Model" placeholder (`webview/src/App.tsx`) until the
       // user's first manual switch.
-      currentModelId: response.models?.currentModelId,
+      ...(response.models?.currentModelId !== undefined
+        ? { currentModelId: response.models.currentModelId }
+        : {}),
     };
   }
 
@@ -843,7 +845,9 @@ export class AcpClient implements AcpClientLike {
           // A7: same capture as `newSession` — a History-panel load or
           // crash-recovery replay (`SessionController.loadReplay`) restores
           // the harness-bound model too, not just the mode.
-          currentModelId: response.models?.currentModelId,
+          ...(response.models?.currentModelId !== undefined
+            ? { currentModelId: response.models.currentModelId }
+            : {}),
         }
       : { found: false };
   }

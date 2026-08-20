@@ -456,7 +456,7 @@ export class AcpBackend implements AgentBackend {
       getClient: () => this.connectionSupervisor.getClient(),
       getConnectionCwd: () => this.cwd,
       resolveRoot: (cwd) => this.resolveRootCoordinator(cwd),
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
       recordOneShotSessionId: (id) => this.recordOneShotSessionId(id),
       deleteOneShotSession: (id) => this.deleteOneShotSession(id),
     };
@@ -483,7 +483,7 @@ export class AcpBackend implements AgentBackend {
         this.clientAuthMethodsSub = client.onAuthMethodsChanged?.(() => this.authMethodsEmitter.fire());
         return client;
       },
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
       callbacks: {
         onSessionUpdate: (sessionId, update) => this.handleSessionUpdate(sessionId, update),
         onRequestPermission: (req) => this.handleRequestPermission(req),
@@ -540,7 +540,7 @@ export class AcpBackend implements AgentBackend {
     const controlPort: ControlDispatcherHostPort = {
       dispatch: (method, params) => this.control.dispatch(method, params),
       emit: (msg) => this.emitter.fire(msg),
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
       panelSources: this.panelSources,
       sessions: this.sessions,
       rootRegistry: this.rootRegistry,
@@ -635,10 +635,11 @@ export class AcpBackend implements AgentBackend {
     return {
       getClient: () => this.connectionSupervisor.getClient(),
       emit: (msg) => this.emitter.fire(msg),
-      emitSystemError: (message, detail) => this.emitter.fire({ type: 'system.error', message, detail }),
+      emitSystemError: (message, detail) =>
+        this.emitter.fire({ type: 'system.error', message, ...(detail !== undefined ? { detail } : {}) }),
       root,
       workspaceRoots: () => this.workspaceRoots(),
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
       // W6-FI-c Part 2 (3-way ARCH I-4c, W4-F5 placement fix): this session's
       // OWN root, resolved once at port-build time above — never ambient
       // ("the active controller's root") — now delegates DIRECTLY to that
@@ -650,7 +651,7 @@ export class AcpBackend implements AgentBackend {
       // `ControlDispatcher.refreshCheckpointsPanel`'s own doc for the exact
       // (unchanged) implementation this now runs through.
       refreshCheckpointsPanel: () => root.refreshCheckpointsPanel(),
-      editPreviewRegistry: this.editPreviewRegistry,
+      ...(this.editPreviewRegistry !== undefined ? { editPreviewRegistry: this.editPreviewRegistry } : {}),
       resolveMentions: (mentions) => this.resolveMentionsSafe(mentions),
     };
   }
@@ -746,7 +747,7 @@ export class AcpBackend implements AgentBackend {
       // TG-5 (AU-51, INV-20): the `sessions` source's exclusion set — see
       // `OneShotSessionRegistry`'s own doc.
       getOneShotSessionIds: () => this.oneShotSessionRegistry.ids(),
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
     };
   }
 

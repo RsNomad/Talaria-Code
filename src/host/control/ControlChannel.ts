@@ -183,7 +183,7 @@ export class ControlChannel {
       command: resolved.control.command,
       args: resolved.control.args,
       cwd: resolved.cwd,
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
     });
 
     // Attach the permanent fan-out BEFORE waiting for readiness so a

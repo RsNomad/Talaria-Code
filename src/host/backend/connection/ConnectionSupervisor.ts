@@ -337,7 +337,7 @@ export class ConnectionSupervisor {
       this.client = this.port.createClient({
         spawn: resolved.acp,
         cwd: resolved.cwd,
-        logger: this.port.logger,
+        ...(this.port.logger !== undefined ? { logger: this.port.logger } : {}),
         callbacks: this.port.callbacks,
       });
       const client = this.client;

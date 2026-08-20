@@ -139,7 +139,7 @@ export class SessionController {
    * snapshot immune to a later `onDidChangeConfiguration` firing — only an
    * explicit {@link setCustomMode} call (a user re-pick) replaces it.
    */
-  activeCustomMode?: ModeFloor;
+  activeCustomMode?: ModeFloor | undefined;
   /**
    * W4-T4b: the id of the active custom mode, or `null` when none is
    * active. `AcpBackend`'s `onDidChangeConfiguration` handler reads this
@@ -562,7 +562,7 @@ export class SessionController {
       sessionId: this.sessionId,
       turnId: pending.turnId,
       id,
-      toolId: pending.toolId,
+      ...(pending.toolId !== undefined ? { toolId: pending.toolId } : {}),
       outcome: 'selected',
       optionId,
     });
@@ -615,7 +615,7 @@ export class SessionController {
       sessionId: this.sessionId,
       turnId: pending.turnId,
       id: approvalId,
-      toolId: pending.toolId,
+      ...(pending.toolId !== undefined ? { toolId: pending.toolId } : {}),
       outcome: 'selected',
       optionId,
     });
@@ -658,7 +658,7 @@ export class SessionController {
           sessionId: this.sessionId,
           turnId: pending.turnId,
           id: approvalId,
-          toolId: pending.toolId,
+          ...(pending.toolId !== undefined ? { toolId: pending.toolId } : {}),
           outcome: reason,
         });
       }
@@ -1024,6 +1024,8 @@ export class SessionController {
 
       const usage = mapUsage(response.usage);
       const status = mapStopReasonToStatus(response.stopReason);
+      const summaryText = this.turn.settledText || undefined;
+      const summaryUsage = usage ? { ...usage, durationMs: Date.now() - this.turnStartedAt } : undefined;
       this.port.emit({
         type: 'result.summary',
         turnId,
@@ -1032,8 +1034,8 @@ export class SessionController {
         // `emitTurnEnd` below carries, computed once above. T4 owns the
         // UI-facing tone-mapped render this unlocks (ResultSummary.tsx).
         status,
-        text: this.turn.settledText || undefined,
-        usage: usage ? { ...usage, durationMs: Date.now() - this.turnStartedAt } : undefined,
+        ...(summaryText !== undefined ? { text: summaryText } : {}),
+        ...(summaryUsage !== undefined ? { usage: summaryUsage } : {}),
       });
       this.emitTurnEnd(turnId, status);
     } catch (err) {

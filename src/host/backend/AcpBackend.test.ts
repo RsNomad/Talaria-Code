@@ -336,7 +336,7 @@ class FakeAcpClient {
     cwd: string,
     mcpServers?: AcpMcpServer[],
   ): Promise<{ sessionId: string; currentModeId: string; currentModelId?: string }> {
-    this.newSessionCalls.push({ cwd, mcpServers });
+    this.newSessionCalls.push({ cwd, ...(mcpServers !== undefined ? { mcpServers } : {}) });
     if (this.hungNewSession) return new Promise<{ sessionId: string; currentModeId: string }>(() => {}); // never resolves
     if (this.nextNewSessionError !== undefined) {
       const err = this.nextNewSessionError;
@@ -348,7 +348,11 @@ class FakeAcpClient {
       return this.delayedNewSessionDeferred.promise;
     }
     const sessionId = this.queuedSessionIds.shift() ?? 'session-1';
-    return { sessionId, currentModeId: this.newSessionModeId, currentModelId: this.newSessionModelId };
+    return {
+      sessionId,
+      currentModeId: this.newSessionModeId,
+      ...(this.newSessionModelId !== undefined ? { currentModelId: this.newSessionModelId } : {}),
+    };
   }
 
   async setSessionMode(sessionId: string, modeId: string): Promise<void> {
@@ -429,7 +433,7 @@ class FakeAcpClient {
   }
 
   async listSessions(cwd?: string, cursor?: string): Promise<AcpListSessionsRawResult> {
-    this.listSessionsCalls.push({ cwd, cursor });
+    this.listSessionsCalls.push({ ...(cwd !== undefined ? { cwd } : {}), ...(cursor !== undefined ? { cursor } : {}) });
     return this.listSessionsResult;
   }
 
@@ -455,7 +459,7 @@ class FakeAcpClient {
     sessionId: string,
     mcpServers?: AcpMcpServer[],
   ): Promise<AcpLoadSessionResult> {
-    this.loadSessionCalls.push({ cwd, sessionId, mcpServers });
+    this.loadSessionCalls.push({ cwd, sessionId, ...(mcpServers !== undefined ? { mcpServers } : {}) });
     for (const update of this.replayUpdates) {
       this.callbacks?.onSessionUpdate(sessionId, update);
     }
@@ -1003,7 +1007,12 @@ class FakeCheckpointTracker implements CheckpointTrackerLike {
     label?: string,
     opts?: { phase?: CheckpointPhase; sessionLabel?: string },
   ): Promise<Checkpoint | null> {
-    this.snapshotCalls.push({ turnOrdinal, label, phase: opts?.phase, sessionLabel: opts?.sessionLabel });
+    this.snapshotCalls.push({
+      turnOrdinal,
+      ...(label !== undefined ? { label } : {}),
+      ...(opts?.phase !== undefined ? { phase: opts.phase } : {}),
+      ...(opts?.sessionLabel !== undefined ? { sessionLabel: opts.sessionLabel } : {}),
+    });
     return {
       id: `ckpt-${turnOrdinal}`,
       label: label ?? `Turn ${turnOrdinal}`,
@@ -1022,7 +1031,7 @@ class FakeCheckpointTracker implements CheckpointTrackerLike {
   }
 
   async restore(id: string, opts?: { force?: boolean }): Promise<RestoreResult> {
-    this.restoreCalls.push({ id, force: opts?.force });
+    this.restoreCalls.push({ id, ...(opts?.force !== undefined ? { force: opts.force } : {}) });
     return this.restoreResult;
   }
 
@@ -1033,12 +1042,12 @@ class FakeCheckpointTracker implements CheckpointTrackerLike {
   redoResult: RestoreResult = { restored: true, filesChanged: 0, changedPaths: [] };
 
   async redo(opts?: { force?: boolean }): Promise<RestoreResult> {
-    this.redoCalls.push({ kind: 'redo', force: opts?.force });
+    this.redoCalls.push({ kind: 'redo', ...(opts?.force !== undefined ? { force: opts.force } : {}) });
     return this.redoResult;
   }
 
   async redoAll(opts?: { force?: boolean }): Promise<RestoreResult> {
-    this.redoCalls.push({ kind: 'redoAll', force: opts?.force });
+    this.redoCalls.push({ kind: 'redoAll', ...(opts?.force !== undefined ? { force: opts.force } : {}) });
     return this.redoResult;
   }
 }
@@ -2122,7 +2131,7 @@ describe('AcpBackend.start — T-3 (closes B1-M1): session-establish wall-clock 
     const { backend, clients } = makeStartableBackend(undefined, (client, index) => {
       if (index === 0) {
         client.newSession = async (cwd: string, mcpServers?: AcpMcpServer[]) => {
-          client.newSessionCalls.push({ cwd, mcpServers });
+          client.newSessionCalls.push({ cwd, ...(mcpServers !== undefined ? { mcpServers } : {}) });
           return resolver.promise;
         };
       }
@@ -3755,7 +3764,7 @@ describe('AcpBackend.loadTab — CF-01/L3-1 fix (Critical): a hung-but-alive cli
     await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
     const resolver = deferred<AcpLoadSessionResult>();
     must(clients[0]).loadSession = async (cwd: string, sessionId: string, mcpServers?: AcpMcpServer[]) => {
-      must(clients[0]).loadSessionCalls.push({ cwd, sessionId, mcpServers });
+      must(clients[0]).loadSessionCalls.push({ cwd, sessionId, ...(mcpServers !== undefined ? { mcpServers } : {}) });
       return resolver.promise;
     };
 
@@ -6853,7 +6862,7 @@ describe('AcpBackend.invokeControl — T-C1 (V-2): restore/redo HOLD the root tu
     // `tracker.restoreCalls` below must still reflect every call that
     // actually reached the tracker.
     tracker.restore = async (id: string, opts?: { force?: boolean }) => {
-      tracker.restoreCalls.push({ id, force: opts?.force });
+      tracker.restoreCalls.push({ id, ...(opts?.force !== undefined ? { force: opts.force } : {}) });
       return restoreGate.promise;
     };
 

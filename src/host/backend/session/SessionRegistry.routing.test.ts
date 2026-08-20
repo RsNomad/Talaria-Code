@@ -44,7 +44,8 @@ function makePort(emitted: HostToWebviewMessage[]): SessionHostPort {
   return {
     getClient: () => client,
     emit: (msg) => emitted.push(msg),
-    emitSystemError: (message, detail) => emitted.push({ type: 'system.error', message, detail }),
+    emitSystemError: (message, detail) =>
+      emitted.push({ type: 'system.error', message, ...(detail !== undefined ? { detail } : {}) }),
     root: new RootCoordinator('/ws', undefined),
     workspaceRoots: () => [],
     refreshCheckpointsPanel: () => undefined,
