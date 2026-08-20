@@ -1879,4 +1879,20 @@ describe('CheckpointTracker', () => {
       expect(after.map((c) => c.id).sort()).toEqual([c1.id, c3.id].sort());
     });
   });
+
+  it('WV3-MIN-SYN: an index whose JSON root is not a record fails as unreadable/corrupt, not a downstream TypeError', async () => {
+    const windowA = new CheckpointTracker(storageDir, workspaceRoot);
+    await windowA.init();
+    const indexPath = path.join(path.dirname(windowA.shadowGitDir), 'index.json');
+    await fs.writeFile(indexPath, '"a bare string is valid JSON"', 'utf8');
+
+    // windowA's in-memory cache is already warm from init() above, so it would
+    // never re-read this corruption (P5's cache-invalidation-under-the-lock
+    // design — by construction, only a re-read observes it). Use a SECOND,
+    // freshly-constructed tracker against the SAME storage (the suite's own
+    // cross-window idiom, e.g. P5 above) — its first loadIndex() has no cache
+    // to shield it and must parse the corrupted file from disk.
+    const windowB = new CheckpointTracker(storageDir, workspaceRoot);
+    await expect(windowB.list()).rejects.toThrow(/unreadable\/corrupt/);
+  });
 });

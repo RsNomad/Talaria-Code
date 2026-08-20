@@ -9,6 +9,7 @@ import * as vscode from 'vscode';
 // `shared/secretPaths.ts` — the RAG indexer is an egress-only consumer, not
 // a host-policy one.
 import { isSecretForCompletion } from '../shared/secretPaths';
+import { isRecord } from '../shared/typeGuards';
 // SEC-1 (audit-3, RATIFIED): the path filter above (`isSecretForCompletion`
 // in `walk()`) only stops a `.env`/`id_rsa`-class FILE from being indexed at
 // all — it says nothing about a secret living INSIDE a normally-named file
@@ -262,7 +263,15 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   async function readManifest(): Promise<Record<string, string>> {
     try {
       const raw = await fs.readFile(manifestPath, 'utf8');
-      return JSON.parse(raw) as Record<string, string>;
+      const parsed: unknown = JSON.parse(raw);
+      // WV3-MIN-SYN: a manifest whose root is not a record of string hashes
+      // is corrupt — treat it exactly like a missing manifest (full rebuild)
+      // instead of letting junk masquerade as path→hash entries.
+      if (!isRecord(parsed)) return {};
+      for (const value of Object.values(parsed)) {
+        if (typeof value !== 'string') return {};
+      }
+      return parsed as Record<string, string>;
     } catch {
       return {};
     }

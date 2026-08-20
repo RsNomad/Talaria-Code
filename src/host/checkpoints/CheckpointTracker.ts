@@ -10,6 +10,7 @@ import type {
 } from '../../shared/protocol';
 // T-19 (C1+C2): moved out of rag/ — host/checkpoints/ importing from rag/ was a zone-crossing edge.
 import { createIgnoreFilter } from '../../shared/ignoreFilter';
+import { isRecord } from '../../shared/typeGuards';
 import { resolveWithinWorkspaceReal } from '../backend/acp/pathConfine';
 import { writeFileNoFollow } from '../backend/acp/safeWrite';
 import { sanitizeGitEnv } from './gitEnv';
@@ -1138,7 +1139,20 @@ export class CheckpointTracker {
 
     let parsed: CheckpointIndexFile;
     try {
-      parsed = JSON.parse(raw) as CheckpointIndexFile;
+      const parsedUnknown: unknown = JSON.parse(raw);
+      // WV3-MIN-SYN: `JSON.parse` returns any — a self-written index whose
+      // root is not a record with a checkpoints array is corrupt; refuse it
+      // HERE (the honest error below) instead of letting it masquerade as
+      // the index and TypeError later in the migration loop.
+      if (!isRecord(parsedUnknown) || !Array.isArray(parsedUnknown.checkpoints)) {
+        throw new Error('index root is not an object with a checkpoints array');
+      }
+      // The isRecord + checkpoints-array checks above are the actual runtime
+      // proof; CheckpointIndexFile's OTHER fields (workspaceRoot,
+      // currentBaselineId) are narrower than the guard checks, so TS's
+      // structural-overlap check rejects a direct `as` here — bridge through
+      // `unknown` (tsc's own suggested fix), not a blind cast.
+      parsed = parsedUnknown as unknown as CheckpointIndexFile;
     } catch (err) {
       // Corrupt index. Refuse to silently reset it — that would DELETE the
       // user's checkpoint history. Surface the failure instead so the caller can
