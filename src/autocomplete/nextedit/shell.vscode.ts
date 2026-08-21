@@ -489,6 +489,7 @@ function resolveRoute(mode: NextEditMode, deps: NextEditShellDeps): RouteResolut
     // deliberately as an interface-contract check, and silent because there is
     // no user-facing setting that can be in this state.
     if (apiBase === '' || model === '') return { kind: 'generic-unconfigured' };
+    const genericApiKey = deps.getAutocompleteApiKey();
     return {
       kind: 'route',
       route: {
@@ -497,7 +498,7 @@ function resolveRoute(mode: NextEditMode, deps: NextEditShellDeps): RouteResolut
         apiBase,
         model,
         remote: !isLoopbackEndpoint(apiBase),
-        apiKey: deps.getAutocompleteApiKey(),
+        ...(genericApiKey !== undefined ? { apiKey: genericApiKey } : {}),
       },
     };
   }
@@ -1277,8 +1278,8 @@ export function registerTalariaNextEdit(
         apiBase: route.apiBase,
         model: route.model,
         sentinels: route.format.sentinels,
-        // `undefined` for the NEXT branch, by construction (see NextEditRoute).
-        apiKey: route.apiKey,
+        // Absent for the NEXT branch, by construction (see NextEditRoute).
+        ...(route.apiKey !== undefined ? { apiKey: route.apiKey } : {}),
       });
 
       const output = await backend.predict(scanned, rendered, controller.signal);

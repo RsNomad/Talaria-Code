@@ -75,7 +75,7 @@ function makeBackend(transport: NextEditTransportId, overrides: { apiKey?: strin
   return new NextEditHttpBackend({
     transport,
     apiBase: overrides.apiBase ?? apiBaseFor(transport),
-    apiKey: overrides.apiKey,
+    ...(overrides.apiKey !== undefined ? { apiKey: overrides.apiKey } : {}),
     model: 'test-model',
     sentinels: [],
   });

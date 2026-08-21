@@ -374,12 +374,13 @@ export class TalariaInlineCompletionProvider
         f.uri.toString(),
       );
 
+      const reponame = reponameFromWorkspace(documentUri, workspaceUris);
       const fimContext: FimContext = {
         filepath: documentUri,
         languageId: document.languageId,
         prefix,
         suffix,
-        reponame: reponameFromWorkspace(documentUri, workspaceUris),
+        ...(reponame !== undefined ? { reponame } : {}),
         workspaceUris,
         // W5-T5 `:106` seam: captured ONCE, right here — `snapshotFor()` is a
         // synchronous read of an already-materialized, `===`-stable frozen
@@ -388,15 +389,17 @@ export class TalariaInlineCompletionProvider
         // debounce/regeneration race, even if the background buffer
         // regenerates again before the engine's own 350ms debounce settles.
         snippets: this.contextService.snapshotFor(document).snippets,
-        selectedCompletionInfo: selectedCompletionInfo
+        ...(selectedCompletionInfo
           ? {
-              range: {
-                start: selectedCompletionInfo.range.start.character,
-                end: selectedCompletionInfo.range.end.character,
+              selectedCompletionInfo: {
+                range: {
+                  start: selectedCompletionInfo.range.start.character,
+                  end: selectedCompletionInfo.range.end.character,
+                },
+                text: selectedCompletionInfo.text,
               },
-              text: selectedCompletionInfo.text,
             }
-          : undefined,
+          : {}),
       };
 
       const manual =

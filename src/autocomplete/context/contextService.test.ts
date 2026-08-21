@@ -197,8 +197,8 @@ function makeHarness(overrides: {
     getSkipUntrustedRemote: overrides.getSkipUntrustedRemote ?? (() => false),
     getEnabled: () => true,
     now: () => clock,
-    backend: overrides.backend,
-    getWarmUpEnabled: overrides.getWarmUpEnabled,
+    ...(overrides.backend !== undefined ? { backend: overrides.backend } : {}),
+    ...(overrides.getWarmUpEnabled !== undefined ? { getWarmUpEnabled: overrides.getWarmUpEnabled } : {}),
   };
 
   const service = new CrossFileContextService(deps);

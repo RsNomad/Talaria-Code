@@ -27,15 +27,19 @@ interface FakeCloseDoc {
 
 const adapterMockState: {
   visibleEditors: FakeEditor[];
-  changeHandler?: (e: FakeChangeEvent) => void;
-  closeHandler?: (doc: FakeCloseDoc) => void;
+  // `?: T | undefined` (not bare `?: T`) on these three: `makeAdapterUnderTest`
+  // genuinely CLEARS each field back to undefined before every test rebuild
+  // (below) to prevent a stale handler leaking across tests — a real
+  // clear-site, not a construction-time absent-key case.
+  changeHandler?: ((e: FakeChangeEvent) => void) | undefined;
+  closeHandler?: ((doc: FakeCloseDoc) => void) | undefined;
   /** T-6 sweep (LRU cap test infra): captures `onDidChangeVisibleTextEditors`'s
    *  callback the same way `changeHandler`/`closeHandler` already do, so a
    *  test can seed a document AFTER construction (the initial `visibleEditors`
    *  seed alone can't exercise "a NEW document seeded once the cache is
    *  already at capacity"). Unused by every pre-existing test — this file's
    *  own mock previously discarded the callback entirely. */
-  visibilityHandler?: (editors: FakeEditor[]) => void;
+  visibilityHandler?: ((editors: FakeEditor[]) => void) | undefined;
 } = { visibleEditors: [] };
 
 vi.mock('vscode', () => ({

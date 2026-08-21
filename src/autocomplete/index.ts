@@ -469,7 +469,7 @@ function buildEngine(
   secretApiKey: string | undefined,
 ): BuiltEngine {
   const apiKey = pickApiKey(secretApiKey, cfg.apiKey);
-  const backend = createBackend({ ...cfg, apiKey });
+  const backend = createBackend({ ...cfg, ...(apiKey !== undefined ? { apiKey } : {}) });
   const template = getTemplateForModel(cfg.model);
   // §4.2 — the crossFileMode predicate gates gathering (R6) and tells the
   // engine which assembly path applies (comment-inject is the only one the

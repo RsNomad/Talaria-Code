@@ -362,7 +362,7 @@ describe('FimEngine', () => {
       'leaves the request prefix untouched when crossFileMode is %s',
       async (mode) => {
         const backend = new FakeBackend();
-        const engine = makeEngine(backend, options({ crossFileMode: mode }));
+        const engine = makeEngine(backend, options(mode !== undefined ? { crossFileMode: mode } : {}));
         const snippets = [snippet()];
 
         await engine.complete(

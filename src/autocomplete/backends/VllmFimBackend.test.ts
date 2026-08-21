@@ -296,7 +296,10 @@ describe('VllmFimBackend.streamFim — D-2 fail-closed invariant: renderedPrompt
     vi.stubGlobal('fetch', fetchSpy);
 
     const backend = new VllmFimBackend({ apiBase: 'http://127.0.0.1:8000', model: 'qwen2.5-coder:1.5b-base' });
-    const badReq: FimRequest = { ...req(), renderedPrompt: undefined };
+    // renderedPrompt deliberately omitted (not spread from req()) — absent, not
+    // explicit undefined, is what exercises the `=== undefined` invariant check.
+    const { context, maxTokens, model, prefix, stop, suffix, temperature } = req();
+    const badReq: FimRequest = { context, maxTokens, model, prefix, stop, suffix, temperature };
 
     const iterator = backend
       .streamFim(badReq, new AbortController().signal)

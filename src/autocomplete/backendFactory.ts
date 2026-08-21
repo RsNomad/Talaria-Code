@@ -106,7 +106,7 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
       }
       return new OllamaFimBackend({ apiBase: cfg.endpoint, model: cfg.model });
     case 'llamacpp':
-      return new LlamaCppInfillBackend({ apiBase: cfg.endpoint, apiKey: cfg.apiKey });
+      return new LlamaCppInfillBackend({ apiBase: cfg.endpoint, ...(cfg.apiKey !== undefined ? { apiKey: cfg.apiKey } : {}) });
     case 'vllm':
       // F6: vLLM serves models by their own repo id / `--served-model-name`,
       // never Ollama's `name:tag` convention — audit finding F-B: this is
@@ -118,7 +118,7 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
           `talaria.autocomplete.model ("${cfg.model}") looks like an Ollama-style "name:tag" — vLLM serves models by their own repo id/served-name and will likely 404 on this exact string. Set "talaria.autocomplete.model" to the name your vLLM server actually serves.`,
         );
       }
-      return new VllmFimBackend({ apiBase: cfg.endpoint, model: cfg.model, apiKey: cfg.apiKey });
+      return new VllmFimBackend({ apiBase: cfg.endpoint, model: cfg.model, ...(cfg.apiKey !== undefined ? { apiKey: cfg.apiKey } : {}) });
     case 'codestral':
       // Review C-1 (was audit C-4's fix): this function must NEVER throw.
       // `index.ts`'s `buildEngine` calls `createBackend` SYNCHRONOUSLY at
@@ -162,7 +162,7 @@ export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
       }
       return new OpenAICompatFimBackend({
         apiBase: cfg.endpoint,
-        apiKey: cfg.apiKey,
+        ...(cfg.apiKey !== undefined ? { apiKey: cfg.apiKey } : {}),
         model: cfg.model,
       });
     default: {

@@ -129,7 +129,7 @@ export class FimEngine {
       model: this.options.model,
       prefix,
       suffix,
-      renderedPrompt,
+      ...(renderedPrompt !== undefined ? { renderedPrompt } : {}),
       stop: effectiveStop,
       temperature: this.options.temperature,
       maxTokens: multiline ? MULTILINE_MAX_TOKENS : SINGLE_LINE_MAX_TOKENS,
