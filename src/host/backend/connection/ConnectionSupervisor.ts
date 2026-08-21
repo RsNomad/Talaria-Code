@@ -16,6 +16,7 @@ import type {
 import type { SessionController } from '../session/SessionController';
 import type { SessionRegistry } from '../session/SessionRegistry';
 import type { SessionHostPort } from '../session/types';
+import { settleRace } from './settleRace';
 
 /**
  * T-B1 (closes V-8): how long `startInternal` waits for `connect()` ->
@@ -863,38 +864,15 @@ export class ConnectionSupervisor {
    * itself resolving/rejecting), so a fast happy path never leaves a stray
    * timer armed (proven by the T-3 fast-path test). Omitting `deadlineMs`
    * reproduces the exact prior behavior (no timer created at all).
+   *
+   * WS-R1: re-implemented as a thin adapter over {@link settleRace} —
+   * outcome mapping (exit/deadline → undefined) unchanged, pinned by
+   * ConnectionSupervisor.test.ts.
    */
   private raceAgainstChildExit<T>(p: Promise<T>, client: AcpClientLike, deadlineMs?: number): Promise<T | undefined> {
-    return new Promise<T | undefined>((resolve, reject) => {
-      let settled = false;
-      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-      const clearDeadline = (): void => {
-        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-      };
-      const settleResolve = (value: T | undefined): void => {
-        if (settled) return;
-        settled = true;
-        exitSub.dispose();
-        clearDeadline();
-        resolve(value);
-      };
-      const settleReject = (err: unknown): void => {
-        if (settled) return;
-        settled = true;
-        exitSub.dispose();
-        clearDeadline();
-        reject(err);
-      };
-      const exitSub = client.onExit(() => settleResolve(undefined));
-      if (deadlineMs !== undefined) {
-        deadlineTimer = setTimeout(() => settleResolve(undefined), deadlineMs);
-        // Don't keep the event loop alive on this deadline — matches
-        // raceConnectPhase's own CONNECT_PHASE_DEADLINE_MS timer and
-        // scheduleAcpRespawn's backoff timer.
-        deadlineTimer.unref?.();
-      }
-      p.then(settleResolve, settleReject);
-    });
+    return settleRace(p, { exit: client, deadline: deadlineMs ?? 'none' }).then((outcome) =>
+      outcome.kind === 'value' ? outcome.value : undefined,
+    );
   }
 
   /**
@@ -930,34 +908,17 @@ export class ConnectionSupervisor {
    * exit-race was written), which `loadReplay`'s try/catch already turns
    * into an honest, session-scoped failure — no SEPARATE exit-race is
    * needed at this layer.
+   *
+   * WS-R1: re-implemented as a thin adapter over {@link settleRace} —
+   * `'exit'` is impossible-by-construction here (no exit source is passed
+   * to `settleRace`, per the deadline-only doc above), so collapsing the
+   * non-value kinds to `timeout` is exact; outcome mapping unchanged,
+   * pinned by ConnectionSupervisor.test.ts.
    */
   raceSessionLoadAgainstDeadline<T>(p: Promise<T>): Promise<{ kind: 'settled'; value: T } | { kind: 'timeout' }> {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        resolve({ kind: 'timeout' });
-      }, SESSION_ESTABLISH_DEADLINE_MS);
-      // Don't keep the event loop alive on this deadline — matches every
-      // other deadline timer in this class (raceConnectPhase/
-      // raceAgainstChildExit/scheduleAcpRespawn).
-      timer.unref?.();
-      p.then(
-        (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve({ kind: 'settled', value });
-        },
-        (err: unknown) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(err);
-        },
-      );
-    });
+    return settleRace(p, { deadline: SESSION_ESTABLISH_DEADLINE_MS }).then((outcome) =>
+      outcome.kind === 'value' ? { kind: 'settled' as const, value: outcome.value } : { kind: 'timeout' as const },
+    );
   }
 
   /**

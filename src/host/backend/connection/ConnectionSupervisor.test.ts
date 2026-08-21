@@ -329,6 +329,20 @@ describe('WS-R1 characterization — raceSessionLoadAgainstDeadline discriminate
     await vi.advanceTimersByTimeAsync(120_000);
     await expect(race).resolves.toEqual({ kind: 'settled', value: 'v' }); // unchanged, no flip to timeout
   });
+
+  it('settle-once: 120s elapses first, then p resolves late — outcome stays {kind:"timeout"} (late value discarded)', async () => {
+    const { supervisor } = makeSupervisorHarness();
+    const d = deferred<string>();
+    const race = supervisor.raceSessionLoadAgainstDeadline(d.promise);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await expect(race).resolves.toEqual({ kind: 'timeout' }); // timeout wins first
+    // late-loser: p resolves AFTER the timeout already won. p's own .then
+    // callback is still registered and WILL run — this is the genuine second
+    // settle call the `if (settled) return` guard must swallow.
+    d.resolve('late-value');
+    await Promise.resolve(); // flush the microtask so the late settle actually runs before we assert
+    await expect(race).resolves.toEqual({ kind: 'timeout' }); // unchanged — the late value never surfaces
+  });
 });
 
 describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contract', () => {
