@@ -666,3 +666,54 @@ describe('WS-R3 F2-19 — ControlChannel.onHealth transitions', () => {
     channel.dispose();
   });
 });
+
+describe('ControlChannel.log() — guarded against a throwing logger on the crash/respawn path (F2-19a IMPORTANT-1, concurrency re-review)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('a logger whose append() always throws does not silently kill the self-heal loop across repeated crash/respawn cycles', async () => {
+    const { factory, transports } = makeFactory();
+    // Models a bad/disposed vscode.OutputChannel: EVERY append() throws,
+    // unconditionally — unlike the existing compound-throw test above, which
+    // only throws for one specific message.
+    const throwingLogger: Logger = {
+      append() {
+        throw new Error('logger boom (disposed OutputChannel)');
+      },
+    };
+    const channel = new ControlChannel(CONFIG, throwingLogger, factory);
+
+    const start = channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    must(transports[0]).emit('event', GATEWAY_READY);
+    await start;
+
+    // Crash: handleCrash() calls this.log() BEFORE scheduleRespawn() runs
+    // (ControlChannel.ts ~L380). Pre-fix, the unguarded `logger?.append`
+    // throw escapes handleCrash entirely — synchronously, through the
+    // FakeTransport.exit() dispatch loop, right out to this call — leaving
+    // the channel a zombie (state stuck at 'ready', transport undefined)
+    // that never respawns.
+    expect(() => must(transports[0]).exit(1)).not.toThrow();
+
+    // Attempt 1's backoff must have been armed despite the throw above —
+    // scheduleRespawn()'s OWN log() call (~L389) is the 2nd unguarded site
+    // on this path.
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1));
+    expect(transports).toHaveLength(2); // respawn actually spawned — loop alive
+
+    // Let attempt 1's handshake time out so attemptRespawn()'s catch handler
+    // runs its own this.log() call (~L421, the 3rd unguarded site) before
+    // scheduling attempt 2 — must not stall the loop either.
+    await vi.advanceTimersByTimeAsync(15_000); // READY_TIMEOUT_MS
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(2));
+    expect(transports).toHaveLength(3); // attempt 2 actually spawned
+
+    // Full self-heal: the loop can still reach 'ready' again.
+    must(transports[2]).emit('event', GATEWAY_READY);
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(channel.dispatch('tools.list')).resolves.toBeUndefined();
+
+    channel.dispose();
+  });
+});

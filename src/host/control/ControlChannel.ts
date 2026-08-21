@@ -441,6 +441,22 @@ export class ControlChannel {
   }
 
   private log(message: string): void {
-    this.logger?.append(`[ControlChannel] ${message}`);
+    // F2-19a (concurrency re-review IMPORTANT-1): three call sites on the
+    // crash/respawn critical path — `handleCrash`, `scheduleRespawn`, and
+    // `attemptRespawn`'s failure handler — all call `log()` BEFORE the next
+    // backoff timer is armed or the next attempt is scheduled. An unguarded
+    // `logger?.append` (e.g. a bad/disposed `vscode.OutputChannel` on
+    // Fedora) would otherwise escape `log()` and propagate out of whichever
+    // caller invoked it, aborting that method before it reaches
+    // `scheduleRespawn()`/`this.state = 'respawning'` — leaving the channel
+    // a zombie (`state` stuck, `transport` undefined) that never respawns:
+    // exactly the F2-19 silent fail-stop this class exists to prevent.
+    // Guarding here, once, hardens every call site at once — same rationale
+    // as `emitHealth`'s own defensive wrap.
+    try {
+      this.logger?.append(`[ControlChannel] ${message}`);
+    } catch {
+      // Swallow: a logging failure must never affect control flow.
+    }
   }
 }
