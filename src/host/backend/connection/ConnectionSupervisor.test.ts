@@ -52,6 +52,16 @@ const NOOP_CALLBACKS: AcpClientCallbacks = {
 class FakeSupervisorClient {
   exitHandlers: Array<(code: number | null) => void> = [];
   disposeCallCount = 0;
+  /** WS-R3 follow-up 2 (IMP-1 re-review): `exitHandlers.length` captured AT
+   * THE MOMENT `dispose()` is called — proves the exit-sub was disposed
+   * BEFORE the client, not merely by the time the whole teardown eventually
+   * settles. A final-state-only assertion (`exitHandlers` after everything
+   * runs) is backstop-masked: `teardownSession()` unconditionally re-disposes
+   * `clientExitSub` as `startInternal`'s first act (`ConnectionSupervisor.ts
+   * :987-988`), so it reaches 0 on the reconnect happy path even if the
+   * ordering this field pins were violated. -1 sentinel = dispose() never
+   * called. */
+  exitHandlersAtDispose = -1;
   connectError: unknown;
   async connect(): Promise<void> {
     if (this.connectError !== undefined) throw this.connectError;
@@ -70,6 +80,7 @@ class FakeSupervisorClient {
   }
   dispose(): void {
     this.disposeCallCount++;
+    this.exitHandlersAtDispose = this.exitHandlers.length;
   }
 }
 
@@ -485,7 +496,8 @@ describe('WS-R3 characterization — reconnect refusal matrix + teardown', () =>
     await expect(h.supervisor.reconnect()).resolves.toEqual({ ok: true });
     expect(h.port.settleOneShot).toHaveBeenCalledWith('agent reconnecting');
     expect(must(h.clients[0]).disposeCallCount).toBe(1); // old client disposed
-    expect(must(h.clients[0]).exitHandlers).toHaveLength(0); // old exit-sub cleared — the double-start guard :1126-27 protects
+    expect(must(h.clients[0]).exitHandlersAtDispose).toBe(0); // exit-sub disposed BEFORE client.dispose() — the ORDERING pin (NOT backstop-masked by teardownSession's later re-dispose; see field doc above)
+    expect(must(h.clients[0]).exitHandlers).toHaveLength(0); // old exit-sub cleared, final state — defense in depth ONLY; teardownSession's :987-988 backstop also reaches 0 here, so this line alone has no teeth against the ordering regression above
     expect(h.clients).toHaveLength(2); // startInternal spawned a fresh one
     expect(h.emitted.filter((m) => m.type === 'system.error')).toHaveLength(0); // reconnect never emits the crash banner
     expect(
