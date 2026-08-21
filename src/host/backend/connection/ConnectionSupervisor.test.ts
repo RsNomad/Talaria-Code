@@ -214,6 +214,7 @@ describe('WS-R1 characterization — raceAgainstChildExit legacy contract', () =
     d.reject(boom);
     await expect(race).rejects.toBe(boom);
     expect(vi.getTimerCount()).toBe(0); // timer cleared on the rejection path too
+    expect(client.exitHandlers).toHaveLength(0); // exit sub disposed on the rejection path too (symmetric with value/exit/deadline)
   });
 
   it('fast path clears the deadline timer (the T-3 fast-path pin)', async () => {
@@ -224,6 +225,45 @@ describe('WS-R1 characterization — raceAgainstChildExit legacy contract', () =
     d.resolve('v');
     await race;
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('exit wins over an armed deadline: fires first AND clears the deadline timer (leaked-timer-on-the-exit-path regression pin)', async () => {
+    const { h, client } = helpers();
+    const race = h.raceAgainstChildExit(deferred<string>().promise, client as unknown as AcpClientLike, 120_000);
+    expect(vi.getTimerCount()).toBe(1); // deadline armed
+    client.simulateExit(1);
+    await expect(race).resolves.toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0); // exit cleared the deadline timer too, not just the p-settle fast path
+    expect(client.exitHandlers).toHaveLength(0);
+  });
+
+  it('settle-once: p resolves first, then the deadline elapses — outcome stays the value (no clobber to undefined)', async () => {
+    const { h, client } = helpers();
+    const d = deferred<string>();
+    const race = h.raceAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
+    d.resolve('v');
+    await expect(race).resolves.toBe('v'); // p wins first
+    // late-loser: the deadline elapses AFTER p already won. If a future adapter
+    // fails to clear the timer, this actually drives the deadline branch's
+    // settleResolve a second time — the `if (settled) return` guard must
+    // absorb it silently rather than flip the outcome.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await expect(race).resolves.toBe('v'); // unchanged
+  });
+
+  it('settle-once: exit wins, then p resolves late — outcome stays undefined (late value has no effect)', async () => {
+    const { h, client } = helpers();
+    const d = deferred<string>();
+    const race = h.raceAgainstChildExit(d.promise, client as unknown as AcpClientLike);
+    client.simulateExit(1);
+    await expect(race).resolves.toBeUndefined(); // exit wins first
+    expect(client.exitHandlers).toHaveLength(0);
+    // late-loser: p resolves AFTER exit already won. p's own .then callback
+    // is still registered and WILL run — this is the genuine second call
+    // into settleResolve that the `if (settled) return` guard must swallow.
+    d.resolve('late-value');
+    await Promise.resolve(); // flush the microtask so settleResolve('late-value') actually runs before we assert
+    await expect(race).resolves.toBeUndefined(); // unchanged — the late value never surfaces
   });
 });
 
@@ -254,6 +294,41 @@ describe('WS-R1 characterization — raceSessionLoadAgainstDeadline discriminate
     d.reject(boom);
     await expect(race).rejects.toBe(boom);
   });
+
+  it('fast path clears the deadline timer (symmetric with raceAgainstChildExit)', async () => {
+    const { supervisor } = makeSupervisorHarness();
+    const d = deferred<string>();
+    const race = supervisor.raceSessionLoadAgainstDeadline(d.promise);
+    expect(vi.getTimerCount()).toBe(1);
+    d.resolve('v');
+    await race;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('p settles with a real object → outcome.value is the SAME object (identity-preserved, not re-derived or hardcoded)', async () => {
+    const { supervisor } = makeSupervisorHarness();
+    const sentinel: AcpLoadSessionResult = { found: true, currentModeId: 'default' };
+    const d = deferred<AcpLoadSessionResult>();
+    const race = supervisor.raceSessionLoadAgainstDeadline(d.promise);
+    d.resolve(sentinel);
+    const outcome = await race;
+    expect(outcome.kind).toBe('settled');
+    if (outcome.kind !== 'settled') throw new Error('unreachable — asserted above');
+    expect(outcome.value).toBe(sentinel);
+  });
+
+  it('settle-once: p settles first, then 120s elapses — stays {kind:"settled"}, does NOT flip to {kind:"timeout"}', async () => {
+    const { supervisor } = makeSupervisorHarness();
+    const d = deferred<string>();
+    const race = supervisor.raceSessionLoadAgainstDeadline(d.promise);
+    d.resolve('v');
+    await expect(race).resolves.toEqual({ kind: 'settled', value: 'v' }); // p wins first
+    // late-loser: 120s elapses AFTER p already settled. If a future adapter
+    // fails to clear the timer, this drives the timeout branch's settle a
+    // second time — the `if (settled) return` guard must absorb it.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await expect(race).resolves.toEqual({ kind: 'settled', value: 'v' }); // unchanged, no flip to timeout
+  });
 });
 
 describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contract', () => {
@@ -270,7 +345,7 @@ describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contra
     await expect(race).resolves.toBeUndefined();
   });
 
-  it('exit → undefined; the pre-existing 120s deadline → undefined', async () => {
+  it('the pre-existing 120s deadline elapses (loadReplay pending, no exit) → undefined', async () => {
     const { supervisor } = makeSupervisorHarness();
     const h = supervisor as unknown as RaceHelpers;
     const client = new FakeSupervisorClient();
@@ -280,5 +355,30 @@ describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contra
     );
     await vi.advanceTimersByTimeAsync(120_000);
     await expect(race).resolves.toBeUndefined();
+  });
+
+  it('exit → undefined (the child-exit race — the entire reason this helper exists, per its own doc)', async () => {
+    const { supervisor } = makeSupervisorHarness();
+    const h = supervisor as unknown as RaceHelpers;
+    const client = new FakeSupervisorClient();
+    const race = h.raceRecoveryAgainstChildExit(
+      deferred<AcpLoadSessionResult | undefined>().promise,
+      client as unknown as AcpClientLike,
+    );
+    client.simulateExit(1);
+    await expect(race).resolves.toBeUndefined();
+    expect(client.exitHandlers).toHaveLength(0); // exit sub disposed
+    expect(vi.getTimerCount()).toBe(0); // the 120s deadline timer is cleared too
+  });
+
+  it('happy path: loadReplay resolves to a real result → identity-preserved passthrough (not swallowed)', async () => {
+    const { supervisor } = makeSupervisorHarness();
+    const h = supervisor as unknown as RaceHelpers;
+    const client = new FakeSupervisorClient();
+    const sentinel: AcpLoadSessionResult = { found: true, currentModeId: 'default' };
+    const d = deferred<AcpLoadSessionResult | undefined>();
+    const race = h.raceRecoveryAgainstChildExit(d.promise, client as unknown as AcpClientLike);
+    d.resolve(sentinel);
+    await expect(race).resolves.toBe(sentinel);
   });
 });
