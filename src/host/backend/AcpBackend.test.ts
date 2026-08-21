@@ -3341,6 +3341,21 @@ describe('WS-R3 F3-2 — a 2nd crash mid-recovery must not retire the fresh outa
   });
 });
 
+describe('WS-R3 F3-4 — a force-ended turn no longer blocks reconnect', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('cancel → 15s force-end → reconnectAgent() proceeds (ok:true)', async () => {
+    const { backend } = makeStartableBackend();
+    await backend.start();
+    backend.sendPrompt('session-1', 'first prompt', 'default'); // prompt hangs on the fake's deferred
+    await vi.advanceTimersByTimeAsync(0);
+    backend.cancel('session-1'); // verified public signature: cancel(sessionId: string): void (:1282)
+    await vi.advanceTimersByTimeAsync(15_000); // CANCEL_FALLBACK_DEADLINE_MS force-end
+    await expect(backend.reconnectAgent()).resolves.toEqual({ ok: true });
+  });
+});
+
 /**
  * T-1 (V-12 RESTART-STATE): today, an EXPLICIT restart (`talaria.newSession` /
  * the trust-upgrade `setBackend` swap → `AcpBackend.start()` a second time)

@@ -508,3 +508,27 @@ describe('WS-R3 characterization — reconnect refusal matrix + teardown', () =>
     expect(h.logs.some((l) => l.includes("(tab 'tab-bad')"))).toBe(false); // the tab segment is CRASH-only
   });
 });
+
+describe('WS-R3 F3-4 (reconnect half) — wedge-break clause', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('{force:true} bypasses the live-turn refusal; the fan-out safely ends the turn', async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    const busy = must(h.controllers.get('session-1'));
+    busy.hasLiveTurn.mockReturnValue(true);
+    await expect(h.supervisor.reconnect({ force: true })).resolves.toEqual({ ok: true });
+    expect(busy.endOnCrash).toHaveBeenCalledTimes(1); // teardownForRespawn's machinery ended it
+  });
+
+  it('no force + live turn → refusal byte-identical to today', async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    must(h.controllers.get('session-1')).hasLiveTurn.mockReturnValue(true);
+    await expect(h.supervisor.reconnect()).resolves.toEqual({
+      ok: false,
+      reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
+    });
+  });
+});

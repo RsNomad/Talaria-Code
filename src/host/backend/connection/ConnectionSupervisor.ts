@@ -1114,8 +1114,15 @@ export class ConnectionSupervisor {
    * On startInternal rejection: same stay-in-outage posture as a failed
    * scheduled respawn attempt (:1129-1131) — hand the outage to the existing
    * backoff machinery AND refuse honestly, so a failed reconnect still heals.
+   *
+   * WS-R3 F3-4: wedge-break — a turn whose cancel force-end deadline already
+   * fired has hasLiveTurn() false (WS-R1 routed the force-end through
+   * emitTurnEnd), so it no longer trips this guard; an explicit {force:true}
+   * (future WS-UX affordance) bypasses a still-live turn — teardownForRespawn's
+   * endOnCrash fan-out is the safe ending machinery, idempotent if the turn
+   * completes in between.
    */
-  async reconnect(): Promise<ReconnectOutcome> {
+  async reconnect(opts?: { force?: boolean }): Promise<ReconnectOutcome> {
     return this.runOnStartTail(async () => {
       if (this.acpState !== 'ready') {
         return {
@@ -1126,12 +1133,14 @@ export class ConnectionSupervisor {
               : 'The agent connection is not running.',
         };
       }
-      for (const controller of this.port.sessions.values()) {
-        if (controller.hasLiveTurn()) {
-          return {
-            ok: false as const,
-            reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
-          };
+      if (opts?.force !== true) {
+        for (const controller of this.port.sessions.values()) {
+          if (controller.hasLiveTurn()) {
+            return {
+              ok: false as const,
+              reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
+            };
+          }
         }
       }
       this.teardownForRespawn(
