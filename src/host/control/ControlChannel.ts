@@ -177,16 +177,51 @@ export class ControlChannel {
     };
   }
 
+  /**
+   * WS-R3 F2-19a (arch review Important-1): the CURRENT health, computed
+   * fresh from the live `respawnAttempts` through the same classifier
+   * `emitHealth` uses — NOT the frozen payload of the last-fired
+   * transition. `onHealth` is purely edge-triggered and holds no replay, so
+   * a subscriber that registers AFTER the channel has already crash-looped
+   * past a threshold (e.g. a webview panel VS Code creates lazily, only
+   * revealed post-outage) would otherwise hear nothing and default to
+   * assuming `'ok'`. Also doubles as the live "retried N times" counter
+   * (arch review Minor-1) — unlike a transition payload, `attempts` here
+   * keeps climbing past the threshold crossing instead of freezing at 5/10.
+   */
+  currentHealth(): RespawnHealth {
+    return {
+      state: respawnHealthForAttempt(this.respawnAttempts),
+      attempts: this.respawnAttempts,
+    };
+  }
+
   private emitHealth(attempts: number): void {
-    const state = respawnHealthForAttempt(attempts);
-    if (state === this.lastHealthState) return;
-    this.lastHealthState = state;
-    for (const handler of [...this.healthHandlers]) {
-      try {
-        handler({ state, attempts });
-      } catch (err) {
-        this.log(`health handler threw: ${String(err)}`);
+    // F2-19a (concurrency review Minor-1): this whole body is wrapped
+    // defensively. Without it, a pathological failure INSIDE the
+    // per-handler catch below (the logger itself throwing, or `String(err)`
+    // throwing on an exotic error) would escape `emitHealth` entirely. Both
+    // call sites of `emitHealth` sit on the respawn loop's critical path —
+    // `scheduleRespawn` arms the next backoff around this call (see the
+    // ordering note there) and `spawnAndAwaitReady` calls it as its very
+    // last step on the success path — so an escaping throw here must never
+    // be possible: the self-heal loop's "always another attempt" invariant
+    // cannot depend on a subscriber or a logger behaving.
+    try {
+      const state = respawnHealthForAttempt(attempts);
+      if (state === this.lastHealthState) return;
+      this.lastHealthState = state;
+      for (const handler of [...this.healthHandlers]) {
+        try {
+          handler({ state, attempts });
+        } catch (err) {
+          this.log(`health handler threw: ${String(err)}`);
+        }
       }
+    } catch {
+      // Swallow: see the doc comment above. Nothing productive can be done
+      // with a failure of the failure-reporting path itself, and this
+      // function must never be the reason the next backoff isn't armed.
     }
   }
 
@@ -350,14 +385,26 @@ export class ControlChannel {
   private scheduleRespawn(): void {
     if (this.state === 'disposed') return;
     const attempt = ++this.respawnAttempts;
-    this.emitHealth(attempt);
     const delayMs = respawnBackoffMs(attempt);
     this.log(`respawn attempt ${attempt} in ${delayMs}ms`);
+    // F2-19a (concurrency review Minor-1/Minor-2): the next backoff is
+    // armed BEFORE `emitHealth` runs — not after. `emitHealth` fans out to
+    // arbitrary subscriber callbacks synchronously; arming first means the
+    // loop's own scheduling work is already committed before any of that
+    // untrusted code runs, so nothing in the emit path (a throw that
+    // somehow escapes `emitHealth`'s own defensive wrapper, or a subscriber
+    // that reentrantly calls `dispose()`/`start()` from inside its
+    // callback) can prevent — or race — this attempt's timer. A reentrant
+    // `dispose()` now correctly clears this very timer via
+    // `clearRespawnTimer()` instead of leaving one armed post-dispose; a
+    // reentrant `start()` now correctly clears it too before arming its own
+    // spawn, instead of this call re-arming a stale one afterward.
     this.respawnTimer = setTimeout(() => {
       this.respawnTimer = undefined;
       this.attemptRespawn();
     }, delayMs);
     this.respawnTimer.unref?.();
+    this.emitHealth(attempt);
   }
 
   private attemptRespawn(): void {

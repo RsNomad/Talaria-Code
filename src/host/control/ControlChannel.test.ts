@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ControlChannel } from './ControlChannel';
 import type { ControlTransport, ControlTransportFactory } from './ControlChannel';
-import type { JsonRpcStdioOptions } from '../transport/JsonRpcStdio';
+import type { JsonRpcStdioOptions, Logger } from '../transport/JsonRpcStdio';
 import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
 import { must } from '../../testing/must';
 import { respawnBackoffMs } from './respawnBackoff';
@@ -585,5 +585,84 @@ describe('WS-R3 F2-19 — ControlChannel.onHealth transitions', () => {
       await failOneAttempt(attempt);
     }
     expect(seen).toEqual([{ state: 'degraded', attempts: 5 }]);
+  });
+
+  it('currentHealth() reflects the LIVE state for a late subscriber, not the frozen last-transition payload (arch review Important-1)', async () => {
+    const { factory, transports } = makeFactory();
+    const channel = new ControlChannel(CONFIG, undefined, factory);
+
+    const start = channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    must(transports[0]).emit('event', GATEWAY_READY);
+    await start;
+
+    expect(channel.currentHealth()).toEqual({ state: 'ok', attempts: 0 });
+
+    must(transports[0]).exit(1); // crash → attempt 1 scheduled
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      await failOneAttempt(attempt);
+    }
+
+    // A subscriber that registers only NOW — e.g. a webview panel lazily
+    // revealed after the outage already happened — must be able to recover
+    // the current state instead of defaulting to 'ok' from having heard no
+    // transition yet. (respawnAttempts is 11 here: the loop above drove
+    // attempts 1..10 to fire AND fail, and processing attempt 10's failure
+    // already scheduled attempt 11 — same count the pre-existing
+    // "degraded at 5, down at 10" test's own recovery step uses.)
+    expect(channel.currentHealth()).toEqual({ state: 'down', attempts: 11 });
+
+    // Prove it's LIVE, not a frozen last-transition payload: one more
+    // failed attempt bumps the real count while onHealth itself stays
+    // silent (transition-only — still no 3rd event, still 'down').
+    await failOneAttempt(11);
+    expect(channel.currentHealth()).toEqual({ state: 'down', attempts: 12 });
+
+    channel.dispose();
+  });
+
+  it('a subscriber that throws at the down transition, whose own error-log call ALSO throws, still lets the next attempt run (F2-19a — no escaping error can kill the self-heal loop; concurrency review Minor-1/2)', async () => {
+    const { factory, transports } = makeFactory();
+    // Simulates the compound escape the concurrency review named: the
+    // per-handler `catch` in `emitHealth` tries to log via `this.log`
+    // (`logger.append`), and the logger itself throws for that exact
+    // message — a failure mode a plain try/catch around the subscriber
+    // alone cannot neutralize.
+    const throwingLogger: Logger = {
+      append(line: string) {
+        if (line.includes('health handler threw')) {
+          throw new Error('logger boom (compound failure)');
+        }
+      },
+    };
+    const channel = new ControlChannel(CONFIG, throwingLogger, factory);
+    channel.onHealth((h) => {
+      if (h.state === 'down') throw new Error('subscriber boom at down');
+    });
+
+    const start = channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    must(transports[0]).emit('event', GATEWAY_READY);
+    await start;
+
+    must(transports[0]).exit(1); // crash → attempt 1 scheduled
+    // Attempts 1..9 are ordinary (no transition below the 'degraded'==5 /
+    // 'down'==10 thresholds crossed here, since 'degraded' at 5 doesn't
+    // throw). Processing attempt 9's failure calls scheduleRespawn(10) —
+    // respawnAttempts crosses the 'down' threshold, which is exactly where
+    // the throwing subscriber AND the throwing logger both fire.
+    for (let attempt = 1; attempt <= 9; attempt++) {
+      await failOneAttempt(attempt);
+    }
+    expect(transports).toHaveLength(10); // initial spawn + attempts 1..9
+
+    // The compound escape above must not have prevented attempt 10's
+    // backoff timer from being armed and firing.
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(10));
+    expect(transports).toHaveLength(11); // attempt 10 actually spawned — loop survives
+
+    must(transports[10]).emit('event', GATEWAY_READY); // let it recover cleanly
+    await vi.advanceTimersByTimeAsync(0);
+    channel.dispose();
   });
 });
