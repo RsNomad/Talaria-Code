@@ -1573,6 +1573,10 @@ describe('WS-R1 F3-4 — cancel fallback deadline force-ends an unresponsive tur
     controller.cancel();
     expect(cancelCalls).toEqual(['session-1']);
     await vi.advanceTimersByTimeAsync(15_000);
+    // M1 (code-lens review): exactly ONE turn.end on the pure force-end path
+    // (not merely "at least one") — a double-emit regression on this path is
+    // otherwise only caught on the harder belated-settlement test (below).
+    expect(emitted.filter((m) => m.type === 'turn.end' && m.turnId === 'turn-1')).toHaveLength(1);
     expect(emitted).toContainEqual(
       expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'cancelled' }),
     );
@@ -1609,10 +1613,69 @@ describe('WS-R1 F3-4 — cancel fallback deadline force-ends an unresponsive tur
     expect(controller.wasForceEnded('turn-1')).toBe(false);
   });
 
+  // M2 (code-lens review): the test above's "no force-end, no notice" outcome
+  // is ALSO satisfiable by forceEndCancelledTurn's own independent
+  // `liveTurnId !== turnId` guard — it would still pass even if emitTurnEnd
+  // stopped calling clearCancelFallback(). This test isolates the clear
+  // itself: checking vi.getTimerCount() right after the genuine end (with no
+  // deadline advance in between) proves the timer handle is actually gone,
+  // not merely neutralized by the other guard.
+  it('a genuine turn.end before the deadline actually clears the cancel-fallback timer handle', async () => {
+    const { controller, prompt } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel();
+    expect(vi.getTimerCount()).toBe(1); // fallback armed
+    prompt.resolve({ stopReason: 'cancelled' });
+    await vi.advanceTimersByTimeAsync(0); // genuine turn.end lands via emitTurnEnd
+    expect(vi.getTimerCount()).toBe(0); // the handle itself is cleared, not just guarded
+  });
+
   it('cancel() with no live prompt turn arms NO fallback timer', async () => {
     const { controller } = makeCancelHarness();
     const before = vi.getTimerCount();
     controller.cancel(); // nothing live
     expect(vi.getTimerCount()).toBe(before);
+  });
+
+  // Task 8 follow-up (concurrency-lens review Minor 1 / code-lens review M3):
+  // endOnCrash/endForRestart clear the turn bookkeeping but, pre-fix, did NOT
+  // clear an armed cancelFallbackTimer — stranding the handle. Harmless when
+  // IT fires (forceEndCancelledTurn's own currentTurnId/liveTurnId guard
+  // no-ops), but armCancelFallback's `cancelFallbackTimer !== undefined`
+  // early-return means a stranded handle surviving onto a reused controller
+  // would silently suppress the NEXT turn's fallback. vi.getTimerCount()
+  // right after the crash/restart call is the discriminator: pre-fix it
+  // stays elevated (the handle is still queued); post-fix it drops to 0.
+  it('endOnCrash clears an armed cancel-fallback timer (defensive symmetry with dispose)', async () => {
+    const { controller, emitted } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel(); // arms the fallback
+    expect(vi.getTimerCount()).toBe(1);
+    controller.endOnCrash();
+    expect(vi.getTimerCount()).toBe(0); // RED pre-fix: stays 1, the handle is stranded
+    await vi.advanceTimersByTimeAsync(15_000); // deadline horizon passes
+    expect(
+      emitted.filter(
+        (m) => m.type === 'error' && typeof m.message === 'string' && m.message.includes('force-stopped'),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it('endForRestart clears an armed cancel-fallback timer (defensive symmetry with dispose)', async () => {
+    const { controller, emitted } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel(); // arms the fallback
+    expect(vi.getTimerCount()).toBe(1);
+    controller.endForRestart();
+    expect(vi.getTimerCount()).toBe(0); // RED pre-fix: stays 1, the handle is stranded
+    await vi.advanceTimersByTimeAsync(15_000); // deadline horizon passes
+    expect(
+      emitted.filter(
+        (m) => m.type === 'error' && typeof m.message === 'string' && m.message.includes('force-stopped'),
+      ),
+    ).toHaveLength(0);
   });
 });

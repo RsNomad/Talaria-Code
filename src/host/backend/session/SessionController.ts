@@ -1346,6 +1346,16 @@ export class SessionController {
    * session-lost" fan-out).
    */
   endOnCrash(): void {
+    // M1 (Task 8 follow-up, concurrency-lens review): defensive symmetry with
+    // dispose() — this method clears the turn bookkeeping directly (bypassing
+    // emitTurnEnd) and, unfixed, left an armed cancelFallbackTimer stranded.
+    // Harmless when the stray timer fires (forceEndCancelledTurn's own
+    // currentTurnId/liveTurnId guard no-ops it against a monotonic, never-
+    // reused turn id), but armCancelFallback's `cancelFallbackTimer !==
+    // undefined` early-return means a surviving handle would silently
+    // suppress the NEXT turn's fallback on a reused controller — regressing
+    // the exact "Stop looks dead" bug F3-4 fixes, with no error surfaced.
+    this.clearCancelFallback();
     if (this.liveTurnId !== undefined) {
       const deadTurnId = this.liveTurnId;
       this.liveTurnId = undefined;
@@ -1376,6 +1386,10 @@ export class SessionController {
    * reasoning that lets `endOnCrash` emit safely.
    */
   endForRestart(): void {
+    // M1 (Task 8 follow-up, concurrency-lens review): see endOnCrash's
+    // identical comment — defensive symmetry with dispose(), clears a
+    // stranded cancel-fallback timer handle.
+    this.clearCancelFallback();
     if (this.liveTurnId !== undefined) {
       const deadTurnId = this.liveTurnId;
       this.liveTurnId = undefined;
