@@ -3,6 +3,8 @@ import type { Logger } from '../../transport/JsonRpcStdio';
 import type { HermesRuntimeConfig } from '../../runtime/resolveHermes';
 import { resolveHermes } from '../../runtime/resolveHermes';
 import { respawnBackoffMs } from '../../control/respawnBackoff';
+import { respawnHealthForAttempt } from '../../control/respawnHealth';
+import type { RespawnHealth, RespawnHealthState } from '../../control/respawnHealth';
 import { describeError, isAuthRequiredError } from '../../../shared/errorText';
 import { BOOTSTRAP_TAB_ID } from '../../../shared/protocol';
 import type { HostToWebviewMessage } from '../../../shared/protocol';
@@ -131,6 +133,13 @@ export class ConnectionSupervisor {
   private acpRespawnAttempts = 0;
   private acpRespawnTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /** WS-R3 F2-19b: health-transition subscribers for the ACP supervisor's
+   * OWN respawn loop — mirrors ControlChannel's `healthHandlers`/
+   * `lastHealthState` field-for-field (the future gateway.health push,
+   * Phase 3 WS-UX wires both loops' `onHealth` to the same panel signal). */
+  private readonly healthHandlers = new Set<(health: RespawnHealth) => void>();
+  private lastHealthState: RespawnHealthState = 'ok';
+
   /**
    * W4-T5a (Q-10 / F2 / P-W4-6): a snapshot of every session registered at
    * CRASH time — `{sessionId, cwd, tabId}` — captured by {@link handleAcpCrash}
@@ -189,6 +198,24 @@ export class ConnectionSupervisor {
   /** The live ACP client, read at call time — `undefined` before/between connections. */
   getClient(): AcpClientLike | undefined {
     return this.client;
+  }
+
+  /**
+   * WS-R3 F2-19b: subscribe to the ACP respawn loop's health TRANSITIONS
+   * ('ok' → 'degraded' at 5 failed attempts → 'down' at 10 → back to 'ok'
+   * on a successful respawn). Transition-only — never one event per
+   * attempt. `scheduleAcpRespawn` keeps its backoff schedule forever
+   * regardless of subscribers (fail-visible, never fail-stopped) — see
+   * {@link emitHealth}'s own doc for the hardening that guarantees it.
+   * Supervisor-scoped like the crash/reconnect machinery it observes.
+   */
+  onHealth(handler: (health: RespawnHealth) => void): { dispose(): void } {
+    this.healthHandlers.add(handler);
+    return {
+      dispose: () => {
+        this.healthHandlers.delete(handler);
+      },
+    };
   }
 
   /**
@@ -377,6 +404,7 @@ export class ConnectionSupervisor {
 
       this.acpRespawnAttempts = 0;
       this.acpState = 'ready';
+      this.emitHealth(0);
     } catch (err) {
       // Cast: TS narrows `acpState` to 'starting' | 'ready' across this try
       // block's control flow, but `AcpBackend.dispose()` can reassign it (via
@@ -1037,7 +1065,13 @@ export class ConnectionSupervisor {
       try {
         controller.endOnCrash();
       } catch (err) {
-        this.port.logger?.append(`${fanOutLog(controller)}: ${describeHostError(err)}`);
+        // WS-R3 F2-19b: `safeLog`, not a raw `port.logger?.append` — this
+        // fan-out sits directly on the `handleAcpCrash -> teardownForRespawn
+        // -> scheduleAcpRespawn` critical path; an unguarded throwing logger
+        // here would abort this loop before `this.acpState = 'respawning'`
+        // below and before `handleAcpCrash` ever reaches its
+        // `scheduleAcpRespawn()` call, zombie-ing the connection.
+        this.safeLog(`${fanOutLog(controller)}: ${describeHostError(err)}`);
       }
     }
     this.client?.dispose();
@@ -1079,9 +1113,11 @@ export class ConnectionSupervisor {
     this.clientExitSub?.dispose();
     this.clientExitSub = undefined;
     if (this.acpState === 'disposed') return;
-    this.port.logger?.append(
-      `[AcpBackend] hermes acp exited unexpectedly (code ${code}); scheduling respawn`,
-    );
+    // WS-R3 F2-19b (mirrors ControlChannel.handleCrash's own log() guard):
+    // this banner log runs BEFORE teardownForRespawn/scheduleAcpRespawn
+    // below — an unguarded throwing logger must not be able to abort this
+    // method before the respawn is actually scheduled.
+    this.safeLog(`[AcpBackend] hermes acp exited unexpectedly (code ${code}); scheduling respawn`);
     if (this.acpState !== 'respawning') {
       // W4 §7 B1: connection-global — hits every open tab, so it rides
       // `system.error` (no sessionId), never a session-scoped `error` that
@@ -1163,18 +1199,31 @@ export class ConnectionSupervisor {
 
   /** Mirrors ControlChannel.scheduleRespawn/attemptRespawn: retry
    * start() forever on the shared respawnBackoffMs schedule; a failed attempt
-   * reschedules, a successful one resets the counter (inside start()). */
+   * reschedules, a successful one resets the counter (inside start()).
+   *
+   * WS-R3 F2-19b (mirrors ControlChannel's own F2-19a hardening,
+   * concurrency review Minor-1/Minor-2): the next backoff is armed BEFORE
+   * `emitHealth` runs — not after. `emitHealth` fans out to arbitrary
+   * subscriber callbacks synchronously; arming first means this attempt's
+   * timer is already committed before any of that untrusted code runs, so
+   * nothing in the emit path (a throw that somehow escapes `emitHealth`'s
+   * own defensive wrapper, or a reentrant subscriber) can prevent — or
+   * race — the next attempt from being scheduled. */
   private scheduleAcpRespawn(): void {
     if (this.acpState === 'disposed') return;
     const attempt = ++this.acpRespawnAttempts;
     const delayMs = respawnBackoffMs(attempt);
-    this.port.logger?.append(`[AcpBackend] ACP respawn attempt ${attempt} in ${delayMs}ms`);
+    // WS-R3 F2-19b: guarded — see `safeLog`'s own doc. This log runs BEFORE
+    // the timer below is armed; an unguarded throw here would silently
+    // abort the whole respawn schedule.
+    this.safeLog(`[AcpBackend] ACP respawn attempt ${attempt} in ${delayMs}ms`);
     this.acpRespawnTimer = setTimeout(() => {
       this.acpRespawnTimer = undefined;
       void this.start().catch((err) => {
-        this.port.logger?.append(
-          `[AcpBackend] ACP respawn attempt ${attempt} failed: ${describeHostError(err)}`,
-        );
+        // WS-R3 F2-19b: guarded — this failure log runs BEFORE the
+        // reschedule call below; an unguarded throw here would silently
+        // drop the outage instead of retrying it.
+        this.safeLog(`[AcpBackend] ACP respawn attempt ${attempt} failed: ${describeHostError(err)}`);
         if ((this.acpState as string) !== 'disposed') {
           this.acpState = 'respawning'; // stay in-outage: no second UI signal
           this.scheduleAcpRespawn();
@@ -1182,12 +1231,66 @@ export class ConnectionSupervisor {
       });
     }, delayMs);
     this.acpRespawnTimer.unref?.();
+    this.emitHealth(attempt);
   }
 
   private clearAcpRespawnTimer(): void {
     if (this.acpRespawnTimer) {
       clearTimeout(this.acpRespawnTimer);
       this.acpRespawnTimer = undefined;
+    }
+  }
+
+  /**
+   * WS-R3 F2-19b: emit an `onHealth` transition for the CURRENT attempt
+   * count. Mirrors ControlChannel.emitHealth exactly (F2-19a concurrency
+   * review Minor-1): the WHOLE body is wrapped defensively. Without it, a
+   * pathological failure INSIDE the per-handler catch below (the logger
+   * itself throwing, or `String(err)` throwing on an exotic error) would
+   * escape `emitHealth` entirely. Both call sites — `scheduleAcpRespawn`
+   * (after arming the next backoff, see its own ordering note) and
+   * `startInternal`'s success path (its very last step) — sit on the
+   * respawn loop's critical path, so an escaping throw here must never be
+   * possible: the self-heal loop's "always another attempt" invariant
+   * cannot depend on a subscriber or a logger behaving.
+   */
+  private emitHealth(attempts: number): void {
+    try {
+      const state = respawnHealthForAttempt(attempts);
+      if (state === this.lastHealthState) return;
+      this.lastHealthState = state;
+      for (const handler of [...this.healthHandlers]) {
+        try {
+          handler({ state, attempts });
+        } catch (err) {
+          this.safeLog(`[AcpBackend] health handler threw: ${String(err)}`);
+        }
+      }
+    } catch {
+      // Swallow: see the doc comment above. Nothing productive can be done
+      // with a failure of the failure-reporting path itself, and this
+      // function must never be the reason the next backoff isn't armed.
+    }
+  }
+
+  /**
+   * WS-R3 F2-19b (mirrors ControlChannel.log()'s own guard, concurrency
+   * re-review IMPORTANT-1): every `port.logger?.append` call on the
+   * crash/respawn/arm critical path — `handleAcpCrash`'s banner,
+   * `teardownForRespawn`'s per-controller fan-out, `scheduleAcpRespawn`'s
+   * own log, and the retry-failure log inside its timeout callback — routes
+   * through here instead of calling `port.logger?.append` directly. An
+   * unguarded call (e.g. a bad/disposed `vscode.OutputChannel` on Fedora)
+   * would otherwise escape and abort whichever caller invoked it before it
+   * reaches the next scheduling step — leaving the connection a zombie that
+   * never respawns: exactly the F2-19 silent fail-stop this class exists to
+   * prevent. A logging failure must never affect control flow.
+   */
+  private safeLog(message: string): void {
+    try {
+      this.port.logger?.append(message);
+    } catch {
+      // Swallow: a logging failure must never affect control flow.
     }
   }
 
@@ -1201,10 +1304,16 @@ export class ConnectionSupervisor {
    * {@link teardownSession} several statements later (AFTER
    * `rootRegistry.disposeAll()`) — that ordering is NOT bundled here, since
    * it is not adjacent in the original.
+   *
+   * WS-R3 F2-19b: also clears `healthHandlers` — mirrors
+   * `ControlChannel.dispose()`'s own `eventHandlers.clear()`/
+   * `healthHandlers.clear()` pair. Same synchronous, no-`await`-between
+   * reasoning applies.
    */
   markDisposed(): void {
     this.acpState = 'disposed';
     this.clearAcpRespawnTimer();
+    this.healthHandlers.clear();
   }
 }
 

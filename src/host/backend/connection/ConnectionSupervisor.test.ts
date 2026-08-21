@@ -25,6 +25,8 @@ import type { SessionController } from '../session/SessionController';
 import type { SessionHostPort } from '../session/types';
 import type { HostToWebviewMessage } from '../../../shared/protocol';
 import { must } from '../../../testing/must';
+import { respawnBackoffMs } from '../../control/respawnBackoff';
+import type { RespawnHealth } from '../../control/respawnHealth';
 
 export function deferred<T>(): {
   promise: Promise<T>;
@@ -530,5 +532,143 @@ describe('WS-R3 F3-4 (reconnect half) — wedge-break clause', () => {
       ok: false,
       reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
     });
+  });
+});
+
+describe('WS-R3 F2-19 — supervisor respawn loop health transitions', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('degraded at attempt 5, down at 10, ok on a successful respawn — transition-only', async () => {
+    let failRespawns = true;
+    const h = makeSupervisorHarness();
+    // Every client AFTER the boot one refuses to connect while failRespawns is on.
+    const originalCreate = h.port.createClient;
+    (h.port as { createClient: typeof originalCreate }).createClient = (options) => {
+      const c = originalCreate(options);
+      if (h.clients.length > 1 && failRespawns) {
+        must(h.clients[h.clients.length - 1]).connectError = new Error('spawn refused');
+      }
+      return c;
+    };
+    const health: RespawnHealth[] = [];
+    h.supervisor.onHealth((x) => health.push(x));
+    await h.supervisor.start();
+    must(h.clients[0]).simulateExit(1); // crash → attempt 1
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      await vi.advanceTimersByTimeAsync(respawnBackoffMs(attempt));
+      await vi.advanceTimersByTimeAsync(1); // let the failed start() settle + reschedule
+    }
+    expect(health).toEqual([
+      { state: 'degraded', attempts: 5 },
+      { state: 'down', attempts: 10 },
+    ]);
+    failRespawns = false;
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(11));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(health[health.length - 1]).toEqual({ state: 'ok', attempts: 0 });
+    expect(health).toHaveLength(3);
+  });
+
+  /**
+   * F2-19b self-heal hardening (mirrors Task 17's ControlChannel review
+   * findings): a throwing `onHealth` subscriber must never be able to
+   * silently kill `scheduleAcpRespawn`'s loop — the exact opposite of what
+   * F2-19 exists to prevent. The throwing subscriber is registered FIRST so
+   * a naive (unguarded) fan-out would abort before the sibling subscriber
+   * below ever runs; both the sibling's full transition sequence AND the
+   * loop's continued arming past the throw are asserted.
+   */
+  it('a throwing health subscriber at the down transition does not stop the loop from arming the next attempt (F2-19 never-terminal invariant)', async () => {
+    let failRespawns = true;
+    const h = makeSupervisorHarness();
+    const originalCreate = h.port.createClient;
+    (h.port as { createClient: typeof originalCreate }).createClient = (options) => {
+      const c = originalCreate(options);
+      if (h.clients.length > 1 && failRespawns) {
+        must(h.clients[h.clients.length - 1]).connectError = new Error('spawn refused');
+      }
+      return c;
+    };
+    const seen: RespawnHealth[] = [];
+    h.supervisor.onHealth((x) => {
+      if (x.state === 'down') throw new Error('subscriber boom at down');
+    });
+    h.supervisor.onHealth((x) => seen.push(x));
+    await h.supervisor.start();
+    must(h.clients[0]).simulateExit(1); // crash → attempt 1
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      await vi.advanceTimersByTimeAsync(respawnBackoffMs(attempt));
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    // The sibling subscriber still saw BOTH transitions — the throw at
+    // 'down' did not abort emitHealth's fan-out for the handlers after it.
+    expect(seen).toEqual([
+      { state: 'degraded', attempts: 5 },
+      { state: 'down', attempts: 10 },
+    ]);
+
+    // The throw at the 'down' transition must not have prevented attempt
+    // 11's backoff from being armed — the loop keeps retrying forever
+    // (F2-19's never-terminal invariant), same guarantee the crash loop
+    // itself already provides.
+    failRespawns = false;
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(11));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.clients.length).toBeGreaterThanOrEqual(12); // attempt 11 actually spawned
+    expect(h.supervisor.getClient()).toBeDefined(); // …and the connection healed
+  });
+
+  /**
+   * F2-19b self-heal hardening, logger half: mirrors ControlChannel's own
+   * "guarded against a throwing logger" suite. `port.logger.append` sits on
+   * the crash/respawn/arm critical path at three call sites
+   * (`handleAcpCrash`'s banner, `scheduleAcpRespawn`'s own log, and the
+   * retry-failure log inside the timeout callback) plus `teardownForRespawn`'s
+   * per-controller fan-out log — an always-throwing logger (a bad/disposed
+   * `vscode.OutputChannel`) must not be able to silently zombie the loop at
+   * any of them.
+   */
+  it('a logger whose append() always throws does not silently kill the self-heal loop across repeated crash/respawn cycles', async () => {
+    let failOnce = true;
+    const h = makeSupervisorHarness();
+    const originalCreate = h.port.createClient;
+    (h.port as { createClient: typeof originalCreate }).createClient = (options) => {
+      const c = originalCreate(options);
+      if (h.clients.length > 1 && failOnce) {
+        must(h.clients[h.clients.length - 1]).connectError = new Error('spawn refused');
+        failOnce = false; // only attempt 1 fails — attempt 2 must reach 'ready'
+      }
+      return c;
+    };
+    (h.port as { logger: typeof h.port.logger }).logger = {
+      append: () => {
+        throw new Error('logger boom (disposed OutputChannel)');
+      },
+    };
+    await h.supervisor.start();
+
+    // Crash: handleAcpCrash() calls the (throwing) banner log BEFORE
+    // teardownForRespawn/scheduleAcpRespawn run. Pre-fix, an unguarded
+    // `logger.append` throw escapes handleAcpCrash entirely — synchronously,
+    // right out through this simulateExit() call — leaving the supervisor a
+    // zombie that never respawns.
+    expect(() => must(h.clients[0]).simulateExit(1)).not.toThrow();
+
+    // Attempt 1's backoff must have been armed despite the throw above —
+    // scheduleAcpRespawn's OWN log call is a 2nd unguarded site on this path.
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1));
+    expect(h.clients).toHaveLength(2); // respawn actually spawned — loop alive
+
+    // Attempt 1 fails (connectError above) — its catch handler's own
+    // (throwing) failure log must not prevent scheduling attempt 2.
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(2));
+    expect(h.clients).toHaveLength(3); // attempt 2 actually spawned
+
+    // Full self-heal: attempt 2 has no connectError — the loop can still
+    // reach 'ready' again despite every logger.append() call throwing.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.supervisor.getClient()).toBeDefined();
   });
 });
