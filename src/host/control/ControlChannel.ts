@@ -4,6 +4,8 @@ import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
 import { resolveHermes } from '../runtime/resolveHermes';
 import { parseGatewayEvent, isGatewayReady } from './eventDemux';
 import { respawnBackoffMs } from './respawnBackoff';
+import { respawnHealthForAttempt } from './respawnHealth';
+import type { RespawnHealth, RespawnHealthState } from './respawnHealth';
 
 /**
  * The Hermes **control plane** (spec §4).
@@ -82,6 +84,10 @@ export class ControlChannel {
 
   private readonly eventHandlers = new Set<(type: string, payload: unknown) => void>();
 
+  /** WS-R3 F2-19: health-transition subscribers (the future gateway.health source). */
+  private readonly healthHandlers = new Set<(health: RespawnHealth) => void>();
+  private lastHealthState: RespawnHealthState = 'ok';
+
   private state: ControlChannelState = 'idle';
   /** The in-flight promise for "next time we reach `ready`", shared by an
    * explicit {@link start} call and internal respawn attempts so concurrent
@@ -155,6 +161,35 @@ export class ControlChannel {
     };
   }
 
+  /**
+   * WS-R3 F2-19: subscribe to respawn-health TRANSITIONS ('ok' → 'degraded'
+   * at 5 failed attempts → 'down' at 10 → back to 'ok' on a successful
+   * handshake). Transition-only — never one event per attempt. The loop
+   * itself keeps its backoff schedule forever (fail-visible, never
+   * fail-stopped). Channel-scoped like onEvent — survives respawns.
+   */
+  onHealth(handler: (health: RespawnHealth) => void): { dispose(): void } {
+    this.healthHandlers.add(handler);
+    return {
+      dispose: () => {
+        this.healthHandlers.delete(handler);
+      },
+    };
+  }
+
+  private emitHealth(attempts: number): void {
+    const state = respawnHealthForAttempt(attempts);
+    if (state === this.lastHealthState) return;
+    this.lastHealthState = state;
+    for (const handler of [...this.healthHandlers]) {
+      try {
+        handler({ state, attempts });
+      } catch (err) {
+        this.log(`health handler threw: ${String(err)}`);
+      }
+    }
+  }
+
   dispose(): void {
     this.state = 'disposed';
     this.clearRespawnTimer();
@@ -165,6 +200,7 @@ export class ControlChannel {
     this.transport?.dispose();
     this.transport = undefined;
     this.eventHandlers.clear();
+    this.healthHandlers.clear();
   }
 
   // --- internals --------------------------------------------------------
@@ -227,6 +263,7 @@ export class ControlChannel {
     this.transportExitSub = transport.onExit((code) => this.handleCrash(code));
     this.respawnAttempts = 0;
     this.state = 'ready';
+    this.emitHealth(0);
   }
 
   /** Race the `gateway.ready` event against a timeout and an early child exit. */
@@ -313,6 +350,7 @@ export class ControlChannel {
   private scheduleRespawn(): void {
     if (this.state === 'disposed') return;
     const attempt = ++this.respawnAttempts;
+    this.emitHealth(attempt);
     const delayMs = respawnBackoffMs(attempt);
     this.log(`respawn attempt ${attempt} in ${delayMs}ms`);
     this.respawnTimer = setTimeout(() => {

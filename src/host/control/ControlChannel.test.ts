@@ -4,6 +4,8 @@ import type { ControlTransport, ControlTransportFactory } from './ControlChannel
 import type { JsonRpcStdioOptions } from '../transport/JsonRpcStdio';
 import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
 import { must } from '../../testing/must';
+import { respawnBackoffMs } from './respawnBackoff';
+import type { RespawnHealth } from './respawnHealth';
 
 /**
  * Fake {@link ControlTransport} the tests drive by hand — no child process,
@@ -524,5 +526,64 @@ describe('ControlChannel respawn/dispose races (CF-01 / L6 I-4, I-5)', () => {
     await expect(startPromise).rejects.toThrow(/disposed/i);
     expect(transports).toHaveLength(0); // no transport spawned for a disposed channel
     await expect(channel.dispatch('tools.list')).rejects.toThrow(/disposed/i);
+  });
+});
+
+describe('WS-R3 F2-19 — ControlChannel.onHealth transitions', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  /** Drive one FAILED respawn attempt: backoff fires, spawn resolves, the
+   * 15s ready-handshake times out, the failure schedules the next attempt. */
+  async function failOneAttempt(attempt: number): Promise<void> {
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(attempt)); // backoff → attemptRespawn → spawn
+    await vi.advanceTimersByTimeAsync(15_000); // READY_TIMEOUT_MS — handshake fails
+  }
+
+  it('degraded at attempt 5, down at attempt 10 — transition-only; ok on recovery', async () => {
+    const { factory, transports } = makeFactory();
+    const channel = new ControlChannel(CONFIG, undefined, factory);
+    const health: RespawnHealth[] = [];
+    channel.onHealth((h) => health.push(h));
+
+    const start = channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    must(transports[0]).emit('event', GATEWAY_READY); // healthy boot
+    await start;
+
+    must(transports[0]).exit(1); // crash → attempt 1 scheduled
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      await failOneAttempt(attempt);
+    }
+    expect(health).toEqual([
+      { state: 'degraded', attempts: 5 },
+      { state: 'down', attempts: 10 },
+    ]);
+
+    // Recovery: the NEXT scheduled attempt gets a ready handshake.
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(11));
+    must(transports[transports.length - 1]).emit('event', GATEWAY_READY);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(health[health.length - 1]).toEqual({ state: 'ok', attempts: 0 });
+    expect(health).toHaveLength(3); // strictly transition-only
+  });
+
+  it('a throwing health subscriber never breaks the loop or its siblings', async () => {
+    const { factory, transports } = makeFactory();
+    const channel = new ControlChannel(CONFIG, undefined, factory);
+    const seen: RespawnHealth[] = [];
+    channel.onHealth(() => {
+      throw new Error('subscriber boom');
+    });
+    channel.onHealth((h) => seen.push(h));
+    const start = channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    must(transports[0]).emit('event', GATEWAY_READY);
+    await start;
+    must(transports[0]).exit(1);
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await failOneAttempt(attempt);
+    }
+    expect(seen).toEqual([{ state: 'degraded', attempts: 5 }]);
   });
 });
