@@ -999,6 +999,47 @@ export class ConnectionSupervisor {
   }
 
   /**
+   * WS-R3 (FUNC-RECONNECT-DRIFT, §3.3): the ONE shared outage teardown both
+   * handleAcpCrash and reconnect() previously hand-copied ("verbatim order"
+   * — the highest-drift-risk duplication in this concurrency zone). Body
+   * order is the crash path's proven sequence, unchanged:
+   *  1. exit-sub dispose — UNCONDITIONAL FIRST statement (idempotent:
+   *     ?.dispose() + set-undefined) so the child's exit can never ALSO
+   *     schedule a crash respawn mid-teardown (double-start);
+   *  2. pendingRecovery snapshot (pendingClose-tombstoned sessions excluded);
+   *  3. settleOneShot(settleReason) — each caller's reason string preserved;
+   *  4. guarded per-controller endOnCrash fan-out — a throwing controller
+   *     never aborts the loop; `fanOutLog` is PER-CALLER because the two
+   *     callers' log lines genuinely differ (crash carries the "(tab '…')"
+   *     segment, reconnect does not — both pinned observables); the body
+   *     appends ": <describeHostError(err)>";
+   *  5. client dispose + null (arch-A2), acpState = 'respawning'.
+   * Drift is dead by construction — one body (ADR-R3).
+   */
+  private teardownForRespawn(settleReason: string, fanOutLog: (controller: SessionController) => string): void {
+    this.clientExitSub?.dispose();
+    this.clientExitSub = undefined;
+    this.pendingRecovery = [...this.port.sessions.values()]
+      .filter((controller) => !this.port.isPendingClose(controller.sessionId))
+      .map((controller) => ({
+        sessionId: controller.sessionId,
+        cwd: controller.cwd,
+        tabId: controller.tabId,
+      }));
+    this.port.settleOneShot(settleReason);
+    for (const controller of this.port.sessions.values()) {
+      try {
+        controller.endOnCrash();
+      } catch (err) {
+        this.port.logger?.append(`${fanOutLog(controller)}: ${describeHostError(err)}`);
+      }
+    }
+    this.client?.dispose();
+    this.client = undefined;
+    this.acpState = 'respawning';
+  }
+
+  /**
    * R-A6: the ACP child died after a successful session establishment.
    * Mirrors ControlChannel.handleCrash: detach, mark respawning, schedule a
    * backoff retry. Emits ONE user-visible signal per outage.
@@ -1041,47 +1082,11 @@ export class ConnectionSupervisor {
       // drop-unknown would eat the moment that one tab closes.
       this.port.emit({ type: 'system.error', message: 'The agent exited unexpectedly — reconnecting…' });
     }
-    // W4-T5a (Q-10): snapshot every registered session's identity BEFORE the
-    // per-controller fan-out / the coming respawn's teardownSession() clears
-    // the registry — endOnCrash() never mutates sessionId/cwd/tabId, so
-    // capturing here (vs. after the loop) makes no functional difference,
-    // but doing it FIRST keeps the recovery worklist visibly independent of
-    // whatever endOnCrash does to each controller's turn/replay state.
-    this.pendingRecovery = [...this.port.sessions.values()]
-      .filter((controller) => !this.port.isPendingClose(controller.sessionId))
-      .map((controller) => ({
-        sessionId: controller.sessionId,
-        cwd: controller.cwd,
-        tabId: controller.tabId,
-      }));
-    // §2c req 5: settle any in-flight one-shot on this SAME child crash —
-    // independent of (and before) the per-controller handling below.
-    // W6-FI-a: delegates to `OneShotRunner` via the port.
-    this.port.settleOneShot('ACP connection lost');
-    // CF-01/A fix wave (arch Important, secondary robustness fix): guarded
-    // per-controller, mirroring `recoverSessions`'s EXISTING per-attempt
-    // try/catch (`:533-546`) — defensive-only (`SessionController.endOnCrash`
-    // never throws today, pure turn/state bookkeeping + event emission), but
-    // an unguarded abort here would skip BOTH the remaining controllers'
-    // crash-end AND the trailing `this.client?.dispose()` below, which is
-    // what clears `this.connection` (via `AcpClient.dispose()`) and is now
-    // the ONLY thing standing between a stale post-terminate client
-    // reference and a hang if `terminate()` itself somehow didn't already
-    // self-clear it — see `acpClient.ts`'s `terminate` closure doc.
-    for (const controller of this.port.sessions.values()) {
-      try {
-        controller.endOnCrash();
-      } catch (err) {
-        this.port.logger?.append(
-          `[AcpBackend] crash fan-out: endOnCrash failed for session '${controller.sessionId}' (tab '${controller.tabId}'), continuing: ${describeHostError(err)}`,
-        );
-      }
-    }
-    // arch-A2: null the dead client so sendPrompt/loadSession's admission
-    // guards refuse honestly ("not started yet") during the backoff window.
-    this.client?.dispose();
-    this.client = undefined;
-    this.acpState = 'respawning';
+    this.teardownForRespawn(
+      'ACP connection lost',
+      (controller) =>
+        `[AcpBackend] crash fan-out: endOnCrash failed for session '${controller.sessionId}' (tab '${controller.tabId}'), continuing`,
+    );
     this.scheduleAcpRespawn();
   }
 
@@ -1123,26 +1128,11 @@ export class ConnectionSupervisor {
           };
         }
       }
-      // handleAcpCrash's teardown, verbatim order — exit-sub FIRST so the
-      // child's exit cannot ALSO schedule a crash respawn (double-start).
-      this.clientExitSub?.dispose();
-      this.clientExitSub = undefined;
-      this.pendingRecovery = [...this.port.sessions.values()]
-        .filter((c) => !this.port.isPendingClose(c.sessionId))
-        .map((c) => ({ sessionId: c.sessionId, cwd: c.cwd, tabId: c.tabId }));
-      this.port.settleOneShot('agent reconnecting');
-      for (const controller of this.port.sessions.values()) {
-        try {
-          controller.endOnCrash();
-        } catch (err) {
-          this.port.logger?.append(
-            `[AcpBackend] reconnect fan-out: endOnCrash failed for session '${controller.sessionId}', continuing: ${describeHostError(err)}`,
-          );
-        }
-      }
-      this.client?.dispose();
-      this.client = undefined;
-      this.acpState = 'respawning';
+      this.teardownForRespawn(
+        'agent reconnecting',
+        (controller) =>
+          `[AcpBackend] reconnect fan-out: endOnCrash failed for session '${controller.sessionId}', continuing`,
+      );
       try {
         await this.startInternal();
         return { ok: true as const };
