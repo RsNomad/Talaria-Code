@@ -3304,6 +3304,44 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
 });
 
 /**
+ * WS-R3 F3-2: `establishInitialSession`'s recovery arm used to emit
+ * `system.recovered` UNCONDITIONALLY once `recoverSessions` settled, while
+ * its sibling `system.error` emit (the deadline/exit branch a few lines
+ * below) guards on `this.acpState !== 'respawning'`. `handleAcpCrash` flips
+ * `acpState` to `'respawning'` SYNCHRONOUSLY on the child's `exit` event
+ * (the last act of `teardownForRespawn`) — so a SECOND crash landing while
+ * `recoverSessions` is still awaiting a hung `loadSession` flips the state
+ * before that await ever settles (the raced `loadReplay` resolves
+ * `undefined` via the same exit, one tick later). The unconditional emit
+ * then wrongly retired the outage banner the 2nd crash had just raised.
+ */
+describe('WS-R3 F3-2 — a 2nd crash mid-recovery must not retire the fresh outage banner', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('system.recovered is suppressed when acpState flipped back to respawning during recoverSessions', async () => {
+    const { backend, clients } = makeStartableBackend(undefined, (client, index) => {
+      if (index === 1) client.hangLoadSession(); // 1st respawn: recovery hangs, we crash it mid-flight
+    });
+    await backend.start();
+    // Registered AFTER the bootstrap settles (mirrors the sibling recovery
+    // tests above, e.g. WS-R1 F2-03) — the fresh bootstrap ALSO emits its
+    // own system.recovered (T5 fold, the non-recovery branch), which is not
+    // what this test is about; only the crash-recovery leg's messages matter.
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    must(clients[0]).simulateExit(1); // crash #1
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1)); // respawn #1; recovery hung on session/load
+    must(clients[1]).simulateExit(1); // crash #2 MID-RECOVERY: the raced load settles undefined via the exit
+    await vi.advanceTimersByTimeAsync(1); // let recoverSessions drain + establishInitialSession return
+    expect(messages.filter((m) => m.type === 'system.recovered')).toHaveLength(0); // the pinned suppression
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(2)); // respawn #2 — clients[2] loads fine
+    await vi.advanceTimersByTimeAsync(1);
+    expect(messages.filter((m) => m.type === 'system.recovered')).toHaveLength(1); // the genuine retirement
+  });
+});
+
+/**
  * T-1 (V-12 RESTART-STATE): today, an EXPLICIT restart (`talaria.newSession` /
  * the trust-upgrade `setBackend` swap → `AcpBackend.start()` a second time)
  * reaches `ConnectionSupervisor.startInternal` → `teardownSession()` →

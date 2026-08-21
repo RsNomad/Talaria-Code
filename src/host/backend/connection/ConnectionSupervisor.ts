@@ -521,7 +521,13 @@ export class ConnectionSupervisor {
       // `tab.error{kind:'session-lost'}`, honestly per-tab per T3). This is a
       // terminal-transition push, not a per-retry-attempt re-emission: it
       // fires exactly once, here, after `recoverSessions` genuinely settles.
-      this.port.emit({ type: 'system.recovered' });
+      //
+      // WS-R3 F3-2: guarded on acpState — mirrors the sibling system.error
+      // guard at :565; a crash during recoverSessions has already flipped
+      // state via handleAcpCrash, which runs synchronously on exit.
+      if (this.acpState !== 'respawning') {
+        this.port.emit({ type: 'system.recovered' });
+      }
       return;
     }
 
