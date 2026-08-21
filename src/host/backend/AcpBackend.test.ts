@@ -2417,6 +2417,70 @@ describe('AcpBackend.openTab/closeTab — W4-T3b (§2d/§2e Deliverable 5): the 
   });
 });
 
+describe('WS-R1 F3-1 — openTab mint is raced (deadline + exit)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('a hung session/new times out: tab.error{open-failed} lands and the topology tail is RELEASED', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start(); // boot mint = newSessionCalls[0]
+    const client = must(clients[0]);
+    client.hangNewSession(); // EVERY later newSession hangs (the fake's flag is sticky)
+
+    const first = backend.openTab('tab-2'); // newSessionCalls[1] — hung
+    await vi.advanceTimersByTimeAsync(120_000);
+    await first;
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: 'tab-2', kind: 'open-failed' }),
+    );
+
+    // The tail is free: a SECOND openTab's body runs (its newSession is
+    // reached) instead of queueing forever behind the hung first mint.
+    const second = backend.openTab('tab-3');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.newSessionCalls).toHaveLength(3); // boot + tab-2 + tab-3
+    await vi.advanceTimersByTimeAsync(120_000); // let the second mint time out too — no dangling await
+    await second;
+  });
+
+  it('child exit during a tab mint lands the same open-failed terminal without waiting 120s', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.hangNewSession();
+    const open = backend.openTab('tab-2');
+    await vi.advanceTimersByTimeAsync(0);
+    client.simulateExit(1);
+    await vi.advanceTimersByTimeAsync(0);
+    await open;
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: 'tab-2', kind: 'open-failed' }),
+    );
+  });
+
+  it('belated session/new after the deadline: orphaned session closed, NO tab.bound announced', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.delayNewSession(); // NEXT newSession returns a controllable deferred
+    const open = backend.openTab('tab-2');
+    await vi.advanceTimersByTimeAsync(120_000); // give up
+    await open;
+    messages.length = 0;
+    client.resolveDelayedNewSession('session-belated'); // the belated resolution
+    await vi.advanceTimersByTimeAsync(0);
+    // openSession's isStaleAttempt guard (:900-924): close, never bind.
+    expect(client.closeSessionCalls).toContain('session-belated');
+    expect(messages.filter((m) => m.type === 'tab.bound')).toHaveLength(0);
+  });
+});
+
 /**
  * CF-01/L3-1 fix (Important — 3-lens review): `closeTab` DEFERS the actual
  * registry removal onto the topology tail (see that method's own doc) —

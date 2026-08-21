@@ -985,8 +985,30 @@ export class AcpBackend implements AgentBackend {
       return;
     }
     const cwd = this.cwd ?? this.workspaceRoots()[0] ?? '';
+    // WS-R1 F3-1: the user-tab mint gets the SAME deadline + exit race the
+    // bootstrap twin (establishInitialSession) has — un-raced, a hung-but-
+    // alive child wedged this tail link (and therefore EVERY later
+    // openTab/closeTab/load/start) forever. Belated-resolution cleanup is
+    // caller-owned via openSession's existing isStaleAttempt guard
+    // (:900-924): the abandoned mint closes its own orphaned session and
+    // never announces tab.bound. A genuine newSession rejection passes
+    // through settleRace and keeps the existing describeHostError terminal.
+    let attemptAbandoned = false;
     try {
-      await this.openSession(cwd, tabId);
+      const open = this.openSession(cwd, tabId, () => attemptAbandoned);
+      const outcome = await settleRace(open, { exit: client, deadline: SESSION_ESTABLISH_DEADLINE_MS });
+      attemptAbandoned = true;
+      if (outcome.kind !== 'value') {
+        this.emitter.fire({
+          type: 'tab.error',
+          tabId,
+          kind: 'open-failed',
+          message:
+            outcome.kind === 'exit'
+              ? 'The agent exited while opening this tab.'
+              : 'The agent did not respond while opening this tab — try again.',
+        });
+      }
     } catch (err) {
       this.emitter.fire({ type: 'tab.error', tabId, kind: 'open-failed', message: describeHostError(err) });
     }
