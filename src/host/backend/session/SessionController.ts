@@ -89,6 +89,17 @@ import { extractPreviewFiles } from '../../preview/extractPreviewFiles';
  * are therefore plain mutable fields, reassigned only by {@link loadReplay}.
  * T3 replaces this approximation with a REAL per-tab controller mint.
  */
+
+export type LoadReplayOutcome =
+  | { kind: 'loaded'; result: AcpLoadSessionResult }
+  | { kind: 'no-client' }
+  | { kind: 'load-failed'; message: string }
+  | { kind: 'not-found' }
+  /** Empty for the :1203/:1226/:1269 supersede arms; carries the real result
+   *  for :1240's success-but-superseded arm — callers today treat that one
+   *  as SUCCESS, and the adapter preserves exactly that. */
+  | { kind: 'superseded'; result?: AcpLoadSessionResult };
+
 export class SessionController {
   sessionId: string;
   cwd: string;
@@ -1217,6 +1228,11 @@ export class SessionController {
    * `session/load` call itself uses (mirrors today's exact asymmetry:
    * `client.loadSession(cwd, ...)` used the raw param while internal state
    * adopted the confined `adoptedCwd`).
+   *
+   * WS-R4: thin legacy adapter over loadReplayOutcome — 'loaded' → result;
+   * 'superseded' WITH a result payload (the :1240 arm) → that result
+   * (today's silent success, pinned); every other kind → undefined.
+   * Deleted once both callers migrate (Tasks 21-22).
    */
   async loadReplay(
     rawCwd: string,
@@ -1224,8 +1240,20 @@ export class SessionController {
     adoptedCwd: string,
     mcpServers: AcpMcpServer[],
   ): Promise<AcpLoadSessionResult | undefined> {
+    const outcome = await this.loadReplayOutcome(rawCwd, sessionId, adoptedCwd, mcpServers);
+    if (outcome.kind === 'loaded') return outcome.result;
+    if (outcome.kind === 'superseded') return outcome.result;
+    return undefined;
+  }
+
+  async loadReplayOutcome(
+    rawCwd: string,
+    sessionId: string,
+    adoptedCwd: string,
+    mcpServers: AcpMcpServer[],
+  ): Promise<LoadReplayOutcome> {
     const client = this.port.getClient();
-    if (!client) return undefined;
+    if (!client) return { kind: 'no-client' };
 
     if (this.sessionId !== sessionId) this.lastCommands = undefined;
     this.sessionId = sessionId;
@@ -1261,13 +1289,13 @@ export class SessionController {
     try {
       result = await client.loadSession(rawCwd, sessionId, mcpServers);
     } catch (err) {
-      if (this.replay !== replay) return undefined;
+      if (this.replay !== replay) return { kind: 'superseded' };
       this.subagents.setReplaying(false);
       this.replay = undefined;
       this.port.emit({ type: 'error', sessionId, message: errorMessage(err), turnId: replay.currentTurnId });
       this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
       this.markSubagentsInterrupted();
-      return undefined;
+      return { kind: 'load-failed', message: errorMessage(err) };
     }
 
     // Audit A-3: `found: false` means Hermes had no session under this id
@@ -1284,7 +1312,7 @@ export class SessionController {
     // crash recovery) the `error` emitted here is the user-visible signal,
     // since that tab is already bound.
     if (!result.found) {
-      if (this.replay !== replay) return undefined; // superseded while awaiting
+      if (this.replay !== replay) return { kind: 'superseded' }; // superseded while awaiting
       this.subagents.setReplaying(false);
       this.replay = undefined;
       this.port.emit({
@@ -1295,10 +1323,10 @@ export class SessionController {
       });
       this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
       this.markSubagentsInterrupted();
-      return undefined;
+      return { kind: 'not-found' };
     }
 
-    if (this.replay !== replay) return result; // superseded while awaiting
+    if (this.replay !== replay) return { kind: 'superseded', result }; // superseded while awaiting
     this.subagents.setReplaying(false);
     this.replay = undefined;
     for (const message of replay.finish()) this.port.emit(message);
@@ -1327,13 +1355,13 @@ export class SessionController {
     // past this point (subagents mutation, `commands.available`, the
     // closing `turn.end`) belongs to a turn that no longer exists from the
     // webview's perspective and must not fire.
-    if (this.replay !== undefined || this.disposed) return;
+    if (this.replay !== undefined || this.disposed) return { kind: 'superseded' };
     this.markSubagentsInterrupted();
     if (this.lastCommands) {
       this.port.emit({ type: 'commands.available', sessionId, commands: this.lastCommands });
     }
     this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'complete' });
-    return result;
+    return { kind: 'loaded', result };
   }
 
   // --- crash / dispose ----------------------------------------------------
