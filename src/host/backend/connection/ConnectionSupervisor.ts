@@ -44,6 +44,16 @@ const CONNECT_PHASE_DEADLINE_MS = 30_000;
  */
 export const SESSION_ESTABLISH_DEADLINE_MS = 120_000;
 
+/**
+ * WS-R1 F2-03: per-session increment on the OVERALL crash-recovery budget.
+ * Recovery of N sessions is bounded by SESSION_ESTABLISH_DEADLINE_MS +
+ * N × this — the first wedged session may burn the full establish deadline,
+ * later ones only ever the shrinking remainder, and sessions past the
+ * budget are marked session-lost WITHOUT an attempt (never their own full
+ * serial 120s slot). Proposed default; tunable on Fedora live-QA.
+ */
+const RECOVERY_PER_SESSION_INCREMENT_MS = 10_000;
+
 /** Outcome of {@link ConnectionSupervisor.raceConnectPhase}'s internal race. */
 type ConnectPhaseOutcome = { kind: 'connected' } | { kind: 'deadline' } | { kind: 'exit'; code: number | null };
 
@@ -676,13 +686,44 @@ export class ConnectionSupervisor {
    * 'respawning')` guard, unaffected here) — `system.recovered` fires
    * exactly once per successful `establishInitialSession`, never per
    * attempt.
+   *
+   * WS-R1 F2-03: this loop previously gave EVERY session its own full
+   * `SESSION_ESTABLISH_DEADLINE_MS` (120s) — N crash-snapshotted sessions
+   * that all hang could therefore wedge this whole tail for up to N×120s.
+   * Now bounded by ONE overall budget (`SESSION_ESTABLISH_DEADLINE_MS +
+   * RECOVERY_PER_SESSION_INCREMENT_MS × recovery.length`, computed once
+   * above the loop) consumed cooperatively across attempts: each session
+   * gets `min(SESSION_ESTABLISH_DEADLINE_MS, remaining-budget)`, and a
+   * session whose turn comes up after the budget is already exhausted is
+   * marked `tab.error{kind:'session-lost'}` WITHOUT even attempting
+   * `session/load` — honest about never having tried, not a slow-attempt
+   * masquerading as an instant one. A session that recovers fast still
+   * only ever consumes its real wall-clock time, exactly as before.
    */
   private async recoverSessions(
     recovery: Array<{ sessionId: string; cwd: string; tabId: string }>,
   ): Promise<void> {
+    // WS-R1 F2-03: one OVERALL budget for the whole serial chain — computed
+    // once, consumed cooperatively (fake-timer- and Fedora-clock-friendly:
+    // Date.now() under vitest fake timers advances with the clock).
+    const budgetDeadline =
+      Date.now() + SESSION_ESTABLISH_DEADLINE_MS + RECOVERY_PER_SESSION_INCREMENT_MS * recovery.length;
     for (const { sessionId, cwd, tabId } of recovery) {
+      const remainingMs = budgetDeadline - Date.now();
+      if (remainingMs <= 0) {
+        this.port.logger?.append(
+          `[AcpBackend] respawn recovery: budget exhausted — session '${sessionId}' (tab '${tabId}') marked session-lost without an attempt`,
+        );
+        this.port.emit({
+          type: 'tab.error',
+          tabId,
+          kind: 'session-lost',
+          message: 'Could not recover this session after reconnecting.',
+        });
+        continue;
+      }
       try {
-        await this.recoverOneSession(sessionId, cwd, tabId);
+        await this.recoverOneSession(sessionId, cwd, tabId, Math.min(SESSION_ESTABLISH_DEADLINE_MS, remainingMs));
       } catch (err) {
         // Defensive — `recoverOneSession` itself never throws today
         // (`SessionController.loadReplay` never rejects), but keeping this
@@ -755,7 +796,7 @@ export class ConnectionSupervisor {
    * `client.loadSession` here would otherwise wedge the ENTIRE respawn tail,
    * not just this one session's recovery.
    */
-  private async recoverOneSession(sessionId: string, cwd: string, tabId: string): Promise<void> {
+  private async recoverOneSession(sessionId: string, cwd: string, tabId: string, deadlineMs: number): Promise<void> {
     const mcpServers = this.port.getMcpServers();
     const controller = this.port.sessions.open(sessionId, cwd, this.port.buildSessionPort(sessionId, cwd), tabId);
 
@@ -763,7 +804,7 @@ export class ConnectionSupervisor {
 
     const loadReplay = controller.loadReplay(cwd, sessionId, cwd, mcpServers);
     const result = this.client
-      ? await this.raceRecoveryAgainstChildExit(loadReplay, this.client)
+      ? await this.raceRecoveryAgainstChildExit(loadReplay, this.client, deadlineMs)
       : await loadReplay;
     if (result === undefined) {
       this.port.emit({
@@ -815,6 +856,7 @@ export class ConnectionSupervisor {
   private raceRecoveryAgainstChildExit(
     loadReplay: Promise<AcpLoadSessionResult | undefined>,
     client: AcpClientLike,
+    deadlineMs: number,
   ): Promise<AcpLoadSessionResult | undefined> {
     // T-B1 (closes V-8): re-implemented on {@link raceAgainstChildExit} —
     // behavior identical for this method's own caller (`recoverOneSession`,
@@ -842,7 +884,14 @@ export class ConnectionSupervisor {
     // the W6-FG note above) and makes the belated continuation a silent
     // no-op, exactly as it already does for the `tab.load`-supersedes-
     // recovery race this same guard was built for.
-    return this.raceAgainstChildExit(loadReplay, client, SESSION_ESTABLISH_DEADLINE_MS).catch(() => undefined);
+    //
+    // WS-R1 F2-03: `deadlineMs` is now CALLER-supplied (was hard-coded
+    // `SESSION_ESTABLISH_DEADLINE_MS`) — `recoverSessions` passes the
+    // shrinking remainder of its own OVERALL recovery budget, capped at
+    // `SESSION_ESTABLISH_DEADLINE_MS`, so a single hung session/load can
+    // never again burn its own full serial 120s slot once earlier sessions
+    // in the same crash have already spent most of the budget.
+    return this.raceAgainstChildExit(loadReplay, client, deadlineMs).catch(() => undefined);
   }
 
   /**

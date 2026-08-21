@@ -55,6 +55,7 @@ import { SessionRegistry } from './session/SessionRegistry';
 import { must } from '../../testing/must';
 import { TRUST_GATED_METHODS } from './control/ControlDispatcher';
 import { RELOAD_LINE } from './control/mcpEntryValidation';
+import { respawnBackoffMs } from '../control/respawnBackoff';
 
 /**
  * `vscode` isn't resolvable outside the extension host; `AcpBackend` only
@@ -2219,6 +2220,45 @@ describe('AcpBackend.start — T-3 (closes B1-M1): session-establish wall-clock 
     expect(clients).toHaveLength(1);
     expect(must(clients[0]).newSessionCalls).toHaveLength(1);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('WS-R1 F2-03 — crash-recovery budget bounds the serial session/load chain', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('3 hung recoveries settle within 120s + 3×10s (not 3×120s); the un-attempted remainder is marked session-lost', async () => {
+    const { backend, clients } = makeStartableBackend(undefined, (client, index) => {
+      if (index > 0) client.hangLoadSession(); // the RESPAWN child never answers session/load
+    });
+    await backend.start(); // session-1 @ bootstrap tab
+    const boot = must(clients[0]);
+    boot.queueSessionId('session-2');
+    await backend.openTab('tab-2');
+    boot.queueSessionId('session-3');
+    await backend.openTab('tab-3');
+
+    // Registered AFTER the bootstrap settles (mirrors the sibling recovery
+    // tests above) — the fresh bootstrap ALSO emits its own system.recovered
+    // (T5 fold, `establishInitialSession`'s non-recovery branch), which is
+    // not what this test is about; only the crash-recovery leg's messages
+    // matter here.
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    boot.simulateExit(1); // crash: snapshot = 3 sessions
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1)); // respawn attempt 1 → clients[1]
+    // Budget = 120_000 + 3×10_000 = 150_000. Session A: min(120s, 150s)=120s;
+    // B: min(120s, 30s)=30s; C: remaining 0 → session-lost with NO attempt.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const lost = messages.filter((m) => m.type === 'tab.error' && m.kind === 'session-lost');
+    expect(lost).toHaveLength(3);
+    expect(must(clients[1]).loadSessionCalls).toHaveLength(2); // C never attempted — budget honesty
+    // the outage still resolves (recovery settled; banner retired):
+    expect(messages.filter((m) => m.type === 'system.recovered')).toHaveLength(1);
   });
 });
 

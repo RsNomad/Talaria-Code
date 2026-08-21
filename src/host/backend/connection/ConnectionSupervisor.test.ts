@@ -168,6 +168,7 @@ type RaceHelpers = {
   raceRecoveryAgainstChildExit(
     p: Promise<AcpLoadSessionResult | undefined>,
     client: AcpClientLike,
+    deadlineMs: number,
   ): Promise<AcpLoadSessionResult | undefined>;
 };
 
@@ -276,7 +277,7 @@ describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contra
     const h = supervisor as unknown as RaceHelpers;
     const client = new FakeSupervisorClient();
     const d = deferred<AcpLoadSessionResult | undefined>();
-    const race = h.raceRecoveryAgainstChildExit(d.promise, client as unknown as AcpClientLike);
+    const race = h.raceRecoveryAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
     d.reject(new Error('boom'));
     await expect(race).resolves.toBeUndefined();
   });
@@ -288,6 +289,7 @@ describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contra
     const race = h.raceRecoveryAgainstChildExit(
       deferred<AcpLoadSessionResult | undefined>().promise,
       client as unknown as AcpClientLike,
+      120_000,
     );
     await vi.advanceTimersByTimeAsync(120_000);
     await expect(race).resolves.toBeUndefined();
@@ -300,6 +302,7 @@ describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contra
     const race = h.raceRecoveryAgainstChildExit(
       deferred<AcpLoadSessionResult | undefined>().promise,
       client as unknown as AcpClientLike,
+      120_000,
     );
     client.simulateExit(1);
     await expect(race).resolves.toBeUndefined();
@@ -313,7 +316,7 @@ describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contra
     const client = new FakeSupervisorClient();
     const sentinel: AcpLoadSessionResult = { found: true, currentModeId: 'default' };
     const d = deferred<AcpLoadSessionResult | undefined>();
-    const race = h.raceRecoveryAgainstChildExit(d.promise, client as unknown as AcpClientLike);
+    const race = h.raceRecoveryAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
     d.resolve(sentinel);
     await expect(race).resolves.toBe(sentinel);
   });
