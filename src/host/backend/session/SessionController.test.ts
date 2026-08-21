@@ -1679,3 +1679,176 @@ describe('WS-R1 F3-4 — cancel fallback deadline force-ends an unresponsive tur
     ).toHaveLength(0);
   });
 });
+
+/**
+ * WS-R4 step 1 (REMEDIATION-ARCHITECTURE §3.4): characterization pins for
+ * ALL SIX caller-visible outcomes `SessionController.loadReplay` can produce
+ * today, BEFORE Task 20 replaces its `AcpLoadSessionResult | undefined`
+ * sentinel return with a `LoadReplayOutcome` discriminated union. These are
+ * NOT new-behavior tests — every pin here must already be GREEN against the
+ * current implementation; if one fails, the test mischaracterized reality
+ * and must be fixed, never the production code (characterization-TDD, not
+ * red/green TDD).
+ *
+ * The reusable harness (`makeLoadHarness` + `FakeLoadClient`) is deliberately
+ * factored out here for Tasks 20/23/24 to import/reuse against the NEW
+ * union-returning `loadReplay` once it lands — same fake client, same port
+ * shape, so the six arms below stay the behavior-preservation contract for
+ * that migration.
+ *
+ * The decisive pin is the "success-but-superseded" arm (current source
+ * `:1301`, `if (this.replay !== replay) return result;`): unlike every other
+ * supersede arm in this method (which returns bare `undefined`), THIS one
+ * returns a TRUTHY, well-formed `AcpLoadSessionResult` while a superseding
+ * load has already claimed `this.replay` — and both of `loadReplay`'s
+ * production callers (`AcpBackend.loadSessionIntoTab`,
+ * `ConnectionSupervisor.recoverOneSession`) treat ANY truthy return as
+ * silent success, never touching the tab. A naive Task 20 adapter that maps
+ * "supersede while awaiting" generically to `undefined`/a `not-loaded`
+ * variant would flip this arm's caller-visible outcome from silent-success
+ * to `tab.error{session-lost}` + a guarded close — a real regression that
+ * would still pass `tsc` and every OTHER existing test. Pinning the truthy
+ * `toEqual` return here (not just `toBeDefined()`) is what makes that
+ * regression fail loudly.
+ */
+class FakeLoadClient {
+  loadSessionCalls: Array<{ cwd: string; sessionId: string }> = [];
+  private loadDeferreds: Array<{
+    resolve: (r: AcpLoadSessionResult) => void;
+    reject: (e: unknown) => void;
+  }> = [];
+  setSessionModeCalls: Array<{ sessionId: string; modeId: string }> = [];
+  private modeDeferreds: Array<{ resolve: () => void }> = [];
+
+  loadSession(cwd: string, sessionId: string): Promise<AcpLoadSessionResult> {
+    this.loadSessionCalls.push({ cwd, sessionId });
+    return new Promise<AcpLoadSessionResult>((resolve, reject) => {
+      this.loadDeferreds.push({ resolve, reject });
+    });
+  }
+  resolveLoad(index: number, result: AcpLoadSessionResult): void {
+    this.loadDeferreds[index]?.resolve(result);
+  }
+  rejectLoad(index: number, err: unknown): void {
+    this.loadDeferreds[index]?.reject(err);
+  }
+  setSessionMode(sessionId: string, modeId: string): Promise<void> {
+    this.setSessionModeCalls.push({ sessionId, modeId });
+    return new Promise<void>((resolve) => {
+      this.modeDeferreds.push({ resolve: () => resolve() });
+    });
+  }
+  resolveMode(index: number): void {
+    this.modeDeferreds[index]?.resolve();
+  }
+  async cancel(): Promise<void> {}
+}
+
+function makeLoadHarness(): {
+  controller: SessionController;
+  client: FakeLoadClient;
+  emitted: HostToWebviewMessage[];
+} {
+  const emitted: HostToWebviewMessage[] = [];
+  const client = new FakeLoadClient();
+  const port: SessionHostPort = {
+    getClient: () => client as unknown as AcpClientLike,
+    emit: (msg) => emitted.push(msg),
+    emitSystemError: () => {},
+    root: makeRoot(),
+    workspaceRoots: () => ['/fake/ws'],
+    logger: { append: () => {} },
+    refreshCheckpointsPanel: () => {},
+    resolveMentions: async () => [],
+  };
+  return { controller: new SessionController('session-1', '/fake/ws', port), client, emitted };
+}
+
+describe('WS-R4 characterization — the SIX loadReplay arms (REMEDIATION-ARCHITECTURE §3.4)', () => {
+  it('ARM loaded (happy path): clear + turn.start stream, turn.end{complete}, returns the result', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplay('/fake/ws', 'session-1', '/fake/ws', []);
+    client.resolveLoad(0, { found: true, currentModeId: 'default' });
+    const result = await load;
+    expect(result).toEqual({ found: true, currentModeId: 'default' });
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'clear', sessionId: 'session-1' }));
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.start', turnId: 'turn-1' }));
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'complete' }),
+    );
+  });
+
+  it('ARM no-client: resolves undefined with ZERO emissions (the silent arm)', async () => {
+    const { controller, emitted } = makeLoadHarness();
+    // A port whose getClient answers undefined:
+    const noClient = new SessionController('session-1', '/fake/ws', {
+      getClient: () => undefined,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    });
+    void controller; // the harness controller is unused in this arm
+    await expect(noClient.loadReplay('/fake/ws', 'session-1', '/fake/ws', [])).resolves.toBeUndefined();
+    expect(emitted).toHaveLength(0);
+  });
+
+  it('ARM load-failed: error{message} + turn.end{error}, resolves undefined', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplay('/fake/ws', 'session-1', '/fake/ws', []);
+    client.rejectLoad(0, new Error('load boom'));
+    await expect(load).resolves.toBeUndefined();
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'error', message: 'load boom' }));
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'error' }));
+  });
+
+  it('ARM not-found: the pinned message + turn.end{error}, resolves undefined', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplay('/fake/ws', 'session-1', '/fake/ws', []);
+    client.resolveLoad(0, { found: false });
+    await expect(load).resolves.toBeUndefined();
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: 'error',
+        message: 'That conversation no longer exists on the agent. Start a new chat.',
+      }),
+    );
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'error' }));
+  });
+
+  it('ARM superseded-mid-await (empty): a superseded load resolves undefined SILENTLY (no error, no turn.end from the loser)', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const loser = controller.loadReplay('/fake/ws', 'session-A', '/fake/ws', []);
+    void controller.loadReplay('/fake/ws', 'session-B', '/fake/ws', []); // supersedes on the SAME instance (T1a reuse)
+    const emissionsBefore = emitted.length;
+    client.resolveLoad(0, { found: false }); // the LOSER's response
+    await expect(loser).resolves.toBeUndefined();
+    expect(emitted).toHaveLength(emissionsBefore); // strict silence
+  });
+
+  it("ARM :1301 success-but-superseded — NAMED OBSERVABLE: returns the TRUTHY result (callers treat as SUCCESS), zero further emissions from the loser's tail", async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const loser = controller.loadReplay('/fake/ws', 'session-A', '/fake/ws', []);
+    void controller.loadReplay('/fake/ws', 'session-B', '/fake/ws', []);
+    const emissionsBefore = emitted.length;
+    client.resolveLoad(0, { found: true, currentModeId: 'default' }); // the loser SUCCEEDED
+    const result = await loser;
+    expect(result).toEqual({ found: true, currentModeId: 'default' }); // truthy — NOT undefined
+    expect(emitted).toHaveLength(emissionsBefore); // silent success
+  });
+
+  it('ARM superseded-post-pin (:1330): dispose mid-pinWireModeDefault → bare-undefined return, NO closing turn.end', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplay('/fake/ws', 'session-1', '/fake/ws', []);
+    client.resolveLoad(0, { found: true, currentModeId: 'weird-mode' }); // non-default → pin awaits setSessionMode
+    await Promise.resolve(); // let loadReplay reach the pin await
+    await Promise.resolve();
+    controller.dispose(); // the production supersede (SessionRegistry.open disposes the prior controller)
+    client.resolveMode(0);
+    await expect(load).resolves.toBeUndefined();
+    expect(emitted.filter((m) => m.type === 'turn.end' && m.status === 'complete')).toHaveLength(0);
+  });
+});
