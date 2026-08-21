@@ -2480,6 +2480,63 @@ describe('WS-R1 F3-1 — openTab mint is raced (deadline + exit)', () => {
     expect(messages.filter((m) => m.type === 'tab.bound')).toHaveLength(0);
     expect(hasController(backend, 'session-belated')).toBe(false); // no registry leak on the discard path
   });
+
+  it('newSessionInTab: a hung mint times out with tab.error{open-failed} and releases the tail', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.hangNewSession();
+    const rebind = backend.newSessionInTab(BOOTSTRAP_TAB_ID);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await rebind;
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'open-failed' }),
+    );
+    // Tail released: a follow-up openTab reaches its own newSession.
+    const after = backend.openTab('tab-2');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.newSessionCalls.length).toBeGreaterThanOrEqual(3);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await after;
+  });
+
+  it('newSessionInTab: child exit during the mint lands the same open-failed terminal without waiting 120s', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.hangNewSession();
+    const rebind = backend.newSessionInTab(BOOTSTRAP_TAB_ID);
+    await vi.advanceTimersByTimeAsync(0);
+    client.simulateExit(1);
+    await vi.advanceTimersByTimeAsync(0);
+    await rebind;
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'open-failed' }),
+    );
+  });
+
+  it('newSessionInTab: belated session/new after the deadline is closed, never bound', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.delayNewSession(); // NEXT newSession returns a controllable deferred
+    const rebind = backend.newSessionInTab(BOOTSTRAP_TAB_ID);
+    await vi.advanceTimersByTimeAsync(120_000); // give up
+    await rebind;
+    messages.length = 0;
+    client.resolveDelayedNewSession('session-belated'); // the belated resolution
+    await vi.advanceTimersByTimeAsync(0);
+    // openSession's isStaleAttempt guard (:900-924): close, never bind.
+    expect(client.closeSessionCalls).toContain('session-belated');
+    expect(messages.filter((m) => m.type === 'tab.bound')).toHaveLength(0);
+    expect(hasController(backend, 'session-belated')).toBe(false); // no registry leak on the discard path
+  });
 });
 
 /**
@@ -3517,6 +3574,14 @@ describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session"
         const d = deferred<{ sessionId: string; currentModeId: string }>();
         calls.push(d);
         return d.promise;
+      },
+      // WS-R1 F3-1 (this task): newSessionInTabInternal now races its mint
+      // via settleRace({ exit: client, ... }), which subscribes to
+      // client.onExit — a never-firing stub keeps this test's own child
+      // "alive" for its full duration (this test asserts tail-serialization
+      // ordering, not exit behavior).
+      onExit(): { dispose(): void } {
+        return { dispose: () => {} };
       },
     };
     seam(backend).client = client;

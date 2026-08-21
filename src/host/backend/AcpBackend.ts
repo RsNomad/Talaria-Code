@@ -1216,8 +1216,24 @@ export class AcpBackend implements AgentBackend {
     // (`old` undefined) exactly the same as a live-old-session tab. See this
     // method's own doc.
     this.emitter.fire({ type: 'tab.clear', tabId });
+    // WS-R1 F3-1 (sibling site, tail-audit-mandated): same race + belated-
+    // cleanup contract as openTabInternal — see that method's comment.
+    let attemptAbandoned = false;
     try {
-      await this.openSession(cwd, tabId);
+      const open = this.openSession(cwd, tabId, () => attemptAbandoned);
+      const outcome = await settleRace(open, { exit: client, deadline: SESSION_ESTABLISH_DEADLINE_MS });
+      attemptAbandoned = true;
+      if (outcome.kind !== 'value') {
+        this.emitter.fire({
+          type: 'tab.error',
+          tabId,
+          kind: 'open-failed',
+          message:
+            outcome.kind === 'exit'
+              ? 'The agent exited while starting a new session.'
+              : 'The agent did not respond while starting a new session — try again.',
+        });
+      }
     } catch (err) {
       this.emitter.fire({ type: 'tab.error', tabId, kind: 'open-failed', message: describeHostError(err) });
     }
