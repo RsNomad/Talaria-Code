@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import { createLibServerHost, decideRebindAction, type LibServerHost } from './libServerHost';
 
@@ -126,7 +127,12 @@ describe('createLibServerHost — start()/advertisement()', () => {
       requestInit: { headers: { Authorization: authHeader ?? '' } },
     });
     const client = new Client({ name: 'test-client', version: '0.0.0' });
-    await client.connect(transport);
+    // SDK boundary, not ours to widen — see `server.ts`'s `mcpServer.connect`
+    // comment: `StreamableHTTPClientTransport` implements `Transport`'s
+    // optional members (e.g. `sessionId`) as GET accessors typed
+    // `X | undefined`, which the checker treats as always-present, so this
+    // genuinely-conformant instance fails only under exactOptionalPropertyTypes.
+    await client.connect(transport as Transport);
     const result = await client.callTool({ name: 'echo', arguments: { id: 'via-host' } });
     const content = result.content as Array<{ type: string; text?: string }>;
     expect(content[0]?.text).toBe('via-host');
@@ -150,7 +156,12 @@ describe('createLibServerHost — dispose() (matrix item (h))', () => {
       requestInit: { headers: { Authorization: authHeader ?? '' } },
     });
     const client = new Client({ name: 'test-client', version: '0.0.0' });
-    await client.connect(transport);
+    // SDK boundary, not ours to widen — see `server.ts`'s `mcpServer.connect`
+    // comment: `StreamableHTTPClientTransport` implements `Transport`'s
+    // optional members (e.g. `sessionId`) as GET accessors typed
+    // `X | undefined`, which the checker treats as always-present, so this
+    // genuinely-conformant instance fails only under exactOptionalPropertyTypes.
+    await client.connect(transport as Transport);
 
     // Fire a call that will hang inside the stub tool until `releaseGate()`
     // runs — guaranteeing the request is genuinely mid-flight below.

@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import { createLibServer } from './server';
 import type { TransportExpectation } from './transportSecurity';
@@ -89,7 +90,7 @@ async function startTestServer(
     maxBodyBytes: 4 * 1024 * 1024,
     ...overrides,
   };
-  const server = createLibServer({ expect, buildMcpServer, log });
+  const server = createLibServer({ expect, buildMcpServer, ...(log !== undefined ? { log } : {}) });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, '127.0.0.1', () => resolve());
@@ -223,7 +224,12 @@ describe('createLibServer — (b) real MCP initialize + tools/list + tools/call 
       requestInit: { headers: { Authorization: `Bearer ${exp.token}` } },
     });
     const client = new Client({ name: 'test-client', version: '0.0.0' });
-    await client.connect(transport);
+    // SDK boundary, not ours to widen — see `server.ts`'s `mcpServer.connect`
+    // comment: `StreamableHTTPClientTransport` implements `Transport`'s
+    // optional members (e.g. `sessionId`) as GET accessors typed
+    // `X | undefined`, which the checker treats as always-present, so this
+    // genuinely-conformant instance fails only under exactOptionalPropertyTypes.
+    await client.connect(transport as Transport);
 
     const tools = await client.listTools();
     expect(tools.tools.map((t) => t.name)).toContain('echo');
@@ -359,7 +365,12 @@ describe('createLibServer — (g) concurrent POSTs, no cross-request bleed', () 
       requestInit: { headers: { Authorization: `Bearer ${exp.token}` } },
     });
     const client = new Client({ name: 'test-client', version: '0.0.0' });
-    await client.connect(transport);
+    // SDK boundary, not ours to widen — see `server.ts`'s `mcpServer.connect`
+    // comment: `StreamableHTTPClientTransport` implements `Transport`'s
+    // optional members (e.g. `sessionId`) as GET accessors typed
+    // `X | undefined`, which the checker treats as always-present, so this
+    // genuinely-conformant instance fails only under exactOptionalPropertyTypes.
+    await client.connect(transport as Transport);
 
     const ids = Array.from({ length: 8 }, (_, i) => `concurrent-${i}`);
     const results = await Promise.all(

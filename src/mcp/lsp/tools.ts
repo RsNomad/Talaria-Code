@@ -374,8 +374,8 @@ function toDiagnosticEntry(relPath: string, raw: RawDiagnostic): PlainDiagnostic
     line: raw.range.start.line,
     character: raw.range.start.character,
     message: raw.message,
-    source: raw.source,
-    code: raw.code,
+    ...(raw.source !== undefined ? { source: raw.source } : {}),
+    ...(raw.code !== undefined ? { code: raw.code } : {}),
   };
 }
 
@@ -410,7 +410,7 @@ function normalizeDocumentSymbol(entry: RawDocumentSymbolEntry): PlainDocumentSy
   const range = entry.location.range ?? ZERO_RANGE;
   return {
     name: entry.name,
-    detail: entry.containerName,
+    ...(entry.containerName !== undefined ? { detail: entry.containerName } : {}),
     kind: entry.kind,
     range,
     selectionRange: range,
@@ -1039,7 +1039,7 @@ async function buildResolvedCodeAction(
       deps.pool.run(async () => {
         const verdict = await deps.classifyUri(f.uri);
         const docText = verdict.inRoot ? await deps.readFullText(f.uri) : undefined;
-        return { uri: f.uri, verdict, edits: f.edits, docText };
+        return { uri: f.uri, verdict, edits: f.edits, ...(docText !== undefined ? { docText } : {}) };
       }),
     ),
   );
@@ -1049,7 +1049,7 @@ async function buildResolvedCodeAction(
     edit: {
       allEntriesAvailable: raw.edit.allEntriesAvailable,
       hasNonTextEntry: raw.edit.hasNonTextEntry,
-      nonTextKind: raw.edit.nonTextKind,
+      ...(raw.edit.nonTextKind !== undefined ? { nonTextKind: raw.edit.nonTextKind } : {}),
       files,
     },
   };
@@ -1140,7 +1140,15 @@ export function buildLibMcpServer(deps: LspToolDeps): McpServer {
       inputSchema: diagnosticsInputShape,
       annotations: { readOnlyHint: true },
     },
-    (args) => safeHandler(deps, () => handleDiagnostics(deps, tracker, args)),
+    (args) =>
+      safeHandler(deps, () =>
+        handleDiagnostics(deps, tracker, {
+          ...(args.path !== undefined ? { path: args.path } : {}),
+          ...(args.scope !== undefined ? { scope: args.scope } : {}),
+          ...(args.severities !== undefined ? { severities: args.severities } : {}),
+          ...(args.limit !== undefined ? { limit: args.limit } : {}),
+        }),
+      ),
   );
 
   server.registerTool(
@@ -1184,7 +1192,13 @@ export function buildLibMcpServer(deps: LspToolDeps): McpServer {
       inputSchema: workspaceSymbolsInputShape,
       annotations: { readOnlyHint: true },
     },
-    (args) => safeHandler(deps, () => handleWorkspaceSymbols(deps, pool, tracker, args)),
+    (args) =>
+      safeHandler(deps, () =>
+        handleWorkspaceSymbols(deps, pool, tracker, {
+          query: args.query,
+          ...(args.limit !== undefined ? { limit: args.limit } : {}),
+        }),
+      ),
   );
 
   server.registerTool(
@@ -1206,7 +1220,18 @@ export function buildLibMcpServer(deps: LspToolDeps): McpServer {
       inputSchema: codeActionsInputShape,
       annotations: { readOnlyHint: true },
     },
-    (args) => safeHandler(deps, () => handleCodeActions(deps, pool, args)),
+    (args) =>
+      safeHandler(deps, () =>
+        handleCodeActions(deps, pool, {
+          path: args.path,
+          startLine: args.startLine,
+          startChar: args.startChar,
+          endLine: args.endLine,
+          endChar: args.endChar,
+          ...(args.kind !== undefined ? { kind: args.kind } : {}),
+          ...(args.maxActions !== undefined ? { maxActions: args.maxActions } : {}),
+        }),
+      ),
   );
 
   return server;

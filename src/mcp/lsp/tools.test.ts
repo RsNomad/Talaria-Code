@@ -154,7 +154,7 @@ function makeFakeDeps(overrides: Partial<LspToolDeps> = {}): LspToolDeps {
     readSnippet: overrides.readSnippet ?? vi.fn(async () => 'fake-snippet'),
     readFullText: overrides.readFullText ?? vi.fn(async () => 'fake-full-text'),
     sleep: overrides.sleep ?? vi.fn(async () => undefined),
-    log: overrides.log,
+    ...(overrides.log !== undefined ? { log: overrides.log } : {}),
     pool: overrides.pool ?? getFreshShared().pool,
     tracker: overrides.tracker ?? getFreshShared().tracker,
     docSymbolsCache: overrides.docSymbolsCache ?? getFreshShared().docSymbolsCache,

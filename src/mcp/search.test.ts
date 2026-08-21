@@ -21,8 +21,32 @@ function fakeEmbedder(vector: number[] = [0.1, 0.2, 0.3]): Embedder {
   return { embed: vi.fn(async (texts: string[]) => texts.map(() => vector)) };
 }
 
-function hit(id: string, path: string, overrides: Partial<SearchHit> = {}): SearchHit {
-  return { id, path, startLine: 0, endLine: 3, content: `content-${id}`, language: 'typescript', score: 1, ...overrides };
+// `language` is widened to accept an explicit `undefined` HERE (test-helper-
+// local override type, not `SearchHit` itself): :116 below passes
+// `{ language: undefined }` to genuinely CLEAR this helper's own
+// `language: 'typescript'` default (arm 2) — `Partial<SearchHit>` alone
+// rejects that under exactOptionalPropertyTypes because `SearchHit.language`
+// is already declared optional (no explicit `| undefined`).
+type HitOverrides = Partial<Omit<SearchHit, 'language'>> & { readonly language?: string | undefined };
+
+function hit(id: string, path: string, overrides: HitOverrides = {}): SearchHit {
+  // `language` is pulled out of the spread and re-added conditionally: an
+  // explicit `{ language: undefined }` override (arm 2, see `HitOverrides`
+  // above) must CLEAR the 'typescript' default to an ABSENT key on the
+  // returned `SearchHit` (its `language?: string` has no explicit
+  // `| undefined`) rather than an explicit-undefined value.
+  const { language, ...rest } = overrides;
+  const resolvedLanguage = 'language' in overrides ? language : 'typescript';
+  return {
+    id,
+    path,
+    startLine: 0,
+    endLine: 3,
+    content: `content-${id}`,
+    score: 1,
+    ...rest,
+    ...(resolvedLanguage !== undefined ? { language: resolvedLanguage } : {}),
+  };
 }
 
 function fakeStore(hits: SearchHit[]): VectorStore & { lastCall?: { k: number; filter?: SearchFilter } } {
@@ -32,7 +56,7 @@ function fakeStore(hits: SearchHit[]): VectorStore & { lastCall?: { k: number; f
     deleteByPath: vi.fn(async () => {}),
     listFileHashes: vi.fn(async () => ({})),
     hybridSearch: vi.fn(async (_q: string, _v: number[], k: number, filter?: SearchFilter) => {
-      store.lastCall = { k, filter };
+      store.lastCall = { k, ...(filter !== undefined ? { filter } : {}) };
       return hits;
     }),
     close: vi.fn(async () => {}),

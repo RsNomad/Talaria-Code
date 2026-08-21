@@ -63,6 +63,7 @@ import * as http from 'node:http';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import {
   evaluateHeaders,
@@ -327,7 +328,12 @@ async function handleAcceptedBody(
 
   try {
     transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless — see module doc
+      // stateless — see module doc. `sessionIdGenerator` is left ABSENT
+      // rather than assigned `undefined`: exactOptionalPropertyTypes forbids
+      // the explicit assignment on this optional SDK field, and the SDK
+      // reads `options.sessionIdGenerator` directly (`= options.sessionIdGenerator`,
+      // no `in` check), so an absent key yields the identical runtime
+      // `undefined` the module doc's stateless-mode note describes.
       enableJsonResponse: true, // plain JSON reply, never SSE — see module doc
     });
     mcpServer = buildMcpServer();
@@ -342,7 +348,18 @@ async function handleAcceptedBody(
     res.once('finish', closeBoth);
     res.once('close', closeBoth);
 
-    await mcpServer.connect(transport);
+    // SDK boundary, not ours to widen: `StreamableHTTPServerTransport`
+    // (`@modelcontextprotocol/sdk@1.29.0`, `server/streamableHttp.d.ts`)
+    // implements `onclose`/`sessionId` as GET/SET ACCESSOR properties typed
+    // `X | undefined`, while the `Transport` interface it implements
+    // (`shared/transport.d.ts`) declares the same members as plain optional
+    // fields (`onclose?: () => void`). Accessor properties are structurally
+    // "always present" to the checker, so under exactOptionalPropertyTypes
+    // this genuinely-conformant instance fails the interface check — a
+    // mismatch entirely inside the SDK's own .d.ts, unrelated to any
+    // field this module declares. `as Transport` documents the verified
+    // conformance without widening any of our own optional types.
+    await mcpServer.connect(transport as Transport);
     await transport.handleRequest(req, res, parsedBody);
   } catch {
     // S2 (AU-36 tail): this is the genuine-defect catch — the SDK itself
