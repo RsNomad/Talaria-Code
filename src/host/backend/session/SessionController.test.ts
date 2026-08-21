@@ -25,7 +25,7 @@
  * `AcpBackend.test.ts`'s `makeTmpWs`/`makeEditReq` pattern for the same
  * canonicalization seam).
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as path from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import * as os from 'node:os';
@@ -1505,5 +1505,114 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
     // stale turn.end, no commands.available, nothing.
     expect(emitted).toEqual([]);
     expect(resultA).toBeUndefined();
+  });
+});
+
+describe('WS-R1 F3-4 — cancel fallback deadline force-ends an unresponsive turn', () => {
+  function deferredPrompt(): {
+    promise: Promise<{ stopReason: string }>;
+    resolve: (v: { stopReason: string }) => void;
+  } {
+    let resolve!: (v: { stopReason: string }) => void;
+    const promise = new Promise<{ stopReason: string }>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  function makeCancelHarness(): {
+    controller: SessionController;
+    emitted: HostToWebviewMessage[];
+    releaseCalls: number[];
+    prompt: ReturnType<typeof deferredPrompt>;
+    cancelCalls: string[];
+  } {
+    const emitted: HostToWebviewMessage[] = [];
+    const releaseCalls: number[] = [];
+    const cancelCalls: string[] = [];
+    const prompt = deferredPrompt();
+    const client = {
+      cancel: async (sessionId: string) => {
+        cancelCalls.push(sessionId);
+      },
+      prompt: () => prompt.promise,
+    } as unknown as AcpClientLike;
+    const root: RootCoordinatorLike = {
+      rootId: 'root-1',
+      tracker: undefined,
+      tryAcquireTurnLease: () => true,
+      releaseTurnLease: () => {
+        releaseCalls.push(Date.now());
+      },
+      anyLiveTurn: () => false,
+      nextTurnOrdinal: () => 1,
+      nextBaselineOrdinal: () => -1,
+      refreshCheckpointsPanel: () => {},
+    };
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root,
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', '/fake/ws', port);
+    return { controller, emitted, releaseCalls, prompt, cancelCalls };
+  }
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('no turn end within 15s of cancel() → local force-end: turn.end{cancelled}, lease released, notice emitted, turnId recorded', async () => {
+    const { controller, emitted, releaseCalls, cancelCalls } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0); // flush to the hanging client.prompt
+    controller.cancel();
+    expect(cancelCalls).toEqual(['session-1']);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'cancelled' }),
+    );
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'error', turnId: 'turn-1', message: expect.stringContaining('force-stopped') }),
+    );
+    expect(releaseCalls).toHaveLength(1);
+    expect(controller.hasLiveTurn()).toBe(false);
+    expect(controller.wasForceEnded('turn-1')).toBe(true);
+  });
+
+  it('belated genuine prompt settlement after a force-end is dropped: exactly ONE turn.end, NO result.summary', async () => {
+    const { controller, emitted, prompt } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel();
+    await vi.advanceTimersByTimeAsync(15_000); // force-end fires
+    prompt.resolve({ stopReason: 'cancelled' }); // the belated genuine settlement
+    await vi.advanceTimersByTimeAsync(0);
+    expect(emitted.filter((m) => m.type === 'turn.end' && m.turnId === 'turn-1')).toHaveLength(1);
+    expect(emitted.filter((m) => m.type === 'result.summary')).toHaveLength(0);
+  });
+
+  it('a genuine turn end BEFORE the deadline clears the timer — no force-end, no notice', async () => {
+    const { controller, emitted, prompt } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel();
+    prompt.resolve({ stopReason: 'cancelled' });
+    await vi.advanceTimersByTimeAsync(0); // genuine turn.end lands
+    await vi.advanceTimersByTimeAsync(15_000); // deadline horizon passes
+    expect(emitted.filter((m) => m.type === 'turn.end' && m.turnId === 'turn-1')).toHaveLength(1);
+    expect(emitted.filter((m) => m.type === 'error' && typeof m.message === 'string' && m.message.includes('force-stopped'))).toHaveLength(0);
+    expect(controller.wasForceEnded('turn-1')).toBe(false);
+  });
+
+  it('cancel() with no live prompt turn arms NO fallback timer', async () => {
+    const { controller } = makeCancelHarness();
+    const before = vi.getTimerCount();
+    controller.cancel(); // nothing live
+    expect(vi.getTimerCount()).toBe(before);
   });
 });

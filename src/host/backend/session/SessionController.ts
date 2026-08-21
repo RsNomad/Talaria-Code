@@ -112,6 +112,16 @@ export class SessionController {
   private liveTurnId: string | undefined;
   /** The turn id (if any) the user cancelled — see `AcpBackend`'s original field doc. */
   private cancelledTurnId: string | undefined;
+  /** WS-R1 F3-4: the armed cancel-fallback deadline, if any (one per cancel window). */
+  private cancelFallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * WS-R1 F3-4: turn ids ended by the fallback deadline (not by a genuine
+   * turn end). The record: (a) makes the force-end queryable (wasForceEnded —
+   * WS-R3's reconnect wedge-break evidence), and (b) documents WHY the
+   * belated genuine settlement is dropped — forceEndCancelledTurn clears
+   * currentTurnId/turn, so runTurn's own :1021/:1042 guards discard it.
+   */
+  private readonly forceEndedTurnIds = new Set<string>();
 
   // --- policy inputs ------------------------------------------------------
   /** W2-F1: boots at `'manual'` — today's ask-everything behavior. */
@@ -213,6 +223,11 @@ export class SessionController {
   /** True while a live PROMPT turn is running (never true during a replay) — the P2/P3 interlock predicate. */
   hasLiveTurn(): boolean {
     return this.liveTurnId !== undefined;
+  }
+
+  /** WS-R1 F3-4: was `turnId` ended by the cancel fallback deadline (not a genuine turn end)? */
+  wasForceEnded(turnId: string): boolean {
+    return this.forceEndedTurnIds.has(turnId);
   }
 
   getPreset(): EditPolicyPreset {
@@ -530,6 +545,51 @@ export class SessionController {
       this.port.logger?.append(`[SessionController] session/cancel failed: ${errorMessage(err)}`);
     });
     this.settlePendingApprovals('cancelled');
+    this.armCancelFallback();
+  }
+
+  /** WS-R1 F3-4: arm the force-end deadline for the LIVE prompt turn (replay
+   *  cancels arm nothing — there is no lease/liveTurnId to strand). One
+   *  timer per cancel window; a second cancel() while armed keeps the first. */
+  private armCancelFallback(): void {
+    const turnId = this.liveTurnId;
+    if (turnId === undefined || this.cancelFallbackTimer !== undefined) return;
+    this.cancelFallbackTimer = setTimeout(() => {
+      this.cancelFallbackTimer = undefined;
+      this.forceEndCancelledTurn(turnId);
+    }, CANCEL_FALLBACK_DEADLINE_MS);
+    this.cancelFallbackTimer.unref?.();
+  }
+
+  private clearCancelFallback(): void {
+    if (this.cancelFallbackTimer !== undefined) {
+      clearTimeout(this.cancelFallbackTimer);
+      this.cancelFallbackTimer = undefined;
+    }
+  }
+
+  /**
+   * WS-R1 F3-4: the agent never confirmed the stop — end the turn locally.
+   * emitTurnEnd releases the root lease (liveTurnId still matches), settles
+   * any straggler approvals, emits turn.end{cancelled} and takes the
+   * after-turn snapshot — the SAME terminal machinery a genuine end uses.
+   * Clearing currentTurnId/turn afterwards makes the belated genuine prompt
+   * settlement drop at runTurn's existing guards (:1021/:1042) — no
+   * duplicate turn.end, no stale result.summary (idempotence, §3.1 step 5).
+   */
+  private forceEndCancelledTurn(turnId: string): void {
+    if (this.disposed) return;
+    if (this.currentTurnId !== turnId || this.liveTurnId !== turnId) return; // ended genuinely — nothing to force
+    this.forceEndedTurnIds.add(turnId);
+    this.emitTurnEnd(turnId, 'cancelled');
+    this.currentTurnId = undefined;
+    this.turn = undefined;
+    this.port.emit({
+      type: 'error',
+      sessionId: this.sessionId,
+      turnId,
+      message: 'The agent did not confirm the stop — the turn was force-stopped locally.',
+    });
   }
 
   // --- approvals ------------------------------------------------------------
@@ -1046,6 +1106,7 @@ export class SessionController {
   }
 
   private emitTurnEnd(turnId: string, status: 'complete' | 'cancelled' | 'error'): void {
+    this.clearCancelFallback();
     // T-A0 (V-5-host backstop): FIRST act — a turn ending means nothing is
     // running in this session (one live turn per session), so any approval
     // still open when it ends is abandoned exactly like the anomalous-turn-end
@@ -1364,6 +1425,7 @@ export class SessionController {
    */
   dispose(): void {
     this.disposed = true;
+    this.clearCancelFallback();
     const client = this.port.getClient();
     if (client && this.liveTurnId !== undefined) {
       void client.cancel(this.sessionId).catch((err) => {
@@ -1461,6 +1523,15 @@ function isMidTurnControlUtterance(text: string, attachments?: Attachment[], men
  * user's own live turn, not just this utterance.
  */
 const UTTERANCE_DEADLINE_MS = 15_000;
+
+/**
+ * WS-R1 F3-4: how long cancel() waits for the agent to confirm the stop
+ * (a genuine turn end) before force-ending the turn locally. The harness
+ * genuinely can fail to unpark (see cancel()'s own doc) — without this the
+ * turn lease is held forever and Stop looks dead. Proposed default; tunable
+ * on Fedora live-QA.
+ */
+const CANCEL_FALLBACK_DEADLINE_MS = 15_000;
 
 /**
  * W2-F1 Plan preamble (C3, pinned VERBATIM — moved off `AcpBackend`):
