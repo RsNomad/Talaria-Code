@@ -199,4 +199,11 @@ describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
 
     expect(exits).toEqual([]); // terminate()'s identity guard still eats the late exit — intentional
   });
+
+  it('WS-R1 F3-10: closeSession settles when the child dies mid-request (never-rejects contract kept)', async () => {
+    const { client, child } = await connectClient();
+    const closing = client.closeSession('session-1');
+    child.emit('exit', 1, null);
+    await expect(closing).resolves.toBeUndefined();
+  });
 });

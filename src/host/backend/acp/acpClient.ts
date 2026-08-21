@@ -863,10 +863,15 @@ export class AcpClient implements AcpClientLike {
    * `close_session` handler. This call is therefore expected to be refused,
    * which is exactly why it stays fire-and-forget: a rejection must never
    * block or throw out of `SessionController.dispose()`.
+   *
+   * WS-R1 F3-10: routed through raceTermination like every sibling request —
+   * child death now settles the promise instead of leaving it eternally
+   * pending; the termination rejection lands in the existing best-effort
+   * catch.
    */
   async closeSession(sessionId: string): Promise<void> {
     try {
-      await this.requireConnection().unstable_closeSession({ sessionId });
+      await this.raceTermination(() => this.requireConnection().unstable_closeSession({ sessionId }));
     } catch (err) {
       this.log(`session/close failed (best-effort, ignored): ${String(err)}`);
     }
