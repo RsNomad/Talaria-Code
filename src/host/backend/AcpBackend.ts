@@ -1759,6 +1759,13 @@ export class AcpBackend implements AgentBackend {
       this.buildSessionPort(sessionId, adoptedCwd),
       tabId,
     );
+    // WS-R4 F3-7: captured so a FAILED load can unwind the cwd this
+    // adoption is about to overwrite. activeSessionId is NOT captured for
+    // restore — when the adoption fires because the active session was this
+    // tab's occupant, that occupant was closed above (:1746); restoring its
+    // id would point at a disposed session, so the unwind clears to
+    // undefined instead (an honest "no active session").
+    const priorCwd = this.cwd;
     if (this.activeSessionId === undefined || this.activeSessionId === currentOccupant?.sessionId) {
       this.activeSessionId = sessionId;
       this.cwd = adoptedCwd;
@@ -1919,8 +1926,18 @@ export class AcpBackend implements AgentBackend {
         // `loadReplayOutcome`'s own arms already emitted the session-scoped
         // signal (`error`+`turn.end` or nothing, per arm); this router adds
         // nothing here — exactly what the deleted adapter's collapse-to-
-        // `undefined` produced for these three kinds. (F3-7's unwind is NOT
-        // in this commit — that's the NEXT commit's own TDD step.)
+        // `undefined` produced for these three kinds.
+        //
+        // WS-R4 F3-7: unwind the identity THIS failed load adopted pre-load
+        // (above, at the `priorCwd` capture). Double identity guard (mirrors
+        // the timeout path's `this.sessions.get(sessionId) === controller`
+        // registry guard, :1832/:1879, plus the activeSessionId check) — it
+        // can only ever unwind state this exact failed load set. NEVER fires
+        // on 'superseded' (either arm): a superseding op owns identity.
+        if (this.sessions.get(sessionId) === controller && this.activeSessionId === sessionId) {
+          this.activeSessionId = undefined;
+          this.cwd = priorCwd;
+        }
         return undefined;
     }
   }

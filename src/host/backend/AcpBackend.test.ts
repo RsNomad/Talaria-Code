@@ -4671,6 +4671,34 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
   });
 });
 
+describe('WS-R4 F3-7 — failed load unwinds the pre-adopted identity (identity-guarded)', () => {
+  type IdentitySeam = { activeSessionId: string | undefined; cwd: string | undefined };
+
+  it('not-found into the ACTIVE tab: activeSessionId cleared (not restored — the occupant is closed), cwd restored', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // active = session-1 @ bootstrap tab
+    const seam = backend as unknown as IdentitySeam;
+    const priorCwd = seam.cwd;
+    must(clients[0]).setLoadSessionResult({ found: false }); // the load will fail not-found
+    await backend.loadTab(BOOTSTRAP_TAB_ID, 'session-ghost', '/fake/ws');
+    expect(seam.activeSessionId).toBeUndefined(); // unwound — never left dangling on 'session-ghost'
+    expect(seam.cwd).toBe(priorCwd);
+  });
+
+  it('failed load into a NON-active tab: guard misses, identity untouched', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    const boot = must(clients[0]);
+    boot.queueSessionId('session-2');
+    await backend.openTab('tab-2'); // active flips to session-2 — openSession adopts unconditionally (:925-926)
+    const seam = backend as unknown as IdentitySeam;
+    const activeBefore = seam.activeSessionId;
+    boot.setLoadSessionResult({ found: false });
+    await backend.loadTab('tab-3', 'session-ghost', '/fake/ws'); // fails; adoption condition was false (an active session exists and tab-3 had no occupant)
+    expect(seam.activeSessionId).toBe(activeBefore);
+  });
+});
+
 describe('beta.7 B1: loadTab threads the History title into tab.bound', () => {
   it('a titled load emits tab.bound carrying that title', async () => {
     const { backend, clients } = makeStartableBackend();
