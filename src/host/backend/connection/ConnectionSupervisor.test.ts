@@ -24,6 +24,7 @@ import type { SessionRegistry } from '../session/SessionRegistry';
 import type { SessionController } from '../session/SessionController';
 import type { SessionHostPort } from '../session/types';
 import type { HostToWebviewMessage } from '../../../shared/protocol';
+import { must } from '../../../testing/must';
 
 export function deferred<T>(): {
   promise: Promise<T>;
@@ -319,5 +320,135 @@ describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contra
     const race = h.raceRecoveryAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
     d.resolve(sentinel);
     await expect(race).resolves.toBe(sentinel);
+  });
+});
+
+type CrashSeam = {
+  handleAcpCrash(code: number | null): void;
+  clientExitSub?: { dispose(): void };
+  pendingRecovery?: Array<{ sessionId: string; cwd: string; tabId: string }>;
+  acpState: string;
+};
+
+describe('WS-R3 characterization — handleAcpCrash observable sequence', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  async function startedHarness(): Promise<ReturnType<typeof makeSupervisorHarness> & { seam: CrashSeam }> {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start(); // boots session-1 via the fake openSession
+    return { ...h, seam: h.supervisor as unknown as CrashSeam };
+  }
+
+  it('crash: banner ONCE per outage; snapshot EXCLUDES pendingClose; one-shot settled; client nulled+disposed; respawn scheduled', async () => {
+    const h = await startedHarness();
+    const extra = makeController('session-2', 'tab-2');
+    h.controllers.set('session-2', extra);
+    const closing = makeController('session-3', 'tab-3');
+    h.controllers.set('session-3', closing);
+    (h.port.isPendingClose as ReturnType<typeof vi.fn>).mockImplementation(
+      (id: string) => id === 'session-3',
+    );
+
+    must(h.clients[0]).simulateExit(1);
+
+    expect(h.emitted.filter((m) => m.type === 'system.error')).toHaveLength(1);
+    expect((h.supervisor as unknown as CrashSeam).pendingRecovery?.map((r) => r.sessionId)).toEqual([
+      'session-1',
+      'session-2', // session-3 excluded — pendingClose tombstone honored
+    ]);
+    expect(h.port.settleOneShot).toHaveBeenCalledWith('ACP connection lost');
+    expect(must(h.clients[0]).disposeCallCount).toBe(1);
+    expect(h.supervisor.getClient()).toBeUndefined();
+    expect(h.logs.some((l) => l.includes('ACP respawn attempt 1'))).toBe(true);
+    // banner-once: a SECOND crash entry while respawning adds no second banner
+    (h.supervisor as unknown as CrashSeam).handleAcpCrash(1);
+    expect(h.emitted.filter((m) => m.type === 'system.error')).toHaveLength(1);
+  });
+
+  it("crash fan-out survives a throwing controller and pins the EXACT log line (with the (tab '…') segment)", async () => {
+    const h = await startedHarness();
+    const bad = makeController('session-bad', 'tab-bad');
+    bad.endOnCrash.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    h.controllers.set('session-bad', bad);
+    const good = makeController('session-good', 'tab-good');
+    h.controllers.set('session-good', good);
+
+    must(h.clients[0]).simulateExit(1);
+
+    expect(good.endOnCrash).toHaveBeenCalledTimes(1); // the throw did not abort the loop
+    expect(must(h.clients[0]).disposeCallCount).toBe(1); // …nor the trailing client dispose
+    expect(
+      h.logs.some((l) =>
+        l.includes("crash fan-out: endOnCrash failed for session 'session-bad' (tab 'tab-bad'), continuing:"),
+      ),
+    ).toBe(true);
+  });
+
+  it('NAMED OBSERVABLE: the exit-sub is disposed even on the already-disposed crash path', async () => {
+    const h = await startedHarness();
+    h.supervisor.markDisposed();
+    const disposeSpy = vi.fn();
+    (h.supervisor as unknown as CrashSeam).clientExitSub = { dispose: disposeSpy };
+    // startedHarness()'s own start() already emitted `system.recovered`
+    // (establishInitialSession, unconditional on a successful mint) and
+    // already called settleOneShot('session torn down') (teardownSession,
+    // startInternal's first act) — reset both trackers here so this test
+    // isolates what THIS handleAcpCrash call does (nothing, past the
+    // exit-sub dispose), not what the preceding start() already did.
+    h.emitted.length = 0;
+    (h.port.settleOneShot as ReturnType<typeof vi.fn>).mockClear();
+    (h.supervisor as unknown as CrashSeam).handleAcpCrash(1);
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    expect((h.supervisor as unknown as CrashSeam).clientExitSub).toBeUndefined();
+    expect(h.emitted).toHaveLength(0); // and NOTHING else ran (no banner)
+    expect(h.port.settleOneShot).not.toHaveBeenCalled();
+  });
+});
+
+describe('WS-R3 characterization — reconnect refusal matrix + teardown', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("not 'ready' → honest refusal (idle wording)", async () => {
+    const h = makeSupervisorHarness();
+    await expect(h.supervisor.reconnect()).resolves.toEqual({
+      ok: false,
+      reason: 'The agent connection is not running.',
+    });
+  });
+
+  it('live turn → refusal with the pinned wording', async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    const busy = must(h.controllers.get('session-1'));
+    busy.hasLiveTurn.mockReturnValue(true);
+    await expect(h.supervisor.reconnect()).resolves.toEqual({
+      ok: false,
+      reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
+    });
+  });
+
+  it("idle reconnect: teardown ordering + startInternal in the SAME tail link → {ok:true}; pins the reconnect fan-out log line (NO tab segment)", async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    const bad = makeController('session-bad', 'tab-bad');
+    bad.endOnCrash.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    h.controllers.set('session-bad', bad);
+
+    await expect(h.supervisor.reconnect()).resolves.toEqual({ ok: true });
+    expect(h.port.settleOneShot).toHaveBeenCalledWith('agent reconnecting');
+    expect(must(h.clients[0]).disposeCallCount).toBe(1); // old client disposed
+    expect(h.clients).toHaveLength(2); // startInternal spawned a fresh one
+    expect(
+      h.logs.some((l) =>
+        l.includes("reconnect fan-out: endOnCrash failed for session 'session-bad', continuing:"),
+      ),
+    ).toBe(true);
+    expect(h.logs.some((l) => l.includes("(tab 'tab-bad')"))).toBe(false); // the tab segment is CRASH-only
   });
 });
