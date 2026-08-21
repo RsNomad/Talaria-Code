@@ -937,6 +937,19 @@ export class ConnectionSupervisor {
           this.port.setCwd(cwd);
         }
         return;
+      default: {
+        // WS-R4 step 3 follow-up (all three review lenses — I-1/M-4, M1,
+        // M1): exhaustiveness guard against union extension. All 5 current
+        // `LoadReplayOutcome` kinds are handled above, so this default is
+        // UNREACHABLE today — no runtime behavior change. Its purpose is
+        // compile-time: a future 6th kind must fail to COMPILE here, not
+        // silently fall through to an implicit no-op return — the exact
+        // sentinel-conflation-by-omission disease this workstream exists to
+        // kill (a recovery method going fail-silent on an unrecognized
+        // terminal state).
+        const _exhaustive: never = outcome;
+        throw new Error(`unhandled LoadReplayOutcome kind: ${(_exhaustive as { kind: string }).kind}`);
+      }
     }
   }
 

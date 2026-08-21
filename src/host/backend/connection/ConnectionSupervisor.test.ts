@@ -199,12 +199,26 @@ type RecoverSeam = {
   recoverOneSession(sessionId: string, cwd: string, tabId: string, deadlineMs: number): Promise<void>;
 };
 
+/** M-2 follow-up (code/concurrency lenses): swaps the supervisor's live
+ * `this.client` for a throwaway exit-only fake, so simulating THAT fake's
+ * exit fires ONLY the `settleRace` subscription `recoverOneSession` just
+ * armed — not `handleAcpCrash`'s standing `clientExitSub` (bound to the
+ * ORIGINAL client captured at `startInternal` :425). Isolates the `exit`
+ * route from a full crash/respawn cycle. */
+type ClientSeam = { client?: AcpClientLike };
+
 describe('WS-R4 co-edit — recoverOneSession routes all six outcomes (named observables)', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
   async function recover(h: ReturnType<typeof makeSupervisorHarness>, outcome: unknown): Promise<void> {
     await h.supervisor.start();
+    // `start()`'s own `teardownSession()` unconditionally calls
+    // `setActiveSessionId(undefined)` as part of the fresh-boot tail — clear
+    // it here so downstream assertions observe ONLY what recoverOneSession
+    // itself did, not this unrelated pre-existing boot call.
+    (h.port.setActiveSessionId as ReturnType<typeof vi.fn>).mockClear();
+    (h.port.setCwd as ReturnType<typeof vi.fn>).mockClear();
     h.state.nextLoadOutcome = outcome; // consumed by the registry's open() wiring (Step 1a)
     await (h.supervisor as unknown as RecoverSeam).recoverOneSession('session-R', '/fake/ws', 'tab-R', 120_000);
   }
@@ -220,7 +234,7 @@ describe('WS-R4 co-edit — recoverOneSession routes all six outcomes (named obs
     }
   });
 
-  it("'superseded' (either arm) → strict no-op: NO tab.error, controller left to its new owner", async () => {
+  it("'superseded' (either arm) → strict no-op: NO tab.error, NO adopt, controller left to its new owner", async () => {
     for (const outcome of [
       { kind: 'superseded' },
       { kind: 'superseded', result: { found: true, currentModeId: 'default' } },
@@ -228,6 +242,16 @@ describe('WS-R4 co-edit — recoverOneSession routes all six outcomes (named obs
       const h = makeSupervisorHarness();
       await recover(h, outcome);
       expect(h.emitted.filter((m) => m.type === 'tab.error' && m.tabId === 'tab-R')).toHaveLength(0);
+      // I-1 (code-lens review): the with-result arm's OLD behavior was ADOPT
+      // (setActiveSessionId/setCwd), which emits NO tab.error — so the
+      // assertion above alone would stay green even if a regression
+      // re-introduced that adopt for THIS arm. Pin the no-op directly, for
+      // BOTH arms.
+      expect(h.port.setActiveSessionId).not.toHaveBeenCalled();
+      expect(h.port.setCwd).not.toHaveBeenCalled();
+      // The stale controller is left registered for its new (winning) owner
+      // — not closed by this losing recovery attempt.
+      expect(h.controllers.has('session-R')).toBe(true);
     }
   });
 
@@ -248,6 +272,56 @@ describe('WS-R4 co-edit — recoverOneSession routes all six outcomes (named obs
     expect(h.emitted).toContainEqual(
       expect.objectContaining({ type: 'tab.error', tabId: 'tab-R', kind: 'session-lost' }),
     );
+  });
+
+  // M-2 (code + concurrency lenses): the `exit` route was previously pinned
+  // only TRANSITIVELY (shared branch with the deadline test above, plus
+  // settleRace.test.ts's own exit→{kind:'exit'} pin). Direct seam-level pin.
+  it("child EXITS mid-load → 'exit' route pinned directly: session-lost + identity-guarded close; belated load resolution discarded (no adopt-after-error)", async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    // See `recover()`'s own comment above: isolate from start()'s own
+    // unrelated setActiveSessionId(undefined) teardown call.
+    (h.port.setActiveSessionId as ReturnType<typeof vi.fn>).mockClear();
+    (h.port.setCwd as ReturnType<typeof vi.fn>).mockClear();
+    const hungLoad = deferred<LoadReplayOutcome>();
+    h.state.nextLoadOutcome = hungLoad.promise;
+    const exitClient = new FakeSupervisorClient();
+    (h.supervisor as unknown as ClientSeam).client = exitClient as unknown as AcpClientLike;
+
+    const pending = (h.supervisor as unknown as RecoverSeam).recoverOneSession('session-R', '/fake/ws', 'tab-R', 120_000);
+    exitClient.simulateExit(1); // the child dies mid-load
+    await pending;
+
+    expect(h.emitted).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: 'tab-R', kind: 'session-lost' }),
+    );
+    expect(h.controllers.has('session-R')).toBe(false); // identity-guarded close ran
+
+    // The load resolves LATE — after the race already settled on 'exit'.
+    // settle-once must discard it: no adopt, no second tab.error.
+    hungLoad.resolve({ kind: 'loaded', result: { found: true, currentModeId: 'default' } });
+    await Promise.resolve();
+    expect(h.port.setActiveSessionId).not.toHaveBeenCalled();
+    expect(h.port.setCwd).not.toHaveBeenCalled();
+    expect(h.emitted.filter((m) => m.type === 'tab.error')).toHaveLength(1);
+  });
+
+  // M-2's defensive-rejection route — zero coverage per the code lens; cheap
+  // to pin directly alongside the other failure kinds.
+  it('a rejecting loadReplayOutcome (defensive-only) → synthetic load-failed → session-lost, same as the other failure kinds', async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    const failing = deferred<LoadReplayOutcome>();
+    h.state.nextLoadOutcome = failing.promise;
+    const pending = (h.supervisor as unknown as RecoverSeam).recoverOneSession('session-R', '/fake/ws', 'tab-R', 120_000);
+    failing.reject(new Error('loadSession boom'));
+    await pending;
+
+    expect(h.emitted).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: 'tab-R', kind: 'session-lost' }),
+    );
+    expect(h.controllers.has('session-R')).toBe(false); // identity-guarded close ran
   });
 });
 
