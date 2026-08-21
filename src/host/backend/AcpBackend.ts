@@ -1642,9 +1642,10 @@ export class AcpBackend implements AgentBackend {
    * NO SELF-DEADLOCK: `loadSessionIntoTabInternal`'s body never calls
    * `start`/`openTab`/`closeTab`/`loadSessionIntoTab` (itself) — it only
    * reaches `this.sessions.*`/`this.buildSessionPort`/
-   * `this.announceSessionBound`/`controller.loadReplay`, none of which touch
-   * `runOnStartTail` — so this enqueues exactly once per call, at this outer
-   * entry, never re-entering the tail from within an already-queued link.
+   * `this.announceSessionBound`/`controller.loadReplayOutcome` (WS-R4 step
+   * 4), none of which touch `runOnStartTail` — so this enqueues exactly once
+   * per call, at this outer entry, never re-entering the tail from within an
+   * already-queued link.
    */
   private async loadSessionIntoTab(
     sessionId: string,
@@ -1836,25 +1837,27 @@ export class AcpBackend implements AgentBackend {
     }
 
     // CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
-    // commit): `client.loadSession` (inside `loadReplay`) had NO wall-clock
-    // deadline at all — only `AcpClient.raceTermination`'s child-EXIT-only
-    // race. Before this commit that was merely a LOCALIZED hang (this one
-    // tab's load); now that this whole method is tail-serialized (see
-    // `loadSessionIntoTab`'s own doc), a hung-but-alive child wedges the
-    // ENTIRE topology tail forever — every subsequent `openTab`/`closeTab`/
-    // `loadSessionIntoTab`/`start` chains behind it. Mirrors
-    // `recoverOneSession`'s `SESSION_ESTABLISH_DEADLINE_MS` deadline via
-    // settleRace with deadline-only opts; no exit source — a child exit
+    // commit): `client.loadSession` (inside `loadReplayOutcome`, WS-R4 step
+    // 4 — formerly reached through the now-legacy `loadReplay` adapter) had
+    // NO wall-clock deadline at all — only `AcpClient.raceTermination`'s
+    // child-EXIT-only race. Before this commit that was merely a LOCALIZED
+    // hang (this one tab's load); now that this whole method is
+    // tail-serialized (see `loadSessionIntoTab`'s own doc), a hung-but-alive
+    // child wedges the ENTIRE topology tail forever — every subsequent
+    // `openTab`/`closeTab`/`loadSessionIntoTab`/`start` chains behind it.
+    // Mirrors `recoverOneSession`'s `SESSION_ESTABLISH_DEADLINE_MS` deadline
+    // via settleRace with deadline-only opts; no exit source — a child exit
     // already reaches p via AcpClient.raceTermination (that call cannot
-    // distinguish "the deadline fired" from "`loadReplay` genuinely resolved
-    // `undefined`" the way a discriminated outcome does — the ordinary
-    // `found:false`/rejected-load outcome, which already emits its OWN
-    // session-scoped `error` via `loadReplay` itself and must NOT also get a
-    // second, duplicate `tab.error` here).
+    // distinguish "the deadline fired" from "`loadReplayOutcome` genuinely
+    // resolved a non-`loaded` kind" the way the discriminated switch below
+    // now does directly — the ordinary `found:false`/rejected-load outcome,
+    // which already emits its OWN session-scoped `error` via
+    // `loadReplayOutcome` itself and must NOT also get a second, duplicate
+    // `tab.error` here).
     const mcpServers = [...this.mcpServers.values()];
-    const loadReplay = controller.loadReplay(cwd, sessionId, adoptedCwd, mcpServers);
-    const outcome = await settleRace(loadReplay, { deadline: SESSION_ESTABLISH_DEADLINE_MS });
-    if (outcome.kind !== 'value') {
+    const load = controller.loadReplayOutcome(cwd, sessionId, adoptedCwd, mcpServers);
+    const raced = await settleRace(load, { deadline: SESSION_ESTABLISH_DEADLINE_MS });
+    if (raced.kind !== 'value') {
       // The child stayed ALIVE but never answered within
       // SESSION_ESTABLISH_DEADLINE_MS. JS promises can't be cancelled — the
       // original `loadReplay` keeps running in the background and MAY still
@@ -1878,7 +1881,44 @@ export class AcpBackend implements AgentBackend {
       });
       return undefined;
     }
-    return outcome.value;
+    // WS-R4 step 4: discriminate the union natively instead of going through
+    // the (now-legacy) `loadReplay` adapter's value-only collapse.
+    const outcome = raced.value;
+    switch (outcome.kind) {
+      case 'loaded':
+        return outcome.result;
+      case 'superseded':
+        // §3.4 (reviewed decision, THIS caller only): the :1240-equivalent
+        // data-bearing arm (a genuine success that raced a newer supersede)
+        // keeps today's silent-success behavior — returning `outcome.result`
+        // reproduces exactly what the deleted `loadReplay` adapter did for
+        // this arm (audit-A-3-pinned by Task 19's pin 6, re-verified below).
+        // The empty `superseded` arm returns `undefined` here too, via the
+        // SAME branch (`outcome.result` is `undefined` on that arm) — again
+        // matching the adapter's old mapping byte-for-byte. This is
+        // DELIBERATELY DIFFERENT from `recoverOneSession`'s Task-21 decision
+        // to treat BOTH `superseded` arms as a strict no-op: that caller
+        // adopts `activeSessionId`/`cwd` as a side effect of a truthy return,
+        // which is wrong once a newer op already owns the tab, so Task 21
+        // changed it. This caller (`loadSessionIntoTabInternal`) has no such
+        // adopt side effect — a returned result here only flows back to its
+        // own two callers (`ControlDispatcher.ts` session.load / loadTab),
+        // which already treat "the load that raced in" as this call's
+        // answer regardless of which internal arm produced it. Preserving
+        // the old value keeps this migration behavior-identical, per the
+        // brief; F3-7's discriminant-aware behavior change (if any) is
+        // Task 24's job, not this structural step's.
+        return outcome.result;
+      case 'no-client':
+      case 'load-failed':
+      case 'not-found':
+        // `loadReplayOutcome`'s own arms already emitted the session-scoped
+        // signal (`error`+`turn.end` or nothing, per arm); this router adds
+        // nothing here — exactly what the deleted adapter's collapse-to-
+        // `undefined` produced for these three kinds. (F3-7's unwind is NOT
+        // in this commit — that's the NEXT commit's own TDD step.)
+        return undefined;
+    }
   }
 
   dispose(): void {
