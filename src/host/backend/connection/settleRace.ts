@@ -51,10 +51,25 @@ export function settleRace<T>(p: Promise<T>, opts: SettleRaceOpts): Promise<Race
   return new Promise<RaceOutcome<T>>((resolve, reject) => {
     let settled = false;
     let exitSub: { dispose(): void } | undefined;
+    // Set when `cleanup()` runs BEFORE the exit handle below has been
+    // assigned — i.e. the `ExitSource` fired its callback SYNCHRONOUSLY,
+    // from inside the `onExit()` call, before that call has returned. No
+    // documented seam (`AcpClient.onExit` / `JsonRpcStdio.onExit`) does
+    // this — both are async-only — but this is a generic primitive: it
+    // must not leak the subscription (or arm a now-orphaned deadline
+    // timer, below) even under that adversarial ordering.
+    let exitDisposePending = false;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const disposeExit = (): void => {
+      if (exitSub !== undefined) {
+        exitSub.dispose();
+        exitSub = undefined;
+      } else {
+        exitDisposePending = true;
+      }
+    };
     const cleanup = (): void => {
-      exitSub?.dispose();
-      exitSub = undefined;
+      disposeExit();
       if (deadlineTimer !== undefined) {
         clearTimeout(deadlineTimer);
         deadlineTimer = undefined;
@@ -72,8 +87,20 @@ export function settleRace<T>(p: Promise<T>, opts: SettleRaceOpts): Promise<Race
       cleanup();
       reject(err);
     };
-    exitSub = opts.exit?.onExit(() => settleResolve({ kind: 'exit' }));
-    if (opts.deadline !== 'none') {
+    const exitHandle = opts.exit?.onExit(() => settleResolve({ kind: 'exit' }));
+    if (exitHandle !== undefined) {
+      if (exitDisposePending) {
+        // The callback above already fired synchronously and cleanup() ran
+        // before this handle existed — dispose it now instead of leaking it.
+        exitHandle.dispose();
+      } else {
+        exitSub = exitHandle;
+      }
+    }
+    // Guard against arming a deadline timer AFTER a synchronous exit fire
+    // has already settled the race (see exitDisposePending above) — such a
+    // timer would never be cleared, since cleanup() already ran.
+    if (opts.deadline !== 'none' && !settled) {
       deadlineTimer = setTimeout(() => settleResolve({ kind: 'deadline' }), opts.deadline);
       // Never keep the event loop alive on a deadline — matches every other
       // deadline timer in this subsystem (raceConnectPhase / scheduleAcpRespawn).
