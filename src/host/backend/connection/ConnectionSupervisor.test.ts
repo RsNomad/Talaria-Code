@@ -671,4 +671,77 @@ describe('WS-R3 F2-19 — supervisor respawn loop health transitions', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(h.supervisor.getClient()).toBeDefined();
   });
+
+  /**
+   * F2-19b follow-up (arch review Important-1): `onHealth` is purely
+   * edge-triggered with no replay. A late subscriber — one that reads state
+   * WITHOUT having registered an `onHealth` handler at all, e.g. a webview
+   * panel VS Code reveals lazily, post-outage — must not default to 'ok'
+   * while the ACP child is actually down. Deliberately registers NO
+   * `onHealth` subscriber here.
+   */
+  it("currentHealth() reflects the LIVE state for a late subscriber, not a default 'ok' (arch review Important-1)", async () => {
+    let failRespawns = true;
+    const h = makeSupervisorHarness();
+    const originalCreate = h.port.createClient;
+    (h.port as { createClient: typeof originalCreate }).createClient = (options) => {
+      const c = originalCreate(options);
+      if (h.clients.length > 1 && failRespawns) {
+        must(h.clients[h.clients.length - 1]).connectError = new Error('spawn refused');
+      }
+      return c;
+    };
+    await h.supervisor.start();
+    must(h.clients[0]).simulateExit(1); // crash → attempt 1
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      await vi.advanceTimersByTimeAsync(respawnBackoffMs(attempt));
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    // No onHealth subscriber was ever registered — a late subscriber calling
+    // currentHealth() now must read the TRUE live state, not a default 'ok'.
+    expect(h.supervisor.currentHealth()).toEqual({ state: 'down', attempts: 11 });
+
+    // LIVE, not frozen at the transition payload's attempts:10 — one more
+    // failed attempt keeps the live counter climbing.
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(11));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.supervisor.currentHealth()).toEqual({ state: 'down', attempts: 12 });
+  });
+
+  /**
+   * F2-19b follow-up (concurrency re-review Important-1): `handleAcpCrash`'s
+   * crash-banner `port.emit(...)` call sits BEFORE `teardownForRespawn`/
+   * `scheduleAcpRespawn` on the crash chain. An unguarded throw there must
+   * not abort the method before the respawn is scheduled — the exact F2-19
+   * zombie this class exists to prevent, independent of whether
+   * `vscode.EventEmitter.fire` happens to swallow listener throws in
+   * production.
+   */
+  it('a throwing crash-banner emit listener does not abort handleAcpCrash before scheduleAcpRespawn (safeEmit guard)', async () => {
+    const h = makeSupervisorHarness();
+    const originalEmit = h.port.emit;
+    (h.port as { emit: typeof originalEmit }).emit = (msg) => {
+      if (msg.type === 'system.error' && msg.message === 'The agent exited unexpectedly — reconnecting…') {
+        throw new Error('emit listener boom (crash banner)');
+      }
+      originalEmit(msg);
+    };
+    await h.supervisor.start();
+
+    // Pre-fix this throws SYNCHRONOUSLY: handleAcpCrash's crash-banner
+    // port.emit call runs before teardownForRespawn/scheduleAcpRespawn, so
+    // an unguarded throw here aborts handleAcpCrash before the respawn is
+    // ever scheduled.
+    expect(() => must(h.clients[0]).simulateExit(1)).not.toThrow();
+
+    // scheduleAcpRespawn was still reached despite the throw: its own log
+    // call fires synchronously inside the same handleAcpCrash call.
+    expect(h.logs.some((l) => l.includes('ACP respawn attempt 1'))).toBe(true);
+
+    // …and attempt 1 actually spawns and the connection self-heals.
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1));
+    expect(h.clients.length).toBeGreaterThanOrEqual(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.supervisor.getClient()).toBeDefined();
+  });
 });

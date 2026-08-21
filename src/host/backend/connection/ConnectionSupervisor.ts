@@ -219,6 +219,27 @@ export class ConnectionSupervisor {
   }
 
   /**
+   * WS-R3 F2-19b (arch review Important-1): the CURRENT health, computed
+   * fresh from the live `acpRespawnAttempts` through the same classifier
+   * `emitHealth` uses — NOT the frozen payload of the last-fired
+   * transition. `onHealth` is purely edge-triggered and holds no replay, so
+   * a subscriber that registers AFTER the ACP child has already
+   * crash-looped past a threshold (e.g. a webview panel VS Code creates
+   * lazily, only revealed post-outage) would otherwise hear nothing and
+   * default to assuming `'ok'` — the exact fail-invisible regression F2-19
+   * exists to prevent, reintroduced for the ACP-child half. Mirrors
+   * `ControlChannel.currentHealth()` field-for-field (ControlChannel.ts
+   * :192-197) — also doubles as the live "retried N times" counter, unlike
+   * a transition payload which freezes at the 5/10 threshold crossing.
+   */
+  currentHealth(): RespawnHealth {
+    return {
+      state: respawnHealthForAttempt(this.acpRespawnAttempts),
+      attempts: this.acpRespawnAttempts,
+    };
+  }
+
+  /**
    * Spawn both channels, ACP-initialize (advertising `fs.readTextFile:true,
    * writeTextFile:false, terminal:false` — deliberately false-sounding but
    * correct: zero terminal handlers are registered, so we advertise what we
@@ -1122,7 +1143,11 @@ export class ConnectionSupervisor {
       // W4 §7 B1: connection-global — hits every open tab, so it rides
       // `system.error` (no sessionId), never a session-scoped `error` that
       // drop-unknown would eat the moment that one tab closes.
-      this.port.emit({ type: 'system.error', message: 'The agent exited unexpectedly — reconnecting…' });
+      // WS-R3 F2-19b (concurrency re-review Important-1): `safeEmit`, not a
+      // raw `port.emit` — see that method's own doc. This is the last
+      // unguarded collaborator call on the crash/respawn/arm chain, and it
+      // runs BEFORE teardownForRespawn/scheduleAcpRespawn below.
+      this.safeEmit({ type: 'system.error', message: 'The agent exited unexpectedly — reconnecting…' });
     }
     this.teardownForRespawn(
       'ACP connection lost',
@@ -1285,12 +1310,44 @@ export class ConnectionSupervisor {
    * reaches the next scheduling step — leaving the connection a zombie that
    * never respawns: exactly the F2-19 silent fail-stop this class exists to
    * prevent. A logging failure must never affect control flow.
+   *
+   * WS-R3 F2-19b (code review Minor — doc footgun): deliberately does NOT
+   * prepend a `[AcpBackend]` prefix itself, unlike `ControlChannel.log()`.
+   * Every call site on this class already embeds `[AcpBackend]` inline in
+   * its own message string — adding one here would double-prefix those
+   * messages and redden T13's fan-out-log characterization pins (the exact
+   * strings `ConnectionSupervisor.test.ts` asserts on). Do not "fix" this.
    */
   private safeLog(message: string): void {
     try {
       this.port.logger?.append(message);
     } catch {
       // Swallow: a logging failure must never affect control flow.
+    }
+  }
+
+  /**
+   * WS-R3 F2-19b (concurrency re-review Important-1): guards
+   * `handleAcpCrash`'s crash-banner `port.emit(...)` call — the one
+   * remaining unguarded collaborator call on the `handleAcpCrash ->
+   * teardownForRespawn -> scheduleAcpRespawn -> arm` chain, sitting BEFORE
+   * `teardownForRespawn`/`scheduleAcpRespawn` run. If it threw,
+   * `handleAcpCrash` would abort at that statement: `teardownForRespawn`
+   * never runs (client not disposed, `pendingRecovery` never snapshotted,
+   * `acpState` never flips to 'respawning') and `scheduleAcpRespawn()` is
+   * never reached — the exact F2-19 zombie this class exists to prevent.
+   * Safe in production TODAY only because `port.emit` -> `AcpBackend.emit`
+   * -> `vscode.EventEmitter.fire` happens to route a throwing listener to
+   * `onUnexpectedError` rather than rethrow synchronously into the caller —
+   * that is the PRIMITIVE's behavior, not a guarantee this call site
+   * enforces itself. Mirrors `safeLog`'s try/catch-swallow shape exactly.
+   */
+  private safeEmit(msg: HostToWebviewMessage): void {
+    try {
+      this.port.emit(msg);
+    } catch {
+      // Swallow: an emit failure must never affect control flow — see the
+      // doc comment above.
     }
   }
 
