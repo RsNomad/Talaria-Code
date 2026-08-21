@@ -20,7 +20,11 @@ export function extractPreviewFiles(content: AcpToolCallContent[] | null | undef
   const files: PreviewFile[] = [];
   for (const item of content) {
     if ('type' in item && item.type === 'diff') {
-      files.push({ path: item.path, oldText: item.oldText, newText: item.newText });
+      files.push({
+        path: item.path,
+        ...(item.oldText !== undefined ? { oldText: item.oldText } : {}),
+        newText: item.newText,
+      });
     }
   }
   return files;

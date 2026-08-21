@@ -207,7 +207,7 @@ export async function generateCommitMessage(deps: GenerateCommitDeps): Promise<G
     diff: budgetedDiff,
     recentSubjects,
     userSubjects,
-    template,
+    ...(template !== undefined ? { template } : {}),
   });
 
   if (token?.isCancellationRequested) return cancelledResult();

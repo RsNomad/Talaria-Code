@@ -159,11 +159,12 @@ export class SubagentAccumulator {
   private applyStart(update: Extract<AcpSessionUpdate, { sessionUpdate: 'tool_call' }>): boolean {
     if (!isDelegateTaskTitle(update.title)) return false;
 
+    const detail = extractToolCallOutputText(update.content) || undefined;
     const node: SubagentNode = {
       id: update.toolCallId,
       goal: update.title,
       status: 'running',
-      detail: extractToolCallOutputText(update.content) || undefined,
+      ...(detail !== undefined ? { detail } : {}),
     };
     // startedAt is a host-observed LIVE timestamp — meaningless (and misleading
     // as `now()`) for a historical delegation replayed by `session/load`.

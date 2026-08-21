@@ -129,9 +129,9 @@ export class HermesDashboardManager implements DashboardService {
       makeClient: (token) =>
         new HermesDashboardClient({
           port: opts.port,
-          host: opts.host,
-          token,
-          logger: opts.logger,
+          ...(opts.host !== undefined ? { host: opts.host } : {}),
+          ...(token !== undefined ? { token } : {}),
+          ...(opts.logger !== undefined ? { logger: opts.logger } : {}),
         }),
       spawn: (token) => this.spawnServe(token),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),

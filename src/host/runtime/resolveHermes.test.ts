@@ -102,7 +102,7 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
       return '/usr/local/bin/hermes\n';
     };
     resetHermesBinCache();
-    await resolveHermesBin({ hermesPath: undefined, pythonPath: undefined, cwd: undefined }, exec);
+    await resolveHermesBin({}, exec);
     expect(seen[0]?.cwd).toBe(os.homedir());
   });
 
@@ -139,7 +139,7 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
   it('AUDIT-5 SEC M-3: with no workspace open (cwd undefined), resolveHermes falls back to os.homedir() — never process.cwd() (the EH install dir)', async () => {
     const { exec } = fakeExec('/home/u/.venvs/hermes/bin/hermes\n');
     const resolved = await resolveHermes(
-      { cwd: undefined, shell: '/bin/bash' },
+      { shell: '/bin/bash' },
       exec,
       identityRealpath,
       alwaysAccessible,

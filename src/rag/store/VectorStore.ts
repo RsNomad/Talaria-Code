@@ -8,7 +8,15 @@ export interface ChunkRecord {
   content: string;
   /** sha256 of the *source file's* full contents, for incremental diffing. */
   contentHash: string;
-  language?: string;
+  /**
+   * Optional AND genuinely undefined-holding: `LanceDBStore.upsert`
+   * coalesces this to `null` for the native row (`record.language ?? null`,
+   * `LanceDBStore.ts`) — TA-1's schema-inference fix depends on an
+   * explicit `undefined` (not just an absent key) reaching that boundary,
+   * so this is arm-2 widened rather than absent-key (grep-verified against
+   * that clear-site).
+   */
+  language?: string | undefined;
   vector: number[];
 }
 

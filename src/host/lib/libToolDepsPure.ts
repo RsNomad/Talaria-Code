@@ -154,7 +154,7 @@ export function buildRawCodeActionEdit(
     return {
       allEntriesAvailable: true,
       hasNonTextEntry: true,
-      nonTextKind: classified.nonTextKind,
+      ...(classified.nonTextKind !== undefined ? { nonTextKind: classified.nonTextKind } : {}),
       files: [],
     };
   }

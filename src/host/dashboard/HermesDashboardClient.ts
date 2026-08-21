@@ -349,7 +349,7 @@ export class HermesDashboardClient implements AdoptableDashboardClient, Dashboar
     // Server probe window is >= 315s (browser OAuth consent); 340s leaves margin.
     return this.json('POST', `/api/mcp/servers/${encodeURIComponent(name)}/auth`, undefined, {
       timeoutMs: 340_000,
-      signal,
+      ...(signal !== undefined ? { signal } : {}),
     });
   }
 
@@ -421,7 +421,7 @@ export class HermesDashboardClient implements AdoptableDashboardClient, Dashboar
     return this.fetchImpl(`${this.base}${path}`, {
       method,
       headers: this.headers(hasBody),
-      body: hasBody ? JSON.stringify(body) : undefined,
+      ...(hasBody ? { body: JSON.stringify(body) } : {}),
       signal,
     });
   }

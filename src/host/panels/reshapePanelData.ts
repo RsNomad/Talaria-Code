@@ -464,17 +464,18 @@ export function reshapeSessionsList(
   const sessions: SessionSummary[] = (raw.sessions ?? [])
     .map((s) => {
       const id = s.session_id ?? s.sessionId ?? '';
-      const updatedAtRaw = s.updated_at ?? s.updatedAt;
+      const title = s.title ?? undefined;
+      const updatedAt = normalizeUpdatedAt(s.updated_at ?? s.updatedAt);
       return {
         id,
         cwd: s.cwd ?? '',
-        title: s.title ?? undefined,
-        updatedAt: normalizeUpdatedAt(updatedAtRaw),
+        ...(title !== undefined ? { title } : {}),
+        ...(updatedAt !== undefined ? { updatedAt } : {}),
       };
     })
     .filter((s) => !excludeIds?.has(s.id));
   const nextCursor = raw.next_cursor ?? raw.nextCursor ?? undefined;
-  return { sessions, nextCursor: nextCursor ?? undefined };
+  return { sessions, ...(nextCursor !== undefined ? { nextCursor } : {}) };
 }
 
 /* ------------------------------------------------------------------ *

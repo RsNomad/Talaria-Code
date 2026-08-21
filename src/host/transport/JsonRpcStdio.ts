@@ -93,7 +93,7 @@ const MAX_LINE_BYTES = 4 * 1024 * 1024;
 
 export class JsonRpcStdio implements Disposable {
   private readonly child: ChildProcess;
-  private readonly logger?: Logger;
+  private readonly logger: Logger | undefined;
   private readonly requestTimeoutMs: number;
 
   private nextId = 1;

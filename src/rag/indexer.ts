@@ -645,8 +645,8 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         contents,
         languageId: languageId ?? extension,
         extension,
-        parser: languageId ? parser : undefined,
-        maxChunkTokens: opts.maxChunkTokens,
+        ...(languageId ? { parser } : {}),
+        ...(opts.maxChunkTokens !== undefined ? { maxChunkTokens: opts.maxChunkTokens } : {}),
       });
 
       let recordCount = 0;

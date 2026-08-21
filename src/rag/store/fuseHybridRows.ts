@@ -44,7 +44,7 @@ export function fuseHybridRows(
       startLine: row.startLine,
       endLine: row.endLine,
       content: row.content,
-      language: row.language,
+      ...(row.language !== undefined ? { language: row.language } : {}),
       score: f.score,
     }];
   });

@@ -908,7 +908,7 @@ export class CheckpointTracker {
     return {
       cwd: this.workspaceRoot,
       env: sanitizeGitEnv(process.env, { GIT_DIR: this.gitDir, GIT_WORK_TREE: this.workspaceRoot }),
-      input,
+      ...(input !== undefined ? { input } : {}),
       // Wall-clock bound so a stalled git can never hang the awaited barrier
       // (arch A#1). Maintenance ops (repack/gc) override this with `timeoutMs: 0`.
       timeoutMs: this.gitTimeoutMs,
@@ -922,7 +922,10 @@ export class CheckpointTracker {
    */
   private shadowGit(): RunGit {
     return (args, opts) =>
-      runGit(args, { ...this.shadowOpts(opts?.input), allowFailure: opts?.allowFailure });
+      runGit(args, {
+        ...this.shadowOpts(opts?.input),
+        ...(opts?.allowFailure !== undefined ? { allowFailure: opts.allowFailure } : {}),
+      });
   }
 
   /**
@@ -1580,7 +1583,9 @@ function toPublicCheckpoint(record: PersistedCheckpoint): Checkpoint {
     age: formatAge(record.timestamp),
     timestamp: record.timestamp,
     filesChanged: record.filesChanged,
-    turnOrdinal: record.turnOrdinal,
+    // Same posture as `phase`/`sessionLabel` below: surface `turnOrdinal` ONLY
+    // when the record carries it (never `turnOrdinal: undefined`).
+    ...(record.turnOrdinal !== undefined ? { turnOrdinal: record.turnOrdinal } : {}),
     // W2-F2: surface `phase` ONLY when the record carries it — legacy (pre-W2)
     // rows have no phase and must stay shapeless-compatible (never `phase: undefined`).
     ...(record.phase ? { phase: record.phase } : {}),

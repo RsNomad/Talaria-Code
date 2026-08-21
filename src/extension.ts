@@ -135,10 +135,13 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
   // process-free mock. `selectBackendKind` is the single decision point.
   const readRuntimeConfig = (): HermesRuntimeConfig => {
     const hermesCfg = vscode.workspace.getConfiguration('talaria');
+    const hermesPath = hermesCfg.get<string>('hermesPath', '').trim() || undefined;
+    const pythonPath = hermesCfg.get<string>('pythonPath', '').trim() || undefined;
+    const cwd = hermesCfg.get<string>('cwd', '').trim() || firstWorkspaceRoot();
     return {
-      hermesPath: hermesCfg.get<string>('hermesPath', '').trim() || undefined,
-      pythonPath: hermesCfg.get<string>('pythonPath', '').trim() || undefined,
-      cwd: hermesCfg.get<string>('cwd', '').trim() || firstWorkspaceRoot(),
+      ...(hermesPath !== undefined ? { hermesPath } : {}),
+      ...(pythonPath !== undefined ? { pythonPath } : {}),
+      ...(cwd !== undefined ? { cwd } : {}),
     };
   };
   const configuredBackend = (): string =>

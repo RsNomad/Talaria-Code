@@ -171,7 +171,7 @@ export function reshapeDashboardToolsets(raw: DashboardToolset[]): ToolsData {
   return { toolsets, tools };
 }
 
-function normalizeProvenance(provenance: string | undefined): SkillInfo['provenance'] {
+function normalizeProvenance(provenance: string | undefined): 'hub' | 'bundled' | 'agent' {
   return provenance === 'hub' || provenance === 'bundled' || provenance === 'agent'
     ? provenance
     : 'agent';

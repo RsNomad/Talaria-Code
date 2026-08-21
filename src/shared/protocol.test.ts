@@ -139,7 +139,6 @@ describe('protocol — Setup panel contract (Task 8)', () => {
         selectedId: 'hermes',
         phase: 'ready',
         version: '1.2.3',
-        detail: undefined,
         logTail: ['pipx found', 'installing…', 'verifying', 'done'],
       },
       provider: {
@@ -191,7 +190,6 @@ describe('protocol — Setup panel contract (Task 8)', () => {
         model: 'qwen2.5-coder:1.5b-base',
         dedicatedConfigured: false,
         genericSupported: true,
-        refusalDetail: undefined,
       },
       rag: {
         enabled: false,

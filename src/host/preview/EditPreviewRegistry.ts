@@ -96,7 +96,7 @@ export class EditPreviewRegistry {
     if (!entry) return undefined;
     const file = entry.files.find((f) => f.path === path);
     if (!file) return undefined;
-    return { oldText: file.oldText, newText: file.newText };
+    return { ...(file.oldText !== undefined ? { oldText: file.oldText } : {}), newText: file.newText };
   }
 
   /** Remove the entry for `(sessionId, toolId)` (approval resolved/denied/

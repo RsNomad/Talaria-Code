@@ -53,7 +53,7 @@ describe('mapDiagnosticEntries — pure vscode.Diagnostic row mapper', () => {
   });
 
   it('omits `source` (undefined) when the diagnostic has none', () => {
-    const rows = mapDiagnosticEntries([entry({ source: undefined })], ERROR, WARNING);
+    const rows = mapDiagnosticEntries([entry({})], ERROR, WARNING);
     expect(rows[0]?.source).toBeUndefined();
   });
 

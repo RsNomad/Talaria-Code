@@ -60,7 +60,7 @@ export function createVscodeContextPorts(terminal: TerminalPort, git: GitPort): 
               severity: d.severity,
               line: d.range.start.line,
               message: d.message,
-              source: d.source,
+              ...(d.source !== undefined ? { source: d.source } : {}),
             });
           }
         }

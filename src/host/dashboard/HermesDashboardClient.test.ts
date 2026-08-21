@@ -66,7 +66,12 @@ function json(body: unknown, status = 200): Response {
 }
 
 function makeClient(fetchImpl: FetchLike, token?: string) {
-  return new HermesDashboardClient({ port: 9119, fetchImpl, token, timeoutMs: 1000 });
+  return new HermesDashboardClient({
+    port: 9119,
+    fetchImpl,
+    ...(token !== undefined ? { token } : {}),
+    timeoutMs: 1000,
+  });
 }
 
 describe('HermesDashboardClient — base URL + Host guard', () => {

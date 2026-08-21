@@ -36,7 +36,7 @@ function delegateUpdate(
   return {
     sessionUpdate: 'tool_call_update',
     toolCallId,
-    status,
+    ...(status !== undefined ? { status } : {}),
     content: contentText ? [{ content: { type: 'text', text: contentText } }] : null,
   };
 }
