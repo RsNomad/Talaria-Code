@@ -544,10 +544,16 @@ export class ConnectionSupervisor {
       // token without needing cross-attempt bookkeeping on the class.
       let attemptAbandoned = false;
       const openSession = this.port.openSession(connectedCwd, BOOTSTRAP_TAB_ID, () => attemptAbandoned);
-      const controller = this.client
-        ? await this.raceAgainstChildExit(openSession, this.client, SESSION_ESTABLISH_DEADLINE_MS)
-        : await openSession;
+      // WS-R1: raced via settleRace directly — exit and deadline are now
+      // discriminated outcomes, but this branch deliberately keeps mapping
+      // BOTH to the same abandoned-attempt handling below (the acpState
+      // check already tells outage from deadline for the banner; new
+      // per-outcome copy is WS-UX's job, not this migration's).
+      const outcome = this.client
+        ? await settleRace(openSession, { exit: this.client, deadline: SESSION_ESTABLISH_DEADLINE_MS })
+        : { kind: 'value' as const, value: await openSession };
       attemptAbandoned = true;
+      const controller = outcome.kind === 'value' ? outcome.value : undefined;
       if (controller === undefined) {
         // T-3: this `undefined` came from EITHER the child's own exit
         // (raced since T-B1/V-8) OR the new SESSION_ESTABLISH_DEADLINE_MS
