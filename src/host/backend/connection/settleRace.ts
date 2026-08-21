@@ -3,11 +3,13 @@
 /**
  * WS-R1 (FUNC-RACE-ROOT, REMEDIATION-ARCHITECTURE.md §3.1): the ONE
  * settle-once / exit-race / deadline primitive the ~8-member hand-rolled
- * race family (`raceAgainstChildExit`, `raceSessionLoadAgainstDeadline`,
- * `raceRecoveryAgainstChildExit`, `raceConnectPhase`, `AcpClient.
- * raceTermination`, `ControlChannel.awaitReady`, …) each re-implemented a
- * subset of. Semantics are inherited from the proven
- * `ConnectionSupervisor.raceAgainstChildExit` body (`:867-898` pre-swap):
+ * race family (`raceAgainstChildExit`, the deadline-only session-load race
+ * deleted at WS-R1 step 3b once `loadSessionIntoTabInternal` migrated to
+ * call this primitive directly, `raceRecoveryAgainstChildExit`,
+ * `raceConnectPhase`, `AcpClient.raceTermination`, `ControlChannel.
+ * awaitReady`, …) each re-implemented a subset of. Semantics are inherited
+ * from the proven `ConnectionSupervisor.raceAgainstChildExit` body
+ * (`:867-898` pre-swap):
  *
  *  - settle-once flag: the FIRST of {p settles, exit fires, deadline fires}
  *    wins; every later signal is discarded.

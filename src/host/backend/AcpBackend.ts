@@ -67,7 +67,13 @@ import {
   ONESHOT_SESSION_IDS_STORAGE_KEY,
   type WorkspaceStateLike,
 } from './oneshot/OneShotSessionRegistry';
-import { ConnectionSupervisor, type ConnectionSupervisorHostPort, type ReconnectOutcome } from './connection/ConnectionSupervisor';
+import {
+  ConnectionSupervisor,
+  SESSION_ESTABLISH_DEADLINE_MS,
+  type ConnectionSupervisorHostPort,
+  type ReconnectOutcome,
+} from './connection/ConnectionSupervisor';
+import { settleRace } from './connection/settleRace';
 import { ControlDispatcher, type ControlDispatcherHostPort } from './control/ControlDispatcher';
 
 /**
@@ -1796,17 +1802,17 @@ export class AcpBackend implements AgentBackend {
     // ENTIRE topology tail forever — every subsequent `openTab`/`closeTab`/
     // `loadSessionIntoTab`/`start` chains behind it. Mirrors
     // `recoverOneSession`'s `SESSION_ESTABLISH_DEADLINE_MS` deadline via
-    // {@link ConnectionSupervisor.raceSessionLoadAgainstDeadline} — see that
-    // method's own doc for why it is DELIBERATELY NOT a reuse of
-    // `raceAgainstChildExit` (that helper cannot distinguish "the deadline
-    // fired" from "`loadReplay` genuinely resolved `undefined`" — the
-    // ordinary `found:false`/rejected-load outcome, which already emits its
-    // OWN session-scoped `error` via `loadReplay` itself and must NOT also
-    // get a second, duplicate `tab.error` here).
+    // settleRace with deadline-only opts; no exit source — a child exit
+    // already reaches p via AcpClient.raceTermination (that call cannot
+    // distinguish "the deadline fired" from "`loadReplay` genuinely resolved
+    // `undefined`" the way a discriminated outcome does — the ordinary
+    // `found:false`/rejected-load outcome, which already emits its OWN
+    // session-scoped `error` via `loadReplay` itself and must NOT also get a
+    // second, duplicate `tab.error` here).
     const mcpServers = [...this.mcpServers.values()];
     const loadReplay = controller.loadReplay(cwd, sessionId, adoptedCwd, mcpServers);
-    const outcome = await this.connectionSupervisor.raceSessionLoadAgainstDeadline(loadReplay);
-    if (outcome.kind === 'timeout') {
+    const outcome = await settleRace(loadReplay, { deadline: SESSION_ESTABLISH_DEADLINE_MS });
+    if (outcome.kind !== 'value') {
       // The child stayed ALIVE but never answered within
       // SESSION_ESTABLISH_DEADLINE_MS. JS promises can't be cancelled — the
       // original `loadReplay` keeps running in the background and MAY still

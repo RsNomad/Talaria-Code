@@ -42,7 +42,7 @@ const CONNECT_PHASE_DEADLINE_MS = 30_000;
  * `session/load` streams back in seconds, so this bounds only the
  * pathological hang, never an ordinary slow response.
  */
-const SESSION_ESTABLISH_DEADLINE_MS = 120_000;
+export const SESSION_ESTABLISH_DEADLINE_MS = 120_000;
 
 /** Outcome of {@link ConnectionSupervisor.raceConnectPhase}'s internal race. */
 type ConnectPhaseOutcome = { kind: 'connected' } | { kind: 'deadline' } | { kind: 'exit'; code: number | null };
@@ -878,52 +878,6 @@ export class ConnectionSupervisor {
   private raceAgainstChildExit<T>(p: Promise<T>, client: AcpClientLike, deadlineMs?: number): Promise<T | undefined> {
     return settleRace(p, { exit: client, deadline: deadlineMs ?? 'none' }).then((outcome) =>
       outcome.kind === 'value' ? outcome.value : undefined,
-    );
-  }
-
-  /**
-   * CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
-   * commit): gives an arbitrary in-flight promise `p` (here:
-   * `AcpBackend.loadSessionIntoTabInternal`'s `controller.loadReplay(...)`,
-   * whose `client.loadSession` had NO wall-clock deadline at all — only
-   * `AcpClient.raceTermination`'s child-EXIT-only race) the SAME {@link
-   * SESSION_ESTABLISH_DEADLINE_MS} `recoverOneSession`'s own `session/load`
-   * already gets via {@link raceAgainstChildExit}.
-   *
-   * Deliberately NOT built on `raceAgainstChildExit` itself, despite the
-   * SAME deadline duration: that helper collapses "the deadline fired" and
-   * "`p` genuinely resolved to `undefined` on its own" into the SAME
-   * `undefined` return value. That ambiguity is harmless for
-   * `recoverOneSession` (both outcomes get IDENTICAL `tab.error{session-lost}`
-   * + identity-guarded-close handling there) but would be WRONG here:
-   * `loadReplay` legitimately resolves `undefined` on an ordinary
-   * `found:false`/rejected direct load — a case that already emits its OWN
-   * session-scoped `error` (see `SessionController.loadReplay`'s own doc)
-   * and, unlike recovery, leaves the controller registered — it must NOT
-   * also get a second, duplicate `tab.error` here (see the existing "audit
-   * A-3" `found:false` tests in `AcpBackend.test.ts`, which pin the EXACT
-   * message list with no `tab.error` in it). Returns a DISCRIMINATED
-   * outcome instead, so `loadSessionIntoTabInternal` can tell "`p` settled
-   * on its own" (even with an `undefined` value) apart from "we gave up
-   * waiting."
-   *
-   * Deadline-only — no child-exit race, unlike `raceAgainstChildExit`: a
-   * child exit already reaches `p` via `AcpClient.raceTermination` (rejects
-   * the in-flight `client.loadSession` the instant `terminate()` fires —
-   * W1-T1/CF-01/A-2, added after `raceRecoveryAgainstChildExit`'s own
-   * exit-race was written), which `loadReplay`'s try/catch already turns
-   * into an honest, session-scoped failure — no SEPARATE exit-race is
-   * needed at this layer.
-   *
-   * WS-R1: re-implemented as a thin adapter over {@link settleRace} —
-   * `'exit'` is impossible-by-construction here (no exit source is passed
-   * to `settleRace`, per the deadline-only doc above), so collapsing the
-   * non-value kinds to `timeout` is exact; outcome mapping unchanged,
-   * pinned by ConnectionSupervisor.test.ts.
-   */
-  raceSessionLoadAgainstDeadline<T>(p: Promise<T>): Promise<{ kind: 'settled'; value: T } | { kind: 'timeout' }> {
-    return settleRace(p, { deadline: SESSION_ESTABLISH_DEADLINE_MS }).then((outcome) =>
-      outcome.kind === 'value' ? { kind: 'settled' as const, value: outcome.value } : { kind: 'timeout' as const },
     );
   }
 

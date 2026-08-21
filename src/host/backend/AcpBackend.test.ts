@@ -3698,10 +3698,12 @@ describe('AcpBackend — CF-01/L3-1: loadSessionIntoTab/closeTab are serialized 
  * that the whole method is tail-serialized (the describe block immediately
  * above), a hung-but-alive child wedges the ENTIRE topology tail forever —
  * every subsequent `openTab`/`closeTab`/`loadSessionIntoTab`/`start` chains
- * behind it. These tests prove `ConnectionSupervisor
- * .raceSessionLoadAgainstDeadline`'s `SESSION_ESTABLISH_DEADLINE_MS` (120s)
- * closes that gap, mirroring the T-3 "session-establish wall-clock deadline"
- * describe block's own style for the bootstrap/recovery legs.
+ * behind it. These tests prove `loadSessionIntoTabInternal`'s direct
+ * `settleRace(loadReplay, { deadline: SESSION_ESTABLISH_DEADLINE_MS })` call
+ * (WS-R1 step 3b — migrated off the now-deleted deadline-only adapter
+ * `ConnectionSupervisor` used to expose) closes that gap, mirroring the T-3
+ * "session-establish wall-clock deadline" describe block's own style for the
+ * bootstrap/recovery legs.
  */
 describe('AcpBackend.loadTab — CF-01/L3-1 fix (Critical): a hung-but-alive client.loadSession must not wedge the topology tail forever', () => {
   beforeEach(() => {
