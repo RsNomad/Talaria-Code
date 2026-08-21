@@ -57,6 +57,12 @@ export function createMutationGate(opts?: { drainDeadlineMs?: number }): Mutatio
         refusedCount += 1;
         return Promise.resolve(undefined);
       }
+      // LOAD-BEARING: `op()` must be invoked SYNCHRONOUSLY here, right after the
+      // `closed` check, with no `await`/`.then`/`Promise.resolve().then` between
+      // them — that adjacency is what makes the check-then-invoke atomic under
+      // JS run-to-completion. Deferring this call (e.g. an `async sink` or a
+      // `.then(op)` hop) reopens the exact post-close mutation race this gate
+      // exists to close: a `close()` could then flip `closed` in the gap.
       return op();
     },
     close(drain: Promise<unknown>): Promise<void> {

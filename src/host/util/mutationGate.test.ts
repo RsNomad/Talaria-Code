@@ -57,6 +57,32 @@ describe('MutationGate — WS-R2 util (position 9.5; closes no finding by itself
     expect(gate.refusedCount).toBe(1);
   });
 
+  it('IN-FLIGHT-ACROSS-CLOSE (value): an op invoked while open, still pending when close() races in, resolves the ORIGINAL sink() promise with its real value after close', async () => {
+    const gate = createMutationGate();
+    const op = deferred<string>();
+    const sinkPromise = gate.sink(() => op.promise); // op() invoked synchronously — gate was still open
+    const closing = gate.close(sinkPromise); // close() races in while the op is still pending
+    expect(gate.closed).toBe(true); // the flip is synchronous, independent of the drain settling
+    // op is STILL pending here — close() must not touch/refuse an already-invoked op;
+    // it was started before the flip and the gate never re-checks a started op.
+    op.resolve('in-flight-real-value');
+    await expect(sinkPromise).resolves.toBe('in-flight-real-value');
+    await closing;
+    expect(gate.refusedCount).toBe(0); // an in-flight-before-close op is never refused
+  });
+
+  it('IN-FLIGHT-ACROSS-CLOSE (rejection): an in-flight op that rejects after close() still rejects the ORIGINAL sink() promise; close() itself still resolves (drain rejection neutralized)', async () => {
+    const gate = createMutationGate();
+    const op = deferred<string>();
+    const sinkPromise = gate.sink(() => op.promise);
+    const closing = gate.close(sinkPromise); // close() races in while the op is still pending
+    const boom = new Error('in-flight-boom');
+    op.reject(boom);
+    await expect(sinkPromise).rejects.toBe(boom); // pass-through, not swallowed by the gate
+    await expect(closing).resolves.toBeUndefined(); // close() never rejects on a drain failure
+    expect(gate.refusedCount).toBe(0);
+  });
+
   it('close() awaits the drain (settles only after the drain settles, pre-deadline)', async () => {
     const gate = createMutationGate();
     const drain = deferred<void>();
