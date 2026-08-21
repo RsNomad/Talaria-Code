@@ -505,10 +505,9 @@ function foldTurnStart(state: AppState, msg: Extract<HostToWebview, { type: 'tur
     // case-4 mint that inherited it would name two tabs identically).
     newTabTitle: `Chat ${state.nextChatNumber}`,
   });
-  // H1-A1: only case 4 ever grows tabOrder (cases 1/2/3 retitle/adopt an
-  // EXISTING tab) — a mint is therefore detected by tabOrder growing, and
-  // `nextChatNumber` advances exactly once per mint, never on close/retitle.
-  const minted = result.tabOrder.length > state.tabOrder.length;
+  // H1-A1 (WS-R4): only case 4 mints — now stated by the reconciler itself
+  // instead of inferred from tabOrder growth.
+  const minted = result.kind === 'opened';
   const nextChatNumber = minted ? state.nextChatNumber + 1 : state.nextChatNumber;
   // W4-T3b (§7 B9(c) wiring): APPEND whatever handleSessionChange returns
   // onto the existing queue — never overwrite it. Case 2's dedup (the only

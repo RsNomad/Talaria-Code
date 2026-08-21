@@ -224,7 +224,51 @@ describe('handleSessionChange — B9 race rules (gating, §7 B9)', () => {
 
     const result = handleSessionChange(state, { currentSessionId: 's1', currentSessionTitle: 'X' });
 
-    expect(result).toEqual({ tabs: {}, tabOrder: [], activeTabId: 'ghost', closeIntents: [] });
+    expect(result).toEqual({ tabs: {}, tabOrder: [], activeTabId: 'ghost', closeIntents: [], kind: 'noop' });
     expect(warn).toHaveBeenCalled();
+  });
+});
+
+describe('WS-R4 sub — handleSessionChange kind discriminant', () => {
+  it("case 1 (active tab owns it) → kind 'noop'", () => {
+    const state = {
+      tabs: { t1: { ...makeTabState('t1', 'A'), sessionId: 's1', binding: 'bound' as const } },
+      tabOrder: ['t1'],
+      activeTabId: 't1',
+    };
+    expect(handleSessionChange(state, { currentSessionId: 's1', currentSessionTitle: 'A2' }).kind).toBe('noop');
+  });
+
+  it("case 2 (another tab owns it) → kind 'switched'", () => {
+    const state = {
+      tabs: {
+        t1: { ...makeTabState('t1', 'A'), sessionId: 'sA', binding: 'bound' as const },
+        t2: { ...makeTabState('t2', 'B'), sessionId: 's1', binding: 'bound' as const },
+      },
+      tabOrder: ['t1', 't2'],
+      activeTabId: 't1',
+    };
+    expect(handleSessionChange(state, { currentSessionId: 's1', currentSessionTitle: 'B2' }).kind).toBe('switched');
+  });
+
+  it("case 3 (unbound active tab adopts) → kind 'noop' (active tab kept)", () => {
+    const state = { tabs: { t1: makeTabState('t1', 'A') }, tabOrder: ['t1'], activeTabId: 't1' };
+    expect(handleSessionChange(state, { currentSessionId: 's1', currentSessionTitle: 'A' }).kind).toBe('noop');
+  });
+
+  it("case 4 (new tab minted) → kind 'opened'", () => {
+    const state = {
+      tabs: { t1: { ...makeTabState('t1', 'A'), sessionId: 'sA', binding: 'bound' as const } },
+      tabOrder: ['t1'],
+      activeTabId: 't1',
+    };
+    expect(
+      handleSessionChange(state, { currentSessionId: 's1', currentSessionTitle: 'A', newTabId: 'tN' }).kind,
+    ).toBe('opened');
+  });
+
+  it("defensive unknown-active-tab → kind 'noop'", () => {
+    const state = { tabs: {}, tabOrder: [], activeTabId: 'ghost' };
+    expect(handleSessionChange(state, { currentSessionId: 's1', currentSessionTitle: 'A' }).kind).toBe('noop');
   });
 });
