@@ -406,6 +406,30 @@ describe('WS-R3 characterization — handleAcpCrash observable sequence', () => 
     expect(h.emitted).toHaveLength(0); // and NOTHING else ran (no banner)
     expect(h.port.settleOneShot).not.toHaveBeenCalled();
   });
+
+  it('pendingRecovery snapshot is taken BEFORE the crash fan-out — order-sensitive (endOnCrash mutates the registry)', async () => {
+    const h = await startedHarness();
+    const extra = makeController('session-2', 'tab-2');
+    h.controllers.set('session-2', extra);
+    // endOnCrash never mutates the registry in production (comment :1044-1049),
+    // and the fakes' default no-op endOnCrash can't observe a snapshot/fan-out
+    // reorder either way — so mutate the registry HERE, mid-fan-out, to make
+    // the relative order observable: if a future extraction moved the
+    // pendingRecovery snapshot to AFTER this loop, it would compute against
+    // the POST-deletion registry and miss 'session-1'.
+    extra.endOnCrash.mockImplementation(() => {
+      h.controllers.delete('session-1');
+    });
+
+    must(h.clients[0]).simulateExit(1);
+
+    // still the PRE-fan-out set — proves the snapshot ran before the loop,
+    // not after (a post-fan-out snapshot would see only ['session-2']).
+    expect((h.supervisor as unknown as CrashSeam).pendingRecovery?.map((r) => r.sessionId)).toEqual([
+      'session-1',
+      'session-2',
+    ]);
+  });
 });
 
 describe('WS-R3 characterization — reconnect refusal matrix + teardown', () => {
@@ -431,6 +455,24 @@ describe('WS-R3 characterization — reconnect refusal matrix + teardown', () =>
     });
   });
 
+  it("acpState 'starting' → honest refusal, distinct wording from idle/live-turn", async () => {
+    const h = makeSupervisorHarness();
+    (h.supervisor as unknown as CrashSeam).acpState = 'starting';
+    await expect(h.supervisor.reconnect()).resolves.toEqual({
+      ok: false,
+      reason: 'The agent is already (re)connecting — wait a moment, then re-check.',
+    });
+  });
+
+  it("acpState 'respawning' → same honest-refusal wording as 'starting' (the third refusal-matrix arm)", async () => {
+    const h = makeSupervisorHarness();
+    (h.supervisor as unknown as CrashSeam).acpState = 'respawning';
+    await expect(h.supervisor.reconnect()).resolves.toEqual({
+      ok: false,
+      reason: 'The agent is already (re)connecting — wait a moment, then re-check.',
+    });
+  });
+
   it("idle reconnect: teardown ordering + startInternal in the SAME tail link → {ok:true}; pins the reconnect fan-out log line (NO tab segment)", async () => {
     const h = makeSupervisorHarness();
     await h.supervisor.start();
@@ -443,7 +485,9 @@ describe('WS-R3 characterization — reconnect refusal matrix + teardown', () =>
     await expect(h.supervisor.reconnect()).resolves.toEqual({ ok: true });
     expect(h.port.settleOneShot).toHaveBeenCalledWith('agent reconnecting');
     expect(must(h.clients[0]).disposeCallCount).toBe(1); // old client disposed
+    expect(must(h.clients[0]).exitHandlers).toHaveLength(0); // old exit-sub cleared — the double-start guard :1126-27 protects
     expect(h.clients).toHaveLength(2); // startInternal spawned a fresh one
+    expect(h.emitted.filter((m) => m.type === 'system.error')).toHaveLength(0); // reconnect never emits the crash banner
     expect(
       h.logs.some((l) =>
         l.includes("reconnect fan-out: endOnCrash failed for session 'session-bad', continuing:"),
