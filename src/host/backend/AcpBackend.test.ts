@@ -2478,6 +2478,7 @@ describe('WS-R1 F3-1 — openTab mint is raced (deadline + exit)', () => {
     // openSession's isStaleAttempt guard (:900-924): close, never bind.
     expect(client.closeSessionCalls).toContain('session-belated');
     expect(messages.filter((m) => m.type === 'tab.bound')).toHaveLength(0);
+    expect(hasController(backend, 'session-belated')).toBe(false); // no registry leak on the discard path
   });
 });
 

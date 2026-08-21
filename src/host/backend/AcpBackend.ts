@@ -879,14 +879,18 @@ export class AcpBackend implements AgentBackend {
    *
    * T-3 (closes B1-M1): `isStaleAttempt`, when supplied, is checked ONCE
    * `client.newSession` resolves — BEFORE `sessions.open`'s registration
-   * has a chance to become visible via `tab.bound`. Only
-   * `ConnectionSupervisor.establishInitialSession`'s bootstrap race passes
-   * one (see its own doc for why the guard has to live HERE rather than at
-   * that call site: this method's register-then-announce runs to
-   * completion synchronously off the SAME microtask `newSession` resolves
-   * into, so by the time control would return to a caller-side check,
-   * `tab.bound` has already fired). `openTab` never passes one — a plain
-   * new-tab mint has no earlier deadline/exit to have been abandoned by.
+   * has a chance to become visible via `tab.bound`. The guard has to live
+   * HERE rather than at either call site: this method's register-then-
+   * announce runs to completion synchronously off the SAME microtask
+   * `newSession` resolves into, so by the time control would return to a
+   * caller-side check, `tab.bound` has already fired. WS-R1 F3-1: BOTH
+   * mints now pass one — `ConnectionSupervisor.establishInitialSession`'s
+   * bootstrap race and `openTabInternal`'s user-tab race each wrap their
+   * `openSession(...)` call in `settleRace(open, { exit, deadline:
+   * SESSION_ESTABLISH_DEADLINE_MS })` and supply `() => attemptAbandoned`
+   * as this argument, so a belated `session/new` for either kind of mint
+   * lands here and is discarded: the orphaned session is closed and no
+   * `tab.bound` is ever announced for it.
    */
   private async openSession(
     cwd: string,

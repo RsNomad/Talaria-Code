@@ -1210,9 +1210,11 @@ export interface ConnectionSupervisorHostPort {
    * `client.newSession` resolves — BEFORE registering the controller or
    * firing `tab.bound` — so a belated resolve for an attempt this class
    * already gave up on (deadline/exit) closes the orphaned session instead
-   * of binding it. `establishInitialSession` is the only caller that passes
-   * one; `openTab`'s un-raced mint has nothing to abandon it, so it omits
-   * the argument (always `undefined` there — never stale).
+   * of binding it. `establishInitialSession` is the only caller reached
+   * through this port interface that passes one. WS-R1 F3-1: `openTab`'s
+   * mint (`AcpBackend.openTabInternal`, called directly — not through this
+   * port) is ALSO now deadline+exit-raced and passes the same guard; it is
+   * no longer un-raced, and no longer unconditionally `undefined`/never-stale.
    */
   openSession(cwd: string, tabId: string, isStaleAttempt?: () => boolean): Promise<SessionController>;
   /** `[...this.mcpServers.values()]` — the MCP servers to advertise on a recovered `session/load`. */
