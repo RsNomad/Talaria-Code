@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import { ContextResolver } from './resolver';
 import type { ResolverPorts, ConfineFn } from './resolver';
@@ -321,5 +321,80 @@ describe('ContextResolver.resolveAll — git', () => {
 
     expect(result?.text).toBe('staged  src/a.ts\n\n--- a/x\n+++ b/x\n+console.log(1);');
     expect(result?.text).not.toContain('withheld');
+  });
+});
+
+describe('ContextResolver.withDeadline — T12 characterization pins (contract frozen before the settleRace swap)', () => {
+  it('pins the FULL timed-out skip shape: uri "skipped:git", fallback title = ref.id, {reason:"error", detail:"timed out"}', async () => {
+    vi.useFakeTimers();
+    try {
+      const hangingGit: GitPort = {
+        ...makePorts().git,
+        workingDiff: () => new Promise(() => {}), // never settles
+      };
+      const resolver = new ContextResolver(makePorts({ git: hangingGit }), { confine: denyConfine, deadlineMs: 20 });
+      const gitRef = ref('git'); // id 'git-1', no path → fallbackTitle() returns ref.id
+
+      const pending = resolver.resolveAll([gitRef]);
+      await vi.advanceTimersByTimeAsync(20);
+      const [result] = await pending;
+
+      expect(result).toEqual({
+        ref: gitRef,
+        uri: 'skipped:git',
+        title: 'git-1',
+        skipped: { reason: 'error', detail: 'timed out' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('pins the fast path leaving NO stray deadline timer behind', async () => {
+    vi.useFakeTimers();
+    try {
+      const resolver = new ContextResolver(makePorts(), { confine: denyConfine });
+      await resolver.resolveAll([ref('problems')]); // resolves via microtasks only — no timer advance needed
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('pins that a work rejection AFTER the deadline already fired is discarded — result unchanged, no unhandledRejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+    vi.useFakeTimers();
+    try {
+      let rejectWork: ((reason: unknown) => void) | undefined;
+      const hangingGit: GitPort = {
+        ...makePorts().git,
+        workingDiff: () =>
+          new Promise<string>((_resolve, reject) => {
+            rejectWork = reject;
+          }),
+      };
+      const resolver = new ContextResolver(makePorts({ git: hangingGit }), { confine: denyConfine, deadlineMs: 10 });
+
+      const pending = resolver.resolveAll([ref('git')]);
+      await vi.advanceTimersByTimeAsync(10);
+      const [result] = await pending;
+      expect(result?.skipped).toEqual({ reason: 'error', detail: 'timed out' });
+
+      // NOW the port rejects, after the deadline already produced the skip.
+      rejectWork?.(new Error('late failure, after the deadline already fired'));
+      // Node's unhandledRejection detection needs a real macrotask turn — the
+      // same real-timer switch as toolPipeline.test.ts's regression lock (:206-213).
+      vi.useRealTimers();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(unhandled).toEqual([]);
+    } finally {
+      vi.useRealTimers(); // idempotent — safe after the in-test switch
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
   });
 });
