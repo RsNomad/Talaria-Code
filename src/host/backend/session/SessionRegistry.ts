@@ -25,7 +25,7 @@ export class SessionRegistry {
    * from the map FIRST, synchronously, THEN disposed — BEFORE the new
    * controller is minted and takes its slot. `dispose()` clears the stale
    * controller's `replay` (no-emit) and settles its pendingApprovals/turn,
-   * so a belated in-flight `loadReplay` on it trips ITS OWN `this.replay
+   * so a belated in-flight `loadReplayOutcome` call on it trips ITS OWN `this.replay
    * !== replay` supersede-guard the instant it resumes — the exact
    * mechanism the same-TAB C1 fix already relies on (`AcpBackend
    * .loadSessionIntoTab`'s doc), now also covering the same-SESSION-

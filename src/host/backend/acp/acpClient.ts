@@ -812,7 +812,7 @@ export class AcpClient implements AcpClientLike {
     // `ConnectionSupervisor.recoverOneSession`'s crash-recovery caller
     // already races this same call via `raceRecoveryAgainstChildExit`
     // (`onExit`-based, pre-existing) — redundant with this, unchanged.
-    // `SessionController.loadReplay`'s History-panel caller (`:1141`) had NO
+    // `SessionController.loadReplayOutcome`'s History-panel caller (`:1141`) had NO
     // race of its own: its `try/catch` (already correct — emits an honest
     // `error` + terminal `turn.end`) could never fire on a child death
     // mid-load before this fix, for the identical "the await itself never
@@ -843,7 +843,7 @@ export class AcpClient implements AcpClientLike {
           found: true,
           currentModeId: response.modes.currentModeId ?? 'default',
           // A7: same capture as `newSession` — a History-panel load or
-          // crash-recovery replay (`SessionController.loadReplay`) restores
+          // crash-recovery replay (`SessionController.loadReplayOutcome`) restores
           // the harness-bound model too, not just the mode.
           ...(response.models?.currentModelId !== undefined
             ? { currentModelId: response.models.currentModelId }

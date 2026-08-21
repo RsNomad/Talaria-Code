@@ -93,7 +93,8 @@ interface FakeController {
   endOnCrash: ReturnType<typeof vi.fn>;
   endForRestart: ReturnType<typeof vi.fn>;
   /** WS-R4 step 3 (Task 21): recoverOneSession now calls loadReplayOutcome
-   * (the nested-discrimination seam), not the retired loadReplay adapter. */
+   * (the nested-discrimination seam), not the loadReplay adapter (WS-R4
+   * step 5 / Task 23 deleted it once every caller had migrated). */
   loadReplayOutcome: ReturnType<typeof vi.fn>;
   getRootId: () => string;
 }

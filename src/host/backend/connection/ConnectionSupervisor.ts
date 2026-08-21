@@ -782,7 +782,7 @@ export class ConnectionSupervisor {
         await this.recoverOneSession(sessionId, cwd, tabId, Math.min(SESSION_ESTABLISH_DEADLINE_MS, remainingMs));
       } catch (err) {
         // Defensive — `recoverOneSession` itself never throws today
-        // (`SessionController.loadReplay` never rejects), but keeping this
+        // (`SessionController.loadReplayOutcome` never rejects), but keeping this
         // per-attempt catch makes the F2 "one bad session can't wedge the
         // others" guarantee airtight against a future change to that
         // contract, exactly like `establishInitialSession`'s own try/catch

@@ -12,7 +12,7 @@ import type { ChildProcess } from 'node:child_process';
  * installed SDK's `loadSession()` then does `?? {}` (`dist/acp.js:484`) before
  * handing it back to us. This is the crash-recovery path: kill Hermes
  * mid-session and the client re-`session/load`s it on respawn
- * (`ConnectionSupervisor.recoverOneSession` -> `SessionController.loadReplay`
+ * (`ConnectionSupervisor.recoverOneSession` -> `SessionController.loadReplayOutcome`
  * -> `client.loadSession`) — if that comes back `None`, the restored
  * conversation must not silently look like an empty-but-successful load.
  *

@@ -52,7 +52,7 @@ import { extractPreviewFiles } from '../../preview/extractPreviewFiles';
  * MOVED VERBATIM off `AcpBackend`: `sendPrompt`, `cancel`, `respondApproval`,
  * `resolveDiff`, `applyUpdate` (ex-`handleSessionUpdate` body),
  * `handlePermission` (ex-`handleRequestPermission` body), `setPreset`,
- * `setModel`, the `loadReplay`/replay bookkeeping, and `dispose()`
+ * `setModel`, the `loadReplayOutcome`/replay bookkeeping, and `dispose()`
  * — each now reading THIS controller's own fields instead of `AcpBackend`'s
  * flat globals. (The `setMode` body that once lived here was YAGNI-deleted in
  * H9/P7-N10 — the wire-mode pin is `pinWireModeDefault`; the picker uses
@@ -86,7 +86,7 @@ import { extractPreviewFiles } from '../../preview/extractPreviewFiles';
  * load's belated resolution must not flip the WINNING load's `replaying`
  * flag" test, which spies on ONE stable `subagents` object instance across
  * two overlapping loads targeting different session ids). `sessionId`/`cwd`
- * are therefore plain mutable fields, reassigned only by {@link loadReplay}.
+ * are therefore plain mutable fields, reassigned only by {@link loadReplayOutcome}.
  * T3 replaces this approximation with a REAL per-tab controller mint.
  */
 
@@ -180,7 +180,7 @@ export class SessionController {
   /**
    * ARCH-1 (final review, UI I-1) §1.6 — liveness token for `setModel`, the
    * same idiom this controller already uses for `this.replay !== replay`
-   * (loadReplay) and BF-B's `disposed` re-check. Two rapid picks A→B can
+   * (loadReplayOutcome) and BF-B's `disposed` re-check. Two rapid picks A→B can
    * settle out of order; each attempt captures `++this.modelSwitchSeq` at
    * entry, and its resolve/reject handler drops silently if a NEWER attempt
    * has since bumped the counter — only the newest attempt's terminal push
@@ -198,7 +198,7 @@ export class SessionController {
    * BF-B: closes the pre-registration dangling-promise window in
    * `handlePermission` — mirrors the controller's existing liveness-token
    * idiom (the `this.replay !== replay` re-check after an await in the
-   * `loadReplay` path). `dispose()`'s `cancelPendingApprovals()` only
+   * `loadReplayOutcome` path). `dispose()`'s `cancelPendingApprovals()` only
    * settles approvals ALREADY registered in `pendingApprovals`; a
    * `handlePermission` still suspended on `buildPresentEffectSignals`'s
    * async path canonicalization at dispose time has nothing there yet to
@@ -271,10 +271,10 @@ export class SessionController {
    * `AcpBackend.pinWireModeDefault` — F4 (the pin is per-controller now).
    *
    * CF-01/I-2 (W1-T3): this is the ONE place both call sites reach —
-   * `loadReplay` (~:1123) and `AcpBackend.openSession` (~:754) — so
+   * `loadReplayOutcome` (~:1123) and `AcpBackend.openSession` (~:754) — so
    * catching `setSessionMode`'s rejection HERE closes both by construction,
    * with no duplicated try/catch at either await. Before this fix, a
-   * rejection propagated out of `loadReplay` (falsifying its documented
+   * rejection propagated out of `loadReplayOutcome` (falsifying its documented
    * "never rejects" contract — the webview's already-emitted `clear`/
    * `turn.start` pair would never get a closing `turn.end`) and out of
    * `openSession` (which `establishInitialSession`'s try/catch does stop
@@ -801,7 +801,7 @@ export class SessionController {
         // interchangeable:
         //  - disposed: stay as silent as every other BF-B liveness guard in
         //    this file (`reportUndeliveredUtterance`, `emitApprovalCard`,
-        //    the `loadReplay` continuation, `dispose()` itself). By the time
+        //    the `loadReplayOutcome` continuation, `dispose()` itself). By the time
         //    a belated resolve lands here, `SessionRegistry.open`'s
         //    same-sessionId replace (W6-FB) may already have minted a FRESH
         //    controller sharing this same `port` — emitting would risk
@@ -1195,7 +1195,7 @@ export class SessionController {
    * snapshot call site — i.e. captured AT SNAPSHOT TIME — and handed to
    * `tracker.snapshot(...)` as plain data; the tracker stores it verbatim on
    * the row it writes and NEVER re-reads it later. Because `sessionId` can
-   * be reassigned in place (`loadReplay`, per this class's own T1a
+   * be reassigned in place (`loadReplayOutcome`, per this class's own T1a
    * mutability note), a later rotation never retroactively changes an
    * already-written row's label — exactly the R8 guarantee (session ids
    * rotate on auto-compaction, so they must never be treated as a live
@@ -1229,23 +1229,13 @@ export class SessionController {
    * `client.loadSession(cwd, ...)` used the raw param while internal state
    * adopted the confined `adoptedCwd`).
    *
-   * WS-R4: thin legacy adapter over loadReplayOutcome — 'loaded' → result;
-   * 'superseded' WITH a result payload (the :1240 arm) → that result
-   * (today's silent success, pinned); every other kind → undefined.
-   * Deleted once both callers migrate (Tasks 21-22).
+   * WS-R4 step 5: the sole surviving entry point — both production callers
+   * (`ConnectionSupervisor.recoverOneSession`, `AcpBackend
+   * .loadSessionIntoTabInternal`) discriminate this method's
+   * `LoadReplayOutcome` union natively; the thin `loadReplay` adapter that
+   * used to collapse it back to `AcpLoadSessionResult | undefined` is
+   * deleted (Tasks 21-22 migrated both callers off it first).
    */
-  async loadReplay(
-    rawCwd: string,
-    sessionId: string,
-    adoptedCwd: string,
-    mcpServers: AcpMcpServer[],
-  ): Promise<AcpLoadSessionResult | undefined> {
-    const outcome = await this.loadReplayOutcome(rawCwd, sessionId, adoptedCwd, mcpServers);
-    if (outcome.kind === 'loaded') return outcome.result;
-    if (outcome.kind === 'superseded') return outcome.result;
-    return undefined;
-  }
-
   async loadReplayOutcome(
     rawCwd: string,
     sessionId: string,
@@ -1340,12 +1330,12 @@ export class SessionController {
     }
     await this.pinWireModeDefault(result.currentModeId);
     // I-2 (W1-T3 review, Important fix; re-review fix2 added `|| this.
-    // disposed`): recheck for a superseding `loadReplay` AFTER this await —
+    // disposed`): recheck for a superseding `loadReplayOutcome` call AFTER this await —
     // the guard just above (~:1180) only covers the `client.loadSession`
     // await; `pinWireModeDefault` is a SEPARATE suspension point with no
     // recheck of its own before this fix. THIS call reset `this.replay` to
     // `undefined` two lines above; a non-undefined value at this point can
-    // only mean a second, superseding `loadReplay` claimed it on the SAME
+    // only mean a second, superseding `loadReplayOutcome` call claimed it on the SAME
     // instance in the meantime (the synthetic case production never
     // creates). The REAL production supersede is `SessionRegistry.open`
     // minting a FRESH controller and DISPOSING this one — which also resets
@@ -1451,13 +1441,13 @@ export class SessionController {
    * every rejection). Child + tracker + dashboard are disposed ONLY in
    * `AcpBackend.dispose()` — this method never touches them.
    *
-   * W4-T5a: also invalidates an in-flight `loadReplay` (sets `this.replay =
+   * W4-T5a: also invalidates an in-flight `loadReplayOutcome` call (sets `this.replay =
    * undefined` with NO emit). `loadSessionIntoTab` now mints a FRESH
    * controller per load and disposes the tab's PRIOR one (F6) instead of
    * reusing one controller in place — so a prior controller's `session/load`
    * can still be awaiting `client.loadSession()` at the moment it is
    * disposed (a second, faster load into the SAME tab won the race). Without
-   * this, that belated resolution would run `loadReplay`'s success/failure
+   * this, that belated resolution would run `loadReplayOutcome`'s success/failure
    * tail on the DISPOSED controller and emit stale `clear`/`turn.start`-
    * bracketed messages via the shared `port.emit` — into a tab a fresh
    * controller has since taken over (the cross-controller generalization of

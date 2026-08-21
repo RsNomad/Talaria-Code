@@ -3175,8 +3175,8 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
    * `found:false` (not a rejection) for the recovered session id. Proves ALL
    * THREE effects fire together through the REAL recovery path
    * (`ConnectionSupervisor.recoverOneSession` -> `SessionController.
-   * loadReplay`'s `!result.found` branch -> that branch's existing `result
-   * === undefined` handling): the transcript-level `error`, the tab-chrome
+   * loadReplayOutcome`'s `!result.found` branch -> that branch's existing
+   * `{kind:'not-found'}` handling): the transcript-level `error`, the tab-chrome
    * `tab.error{kind:'session-lost'}`, and the dropped controller — not just
    * each one covered in isolation elsewhere.
    */
@@ -3196,7 +3196,7 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
     expect(clients).toHaveLength(2);
     expect(must(clients[1]).loadSessionCalls).toHaveLength(1);
 
-    // the transcript-level signal — loadReplay's own found:false branch,
+    // the transcript-level signal — loadReplayOutcome's own found:false branch,
     // identical shape to a rejected client.loadSession().
     expect(messages).toContainEqual({
       type: 'error',
@@ -3259,7 +3259,7 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
 
   /**
    * I1 (independent concurrency review, W4-T5a fix pass): `recoverOneSession`
-   * awaits `client.loadSession` (via `controller.loadReplay`) INSIDE the
+   * awaits `client.loadSession` (via `controller.loadReplayOutcome`) INSIDE the
    * `inFlightStart`-serialized `start()` run. `AcpClientLike.loadSession` is
    * not contractually guaranteed to reject when its child is killed
    * mid-request — if it HANGS, that await never settles, `start()`'s `run`
@@ -3311,8 +3311,8 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
  * `acpState` to `'respawning'` SYNCHRONOUSLY on the child's `exit` event
  * (the last act of `teardownForRespawn`) — so a SECOND crash landing while
  * `recoverSessions` is still awaiting a hung `loadSession` flips the state
- * before that await ever settles (the raced `loadReplay` resolves
- * `undefined` via the same exit, one tick later). The unconditional emit
+ * before that await ever settles (the raced `loadReplayOutcome` call
+ * resolves via the same exit, one tick later). The unconditional emit
  * then wrongly retired the outage banner the 2nd crash had just raised.
  */
 describe('WS-R3 F3-2 — a 2nd crash mid-recovery must not retire the fresh outage banner', () => {
@@ -3443,10 +3443,10 @@ describe('AcpBackend — T-1 (V-12 RESTART-STATE): explicit restart fans out end
       expect(loadedIds).toEqual(['session-1', 'session-2']); // both sessions recovered normally
 
       // Exactly ONE `clear` per recovered session — `SessionController.
-      // loadReplay`'s OWN, pre-existing per-session clear (unrelated to the
+      // loadReplayOutcome`'s OWN, pre-existing per-session clear (unrelated to the
       // restart fan-out). If the fan-out's `pendingRecovery` guard were
       // broken, the bootstrap session would get a SECOND, extra clear from
-      // `fanOutRestartSignal` stacked on top of `loadReplay`'s.
+      // `fanOutRestartSignal` stacked on top of `loadReplayOutcome`'s.
       const clears = messages.filter((m) => m.type === 'clear') as Array<{ sessionId: string }>;
       expect(clears.map((c) => c.sessionId).sort()).toEqual(['session-1', 'session-2']);
 
@@ -3738,7 +3738,7 @@ describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session"
  * a failed/superseded recovery load, with NO identity guard. `loadTab`/
  * `tab.load` used to NOT be serialized behind `inFlightStart` (only `openTab`
  * was) — a user could load the SAME `sessionId` into a DIFFERENT tab WHILE
- * this recovery's own `loadReplay` await was still in flight.
+ * this recovery's own `loadReplayOutcome` await was still in flight.
  * `SessionRegistry.open`'s W6-FB remove-then-dispose then disposed recovery's
  * controller and rebound `sessionId` to the winner's fresh controller. If
  * recovery's own load THEN failed, closing by key disposed the WINNER (not
@@ -3785,7 +3785,7 @@ describe('AcpBackend — CF-01/L3-1: loadTab is now serialized on the SAME tail 
     await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID, on client[0]
 
     must(clients[0]).simulateExit(1); // crash -> respawning, backoff scheduled
-    await vi.advanceTimersByTimeAsync(500); // respawn #1 fires -> recoverOneSession's own loadReplay (call #0) is now in flight, still inside start()'s OWN runOnStartTail turn
+    await vi.advanceTimersByTimeAsync(500); // respawn #1 fires -> recoverOneSession's own loadReplayOutcome call (call #0) is now in flight, still inside start()'s OWN runOnStartTail turn
 
     expect(loadCalls).toHaveLength(1); // recovery's own session-1 load — not yet settled
 
@@ -3804,9 +3804,9 @@ describe('AcpBackend — CF-01/L3-1: loadTab is now serialized on the SAME tail 
     // recovery — no second call has been made yet.
     expect(loadCalls).toHaveLength(1);
 
-    // Recovery's OWN load (call #0) now fails. `SessionController.loadReplay`
+    // Recovery's OWN load (call #0) now fails. `SessionController.loadReplayOutcome`
     // never rejects (it catches internally) — this settles `recoverOneSession`'s
-    // `result === undefined` failure branch, which identity-guard-closes
+    // non-`loaded` `outcome.kind` failure branch, which identity-guard-closes
     // session-1 (still its own, untouched, controller at this point).
     must(loadCalls[0]).reject(new Error('history store corrupt'));
     await flushMicrotasks();
@@ -3866,7 +3866,7 @@ describe('AcpBackend — CF-01/L3-1: loadSessionIntoTab/closeTab are serialized 
     // would already be 2 here. GREEN (post-fix): load B is queued behind
     // load A on the SAME `inFlightStart` tail — it cannot start until load
     // A's ENTIRE tail-wrapped call (through its own client.loadSession
-    // resolving and its whole announce/loadReplay chain) settles.
+    // resolving and its whole announce/loadReplayOutcome chain) settles.
     expect(calls).toHaveLength(1);
 
     calls[0]?.resolve({ found: true, currentModeId: 'default' });
@@ -3922,7 +3922,7 @@ describe('AcpBackend — CF-01/L3-1: loadSessionIntoTab/closeTab are serialized 
  * above), a hung-but-alive child wedges the ENTIRE topology tail forever —
  * every subsequent `openTab`/`closeTab`/`loadSessionIntoTab`/`start` chains
  * behind it. These tests prove `loadSessionIntoTabInternal`'s direct
- * `settleRace(loadReplay, { deadline: SESSION_ESTABLISH_DEADLINE_MS })` call
+ * `settleRace(loadReplayOutcome, { deadline: SESSION_ESTABLISH_DEADLINE_MS })` call
  * (WS-R1 step 3b — migrated off the now-deleted deadline-only adapter
  * `ConnectionSupervisor` used to expose) closes that gap, mirroring the T-3
  * "session-establish wall-clock deadline" describe block's own style for the
@@ -4211,7 +4211,7 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
     );
   });
 
-  it('a stale loadReplay whose controller was disposed (superseded by a fresh mint on the SAME tab) never emits into the tab after the fact (F6 x P4b generalized across mint-fresh)', async () => {
+  it('a stale loadReplayOutcome call whose controller was disposed (superseded by a fresh mint on the SAME tab) never emits into the tab after the fact (F6 x P4b generalized across mint-fresh)', async () => {
     const { backend } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
     let resolveFirst!: (result: AcpLoadSessionResult) => void;
     const firstLoad = new Promise<AcpLoadSessionResult>((resolve) => {
@@ -4252,15 +4252,16 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
    * Task-7 fix-wave (Important-1, guard 1 of 3): the SAME stale-superseded-load
    * proof as immediately above, but the belated resolution is `found:false`
    * (audit A-3's lost-session branch) instead of a genuine success. Proves the
-   * `if (this.replay !== replay) return undefined;` re-check INSIDE that
-   * branch (`SessionController.loadReplay`, right after the `!result.found`
-   * check) is load-bearing: without it, load A's belated `found:false`
-   * resolution would fall through and emit `error`/`turn.end` into tab-1
-   * AFTER its controller was disposed by load B's fresh mint — the exact
-   * "stale emit after supersede" class this file's `found:true` sibling test
-   * exists to forbid, just reached via the OTHER exit of `loadReplay`.
+   * `if (this.replay !== replay) return { kind: 'superseded' };` re-check
+   * INSIDE that branch (`SessionController.loadReplayOutcome`, right after
+   * the `!result.found` check) is load-bearing: without it, load A's belated
+   * `found:false` resolution would fall through and emit `error`/`turn.end`
+   * into tab-1 AFTER its controller was disposed by load B's fresh mint —
+   * the exact "stale emit after supersede" class this file's `found:true`
+   * sibling test exists to forbid, just reached via the OTHER exit of
+   * `loadReplayOutcome`.
    */
-  it('a stale loadReplay whose controller was disposed (superseded by a fresh mint on the SAME tab) never emits into the tab after the fact — found:false variant (audit A-3 supersede re-check)', async () => {
+  it('a stale loadReplayOutcome call whose controller was disposed (superseded by a fresh mint on the SAME tab) never emits into the tab after the fact — found:false variant (audit A-3 supersede re-check)', async () => {
     const { backend } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
     let resolveFirst!: (result: AcpLoadSessionResult) => void;
     const firstLoad = new Promise<AcpLoadSessionResult>((resolve) => {
@@ -4296,7 +4297,7 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
 
   /**
    * C1 (independent concurrency review, W4-T5a fix pass): the ABOVE "stale
-   * loadReplay" test runs with `workspaceFolders === undefined` — the ONE
+   * loadReplayOutcome" test runs with `workspaceFolders === undefined` — the ONE
    * branch of `loadSessionIntoTab` with NO `await` between capturing the
    * tab's occupant (:1601) and disposing it (pre-fix :1626). With a
    * workspace OPEN, `resolveWithinWorkspaceReal` (:1615) is a REAL `await`
@@ -4578,27 +4579,27 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
    * previously genuinely-silent branch: the client disappearing in the
    * window AFTER this method's own entry-check (a real ACP-child crash
    * while the `resolveWithinWorkspaceReal` confinement `await` is in flight
-   * is the realistic trigger) but BEFORE `controller.loadReplay` actually
-   * runs. `announceSessionBound` has ALREADY fired `tab.bound` by that
-   * point, so pre-fix this tab was left silently "bound" with an empty
+   * is the realistic trigger) but BEFORE `controller.loadReplayOutcome`
+   * actually runs. `announceSessionBound` has ALREADY fired `tab.bound` by
+   * that point, so pre-fix this tab was left silently "bound" with an empty
    * transcript and no failure affordance at all: `SessionController
-   * .loadReplay`'s own `!client` early-guard returns `undefined` with no
-   * `clear`/`turn.start`/`error`/`turn.end` of its own, and (pre-fix)
-   * `loadSessionIntoTabInternal` just forwarded that bare `undefined`
-   * straight through with no emission of its own — unlike
+   * .loadReplayOutcome`'s own `!client` early-guard resolves
+   * `{kind:'no-client'}` with no `clear`/`turn.start`/`error`/`turn.end` of
+   * its own, and (pre-fix) `loadSessionIntoTabInternal` just forwarded that
+   * bare `undefined` straight through with no emission of its own — unlike
    * `recoverOneSession`'s crash-recovery path, which already turns ANY
-   * `loadReplay` `undefined` (including this exact cause) into
+   * non-`loaded` `loadReplayOutcome` kind (including this exact cause) into
    * `tab.error{kind:'session-lost'}` unconditionally.
    *
    * A call-counting `getClient` stub simulates the crash deterministically
    * (no real fs interleaving needed): the FIRST call is this method's own
    * entry-check (must see the live client, or the test would exercise
    * CF-14's branch instead); every call after that — this fix's own
-   * pre-`loadReplay` check, and `loadReplay`'s internal check if ever
-   * reached — sees the client gone, exactly as an ACP crash mid-await
-   * would leave it.
+   * pre-`loadReplayOutcome` check, and `loadReplayOutcome`'s internal check
+   * if ever reached — sees the client gone, exactly as an ACP crash
+   * mid-await would leave it.
    */
-  it('TI-5 (AU-60): a client that disappears AFTER tab.bound fires but BEFORE loadReplay runs surfaces tab.error{session-lost} — not a silent no-op', async () => {
+  it('TI-5 (AU-60): a client that disappears AFTER tab.bound fires but BEFORE loadReplayOutcome runs surfaces tab.error{session-lost} — not a silent no-op', async () => {
     const { backend, clients } = makeStartableBackend();
     await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID, client alive
     const messages: HostToWebviewMessage[] = [];
@@ -4624,7 +4625,7 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
       kind: 'session-lost',
       message: expect.any(String),
     });
-    // Never reached the ACP client — loadReplay's own `!client` guard (or
+    // Never reached the ACP client — loadReplayOutcome's own `!client` guard (or
     // this fix's short-circuit ahead of it) refused before that.
     expect(must(clients[0]).loadSessionCalls).toEqual([]);
     // No leaked controller — mirrors the timeout branch's identity-guarded
@@ -4801,7 +4802,7 @@ describe('AcpBackend.invokeControl — Zone HIST: session.load (row click) round
 
     const result = await backend.invokeControl('session.load', { sessionId: 'gone-session', cwd: '/ws' });
 
-    // `loadReplay`'s own "not performed" signal — same shape a rejected
+    // `loadReplayOutcome`'s own "not performed" signal — same shape a rejected
     // `client.loadSession` already returns, NOT a bound empty transcript.
     expect(result).toBeUndefined();
     expect(messages.map((m) => m.type)).toEqual(['tab.bound', 'mode.state', 'clear', 'turn.start', 'error', 'turn.end']);
@@ -4818,7 +4819,7 @@ describe('AcpBackend.invokeControl — Zone HIST: session.load (row click) round
   /**
    * Task-7 fix-wave (Important-1, guard 2 of 3): proves
    * `this.subagents.setReplaying(false)` INSIDE the `!result.found` branch
-   * (`SessionController.loadReplay`) is load-bearing, mirroring the existing
+   * (`SessionController.loadReplayOutcome`) is load-bearing, mirroring the existing
    * P4b spy idiom (`seamFor(...).subagents`, `vi.spyOn`) rather than
    * reinventing one. Without it, a session whose load reports `found:false`
    * would be left permanently stuck in "replaying" mode — a LATER live
@@ -4840,7 +4841,7 @@ describe('AcpBackend.invokeControl — Zone HIST: session.load (row click) round
     seam(backend).client = client;
 
     const p = backend.invokeControl('session.load', { sessionId: 'gone-session', cwd: '/ws' });
-    await flushMicrotasks(); // let loadReplay reach `await client.loadSession(...)` — controller minted, setReplaying(true) already fired
+    await flushMicrotasks(); // let loadReplayOutcome reach `await client.loadSession(...)` — controller minted, setReplaying(true) already fired
 
     const ctrlSubagents = seamFor(backend, 'gone-session').subagents as { setReplaying(replaying: boolean): void };
     const setReplayingSpy = vi.spyOn(ctrlSubagents, 'setReplaying');
@@ -4854,7 +4855,7 @@ describe('AcpBackend.invokeControl — Zone HIST: session.load (row click) round
   /**
    * Task-7 fix-wave (Important-1, guard 3 of 3): proves `this.replay =
    * undefined` INSIDE the `!result.found` branch (`SessionController.
-   * loadReplay`) is load-bearing. The History-panel path (unlike crash
+   * loadReplayOutcome`) is load-bearing. The History-panel path (unlike crash
    * recovery) never closes the controller on `found:false` — it stays
    * registered, still bound to its tab (see `loadSessionIntoTab`'s own doc).
    * Without the clear, a LATER `session/update` for this same sessionId
@@ -10267,11 +10268,11 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
   /**
    * CF-01/I-2 (W1-T3, concurrency-critical): `pinWireModeDefault` is called
    * from TWO await sites that must never let a REJECTED `setSessionMode`
-   * escape uncaught — `loadReplay` (`SessionController.ts` ~:1123) and
+   * escape uncaught — `loadReplayOutcome` (`SessionController.ts` ~:1123) and
    * `openSession` (`AcpBackend.ts` ~:754). Before this fix, NEITHER call
    * site wrapped the pin, so a rejection propagated:
-   *  - out of `loadReplay` -> `loadSessionIntoTab` -> `invokeControl`,
-   *    falsifying `loadReplay`'s documented "never rejects" contract and
+   *  - out of `loadReplayOutcome` -> `loadSessionIntoTab` -> `invokeControl`,
+   *    falsifying `loadReplayOutcome`'s documented "never rejects" contract and
    *    leaving the webview's transcript stuck mid-turn (the `clear`/
    *    `turn.start` pair it already emitted is never closed by a `turn.end`
    *    — a genuinely different, protocol-level channel from the
@@ -10290,7 +10291,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
    * wrapping is duplicated at either await.
    */
   describe('CF-01/I-2 (W1-T3): a REJECTED setSessionMode pin degrades instead of propagating', () => {
-    it('loadReplay: never rejects past the pin, and still emits the closing turn.end (found:true, mode drift, setSessionMode rejects)', async () => {
+    it('loadReplayOutcome: never rejects past the pin, and still emits the closing turn.end (found:true, mode drift, setSessionMode rejects)', async () => {
       const { backend, client, messages } = makeBackend();
       mockWorkspace.workspaceFolders = undefined; // no roots -> load cwd confinement skipped (mirrors :6854)
       client.setLoadSessionResult({ found: true, currentModeId: 'accept_edits' }); // forces the pin's setSessionMode call
@@ -10299,7 +10300,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
         return Promise.reject(new Error('wire: setSessionMode failed'));
       };
 
-      // RED (pre-fix): this rejects — `loadReplay`'s "never rejects" contract
+      // RED (pre-fix): this rejects — `loadReplayOutcome`'s "never rejects" contract
       // is falsified by the un-caught pin at SessionController.ts ~:1123.
       const result = await backend.invokeControl('session.load', { sessionId: 'old-session', cwd: '/ws' });
       expect(result).toBeDefined(); // the load itself genuinely succeeded — only the best-effort pin degraded
@@ -10318,7 +10319,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
 
     /**
      * CF-01 (W1-T3 review, CRITICAL fix): the brief's concrete failing
-     * scenario end to end — crash-recovery/History `loadReplay` for a
+     * scenario end to end — crash-recovery/History `loadReplayOutcome` for a
      * session Hermes reports as `accept_edits` (real drift), whose re-pin
      * ALSO rejects. The load itself still degrades honestly (proven by the
      * test right above). The bug: before the fix, `currentMode` stayed
@@ -10332,7 +10333,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
      * genuinely re-attempts the pin — and, since it ALSO fails here, aborts
      * the turn honestly instead of ever reaching `client.prompt`.
      */
-    it('CF-01 fix: a loadReplay-drifted session with a persistently-failing pin ABORTS its next turn — never reaches client.prompt', async () => {
+    it('CF-01 fix: a loadReplayOutcome-drifted session with a persistently-failing pin ABORTS its next turn — never reaches client.prompt', async () => {
       const { backend, client, messages } = makeBackend();
       mockWorkspace.workspaceFolders = undefined; // no roots -> load cwd confinement skipped
       client.setLoadSessionResult({ found: true, currentModeId: 'accept_edits' }); // forces the pin's setSessionMode call

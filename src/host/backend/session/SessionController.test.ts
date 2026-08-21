@@ -317,7 +317,7 @@ describe('SessionController.setModel — ARCH-1 (final review, UI I-1): terminal
    *
    * `dispose()` case: the controller must stay as silent as every other
    * BF-B liveness guard in this file (`reportUndeliveredUtterance`,
-   * `emitApprovalCard`, the `loadReplay` continuation, `dispose()` itself) —
+   * `emitApprovalCard`, the `loadReplayOutcome` continuation, `dispose()` itself) —
    * `SessionRegistry.open`'s same-sessionId replace (W6-FB) can already have
    * minted a FRESH controller sharing this `port` by the time this resolve
    * lands, so an emit here would risk clobbering the NEW controller's
@@ -1284,23 +1284,29 @@ describe('SessionController.sendPrompt — V-19: attachment path confinement', (
 });
 
 /**
- * I-2 (W1-T3 review, Important fix): `loadReplay`'s LAST supersede guard
- * (`this.replay !== replay`) sits right before `this.replay = undefined`
- * (~:1142-1144) — but `await this.pinWireModeDefault(...)` (~:1154) is a
- * SEPARATE suspension point AFTER that guard, with no recheck once it
- * resolves. If a second, superseding `loadReplay` call (B) starts while the
- * first (A) is parked on that pin await — and B is itself still in flight
- * (parked on its OWN `client.loadSession` await, so `this.replay` still
- * points at B's fresh `ReplayTranslator`) — A resuming after the pin would,
- * pre-fix, call `markSubagentsInterrupted()` against B's already-reset fold
- * and emit a STALE `turn.end{complete}` for A's own superseded turn on top
- * of B's still-live replay. Fixed: recheck `this.replay !== undefined`
- * right after the pin await, before touching subagents or emitting
- * `turn.end` — A's own reset at ~:1144 left `this.replay` `undefined`; a
- * non-undefined value at this point can only mean a superseding call
- * claimed it in the meantime.
+ * I-2 (W1-T3 review, Important fix): `loadReplayOutcome`'s LAST supersede
+ * guard (`this.replay !== replay`) sits right before `this.replay =
+ * undefined` (~:1142-1144) — but `await this.pinWireModeDefault(...)`
+ * (~:1154) is a SEPARATE suspension point AFTER that guard, with no recheck
+ * once it resolves. If a second, superseding `loadReplayOutcome` call (B)
+ * starts while the first (A) is parked on that pin await — and B is itself
+ * still in flight (parked on its OWN `client.loadSession` await, so
+ * `this.replay` still points at B's fresh `ReplayTranslator`) — A resuming
+ * after the pin would, pre-fix, call `markSubagentsInterrupted()` against
+ * B's already-reset fold and emit a STALE `turn.end{complete}` for A's own
+ * superseded turn on top of B's still-live replay. Fixed: recheck
+ * `this.replay !== undefined` right after the pin await, before touching
+ * subagents or emitting `turn.end` — A's own reset at ~:1144 left
+ * `this.replay` `undefined`; a non-undefined value at this point can only
+ * mean a superseding call claimed it in the meantime.
+ *
+ * WS-R4 step 5: both tests below drive `loadReplayOutcome` directly (the
+ * `loadReplay` adapter these were originally written against is deleted) —
+ * their `resultA`/`resultB` assertions now check the union `kind` instead of
+ * the adapter's collapsed `AcpLoadSessionResult | undefined`; the underlying
+ * race being characterized is unchanged.
  */
-describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck AFTER the pinWireModeDefault await', () => {
+describe('SessionController.loadReplayOutcome — I-2 (W1-T3 review): supersede recheck AFTER the pinWireModeDefault await', () => {
   /** Same tiny deferred-promise helper `AcpBackend.test.ts` uses. */
   function deferred<T>() {
     let resolve!: (value: T) => void;
@@ -1311,8 +1317,9 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
   }
 
   // I-2 re-review (W1-T3 fix2): this first test exercises the SYNTHETIC
-  // same-instance variant — a second `loadReplay` re-claiming `this.replay`
-  // on the SAME controller — which the recheck's `this.replay !== undefined`
+  // same-instance variant — a second `loadReplayOutcome` call re-claiming
+  // `this.replay` on the SAME controller — which the recheck's
+  // `this.replay !== undefined`
   // half does cover, but which production never actually does. The test
   // below it ('A DISPOSED while parked...') exercises the REAL production
   // supersede: `SessionRegistry.open` minting a FRESH controller and
@@ -1374,7 +1381,7 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
     const controller = new SessionController('bootstrap', '/ws', port);
 
     // A starts and parks on `client.loadSession`.
-    const replayA = controller.loadReplay('/ws', 'session-A', '/ws', []);
+    const replayA = controller.loadReplayOutcome('/ws', 'session-A', '/ws', []);
 
     // A's load resolves with a drift, so A proceeds into the pin — which
     // itself parks on `setSessionModeA`. Flush generously: since
@@ -1383,29 +1390,32 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
     loadSessionA.resolve({ found: true, currentModeId: 'accept_edits' });
     for (let i = 0; i < 10; i++) await Promise.resolve();
 
-    // B supersedes A on the SAME controller — a second, later `loadReplay`
-    // call — and parks on ITS OWN `client.loadSession` (never reaches the
-    // pin in this test). `this.replay` now points at B's fresh
-    // ReplayTranslator.
-    const replayB = controller.loadReplay('/ws', 'session-B', '/ws', []);
+    // B supersedes A on the SAME controller — a second, later
+    // `loadReplayOutcome` call — and parks on ITS OWN `client.loadSession`
+    // (never reaches the pin in this test). `this.replay` now points at B's
+    // fresh ReplayTranslator.
+    const replayB = controller.loadReplayOutcome('/ws', 'session-B', '/ws', []);
     await Promise.resolve();
 
     emitted.length = 0; // isolate: only what happens from here on is under test
 
-    // Let A's pin settle — A resumes INSIDE loadReplay, past the pin await,
-    // with B still fully in flight.
+    // Let A's pin settle — A resumes INSIDE loadReplayOutcome, past the pin
+    // await, with B still fully in flight.
     setSessionModeA.resolve(undefined);
     const resultA = await replayA;
 
     // The fix: A emits NOTHING past the pin boundary once superseded — no
-    // stale turn.end, no commands.available, nothing.
+    // stale turn.end, no commands.available, nothing. WS-R4 step 5: this is
+    // the post-pin supersede arm — bare `{kind:'superseded'}`, no `result`
+    // key (exactOptional absent-key discipline).
     expect(emitted).toEqual([]);
-    expect(resultA).toBeUndefined();
+    expect(resultA).toEqual({ kind: 'superseded' });
+    expect('result' in resultA).toBe(false);
 
     // B is unaffected and still completes honestly with its own turn.end.
     loadSessionB.resolve({ found: true, currentModeId: 'default' });
     const resultB = await replayB;
-    expect(resultB).toEqual({ found: true, currentModeId: 'default' });
+    expect(resultB).toEqual({ kind: 'loaded', result: { found: true, currentModeId: 'default' } });
     expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'complete' }));
   });
 
@@ -1478,7 +1488,7 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
     const controller = new SessionController('bootstrap', '/ws', port);
 
     // A starts and parks on `client.loadSession`.
-    const replayA = controller.loadReplay('/ws', 'session-A', '/ws', []);
+    const replayA = controller.loadReplayOutcome('/ws', 'session-A', '/ws', []);
 
     // A's load resolves with a drift, so A proceeds into the pin — which
     // itself parks on `setSessionModeA`. Flush generously: since
@@ -1489,22 +1499,24 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
 
     // The REAL production supersede: a fresh controller is minted for this
     // sessionId (`SessionRegistry.open`) and THIS controller is disposed —
-    // never a second `loadReplay` call on the same instance. No live turn
-    // is registered here, so `dispose()` takes its no-op branch for the
+    // never a second `loadReplayOutcome` call on the same instance. No live
+    // turn is registered here, so `dispose()` takes its no-op branch for the
     // cancel/turn-lease bookkeeping; what matters is `this.replay =
     // undefined` and `this.disposed = true`.
     emitted.length = 0; // isolate: only what happens from here on is under test
     controller.dispose();
 
-    // Let A's pin settle — A resumes INSIDE loadReplay, past the pin await,
-    // on a controller that is now disposed.
+    // Let A's pin settle — A resumes INSIDE loadReplayOutcome, past the pin
+    // await, on a controller that is now disposed.
     setSessionModeA.resolve(undefined);
     const resultA = await replayA;
 
     // The fix: A emits NOTHING past the pin boundary once disposed — no
-    // stale turn.end, no commands.available, nothing.
+    // stale turn.end, no commands.available, nothing. WS-R4 step 5: bare
+    // `{kind:'superseded'}` via the `|| this.disposed` half of the recheck.
     expect(emitted).toEqual([]);
-    expect(resultA).toBeUndefined();
+    expect(resultA).toEqual({ kind: 'superseded' });
+    expect('result' in resultA).toBe(false);
   });
 });
 
@@ -1682,33 +1694,39 @@ describe('WS-R1 F3-4 — cancel fallback deadline force-ends an unresponsive tur
 
 /**
  * WS-R4 step 1 (REMEDIATION-ARCHITECTURE §3.4): characterization pins for
- * ALL SIX caller-visible outcomes `SessionController.loadReplay` can produce
- * today, BEFORE Task 20 replaces its `AcpLoadSessionResult | undefined`
- * sentinel return with a `LoadReplayOutcome` discriminated union. These are
- * NOT new-behavior tests — every pin here must already be GREEN against the
- * current implementation; if one fails, the test mischaracterized reality
- * and must be fixed, never the production code (characterization-TDD, not
- * red/green TDD).
+ * ALL SIX caller-visible outcomes `SessionController.loadReplayOutcome` can
+ * produce. Originally written (Task 19) against the pre-union
+ * `AcpLoadSessionResult | undefined` sentinel return, driven through the
+ * `loadReplay` adapter Task 20 laid over the new union (Task 21-22 migrated
+ * both production callers off that adapter onto the union directly). WS-R4
+ * step 5 (Task 23) deletes the now-unused `loadReplay` adapter and flips
+ * these SAME six arms to drive `loadReplayOutcome` directly, asserting its
+ * `LoadReplayOutcome` union `kind` (+ payload) instead of the adapter's
+ * collapsed return. These are NOT new-behavior tests — every pin here
+ * characterizes the SAME underlying six-arm behavior before and after the
+ * flip; if one fails, the test mischaracterized reality and must be fixed,
+ * never the production code (characterization-TDD, not red/green TDD).
  *
  * The reusable harness (`makeLoadHarness` + `FakeLoadClient`) is deliberately
- * factored out here for Tasks 20/23/24 to import/reuse against the NEW
- * union-returning `loadReplay` once it lands — same fake client, same port
- * shape, so the six arms below stay the behavior-preservation contract for
- * that migration.
+ * factored out here for reuse — same fake client, same port shape, so the
+ * six arms below stay the behavior-preservation contract across the
+ * adapter's whole migration-then-deletion arc.
  *
  * The decisive pin is the "success-but-superseded" arm (current source
- * `:1301`, `if (this.replay !== replay) return result;`): unlike every other
- * supersede arm in this method (which returns bare `undefined`), THIS one
- * returns a TRUTHY, well-formed `AcpLoadSessionResult` while a superseding
- * load has already claimed `this.replay` — and both of `loadReplay`'s
- * production callers (`AcpBackend.loadSessionIntoTab`,
- * `ConnectionSupervisor.recoverOneSession`) treat ANY truthy return as
- * silent success, never touching the tab. A naive Task 20 adapter that maps
- * "supersede while awaiting" generically to `undefined`/a `not-loaded`
- * variant would flip this arm's caller-visible outcome from silent-success
- * to `tab.error{session-lost}` + a guarded close — a real regression that
- * would still pass `tsc` and every OTHER existing test. Pinning the truthy
- * `toEqual` return here (not just `toBeDefined()`) is what makes that
+ * `:1301`, `if (this.replay !== replay) return { kind: 'superseded', result
+ * };`): unlike every other supersede arm in this method (which returns a
+ * BARE `{ kind: 'superseded' }`, no `result` key), THIS one carries a
+ * TRUTHY, well-formed `AcpLoadSessionResult` on the union while a
+ * superseding load has already claimed `this.replay` — and both of
+ * `loadReplayOutcome`'s production callers (`AcpBackend
+ * .loadSessionIntoTabInternal`, `ConnectionSupervisor.recoverOneSession`)
+ * treat this arm's `result` as SUCCESS, never touching the tab. A naive
+ * union consumer that maps every `superseded` kind generically (ignoring the
+ * `result` payload) would flip this arm's caller-visible outcome from
+ * silent-success to `tab.error{session-lost}` + a guarded close — a real
+ * regression that would still pass `tsc` and every OTHER existing test.
+ * Pinning the truthy `toEqual({ kind: 'superseded', result: {...} })` here
+ * (not just `toMatchObject({ kind: 'superseded' })`) is what makes that
  * regression fail loudly.
  */
 class FakeLoadClient {
@@ -1764,13 +1782,13 @@ function makeLoadHarness(): {
   return { controller: new SessionController('session-1', '/fake/ws', port), client, emitted };
 }
 
-describe('WS-R4 characterization — the SIX loadReplay arms (REMEDIATION-ARCHITECTURE §3.4)', () => {
-  it('ARM loaded (happy path): clear + turn.start stream, turn.end{complete}, returns the result', async () => {
+describe('WS-R4 characterization — the SIX loadReplayOutcome arms (REMEDIATION-ARCHITECTURE §3.4)', () => {
+  it('ARM loaded (happy path): clear + turn.start stream, turn.end{complete}, returns {kind:"loaded", result}', async () => {
     const { controller, client, emitted } = makeLoadHarness();
-    const load = controller.loadReplay('/fake/ws', 'session-1', '/fake/ws', []);
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
     client.resolveLoad(0, { found: true, currentModeId: 'default' });
-    const result = await load;
-    expect(result).toEqual({ found: true, currentModeId: 'default' });
+    const outcome = await load;
+    expect(outcome).toEqual({ kind: 'loaded', result: { found: true, currentModeId: 'default' } });
     expect(emitted).toContainEqual(expect.objectContaining({ type: 'clear', sessionId: 'session-1' }));
     expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.start', turnId: 'turn-1' }));
     expect(emitted).toContainEqual(
@@ -1778,7 +1796,7 @@ describe('WS-R4 characterization — the SIX loadReplay arms (REMEDIATION-ARCHIT
     );
   });
 
-  it('ARM no-client: resolves undefined with ZERO emissions (the silent arm)', async () => {
+  it('ARM no-client: resolves {kind:"no-client"} with ZERO emissions (the silent arm)', async () => {
     const { controller, emitted } = makeLoadHarness();
     // A port whose getClient answers undefined:
     const noClient = new SessionController('session-1', '/fake/ws', {
@@ -1792,24 +1810,26 @@ describe('WS-R4 characterization — the SIX loadReplay arms (REMEDIATION-ARCHIT
       resolveMentions: async () => [],
     });
     void controller; // the harness controller is unused in this arm
-    await expect(noClient.loadReplay('/fake/ws', 'session-1', '/fake/ws', [])).resolves.toBeUndefined();
+    await expect(noClient.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', [])).resolves.toEqual({
+      kind: 'no-client',
+    });
     expect(emitted).toHaveLength(0);
   });
 
-  it('ARM load-failed: error{message} + turn.end{error}, resolves undefined', async () => {
+  it('ARM load-failed: error{message} + turn.end{error}, resolves {kind:"load-failed", message}', async () => {
     const { controller, client, emitted } = makeLoadHarness();
-    const load = controller.loadReplay('/fake/ws', 'session-1', '/fake/ws', []);
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
     client.rejectLoad(0, new Error('load boom'));
-    await expect(load).resolves.toBeUndefined();
+    await expect(load).resolves.toEqual({ kind: 'load-failed', message: 'load boom' });
     expect(emitted).toContainEqual(expect.objectContaining({ type: 'error', message: 'load boom' }));
     expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'error' }));
   });
 
-  it('ARM not-found: the pinned message + turn.end{error}, resolves undefined', async () => {
+  it('ARM not-found: the pinned message + turn.end{error}, resolves {kind:"not-found"}', async () => {
     const { controller, client, emitted } = makeLoadHarness();
-    const load = controller.loadReplay('/fake/ws', 'session-1', '/fake/ws', []);
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
     client.resolveLoad(0, { found: false });
-    await expect(load).resolves.toBeUndefined();
+    await expect(load).resolves.toEqual({ kind: 'not-found' });
     expect(emitted).toContainEqual(
       expect.objectContaining({
         type: 'error',
@@ -1819,36 +1839,42 @@ describe('WS-R4 characterization — the SIX loadReplay arms (REMEDIATION-ARCHIT
     expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'error' }));
   });
 
-  it('ARM superseded-mid-await (empty): a superseded load resolves undefined SILENTLY (no error, no turn.end from the loser)', async () => {
+  it('ARM superseded-mid-await (empty): a superseded load resolves bare {kind:"superseded"} SILENTLY, no result key (no error, no turn.end from the loser)', async () => {
     const { controller, client, emitted } = makeLoadHarness();
-    const loser = controller.loadReplay('/fake/ws', 'session-A', '/fake/ws', []);
-    void controller.loadReplay('/fake/ws', 'session-B', '/fake/ws', []); // supersedes on the SAME instance (T1a reuse)
+    const loser = controller.loadReplayOutcome('/fake/ws', 'session-A', '/fake/ws', []);
+    void controller.loadReplayOutcome('/fake/ws', 'session-B', '/fake/ws', []); // supersedes on the SAME instance (T1a reuse)
     const emissionsBefore = emitted.length;
     client.resolveLoad(0, { found: false }); // the LOSER's response
-    await expect(loser).resolves.toBeUndefined();
+    const outcome = await loser;
+    expect(outcome).toEqual({ kind: 'superseded' });
+    expect('result' in outcome).toBe(false); // exactOptional absent-key discipline
     expect(emitted).toHaveLength(emissionsBefore); // strict silence
   });
 
-  it("ARM :1301 success-but-superseded — NAMED OBSERVABLE: returns the TRUTHY result (callers treat as SUCCESS), zero further emissions from the loser's tail", async () => {
+  it("ARM :1301 success-but-superseded — NAMED OBSERVABLE (union): {kind:'superseded'} CARRIES the result (callers treat as SUCCESS), zero further emissions from the loser's tail", async () => {
     const { controller, client, emitted } = makeLoadHarness();
-    const loser = controller.loadReplay('/fake/ws', 'session-A', '/fake/ws', []);
-    void controller.loadReplay('/fake/ws', 'session-B', '/fake/ws', []);
+    const loser = controller.loadReplayOutcome('/fake/ws', 'session-A', '/fake/ws', []);
+    void controller.loadReplayOutcome('/fake/ws', 'session-B', '/fake/ws', []);
     const emissionsBefore = emitted.length;
     client.resolveLoad(0, { found: true, currentModeId: 'default' }); // the loser SUCCEEDED
-    const result = await loser;
-    expect(result).toEqual({ found: true, currentModeId: 'default' }); // truthy — NOT undefined
+    await expect(loser).resolves.toEqual({
+      kind: 'superseded',
+      result: { found: true, currentModeId: 'default' },
+    });
     expect(emitted).toHaveLength(emissionsBefore); // silent success
   });
 
-  it('ARM superseded-post-pin (:1330): dispose mid-pinWireModeDefault → bare-undefined return, NO closing turn.end', async () => {
+  it('ARM superseded-post-pin (:1330): dispose mid-pinWireModeDefault → bare {kind:"superseded"} return, no result key, NO closing turn.end', async () => {
     const { controller, client, emitted } = makeLoadHarness();
-    const load = controller.loadReplay('/fake/ws', 'session-1', '/fake/ws', []);
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
     client.resolveLoad(0, { found: true, currentModeId: 'weird-mode' }); // non-default → pin awaits setSessionMode
-    await Promise.resolve(); // let loadReplay reach the pin await
+    await Promise.resolve(); // let loadReplayOutcome reach the pin await
     await Promise.resolve();
     controller.dispose(); // the production supersede (SessionRegistry.open disposes the prior controller)
     client.resolveMode(0);
-    await expect(load).resolves.toBeUndefined();
+    const outcome = await load;
+    expect(outcome).toEqual({ kind: 'superseded' });
+    expect('result' in outcome).toBe(false);
     expect(emitted.filter((m) => m.type === 'turn.end' && m.status === 'complete')).toHaveLength(0);
   });
 });
