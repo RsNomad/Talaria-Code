@@ -25,6 +25,7 @@ import { basename } from 'node:path';
 
 import type { ContextRef } from '../../shared/protocol';
 import { resolveWithinWorkspaceReal } from '../backend/acp/pathConfine';
+import { settleRace } from '../backend/connection/settleRace';
 import { formatDiagnostics, formatGit, formatSelection, formatTerminal } from './format';
 import { CONTEXT_BUDGET, clampText, isSecretPath } from './sanitize';
 import type { DiagnosticsPort, EditorPort, GitPort, ResolvedContext, TerminalPort, WorkspacePort } from './types';
@@ -104,35 +105,31 @@ export class ContextResolver {
   }
 
   /**
-   * Race `work` against a `deadlineMs` timer. The timer settles (never
-   * rejects) with a `timed out` skip, so a hanging port degrades to data,
-   * not an unhandled rejection or a stuck batch. The timer is `unref`'d and
-   * always cleared on the winning path so a hung fake never keeps the
-   * process alive.
+   * Race `work` against the per-ref `deadlineMs` wall clock via the audited
+   * WS-R1 `settleRace` primitive (settle-once, timer cleared on every settle
+   * path, timer `unref()`d, late settlement — resolve OR reject — silently
+   * discarded; all pinned by `settleRace.test.ts`). The outcome mapping
+   * preserves this method's pre-T12 contract exactly — it still NEVER
+   * rejects, so a hanging or failing port degrades to data, not an unhandled
+   * rejection or a stuck batch:
+   *  - `{kind:'value'}`    → the resolved context, passed through;
+   *  - `{kind:'deadline'}` → the same `timed out` error skip as before;
+   *  - a genuine `work` rejection passes through `settleRace` and is mapped
+   *    to the same `toErrorSkip` value the old then-handler produced.
+   * No `exit` source is supplied, so `{kind:'exit'}` is structurally
+   * unreachable; the mapping folds it into the deadline arm rather than
+   * inventing a new outcome for an impossible state.
    */
-  private withDeadline(work: Promise<ResolvedContext>, ref: ContextRef): Promise<ResolvedContext> {
-    return new Promise((resolve) => {
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-
-      const clearTimer = (): void => {
-        if (timer !== undefined) {
-          clearTimeout(timer);
-          timer = undefined;
-        }
-      };
-      const settle = (result: ResolvedContext): void => {
-        if (settled) return;
-        settled = true;
-        clearTimer();
-        resolve(result);
-      };
-
-      timer = setTimeout(() => settle(skip(ref, 'error', 'timed out', fallbackTitle(ref))), this.deadlineMs);
-      timer.unref?.();
-
-      work.then(settle, (err: unknown) => settle(toErrorSkip(ref, err)));
-    });
+  private async withDeadline(work: Promise<ResolvedContext>, ref: ContextRef): Promise<ResolvedContext> {
+    try {
+      const outcome = await settleRace(work, { deadline: this.deadlineMs });
+      if (outcome.kind === 'value') {
+        return outcome.value;
+      }
+      return skip(ref, 'error', 'timed out', fallbackTitle(ref));
+    } catch (err) {
+      return toErrorSkip(ref, err);
+    }
   }
 
   private dispatch(ref: ContextRef): Promise<ResolvedContext> {
