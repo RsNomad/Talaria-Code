@@ -18,10 +18,9 @@ import type { ConnectionSupervisorHostPort } from './ConnectionSupervisor';
 import type {
   AcpClientCallbacks,
   AcpClientLike,
-  AcpLoadSessionResult,
 } from '../acp/acpClient';
 import type { SessionRegistry } from '../session/SessionRegistry';
-import type { SessionController } from '../session/SessionController';
+import type { SessionController, LoadReplayOutcome } from '../session/SessionController';
 import type { SessionHostPort } from '../session/types';
 import type { HostToWebviewMessage } from '../../../shared/protocol';
 import { must } from '../../../testing/must';
@@ -93,9 +92,9 @@ interface FakeController {
   hasLiveTurn: ReturnType<typeof vi.fn>;
   endOnCrash: ReturnType<typeof vi.fn>;
   endForRestart: ReturnType<typeof vi.fn>;
-  /** Pre-migration recovery stub (recoverOneSession calls loadReplay until
-   * Task 21 flips it to loadReplayOutcome — Task 21 adds that member). */
-  loadReplay: ReturnType<typeof vi.fn>;
+  /** WS-R4 step 3 (Task 21): recoverOneSession now calls loadReplayOutcome
+   * (the nested-discrimination seam), not the retired loadReplay adapter. */
+  loadReplayOutcome: ReturnType<typeof vi.fn>;
   getRootId: () => string;
 }
 
@@ -107,7 +106,10 @@ export function makeController(sessionId: string, tabId: string): FakeController
     hasLiveTurn: vi.fn(() => false),
     endOnCrash: vi.fn(),
     endForRestart: vi.fn(),
-    loadReplay: vi.fn(async () => ({ found: true, currentModeId: 'default' })),
+    loadReplayOutcome: vi.fn(async () => ({
+      kind: 'loaded',
+      result: { found: true, currentModeId: 'default' },
+    })),
     getRootId: () => 'root-1',
   };
 }
@@ -119,12 +121,17 @@ export function makeSupervisorHarness(): {
   controllers: Map<string, FakeController>;
   emitted: HostToWebviewMessage[];
   logs: string[];
+  state: { nextLoadOutcome: unknown; lastMinted: FakeController | undefined };
 } {
   const clients: FakeSupervisorClient[] = [];
   const controllers = new Map<string, FakeController>();
   const emitted: HostToWebviewMessage[] = [];
   const logs: string[] = [];
   let mintCounter = 0;
+  const state: { nextLoadOutcome: unknown; lastMinted: FakeController | undefined } = {
+    nextLoadOutcome: undefined,
+    lastMinted: undefined,
+  };
   const registry = {
     values: () => [...controllers.values()],
     get: (id: string) => controllers.get(id),
@@ -132,6 +139,17 @@ export function makeSupervisorHarness(): {
     open: (sessionId: string, cwd: string, _port: unknown, tabId: string) => {
       const c = makeController(sessionId, tabId);
       c.cwd = cwd;
+      c.loadReplayOutcome = vi.fn(() =>
+        state.nextLoadOutcome instanceof Promise
+          ? (state.nextLoadOutcome as Promise<LoadReplayOutcome>)
+          : Promise.resolve(
+              (state.nextLoadOutcome as LoadReplayOutcome | undefined) ?? {
+                kind: 'loaded',
+                result: { found: true, currentModeId: 'default' },
+              },
+            ),
+      );
+      state.lastMinted = c;
       controllers.set(sessionId, c);
       return c;
     },
@@ -173,166 +191,63 @@ export function makeSupervisorHarness(): {
     isPendingClose: vi.fn(() => false),
     emit: (msg: HostToWebviewMessage) => emitted.push(msg),
   };
-  return { supervisor: new ConnectionSupervisor(port), port, clients, controllers, emitted, logs };
+  return { supervisor: new ConnectionSupervisor(port), port, clients, controllers, emitted, logs, state };
 }
 
 /** Private-member access (repo convention: element access via a cast, never `any`). */
-type RaceHelpers = {
-  raceAgainstChildExit<T>(p: Promise<T>, client: AcpClientLike, deadlineMs?: number): Promise<T | undefined>;
-  raceRecoveryAgainstChildExit(
-    p: Promise<AcpLoadSessionResult | undefined>,
-    client: AcpClientLike,
-    deadlineMs: number,
-  ): Promise<AcpLoadSessionResult | undefined>;
+type RecoverSeam = {
+  recoverOneSession(sessionId: string, cwd: string, tabId: string, deadlineMs: number): Promise<void>;
 };
 
-describe('WS-R1 characterization — raceAgainstChildExit legacy contract', () => {
+describe('WS-R4 co-edit — recoverOneSession routes all six outcomes (named observables)', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  function helpers(): { h: RaceHelpers; client: FakeSupervisorClient } {
-    const { supervisor } = makeSupervisorHarness();
-    return { h: supervisor as unknown as RaceHelpers, client: new FakeSupervisorClient() };
+  async function recover(h: ReturnType<typeof makeSupervisorHarness>, outcome: unknown): Promise<void> {
+    await h.supervisor.start();
+    h.state.nextLoadOutcome = outcome; // consumed by the registry's open() wiring (Step 1a)
+    await (h.supervisor as unknown as RecoverSeam).recoverOneSession('session-R', '/fake/ws', 'tab-R', 120_000);
   }
 
-  it('value passthrough (deadline omitted): resolves the value, NO timer is created', async () => {
-    const { h, client } = helpers();
-    const d = deferred<string>();
-    const race = h.raceAgainstChildExit(d.promise, client as unknown as AcpClientLike);
-    expect(vi.getTimerCount()).toBe(0); // omitted deadline reproduces the prior no-timer behavior
-    d.resolve('v');
-    await expect(race).resolves.toBe('v');
-    expect(client.exitHandlers).toHaveLength(0); // exit sub disposed on the value path
+  it("failure kinds route to session-lost + identity-guarded close: 'no-client' | 'load-failed' | 'not-found'", async () => {
+    for (const kind of [{ kind: 'no-client' }, { kind: 'load-failed', message: 'x' }, { kind: 'not-found' }]) {
+      const h = makeSupervisorHarness();
+      await recover(h, kind);
+      expect(h.emitted).toContainEqual(
+        expect.objectContaining({ type: 'tab.error', tabId: 'tab-R', kind: 'session-lost' }),
+      );
+      expect(h.controllers.has('session-R')).toBe(false); // identity-guarded close ran
+    }
   });
 
-  it('exit → resolves undefined (collapsed sentinel — the documented :851-856 ambiguity)', async () => {
-    const { h, client } = helpers();
-    const race = h.raceAgainstChildExit(deferred<string>().promise, client as unknown as AcpClientLike);
-    client.simulateExit(1);
-    await expect(race).resolves.toBeUndefined();
-    expect(client.exitHandlers).toHaveLength(0);
+  it("'superseded' (either arm) → strict no-op: NO tab.error, controller left to its new owner", async () => {
+    for (const outcome of [
+      { kind: 'superseded' },
+      { kind: 'superseded', result: { found: true, currentModeId: 'default' } },
+    ]) {
+      const h = makeSupervisorHarness();
+      await recover(h, outcome);
+      expect(h.emitted.filter((m) => m.type === 'tab.error' && m.tabId === 'tab-R')).toHaveLength(0);
+    }
   });
 
-  it('deadline → resolves undefined (SAME sentinel as exit — deliberately indistinguishable)', async () => {
-    const { h, client } = helpers();
-    const race = h.raceAgainstChildExit(deferred<string>().promise, client as unknown as AcpClientLike, 120_000);
+  it("'loaded' adopts activeSessionId/cwd when none is active", async () => {
+    const h = makeSupervisorHarness();
+    await recover(h, { kind: 'loaded', result: { found: true, currentModeId: 'default' } });
+    expect(h.port.setActiveSessionId).toHaveBeenCalledWith('session-R');
+    expect(h.port.setCwd).toHaveBeenCalledWith('/fake/ws');
+  });
+
+  it('settleRace deadline → session-lost (the wall clock still un-jams the tail)', async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    h.state.nextLoadOutcome = new Promise(() => {}); // a hung loadReplayOutcome
+    const pending = (h.supervisor as unknown as RecoverSeam).recoverOneSession('session-R', '/fake/ws', 'tab-R', 120_000);
     await vi.advanceTimersByTimeAsync(120_000);
-    await expect(race).resolves.toBeUndefined();
-    expect(client.exitHandlers).toHaveLength(0);
-  });
-
-  it('rejection passthrough: a genuine rejection of p rejects the race (NOT swallowed)', async () => {
-    const { h, client } = helpers();
-    const d = deferred<string>();
-    const race = h.raceAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
-    const boom = new Error('boom');
-    d.reject(boom);
-    await expect(race).rejects.toBe(boom);
-    expect(vi.getTimerCount()).toBe(0); // timer cleared on the rejection path too
-    expect(client.exitHandlers).toHaveLength(0); // exit sub disposed on the rejection path too (symmetric with value/exit/deadline)
-  });
-
-  it('fast path clears the deadline timer (the T-3 fast-path pin)', async () => {
-    const { h, client } = helpers();
-    const d = deferred<string>();
-    const race = h.raceAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
-    expect(vi.getTimerCount()).toBe(1);
-    d.resolve('v');
-    await race;
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it('exit wins over an armed deadline: fires first AND clears the deadline timer (leaked-timer-on-the-exit-path regression pin)', async () => {
-    const { h, client } = helpers();
-    const race = h.raceAgainstChildExit(deferred<string>().promise, client as unknown as AcpClientLike, 120_000);
-    expect(vi.getTimerCount()).toBe(1); // deadline armed
-    client.simulateExit(1);
-    await expect(race).resolves.toBeUndefined();
-    expect(vi.getTimerCount()).toBe(0); // exit cleared the deadline timer too, not just the p-settle fast path
-    expect(client.exitHandlers).toHaveLength(0);
-  });
-
-  it('settle-once: p resolves first, then the deadline elapses — outcome stays the value (no clobber to undefined)', async () => {
-    const { h, client } = helpers();
-    const d = deferred<string>();
-    const race = h.raceAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
-    d.resolve('v');
-    await expect(race).resolves.toBe('v'); // p wins first
-    // late-loser: the deadline elapses AFTER p already won. If a future adapter
-    // fails to clear the timer, this actually drives the deadline branch's
-    // settleResolve a second time — the `if (settled) return` guard must
-    // absorb it silently rather than flip the outcome.
-    await vi.advanceTimersByTimeAsync(120_000);
-    await expect(race).resolves.toBe('v'); // unchanged
-  });
-
-  it('settle-once: exit wins, then p resolves late — outcome stays undefined (late value has no effect)', async () => {
-    const { h, client } = helpers();
-    const d = deferred<string>();
-    const race = h.raceAgainstChildExit(d.promise, client as unknown as AcpClientLike);
-    client.simulateExit(1);
-    await expect(race).resolves.toBeUndefined(); // exit wins first
-    expect(client.exitHandlers).toHaveLength(0);
-    // late-loser: p resolves AFTER exit already won. p's own .then callback
-    // is still registered and WILL run — this is the genuine second call
-    // into settleResolve that the `if (settled) return` guard must swallow.
-    d.resolve('late-value');
-    await Promise.resolve(); // flush the microtask so settleResolve('late-value') actually runs before we assert
-    await expect(race).resolves.toBeUndefined(); // unchanged — the late value never surfaces
-  });
-});
-
-describe('WS-R1 characterization — raceRecoveryAgainstChildExit swallow contract', () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
-
-  it('a rejection is SWALLOWED to undefined (unlike raceAgainstChildExit)', async () => {
-    const { supervisor } = makeSupervisorHarness();
-    const h = supervisor as unknown as RaceHelpers;
-    const client = new FakeSupervisorClient();
-    const d = deferred<AcpLoadSessionResult | undefined>();
-    const race = h.raceRecoveryAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
-    d.reject(new Error('boom'));
-    await expect(race).resolves.toBeUndefined();
-  });
-
-  it('the pre-existing 120s deadline elapses (loadReplay pending, no exit) → undefined', async () => {
-    const { supervisor } = makeSupervisorHarness();
-    const h = supervisor as unknown as RaceHelpers;
-    const client = new FakeSupervisorClient();
-    const race = h.raceRecoveryAgainstChildExit(
-      deferred<AcpLoadSessionResult | undefined>().promise,
-      client as unknown as AcpClientLike,
-      120_000,
+    await pending;
+    expect(h.emitted).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: 'tab-R', kind: 'session-lost' }),
     );
-    await vi.advanceTimersByTimeAsync(120_000);
-    await expect(race).resolves.toBeUndefined();
-  });
-
-  it('exit → undefined (the child-exit race — the entire reason this helper exists, per its own doc)', async () => {
-    const { supervisor } = makeSupervisorHarness();
-    const h = supervisor as unknown as RaceHelpers;
-    const client = new FakeSupervisorClient();
-    const race = h.raceRecoveryAgainstChildExit(
-      deferred<AcpLoadSessionResult | undefined>().promise,
-      client as unknown as AcpClientLike,
-      120_000,
-    );
-    client.simulateExit(1);
-    await expect(race).resolves.toBeUndefined();
-    expect(client.exitHandlers).toHaveLength(0); // exit sub disposed
-    expect(vi.getTimerCount()).toBe(0); // the 120s deadline timer is cleared too
-  });
-
-  it('happy path: loadReplay resolves to a real result → identity-preserved passthrough (not swallowed)', async () => {
-    const { supervisor } = makeSupervisorHarness();
-    const h = supervisor as unknown as RaceHelpers;
-    const client = new FakeSupervisorClient();
-    const sentinel: AcpLoadSessionResult = { found: true, currentModeId: 'default' };
-    const d = deferred<AcpLoadSessionResult | undefined>();
-    const race = h.raceRecoveryAgainstChildExit(d.promise, client as unknown as AcpClientLike, 120_000);
-    d.resolve(sentinel);
-    await expect(race).resolves.toBe(sentinel);
   });
 });
 
