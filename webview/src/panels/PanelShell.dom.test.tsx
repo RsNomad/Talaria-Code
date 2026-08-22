@@ -16,6 +16,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { RemotePanel, PanelShell, SectionLabel } from './PanelShell';
 import type { RemoteData } from '../state/remoteData';
+import { must } from '../testing/must';
 
 /**
  * A11Y-03 (WCAG 1.3.1 / 2.4.6): the panel title used to be a plain `<span>`
@@ -65,14 +66,25 @@ describe('RemotePanel — B5 M-4: loading/idle announces busy status', () => {
     expect(status).toHaveAttribute('aria-busy', 'true');
   });
 
-  it('success status renders NO aria-busy wrapper — only the resolved children', () => {
+  /**
+   * Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): success used to
+   * render NO `role="status"` at all. It now always mounts exactly ONE —
+   * the sr-only stale-data `LiveRegion` this task adds to `RemotePanel`'s
+   * success branch (see the "Task 17" describe block below) — empty while
+   * there is no refreshError. This test's real claim survives narrowed: the
+   * B5 busy WRAPPER (the loading-branch's `aria-busy` idiom) never leaks
+   * into success.
+   */
+  it('success status renders NO aria-busy wrapper — only the resolved children (+ the sr-only stale-data region, Task 17)', () => {
     const remote: RemoteData<string> = { status: 'success', data: 'hello' };
     render(
       <RemotePanel<string> remote={remote} loadingHint="Loading tools…" onRetry={() => undefined}>
         {(data) => <div>{data}</div>}
       </RemotePanel>,
     );
-    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    const status = screen.getByRole('status');
+    expect(status).not.toHaveAttribute('aria-busy');
+    expect(status.textContent).toBe('');
     expect(screen.getByText('hello')).toBeInTheDocument();
   });
 });
@@ -89,14 +101,23 @@ describe('RemotePanel — B5 M-4: loading/idle announces busy status', () => {
  * `refreshError` and still finds no `role="status"` at all.
  */
 describe('RemotePanel — TI-3 (AU-42 Part B): the refreshError banner', () => {
-  it('omitted refreshError (undefined): success renders with no banner, no role="status" at all', () => {
+  /**
+   * Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): this used to pin
+   * "no role=status at all" for the omitted-refreshError case. Success now
+   * ALWAYS mounts exactly one `role="status"` — the sr-only stale-data
+   * `LiveRegion` below the resolved children — empty until refreshError
+   * appears. The pin narrows to "exactly one, and it carries no text".
+   */
+  it('omitted refreshError (undefined): success renders exactly ONE role="status" (the sr-only region), empty', () => {
     const remote: RemoteData<string> = { status: 'success', data: 'hello' };
     render(
       <RemotePanel<string> remote={remote} loadingHint="Loading tools…" onRetry={() => undefined}>
         {(data) => <div>{data}</div>}
       </RemotePanel>,
     );
-    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    const statuses = screen.getAllByRole('status');
+    expect(statuses).toHaveLength(1);
+    expect(must(statuses[0]).textContent).toBe('');
   });
 
   it('present refreshError: renders the banner AND the resolved children — data is never wiped', () => {
@@ -156,5 +177,49 @@ describe('RemotePanel — TI-3 (AU-42 Part B): the refreshError banner', () => {
     expect(retried).toEqual([true]);
     await user.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(dismissed).toEqual([true]);
+  });
+});
+
+/**
+ * Task 17 (Finding-7, WV4-MIN): the stale-data announcement itself now rides
+ * an ALWAYS-mounted sr-only `LiveRegion` in the success branch, not the
+ * visible banner's own (now dropped) `role="status"` — a region that mounts
+ * together with its content is the known-unreliable screen-reader
+ * announcement pattern this task closes out. MDN Live regions: "Start with
+ * an empty live region, then – in a separate step – change the content
+ * inside the region."
+ */
+describe('RemotePanel — Task 17 (Finding-7, WV4-MIN): permanently-mounted sr-only stale-data region', () => {
+  it('the region exists (empty) with no refreshError, then fills once refreshError appears — the SAME node', () => {
+    const remote: RemoteData<string> = { status: 'success', data: 'hello' };
+    const { rerender } = render(
+      <RemotePanel<string> remote={remote} loadingHint="Loading tools…" onRetry={() => undefined}>
+        {(data) => <div>{data}</div>}
+      </RemotePanel>,
+    );
+    const status = screen.getByRole('status');
+    expect(
+      status,
+      'the region must not carry the stale-data text before any refreshError, or the "already mounted" ' +
+        'half of this test proves nothing',
+    ).not.toHaveTextContent(/refresh/i);
+
+    rerender(
+      <RemotePanel<string>
+        remote={remote}
+        loadingHint="Loading tools…"
+        onRetry={() => undefined}
+        refreshError={{ message: 'Agent is not connected yet.', onRetry: () => undefined, onDismiss: () => undefined }}
+      >
+        {(data) => <div>{data}</div>}
+      </RemotePanel>,
+    );
+
+    expect(
+      screen.getByRole('status'),
+      'the SAME node must update its text, not be unmounted and replaced — a fresh node would miss a ' +
+        'live-region listener a screen reader attached at mount time',
+    ).toBe(status);
+    expect(status).toHaveTextContent('Couldn’t refresh — showing last loaded data.');
   });
 });

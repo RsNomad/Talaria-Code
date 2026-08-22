@@ -239,11 +239,17 @@ function SetupCards({
         </div>
       )}
 
+      {/* Task 17 (Finding-7, WV4-MIN): ALWAYS mounted — the actual
+          screen-reader announcement now lives here, not on the visible
+          card's own (now dropped) role="status" below. A region that mounts
+          together with its content is the known-unreliable announcement
+          pattern; this one exists empty until setup.ready flips true. */}
+      <LiveRegion
+        text={setup.ready ? "You're ready — agent, provider, and autocomplete are all set up." : ''}
+        className="sr-only"
+      />
       {setup.ready && (
-        <div
-          role="status"
-          className="mb-3 flex items-center gap-2 rounded-card border border-add bg-add-soft px-3 py-2 text-xs text-fg"
-        >
+        <div className="mb-3 flex items-center gap-2 rounded-card border border-add bg-add-soft px-3 py-2 text-xs text-fg">
           <Icon name="pass-filled" size={14} className="flex-none text-add" />
           <span>You&apos;re ready — agent, provider, and autocomplete are all set up.</span>
         </div>

@@ -685,12 +685,58 @@ describe('!trusted disables every mutating button with an explanatory reason (§
 describe('"You\'re ready" banner (§6)', () => {
   it('renders when agent + provider + fim are all green', () => {
     renderPanel(baseData({ ready: true }));
-    expect(screen.getByText(/You.re ready/)).toBeInTheDocument();
+    // Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): the ready text
+    // now also lives in the sr-only announcement `LiveRegion` (empty until
+    // ready, then carrying this SAME string) — `{ selector: 'span' }` scopes
+    // this query to the visible card's own copy, which is the thing this
+    // test actually means to assert on.
+    expect(screen.getByText(/You.re ready/, { selector: 'span' })).toBeInTheDocument();
   });
 
   it('does not render when not ready', () => {
     renderPanel(baseData({ ready: false }));
     expect(screen.queryByText(/You.re ready/)).not.toBeInTheDocument();
+  });
+
+  /**
+   * Task 17 (Finding-7, WV4-MIN): the visible card above is decorative now —
+   * the actual screen-reader announcement rides an ALWAYS-mounted sr-only
+   * `LiveRegion` in `SetupCards`, immediately above the conditional card,
+   * empty until `setup.ready` flips true. Index [1], not [0]: `RemotePanel`
+   * (Task 17's OTHER site — see `PanelShell.dom.test.tsx`) always mounts its
+   * own sr-only stale-data region FIRST, ahead of `SetupCards`' own content,
+   * and `SetupPanel` never passes it a `refreshError` — so that region stays
+   * permanently empty and is index [0] in every render below. This region is
+   * index [1]: the first thing `SetupCards` itself renders (`baseData()`'s
+   * `trusted: true` and no `os.containerNote` mean nothing else precedes it
+   * either).
+   */
+  it('the sr-only status region exists (empty) while not ready, and fills once ready flips true', () => {
+    const { rerender, onToggleNextEdit } = renderPanel(baseData({ ready: false }));
+    const status = must(screen.getAllByRole('status')[1]);
+    expect(
+      status,
+      'the region must not carry the ready text before setup.ready is true, or the "already mounted" ' +
+        'half of this test proves nothing',
+    ).not.toHaveTextContent(/You.re ready/);
+
+    rerender(
+      <SetupPanel
+        data={{ status: 'success', data: baseData({ ready: true }) }}
+        onRetry={noopRetry}
+        progress={{}}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={onToggleNextEdit}
+        dispatch={vi.fn().mockResolvedValue(undefined) as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />,
+    );
+
+    expect(
+      must(screen.getAllByRole('status')[1]),
+      'the SAME node must update its text, not be unmounted and replaced — a fresh node would miss a ' +
+        'live-region listener a screen reader attached at mount time',
+    ).toBe(status);
+    expect(status).toHaveTextContent("You're ready — agent, provider, and autocomplete are all set up.");
   });
 });
 
@@ -3313,9 +3359,26 @@ describe('T18 — RecommendationsBlock strip (§3.5)', () => {
     // OTHER, unlabelled markup. `ready: false` suppresses the (unrelated)
     // "You're ready" banner, which would otherwise be a legitimate
     // preceding sibling of its own and mask this check.
+    //
+    // Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): the Agent card's
+    // immediate previous sibling is no longer literally absent — TWO
+    // always-mounted, empty sr-only `role="status"` regions now precede real
+    // panel content on every success render: `RemotePanel`'s own stale-data
+    // region (Task 17's OTHER site, `PanelShell.tsx` — `SetupPanel` never
+    // gives it a `refreshError`, so it stays permanently empty) and
+    // `SetupCards`' own "You're ready" region (this site, empty here since
+    // `ready: false`). The check's real intent survives: walk back over
+    // ONLY that always-mounted, always-empty status chrome and confirm
+    // nothing else — in particular no `RecommendationsBlock` output — sits
+    // between it and the Agent card.
     function agentCardHasNoPrecedingSibling(): void {
       const agentSection = must(document.getElementById('setup-card-agent'));
-      expect(agentSection.previousElementSibling).toBeNull();
+      let node = agentSection.previousElementSibling;
+      while (node !== null) {
+        expect(node.getAttribute('role')).toBe('status');
+        expect(node.textContent).toBe('');
+        node = node.previousElementSibling;
+      }
     }
 
     it('renders NOTHING when catalog is absent', () => {

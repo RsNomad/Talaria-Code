@@ -816,7 +816,12 @@ describe('TI-3 (AU-42 Part B): a refreshError renders a dismissible banner over 
 
     // The banner AND the previously-loaded row both render — the defect
     // this task fixes replaced the row with a full-panel error card instead.
-    expect(screen.getByText(/Couldn.t refresh/i)).toBeInTheDocument();
+    //
+    // Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): the same text now
+    // ALSO lives in RemotePanel's always-mounted sr-only announcement
+    // LiveRegion — `:not(.sr-only)` scopes this query to the VISIBLE banner
+    // copy, which is what this test actually means to assert on.
+    expect(screen.getByText(/Couldn.t refresh/i, { selector: ':not(.sr-only)' })).toBeInTheDocument();
     expect(screen.getByText('Agent is not connected yet.')).toBeInTheDocument();
     expect(screen.getByText('web-search')).toBeInTheDocument();
     expect(screen.getByRole('switch', { name: 'Enable web-search' })).toBeInTheDocument();

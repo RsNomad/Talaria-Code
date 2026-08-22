@@ -23,6 +23,7 @@ import userEvent from '@testing-library/user-event';
 import { Toggle } from '../components/Toggle';
 import { SettingsPanel } from './SettingsPanel';
 import type { FieldValue } from './settingsField';
+import { must } from '../testing/must';
 
 /** Documented shape: invoke `userEvent.setup()` BEFORE rendering, and use the
  *  returned instance rather than the direct API. */
@@ -308,7 +309,14 @@ describe('the ARIA surface reaches the DOM', () => {
     // The region must exist BEFORE anything has failed — a region only
     // created once `lastError` is set is the known-unreliable
     // mount-with-content pattern (Finding 7).
-    const status = within(fieldRow).getByRole('status');
+    //
+    // Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): the row now
+    // carries TWO always-mounted role="status" regions — this one (the
+    // "Not saved" error, first in FieldRow's fixed DOM order) and the
+    // "Saving…" indicator this task adds (last in DOM order — see the
+    // sibling describe block below). Index [0] is the error region by
+    // that fixed layout, not an arbitrary pick.
+    const status = must(within(fieldRow).getAllByRole('status')[0]);
     expect(
       status,
       'the region must not carry the refusal text before any request has been refused, or the ' +
@@ -319,12 +327,48 @@ describe('the ARIA surface reaches the DOM', () => {
     await screen.findByText(/read-only workspace/);
 
     expect(
-      within(fieldRow).getByRole('status'),
+      must(within(fieldRow).getAllByRole('status')[0]),
       'the SAME node must update its text, not be unmounted and replaced — a fresh node would miss a ' +
         'live-region listener a screen reader attached at mount time',
     ).toBe(status);
     expect(status).toHaveTextContent(/Not saved:.*read-only workspace/);
     expect(status).toHaveAttribute('aria-live', 'polite');
+  });
+});
+
+/**
+ * Task 17 (Finding-7, WV4-MIN): the row's "Saving…" indicator used to be a
+ * conditionally-mounted `<span aria-live="polite">` — created only once
+ * `pending` went true, the known-unreliable mount-with-content pattern. It
+ * now rides the same permanently-mounted `LiveRegion` pattern as the row's
+ * "Not saved" error just above it (A3) — always present, empty until a
+ * write is actually in flight.
+ */
+describe('Task 17: the row "Saving…" indicator is a permanently-mounted LiveRegion', () => {
+  it('the region exists (empty) before any edit, and fills with "Saving…" once a write is in flight', async () => {
+    const { user } = setup(
+      <SettingsPanel config={successConfig(false)} onRetryConfig={() => undefined} onSetConfig={neverSettles} />,
+    );
+    const fieldSwitch = screen.getByRole('switch', { name: FIELD_KEY });
+    const fieldRow = fieldSwitch.parentElement as HTMLElement;
+
+    // FieldRow's fixed DOM order: index [0] is the "Not saved" error region
+    // (A3, above), index [1] is this "Saving…" region — both permanently
+    // mounted, both empty before any edit.
+    const saving = must(within(fieldRow).getAllByRole('status')[1]);
+    expect(
+      saving,
+      'the region must not carry "Saving…" before any edit, or the "already mounted" half of this test proves nothing',
+    ).not.toHaveTextContent('Saving…');
+
+    await user.click(fieldSwitch);
+
+    expect(
+      must(within(fieldRow).getAllByRole('status')[1]),
+      'the SAME node must update its text, not be unmounted and replaced — a fresh node would miss a ' +
+        'live-region listener a screen reader attached at mount time',
+    ).toBe(saving);
+    expect(saving).toHaveTextContent('Saving…');
   });
 });
 
