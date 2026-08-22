@@ -18,9 +18,11 @@
  *   opened"; Up/Down Arrow move focus to the previous/next item.
  */
 import { describe, it, expect } from 'vitest';
+import { useRef } from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Composer } from './Composer';
+import { useMenuFocus } from '../hooks/useMenuFocus';
 import type { Attachment, ContextRef, CustomModeInfo, EditPolicyPreset } from '../protocol';
 import type { ComposerSeed } from '../composer/applySeed';
 
@@ -75,6 +77,44 @@ function getModeTrigger(container: HTMLElement): HTMLElement {
   const el = container.querySelector('[title^="Custom mode:"]');
   if (!(el instanceof HTMLElement)) throw new Error('mode trigger not found');
   return el;
+}
+
+/*
+ * Task 20 (WV4-MIN) — a minimal `useMenuFocus` harness for the two additive
+ * pieces that have no existing real consumer to exercise them through yet at
+ * RED time: `openMenuAt(index)` (OverflowMenu's post-rewrite G-4 park-on-open
+ * calls this, but the rewrite hasn't happened when this test is first
+ * written — TDD order, hook tests before the OverflowMenu rewrite) and, as a
+ * secondary check, the same Home/End roving the real preset-picker tests
+ * below exercise through a live consumer. Shaped like OverflowMenu's own
+ * open/menu/item wiring (trigger button + role="menu" + itemRef) so it
+ * stands in for "an OverflowMenu-shaped harness" per the task brief.
+ */
+function OpenAtHarness({ count }: { count: number }) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const { open, focusIdx, itemRef, onMenuKey, openMenuAt } = useMenuFocus(count, triggerRef);
+  return (
+    <div>
+      <button ref={triggerRef} type="button" onClick={() => openMenuAt(2)}>
+        open at 2
+      </button>
+      {open && (
+        <div role="menu" aria-label="harness" onKeyDown={onMenuKey}>
+          {Array.from({ length: count }, (_, i) => (
+            <button
+              key={i}
+              ref={itemRef(i)}
+              role="menuitem"
+              type="button"
+              tabIndex={i === focusIdx ? 0 : -1}
+            >
+              Item {i}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 describe('B3 (UI M-1): preset picker gains the APG menu keyboard contract', () => {
@@ -294,5 +334,72 @@ describe('W4-T6 (UI#8): the mode menu carries an accessible name (APG: a menu MU
     await user.click(getModeTrigger(container));
 
     expect(screen.getByRole('menu', { name: 'Mode' })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Task 20 (WV4-MIN): `useMenuFocus.onMenuKey` previously routed only
+ * ArrowDown/ArrowUp — Home/End were no-ops. APG's Menu pattern
+ * (https://www.w3.org/WAI/ARIA/apg/patterns/menu/, fetched live for this
+ * task): "Home: moves focus to first item"; "End: moves focus to last item".
+ * `nextRovingIndex` (rovingIndex.ts) already computes both; this only wires
+ * them into the hook's key handler. Exercised through the preset picker (a
+ * real `useMenuFocus` consumer, 4 items — manual/normal/strict/plan), same
+ * idiom as the existing ArrowDown test above.
+ */
+describe('Task 20: useMenuFocus gains Home/End (additive, APG menu pattern)', () => {
+  it('End moves focus to the last item', async () => {
+    const user = userEvent.setup();
+    const { container } = renderComposer();
+
+    await user.click(getPresetTrigger(container));
+    const items = screen.getAllByRole('menuitemradio');
+    await waitFor(() => expect(document.activeElement).toBe(items[0]));
+
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+
+  it('Home moves focus back to the first item', async () => {
+    const user = userEvent.setup();
+    const { container } = renderComposer();
+
+    await user.click(getPresetTrigger(container));
+    const items = screen.getAllByRole('menuitemradio');
+    await waitFor(() => expect(document.activeElement).toBe(items[0]));
+
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(items[1]);
+
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(items[0]);
+  });
+});
+
+/**
+ * Task 20 (WV4-MIN): `openMenuAt(index)` — additive to `UseMenuFocusResult`.
+ * OverflowMenu's post-rewrite G-4 park-on-open behavior calls this with the
+ * active item's index; this pins the hook's own contract directly (see
+ * `OpenAtHarness` above) ahead of that rewrite.
+ */
+describe('Task 20: useMenuFocus.openMenuAt opens with initial focus on a given index', () => {
+  it('openMenuAt(2) focuses item 2 once the menu opens', async () => {
+    const user = userEvent.setup();
+    render(<OpenAtHarness count={4} />);
+
+    await user.click(screen.getByRole('button', { name: 'open at 2' }));
+    const items = screen.getAllByRole('menuitem');
+
+    await waitFor(() => expect(document.activeElement).toBe(items[2]));
+  });
+
+  it('openMenuAt clamps an out-of-range index to the last item', async () => {
+    const user = userEvent.setup();
+    render(<OpenAtHarness count={2} />);
+
+    await user.click(screen.getByRole('button', { name: 'open at 2' }));
+    const items = screen.getAllByRole('menuitem');
+
+    await waitFor(() => expect(document.activeElement).toBe(items[items.length - 1]));
   });
 });
