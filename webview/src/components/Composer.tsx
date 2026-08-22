@@ -33,6 +33,7 @@ import { parsePathPick, filesToFolders } from '../composer/fileSearch';
 import { useFileSearch } from '../composer/useFileSearch';
 import { applySeed, type ComposerSeed } from '../composer/applySeed';
 import { busyInteraction } from './busyInteraction';
+import { useFocusAnchorOnUnmount } from '../hooks/useFocusAnchorOnUnmount';
 
 // W2-F1: the picker replaced the wire AgentMode picker — every preset pins the
 // ACP mode at 'default' and differs only in the client-side edit-policy engine.
@@ -369,6 +370,13 @@ export function Composer({
   const presetWrapRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  // Task 6 (A11Y-01, WCAG 2.4.3): Send unmounts the instant `busy` flips true
+  // (swapped for Stop) and Stop unmounts the instant the turn ends (swapped
+  // back to Send) — without this, either commit drops focus to `<body>`. The
+  // send/stop wrapper div is the stable anchor (`tabIndex={-1}` below), same
+  // contract ApprovalCard's/DiffCard's own A11Y-01 adoptions document.
+  const sendStopWrapRef = useRef<HTMLDivElement | null>(null);
+  const armFocusAnchor = useFocusAnchorOnUnmount(sendStopWrapRef);
 
   // B3 (UI M-1) / path doc §2.3: the preset and mode pickers adopt the same
   // APG menu keyboard contract as AttachMenu, via the shared `useMenuFocus`
@@ -1289,7 +1297,12 @@ export function Composer({
             {!narrow && <span className="max-w-[120px] truncate">{modelLabel}</span>}
           </button>
 
-          <div className="ml-auto flex items-center gap-1.5">
+          <div
+            ref={sendStopWrapRef}
+            tabIndex={-1}
+            data-testid="send-stop-wrap"
+            className="ml-auto flex items-center gap-1.5"
+          >
             {/* new session */}
             <button
               type="button"
@@ -1314,8 +1327,9 @@ export function Composer({
                 return (
                   <button
                     type="button"
-                    onClick={() => {
+                    onClick={(e) => {
                       if (!stopInteraction.interactive) return;
+                      armFocusAnchor(e.currentTarget);
                       onCancel();
                     }}
                     disabled={stopInteraction.nativeDisabled}
@@ -1332,7 +1346,10 @@ export function Composer({
             ) : (
               <button
                 type="button"
-                onClick={submit}
+                onClick={(e) => {
+                  armFocusAnchor(e.currentTarget);
+                  submit();
+                }}
                 disabled={disabled || (!draft.trim() && draftAttachments.length === 0)}
                 title="Send"
                 aria-label="Send"

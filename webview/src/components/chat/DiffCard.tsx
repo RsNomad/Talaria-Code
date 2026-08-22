@@ -22,9 +22,11 @@
  * green "accepted" on an individually-accepted sibling would be exactly the
  * V-7 lie); an explicit per-hunk 'reject' keeps its own red "rejected" pill.
  */
+import { useRef } from 'react';
 import type { DiffHunk, ToolDiff } from '../../protocol';
 import { Icon } from '../Icon';
 import { Pill, type PillTone } from '../Pill';
+import { useFocusAnchorOnUnmount } from '../../hooks/useFocusAnchorOnUnmount';
 
 interface DiffCardProps {
   diff: ToolDiff;
@@ -68,6 +70,7 @@ function HunkView({
   pending,
   denied,
   onResolve,
+  onActivate,
   hunkNumber,
   total,
   path,
@@ -77,6 +80,10 @@ function HunkView({
   pending: boolean;
   denied: boolean;
   onResolve: (action: 'accept' | 'reject') => void;
+  /** Task 6 (A11Y-01, WCAG 2.4.3): arms the card-root focus anchor with the
+   * clicked button BEFORE `onResolve` runs — the button unmounts the instant
+   * the hunk resolves, and without this the browser drops focus to `<body>`. */
+  onActivate: (activated: HTMLElement) => void;
   /** B5 (M-3): this hunk's 1-based position within the file's diff — combined
    * with `total`/`path` to give the Accept/Reject buttons a per-hunk
    * accessible name (otherwise identical across every hunk in the card). */
@@ -120,7 +127,10 @@ function HunkView({
         <div className="flex gap-2 border-t border-border bg-surface px-3 py-2">
           <button
             type="button"
-            onClick={() => onResolve('accept')}
+            onClick={(e) => {
+              onActivate(e.currentTarget);
+              onResolve('accept');
+            }}
             aria-label={`Accept hunk ${hunkNumber} of ${total} in ${path}`}
             className="rounded border border-accent bg-accent px-2.5 py-1 text-2xs font-semibold text-accent-fg hover:opacity-90"
           >
@@ -128,7 +138,10 @@ function HunkView({
           </button>
           <button
             type="button"
-            onClick={() => onResolve('reject')}
+            onClick={(e) => {
+              onActivate(e.currentTarget);
+              onResolve('reject');
+            }}
             aria-label={`Reject hunk ${hunkNumber} of ${total} in ${path}`}
             className="rounded border border-border px-2.5 py-1 text-2xs font-semibold text-muted hover:bg-overlay"
           >
@@ -145,8 +158,14 @@ export function DiffCard({ diff, resolvedHunks, hunkOffset, onResolve, pending, 
   const resolvedCount = diff.hunks.filter(
     (_, i) => resolvedHunks?.[hunkOffset + i] !== undefined,
   ).length;
+  // Task 6 (A11Y-01, WCAG 2.4.3): the card root is the stable focus anchor
+  // for the hunk-button unmount-on-resolve case — `tabIndex={-1}` makes it
+  // programmatically focusable without adding it to the normal Tab order
+  // (same contract ApprovalCard's own A11Y-01 adoption documents).
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const armFocusAnchor = useFocusAnchorOnUnmount(cardRef);
   return (
-    <div className="overflow-hidden rounded-card border border-border">
+    <div ref={cardRef} tabIndex={-1} className="overflow-hidden rounded-card border border-border">
       <div className="flex items-center gap-2 bg-surface px-3 py-2">
         <Icon name="file-code" size={15} className="flex-none text-accent" />
         <span className="min-w-0 truncate font-mono text-xs text-fg">{diff.path}</span>
@@ -175,6 +194,7 @@ export function DiffCard({ diff, resolvedHunks, hunkOffset, onResolve, pending, 
             pending={pending ?? false}
             denied={denied}
             onResolve={(action) => onResolve(index, action)}
+            onActivate={armFocusAnchor}
             hunkNumber={i + 1}
             total={total}
             path={diff.path}

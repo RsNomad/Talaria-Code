@@ -1078,3 +1078,55 @@ describe('UX-03: Stop -> Stopping… lifecycle (role/name/value)', () => {
     expect(onCancel).not.toHaveBeenCalled(); // guarded click replaces native blocking
   });
 });
+
+/**
+ * Task 6 (A11Y-01, WCAG 2.4.3): the Composer sibling of ApprovalCard's and
+ * DiffCard's own A11Y-01 adoption. Send unmounts the instant `busy` flips
+ * true (swapped for Stop) and Stop unmounts the instant the turn ends
+ * (swapped back to Send) — without `useFocusAnchorOnUnmount`, either commit
+ * silently drops focus to `<body>`. The send/stop wrapper div
+ * (`data-testid="send-stop-wrap"`, `tabIndex={-1}`) is the stable anchor.
+ */
+describe('A11Y-01: focus anchor on Send/Stop unmount (WCAG 2.4.3)', () => {
+  it('focus lands on the send/stop wrapper (not <body>) when Send unmounts as busy flips true', async () => {
+    const user = userEvent.setup();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: 'hello',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: false,
+    };
+    const { rerender } = renderComposer(baseProps);
+    const send = screen.getByRole('button', { name: 'Send' });
+    await user.click(send);
+    rerender(composerElementForRender({ ...baseProps, busy: true }));
+    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(document.body);
+    expect((document.activeElement as HTMLElement).closest('[data-testid="send-stop-wrap"]')).not.toBeNull();
+  });
+
+  it('focus lands on the send/stop wrapper (not <body>) when Stop unmounts as the turn ends', async () => {
+    const onCancel = vi.fn();
+    const user = userEvent.setup();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      stopping: false,
+      onCancel,
+    };
+    const { rerender } = renderComposer(baseProps);
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    await user.click(stop);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    rerender(composerElementForRender({ ...baseProps, busy: false }));
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(document.body);
+    expect((document.activeElement as HTMLElement).closest('[data-testid="send-stop-wrap"]')).not.toBeNull();
+  });
+});
