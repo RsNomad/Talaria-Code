@@ -2020,6 +2020,80 @@ describe('transcript reducer — ARCH-1 (final review, UI I-3): draft survives a
     // half of its own fold) — open-failed must not FLIP that to true.
     expect(activeTab(state).sessionLost).toBe(false);
   });
+
+  it('UX-04c: session-lost reason rides the marker; a successful bind clears it BY KEY OMISSION', () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess1',
+      rootId: '/workspace/root-a',
+    });
+
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'x',
+      reason: 'timeout',
+    });
+    expect(activeTab(state).sessionLostReason).toBe('timeout');
+
+    state = reduce(state, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 's2',
+      rootId: '/workspace/root-a',
+    });
+
+    expect('sessionLostReason' in activeTab(state)).toBe(false); // key GONE, never `undefined`
+  });
+
+  it('UX-04c: reason omitted on the wire → no sessionLostReason key at all', () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess1',
+      rootId: '/workspace/root-a',
+    });
+
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'the session is gone',
+      // no `reason` — legacy/back-compat emitter
+    });
+
+    expect('sessionLostReason' in activeTab(state)).toBe(false);
+  });
+
+  it("UX-04c: a NEW session-lost WITHOUT a reason clears a previous loss's reason (no stale vocabulary)", () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess1',
+      rootId: '/workspace/root-a',
+    });
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'x',
+      reason: 'disconnected',
+    });
+    expect(activeTab(state).sessionLostReason).toBe('disconnected');
+
+    // A second session-lost for the SAME tab (e.g. a subsequent History
+    // load attempt that fails again) — this time the host sends no reason.
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'y',
+    });
+
+    expect('sessionLostReason' in activeTab(state)).toBe(false);
+  });
 });
 
 describe('transcript reducer — IMP-2 (W3-T6 3-lens review, CF-11): tab.clear is tabId-scoped + unconditional', () => {
@@ -2097,6 +2171,27 @@ describe('transcript reducer — IMP-2 (W3-T6 3-lens review, CF-11): tab.clear i
 
   it('tab.clear for an unknown tabId is dropped (dev-log), never throws', () => {
     expect(() => reduce(INITIAL_STATE, { type: 'tab.clear', tabId: 'no-such-tab' })).not.toThrow();
+  });
+
+  it('UX-04c: tab.clear strips sessionLostReason along with error', () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess-dead',
+      rootId: '/root',
+    });
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'the session is gone',
+      reason: 'recovery-failed',
+    });
+    expect(activeTab(state).sessionLostReason).toBe('recovery-failed');
+
+    state = reduce(state, { type: 'tab.clear', tabId: BOOTSTRAP_TAB_ID });
+
+    expect('sessionLostReason' in activeTab(state)).toBe(false);
   });
 });
 

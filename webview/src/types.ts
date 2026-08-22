@@ -23,6 +23,7 @@ import type {
   NextEditToggleState,
   Panel,
   PlanItem,
+  SessionLostReason,
   SessionsData,
   SlashCommandInfo,
   SubagentsData,
@@ -268,6 +269,14 @@ export interface TabState {
    * pattern) and is cleared by the next successful `tab.bound`.
    */
   sessionLost?: boolean;
+  /**
+   * UX-04c: WHY the session was lost — the host's closed literal
+   * (`tab.error.reason`, session-lost only). Drives the standing row's
+   * per-reason copy in App.tsx; outlives the dismissible banner alongside
+   * `sessionLost` and clears with it on the next successful `tab.bound`
+   * (exactOptional: cleared by key omission, never `undefined`).
+   */
+  sessionLostReason?: SessionLostReason;
   /**
    * W6-FE Part 1 (3-way ARCH I-3b): the ACP `available_commands` catalog for
    * THIS tab's session — per-tab (was a single GLOBAL `useState` in

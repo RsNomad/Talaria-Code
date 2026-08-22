@@ -1203,6 +1203,21 @@ export interface WebviewState {
  * ------------------------------------------------------------------ */
 
 /**
+ * UX-04c: WHY a session-lost happened — a CLOSED machine-readable literal
+ * (never free-form; the human `message` stays the banner's copy, and no
+ * reason ever carries a path). Drives the webview's standing-row
+ * vocabulary; OPTIONAL so an emitter that sends none simply falls back to
+ * the generic copy. `open-failed` deliberately has no reason field — its
+ * standing affordance is already honest for every open-failed path.
+ */
+export type SessionLostReason =
+  | 'superseded'      // another tab loaded this session out from under this one
+  | 'disconnected'    // the agent client vanished mid-load
+  | 'timeout'         // the load hit SESSION_ESTABLISH_DEADLINE_MS with no reply
+  | 'recovery-failed' // post-respawn recovery could not restore it
+  | 'restarted';      // a deliberate restart/new-session fan-out ended it
+
+/**
  * Messages the extension host sends to the webview. Discriminated on `type`.
  */
 export type HostToWebview =
@@ -1574,8 +1589,15 @@ export type HostToWebview =
    * webview offers a retry affordance on the still-unbound tab.
    * `open-failed` = the initial bind never succeeded; `session-lost` = a
    * previously-bound tab's session died and could not be restored.
+   *
+   * UX-04c: `reason` is session-lost-only, OPTIONAL, and a CLOSED literal
+   * ({@link SessionLostReason}) — `open-failed` deliberately never carries
+   * one (scope pin: its standing row is already honest for every
+   * open-failed path; duplicating a reason vocabulary there is not needed).
+   * Omitted ⇒ the webview's standing row falls back to its legacy sentence
+   * (additive, back-compatible with any pre-UX-04c emitter).
    */
-  | { type: 'tab.error'; tabId: string; message: string; kind: 'open-failed' | 'session-lost' }
+  | { type: 'tab.error'; tabId: string; message: string; kind: 'open-failed' | 'session-lost'; reason?: SessionLostReason }
 
   /**
    * W3-T6 (CF-11/D2 3-lens review fix, IMP-2): tabId-scoped transcript clear

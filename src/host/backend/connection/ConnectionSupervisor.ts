@@ -792,6 +792,7 @@ export class ConnectionSupervisor {
           type: 'tab.error',
           tabId,
           kind: 'session-lost',
+          reason: 'recovery-failed',
           message: 'Could not recover this session after reconnecting.',
         });
         continue;
@@ -808,7 +809,7 @@ export class ConnectionSupervisor {
         this.port.logger?.append(
           `[AcpBackend] respawn recovery: unexpected failure recovering session '${sessionId}' (tab '${tabId}') — treating as session-lost: ${describeHostError(err)}`,
         );
-        this.port.emit({ type: 'tab.error', tabId, kind: 'session-lost', message: describeHostError(err) });
+        this.port.emit({ type: 'tab.error', tabId, kind: 'session-lost', reason: 'recovery-failed', message: describeHostError(err) });
       }
     }
   }
@@ -925,6 +926,7 @@ export class ConnectionSupervisor {
         type: 'tab.error',
         tabId,
         kind: 'session-lost',
+        reason: 'recovery-failed',
         message: 'Could not recover this session after reconnecting.',
       });
       // W6-FG: identity-guarded — only close if `controller` (captured above,
@@ -1004,6 +1006,7 @@ export class ConnectionSupervisor {
           type: 'tab.error',
           tabId: controller.tabId,
           kind: 'session-lost',
+          reason: 'restarted',
           message: 'Session ended — a new agent session was started.',
         });
       }

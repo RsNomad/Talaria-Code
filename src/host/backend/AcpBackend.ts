@@ -1822,6 +1822,7 @@ export class AcpBackend implements AgentBackend {
         type: 'tab.error',
         tabId: orphanedTabId,
         kind: 'session-lost',
+        reason: 'superseded',
         message: 'This session was loaded into another tab.',
       });
     }
@@ -1889,6 +1890,7 @@ export class AcpBackend implements AgentBackend {
         type: 'tab.error',
         tabId,
         kind: 'session-lost',
+        reason: 'disconnected',
         message: 'The agent disconnected while loading this session — try again.',
       });
       return undefined;
@@ -1949,6 +1951,7 @@ export class AcpBackend implements AgentBackend {
         type: 'tab.error',
         tabId,
         kind: 'session-lost',
+        reason: 'timeout',
         message: 'The agent did not respond while loading this session — try again.',
       });
       return undefined;

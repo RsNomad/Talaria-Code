@@ -2216,10 +2216,13 @@ describe('AcpBackend.start — T-3 (closes B1-M1): session-establish wall-clock 
 
     // RED (pre-fix): only the child's own exit is raced during recovery —
     // no exit is simulated here, so this message never appears.
+    // UX-04c: this is `recoverOneSession`'s crash-recovery route — the pin
+    // gains `reason` (characterization-first, never deleted silently).
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: 'tab-2',
       kind: 'session-lost',
+      reason: 'recovery-failed',
       message: expect.any(String),
     });
     expect(hasController(backend, 'session-2')).toBe(false);
@@ -2391,7 +2394,14 @@ describe('ConnectionSupervisor.establishInitialSession — T5 (UI I-2 / Q2, owne
     must(clients[0]).simulateExit(1);
     await vi.advanceTimersByTimeAsync(500);
 
-    expect(messages).toContainEqual({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'session-lost', message: expect.any(String) });
+    // UX-04c: post-crash `recoverOneSession` route — pin gains `reason`.
+    expect(messages).toContainEqual({
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      reason: 'recovery-failed',
+      message: expect.any(String),
+    });
     expect(messages).toContainEqual({ type: 'system.recovered' });
   });
 });
@@ -3160,10 +3170,12 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
     await vi.advanceTimersByTimeAsync(500);
 
     // session-2's load failed -> a per-tab session-lost affordance, controller dropped
+    // UX-04c: routes through `recoverOneSession`'s failure branch — pin gains `reason`.
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: 'tab-2',
       kind: 'session-lost',
+      reason: 'recovery-failed',
       message: expect.any(String),
     });
     expect(hasController(backend, 'session-2')).toBe(false);
@@ -3221,10 +3233,12 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
     expect(turnEnd).toMatchObject({ status: 'error', sessionId: 'session-1' });
 
     // the tab-chrome-level terminal signal — the SAME tab.error{kind:'session-lost'} a rejected recovery fires.
+    // UX-04c: pin gains `reason` (characterization-first, never deleted silently).
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: BOOTSTRAP_TAB_ID,
       kind: 'session-lost',
+      reason: 'recovery-failed',
       message: 'Could not recover this session after reconnecting.',
     });
 
@@ -3822,12 +3836,14 @@ describe('AcpBackend — CF-01/L3-1: loadTab is now serialized on the SAME tail 
     must(loadCalls[0]).reject(new Error('history store corrupt'));
     await flushMicrotasks();
 
+    // UX-04c: recovery's own load failure — pin gains `reason`.
     expect(
       messages.filter((m) => m.type === 'tab.error' && (m as { tabId: string }).tabId === BOOTSTRAP_TAB_ID),
     ).toContainEqual({
       type: 'tab.error',
       tabId: BOOTSTRAP_TAB_ID,
       kind: 'session-lost',
+      reason: 'recovery-failed',
       message: expect.any(String),
     });
 
@@ -3972,10 +3988,12 @@ describe('AcpBackend.loadTab — CF-01/L3-1 fix (Critical): a hung-but-alive cli
     expect(settlement.settled()).toBe(true);
     await loadPromise;
 
+    // UX-04c: the settleRace deadline mid-load route — pin gains `reason`.
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: 'tab-2',
       kind: 'session-lost',
+      reason: 'timeout',
       message: expect.any(String),
     });
     // The abandoned attempt's controller is disposed (identity-guarded,
@@ -4444,16 +4462,40 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
       // No silent zombie: tab-1 gets the EXISTING T5a terminal signal — the
       // SAME `tab.error{kind:'session-lost'}` a failed respawn recovery
       // fires — never left bound-to-a-dead-controller with no affordance.
+      // UX-04c: the orphaned-tab route — pin gains `reason`.
       expect(messages).toContainEqual({
         type: 'tab.error',
         tabId: 'tab-1',
         kind: 'session-lost',
+        reason: 'superseded',
         message: expect.any(String),
       });
 
       // Exactly one controller is live for SA, and it is bound to tab-2.
       expect(sessionIdForTab(backend, 'tab-2')).toBe('SA');
       expect(sessionIdForTab(backend, 'tab-1')).toBeUndefined();
+    } finally {
+      await fsp.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('UX-04c: the orphaned-tab session-lost emit carries reason "superseded"', async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'hermes-acp-w6fb-ux04c-'));
+    try {
+      const project = path.join(tmpRoot, 'project');
+      await fsp.mkdir(project, { recursive: true });
+      mockWorkspace.workspaceFolders = [{ uri: { fsPath: tmpRoot } }];
+
+      const { backend, messages } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
+      const load = callLoadSessionIntoTab(backend);
+
+      await load('SA', project, 'tab-1');
+      messages.length = 0; // drop tab-1's own tab.bound/mode.state/clear/turn.start/turn.end noise
+      await load('SA', project, 'tab-2');
+
+      expect(messages).toContainEqual(
+        expect.objectContaining({ type: 'tab.error', tabId: 'tab-1', kind: 'session-lost', reason: 'superseded' }),
+      );
     } finally {
       await fsp.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
     }
@@ -4530,10 +4572,12 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
       const orphan = xHasSA ? 'tab-y' : 'tab-x';
 
       // No silent zombie: the orphaned tab got the terminal session-lost signal.
+      // UX-04c: the orphaned-tab route — pin gains `reason`.
       expect(messages).toContainEqual({
         type: 'tab.error',
         tabId: orphan,
         kind: 'session-lost',
+        reason: 'superseded',
         message: expect.any(String),
       });
     } finally {
@@ -4630,10 +4674,12 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
     expect(result).toBeUndefined();
     // RED (pre-fix): messages would contain ONLY tab.bound/mode.state (the
     // mint's own emissions) — no tab.error at all; the genuinely-silent gap.
+    // UX-04c: TI-5 no-client mid-load route — pin gains `reason`.
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: 'tab-2',
       kind: 'session-lost',
+      reason: 'disconnected',
       message: expect.any(String),
     });
     // Never reached the ACP client — loadReplayOutcome's own `!client` guard (or
@@ -4751,10 +4797,12 @@ describe('F3-7-S — sibling identity-unwind (TI-5 short-circuit + settleRace ti
       const result = await backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
 
       expect(result).toBeUndefined();
+      // UX-04c: TI-5 no-client mid-load route — pin gains `reason`.
       expect(messages).toContainEqual({
         type: 'tab.error',
         tabId: BOOTSTRAP_TAB_ID,
         kind: 'session-lost',
+        reason: 'disconnected',
         message: expect.any(String),
       });
       expect(hasController(backend, 'history-session')).toBe(false);
@@ -4765,6 +4813,28 @@ describe('F3-7-S — sibling identity-unwind (TI-5 short-circuit + settleRace ti
       // unrelated op happens to overwrite it).
       expect(seam.activeSessionId).toBeUndefined();
       expect(seam.cwd).toBe(priorCwd);
+    });
+
+    it('UX-04c: the mid-load disconnect emit carries reason "disconnected"', async () => {
+      const { backend } = makeStartableBackend();
+      await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID, client alive
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      const supervisor = (backend as unknown as { connectionSupervisor: { getClient(): unknown } })
+        .connectionSupervisor;
+      const originalGetClient = supervisor.getClient.bind(supervisor);
+      let calls = 0;
+      supervisor.getClient = () => {
+        calls += 1;
+        return calls === 1 ? originalGetClient() : undefined;
+      };
+
+      await backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+
+      expect(messages).toContainEqual(
+        expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'session-lost', reason: 'disconnected' }),
+      );
     });
 
     it('into a NON-active tab: guard misses, identity untouched (true negative)', async () => {
@@ -4825,10 +4895,12 @@ describe('F3-7-S — sibling identity-unwind (TI-5 short-circuit + settleRace ti
       expect(settlement.settled()).toBe(true);
       await loadPromise;
 
+      // UX-04c: the settleRace deadline mid-load route — pin gains `reason`.
       expect(messages).toContainEqual({
         type: 'tab.error',
         tabId: BOOTSTRAP_TAB_ID,
         kind: 'session-lost',
+        reason: 'timeout',
         message: expect.any(String),
       });
       expect(hasController(backend, 'history-session')).toBe(false);
@@ -4839,6 +4911,23 @@ describe('F3-7-S — sibling identity-unwind (TI-5 short-circuit + settleRace ti
       // or === the target tab's occupant, and after the dangle neither holds).
       expect(seam.activeSessionId).toBeUndefined();
       expect(seam.cwd).toBe(priorCwd);
+    });
+
+    it('UX-04c: the mid-load deadline emit carries reason "timeout"', async () => {
+      const { backend, clients } = makeStartableBackend();
+      await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID
+      must(clients[0]).hangLoadSession();
+
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      const loadPromise = backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+      await vi.advanceTimersByTimeAsync(120_000);
+      await loadPromise;
+
+      expect(messages).toContainEqual(
+        expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'session-lost', reason: 'timeout' }),
+      );
     });
 
     it('a hung-but-alive load into a NON-active tab times out with identity untouched (true negative)', async () => {

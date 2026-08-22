@@ -225,6 +225,34 @@ describe('session-lost at the App level (ARCH-1, UI I-3): a dead session disable
       screen.queryByPlaceholderText('Session lost — load it again from History or start a new chat'),
     ).not.toBeInTheDocument();
   });
+
+  it('UX-04c: the standing session-lost row speaks the reason and keeps History; legacy copy without one', async () => {
+    const { user } = setup(<App />);
+    act(() => {
+      bridge.emit({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        message: 'the session died when the agent restarted',
+        kind: 'session-lost',
+        reason: 'timeout',
+      });
+    });
+    // The standing row is gated on `!tab.error` (same as the other cases in
+    // this describe block) — dismiss the banner to reveal it.
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+
+    expect(screen.getByText('The agent did not respond while loading this session.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'History' })).toBeInTheDocument();
+  });
+
+  it('UX-04c: the standing row falls back to the legacy sentence when no reason rides the wire', async () => {
+    const { user } = setup(<App />);
+    emitSessionLost(); // no `reason` — legacy/back-compat emitter
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+
+    expect(screen.getByText("This chat's session was lost when the agent restarted.")).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'History' })).toBeInTheDocument();
+  });
 });
 
 /**

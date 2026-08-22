@@ -914,7 +914,14 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
           // by KEY OMISSION (never `false`/`undefined`), same discipline the
           // `clear`/`tab.clear` folds already use for `error`. A successful
           // bind is one of this flag's two terminals.
-          const { newSessionPending: _clearedNewSessionPending, ...rest } = tab;
+          // UX-04c: a successful bind retires `sessionLostReason` together
+          // with the `sessionLost` marker it rides on — same key-omission
+          // discipline (exactOptional: cleared by omission, never `undefined`).
+          const {
+            newSessionPending: _clearedNewSessionPending,
+            sessionLostReason: _clearedSessionLostReason,
+            ...rest
+          } = tab;
           return {
             ...rest,
             sessionId: msg.sessionId,
@@ -942,17 +949,29 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
           // (verified — `AcpBackend.newSessionInTabInternal`), so this is the
           // exhaustive pair with `tab.bound` above. Same key-omission clear.
           const { newSessionPending: _clearedNewSessionPending, ...rest } = tab;
+          if (msg.kind === 'open-failed') {
+            // UX-04c: open-failed leaves any prior session-lost marker AND
+            // its reason untouched, exactly as before — its standing row is
+            // already honest for every open-failed path (no reason
+            // vocabulary needed there, scope pin).
+            return { ...rest, error: { message: msg.message, kind: msg.kind }, openFailed: true };
+          }
+          // ARCH-1 (final review, UI I-3): a lost session is a terminal
+          // transition — regress `binding` so the composer (App.tsx
+          // `disabled={tab.binding !== 'bound'}`) stops accepting sends that
+          // have nowhere to go. `sessionLost` outlives the dismissible banner
+          // exactly like `openFailed` does (G-9 pattern); cleared by the next
+          // successful `tab.bound` above.
+          // UX-04c: strip any PREVIOUS loss's reason first, so a reason-less
+          // new loss never wears stale vocabulary; re-add only what THIS
+          // message says (exactOptional: key omitted when the host sent none).
+          const { sessionLostReason: _staleReason, ...restWithoutReason } = rest;
           return {
-            ...rest,
+            ...restWithoutReason,
             error: { message: msg.message, kind: msg.kind },
-            ...(msg.kind === 'open-failed' ? { openFailed: true } : {}),
-            // ARCH-1 (final review, UI I-3): a lost session is a terminal
-            // transition — regress `binding` so the composer (App.tsx
-            // `disabled={tab.binding !== 'bound'}`) stops accepting sends that
-            // have nowhere to go. `sessionLost` outlives the dismissible banner
-            // exactly like `openFailed` does (G-9 pattern); cleared by the next
-            // successful `tab.bound` above.
-            ...(msg.kind === 'session-lost' ? { binding: 'unbound' as const, sessionLost: true } : {}),
+            binding: 'unbound' as const,
+            sessionLost: true,
+            ...(msg.reason !== undefined ? { sessionLostReason: msg.reason } : {}),
           };
         }),
         msg.tabId,
@@ -974,8 +993,11 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // exactOptional prep (arm 1): clear `error` by omitting the key
       // (openFailed/sessionLost stay explicit `false` — a real, non-undefined
       // boolean value, not the exactOptional case).
+      // UX-04c: `sessionLostReason` rides the same exactOptional-by-omission
+      // discipline as `error` — strip it here too, or a stale reason from the
+      // session that just went lost would survive into the fresh tab.
       return foldTabScoped(state, msg.tabId, 'tab.clear', (tab) => {
-        const { error: _clearedError, ...rest } = tab;
+        const { error: _clearedError, sessionLostReason: _clearedReason, ...rest } = tab;
         return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false, openFailed: false, sessionLost: false };
       });
 

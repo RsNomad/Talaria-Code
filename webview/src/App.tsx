@@ -35,6 +35,7 @@ import type {
   McpTestResult,
   NextEditToggleSource,
   Panel,
+  SessionLostReason,
   SetupMethod,
   SkillCreateParams,
   ThemeKind,
@@ -135,6 +136,32 @@ function modelLabel(state: AppState): string {
     ?.providers.flatMap((p) => p.models)
     .find((m) => m.id === id);
   return found?.label ?? id;
+}
+
+/** UX-04c: the standing row used to claim "lost when the agent restarted"
+ * for EVERY loss — false for a mid-load timeout, a mid-load disconnect,
+ * and a session another tab took over. Copy is per-reason now; the
+ * affordance stays History for all of them deliberately (History IS the
+ * retry surface for a load; Force-reconnect already self-surfaces in the
+ * connection banner when health is down — no second home for a
+ * consent-gated destructive control). Exhaustive over all 5 reasons +
+ * `undefined` (the legacy sentence) — no `default` arm, so tsc enforces
+ * exhaustiveness against `SessionLostReason` if it ever grows. */
+function sessionLostRowCopy(reason: SessionLostReason | undefined): string {
+  switch (reason) {
+    case 'superseded':
+      return 'This session is now open in another tab.';
+    case 'disconnected':
+      return 'The agent disconnected while loading this session.';
+    case 'timeout':
+      return 'The agent did not respond while loading this session.';
+    case 'recovery-failed':
+      return 'This session could not be recovered after the agent restarted.';
+    case 'restarted':
+      return 'This session ended when the agent restarted.';
+    case undefined:
+      return "This chat's session was lost when the agent restarted.";
+  }
 }
 
 /** D1 (M7): the shape `vscode.setState`/`getState` persist across a webview
@@ -923,7 +950,7 @@ export function App() {
       {!tab.error && tab.sessionLost === true && tab.binding !== 'bound' && (
         <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
           <Icon name="warning" size={12} className="flex-none text-warn" />
-          <span className="min-w-0 flex-1">This chat's session was lost when the agent restarted.</span>
+          <span className="min-w-0 flex-1">{sessionLostRowCopy(tab.sessionLostReason)}</span>
           <button
             type="button"
             onClick={() => dispatch({ local: { type: 'local.setPanel', panel: 'sessions' } })}

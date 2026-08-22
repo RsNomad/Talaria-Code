@@ -236,6 +236,19 @@ describe('WS-R4 co-edit — recoverOneSession routes all six outcomes (named obs
     }
   });
 
+  it('UX-04c: recovery failures carry reason "recovery-failed"', async () => {
+    const h = makeSupervisorHarness();
+    await recover(h, { kind: 'load-failed', message: 'x' });
+    expect(h.emitted).toContainEqual(
+      expect.objectContaining({
+        type: 'tab.error',
+        tabId: 'tab-R',
+        kind: 'session-lost',
+        reason: 'recovery-failed',
+      }),
+    );
+  });
+
   it("'superseded' (either arm) → strict no-op: NO tab.error, NO adopt, controller left to its new owner", async () => {
     for (const outcome of [
       { kind: 'superseded' },
@@ -930,5 +943,33 @@ describe('dispose() racing startInternal — a disposed supervisor never resurre
     expect(outcome).toEqual({ ok: false, reason: expect.stringContaining('disposed') });
     expect((h.supervisor as unknown as DisposeRaceSeam).acpState).toBe('disposed');
     expect(h.logs.some((line) => line.includes('ACP respawn attempt'))).toBe(false); // reconnect's catch skipped scheduleAcpRespawn (:1213-1216)
+  });
+});
+
+/**
+ * UX-04c (WS-UX Phase-2 Task 30): `fanOutRestartSignal`'s own doc names the
+ * discriminator this seam relies on — `pendingRecovery === undefined` (its
+ * class-field default on a freshly-constructed supervisor, never touched by
+ * a bare `makeSupervisorHarness()`), so the private method can be driven
+ * directly here without a full crash/respawn cycle.
+ */
+describe('UX-04c — session-lost reason vocabulary', () => {
+  it('the restart fan-out carries reason "restarted"', () => {
+    const h = makeSupervisorHarness();
+    // A non-bootstrap controller registered directly into the harness's
+    // registry — `fanOutRestartSignal` emits `tab.error` (not `clear`) for
+    // every controller whose tabId isn't BOOTSTRAP_TAB_ID.
+    h.controllers.set('session-R', makeController('session-R', 'tab-R'));
+
+    (h.supervisor as unknown as { fanOutRestartSignal(): void }).fanOutRestartSignal();
+
+    expect(h.emitted).toContainEqual(
+      expect.objectContaining({
+        type: 'tab.error',
+        tabId: 'tab-R',
+        kind: 'session-lost',
+        reason: 'restarted',
+      }),
+    );
   });
 });
