@@ -140,4 +140,17 @@ describe('UX-02/12b: confirm-on-live-turn gate for Force reconnect (SessionsPane
     expect(screen.getByRole('status').querySelector('button')).toBeNull();
     expect(screen.getByRole('group', { name: 'Confirm force reconnect' })).toBeInTheDocument();
   });
+
+  it('12b fix: a confirm strip left open when health recovers does NOT reappear on the next outage', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={noop} />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+    expect(screen.getByText('A turn is still running — force reconnect will cancel it.')).toBeInTheDocument();
+    rerender(<GatewayHealthBanner health={{ state: 'ok' }} anyTurnLive={true} onForceReconnect={noop} />); // recovery — banner row unmounts
+    rerender(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={noop} />); // NEW outage
+    // Without the fix, stale `confirming` re-mounts the strip with no fresh request:
+    expect(screen.queryByText('A turn is still running — force reconnect will cancel it.')).toBeNull();
+  });
 });

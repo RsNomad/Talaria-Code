@@ -57,6 +57,14 @@ export function GatewayHealthBanner({
     if (confirming) confirmRef.current?.focus();
   }, [confirming]);
 
+  // 12b review fix: an open confirm belongs to ONE outage. If health
+  // recovers while the strip is up, the question ("force reconnect will
+  // cancel the turn") is moot — drop it so a LATER outage never resurrects
+  // a stale consent prompt the user did not just ask for.
+  useEffect(() => {
+    if (health.state === 'ok') setConfirming(false);
+  }, [health.state]);
+
   const announcement = failure
     ? `Force reconnect failed: ${failure}`
     : health.state !== 'ok'
