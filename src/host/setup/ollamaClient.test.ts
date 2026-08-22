@@ -316,3 +316,31 @@ describe('pullModel — POST /api/pull streaming NDJSON (§2.4)', () => {
     expect(cancel).toHaveBeenCalled();
   });
 });
+
+describe('F1-6: pull completion is REQUIRED, not assumed', () => {
+  it('a stream that ends WITHOUT {"status":"success"} rejects PullIncompleteError', async () => {
+    const lines = [
+      JSON.stringify({ status: 'pulling manifest' }),
+      JSON.stringify({ status: 'pulling sha256:aaa', total: 10, completed: 5 }),
+    ];
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    const promise = pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal);
+    await expect(promise).rejects.toThrow('pull stream ended before {"status":"success"} — incomplete');
+    await expect(promise).rejects.toMatchObject({ name: 'PullIncompleteError' });
+  });
+
+  it('success arriving as the FINAL, un-newline-terminated trailing chunk still resolves', async () => {
+    const chunk = new TextEncoder().encode(`${JSON.stringify({ status: 'pulling manifest' })}\n${JSON.stringify({ status: 'success' })}`);
+    const response = { ok: true, body: chunkedBody([chunk]) } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).resolves.toBeUndefined();
+  });
+
+  it('an empty stream (immediate done) rejects PullIncompleteError', async () => {
+    const response = { ok: true, body: chunkedBody([]) } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      name: 'PullIncompleteError',
+    });
+  });
+});

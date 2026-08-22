@@ -75,6 +75,18 @@ export class StreamByteCapError extends Error {
   }
 }
 
+/** WS-SU F1-6: thrown by {@link pullModel} when the NDJSON stream ends
+ *  WITHOUT the terminal `{"status":"success"}` chunk — a clean mid-pull
+ *  disconnect used to be reported as a completed pull. Fixed template
+ *  message (no endpoint/response detail), mirroring {@link
+ *  StreamByteCapError}'s shape discipline. */
+export class PullIncompleteError extends Error {
+  constructor() {
+    super('pull stream ended before {"status":"success"} — incomplete');
+    this.name = 'PullIncompleteError';
+  }
+}
+
 interface TagsResponseModel {
   name: string;
   size: number;
@@ -132,7 +144,8 @@ interface PullResponseChunk {
  * line to `onProgress`. Rejects on a non-2xx response, on a mid-stream
  * `{"error":e}` chunk (`new Error(e)`), or when `signal` aborts (an
  * `AbortError` `DOMException`, interrupting even an in-flight read).
- * Resolves as soon as a `{"status":"success"}` chunk is observed.
+ * Resolves ONLY when a `{"status":"success"}` chunk is observed; a stream
+ * that ends without one rejects with {@link PullIncompleteError} (F1-6).
  */
 export async function pullModel(
   endpoint: string,
@@ -188,8 +201,12 @@ export async function pullModel(
     }
     const trailing = buffer.trim();
     if (trailing) {
-      handlePullChunkLine(trailing, onProgress);
+      if (handlePullChunkLine(trailing, onProgress)) return;
     }
+    // F1-6: the loop returns above the moment success is observed; reaching
+    // here means the stream ended (or was closed under us) without ever
+    // confirming completion — reject, never fabricate a completed pull.
+    throw new PullIncompleteError();
   } finally {
     // F7 discipline (this codebase's `readNdjsonLines`/`readSseEvents`
     // convention, http.ts): cancel() on every exit path — success,
