@@ -9,7 +9,7 @@
  * server's confirmation / failure is SURFACED inline instead of being dropped by
  * a fire-and-forget invoke. The click is still the confirmation (the host sends
  * `confirm:true`); we only make the RESULT visible. */
-import { useState, type FormEvent } from 'react';
+import { useId, useState, type FormEvent } from 'react';
 import type {
   McpAddParams,
   McpAddResult,
@@ -188,56 +188,99 @@ function errorMessage(err: unknown, fallback: string): string {
 
 /** Task A7: the `SetupPanel.tsx:457-486` label+input TextField pattern, copied
  *  locally (no shared component exists to import — same posture as this
- *  file's own plain `<button>`s). */
+ *  file's own plain `<button>`s).
+ *
+ * Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): `error` — when present — wires
+ * `aria-invalid` + `aria-describedby` to a rendered `<span id={errorId}>` so
+ * a screen reader announces WHICH field failed and WHY. The error `<span>` is
+ * a SIBLING of `<label>`, not nested inside it: the browser's accessible-name
+ * algorithm for a wrapping `<label>` folds ALL descendant text into the
+ * control's accessible NAME (not just its description) — nesting the span
+ * inside would corrupt the field's name into "NameName is required." instead
+ * of leaving "Name" as the name and the error as a separate
+ * `aria-describedby` description, which defeats this task's own WCAG intent.
+ * (Confirmed empirically: `@testing-library/dom`'s label-content walk —
+ * `label-helpers.js`'s `getTextContent` — implements the identical
+ * name-computation rule and reproduces the same corruption in jsdom.)
+ * `undefined` (no error) omits both attributes entirely, per
+ * `exactOptionalPropertyTypes` — never a `false`/empty-string placeholder
+ * attribute value. */
 function TextField({
   label,
   value,
   onChange,
   placeholder,
+  error,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
+  error?: string | undefined;
 }) {
+  const errorId = useId();
   return (
-    <label className="flex flex-col gap-1 text-2xs text-muted">
-      {label}
-      <input
-        type="text"
-        value={value}
-        placeholder={placeholder}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg"
-      />
-    </label>
+    <div className="flex flex-col gap-1 text-2xs text-muted">
+      <label className="flex flex-col gap-1">
+        {label}
+        <input
+          type="text"
+          value={value}
+          placeholder={placeholder}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? errorId : undefined}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg aria-[invalid=true]:border-del"
+        />
+      </label>
+      {error && (
+        <span id={errorId} className="text-2xs text-del">
+          {error}
+        </span>
+      )}
+    </div>
   );
 }
 
 /** Task A7: the textarea sibling of {@link TextField} — same classes, for
- *  Args (one per line) / Env (`KEY=VALUE` per line). */
+ *  Args (one per line) / Env (`KEY=VALUE` per line). Task 16: same
+ *  `error`/`aria-invalid`/`aria-describedby` wiring as {@link TextField},
+ *  including the same sibling-not-nested placement of the error `<span>` —
+ *  see {@link TextField}'s doc comment for why. */
 function TextAreaField({
   label,
   value,
   onChange,
   placeholder,
+  error,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
+  error?: string | undefined;
 }) {
+  const errorId = useId();
   return (
-    <label className="flex flex-col gap-1 text-2xs text-muted">
-      {label}
-      <textarea
-        value={value}
-        placeholder={placeholder}
-        rows={3}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg"
-      />
-    </label>
+    <div className="flex flex-col gap-1 text-2xs text-muted">
+      <label className="flex flex-col gap-1">
+        {label}
+        <textarea
+          value={value}
+          placeholder={placeholder}
+          rows={3}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? errorId : undefined}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg aria-[invalid=true]:border-del"
+        />
+      </label>
+      {error && (
+        <span id={errorId} className="text-2xs text-del">
+          {error}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -267,7 +310,14 @@ function AddServerDisclosure({
   const [envText, setEnvText] = useState('');
   const [url, setUrl] = useState('');
   const [adding, setAdding] = useState(false);
-  const [error, setError] = useState<string | undefined>();
+  // Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): field-keyed (was a flat `string`) so
+  // each field's own `TextField`/`TextAreaField` can wire `aria-invalid` +
+  // `aria-describedby` to ONLY the field that actually failed — `'submit'`
+  // covers the onAdd-rejection case, which has no field of its own to attach
+  // to and renders in the same spot the old flat string used to.
+  const [error, setError] = useState<
+    { field: 'name' | 'command' | 'env' | 'url' | 'submit'; text: string } | undefined
+  >();
 
   const resetFields = () => {
     setName('');
@@ -283,7 +333,7 @@ function AddServerDisclosure({
 
     const trimmedName = name.trim();
     if (!trimmedName) {
-      setError('Name is required.');
+      setError({ field: 'name', text: 'Name is required.' });
       return;
     }
 
@@ -291,12 +341,12 @@ function AddServerDisclosure({
     if (transport === 'stdio') {
       const trimmedCommand = command.trim();
       if (!trimmedCommand) {
-        setError('Command is required.');
+        setError({ field: 'command', text: 'Command is required.' });
         return;
       }
       const envResult = parseEnvLines(envText);
       if (!envResult.ok) {
-        setError(envResult.error);
+        setError({ field: 'env', text: envResult.error });
         return;
       }
       params = {
@@ -309,7 +359,7 @@ function AddServerDisclosure({
     } else {
       const trimmedUrl = url.trim();
       if (!trimmedUrl) {
-        setError('URL is required.');
+        setError({ field: 'url', text: 'URL is required.' });
         return;
       }
       params = { name: trimmedName, transport: 'http', url: trimmedUrl };
@@ -326,7 +376,7 @@ function AddServerDisclosure({
       },
       (err: unknown) => {
         setAdding(false);
-        setError(errorMessage(err, 'Add failed.'));
+        setError({ field: 'submit', text: errorMessage(err, 'Add failed.') });
       },
     );
   };
@@ -350,7 +400,13 @@ function AddServerDisclosure({
       </button>
       {open && (
         <form onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
-          <TextField label="Name" value={name} onChange={setName} placeholder="my-server" />
+          <TextField
+            label="Name"
+            value={name}
+            onChange={setName}
+            placeholder="my-server"
+            error={error?.field === 'name' ? error.text : undefined}
+          />
 
           <fieldset className="flex items-center gap-3">
             <legend className="sr-only">Transport</legend>
@@ -376,7 +432,13 @@ function AddServerDisclosure({
 
           {transport === 'stdio' ? (
             <>
-              <TextField label="Command" value={command} onChange={setCommand} placeholder="npx" />
+              <TextField
+                label="Command"
+                value={command}
+                onChange={setCommand}
+                placeholder="npx"
+                error={error?.field === 'command' ? error.text : undefined}
+              />
               <TextAreaField
                 label="Args (one per line)"
                 value={argsText}
@@ -388,17 +450,34 @@ function AddServerDisclosure({
                 value={envText}
                 onChange={setEnvText}
                 placeholder={'API_KEY=...'}
+                error={error?.field === 'env' ? error.text : undefined}
               />
             </>
           ) : (
-            <TextField label="URL" value={url} onChange={setUrl} placeholder="https://example.com/mcp" />
+            <TextField
+              label="URL"
+              value={url}
+              onChange={setUrl}
+              placeholder="https://example.com/mcp"
+              error={error?.field === 'url' ? error.text : undefined}
+            />
           )}
 
-          <LiveRegion text={error ?? ''} className="sr-only" />
-          {error && (
+          {/* Finding-7: this LiveRegion stays the SOLE screen-reader
+              announcer for every refusal on this form — field-level errors
+              above are ALSO wired via aria-invalid/aria-describedby (WCAG
+              1.3.1/3.3.1), but this permanently-mounted region is what
+              actually fires the announcement, same posture as every other
+              LiveRegion in this file. */}
+          <LiveRegion text={error?.text ?? ''} className="sr-only" />
+          {/* The onAdd-rejection case has no field of its own to attach to —
+              it keeps rendering in this form-level slot, same as the old
+              flat string did. Every OTHER error now renders field-adjacent,
+              via the TextField/TextAreaField `error` prop above. */}
+          {error?.field === 'submit' && (
             <div className="flex items-start gap-1.5 rounded border border-del bg-del-soft px-2 py-1 text-2xs text-fg">
               <Icon name="error" size={11} className="mt-0.5 flex-none text-del" />
-              <span className="min-w-0 flex-1 break-words">{error}</span>
+              <span className="min-w-0 flex-1 break-words">{error.text}</span>
             </div>
           )}
 

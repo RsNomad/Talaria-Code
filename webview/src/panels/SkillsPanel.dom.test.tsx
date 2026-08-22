@@ -828,3 +828,47 @@ describe('TI-3 (AU-42 Part B): a refreshError renders a dismissible banner over 
     expect(dismissed).toEqual([true]);
   });
 });
+
+/**
+ * Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): the Create-skill form's error state is
+ * field-keyed (`{field, text}`), same twin fix as McpPanel's Add-server form
+ * above — `aria-invalid` + `aria-describedby` tie the offending field to its
+ * error text for a screen reader.
+ */
+describe('WV4-MIN a11y: SkillsPanel create-form field errors are keyed to their field', () => {
+  it('submitting the create form with an empty Name marks the field aria-invalid and wires the error via aria-describedby', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    const name = screen.getByLabelText(/^Name$/i);
+    expect(name).toHaveAttribute('aria-invalid', 'true');
+    const describedBy = name.getAttribute('aria-describedby');
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(must(describedBy))).toHaveTextContent('Name is required.');
+  });
+
+  it('submitting with a Name but empty Content marks Content aria-invalid instead, and Name is no longer flagged', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    const name = screen.getByLabelText(/^Name$/i);
+    await user.type(name, 'my-skill');
+    const content = screen.getByLabelText(/^Content$/i);
+    await user.clear(content); // seeded content cleared → contentEdited, empty
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    expect(content).toHaveAttribute('aria-invalid', 'true');
+    const describedBy = content.getAttribute('aria-describedby');
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(must(describedBy))).toHaveTextContent('Content is required.');
+    expect(name).not.toHaveAttribute('aria-invalid', 'true');
+  });
+});

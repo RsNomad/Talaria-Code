@@ -446,3 +446,26 @@ describe('AU-40: row "Test" goes BUSY, not natively disabled, while mcp.test is 
     expect(pending).toHaveFocus();
   });
 });
+
+/**
+ * Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): the Add-server form's error state is
+ * field-keyed (`{field, text}`), not a flat string — a screen reader must be
+ * able to tell WHICH field failed and WHY, via `aria-invalid` +
+ * `aria-describedby` pointing at the rendered error text, not just an
+ * unassociated floating error string.
+ */
+describe('WV4-MIN a11y: MCP add-server form field errors are keyed to their field', () => {
+  it('submitting the add form with an empty Name marks the field aria-invalid and wires the error via aria-describedby', async () => {
+    const user = userEvent.setup();
+    render(<McpPanel data={mcpData()} onReload={async () => ({ status: 'reloaded' })} {...noopMcpAdminProps()} />);
+
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    await user.click(screen.getByRole('button', { name: /^Add$/i }));
+
+    const name = screen.getByLabelText('Name');
+    expect(name).toHaveAttribute('aria-invalid', 'true');
+    const describedBy = name.getAttribute('aria-describedby');
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(must(describedBy))).toHaveTextContent('Name is required.');
+  });
+});
