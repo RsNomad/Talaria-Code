@@ -260,6 +260,22 @@ describe('UI#2 review: markdown block/list recursion depth is capped against unt
 });
 
 /**
+ * A11Y-03 lock (WCAG 1.3.1 / 2.4.6): pins the G-5/C2 heading-demotion
+ * behavior above (`renderBlock`'s `# `-`######` -> `h3`-`h6` clamp) as a
+ * regression guard for the panel-chrome heading work — the transcript's own
+ * headings must stay BELOW the panel's `h2` (`PanelShell`) / the chat
+ * surface's sr-only `h2` (`ChatView`), never colliding with or outranking
+ * them. No renderer change: this locks already-implemented behavior.
+ */
+describe('A11Y-03 lock: markdown heading clamp stays below the panel/chat h2', () => {
+  it('markdown # maps to h3 and #### collapses to h6 (transcript headings stay below the panel h2)', () => {
+    render(<AgentMarkdown text={'# a\n\n#### b'} />);
+    expect(screen.getByRole('heading', { level: 3, name: 'a' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 6, name: 'b' })).toBeInTheDocument();
+  });
+});
+
+/**
  * M-1 (review-verified-by-hand, now locked as regression coverage): the C2
  * link-scheme gate lives in `inline()`'s regex, and every leaf block
  * (paragraph, table cell, list item, blockquote content) routes its content

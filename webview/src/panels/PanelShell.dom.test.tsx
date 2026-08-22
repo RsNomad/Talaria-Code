@@ -14,8 +14,33 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { RemotePanel } from './PanelShell';
+import { RemotePanel, PanelShell, SectionLabel } from './PanelShell';
 import type { RemoteData } from '../state/remoteData';
+
+/**
+ * A11Y-03 (WCAG 1.3.1 / 2.4.6): the panel title used to be a plain `<span>`
+ * and `SectionLabel` a plain `<div>` — AT saw NO document structure anywhere
+ * in panel chrome, no heading to navigate to, no landmark naming the panel.
+ * `PanelShell`'s title is now a real `<h2>` and the shell itself is a
+ * `role="region"` named by that h2 (via `aria-labelledby`, so the string
+ * lives in exactly one place); `SectionLabel` is now a real `<h3>` — both are
+ * visual no-ops (Tailwind preflight zeroes heading margin/font-size, and
+ * `.h-eyebrow` already fully defines the rendered appearance).
+ */
+describe('PanelShell — A11Y-03: real h2 + region landmark', () => {
+  it('the panel title is a real h2 and the shell is a region named by it', () => {
+    render(<PanelShell title="History">x</PanelShell>);
+    expect(screen.getByRole('heading', { level: 2, name: 'History' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'History' })).toBeInTheDocument();
+  });
+});
+
+describe('SectionLabel — A11Y-03: real h3 heading', () => {
+  it('renders a level-3 heading', () => {
+    render(<SectionLabel>Agent</SectionLabel>);
+    expect(screen.getByRole('heading', { level: 3, name: 'Agent' })).toBeInTheDocument();
+  });
+});
 
 describe('RemotePanel — B5 M-4: loading/idle announces busy status', () => {
   it('idle (remote=undefined) renders a role="status" element with aria-busy="true"', () => {

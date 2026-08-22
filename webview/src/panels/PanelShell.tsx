@@ -1,5 +1,5 @@
 /* Shared scaffolding for side panels: a telemetry header + scroll body. */
-import type { ReactNode } from 'react';
+import { useId, type ReactNode } from 'react';
 import { Icon } from '../components/Icon';
 import type { RemoteData } from '../state/remoteData';
 
@@ -9,11 +9,24 @@ interface PanelShellProps {
   children: ReactNode;
 }
 
+/**
+ * A11Y-03 (WCAG 1.3.1 / 2.4.6): the title used to be a plain `<span>` — AT
+ * saw NO document structure anywhere in panel chrome: no heading to jump to,
+ * no landmark naming the panel. It's now a real `<h2>`, and the shell itself
+ * is a `role="region"` named by that h2 via `aria-labelledby` (the string
+ * lives in exactly one place, not duplicated into a separate `aria-label`).
+ * This is the outline root every panel's content sits under — SectionLabel's
+ * `h3` below it, and (in the chat surface) AgentMarkdown's clamped `h3`-`h6`
+ * markdown headings via ChatView's own sr-only `h2`.
+ */
 export function PanelShell({ title, meta, children }: PanelShellProps) {
+  const headingId = useId();
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div role="region" aria-labelledby={headingId} className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-none items-center justify-between px-3 py-2.5">
-        <span className="h-eyebrow">{title}</span>
+        <h2 id={headingId} className="h-eyebrow">
+          {title}
+        </h2>
         {meta && <span className="font-mono text-2xs text-faint">{meta}</span>}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-4">{children}</div>
@@ -31,12 +44,17 @@ export function EmptyPanel({ hint }: { hint: string }) {
  * heading after `scrollIntoView`, and a heading needs to be programmatically
  * focusable to receive it. Every existing caller omits `id` and is
  * byte-for-byte unaffected (optional, defaults to `undefined`).
+ *
+ * A11Y-03: was a plain `<div>` — now a real `<h3>`, sitting below the
+ * `PanelShell` `h2` that wraps every panel using it. Tailwind preflight
+ * zeroes heading margin/font-size (`.h-eyebrow` fully defines the rendered
+ * appearance), so this is a visual no-op — same classes, same look.
  */
 export function SectionLabel({ children, id }: { children: ReactNode; id?: string }) {
   return (
-    <div id={id} tabIndex={id !== undefined ? -1 : undefined} className="h-eyebrow mb-1.5 mt-3 first:mt-0">
+    <h3 id={id} tabIndex={id !== undefined ? -1 : undefined} className="h-eyebrow mb-1.5 mt-3 first:mt-0">
       {children}
-    </div>
+    </h3>
   );
 }
 

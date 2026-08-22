@@ -411,6 +411,15 @@ export const ChatView = memo(function ChatView({
 
   return (
     <>
+      {/* A11Y-03 (WCAG 1.3.1 / 2.4.6): AgentMarkdown clamps its `#`-`######`
+       * markdown into `h3`-`h6` (G-5/C2) so a transcript message's own
+       * headings sit BELOW the panel chrome's `h2` — but this chat surface
+       * has no PanelShell wrapper of its own, so without a heading here
+       * those h3-h6 would be orphaned (no h2 above them in the document
+       * outline). `sr-only`: sighted users already see this is the
+       * conversation; screen-reader/heading-navigation users get the
+       * structure. */}
+      <h2 className="sr-only">Conversation</h2>
       {/* B1: assertive sibling, mounted BEFORE the log region — a separate
        * element from the log's own implicit polite live-ness (role="log"
        * already carries an implicit aria-live="polite"; doubling an

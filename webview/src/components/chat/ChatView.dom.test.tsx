@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
+import { render, fireEvent, screen } from '@testing-library/react';
 import { ChatView } from './ChatView';
 import type { ApprovalItem, MessageItem, TranscriptItem, UserItem } from '../../types';
 
@@ -60,6 +60,24 @@ function renderChatView(transcript: TranscriptItem[]) {
     />,
   );
 }
+
+/**
+ * A11Y-03 (WCAG 1.3.1 / 2.4.6): `AgentMarkdown` demotes `#`-`######` into
+ * `h3`-`h6` (G-5/C2) so its headings sit BELOW the panel chrome's `h2`
+ * (`PanelShell`) — but the chat surface has no `PanelShell` wrapper at all,
+ * so without a heading of its own the transcript's h3-h6 would be orphaned:
+ * the first heading level ever encountered in the panel would jump straight
+ * to h3/h4/h5/h6 with no h2 above it (a WCAG 1.3.1/2.4.6 structural gap, and
+ * a broken outline for heading-navigation AT). An sr-only `<h2>Conversation
+ * </h2>` — visually hidden, present in the accessibility tree — fixes that
+ * without changing anything sighted users see.
+ */
+describe('ChatView accessibility (A11Y-03)', () => {
+  it('the conversation carries an sr-only h2 so AgentMarkdown h3-h6 are never orphaned', () => {
+    renderChatView([userItem()]);
+    expect(screen.getByRole('heading', { level: 2, name: 'Conversation' })).toBeInTheDocument();
+  });
+});
 
 describe('ChatView accessibility (B1)', () => {
   it('renders the transcript scroll container as a keyboard-focusable ARIA log', () => {
