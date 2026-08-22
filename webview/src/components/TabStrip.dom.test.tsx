@@ -422,3 +422,61 @@ describe('W4-T6 (UI#14): aria-controls is a dangling IDREF when the chat panel i
     }
   });
 });
+
+/*
+ * Task 18 (WCAG 1.1.1, WV4-MIN): the "waiting on tab.bound" spinner (this
+ * file's header doc) was a bare `<Icon name="loading" spin>` inside the tab
+ * button — an SVG glyph with no text alternative, so a pending tab's
+ * accessible name was just its title, identical to a bound tab's. AT users
+ * had no way to tell a session was still connecting. An `sr-only` span
+ * (same pattern as ChatView's/PanelShell's sr-only regions) folds
+ * "(connecting…)" into the tab button's accessible name ONLY while
+ * `tab.binding === 'pending'` — bound/unbound tabs are textually unchanged.
+ */
+describe('Task 18 (WCAG 1.1.1): a pending tab announces "connecting" to assistive tech', () => {
+  function pendingTab(tabId: string, title: string) {
+    return { ...makeTabState(tabId, title), binding: 'pending' as const };
+  }
+
+  function boundTab(tabId: string, title: string) {
+    return { ...makeTabState(tabId, title), binding: 'bound' as const };
+  }
+
+  it('a pending tab resolves via getByRole("tab", { name: /connecting/i })', () => {
+    render(
+      <TabStrip
+        tabs={[pendingTab('t1', 'Alpha'), boundTab('t2', 'Bravo')]}
+        activeTabId="t1"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={true}
+      />,
+    );
+
+    expect(screen.getByRole('tab', { name: /connecting/i })).toBeInTheDocument();
+  });
+
+  it("a bound tab's accessible name does NOT match /connecting/i", () => {
+    render(
+      <TabStrip
+        tabs={[pendingTab('t1', 'Alpha'), boundTab('t2', 'Bravo')]}
+        activeTabId="t1"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={true}
+      />,
+    );
+
+    // Exact-name match ('Bravo', no trailing text) proves the accessible
+    // name carries nothing extra; the regex assertion is the direct check
+    // the brief asks for.
+    const bravo = screen.getByRole('tab', { name: 'Bravo' });
+    expect(bravo).not.toHaveAccessibleName(/connecting/i);
+  });
+});

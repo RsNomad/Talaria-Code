@@ -172,6 +172,15 @@ export function TabStrip({
                   <Icon name="loading" size={10} spin className="flex-none" />
                 )}
                 <span className="truncate">{tab.title}</span>
+                {/* Task 18 (WCAG 1.1.1): the spinner above is `aria-hidden`
+                 * (Icon's own default) — a bare glyph with no text
+                 * alternative, so a pending tab's accessible name was
+                 * identical to a bound tab's and AT users had no way to
+                 * tell a session was still connecting. This sr-only span
+                 * folds "(connecting…)" into the button's accessible name
+                 * ONLY while binding is 'pending'; bound/unbound tabs are
+                 * textually unchanged. */}
+                {tab.binding === 'pending' && <span className="sr-only">(connecting…)</span>}
               </button>
               {canClose && (
                 <button
