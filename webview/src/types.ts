@@ -272,6 +272,13 @@ export interface TabState {
   draftAttachments: Attachment[];
 }
 
+/** UX-02: the `gateway.health` payload as held in state (type-only mirror). */
+export interface GatewayHealthView {
+  state: 'ok' | 'degraded' | 'down';
+  /** Live retry counter of the worst management link; present iff state !== 'ok'. */
+  attempts?: number;
+}
+
 export interface AppState {
   tabs: Record<string, TabState>;
   tabOrder: string[];
@@ -287,6 +294,13 @@ export interface AppState {
    * `Pill` in `TabStrip`.
    */
   backendKind: BackendKind;
+  /**
+   * UX-02: combined management-link health (`gateway.health` push) —
+   * CONNECTION-GLOBAL, exactly like `backendKind`/`nextEditToggles` above.
+   * Boot default `{state:'ok'}`: no banner until the host says otherwise
+   * (the provider re-syncs the real value right after every hydrate).
+   */
+  gatewayHealth: GatewayHealthView;
   /**
    * W5.1 R5 (Task 13): the Guard-ratified «Next Edit Suggestions» toggles —
    * CONNECTION-GLOBAL, exactly like `theme`/`backendKind` above (there is one
@@ -486,6 +500,9 @@ export function createInitialState(restored?: {
     // fallback for the one render before hydrate — exactly the A2 bug this
     // badge exists to close).
     backendKind: 'mock',
+    // UX-02: boot default {state:'ok'} — no banner until the host says
+    // otherwise (the provider re-syncs the real value right after hydrate).
+    gatewayHealth: { state: 'ok' },
     // R5 (Task 13): boot both-OFF — the same hardcoded first-run default the
     // Guard itself uses. Before the first `nextEdit.state` push there IS no
     // known state, and honestly showing OFF (then self-correcting the instant

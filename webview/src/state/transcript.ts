@@ -832,6 +832,18 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       return rest;
     }
 
+    case 'gateway.health':
+      // UX-02: CONNECTION-GLOBAL — same posture as `backend.state`/
+      // `nextEdit.state` above (no sessionId, one gateway per connection).
+      // exactOptional (arm 1): omit `attempts` when the wire omitted it.
+      return {
+        ...state,
+        gatewayHealth: {
+          state: msg.state,
+          ...(msg.attempts !== undefined ? { attempts: msg.attempts } : {}),
+        },
+      };
+
     case 'turn.start':
       return foldTurnStart(state, msg);
 
@@ -1009,6 +1021,7 @@ function assertReduceHandlesEveryRoutedMessage(
     case 'nextEdit.state':
     case 'system.error':
     case 'system.recovered':
+    case 'gateway.health':
     case 'turn.start':
     case 'policy.state':
     case 'commands.available':

@@ -2478,3 +2478,26 @@ describe('panel.activate (P1 entry-point fix)', () => {
     expect({ ...next, activePanel: INITIAL_STATE.activePanel }).toEqual(INITIAL_STATE);
   });
 });
+
+describe('UX-02: gateway.health folds into AppState.gatewayHealth (connection-global)', () => {
+  it('folds state + attempts; a later ok push (attempts omitted) retires it', () => {
+    let state = reduce(INITIAL_STATE, { type: 'gateway.health', state: 'degraded', attempts: 5 });
+    expect(state.gatewayHealth).toEqual({ state: 'degraded', attempts: 5 });
+    state = reduce(state, { type: 'gateway.health', state: 'down', attempts: 10 });
+    expect(state.gatewayHealth).toEqual({ state: 'down', attempts: 10 });
+    state = reduce(state, { type: 'gateway.health', state: 'ok' });
+    // exactOptional: the key is ABSENT after an ok push, never present-with-undefined.
+    expect(state.gatewayHealth).toEqual({ state: 'ok' });
+    expect('attempts' in state.gatewayHealth).toBe(false);
+  });
+
+  it('boot default is {state:"ok"} — no banner until the host says otherwise', () => {
+    expect(INITIAL_STATE.gatewayHealth).toEqual({ state: 'ok' });
+  });
+
+  it('does not touch any tab state (connection-global, like backend.state)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'gateway.health', state: 'down', attempts: 12 });
+    expect(activeTab(state).turnActive).toBe(true); // untouched
+  });
+});

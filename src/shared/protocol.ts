@@ -1445,6 +1445,26 @@ export type HostToWebview =
   | { type: 'system.recovered' }
 
   /**
+   * WS-UX UX-02 (the F2-19 UI face): COMBINED health of the two host↔Hermes
+   * management links — the control plane (`ControlChannel`) and the ACP
+   * connection (`ConnectionSupervisor`) — classified by the shared
+   * respawn-attempt thresholds (`src/host/control/respawnHealth.ts`) and
+   * combined worst-state-wins (`combineGatewayHealth`). CONNECTION-GLOBAL
+   * (no sessionId; there is one gateway per extension, never one per tab).
+   * Edge-triggered: one push per COMBINED-state transition — plus one
+   * unconditional re-sync right after every `hydrate` (and after a backend
+   * swap), because a re-created webview boots back to `{state:'ok'}`.
+   * `attempts` (the live retry counter of the worst port) is present iff
+   * `state !== 'ok'`. Deliberately NOT `system.error`: that message's T5
+   * contract above reserves it for one-shot connection signals retired by
+   * the next successful establish — this is a STANDING degraded state with
+   * its own retirement (`state:'ok'`). The literals mirror
+   * `RespawnHealthState` structurally; this dependency-free module must not
+   * import host code (same posture as `BackendKind`'s note, :150-165).
+   */
+  | { type: 'gateway.health'; state: 'ok' | 'degraded' | 'down'; attempts?: number }
+
+  /**
    * The editor color theme changed.
    * Origin: host-side `window.onDidChangeActiveColorTheme`.
    */
