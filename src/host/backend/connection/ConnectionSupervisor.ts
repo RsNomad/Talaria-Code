@@ -385,6 +385,14 @@ export class ConnectionSupervisor {
     let connectedCwd: string | undefined;
     try {
       const resolved = await resolveHermes(this.port.config);
+      // Dispose-race fix (WS-UX T5 review; mirrors ControlChannel
+      // .spawnAndAwaitReady's CF-01/I-5 pre-spawn re-check, ControlChannel.ts
+      // :227-229): `AcpBackend.dispose()` -> `markDisposed()` can land while
+      // `resolveHermes` is in flight. Don't create a client — whose
+      // `connect()` would spawn a child NOTHING will ever reap, because
+      // dispose() has already run — for a supervisor that's already gone.
+      // Cast: same TS-narrowing reasoning as this try's catch below.
+      if ((this.acpState as string) === 'disposed') throw new Error('AcpBackend: disposed');
       this.port.setCwd(resolved.cwd);
       connectedCwd = resolved.cwd;
 
@@ -412,6 +420,22 @@ export class ConnectionSupervisor {
         await client.initialize();
         await this.port.startControl();
       });
+
+      // Dispose-race fix (WS-UX T5 review; mirrors ControlChannel
+      // .spawnAndAwaitReady's post-await disposed re-check, ControlChannel.ts
+      // :263-267): `AcpBackend.dispose()` landing after the connect phase
+      // settled but before this continuation resumed must NOT resurrect a
+      // disposed supervisor to 'ready', must NOT fire a spurious 'ok' health
+      // transition to still-registered onHealth subscribers, and must NOT
+      // attach a crash subscription to a client dispose()'s teardownSession
+      // already tore down. Everything from this check to `emitHealth(0)`
+      // below is synchronous, so this re-check is race-free by construction.
+      // The throw lands in this try's own catch, which is already
+      // disposed-aware: it keeps acpState 'disposed' (never resets to
+      // 'idle'), disposes+nulls any still-assigned client (CF-01/I-1), and
+      // suppresses the failure banner — a disposed supervisor stays disposed
+      // and no child is orphaned.
+      if ((this.acpState as string) === 'disposed') throw new Error('AcpBackend: disposed');
 
       // R-A6: supervise the live child as soon as the CONNECTION itself is
       // healthy — independent of whether the session below manages to

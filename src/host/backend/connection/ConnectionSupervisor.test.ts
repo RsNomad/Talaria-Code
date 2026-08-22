@@ -18,6 +18,7 @@ import type { ConnectionSupervisorHostPort } from './ConnectionSupervisor';
 import type {
   AcpClientCallbacks,
   AcpClientLike,
+  AcpClientOptions,
 } from '../acp/acpClient';
 import type { SessionRegistry } from '../session/SessionRegistry';
 import type { SessionController, LoadReplayOutcome } from '../session/SessionController';
@@ -798,5 +799,135 @@ describe('WS-R3 F2-19 — supervisor respawn loop health transitions', () => {
     expect(h.clients.length).toBeGreaterThanOrEqual(2);
     await vi.advanceTimersByTimeAsync(1);
     expect(h.supervisor.getClient()).toBeDefined();
+  });
+});
+
+/** Dispose-race fix: private-state seam (repo convention — cast, never `any`). */
+type DisposeRaceSeam = { acpState: string };
+
+describe('dispose() racing startInternal — a disposed supervisor never resurrects (WS-UX T5 review finding)', () => {
+  it('G2: dispose() landing while the connect phase settles → start() rejects; no resurrect, no exit-sub, no session mint, no banner, no orphan', async () => {
+    const h = makeSupervisorHarness();
+    const healthEvents: RespawnHealth[] = [];
+    h.supervisor.onHealth((health) => healthEvents.push(health));
+    (h.port.startControl as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      // The REAL AcpBackend.dispose() sequence (AcpBackend.ts:1979 then
+      // :1992), landing after connect()/initialize() resolved but before
+      // startInternal's continuation resumes past the connect-phase await.
+      h.supervisor.markDisposed();
+      h.supervisor.teardownSession();
+    });
+
+    // RED (pre-fix): start() RESOLVES — the supervisor resurrects to 'ready',
+    // attaches an exit-sub to the disposed client, mints a bootstrap session
+    // and emits system.recovered, all on a disposed supervisor.
+    await expect(h.supervisor.start()).rejects.toThrow(/disposed/i);
+
+    expect((h.supervisor as unknown as DisposeRaceSeam).acpState).toBe('disposed'); // never 'ready'
+    expect(must(h.clients[0]).disposeCallCount).toBe(1); // no orphaned client (teardownSession's dispose; catch no-ops)
+    expect(must(h.clients[0]).exitHandlers).toHaveLength(0); // no crash-sub attached to a disposed client
+    expect(h.supervisor.getClient()).toBeUndefined();
+    expect(h.port.openSession).not.toHaveBeenCalled(); // no session minted post-dispose
+    expect(h.emitted.filter((m) => m.type === 'system.recovered')).toHaveLength(0);
+    expect(h.emitted.filter((m) => m.type === 'system.error')).toHaveLength(0); // catch suppresses the banner when disposed
+    expect(healthEvents).toHaveLength(0);
+  });
+
+  it('G2 (markDisposed alone in the window): the catch still disposes the just-connected client — no orphan even without teardownSession', async () => {
+    const h = makeSupervisorHarness();
+    (h.port.startControl as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      h.supervisor.markDisposed(); // no teardownSession — the guard+catch clean up alone
+    });
+    await expect(h.supervisor.start()).rejects.toThrow(/disposed/i);
+    expect(must(h.clients[0]).disposeCallCount).toBe(1); // disposed by startInternal's own catch (CF-01/I-1 path)
+    expect(h.supervisor.getClient()).toBeUndefined();
+    expect((h.supervisor as unknown as DisposeRaceSeam).acpState).toBe('disposed');
+  });
+
+  it('G1: dispose() racing the resolveHermes() await aborts before any client is created', async () => {
+    const h = makeSupervisorHarness();
+    const startPromise = h.supervisor.start();
+    // startInternal's FIRST act (teardownSession, :377) synchronously calls
+    // settleOneShot('session torn down'), then suspends at `await
+    // resolveHermes(...)` (:387; pinned hermesPath+pythonPath → microtasks
+    // only, no OS calls — same reasoning as ControlChannel.test.ts:506-528).
+    // Poll one microtask at a time until that sentinel shows: we are then
+    // INSIDE the resolveHermes window, strictly before createClient. Bounded
+    // so a regression fails loudly instead of hanging the suite.
+    for (let i = 0; i < 50 && (h.port.settleOneShot as ReturnType<typeof vi.fn>).mock.calls.length === 0; i++) {
+      await Promise.resolve();
+    }
+    expect(h.port.settleOneShot).toHaveBeenCalled(); // startInternal entered…
+    expect(h.clients).toHaveLength(0); // …and is still pre-createClient: the window is REAL, not assumed
+    h.supervisor.markDisposed();
+
+    // RED (pre-fix): resolves, and h.clients grows to 1 — a client (⇒ child)
+    // created for a supervisor that dispose() already finished with.
+    await expect(startPromise).rejects.toThrow(/disposed/i);
+    expect(h.clients).toHaveLength(0); // a disposed supervisor never creates a client
+    expect((h.supervisor as unknown as DisposeRaceSeam).acpState).toBe('disposed');
+  });
+
+  it('spurious-health pin + respawn-caller safety: dispose() landing while a crash-loop attempt is mid-connect emits NO {state:ok} recovery and never re-arms', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeSupervisorHarness();
+      const healthEvents: RespawnHealth[] = [];
+      h.supervisor.onHealth((health) => healthEvents.push(health));
+      await h.supervisor.start(); // healthy boot (emitHealth(0) dedupes: lastState already 'ok')
+
+      // Fail the next 4 connect phases so the tracker leaves 'ok'
+      // ('degraded' fires when attempt 5 is ARMED — respawnHealth.ts:9,19-23).
+      let failNext = 4;
+      const realCreate = h.port.createClient;
+      h.port.createClient = (opts: AcpClientOptions) => {
+        const client = realCreate(opts) as unknown as FakeSupervisorClient;
+        if (failNext > 0) {
+          failNext -= 1;
+          client.connectError = new Error('connect boom');
+        }
+        return client as unknown as AcpClientLike;
+      };
+
+      must(h.clients[0]).simulateExit(1); // handleAcpCrash → attempt 1 armed
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        await vi.advanceTimersByTimeAsync(respawnBackoffMs(attempt)); // each fails, re-arms the next
+      }
+      expect(healthEvents).toContainEqual({ state: 'degraded', attempts: 5 });
+      healthEvents.length = 0;
+
+      // Attempt 5 will SUCCEED its connect phase — but dispose() lands in the window.
+      (h.port.startControl as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        h.supervisor.markDisposed();
+        h.supervisor.teardownSession();
+      });
+      await vi.advanceTimersByTimeAsync(respawnBackoffMs(5));
+
+      // RED (pre-fix): healthEvents contains the spurious {state:'ok',
+      // attempts:0} "recovered" push — fired AFTER dispose(), to subscribers
+      // markDisposed() correctly no longer clears (T5's tracker refactor).
+      expect(healthEvents).toHaveLength(0);
+      expect((h.supervisor as unknown as DisposeRaceSeam).acpState).toBe('disposed');
+      expect(vi.getTimerCount()).toBe(0); // the timer-callback catch saw 'disposed': no re-arm (ConnectionSupervisor.ts:1249)
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reconnect-caller safety: an in-flight reconnect() that loses the dispose race refuses honestly and does not re-arm', async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    (h.port.startControl as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      h.supervisor.markDisposed();
+      h.supervisor.teardownSession();
+    });
+
+    // RED (pre-fix): resolves {ok:true} — a "successful" reconnect of a
+    // supervisor that is already disposed, with acpState resurrected.
+    const outcome = await h.supervisor.reconnect();
+
+    expect(outcome).toEqual({ ok: false, reason: expect.stringContaining('disposed') });
+    expect((h.supervisor as unknown as DisposeRaceSeam).acpState).toBe('disposed');
+    expect(h.logs.some((line) => line.includes('ACP respawn attempt'))).toBe(false); // reconnect's catch skipped scheduleAcpRespawn (:1213-1216)
   });
 });
