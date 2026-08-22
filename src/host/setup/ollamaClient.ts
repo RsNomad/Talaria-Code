@@ -87,6 +87,19 @@ export class PullIncompleteError extends Error {
   }
 }
 
+/** F1-7: how many malformed NDJSON lines one pull tolerates before failing
+ *  honestly. Generous — a healthy Ollama stream contains zero. */
+const MAX_MALFORMED_PULL_LINES = 20;
+
+/** F1-7: thrown when a pull stream exceeds {@link MAX_MALFORMED_PULL_LINES}.
+ *  Carries a COUNT only — never line content (untrusted stream data). */
+export class PullMalformedStreamError extends Error {
+  constructor(count: number) {
+    super(`pull stream produced ${count} malformed NDJSON lines — aborting`);
+    this.name = 'PullMalformedStreamError';
+  }
+}
+
 interface TagsResponseModel {
   name: string;
   size: number;
@@ -173,6 +186,7 @@ export async function pullModel(
   const decoder = new TextDecoder();
   let buffer = '';
   let received = 0;
+  let malformedLines = 0;
   try {
     for (;;) {
       const { value, done } = await readWithAbort(reader, signal);
@@ -196,12 +210,19 @@ export async function pullModel(
         const line = buffer.slice(0, newlineIdx).trim();
         buffer = buffer.slice(newlineIdx + 1);
         if (!line) continue;
-        if (handlePullChunkLine(line, onProgress)) return;
+        const outcome = handlePullChunkLine(line, onProgress);
+        if (outcome === 'success') return;
+        if (outcome === 'malformed') {
+          malformedLines += 1;
+          if (malformedLines > MAX_MALFORMED_PULL_LINES) {
+            throw new PullMalformedStreamError(malformedLines);
+          }
+        }
       }
     }
     const trailing = buffer.trim();
     if (trailing) {
-      if (handlePullChunkLine(trailing, onProgress)) return;
+      if (handlePullChunkLine(trailing, onProgress) === 'success') return;
     }
     // F1-6: the loop returns above the moment success is observed; reaching
     // here means the stream ended (or was closed under us) without ever
@@ -220,11 +241,23 @@ export async function pullModel(
 // --- internals ---------------------------------------------------------
 
 /** Parses one NDJSON line, forwards it as a {@link PullProgress}, and
- *  returns `true` once the stream has reached its terminal
- *  `"status":"success"`. Throws the runner's own message verbatim (never
- *  redacted — see module doc) on an `{"error":…}` chunk. */
-function handlePullChunkLine(line: string, onProgress: (p: PullProgress) => void): boolean {
-  const chunk = JSON.parse(line) as PullResponseChunk;
+ *  returns a tri-state outcome: `'success'` once the stream has reached its
+ *  terminal `"status":"success"`, `'progress'` for any other well-formed
+ *  chunk, or `'malformed'` when the line isn't valid JSON (F1-7: counted +
+ *  skipped by the caller, up to {@link MAX_MALFORMED_PULL_LINES}). Throws
+ *  the runner's own message verbatim (never redacted — see module doc) on
+ *  an `{"error":…}` chunk. */
+function handlePullChunkLine(line: string, onProgress: (p: PullProgress) => void): 'success' | 'progress' | 'malformed' {
+  let chunk: PullResponseChunk;
+  try {
+    chunk = JSON.parse(line) as PullResponseChunk;
+  } catch {
+    // F1-7: count-and-skip at the CALLER — never log or embed the line
+    // content. Fail-closed by construction: F1-6's terminal-success
+    // requirement means a skipped success line still ends in
+    // PullIncompleteError, never a fabricated success.
+    return 'malformed';
+  }
   if (chunk.error) {
     throw new Error(chunk.error);
   }
@@ -234,9 +267,9 @@ function handlePullChunkLine(line: string, onProgress: (p: PullProgress) => void
       ...(chunk.total !== undefined ? { totalBytes: chunk.total } : {}),
       ...(chunk.completed !== undefined ? { completedBytes: chunk.completed } : {}),
     });
-    if (chunk.status === 'success') return true;
+    if (chunk.status === 'success') return 'success';
   }
-  return false;
+  return 'progress';
 }
 
 /**

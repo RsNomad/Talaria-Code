@@ -344,3 +344,27 @@ describe('F1-6: pull completion is REQUIRED, not assumed', () => {
     });
   });
 });
+
+describe('F1-7: malformed NDJSON lines are counted + skipped, never fatal one-by-one', () => {
+  it('one malformed line mid-stream is skipped; the pull still completes on the later success', async () => {
+    const lines = [JSON.stringify({ status: 'pulling manifest' }), '{not json', JSON.stringify({ status: 'success' })];
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    const seen: string[] = [];
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, (p) => seen.push(p.status), new AbortController().signal)).resolves.toBeUndefined();
+    expect(seen).toEqual(['pulling manifest', 'success']);
+  });
+  it('MORE than MAX_MALFORMED_PULL_LINES malformed lines fail the pull honestly', async () => {
+    const lines = Array.from({ length: 21 }, () => '{not json');
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      name: 'PullMalformedStreamError',
+    });
+  });
+  it('fail-closed interplay (F1-6×F1-7): a malformed SUCCESS line ends as PullIncompleteError, never silent success', async () => {
+    const lines = [JSON.stringify({ status: 'pulling manifest' }), '{"status":"success"']; // truncated JSON
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      name: 'PullIncompleteError',
+    });
+  });
+});
