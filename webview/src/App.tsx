@@ -73,6 +73,7 @@ import { ModelsPanel } from './panels/ModelsPanel';
 import { SettingsPanel } from './panels/SettingsPanel';
 import { SetupPanel } from './panels/SetupPanel';
 import { ErrorBanner } from './components/ErrorBanner';
+import { GatewayHealthBanner } from './components/GatewayHealthBanner';
 import { MockNotice } from './components/MockNotice';
 import { Icon } from './components/Icon';
 
@@ -806,6 +807,24 @@ export function App() {
       {state.backendKind === 'mock' && <MockNotice onOpenSetup={openSetup} />}
 
       <PriorityTabs active={state.activePanel} onSelect={selectPanel} />
+
+      {/* UX-02 (F2-19 UI face): the STANDING management-link banner — its
+          LiveRegion is permanently mounted (Finding-7); only the visual row
+          is conditional. Sits above the dismissible system.error banner:
+          this is standing state, that one is a one-shot signal. Force
+          reconnect = the wedge-break (T16): rides setup.reconnectAgent
+          {force:true}; a refusal REJECTS out of dispatchSetup with the
+          redacted reason, which the banner surfaces + announces. The 12b
+          confirm gate asks first when ANY tab's turn is live — the webview
+          mirror of the liveness the host's force guard fans out over (force
+          ends EVERY live turn, so any-tab-live is the honest gate, not just
+          the active tab; SessionsPanel's active-tab gate protects one tab,
+          this one protects them all). */}
+      <GatewayHealthBanner
+        health={state.gatewayHealth}
+        anyTurnLive={Object.values(state.tabs).some((t) => t.turnActive)}
+        onForceReconnect={() => dispatchSetup('setup.reconnectAgent', { force: true })}
+      />
 
       {/* Audit G-6 (WCAG 2.2 SC 4.1.2): both dismiss buttons contained only
           an <Icon>, so a screen reader announced "button" and nothing else.

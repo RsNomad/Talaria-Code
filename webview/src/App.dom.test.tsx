@@ -639,3 +639,63 @@ describe('Task 2 (P1 §3.3): cause-tagged setup fetch on panel.activate + hydrat
     requestSpy.mockRestore();
   });
 });
+
+/**
+ * Task 13: App-level mount + end-to-end wiring for `GatewayHealthBanner`
+ * (Tasks 12/12b). Proves the three things the pure component tests cannot:
+ * the banner is actually mounted in the real tree, driven by the real
+ * `gateway.health` push; `onForceReconnect` is actually wired to
+ * `dispatchSetup('setup.reconnectAgent', {force:true})` over the correlated
+ * control wire; and the 12b confirm gate is actually wired to real tab
+ * liveness (`state.tabs[...].turnActive`), not just the component's own
+ * `anyTurnLive` prop in isolation.
+ */
+describe('UX-02 at the App level: gateway.health drives the standing banner', () => {
+  it('a down push mounts the banner + Force reconnect; an ok push retires it', () => {
+    render(<App />);
+    expect(screen.queryByText(/Management link/)).not.toBeInTheDocument();
+    act(() => {
+      bridge.emit({ type: 'gateway.health', state: 'down', attempts: 10 });
+    });
+    expect(screen.getByRole('button', { name: 'Force reconnect' })).toBeInTheDocument();
+    const announced = screen.getAllByRole('status').some((el) => (el.textContent ?? '').includes('Management link down'));
+    expect(announced).toBe(true);
+    act(() => {
+      bridge.emit({ type: 'gateway.health', state: 'ok' });
+    });
+    expect(screen.queryByRole('button', { name: 'Force reconnect' })).not.toBeInTheDocument();
+  });
+
+  it('Force reconnect posts setup.reconnectAgent {force:true} over the correlated control wire', async () => {
+    const user = userEvent.setup();
+    const request = vi.spyOn(bridge, 'request').mockResolvedValue({ ok: true });
+    try {
+      render(<App />);
+      act(() => {
+        bridge.emit({ type: 'gateway.health', state: 'degraded', attempts: 5 });
+      });
+      await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+      expect(request).toHaveBeenCalledWith('setup.reconnectAgent', { force: true });
+    } finally {
+      request.mockRestore();
+    }
+  });
+
+  it('12b wiring: with a live turn, Force reconnect asks first — confirming fires the {force:true} post', async () => {
+    const user = userEvent.setup();
+    const request = vi.spyOn(bridge, 'request').mockResolvedValue({ ok: true });
+    try {
+      render(<App />);
+      act(() => {
+        bridge.emit({ type: 'turn.start', turnId: 't1', sessionId: 's1' }); // same liveness idiom as the reducer suites
+        bridge.emit({ type: 'gateway.health', state: 'down', attempts: 10 });
+      });
+      await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+      expect(request).not.toHaveBeenCalled(); // asked, not fired — the 12b gate is actually WIRED to tab liveness
+      await user.click(screen.getByRole('button', { name: 'Force reconnect anyway' }));
+      expect(request).toHaveBeenCalledWith('setup.reconnectAgent', { force: true });
+    } finally {
+      request.mockRestore();
+    }
+  });
+});
