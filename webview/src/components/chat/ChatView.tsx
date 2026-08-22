@@ -5,6 +5,7 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import type { TranscriptItem, ToolItem } from '../../types';
 import { Hero } from '../Hero';
+import { Icon } from '../Icon';
 import { LiveRegion } from '../LiveRegion';
 import { scrollIntoViewRespectingMotion } from '../scrollIntoViewRespectingMotion';
 import { UserMessage } from './UserMessage';
@@ -39,6 +40,11 @@ interface ChatViewProps {
   starterDisabled?: boolean;
   /** Task 10: forwarded straight through to `<Hero>` — see Hero's `onOpenSetup` doc. */
   onOpenSetup?: () => void;
+  /** UX-07: whether the active turn (if any) is still in flight — gates the
+   * "Waiting for the agent…" indicator during the dead-air window between
+   * the user's echoed message and the first agent item. Optional so every
+   * existing render without it stays byte-identical. */
+  turnActive?: boolean;
 }
 
 /**
@@ -338,6 +344,7 @@ export const ChatView = memo(function ChatView({
   onStarter,
   starterDisabled,
   onOpenSetup,
+  turnActive,
 }: ChatViewProps) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -454,6 +461,16 @@ export const ChatView = memo(function ChatView({
               />
             </div>
           ))}
+          {/* UX-07: the dead-air window between the user echo and the first
+           * reasoning/message item — the ONLY period with zero feedback. Lives
+           * inside role="log" (implicit polite) so its appearance is announced
+           * once; disappears the moment any agent item lands. */}
+          {turnActive === true && transcript[transcript.length - 1]?.kind === 'user' && (
+            <div className="flex items-center gap-2 text-2xs text-faint">
+              <Icon name="loading" size={12} spin className="flex-none" />
+              Waiting for the agent…
+            </div>
+          )}
           <div ref={endRef} />
         </div>
         {/* UI#1: only while scrolled away from the bottom AND content has

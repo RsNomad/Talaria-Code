@@ -939,6 +939,10 @@ export function App() {
                  pending/unbound tab (no session yet) must grey it out the same
                  way instead of dropping the click silently. */
               starterDisabled={tab.binding !== 'bound'}
+              // UX-07: same live-turn signal Composer's `busy` below is wired
+              // from — gates the "Waiting for the agent…" indicator for the
+              // dead-air window right after the user's echo lands.
+              turnActive={tab.turnActive}
             />
           </div>
           <Composer

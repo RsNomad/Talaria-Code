@@ -376,3 +376,71 @@ describe('ChatView jump-to-latest pill (UI#1)', () => {
     expect(queryByRole('button', { name: /Jump to latest/ })).toBeNull();
   });
 });
+
+/**
+ * UX-07: the dead-air window between the user's echoed message and the
+ * first agent item (reasoning/message/tool/...) is the ONLY period with
+ * zero feedback — no streaming text, no spinner, nothing. `turnActive` (a
+ * definite boolean already tracked by `App.tsx`'s tab state) plus "the last
+ * transcript item is the user's own echo" together gate a small
+ * "Waiting for the agent…" indicator so that dead air, and only that dead
+ * air, gets a signal.
+ */
+describe('ChatView UX-07 (pre-first-token waiting indicator)', () => {
+  it('shows "Waiting for the agent…" once the user turn lands and the turn is active', () => {
+    render(
+      <ChatView
+        transcript={[userItem()]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+        turnActive
+      />,
+    );
+
+    expect(screen.getByText('Waiting for the agent…')).toBeInTheDocument();
+  });
+
+  it('hides the indicator the moment an agent item lands, even though the turn is still active', () => {
+    const { rerender } = render(
+      <ChatView
+        transcript={[userItem()]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+        turnActive
+      />,
+    );
+    expect(screen.getByText('Waiting for the agent…')).toBeInTheDocument();
+
+    rerender(
+      <ChatView
+        transcript={[userItem(), messageItem()]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+        turnActive
+      />,
+    );
+
+    expect(screen.queryByText('Waiting for the agent…')).toBeNull();
+  });
+
+  it('stays absent when the turn is not active, even with the user echo as the last item', () => {
+    render(
+      <ChatView
+        transcript={[userItem()]}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+        turnActive={false}
+      />,
+    );
+
+    expect(screen.queryByText('Waiting for the agent…')).toBeNull();
+  });
+});
