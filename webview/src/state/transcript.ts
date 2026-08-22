@@ -702,6 +702,15 @@ function foldHydrateReconcile(state: AppState, seed: WebviewState): AppState {
       // absent falls back to makeTabState's `false` default, same posture
       // as every other optional display field above.
       turnActive: entry.turnActive ?? false,
+      // T10 Opus review fix: `stopPending` is deliberately NOT hydrate-carried
+      // (no `HydrateTabSeed.stopPending` field exists) — reset it here
+      // structurally, symmetric with `turnActive` above, so `...base` can
+      // never leak a still-live tab's in-flight-Stop flag through a second
+      // hydrate on a still-live webview (its `turn.end` already landed
+      // `turnActive: false` via the fold above; without this line
+      // `stopPending: true` alone would ride `...base` and paint a
+      // "Stopping…" that outlives its turn).
+      stopPending: false,
       // AUDIT-5 UI M-2: a LIVE draft on `base` (already spread in above) always
       // wins — `restoredDrafts` only fills a freshly-minted `makeTabState` base
       // (draft: ''), giving an unsent Composer draft back after a

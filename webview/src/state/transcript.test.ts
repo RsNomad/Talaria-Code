@@ -559,6 +559,32 @@ describe('transcript reducer — W6-FF (3-way ARCH I-1): hydrate reconciles the 
     expect(hydrated.tabs[priorTabId]).toMatchObject({ sessionId: 'sA', binding: 'bound', rootId: '/root-a' });
   });
 
+  /** T10 Opus review fix: `stopPending` is documented "deliberately NOT
+   * hydrate-carried" but the reconcile literal never structurally enforced
+   * it the way it does for `turnActive` (explicit `entry.turnActive ?? false`
+   * override on the same `{ ...base, ...overrides }` literal). Same
+   * still-live-webview harness as the test above — `base` is a tab this
+   * webview already holds, now carrying `stopPending: true` from an
+   * in-flight Stop click — proving the reset is structural, not incidental
+   * to `base` happening to be idle. RED before the fix: `stopPending` rides
+   * `...base` unreset, so a second hydrate on a still-live webview mid-Stop
+   * paints "Stopping…" that will never clear (its `turn.end` already fired,
+   * `turnActive` correctly lands `false` here). */
+  it('resets stopPending:false when reconciling a session already bound in the current state — never leaks a stale "Stopping…" past a live turn\'s end', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 'sA' }); // adopts into bootstrap
+    const priorTabId = state.activeTabId;
+    state = reduceLocal(state, { type: 'local.stopPending', tabId: priorTabId });
+    expect(state.tabs[priorTabId]?.stopPending).toBe(true); // precondition: base really carries it
+
+    const reSeed = {
+      ...twoLiveTabsSeed,
+      tabs: [{ tabId: priorTabId, sessionId: 'sA', cwd: '/root-a', rootId: '/root-a', preset: 'manual' as const }],
+    };
+    const hydrated = reduce(state, { type: 'hydrate', state: reSeed });
+
+    expect(hydrated.tabs[priorTabId]).toMatchObject({ stopPending: false });
+  });
+
   /** H4-B8 (arch report Minor-2): the seed's per-tab DISPLAY fields
    * (preset/currentModelId/activeModeId/availableCommands) — sourced from
    * each `SessionController`, NOT a new source of truth — so a reconciled
@@ -2530,6 +2556,19 @@ describe('UX-03: stop lifecycle — stopPending', () => {
     let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
     state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
     state = reduce(state, { type: 'clear', sessionId: 's1' });
+    expect(activeTab(state).stopPending).toBe(false);
+  });
+
+  // Coverage Minor (T10 review): tab.clear's OWN reset literal (the
+  // tabId-scoped path used by "New Session" on an already-unbound tab, §930)
+  // had never been exercised for stopPending — only the generic
+  // session-scoped `clear` above was. Both reset it independently.
+  it('tab.clear resets stopPending alongside turnActive', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
+    expect(activeTab(state).stopPending).toBe(true); // precondition
+
+    state = reduce(state, { type: 'tab.clear', tabId: activeTab(state).tabId });
     expect(activeTab(state).stopPending).toBe(false);
   });
 });
