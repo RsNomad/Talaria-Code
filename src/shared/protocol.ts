@@ -2037,8 +2037,11 @@ export const SETUP_METHODS = [
 
 /**
  * WS-SU F2-20: `setup.cancel`'s result. `cancelled` is TRUE only when an
- * in-flight `(op,id)` latch actually existed and its AbortController was
- * aborted by THIS call; `{ok:true, cancelled:false}` = nothing matched (the
+ * in-flight `(op,id)` latch actually existed and abort() was delivered to it
+ * by THIS call — idempotently: a repeat cancel landing while the already-
+ * aborted op is still winding down (latch not yet released by its handler's
+ * finally) also reports true, because the matched op is genuinely still
+ * live; `{ok:true, cancelled:false}` = nothing matched (the
  * op had already finished, or never started). `matched` — present ONLY when
  * `cancelled` is true — echoes the CANONICAL latch id that was aborted (a
  * catalog id / backendId: a bounded catalog-derived value the webview

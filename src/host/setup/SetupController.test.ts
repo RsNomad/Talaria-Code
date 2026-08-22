@@ -2200,6 +2200,70 @@ describe('§7.2.2 (extra-a, T4): a terminal `done` push on every pull settle pat
   });
 });
 
+// --- WS-SU M-T1 (F2-20 informational follow-up): repeat-cancel semantics ---
+//
+// Pins BOTH phases of a repeated `setup.cancel` against the same (op,id) so
+// the semantics cannot silently drift in either direction:
+//   1. a second cancel landing while the aborted op is still winding down
+//      (latch not yet released by the pull handler's finally) reports
+//      {cancelled:true, matched} again — the matched op is genuinely still
+//      live, and AbortController#abort() is an idempotent no-op;
+//   2. a cancel after the op has fully settled (latch released) reports
+//      {cancelled:false} with NO `matched` key — nothing live matched.
+// Adjudicated 2026-08-23 (WS-SU minor-fixes plan): current behavior is
+// CORRECT under the SetupCancelResult contract — this test is a pin, not a
+// fix. Fake timers mirror the §7.2.2 cancelled-pull test above (the settle
+// path's terminal `done` push rides the real-setTimeout throttle).
+describe('WS-SU M-T1: setup.cancel repeated against the same op (F2-20)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('wind-down repeat reports cancelled:true again; post-settle repeat reports cancelled:false with matched omitted', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        // Hangs until aborted — same fixture shape as the §7.2.2 cancelled-
+        // pull test (mirrors real pullModel's abort-rejects-in-flight contract).
+        pullModel: (_endpoint, _model, _onProgress, sig): Promise<void> =>
+          new Promise<void>((_resolve, reject) => {
+            sig.addEventListener('abort', () => {
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          }),
+      },
+    );
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks(); // modal confirm -> runLibraryPull -> the hanging dep; the pull latch is now held
+
+    // Phase 1: two cancels back-to-back with NO await between them.
+    // `handle()` reaches the synchronous `handleCancel` with no prior await,
+    // so BOTH run before any microtask can execute the pull handler's
+    // finally (which releases the latch) — a deterministic wind-down window.
+    const first = controller.handle('setup.cancel', { op: 'pull', id: 'llama3:8b' });
+    const second = controller.handle('setup.cancel', { op: 'pull', id: 'llama3:8b' });
+    await expect(first).resolves.toEqual({ ok: true, cancelled: true, matched: 'llama3:8b' });
+    await expect(second).resolves.toEqual({ ok: true, cancelled: true, matched: 'llama3:8b' });
+
+    // Let the aborted pull settle fully (latch released in its finally;
+    // terminal `done` push flushed through the throttle timer).
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    await expect(pullPromise).resolves.toEqual({ ok: false, reason: 'cancelled' });
+
+    // Phase 2: nothing live matches any more.
+    const third = await controller.handle('setup.cancel', { op: 'pull', id: 'llama3:8b' });
+    expect(third).toEqual({ ok: true, cancelled: false });
+    expect(third).not.toHaveProperty('matched'); // key OMITTED, never `= undefined`
+  });
+});
+
 // --- helper ------------------------------------------------------------------
 
 function settingsMap(entries: Record<string, unknown>): Map<string, unknown> {
