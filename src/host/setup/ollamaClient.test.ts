@@ -162,7 +162,7 @@ describe('probeOllama — GET /api/tags (§2.4)', () => {
 });
 
 describe('F2-15: probeOllama caps the /api/tags body read', () => {
-  it('an over-cap body degrades to {running:false} with a cap-naming detail — never buffers past the ceiling', async () => {
+  it('an over-cap body degrades to {running:false} with a cap-naming detail', async () => {
     const huge = new TextEncoder().encode(`{"models":[{"name":"${'x'.repeat(1_100_000)}","size":1}]}`);
     const response = { ok: true, status: 200, statusText: 'OK', body: chunkedBody([huge]) } as unknown as Response;
     const fetchImpl = vi.fn().mockResolvedValue(response);
@@ -170,10 +170,45 @@ describe('F2-15: probeOllama caps the /api/tags body read', () => {
     expect(status.running).toBe(false);
     if (!status.running) expect(status.detail).toContain('exceeded');
   });
-  it('a 200 with NO readable body degrades to {running:false} (fail-closed, never a crash)', async () => {
+  it('stops reading once the running total crosses the cap — never drains the rest of the stream (M-T6b pin)', async () => {
+    // The invariant the renamed test above cannot observe from a single
+    // chunk: `readBodyBounded` returns BEFORE appending the over-cap chunk
+    // and stops issuing read()s. Same read-call-count idiom as pullModel's
+    // "bails out WHILE reading" test below. Six 512 KiB chunks are on offer
+    // (3 MiB); the 1 MiB probe cap is first EXCEEDED on chunk 3 (1.5 MiB —
+    // chunk 2's exact 1 MiB is not `>` the cap), so read() must be called at
+    // most 3 times — draining all 6 (plus the terminal done-read) is the
+    // regression this pins against.
+    const chunk = new Uint8Array(512 * 1024).fill(97); // 'a' bytes; no newline needed — the probe body is one-shot JSON
+    let calls = 0;
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const reader = {
+      read: vi.fn(async (): Promise<StreamReadResult> => {
+        calls += 1;
+        if (calls > 6) return { value: undefined, done: true };
+        return { value: chunk, done: false };
+      }),
+      cancel,
+      releaseLock: vi.fn(),
+    } as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    const response = { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+
+    const status = await probeOllama(ENDPOINT, fetchImpl);
+
+    expect(status.running).toBe(false);
+    if (!status.running) expect(status.detail).toContain('exceeded');
+    expect(calls).toBeLessThanOrEqual(3); // the load-bearing assertion: bailed WHILE reading
+    expect(cancel).toHaveBeenCalled(); // teardown sanity — the finally cancels on every exit path
+  });
+  it('a 200 with NO readable body degrades to {running:false} with a reason-naming detail (fail-closed, never a crash)', async () => {
     const response = { ok: true, status: 200, statusText: 'OK' } as unknown as Response;
     const fetchImpl = vi.fn().mockResolvedValue(response);
-    await expect(probeOllama(ENDPOINT, fetchImpl)).resolves.toMatchObject({ running: false });
+    const status = await probeOllama(ENDPOINT, fetchImpl);
+    expect(status.running).toBe(false);
+    // M-T6a: parity with the over-cap sibling — the detail names WHY, so the
+    // failure is diagnosable. Pins readBodyBounded's stable template reason.
+    if (!status.running) expect(status.detail).toContain('no readable body');
   });
 });
 
