@@ -21,12 +21,14 @@ type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Arra
 
 // --- shared fetch-response fakes ----------------------------------------
 
+// WS-SU Task 6: probeOllama now reads the BODY stream (F2-15) — fixture carries one.
 function jsonResponse(status: number, statusText: string, body: unknown): Response {
+  const chunk = new TextEncoder().encode(JSON.stringify(body));
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText,
-    json: async () => body,
+    body: chunkedBody([chunk]),
   } as unknown as Response;
 }
 
@@ -156,6 +158,22 @@ describe('probeOllama — GET /api/tags (§2.4)', () => {
     const result = await probeOllama(ENDPOINT, fetchImpl as unknown as typeof fetch, 5);
 
     expect(result.running).toBe(false);
+  });
+});
+
+describe('F2-15: probeOllama caps the /api/tags body read', () => {
+  it('an over-cap body degrades to {running:false} with a cap-naming detail — never buffers past the ceiling', async () => {
+    const huge = new TextEncoder().encode(`{"models":[{"name":"${'x'.repeat(1_100_000)}","size":1}]}`);
+    const response = { ok: true, status: 200, statusText: 'OK', body: chunkedBody([huge]) } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    const status = await probeOllama(ENDPOINT, fetchImpl);
+    expect(status.running).toBe(false);
+    if (!status.running) expect(status.detail).toContain('exceeded');
+  });
+  it('a 200 with NO readable body degrades to {running:false} (fail-closed, never a crash)', async () => {
+    const response = { ok: true, status: 200, statusText: 'OK' } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    await expect(probeOllama(ENDPOINT, fetchImpl)).resolves.toMatchObject({ running: false });
   });
 });
 

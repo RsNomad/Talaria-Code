@@ -29,6 +29,35 @@ function jsonResponse(status: number, statusText: string, body: unknown): Respon
   } as unknown as Response;
 }
 
+/** See ollamaClient.ts's identical alias: `ReadableStreamReadResult` isn't a
+ *  global type name under this repo's `lib: ["ES2022"]` tsconfig. */
+type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>;
+
+/** WS-SU Task 6 (F2-15): `ollama-tags` routes through `probeOllama`, which
+ *  now reads its body via `getReader()` (byte-capped), not `response.json()`
+ *  — so its fixture, unlike the plain `jsonResponse` above (still used by
+ *  the llamacpp-health/openai-models paths, which are untouched by F2-15),
+ *  must carry a streamable body instead of a `.json()` member. */
+function ollamaTagsResponse(status: number, statusText: string, body: unknown): Response {
+  const chunk = new TextEncoder().encode(JSON.stringify(body));
+  let read = false;
+  const reader = {
+    read: async (): Promise<StreamReadResult> => {
+      if (read) return { value: undefined, done: true };
+      read = true;
+      return { value: chunk, done: false };
+    },
+    cancel: async () => {},
+    releaseLock: () => {},
+  } as unknown as ReadableStreamDefaultReader<Uint8Array>;
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText,
+    body: { getReader: () => reader },
+  } as unknown as Response;
+}
+
 const OLLAMA_SPEC: ProbeSpec = { kind: 'ollama-tags' };
 const LLAMACPP_SPEC: ProbeSpec = { kind: 'llamacpp-health' };
 const OPENAI_SPEC: ProbeSpec = { kind: 'openai-models' };
@@ -39,7 +68,7 @@ const NONE_SPEC: ProbeSpec = { kind: 'none' };
 describe('probeRemote — ollama-tags (§2.5, reuses probeOllama)', () => {
   it('reachable daemon reports ok:true with model names', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(
-      jsonResponse(200, 'OK', {
+      ollamaTagsResponse(200, 'OK', {
         models: [
           { name: 'qwen2.5-coder:1.5b-base', size: 986_000_000 },
           { name: 'qwen3-embedding:0.6b', size: 600_000_000 },

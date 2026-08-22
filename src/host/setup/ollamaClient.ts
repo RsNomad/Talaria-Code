@@ -109,6 +109,42 @@ interface TagsResponseBody {
   models?: TagsResponseModel[];
 }
 
+/** F2-15: probeOllama's own body ceiling — /api/tags is a small JSON
+ *  document; 1 MiB is orders of magnitude above any legitimate tag list. */
+const PROBE_MAX_BODY_BYTES = 1 * 1024 * 1024;
+
+type BoundedBodyResult = { ok: true; text: string } | { ok: false; reason: string };
+
+/** F2-15: reads a fetch Response body through `getReader()` with a byte
+ *  ceiling — the same idiom {@link pullModel} already applies to its own
+ *  stream (`MAX_STREAM_BYTES`), now covering the probe's one-shot JSON body.
+ *  Cancels the reader on every exit path (F7 discipline, see pullModel). */
+async function readBodyBounded(response: Response, maxBytes: number): Promise<BoundedBodyResult> {
+  if (!response.body) {
+    return { ok: false, reason: 'response had no readable body' };
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let received = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        return { ok: false, reason: `response exceeded ${maxBytes} bytes without completing` };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return { ok: true, text };
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 /**
  * `GET {endpoint}/api/tags`. Resolves — never rejects — with a discriminated
  * `OllamaStatus`: `{running:true, models}` on a 200 whose `models[]` maps to
@@ -132,7 +168,11 @@ export async function probeOllama(
         detail: `Ollama /api/tags responded ${response.status} ${response.statusText}`,
       };
     }
-    const body = (await response.json()) as TagsResponseBody;
+    const raw = await readBodyBounded(response, PROBE_MAX_BODY_BYTES);
+    if (!raw.ok) {
+      return { running: false, detail: `Ollama /api/tags ${raw.reason}` };
+    }
+    const body = JSON.parse(raw.text) as TagsResponseBody;
     const models: OllamaModel[] = (body.models ?? []).map((m) => ({ name: m.name, sizeBytes: m.size }));
     return { running: true, models };
   } catch (err) {
