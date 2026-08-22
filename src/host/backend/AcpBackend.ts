@@ -26,6 +26,9 @@ import type { Logger } from '../transport/JsonRpcStdio';
 import type { ResolvedContext } from '../context/types';
 import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
 import { ControlChannel } from '../control/ControlChannel';
+import { combineGatewayHealth } from '../control/respawnHealth';
+import type { RespawnHealth } from '../control/respawnHealth';
+import { wireGatewayHealth } from './gatewayHealth';
 import { createDefaultPanelSources } from '../panels/PanelSourceRegistry';
 import type {
   PanelSource,
@@ -211,6 +214,10 @@ export class AcpBackend implements AgentBackend {
   private clientAuthMethodsSub: { dispose(): void } | undefined;
 
   private readonly control: ControlChannel;
+
+  /** UX-02 (F2-19 UI face): the combined-push subscription wired in the
+   * constructor — see {@link wireGatewayHealth}. */
+  private readonly gatewayHealthSub: { dispose(): void };
 
   /**
    * W4 §2d: "the most recently opened/loaded session" bookkeeping —
@@ -537,6 +544,23 @@ export class AcpBackend implements AgentBackend {
       emit: (msg) => this.emitter.fire(msg),
     };
     this.connectionSupervisor = new ConnectionSupervisor(connectionPort);
+    // UX-02 (F2-19 UI face): both management links feed ONE combined
+    // gateway.health webview push — see gatewayHealth.ts. The log callback
+    // is guarded here (not just in the tracker) because it runs on the
+    // respawn loops' critical path, same rationale as safeLog everywhere
+    // else on that chain.
+    this.gatewayHealthSub = wireGatewayHealth(
+      this.control,
+      this.connectionSupervisor,
+      (msg) => this.emitter.fire(msg),
+      (message) => {
+        try {
+          this.logger?.append(`[AcpBackend] gateway.health: ${message}`);
+        } catch {
+          // A logging failure must never affect control flow.
+        }
+      },
+    );
     this.panelSources = createDefaultPanelSources(this.buildPanelSourceContext());
     // W6-FI-c (3-way ARCH I-4, part 3 of 3): every accessor closes over
     // `this`, read at CALL TIME — mirrors `oneShotPort`/`connectionPort`'s
@@ -814,6 +838,17 @@ export class AcpBackend implements AgentBackend {
    */
   getAdvertisedAuthMethods(): AdvertisedAuthMethod[] | undefined {
     return this.connectionSupervisor.getClient()?.getAdvertisedAuthMethods?.();
+  }
+
+  /**
+   * UX-02: the combined management-link health, computed FRESH from both
+   * loops' live counters (never a cached transition payload) — the provider
+   * posts this right after every `hydrate` so a re-created webview can't
+   * assume 'ok' through an ongoing outage (the exact late-subscriber gap
+   * `currentHealth()` documents, ControlChannel.ts:180-191).
+   */
+  currentGatewayHealth(): RespawnHealth {
+    return combineGatewayHealth(this.control.currentHealth(), this.connectionSupervisor.currentHealth());
   }
 
   /** beta.7 B3: thin passthrough to {@link ConnectionSupervisor.reconnect} —
@@ -2001,6 +2036,7 @@ export class AcpBackend implements AgentBackend {
     this.clientAuthMethodsSub?.dispose();
     this.clientAuthMethodsSub = undefined;
     this.authMethodsEmitter.dispose();
+    this.gatewayHealthSub.dispose();
     this.emitter.dispose();
   }
 

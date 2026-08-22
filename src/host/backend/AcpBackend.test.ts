@@ -56,6 +56,7 @@ import { must } from '../../testing/must';
 import { TRUST_GATED_METHODS } from './control/ControlDispatcher';
 import { RELOAD_LINE } from './control/mcpEntryValidation';
 import { respawnBackoffMs } from '../control/respawnBackoff';
+import type { RespawnHealth } from '../control/respawnHealth';
 
 /**
  * `vscode` isn't resolvable outside the extension host; `AcpBackend` only
@@ -977,6 +978,16 @@ class FakeControlChannel {
     const deferred = queue?.shift();
     if (deferred) return deferred as Promise<T>;
     return (this.resultsByMethod.has(method) ? this.resultsByMethod.get(method) : this.nextResult) as T;
+  }
+
+  // UX-02: the health face the gateway wiring reads. The fake never respawns,
+  // so it is always 'ok'; per-test health driving happens through the ACP
+  // loop side (see the new describe below).
+  onHealth(_handler: (health: RespawnHealth) => void): { dispose(): void } {
+    return { dispose: () => {} };
+  }
+  currentHealth(): RespawnHealth {
+    return { state: 'ok', attempts: 0 };
   }
 }
 
@@ -12929,5 +12940,42 @@ describe('beta.7 B3: user-triggered reconnect (backend.reconnectAgent)', () => {
     const rebinds = messages.filter((m) => m.type === 'tab.bound');
     expect(rebinds.length).toBeGreaterThan(0);
     for (const b of rebinds) expect('title' in b).toBe(false);
+  });
+});
+
+describe('UX-02: AcpBackend pushes gateway.health on combined transitions (ACP-loop driven)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('crash-loop to attempt 5 pushes {degraded,5}; a successful respawn pushes {ok} with no attempts key', async () => {
+    let failRespawns = true;
+    const { backend, clients } = makeStartableBackend({}, (client, index) => {
+      if (index > 0 && failRespawns) client.connectError = new Error('spawn refused');
+    });
+    await backend.start();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    must(clients[0]).simulateExit(1); // crash → attempt 1
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await vi.advanceTimersByTimeAsync(respawnBackoffMs(attempt));
+      await vi.advanceTimersByTimeAsync(1); // let the failed start() settle + reschedule
+    }
+    expect(messages.filter((m) => m.type === 'gateway.health')).toEqual([
+      { type: 'gateway.health', state: 'degraded', attempts: 5 },
+    ]);
+
+    failRespawns = false;
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(6));
+    await vi.advanceTimersByTimeAsync(1);
+    const health = messages.filter((m) => m.type === 'gateway.health');
+    expect(health[health.length - 1]).toEqual({ type: 'gateway.health', state: 'ok' });
+    expect(health).toHaveLength(2);
+  });
+
+  it('currentGatewayHealth() reads the live combined counter fresh (not the last transition payload)', async () => {
+    const { backend } = makeStartableBackend();
+    await backend.start();
+    expect(backend.currentGatewayHealth()).toEqual({ state: 'ok', attempts: 0 });
   });
 });
