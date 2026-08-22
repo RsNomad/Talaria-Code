@@ -4,8 +4,8 @@ import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
 import { resolveHermes } from '../runtime/resolveHermes';
 import { parseGatewayEvent, isGatewayReady } from './eventDemux';
 import { respawnBackoffMs } from './respawnBackoff';
-import { respawnHealthForAttempt } from './respawnHealth';
-import type { RespawnHealth, RespawnHealthState } from './respawnHealth';
+import { respawnHealthForAttempt, RespawnHealthTracker } from './respawnHealth';
+import type { RespawnHealth } from './respawnHealth';
 
 /**
  * The Hermes **control plane** (spec §4).
@@ -84,9 +84,12 @@ export class ControlChannel {
 
   private readonly eventHandlers = new Set<(type: string, payload: unknown) => void>();
 
-  /** WS-R3 F2-19: health-transition subscribers (the future gateway.health source). */
-  private readonly healthHandlers = new Set<(health: RespawnHealth) => void>();
-  private lastHealthState: RespawnHealthState = 'ok';
+  /** WS-R3 F2-19: health-transition machinery (the gateway.health source) —
+   * consolidated into the shared RespawnHealthTracker (see its class doc for
+   * the double defensive guard that used to live inline here). The `log`
+   * callback is this class's own guarded `log()` (:461-477), so a throwing
+   * OutputChannel still cannot reach the respawn-critical path. */
+  private readonly healthTracker = new RespawnHealthTracker((m) => this.log(m));
 
   private state: ControlChannelState = 'idle';
   /** The in-flight promise for "next time we reach `ready`", shared by an
@@ -169,12 +172,7 @@ export class ControlChannel {
    * fail-stopped). Channel-scoped like onEvent — survives respawns.
    */
   onHealth(handler: (health: RespawnHealth) => void): { dispose(): void } {
-    this.healthHandlers.add(handler);
-    return {
-      dispose: () => {
-        this.healthHandlers.delete(handler);
-      },
-    };
+    return this.healthTracker.onHealth(handler);
   }
 
   /**
@@ -196,33 +194,14 @@ export class ControlChannel {
     };
   }
 
+  // F2-19a (concurrency review Minor-1): both call sites of `emitHealth`
+  // sit on the respawn loop's critical path — `scheduleRespawn` arms the
+  // next backoff around this call (see the ordering note there) and
+  // `spawnAndAwaitReady` calls it as its very last step on the success
+  // path — so the double defensive guard (per-handler + whole-body) now
+  // lives in `RespawnHealthTracker.emit` instead of here; see its class doc.
   private emitHealth(attempts: number): void {
-    // F2-19a (concurrency review Minor-1): this whole body is wrapped
-    // defensively. Without it, a pathological failure INSIDE the
-    // per-handler catch below (the logger itself throwing, or `String(err)`
-    // throwing on an exotic error) would escape `emitHealth` entirely. Both
-    // call sites of `emitHealth` sit on the respawn loop's critical path —
-    // `scheduleRespawn` arms the next backoff around this call (see the
-    // ordering note there) and `spawnAndAwaitReady` calls it as its very
-    // last step on the success path — so an escaping throw here must never
-    // be possible: the self-heal loop's "always another attempt" invariant
-    // cannot depend on a subscriber or a logger behaving.
-    try {
-      const state = respawnHealthForAttempt(attempts);
-      if (state === this.lastHealthState) return;
-      this.lastHealthState = state;
-      for (const handler of [...this.healthHandlers]) {
-        try {
-          handler({ state, attempts });
-        } catch (err) {
-          this.log(`health handler threw: ${String(err)}`);
-        }
-      }
-    } catch {
-      // Swallow: see the doc comment above. Nothing productive can be done
-      // with a failure of the failure-reporting path itself, and this
-      // function must never be the reason the next backoff isn't armed.
-    }
+    this.healthTracker.emit({ state: respawnHealthForAttempt(attempts), attempts });
   }
 
   dispose(): void {
@@ -235,7 +214,6 @@ export class ControlChannel {
     this.transport?.dispose();
     this.transport = undefined;
     this.eventHandlers.clear();
-    this.healthHandlers.clear();
   }
 
   // --- internals --------------------------------------------------------
