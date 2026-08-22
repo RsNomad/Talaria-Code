@@ -22,7 +22,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { ReactElement } from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { SessionSummary, SessionsData, WebviewToHost } from '../protocol';
 import { SessionsPanel } from './SessionsPanel';
@@ -107,6 +107,13 @@ describe('C4: History rows carry a bound marker and confirm before replacing a l
 
     expect(loads).toEqual([]);
     expect(screen.getByRole('button', { name: 'Load anyway' })).toBeInTheDocument();
+    // A11Y-07 (task-8-brief.md): this strip used to be a plain, unnamed
+    // <div> — no dialog role at all, so a screen-reader user perceived a
+    // silent DOM change with no cue a decision was being asked of them.
+    // Pinning the shared ConfirmStrip's alertdialog role + accessible name
+    // here replaces that old no-role characterization (GatewayHealthBanner
+    // A11Y-07 adoption precedent, ConfirmStrip.tsx).
+    expect(screen.getByRole('alertdialog', { name: 'Confirm load' })).toBeInTheDocument();
   });
 
   it('"Load anyway" loads the session exactly once', async () => {
@@ -130,6 +137,53 @@ describe('C4: History rows carry a bound marker and confirm before replacing a l
 
     expect(loads).toEqual([]);
     expect(screen.queryByRole('button', { name: 'Load anyway' })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * A11Y-07 (task-8-brief.md): SessionsPanel's inline "load anyway" strip
+ * adopts the shared `ConfirmStrip` alertdialog (built in Task 7,
+ * GatewayHealthBanner.dom.test.tsx's "UX-02/12b" describe block is the same
+ * adoption a beat earlier). Three focus-management behaviors this task adds
+ * that the old raw `<div>` strip never had: focus moves to "Load anyway" on
+ * open, and EVERY way out (Escape here, "Load anyway" below) hands focus
+ * back to the clicked ROW button — not a generic trigger, since History has
+ * many rows and only the confirming one's button is wired as the
+ * `returnFocus` target (`confirmTriggerRef`, conditionally attached via
+ * `ref={isConfirming ? confirmTriggerRef : undefined}`).
+ */
+describe('A11Y-07: the confirm-load strip is a focus-managed alertdialog', () => {
+  it('opening the strip moves focus to "Load anyway"', async () => {
+    const { user } = setup(renderPanel({ activeTabHasLiveTurn: true }));
+
+    await user.click(screen.getByRole('button', { name: /Fix the bug/ }));
+
+    expect(screen.getByRole('alertdialog', { name: 'Confirm load' })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Load anyway' })),
+    );
+  });
+
+  it('Escape cancels the strip and returns focus to the clicked row button', async () => {
+    const { user } = setup(renderPanel({ activeTabHasLiveTurn: true }));
+    const rowButton = screen.getByRole('button', { name: /Fix the bug/ });
+
+    await user.click(rowButton);
+    await user.keyboard('{Escape}');
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm load' })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(rowButton));
+  });
+
+  it('"Load anyway" closes the strip and returns focus to the row button', async () => {
+    const { user } = setup(renderPanel({ activeTabHasLiveTurn: true }));
+    const rowButton = screen.getByRole('button', { name: /Fix the bug/ });
+
+    await user.click(rowButton);
+    await user.click(screen.getByRole('button', { name: 'Load anyway' }));
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm load' })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(rowButton));
   });
 });
 

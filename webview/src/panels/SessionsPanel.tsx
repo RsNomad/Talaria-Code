@@ -7,9 +7,10 @@
  * pipeline (no new payload type for the transcript itself; this panel only
  * ever renders the browsable list).
  */
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { SessionSummary, SessionsData, WebviewToHost } from '../protocol';
 import { busyInteraction } from '../components/busyInteraction';
+import { ConfirmStrip } from '../components/ConfirmStrip';
 import { Icon } from '../components/Icon';
 import { Pill } from '../components/Pill';
 import { EmptyPanel, PanelShell } from './PanelShell';
@@ -98,6 +99,13 @@ export function SessionsPanel({
    * which implicitly collapses whichever strip was open before.
    */
   const [confirmingId, setConfirmingId] = useState<string | undefined>(undefined);
+  /** A11Y-07 (task-8-brief.md): the row button `returnFocus` lands on — only
+   *  ONE row can be confirming at a time (`confirmingId` above), so a single
+   *  ref conditionally attached to whichever row is confirming (`ref={isConfirming
+   *  ? confirmTriggerRef : undefined}` below) is enough; the busy posture
+   *  (TI-1/AU-39) keeps that row's button focusable even once `loadingSessionId`
+   *  marks it after confirm fires the load. */
+  const confirmTriggerRef = useRef<HTMLButtonElement | null>(null);
 
   if (data.sessions.length === 0) {
     return (
@@ -146,6 +154,7 @@ export function SessionsPanel({
           <div key={s.id} className="mb-1.5">
             <button
               type="button"
+              ref={isConfirming ? confirmTriggerRef : undefined}
               onClick={() => {
                 if (!rowInteraction.interactive) return;
                 handleRowClick(s);
@@ -186,28 +195,15 @@ export function SessionsPanel({
             </button>
 
             {isConfirming && (
-              <div className="mt-1 rounded border border-warn bg-warn-soft px-2 py-1.5">
-                <div className="flex items-start gap-1.5 text-2xs text-fg">
-                  <Icon name="warning" size={12} className="mt-0.5 flex-none text-warn" />
-                  <span>Loading this will replace the conversation currently running in this tab.</span>
-                </div>
-                <div className="mt-1.5 flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => confirmLoad(s)}
-                    className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay"
-                  >
-                    Load anyway
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setConfirmingId(undefined)}
-                    className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
+              <ConfirmStrip
+                className="mt-1"
+                ariaLabel="Confirm load"
+                message="Loading this will replace the conversation currently running in this tab."
+                confirmLabel="Load anyway"
+                onConfirm={() => confirmLoad(s)}
+                onCancel={() => setConfirmingId(undefined)}
+                returnFocus={() => confirmTriggerRef.current?.focus()}
+              />
             )}
           </div>
         );
