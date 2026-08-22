@@ -35,6 +35,7 @@ import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
 import { PullAnnouncer } from '../components/PullAnnouncer';
 import { scrollIntoViewRespectingMotion } from '../components/scrollIntoViewRespectingMotion';
+import { SegmentedSwitch } from '../components/SegmentedSwitch';
 import { Toggle } from '../components/Toggle';
 import { DECLINED, errorMessage } from '../state/panels';
 import type { RemoteData } from '../state/remoteData';
@@ -997,21 +998,12 @@ function AgentLocalModelSection({
 
         {pickerOpen && (
           <div className="flex flex-col gap-2">
-            <div className="inline-flex gap-1 self-start rounded border border-border p-0.5">
-              {(['ollama', 'llamacpp', 'vllm'] as const).map((b) => (
-                <button
-                  key={b}
-                  type="button"
-                  aria-pressed={backend === b}
-                  onClick={() => setBackend(b)}
-                  className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-                    backend === b ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
-                  }`}
-                >
-                  {BACKEND_DISPLAY[b]}
-                </button>
-              ))}
-            </div>
+            <SegmentedSwitch
+              ariaLabel="Backend"
+              options={(['ollama', 'llamacpp', 'vllm'] as const).map((b) => ({ id: b, label: BACKEND_DISPLAY[b] }))}
+              value={backend}
+              onChange={setBackend}
+            />
 
             <TextField
               label="Endpoint"
@@ -1209,28 +1201,16 @@ function FimCard({
       {hasLocal && (
         <>
           <p className="mb-1.5 text-2xs text-muted">Install locally, or connect to an existing endpoint?</p>
-          <div className="mb-2 inline-flex gap-1 rounded border border-border p-0.5">
-            <button
-              type="button"
-              aria-pressed={mode === 'connect'}
-              onClick={() => setMode('connect')}
-              className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-                mode === 'connect' ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
-              }`}
-            >
-              Connect
-            </button>
-            <button
-              type="button"
-              aria-pressed={mode === 'install'}
-              onClick={() => setMode('install')}
-              className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-                mode === 'install' ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
-              }`}
-            >
-              Install locally
-            </button>
-          </div>
+          <SegmentedSwitch
+            ariaLabel="Install method"
+            options={[
+              { id: 'connect' as const, label: 'Connect' },
+              { id: 'install' as const, label: 'Install locally' },
+            ]}
+            value={mode}
+            onChange={setMode}
+            className="mb-2"
+          />
         </>
       )}
 
@@ -2343,21 +2323,15 @@ function RagEmbedSection({
       </button>
       {open && (
         <div className="mt-2 flex flex-col gap-2">
-          <div className="inline-flex gap-1 self-start rounded border border-border p-0.5">
-            {(['ollama', 'llamacpp', 'openai-compat'] as const).map((b) => (
-              <button
-                key={b}
-                type="button"
-                aria-pressed={pane === b}
-                onClick={() => setPane(b)}
-                className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-                  pane === b ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
-                }`}
-              >
-                {b === 'openai-compat' ? RAG_THIRD_TAB_LABEL : BACKEND_DISPLAY[b]}
-              </button>
-            ))}
-          </div>
+          <SegmentedSwitch
+            ariaLabel="Embedding backend"
+            options={(['ollama', 'llamacpp', 'openai-compat'] as const).map((b) => ({
+              id: b,
+              label: b === 'openai-compat' ? RAG_THIRD_TAB_LABEL : BACKEND_DISPLAY[b],
+            }))}
+            value={pane}
+            onChange={setPane}
+          />
 
           <TextField
             label="Endpoint"
