@@ -1,17 +1,19 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, screen, act, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { GatewayHealthBanner } from './GatewayHealthBanner';
 
 describe('UX-02: GatewayHealthBanner', () => {
   it('ok: no visual banner, but the live region IS mounted (empty) — Finding-7', () => {
-    render(<GatewayHealthBanner health={{ state: 'ok' }} onForceReconnect={async () => undefined} />);
+    render(<GatewayHealthBanner health={{ state: 'ok' }} anyTurnLive={false} onForceReconnect={async () => undefined} />);
     expect(screen.queryByText(/Management link/)).not.toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('');
   });
 
   it('down: standing banner + polite announcement carrying the live attempts counter', () => {
-    render(<GatewayHealthBanner health={{ state: 'down', attempts: 12 }} onForceReconnect={async () => undefined} />);
+    render(
+      <GatewayHealthBanner health={{ state: 'down', attempts: 12 }} anyTurnLive={false} onForceReconnect={async () => undefined} />,
+    );
     // Finding-7: the standing text is deliberately DUAL-CHANNEL — the same
     // sentence appears both in the always-visible row and (redundantly) in
     // the permanently-mounted sr-only region, so a plain `getByText` matches
@@ -27,7 +29,9 @@ describe('UX-02: GatewayHealthBanner', () => {
   });
 
   it('degraded: the softer copy', () => {
-    render(<GatewayHealthBanner health={{ state: 'degraded', attempts: 5 }} onForceReconnect={async () => undefined} />);
+    render(
+      <GatewayHealthBanner health={{ state: 'degraded', attempts: 5 }} anyTurnLive={false} onForceReconnect={async () => undefined} />,
+    );
     expect(
       screen.getByText('Management link unstable — panels may be stale (retrying — 5 attempts so far).', {
         selector: 'span.flex-1',
@@ -37,9 +41,9 @@ describe('UX-02: GatewayHealthBanner', () => {
 
   it('recovery: ok AFTER an outage announces restoration through the same region', () => {
     const { rerender } = render(
-      <GatewayHealthBanner health={{ state: 'down', attempts: 10 }} onForceReconnect={async () => undefined} />,
+      <GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={false} onForceReconnect={async () => undefined} />,
     );
-    rerender(<GatewayHealthBanner health={{ state: 'ok' }} onForceReconnect={async () => undefined} />);
+    rerender(<GatewayHealthBanner health={{ state: 'ok' }} anyTurnLive={false} onForceReconnect={async () => undefined} />);
     expect(screen.getByRole('status')).toHaveTextContent('Management link restored.');
     expect(screen.queryByRole('button', { name: 'Force reconnect' })).not.toBeInTheDocument();
   });
@@ -48,7 +52,9 @@ describe('UX-02: GatewayHealthBanner', () => {
     const user = userEvent.setup();
     let reject!: (reason: Error) => void;
     const onForceReconnect = vi.fn(() => new Promise<unknown>((_resolve, rej) => { reject = rej; }));
-    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} onForceReconnect={onForceReconnect} />);
+    render(
+      <GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={false} onForceReconnect={onForceReconnect} />,
+    );
     await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
     expect(onForceReconnect).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('button', { name: 'Reconnecting…' })).toBeDisabled();
@@ -64,10 +70,74 @@ describe('UX-02: GatewayHealthBanner', () => {
   });
 
   it('axe-style: no unnamed buttons; the interactive control lives OUTSIDE the live element', () => {
-    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} onForceReconnect={async () => undefined} />);
+    render(
+      <GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={false} onForceReconnect={async () => undefined} />,
+    );
     const unnamed = screen.getAllByRole('button').filter((b) => (b.getAttribute('aria-label') ?? b.textContent ?? '').trim().length === 0);
     expect(unnamed).toEqual([]);
     const region = screen.getByRole('status');
     expect(region.querySelector('button')).toBeNull();
+  });
+});
+
+describe('UX-02/12b: confirm-on-live-turn gate for Force reconnect (SessionsPanel C4 pattern)', () => {
+  const noop = async () => undefined;
+
+  it('live turn: Force reconnect asks first — callback NOT fired, inline confirm strip shown (RED: pre-fix the click fires immediately)', async () => {
+    const user = userEvent.setup();
+    const onForceReconnect = vi.fn(async () => undefined);
+    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={onForceReconnect} />);
+    await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+    expect(onForceReconnect).not.toHaveBeenCalled(); // the defect this task closes: no turn may die on a title-warning alone
+    expect(screen.getByRole('group', { name: 'Confirm force reconnect' })).toBeInTheDocument();
+    expect(screen.getByText('A turn is still running — force reconnect will cancel it.')).toBeInTheDocument();
+  });
+
+  it('no live turn: fires immediately, no confirm strip (unchanged Task 12 behavior — the control)', async () => {
+    const user = userEvent.setup();
+    const onForceReconnect = vi.fn(async () => undefined);
+    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={false} onForceReconnect={onForceReconnect} />);
+    await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+    expect(onForceReconnect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('group', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
+  });
+
+  it('confirm: "Force reconnect anyway" fires the callback exactly once and closes the strip', async () => {
+    const user = userEvent.setup();
+    const onForceReconnect = vi.fn(async () => undefined);
+    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={onForceReconnect} />);
+    await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+    await user.click(screen.getByRole('button', { name: 'Force reconnect anyway' }));
+    expect(onForceReconnect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('group', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
+  });
+
+  it('a11y: opening moves focus to the confirm control; Cancel closes and returns focus to Force reconnect', async () => {
+    const user = userEvent.setup();
+    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={noop} />);
+    await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Force reconnect anyway' })));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('group', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Force reconnect' })));
+  });
+
+  it('a11y: Escape inside the strip cancels and returns focus (same treatment as Cancel)', async () => {
+    const user = userEvent.setup();
+    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={noop} />);
+    await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('group', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Force reconnect' })));
+  });
+
+  it('axe-style (role/name/value) while confirming: every button named; still no interactive content inside the live element', async () => {
+    const user = userEvent.setup();
+    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={noop} />);
+    await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+    const unnamed = screen.getAllByRole('button').filter((b) => (b.getAttribute('aria-label') ?? b.textContent ?? '').trim().length === 0);
+    expect(unnamed).toEqual([]);
+    expect(screen.getByRole('status').querySelector('button')).toBeNull();
+    expect(screen.getByRole('group', { name: 'Confirm force reconnect' })).toBeInTheDocument();
   });
 });
