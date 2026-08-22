@@ -23,6 +23,7 @@ import {
   pendingSelectionLine,
   PIPX_INSTALL_DOCS_URL,
   progressKey,
+  PULL_NOT_CONFIRMED_TEXT,
   PYTHON_VERSION_HELP_URL,
   RAG_LLAMACPP_MODEL_NOTE,
   RAG_MODEL_FIELD_CAPTION,
@@ -2029,8 +2030,8 @@ function fimBlockData(overrides: Partial<SetupData> = {}): SetupData {
   });
 }
 
-async function openFimInstallTab(data: SetupData, pickerName?: string) {
-  const utils = renderPanel(data);
+async function openFimInstallTab(data: SetupData, pickerName?: string, extra: Partial<Parameters<typeof SetupPanel>[0]> = {}) {
+  const utils = renderPanel(data, extra);
   if (pickerName !== undefined) {
     await utils.user.click(screen.getByRole('button', { name: pickerName }));
   }
@@ -2099,7 +2100,12 @@ describe('T11 — THREE catalog fim rows render (1.5b ★ / 7b / 14b), role-filt
   });
 
   it('a catalog Pull dispatches setup.provisionModel keyed by catalog id, then flashes the §6 FIM post-pull nudge', async () => {
-    const { fimCard, user, dispatch } = await openFimInstallTab(fimBlockData());
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { fimCard, user } = await openFimInstallTab(fimBlockData(), undefined, { dispatch });
     await user.click(within(fimCard).getByRole('button', { name: 'Pull qwen2.5-coder:7b-base (~4.4 GB)' }));
     expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
       modelId: 'qwen25-coder-7b',
@@ -3988,7 +3994,11 @@ describe('PT4-M1 — FIM Connect "not saved yet" is announced to screen readers 
 
 describe('PT4 — FIM Install-tab selectable rows + pending draft (§3.2)', () => {
   it('(a) catalog Pull success selects the row: highlight + pending line + Connect Model field — and NO settings write (pull ≠ save)', async () => {
-    const { user, dispatch } = renderPanel(fimSelectionData());
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const { user } = renderPanel(fimSelectionData(), {
+      dispatch: dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>,
+    });
     await user.click(screen.getByRole('button', { name: 'Install locally' }));
     await user.click(screen.getByRole('button', { name: /^Pull deepseek-coder:6\.7b-base/ }));
     const row = screen.getByRole('button', { name: 'DeepSeek Coder 6.7B (base)' });
@@ -4041,11 +4051,16 @@ describe('PT4 — FIM Install-tab selectable rows + pending draft (§3.2)', () =
   });
 
   it("(k) the ConfiguredModelRow's pull success selects ITS (out-of-catalog) model (C1-2)", async () => {
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
     const data = fimSelectionData({
       fim: { ...baseData().fim, model: 'my-legacy-model' },
       ollama: { ...baseData().ollama, models: [] },
     });
-    const { user, dispatch } = renderPanel(data);
+    const { user } = renderPanel(data, { dispatch });
     const field = screen.getByRole('textbox', { name: 'Model' });
     await user.clear(field);
     await user.type(field, 'typed-draft');
@@ -4056,6 +4071,31 @@ describe('PT4 — FIM Install-tab selectable rows + pending draft (§3.2)', () =
     );
     await user.click(screen.getByRole('button', { name: 'Connect' }));
     await waitFor(() => expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('my-legacy-model'));
+  });
+
+  it('T32: a ConfiguredModelRow pull that "resolves" WITHOUT a confirmed ok shows the not-confirmed copy and does NOT select the model', async () => {
+    const dispatch = vi.fn().mockResolvedValue({}) as unknown as ( // resolved, but nothing confirmed
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const data = fimSelectionData({
+      fim: { ...baseData().fim, model: 'my-legacy-model' },
+      ollama: { ...baseData().ollama, models: [] },
+    });
+    const { user } = renderPanel(data, { dispatch });
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'typed-draft');
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull my-legacy-model' }));
+    // The failure-tone outcome rides the SAME error state as a rejection, so
+    // it renders with the ✗ prefix (mirrors the codebase's `✗ <reason>`
+    // rejection convention this Task's global constraints name).
+    expect(await screen.findByText(`✗ ${PULL_NOT_CONFIRMED_TEXT}`)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    // The unconfirmed resolve never fired onPullSuccess, so the pending draft
+    // was never overwritten with the pulled model's id.
+    expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('typed-draft');
   });
 });
 
@@ -4162,7 +4202,11 @@ describe('PT5 — RAG Apply persists everything it shows (§3.2, write-shape pin
 
 describe('PT5 — RAG ollama rows selectable; the pull is honored (§3.2)', () => {
   it('(a) catalog Pull success selects the row: highlight + pending line + field — and ZERO settings writes (pull ≠ save)', async () => {
-    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const { user, ragCard } = await openRagSection(ragSurfaceData(), {
+      dispatch: dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>,
+    });
     await user.click(within(ragCard).getByRole('button', { name: /^Pull qwen3-embedding:4b/ }));
     const row = within(ragCard).getByRole('button', { name: 'Qwen3-Embedding 4B' });
     await waitFor(() => expect(row).toHaveAttribute('aria-pressed', 'true'));
@@ -4225,7 +4269,12 @@ describe('PT5 — RAG ollama rows selectable; the pull is honored (§3.2)', () =
   });
 
   it("the ConfiguredModelRow's pull success selects ITS (out-of-catalog) model with the NEW pull nudge (C1-2)", async () => {
-    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user, ragCard } = await openRagSection(ragSurfaceData(), { dispatch });
     const field = within(ragCard).getByRole('textbox', { name: 'Embedding model' });
     await user.clear(field);
     await user.type(field, 'typed-draft');

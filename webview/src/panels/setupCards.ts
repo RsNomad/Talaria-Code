@@ -824,6 +824,32 @@ export function cancelOutcome(result: unknown): ActionOutcome | undefined {
   return { text: r.cancelled ? CANCEL_DONE_TEXT : CANCEL_NOTHING_TEXT, tone: 'success' };
 }
 
+/** T32 (F1-6-face): TRUE only for a host result that affirmatively reports
+ *  `{ok: true}` — the ONLY shape allowed to claim pull completion. */
+export function isConfirmedOk(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && (result as { ok?: unknown }).ok === true;
+}
+
+/** T32 honest-copy for a resolve that is neither DECLINED nor a confirmed ok. */
+export const PULL_NOT_CONFIRMED_TEXT =
+  'The backend did not confirm the pull completed — re-check the model list before relying on it.';
+
+/** T32: outcome mapper for the Ollama pull buttons — a confirmed `{ok:true}`
+ *  earns the success flash; any OTHER resolve renders the honest
+ *  not-confirmed line instead of a fabricated success. (DECLINED never
+ *  reaches this — ActionButton short-circuits it first; an {ok:false}
+ *  refusal never reaches it either — unwrapSetupResult throws those.) */
+export function pullCompletionOutcome(
+  successLabel: string | undefined,
+): (result: unknown) => ActionOutcome | undefined {
+  return (result) =>
+    isConfirmedOk(result)
+      ? successLabel !== undefined
+        ? { text: successLabel, tone: 'success' }
+        : undefined
+      : { text: PULL_NOT_CONFIRMED_TEXT, tone: 'failure' };
+}
+
 /** The block's own scoped `setup.recheck` payload — narrower than the full
  *  `SetupMethod` param validation (T9), since the block only ever re-checks
  *  the ONE backend pane it renders. */

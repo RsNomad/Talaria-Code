@@ -70,10 +70,12 @@ import {
   cancelPullParams,
   catalogPresence,
   catalogPresenceText,
+  isConfirmedOk,
   llamacppDownloadButtonLabel,
   llamacppPresenceText,
   ollamaPullButtonLabel,
   progressKey,
+  pullCompletionOutcome,
   pullPercent,
   recheckScopeParams,
   servingLine,
@@ -137,10 +139,11 @@ export interface LocalModelBlockProps {
   pinnedDownload?: { label: string; unavailableReason: string };
   /**
    * beta.6 panel-fix (T6): fires exactly when an OLLAMA-pane Pull dispatch
-   * resolves with a result ≠ DECLINED (the same condition as the success
-   * flash). Never on rejection, never on DECLINED, never on llama.cpp/vLLM
-   * Download. The surface owns any snapshot/no-clobber rule. Omitted ⇒
-   * byte-identical behavior.
+   * resolves with a CONFIRMED `{ok:true}` result (T32/F1-6-face — the same
+   * condition as the success flash). Never on rejection, never on DECLINED,
+   * never on an unconfirmed resolve, never on llama.cpp/vLLM Download. The
+   * surface owns any snapshot/no-clobber rule. Omitted ⇒ byte-identical
+   * behavior.
    */
   onOllamaPullSuccess?: (model: SetupCatalogModel) => void;
 }
@@ -352,7 +355,15 @@ function ModelRow({
 
   let presenceText: string | undefined;
   let isPresent = false;
-  let action: { label: string; onRun: () => Promise<unknown>; disabledReason?: string | undefined; successLabel?: string | undefined } | undefined;
+  let action:
+    | {
+        label: string;
+        onRun: () => Promise<unknown>;
+        disabledReason?: string | undefined;
+        successLabel?: string | undefined;
+        outcomeFor?: ((result: unknown) => ActionOutcome | undefined) | undefined;
+      }
+    | undefined;
   let absenceOnly: string | undefined; // llama.cpp honest-absence: no action at all
 
   if (backend === 'ollama') {
@@ -365,14 +376,18 @@ function ModelRow({
         onRun: onOllamaPullSuccess
           ? () =>
               dispatch('setup.provisionModel', { modelId: model.id, backend: 'ollama', endpoint }).then((result) => {
-                if (result !== DECLINED) onOllamaPullSuccess(model);
+                if (isConfirmedOk(result)) onOllamaPullSuccess(model);
                 return result;
               })
           : () => dispatch('setup.provisionModel', { modelId: model.id, backend: 'ollama', endpoint }),
         // §4.1: Ollama rows with no daemon are visible, Pull disabled-with-reason —
         // independent of (but additive to) the trust gate.
         disabledReason: disabledReason ?? (!ollama.running ? OLLAMA_DAEMON_DOWN_PULL_REASON : undefined),
-        successLabel: ollamaPullSuccessLabel,
+        // T32 (F1-6-face): the success flash is earned only by a CONFIRMED
+        // {ok:true} resolve — any other resolve renders the honest
+        // not-confirmed line instead (pullCompletionOutcome supersedes
+        // successLabel below; see the ActionButton render site).
+        outcomeFor: pullCompletionOutcome(ollamaPullSuccessLabel),
       };
     }
   } else if (backend === 'llamacpp') {
@@ -452,7 +467,14 @@ function ModelRow({
 
       {action && (
         <div>
-          <ActionButton label={action.label} icon="cloud-download" onRun={action.onRun} disabledReason={action.disabledReason} successLabel={action.successLabel} />
+          <ActionButton
+            label={action.label}
+            icon="cloud-download"
+            onRun={action.onRun}
+            disabledReason={action.disabledReason}
+            successLabel={action.successLabel}
+            outcomeFor={action.outcomeFor}
+          />
         </div>
       )}
 
@@ -630,7 +652,7 @@ function ActionButton({
   icon?: string;
   successLabel?: string | undefined;
   pendingLabel?: string;
-  outcomeFor?: (result: unknown) => ActionOutcome | undefined;
+  outcomeFor?: ((result: unknown) => ActionOutcome | undefined) | undefined;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);

@@ -58,6 +58,7 @@ import {
   initDedicatedFormFieldState,
   initPendingModel,
   isComingSoon,
+  isConfirmedOk,
   llamacppDownloadButtonLabel,
   LLAMACPP_CHECKING_TEXT,
   LLAMACPP_HONEST_ABSENCE_TEXT,
@@ -85,8 +86,10 @@ import {
   provisionModalCopyPinned,
   providerDoneLine,
   PYTHON_VERSION_HELP_URL,
+  pullCompletionOutcome,
   pullPercent,
   PROGRESS_LOG_TAIL_MAX,
+  PULL_NOT_CONFIRMED_TEXT,
   RAG_APPLY_NUDGE,
   RAG_LLAMACPP_MODEL_NOTE,
   RAG_MODEL_FIELD_CAPTION,
@@ -1044,6 +1047,21 @@ describe('T31 (F2-20-face): cancelOutcome maps the host discriminant onto honest
     expect(cancelOutcome(undefined)).toBeUndefined();
     expect(cancelOutcome('junk')).toBeUndefined();
   });
+});
+
+describe('T32 (F1-6-face): only an affirmative {ok:true} counts as pull completion', () => {
+  it('isConfirmedOk: true ONLY for {ok:true}-shaped results', () => {
+    expect(isConfirmedOk({ ok: true })).toBe(true);
+    expect(isConfirmedOk({ ok: false, reason: 'x' })).toBe(false);
+    expect(isConfirmedOk({})).toBe(false);
+    expect(isConfirmedOk(undefined)).toBe(false);
+  });
+  it('pullCompletionOutcome: confirmed → success flash with the given label', () =>
+    expect(pullCompletionOutcome('✓ Pulled')({ ok: true })).toEqual({ text: '✓ Pulled', tone: 'success' }));
+  it('pullCompletionOutcome: confirmed with NO label → silent (today’s no-flash behavior)', () =>
+    expect(pullCompletionOutcome(undefined)({ ok: true })).toBeUndefined());
+  it('pullCompletionOutcome: an UNCONFIRMED resolve → the honest not-confirmed failure line', () =>
+    expect(pullCompletionOutcome('✓ Pulled')({})).toEqual({ text: PULL_NOT_CONFIRMED_TEXT, tone: 'failure' }));
 });
 
 describe('backendReadyText — §6 "Backend ready" row, shared template', () => {

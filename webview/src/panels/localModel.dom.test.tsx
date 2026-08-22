@@ -15,6 +15,7 @@ import userEvent from '@testing-library/user-event';
 import type { SetupCatalogModel, SetupData } from '../protocol';
 import { DECLINED } from '../state/panels';
 import { LocalModelBlock, type LocalModelBlockProps } from './localModel';
+import { PULL_NOT_CONFIRMED_TEXT } from './setupCards';
 
 function setup(jsx: ReactElement) {
   return { user: userEvent.setup(), ...render(jsx) };
@@ -851,13 +852,15 @@ describe('LocalModelBlock — pinnedDownload (T13, §3.3): the NEXT pinned-model
 
 /* ------------------------------------------------------------------ *
  * beta.6 panel-fix T6 — `onOllamaPullSuccess` (opt-in): fires exactly when
- * an OLLAMA-pane Pull dispatch resolves with a result ≠ DECLINED. Never on
- * rejection, never on DECLINED, never on llama.cpp/vLLM Download. OPT-IN —
- * omitted, the ollama Pull path stays byte-identical.
+ * an OLLAMA-pane Pull dispatch resolves with a CONFIRMED `{ok:true}` result
+ * (T32/F1-6-face). Never on rejection, never on DECLINED, never on an
+ * unconfirmed resolve, never on llama.cpp/vLLM Download. OPT-IN — omitted,
+ * the ollama Pull path stays byte-identical.
  * ------------------------------------------------------------------ */
 
 describe('LocalModelBlock — onOllamaPullSuccess (panel-fix T6)', () => {
-  it('ollama Pull resolves non-DECLINED: calls onOllamaPullSuccess once with the row model', async () => {
+  // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+  it('ollama Pull resolves confirmed {ok:true}: calls onOllamaPullSuccess once with the row model', async () => {
     const dispatch = vi.fn().mockResolvedValue({ ok: true });
     const onOllamaPullSuccess = vi.fn();
     const { user } = setup(
@@ -900,6 +903,23 @@ describe('LocalModelBlock — onOllamaPullSuccess (panel-fix T6)', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    expect(onOllamaPullSuccess).not.toHaveBeenCalled();
+    expect(screen.queryByText('✓ nudge')).not.toBeInTheDocument();
+  });
+
+  it('T32: a pull that "resolves" WITHOUT a confirmed ok shows the not-confirmed copy and NO success nudge', async () => {
+    const dispatch = vi.fn().mockResolvedValue({}); // resolved, but nothing confirmed
+    const onOllamaPullSuccess = vi.fn();
+    const { user } = setup(
+      <LocalModelBlock
+        {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }), onOllamaPullSuccess, ollamaPullSuccessLabel: '✓ nudge' })}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    // The failure-tone outcome rides the SAME error state as a rejection, so
+    // it renders with the ✗ prefix — mirroring the sibling REJECTS test's
+    // `'✗ boom'` assertion above.
+    expect(await screen.findByText(`✗ ${PULL_NOT_CONFIRMED_TEXT}`)).toBeInTheDocument();
     expect(onOllamaPullSuccess).not.toHaveBeenCalled();
     expect(screen.queryByText('✓ nudge')).not.toBeInTheDocument();
   });

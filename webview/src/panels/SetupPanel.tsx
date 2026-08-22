@@ -85,6 +85,7 @@ import {
   initDedicatedFormFieldState,
   initPendingModel,
   isComingSoon,
+  isConfirmedOk,
   meterSegments,
   mutationDisabledReason,
   NEXT_DOWNLOAD_BUTTON_LABEL,
@@ -104,6 +105,7 @@ import {
   providerDoneLine,
   PROVIDER_RECHECK_CAPTION,
   PYTHON_VERSION_HELP_URL,
+  pullCompletionOutcome,
   pullPercent,
   RAG_APPLY_NUDGE,
   RAG_LLAMACPP_MODEL_NOTE,
@@ -1588,8 +1590,9 @@ function ConfiguredModelRow({
   disabledReason?: string | undefined;
   pullSuccessLabel: string;
   /** beta.6 panel-fix PT4 (C1-2): fires exactly when the pull dispatch
-   *  resolves with a result ≠ DECLINED (the success-flash condition) —
-   *  never on rejection, never on DECLINED. Mirrors the block's PT6
+   *  resolves with a CONFIRMED `{ok:true}` result (T32/F1-6-face — the
+   *  success-flash condition) — never on rejection, never on DECLINED,
+   *  never on an unconfirmed resolve. Mirrors the block's PT6
    *  `onOllamaPullSuccess`. Omitted ⇒ byte-identical behavior. */
   onPullSuccess?: () => void;
 }) {
@@ -1610,7 +1613,7 @@ function ConfiguredModelRow({
   const pullOnRun = onPullSuccess
     ? () =>
         dispatch('setup.pullModel', { model, endpoint }).then((result) => {
-          if (result !== DECLINED) onPullSuccess();
+          if (isConfirmedOk(result)) onPullSuccess();
           return result;
         })
     : () => dispatch('setup.pullModel', { model, endpoint });
@@ -1636,7 +1639,7 @@ function ConfiguredModelRow({
               return pullOnRun().finally(() => setDispatching(false));
             }}
             disabledReason={disabledReason}
-            successLabel={pullSuccessLabel}
+            outcomeFor={pullCompletionOutcome(pullSuccessLabel)}
           />
         </div>
       )}
