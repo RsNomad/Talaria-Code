@@ -793,96 +793,103 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
 
   return (
     <PanelShell title="Active MCP servers" meta={`${data.servers.length} configured`}>
-      {data.servers.map((srv) => {
-        const s = totalLookup(STATUS, srv.status, UNKNOWN_MCP_STATUS);
-        const rowTesting = testing[srv.name] === true;
-        const rowRemoving = removing[srv.name] === true;
-        const rowAuthing = authing[srv.name] === true;
-        // AU-40: none of these three is genuinely-indefinite — each is
-        // purely "a request from THIS button is in flight".
-        const testInteraction = busyInteraction(false, rowTesting);
-        const removeInteraction = busyInteraction(false, rowRemoving);
-        const authInteraction = busyInteraction(false, rowAuthing);
-        const toggleErr = lastError(srv.name);
-        return (
-          <div key={srv.id} className="mb-2 rounded-card border border-border bg-surface px-3 py-2.5">
-            <div className="flex items-center gap-2">
-              <Icon name="server-process" size={15} className="flex-none text-accent" />
-              <span className="min-w-0 truncate font-mono text-xs text-fg">{srv.name}</span>
-              <span className="ml-auto flex flex-none items-center gap-2">
-                <Pill tone={s.tone} icon={s.icon}>
-                  {s.label}
-                </Pill>
-                <Toggle
-                  on={isOn(srv.name, srv.enabled)}
-                  label={`Enable ${srv.name}`}
-                  onChange={(next) => toggle(srv.name, next)}
-                />
-              </span>
-            </div>
-            <div className="mt-1.5 truncate font-mono text-2xs text-faint" title={srv.command}>
-              {srv.command}
-            </div>
-            <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
-              {srv.toolCount} tools
-            </div>
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): the server-row collection was `div`
+          soup — no `role="list"`/`role="listitem"` at all. AddServerDisclosure
+          and CatalogDisclosure below (each rendering their own independent
+          collections — the catalog's `entries.map` is a separate,
+          out-of-scope list per the task brief) stay OUTSIDE this list. */}
+      <div role="list">
+        {data.servers.map((srv) => {
+          const s = totalLookup(STATUS, srv.status, UNKNOWN_MCP_STATUS);
+          const rowTesting = testing[srv.name] === true;
+          const rowRemoving = removing[srv.name] === true;
+          const rowAuthing = authing[srv.name] === true;
+          // AU-40: none of these three is genuinely-indefinite — each is
+          // purely "a request from THIS button is in flight".
+          const testInteraction = busyInteraction(false, rowTesting);
+          const removeInteraction = busyInteraction(false, rowRemoving);
+          const authInteraction = busyInteraction(false, rowAuthing);
+          const toggleErr = lastError(srv.name);
+          return (
+            <div key={srv.id} role="listitem" className="mb-2 rounded-card border border-border bg-surface px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <Icon name="server-process" size={15} className="flex-none text-accent" />
+                <span className="min-w-0 truncate font-mono text-xs text-fg">{srv.name}</span>
+                <span className="ml-auto flex flex-none items-center gap-2">
+                  <Pill tone={s.tone} icon={s.icon}>
+                    {s.label}
+                  </Pill>
+                  <Toggle
+                    on={isOn(srv.name, srv.enabled)}
+                    label={`Enable ${srv.name}`}
+                    onChange={(next) => toggle(srv.name, next)}
+                  />
+                </span>
+              </div>
+              <div className="mt-1.5 truncate font-mono text-2xs text-faint" title={srv.command}>
+                {srv.command}
+              </div>
+              <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
+                {srv.toolCount} tools
+              </div>
 
-            {/* V-11 (TOGGLE-HONESTY) grammar, exactly as SkillsPanel.tsx uses
-                it: a rejected `mcp.setEnabled` rolls the switch back and
-                names why, through this permanently-mounted LiveRegion. */}
-            <LiveRegion
-              text={toggleErr ? `Not saved: ${toggleErr}` : ''}
-              className="mt-1 text-2xs text-del"
-              title={toggleErr}
-            />
+              {/* V-11 (TOGGLE-HONESTY) grammar, exactly as SkillsPanel.tsx uses
+                  it: a rejected `mcp.setEnabled` rolls the switch back and
+                  names why, through this permanently-mounted LiveRegion. */}
+              <LiveRegion
+                text={toggleErr ? `Not saved: ${toggleErr}` : ''}
+                className="mt-1 text-2xs text-del"
+                title={toggleErr}
+              />
 
-            <div className="mt-2 flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => handleTest(srv.name)}
-                disabled={testInteraction.nativeDisabled}
-                aria-disabled={testInteraction.ariaDisabled}
-                aria-busy={testInteraction.ariaBusy}
-                className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
-              >
-                <Icon name={rowTesting ? 'loading' : 'beaker'} size={12} spin={rowTesting} />
-                {rowTesting ? 'Testing…' : 'Test'}
-              </button>
-              <button
-                type="button"
-                onClick={() => handleRemove(srv.name)}
-                disabled={removeInteraction.nativeDisabled}
-                aria-disabled={removeInteraction.ariaDisabled}
-                aria-busy={removeInteraction.ariaBusy}
-                className="flex items-center gap-1.5 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
-              >
-                <Icon name={rowRemoving ? 'loading' : 'trash'} size={12} spin={rowRemoving} />
-                {rowRemoving ? 'Removing…' : 'Remove'}
-              </button>
-              {/* Task A8 (§4.8): OAuth login only makes sense for HTTP-transport
-                  servers — stdio servers "authenticate via env keys, not OAuth"
-                  (`web_server.py:10568-10572`), which is exactly why the
-                  dispatcher itself 400s a stdio `mcp.auth` call; gating the
-                  button here keeps the panel from ever offering an action the
-                  host would refuse. */}
-              {srv.transport === 'http' && (
+              <div className="mt-2 flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => handleAuth(srv.name)}
-                  disabled={authInteraction.nativeDisabled}
-                  aria-disabled={authInteraction.ariaDisabled}
-                  aria-busy={authInteraction.ariaBusy}
+                  onClick={() => handleTest(srv.name)}
+                  disabled={testInteraction.nativeDisabled}
+                  aria-disabled={testInteraction.ariaDisabled}
+                  aria-busy={testInteraction.ariaBusy}
                   className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
                 >
-                  <Icon name={rowAuthing ? 'loading' : 'sign-in'} size={12} spin={rowAuthing} />
-                  {rowAuthing ? 'Waiting for browser sign-in…' : 'Login'}
+                  <Icon name={rowTesting ? 'loading' : 'beaker'} size={12} spin={rowTesting} />
+                  {rowTesting ? 'Testing…' : 'Test'}
                 </button>
-              )}
+                <button
+                  type="button"
+                  onClick={() => handleRemove(srv.name)}
+                  disabled={removeInteraction.nativeDisabled}
+                  aria-disabled={removeInteraction.ariaDisabled}
+                  aria-busy={removeInteraction.ariaBusy}
+                  className="flex items-center gap-1.5 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
+                >
+                  <Icon name={rowRemoving ? 'loading' : 'trash'} size={12} spin={rowRemoving} />
+                  {rowRemoving ? 'Removing…' : 'Remove'}
+                </button>
+                {/* Task A8 (§4.8): OAuth login only makes sense for HTTP-transport
+                    servers — stdio servers "authenticate via env keys, not OAuth"
+                    (`web_server.py:10568-10572`), which is exactly why the
+                    dispatcher itself 400s a stdio `mcp.auth` call; gating the
+                    button here keeps the panel from ever offering an action the
+                    host would refuse. */}
+                {srv.transport === 'http' && (
+                  <button
+                    type="button"
+                    onClick={() => handleAuth(srv.name)}
+                    disabled={authInteraction.nativeDisabled}
+                    aria-disabled={authInteraction.ariaDisabled}
+                    aria-busy={authInteraction.ariaBusy}
+                    className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
+                  >
+                    <Icon name={rowAuthing ? 'loading' : 'sign-in'} size={12} spin={rowAuthing} />
+                    {rowAuthing ? 'Waiting for browser sign-in…' : 'Login'}
+                  </button>
+                )}
+              </div>
+              <RowNoticeCard notice={rowNotice[srv.name]} />
             </div>
-            <RowNoticeCard notice={rowNotice[srv.name]} />
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
 
       <AddServerDisclosure onAdd={onAdd} onAdded={handleTest} />
       <CatalogDisclosure onCatalog={onCatalog} onCatalogInstall={onCatalogInstall} />

@@ -305,3 +305,25 @@ describe('AU-46: the empty state keeps the "History" panel header', () => {
     expect(screen.getByText('No past sessions yet.')).toBeInTheDocument();
   });
 });
+
+/**
+ * Task 19 (WCAG 1.3.1, WV4-MIN): the History row collection was `div` soup —
+ * no `role="list"`/`role="listitem"` at all, so AT could not count or
+ * navigate rows as a set. The "Load more" footer (a distinct, non-row
+ * control) stays OUTSIDE the list element.
+ */
+describe('WV4-MIN (Task 19, WCAG 1.3.1): History rows carry list/listitem semantics', () => {
+  it('the row collection exposes role="list" with one listitem per session', () => {
+    setup(
+      renderPanel({
+        sessions: [
+          session({ id: 'sess-1', title: 'Fix the bug' }),
+          session({ id: 'sess-2', title: 'Other session' }),
+        ],
+      }),
+    );
+
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});

@@ -840,6 +840,24 @@ describe('TI-3 (AU-42 Part B): a refreshError renders a dismissible banner over 
  * above — `aria-invalid` + `aria-describedby` tie the offending field to its
  * error text for a screen reader.
  */
+/**
+ * Task 19 (WCAG 1.3.1, WV4-MIN): the skill-row collection was `div` soup —
+ * no `role="list"`/`role="listitem"` at all. `CreateSkillDisclosure` and
+ * `InstallFromHubDisclosure` stay OUTSIDE the skills list element, as does
+ * the panel-level "Toggles persist immediately" note (already renders above
+ * the row collection).
+ */
+describe('WV4-MIN (Task 19, WCAG 1.3.1): the skills list carries explicit list/listitem semantics', () => {
+  it('the skill collection exposes role="list" with one listitem per skill', () => {
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});
+
 describe('WV4-MIN a11y: SkillsPanel create-form field errors are keyed to their field', () => {
   it('submitting the create form with an empty Name marks the field aria-invalid and wires the error via aria-describedby', async () => {
     const user = userEvent.setup();

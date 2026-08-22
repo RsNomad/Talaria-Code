@@ -429,7 +429,12 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
           )}
         </div>
       )}
-      <ol className="relative m-0 list-none p-0">
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): explicit `role="list"`/`role="listitem"`
+          alongside the native `<ol>`/`<li>` — `list-none` above strips the
+          native list SEMANTICS in some browsers/AT (WebKit/VoiceOver) unless
+          the role is stated explicitly, so the implicit tag-based mapping
+          alone is not enough here. */}
+      <ol role="list" className="relative m-0 list-none p-0">
         {data.checkpoints.map((cp, i) => {
           const last = i === data.checkpoints.length - 1;
           const latest = i === 0;
@@ -470,7 +475,7 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
                 : '';
           const rowStatusClass = restoringId === cp.id ? 'text-2xs text-muted' : 'text-2xs text-fg';
           return (
-            <li key={cp.id} className="relative flex gap-3 pb-3">
+            <li key={cp.id} role="listitem" className="relative flex gap-3 pb-3">
               {/* timeline rail */}
               <div className="flex flex-none flex-col items-center">
                 <Icon

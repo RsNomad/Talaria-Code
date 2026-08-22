@@ -454,6 +454,44 @@ describe('AU-40: row "Test" goes BUSY, not natively disabled, while mcp.test is 
  * `aria-describedby` pointing at the rendered error text, not just an
  * unassociated floating error string.
  */
+/**
+ * Task 19 (WCAG 1.3.1, WV4-MIN): the server-row collection was `div` soup —
+ * no `role="list"`/`role="listitem"` at all. `AddServerDisclosure` and
+ * `CatalogDisclosure` (each rendering their OWN independent collections —
+ * the catalog's `entries.map` is a separate, out-of-scope list per the task
+ * brief) stay OUTSIDE the servers list element.
+ */
+describe('WV4-MIN (Task 19, WCAG 1.3.1): the server list carries explicit list/listitem semantics', () => {
+  it('the server collection exposes role="list" with one listitem per server', () => {
+    const data: McpData = {
+      servers: [
+        {
+          id: 'srv-1',
+          name: 'filesystem',
+          status: 'connected',
+          command: 'npx mcp-fs',
+          toolCount: 4,
+          enabled: true,
+          transport: 'stdio',
+        },
+        {
+          id: 'srv-2',
+          name: 'remote',
+          status: 'connected',
+          command: 'https://x.example/mcp',
+          toolCount: 2,
+          enabled: true,
+          transport: 'http',
+        },
+      ],
+    };
+    render(<McpPanel data={data} onReload={async () => ({ status: 'reloaded' })} {...noopMcpAdminProps()} />);
+
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});
+
 describe('WV4-MIN a11y: MCP add-server form field errors are keyed to their field', () => {
   it('submitting the add form with an empty Name marks the field aria-invalid and wires the error via aria-describedby', async () => {
     const user = userEvent.setup();

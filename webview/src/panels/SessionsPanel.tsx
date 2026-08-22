@@ -139,75 +139,81 @@ export function SessionsPanel({
 
   return (
     <PanelShell title="History" meta={`${data.sessions.length} sessions`}>
-      {data.sessions.map((s) => {
-        const age = relativeAge(s.updatedAt);
-        const isBound = boundSessionIds.has(s.id);
-        const isConfirming = confirmingId === s.id;
-        // TI-1 (AU-39): busy, never natively disabled — a loading row must
-        // stay focusable (busyInteraction.ts's own rationale) and the
-        // click-guard below (`interactive`) is what actually blocks a
-        // double-post, not the native attribute (which stays permanently
-        // `false` here, mirroring the "Load more" footer button above).
-        const isLoading = loadingSessionId === s.id;
-        const rowInteraction = busyInteraction(false, isLoading);
-        return (
-          <div key={s.id} className="mb-1.5">
-            <button
-              type="button"
-              ref={isConfirming ? confirmTriggerRef : undefined}
-              onClick={() => {
-                if (!rowInteraction.interactive) return;
-                handleRowClick(s);
-              }}
-              disabled={rowInteraction.nativeDisabled}
-              aria-disabled={rowInteraction.ariaDisabled}
-              aria-busy={rowInteraction.ariaBusy}
-              aria-current={isBound ? 'true' : undefined}
-              className="flex w-full items-start gap-2 rounded-card border border-border bg-surface px-3 py-2 text-left transition-colors hover:border-accent disabled:cursor-default disabled:opacity-60 aria-disabled:cursor-default aria-disabled:opacity-60"
-            >
-              <Icon
-                name={isLoading ? 'loading' : 'comment-discussion'}
-                size={15}
-                spin={isLoading}
-                className="mt-0.5 flex-none text-muted"
-              />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="min-w-0 truncate text-[12.5px] font-semibold text-fg">
-                    {s.title || UNTITLED_SESSION_LABEL}
-                  </span>
-                  {isBound && (
-                    <span className="ml-auto flex-none">
-                      <Pill tone="accent">Open</Pill>
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): the row collection was `div` soup —
+          no `role="list"`/`role="listitem"` at all, so AT could not count or
+          navigate rows as a set. The "Load more" footer below is a distinct,
+          non-row control and stays OUTSIDE this list element. */}
+      <div role="list">
+        {data.sessions.map((s) => {
+          const age = relativeAge(s.updatedAt);
+          const isBound = boundSessionIds.has(s.id);
+          const isConfirming = confirmingId === s.id;
+          // TI-1 (AU-39): busy, never natively disabled — a loading row must
+          // stay focusable (busyInteraction.ts's own rationale) and the
+          // click-guard below (`interactive`) is what actually blocks a
+          // double-post, not the native attribute (which stays permanently
+          // `false` here, mirroring the "Load more" footer button above).
+          const isLoading = loadingSessionId === s.id;
+          const rowInteraction = busyInteraction(false, isLoading);
+          return (
+            <div key={s.id} role="listitem" className="mb-1.5">
+              <button
+                type="button"
+                ref={isConfirming ? confirmTriggerRef : undefined}
+                onClick={() => {
+                  if (!rowInteraction.interactive) return;
+                  handleRowClick(s);
+                }}
+                disabled={rowInteraction.nativeDisabled}
+                aria-disabled={rowInteraction.ariaDisabled}
+                aria-busy={rowInteraction.ariaBusy}
+                aria-current={isBound ? 'true' : undefined}
+                className="flex w-full items-start gap-2 rounded-card border border-border bg-surface px-3 py-2 text-left transition-colors hover:border-accent disabled:cursor-default disabled:opacity-60 aria-disabled:cursor-default aria-disabled:opacity-60"
+              >
+                <Icon
+                  name={isLoading ? 'loading' : 'comment-discussion'}
+                  size={15}
+                  spin={isLoading}
+                  className="mt-0.5 flex-none text-muted"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="min-w-0 truncate text-[12.5px] font-semibold text-fg">
+                      {s.title || UNTITLED_SESSION_LABEL}
                     </span>
-                  )}
+                    {isBound && (
+                      <span className="ml-auto flex-none">
+                        <Pill tone="accent">Open</Pill>
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-0.5 flex items-center gap-2 font-mono text-2xs text-faint">
+                    <span className="min-w-0 truncate">{s.cwd}</span>
+                    {age && (
+                      <>
+                        <span className="flex-none">·</span>
+                        <span className="flex-none">{age}</span>
+                      </>
+                    )}
+                  </div>
                 </div>
-                <div className="mt-0.5 flex items-center gap-2 font-mono text-2xs text-faint">
-                  <span className="min-w-0 truncate">{s.cwd}</span>
-                  {age && (
-                    <>
-                      <span className="flex-none">·</span>
-                      <span className="flex-none">{age}</span>
-                    </>
-                  )}
-                </div>
-              </div>
-            </button>
+              </button>
 
-            {isConfirming && (
-              <ConfirmStrip
-                className="mt-1"
-                ariaLabel="Confirm load"
-                message="Loading this will replace the conversation currently running in this tab."
-                confirmLabel="Load anyway"
-                onConfirm={() => confirmLoad(s)}
-                onCancel={() => setConfirmingId(undefined)}
-                returnFocus={() => confirmTriggerRef.current?.focus()}
-              />
-            )}
-          </div>
-        );
-      })}
+              {isConfirming && (
+                <ConfirmStrip
+                  className="mt-1"
+                  ariaLabel="Confirm load"
+                  message="Loading this will replace the conversation currently running in this tab."
+                  confirmLabel="Load anyway"
+                  onConfirm={() => confirmLoad(s)}
+                  onCancel={() => setConfirmingId(undefined)}
+                  returnFocus={() => confirmTriggerRef.current?.focus()}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
 
       {(() => {
         // BF-A: the footer's tri-state (+hidden) is decided by the pure

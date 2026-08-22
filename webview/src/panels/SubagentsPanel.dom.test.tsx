@@ -97,3 +97,26 @@ describe('W4-T6: the "Running" status tone matches ToolCard.tsx\'s vocabulary (t
     expect(pill?.className).toContain('text-add');
   });
 });
+
+/**
+ * Task 19 (WCAG 1.3.1, WV4-MIN): the delegation row collection was `div`
+ * soup — no `role="list"`/`role="listitem"` at all, so AT could not count or
+ * navigate delegations as a set.
+ */
+describe('WV4-MIN (Task 19, WCAG 1.3.1): the delegation list carries explicit list/listitem semantics', () => {
+  it('the delegation collection exposes role="list" with one listitem per delegation', () => {
+    render(
+      <SubagentsPanel
+        data={data({
+          delegations: [
+            { id: 'd1', goal: 'Fix the bug', status: 'complete' },
+            { id: 'd2', goal: 'Add tests', status: 'running' },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});

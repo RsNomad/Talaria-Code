@@ -475,6 +475,34 @@ describe('F6: checkpoint restore progress/success is carried by a permanently-mo
  * tests now spy the PROPS, not `bridge.request` directly (App.dom.test.tsx
  * covers the App.tsx wiring itself: rootId + tab tag).
  */
+/**
+ * Task 19 (WCAG 1.3.1, WV4-MIN): the checkpoint timeline already used native
+ * `<ol>`/`<li>` (implicit list/listitem roles), but the `<ol>` also carries
+ * Tailwind's `list-none` — which strips the native list SEMANTICS in some
+ * browsers/AT (WebKit/VoiceOver) unless `role="list"` is stated explicitly.
+ * This pins the EXPLICIT roles the fix adds, not just the implicit ones the
+ * bare tag names already produced. The redo/redo-all block sits BEFORE the
+ * `<ol>`, outside the list.
+ */
+describe('WV4-MIN (Task 19, WCAG 1.3.1): the checkpoint timeline carries explicit list/listitem semantics', () => {
+  it('the timeline exposes role="list" with one listitem per checkpoint', () => {
+    const data: CheckpointsData = {
+      checkpoints: [checkpoint({ id: 'c1' }), checkpoint({ id: 'c2' })],
+    };
+    render(
+      <CheckpointsPanel
+        data={data}
+        onRestore={async () => ({ restored: true, filesChanged: 0, changedPaths: [] })}
+        onRedo={neverRedo}
+        onRedoAll={neverRedo}
+      />,
+    );
+
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});
+
 describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRedoAll props', () => {
   const defaultRedoResult: CheckpointRestoreResult = { restored: true, filesChanged: 0, changedPaths: [] };
 

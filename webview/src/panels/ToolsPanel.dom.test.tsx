@@ -133,3 +133,29 @@ describe('ToolsPanel V-11 TOGGLE-HONESTY', () => {
     expect(screen.queryByText(/\d+ available/)).not.toBeInTheDocument();
   });
 });
+
+/**
+ * Task 19 (WCAG 1.3.1, WV4-MIN): the TOP-LEVEL toolset collection was `div`
+ * soup — no `role="list"`/`role="listitem"` at all. Scoped to the top-level
+ * `data.toolsets.map` only, per the task brief — the nested per-toolset
+ * `tools` collection stays untouched (2 toolsets x 1 tool each below still
+ * yields exactly 2 listitems, never 4).
+ */
+describe('WV4-MIN (Task 19, WCAG 1.3.1): the toolset collection carries explicit list/listitem semantics', () => {
+  it('the top-level toolset collection exposes role="list" with one listitem per toolset (not per tool)', () => {
+    const data: ToolsData = {
+      toolsets: [
+        { name: 'web', enabled: true, toolCount: 1 },
+        { name: 'computer_use', enabled: true, toolCount: 1 },
+      ],
+      tools: [
+        { name: 'fetch_url', description: 'Fetch a URL.', enabled: true, kind: 'fetch', toolset: 'web', source: 'core' },
+        { name: 'screenshot', description: 'Take a screenshot.', enabled: true, kind: 'other', toolset: 'computer_use', source: 'core' },
+      ],
+    };
+    setup(<ToolsPanel data={data} onToggle={async () => undefined} />);
+
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});

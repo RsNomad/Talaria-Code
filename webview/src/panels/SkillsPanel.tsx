@@ -900,68 +900,74 @@ export function SkillsPanel({
       <p className="mb-2 px-1 text-2xs leading-snug text-faint">
         {`Toggles persist immediately. ${APPLIES_NEXT_SESSION}`}
       </p>
-      {data.skills.map((sk) => {
-        const err = lastError(sk.id);
-        const isHub = sk.provenance === 'hub';
-        const rowUninstalling = uninstalling[sk.name] === true;
-        // AU-40: purely in-flight — nothing genuinely-indefinite gates uninstall.
-        const uninstallInteraction = busyInteraction(false, rowUninstalling);
-        return (
-          <div
-            key={sk.id}
-            className="mb-1.5 flex items-start gap-2 rounded-card border border-border bg-surface px-3 py-2"
-          >
-            <Icon name="extensions" size={15} className="mt-0.5 flex-none text-accent" />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5">
-                <span className="truncate font-mono text-xs text-fg">{sk.name}</span>
-                <Pill tone="neutral">{sk.category}</Pill>
-                {sk.provenance && (
-                  <Pill tone="neutral">
-                    {totalLookup(PROVENANCE_LABEL, sk.provenance, UNKNOWN_PROVENANCE_LABEL)}
-                  </Pill>
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): the skill-row collection was `div`
+          soup — no `role="list"`/`role="listitem"` at all. CreateSkillDisclosure
+          and InstallFromHubDisclosure below stay OUTSIDE this list. */}
+      <div role="list">
+        {data.skills.map((sk) => {
+          const err = lastError(sk.id);
+          const isHub = sk.provenance === 'hub';
+          const rowUninstalling = uninstalling[sk.name] === true;
+          // AU-40: purely in-flight — nothing genuinely-indefinite gates uninstall.
+          const uninstallInteraction = busyInteraction(false, rowUninstalling);
+          return (
+            <div
+              key={sk.id}
+              role="listitem"
+              className="mb-1.5 flex items-start gap-2 rounded-card border border-border bg-surface px-3 py-2"
+            >
+              <Icon name="extensions" size={15} className="mt-0.5 flex-none text-accent" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate font-mono text-xs text-fg">{sk.name}</span>
+                  <Pill tone="neutral">{sk.category}</Pill>
+                  {sk.provenance && (
+                    <Pill tone="neutral">
+                      {totalLookup(PROVENANCE_LABEL, sk.provenance, UNKNOWN_PROVENANCE_LABEL)}
+                    </Pill>
+                  )}
+                  {typeof sk.usage === 'number' && sk.usage > 0 && (
+                    <span className="text-2xs text-faint">used {sk.usage}×</span>
+                  )}
+                </div>
+                {sk.description && (
+                  <div className="mt-0.5 text-2xs leading-snug text-muted">{sk.description}</div>
                 )}
-                {typeof sk.usage === 'number' && sk.usage > 0 && (
-                  <span className="text-2xs text-faint">used {sk.usage}×</span>
+                {/* V-11 (TOGGLE-HONESTY): a rejected persist used to roll the
+                    switch back with NOTHING surfaced anywhere. Same grammar
+                    SettingsPanel's FieldRow already carries (SettingsPanel.tsx:
+                    159): a permanently-mounted LiveRegion (WCAG 2.2 SC 4.1.3),
+                    only its text swaps — never conditionally mounted. */}
+                <LiveRegion text={err ? `Not saved: ${err}` : ''} className="text-2xs text-del" title={err} />
+                {isHub && <HubNoticeCard notice={hubNotice[sk.name]} />}
+              </div>
+              <div className="flex flex-none items-center gap-2 pt-0.5">
+                <Toggle
+                  on={isOn(sk.id, sk.enabled)}
+                  label={`Enable ${sk.name}`}
+                  onChange={(next) => toggle(sk.id, next)}
+                />
+                {/* Task B6 (§5.6 item 3): only hub-provenance rows get a
+                    Remove — a bundled/agent skill has no hub install to
+                    reverse this way. */}
+                {isHub && (
+                  <button
+                    type="button"
+                    onClick={() => handleHubUninstall(sk.name)}
+                    disabled={uninstallInteraction.nativeDisabled}
+                    aria-disabled={uninstallInteraction.ariaDisabled}
+                    aria-busy={uninstallInteraction.ariaBusy}
+                    className="flex items-center gap-1 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
+                  >
+                    <Icon name={rowUninstalling ? 'loading' : 'trash'} size={12} spin={rowUninstalling} />
+                    {rowUninstalling ? 'Removing…' : 'Remove'}
+                  </button>
                 )}
               </div>
-              {sk.description && (
-                <div className="mt-0.5 text-2xs leading-snug text-muted">{sk.description}</div>
-              )}
-              {/* V-11 (TOGGLE-HONESTY): a rejected persist used to roll the
-                  switch back with NOTHING surfaced anywhere. Same grammar
-                  SettingsPanel's FieldRow already carries (SettingsPanel.tsx:
-                  159): a permanently-mounted LiveRegion (WCAG 2.2 SC 4.1.3),
-                  only its text swaps — never conditionally mounted. */}
-              <LiveRegion text={err ? `Not saved: ${err}` : ''} className="text-2xs text-del" title={err} />
-              {isHub && <HubNoticeCard notice={hubNotice[sk.name]} />}
             </div>
-            <div className="flex flex-none items-center gap-2 pt-0.5">
-              <Toggle
-                on={isOn(sk.id, sk.enabled)}
-                label={`Enable ${sk.name}`}
-                onChange={(next) => toggle(sk.id, next)}
-              />
-              {/* Task B6 (§5.6 item 3): only hub-provenance rows get a
-                  Remove — a bundled/agent skill has no hub install to
-                  reverse this way. */}
-              {isHub && (
-                <button
-                  type="button"
-                  onClick={() => handleHubUninstall(sk.name)}
-                  disabled={uninstallInteraction.nativeDisabled}
-                  aria-disabled={uninstallInteraction.ariaDisabled}
-                  aria-busy={uninstallInteraction.ariaBusy}
-                  className="flex items-center gap-1 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
-                >
-                  <Icon name={rowUninstalling ? 'loading' : 'trash'} size={12} spin={rowUninstalling} />
-                  {rowUninstalling ? 'Removing…' : 'Remove'}
-                </button>
-              )}
-            </div>
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
 
       <CreateSkillDisclosure onCreate={onCreate} />
       <InstallFromHubDisclosure onHubPreview={onHubPreview} onHubScan={onHubScan} onHubInstall={onHubInstall} />
