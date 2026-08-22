@@ -455,6 +455,28 @@ describe('WS-R3 characterization — handleAcpCrash observable sequence', () => 
     await vi.advanceTimersByTimeAsync(respawnBackoffMs(1));
     expect(h.clients.length).toBeGreaterThanOrEqual(2); // respawn actually spawned
   });
+
+  it('handleAcpCrash: a throwing client.dispose() (inside teardownForRespawn) does not abort before the respawn is scheduled (WS-R3 F2-19 close-out follow-up)', async () => {
+    const h = await startedHarness();
+    const client = must(h.clients[0]);
+    client.dispose = () => {
+      throw new Error('client dispose boom');
+    };
+
+    // Pre-fix: teardownForRespawn's unguarded `this.client?.dispose()` throws,
+    // propagating straight out of handleAcpCrash — which has NO try/catch
+    // around its `teardownForRespawn(...)` call — BEFORE `scheduleAcpRespawn()`
+    // ever runs. The supervisor zombies (acpState stuck, no respawn timer
+    // armed, no subsequent spawn attempt).
+    expect(() => must(h.clients[0]).simulateExit(1)).not.toThrow();
+
+    expect(h.supervisor.getClient()).toBeUndefined();
+    expect((h.supervisor as unknown as CrashSeam).acpState).toBe('respawning');
+    expect(h.logs.some((l) => l.includes('ACP respawn attempt 1'))).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1));
+    expect(h.clients.length).toBeGreaterThanOrEqual(2); // respawn actually spawned
+  });
 });
 
 describe('WS-R3 characterization — reconnect refusal matrix + teardown', () => {

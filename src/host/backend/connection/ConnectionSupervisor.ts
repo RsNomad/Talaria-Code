@@ -1074,7 +1074,19 @@ export class ConnectionSupervisor {
         this.safeLog(`${fanOutLog(controller)}: ${describeHostError(err)}`);
       }
     }
-    this.client?.dispose();
+    // WS-R3 F2-19 close-out follow-up: `handleAcpCrash` calls
+    // `teardownForRespawn(...)` then `scheduleAcpRespawn()` with NO outer
+    // try/catch — an unguarded throw here would propagate straight out of
+    // `handleAcpCrash`, aborting it before `this.acpState = 'respawning'`
+    // below (and, on that caller, before `scheduleAcpRespawn()` is ever
+    // reached) — the exact F2-19 zombie every other collaborator call on
+    // this path is already guarded against. `client` is produced by the
+    // same injected `AcpClientFactory` as the exit-sub above.
+    try {
+      this.client?.dispose();
+    } catch (err) {
+      this.safeLog(`[AcpBackend] client dispose threw during respawn teardown: ${describeHostError(err)}`);
+    }
     this.client = undefined;
     this.acpState = 'respawning';
   }
