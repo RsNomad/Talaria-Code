@@ -1359,18 +1359,27 @@ export function Composer({
               ref={newSessionRef}
               type="button"
               onClick={() => {
+                // WS-UX P2 M2: the UX-04a in-flight guard runs FIRST.
+                // busyInteraction's `interactive` click-guard STANDS IN for
+                // native `disabled`'s own click-blocking (busyInteraction.ts)
+                // — native disabled would have suppressed the whole click,
+                // confirm gate included. A click while "Starting a new
+                // session…" is already in flight asks for nothing new (it is
+                // already starting); running the UX-11 busy gate first here
+                // let a second click re-open the ConfirmStrip in the
+                // busy && newSessionPending window, and a second confirm
+                // re-dispatched `tab.newSession`.
+                if (!newSessionInteraction.interactive) return;
                 // UX-11: a live turn must be asked about, never silently
-                // cancelled — mirrors submit()'s own UI#9-honesty `busy` gate.
-                // This gate runs FIRST; the UX-04a pending-busy posture below
-                // only ever applies AFTER `newSession()` actually dispatches.
+                // cancelled — mirrors submit()'s own UI#9-honesty `busy`
+                // gate. Reached only when NO New-Session request is in
+                // flight (guard above; at this MIXED site `interactive` is
+                // exactly `!newSessionPending`), so the plain live-turn case
+                // still always asks.
                 if (busy) {
                   setConfirmingNewSession(true);
                   return;
                 }
-                // UX-04a: guard against a double-dispatch while a prior New
-                // Session request is still in flight (busyInteraction's
-                // click-guard, standing in for native `disabled`).
-                if (!newSessionInteraction.interactive) return;
                 newSession();
               }}
               disabled={newSessionInteraction.nativeDisabled}

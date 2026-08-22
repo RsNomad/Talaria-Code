@@ -33,6 +33,8 @@ interface RenderComposerProps {
   stopping?: boolean;
   onCancel?: () => void;
   onNewSession?: () => void;
+  /** WS-UX P2 M2: UX-04a in-flight flag, wired by App from `tab.newSessionPending`. */
+  newSessionPending?: boolean;
 }
 
 // T11: factored out of `renderComposer` so a rerender (a busy -> stopping
@@ -50,6 +52,7 @@ function composerElementForRender(props: RenderComposerProps) {
       preset="normal"
       modelLabel="test-model"
       busy={props.busy ?? false}
+      newSessionPending={props.newSessionPending ?? false}
       stopping={props.stopping ?? false}
       disabled={false}
       activeModeId={null}
@@ -1248,5 +1251,98 @@ describe('UX-11: "+ New Session" with a live turn asks first (ConfirmStrip)', ()
 
     expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
     expect(onNewSession).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * WS-UX P2 M2 (wave-review cross-task Minor, T11 × T28): in the
+ * `busy && newSessionPending` window (confirm consumed, request in flight,
+ * live turn not yet ended by the host's `tab.clear`), the Task-11 `busy`
+ * confirm gate used to run BEFORE the UX-04a `!interactive` in-flight guard —
+ * so a second click re-opened the ConfirmStrip and a second confirm
+ * re-dispatched `tab.newSession`. busyInteraction's click-guard stands in for
+ * native `disabled`'s click-blocking (busyInteraction.ts) — native disabled
+ * would have suppressed the WHOLE click, confirm-open included — so the
+ * in-flight guard must run FIRST. A click while "Starting a new session…" is
+ * already in flight means nothing: it is already starting.
+ */
+describe('WS-UX P2 M2: the in-flight New Session guard wins over the busy confirm gate', () => {
+  it('busy && newSessionPending: a click does nothing — no confirm strip, no dispatch (busy-focusable posture intact)', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      newSessionPending: true,
+      onNewSession,
+    });
+
+    const button = screen.getByRole('button', { name: 'New Session' });
+    // UX-04a posture untouched by the reorder: in-flight is BUSY, never
+    // natively disabled (the control stays focusable — busyInteraction.ts).
+    expect(button).not.toBeDisabled();
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+    expect(button).toHaveAttribute('aria-busy', 'true');
+
+    await user.click(button);
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
+    expect(onNewSession).not.toHaveBeenCalled();
+  });
+
+  it('the race window end-to-end: after one confirm, a re-click cannot re-open the confirm and double-dispatch', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      onNewSession,
+    };
+    const { rerender } = renderComposer(baseProps);
+
+    // T11's normal live-turn flow, unchanged: ask, confirm once.
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+    await user.click(screen.getByRole('button', { name: 'New session anyway' }));
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+
+    // App's reaction lands (`local.newSessionPending`), but the live turn has
+    // not ended yet — the host's `tab.clear` is still a message-hop away.
+    // This is the exact busy && newSessionPending window.
+    rerender(composerElementForRender({ ...baseProps, newSessionPending: true }));
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    // Before the fix: the strip re-opened here, and a second "New session
+    // anyway" would have made this 2 — the latent double-dispatch.
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('not busy && newSessionPending: a click still does nothing (the pre-existing UX-04a click-guard, unchanged by the reorder)', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: false,
+      newSessionPending: true,
+      onNewSession,
+    });
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(onNewSession).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 });
