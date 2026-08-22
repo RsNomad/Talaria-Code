@@ -4699,6 +4699,161 @@ describe('WS-R4 F3-7 — failed load unwinds the pre-adopted identity (identity-
   });
 });
 
+/**
+ * F3-7-S (WS-R4 F3-7 sibling closure — Phase-1 close-out
+ * `docs_claude/lens-dorabotok/PHASE1-CLOSEOUT-DECISION.md` §1.4): the switch's
+ * failure kinds (the describe block right above) unwind the pre-load identity
+ * adoption (:1769) on their own failure exit — but `loadSessionIntoTabInternal`
+ * has TWO SIBLING failure exits that sit BEFORE the switch and used to skip
+ * that unwind entirely: the TI-5 no-client short-circuit and the settleRace
+ * wall-clock timeout. Neither branch's identity-guarded `sessions.close()`
+ * resets `activeSessionId`/`cwd` (the only `setActiveSessionId(undefined)` in
+ * the codebase is `ConnectionSupervisor.teardownSession()`, which neither
+ * branch reaches) — so pre-fix both branches leave a FAILED load's identity
+ * dangling on the dead session id, exactly the bug class F3-7 killed for the
+ * switch arms.
+ */
+describe('F3-7-S — sibling identity-unwind (TI-5 short-circuit + settleRace timeout)', () => {
+  type IdentitySeam = { activeSessionId: string | undefined; cwd: string | undefined };
+
+  describe('TI-5 no-client short-circuit', () => {
+    it('into the ACTIVE tab: activeSessionId cleared (not restored), cwd restored — not left dangling on the dead session', async () => {
+      const { backend } = makeStartableBackend();
+      await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID, client alive
+      const seam = backend as unknown as IdentitySeam;
+      const priorCwd = seam.cwd;
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      const supervisor = (backend as unknown as { connectionSupervisor: { getClient(): unknown } })
+        .connectionSupervisor;
+      const originalGetClient = supervisor.getClient.bind(supervisor);
+      let calls = 0;
+      supervisor.getClient = () => {
+        calls += 1;
+        return calls === 1 ? originalGetClient() : undefined;
+      };
+
+      // Loading into BOOTSTRAP_TAB_ID (session-1's own tab) makes the :1769
+      // pre-load adoption fire (`activeSessionId === currentOccupant.sessionId`)
+      // before the client-disappears short-circuit below it takes over.
+      const result = await backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+
+      expect(result).toBeUndefined();
+      expect(messages).toContainEqual({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        kind: 'session-lost',
+        message: expect.any(String),
+      });
+      expect(hasController(backend, 'history-session')).toBe(false);
+      expect(calls).toBeGreaterThanOrEqual(2); // entry-check + this branch's own check both ran
+      // RED (pre-fix): this short-circuit never unwinds — activeSessionId
+      // stays 'history-session' (a closed, disposed, unregistered session)
+      // and cwd stays the failed load's adoptedCwd, forever (until a LATER
+      // unrelated op happens to overwrite it).
+      expect(seam.activeSessionId).toBeUndefined();
+      expect(seam.cwd).toBe(priorCwd);
+    });
+
+    it('into a NON-active tab: guard misses, identity untouched (true negative)', async () => {
+      const { backend, clients } = makeStartableBackend();
+      await backend.start();
+      const boot = must(clients[0]);
+      boot.queueSessionId('session-2');
+      await backend.openTab('tab-2'); // active flips to session-2
+      const seam = backend as unknown as IdentitySeam;
+      const activeBefore = seam.activeSessionId;
+      const cwdBefore = seam.cwd;
+
+      const supervisor = (backend as unknown as { connectionSupervisor: { getClient(): unknown } })
+        .connectionSupervisor;
+      const originalGetClient = supervisor.getClient.bind(supervisor);
+      let calls = 0;
+      supervisor.getClient = () => {
+        calls += 1;
+        return calls === 1 ? originalGetClient() : undefined;
+      };
+
+      // tab-3 has no occupant and session-2 (not undefined) is active — the
+      // :1769 adoption condition is false, so nothing was ever adopted for
+      // this failed load to unwind.
+      await backend.loadTab('tab-3', 'session-ghost', '/fake/ws');
+      expect(calls).toBeGreaterThanOrEqual(2);
+      expect(seam.activeSessionId).toBe(activeBefore);
+      expect(seam.cwd).toBe(cwdBefore);
+    });
+  });
+
+  describe('settleRace wall-clock timeout', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('a hung-but-alive load into the ACTIVE tab times out and unwinds activeSessionId/cwd — not left dangling permanently', async () => {
+      const { backend, clients } = makeStartableBackend();
+      await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID
+      const seam = backend as unknown as IdentitySeam;
+      const priorCwd = seam.cwd;
+      must(clients[0]).hangLoadSession();
+
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      // Loading into BOOTSTRAP_TAB_ID makes the :1769 pre-load adoption fire
+      // before the deadline below it expires.
+      const loadPromise = backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+      const settlement = trackSettlement(loadPromise);
+      await flushMicrotasks();
+      expect(settlement.settled()).toBe(false); // still hanging — the child never exits
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(settlement.settled()).toBe(true);
+      await loadPromise;
+
+      expect(messages).toContainEqual({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        kind: 'session-lost',
+        message: expect.any(String),
+      });
+      expect(hasController(backend, 'history-session')).toBe(false);
+      // RED (pre-fix): the timeout branch never unwinds — activeSessionId
+      // stays 'history-session' PERMANENTLY: no downstream path resets it
+      // (the designed session-lost -> History recovery flow can never
+      // re-adopt, since the :1769 guard needs activeSessionId === undefined
+      // or === the target tab's occupant, and after the dangle neither holds).
+      expect(seam.activeSessionId).toBeUndefined();
+      expect(seam.cwd).toBe(priorCwd);
+    });
+
+    it('a hung-but-alive load into a NON-active tab times out with identity untouched (true negative)', async () => {
+      const { backend, clients } = makeStartableBackend();
+      await backend.start();
+      const boot = must(clients[0]);
+      boot.queueSessionId('session-2');
+      await backend.openTab('tab-2'); // active flips to session-2
+      const seam = backend as unknown as IdentitySeam;
+      const activeBefore = seam.activeSessionId;
+      const cwdBefore = seam.cwd;
+      boot.hangLoadSession();
+
+      // tab-3 has no occupant and session-2 (not undefined) is active — the
+      // :1769 adoption condition is false, so nothing was ever adopted for
+      // this failed load to unwind.
+      const loadPromise = backend.loadTab('tab-3', 'session-ghost', '/fake/ws');
+      await vi.advanceTimersByTimeAsync(120_000);
+      await loadPromise;
+
+      expect(seam.activeSessionId).toBe(activeBefore);
+      expect(seam.cwd).toBe(cwdBefore);
+    });
+  });
+});
+
 describe('beta.7 B1: loadTab threads the History title into tab.bound', () => {
   it('a titled load emits tab.bound carrying that title', async () => {
     const { backend, clients } = makeStartableBackend();
