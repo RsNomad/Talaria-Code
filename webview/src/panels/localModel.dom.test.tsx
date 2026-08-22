@@ -254,6 +254,73 @@ describe('LocalModelBlock — in-flight pull a11y (A11Y-05)', () => {
   });
 });
 
+/**
+ * UX-09: the window between dispatching a Pull and the FIRST `setup.progress`
+ * push for it had no feedback and no way to cancel — the ActionButton's own
+ * "Working…" pending label is the only signal, and it vanishes the instant
+ * the dispatch promise settles even if no progress entry has shown up yet.
+ * `dispatching` (local `useState`) covers exactly that window; the render
+ * guard (`dispatching && live === undefined`) keeps it mutually exclusive
+ * with the CC-9 in-flight block above (which takes over the instant `live`
+ * appears).
+ */
+describe('LocalModelBlock — Ollama pre-progress Working line (UX-09)', () => {
+  it('clicking Pull with no progress entry yet shows the Working line + an early Cancel button', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }) })} />);
+
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it('the early Cancel dispatches setup.cancel {op:"pull", id:<catalogId>} — same as the in-flight Cancel', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }) })} />);
+
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(dispatch).toHaveBeenCalledWith('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' });
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it('once a progress entry arrives, the Working line yields to the ordinary in-flight block — exactly ONE Cancel button', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user, rerender } = setup(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }) })} />);
+
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+
+    const inFlightProgress = {
+      'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 1000, completedBytes: 400 },
+    };
+    rerender(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress })} />);
+
+    expect(screen.queryByText('Working — waiting for the backend to report progress…')).not.toBeInTheDocument();
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '40');
+    expect(screen.getAllByRole('button', { name: 'Cancel' })).toHaveLength(1);
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+});
+
 /* ------------------------------------------------------------------ *
  * §4.1 — llama.cpp backend
  * ------------------------------------------------------------------ */
@@ -450,6 +517,24 @@ describe('LocalModelBlock — llama.cpp in-flight download (CC-9)', () => {
     const { user, dispatch } = renderBlock({ backend: 'llamacpp', progress: inFlightProgress });
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(dispatch).toHaveBeenCalledWith('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' });
+  });
+});
+
+describe('LocalModelBlock — llama.cpp pre-progress Working line (UX-09)', () => {
+  it('clicking Download with no progress entry yet shows the Working line + an early Cancel button', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(<LocalModelBlock {...baseProps({ dispatch, backend: 'llamacpp' })} />);
+
+    await user.click(screen.getByRole('button', { name: /Download Qwen2\.5-Coder/ }));
+
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
   });
 });
 

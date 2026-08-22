@@ -340,6 +340,13 @@ function ModelRow({
 }) {
   const live = progress[progressKey('pull', model.id)];
   const percent = pullPercent(live?.totalBytes, live?.completedBytes);
+  // UX-09: covers the window between dispatching the pull/download and the
+  // FIRST `setup.progress` push for it — before `live` exists there is
+  // otherwise no feedback and no way to cancel. Set true right before the
+  // dispatch, false when it settles; the render guard below
+  // (`dispatching && live === undefined`) keeps this mutually exclusive with
+  // the `inFlight` block, which takes over the instant `live` appears.
+  const [dispatching, setDispatching] = useState(false);
 
   let presenceText: string | undefined;
   let isPresent = false;
@@ -400,6 +407,17 @@ function ModelRow({
   }
   // vllm: no presence/action at all — the run command IS the row's content.
 
+  if (action) {
+    const rawOnRun = action.onRun;
+    action = {
+      ...action,
+      onRun: () => {
+        setDispatching(true);
+        return rawOnRun().finally(() => setDispatching(false));
+      },
+    };
+  }
+
   const inFlight = live !== undefined && !isPresent && backend !== 'vllm';
   const runCommand = backend === 'llamacpp' && isPresent ? model.llamacpp?.runCommand : backend === 'vllm' ? model.vllm?.runCommand : undefined;
 
@@ -444,6 +462,15 @@ function ModelRow({
           <RunCommandLine command={runCommand} label={backend === 'llamacpp' ? 'Start the server:' : 'Run:'} />
           {runCommandCaption && <p className="text-2xs text-faint">{runCommandCaption}</p>}
         </>
+      )}
+
+      {dispatching && live === undefined && (
+        <div className="flex flex-col gap-1">
+          <StatusLine icon="sync" text="Working — waiting for the backend to report progress…" tone="neutral" />
+          <div>
+            <ActionButton label={CANCEL_LABEL} icon="close" onRun={() => dispatch('setup.cancel', cancelPullParams(model.id))} />
+          </div>
+        </div>
       )}
 
       {inFlight && (

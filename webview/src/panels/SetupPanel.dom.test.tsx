@@ -492,6 +492,105 @@ describe('FIM card — pull progress renders a percent (§6)', () => {
   });
 });
 
+/**
+ * UX-09: the window between dispatching the CC-8 configured-model Pull and
+ * the FIRST `setup.progress` push for it had no feedback and no way to
+ * cancel — `ConfiguredModelRow`'s local `dispatching` state covers exactly
+ * that window, mutually exclusive with the `inFlight` block above (which
+ * takes over the instant `live` appears).
+ */
+describe('FIM card — CC-8 configured-model row: pre-progress Working line (UX-09)', () => {
+  function configuredModelData() {
+    return baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      // Empty daemon list ⇒ the configured model is honestly 'not present',
+      // so the row shows its Pull affordance.
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
+    });
+  }
+
+  it('clicking Pull with no progress entry yet shows the Working line + an early Cancel button', async () => {
+    const data = configuredModelData();
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull qwen2.5-coder:1.5b-base' }));
+
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it('the early Cancel dispatches setup.cancel {op:"pull", id:<model>} — TAG-keyed, same as the in-flight Cancel', async () => {
+    const data = configuredModelData();
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull qwen2.5-coder:1.5b-base' }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(dispatch).toHaveBeenCalledWith('setup.cancel', { op: 'pull', id: 'qwen2.5-coder:1.5b-base' });
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it('once a progress entry arrives, the Working line yields to the ordinary in-flight block — exactly ONE Cancel button', async () => {
+    const data = configuredModelData();
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const mk = (progress: SetupProgressMap) => (
+      <SetupPanel
+        data={{ status: 'success', data }}
+        onRetry={noopRetry}
+        progress={progress}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />
+    );
+
+    const { user, rerender } = setup(mk({}));
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull qwen2.5-coder:1.5b-base' }));
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+
+    const withEntry: SetupProgressMap = {
+      [progressKey('pull', 'qwen2.5-coder:1.5b-base')]: {
+        op: 'pull',
+        id: 'qwen2.5-coder:1.5b-base',
+        logTail: [],
+        totalBytes: 1000,
+        completedBytes: 250,
+      },
+    };
+    rerender(mk(withEntry));
+
+    expect(screen.queryByText('Working — waiting for the backend to report progress…')).not.toBeInTheDocument();
+    expect(screen.getByText('25%')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Cancel' })).toHaveLength(1);
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+});
+
 describe('FIM card — pull progress a11y: PullAnnouncer replaces the row aria-live (A11Y-05)', () => {
   function fimInstallData(progressPercent: { totalBytes: number; completedBytes: number }) {
     const data = baseData({

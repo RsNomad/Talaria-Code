@@ -1605,6 +1605,20 @@ function ConfiguredModelRow({
   const live = progress[progressKey('pull', model)];
   const percent = pullPercent(live?.totalBytes, live?.completedBytes);
   const inFlight = live !== undefined && !present;
+  // UX-09: covers the window between dispatching the pull and the FIRST
+  // `setup.progress` push for it — before `live` exists there is otherwise
+  // no feedback and no way to cancel. Set true right before the dispatch,
+  // false when it settles; the render guard below (`dispatching && live ===
+  // undefined`) keeps this mutually exclusive with the `inFlight` block,
+  // which takes over the instant `live` appears.
+  const [dispatching, setDispatching] = useState(false);
+  const pullOnRun = onPullSuccess
+    ? () =>
+        dispatch('setup.pullModel', { model, endpoint }).then((result) => {
+          if (result !== DECLINED) onPullSuccess();
+          return result;
+        })
+    : () => dispatch('setup.pullModel', { model, endpoint });
 
   return (
     <div className="flex flex-col gap-1 rounded border border-border bg-overlay px-2 py-1.5">
@@ -1622,18 +1636,21 @@ function ConfiguredModelRow({
           <ActionButton
             label={`Pull ${model}`}
             icon="cloud-download"
-            onRun={
-              onPullSuccess
-                ? () =>
-                    dispatch('setup.pullModel', { model, endpoint }).then((result) => {
-                      if (result !== DECLINED) onPullSuccess();
-                      return result;
-                    })
-                : () => dispatch('setup.pullModel', { model, endpoint })
-            }
+            onRun={() => {
+              setDispatching(true);
+              return pullOnRun().finally(() => setDispatching(false));
+            }}
             disabledReason={disabledReason}
             successLabel={pullSuccessLabel}
           />
+        </div>
+      )}
+      {dispatching && live === undefined && (
+        <div className="flex flex-col gap-1">
+          <StatusLine icon="sync" text="Working — waiting for the backend to report progress…" tone="neutral" />
+          <div>
+            <ActionButton label={CANCEL_LABEL} icon="close" onRun={() => dispatch('setup.cancel', cancelPullParams(model))} />
+          </div>
         </div>
       )}
       {inFlight && (
