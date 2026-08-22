@@ -42,10 +42,11 @@
  * that is an owner/harness item, documented here rather than silently
  * ignored.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ApprovalItem } from '../../types';
 import type { ApprovalOption } from '../../protocol';
 import { Icon } from '../Icon';
+import { useFocusAnchorOnUnmount } from '../../hooks/useFocusAnchorOnUnmount';
 import type { ReactNode } from 'react';
 
 interface ApprovalCardProps {
@@ -118,10 +119,12 @@ function LiveRow({
   options,
   timeoutMs,
   onRespond,
+  onActivate,
 }: {
   options: ApprovalOption[];
   timeoutMs: number | undefined;
   onRespond: (optionId: string) => void;
+  onActivate?: (el: HTMLElement) => void;
 }) {
   return (
     <>
@@ -132,7 +135,10 @@ function LiveRow({
             <button
               key={opt.id}
               type="button"
-              onClick={() => onRespond(opt.id)}
+              onClick={(e) => {
+                onActivate?.(e.currentTarget);
+                onRespond(opt.id);
+              }}
               className={`rounded border px-2.5 py-1 text-2xs font-semibold ${
                 emp === 'primary'
                   ? 'border-accent bg-accent text-accent-fg hover:opacity-90'
@@ -158,6 +164,12 @@ function LiveRow({
 export function ApprovalCard({ item, onRespond }: ApprovalCardProps) {
   const [expiredLocal, setExpiredLocal] = useState(false);
   const isLive = item.settledOutcome === undefined && item.resolvedOptionId === undefined;
+  // A11Y-01 (WCAG 2.4.3): when the clicked option button unmounts because the
+  // card just settled, focus would otherwise silently drop to <body> — move
+  // it to this card instead. `tabIndex={-1}` makes the div programmatically
+  // focusable without adding it to the normal Tab order.
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const armFocusAnchor = useFocusAnchorOnUnmount(cardRef);
 
   // T-A2 (V-6): a one-shot, display-only local deadline. Armed ONLY while
   // the card is genuinely live and a timeout is known; cleared on unmount
@@ -196,11 +208,22 @@ export function ApprovalCard({ item, onRespond }: ApprovalCardProps) {
     body = <TerminalRow text={expiredCopy(item.timeoutMs)} icon="warning" tone="text-warn" />;
   } else {
     // ⑤ genuinely live.
-    body = <LiveRow options={item.options} timeoutMs={item.timeoutMs} onRespond={onRespond} />;
+    body = (
+      <LiveRow
+        options={item.options}
+        timeoutMs={item.timeoutMs}
+        onRespond={onRespond}
+        onActivate={armFocusAnchor}
+      />
+    );
   }
 
   return (
-    <div className="flex flex-col gap-2 rounded-card border border-warn bg-warn-soft px-3 py-2.5">
+    <div
+      ref={cardRef}
+      tabIndex={-1}
+      className="flex flex-col gap-2 rounded-card border border-warn bg-warn-soft px-3 py-2.5"
+    >
       <div className="flex items-start gap-2 text-[12.5px] text-fg">
         <Icon name="shield" size={15} className="mt-0.5 flex-none text-warn" />
         <div className="min-w-0">
