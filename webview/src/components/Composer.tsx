@@ -87,6 +87,9 @@ interface ComposerProps {
   preset: EditPolicyPreset;
   modelLabel: string;
   busy: boolean;
+  /** UX-03: Stop dispatched, terminal not yet arrived — renders the disabled
+   * "Stopping" affordance + the SR announcement. App wires `tab.stopPending`. */
+  stopping: boolean;
   /**
    * W4 §2e: the per-tab composer latch — the multi-tab generalization of the
    * old `backendStarted` latch. Disabled (textarea + send both inert) until
@@ -297,6 +300,7 @@ export function Composer({
   preset,
   modelLabel,
   busy,
+  stopping,
   disabled = false,
   disabledPlaceholder,
   activeModeId = null,
@@ -1104,6 +1108,12 @@ export function Composer({
           )}
         </div>
 
+        {/* UX-03: stop-lifecycle announcement — permanently-mounted LiveRegion
+          * (Finding-7 discipline, same as the attachNotice region above): the
+          * region always exists, only the text swaps. sr-only: sighted users
+          * already see the disabled "Stopping" button state. */}
+        <LiveRegion text={stopping ? 'Stopping — waiting for the agent to confirm…' : ''} className="sr-only" />
+
         {/* toolbar */}
         <div className="mt-2 flex items-center gap-1.5">
           <AttachMenu
@@ -1296,9 +1306,10 @@ export function Composer({
               <button
                 type="button"
                 onClick={onCancel}
-                title="Stop"
-                aria-label="Stop"
-                className="flex h-7 w-7 flex-none items-center justify-center rounded-lg border border-del text-del transition-colors hover:bg-del-soft"
+                disabled={stopping}
+                title={stopping ? 'Stopping' : 'Stop'}
+                aria-label={stopping ? 'Stopping' : 'Stop'}
+                className="flex h-7 w-7 flex-none items-center justify-center rounded-lg border border-del text-del transition-colors hover:bg-del-soft disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Icon name="debug-stop" size={14} />
               </button>

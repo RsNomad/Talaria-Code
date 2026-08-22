@@ -29,6 +29,8 @@ function renderComposer(props: {
   pendingSeed: ComposerSeed | null;
   onDraftChange: (text: string) => void;
   onSeedApplied: (seed: ComposerSeed) => void;
+  busy?: boolean;
+  stopping?: boolean;
 }) {
   return render(
     <Composer
@@ -40,7 +42,8 @@ function renderComposer(props: {
       onAttachRemove={() => undefined}
       preset="normal"
       modelLabel="test-model"
-      busy={false}
+      busy={props.busy ?? false}
+      stopping={props.stopping ?? false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}
@@ -158,6 +161,7 @@ function renderComposerForAttachments(onAttachAdd: (a: Attachment) => void) {
       preset="normal"
       modelLabel="test-model"
       busy={false}
+      stopping={false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}
@@ -187,16 +191,30 @@ function getGenericFileInput(container: HTMLElement): HTMLInputElement {
   return input;
 }
 
+/** UX-03 grew a SECOND permanently-mounted `role="status"` region (the
+ * stop-lifecycle announcer, alongside this existing attachment / "still
+ * running" notice) — so `getByRole('status')` is no longer unambiguous
+ * anywhere in this file. This selects the attachment-notice region
+ * specifically, by its stable production class (`text-del`), rather than by
+ * role alone. */
+function attachNoticeRegion(root: ParentNode = document.body): HTMLElement {
+  const region = root.querySelector('[role="status"].text-del');
+  if (!(region instanceof HTMLElement)) {
+    throw new Error('attach notice live region not found');
+  }
+  return region;
+}
+
 describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region notice', () => {
   it('the notice region is mounted (empty) from the start — Finding-7 discipline', () => {
-    const { getByRole } = renderComposerForAttachments(() => undefined);
+    const { container } = renderComposerForAttachments(() => undefined);
 
-    expect(getByRole('status')).toHaveTextContent('');
+    expect(attachNoticeRegion(container)).toHaveTextContent('');
   });
 
   it('an oversized file is skipped AND the notice names it (was console.warn-only)', () => {
     const added: Attachment[] = [];
-    const { container, getByRole } = renderComposerForAttachments((a) => added.push(a));
+    const { container } = renderComposerForAttachments((a) => added.push(a));
 
     // Composer.tsx: MAX_FILE_BYTES (generic-file cap) is 512 * 1024.
     const oversizedBytes = 512 * 1024 + 1;
@@ -204,7 +222,7 @@ describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region no
 
     fireEvent.change(getGenericFileInput(container), { target: { files: [bigFile] } });
 
-    expect(getByRole('status')).toHaveTextContent(/huge\.txt/);
+    expect(attachNoticeRegion(container)).toHaveTextContent(/huge\.txt/);
     expect(added).toEqual([]);
   });
 
@@ -226,12 +244,12 @@ describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region no
     globalThis.FileReader = FailingFileReader as unknown as typeof FileReader;
 
     try {
-      const { container, getByRole } = renderComposerForAttachments((a) => added.push(a));
+      const { container } = renderComposerForAttachments((a) => added.push(a));
       const smallFile = new File(['hello'], 'notes.txt', { type: 'text/plain' });
 
       fireEvent.change(getGenericFileInput(container), { target: { files: [smallFile] } });
 
-      await waitFor(() => expect(getByRole('status')).toHaveTextContent(/notes\.txt/));
+      await waitFor(() => expect(attachNoticeRegion(container)).toHaveTextContent(/notes\.txt/));
       expect(added).toEqual([]);
     } finally {
       globalThis.FileReader = originalFileReader;
@@ -244,27 +262,27 @@ describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region no
     const bigFile = new File([new Uint8Array(oversizedBytes)], 'huge.txt', { type: 'text/plain' });
 
     fireEvent.change(getGenericFileInput(container), { target: { files: [bigFile] } });
-    expect(getByRole('status')).toHaveTextContent(/huge\.txt/);
+    expect(attachNoticeRegion(container)).toHaveTextContent(/huge\.txt/);
 
     fireEvent.click(getByRole('button', { name: 'Dismiss attachment notice' }));
 
     // The region stays mounted (Finding-7) — only its text clears.
-    expect(getByRole('status')).toHaveTextContent('');
+    expect(attachNoticeRegion(container)).toHaveTextContent('');
     expect(queryByRole('button', { name: 'Dismiss attachment notice' })).not.toBeInTheDocument();
   });
 
   it('a subsequent successful attach clears a stale oversize notice', () => {
     const added: Attachment[] = [];
-    const { container, getByRole } = renderComposerForAttachments((a) => added.push(a));
+    const { container } = renderComposerForAttachments((a) => added.push(a));
     const oversizedBytes = 512 * 1024 + 1;
     const bigFile = new File([new Uint8Array(oversizedBytes)], 'huge.txt', { type: 'text/plain' });
     fireEvent.change(getGenericFileInput(container), { target: { files: [bigFile] } });
-    expect(getByRole('status')).toHaveTextContent(/huge\.txt/);
+    expect(attachNoticeRegion(container)).toHaveTextContent(/huge\.txt/);
 
     const okFile = new File(['ok'], 'small.txt', { type: 'text/plain' });
     fireEvent.change(getGenericFileInput(container), { target: { files: [okFile] } });
 
-    expect(getByRole('status')).toHaveTextContent('');
+    expect(attachNoticeRegion(container)).toHaveTextContent('');
   });
 });
 
@@ -300,6 +318,7 @@ function renderComposerChips(overrides: {
       preset={overrides.preset ?? 'normal'}
       modelLabel={overrides.modelLabel ?? 'test-model'}
       busy={false}
+      stopping={false}
       disabled={false}
       activeModeId={overrides.activeModeId ?? null}
       availableModes={overrides.availableModes ?? []}
@@ -368,6 +387,7 @@ describe('B5: state-bearing chips carry a dynamic aria-label (title alone is unr
         preset="normal"
         modelLabel="claude-sonnet"
         busy={false}
+        stopping={false}
         disabled={false}
         activeModeId={null}
         availableModes={[]}
@@ -432,6 +452,7 @@ function renderComposerForIME(overrides: {
         preset="normal"
         modelLabel="test-model"
         busy={false}
+        stopping={false}
         disabled={false}
         activeModeId={null}
         availableModes={[]}
@@ -492,6 +513,7 @@ function renderComposerBusy(overrides: {
         preset="normal"
         modelLabel="test-model"
         busy={true}
+        stopping={false}
         disabled={false}
         activeModeId={null}
         availableModes={[]}
@@ -530,7 +552,7 @@ describe('UI#9-honesty: a mid-turn submit never silently vanishes', () => {
     expect(screen.getByText('notes.txt')).toBeInTheDocument();
     // An honest, visible affordance — not a silent no-op — via the EXISTING
     // composer status LiveRegion (role="status").
-    expect(screen.getByRole('status')).toHaveTextContent(/turn.*running|still running/i);
+    expect(attachNoticeRegion()).toHaveTextContent(/turn.*running|still running/i);
   });
 
   it('clicking the (disabled) Send button while a turn is live is inert — Stop is rendered instead, so Send is not even present', () => {
@@ -564,6 +586,7 @@ function composerElement(props: { tabId: string; busy: boolean; draft: string })
       preset="normal"
       modelLabel="test-model"
       busy={props.busy}
+      stopping={false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}
@@ -593,14 +616,14 @@ describe('UI#9 review: the "still running" status notice cannot survive a tab sw
     fireEvent.keyDown(textarea, { key: 'Enter' });
 
     // Sanity: the busy-branch notice fired on tab A.
-    expect(screen.getByRole('status')).toHaveTextContent(/still running/i);
+    expect(attachNoticeRegion()).toHaveTextContent(/still running/i);
 
     // Simulate switching to a DIFFERENT, IDLE tab: same mounted Composer
     // instance (it is not keyed by tabId), new tabId, busy now false.
     rerender(composerElement({ tabId: 'tab-B', busy: false, draft: '' }));
 
     // The stale notice must NOT survive onto tab B — tab B has no live turn.
-    expect(screen.getByRole('status')).toBeEmptyDOMElement();
+    expect(attachNoticeRegion()).toBeEmptyDOMElement();
   });
 });
 
@@ -696,6 +719,7 @@ function renderComposerForAccessibleName(
       preset="normal"
       modelLabel="test-model"
       busy={false}
+      stopping={false}
       disabled={overrides.disabled ?? false}
       disabledPlaceholder={overrides.disabledPlaceholder}
       activeModeId={null}
@@ -920,6 +944,7 @@ function renderComposerForResize(onHeightChange: (height: number) => void = () =
       preset="normal"
       modelLabel="test-model"
       busy={false}
+      stopping={false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}
@@ -989,5 +1014,30 @@ describe('T5 (§7.2.3): Composer drag-resize window-listener leak on unmount', (
 
     expect(onHeightChange).toHaveBeenCalledTimes(1);
     expect(document.body.style.userSelect).toBe('');
+  });
+});
+
+describe('UX-03: Stop -> Stopping… lifecycle (role/name/value)', () => {
+  it('busy + not stopping: an enabled button named "Stop"; no stopping announcement anywhere', () => {
+    renderComposer({ tabId: 'tab-1', draft: '', pendingSeed: null, onDraftChange: () => undefined, onSeedApplied: () => undefined, busy: true });
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled();
+    const announced = screen.getAllByRole('status').some((el) => (el.textContent ?? '').includes('Stopping'));
+    expect(announced).toBe(false);
+  });
+
+  it('stopping: the button is disabled, renamed "Stopping", and a permanently-mounted status region announces it', () => {
+    renderComposer({ tabId: 'tab-1', draft: '', pendingSeed: null, onDraftChange: () => undefined, onSeedApplied: () => undefined, busy: true, stopping: true });
+    const button = screen.getByRole('button', { name: 'Stopping' });
+    expect(button).toBeDisabled();
+    const region = screen
+      .getAllByRole('status')
+      .find((el) => (el.textContent ?? '').includes('Stopping — waiting for the agent to confirm'));
+    expect(region).toBeDefined();
+  });
+
+  it('the stop live region exists (empty) even while idle — Finding-7: the region never mounts together with its content', () => {
+    renderComposer({ tabId: 'tab-1', draft: '', pendingSeed: null, onDraftChange: () => undefined, onSeedApplied: () => undefined });
+    // attachNotice region + stop region are both permanently mounted:
+    expect(screen.getAllByRole('status').length).toBeGreaterThanOrEqual(2);
   });
 });

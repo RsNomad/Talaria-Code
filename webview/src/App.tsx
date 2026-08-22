@@ -936,6 +936,7 @@ export function App() {
             preset={tab.preset}
             modelLabel={modelLabel(state)}
             busy={tab.turnActive}
+            stopping={tab.stopPending}
             disabled={tab.binding !== 'bound'}
             // ARCH-1 (final review, UI I-3): honest copy for a lost session —
             // "Connecting…" (the default) would be a lie here; nothing is
@@ -951,7 +952,12 @@ export function App() {
             initialHeight={composerHeight}
             onHeightChange={setComposerHeight}
             onSubmit={hostActions.sendDraft}
-            onCancel={() => bridge.post({ type: 'cancel', sessionId: tab.sessionId ?? UNBOUND_SESSION_PLACEHOLDER })}
+            onCancel={() => {
+              // UX-03: mark the pending stop FIRST (pure local fold), then post
+              // the cancel — turn.end (any status) is the single clearer.
+              dispatch({ local: { type: 'local.stopPending', tabId: tab.tabId } });
+              bridge.post({ type: 'cancel', sessionId: tab.sessionId ?? UNBOUND_SESSION_PLACEHOLDER });
+            }}
             onSetPreset={hostActions.setPreset}
             onPickModel={() => selectPanel('models')}
             onNewSession={newSession}

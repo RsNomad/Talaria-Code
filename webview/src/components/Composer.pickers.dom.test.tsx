@@ -45,6 +45,7 @@ function renderComposer(overrides: {
       preset={overrides.preset ?? 'normal'}
       modelLabel="test-model"
       busy={false}
+      stopping={false}
       disabled={false}
       activeModeId={overrides.activeModeId ?? null}
       availableModes={overrides.availableModes ?? MODES}
