@@ -260,6 +260,114 @@ describe('B2 item 4: tabs carry aria-controls + a stable id for the shared chat 
  * tab omits `aria-controls` entirely while it's false, rather than pointing
  * at a target that doesn't exist.
  */
+/*
+ * UX-10: closing a tab whose turn is still live must ask first — reuses the
+ * shared `ConfirmStrip` alertdialog (A11Y-07/ConfirmStrip.tsx) rather than
+ * calling `onClose` immediately. Idle tabs (the existing characterization
+ * above, all built via `makeTabState` → `turnActive: false`) are UNCHANGED:
+ * × still closes them immediately. The strip renders as a SIBLING of the
+ * `role="tablist"` div (a strip inside a tablist would be invalid tablist
+ * content), so it is found by its own `alertdialog` role, not scoped inside
+ * `getAllByRole('tab')`.
+ */
+describe('UX-10: close-tab with a live turn asks first (ConfirmStrip gate)', () => {
+  function liveTab(tabId: string, title: string) {
+    return { ...makeTabState(tabId, title), turnActive: true };
+  }
+
+  it('closing a tab whose turn is live does NOT call onClose and opens a Confirm close tab alertdialog', () => {
+    const onClose = vi.fn();
+    render(
+      <TabStrip
+        tabs={[liveTab('t1', 'Alpha'), makeTabState('t2', 'Bravo')]}
+        activeTabId="t1"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={onClose}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={true}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close Alpha' }));
+
+    expect(onClose).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('alertdialog', { name: 'Confirm close tab' });
+    expect(dialog).toHaveTextContent('Closing this tab will cancel the turn still running in it.');
+  });
+
+  it('"Close anyway" calls onClose(tabId) exactly once', () => {
+    const onClose = vi.fn();
+    render(
+      <TabStrip
+        tabs={[liveTab('t1', 'Alpha'), makeTabState('t2', 'Bravo')]}
+        activeTabId="t1"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={onClose}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={true}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close Alpha' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close anyway' }));
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledWith('t1');
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('characterization: × on an idle tab still closes immediately (unchanged path, no confirm)', () => {
+    const onClose = vi.fn();
+    render(
+      <TabStrip
+        tabs={THREE_TABS}
+        activeTabId="t1"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={onClose}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={true}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close Alpha' }));
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledWith('t1');
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('Escape cancels and returns focus to that tab\'s tab button (no onClose)', () => {
+    const onClose = vi.fn();
+    render(
+      <TabStrip
+        tabs={[liveTab('t1', 'Alpha'), makeTabState('t2', 'Bravo')]}
+        activeTabId="t1"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={onClose}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={true}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close Alpha' }));
+    const dialog = screen.getByRole('alertdialog', { name: 'Confirm close tab' });
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    const alphaTab = screen.getAllByRole('tab').find((t) => t.textContent?.includes('Alpha'))!;
+    expect(document.activeElement).toBe(alphaTab);
+  });
+});
+
 describe('W4-T6 (UI#14): aria-controls is a dangling IDREF when the chat panel is not the mounted target', () => {
   it('every tab OMITS aria-controls when chatPanelMounted is false (a side panel is active, no chat-tabpanel in the DOM)', () => {
     render(
