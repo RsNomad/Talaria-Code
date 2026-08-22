@@ -141,6 +141,23 @@ describe('ToolsPanel V-11 TOGGLE-HONESTY', () => {
  * `tools` collection stays untouched (2 toolsets x 1 tool each below still
  * yields exactly 2 listitems, never 4).
  */
+/**
+ * Task 22 (UX-01/UX-16): a standard empty state, reused from `PanelShell`'s
+ * `EmptyPanel` — the panel used to render silent blank space with zero
+ * toolsets. The AU-46 lesson (empty state must keep the shell): ToolsPanel
+ * has no add affordance of its own (toolsets are agent-reported, not
+ * user-authored here), so the assertion instead confirms the panel
+ * shell/title survives alongside the hint.
+ */
+describe('Task 22 (UX-01/UX-16): Tools panel empty state', () => {
+  it('renders the empty-state hint and keeps the panel shell/title when there are zero toolsets', () => {
+    setup(<ToolsPanel data={{ toolsets: [], tools: [] }} onToggle={async () => undefined} />);
+
+    expect(screen.getByText('No toolsets reported by the agent yet.')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Tools' })).toBeInTheDocument();
+  });
+});
+
 describe('WV4-MIN (Task 19, WCAG 1.3.1): the toolset collection carries explicit list/listitem semantics', () => {
   it('the top-level toolset collection exposes role="list" with one listitem per toolset (not per tool)', () => {
     const data: ToolsData = {

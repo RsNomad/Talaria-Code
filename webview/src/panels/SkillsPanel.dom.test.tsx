@@ -858,6 +858,32 @@ describe('WV4-MIN (Task 19, WCAG 1.3.1): the skills list carries explicit list/l
   });
 });
 
+/**
+ * Task 22 (UX-01/UX-16): a standard empty state, reused from `PanelShell`'s
+ * `EmptyPanel` — the panel used to render silent blank space with zero
+ * skills. The AU-46 lesson (empty state must keep the shell) plus this
+ * panel-specific twist: the empty state must never hide the way OUT of being
+ * empty — both the Create-skill and Install-from-hub disclosures stay
+ * rendered below it.
+ */
+describe('Task 22 (UX-01/UX-16): Skills panel empty state', () => {
+  it('renders the empty-state hint and keeps the Create-skill and Install-from-hub affordances when there are zero skills', () => {
+    render(
+      <SkillsPanel
+        data={{ skills: [], categories: [] }}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+      />,
+    );
+
+    expect(screen.getByText('No skills yet — create one below, or install from the hub.')).toBeInTheDocument();
+    // AU-46: the way OUT of empty must never be hidden by the empty state.
+    expect(screen.getByRole('button', { name: /Create skill/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Install from hub/i })).toBeInTheDocument();
+  });
+});
+
 describe('WV4-MIN a11y: SkillsPanel create-form field errors are keyed to their field', () => {
   it('submitting the create form with an empty Name marks the field aria-invalid and wires the error via aria-describedby', async () => {
     const user = userEvent.setup();

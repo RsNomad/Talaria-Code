@@ -492,6 +492,25 @@ describe('WV4-MIN (Task 19, WCAG 1.3.1): the server list carries explicit list/l
   });
 });
 
+/**
+ * Task 22 (UX-01/UX-16): a standard empty state, reused from `PanelShell`'s
+ * `EmptyPanel` — the panel used to render silent blank space with zero
+ * servers. The AU-46 lesson (empty state must keep the shell) plus this
+ * panel-specific twist: the empty state must never hide the way OUT of being
+ * empty — the Add-server disclosure stays rendered below it.
+ */
+describe('Task 22 (UX-01/UX-16): MCP panel empty state', () => {
+  it('renders the empty-state hint and keeps the Add-server affordance when there are zero servers', () => {
+    render(
+      <McpPanel data={{ servers: [] }} onReload={async () => ({ status: 'reloaded' })} {...noopMcpAdminProps()} />,
+    );
+
+    expect(screen.getByText('No MCP servers yet — add one below.')).toBeInTheDocument();
+    // AU-46: the way OUT of empty must never be hidden by the empty state.
+    expect(screen.getByRole('button', { name: /Add server/i })).toBeInTheDocument();
+  });
+});
+
 describe('WV4-MIN a11y: MCP add-server form field errors are keyed to their field', () => {
   it('submitting the add form with an empty Name marks the field aria-invalid and wires the error via aria-describedby', async () => {
     const user = userEvent.setup();

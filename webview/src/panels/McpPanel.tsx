@@ -28,7 +28,7 @@ import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill, type PillTone } from '../components/Pill';
 import { Toggle } from '../components/Toggle';
-import { PanelShell } from './PanelShell';
+import { EmptyPanel, PanelShell } from './PanelShell';
 import { useToggle } from './useToggle';
 
 /** Exported (UI-I1) so `McpPanel.test.ts` can exercise the total lookup
@@ -798,6 +798,12 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
           and CatalogDisclosure below (each rendering their own independent
           collections — the catalog's `entries.map` is a separate,
           out-of-scope list per the task brief) stay OUTSIDE this list. */}
+      {/* Task 22 (UX-01/UX-16): the standard empty state — this panel used to
+          render silent blank space with zero servers. Rendered BEFORE the
+          (empty) list, never as an early return: AddServerDisclosure and
+          CatalogDisclosure below still render in the zero-row case (AU-46 —
+          the empty state must never hide the way OUT of being empty). */}
+      {data.servers.length === 0 && <EmptyPanel hint="No MCP servers yet — add one below." />}
       <div role="list">
         {data.servers.map((srv) => {
           const s = totalLookup(STATUS, srv.status, UNKNOWN_MCP_STATUS);

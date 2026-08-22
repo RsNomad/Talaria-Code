@@ -23,7 +23,7 @@ import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill, type PillTone } from '../components/Pill';
 import { Toggle } from '../components/Toggle';
-import { PanelShell } from './PanelShell';
+import { EmptyPanel, PanelShell } from './PanelShell';
 import { useToggle } from './useToggle';
 
 interface SkillsPanelProps {
@@ -903,6 +903,15 @@ export function SkillsPanel({
       {/* Task 19 (WCAG 1.3.1, WV4-MIN): the skill-row collection was `div`
           soup — no `role="list"`/`role="listitem"` at all. CreateSkillDisclosure
           and InstallFromHubDisclosure below stay OUTSIDE this list. */}
+      {/* Task 22 (UX-01/UX-16): the standard empty state — this panel used to
+          render silent blank space with zero skills. Rendered BEFORE the
+          (empty) list, never as an early return: CreateSkillDisclosure and
+          InstallFromHubDisclosure below still render in the zero-row case
+          (AU-46 — the empty state must never hide the way OUT of being
+          empty). */}
+      {data.skills.length === 0 && (
+        <EmptyPanel hint="No skills yet — create one below, or install from the hub." />
+      )}
       <div role="list">
         {data.skills.map((sk) => {
           const err = lastError(sk.id);
