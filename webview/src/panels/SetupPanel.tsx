@@ -33,6 +33,7 @@ import type {
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
+import { scrollIntoViewRespectingMotion } from '../components/scrollIntoViewRespectingMotion';
 import { Toggle } from '../components/Toggle';
 import { DECLINED, errorMessage } from '../state/panels';
 import type { RemoteData } from '../state/remoteData';
@@ -191,7 +192,7 @@ function useExpandOnJump(
   useEffect(() => {
     if (pendingSeq === 0 || !isOpen) return;
     setPendingSeq(0);
-    toggleRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    scrollIntoViewRespectingMotion(toggleRef.current, { block: 'start' });
     toggleRef.current?.focus({ preventScroll: true });
   }, [pendingSeq, isOpen, toggleRef]);
 }
@@ -526,7 +527,7 @@ const RECS_METER_SEGMENT_CLASS: Record<'agent' | 'fim' | 'embedding', string> = 
  */
 function jumpToCard(cardId: string): void {
   const section = document.getElementById(cardId);
-  section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  scrollIntoViewRespectingMotion(section, { block: 'start' });
   document.getElementById(`${cardId}-heading`)?.focus({ preventScroll: true });
 }
 

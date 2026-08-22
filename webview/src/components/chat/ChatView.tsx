@@ -6,6 +6,7 @@ import { memo, useEffect, useRef, useState } from 'react';
 import type { TranscriptItem, ToolItem } from '../../types';
 import { Hero } from '../Hero';
 import { LiveRegion } from '../LiveRegion';
+import { scrollIntoViewRespectingMotion } from '../scrollIntoViewRespectingMotion';
 import { UserMessage } from './UserMessage';
 import { ReasoningBlock } from './ReasoningBlock';
 import { AgentMarkdown } from './AgentMarkdown';
@@ -25,20 +26,6 @@ import { JumpToLatest } from './JumpToLatest';
  * never intended as "step away from live content".
  */
 const REPIN_BUFFER_PX = 100;
-
-/**
- * UI#1: native `scrollIntoView({behavior:'smooth'})` is not a CSS
- * transition, so the global `prefers-reduced-motion` kill-rule (`index.css`)
- * has no effect on it — this must be checked explicitly, mirroring the same
- * defensive `matchMedia` guard `MockBackend.ts` already uses (jsdom, and
- * some older engines, don't implement `matchMedia` at all).
- */
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false)
-  );
-}
 
 interface ChatViewProps {
   transcript: TranscriptItem[];
@@ -393,10 +380,7 @@ export const ChatView = memo(function ChatView({
   const jumpToLatest = () => {
     pinnedRef.current = true;
     setPinned(true);
-    endRef.current?.scrollIntoView({
-      block: 'end',
-      behavior: prefersReducedMotion() ? 'auto' : 'smooth',
-    });
+    scrollIntoViewRespectingMotion(endRef.current, { block: 'end' });
   };
 
   useEffect(() => {
