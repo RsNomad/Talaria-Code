@@ -42,7 +42,16 @@ const MIN_SWEPT_SITES: Record<(typeof SWEPT_FILES)[number], number> = {
   'McpPanel.tsx': 6,
   'SkillsPanel.tsx': 4,
   'SessionsPanel.tsx': 1,
-  'CheckpointsPanel.tsx': 6,
+  // A11Y-07 (task-9-brief.md): 6 → 3. Three of the six ORIGINAL AU-40 sites
+  // here (the block/confirming restore strips' "Restore anyway"/"Restore
+  // workspace", and the combined redo-blocked "Redo anyway"/"Redo all
+  // anyway") were relocated into the shared `ConfirmStrip.tsx` component —
+  // now ONE `disabled={confirmInteraction.nativeDisabled}` site there
+  // (covered by `ConfirmStrip.dom.test.tsx`, not this file: `ConfirmStrip`
+  // is a new shared component, outside this lock's "four swept panels"
+  // scope per its own header doc). The 3 that remain here — the row's plain
+  // "Restore", "Redo", "Redo all" — are unchanged, still `.nativeDisabled`.
+  'CheckpointsPanel.tsx': 3,
 };
 
 /**

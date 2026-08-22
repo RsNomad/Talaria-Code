@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { ReactElement } from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { Checkpoint, CheckpointRedoState, CheckpointRestoreResult, CheckpointsData } from '../protocol';
 import { CheckpointsPanel } from './CheckpointsPanel';
@@ -329,6 +329,86 @@ describe('G-11: restoring the workspace is confirmed, locked and acknowledged', 
 });
 
 /**
+ * A11Y-07 (task-9-brief.md): CheckpointsPanel's three inline confirm/blocked
+ * strips (restore-confirm, restore-blocked, redo-blocked) adopt the shared
+ * `ConfirmStrip` alertdialog built in Task 7 (SessionsPanel's "load anyway"
+ * strip, `SessionsPanel.dom.test.tsx`, is the same adoption a beat earlier).
+ * Before this task none of the three carried a dialog role or moved focus —
+ * a screen-reader user perceived a silent DOM change with no cue a decision
+ * was being asked of them. PLAN-NAMING / characterization note: every
+ * existing test above this block that exercises these strips (the "G-11"
+ * describe above, and "CF-12" below) already queried them ONLY by button
+ * role/name and message text — never by the old plain `<div>`'s (absent)
+ * role or its CSS classes — so none of those pinned the raw-`<div>`
+ * structure this task replaces, and none needed editing to stay green.
+ * `aria-disabled`/`aria-busy`/`.not.toBeDisabled()` assertions on the
+ * "Restore anyway"/"Redo anyway"/"Redo all anyway" buttons in those older
+ * tests keep passing unchanged too — `confirmBusy` reproduces the exact
+ * same `busyInteraction` posture those buttons already rendered inline.
+ */
+describe('A11Y-07: the restore-confirm strip is a focus-managed alertdialog', () => {
+  it('is named "Confirm restore" and opening it moves focus to "Restore workspace"', async () => {
+    const { user } = setup(
+      renderPanel({ onRestore: async () => ({ restored: true, filesChanged: 0, changedPaths: [] }) }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Restore' }));
+
+    expect(screen.getByRole('alertdialog', { name: 'Confirm restore' })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Restore workspace' })),
+    );
+  });
+
+  it("Escape cancels and returns focus to the row's Restore button", async () => {
+    const { user } = setup(
+      renderPanel({ onRestore: async () => ({ restored: true, filesChanged: 0, changedPaths: [] }) }),
+    );
+    const restoreButton = screen.getByRole('button', { name: 'Restore' });
+
+    await user.click(restoreButton);
+    await user.keyboard('{Escape}');
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm restore' })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Restore' })));
+  });
+});
+
+describe('A11Y-07: the restore-blocked strip is a focus-managed alertdialog', () => {
+  it('is named "Restore was blocked" and opening it moves focus to "Restore anyway"', async () => {
+    const { user } = setup(
+      renderPanel({
+        onRestore: async () => ({ restored: false, reason: 'Uncommitted changes would be overwritten.' }),
+      }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Restore' }));
+    await user.click(screen.getByRole('button', { name: 'Restore workspace' }));
+
+    expect(await screen.findByRole('alertdialog', { name: 'Restore was blocked' })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Restore anyway' })),
+    );
+  });
+
+  it("Escape cancels the block and returns focus to the row's Restore button", async () => {
+    const { user } = setup(
+      renderPanel({
+        onRestore: async () => ({ restored: false, reason: 'Uncommitted changes would be overwritten.' }),
+      }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Restore' }));
+    await user.click(screen.getByRole('button', { name: 'Restore workspace' }));
+    await screen.findByRole('alertdialog', { name: 'Restore was blocked' });
+    await user.keyboard('{Escape}');
+
+    expect(screen.queryByRole('alertdialog', { name: 'Restore was blocked' })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Restore' })));
+  });
+});
+
+/**
  * Tier-2 T-15, F6. `restoringId`/`restored`'s "Restoring…"/"Workspace
  * restored to this checkpoint." spans carried `aria-live="polite"` (and, for
  * the restored span, `role="status"`) directly on themselves — but both
@@ -423,6 +503,57 @@ describe('CF-12: Redo/Redo-all render from data.redo and invoke the onRedo/onRed
   function renderWithRedo(config: Parameters<typeof redoPanel>[0] = {}) {
     return render(redoPanel(config));
   }
+
+  /**
+   * A11Y-07 (task-9-brief.md): the redo-blocked strip's ConfirmStrip
+   * adoption — see the plan-naming note on the restore-side A11Y-07 blocks
+   * above this describe for why nothing here needed updating for the new
+   * role. Two triggers share this ONE strip depending on which action was
+   * refused (`redoBlocked.kind`): "Redo" opens it with confirmLabel "Redo
+   * anyway" and returns focus to "Redo"; "Redo all" opens it with "Redo all
+   * anyway" and returns focus to "Redo all".
+   */
+  describe('A11Y-07: the redo-blocked strip is a focus-managed alertdialog', () => {
+    it('via Redo: named "Redo was blocked", focus moves to "Redo anyway", Escape returns focus to Redo', async () => {
+      const user = userEvent.setup();
+      renderWithRedo({
+        redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+        onRedo: async () => ({ restored: false, reason: 'A turn is still running — wait for it to finish.' }),
+      });
+
+      await user.click(screen.getByRole('button', { name: 'Redo' }));
+
+      expect(await screen.findByRole('alertdialog', { name: 'Redo was blocked' })).toBeInTheDocument();
+      await waitFor(() =>
+        expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Redo anyway' })),
+      );
+
+      await user.keyboard('{Escape}');
+
+      expect(screen.queryByRole('alertdialog', { name: 'Redo was blocked' })).not.toBeInTheDocument();
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Redo' })));
+    });
+
+    it('via Redo all: named "Redo was blocked", focus moves to "Redo all anyway", Escape returns focus to Redo all', async () => {
+      const user = userEvent.setup();
+      renderWithRedo({
+        redo: { anchorId: 'ckpt-a', cursorId: 'ckpt-1' },
+        onRedoAll: async () => ({ restored: false, reason: 'A turn is still running — wait for it to finish.' }),
+      });
+
+      await user.click(screen.getByRole('button', { name: 'Redo all' }));
+
+      expect(await screen.findByRole('alertdialog', { name: 'Redo was blocked' })).toBeInTheDocument();
+      await waitFor(() =>
+        expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Redo all anyway' })),
+      );
+
+      await user.keyboard('{Escape}');
+
+      expect(screen.queryByRole('alertdialog', { name: 'Redo was blocked' })).not.toBeInTheDocument();
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Redo all' })));
+    });
+  });
 
   it('renders no Redo controls when data.redo is absent (no dead affordance)', () => {
     renderWithRedo();
