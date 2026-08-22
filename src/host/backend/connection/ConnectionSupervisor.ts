@@ -1122,10 +1122,12 @@ export class ConnectionSupervisor {
    * the full tombstone rationale.
    */
   private handleAcpCrash(code: number | null): void {
-    // WS-R3 F2-19 close-out: guarded — an injected-factory client's exit-sub
-    // dispose is the last unguarded collaborator call on this crash path. A
-    // throw here must not be able to abort this method before
-    // teardownForRespawn/scheduleAcpRespawn below ever run.
+    // WS-R3 F2-19 close-out: guarded — this injected-factory exit-sub dispose
+    // could throw under a future transport, and a throw here would abort this
+    // method before teardownForRespawn/scheduleAcpRespawn below ever run
+    // (zombie loop). The other injected-collaborator calls on this chain (the
+    // client dispose in teardownForRespawn, the log, the emit) are guarded the
+    // same way; the remaining calls are first-party and non-throwing.
     try {
       this.clientExitSub?.dispose();
     } catch (err) {
@@ -1143,9 +1145,11 @@ export class ConnectionSupervisor {
       // `system.error` (no sessionId), never a session-scoped `error` that
       // drop-unknown would eat the moment that one tab closes.
       // WS-R3 F2-19b (concurrency re-review Important-1): `safeEmit`, not a
-      // raw `port.emit` — see that method's own doc. This is the last
-      // unguarded collaborator call on the crash/respawn/arm chain, and it
-      // runs BEFORE teardownForRespawn/scheduleAcpRespawn below.
+      // raw `port.emit` — see that method's own doc. Like every injected-
+      // collaborator call on the crash/respawn/arm chain (the guarded
+      // disposes, log, emit), it runs BEFORE teardownForRespawn/
+      // scheduleAcpRespawn below, so an unguarded throw here would abort the
+      // handler before the respawn is scheduled.
       this.safeEmit({ type: 'system.error', message: 'The agent exited unexpectedly — reconnecting…' });
     }
     this.teardownForRespawn(

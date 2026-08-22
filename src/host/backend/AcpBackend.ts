@@ -1841,7 +1841,7 @@ export class AcpBackend implements AgentBackend {
         // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the
         // switch below and used to skip its unwind): unwind the identity
         // THIS failed load adopted pre-load (:1769-1772). Same double guard
-        // as the switch's failure kinds (:1937) factored around the close —
+        // as the switch's failure kinds (below) factored around the close —
         // the registry leg above is evaluated BEFORE close() deletes the map
         // entry, so it cannot be re-checked after; the activeSessionId leg
         // nests inside it instead.
@@ -1901,7 +1901,7 @@ export class AcpBackend implements AgentBackend {
         // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the
         // switch below and used to skip its unwind): unwind the identity
         // THIS failed load adopted pre-load (:1769-1772). Same double guard
-        // as the switch's failure kinds (:1937) factored around the close —
+        // as the switch's failure kinds (below) factored around the close —
         // the registry leg above is evaluated BEFORE close() deletes the map
         // entry, so it cannot be re-checked after; the activeSessionId leg
         // nests inside it instead.
