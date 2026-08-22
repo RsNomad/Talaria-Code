@@ -571,13 +571,14 @@ describe('WS-R3 F3-4 (reconnect half) — wedge-break clause', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it('{force:true} bypasses the live-turn refusal; the fan-out safely ends the turn', async () => {
+  it('{force:true} bypasses the live-turn refusal; the fan-out ends the turn as USER intent (endForRestart -> turn.end{cancelled}), never as a crash', async () => {
     const h = makeSupervisorHarness();
     await h.supervisor.start();
     const busy = must(h.controllers.get('session-1'));
     busy.hasLiveTurn.mockReturnValue(true);
     await expect(h.supervisor.reconnect({ force: true })).resolves.toEqual({ ok: true });
-    expect(busy.endOnCrash).toHaveBeenCalledTimes(1); // teardownForRespawn's machinery ended it
+    expect(busy.endForRestart).toHaveBeenCalledTimes(1); // T16: user-intent ending (ADR-T16)
+    expect(busy.endOnCrash).not.toHaveBeenCalled(); // the crash ending stays crash-only
   });
 
   it('no force + live turn → refusal byte-identical to today', async () => {

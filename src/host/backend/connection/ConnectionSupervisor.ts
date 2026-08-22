@@ -1049,15 +1049,32 @@ export class ConnectionSupervisor {
    *     schedule a crash respawn mid-teardown (double-start);
    *  2. pendingRecovery snapshot (pendingClose-tombstoned sessions excluded);
    *  3. settleOneShot(settleReason) — each caller's reason string preserved;
-   *  4. guarded per-controller endOnCrash fan-out — a throwing controller
+   *  4. guarded per-controller ending fan-out — a throwing controller
    *     never aborts the loop; `fanOutLog` is PER-CALLER because the two
    *     callers' log lines genuinely differ (crash carries the "(tab '…')"
    *     segment, reconnect does not — both pinned observables); the body
    *     appends ": <describeHostError(err)>";
    *  5. client dispose + null (arch-A2), acpState = 'respawning'.
    * Drift is dead by construction — one body (ADR-R3).
+   *
+   * T16 (ADR-T16): `ending` picks which per-controller method the fan-out
+   * calls — 'crash' (default) = `endOnCrash` -> `turn.end{error}` (the crash
+   * path and the non-force reconnect, byte-identical to before); 'restart' =
+   * `endForRestart` -> `turn.end{cancelled}`, the USER-intent ending — ONLY
+   * the explicit `{force:true}` reconnect passes it (a user-initiated
+   * wedge-break is intent, not a failure).
    */
-  private teardownForRespawn(settleReason: string, fanOutLog: (controller: SessionController) => string): void {
+  private teardownForRespawn(
+    settleReason: string,
+    fanOutLog: (controller: SessionController) => string,
+    // T16 (ADR-T16): which ending the per-controller fan-out uses. 'crash'
+    // (default) = endOnCrash -> turn.end{error} — the crash path and the
+    // non-force reconnect, byte-identical to before. 'restart' = the
+    // user-intent ending endForRestart -> turn.end{cancelled} — ONLY the
+    // explicit {force:true} reconnect passes it (a user-initiated wedge-break
+    // is intent, not a failure; the V-12 endForRestart precedent).
+    ending: 'crash' | 'restart' = 'crash',
+  ): void {
     // WS-R3 F2-19 close-out: guarded, same shape as `handleAcpCrash`'s own
     // exit-sub guard below — on the handleAcpCrash path this dispose is a
     // no-op (already nulled there), but it disposes for REAL on the
@@ -1081,7 +1098,8 @@ export class ConnectionSupervisor {
     this.port.settleOneShot(settleReason);
     for (const controller of this.port.sessions.values()) {
       try {
-        controller.endOnCrash();
+        if (ending === 'restart') controller.endForRestart();
+        else controller.endOnCrash();
       } catch (err) {
         // WS-R3 F2-19b: `safeLog`, not a raw `port.logger?.append` — this
         // fan-out sits directly on the `handleAcpCrash -> teardownForRespawn
@@ -1199,10 +1217,10 @@ export class ConnectionSupervisor {
    *
    * WS-R3 F3-4: wedge-break — a turn whose cancel force-end deadline already
    * fired has hasLiveTurn() false (WS-R1 routed the force-end through
-   * emitTurnEnd), so it no longer trips this guard; an explicit {force:true}
-   * (future WS-UX affordance) bypasses a still-live turn — teardownForRespawn's
-   * endOnCrash fan-out is the safe ending machinery, idempotent if the turn
-   * completes in between.
+   * emitTurnEnd), so it no longer trips this guard; an explicit `{force:true}`
+   * (the WS-UX banner affordance) bypasses a still-live turn — the fan-out
+   * ends it via `endForRestart` (`turn.end{cancelled}`, user intent;
+   * ADR-T16), idempotent if the turn completes in between.
    */
   async reconnect(opts?: { force?: boolean }): Promise<ReconnectOutcome> {
     return this.runOnStartTail(async () => {
@@ -1225,10 +1243,12 @@ export class ConnectionSupervisor {
           }
         }
       }
+      const ending = opts?.force === true ? ('restart' as const) : ('crash' as const);
       this.teardownForRespawn(
         'agent reconnecting',
         (controller) =>
-          `[AcpBackend] reconnect fan-out: endOnCrash failed for session '${controller.sessionId}', continuing`,
+          `[AcpBackend] reconnect fan-out: ${ending === 'restart' ? 'endForRestart' : 'endOnCrash'} failed for session '${controller.sessionId}', continuing`,
+        ending,
       );
       try {
         await this.startInternal();
