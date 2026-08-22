@@ -378,6 +378,20 @@ describe('F1-7: malformed NDJSON lines are counted + skipped, never fatal one-by
       name: 'PullMalformedStreamError',
     });
   });
+  it('EXACTLY MAX_MALFORMED_PULL_LINES (20) malformed lines are tolerated — the boundary itself, not just 21 (M-T5 pin)', async () => {
+    // Pins the strict `>` in `malformedLines > MAX_MALFORMED_PULL_LINES`
+    // (ollamaClient.ts): a silent regression to `>=` would still pass the
+    // 21-line test above yet break the documented "20 tolerated" guarantee.
+    // `streamingResponse` newline-terminates every line, so all 20 malformed
+    // lines land in the inner parse loop before the success line does.
+    const lines = [...Array.from({ length: 20 }, () => '{not json'), JSON.stringify({ status: 'success' })];
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    const seen: string[] = [];
+    await expect(
+      pullModel(ENDPOINT, 'm', fetchImpl, (p) => seen.push(p.status), new AbortController().signal),
+    ).resolves.toBeUndefined();
+    expect(seen).toEqual(['success']); // the malformed lines emitted no progress ticks
+  });
   it('fail-closed interplay (F1-6×F1-7): a malformed SUCCESS line ends as PullIncompleteError, never silent success', async () => {
     const lines = [JSON.stringify({ status: 'pulling manifest' }), '{"status":"success"']; // truncated JSON
     const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
