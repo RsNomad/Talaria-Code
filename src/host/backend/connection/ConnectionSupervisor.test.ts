@@ -433,6 +433,28 @@ describe('WS-R3 characterization — handleAcpCrash observable sequence', () => 
       'session-2',
     ]);
   });
+
+  it('handleAcpCrash: a throwing clientExitSub dispose does not abort before the respawn is scheduled (WS-R3 F2-19 close-out)', async () => {
+    const h = await startedHarness();
+    const throwingDispose = vi.fn(() => {
+      throw new Error('exit-sub dispose boom');
+    });
+    (h.supervisor as unknown as CrashSeam).clientExitSub = { dispose: throwingDispose };
+
+    // Pre-fix: the throw escapes handleAcpCrash before clientExitSub is
+    // nulled and before teardownForRespawn/scheduleAcpRespawn ever run — the
+    // supervisor zombies (acpState stuck at 'ready', no respawn timer armed).
+    expect(() => must(h.clients[0]).simulateExit(1)).not.toThrow();
+
+    expect(throwingDispose).toHaveBeenCalledTimes(1);
+    expect((h.supervisor as unknown as CrashSeam).clientExitSub).toBeUndefined();
+    // Sibling crash-banner behavior is untouched by this guard.
+    expect(h.emitted.filter((m) => m.type === 'system.error')).toHaveLength(1);
+    expect(h.logs.some((l) => l.includes('ACP respawn attempt 1'))).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1));
+    expect(h.clients.length).toBeGreaterThanOrEqual(2); // respawn actually spawned
+  });
 });
 
 describe('WS-R3 characterization — reconnect refusal matrix + teardown', () => {
@@ -498,6 +520,27 @@ describe('WS-R3 characterization — reconnect refusal matrix + teardown', () =>
       ),
     ).toBe(true);
     expect(h.logs.some((l) => l.includes("(tab 'tab-bad')"))).toBe(false); // the tab segment is CRASH-only
+  });
+
+  it('teardownForRespawn (via reconnect()): a throwing clientExitSub dispose does not abort the reconnect (WS-R3 F2-19 close-out)', async () => {
+    const h = makeSupervisorHarness();
+    await h.supervisor.start();
+    const throwingDispose = vi.fn(() => {
+      throw new Error('exit-sub dispose boom');
+    });
+    // Live on the reconnect() path — unlike handleAcpCrash (which already
+    // nulled clientExitSub before calling teardownForRespawn), this is the
+    // dispose that actually fires for real (see teardownForRespawn's own doc).
+    (h.supervisor as unknown as CrashSeam).clientExitSub = { dispose: throwingDispose };
+
+    // Pre-fix: the throw escapes teardownForRespawn, which sits OUTSIDE
+    // reconnect()'s own try/catch around startInternal() — the whole
+    // runOnStartTail link rejects instead of resolving {ok:false}, and
+    // acpState never reaches 'respawning' / startInternal() never runs.
+    await expect(h.supervisor.reconnect()).resolves.toEqual({ ok: true });
+
+    expect(throwingDispose).toHaveBeenCalledTimes(1);
+    expect(h.clients).toHaveLength(2); // startInternal still spawned a fresh client
   });
 });
 

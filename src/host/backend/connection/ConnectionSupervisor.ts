@@ -1040,7 +1040,18 @@ export class ConnectionSupervisor {
    * Drift is dead by construction — one body (ADR-R3).
    */
   private teardownForRespawn(settleReason: string, fanOutLog: (controller: SessionController) => string): void {
-    this.clientExitSub?.dispose();
+    // WS-R3 F2-19 close-out: guarded, same shape as `handleAcpCrash`'s own
+    // exit-sub guard below — on the handleAcpCrash path this dispose is a
+    // no-op (already nulled there), but it disposes for REAL on the
+    // reconnect() path, where clientExitSub is still live. An injected-
+    // factory client's exit-sub dispose must not be able to abort this
+    // method before the unconditional nulling below (or before this
+    // teardown's caller reaches startInternal()/reschedule).
+    try {
+      this.clientExitSub?.dispose();
+    } catch (err) {
+      this.safeLog(`[AcpBackend] clientExitSub dispose failed during teardownForRespawn: ${describeHostError(err)}`);
+    }
     this.clientExitSub = undefined;
     this.pendingRecovery = [...this.port.sessions.values()]
       .filter((controller) => !this.port.isPendingClose(controller.sessionId))
@@ -1099,7 +1110,15 @@ export class ConnectionSupervisor {
    * the full tombstone rationale.
    */
   private handleAcpCrash(code: number | null): void {
-    this.clientExitSub?.dispose();
+    // WS-R3 F2-19 close-out: guarded — an injected-factory client's exit-sub
+    // dispose is the last unguarded collaborator call on this crash path. A
+    // throw here must not be able to abort this method before
+    // teardownForRespawn/scheduleAcpRespawn below ever run.
+    try {
+      this.clientExitSub?.dispose();
+    } catch (err) {
+      this.safeLog(`[AcpBackend] clientExitSub dispose failed during crash teardown: ${describeHostError(err)}`);
+    }
     this.clientExitSub = undefined;
     if (this.acpState === 'disposed') return;
     // WS-R3 F2-19b (mirrors ControlChannel.handleCrash's own log() guard):

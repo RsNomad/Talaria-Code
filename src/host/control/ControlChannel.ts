@@ -370,8 +370,24 @@ export class ControlChannel {
 
   /** The control process died after a successful handshake — respawn it. */
   private handleCrash(code: number | null): void {
-    this.transportEventSub?.dispose();
-    this.transportExitSub?.dispose();
+    // WS-R3 F2-19 close-out: each dispose is guarded in its OWN try/catch —
+    // best-effort, so a throwing event-sub dispose can never prevent the
+    // exit-sub from STILL being disposed, and neither can prevent the
+    // unconditional nulling below (idempotency: a late child `onExit` must
+    // never re-enter a live sub — the existing invariant). These are
+    // injected-factory transport disposables (transport-swap-ready); the
+    // self-heal loop's "always another respawn attempt" guarantee must not
+    // depend on one behaving — mirrors `log()`'s own hardening on this path.
+    try {
+      this.transportEventSub?.dispose();
+    } catch (err) {
+      this.log(`transport event-sub dispose failed during crash teardown: ${String(err)}`);
+    }
+    try {
+      this.transportExitSub?.dispose();
+    } catch (err) {
+      this.log(`transport exit-sub dispose failed during crash teardown: ${String(err)}`);
+    }
     this.transportEventSub = undefined;
     this.transportExitSub = undefined;
     this.transport = undefined;

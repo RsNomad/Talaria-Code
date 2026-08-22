@@ -717,3 +717,52 @@ describe('ControlChannel.log() — guarded against a throwing logger on the cras
     channel.dispose();
   });
 });
+
+describe('ControlChannel.handleCrash — guarded subscription disposes (WS-R3 F2-19 close-out)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  /** Private-member access (repo convention: element access via a cast, never
+   * `any`) — mirrors `ConnectionSupervisor.test.ts`'s own pattern of swapping
+   * a throwing disposable directly onto a private subscription field. Stands
+   * in for a misbehaving injected-factory transport's `dispose()`. */
+  type CrashSeam = {
+    transportEventSub?: { dispose(): void };
+    transportExitSub?: { dispose(): void };
+  };
+
+  it('an event-sub dispose that throws still disposes the sibling exit-sub (best-effort) and schedules a respawn', async () => {
+    const { factory, transports } = makeFactory();
+    const channel = new ControlChannel(CONFIG, undefined, factory);
+
+    const start = channel.start();
+    await flushMicrotasksFake();
+    must(transports[0]).emit('event', GATEWAY_READY);
+    await start;
+
+    const exitDisposeSpy = vi.fn();
+    (channel as unknown as CrashSeam).transportEventSub = {
+      dispose: () => {
+        throw new Error('event-sub dispose boom');
+      },
+    };
+    (channel as unknown as CrashSeam).transportExitSub = { dispose: exitDisposeSpy };
+
+    // Pre-fix: the throwing dispose escapes handleCrash entirely, aborting
+    // it before the sibling sub is disposed and before a respawn is
+    // scheduled — the channel zombies (state stuck at 'ready', transport
+    // undefined, no timer armed, no subsequent spawn attempt).
+    expect(() => must(transports[0]).exit(1)).not.toThrow();
+
+    // Best-effort: the sibling sub was STILL disposed despite the throw.
+    expect(exitDisposeSpy).toHaveBeenCalledTimes(1);
+
+    // Not a zombie: a respawn was scheduled and actually fires.
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1));
+    expect(transports).toHaveLength(2);
+
+    must(transports[1]).emit('event', GATEWAY_READY);
+    await flushMicrotasksFake();
+    channel.dispose();
+  });
+});
