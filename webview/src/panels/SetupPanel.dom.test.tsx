@@ -345,6 +345,33 @@ describe('Agent card — "installing" phase: Cancel moved out of the live region
   });
 });
 
+describe('F2-20-face site 6: Agent card "installing" Cancel announces the HOST outcome', () => {
+  it('{cancelled:true} → announces "Cancelled"', async () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'installing', selectedId: 'hermes' } });
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: true, matched: 'hermes' }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { dispatch });
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    await user.click(within(agentSection).getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Cancelled')).toBeInTheDocument();
+  });
+
+  it('{cancelled:false} → announces the nothing-to-cancel copy, NOT "Cancelled"', async () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'installing', selectedId: 'hermes' } });
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: false }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { dispatch });
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    await user.click(within(agentSection).getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Nothing to cancel — it had already finished.')).toBeInTheDocument();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+  });
+});
+
 describe('Agent card — identity options are informational, not selectable (§6, A19/C1-13)', () => {
   // A19 (C1-13): the Agent card never passes `onSelect` to `BackendOptionRow`
   // (identity here isn't a click-to-pick control) — every row, including the

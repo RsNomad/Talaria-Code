@@ -839,6 +839,7 @@ function AgentCard({
           <ActionButton
             label="Cancel"
             onRun={() => dispatch('setup.cancel', { op: 'install', id: agent.selectedId })}
+            outcomeFor={cancelOutcome}
           />
         </div>
       ) : (
