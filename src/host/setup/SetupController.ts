@@ -20,6 +20,7 @@ import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import type {
   AgentSetupPhase,
   SetupBackendOption,
+  SetupCancelResult,
   SetupCatalogModel,
   SetupData,
   SetupMethod,
@@ -1230,7 +1231,7 @@ export class SetupController {
   async handle(
     method: SetupMethod,
     params: unknown,
-  ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string } | SetupCancelResult> {
     // TE-4 (AU-11, INV-15) belt — see SETUP_METHOD_SET's doc: a method
     // outside the known set fails closed HERE, before the trust gate or the
     // switch, instead of silently falling through to an unhandled `undefined`.
@@ -2223,7 +2224,7 @@ export class SetupController {
 
   // --- setup.cancel (read-only / best-effort) -----------------------------------
 
-  private handleCancel(params: unknown): { ok: true } {
+  private handleCancel(params: unknown): SetupCancelResult {
     const op = str(params, 'op');
     const id = str(params, 'id');
     if (op && id) {
@@ -2236,9 +2237,16 @@ export class SetupController {
       // for that row silently no-ops (dedup itself still holds; only
       // Cancel was missing it). Every other `op` (`install`) is unaffected.
       const latchId = op === 'pull' ? this.canonicalPullLatchId(id) : id;
-      this.inFlight.get(`${op}:${latchId}`)?.abort();
+      const latch = this.inFlight.get(`${op}:${latchId}`);
+      if (latch !== undefined) {
+        latch.abort();
+        // F2-20: report what actually happened — an abort was DELIVERED to a
+        // live latch. `{cancelled:false}` below is the honest "nothing to
+        // cancel" outcome the webview's T31 face renders.
+        return { ok: true, cancelled: true, matched: latchId };
+      }
     }
-    return { ok: true };
+    return { ok: true, cancelled: false };
   }
 
   // --- setup.recheck (read-only, re-probes pipx) --------------------------------

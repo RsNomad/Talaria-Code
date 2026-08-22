@@ -373,6 +373,34 @@ describe('T7 step 4b: library tier (qwen25-coder-1.5b via ollama)', () => {
     await controller.handle('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' });
     await expect(first).resolves.toEqual({ ok: false, reason: 'cancelled' });
   });
+
+  it('F2-20: setup.cancel with an in-flight pull resolves {ok, cancelled:true, matched:<canonical id>}', async () => {
+    const { controller, calls } = makeProvController({}, { hang: 'pull' });
+    const first = controller.handle('setup.provisionModel', { modelId: 'qwen25-coder-1.5b', backend: 'ollama' });
+    await vi.waitFor(() => {
+      expect(calls).toContain('pullModel');
+    });
+    await expect(controller.handle('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' })).resolves.toEqual({
+      ok: true,
+      cancelled: true,
+      matched: 'qwen25-coder-1.5b',
+    });
+    await expect(first).resolves.toEqual({ ok: false, reason: 'cancelled' });
+  });
+
+  it('F2-20: setup.cancel with NOTHING in flight resolves {ok, cancelled:false} — no matched key', async () => {
+    const { controller } = makeProvController();
+    // toEqual is exact: asserts `matched` is ABSENT (key omission), not undefined.
+    await expect(controller.handle('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' })).resolves.toEqual({
+      ok: true,
+      cancelled: false,
+    });
+  });
+
+  it('F2-20: setup.cancel with malformed params (no op/id) resolves {ok, cancelled:false}', async () => {
+    const { controller } = makeProvController();
+    await expect(controller.handle('setup.cancel', {})).resolves.toEqual({ ok: true, cancelled: false });
+  });
 });
 
 // --- L1-I-1 (beta.6 fix-wave T2): the library-tier arm of the 7-handler

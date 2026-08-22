@@ -291,7 +291,9 @@ describe('FM-14: mutating methods refused when untrusted', () => {
   it('setup.cancel still works when untrusted', async () => {
     const { controller } = makeController({ trusted: false });
     const result = await controller.handle('setup.cancel', { op: 'install', id: 'hermes' });
-    expect(result).toEqual({ ok: true });
+    // WS-SU Task 1: cancel result now carries {cancelled} (F2-20) — nothing
+    // was in flight here, so the honest outcome is cancelled:false.
+    expect(result).toEqual({ ok: true, cancelled: false });
   });
 
   it('status() still renders when untrusted', async () => {

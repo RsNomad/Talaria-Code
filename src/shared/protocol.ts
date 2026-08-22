@@ -2035,6 +2035,22 @@ export const SETUP_METHODS = [
   'setup.setTunable',
 ] as const;
 
+/**
+ * WS-SU F2-20: `setup.cancel`'s result. `cancelled` is TRUE only when an
+ * in-flight `(op,id)` latch actually existed and its AbortController was
+ * aborted by THIS call; `{ok:true, cancelled:false}` = nothing matched (the
+ * op had already finished, or never started). `matched` — present ONLY when
+ * `cancelled` is true — echoes the CANONICAL latch id that was aborted (a
+ * catalog id / backendId: a bounded catalog-derived value the webview
+ * already renders, never a path or host state). Additive: the transport
+ * envelope stays `ok:true`, so an older webview renders exactly as before.
+ */
+export interface SetupCancelResult {
+  ok: true;
+  cancelled: boolean;
+  matched?: string;
+}
+
 /** A Setup-panel control-request method. Derived from {@link SETUP_METHODS}. */
 export type SetupMethod = (typeof SETUP_METHODS)[number];
 
