@@ -12,6 +12,7 @@ import type {
   WebviewState,
 } from '../shared/protocol';
 import type { AgentBackend } from './backend/AgentBackend';
+import { gatewayHealthMessage } from './backend/gatewayHealth';
 import { getNonce } from './util/nonce';
 import { buildSearchFilesResponse } from './context/searchFilesResponse';
 import type { FindFilesFn } from './context/searchFilesResponse';
@@ -387,6 +388,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // trust-upgrade mock->acp swap gets; `WebviewState.backendKind` at the
     // next genuine hydrate is the OTHER half of the pair.
     this.postToWebview({ type: 'backend.state', kind: backend.kind });
+    this.postGatewayHealth();
     if (this.view) {
       // T-1 (V-12 RESTART-STATE): no host-side `clear` here anymore — the
       // retired `PENDING_SESSION_PLACEHOLDER` was a dead letter
@@ -625,6 +627,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         this.webviewSignalEmitter.fire({ kind: 'ready' });
         this.postTheme();
         this.postToWebview({ type: 'hydrate', state: this.seedState() });
+        this.postGatewayHealth();
         // R-C4: only the FIRST ready arms the backend. A re-created view
         // (memory-pressure dispose; retainContextWhenHidden is best-effort)
         // re-hydrates but must NOT replace the live ACP session.
@@ -1217,6 +1220,16 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 
   private postTheme(): void {
     this.postToWebview({ type: 'theme', theme: this.currentTheme() });
+  }
+
+  /** UX-02: one unconditional re-sync of the standing gateway-health signal.
+   * The push is edge-triggered backend-side; a (re)created webview boots to
+   * {state:'ok'}, so every hydrate needs the CURRENT combined truth —
+   * fresh-computed, never the last transition payload. No-op under mock
+   * (optional capability, AgentBackend.currentGatewayHealth?). */
+  private postGatewayHealth(): void {
+    const health = this.backend.currentGatewayHealth?.();
+    if (health) this.postToWebview(gatewayHealthMessage(health));
   }
 
   private currentTheme(): ThemeInfo {

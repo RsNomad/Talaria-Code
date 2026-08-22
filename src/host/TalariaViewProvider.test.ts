@@ -2351,3 +2351,43 @@ describe('TalariaViewProvider — TE-7 (AU-31): per-view disposable scope does n
     expect(disposeDisposeSub).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('TalariaViewProvider — UX-02: gateway.health re-sync', () => {
+  /** The optional-capability seam, mirroring makePresetBackend/makeTabsBackend above. */
+  function makeHealthBackend(health: { state: 'ok' | 'degraded' | 'down'; attempts: number }): AgentBackend {
+    return { ...makeFakeBackend(), currentGatewayHealth: () => health };
+  }
+
+  it('posts gateway.health AFTER hydrate when the backend exposes currentGatewayHealth (a re-created webview must not assume ok)', () => {
+    const { provider, posted } = makeProviderWith(makeHealthBackend({ state: 'down', attempts: 12 }));
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    const hydrateIndex = posted.findIndex((m) => m.type === 'hydrate');
+    const healthIndex = posted.findIndex((m) => m.type === 'gateway.health');
+    expect(hydrateIndex).toBeGreaterThanOrEqual(0);
+    // AFTER hydrate — the webview's {state:'ok'} boot fold must not overwrite the truth:
+    expect(healthIndex).toBeGreaterThan(hydrateIndex);
+    expect(posted[healthIndex]).toEqual({ type: 'gateway.health', state: 'down', attempts: 12 });
+  });
+
+  it('skips the push for a backend without the capability (mock) — the webview keeps its honest ok default', () => {
+    const { provider, posted } = makeProviderWith(makeFakeBackend());
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    expect(posted.filter((m) => m.type === 'gateway.health')).toEqual([]);
+  });
+
+  it("setBackend (trust-upgrade swap) posts the NEW backend's health after backend.state", () => {
+    const { provider, posted } = makeProviderWith(makeFakeBackend());
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    posted.length = 0; // only the swap's own output matters below (idiom of :499)
+    const acpBackend: AgentBackend = {
+      ...makeFakeBackend(),
+      kind: 'acp',
+      currentGatewayHealth: () => ({ state: 'degraded' as const, attempts: 6 }),
+    };
+    provider.setBackend(acpBackend);
+    const stateIndex = posted.findIndex((m) => m.type === 'backend.state');
+    const healthIndex = posted.findIndex((m) => m.type === 'gateway.health');
+    expect(healthIndex).toBeGreaterThan(stateIndex);
+    expect(posted[healthIndex]).toEqual({ type: 'gateway.health', state: 'degraded', attempts: 6 });
+  });
+});
