@@ -1536,6 +1536,17 @@ describe('setup.reconnectAgent (beta.7 B3)', () => {
     const result = await controller.handle('setup.reconnectAgent', {});
     expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('spawn ENOENT') });
   });
+
+  it('threads {force:true} through to deps.reconnectAgent; absent or non-boolean force stays non-force (fail-closed)', async () => {
+    const reconnectAgent = vi.fn().mockResolvedValue({ ok: true });
+    const { controller } = makeController({}, { reconnectAgent });
+    await controller.handle('setup.reconnectAgent', { force: true });
+    expect(reconnectAgent).toHaveBeenLastCalledWith({ force: true });
+    await controller.handle('setup.reconnectAgent', {});
+    expect(reconnectAgent).toHaveBeenLastCalledWith(undefined);
+    await controller.handle('setup.reconnectAgent', { force: 'yes' });
+    expect(reconnectAgent).toHaveBeenLastCalledWith(undefined);
+  });
 });
 
 // --- FIX 1 (final review wave, IMPORTANT): setup.recheck re-probes pipx -----

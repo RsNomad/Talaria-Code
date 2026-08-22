@@ -341,8 +341,8 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
     createVsCodeSetupHost(context),
     createSetupControllerDeps(
       () => backend.getAdvertisedAuthMethods?.(),
-      () =>
-        backend.reconnectAgent?.() ??
+      (opts) =>
+        backend.reconnectAgent?.(opts) ??
         Promise.resolve({ ok: false as const, reason: 'The agent connection is not running yet.' }),
     ),
   );

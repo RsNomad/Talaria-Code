@@ -854,8 +854,8 @@ export class AcpBackend implements AgentBackend {
   /** beta.7 B3: thin passthrough to {@link ConnectionSupervisor.reconnect} —
    * see that method's own doc for the full tail-serialized teardown +
    * respawn + re-`initialize()` rationale. */
-  async reconnectAgent(): Promise<ReconnectOutcome> {
-    return this.connectionSupervisor.reconnect();
+  async reconnectAgent(opts?: { force?: boolean }): Promise<ReconnectOutcome> {
+    return this.connectionSupervisor.reconnect(opts);
   }
 
   /**

@@ -12943,6 +12943,23 @@ describe('beta.7 B3: user-triggered reconnect (backend.reconnectAgent)', () => {
   });
 });
 
+describe('T16: reconnectAgent({force:true}) passthrough', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('forwards force to ConnectionSupervisor.reconnect — a live turn refuses non-force but yields to force', async () => {
+    const { backend } = makeStartableBackend();
+    await backend.start();
+    backend.sendPrompt('session-1', 'first prompt', 'default'); // hangs on the fake's held-open deferred
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(backend.reconnectAgent()).resolves.toEqual({
+      ok: false,
+      reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
+    });
+    await expect(backend.reconnectAgent({ force: true })).resolves.toEqual({ ok: true });
+  });
+});
+
 describe('UX-02: AcpBackend pushes gateway.health on combined transitions (ACP-loop driven)', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());

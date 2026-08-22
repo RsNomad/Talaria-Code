@@ -555,11 +555,11 @@ const boundFetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
  * {@link SetupControllerDeps.reconnectAgent}'s optionality exactly so every
  * existing zero-second-arg factory call site keeps compiling unchanged.
  * `extension.ts` passes a thunk over the CURRENT backend
- * (`() => backend.reconnectAgent?.() ?? Promise.resolve({ok:false,...})`).
+ * (`(opts) => backend.reconnectAgent?.(opts) ?? Promise.resolve({ok:false,...})`).
  */
 export function createSetupControllerDeps(
   getAdvertisedAuthMethods: () => AdvertisedAuthMethod[] | undefined,
-  reconnectAgent?: () => Promise<{ ok: true } | { ok: false; reason: string }>,
+  reconnectAgent?: (opts?: { force?: boolean }) => Promise<{ ok: true } | { ok: false; reason: string }>,
 ): SetupControllerDeps {
   const exec = createExecLookup();
   const spawn = createNodeSpawnFn();

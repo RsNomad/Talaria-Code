@@ -367,9 +367,13 @@ export interface SetupControllerDeps {
   ): Promise<void>;
   /**
    * beta.7 B3: the deliberate teardown+respawn+re-`initialize()` reconnect —
-   * bound to `() => backend.reconnectAgent?.() ?? Promise.resolve({ok:false,
-   * reason:...})` (a thunk over the CURRENT backend, `extension.ts`) so the
-   * trust-upgrade mock→real swap is reflected on the next call. OPTIONAL
+   * bound to `(opts) => backend.reconnectAgent?.(opts) ?? Promise.resolve({
+   * ok:false, reason:...})` (a thunk over the CURRENT backend, `extension.ts`)
+   * so the trust-upgrade mock→real swap is reflected on the next call.
+   * T16: `opts.force` threads straight through to `ConnectionSupervisor.
+   * reconnect`'s own force posture — this seam does no parsing of its own
+   * (that's {@link SetupController.handleReconnectAgent}'s job, fail-closed
+   * via the `bool` helper). OPTIONAL
    * (posture of `loadTab?`/`getAdvertisedAuthMethods?` above) — NOT a
    * required member: a required member would break `check-types:all` in
    * every existing deps-literal/factory-call test site. `undefined` = no
@@ -377,7 +381,7 @@ export interface SetupControllerDeps {
    * handleReconnectAgent} fails closed with an honest reason rather than
    * throwing.
    */
-  reconnectAgent?(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  reconnectAgent?(opts?: { force?: boolean }): Promise<{ ok: true } | { ok: false; reason: string }>;
   /**
    * TC-3 (AU-8 / INV-11): the SAME settings-OR-PATH resolution the runtime
    * uses to find `hermes` — bound to `resolveHermesBin({}, exec)`
@@ -1269,7 +1273,7 @@ export class SetupController {
       case 'setup.reload':
         return this.handleReload();
       case 'setup.reconnectAgent':
-        return this.handleReconnectAgent();
+        return this.handleReconnectAgent(params);
       case 'setup.recheck':
         return this.handleRecheck(params);
       case 'setup.setNextEdit':
@@ -2473,13 +2477,17 @@ export class SetupController {
 
   // --- setup.reconnectAgent (beta.7 B3) --------------------------------------
 
-  private async handleReconnectAgent(): Promise<{ ok: true } | { ok: false; reason: string }> {
+  private async handleReconnectAgent(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
     const reconnect = this.deps.reconnectAgent;
     if (!reconnect) {
       return { ok: false, reason: 'The agent connection is not running yet.' };
     }
+    // T16/UX-04: force = the banner's wedge-break — bypasses the live-turn
+    // refusal host-side and ends the turn as user intent (turn.end{cancelled},
+    // ADR-T16). Absent or non-boolean input fails closed to non-force.
+    const force = bool(params, 'force');
     try {
-      const result = await reconnect();
+      const result = await reconnect(force === true ? { force: true } : undefined);
       this.statusChangedEmitter.fire(); // handleRecheck's single completion-fire posture (:2069-2073)
       return result;
     } catch (err) {
