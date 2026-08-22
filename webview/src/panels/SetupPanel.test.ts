@@ -28,7 +28,10 @@ import {
   backendReadyText,
   BACKEND_DISPLAY,
   buildCopyLogText,
+  cancelOutcome,
   cancelPullParams,
+  CANCEL_DONE_TEXT,
+  CANCEL_NOTHING_TEXT,
   CANCEL_LABEL,
   CATALOG_DEFAULT_CHIP_LABEL,
   catalogPresence,
@@ -1028,6 +1031,18 @@ describe('cancelPullParams / recheckScopeParams — the exact dispatch payload s
   it('recheckScopeParams narrows to ollama or llamacpp only', () => {
     expect(recheckScopeParams('ollama')).toEqual({ scope: 'ollama' });
     expect(recheckScopeParams('llamacpp')).toEqual({ scope: 'llamacpp' });
+  });
+});
+
+describe('T31 (F2-20-face): cancelOutcome maps the host discriminant onto honest copy', () => {
+  it('{ok:true, cancelled:true} → "Cancelled" (success tone)', () =>
+    expect(cancelOutcome({ ok: true, cancelled: true, matched: 'x' })).toEqual({ text: CANCEL_DONE_TEXT, tone: 'success' }));
+  it('{ok:true, cancelled:false} → the nothing-to-cancel copy', () =>
+    expect(cancelOutcome({ ok: true, cancelled: false })).toEqual({ text: CANCEL_NOTHING_TEXT, tone: 'success' }));
+  it('a result WITHOUT the discriminant renders nothing (no fabricated claim)', () => {
+    expect(cancelOutcome({ ok: true })).toBeUndefined();
+    expect(cancelOutcome(undefined)).toBeUndefined();
+    expect(cancelOutcome('junk')).toBeUndefined();
   });
 });
 

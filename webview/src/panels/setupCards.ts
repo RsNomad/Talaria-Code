@@ -803,6 +803,27 @@ export function cancelPullParams(catalogId: string): { op: 'pull'; id: string } 
   return { op: 'pull', id: catalogId };
 }
 
+/* --- WS-SU T31/T32: honest action outcomes (F2-20-face / F1-6-face) ------- */
+
+/** One resolved Setup-mutation result, mapped for ActionButton's live line. */
+export type ActionOutcome = { text: string; tone: 'success' | 'failure' };
+
+/** T31 copy — the two honest cancel outcomes (WS-UX plan Task 31, verbatim). */
+export const CANCEL_DONE_TEXT = 'Cancelled';
+export const CANCEL_NOTHING_TEXT = 'Nothing to cancel — it had already finished.';
+
+/** T31 (F2-20-face): maps a resolved `setup.cancel` result onto its honest
+ *  outcome copy. A result without the WS-SU `{cancelled: boolean}`
+ *  discriminant renders NOTHING — the face never fabricates an outcome the
+ *  host didn't report. Both outcomes ride the success (non-error) tone: a
+ *  no-op cancel is information, not a failure. */
+export function cancelOutcome(result: unknown): ActionOutcome | undefined {
+  if (typeof result !== 'object' || result === null) return undefined;
+  const r = result as { ok?: unknown; cancelled?: unknown };
+  if (r.ok !== true || typeof r.cancelled !== 'boolean') return undefined;
+  return { text: r.cancelled ? CANCEL_DONE_TEXT : CANCEL_NOTHING_TEXT, tone: 'success' };
+}
+
 /** The block's own scoped `setup.recheck` payload — narrower than the full
  *  `SetupMethod` param validation (T9), since the block only ever re-checks
  *  the ONE backend pane it renders. */

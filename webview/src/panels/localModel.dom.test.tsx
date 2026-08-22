@@ -209,6 +209,37 @@ describe('LocalModelBlock — Ollama in-flight pull (CC-9)', () => {
   });
 });
 
+describe('T31 (F2-20-face): Cancel announces the HOST-reported outcome', () => {
+  const inFlightProgress = {
+    'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 1000, completedBytes: 400 },
+  };
+
+  it('{cancelled:true} → announces "Cancelled"', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: true, matched: 'qwen25-coder-1.5b' });
+    const { user } = renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Cancelled')).toBeInTheDocument();
+  });
+
+  it('{cancelled:false} → announces the nothing-to-cancel copy, NOT "Cancelled"', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: false });
+    const { user } = renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Nothing to cancel — it had already finished.')).toBeInTheDocument();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+  });
+
+  it('a legacy {ok:true} result (no discriminant) announces NOTHING', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const { user } = renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    // give the resolve a tick, then assert silence
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+    expect(screen.queryByText('Nothing to cancel — it had already finished.')).not.toBeInTheDocument();
+  });
+});
+
 /**
  * A11Y-05 (WCAG 4.1.3): the percent row no longer chatters `aria-live`
  * itself — a single sr-only `PullAnnouncer` (`role="status"`) speaks only

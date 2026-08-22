@@ -591,6 +591,53 @@ describe('FIM card — CC-8 configured-model row: pre-progress Working line (UX-
   });
 });
 
+describe('T31 (F2-20-face): ConfiguredModelRow Cancel announces the HOST-reported outcome', () => {
+  function inFlightConfiguredModelData(): { data: SetupData; progress: SetupProgressMap } {
+    // Same fixture as the CC-8 configured-model row's own `configuredModelData()`
+    // above (empty daemon list ⇒ honest 'not present', so the row shows its
+    // Pull/in-flight affordance) plus an already-in-flight progress entry.
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
+    });
+    const progress: SetupProgressMap = {
+      [progressKey('pull', 'qwen2.5-coder:1.5b-base')]: {
+        op: 'pull',
+        id: 'qwen2.5-coder:1.5b-base',
+        logTail: [],
+        totalBytes: 1000,
+        completedBytes: 250,
+      },
+    };
+    return { data, progress };
+  }
+
+  it('{cancelled:true} → announces "Cancelled"', async () => {
+    const { data, progress } = inFlightConfiguredModelData();
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: true, matched: 'qwen2.5-coder:1.5b-base' }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { progress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Cancelled')).toBeInTheDocument();
+  });
+
+  it('{cancelled:false} → announces the nothing-to-cancel copy, NOT "Cancelled"', async () => {
+    const { data, progress } = inFlightConfiguredModelData();
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: false }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { progress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Nothing to cancel — it had already finished.')).toBeInTheDocument();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+  });
+});
+
 describe('FIM card — pull progress a11y: PullAnnouncer replaces the row aria-live (A11Y-05)', () => {
   function fimInstallData(progressPercent: { totalBytes: number; completedBytes: number }) {
     const data = baseData({

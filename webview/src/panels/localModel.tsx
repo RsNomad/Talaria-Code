@@ -55,6 +55,8 @@ import { Pill } from '../components/Pill';
 import { PullAnnouncer } from '../components/PullAnnouncer';
 import { DECLINED, errorMessage } from '../state/panels';
 import {
+  type ActionOutcome,
+  cancelOutcome,
   CANCEL_LABEL,
   CATALOG_DEFAULT_CHIP_LABEL,
   LLAMACPP_CHECKING_TEXT,
@@ -468,7 +470,12 @@ function ModelRow({
         <div className="flex flex-col gap-1">
           <StatusLine icon="sync" text="Working — waiting for the backend to report progress…" tone="neutral" />
           <div>
-            <ActionButton label={CANCEL_LABEL} icon="close" onRun={() => dispatch('setup.cancel', cancelPullParams(model.id))} />
+            <ActionButton
+              label={CANCEL_LABEL}
+              icon="close"
+              onRun={() => dispatch('setup.cancel', cancelPullParams(model.id))}
+              outcomeFor={cancelOutcome}
+            />
           </div>
         </div>
       )}
@@ -495,7 +502,12 @@ function ModelRow({
             </div>
           )}
           <div>
-            <ActionButton label={CANCEL_LABEL} icon="close" onRun={() => dispatch('setup.cancel', cancelPullParams(model.id))} />
+            <ActionButton
+              label={CANCEL_LABEL}
+              icon="close"
+              onRun={() => dispatch('setup.cancel', cancelPullParams(model.id))}
+              outcomeFor={cancelOutcome}
+            />
           </div>
         </div>
       )}
@@ -610,6 +622,7 @@ function ActionButton({
   icon,
   successLabel,
   pendingLabel,
+  outcomeFor,
 }: {
   label: string;
   onRun: () => Promise<unknown>;
@@ -617,28 +630,39 @@ function ActionButton({
   icon?: string;
   successLabel?: string | undefined;
   pendingLabel?: string;
+  outcomeFor?: (result: unknown) => ActionOutcome | undefined;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
-  const [success, setSuccess] = useState(false);
+  const [successText, setSuccessText] = useState<string | undefined>(undefined);
   const genuinelyDisabled = disabledReason !== undefined;
 
   useEffect(() => {
-    if (!success) return;
-    const timer = setTimeout(() => setSuccess(false), 4000);
+    if (successText === undefined) return;
+    const timer = setTimeout(() => setSuccessText(undefined), 4000);
     return () => clearTimeout(timer);
-  }, [success]);
+  }, [successText]);
 
   const onClick = () => {
     if (genuinelyDisabled || pending) return;
     setPending(true);
     setError(undefined);
-    setSuccess(false);
+    setSuccessText(undefined);
     void onRun().then(
       (result: unknown) => {
         setPending(false);
         if (result === DECLINED) return; // C-2 lock: neither success nor failure
-        if (successLabel !== undefined) setSuccess(true);
+        if (outcomeFor !== undefined) {
+          const outcome = outcomeFor(result);
+          if (outcome === undefined) return;
+          if (outcome.tone === 'failure') {
+            setError(outcome.text);
+            return;
+          }
+          setSuccessText(outcome.text);
+          return;
+        }
+        if (successLabel !== undefined) setSuccessText(successLabel);
       },
       (err: unknown) => {
         setPending(false);
@@ -647,7 +671,7 @@ function ActionButton({
     );
   };
 
-  const liveText = error ? `✗ ${error}` : success && successLabel !== undefined ? successLabel : '';
+  const liveText = error ? `✗ ${error}` : (successText ?? '');
   const liveClass = error ? 'text-2xs text-del' : 'text-2xs text-add';
 
   return (
