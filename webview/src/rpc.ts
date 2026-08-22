@@ -146,7 +146,17 @@ export class RpcClient {
       if (effectiveTimeoutMs > 0) {
         handle = this.setTimer(() => {
           if (this.pending.delete(requestId)) {
-            reject(new Error(`control.request '${method}' timed out after ${effectiveTimeoutMs}ms`));
+            // UX-12 (WS-UX Phase-2, docs/superpowers/plans/2026-08-22-ws-ux-phase2.md
+            // Task 25): raw milliseconds ("timed out after 30000ms") read as a bug
+            // report, not a status. Human copy: seconds (not ms), honest
+            // uncertainty (the agent may still be working — this is a client-side
+            // giveup, not proof of failure), and a next step.
+            const seconds = Math.round(effectiveTimeoutMs / 1000);
+            reject(
+              new Error(
+                `The agent didn't reply within ${seconds} seconds ('${method}'). It may still be busy — try again, or check the connection banner.`,
+              ),
+            );
           }
         }, effectiveTimeoutMs);
       }

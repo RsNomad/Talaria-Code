@@ -74,10 +74,18 @@ describe('RpcClient — id-correlated request/response (Part A2)', () => {
     await expect(pending).rejects.toThrow(/gateway not connected/);
   });
 
-  it('rejects with a timeout when no response arrives within timeoutMs', async () => {
+  // UX-12 (WS-UX Phase-2, docs/superpowers/plans/2026-08-22-ws-ux-phase2.md
+  // Task 25): the raw-ms "control.request 'method' timed out after 30000ms"
+  // copy read as a bug report, not a status — this pin is the human
+  // replacement (seconds, honest uncertainty, next steps). Reuses this
+  // suite's existing fake-timer timeout fixture (injected `setTimeout`
+  // captures the callback; the test fires it manually rather than waiting).
+  // No `timeoutMs` override here so `effectiveTimeoutMs` is the ordinary
+  // `DEFAULT_TIMEOUT_MS` (30_000) — matching the "30 seconds" the message
+  // asserts below.
+  it("UX-12: rejects with human copy (seconds, honest uncertainty), not raw milliseconds, when no response arrives within timeoutMs", async () => {
     let fireTimeout: (() => void) | undefined;
     const rpc = new RpcClient(() => {}, {
-      timeoutMs: 100,
       setTimeout: (fn) => {
         fireTimeout = fn;
         return 1;
@@ -91,7 +99,9 @@ describe('RpcClient — id-correlated request/response (Part A2)', () => {
     expect(fireTimeout).toBeDefined();
     fireTimeout?.();
 
-    await expect(pending).rejects.toThrow(/timed out/i);
+    await expect(pending).rejects.toThrow(
+      /The agent didn't reply within 30 seconds \('config\.show'\)\. It may still be busy — try again, or check the connection banner\./,
+    );
   });
 
   it('clears the timeout when the response arrives in time (no late rejection)', async () => {
