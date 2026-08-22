@@ -1878,3 +1878,33 @@ describe('WS-R4 characterization — the SIX loadReplayOutcome arms (REMEDIATION
     expect(emitted.filter((m) => m.type === 'turn.end' && m.status === 'complete')).toHaveLength(0);
   });
 });
+
+/**
+ * ADR-UX-P2-2 (WS-UX Phase-2, Task 3): `endForRestart`'s replay arm must
+ * close the bracket with `status:'cancelled'`, not `'error'` — extending
+ * V-12's own reasoning (the live-turn arm already does this) to the replay
+ * arm. `endForRestart` is reached only on user-intended paths (per-tab New
+ * Session, explicit restart fan-out, T16 force-reconnect), so an in-flight
+ * replay it interrupts was abandoned by user choice, not broken.
+ * `endOnCrash` (a real failure path) keeps `'error'` in both arms —
+ * untouched by this task.
+ *
+ * Reuses the `makeLoadHarness`/`FakeLoadClient` fixture from the WS-R4
+ * `loadReplayOutcome` suite above: `loadSession()` never resolves, so
+ * `this.replay` stays set exactly like the "mid-await" arms there — the
+ * same in-flight-replay state `endForRestart` must interrupt.
+ */
+describe('SessionController.endForRestart — ADR-UX-P2-2 (replay arm)', () => {
+  it('landing MID-REPLAY closes the replay bracket with status "cancelled" (user-intended), not "error"', () => {
+    const { controller, emitted } = makeLoadHarness();
+    // Arrange: an in-flight replay (this.replay set, client.loadSession()
+    // never resolves) — the same pending-loadSession fixture the
+    // loadReplayOutcome suite uses.
+    void controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    // Act:
+    controller.endForRestart();
+    // Assert: the closing bracket is user-intent vocabulary, not 'error'.
+    const end = emitted.find((m) => m.type === 'turn.end');
+    expect(end).toMatchObject({ type: 'turn.end', status: 'cancelled' });
+  });
+});

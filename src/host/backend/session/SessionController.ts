@@ -1396,12 +1396,15 @@ export class SessionController {
    * endOnCrash} — reuses that method's exact live-turn/replay arms
    * (release the root turn-lease, emit the closing `turn.end` bracket, mark
    * subagents interrupted) instead of inventing a second mechanism. The ONE
-   * difference: the live-turn arm's `turn.end` carries `status:'cancelled'`,
-   * not `'error'` — this end is USER-intended (an explicit restart / "New
-   * Session"), never a failure. Called by `ConnectionSupervisor`'s restart
-   * fan-out (`startInternal`, BEFORE `teardownSession()`) while this
-   * controller is still registered and the port is live — the same
-   * reasoning that lets `endOnCrash` emit safely.
+   * difference from endOnCrash: BOTH arms' `turn.end` carry
+   * `status:'cancelled'`, not `'error'` — this end is USER-intended (an
+   * explicit restart / "New Session" / force reconnect), never a failure;
+   * a replay abandoned by user choice is abandoned, not broken
+   * (ADR-UX-P2-2, WS-UX Phase-2 plan 2026-08-22; extends V-12's own
+   * principle to the replay arm — endOnCrash alone keeps 'error'). Called
+   * by `ConnectionSupervisor`'s restart fan-out (`startInternal`, BEFORE
+   * `teardownSession()`) while this controller is still registered and the
+   * port is live — the same reasoning that lets `endOnCrash` emit safely.
    */
   endForRestart(): void {
     // M1 (Task 8 follow-up, concurrency-lens review): see endOnCrash's
@@ -1420,7 +1423,7 @@ export class SessionController {
       this.subagents.setReplaying(false);
       this.replay = undefined;
       this.currentTurnId = undefined;
-      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status: 'error' });
+      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status: 'cancelled' });
       this.markSubagentsInterrupted();
     }
   }
