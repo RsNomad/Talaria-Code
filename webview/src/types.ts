@@ -187,6 +187,15 @@ export interface TabState {
   transcript: TranscriptItem[];
   plan: PlanStepView[];
   turnActive: boolean;
+  /**
+   * UX-03: Stop was dispatched and no terminal has arrived yet — drives the
+   * composer's disabled "Stopping…" affordance + SR announcement. Set by
+   * `local.stopPending` at Stop-click time; cleared EVERYWHERE `turnActive`
+   * clears (turn.end all statuses, clear, tab.clear). Deliberately NOT
+   * hydrate-carried: a re-created webview drops the pending flag — the turn
+   * either ends (clearing is then a no-op) or the user presses Stop again.
+   */
+  stopPending: boolean;
   currentModelId: string | null;
   /** Per-tab (Q-7 decided) — W2-F1 edit-policy preset. */
   preset: EditPolicyPreset;
@@ -449,6 +458,7 @@ export function makeTabState(tabId: string, title: string): TabState {
     transcript: [],
     plan: [],
     turnActive: false,
+    stopPending: false,
     currentModelId: null,
     preset: DEFAULT_PRESET,
     activeModeId: null,

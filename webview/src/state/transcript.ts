@@ -157,7 +157,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       // (absent ≡ initial), never by writing an explicit `undefined` —
       // TabState.error stays `?: {...}`, no `| undefined` widening.
       const { error: _clearedError, ...rest } = tab;
-      return { ...rest, transcript: [], plan: [], turnActive: false };
+      return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false };
     }
 
     case 'turn.end': {
@@ -168,7 +168,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
         // papered over client-side. `closeOpenMessages` still runs its own
         // narrower MID-TURN role here (settling only a still-streaming
         // `message` block) — unchanged, pre-dates this fork.
-        return { ...tab, turnActive: false, transcript: closeOpenMessages(tab.transcript) };
+        return { ...tab, turnActive: false, stopPending: false, transcript: closeOpenMessages(tab.transcript) };
       }
       // V-5/V-4 + CF-06/R2: the webview mirror of the host's
       // `markSubagentsInterrupted` — a turn ending anything other than
@@ -177,7 +177,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       // item — message, reasoning, tool, approval alike — must stop lying
       // about being live. Derived in one place (settleOpenItems) instead of
       // enumerated per-kind here.
-      return { ...tab, turnActive: false, transcript: settleOpenItems(tab.transcript), plan: settlePlanSteps(tab.plan) };
+      return { ...tab, turnActive: false, stopPending: false, transcript: settleOpenItems(tab.transcript), plan: settlePlanSteps(tab.plan) };
     }
 
     case 'user': {
@@ -945,7 +945,7 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // boolean value, not the exactOptional case).
       return foldTabScoped(state, msg.tabId, 'tab.clear', (tab) => {
         const { error: _clearedError, ...rest } = tab;
-        return { ...rest, transcript: [], plan: [], turnActive: false, openFailed: false, sessionLost: false };
+        return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false, openFailed: false, sessionLost: false };
       });
 
     // ---- generic session-scoped fold (drop-unknown; §2e reuses foldTab) ----
@@ -1131,6 +1131,8 @@ export type LocalAction =
       type: 'local.scopedRefreshError.dismiss';
       target: { panel: 'sessions' } | { panel: 'checkpoints'; rootId: string } | { panel: 'subagents'; tabId: string };
     }
+  // UX-03: Stop clicked — paired by the caller with the 'cancel' post (this reducer never posts).
+  | { type: 'local.stopPending'; tabId: string }
   // Part X2: a panel's own loading/error transitions (fed by fetchPanel).
   | PanelAction;
 
@@ -1464,6 +1466,13 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
 
     case 'local.draft.clear':
       return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, draft: '', draftAttachments: [] }));
+
+    case 'local.stopPending':
+      // UX-03: only meaningful while a turn is live — a stray dispatch on an
+      // idle tab must not paint a "Stopping…" nothing will ever clear.
+      return foldTabScoped(state, action.tabId, action.type, (tab) =>
+        tab.turnActive ? { ...tab, stopPending: true } : tab,
+      );
 
     default:
       return state;

@@ -2501,3 +2501,35 @@ describe('UX-02: gateway.health folds into AppState.gatewayHealth (connection-gl
     expect(activeTab(state).turnActive).toBe(true); // untouched
   });
 });
+
+describe('UX-03: stop lifecycle — stopPending', () => {
+  it('local.stopPending marks the live tab; turn.end{cancelled} clears it with turnActive', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
+    expect(activeTab(state).stopPending).toBe(true);
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'cancelled' });
+    expect(activeTab(state).stopPending).toBe(false);
+    expect(activeTab(state).turnActive).toBe(false);
+  });
+
+  it('every terminal clears it — complete and error too (the pending stop must never outlive its turn)', () => {
+    for (const status of ['complete', 'error'] as const) {
+      let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+      state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
+      state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status });
+      expect(activeTab(state).stopPending).toBe(false);
+    }
+  });
+
+  it('local.stopPending on an idle tab is a no-op (nothing would ever clear it)', () => {
+    const state = reduceLocal(INITIAL_STATE, { type: 'local.stopPending', tabId: INITIAL_STATE.activeTabId });
+    expect(activeTab(state).stopPending).toBe(false);
+  });
+
+  it('clear resets stopPending alongside turnActive', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
+    state = reduce(state, { type: 'clear', sessionId: 's1' });
+    expect(activeTab(state).stopPending).toBe(false);
+  });
+});
