@@ -12,6 +12,7 @@ import type { SessionSummary, SessionsData, WebviewToHost } from '../protocol';
 import { busyInteraction } from '../components/busyInteraction';
 import { ConfirmStrip } from '../components/ConfirmStrip';
 import { Icon } from '../components/Icon';
+import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
 import { EmptyPanel, PanelShell } from './PanelShell';
 import { loadMoreFooterState } from '../state/panels';
@@ -79,6 +80,46 @@ interface SessionsPanelProps {
    *  RemoteData so a failed append never wipes the list above. `undefined`
    *  when idle or after a successful retry. */
   loadMoreError?: string;
+  /**
+   * UX-04b: the webview watchdog's own fallback notice (`useSessionLoadWatchdog`,
+   * `App.tsx`) — set only when a committed History load's `pendingSessionLoad`
+   * outlives 130s with NO host terminal (`tab.bound`/`tab.error`) at all. This
+   * is DEFENSE IN DEPTH over WS-R4's host-side `SESSION_ESTABLISH_DEADLINE_MS`
+   * (120s), so in practice it should almost never fire. `undefined` (the
+   * common case) renders nothing.
+   */
+  loadNotice?: { text: string; onDismiss: () => void } | undefined;
+}
+
+/**
+ * UX-04b: the watchdog notice's own render — factored out of `SessionsPanel`
+ * so BOTH its return paths (the zero-sessions early return and the main
+ * list return, below) render the identical banner + LiveRegion at the TOP
+ * of the shell, above/outside the row collection (Task 19's `role="list"`
+ * wrapper never gains a non-listitem child). The LiveRegion is
+ * PERMANENTLY mounted (Finding-7 discipline, `LiveRegion.tsx`'s own doc):
+ * only its text swaps, the region itself is never conditionally rendered.
+ */
+function LoadNotice({ notice }: { notice: SessionsPanelProps['loadNotice'] }) {
+  return (
+    <>
+      <LiveRegion text={notice?.text ?? ''} className="sr-only" />
+      {notice && (
+        <div className="mb-2 flex items-start gap-2 rounded border border-warn bg-warn-soft px-2 py-1.5 text-2xs text-fg">
+          <Icon name="warning" size={12} className="mt-0.5 flex-none text-warn" />
+          <span className="min-w-0 flex-1">{notice.text}</span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={notice.onDismiss}
+            className="flex-none rounded p-0.5 text-faint hover:text-del"
+          >
+            <Icon name="close" size={11} />
+          </button>
+        </div>
+      )}
+    </>
+  );
 }
 
 export function SessionsPanel({
@@ -91,6 +132,7 @@ export function SessionsPanel({
   onLoadMore,
   loadingMore,
   loadMoreError,
+  loadNotice,
 }: SessionsPanelProps) {
   /**
    * C4: which row (by session id) is currently asking "Load anyway?" — at
@@ -110,6 +152,7 @@ export function SessionsPanel({
   if (data.sessions.length === 0) {
     return (
       <PanelShell title="History">
+        <LoadNotice notice={loadNotice} />
         <EmptyPanel hint="No past sessions yet." />
       </PanelShell>
     );
@@ -139,6 +182,7 @@ export function SessionsPanel({
 
   return (
     <PanelShell title="History" meta={`${data.sessions.length} sessions`}>
+      <LoadNotice notice={loadNotice} />
       {/* Task 19 (WCAG 1.3.1, WV4-MIN): the row collection was `div` soup —
           no `role="list"`/`role="listitem"` at all, so AT could not count or
           navigate rows as a set. The "Load more" footer below is a distinct,

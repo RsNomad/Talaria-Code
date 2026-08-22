@@ -56,6 +56,7 @@ import { idle } from './state/remoteData';
 import { createInitialState, type AppState, type TabState } from './types';
 import type { ComposerSeed } from './composer/applySeed';
 import { useHostActions } from './hooks/useHostActions';
+import { useSessionLoadWatchdog } from './hooks/useSessionLoadWatchdog';
 
 import { PriorityTabs, panelTabDomId, panelTabpanelId } from './components/PriorityTabs';
 import { TabStrip, tabDomId, CHAT_TABPANEL_ID } from './components/TabStrip';
@@ -192,6 +193,24 @@ export function App() {
   // append surfaces its own error affordance WITHOUT replacing the
   // already-loaded list (see `loadMoreFooterState`, state/panels.ts).
   const [sessionsLoadMoreError, setSessionsLoadMoreError] = useState<string | undefined>(undefined);
+
+  // UX-04b: a webview-side watchdog on `state.pendingSessionLoad` — DEFENSE
+  // IN DEPTH over WS-R4's host-side `SESSION_ESTABLISH_DEADLINE_MS` (120s,
+  // now merged on this branch, which already closes the wedge host-side).
+  // This hook fires only when NO host terminal (`tab.bound`/`tab.error`)
+  // ever arrives for a committed History load at all. `sessionLoadNotice`
+  // drives SessionsPanel's dismissible banner AND its permanently-mounted
+  // sr-only LiveRegion (Finding-7 discipline: the region itself is never
+  // conditionally mounted, only its text swaps) — cleared here on dismiss,
+  // and by `loadSession` below (the real `onLoad` path) the instant a NEW
+  // load starts, so a stale notice can never linger over a fresh attempt.
+  const [sessionLoadNotice, setSessionLoadNotice] = useState<string | undefined>(undefined);
+  useSessionLoadWatchdog(state.pendingSessionLoad, () => {
+    dispatch({ local: { type: 'local.sessionLoad.timeout' } });
+    setSessionLoadNotice(
+      'Still no reply from the agent after 130 seconds — the load may be stuck. Force reconnect from the connection banner, or click the session again.',
+    );
+  });
 
   // C4: every session id currently bound to an open tab — a History row for
   // one of these already has a live tab somewhere, so it gets a bound marker
@@ -626,6 +645,15 @@ export function App() {
         (err) => setSessionsLoadMoreError(errorMessage(err)),
       )
       .finally(() => setSessionsLoadingMore(false));
+  };
+
+  // UX-04b: the real `onLoad` path SessionsPanel calls into — clears any
+  // stale watchdog notice the instant a NEW load starts (TI-1/AU-39's own
+  // "committed load" moment, the same moment `hostActions.loadSession`
+  // dispatches `local.sessionLoad.start`), then delegates to it unchanged.
+  const loadSession = (message: Parameters<typeof hostActions.loadSession>[0]) => {
+    setSessionLoadNotice(undefined);
+    hostActions.loadSession(message);
   };
 
   // W2 T2e (§2e/§3.1): the `@file`/`@folder` submenu's file source, threaded
@@ -1178,7 +1206,7 @@ export function App() {
                   activeTabId={state.activeTabId}
                   boundSessionIds={boundSessionIds}
                   activeTabHasLiveTurn={tab.turnActive}
-                  onLoad={hostActions.loadSession}
+                  onLoad={loadSession}
                   /* exactOptional prep (arm 1): `SessionsPanelProps`
                      (`panels/SessionsPanel.tsx`, outside this batch) declares
                      both as `?: string` — spread each key in only when present. */
@@ -1188,6 +1216,16 @@ export function App() {
                   onLoadMore={loadMoreSessions}
                   loadingMore={sessionsLoadingMore}
                   {...(sessionsLoadMoreError !== undefined ? { loadMoreError: sessionsLoadMoreError } : {})}
+                  // UX-04b: `loadNotice?: {...} | undefined` — unlike the
+                  // spread-omission props above, this type explicitly
+                  // includes `| undefined`, so assigning it directly (rather
+                  // than omitting the key) type-checks under
+                  // exactOptionalPropertyTypes.
+                  loadNotice={
+                    sessionLoadNotice !== undefined
+                      ? { text: sessionLoadNotice, onDismiss: () => setSessionLoadNotice(undefined) }
+                      : undefined
+                  }
                 />
               )}
             </RemotePanel>

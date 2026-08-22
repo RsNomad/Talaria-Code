@@ -1138,6 +1138,15 @@ export type LocalAction =
   // .pendingSessionLoad`'s own doc for the clearing half (the `tab.bound`/
   // `tab.error` cases below).
   | { type: 'local.sessionLoad.start'; tabId: string; sessionId: string }
+  // UX-04b: the webview-side watchdog's own fallback timeout — DEFENSE IN
+  // DEPTH over WS-R4's host-side `SESSION_ESTABLISH_DEADLINE_MS` (120s):
+  // this fires (`useSessionLoadWatchdog`, `hooks/useSessionLoadWatchdog.ts`)
+  // only when NO host terminal (`tab.bound`/`tab.error`) ever arrives for
+  // the pending load at all. Carries no `tabId` — the hook is armed against
+  // the CURRENT `pendingSessionLoad` snapshot already, so there is nothing
+  // left to match; the fold below clears it unconditionally, same as
+  // `local.dismissSystemError`'s single-slot clear just below.
+  | { type: 'local.sessionLoad.timeout' }
   // TI-3 (AU-42 Part B): dismisses one panel's `refreshError` banner — the
   // OTHER way it clears besides that panel's next success push (see
   // `AppState.refreshError`'s own doc). `panel` is scoped to
@@ -1376,6 +1385,14 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
       });
     case 'local.sessionLoad.start':
       return { ...state, pendingSessionLoad: { tabId: action.tabId, sessionId: action.sessionId } };
+    case 'local.sessionLoad.timeout': {
+      // UX-04b: clears `pendingSessionLoad` by key omission — the same
+      // exactOptional discipline `clearResolvedSessionLoad` (above) already
+      // uses for the host-terminal half; this is the webview watchdog's own
+      // fallback half. Nothing else in state changes.
+      const { pendingSessionLoad: _clearedPendingSessionLoadOnTimeout, ...rest } = state;
+      return rest;
+    }
     case 'local.dismissSystemError': {
       // exactOptional prep (arm 1): clear by omitting the key.
       const { systemError: _clearedSystemError, ...rest } = state;

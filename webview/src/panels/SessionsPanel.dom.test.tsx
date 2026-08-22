@@ -22,7 +22,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { ReactElement } from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { SessionSummary, SessionsData, WebviewToHost } from '../protocol';
 import { SessionsPanel } from './SessionsPanel';
@@ -48,6 +48,7 @@ function renderPanel(config: {
   nextCursor?: string;
   onLoadMore?: (cursor: string) => void;
   loadingMore?: boolean;
+  loadNotice?: { text: string; onDismiss: () => void };
 }) {
   const data: SessionsData = {
     sessions: config.sessions ?? [session()],
@@ -63,6 +64,7 @@ function renderPanel(config: {
       loadingSessionId={config.loadingSessionId}
       onLoadMore={config.onLoadMore ?? (() => {})}
       loadingMore={config.loadingMore ?? false}
+      loadNotice={config.loadNotice}
     />
   );
 }
@@ -325,5 +327,81 @@ describe('WV4-MIN (Task 19, WCAG 1.3.1): History rows carry list/listitem semant
 
     expect(screen.getByRole('list')).toBeInTheDocument();
     expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});
+
+/**
+ * UX-04b: the webview watchdog's own fallback notice (`useSessionLoadWatchdog`,
+ * `App.tsx`) — DEFENSE IN DEPTH over WS-R4's host-side
+ * `SESSION_ESTABLISH_DEADLINE_MS`. `loadNotice` is `undefined` in every other
+ * test in this file (the `renderPanel` default), so those stay an implicit
+ * characterization that the banner adds nothing when absent.
+ */
+describe('UX-04b: the History-load watchdog notice', () => {
+  it('with no loadNotice, renders no banner and an empty (but present) sr-only live region', () => {
+    setup(renderPanel({}));
+
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+    // Finding-7: the LiveRegion is ALWAYS mounted — only its text is empty.
+    expect(screen.getByRole('status')).toHaveTextContent('');
+  });
+
+  it('with a loadNotice set, renders the warning banner text AND announces it via the sr-only role="status" region', () => {
+    setup(
+      renderPanel({
+        loadNotice: {
+          text: 'Still no reply from the agent after 130 seconds — the load may be stuck. Force reconnect from the connection banner, or click the session again.',
+          onDismiss: () => {},
+        },
+      }),
+    );
+
+    // Two copies of the text exist by design: the visible banner AND the
+    // permanently-mounted sr-only LiveRegion (Finding-7) that announces it.
+    expect(
+      screen.getAllByText(
+        'Still no reply from the agent after 130 seconds — the load may be stuck. Force reconnect from the connection banner, or click the session again.',
+      ),
+    ).toHaveLength(2);
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Still no reply from the agent after 130 seconds — the load may be stuck. Force reconnect from the connection banner, or click the session again.',
+    );
+  });
+
+  it('the banner sits ABOVE/OUTSIDE the row list — its Dismiss button is not one of the list\'s descendants', () => {
+    setup(
+      renderPanel({
+        sessions: [session({ id: 'sess-1', title: 'Fix the bug' })],
+        loadNotice: { text: 'Stuck.', onDismiss: () => {} },
+      }),
+    );
+
+    const list = screen.getByRole('list');
+    expect(within(list).queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument();
+  });
+
+  it('clicking Dismiss calls onDismiss (the caller, App.tsx, is what actually clears the notice)', async () => {
+    const onDismiss = () => {
+      dismissed = true;
+    };
+    let dismissed = false;
+    const { user } = setup(renderPanel({ loadNotice: { text: 'Stuck.', onDismiss } }));
+
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }));
+
+    expect(dismissed).toBe(true);
+  });
+
+  it('renders the banner above the EmptyPanel hint too — the empty-sessions path keeps the same top-of-shell placement', () => {
+    setup(
+      renderPanel({
+        sessions: [],
+        loadNotice: { text: 'Stuck.', onDismiss: () => {} },
+      }),
+    );
+
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument();
+    expect(screen.getByText('No past sessions yet.')).toBeInTheDocument();
   });
 });

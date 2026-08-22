@@ -1344,6 +1344,26 @@ describe('transcript reducer — TI-1 (AU-39): pendingSessionLoad clears on the 
   });
 });
 
+describe('transcript reducer — UX-04b: local.sessionLoad.timeout (webview-side watchdog fallback, defense in depth over WS-R4\'s host-side deadline)', () => {
+  it('clears pendingSessionLoad, mirroring clearResolvedSessionLoad\'s key-omission discipline', () => {
+    let state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    expect(state.pendingSessionLoad).toEqual({ tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1' });
+
+    state = reduceLocal(state, { type: 'local.sessionLoad.timeout' });
+    expect(state.pendingSessionLoad).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(state, 'pendingSessionLoad')).toBe(false);
+  });
+
+  it('is a no-op when nothing is pending', () => {
+    const state = reduceLocal(INITIAL_STATE, { type: 'local.sessionLoad.timeout' });
+    expect(state.pendingSessionLoad).toBeUndefined();
+  });
+});
+
 describe('transcript reducer — W4-T3b D1: the checkpoints eternal-spinner fix (App-read <-> push-key consistency)', () => {
   it('fetch-loading -> tab.bound{rootId} -> checkpoints push{rootId} resolves the ACTIVE tab\'s rootPanels slice to success, not a stuck idle/loading', () => {
     // 1. The panel is opened BEFORE the tab is bound — a `local.panelLoading`
