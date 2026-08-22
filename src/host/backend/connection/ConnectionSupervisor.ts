@@ -3,8 +3,8 @@ import type { Logger } from '../../transport/JsonRpcStdio';
 import type { HermesRuntimeConfig } from '../../runtime/resolveHermes';
 import { resolveHermes } from '../../runtime/resolveHermes';
 import { respawnBackoffMs } from '../../control/respawnBackoff';
-import { respawnHealthForAttempt } from '../../control/respawnHealth';
-import type { RespawnHealth, RespawnHealthState } from '../../control/respawnHealth';
+import { respawnHealthForAttempt, RespawnHealthTracker } from '../../control/respawnHealth';
+import type { RespawnHealth } from '../../control/respawnHealth';
 import { describeError, isAuthRequiredError } from '../../../shared/errorText';
 import { BOOTSTRAP_TAB_ID } from '../../../shared/protocol';
 import type { HostToWebviewMessage } from '../../../shared/protocol';
@@ -134,12 +134,11 @@ export class ConnectionSupervisor {
   private acpRespawnAttempts = 0;
   private acpRespawnTimer: ReturnType<typeof setTimeout> | undefined;
 
-  /** WS-R3 F2-19b: health-transition subscribers for the ACP supervisor's
-   * OWN respawn loop — mirrors ControlChannel's `healthHandlers`/
-   * `lastHealthState` field-for-field (the future gateway.health push,
-   * Phase 3 WS-UX wires both loops' `onHealth` to the same panel signal). */
-  private readonly healthHandlers = new Set<(health: RespawnHealth) => void>();
-  private lastHealthState: RespawnHealthState = 'ok';
+  /** WS-R3 F2-19b: the ACP loop's health machinery — the shared
+   * RespawnHealthTracker (same consolidation as ControlChannel; see the
+   * class doc in respawnHealth.ts). `safeLog` keeps the pinned
+   * `[AcpBackend] health handler threw: …` string byte-identical. */
+  private readonly healthTracker = new RespawnHealthTracker((m) => this.safeLog(`[AcpBackend] ${m}`));
 
   /**
    * W4-T5a (Q-10 / F2 / P-W4-6): a snapshot of every session registered at
@@ -211,12 +210,7 @@ export class ConnectionSupervisor {
    * Supervisor-scoped like the crash/reconnect machinery it observes.
    */
   onHealth(handler: (health: RespawnHealth) => void): { dispose(): void } {
-    this.healthHandlers.add(handler);
-    return {
-      dispose: () => {
-        this.healthHandlers.delete(handler);
-      },
-    };
+    return this.healthTracker.onHealth(handler);
   }
 
   /**
@@ -1269,36 +1263,14 @@ export class ConnectionSupervisor {
     }
   }
 
-  /**
-   * WS-R3 F2-19b: emit an `onHealth` transition for the CURRENT attempt
-   * count. Mirrors ControlChannel.emitHealth exactly (F2-19a concurrency
-   * review Minor-1): the WHOLE body is wrapped defensively. Without it, a
-   * pathological failure INSIDE the per-handler catch below (the logger
-   * itself throwing, or `String(err)` throwing on an exotic error) would
-   * escape `emitHealth` entirely. Both call sites — `scheduleAcpRespawn`
-   * (after arming the next backoff, see its own ordering note) and
-   * `startInternal`'s success path (its very last step) — sit on the
-   * respawn loop's critical path, so an escaping throw here must never be
-   * possible: the self-heal loop's "always another attempt" invariant
-   * cannot depend on a subscriber or a logger behaving.
-   */
+  // F2-19a (concurrency review Minor-1): both call sites of `emitHealth`
+  // sit on the respawn loop's critical path — `scheduleAcpRespawn` arms the
+  // next backoff around this call (see its own ordering note) and
+  // `startInternal`'s success path calls it as its very last step — so the
+  // double defensive guard (per-handler + whole-body) now lives in
+  // `RespawnHealthTracker.emit` instead of here; see its class doc.
   private emitHealth(attempts: number): void {
-    try {
-      const state = respawnHealthForAttempt(attempts);
-      if (state === this.lastHealthState) return;
-      this.lastHealthState = state;
-      for (const handler of [...this.healthHandlers]) {
-        try {
-          handler({ state, attempts });
-        } catch (err) {
-          this.safeLog(`[AcpBackend] health handler threw: ${String(err)}`);
-        }
-      }
-    } catch {
-      // Swallow: see the doc comment above. Nothing productive can be done
-      // with a failure of the failure-reporting path itself, and this
-      // function must never be the reason the next backoff isn't armed.
-    }
+    this.healthTracker.emit({ state: respawnHealthForAttempt(attempts), attempts });
   }
 
   /**
@@ -1365,15 +1337,10 @@ export class ConnectionSupervisor {
    * `rootRegistry.disposeAll()`) — that ordering is NOT bundled here, since
    * it is not adjacent in the original.
    *
-   * WS-R3 F2-19b: also clears `healthHandlers` — mirrors
-   * `ControlChannel.dispose()`'s own `eventHandlers.clear()`/
-   * `healthHandlers.clear()` pair. Same synchronous, no-`await`-between
-   * reasoning applies.
    */
   markDisposed(): void {
     this.acpState = 'disposed';
     this.clearAcpRespawnTimer();
-    this.healthHandlers.clear();
   }
 }
 
