@@ -32,6 +32,7 @@ interface RenderComposerProps {
   busy?: boolean;
   stopping?: boolean;
   onCancel?: () => void;
+  onNewSession?: () => void;
 }
 
 // T11: factored out of `renderComposer` so a rerender (a busy -> stopping
@@ -60,7 +61,7 @@ function composerElementForRender(props: RenderComposerProps) {
       onCancel={props.onCancel ?? (() => undefined)}
       onSetPreset={async () => undefined}
       onPickModel={() => undefined}
-      onNewSession={() => undefined}
+      onNewSession={props.onNewSession ?? (() => undefined)}
       availableCommands={[]}
       searchFiles={async () => []}
       pendingSeed={props.pendingSeed}
@@ -1128,5 +1129,102 @@ describe('A11Y-01: focus anchor on Send/Stop unmount (WCAG 2.4.3)', () => {
     expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
     expect(document.activeElement).not.toBe(document.body);
     expect((document.activeElement as HTMLElement).closest('[data-testid="send-stop-wrap"]')).not.toBeNull();
+  });
+});
+
+/**
+ * Task 11 (UX-11): "+ New Session" while a turn is live must ASK first
+ * (ConfirmStrip alertdialog), not silently cancel the running turn.
+ * `busy` (= `tab.turnActive`, wired by App.tsx) is the same live-turn signal
+ * `submit()`'s UI#9-honesty branch already reads. Reuses `ConfirmStrip`
+ * (Task 7) rather than forking a second confirm surface.
+ */
+describe('UX-11: "+ New Session" with a live turn asks first (ConfirmStrip)', () => {
+  it('busy: clicking New Session does NOT start a new session — an alertdialog asks first', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      onNewSession,
+    });
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(onNewSession).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('alertdialog', { name: 'Confirm new session' });
+    expect(dialog).toHaveTextContent(
+      'Starting a new session will cancel the turn still running in this tab.',
+    );
+  });
+
+  it('busy: "New session anyway" starts the new session exactly once and returns focus to the New Session button', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      onNewSession,
+    });
+
+    const newSessionButton = screen.getByRole('button', { name: 'New Session' });
+    await user.click(newSessionButton);
+    await user.click(screen.getByRole('button', { name: 'New session anyway' }));
+
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(newSessionButton);
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
+  });
+
+  it('not busy: clicking New Session starts the new session immediately — no confirm dialog (characterization)', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: false,
+      onNewSession,
+    });
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('the confirm strip auto-dismisses (stale-consent class) when busy flips false out from under it', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      onNewSession,
+    };
+    const { rerender } = renderComposer(baseProps);
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+    expect(screen.getByRole('alertdialog', { name: 'Confirm new session' })).toBeInTheDocument();
+
+    // The live turn ended while the strip was open — the confirm gate must
+    // not survive it (a stale "cancel it anyway" invites a no-op click).
+    rerender(composerElementForRender({ ...baseProps, busy: false }));
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
+    expect(onNewSession).not.toHaveBeenCalled();
   });
 });

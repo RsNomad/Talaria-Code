@@ -34,6 +34,7 @@ import { useFileSearch } from '../composer/useFileSearch';
 import { applySeed, type ComposerSeed } from '../composer/applySeed';
 import { busyInteraction } from './busyInteraction';
 import { useFocusAnchorOnUnmount } from '../hooks/useFocusAnchorOnUnmount';
+import { ConfirmStrip } from './ConfirmStrip';
 
 // W2-F1: the picker replaced the wire AgentMode picker — every preset pins the
 // ACP mode at 'default' and differs only in the client-side edit-policy engine.
@@ -377,6 +378,21 @@ export function Composer({
   // contract ApprovalCard's/DiffCard's own A11Y-01 adoptions document.
   const sendStopWrapRef = useRef<HTMLDivElement | null>(null);
   const armFocusAnchor = useFocusAnchorOnUnmount(sendStopWrapRef);
+
+  // Task 11 (UX-11): "+ New Session" while a turn is live must ASK first
+  // (ConfirmStrip), not silently cancel the running turn — the same
+  // ConfirmStrip contract Task 7/12 already use (role="alertdialog", focus
+  // -> confirm on mount, Escape cancels, every exit calls `returnFocus`).
+  // `newSessionRef` is the strip's trigger/return-focus target.
+  const [confirmingNewSession, setConfirmingNewSession] = useState(false);
+  const newSessionRef = useRef<HTMLButtonElement | null>(null);
+
+  // Same stale-consent class as Task 2/12: if the live turn ends (or is
+  // cancelled) while the strip is open, there is nothing left to warn
+  // about — a lingering "New session anyway" invites a no-op click.
+  useEffect(() => {
+    if (!busy) setConfirmingNewSession(false);
+  }, [busy]);
 
   // B3 (UI M-1) / path doc §2.3: the preset and mode pickers adopt the same
   // APG menu keyboard contract as AttachMenu, via the shared `useMenuFocus`
@@ -1305,8 +1321,17 @@ export function Composer({
           >
             {/* new session */}
             <button
+              ref={newSessionRef}
               type="button"
-              onClick={newSession}
+              onClick={() => {
+                // UX-11: a live turn must be asked about, never silently
+                // cancelled — mirrors submit()'s own UI#9-honesty `busy` gate.
+                if (busy) {
+                  setConfirmingNewSession(true);
+                  return;
+                }
+                newSession();
+              }}
               title="New Session"
               aria-label="New Session"
               className="flex items-center gap-1 rounded-lg border border-border px-2 py-1.5 text-2xs text-muted transition-colors hover:border-accent hover:text-fg"
@@ -1360,6 +1385,29 @@ export function Composer({
             )}
           </div>
         </div>
+
+        {/* UX-11: New-Session-while-busy confirm gate — a full-width sibling
+            below the toolbar row, same slot grammar GatewayHealthBanner's own
+            ConfirmStrip uses (there via `className="basis-full"` inside its
+            `flex-wrap` row; here the parent is `flex-col`, so a plain block
+            sibling already stretches full-width via the default
+            `align-items: stretch` — `mt-2` supplies the same row-gap
+            `basis-full` gave it there). Reuses Task 7's ConfirmStrip rather
+            than a second confirm surface. */}
+        {confirmingNewSession && (
+          <ConfirmStrip
+            className="mt-2"
+            ariaLabel="Confirm new session"
+            message="Starting a new session will cancel the turn still running in this tab."
+            confirmLabel="New session anyway"
+            onConfirm={() => {
+              setConfirmingNewSession(false);
+              newSession();
+            }}
+            onCancel={() => setConfirmingNewSession(false)}
+            returnFocus={() => newSessionRef.current?.focus()}
+          />
+        )}
       </div>
 
       {/* drag overlay */}
