@@ -461,6 +461,61 @@ describe('W3-T6 (CF-11/D2): the composer posts tab.newSession, never the old con
 });
 
 /**
+ * UX-04a: "Starting a new session…" pending state — mirrors the T10
+ * `stopPending` pattern for the New-Session flow (UX-03's own App-level
+ * counterpart is the GatewayHealthBanner describe below; this is the sibling
+ * for the composer's own New Session button). Proves the row + LiveRegion
+ * wiring against a REAL `<App>` render: `App.newSession` dispatches
+ * `local.newSessionPending` before posting `tab.newSession`, and only a
+ * `tab.bound`/`tab.error` terminal ever retires it — nothing in `Composer`
+ * itself owns this state.
+ */
+describe('UX-04a at the App level: "Starting a new session…" pending state', () => {
+  function setup(jsx: ReactElement) {
+    return { user: userEvent.setup(), ...render(jsx) };
+  }
+
+  it('clicking New Session shows the standing row + announces it via role="status"; tab.bound clears both', async () => {
+    const { user } = setup(<App />);
+
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    // The visible row's <span> and the permanently-mounted sr-only
+    // LiveRegion both carry the exact same text (Finding-7 discipline) — a
+    // bare `getByText` would throw on the duplicate match, so this asserts
+    // the COUNT (2) instead, same "duplicate exact text" shape as
+    // GatewayHealthBanner's own describe below, which sidesteps it the same
+    // way (getAllByRole('status').some(...) rather than a bare getByText).
+    expect(screen.getAllByText('Starting a new session…')).toHaveLength(2);
+    const announced = screen
+      .getAllByRole('status')
+      .some((el) => (el.textContent ?? '').includes('Starting a new session…'));
+    expect(announced).toBe(true);
+
+    act(() => {
+      bridge.emit({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 's1', rootId: '/r' });
+    });
+
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+  });
+
+  it('tab.error also clears it (a refusal is a terminal too — the row must not survive a failed New Session)', async () => {
+    const { user } = setup(<App />);
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+    expect(screen.getAllByText('Starting a new session…')).toHaveLength(2);
+
+    act(() => {
+      bridge.emit({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, message: 'no client', kind: 'open-failed' });
+    });
+
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+  });
+});
+
+/**
  * CF-12 review fix (W3-T7, IMP-2): `checkpoint.restore` is wired through an
  * `App.tsx`-owned `restoreCheckpoint` callback that carries BOTH `rootId`
  * (params, multi-root routing) and `tab.tabId` (the `bridge.request` "tag"

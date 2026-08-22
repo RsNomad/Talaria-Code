@@ -684,10 +684,18 @@ function foldHydrateReconcile(state: AppState, seed: WebviewState): AppState {
 
   seedTabs.forEach((entry, index) => {
     const priorTabId = priorTabForSession[entry.sessionId];
-    const base =
+    const rawBase =
       (priorTabId ? state.tabs[priorTabId] : undefined) ??
       state.tabs[entry.tabId] ??
       makeTabState(entry.tabId, state.restoredTitles?.[entry.tabId] ?? `Chat ${index + 1}`);
+    // UX-04a (261faba lesson, mirrors `stopPending: false` below): unlike
+    // `stopPending` (a real boolean), `newSessionPending` is exactOptional
+    // (`?: true`) — cleared by KEY OMISSION so a second hydrate on a
+    // still-live webview can never leak a stale "Starting a new session…"
+    // through `...base` (its own `tab.bound`/`tab.error` terminal already
+    // resolved it if that flow completed; if it hasn't yet, this very
+    // reconcile IS the fresh bind, so the flag is moot either way).
+    const { newSessionPending: _clearedNewSessionPending, ...base } = rawBase;
     tabs[entry.tabId] = {
       ...base,
       tabId: entry.tabId,
@@ -901,18 +909,25 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // read) can never resolve. This is the ONE place `TabState.rootId`
       // ever changes.
       return clearResolvedSessionLoad(
-        foldTabScoped(state, msg.tabId, 'tab.bound', (tab) => ({
-          ...tab,
-          sessionId: msg.sessionId,
-          binding: 'bound',
-          rootId: msg.rootId,
-          title: msg.title ?? tab.title,
-          // Audit G-9: a successful bind is the one thing that retires the marker.
-          openFailed: false,
-          // ARCH-1 (final review, UI I-3): a successful bind is likewise the
-          // one thing that retires the session-lost marker (G-9 parity).
-          sessionLost: false,
-        })),
+        foldTabScoped(state, msg.tabId, 'tab.bound', (tab) => {
+          // UX-04a: `newSessionPending` is exactOptional (`?: true`) — clear
+          // by KEY OMISSION (never `false`/`undefined`), same discipline the
+          // `clear`/`tab.clear` folds already use for `error`. A successful
+          // bind is one of this flag's two terminals.
+          const { newSessionPending: _clearedNewSessionPending, ...rest } = tab;
+          return {
+            ...rest,
+            sessionId: msg.sessionId,
+            binding: 'bound',
+            rootId: msg.rootId,
+            title: msg.title ?? tab.title,
+            // Audit G-9: a successful bind is the one thing that retires the marker.
+            openFailed: false,
+            // ARCH-1 (final review, UI I-3): a successful bind is likewise the
+            // one thing that retires the session-lost marker (G-9 parity).
+            sessionLost: false,
+          };
+        }),
         msg.tabId,
       );
 
@@ -921,18 +936,25 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // for `open-failed`). Audit G-9: `openFailed` outlives the banner so the
       // route back survives a dismissal.
       return clearResolvedSessionLoad(
-        foldTabScoped(state, msg.tabId, 'tab.error', (tab) => ({
-          ...tab,
-          error: { message: msg.message, kind: msg.kind },
-          ...(msg.kind === 'open-failed' ? { openFailed: true } : {}),
-          // ARCH-1 (final review, UI I-3): a lost session is a terminal
-          // transition — regress `binding` so the composer (App.tsx
-          // `disabled={tab.binding !== 'bound'}`) stops accepting sends that
-          // have nowhere to go. `sessionLost` outlives the dismissible banner
-          // exactly like `openFailed` does (G-9 pattern); cleared by the next
-          // successful `tab.bound` above.
-          ...(msg.kind === 'session-lost' ? { binding: 'unbound' as const, sessionLost: true } : {}),
-        })),
+        foldTabScoped(state, msg.tabId, 'tab.error', (tab) => {
+          // UX-04a: the other terminal for `newSessionPending` — every host
+          // refusal path for `tab.newSession` already lands as `tab.error`
+          // (verified — `AcpBackend.newSessionInTabInternal`), so this is the
+          // exhaustive pair with `tab.bound` above. Same key-omission clear.
+          const { newSessionPending: _clearedNewSessionPending, ...rest } = tab;
+          return {
+            ...rest,
+            error: { message: msg.message, kind: msg.kind },
+            ...(msg.kind === 'open-failed' ? { openFailed: true } : {}),
+            // ARCH-1 (final review, UI I-3): a lost session is a terminal
+            // transition — regress `binding` so the composer (App.tsx
+            // `disabled={tab.binding !== 'bound'}`) stops accepting sends that
+            // have nowhere to go. `sessionLost` outlives the dismissible banner
+            // exactly like `openFailed` does (G-9 pattern); cleared by the next
+            // successful `tab.bound` above.
+            ...(msg.kind === 'session-lost' ? { binding: 'unbound' as const, sessionLost: true } : {}),
+          };
+        }),
         msg.tabId,
       );
 
@@ -1142,6 +1164,9 @@ export type LocalAction =
     }
   // UX-03: Stop clicked — paired by the caller with the 'cancel' post (this reducer never posts).
   | { type: 'local.stopPending'; tabId: string }
+  // UX-04a: New Session clicked — paired by the caller (App.newSession) with
+  // the 'tab.newSession' post that follows (this reducer never posts).
+  | { type: 'local.newSessionPending'; tabId: string }
   // Part X2: a panel's own loading/error transitions (fed by fetchPanel).
   | PanelAction;
 
@@ -1482,6 +1507,14 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
       return foldTabScoped(state, action.tabId, action.type, (tab) =>
         tab.turnActive ? { ...tab, stopPending: true } : tab,
       );
+
+    case 'local.newSessionPending':
+      // UX-04a: unlike stopPending, unconditional — New Session is legal on
+      // any tab (bound or not, idle or live-turn; Composer's own Task-11
+      // confirm gate is what asks first while busy, not this fold). Cleared
+      // by `tab.bound`/`tab.error` below (exhaustive terminals for the
+      // `tab.newSession` post App.newSession issues right after this).
+      return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, newSessionPending: true }));
 
     default:
       return state;

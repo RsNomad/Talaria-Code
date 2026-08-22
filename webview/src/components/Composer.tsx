@@ -94,6 +94,16 @@ interface ComposerProps {
    * "Stopping" affordance + the SR announcement. App wires `tab.stopPending`. */
   stopping: boolean;
   /**
+   * UX-04a: New Session dispatched, no `tab.bound`/`tab.error` terminal has
+   * arrived yet — the New Session button's mirror of `stopping` above. App
+   * wires `tab.newSessionPending === true`; the standing "Starting a new
+   * session…" row + its SR announcement are App's own (this component only
+   * needs the flag for the button's `busyInteraction` posture). Optional
+   * (unlike `stopping`, which App has always passed) — existing fixtures
+   * that omit it default to "not pending", same posture `disabled` uses.
+   */
+  newSessionPending?: boolean;
+  /**
    * W4 §2e: the per-tab composer latch — the multi-tab generalization of the
    * old `backendStarted` latch. Disabled (textarea + send both inert) until
    * the ACTIVE tab's `binding === 'bound'`; a fresh unbound/pending tab
@@ -304,6 +314,7 @@ export function Composer({
   modelLabel,
   busy,
   stopping,
+  newSessionPending = false,
   disabled = false,
   disabledPlaceholder,
   activeModeId = null,
@@ -970,6 +981,14 @@ export function Composer({
   // is "removed" (no separate remove-affordance in v1, per the brief).
   const draftMentions = parseMentions(draft);
 
+  // UX-04a: mirrors `stopInteraction` (computed inline below for Stop) —
+  // busy-focusable while a New Session request is in flight (dispatched, no
+  // `tab.bound`/`tab.error` yet), guarding the click against a double-
+  // dispatch. `false` first arg: nothing genuinely disables this button —
+  // only the in-flight state goes busy (busyInteraction's MIXED-site
+  // convention, same as GatewayHealthBanner's `reconnectInteraction`).
+  const newSessionInteraction = busyInteraction(false, newSessionPending);
+
   return (
     <div
       ref={rootRef}
@@ -1342,15 +1361,24 @@ export function Composer({
               onClick={() => {
                 // UX-11: a live turn must be asked about, never silently
                 // cancelled — mirrors submit()'s own UI#9-honesty `busy` gate.
+                // This gate runs FIRST; the UX-04a pending-busy posture below
+                // only ever applies AFTER `newSession()` actually dispatches.
                 if (busy) {
                   setConfirmingNewSession(true);
                   return;
                 }
+                // UX-04a: guard against a double-dispatch while a prior New
+                // Session request is still in flight (busyInteraction's
+                // click-guard, standing in for native `disabled`).
+                if (!newSessionInteraction.interactive) return;
                 newSession();
               }}
+              disabled={newSessionInteraction.nativeDisabled}
+              aria-disabled={newSessionInteraction.ariaDisabled}
+              aria-busy={newSessionInteraction.ariaBusy}
               title="New Session"
               aria-label="New Session"
-              className="flex items-center gap-1 rounded-lg border border-border px-2 py-1.5 text-2xs text-muted transition-colors hover:border-accent hover:text-fg"
+              className="flex items-center gap-1 rounded-lg border border-border px-2 py-1.5 text-2xs text-muted transition-colors hover:border-accent hover:text-fg aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
             >
               <Icon name="add" size={13} />
               {!narrow && <span>New Session</span>}

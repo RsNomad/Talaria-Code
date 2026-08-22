@@ -585,6 +585,31 @@ describe('transcript reducer — W6-FF (3-way ARCH I-1): hydrate reconciles the 
     expect(hydrated.tabs[priorTabId]).toMatchObject({ stopPending: false });
   });
 
+  /** UX-04a (mirrors the T10/261faba lesson immediately above): `newSessionPending`
+   * is likewise NOT hydrate-carried — `local.newSessionPending` sets it at
+   * New-Session-click time, and only `tab.bound`/`tab.error` (the terminal
+   * response to the `tab.newSession` post that follows) ever clear it. A
+   * reload/second-hydrate on a still-live webview must never resurrect a
+   * stale "Starting a new session…" that its own terminal already resolved.
+   * Unlike `stopPending: false` (a real boolean), the exactOptional `?: true`
+   * field can only be cleared by KEY OMISSION — asserted via `toBeUndefined()`
+   * / `not.toHaveProperty`, never a `false` literal. */
+  it('clears newSessionPending (by key omission) when reconciling a session already bound in the current state — never leaks a stale "Starting a new session…" past its own tab.bound/tab.error', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 'sA' }); // adopts into bootstrap
+    const priorTabId = state.activeTabId;
+    state = reduceLocal(state, { type: 'local.newSessionPending', tabId: priorTabId });
+    expect(state.tabs[priorTabId]?.newSessionPending).toBe(true); // precondition: base really carries it
+
+    const reSeed = {
+      ...twoLiveTabsSeed,
+      tabs: [{ tabId: priorTabId, sessionId: 'sA', cwd: '/root-a', rootId: '/root-a', preset: 'manual' as const }],
+    };
+    const hydrated = reduce(state, { type: 'hydrate', state: reSeed });
+
+    expect(hydrated.tabs[priorTabId]?.newSessionPending).toBeUndefined();
+    expect(hydrated.tabs[priorTabId]).not.toHaveProperty('newSessionPending');
+  });
+
   /** H4-B8 (arch report Minor-2): the seed's per-tab DISPLAY fields
    * (preset/currentModelId/activeModeId/availableCommands) — sourced from
    * each `SessionController`, NOT a new source of truth — so a reconciled
@@ -2570,5 +2595,38 @@ describe('UX-03: stop lifecycle — stopPending', () => {
 
     state = reduce(state, { type: 'tab.clear', tabId: activeTab(state).tabId });
     expect(activeTab(state).stopPending).toBe(false);
+  });
+});
+
+describe('UX-04a: new-session lifecycle — newSessionPending', () => {
+  it('local.newSessionPending marks the tab; tab.bound clears it (by key omission)', () => {
+    let state = reduceLocal(INITIAL_STATE, { type: 'local.newSessionPending', tabId: INITIAL_STATE.activeTabId });
+    expect(activeTab(state).newSessionPending).toBe(true);
+
+    state = reduce(state, { type: 'tab.bound', tabId: activeTab(state).tabId, sessionId: 's1', rootId: '/r' });
+    expect(activeTab(state).newSessionPending).toBeUndefined();
+    expect(activeTab(state)).not.toHaveProperty('newSessionPending');
+  });
+
+  it('tab.error clears it too — a refusal is a terminal exactly like a successful bind (every host refusal path lands as tab.error)', () => {
+    let state = reduceLocal(INITIAL_STATE, { type: 'local.newSessionPending', tabId: INITIAL_STATE.activeTabId });
+    expect(activeTab(state).newSessionPending).toBe(true);
+
+    state = reduce(state, { type: 'tab.error', tabId: activeTab(state).tabId, message: 'no client', kind: 'open-failed' });
+    expect(activeTab(state).newSessionPending).toBeUndefined();
+    expect(activeTab(state)).not.toHaveProperty('newSessionPending');
+  });
+
+  // Unlike `local.stopPending` (turnActive-guarded — Stop is only meaningful
+  // mid-turn), New Session is legal on ANY tab regardless of a live turn —
+  // Composer's own Task-11 confirm gate is what asks first while busy, not
+  // this fold. Sets unconditionally on both an idle and a live-turn tab.
+  it('sets unconditionally — both an idle tab and a live-turn tab (no turnActive guard, unlike stopPending)', () => {
+    const idle = reduceLocal(INITIAL_STATE, { type: 'local.newSessionPending', tabId: INITIAL_STATE.activeTabId });
+    expect(activeTab(idle).newSessionPending).toBe(true);
+
+    let live = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    live = reduceLocal(live, { type: 'local.newSessionPending', tabId: activeTab(live).tabId });
+    expect(activeTab(live).newSessionPending).toBe(true);
   });
 });

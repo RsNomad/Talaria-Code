@@ -76,6 +76,7 @@ import { ErrorBanner } from './components/ErrorBanner';
 import { GatewayHealthBanner } from './components/GatewayHealthBanner';
 import { MockNotice } from './components/MockNotice';
 import { Icon } from './components/Icon';
+import { LiveRegion } from './components/LiveRegion';
 
 type Action = { host: HostToWebview } | { local: LocalAction };
 
@@ -644,6 +645,10 @@ export function App() {
     // the reducer (the draft used to live in Composer's own useState, which
     // `newSession`'s local handler cleared directly — that state is gone now).
     dispatch({ local: { type: 'local.draft.clear', tabId: tab.tabId } });
+    // UX-04a: mark the pending "Starting a new session…" state FIRST (pure
+    // local fold, mirrors `onCancel`'s `local.stopPending`-before-`cancel`
+    // ordering below) — only `tab.bound`/`tab.error` ever clear it.
+    dispatch({ local: { type: 'local.newSessionPending', tabId: tab.tabId } });
     // W3-T6 (CF-11/D2): rebind ONLY this tab — leaves every sibling tab's
     // live turn untouched (the old `{type:'newSession'}` restarted the WHOLE
     // connection, ending every tab). `tab.sessionId` is a hint only; the
@@ -901,6 +906,22 @@ export function App() {
         </div>
       )}
 
+      {/* UX-04a: honest "Starting a new session…" pending state, mirroring
+          the T10 `stopPending`/GatewayHealthBanner posture — visible row +
+          permanently-mounted sr-only LiveRegion (Finding-7 discipline: the
+          region itself is never conditionally mounted, only its text
+          swaps). `!tab.error` gate matches the two standing rows above: a
+          failed New Session lands as `tab.error` (App's own ErrorBanner
+          takes over), so this row never overlaps that banner. `tab.bound`
+          arrival removes both. */}
+      {tab.newSessionPending === true && !tab.error && (
+        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
+          <Icon name="loading" size={12} spin className="flex-none" />
+          <span className="min-w-0 flex-1">Starting a new session…</span>
+        </div>
+      )}
+      <LiveRegion text={tab.newSessionPending === true ? 'Starting a new session…' : ''} className="sr-only" />
+
       {state.activePanel === 'chat' && (
         <ErrorBoundary region="the chat view">
           {/* B2 item 4 (path doc §4 B2, "aria-controls trio"): the ChatView
@@ -960,6 +981,7 @@ export function App() {
             modelLabel={modelLabel(state)}
             busy={tab.turnActive}
             stopping={tab.stopPending}
+            newSessionPending={tab.newSessionPending === true}
             disabled={tab.binding !== 'bound'}
             // ARCH-1 (final review, UI I-3): honest copy for a lost session —
             // "Connecting…" (the default) would be a lie here; nothing is

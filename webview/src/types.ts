@@ -196,6 +196,21 @@ export interface TabState {
    * either ends (clearing is then a no-op) or the user presses Stop again.
    */
   stopPending: boolean;
+  /**
+   * UX-04a: a `tab.newSession` request was dispatched and no `tab.bound`/
+   * `tab.error` terminal has arrived yet — drives the standing "Starting a
+   * new session…" row + SR announcement (App.tsx, below the sessionLost
+   * row) and the New Session button's busy-focusable posture (mirrors
+   * `stopPending` above, minus its `turnActive` guard: New Session is legal
+   * on any tab, bound or not). Set by `local.newSessionPending` at
+   * New-Session-click time, ahead of the `tab.newSession` post. exactOptional
+   * (`?: true`, never `false`/`undefined`): cleared by KEY OMISSION on
+   * `tab.bound`, `tab.error`, and the hydrate reconcile (the T10/261faba
+   * lesson — a reload must never resurrect a stale pending flag; every host
+   * refusal path already lands as `tab.error`, so bound/error are the
+   * exhaustive terminals for this flow).
+   */
+  newSessionPending?: true;
   currentModelId: string | null;
   /** Per-tab (Q-7 decided) — W2-F1 edit-policy preset. */
   preset: EditPolicyPreset;
