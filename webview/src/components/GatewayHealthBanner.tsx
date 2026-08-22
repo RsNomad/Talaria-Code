@@ -12,6 +12,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Icon } from './Icon';
 import { LiveRegion } from './LiveRegion';
+import { ConfirmStrip } from './ConfirmStrip';
+import { busyInteraction } from './busyInteraction';
 import type { GatewayHealthView } from '../types';
 
 function bannerText(health: GatewayHealthView): string {
@@ -48,19 +50,15 @@ export function GatewayHealthBanner({
    * force-reconnect cancels every live turn, so a live turn asks first. */
   const [confirming, setConfirming] = useState(false);
   const reconnectRef = useRef<HTMLButtonElement | null>(null);
-  const confirmRef = useRef<HTMLButtonElement | null>(null);
-  // a11y: focus lands on the confirm control the moment the strip opens.
-  // Synchronous post-commit effect — no rAF needed (unlike useMenuFocus's
-  // open-in-same-tick case): the strip mounts in the very commit that sets
-  // `confirming`, so the node exists when this runs.
-  useEffect(() => {
-    if (confirming) confirmRef.current?.focus();
-  }, [confirming]);
+  // A11Y-07: focus-on-mount and the confirm control itself now live inside
+  // the shared ConfirmStrip (ariaLabel-named alertdialog) — no local
+  // confirmRef/focus-effect needed here.
 
-  // 12b review fix: an open confirm belongs to ONE outage. If health
-  // recovers while the strip is up, the question ("force reconnect will
-  // cancel the turn") is moot — drop it so a LATER outage never resurrects
-  // a stale consent prompt the user did not just ask for.
+  // 12b review fix (Task 2 — untouched by A11Y-07): an open confirm belongs
+  // to ONE outage. If health recovers while the strip is up, the question
+  // ("force reconnect will cancel the turn") is moot — drop it so a LATER
+  // outage never resurrects a stale consent prompt the user did not just ask
+  // for.
   useEffect(() => {
     if (health.state === 'ok') setConfirming(false);
   }, [health.state]);
@@ -85,7 +83,16 @@ export function GatewayHealthBanner({
     );
   };
 
+  // A11Y-07/ADR-UX-P2-1: the trigger goes BUSY (not natively disabled) while
+  // its own request is in flight, so it stays focusable for the moment
+  // ConfirmStrip's `returnFocus` lands back on it mid-flight (see the ADR
+  // test in the .dom.test.tsx). `pending` has no genuine-indefinite half
+  // here — it's a pure in-flight gate — so it goes entirely into the second
+  // (busy) argument, per busyInteraction's MIXED-site convention.
+  const reconnectInteraction = busyInteraction(false, pending);
+
   const requestForceReconnect = () => {
+    if (!reconnectInteraction.interactive) return; // busy guard, mirrors the native disabled it replaced
     if (anyTurnLive) {
       // 12b: never kill a live turn on a title-warning alone — ask first.
       setConfirming(true);
@@ -98,13 +105,9 @@ export function GatewayHealthBanner({
     setConfirming(false);
     // If the turn ended while the strip was open, this is just a normal
     // force reconnect — still correct, nothing left to cancel (see the
-    // race note in this task's header).
+    // race note in this task's header). Focus return is ConfirmStrip's job
+    // now (ADR-UX-P2-1, `returnFocus`) — not this handler's.
     forceReconnect();
-  };
-
-  const cancelConfirm = () => {
-    setConfirming(false);
-    reconnectRef.current?.focus(); // a11y: hand focus back where it came from
   };
 
   return (
@@ -118,46 +121,24 @@ export function GatewayHealthBanner({
             ref={reconnectRef}
             type="button"
             onClick={requestForceReconnect}
-            disabled={pending}
+            disabled={reconnectInteraction.nativeDisabled}
+            aria-disabled={reconnectInteraction.ariaDisabled}
+            aria-busy={reconnectInteraction.ariaBusy}
             title="Force reconnect — cancels any running turn and rebuilds the agent connection"
-            className="flex-none rounded border border-border px-1.5 py-0.5 text-2xs text-fg hover:bg-overlay disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex-none rounded border border-border px-1.5 py-0.5 text-2xs text-fg hover:bg-overlay aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
           >
             {pending ? 'Reconnecting…' : 'Force reconnect'}
           </button>
           {confirming && (
-            <div
-              role="group"
-              aria-label="Confirm force reconnect"
-              className="basis-full rounded border border-warn bg-warn-soft px-2 py-1.5"
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') {
-                  e.stopPropagation();
-                  cancelConfirm();
-                }
-              }}
-            >
-              <div className="flex items-start gap-1.5 text-2xs text-fg">
-                <Icon name="warning" size={12} className="mt-0.5 flex-none text-warn" />
-                <span>A turn is still running — force reconnect will cancel it.</span>
-              </div>
-              <div className="mt-1.5 flex gap-2">
-                <button
-                  ref={confirmRef}
-                  type="button"
-                  onClick={confirmForceReconnect}
-                  className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay"
-                >
-                  Force reconnect anyway
-                </button>
-                <button
-                  type="button"
-                  onClick={cancelConfirm}
-                  className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay"
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
+            <ConfirmStrip
+              className="basis-full"
+              ariaLabel="Confirm force reconnect"
+              message="A turn is still running — force reconnect will cancel it."
+              confirmLabel="Force reconnect anyway"
+              onConfirm={confirmForceReconnect}
+              onCancel={() => setConfirming(false)}
+              returnFocus={() => reconnectRef.current?.focus()}
+            />
           )}
           {failure && <span className="min-w-0 basis-full text-del">{failure}</span>}
         </div>

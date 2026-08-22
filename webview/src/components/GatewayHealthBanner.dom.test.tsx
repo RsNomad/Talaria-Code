@@ -48,7 +48,17 @@ describe('UX-02: GatewayHealthBanner', () => {
     expect(screen.queryByRole('button', { name: 'Force reconnect' })).not.toBeInTheDocument();
   });
 
-  it('Force reconnect: invokes the callback, disables while pending, surfaces + announces a refusal', async () => {
+  /**
+   * A11Y-07/ADR-UX-P2-1 (task-7-brief.md, "Trigger button" adoption): the
+   * OLD assertion (`toBeDisabled()`) encoded the F-8-flavored bug this task
+   * fixes — natively disabling the trigger the instant a request is in
+   * flight blurs a keyboard/screen-reader user to `<body>`, exactly when the
+   * ADR wants focus to LAND there (the confirm→returnFocus path returns
+   * focus to this very button while it reads "Reconnecting…"). Rewritten to
+   * the busy posture: `.not.toBeDisabled()` + `aria-disabled` + `aria-busy`,
+   * matching CheckpointsPanel.dom.test.tsx's AU-40 precedent.
+   */
+  it('Force reconnect: invokes the callback, goes BUSY (not natively disabled) while pending, surfaces + announces a refusal', async () => {
     const user = userEvent.setup();
     let reject!: (reason: Error) => void;
     const onForceReconnect = vi.fn(() => new Promise<unknown>((_resolve, rej) => { reject = rej; }));
@@ -57,7 +67,10 @@ describe('UX-02: GatewayHealthBanner', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
     expect(onForceReconnect).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole('button', { name: 'Reconnecting…' })).toBeDisabled();
+    const reconnecting = screen.getByRole('button', { name: 'Reconnecting…' });
+    expect(reconnecting, 'A11Y-07: an in-flight trigger must stay focusable — never natively disabled').not.toBeDisabled();
+    expect(reconnecting).toHaveAttribute('aria-disabled', 'true');
+    expect(reconnecting).toHaveAttribute('aria-busy', 'true');
     await act(async () => {
       reject(new Error('The agent is already (re)connecting — wait a moment, then re-check.'));
     });
@@ -83,13 +96,17 @@ describe('UX-02: GatewayHealthBanner', () => {
 describe('UX-02/12b: confirm-on-live-turn gate for Force reconnect (SessionsPanel C4 pattern)', () => {
   const noop = async () => undefined;
 
-  it('live turn: Force reconnect asks first — callback NOT fired, inline confirm strip shown (RED: pre-fix the click fires immediately)', async () => {
+  it('live turn: Force reconnect asks first — callback NOT fired, ConfirmStrip alertdialog shown (RED: pre-fix the click fires immediately)', async () => {
     const user = userEvent.setup();
     const onForceReconnect = vi.fn(async () => undefined);
     render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={onForceReconnect} />);
     await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
     expect(onForceReconnect).not.toHaveBeenCalled(); // the defect this task closes: no turn may die on a title-warning alone
-    expect(screen.getByRole('group', { name: 'Confirm force reconnect' })).toBeInTheDocument();
+    // A11Y-07 (task-7-brief.md): was `role="group"` — the inline strip
+    // mounted with no dialog semantics at all, a consent surface an SR user
+    // could not tell apart from a plain status readout. Now the shared
+    // ConfirmStrip's `role="alertdialog"`, named the same way.
+    expect(screen.getByRole('alertdialog', { name: 'Confirm force reconnect' })).toBeInTheDocument();
     expect(screen.getByText('A turn is still running — force reconnect will cancel it.')).toBeInTheDocument();
   });
 
@@ -99,7 +116,7 @@ describe('UX-02/12b: confirm-on-live-turn gate for Force reconnect (SessionsPane
     render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={false} onForceReconnect={onForceReconnect} />);
     await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
     expect(onForceReconnect).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole('group', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
   });
 
   it('confirm: "Force reconnect anyway" fires the callback exactly once and closes the strip', async () => {
@@ -109,7 +126,7 @@ describe('UX-02/12b: confirm-on-live-turn gate for Force reconnect (SessionsPane
     await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
     await user.click(screen.getByRole('button', { name: 'Force reconnect anyway' }));
     expect(onForceReconnect).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole('group', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
   });
 
   it('a11y: opening moves focus to the confirm control; Cancel closes and returns focus to Force reconnect', async () => {
@@ -118,7 +135,7 @@ describe('UX-02/12b: confirm-on-live-turn gate for Force reconnect (SessionsPane
     await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Force reconnect anyway' })));
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
-    expect(screen.queryByRole('group', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Force reconnect' })));
   });
 
@@ -127,7 +144,7 @@ describe('UX-02/12b: confirm-on-live-turn gate for Force reconnect (SessionsPane
     render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={noop} />);
     await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
     await user.keyboard('{Escape}');
-    expect(screen.queryByRole('group', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm force reconnect' })).not.toBeInTheDocument();
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Force reconnect' })));
   });
 
@@ -138,7 +155,30 @@ describe('UX-02/12b: confirm-on-live-turn gate for Force reconnect (SessionsPane
     const unnamed = screen.getAllByRole('button').filter((b) => (b.getAttribute('aria-label') ?? b.textContent ?? '').trim().length === 0);
     expect(unnamed).toEqual([]);
     expect(screen.getByRole('status').querySelector('button')).toBeNull();
-    expect(screen.getByRole('group', { name: 'Confirm force reconnect' })).toBeInTheDocument();
+    expect(screen.getByRole('alertdialog', { name: 'Confirm force reconnect' })).toBeInTheDocument();
+  });
+
+  /**
+   * ADR-UX-P2-1 (task-7-brief.md, "Trigger button" adoption): confirm's
+   * `returnFocus` lands on the trigger while it is ALREADY busy — the
+   * confirm click both fires `forceReconnect()` (which sets `pending`
+   * synchronously) and hands focus back in the same commit, so the button
+   * the strip returns focus to is the "Reconnecting…" one, not a stale
+   * "Force reconnect" label. This is the load-bearing proof the trigger
+   * stayed busy-focusable through the whole round trip, not just disabled
+   * then silently unreachable.
+   */
+  it('ADR-UX-P2-1: confirming returns focus to the trigger, which is now busy ("Reconnecting…")', async () => {
+    const user = userEvent.setup();
+    const onForceReconnect = vi.fn(() => new Promise<unknown>(() => {})); // never resolves — hold the busy state
+    render(<GatewayHealthBanner health={{ state: 'down', attempts: 10 }} anyTurnLive={true} onForceReconnect={onForceReconnect} />);
+    await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+    await user.click(screen.getByRole('button', { name: 'Force reconnect anyway' }));
+    const reconnecting = screen.getByRole('button', { name: 'Reconnecting…' });
+    await waitFor(() => expect(document.activeElement).toBe(reconnecting));
+    expect(reconnecting).not.toBeDisabled();
+    expect(reconnecting).toHaveAttribute('aria-disabled', 'true');
+    expect(reconnecting).toHaveAttribute('aria-busy', 'true');
   });
 
   it('12b fix: a confirm strip left open when health recovers does NOT reappear on the next outage', async () => {
