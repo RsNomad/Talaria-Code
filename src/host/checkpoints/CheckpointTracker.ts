@@ -1143,12 +1143,17 @@ export class CheckpointTracker {
     let parsed: CheckpointIndexFile;
     try {
       const parsedUnknown: unknown = JSON.parse(raw);
-      // WV3-MIN-SYN: `JSON.parse` returns any — a self-written index whose
-      // root is not a record with a checkpoints array is corrupt; refuse it
-      // HERE (the honest error below) instead of letting it masquerade as
-      // the index and TypeError later in the migration loop.
-      if (!isRecord(parsedUnknown) || !Array.isArray(parsedUnknown.checkpoints)) {
-        throw new Error('index root is not an object with a checkpoints array');
+      // WV3-MIN-SYN / T13: `JSON.parse` returns any — a self-written index
+      // whose root is not a record with a checkpoints array of records is
+      // corrupt; refuse it HERE (the honest error below) instead of letting
+      // it masquerade as the index and TypeError later in the migration loop
+      // (e.g. `c.tree = c.id` on a non-object element).
+      if (
+        !isRecord(parsedUnknown) ||
+        !Array.isArray(parsedUnknown.checkpoints) ||
+        !parsedUnknown.checkpoints.every(isRecord)
+      ) {
+        throw new Error('index root is not an object with a checkpoints array of objects');
       }
       // The isRecord + checkpoints-array checks above are the actual runtime
       // proof; CheckpointIndexFile's OTHER fields (workspaceRoot,

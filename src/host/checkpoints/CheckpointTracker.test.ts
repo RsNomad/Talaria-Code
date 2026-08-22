@@ -1895,4 +1895,66 @@ describe('CheckpointTracker', () => {
     const windowB = new CheckpointTracker(storageDir, workspaceRoot);
     await expect(windowB.list()).rejects.toThrow(/unreadable\/corrupt/);
   });
+
+  describe('T13: checkpoints-array elements must be objects too', () => {
+    it('rejects a checkpoints array holding non-object elements with the honest unreadable/corrupt error, not a raw TypeError', async () => {
+      const windowA = new CheckpointTracker(storageDir, workspaceRoot);
+      await windowA.init();
+      const indexPath = path.join(path.dirname(windowA.shadowGitDir), 'index.json');
+      await fs.writeFile(
+        indexPath,
+        JSON.stringify({ workspaceRoot, currentBaselineId: null, checkpoints: [1, 2] }),
+        'utf8',
+      );
+
+      // Same cross-window idiom as the WV3-MIN-SYN test above: windowA's cache
+      // is warm from init(), so a SECOND, freshly-constructed tracker is needed
+      // to force a real disk re-read through loadIndex().
+      const windowB = new CheckpointTracker(storageDir, workspaceRoot);
+      await expect(windowB.list()).rejects.toThrow(/unreadable\/corrupt/);
+    });
+
+    it('still loads and migrates a valid index whose checkpoints are all objects, including a legacy bare-id (no tree) row', async () => {
+      const windowA = new CheckpointTracker(storageDir, workspaceRoot);
+      await windowA.init();
+      const indexPath = path.join(path.dirname(windowA.shadowGitDir), 'index.json');
+      const legacyId = 'deadbeef-1';
+      await fs.writeFile(
+        indexPath,
+        JSON.stringify({
+          workspaceRoot,
+          currentBaselineId: null,
+          checkpoints: [
+            {
+              id: legacyId,
+              // no `tree` — legacy pre-migration shape the loop backfills from `id`.
+              label: 'Before turn 1',
+              timestamp: new Date().toISOString(),
+              filesChanged: 1,
+            },
+          ],
+        }),
+        'utf8',
+      );
+
+      const windowB = new CheckpointTracker(storageDir, workspaceRoot);
+      const { checkpoints } = await windowB.list();
+      expect(checkpoints).toHaveLength(1);
+      expect(must(checkpoints[0]).id).toBe(legacyId);
+    });
+
+    it('still loads an index with an empty checkpoints array', async () => {
+      const windowA = new CheckpointTracker(storageDir, workspaceRoot);
+      await windowA.init();
+      const indexPath = path.join(path.dirname(windowA.shadowGitDir), 'index.json');
+      await fs.writeFile(
+        indexPath,
+        JSON.stringify({ workspaceRoot, currentBaselineId: null, checkpoints: [] }),
+        'utf8',
+      );
+
+      const windowB = new CheckpointTracker(storageDir, workspaceRoot);
+      await expect(windowB.list()).resolves.toEqual({ checkpoints: [] });
+    });
+  });
 });
