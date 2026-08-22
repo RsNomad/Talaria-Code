@@ -348,6 +348,12 @@ export function Composer({
    * the region itself is never conditionally mounted, only this text is
    * swapped). Empty string = no notice. */
   const [attachNotice, setAttachNotice] = useState('');
+  /** Task 21 (WCAG 4.1.3): `attachNotice` above only ever announces FAILURE —
+   * a successful attach was silent to assistive tech. Surfaced through its
+   * own permanently-mounted `LiveRegion` (Finding-7 discipline: mounted
+   * empty, text swaps per attach) so a screen-reader user gets the same
+   * confirmation a sighted user gets from the new chip appearing. */
+  const [attachAnnounce, setAttachAnnounce] = useState('');
 
   // W2 T1 (§2b): the ONE shared suggest primitive drives both `@` (mentions,
   // any word boundary — unchanged pre-T1 behavior) and `/` (slash commands,
@@ -549,6 +555,9 @@ export function Composer({
         const raw = String(reader.result);
         const base64 = raw.slice(raw.indexOf(',') + 1);
         onAttachAdd({ ...meta, dataUri: `data:${mime};base64,${base64}` });
+        // Task 21 (WCAG 4.1.3): announce the success too — until now only
+        // the failure branches (oversize / reader.onerror, above) spoke.
+        setAttachAnnounce(`Attached "${file.name}"`);
       };
       // A2 (UI I-9): previously unassigned — a FileReader failure (permission
       // denial, an unreadable/vanished file, an OS-level read error) was
@@ -1138,6 +1147,13 @@ export function Composer({
           * region always exists, only the text swaps. sr-only: sighted users
           * already see the disabled "Stopping" button state. */}
         <LiveRegion text={stopping ? 'Stopping — waiting for the agent to confirm…' : ''} className="sr-only" />
+
+        {/* Task 21 (WCAG 4.1.3): successful-attach announcement — permanently
+          * mounted LiveRegion (Finding-7 discipline, same as the two regions
+          * above): the region always exists, only `attachAnnounce` swaps. The
+          * failure notice (`attachNotice` above) is unchanged; this is purely
+          * additive for the success case it never covered. */}
+        <LiveRegion text={attachAnnounce} className="sr-only" />
 
         {/* toolbar */}
         <div className="mt-2 flex items-center gap-1.5">

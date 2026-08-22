@@ -298,6 +298,28 @@ describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region no
 });
 
 /**
+ * Task 21 (WCAG 4.1.3): only FAILURE was ever announced (via `attachNotice`
+ * above) — a screen-reader user got no confirmation that a successful attach
+ * actually landed. Scoped by the announced TEXT rather than a bare
+ * `getByRole('status')`: every ActionButton/LiveRegion mounts a
+ * `role="status"` region in this tree (Task 14's lesson), so a role-only
+ * query is ambiguous.
+ */
+describe('Task 21 (WCAG 4.1.3): a successful attach is announced too', () => {
+  it('a successful attach announces the filename through a role="status" live region', async () => {
+    const added: Attachment[] = [];
+    const { container } = renderComposerForAttachments((a) => added.push(a));
+    const file = new File(['hello'], 'notes.txt', { type: 'text/plain' });
+
+    fireEvent.change(getGenericFileInput(container), { target: { files: [file] } });
+
+    const announcement = await waitFor(() => screen.getByText('Attached "notes.txt"'));
+    expect(announcement).toHaveAttribute('role', 'status');
+    expect(added).toHaveLength(1);
+  });
+});
+
+/**
  * B5 (path doc §4 B5, item 1 of 3 remaining): the preset/mode/model chips only
  * name their current value via `title` — MDN: "Use of the title attribute is
  * highly problematic for … people navigating with keyboards … assistive
