@@ -129,7 +129,11 @@ describe('W4-T6 (UI#14): aria-controls is a dangling IDREF on a PriorityTabs tab
     render(<PriorityTabs active="settings" onSelect={() => undefined} />);
 
     const chatTab = screen.getByRole('tab', { name: 'Chat' });
-    const settingsTab = screen.getByRole('tab', { name: 'Settings' });
+    // Task 27 (UX-14): nav label renamed 'Settings' -> 'Agent config' so the
+    // tab agrees with SettingsPanel's own "Agent config … read-only" title;
+    // the `id: 'settings'` wire value (used above via `active="settings"`)
+    // is UNCHANGED — only this human-facing query string moves.
+    const settingsTab = screen.getByRole('tab', { name: 'Agent config' });
     expect(chatTab).not.toHaveAttribute('aria-controls');
     expect(settingsTab).toHaveAttribute('aria-controls');
   });

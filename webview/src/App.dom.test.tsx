@@ -310,7 +310,10 @@ describe('T-16 F9: every PriorityTabs tab controls a real role=tabpanel, and non
     { label: 'History' },
     { label: 'Models' },
     { label: 'Setup' },
-    { label: 'Settings' },
+    // Task 27 (UX-14): nav label renamed 'Settings' -> 'Agent config' — the
+    // panel `id` ('settings', PANELS is only ever used to look tabs up by
+    // their human-facing name) does not change, only this pinned label.
+    { label: 'Agent config' },
   ];
 
   it('no tab in the Panels tablist carries aria-current (aria-selected is the correct tab state)', () => {

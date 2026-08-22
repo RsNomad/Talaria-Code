@@ -65,7 +65,11 @@ const TABS: TabDef[] = [
   // where `talaria.openSetup` sits at `navigation@1`, ahead of
   // `talaria.openSettings` at `navigation@2`).
   { id: 'setup', label: 'Setup', icon: 'rocket' },
-  { id: 'settings', label: 'Settings', icon: 'settings' },
+  // Task 27 (UX-14): nav label renamed 'Settings' -> 'Agent config' so the
+  // tab agrees with the panel body it opens (SettingsPanel.tsx's own title
+  // is "Agent config … read-only"). The `id: 'settings'` stays WIRE
+  // vocabulary — unchanged.
+  { id: 'settings', label: 'Agent config', icon: 'settings' },
 ];
 
 /** Flex gap between chips, in px (matches the `gap-1` on the strip). */
