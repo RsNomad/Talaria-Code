@@ -209,6 +209,51 @@ describe('LocalModelBlock — Ollama in-flight pull (CC-9)', () => {
   });
 });
 
+/**
+ * A11Y-05 (WCAG 4.1.3): the percent row no longer chatters `aria-live`
+ * itself — a single sr-only `PullAnnouncer` (`role="status"`) speaks only
+ * 10%-step crossings, and the Cancel button never sits inside a live
+ * region.
+ */
+describe('LocalModelBlock — in-flight pull a11y (A11Y-05)', () => {
+  const inFlightProgress = {
+    'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 1000, completedBytes: 400 },
+  };
+
+  it('the progressbar row no longer carries aria-live (silent aria-valuenow updates)', () => {
+    renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress });
+    expect(screen.getByRole('progressbar').closest('[aria-live]')).toBeNull();
+  });
+
+  it('an sr-only role="status" PullAnnouncer region exists inside the in-flight block', () => {
+    renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress });
+    // Every `ActionButton` (Pull, Cancel, …) mounts its own always-on
+    // `LiveRegion` (role="status", usually empty) — find THIS one by its
+    // announced text, not by role alone (role="status" is not unique here).
+    const announcer = screen.getByText(/^Pulling qwen25-coder-1\.5b — \d+%$/);
+    expect(announcer).toHaveAttribute('role', 'status');
+  });
+
+  it('percent 7 then 9 leaves the announcer text unchanged (10%-step latch)', () => {
+    const at7 = {
+      'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 100, completedBytes: 7 },
+    };
+    const at9 = {
+      'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 100, completedBytes: 9 },
+    };
+    const { rerender } = renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: at7 });
+    const textAt7 = screen.getByText(/^Pulling qwen25-coder-1\.5b — \d+%$/).textContent;
+    rerender(<LocalModelBlock {...baseProps({ ollama: ollamaWire({ running: true, models: [] }), progress: at9 })} />);
+    expect(screen.getByText(/^Pulling qwen25-coder-1\.5b — \d+%$/).textContent).toBe(textAt7);
+  });
+
+  it('the Cancel button is NOT a descendant of any [aria-live] element', () => {
+    renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress });
+    const cancelBtn = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancelBtn.closest('[aria-live]')).toBeNull();
+  });
+});
+
 /* ------------------------------------------------------------------ *
  * §4.1 — llama.cpp backend
  * ------------------------------------------------------------------ */

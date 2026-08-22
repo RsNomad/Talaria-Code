@@ -33,6 +33,7 @@ import type {
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
+import { PullAnnouncer } from '../components/PullAnnouncer';
 import { scrollIntoViewRespectingMotion } from '../components/scrollIntoViewRespectingMotion';
 import { Toggle } from '../components/Toggle';
 import { DECLINED, errorMessage } from '../state/panels';
@@ -804,13 +805,16 @@ function AgentCard({
       )}
 
       {agent.phase === 'installing' ? (
-        <div className="mt-2 flex flex-col gap-1.5" aria-live="polite">
-          {/* The phase label above already says "Installing…" — only add a
-              SECOND line when there is genuinely more to say (the live
-              sub-phase from a `setup.progress` push), never a duplicate of
-              the same text. */}
-          {live?.phase && <StatusLine icon="sync" text={`(${live.phase})`} tone="accent" />}
-          {/* `setup.cancel` is read-only/best-effort (§8) — never trust-gated. */}
+        <div className="mt-2 flex flex-col gap-1.5">
+          <div aria-live="polite">
+            {/* The phase label above already says "Installing…" — only add
+                a SECOND line when there is genuinely more to say (the live
+                sub-phase from a `setup.progress` push), never a duplicate
+                of the same text. */}
+            {live?.phase && <StatusLine icon="sync" text={`(${live.phase})`} tone="accent" />}
+          </div>
+          {/* `setup.cancel` is read-only/best-effort (§8) — never trust-gated.
+              A11Y-05: interactive content never sits inside a live region. */}
           <ActionButton
             label="Cancel"
             onRun={() => dispatch('setup.cancel', { op: 'install', id: agent.selectedId })}
@@ -1628,8 +1632,13 @@ function ConfiguredModelRow({
       )}
       {inFlight && (
         <div className="flex flex-col gap-1">
+          {/* A11Y-05: mounted for the whole in-flight block (before the
+              `percent !== undefined` guard) so the sr-only region exists
+              before its first text (Finding-7) — not conditionally mounted
+              together with the percent it announces. */}
+          <PullAnnouncer label={`Pulling ${model}`} percent={percent} />
           {percent !== undefined && (
-            <div className="flex items-center gap-2" aria-live="polite">
+            <div className="flex items-center gap-2">
               <div
                 role="progressbar"
                 aria-valuenow={percent}
@@ -1997,8 +2006,12 @@ function DedicatedNextForm({
               )}
               {pinnedRow !== undefined && pullInFlight && (
                 <div className="flex flex-col gap-1">
+                  {/* A11Y-05: mounted for the whole in-flight block (before
+                      the `pullPct !== undefined` guard) — see the
+                      configured-model row above for the same discipline. */}
+                  <PullAnnouncer label={`Pulling ${pinnedRow.id}`} percent={pullPct} />
                   {pullPct !== undefined && (
-                    <div className="flex items-center gap-2" aria-live="polite">
+                    <div className="flex items-center gap-2">
                       <div
                         role="progressbar"
                         aria-valuenow={pullPct}

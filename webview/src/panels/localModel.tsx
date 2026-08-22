@@ -52,6 +52,7 @@ import type { SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
+import { PullAnnouncer } from '../components/PullAnnouncer';
 import { DECLINED, errorMessage } from '../state/panels';
 import {
   CANCEL_LABEL,
@@ -447,8 +448,12 @@ function ModelRow({
 
       {inFlight && (
         <div className="flex flex-col gap-1">
+          {/* A11Y-05: mounted for the whole in-flight block (before the
+              `percent !== undefined` guard) so the sr-only region exists
+              before its first text (Finding-7). */}
+          <PullAnnouncer label={`Pulling ${model.id}`} percent={percent} />
           {percent !== undefined && (
-            <div className="flex items-center gap-2" aria-live="polite">
+            <div className="flex items-center gap-2">
               <div
                 role="progressbar"
                 aria-valuenow={percent}

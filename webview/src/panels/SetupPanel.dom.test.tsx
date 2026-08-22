@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { ReactElement } from 'react';
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
 import { NEXT_EDIT_ROWS } from './nextEditCopy';
@@ -332,6 +332,19 @@ describe('Agent card — renders every AgentSetupPhase fixture (§6 card 1)', ()
   });
 });
 
+describe('Agent card — "installing" phase: Cancel moved out of the live region (A11Y-05)', () => {
+  it('the live sub-phase text stays inside aria-live, but Cancel does NOT', () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'installing', selectedId: 'hermes' } });
+    const progress = {
+      [progressKey('install', 'hermes')]: { op: 'install' as const, id: 'hermes', logTail: [], phase: 'downloading' },
+    };
+    renderPanel(data, { progress });
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    expect(within(agentSection).getByText('(downloading)').closest('[aria-live]')).not.toBeNull();
+    expect(within(agentSection).getByRole('button', { name: 'Cancel' }).closest('[aria-live]')).toBeNull();
+  });
+});
+
 describe('Agent card — identity options are informational, not selectable (§6, A19/C1-13)', () => {
   // A19 (C1-13): the Agent card never passes `onSelect` to `BackendOptionRow`
   // (identity here isn't a click-to-pick control) — every row, including the
@@ -476,6 +489,61 @@ describe('FIM card — pull progress renders a percent (§6)', () => {
     // The percent lives under the "Install locally" tab.
     await user.click(screen.getByRole('button', { name: 'Install locally' }));
     expect(screen.getByText('25%')).toBeInTheDocument();
+  });
+});
+
+describe('FIM card — pull progress a11y: PullAnnouncer replaces the row aria-live (A11Y-05)', () => {
+  function fimInstallData(progressPercent: { totalBytes: number; completedBytes: number }) {
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
+    });
+    const progress = {
+      'pull:qwen2.5-coder:1.5b-base': {
+        op: 'pull' as const,
+        id: 'qwen2.5-coder:1.5b-base',
+        logTail: [],
+        totalBytes: progressPercent.totalBytes,
+        completedBytes: progressPercent.completedBytes,
+      },
+    };
+    return { data, progress };
+  }
+
+  it('the progressbar row no longer carries aria-live (silent aria-valuenow updates)', async () => {
+    const { data, progress } = fimInstallData({ totalBytes: 1000, completedBytes: 250 });
+    const { user, container } = renderPanel(data, { progress });
+    await user.click(within(container).getByRole('button', { name: 'Install locally' }));
+    expect(within(container).getByRole('progressbar').closest('[aria-live]')).toBeNull();
+  });
+
+  it('an sr-only role="status" PullAnnouncer region exists inside the in-flight block', async () => {
+    const { data, progress } = fimInstallData({ totalBytes: 1000, completedBytes: 250 });
+    const { user, container } = renderPanel(data, { progress });
+    await user.click(within(container).getByRole('button', { name: 'Install locally' }));
+    // Other cards mount their own always-on `LiveRegion`s (role="status"), so
+    // find THIS one by its announced text, not by role alone.
+    const announcer = within(container).getByText(/^Pulling qwen2\.5-coder:1\.5b-base — \d+%$/);
+    expect(announcer).toHaveAttribute('role', 'status');
+  });
+
+  it('percent 7 then 9 leaves the announcer text unchanged (10%-step latch)', async () => {
+    const at7 = fimInstallData({ totalBytes: 100, completedBytes: 7 });
+    const { user: userAt7, container: containerAt7 } = renderPanel(at7.data, { progress: at7.progress });
+    await userAt7.click(within(containerAt7).getByRole('button', { name: 'Install locally' }));
+    const textAt7 = within(containerAt7).getByText(/^Pulling qwen2\.5-coder:1\.5b-base — \d+%$/).textContent;
+
+    const at9 = fimInstallData({ totalBytes: 100, completedBytes: 9 });
+    const { user: userAt9, container: containerAt9 } = renderPanel(at9.data, { progress: at9.progress });
+    await userAt9.click(within(containerAt9).getByRole('button', { name: 'Install locally' }));
+    expect(within(containerAt9).getByText(/^Pulling qwen2\.5-coder:1\.5b-base — \d+%$/).textContent).toBe(textAt7);
+  });
+
+  it('the Cancel button is NOT a descendant of any [aria-live] element', async () => {
+    const { data, progress } = fimInstallData({ totalBytes: 1000, completedBytes: 250 });
+    const { user, container } = renderPanel(data, { progress });
+    await user.click(within(container).getByRole('button', { name: 'Install locally' }));
+    expect(within(container).getByRole('button', { name: 'Cancel' }).closest('[aria-live]')).toBeNull();
   });
 });
 
@@ -2616,6 +2684,40 @@ describe('T13 — Ollama pane in-flight: progress + Cancel keyed pull:sweep-next
     };
     const { nextCard } = await openNextForm(nextSurfaceData(), { progress: stale });
     expect(within(nextCard).queryByRole('progressbar')).not.toBeInTheDocument();
+  });
+
+  it('A11Y-05: the progressbar row no longer carries aria-live', async () => {
+    const { nextCard } = await openNextForm(nextSurfaceData(), { progress: inFlight });
+    expect(within(nextCard).getByRole('progressbar').closest('[aria-live]')).toBeNull();
+  });
+
+  it('A11Y-05: an sr-only role="status" PullAnnouncer region exists inside the in-flight block', async () => {
+    const { nextCard } = await openNextForm(nextSurfaceData(), { progress: inFlight });
+    // The NEXT card also mounts a per-settings-row `LiveRegion` (save-error,
+    // usually empty) for every `NEXT_EDIT_ROWS` entry — find THIS one by its
+    // announced text, not by role alone (role="status" is not unique here).
+    const announcer = within(nextCard).getByText(/^Pulling sweep-next — \d+%$/);
+    expect(announcer).toHaveAttribute('role', 'status');
+  });
+
+  it('A11Y-05: percent 7 then 9 leaves the announcer text unchanged (10%-step latch)', async () => {
+    const at7 = {
+      'pull:sweep-next': { op: 'pull' as const, id: 'sweep-next', logTail: [], totalBytes: 100, completedBytes: 7 },
+    };
+    const at9 = {
+      'pull:sweep-next': { op: 'pull' as const, id: 'sweep-next', logTail: [], totalBytes: 100, completedBytes: 9 },
+    };
+    const { nextCard: cardAt7 } = await openNextForm(nextSurfaceData(), { progress: at7 });
+    const textAt7 = within(cardAt7).getByText(/^Pulling sweep-next — \d+%$/).textContent;
+    cleanup();
+
+    const { nextCard: cardAt9 } = await openNextForm(nextSurfaceData(), { progress: at9 });
+    expect(within(cardAt9).getByText(/^Pulling sweep-next — \d+%$/).textContent).toBe(textAt7);
+  });
+
+  it('A11Y-05: the Cancel button is NOT a descendant of any [aria-live] element', async () => {
+    const { nextCard } = await openNextForm(nextSurfaceData(), { progress: inFlight });
+    expect(within(nextCard).getByRole('button', { name: 'Cancel' }).closest('[aria-live]')).toBeNull();
   });
 });
 
