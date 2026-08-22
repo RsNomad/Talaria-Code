@@ -23,7 +23,7 @@ import { resolveWithinWorkspace } from '../../../src/host/backend/acp/pathConfin
  * chat re-applied the same seed; and `onDraftChange` is bound to the ACTIVE
  * tab, so a tab switch in between delivered the text to another conversation.
  */
-function renderComposer(props: {
+interface RenderComposerProps {
   tabId: string;
   draft: string;
   pendingSeed: ComposerSeed | null;
@@ -31,8 +31,14 @@ function renderComposer(props: {
   onSeedApplied: (seed: ComposerSeed) => void;
   busy?: boolean;
   stopping?: boolean;
-}) {
-  return render(
+  onCancel?: () => void;
+}
+
+// T11: factored out of `renderComposer` so a rerender (a busy -> stopping
+// transition, in particular) can produce the exact same element tree —
+// `render`'s own `rerender` takes a JSX element, not a prop bag.
+function composerElementForRender(props: RenderComposerProps) {
+  return (
     <Composer
       tabId={props.tabId}
       draft={props.draft}
@@ -51,7 +57,7 @@ function renderComposer(props: {
       initialHeight={120}
       onHeightChange={() => undefined}
       onSubmit={async () => undefined}
-      onCancel={() => undefined}
+      onCancel={props.onCancel ?? (() => undefined)}
       onSetPreset={async () => undefined}
       onPickModel={() => undefined}
       onNewSession={() => undefined}
@@ -59,8 +65,12 @@ function renderComposer(props: {
       searchFiles={async () => []}
       pendingSeed={props.pendingSeed}
       onSeedApplied={props.onSeedApplied}
-    />,
+    />
   );
+}
+
+function renderComposer(props: RenderComposerProps) {
+  return render(composerElementForRender(props));
 }
 
 describe('C-3: a composer seed is applied exactly once, to the tab it was minted for', () => {
@@ -1025,10 +1035,11 @@ describe('UX-03: Stop -> Stopping… lifecycle (role/name/value)', () => {
     expect(announced).toBe(false);
   });
 
-  it('stopping: the button is disabled, renamed "Stopping", and a permanently-mounted status region announces it', () => {
+  it('stopping: the button is renamed "Stopping", kept focusable via aria-disabled (T11 — not native disabled), and a permanently-mounted status region announces it', () => {
     renderComposer({ tabId: 'tab-1', draft: '', pendingSeed: null, onDraftChange: () => undefined, onSeedApplied: () => undefined, busy: true, stopping: true });
     const button = screen.getByRole('button', { name: 'Stopping' });
-    expect(button).toBeDisabled();
+    expect(button).not.toBeDisabled();
+    expect(button).toHaveAttribute('aria-disabled', 'true');
     const region = screen
       .getAllByRole('status')
       .find((el) => (el.textContent ?? '').includes('Stopping — waiting for the agent to confirm'));
@@ -1039,5 +1050,31 @@ describe('UX-03: Stop -> Stopping… lifecycle (role/name/value)', () => {
     renderComposer({ tabId: 'tab-1', draft: '', pendingSeed: null, onDraftChange: () => undefined, onSeedApplied: () => undefined });
     // attachNotice region + stop region are both permanently mounted:
     expect(screen.getAllByRole('status').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('T11 (A11Y): the Stop button stays focusable while stopping — aria-disabled, never native disabled — and a click while stopping does not fire onCancel', async () => {
+    const onCancel = vi.fn();
+    const user = userEvent.setup();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      stopping: false,
+      onCancel,
+    };
+    const { rerender } = renderComposer(baseProps);
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    stop.focus();
+    rerender(composerElementForRender({ ...baseProps, stopping: true }));
+    const stopping = screen.getByRole('button', { name: 'Stopping' });
+    expect(stopping).not.toBeDisabled(); // the T11 bug: native disabled blurred it
+    expect(stopping).toHaveAttribute('aria-disabled', 'true'); // role/name/value (axe-style)
+    expect(stopping).toHaveAttribute('aria-busy', 'true');
+    expect(document.activeElement).toBe(stopping); // focus retained through the flip
+    await user.click(stopping);
+    expect(onCancel).not.toHaveBeenCalled(); // guarded click replaces native blocking
   });
 });

@@ -32,6 +32,7 @@ import { describeMention, basename } from '../composer/mentionChip';
 import { parsePathPick, filesToFolders } from '../composer/fileSearch';
 import { useFileSearch } from '../composer/useFileSearch';
 import { applySeed, type ComposerSeed } from '../composer/applySeed';
+import { busyInteraction } from './busyInteraction';
 
 // W2-F1: the picker replaced the wire AgentMode picker — every preset pins the
 // ACP mode at 'default' and differs only in the client-side edit-policy engine.
@@ -1303,16 +1304,31 @@ export function Composer({
 
             {/* send / stop */}
             {busy ? (
-              <button
-                type="button"
-                onClick={onCancel}
-                disabled={stopping}
-                title={stopping ? 'Stopping' : 'Stop'}
-                aria-label={stopping ? 'Stopping' : 'Stop'}
-                className="flex h-7 w-7 flex-none items-center justify-center rounded-lg border border-del text-del transition-colors hover:bg-del-soft disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Icon name="debug-stop" size={14} />
-              </button>
+              (() => {
+                // T11 (A11Y-01 sibling): `stopping` is purely IN-FLIGHT — native
+                // `disabled` blurred a keyboard user to <body> the instant Stop was
+                // pressed (busyInteraction.ts's own rationale; SessionsPanel TI-1
+                // precedent). Genuine-indefinite half is `false`: nothing but the
+                // in-flight stop ever gates this control.
+                const stopInteraction = busyInteraction(false, stopping);
+                return (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!stopInteraction.interactive) return;
+                      onCancel();
+                    }}
+                    disabled={stopInteraction.nativeDisabled}
+                    aria-disabled={stopInteraction.ariaDisabled}
+                    aria-busy={stopInteraction.ariaBusy}
+                    title={stopping ? 'Stopping' : 'Stop'}
+                    aria-label={stopping ? 'Stopping' : 'Stop'}
+                    className="flex h-7 w-7 flex-none items-center justify-center rounded-lg border border-del text-del transition-colors hover:bg-del-soft disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                  >
+                    <Icon name="debug-stop" size={14} />
+                  </button>
+                );
+              })()
             ) : (
               <button
                 type="button"
