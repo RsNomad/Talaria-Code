@@ -927,8 +927,16 @@ export function App() {
 
       {/* Audit G-9: the standing route back. The banner above is dismissible;
           this row is not, and it survives the dismissal, so a tab that failed
-          to open can always be retried instead of being silently dead. */}
-      {!tab.error && tab.openFailed === true && tab.binding !== 'bound' && (
+          to open can always be retried instead of being silently dead.
+          WS-UX P2 M1: yields to the "Starting a new session…" row below while
+          a New Session is in flight for THIS tab — a standing Reconnect for a
+          tab already being replaced is a stale affordance, and its pending
+          sibling is the honest surface. Render priority ONLY (same grammar as
+          this row's own `!tab.error` gate): the marker itself stays true in
+          state (host-owned truth — see the `local.newSessionPending` fold),
+          so the flag's terminals (`tab.bound`/`tab.error`) restore this row
+          automatically if the attempt fails. */}
+      {!tab.error && tab.openFailed === true && tab.binding !== 'bound' && tab.newSessionPending !== true && (
         <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
           <Icon name="warning" size={12} className="flex-none text-warn" />
           <span className="min-w-0 flex-1">This chat never connected to the agent.</span>
@@ -946,8 +954,10 @@ export function App() {
           row above — same non-dismissible posture, but a lost session has no
           connection to retry (Reconnect would just fail again), so this
           routes to the real recovery surface instead of offering a fake
-          retry. */}
-      {!tab.error && tab.sessionLost === true && tab.binding !== 'bound' && (
+          retry. WS-UX P2 M1: same yield-to-pending gate as the G-9 row above
+          (render priority only — `sessionLost`/`sessionLostReason` stay
+          untouched in state, so a failed attempt restores this row). */}
+      {!tab.error && tab.sessionLost === true && tab.binding !== 'bound' && tab.newSessionPending !== true && (
         <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
           <Icon name="warning" size={12} className="flex-none text-warn" />
           <span className="min-w-0 flex-1">{sessionLostRowCopy(tab.sessionLostReason)}</span>

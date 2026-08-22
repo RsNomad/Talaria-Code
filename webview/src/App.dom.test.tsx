@@ -544,6 +544,110 @@ describe('UX-04a at the App level: "Starting a new session…" pending state', (
 });
 
 /**
+ * WS-UX P2 M1 (wave-review cross-task Minor, T28 × T30/G-9): the two standing
+ * recovery rows (G-9 "Reconnect", ARCH-1 "History") must YIELD to the
+ * "Starting a new session…" pending row while a New Session is in flight for
+ * the tab — two truthful standing rows at once is a presentation conflict,
+ * resolved by render priority (same grammar as the rows' own `!tab.error`
+ * gates), NOT by stripping the host-owned `sessionLost`/`openFailed` markers
+ * in the reducer (see the `local.newSessionPending` fold comment,
+ * transcript.ts): the markers stay true in state, so a FAILED New Session
+ * attempt restores the recovery affordance by itself.
+ */
+describe('WS-UX P2 M1: standing recovery rows yield to the New-Session pending row', () => {
+  function setup(jsx: ReactElement) {
+    return { user: userEvent.setup(), ...render(jsx) };
+  }
+
+  /** Same idiom as the G-9 / session-lost describes above. */
+  function emitOpenFailed() {
+    act(() => {
+      bridge.emit({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        message: 'could not open the session',
+        kind: 'open-failed',
+      });
+    });
+  }
+
+  function emitSessionLost() {
+    act(() => {
+      bridge.emit({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        message: 'the session died when the agent restarted',
+        kind: 'session-lost',
+      });
+    });
+  }
+
+  it('clicking New Session on a session-lost tab swaps the standing History row for the pending row (no double standing-row)', async () => {
+    const { user } = setup(<App />);
+    emitSessionLost();
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+    // The revealed standing row — the M1 starting position.
+    expect(screen.getByRole('button', { name: 'History' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    // The pending row (visible <span> + sr-only LiveRegion twin — the same
+    // duplicate-exact-text COUNT idiom as the UX-04a describe above) is now
+    // the ONLY standing surface; the session-lost row must NOT stand beside it.
+    expect(screen.getAllByText('Starting a new session…')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'History' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("This chat's session was lost when the agent restarted."),
+    ).not.toBeInTheDocument();
+
+    // Host completes the flow in its real order: tab.clear FIRST (retires the
+    // lost/openFailed markers), then the fresh bind (retires the pending flag).
+    act(() => {
+      bridge.emit({ type: 'tab.clear', tabId: BOOTSTRAP_TAB_ID });
+    });
+    act(() => {
+      bridge.emit({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 's-new', rootId: '/r' });
+    });
+
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+    expect(screen.queryByRole('button', { name: 'History' })).not.toBeInTheDocument();
+  });
+
+  it('clicking New Session on an open-failed tab hides the standing Reconnect row while the request is in flight', async () => {
+    const { user } = setup(<App />);
+    emitOpenFailed();
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+    expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(screen.getAllByText('Starting a new session…')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'Reconnect' })).not.toBeInTheDocument();
+  });
+
+  it('a FAILED New Session attempt restores the standing History row — the fail-safe the render gate (vs a reducer strip) preserves', async () => {
+    const { user } = setup(<App />);
+    emitSessionLost();
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+    expect(screen.queryByRole('button', { name: 'History' })).not.toBeInTheDocument();
+
+    // The attempt fails: tab.error is the pending flag's other terminal. The
+    // fresh dismissible banner covers the rows (their `!tab.error` gate)…
+    emitOpenFailed();
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+
+    // …and once dismissed, the recovery affordance is BACK: `sessionLost`
+    // was never stripped from state, only out-prioritized while pending.
+    // (The G-9 Reconnect row also stands here — `openFailed` landed true too;
+    // that dual-marker rendering is pre-existing UX-04c-pinned behavior, not
+    // this fix's concern.)
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+    expect(screen.getByRole('button', { name: 'History' })).toBeInTheDocument();
+  });
+});
+
+/**
  * CF-12 review fix (W3-T7, IMP-2): `checkpoint.restore` is wired through an
  * `App.tsx`-owned `restoreCheckpoint` callback that carries BOTH `rootId`
  * (params, multi-root routing) and `tab.tabId` (the `bridge.request` "tag"

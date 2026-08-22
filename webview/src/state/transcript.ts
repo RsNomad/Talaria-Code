@@ -1553,6 +1553,14 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
       // confirm gate is what asks first while busy, not this fold). Cleared
       // by `tab.bound`/`tab.error` below (exhaustive terminals for the
       // `tab.newSession` post App.newSession issues right after this).
+      // WS-UX P2 M1 (deliberate non-fix): this fold does NOT touch
+      // `sessionLost`/`sessionLostReason`/`openFailed`. Those are host-owned
+      // truth with exactly two retirers (`tab.bound`, `tab.clear`) — a local
+      // optimistic action must never become a third writer, or a lost
+      // `tab.newSession` post would strand the tab with its recovery
+      // affordances stripped and no way to rebuild them. While the request
+      // is in flight, App.tsx GATES the two standing recovery rows on this
+      // flag instead (render priority, not state mutation).
       return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, newSessionPending: true }));
 
     default:
