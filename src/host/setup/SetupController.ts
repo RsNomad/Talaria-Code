@@ -17,6 +17,7 @@ import type { LlamaCppLocateResult } from './llamaCppLocator';
 import type { GgufDestResult } from './modelStore';
 import type { GgufStoreSpec } from './ggufIngest';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
+import { createMutationGate, type MutationGate } from '../util/mutationGate';
 import type {
   AgentSetupPhase,
   SetupBackendOption,
@@ -404,6 +405,9 @@ export interface SetupControllerDeps {
 // --- misc constants -------------------------------------------------------
 
 const PROGRESS_THROTTLE_MS = 150;
+/** F2-16: the refusal every post-dispose mutating latch gets — a closed
+ *  literal (webview-rendered), matching the file's terse refusal style. */
+export const SETUP_DISPOSED_REFUSAL = 'setup controller disposed';
 const LOG_TAIL_MAX = 40;
 const DEFAULT_FIM_MODEL = 'qwen2.5-coder:1.5b-base';
 const DEFAULT_OLLAMA_ENDPOINT = 'http://127.0.0.1:11434';
@@ -679,10 +683,27 @@ export const READ_ONLY_METHODS: readonly SetupMethod[] = [
  *  other caller of `handle` directly. */
 const SETUP_METHOD_SET: ReadonlySet<string> = new Set<SetupMethod>(SETUP_METHODS);
 
-interface ThrottleState {
+export interface ThrottleState {
   lastEmit: number;
   timer: ReturnType<typeof setTimeout> | undefined;
   pending: SetupProgress | undefined;
+}
+
+/** F2-16: an entry with no armed timer, no pending value, and a lastEmit
+ *  older than the throttle window is SEMANTICALLY identical to no entry (a
+ *  fresh entry's `-Infinity` lastEmit also fires immediately) — so pruning
+ *  it is behavior-preserving, and the map stops growing one entry per
+ *  (op,id) pair forever. Exported pure for direct unit tests. */
+export function pruneExpiredThrottleEntries(
+  throttle: Map<string, ThrottleState>,
+  now: number,
+  throttleMs: number,
+): void {
+  for (const [key, state] of throttle) {
+    if (state.timer === undefined && state.pending === undefined && now - state.lastEmit >= throttleMs) {
+      throttle.delete(key);
+    }
+  }
 }
 
 /**
@@ -728,6 +749,11 @@ export class SetupController {
   /** Keyed `${op}:${id}` (`install:<backendId>` / `pull:<model>`) — presence = single-flight latch (FM-12); the held `AbortController` is what `setup.cancel` interrupts. */
   private readonly inFlight = new Map<string, AbortController>();
   private readonly throttle = new Map<string, ThrottleState>();
+  /** F2-16: the WS-R2 gate idiom — flipped CLOSED synchronously by
+   *  {@link dispose} BEFORE any teardown, so {@link armLatch} can never arm
+   *  a new install/pull latch that no dispose will ever abort (the TC-6
+   *  detached-download class, closed structurally at one choke point). */
+  private readonly lifecycle: MutationGate = createMutationGate();
 
   private installLogTail: string[] = [];
   private lastAgentIssue: { phase: AgentSetupPhase; detail: string } | undefined;
@@ -793,6 +819,11 @@ export class SetupController {
   ) {}
 
   dispose(): void {
+    // F2-16: flip the gate CLOSED synchronously, FIRST — before any teardown
+    // below — so a concurrent `armLatch` call can never interleave between
+    // this flip and the teardown that follows (run-to-completion; see
+    // {@link armLatch}'s own doc for the atomicity this buys).
+    void this.lifecycle.close(Promise.resolve());
     for (const state of this.throttle.values()) {
       if (state.timer) clearTimeout(state.timer);
     }
@@ -1300,8 +1331,8 @@ export class SetupController {
       return { ok: false, reason: `'${backendId}' has no pipx install recipe.` };
     }
 
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
+    const abort = this.armLatch(key);
+    if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     this.lastAgentIssue = undefined;
     this.installLogTail = [];
     try {
@@ -1579,8 +1610,8 @@ export class SetupController {
     // `setup.cancel` unable to reach the first pull. The `finally` below
     // still deletes the key on every exit path, including a decline, so a
     // declined pull never wedges the latch.
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
+    const abort = this.armLatch(key);
+    if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     try {
       // T1 (beta.6 panel-fix PT1): sanitize BEFORE the modal below — a
       // STRICTER, EARLIER gate than the leading-'-' check inside
@@ -1670,8 +1701,8 @@ export class SetupController {
     const canonicalId = this.canonicalPullLatchId(created);
     const key = `pull:${canonicalId}`;
     if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
+    const abort = this.armLatch(key);
+    if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     try {
       // (c) integrity pre-flight — dep can also REJECT (a fetch binding
       // throwing synchronously); that is the same refusal, never a crash.
@@ -1765,8 +1796,8 @@ export class SetupController {
     // (3) latch BEFORE the modal; finally-release on every exit path.
     const key = `pull:${entry.id}`;
     if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
+    const abort = this.armLatch(key);
+    if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     try {
       return backend === 'ollama'
         ? await this.provisionOllama(entry, params, abort.signal)
@@ -2220,6 +2251,18 @@ export class SetupController {
       }
     }
     return { modelId: entry.id, backend, endpoint, servedName, ...(runCommand !== undefined ? { runCommand } : {}) };
+  }
+
+  /** F2-16: the ONE place an install/pull latch is armed. Refuses after
+   *  dispose (gate closed) — the caller maps `undefined` to
+   *  {@link SETUP_DISPOSED_REFUSAL}. Synchronous by construction: the
+   *  closed-check and the Map.set run in one tick (run-to-completion), so a
+   *  concurrent dispose() cannot interleave between them. */
+  private armLatch(key: string): AbortController | undefined {
+    if (this.lifecycle.closed) return undefined;
+    const abort = new AbortController();
+    this.inFlight.set(key, abort);
+    return abort;
   }
 
   // --- setup.cancel (read-only / best-effort) -----------------------------------
@@ -2731,8 +2774,12 @@ export class SetupController {
   }
 
   private pushProgress(progress: SetupProgress): void {
+    // F2-16: a straggler progress tick after dispose must not re-create
+    // throttle entries or arm timers against a disposed emitter.
+    if (this.lifecycle.closed) return;
     const key = `${progress.op}:${progress.id}`;
     const now = Date.now();
+    pruneExpiredThrottleEntries(this.throttle, now, PROGRESS_THROTTLE_MS);
     let state = this.throttle.get(key);
     if (!state) {
       state = { lastEmit: -Infinity, timer: undefined, pending: undefined };

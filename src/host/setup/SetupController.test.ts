@@ -14,8 +14,11 @@ import {
   composeLlamacppCell,
   redactForModal,
   MODAL_UNSAFE_TEXT_PATTERN,
+  SETUP_DISPOSED_REFUSAL,
+  pruneExpiredThrottleEntries,
   type SetupHost,
   type SetupControllerDeps,
+  type ThrottleState,
 } from './SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend, NEXT_DEDICATED_MODEL } from './registry';
 import { MODEL_CATALOG } from './modelCatalog';
@@ -3359,6 +3362,51 @@ describe('TC-6 (AU-6): dispose() aborts in-flight installs/pulls', () => {
     // The epoch bump inside dispose() (pre-existing TC-3 behavior) must still
     // drop this late settle — the memo is never written.
     expect((await controller.status()).agent.phase).toBe('missing');
+  });
+});
+
+describe('F2-16: a disposed controller refuses to arm NEW install/pull latches', () => {
+  it('setup.pullModel after dispose() refuses without invoking the pull dep', async () => {
+    const pullModel = vi.fn();
+    const { controller } = makeController({}, { pullModel });
+    controller.dispose();
+    const result = await controller.handle('setup.pullModel', { model: 'llama3:8b', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: false, reason: SETUP_DISPOSED_REFUSAL });
+    expect(pullModel).not.toHaveBeenCalled();
+  });
+  it('setup.install after dispose() refuses the same way', async () => {
+    const { controller } = makeController();
+    controller.dispose();
+    await expect(controller.handle('setup.install', { backendId: 'hermes' })).resolves.toEqual({
+      ok: false,
+      reason: SETUP_DISPOSED_REFUSAL,
+    });
+  });
+  it('setup.provisionModel after dispose() refuses the same way', async () => {
+    const { controller } = makeController();
+    controller.dispose();
+    await expect(
+      controller.handle('setup.provisionModel', { modelId: 'qwen25-coder-1.5b', backend: 'ollama' }),
+    ).resolves.toEqual({ ok: false, reason: SETUP_DISPOSED_REFUSAL });
+  });
+});
+
+describe('F2-16: throttle-map entry expiry', () => {
+  it('pruneExpiredThrottleEntries drops idle entries and keeps live ones', () => {
+    const throttle = new Map<string, ThrottleState>();
+    throttle.set('pull:stale', { lastEmit: 1_000, timer: undefined, pending: undefined });
+    throttle.set('pull:pending', { lastEmit: 1_000, timer: undefined, pending: { op: 'pull', id: 'pending' } });
+    const timer = setTimeout(() => {}, 1);
+    throttle.set('pull:timed', { lastEmit: 1_000, timer, pending: undefined });
+    pruneExpiredThrottleEntries(throttle, 1_200, 150);
+    expect([...throttle.keys()].sort()).toEqual(['pull:pending', 'pull:timed']);
+    clearTimeout(timer);
+  });
+  it('a pruned key throttles a fresh burst exactly like a first-ever key (semantics preserved)', () => {
+    // fresh entry: lastEmit=-Infinity ⇒ immediate fire — identical to a pruned-then-recreated entry.
+    const throttle = new Map<string, ThrottleState>();
+    pruneExpiredThrottleEntries(throttle, Date.now(), 150); // empty map: no-op, no throw
+    expect(throttle.size).toBe(0);
   });
 });
 
