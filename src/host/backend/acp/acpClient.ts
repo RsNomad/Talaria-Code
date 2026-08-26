@@ -17,6 +17,7 @@ import type {
 } from './types';
 import type { AcpMcpServerHttp } from '../../../shared/acpMcpServerHttp';
 import { isRecord } from '../../../shared/typeGuards';
+import { EXTENSION_NAME, EXTENSION_TITLE, EXTENSION_VERSION } from '../../../shared/version';
 import { MAX_LINE_BYTES } from '../../transport/maxLineBytes';
 import { createStdoutByteCapTransform } from './stdoutByteCap';
 
@@ -650,6 +651,11 @@ export class AcpClient implements AcpClientLike {
       // constant was confirmed" comment was fabrication-adjacent: the
       // constant exists.
       protocolVersion: PROTOCOL_VERSION,
+      // S1-05 (WS-AC): ACP SHOULD — identify the client (the spec marks
+      // clientInfo "will be required" in future versions; Hermes logs the
+      // client name at initialize, acp_adapter/server.py:877-882). Values
+      // are the package.json identity via the test-pinned shared constant.
+      clientInfo: { name: EXTENSION_NAME, title: EXTENSION_TITLE, version: EXTENSION_VERSION },
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: false },
         // Audit (🟡): we advertised `terminal: true` while registering ZERO

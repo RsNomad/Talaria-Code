@@ -45,6 +45,7 @@ vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
 
 import { spawn } from 'node:child_process';
 import { AcpClient, type AcpClientCallbacks } from './acpClient';
+import { EXTENSION_VERSION } from '../../../shared/version';
 
 const NOOP_CALLBACKS: AcpClientCallbacks = {
   onSessionUpdate: () => {},
@@ -201,6 +202,7 @@ describe('AcpClient — real client, real stdin bytes (Task 5 review F-1)', () =
         method: 'initialize',
         params: {
           protocolVersion: 1,
+          clientInfo: { name: 'talaria-code', title: 'Talaria Code', version: EXTENSION_VERSION },
           clientCapabilities: {
             fs: { readTextFile: true, writeTextFile: false },
             terminal: false,
