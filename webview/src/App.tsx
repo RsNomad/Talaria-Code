@@ -41,6 +41,17 @@ import type {
   ThemeKind,
 } from './protocol';
 import { MAX_TABS, PANEL_SCOPE } from './protocol';
+import {
+  asShape,
+  isCheckpointRestoreResult,
+  isHubInstallResult,
+  isHubPreview,
+  isHubScan,
+  isMcpAddResult,
+  isMcpCatalogData,
+  isMcpCatalogInstallResult,
+  isMcpTestResult,
+} from './shapeGuards';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
@@ -94,6 +105,18 @@ type Action = { host: HostToWebview } | { local: LocalAction };
  * whenever no session is live yet.
  */
 const UNBOUND_SESSION_PLACEHOLDER = '';
+
+/**
+ * WS-BG: guard-or-throw for correlated RPC results. A refused shape rejects
+ * with an honest method-named Error — the same rejected-promise path every
+ * caller already handles for RPC timeouts (panel error rendering /
+ * optimistic rollback). Message names the METHOD only, never the payload.
+ */
+const requireShape = <T,>(raw: unknown, guard: (x: unknown) => x is T, method: string): T => {
+  const shaped = asShape(raw, guard);
+  if (shaped === undefined) throw new Error(`${method} returned an unrecognized result shape`);
+  return shaped;
+};
 
 function rootReducer(state: AppState, action: Action): AppState {
   if ('host' in action) return reduce(state, action.host);
@@ -476,7 +499,7 @@ export function App() {
     const params: Record<string, unknown> = { id, rootId: tab.rootId };
     if (force) params.force = true;
     const result = await bridge.request('checkpoint.restore', params, tab.tabId);
-    return result as CheckpointRestoreResult | undefined;
+    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.restore');
   };
 
   // CF-12 review fix (W3-T7): correlated `checkpoint.redo`/`checkpoint.redoAll`
@@ -494,14 +517,14 @@ export function App() {
     const params: Record<string, unknown> = { rootId: tab.rootId };
     if (force) params.force = true;
     const result = await bridge.request('checkpoint.redo', params, tab.tabId);
-    return result as CheckpointRestoreResult | undefined;
+    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.redo');
   };
 
   const redoAllCheckpoint = async (force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
     const params: Record<string, unknown> = { rootId: tab.rootId };
     if (force) params.force = true;
     const result = await bridge.request('checkpoint.redoAll', params, tab.tabId);
-    return result as CheckpointRestoreResult | undefined;
+    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.redoAll');
   };
 
   // A#5: MCP "Reload servers" over the CORRELATED path so the gateway's result
@@ -514,17 +537,18 @@ export function App() {
   // Task A7 (§4.9): the MCP admin RPCs `McpPanel`'s row actions + Add-server
   // form drive. All correlated (`bridge.request`), same F-1 posture as
   // `reloadMcp`/`toggle` above — `mcp` is connection-global, so these are
-  // UNTAGGED. `addMcpServer`/`testMcpServer`/`authMcpServer` cast the
-  // resolved value to its known shape, the same `restoreCheckpoint`/
-  // `redoCheckpoint` idiom above (`bridge.request` itself only promises
-  // `unknown` — the host's real return shape is the wire contract).
+  // UNTAGGED. `addMcpServer`/`testMcpServer`/`authMcpServer` now GUARD the
+  // resolved value onto its known shape via `requireShape` (WS-BG), the same
+  // `restoreCheckpoint`/`redoCheckpoint` idiom above (`bridge.request` itself
+  // only promises `unknown` — the host's real return shape is the wire
+  // contract).
   const addMcpServer = async (params: McpAddParams): Promise<McpAddResult> => {
     const result = await bridge.request('mcp.add', params);
-    return result as McpAddResult;
+    return requireShape(result, isMcpAddResult, 'mcp.add');
   };
   const testMcpServer = async (name: string): Promise<McpTestResult> => {
     const result = await bridge.request('mcp.test', { name });
-    return result as McpTestResult;
+    return requireShape(result, isMcpTestResult, 'mcp.test');
   };
   const removeMcpServer = (name: string) => bridge.request('mcp.remove', { name });
   const setMcpServerEnabled = (name: string, enabled: boolean) =>
@@ -532,15 +556,15 @@ export function App() {
   // Task A8 (§4.8): drives the panel's per-row `Login` button.
   const authMcpServer = async (name: string): Promise<McpTestResult> => {
     const result = await bridge.request('mcp.auth', { name });
-    return result as McpTestResult;
+    return requireShape(result, isMcpTestResult, 'mcp.auth');
   };
   // Task A8 (§4.7): the Catalog disclosure's fetch (read-only, not trust-
   // gated — fired at most once per panel mount, on first expand) and its
-  // `Install` action. Same untagged/cast posture as the other MCP admin RPCs
-  // above — `mcp` is connection-global.
+  // `Install` action. Same untagged/guarded posture as the other MCP admin
+  // RPCs above — `mcp` is connection-global.
   const mcpCatalog = async (): Promise<McpCatalogData> => {
     const result = await bridge.request('mcp.catalog', {});
-    return result as McpCatalogData;
+    return requireShape(result, isMcpCatalogData, 'mcp.catalog');
   };
   const mcpCatalogInstall = async (p: McpCatalogInstallParams): Promise<McpCatalogInstallResult> => {
     // `bridge.request` wants `Record<string, unknown>`; unlike `McpAddParams`
@@ -554,7 +578,7 @@ export function App() {
     // `required_env` vars itself, masked, after the consent modal.
     const wireParams: Record<string, unknown> = { name: p.name };
     const result = await bridge.request('mcp.catalogInstall', wireParams);
-    return result as McpCatalogInstallResult;
+    return requireShape(result, isMcpCatalogInstallResult, 'mcp.catalogInstall');
   };
 
   // Task B6 (§5.6): the T2 skills admin RPCs `SkillsPanel`'s Create/Install-
@@ -572,15 +596,15 @@ export function App() {
   };
   const previewHubSkill = async (identifier: string): Promise<HubPreview> => {
     const result = await bridge.request('skills.hubPreview', { identifier });
-    return result as HubPreview;
+    return requireShape(result, isHubPreview, 'skills.hubPreview');
   };
   const scanHubSkill = async (identifier: string): Promise<HubScan> => {
     const result = await bridge.request('skills.hubScan', { identifier });
-    return result as HubScan;
+    return requireShape(result, isHubScan, 'skills.hubScan');
   };
   const installHubSkill = async (identifier: string): Promise<HubInstallResult> => {
     const result = await bridge.request('skills.hubInstall', { identifier });
-    return result as HubInstallResult;
+    return requireShape(result, isHubInstallResult, 'skills.hubInstall');
   };
   const uninstallHubSkill = (name: string) => bridge.request('skills.hubUninstall', { name });
 
