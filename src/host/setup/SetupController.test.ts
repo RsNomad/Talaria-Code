@@ -17,6 +17,8 @@ import {
   SETUP_DISPOSED_REFUSAL,
   pruneExpiredThrottleEntries,
   OLLAMA_PROBE_MEMO_TTL_MS,
+  EXCLUDE_GLOBS_MAX_ENTRIES,
+  EXCLUDE_GLOB_MAX_LENGTH,
   type SetupHost,
   type SetupControllerDeps,
   type ThrottleState,
@@ -457,6 +459,30 @@ describe('FM-16: setup.setTunable allowlist (D9)', () => {
     const result = await controller.handle('setup.setTunable', { key: 'talaria.autocomplete.debounceMs', value: -5 });
     expect(result.ok).toBe(false);
     expect(host.settings.size).toBe(0);
+  });
+});
+
+// --- CA-M11: excludeGlobs length caps ---------------------------------------
+
+describe('CA-M11: excludeGlobs is length-capped', () => {
+  it('refuses more than EXCLUDE_GLOBS_MAX_ENTRIES entries', async () => {
+    const { controller } = makeController();
+    const value = Array.from({ length: EXCLUDE_GLOBS_MAX_ENTRIES + 1 }, (_, i) => `**/${i}`);
+    const result = (await controller.handle('setup.setTunable', { key: 'talaria.rag.excludeGlobs', value })) as { ok: boolean };
+    expect(result.ok).toBe(false);
+  });
+  it('refuses a single glob longer than EXCLUDE_GLOB_MAX_LENGTH', async () => {
+    const { controller } = makeController();
+    const result = (await controller.handle('setup.setTunable', {
+      key: 'talaria.rag.excludeGlobs',
+      value: ['x'.repeat(EXCLUDE_GLOB_MAX_LENGTH + 1)],
+    })) as { ok: boolean };
+    expect(result.ok).toBe(false);
+  });
+  it('accepts a normal list unchanged', async () => {
+    const { controller, host } = makeController();
+    await controller.handle('setup.setTunable', { key: 'talaria.rag.excludeGlobs', value: ['**/node_modules/**'] });
+    expect(host.settings.get('talaria.rag.excludeGlobs')).toEqual(['**/node_modules/**']);
   });
 });
 

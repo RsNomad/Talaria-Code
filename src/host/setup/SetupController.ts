@@ -3401,6 +3401,10 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
+/** CA-M11: generous ceilings — real ignore lists are dozens of entries. */
+export const EXCLUDE_GLOBS_MAX_ENTRIES = 128;
+export const EXCLUDE_GLOB_MAX_LENGTH = 256;
+
 function validateTunableValue(
   key: string,
   value: unknown,
@@ -3425,9 +3429,14 @@ function validateTunableValue(
         ? { ok: true, value }
         : { ok: false, reason: `${key} must be a non-negative integer.` };
     case 'talaria.rag.excludeGlobs':
-      return Array.isArray(value) && value.every((v) => typeof v === 'string')
+      return Array.isArray(value) &&
+        value.length <= EXCLUDE_GLOBS_MAX_ENTRIES &&
+        value.every((v) => typeof v === 'string' && v.length <= EXCLUDE_GLOB_MAX_LENGTH)
         ? { ok: true, value }
-        : { ok: false, reason: `${key} must be an array of strings.` };
+        : {
+            ok: false,
+            reason: `${key} must be an array of at most ${EXCLUDE_GLOBS_MAX_ENTRIES} strings, each at most ${EXCLUDE_GLOB_MAX_LENGTH} characters.`,
+          };
     case 'talaria.autocomplete.crossFile.enabled':
     case 'talaria.autocomplete.crossFile.prefixInjection':
     case 'talaria.autocomplete.crossFile.warmUp':
