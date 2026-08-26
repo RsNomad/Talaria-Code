@@ -2693,6 +2693,56 @@ describe('AcpBackend.closeTab — CF-01/L3-1 fix (Important): the pendingClose t
   });
 });
 
+/**
+ * WS-SL F3-9: `closeTab` tombstones `pendingClose` SYNCHRONOUSLY but the
+ * registry removal is queued on the topology tail — behind a hung link, up
+ * to SESSION_ESTABLISH_DEADLINE_MS (120 s). In that window
+ * `handleRequestPermission` still found the live controller and emitted an
+ * approval card onto a tab the user already closed (the harness thread then
+ * blocked on a card nobody can answer). The tombstone check mirrors the
+ * sendPrompt (:1322) and handleSessionUpdate (:2068) guards — this was the
+ * last unguarded ingress. Characterization-first: the first committed shape
+ * of this test PINNED the card-onto-closing-tab, then flipped.
+ */
+describe('AcpBackend.handleRequestPermission — WS-SL F3-9: pendingClose tombstone refusal', () => {
+  it('a request_permission landing in the closeTab deferral window is auto-denied (cancelled) — no card onto the closing tab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    const client = must(clients[0]);
+
+    // A LIVE turn on session-1 (so post-F3-3 the registration would be
+    // legitimate — the refusal under test must come from the tombstone,
+    // not from turn-liveness). FakeAcpClient.prompt hangs by default.
+    backend.sendPrompt('session-1', 'work', 'default');
+    await flushMicrotasks();
+
+    // Occupy the topology tail so the queued close CANNOT run yet:
+    client.hangLoadSession();
+    const loadPromise = backend.loadTab('tab-2', 'history-x', '/ws');
+    await flushMicrotasks();
+    backend.closeTab('session-1'); // tombstoned SYNCHRONOUSLY; removal queued BEHIND the hung load
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    const res = await must(client.callbacks).onRequestPermission({
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId: 'closing-1',
+        title: 'Run: npm test',
+        kind: 'execute',
+        content: [{ content: { type: 'text', text: '$ npm test' } }],
+        rawInput: { command: 'npm test', description: 'run' },
+      },
+    });
+
+    expect(res).toEqual({ outcome: { outcome: 'cancelled' } });
+    expect(messages.some((m) => m.type === 'approval.request')).toBe(false);
+    void loadPromise; // deliberately left in flight (hung child) — discarded at teardown
+  });
+});
+
 describe('AcpBackend.listTabs — W6-FF (3-way ARCH I-1): the live tab list TalariaViewProvider\'s hydrate payload reuses', () => {
   it('is empty before any session is established (a genuine cold boot — nothing live to reconcile)', () => {
     const { backend } = makeStartableBackend();

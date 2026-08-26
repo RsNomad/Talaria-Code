@@ -2100,6 +2100,19 @@ export class AcpBackend implements AgentBackend {
       return buildCancelledOutcome();
     }
 
+    // WS-SL F3-9: a session mid-`closeTab` is about to be gone — its
+    // registry entry may linger while the close is queued on the topology
+    // tail (up to 120 s behind a hung link). Auto-deny instead of emitting a
+    // card onto a closing tab; the SAME synchronous tombstone `sendPrompt`
+    // and `handleSessionUpdate` already read — this was the last unguarded
+    // ingress. Fail-closed: cancelled maps to deny harness-side.
+    if (this.pendingClose.has(req.sessionId)) {
+      this.logger?.append(
+        `[policy] permission request on closing session '${req.sessionId}' — auto-denied (fail-closed)`,
+      );
+      return buildCancelledOutcome();
+    }
+
     const controller = this.sessions.get(req.sessionId);
     if (controller) {
       this.approvalCounter += 1;
