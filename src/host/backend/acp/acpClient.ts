@@ -979,8 +979,24 @@ export class AcpClient implements AcpClientLike {
    * child death now settles the promise instead of leaving it eternally
    * pending; the termination rejection lands in the existing best-effort
    * catch.
+   *
+   * WS-AC A-02: the call is now additionally gated on the advertised
+   * sessionCapabilities.close — see the in-body comment.
    */
   async closeSession(sessionId: string): Promise<void> {
+    // A-02 gate (WS-AC): the spec MUST NOT call an unadvertised
+    // `session/close`. Pinned Hermes advertises fork/list/resume and no
+    // close (`acp_adapter/server.py:890-894`), so vs the pinned harness this
+    // stops emitting a frame Hermes could only refuse (-32601) — the ONE
+    // deliberate wire change in the A-02 set, and the call is best-effort
+    // fire-and-forget with an identical client-observable outcome (resolves
+    // void either way; `SessionController.dispose`'s `?.catch(() => {})`
+    // never sees a difference). Fail-toward-silence, never rejects — the
+    // pre-initialize case skips for the same reason.
+    if (!this.advertised?.sessionClose) {
+      this.log('session/close not advertised — skipping (ACP MUST NOT call unadvertised session/close)');
+      return;
+    }
     try {
       await this.raceTermination(() => this.requireConnection().unstable_closeSession({ sessionId }));
     } catch (err) {

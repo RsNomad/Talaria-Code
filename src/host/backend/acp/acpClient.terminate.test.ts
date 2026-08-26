@@ -82,6 +82,23 @@ async function connectClient(): Promise<{ client: AcpClient; child: ChildProcess
   return { client, child, stdout };
 }
 
+/** WS-AC A-02: caps for tests that must reach the session/close wire path. */
+const CLOSE_ADVERTISED_CAPS = {
+  loadSession: true,
+  promptCapabilities: { image: true },
+  sessionCapabilities: { fork: {}, list: {}, resume: {}, close: {} },
+};
+
+/** WS-AC A-02: the gated RPCs refuse before initialize() — run one first (id 0). */
+async function initializeWithCaps(client: AcpClient, stdout: PassThrough, agentCapabilities: unknown): Promise<void> {
+  const init = client.initialize();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  stdout.write(
+    `${JSON.stringify({ jsonrpc: '2.0', id: 0, result: { protocolVersion: 1, agentCapabilities, authMethods: [] } })}\n`,
+  );
+  await init;
+}
+
 describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
   it('prompt() rejects with a "terminated" message when the child exits mid-request, instead of hanging forever', async () => {
     const { client, child } = await connectClient();
@@ -201,7 +218,8 @@ describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
   });
 
   it('WS-R1 F3-10: closeSession settles when the child dies mid-request (never-rejects contract kept)', async () => {
-    const { client, child } = await connectClient();
+    const { client, child, stdout } = await connectClient();
+    await initializeWithCaps(client, stdout, CLOSE_ADVERTISED_CAPS);
     const closing = client.closeSession('session-1');
     child.emit('exit', 1, null);
     await expect(closing).resolves.toBeUndefined();

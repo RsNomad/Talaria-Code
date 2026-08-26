@@ -184,11 +184,10 @@ describe('AcpClient — real client, real stdin bytes (Task 5 review F-1)', () =
     ]);
   });
 
-  it('closeSession() writes an unprefixed "session/close" request frame', async () => {
+  it('closeSession() pre-initialize is a silent no-op — nothing written, never rejects (A-02 MUST NOT)', async () => {
     const { client, wireFrames } = await connectClient();
-    void client.closeSession('s1');
-    await flush();
-    expect(wireFrames()).toEqual([{ jsonrpc: '2.0', id: 0, method: 'session/close', params: { sessionId: 's1' } }]);
+    await expect(client.closeSession('s1')).resolves.toBeUndefined();
+    expect(wireFrames()).toEqual([]);
   });
 
   it('initialize() writes the pinned protocolVersion + capabilities frame', async () => {
@@ -368,5 +367,28 @@ describe('AcpClient — WS-AC A-02 root: initialize retains + asserts the advert
   it('gate: session/load before initialize() is refused (initialize-first)', async () => {
     const { client } = await connectClient();
     await expect(client.loadSession('/w', 's1')).rejects.toThrow(/before initialize/);
+  });
+
+  it('gate: pinned Hermes advertises no close capability — closeSession resolves without writing ANY frame', async () => {
+    const { client, wireFramesAfterInit } = await connectInitializedClient();
+    await expect(client.closeSession('s1')).resolves.toBeUndefined();
+    expect(wireFramesAfterInit()).toEqual([]);
+  });
+
+  it('gate: a richer agent advertising sessionCapabilities.close still gets the best-effort frame', async () => {
+    const { client, wireFramesAfterInit } = await connectInitializedClient({
+      protocolVersion: 1,
+      agentCapabilities: {
+        loadSession: true,
+        promptCapabilities: { image: true },
+        sessionCapabilities: { fork: {}, list: {}, resume: {}, close: {} },
+      },
+      authMethods: [],
+    });
+    void client.closeSession('s1');
+    await flush();
+    expect(wireFramesAfterInit()).toEqual([
+      { jsonrpc: '2.0', id: 1, method: 'session/close', params: { sessionId: 's1' } },
+    ]);
   });
 });
