@@ -161,8 +161,13 @@ export class JsonRpcStdio implements Disposable {
    * error frames, on child exit, and after {@link requestTimeoutMs}.
    */
   request<T>(method: string, params?: unknown): Promise<T> {
-    if (this.disposed) {
-      return Promise.reject(new Error('JsonRpcStdio disposed'));
+    if (this.disposed || this.terminated) {
+      // F2-01/F3-13 (WS-AC): a terminated (crashed) child can never answer —
+      // queueing would burn the full 120s timeout against a dead stdin.
+      // Same fast-fail the disposed path always had.
+      return Promise.reject(
+        new Error(this.terminated && !this.disposed ? `request '${method}' refused: child already terminated` : 'JsonRpcStdio disposed'),
+      );
     }
     const id = this.nextId++;
     const frame = { jsonrpc: '2.0' as const, id, method, params };
@@ -186,7 +191,7 @@ export class JsonRpcStdio implements Disposable {
 
   /** Fire-and-forget notification (no `id`, no reply expected). */
   notify(method: string, params?: unknown): void {
-    if (this.disposed) return;
+    if (this.disposed || this.terminated) return;
     this.send({ jsonrpc: '2.0', method, params });
   }
 

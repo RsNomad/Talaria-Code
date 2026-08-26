@@ -47,14 +47,16 @@ function makeFakeChild(): {
 function makeTransport(): {
   transport: JsonRpcStdio;
   stdout: PassThrough;
+  stdin: PassThrough;
   fakeChild: ChildProcess & { kill: ReturnType<typeof vi.fn>; exitCode: number | null };
 } {
-  const { child, stdout } = makeFakeChild();
+  const { child, stdout, stdin } = makeFakeChild();
   vi.mocked(spawn).mockReturnValue(child);
   const transport = new JsonRpcStdio({ command: 'python', args: ['-m', 'tui_gateway.entry'] });
   return {
     transport,
     stdout,
+    stdin,
     fakeChild: child as unknown as ChildProcess & { kill: ReturnType<typeof vi.fn>; exitCode: number | null },
   };
 }
@@ -395,5 +397,26 @@ describe("JsonRpcStdio — AU-12/TE-1: child 'error' fans to onExit (mirrors Acp
 
     expect(throwing).toHaveBeenCalledWith(null);
     expect(other).toHaveBeenCalledWith(null);
+  });
+});
+
+describe('F2-01/F3-13 (WS-AC): requests against a terminated child fast-fail, never 120s-hang', () => {
+  it('request() after child exit rejects immediately with a terminated message', async () => {
+    const { transport, fakeChild } = makeTransport();
+    fakeChild.emit('exit', 1); // ChildProcess IS an EventEmitter — same idiom as the file's other tests
+    // RED evidence (pre-fix): this stays pending until the 120s request
+    // timer — the rejects-assertion times out at vitest's 5s default, the
+    // same red shape acpClient.terminate.test.ts documents.
+    await expect(transport.request('config.show')).rejects.toThrow(/terminated/i);
+  });
+
+  it('notify() after child exit writes nothing to the dead stdin', async () => {
+    const { transport, fakeChild, stdin } = makeTransport();
+    const written: Buffer[] = [];
+    stdin.on('data', (c: Buffer) => written.push(c));
+    fakeChild.emit('exit', 1);
+    transport.notify('ui.ping');
+    await Promise.resolve();
+    expect(Buffer.concat(written).toString('utf8')).toBe('');
   });
 });
