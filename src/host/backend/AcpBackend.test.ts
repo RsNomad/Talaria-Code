@@ -2476,6 +2476,26 @@ describe('AcpBackend.openTab/closeTab — W4-T3b (§2d/§2e Deliverable 5): the 
     await backend.start();
     expect(() => backend.closeTab('never-existed')).not.toThrow();
   });
+
+  it('WS-SL F3-5: a second tab.open for an ALREADY-OCCUPIED tabId is an idempotent no-op — no second session mint, no tab.error onto the healthy tab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).queueSessionId('session-2');
+    await backend.openTab('tab-2'); // first open: mints + binds session-2
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    must(clients[0]).queueSessionId('session-3'); // would be consumed by a (wrong) second mint
+
+    await backend.openTab('tab-2'); // the duplicate (double-fired tab.open)
+
+    // No second mint: boot + tab-2 only.
+    expect(must(clients[0]).newSessionCalls).toHaveLength(2);
+    // The healthy bound tab is untouched: no tab.error, no second tab.bound.
+    expect(messages).toEqual([]);
+    // The occupant is still session-2 (registry first-match and the webview
+    // binding agree — the finding's divergence never happens).
+    expect(sessionIdForTab(backend, 'tab-2')).toBe('session-2');
+  });
 });
 
 describe('WS-R1 F3-1 — openTab mint is raced (deadline + exit)', () => {

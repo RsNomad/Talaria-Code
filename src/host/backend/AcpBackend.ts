@@ -1013,6 +1013,25 @@ export class AcpBackend implements AgentBackend {
   }
 
   private async openTabInternal(tabId: string): Promise<void> {
+    // WS-SL F3-5: per-tabId occupant dedup — the mint path's missing guard
+    // (its load sibling already dedups per-sessionId at the registry, W6-FB).
+    // A double-fired `tab.open` (webview retry affordances, replayed posts)
+    // would otherwise mint a SECOND session for the same tab: the first
+    // controller leaks and `getByTabId` (first-match) diverges from the
+    // webview's binding (last `tab.bound`). Idempotent no-op ack, NOT a
+    // `tab.error`: opens are tail-serialized, so an occupant existing here
+    // means its `tab.bound` was already announced (§7 B8 satisfied), and the
+    // webview's open-failed fold would deface that healthy bound tab
+    // (`transcript.ts` sets error+openFailed regardless of binding). A
+    // genuinely failed first open leaves NO occupant, so its Retry re-post
+    // still proceeds normally.
+    const occupant = this.sessions.getByTabId(tabId);
+    if (occupant) {
+      this.logger?.append(
+        `[AcpBackend] openTab('${tabId}') ignored — session '${occupant.sessionId}' already occupies this tab (tab.bound already announced)`,
+      );
+      return;
+    }
     const client = this.connectionSupervisor.getClient();
     if (!client) {
       this.emitter.fire({
