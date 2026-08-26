@@ -2189,3 +2189,97 @@ describe('SessionController.sendPrompt — WS-SL F1-13: empty-prompt refusal', (
     expect(emitted.some((m) => m.type === 'turn.start')).toBe(true);
   });
 });
+
+/**
+ * WS-SL F2-05: `void this.runTurnWithCheckpoint(...)` had no terminal catch —
+ * a rejection from `snapshotCheckpoint`/`resolveMentions` (the `Promise.all`
+ * before any turn guard) became an unhandled rejection AND leaked the root
+ * turn lease + `liveTurnId`, wedging every later prompt on this root behind
+ * "A turn is already running…". Characterization-first: the first committed
+ * shape of this test PINNED the wedge (no turn.end, lease held, next prompt
+ * refused), then flipped. The catch mirrors `runTurn`'s own error arm:
+ * same guard, same bounded `errorMessage(err)`, same `emitTurnEnd`.
+ */
+describe('SessionController.runTurnWithCheckpoint — WS-SL F2-05: terminal catch (no leaked lease)', () => {
+  function makeF205Harness(): {
+    controller: SessionController;
+    emitted: HostToWebviewMessage[];
+    releaseCalls: () => number;
+    promptCalls: () => number;
+    disarmMentionBoom: () => void;
+  } {
+    const emitted: HostToWebviewMessage[] = [];
+    let releases = 0;
+    let prompts = 0;
+    let mentionBoom = true;
+    const client = {
+      cancel: async () => undefined,
+      prompt: () => {
+        prompts += 1;
+        return new Promise<never>(() => {});
+      },
+    } as unknown as AcpClientLike;
+    const root: RootCoordinatorLike = {
+      rootId: 'root-1',
+      tracker: undefined,
+      tryAcquireTurnLease: () => true,
+      releaseTurnLease: () => {
+        releases += 1;
+      },
+      anyLiveTurn: () => false,
+      nextTurnOrdinal: () => 1,
+      nextBaselineOrdinal: () => -1,
+      refreshCheckpointsPanel: () => {},
+    };
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root,
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => {
+        if (mentionBoom) throw new Error('mention resolution boom');
+        return [];
+      },
+    };
+    return {
+      controller: new SessionController('session-1', '/fake/ws', port),
+      emitted,
+      releaseCalls: () => releases,
+      promptCalls: () => prompts,
+      disarmMentionBoom: () => {
+        mentionBoom = false;
+      },
+    };
+  }
+
+  it('a pre-prompt rejection ends the turn honestly: error{turnId} + turn.end{error}, lease released, next prompt admitted', async () => {
+    const { controller, emitted, releaseCalls, promptCalls, disarmMentionBoom } = makeF205Harness();
+
+    controller.sendPrompt('do the thing', 'default');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => m.type === 'turn.end')).toBe(true);
+    });
+
+    expect(emitted).toContainEqual({
+      type: 'error',
+      sessionId: 'session-1',
+      message: 'mention resolution boom',
+      turnId: 'turn-1',
+    });
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'error' }),
+    );
+    expect(releaseCalls()).toBe(1);
+    expect(controller.hasLiveTurn()).toBe(false);
+    expect(promptCalls()).toBe(0); // the turn never reached client.prompt
+
+    // The lease is genuinely free: the NEXT prompt is admitted, not refused.
+    disarmMentionBoom();
+    controller.sendPrompt('again', 'default');
+    await vi.waitFor(() => expect(promptCalls()).toBe(1));
+    expect(emitted.some((m) => m.type === 'error' && m.message.includes('already running'))).toBe(false);
+  });
+});

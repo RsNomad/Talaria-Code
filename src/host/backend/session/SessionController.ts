@@ -426,7 +426,26 @@ export class SessionController {
     this.port.emit({ type: 'turn.start', turnId, sessionId: this.sessionId });
     this.port.emit({ type: 'user', turnId, sessionId: this.sessionId, text, mode });
 
-    void this.runTurnWithCheckpoint(turnId, turnOrdinal, text, mode, attachments, mentions);
+    // WS-SL F2-05: the terminal catch — `runTurnWithCheckpoint`'s pre-guard
+    // `Promise.all` (checkpoint snapshot + mention resolution) can reject
+    // BEFORE runTurn's own try/catch is even entered; unhandled, that leaked
+    // the root turn lease + liveTurnId forever. Mirrors runTurn's error arm
+    // exactly: same superseded guard, same bounded `errorMessage(err)`
+    // (Error.message only — the established webview-safe form), same
+    // `emitTurnEnd(turnId,'error')` (which releases the lease, settles any
+    // straggler approvals, and emits the closing bracket). State first, log
+    // last (T17/T18 ordering lesson).
+    void this.runTurnWithCheckpoint(turnId, turnOrdinal, text, mode, attachments, mentions).catch(
+      (err: unknown) => {
+        if (this.currentTurnId === turnId) {
+          this.port.emit({ type: 'error', sessionId: this.sessionId, message: errorMessage(err), turnId });
+          this.emitTurnEnd(turnId, 'error');
+        }
+        this.port.logger?.append(
+          `[SessionController] turn '${turnId}' aborted before the prompt settled: ${errorMessage(err)}`,
+        );
+      },
+    );
   }
 
   /**
