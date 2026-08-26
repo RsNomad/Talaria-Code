@@ -20,9 +20,21 @@ import type { PromptDegradeCaps } from './promptCaps';
  * everything else; live Hermes acceptance of both variants is verified at
  * the Fedora local-test phase (cannot run `hermes acp` here).
  */
+declare const CONFINED_BRAND: unique symbol;
+/**
+ * CA-M03 (WS-AC): compile-time brand for "this attachment came out of
+ * {@link confineAttachmentPaths}" — the ONE blessing point (V-19's
+ * confine-first, secret-gate-second choke; dataUri-only attachments pass
+ * through it too and are blessed by passage). Zero runtime representation;
+ * the single `as` below is the documented blessing, making a RAW webview
+ * attachment handed straight to {@link buildPromptContent} a type error
+ * instead of a reviewer catch.
+ */
+export type ConfinedAttachment = Attachment & { readonly [CONFINED_BRAND]: true };
+
 export function buildPromptContent(
   text: string,
-  attachments: Attachment[] | undefined,
+  attachments: readonly ConfinedAttachment[] | undefined,
   promptCaps: PromptDegradeCaps,
 ): AcpOutboundContentBlock[] {
   const blocks: AcpOutboundContentBlock[] = [];
@@ -119,7 +131,7 @@ function parseDataUri(dataUri: string): { mime: string; base64: string } | undef
 export type AttachmentConfineFn = (path: string, roots: readonly string[]) => Promise<string | null>;
 
 export interface ConfineAttachmentsResult {
-  attachments: Attachment[];
+  attachments: ConfinedAttachment[];
   droppedCount: number;
 }
 
@@ -145,11 +157,11 @@ export async function confineAttachmentPaths(
   workspaceRoots: readonly string[],
   confine: AttachmentConfineFn = resolveWithinWorkspaceReal,
 ): Promise<ConfineAttachmentsResult> {
-  const kept: Attachment[] = [];
+  const kept: ConfinedAttachment[] = [];
   let droppedCount = 0;
   for (const attachment of attachments) {
     if (!attachment.path) {
-      kept.push(attachment);
+      kept.push(attachment as ConfinedAttachment); // blessed: no fs reference to confine
       continue;
     }
     const canonical = await confine(attachment.path, workspaceRoots);
@@ -157,7 +169,7 @@ export async function confineAttachmentPaths(
       droppedCount++;
       continue;
     }
-    kept.push(canonical === attachment.path ? attachment : { ...attachment, path: canonical });
+    kept.push((canonical === attachment.path ? attachment : { ...attachment, path: canonical }) as ConfinedAttachment);
   }
   return { attachments: kept, droppedCount };
 }

@@ -2,6 +2,11 @@ import { describe, it, expect } from 'vitest';
 import { buildPromptContent, confineAttachmentPaths } from './attachments';
 import type { AttachmentConfineFn } from './attachments';
 import { derivePromptCaps, PROMPT_DEGRADE_INACTIVE, type PromptDegradeCaps } from './promptCaps';
+import type { Attachment } from '../../../shared/protocol';
+import type { ConfinedAttachment } from './attachments';
+
+/** Test-local blessing: unit fixtures did not pass through confineAttachmentPaths. */
+const asConfined = (a: Attachment[]): ConfinedAttachment[] => a as ConfinedAttachment[];
 
 const INACTIVE = PROMPT_DEGRADE_INACTIVE;
 const ACTIVE: PromptDegradeCaps = { degradeEmbeddedResources: true };
@@ -16,9 +21,9 @@ describe('buildPromptContent', () => {
   });
 
   it('maps an image attachment with a data URI to an image content block', () => {
-    const blocks = buildPromptContent('look', [
+    const blocks = buildPromptContent('look', asConfined([
       { id: 'a1', name: 'shot.png', kind: 'image', dataUri: 'data:image/png;base64,QUJD' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks).toEqual([
       { type: 'text', text: 'look' },
       { type: 'image', data: 'QUJD', mimeType: 'image/png' },
@@ -26,25 +31,25 @@ describe('buildPromptContent', () => {
   });
 
   it('maps a path-only image attachment to a resource_link', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'a2', name: 'shot.png', kind: 'image', path: '/repo/shot.png', mime: 'image/png' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks).toEqual([{ type: 'resource_link', uri: 'file:///repo/shot.png', name: 'shot.png', mimeType: 'image/png' }]);
   });
 
   it('maps a file attachment with a workspace path to a resource_link', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'a3', name: 'notes.txt', kind: 'file', path: '/repo/notes.txt', mime: 'text/plain' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks).toEqual([
       { type: 'resource_link', uri: 'file:///repo/notes.txt', name: 'notes.txt', mimeType: 'text/plain' },
     ]);
   });
 
   it('maps a pdf attachment with only inline bytes to an embedded resource', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'a4', name: 'doc.pdf', kind: 'pdf', mime: 'application/pdf', dataUri: 'data:application/pdf;base64,ZmFr' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks).toEqual([
       {
         type: 'resource',
@@ -54,14 +59,14 @@ describe('buildPromptContent', () => {
   });
 
   it('skips an attachment with neither a path nor a data URI', () => {
-    expect(buildPromptContent('', [{ id: 'a5', name: 'ghost.txt', kind: 'file' }], INACTIVE)).toEqual([]);
+    expect(buildPromptContent('', asConfined([{ id: 'a5', name: 'ghost.txt', kind: 'file' }]), INACTIVE)).toEqual([]);
   });
 
   it('maps a path-less generic text file to an embedded resource with decoded text (no blob)', () => {
     // base64 of "a,b\n1,2"
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'a6', name: 'data.csv', kind: 'file', mime: 'text/csv', dataUri: 'data:text/csv;base64,YSxiCjEsMg==' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks).toEqual([
       {
         type: 'resource',
@@ -71,7 +76,7 @@ describe('buildPromptContent', () => {
   });
 
   it('maps a path-less generic binary file to an embedded resource with a blob (no text)', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       {
         id: 'a7',
         name: 'archive.bin',
@@ -79,7 +84,7 @@ describe('buildPromptContent', () => {
         mime: 'application/octet-stream',
         dataUri: 'data:application/octet-stream;base64,ZmFr',
       },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks).toEqual([
       {
         type: 'resource',
@@ -100,9 +105,9 @@ describe('buildPromptContent', () => {
 describe('WS-AC A-03: the degrade seam — inactive is byte-identical, active degrades', () => {
   it('CHARACTERIZATION: derivePromptCaps(pinned-Hermes caps) keeps embedded resources exactly as before', () => {
     const caps = derivePromptCaps({ image: true });
-    const blocks = buildPromptContent('t', [
+    const blocks = buildPromptContent('t', asConfined([
       { id: 'a', name: 'inline.txt', kind: 'file', dataUri: 'data:text/plain;base64,aGV5' },
-    ], caps);
+    ]), caps);
     expect(blocks).toEqual([
       { type: 'text', text: 't' },
       { type: 'resource', resource: { uri: 'attachment://a/inline.txt', mimeType: 'text/plain', text: 'hey' } },
@@ -110,26 +115,26 @@ describe('WS-AC A-03: the degrade seam — inactive is byte-identical, active de
   });
 
   it('ACTIVE: a text-mime inline attachment degrades to a plain text block (content preserved)', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'a', name: 'inline.txt', kind: 'file', dataUri: 'data:text/plain;base64,aGV5' },
-    ], ACTIVE);
+    ]), ACTIVE);
     expect(blocks).toEqual([{ type: 'text', text: '[attachment: inline.txt]\nhey' }]);
   });
 
   it('ACTIVE: a binary inline attachment degrades to a resource_link at the synthetic uri', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'b', name: 'pic.bin', kind: 'file', dataUri: 'data:application/octet-stream;base64,QUJD' },
-    ], ACTIVE);
+    ]), ACTIVE);
     expect(blocks).toEqual([
       { type: 'resource_link', uri: 'attachment://b/pic.bin', name: 'pic.bin', mimeType: 'application/octet-stream' },
     ]);
   });
 
   it('ACTIVE: path-backed and image attachments are untouched by the degrade (already link/image form)', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'c', name: 'notes.txt', kind: 'file', path: '/repo/notes.txt', mime: 'text/plain' },
       { id: 'd', name: 'shot.png', kind: 'image', dataUri: 'data:image/png;base64,QUJD' },
-    ], ACTIVE);
+    ]), ACTIVE);
     expect(blocks).toEqual([
       { type: 'resource_link', uri: 'file:///repo/notes.txt', name: 'notes.txt', mimeType: 'text/plain' },
       { type: 'image', data: 'QUJD', mimeType: 'image/png' },
@@ -222,48 +227,68 @@ describe('confineAttachmentPaths — V-19 attachment path confinement', () => {
 
 describe('CA-M02 (WS-AC): file:// URIs are percent-encoded per segment', () => {
   it('CHARACTERIZATION: plain paths are unchanged (existing pins stay byte-identical)', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'p1', name: 'notes.txt', kind: 'file', path: '/repo/notes.txt', mime: 'text/plain' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks).toEqual([
       { type: 'resource_link', uri: 'file:///repo/notes.txt', name: 'notes.txt', mimeType: 'text/plain' },
     ]);
   });
 
   it('encodes spaces and # (a raw # would truncate the path into a fragment)', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'p2', name: 'a b#c.txt', kind: 'file', path: '/repo/a b#c.txt', mime: 'text/plain' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks).toEqual([
       { type: 'resource_link', uri: 'file:///repo/a%20b%23c.txt', name: 'a b#c.txt', mimeType: 'text/plain' },
     ]);
   });
 
   it('encodes a literal % so it cannot mis-decode', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'p3', name: '100%.txt', kind: 'file', path: '/repo/100%.txt', mime: 'text/plain' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks[0]).toMatchObject({ uri: 'file:///repo/100%25.txt' });
   });
 
   it('encodes non-ASCII as UTF-8 percent-escapes', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'p4', name: '文.txt', kind: 'file', path: '/repo/文.txt', mime: 'text/plain' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks[0]).toMatchObject({ uri: 'file:///repo/%E6%96%87.txt' });
   });
 
   it('a Windows drive path keeps its colon and forward-slashes', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'p5', name: 'f.txt', kind: 'file', path: 'C:\\w s\\f.txt', mime: 'text/plain' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks[0]).toMatchObject({ uri: 'file:///C:/w%20s/f.txt' });
   });
 
   it('an input that is already a URI passes through untouched (existing early-return)', () => {
-    const blocks = buildPromptContent('', [
+    const blocks = buildPromptContent('', asConfined([
       { id: 'p6', name: 'x', kind: 'file', path: 'https://example.com/a b', mime: 'text/plain' },
-    ], INACTIVE);
+    ]), INACTIVE);
     expect(blocks[0]).toMatchObject({ uri: 'https://example.com/a b' });
+  });
+});
+
+describe('CA-M03 (WS-AC): the ConfinedAttachment brand', () => {
+  it('a raw Attachment[] is a COMPILE error at buildPromptContent', () => {
+    const raw: Attachment[] = [{ id: 'x', name: 'n', kind: 'file', path: '/repo/n' }];
+    // @ts-expect-error — unconfined attachments must not reach the builder (V-19 brand)
+    void buildPromptContent('t', raw, INACTIVE);
+    expect(true).toBe(true);
+  });
+
+  it('confineAttachmentPaths output feeds buildPromptContent without casts (the blessing point)', async () => {
+    const confine: AttachmentConfineFn = async (p) => p;
+    const { attachments } = await confineAttachmentPaths(
+      [{ id: 'a', name: 'n.txt', kind: 'file', path: '/w/n.txt', mime: 'text/plain' }],
+      ['/w'],
+      confine,
+    );
+    const blocks = buildPromptContent('', attachments, INACTIVE);
+    expect(blocks).toHaveLength(1);
   });
 });
