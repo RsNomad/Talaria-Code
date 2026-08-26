@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildDiffHunks } from './diffHunks';
+import { buildDiffHunks, DIFF_TOO_LARGE_HEADER, MAX_LCS_CELLS } from './diffHunks';
 import { must } from '../../../testing/must';
 
 describe('buildDiffHunks', () => {
@@ -65,5 +65,40 @@ describe('buildDiffHunks', () => {
         lines: [{ sign: '-', text: 'b' }],
       },
     ]);
+  });
+});
+
+describe('CA-02 (WS-AC): oversized inputs return a placeholder, never the O(n·m) matrix', () => {
+  it('above MAX_LCS_CELLS: the fixed placeholder hunk (closed literal + bounded counts)', () => {
+    // Pin the boundary constant itself (noUnusedLocals forbids an import
+    // used only inside a string literal — this makes the doc a real read).
+    expect(MAX_LCS_CELLS).toBe(25_000_000);
+    // 5100×5100 lines → (5101)² ≈ 26.0M cells > 25M. NOTE: the RED run of
+    // this test makes today's code actually compute the 26M-cell diff
+    // (seconds + ~200MB transient) — expected once; GREEN returns instantly.
+    const oldText = Array.from({ length: 5100 }, (_, i) => `old-${i}`).join('\n');
+    const newText = Array.from({ length: 5100 }, (_, i) => `new-${i}`).join('\n');
+    expect(buildDiffHunks(oldText, newText)).toEqual([
+      {
+        header: DIFF_TOO_LARGE_HEADER,
+        lines: [{ sign: ' ', text: '(5100 → 5100 lines — too large to preview)' }],
+      },
+    ]);
+  });
+
+  it('an under-cap diff still produces real hunks (no false trip)', () => {
+    const hunks = buildDiffHunks('a\nb\nc', 'a\nX\nc');
+    expect(hunks).toHaveLength(1);
+    expect(hunks[0]?.header).not.toBe(DIFF_TOO_LARGE_HEADER);
+    expect(hunks[0]?.lines).toContainEqual({ sign: '+', text: 'X' });
+  });
+
+  it('the placeholder path is fast (no matrix allocation) — bounded wall-clock', () => {
+    const oldText = Array.from({ length: 20_000 }, (_, i) => `o${i}`).join('\n');
+    const newText = Array.from({ length: 20_000 }, (_, i) => `n${i}`).join('\n');
+    const t0 = Date.now();
+    const hunks = buildDiffHunks(oldText, newText);
+    expect(Date.now() - t0).toBeLessThan(1000); // pre-fix this is a ~400M-cell OOM/stall
+    expect(hunks[0]?.header).toBe(DIFF_TOO_LARGE_HEADER);
   });
 });

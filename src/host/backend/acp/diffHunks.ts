@@ -32,6 +32,22 @@ import type { DiffHunk } from '../../../shared/protocol';
  * `oldText == null` means the file did not previously exist (write_file to a
  * new path) — every line is an addition.
  */
+
+/**
+ * CA-02 (WS-AC): entry cap for the O(n·m) LCS below. ~25M cells ≈ a 5k×5k
+ * line diff — beyond it the DP matrix allocation alone (~8 bytes/cell)
+ * stalls/OOMs the single-threaded ext-host, INCLUDING the pre-exec
+ * permission card (which must stay responsive so a human can still deny).
+ * Oversized pairs return {@link DIFF_TOO_LARGE_HEADER} instead — a
+ * display-only placeholder: approval options never depend on hunks, and the
+ * read-only preview (extractPreviewFiles.ts) serves the raw texts without
+ * ever entering this function.
+ */
+export const MAX_LCS_CELLS = 25_000_000;
+
+/** CA-02: closed literal (webview-safe) — the placeholder hunk's header. */
+export const DIFF_TOO_LARGE_HEADER = '@@ diff too large to preview @@';
+
 export function buildDiffHunks(
   oldText: string | null | undefined,
   newText: string,
@@ -39,6 +55,16 @@ export function buildDiffHunks(
 ): DiffHunk[] {
   const oldLines = oldText != null ? splitLines(oldText) : [];
   const newLines = splitLines(newText);
+  // CA-02 (WS-AC): refuse the matrix BEFORE allocating it. Counts only —
+  // never content — reach the placeholder (SECRETS-NEVER-ENTER-WEBVIEW).
+  if ((oldLines.length + 1) * (newLines.length + 1) > MAX_LCS_CELLS) {
+    return [
+      {
+        header: DIFF_TOO_LARGE_HEADER,
+        lines: [{ sign: ' ', text: `(${oldLines.length} → ${newLines.length} lines — too large to preview)` }],
+      },
+    ];
+  }
   const ops = diffLines(oldLines, newLines);
   return groupIntoHunks(ops, contextLines);
 }
