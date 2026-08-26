@@ -69,7 +69,7 @@ describe('AcpClient — CA-01 byte cap on the ACP stdout line', () => {
     const pending = client.listSessions(); // in flight — stdout never answers id 1
 
     const chunk = Buffer.alloc(1024 * 1024, 0x78); // 1 MiB, no newline
-    for (let i = 0; i < 5; i++) stdout.write(chunk); // 5 MiB single line
+    for (let i = 0; i < 33; i++) stdout.write(chunk); // 33 MiB single line — over the 32 MiB ACP cap
     await flush();
 
     expect(kill).toHaveBeenCalledWith('SIGTERM');
@@ -78,12 +78,20 @@ describe('AcpClient — CA-01 byte cap on the ACP stdout line', () => {
     expect(exits).toEqual([143]);
   });
 
-  it('a large-but-under-cap response frame still parses — no false trip', async () => {
+  it('a large-but-under-cap response frame still parses — no false trip (M-3: 5 MiB, over the OLD 4 MiB shared cap)', async () => {
     const { client, stdout, kill } = await connectInitialized();
-    const big = 'y'.repeat(1024 * 1024); // 1 MiB payload in a terminated frame
+    const big = 'y'.repeat(5 * 1024 * 1024); // 5 MiB payload — over the retired shared 4 MiB cap
     const listing = client.listSessions();
     await flush();
-    stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { sessions: [{ sessionId: big }] } })}\n`);
+    const frame = `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { sessions: [{ sessionId: big }] } })}\n`;
+    // Deliver in 1 MiB slices, newline only in the final slice. A real
+    // child-process stdout pipe fragments large output across many chunks;
+    // a single JS `.write()` call would hand the whole (already-terminated)
+    // frame to the Transform atomically, which trivially resets its
+    // bytes-since-newline counter to 0 on arrival and would never exercise
+    // the accumulate-across-chunks path this test means to pin.
+    const SLICE = 1024 * 1024;
+    for (let i = 0; i < frame.length; i += SLICE) stdout.write(frame.slice(i, i + SLICE));
     const result = (await listing) as { sessions: Array<{ sessionId: string }> };
     expect(result.sessions[0]?.sessionId).toBe(big);
     expect(kill).not.toHaveBeenCalled();

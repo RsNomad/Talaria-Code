@@ -18,7 +18,7 @@ import type {
 import type { AcpMcpServerHttp } from '../../../shared/acpMcpServerHttp';
 import { isRecord } from '../../../shared/typeGuards';
 import { EXTENSION_NAME, EXTENSION_TITLE, EXTENSION_VERSION } from '../../../shared/version';
-import { MAX_LINE_BYTES } from '../../transport/maxLineBytes';
+import { MAX_ACP_LINE_BYTES } from '../../transport/maxLineBytes';
 import { createStdoutByteCapTransform } from './stdoutByteCap';
 
 /**
@@ -590,9 +590,9 @@ export class AcpClient implements AcpClientLike {
     // cap-then-teardown+respawn, the JsonRpcStdio model — no silent
     // truncation, no parallel error channel. Message carries byte counts
     // only, never buffered content.
-    const capTransform = createStdoutByteCapTransform(MAX_LINE_BYTES, (bufferedBytes) => {
+    const capTransform = createStdoutByteCapTransform(MAX_ACP_LINE_BYTES, (bufferedBytes) => {
       this.log(
-        `[fatal] ACP stdout line exceeded ${MAX_LINE_BYTES} bytes ` +
+        `[fatal] ACP stdout line exceeded ${MAX_ACP_LINE_BYTES} bytes ` +
           `(${bufferedBytes} bytes since last newline) — killing child for respawn`,
       );
       if (child.exitCode === null && !child.killed) {
