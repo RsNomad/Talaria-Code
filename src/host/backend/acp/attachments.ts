@@ -162,8 +162,23 @@ export async function confineAttachmentPaths(
   return { attachments: kept, droppedCount };
 }
 
+/**
+ * CA-M02 (WS-AC): RFC-3986-safe `file://` URI from a (confined) filesystem
+ * path — per-segment `encodeURIComponent`, restoring `:` (legal in path
+ * segments; keeps `C:` drive prefixes intact). Deliberately NOT
+ * `node:url.pathToFileURL`: that resolves through the HOST platform's path
+ * rules, so the same input produces different URIs on the Windows dev gate
+ * vs Linux CI — this must stay platform-deterministic (repo lesson: never
+ * per-arch behavior in gate-covered code). Inputs that already look like
+ * URIs pass through untouched, as before.
+ */
 function pathToFileUri(path: string): string {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) return path;
   const normalized = path.replace(/\\/g, '/');
-  return normalized.startsWith('/') ? `file://${normalized}` : `file:///${normalized}`;
+  const rooted = normalized.startsWith('/') ? normalized : `/${normalized}`;
+  const encoded = rooted
+    .split('/')
+    .map((segment) => encodeURIComponent(segment).replace(/%3A/gi, ':'))
+    .join('/');
+  return `file://${encoded}`;
 }

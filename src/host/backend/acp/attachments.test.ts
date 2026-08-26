@@ -219,3 +219,51 @@ describe('confineAttachmentPaths — V-19 attachment path confinement', () => {
     expect(result.droppedCount).toBe(2);
   });
 });
+
+describe('CA-M02 (WS-AC): file:// URIs are percent-encoded per segment', () => {
+  it('CHARACTERIZATION: plain paths are unchanged (existing pins stay byte-identical)', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'p1', name: 'notes.txt', kind: 'file', path: '/repo/notes.txt', mime: 'text/plain' },
+    ], INACTIVE);
+    expect(blocks).toEqual([
+      { type: 'resource_link', uri: 'file:///repo/notes.txt', name: 'notes.txt', mimeType: 'text/plain' },
+    ]);
+  });
+
+  it('encodes spaces and # (a raw # would truncate the path into a fragment)', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'p2', name: 'a b#c.txt', kind: 'file', path: '/repo/a b#c.txt', mime: 'text/plain' },
+    ], INACTIVE);
+    expect(blocks).toEqual([
+      { type: 'resource_link', uri: 'file:///repo/a%20b%23c.txt', name: 'a b#c.txt', mimeType: 'text/plain' },
+    ]);
+  });
+
+  it('encodes a literal % so it cannot mis-decode', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'p3', name: '100%.txt', kind: 'file', path: '/repo/100%.txt', mime: 'text/plain' },
+    ], INACTIVE);
+    expect(blocks[0]).toMatchObject({ uri: 'file:///repo/100%25.txt' });
+  });
+
+  it('encodes non-ASCII as UTF-8 percent-escapes', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'p4', name: '文.txt', kind: 'file', path: '/repo/文.txt', mime: 'text/plain' },
+    ], INACTIVE);
+    expect(blocks[0]).toMatchObject({ uri: 'file:///repo/%E6%96%87.txt' });
+  });
+
+  it('a Windows drive path keeps its colon and forward-slashes', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'p5', name: 'f.txt', kind: 'file', path: 'C:\\w s\\f.txt', mime: 'text/plain' },
+    ], INACTIVE);
+    expect(blocks[0]).toMatchObject({ uri: 'file:///C:/w%20s/f.txt' });
+  });
+
+  it('an input that is already a URI passes through untouched (existing early-return)', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'p6', name: 'x', kind: 'file', path: 'https://example.com/a b', mime: 'text/plain' },
+    ], INACTIVE);
+    expect(blocks[0]).toMatchObject({ uri: 'https://example.com/a b' });
+  });
+});
