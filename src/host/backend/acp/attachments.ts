@@ -2,6 +2,7 @@ import type { Attachment } from '../../../shared/protocol';
 import { resolveWithinWorkspaceReal } from './pathConfine';
 import { isSecretPath } from '../../context/sanitize';
 import type { AcpOutboundContentBlock } from './types';
+import type { PromptDegradeCaps } from './promptCaps';
 
 /**
  * Build the ACP `session/prompt` `prompt: ContentBlock[]` array from the
@@ -19,17 +20,24 @@ import type { AcpOutboundContentBlock } from './types';
  * everything else; live Hermes acceptance of both variants is verified at
  * the Fedora local-test phase (cannot run `hermes acp` here).
  */
-export function buildPromptContent(text: string, attachments: Attachment[] | undefined): AcpOutboundContentBlock[] {
+export function buildPromptContent(
+  text: string,
+  attachments: Attachment[] | undefined,
+  promptCaps: PromptDegradeCaps,
+): AcpOutboundContentBlock[] {
   const blocks: AcpOutboundContentBlock[] = [];
   if (text) blocks.push({ type: 'text', text });
   for (const attachment of attachments ?? []) {
-    const block = attachmentToContentBlock(attachment);
+    const block = attachmentToContentBlock(attachment, promptCaps);
     if (block) blocks.push(block);
   }
   return blocks;
 }
 
-function attachmentToContentBlock(attachment: Attachment): AcpOutboundContentBlock | undefined {
+function attachmentToContentBlock(
+  attachment: Attachment,
+  promptCaps: PromptDegradeCaps,
+): AcpOutboundContentBlock | undefined {
   const parsed = attachment.dataUri ? parseDataUri(attachment.dataUri) : undefined;
 
   if (attachment.kind === 'image') {
@@ -57,15 +65,22 @@ function attachmentToContentBlock(attachment: Attachment): AcpOutboundContentBlo
   if (parsed) {
     const uri = `attachment://${attachment.id}/${encodeURIComponent(attachment.name)}`;
     if (isTextMime(parsed.mime)) {
-      return {
-        type: 'resource',
-        resource: { uri, mimeType: parsed.mime, text: Buffer.from(parsed.base64, 'base64').toString('utf8') },
-      };
+      const text = Buffer.from(parsed.base64, 'base64').toString('utf8');
+      if (promptCaps.degradeEmbeddedResources) {
+        // A-03 degrade (INACTIVE vs pinned Hermes — promptCaps.ts): the
+        // decoded text still reaches the agent, as a plain text block
+        // headed by the attachment name (no on-disk path exists to link).
+        return { type: 'text', text: `[attachment: ${attachment.name}]\n${text}` };
+      }
+      return { type: 'resource', resource: { uri, mimeType: parsed.mime, text } };
     }
-    return {
-      type: 'resource',
-      resource: { uri, mimeType: parsed.mime, blob: parsed.base64 },
-    };
+    if (promptCaps.degradeEmbeddedResources) {
+      // A-03 degrade: binary bytes have no text form — a resource_link to
+      // the synthetic attachment uri is the best remaining reference
+      // (fidelity loss is exactly why this path ships inactive).
+      return { type: 'resource_link', uri, name: attachment.name, mimeType: parsed.mime };
+    }
+    return { type: 'resource', resource: { uri, mimeType: parsed.mime, blob: parsed.base64 } };
   }
   return undefined;
 }

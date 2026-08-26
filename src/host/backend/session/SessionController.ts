@@ -16,6 +16,7 @@ import { TurnTranslator } from '../acp/turnTranslator';
 import { ReplayTranslator } from '../acp/replayTranslator';
 import { buildPromptContent, confineAttachmentPaths } from '../acp/attachments';
 import { mentionBlocks } from '../acp/mentions';
+import { derivePromptCaps } from '../acp/promptCaps';
 import {
   mapPermissionRequest,
   applyResolvedPresentation,
@@ -1204,9 +1205,16 @@ export class SessionController {
       }
 
       const promptText = this.activePreset === 'plan' ? PLAN_PREAMBLE + text : text;
+      // A-03 (WS-AC): the degrade decision is derived ONCE per turn from the
+      // client's retained initialize advertisement — SHIP-INACTIVE today
+      // (derivePromptCaps returns the inactive decision for every input; see
+      // its activation contract). Threading it now means activation is a
+      // one-line change in promptCaps.ts, nowhere else. Optional-member `?.`:
+      // test doubles without the getter read as "nothing advertised".
+      const promptCaps = derivePromptCaps(client.getAdvertisedPromptCapabilities?.());
       const content: AcpOutboundContentBlock[] = [
-        ...buildPromptContent(promptText, confinedAttachments),
-        ...mentionBlocks(resolved ?? []),
+        ...buildPromptContent(promptText, confinedAttachments, promptCaps),
+        ...mentionBlocks(resolved ?? [], promptCaps),
       ];
       const response = await client.prompt(this.sessionId, content);
 

@@ -1,20 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import { buildPromptContent, confineAttachmentPaths } from './attachments';
 import type { AttachmentConfineFn } from './attachments';
+import { derivePromptCaps, PROMPT_DEGRADE_INACTIVE, type PromptDegradeCaps } from './promptCaps';
+
+const INACTIVE = PROMPT_DEGRADE_INACTIVE;
+const ACTIVE: PromptDegradeCaps = { degradeEmbeddedResources: true };
 
 describe('buildPromptContent', () => {
   it('always leads with a text block when text is non-empty', () => {
-    expect(buildPromptContent('hello', undefined)).toEqual([{ type: 'text', text: 'hello' }]);
+    expect(buildPromptContent('hello', undefined, INACTIVE)).toEqual([{ type: 'text', text: 'hello' }]);
   });
 
   it('omits the text block for empty text', () => {
-    expect(buildPromptContent('', undefined)).toEqual([]);
+    expect(buildPromptContent('', undefined, INACTIVE)).toEqual([]);
   });
 
   it('maps an image attachment with a data URI to an image content block', () => {
     const blocks = buildPromptContent('look', [
       { id: 'a1', name: 'shot.png', kind: 'image', dataUri: 'data:image/png;base64,QUJD' },
-    ]);
+    ], INACTIVE);
     expect(blocks).toEqual([
       { type: 'text', text: 'look' },
       { type: 'image', data: 'QUJD', mimeType: 'image/png' },
@@ -24,14 +28,14 @@ describe('buildPromptContent', () => {
   it('maps a path-only image attachment to a resource_link', () => {
     const blocks = buildPromptContent('', [
       { id: 'a2', name: 'shot.png', kind: 'image', path: '/repo/shot.png', mime: 'image/png' },
-    ]);
+    ], INACTIVE);
     expect(blocks).toEqual([{ type: 'resource_link', uri: 'file:///repo/shot.png', name: 'shot.png', mimeType: 'image/png' }]);
   });
 
   it('maps a file attachment with a workspace path to a resource_link', () => {
     const blocks = buildPromptContent('', [
       { id: 'a3', name: 'notes.txt', kind: 'file', path: '/repo/notes.txt', mime: 'text/plain' },
-    ]);
+    ], INACTIVE);
     expect(blocks).toEqual([
       { type: 'resource_link', uri: 'file:///repo/notes.txt', name: 'notes.txt', mimeType: 'text/plain' },
     ]);
@@ -40,7 +44,7 @@ describe('buildPromptContent', () => {
   it('maps a pdf attachment with only inline bytes to an embedded resource', () => {
     const blocks = buildPromptContent('', [
       { id: 'a4', name: 'doc.pdf', kind: 'pdf', mime: 'application/pdf', dataUri: 'data:application/pdf;base64,ZmFr' },
-    ]);
+    ], INACTIVE);
     expect(blocks).toEqual([
       {
         type: 'resource',
@@ -50,14 +54,14 @@ describe('buildPromptContent', () => {
   });
 
   it('skips an attachment with neither a path nor a data URI', () => {
-    expect(buildPromptContent('', [{ id: 'a5', name: 'ghost.txt', kind: 'file' }])).toEqual([]);
+    expect(buildPromptContent('', [{ id: 'a5', name: 'ghost.txt', kind: 'file' }], INACTIVE)).toEqual([]);
   });
 
   it('maps a path-less generic text file to an embedded resource with decoded text (no blob)', () => {
     // base64 of "a,b\n1,2"
     const blocks = buildPromptContent('', [
       { id: 'a6', name: 'data.csv', kind: 'file', mime: 'text/csv', dataUri: 'data:text/csv;base64,YSxiCjEsMg==' },
-    ]);
+    ], INACTIVE);
     expect(blocks).toEqual([
       {
         type: 'resource',
@@ -75,12 +79,60 @@ describe('buildPromptContent', () => {
         mime: 'application/octet-stream',
         dataUri: 'data:application/octet-stream;base64,ZmFr',
       },
-    ]);
+    ], INACTIVE);
     expect(blocks).toEqual([
       {
         type: 'resource',
         resource: { uri: 'attachment://a7/archive.bin', mimeType: 'application/octet-stream', blob: 'ZmFr' },
       },
+    ]);
+  });
+});
+
+/**
+ * A-03 (WS-AC): the degrade seam. INACTIVE reproduces today's embedded-
+ * resource emission byte-for-byte against pinned Hermes's advertised caps
+ * (`derivePromptCaps({ image: true })` — `acp_adapter/server.py:889`) —
+ * that IS the ship-inactive characterization. ACTIVE (unit-tested in
+ * isolation; nothing wires it live yet — see `promptCaps.ts`'s activation
+ * contract) proves the degrade path itself is correct.
+ */
+describe('WS-AC A-03: the degrade seam — inactive is byte-identical, active degrades', () => {
+  it('CHARACTERIZATION: derivePromptCaps(pinned-Hermes caps) keeps embedded resources exactly as before', () => {
+    const caps = derivePromptCaps({ image: true });
+    const blocks = buildPromptContent('t', [
+      { id: 'a', name: 'inline.txt', kind: 'file', dataUri: 'data:text/plain;base64,aGV5' },
+    ], caps);
+    expect(blocks).toEqual([
+      { type: 'text', text: 't' },
+      { type: 'resource', resource: { uri: 'attachment://a/inline.txt', mimeType: 'text/plain', text: 'hey' } },
+    ]);
+  });
+
+  it('ACTIVE: a text-mime inline attachment degrades to a plain text block (content preserved)', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'a', name: 'inline.txt', kind: 'file', dataUri: 'data:text/plain;base64,aGV5' },
+    ], ACTIVE);
+    expect(blocks).toEqual([{ type: 'text', text: '[attachment: inline.txt]\nhey' }]);
+  });
+
+  it('ACTIVE: a binary inline attachment degrades to a resource_link at the synthetic uri', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'b', name: 'pic.bin', kind: 'file', dataUri: 'data:application/octet-stream;base64,QUJD' },
+    ], ACTIVE);
+    expect(blocks).toEqual([
+      { type: 'resource_link', uri: 'attachment://b/pic.bin', name: 'pic.bin', mimeType: 'application/octet-stream' },
+    ]);
+  });
+
+  it('ACTIVE: path-backed and image attachments are untouched by the degrade (already link/image form)', () => {
+    const blocks = buildPromptContent('', [
+      { id: 'c', name: 'notes.txt', kind: 'file', path: '/repo/notes.txt', mime: 'text/plain' },
+      { id: 'd', name: 'shot.png', kind: 'image', dataUri: 'data:image/png;base64,QUJD' },
+    ], ACTIVE);
+    expect(blocks).toEqual([
+      { type: 'resource_link', uri: 'file:///repo/notes.txt', name: 'notes.txt', mimeType: 'text/plain' },
+      { type: 'image', data: 'QUJD', mimeType: 'image/png' },
     ]);
   });
 });
