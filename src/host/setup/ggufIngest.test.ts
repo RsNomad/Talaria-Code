@@ -465,6 +465,34 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
   });
 });
 
+/** CA-M10: thin wrapper over this file's EXISTING createModel/ingest
+ *  fixtures (`fakeIo`, `routedFetch`, `downloadResponse`, `createResponse`) —
+ *  drives the REAL `ingestGguf` through a fake `/api/create` NDJSON stream
+ *  built from caller-supplied raw lines (well-formed or not), so a test can
+ *  assert on `handleCreateChunkLine`'s parse-failure behavior without a
+ *  parallel harness. */
+function runCreateWithLines(lines: string[]): Promise<void> {
+  const { io } = fakeIo();
+  const { fetchImpl } = routedFetch({
+    download: () => downloadResponse([CONTENT]),
+    create: () => createResponse(lines),
+  });
+  io.fetchImpl = fetchImpl;
+  return ingestGguf(io, SPEC, ENDPOINT, () => {}, new AbortController().signal);
+}
+
+describe('CA-M10 (frozen, owner-approved): a malformed create NDJSON line fails the create, typed', () => {
+  it('one malformed line mid-stream rejects GgufCreateLineParseError — no success is ever reported', async () => {
+    await expect(runCreateWithLines(['{"status":"reading model"}', '{not json'])).rejects.toMatchObject({
+      name: 'GgufCreateLineParseError',
+    });
+  });
+  it('the rejection message carries a byte length, never the line content', async () => {
+    await expect(runCreateWithLines(['{secret-looking-garbage'])).rejects.toThrow(/malformed NDJSON line \(\d+ bytes\)/);
+    await expect(runCreateWithLines(['{secret-looking-garbage'])).rejects.not.toThrow(/secret-looking/);
+  });
+});
+
 // --- downloadGgufToStore (beta.6 T3, §2.4/§2.2.8/§7 line 509) --------------
 
 const STORE_CATALOG_ID = 'sweep-next';
