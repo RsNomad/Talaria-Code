@@ -16,6 +16,7 @@ import type {
   AcpSessionUpdate,
 } from './types';
 import type { AcpMcpServerHttp } from '../../../shared/acpMcpServerHttp';
+import { isRecord } from '../../../shared/typeGuards';
 
 /**
  * Thin seam around the ACP TypeScript SDK (`@agentclientprotocol/sdk`,
@@ -168,6 +169,39 @@ export interface AdvertisedAuthMethod {
 }
 
 /**
+ * A-02 (WS-AC root): the retained, defensively-projected `initialize`
+ * advertisement — `undefined` until {@link AcpClient.initialize} resolves
+ * (single-lifecycle retention, same posture as `advertisedAuthMethods`).
+ * The SDK hands the raw JSON-RPC result back WITHOUT zod-parsing it
+ * (`dist/acp.js:451-453`), so every field below is read through `isRecord`
+ * guards, never trusted.
+ *
+ * Deliberately NOT projected/gated here: `agentCapabilities.mcpCapabilities`.
+ * The pinned Hermes never sets `mcp_capabilities` in its InitializeResponse
+ * (`acp_adapter/server.py:884-897`) yet ACCEPTS and registers
+ * `McpServerHttp` entries unconditionally (`server.py:795-818` — the
+ * `{url, headers}` else-branch) — the live `vscode_lsp` http binding depends
+ * on exactly that. Gating http-MCP emission on the advertised flag would
+ * therefore break a working production flow to satisfy an advertisement the
+ * agent itself does not honor — the same compensating-violations asymmetry
+ * as A-03's embedded resources, and it ships inactive the same way (see
+ * `promptCaps.ts`'s activation contract; upstream note filed in
+ * `docs_claude/lens-dorabotok/hermes-upstream-notes.md`).
+ */
+export interface AdvertisedCapabilities {
+  /** Negotiated version — always === PROTOCOL_VERSION once retained (asserted in initialize()). */
+  protocolVersion: number;
+  /** `agentCapabilities.loadSession === true` — the `session/load` MUST-gate. */
+  loadSession: boolean;
+  /** `agentCapabilities.sessionCapabilities.list` advertised (present, object) — the `session/list` gate. */
+  sessionList: boolean;
+  /** `agentCapabilities.sessionCapabilities.close` advertised — the `session/close` MUST-NOT gate. */
+  sessionClose: boolean;
+  /** Raw `agentCapabilities.promptCapabilities` record ({} when absent/malformed) — A-03's input. */
+  promptCapabilities: Record<string, unknown>;
+}
+
+/**
  * An environment variable to set when launching an MCP server — ACP's
  * `EnvVariable`. Re-verified (audit-3 CA-12) against the INSTALLED
  * `@agentclientprotocol/sdk@0.17.1` (`package.json`'s pinned version;
@@ -286,6 +320,15 @@ export interface AcpClientLike {
    * event). OPTIONAL for the same test-double reason as the getter.
    */
   onAuthMethodsChanged?(handler: () => void): { dispose(): void };
+  /**
+   * A-03 (WS-AC): the raw advertised `promptCapabilities` record —
+   * `undefined` until THIS client's `initialize()` has resolved. OPTIONAL,
+   * like {@link getAdvertisedAuthMethods}: a test double that never
+   * implements it reads as "nothing advertised" through the caller's own
+   * `?.()` chain (`SessionController.runTurn` → `derivePromptCaps`), never a
+   * crash.
+   */
+  getAdvertisedPromptCapabilities?(): Record<string, unknown> | undefined;
   dispose(): void;
 }
 
@@ -307,6 +350,13 @@ export class AcpClient implements AcpClientLike {
    */
   private advertisedAuthMethods: AdvertisedAuthMethod[] | undefined;
   private readonly authMethodsHandlers = new Set<() => void>();
+
+  /**
+   * A-02: the retained advertisement — `undefined` until {@link initialize}
+   * resolves, never cleared afterwards (single-lifecycle instance; a restart
+   * mints a whole new client). See {@link AdvertisedCapabilities}.
+   */
+  private advertised: AdvertisedCapabilities | undefined;
 
   /**
    * W1-T1 (CF-01/A-2): the central terminate-race primitive. The pinned ACP
@@ -361,6 +411,14 @@ export class AcpClient implements AcpClientLike {
    *  defensive copy so no caller can mutate the retained advertisement. */
   getAdvertisedAuthMethods(): AdvertisedAuthMethod[] | undefined {
     return this.advertisedAuthMethods?.map((m) => ({ ...m }));
+  }
+
+  /** A-03 (WS-AC): the raw advertised `promptCapabilities` record ({} = agent
+   *  advertised none), `undefined` until initialize() has retained the
+   *  advertisement. Defensive copy, same posture as
+   *  {@link getAdvertisedAuthMethods}. */
+  getAdvertisedPromptCapabilities(): Record<string, unknown> | undefined {
+    return this.advertised ? { ...this.advertised.promptCapabilities } : undefined;
   }
 
   /** Task 13: see {@link AcpClientLike.onAuthMethodsChanged}. Same
@@ -578,6 +636,52 @@ export class AcpClient implements AcpClientLike {
         terminal: false,
       },
     });
+    // A-02 (WS-AC root): assert the negotiated version BEFORE retaining
+    // anything. Spec guidance on InitializeResponse.protocolVersion: "The
+    // client should disconnect, if it doesn't support this version"
+    // (types.gen.d.ts:1512-1518). Throwing here surfaces as an honest
+    // connect-phase failure through ConnectionSupervisor.startInternal's
+    // existing try/catch + banner (raceConnectPhase wraps THIS call,
+    // ConnectionSupervisor.ts:418-422). A malformed/absent version fails the
+    // same way — fail-closed. Vs pinned Hermes this is a provable no-op:
+    // acp_adapter/server.py:885 always answers acp.PROTOCOL_VERSION (= 1,
+    // both SDKs pin it).
+    const raw: unknown = response;
+    // `rawRecord` is the guarded view — a non-object result reads as {} and
+    // fails the version assert below (no field to find). Explicitly typed so
+    // the {} arm keeps the index-signature access legal (no casts).
+    const rawRecord: Record<string, unknown> = isRecord(raw) ? raw : {};
+    const rawVersion = rawRecord.protocolVersion;
+    if (typeof rawVersion !== 'number' || rawVersion !== PROTOCOL_VERSION) {
+      const shown = typeof rawVersion === 'number' ? String(rawVersion) : typeof rawVersion;
+      throw new Error(
+        `hermes acp: agent negotiated unsupported ACP protocolVersion (${shown}); ` +
+          `this client requires ${PROTOCOL_VERSION} — closing (spec: client should disconnect)`,
+      );
+    }
+    // A-02: retain the advertisement (defensive isRecord projection at the
+    // wire boundary — same belt-and-braces posture as the authMethods read
+    // below). `sessionCapabilities.list/close` advertise by PRESENCE of the
+    // capability object (`SessionCapabilities { close?: … | null; list?: … |
+    // null }`, types.gen.d.ts:2600-2645); Hermes serializes each set
+    // capability as `{}` (pydantic by_alias + exclude_unset).
+    const agentCaps = isRecord(rawRecord.agentCapabilities) ? rawRecord.agentCapabilities : {};
+    const sessionCaps = isRecord(agentCaps.sessionCapabilities) ? agentCaps.sessionCapabilities : {};
+    this.advertised = {
+      protocolVersion: rawVersion,
+      loadSession: agentCaps.loadSession === true,
+      sessionList: isRecord(sessionCaps.list),
+      sessionClose: isRecord(sessionCaps.close),
+      promptCapabilities: isRecord(agentCaps.promptCapabilities) ? agentCaps.promptCapabilities : {},
+    };
+    // WS-AC Task 1 note: `requireAdvertised` is the initialize-first choke
+    // Tasks 2-4 (session/list, session/close, session/load gates) will call;
+    // this task only PRODUCES it. `void` here is a deliberate reference (not
+    // a call) so `noUnusedLocals: true` doesn't flag the declaration as dead
+    // between this commit and Task 2's — same pattern as `task-3-report.md`'s
+    // `void promptCalls;`. Zero runtime behavior change (a bound-method
+    // property read, discarded).
+    void this.requireAdvertised;
     // Task 13: RETAIN the advertised auth methods (`response.authMethods` —
     // the SDK-typed field, see {@link AdvertisedAuthMethod}'s verification
     // trail). The SDK's client-side wrapper hands back the raw JSON-RPC
@@ -904,6 +1008,15 @@ export class AcpClient implements AcpClientLike {
   private requireConnection(): ClientSideConnection {
     if (!this.connection) throw new Error('AcpClient: not connected (call connect() first)');
     return this.connection;
+  }
+
+  /** A-02: initialize-first conformance choke for the gated session RPCs
+   *  (ACP: initialization MUST complete before other requests). */
+  private requireAdvertised(method: string): AdvertisedCapabilities {
+    if (!this.advertised) {
+      throw new Error(`AcpClient: ${method} called before initialize() completed (ACP: initialization must complete first)`);
+    }
+    return this.advertised;
   }
 
   private log(message: string): void {

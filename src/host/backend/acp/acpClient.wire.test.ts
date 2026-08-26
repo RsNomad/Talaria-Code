@@ -122,6 +122,42 @@ async function flush(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
+/**
+ * WS-AC A-02: the pinned-Hermes initialize advertisement, mirrored
+ * field-for-field from `acp_adapter/server.py:884-897` (protocol_version=1,
+ * load_session=True, prompt_capabilities image-only, session_capabilities
+ * fork/list/resume — NO close, NO mcp_capabilities). Tests that need a
+ * STRICTER or RICHER agent pass their own `initResult`.
+ */
+const PINNED_HERMES_INIT_RESULT = {
+  protocolVersion: 1,
+  agentInfo: { name: 'hermes-agent', version: '2026.7.7.2' },
+  agentCapabilities: {
+    loadSession: true,
+    promptCapabilities: { image: true },
+    sessionCapabilities: { fork: {}, list: {}, resume: {} },
+  },
+  authMethods: [],
+};
+
+/**
+ * A-02: connect + initialize (id 0) against `initResult`, returning a frame
+ * reader that SKIPS the initialize frame — post-gate tests assert their own
+ * request frames (which now carry id 1) without re-pinning initialize.
+ */
+async function connectInitializedClient(initResult: unknown = PINNED_HERMES_INIT_RESULT): Promise<{
+  client: AcpClient;
+  wireFramesAfterInit: () => unknown[];
+  respond: (frame: unknown) => void;
+}> {
+  const { client, wireFrames, respond } = await connectClient();
+  const init = client.initialize();
+  await flush();
+  respond({ jsonrpc: '2.0', id: 0, result: initResult });
+  await init;
+  return { client, wireFramesAfterInit: () => wireFrames().slice(1), respond };
+}
+
 describe('AcpClient — real client, real stdin bytes (Task 5 review F-1)', () => {
   it('listSessions() writes an unprefixed "session/list" request frame', async () => {
     const { client, wireFrames } = await connectClient();
@@ -255,14 +291,7 @@ describe('AcpClient — Task 13: initialize retains the advertised authMethods',
     expect(client.getAdvertisedAuthMethods()).toEqual([{ id: 'openrouter', name: 'openrouter runtime credentials' }]);
   });
 
-  it('FIX 4 (T13 M-1): a null `result` never throws reading .authMethods off it — resolves to []', async () => {
-    const { client, respond } = await connectClient();
-    const init = client.initialize();
-    await flush();
-    respond({ jsonrpc: '2.0', id: 0, result: null });
-    await expect(init).resolves.toBeUndefined();
-    expect(client.getAdvertisedAuthMethods()).toEqual([]);
-  });
+  // The old "null result resolves []" test moved to the A-02 describe below as a fail-closed REJECTION — A-02's version assert now refuses a result with no protocolVersion.
 
   it('onAuthMethodsChanged fires once initialize has retained the methods (getter already fresh inside the handler)', async () => {
     const { client, respond } = await connectClient();
@@ -279,5 +308,50 @@ describe('AcpClient — Task 13: initialize retains the advertised authMethods',
     await init;
 
     expect(seen).toEqual([[{ id: 'hermes-setup', name: 'Configure Hermes provider' }]]);
+  });
+});
+
+/**
+ * WS-AC A-02 root: `initialize()` must RETAIN {protocolVersion,
+ * agentCapabilities, promptCapabilities} (it used to keep only authMethods)
+ * and ASSERT the negotiated version — the spec's own guidance on
+ * `InitializeResponse.protocolVersion` is "The client should disconnect, if
+ * it doesn't support this version" (types.gen.d.ts:1512-1518). All no-ops vs
+ * pinned Hermes (always version 1); the rejects fire only against a
+ * non-conformant agent, and they surface through
+ * ConnectionSupervisor.startInternal's existing connect-phase catch+banner.
+ */
+describe('AcpClient — WS-AC A-02 root: initialize retains + asserts the advertisement', () => {
+  it('rejects initialize when the agent negotiates a different protocolVersion', async () => {
+    const { client, respond } = await connectClient();
+    const init = client.initialize();
+    await flush();
+    respond({ jsonrpc: '2.0', id: 0, result: { protocolVersion: 2, agentCapabilities: {} } });
+    await expect(init).rejects.toThrow(/unsupported ACP protocolVersion/);
+    expect(client.getAdvertisedPromptCapabilities()).toBeUndefined();
+  });
+
+  it('rejects initialize on a null result (no protocolVersion) — fail-closed, no TypeError', async () => {
+    const { client, respond } = await connectClient();
+    const init = client.initialize();
+    await flush();
+    respond({ jsonrpc: '2.0', id: 0, result: null });
+    await expect(init).rejects.toThrow(/unsupported ACP protocolVersion/);
+    expect(client.getAdvertisedAuthMethods()).toBeUndefined();
+  });
+
+  it('retains the pinned-Hermes promptCapabilities projection', async () => {
+    const { client } = await connectInitializedClient();
+    expect(client.getAdvertisedPromptCapabilities()).toEqual({ image: true });
+  });
+
+  it('getAdvertisedPromptCapabilities() is undefined before initialize', async () => {
+    const { client } = await connectClient();
+    expect(client.getAdvertisedPromptCapabilities()).toBeUndefined();
+  });
+
+  it('absent agentCapabilities retains the empty projection, not a crash', async () => {
+    const { client } = await connectInitializedClient({ protocolVersion: 1 });
+    expect(client.getAdvertisedPromptCapabilities()).toEqual({});
   });
 });
