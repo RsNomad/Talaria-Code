@@ -2354,3 +2354,56 @@ describe('SessionController.applyUpdate — WS-SL A-04: current_mode_update reac
     expect(setSessionModeCalls).toEqual([]);
   });
 });
+
+/** WS-SL preemptive tool-cancel (ACP SHOULD): cancel() marks the LIVE turn's
+ *  in-flight tools interrupted immediately — the user sees the stop land
+ *  without waiting for the harness to acknowledge. Display-only. */
+describe('SessionController.cancel — WS-SL preemptive tool-cancel marking', () => {
+  function makeCancelMarkHarness(): { controller: SessionController; emitted: HostToWebviewMessage[] } {
+    const emitted: HostToWebviewMessage[] = [];
+    const client = {
+      cancel: async () => undefined,
+      prompt: () => new Promise<never>(() => {}),
+    } as unknown as AcpClientLike;
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return { controller: new SessionController('session-1', '/fake/ws', port), emitted };
+  }
+
+  it("cancel() marks the live turn's running tools interrupted before the agent confirms the stop", async () => {
+    const { controller, emitted } = makeCancelMarkHarness();
+    controller.sendPrompt('do the thing', 'default');
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    controller.applyUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-live',
+      title: 'run tests',
+      kind: 'execute',
+      status: 'in_progress',
+    });
+
+    controller.cancel();
+
+    expect(emitted).toContainEqual({
+      type: 'tool.update',
+      turnId: 'turn-1',
+      sessionId: 'session-1',
+      toolId: 'tc-live',
+      status: 'interrupted',
+    });
+  });
+
+  it('cancel() with no live turn emits no tool.update (replay/idle cancels stay silent)', () => {
+    const { controller, emitted } = makeCancelMarkHarness();
+    controller.cancel();
+    expect(emitted.some((m) => m.type === 'tool.update')).toBe(false);
+  });
+});

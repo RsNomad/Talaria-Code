@@ -585,6 +585,14 @@ export class SessionController {
    */
   cancel(): void {
     this.cancelledTurnId = this.currentTurnId;
+    // WS-SL preemptive tool-cancel (ACP SHOULD; WV1-MIN-ARCH): mark the LIVE
+    // turn's in-flight tool calls interrupted the moment the user stops —
+    // display-only (no wire change); a belated genuine tool_call_update
+    // still overwrites through applyUpdate. Replay/idle cancels no-op
+    // (no live turn / no live translator).
+    if (this.liveTurnId !== undefined && this.turn) {
+      for (const message of this.turn.markInFlightToolsInterrupted()) this.port.emit(message);
+    }
     const client = this.port.getClient();
     if (!client) {
       this.settlePendingApprovals('cancelled');
