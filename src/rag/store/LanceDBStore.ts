@@ -473,12 +473,13 @@ export class LanceDBStore implements VectorStore {
       // — never silently degraded like the FTS leg below.
       throw vecOutcome.reason;
     }
-    const vecRaw = vecOutcome.value;
+    const vecRaw: unknown[] = vecOutcome.value;
     const vecRows = vecRaw.filter(isStoredRow);
 
     let ftsRows: StoredRow[] = [];
     if (ftsOutcome.status === 'fulfilled') {
-      ftsRows = ftsOutcome.value.filter(isStoredRow);
+      const ftsRaw: unknown[] = ftsOutcome.value;
+      ftsRows = ftsRaw.filter(isStoredRow);
     } else if (!this.ftsRepairAttempted) {
       // Degrade-visibly-not-silently: log once per store instance (not once
       // per search — a broken FTS index would otherwise spam the log on

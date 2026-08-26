@@ -582,7 +582,7 @@ export function App() {
   };
 
   // Task B6 (§5.6): the T2 skills admin RPCs `SkillsPanel`'s Create/Install-
-  // from-hub disclosures and hub-row Remove button drive. Same untagged/cast
+  // from-hub disclosures and hub-row Remove button drive. Same untagged/guarded
   // posture as the MCP admin RPCs above — `skills` is connection-global
   // (`skills.toggle` above already is untagged), so these are UNTAGGED too.
   // `createSkill` rebuilds `params` as a fresh `Record<string, unknown>`
