@@ -2283,3 +2283,74 @@ describe('SessionController.runTurnWithCheckpoint — WS-SL F2-05: terminal catc
     expect(emitted.some((m) => m.type === 'error' && m.message.includes('already running'))).toBe(false);
   });
 });
+
+/**
+ * WS-SL A-04: `current_mode_update` was typed (`types.ts:158`) but never
+ * applied to `currentMode` — `runTurn`'s re-pin backstop (`if
+ * (this.currentMode !== 'default')` before `client.prompt`) was blind to an
+ * agent-initiated switch to accept_edits/dont_ask. Zero behavior change vs
+ * pinned Hermes 2026.7.7.2 (never emits it — grep 0); real on a future
+ * harness. Characterization-first: the first committed shape of the first
+ * test PINNED the blindness (no re-pin call), then flipped.
+ */
+describe('SessionController.applyUpdate — WS-SL A-04: current_mode_update reaches the re-pin backstop', () => {
+  function makeA04Harness(): {
+    controller: SessionController;
+    setSessionModeCalls: Array<{ sessionId: string; modeId: string }>;
+    promptCalls: () => number;
+  } {
+    const setSessionModeCalls: Array<{ sessionId: string; modeId: string }> = [];
+    let prompts = 0;
+    const client = {
+      cancel: async () => undefined,
+      setSessionMode: async (sessionId: string, modeId: string) => {
+        setSessionModeCalls.push({ sessionId, modeId });
+      },
+      prompt: () => {
+        prompts += 1;
+        return new Promise<never>(() => {});
+      },
+    } as unknown as AcpClientLike;
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: () => {},
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return {
+      controller: new SessionController('session-1', '/fake/ws', port),
+      setSessionModeCalls,
+      promptCalls: () => prompts,
+    };
+  }
+
+  it('an agent-initiated switch reported via current_mode_update makes the NEXT turn re-pin default before prompting', async () => {
+    const { controller, setSessionModeCalls, promptCalls } = makeA04Harness();
+
+    controller.applyUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'acceptEdits' });
+
+    controller.sendPrompt('do the thing', 'default');
+    await vi.waitFor(() => expect(promptCalls()).toBe(1));
+    expect(setSessionModeCalls).toEqual([{ sessionId: 'session-1', modeId: 'default' }]);
+  });
+
+  it('without a current_mode_update the next turn does NOT re-pin (baseline — proves the write, not ambient behavior)', async () => {
+    const { controller, setSessionModeCalls, promptCalls } = makeA04Harness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.waitFor(() => expect(promptCalls()).toBe(1));
+    expect(setSessionModeCalls).toEqual([]);
+  });
+
+  it('a switch back to default overwrites the record — no spurious re-pin', async () => {
+    const { controller, setSessionModeCalls, promptCalls } = makeA04Harness();
+    controller.applyUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'acceptEdits' });
+    controller.applyUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'default' });
+    controller.sendPrompt('do the thing', 'default');
+    await vi.waitFor(() => expect(promptCalls()).toBe(1));
+    expect(setSessionModeCalls).toEqual([]);
+  });
+});

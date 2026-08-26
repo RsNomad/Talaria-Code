@@ -920,6 +920,22 @@ export class SessionController {
       return;
     }
 
+    // WS-SL A-04: record an agent-initiated mode switch so `runTurn`'s
+    // re-pin backstop (`this.currentMode !== 'default'` before
+    // `client.prompt`) can see it — previously typed but never applied,
+    // leaving the backstop blind to a wire switch to accept_edits/dont_ask.
+    // Deliberately NOT an early return: the update still falls through to
+    // the live translator below so a mid-reasoning current_mode_update keeps
+    // closing the reasoning block exactly as before (the pure mapper —
+    // sessionUpdate.ts — is unchanged). Zero behavior change vs pinned
+    // Hermes 2026.7.7.2 (never emits this update — grep 0).
+    if (update.sessionUpdate === 'current_mode_update') {
+      this.currentMode = update.currentModeId;
+      this.port.logger?.append(
+        `[SessionController] agent-initiated mode change reported: '${update.currentModeId}' — the next turn re-pins 'default'`,
+      );
+    }
+
     if (this.replay) {
       for (const message of this.replay.apply(update)) this.port.emit(message);
     } else {
