@@ -30,6 +30,8 @@
  * their local `errorMessage` helpers) is T8's job, not this task's.
  */
 
+import { isRecord } from './typeGuards';
+
 /** JSON-RPC error `.data` keys `describeError` is allowed to fold into the
  *  message (§2.3's locked allowlist). Anything else on `.data` (a raw
  *  `.stack`, or caller-supplied extra fields) is dropped — this is a
@@ -40,10 +42,6 @@ const DATA_KEY_ALLOWLIST = ['details', 'method'] as const;
  *  characters (§2.3) so a huge/unexpected object shape can't blow up a
  *  status line or log message. */
 const JSON_FALLBACK_CAP = 300;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
 
 /** Reads `.data` off any object-shaped value (an `Error` instance or a
  *  plain `{code,message,data}` object) without assuming it's typed. */

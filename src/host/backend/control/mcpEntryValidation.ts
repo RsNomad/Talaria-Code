@@ -1,5 +1,6 @@
 import { MODAL_UNSAFE_TEXT_PATTERN } from '../../setup/SetupController';
 import type { McpAddParams, McpCatalogEntry } from '../../../shared/protocol';
+import { isRecord } from '../../../shared/typeGuards';
 
 /**
  * Task A3 (features-add-mcp-skills-architecture.md §4.4, §3 Layer 1/3) — the
@@ -71,10 +72,6 @@ function basename(path: string): string {
 
 function isShellInterpreter(command: string): boolean {
   return SHELL_INTERPRETERS.has(basename(command).toLowerCase());
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import type { SkillCreateParams } from '../../../shared/protocol';
+import { isRecord } from '../../../shared/typeGuards';
 
 /**
  * Task B3 (features-add-mcp-skills-architecture.md §5.3 / §3 Layer 1 S-5) —
@@ -134,10 +135,6 @@ const VALID_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const MAX_NAME_LENGTH = 64;
 /** `tools/skill_manager_tool.py:471` — MAX_SKILL_CONTENT_CHARS, verbatim. */
 const MAX_SKILL_CONTENT_CHARS = 100_000;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 export type SkillCreateValidation = { ok: true; body: SkillCreateParams } | { ok: false; reason: string };
 

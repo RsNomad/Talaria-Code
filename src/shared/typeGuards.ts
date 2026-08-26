@@ -1,11 +1,12 @@
 /**
  * WS-A (lens-dorabotok A-01, REMEDIATION-ARCHITECTURE §2 WS-A step 3): the ONE
- * shared record guard for untyped ingress boundaries. This is the enabling
- * point WS-BG later migrates the whole boundary-assertion class onto
- * (branch-by-abstraction: helper first, class migration later) — the three
- * module-local copies (`shared/errorText.ts:44`,
- * `host/backend/control/skillSourceGate.ts:138`,
- * `host/backend/control/mcpEntryValidation.ts:76`) stay put until then.
+ * shared record guard for untyped ingress boundaries. This was the enabling
+ * point WS-BG later migrated the whole boundary-assertion class onto
+ * (branch-by-abstraction: helper first, class migration later) — WS-BG Task 2
+ * unified the three module-local copies (`shared/errorText.ts`,
+ * `host/backend/control/skillSourceGate.ts`,
+ * `host/backend/control/mcpEntryValidation.ts`) onto this shared guard; none
+ * remain.
  *
  * Semantics: the STRICTER array-excluding form (matches the two control-plane
  * copies). An array is not a Record in intent; excluding it is fail-closed at

@@ -251,3 +251,14 @@ describe('redactHomePath', () => {
     expect(redactHomePath('')).toBe('');
   });
 });
+
+describe('WS-BG characterization: array inputs behave identically under the strict shared isRecord', () => {
+  it('describeError on an array falls through to the JSON fallback (no .message/.data extraction)', () => {
+    const before = describeError(['not', 'an', 'error']);
+    // Pinned OUTCOME, not implementation: an array has no usable .message,
+    // so the description must not be empty and must not fabricate one.
+    expect(typeof before).toBe('string');
+    expect(before.length).toBeGreaterThan(0);
+    expect(before).not.toContain('undefined');
+  });
+});
