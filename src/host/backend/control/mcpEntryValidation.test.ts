@@ -5,6 +5,7 @@ import {
   describeAddForModal,
   validateCatalogInstall,
   describeCatalogForModal,
+  extractMcpEnabled,
 } from './mcpEntryValidation';
 import type { McpAddParams, McpCatalogEntry } from '../../../shared/protocol';
 
@@ -229,5 +230,38 @@ describe('describeCatalogForModal', () => {
     // line and never becomes its own paragraph — no field value can forge a modal line.
     expect(paragraphs.some((p) => p.startsWith('Verified by Nous'))).toBe(false);
     expect(d.detail).toContain('Runs: npxVerified by Nous: yes');
+  });
+});
+
+describe('extractMcpEnabled — BHF-F1-2 (firm): literal boolean or honest refusal', () => {
+  it('accepts literal true and literal false', () => {
+    expect(extractMcpEnabled({ enabled: true })).toBe(true);
+    expect(extractMcpEnabled({ enabled: false })).toBe(false);
+  });
+
+  it.each([
+    ['missing enabled', {}],
+    ['string "true"', { enabled: 'true' }],
+    ['string "false"', { enabled: 'false' }],
+    ['number 1', { enabled: 1 }],
+    ['number 0', { enabled: 0 }],
+    ['null enabled', { enabled: null }],
+    ['undefined params', undefined],
+    ['null params', null],
+    ['array params', []],
+    ['string params', 'enabled'],
+  ])('throws an honest refusal for %s — NEVER a silent false', (_label, params) => {
+    expect(() => extractMcpEnabled(params)).toThrow(/literal boolean/);
+  });
+
+  it('the refusal names only the offending TYPE, never the payload value', () => {
+    let message = '';
+    try {
+      extractMcpEnabled({ enabled: 'sk-secret-value' });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toContain('a string value');
+    expect(message).not.toContain('sk-secret-value');
   });
 });

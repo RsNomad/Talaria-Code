@@ -346,3 +346,23 @@ export function describeCatalogForModal(entry: McpCatalogEntry): ModalDescriptio
     reason: `The build script of "${entry.name}" is too large to review in a dialog — install it from a terminal instead: hermes mcp install ${entry.name}`,
   };
 }
+
+/**
+ * BHF-F1-2 (WS-BG, owner-adjudicated FIRM): `mcp.setEnabled`'s `enabled`
+ * payload accepts ONLY a literal boolean. Anything else — missing, `"true"`,
+ * `1`, `null` — used to silently coerce to `false`, i.e. a DESTRUCTIVE
+ * silent-disable default at a modal-less boundary. Now it throws an honest
+ * refusal: fail-LOUD, still fail-closed (nothing is toggled). The throw
+ * surfaces to the webview exactly like `requireListedMcpName`'s refusals on
+ * the same `handleMcpAdminInner` path (`ControlDispatcher.ts:772` → `:778`).
+ * Hygiene: the message names the offending TYPE only — never the value.
+ */
+export function extractMcpEnabled(params: unknown): boolean {
+  const enabled = isRecord(params) ? params.enabled : undefined;
+  if (enabled === true || enabled === false) return enabled;
+  throw new Error(
+    `'mcp.setEnabled' requires a literal boolean { enabled: true | false } — got ${
+      enabled === undefined ? 'no enabled value' : `a ${typeof enabled} value`
+    }. Refusing rather than guessing: a wrong guess silently disables a server.`,
+  );
+}

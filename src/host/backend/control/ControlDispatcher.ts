@@ -38,6 +38,7 @@ import {
   stripModalControls,
   validateCatalogInstall,
   describeCatalogForModal,
+  extractMcpEnabled,
   RELOAD_LINE,
   MODAL_DETAIL_MAX,
 } from './mcpEntryValidation';
@@ -1790,12 +1791,6 @@ function extractMcpName(params: unknown): string | undefined {
   if (!params || typeof params !== 'object') return undefined;
   const p = params as { name?: unknown };
   return typeof p.name === 'string' ? p.name : undefined;
-}
-
-/** Task A5: pull `{enabled}` out of an `mcp.setEnabled` payload. */
-function extractMcpEnabled(params: unknown): boolean {
-  if (!params || typeof params !== 'object') return false;
-  return (params as { enabled?: unknown }).enabled === true;
 }
 
 /** Task B4: pull `{identifier}` out of a `skills.hubPreview`/`skills.hubScan`/`skills.hubInstall` payload. */
