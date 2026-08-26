@@ -746,7 +746,11 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       case 'tab.close':
         // W4 §2d: only a BOUND tab has a session to close — a still-unbound
         // tab (its `tab.open` never resolved) carries no `sessionId`.
-        if (message.sessionId) this.backend.closeTab(message.sessionId);
+        // CA-M16 (WS-BG): PRESENCE, not truthiness — the wire contract's
+        // discriminator is "sessionId absent for a still-unbound tab"
+        // (protocol.ts:2297-2300); a truthy check conflates absent with
+        // falsy, and this boundary's job is to mirror the contract exactly.
+        if (message.sessionId !== undefined) this.backend.closeTab(message.sessionId);
         break;
 
       case 'tab.activate':

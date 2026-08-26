@@ -2301,6 +2301,33 @@ describe('TalariaViewProvider — TE-7 (AU-31): per-view disposable scope does n
     expect(posted2.some((m) => m.type === 'hydrate')).toBe(true);
   });
 
+  it('CA-M16 (WS-BG): tab.close routes on sessionId PRESENCE — absent -> no closeTab; present -> closeTab', () => {
+    const closeTab = vi.fn();
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(undefined, { closeTab }));
+
+    let capturedCb: ((msg: WebviewToHostMessage) => void) | undefined;
+    const view = {
+      webview: {
+        cspSource: 'vscode-webview:',
+        asWebviewUri: (uri: unknown) => uri,
+        onDidReceiveMessage: (cb: (msg: WebviewToHostMessage) => void) => {
+          capturedCb = cb;
+          return { dispose() {} };
+        },
+        postMessage: () => Promise.resolve(true),
+      },
+      onDidDispose: () => ({ dispose() {} }),
+    };
+    provider.resolveWebviewView(view as never, {} as never, {} as never);
+    expect(capturedCb).toBeDefined();
+
+    capturedCb?.({ type: 'tab.close', tabId: 't1' });
+    expect(closeTab).not.toHaveBeenCalled();
+
+    capturedCb?.({ type: 'tab.close', tabId: 't1', sessionId: 's1' });
+    expect(closeTab).toHaveBeenCalledWith('s1');
+  });
+
   it('setNextEditToggles rewiring does not leave a disposed husk in the provider-lifetime disposables array', () => {
     const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
     const baseline = disposablesOf(provider).length;
