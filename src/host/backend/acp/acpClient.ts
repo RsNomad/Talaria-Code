@@ -17,6 +17,8 @@ import type {
 } from './types';
 import type { AcpMcpServerHttp } from '../../../shared/acpMcpServerHttp';
 import { isRecord } from '../../../shared/typeGuards';
+import { MAX_LINE_BYTES } from '../../transport/maxLineBytes';
+import { createStdoutByteCapTransform } from './stdoutByteCap';
 
 /**
  * Thin seam around the ACP TypeScript SDK (`@agentclientprotocol/sdk`,
@@ -568,8 +570,30 @@ export class AcpClient implements AcpClientLike {
     // type as generic Web Streams; cast to the byte-stream shape `ndJsonStream`
     // declares (Context7: `ndJsonStream(output: WritableStream<Uint8Array>,
     // input: ReadableStream<Uint8Array>): Stream`).
+    //
+    // CA-01 (WS-AC): the byte-cap Transform sits BETWEEN stdout and the web
+    // adapter — OUTSIDE the SDK's ndJsonStream, framing untouched. On trip
+    // it kills the child WITHOUT clearing `this.child`, so the natural
+    // 'exit' drives the EXISTING crash machinery (terminate() →
+    // termination-pair rejection → exitHandlers → supervisor respawn):
+    // cap-then-teardown+respawn, the JsonRpcStdio model — no silent
+    // truncation, no parallel error channel. Message carries byte counts
+    // only, never buffered content.
+    const capTransform = createStdoutByteCapTransform(MAX_LINE_BYTES, (bufferedBytes) => {
+      this.log(
+        `[fatal] ACP stdout line exceeded ${MAX_LINE_BYTES} bytes ` +
+          `(${bufferedBytes} bytes since last newline) — killing child for respawn`,
+      );
+      if (child.exitCode === null && !child.killed) {
+        child.kill('SIGTERM');
+        const killTimer = setTimeout(() => {
+          if (child.exitCode === null) child.kill('SIGKILL');
+        }, 5000);
+        killTimer.unref?.();
+      }
+    });
     const output = Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>;
-    const input = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
+    const input = Readable.toWeb(child.stdout.pipe(capTransform)) as unknown as ReadableStream<Uint8Array>;
     const stream = ndJsonStream(output, input);
 
     const callbacks = this.options.callbacks;

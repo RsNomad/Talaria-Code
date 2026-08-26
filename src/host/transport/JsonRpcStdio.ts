@@ -1,5 +1,6 @@
 import { spawn, ChildProcess } from 'node:child_process';
 import { redactSecretsDeep } from '../redactControlResponse';
+import { MAX_LINE_BYTES } from './maxLineBytes';
 
 /**
  * Newline-delimited JSON-RPC 2.0 over a child process's stdio.
@@ -88,8 +89,9 @@ const KILL_GRACE_MS = 5_000;
  * hostile stream (a truncated JSON line would fail to parse anyway), so
  * we refuse to buffer it and tear the transport down for a clean respawn
  * rather than grow unbounded or silently truncate.
+ * Shared with the ACP channel's stdoutByteCap Transform since WS-AC CA-01 —
+ * one definition (./maxLineBytes.ts).
  */
-const MAX_LINE_BYTES = 4 * 1024 * 1024;
 
 export class JsonRpcStdio implements Disposable {
   private readonly child: ChildProcess;
