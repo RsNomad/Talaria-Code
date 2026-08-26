@@ -2103,3 +2103,89 @@ describe('SessionController.emitApprovalCard — WS-SL F2-06: emit-throw settles
     }
   });
 });
+
+/**
+ * WS-SL F1-13: `sendPrompt` minted a turn id, a ROOT-scoped checkpoint
+ * ordinal, and a checkpoint snapshot for a whitespace-only prompt with
+ * nothing attached — burning a turn + ordinal on an utterance Hermes treats
+ * as empty. Characterization-first: the first committed shape of the first
+ * test PINNED the burn (turn.start emitted, ordinal minted), then flipped.
+ */
+describe('SessionController.sendPrompt — WS-SL F1-13: empty-prompt refusal', () => {
+  function makeF113Harness(): {
+    controller: SessionController;
+    emitted: HostToWebviewMessage[];
+    ordinalCalls: () => number;
+    promptCalls: () => number;
+  } {
+    const emitted: HostToWebviewMessage[] = [];
+    let ordinals = 0;
+    let prompts = 0;
+    const client = {
+      cancel: async () => undefined,
+      prompt: () => {
+        prompts += 1;
+        return new Promise<never>(() => {});
+      },
+    } as unknown as AcpClientLike;
+    const root: RootCoordinatorLike = {
+      rootId: 'root-1',
+      tracker: undefined,
+      tryAcquireTurnLease: () => true,
+      releaseTurnLease: () => {},
+      anyLiveTurn: () => false,
+      nextTurnOrdinal: () => {
+        ordinals += 1;
+        return ordinals;
+      },
+      nextBaselineOrdinal: () => -1,
+      refreshCheckpointsPanel: () => {},
+    };
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root,
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return {
+      controller: new SessionController('session-1', '/fake/ws', port),
+      emitted,
+      ordinalCalls: () => ordinals,
+      promptCalls: () => prompts,
+    };
+  }
+
+  it('a whitespace-only prompt with no attachments/mentions is refused BEFORE any mint: error emitted, no turn.start, no ordinal, no client.prompt', async () => {
+    const { controller, emitted, ordinalCalls, promptCalls } = makeF113Harness();
+    controller.sendPrompt('   \n\t ', 'default');
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
+    expect(emitted).toEqual([
+      { type: 'error', sessionId: 'session-1', message: 'Cannot send an empty message.' },
+    ]);
+    expect(ordinalCalls()).toBe(0);
+    expect(promptCalls()).toBe(0);
+    expect(controller.hasLiveTurn()).toBe(false);
+  });
+
+  it('an empty text WITH an attachment is admitted (the attachment carries the content)', async () => {
+    const { controller, emitted, ordinalCalls } = makeF113Harness();
+    controller.sendPrompt('', 'default', [
+      { id: 'att-1', name: 'notes.txt', kind: 'file', path: '/fake/ws/notes.txt' },
+    ]);
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(emitted.some((m) => m.type === 'turn.start')).toBe(true);
+    expect(ordinalCalls()).toBe(1);
+  });
+
+  it('an empty text WITH a mention is admitted', async () => {
+    const { controller, emitted } = makeF113Harness();
+    controller.sendPrompt('', 'default', undefined, [{ id: 'ref-1', kind: 'file', path: 'a.ts' }]);
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(emitted.some((m) => m.type === 'turn.start')).toBe(true);
+  });
+});

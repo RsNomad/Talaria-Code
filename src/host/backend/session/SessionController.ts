@@ -350,6 +350,25 @@ export class SessionController {
       return;
     }
 
+    // WS-SL F1-13: refuse an empty utterance BEFORE any turn/ordinal/
+    // checkpoint mint — a whitespace-only prompt with nothing attached would
+    // burn a turn id, a ROOT-scoped checkpoint ordinal and a snapshot for a
+    // prompt Hermes treats as empty. Deliberately ahead of the `liveTurnId`
+    // branch: an empty mid-turn utterance can never be a `/steer`/`/queue`
+    // control command, and "empty" is the more honest refusal than "already
+    // running". Closed literal only — nothing user-supplied reaches the wire.
+    if (text.trim() === '' && (attachments?.length ?? 0) === 0 && (mentions?.length ?? 0) === 0) {
+      this.port.logger?.append(
+        '[SessionController] sendPrompt refused — empty message (no text, attachments, or mentions)',
+      );
+      this.port.emit({
+        type: 'error',
+        sessionId: this.sessionId,
+        message: 'Cannot send an empty message.',
+      });
+      return;
+    }
+
     if (this.liveTurnId) {
       // V-18 (Tier-2 remediation architecture §2.2): the ONE narrow exception
       // to the refusal below — a text-only `/steer` or `/queue` typed while
