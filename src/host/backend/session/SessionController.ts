@@ -1001,7 +1001,20 @@ export class SessionController {
     const { approval, diffs } = mapped;
     const options = approval.options;
 
-    return new Promise<AcpRequestPermissionResponse>((resolve) => {
+    // WS-SL F3-3: turn-liveness at the sole registration point. `cancel()`'s
+    // `settlePendingApprovals` is a one-time snapshot — an approval whose
+    // `handlePermission` was suspended across that snapshot would otherwise
+    // register a fresh card for a stopped turn and live until the 60 s
+    // expiry (the zombie). Refusal resolves the ACP future cancelled — the
+    // harness maps that to deny (fail-closed), same as every settle path.
+    if (this.isStaleApprovalRegistration(approval.turnId)) {
+      this.port.logger?.append(
+        `[SessionController] approval '${approvalId}' refused at registration — its turn is gone or cancelled (fail-closed)`,
+      );
+      return Promise.resolve(buildCancelledOutcome());
+    }
+
+    const response = new Promise<AcpRequestPermissionResponse>((resolve) => {
       // T-A0 (M2-b): arm the host-side auto-deny deadline HERE, the sole
       // registration point into `pendingApprovals` — our timer starts at
       // receipt, i.e. always >= the harness's own deadline (which starts at
@@ -1033,6 +1046,39 @@ export class SessionController {
       this.port.emit(approval);
       for (const diff of diffs) this.port.emit(diff);
     });
+
+    // WS-SL F3-3 (the arch's mandated post-registration re-check): the guard
+    // above and the executor run synchronously today, so this is unreachable
+    // unless future code motion inserts an await between them — in which
+    // case anything that raced past the guard is settled here, never left
+    // as a zombie until expiry. Settle-then-return keeps the future honest.
+    if (this.isStaleApprovalRegistration(approval.turnId)) {
+      this.settlePendingApprovals('cancelled', { onlyApprovalId: approvalId });
+    }
+    return response;
+  }
+
+  /**
+   * WS-SL F3-3: is a card registration for an approval born under
+   * `birthTurnId` stale? True when: no turn was ever admitted / the turn
+   * bookkeeping was cleared (crash, restart, force-end, dispose); the
+   * CURRENT turn is the one the user cancelled (the primary zombie window
+   * — `cancel()` already swept `pendingApprovals`, anything registering
+   * after that sweep is unreachable by it); or the approval was born under
+   * a PREVIOUS turn (its `handlePermission` suspended across a turn
+   * transition — `birthTurnId` is `handlePermission`'s entry-time capture,
+   * threaded here via `mapped.approval.turnId`). Residual (documented,
+   * accepted): a turn that ended `complete` leaves `currentTurnId` set, so
+   * a straggler registering in THAT narrow window still cards and is
+   * bounded by the M2-b expiry — closing it needs the turn-scoped approval
+   * registry ADR-SL explicitly rejected.
+   */
+  private isStaleApprovalRegistration(birthTurnId: string): boolean {
+    return (
+      this.currentTurnId === undefined ||
+      this.cancelledTurnId === this.currentTurnId ||
+      birthTurnId !== this.currentTurnId
+    );
   }
 
   // --- turn plumbing ----------------------------------------------------------

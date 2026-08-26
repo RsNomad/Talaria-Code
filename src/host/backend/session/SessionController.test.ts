@@ -537,9 +537,14 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
   }
 
   it('V-4 RED: cancel() settles a pending approval — the promise resolves cancelled AND approval.settle{outcome:"cancelled"} is emitted', async () => {
-    const client = makeApprovalClient({ cancel: async () => undefined });
+    const client = makeApprovalClient({
+      cancel: async () => undefined,
+      prompt: () => new Promise<never>(() => {}),
+    });
     const { port, emitted } = makeSettlePort(client);
     const controller = new SessionController('session-1', '/tmp/ws-a0', port);
+    controller.sendPrompt('run it', 'default');
+    await flushMicrotasks(); // turn-1 live, prompt hanging
 
     const pending = controller.handlePermission(makeCommandReq('npm test'), 'appr-1');
     await flushMicrotasks();
@@ -555,7 +560,7 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
     expect(emitted).toContainEqual({
       type: 'approval.settle',
       sessionId: 'session-1',
-      turnId: 'turn',
+      turnId: 'turn-1',
       id: 'appr-1',
       toolId: 'cmd-1',
       outcome: 'cancelled',
@@ -567,9 +572,11 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
     async () => {
       vi.useFakeTimers();
       try {
-        const client = makeApprovalClient();
+        const client = makeApprovalClient({ prompt: () => new Promise<never>(() => {}) });
         const { port, emitted, logs } = makeSettlePort(client);
         const controller = new SessionController('session-1', '/tmp/ws-a0', port);
+        controller.sendPrompt('run it', 'default');
+        await flushMicrotasks(); // turn-1 live, prompt hanging
 
         const pending = controller.handlePermission(makeCommandReq('npm test', 'cmd-v6'), 'appr-v6');
         await flushMicrotasks();
@@ -583,7 +590,7 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
         expect(emitted).toContainEqual({
           type: 'approval.settle',
           sessionId: 'session-1',
-          turnId: 'turn',
+          turnId: 'turn-1',
           id: 'appr-v6',
           toolId: 'cmd-v6',
           outcome: 'expired',
@@ -637,9 +644,11 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
   });
 
   it('Echo RED: respondApproval emits approval.settle{outcome:"selected", optionId}', async () => {
-    const client = makeApprovalClient();
+    const client = makeApprovalClient({ prompt: () => new Promise<never>(() => {}) });
     const { port, emitted } = makeSettlePort(client);
     const controller = new SessionController('session-1', '/tmp/ws-a0', port);
+    controller.sendPrompt('run it', 'default');
+    await flushMicrotasks(); // turn-1 live, prompt hanging
 
     const pending = controller.handlePermission(makeCommandReq('npm test', 'cmd-echo'), 'appr-echo');
     await flushMicrotasks();
@@ -653,7 +662,7 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
     expect(emitted).toContainEqual({
       type: 'approval.settle',
       sessionId: 'session-1',
-      turnId: 'turn',
+      turnId: 'turn-1',
       id: 'appr-echo',
       toolId: 'cmd-echo',
       outcome: 'selected',
@@ -666,9 +675,11 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
     async () => {
       vi.useFakeTimers();
       try {
-        const client = makeApprovalClient();
+        const client = makeApprovalClient({ prompt: () => new Promise<never>(() => {}) });
         const { port, emitted } = makeSettlePort(client);
         const controller = new SessionController('session-1', '/tmp/ws-a0', port);
+        controller.sendPrompt('run it', 'default');
+        await flushMicrotasks(); // turn-1 live, prompt hanging
 
         const pending = controller.handlePermission(makeCommandReq('npm test', 'cmd-hyg'), 'appr-hyg');
         await flushMicrotasks();
@@ -1906,5 +1917,119 @@ describe('SessionController.endForRestart — ADR-UX-P2-2 (replay arm)', () => {
     // Assert: the closing bracket is user-intent vocabulary, not 'error'.
     const end = emitted.find((m) => m.type === 'turn.end');
     expect(end).toMatchObject({ type: 'turn.end', status: 'cancelled' });
+  });
+});
+
+/**
+ * WS-SL F3-3 (BHF-F3-3): turn-liveness at approval registration.
+ * The zombie: `handlePermission` suspends at `await buildPresentEffectSignals`;
+ * a `cancel()` landing in that window runs `settlePendingApprovals` over a
+ * snapshot that does NOT yet contain this approval — when the await resolves,
+ * `emitApprovalCard` registers a fresh card for a turn the user already
+ * stopped, and it lives until the 60 s M2-b expiry (or the 15 s WS-R1 cancel
+ * fallback force-end). Characterization-first: the first committed shape of
+ * the first test below PINNED today's zombie (card emitted after cancel,
+ * promise stranded), then flipped to the fixed expectation — the flip is the
+ * regression test.
+ */
+describe('SessionController.emitApprovalCard — WS-SL F3-3: turn-liveness at registration', () => {
+  async function flushF33(times = 6): Promise<void> {
+    for (let i = 0; i < times; i++) await Promise.resolve();
+  }
+
+  function makeF33CommandReq(command: string, toolCallId = 'cmd-1'): AcpRequestPermissionRequest {
+    return {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId,
+        title: `Run: ${command}`,
+        kind: 'execute',
+        content: [{ content: { type: 'text', text: `$ ${command}` } }],
+        rawInput: { command, description: 'run' },
+      },
+    };
+  }
+
+  function makeF33Harness(): {
+    controller: SessionController;
+    emitted: HostToWebviewMessage[];
+    logs: string[];
+    resolvePrompt: (v: { stopReason: string }) => void;
+  } {
+    const emitted: HostToWebviewMessage[] = [];
+    const logs: string[] = [];
+    let resolvePrompt!: (v: { stopReason: string }) => void;
+    const client = {
+      cancel: async () => undefined,
+      prompt: () =>
+        new Promise<{ stopReason: string }>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    } as unknown as AcpClientLike;
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: (l) => logs.push(l) },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', '/fake/ws', port);
+    return { controller, emitted, logs, resolvePrompt: (v) => resolvePrompt(v) };
+  }
+
+  it('a cancel() landing while handlePermission is suspended refuses the registration — cancelled outcome, NO card, nothing pending', async () => {
+    const { controller, emitted } = makeF33Harness();
+    controller.sendPrompt('do the thing', 'default');
+    await flushF33(); // reach the hanging client.prompt — turn-1 is live
+
+    // Suspends at `await this.buildPresentEffectSignals(...)`:
+    const pending = controller.handlePermission(makeF33CommandReq('npm test'), 'appr-z1');
+    controller.cancel(); // lands INSIDE the suspension window — the F3-3 race
+
+    const res = await pending;
+    expect(res).toEqual(buildCancelledOutcome());
+    // The zombie observable (pre-fix): approval.request WAS emitted after
+    // cancel and lived until expiry. Post-fix: no card at all.
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(false);
+    // Nothing was registered: a late answer is the documented no-op and emits
+    // no settle echo.
+    controller.respondApproval('appr-z1', 'allow_once');
+    expect(emitted.some((m) => m.type === 'approval.settle')).toBe(false);
+  });
+
+  it('after the cancelled turn ends, a straggler handlePermission still resolves cancelled with no card (cancelledTurnId bookkeeping lingers)', async () => {
+    const { controller, emitted, resolvePrompt } = makeF33Harness();
+    controller.sendPrompt('do the thing', 'default');
+    await flushF33();
+    controller.cancel();
+    resolvePrompt({ stopReason: 'cancelled' });
+    await flushF33(); // turn-1 fully over (turn.end{cancelled} emitted)
+    emitted.length = 0;
+
+    const res = await controller.handlePermission(makeF33CommandReq('npm test', 'cmd-z2'), 'appr-z2');
+    expect(res).toEqual(buildCancelledOutcome());
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(false);
+  });
+
+  it('a permission arriving with NO turn ever admitted refuses registration (fail-closed) instead of minting a 60 s zombie card', async () => {
+    const { controller, emitted } = makeF33Harness();
+    const res = await controller.handlePermission(makeF33CommandReq('npm test', 'cmd-z3'), 'appr-z3');
+    expect(res).toEqual(buildCancelledOutcome());
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(false);
+  });
+
+  it('a live, uncancelled turn still gets its card and a user answer resolves selected (healthy path untouched)', async () => {
+    const { controller, emitted } = makeF33Harness();
+    controller.sendPrompt('do the thing', 'default');
+    await flushF33();
+    const pending = controller.handlePermission(makeF33CommandReq('npm test', 'cmd-z4'), 'appr-z4');
+    await flushF33();
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+    controller.respondApproval('appr-z4', 'allow_once');
+    await expect(pending).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow_once' } });
   });
 });

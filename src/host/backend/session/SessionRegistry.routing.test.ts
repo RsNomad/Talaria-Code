@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { SessionRegistry } from './SessionRegistry';
+import type { SessionController } from './SessionController';
 import type { SessionHostPort } from './types';
 import { RootCoordinator } from '../../checkpoints/RootCoordinator';
 import type { AcpClientLike, AcpLoadSessionResult } from '../acp/acpClient';
@@ -89,6 +90,13 @@ function makeEditReq(sessionId: string, toolCallId: string): AcpRequestPermissio
   };
 }
 
+/** WS-SL F3-3: card registration now requires a live turn — arm the private
+ *  turn fields directly (runtime-visible; TS `private` is compile-time only),
+ *  mirroring `AcpBackend.test.ts`'s `seam(...).currentTurnId = 'turn-1'` idiom. */
+function armLiveTurn(controller: SessionController): void {
+  (controller as unknown as Record<string, unknown>).currentTurnId = 'turn-1';
+}
+
 async function flush(): Promise<void> {
   for (let i = 0; i < 8; i++) await Promise.resolve();
 }
@@ -114,8 +122,10 @@ describe('W4-T1a — SessionController/SessionRegistry isolation (headless, fake
     const registry = new SessionRegistry();
     const emittedA: HostToWebviewMessage[] = [];
     const emittedB: HostToWebviewMessage[] = [];
-    registry.open('session-a', '/ws', makePort(emittedA));
-    registry.open('session-b', '/ws', makePort(emittedB));
+    const a = registry.open('session-a', '/ws', makePort(emittedA));
+    const b = registry.open('session-b', '/ws', makePort(emittedB));
+    armLiveTurn(a);
+    armLiveTurn(b);
     const logs: string[] = [];
 
     const pendingA = routePermission(registry, makeEditReq('session-a', 'tc-a'), 'appr-a', logs);
@@ -213,7 +223,8 @@ describe('W4-T1a — SessionController/SessionRegistry isolation (headless, fake
     const registry = new SessionRegistry();
     const emittedA: HostToWebviewMessage[] = [];
     const emittedB: HostToWebviewMessage[] = [];
-    registry.open('session-shared', '/ws', makePort(emittedA), 'tab-1');
+    const first = registry.open('session-shared', '/ws', makePort(emittedA), 'tab-1');
+    armLiveTurn(first); // WS-SL F3-3: card registration now requires a live turn
 
     const logs: string[] = [];
     let settledFirst = false;

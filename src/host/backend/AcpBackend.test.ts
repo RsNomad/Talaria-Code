@@ -11936,6 +11936,7 @@ describe('AcpBackend.handleRequestPermission — W4-T1b: P-0 multi-controller po
     const client = new FakeAcpClient();
     seam(backend).client = client;
     seam(backend).sessionId = 'session-a';
+    seam(backend).currentTurnId = 'turn-1'; // WS-SL F3-3: card registration now requires a live turn id
     const messages: HostToWebviewMessage[] = [];
     backend.onMessage((m) => messages.push(m));
     return { backend, client, messages, logs };
@@ -11948,6 +11949,7 @@ describe('AcpBackend.handleRequestPermission — W4-T1b: P-0 multi-controller po
   function mintSecondController(backend: AcpBackend, sessionId: string, cwd: string): void {
     seam(backend).sessionId = sessionId;
     seam(backend).cwd = cwd;
+    seam(backend).currentTurnId = 'turn-1'; // WS-SL F3-3: arm the fresh controller too
   }
 
   /** Like {@link makeEditReq} but the caller supplies BOTH the target
@@ -12133,6 +12135,7 @@ describe('AcpBackend.handleRequestPermission — W4-T1b: P-0 multi-controller po
     const client = new FakeAcpClient();
     seam(backend).client = client;
     seam(backend).sessionId = 'session-a';
+    seam(backend).currentTurnId = 'turn-1'; // WS-SL F3-3: card registration now requires a live turn id
     const messages: HostToWebviewMessage[] = [];
     backend.onMessage((m) => messages.push(m));
 
