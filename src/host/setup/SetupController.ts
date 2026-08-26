@@ -1791,26 +1791,16 @@ export class SetupController {
       // §7.2.2: settled-flag straggler guard around ingestGguf's own await —
       // same discipline as {@link runLibraryPull}; required regardless of
       // the (verified-by-inspection) FROZEN dep's actual timing contract.
-      let settled = false;
-      try {
-        await this.deps.ingestGguf(
-          { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
-          endpoint,
-          (p) => {
-            if (settled) return;
-            this.pushProgress({
-              op: 'pull',
-              id: created,
-              phase: p.status,
-              ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
-              ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
-            });
-          },
-          abort.signal,
-        );
-      } finally {
-        settled = true;
-      }
+      await this.runWithSettledGuard(
+        (p) => this.pushPullProgress(created, p),
+        (cb) =>
+          this.deps.ingestGguf(
+            { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
+            endpoint,
+            cb,
+            abort.signal,
+          ),
+      );
       return { ok: true };
     } catch (err) {
       if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
@@ -1936,36 +1926,38 @@ export class SetupController {
           'Download',
         );
         if (!confirmed) return { ok: false, reason: 'declined' };
+        // WV3-MIN-FUNC follow-on: `cell.verify.sha256` narrows off the
+        // `VerifySpec` union only within this switch case's own scope — the
+        // narrowing does not survive into the closure below (a property-path
+        // narrowing, unlike a plain local's), so it is hoisted to a local
+        // here. Same value, same read timing (still after every await
+        // above); no behavior change.
+        const sha256 = cell.verify.sha256;
         // §7.2.2: settled-flag straggler guard around ingestGguf's own
         // await — same discipline as {@link runLibraryPull}; the shared
         // `entry.id`-keyed terminal `done` push lives in the CALLER's
         // (`handleProvisionModel`'s) finally, which runs strictly after
         // this flag flips.
-        {
-          let settled = false;
-          try {
-            await this.deps.ingestGguf(
+        await this.runWithSettledGuard(
+          (p) => this.pushPullProgress(entry.id, p),
+          (cb) =>
+            this.deps.ingestGguf(
               {
                 gguf: {
                   hfRepo: cell.gguf.hfRepo,
                   file: cell.gguf.file,
                   quant: cell.gguf.quant,
-                  sha256: cell.verify.sha256,
+                  sha256,
                   approxBytes: cell.gguf.approxBytes,
                   allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles,
                 },
                 ollamaCreatedName: cell.createdName,
               },
               validated.url,
-              (p) => {
-                if (!settled) this.pushPullProgress(entry.id, p);
-              },
+              cb,
               signal,
-            );
-          } finally {
-            settled = true;
-          }
-        }
+            ),
+        );
         return { ok: true };
       }
       case 'live-oid': {
@@ -1999,10 +1991,10 @@ export class SetupController {
         // `runLibraryPull` site, not here) — so it gets the identical
         // guard for consistency and genuine safety, not just the
         // dormant sibling.
-        {
-          let settled = false;
-          try {
-            await this.deps.ingestGguf(
+        await this.runWithSettledGuard(
+          (p) => this.pushPullProgress(entry.id, p),
+          (cb) =>
+            this.deps.ingestGguf(
               {
                 gguf: {
                   hfRepo: cell.gguf.hfRepo,
@@ -2014,15 +2006,10 @@ export class SetupController {
                 ollamaCreatedName: cell.createdName,
               },
               validated.url,
-              (p) => {
-                if (!settled) this.pushPullProgress(entry.id, p);
-              },
+              cb,
               signal,
-            );
-          } finally {
-            settled = true;
-          }
-        }
+            ),
+        );
         return { ok: true };
       }
       default:
@@ -2107,29 +2094,26 @@ export class SetupController {
     // `entry.id`-keyed terminal `done` push lives in the CALLER's
     // (`handleProvisionModel`'s) finally, which runs strictly after this
     // flag flips.
-    let settled = false;
-    try {
-      await this.deps.downloadGgufToStore(
-        {
-          catalogId: entry.id,
-          gguf: {
-            hfRepo: cell.gguf.hfRepo,
-            file: cell.gguf.file,
-            quant: cell.gguf.quant,
-            sha256: expected,
-            approxBytes: cell.gguf.approxBytes,
+    await this.runWithSettledGuard(
+      (p) => this.pushPullProgress(entry.id, p),
+      (cb) =>
+        this.deps.downloadGgufToStore(
+          {
+            catalogId: entry.id,
+            gguf: {
+              hfRepo: cell.gguf.hfRepo,
+              file: cell.gguf.file,
+              quant: cell.gguf.quant,
+              sha256: expected,
+              approxBytes: cell.gguf.approxBytes,
+            },
           },
-        },
-        reassert.destDir,
-        reassert.destFile,
-        (p) => {
-          if (!settled) this.pushPullProgress(entry.id, p);
-        },
-        signal,
-      );
-    } finally {
-      settled = true;
-    }
+          reassert.destDir,
+          reassert.destFile,
+          cb,
+          signal,
+        ),
+    );
     // Presence flips: the sidecar now exists, so the next status() scan reads
     // present — fire so the panel re-fetches without waiting for a user poke.
     this.bumpStatus();
@@ -2161,12 +2145,10 @@ export class SetupController {
     // (`ollamaClient.ts`) streams every `onProgress` call from a fully
     // awaited read loop, strictly before its own promise settles — this
     // guard is required regardless, since a FROZEN dep is not a contract.
-    let settled = false;
-    try {
-      await this.deps.pullModel(endpoint, tag, (p) => { if (!settled) this.pushPullProgress(progressId, p); }, signal);
-    } finally {
-      settled = true;
-    }
+    await this.runWithSettledGuard(
+      (p) => this.pushPullProgress(progressId, p),
+      (cb) => this.deps.pullModel(endpoint, tag, cb, signal),
+    );
   }
 
   /** One `{op:'pull'}` progress push under the given key — the shared
@@ -2179,6 +2161,25 @@ export class SetupController {
       ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
       ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
     });
+  }
+
+  /** WV3-MIN-FUNC: the ONE settled-flag straggler guard (§7.2.2) — silences
+   *  any progress tick that fires AFTER the wrapped dep's promise settles,
+   *  so it can never race the caller's terminal `done` push (throttle
+   *  single-pending-slot hazard — see runLibraryPull's original doc).
+   *  Extracted verbatim from the five hand-copied sites. */
+  private async runWithSettledGuard(
+    onProgress: (p: PullProgress) => void,
+    run: (guarded: (p: PullProgress) => void) => Promise<void>,
+  ): Promise<void> {
+    let settled = false;
+    try {
+      await run((p) => {
+        if (!settled) onProgress(p);
+      });
+    } finally {
+      settled = true;
+    }
   }
 
   // --- setup.saveAgentModel (beta.6 T8 — §2.5/§6) ---------------------------
