@@ -253,36 +253,43 @@ export class JsonRpcStdio implements Disposable {
       if (line.length > 0) this.handleFrame(line);
     }
 
-    // B-4 (SEC-6): bound the RESIDUAL (post-drain) partial frame, not the
-    // transient pre-drain total — a legitimate burst of many complete
-    // `\n`-terminated frames in one chunk can exceed MAX_LINE_BYTES in
-    // total without ever leaving an oversized unterminated tail behind, and
-    // must not false-trip. What's left here (if anything) is always a
-    // SINGLE partial line still waiting on its terminator.
-    if (this.stdoutBuffer.length > MAX_LINE_BYTES) {
-      const oversizedByteCount = this.stdoutBuffer.length;
-      // Never retain the oversized data and never parse a partial frame —
-      // clear before anything else so no code path downstream can see it.
-      this.stdoutBuffer = '';
-      this.log(
-        `[fatal] residual stdout line exceeded ${MAX_LINE_BYTES} bytes ` +
-          `(${oversizedByteCount} bytes buffered, no terminating newline) — ` +
-          'tearing down transport for respawn',
-      );
-      this.rejectAll(
-        new Error(
-          `JsonRpcStdio: stdout frame exceeded ${MAX_LINE_BYTES} bytes ` +
-            `(${oversizedByteCount} bytes) without a terminating newline`,
-        ),
-      );
-      // Reuse the existing teardown path: dispose() kills the child
-      // (SIGTERM, escalating to SIGKILL) without inventing a parallel error
-      // channel. dispose() does not remove the constructor's 'exit'
-      // listener, so the natural exit -> exitHandlers chain still fires
-      // once the child actually dies — the same signal a crash reaches —
-      // which is what drives an upstream supervisor's respawn (e.g.
-      // ControlChannel.spawnAndAwaitReady's `transport.onExit(...)`).
-      this.dispose();
+    // B-4 (SEC-6) + CA-M01 (WS-AC): bound the RESIDUAL (post-drain) partial
+    // frame in UTF-8 BYTES, not UTF-16 code units — `.length` under-counts
+    // multi-byte text up to 3× (a CJK-heavy line could buffer ~12 MiB of
+    // real bytes before a `.length` check saw 4 Mi "characters"). Cheap
+    // pre-filter: one UTF-16 code unit encodes to AT MOST 3 UTF-8 bytes
+    // (astral pairs: 2 units → 4 bytes = 2 bytes/unit), so when
+    // `length * 3` cannot reach the cap the exact byte count cannot either
+    // and the O(n) `Buffer.byteLength` scan is skipped — the common case
+    // costs nothing. What's left here (if anything) is always a SINGLE
+    // partial line still waiting on its terminator (see the drain loop
+    // above).
+    if (this.stdoutBuffer.length * 3 > MAX_LINE_BYTES) {
+      const residualBytes = Buffer.byteLength(this.stdoutBuffer, 'utf8');
+      if (residualBytes > MAX_LINE_BYTES) {
+        // Never retain the oversized data and never parse a partial frame —
+        // clear before anything else so no code path downstream can see it.
+        this.stdoutBuffer = '';
+        this.log(
+          `[fatal] residual stdout line exceeded ${MAX_LINE_BYTES} bytes ` +
+            `(${residualBytes} bytes buffered, no terminating newline) — ` +
+            'tearing down transport for respawn',
+        );
+        this.rejectAll(
+          new Error(
+            `JsonRpcStdio: stdout frame exceeded ${MAX_LINE_BYTES} bytes ` +
+              `(${residualBytes} bytes) without a terminating newline`,
+          ),
+        );
+        // Reuse the existing teardown path: dispose() kills the child
+        // (SIGTERM, escalating to SIGKILL) without inventing a parallel
+        // error channel. dispose() does not remove the constructor's 'exit'
+        // listener, so the natural exit -> exitHandlers chain still fires
+        // once the child actually dies — the same signal a crash reaches —
+        // which is what drives an upstream supervisor's respawn (e.g.
+        // ControlChannel.spawnAndAwaitReady's `transport.onExit(...)`).
+        this.dispose();
+      }
     }
   }
 

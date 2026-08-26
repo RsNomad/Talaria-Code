@@ -121,6 +121,24 @@ describe('JsonRpcStdio.onStdout — B-4 (SEC-6): cap the residual (post-drain) s
     stdout.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'pong' })}\n`);
     await expect(pending).resolves.toBe('pong');
   });
+
+  it('CA-M01 (WS-AC): a CJK residual line trips the cap by UTF-8 BYTES, not UTF-16 units', async () => {
+    const { transport, stdout, fakeChild } = makeTransport();
+    void transport;
+    // 1.5M CJK chars = 1.5M UTF-16 units (< 4Mi units — the OLD check never
+    // fired) but 4.5 MB UTF-8 bytes (> 4 MiB — the cap's real meaning).
+    stdout.emit('data', '一'.repeat(1_500_000));
+    await Promise.resolve();
+    expect(fakeChild.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  it('CA-M01: a CJK residual UNDER the byte cap does not trip', async () => {
+    const { transport, stdout, fakeChild } = makeTransport();
+    void transport;
+    stdout.emit('data', '一'.repeat(1_000_000)); // 3 MB bytes < 4 MiB
+    await Promise.resolve();
+    expect(fakeChild.kill).not.toHaveBeenCalled();
+  });
 });
 
 /**
