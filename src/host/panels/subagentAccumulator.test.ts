@@ -179,4 +179,21 @@ describe('SubagentAccumulator', () => {
     acc.apply(delegateStart('tc-2', 'delegate: live'));
     expect(typeof must(acc.snapshot().delegations[1]).startedAt).toBe('string');
   });
+
+  it('F1-12: a tool_call whose runtime title is absent (type-only string) is a no-op, not a TypeError', () => {
+    const acc = new SubagentAccumulator();
+    // Wire truth: `title` is REQUIRED by the AcpSessionUpdate type
+    // (types.ts:154) but arrives off untrusted JSON — simulate its absence.
+    const malformed = {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-x',
+      kind: 'execute',
+      status: 'pending',
+      content: null,
+    } as unknown as AcpSessionUpdate;
+
+    expect(() => acc.apply(malformed)).not.toThrow();
+    expect(acc.apply(malformed)).toBe(false);
+    expect(acc.snapshot()).toEqual({ delegations: [] });
+  });
 });

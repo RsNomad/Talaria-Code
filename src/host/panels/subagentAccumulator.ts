@@ -157,12 +157,17 @@ export class SubagentAccumulator {
   }
 
   private applyStart(update: Extract<AcpSessionUpdate, { sessionUpdate: 'tool_call' }>): boolean {
-    if (!isDelegateTaskTitle(update.title)) return false;
+    // F1-12 (WS-BG): `title` is type-REQUIRED on `tool_call` (types.ts:154)
+    // but arrives off untrusted wire JSON — a runtime-absent/non-string
+    // title makes this a non-delegation no-op, never a TypeError. Widened to
+    // `unknown` so the check is honest, not "always true" to the checker.
+    const title: unknown = update.title;
+    if (typeof title !== 'string' || !isDelegateTaskTitle(title)) return false;
 
     const detail = extractToolCallOutputText(update.content) || undefined;
     const node: SubagentNode = {
       id: update.toolCallId,
-      goal: update.title,
+      goal: title,
       status: 'running',
       ...(detail !== undefined ? { detail } : {}),
     };
