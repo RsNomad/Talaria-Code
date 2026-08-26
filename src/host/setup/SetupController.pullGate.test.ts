@@ -89,7 +89,6 @@ function treeFetch(body: unknown, status = 200): typeof fetch {
     ok: status >= 200 && status < 300,
     status,
     statusText: String(status),
-    json: async () => body,
     body: chunkedBody([chunk]),
   })) as unknown as typeof fetch;
 }
