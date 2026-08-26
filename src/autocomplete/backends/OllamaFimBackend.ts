@@ -1,6 +1,7 @@
 import { joinUrl } from '../util';
 import { BackendHttpError, BackendStreamError, readNdjsonLines } from './http';
 import { assertAllScanned } from '../context/assertAllScanned';
+import { isRecord } from '../../shared/typeGuards';
 import type { BackendCapabilities, FimBackend, FimRequest } from '../types';
 
 export interface OllamaFimBackendOptions {
@@ -12,9 +13,9 @@ export interface OllamaFimBackendOptions {
 }
 
 interface OllamaGenerateChunk {
-  response?: string;
-  done?: boolean;
-  error?: string;
+  response?: string | null;
+  done?: boolean | null;
+  error?: unknown;
 }
 
 /**
@@ -102,6 +103,10 @@ export class OllamaFimBackend implements FimBackend {
     }
 
     for await (const raw of readNdjsonLines(response)) {
+      // WS-BG (SYN-BOUNDARY): a non-record NDJSON line off a user-configured
+      // server is junk — skip it exactly like the SSE reader's "no text this
+      // round" posture, never dot into it through a bare cast.
+      if (!isRecord(raw)) continue;
       const chunk = raw as OllamaGenerateChunk;
       if (chunk.error) {
         // Invariant #3 (T6, M6 + ARCH-2): `chunk.error` is runner-generated
@@ -120,10 +125,10 @@ export class OllamaFimBackend implements FimBackend {
         // and reuses that same arm instead of inventing a second one.
         throw new BackendStreamError('Ollama /api/generate reported an error mid-stream');
       }
-      if (chunk.response) {
+      if (typeof chunk.response === 'string' && chunk.response) {
         yield chunk.response;
       }
-      if (chunk.done) {
+      if (chunk.done === true) {
         return;
       }
     }
