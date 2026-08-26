@@ -420,3 +420,21 @@ describe('F2-01/F3-13 (WS-AC): requests against a terminated child fast-fail, ne
     expect(Buffer.concat(written).toString('utf8')).toBe('');
   });
 });
+
+describe('F2-02 (WS-AC): dispose() stops consuming the dead child streams', () => {
+  it('stdout data after dispose is neither buffered nor logged', async () => {
+    const lines: string[] = [];
+    const { child, stdout } = makeFakeChild();
+    vi.mocked(spawn).mockReturnValue(child);
+    const transport = new JsonRpcStdio({
+      command: 'python',
+      args: ['-m', 'tui_gateway.entry'],
+      logger: { append: (l) => lines.push(l) },
+    });
+    transport.dispose();
+    const before = lines.length;
+    stdout.emit('data', '{"jsonrpc":"2.0","method":"ev","params":{}}\n');
+    await Promise.resolve();
+    expect(lines.slice(before).filter((l) => l.includes('←'))).toEqual([]);
+  });
+});

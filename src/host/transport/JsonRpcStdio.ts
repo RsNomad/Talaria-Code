@@ -178,6 +178,9 @@ export class JsonRpcStdio implements Disposable {
         reject(new Error(`request '${method}' (id ${id}) timed out ` +
           `after ${this.requestTimeoutMs}ms`));
       }, this.requestTimeoutMs);
+      // F2-02 (WS-AC): a pending-request timeout must not hold the host's
+      // event loop open by itself — same convention as killTimer below.
+      timer.unref?.();
 
       this.pending.set(id, {
         resolve: resolve as (v: unknown) => void,
@@ -226,6 +229,17 @@ export class JsonRpcStdio implements Disposable {
     this.disposed = true;
     this.rejectAll(new Error('JsonRpcStdio disposed'));
     this.eventHandlers.clear();
+
+    // F2-02 (WS-AC): stop consuming the dead child's streams. The
+    // constructor's child 'exit'/'error' listeners stay ON PURPOSE (the
+    // natural exit → terminate() → exitHandlers chain is the upstream
+    // respawn signal — see this method's TE-1 doc above), and stdin's
+    // 'error' listener stays (a just-issued write can still error
+    // asynchronously and must not crash the host) — but nothing may keep
+    // BUFFERING or LOGGING stdout/stderr after teardown.
+    this.child.stdout?.removeAllListeners('data');
+    this.child.stderr?.removeAllListeners('data');
+    this.stdoutBuffer = '';
 
     if (this.child.exitCode === null && !this.child.killed) {
       this.child.kill('SIGTERM');
