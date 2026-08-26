@@ -519,7 +519,11 @@ const STORE_SPEC: GgufStoreSpec = {
  *  `downloadGgufToStore` is asked to write into — a test overrides it to
  *  simulate a `createStoreTempWrite` binding that (incorrectly) placed the
  *  temp file elsewhere (the SC-4 contract-violation case). */
-function fakeStoreIo(opts: { tempDir?: string } = {}): {
+/** CA-M09: the pre-rename re-lstat classification shape, mirrored from
+ *  {@link GgufStoreIo.lstatKind}. */
+type LstatKind = 'missing' | 'file' | 'dir' | 'symlink' | 'other';
+
+function fakeStoreIo(opts: { tempDir?: string; lstatKinds?: Record<string, LstatKind> } = {}): {
   io: GgufStoreIo;
   ensureDir: ReturnType<typeof vi.fn>;
   removeTemp: ReturnType<typeof vi.fn>;
@@ -531,6 +535,15 @@ function fakeStoreIo(opts: { tempDir?: string } = {}): {
   const tempStore = new Map<string, Uint8Array[]>();
   const order: string[] = [];
   const tempDir = opts.tempDir ?? DEST_DIR;
+  // CA-M09: defaults match the real-world common case — the destination
+  // directory already exists (it was just written into by `ensureDir`) and
+  // the destination file does not exist yet. A test overrides one entry to
+  // simulate a symlink racing into the store path during the download.
+  const lstatKinds: Record<string, LstatKind> = {
+    [DEST_DIR]: 'dir',
+    [DEST_PATH]: 'missing',
+    ...opts.lstatKinds,
+  };
   const ensureDir = vi.fn(async (_dir: string) => {});
   const removeTemp = vi.fn(async (path: string) => {
     tempStore.delete(path);
@@ -562,6 +575,7 @@ function fakeStoreIo(opts: { tempDir?: string } = {}): {
     removeTemp,
     renameTemp,
     writeSidecar,
+    lstatKind: async (p: string): Promise<LstatKind> => lstatKinds[p] ?? 'missing',
   };
   return { io, ensureDir, removeTemp, renameTemp, writeSidecar, closeSpy, order };
 }
@@ -834,5 +848,58 @@ describe('downloadGgufToStore — atomic same-dir file sink (beta.6 T3, §2.4/§
     const downloadEvents = progress.filter((p) => p.completedBytes !== undefined);
     expect(downloadEvents.length).toBeGreaterThanOrEqual(1);
     expect(downloadEvents.at(-1)!.completedBytes).toBe(CONTENT.byteLength);
+  });
+});
+
+describe('CA-M09 (frozen, owner-approved): pre-rename destination re-lstat', () => {
+  it('a symlink raced in at destPath → refuses, removes the .part, writes NO sidecar', async () => {
+    const { io, removeTemp, renameTemp, writeSidecar } = fakeStoreIo({ lstatKinds: { [DEST_PATH]: 'symlink' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toMatchObject({ name: 'GgufStoreSymlinkRaceError' });
+
+    expect(renameTemp).not.toHaveBeenCalled();
+    expect(writeSidecar).not.toHaveBeenCalled();
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
+  it('destDir swapped for a symlink → refuses the same way', async () => {
+    const { io, removeTemp, renameTemp, writeSidecar } = fakeStoreIo({ lstatKinds: { [DEST_DIR]: 'symlink' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toMatchObject({ name: 'GgufStoreSymlinkRaceError' });
+
+    expect(renameTemp).not.toHaveBeenCalled();
+    expect(writeSidecar).not.toHaveBeenCalled();
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
+  it('destPath being an existing regular FILE still proceeds (re-download path unchanged)', async () => {
+    const { io, renameTemp, writeSidecar } = fakeStoreIo({ lstatKinds: { [DEST_PATH]: 'file' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).resolves.toBeUndefined();
+
+    expect(renameTemp).toHaveBeenCalledTimes(1);
+    expect(writeSidecar).toHaveBeenCalledTimes(1);
+  });
+
+  it('the refusal message is path-free', async () => {
+    const { io } = fakeStoreIo({ lstatKinds: { [DEST_PATH]: 'symlink' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toThrow('store destination changed while downloading (possible symlink race) — refusing to place the file');
   });
 });

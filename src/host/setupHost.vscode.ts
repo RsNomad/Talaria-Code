@@ -337,6 +337,22 @@ function createNodeGgufIngestIo(): GgufIngestIo & GgufStoreIo {
     ensureDir: async (dir: string): Promise<void> => {
       await mkdir(dir, { recursive: true });
     },
+    // CA-M09 (frozen commit, owner-approved rev-3): 'missing' on ENOENT;
+    // NEVER follows symlinks (`lstat`, checking `isSymbolicLink()` first);
+    // any other error rejects (fail-closed). Backs the pre-rename
+    // destination re-check in `downloadGgufToStore`.
+    lstatKind: async (p: string): Promise<'missing' | 'file' | 'dir' | 'symlink' | 'other'> => {
+      try {
+        const st = await lstat(p);
+        if (st.isSymbolicLink()) return 'symlink';
+        if (st.isDirectory()) return 'dir';
+        if (st.isFile()) return 'file';
+        return 'other';
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'missing';
+        throw err;
+      }
+    },
     // Same open/write/close discipline as `createTempWrite` above (T14
     // Finding 1's own comment applies verbatim: `destroy()` + wait for the
     // 'close' event, never `end()`'s weaker 'finish') — the ONLY difference

@@ -132,6 +132,10 @@ export interface GgufStoreIo {
   /** `fs.mkdir(dir, {recursive:true})` — called before `createStoreTempWrite`
    *  so the `.part` file always has somewhere to land. */
   ensureDir(dir: string): Promise<void>;
+  /** CA-M09 (frozen commit, owner-approved rev-3): `fs.lstat` classification
+   *  — 'missing' on ENOENT; NEVER follows symlinks; any other error rejects
+   *  (fail-closed). Backs the pre-rename destination re-check. */
+  lstatKind(p: string): Promise<'missing' | 'file' | 'dir' | 'symlink' | 'other'>;
   /** Opens `<destDir>/<random>.part` — INSIDE `destDir`, never `os.tmpdir()`
    *  ({@link GgufIngestIo.createTempWrite}'s own binding) — SC-4. */
   createStoreTempWrite(destDir: string): Promise<TempWriteHandle>;
@@ -253,6 +257,15 @@ export class GgufStoreRenameError extends Error {
   }
 }
 
+/** CA-M09: the pre-rename re-check found the destination changed under us.
+ *  Fixed, path-free message (it reaches webview refusal text). */
+export class GgufStoreSymlinkRaceError extends Error {
+  constructor() {
+    super('store destination changed while downloading (possible symlink race) — refusing to place the file');
+    this.name = 'GgufStoreSymlinkRaceError';
+  }
+}
+
 /** The hard download-size ceiling, computed from the code-pinned
  *  `approxBytes` — NEVER from a response header. A 10% margin absorbs
  *  legitimate rounding between the registry's pinned estimate and the
@@ -364,6 +377,25 @@ export async function downloadGgufToStore(
     // never reached on any of these paths (proven by the RED suite).
     await io.removeTemp(handle.path);
     throw err;
+  }
+
+  // CA-M09 (frozen commit, owner-approved rev-3): re-lstat the destination
+  // IMMEDIATELY before the landing rename — the caller's checkedStoreDest
+  // re-assert ran a whole download ago (the 2-await gap); a symlink raced
+  // into the store path in that window MUST refuse the write. sha256 digest
+  // verification remains the primary integrity control either way.
+  let dirKind: Awaited<ReturnType<typeof io.lstatKind>>;
+  let destKind: Awaited<ReturnType<typeof io.lstatKind>>;
+  try {
+    dirKind = await io.lstatKind(normalizedDestDir);
+    destKind = await io.lstatKind(destPath);
+  } catch (err) {
+    await io.removeTemp(handle.path);
+    throw err;
+  }
+  if (dirKind !== 'dir' || destKind === 'symlink' || destKind === 'dir' || destKind === 'other') {
+    await io.removeTemp(handle.path);
+    throw new GgufStoreSymlinkRaceError();
   }
 
   try {
