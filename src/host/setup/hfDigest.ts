@@ -94,6 +94,41 @@ function hasNextPageLink(response: Response): boolean {
   return /rel\s*=\s*"?next"?/i.test(link);
 }
 
+/** CA-08: tree-body ceiling — allowlisted-publisher GGUF repos have small
+ *  trees; 4 MiB matches the codebase's cap convention (MAX_STREAM_BYTES). */
+const TREE_MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+/** CA-08: bounded body read (local copy — this frozen module imports
+ *  nothing new; see ollamaClient.ts's F2-15 sibling for the shared idiom). */
+async function readTreeBodyBounded(
+  response: Response,
+  maxBytes: number,
+): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+  if (!response.body) {
+    return { ok: false, reason: 'tree API returned no readable body' };
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let received = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        return { ok: false, reason: `tree API response exceeded ${maxBytes} bytes — refusing a possibly truncated/hostile tree` };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return { ok: true, text };
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 /**
  * The shared tree-fetch/shape-validation core (T2 extraction). Fetches the
  * HF tree API for `hfRepo`, applies the 10 s abort + pagination-refuse +
@@ -122,7 +157,15 @@ async function fetchHfTree(fetchImpl: typeof fetch, hfRepo: string): Promise<HfT
     if (!response.ok) {
       return { ok: false, reason: `tree API responded ${response.status}` };
     }
-    body = await response.json();
+    // CA-08 (frozen commit, owner-approved rev-3): byte-cap the tree body
+    // BEFORE parsing — a compromised/MITM'd endpoint streaming an
+    // oversized body must refuse (no OOM, no event-loop stall, no partial
+    // parse), as a 4th refusal arm beside pagination/non-200/shape.
+    const raw = await readTreeBodyBounded(response, TREE_MAX_BODY_BYTES);
+    if (!raw.ok) {
+      return { ok: false, reason: raw.reason };
+    }
+    body = JSON.parse(raw.text);
   } catch (err) {
     return { ok: false, reason: `tree API request failed: ${err instanceof Error ? err.message : String(err)}` };
   } finally {

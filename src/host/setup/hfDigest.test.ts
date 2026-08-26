@@ -45,12 +45,55 @@ function goodTree(): TreeEntry[] {
   ];
 }
 
+/** See ollamaClient.test.ts's identical alias: `ReadableStreamReadResult` isn't a
+ *  global type name under this repo's `lib: ["ES2022"]` tsconfig. */
+type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>;
+
+/** A fake `ReadableStream<Uint8Array>`-shaped body backed by a fixed list of
+ *  already-encoded chunks, delivered one per `read()` call in order (local
+ *  copy of ollamaClient.test.ts's F2-15 idiom — this suite's fetch fakes
+ *  gained streamable bodies for CA-08, WS-SU Task 15). */
+function chunkedBody(chunks: Uint8Array[]): { getReader: () => ReadableStreamDefaultReader<Uint8Array> } {
+  let i = 0;
+  const reader = {
+    read: async (): Promise<StreamReadResult> => {
+      const value = chunks[i];
+      if (value === undefined) {
+        return { value: undefined, done: true };
+      }
+      i += 1;
+      return { value, done: false };
+    },
+    cancel: async () => {},
+    releaseLock: () => {},
+  } as unknown as ReadableStreamDefaultReader<Uint8Array>;
+  return { getReader: () => reader };
+}
+
+// CA-08 (WS-SU Task 15): fetchHfTree now reads the BODY stream (byte-capped)
+// instead of calling response.json() — every 200-fake below carries a real
+// streamable body.
 function fetchReturning(body: unknown, status = 200): typeof fetch {
+  const chunk = new TextEncoder().encode(JSON.stringify(body));
   return vi.fn(async () => ({
     ok: status >= 200 && status < 300,
     status,
     statusText: String(status),
-    json: async () => body,
+    body: chunkedBody([chunk]),
+  })) as unknown as typeof fetch;
+}
+
+/** CA-08: a 200(-by-default) fake whose body is exactly `text`, delivered
+ *  through the same `chunkedBody` reader idiom — lets tests drive
+ *  `fetchHfTree`'s byte-capped body read (and its downstream `JSON.parse`)
+ *  directly, including deliberately oversized or malformed text. */
+function treeFetchWithBody(text: string, status = 200): typeof fetch {
+  const chunk = new TextEncoder().encode(text);
+  return vi.fn(async () => ({
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: String(status),
+    body: chunkedBody([chunk]),
   })) as unknown as typeof fetch;
 }
 
@@ -116,16 +159,8 @@ describe('verifyHfDigest', () => {
     expect(result.ok).toBe(false);
   });
 
-  it('refuses when json() rejects (malformed body)', async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      statusText: 'OK',
-      json: async () => {
-        throw new SyntaxError('bad json');
-      },
-    })) as unknown as typeof fetch;
-    const result = await verifyHfDigest(fetchImpl, GGUF);
+  it('refuses when the body is not valid JSON (malformed body — CA-08: JSON.parse now throws, not response.json())', async () => {
+    const result = await verifyHfDigest(treeFetchWithBody('{not valid json'), GGUF);
     expect(result.ok).toBe(false);
   });
 
@@ -181,6 +216,7 @@ describe('verifyHfDigest', () => {
  *  - never throws: every failure mode resolves to `{ok:false, reason}`.
  */
 function fetchReturningPaginated(body: unknown, status = 200): typeof fetch {
+  const chunk = new TextEncoder().encode(JSON.stringify(body));
   return vi.fn(async () => ({
     ok: status >= 200 && status < 300,
     status,
@@ -191,7 +227,7 @@ function fetchReturningPaginated(body: unknown, status = 200): typeof fetch {
           ? '<https://huggingface.co/api/models/x/tree/main?recursive=true&cursor=abc>; rel="next"'
           : null,
     },
-    json: async () => body,
+    body: chunkedBody([chunk]),
   })) as unknown as typeof fetch;
 }
 
@@ -276,16 +312,8 @@ describe('resolveLfsOid', () => {
     expect(result.ok).toBe(false);
   });
 
-  it('refuses when json() rejects (malformed body)', async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      statusText: 'OK',
-      json: async () => {
-        throw new SyntaxError('bad json');
-      },
-    })) as unknown as typeof fetch;
-    const result = await resolveLfsOid(fetchImpl, REPO, FILE);
+  it('refuses when the body is not valid JSON (malformed body — CA-08: JSON.parse now throws, not response.json())', async () => {
+    const result = await resolveLfsOid(treeFetchWithBody('{not valid json'), REPO, FILE);
     expect(result.ok).toBe(false);
   });
 
@@ -326,4 +354,37 @@ describe('resolveLfsOid', () => {
     expect(url).toBe(`https://huggingface.co/api/models/${REPO}/tree/main?recursive=true`);
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
+});
+
+/**
+ * CA-08 (WS-SU Task 15, frozen zone, owner-approved): `fetchHfTree` reads
+ * the tree body through a byte-capped reader — a 4th refusal arm beside
+ * pagination (:116-121) / non-200 (:122-123) / shape (:132-152). A
+ * compromised/MITM'd endpoint streaming an oversized body must refuse
+ * BEFORE buffering past the ceiling (no OOM, no partial parse).
+ */
+describe('CA-08 (frozen, owner-approved): the tree read is byte-capped', () => {
+  it('an oversized tree body refuses {ok:false} without a partial parse', async () => {
+    const huge = `[${Array.from({ length: 200_000 }, (_, i) => `{"path":"f${i}.bin"}`).join(',')}]`; // > 4 MiB
+    const fetchImpl = treeFetchWithBody(huge);
+    const verdict = await verifyHfDigest(fetchImpl, GGUF);
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.reason).toContain('exceeded');
+  });
+
+  it('a 200 with no readable body refuses {ok:false}', async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: null,
+    })) as unknown as typeof fetch;
+    const result = await verifyHfDigest(fetchImpl, GGUF);
+    expect(result.ok).toBe(false);
+  });
+
+  // 'every existing verify/resolve behavior is unchanged for in-cap bodies':
+  // the pre-existing suite above, running green against the streamed
+  // fixtures (`fetchReturning`/`fetchReturningPaginated`/`treeFetchWithBody`),
+  // IS this assertion — no separate test body needed here.
 });
