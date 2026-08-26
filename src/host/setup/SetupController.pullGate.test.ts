@@ -58,12 +58,39 @@ function goodTree(): TreeEntry[] {
   ];
 }
 
+/** See ollamaClient.test.ts's identical alias: `ReadableStreamReadResult`
+ *  isn't a global type name under this repo's `lib: ["ES2022"]` tsconfig. */
+type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>;
+
+/** A fake `ReadableStream<Uint8Array>`-shaped body backed by a single
+ *  already-encoded chunk (local copy of the F2-15/CA-08 fixture idiom —
+ *  CA-08 makes `fetchHfTree` read the body stream instead of
+ *  `response.json()`; this file drives the REAL `verifyHfDigest`). */
+function chunkedBody(chunks: Uint8Array[]): { getReader: () => ReadableStreamDefaultReader<Uint8Array> } {
+  let i = 0;
+  const reader = {
+    read: async (): Promise<StreamReadResult> => {
+      const value = chunks[i];
+      if (value === undefined) {
+        return { value: undefined, done: true };
+      }
+      i += 1;
+      return { value, done: false };
+    },
+    cancel: async () => {},
+    releaseLock: () => {},
+  } as unknown as ReadableStreamDefaultReader<Uint8Array>;
+  return { getReader: () => reader };
+}
+
 function treeFetch(body: unknown, status = 200): typeof fetch {
+  const chunk = new TextEncoder().encode(JSON.stringify(body));
   return (async () => ({
     ok: status >= 200 && status < 300,
     status,
     statusText: String(status),
     json: async () => body,
+    body: chunkedBody([chunk]),
   })) as unknown as typeof fetch;
 }
 
