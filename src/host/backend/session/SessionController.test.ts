@@ -32,7 +32,7 @@ import * as os from 'node:os';
 import { SessionController } from './SessionController';
 import type { SessionHostPort } from './types';
 import type { RootCoordinatorLike } from '../../checkpoints/RootCoordinator';
-import { buildCancelledOutcome } from '../acp/permission';
+import { buildCancelledOutcome, buildSelectedOutcome } from '../acp/permission';
 import type { AcpRequestPermissionRequest, AcpOutboundContentBlock } from '../acp/types';
 import type { AcpClientLike, AcpListSessionsRawResult, AcpLoadSessionResult } from '../acp/acpClient';
 import type { Attachment, HostToWebviewMessage } from '../../../shared/protocol';
@@ -2414,5 +2414,103 @@ describe('SessionController.cancel — WS-SL preemptive tool-cancel marking', ()
     const { controller, emitted } = makeCancelMarkHarness();
     controller.cancel();
     expect(emitted.some((m) => m.type === 'tool.update')).toBe(false);
+  });
+});
+
+describe('SessionController.resolveDiff — BHF-F1-3 (firm): junk hunk indices never count toward the accept threshold', () => {
+  const tmpDirs: string[] = [];
+  function makeTmpWs(): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-sc-f13-ws-'));
+    tmpDirs.push(dir);
+    return dir;
+  }
+  afterEach(() => {
+    while (tmpDirs.length) {
+      const dir = tmpDirs.pop()!;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+
+  /** A hanging `AcpClientLike` (mirrors the T-A0 describe's
+   *  `makeApprovalClient`): `prompt` never resolves, so `sendPrompt` below
+   *  keeps a LIVE turn (`currentTurnId` set) for the whole test — required
+   *  because `emitApprovalCard`'s `isStaleApprovalRegistration` guard
+   *  (`SessionController.ts:1152-1158`) short-circuits to a cancelled
+   *  no-registration outcome whenever `currentTurnId === undefined`, which
+   *  would otherwise mask the vulnerability under test (no hunk state would
+   *  ever be registered for `resolveDiff` to mis-accept). */
+  function makeHangingEditClient(): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in a BHF-F1-3 test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt: () => new Promise<never>(() => {}),
+      cancel: async () => undefined,
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  /** Registers ONE pending edit approval (1 hunk: 'a' -> 'b') and waits for
+   *  the approval.request emit — the same headless handlePermission seam the
+   *  BF-B describe above drives, with a live turn (see `makeHangingEditClient`)
+   *  so the approval actually registers instead of short-circuiting cancelled. */
+  async function makePendingEditApproval() {
+    const ws = makeTmpWs();
+    const { port, emitted, logs } = makePort(ws);
+    const liveClientPort: SessionHostPort = { ...port, getClient: () => makeHangingEditClient() };
+    const controller = new SessionController('session-1', ws, liveClientPort);
+    controller.sendPrompt('edit it', 'default');
+    const pending = controller.handlePermission(makeEditReq('src/a.ts'), 'appr-1');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => (m as { type?: string }).type === 'approval.request')).toBe(true);
+    });
+    return { controller, pending, emitted, logs };
+  }
+
+  it('RED-pin: an out-of-range accept (index 999 on a 1-hunk diff) must NOT settle the approval; a valid index still does', async () => {
+    const { controller, pending, emitted } = await makePendingEditApproval();
+
+    controller.resolveDiff('edit-1', 999, 'accept');
+    expect(emitted.some((m) => (m as { type?: string }).type === 'approval.settle')).toBe(false);
+
+    controller.resolveDiff('edit-1', 0, 'accept');
+    const res = await pending;
+    expect(res).toEqual(buildSelectedOutcome('allow_once'));
+  });
+
+  it.each([[-1], [0.5], [Number.NaN], [1]])(
+    'junk/out-of-range index %p is refused, logged, and counts for nothing',
+    async (idx) => {
+      const { controller, pending, emitted, logs } = await makePendingEditApproval();
+
+      controller.resolveDiff('edit-1', idx, 'accept');
+
+      expect(emitted.some((m) => (m as { type?: string }).type === 'approval.settle')).toBe(false);
+      expect(logs.some((l) => l.includes('ignoring out-of-range hunkIndex'))).toBe(true);
+
+      // Cleanup: settle the still-pending approval so its 60s auto-deny
+      // timer does not outlive the test (dispose() cancels fail-closed).
+      controller.dispose();
+      await pending;
+    },
+  );
+
+  it('acceptWholeFileDiff still settles through valid indices 0..totalHunks-1', async () => {
+    const { controller, pending } = await makePendingEditApproval();
+    controller.acceptWholeFileDiff('edit-1');
+    const res = await pending;
+    expect(res).toEqual(buildSelectedOutcome('allow_once'));
   });
 });

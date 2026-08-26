@@ -703,6 +703,20 @@ export class SessionController {
       return;
     }
 
+    // BHF-F1-3 (WS-BG, owner-adjudicated FIRM): `hunkIndex` arrives off the
+    // webview wire (`diff.resolve`, protocol.ts:2240-2246). A junk index —
+    // non-integer, negative, or >= totalHunks — used to land in `decisions`
+    // and count toward the `decisions.size >= totalHunks` accept threshold
+    // below, so a hostile/buggy webview could satisfy the "all hunks
+    // decided => allow" invariant with ZERO real hunks decided. Refuse it
+    // loudly (ids/counts only in the log — no content) and count nothing.
+    if (!Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= hunks.totalHunks) {
+      this.port.logger?.append(
+        `[SessionController] resolveDiff: ignoring out-of-range hunkIndex ${String(hunkIndex)} for tool '${toolId}' (totalHunks=${hunks.totalHunks})`,
+      );
+      return;
+    }
+
     hunks.decisions.set(hunkIndex, action);
     if (hunks.decisions.size >= hunks.totalHunks) {
       this.finishApproval(approvalId, findOptionId(pending.options, 'allow_once') ?? 'allow_once');
