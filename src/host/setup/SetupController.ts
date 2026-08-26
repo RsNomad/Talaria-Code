@@ -413,6 +413,9 @@ export interface SetupControllerDeps {
 // --- misc constants -------------------------------------------------------
 
 const PROGRESS_THROTTLE_MS = 150;
+/** CA-M18: single-flight, short-TTL memo window over {@link
+ *  SetupController.safeProbeOllama} — see that method's doc for why. */
+export const OLLAMA_PROBE_MEMO_TTL_MS = 1_000;
 /** F2-16: the refusal every post-dispose mutating latch gets — a closed
  *  literal (webview-rendered), matching the file's terse refusal style. */
 export const SETUP_DISPOSED_REFUSAL = 'setup controller disposed';
@@ -754,6 +757,14 @@ export class SetupController {
   private readonly statusChangedEmitter = new Emitter<void>();
   readonly onStatusChanged: Event<void> = this.statusChangedEmitter.event;
 
+  /** CA-M18: any state change that re-pushes SetupData ALSO invalidates the
+   *  probe memo — the resulting status() pass reflects post-change truth,
+   *  while the two pushes it triggers still share ONE fresh probe. */
+  private bumpStatus(): void {
+    this.ollamaProbeMemo = undefined;
+    this.statusChangedEmitter.fire();
+  }
+
   /** Keyed `${op}:${id}` (`install:<backendId>` / `pull:<model>`) — presence = single-flight latch (FM-12); the held `AbortController` is what `setup.cancel` interrupts. */
   private readonly inFlight = new Map<string, AbortController>();
   private readonly throttle = new Map<string, ThrottleState>();
@@ -861,6 +872,10 @@ export class SetupController {
     // epoch is the only guard; its late settle is dropped (epoch mismatch)
     // instead of writing state or firing into the disposed emitter.
     this.hermesDiscoveryEpoch += 1;
+    // CA-M18: drop the Ollama probe memo too — an in-flight probe's late
+    // settle is harmless (it resolves the stored promise, nothing more),
+    // but a disposed controller must never SERVE a memoized result again.
+    this.ollamaProbeMemo = undefined;
     this.progressEmitter.dispose();
     this.statusChangedEmitter.dispose();
   }
@@ -1177,7 +1192,7 @@ export class SetupController {
       this.llamaCppRuntime = settled;
       this.llamaCppProbeInFlight = false;
       this.llamaCppProbeAbort = undefined;
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
     })();
   }
 
@@ -1353,7 +1368,7 @@ export class SetupController {
       // after the user's CONFIRM — never at the in-flight latch above (which
       // is set BEFORE the modal, so firing there would push a phase the user
       // hasn't agreed to yet).
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
 
       let located: PipxLocateResult;
       try {
@@ -1365,7 +1380,7 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
-        this.statusChangedEmitter.fire();
+        this.bumpStatus();
         return { ok: false, reason: detail };
       }
       if (!located.ok) {
@@ -1380,7 +1395,7 @@ export class SetupController {
         // to the generic 'error' phase (the detail line carries the specifics).
         const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
         this.lastAgentIssue = { phase, detail };
-        this.statusChangedEmitter.fire();
+        this.bumpStatus();
         const reason =
           located.reason === 'pipx-missing' ? composeBootstrap(await this.resolveOs()).guidance : detail;
         return { ok: false, reason };
@@ -1397,7 +1412,7 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
-        this.statusChangedEmitter.fire();
+        this.bumpStatus();
         return { ok: false, reason: detail };
       }
 
@@ -1420,11 +1435,11 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
-        this.statusChangedEmitter.fire();
+        this.bumpStatus();
         return { ok: false, reason: detail };
       }
       this.awaitingReload = true;
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
       this.host.offerReload();
       return { ok: true };
     } finally {
@@ -1449,7 +1464,7 @@ export class SetupController {
       // only surface (§0.1 ②); `handleInstall`'s own catch below fires again
       // once the rejection propagates, which the provider's seq guard
       // safely collapses with this one.
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
       this.pushProgress({ op: 'install', id: backendId, phase: event.phase, line: detail });
     } else if (event.kind === 'done') {
       this.pushProgress({ op: 'install', id: backendId, phase: 'verify', line: 'Install verified.' });
@@ -2117,7 +2132,7 @@ export class SetupController {
     }
     // Presence flips: the sidecar now exists, so the next status() scan reads
     // present — fire so the panel re-fetches without waiting for a user poke.
-    this.statusChangedEmitter.fire();
+    this.bumpStatus();
     return { ok: true };
   }
 
@@ -2390,6 +2405,10 @@ export class SetupController {
    * (rev-2 critic fold).
    */
   private async handleRecheck(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    // CA-M18: an explicit user re-probe always drops the memo, regardless of
+    // scope — the completion fire below must reflect a FRESH Ollama probe,
+    // not a stale in-window one.
+    this.ollamaProbeMemo = undefined;
     const scope = validateRecheckScope(params);
     if (scope === undefined) {
       return { ok: false, reason: "scope must be one of 'all', 'agent', 'os', 'ollama', 'llamacpp'." };
@@ -2438,7 +2457,7 @@ export class SetupController {
     // write above) — recheck is read-only/no-modal, so "the recheck
     // completed" is itself the single meaningful state-change signal,
     // whether it cleared the sticky issue or refreshed it.
-    this.statusChangedEmitter.fire();
+    this.bumpStatus();
     return { ok: true };
   }
 
@@ -2600,10 +2619,10 @@ export class SetupController {
     const force = bool(params, 'force');
     try {
       const result = await reconnect(force === true ? { force: true } : undefined);
-      this.statusChangedEmitter.fire(); // handleRecheck's single completion-fire posture (:2069-2073)
+      this.bumpStatus(); // handleRecheck's single completion-fire posture (:2069-2073)
       return result;
     } catch (err) {
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
       return { ok: false, reason: this.redact(errorMessage(err)) };
     }
   }
@@ -2754,7 +2773,7 @@ export class SetupController {
       if (epoch !== this.hermesDiscoveryEpoch) return; // superseded — the fresh probe (or a recheck clear) owns the state
       this.hermesPathDiscovery = settled;
       this.hermesDiscoveryProbeInFlight = false;
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
     })();
   }
 
@@ -2815,12 +2834,29 @@ export class SetupController {
     return option;
   }
 
-  private async safeProbeOllama(endpoint: string): Promise<OllamaStatus> {
-    try {
-      return await this.deps.probeOllama(endpoint);
-    } catch (err) {
-      return { running: false, detail: this.redact(errorMessage(err)) };
+  /** CA-M18: single-flight, short-TTL memo over the network Ollama probe —
+   *  the two back-to-back SetupData pushes ONE mutation triggers (provider
+   *  post-handle + onStatusChanged) share one probe instead of two. The
+   *  PROMISE is stored at issue time, so concurrent status() calls join the
+   *  in-flight probe. Invalidated by {@link bumpStatus}, `setup.recheck`,
+   *  and {@link dispose}. */
+  private ollamaProbeMemo: { endpoint: string; startedAt: number; result: Promise<OllamaStatus> } | undefined;
+
+  private safeProbeOllama(endpoint: string): Promise<OllamaStatus> {
+    const now = Date.now();
+    const memo = this.ollamaProbeMemo;
+    if (memo !== undefined && memo.endpoint === endpoint && now - memo.startedAt < OLLAMA_PROBE_MEMO_TTL_MS) {
+      return memo.result;
     }
+    const result = (async (): Promise<OllamaStatus> => {
+      try {
+        return await this.deps.probeOllama(endpoint);
+      } catch (err) {
+        return { running: false, detail: this.redact(errorMessage(err)) };
+      }
+    })();
+    this.ollamaProbeMemo = { endpoint, startedAt: now, result };
+    return result;
   }
 
   /** T6 M-3 carry-forward: replace the real home directory with `~` in any

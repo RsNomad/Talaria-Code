@@ -16,6 +16,7 @@ import {
   MODAL_UNSAFE_TEXT_PATTERN,
   SETUP_DISPOSED_REFUSAL,
   pruneExpiredThrottleEntries,
+  OLLAMA_PROBE_MEMO_TTL_MS,
   type SetupHost,
   type SetupControllerDeps,
   type ThrottleState,
@@ -3793,5 +3794,34 @@ describe('T6 (CC-2): setup.testRemote result widening — {ok:true, models} when
     const { controller } = makeController({}, { probeRemote: async () => ({ ok: true, detail: 'ok' }) });
     const result = await controller.handle('setup.testRemote', { backendId: 'ollama' });
     expect(result).toEqual({ ok: true });
+  });
+});
+
+// --- WS-SU Task 9 (CA-M18): single-flight, short-TTL memo over safeProbeOllama ---
+
+describe('CA-M18: back-to-back status() passes share ONE Ollama probe', () => {
+  it('two immediate status() calls probe once; TTL expiry probes again', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const probeOllama = vi.fn().mockResolvedValue({ running: false, detail: 'down' });
+    const { controller } = makeController({}, { probeOllama });
+    await controller.status();
+    await controller.status();
+    expect(probeOllama).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(1_000_000 + OLLAMA_PROBE_MEMO_TTL_MS + 1);
+    await controller.status();
+    expect(probeOllama).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it('a status-changing completion invalidates the memo (the completion push sees fresh truth)', async () => {
+    const probeOllama = vi.fn().mockResolvedValue({ running: true, models: [] });
+    const { controller } = makeController({}, { probeOllama });
+    await controller.status(); // memo armed
+    // any successful mutation that fires onStatusChanged — use setup.recheck
+    // if no cheaper seam exists in the fixture; the assertion is the same:
+    await controller.handle('setup.recheck', {});
+    await controller.status();
+    expect(probeOllama).toHaveBeenCalledTimes(2);
   });
 });
