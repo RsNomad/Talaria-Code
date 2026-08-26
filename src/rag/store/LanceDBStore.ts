@@ -11,6 +11,7 @@ import * as lancedb from '@lancedb/lancedb';
 // identity is safe by design.
 import { Field, FixedSizeList, Float32, Int32, Schema, Utf8 } from 'apache-arrow';
 
+import { isRecord } from '../../shared/typeGuards';
 import { fuseHybridRows, type StoredRow } from './fuseHybridRows';
 import type { ChunkRecord, SearchFilter, SearchHit, VectorStore } from './VectorStore';
 
@@ -94,6 +95,32 @@ function toStoreRow(record: ChunkRecord): Record<string, unknown> {
  */
 export function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
+}
+
+/**
+ * WS-BG (SYN-BOUNDARY): shallow row-shape guard over rows returned by the
+ * native binding's `.toArray()` — unknown-in-truth (an older or corrupt
+ * index is free to hold anything; the same distrust `isWellFormedVector`
+ * codifies for the write path, `embedder.ts`). Exactly the RESULT_COLUMNS
+ * fields `fuseHybridRows` reads, at the depth it reads them; `language`
+ * tolerates `null` (nullable column — `toStoreRow` writes `null` on
+ * purpose). Exported for test (mirrors `escapeSqlLiteral` above).
+ */
+export function isStoredRow(x: unknown): x is StoredRow {
+  return (
+    isRecord(x) &&
+    typeof x.id === 'string' &&
+    typeof x.path === 'string' &&
+    typeof x.startLine === 'number' &&
+    typeof x.endLine === 'number' &&
+    typeof x.content === 'string' &&
+    (x.language == null || typeof x.language === 'string')
+  );
+}
+
+/** WS-BG: the `listFileHashes` projection's row guard. Exported for test. */
+export function isFileHashRow(x: unknown): x is { path: string; contentHash: string } {
+  return isRecord(x) && typeof x.path === 'string' && typeof x.contentHash === 'string';
 }
 
 /**
@@ -186,7 +213,17 @@ export class LanceDBStore implements VectorStore {
    * once the first failure has been recorded.
    */
   private ftsRepairAttempted = false;
+  /** WS-BG: once-per-instance malformed-row warning (mirrors `ftsRepairAttempted`). */
+  private rowShapeWarned = false;
   private readonly connectImpl: typeof lancedb.connect;
+
+  private warnMalformedRowsOnce(dropped: number): void {
+    if (this.rowShapeWarned) return;
+    this.rowShapeWarned = true;
+    console.error(
+      `hermes-codebase: dropped ${dropped} malformed row(s) from a store query (older or corrupt index?) — results may be incomplete until a re-index`,
+    );
+  }
 
   /**
    * TA-4 (AU-22, Med) / Rev-1 A5 — named seam: `LanceDBStore` built its own
@@ -366,14 +403,19 @@ export class LanceDBStore implements VectorStore {
 
   async listFileHashes(): Promise<Record<string, string>> {
     if (!this.table) return {};
-    const rows = (await this.table
-      .query()
-      .select(['path', 'contentHash'])
-      .toArray()) as Array<{ path: string; contentHash: string }>;
+    const rows: unknown[] = await this.table.query().select(['path', 'contentHash']).toArray();
     const result: Record<string, string> = {};
+    let dropped = 0;
     for (const row of rows) {
+      // WS-BG: a malformed row is SKIPPED — its file then reads as changed
+      // and simply gets re-indexed (the self-healing direction).
+      if (!isFileHashRow(row)) {
+        dropped += 1;
+        continue;
+      }
       result[row.path] = row.contentHash;
     }
+    if (dropped > 0) this.warnMalformedRowsOnce(dropped);
     return result;
   }
 
@@ -431,11 +473,12 @@ export class LanceDBStore implements VectorStore {
       // — never silently degraded like the FTS leg below.
       throw vecOutcome.reason;
     }
-    const vecRows = vecOutcome.value as StoredRow[];
+    const vecRaw = vecOutcome.value;
+    const vecRows = vecRaw.filter(isStoredRow);
 
     let ftsRows: StoredRow[] = [];
     if (ftsOutcome.status === 'fulfilled') {
-      ftsRows = ftsOutcome.value as StoredRow[];
+      ftsRows = ftsOutcome.value.filter(isStoredRow);
     } else if (!this.ftsRepairAttempted) {
       // Degrade-visibly-not-silently: log once per store instance (not once
       // per search — a broken FTS index would otherwise spam the log on
@@ -451,6 +494,11 @@ export class LanceDBStore implements VectorStore {
         console.error('hermes-codebase: FTS index repair attempt failed', err);
       });
     }
+
+    const droppedHybrid =
+      vecRaw.length - vecRows.length +
+      (ftsOutcome.status === 'fulfilled' ? ftsOutcome.value.length - ftsRows.length : 0);
+    if (droppedHybrid > 0) this.warnMalformedRowsOnce(droppedHybrid);
 
     return fuseHybridRows(vecRows, ftsRows, k);
   }
