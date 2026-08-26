@@ -4,6 +4,7 @@ import {
   buildEmbeddingsRequestBody,
   EMBED_TIMEOUT_MS,
   HttpEmbedder,
+  isEmbeddingsResponseEnvelope,
   parseEmbeddingsResponse,
   type EmbeddingsResponse,
 } from './embedder';
@@ -77,18 +78,21 @@ describe('parseEmbeddingsResponse', () => {
   });
 });
 
-describe('HttpEmbedder', () => {
-  function fakeFetch(handler: (url: string, init: RequestInit) => EmbeddingsResponse) {
-    const calls: Array<{ url: string; init: RequestInit }> = [];
-    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
-      const urlStr = String(url);
-      calls.push({ url: urlStr, init: init as RequestInit });
-      const body = handler(urlStr, init as RequestInit);
-      return new Response(JSON.stringify(body), { status: 200 });
-    }) as unknown as typeof fetch;
-    return { fetchImpl, calls };
-  }
+// Module-scope (not describe-local): a pure test harness with no closure over
+// describe-block state, shared by `HttpEmbedder` and the WS-BG envelope-guard
+// suite appended below.
+function fakeFetch(handler: (url: string, init: RequestInit) => EmbeddingsResponse) {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+    const urlStr = String(url);
+    calls.push({ url: urlStr, init: init as RequestInit });
+    const body = handler(urlStr, init as RequestInit);
+    return new Response(JSON.stringify(body), { status: 200 });
+  }) as unknown as typeof fetch;
+  return { fetchImpl, calls };
+}
 
+describe('HttpEmbedder', () => {
   it('posts to {endpoint}/v1/embeddings with the batch input', async () => {
     const { fetchImpl, calls } = fakeFetch(() => ({
       data: [
@@ -389,5 +393,33 @@ describe('CF-21: bounded read (4 MiB cap) on the embeddings response', () => {
       /response exceeded \d+ bytes without completing/,
     );
     expect(cancelled).toBe(true);
+  });
+});
+
+describe('isEmbeddingsResponseEnvelope — WS-BG shallow envelope guard', () => {
+  it('accepts the documented { data: [...] } envelope', () => {
+    expect(isEmbeddingsResponseEnvelope({ data: [] })).toBe(true);
+    expect(isEmbeddingsResponseEnvelope({ data: [{ index: 0, embedding: [1] }] })).toBe(true);
+  });
+
+  it.each([[null], ['nope'], [42], [[]], [{}], [{ data: 'not-an-array' }], [{ data: {} }]])(
+    'refuses %p',
+    (body) => {
+      expect(isEmbeddingsResponseEnvelope(body)).toBe(false);
+    },
+  );
+});
+
+describe('HttpEmbedder — WS-BG: a malformed envelope is refused honestly, not as an opaque TypeError', () => {
+  it('rejects with the named envelope message for a non-object body', async () => {
+    const { fetchImpl } = fakeFetch(() => 'garbage' as unknown as EmbeddingsResponse);
+    const embedder = new HttpEmbedder({ endpoint: 'http://x', model: 'm', fetchImpl });
+    await expect(embedder.embed(['a'])).rejects.toThrow(/was not the documented \{ data:/);
+  });
+
+  it('rejects with the named envelope message when data is missing', async () => {
+    const { fetchImpl } = fakeFetch(() => ({}) as EmbeddingsResponse);
+    const embedder = new HttpEmbedder({ endpoint: 'http://x', model: 'm', fetchImpl });
+    await expect(embedder.embed(['a'])).rejects.toThrow(/was not the documented \{ data:/);
   });
 });
