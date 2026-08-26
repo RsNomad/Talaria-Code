@@ -550,6 +550,65 @@ describe('LlamaCppInfillBackend.streamFim — F4: optional apiKey (S4.2 transpor
  * "fetch never called" assertion below rather than a rejection assertion
  * (warmUp returns `void`, not a rejecting promise).
  */
+describe('LlamaCppInfillBackend.streamFim — WS-BG ingress shape guard', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function cleanReq(): FimRequest {
+    return {
+      model: 'qwen2.5-coder:1.5b-base',
+      prefix: 'const x = ',
+      suffix: '',
+      stop: [],
+      temperature: 0.01,
+      maxTokens: 128,
+      context: {
+        filepath: 'file:///a.ts',
+        languageId: 'typescript',
+        prefix: 'const x = ',
+        suffix: '',
+        workspaceUris: [],
+        snippets: [snippet({ content: 'const a = 1;' })],
+      },
+    };
+  }
+
+  async function collect(body: unknown): Promise<string[]> {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okJsonResponse(body)));
+    const backend = new LlamaCppInfillBackend({ apiBase: 'http://127.0.0.1:8080' });
+    const parts: string[] = [];
+    for await (const t of backend.streamFim(cleanReq(), new AbortController().signal)) parts.push(t);
+    return parts;
+  }
+
+  it.each([['a bare string', 'nope'], ['an array', ['content']], ['a number', 42]])(
+    '%s ok-body is refused loudly',
+    async (_label, body) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okJsonResponse(body)));
+      const backend = new LlamaCppInfillBackend({ apiBase: 'http://127.0.0.1:8080' });
+      const iterator = backend.streamFim(cleanReq(), new AbortController().signal)[Symbol.asyncIterator]();
+      await expect(iterator.next()).rejects.toThrow(/unrecognized response shape/);
+    },
+  );
+
+  it('a wrong-typed content field (content: 42) is refused — never yielded as fake completion text', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(okJsonResponse({ content: 42 })));
+    const backend = new LlamaCppInfillBackend({ apiBase: 'http://127.0.0.1:8080' });
+    const iterator = backend.streamFim(cleanReq(), new AbortController().signal)[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toThrow(/unrecognized response shape/);
+  });
+
+  it('null/absent content stays tolerated (yields nothing)', async () => {
+    expect(await collect({ content: null })).toEqual([]);
+    expect(await collect({})).toEqual([]);
+  });
+
+  it('the happy path is unchanged', async () => {
+    expect(await collect({ content: 'const x = 1;' })).toEqual(['const x = 1;']);
+  });
+});
+
 describe('LlamaCppInfillBackend.warmUp — F4: optional apiKey', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
