@@ -68,6 +68,7 @@ import { joinUrl } from '../util';
 import { BackendHttpError, readJsonBounded } from '../backends/http';
 import { assertSecureAuthTransport } from '../backends/secureTransport';
 import { mintScannedNextEditRequest } from './scan';
+import { isRecord } from '../../shared/typeGuards';
 import type { NextEditTransportId, ScannedNextEditRequest } from './types';
 import type { NextEditModelOutput, RenderedNextEditPrompt, StopReason } from './formats/types';
 
@@ -111,15 +112,40 @@ export function clearNextEditBackendWarnings(): void {
  *  `done_reason` case (`08` §5.3) is covered by the same `undefined`/
  *  not-'stop'/not-'length' fallthrough as a genuinely absent field. */
 interface OllamaGenerateResponse {
-  response?: string;
-  done?: boolean;
-  done_reason?: string;
+  response?: string | null;
+  done?: boolean | null;
+  done_reason?: string | null;
 }
 
 /** openai-compat `/v1/completions` (non-streaming) response shape — only
  *  the fields this backend reads, from `choices[0]`. */
 interface OpenAiCompletionResponse {
-  choices?: { text?: string; finish_reason?: string }[];
+  choices?: { text?: string | null; finish_reason?: string | null }[] | null;
+}
+
+/** WS-BG (SYN-BOUNDARY): shallow ingress guards — exactly the fields the
+ *  two predict paths read, at the depth they read them (ADR-BG). `null` is
+ *  tolerated wherever the downstream `??` read already tolerates it. */
+function isOllamaGenerateResponse(x: unknown): x is OllamaGenerateResponse {
+  return (
+    isRecord(x) &&
+    (x.response == null || typeof x.response === 'string') &&
+    (x.done_reason == null || typeof x.done_reason === 'string')
+  );
+}
+
+function isOpenAiCompletionResponse(x: unknown): x is OpenAiCompletionResponse {
+  if (!isRecord(x)) return false;
+  const choices = x.choices;
+  if (choices == null) return true;
+  if (!Array.isArray(choices)) return false;
+  const first: unknown = choices[0];
+  if (first === undefined) return true;
+  if (!isRecord(first)) return false;
+  return (
+    (first.text == null || typeof first.text === 'string') &&
+    (first.finish_reason == null || typeof first.finish_reason === 'string')
+  );
 }
 
 /**
@@ -260,8 +286,16 @@ export class NextEditHttpBackend {
     // Ollama's non-streaming /api/generate body is bounded by our own
     // num_predict, but a hostile/misconfigured server is free to send
     // anything; readJsonBounded caps it.
-    const data = (await readJsonBounded(response)) as OllamaGenerateResponse;
-    return { text: data.response ?? '', stopReason: normalizeStopReason(data.done_reason) };
+    const raw = await readJsonBounded(response);
+    if (!isOllamaGenerateResponse(raw)) {
+      // WS-BG: an ok-status body that isn't the documented response shape is
+      // a misbehaving/misconfigured server — refuse loudly. Status-only
+      // message, NEVER body content (C-5 hygiene).
+      throw new Error(
+        `Next-edit Ollama /api/generate returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+      );
+    }
+    return { text: raw.response ?? '', stopReason: normalizeStopReason(raw.done_reason ?? undefined) };
   }
 
   private async predictOpenAiCompat(
@@ -314,8 +348,15 @@ export class NextEditHttpBackend {
 
     // D1: bounded read (4 MiB cap), not the unbounded response.json() —
     // same rationale as predictOllama above.
-    const data = (await readJsonBounded(response)) as OpenAiCompletionResponse;
-    const choice = data.choices?.[0];
-    return { text: choice?.text ?? '', stopReason: normalizeStopReason(choice?.finish_reason) };
+    const raw = await readJsonBounded(response);
+    if (!isOpenAiCompletionResponse(raw)) {
+      // WS-BG: same refusal posture as predictOllama above (C-5 hygiene:
+      // status only, never body content).
+      throw new Error(
+        `Next-edit openai-compat /v1/completions returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+      );
+    }
+    const choice = raw.choices?.[0];
+    return { text: choice?.text ?? '', stopReason: normalizeStopReason(choice?.finish_reason ?? undefined) };
   }
 }
