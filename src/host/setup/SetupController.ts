@@ -129,6 +129,14 @@ export interface SetupHost {
   runInTerminal(name: string, shellPath: string, shellArgs: string[]): void;
   getSetting<T>(key: string): T | undefined;
   updateSettingGlobal(key: string, value: unknown): Promise<void>;
+  /**
+   * F2-17: the GLOBAL-scope stored value of `key` (VS Code
+   * `inspect(key)?.globalValue`) — `undefined` = not set at Global scope.
+   * Backs {@link SetupController.writeSettingsBatch}'s exact rollback.
+   * OPTIONAL (the `discoverHermes` idiom): every existing host fake keeps
+   * compiling; when absent the batch skips rollback and SAYS so.
+   */
+  inspectSettingGlobal?(key: string): unknown;
   secrets: {
     store(key: string, v: string): Promise<void>;
     has(key: string): Promise<boolean>;
@@ -1448,6 +1456,56 @@ export class SetupController {
     }
   }
 
+  /**
+   * F2-17: one multi-key Global settings write as a DISCLOSED transaction —
+   * sequential writes; on the first failure, best-effort rollback of every
+   * key already written (to its exact prior Global value via the optional
+   * {@link SetupHost.inspectSettingGlobal} seam) and an honest per-key
+   * disclosure in the reason. Reasons carry closed `talaria.*` key literals
+   * and a redacted error only — never setting VALUES (webview-bound).
+   */
+  private async writeSettingsBatch(
+    writes: ReadonlyArray<readonly [string, unknown]>,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const inspect = this.host.inspectSettingGlobal?.bind(this.host);
+    const written: Array<readonly [string, unknown]> = [];
+    for (const [key, value] of writes) {
+      const prior = inspect?.(key);
+      try {
+        await this.host.updateSettingGlobal(key, value);
+      } catch (err) {
+        const detail = this.redact(errorMessage(err));
+        if (written.length === 0) {
+          return { ok: false, reason: `settings write failed at '${key}' (${detail}) — no other keys were changed.` };
+        }
+        if (inspect === undefined) {
+          return {
+            ok: false,
+            reason:
+              `settings write failed at '${key}' (${detail}) — already written and NOT rolled back: ` +
+              `${written.map(([k]) => k).join(', ')}. Re-apply to finish, or revert in settings.json.`,
+          };
+        }
+        const restored: string[] = [];
+        const failed: string[] = [];
+        for (const [k, prev] of written) {
+          try {
+            await this.host.updateSettingGlobal(k, prev);
+            restored.push(k);
+          } catch {
+            failed.push(k);
+          }
+        }
+        const parts = [`settings write failed at '${key}' (${detail}).`];
+        if (restored.length > 0) parts.push(`Rolled back: ${restored.join(', ')}.`);
+        if (failed.length > 0) parts.push(`Rollback FAILED for: ${failed.join(', ')} — check settings.json.`);
+        return { ok: false, reason: parts.join(' ') };
+      }
+      written.push([key, prior] as const);
+    }
+    return { ok: true };
+  }
+
   // --- setup.applyAgent ------------------------------------------------------
 
   private async handleApplyAgent(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
@@ -1465,9 +1523,8 @@ export class SetupController {
       'Activate',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
-    for (const [settingKey, value] of entries) {
-      await this.host.updateSettingGlobal(settingKey, value);
-    }
+    const wrote = await this.writeSettingsBatch(entries.map(([k, v]) => [k, v] as const));
+    if (!wrote.ok) return wrote;
     this.host.offerReload();
     return { ok: true };
   }
@@ -1509,12 +1566,12 @@ export class SetupController {
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
 
-    await this.host.updateSettingGlobal('talaria.autocomplete.backend', backendId);
-    await this.host.updateSettingGlobal('talaria.autocomplete.endpoint', validated.url);
-    if (model) {
-      await this.host.updateSettingGlobal('talaria.autocomplete.model', model);
-    }
-    return { ok: true };
+    const writes: Array<readonly [string, unknown]> = [
+      ['talaria.autocomplete.backend', backendId],
+      ['talaria.autocomplete.endpoint', validated.url],
+    ];
+    if (model) writes.push(['talaria.autocomplete.model', model]);
+    return this.writeSettingsBatch(writes);
   }
 
   // --- setup.setApiKey --------------------------------------------------------
@@ -2138,10 +2195,12 @@ export class SetupController {
     if (bool(params, 'clear') === true) {
       const confirmed = await this.host.showModal(CLEAR_AGENT_MODEL_MODAL, 'Clear');
       if (!confirmed) return { ok: false, reason: 'declined' };
-      await this.host.updateSettingGlobal('talaria.agent.localModel.modelId', undefined);
-      await this.host.updateSettingGlobal('talaria.agent.localModel.backend', undefined);
-      await this.host.updateSettingGlobal('talaria.agent.localModel.endpoint', undefined);
-      return { ok: true };
+      const wrote = await this.writeSettingsBatch([
+        ['talaria.agent.localModel.modelId', undefined],
+        ['talaria.agent.localModel.backend', undefined],
+        ['talaria.agent.localModel.endpoint', undefined],
+      ]);
+      return wrote.ok ? { ok: true } : wrote;
     }
 
     const modelId = str(params, 'modelId');
@@ -2165,10 +2224,12 @@ export class SetupController {
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
 
-    await this.host.updateSettingGlobal('talaria.agent.localModel.modelId', entry.id);
-    await this.host.updateSettingGlobal('talaria.agent.localModel.backend', backend);
-    await this.host.updateSettingGlobal('talaria.agent.localModel.endpoint', validated.url);
-    return { ok: true };
+    const wrote = await this.writeSettingsBatch([
+      ['talaria.agent.localModel.modelId', entry.id],
+      ['talaria.agent.localModel.backend', backend],
+      ['talaria.agent.localModel.endpoint', validated.url],
+    ]);
+    return wrote.ok ? { ok: true } : wrote;
   }
 
   /**
@@ -2584,13 +2645,13 @@ export class SetupController {
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
 
-    await this.host.updateSettingGlobal('talaria.nextEdit.backend', backend);
-    await this.host.updateSettingGlobal('talaria.nextEdit.endpoint', validated.url);
-    await this.host.updateSettingGlobal('talaria.nextEdit.model', model);
-    if (dedicatedBackendIdRaw !== undefined) {
-      await this.host.updateSettingGlobal('talaria.nextEdit.dedicatedBackendId', dedicatedBackendIdRaw);
-    }
-    return { ok: true };
+    const writes: Array<readonly [string, unknown]> = [
+      ['talaria.nextEdit.backend', backend],
+      ['talaria.nextEdit.endpoint', validated.url],
+      ['talaria.nextEdit.model', model],
+    ];
+    if (dedicatedBackendIdRaw !== undefined) writes.push(['talaria.nextEdit.dedicatedBackendId', dedicatedBackendIdRaw]);
+    return this.writeSettingsBatch(writes);
   }
 
   // --- setup.setRag -----------------------------------------------------------
@@ -2638,10 +2699,7 @@ export class SetupController {
     const confirmed = await this.host.showModal(`Update codebase-index settings: ${summary}?`, 'Apply');
     if (!confirmed) return { ok: false, reason: 'declined' };
 
-    for (const [settingKey, value] of Object.entries(patch)) {
-      await this.host.updateSettingGlobal(settingKey, value);
-    }
-    return { ok: true };
+    return this.writeSettingsBatch(Object.entries(patch));
   }
 
   // --- setup.setTunable (Tier-2, no modal) -----------------------------------------

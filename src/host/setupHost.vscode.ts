@@ -679,6 +679,7 @@ export function createVsCodeSetupHost(context: vscode.ExtensionContext): SetupHo
       const { section, prop } = splitSettingKey(key);
       await vscode.workspace.getConfiguration(section).update(prop, value, vscode.ConfigurationTarget.Global);
     },
+    inspectSettingGlobal: (key: string): unknown => vscode.workspace.getConfiguration().inspect(key)?.globalValue,
     secrets: {
       store: (key, v) => Promise.resolve(context.secrets.store(key, v)),
       // Final review wave, pre-merge defensive fix: `has()`'s contract

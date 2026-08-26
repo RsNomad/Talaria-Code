@@ -82,6 +82,11 @@ class FakeSetupHost implements SetupHost {
     this.settings.set(key, value);
   }
 
+  // F2-17: in the fake, the settings map IS global scope.
+  inspectSettingGlobal(key: string): unknown {
+    return this.settings.get(key);
+  }
+
   secrets = {
     store: async (key: string, v: string): Promise<void> => {
       this.calls.push(`secrets.store:${key}`);
@@ -858,6 +863,62 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(result).toEqual({ ok: true });
     const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
     expect(modalCall).toContain("from '(default)' to");
+  });
+});
+
+// --- F2-17: multi-key settings writes disclose + roll back partial failure ---
+
+describe('F2-17: multi-key settings writes disclose + roll back partial failure', () => {
+  function failNthWrite(host: FakeSetupHost, n: number): void {
+    const original = host.updateSettingGlobal.bind(host);
+    let count = 0;
+    host.updateSettingGlobal = async (key: string, value: unknown): Promise<void> => {
+      count += 1;
+      if (count === n) throw new Error('EACCES: settings file locked');
+      return original(key, value);
+    };
+  }
+
+  it('applyFim: 2nd write fails -> first key ROLLED BACK to its prior global value, reason names both', async () => {
+    const { host, controller } = makeController();
+    host.settings.set('talaria.autocomplete.backend', 'mock'); // prior global value
+    failNthWrite(host, 2);
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toMatchObject({ ok: false });
+    if (result && typeof result === 'object' && 'reason' in result) {
+      const reason = String((result as { reason: unknown }).reason);
+      expect(reason).toContain("failed at 'talaria.autocomplete.endpoint'");
+      expect(reason).toContain('Rolled back: talaria.autocomplete.backend');
+    }
+    expect(host.settings.get('talaria.autocomplete.backend')).toBe('mock'); // restored
+  });
+
+  it('applyFim: FIRST write fails -> "no other keys were changed"', async () => {
+    const { host, controller } = makeController();
+    failNthWrite(host, 1);
+    const result = (await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    })) as { ok: boolean; reason?: string };
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('no other keys were changed');
+  });
+
+  it('rollback itself failing is DISCLOSED per key', async () => {
+    const { host, controller } = makeController();
+    host.settings.set('talaria.autocomplete.backend', 'mock');
+    const original = host.updateSettingGlobal.bind(host);
+    let count = 0;
+    host.updateSettingGlobal = async (key: string, value: unknown): Promise<void> => {
+      count += 1;
+      if (count >= 2) throw new Error('EACCES'); // 2nd write AND the rollback write both fail
+      return original(key, value);
+    };
+    const result = (await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    })) as { ok: boolean; reason?: string };
+    expect(result.reason).toContain('Rollback FAILED for: talaria.autocomplete.backend');
   });
 });
 
