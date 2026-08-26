@@ -29,7 +29,10 @@ export function mapUsage(raw: unknown): Pick<UsageInfo, 'inputTokens' | 'outputT
 
 function firstNumber(...values: (number | undefined)[]): number | undefined {
   for (const v of values) {
-    if (typeof v === 'number') return v;
+    // F1-14 (WS-BG): a NaN/±Infinity token count off the wire is junk, not a
+    // count — skipped exactly like a missing field, so the UI either shows a
+    // finite sibling value or no usage at all (fail-closed), never `NaN`.
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
   }
   return undefined;
 }
