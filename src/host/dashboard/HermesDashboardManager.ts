@@ -116,6 +116,29 @@ export interface HermesDashboardManagerOptions {
 /** Default backoff for the post-spawn health probe (~9.4s total across 8 tries). */
 const DEFAULT_PROBE_BACKOFF_MS = [150, 300, 500, 800, 1200, 1600, 2000, 2800];
 
+/** F2-18: how long a SIGTERM'd dashboard child gets before SIGKILL. */
+export const DASHBOARD_KILL_ESCALATION_MS = 3_000;
+
+/**
+ * F2-18: SIGTERM now; SIGKILL after `escalationMs` if the child still has
+ * not died (a wedged `serve` used to survive dispose forever). The timer is
+ * unref()'d so a dying extension host never waits on it. Exported because
+ * the real spawn path is build-blind to the unit suite (deps.spawn is
+ * injected) — this helper IS the testable seam.
+ */
+export function killWithEscalation(
+  target: { kill(signal?: NodeJS.Signals): boolean },
+  isDead: () => boolean,
+  escalationMs: number = DASHBOARD_KILL_ESCALATION_MS,
+): void {
+  target.kill();
+  if (isDead()) return;
+  const timer = setTimeout(() => {
+    if (!isDead()) target.kill('SIGKILL');
+  }, escalationMs);
+  timer.unref?.();
+}
+
 export class HermesDashboardManager implements DashboardService {
   private readonly deps: HermesDashboardManagerDeps;
   private readonly probeBackoffMs: number[];
@@ -340,7 +363,7 @@ export class HermesDashboardManager implements DashboardService {
       dead = true;
       this.log(`dashboard child exited (code ${code})`);
     });
-    return { kill: () => proc.kill(), alive: () => !dead };
+    return { kill: () => killWithEscalation(proc, () => dead), alive: () => !dead };
   }
 
   private describeTarget(): string {

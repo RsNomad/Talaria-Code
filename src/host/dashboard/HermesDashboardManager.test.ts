@@ -13,7 +13,12 @@ import type { ChildProcess } from 'node:child_process';
 vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
 
 import { spawn } from 'node:child_process';
-import { HermesDashboardManager, type DashboardChild } from './HermesDashboardManager';
+import {
+  HermesDashboardManager,
+  type DashboardChild,
+  DASHBOARD_KILL_ESCALATION_MS,
+  killWithEscalation,
+} from './HermesDashboardManager';
 import type { AdoptableDashboardClient, DashboardToggleResult } from './HermesDashboardClient';
 import { must } from '../../testing/must';
 
@@ -760,5 +765,29 @@ describe('HermesDashboardManager — T-B2: dashboard liveness fail-open (V-9, re
     // treats the mismatch as benign drift -> ADOPTS the squatter. Must instead
     // throw the existing "served by a process we did not spawn" refusal.
     await expect(manager.ensure()).rejects.toThrow(/we did not spawn/i);
+  });
+});
+
+describe('F2-18: killWithEscalation', () => {
+  it('sends SIGTERM immediately and SIGKILL after the escalation window if still alive', () => {
+    vi.useFakeTimers();
+    const signals: (string | undefined)[] = [];
+    const target = { kill: (signal?: NodeJS.Signals): boolean => (signals.push(signal), true) };
+    killWithEscalation(target, () => false, DASHBOARD_KILL_ESCALATION_MS);
+    expect(signals).toEqual([undefined]); // default kill() = SIGTERM
+    vi.advanceTimersByTime(DASHBOARD_KILL_ESCALATION_MS);
+    expect(signals).toEqual([undefined, 'SIGKILL']);
+    vi.useRealTimers();
+  });
+  it('never escalates once the child is dead', () => {
+    vi.useFakeTimers();
+    const signals: (string | undefined)[] = [];
+    let dead = false;
+    const target = { kill: (signal?: NodeJS.Signals): boolean => (signals.push(signal), true) };
+    killWithEscalation(target, () => dead, DASHBOARD_KILL_ESCALATION_MS);
+    dead = true;
+    vi.advanceTimersByTime(DASHBOARD_KILL_ESCALATION_MS);
+    expect(signals).toEqual([undefined]);
+    vi.useRealTimers();
   });
 });
