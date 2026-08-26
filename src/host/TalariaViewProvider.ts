@@ -854,8 +854,17 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * it can never be mistaken for an ordinary file compare.
    */
   private openDiffPreview(sessionId: string, toolId: string, path: string): void {
-    const before = vscode.Uri.from(buildDiffUriParts('before', sessionId, toolId, path));
-    const after = vscode.Uri.from(buildDiffUriParts('after', sessionId, toolId, path));
+    const beforeParts = buildDiffUriParts('before', sessionId, toolId, path);
+    const afterParts = buildDiffUriParts('after', sessionId, toolId, path);
+    if (!beforeParts || !afterParts) {
+      // CA-M17 (WS-BG): an id the talaria-diff: URI cannot round-trip is
+      // refused — the registry refused registering it too, so there is
+      // nothing to preview. Ids only; never log paths/content here.
+      this.logger?.appendLine('[diff.open] refused: session/tool id is not talaria-diff-safe');
+      return;
+    }
+    const before = vscode.Uri.from(beforeParts);
+    const after = vscode.Uri.from(afterParts);
     const basename = path.split('/').pop() || path;
     // F-3 (final-4way-fixes.md): still fire-and-forget (no caller awaits
     // this), but a rejection (e.g. no diff content provider registered) is

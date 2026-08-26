@@ -154,4 +154,14 @@ describe('EditPreviewRegistry — W2 T4 F-D: pure ask-path-scoped preview store'
       expect(b).toHaveBeenCalledTimes(1);
     });
   });
+
+  it('CA-M17 RED: delimiter-carrying ids can NEVER alias two different (sessionId, toolId) pairs onto one entry', () => {
+    const registry = new EditPreviewRegistry();
+    // Old space-joined key: set('a','b c') and getFile('a b','c') both
+    // composed the SAME 'a b c' key — a cross-session preview cross-wire.
+    registry.set('a', 'b c', 'appr-x', [{ path: 'f.ts', oldText: 'o', newText: 'n' }]);
+    expect(registry.getFile('a b', 'c', 'f.ts')).toBeUndefined();
+    // And the unsafe id never registered at all (fail-safe placeholder posture):
+    expect(registry.getFile('a', 'b c', 'f.ts')).toBeUndefined();
+  });
 });
