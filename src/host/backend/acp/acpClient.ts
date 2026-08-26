@@ -445,6 +445,12 @@ export class AcpClient implements AcpClientLike {
    */
   async connect(): Promise<void> {
     if (this.child) throw new Error('AcpClient.connect: already connected');
+    const child = this.spawnAcpChild();
+    this.wireAcpConnection(child);
+  }
+
+  /** WV3-MIN-FUNC (WS-AC): extraction only — every line and comment moved verbatim from the former 180-line connect(). */
+  private spawnAcpChild(): ChildProcess {
     const { command, args } = this.options.spawn;
     this.log(`spawn: ${command} ${args.join(' ')}`);
     const child = spawn(command, args, {
@@ -563,7 +569,11 @@ export class AcpClient implements AcpClientLike {
       this.log(`hermes acp spawn error: ${String(err)}`);
       terminate(null);
     });
+    return child;
+  }
 
+  /** WV3-MIN-FUNC (WS-AC): extraction only — every line and comment moved verbatim from the former 180-line connect(). */
+  private wireAcpConnection(child: ChildProcess): void {
     if (!child.stdin || !child.stdout) {
       throw new Error('hermes acp: missing stdio pipes');
     }
