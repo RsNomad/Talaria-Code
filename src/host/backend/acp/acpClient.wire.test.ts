@@ -160,27 +160,27 @@ async function connectInitializedClient(initResult: unknown = PINNED_HERMES_INIT
 
 describe('AcpClient — real client, real stdin bytes (Task 5 review F-1)', () => {
   it('listSessions() writes an unprefixed "session/list" request frame', async () => {
-    const { client, wireFrames } = await connectClient();
+    const { client, wireFramesAfterInit } = await connectInitializedClient();
     void client.listSessions();
     await flush();
-    expect(wireFrames()).toEqual([{ jsonrpc: '2.0', id: 0, method: 'session/list', params: {} }]);
+    expect(wireFramesAfterInit()).toEqual([{ jsonrpc: '2.0', id: 1, method: 'session/list', params: {} }]);
   });
 
   it('listSessions(cwd, cursor) attaches both params to the request frame', async () => {
-    const { client, wireFrames } = await connectClient();
+    const { client, wireFramesAfterInit } = await connectInitializedClient();
     void client.listSessions('/workspace', 'cur-1');
     await flush();
-    expect(wireFrames()).toEqual([
-      { jsonrpc: '2.0', id: 0, method: 'session/list', params: { cwd: '/workspace', cursor: 'cur-1' } },
+    expect(wireFramesAfterInit()).toEqual([
+      { jsonrpc: '2.0', id: 1, method: 'session/list', params: { cwd: '/workspace', cursor: 'cur-1' } },
     ]);
   });
 
   it('setSessionModel() writes an unprefixed "session/set_model" request frame', async () => {
-    const { client, wireFrames } = await connectClient();
+    const { client, wireFramesAfterInit } = await connectInitializedClient();
     void client.setSessionModel('s1', 'm1');
     await flush();
-    expect(wireFrames()).toEqual([
-      { jsonrpc: '2.0', id: 0, method: 'session/set_model', params: { sessionId: 's1', modelId: 'm1' } },
+    expect(wireFramesAfterInit()).toEqual([
+      { jsonrpc: '2.0', id: 1, method: 'session/set_model', params: { sessionId: 's1', modelId: 'm1' } },
     ]);
   });
 
@@ -390,5 +390,25 @@ describe('AcpClient — WS-AC A-02 root: initialize retains + asserts the advert
     expect(wireFramesAfterInit()).toEqual([
       { jsonrpc: '2.0', id: 1, method: 'session/close', params: { sessionId: 's1' } },
     ]);
+  });
+
+  it('gate: session/list against an agent NOT advertising sessionCapabilities.list — refused, NO frame', async () => {
+    const { client, wireFramesAfterInit } = await connectInitializedClient({
+      protocolVersion: 1,
+      agentCapabilities: {
+        loadSession: true,
+        promptCapabilities: { image: true },
+        sessionCapabilities: { fork: {}, resume: {} },
+      },
+      authMethods: [],
+    });
+    await expect(client.listSessions()).rejects.toThrow(/did not advertise sessionCapabilities\.list/);
+    expect(wireFramesAfterInit()).toEqual([]);
+  });
+
+  it('gate: session/list and session/set_model before initialize() are refused (initialize-first)', async () => {
+    const { client } = await connectClient();
+    await expect(client.listSessions()).rejects.toThrow(/before initialize/);
+    await expect(client.setSessionModel('s1', 'm1')).rejects.toThrow(/before initialize/);
   });
 });

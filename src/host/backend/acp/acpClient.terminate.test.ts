@@ -115,7 +115,8 @@ describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
   });
 
   it('listSessions() rejects with a "terminated" message when the child exits mid-request, instead of hanging forever', async () => {
-    const { client, child } = await connectClient();
+    const { client, child, stdout } = await connectClient();
+    await initializeWithCaps(client, stdout, { loadSession: true, promptCapabilities: { image: true }, sessionCapabilities: { fork: {}, list: {}, resume: {} } });
 
     const listResult = client.listSessions();
 
@@ -125,7 +126,8 @@ describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
   });
 
   it('both prompt() and listSessions() reject off the SAME termination event when both are in flight together', async () => {
-    const { client, child } = await connectClient();
+    const { client, child, stdout } = await connectClient();
+    await initializeWithCaps(client, stdout, { loadSession: true, promptCapabilities: { image: true }, sessionCapabilities: { fork: {}, list: {}, resume: {} } });
 
     const promptResult = client.prompt('s1', []);
     const listResult = client.listSessions();
@@ -138,14 +140,17 @@ describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
 
   it('the happy path is unaffected: a resolving request still resolves normally through the race', async () => {
     const { client, stdout } = await connectClient();
+    await initializeWithCaps(client, stdout, { loadSession: true, promptCapabilities: { image: true }, sessionCapabilities: { fork: {}, list: {}, resume: {} } });
 
     const listResult = client.listSessions();
 
     // Answer the in-flight `session/list` request directly on the fake
-    // child's stdout with a well-formed JSON-RPC response — the id is `0`,
-    // the connection's first request on a fresh client (same convention
-    // `acpClient.wire.test.ts` relies on for its own frame assertions).
-    stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: 0, result: { sessions: [] } })}\n`);
+    // child's stdout with a well-formed JSON-RPC response — id `1`: the
+    // preceding `initializeWithCaps` call already consumed id `0` for the
+    // `initialize` request/response pair (same convention
+    // `acpClient.wire.test.ts` relies on for its own post-init frame
+    // assertions).
+    stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { sessions: [] } })}\n`);
 
     await expect(listResult).resolves.toEqual({ sessions: [] });
   });
@@ -198,7 +203,8 @@ describe('AcpClient — central terminate-race (CF-01/A-2)', () => {
   });
 
   it('AUDIT-5 ARCH-4: dispose() settles the termination pair — an in-flight RPC rejects promptly instead of dangling until the webview 30s timeout', async () => {
-    const { client } = await connectClient();
+    const { client, stdout } = await connectClient();
+    await initializeWithCaps(client, stdout, { loadSession: true, promptCapabilities: { image: true }, sessionCapabilities: { fork: {}, list: {}, resume: {} } });
     const listResult = client.listSessions(); // stdout never answers — only the pair can settle this
 
     client.dispose(); // intentional teardown: Restart Agent Connection / deactivate / backend swap

@@ -840,6 +840,16 @@ export class AcpClient implements AcpClientLike {
    * `=== null` check that can never fire against the pinned SDK.
    */
   async setSessionModel(sessionId: string, modelId: string): Promise<void> {
+    // A-02 (WS-AC): ACP v1 advertises NO capability for `session/set_model`
+    // at all — SessionCapabilities carries only close/fork/list/resume
+    // (types.gen.d.ts:2600-2645, verified against the installed SDK), so the
+    // only wire-level conformance gates available are the protocolVersion
+    // assert and initialize-first. Session-scoped availability is already
+    // structurally gated upstream: the Models UI only exists when the
+    // session advertised `models` state (A7 retention). Same
+    // requireConnection-first ordering as listSessions.
+    this.requireConnection();
+    this.requireAdvertised('set_model');
     // W1-T1 (CF-01/A-2): raced against child termination. The sole caller
     // (`SessionController.setModel`) already attaches an explicit rejection
     // handler (`.then(resolve, reject)`, a seq-guarded UI rollback) — this
@@ -859,6 +869,19 @@ export class AcpClient implements AcpClientLike {
    * `_session/list` and made the Sessions panel permanently unloadable.
    */
   async listSessions(cwd?: string, cursor?: string): Promise<AcpListSessionsRawResult> {
+    // A-02 gate (WS-AC): `session/list` only when advertised. ORDER MATTERS:
+    // requireConnection first — a never-connected or already-terminated
+    // client must keep failing "not connected" (the terminate suite pins
+    // it), advertisement state is only consulted on a live connection. Vs
+    // pinned Hermes a no-op (SessionListCapabilities advertised,
+    // server.py:892); the refusal propagates through
+    // SessionsPanelSource.fetchPage's documented honest error face (:769-787
+    // below).
+    this.requireConnection();
+    const caps = this.requireAdvertised('session/list');
+    if (!caps.sessionList) {
+      throw new Error('AcpClient: agent did not advertise sessionCapabilities.list — refusing session/list');
+    }
     const params: Record<string, unknown> = {};
     if (cwd !== undefined) params.cwd = cwd;
     if (cursor !== undefined) params.cursor = cursor;

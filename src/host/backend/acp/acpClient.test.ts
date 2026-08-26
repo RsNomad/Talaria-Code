@@ -234,6 +234,7 @@ describe('AcpClient.newSession/loadSession — A7: capture the harness-bound cur
 describe('AcpClient.setSessionModel — A8: investigated (SDK swallows the null-vs-empty distinction)', () => {
   it('DOCUMENTS the SDK-level blocker: a wire null result and a real empty response both resolve identically (no distinguishing signal reaches the caller)', async () => {
     const { client, stdout } = await connectClient();
+    await initializePinned(client, stdout);
     const resultPromise = client.setSessionModel('gone-session', 'm1');
     await flush();
     // acp_adapter/server.py:2026-2036 — the harness sends a literal
@@ -241,16 +242,17 @@ describe('AcpClient.setSessionModel — A8: investigated (SDK swallows the null-
     // `unstable_setSessionModel` normalizes this to `{}` internally
     // (`?? {}`), so this call resolves (not rejects) exactly like a real
     // success would — there is no wire-level signal left to act on here.
-    respond(stdout, null);
+    respond(stdout, null, 1);
 
     await expect(resultPromise).resolves.toBeUndefined();
   });
 
   it('resolves normally for a real switch (a genuine SetSessionModelResponse, non-null)', async () => {
     const { client, stdout } = await connectClient();
+    await initializePinned(client, stdout);
     const resultPromise = client.setSessionModel('live-session', 'm1');
     await flush();
-    respond(stdout, {});
+    respond(stdout, {}, 1);
 
     await expect(resultPromise).resolves.toBeUndefined();
   });
