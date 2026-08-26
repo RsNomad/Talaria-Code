@@ -1918,6 +1918,15 @@ describe('SessionController.endForRestart — ADR-UX-P2-2 (replay arm)', () => {
     const end = emitted.find((m) => m.type === 'turn.end');
     expect(end).toMatchObject({ type: 'turn.end', status: 'cancelled' });
   });
+
+  it("CA-03 pin: the replay-arm bracket is EXACTLY ONE turn.end{cancelled} carrying the replay's turn id — no 'error' twin", () => {
+    const { controller, emitted } = makeLoadHarness();
+    void controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    controller.endForRestart();
+    expect(emitted.filter((m) => m.type === 'turn.end')).toEqual([
+      { type: 'turn.end', turnId: 'turn-1', sessionId: 'session-1', status: 'cancelled' },
+    ]);
+  });
 });
 
 /**
