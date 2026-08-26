@@ -10,6 +10,7 @@
  */
 import type { ControlRequestMethod, HostToWebview, WebviewToHost } from './protocol';
 import { RpcClient } from './rpc';
+import { isRecord } from './shapeGuards';
 
 interface VsCodeApi {
   postMessage(msg: unknown): void;
@@ -53,9 +54,13 @@ class Bridge {
     }
 
     window.addEventListener('message', (event: MessageEvent) => {
-      const data = event.data as HostToWebview | undefined;
-      if (data && typeof data.type === 'string') {
-        this.emit(data);
+      // WS-BG (SYN-BOUNDARY): guard BEFORE narrowing — `event.data` is
+      // whatever the host (or anything else with a handle to this window)
+      // posted. A record with a string `type` is the protocol's whole
+      // structural contract at this ingress; everything else is dropped.
+      const data: unknown = event.data;
+      if (isRecord(data) && typeof data.type === 'string') {
+        this.emit(data as HostToWebview);
       }
     });
 

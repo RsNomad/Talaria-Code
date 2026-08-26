@@ -25,8 +25,14 @@ import type { WebviewToHost } from './protocol';
 
 let bridge: typeof BridgeSingleton;
 
+const windowListeners: Record<string, (ev: unknown) => void> = {};
+
 beforeAll(async () => {
-  vi.stubGlobal('window', { addEventListener: () => {} });
+  vi.stubGlobal('window', {
+    addEventListener: (name: string, cb: (ev: unknown) => void) => {
+      windowListeners[name] = cb;
+    },
+  });
   ({ bridge } = await import('./bridge'));
 });
 
@@ -73,5 +79,24 @@ describe('bridge.request — AU-9/INV-13: stamps every outgoing control.request 
     const instanceId = (req as { instanceId?: unknown } | undefined)?.instanceId;
     expect(typeof instanceId).toBe('string');
     expect((instanceId as string).length).toBeGreaterThan(0);
+  });
+});
+
+describe('bridge message ingress — WS-BG (SYN-BOUNDARY)', () => {
+  it('non-record and discriminant-less window messages are dropped before emit', () => {
+    const seen: unknown[] = [];
+    const unsubscribe = bridge.onMessage((m) => seen.push(m));
+
+    windowListeners['message']?.({ data: 42 });
+    windowListeners['message']?.({ data: null });
+    windowListeners['message']?.({ data: ['type', 'x'] });
+    windowListeners['message']?.({ data: { notype: true } });
+    windowListeners['message']?.({ data: { type: 7 } });
+    expect(seen).toEqual([]);
+
+    windowListeners['message']?.({ data: { type: 'wsbg.test-probe' } });
+    expect(seen).toHaveLength(1);
+
+    unsubscribe();
   });
 });
