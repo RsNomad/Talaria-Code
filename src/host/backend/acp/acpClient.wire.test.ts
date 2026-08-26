@@ -354,4 +354,19 @@ describe('AcpClient — WS-AC A-02 root: initialize retains + asserts the advert
     const { client } = await connectInitializedClient({ protocolVersion: 1 });
     expect(client.getAdvertisedPromptCapabilities()).toEqual({});
   });
+
+  it('gate: session/load against an agent NOT advertising loadSession — refused, NO frame written', async () => {
+    const { client, wireFramesAfterInit } = await connectInitializedClient({
+      protocolVersion: 1,
+      agentCapabilities: { promptCapabilities: { image: true }, sessionCapabilities: { fork: {}, list: {}, resume: {} } },
+      authMethods: [],
+    });
+    await expect(client.loadSession('/w', 's1')).rejects.toThrow(/did not advertise loadSession/);
+    expect(wireFramesAfterInit()).toEqual([]);
+  });
+
+  it('gate: session/load before initialize() is refused (initialize-first)', async () => {
+    const { client } = await connectClient();
+    await expect(client.loadSession('/w', 's1')).rejects.toThrow(/before initialize/);
+  });
 });

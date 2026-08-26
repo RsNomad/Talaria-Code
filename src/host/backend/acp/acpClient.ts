@@ -674,14 +674,6 @@ export class AcpClient implements AcpClientLike {
       sessionClose: isRecord(sessionCaps.close),
       promptCapabilities: isRecord(agentCaps.promptCapabilities) ? agentCaps.promptCapabilities : {},
     };
-    // WS-AC Task 1 note: `requireAdvertised` is the initialize-first choke
-    // Tasks 2-4 (session/list, session/close, session/load gates) will call;
-    // this task only PRODUCES it. `void` here is a deliberate reference (not
-    // a call) so `noUnusedLocals: true` doesn't flag the declaration as dead
-    // between this commit and Task 2's — same pattern as `task-3-report.md`'s
-    // `void promptCalls;`. Zero runtime behavior change (a bound-method
-    // property read, discarded).
-    void this.requireAdvertised;
     // Task 13: RETAIN the advertised auth methods (`response.authMethods` —
     // the SDK-typed field, see {@link AdvertisedAuthMethod}'s verification
     // trail). The SDK's client-side wrapper hands back the raw JSON-RPC
@@ -912,6 +904,21 @@ export class AcpClient implements AcpClientLike {
     sessionId: string,
     mcpServers: AcpMcpServer[] = [],
   ): Promise<AcpLoadSessionResult> {
+    // A-02 gate (WS-AC): the spec MUST-check — `session/load` may only be
+    // called when the agent advertised `loadSession`. Vs pinned Hermes this
+    // is a no-op (`acp_adapter/server.py:888` advertises load_session=True);
+    // the refusal fires only against a stricter agent, and both callers
+    // (`SessionController.loadReplayOutcome`'s try/catch at :1401 — honest
+    // error + terminal turn.end; ConnectionSupervisor.recoverOneSession via
+    // the same controller path) already surface a loadSession rejection
+    // honestly. requireConnection FIRST (uniform gate order across the
+    // gated RPCs): a never-connected or terminated client keeps failing
+    // "not connected"; advertisement is only consulted on a live one.
+    this.requireConnection();
+    const caps = this.requireAdvertised('session/load');
+    if (!caps.loadSession) {
+      throw new Error('AcpClient: agent did not advertise loadSession — refusing session/load');
+    }
     // W1-T1 (CF-01/A-2): raced against child termination.
     // `ConnectionSupervisor.recoverOneSession`'s crash-recovery caller
     // already races this same call via `raceRecoveryAgainstChildExit`

@@ -80,9 +80,26 @@ async function connectClient(): Promise<{ client: AcpClient; stdout: PassThrough
  * starts at 0 per-instance, confirmed at `dist/acp.js:712`), and each test
  * issues exactly one request before responding — the same assumption
  * `acpClient.wire.test.ts`'s own `id: 0` assertions already rely on.
+ * WS-AC A-02: id is now a parameter — initialize-first tests consume id 0
+ * for the initialize response and answer their own request at id 1.
  */
-function respond(stdout: PassThrough, result: unknown): void {
-  stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: 0, result })}\n`);
+function respond(stdout: PassThrough, result: unknown, id = 0): void {
+  stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
+}
+
+/** WS-AC A-02: pinned-Hermes agentCapabilities (acp_adapter/server.py:887-895). */
+const PINNED_HERMES_AGENT_CAPS = {
+  loadSession: true,
+  promptCapabilities: { image: true },
+  sessionCapabilities: { fork: {}, list: {}, resume: {} },
+};
+
+/** A-02: the gated RPCs refuse before initialize() — run a pinned-Hermes initialize first. */
+async function initializePinned(client: AcpClient, stdout: PassThrough): Promise<void> {
+  const init = client.initialize();
+  await flush();
+  respond(stdout, { protocolVersion: 1, agentCapabilities: PINNED_HERMES_AGENT_CAPS, authMethods: [] });
+  await init;
 }
 
 async function flush(): Promise<void> {
@@ -92,11 +109,12 @@ async function flush(): Promise<void> {
 describe('AcpClient.loadSession — audit A-3: a lost session must not look like a successful load', () => {
   it('reports found:false when Hermes answers null for an unknown session id (the crash-recovery path)', async () => {
     const { client, stdout } = await connectClient();
+    await initializePinned(client, stdout);
     const resultPromise = client.loadSession('/w', 'gone-session');
     await flush();
     // acp_adapter/server.py:1141-1143 — `if state is None: return None`,
     // which the wire carries as a literal JSON-RPC `"result": null`.
-    respond(stdout, null);
+    respond(stdout, null, 1);
 
     const result = await resultPromise;
 
@@ -105,9 +123,10 @@ describe('AcpClient.loadSession — audit A-3: a lost session must not look like
 
   it('reports found:true for a real load, and keeps the mode id', async () => {
     const { client, stdout } = await connectClient();
+    await initializePinned(client, stdout);
     const resultPromise = client.loadSession('/w', 'live-session');
     await flush();
-    respond(stdout, { modes: { currentModeId: 'architect' }, models: { available: [] } });
+    respond(stdout, { modes: { currentModeId: 'architect' }, models: { available: [] } }, 1);
 
     const result = await resultPromise;
 
@@ -118,9 +137,10 @@ describe('AcpClient.loadSession — audit A-3: a lost session must not look like
 
   it('a real load that omits currentModeId still counts as found, defaulting the mode', async () => {
     const { client, stdout } = await connectClient();
+    await initializePinned(client, stdout);
     const resultPromise = client.loadSession('/w', 'live-session');
     await flush();
-    respond(stdout, { modes: {} });
+    respond(stdout, { modes: {} }, 1);
 
     const result = await resultPromise;
 
@@ -176,12 +196,17 @@ describe('AcpClient.newSession/loadSession — A7: capture the harness-bound cur
 
   it('loadSession captures models.currentModelId on a live (found:true) load', async () => {
     const { client, stdout } = await connectClient();
+    await initializePinned(client, stdout);
     const resultPromise = client.loadSession('/w', 'live-session');
     await flush();
-    respond(stdout, {
-      modes: { currentModeId: 'architect' },
-      models: { currentModelId: 'gpt-5', availableModels: [] },
-    });
+    respond(
+      stdout,
+      {
+        modes: { currentModeId: 'architect' },
+        models: { currentModelId: 'gpt-5', availableModels: [] },
+      },
+      1,
+    );
 
     const result = await resultPromise;
 
