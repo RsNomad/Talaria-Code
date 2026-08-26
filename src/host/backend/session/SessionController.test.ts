@@ -2033,3 +2033,73 @@ describe('SessionController.emitApprovalCard — WS-SL F3-3: turn-liveness at re
     await expect(pending).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow_once' } });
   });
 });
+
+/**
+ * WS-SL F2-06: `emitApprovalCard` registers into `pendingApprovals` (entry +
+ * 60 s timer) BEFORE `port.emit(approval)`. Pre-fix, an emit throw propagated
+ * out of the Promise executor — the returned promise REJECTED (the harness
+ * saw an RPC error) while the entry and its 60 s timer lingered, later firing
+ * a stale `approval.settle{expired}` for a card the webview may never have
+ * rendered. Characterization-first: the first committed shape of this test
+ * PINNED the rejection + leaked timer, then flipped.
+ */
+describe('SessionController.emitApprovalCard — WS-SL F2-06: emit-throw settles fail-closed', () => {
+  it('a port.emit throw during the card emit resolves the approval cancelled, clears the entry + timer, and leaks nothing', async () => {
+    vi.useFakeTimers();
+    try {
+      const emitted: HostToWebviewMessage[] = [];
+      const logs: string[] = [];
+      let boomArmed = true;
+      const client = {
+        cancel: async () => undefined,
+        prompt: () => new Promise<never>(() => {}),
+      } as unknown as AcpClientLike;
+      const port: SessionHostPort = {
+        getClient: () => client,
+        emit: (msg) => {
+          if (boomArmed && msg.type === 'approval.request') throw new Error('webview gone');
+          emitted.push(msg);
+        },
+        emitSystemError: () => {},
+        root: makeRoot(),
+        workspaceRoots: () => ['/fake/ws'],
+        logger: { append: (l) => logs.push(l) },
+        refreshCheckpointsPanel: () => {},
+        resolveMentions: async () => [],
+      };
+      const controller = new SessionController('session-1', '/fake/ws', port);
+      controller.sendPrompt('do the thing', 'default');
+      for (let i = 0; i < 6; i++) await Promise.resolve(); // turn-1 live, prompt hanging
+      const timersBefore = vi.getTimerCount();
+
+      const res = await controller.handlePermission(
+        {
+          sessionId: 'session-1',
+          options: EDIT_OPTIONS.map((o) => ({ ...o })),
+          toolCall: {
+            toolCallId: 'cmd-f206',
+            title: 'Run: npm test',
+            kind: 'execute',
+            content: [{ content: { type: 'text', text: '$ npm test' } }],
+            rawInput: { command: 'npm test', description: 'run' },
+          },
+        },
+        'appr-f206',
+      );
+
+      // Fail-closed: the future RESOLVES cancelled (never rejects — a
+      // rejection is an RPC error, not a deny).
+      expect(res).toEqual(buildCancelledOutcome());
+      // The just-registered entry + its 60 s timer are gone.
+      expect(vi.getTimerCount()).toBe(timersBefore);
+      boomArmed = false;
+      controller.respondApproval('appr-f206', 'allow_once');
+      expect(logs.some((l) => l.includes("no pending approval 'appr-f206'"))).toBe(true);
+      // The settle used emit:false (the port just proved unreliable) — no
+      // approval.settle echo was attempted through the failing port.
+      expect(emitted.some((m) => m.type === 'approval.settle')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

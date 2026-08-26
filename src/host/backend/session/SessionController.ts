@@ -1043,8 +1043,21 @@ export class SessionController {
         this.port.editPreviewRegistry?.set(this.sessionId, req.toolCall.toolCallId, approvalId, previewFiles);
       }
 
-      this.port.emit(approval);
-      for (const diff of diffs) this.port.emit(diff);
+      // WS-SL F2-06: the emit itself can throw (a torn-down webview port, a
+      // listener bug). Settle FIRST (fail-closed cancelled, emit:false — the
+      // port just proved unreliable, and the harness maps cancelled to deny),
+      // log LAST (a throwing logger must never strand the future — the
+      // T17/T18 ordering lesson). `settlePendingApprovals` clears the entry,
+      // its 60 s timer, and the hunk/preview bookkeeping in one sweep.
+      try {
+        this.port.emit(approval);
+        for (const diff of diffs) this.port.emit(diff);
+      } catch (err) {
+        this.settlePendingApprovals('cancelled', { onlyApprovalId: approvalId, emit: false });
+        this.port.logger?.append(
+          `[SessionController] approval card emit failed — approval '${approvalId}' resolved cancelled (fail-closed): ${errorMessage(err)}`,
+        );
+      }
     });
 
     // WS-SL F3-3 (the arch's mandated post-registration re-check): the guard
