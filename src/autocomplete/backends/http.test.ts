@@ -422,6 +422,20 @@ describe('readOpenAiSseText — V-14 shared OpenAI-style SSE drain', () => {
     for await (const text of readOpenAiSseText({ body: null }, 'vLLM')) out.push(text);
     expect(out).toEqual([]);
   });
+
+  it('WS-BG: an array frame is skipped like any non-record frame (no throw, no text)', async () => {
+    const res = streamFromChunks(['data: [1,2]\n\ndata: {"choices":[{"text":"hi"}]}\n\ndata: [DONE]\n\n']);
+    const parts: string[] = [];
+    for await (const t of readOpenAiSseText(res, 'test')) parts.push(t);
+    expect(parts).toEqual(['hi']);
+  });
+
+  it('WS-BG: a non-string choices[0].text is dropped, never yielded as fake text', async () => {
+    const res = streamFromChunks(['data: {"choices":[{"text":42}]}\n\ndata: {"choices":[{"text":"ok"}]}\n\ndata: [DONE]\n\n']);
+    const parts: string[] = [];
+    for await (const t of readOpenAiSseText(res, 'test')) parts.push(t);
+    expect(parts).toEqual(['ok']);
+  });
 });
 
 describe('BackendStreamError', () => {

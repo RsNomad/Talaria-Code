@@ -1,3 +1,5 @@
+import { isRecord } from '../../shared/typeGuards';
+
 /**
  * The subset of `fetch`'s `Response` these parsers need — just enough to be unit
  * testable against a synthetic `ReadableStream` without a real HTTP round-trip.
@@ -64,7 +66,7 @@ export class BackendStreamError extends Error {
  *  is the ONLY signal `readOpenAiSseText` keys on — see its doc comment. */
 interface OpenAiSseChunk {
   error?: unknown;
-  choices?: { text?: string; delta?: { content?: string } }[];
+  choices?: { text?: string | null; delta?: { content?: string | null } | null }[] | null;
 }
 
 /**
@@ -258,13 +260,16 @@ export async function* readOpenAiSseText(
   for await (const data of readSseEvents(response)) {
     if (data === '[DONE]') return;
     const parsed = tryParseJson(data);
-    if (typeof parsed !== 'object' || parsed === null) continue;
+    // WS-BG (SYN-BOUNDARY): record-shaped frames only — `isRecord` also
+    // excludes arrays, which the old typeof-object check let through (they
+    // behaved as "no text" anyway; now the skip is uniform and total).
+    if (!isRecord(parsed)) continue;
     const chunk = parsed as OpenAiSseChunk;
     if (chunk.error != null) {
       throw new BackendStreamError(`${label} reported an error mid-stream`);
     }
     const text = chunk.choices?.[0]?.text ?? chunk.choices?.[0]?.delta?.content;
-    if (text) yield text;
+    if (typeof text === 'string' && text) yield text;
   }
 }
 
