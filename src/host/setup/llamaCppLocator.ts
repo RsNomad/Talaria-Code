@@ -1,6 +1,9 @@
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loginShellSpawn, type ExecLookup } from '../runtime/resolveHermes';
+import { isExecTimeout, lastNonEmptyLine, throwIfAborted } from './locatorShared';
+
+export { isExecTimeout } from './locatorShared';
 
 /**
  * llama.cpp `llama-server` binary locator
@@ -45,6 +48,10 @@ import { loginShellSpawn, type ExecLookup } from '../runtime/resolveHermes';
  *      failure here does not downgrade an already-confirmed `found` result
  *      — the path is real (the login shell just told us so), only the
  *      cosmetic version string is missing.
+ *
+ * `isExecTimeout`/`throwIfAborted`/`lastNonEmptyLine` — this module's clone
+ * of `pipxLocator.ts`'s trio — shared core extracted to `locatorShared.ts`
+ * (WS-SU).
  */
 
 /** Typed probe result — the exact shape the controller (T6) consumes. */
@@ -74,34 +81,6 @@ const VERSION_PROBE_TIMEOUT_MS = 2_000;
  *  answer, not a probe that got a clean "not installed" answer). */
 const PROBE_TIMEOUT_DETAIL =
   "Your login shell didn't answer in time — a slow shell profile (nvm, conda, a network home directory) can cause this. It's usually transient: press Re-check.";
-
-/**
- * Classify a rejected `ExecLookup` error as a TIMEOUT kill specifically —
- * cloned verbatim from `pipxLocator.ts`'s `isExecTimeout` (Node's
- * `execFile` sets `err.killed = true` — and usually `err.signal =
- * 'SIGTERM'` — both when the `timeout` option fires AND when the child is
- * killed for exceeding `maxBuffer`; the latter must NOT be treated as a
- * login-shell slowness signal, excluded via Node's own `err.code`).
- */
-export function isExecTimeout(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const e = err as { killed?: unknown; signal?: unknown; code?: unknown };
-  const killedOrSigterm = e.killed === true || e.signal === 'SIGTERM';
-  return killedOrSigterm && e.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
-}
-
-/** T6 (doc §2.4 line 308, `locateLlamaServer(exec, signal?)`):
- *  `locateLlamaServer`'s optional cancellation seam — checked at the start
- *  and BETWEEN the two exec steps (the step-0 lookup and the best-effort
- *  version probe), matching the `throwIfAborted` pattern `pipxLocator.ts`
- *  already uses for its own three-step pipeline. The controller's settled-
- *  value memo passes each probe's own `AbortController.signal` so a scoped
- *  `setup.recheck {scope:'llamacpp'}` can cancel a superseded probe. */
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) {
-    throw new DOMException('The operation was aborted.', 'AbortError');
-  }
-}
 
 /**
  * Locate `llama-server` and (best-effort) its version. Never throws for the
@@ -258,14 +237,4 @@ async function tryGetVersion(
     if (signal?.aborted) throw err;
     return undefined;
   }
-}
-
-/** Login shells may echo profile/motd noise before the answer — same
- *  tolerance `pipxLocator.ts`/`resolveHermes.ts` need. */
-function lastNonEmptyLine(stdout: string): string {
-  const lines = stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-  return lines[lines.length - 1] ?? '';
 }
