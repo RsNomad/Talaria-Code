@@ -43,9 +43,10 @@ import { isRecord } from '../../shared/typeGuards';
 
 /**
  * One resolved tool row, kept only for DEFENSIVE/forward-compat handling. The
- * REAL `tools.list` wire shape carries tool NAMES as bare strings (see
- * {@link RawToolset}); this object form is tolerated in case a future Hermes
- * build enriches the per-tool entry (it is NOT evidenced by current source).
+ * REAL `tools.list` wire shape carries tool NAMES as bare strings under the
+ * `tools` key (see {@link RawToolset}); this object form is tolerated in case
+ * a future Hermes build enriches the per-tool entry (NOT evidenced by
+ * current source).
  */
 export interface RawToolDef {
   name: string;
@@ -54,26 +55,30 @@ export interface RawToolDef {
 }
 
 /**
- * One toolset bundle inside a `tools.list` result
- * (`tui_gateway/server.py:13439-13467`).
+ * One toolset bundle inside a `tools.list` result (`tui_gateway/server.py`,
+ * the `@method("tools.list")` handler — re-grepped WS-AC Task 15; cite the
+ * CURRENT line of the `"tools": info["resolved_tools"]` emission here: 13462).
  *
- * corr-M1 — GROUND TRUTH: a toolset's member tools arrive as
- * `resolved_tools: List[str]` — bare tool-NAME strings, not `{name,...}` objects
- * (`tools/toolsets.py:687,920`; the dashboard `GET /api/tools/toolsets` reshaper
- * already treats them as `string[]`). The reshaper reads {@link resolved_tools}
- * first; the legacy `tools` field (either `string[]` or the defensive
- * {@link RawToolDef} object form) is a fallback so an older/mock shape still
- * works. Reading a plain string as `t.name` was crashing the LIVE no-dashboard
- * tools source (`classifySource(undefined)` TypeError).
+ * S4-09 (WS-AC doc fix) — GROUND TRUTH INVERTED from what this doc used to
+ * claim: the WIRE key is `tools` (the handler serializes its internal
+ * `resolved_tools` list UNDER the key `"tools"`); a `resolved_tools` key
+ * never appears on this wire. The reshaper's read order
+ * `resolved_tools ?? tools` (:138) still lands correctly — real payloads
+ * carry only `tools`, so the first alternative is simply absent — and the
+ * order is deliberately KEPT (behavior-preserving doc fix): `resolved_tools`
+ * remains tolerated in case a future Hermes emits the internal name
+ * directly. Entries are bare tool-NAME strings (`tools/toolsets.py`
+ * `resolved_tools: List[str]`); the {@link RawToolDef} object form is
+ * defensive only.
  */
 export interface RawToolset {
   name: string;
   description?: string;
   tool_count: number;
   enabled: boolean;
-  /** Real tui_gateway field: resolved tool NAMES. */
+  /** Defensive/forward-compat: the INTERNAL Hermes field name — never observed on this wire. */
   resolved_tools?: string[];
-  /** Legacy/defensive fallback: names, or the object form for forward-compat. */
+  /** Real tui_gateway wire field: resolved tool NAMES (or the defensive object form). */
   tools?: Array<string | RawToolDef>;
 }
 
@@ -121,8 +126,10 @@ export function classifySource(name: string): ToolInfo['source'] {
 /**
  * Reshape a raw `tools.list` result into `ToolsData` (`ToolsPanel.tsx`).
  *
- * corr-M1: a toolset's member tools are `resolved_tools: string[]` on the real
- * wire (bare names). Each entry is normalized to `{name, description?, enabled?}`
+ * corr-M1 (read order) + S4-09 (WS-AC, key name): a toolset's member tools
+ * arrive as bare NAME strings under the wire key `tools`; `resolved_tools` is
+ * the internal Hermes name, tolerated first in the read order as
+ * forward-compat only. Each entry is normalized to `{name, description?, enabled?}`
  * whether it arrives as a string (real shape → empty description, inherits the
  * toolset's `enabled`) or as a defensive/legacy object. Handling the string case
  * is what fixes the `classifySource(undefined)` TypeError the LIVE no-dashboard
