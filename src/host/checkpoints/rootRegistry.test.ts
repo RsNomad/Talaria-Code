@@ -9,7 +9,15 @@ describe('RootRegistry (W4-T2 Deliverable 2)', () => {
     const first = registry.getOrCreate('/ws-a', factory);
     const second = registry.getOrCreate('/ws-a', factory);
     expect(second).toBe(first); // same instance
-    expect(factory).toHaveBeenCalledTimes(1); // NOT re-invoked on a cache hit
+    // WS-CK-A6 prep: `getOrCreate` now passes `trackerFactory` THROUGH to the
+    // `RootCoordinator` ctor unchanged (never invokes it) — `factory` is only
+    // ever consulted by the coordinator's OWN `.tracker` getter, on access
+    // (a getter's own per-access re-invocation is covered by
+    // `RootCoordinator.test.ts`'s "A6: tracker is consulted at ACCESS time"
+    // test). Neither `getOrCreate` call here reads `.tracker`, so `factory`
+    // stays uncalled — this replaces the pre-A6-prep pin of "called exactly
+    // once, at mint" (now impossible: mint no longer calls it at all).
+    expect(factory).not.toHaveBeenCalled();
   });
 
   it('a DIFFERENT canonical root mints a DIFFERENT, independent coordinator', () => {

@@ -719,6 +719,11 @@ export class AcpBackend implements AgentBackend {
     const containingRoot = this.findContainingWorkspaceRoot(cwd);
     const canonicalRoot = this.canonicalizeWorkspaceRoot(containingRoot);
     const primaryRoot = this.canonicalizeWorkspaceRoot(this.workspaceRoots()[0] ?? cwd);
+    // WS-CK-A6 prep: `RootCoordinator.tracker` now re-invokes this thunk on
+    // EVERY access (not just once at mint) — a no-op change for THIS thunk,
+    // since `canonicalRoot`/`primaryRoot` are captures of already-computed
+    // consts and `this.checkpointTracker` is a readonly field, so every
+    // re-evaluation is idempotent (identical result every time).
     return this.rootRegistry.getOrCreate(
       canonicalRoot,
       () => (canonicalRoot === primaryRoot ? this.checkpointTracker : undefined),
