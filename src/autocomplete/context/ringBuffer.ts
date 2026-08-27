@@ -46,6 +46,15 @@ const PARTITION_CAPS: Partial<Record<CrossFileSnippetKind, number>> = {
   'recently-opened': 16,
 };
 
+/** CA-M13 — quarantine capacity. Insertion order = recency order (a
+ *  quarantine HIT refreshes; adding past the cap evicts the least-recently-
+ *  hit uri). Eviction removes only the skip-scan short-circuit: the evicted
+ *  uri's next offending window re-rejects at the scan and re-quarantines —
+ *  the scanner remains the authority. Residual: a clean-scanning sibling
+ *  window of an EVICTED uri can slip in before that re-quarantine; bounded,
+ *  and the price of not growing this Set for the session's life. */
+const MAX_QUARANTINED_URIS = 512;
+
 function anchorsEqual(a: Anchor, b: Anchor): boolean {
   return a.uri === b.uri && a.line === b.line;
 }
@@ -108,8 +117,11 @@ export class RingBuffer {
     // 4. Quarantine check — strict, uri-scoped (§3.3 item 4 / P7). No window
     // comparison, no content hash: every candidate from a quarantined uri
     // drops until an explicit `clearQuarantine(uri)` call (see the class
-    // doc-comment for why window-content-based clearing is unsound).
+    // doc-comment for why window-content-based clearing is unsound). CA-M13:
+    // a hit refreshes the uri's LRU position (delete+re-add).
     if (this.quarantine.has(candidate.uri)) {
+      this.quarantine.delete(candidate.uri);
+      this.quarantine.add(candidate.uri);
       return;
     }
 
@@ -127,6 +139,14 @@ export class RingBuffer {
       // Quarantine the WHOLE uri (not just drop this window) — closes the
       // split-secret/windowing bypass (§3.3 item 4): every candidate from
       // this uri drops until an explicit `clearQuarantine(uri)` call.
+      // CA-M13: capped — evict the least-recently-hit uri first (see
+      // MAX_QUARANTINED_URIS).
+      if (this.quarantine.size >= MAX_QUARANTINED_URIS) {
+        const oldest = this.quarantine.values().next().value;
+        if (oldest !== undefined) {
+          this.quarantine.delete(oldest);
+        }
+      }
       this.quarantine.add(candidate.uri);
       return; // drop — do NOT mint
     }
