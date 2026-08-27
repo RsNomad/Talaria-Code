@@ -15,8 +15,13 @@ import { resolveWithinWorkspaceReal } from '../backend/acp/pathConfine';
 import { writeFileNoFollow } from '../backend/acp/safeWrite';
 import { sanitizeGitEnv } from './gitEnv';
 import { runGit, runGitBinary, type RunGitOptions } from './gitProcess';
+import { parseNameStatusZ, type CheckpointDiffEntry } from './nameStatus';
 import { missingObjects, type RunGit } from './objectClosure';
 import { acquireLock } from './shadowLock';
+
+// CKP-04 (WS-CK CA-M08): re-exported so every existing importer of these
+// types keeps compiling after the parser + its types moved to nameStatus.ts.
+export type { DiffStatus, CheckpointDiffEntry } from './nameStatus';
 
 // Re-export so consumers (e.g. AcpBackend) can distinguish a transient,
 // retryable lock timeout from a permanent checkpoint failure without reaching
@@ -101,16 +106,6 @@ export interface CheckpointTrackerOptions {
    * real repo and a real-repo `gc --prune` could orphan them).
    */
   localizeDebounceMs?: number;
-}
-
-/** One file's change status between two trees (or a tree and the live worktree). */
-export type DiffStatus = 'added' | 'modified' | 'deleted';
-
-/** One entry of a {@link CheckpointTracker.diff} result. */
-export interface CheckpointDiffEntry {
-  /** POSIX-relative path from the workspace root. */
-  path: string;
-  status: DiffStatus;
 }
 
 /** Result of {@link CheckpointTracker.restore}. */
@@ -832,10 +827,7 @@ export class CheckpointTracker {
         }
         changedPaths.push(change.path);
       } catch (err: unknown) {
-        const code =
-          (err as NodeJS.ErrnoException).code ??
-          (err instanceof Error ? err.name : 'unknown');
-        console.error(`restore: failed to apply ${change.path}: ${code}`);
+        console.error(`restore: failed to apply ${change.path}: ${errCode(err)}`);
         skippedPaths.push(change.path);
         continue;
       }
@@ -1027,7 +1019,12 @@ export class CheckpointTracker {
     if (this.localizeTimer !== undefined) return; // a flush is already scheduled
     this.localizeTimer = setTimeout(() => {
       this.localizeTimer = undefined;
-      void this.flushLocalization().catch(() => undefined);
+      void this.flushLocalization().catch((err: unknown) => {
+        // CA-M07 (WS-CK): a silently-swallowed repack failure leaves borrowed
+        // blobs un-localized with zero trace — log the errno code (never
+        // String(err): fs errors embed absolute paths).
+        console.error(`checkpoints: background localization repack failed: ${errCode(err)}`);
+      });
     }, this.localizeDebounceMs);
   }
 
@@ -1077,7 +1074,7 @@ export class CheckpointTracker {
       await runGit(['--version'], { cwd: this.storageDir, env: sanitizeGitEnv(process.env) });
     } catch (err) {
       throw new GitUnavailableError(
-        `git executable not found on PATH; checkpoints are disabled (${String(err)})`,
+        `git executable not found on PATH; checkpoints are disabled (${errCode(err)})`,
       );
     }
   }
@@ -1240,7 +1237,7 @@ export class CheckpointTracker {
       // report/recover. (Because {@link saveIndex} writes atomically, a
       // concurrent writer can never expose a half-written file here, so this
       // signals genuine corruption rather than a benign read/write race.)
-      throw new Error(`Checkpoint index at ${this.indexPath} is unreadable/corrupt: ${String(err)}`);
+      throw new Error(`Checkpoint index at ${this.indexPath} is unreadable/corrupt: ${errCode(err)}`);
     }
 
     // Migration: pre-existing records stored only the bare `write-tree` hash as
@@ -1686,52 +1683,6 @@ function formatAge(timestampIso: string): string {
   return `${days}d ago`;
 }
 
-/**
- * Parse `git diff-tree --name-status -z` output. The `-z` stream is a flat run
- * of NUL-terminated tokens: `STATUS\0PATH\0` per change, except renames/copies
- * (`R###`/`C###`) which carry `STATUS\0OLDPATH\0NEWPATH\0`. Rename detection is
- * NOT enabled here (the {@link CheckpointTracker.diffTrees} call passes no
- * `-M`/`-C`), but we parse it defensively so a future `-M` can't corrupt the
- * walk (i.e. misinterpret the 3-token record as two 2-token ones).
- *
- * AU-36:CP-rename landmine (deferred — dead code today, no live call site
- * passes `-M`/`-C`): the R/C branch below records ONLY the NEW path as
- * `modified` and silently drops OLDPATH — no `deleted` entry is ever emitted
- * for it. That is correct AS LONG AS rename detection stays off (git's own
- * `--name-status`, undetected, already reports a rename as a plain D+A pair
- * that this function handles fine). But the moment a future change enables
- * `-M`/`-C` on the `diff-tree` call, a genuine rename would restore the
- * content at NEWPATH while leaving OLDPATH's file untouched on disk — a
- * stale duplicate `restoreInternal` never deletes, silently corrupting the
- * restore. Fix-on-enable: also push `{ path: OLDPATH, status: 'deleted' }`
- * for the R/C case.
- */
-function parseNameStatusZ(output: string): CheckpointDiffEntry[] {
-  const tokens = output.split('\0');
-  const entries: CheckpointDiffEntry[] = [];
-  let i = 0;
-  while (i < tokens.length) {
-    const statusCode = tokens[i];
-    if (!statusCode) {
-      i++;
-      continue;
-    }
-    if (statusCode[0] === 'R' || statusCode[0] === 'C') {
-      const newPath = tokens[i + 2];
-      if (newPath) entries.push({ path: newPath, status: 'modified' });
-      i += 3;
-      continue;
-    }
-    const filePath = tokens[i + 1];
-    if (filePath === undefined) break;
-    const status: DiffStatus =
-      statusCode[0] === 'A' ? 'added' : statusCode[0] === 'D' ? 'deleted' : 'modified';
-    entries.push({ path: filePath, status });
-    i += 2;
-  }
-  return entries;
-}
-
 async function pathExists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
@@ -1744,4 +1695,11 @@ async function pathExists(p: string): Promise<boolean> {
 /** Normalizes an OS path separator to the forward-slash form git's `alternates` file expects. */
 function toPosixAbsolute(p: string): string {
   return p.replace(/\\/g, '/');
+}
+
+/** CKP-05: errno-code-or-name only — never String(err) (fs errors embed absolute paths). */
+function errCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  if (typeof code === 'string') return code;
+  return err instanceof Error ? err.name : 'unknown';
 }
