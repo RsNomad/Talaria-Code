@@ -143,11 +143,16 @@ describe('CheckpointTrackerRegistry — isolation proofs (WS-CK-A6 Task 16)', ()
   });
 
   it('INV-A6-GITDIR: a git repo planted at an ANCESTOR of the storage dir is byte-untouched by shadow ops', async () => {
-    // Layout: outer/ (a REAL git repo) contains outer/storage/ (the tracker
-    // storage dir). The workspace lives ELSEWHERE (no repo). If any shadow op
-    // ever ran discovery-by-cwd (GIT_DIR dropped), it would attach to outer/.git.
+    // Layout: outer/ is a REAL git repo. BOTH the tracker storage dir
+    // (outer/storage/) AND the workspace (outer/ws/, the cwd of every
+    // mutating shadow op) live INSIDE outer's worktree. So if any shadow op
+    // ever dropped GIT_DIR, discovery-by-cwd would attach to outer/.git and
+    // mutate it — the byte-untouched assertion below is therefore directly
+    // sensitive to a discovery escape on the mutating ops themselves, not
+    // merely in aggregate. Every tracker op sets GIT_DIR to the per-root
+    // shadow (INV-A6-GITDIR), so the correct behavior is that outer/.git is
+    // NEVER discovered and stays byte-identical.
     const outer = await fs.mkdtemp(path.join(os.tmpdir(), 'hermes-anc-'));
-    const ws = await fs.mkdtemp(path.join(os.tmpdir(), 'hermes-anc-ws-'));
     let tracker: CheckpointTracker | undefined;
     try {
       execFileSync('git', ['init', '--quiet'], { cwd: outer });
@@ -156,6 +161,8 @@ describe('CheckpointTrackerRegistry — isolation proofs (WS-CK-A6 Task 16)', ()
       const plantedGit = path.join(outer, '.git');
       const nestedStorage = path.join(outer, 'storage');
       await fs.mkdir(nestedStorage, { recursive: true });
+      const ws = path.join(outer, 'ws');
+      await fs.mkdir(ws, { recursive: true });
       await fs.writeFile(path.join(ws, 'f.txt'), 'x');
 
       const before = await treeFingerprint(plantedGit);
@@ -174,7 +181,6 @@ describe('CheckpointTrackerRegistry — isolation proofs (WS-CK-A6 Task 16)', ()
     } finally {
       tracker?.dispose();
       await fs.rm(outer, { recursive: true, force: true }).catch(() => undefined);
-      await fs.rm(ws, { recursive: true, force: true }).catch(() => undefined);
     }
   });
 });
