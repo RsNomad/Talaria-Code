@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CheckpointTracker, WorktreeScanTimeoutError } from './CheckpointTracker';
 import { GitTimeoutError, __setSpawnForTests } from './gitProcess';
+import { acquireLock } from './shadowLock';
 import { must } from '../../testing/must';
 
 /** A stalled `git` child: never emits `close` unless a test does so explicitly. */
@@ -2064,5 +2065,100 @@ describe('CheckpointTracker', () => {
       await hung;
       await tracker.flushLocalization();
     });
+
+    it(
+      "review fix (order): a snapshot racing teardown is localized SYNCHRONOUSLY before disposeAndFlush() resolves 'flushed' — not deferred to the debounce timer dispose() already cleared",
+      async () => {
+        // Hold the shadow's cross-process lock OURSELVES so the racing
+        // snapshot's withLock() blocks mid-flight. This gives deterministic
+        // control over exactly when its critical section (and the
+        // synchronous markLocalizeNeeded() call at its tail) runs, without
+        // faking any git subprocess — the snapshot's write-tree/update-ref
+        // run for REAL once we release, so the resulting checkpoint is
+        // genuinely restorable-or-not on its own merits.
+        const shadowDir = path.dirname(tracker.shadowGitDir);
+        const heldLock = await acquireLock(shadowDir, { staleMs: 30_000, maxWaitMs: 10_000 });
+
+        const snapshotPromise = tracker.snapshot(1);
+        // Yield to the event loop (a real timer tick, not just a microtask —
+        // `enqueue()`'s field update happens synchronously off `await
+        // this.init()`'s continuation, but empirically a couple of chained
+        // `Promise.resolve()` ticks were NOT sufficient here; a short real
+        // delay deterministically lets snapshot()'s `await this.init()`
+        // continuation run and its `enqueue()` call push the op onto the
+        // tracker's internal queue) — this must happen BEFORE
+        // disposeAndFlush() reads that queue below, or the "op in flight at
+        // teardown" race this test exercises would not actually be set up.
+        // Safe regardless of how long we wait: the snapshot cannot progress
+        // past this point anyway — it is blocked polling for the lock we
+        // hold — so there is no risk of it completing early.
+        await new Promise((resolve) => setTimeout(resolve, 30));
+
+        // Teardown starts while the snapshot is still queued and blocked on
+        // the lock we hold: `localizePending` is still false at this instant
+        // — exactly the interleaving the fix targets.
+        const disposePromise = tracker.disposeAndFlush();
+
+        // Let the snapshot's critical section run for real (real write-tree +
+        // update-ref against the borrowed real-repo objects, then
+        // markLocalizeNeeded()), then let disposeAndFlush's queue-drain see
+        // it finish.
+        await heldLock.release();
+
+        await expect(disposePromise).resolves.toBe('flushed');
+        const cp = await snapshotPromise;
+        expect(cp).not.toBeNull();
+
+        // Prune the real repo IMMEDIATELY — well before the re-armed 60s
+        // debounce timer could ever fire.
+        pruneRealRepoHard(workspaceRoot);
+
+        const fresh = new CheckpointTracker(storageDir, workspaceRoot);
+        const r = await fresh.restore(cp!.id, { force: true });
+        // Pre-fix: the borrow was deferred to the cleared/re-armed timer, so
+        // pruning orphans it and restore refuses (restored: false). Post-fix:
+        // the borrow is localized before 'flushed' returns, so it survives.
+        expect(r.restored).toBe(true);
+        fresh.dispose();
+      },
+    );
+
+    it(
+      "review fix (disclosure): a genuine repack failure during the flush resolves 'failed' and logs an errno/name — never swallowed as 'flushed', never a raw path",
+      async () => {
+        const cp = await tracker.snapshot(1);
+        expect(cp).not.toBeNull();
+
+        // Force the localization repack (localizeAlternateObjects's `git
+        // repack -a -d`) to fail for real: intercept ONLY that invocation —
+        // every other git call (including this test's own scaffolding) runs
+        // for real. Same FakeGitChild + queueMicrotask(close) idiom already
+        // used above (installFakeGitChild / the AU-25 lock-race describe).
+        __setSpawnForTests(
+          ((command: string, args: string[], options: unknown) => {
+            if (Array.isArray(args) && args[0] === 'repack') {
+              const fake = new FakeGitChild();
+              queueMicrotask(() => {
+                fake.stderr.emit('data', Buffer.from('fatal: simulated repack failure\n'));
+                fake.emit('close', 1);
+              });
+              return fake;
+            }
+            return realSpawn(command as never, args as never, options as never);
+          }) as unknown as Parameters<typeof __setSpawnForTests>[0],
+        );
+
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        await expect(tracker.disposeAndFlush()).resolves.toBe('failed');
+
+        expect(errorSpy).toHaveBeenCalled();
+        const logged = errorSpy.mock.calls.map((call) => String(call[0]));
+        // errno/name only (errCode's contract) — 'Error' for this plain thrown Error.
+        expect(logged.some((m) => m.includes('Error'))).toBe(true);
+        // CA-M07: never a raw path in the log line.
+        expect(logged.some((m) => m.includes(workspaceRoot) || m.includes(storageDir))).toBe(false);
+        errorSpy.mockRestore();
+      },
+    );
   });
 });

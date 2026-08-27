@@ -956,20 +956,61 @@ export class CheckpointTracker {
    * a successor tracker instance on this root serializes against it) — the
    * CALLER discloses it. NEVER deletes the on-disk shadow repo: history is
    * retention-by-default; a re-added folder finds it via shadowDirFor.
+   *
+   * Review fix (durability, post-commit): TWO ordering/disclosure defects in
+   * the original body are fixed here —
+   *
+   *  1. **Drain BEFORE flush, not flush-then-drain.** An op racing teardown
+   *     (`snapshot`/`restore`) sets `localizePending` via
+   *     {@link markLocalizeNeeded} only on ITS OWN completion. Flushing first
+   *     (the original order) checks `localizePending` while that op is still
+   *     in flight, sees `false`, and no-ops — then the drain below waits for
+   *     the op to finish, which RE-ARMS the debounce timer `dispose()` already
+   *     cleared above, deferring the borrow's localization to that timer
+   *     (~`localizeDebounceMs` later) instead of doing it before 'flushed' is
+   *     returned. A crash/`gc --prune` in that window silently loses it. A
+   *     single drain-then-flush is sufficient (not a loop): the drained
+   *     promise chain only settles AFTER the racing op's synchronous
+   *     `markLocalizeNeeded()` call has already run (it happens before that
+   *     op's own promise resolves), so by the time `flushLocalization()` runs
+   *     immediately after the drain, `localizePending` is guaranteed
+   *     up-to-date and its OWN `enqueue`+`withLock` call correctly localizes
+   *     the now-pending borrow. Nothing else can race a NEW `markLocalizeNeeded`
+   *     into the gap between the drain and the flush call — this whole
+   *     sequence has no `await` where a new caller could interleave (`dispose()`
+   *     already ran, cancelling the debounce path).
+   *  2. **A repack failure must not be indistinguishable from success.** The
+   *     original `flushLocalization().catch(() => undefined)` swallowed a
+   *     genuine durability-flush failure (disk-full, corrupt object) and
+   *     still returned 'flushed' — violating this file's own CA-M07 rule
+   *     (never silently swallow a repack failure). The error is now captured
+   *     and, if present, logged via `errCode` (errno/name only — never a raw
+   *     path) and disclosed as `'failed'`.
    */
   async disposeAndFlush(
     deadlineMs: number = DEFAULT_DISPOSE_FLUSH_DEADLINE_MS,
-  ): Promise<'flushed' | 'deadline'> {
+  ): Promise<'flushed' | 'deadline' | 'failed'> {
     this.dispose();
+    let flushError: unknown;
     const work = (async (): Promise<void> => {
-      await this.flushLocalization().catch(() => undefined);
+      // Drain the queue tail FIRST: see defect (1) above for why flushing
+      // before the drain can localize nothing.
       await this.queue.then(
         () => undefined,
         () => undefined,
       );
+      await this.flushLocalization().catch((err: unknown) => {
+        flushError = err;
+      });
     })();
     const outcome = await settleRace(work, { deadline: deadlineMs });
-    return outcome.kind === 'value' ? 'flushed' : 'deadline';
+    if (outcome.kind !== 'value') return 'deadline';
+    if (flushError !== undefined) {
+      // CA-M07: never silently swallow a repack failure (errno-only — no path leak).
+      console.error(`checkpoints: dispose flush repack failed: ${errCode(flushError)}`);
+      return 'failed';
+    }
+    return 'flushed';
   }
 
   // --- internals ----------------------------------------------------------
