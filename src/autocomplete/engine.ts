@@ -5,7 +5,7 @@ import { shouldCompleteMultiline } from './multiline';
 import { postprocessCompletion } from './postprocess';
 import { pruneToBudget } from './prefixSuffix';
 import { getTemplateForModel } from './templates';
-import { snippetSetHash } from './context/hash';
+import { snippetSetHash, fimContextHash } from './context/hash';
 import { injectSnippetsAsComments } from './context/mode';
 import type { FimEgressGuard } from './egressScan';
 import type {
@@ -103,10 +103,14 @@ export class FimEngine {
       this.options,
     );
     // R4 (§2.6): the snippet-set hash keys the context PARTITION so distinct
-    // snippet sets never collide on a shared prefix (T7 widens this with the
-    // suffix/filepath/languageId discriminator). Keyed on the PRUNED
-    // (pre-injection) prefix — see the original design note.
-    const contextKey = snippetSetHash(ctx.snippets);
+    // snippet sets never collide on a shared prefix. CA-07 widens this with
+    // a fixed-width fold of the pruned suffix, filepath and languageId --
+    // same-prefix requests from a different context must never collide on
+    // a shared cache partition. The PRUNED suffix is used here (the same
+    // bytes that egress below). Keyed on the PRUNED (pre-injection) prefix
+    // — see the original design note.
+    const contextKey =
+      snippetSetHash(ctx.snippets) + ' ' + fimContextHash(ctx.languageId, ctx.filepath, suffix);
     // F1-10: an empty pruned prefix gives prefix-matching nothing to match
     // on — skip the cache entirely (the cache also refuses at both ends).
     const cacheEligible = this.options.useCache && prunedPrefix.length > 0;

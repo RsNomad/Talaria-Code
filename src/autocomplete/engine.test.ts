@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { FimEngine } from './engine';
 import { AutocompleteDebouncer } from './debouncer';
 import { InMemoryCompletionCache } from './cache';
-import { snippetSetHash } from './context/hash';
+import { snippetSetHash, fimContextHash } from './context/hash';
 import { scannedSnippetForTest } from './context/scannedSnippetTestFactory';
 import { getStopTokens } from './stopTokens';
 import { getTemplateForModel } from './templates';
@@ -237,14 +237,14 @@ describe('FimEngine', () => {
         checkEgress: () => 'allow',
       });
 
-      await engine.complete(
-        ctx({ prefix: 'const x = ', suffix: '\n' }),
-        { manual: true },
-        new AbortController().signal,
-      );
+      const context = ctx({ prefix: 'const x = ', suffix: '\n' });
+      await engine.complete(context, { manual: true }, new AbortController().signal);
 
       expect(cache.puts.length).toBe(1);
-      expect(must(cache.puts[0]).contextKey).toBe('0000000000000000');
+      expect(must(cache.puts[0]).contextKey).toBe(
+        '0000000000000000 ' +
+          fimContextHash(context.languageId, context.filepath, context.suffix),
+      );
       expect(must(cache.puts[0]).prefix).toBe('const x = ');
     });
 
@@ -416,15 +416,15 @@ describe('FimEngine', () => {
         checkEgress: () => 'allow',
       });
       const snippets = [snippet({ filepath: 'src/util.ts', content: 'export function helper() {}' })];
+      const context = ctx({ prefix: 'const x = ', snippets });
 
-      await engine.complete(
-        ctx({ prefix: 'const x = ', snippets }),
-        { manual: true },
-        new AbortController().signal,
-      );
+      await engine.complete(context, { manual: true }, new AbortController().signal);
 
-      const expectedHash = snippetSetHash(snippets);
-      expect(must(cache.puts[0]).contextKey).toBe(expectedHash);
+      const expectedKey =
+        snippetSetHash(snippets) +
+        ' ' +
+        fimContextHash(context.languageId, context.filepath, context.suffix);
+      expect(must(cache.puts[0]).contextKey).toBe(expectedKey);
       expect(must(cache.puts[0]).prefix).toBe('const x = ');
     });
   });
@@ -510,6 +510,52 @@ describe('FimEngine', () => {
       const [scannedPrefix] = must(seen[0]);
       expect(scannedPrefix).toContain('export function helper() {}');
     });
+  });
+});
+
+describe('CA-07 — the cache key discriminates suffix / filepath / languageId', () => {
+  async function completeOnce(
+    cache: RecordingCache,
+    overrides: Partial<FimContext>,
+  ): Promise<void> {
+    const backend = new FakeBackend();
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache,
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'allow',
+    });
+    await engine.complete(ctx(overrides), { manual: true }, new AbortController().signal);
+  }
+
+  it('same prefix, DIFFERENT suffix ⇒ different contextKey (no wrong-context hit)', async () => {
+    const cache = new RecordingCache();
+    await completeOnce(cache, { prefix: 'const x = ', suffix: ';\n' });
+    await completeOnce(cache, { prefix: 'const x = ', suffix: '}\n' });
+    expect(cache.gets).toHaveLength(2);
+    expect(must(cache.gets[0]).contextKey).not.toBe(must(cache.gets[1]).contextKey);
+  });
+
+  it('same prefix+suffix, DIFFERENT filepath ⇒ different contextKey', async () => {
+    const cache = new RecordingCache();
+    await completeOnce(cache, { filepath: 'file:///repo/a.ts' });
+    await completeOnce(cache, { filepath: 'file:///repo/b.ts' });
+    expect(must(cache.gets[0]).contextKey).not.toBe(must(cache.gets[1]).contextKey);
+  });
+
+  it('same everything, DIFFERENT languageId ⇒ different contextKey', async () => {
+    const cache = new RecordingCache();
+    await completeOnce(cache, { languageId: 'typescript' });
+    await completeOnce(cache, { languageId: 'python' });
+    expect(must(cache.gets[0]).contextKey).not.toBe(must(cache.gets[1]).contextKey);
+  });
+
+  it('identical context ⇒ identical contextKey (cache still hits)', async () => {
+    const cache = new RecordingCache();
+    await completeOnce(cache, {});
+    await completeOnce(cache, {});
+    expect(must(cache.gets[0]).contextKey).toBe(must(cache.gets[1]).contextKey);
   });
 });
 
