@@ -28,7 +28,11 @@ export function balanceBrackets(
   // cursor in the file, so the model isn't forced to re-close something the file
   // will close for it. Stop at the first non-whitespace, non-bracket character.
   for (const ch of suffix) {
-    if (ch === ' ' || ch === '\t') continue;
+    // F1-11: \n and \r are whitespace — the contract ("stop at the first
+    // non-whitespace, non-bracket character") means the seed scans past
+    // line breaks; the old loop broke on them, orphaning any closer on a
+    // following line.
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
     const openBracket = BRACKETS_REVERSE[ch];
     if (!openBracket) break;
     stack.unshift(openBracket);
