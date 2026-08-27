@@ -156,6 +156,64 @@ describe('readSseEvents', () => {
     const events = await collect(readSseEvents({ body: null }));
     expect(events).toEqual([]);
   });
+
+  it('F1-9: splits events delimited by CRLF blank lines (\\r\\n\\r\\n) — the SSE spec allows CRLF line endings', async () => {
+    const events = await collect(
+      readSseEvents(streamFromChunks(['data: {"a":1}\r\n\r\ndata: {"b":2}\r\n\r\n'])),
+    );
+    expect(events).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  it('F1-9: handles a CRLF boundary split across chunks', async () => {
+    const events = await collect(
+      readSseEvents(streamFromChunks(['data: {"a":1}\r\n', '\r\ndata: {"b":2}\n\n'])),
+    );
+    expect(events).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  // F1-9 (real RED/GREEN case): the two tests above assert final CONTENT,
+  // which turns out to be correct even with the old `\n\n`-only boundary —
+  // `emitEvent` extracts every `data:`-prefixed line independently of how
+  // the buffer was chunked into "events", so a merged/late-split event still
+  // yields the same payloads in the same order once the stream ends. The
+  // boundary bug is really about TIMING: a `\r\n\r\n`-only event has no bare
+  // `\n\n` anywhere in it, so the old `indexOf('\n\n')` loop finds nothing
+  // and blocks on a SECOND `reader.read()` — a live, still-open connection
+  // would never surface that first event until more bytes arrive or the
+  // connection closes. This test proves the regex boundary resolves the
+  // event off a SINGLE already-buffered chunk, with no further read needed.
+  it('F1-9: a CRLF-only event resolves without waiting on a further read (boundary is \\r\\n\\r\\n, not \\n\\n-only)', async () => {
+    const encoder = new TextEncoder();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const iterator = readSseEvents({ body })[Symbol.asyncIterator]();
+
+    controller.enqueue(encoder.encode('data: {"a":1}\r\n\r\n'));
+
+    let settled: IteratorResult<string> | undefined;
+    void iterator.next().then((r) => {
+      settled = r;
+    });
+
+    // Drain the microtask queue via a macrotask tick, WITHOUT ever pushing
+    // more data or closing the stream. If the boundary regex isn't doing
+    // its job, `iterator.next()` is stuck awaiting a second `reader.read()`
+    // that nothing in this test will ever satisfy, so `settled` stays
+    // undefined forever.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(settled).toBeDefined();
+    expect(settled?.value).toBe('{"a":1}');
+
+    // Clean up: let the generator's underlying reader finish so it doesn't
+    // dangle past this test.
+    controller.close();
+    await iterator.return?.(undefined);
+  });
 });
 
 // D1 — 4 MiB total-received-byte cap (unbounded-memory DoS hardening).
