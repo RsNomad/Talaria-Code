@@ -49,6 +49,7 @@ import { resolveNextEditMode, type NextEditMode, type ToggleRequest, type Toggle
 import { mintScannedNextEditRequest, NextEditMintRejectionError } from './scan';
 import type {
   AnchoredProposal,
+  ApplyExpectation,
   EditableRegion,
   LineRange,
   NextEditEffect,
@@ -160,7 +161,15 @@ export interface NextEditExecutorHost {
   showDecorations(p: AnchoredProposal, jumped: boolean): boolean;
   clearDecorations(): void;
   reveal(range: LineRange): void;
-  applyEdit(region: EditableRegion, newText: string): Promise<boolean>;
+  /**
+   * BHF-F3-15: `expected` is the dispatch-time freshness snapshot (see
+   * `dispatch()`); the host MUST re-validate document.version and the
+   * region's base text against it immediately before the WorkspaceEdit and
+   * resolve `false` on ANY mismatch — that `false` is the FSM's
+   * `applyResult` and routes to the existing dismiss+note path. `null`
+   * (no live proposal at dispatch) MUST also resolve `false`.
+   */
+  applyEdit(region: EditableRegion, newText: string, expected: ApplyExpectation | null): Promise<boolean>;
   note(msgId: string): void;
 }
 
@@ -200,7 +209,10 @@ export interface NextEditExecutor {
  */
 export function makeExecutor(
   host: NextEditExecutorHost,
-  onApplyResult: (ok: boolean) => void = () => {},
+  onApplyResult: (ok: boolean) => void,
+  /** BHF-F3-15 — read synchronously when an `applyEdit` effect executes;
+   *  REQUIRED so forgetting it is a compile error, not a silent fail-open. */
+  getApplyExpectation: () => ApplyExpectation | null,
 ): NextEditExecutor {
   let shownProposal: AnchoredProposal | null = null;
   let jumped = false;
@@ -245,8 +257,11 @@ export function makeExecutor(
       case 'applyEdit': {
         // The boolean comes back as the FSM's `applyResult` event. A REJECTED
         // `applyEdit` is reported as `false` (fail-closed: dismiss + note),
-        // never left as an unhandled rejection.
-        void host.applyEdit(effect.region, effect.newText).then(
+        // never left as an unhandled rejection. BHF-F3-15: the expectation is
+        // read HERE, synchronously within this run — a later dispatch
+        // overwriting the shell's snapshot cannot affect an apply already
+        // dispatched.
+        void host.applyEdit(effect.region, effect.newText, getApplyExpectation()).then(
           (ok) => onApplyResult(ok),
           () => onApplyResult(false),
         );
@@ -780,6 +795,10 @@ export function registerTalariaNextEdit(
   /** The document version the live proposal is anchored to. `null` when idle.
    *  This is the freshness token the Global Constraints keep in the shell. */
   let trackedVersion: number | null = null;
+  /** BHF-F3-15 — the freshness pair for the applyEdit effect this dispatch
+   *  may emit, captured BEFORE the reducer can transition to idle (tabAccept
+   *  does) and null the tracking state below. */
+  let pendingApplyExpectation: ApplyExpectation | null = null;
   /** The next-edit request in flight, if any. Aborted by a FIM start (R2) and
    *  by the next next-edit trigger (single-flight). NEVER the reverse: this
    *  module holds no FIM cancellation handle at all. */
@@ -957,20 +976,36 @@ export function registerTalariaNextEdit(
         vscode.TextEditorRevealType.InCenterIfOutsideViewport,
       );
     },
-    async applyEdit(region, newText) {
+    async applyEdit(region, newText, expected) {
       // A plain WorkspaceEdit — never the ACP diff-decision gate (Global
       // Constraints). This is the user's own accepted edit in their own
       // editor, not an agent-proposed change needing approval.
+      //
+      // BHF-F3-15 — fail-closed re-validation, immediately before the edit:
+      if (expected === null) return false;
       const editor = editorFor(region.uri);
       if (editor === undefined) return false;
       const document = editor.document;
+      // (1) VERSION: `TextDocument.version` strictly increases on every
+      // change — any interleaved edit in the dispatch→apply gap fails this.
+      if (document.version !== expected.docVersion) return false;
       const endLine = Math.min(region.endLine, document.lineCount - 1);
-      const edit = new vscode.WorkspaceEdit();
-      edit.replace(
-        document.uri,
-        new vscode.Range(region.startLine, 0, endLine, document.lineAt(endLine).text.length),
-        newText,
+      const range = new vscode.Range(
+        region.startLine,
+        0,
+        endLine,
+        document.lineAt(endLine).text.length,
       );
+      // (2) BASE TEXT: the bytes being replaced must be the bytes the
+      // proposal was anchored to — the belt for anything version cannot
+      // see (e.g. a reanchor-drift bug). getText(range) clamps, mirroring
+      // the proposal-time read.
+      if (document.getText(range) !== expected.baseText) return false;
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(document.uri, range, newText);
+      // `workspace.applyEdit` resolves false when the edit could not be
+      // applied (all-or-nothing for text-only edits) — that residual-window
+      // failure reports through the same boolean.
       return vscode.workspace.applyEdit(edit);
     },
     note(msgId) {
@@ -980,7 +1015,11 @@ export function registerTalariaNextEdit(
     },
   };
 
-  const executor = makeExecutor(executorHost, (ok) => dispatch({ kind: 'applyResult', ok }));
+  const executor = makeExecutor(
+    executorHost,
+    (ok) => dispatch({ kind: 'applyResult', ok }),
+    () => pendingApplyExpectation,
+  );
 
   function currentProposal(): AnchoredProposal | null {
     return state.kind === 'idle' ? null : state.p;
@@ -988,6 +1027,14 @@ export function registerTalariaNextEdit(
 
   function dispatch(event: NextEditFsmEvent): void {
     if (disposed) return;
+    // BHF-F3-15: snapshot pre-reduce — `trackedVersion` is the version the
+    // live proposal's coordinates are valid FOR (advanced on every
+    // successful reanchor), `region.content` the bytes being replaced.
+    const proposal = currentProposal();
+    pendingApplyExpectation =
+      proposal !== null && trackedVersion !== null
+        ? { docVersion: trackedVersion, baseText: proposal.region.content }
+        : null;
     const next = reduceNextEdit(state, event);
     state = next.state;
     if (state.kind === 'idle') {

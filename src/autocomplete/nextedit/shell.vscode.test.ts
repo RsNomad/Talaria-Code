@@ -406,7 +406,9 @@ function makeMockHost(): MockHost {
 describe('next-edit effect executor', () => {
   it('INVARIANT (replaces the deleted wall-clock timeout): after every effect batch, jumpVisible === decorationsShown', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    // BHF-F3-15: no batch here exercises `applyEdit`, so the expectation
+    // getter is never consulted — `() => null` keeps the arrangement honest.
+    const exec = makeExecutor(mock, () => {}, () => null);
     const batches: NextEditEffect[][] = [
       [{ kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true }, { kind: 'showDecorations', p: P }],
       [{ kind: 'clearAll' }],
@@ -422,7 +424,7 @@ describe('next-edit effect executor', () => {
 
   it('clearAll drives BOTH context keys false and clears the decorations', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
 
     exec.run([
       { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
@@ -439,7 +441,7 @@ describe('next-edit effect executor', () => {
 
   it('an executor exception forces clearAll — the invariant survives a throwing host', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
     mock.throwOnShowDecorations = true;
 
     exec.run([
@@ -454,7 +456,7 @@ describe('next-edit effect executor', () => {
 
   it('F-1: a DECLINED paint forces clearAll — a SILENT no-op host may not leave jumpVisible up with nothing on screen', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
     mock.paintDeclined = true;
 
     // The exact batch `idle × proposalReady` emits. The executor's own header
@@ -473,7 +475,7 @@ describe('next-edit effect executor', () => {
 
   it('F-1: a paint DECLINED during the jumped re-render clears too (the locator re-render is a paint like any other)', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
 
     exec.run([
       { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
@@ -491,7 +493,7 @@ describe('next-edit effect executor', () => {
 
   it('reveal forwards the range to the host', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
     exec.run([{ kind: 'reveal', range: { startLine: 4, endLine: 8 } }]);
     expect(mock.reveals).toEqual([{ startLine: 4, endLine: 8 }]);
   });
@@ -499,7 +501,14 @@ describe('next-edit effect executor', () => {
   it('applyEdit reports the host boolean back as an applyResult event', async () => {
     const mock = makeMockHost();
     const results: boolean[] = [];
-    const exec = makeExecutor(mock, (ok) => void results.push(ok));
+    // BHF-F3-15: this test DOES exercise `applyEdit`, so it wires a real
+    // (non-null) getter — the MockHost's own `applyEdit` ignores `expected`
+    // (it is not the re-validating host; that logic lives in the shell's
+    // `executorHost.applyEdit`, covered by the shell-level suite below).
+    const exec = makeExecutor(mock, (ok) => void results.push(ok), () => ({
+      docVersion: 7,
+      baseText: REGION.content,
+    }));
 
     mock.applyResolves = true;
     exec.run([{ kind: 'applyEdit', region: REGION, newText: 'const a = 2;\n' }]);
@@ -513,7 +522,10 @@ describe('next-edit effect executor', () => {
   it('a REJECTED applyEdit is reported as applyResult(false), never as an unhandled rejection', async () => {
     const mock = makeMockHost();
     const results: boolean[] = [];
-    const exec = makeExecutor(mock, (ok) => void results.push(ok));
+    const exec = makeExecutor(mock, (ok) => void results.push(ok), () => ({
+      docVersion: 7,
+      baseText: REGION.content,
+    }));
 
     mock.applyRejects = true;
     exec.run([{ kind: 'applyEdit', region: REGION, newText: 'x' }]);
@@ -525,7 +537,7 @@ describe('next-edit effect executor', () => {
 
   it('noteOnce surfaces a given msgId exactly once, however many times it is emitted', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
 
     exec.run([{ kind: 'noteOnce', msgId: 'apply-failed' }]);
     exec.run([{ kind: 'noteOnce', msgId: 'apply-failed' }]);
@@ -536,7 +548,7 @@ describe('next-edit effect executor', () => {
 
   it('the locator flips to "Tab to accept" once the jumped key goes up (the FSM tabJump batch carries no showDecorations)', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
 
     exec.run([
       { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
@@ -3302,5 +3314,162 @@ describe('B-3/B-7: ordering and settle no-ops are individually observable', () =
 
     const setContextCalls = host.executed.filter((e) => e.command === 'setContext');
     expect(setContextCalls.length).toBeGreaterThan(0);
+  });
+});
+
+// ────────────── BHF-F3-15: apply-time document-version + base-text ──────────────
+// re-validation (next-edit executor). See task-5-brief.md for the finding.
+
+describe('BHF-F3-15 — makeExecutor threads the apply expectation', () => {
+  function scriptedHost(calls: string[], applyResult: boolean | Error) {
+    return {
+      setContext: (key: string, value: boolean) => {
+        calls.push(`setContext ${key}=${String(value)}`);
+      },
+      showDecorations: () => {
+        calls.push('showDecorations');
+        return true;
+      },
+      clearDecorations: () => {
+        calls.push('clearDecorations');
+      },
+      reveal: () => {
+        calls.push('reveal');
+      },
+      applyEdit: (
+        _region: EditableRegion,
+        _newText: string,
+        expected: import('./types').ApplyExpectation | null,
+      ) => {
+        calls.push(`applyEdit expected=${expected === null ? 'null' : `${expected.docVersion}:${expected.baseText}`}`);
+        return applyResult instanceof Error ? Promise.reject(applyResult) : Promise.resolve(applyResult);
+      },
+      note: (msgId: string) => {
+        calls.push(`note ${msgId}`);
+      },
+    };
+  }
+
+  const region: EditableRegion = {
+    uri: 'file:///w/a.ts',
+    filepath: 'a.ts',
+    startLine: 0,
+    endLine: 1,
+    content: 'base\ntext',
+  };
+
+  it('passes getApplyExpectation() through to host.applyEdit and reports the boolean back', async () => {
+    const calls: string[] = [];
+    const results: boolean[] = [];
+    const executor = makeExecutor(
+      scriptedHost(calls, true),
+      (ok) => results.push(ok),
+      () => ({ docVersion: 7, baseText: 'base\ntext' }),
+    );
+    executor.run([{ kind: 'applyEdit', region, newText: 'new' }]);
+    await Promise.resolve();
+    expect(calls).toEqual(['applyEdit expected=7:base\ntext']);
+    expect(results).toEqual([true]);
+  });
+
+  it('a null expectation still reaches the host (the HOST refuses — fail-closed lives host-side), and a rejecting applyEdit reports false', async () => {
+    const calls: string[] = [];
+    const results: boolean[] = [];
+    const executor = makeExecutor(
+      scriptedHost(calls, new Error('boom')),
+      (ok) => results.push(ok),
+      () => null,
+    );
+    executor.run([{ kind: 'applyEdit', region, newText: 'new' }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual(['applyEdit expected=null']);
+    expect(results).toEqual([false]);
+  });
+});
+
+describe('BHF-F3-15 — stale-coordinate apply is refused and dismissed', () => {
+  // Mirrors the 'next-edit commands' describe block's own beforeEach/afterEach
+  // verbatim (this file's established convention — see 'B-2/B-8' and 'B-3/B-7'
+  // above, which each duplicate the same setup rather than sharing it).
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHost();
+    failures.length = 0;
+    backendSpy.constructed.length = 0;
+    backendSpy.predicts.length = 0;
+    mintCalls.length = 0;
+    backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
+    autocompleteConfig.backend = 'ollama';
+    autocompleteConfig.apiKey = undefined;
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a document change in the dispatch→apply gap (version moved, no event delivered) refuses the WorkspaceEdit and fires the apply-failed note', async () => {
+    // Arrange: drive the shell to a live proposal in `jumped` state exactly
+    // as the existing accept-path test does (proposalReady → tabJump) — see
+    // 'jump then accept applies the edit through a plain WorkspaceEdit'.
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false });
+    await fireTrigger();
+
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+    expect(contextKeyValue('talaria.nextEdit.jumped')).toBe(true);
+
+    // THE GAP: mutate the fake document's version + text directly WITHOUT
+    // firing a change event — modeling a change whose event has not reached
+    // the shell yet (the unguarded window the finding names).
+    const editor = must(host.activeTextEditor);
+    editor.document.version += 1;
+
+    // Act: Tab-accept.
+    must(host.registeredCommands.get('talaria.nextEdit.accept'))();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Assert: NO edit was applied; the existing dismiss+note path fired.
+    expect(host.appliedEdits).toEqual([]);
+    expect(host.warnings.some((w) => w.includes('could not be applied'))).toBe(true);
+  });
+
+  it('the happy path is unchanged: version and base text intact ⇒ the edit applies', async () => {
+    // Same arrangement, no mutation between jump and accept.
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false });
+    await fireTrigger();
+
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+
+    must(host.registeredCommands.get('talaria.nextEdit.accept'))();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(host.appliedEdits).toHaveLength(1);
+    expect(host.warnings).toEqual([]);
+  });
+
+  it('base-text drift at an unmoved version (belt: what version cannot see) refuses and dismisses', async () => {
+    // Same arrangement; mutate the region TEXT the fake document serves for
+    // getText(range) WITHOUT bumping version (only a harness can do this —
+    // real vscode cannot — which is exactly why the belt exists: it also
+    // catches any future reanchor-drift bug).
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false });
+    await fireTrigger();
+
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+
+    const editor = must(host.activeTextEditor);
+    editor.document.getText = (range?: { start: FakePosition; end: FakePosition }): string =>
+      range === undefined ? DOC_TEXT : 'DRIFTED BASE TEXT';
+
+    must(host.registeredCommands.get('talaria.nextEdit.accept'))();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(host.appliedEdits).toEqual([]);
+    expect(host.warnings.some((w) => w.includes('could not be applied'))).toBe(true);
   });
 });
