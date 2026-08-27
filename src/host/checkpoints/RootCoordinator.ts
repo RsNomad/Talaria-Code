@@ -23,7 +23,13 @@ import type { CheckpointTrackerLike } from './trackerContract';
 export interface RootCoordinatorLike {
   /** The canonical (realpath'd) root key this coordinator was registered under (`rootRegistry`'s map key). */
   readonly rootId: string;
-  /** The ONE per-root shadow-git tracker instance, or `undefined` when checkpoints aren't wired for this root. */
+  /**
+   * The per-root shadow-git tracker, or `undefined` when checkpoints aren't
+   * wired for this root. WS-CK-A6: resolved PER-ACCESS (not frozen at mint
+   * time) — under the registry-backed factory the value can appear (a folder
+   * re-added / init retry) or disappear (folder removed) across successive
+   * reads of this same coordinator instance.
+   */
   readonly tracker: CheckpointTrackerLike | undefined;
   /**
    * Synchronously claim the root's turn lease for `sessionId`. `false` ⇒

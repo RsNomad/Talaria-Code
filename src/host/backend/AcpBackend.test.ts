@@ -41,7 +41,7 @@ import type { AcpMcpServerHttp } from '../../shared/acpMcpServerHttp';
 import type { AcpSessionUpdate, AcpRequestPermissionRequest, AcpRequestPermissionResponse } from './acp/types';
 import { evaluateEditPolicy } from './policy/editPolicy';
 import { EditPreviewRegistry } from '../preview/EditPreviewRegistry';
-import type { CheckpointTrackerLike } from '../checkpoints/trackerContract';
+import type { CheckpointTrackerLike, CheckpointTrackerRegistryLike } from '../checkpoints/trackerContract';
 import type { RestoreResult } from '../checkpoints/CheckpointTracker';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
 import type { PanelSource } from '../panels/PanelSourceRegistry';
@@ -12688,6 +12688,92 @@ describe('A6 golden master — primary-only tracker factory (pre-flip pin)', () 
     const coordinator = coordinatorFor(backend, '/bare-cwd');
 
     expect(coordinator.tracker).toBe(fakeTracker);
+  });
+});
+
+/**
+ * WS-CK-A6 Task 15 — flag-off wiring: with `MULTI_ROOT_CHECKPOINTS` false,
+ * `resolveRootCoordinator`'s registry arm (`:718-732`) is dead code — the
+ * ternary always takes the primary-only branch, so an injected
+ * `trackerRegistry` must NEVER be consulted, and the Task 10 golden-master
+ * pins (above) must hold byte-identical with a registry present. Deliberately
+ * does NOT mock `./checkpoints/multiRootFlag` (it flips for real in Task 17)
+ * — this exercises the REAL flag-off value. The registry ARM's live behavior
+ * (flag true) is covered by Task 17's flip (which re-runs the whole
+ * golden-master suite against the new arm) + Task 16's registry-level
+ * isolation tests — not asserted here.
+ */
+describe('A6 flag-off wiring — injected trackerRegistry is never consulted', () => {
+  afterEach(() => {
+    mockWorkspace.workspaceFolders = undefined;
+  });
+
+  /** Same reach-past-`private` idiom as `coordinatorFor` above, scoped locally to this block. */
+  function coordinatorFor(backend: AcpBackend, cwd: string): { tracker: CheckpointTrackerLike | undefined } {
+    return (
+      backend as unknown as {
+        resolveRootCoordinator(cwd: string): { tracker: CheckpointTrackerLike | undefined };
+      }
+    ).resolveRootCoordinator(cwd);
+  }
+
+  /** Spy-only fake — the ONLY assertion this suite makes on it is that `get` is never called. */
+  class FakeTrackerRegistry implements CheckpointTrackerRegistryLike {
+    readonly getCalls: string[] = [];
+    get(canonicalRoot: string): CheckpointTrackerLike | undefined {
+      this.getCalls.push(canonicalRoot);
+      return undefined;
+    }
+  }
+
+  it('flag-off: registry.get is never called, AND the golden-master primary/non-primary/same-instance pins all still hold', () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    const fakeRegistry = new FakeTrackerRegistry();
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      fakeTracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      fakeRegistry,
+    );
+
+    // Primary root -> the injected legacy tracker (golden-master pin 1).
+    expect(coordinatorFor(backend, '/root-a/sub/dir').tracker).toBe(fakeTracker);
+    // Non-primary root -> undefined, the honest NO_TRACKER refusal (pin 2).
+    expect(coordinatorFor(backend, '/root-b/sub/dir').tracker).toBeUndefined();
+    // Same canonical root -> same coordinator instance (pin 3).
+    expect(coordinatorFor(backend, '/root-a/x')).toBe(coordinatorFor(backend, '/root-a/y'));
+
+    // The flag-off ternary in `resolveRootCoordinator` never took the
+    // registry arm — the fake's `get` spy was never invoked.
+    expect(fakeRegistry.getCalls).toEqual([]);
+  });
+
+  it("zero workspace folders, flag-off + registry injected: a bare cwd still gets the injected tracker (golden-master pin 4), registry still uncalled", () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    const fakeRegistry = new FakeTrackerRegistry();
+    mockWorkspace.workspaceFolders = [];
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      fakeTracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      fakeRegistry,
+    );
+
+    expect(coordinatorFor(backend, '/bare-cwd').tracker).toBe(fakeTracker);
+    expect(fakeRegistry.getCalls).toEqual([]);
   });
 });
 

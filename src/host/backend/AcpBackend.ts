@@ -17,13 +17,14 @@ import { describeError } from '../../shared/errorText';
 // import direction is backend → setup only (`SetupController` itself never
 // imports from `src/host/backend/`, preserving its purity constraint).
 import { computeProviderCard } from '../setup/SetupController';
-import type { CheckpointTrackerLike } from '../checkpoints/trackerContract';
+import type { CheckpointTrackerLike, CheckpointTrackerRegistryLike } from '../checkpoints/trackerContract';
 import type { RootCoordinator } from '../checkpoints/RootCoordinator';
 import { RootRegistry } from '../checkpoints/rootRegistry';
 import {
   canonicalizeWorkspaceRoot,
   findContainingWorkspaceRoot,
 } from '../checkpoints/rootResolution';
+import { MULTI_ROOT_CHECKPOINTS } from '../checkpoints/multiRootFlag';
 import type { Logger } from '../transport/JsonRpcStdio';
 import type { ResolvedContext } from '../context/types';
 import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
@@ -455,6 +456,13 @@ export class AcpBackend implements AgentBackend {
       get: () => undefined,
       update: () => Promise.resolve(),
     },
+    /**
+     * WS-CK-A6: the per-root tracker registry (extension.ts-owned, threaded in
+     * like checkpointTracker above; `undefined` pre-flip and in tests).
+     * Consulted LAZILY per RootCoordinator.tracker access, behind
+     * MULTI_ROOT_CHECKPOINTS — `checkpointTracker` remains the flag-off path.
+     */
+    private readonly trackerRegistry?: CheckpointTrackerRegistryLike,
   ) {
     this.control = new ControlChannel(config, logger);
     // TG-5 (AU-51): seeded from the persisted array (oldest-first,
@@ -726,7 +734,12 @@ export class AcpBackend implements AgentBackend {
     // re-evaluation is idempotent (identical result every time).
     return this.rootRegistry.getOrCreate(
       canonicalRoot,
-      () => (canonicalRoot === primaryRoot ? this.checkpointTracker : undefined),
+      // WS-CK-A6 ship gate: registry-backed per-root trackers vs today's
+      // primary-only single tracker. Evaluated per `tracker` ACCESS (Task 11's
+      // lazy getter) over stable captures — idempotent either way.
+      MULTI_ROOT_CHECKPOINTS
+        ? () => this.trackerRegistry?.get(canonicalRoot)
+        : () => (canonicalRoot === primaryRoot ? this.checkpointTracker : undefined),
       () => this.controlDispatcher.refreshCheckpointsPanel(canonicalRoot),
     );
   }

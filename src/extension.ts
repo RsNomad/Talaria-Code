@@ -21,6 +21,8 @@ import { createLibServerHost } from './mcp/lsp/libServerHost';
 import { buildLibMcpServer, createSharedLspToolState } from './mcp/lsp/tools';
 import { createLibToolDeps } from './host/lib/libToolDeps.vscode';
 import { CheckpointTracker, GitUnavailableError } from './host/checkpoints/CheckpointTracker';
+import { CheckpointTrackerRegistry } from './host/checkpoints/trackerRegistry';
+import { MULTI_ROOT_CHECKPOINTS } from './host/checkpoints/multiRootFlag';
 import { HermesDashboardManager, type DashboardService } from './host/dashboard/HermesDashboardManager';
 import { ContextResolver } from './host/context/resolver';
 import { createVscodeContextPorts } from './host/context/ports.vscode';
@@ -197,11 +199,21 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
     const ports = createVscodeContextPorts(terminalCapture, createGitPort());
     searchFilesPort = ports.workspace.findFiles;
 
+    // WS-CK-A6 ship gate: BOTH trackers sit behind the ONE
+    // MULTI_ROOT_CHECKPOINTS const — while false, the registry is never
+    // constructed (no eager shadow repos for non-primary roots) and the
+    // legacy single primary-root `createCheckpointTracker` path runs
+    // byte-identical to pre-A6.
+    const trackerRegistry = MULTI_ROOT_CHECKPOINTS
+      ? createWorkspaceTrackerRegistry(context, output)
+      : undefined;
+    if (trackerRegistry) checkpointTrackerRegistry = trackerRegistry;
+
     return new AcpBackend(
       readRuntimeConfig(),
       output,
       undefined,
-      createCheckpointTracker(context, output),
+      MULTI_ROOT_CHECKPOINTS ? undefined : createCheckpointTracker(context, output),
       createDashboard(),
       new ContextResolver(ports),
       editPreviewRegistry,
@@ -216,6 +228,7 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
         get: <T,>(key: string) => context.workspaceState.get<T>(key),
         update: (key, v) => Promise.resolve(context.workspaceState.update(key, v)),
       },
+      trackerRegistry,
     );
   };
 
@@ -740,6 +753,18 @@ export function activate(context: vscode.ExtensionContext): TalariaTestApi | und
  */
 let activeCheckpointTracker: CheckpointTracker | undefined;
 
+/**
+ * WS-CK-A6: the per-root tracker registry, held at module scope for the same
+ * reason as {@link activeCheckpointTracker} — a future `deactivate` flush
+ * needs a handle to it. `undefined` while {@link MULTI_ROOT_CHECKPOINTS} is
+ * false (the registry is never constructed pre-flip); NOT read by
+ * `deactivate` yet — that generalization is deliberately reserved for the
+ * flip commit (Task 17), per the spec's rev-4 caveat (ii): pre-flip the
+ * registry is never constructed, so the legacy single-flush above remains
+ * complete on its own.
+ */
+let checkpointTrackerRegistry: CheckpointTrackerRegistry | undefined;
+
 export async function deactivate(): Promise<void> {
   // Everything registered in `context.subscriptions` (the backend + its
   // dashboard, the indexer, output channel) is disposed by VS Code
@@ -759,6 +784,15 @@ export async function deactivate(): Promise<void> {
     }
     tracker.dispose();
   }
+
+  // WS-CK-A6 (Task 15): `checkpointTrackerRegistry` is written by
+  // `makeAcpBackend` (only ever non-undefined once MULTI_ROOT_CHECKPOINTS
+  // flips true) but deliberately NOT flushed here yet — that generalization
+  // is reserved for Task 17's flip commit (rev-4 caveat (ii)); pre-flip the
+  // registry is never constructed, so the legacy single-flush above is
+  // already complete on its own. This reference just keeps the module-scope
+  // binding live for tsc (`noUnusedLocals`) without doing anything with it.
+  void checkpointTrackerRegistry;
 }
 
 /**
@@ -933,6 +967,54 @@ function firstWorkspaceRoot(): string | undefined {
  * timing of this `.catch()` racing a panel open doesn't matter. On success,
  * also runs one opportunistic, non-blocking `cleanup()` (`git gc --prune`).
  */
+/**
+ * WS-CK-A6: construct the per-root tracker registry, run the initial
+ * reconcile, and subscribe to folder changes. ONLY reachable when
+ * MULTI_ROOT_CHECKPOINTS is true (the ship gate). Context7-grounded:
+ * onDidChangeWorkspaceFolders does NOT fire when the FIRST folder is
+ * added/removed/changed — the extension host restarts, so fresh activation
+ * covers that case; the reconcile ignores the event delta and recomputes from
+ * workspace.workspaceFolders at pass start (spec req 4).
+ *
+ * Per-root settings (spec req 7, audited at HEAD): NO root-scoped setting
+ * feeds the tracker path today (`createCheckpointTracker` passes no options —
+ * `talaria.rag.excludeGlobs` feeds only the indexer). When one is added, read
+ * it per-folder via getConfiguration(section, folder.uri) LAZILY at operation
+ * time (never cached at construction — side-steps the folder-change vs
+ * config-change event-ordering subtlety, vscode #73353) and thread it through
+ * the registry's makeTracker seam.
+ */
+function createWorkspaceTrackerRegistry(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+): CheckpointTrackerRegistry {
+  const registry = new CheckpointTrackerRegistry({
+    storageDir: context.globalStorageUri.fsPath,
+    listFolders: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    log: (line) => output.appendLine(line),
+    onPromotion: (childRoot, formerParentRoot) => {
+      const msg =
+        'Checkpoint history for this folder started fresh when its parent folder was removed; ' +
+        'the prior history is retained with the parent folder and returns if it is re-added.';
+      output.appendLine(`Talaria Checkpoints: ${msg} (folder: ${childRoot}; former parent: ${formerParentRoot})`);
+      // Surface ruling (docs_claude/lens-dorabotok/A06-surface-decisions.md):
+      // non-modal toast + a 'Show Log' action revealing the detail line above.
+      // Deliberately NO 'Do not show again' — suppression would re-introduce
+      // silent history loss. Fires once per promoted child (registry dedup).
+      void vscode.window
+        .showInformationMessage(`Talaria Checkpoints: ${msg}`, 'Show Log')
+        .then((choice) => {
+          if (choice === 'Show Log') output.show();
+        });
+    },
+  });
+  void registry.reconcile();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => void registry.reconcile()),
+  );
+  return registry;
+}
+
 function createCheckpointTracker(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
