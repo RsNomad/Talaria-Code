@@ -64,6 +64,16 @@ function endpointHost(rawUrl: string): string {
 }
 
 /**
+ * BHF-F3-6 — liveness token for the two async API-key reads (activation
+ * `initApiKey`, rotation re-read), the `SessionController.modelSwitchSeq`
+ * idiom: each read captures `++keyRefreshSeq` AT ISSUE TIME and applies
+ * (`secretApiKey = …; rebuild()`) only while still current. The rotation
+ * listener's read, issued later, therefore always outranks a slower
+ * activation read — one winner assigns AND rebuilds; losers no-op.
+ */
+let keyRefreshSeq = 0;
+
+/**
  * Frozen public entry (Zone AC) — the controller wires this
  * into `extension.ts`. Reads its own config from
  * `vscode.workspace.getConfiguration('talaria.autocomplete')`.
@@ -204,8 +214,12 @@ export function registerTalariaAutocomplete(
   };
 
   // Load (and one-time migrate) the API key from SecretStorage.
+  const initSeq = ++keyRefreshSeq; // F3-6: captured at ISSUE time
   void initApiKey(context, cfg.apiKey).then(
     (key) => {
+      // F3-6: a rotation read issued after us owns the state now — do not
+      // overwrite the fresher key with this slower read's result.
+      if (initSeq !== keyRefreshSeq) return;
       secretApiKey = key;
       rebuild();
     },
@@ -249,8 +263,10 @@ export function registerTalariaAutocomplete(
   // another window) without a reload.
   const secretDisposable = context.secrets.onDidChange((e) => {
     if (e.key !== AUTOCOMPLETE_API_KEY_SECRET) return;
+    const seq = ++keyRefreshSeq; // F3-6: captured at ISSUE time
     void context.secrets.get(AUTOCOMPLETE_API_KEY_SECRET).then(
       (key) => {
+        if (seq !== keyRefreshSeq) return; // superseded — the newer read owns the state
         secretApiKey = key ?? undefined;
         rebuild();
       },
