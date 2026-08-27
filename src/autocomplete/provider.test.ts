@@ -332,8 +332,8 @@ describe(
   },
 );
 
-describe('TalariaInlineCompletionProvider — widget-open prefix/range (finding #1)', () => {
-  it('splices the prefix at the widget range start, not the cursor — no duplicated typed text', async () => {
+describe('TalariaInlineCompletionProvider — widget-open prefix/range (finding #1) (BHF-F1-5 verify-first)', () => {
+  it('splices the prefix at the widget range start, not the cursor — no duplicated typed text (BHF-F1-5: request-side pin, not response-rigged)', async () => {
     const doc = new FakeDocument('getD');
     const position = new vscode.Position(0, 4); // cursor right after "getD"
     const wordStart = new vscode.Position(0, 0);
@@ -355,8 +355,17 @@ describe('TalariaInlineCompletionProvider — widget-open prefix/range (finding 
       fakeToken(),
     );
 
-    // The bug: old code produced "getDgetData". Fixed: splice at wordStart.
+    // BHF-F1-5 (verify-first): this is the NON-RIGGED, request-side proof —
+    // it asserts what the engine RECEIVED (engine.calls[0].prefix), which is
+    // captured independently of engine.respondWith above. A response-side-only
+    // pin (asserting the returned item startsWith the widget text) would prove
+    // nothing about the request, since a rigged response trivially satisfies
+    // it by construction. The bug: old code produced "getDgetData" (the typed
+    // partial left in place, ahead of the full widget word, both sent to the
+    // engine). Fixed: splice at wordStart, so the request prefix is exactly
+    // the full widget word with no doubled partial.
     expect(must(engine.calls[0]).prefix).toBe('getData');
+    expect(must(engine.calls[0]).prefix).not.toContain('getDgetData'); // the self-defeat shape
     expect(must(engine.calls[0]).suffix).toBe('');
 
     expect(result).not.toBeNull();
