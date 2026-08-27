@@ -52,8 +52,14 @@ export const qwenMultifileFimTemplate: FimTemplate = {
       )
       .join('\n');
     const currentPath = toRelativePath(ctx.filepath, ctx.workspaceUris);
+    // WV1-MIN-ARCH (empty `<|repo_name|>` edge): the trained repo-FIM shape
+    // always carries a name in this slot — llama.cpp inserts the dummy
+    // `myproject` server-side for the same case (see provider.ts's
+    // reponameFromWorkspace doc). An empty name diverges from the trained
+    // shape; render the same dummy instead.
+    const repoName = ctx.reponame !== undefined && ctx.reponame !== '' ? ctx.reponame : 'myproject';
     return (
-      `<|repo_name|>${ctx.reponame ?? ''}\n${fileBlocks}\n` +
+      `<|repo_name|>${repoName}\n${fileBlocks}\n` +
       `<|file_sep|>${currentPath}\n` +
       `<|fim_prefix|>${prefix}<|fim_suffix|>${suffix}<|fim_middle|>`
     );
