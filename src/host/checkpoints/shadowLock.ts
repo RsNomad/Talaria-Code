@@ -163,16 +163,22 @@ async function tryStealStaleLock(lockPath: string, staleMs: number): Promise<voi
       await fs.rm(stolenPath, { force: true }).catch(() => undefined);
       return;
     }
-    // Grabbed a now-live lock; put it back so its owner is not silently evicted.
-    try {
-      await fs.access(lockPath);
-      // A newer lock already occupies the slot — ours is obsolete, drop it.
-      await fs.rm(stolenPath, { force: true }).catch(() => undefined);
-    } catch {
-      await fs.rename(stolenPath, lockPath).catch(async () => {
-        await fs.rm(stolenPath, { force: true }).catch(() => undefined);
-      });
-    }
+    // Grabbed a now-LIVE lock: put it back so its owner is not silently
+    // evicted. CA-04 (WS-CK): the restore is link(2), NEVER check-then-rename.
+    // rename(2) REPLACES an existing target, so a third party's fresh lock
+    // created between an existence check and a rename would be silently
+    // clobbered — two holders. link(2) is atomic-fail-on-exist:
+    //   - success -> the live owner's file is back at lockPath (same inode,
+    //     token intact, its heartbeat keeps matching); our extra name for the
+    //     inode is then removed below.
+    //   - EEXIST  -> a NEWER lock already occupies the slot; our stolen copy
+    //     is obsolete — it is removed below, the occupant untouched.
+    //   - any other failure degrades exactly like the old rename-failure
+    //     fallback: the stolen copy is dropped (the displaced owner's
+    //     heartbeat sees the missing file and stops refreshing — the same
+    //     pre-existing residual, not widened).
+    await fs.link(stolenPath, lockPath).catch(() => undefined);
+    await fs.rm(stolenPath, { force: true }).catch(() => undefined);
   } catch {
     await fs.rm(stolenPath, { force: true }).catch(() => undefined);
   }
