@@ -3473,3 +3473,268 @@ describe('BHF-F3-15 — stale-coordinate apply is refused and dismissed', () => 
     expect(host.warnings.some((w) => w.includes('could not be applied'))).toBe(true);
   });
 });
+
+// ───────── WS-FIM T15 — FUNC-NEXTEDIT characterization: ordered host-effect ─────────
+// trace pins (pre-T16 move). Lesson applied (memory: T13/WS-R1): pin the
+// ORDERING of host effects, not the end state — a final-state pin can be
+// backstop-masked. These are behavior-preservation pins for T16's promotion
+// of `registerTalariaNextEdit` to a class: characterization tests that pass
+// GREEN on current code (that IS success here, not a RED-first cycle).
+
+describe('FUNC-NEXTEDIT characterization — executor ordered-effect trace (pre-T16 move)', () => {
+  /**
+   * A THIRD `scriptedHost`, block-local — same shape as the BHF-F3-15 one
+   * above, duplicated rather than shared (this file's established
+   * convention; see the 'BHF-F3-15 — stale-coordinate apply is refused'
+   * block's own comment about mirroring setup verbatim). Every call renders
+   * as exactly one string so a whole multi-batch scenario reads as ONE
+   * ordered list via a single `toEqual`.
+   */
+  function scriptedHost(calls: string[], applyResult: boolean | Error) {
+    return {
+      setContext: (key: string, value: boolean) => {
+        calls.push(`setContext ${key}=${String(value)}`);
+      },
+      showDecorations: () => {
+        calls.push('showDecorations');
+        return true;
+      },
+      clearDecorations: () => {
+        calls.push('clearDecorations');
+      },
+      reveal: () => {
+        calls.push('reveal');
+      },
+      applyEdit: (
+        _region: EditableRegion,
+        _newText: string,
+        expected: import('./types').ApplyExpectation | null,
+      ) => {
+        calls.push(
+          `applyEdit expected=${expected === null ? 'null' : `${expected.docVersion}:${expected.baseText}`}`,
+        );
+        return applyResult instanceof Error ? Promise.reject(applyResult) : Promise.resolve(applyResult);
+      },
+      note: (msgId: string) => {
+        calls.push(`note ${msgId}`);
+      },
+    };
+  }
+
+  const p: AnchoredProposal = {
+    region: { uri: 'file:///w/a.ts', filepath: 'a.ts', startLine: 2, endLine: 6, content: 'R' },
+    newText: 'N',
+    docVersion: 3,
+    cursorLine: 4,
+  };
+
+  it('pins the exact host-call order for the canonical batches', async () => {
+    const calls: string[] = [];
+    const results: boolean[] = [];
+    const executor = makeExecutor(
+      scriptedHost(calls, true),
+      (ok) => results.push(ok),
+      () => ({ docVersion: 3, baseText: 'R' }),
+    );
+    // proposalReady batch (idle×proposalReady): setContext THEN paint.
+    executor.run([
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
+      { kind: 'showDecorations', p },
+    ]);
+    // proposed×tabJump batch: jumped flip triggers the property-2 re-render, then reveal.
+    executor.run([
+      { kind: 'setContext', key: 'talaria.nextEdit.jumped', value: true },
+      { kind: 'reveal', range: { startLine: 2, endLine: 6 } },
+    ]);
+    // jumped×tabAccept batch: applyEdit THEN clearAll.
+    executor.run([{ kind: 'applyEdit', region: p.region, newText: 'N' }, { kind: 'clearAll' }]);
+    await Promise.resolve();
+
+    expect(calls).toEqual([
+      'setContext talaria.nextEdit.jumpVisible=true',
+      'showDecorations',
+      'setContext talaria.nextEdit.jumped=true',
+      'showDecorations', // property 2: the jumped flip re-renders in place
+      'reveal',
+      'applyEdit expected=3:R',
+      'setContext talaria.nextEdit.jumpVisible=false', // clearAll, exact internal order
+      'setContext talaria.nextEdit.jumped=false',
+      'clearDecorations',
+    ]);
+    expect(results).toEqual([true]);
+  });
+
+  it('pins the declined-paint order: a false showDecorations forces the full clearAll sequence immediately', () => {
+    const calls: string[] = [];
+    const host = scriptedHost(calls, true);
+    host.showDecorations = () => {
+      calls.push('showDecorations->declined');
+      return false;
+    };
+    const executor = makeExecutor(host, () => {}, () => null);
+    executor.run([
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
+      { kind: 'showDecorations', p },
+    ]);
+    expect(calls).toEqual([
+      'setContext talaria.nextEdit.jumpVisible=true',
+      'showDecorations->declined',
+      'setContext talaria.nextEdit.jumpVisible=false',
+      'setContext talaria.nextEdit.jumped=false',
+      'clearDecorations',
+    ]);
+  });
+});
+
+/**
+ * Shell-level ordered trace: ONE scenario through the REAL
+ * `registerTalariaNextEdit` against the fake-vscode harness, from activation
+ * through an applied edit. Reuses `setupShell`/`fireTrigger`/
+ * `host.docChangeHandlers`/`makeEditor`/`makeDoc` verbatim (the same pieces
+ * 'next-edit commands' and 'next-edit document listeners' already use above)
+ * — no parallel harness.
+ *
+ * The interleaved trace is assembled by tapping the harness's OWN recorders
+ * (`host.executed`'s setContext entries, `host.decorationCalls`,
+ * `host.reveals`, `host.appliedEdits`) IN REAL TIME as the scenario runs, so
+ * the merge reflects the true cross-array call order rather than a guess
+ * reconstructed after the fact from four separately-timestamped arrays. The
+ * tap is installed and torn down inside this one test only — it is never a
+ * permanent change to the shared `host` fake.
+ */
+describe('FUNC-NEXTEDIT characterization — shell ordered-effect trace (pre-T16 move)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHost();
+    failures.length = 0;
+    backendSpy.constructed.length = 0;
+    backendSpy.predicts.length = 0;
+    mintCalls.length = 0;
+    backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
+    autocompleteConfig.backend = 'ollama';
+    autocompleteConfig.apiKey = undefined;
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Temporarily wraps `arr.push` to also feed `onPush`, returning the
+   *  restorer. Scoped to ONE test via the `finally` below — never a
+   *  permanent harness change. */
+  function tapPush<T>(arr: T[], onPush: (item: T) => void): () => void {
+    const original = arr.push.bind(arr);
+    arr.push = (...items: T[]): number => {
+      for (const item of items) onPush(item);
+      return original(...items);
+    };
+    return () => {
+      arr.push = original;
+    };
+  }
+
+  /** Region calls carry bare `Range`-shaped entries (`.start`/`.end`
+   *  directly); locator calls carry `{ range, renderOptions }` entries —
+   *  same shape distinction 'an edit ENTIRELY ABOVE the region SHIFTS...'
+   *  uses above. An empty `ranges` array (a `clearDecorations` sweep) cannot
+   *  be told apart by shape, hence the third label. */
+  function decorationLabel(call: { type: string; ranges: unknown[] }): string {
+    if (call.ranges.length === 0) return 'setDecorations clear';
+    const first = call.ranges[0];
+    return typeof first === 'object' && first !== null && 'start' in first
+      ? 'setDecorations region'
+      : 'setDecorations locator';
+  }
+
+  it('pins one interleaved host-effect trace: activation -> toggle-on -> edit burst -> proposalReady paint -> docChanged remap -> tabJump -> tabAccept -> applied', async () => {
+    const trace: string[] = [];
+    const untaps = [
+      tapPush(host.executed, (item) => {
+        if (item.command === 'setContext') {
+          trace.push(`setContext ${String(item.args[0])}=${String(item.args[1])}`);
+        }
+      }),
+      tapPush(host.decorationCalls, (item) => trace.push(decorationLabel(item))),
+      tapPush(host.reveals, () => trace.push('reveal')),
+      tapPush(host.appliedEdits, (item) => {
+        const r = item.range as { start: { line: number }; end: { line: number } };
+        trace.push(`applyEdit range=${r.start.line}-${r.end.line}`);
+      }),
+    ];
+
+    try {
+      // activation + toggle-on (NextEditGuard hydrated straight to
+      // 'dedicated', the same pattern every test in this file uses).
+      const tallLines = Array.from({ length: 60 }, (_, i) => `const v${i} = ${i};`);
+      const doc = makeDoc({ text: `${tallLines.join('\n')}\n` });
+      host.activeTextEditor = makeEditor(doc, 40); // region = lines 30..50 (windowLines=10)
+      await setupShell({ next: true, generic: false });
+
+      // edit burst -> (mocked backend) round-trip -> proposalReady paint.
+      await fireTrigger();
+      expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
+
+      // docChanged remap: an edit entirely ABOVE the region shifts it rather
+      // than dismissing it (same shape as 'an edit ENTIRELY ABOVE the region
+      // SHIFTS the proposal down instead of dismissing it', above). Unlike
+      // that test, THIS scenario goes on to apply through the real region
+      // text afterwards, so the fake document's actual lines must reflect
+      // the insertion too (inserting 'a\nb\n' at line 5 shifts everything
+      // from line 5 down by two, content unchanged) — a plain `.version`
+      // bump on the SAME object (as `fireDocChange` above does) does not
+      // touch the closed-over `lines` the fake's `getText`/`lineAt` read
+      // from, which the BHF-F3-15 base-text-drift test relies on directly.
+      const editedLines = [...tallLines.slice(0, 5), 'a', 'b', ...tallLines.slice(5)];
+      const editedDoc = makeDoc({ text: `${editedLines.join('\n')}\n`, version: doc.version + 1 });
+      host.activeTextEditor = makeEditor(editedDoc, 42); // same identity (default uri); cursor is stale post-shift, unused after this point
+      for (const handler of host.docChangeHandlers) {
+        handler({
+          document: editedDoc,
+          contentChanges: [
+            { range: { start: { line: 5, character: 0 }, end: { line: 5, character: 0 } }, text: 'a\nb\n' },
+          ],
+        });
+      }
+
+      // tabJump.
+      await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+      // tabAccept -> applied.
+      await host.registeredCommands.get('talaria.nextEdit.accept')?.();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(host.appliedEdits).toHaveLength(1);
+    } finally {
+      for (const untap of untaps) untap();
+    }
+
+    expect(trace).toEqual([
+      // idle×proposalReady: setContext THEN the paint (region, then locator).
+      'setContext talaria.nextEdit.jumpVisible=true',
+      'setDecorations region',
+      'setDecorations locator',
+      // proposed×docChanged(remapped): re-anchor repaints, no setContext —
+      // the proposal did not change, only its on-screen coordinates.
+      'setDecorations region',
+      'setDecorations locator',
+      // proposed×tabJump: setContext, THEN the executor's own property-2
+      // re-render (the jumped flip repaints the locator's verb in place),
+      // THEN reveal.
+      'setContext talaria.nextEdit.jumped=true',
+      'setDecorations region',
+      'setDecorations locator',
+      'reveal',
+      // jumped×tabAccept: applyEdit (at the RE-ANCHORED span, 32-52 = the
+      // original 30-50 shifted +2 by the docChanged step above) THEN
+      // clearAll's two setContext calls. clearAll's THIRD action
+      // (clearDecorations) produces no `setDecorations` entries here because
+      // this scenario's `host.visibleTextEditors` is empty — the same
+      // harness shape 'jump then accept applies the edit through a plain
+      // WorkspaceEdit' above uses, never populated there either.
+      'applyEdit range=32-52',
+      'setContext talaria.nextEdit.jumpVisible=false',
+      'setContext talaria.nextEdit.jumped=false',
+    ]);
+  });
+});
