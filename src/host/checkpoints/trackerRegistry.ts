@@ -27,7 +27,7 @@ import * as path from 'node:path';
 import { CheckpointTracker, shadowDirFor } from './CheckpointTracker';
 import { DEFAULT_DISPOSE_FLUSH_DEADLINE_MS } from './constants';
 import { canonicalizeWorkspaceRoot, findContainingWorkspaceRoot } from './rootResolution';
-import type { CheckpointTrackerLike } from './trackerContract';
+import type { CheckpointTrackerLike, CheckpointTrackerRegistryLike } from './trackerContract';
 
 /** The structural tracker surface the registry manages (the real `CheckpointTracker` satisfies it; tests inject fakes). */
 export interface RegistryTrackerLike extends CheckpointTrackerLike {
@@ -49,9 +49,16 @@ export interface TrackerRegistryDeps {
   listFolders: () => readonly string[];
   /** User-visible log line (extension.ts wires the OutputChannel). */
   log: (line: string) => void;
-  /** Seam (repo idiom: LanceDBStore.connectImpl). Default mints a real CheckpointTracker on the CANONICAL root. */
+  /**
+   * Seam (repo idiom: LanceDBStore.connectImpl). Default mints a real CheckpointTracker on the CANONICAL root.
+   * Override BOTH this and `shadowDirForImpl` together, or NEITHER — overriding only one diverges the
+   * registry's own bookkeeping shadowDir (`shadowDirOwner`) from the real tracker's `shadowGitDir`.
+   */
   makeTracker?: (canonicalRoot: string) => RegistryTrackerLike;
-  /** Seam for the hash-collision test (sha256-16 cannot be collided for real). */
+  /**
+   * Seam for the hash-collision test (sha256-16 cannot be collided for real).
+   * Override BOTH this and `makeTracker` together, or NEITHER — see `makeTracker`'s doc above.
+   */
   shadowDirForImpl?: (storageDir: string, workspaceRoot: string) => string;
   /** Fired ONCE per promoted child (spec req 6b, option b). Unused until Task 14's full reconcile pass. */
   onPromotion?: (childRoot: string, formerParentRoot: string) => void;
@@ -86,7 +93,7 @@ function errCode(err: unknown): string {
   return err instanceof Error ? err.name : 'unknown';
 }
 
-export class CheckpointTrackerRegistry {
+export class CheckpointTrackerRegistry implements CheckpointTrackerRegistryLike {
   private readonly deps: ResolvedDeps;
 
   private readonly trackers = new Map<string, RegistryTrackerLike>();
@@ -136,13 +143,19 @@ export class CheckpointTrackerRegistry {
     }
   }
 
-  /** deactivate-scope: disposeAndFlush EVERY tracker (sequential, best-effort), then clear. */
+  /**
+   * deactivate-scope: disposeAndFlush EVERY tracker (sequential, best-effort).
+   * No terminal `.clear()` here (review fix, Minor b) — each `removeRoot`
+   * call already empties both maps of ITS OWN entry via `removeRegistration`
+   * (synchronously, before the flush is even awaited), so a blanket clear at
+   * the end would only mask a `removeRoot` that failed to deregister —
+   * `size === 0` afterward is real proof the per-root removal path ran, not
+   * a side effect of this method's own bookkeeping.
+   */
   async disposeAll(): Promise<void> {
     for (const [canonicalRoot] of [...this.trackers.entries()]) {
       await this.removeRoot(canonicalRoot).catch(() => undefined);
     }
-    this.trackers.clear();
-    this.shadowDirOwner.clear();
   }
 
   /**
@@ -153,14 +166,18 @@ export class CheckpointTrackerRegistry {
    *    compute the same `shadowDir` via the injected test seam (sha256-16 is
    *    not collidable for real) — refuse honestly rather than let two roots
    *    silently share one shadow history.
-   * 2. **Symlinked-root adopt-by-rename (spec req 1).** When the raw listed
-   *    path is a symlink into `canonicalRoot`, its shadow history lives under
-   *    the OLD lexical hash — move it to the canonical hash so history
-   *    survives the realpath switch. Deliberately NOT gated on whether the
-   *    canonical shadow dir already exists: a two-window race (two callers
-   *    both see the lexical dir present) lets one winner actually move it,
-   *    and the loser's `fs.rename` then fails naturally (source vanished, or
-   *    target now occupied) — caught below and disclosed, never silent.
+   * 2. **Symlinked-root adopt-by-rename (spec req 1).** When `rawFolderPath`
+   *    is itself a symlink resolving to `canonicalRoot` (never a merely
+   *    NESTED descendant of it — see the `canonicalizeWorkspaceRoot`
+   *    re-check below), its shadow history lives under the OLD lexical hash
+   *    — move it to the canonical hash so history survives the realpath
+   *    switch. Gated FIRST on `!shadowDir-exists`: on POSIX, `fs.rename`
+   *    onto an existing EMPTY directory SUCCEEDS and would silently clobber
+   *    a canonical shadow (including a concurrent init's freshly-`mkdir`'d
+   *    dir, or a crash leftover) — never rename onto an existing target. The
+   *    `catch` around the rename itself remains as belt-and-suspenders for
+   *    the residual TOCTOU window (Node has no `renameat2(RENAME_NOREPLACE)`
+   *    to close it atomically) — disclosed, never silent, either way.
    * 3. **Mint + per-root init isolation.** `makeTracker(canonicalRoot)` —
    *    constructor arg is the canonical string, so key === hash input by
    *    construction. Registers in BOTH maps BEFORE kicking off `init()`
@@ -181,15 +198,37 @@ export class CheckpointTrackerRegistry {
       return;
     }
 
-    const lexical = path.resolve(rawFolderPath);
-    if (lexical !== canonicalRoot) {
-      const lexDir = shadowDirForImpl(storageDir, lexical);
-      if (lexDir !== shadowDir && (await pathExists(lexDir))) {
-        try {
-          await fs.rename(lexDir, shadowDir);
-        } catch (err) {
+    // FIX 2 (review, mis-adoption guard): `lexical !== canonicalRoot` alone
+    // conflates "rawFolderPath is a symlink INTO canonicalRoot" with
+    // "rawFolderPath is a NESTED DESCENDANT whose containing root happens to
+    // be canonicalRoot" (`reconcile()` maps a nested child's rawFolderPath to
+    // its containing root's canonical string via `findContainingWorkspaceRoot`
+    // before calling this method). Only the former is a genuine symlink
+    // alias eligible for adoption — require rawFolderPath to itself
+    // realpath to canonicalRoot before ever computing a lexical hash to
+    // adopt from. A nested/other root's own pre-A6 shadow (if any) is simply
+    // not touched — nothing to adopt, so nothing is logged either.
+    if (canonicalizeWorkspaceRoot(rawFolderPath) === canonicalRoot) {
+      const lexical = path.resolve(rawFolderPath);
+      if (lexical !== canonicalRoot) {
+        const lexDir = shadowDirForImpl(storageDir, lexical);
+        const lexicalExists = lexDir !== shadowDir && (await pathExists(lexDir));
+        if (lexicalExists && !(await pathExists(shadowDir))) {
+          // FIX 1 (review, POSIX-safety guard): !shadowDir-exists checked
+          // FIRST — see the phase-2 doc comment above.
+          try {
+            await fs.rename(lexDir, shadowDir);
+          } catch (err) {
+            // Residual micro-TOCTOU: shadowDir may appear between the check
+            // and the rename — the catch discloses it, never silent.
+            log(
+              `checkpoints: could not adopt existing shadow history for symlinked root ${canonicalRoot} (${errCode(err)}); starting a fresh shadow — prior history remains at ${lexDir}`,
+            );
+          }
+        } else if (lexicalExists) {
+          // shadowDir already exists — do NOT clobber it; disclose and start fresh.
           log(
-            `checkpoints: could not adopt existing shadow history for symlinked root ${canonicalRoot} (${errCode(err)}); starting a fresh shadow — prior history remains at ${lexDir}`,
+            `checkpoints: could not adopt existing shadow history for symlinked root ${canonicalRoot} (shadow already present); starting a fresh shadow — prior history remains at ${lexDir}`,
           );
         }
       }

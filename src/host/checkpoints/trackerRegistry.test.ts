@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { promises as fsPromises } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -234,6 +235,94 @@ describe('CheckpointTrackerRegistry (WS-CK-A6 Task 13 core)', () => {
         rmSync(storageDir, { recursive: true, force: true });
         rmSync(linkParent, { recursive: true, force: true });
         rmSync(real, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe.runIf(CAN_SYMLINK)('adopt-by-rename POSIX-safety guard (review fix)', () => {
+    it('an existing EMPTY canonical shadowDir is never clobbered by rename (spy-proven)', async () => {
+      const storageDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-store-'));
+      const real = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-real-'));
+      const linkParent = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-link-'));
+      const link = path.join(linkParent, 'ws');
+      symlinkSync(real, link, 'junction');
+      const renameSpy = vi.spyOn(fsPromises, 'rename');
+      try {
+        const canonicalRoot = canonicalizeWorkspaceRoot(link);
+        const lexical = path.resolve(link);
+        const lexDir = shadowDirFor(storageDir, lexical);
+        const canonicalShadowDir = shadowDirFor(storageDir, canonicalRoot);
+        mkdirSync(lexDir, { recursive: true });
+        writeFileSync(path.join(lexDir, 'marker.txt'), 'hello');
+        mkdirSync(canonicalShadowDir, { recursive: true }); // pre-exists, EMPTY — the dangerous case on POSIX
+
+        const log = vi.fn();
+        const registry = new CheckpointTrackerRegistry({
+          storageDir,
+          listFolders: () => [link],
+          log,
+          makeTracker: () => makeFakeTracker(),
+        });
+
+        await registry.reconcile();
+
+        // The guard must skip the rename attempt entirely — never call it
+        // when the target already exists (POSIX `fs.rename` onto an existing
+        // EMPTY dir SUCCEEDS and would silently clobber it).
+        expect(renameSpy).not.toHaveBeenCalled();
+        expect(existsSync(path.join(lexDir, 'marker.txt'))).toBe(true); // history retained, not clobbered
+        expect(existsSync(path.join(canonicalShadowDir, 'marker.txt'))).toBe(false); // canonical shadow untouched
+        expect(loggedSubstring(log, 'could not adopt')).toBe(true); // disclosed, never silent
+      } finally {
+        renameSpy.mockRestore();
+        rmSync(storageDir, { recursive: true, force: true });
+        rmSync(linkParent, { recursive: true, force: true });
+        rmSync(real, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('adopt-by-rename mis-adoption contract guard (review fix)', () => {
+    it("does not adopt a nested descendant folder's own shadow into its containing root's canonical shadow", async () => {
+      const parentRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-nest-parent-'));
+      const storageDir = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-nest-store-'));
+      const childDir = path.join(parentRoot, 'child');
+      mkdirSync(childDir, { recursive: true });
+      const renameSpy = vi.spyOn(fsPromises, 'rename');
+      try {
+        const canonicalParent = canonicalizeWorkspaceRoot(parentRoot);
+        // Sanity: the nested child is genuinely a DIFFERENT real directory
+        // from the parent — this is NOT a symlink-alias case.
+        expect(canonicalizeWorkspaceRoot(childDir)).not.toBe(canonicalParent);
+
+        const childLexical = path.resolve(childDir);
+        const childShadowDir = shadowDirFor(storageDir, childLexical);
+        mkdirSync(childShadowDir, { recursive: true });
+        writeFileSync(path.join(childShadowDir, 'marker.txt'), 'child-history');
+
+        const log = vi.fn();
+        // Both the parent AND its nested child are listed — `reconcile()`
+        // maps the child's rawFolderPath to the PARENT's canonical root
+        // (`findContainingWorkspaceRoot`), which is exactly the confusion
+        // the fix must not act on.
+        const registry = new CheckpointTrackerRegistry({
+          storageDir,
+          listFolders: () => [parentRoot, childDir],
+          log,
+          makeTracker: () => makeFakeTracker(),
+        });
+
+        await registry.reconcile();
+
+        const parentShadowDir = shadowDirFor(storageDir, canonicalParent);
+        expect(renameSpy).not.toHaveBeenCalledWith(childShadowDir, expect.anything());
+        expect(existsSync(path.join(childShadowDir, 'marker.txt'))).toBe(true); // child's own history untouched
+        expect(existsSync(path.join(parentShadowDir, 'marker.txt'))).toBe(false); // never merged into the parent
+        expect(loggedSubstring(log, 'could not adopt')).toBe(false); // nothing to adopt — not even disclosed
+      } finally {
+        renameSpy.mockRestore();
+        rmSync(parentRoot, { recursive: true, force: true });
+        rmSync(storageDir, { recursive: true, force: true });
       }
     });
   });
