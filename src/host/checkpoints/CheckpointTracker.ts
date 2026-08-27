@@ -725,6 +725,27 @@ export class CheckpointTracker {
           // link (whether stale from a prior state, or raced in above) so a
           // fresh regular file lands at the intended in-tree path.
           await removeIfSymlink(absPath);
+          // CA-05 (WS-CK): containment RE-ASSERTION, placed immediately before
+          // the write — AFTER removeIfSymlink — so the validation→write window
+          // shrinks to the single open() below. The `safe` result computed at
+          // the top of this iteration does NOT travel with the string: the OS
+          // re-resolves every path component fresh on each syscall, so an
+          // ancestor dir swapped to an out-of-tree symlink during the awaited
+          // `git show` above would be FOLLOWED by this write's non-leaf
+          // components (O_NOFOLLOW guards the LEAF only — the :704-711
+          // argument, applied symmetrically to the ancestor). A violation
+          // rides the SAME skippedPaths disclosure as the loop-top refusal.
+          // Honest residual (ADR-006): between THIS check's own resolution and
+          // the open() an ancestor swap is theoretically still possible; full
+          // closure needs openat()-per-component inside frozen safeWrite —
+          // owner-gated, deliberately not taken here.
+          const dirSafe = await resolveWithinWorkspaceReal(path.dirname(absPath), [
+            this.workspaceRoot,
+          ]);
+          if (dirSafe === null) {
+            skippedPaths.push(change.path);
+            continue;
+          }
           // `writeFileNoFollow` (`../backend/acp/safeWrite.ts`) is the belt-
           // and-suspenders backstop for the tiny remaining gap between the
           // cleanup above and this open: on Linux it opens with `O_NOFOLLOW`,
