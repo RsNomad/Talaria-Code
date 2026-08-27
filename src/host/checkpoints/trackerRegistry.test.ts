@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CheckpointsData } from '../../shared/protocol';
 import type { RestoreResult } from './CheckpointTracker';
 import { shadowDirFor } from './CheckpointTracker';
-import { canonicalizeWorkspaceRoot } from './rootResolution';
+import { canonicalizeWorkspaceRoot, findContainingWorkspaceRoot } from './rootResolution';
 import { CheckpointTrackerRegistry } from './trackerRegistry';
 import type { RegistryTrackerLike } from './trackerRegistry';
 
@@ -371,9 +371,10 @@ describe('CheckpointTrackerRegistry (WS-CK-A6 Task 13 core)', () => {
           return calls === 1 ? deadTracker : healthyTracker;
         });
         const log = vi.fn();
+        let folders: string[] = [rootB];
         const registry = new CheckpointTrackerRegistry({
           storageDir: '/store',
-          listFolders: () => [rootB],
+          listFolders: () => folders,
           log,
           makeTracker,
         });
@@ -381,7 +382,16 @@ describe('CheckpointTrackerRegistry (WS-CK-A6 Task 13 core)', () => {
         await registry.reconcile(); // mints deadTracker; its init() is still pending
         expect(registry.get(canonicalB)).toBe(deadTracker);
 
-        await registry.reconcile(); // stub unconditionally re-adds -> mints healthyTracker, replaces the entry
+        // Task 14's reconcile() skips an already-registered root (idempotency
+        // guard), so re-calling it with the SAME folder list is now a no-op —
+        // churn the folder list to force a genuine remove+re-add cycle,
+        // producing a real successor instance for the SAME canonical root.
+        folders = [];
+        await registry.reconcile(); // removes deadTracker (disposeAndFlush -> default 'flushed')
+        expect(registry.get(canonicalB)).toBeUndefined();
+
+        folders = [rootB];
+        await registry.reconcile(); // mints healthyTracker, a genuine successor
         expect(registry.get(canonicalB)).toBe(healthyTracker);
 
         // The FIRST (now-superseded) instance's init() finally rejects, LATE.
@@ -498,6 +508,243 @@ describe('CheckpointTrackerRegistry (WS-CK-A6 Task 13 core)', () => {
       } finally {
         rmSync(rootA, { recursive: true, force: true });
       }
+    });
+  });
+
+  /**
+   * WS-CK-A6 Task 14: the real reconcile pass — resolver-derived desired set
+   * (ONE containment rule, spec req 5), single-flight serialization + a
+   * chain-mutex (spec req 4), construct-before-dispose (spec req 4), and
+   * promotion notice (spec req 6b, option b). Task 13's `reconcile()` stub
+   * (unconditional re-add, every folder, every call, NO removal) is replaced
+   * here — these scenarios exercise removal/serialization/promotion that the
+   * stub never implemented.
+   */
+  describe('reconcile — Task 14 real pass', () => {
+    describe('first-listed-wins desired set (spec req 5)', () => {
+      it('child listed FIRST: the resolver keeps both child and parent as their own root (2 trackers)', async () => {
+        const parent = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-t14-fw-parent-'));
+        const child = path.join(parent, 'child');
+        mkdirSync(child, { recursive: true });
+        try {
+          const canonicalParent = canonicalizeWorkspaceRoot(parent);
+          const canonicalChild = canonicalizeWorkspaceRoot(child);
+          const log = vi.fn();
+          const registry = new CheckpointTrackerRegistry({
+            storageDir: '/store',
+            listFolders: () => [child, parent], // child listed FIRST
+            log,
+            makeTracker: () => makeFakeTracker(),
+          });
+
+          await registry.reconcile();
+
+          expect(registry.size).toBe(2);
+          expect(registry.get(canonicalChild)).toBeDefined();
+          expect(registry.get(canonicalParent)).toBeDefined();
+        } finally {
+          rmSync(parent, { recursive: true, force: true });
+        }
+      });
+
+      it('parent listed FIRST: the desired set collapses to the parent alone (1 tracker); a cwd inside the child still routes there — no spurious NO_TRACKER', async () => {
+        const parent = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-t14-fw-parent2-'));
+        const child = path.join(parent, 'child');
+        mkdirSync(child, { recursive: true });
+        try {
+          const canonicalParent = canonicalizeWorkspaceRoot(parent);
+          const canonicalChild = canonicalizeWorkspaceRoot(child);
+          const folders = [parent, child]; // parent listed FIRST
+          const log = vi.fn();
+          const registry = new CheckpointTrackerRegistry({
+            storageDir: '/store',
+            listFolders: () => folders,
+            log,
+            makeTracker: () => makeFakeTracker(),
+          });
+
+          await registry.reconcile();
+
+          expect(registry.size).toBe(1);
+          expect(registry.get(canonicalParent)).toBeDefined();
+          expect(registry.get(canonicalChild)).toBeUndefined();
+
+          // cwd-routing companion: a file inside the child resolves (via the
+          // SAME resolver the runtime routes with) to a root the registry
+          // covers — no spurious NO_TRACKER for a cwd already tracked.
+          const childFile = path.join(child, 'some-file.ts');
+          const routedRoot = canonicalizeWorkspaceRoot(findContainingWorkspaceRoot(childFile, folders));
+          expect(registry.get(routedRoot)).toBeDefined();
+        } finally {
+          rmSync(parent, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe('serialized convergence (spec req 4) — single-flight prevents overlap', () => {
+      it('a burst of un-awaited reconcile() calls converges to exactly the last folder state; no root is ever minted twice while its predecessor is still live', async () => {
+        const rootA = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-t14-conv-a-'));
+        const rootB = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-t14-conv-b-'));
+        try {
+          const canonicalA = canonicalizeWorkspaceRoot(rootA);
+          const canonicalB = canonicalizeWorkspaceRoot(rootB);
+
+          // Per-root LIVE-COUNT: mint++ when makeTracker(root) is called,
+          // dispose-- only once THAT instance's disposeAndFlush actually
+          // SETTLES (not merely invoked) — proves no root ever has two live
+          // instances outstanding at once, not just that calls don't overlap
+          // textually.
+          const live = new Map<string, number>();
+          const maxLive = new Map<string, number>();
+          const bumpLive = (root: string, delta: number): void => {
+            const next = (live.get(root) ?? 0) + delta;
+            live.set(root, next);
+            maxLive.set(root, Math.max(maxLive.get(root) ?? 0, next));
+          };
+
+          const gateA = createDeferred<'flushed'>();
+          const makeTracker = vi.fn((canonicalRoot: string) => {
+            bumpLive(canonicalRoot, 1);
+            const isA = canonicalRoot === canonicalA;
+            return makeFakeTracker({
+              disposeAndFlush: async (): Promise<'flushed' | 'deadline' | 'failed'> => {
+                const outcome = isA ? await gateA.promise : ('flushed' as const);
+                bumpLive(canonicalRoot, -1);
+                return outcome;
+              },
+            });
+          });
+
+          const log = vi.fn();
+          let folders: string[] = [rootA];
+          const registry = new CheckpointTrackerRegistry({
+            storageDir: '/store',
+            listFolders: () => folders,
+            log,
+            makeTracker,
+          });
+
+          // Prime: A alone, fully settled (establishes the tracker whose
+          // removal this test gates).
+          await registry.reconcile();
+          expect(registry.get(canonicalA)).toBeDefined();
+
+          // Burst: mutate folders [A]->[A,B]->[B], firing reconcile() for
+          // each WITHOUT awaiting either call before the last one.
+          folders = [rootA, rootB];
+          void registry.reconcile();
+          folders = [rootB];
+          const p2 = registry.reconcile();
+
+          // While A's removal is gated-slow: B is already up
+          // (construct-before-dispose runs the adds before the removes) and
+          // A is already unreachable (removeRegistration precedes the
+          // flush) — but B must have been minted only ONCE, proving the
+          // second (queued) call never ran its own construct step
+          // concurrently with the first.
+          await vi.waitFor(() => {
+            expect(registry.get(canonicalB)).toBeDefined();
+          });
+          expect(registry.get(canonicalA)).toBeUndefined();
+          expect(makeTracker.mock.calls.filter(([r]) => r === canonicalB)).toHaveLength(1);
+
+          gateA.resolve('flushed');
+          await p2;
+
+          expect(registry.size).toBe(1);
+          expect(registry.get(canonicalB)).toBeDefined();
+          expect(registry.get(canonicalA)).toBeUndefined();
+          expect(makeTracker.mock.calls.filter(([r]) => r === canonicalB)).toHaveLength(1);
+          expect(maxLive.get(canonicalA)).toBeLessThanOrEqual(1);
+          expect(maxLive.get(canonicalB)).toBeLessThanOrEqual(1);
+        } finally {
+          rmSync(rootA, { recursive: true, force: true });
+          rmSync(rootB, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe('promotion detection (spec req 6b, option b)', () => {
+      it('a child no longer covered by its parent is promoted to its own root exactly once; re-adding the parent later re-mints it (same canonical root) without re-firing promotion', async () => {
+        const parentRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-t14-promo-parent-'));
+        const childDir = path.join(parentRoot, 'child');
+        mkdirSync(childDir, { recursive: true });
+        try {
+          const canonicalParent = canonicalizeWorkspaceRoot(parentRoot);
+          const canonicalChild = canonicalizeWorkspaceRoot(childDir);
+
+          const parentTrackers: FakeTracker[] = [];
+          const childTrackers: FakeTracker[] = [];
+          const makeTracker = vi.fn((canonicalRoot: string) => {
+            const t = makeFakeTracker();
+            if (canonicalRoot === canonicalParent) parentTrackers.push(t);
+            else childTrackers.push(t);
+            return t;
+          });
+          const onPromotion = vi.fn();
+          const log = vi.fn();
+          let folders: string[] = [parentRoot, childDir]; // parent listed first
+          const registry = new CheckpointTrackerRegistry({
+            storageDir: '/store',
+            listFolders: () => folders,
+            log,
+            makeTracker,
+            onPromotion,
+          });
+
+          await registry.reconcile(); // only the parent is tracked
+          expect(registry.get(canonicalParent)).toBe(parentTrackers[0]);
+          expect(registry.get(canonicalChild)).toBeUndefined();
+
+          folders = [childDir]; // parent no longer listed — child now covers itself
+          await registry.reconcile();
+
+          expect(onPromotion).toHaveBeenCalledTimes(1);
+          expect(onPromotion).toHaveBeenCalledWith(canonicalChild, canonicalParent);
+          expect(registry.get(canonicalChild)).toBe(childTrackers[0]); // fresh instance
+          expect(registry.get(canonicalParent)).toBeUndefined();
+          expect(parentTrackers[0]?.disposeAndFlush).toHaveBeenCalledTimes(1); // retention: flush, not delete
+          expect(parentTrackers[0]?.dispose).not.toHaveBeenCalled();
+
+          folders = [childDir, parentRoot]; // re-add: child listed first, both now desired
+          await registry.reconcile();
+
+          expect(registry.get(canonicalParent)).toBe(parentTrackers[1]); // re-minted, SAME canonical root
+          expect(parentTrackers).toHaveLength(2);
+          expect(onPromotion).toHaveBeenCalledTimes(1); // does NOT re-fire
+        } finally {
+          rmSync(parentRoot, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe('0-roots pass (after having trackers)', () => {
+      it('folders become empty -> every tracker is disposed and removed, size 0', async () => {
+        const rootA = mkdtempSync(path.join(os.tmpdir(), 'hermes-a6-t14-zero-a-'));
+        try {
+          const tracker = makeFakeTracker();
+          const log = vi.fn();
+          let folders: string[] = [rootA];
+          const registry = new CheckpointTrackerRegistry({
+            storageDir: '/store',
+            listFolders: () => folders,
+            log,
+            makeTracker: () => tracker,
+          });
+
+          await registry.reconcile();
+          expect(registry.size).toBe(1);
+
+          folders = [];
+          await registry.reconcile();
+
+          expect(registry.size).toBe(0);
+          expect(tracker.disposeAndFlush).toHaveBeenCalledTimes(1);
+          expect(registry.allTrackers()).toEqual([]);
+        } finally {
+          rmSync(rootA, { recursive: true, force: true });
+        }
+      });
     });
   });
 });

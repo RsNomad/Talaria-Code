@@ -14,12 +14,14 @@
  * NO vscode imports (headless-testable), mirroring `rootRegistry.ts`'s own
  * posture.
  *
- * Scope: this task ships construction, `get`/`allTrackers`/`size`/
- * `disposeAll`, and the private `addRoot`/`removeRoot` lifecycle primitives.
- * `reconcile()` is a MINIMAL STUB here — Task 14 replaces its body with the
- * full serialized pass (removal of vanished roots, first-listed-wins
- * promotion, `reconcileChain` serialization). See the doc comment on
- * `reconcile()` below.
+ * Task 13 shipped construction, `get`/`allTrackers`/`size`/`disposeAll`, and
+ * the private `addRoot`/`removeRoot` lifecycle primitives (with `reconcile()`
+ * as a minimal, unconditional-re-add-only stub). Task 14 replaced that stub
+ * with the full serialized reconcile pass: a resolver-derived desired set
+ * (ONE containment rule, spec req 5), single-flight serialization via
+ * `reconcileChain` (spec req 4), construct-before-dispose within each pass
+ * (spec req 4), and one-shot promotion notice (spec req 6b, option b). See
+ * the doc comments on `reconcile()`/`reconcilePass()` below.
  */
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
@@ -60,7 +62,7 @@ export interface TrackerRegistryDeps {
    * Override BOTH this and `makeTracker` together, or NEITHER — see `makeTracker`'s doc above.
    */
   shadowDirForImpl?: (storageDir: string, workspaceRoot: string) => string;
-  /** Fired ONCE per promoted child (spec req 6b, option b). Unused until Task 14's full reconcile pass. */
+  /** Fired ONCE per promoted child (spec req 6b, option b) by `reconcilePass()`. */
   onPromotion?: (childRoot: string, formerParentRoot: string) => void;
   disposeDeadlineMs?: number;
 }
@@ -99,6 +101,12 @@ export class CheckpointTrackerRegistry implements CheckpointTrackerRegistryLike 
   private readonly trackers = new Map<string, RegistryTrackerLike>();
   /** shadowDir -> the canonical root that currently owns it (hash-collision detection). */
   private readonly shadowDirOwner = new Map<string, string>();
+  /** Single-flight mutex (Task 14): a second `reconcile()` arriving mid-pass chains behind it rather than running concurrently. */
+  private reconcileChain: Promise<void> = Promise.resolve();
+  /** raw listed folder -> its containing root's canonical form, as of the LAST completed pass (promotion detection needs the prior mapping). */
+  private prevAssignment = new Map<string, string>();
+  /** Canonical roots already surfaced via `onPromotion` — fires ONCE per promoted root, never again even if it churns further. */
+  private readonly promotionNotified = new Set<string>();
 
   constructor(deps: TrackerRegistryDeps) {
     const { storageDir, listFolders, log, makeTracker, shadowDirForImpl, onPromotion, disposeDeadlineMs } = deps;
@@ -128,19 +136,60 @@ export class CheckpointTrackerRegistry implements CheckpointTrackerRegistryLike 
     return this.trackers.size;
   }
 
-  /**
-   * Task 13 STUB — Task 14 replaces this body with the full serialized
-   * reconcile pass (removal of vanished roots, first-listed-wins promotion,
-   * `reconcileChain` re-entrancy serialization). For now: unconditionally
-   * (re-)add every CURRENTLY listed folder, every call, with NO removal —
-   * callers/tests drive `addRoot`'s behaviors through this stub.
-   */
-  async reconcile(): Promise<void> {
-    const folders = this.deps.listFolders();
-    for (const rawFolderPath of folders) {
-      const canonicalRoot = canonicalizeWorkspaceRoot(findContainingWorkspaceRoot(rawFolderPath, folders));
-      await this.addRoot(canonicalRoot, rawFolderPath);
+  /** Serialized: a second reconcile() arriving mid-pass queues behind it; each pass re-reads the CURRENT folder list at its start. */
+  reconcile(): Promise<void> {
+    const run = this.reconcileChain.then(
+      () => this.reconcilePass(),
+      () => this.reconcilePass(),
+    );
+    this.reconcileChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async reconcilePass(): Promise<void> {
+    const folders = [...this.deps.listFolders()];
+    // ONE containment rule: the runtime's own resolver decides the desired set
+    // (spec req 5 — first-listed-wins; a parent-wins re-derivation here would
+    // build a set the runtime later disagrees with -> spurious NO_TRACKER).
+    const assignment = new Map<string, string>();
+    for (const f of folders) {
+      assignment.set(f, canonicalizeWorkspaceRoot(findContainingWorkspaceRoot(f, folders)));
     }
+    const desired = new Set(assignment.values());
+
+    // Promotion detection (spec req 6b, option b): a folder that now maps to
+    // ITSELF but previously mapped to a different (parent) root started a
+    // fresh undo domain — surface it ONCE, visibly, never silently.
+    for (const [f, cur] of assignment) {
+      const prev = this.prevAssignment.get(f);
+      if (
+        prev !== undefined &&
+        prev !== cur &&
+        cur === canonicalizeWorkspaceRoot(f) &&
+        !this.promotionNotified.has(cur)
+      ) {
+        this.promotionNotified.add(cur);
+        this.deps.onPromotion?.(cur, prev);
+      }
+    }
+
+    // Construct-before-dispose within the pass (spec req 4).
+    for (const root of desired) {
+      if (!this.trackers.has(root)) {
+        const raw = folders.find((g) => canonicalizeWorkspaceRoot(g) === root) ?? root;
+        await this.addRoot(root, raw);
+      }
+    }
+    for (const [root] of [...this.trackers]) {
+      if (!desired.has(root)) {
+        await this.removeRoot(root);
+      }
+    }
+
+    this.prevAssignment = assignment;
   }
 
   /**
@@ -219,8 +268,14 @@ export class CheckpointTrackerRegistry implements CheckpointTrackerRegistryLike 
           try {
             await fs.rename(lexDir, shadowDir);
           } catch (err) {
-            // Residual micro-TOCTOU: shadowDir may appear between the check
-            // and the rename — the catch discloses it, never silent.
+            // Residual micro-TOCTOU: this catch covers a NON-EMPTY shadowDir
+            // reappearing in the check->rename window (ENOTEMPTY). An EMPTY
+            // dir materializing there instead is the irreducible residual —
+            // Node has no renameat2(RENAME_NOREPLACE) to close that window
+            // atomically — but exposure is near-nil (a cross-process
+            // bare-init instant on the very same canonical root; an empty
+            // dir carries zero history to lose). Disclosed, never silent,
+            // either way.
             log(
               `checkpoints: could not adopt existing shadow history for symlinked root ${canonicalRoot} (${errCode(err)}); starting a fresh shadow — prior history remains at ${lexDir}`,
             );
