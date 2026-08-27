@@ -12612,6 +12612,86 @@ describe('AcpBackend — W4-T2: real per-root turn lease + root-scoped ordinals 
 });
 
 /**
+ * WS-CK-A6 Task 10 — golden master pinning the OBSERVABLE behavior of the
+ * pre-flip primary-only tracker factory inside `resolveRootCoordinator`
+ * (`:718-727`): the injected `checkpointTracker` (constructed by
+ * `extension.ts` for the FIRST workspace root only — today's only reachable
+ * shape) is handed to the resolved coordinator ONLY when its canonical root
+ * matches the primary (first-listed) root; every other root gets
+ * `tracker: undefined` (the honest NO_TRACKER refusal feed, not a silently
+ * shared shadow-git). Task 15 flag-gates this factory and Task 17 flips it
+ * to per-root live trackers — these 4 pins are exactly the pre-flip contract
+ * both must preserve on the flag-OFF path. Scoped to non-symlinked roots
+ * (spec's scoped-honesty: a symlinked root's canonical hash deliberately
+ * diverges post-flip, handled by adopt-by-rename in Task 13) — fake
+ * non-existent absolute paths are fine here (same convention as `/root-1`/
+ * `/root-b` elsewhere in this file): `canonicalizeWorkspaceRoot` falls back
+ * to the lexical `path.resolve`'d form on any FS error, so the canonical key
+ * is still stable and deterministic without the path existing on disk.
+ */
+describe('A6 golden master — primary-only tracker factory (pre-flip pin)', () => {
+  afterEach(() => {
+    mockWorkspace.workspaceFolders = undefined;
+  });
+
+  /**
+   * Reach past `private` to the REAL production root resolution (not a
+   * reimplementation) — same idiom as `rootIdFor`/`rootFor` above, but
+   * returns the actual `RootCoordinator` instance itself (not just a scalar
+   * field off it) so both `.tracker` AND same-instance identity are directly
+   * observable from the SAME call site.
+   */
+  function coordinatorFor(backend: AcpBackend, cwd: string): { tracker: CheckpointTrackerLike | undefined } {
+    return (
+      backend as unknown as {
+        resolveRootCoordinator(cwd: string): { tracker: CheckpointTrackerLike | undefined };
+      }
+    ).resolveRootCoordinator(cwd);
+  }
+
+  it('a cwd under the PRIMARY (first-listed) root resolves a coordinator holding the injected tracker', () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
+    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, fakeTracker);
+
+    const coordinator = coordinatorFor(backend, '/root-a/sub/dir');
+
+    expect(coordinator.tracker).toBe(fakeTracker);
+  });
+
+  it('a cwd under a NON-primary root resolves tracker: undefined (the honest NO_TRACKER refusal feed)', () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
+    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, fakeTracker);
+
+    const coordinator = coordinatorFor(backend, '/root-b/sub/dir');
+
+    expect(coordinator.tracker).toBeUndefined();
+  });
+
+  it('the same canonical root always yields the SAME coordinator instance', () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }];
+    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, fakeTracker);
+
+    const first = coordinatorFor(backend, '/root-a/x');
+    const second = coordinatorFor(backend, '/root-a/y');
+
+    expect(first).toBe(second);
+  });
+
+  it("zero workspace folders: a bare cwd is its own root and gets the injected tracker (today's reachable shape)", () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    mockWorkspace.workspaceFolders = [];
+    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, fakeTracker);
+
+    const coordinator = coordinatorFor(backend, '/bare-cwd');
+
+    expect(coordinator.tracker).toBe(fakeTracker);
+  });
+});
+
+/**
  * W4-T4b — SF-2 custom modes: host wiring. The PURE engine (T4a) is frozen
  * and unchanged; these tests prove the vscode-boundary wiring that produces
  * the `ModeFloor` data it consumes: `setCustomMode` routing, `mode.state` on
