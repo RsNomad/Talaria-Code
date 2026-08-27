@@ -1,7 +1,5 @@
 import * as vscode from 'vscode';
-import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import * as path from 'node:path';
 import type {
   HostToWebviewMessage,
   AgentMode,
@@ -22,6 +20,10 @@ import { computeProviderCard } from '../setup/SetupController';
 import type { CheckpointTrackerLike } from '../checkpoints/trackerContract';
 import type { RootCoordinator } from '../checkpoints/RootCoordinator';
 import { RootRegistry } from '../checkpoints/rootRegistry';
+import {
+  canonicalizeWorkspaceRoot,
+  findContainingWorkspaceRoot,
+} from '../checkpoints/rootResolution';
 import type { Logger } from '../transport/JsonRpcStdio';
 import type { ResolvedContext } from '../context/types';
 import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
@@ -724,35 +726,19 @@ export class AcpBackend implements AgentBackend {
     );
   }
 
-  /** The open workspace folder that CONTAINS `cwd`, or the first folder / `cwd` itself when none contains it (no workspace open — a bare cwd is its own root). */
+  /** The open workspace folder that CONTAINS `cwd`, or the first folder / `cwd` itself when none contains it (no workspace open — a bare cwd is its own root). Delegates to {@link findContainingWorkspaceRoot} (moved to `rootResolution.ts` — WS-CK-A6 prep, so the registry's desired set derives from the SAME resolver). */
   private findContainingWorkspaceRoot(cwd: string): string {
-    const roots = this.workspaceRoots();
-    const firstRoot = roots[0];
-    if (roots.length === 0 || firstRoot === undefined) return cwd;
-    const resolved = path.resolve(cwd || firstRoot);
-    for (const root of roots) {
-      if (isPathWithin(resolved, path.resolve(root))) return root;
-    }
-    return firstRoot;
+    return findContainingWorkspaceRoot(cwd, this.workspaceRoots());
   }
 
   /**
-   * Realpath a workspace root to its canonical form (sync — this keeps
-   * {@link buildSessionPort}/{@link resolveRootCoordinator} synchronous,
-   * matching `tryAcquireTurnLease`'s own synchronous-admission discipline;
-   * called rarely — once per genuinely NEW root, not per-turn). Falls back
-   * to the lexical form on any FS error (a not-yet-existing/unreadable root
-   * still needs a STABLE key). An empty/falsy `root` is returned AS-IS —
-   * never realpath'd — so a degenerate no-cwd caller (headless tests) never
-   * silently resolves to `process.cwd()` via `path.resolve('')`.
+   * Realpath a workspace root to its canonical form. Delegates to
+   * {@link canonicalizeWorkspaceRoot} (moved to `rootResolution.ts` —
+   * WS-CK-A6 prep; ONE canonicalization for both the registry key and the
+   * tracker's constructor arg / shadow-dir hash).
    */
   private canonicalizeWorkspaceRoot(root: string): string {
-    if (!root) return root;
-    try {
-      return realpathSync(path.resolve(root));
-    } catch {
-      return path.resolve(root);
-    }
+    return canonicalizeWorkspaceRoot(root);
   }
 
   /**
@@ -2263,17 +2249,8 @@ function describeHostError(err: unknown): string {
   return describeError(err, homedir());
 }
 
-/**
- * W4-T2: is `child` at or below `parent`? Mirrors `pathConfine.ts`'s own
- * `isWithin` (kept local — that module's version isn't exported, and this
- * is a cheap lexical containment check over already-`path.resolve`'d
- * strings, not a security boundary — `resolveRootCoordinator` only ever
- * uses it to pick WHICH already-open workspace folder a cwd belongs to).
- */
-function isPathWithin(child: string, parent: string): boolean {
-  const rel = path.relative(parent, child);
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
-}
+// W4-T2: `isPathWithin` moved to `rootResolution.ts` verbatim (WS-CK-A6
+// prep) — `findContainingWorkspaceRoot`'s only caller now lives there too.
 
 // W6-FI-c: `isReloadedResult`/`extractLoadParams`/`extractToggleParams`/
 // `TURN_ACTIVE_RESTORE_REFUSAL`/`AMBIGUOUS_ROOT`/`UNKNOWN_ROOT_RESTORE_REFUSAL`/
