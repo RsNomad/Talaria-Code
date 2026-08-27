@@ -151,12 +151,44 @@ export class CheckpointTrackerRegistry implements CheckpointTrackerRegistryLike 
 
   private async reconcilePass(): Promise<void> {
     const folders = [...this.deps.listFolders()];
+
+    // Pass-local canonicalization memo: canonicalizeWorkspaceRoot reads disk
+    // (realpathSync) and fail-opens to a lexical fallback, so calling it
+    // multiple times for the same path within ONE pass could see DIFFERENT
+    // results if a transient failure lands between calls — mis-firing the
+    // promotion notice. Memoize per pass so every canonicalization within
+    // this pass is self-consistent. Recreated on EVERY reconcilePass() call
+    // (never a registry field) — see the FN-2 doc comment below for why a
+    // cross-pass cache would be actively harmful, not just unnecessary.
+    const canonMemo = new Map<string, string>();
+    const canon = (p: string): string => {
+      const hit = canonMemo.get(p);
+      if (hit !== undefined) return hit;
+      const v = canonicalizeWorkspaceRoot(p);
+      canonMemo.set(p, v);
+      return v;
+    };
+
     // ONE containment rule: the runtime's own resolver decides the desired set
     // (spec req 5 — first-listed-wins; a parent-wins re-derivation here would
     // build a set the runtime later disagrees with -> spurious NO_TRACKER).
+    //
+    // FN-2 (WS-CK-A6): the canonical key is re-derived per pass (never
+    // persistently cached) so the registry and the runtime resolver co-derive
+    // it identically — a persistent registry-side cache would, during a
+    // transient realpath failure, hold the resolved key while the runtime
+    // falls back to lexical, producing a spurious NO_TRACKER. The accepted
+    // residual: a transient realpathSync failure on a genuinely-symlinked
+    // root yields a self-correcting ONE-PASS domain "flap" (a lexical-keyed
+    // tracker minted + the resolved one disposed, history RETAINED on disk +
+    // disclosed, re-converged next healthy pass). Near-nil on the local
+    // POSIX target (realpath of an open local folder does not transiently
+    // fail). REVISIT with a shared (registry+runtime) canonicalization cache
+    // or a fail-closed canonicalize if the target ever expands to
+    // network/removable mounts.
     const assignment = new Map<string, string>();
     for (const f of folders) {
-      assignment.set(f, canonicalizeWorkspaceRoot(findContainingWorkspaceRoot(f, folders)));
+      assignment.set(f, canon(findContainingWorkspaceRoot(f, folders)));
     }
     const desired = new Set(assignment.values());
 
@@ -165,12 +197,7 @@ export class CheckpointTrackerRegistry implements CheckpointTrackerRegistryLike 
     // fresh undo domain — surface it ONCE, visibly, never silently.
     for (const [f, cur] of assignment) {
       const prev = this.prevAssignment.get(f);
-      if (
-        prev !== undefined &&
-        prev !== cur &&
-        cur === canonicalizeWorkspaceRoot(f) &&
-        !this.promotionNotified.has(cur)
-      ) {
+      if (prev !== undefined && prev !== cur && cur === canon(f) && !this.promotionNotified.has(cur)) {
         this.promotionNotified.add(cur);
         this.deps.onPromotion?.(cur, prev);
       }
@@ -179,7 +206,7 @@ export class CheckpointTrackerRegistry implements CheckpointTrackerRegistryLike 
     // Construct-before-dispose within the pass (spec req 4).
     for (const root of desired) {
       if (!this.trackers.has(root)) {
-        const raw = folders.find((g) => canonicalizeWorkspaceRoot(g) === root) ?? root;
+        const raw = folders.find((g) => canon(g) === root) ?? root;
         await this.addRoot(root, raw);
       }
     }
