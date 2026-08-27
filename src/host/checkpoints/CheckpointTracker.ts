@@ -13,6 +13,7 @@ import { createIgnoreFilter } from '../../shared/ignoreFilter';
 import { isRecord } from '../../shared/typeGuards';
 import { resolveWithinWorkspaceReal } from '../backend/acp/pathConfine';
 import { writeFileNoFollow } from '../backend/acp/safeWrite';
+import { DEFAULT_GIT_TIMEOUT_MS, DEFAULT_LOCK_MAX_WAIT_MS, DEFAULT_LOCK_STALE_MS } from './constants';
 import { sanitizeGitEnv } from './gitEnv';
 import { runGit, runGitBinary, type RunGitOptions } from './gitProcess';
 import { parseNameStatusZ, type CheckpointDiffEntry } from './nameStatus';
@@ -153,7 +154,9 @@ export class WorktreeScanTimeoutError extends Error {
 
 const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024; // ~2 MiB, mirrors OpenCode's live size cutoff.
 const DEFAULT_PRUNE_DAYS = 7; // mirrors OpenCode's `prune = "7.days"`.
-const DEFAULT_GIT_TIMEOUT_MS = 15_000; // wall-clock bound per barrier/foreground git op (arch A#1).
+// DEFAULT_GIT_TIMEOUT_MS (wall-clock bound per barrier/foreground git op, arch
+// A#1) moved to ./constants — WS-CK dedup (was previously ALSO independently
+// defined in gitProcess.ts).
 // I-2: shortened 2 s -> 500 ms so a borrowing checkpoint is localized (made
 // self-contained) sooner, shrinking the window in which a real-repo `gc --prune`
 // could orphan its still-borrowed blobs. The debounce is NON-resetting (fires
@@ -254,8 +257,8 @@ export class CheckpointTracker {
     this.maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     this.extraIgnoreGlobs = options.extraIgnoreGlobs ?? [];
     this.defaultPruneDays = options.pruneDays ?? DEFAULT_PRUNE_DAYS;
-    this.lockStaleMs = options.lockStaleMs ?? 30_000;
-    this.lockMaxWaitMs = options.lockMaxWaitMs ?? 10_000;
+    this.lockStaleMs = options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS;
+    this.lockMaxWaitMs = options.lockMaxWaitMs ?? DEFAULT_LOCK_MAX_WAIT_MS;
     this.gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
     this.localizeDebounceMs = options.localizeDebounceMs ?? DEFAULT_LOCALIZE_DEBOUNCE_MS;
 

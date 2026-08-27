@@ -1,6 +1,17 @@
 import { spawn } from 'node:child_process';
 
 /**
+ * Default wall-clock bound (15 s) for a single `git` invocation. Comfortably
+ * above a warm-index snapshot's steady-state cost (tens of ms to sub-second even
+ * on a ~6 K-file tree — research §3) yet low enough that a genuinely stalled git
+ * frees the turn quickly (fail-open, unprotected). Overridable per call via
+ * {@link RunGitOptions.timeoutMs}; background maintenance disables it with `0`.
+ *
+ * WS-CK dedup: the ONE definition now lives in {@link ./constants}.
+ */
+import { DEFAULT_GIT_TIMEOUT_MS } from './constants';
+
+/**
  * The child-process spawner every runner uses. A module-level indirection so a
  * test can inject a fake `git` child (see {@link __setSpawnForTests}) — in
  * production this is always Node's real `spawn`.
@@ -80,15 +91,6 @@ export interface GitResult {
  * per-call via {@link RunGitOptions.maxBufferBytes}.
  */
 const DEFAULT_MAX_BUFFER_BYTES = 128 * 1024 * 1024;
-
-/**
- * Default wall-clock bound (15 s) for a single `git` invocation. Comfortably
- * above a warm-index snapshot's steady-state cost (tens of ms to sub-second even
- * on a ~6 K-file tree — research §3) yet low enough that a genuinely stalled git
- * frees the turn quickly (fail-open, unprotected). Overridable per call via
- * {@link RunGitOptions.timeoutMs}; background maintenance disables it with `0`.
- */
-const DEFAULT_GIT_TIMEOUT_MS = 15_000;
 
 /** Thrown when a git invocation's captured stdout/stderr exceeds the byte cap. */
 export class GitOutputLimitError extends Error {

@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
+import { DEFAULT_LOCK_MAX_WAIT_MS, DEFAULT_LOCK_STALE_MS } from './constants';
+
 /**
  * Cross-process advisory lock for the shadow-git dir (review IMPORTANT #3, and
  * its re-review hardening).
@@ -71,8 +73,9 @@ export interface LockHandle {
   release(): Promise<void>;
 }
 
-const DEFAULT_STALE_MS = 30_000;
-const DEFAULT_MAX_WAIT_MS = 10_000;
+// DEFAULT_STALE_MS / DEFAULT_MAX_WAIT_MS moved to ./constants (WS-CK dedup: was
+// previously ALSO independently defined in CheckpointTracker's constructor
+// fallbacks) as DEFAULT_LOCK_STALE_MS / DEFAULT_LOCK_MAX_WAIT_MS.
 const DEFAULT_POLL_MS = 100;
 
 function delay(ms: number): Promise<void> {
@@ -93,8 +96,8 @@ export async function acquireLock(
   dir: string,
   options: AcquireLockOptions = {},
 ): Promise<LockHandle> {
-  const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
-  const maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  const staleMs = options.staleMs ?? DEFAULT_LOCK_STALE_MS;
+  const maxWaitMs = options.maxWaitMs ?? DEFAULT_LOCK_MAX_WAIT_MS;
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
   const heartbeatMs = options.heartbeatMs ?? Math.max(1, Math.floor(staleMs / 3));
   const lockPath = path.join(dir, LOCK_FILENAME);
