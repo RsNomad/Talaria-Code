@@ -913,8 +913,8 @@ function firstWorkspaceRoot(): string | undefined {
 
 /**
  * Zone CKPT: construct + lazily initialize the extension-side checkpoint
- * tracker (shadow-git; `src/host/checkpoints/CheckpointTracker.ts`, frozen —
- * used, never modified). Storage dir = this extension's own storage path
+ * tracker (shadow-git; `src/host/checkpoints/CheckpointTracker.ts`,
+ * WS-CK-editable; see ADR-019). Storage dir = this extension's own storage path
  * (`context.globalStorageUri`, never the workspace); workspace root = the
  * first open folder.
  *

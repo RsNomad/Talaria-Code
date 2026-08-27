@@ -782,7 +782,7 @@ export class CheckpointTracker {
           // components (O_NOFOLLOW guards the LEAF only — the :704-711
           // argument, applied symmetrically to the ancestor). A violation
           // rides the SAME skippedPaths disclosure as the loop-top refusal.
-          // Honest residual (ADR-006): between THIS check's own resolution and
+          // Honest residual (ADR-019): between THIS check's own resolution and
           // the open() an ancestor swap is theoretically still possible; full
           // closure needs openat()-per-component inside frozen safeWrite —
           // owner-gated, deliberately not taken here.

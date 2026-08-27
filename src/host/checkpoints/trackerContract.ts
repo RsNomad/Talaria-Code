@@ -3,8 +3,10 @@ import type { RestoreResult } from './CheckpointTracker';
 
 /**
  * Zone CKPT: the narrow structural slice of `CheckpointTracker`'s public API
- * (`src/host/checkpoints/CheckpointTracker.ts` — frozen; used, never
- * modified) that `AcpBackend` actually depends on. Kept as an interface
+ * (`src/host/checkpoints/CheckpointTracker.ts` — WS-CK-editable since the
+ * lens-dorabotok remediation; the frozen surfaces are `safeWrite.ts`/
+ * `pathConfine.ts`, plus `shadowLock.ts` internals for WS-CK-A6) that
+ * `AcpBackend` actually depends on. Kept as an interface
  * (rather than importing the concrete class as the constructor param type)
  * so tests can inject a lightweight fake with no real `git` subprocess
  * machinery — the real `CheckpointTracker` satisfies this structurally.
