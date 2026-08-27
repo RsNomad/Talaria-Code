@@ -2065,3 +2065,74 @@ describe('TA-7 (AU-34): nested .gitignore/.hermesignore files are honored, not j
     indexer.dispose();
   });
 });
+
+/**
+ * F2-12: `schedule()`'s catch (the debounced watch path's failure handler)
+ * was `console.error('hermes-codebase: incremental reindex failed', err)` —
+ * passing the RAW `err` object straight to `console.error`. Node's default
+ * Error formatting prints the full message (and an fs error's message
+ * embeds the absolute path it failed on — here, the workspace tmp dir), so
+ * every incremental-reindex failure leaked the user's absolute workspace
+ * path into the log. The fix folds `err` down to its `name` only (errno-name
+ * idiom, never `String(err)`/`.message`) through an injectable `logger?`
+ * option, and surfaces a cumulative `failedIncrementalReindexes()` counter
+ * so a future panel can read it (there is no RAG panel at HEAD — the
+ * extension OutputChannel is the user-visible surface today).
+ */
+describe('F2-12: incremental-reindex failure — logger seam + counter + path-disclosure hygiene', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-f2-12-'));
+    indexDir = path.join(workspaceRoot, 'index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it('increments failedIncrementalReindexes() and logs an errno-name-only line that never contains the workspace path', async () => {
+    const logSpy = vi.fn();
+    const indexer = createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs: 5,
+      logger: logSpy,
+    });
+    const disposable = indexer.watch();
+
+    // Simulate a real fs-style failure inside the incremental path (e.g. a
+    // permission/corruption error surfacing through store.init()) whose
+    // message embeds the absolute workspace path — the exact shape that
+    // leaked before this fix.
+    const fsLikeErr = new Error(
+      `ENOENT: no such file or directory, open '${path.join(workspaceRoot, 'src', 'app.txt')}'`,
+    );
+    fsLikeErr.name = 'ENOENT';
+    initMock.mockRejectedValueOnce(fsLikeErr);
+
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(indexer.failedIncrementalReindexes()).toBe(1);
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const [line] = logSpy.mock.calls[0]!;
+    expect(line).toContain('incremental reindex failed');
+    expect(line).toContain('ENOENT');
+    expect(line).not.toContain(workspaceRoot);
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+});

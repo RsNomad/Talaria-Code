@@ -72,12 +72,27 @@ export interface IndexerOptions {
    * back-compat with existing callers/tests that don't pass it.
    */
   grammarsDir?: string;
+  /**
+   * F2-12: injected log seam for this indexer's own failure lines (the
+   * incremental-reindex-failed line below) AND threaded through to the
+   * `LanceDBStore` it constructs. Default `console.error` — behavior-
+   * identical where unwired.
+   */
+  logger?: (line: string) => void;
 }
 
 export interface Indexer {
   build(): Promise<void>;
   watch(): vscode.Disposable;
   dispose(): void;
+  /**
+   * F2-12: CUMULATIVE count of incremental (debounced watch-path) reindex
+   * failures over this indexer's lifetime. Exposed as a getter so a caller
+   * (today: nothing reads it directly — the OutputChannel line IS the
+   * user-visible surface; tomorrow: a RAG panel, none exists at HEAD) can
+   * surface it.
+   */
+  readonly failedIncrementalReindexes: () => number;
 }
 
 const MANIFEST_FILE = 'manifest.json';
@@ -168,7 +183,10 @@ function matchesNestedIgnore(entries: readonly NestedIgnoreEntry[], relPosixPath
  * co-located tests.
  */
 export function createIndexer(opts: IndexerOptions): Indexer {
-  const store: VectorStore = new LanceDBStore(opts.indexDir);
+  // F2-12: default `console.error` — behavior-identical for every caller
+  // that doesn't pass `logger` (unchanged today outside `extension.ts`).
+  const logger: (line: string) => void = opts.logger ?? ((line) => console.error(line));
+  const store: VectorStore = new LanceDBStore(opts.indexDir, { logger });
   const embedder = new HttpEmbedder({
     endpoint: opts.embedEndpoint,
     model: opts.embedModel,
@@ -211,6 +229,9 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   }
 
   let disposed = false;
+  // F2-12: cumulative count of `schedule()`'s catch firing — see the
+  // `Indexer.failedIncrementalReindexes` doc comment.
+  let failedIncrementalReindexesTotal = 0;
 
   // AUDIT-5 CR-B: memoized single-flight init — same idiom as
   // CheckpointTracker.init (CheckpointTracker.ts:289-297). The old
@@ -1190,9 +1211,16 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         key,
         setTimeout(() => {
           timers.delete(key);
-          void handleFsEvent(uri, kind).catch((err) =>
-            console.error('hermes-codebase: incremental reindex failed', err),
-          );
+          void handleFsEvent(uri, kind).catch((err: unknown) => {
+            failedIncrementalReindexesTotal += 1;
+            // F2-12 hygiene fix: the OLD line passed the raw `err` object to
+            // `console.error` — an fs error's `.message` embeds the absolute
+            // workspace path it failed on, leaking it into the log on every
+            // failure. Errno-name idiom only (never `String(err)`/`.message`).
+            logger(
+              `hermes-codebase: incremental reindex failed: ${err instanceof Error ? err.name : 'unknown'}`,
+            );
+          });
         }, debounceMs),
       );
     };
@@ -1237,5 +1265,10 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     parser.dispose?.();
   }
 
-  return { build, watch, dispose };
+  return {
+    build,
+    watch,
+    dispose,
+    failedIncrementalReindexes: () => failedIncrementalReindexesTotal,
+  };
 }

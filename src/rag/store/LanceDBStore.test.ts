@@ -440,3 +440,74 @@ describe('WS-BG: listFileHashes skips malformed rows (self-healing: the file re-
     expect(await store.listFileHashes()).toEqual({ 'a.ts': 'h1', 'b.ts': 'h3' });
   });
 });
+
+/**
+ * F2-12: the malformed-row warn (`warnMalformedRowsOnce`) was `console.error`
+ * only, with no way for a caller to observe HOW MANY rows have been dropped
+ * over the store's lifetime, nor to redirect the log line to the extension's
+ * own OutputChannel instead of the process stderr. `logger?` is an injected
+ * seam (default `console.error`, behavior-identical where unwired — e.g. the
+ * MCP child); `droppedMalformedRows` is a CUMULATIVE counter incremented on
+ * EVERY drop even though the warn line itself stays once-gated (spamming the
+ * log on every query would be worse than the bug this store already fixed).
+ */
+describe('F2-12: injected logger seam + cumulative droppedMalformedRows counter', () => {
+  beforeEach(() => {
+    connectMock.mockReset();
+  });
+
+  interface FakeHashChain {
+    select: (cols: string[]) => FakeHashChain;
+    toArray: () => Promise<unknown[]>;
+  }
+
+  it('the once-gated warn logs through the injected logger exactly once, while the counter accumulates every drop', async () => {
+    const logSpy = vi.fn();
+    let rows: unknown[] = [{ path: 'a.ts', contentHash: 'h1' }, 'garbage'];
+    const chain: FakeHashChain = {
+      select: () => chain,
+      toArray: async () => rows,
+    };
+    const table: FakeTable = {
+      query: () => chain,
+      createIndex: vi.fn(async () => {}),
+      close: vi.fn(),
+      schema: vi.fn(async () => ({ fields: HEALTHY_SCHEMA_FIELD_NAMES.map((name) => ({ name })) })),
+    } as unknown as FakeTable;
+    const db = makeFakeDb(table);
+    connectMock.mockResolvedValue(db);
+    const store = new LanceDBStore('/fake/index/dir', { logger: logSpy });
+    await store.init();
+
+    await store.listFileHashes(); // 1 malformed row dropped ('garbage')
+    rows = [{ path: 'b.ts', contentHash: 'h2' }, 7, { path: 9, contentHash: 'h3' }];
+    await store.listFileHashes(); // 2 more malformed rows dropped (7, {path:9,...})
+
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls[0]?.[0]).toContain('dropped 1 malformed row');
+    expect(store.droppedMalformedRows).toBe(3);
+  });
+
+  it('defaults the logger to console.error when unwired (MCP-child/back-compat behavior)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const chain: FakeHashChain = {
+      select: () => chain,
+      toArray: async () => [],
+    };
+    const table: FakeTable = {
+      query: () => chain,
+      createIndex: vi.fn(async () => {}),
+      close: vi.fn(),
+      schema: vi.fn(async () => ({ fields: HEALTHY_SCHEMA_FIELD_NAMES.map((name) => ({ name })) })),
+    } as unknown as FakeTable;
+    const db = makeFakeDb(table);
+    connectMock.mockResolvedValue(db);
+    const store = new LanceDBStore('/fake/index/dir');
+    await store.init();
+
+    await store.listFileHashes(); // no rows -> nothing dropped, just proves construction still works
+    expect(store.droppedMalformedRows).toBe(0);
+
+    errSpy.mockRestore();
+  });
+});

@@ -859,6 +859,10 @@ async function activateCodebaseRag(
     debounceMs,
     extraIgnoreGlobs: excludeGlobs,
     grammarsDir,
+    // F2-12: route the two RAG legs that were console.error-only (malformed-
+    // row drops in LanceDBStore, failed incremental reindexes here) to the
+    // extension's own user-visible OutputChannel instead of process stderr.
+    logger: (line) => output.appendLine(line),
   });
 
   context.subscriptions.push(indexer.watch());
