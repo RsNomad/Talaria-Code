@@ -1,76 +1,71 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { InMemoryCompletionCache } from './cache';
 
-describe('InMemoryCompletionCache', () => {
+const CTX = 'hash-a';
+const CTX_B = 'hash-b';
+
+describe('InMemoryCompletionCache — two-part key, longest-prefix within a context partition', () => {
   it('returns undefined on a cold cache', () => {
     const cache = new InMemoryCompletionCache();
-    expect(cache.get('const x = ')).toBeUndefined();
+    expect(cache.get(CTX, 'const x = ')).toBeUndefined();
   });
 
   it('returns the exact completion for an exact key match', () => {
     const cache = new InMemoryCompletionCache();
-    cache.put('const x = ', '1;');
-    expect(cache.get('const x = ')).toBe('1;');
+    cache.put(CTX, 'const x = ', '1;');
+    expect(cache.get(CTX, 'const x = ')).toBe('1;');
   });
 
-  it('serves a longer, typed-forward prefix from a shorter cached key (longest-prefix match)', () => {
+  it('serves a typed-forward prefix from a shorter cached key (longest-prefix match)', () => {
     const cache = new InMemoryCompletionCache();
-    cache.put('const x = ', '1234;');
-    // User typed one more char ("1") within the previously suggested completion.
-    expect(cache.get('const x = 1')).toBe('234;');
+    cache.put(CTX, 'const x = ', '1234;');
+    expect(cache.get(CTX, 'const x = 1')).toBe('234;');
   });
 
   it('picks the LONGEST matching cached key when multiple keys are prefixes', () => {
     const cache = new InMemoryCompletionCache();
-    cache.put('const ', 'x = 1;');
-    cache.put('const x = ', '1;');
-    expect(cache.get('const x = 1')).toBe(';');
+    cache.put(CTX, 'const ', 'x = 1;');
+    cache.put(CTX, 'const x = ', '1;');
+    expect(cache.get(CTX, 'const x = 1')).toBe(';');
   });
 
-  it('misses when the cached completion does not actually continue with the typed text', () => {
+  it('misses when the cached completion does not continue with the typed text', () => {
     const cache = new InMemoryCompletionCache();
-    cache.put('const x = ', '1;');
-    // Typed something that diverges from what was cached ("2" vs cached "1;").
-    expect(cache.get('const x = 2')).toBeUndefined();
+    cache.put(CTX, 'const x = ', '1;');
+    expect(cache.get(CTX, 'const x = 2')).toBeUndefined();
   });
 
-  it('misses when no cached key is a prefix of the query', () => {
+  it('never crosses context partitions (different contextKey = different world)', () => {
     const cache = new InMemoryCompletionCache();
-    cache.put('function foo(', ') {}');
-    expect(cache.get('const x = ')).toBeUndefined();
+    cache.put(CTX, 'const x = ', '1;');
+    expect(cache.get(CTX_B, 'const x = ')).toBeUndefined();
   });
 
-  it('evicts the least-recently-used entry once capacity is exceeded', () => {
-    const cache = new InMemoryCompletionCache(2);
-    const now = vi.spyOn(Date, 'now');
-    now.mockReturnValue(1000);
-    cache.put('aaa', '1');
-    now.mockReturnValue(2000);
-    cache.put('bbb', '2');
-    now.mockReturnValue(3000);
-    cache.put('ccc', '3'); // capacity 2 -> evicts oldest ('aaa', ts=1000)
-
-    expect(cache.get('aaa')).toBeUndefined();
-    expect(cache.get('bbb')).toBe('2');
-    expect(cache.get('ccc')).toBe('3');
-    now.mockRestore();
+  it('F1-10: an empty prefix is never stored and never a hit', () => {
+    const cache = new InMemoryCompletionCache();
+    cache.put(CTX, '', 'phantom completion');
+    expect(cache.get(CTX, '')).toBeUndefined();
+    expect(cache.get(CTX, 'anything')).toBeUndefined();
   });
 
-  it('refreshes an entry timestamp on get, protecting it from eviction', () => {
+  it('CA-M12: evicts the least-recently-USED entry at capacity — recency by operation order, no clock', () => {
     const cache = new InMemoryCompletionCache(2);
-    const now = vi.spyOn(Date, 'now');
-    now.mockReturnValue(1000);
-    cache.put('aaa', '1');
-    now.mockReturnValue(2000);
-    cache.put('bbb', '2');
-    now.mockReturnValue(2500);
-    cache.get('aaa'); // refresh 'aaa' so it is now the most recently used
-    now.mockReturnValue(3000);
-    cache.put('ccc', '3'); // should evict 'bbb' (least recently used now), not 'aaa'
+    cache.put(CTX, 'aaa', '1');
+    cache.put(CTX, 'bbb', '2');
+    cache.get(CTX, 'aaa'); // refresh 'aaa'
+    cache.put(CTX, 'ccc', '3'); // evicts 'bbb' (LRU), not 'aaa'
+    expect(cache.get(CTX, 'bbb')).toBeUndefined();
+    expect(cache.get(CTX, 'aaa')).toBe('1');
+    expect(cache.get(CTX, 'ccc')).toBe('3');
+  });
 
-    expect(cache.get('bbb')).toBeUndefined();
-    expect(cache.get('aaa')).toBe('1');
-    expect(cache.get('ccc')).toBe('3');
-    now.mockRestore();
+  it('re-putting an existing key refreshes its recency', () => {
+    const cache = new InMemoryCompletionCache(2);
+    cache.put(CTX, 'aaa', '1');
+    cache.put(CTX, 'bbb', '2');
+    cache.put(CTX, 'aaa', '1-new'); // refresh via re-put
+    cache.put(CTX, 'ccc', '3'); // evicts 'bbb'
+    expect(cache.get(CTX, 'bbb')).toBeUndefined();
+    expect(cache.get(CTX, 'aaa')).toBe('1-new');
   });
 });

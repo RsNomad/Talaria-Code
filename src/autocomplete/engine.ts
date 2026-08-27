@@ -102,17 +102,17 @@ export class FimEngine {
       ctx.suffix,
       this.options,
     );
-    // R4 (§2.6): fold the snippet-set hash into the cache key so distinct snippet
-    // sets never collide on a shared prefix. Keyed on the PRUNED (pre-injection)
-    // prefix — the hash already distinguishes snippet sets, so comment-inject
-    // (below) needs no extra key handling (§4.5). Empty snippets -> T0's fixed
-    // constant, so v1 (no cross-file gathering) cache keys stay bit-stable vs
-    // pre-W5. Recomputed here (not plumbed from the host snapshot) to keep the
-    // FimContext boundary a flat `readonly ScannedSnippet[]` array (§2.6 pin).
-    const cacheKey = snippetSetHash(ctx.snippets) + ' ' + prunedPrefix;
+    // R4 (§2.6): the snippet-set hash keys the context PARTITION so distinct
+    // snippet sets never collide on a shared prefix (T7 widens this with the
+    // suffix/filepath/languageId discriminator). Keyed on the PRUNED
+    // (pre-injection) prefix — see the original design note.
+    const contextKey = snippetSetHash(ctx.snippets);
+    // F1-10: an empty pruned prefix gives prefix-matching nothing to match
+    // on — skip the cache entirely (the cache also refuses at both ends).
+    const cacheEligible = this.options.useCache && prunedPrefix.length > 0;
 
-    if (this.options.useCache) {
-      const cached = this.cache.get(cacheKey);
+    if (cacheEligible) {
+      const cached = this.cache.get(contextKey, prunedPrefix);
       if (cached !== undefined) {
         return { text: cached };
       }
@@ -214,8 +214,8 @@ export class FimEngine {
     const balanced = balanceBrackets(processed, prefix, suffix);
     if (balanced.length === 0) return undefined;
 
-    if (this.options.useCache) {
-      this.cache.put(cacheKey, balanced);
+    if (cacheEligible) {
+      this.cache.put(contextKey, prunedPrefix, balanced);
     }
 
     return { text: balanced };

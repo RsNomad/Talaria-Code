@@ -71,21 +71,22 @@ function makeEngine(backend: FakeBackend, opts: AutocompleteOptions) {
   });
 }
 
-/** Records every key passed to get/put so cache-key tests can pin the exact string,
- *  while still behaving like a real cache (backed by a Map) for round-trip tests. */
+/** Records every (contextKey, prefix) pair passed to get/put so cache-key tests
+ *  can pin the exact partition/prefix, while still behaving like a real cache
+ *  (backed by a Map, keyed on the pair) for round-trip tests. */
 class RecordingCache implements CompletionCache {
-  readonly gets: string[] = [];
-  readonly puts: { key: string; value: string }[] = [];
+  readonly gets: { contextKey: string; prefix: string }[] = [];
+  readonly puts: { contextKey: string; prefix: string; value: string }[] = [];
   private readonly map = new Map<string, string>();
 
-  get(prefixKey: string): string | undefined {
-    this.gets.push(prefixKey);
-    return this.map.get(prefixKey);
+  get(contextKey: string, prefix: string): string | undefined {
+    this.gets.push({ contextKey, prefix });
+    return this.map.get(`${contextKey} ${prefix}`);
   }
 
-  put(prefixKey: string, completion: string): void {
-    this.puts.push({ key: prefixKey, value: completion });
-    this.map.set(prefixKey, completion);
+  put(contextKey: string, prefix: string, completion: string): void {
+    this.puts.push({ contextKey, prefix, value: completion });
+    this.map.set(`${contextKey} ${prefix}`, completion);
   }
 }
 
@@ -243,7 +244,8 @@ describe('FimEngine', () => {
       );
 
       expect(cache.puts.length).toBe(1);
-      expect(must(cache.puts[0]).key).toBe('0000000000000000 const x = ');
+      expect(must(cache.puts[0]).contextKey).toBe('0000000000000000');
+      expect(must(cache.puts[0]).prefix).toBe('const x = ');
     });
 
     it('produces a different cache key for a different (non-empty) snippet set', async () => {
@@ -270,7 +272,7 @@ describe('FimEngine', () => {
       );
 
       expect(cache.puts.length).toBe(2);
-      expect(must(cache.puts[0]).key).not.toBe(must(cache.puts[1]).key);
+      expect(must(cache.puts[0]).contextKey).not.toBe(must(cache.puts[1]).contextKey);
       expect(backend.calls.length).toBe(2); // second snippet set must not hit the first's cache entry
     });
 
@@ -297,6 +299,30 @@ describe('FimEngine', () => {
       );
       expect(second?.text).toBe(';');
       expect(backend.calls.length).toBe(1); // still 1 -> served from cache
+    });
+  });
+
+  describe('F1-10 — engine skips the cache entirely for an empty pruned prefix', () => {
+    it('never calls cache.get or cache.put when the pruned prefix is empty (cursor at file start)', async () => {
+      const backend = new FakeBackend();
+      backend.chunks = ['1;'];
+      const cache = new RecordingCache();
+      const engine = new FimEngine({
+        backend,
+        options: options(),
+        cache,
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
+      });
+
+      await engine.complete(
+        ctx({ prefix: '', suffix: 'rest of file' }),
+        { manual: true },
+        new AbortController().signal,
+      );
+
+      expect(cache.gets).toEqual([]);
+      expect(cache.puts).toEqual([]);
     });
   });
 
@@ -398,7 +424,8 @@ describe('FimEngine', () => {
       );
 
       const expectedHash = snippetSetHash(snippets);
-      expect(must(cache.puts[0]).key).toBe(`${expectedHash} const x = `);
+      expect(must(cache.puts[0]).contextKey).toBe(expectedHash);
+      expect(must(cache.puts[0]).prefix).toBe('const x = ');
     });
   });
 

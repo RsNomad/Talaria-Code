@@ -134,7 +134,9 @@ export interface AutocompleteOptions {
 }
 
 export interface CompletionCache {
-  /** Longest-prefix match, returns the completion remainder (already-typed portion sliced off). */
-  get(prefixKey: string): string | undefined;
-  put(prefixKey: string, completion: string): void;
+  /** Longest-prefix match WITHIN the `contextKey` partition. `prefix === ''`
+   *  is never a hit and never stored (F1-10). Returns the completion
+   *  remainder (already-typed portion sliced off). */
+  get(contextKey: string, prefix: string): string | undefined;
+  put(contextKey: string, prefix: string, completion: string): void;
 }
