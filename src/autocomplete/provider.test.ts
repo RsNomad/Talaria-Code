@@ -6,7 +6,7 @@ import {
   clearSurfacedAutocompleteFailures,
   type FimActivityListener,
 } from './provider';
-import type { FimEngine } from './engine';
+import type { FimEngine, EgressVerdictObserver } from './engine';
 import type { FimContext } from './types';
 import type { CrossFileContextService } from './context/contextService';
 import { scannedSnippetForTest } from './context/scannedSnippetTestFactory';
@@ -142,6 +142,8 @@ interface FailureSurfacingOpts {
   getModelName?: () => string;
   reportFailure?: (msg: string) => void;
   fimActivity?: FimActivityListener;
+  /** CA-06-path-face: the secret-path-skip notice observer. */
+  onEgressVerdict?: EgressVerdictObserver;
 }
 
 function makeProvider(
@@ -158,7 +160,12 @@ function makeProvider(
     opts.getEndpointHost ?? (() => 'endpoint.example.com'),
     opts.getModelName ?? (() => 'qwen2.5-coder:1.5b-base'),
     opts.reportFailure ?? (() => {}),
-    ...(opts.fimActivity === undefined ? [] : [opts.fimActivity]),
+    // Trailing optional params passed directly: an explicit `undefined` for a
+    // defaulted/optional PARAMETER triggers the default / absent state by JS
+    // semantics — identical to omission (the key-omission doctrine binds
+    // object literals under exactOptionalPropertyTypes, not positional args).
+    opts.fimActivity,
+    opts.onEgressVerdict,
   );
 }
 
@@ -1580,5 +1587,103 @@ describe('TalariaInlineCompletionProvider — F-A: a rejected talaria.setAutocom
     mockShowWarningMessage.mockResolvedValueOnce(undefined);
     await complete(provider);
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('CA-06-path-face — the secret-path-skip observer seam', () => {
+  it('a secret-classified document notifies (uri, path-block) — and the skip is unchanged', async () => {
+    const seen: Array<[string, string]> = [];
+    const doc = new FakeDocument('SECRET=abc123', '/repo/.env');
+    const engine = new FakeEngine();
+    engine.respondWith = 'SHOULD_NOT_BE_USED';
+    const provider = makeProvider(engine, new FakeContextService(), {
+      onEgressVerdict: (filepath, verdict) => {
+        seen.push([filepath, verdict]);
+      },
+    });
+
+    const result = await provider.provideInlineCompletionItems(
+      doc as unknown as vscode.TextDocument,
+      new vscode.Position(0, 0),
+      { triggerKind: 1, selectedCompletionInfo: undefined } as unknown as vscode.InlineCompletionContext,
+      fakeToken(),
+    );
+
+    expect(result).toBeNull();
+    expect(engine.calls).toHaveLength(0); // the skip is untouched by the seam
+    expect(seen).toEqual([['file:///repo/.env', 'path-block']]);
+  });
+
+  it('a THROWING observer changes nothing: still null, no throw, engine never consulted', async () => {
+    const doc = new FakeDocument('SECRET=abc123', '/repo/.env');
+    const engine = new FakeEngine();
+    engine.respondWith = 'SHOULD_NOT_BE_USED';
+    const provider = makeProvider(engine, new FakeContextService(), {
+      onEgressVerdict: () => {
+        throw new Error('surface exploded');
+      },
+    });
+
+    const result = await provider.provideInlineCompletionItems(
+      doc as unknown as vscode.TextDocument,
+      new vscode.Position(0, 0),
+      { triggerKind: 1, selectedCompletionInfo: undefined } as unknown as vscode.InlineCompletionContext,
+      fakeToken(),
+    );
+
+    expect(result).toBeNull();
+    expect(engine.calls).toHaveLength(0);
+  });
+
+  it('a NON-secret file emits NOTHING from the provider (allow edges belong to the engine — §6(f))', async () => {
+    const seen: string[] = [];
+    const doc = new FakeDocument('const x = 1;', '/repo/app.ts');
+    const engine = new FakeEngine();
+    engine.respondWith = 'done()';
+    const provider = makeProvider(engine, new FakeContextService(), {
+      onEgressVerdict: (_filepath, verdict) => {
+        seen.push(verdict);
+      },
+    });
+
+    await provider.provideInlineCompletionItems(
+      doc as unknown as vscode.TextDocument,
+      new vscode.Position(0, 0),
+      { triggerKind: 1, selectedCompletionInfo: undefined } as unknown as vscode.InlineCompletionContext,
+      fakeToken(),
+    );
+
+    expect(engine.calls).toHaveLength(1); // the healthy path ran
+    expect(seen).toEqual([]); // zero provider-side observer traffic on it
+  });
+
+  it('a preceding gate (disabled) wins: secret file, no observer call (feature-off inertness)', async () => {
+    const seen: string[] = [];
+    const doc = new FakeDocument('SECRET=abc123', '/repo/.env');
+    const engine = new FakeEngine();
+    const provider = new TalariaInlineCompletionProvider(
+      () => engine as unknown as FimEngine,
+      () => false, // disabled — egressPreconditionsMet returns before the path gate
+      () => false,
+      new FakeContextService() as unknown as CrossFileContextService,
+      () => 'vllm',
+      () => 'endpoint.example.com',
+      () => 'qwen2.5-coder:1.5b-base',
+      () => {},
+      undefined, // fimActivity → the no-op default (JS default semantics)
+      (_filepath, verdict) => {
+        seen.push(verdict);
+      },
+    );
+
+    const result = await provider.provideInlineCompletionItems(
+      doc as unknown as vscode.TextDocument,
+      new vscode.Position(0, 0),
+      { triggerKind: 1, selectedCompletionInfo: undefined } as unknown as vscode.InlineCompletionContext,
+      fakeToken(),
+    );
+
+    expect(result).toBeNull();
+    expect(seen).toEqual([]);
   });
 });

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { FimEngine } from './engine';
+import type { FimEngine, EgressVerdictObserver } from './engine';
 import { processSingleLineCompletion } from './singleLine';
 import type { FimContext } from './types';
 // W6-FC (final-3way-arch.md I-6): import the pure classifier directly from
@@ -223,6 +223,15 @@ export class TalariaInlineCompletionProvider
     // working unchanged, and FIM behaviour is identical when next-edit is not
     // registered.
     private readonly fimActivity: FimActivityListener = NO_OP_FIM_ACTIVITY,
+    // CA-06-path-face: the notice observer for THIS layer's gate — the
+    // secret-path skip below. Optional and purely OBSERVATIONAL (the skip
+    // is byte-identical with it absent, present, or throwing); wired
+    // UNCONDITIONALLY by index.ts because the path gate is
+    // locality-independent, unlike the engine's content gate. The provider
+    // only ever emits 'path-block' — 'allow' edges belong to the engine,
+    // whose content verdicts must not be pre-empted (or its badges cleared)
+    // by a path-level pass. T14 folds this into the options object.
+    private readonly onEgressVerdict?: EgressVerdictObserver,
   ) {}
 
   /**
@@ -329,6 +338,20 @@ export class TalariaInlineCompletionProvider
     // too costly for this low-severity, malicious-clone-only threat).
     const fsPathLike = (document.uri.path ?? document.uri.fsPath ?? '').replace(/\\/g, '/');
     if (isSecretForCompletion(fsPathLike)) {
+      // CA-06-path-face: tell the notice surface WHY completions never
+      // appear in this file. Decided-then-notified: isSecretForCompletion
+      // already returned true; the observer gets the verdict only (never
+      // the matched rule or the content), synchronously, result ignored,
+      // throw swallowed — and the `return null` below is unconditional and
+      // unchanged. This sits BEFORE the AbortController/try/fimActivity
+      // bookkeeping, so a swallowed throw leaves nothing half-initialized.
+      if (this.onEgressVerdict !== undefined) {
+        try {
+          this.onEgressVerdict(document.uri.toString(), 'path-block');
+        } catch {
+          // Fail-safe surface: a broken notice must never reach the skip path.
+        }
+      }
       return null;
     }
 

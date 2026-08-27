@@ -453,5 +453,113 @@ describe('FimEngine', () => {
       const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
       expect(result).toEqual({ text: 'world' });
     });
+
+    it('scans the POST-injection prefix (comment-inject mode) — pins the gate AFTER snippet injection', async () => {
+      // T2's own "post-injection" test above ran in the default (non-comment-inject)
+      // mode, so it never pinned that the content gate sits AFTER snippet
+      // injection. Step 5(c) rewrites that exact gate site, so this test guards
+      // against a future reorder that moves the gate back before injection.
+      const seen: string[][] = [];
+      const backend = new FakeBackend();
+      const engine = new FimEngine({
+        backend,
+        options: options({ crossFileMode: 'comment-inject' }),
+        cache: new InMemoryCompletionCache(),
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: (texts) => {
+          seen.push([...texts]);
+          return 'allow';
+        },
+      });
+      const snippets = [snippet({ filepath: 'src/util.ts', content: 'export function helper() {}' })];
+
+      await engine.complete(
+        ctx({ prefix: 'const x = ', languageId: 'typescript', snippets }),
+        { manual: true },
+        new AbortController().signal,
+      );
+
+      expect(seen).toHaveLength(1);
+      const [scannedPrefix] = must(seen[0]);
+      expect(scannedPrefix).toContain('export function helper() {}');
+    });
+  });
+});
+
+describe('CA-06-face — the egress-verdict observer seam', () => {
+  // The engine's face of the two-kind union: guard 'block' → 'content-block'.
+  it('notifies (filepath, verdict) on a blocked attempt — and still fail-closes', async () => {
+    const seen: Array<[string, string]> = [];
+    const backend = new FakeBackend();
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache: new InMemoryCompletionCache(),
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'block',
+      onEgressVerdict: (filepath, verdict) => {
+        seen.push([filepath, verdict]);
+      },
+    });
+    const result = await engine.complete(
+      ctx({ filepath: 'file:///tmp/observed.ts' }),
+      { manual: true },
+      new AbortController().signal,
+    );
+    expect(result).toBeUndefined();
+    expect(backend.calls).toEqual([]); // the block is untouched by the seam
+    expect(seen).toEqual([['file:///tmp/observed.ts', 'content-block']]);
+  });
+
+  it('a THROWING observer changes nothing on the block path (fail-closed intact, no egress)', async () => {
+    const backend = new FakeBackend();
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache: new InMemoryCompletionCache(),
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'block',
+      onEgressVerdict: () => {
+        throw new Error('surface exploded');
+      },
+    });
+    const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+    expect(result).toBeUndefined();
+    expect(backend.calls).toEqual([]);
+  });
+
+  it('a THROWING observer does not break the ALLOW path either', async () => {
+    const backend = new FakeBackend();
+    backend.chunks = ['world'];
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache: new InMemoryCompletionCache(),
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'allow',
+      onEgressVerdict: () => {
+        throw new Error('surface exploded');
+      },
+    });
+    const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+    expect(result).toEqual({ text: 'world' });
+  });
+
+  it('receives the allow verdict too (the surface clears badges on it)', async () => {
+    const verdicts: string[] = [];
+    const backend = new FakeBackend();
+    backend.chunks = ['x'];
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache: new InMemoryCompletionCache(),
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'allow',
+      onEgressVerdict: (_filepath, verdict) => {
+        verdicts.push(verdict);
+      },
+    });
+    await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+    expect(verdicts).toEqual(['allow']);
   });
 });

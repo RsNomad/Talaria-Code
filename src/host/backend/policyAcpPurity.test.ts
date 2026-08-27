@@ -313,14 +313,24 @@ describe('T-18 (C3): rag/ purity guard', () => {
 // honest guard, and re-litigating them here would be redundant, not
 // stricter. `index.ts` (the activation/registration entry), `provider.ts`
 // (the `vscode.InlineCompletionItemProvider` registration) and `config.ts`
-// (`vscode.workspace.getConfiguration` reads) are the three top-level
+// (`vscode.workspace.getConfiguration` reads) are three top-level
 // adapter-tier files — the non-`.vscode.ts`-named outlier this repo's
 // naming-convention backlog already documents (`purityScan.ts`'s module
 // doc) — verified below to genuinely need `vscode`, non-vacuously.
+// CA-06-face + CA-06-path-face (WS-FIM T2b) added a FOURTH: `egressNotice.
+// vscode.ts` — the two-kind egress-notice surface (`LanguageStatusItem` +
+// toast). It follows the repo's proper `.vscode.ts` adapter-naming
+// convention (unlike the three legacy outliers above), so it needs no
+// naming-backlog entry — just this allowlist addition.
 // ---------------------------------------------------------------------------
 
 const AUTOCOMPLETE_ROOT = join(__dirname, '..', '..', 'autocomplete');
-const AUTOCOMPLETE_ADAPTER_ALLOW = new Set(['index.ts', 'provider.ts', 'config.ts']);
+const AUTOCOMPLETE_ADAPTER_ALLOW = new Set([
+  'index.ts',
+  'provider.ts',
+  'config.ts',
+  'egressNotice.vscode.ts',
+]);
 
 /**
  * Non-recursive top-level-only sibling of `collectNonTestTsSources` — used
@@ -346,7 +356,7 @@ function collectAutocompleteRootSources() {
 }
 
 describe('T-18 (C3): autocomplete/ ROOT purity guard (top-level files only — context/ and nextedit/ have their own dedicated guards)', () => {
-  it('discovers the three adapters + at least one pure sibling (non-vacuous file discovery)', () => {
+  it('discovers the four adapters + at least one pure sibling (non-vacuous file discovery)', () => {
     const files = collectAutocompleteRootSources();
     expect(files.length).toBeGreaterThan(0);
     for (const adapter of AUTOCOMPLETE_ADAPTER_ALLOW) {
@@ -355,14 +365,14 @@ describe('T-18 (C3): autocomplete/ ROOT purity guard (top-level files only — c
     expect(files.some((f) => f.file === 'apiKey.ts')).toBe(true);
   });
 
-  it('no top-level autocomplete/ module imports node:fs (zero exceptions — not even the three adapters need it)', () => {
+  it('no top-level autocomplete/ module imports node:fs (zero exceptions — not even the four adapters need it)', () => {
     const offenders = collectAutocompleteRootSources()
       .filter((f) => FS_IMPORT_BAN.test(f.content))
       .map((f) => f.file);
     expect(offenders).toEqual([]);
   });
 
-  it('no top-level autocomplete/ module imports vscode EXCEPT the three sanctioned adapters', () => {
+  it('no top-level autocomplete/ module imports vscode EXCEPT the four sanctioned adapters', () => {
     const offenders = collectAutocompleteRootSources()
       .filter((f) => !AUTOCOMPLETE_ADAPTER_ALLOW.has(f.file))
       .filter((f) => VSCODE_IMPORT_BAN.test(f.content))
@@ -370,7 +380,7 @@ describe('T-18 (C3): autocomplete/ ROOT purity guard (top-level files only — c
     expect(offenders).toEqual([]);
   });
 
-  it('sanity: all three sanctioned adapters DO import vscode (the exemption is real, not vacuous)', () => {
+  it('sanity: all four sanctioned adapters DO import vscode (the exemption is real, not vacuous)', () => {
     const files = collectAutocompleteRootSources();
     for (const adapter of AUTOCOMPLETE_ADAPTER_ALLOW) {
       const source = files.find((f) => f.file === adapter);
@@ -405,6 +415,7 @@ describe('T-18 (C3): autocomplete/ ROOT purity guard (top-level files only — c
     expect(offenders).not.toContain('index.ts');
     expect(offenders).not.toContain('provider.ts');
     expect(offenders).not.toContain('config.ts');
+    expect(offenders).not.toContain('egressNotice.vscode.ts');
   });
 
   it('non-recursive by construction: never descends into context/, nextedit/, or backends/ (those are scanned by their own dedicated guards)', () => {

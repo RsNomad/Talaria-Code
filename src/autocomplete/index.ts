@@ -12,7 +12,9 @@ import {
   shouldClearLegacyApiKeySetting,
 } from './apiKey';
 import { isLoopbackHost } from './backends/secureTransport';
-import { makeFimEgressGuard } from './egressScan';
+import { makeFimEgressGuard, isLoopbackFimEndpoint } from './egressScan';
+import { createEgressNoticeSurface } from './egressNotice.vscode';
+import type { EgressVerdictObserver } from './engine';
 import { getTemplateForModel } from './templates';
 import { crossFileMode } from './context/mode';
 import { createHermesCrossFileContextService } from './context/contextService.vscode';
@@ -93,7 +95,16 @@ export function registerTalariaAutocomplete(
   // refreshed on change. Until it resolves, the engine uses whatever legacy
   // setting value `cfg.apiKey` carries (back-compat).
   let secretApiKey: string | undefined;
-  let built = buildEngine(cfg, secretApiKey);
+  // CA-06-face: ONE surface per activation. The observer is threaded only
+  // for a non-loopback endpoint, decided by the SAME classifier the guard
+  // factory uses (`isLoopbackFimEndpoint`) — no drift possible between
+  // "the guard scans" and "the surface is wired". This gates the ENGINE
+  // (content) thread ONLY — the provider's path thread is wired
+  // unconditionally at the provider construction below (9(f)).
+  const egressNotice = createEgressNoticeSurface();
+  const egressObserverFor = (endpoint: string): EgressVerdictObserver | undefined =>
+    isLoopbackFimEndpoint(endpoint) ? undefined : egressNotice.onEgressVerdict;
+  let built = buildEngine(cfg, secretApiKey, egressObserverFor(cfg.endpoint));
   let engine = built.engine;
   // S4.3: recomputed alongside `engine` on every rebuild (config change), so a
   // changed `talaria.autocomplete.endpoint` is reflected immediately. Workspace
@@ -147,6 +158,11 @@ export function registerTalariaAutocomplete(
     // unconditionally keeps the provider's construction independent of
     // whether next-edit registered successfully.
     fimActivityRelay,
+    // CA-06-path-face: the path-skip notice thread — UNCONDITIONAL, the
+    // deliberate contrast with egressObserverFor above: the S4.1 secret-path
+    // gate fires regardless of endpoint locality, so its face must too. The
+    // surface renders 'path-block' as an Information badge with no toast.
+    egressNotice.onEgressVerdict,
   );
 
   const providerDisposable = vscode.languages.registerInlineCompletionItemProvider(
@@ -163,7 +179,11 @@ export function registerTalariaAutocomplete(
     // would miss this rebuild's own chance to re-warn on a still-broken (or
     // newly re-broken) config, and only catch up one rebuild late.
     clearBackendFactoryWarnings();
-    built = buildEngine(cfg, secretApiKey);
+    // CA-06-face: a rebuild is an epoch boundary — the endpoint may have
+    // changed. Clear badges and re-arm the one-shot toasts (the same
+    // clearSurfacedAutocompleteFailures re-arm posture used just below).
+    egressNotice.reset();
+    built = buildEngine(cfg, secretApiKey, egressObserverFor(cfg.endpoint));
     engine = built.engine;
     remote = !isLoopbackEndpoint(cfg.endpoint);
     // A5: re-arm every surfaced-once failure warning on every rebuild (config
@@ -326,6 +346,7 @@ export function registerTalariaAutocomplete(
     secretDisposable,
     setKeyCommand,
     contextServiceDisposable,
+    egressNotice,
     {
       dispose: () => {
         nextEditTornDown = true;
@@ -468,6 +489,7 @@ interface BuiltEngine {
 function buildEngine(
   cfg: HermesAutocompleteConfig,
   secretApiKey: string | undefined,
+  onEgressVerdict?: EgressVerdictObserver,
 ): BuiltEngine {
   const apiKey = pickApiKey(secretApiKey, cfg.apiKey);
   const backend = createBackend({ ...cfg, ...(apiKey !== undefined ? { apiKey } : {}) });
@@ -505,6 +527,11 @@ function buildEngine(
     // `apiBase: cfg.endpoint` from backendFactory), so this string IS where
     // streamFim will POST.
     checkEgress: makeFimEgressGuard(cfg.endpoint),
+    // CA-06-face: present ONLY for non-loopback endpoints (the caller omits
+    // it otherwise) — the default local path never carries the callback.
+    // This gates the ENGINE (content) thread ONLY — the provider's path
+    // thread is wired unconditionally at the provider construction (9(f)).
+    ...(onEgressVerdict !== undefined ? { onEgressVerdict } : {}),
   });
 
   return { engine, capabilities: backend.capabilities, template, backend };

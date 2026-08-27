@@ -19,6 +19,15 @@ import type {
 const SINGLE_LINE_MAX_TOKENS = 128;
 const MULTILINE_MAX_TOKENS = 256;
 
+/** CA-06-face + CA-06-path-face — the notice seam's verdict union and shape.
+ *  Host-pure: plain types, no vscode. 'content-block'/'allow' are the
+ *  ENGINE's face (its guard verdict, mapped at the single call site);
+ *  'path-block' is emitted one layer above by the PROVIDER's secret-path
+ *  gate (provider.ts) — the engine can never emit it, and the provider
+ *  never emits the other two. */
+export type FimEgressNoticeVerdict = 'path-block' | 'content-block' | 'allow';
+export type EgressVerdictObserver = (filepath: string, verdict: FimEgressNoticeVerdict) => void;
+
 export interface FimEngineDeps {
   backend: FimBackend;
   options: AutocompleteOptions;
@@ -29,6 +38,15 @@ export interface FimEngineDeps {
    *  Built once per engine (`makeFimEgressGuard(cfg.endpoint)`) — loopback
    *  endpoints get a constant-allow (zero added work on the default path). */
   checkEgress: FimEgressGuard;
+  /** CA-06-face — optional, purely OBSERVATIONAL: notified with the guard's
+   *  verdict on every guard-consulted attempt. It cannot affect the
+   *  completion path: the verdict is decided before the call, the return
+   *  value is ignored, and a throw is swallowed at the call site. The
+   *  composition root OMITS this key entirely (key omission, never
+   *  `= undefined`) for loopback endpoints, so the default path never even
+   *  carries the callback. Optional-by-design — absence is a first-class
+   *  correct state for an observer, unlike the load-bearing `checkEgress`. */
+  onEgressVerdict?: EgressVerdictObserver;
 }
 
 /**
@@ -47,6 +65,7 @@ export class FimEngine {
   private readonly cache: CompletionCache;
   private readonly debouncer: AutocompleteDebouncer;
   private readonly checkEgress: FimEgressGuard;
+  private readonly onEgressVerdict: EgressVerdictObserver | undefined;
 
   constructor(deps: FimEngineDeps) {
     this.backend = deps.backend;
@@ -54,6 +73,7 @@ export class FimEngine {
     this.cache = deps.cache;
     this.debouncer = deps.debouncer;
     this.checkEgress = deps.checkEgress;
+    this.onEgressVerdict = deps.onEgressVerdict;
   }
 
   /** Hot-swap Ollama <-> llama.cpp <-> vLLM <-> Codestral <-> OpenAI-compat. */
@@ -131,7 +151,21 @@ export class FimEngine {
     // these two plus already-scanned ScannedSnippets and name-derived
     // fields). A 'block' — scanner hit OR scanner error — means NO egress,
     // silently (the ringBuffer.ingest drop posture): fail-closed.
-    if (this.checkEgress([prefix, suffix]) === 'block') {
+    const egressVerdict = this.checkEgress([prefix, suffix]);
+    if (this.onEgressVerdict !== undefined) {
+      // CA-06-face: observational ONLY. The verdict is already decided (the
+      // const above); the observer gets no scanned text, its return value is
+      // ignored, and a throw is swallowed — it cannot cause egress, cannot
+      // un-block, cannot break or delay completions (never awaited). The
+      // guard verdict maps onto the two-kind notice union here: the engine
+      // only ever speaks content kinds ('path-block' is the provider's).
+      try {
+        this.onEgressVerdict(ctx.filepath, egressVerdict === 'block' ? 'content-block' : 'allow');
+      } catch {
+        // Fail-safe surface: a broken notice must never reach this path.
+      }
+    }
+    if (egressVerdict === 'block') {
       return undefined;
     }
 
