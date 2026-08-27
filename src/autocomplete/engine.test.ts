@@ -67,6 +67,7 @@ function makeEngine(backend: FakeBackend, opts: AutocompleteOptions) {
     options: opts,
     cache: new InMemoryCompletionCache(),
     debouncer: new AutocompleteDebouncer(),
+    checkEgress: () => 'allow',
   });
 }
 
@@ -232,6 +233,7 @@ describe('FimEngine', () => {
         options: options(),
         cache,
         debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
       });
 
       await engine.complete(
@@ -252,6 +254,7 @@ describe('FimEngine', () => {
         options: options(),
         cache,
         debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
       });
       const signal = new AbortController().signal;
 
@@ -384,6 +387,7 @@ describe('FimEngine', () => {
         options: options({ crossFileMode: 'comment-inject' }),
         cache,
         debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
       });
       const snippets = [snippet({ filepath: 'src/util.ts', content: 'export function helper() {}' })];
 
@@ -395,6 +399,59 @@ describe('FimEngine', () => {
 
       const expectedHash = snippetSetHash(snippets);
       expect(must(cache.puts[0]).key).toBe(`${expectedHash} const x = `);
+    });
+  });
+
+  describe('CA-06 — pre-egress content gate', () => {
+    it('a blocking guard returns undefined BEFORE any backend call, and caches nothing', async () => {
+      const backend = new FakeBackend();
+      const cache = new InMemoryCompletionCache();
+      const engine = new FimEngine({
+        backend,
+        options: options(),
+        cache,
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'block',
+      });
+      const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+      expect(result).toBeUndefined();
+      expect(backend.calls).toEqual([]); // no egress
+    });
+
+    it('the guard receives the POST-prune, POST-injection egressing strings (prefix, suffix) — not the raw document', async () => {
+      const seen: string[][] = [];
+      const backend = new FakeBackend();
+      const engine = new FimEngine({
+        backend,
+        options: options(),
+        cache: new InMemoryCompletionCache(),
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: (texts) => {
+          seen.push([...texts]);
+          return 'allow';
+        },
+      });
+      await engine.complete(ctx({ prefix: 'const x = ', suffix: ';\n' }), { manual: true }, new AbortController().signal);
+      expect(seen).toHaveLength(1);
+      const call = must(seen[0]);
+      // The engine egresses exactly what it scanned: the request the backend saw
+      // carries the same two strings.
+      const req = must(backend.calls[0]);
+      expect(call).toEqual([req.prefix, req.suffix]);
+    });
+
+    it('an allowing guard leaves the completion flow byte-identical (control)', async () => {
+      const backend = new FakeBackend();
+      backend.chunks = ['world'];
+      const engine = new FimEngine({
+        backend,
+        options: options(),
+        cache: new InMemoryCompletionCache(),
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
+      });
+      const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+      expect(result).toEqual({ text: 'world' });
     });
   });
 });

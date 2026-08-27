@@ -12,6 +12,7 @@ import {
   shouldClearLegacyApiKeySetting,
 } from './apiKey';
 import { isLoopbackHost } from './backends/secureTransport';
+import { makeFimEgressGuard } from './egressScan';
 import { getTemplateForModel } from './templates';
 import { crossFileMode } from './context/mode';
 import { createHermesCrossFileContextService } from './context/contextService.vscode';
@@ -498,6 +499,12 @@ function buildEngine(
     },
     cache: new InMemoryCompletionCache(),
     debouncer: new AutocompleteDebouncer(),
+    // CA-06: classified once per build — cfg.endpoint is already the RESOLVED
+    // egress destination (readConfig substitutes the backend's default when
+    // the raw setting is empty/invalid, and every backend receives
+    // `apiBase: cfg.endpoint` from backendFactory), so this string IS where
+    // streamFim will POST.
+    checkEgress: makeFimEgressGuard(cfg.endpoint),
   });
 
   return { engine, capabilities: backend.capabilities, template, backend };

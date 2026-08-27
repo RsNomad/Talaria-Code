@@ -7,6 +7,7 @@ import { pruneToBudget } from './prefixSuffix';
 import { getTemplateForModel } from './templates';
 import { snippetSetHash } from './context/hash';
 import { injectSnippetsAsComments } from './context/mode';
+import type { FimEgressGuard } from './egressScan';
 import type {
   AutocompleteOptions,
   CompletionCache,
@@ -23,6 +24,11 @@ export interface FimEngineDeps {
   options: AutocompleteOptions;
   cache: CompletionCache;
   debouncer: AutocompleteDebouncer;
+  /** CA-06 — consulted with the exact egressing strings immediately before
+   *  `streamFim`. `'block'` ⇒ return undefined (no egress, fail-closed).
+   *  Built once per engine (`makeFimEgressGuard(cfg.endpoint)`) — loopback
+   *  endpoints get a constant-allow (zero added work on the default path). */
+  checkEgress: FimEgressGuard;
 }
 
 /**
@@ -40,12 +46,14 @@ export class FimEngine {
   private readonly options: AutocompleteOptions;
   private readonly cache: CompletionCache;
   private readonly debouncer: AutocompleteDebouncer;
+  private readonly checkEgress: FimEgressGuard;
 
   constructor(deps: FimEngineDeps) {
     this.backend = deps.backend;
     this.options = deps.options;
     this.cache = deps.cache;
     this.debouncer = deps.debouncer;
+    this.checkEgress = deps.checkEgress;
   }
 
   /** Hot-swap Ollama <-> llama.cpp <-> vLLM <-> Codestral <-> OpenAI-compat. */
@@ -116,6 +124,16 @@ export class FimEngine {
       this.options.crossFileMode === 'comment-inject'
         ? injectSnippetsAsComments(prunedPrefix, ctx.snippets, ctx.languageId)
         : prunedPrefix;
+
+    // CA-06 — the active-file content egress gate. `prefix` here is the
+    // post-prune, post-injection string and `suffix` the post-prune string:
+    // exactly the bytes about to egress (renderedPrompt is derived from
+    // these two plus already-scanned ScannedSnippets and name-derived
+    // fields). A 'block' — scanner hit OR scanner error — means NO egress,
+    // silently (the ringBuffer.ingest drop posture): fail-closed.
+    if (this.checkEgress([prefix, suffix]) === 'block') {
+      return undefined;
+    }
 
     const requestContext: FimContext = { ...ctx, prefix, suffix };
     // R7 (no double-wrap) — DO NOT weaken: a nativeFim backend receives snippets
