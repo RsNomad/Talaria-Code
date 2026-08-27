@@ -1131,6 +1131,10 @@ function makeBackendWithCheckpoints(mentionResolver?: MentionResolverLike): {
     undefined,
     undefined,
     undefined,
+    // GUARD: valid ONLY for ≤1-folder tests (canonicalRoot === primaryRoot
+    // for every cwd here). A 2+-element workspaceFolders needs a
+    // discriminating fake (PrimaryOnlyTrackerRegistry / SpyTrackerRegistry)
+    // instead, or this silently masks a non-primary→undefined divergence.
     new UniversalTrackerRegistry(tracker),
   );
   const client = new FakeAcpClient();
@@ -3133,6 +3137,10 @@ describe('AcpBackend — W4-T1b §3: a crash releases the (bridge) root turn-lea
       undefined,
       undefined,
       undefined,
+      // GUARD: valid ONLY for ≤1-folder tests (canonicalRoot === primaryRoot
+      // for every cwd here). A 2+-element workspaceFolders needs a
+      // discriminating fake (PrimaryOnlyTrackerRegistry / SpyTrackerRegistry)
+      // instead, or this silently masks a non-primary→undefined divergence.
       new UniversalTrackerRegistry(tracker),
     );
     seam(backend).control = new FakeControlChannel();
@@ -11015,6 +11023,10 @@ function makeOneShotBackend(tracker?: CheckpointTrackerLike): {
     undefined,
     undefined,
     undefined,
+    // GUARD: valid ONLY for ≤1-folder tests (canonicalRoot === primaryRoot
+    // for every cwd here). A 2+-element workspaceFolders needs a
+    // discriminating fake (PrimaryOnlyTrackerRegistry / SpyTrackerRegistry)
+    // instead, or this silently masks a non-primary→undefined divergence.
     tracker ? new UniversalTrackerRegistry(tracker) : undefined,
   );
   const client = new FakeAcpClient();
@@ -12366,6 +12378,10 @@ describe('AcpBackend — W4-T2: real per-root turn lease + root-scoped ordinals 
       undefined,
       undefined,
       undefined,
+      // GUARD: valid ONLY for ≤1-folder tests (canonicalRoot === primaryRoot
+      // for every cwd here). A 2+-element workspaceFolders needs a
+      // discriminating fake (PrimaryOnlyTrackerRegistry / SpyTrackerRegistry)
+      // instead, or this silently masks a non-primary→undefined divergence.
       tracker ? new UniversalTrackerRegistry(tracker) : undefined,
     );
     const client = new FakeAcpClient();
