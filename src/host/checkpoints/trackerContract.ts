@@ -42,3 +42,8 @@ export interface CheckpointTrackerLike {
   redo(opts?: { force?: boolean }): Promise<RestoreResult>;
   redoAll(opts?: { force?: boolean }): Promise<RestoreResult>;
 }
+
+/** WS-CK-A6: the narrow slice of the per-root tracker registry AcpBackend consults (lazily, per RootCoordinator.tracker access). */
+export interface CheckpointTrackerRegistryLike {
+  get(canonicalRoot: string): CheckpointTrackerLike | undefined;
+}
