@@ -6,5 +6,7 @@
  * is constructed. Flipped to true ONLY by the final A6 gate commit, after the
  * per-root suite (registry + reconcile + isolation + INV-A6-GITDIR +
  * dispose-durability + promotion) is green.
+ *
+ * Flipped 2026-08-27, per-root suite green — see ADR-020.
  */
-export const MULTI_ROOT_CHECKPOINTS = false;
+export const MULTI_ROOT_CHECKPOINTS = true;

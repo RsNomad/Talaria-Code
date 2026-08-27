@@ -755,13 +755,13 @@ let activeCheckpointTracker: CheckpointTracker | undefined;
 
 /**
  * WS-CK-A6: the per-root tracker registry, held at module scope for the same
- * reason as {@link activeCheckpointTracker} — a future `deactivate` flush
- * needs a handle to it. `undefined` while {@link MULTI_ROOT_CHECKPOINTS} is
- * false (the registry is never constructed pre-flip); NOT read by
- * `deactivate` yet — that generalization is deliberately reserved for the
- * flip commit (Task 17), per the spec's rev-4 caveat (ii): pre-flip the
- * registry is never constructed, so the legacy single-flush above remains
- * complete on its own.
+ * reason as {@link activeCheckpointTracker} — {@link deactivate} needs a
+ * handle to it to flush EVERY root's pending object localization before
+ * shutdown (Task 17 gate flip). `undefined` while {@link
+ * MULTI_ROOT_CHECKPOINTS} is false (the registry is never constructed
+ * pre-flip) — `deactivate`'s null-guard makes that arm inert rather than a
+ * durability gap, so re-flipping the flag back to false is a safe 1-line
+ * revert (the legacy single-tracker arm below stays intact for that path).
  */
 let checkpointTrackerRegistry: CheckpointTrackerRegistry | undefined;
 
@@ -775,6 +775,21 @@ export async function deactivate(): Promise<void> {
   // a just-made checkpoint). Flushing it here on shutdown closes that window
   // (`CheckpointTracker.localizeAlternateObjects`'s note). Best-effort — never
   // throw out of deactivate.
+
+  // WS-CK-A6 (Task 17, gate flip): flush EVERY registered per-root tracker
+  // (durability window A#10, generalized) — post-flip, `createCheckpointTracker`
+  // no longer runs for ANY root (the registry owns construction instead), so
+  // `activeCheckpointTracker` is undefined and a primary-only flush would be
+  // a durability hole for every other root's borrowed-blob checkpoints.
+  const registry = checkpointTrackerRegistry;
+  if (registry) {
+    await registry.disposeAll().catch(() => undefined);
+  }
+
+  // Legacy single-tracker arm: unreachable while MULTI_ROOT_CHECKPOINTS is
+  // true (the registry above already flushed every root, including the
+  // primary); kept byte-intact as the flag-off path's own teardown so
+  // re-flipping the const back to false needs no further change here.
   const tracker = activeCheckpointTracker;
   if (tracker) {
     try {
@@ -784,15 +799,6 @@ export async function deactivate(): Promise<void> {
     }
     tracker.dispose();
   }
-
-  // WS-CK-A6 (Task 15): `checkpointTrackerRegistry` is written by
-  // `makeAcpBackend` (only ever non-undefined once MULTI_ROOT_CHECKPOINTS
-  // flips true) but deliberately NOT flushed here yet — that generalization
-  // is reserved for Task 17's flip commit (rev-4 caveat (ii)); pre-flip the
-  // registry is never constructed, so the legacy single-flush above is
-  // already complete on its own. This reference just keeps the module-scope
-  // binding live for tsc (`noUnusedLocals`) without doing anything with it.
-  void checkpointTrackerRegistry;
 }
 
 /**

@@ -42,6 +42,7 @@ import type { AcpSessionUpdate, AcpRequestPermissionRequest, AcpRequestPermissio
 import { evaluateEditPolicy } from './policy/editPolicy';
 import { EditPreviewRegistry } from '../preview/EditPreviewRegistry';
 import type { CheckpointTrackerLike, CheckpointTrackerRegistryLike } from '../checkpoints/trackerContract';
+import { canonicalizeWorkspaceRoot } from '../checkpoints/rootResolution';
 import type { RestoreResult } from '../checkpoints/CheckpointTracker';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
 import type { PanelSource } from '../panels/PanelSourceRegistry';
@@ -1065,6 +1066,31 @@ class FakeCheckpointTracker implements CheckpointTrackerLike {
 }
 
 /**
+ * WS-CK-A6 Task 17 (post-flip test-pin migration): with `MULTI_ROOT_CHECKPOINTS`
+ * true, `resolveRootCoordinator`'s factory ternary resolves a tracker
+ * EXCLUSIVELY through `this.trackerRegistry?.get(canonicalRoot)` — the
+ * `checkpointTracker` ctor-arg arm (position 4) is dead on this path (see the
+ * dedicated "A6 flag-on wiring" suite). Every OTHER test in this file that
+ * injects a `checkpointTracker` to exercise genuine checkpoint FUNCTIONALITY
+ * (turn barriers, snapshot ordinals, restore/redo, panel refresh — not the A6
+ * wiring contract itself) never configures more than ONE `mockWorkspace
+ * .workspaceFolders` entry, under which `findContainingWorkspaceRoot` always
+ * returns that one folder (or the bare cwd when zero are configured) — so the
+ * canonical root the registry is asked for is trivially always the SAME one
+ * the pre-flip ternary trivially always matched too. This fake reproduces
+ * that exact pre-flip primary-only shape for the registry seam: it answers
+ * with ONE fixed tracker for ANY canonical root asked, matching what the bare
+ * `checkpointTracker` ctor arg used to provide unconditionally in every one
+ * of those single/zero-root test contexts.
+ */
+class UniversalTrackerRegistry implements CheckpointTrackerRegistryLike {
+  constructor(private readonly tracker: CheckpointTrackerLike) {}
+  get(): CheckpointTrackerLike | undefined {
+    return this.tracker;
+  }
+}
+
+/**
  * T2c: fake {@link MentionResolverLike} — tests control resolution TIMING
  * (via `setImpl`, so a test can hand back a deferred promise to prove
  * barrier-parallel concurrency) and OUTCOME (including a resolver that
@@ -1095,7 +1121,18 @@ function makeBackendWithCheckpoints(mentionResolver?: MentionResolverLike): {
 } {
   const config: HermesRuntimeConfig = {};
   const tracker = new FakeCheckpointTracker();
-  const backend = new AcpBackend(config, undefined, undefined, tracker, undefined, mentionResolver);
+  const backend = new AcpBackend(
+    config,
+    undefined,
+    undefined,
+    tracker,
+    undefined,
+    mentionResolver,
+    undefined,
+    undefined,
+    undefined,
+    new UniversalTrackerRegistry(tracker),
+  );
   const client = new FakeAcpClient();
   seam(backend).client = client;
   seam(backend).sessionId = 'session-1';
@@ -3086,7 +3123,18 @@ describe('AcpBackend — W4-T1b §3: a crash releases the (bridge) root turn-lea
       clients.push(client);
       return client;
     };
-    const backend = new AcpBackend(config, undefined, createClient, tracker);
+    const backend = new AcpBackend(
+      config,
+      undefined,
+      createClient,
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      new UniversalTrackerRegistry(tracker),
+    );
     seam(backend).control = new FakeControlChannel();
     return { backend, clients };
   }
@@ -6401,7 +6449,18 @@ describe('AcpBackend — C1: the pre-turn checkpoint snapshot is an AWAITED barr
     tracker.snapshot = async () => {
       throw new Error('git executable not found on PATH');
     };
-    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, tracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      { append: (l) => logs.push(l) },
+      undefined,
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      tracker ? new UniversalTrackerRegistry(tracker) : undefined,
+    );
     const client = new FakeAcpClient();
     seam(backend).client = client;
     seam(backend).sessionId = 'session-1';
@@ -6590,6 +6649,10 @@ describe('AcpBackend — T2c: @-mentions resolve in parallel with the C1 barrier
       tracker,
       undefined,
       resolver,
+      undefined,
+      undefined,
+      undefined,
+      new UniversalTrackerRegistry(tracker),
     );
     const client = new FakeAcpClient();
     seam(backend).client = client;
@@ -6792,7 +6855,18 @@ describe('AcpBackend — W2-F2 Phase 0: after-turn checkpoint on every terminal 
       if (opts?.phase === 'after') throw new Error('after write-tree boom');
       return null;
     };
-    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, tracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      { append: (l) => logs.push(l) },
+      undefined,
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      tracker ? new UniversalTrackerRegistry(tracker) : undefined,
+    );
     const client = new FakeAcpClient();
     seam(backend).client = client;
     seam(backend).sessionId = 'session-1';
@@ -10931,7 +11005,18 @@ function makeOneShotBackend(tracker?: CheckpointTrackerLike): {
   logs: string[];
 } {
   const logs: string[] = [];
-  const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, tracker);
+  const backend = new AcpBackend(
+    {} as HermesRuntimeConfig,
+    { append: (l) => logs.push(l) },
+    undefined,
+    tracker,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    tracker ? new UniversalTrackerRegistry(tracker) : undefined,
+  );
   const client = new FakeAcpClient();
   seam(backend).client = client;
   // W4-T2: `cwd` MUST be set BEFORE `sessionId` mints the controller — the
@@ -12271,7 +12356,18 @@ describe('AcpBackend — W4-T2: real per-root turn lease + root-scoped ordinals 
     client: FakeAcpClient;
     messages: HostToWebviewMessage[];
   } {
-    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, tracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      tracker ? new UniversalTrackerRegistry(tracker) : undefined,
+    );
     const client = new FakeAcpClient();
     seam(backend).client = client;
     const messages: HostToWebviewMessage[] = [];
@@ -12612,24 +12708,28 @@ describe('AcpBackend — W4-T2: real per-root turn lease + root-scoped ordinals 
 });
 
 /**
- * WS-CK-A6 Task 10 — golden master pinning the OBSERVABLE behavior of the
- * pre-flip primary-only tracker factory inside `resolveRootCoordinator`
- * (`:718-727`): the injected `checkpointTracker` (constructed by
- * `extension.ts` for the FIRST workspace root only — today's only reachable
- * shape) is handed to the resolved coordinator ONLY when its canonical root
- * matches the primary (first-listed) root; every other root gets
- * `tracker: undefined` (the honest NO_TRACKER refusal feed, not a silently
- * shared shadow-git). Task 15 flag-gates this factory and Task 17 flips it
- * to per-root live trackers — these 4 pins are exactly the pre-flip contract
- * both must preserve on the flag-OFF path. Scoped to non-symlinked roots
- * (spec's scoped-honesty: a symlinked root's canonical hash deliberately
- * diverges post-flip, handled by adopt-by-rename in Task 13) — fake
- * non-existent absolute paths are fine here (same convention as `/root-1`/
- * `/root-b` elsewhere in this file): `canonicalizeWorkspaceRoot` falls back
- * to the lexical `path.resolve`'d form on any FS error, so the canonical key
- * is still stable and deterministic without the path existing on disk.
+ * WS-CK-A6 Task 17 (post-flip) — golden master pinning the OBSERVABLE
+ * behavior of the registry-backed tracker factory inside
+ * `resolveRootCoordinator` (`:735-744`) now that `MULTI_ROOT_CHECKPOINTS` is
+ * true: the ternary's registry arm (`this.trackerRegistry?.get(canonicalRoot)`)
+ * is live, and the legacy `checkpointTracker` ctor-arg arm is dead code on
+ * this path (proven separately by the "legacy arm is dead" suite below).
+ * These are the SAME four observable outcomes Task 10 originally pinned for
+ * the pre-flip primary-only factory — inverted here onto a fake
+ * `CheckpointTrackerRegistryLike` whose `get` answers only for ONE
+ * pre-registered canonical root (mirroring `extension.ts`'s real registry,
+ * which today only ever reconciles the roots VS Code reports; a second LIVE
+ * root end-to-end is Fedora-probed, per Task 13/14/16's registry-level
+ * isolation tests + Task 3's tracker-level characterization): primary root
+ * -> tracker; unregistered non-primary root -> undefined (the honest
+ * NO_TRACKER refusal feed, not a silently shared shadow-git); same canonical
+ * root -> same coordinator instance; zero workspace folders -> a bare cwd is
+ * its own root and still resolves a tracker. Scoped to non-symlinked roots
+ * (spec's scoped-honesty — see `canonicalizeWorkspaceRoot`'s FS-error
+ * fallback); fake non-existent absolute paths are fine here (same convention
+ * as `/root-1`/`/root-b` elsewhere in this file).
  */
-describe('A6 golden master — primary-only tracker factory (pre-flip pin)', () => {
+describe('A6 golden master — registry-backed tracker factory (post-flip pin)', () => {
   afterEach(() => {
     mockWorkspace.workspaceFolders = undefined;
   });
@@ -12649,20 +12749,55 @@ describe('A6 golden master — primary-only tracker factory (pre-flip pin)', () 
     ).resolveRootCoordinator(cwd);
   }
 
-  it('a cwd under the PRIMARY (first-listed) root resolves a coordinator holding the injected tracker', () => {
+  /** `get` answers only for the ONE pre-canonicalized root the fake is registered with — `undefined` for every other canonical root, matching the honest per-root registry contract (an un-reconciled root has no tracker). */
+  class PrimaryOnlyTrackerRegistry implements CheckpointTrackerRegistryLike {
+    constructor(
+      private readonly tracker: CheckpointTrackerLike,
+      private readonly registeredCanonicalRoot: string,
+    ) {}
+    get(canonicalRoot: string): CheckpointTrackerLike | undefined {
+      return canonicalRoot === this.registeredCanonicalRoot ? this.tracker : undefined;
+    }
+  }
+
+  it('a cwd under the PRIMARY (first-listed) root resolves a coordinator holding the registry-backed tracker', () => {
     const fakeTracker = new FakeCheckpointTracker();
+    const registry = new PrimaryOnlyTrackerRegistry(fakeTracker, canonicalizeWorkspaceRoot('/root-a'));
     mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
-    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, fakeTracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
 
     const coordinator = coordinatorFor(backend, '/root-a/sub/dir');
 
     expect(coordinator.tracker).toBe(fakeTracker);
   });
 
-  it('a cwd under a NON-primary root resolves tracker: undefined (the honest NO_TRACKER refusal feed)', () => {
+  it('a cwd under a NON-registered root resolves tracker: undefined (the honest NO_TRACKER refusal feed)', () => {
     const fakeTracker = new FakeCheckpointTracker();
+    const registry = new PrimaryOnlyTrackerRegistry(fakeTracker, canonicalizeWorkspaceRoot('/root-a'));
     mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
-    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, fakeTracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
 
     const coordinator = coordinatorFor(backend, '/root-b/sub/dir');
 
@@ -12671,8 +12806,20 @@ describe('A6 golden master — primary-only tracker factory (pre-flip pin)', () 
 
   it('the same canonical root always yields the SAME coordinator instance', () => {
     const fakeTracker = new FakeCheckpointTracker();
+    const registry = new PrimaryOnlyTrackerRegistry(fakeTracker, canonicalizeWorkspaceRoot('/root-a'));
     mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }];
-    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, fakeTracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
 
     const first = coordinatorFor(backend, '/root-a/x');
     const second = coordinatorFor(backend, '/root-a/y');
@@ -12680,10 +12827,25 @@ describe('A6 golden master — primary-only tracker factory (pre-flip pin)', () 
     expect(first).toBe(second);
   });
 
-  it("zero workspace folders: a bare cwd is its own root and gets the injected tracker (today's reachable shape)", () => {
+  it("zero workspace folders: a bare cwd is its own root and gets the registry-backed tracker (today's reachable shape)", () => {
     const fakeTracker = new FakeCheckpointTracker();
+    // Zero folders: `resolveRootCoordinator`'s `primaryRoot` capture falls
+    // back to the cwd itself (`workspaceRoots()[0] ?? cwd`), so the fake
+    // must be registered under the SAME cwd-derived canonical root.
+    const registry = new PrimaryOnlyTrackerRegistry(fakeTracker, canonicalizeWorkspaceRoot('/bare-cwd'));
     mockWorkspace.workspaceFolders = [];
-    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, fakeTracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
 
     const coordinator = coordinatorFor(backend, '/bare-cwd');
 
@@ -12692,18 +12854,18 @@ describe('A6 golden master — primary-only tracker factory (pre-flip pin)', () 
 });
 
 /**
- * WS-CK-A6 Task 15 — flag-off wiring: with `MULTI_ROOT_CHECKPOINTS` false,
- * `resolveRootCoordinator`'s registry arm (`:718-732`) is dead code — the
- * ternary always takes the primary-only branch, so an injected
- * `trackerRegistry` must NEVER be consulted, and the Task 10 golden-master
- * pins (above) must hold byte-identical with a registry present. Deliberately
- * does NOT mock `./checkpoints/multiRootFlag` (it flips for real in Task 17)
- * — this exercises the REAL flag-off value. The registry ARM's live behavior
- * (flag true) is covered by Task 17's flip (which re-runs the whole
- * golden-master suite against the new arm) + Task 16's registry-level
- * isolation tests — not asserted here.
+ * WS-CK-A6 Task 17 — flag-on inversion of Task 15's flag-off pin: with
+ * `MULTI_ROOT_CHECKPOINTS` now true, `resolveRootCoordinator`'s ternary
+ * (`:740-742`) takes the REGISTRY arm unconditionally, so an injected
+ * `trackerRegistry` MUST be consulted, and the legacy `checkpointTracker`
+ * ctor-arg arm is dead code — proven here by injecting BOTH a legacy tracker
+ * and a distinct registry-backed tracker and observing the registry's
+ * tracker wins (identity, not just "truthy"). Deliberately does NOT mock
+ * `./checkpoints/multiRootFlag` — it flips for real in this commit, so this
+ * exercises the REAL flag-on value, mirroring Task 15's own "don't mock the
+ * flag" discipline.
  */
-describe('A6 flag-off wiring — injected trackerRegistry is never consulted', () => {
+describe('A6 flag-on wiring — registry is consulted, legacy checkpointTracker arm is dead', () => {
   afterEach(() => {
     mockWorkspace.workspaceFolders = undefined;
   });
@@ -12717,63 +12879,71 @@ describe('A6 flag-off wiring — injected trackerRegistry is never consulted', (
     ).resolveRootCoordinator(cwd);
   }
 
-  /** Spy-only fake — the ONLY assertion this suite makes on it is that `get` is never called. */
-  class FakeTrackerRegistry implements CheckpointTrackerRegistryLike {
+  /** Spy fake — records every canonical root it's asked about, and always answers with its OWN tracker (a distinct instance from the legacy ctor-arg tracker in every test below), so identity alone proves which arm won. */
+  class SpyTrackerRegistry implements CheckpointTrackerRegistryLike {
     readonly getCalls: string[] = [];
+    constructor(private readonly tracker: CheckpointTrackerLike) {}
     get(canonicalRoot: string): CheckpointTrackerLike | undefined {
       this.getCalls.push(canonicalRoot);
-      return undefined;
+      return this.tracker;
     }
   }
 
-  it('flag-off: registry.get is never called, AND the golden-master primary/non-primary/same-instance pins all still hold', () => {
-    const fakeTracker = new FakeCheckpointTracker();
-    const fakeRegistry = new FakeTrackerRegistry();
+  it('flag-on: registry.get IS called, AND its tracker wins over the injected legacy checkpointTracker for both the primary and a non-primary root', () => {
+    const legacyTracker = new FakeCheckpointTracker();
+    const registryTracker = new FakeCheckpointTracker();
+    const registry = new SpyTrackerRegistry(registryTracker);
     mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
     const backend = new AcpBackend(
       {} as HermesRuntimeConfig,
       undefined,
       undefined,
-      fakeTracker,
+      legacyTracker,
       undefined,
       undefined,
       undefined,
       undefined,
       undefined,
-      fakeRegistry,
+      registry,
     );
 
-    // Primary root -> the injected legacy tracker (golden-master pin 1).
-    expect(coordinatorFor(backend, '/root-a/sub/dir').tracker).toBe(fakeTracker);
-    // Non-primary root -> undefined, the honest NO_TRACKER refusal (pin 2).
-    expect(coordinatorFor(backend, '/root-b/sub/dir').tracker).toBeUndefined();
-    // Same canonical root -> same coordinator instance (pin 3).
+    // Primary root: registry's tracker wins, NOT the legacy ctor-arg one —
+    // under flag-off this same shape resolved `legacyTracker` (Task 10/15).
+    expect(coordinatorFor(backend, '/root-a/sub/dir').tracker).toBe(registryTracker);
+    // Non-primary root: also served through the registry — under flag-off
+    // this was hardwired to `undefined` (the legacy arm is primary-only);
+    // under flag-on it depends entirely on what the registry answers.
+    expect(coordinatorFor(backend, '/root-b/sub/dir').tracker).toBe(registryTracker);
+    // Same canonical root -> same coordinator instance still holds.
     expect(coordinatorFor(backend, '/root-a/x')).toBe(coordinatorFor(backend, '/root-a/y'));
-
-    // The flag-off ternary in `resolveRootCoordinator` never took the
-    // registry arm — the fake's `get` spy was never invoked.
-    expect(fakeRegistry.getCalls).toEqual([]);
+    // The registry arm was actually taken (not silently short-circuited) —
+    // once per `.tracker` access above (the identity check just above does
+    // NOT touch `.tracker`, so it adds no further calls).
+    expect(registry.getCalls).toEqual([canonicalizeWorkspaceRoot('/root-a'), canonicalizeWorkspaceRoot('/root-b')]);
   });
 
-  it("zero workspace folders, flag-off + registry injected: a bare cwd still gets the injected tracker (golden-master pin 4), registry still uncalled", () => {
-    const fakeTracker = new FakeCheckpointTracker();
-    const fakeRegistry = new FakeTrackerRegistry();
+  it('zero workspace folders, flag-on: a bare cwd resolves through the registry, not the legacy checkpointTracker ctor-arg', () => {
+    const legacyTracker = new FakeCheckpointTracker();
+    const registryTracker = new FakeCheckpointTracker();
+    const registry = new SpyTrackerRegistry(registryTracker);
     mockWorkspace.workspaceFolders = [];
     const backend = new AcpBackend(
       {} as HermesRuntimeConfig,
       undefined,
       undefined,
-      fakeTracker,
+      legacyTracker,
       undefined,
       undefined,
       undefined,
       undefined,
       undefined,
-      fakeRegistry,
+      registry,
     );
 
-    expect(coordinatorFor(backend, '/bare-cwd').tracker).toBe(fakeTracker);
-    expect(fakeRegistry.getCalls).toEqual([]);
+    const coordinator = coordinatorFor(backend, '/bare-cwd');
+
+    expect(coordinator.tracker).toBe(registryTracker);
+    expect(registry.getCalls).toContain(canonicalizeWorkspaceRoot('/bare-cwd'));
   });
 });
 
