@@ -550,6 +550,25 @@ export class CheckpointTracker {
     const target = await this.findCheckpoint(id);
     const index = await this.loadIndex();
 
+    const targetRefusal = await this.refuseIfTargetIncomplete(id, target);
+    if (targetRefusal) return targetRefusal;
+
+    const preconditions = await this.assessRestorePreconditions(index, target, opts);
+    if ('refusal' in preconditions) return preconditions.refusal;
+    const { currentTree, currentFiles, changes } = preconditions;
+
+    const { workingIndex, anchorRowId } = await this.ensureAnchorRow(index, currentTree, currentFiles);
+
+    const { changedPaths, skippedPaths } = await this.applyRestoreChanges(changes, target.tree);
+
+    await this.persistRestoreOutcome(workingIndex, target, anchorRowId);
+
+    return skippedPaths.length > 0
+      ? { restored: true, filesChanged: changedPaths.length, changedPaths, skippedPaths }
+      : { restored: true, filesChanged: changedPaths.length, changedPaths };
+  }
+
+  private async refuseIfTargetIncomplete(id: string, target: PersistedCheckpoint): Promise<RestoreResult | null> {
     // R1 (universal target pre-check, F1 closure check): refuse cleanly if ANY
     // object in the target tree's closure — the tree, its sub-trees, or a leaf
     // blob — is gone from the shadow store (external `gc --prune`, a deleted
@@ -570,7 +589,21 @@ export class CheckpointTracker {
           'store (pruned externally?) — refusing to restore so the worktree is not partially mutated.',
       };
     }
+    return null;
+  }
 
+  private async assessRestorePreconditions(
+    index: CheckpointIndexFile,
+    target: PersistedCheckpoint,
+    opts: { force?: boolean },
+  ): Promise<
+    | { refusal: RestoreResult }
+    | {
+        currentTree: string;
+        currentFiles: string[];
+        changes: CheckpointDiffEntry[];
+      }
+  > {
     const { tree: currentTree, files: currentFiles } = await this.writeTreeFromWorktree();
     const includedSet = new Set(currentFiles);
     const baseline = index.currentBaselineId;
@@ -606,11 +639,21 @@ export class CheckpointTracker {
             '(excluded by ignore rules or the file-size cutoff)'
           : 'the worktree has changes since the last checkpoint that no checkpoint captured';
       return {
-        restored: false,
-        reason: `Refusing to restore: ${detail}. Pass { force: true } to override.`,
+        refusal: {
+          restored: false,
+          reason: `Refusing to restore: ${detail}. Pass { force: true } to override.`,
+        },
       };
     }
 
+    return { currentTree, currentFiles, changes };
+  }
+
+  private async ensureAnchorRow(
+    index: CheckpointIndexFile,
+    currentTree: string,
+    currentFiles: string[],
+  ): Promise<{ workingIndex: CheckpointIndexFile; anchorRowId: string }> {
     // ---- P1 (Task 6): eager anchor pre-capture (BEFORE any file mutation) ---
     // The pre-restore live tree (`currentTree`) must exist as a restorable row
     // so nothing this restore overwrites is ever lost. NOT via snapshot(): its
@@ -657,7 +700,13 @@ export class CheckpointTracker {
       anchorRowId_ = anchorRecord.id;
       this.markLocalizeNeeded(); // the fresh tree may borrow alternate objects
     }
+    return { workingIndex, anchorRowId: anchorRowId_ };
+  }
 
+  private async applyRestoreChanges(
+    changes: CheckpointDiffEntry[],
+    targetTree: string,
+  ): Promise<{ changedPaths: string[]; skippedPaths: string[] }> {
     // AU-4/INV-12: ONE batched mode read for the whole restore (not per-file
     // — see {@link readTreeModes}'s doc for the rejected alternative), used
     // below to reapply the executable bit `git show` (content-only) can't
@@ -665,7 +714,7 @@ export class CheckpointTracker {
     // or empty diff — the common no-op-restore case): a deletion never reads
     // a mode, so there is no reason to pay for the extra `git` child.
     const targetModes = changes.some((c) => c.status !== 'deleted')
-      ? await this.readTreeModes(target.tree)
+      ? await this.readTreeModes(targetTree)
       : new Map<string, string>();
 
     const changedPaths: string[] = [];
@@ -718,7 +767,7 @@ export class CheckpointTracker {
           // the worktree.
           await fs.mkdir(path.dirname(absPath), { recursive: true });
           const content = await runGitBinary(
-            ['show', `${target.tree}:${change.path}`],
+            ['show', `${targetTree}:${change.path}`],
             this.shadowOpts(),
           );
           // Never write THROUGH an in-worktree symlink at the leaf: drop the
@@ -791,14 +840,21 @@ export class CheckpointTracker {
         continue;
       }
     }
+    return { changedPaths, skippedPaths };
+  }
 
+  private async persistRestoreOutcome(
+    workingIndex: CheckpointIndexFile,
+    target: PersistedCheckpoint,
+    anchorRowId: string,
+  ): Promise<void> {
     // ---- redo pointer + baseline (single durable write; corr-M3 disk-first,
     // P4/C5) --------------------------------------------------------------
     // Establish (rule 1) on the first undo; Move (rule 3) keeps the ORIGINAL
     // anchor and only moves the cursor while a redo is already outstanding;
     // Consume (rule 4) clears the pointer when the restore target IS the
     // anchor row itself (a manual restore of it, or redoAll()).
-    const anchorId = workingIndex.redo?.anchorId ?? anchorRowId_;
+    const anchorId = workingIndex.redo?.anchorId ?? anchorRowId;
     const next: CheckpointIndexFile = { ...workingIndex, currentBaselineId: target.tree };
     if (target.id === anchorId) {
       delete next.redo; // restored the forward tip — pointer consumed
@@ -807,10 +863,6 @@ export class CheckpointTracker {
     }
     await this.persistIndex(next);
     this.cachedIndex = next;
-
-    return skippedPaths.length > 0
-      ? { restored: true, filesChanged: changedPaths.length, changedPaths, skippedPaths }
-      : { restored: true, filesChanged: changedPaths.length, changedPaths };
   }
 
   /**
