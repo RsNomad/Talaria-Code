@@ -1317,6 +1317,206 @@ describe('TalariaInlineCompletionProvider — failure surfacing (A5)', () => {
   });
 });
 
+// WS-FIM T13 (pre-T14 characterization): exact-string pins for every
+// provider.ts catch-arm classification + the shared dedup/silence mechanics.
+// These are the T14 refactor's behavior-preservation contract — GREEN here
+// on CURRENT code is the point; a RED means the copy drifted from the plan,
+// never that production should change to match this file.
+describe('FUNC-PROVIDER characterization — exact catch-classification strings (pinned BEFORE the T14 move)', () => {
+  beforeEach(() => {
+    clearSurfacedAutocompleteFailures();
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    mockExecuteCommand.mockClear();
+  });
+
+  /** Local copy of the A5 describe block's `complete` helper — that one is
+   *  scoped to its own describe callback and isn't visible here. */
+  async function complete(
+    provider: TalariaInlineCompletionProvider,
+  ): Promise<vscode.InlineCompletionItem[] | vscode.InlineCompletionList | null> {
+    const doc = new FakeDocument('getD');
+    const position = new vscode.Position(0, 4);
+    return provider.provideInlineCompletionItems(
+      doc as unknown as vscode.TextDocument,
+      position,
+      {
+        triggerKind: vscode.InlineCompletionTriggerKind.Automatic,
+        selectedCompletionInfo: undefined,
+      } as unknown as vscode.InlineCompletionContext,
+      fakeToken(),
+    );
+  }
+
+  it('InsecureTransportError: rebuilt toast (no CWE, no raw url) + the DIFFERENT channel line', async () => {
+    const engine = new FakeEngine();
+    const detail =
+      'Refusing to send the autocomplete API key over cleartext http to a remote host (CWE-319). Use https, or a loopback endpoint.';
+    engine.throwError = new InsecureTransportError(detail);
+    const reportFailure = vi.fn();
+    const provider = makeProvider(engine, undefined, { reportFailure });
+
+    const result = await complete(provider);
+
+    expect(result).toBeNull();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [toast, ...items] = must(mockShowWarningMessage.mock.calls[0]);
+    expect(toast).toBe(
+      `Talaria autocomplete: refusing to send the API key over cleartext HTTP to a remote host. Use https, or point the endpoint at a loopback address (127.0.0.1/localhost).`,
+    );
+    expect(items).toEqual([]);
+
+    // The DIFFERENT channel line: the throw-site detail (still no key, no
+    // response body), never the rebuilt toast text above.
+    expect(reportFailure).toHaveBeenCalledTimes(1);
+    expect(reportFailure).toHaveBeenCalledWith(`Talaria autocomplete: ${detail}`);
+  });
+
+  it('MissingApiKeyError: exact toast + the Set API Key action item', async () => {
+    const engine = new FakeEngine();
+    engine.throwError = new MissingApiKeyError(
+      'talaria.autocomplete.backend=codestral requires an API key. Run "Talaria: Set Autocomplete API Key", or choose a local backend.',
+    );
+    const provider = makeProvider(engine, undefined, { getBackendName: () => 'codestral' });
+
+    const result = await complete(provider);
+
+    expect(result).toBeNull();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [message, ...items] = must(mockShowWarningMessage.mock.calls[0]);
+    expect(message).toBe(
+      `Talaria autocomplete: codestral requires an API key. Run "Talaria: Set Autocomplete API Key", or switch "talaria.autocomplete.backend" to a local backend.`,
+    );
+    expect(items).toEqual(['Set API Key']);
+  });
+
+  it('400: exact dialect-hedge toast', async () => {
+    const engine = new FakeEngine();
+    engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 400 Bad Request', 400, 'Bad Request');
+    const provider = makeProvider(engine, undefined, { getBackendName: () => 'vllm' });
+
+    const result = await complete(provider);
+
+    expect(result).toBeNull();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [message, ...items] = must(mockShowWarningMessage.mock.calls[0]);
+    expect(message).toBe(
+      `Talaria autocomplete: vllm rejected the request (400 Bad Request). This usually means "talaria.autocomplete.backend" doesn't match your server's API dialect — it can also mean the request itself was invalid (e.g. too many tokens for the server's context length).`,
+    );
+    expect(items).toEqual([]);
+  });
+
+  it('404: exact model toast naming getModelName()', async () => {
+    const engine = new FakeEngine();
+    engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 404 Not Found', 404, 'Not Found');
+    const provider = makeProvider(engine, undefined, {
+      getBackendName: () => 'vllm',
+      getModelName: () => 'qwen2.5-coder:1.5b-base',
+    });
+
+    const result = await complete(provider);
+
+    expect(result).toBeNull();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [message, ...items] = must(mockShowWarningMessage.mock.calls[0]);
+    expect(message).toBe(
+      `Talaria autocomplete: vllm does not serve the model "qwen2.5-coder:1.5b-base" (404). Check "talaria.autocomplete.model".`,
+    );
+    expect(items).toEqual([]);
+  });
+
+  it('BackendStreamError: exact mid-stream toast naming backend + host', async () => {
+    const engine = new FakeEngine();
+    engine.throwError = new BackendStreamError('vLLM reported an error mid-stream: RUNNER_FRAME_DETAIL_never_surfaced');
+    const provider = makeProvider(engine, undefined, {
+      getBackendName: () => 'vllm',
+      getEndpointHost: () => 'endpoint.example.com',
+    });
+
+    const result = await complete(provider);
+
+    expect(result).toBeNull();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [message, ...items] = must(mockShowWarningMessage.mock.calls[0]);
+    expect(message).toBe(
+      `Talaria autocomplete: the vllm server at endpoint.example.com reported an error while generating (mid-stream). Check the server log.`,
+    );
+    expect(items).toEqual([]);
+  });
+
+  it('BackendHttpError catch-all: exact status+statusText toast, WITH the 501 FIM hint and WITHOUT it on another status', async () => {
+    const engine501 = new FakeEngine();
+    engine501.throwError = new BackendHttpError(
+      'llama.cpp /infill failed: 501 Not Implemented',
+      501,
+      'Not Implemented',
+    );
+    const provider501 = makeProvider(engine501, undefined, { getBackendName: () => 'llamacpp' });
+
+    const result501 = await complete(provider501);
+    expect(result501).toBeNull();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [message501, ...items501] = must(mockShowWarningMessage.mock.calls[0]);
+    expect(message501).toBe(
+      `Talaria autocomplete: the llamacpp server rejected the request (501 Not Implemented). A 501 from a local runner usually means the loaded model does not support fill-in-the-middle — use a FIM-capable model (e.g. a coder "-base" tag).`,
+    );
+    expect(items501).toEqual([]);
+
+    mockShowWarningMessage.mockClear();
+    const engine503 = new FakeEngine();
+    engine503.throwError = new BackendHttpError(
+      'vLLM /v1/completions failed: 503 Service Unavailable',
+      503,
+      'Service Unavailable',
+    );
+    const provider503 = makeProvider(engine503, undefined, { getBackendName: () => 'vllm' });
+
+    const result503 = await complete(provider503);
+    expect(result503).toBeNull();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [message503, ...items503] = must(mockShowWarningMessage.mock.calls[0]);
+    expect(message503).toBe(`Talaria autocomplete: the vllm server rejected the request (503 Service Unavailable).`);
+    expect(items503).toEqual([]);
+  });
+
+  it('dedup key shape: two DIFFERENT statusClasses on the same backend|host surface independently; the same one repeats silently', async () => {
+    const engine = new FakeEngine();
+    const provider = makeProvider(engine, undefined, {
+      getBackendName: () => 'vllm',
+      getEndpointHost: () => 'endpoint.example.com',
+    });
+
+    engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 401 Unauthorized', 401, 'Unauthorized');
+    await complete(provider);
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+
+    // Different statusClass ('model' vs 'auth'), same backend|host -> an
+    // independent key, so it surfaces again rather than staying silent.
+    engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 404 Not Found', 404, 'Not Found');
+    await complete(provider);
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+
+    // Repeat the FIRST statusClass ('auth') -> the key was already inserted
+    // above, so this one stays silent (count unchanged).
+    engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 401 Unauthorized', 401, 'Unauthorized');
+    await complete(provider);
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('a plain Error (network-ish, not a BackendHttpError) stays deliberately silent', async () => {
+    const reportFailure = vi.fn();
+    const engine = new FakeEngine();
+    engine.throwError = new Error('ECONNREFUSED');
+    const provider = makeProvider(engine, undefined, { reportFailure });
+
+    const result = await complete(provider);
+
+    expect(result).toBeNull();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(reportFailure).not.toHaveBeenCalled();
+  });
+});
+
 // ── Task 16 (08 §11, ADR-010): unknown-model one-shot warning / vllm refusal ──
 describe('TalariaInlineCompletionProvider — unknown-model warning / refusal (Task 16)', () => {
   beforeEach(() => {
