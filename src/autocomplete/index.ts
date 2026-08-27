@@ -148,32 +148,32 @@ export function registerTalariaAutocomplete(
       getWarmUpEnabled: () => cfg.crossFile.warmUp,
     });
 
-  const provider = new TalariaInlineCompletionProvider(
-    () => engine,
-    () => cfg.enabled,
-    () => remote && !vscode.workspace.isTrusted,
+  const provider = new TalariaInlineCompletionProvider({
+    getEngine: () => engine,
+    getEnabled: () => cfg.enabled,
+    getSkipUntrustedRemote: () => remote && !vscode.workspace.isTrusted,
     contextService,
     // A5: live closures over the mutable `cfg` binding below (reassigned by
     // `onDidChangeConfiguration`), same posture as `getEnabled` above.
-    () => cfg.backend,
-    () => endpointHost(cfg.endpoint),
+    getBackendName: () => cfg.backend,
+    getEndpointHost: () => endpointHost(cfg.endpoint),
     // F-B: same live-closure posture — reads `talaria.autocomplete.model`
     // fresh on every failure so the 404 arm's message always names the
     // currently-configured model, not a stale one from a prior rebuild.
-    () => cfg.model,
+    getModelName: () => cfg.model,
     reportFailure,
     // W5.1 Task 12 (R2/R4): the next-edit observation seam. `fimActivityRelay`
     // is a fixed forwarding address — a no-op until `registerTalariaNextEdit`
     // below attaches to it, and a no-op again after it disposes. Passing it
     // unconditionally keeps the provider's construction independent of
     // whether next-edit registered successfully.
-    fimActivityRelay,
+    fimActivity: fimActivityRelay,
     // CA-06-path-face: the path-skip notice thread — UNCONDITIONAL, the
     // deliberate contrast with egressObserverFor above: the S4.1 secret-path
     // gate fires regardless of endpoint locality, so its face must too. The
     // surface renders 'path-block' as an Information badge with no toast.
-    egressNotice.onEgressVerdict,
-  );
+    onEgressVerdict: egressNotice.onEgressVerdict,
+  });
 
   const providerDisposable = vscode.languages.registerInlineCompletionItemProvider(
     { pattern: '**' },

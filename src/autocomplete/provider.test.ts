@@ -151,22 +151,18 @@ function makeProvider(
   contextService: FakeContextService = new FakeContextService(),
   opts: FailureSurfacingOpts = {},
 ): TalariaInlineCompletionProvider {
-  return new TalariaInlineCompletionProvider(
-    () => engine as unknown as FimEngine,
-    () => true,
-    () => false, // not Restricted Mode / not remote — never skip (S4.3 covered separately below)
-    contextService as unknown as CrossFileContextService,
-    opts.getBackendName ?? (() => 'vllm'),
-    opts.getEndpointHost ?? (() => 'endpoint.example.com'),
-    opts.getModelName ?? (() => 'qwen2.5-coder:1.5b-base'),
-    opts.reportFailure ?? (() => {}),
-    // Trailing optional params passed directly: an explicit `undefined` for a
-    // defaulted/optional PARAMETER triggers the default / absent state by JS
-    // semantics — identical to omission (the key-omission doctrine binds
-    // object literals under exactOptionalPropertyTypes, not positional args).
-    opts.fimActivity,
-    opts.onEgressVerdict,
-  );
+  return new TalariaInlineCompletionProvider({
+    getEngine: () => engine as unknown as FimEngine,
+    getEnabled: () => true,
+    getSkipUntrustedRemote: () => false, // not Restricted Mode / not remote — never skip (S4.3 covered separately below)
+    contextService: contextService as unknown as CrossFileContextService,
+    getBackendName: opts.getBackendName ?? (() => 'vllm'),
+    getEndpointHost: opts.getEndpointHost ?? (() => 'endpoint.example.com'),
+    getModelName: opts.getModelName ?? (() => 'qwen2.5-coder:1.5b-base'),
+    reportFailure: opts.reportFailure ?? (() => {}),
+    ...(opts.fimActivity === undefined ? {} : { fimActivity: opts.fimActivity }),
+    ...(opts.onEgressVerdict === undefined ? {} : { onEgressVerdict: opts.onEgressVerdict }),
+  });
 }
 
 /**
@@ -274,16 +270,16 @@ describe(
       const engine = new FakeEngine();
       engine.respondWith = 'ata()';
       // Restricted Mode + a remote (non-loopback) configured endpoint.
-      const provider = new TalariaInlineCompletionProvider(
-        () => engine as unknown as FimEngine,
-        () => true,
-        () => true,
-        new FakeContextService() as unknown as CrossFileContextService,
-        () => 'vllm',
-        () => 'endpoint.example.com',
-        () => 'qwen2.5-coder:1.5b-base',
-        () => {},
-      );
+      const provider = new TalariaInlineCompletionProvider({
+        getEngine: () => engine as unknown as FimEngine,
+        getEnabled: () => true,
+        getSkipUntrustedRemote: () => true,
+        contextService: new FakeContextService() as unknown as CrossFileContextService,
+        getBackendName: () => 'vllm',
+        getEndpointHost: () => 'endpoint.example.com',
+        getModelName: () => 'qwen2.5-coder:1.5b-base',
+        reportFailure: () => {},
+      });
 
       const result = await provider.provideInlineCompletionItems(
         doc as unknown as vscode.TextDocument,
@@ -305,16 +301,16 @@ describe(
       const engine = new FakeEngine();
       engine.respondWith = 'ata()';
       // Restricted Mode, but the configured endpoint is loopback -> never skip.
-      const provider = new TalariaInlineCompletionProvider(
-        () => engine as unknown as FimEngine,
-        () => true,
-        () => false,
-        new FakeContextService() as unknown as CrossFileContextService,
-        () => 'vllm',
-        () => 'endpoint.example.com',
-        () => 'qwen2.5-coder:1.5b-base',
-        () => {},
-      );
+      const provider = new TalariaInlineCompletionProvider({
+        getEngine: () => engine as unknown as FimEngine,
+        getEnabled: () => true,
+        getSkipUntrustedRemote: () => false,
+        contextService: new FakeContextService() as unknown as CrossFileContextService,
+        getBackendName: () => 'vllm',
+        getEndpointHost: () => 'endpoint.example.com',
+        getModelName: () => 'qwen2.5-coder:1.5b-base',
+        reportFailure: () => {},
+      });
 
       const result = await provider.provideInlineCompletionItems(
         doc as unknown as vscode.TextDocument,
@@ -597,16 +593,16 @@ describe('TalariaInlineCompletionProvider — cross-file wiring (W5-T5)', () => 
     const position = new vscode.Position(0, 4);
     const engine = new FakeEngine();
     engine.respondWith = 'SHOULD_NOT_BE_USED';
-    const provider = new TalariaInlineCompletionProvider(
-      () => engine as unknown as FimEngine,
-      () => true, // enabled
-      () => true, // skipUntrustedRemote
-      new FakeContextService() as unknown as CrossFileContextService,
-      () => 'vllm',
-      () => 'endpoint.example.com',
-      () => 'qwen2.5-coder:1.5b-base',
-      () => {},
-    );
+    const provider = new TalariaInlineCompletionProvider({
+      getEngine: () => engine as unknown as FimEngine,
+      getEnabled: () => true, // enabled
+      getSkipUntrustedRemote: () => true, // skipUntrustedRemote
+      contextService: new FakeContextService() as unknown as CrossFileContextService,
+      getBackendName: () => 'vllm',
+      getEndpointHost: () => 'endpoint.example.com',
+      getModelName: () => 'qwen2.5-coder:1.5b-base',
+      reportFailure: () => {},
+    });
 
     const result = await provider.provideInlineCompletionItems(
       doc as unknown as vscode.TextDocument,
@@ -627,16 +623,16 @@ describe('TalariaInlineCompletionProvider — cross-file wiring (W5-T5)', () => 
     const position = new vscode.Position(0, 4);
     const engine = new FakeEngine();
     engine.respondWith = 'SHOULD_NOT_BE_USED';
-    const provider = new TalariaInlineCompletionProvider(
-      () => engine as unknown as FimEngine,
-      () => false, // NOT enabled
-      () => false, // skipUntrustedRemote
-      new FakeContextService() as unknown as CrossFileContextService,
-      () => 'vllm',
-      () => 'endpoint.example.com',
-      () => 'qwen2.5-coder:1.5b-base',
-      () => {},
-    );
+    const provider = new TalariaInlineCompletionProvider({
+      getEngine: () => engine as unknown as FimEngine,
+      getEnabled: () => false, // NOT enabled
+      getSkipUntrustedRemote: () => false, // skipUntrustedRemote
+      contextService: new FakeContextService() as unknown as CrossFileContextService,
+      getBackendName: () => 'vllm',
+      getEndpointHost: () => 'endpoint.example.com',
+      getModelName: () => 'qwen2.5-coder:1.5b-base',
+      reportFailure: () => {},
+    });
 
     const result = await provider.provideInlineCompletionItems(
       doc as unknown as vscode.TextDocument,
@@ -1870,20 +1866,20 @@ describe('CA-06-path-face — the secret-path-skip observer seam', () => {
     const seen: string[] = [];
     const doc = new FakeDocument('SECRET=abc123', '/repo/.env');
     const engine = new FakeEngine();
-    const provider = new TalariaInlineCompletionProvider(
-      () => engine as unknown as FimEngine,
-      () => false, // disabled — egressPreconditionsMet returns before the path gate
-      () => false,
-      new FakeContextService() as unknown as CrossFileContextService,
-      () => 'vllm',
-      () => 'endpoint.example.com',
-      () => 'qwen2.5-coder:1.5b-base',
-      () => {},
-      undefined, // fimActivity → the no-op default (JS default semantics)
-      (_filepath, verdict) => {
+    const provider = new TalariaInlineCompletionProvider({
+      getEngine: () => engine as unknown as FimEngine,
+      getEnabled: () => false, // disabled — egressPreconditionsMet returns before the path gate
+      getSkipUntrustedRemote: () => false,
+      contextService: new FakeContextService() as unknown as CrossFileContextService,
+      getBackendName: () => 'vllm',
+      getEndpointHost: () => 'endpoint.example.com',
+      getModelName: () => 'qwen2.5-coder:1.5b-base',
+      reportFailure: () => {},
+      // fimActivity omitted → the no-op default (key omission, exactOptionalPropertyTypes)
+      onEgressVerdict: (_filepath, verdict) => {
         seen.push(verdict);
       },
-    );
+    });
 
     const result = await provider.provideInlineCompletionItems(
       doc as unknown as vscode.TextDocument,

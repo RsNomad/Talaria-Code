@@ -174,6 +174,63 @@ export function reponameFromWorkspace(
 }
 
 /**
+ * FUNC-PROVIDER — construction options. An options object because the old
+ * 10-positional constructor carried THREE consecutive `() => string` params
+ * (getBackendName/getEndpointHost/getModelName): a silent swap hazard no
+ * type could catch. Field docs live on the fields they used to annotate.
+ * exactOptionalPropertyTypes: omit `fimActivity`/`onEgressVerdict` by KEY
+ * OMISSION for the no-op/absent default — never pass `undefined` explicitly.
+ */
+export interface TalariaInlineCompletionProviderOptions {
+  getEngine: () => FimEngine;
+  getEnabled: () => boolean;
+  /**
+   * S4.3: true when the workspace is Restricted Mode (untrusted) AND the
+   * configured endpoint is remote (non-loopback) — skip rather than ship
+   * workspace code off-box without trust.
+   */
+  getSkipUntrustedRemote: () => boolean;
+  /** W5-T5: the single background gatherer/snapshot cache — §2.1/§2.4. */
+  contextService: CrossFileContextService;
+  /**
+   * A5: the currently-configured backend name + endpoint host, read fresh
+   * on every failure (mirrors `getEnabled`/`getSkipUntrustedRemote`'s
+   * live-closure-over-mutable-`cfg` posture in `index.ts`) — used ONLY to
+   * build the one-shot Set key and the surfaced message text, never sent
+   * anywhere.
+   */
+  getBackendName: () => string;
+  getEndpointHost: () => string;
+  /**
+   * F-B: the currently-configured model name — same live-closure posture
+   * as getBackendName/getEndpointHost above. Used ONLY in the 404 arm's
+   * surfaced message text (never the Set key, which stays keyed on the
+   * fixed `'model'` statusClass) — the model name is user config, not a
+   * secret, so naming it is safe and is what makes the message actionable.
+   */
+  getModelName: () => string;
+  /**
+   * A5: DI seam for the `Talaria` output channel line — mirrors
+   * `ControlDispatcherHostPort.showWarningMessage`'s posture
+   * (`host/backend/control/ControlDispatcher.ts:59-60`): keeps this file
+   * mockable without a real `vscode.OutputChannel`. Wired to the real
+   * channel at the composition root (`index.ts` -> `extension.ts`).
+   */
+  reportFailure: (msg: string) => void;
+  /**
+   * W5.1 Task 12: the next-edit observation seam. Optional and defaulted to
+   * a no-op — every existing call site (and every existing test) keeps
+   * working unchanged, and FIM behaviour is identical when next-edit is not
+   * registered.
+   */
+  fimActivity?: FimActivityListener;
+  /** CA-06-path-face: the secret-path-skip notice observer (emits 'path-block'
+   *  only — see provider gate comment). Omit in tests not exercising it;
+   *  production wires it unconditionally (the gate is locality-independent). */
+  onEgressVerdict?: EgressVerdictObserver;
+}
+
+/**
  * Thin VS Code adapter over the IDE-agnostic `FimEngine`. Registered for
  * `{ pattern: '**' }` by `registerTalariaAutocomplete` (`index.ts`).
  *
@@ -190,49 +247,29 @@ export function reponameFromWorkspace(
 export class TalariaInlineCompletionProvider
   implements vscode.InlineCompletionItemProvider
 {
-  constructor(
-    private readonly getEngine: () => FimEngine,
-    private readonly getEnabled: () => boolean,
-    // S4.3: true when the workspace is Restricted Mode (untrusted) AND the
-    // configured endpoint is remote (non-loopback) — skip rather than ship
-    // workspace code off-box without trust.
-    private readonly getSkipUntrustedRemote: () => boolean,
-    // W5-T5: the single background gatherer/snapshot cache — §2.1/§2.4.
-    private readonly contextService: CrossFileContextService,
-    // A5: the currently-configured backend name + endpoint host, read fresh
-    // on every failure (mirrors `getEnabled`/`getSkipUntrustedRemote`'s
-    // live-closure-over-mutable-`cfg` posture in `index.ts`) — used ONLY to
-    // build the one-shot Set key and the surfaced message text, never sent
-    // anywhere.
-    private readonly getBackendName: () => string,
-    private readonly getEndpointHost: () => string,
-    // F-B: the currently-configured model name — same live-closure posture
-    // as getBackendName/getEndpointHost above. Used ONLY in the 404 arm's
-    // surfaced message text (never the Set key, which stays keyed on the
-    // fixed `'model'` statusClass) — the model name is user config, not a
-    // secret, so naming it is safe and is what makes the message actionable.
-    private readonly getModelName: () => string,
-    // A5: DI seam for the `Talaria` output channel line — mirrors
-    // `ControlDispatcherHostPort.showWarningMessage`'s posture
-    // (`host/backend/control/ControlDispatcher.ts:59-60`): keeps this file
-    // mockable without a real `vscode.OutputChannel`. Wired to the real
-    // channel at the composition root (`index.ts` -> `extension.ts`).
-    private readonly reportFailure: (msg: string) => void,
-    // W5.1 Task 12: the next-edit observation seam. Optional and defaulted to
-    // a no-op — every existing call site (and every existing test) keeps
-    // working unchanged, and FIM behaviour is identical when next-edit is not
-    // registered.
-    private readonly fimActivity: FimActivityListener = NO_OP_FIM_ACTIVITY,
-    // CA-06-path-face: the notice observer for THIS layer's gate — the
-    // secret-path skip below. Optional and purely OBSERVATIONAL (the skip
-    // is byte-identical with it absent, present, or throwing); wired
-    // UNCONDITIONALLY by index.ts because the path gate is
-    // locality-independent, unlike the engine's content gate. The provider
-    // only ever emits 'path-block' — 'allow' edges belong to the engine,
-    // whose content verdicts must not be pre-empted (or its badges cleared)
-    // by a path-level pass. T14 folds this into the options object.
-    private readonly onEgressVerdict?: EgressVerdictObserver,
-  ) {}
+  private readonly getEngine: () => FimEngine;
+  private readonly getEnabled: () => boolean;
+  private readonly getSkipUntrustedRemote: () => boolean;
+  private readonly contextService: CrossFileContextService;
+  private readonly getBackendName: () => string;
+  private readonly getEndpointHost: () => string;
+  private readonly getModelName: () => string;
+  private readonly reportFailure: (msg: string) => void;
+  private readonly fimActivity: FimActivityListener;
+  private readonly onEgressVerdict: EgressVerdictObserver | undefined;
+
+  constructor(opts: TalariaInlineCompletionProviderOptions) {
+    this.getEngine = opts.getEngine;
+    this.getEnabled = opts.getEnabled;
+    this.getSkipUntrustedRemote = opts.getSkipUntrustedRemote;
+    this.contextService = opts.contextService;
+    this.getBackendName = opts.getBackendName;
+    this.getEndpointHost = opts.getEndpointHost;
+    this.getModelName = opts.getModelName;
+    this.reportFailure = opts.reportFailure;
+    this.fimActivity = opts.fimActivity ?? NO_OP_FIM_ACTIVITY;
+    this.onEgressVerdict = opts.onEgressVerdict;
+  }
 
   /**
    * A5: surface `message` (+ optional action `items`, e.g. `Set API Key`)
@@ -291,6 +328,119 @@ export class TalariaInlineCompletionProvider
       },
       (err) => this.reportFailure(`[autocomplete.warning] ${String(err)}`),
     );
+  }
+
+  /**
+   * FUNC-PROVIDER — the FIM twin of the next-edit shell's
+   * `surfaceTriggerFailure`: classify ONE completion failure into an
+   * at-most-once actionable surface, or deliberate silence. Extracted
+   * verbatim from the inline catch (the T13 pins are the preservation
+   * proof). See the original arm-by-arm comments, which move with it.
+   */
+  private surfaceCompletionFailure(err: unknown): void {
+    // A5/F-B: narrowed, not widened — only the four ACTIONABLE failures below
+    // are ever surfaced (each at most once per backend/host/statusClass
+    // until the next engine rebuild). Everything else (timeouts, connection
+    // refused, other non-2xx, etc.) still fails this single completion
+    // request silently rather than surfacing a VS Code error toast on every
+    // keystroke — a failing provider doesn't fail the overall
+    // inline-completion operation anyway (how-to §2.1). Never put the API
+    // key or a response body in a surfaced message (jobA-common.md
+    // invariant 5) — status + backend name + endpoint host/model only.
+    const backend = this.getBackendName();
+    const host = this.getEndpointHost();
+    const key = (statusClass: string): string => `${backend}|${host}|${statusClass}`;
+
+    if (err instanceof InsecureTransportError) {
+      // F-C Minor-4 (also security M-3): a config/security refusal is
+      // always actionable, but the toast must NOT echo the throw site's
+      // raw `err.message` verbatim — that message shows a non-expert user
+      // "(CWE-319)" and is one future edit away from carrying `rawUrl`
+      // (which can hold userinfo credentials). Rebuild the user-facing
+      // text the way every other arm here does; keep the developer detail
+      // (still no key, no response body) in the output channel only.
+      this.surfaceIfFirst(
+        key('insecure-transport'),
+        'Talaria autocomplete: refusing to send the API key over cleartext HTTP to a remote host. Use https, or point the endpoint at a loopback address (127.0.0.1/localhost).',
+        [],
+        `Talaria autocomplete: ${err.message}`,
+      );
+    } else if (err instanceof MissingApiKeyError) {
+      // Review C-1 fix: CodestralFimBackend.streamFim throws this BEFORE
+      // any fetch when the configured backend's key is empty/whitespace —
+      // a config/security refusal, always actionable, the same posture as
+      // InsecureTransportError immediately above. No key value in the
+      // message (there is none to leak — the whole point is that no key
+      // was ever supplied).
+      this.surfaceIfFirst(
+        key('missing-key'),
+        `Talaria autocomplete: ${backend} requires an API key. Run "Talaria: Set Autocomplete API Key", or switch "talaria.autocomplete.backend" to a local backend.`,
+        [SET_API_KEY_ACTION],
+      );
+    } else if (err instanceof BackendHttpError && (err.status === 401 || err.status === 403)) {
+      // F-C Minor-2/Minor-3: "Set the API key" was the wrong mood for the
+      // common case (a MISTYPED key, not an absent one) — the copy now
+      // covers both. Includes statusText (permitted by invariant 5), and
+      // "the vllm server" rather than raw "vllm" as the grammatical subject.
+      this.surfaceIfFirst(
+        key('auth'),
+        `Talaria autocomplete: the ${backend} server rejected the request (${err.status} ${err.statusText}) — the API key is missing or incorrect.`,
+        [SET_API_KEY_ACTION],
+      );
+    } else if (err instanceof BackendHttpError && err.status === 400) {
+      // F-C Minor-1: a dialect mismatch is the likely, not the only, cause
+      // (vLLM also 400s on context-length overflow / malformed sampling
+      // params) — hedge rather than assert a cause this code cannot know.
+      this.surfaceIfFirst(
+        key('dialect'),
+        `Talaria autocomplete: ${backend} rejected the request (${err.status} ${err.statusText}). This usually means "talaria.autocomplete.backend" doesn't match your server's API dialect — it can also mean the request itself was invalid (e.g. too many tokens for the server's context length).`,
+      );
+    } else if (err instanceof BackendHttpError && err.status === 404) {
+      // F-B: vLLM's check_model 404s for a model it doesn't serve — the
+      // DEFAULT vLLM path, since config.ts's DEFAULT_MODEL is an Ollama tag
+      // format vLLM never serves. Without this arm, a correctly-authed user
+      // who never touches talaria.autocomplete.model gets pure silence.
+      this.surfaceIfFirst(
+        key('model'),
+        `Talaria autocomplete: ${backend} does not serve the model "${this.getModelName()}" (404). Check "talaria.autocomplete.model".`,
+      );
+    } else if (err instanceof BackendStreamError) {
+      // T-5 (closes V-14): a mid-stream SSE error frame on an otherwise-200
+      // response — the runner's real error-as-data-frame convention (root
+      // cause: vLLM `serving.py:491-497`). `BackendStreamError` is a
+      // DISJOINT class from `BackendHttpError` (this response was 2xx), so
+      // this arm composes with every arm above/below without overlap.
+      // Body-free by construction on both ends: the error itself never
+      // carries the frame's message text (`http.ts`'s `readOpenAiSseText`),
+      // and this toast is a fixed template that never reads `err.message`.
+      this.surfaceIfFirst(
+        key('stream'),
+        `Talaria autocomplete: the ${backend} server at ${host} reported an error while generating (mid-stream). Check the server log.`,
+      );
+    } else if (err instanceof BackendHttpError) {
+      // T-D1 (closes V-15): every OTHER HTTP status a FIM backend can throw
+      // — crucially llama.cpp's 501 "Infill is not supported by this
+      // model" (`post_infill` -> `format_error_response(...,
+      // ERROR_TYPE_NOT_SUPPORTED)` when the loaded GGUF's vocab lacks FIM
+      // pre/suf/mid tokens: the classic non-FIM-GGUF misconfiguration),
+      // plus any 5xx/unlisted status — used to fall through every arm
+      // above into the silent `return null` below: autocomplete died
+      // permanently with zero diagnostic signal. This catch-all surfaces
+      // status + statusText ONLY, never a response body (invariant 5),
+      // once per backend|host|statusClass via the same surfaceIfFirst
+      // dedup as every arm above (no per-keystroke spam). Non-HTTP
+      // failures (timeouts, ECONNREFUSED) are not a BackendHttpError and
+      // so still fall through this arm too — they stay deliberately
+      // silent, per the documented per-keystroke design at :514-522.
+      const fimHint =
+        err.status === 501
+          ? ' A 501 from a local runner usually means the loaded model does not support fill-in-the-middle — use a FIM-capable model (e.g. a coder "-base" tag).'
+          : '';
+      this.surfaceIfFirst(
+        key(`status-${err.status}`),
+        `Talaria autocomplete: the ${backend} server rejected the request (${err.status} ${err.statusText}).${fimHint}`,
+      );
+    }
   }
 
   async provideInlineCompletionItems(
@@ -537,109 +687,8 @@ export class TalariaInlineCompletionProvider
       fimShown = true;
       return [item];
     } catch (err) {
-      // A5/F-B: narrowed, not widened — only the four ACTIONABLE failures below
-      // are ever surfaced (each at most once per backend/host/statusClass
-      // until the next engine rebuild). Everything else (timeouts, connection
-      // refused, other non-2xx, etc.) still fails this single completion
-      // request silently rather than surfacing a VS Code error toast on every
-      // keystroke — a failing provider doesn't fail the overall
-      // inline-completion operation anyway (how-to §2.1). Never put the API
-      // key or a response body in a surfaced message (jobA-common.md
-      // invariant 5) — status + backend name + endpoint host/model only.
-      const backend = this.getBackendName();
-      const host = this.getEndpointHost();
-      const key = (statusClass: string): string => `${backend}|${host}|${statusClass}`;
-
-      if (err instanceof InsecureTransportError) {
-        // F-C Minor-4 (also security M-3): a config/security refusal is
-        // always actionable, but the toast must NOT echo the throw site's
-        // raw `err.message` verbatim — that message shows a non-expert user
-        // "(CWE-319)" and is one future edit away from carrying `rawUrl`
-        // (which can hold userinfo credentials). Rebuild the user-facing
-        // text the way every other arm here does; keep the developer detail
-        // (still no key, no response body) in the output channel only.
-        this.surfaceIfFirst(
-          key('insecure-transport'),
-          'Talaria autocomplete: refusing to send the API key over cleartext HTTP to a remote host. Use https, or point the endpoint at a loopback address (127.0.0.1/localhost).',
-          [],
-          `Talaria autocomplete: ${err.message}`,
-        );
-      } else if (err instanceof MissingApiKeyError) {
-        // Review C-1 fix: CodestralFimBackend.streamFim throws this BEFORE
-        // any fetch when the configured backend's key is empty/whitespace —
-        // a config/security refusal, always actionable, the same posture as
-        // InsecureTransportError immediately above. No key value in the
-        // message (there is none to leak — the whole point is that no key
-        // was ever supplied).
-        this.surfaceIfFirst(
-          key('missing-key'),
-          `Talaria autocomplete: ${backend} requires an API key. Run "Talaria: Set Autocomplete API Key", or switch "talaria.autocomplete.backend" to a local backend.`,
-          [SET_API_KEY_ACTION],
-        );
-      } else if (err instanceof BackendHttpError && (err.status === 401 || err.status === 403)) {
-        // F-C Minor-2/Minor-3: "Set the API key" was the wrong mood for the
-        // common case (a MISTYPED key, not an absent one) — the copy now
-        // covers both. Includes statusText (permitted by invariant 5), and
-        // "the vllm server" rather than raw "vllm" as the grammatical subject.
-        this.surfaceIfFirst(
-          key('auth'),
-          `Talaria autocomplete: the ${backend} server rejected the request (${err.status} ${err.statusText}) — the API key is missing or incorrect.`,
-          [SET_API_KEY_ACTION],
-        );
-      } else if (err instanceof BackendHttpError && err.status === 400) {
-        // F-C Minor-1: a dialect mismatch is the likely, not the only, cause
-        // (vLLM also 400s on context-length overflow / malformed sampling
-        // params) — hedge rather than assert a cause this code cannot know.
-        this.surfaceIfFirst(
-          key('dialect'),
-          `Talaria autocomplete: ${backend} rejected the request (${err.status} ${err.statusText}). This usually means "talaria.autocomplete.backend" doesn't match your server's API dialect — it can also mean the request itself was invalid (e.g. too many tokens for the server's context length).`,
-        );
-      } else if (err instanceof BackendHttpError && err.status === 404) {
-        // F-B: vLLM's check_model 404s for a model it doesn't serve — the
-        // DEFAULT vLLM path, since config.ts's DEFAULT_MODEL is an Ollama tag
-        // format vLLM never serves. Without this arm, a correctly-authed user
-        // who never touches talaria.autocomplete.model gets pure silence.
-        this.surfaceIfFirst(
-          key('model'),
-          `Talaria autocomplete: ${backend} does not serve the model "${this.getModelName()}" (404). Check "talaria.autocomplete.model".`,
-        );
-      } else if (err instanceof BackendStreamError) {
-        // T-5 (closes V-14): a mid-stream SSE error frame on an otherwise-200
-        // response — the runner's real error-as-data-frame convention (root
-        // cause: vLLM `serving.py:491-497`). `BackendStreamError` is a
-        // DISJOINT class from `BackendHttpError` (this response was 2xx), so
-        // this arm composes with every arm above/below without overlap.
-        // Body-free by construction on both ends: the error itself never
-        // carries the frame's message text (`http.ts`'s `readOpenAiSseText`),
-        // and this toast is a fixed template that never reads `err.message`.
-        this.surfaceIfFirst(
-          key('stream'),
-          `Talaria autocomplete: the ${backend} server at ${host} reported an error while generating (mid-stream). Check the server log.`,
-        );
-      } else if (err instanceof BackendHttpError) {
-        // T-D1 (closes V-15): every OTHER HTTP status a FIM backend can throw
-        // — crucially llama.cpp's 501 "Infill is not supported by this
-        // model" (`post_infill` -> `format_error_response(...,
-        // ERROR_TYPE_NOT_SUPPORTED)` when the loaded GGUF's vocab lacks FIM
-        // pre/suf/mid tokens: the classic non-FIM-GGUF misconfiguration),
-        // plus any 5xx/unlisted status — used to fall through every arm
-        // above into the silent `return null` below: autocomplete died
-        // permanently with zero diagnostic signal. This catch-all surfaces
-        // status + statusText ONLY, never a response body (invariant 5),
-        // once per backend|host|statusClass via the same surfaceIfFirst
-        // dedup as every arm above (no per-keystroke spam). Non-HTTP
-        // failures (timeouts, ECONNREFUSED) are not a BackendHttpError and
-        // so still fall through this arm too — they stay deliberately
-        // silent, per the documented per-keystroke design at :514-522.
-        const fimHint =
-          err.status === 501
-            ? ' A 501 from a local runner usually means the loaded model does not support fill-in-the-middle — use a FIM-capable model (e.g. a coder "-base" tag).'
-            : '';
-        this.surfaceIfFirst(
-          key(`status-${err.status}`),
-          `Talaria autocomplete: the ${backend} server rejected the request (${err.status} ${err.statusText}).${fimHint}`,
-        );
-      }
+      // A5/F-B: narrowed, not widened — see surfaceCompletionFailure.
+      this.surfaceCompletionFailure(err);
       return null;
     } finally {
       cancelSub.dispose();
