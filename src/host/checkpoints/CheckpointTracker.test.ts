@@ -1957,4 +1957,112 @@ describe('CheckpointTracker', () => {
       await expect(windowB.list()).resolves.toEqual({ checkpoints: [] });
     });
   });
+
+  describe('A6 dispose-durability (spec test group 4)', () => {
+    let tracker: CheckpointTracker;
+
+    /**
+     * Extracted from the established `object durability vs real-repo gc
+     * (S-M6g)` pattern above: rewrite `foo.txt` on the REAL repo so the
+     * previously-committed blob/tree become unreachable, then hard-prune.
+     * Reused verbatim (same command sequence) — not reinvented.
+     */
+    function pruneRealRepoHard(ws: string): void {
+      writeFileSync(path.join(ws, 'foo.txt'), 'V2-CONTENT');
+      realGit(ws, ['add', 'foo.txt']);
+      realGit(ws, ['commit', '-q', '--amend', '--no-edit']);
+      realGit(ws, ['reflog', 'expire', '--expire=now', '--all']);
+      realGit(ws, ['gc', '--prune=now', '--quiet']);
+    }
+
+    /**
+     * Same targeted spawn-intercept idiom as the "wall-clock timeout on a
+     * stalled git" describe above: only `write-tree` calls become a
+     * `FakeGitChild` that never closes on its own; every other git call runs
+     * for real. `emitCloseAll` lets the test unwedge it deliberately.
+     */
+    function installFakeGitChild(): { emitCloseAll: (code: number) => void } {
+      const fakes: FakeGitChild[] = [];
+      __setSpawnForTests(
+        ((command: string, args: string[], options: unknown) => {
+          if (Array.isArray(args) && args.includes('write-tree')) {
+            const fake = new FakeGitChild();
+            fakes.push(fake);
+            return fake;
+          }
+          return realSpawn(command as never, args as never, options as never);
+        }) as unknown as Parameters<typeof __setSpawnForTests>[0],
+      );
+      return {
+        emitCloseAll(code: number): void {
+          for (const fake of fakes) fake.emit('close', code);
+        },
+      };
+    }
+
+    beforeEach(async () => {
+      // Real repo so the shadow borrows objects (localization is meaningful) —
+      // same seeding as the S-M6g durability describe above.
+      realGit(workspaceRoot, ['init', '--quiet']);
+      realGit(workspaceRoot, ['config', 'user.email', 'a@b.c']);
+      realGit(workspaceRoot, ['config', 'user.name', 'Test']);
+      await writeFile('foo.txt', 'V1-BORROWED-CONTENT');
+      realGit(workspaceRoot, ['add', 'foo.txt']);
+      realGit(workspaceRoot, ['commit', '-q', '-m', 'v1']);
+
+      // Large debounce so nothing auto-flushes localization on its own — only
+      // an explicit dispose()/disposeAndFlush() determines durability here.
+      tracker = new CheckpointTracker(storageDir, workspaceRoot, { localizeDebounceMs: 60_000 });
+      await tracker.init();
+      expect(tracker.hasRealGitAlternates).toBe(true);
+    });
+
+    afterEach(() => {
+      __setSpawnForTests(null);
+    });
+
+    it('HAZARD PIN: timer-only dispose() + real-repo prune orphans a borrowing checkpoint', async () => {
+      const cp = await tracker.snapshot(1);
+      expect(cp).not.toBeNull();
+      tracker.dispose(); // the OLD teardown — no flush
+      // Make the borrowed blobs unreachable in the real repo, then prune hard.
+      pruneRealRepoHard(workspaceRoot);
+      const fresh = new CheckpointTracker(storageDir, workspaceRoot);
+      const r = await fresh.restore(cp!.id, { force: true });
+      expect(r.restored).toBe(false); // silent-rot made visible: closure pre-check refuses
+      if (!r.restored) expect(r.reason).toMatch(/missing/);
+      fresh.dispose();
+    });
+
+    it('disposeAndFlush(): the same sequence leaves every checkpoint restorable', async () => {
+      const cp = await tracker.snapshot(1);
+      expect(cp).not.toBeNull();
+      await expect(tracker.disposeAndFlush()).resolves.toBe('flushed');
+      pruneRealRepoHard(workspaceRoot);
+      const fresh = new CheckpointTracker(storageDir, workspaceRoot);
+      const r = await fresh.restore(cp!.id, { force: true });
+      expect(r.restored).toBe(true);
+      fresh.dispose();
+    });
+
+    it("deadline: a wedged queue tail yields 'deadline' instead of hanging teardown", async () => {
+      // A checkpoint made with REAL git first, so there is a valid id to diff.
+      const cp = await tracker.snapshot(1);
+      expect(cp).not.toBeNull();
+      // THEN install the fake write-tree spawn so the next diff()'s git child
+      // never closes and the queue tail wedges.
+      const fake = installFakeGitChild();
+      const hung = tracker.diff(cp!.id).catch(() => undefined);
+      await expect(tracker.disposeAndFlush(100)).resolves.toBe('deadline');
+      // Cleanup: emit close on the fake child so the queue drains before
+      // afterEach (which also restores the real spawn). Same idiom as the
+      // I-2 durability test above: an extra `flushLocalization()` drains the
+      // background localization `disposeAndFlush`'s `work` left running past
+      // the deadline — otherwise its orphaned repack can race this test's
+      // own workspace cleanup (intermittent Windows EBUSY on rmdir).
+      fake.emitCloseAll(0);
+      await hung;
+      await tracker.flushLocalization();
+    });
+  });
 });

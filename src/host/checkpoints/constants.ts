@@ -12,3 +12,5 @@ export const DEFAULT_GIT_TIMEOUT_MS = 15_000;
 export const DEFAULT_LOCK_STALE_MS = 30_000;
 /** Cross-process lock: max wait for a live lock before failing. */
 export const DEFAULT_LOCK_MAX_WAIT_MS = 10_000;
+/** WS-CK-A6: bound on `CheckpointTracker.disposeAndFlush`'s durability flush. */
+export const DEFAULT_DISPOSE_FLUSH_DEADLINE_MS = 15_000;

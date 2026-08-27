@@ -13,7 +13,13 @@ import { createIgnoreFilter } from '../../shared/ignoreFilter';
 import { isRecord } from '../../shared/typeGuards';
 import { resolveWithinWorkspaceReal } from '../backend/acp/pathConfine';
 import { writeFileNoFollow } from '../backend/acp/safeWrite';
-import { DEFAULT_GIT_TIMEOUT_MS, DEFAULT_LOCK_MAX_WAIT_MS, DEFAULT_LOCK_STALE_MS } from './constants';
+import { settleRace } from '../backend/connection/settleRace';
+import {
+  DEFAULT_DISPOSE_FLUSH_DEADLINE_MS,
+  DEFAULT_GIT_TIMEOUT_MS,
+  DEFAULT_LOCK_MAX_WAIT_MS,
+  DEFAULT_LOCK_STALE_MS,
+} from './constants';
 import { sanitizeGitEnv } from './gitEnv';
 import { runGit, runGitBinary, type RunGitOptions } from './gitProcess';
 import { parseNameStatusZ, type CheckpointDiffEntry } from './nameStatus';
@@ -220,6 +226,19 @@ interface CheckpointIndexFile {
   redo?: CheckpointRedoState;
 }
 
+/**
+ * WS-CK-A6: the deterministic per-root shadow directory — sha256(canonical
+ * root), 16 hex chars, under `<storage>/checkpoints/`. Pure-move of the
+ * constructor's hash rule (behavior-preserving: `path.resolve` only, NOT
+ * realpath — canonicalization is the A6 registry's job, not this rule's).
+ * ONE source of truth the constructor AND the A6 registry both reuse (key
+ * === hash input by construction) for collision checks and adopt-by-rename.
+ */
+export function shadowDirFor(storageDir: string, workspaceRoot: string): string {
+  const hash = createHash('sha256').update(path.resolve(workspaceRoot)).digest('hex').slice(0, 16);
+  return path.join(path.resolve(storageDir), 'checkpoints', hash);
+}
+
 export class CheckpointTracker {
   private readonly workspaceRoot: string;
   private readonly storageDir: string;
@@ -262,8 +281,7 @@ export class CheckpointTracker {
     this.gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
     this.localizeDebounceMs = options.localizeDebounceMs ?? DEFAULT_LOCALIZE_DEBOUNCE_MS;
 
-    const hash = createHash('sha256').update(this.workspaceRoot).digest('hex').slice(0, 16);
-    this.shadowDir = path.join(this.storageDir, 'checkpoints', hash);
+    this.shadowDir = shadowDirFor(this.storageDir, this.workspaceRoot);
     this.gitDir = path.join(this.shadowDir, '.git');
     this.indexPath = path.join(this.shadowDir, 'index.json');
   }
@@ -926,6 +944,32 @@ export class CheckpointTracker {
       clearTimeout(this.localizeTimer);
       this.localizeTimer = undefined;
     }
+  }
+
+  /**
+   * WS-CK-A6 (spec req 6): dispose WITH the durability flush — for per-root
+   * teardown on folder removal (and deactivate). Cancels the debounce, runs
+   * any pending localization (queue+lock-serialized), then awaits the queue
+   * tail so no in-flight op is abandoned mid-critical-section — all bounded by
+   * `deadlineMs` via the WS-R1 settleRace. 'deadline' means the flush is
+   * still running in the background (safe: it holds the cross-process lock;
+   * a successor tracker instance on this root serializes against it) — the
+   * CALLER discloses it. NEVER deletes the on-disk shadow repo: history is
+   * retention-by-default; a re-added folder finds it via shadowDirFor.
+   */
+  async disposeAndFlush(
+    deadlineMs: number = DEFAULT_DISPOSE_FLUSH_DEADLINE_MS,
+  ): Promise<'flushed' | 'deadline'> {
+    this.dispose();
+    const work = (async (): Promise<void> => {
+      await this.flushLocalization().catch(() => undefined);
+      await this.queue.then(
+        () => undefined,
+        () => undefined,
+      );
+    })();
+    const outcome = await settleRace(work, { deadline: deadlineMs });
+    return outcome.kind === 'value' ? 'flushed' : 'deadline';
   }
 
   // --- internals ----------------------------------------------------------
