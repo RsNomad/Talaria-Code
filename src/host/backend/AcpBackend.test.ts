@@ -8584,6 +8584,24 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     await expect(backend.invokeControl('mcp.catalog', {})).resolves.toBeDefined(); // sanity: client still usable
   });
 
+  it('CA-M05: a hung actionStatus that blows past the deadline is bounded (rejects "did not complete") instead of hanging forever', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'builder', needs_install: true, required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'act-1' };
+    client.actionStatusDeferred = new Promise(() => {}); // a HUNG status call — never resolves
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    const resultPromise = backend.invokeControl('mcp.catalogInstall', { name: 'builder' });
+    const assertion = expect(resultPromise).rejects.toThrow(/did not complete/i);
+    await vi.advanceTimersByTimeAsync(181_000); // > CATALOG_POLL_CAP_MS (180s) — fire the around-call deadline
+    await assertion;
+  });
+
   // ---------------------------------------------------------------------
   // Rev-1 B4 (CF-13 parity, TH-4) — SUPERSEDES the test above (old name:
   // "describeCatalogForModal receives the VALIDATED submitted env (A3-IMP2

@@ -959,6 +959,45 @@ export class ControlDispatcher {
   }
 
   /**
+   * CA-M05: run ONE `actionStatus` bounded by the poll deadline. A long-hanging
+   * call can otherwise blow past the deadline undetected (the loop's between-
+   * calls check is only reached AFTER the await returns). A settle-once race:
+   * a wall-clock timeout resolves `{ timedOut: true }`; a real status resolves
+   * `{ status }`; a TRANSPORT rejection passes through as a rejection (→ {@link
+   * throwPollUnconfirmed}). The timer is `unref()`d and cleared on the fast path.
+   */
+  private actionStatusWithinDeadline(
+    client: DashboardAdminClient,
+    action: string,
+    deadline: number,
+  ): Promise<PolledOutcome> {
+    const remaining = Math.max(0, deadline - Date.now());
+    return new Promise<PolledOutcome>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ timedOut: true });
+      }, remaining);
+      timer.unref?.();
+      client.actionStatus(action).then(
+        (status) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ status });
+        },
+        (err: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
+  }
+
+  /**
    * Task A6 (§4.7 item 2, background branch): poll `actionStatus` at a
    * 1s -> 2s backoff, capped at 180s total (clone+build headroom). On
    * `running:false`, GROUND-TRUTH verify (Layer 6, unexecuted-assurance
@@ -966,6 +1005,9 @@ export class ControlDispatcher {
    * === true` — the exit code alone is never trusted. On a timeout or a
    * still-`installed:false` row, the action's tail `lines` go to the
    * output-channel logger ONLY; the thrown message never carries them.
+   * CA-M05: the deadline bounds the `actionStatus` call itself (via {@link
+   * actionStatusWithinDeadline}), not just the gap between calls — a hung
+   * call can no longer blow past the cap undetected.
    */
   private async pollCatalogInstall(
     client: DashboardAdminClient,
@@ -976,16 +1018,20 @@ export class ControlDispatcher {
     let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
     let lastLines: string[] = [];
     for (;;) {
-      let status: { running: boolean; exit_code: number | null; lines: string[] };
+      let polled: PolledOutcome;
       try {
-        status = await client.actionStatus(action);
+        polled = await this.actionStatusWithinDeadline(client, action, deadline);
       } catch (err) {
         this.throwPollUnconfirmed(action, err);
       }
+      if ('timedOut' in polled) {
+        this.rejectCatalogInstall(name, lastLines);
+      }
+      const status = polled.status;
       lastLines = status.lines;
       if (!status.running) break;
       if (Date.now() >= deadline) {
-        this.rejectCatalogInstall(name, lastLines);
+        this.rejectCatalogInstall(name, lastLines); // cheap fast-path exit; now redundant with the bound but harmless
       }
       await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
       delay = BACKGROUND_POLL_STEP_DELAY_MS;
@@ -1336,16 +1382,20 @@ export class ControlDispatcher {
     let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
     let lastLines: string[] = [];
     for (;;) {
-      let status: { running: boolean; exit_code: number | null; lines: string[] };
+      let polled: PolledOutcome;
       try {
-        status = await client.actionStatus(action);
+        polled = await this.actionStatusWithinDeadline(client, action, deadline);
       } catch (err) {
         this.throwPollUnconfirmed(action, err);
       }
+      if ('timedOut' in polled) {
+        this.rejectSkillInstall(skillName, lastLines);
+      }
+      const status = polled.status;
       lastLines = status.lines;
       if (!status.running) break;
       if (Date.now() >= deadline) {
-        this.rejectSkillInstall(skillName, lastLines);
+        this.rejectSkillInstall(skillName, lastLines); // cheap fast-path exit; now redundant with the bound but harmless
       }
       await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
       delay = BACKGROUND_POLL_STEP_DELAY_MS;
@@ -1458,16 +1508,20 @@ export class ControlDispatcher {
     let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
     let lastLines: string[] = [];
     for (;;) {
-      let status: { running: boolean; exit_code: number | null; lines: string[] };
+      let polled: PolledOutcome;
       try {
-        status = await client.actionStatus(action);
+        polled = await this.actionStatusWithinDeadline(client, action, deadline);
       } catch (err) {
         this.throwPollUnconfirmed(action, err);
       }
+      if ('timedOut' in polled) {
+        this.rejectSkillUninstall(skillName, lastLines);
+      }
+      const status = polled.status;
       lastLines = status.lines;
       if (!status.running) break;
       if (Date.now() >= deadline) {
-        this.rejectSkillUninstall(skillName, lastLines);
+        this.rejectSkillUninstall(skillName, lastLines); // cheap fast-path exit; now redundant with the bound but harmless
       }
       await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
       delay = BACKGROUND_POLL_STEP_DELAY_MS;
@@ -1957,6 +2011,11 @@ const MCP_RELOAD_DIVERGENCE_MESSAGE =
  */
 const POLL_UNCONFIRMED_MESSAGE =
   'The action was dispatched, but its status could not be confirmed — refresh the panel to check whether it completed.';
+
+/** CA-M05: the raw `actionStatus` envelope shape. */
+type ActionStatus = { running: boolean; exit_code: number | null; lines: string[] };
+/** CA-M05: either the fetched status, or a wall-clock timeout that the caller maps to its own "did not complete" refusal. */
+type PolledOutcome = { status: ActionStatus } | { timedOut: true };
 
 /**
  * Task A6 (§4.7 item 2), widened by Task B4: the shared background-poll
