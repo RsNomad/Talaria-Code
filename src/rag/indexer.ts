@@ -328,33 +328,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   }
 
   async function writeManifest(manifest: Record<string, string>): Promise<void> {
-    // F2-13: crash-safe atomic replace. Write the full JSON to a same-
-    // directory temp file, then fs.rename(2) — atomic on the target's
-    // filesystem (Linux), never a torn/partial manifest a concurrent
-    // readManifest could parse.
+    // F2-13: crash-safe atomic replace — write the full JSON to a same-directory
+    // temp file, then fs.rename(2), which is atomic on the target filesystem
+    // (Linux), never leaving a torn/partial manifest a concurrent readManifest
+    // could parse.
     const tmpPath = `${manifestPath}.tmp`;
     await fs.writeFile(tmpPath, JSON.stringify(manifest), 'utf8');
-    // Dev-box hygiene (Windows only; a no-op on the Linux target): replacing
-    // an EXISTING file via rename(2) is unconditionally atomic on POSIX, but
-    // the Windows MoveFileEx equivalent can transiently reject with EPERM/
-    // EBUSY/EACCES while some other handle (indexer, AV, etc.) briefly holds
-    // the destination open — a known Node-on-Windows quirk (the same one
-    // `graceful-fs` retries around). Bounded, undelayed retry: irrelevant on
-    // Linux (rename(2) never returns these codes for a same-dir replace, so
-    // this always resolves on the first attempt there); on Windows it gives
-    // the transient holder a few real event-loop turns to release the file
-    // before this genuinely fails.
-    const RENAME_RETRY_ATTEMPTS = 5;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await fs.rename(tmpPath, manifestPath);
-        return;
-      } catch (err) {
-        const code = err instanceof Error && 'code' in err ? (err as { code?: string }).code : undefined;
-        const transient = code === 'EPERM' || code === 'EBUSY' || code === 'EACCES';
-        if (!transient || attempt >= RENAME_RETRY_ATTEMPTS) throw err;
-      }
-    }
+    await fs.rename(tmpPath, manifestPath);
   }
 
   const metaPath = path.join(opts.indexDir, 'manifest.meta.json');

@@ -1,7 +1,6 @@
 import {
   promises as fs,
   existsSync,
-  readFileSync,
   mkdtempSync,
   mkdirSync,
   rmSync,
@@ -212,6 +211,65 @@ async function flushWatch(debounceMs: number, until: () => boolean): Promise<voi
   await vi.advanceTimersByTimeAsync(debounceMs);
   await drainUntil(until);
 }
+
+/**
+ * B1a: production's `writeManifest` writes via a same-dir `.tmp` file then
+ * `fs.rename`s it into place — atomic on the target's Linux filesystem, so a
+ * concurrent reader NEVER observes a torn write and the rename ITSELF never
+ * fails there. This dev box (Windows) has no such guarantee: a `readFileSync`
+ * of the live manifest file that happens to run while `fs.rename` is
+ * transiently mid-flight can hold the destination open long enough to make
+ * the Windows MoveFileEx equivalent fail outright with a sharing violation —
+ * a purely Windows-dev-box artifact of a `drainUntil`/`flushWatch` predicate
+ * READING the manifest FILE mid-build, not a real production bug. B1 papered
+ * over this with a Windows-only retry loop in production; B1a removes that
+ * (POSIX has no such failure mode to retry around) and fixes it on the test
+ * side instead: no drain predicate below may read the manifest file while a
+ * build/reindex could still be in flight.
+ *
+ * This plain array-push call-through recorder (no `vi.fn()`/`vi.spyOn` —
+ * matches this file's other fakes, e.g. `nextEditNotice.vscode.test.ts`) lets
+ * a predicate wait for the RENAME ITSELF — `writeManifest`'s atomic commit
+ * signal — instead of the file's content. The real rename still runs
+ * (call-through), so the file on disk, and every POST-drain assertion (which
+ * only runs after the build has settled, so there is no race there), are
+ * unaffected.
+ *
+ * `real`/`restore` are captured as LOCALS inside each `beforeEach`
+ * invocation, not a shared outer `let` re-read at call time: several tests
+ * in this file (by design — see F3-11's "dangling `buildChain`" tests)
+ * deliberately leave an unawaited `build()`/watch chain still running past
+ * their own test's completion, so an OLDER test's wrapper can still fire its
+ * real `fs.rename` call while a LATER test is executing. A shared mutable
+ * "real" binding would have every still-live wrapper (from every test so
+ * far) call whatever the CURRENT test most recently captured — on a long
+ * enough chain of leftover wrappers this can loop back on itself. Each
+ * `beforeEach` call's own `real`/`restore` closure pair is self-contained,
+ * so an old wrapper firing late always still resolves to a genuine,
+ * terminating call chain down to the true `fs.rename`.
+ */
+let renameCommits: Array<[string, string]>;
+let restoreRename: () => void;
+beforeEach(() => {
+  renameCommits = [];
+  const real = fs.rename;
+  fs.rename = (async (
+    from: Parameters<typeof fs.rename>[0],
+    to: Parameters<typeof fs.rename>[1],
+  ): Promise<void> => {
+    // Record AFTER the real rename resolves, not before — a predicate must
+    // only see a rename that actually LANDED (the genuine atomic-commit
+    // signal), never one merely attempted (which could still reject).
+    await (real as typeof fs.rename)(from, to);
+    renameCommits.push([String(from), String(to)]);
+  }) as typeof fs.rename;
+  restoreRename = () => {
+    fs.rename = real;
+  };
+});
+afterEach(() => {
+  restoreRename();
+});
 
 describe('createIndexer — secret-path filtering (W5-T6)', () => {
   let workspaceRoot: string;
@@ -708,18 +766,15 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
 
     // b's debounce timer was already fired by a's nested-80 advance above;
     // drain (no extra debounce advance) until both serialize()-ordered
-    // cycles have written their entries.
-    await drainUntil(() => {
-      try {
-        const m = JSON.parse(readFileSync(path.join(indexDir, 'manifest.json'), 'utf8')) as Record<
-          string,
-          string
-        >;
-        return m['a.txt'] !== undefined && m['b.txt'] !== undefined;
-      } catch {
-        return false;
-      }
-    });
+    // cycles have written their entries. B1a: anchor on the WRITE COMMIT
+    // itself (the `fs.rename` call `writeManifest` makes) rather than
+    // reading the live manifest.json file — that read is exactly what raced
+    // production's own in-flight rename on this dev box (see the recorder's
+    // doc comment above). Each cycle's success path calls `writeManifest`
+    // exactly once, so two renames to `manifestPath` means both cycles'
+    // entries have actually landed on disk.
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    await drainUntil(() => renameCommits.filter(([, to]) => to === manifestPath).length >= 2);
 
     const manifest = await readManifest();
     expect(manifest['a.txt']).toBeDefined();
@@ -1060,15 +1115,18 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     const disposable = indexer.watch();
     deleteByPathMock.mockClear();
 
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    const renameCountBeforeDelete = renameCommits.filter(([, to]) => to === manifestPath).length;
     fsWatcherListeners.delete[0]!({ fsPath: path.join(workspaceRoot, 'src') }); // ONE event for the dir — the granularity ARCH-5 names
-    await flushWatch(5, () => {
-      try {
-        const m = JSON.parse(readFileSync(path.join(indexDir, 'manifest.json'), 'utf8')) as Record<string, string>;
-        return Object.keys(m).length === 0;
-      } catch {
-        return false;
-      }
-    });
+    // B1a: anchor on the delete-branch's SINGLE `writeManifest` commit (one
+    // new rename to `manifestPath`, observed via the call-through recorder)
+    // instead of reading the live manifest.json file inside the drain loop —
+    // see the recorder's doc comment for why that read races production's
+    // in-flight rename on this dev box.
+    await flushWatch(
+      5,
+      () => renameCommits.filter(([, to]) => to === manifestPath).length > renameCountBeforeDelete,
+    );
 
     const deleted = deleteByPathMock.mock.calls.map(([p]) => p);
     expect(deleted).toContain('src/a.txt');
@@ -1246,21 +1304,6 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
     return upsertMock.mock.calls.flatMap(([records]) => records.map((r) => r.path));
   }
 
-  /** F2-13 (B1) drain helper — see TA-6's identically-purposed helper for the
-   * full rationale: a synchronous manifest-entry check so the existing
-   * `() => boolean` drain predicates can also require `writeManifest`'s
-   * (now two-await) atomic write to have actually landed, not just the
-   * `upsertMock` call that precedes it in `reindexFiles`. */
-  function manifestHasEntrySync(relPath: string): boolean {
-    try {
-      const raw = readFileSync(path.join(indexDir, 'manifest.json'), 'utf8');
-      const parsed: unknown = JSON.parse(raw);
-      return typeof parsed === 'object' && parsed !== null && relPath in parsed;
-    } catch {
-      return false;
-    }
-  }
-
   it.skipIf(!canLinkDir)(
     'RED: a change event through an in-workspace dir-symlink alias READS the confined canonical path and STORES under the alias relPath',
     async () => {
@@ -1277,13 +1320,16 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
       const indexer = makeIndexer();
       const disposable = indexer.watch();
 
+      const manifestPath = path.join(indexDir, 'manifest.json');
       fsWatcherListeners.change[0]!({ fsPath: aliasAbs });
-      // F2-13 (B1): wait for the upsert AND the manifest write to have
-      // actually landed — see the TA-6 helper's doc comment for why the
-      // upsert call alone is no longer a sufficient "done" signal.
+      // B1a: wait for the upsert AND the manifest write's rename commit to
+      // have actually landed — the upsert call alone is not a sufficient
+      // "done" signal (writeManifest's atomic replace is a further real-fs
+      // await beyond it) — see the recorder's doc comment for why this no
+      // longer reads the live manifest file to observe that.
       await flushWatch(
         5,
-        () => upsertedPaths().includes('alias/doc.txt') && manifestHasEntrySync('alias/doc.txt'),
+        () => upsertedPaths().includes('alias/doc.txt') && renameCommits.some(([, to]) => to === manifestPath),
       );
 
       // (a) THE RED PAIR — the reindex read must hit the CONFINED canonical
@@ -1595,25 +1641,6 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
     }
   }
 
-  /** F2-13 (B1) drain helper: a SYNCHRONOUS manifest-entry check, usable as a
-   * `drainUntil`/`flushWatch` predicate. `writeManifest` is now a same-dir
-   * `.tmp` write + `fs.rename` (crash-safe atomic replace) instead of a
-   * single write — one extra real-fs await beyond `deleteByPathMock` firing.
-   * Waiting on the delete call ALONE (the pre-F2-13 predicate) can observe
-   * the drain as "done" one turn before the renamed manifest actually lands,
-   * reading the file's PRE-purge content — a stale read, not a real failure.
-   * A synchronous `readFileSync` check lets the existing `() => boolean`
-   * drain predicates also require the manifest write to have landed. */
-  function manifestHasEntrySync(relPath: string): boolean {
-    try {
-      const raw = readFileSync(path.join(indexDir, 'manifest.json'), 'utf8');
-      const parsed: unknown = JSON.parse(raw);
-      return typeof parsed === 'object' && parsed !== null && relPath in parsed;
-    } catch {
-      return false;
-    }
-  }
-
   it('RED: a previously-indexed file that GROWS past MAX_FILE_BYTES on a watch event is purged from the store AND the manifest', async () => {
     await writeWorkspaceFile('big.ts', 'export const x = 1;\n');
     const indexer = makeIndexer();
@@ -1622,6 +1649,8 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
     expect(before['big.ts']).toBeDefined();
     deleteByPathMock.mockClear();
     upsertMock.mockClear();
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    const renameCountBaseline = renameCommits.filter(([, to]) => to === manifestPath).length;
 
     const disposable = indexer.watch();
     // Grow the SAME path well past the 1MB cap (indexer.ts's MAX_FILE_BYTES)
@@ -1632,14 +1661,16 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'big.ts') });
-    // F2-13 (B1): wait for the delete call AND the manifest purge to have
-    // actually landed — `writeManifest` is now a same-dir `.tmp` write +
-    // `fs.rename`, one real-fs await beyond `deleteByPathMock` firing, so
-    // waiting on the delete call alone can observe "done" one turn before
-    // the purge is actually persisted (a stale read of the pre-purge file).
+    // B1a: wait for the delete call AND the manifest purge's rename commit
+    // to have actually landed — waiting on the delete call alone can observe
+    // "done" one turn before `writeManifest`'s atomic replace is actually
+    // persisted. See the recorder's doc comment for why this no longer reads
+    // the live manifest file to observe that.
     await flushWatch(
       10,
-      () => deleteByPathMock.mock.calls.some(([p]) => p === 'big.ts') && !manifestHasEntrySync('big.ts'),
+      () =>
+        deleteByPathMock.mock.calls.some(([p]) => p === 'big.ts') &&
+        renameCommits.filter(([, to]) => to === manifestPath).length > renameCountBaseline,
     );
 
     // AU-24: at HEAD, the oversize `continue` fires BEFORE any purge — the
@@ -1663,6 +1694,8 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
     expect(before['data.ts']).toBeDefined();
     deleteByPathMock.mockClear();
     upsertMock.mockClear();
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    const renameCountBaseline = renameCommits.filter(([, to]) => to === manifestPath).length;
 
     const disposable = indexer.watch();
     // A NUL byte in the first 8000 bytes is indexer.ts's `looksBinary` test —
@@ -1672,10 +1705,12 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'data.ts') });
-    // F2-13 (B1): see the sibling GROWS test's comment above — same reason.
+    // B1a: see the sibling GROWS test's comment above — same reason.
     await flushWatch(
       10,
-      () => deleteByPathMock.mock.calls.some(([p]) => p === 'data.ts') && !manifestHasEntrySync('data.ts'),
+      () =>
+        deleteByPathMock.mock.calls.some(([p]) => p === 'data.ts') &&
+        renameCommits.filter(([, to]) => to === manifestPath).length > renameCountBaseline,
     );
 
     expect(deleteByPathMock).toHaveBeenCalledWith('data.ts');
