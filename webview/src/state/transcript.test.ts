@@ -2745,3 +2745,58 @@ describe('UX-04a: new-session lifecycle — newSessionPending', () => {
     expect(activeTab(live).newSessionPending).toBe(true);
   });
 });
+
+describe('CA-09: message.delta O(1) fast path (behavior-identical, no reverse-copy on the fast path)', () => {
+  it('[perf genuine-RED] does NOT allocate+reverse a copy when the open message is the last item', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'Hel' });
+    const reverseSpy = vi.spyOn(Array.prototype, 'reverse');
+    try {
+      state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'lo' });
+      expect(reverseSpy).not.toHaveBeenCalled();
+    } finally {
+      reverseSpy.mockRestore();
+    }
+    const tab = must(state.tabs[state.activeTabId], 'active tab');
+    const msgs = tab.transcript.filter((i) => i.kind === 'message');
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toMatchObject({ text: 'Hello', streaming: true });
+  });
+
+  it('appends the SAME text as before across a multi-delta sequence (fold semantics unchanged)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    for (const chunk of ['a', 'b', 'c', 'd']) {
+      state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: chunk });
+    }
+    const tab = must(state.tabs[state.activeTabId], 'active tab');
+    const msgs = tab.transcript.filter((i) => i.kind === 'message');
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toMatchObject({ text: 'abcd', streaming: true });
+  });
+
+  it('unchanged items keep their object identity (immutable-update parity with the old .map)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'reasoning.end', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'x' });
+    const before = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    const reasoningBefore = before.find((i) => i.kind === 'reasoning');
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'y' });
+    const after = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    // the reasoning item was not the target — its reference must be preserved
+    expect(after.find((i) => i.kind === 'reasoning')).toBe(reasoningBefore);
+  });
+
+  it('FALLBACK: an open streaming message that is NOT last still receives the delta (reverse-scan retained)', () => {
+    // Hand-build a tab whose last item is a reasoning block while an earlier
+    // message is still streaming — exercises the retained reverse-scan path.
+    const streamingMsg = { kind: 'message' as const, turnId: 't1', id: 'msg-t1-0', text: 'A', streaming: true };
+    const reasoning = { kind: 'reasoning' as const, turnId: 't1', blockId: 'r9', text: 'thinking', streaming: false };
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript: [streamingMsg, reasoning] };
+    const state: AppState = { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+    const next = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'B' });
+    const nextTab = must(next.tabs.boot, 'boot tab');
+    expect(nextTab.transcript[0]).toMatchObject({ kind: 'message', text: 'AB', streaming: true });
+    expect(nextTab.transcript[1]).toBe(reasoning); // untouched
+  });
+});

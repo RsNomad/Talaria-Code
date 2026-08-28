@@ -227,14 +227,27 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       };
 
     case 'message.delta': {
-      const open = [...tab.transcript]
-        .reverse()
-        .find((i) => i.kind === 'message' && i.streaming && i.turnId === msg.turnId);
+      // CA-09: the open streaming message is provably the LAST element in the
+      // normal flow (any interleaving item runs closeOpenMessages, settling
+      // prior streaming messages, so a new delta opens a fresh one at the tail).
+      // Check the tail first (O(1)); keep the reverse-scan as the rare fallback
+      // (an open message that is not last) so the result is provably identical.
+      const lastIndex = tab.transcript.length - 1;
+      const last = tab.transcript[lastIndex];
+      const openIsLast =
+        last !== undefined && last.kind === 'message' && last.streaming && last.turnId === msg.turnId;
+      const open = openIsLast
+        ? last
+        : [...tab.transcript].reverse().find((i) => i.kind === 'message' && i.streaming && i.turnId === msg.turnId);
       if (open && open.kind === 'message') {
-        return {
-          ...tab,
-          transcript: tab.transcript.map((i) => (i === open ? { ...i, text: i.text + msg.text } : i)),
-        };
+        // Targeted splice: copy the array once, replace only the matched index —
+        // no per-element .map callback, no reverse-copy on the fast path. Unchanged
+        // items keep their references (slice copies references), exactly like the
+        // old .map(i => i === open ? {...} : i).
+        const idx = openIsLast ? lastIndex : tab.transcript.indexOf(open);
+        const nextTranscript = tab.transcript.slice();
+        nextTranscript[idx] = { ...open, text: open.text + msg.text };
+        return { ...tab, transcript: nextTranscript };
       }
       return {
         ...tab,
