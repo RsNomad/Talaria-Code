@@ -44,6 +44,7 @@ import {
 } from './mcpEntryValidation';
 import { assertSkillIdentifier, validateSkillCreate, TRUSTED_SKILL_PREFIXES } from './skillSourceGate';
 import { redactForModal } from '../../setup/SetupController';
+import { redactSecretsDeep } from '../../redactControlResponse';
 
 /**
  * Task A5 (features-add-mcp-skills-architecture.md §3 Layer 5, §4.5 item 1):
@@ -531,7 +532,14 @@ export class ControlDispatcher {
     // overwrite hazard, so only it is gated: a superseded attempt (a newer
     // fetch for the SAME scope has since landed) drops its push silently.
     if (this.panelFetchSeq.get(scopeKey) === seq) {
-      this.port.emit(this.buildPanelDataMessage(panel, outcome.data, scopedParams));
+      // CA-M19 [SECURITY]: the proactive push IS the render path (the correlated
+      // control.response is REDACTION_EXEMPT + ignored by the webview for panel
+      // fetches). Route the pushed data through the SAME deny-list walker the
+      // response path uses — `redactSecretsDeep` is the ungated twin of
+      // `redactControlResponse` (one doctrine, not two). Over-redaction of a
+      // genuinely secret-shaped key is the SAFE direction (belt doctrine).
+      const redacted = redactSecretsDeep(outcome.data) as PanelDataMap[P];
+      this.port.emit(this.buildPanelDataMessage(panel, redacted, scopedParams));
     }
     return outcome.data;
   }

@@ -138,3 +138,27 @@ describe('ControlDispatcher — WS-GD.1 CA-M04b: registry-close pruning (all clo
     expect(seqMap.has('subagents:S1')).toBe(false); // pruned via the registry hook, no per-site wiring
   });
 });
+
+describe('ControlDispatcher — WS-GD.1 CA-M19 [SECURITY]: push-channel redaction', () => {
+  it('redacts secret-shaped keys in the proactive panel.data PUSH (closes the AU-OBS-TE5 bypass)', async () => {
+    const { port, emitted, registry } = makePort();
+    registerFakeSource(registry, 'models', async () => ({
+      data: { providers: [{ id: 'openai', token: 'sk-LIVE-SECRET' }] } as unknown as PanelDataMap['models'],
+    }));
+    const dispatcher = new ControlDispatcher(port);
+
+    await dispatcher.invokeControl('panel.data', { panel: 'models' });
+
+    // F3-16 pattern: narrow by the `panel: 'models'` discriminant (a bare
+    // `{ type: 'panel.data' }` narrowing does not sufficiently overlap the
+    // fixture's `{ providers }` assertion shape, since `HostToWebview`'s
+    // `panel.data` variant is itself a union over every DataPanel).
+    const push = emitted.find(
+      (m): m is Extract<HostToWebview, { type: 'panel.data'; panel: 'models' }> =>
+        m.type === 'panel.data' && m.panel === 'models',
+    );
+    expect(push).toBeDefined();
+    const providers = (push?.data as unknown as { providers: Array<{ token: unknown }> } | undefined)?.providers;
+    expect(providers?.[0]?.token).toBe('[redacted]'); // walked by the SAME deny-list the response path uses
+  });
+});
