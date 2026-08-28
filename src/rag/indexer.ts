@@ -42,6 +42,7 @@ import { toPosixRelative } from './gitignore';
 import { WebTreeSitterParser } from './parser/WebTreeSitterParser';
 import { LanceDBStore } from './store/LanceDBStore';
 import type { ChunkRecord, VectorStore } from './store/VectorStore';
+import { createMutationGate } from '../host/util/mutationGate';
 
 export interface IndexerOptions {
   workspaceRoot: string;
@@ -229,6 +230,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   }
 
   let disposed = false;
+  // WS-R2 (FUNC-DISPOSED-ROOT): the structural disposed-guard. Every
+  // store/manifest mutation routes through gate.sink(); dispose() flips it
+  // (A4). The existing `if (disposed)` early-outs stay as harmless
+  // optimizations — the CLASS (post-dispose mutation) dies at these four
+  // sink families regardless of body-level vigilance.
+  const gate = createMutationGate();
   // F2-12: cumulative count of `schedule()`'s catch firing — see the
   // `Indexer.failedIncrementalReindexes` doc comment.
   let failedIncrementalReindexesTotal = 0;
@@ -639,7 +646,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // path's stale rows and its manifest entry NOW, in the same op as the
         // bail — idempotent and harmless on the build path too (these rows
         // would be purged by the diff anyway).
-        await store.deleteByPath(relPath);
+        await gate.sink(() => store.deleteByPath(relPath));
         // TA-5 / INV-5: the purge above is an await — `dispose()` may have
         // fired while it was in flight. Re-check before the manifest mutation
         // that follows it (same discipline as every other await-then-mutate
@@ -715,7 +722,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // any stale rows now and record the hash immediately: this mirrors
         // HEAD's behavior for this exact case (which also never reaches the
         // embed step, so there is no failure window to protect against).
-        await store.deleteByPath(relPath);
+        await gate.sink(() => store.deleteByPath(relPath));
         manifest[relPath] = contentHash;
       } else {
         pathState.set(relPath, { contentHash, remaining: recordCount, deleted: false });
@@ -794,12 +801,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         for (const relPath of new Set(batch.map((r) => r.path))) {
           const state = pathState.get(relPath);
           if (state && !state.deleted) {
-            await store.deleteByPath(relPath);
+            await gate.sink(() => store.deleteByPath(relPath));
             state.deleted = true;
           }
         }
 
-        await store.upsert(batch);
+        await gate.sink(() => store.upsert(batch));
 
         for (const record of batch) {
           const state = pathState.get(record.path);
@@ -898,7 +905,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     // sidecar yet at all).
     for (const relPath of Object.keys(stored)) {
       if (isSecretForCompletion(relPath)) {
-        await store.deleteByPath(relPath);
+        await gate.sink(() => store.deleteByPath(relPath));
         delete stored[relPath];
       }
     }
@@ -925,7 +932,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     if (disposed) return;
 
     for (const relPath of diff.toDelete) {
-      await store.deleteByPath(relPath);
+      await gate.sink(() => store.deleteByPath(relPath));
       delete stored[relPath];
     }
 
@@ -958,14 +965,14 @@ export function createIndexer(opts: IndexerOptions): Indexer {
       // `manifest` to disk AFTER dispose is the same orphan/drift defect as
       // the incremental path's — skip the write, still propagate the error.
       if (disposed) throw err;
-      await writeManifest(manifest);
+      await gate.sink(() => writeManifest(manifest));
       throw err;
     }
 
     // TA-5 (AU-23, Critical remediation) / INV-5: same hazard as the catch
     // arm above, for the non-throwing (success) case.
     if (disposed) return;
-    await writeManifest(manifest);
+    await gate.sink(() => writeManifest(manifest));
     // Task 14b: if this build embedded nothing (nothing changed, or a
     // fingerprint mismatch found zero files to recompute), there is no NEW
     // observation to record — preserve whatever width the fingerprint-matched
@@ -976,7 +983,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     // TA-5 (AU-23, Critical remediation) / INV-5: `writeManifest` above is
     // itself an await — re-check once more before this last mutation too.
     if (disposed) return;
-    await writeMeta(observedWidth ?? (fingerprintOk ? storedMeta?.width : undefined));
+    await gate.sink(() => writeMeta(observedWidth ?? (fingerprintOk ? storedMeta?.width : undefined)));
   }
 
   // Audit D-5: `build()` is a read-modify-write over one manifest file and is
@@ -1062,7 +1069,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // path's manifest entry — the exact orphan-row/manifest-drift
           // AU-23 named.
           if (disposed) return;
-          await store.deleteByPath(relPath);
+          await gate.sink(() => store.deleteByPath(relPath));
           delete manifest[relPath];
           // AUDIT-5 ARCH-5 (F-1 final): delete-event granularity is platform/
           // watcher-dependent — a directory delete may arrive as ONE event
@@ -1073,7 +1080,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // escaping needed, idempotent when per-file events also arrive.
           for (const key of Object.keys(manifest)) {
             if (key.startsWith(`${relPath}/`)) {
-              await store.deleteByPath(key);
+              await gate.sink(() => store.deleteByPath(key));
               delete manifest[key];
             }
           }
@@ -1083,7 +1090,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // this function. The entry guard above only covers what precedes
           // the loop; re-check once more, after it, right before the write.
           if (disposed) return;
-          await writeManifest(manifest);
+          await gate.sink(() => writeManifest(manifest));
           return;
         }
         if (isSecretForCompletion(relPath)) {
@@ -1093,13 +1100,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // A newly-created/changed secret-path file (e.g. a fresh `.env`)
           // must never be indexed. Best-effort purge in case it was somehow
           // already stored (mirrors build()'s self-heal purge pass).
-          await store.deleteByPath(relPath);
+          await gate.sink(() => store.deleteByPath(relPath));
           delete manifest[relPath];
           // AU-23 re-review (TA-5 completion) / INV-5: the entry guard above
           // covers what precedes `store.deleteByPath`, not the await itself
           // — re-check once more before the write.
           if (disposed) return;
-          await writeManifest(manifest);
+          await gate.sink(() => writeManifest(manifest));
           return;
         }
         // AUDIT-5 ARCH-2: watch/build symmetry + containment. runBuild's
@@ -1133,13 +1140,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // above both await — same re-check, same reason as the two
           // branches above.
           if (disposed) return;
-          await store.deleteByPath(relPath);
+          await gate.sink(() => store.deleteByPath(relPath));
           delete manifest[relPath];
           // AU-23 re-review (TA-5 completion) / INV-5: the entry guard above
           // covers what precedes `store.deleteByPath`, not the await itself
           // — re-check once more before the write.
           if (disposed) return;
-          await writeManifest(manifest);
+          await gate.sink(() => writeManifest(manifest));
           return;
         }
         // Task 14b: the incremental path shares the SAME embedder instance
@@ -1191,7 +1198,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
           // exact orphan/drift defect AU-23 named — on the commonest path
           // (every ordinary file change). Skip the write, still propagate.
           if (disposed) throw err;
-          await writeManifest(manifest);
+          await gate.sink(() => writeManifest(manifest));
           throw err;
         }
         // TA-5 (AU-23, Critical remediation) / INV-5: same hazard as the
@@ -1199,7 +1206,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
         // firing during reindexFiles's embed await must not let this
         // continuation write `manifest` afterward.
         if (disposed) return;
-        await writeManifest(manifest);
+        await gate.sink(() => writeManifest(manifest));
       });
     }
 
