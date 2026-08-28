@@ -1264,7 +1264,12 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     // `store.init()` instead of genuinely reinitializing against a fresh
     // (post-close) store.
     initPromise = undefined;
-    void store.close();
+    // F3-11: flip the gate (sinks refused synchronously), await the in-flight
+    // buildChain tail bounded by the drain deadline, THEN close the store — no
+    // more closing under an active chain. gate.close never rejects/wedges.
+    void gate.close(buildChain).finally(() => {
+      void store.close();
+    });
     // AU-35 (TA-9): the parser's cached `Parser`/`Tree` native handles were
     // never freed on indexer teardown before this — deferred here from
     // TA-5. Optional per `CodeParser` (a test stand-in owns no native

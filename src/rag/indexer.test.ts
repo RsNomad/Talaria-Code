@@ -1885,25 +1885,33 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
     // Fire dispose() from INSIDE the sweep loop's own awaited
     // `store.deleteByPath('dir/a.txt')` — the loop's first iteration, not
     // the entry guard's `readManifest`/first `deleteByPath('dir')` the
-    // earlier TA-5 pass already covers (indexer.ts:880). The loop has no
-    // per-iteration `disposed` check by design (deleteByPath no-ops on a
-    // closed store — `LanceDBStore.ts:362-364`), so it keeps running; the
-    // fix under test is the WRITE after it.
+    // earlier TA-5 pass already covers (indexer.ts:880).
+    //
+    // F3-11 ripple: dispose() now flips the shared `gate` (A2), and the
+    // flip is synchronous — a `gate.sink()` call issued later in this SAME
+    // synchronous loop (the 'dir/b.txt' iteration, right after this one)
+    // is therefore refused outright: `store.deleteByPath('dir/b.txt')` is
+    // never even invoked. This is a STRONGER guarantee than the old
+    // per-branch `disposed` checks (which relied on the by-then-closed
+    // store's own `deleteByPath` no-op, `LanceDBStore.ts:362-364`) — the
+    // choke point now sits one level up, at the gate itself. Only
+    // `deleteByPathMock` calls that happened before the flip ('dir', then
+    // 'dir/a.txt' which triggers the flip) are observed.
     deleteByPathMock.mockImplementation(async (p: string) => {
       if (p === 'dir/a.txt') indexer.dispose();
     });
 
     const onDelete = fsWatcherListeners.delete[0]!;
     onDelete({ fsPath: path.join(workspaceRoot, 'dir') });
-    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'dir/b.txt'));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.length >= 2);
 
-    // Fails at HEAD: the loop purges both children from the in-memory
-    // manifest object regardless of `disposed`, then `writeManifest` at
-    // indexer.ts:896 runs unconditionally, persisting the now-empty
-    // manifest to disk even though dispose() fired mid-sweep.
-    expect(deleteByPathMock.mock.calls.map(([p]) => p)).toEqual(
-      expect.arrayContaining(['dir/a.txt', 'dir/b.txt']),
-    );
+    // Fails at HEAD (pre-F3-11, dispose() never flipped the gate): the loop
+    // purged both children from the in-memory manifest object regardless of
+    // `disposed`, then `writeManifest` at indexer.ts:896 ran unconditionally,
+    // persisting the now-empty manifest to disk even though dispose() fired
+    // mid-sweep. Post-F3-11, 'dir/b.txt' is refused by the gate before ever
+    // reaching `store.deleteByPath`.
+    expect(deleteByPathMock.mock.calls.map(([p]) => p)).toEqual(['dir', 'dir/a.txt']);
     const manifestAfter = await readManifest();
     expect(manifestAfter).toEqual(seedManifest);
 
@@ -2232,5 +2240,88 @@ describe('F2-12: incremental-reindex failure — logger seam + counter + path-di
 
     disposable.dispose();
     indexer.dispose();
+  });
+});
+
+/**
+ * F3-11: `dispose()` used to close the store EAGERLY (`void store.close()`,
+ * unconditional) even while `buildChain` had an in-flight run — the same
+ * "mutation races the teardown it should be gated by" shape TA-5/AU-23
+ * closed for the individual store/manifest sinks, just one level up, at the
+ * store handle itself. The fix routes dispose() through `gate.close
+ * (buildChain)`: the gate flips (sinks refused) synchronously, THEN the
+ * caller-supplied `buildChain` drain is awaited (bounded by
+ * `MUTATION_GATE_DRAIN_DEADLINE_MS`), and only then does `store.close()` run.
+ */
+describe('F3-11: dispose() drains the in-flight buildChain before closing the store', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-f3-11-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    closeMock.mockImplementation(async () => {});
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    closeMock.mockImplementation(async () => {});
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it('F3-11: dispose() drains the in-flight buildChain before closing the store', async () => {
+    await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'real content to embed\n', 'utf8');
+    const indexer = createIndexer({
+      workspaceRoot, indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+    });
+
+    // Hold the embed open so the build is genuinely in-flight when dispose fires.
+    let releaseEmbed!: () => void;
+    const embedGate = new Promise<void>((r) => { releaseEmbed = r; });
+    embedMock.mockImplementationOnce(async (texts: string[]) => {
+      await embedGate;
+      return texts.map(() => [0.1, 0.2, 0.3]);
+    });
+
+    const building = indexer.build();
+    await vi.advanceTimersByTimeAsync(0); // let the build reach the held embed
+    closeMock.mockClear();
+
+    indexer.dispose();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closeMock).not.toHaveBeenCalled(); // store NOT closed while chain is in-flight
+
+    releaseEmbed();
+    await building.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closeMock).toHaveBeenCalledTimes(1); // closed AFTER the drain
+  });
+
+  it('F3-11: dispose() still closes the store after the drain deadline if the chain never settles', async () => {
+    const indexer = createIndexer({
+      workspaceRoot, indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+    });
+    embedMock.mockImplementationOnce(() => new Promise<number[][]>(() => { /* never resolves */ }));
+    await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+    void indexer.build();
+    await vi.advanceTimersByTimeAsync(0);
+    closeMock.mockClear();
+
+    indexer.dispose();
+    await vi.advanceTimersByTimeAsync(11_000); // past MUTATION_GATE_DRAIN_DEADLINE_MS (10s)
+    expect(closeMock).toHaveBeenCalledTimes(1);
   });
 });
