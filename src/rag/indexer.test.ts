@@ -1508,6 +1508,12 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
       const disposable = indexer.watch();
 
       const manifestPath = path.join(indexDir, 'manifest.json');
+      // close-out (test-hygiene): baseline-delta instead of a bare `.some()`
+      // — the SAME pattern the file uses elsewhere (e.g. the TA-6 tests
+      // below) — so a future edit that inserts a PRE-event manifest write
+      // can never satisfy this predicate prematurely; only a rename that
+      // lands AFTER this baseline is captured counts.
+      const renamesBefore = renameCommits.filter(([, to]) => to === manifestPath).length;
       fsWatcherListeners.change[0]!({ fsPath: aliasAbs });
       // B1a: wait for the upsert AND the manifest write's rename commit to
       // have actually landed — the upsert call alone is not a sufficient
@@ -1516,7 +1522,9 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
       // longer reads the live manifest file to observe that.
       await flushWatch(
         5,
-        () => upsertedPaths().includes('alias/doc.txt') && renameCommits.some(([, to]) => to === manifestPath),
+        () =>
+          upsertedPaths().includes('alias/doc.txt') &&
+          renameCommits.filter(([, to]) => to === manifestPath).length > renamesBefore,
       );
 
       // (a) THE RED PAIR — the reindex read must hit the CONFINED canonical
@@ -2665,19 +2673,17 @@ describe('WS-R2 A5: AU-23 class is dead — dispose mid-await mutates nothing', 
     // IMPLEMENTER FIX (A5 verification finding — see task-A5-report.md):
     // a plain `mockImplementationOnce` is a FIFO queue SHARED across this
     // whole file's `embedMock`. An unrelated EARLIER test ("F3-11: dispose()
-    // still closes the store after the drain deadline...") deliberately
-    // leaves an unawaited `void indexer.build()` chain permanently stuck on
-    // `new Promise(() => {})`; verified empirically that this dangling chain
-    // can still make real progress on later real-fs/microtask turns (this
-    // test's own drain turns included) and steal a plain queued `once` block
-    // before THIS test's own real call ever reaches it — the queued body
-    // never even started executing, yet the real call still completed and
-    // upserted for real, because it fell through to whatever base
-    // `mockImplementation` a prior describe block left behind. Gating on
-    // THIS call's own content makes the block immune to queue position and
-    // to any other in-flight call: whichever invocation actually carries
-    // this file's content is the one that blocks; anything else (e.g. that
-    // dangling chain's own, differently-worded content) resolves normally.
+    // still closes the store after the drain deadline...") parks a build
+    // chain on a controllable hung embed and — as of ISO-1 — captures,
+    // rejects, and awaits that same chain in its own cleanup, so it no
+    // longer outlives that test. This block's content-gated mock remains a
+    // correct defensive backstop regardless: it no longer needs to defend
+    // against a permanently-stuck chain, but gating on THIS call's own
+    // content still makes the block immune to queue position and to any
+    // other in-flight call (e.g. one from a test that hasn't reached its own
+    // cleanup yet) — whichever invocation actually carries this file's
+    // content is the one that blocks; anything else (differently-worded
+    // content) resolves normally.
     embedMock.mockReset(); // drop any stale queued `once` entries left by earlier tests
     embedMock.mockImplementation(async (texts: string[]) => {
       if (texts.some((t) => t.includes(CONTENT_MARKER))) await embedGate;
