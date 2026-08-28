@@ -25,6 +25,40 @@ import { reindexFiles, type IndexerContext } from './buildPipeline';
 import { toPosixRelative } from './gitignore';
 
 /**
+ * B8 (FUNC-INDEXER) / WV3-MIN-FUNC: the three destructive `handleFsEvent`
+ * branches below (delete, secret-path, unconfinable-path) share this exact
+ * shape — purge each of `keys` from the store, one `gate.sink` per key IN
+ * ORDER, stripping each from the in-memory `manifest` as it goes, then
+ * (after one final disposed re-check) persist the result.
+ *
+ * Deliberately NO per-key `disposed` re-check inside the loop: the gate's
+ * OWN synchronous closed-check is what stops a later key once dispose()
+ * fires mid-loop (F3-11) — pinned by the delete-branch sweep's RED test
+ * (`indexer.test.ts`: dispose() firing inside the first swept key's
+ * `deleteByPath` flips the gate synchronously, so the NEXT key's
+ * `gate.sink` is refused before `store.deleteByPath` is ever invoked for
+ * it). Callers own the entry-guard `if (ctx.isDisposed()) return;` BEFORE
+ * calling this (not repeated here) and `return` right after — matching
+ * every branch's original control flow verbatim.
+ */
+async function purgeAndPersist(
+  ctx: IndexerContext,
+  manifest: Record<string, string>,
+  keys: readonly string[],
+): Promise<void> {
+  for (const key of keys) {
+    await ctx.gate.sink(() => ctx.store.deleteByPath(key));
+    delete manifest[key];
+  }
+  // TA-5 (AU-23, Critical remediation) / INV-5: the loop above awaits
+  // `store.deleteByPath` once per key — `dispose()` can fire during any one
+  // of those awaits, same hazard as every other await in this function.
+  // Re-check once more, after the whole purge, right before the write.
+  if (ctx.isDisposed()) return;
+  await ctx.gate.sink(() => ctx.writeManifest(manifest));
+}
+
+/**
  * B8 (FUNC-INDEXER): the `watch()` body, moved verbatim out of
  * `createIndexer` — see `buildPipeline.ts`'s `IndexerContext` doc comment
  * for why `fs` stays a direct `node:fs` import here rather than a ctx field.
@@ -100,8 +134,6 @@ export function createWatch(
         // path's manifest entry — the exact orphan-row/manifest-drift
         // AU-23 named.
         if (ctx.isDisposed()) return;
-        await ctx.gate.sink(() => ctx.store.deleteByPath(relPath));
-        delete manifest[relPath];
         // AUDIT-5 ARCH-5 (F-1 final): delete-event granularity is platform/
         // watcher-dependent — a directory delete may arrive as ONE event
         // for the dir with no per-file events, which used to leave every
@@ -109,19 +141,12 @@ export function createWatch(
         // manifest enumerates every indexed path, so sweep it by prefix —
         // exact-match store deletes per swept key, no LIKE-predicate
         // escaping needed, idempotent when per-file events also arrive.
-        for (const key of Object.keys(manifest)) {
-          if (key.startsWith(`${relPath}/`)) {
-            await ctx.gate.sink(() => ctx.store.deleteByPath(key));
-            delete manifest[key];
-          }
-        }
-        // AU-23 re-review (TA-5 completion) / INV-5: the loop above awaits
-        // `store.deleteByPath` per swept key — `dispose()` can fire during
-        // any one of those awaits, same hazard as every other await in
-        // this function. The entry guard above only covers what precedes
-        // the loop; re-check once more, after it, right before the write.
-        if (ctx.isDisposed()) return;
-        await ctx.gate.sink(() => ctx.writeManifest(manifest));
+        // WV3-MIN-FUNC: relPath itself, THEN every already-swept key, in
+        // the SAME order `Object.keys(manifest)` would yield here (relPath
+        // can never match its own `${relPath}/` prefix, so computing this
+        // list before deleting relPath is equivalent to computing it after).
+        const sweptKeys = Object.keys(manifest).filter((key) => key.startsWith(`${relPath}/`));
+        await purgeAndPersist(ctx, manifest, [relPath, ...sweptKeys]);
         return;
       }
       if (isSecretForCompletion(relPath)) {
@@ -131,13 +156,7 @@ export function createWatch(
         // A newly-created/changed secret-path file (e.g. a fresh `.env`)
         // must never be indexed. Best-effort purge in case it was somehow
         // already stored (mirrors build()'s self-heal purge pass).
-        await ctx.gate.sink(() => ctx.store.deleteByPath(relPath));
-        delete manifest[relPath];
-        // AU-23 re-review (TA-5 completion) / INV-5: the entry guard above
-        // covers what precedes `store.deleteByPath`, not the await itself
-        // — re-check once more before the write.
-        if (ctx.isDisposed()) return;
-        await ctx.gate.sink(() => ctx.writeManifest(manifest));
+        await purgeAndPersist(ctx, manifest, [relPath]);
         return;
       }
       // AUDIT-5 ARCH-2: watch/build symmetry + containment. runBuild's
@@ -171,13 +190,7 @@ export function createWatch(
         // above both await — same re-check, same reason as the two
         // branches above.
         if (ctx.isDisposed()) return;
-        await ctx.gate.sink(() => ctx.store.deleteByPath(relPath));
-        delete manifest[relPath];
-        // AU-23 re-review (TA-5 completion) / INV-5: the entry guard above
-        // covers what precedes `store.deleteByPath`, not the await itself
-        // — re-check once more before the write.
-        if (ctx.isDisposed()) return;
-        await ctx.gate.sink(() => ctx.writeManifest(manifest));
+        await purgeAndPersist(ctx, manifest, [relPath]);
         return;
       }
       // Task 14b: the incremental path shares the SAME embedder instance
