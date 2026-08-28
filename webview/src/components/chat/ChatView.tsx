@@ -2,7 +2,7 @@
  * Renders the streaming transcript. Auto-scrolls to the newest item unless the
  * user has scrolled up to read history. Dispatches diff / approval resolutions.
  */
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { TranscriptItem, ToolItem } from '../../types';
 import { Hero } from '../Hero';
 import { Icon } from '../Icon';
@@ -364,8 +364,21 @@ export const ChatView = memo(function ChatView({
    * a turn start, so the effect below can tell "this turn's transcript grew
    * again" from "a NEW turn just began" without a dedicated prop. */
   const lastTurnIdRef = useRef<string | undefined>(undefined);
-  const pendingToolIds = pendingDiffToolIds(transcript);
-  const deniedIds = deniedToolIds(transcript);
+  // CA-M14: all four scans are pure functions of `transcript` alone — wrap
+  // them in ONE memo keyed on `transcript` so they recompute only when the
+  // transcript array's reference actually changes, not on every ChatView
+  // render (a scroll/pin state change re-renders this component without
+  // touching `transcript`; see this component's own `React.memo` doc above
+  // for why a draft-keystroke fold preserves `tab.transcript`'s identity).
+  const { pendingToolIds, deniedIds, pendingApproval, settlement } = useMemo(
+    () => ({
+      pendingToolIds: pendingDiffToolIds(transcript),
+      deniedIds: deniedToolIds(transcript),
+      pendingApproval: pendingApprovalAnnouncement(transcript),
+      settlement: settlementAnnouncement(transcript),
+    }),
+    [transcript],
+  );
 
   // Track whether the user is pinned to the bottom. UI#1: buffer raised
   // 48px -> 100px (see REPIN_BUFFER_PX doc).
@@ -433,13 +446,13 @@ export const ChatView = memo(function ChatView({
        * assertive announcer onto that same element would fight it). Stays
        * mounted at all times (Finding-7 discipline) and only its text
        * changes; `sr-only` keeps it out of the visual layout. */}
-      <LiveRegion text={pendingApprovalAnnouncement(transcript)} assertive className="sr-only" />
+      <LiveRegion text={pendingApproval} assertive className="sr-only" />
       {/* T-A2-SC4: a SEPARATE polite region for settlement disclosure — a
        * state change inside `role="log"` is not reliably announced, and the
        * assertive region above only ever speaks PENDING approvals (it goes
        * silent, not descriptive, the instant one settles). Same
        * always-mounted, text-swap-only discipline as the assertive sibling. */}
-      <LiveRegion text={settlementAnnouncement(transcript)} className="sr-only" />
+      <LiveRegion text={settlement} className="sr-only" />
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div
           ref={scrollRef}

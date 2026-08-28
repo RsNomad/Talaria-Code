@@ -444,3 +444,32 @@ describe('ChatView UX-07 (pre-first-token waiting indicator)', () => {
     expect(screen.queryByText('Waiting for the agent…')).toBeNull();
   });
 });
+
+/**
+ * CA-M14 (perf): `pendingDiffToolIds`, `deniedToolIds`,
+ * `pendingApprovalAnnouncement`, and `settlementAnnouncement` are wrapped in
+ * one `useMemo(() => ({...}), [transcript])` so they recompute only when the
+ * `transcript` array reference changes, not on every `ChatView` render
+ * (scroll/pin state changes re-render this component without touching
+ * `transcript`). This is a behavior-preserving pure-memo change — these cases
+ * pin the OBSERVABLE OUTPUT of the four scans so the refactor cannot silently
+ * change what gets rendered/announced. (No counting genuine-RED: the four
+ * scans are file-local functions that cannot be spied on from a test.)
+ */
+describe('CA-M14: memoized transcript scans render identically', () => {
+  it('a pending approval still announces (assertive region text unchanged)', () => {
+    renderChatView([userItem(), approvalItem({ title: 'Edit: src/a.ts' })]);
+    expect(screen.getByRole('alert')).toHaveTextContent('Approval required: Edit: src/a.ts');
+  });
+
+  it('a settled (expired) approval still drives the polite settlement region', () => {
+    renderChatView([userItem(), approvalItem({ title: 'Edit: src/a.ts', settledOutcome: 'expired' })]);
+    expect(screen.getByRole('status')).toHaveTextContent('Approval expired — automatically denied: Edit: src/a.ts');
+  });
+
+  it('no pending/settled approval → both regions render empty (no spurious announcement)', () => {
+    renderChatView([userItem(), messageItem({ text: 'done' })]);
+    expect(screen.getByRole('alert')).toHaveTextContent('');
+    expect(screen.getByRole('status')).toHaveTextContent('');
+  });
+});
