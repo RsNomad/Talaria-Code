@@ -43,7 +43,7 @@ import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
 import { reduceNextEdit } from './fsm';
 import { genericInstructFormat } from './formats/genericInstruct';
 import { sweepV2Format } from './formats/sweepV2';
-import type { NextEditFormat } from './formats/types';
+import type { NextEditFormat, RenderedNextEditPrompt } from './formats/types';
 import { NextEditGuard } from './guard';
 import { resolveNextEditMode, type NextEditMode, type ToggleRequest, type ToggleState } from './mode';
 import { mintScannedNextEditRequest, NextEditMintRejectionError } from './scan';
@@ -781,28 +781,27 @@ function toContentChangeLites(
 // ─────────────────────────────── registration ────────────────────────────────
 
 /**
- * Wires next-edit into VS Code. Called from `index.ts` beside
- * `registerTalariaAutocomplete`, with a Guard already hydrated from the
- * `talaria.nextEdit.source` config port (Task 2 §5.5).
+ * FUNC-NEXTEDIT — the shell, promoted from a 770-line closure to a class.
+ * The closure already received its deps as parameters (the Fowler parameter
+ * seam); the constructor takes the same three. Every method body is the
+ * closure's body moved verbatim — behavior is pinned by the T15 ordered
+ * traces and the pre-existing shell suite (zero assertion edits).
+ * Module-private: the ONLY public entry stays `registerTalariaNextEdit`.
  */
-export function registerTalariaNextEdit(
-  context: vscode.ExtensionContext,
-  guard: NextEditGuard,
-  deps: NextEditShellDeps,
-): vscode.Disposable {
-  let disposed = false;
-  let state: NextEditFsmState = { kind: 'idle' };
+class NextEditShell {
+  private disposed = false;
+  private state: NextEditFsmState = { kind: 'idle' };
   /** The document version the live proposal is anchored to. `null` when idle.
    *  This is the freshness token the Global Constraints keep in the shell. */
-  let trackedVersion: number | null = null;
+  private trackedVersion: number | null = null;
   /** BHF-F3-15 — the freshness pair for the applyEdit effect this dispatch
    *  may emit, captured BEFORE the reducer can transition to idle (tabAccept
    *  does) and null the tracking state below. */
-  let pendingApplyExpectation: ApplyExpectation | null = null;
+  private pendingApplyExpectation: ApplyExpectation | null = null;
   /** The next-edit request in flight, if any. Aborted by a FIM start (R2) and
    *  by the next next-edit trigger (single-flight). NEVER the reverse: this
    *  module holds no FIM cancellation handle at all. */
-  let inFlight: AbortController | null = null;
+  private inFlight: AbortController | null = null;
 
   /**
    * R2's view of what FIM is doing. `inFlightCount` is a REFCOUNT, not a
@@ -816,13 +815,8 @@ export function registerTalariaNextEdit(
    * live FIM request — precisely what R2 forbids. Counting makes "FIM is
    * idle" mean what it says: every started request has settled.
    */
-  const fim = { visible: false, inFlightCount: 0 };
-  /** GATE 2's predicate, and the same one the post-round-trip freshness
-   *  re-check uses — one definition so the two can never drift apart. */
-  function fimBusy(): boolean {
-    return fim.visible || fim.inFlightCount > 0;
-  }
-  const debouncer = new AutocompleteDebouncer();
+  private readonly fim = { visible: false, inFlightCount: 0 };
+  private readonly debouncer = new AutocompleteDebouncer();
 
   /**
    * CF-20-lazy — `createEditTrackerAdapter()` is next-edit's HALF of two
@@ -849,25 +843,7 @@ export function registerTalariaNextEdit(
    * would also (for the reason that lock exists) risk answering
    * differently mid-flight from the read `trigger()` already took.
    */
-  let editTrackerInstance: EditTrackerAdapter | null = null;
-  function ensureEditTracker(): EditTrackerAdapter {
-    if (editTrackerInstance === null) {
-      editTrackerInstance = createEditTrackerAdapter();
-    }
-    return editTrackerInstance;
-  }
-  function buildEditTrackerOnToggleOn(toggles: ToggleState): void {
-    if (resolveNextEditMode(toggles.next, toggles.generic) !== 'off') {
-      ensureEditTracker();
-    }
-  }
-  // Covers a Guard hydrated ALREADY on (state persisted from a previous
-  // session) — no `onDidChange` event fires this session in that case, so
-  // without this check the adapter would never be built at all and
-  // next-edit would run silently inert (no pre-edit shadow, an always-empty
-  // diff ring) until the user toggled it off and back on.
-  buildEditTrackerOnToggleOn(guard.getState());
-  const guardToggleSubscription = guard.onDidChange(buildEditTrackerOnToggleOn);
+  private editTrackerInstance: EditTrackerAdapter | null = null;
 
   /**
    * F-4 — the one-shot failure surface, mirroring `provider.ts`'s
@@ -885,162 +861,408 @@ export function registerTalariaNextEdit(
    *
    * No timers, no counters, no state beyond this Set.
    */
-  const surfacedFailures = new Set<string>();
-  function surfaceOnce(key: string, message: string): void {
-    if (surfacedFailures.has(key)) return;
-    surfacedFailures.add(key);
-    deps.reportFailure(message);
+  private readonly surfacedFailures = new Set<string>();
+
+  // Two decoration types, created ONCE for the whole activation.
+  private readonly regionDecoration: vscode.TextEditorDecorationType;
+  private readonly locatorDecoration: vscode.TextEditorDecorationType;
+
+  /**
+   * The executor's host port. Built in the constructor; its methods MUST be
+   * arrow-bodied object properties so `this` inside them binds to the shell
+   * instance — they reference `this.editorFor`, `this.currentProposal`, and
+   * the decoration fields above.
+   */
+  private readonly executorHost: NextEditExecutorHost;
+  private readonly executor: NextEditExecutor;
+
+  /**
+   * Held under its own name so `dispose()` below can prove it still OWNS the
+   * module-level relay slot before clearing it — `currentFimActivity` is a
+   * single shared slot, and a newer registration may already have taken it.
+   */
+  private readonly fimActivity: FimActivityListener;
+
+  readonly disposable: vscode.Disposable;
+
+  constructor(
+    context: vscode.ExtensionContext,
+    private readonly guard: NextEditGuard,
+    private readonly deps: NextEditShellDeps,
+  ) {
+    // Covers a Guard hydrated ALREADY on (state persisted from a previous
+    // session) — no `onDidChange` event fires this session in that case, so
+    // without this check the adapter would never be built at all and
+    // next-edit would run silently inert (no pre-edit shadow, an always-empty
+    // diff ring) until the user toggled it off and back on.
+    this.buildEditTrackerOnToggleOn(this.guard.getState());
+    const guardToggleSubscription = this.guard.onDidChange((toggles) => this.buildEditTrackerOnToggleOn(toggles));
+
+    this.regionDecoration = vscode.window.createTextEditorDecorationType({
+      isWholeLine: true,
+      backgroundColor: new vscode.ThemeColor('diffEditor.insertedLineBackground'),
+    });
+    this.locatorDecoration = vscode.window.createTextEditorDecorationType({});
+
+    this.executorHost = {
+      setContext: (key, value) => {
+        void vscode.commands.executeCommand('setContext', key, value);
+      },
+      showDecorations: (p, jumped) => {
+        const editor = this.editorFor(p.region.uri);
+        // F-1: DECLINE rather than silently no-op. The executor turns a declined
+        // paint into a full `clearAll`, so `jumpVisible` can never stand up
+        // against an empty screen (and Tab can never be stolen in a file that
+        // has no proposal).
+        if (editor === undefined) return false;
+        const regionRange = new vscode.Range(p.region.startLine, 0, p.region.endLine, 0);
+        editor.setDecorations(this.regionDecoration, [regionRange]);
+
+        // U-7 — the SPAN, in the 1-based coordinates the gutter shows, not a
+        // "distance". `regionAroundCursor` returns cursor ± windowLines, so the
+        // old `|startLine − cursorLine|` was the CONSTANT `windowLines` for
+        // every proposal past line 10, and its `⤵` pointed DOWN at a region
+        // that starts ten lines ABOVE the cursor. This says something the user
+        // can check against their own gutter.
+        const firstLine = p.region.startLine + 1;
+        const lastLine = p.region.endLine + 1;
+        const verb = jumped ? 'Tab to accept' : 'Tab to jump';
+        const lineLength = editor.document.lineAt(p.cursorLine).text.length;
+        // Zero-width end-of-line range on the CURSOR line — the locator rides
+        // where the user is looking, not where the edit is.
+        const locatorRange = new vscode.Range(p.cursorLine, lineLength, p.cursorLine, lineLength);
+        editor.setDecorations(this.locatorDecoration, [
+          {
+            range: locatorRange,
+            renderOptions: {
+              after: {
+                // U-7: `08` §10 pins this copy as `⤵ N lines · <verb> · Esc to
+                // dismiss`. The verb and the Esc clause are kept verbatim; the
+                // leading clause is the one the final review found to be
+                // untrue in every case, so it now reports the span instead of a
+                // constant. `⇕` because the region brackets the cursor (it is
+                // cursor ± windowLines) — it never lies below it, which is what
+                // `⤵` claimed. Visual separation from the code is `margin`'s
+                // job, never padding baked into the string.
+                contentText: `⇕ lines ${firstLine}–${lastLine} · ${verb} · Esc to dismiss`,
+                margin: '0 0 0 1em',
+                color: new vscode.ThemeColor('editorGhostText.foreground'),
+              },
+            },
+          },
+        ]);
+        return true;
+      },
+      clearDecorations: () => {
+        for (const editor of vscode.window.visibleTextEditors) {
+          editor.setDecorations(this.regionDecoration, []);
+          editor.setDecorations(this.locatorDecoration, []);
+        }
+      },
+      reveal: (range) => {
+        // F-1: `range` is bare line geometry — it carries no uri of its own, so
+        // an unqualified `activeTextEditor` would happily scroll a FOREIGN file
+        // to line numbers taken from the proposal's document. The live proposal
+        // is the range's only owner (`reveal` is emitted solely by
+        // `proposed × tabJump`, whose `p` is the state the shell already holds),
+        // so resolve the editor through the SAME `editorFor` identity check the
+        // paint uses — one definition, so the two cannot drift.
+        const proposal = this.currentProposal();
+        const editor = proposal === null ? undefined : this.editorFor(proposal.region.uri);
+        if (editor === undefined) return;
+        editor.revealRange(
+          new vscode.Range(range.startLine, 0, range.endLine, 0),
+          vscode.TextEditorRevealType.InCenterIfOutsideViewport,
+        );
+      },
+      applyEdit: async (region, newText, expected) => {
+        // A plain WorkspaceEdit — never the ACP diff-decision gate (Global
+        // Constraints). This is the user's own accepted edit in their own
+        // editor, not an agent-proposed change needing approval.
+        //
+        // BHF-F3-15 — fail-closed re-validation, immediately before the edit:
+        if (expected === null) return false;
+        const editor = this.editorFor(region.uri);
+        if (editor === undefined) return false;
+        const document = editor.document;
+        // (1) VERSION: `TextDocument.version` strictly increases on every
+        // change — any interleaved edit in the dispatch→apply gap fails this.
+        if (document.version !== expected.docVersion) return false;
+        const endLine = Math.min(region.endLine, document.lineCount - 1);
+        const range = new vscode.Range(
+          region.startLine,
+          0,
+          endLine,
+          document.lineAt(endLine).text.length,
+        );
+        // (2) BASE TEXT: the bytes being replaced must be the bytes the
+        // proposal was anchored to — the belt for anything version cannot
+        // see (e.g. a reanchor-drift bug). getText(range) clamps, mirroring
+        // the proposal-time read.
+        if (document.getText(range) !== expected.baseText) return false;
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(document.uri, range, newText);
+        // `workspace.applyEdit` resolves false when the edit could not be
+        // applied (all-or-nothing for text-only edits) — that residual-window
+        // failure reports through the same boolean.
+        return vscode.workspace.applyEdit(edit);
+      },
+      note: (msgId) => {
+        const message = NOTE_MESSAGES[msgId] ?? `Next Edit: ${msgId}`;
+        this.deps.reportFailure(message);
+        void vscode.window.showWarningMessage(message);
+      },
+    };
+
+    this.executor = makeExecutor(
+      this.executorHost,
+      (ok) => this.dispatch({ kind: 'applyResult', ok }),
+      () => this.pendingApplyExpectation,
+    );
+
+    this.fimActivity = {
+      requestStarted: () => {
+        this.fim.inFlightCount += 1;
+        try {
+          // R2, the direction that matters: FIM-start aborts next-edit. Never
+          // the reverse — nothing in this module can cancel a FIM request.
+          this.abortInFlight();
+          this.dispatch({ kind: 'fimVisibility', visible: true });
+        } catch {
+          // Must not escape this call: `provider.ts` sets its own
+          // `fimRequested` flag only AFTER `requestStarted()` returns, and
+          // only a set flag makes its `finally` call the paired
+          // `resultShown` later. A throw here (e.g. `dispatch()` reaching a
+          // throwing host) would skip that flag and strand the increment
+          // above forever — unlike the boolean this refcount replaced, it
+          // does not self-heal on the next FIM cycle. The count's integrity
+          // matters more than reporting whatever failed downstream.
+        }
+      },
+      resultShown: (hasItem: boolean) => {
+        if (this.fim.inFlightCount === 0) {
+          // UNPAIRED settle: a settle whose `requestStarted` was delivered to
+          // a PREVIOUS registration (the relay swapped while that request was
+          // in flight), or a stray duplicate — either way nothing of ours is
+          // outstanding to count out. Complete no-op: touching `visible` here
+          // could silently clear a GENUINELY visible ghost-text flag set by a
+          // real, unrelated request, reopening GATE 2 against R2.
+          return;
+        }
+        this.fim.inFlightCount -= 1;
+        // SUPERSEDED settle — a NEWER FIM request is still in flight, so this
+        // result speaks for a request VS Code has already cancelled and whose
+        // item it discarded. It may not report on visibility at all: the
+        // newest request is the one that gets to settle that, and until it
+        // does the refcount above holds GATE 2 closed on its own. Treating a
+        // stale settle as authoritative is what let a boolean `visible` be
+        // cleared out from under a live FIM request.
+        if (this.fim.inFlightCount > 0) return;
+        // Conservative visibility: a non-null item COUNTS as on screen, even
+        // though VS Code may still decline to render it.
+        this.fim.visible = hasItem;
+        this.dispatch({ kind: 'fimVisibility', visible: hasItem });
+      },
+      accepted: () => {
+        // The ghost text was consumed, so FIM is no longer on screen — and this
+        // is the R4 seam: the post-FIM-accept moment is exactly when a next
+        // edit is most likely to exist.
+        //
+        // The refcount is deliberately NOT zeroed here. `provider.ts` pairs
+        // every `requestStarted` with a `resultShown` in its own `finally`, so
+        // the request that produced this accepted item has already been counted
+        // out; any count still standing belongs to a LATER request that is
+        // genuinely in flight. Zeroing it would discard that and reopen GATE 2
+        // against R2 — the armed trigger below simply waits for it instead.
+        this.fim.visible = false;
+        this.dispatch({ kind: 'fimVisibility', visible: false });
+        this.armTrigger();
+      },
+      // Safe to answer unconditionally: this object only ever reaches the relay
+      // AFTER the command below is registered (see the attach site at the end of
+      // this function), and it leaves the relay when this registration disposes.
+      acceptCommandId: () => FIM_ACCEPT_COMMAND,
+    };
+
+    // ── listeners ────────────────────────────────────────────────────────────
+
+    const changeSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
+      // CF-19 — GATE-4 parity: a non-recordable scheme (Output/SCM/etc.) must
+      // not arm anything at all. Before this guard, `armTrigger()` ran
+      // unconditionally on EVERY `onDidChangeTextDocument` event regardless of
+      // which document changed, so edit-burst noise from an unrelated
+      // Output/SCM document could arm (and eventually fire) a next-edit
+      // request against the CURRENT active editor — a document GATE-4 would
+      // separately have to be scheme-valid on its own, but the arm itself
+      // never checked the document that actually changed.
+      if (!isRecordableScheme(e.document.uri.scheme)) return;
+
+      // Source 2 of the ONE trigger path: the debounced edit burst. Armed
+      // unconditionally (once past the scheme guard above) — `trigger()`
+      // itself resolves which editor/document is current, so no editor lookup
+      // is needed (or wanted) this early.
+      this.armTrigger();
+
+      const proposal = this.currentProposal();
+      if (proposal === null || proposal.region.uri !== e.document.uri.toString()) return;
+
+      if (e.contentChanges.length === 0) {
+        // A metadata-only event (dirty-flag, EOL, save) still bumps `version`.
+        // Nothing textual moved, so re-baseline instead of dismissing.
+        this.trackedVersion = e.document.version;
+        return;
+      }
+
+      if (this.trackedVersion === null || e.document.version !== this.trackedVersion + 1) {
+        // Versions skipped ⇒ at least one change event never reached us, so the
+        // changes in hand cannot describe the full delta. Fail closed.
+        this.dispatch({ kind: 'docChanged', remapped: null });
+        return;
+      }
+
+      const remapped = remapRange(
+        { startLine: proposal.region.startLine, endLine: proposal.region.endLine },
+        toContentChangeLites(e.contentChanges),
+      );
+      this.trackedVersion = e.document.version;
+      this.dispatch({ kind: 'docChanged', remapped });
+    });
+
+    const activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor(() => {
+      // C-6 — the one clearer `fim.visible` can safely have. Esc on ghost text
+      // is unobservable on the stable API, so nothing but the NEXT FIM request
+      // settling ever lowered this flag; disable FIM in between and GATE 2 stays
+      // shut for the rest of the session with no ghost text on screen at all.
+      //
+      // Why THIS event and not `onDidChangeTextDocument`: an inline suggestion
+      // is painted into ONE editor and cannot outlive it being switched away
+      // from, so clearing here cannot let next-edit build against ghost text
+      // that is genuinely on screen. A document change would be the wrong
+      // signal — the ordinary keystroke path fires it BEFORE FIM's provider is
+      // invoked, so it would reopen the gate in exactly the window R2 exists to
+      // close.
+      //
+      // `inFlightCount` is deliberately NOT touched: a FIM request in flight
+      // survives an editor switch, and it alone must keep the gate shut.
+      this.fim.visible = false;
+      this.dispatch({ kind: 'editorChanged' });
+    });
+
+    const windowStateSubscription = vscode.window.onDidChangeWindowState((windowState) => {
+      if (!windowState.focused) {
+        this.dispatch({ kind: 'focusLost' });
+      }
+    });
+
+    // ── commands (registered ONCE) ───────────────────────────────────────────
+
+    const jumpCommand = vscode.commands.registerCommand('talaria.nextEdit.jump', () => {
+      this.dispatch({ kind: 'tabJump' });
+    });
+    const acceptCommand = vscode.commands.registerCommand('talaria.nextEdit.accept', () => {
+      this.dispatch({ kind: 'tabAccept' });
+    });
+    const dismissCommand = vscode.commands.registerCommand('talaria.nextEdit.dismiss', () => {
+      this.dispatch({ kind: 'esc' });
+    });
+    // The R4 seam: fired by the InlineCompletionItem's own `command`, which VS
+    // Code executes when the user ACCEPTS the FIM ghost text.
+    const onFimAcceptCommand = vscode.commands.registerCommand(FIM_ACCEPT_COMMAND, () => {
+      fimActivityRelay.accepted();
+    });
+
+    // ATTACH LAST. `fimActivity.acceptCommandId()` advertises FIM_ACCEPT_COMMAND
+    // to `provider.ts`, so the relay may not point here until that command is
+    // actually registered — which is the line above. Ordering it this way makes
+    // "an advertised command is a registered command" structural rather than a
+    // property of where the assignment happened to sit.
+    currentFimActivity = this.fimActivity;
+
+    this.disposable = vscode.Disposable.from(
+      changeSubscription,
+      activeEditorSubscription,
+      windowStateSubscription,
+      jumpCommand,
+      acceptCommand,
+      dismissCommand,
+      onFimAcceptCommand,
+      guardToggleSubscription,
+      this.regionDecoration,
+      this.locatorDecoration,
+      {
+        dispose: () => {
+          this.disposed = true;
+          this.abortInFlight();
+          // CF-20-lazy: the adapter may never have been built at all (both
+          // toggles stayed off for the whole registration) — `?.` rather than
+          // an unconditional `.dispose()`.
+          this.editTrackerInstance?.dispose();
+          // BF-B's liveness idiom (`SessionController.ts`'s `disposed` re-check),
+          // applied to a MODULE-level slot: clear the relay only while THIS
+          // registration still owns it. Disposing a registration that a newer
+          // one already replaced must not point the relay back at the no-op —
+          // that would silently disarm R2 for the shell that is actually live.
+          if (currentFimActivity === this.fimActivity) {
+            currentFimActivity = NO_OP_FIM_ACTIVITY;
+          }
+        },
+      },
+    );
+
+    context.subscriptions.push(this.disposable);
+  }
+
+  /** GATE 2's predicate, and the same one the post-round-trip freshness
+   *  re-check uses — one definition so the two can never drift apart. */
+  private fimBusy(): boolean {
+    return this.fim.visible || this.fim.inFlightCount > 0;
+  }
+
+  private ensureEditTracker(): EditTrackerAdapter {
+    if (this.editTrackerInstance === null) {
+      this.editTrackerInstance = createEditTrackerAdapter();
+    }
+    return this.editTrackerInstance;
+  }
+
+  private buildEditTrackerOnToggleOn(toggles: ToggleState): void {
+    if (resolveNextEditMode(toggles.next, toggles.generic) !== 'off') {
+      this.ensureEditTracker();
+    }
+  }
+
+  private surfaceOnce(key: string, message: string): void {
+    if (this.surfacedFailures.has(key)) return;
+    this.surfacedFailures.add(key);
+    this.deps.reportFailure(message);
     void vscode.window.showWarningMessage(message);
   }
 
-  // Two decoration types, created ONCE for the whole activation.
-  const regionDecoration = vscode.window.createTextEditorDecorationType({
-    isWholeLine: true,
-    backgroundColor: new vscode.ThemeColor('diffEditor.insertedLineBackground'),
-  });
-  const locatorDecoration = vscode.window.createTextEditorDecorationType({});
-
-  function editorFor(uri: string): vscode.TextEditor | undefined {
+  private editorFor(uri: string): vscode.TextEditor | undefined {
     const active = vscode.window.activeTextEditor;
     return active !== undefined && active.document.uri.toString() === uri ? active : undefined;
   }
 
-  const executorHost: NextEditExecutorHost = {
-    setContext(key, value) {
-      void vscode.commands.executeCommand('setContext', key, value);
-    },
-    showDecorations(p, jumped) {
-      const editor = editorFor(p.region.uri);
-      // F-1: DECLINE rather than silently no-op. The executor turns a declined
-      // paint into a full `clearAll`, so `jumpVisible` can never stand up
-      // against an empty screen (and Tab can never be stolen in a file that
-      // has no proposal).
-      if (editor === undefined) return false;
-      const regionRange = new vscode.Range(p.region.startLine, 0, p.region.endLine, 0);
-      editor.setDecorations(regionDecoration, [regionRange]);
-
-      // U-7 — the SPAN, in the 1-based coordinates the gutter shows, not a
-      // "distance". `regionAroundCursor` returns cursor ± windowLines, so the
-      // old `|startLine − cursorLine|` was the CONSTANT `windowLines` for
-      // every proposal past line 10, and its `⤵` pointed DOWN at a region
-      // that starts ten lines ABOVE the cursor. This says something the user
-      // can check against their own gutter.
-      const firstLine = p.region.startLine + 1;
-      const lastLine = p.region.endLine + 1;
-      const verb = jumped ? 'Tab to accept' : 'Tab to jump';
-      const lineLength = editor.document.lineAt(p.cursorLine).text.length;
-      // Zero-width end-of-line range on the CURSOR line — the locator rides
-      // where the user is looking, not where the edit is.
-      const locatorRange = new vscode.Range(p.cursorLine, lineLength, p.cursorLine, lineLength);
-      editor.setDecorations(locatorDecoration, [
-        {
-          range: locatorRange,
-          renderOptions: {
-            after: {
-              // U-7: `08` §10 pins this copy as `⤵ N lines · <verb> · Esc to
-              // dismiss`. The verb and the Esc clause are kept verbatim; the
-              // leading clause is the one the final review found to be
-              // untrue in every case, so it now reports the span instead of a
-              // constant. `⇕` because the region brackets the cursor (it is
-              // cursor ± windowLines) — it never lies below it, which is what
-              // `⤵` claimed. Visual separation from the code is `margin`'s
-              // job, never padding baked into the string.
-              contentText: `⇕ lines ${firstLine}–${lastLine} · ${verb} · Esc to dismiss`,
-              margin: '0 0 0 1em',
-              color: new vscode.ThemeColor('editorGhostText.foreground'),
-            },
-          },
-        },
-      ]);
-      return true;
-    },
-    clearDecorations() {
-      for (const editor of vscode.window.visibleTextEditors) {
-        editor.setDecorations(regionDecoration, []);
-        editor.setDecorations(locatorDecoration, []);
-      }
-    },
-    reveal(range) {
-      // F-1: `range` is bare line geometry — it carries no uri of its own, so
-      // an unqualified `activeTextEditor` would happily scroll a FOREIGN file
-      // to line numbers taken from the proposal's document. The live proposal
-      // is the range's only owner (`reveal` is emitted solely by
-      // `proposed × tabJump`, whose `p` is the state the shell already holds),
-      // so resolve the editor through the SAME `editorFor` identity check the
-      // paint uses — one definition, so the two cannot drift.
-      const proposal = currentProposal();
-      const editor = proposal === null ? undefined : editorFor(proposal.region.uri);
-      if (editor === undefined) return;
-      editor.revealRange(
-        new vscode.Range(range.startLine, 0, range.endLine, 0),
-        vscode.TextEditorRevealType.InCenterIfOutsideViewport,
-      );
-    },
-    async applyEdit(region, newText, expected) {
-      // A plain WorkspaceEdit — never the ACP diff-decision gate (Global
-      // Constraints). This is the user's own accepted edit in their own
-      // editor, not an agent-proposed change needing approval.
-      //
-      // BHF-F3-15 — fail-closed re-validation, immediately before the edit:
-      if (expected === null) return false;
-      const editor = editorFor(region.uri);
-      if (editor === undefined) return false;
-      const document = editor.document;
-      // (1) VERSION: `TextDocument.version` strictly increases on every
-      // change — any interleaved edit in the dispatch→apply gap fails this.
-      if (document.version !== expected.docVersion) return false;
-      const endLine = Math.min(region.endLine, document.lineCount - 1);
-      const range = new vscode.Range(
-        region.startLine,
-        0,
-        endLine,
-        document.lineAt(endLine).text.length,
-      );
-      // (2) BASE TEXT: the bytes being replaced must be the bytes the
-      // proposal was anchored to — the belt for anything version cannot
-      // see (e.g. a reanchor-drift bug). getText(range) clamps, mirroring
-      // the proposal-time read.
-      if (document.getText(range) !== expected.baseText) return false;
-      const edit = new vscode.WorkspaceEdit();
-      edit.replace(document.uri, range, newText);
-      // `workspace.applyEdit` resolves false when the edit could not be
-      // applied (all-or-nothing for text-only edits) — that residual-window
-      // failure reports through the same boolean.
-      return vscode.workspace.applyEdit(edit);
-    },
-    note(msgId) {
-      const message = NOTE_MESSAGES[msgId] ?? `Next Edit: ${msgId}`;
-      deps.reportFailure(message);
-      void vscode.window.showWarningMessage(message);
-    },
-  };
-
-  const executor = makeExecutor(
-    executorHost,
-    (ok) => dispatch({ kind: 'applyResult', ok }),
-    () => pendingApplyExpectation,
-  );
-
-  function currentProposal(): AnchoredProposal | null {
-    return state.kind === 'idle' ? null : state.p;
+  private currentProposal(): AnchoredProposal | null {
+    return this.state.kind === 'idle' ? null : this.state.p;
   }
 
-  function dispatch(event: NextEditFsmEvent): void {
-    if (disposed) return;
+  private dispatch(event: NextEditFsmEvent): void {
+    if (this.disposed) return;
     // BHF-F3-15: snapshot pre-reduce — `trackedVersion` is the version the
     // live proposal's coordinates are valid FOR (advanced on every
     // successful reanchor), `region.content` the bytes being replaced.
-    const proposal = currentProposal();
-    pendingApplyExpectation =
-      proposal !== null && trackedVersion !== null
-        ? { docVersion: trackedVersion, baseText: proposal.region.content }
+    const proposal = this.currentProposal();
+    this.pendingApplyExpectation =
+      proposal !== null && this.trackedVersion !== null
+        ? { docVersion: this.trackedVersion, baseText: proposal.region.content }
         : null;
-    const next = reduceNextEdit(state, event);
-    state = next.state;
-    if (state.kind === 'idle') {
-      trackedVersion = null;
+    const next = reduceNextEdit(this.state, event);
+    this.state = next.state;
+    if (this.state.kind === 'idle') {
+      this.trackedVersion = null;
     }
-    executor.run(next.effects);
+    this.executor.run(next.effects);
   }
 
   /**
@@ -1054,7 +1276,7 @@ export function registerTalariaNextEdit(
    * clause is honoured too: parse/apply failures dismiss silently and never
    * reach here at all (they are verdicts, not throws).
    */
-  function surfaceTriggerFailure(err: unknown, route: NextEditRoute, mode: NextEditMode): void {
+  private surfaceTriggerFailure(err: unknown, route: NextEditRoute, mode: NextEditMode): void {
     const where = endpointLabel(route.apiBase);
     const endpointSetting =
       mode === 'next' ? '"talaria.nextEdit.endpoint"' : '"talaria.autocomplete.endpoint"';
@@ -1065,7 +1287,7 @@ export function registerTalariaNextEdit(
       // Rebuild the copy — never echo the throw site, which names the scheme,
       // the raw url and "(CWE-319)". Same discipline as `provider.ts`'s
       // insecure-transport arm.
-      surfaceOnce(
+      this.surfaceOnce(
         key('insecure-transport'),
         'Next Edit is paused: refusing to send credentials over cleartext HTTP to a remote host. Use https, or point the endpoint at a loopback address (127.0.0.1/localhost).',
       );
@@ -1074,27 +1296,27 @@ export function registerTalariaNextEdit(
 
     if (err instanceof BackendHttpError) {
       if (err.status === 404) {
-        surfaceOnce(
+        this.surfaceOnce(
           key('model'),
           `Next Edit is paused: the ${route.transport} server at ${where} does not serve the model "${route.model}" (404). Check ${modelSetting}.`,
         );
         return;
       }
       if (err.status === 401 || err.status === 403) {
-        surfaceOnce(
+        this.surfaceOnce(
           key('auth'),
           `Next Edit is paused: the ${route.transport} server at ${where} rejected the request (${err.status} ${err.statusText}). Check that ${endpointSetting} points at a server this machine is authorized to use.`,
         );
         return;
       }
       if (err.status === 400) {
-        surfaceOnce(
+        this.surfaceOnce(
           key('dialect'),
           `Next Edit is paused: the server at ${where} rejected the request (${err.status} ${err.statusText}). This usually means the configured transport doesn't match the server's API dialect — it can also mean the prompt exceeded the server's context length.`,
         );
         return;
       }
-      surfaceOnce(
+      this.surfaceOnce(
         key('http'),
         `Next Edit is paused: the ${route.transport} server at ${where} returned ${err.status} ${err.statusText}. Check ${endpointSetting}.`,
       );
@@ -1113,7 +1335,7 @@ export function registerTalariaNextEdit(
     // to prevent. Dedup key includes `ruleId` so a secret-rule skip and a
     // rare oversize skip each surface once, independently.
     if (err instanceof NextEditMintRejectionError) {
-      surfaceOnce(
+      this.surfaceOnce(
         key(`mint|${err.ruleId}`),
         `Next Edit skipped for this file: its content cannot be sent safely (rule: ${err.ruleId}). No request was sent.`,
       );
@@ -1127,20 +1349,28 @@ export function registerTalariaNextEdit(
     // that simply never has anything to suggest. One message per
     // transport/host/class per registration, so a permanently-down server
     // costs exactly one toast.
-    surfaceOnce(
+    this.surfaceOnce(
       key('unreachable'),
       `Next Edit is paused: the request to the ${route.transport} server at ${where} failed. Check ${endpointSetting}, and that the server is running.`,
     );
   }
 
-  function abortInFlight(): void {
+  private abortInFlight(): void {
+    // Read into a local first: the R2-direction structural lock
+    // (`coexistence.lock.test.ts`'s `ABORT_RECEIVER` scan) asserts every
+    // `.abort()` call in this file resolves to the bare receiver `inFlight` —
+    // `this.inFlight.abort()` would scan as receiver `this.inFlight`, a
+    // DIFFERENT string, and trip that lock. Same field, same behavior
+    // (read-check-abort-clear), the local is purely what the receiver text
+    // resolves to.
+    const inFlight = this.inFlight;
     if (inFlight !== null) {
       inFlight.abort();
-      inFlight = null;
+      this.inFlight = null;
     }
   }
 
-  // ── the ONE trigger path ───────────────────────────────────────────────────
+  // ── the ONE trigger path ─────────────────────────────────────────────────
 
   /**
    * The gates run IN ORDER — this is a sequence, not a set. A later gate is
@@ -1149,15 +1379,15 @@ export function registerTalariaNextEdit(
    * capability even on? is FIM busy?) ahead of anything that touches the
    * document.
    */
-  async function trigger(): Promise<void> {
+  private async trigger(): Promise<void> {
     // GATE 1 — mode. The Guard is the ONLY authority; nothing here reads the
     // store or a config boolean (there is none).
-    const mode = guard.getMode();
+    const mode = this.guard.getMode();
     if (mode !== 'next' && mode !== 'generic') return;
 
     // GATE 2 — R2: FIM idle. Next-edit may not even BUILD a request while FIM
     // has ghost text on screen OR a request in flight.
-    if (fimBusy()) return;
+    if (this.fimBusy()) return;
 
     // GATE 2b (F-2) — next-edit's OWN surface is idle. R2's shape applied to
     // this feature's own decorations: do not even BUILD a request while a
@@ -1176,7 +1406,7 @@ export function registerTalariaNextEdit(
     // A gate, not a stop: `esc`, an overlapping edit, a focus loss, an editor
     // switch and an accept all return the state to `idle`, and the very next
     // edit burst triggers normally.
-    if (state.kind !== 'idle') return;
+    if (this.state.kind !== 'idle') return;
 
     // NOT a gate — the two steps the gate sequence is INTERRUPTED by, named
     // explicitly because the brief pins the order mode → FIM → trust →
@@ -1199,39 +1429,8 @@ export function registerTalariaNextEdit(
     if (editor === undefined) return;
     const document = editor.document;
 
-    // F-5 / C-5 — a route that cannot be built is REPORTED (once) when the
-    // user can do something about it, instead of returning into silence while
-    // the panel row still reads as if the source were running.
-    const resolution = resolveRoute(mode, deps);
-    if (resolution.kind === 'next-model-unset') {
-      surfaceOnce('next-model-unset', NEXT_EDIT_MODEL_UNSET_NOTE);
-      return;
-    }
-    if (resolution.kind === 'generic-unsupported-backend') {
-      surfaceOnce(
-        `generic-unsupported-backend|${resolution.fimBackend}`,
-        genericUnsupportedBackendMessage(resolution.fimBackend),
-      );
-      return;
-    }
-    if (resolution.kind !== 'route') return;
-    const route = resolution.route;
-
-    // B.2 tripwire. NEXT deliberately has NO credential (ADR-014): the shipped
-    // matrix is a local GGUF import on a loopback endpoint, so there is nothing
-    // to authenticate to. The one observation that would reopen that decision
-    // is a NEXT route pointing off-box — and `remote` is ALREADY computed, so
-    // reporting it costs one line and turns a speculative question into an
-    // observed event. This is an observation, not a warning: it does not gate,
-    // block, or refuse anything.
-    if (mode === 'next' && route.remote) {
-      surfaceOnce(
-        'next-remote-endpoint',
-        'Next Edit is using a REMOTE endpoint for its dedicated model (talaria.nextEdit.endpoint). ' +
-          'Next Edit sends no credential of its own. If this endpoint requires authentication, say so — ' +
-          'it would need its own key, never the autocomplete key.',
-      );
-    }
+    const route = this.resolveReportedRoute(mode);
+    if (route === null) return;
 
     // GATE 3 — trust. Read unconditionally (not short-circuited behind
     // `route.remote`) so reaching this gate is observable.
@@ -1247,6 +1446,64 @@ export function registerTalariaNextEdit(
     const fsPathLike = (document.uri.path ?? document.uri.fsPath ?? '').replace(/\\/g, '/');
     if (isSecretForCompletion(fsPathLike)) return;
 
+    const built = this.buildRequest(editor, document, route);
+    if (built === null) return;
+    await this.runPrediction(document, route, mode, built.request, built.rendered);
+  }
+
+  /**
+   * `resolveRoute` + the F-5/C-5 surfacing arms + the B.2 remote
+   * observation — moved verbatim from between GATE 2b and GATE 3. Returns
+   * null when nothing routable.
+   */
+  private resolveReportedRoute(mode: NextEditMode): NextEditRoute | null {
+    // F-5 / C-5 — a route that cannot be built is REPORTED (once) when the
+    // user can do something about it, instead of returning into silence while
+    // the panel row still reads as if the source were running.
+    const resolution = resolveRoute(mode, this.deps);
+    if (resolution.kind === 'next-model-unset') {
+      this.surfaceOnce('next-model-unset', NEXT_EDIT_MODEL_UNSET_NOTE);
+      return null;
+    }
+    if (resolution.kind === 'generic-unsupported-backend') {
+      this.surfaceOnce(
+        `generic-unsupported-backend|${resolution.fimBackend}`,
+        genericUnsupportedBackendMessage(resolution.fimBackend),
+      );
+      return null;
+    }
+    if (resolution.kind !== 'route') return null;
+    const route = resolution.route;
+
+    // B.2 tripwire. NEXT deliberately has NO credential (ADR-014): the shipped
+    // matrix is a local GGUF import on a loopback endpoint, so there is nothing
+    // to authenticate to. The one observation that would reopen that decision
+    // is a NEXT route pointing off-box — and `remote` is ALREADY computed, so
+    // reporting it costs one line and turns a speculative question into an
+    // observed event. This is an observation, not a warning: it does not gate,
+    // block, or refuse anything.
+    if (mode === 'next' && route.remote) {
+      this.surfaceOnce(
+        'next-remote-endpoint',
+        'Next Edit is using a REMOTE endpoint for its dedicated model (talaria.nextEdit.endpoint). ' +
+          'Next Edit sends no credential of its own. If this endpoint requires authentication, say so — ' +
+          'it would need its own key, never the autocomplete key.',
+      );
+    }
+
+    return route;
+  }
+
+  /**
+   * The request-assembly block — everything from `const cursor =
+   * editor.selection.active;` through `const renderResult = …` /
+   * `renderResult.kind === 'skip'` — verbatim.
+   */
+  private buildRequest(
+    editor: vscode.TextEditor,
+    document: vscode.TextDocument,
+    route: NextEditRoute,
+  ): { request: NextEditRequest; rendered: RenderedNextEditPrompt } | null {
     const cursor = editor.selection.active;
     const uri = document.uri.toString();
     const span = regionAroundCursor(cursor.line, document.lineCount, route.format.windowLines);
@@ -1255,7 +1512,7 @@ export function registerTalariaNextEdit(
       new vscode.Range(span.startLine, 0, span.endLine, regionEndLength),
     );
     const docText = document.getText();
-    const preEditDocText = ensureEditTracker().getPreEditText(uri) ?? null;
+    const preEditDocText = this.ensureEditTracker().getPreEditText(uri) ?? null;
     // C-3 / ADR-018 — `preEditRegion` is extracted from the FULL pre-edit
     // text, BEFORE windowing. The region and the doc-level window are
     // independent (exactly as in the vendor script: `block` is ±10 lines,
@@ -1279,7 +1536,7 @@ export function registerTalariaNextEdit(
     // mint ever sees it. `changesAboveCursor` reads the same kept list, so the
     // structural heuristic and the egressing payload describe one history.
     const ringDiffs = partitionEgressableDiffs(
-      ensureEditTracker().tracker.getRecentDiffs(),
+      this.ensureEditTracker().tracker.getRecentDiffs(),
       route.format.sentinels,
     );
     const diffs = ringDiffs.kept;
@@ -1307,12 +1564,27 @@ export function registerTalariaNextEdit(
     };
 
     const renderResult = route.format.render(request);
-    if (renderResult.kind === 'skip') return;
-    const rendered = renderResult.prompt;
+    if (renderResult.kind === 'skip') return null;
+    return { request, rendered: renderResult.prompt };
+  }
 
+  /**
+   * The round trip — from `const controller = new AbortController();`
+   * through the whole try/catch/finally — verbatim. The freshness
+   * re-checks read `request.docVersion` / `request.cursor.uri` /
+   * `request.cursor.line` (the same values the old locals held — the
+   * request already carries all three).
+   */
+  private async runPrediction(
+    document: vscode.TextDocument,
+    route: NextEditRoute,
+    mode: NextEditMode,
+    request: NextEditRequest,
+    rendered: RenderedNextEditPrompt,
+  ): Promise<void> {
     const controller = new AbortController();
-    abortInFlight();
-    inFlight = controller;
+    this.abortInFlight();
+    this.inFlight = controller;
 
     try {
       // The brand comes from CALLING the one sanctioned mint — it throws
@@ -1330,7 +1602,7 @@ export function registerTalariaNextEdit(
       });
 
       const output = await backend.predict(scanned, rendered, controller.signal);
-      if (controller.signal.aborted || disposed) return;
+      if (controller.signal.aborted || this.disposed) return;
 
       // CONTRACT (`formats/*`): `parse` trusts that `rendered` and `request`
       // are a MATCHED pair — it cannot detect a mismatch. Both locals below
@@ -1341,8 +1613,8 @@ export function registerTalariaNextEdit(
       // Freshness re-check: the document must not have moved under the
       // request, and FIM must STILL be idle (R2 covers the whole round trip,
       // not just its start).
-      if (document.version !== docVersion) return;
-      if (fimBusy()) return;
+      if (document.version !== request.docVersion) return;
+      if (this.fimBusy()) return;
       // F-1 — IDENTITY re-check, the third freshness dimension. `version` only
       // answers "did THIS document change?"; it says nothing about whether the
       // user is still looking at it. Switching files mid-round-trip moves
@@ -1350,240 +1622,56 @@ export function registerTalariaNextEdit(
       // lands for a document that is no longer on screen: `jumpVisible` goes
       // up with zero decorations anywhere and Tab is hijacked in the file the
       // user actually has open. Same `editorFor` predicate the paint uses.
-      if (editorFor(uri) === undefined) return;
+      if (this.editorFor(request.cursor.uri) === undefined) return;
 
-      trackedVersion = docVersion;
-      dispatch({
+      this.trackedVersion = request.docVersion;
+      this.dispatch({
         kind: 'proposalReady',
         p: {
           region: verdict.region,
           newText: verdict.newText,
-          docVersion,
-          cursorLine: cursor.line,
+          docVersion: request.docVersion,
+          cursorLine: request.cursor.line,
         },
       });
     } catch (err) {
       // Aborts are the common case here and are not failures: R2 aborts every
       // in-flight prediction the moment FIM starts, and each new trigger
       // aborts its predecessor. Those must stay silent.
-      if (controller.signal.aborted || disposed) return;
+      if (controller.signal.aborted || this.disposed) return;
       // F-4 — everything else is surfaced ONCE and actionably (`08` §9.3).
       // The old bare catch swallowed all of it, so a CWE-319 refusal, a wrong
       // endpoint or a 404-ing model left next-edit dead for the whole session
       // with no signal anywhere. A toast per keystroke would indeed be worse
       // than a missing suggestion, which is exactly what `surfaceOnce` is for.
-      surfaceTriggerFailure(err, route, mode);
+      this.surfaceTriggerFailure(err, route, mode);
     } finally {
-      if (inFlight === controller) {
-        inFlight = null;
+      if (this.inFlight === controller) {
+        this.inFlight = null;
       }
     }
   }
 
-  function armTrigger(): void {
-    void debouncer.delayAndShouldDebounce(TRIGGER_DEBOUNCE_MS).then(
+  private armTrigger(): void {
+    void this.debouncer.delayAndShouldDebounce(TRIGGER_DEBOUNCE_MS).then(
       (superseded) => {
-        if (superseded || disposed) return undefined;
-        return trigger();
+        if (superseded || this.disposed) return undefined;
+        return this.trigger();
       },
       () => undefined,
     );
   }
+}
 
-  // ── listeners ──────────────────────────────────────────────────────────────
-
-  /**
-   * Held under its own name so `dispose()` below can prove it still OWNS the
-   * module-level relay slot before clearing it — `currentFimActivity` is a
-   * single shared slot, and a newer registration may already have taken it.
-   */
-  const fimActivity: FimActivityListener = {
-    requestStarted() {
-      fim.inFlightCount += 1;
-      try {
-        // R2, the direction that matters: FIM-start aborts next-edit. Never
-        // the reverse — nothing in this module can cancel a FIM request.
-        abortInFlight();
-        dispatch({ kind: 'fimVisibility', visible: true });
-      } catch {
-        // Must not escape this call: `provider.ts` sets its own
-        // `fimRequested` flag only AFTER `requestStarted()` returns, and
-        // only a set flag makes its `finally` call the paired
-        // `resultShown` later. A throw here (e.g. `dispatch()` reaching a
-        // throwing host) would skip that flag and strand the increment
-        // above forever — unlike the boolean this refcount replaced, it
-        // does not self-heal on the next FIM cycle. The count's integrity
-        // matters more than reporting whatever failed downstream.
-      }
-    },
-    resultShown(hasItem: boolean) {
-      if (fim.inFlightCount === 0) {
-        // UNPAIRED settle: a settle whose `requestStarted` was delivered to
-        // a PREVIOUS registration (the relay swapped while that request was
-        // in flight), or a stray duplicate — either way nothing of ours is
-        // outstanding to count out. Complete no-op: touching `visible` here
-        // could silently clear a GENUINELY visible ghost-text flag set by a
-        // real, unrelated request, reopening GATE 2 against R2.
-        return;
-      }
-      fim.inFlightCount -= 1;
-      // SUPERSEDED settle — a NEWER FIM request is still in flight, so this
-      // result speaks for a request VS Code has already cancelled and whose
-      // item it discarded. It may not report on visibility at all: the
-      // newest request is the one that gets to settle that, and until it
-      // does the refcount above holds GATE 2 closed on its own. Treating a
-      // stale settle as authoritative is what let a boolean `visible` be
-      // cleared out from under a live FIM request.
-      if (fim.inFlightCount > 0) return;
-      // Conservative visibility: a non-null item COUNTS as on screen, even
-      // though VS Code may still decline to render it.
-      fim.visible = hasItem;
-      dispatch({ kind: 'fimVisibility', visible: hasItem });
-    },
-    accepted() {
-      // The ghost text was consumed, so FIM is no longer on screen — and this
-      // is the R4 seam: the post-FIM-accept moment is exactly when a next
-      // edit is most likely to exist.
-      //
-      // The refcount is deliberately NOT zeroed here. `provider.ts` pairs
-      // every `requestStarted` with a `resultShown` in its own `finally`, so
-      // the request that produced this accepted item has already been counted
-      // out; any count still standing belongs to a LATER request that is
-      // genuinely in flight. Zeroing it would discard that and reopen GATE 2
-      // against R2 — the armed trigger below simply waits for it instead.
-      fim.visible = false;
-      dispatch({ kind: 'fimVisibility', visible: false });
-      armTrigger();
-    },
-    // Safe to answer unconditionally: this object only ever reaches the relay
-    // AFTER the command below is registered (see the attach site at the end of
-    // this function), and it leaves the relay when this registration disposes.
-    acceptCommandId: () => FIM_ACCEPT_COMMAND,
-  };
-
-  const changeSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
-    // CF-19 — GATE-4 parity: a non-recordable scheme (Output/SCM/etc.) must
-    // not arm anything at all. Before this guard, `armTrigger()` ran
-    // unconditionally on EVERY `onDidChangeTextDocument` event regardless of
-    // which document changed, so edit-burst noise from an unrelated
-    // Output/SCM document could arm (and eventually fire) a next-edit
-    // request against the CURRENT active editor — a document GATE-4 would
-    // separately have to be scheme-valid on its own, but the arm itself
-    // never checked the document that actually changed.
-    if (!isRecordableScheme(e.document.uri.scheme)) return;
-
-    // Source 2 of the ONE trigger path: the debounced edit burst. Armed
-    // unconditionally (once past the scheme guard above) — `trigger()`
-    // itself resolves which editor/document is current, so no editor lookup
-    // is needed (or wanted) this early.
-    armTrigger();
-
-    const proposal = currentProposal();
-    if (proposal === null || proposal.region.uri !== e.document.uri.toString()) return;
-
-    if (e.contentChanges.length === 0) {
-      // A metadata-only event (dirty-flag, EOL, save) still bumps `version`.
-      // Nothing textual moved, so re-baseline instead of dismissing.
-      trackedVersion = e.document.version;
-      return;
-    }
-
-    if (trackedVersion === null || e.document.version !== trackedVersion + 1) {
-      // Versions skipped ⇒ at least one change event never reached us, so the
-      // changes in hand cannot describe the full delta. Fail closed.
-      dispatch({ kind: 'docChanged', remapped: null });
-      return;
-    }
-
-    const remapped = remapRange(
-      { startLine: proposal.region.startLine, endLine: proposal.region.endLine },
-      toContentChangeLites(e.contentChanges),
-    );
-    trackedVersion = e.document.version;
-    dispatch({ kind: 'docChanged', remapped });
-  });
-
-  const activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor(() => {
-    // C-6 — the one clearer `fim.visible` can safely have. Esc on ghost text
-    // is unobservable on the stable API, so nothing but the NEXT FIM request
-    // settling ever lowered this flag; disable FIM in between and GATE 2 stays
-    // shut for the rest of the session with no ghost text on screen at all.
-    //
-    // Why THIS event and not `onDidChangeTextDocument`: an inline suggestion
-    // is painted into ONE editor and cannot outlive it being switched away
-    // from, so clearing here cannot let next-edit build against ghost text
-    // that is genuinely on screen. A document change would be the wrong
-    // signal — the ordinary keystroke path fires it BEFORE FIM's provider is
-    // invoked, so it would reopen the gate in exactly the window R2 exists to
-    // close.
-    //
-    // `inFlightCount` is deliberately NOT touched: a FIM request in flight
-    // survives an editor switch, and it alone must keep the gate shut.
-    fim.visible = false;
-    dispatch({ kind: 'editorChanged' });
-  });
-
-  const windowStateSubscription = vscode.window.onDidChangeWindowState((windowState) => {
-    if (!windowState.focused) {
-      dispatch({ kind: 'focusLost' });
-    }
-  });
-
-  // ── commands (registered ONCE) ─────────────────────────────────────────────
-
-  const jumpCommand = vscode.commands.registerCommand('talaria.nextEdit.jump', () => {
-    dispatch({ kind: 'tabJump' });
-  });
-  const acceptCommand = vscode.commands.registerCommand('talaria.nextEdit.accept', () => {
-    dispatch({ kind: 'tabAccept' });
-  });
-  const dismissCommand = vscode.commands.registerCommand('talaria.nextEdit.dismiss', () => {
-    dispatch({ kind: 'esc' });
-  });
-  // The R4 seam: fired by the InlineCompletionItem's own `command`, which VS
-  // Code executes when the user ACCEPTS the FIM ghost text.
-  const onFimAcceptCommand = vscode.commands.registerCommand(FIM_ACCEPT_COMMAND, () => {
-    fimActivityRelay.accepted();
-  });
-
-  // ATTACH LAST. `fimActivity.acceptCommandId()` advertises FIM_ACCEPT_COMMAND
-  // to `provider.ts`, so the relay may not point here until that command is
-  // actually registered — which is the line above. Ordering it this way makes
-  // "an advertised command is a registered command" structural rather than a
-  // property of where the assignment happened to sit.
-  currentFimActivity = fimActivity;
-
-  const disposable = vscode.Disposable.from(
-    changeSubscription,
-    activeEditorSubscription,
-    windowStateSubscription,
-    jumpCommand,
-    acceptCommand,
-    dismissCommand,
-    onFimAcceptCommand,
-    guardToggleSubscription,
-    regionDecoration,
-    locatorDecoration,
-    {
-      dispose: () => {
-        disposed = true;
-        abortInFlight();
-        // CF-20-lazy: the adapter may never have been built at all (both
-        // toggles stayed off for the whole registration) — `?.` rather than
-        // an unconditional `.dispose()`.
-        editTrackerInstance?.dispose();
-        // BF-B's liveness idiom (`SessionController.ts`'s `disposed` re-check),
-        // applied to a MODULE-level slot: clear the relay only while THIS
-        // registration still owns it. Disposing a registration that a newer
-        // one already replaced must not point the relay back at the no-op —
-        // that would silently disarm R2 for the shell that is actually live.
-        if (currentFimActivity === fimActivity) {
-          currentFimActivity = NO_OP_FIM_ACTIVITY;
-        }
-      },
-    },
-  );
-
-  context.subscriptions.push(disposable);
-  return disposable;
+/**
+ * Wires next-edit into VS Code. Called from `index.ts` beside
+ * `registerTalariaAutocomplete`, with a Guard already hydrated from the
+ * `talaria.nextEdit.source` config port (Task 2 §5.5).
+ */
+export function registerTalariaNextEdit(
+  context: vscode.ExtensionContext,
+  guard: NextEditGuard,
+  deps: NextEditShellDeps,
+): vscode.Disposable {
+  return new NextEditShell(context, guard, deps).disposable;
 }
