@@ -2325,3 +2325,91 @@ describe('F3-11: dispose() drains the in-flight buildChain before closing the st
     expect(closeMock).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('WS-R2 A5: AU-23 class is dead — dispose mid-await mutates nothing', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-a5-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear(); deleteByPathMock.mockClear();
+  });
+  afterEach(() => { rmSync(workspaceRoot, { recursive: true, force: true }); });
+
+  it('a change event whose embed is in-flight when dispose() fires never upserts or writes the manifest', async () => {
+    await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'ordinary content to chunk and embed\n', 'utf8');
+    const indexer = createIndexer({
+      workspaceRoot, indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+    });
+
+    let releaseEmbed!: () => void;
+    const embedGate = new Promise<void>((r) => { releaseEmbed = r; });
+    const CONTENT_MARKER = 'ordinary content to chunk and embed';
+    // IMPLEMENTER FIX (A5 verification finding — see task-A5-report.md):
+    // a plain `mockImplementationOnce` is a FIFO queue SHARED across this
+    // whole file's `embedMock`. An unrelated EARLIER test ("F3-11: dispose()
+    // still closes the store after the drain deadline...") deliberately
+    // leaves an unawaited `void indexer.build()` chain permanently stuck on
+    // `new Promise(() => {})`; verified empirically that this dangling chain
+    // can still make real progress on later real-fs/microtask turns (this
+    // test's own drain turns included) and steal a plain queued `once` block
+    // before THIS test's own real call ever reaches it — the queued body
+    // never even started executing, yet the real call still completed and
+    // upserted for real, because it fell through to whatever base
+    // `mockImplementation` a prior describe block left behind. Gating on
+    // THIS call's own content makes the block immune to queue position and
+    // to any other in-flight call: whichever invocation actually carries
+    // this file's content is the one that blocks; anything else (e.g. that
+    // dangling chain's own, differently-worded content) resolves normally.
+    embedMock.mockReset(); // drop any stale queued `once` entries left by earlier tests
+    embedMock.mockImplementation(async (texts: string[]) => {
+      if (texts.some((t) => t.includes(CONTENT_MARKER))) await embedGate;
+      return texts.map(() => [0.1, 0.2, 0.3]);
+    });
+
+    const disposable = indexer.watch();
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src/a.txt') });
+    await vi.advanceTimersByTimeAsync(20); // fire the debounce
+    // A fixed advance alone does NOT reliably get the handler as far as the
+    // held embed — traced empirically: a single `advanceTimersByTimeAsync`
+    // call fires the debounce timer and yields only ~one real turn, leaving
+    // the handler still mid-`loadIgnoreFilter()`/`ensureStoreInitialized()`,
+    // several real fs-await turns short of `reindexFiles`'s `embedder.embed`
+    // call. `dispose()` called that early captures whatever `buildChain` was
+    // BEFORE this handler ever reaches `serialize()` — a stale,
+    // already-resolved chain — so `gate.close(buildChain)` (and therefore
+    // `closeMock`) resolves almost immediately, well before the handler is
+    // anywhere near a mutation. Without this drain the assertions below would
+    // hold VACUOUSLY (the mutation was simply never attempted YET, not
+    // refused) — the exact false-pass shape M-1 already closed on the other
+    // side of `dispose()`. Drain (real turns, no wall-clock sleep) until THIS
+    // file's own call (content-matched, not just "any call" — the dangling
+    // chain described above can also produce a call, with different content,
+    // that would otherwise satisfy a position-only predicate prematurely) is
+    // GENUINELY parked inside the held `embedGate` await, so `dispose()`
+    // below captures the buildChain THIS handler actually joined.
+    await drainUntil(() =>
+      embedMock.mock.calls.some(([texts]) => texts.some((t) => t.includes(CONTENT_MARKER))),
+    );
+    upsertMock.mockClear();
+
+    closeMock.mockClear();
+    indexer.dispose();     // A4: gate flips closed synchronously; dispose drains buildChain THEN closes the store
+    releaseEmbed();        // handler resumes past the await; the :762 disposed-guard bails and the gate refuses the sinks
+
+    // TERMINAL ANCHOR (A1-review M-1) — do NOT use a fixed `advanceTimersByTimeAsync(200)`:
+    // a fixed advance can pass merely because the resumed continuation has not yet REACHED
+    // the (refused) upsert/writeManifest = a false pass. After A4, dispose() drains the
+    // in-flight buildChain (this very handler) and only THEN closes the store, so closeMock
+    // firing is the deterministic signal that the handler ran to completion having mutated
+    // nothing. (A5 runs after A4, so drain-then-close is in place.)
+    await drainUntil(() => closeMock.mock.calls.length > 0);
+
+    expect(upsertMock).not.toHaveBeenCalled();
+    const manifestExists = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8').then(() => true).catch(() => false);
+    expect(manifestExists).toBe(false); // writeManifest was guarded/refused → no manifest file was written
+    disposable.dispose();
+  });
+});
