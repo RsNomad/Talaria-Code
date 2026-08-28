@@ -197,8 +197,9 @@ content. Store-first stands, unchanged.
 
 **Cite.** `src/host/util/mutationGate.ts` (`createMutationGate`, `sink`,
 `close`, `MUTATION_GATE_DRAIN_DEADLINE_MS`); `src/rag/indexer.ts` — `dispose`;
-the sink routing across `src/rag/buildPipeline.ts`; the A1-A5 / F3-11 / WS-R2-A5
-dispose-race tests in `src/rag/indexer.test.ts`;
+the sink routing across `src/rag/buildPipeline.ts` and `src/rag/watchPipeline.ts`
+(`purgeAndPersist`); the A1-A5 / F3-11 / WS-R2-A5 dispose-race tests in
+`src/rag/indexer.test.ts`;
 `docs_claude/lens-dorabotok/REMEDIATION-ARCHITECTURE.md` §3.2 revision note
 (2026-08-28) recording the drop.
 
