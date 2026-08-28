@@ -241,11 +241,19 @@ describe('W6-FK (I-9): session/ purity guard — HEADLESS tier (vscode-free + fs
 // ONLY the fs-ban exception (`RAG_FS_ADAPTER_ALLOW`), not the vscode-ban one
 // (`RAG_ADAPTER_ALLOW`) — a future accidental `import 'vscode'` inside
 // buildPipeline.ts would still be caught.
+//
+// `indexer.ts`'s `watch()` body (the file-watcher + `handleFsEvent`
+// debounce loop) was likewise extracted verbatim into `watchPipeline.ts`.
+// Unlike `buildPipeline.ts`, it genuinely needs BOTH `vscode`
+// (`vscode.workspace.createFileSystemWatcher`, `vscode.Disposable`,
+// `vscode.Uri`) and `node:fs` (`fs.lstat`, same monkey-patch-visibility
+// reasoning) — the same dual exemption `indexer.ts` itself has — so it is
+// added to both allow-sets.
 // ---------------------------------------------------------------------------
 
 const RAG_ROOT = join(__dirname, '..', '..', 'rag');
-const RAG_ADAPTER_ALLOW = new Set(['indexer.ts']);
-const RAG_FS_ADAPTER_ALLOW = new Set(['indexer.ts', 'buildPipeline.ts']);
+const RAG_ADAPTER_ALLOW = new Set(['indexer.ts', 'watchPipeline.ts']);
+const RAG_FS_ADAPTER_ALLOW = new Set(['indexer.ts', 'buildPipeline.ts', 'watchPipeline.ts']);
 
 function collectRagSources() {
   return collectNonTestTsSources(RAG_ROOT);
@@ -258,7 +266,7 @@ describe('T-18 (C3): rag/ purity guard', () => {
     expect(files.some((f) => f.file === 'indexer.ts')).toBe(true);
   });
 
-  it('no module under rag/ imports vscode EXCEPT the sanctioned indexer.ts', () => {
+  it('no module under rag/ imports vscode EXCEPT the sanctioned indexer.ts/watchPipeline.ts', () => {
     const offenders = collectRagSources()
       .filter((f) => !RAG_ADAPTER_ALLOW.has(f.file))
       .filter((f) => VSCODE_IMPORT_BAN.test(f.content))
@@ -266,7 +274,7 @@ describe('T-18 (C3): rag/ purity guard', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('no module under rag/ imports node:fs EXCEPT the sanctioned indexer.ts/buildPipeline.ts', () => {
+  it('no module under rag/ imports node:fs EXCEPT the sanctioned indexer.ts/buildPipeline.ts/watchPipeline.ts', () => {
     const offenders = collectRagSources()
       .filter((f) => !RAG_FS_ADAPTER_ALLOW.has(f.file))
       .filter((f) => FS_IMPORT_BAN.test(f.content))

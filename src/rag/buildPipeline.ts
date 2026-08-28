@@ -122,6 +122,8 @@ export interface IndexerContext {
   embedder: Embedder;
   gate: MutationGate;
   parser: CodeParser;
+  /** F2-12: same injected log seam as `IndexerOptions.logger` (default `console.error`). */
+  logger: (line: string) => void;
   isDisposed: () => boolean;
   ensureStoreInitialized: () => Promise<void>;
   readManifest: () => Promise<Record<string, string>>;
@@ -135,6 +137,8 @@ export interface IndexerContext {
   invalidateIgnoreFilterCache: () => void;
   /** Records this build's freshly-discovered nested-ignore directories (indexer.ts's `knownNestedIgnoreDirs`). */
   setKnownNestedIgnoreDirs: (dirs: string[]) => void;
+  /** F2-12: bumps indexer.ts's cumulative `failedIncrementalReindexesTotal` counter (watchPipeline.ts's `schedule()` catch). */
+  recordFailedIncrementalReindex: () => void;
 }
 
 export async function walk(
