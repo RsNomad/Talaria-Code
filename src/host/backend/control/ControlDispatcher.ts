@@ -503,7 +503,7 @@ export class ControlDispatcher {
    * always honest" posture the staleness comment already documents.
    */
   private async fetchPanelData<P extends DataPanel>(panel: P, params?: unknown): Promise<unknown> {
-    const scopedParams = this.withDefaultCheckpointsScope(panel, params);
+    const scopedParams = this.withResolvedSessionsScope(panel, this.withDefaultCheckpointsScope(panel, params));
     // T-12: mint this attempt's sequence token for its scope BEFORE the
     // fetch starts, so a caller that races ahead (issued LATER, resolves
     // FIRST) bumps the scope's latest token before this one's belated
@@ -577,6 +577,39 @@ export class ControlDispatcher {
       return params;
     }
     return { ...base, rootId: first.rootId };
+  }
+
+  /**
+   * F3-16: the T-12 staleness gate key and the pushed panel scope must agree
+   * and be STABLE across the fetch await. Both `panelScopeKey` and
+   * `buildPanelDataMessage` derive the `sessions` cwd from LIVE mutable state
+   * (`this.port.sessions`/`getConnectionCwd()`), read at two different times
+   * (pre- and post-await) — a mid-await mutation makes them disagree. Resolve
+   * the cwd ONCE at fetch entry and stamp it into the (now immutable)
+   * scopedParams; both consumers already prefer `extractCwd(params)`, so they
+   * then read this single snapshot instead of re-resolving live state.
+   *
+   * Only stamps when a REAL cwd resolves (session cwd or connection cwd) —
+   * when NEITHER resolves, `params` is returned unchanged rather than
+   * stamping a synthetic `''`. `scopedParams` is also what's handed to the
+   * `PanelSource` itself ({@link fetchPanelData}), and `SessionsPanelSource
+   * .resolveCwd` has its OWN richer fallback (`PanelSourceContext
+   * .getSessionCwd`/`.getCwd`) for the "nothing resolved yet" case — stamping
+   * an empty string here would short-circuit that fallback with a literal
+   * `''` instead of leaving `cwd` absent for it to resolve itself (verified
+   * against `AcpBackend.test.ts`'s pinned `{cwd: undefined}` `listSessions`
+   * calls, which are independent of `buildPanelDataMessage`'s OWN unrelated
+   * `?? ''` push-scope default).
+   */
+  private withResolvedSessionsScope(panel: DataPanel, params: unknown): unknown {
+    if (panel !== 'sessions' || extractCwd(params) !== undefined) return params;
+    const scopedSessionId = extractSessionId(params);
+    const cwd =
+      (scopedSessionId !== undefined ? this.port.sessions.get(scopedSessionId)?.cwd : undefined) ??
+      this.port.getConnectionCwd();
+    if (cwd === undefined) return params;
+    const base = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
+    return { ...base, cwd };
   }
 
   /**
