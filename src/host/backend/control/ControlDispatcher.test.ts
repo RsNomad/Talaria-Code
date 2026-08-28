@@ -115,3 +115,26 @@ describe('ControlDispatcher — WS-GD.1 CA-M04: panelFetchSeq pruning', () => {
     expect(seqMap.has('subagents:S1')).toBe(false); // ... and prune drops exactly it
   });
 });
+
+describe('ControlDispatcher — WS-GD.1 CA-M04b: registry-close pruning (all close paths, not just closeTabInternal)', () => {
+  it('a SessionRegistry.close prunes the subagents fetch-seq entry — the rebind/swap/failed-load/recovery close paths reduce to exactly this seam', async () => {
+    const { port, registry } = makePort();
+    registerFakeSource(registry, 'subagents', async () => ({
+      data: {} as unknown as PanelDataMap['subagents'], // shape-agnostic; the test asserts on the map key, not payload
+    }));
+    const dispatcher = new ControlDispatcher(port);
+    // Reach the private map (private is compile-time only — no production surface added).
+    const seqMap = (dispatcher as unknown as { panelFetchSeq: Map<string, number> }).panelFetchSeq;
+
+    await dispatcher.invokeControl('panel.data', { panel: 'subagents', sessionId: 'S1' });
+    expect(seqMap.has('subagents:S1')).toBe(true); // the fetch minted the per-session key
+
+    // Every close site that BYPASSES AcpBackend.closeTabInternal (rebind,
+    // swap-eviction, failed-load, crash-recovery failure, disposeAll) funnels
+    // through SessionRegistry.close — drive that seam directly. No controller
+    // is registered for S1: the hook contract is UNCONDITIONAL, preserving the
+    // semantics of the explicit closeTabInternal prune it replaces.
+    port.sessions.close('S1');
+    expect(seqMap.has('subagents:S1')).toBe(false); // pruned via the registry hook, no per-site wiring
+  });
+});

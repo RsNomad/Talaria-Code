@@ -1121,7 +1121,8 @@ export class AcpBackend implements AgentBackend {
 
   private async closeTabInternal(sessionId: string): Promise<void> {
     try {
-      this.controlDispatcher.pruneFetchSeqForSession(sessionId); // CA-M04: prune the closing session's fetch-seq entry
+      // CA-M04b: `SessionRegistry.close` itself fires the fetch-seq prune now
+      // (hook wired in `ControlDispatcher`'s constructor) — no explicit call.
       this.sessions.close(sessionId);
     } finally {
       // CF-01/L3-1 fix: clear the tombstone only once the ACTUAL removal has

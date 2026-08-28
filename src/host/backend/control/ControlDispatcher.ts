@@ -376,7 +376,14 @@ export class ControlDispatcher {
   private readonly busySkillInstallIds = new Set<string>();
   private readonly busySkillUninstallNames = new Set<string>();
 
-  constructor(private readonly port: ControlDispatcherHostPort) {}
+  constructor(private readonly port: ControlDispatcherHostPort) {
+    // CA-M04b: self-wire the per-session fetch-seq prune to the registry's
+    // close choke point — every close path (tab close, rebind, swap-eviction,
+    // failed/abandoned loads, crash-recovery failure, teardown disposeAll)
+    // funnels through `SessionRegistry.close`/`disposeAll`, so this ONE hook
+    // covers them all, present and future, with no per-site wiring.
+    port.sessions.setOnClosed((sessionId) => this.pruneFetchSeqForSession(sessionId));
+  }
 
   /**
    * The most-recently-opened/loaded session's controller, or `undefined`
@@ -1889,7 +1896,8 @@ export class ControlDispatcher {
    * and `checkpoints:${rootId}` are bounded by the finite set of roots/cwds AND
    * shared across tabs, so they are deliberately NOT pruned here. The key
    * format MUST match {@link panelScopeKey}'s `subagents` branch verbatim.
-   * Wired from `AcpBackend.closeTabInternal`.
+   * Wired by this class's own constructor as the `SessionRegistry.setOnClosed`
+   * hook — every registry close path prunes; no per-site wiring (CA-M04b).
    */
   pruneFetchSeqForSession(sessionId: string): void {
     this.panelFetchSeq.delete(`subagents:${sessionId}`);
