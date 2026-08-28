@@ -976,7 +976,12 @@ export class ControlDispatcher {
     let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
     let lastLines: string[] = [];
     for (;;) {
-      const status = await client.actionStatus(action);
+      let status: { running: boolean; exit_code: number | null; lines: string[] };
+      try {
+        status = await client.actionStatus(action);
+      } catch (err) {
+        this.throwPollUnconfirmed(action, err);
+      }
       lastLines = status.lines;
       if (!status.running) break;
       if (Date.now() >= deadline) {
@@ -986,7 +991,12 @@ export class ControlDispatcher {
       delay = BACKGROUND_POLL_STEP_DELAY_MS;
     }
 
-    const verify = await client.listMcpCatalog();
+    let verify: McpCatalogData;
+    try {
+      verify = await client.listMcpCatalog();
+    } catch (err) {
+      this.throwPollUnconfirmed(action, err);
+    }
     this.lastCatalogEntries = verify.entries;
     const row = verify.entries.find((entry) => entry.name === name);
     if (!row || row.installed !== true) {
@@ -1008,6 +1018,19 @@ export class ControlDispatcher {
       `[AcpBackend] catalog install "${name}" did not verify as installed — action tail:\n${tailLines.join('\n')}`,
     );
     throw new Error('Catalog install did not complete — see the Talaria output log.');
+  }
+
+  /**
+   * F2-09: a poll/verify TRANSPORT rejection is NOT an action failure. Report
+   * "dispatched — confirmation unknown" ({@link POLL_UNCONFIRMED_MESSAGE}),
+   * distinct from {@link rejectCatalogInstall}'s ground-truth "did not
+   * complete". The underlying error goes to the logger only.
+   */
+  private throwPollUnconfirmed(action: string, err: unknown): never {
+    this.port.logger?.append(
+      `[AcpBackend] poll for action "${action}" could not be confirmed (transport): ${errorMessage(err)}`,
+    );
+    throw new Error(POLL_UNCONFIRMED_MESSAGE);
   }
 
   /**
@@ -1313,7 +1336,12 @@ export class ControlDispatcher {
     let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
     let lastLines: string[] = [];
     for (;;) {
-      const status = await client.actionStatus(action);
+      let status: { running: boolean; exit_code: number | null; lines: string[] };
+      try {
+        status = await client.actionStatus(action);
+      } catch (err) {
+        this.throwPollUnconfirmed(action, err);
+      }
       lastLines = status.lines;
       if (!status.running) break;
       if (Date.now() >= deadline) {
@@ -1323,7 +1351,12 @@ export class ControlDispatcher {
       delay = BACKGROUND_POLL_STEP_DELAY_MS;
     }
 
-    const rows = await client.listSkills();
+    let rows: Awaited<ReturnType<DashboardClientLike['listSkills']>>;
+    try {
+      rows = await client.listSkills();
+    } catch (err) {
+      this.throwPollUnconfirmed(action, err);
+    }
     const found = rows.some((row) => row.name === skillName);
     if (!found) {
       this.rejectSkillInstall(skillName, lastLines);
@@ -1425,7 +1458,12 @@ export class ControlDispatcher {
     let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
     let lastLines: string[] = [];
     for (;;) {
-      const status = await client.actionStatus(action);
+      let status: { running: boolean; exit_code: number | null; lines: string[] };
+      try {
+        status = await client.actionStatus(action);
+      } catch (err) {
+        this.throwPollUnconfirmed(action, err);
+      }
       lastLines = status.lines;
       if (!status.running) break;
       if (Date.now() >= deadline) {
@@ -1435,7 +1473,12 @@ export class ControlDispatcher {
       delay = BACKGROUND_POLL_STEP_DELAY_MS;
     }
 
-    const rows = await client.listSkills();
+    let rows: Awaited<ReturnType<DashboardClientLike['listSkills']>>;
+    try {
+      rows = await client.listSkills();
+    } catch (err) {
+      this.throwPollUnconfirmed(action, err);
+    }
     const stillPresent = rows.some((row) => row.name === skillName);
     if (stillPresent) {
       this.rejectSkillUninstall(skillName, lastLines);
@@ -1906,6 +1949,14 @@ function toMcpAddParams(
  */
 const MCP_RELOAD_DIVERGENCE_MESSAGE =
   'The MCP configuration was saved, but reloading the running Hermes server failed — reload the window or restart Hermes to apply the change.';
+
+/**
+ * F2-09: reported when a poll/verify TRANSPORT call rejects — the action was
+ * already DISPATCHED server-side; we merely lost visibility (distinct from the
+ * ground-truth "did not complete" refusals).
+ */
+const POLL_UNCONFIRMED_MESSAGE =
+  'The action was dispatched, but its status could not be confirmed — refresh the panel to check whether it completed.';
 
 /**
  * Task A6 (§4.7 item 2), widened by Task B4: the shared background-poll

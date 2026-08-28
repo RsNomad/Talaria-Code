@@ -7919,6 +7919,8 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
     exit_code: 0,
     lines: [],
   };
+  /** WS-GD.1 F2-09/CA-M05 harness extension: when set, the NEXT actionStatus resolves to THIS promise (reject → F2-09 unconfirmed; never-settling → CA-M05 hung). Mirrors installDeferred/authDeferred. */
+  actionStatusDeferred: Promise<{ running: boolean; exit_code: number | null; lines: string[] }> | undefined;
   /** Settable canned envelope `authMcpServer` resolves with (signal ignored — the happy-path default). */
   authResult: McpTestResult = { ok: true, tools: [] };
   /** When set, `authMcpServer` returns THIS promise verbatim (ignoring `authResult`/signal) — the IMPORTANT-3 single-flight test's controllable in-flight call. */
@@ -7974,6 +7976,11 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
 
   async actionStatus(name: string): Promise<{ running: boolean; exit_code: number | null; lines: string[] }> {
     this.actionStatusCalls.push(name);
+    if (this.actionStatusDeferred) {
+      const d = this.actionStatusDeferred;
+      this.actionStatusDeferred = undefined;
+      return d;
+    }
     const next = this.statusSeq.shift();
     if (next) this.lastStatus = next;
     return this.lastStatus;
@@ -8556,6 +8563,25 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     expect(message).toBe('Catalog install did not complete — see the Talaria output log.');
     expect(message).not.toContain('EACCES'); // the tail must NEVER leak into the reject message
     expect(logs.some((l) => l.includes('EACCES permission denied'))).toBe(true); // ...only into the output-channel logger
+  });
+
+  it('F2-09: an actionStatus REJECTION reports "dispatched — confirmation unknown" (not a hard install failure)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'builder', needs_install: true, required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'act-1' };
+    client.actionStatusDeferred = Promise.reject(new Error('ECONNRESET')); // transport blip on the first poll
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'builder' })).rejects.toThrow(
+      /could not be confirmed|confirmation unknown|refresh/i,
+    );
+    // NOT the raw transport error, and NOT the ground-truth "did not complete".
+    await expect(backend.invokeControl('mcp.catalog', {})).resolves.toBeDefined(); // sanity: client still usable
   });
 
   // ---------------------------------------------------------------------
