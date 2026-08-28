@@ -1246,6 +1246,21 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
     return upsertMock.mock.calls.flatMap(([records]) => records.map((r) => r.path));
   }
 
+  /** F2-13 (B1) drain helper — see TA-6's identically-purposed helper for the
+   * full rationale: a synchronous manifest-entry check so the existing
+   * `() => boolean` drain predicates can also require `writeManifest`'s
+   * (now two-await) atomic write to have actually landed, not just the
+   * `upsertMock` call that precedes it in `reindexFiles`. */
+  function manifestHasEntrySync(relPath: string): boolean {
+    try {
+      const raw = readFileSync(path.join(indexDir, 'manifest.json'), 'utf8');
+      const parsed: unknown = JSON.parse(raw);
+      return typeof parsed === 'object' && parsed !== null && relPath in parsed;
+    } catch {
+      return false;
+    }
+  }
+
   it.skipIf(!canLinkDir)(
     'RED: a change event through an in-workspace dir-symlink alias READS the confined canonical path and STORES under the alias relPath',
     async () => {
@@ -1263,7 +1278,13 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
       const disposable = indexer.watch();
 
       fsWatcherListeners.change[0]!({ fsPath: aliasAbs });
-      await flushWatch(5, () => upsertedPaths().includes('alias/doc.txt'));
+      // F2-13 (B1): wait for the upsert AND the manifest write to have
+      // actually landed — see the TA-6 helper's doc comment for why the
+      // upsert call alone is no longer a sufficient "done" signal.
+      await flushWatch(
+        5,
+        () => upsertedPaths().includes('alias/doc.txt') && manifestHasEntrySync('alias/doc.txt'),
+      );
 
       // (a) THE RED PAIR — the reindex read must hit the CONFINED canonical
       // path (pathConfine.ts: "read exactly the returned path so the file
@@ -1574,6 +1595,25 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
     }
   }
 
+  /** F2-13 (B1) drain helper: a SYNCHRONOUS manifest-entry check, usable as a
+   * `drainUntil`/`flushWatch` predicate. `writeManifest` is now a same-dir
+   * `.tmp` write + `fs.rename` (crash-safe atomic replace) instead of a
+   * single write — one extra real-fs await beyond `deleteByPathMock` firing.
+   * Waiting on the delete call ALONE (the pre-F2-13 predicate) can observe
+   * the drain as "done" one turn before the renamed manifest actually lands,
+   * reading the file's PRE-purge content — a stale read, not a real failure.
+   * A synchronous `readFileSync` check lets the existing `() => boolean`
+   * drain predicates also require the manifest write to have landed. */
+  function manifestHasEntrySync(relPath: string): boolean {
+    try {
+      const raw = readFileSync(path.join(indexDir, 'manifest.json'), 'utf8');
+      const parsed: unknown = JSON.parse(raw);
+      return typeof parsed === 'object' && parsed !== null && relPath in parsed;
+    } catch {
+      return false;
+    }
+  }
+
   it('RED: a previously-indexed file that GROWS past MAX_FILE_BYTES on a watch event is purged from the store AND the manifest', async () => {
     await writeWorkspaceFile('big.ts', 'export const x = 1;\n');
     const indexer = makeIndexer();
@@ -1592,7 +1632,15 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'big.ts') });
-    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'big.ts'));
+    // F2-13 (B1): wait for the delete call AND the manifest purge to have
+    // actually landed — `writeManifest` is now a same-dir `.tmp` write +
+    // `fs.rename`, one real-fs await beyond `deleteByPathMock` firing, so
+    // waiting on the delete call alone can observe "done" one turn before
+    // the purge is actually persisted (a stale read of the pre-purge file).
+    await flushWatch(
+      10,
+      () => deleteByPathMock.mock.calls.some(([p]) => p === 'big.ts') && !manifestHasEntrySync('big.ts'),
+    );
 
     // AU-24: at HEAD, the oversize `continue` fires BEFORE any purge — the
     // file's OLD (now-wrong) chunks stay in the store and the manifest still
@@ -1624,7 +1672,11 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'data.ts') });
-    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'data.ts'));
+    // F2-13 (B1): see the sibling GROWS test's comment above — same reason.
+    await flushWatch(
+      10,
+      () => deleteByPathMock.mock.calls.some(([p]) => p === 'data.ts') && !manifestHasEntrySync('data.ts'),
+    );
 
     expect(deleteByPathMock).toHaveBeenCalledWith('data.ts');
     expect(upsertMock).not.toHaveBeenCalled();
@@ -2333,8 +2385,25 @@ describe('WS-R2 A5: AU-23 class is dead — dispose mid-await mutates nothing', 
     workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-a5-'));
     indexDir = path.join(workspaceRoot, '.hermes-index');
     upsertMock.mockClear(); deleteByPathMock.mockClear();
+    // M-1 (B1 self-containment hardening): this block installs its own
+    // watcher via indexer.watch()/fsWatcherListeners.change[0] — without
+    // clearing these arrays here, a leftover listener pushed by an earlier
+    // describe block's own indexer.watch() call (never disposed, or disposed
+    // after this beforeEach already read index [0]) could be selected
+    // instead of THIS test's own listener.
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
   });
-  afterEach(() => { rmSync(workspaceRoot, { recursive: true, force: true }); });
+  afterEach(() => {
+    // M-2 (B1 self-containment hardening): restore embedMock's base
+    // implementation (mirrors the F3-11 block's own afterEach) — this
+    // describe's test permanently swaps embedMock via `.mockImplementation`
+    // (never `.mockImplementationOnce`), so without a restore that swap
+    // would otherwise leak into whichever test runs next.
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 
   it('a change event whose embed is in-flight when dispose() fires never upserts or writes the manifest', async () => {
     await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
@@ -2411,5 +2480,68 @@ describe('WS-R2 A5: AU-23 class is dead — dispose mid-await mutates nothing', 
     const manifestExists = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8').then(() => true).catch(() => false);
     expect(manifestExists).toBe(false); // writeManifest was guarded/refused → no manifest file was written
     disposable.dispose();
+  });
+});
+
+/**
+ * F2-13 (adversarial-review-flagged durability fix): `writeManifest` used to
+ * write `manifest.json` directly — a crash (or an out-of-process reader)
+ * mid-write could observe a torn/partial file. `readManifest`'s catch also
+ * used to fold EVERY failure (missing file, permission error, corrupt JSON)
+ * into the SAME silent `{}` — masking real corruption as an ordinary "no
+ * index yet" first run. The fix: `writeManifest` writes a same-directory
+ * `.tmp` file then `fs.rename`s it into place (POSIX same-filesystem atomic
+ * replace — never a torn read); `readManifest` still returns `{}` silently
+ * for ENOENT (the ordinary "no index yet" case) but logs a name-only line
+ * before returning `{}` for any other read failure or parse/shape corruption.
+ */
+describe('F2-13: writeManifest is a crash-safe atomic write; readManifest distinguishes ENOENT from corruption', () => {
+  it('writeManifest writes via a same-dir .tmp then renames (atomic)', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b1-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const renames: Array<[string, string]> = [];
+      const realRename = fs.rename;
+      const spy = vi.spyOn(fs, 'rename').mockImplementation(
+        async (from: Parameters<typeof fs.rename>[0], to: Parameters<typeof fs.rename>[1]) => {
+          renames.push([String(from), String(to)]);
+          return (realRename as typeof fs.rename)(from, to);
+        },
+      );
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      await indexer.build();
+      const manifestPath = path.join(indexDir, 'manifest.json');
+      expect(renames.some(([from, to]) => from === `${manifestPath}.tmp` && to === manifestPath)).toBe(true);
+      await expect(fs.readFile(manifestPath, 'utf8')).resolves.toContain('src/a.txt');
+      spy.mockRestore();
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('readManifest logs a corrupt manifest (not silent) and rebuilds; ENOENT stays silent', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b1c-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(indexDir, { recursive: true });
+      await fs.writeFile(path.join(indexDir, 'manifest.json'), '{ this is not json', 'utf8'); // corrupt
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      expect(logs.some((l) => /manifest/i.test(l) && /corrupt|parse/i.test(l))).toBe(true);
+      expect(upsertMock).toHaveBeenCalled(); // rebuilt src/a.txt despite the corrupt manifest
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
   });
 });
