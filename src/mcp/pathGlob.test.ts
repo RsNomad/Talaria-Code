@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { matchesPathGlobs } from './pathGlob';
+import { compilePathGlobs, matchesPathGlobs } from './pathGlob';
 
 describe('matchesPathGlobs', () => {
   it('matches everything when globs is undefined or empty', () => {
@@ -32,5 +32,20 @@ describe('matchesPathGlobs', () => {
   it('with only negative patterns, anything not excluded matches', () => {
     expect(matchesPathGlobs('src/foo.ts', ['!**/*.test.*'])).toBe(true);
     expect(matchesPathGlobs('src/foo.test.ts', ['!**/*.test.*'])).toBe(false);
+  });
+});
+
+describe('CA-M21: glob→regex translation is bounded', () => {
+  it('rejects an over-length glob with a RangeError', () => {
+    expect(() => compilePathGlobs(['a'.repeat(5000)])).toThrow(RangeError);
+  });
+  it('rejects a glob with too many segments (pathological ** fan-out) in bounded time', () => {
+    const pathological = 'x/'.repeat(500) + '**';
+    const start = Date.now();
+    expect(() => compilePathGlobs([pathological])).toThrow(RangeError);
+    expect(Date.now() - start).toBeLessThan(100); // bounded — no catastrophic work
+  });
+  it('still compiles ordinary globs unchanged', () => {
+    expect(() => compilePathGlobs(['src/**', '!**/*.test.*'])).not.toThrow();
   });
 });
