@@ -1336,6 +1336,115 @@ describe('RAG-01: the full-build hash pass streams — it no longer retains ever
   });
 });
 
+/**
+ * RAG-02: `walk()` (indexer.ts) descends the workspace tree with a bounded
+ * pool (`createConcurrencyPool`, `WALK_CONCURRENCY`) instead of one
+ * sequential recursive await-chain. Walk ORDER is no longer deterministic —
+ * every assertion below is Set/count-based, never order-based.
+ */
+describe('RAG-02: bounded-parallel directory walk', () => {
+  beforeEach(() => {
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  it('RAG-02: parallel walk discovers the same files as a sequential walk and honors nested ignores', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b5b-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      // wide + deep tree
+      for (let d = 0; d < 8; d++) {
+        const dir = path.join(workspaceRoot, `pkg${d}`, 'sub');
+        await fs.mkdir(dir, { recursive: true });
+        for (let f = 0; f < 4; f++) await fs.writeFile(path.join(dir, `f${f}.txt`), `pkg${d} sub f${f}\n`, 'utf8');
+      }
+      // nested ignore: pkg0/sub/.gitignore excludes f3.txt
+      await fs.writeFile(path.join(workspaceRoot, 'pkg0', 'sub', '.gitignore'), 'f3.txt\n', 'utf8');
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      await indexer.build();
+      const upserted = new Set(upsertMock.mock.calls.flatMap(([recs]) => recs.map((r) => r.path)));
+      expect(upserted.has('pkg0/sub/f0.txt')).toBe(true);
+      expect(upserted.has('pkg7/sub/f0.txt')).toBe(true);
+      expect(upserted.has('pkg0/sub/f3.txt')).toBe(false); // nested ignore honored
+      expect([...upserted].filter((p) => /pkg\d\/sub\/f\d\.txt/.test(p)).length).toBe(8 * 4 - 1);
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('RAG-02: walk() overlaps readdir calls up to WALK_CONCURRENCY, never exceeding it', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b5b-conc-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    // Mirrors indexer.ts's own WALK_CONCURRENCY (not exported — this is the
+    // fan-out bound `walk()` must never exceed; keep this literal in sync if
+    // that constant ever changes).
+    const WALK_CONCURRENCY = 8;
+    try {
+      // WALK_CONCURRENCY siblings directly under the root, each holding one
+      // file. The bounded-pool BFS schedules every sibling's pool.run(...)
+      // synchronously in one pass (no await between pushes — see walk()'s
+      // deadlock-safety comment), so all admitted tasks enter their
+      // readdir() call before any of them can resolve.
+      for (let d = 0; d < WALK_CONCURRENCY; d++) {
+        const dir = path.join(workspaceRoot, `pkg${d}`);
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, 'f.txt'), `pkg${d}\n`, 'utf8');
+      }
+
+      // Plain counter/array-push seam (no vi.fn()), same monkey-patch idiom
+      // as this file's top-level fs.rename wrapper and the RAG-01 fs.readFile
+      // wrapper above: replace fs.readdir, call through to the real
+      // implementation, restore in `finally`. The `await Promise.resolve()`
+      // BEFORE the call-through is what makes overlap deterministically
+      // observable — every task admitted in the same synchronous scheduling
+      // pass increments the counter before any of them can decrement it, so
+      // the peak reflects genuine concurrent admission rather than real I/O
+      // timing luck.
+      let inFlightReaddir = 0;
+      let peakConcurrentReaddir = 0;
+      const realReaddir = fs.readdir;
+      fs.readdir = (async (dirPath: Parameters<typeof fs.readdir>[0], ...rest: unknown[]) => {
+        inFlightReaddir++;
+        if (inFlightReaddir > peakConcurrentReaddir) peakConcurrentReaddir = inFlightReaddir;
+        await Promise.resolve();
+        try {
+          return await (realReaddir as typeof fs.readdir)(dirPath as never, ...(rest as unknown as never[]));
+        } finally {
+          inFlightReaddir--;
+        }
+      }) as typeof fs.readdir;
+
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      try {
+        await indexer.build();
+      } finally {
+        fs.readdir = realReaddir;
+      }
+
+      // FD-safety: the pool never admits more concurrent readdir calls than
+      // its bound.
+      expect(peakConcurrentReaddir).toBeLessThanOrEqual(WALK_CONCURRENCY);
+      // Genuine parallelism: a sequential walk (or a regression to the
+      // deadlock-prone `await pool.run(...)` form) never exceeds 1 in-flight
+      // readdir call — this is the assertion that actually pins the fan-out.
+      expect(peakConcurrentReaddir).toBeGreaterThanOrEqual(2);
+
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+});
+
 describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine read-what-you-checked)', () => {
   let workspaceRoot: string;
   let indexDir: string;

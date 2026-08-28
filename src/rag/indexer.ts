@@ -43,6 +43,7 @@ import { WebTreeSitterParser } from './parser/WebTreeSitterParser';
 import { LanceDBStore } from './store/LanceDBStore';
 import type { ChunkRecord, VectorStore } from './store/VectorStore';
 import { createMutationGate } from '../host/util/mutationGate';
+import { createConcurrencyPool } from '../mcp/lsp/toolPipeline';
 
 export interface IndexerOptions {
   workspaceRoot: string;
@@ -99,6 +100,9 @@ export interface Indexer {
 const MANIFEST_FILE = 'manifest.json';
 const MAX_FILE_BYTES = 1_000_000; // matches Continue's shouldChunk cutoff
 const EMBED_BATCH_SIZE = 64; // how-to §2.4: batch ~64-200
+// RAG-02: bounded fan-out for the full-build directory descent — enough to
+// overlap readdir latency without exhausting file descriptors on a big repo.
+const WALK_CONCURRENCY = 8;
 // SEC-1 (audit-3) / F-3b: bump this when secretScanner.ts's rules change so
 // every workspace re-scans its whole index on upgrade — see `IndexMeta.
 // scannerVersion` and `fingerprintMatches` below. A rule-set change can only
@@ -525,71 +529,97 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   }
 
   async function walk(
-    dir: string,
+    root: string,
     ignoreFilter: (p: string) => boolean,
     out: string[],
     ancestors: readonly NestedIgnoreEntry[] = [],
     discoveredNestedDirs?: string[],
   ): Promise<void> {
-    let entries: Dirent[];
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
+    // RAG-02: bounded-parallel BFS descent, reusing the same pool util as
+    // LSP-01 (`createConcurrencyPool`). Deadlock-safety (pool re-entrancy
+    // caveat, toolPipeline.ts): a pooled task must NEVER await a nested
+    // `pool.run` on the SAME pool while holding a slot — `visitDir` below
+    // schedules each child directory by pushing its `pool.run(...)` promise
+    // onto `pending` (no await at schedule time), and this function alone
+    // drains `pending` at the top level, so no task ever waits on the pool
+    // that scheduled it.
+    const pool = createConcurrencyPool(WALK_CONCURRENCY);
+    const pending: Array<Promise<void>> = [];
 
-    // TA-7 (AU-34) / INV-6: discover THIS directory's own nested ignore
-    // file(s) fresh, live, on every full build — independent of whatever
-    // `ignoreFilter`'s (possibly stale, prior-build) nested knowledge
-    // already contains, so a brand-new nested `.gitignore` is honored
-    // starting with the VERY build that walks past it. The workspace ROOT
-    // is excluded here: its `.gitignore`/`.hermesignore` are already folded
-    // into `ignoreFilter` via `loadIgnoreFilter()`, so re-reading them here
-    // too would just be a redundant duplicate check.
-    let localAncestors = ancestors;
-    if (dir !== opts.workspaceRoot) {
-      const dirRel = toPosixRelative(path.relative(opts.workspaceRoot, dir));
-      const dirContents: string[] = [];
-      try {
-        dirContents.push(await fs.readFile(path.join(dir, '.gitignore'), 'utf8'));
-      } catch {
-        // no nested .gitignore in this directory.
-      }
-      try {
-        dirContents.push(await fs.readFile(path.join(dir, '.hermesignore'), 'utf8'));
-      } catch {
-        // optional
-      }
-      if (dirContents.length > 0) {
-        localAncestors = [...ancestors, { dirRel, matches: createIgnoreFilter(dirContents) }];
-        discoveredNestedDirs?.push(dirRel);
-      }
-    }
+    const visitDir = (dir: string, localAncestors: readonly NestedIgnoreEntry[]): void => {
+      pending.push(
+        pool.run(async () => {
+          let entries: Dirent[];
+          try {
+            entries = await fs.readdir(dir, { withFileTypes: true });
+          } catch {
+            return;
+          }
 
-    for (const entry of entries) {
-      const abs = path.join(dir, entry.name);
-      const rel = toPosixRelative(path.relative(opts.workspaceRoot, abs));
-      // Secret-path floor (W5-T6): a `.env`/`id_rsa`/`.aws/credentials`-class
-      // file is skipped BEFORE it is ever read/chunked/embedded — same
-      // classifier as the completion exfiltration gate (one source of
-      // truth). This walk-time check is a PATH filter only; it does not
-      // scan content, and it cannot be overridden by `.gitignore` negation
-      // (defense in depth). SEC-1 (audit-3) adds the missing CONTENT layer
-      // for files that pass this path filter — see the `scanSnippetForSecrets`
-      // call in `reindexFiles` below, the two layers together now mirror the
-      // completion path's path+content gate.
-      if (
-        ignoreFilter(rel) ||
-        isSecretForCompletion(rel) ||
-        matchesNestedIgnore(localAncestors, rel)
-      ) {
-        continue;
-      }
-      if (entry.isDirectory()) {
-        await walk(abs, ignoreFilter, out, localAncestors, discoveredNestedDirs);
-      } else if (entry.isFile()) {
-        out.push(abs);
-      }
+          // TA-7 (AU-34) / INV-6: discover THIS directory's own nested
+          // ignore file(s) fresh, live, on every full build — independent of
+          // whatever `ignoreFilter`'s (possibly stale, prior-build) nested
+          // knowledge already contains, so a brand-new nested `.gitignore`
+          // is honored starting with the VERY build that walks past it. The
+          // workspace ROOT is excluded here: its `.gitignore`/`.hermesignore`
+          // are already folded into `ignoreFilter` via `loadIgnoreFilter()`,
+          // so re-reading them here too would just be a redundant duplicate
+          // check.
+          let dirAncestors = localAncestors;
+          if (dir !== opts.workspaceRoot) {
+            const dirRel = toPosixRelative(path.relative(opts.workspaceRoot, dir));
+            const dirContents: string[] = [];
+            try {
+              dirContents.push(await fs.readFile(path.join(dir, '.gitignore'), 'utf8'));
+            } catch {
+              // no nested .gitignore in this directory.
+            }
+            try {
+              dirContents.push(await fs.readFile(path.join(dir, '.hermesignore'), 'utf8'));
+            } catch {
+              // optional
+            }
+            if (dirContents.length > 0) {
+              dirAncestors = [...localAncestors, { dirRel, matches: createIgnoreFilter(dirContents) }];
+              discoveredNestedDirs?.push(dirRel);
+            }
+          }
+
+          for (const entry of entries) {
+            const abs = path.join(dir, entry.name);
+            const rel = toPosixRelative(path.relative(opts.workspaceRoot, abs));
+            // Secret-path floor (W5-T6): a `.env`/`id_rsa`/`.aws/credentials`-
+            // class file is skipped BEFORE it is ever read/chunked/embedded —
+            // same classifier as the completion exfiltration gate (one
+            // source of truth). This walk-time check is a PATH filter only;
+            // it does not scan content, and it cannot be overridden by
+            // `.gitignore` negation (defense in depth). SEC-1 (audit-3) adds
+            // the missing CONTENT layer for files that pass this path filter
+            // — see the `scanSnippetForSecrets` call in `reindexFiles` below,
+            // the two layers together now mirror the completion path's
+            // path+content gate.
+            if (
+              ignoreFilter(rel) ||
+              isSecretForCompletion(rel) ||
+              matchesNestedIgnore(dirAncestors, rel)
+            ) {
+              continue;
+            }
+            if (entry.isDirectory()) {
+              visitDir(abs, dirAncestors); // schedules; does NOT await here
+            } else if (entry.isFile()) {
+              out.push(abs);
+            }
+          }
+        }),
+      );
+    };
+
+    visitDir(root, ancestors);
+    // Drain: `pending` grows as directories are discovered; re-read its
+    // (growing) length on every pass rather than snapshotting it up front.
+    for (let i = 0; i < pending.length; i++) {
+      await pending[i];
     }
   }
 
