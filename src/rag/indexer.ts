@@ -408,6 +408,26 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     }
   }
 
+  /**
+   * Audit D-2: the manifest is path -> contentHash and nothing else, and
+   * `indexDir` does not depend on the embedding model or its width. Change the
+   * model and every stored vector becomes incomparable with every new query
+   * vector — search degrades silently and permanently, because content hashes
+   * still match and nothing is recomputed. The fingerprint (`fingerprintMatches`
+   * above) makes that detectable.
+   *
+   * This intentionally reports a MISMATCH (not a match) only — it does not
+   * hand back a manifest to use. An earlier version of this fix discarded the
+   * whole stored manifest (`return {}`) on a mismatch, which silently starved
+   * BOTH the self-heal secret-purge loop below (W5-T6: it iterates the stored
+   * manifest to find and delete stale secret-path vector rows) and the
+   * ordinary deleted-file cleanup (`diffContentHashes`'s `toDelete`, which
+   * also needs the real stored path set) on every first post-upgrade build —
+   * caught by the existing B-10 regression test. So `runBuild` below reads
+   * the real, un-gated manifest for purge/delete purposes and uses the
+   * fingerprint flag ONLY to decide whether stored content hashes (and the
+   * stored width) may still be trusted.
+   */
   function fingerprintMatches(stored: IndexMeta | undefined): boolean {
     const want = currentMeta();
     return (
@@ -458,26 +478,6 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     await fs.writeFile(metaPath, JSON.stringify(meta), 'utf8');
   }
 
-  /**
-   * Audit D-2: the manifest is path -> contentHash and nothing else, and
-   * `indexDir` does not depend on the embedding model or its width. Change the
-   * model and every stored vector becomes incomparable with every new query
-   * vector — search degrades silently and permanently, because content hashes
-   * still match and nothing is recomputed. The fingerprint (`fingerprintMatches`
-   * above) makes that detectable.
-   *
-   * This intentionally reports a MISMATCH (not a match) only — it does not
-   * hand back a manifest to use. An earlier version of this fix discarded the
-   * whole stored manifest (`return {}`) on a mismatch, which silently starved
-   * BOTH the self-heal secret-purge loop below (W5-T6: it iterates the stored
-   * manifest to find and delete stale secret-path vector rows) and the
-   * ordinary deleted-file cleanup (`diffContentHashes`'s `toDelete`, which
-   * also needs the real stored path set) on every first post-upgrade build —
-   * caught by the existing B-10 regression test. So `runBuild` below reads
-   * the real, un-gated manifest for purge/delete purposes and uses the
-   * fingerprint flag ONLY to decide whether stored content hashes (and the
-   * stored width) may still be trusted.
-   */
   async function loadIgnoreFilter(): Promise<(relPosixPath: string) => boolean> {
     // AUDIT-5 Task 10: serve the cached predicate when one is live — see the
     // `cachedIgnoreFilter` declaration above for the invalidation contract.
