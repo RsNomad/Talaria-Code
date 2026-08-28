@@ -221,20 +221,31 @@ describe('W6-FK (I-9): session/ purity guard — HEADLESS tier (vscode-free + fs
 // this task. Mirrors `contextPurity.test.ts`/`nextEditPurity.test.ts`'s
 // established shape (own ROOT, own ADAPTER_ALLOW, the SAME shared
 // `VSCODE_IMPORT_BAN`/`FS_IMPORT_BAN` from `purityScan.ts`), narrowed to
-// rag/'s own adapter: `indexer.ts` is the one file that legitimately
-// imports BOTH `vscode` (workspace root resolution / file-watcher wiring)
-// AND `node:fs` (walking the workspace tree to index it) — unlike
+// rag/'s own adapter(s): `indexer.ts` is the file that legitimately imports
+// BOTH `vscode` (workspace root resolution / file-watcher wiring) AND
+// `node:fs` (walking the workspace tree to index it) — unlike
 // `context/`/`nextedit/`'s adapters, which need vscode but never fs, so
 // (unlike those two files' zero-exception fs-ban) THIS guard's fs-ban
-// carries the identical adapter exception as its vscode-ban. Every other
-// rag/ module (chunk/, parser/, store/, chunker.ts, contentHash.ts,
-// embedder.ts, gitignore.ts, header.ts, hybrid.ts) must import neither —
-// verified true at widening time (empirically re-checked: `indexer.ts` is
-// the ONLY vscode/fs importer anywhere under `src/rag/`).
+// carries a WIDER adapter exception than its vscode-ban. Every other rag/
+// module (chunk/, parser/, store/, chunker.ts, contentHash.ts, embedder.ts,
+// gitignore.ts, header.ts, hybrid.ts) must import neither.
+//
+// B8 (FUNC-INDEXER, pure-move refactor): `indexer.ts`'s `runBuild`/
+// `reindexFiles`/`walk` were extracted into `buildPipeline.ts` verbatim,
+// including their `node:fs` calls (the RAG test suite monkey-patches
+// `node:fs`'s promise methods on the shared module-cache singleton, so the
+// extracted module imports `fs` the SAME way indexer.ts does rather than
+// threading it through the `IndexerContext` bag — see buildPipeline.ts's own
+// doc comment). `buildPipeline.ts` never imports `vscode` (it takes
+// `opts.workspaceRoot` etc. as plain data via the ctx bag), so it widens
+// ONLY the fs-ban exception (`RAG_FS_ADAPTER_ALLOW`), not the vscode-ban one
+// (`RAG_ADAPTER_ALLOW`) — a future accidental `import 'vscode'` inside
+// buildPipeline.ts would still be caught.
 // ---------------------------------------------------------------------------
 
 const RAG_ROOT = join(__dirname, '..', '..', 'rag');
 const RAG_ADAPTER_ALLOW = new Set(['indexer.ts']);
+const RAG_FS_ADAPTER_ALLOW = new Set(['indexer.ts', 'buildPipeline.ts']);
 
 function collectRagSources() {
   return collectNonTestTsSources(RAG_ROOT);
@@ -255,9 +266,9 @@ describe('T-18 (C3): rag/ purity guard', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('no module under rag/ imports node:fs EXCEPT the sanctioned indexer.ts', () => {
+  it('no module under rag/ imports node:fs EXCEPT the sanctioned indexer.ts/buildPipeline.ts', () => {
     const offenders = collectRagSources()
-      .filter((f) => !RAG_ADAPTER_ALLOW.has(f.file))
+      .filter((f) => !RAG_FS_ADAPTER_ALLOW.has(f.file))
       .filter((f) => FS_IMPORT_BAN.test(f.content))
       .map((f) => f.file);
     expect(offenders).toEqual([]);
@@ -281,7 +292,7 @@ describe('T-18 (C3): rag/ purity guard', () => {
 
   it('RED-first proof: the fs-ban would catch a hypothetical non-adapter violation (in-memory injection into the REAL collected file list)', () => {
     const withInjectedViolation = [
-      ...collectRagSources().filter((f) => !RAG_ADAPTER_ALLOW.has(f.file)),
+      ...collectRagSources().filter((f) => !RAG_FS_ADAPTER_ALLOW.has(f.file)),
       { file: '__hypothetical_fs_violation__.ts', absPath: '', content: "import { readFileSync } from 'node:fs';\n" },
     ];
     const offenders = withInjectedViolation.filter((f) => FS_IMPORT_BAN.test(f.content)).map((f) => f.file);
