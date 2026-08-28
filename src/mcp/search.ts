@@ -1,5 +1,6 @@
 import type { Embedder } from '../rag/embedder';
 import type { SearchFilter, SearchHit, VectorStore } from '../rag/store/VectorStore';
+import { CONTROL_CHAR_PATTERN } from './lsp/frameSanitize';
 import { compilePathGlobs, matchesCompiledPathGlobs } from './pathGlob';
 import type { CodebaseSearchInput } from './toolSchema';
 
@@ -62,5 +63,10 @@ const FENCE_LANGUAGE_PATTERN = /^[A-Za-z0-9_+-]{1,32}$/;
 export function formatHitAsText(hit: SearchHit): string {
   const rawLanguage = hit.language ?? '';
   const fence = FENCE_LANGUAGE_PATTERN.test(rawLanguage) ? rawLanguage : '';
-  return `${hit.path}:${hit.startLine + 1}-${hit.endLine + 1}\n\`\`\`${fence}\n${hit.content}\n\`\`\``;
+  // LSP-02 (DiD): strip C0 controls + DEL from the untrusted snippet, exactly
+  // as the LSP tool outputs are sanitized. CR/LF/tab are intentionally kept
+  // (CONTROL_CHAR_PATTERN excludes them) — they are legitimate in a fenced
+  // code block and pose no framing risk.
+  const safeContent = hit.content.replace(CONTROL_CHAR_PATTERN, '');
+  return `${hit.path}:${hit.startLine + 1}-${hit.endLine + 1}\n\`\`\`${fence}\n${safeContent}\n\`\`\``;
 }

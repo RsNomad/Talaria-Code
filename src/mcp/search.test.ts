@@ -146,4 +146,19 @@ describe('formatHitAsText', () => {
     expect(text.startsWith('src/a.ts:1-4\n```\n')).toBe(true);
     expect(text).not.toContain('python"><evil');
   });
+
+  it('LSP-02: formatHitAsText strips control characters from the snippet but keeps tabs and newlines', () => {
+    const hitWithControlChars: SearchHit = {
+      id: 'x',
+      path: 'src/a.ts',
+      startLine: 0,
+      endLine: 2,
+      score: 1,
+      language: 'ts',
+      content: 'line1\n\tindented\x07\x00 bell+nul\nline3',
+    };
+    const out = formatHitAsText(hitWithControlChars);
+    expect(out).not.toMatch(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/); // no control chars
+    expect(out).toContain('\n\tindented bell+nul'); // \t and \n preserved, \x07/\x00 gone
+  });
 });
