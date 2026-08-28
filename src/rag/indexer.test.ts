@@ -2587,16 +2587,40 @@ describe('F3-11: dispose() drains the in-flight buildChain before closing the st
       workspaceRoot, indexDir,
       embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
     });
-    embedMock.mockImplementationOnce(() => new Promise<number[][]>(() => { /* never resolves */ }));
+    // ISO-1: a CONTROLLABLE hung embed (not a genuinely-never-settling promise).
+    // During the assertion window it stays unresolved (so the deadline path is
+    // exercised exactly as before); in cleanup we reject it and await the build
+    // so the chain fully unwinds BEFORE afterEach's rmSync — no dangling op can
+    // race the recursive delete (the Windows ENOTEMPTY flake this kills).
+    let releaseHungEmbed!: () => void;
+    const hungEmbed = new Promise<number[][]>((_resolve, reject) => {
+      releaseHungEmbed = () => reject(new Error('ISO-1 cleanup: unwind parked build chain'));
+    });
+    // Whether the production chain actually reaches this mock before it bails
+    // out via an earlier `disposed` check (a real timing race — verified
+    // empirically that within this test's own execution window it can settle
+    // via that earlier bail-out WITHOUT ever calling embed) is not something
+    // this test controls. Attach our own handler unconditionally so releasing
+    // it below can never surface as an unhandled rejection either way.
+    hungEmbed.catch(() => undefined);
+    embedMock.mockImplementationOnce(() => hungEmbed);
     await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
     await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
-    void indexer.build();
+    const building = indexer.build();
     await vi.advanceTimersByTimeAsync(0);
     closeMock.mockClear();
 
     indexer.dispose();
     await vi.advanceTimersByTimeAsync(11_000); // past MUTATION_GATE_DRAIN_DEADLINE_MS (10s)
     expect(closeMock).toHaveBeenCalledTimes(1);
+
+    // ISO-1: unwind the parked chain now that the deadline behaviour is proven,
+    // so it cannot outlive the test and race afterEach's rmSync. The gate is
+    // already closed (dispose fired), so the rejected embed simply unwinds
+    // reindexFiles/runBuild with no sink writes; build() settles.
+    releaseHungEmbed();
+    await building.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
   });
 });
 
