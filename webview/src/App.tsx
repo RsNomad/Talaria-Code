@@ -55,6 +55,7 @@ import {
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
+import { useDebouncedPersist } from './state/useDebouncedPersist';
 import {
   errorMessage,
   fetchPanel,
@@ -365,29 +366,38 @@ export function App() {
   // needed). Title ownership stays webview-side (the host deliberately does
   // not own a tab title); this is a read-only snapshot, never a second
   // source of truth for `TabState.title` itself.
-  useEffect(() => {
-    // F-5 (final-4way-fixes.md, defensive): guard-consistent with the
-    // TabStrip render below (`.filter((t): t is TabState => t !== undefined)`)
-    // — under `noUncheckedIndexedAccess`, `state.tabs[id]` is `TabState |
-    // undefined`; a stale id in `tabOrder` with no matching `tabs` entry
-    // (unreachable today given how the effect derives its ids, hence
-    // Minor/defensive) must skip that id rather than throw on `.title`.
-    const tabTitles = Object.fromEntries(
-      state.tabOrder
-        .map((id) => state.tabs[id])
-        .filter((t): t is TabState => t !== undefined)
-        .map((t) => [t.tabId, t.title]),
-    );
-    bridge.setState({
-      composerHeight,
-      tabTitles,
-      nextChatNumber: state.nextChatNumber,
-      // AUDIT-5 UI M-2: same per-write-derived-fresh posture as `tabTitles`
-      // above — a closed tab's stale draft is pruned automatically on the
-      // very next write, no separate cleanup path needed.
-      drafts: buildDraftSnapshot(state),
-    });
-  }, [composerHeight, state.tabs, state.tabOrder, state.nextChatNumber]);
+  // CA-10: same snapshot + same dep list as the direct write; execution
+  // coalesced to a trailing 400ms write + flush on hidden/unmount (see
+  // useDebouncedPersist). state.tabs gets a fresh ref per token fold, so the
+  // direct write fired per delta — this coalesces that to one write per
+  // quiescence without changing WHAT or WHEN (durability-wise) is persisted.
+  useDebouncedPersist(
+    () => {
+      // F-5 (final-4way-fixes.md, defensive): guard-consistent with the
+      // TabStrip render below (`.filter((t): t is TabState => t !== undefined)`)
+      // — under `noUncheckedIndexedAccess`, `state.tabs[id]` is `TabState |
+      // undefined`; a stale id in `tabOrder` with no matching `tabs` entry
+      // (unreachable today given how the effect derives its ids, hence
+      // Minor/defensive) must skip that id rather than throw on `.title`.
+      const tabTitles = Object.fromEntries(
+        state.tabOrder
+          .map((id) => state.tabs[id])
+          .filter((t): t is TabState => t !== undefined)
+          .map((t) => [t.tabId, t.title]),
+      );
+      return {
+        composerHeight,
+        tabTitles,
+        nextChatNumber: state.nextChatNumber,
+        // AUDIT-5 UI M-2: same per-write-derived-fresh posture as `tabTitles`
+        // above — a closed tab's stale draft is pruned automatically on the
+        // very next write, no separate cleanup path needed.
+        drafts: buildDraftSnapshot(state),
+      };
+    },
+    [composerHeight, state.tabs, state.tabOrder, state.nextChatNumber],
+    400,
+  );
 
   // §7 B9(c): drain any tabIds `handleSessionChange`'s dedup queued for
   // closing — post `tab.close` for each so the host session doesn't leak
