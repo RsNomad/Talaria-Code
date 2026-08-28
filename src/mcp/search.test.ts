@@ -163,6 +163,16 @@ describe('formatHitAsText', () => {
     expect(out).not.toMatch(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/); // no control chars
     expect(out).toContain('\n\tindented bell+nul'); // \t and \n preserved, \x07/\x00 gone
   });
+
+  it('LSP-02: formatHitAsText strips control characters from the hit path too (DiD parity)', () => {
+    const hit: SearchHit = {
+      id: 'x', path: 'src/a\x07\x00b.ts', startLine: 0, endLine: 2, score: 1, language: 'ts',
+      content: 'clean\n',
+    };
+    const out = formatHitAsText(hit);
+    expect(out).not.toMatch(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/); // no control chars anywhere
+    expect(out).toContain('src/ab.ts:1-3'); // \x07/\x00 gone from the path segment
+  });
 });
 
 /**

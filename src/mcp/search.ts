@@ -95,5 +95,9 @@ export function formatHitAsText(hit: SearchHit): string {
   // (CONTROL_CHAR_PATTERN excludes them) — they are legitimate in a fenced
   // code block and pose no framing risk.
   const safeContent = hit.content.replace(CONTROL_CHAR_PATTERN, '');
-  return `${hit.path}:${hit.startLine + 1}-${hit.endLine + 1}\n\`\`\`${fence}\n${safeContent}\n\`\`\``;
+  // LSP-02 DiD parity: the path is untrusted too — strip the same control chars
+  // the LSP tool outputs strip from every field (sanitizeLsString), so a crafted
+  // filename can't smuggle control bytes into the header.
+  const safePath = hit.path.replace(CONTROL_CHAR_PATTERN, '');
+  return `${safePath}:${hit.startLine + 1}-${hit.endLine + 1}\n\`\`\`${fence}\n${safeContent}\n\`\`\``;
 }
