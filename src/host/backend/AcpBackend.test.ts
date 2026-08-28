@@ -8527,6 +8527,56 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     expect(client.actionStatusCalls).toEqual(['mcp-install-builder-ab12cd34', 'mcp-install-builder-ab12cd34']);
   });
 
+  it('CA-M06: the background-poll sleep timer is unref()ed (a pending poll-sleep cannot keep the event loop alive)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'builder', needs_install: true, required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'act-1' };
+    client.statusSeq = [
+      { running: true, exit_code: null, lines: [] }, // → the loop sleeps once ...
+      { running: false, exit_code: 0, lines: ['done'] },
+    ];
+    client.catalogEntriesAfterInstall = [catalogRow({ name: 'builder', needs_install: true, installed: true })];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    // Record each setTimeout's delay + whether unref() was later called on its handle.
+    const timers: Array<{ ms: number; unrefed: boolean }> = [];
+    const realSetTimeout: typeof setTimeout = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((cb: (...cbArgs: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+        const handle = realSetTimeout(cb, ms, ...rest);
+        const record = { ms: ms ?? 0, unrefed: false };
+        timers.push(record);
+        const timer = handle as unknown as { unref?: () => unknown };
+        if (typeof timer.unref === 'function') {
+          const realUnref = timer.unref.bind(timer);
+          timer.unref = () => {
+            record.unrefed = true;
+            return realUnref();
+          };
+        }
+        return handle;
+      }) as unknown as typeof setTimeout,
+    );
+    try {
+      const resultPromise = backend.invokeControl('mcp.catalogInstall', { name: 'builder' });
+      await vi.advanceTimersByTimeAsync(1_000); // fire the one poll-sleep
+      await resultPromise;
+      // Pin the poll-SLEEP timer specifically (NOT the Task-3 deadline timer, which is 180000ms).
+      // The sleep timer is the short, non-deadline one the loop created.
+      const sleepTimers = timers.filter((t) => t.ms > 0 && t.ms < 180_000);
+      expect(sleepTimers.length).toBeGreaterThan(0); // the poll actually slept
+      expect(sleepTimers.every((t) => t.unrefed)).toBe(true); // and every poll-sleep timer was unref'd
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('mcp.catalogInstall: action finished but installed-flag still false -> generic reject, tail to logger only', async () => {
     const logs: string[] = [];
     const client = new FakeAdminDashboardClient();
