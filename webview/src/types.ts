@@ -186,6 +186,15 @@ export interface TabState {
   binding: 'unbound' | 'pending' | 'bound';
   title: string;
   transcript: TranscriptItem[];
+  /**
+   * CA-M15: how many oldest transcript items have been trimmed from this tab
+   * to keep the view responsive (reducer-level cap, MAX_TRANSCRIPT_ITEMS).
+   * Absent ≡ 0 (kept off `makeTabState` so existing toEqual assertions on a
+   * fresh tab stay byte-identical); reset to 0 on `clear`. Monotonic between
+   * clears. Drives ChatView's honest "N earlier messages hidden" affordance +
+   * a one-time polite SR announcement.
+   */
+  hiddenCount?: number;
   plan: PlanStepView[];
   turnActive: boolean;
   /**

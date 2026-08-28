@@ -45,6 +45,11 @@ interface ChatViewProps {
    * the user's echoed message and the first agent item. Optional so every
    * existing render without it stays byte-identical. */
   turnActive?: boolean;
+  /** CA-M15: how many oldest transcript items the reducer has trimmed from
+   * this tab (TabState.hiddenCount). Drives the honest collapse affordance,
+   * rendered inside role="log" so its appearance is announced politely
+   * (announce-once — see the affordance comment). Absent/0 → nothing rendered. */
+  hiddenCount?: number;
 }
 
 /**
@@ -345,7 +350,9 @@ export const ChatView = memo(function ChatView({
   starterDisabled,
   onOpenSetup,
   turnActive,
+  hiddenCount,
 }: ChatViewProps) {
+  const hidden = hiddenCount ?? 0;
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // UI#1: `pinnedRef` stays the single SYNCHRONOUS source of truth for the
@@ -462,6 +469,20 @@ export const ChatView = memo(function ChatView({
           tabIndex={0}
           className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-3 py-3.5"
         >
+          {/* CA-M15: honest "older messages collapsed" affordance. Rendered as
+           * the first child of role="log" (implicit aria-live="polite"): its
+           * APPEARANCE is announced as a log addition (announce-once); later
+           * count bumps are text changes to an existing node, which role="log"
+           * does not re-announce (this file's settlementAnnouncement doc) —
+           * exactly the desired low-chatter cadence. No separate live region:
+           * LiveRegion's frozen signature can't be told apart by name, and a
+           * second role="status" would break the singular getByRole('status')
+           * queries. The always-mounted log IS the live region. */}
+          {hidden > 0 && (
+            <div className="flex-none py-1 text-center text-2xs text-faint">
+              {hidden} earlier {hidden === 1 ? 'message' : 'messages'} hidden to keep the view responsive
+            </div>
+          )}
           {transcript.map((item, i) => (
             <div key={itemKey(item, i)}>
               <TranscriptRow

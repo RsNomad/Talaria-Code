@@ -3,7 +3,7 @@ import type { CheckpointsData, DataPanel, PanelDataMap, ThemeInfo } from '../pro
 import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type AppState, type MessageItem } from '../types';
 import { must } from '../testing/must';
 import { assertExhaustivePanel } from './panels';
-import { reduce, reduceLocal } from './transcript';
+import { reduce, reduceLocal, MAX_TRANSCRIPT_ITEMS } from './transcript';
 
 /** One minimal-valid payload per GLOBAL DataPanel (§2f) — used to pin every
  * global panel's routing, not just `tools` (P7-N4). */
@@ -2798,5 +2798,53 @@ describe('CA-09: message.delta O(1) fast path (behavior-identical, no reverse-co
     const nextTab = must(next.tabs.boot, 'boot tab');
     expect(nextTab.transcript[0]).toMatchObject({ kind: 'message', text: 'AB', streaming: true });
     expect(nextTab.transcript[1]).toBe(reasoning); // untouched
+  });
+});
+
+describe('CA-M15: transcript length cap keeps the tail and records the drop count', () => {
+  function tabWithNItems(n: number): AppState {
+    const transcript = Array.from({ length: n }, (_, i) => ({
+      kind: 'message' as const, turnId: `t${i}`, id: `msg-t${i}-0`, text: `m${i}`, streaming: false,
+    }));
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript };
+    return { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+  }
+
+  it('trims to the cap and reports how many were dropped when a fold pushes over the limit', () => {
+    const state = tabWithNItems(MAX_TRANSCRIPT_ITEMS); // exactly at the cap
+    const next = reduce(state, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
+    const tab = must(next.tabs.boot, 'boot tab');
+    expect(tab.transcript).toHaveLength(MAX_TRANSCRIPT_ITEMS); // one added, one dropped
+    expect(tab.hiddenCount).toBe(1);
+    expect(tab.transcript[tab.transcript.length - 1]).toMatchObject({ kind: 'reasoning', blockId: 'rN' });
+    expect(tab.transcript[0]).toMatchObject({ text: 'm1' }); // m0 was dropped from the front
+  });
+
+  it('leaves a below-cap transcript (and hiddenCount) untouched', () => {
+    const state = tabWithNItems(10);
+    const next = reduce(state, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
+    const tab = must(next.tabs.boot, 'boot tab');
+    expect(tab.transcript).toHaveLength(11);
+    expect(tab.hiddenCount ?? 0).toBe(0);
+  });
+
+  it('the active streaming message still folds correctly after trimming', () => {
+    let state = tabWithNItems(MAX_TRANSCRIPT_ITEMS - 1);
+    state = reduce(state, { type: 'message.delta', turnId: 'live', sessionId: 's1', text: 'A' }); // opens (at cap now)
+    state = reduce(state, { type: 'message.delta', turnId: 'live', sessionId: 's1', text: 'B' }); // still folds the tail
+    const tab = must(state.tabs.boot, 'boot tab');
+    const live = tab.transcript.filter((i) => i.kind === 'message' && i.turnId === 'live');
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ text: 'AB', streaming: true });
+  });
+
+  it('clear resets hiddenCount to 0', () => {
+    const over = tabWithNItems(MAX_TRANSCRIPT_ITEMS + 5);
+    const trimmed = reduce(over, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
+    expect(must(trimmed.tabs.boot, 'boot').hiddenCount).toBeGreaterThan(0);
+    const cleared = reduce(trimmed, { type: 'clear', sessionId: 's1' });
+    const tab = must(cleared.tabs.boot, 'boot');
+    expect(tab.transcript).toHaveLength(0);
+    expect(tab.hiddenCount ?? 0).toBe(0);
   });
 });

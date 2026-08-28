@@ -35,6 +35,20 @@ import { success, type RemoteData } from './remoteData';
 import { handleSessionChange, sessionToTab } from './tabs';
 
 /**
+ * CA-M15: hard cap on transcript items per tab. The reducer keeps the last
+ * MAX_TRANSCRIPT_ITEMS and records the running drop count in `TabState.
+ * hiddenCount`. The active turn's items are always at the tail, so trimming
+ * the oldest settled items never orphans an in-flight streaming fold.
+ */
+export const MAX_TRANSCRIPT_ITEMS = 500;
+
+function capTranscript(tab: TabState): TabState {
+  const over = tab.transcript.length - MAX_TRANSCRIPT_ITEMS;
+  if (over <= 0) return tab;
+  return { ...tab, transcript: tab.transcript.slice(over), hiddenCount: (tab.hiddenCount ?? 0) + over };
+}
+
+/**
  * Deterministic id for a new message block, derived from the turn and how many
  * message blocks already exist for it. Pure — safe under React StrictMode's
  * double-invocation of reducers (no module-level mutable counter).
@@ -157,7 +171,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       // (absent ≡ initial), never by writing an explicit `undefined` —
       // TabState.error stays `?: {...}`, no `| undefined` widening.
       const { error: _clearedError, ...rest } = tab;
-      return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false };
+      return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false, hiddenCount: 0 };
     }
 
     case 'turn.end': {
@@ -1031,7 +1045,7 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
     case 'plan.update':
     case 'result.summary':
     case 'error':
-      return foldSessionScoped(state, msg.sessionId, msg.type, (tab) => foldTab(tab, msg));
+      return foldSessionScoped(state, msg.sessionId, msg.type, (tab) => capTranscript(foldTab(tab, msg)));
 
     // Task 10: CONNECTION-GLOBAL accumulation of the throttled
     // `setup.progress` stream (Agent install log lines, FIM/RAG model pull

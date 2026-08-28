@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, fireEvent, screen } from '@testing-library/react';
+import { render, fireEvent, screen, within } from '@testing-library/react';
 import { ChatView } from './ChatView';
 import type { ApprovalItem, MessageItem, TranscriptItem, UserItem } from '../../types';
 
@@ -57,6 +57,27 @@ function renderChatView(transcript: TranscriptItem[]) {
       onDiff={() => undefined}
       onOpenDiff={() => undefined}
       onStarter={() => undefined}
+    />,
+  );
+}
+
+function renderChatViewWithHidden(transcript: TranscriptItem[], hiddenCount: number | undefined) {
+  return render(
+    <ChatView
+      transcript={transcript}
+      onApproval={() => undefined}
+      onDiff={() => undefined}
+      onOpenDiff={() => undefined}
+      onStarter={() => undefined}
+      // CA-M15 correction (mirrors App.tsx): `hiddenCount` here is
+      // `number | undefined`, but `ChatViewProps.hiddenCount` is
+      // `?: number` — under exactOptionalPropertyTypes, passing an explicit
+      // `undefined` value is a tsc error. Omit the key by conditional
+      // spread instead; behaviorally identical (an absent prop and an
+      // explicit `undefined` both fall through ChatView's own
+      // `hiddenCount ?? 0`), and still exercises the `undefined` case the
+      // "renders no affordance" test below asserts on.
+      {...(hiddenCount !== undefined ? { hiddenCount } : {})}
     />,
   );
 }
@@ -471,5 +492,31 @@ describe('CA-M14: memoized transcript scans render identically', () => {
     renderChatView([userItem(), messageItem({ text: 'done' })]);
     expect(screen.getByRole('alert')).toHaveTextContent('');
     expect(screen.getByRole('status')).toHaveTextContent('');
+  });
+});
+
+describe('CA-M15: collapsed-older-messages affordance', () => {
+  it('shows the honest count when items were hidden', () => {
+    renderChatViewWithHidden([messageItem({ text: 'newest' })], 7);
+    expect(screen.getByText(/7 earlier messages hidden/i)).toBeInTheDocument();
+  });
+
+  it('renders the affordance INSIDE the role="log" live region (announced as an addition)', () => {
+    renderChatViewWithHidden([messageItem({ text: 'newest' })], 7);
+    const log = screen.getByRole('log');
+    expect(within(log).getByText(/7 earlier messages hidden/i)).toBeInTheDocument();
+  });
+
+  it('singular pluralization for exactly one hidden message', () => {
+    renderChatViewWithHidden([messageItem({ text: 'newest' })], 1);
+    expect(screen.getByText(/1 earlier message hidden/i)).toBeInTheDocument();
+  });
+
+  it('renders no affordance when nothing is hidden (and does not add a second status region)', () => {
+    renderChatViewWithHidden([messageItem({ text: 'only' })], undefined);
+    expect(screen.queryByText(/earlier message/i)).toBeNull();
+    // regression: still exactly one polite status region (settlement), so the
+    // existing getByRole('status') singular queries keep resolving.
+    expect(screen.getAllByRole('status')).toHaveLength(1);
   });
 });

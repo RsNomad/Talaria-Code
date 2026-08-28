@@ -1053,6 +1053,13 @@ export function App() {
               // from — gates the "Waiting for the agent…" indicator for the
               // dead-air window right after the user's echo lands.
               turnActive={tab.turnActive}
+              // CA-M15: `tab.hiddenCount` is `number | undefined`
+              // (exactOptionalPropertyTypes forbids passing that straight
+              // into an optional-not-undefined `hiddenCount?: number` prop)
+              // — `?? 0` is behaviorally identical since ChatView does
+              // `hiddenCount ?? 0` itself and gates the affordance on
+              // `hidden > 0` (0 and undefined render the same: nothing).
+              hiddenCount={tab.hiddenCount ?? 0}
             />
           </div>
           <Composer
