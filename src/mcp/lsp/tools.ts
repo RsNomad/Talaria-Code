@@ -205,7 +205,17 @@ const ZERO_RANGE: PlainRange = Object.freeze({
  * while still keeping that summary's TOTAL accurate. */
 const UNCLASSIFIED_TAIL_VERDICT: ConfinementVerdict = Object.freeze({ inRoot: false, externalUri: '' });
 
-const SERVER_NAME = 'hermes-lsp';
+// B7 (WV1-MIN-ARCH serverInfo naming): the server's own serverInfo.name must
+// match the wire registration key every consumer uses — backend.setMcpServer
+// registers this server as 'vscode_lsp' (extension.ts, libServerHost.ts
+// DEFAULT_SERVER_NAME). The prior internal 'hermes-lsp' was a cosmetic drift.
+//
+// NOTE (accepted-as-is): the codebase server's tool id renders as the
+// `mcp__codebase_search__codebase_search` stutter. It is NOT renamed here —
+// the server/tool name is part of the id Hermes-side tool-permission configs
+// may reference, so renaming risks real breakage for a cosmetic gain. Owner
+// may override later.
+const SERVER_NAME = 'vscode_lsp';
 const SERVER_VERSION = '1.0.0';
 
 // ---------------------------------------------------------------------------

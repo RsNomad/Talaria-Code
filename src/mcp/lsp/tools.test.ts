@@ -246,6 +246,16 @@ describe('buildLibMcpServer — registration', () => {
       await cleanup();
     }
   });
+
+  it("B7: the LIB LSP MCP server advertises serverInfo.name === 'vscode_lsp' (matches the wire registration key every consumer uses)", async () => {
+    const { client, cleanup } = await connectClient(makeFakeDeps());
+    try {
+      const info = client.getServerVersion();
+      expect(info?.name).toBe('vscode_lsp');
+    } finally {
+      await cleanup();
+    }
+  });
 });
 
 describe('buildLibMcpServer — pinned description contract (verbatim key phrases)', () => {
