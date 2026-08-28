@@ -926,7 +926,9 @@ async function handleWorkspaceSymbols(
   // true total.
   const capped = run.value.slice(0, capLimit);
   const classified: WorkspaceSymbolTarget[] = await Promise.all(
-    capped.map(async (sym) => ({ sym, verdict: await deps.classifyUri(sym.location.uri) })),
+    capped.map((sym) =>
+      deps.pool.run(async () => ({ sym, verdict: await deps.classifyUri(sym.location.uri) })),
+    ),
   );
   const tail: WorkspaceSymbolTarget[] = run.value
     .slice(capLimit)
