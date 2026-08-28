@@ -286,3 +286,20 @@ describe('CA-06-face + CA-06-path-face — composition-root wiring', () => {
     disposable.dispose();
   });
 });
+
+describe('CA-06-NE-face — composition-root wiring', () => {
+  beforeEach(() => {
+    resetHost();
+  });
+
+  it('is inert at rest: activation with next-edit OFF (default) creates no language status item and no toast', async () => {
+    const { ctx } = makeFakeContext();
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    await Promise.resolve(); // let the NextEditGuard.hydrate continuation land
+    disposable.dispose();
+    expect(
+      createdStatusItems.filter((id) => id.startsWith('talaria.nextEdit.egressPaused:')),
+    ).toEqual([]);
+    expect(shownWarningToasts).toEqual([]);
+  });
+});

@@ -341,6 +341,10 @@ export const fimActivityRelay: FimActivityListener = {
 
 // ───────────────────────────── the toggle gate ───────────────────────────────
 
+/** CA-06-NE-face — the notice seam's shapes. Observational only: §7 of the design. */
+export type NextEditEgressVerdict = 'path-block' | 'content-block' | 'allow';
+export type NextEditEgressObserver = (filepath: string, verdict: NextEditEgressVerdict) => void;
+
 export interface NextEditShellDeps {
   reportFailure(msg: string): void;
   getAutocompleteEndpoint(): string;
@@ -360,6 +364,15 @@ export interface NextEditShellDeps {
    * `resolveRoute` leaves `NextEditRoute.apiKey` unset.
    */
   getAutocompleteApiKey(): string | undefined;
+  /** CA-06-NE-face — optional, purely OBSERVATIONAL: notified with the
+   *  egress verdict at GATE 5 ('path-block'), after a successful mint
+   *  ('allow'), and on a mint rejection ('content-block'). It cannot affect
+   *  the trigger path: every call goes through the shell's never-throwing
+   *  `notifyEgress` helper, is decided-then-notified, synchronous, and
+   *  result-ignored. Absent in every test/lock harness by design; the
+   *  composition root wires it UNCONDITIONALLY (the next-edit gates are
+   *  locality-unconditioned, unlike FIM's CA-06). */
+  onEgressVerdict?: NextEditEgressObserver;
 }
 
 /**
@@ -1238,6 +1251,22 @@ class NextEditShell {
     void vscode.window.showWarningMessage(message);
   }
 
+  /**
+   * CA-06-NE-face — the ONE way the egress observer is ever invoked. Never
+   * throws: a broken notice surface must not abort a healthy request on the
+   * allow path, and must not disturb a block path. Decided-then-notified at
+   * every call site.
+   */
+  private notifyEgress(filepath: string, verdict: NextEditEgressVerdict): void {
+    const observer = this.deps.onEgressVerdict;
+    if (observer === undefined) return;
+    try {
+      observer(filepath, verdict);
+    } catch {
+      // Observational only — swallow. See the design's §7(a).
+    }
+  }
+
   private editorFor(uri: string): vscode.TextEditor | undefined {
     const active = vscode.window.activeTextEditor;
     return active !== undefined && active.document.uri.toString() === uri ? active : undefined;
@@ -1335,10 +1364,18 @@ class NextEditShell {
     // to prevent. Dedup key includes `ruleId` so a secret-rule skip and a
     // rare oversize skip each surface once, independently.
     if (err instanceof NextEditMintRejectionError) {
-      this.surfaceOnce(
-        key(`mint|${err.ruleId}`),
-        `Next Edit skipped for this file: its content cannot be sent safely (rule: ${err.ruleId}). No request was sent.`,
-      );
+      // CA-06-NE-face: the HUMAN surface for this condition is the per-file
+      // badge + one-shot toast (nextEditNotice.vscode.ts). This arm keeps
+      // only the technical audit line — output channel, ruleId-only
+      // contract (never matched text, never content) — deduped by the same
+      // registration-scoped Set surfaceOnce uses, minus its toast.
+      const logKey = key(`mint|${err.ruleId}`);
+      if (!this.surfacedFailures.has(logKey)) {
+        this.surfacedFailures.add(logKey);
+        this.deps.reportFailure(
+          `Next Edit skipped for this file: its content cannot be sent safely (rule: ${err.ruleId}). No request was sent.`,
+        );
+      }
       return;
     }
 
@@ -1444,7 +1481,13 @@ class NextEditShell {
     // inherited: this is the ACTIVE-FILE gate, and the request-level mint
     // below is the separate content-level backstop.
     const fsPathLike = (document.uri.path ?? document.uri.fsPath ?? '').replace(/\\/g, '/');
-    if (isSecretForCompletion(fsPathLike)) return;
+    if (isSecretForCompletion(fsPathLike)) {
+      // CA-06-NE-face: tell the notice surface WHY nothing will ever happen
+      // in this file. Decided-then-notified: the return below is
+      // unconditional and unchanged.
+      this.notifyEgress(document.uri.toString(), 'path-block');
+      return;
+    }
 
     const built = this.buildRequest(editor, document, route);
     if (built === null) return;
@@ -1592,6 +1635,11 @@ class NextEditShell {
       // content field carries a secret or a format sentinel.
       const scanned = mintScannedNextEditRequest(request, route.format.sentinels);
 
+      // CA-06-NE-face: the content verdict for this attempt is ALLOW — the
+      // mint ratified every egressing field. An earlier block's badge clears
+      // on this edge. Guarded: a throwing observer cannot abort the request.
+      this.notifyEgress(request.cursor.uri, 'allow');
+
       const backend = new NextEditHttpBackend({
         transport: route.transport,
         apiBase: route.apiBase,
@@ -1644,6 +1692,13 @@ class NextEditShell {
       // endpoint or a 404-ing model left next-edit dead for the whole session
       // with no signal anywhere. A toast per keystroke would indeed be worse
       // than a missing suggestion, which is exactly what `surfaceOnce` is for.
+      //
+      // CA-06-NE-face: a mint rejection is the content-block verdict for
+      // this file — the badge + one-shot toast render it (rule-id-free);
+      // surfaceTriggerFailure below keeps only the technical log line.
+      if (err instanceof NextEditMintRejectionError) {
+        this.notifyEgress(request.cursor.uri, 'content-block');
+      }
       this.surfaceTriggerFailure(err, route, mode);
     } finally {
       if (this.inFlight === controller) {

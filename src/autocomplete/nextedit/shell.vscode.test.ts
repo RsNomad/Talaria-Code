@@ -328,6 +328,9 @@ import {
   NEXT_EDIT_MODEL_UNSET_NOTE,
   genericUnsupportedBackendMessage,
   type NextEditExecutorHost,
+  type NextEditShellDeps,
+  type NextEditEgressObserver,
+  type NextEditEgressVerdict,
 } from './shell.vscode';
 import { NextEditGuard, type NextEditConfigPort, type NextEditSource } from './guard';
 import { BackendHttpError } from '../backends/http';
@@ -675,15 +678,32 @@ function makeContext(): vscodeTypes.ExtensionContext {
   return { subscriptions: [] } as unknown as vscodeTypes.ExtensionContext;
 }
 
-/** Registers the shell against a freshly-hydrated Guard. */
-async function setupShell(toggles?: ToggleState): Promise<{
+/** Registers the shell against a freshly-hydrated Guard. `observer`
+ *  (CA-06-NE-face) is threaded FIELD-BY-FIELD — no spread-with-override
+ *  (repo purity guards) — so the observer-absent path hands the SAME
+ *  `SHELL_DEPS` object every pre-existing call site already used. */
+async function setupShell(
+  toggles?: ToggleState,
+  observer?: NextEditEgressObserver,
+): Promise<{
   guard: NextEditGuard;
   disposable: vscodeTypes.Disposable;
 }> {
   const guard = await NextEditGuard.hydrate(makeSourcePort(sourceOf(toggles)), {
     reportFailure: SHELL_DEPS.reportFailure,
   });
-  const disposable = registerTalariaNextEdit(makeContext(), guard, SHELL_DEPS);
+  const deps: NextEditShellDeps =
+    observer === undefined
+      ? SHELL_DEPS
+      : {
+          reportFailure: SHELL_DEPS.reportFailure,
+          getAutocompleteEndpoint: SHELL_DEPS.getAutocompleteEndpoint,
+          getAutocompleteModel: SHELL_DEPS.getAutocompleteModel,
+          getAutocompleteBackend: SHELL_DEPS.getAutocompleteBackend,
+          getAutocompleteApiKey: SHELL_DEPS.getAutocompleteApiKey,
+          onEgressVerdict: observer,
+        };
+  const disposable = registerTalariaNextEdit(makeContext(), guard, deps);
   return { guard, disposable };
 }
 
@@ -1874,7 +1894,7 @@ describe('V-1: next-edit is not structurally dead on an oversized file (bounded,
     expect(call.req.fileContext).not.toContain('x'.repeat(3000));
   });
 
-  it('RED-3: a 3 000-char line ON the cursor line makes the mint reject oversized-line, and the toast is the HONEST mint-rejection copy (never the server-blame fallback)', async () => {
+  it('RED-3: a 3 000-char line ON the cursor line makes the mint reject oversized-line, and the audit line is the HONEST mint-rejection copy in the LOG ONLY (never a toast, never the server-blame fallback)', async () => {
     const lines = Array.from({ length: 21 }, (_, i) => `const v${i} = ${i};`);
     lines[10] = 'x'.repeat(3000);
     const doc = `${lines.join('\n')}\n`;
@@ -1890,14 +1910,17 @@ describe('V-1: next-edit is not structurally dead on an oversized file (bounded,
     expect(backendSpy.predicts).toHaveLength(0);
     // The mint WAS reached (and rejected) — this is not an earlier gate skip.
     expect(mintCalls).toHaveLength(1);
-    expect(host.warnings).toHaveLength(1);
-    const msg = must(host.warnings[0]);
+    // CA-06-NE-face: the mint arm no longer toasts — the per-file badge +
+    // one-shot toast (nextEditNotice.vscode.ts) is the ONLY human surface
+    // for this condition now; this arm keeps only the technical audit line.
+    expect(host.warnings).toEqual([]);
+    expect(failures).toHaveLength(1);
+    const msg = must(failures[0]);
     expect(msg).toContain('oversized-line');
     expect(msg).toContain('No request was sent');
     expect(msg.toLowerCase()).not.toContain('server');
     expect(msg).not.toContain('talaria.nextEdit.endpoint');
     expect(msg).not.toContain('talaria.nextEdit.model');
-    expect(failures).toEqual([msg]);
   });
 
   /**
@@ -1932,8 +1955,12 @@ describe('V-1: next-edit is not structurally dead on an oversized file (bounded,
 
       expect(backendSpy.predicts).toHaveLength(0);
       expect(mintCalls).toHaveLength(1);
-      expect(host.warnings).toHaveLength(1);
-      const msg = must(host.warnings[0]);
+      // CA-06-NE-face: same log-once conversion as RED-3 above — this is a
+      // mint rejection too, so it no longer toasts; the audit line moves to
+      // `failures` (the technical output-channel surface).
+      expect(host.warnings).toEqual([]);
+      expect(failures).toHaveLength(1);
+      const msg = must(failures[0]);
       expect(msg).toContain('aws-akia');
       expect(msg).not.toContain(SECRET);
     });
@@ -3736,5 +3763,111 @@ describe('FUNC-NEXTEDIT characterization — shell ordered-effect trace (pre-T16
       'setContext talaria.nextEdit.jumpVisible=false',
       'setContext talaria.nextEdit.jumped=false',
     ]);
+  });
+});
+
+/**
+ * CA-06-NE-face — the egress-verdict observer seam (WS-FIM T16b).
+ *
+ * `onEgressVerdict` is optional and purely observational: every existing
+ * test above hands the shell the plain `SHELL_DEPS` object (no observer),
+ * so this suite is the ONLY place the seam is exercised — the untouched
+ * suite above is the observer-absent control (design §7(a)).
+ */
+describe('CA-06-NE-face — the egress-verdict observer seam', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHost();
+    failures.length = 0;
+    backendSpy.constructed.length = 0;
+    backendSpy.predicts.length = 0;
+    mintCalls.length = 0;
+    backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
+    autocompleteConfig.endpoint = 'http://127.0.0.1:11434';
+    autocompleteConfig.model = 'qwen2.5-coder:7b';
+    autocompleteConfig.backend = 'ollama';
+    autocompleteConfig.apiKey = undefined;
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('GATE 5: a secret-path file notifies (uri, path-block) — and still builds nothing', async () => {
+    const seen: Array<[string, NextEditEgressVerdict]> = [];
+    host.activeTextEditor = makeEditor(
+      makeDoc({ uri: 'file:///home/u/.env', path: '/home/u/.env' }),
+    );
+    await setupShell({ next: true, generic: false }, (filepath, verdict) => {
+      seen.push([filepath, verdict]);
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(0);
+    expect(mintCalls).toEqual([]); // the gate still returns before the mint
+    expect(seen).toHaveLength(1);
+    expect(must(seen[0])[1]).toBe('path-block');
+  });
+
+  it('a mint rejection notifies content-block, logs ONCE (no toast), and stays fail-closed', async () => {
+    const seen: NextEditEgressVerdict[] = [];
+    // The RED-3 arrangement: a 3 000-char line ON the cursor line makes the
+    // mint reject (ruleId oversized-line) — same fixture, new surfacing.
+    const lines = Array.from({ length: 21 }, (_, i) => `const v${i} = ${i};`);
+    lines[10] = 'x'.repeat(3000);
+    host.activeTextEditor = makeEditor(makeDoc({ text: `${lines.join('\n')}\n` }), 10);
+    await setupShell({ next: true, generic: false }, (_filepath, verdict) => {
+      seen.push(verdict);
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(0);
+    expect(mintCalls).toHaveLength(1); // the mint WAS reached and rejected
+    expect(seen).toEqual(['content-block']);
+    expect(host.warnings).toEqual([]); // NO shell toast any more — the surface owns the human side
+    expect(failures).toHaveLength(1); // the technical audit line survives, once
+    expect(must(failures[0])).toContain('oversized-line');
+    expect(must(failures[0])).toContain('No request was sent');
+  });
+
+  it('a successful mint notifies allow and the request proceeds', async () => {
+    const seen: NextEditEgressVerdict[] = [];
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false }, (_filepath, verdict) => {
+      seen.push(verdict);
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(1);
+    expect(seen).toEqual(['allow']);
+  });
+
+  it('a THROWING observer changes nothing: the allow-path request still goes out', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false }, () => {
+      throw new Error('surface exploded');
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(1); // the throw was swallowed BEFORE the backend call
+    expect(host.warnings).toEqual([]); // and never misclassified as a trigger failure
+  });
+
+  it('a THROWING observer changes nothing on the path-block gate either', async () => {
+    host.activeTextEditor = makeEditor(makeDoc({ uri: 'file:///home/u/.env', path: '/home/u/.env' }));
+    await setupShell({ next: true, generic: false }, () => {
+      throw new Error('surface exploded');
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(0);
+    expect(mintCalls).toEqual([]);
   });
 });

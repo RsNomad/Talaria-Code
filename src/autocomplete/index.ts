@@ -21,6 +21,7 @@ import { createHermesCrossFileContextService } from './context/contextService.vs
 import { createVsCodeNextEditConfigPort, NextEditGuard } from './nextedit/guard';
 import { fimActivityRelay, registerTalariaNextEdit, requestNextEditToggle } from './nextedit/shell.vscode';
 import type { NextEditShellDeps } from './nextedit/shell.vscode';
+import { createNextEditNoticeSurface } from './nextedit/nextEditNotice.vscode';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
 import type { BackendCapabilities, FimBackend, FimTemplate } from './types';
 
@@ -306,6 +307,11 @@ export function registerTalariaAutocomplete(
   let nextEditDisposable: vscode.Disposable | undefined;
   let nextEditGuard: NextEditGuard | undefined;
   let nextEditTornDown = false;
+  // CA-06-NE-face: ONE notice surface per activation, wired UNCONDITIONALLY —
+  // the next-edit gates scan regardless of endpoint locality (unlike FIM's
+  // CA-06), so the observer mirrors the gate it observes. Inert while
+  // talaria.nextEdit.source is 'off' (GATE 1 precedes every notify site).
+  const nextEditNotice = createNextEditNoticeSurface();
   // Hoisted so the toggle port below and `registerTalariaNextEdit` share ONE
   // deps object: `requestNextEditToggle`'s Generic refusal must be decided
   // against exactly the FIM backend the runtime path would use, never a
@@ -323,6 +329,7 @@ export function registerTalariaAutocomplete(
     // `context.secrets.onDidChange` subscription above, so rotation reaches
     // Generic with no reload and nothing new is loaded, watched, or stored.
     getAutocompleteApiKey: () => pickApiKey(secretApiKey, cfg.apiKey),
+    onEgressVerdict: nextEditNotice.onEgressVerdict,
   };
   void NextEditGuard.hydrate(createVsCodeNextEditConfigPort(), { reportFailure }).then(
     (guard) => {
@@ -368,6 +375,7 @@ export function registerTalariaAutocomplete(
         nextEditTornDown = true;
         nextEditDisposable?.dispose();
         nextEditGuard?.dispose();
+        nextEditNotice.dispose();
       },
     },
   );
