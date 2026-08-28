@@ -1,6 +1,7 @@
 import {
   promises as fs,
   existsSync,
+  readFileSync,
   mkdtempSync,
   mkdirSync,
   rmSync,
@@ -164,6 +165,54 @@ import { isSecretForCompletion } from '../shared/secretPaths';
 // file — the real scanner runs against real chunk content (SEC-1, audit-3).
 import { scanSnippetForSecrets } from '../autocomplete/context/secretScanner';
 
+// TST-01 (WS-R2): fake timers make the debounce + async-handler settling
+// deterministic — the `.not.toHaveBeenCalled()`-after-sleep assertions below
+// are otherwise a wall-clock false-pass direction. The only production timer
+// in play is the watch() debounce (indexer.ts); the embedder/store are mocked
+// (no real network/IO timer), so faking timers globally is safe here.
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+// TST-01 (WS-R2) drain helpers. The watch path is fire-and-forget behind a
+// debounce timer (indexer.ts schedule(): setTimeout(debounceMs) -> void
+// handleFsEvent().catch()). A single vi.advanceTimersByTimeAsync(N) FIRES the
+// debounce but @sinonjs/fake-timers' doTick async branch yields only ~one real
+// macrotask turn per fake-timer firing, whereas handleFsEvent's REAL
+// fs.promises chain (readManifest -> lstat -> resolveWithinWorkspaceReal's 2x
+// realpath -> readMeta -> reindexFiles -> writeManifest) needs MANY real turns
+// to drain -- a count that varies by platform (Windows Defender/NTFS inflate
+// it vs the Fedora CI target). A fixed extra-tick count is therefore
+// platform-dependent and flaky. advanceTimersByTimeAsync(0) NEVER advances
+// virtual time (tickTo === now), so it cannot fire a not-yet-due timer nor
+// perturb any time-ordering assertion -- it only hands the real event loop one
+// more turn. drainUntil loops it until the caller's predicate observes the
+// handler's real effect: it waits EXACTLY as many turns as the I/O needs, on
+// any platform. The cap only trips on a genuine hang (a wrong predicate or a
+// handler that never produces the awaited effect), turning an infinite hang
+// into a fast, legible failure.
+const WATCH_DRAIN_CAP = 5000;
+async function drainUntil(until: () => boolean): Promise<void> {
+  for (let i = 0; i < WATCH_DRAIN_CAP; i++) {
+    if (until()) return;
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  throw new Error(
+    'drainUntil: watch handler did not settle within ' +
+      WATCH_DRAIN_CAP +
+      ' drain turns -- the awaited condition never held (a real hang, or a wrong until() predicate).',
+  );
+}
+/** Fire the pending debounce, then drain real event-loop turns until `until`
+ * observes the fire-and-forget handler's effect. */
+async function flushWatch(debounceMs: number, until: () => boolean): Promise<void> {
+  await vi.advanceTimersByTimeAsync(debounceMs);
+  await drainUntil(until);
+}
+
 describe('createIndexer — secret-path filtering (W5-T6)', () => {
   let workspaceRoot: string;
   let indexDir: string;
@@ -314,9 +363,10 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
     const onCreate = fsWatcherListeners.create[0]!;
     onCreate({ fsPath: path.join(workspaceRoot, '.env') });
 
-    // past the 10ms debounce configured above, plus slack for the async
-    // handler (fs read + manifest read/write) to complete.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Drain the fire-and-forget secret-path handler until its terminal purge is
+    // observed; `upsert not called` then holds by construction (the secret
+    // branch purges and returns, never reaching embed/upsert).
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === '.env'));
 
     expect(upsertMock).not.toHaveBeenCalled();
     expect(deleteByPathMock).toHaveBeenCalledWith('.env');
@@ -334,7 +384,7 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
     const onCreate = fsWatcherListeners.create[0]!;
     onCreate({ fsPath: path.join(workspaceRoot, 'src/app.txt') });
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(10, () => upsertMock.mock.calls.length > 0);
 
     expect(upsertMock).toHaveBeenCalled();
 
@@ -637,7 +687,10 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
     // does not touch b's embed call; the mock reverts to its normal fast
     // implementation for every call after this one.
     embedMock.mockImplementationOnce(async (texts: string[]) => {
-      await new Promise((resolve) => setTimeout(resolve, 80));
+      // KEEP (TST-01 #3): this nested tickAsync self-drives its own 80ms
+      // range (validated); do NOT convert to a real setTimeout — a setTimeout
+      // delay never fires under the advanceTimersByTimeAsync(0) drain.
+      await vi.advanceTimersByTimeAsync(80);
       return texts.map(() => [0.1, 0.2, 0.3]);
     });
 
@@ -648,11 +701,25 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
     // serialized, b's fast cycle would finish and write first, and a's slow
     // cycle would finish later and overwrite b's entry with a stale
     // manifest that never saw it.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // KEEP (TST-01 #4): sequences a's debounce ahead of b; leave as a
+    // virtual-time advance.
+    await vi.advanceTimersByTimeAsync(20);
     onChange({ fsPath: path.join(workspaceRoot, 'b.txt') });
 
-    // Comfortably past both debounces plus the artificial 80ms embed delay.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // b's debounce timer was already fired by a's nested-80 advance above;
+    // drain (no extra debounce advance) until both serialize()-ordered
+    // cycles have written their entries.
+    await drainUntil(() => {
+      try {
+        const m = JSON.parse(readFileSync(path.join(indexDir, 'manifest.json'), 'utf8')) as Record<
+          string,
+          string
+        >;
+        return m['a.txt'] !== undefined && m['b.txt'] !== undefined;
+      } catch {
+        return false;
+      }
+    });
 
     const manifest = await readManifest();
     expect(manifest['a.txt']).toBeDefined();
@@ -715,9 +782,10 @@ describe('RAG-4: watch() Disposable clears pending debounce timers on dispose', 
     // elapses must cancel the pending timer, not just stop future events.
     disposable.dispose();
 
-    // Comfortably past the debounce window, with slack for the (would-be)
-    // async handler to have run if the timer had fired.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // KEEP (TST-01 #6): the timer was cleared by dispose() above, so
+    // advancing fires nothing; `init not called` holds deterministically by
+    // construction, without any drain.
+    await vi.advanceTimersByTimeAsync(200);
 
     // handleFsEvent's first action is ensureStoreInitialized() -> store.init()
     // — if the timer had fired despite dispose(), initMock would have been
@@ -739,7 +807,7 @@ describe('RAG-4: watch() Disposable clears pending debounce timers on dispose', 
 
     // Past the 10ms debounce, plus slack for the async handler to complete —
     // dispose() only happens AFTER the timer has already fired.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(10, () => upsertMock.mock.calls.length > 0);
     disposable.dispose();
 
     expect(upsertMock).toHaveBeenCalled();
@@ -871,7 +939,11 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     upsertMock.mockClear();
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(indexDir, 'manifest.json') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // KEEP (TST-01 #8): the prior build() left the ignore filter CACHED, so
+    // the handler awaits a cached predicate (a microtask, no fs) and
+    // early-returns at the isUnderIndexDir gate within microtasks — a single
+    // advance settles it deterministically.
+    await vi.advanceTimersByTimeAsync(200);
 
     expect(embedMock).not.toHaveBeenCalled();
     expect(upsertMock).not.toHaveBeenCalled();
@@ -892,7 +964,7 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
         const disposable = indexer.watch();
 
         fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'vault', 'private.txt') });
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await flushWatch(5, () => deleteByPathMock.mock.calls.some(([p]) => p === 'vault/private.txt'));
 
         expect(embedMock).not.toHaveBeenCalled(); // at HEAD: fs.readFile FOLLOWS the link and the content IS embedded
         expect(upsertMock).not.toHaveBeenCalled();
@@ -916,7 +988,7 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
         const disposable = indexer.watch();
 
         fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'link.txt') });
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await flushWatch(5, () => deleteByPathMock.mock.calls.some(([p]) => p === 'link.txt'));
 
         expect(embedMock).not.toHaveBeenCalled();
         expect(deleteByPathMock.mock.calls.map(([p]) => p)).toContain('link.txt');
@@ -936,7 +1008,11 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
       const disposable = indexer.watch();
 
       fsWatcherListeners.change[0]!({ fsPath: path.join(sibling, 'b.ts') });
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // KEEP (TST-01 #11): handleFsEvent early-returns at the SYNCHRONOUS
+      // !isPathValid(relPath) guard (no await before it), so it runs to
+      // completion synchronously the instant the debounce fires — a single
+      // advance settles it deterministically.
+      await vi.advanceTimersByTimeAsync(200);
 
       // At HEAD: ignore@7 throws RangeError inside the filter, caught by
       // schedule()'s catch -> console.error('hermes-codebase: incremental reindex failed', ...).
@@ -953,7 +1029,9 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
   it('CR-B: a watcher event racing the first build() runs store.init() exactly ONCE (memoized single-flight)', async () => {
     await writeWorkspaceFile('src/app.txt', 'ordinary content to chunk and index.\n');
     initMock.mockImplementationOnce(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 100)); // first native init is slow — the cold-start race window
+      // KEEP (TST-01 #12): this nested tickAsync self-drives (validated) —
+      // first native init is slow, the cold-start race window.
+      await vi.advanceTimersByTimeAsync(100);
     });
     const indexer = makeIndexer(5);
     const disposable = indexer.watch();
@@ -961,7 +1039,10 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     const buildPromise = indexer.build(); // enters ensureStoreInitialized, parks on the slow init
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') }); // fires ~5ms in, while init is pending
     await buildPromise;
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The racing watch debounce was already fired by the init's nested-100
+    // advance above; drain (no extra debounce advance) until build's own
+    // reindex (1 upsert) plus the racing watch reindex (2nd upsert) both land.
+    await drainUntil(() => upsertMock.mock.calls.length >= 2);
 
     expect(initMock).toHaveBeenCalledTimes(1); // at HEAD: 2 — both callers pass the un-set flag
     disposable.dispose();
@@ -980,7 +1061,14 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     deleteByPathMock.mockClear();
 
     fsWatcherListeners.delete[0]!({ fsPath: path.join(workspaceRoot, 'src') }); // ONE event for the dir — the granularity ARCH-5 names
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(5, () => {
+      try {
+        const m = JSON.parse(readFileSync(path.join(indexDir, 'manifest.json'), 'utf8')) as Record<string, string>;
+        return Object.keys(m).length === 0;
+      } catch {
+        return false;
+      }
+    });
 
     const deleted = deleteByPathMock.mock.calls.map(([p]) => p);
     expect(deleted).toContain('src/a.txt');
@@ -1044,9 +1132,9 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
     const disposable = indexer.watch();
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'a.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(5, () => upsertMock.mock.calls.flatMap(([r]) => r.map((x) => x.path)).includes('a.txt'));
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'b.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(5, () => upsertMock.mock.calls.flatMap(([r]) => r.map((x) => x.path)).includes('b.txt'));
 
     // At HEAD: loadIgnoreFilter() re-reads .gitignore on EVERY handleFsEvent
     // call — 2 events -> 2 reads, growing unboundedly with watcher traffic.
@@ -1067,17 +1155,23 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
     // Prime the cache with the OLD .gitignore (no generated/** rule) via an
     // unrelated event.
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'unrelated.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // The file is not on disk -> the unconfinable/ENOENT branch purges it;
+    // that purge also proves the ignore filter was (re)loaded and cached.
+    await flushWatch(5, () => deleteByPathMock.mock.calls.some(([p]) => p === 'unrelated.txt'));
 
     await writeWorkspaceFile('.gitignore', 'generated/**\n');
-    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, '.gitignore') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, '.gitignore') }); // keep the fire line!
+    await flushWatch(5, () => upsertMock.mock.calls.flatMap(([r]) => r.map((x) => x.path)).includes('.gitignore'));
 
     embedMock.mockClear();
     upsertMock.mockClear();
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'generated', 'x.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // KEEP (TST-01 #19): the prior .gitignore-change event repopulated the
+    // cache WITH the generated/** rule, so this handler hits the warm cache
+    // and early-returns at the ignoreFilter gate within microtasks — a
+    // single advance settles it deterministically.
+    await vi.advanceTimersByTimeAsync(200);
 
     expect(embedMock).not.toHaveBeenCalled();
     expect(upsertMock).not.toHaveBeenCalled();
@@ -1169,7 +1263,7 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
       const disposable = indexer.watch();
 
       fsWatcherListeners.change[0]!({ fsPath: aliasAbs });
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await flushWatch(5, () => upsertedPaths().includes('alias/doc.txt'));
 
       // (a) THE RED PAIR — the reindex read must hit the CONFINED canonical
       // path (pathConfine.ts: "read exactly the returned path so the file
@@ -1327,7 +1421,7 @@ describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'src', 'app.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => indexer.failedIncrementalReindexes() > 0);
     errorSpy.mockRestore();
 
     // HEAD's bug: reindexFiles deletes the path's OLD rows unconditionally,
@@ -1365,7 +1459,7 @@ describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'src', 'app.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => indexer.failedIncrementalReindexes() > 0);
     errorSpy.mockRestore();
 
     // Embed succeeded (default mock), so the swap's delete DID run for this
@@ -1409,7 +1503,7 @@ describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a 
     // Identical-bytes resave of the SAME unchanged big file.
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'big.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await flushWatch(10, () => indexer.failedIncrementalReindexes() > 0);
     errorSpy.mockRestore();
 
     // Batch 1's swap ran to completion (one delete, one upsert) before
@@ -1498,7 +1592,7 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'big.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'big.ts'));
 
     // AU-24: at HEAD, the oversize `continue` fires BEFORE any purge — the
     // file's OLD (now-wrong) chunks stay in the store and the manifest still
@@ -1530,7 +1624,7 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'data.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'data.ts'));
 
     expect(deleteByPathMock).toHaveBeenCalledWith('data.ts');
     expect(upsertMock).not.toHaveBeenCalled();
@@ -1635,7 +1729,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, '.env') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => closeMock.mock.calls.length > 0);
     readFileSpy.mockRestore();
 
     // Fails at HEAD: the secret-path branch runs to completion regardless of
@@ -1719,7 +1813,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'src/app.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => closeMock.mock.calls.length > 0);
 
     // Fails at HEAD: `store.upsert` throws (closed), `reindexFiles`'s catch
     // block scrubs `manifest['src/app.txt']` (TA-3), and `handleFsEvent`'s
@@ -1801,7 +1895,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onDelete = fsWatcherListeners.delete[0]!;
     onDelete({ fsPath: path.join(workspaceRoot, 'dir') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'dir/b.txt'));
 
     // Fails at HEAD: the loop purges both children from the in-memory
     // manifest object regardless of `disposed`, then `writeManifest` at
@@ -1836,7 +1930,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, '.env') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === '.env'));
 
     // Fails at HEAD: `writeManifest` at indexer.ts:908 runs unconditionally
     // after the awaited deleteByPath, stripping `.env` from the on-disk
@@ -1871,7 +1965,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'ghost.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'ghost.txt'));
 
     // Fails at HEAD: `writeManifest` at indexer.ts:944 runs unconditionally
     // after the awaited deleteByPath.
@@ -1907,7 +2001,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
         const onChange = fsWatcherListeners.change[0]!;
         onChange({ fsPath: path.join(workspaceRoot, 'link.txt') });
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'link.txt'));
 
         // Fails at HEAD: `writeManifest` at indexer.ts:944 runs
         // unconditionally after the awaited deleteByPath.
@@ -2044,14 +2138,18 @@ describe('TA-7 (AU-34): nested .gitignore/.hermesignore files are honored, not j
     // Edit the nested .gitignore to now exclude target.ts, and fire ITS OWN
     // change event.
     await writeWorkspaceFile('sub/.gitignore', 'target.ts\n');
-    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'sub', '.gitignore') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'sub', '.gitignore') }); // keep the fire line!
+    await flushWatch(10, () => upsertMock.mock.calls.flatMap(([r]) => r.map((x) => x.path)).includes('sub/.gitignore'));
 
     embedMock.mockClear();
     upsertMock.mockClear();
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'sub', 'target.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // KEEP (TST-01 #33): the prior nested-.gitignore-change event repopulated
+    // the cache WITH the target.ts rule, so this handler hits the warm cache
+    // and early-returns at the matchesNestedIgnore gate within microtasks —
+    // a single advance settles it deterministically.
+    await vi.advanceTimersByTimeAsync(300);
 
     // AU-34 (fails at HEAD): the pre-fix invalidation check only matches
     // `relPath === '.gitignore'` (workspace root, exact match) — a nested
@@ -2123,7 +2221,7 @@ describe('F2-12: incremental-reindex failure — logger seam + counter + path-di
     initMock.mockRejectedValueOnce(fsLikeErr);
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(5, () => indexer.failedIncrementalReindexes() > 0);
 
     expect(indexer.failedIncrementalReindexes()).toBe(1);
     expect(logSpy).toHaveBeenCalledTimes(1);
