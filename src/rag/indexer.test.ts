@@ -2790,4 +2790,23 @@ describe('F2-13: writeManifest is a crash-safe atomic write; readManifest distin
       indexer.dispose();
     } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
   });
+
+  it('F2-13 parity: writeMeta commits manifest.meta.json atomically via rename', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b1d-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      await indexer.build();
+      const metaPath = path.join(indexDir, 'manifest.meta.json');
+      const committedMeta = renameCommits.some(([, to]) => to === metaPath);
+      expect(committedMeta).toBe(true);
+      await expect(fs.readFile(metaPath, 'utf8')).resolves.toContain('schema');
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
 });

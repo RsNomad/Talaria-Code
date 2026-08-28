@@ -391,7 +391,13 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     if (observedWidth !== undefined) {
       meta.width = observedWidth;
     }
-    await fs.writeFile(metaPath, JSON.stringify(meta), 'utf8');
+    // F2-13 (parity): atomic replace — same-dir tmp + rename(2), matching
+    // writeManifest, so a crash mid-write never leaves a torn manifest.meta.json.
+    // (readMeta already treats any read/parse failure as a rebuild; this removes
+    // the torn-read window entirely.)
+    const tmpPath = `${metaPath}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(meta), 'utf8');
+    await fs.rename(tmpPath, metaPath);
   }
 
   async function loadIgnoreFilter(): Promise<(relPosixPath: string) => boolean> {
