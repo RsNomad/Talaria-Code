@@ -8386,6 +8386,27 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     expect(result).toEqual({ ok: true });
     expect(client.removeCalls).toEqual(['gh']);
   });
+
+  it('F2-08: a reload.mcp failure AFTER the config mutate refetches the panel and discloses divergence (no false success, no stale panel)', async () => {
+    const { backend, client, messages } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    // reload.mcp REJECTS on the next (only) dispatch — the mutate already landed.
+    control.setDeferredFor('reload.mcp', Promise.reject(new Error('gateway said no')));
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    mockShowWarningMessage.mockResolvedValueOnce('Add server'); // user confirms the native modal
+
+    await expect(
+      backend.invokeControl('mcp.add', { name: 'gh', transport: 'stdio', command: 'npx', args: [], env: {} }),
+    ).rejects.toThrow(/saved.*reload|reload.*fail|restart Hermes/i);
+
+    // the mutate DID happen (config was written) ...
+    expect(client.addCalls).toEqual([{ name: 'gh', command: 'npx', args: [], env: {} }]);
+    // ... so the panel is RE-FETCHED to reflect the true persisted state (not left stale) ...
+    expect(control.dispatchCalls.map((c) => c.method)).toContain('config.get');
+    // ... and a fresh mcp panel.data PUSH is emitted (divergence surfaced, not swallowed).
+    expect(messages.some((m) => m.type === 'panel.data' && (m as { panel?: string }).panel === 'mcp')).toBe(true);
+  });
 });
 
 // =============================================================================

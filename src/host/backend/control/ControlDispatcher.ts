@@ -866,8 +866,7 @@ export class ControlDispatcher {
       throw new Error(`Adding MCP server "${validated.body.name}" was declined or cancelled.`);
     }
     await client.addMcpServer(validated.body);
-    await this.port.dispatch('reload.mcp', { confirm: true });
-    await this.fetchPanelData('mcp');
+    await this.reloadMcpAndRefetch();
     return { ok: true, name: validated.body.name, transport };
   }
 
@@ -879,8 +878,7 @@ export class ControlDispatcher {
       throw new Error(`Removing MCP server "${name}" was declined or cancelled.`);
     }
     const result = await client.removeMcpServer(name);
-    await this.port.dispatch('reload.mcp', { confirm: true });
-    await this.fetchPanelData('mcp');
+    await this.reloadMcpAndRefetch();
     return result;
   }
 
@@ -951,8 +949,7 @@ export class ControlDispatcher {
     }
     const result = await client.installCatalogEntry({ name: entry.name, env, enable: true });
     if (!result.background) {
-      await this.port.dispatch('reload.mcp', { confirm: true });
-      await this.fetchPanelData('mcp');
+      await this.reloadMcpAndRefetch();
       return { ok: true, name: entry.name };
     }
     if (!result.action) {
@@ -996,8 +993,7 @@ export class ControlDispatcher {
       this.rejectCatalogInstall(name, lastLines);
     }
 
-    await this.port.dispatch('reload.mcp', { confirm: true });
-    await this.fetchPanelData('mcp');
+    await this.reloadMcpAndRefetch();
     return { ok: true, name };
   }
 
@@ -1060,9 +1056,29 @@ export class ControlDispatcher {
    */
   private async mcpSetEnabled(client: DashboardAdminClient, name: string, enabled: boolean): Promise<unknown> {
     const result = await client.setMcpServerEnabled(name, enabled);
-    await this.port.dispatch('reload.mcp', { confirm: true });
-    await this.fetchPanelData('mcp');
+    await this.reloadMcpAndRefetch();
     return result;
+  }
+
+  /**
+   * F2-08: the shared post-mutation reload+refetch. On a `reload.mcp` failure
+   * AFTER a config mutate already landed, the persisted config and the running
+   * Hermes DIVERGE — so we still RE-FETCH the `mcp` panel (the webview then
+   * renders the true persisted state) and DISCLOSE the divergence, instead of
+   * letting a raw reload error propagate over a stale panel or pretending
+   * success. On reload success it is the plain reload → refetch it replaces.
+   */
+  private async reloadMcpAndRefetch(): Promise<void> {
+    try {
+      await this.port.dispatch('reload.mcp', { confirm: true });
+    } catch (err) {
+      this.port.logger?.append(
+        `[AcpBackend] reload.mcp failed after a config mutate — config/runtime may diverge: ${errorMessage(err)}`,
+      );
+      await this.fetchPanelData('mcp').catch(() => {});
+      throw new Error(MCP_RELOAD_DIVERGENCE_MESSAGE);
+    }
+    await this.fetchPanelData('mcp');
   }
 
   // ---------------------------------------------------------------------
@@ -1883,6 +1899,13 @@ function toMcpAddParams(
     ? { name: body.name, transport: 'http', url: body.url ?? '' }
     : { name: body.name, transport: 'stdio', command: body.command ?? '', args: body.args ?? [], env: body.env ?? {} };
 }
+
+/**
+ * F2-08: disclosed when a `reload.mcp` fails AFTER a config mutate already
+ * landed — the persisted config and the running Hermes have diverged.
+ */
+const MCP_RELOAD_DIVERGENCE_MESSAGE =
+  'The MCP configuration was saved, but reloading the running Hermes server failed — reload the window or restart Hermes to apply the change.';
 
 /**
  * Task A6 (§4.7 item 2), widened by Task B4: the shared background-poll
