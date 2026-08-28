@@ -2829,10 +2829,11 @@ describe('CA-M15: transcript length cap keeps the tail and records the drop coun
   });
 
   it('the active streaming message still folds correctly after trimming', () => {
-    let state = tabWithNItems(MAX_TRANSCRIPT_ITEMS - 1);
-    state = reduce(state, { type: 'message.delta', turnId: 'live', sessionId: 's1', text: 'A' }); // opens (at cap now)
-    state = reduce(state, { type: 'message.delta', turnId: 'live', sessionId: 's1', text: 'B' }); // still folds the tail
+    let state = tabWithNItems(MAX_TRANSCRIPT_ITEMS);
+    state = reduce(state, { type: 'message.delta', turnId: 'live', sessionId: 's1', text: 'A' }); // opens, pushes over the cap, trims
+    state = reduce(state, { type: 'message.delta', turnId: 'live', sessionId: 's1', text: 'B' }); // folds the tail AFTER the trim
     const tab = must(state.tabs.boot, 'boot tab');
+    expect(tab.hiddenCount ?? 0).toBeGreaterThanOrEqual(1); // a trim genuinely happened, not a no-op
     const live = tab.transcript.filter((i) => i.kind === 'message' && i.turnId === 'live');
     expect(live).toHaveLength(1);
     expect(live[0]).toMatchObject({ text: 'AB', streaming: true });
@@ -2843,6 +2844,16 @@ describe('CA-M15: transcript length cap keeps the tail and records the drop coun
     const trimmed = reduce(over, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
     expect(must(trimmed.tabs.boot, 'boot').hiddenCount).toBeGreaterThan(0);
     const cleared = reduce(trimmed, { type: 'clear', sessionId: 's1' });
+    const tab = must(cleared.tabs.boot, 'boot');
+    expect(tab.transcript).toHaveLength(0);
+    expect(tab.hiddenCount ?? 0).toBe(0);
+  });
+
+  it('tab.clear (the session-lost "New Session" path) also resets hiddenCount to 0', () => {
+    const over = tabWithNItems(MAX_TRANSCRIPT_ITEMS + 5);
+    const trimmed = reduce(over, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
+    expect(must(trimmed.tabs.boot, 'boot').hiddenCount).toBeGreaterThan(0);
+    const cleared = reduce(trimmed, { type: 'tab.clear', tabId: 'boot' });
     const tab = must(cleared.tabs.boot, 'boot');
     expect(tab.transcript).toHaveLength(0);
     expect(tab.hiddenCount ?? 0).toBe(0);

@@ -1025,7 +1025,7 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // session that just went lost would survive into the fresh tab.
       return foldTabScoped(state, msg.tabId, 'tab.clear', (tab) => {
         const { error: _clearedError, sessionLostReason: _clearedReason, ...rest } = tab;
-        return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false, openFailed: false, sessionLost: false };
+        return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false, openFailed: false, sessionLost: false, hiddenCount: 0 };
       });
 
     // ---- generic session-scoped fold (drop-unknown; §2e reuses foldTab) ----
