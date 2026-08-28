@@ -1881,6 +1881,19 @@ export class ControlDispatcher {
       this.port.logger?.append(`[AcpBackend] checkpoints panel refresh failed: ${errorMessage(err)}`);
     });
   }
+
+  /**
+   * CA-M04: drop the unbounded per-SESSION fetch-seq entry when a tab/session
+   * closes. `subagents:${sessionId}` is the only `panelFetchSeq` key that grows
+   * without bound (a fresh session id per session/restart); `sessions:${cwd}`
+   * and `checkpoints:${rootId}` are bounded by the finite set of roots/cwds AND
+   * shared across tabs, so they are deliberately NOT pruned here. The key
+   * format MUST match {@link panelScopeKey}'s `subagents` branch verbatim.
+   * Wired from `AcpBackend.closeTabInternal`.
+   */
+  pruneFetchSeqForSession(sessionId: string): void {
+    this.panelFetchSeq.delete(`subagents:${sessionId}`);
+  }
 }
 
 // --- module-local helpers ----------------------------------------------------

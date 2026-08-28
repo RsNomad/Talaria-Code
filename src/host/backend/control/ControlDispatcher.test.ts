@@ -97,3 +97,21 @@ describe('ControlDispatcher — WS-GD.1 F3-16: sessions scope snapshot', () => {
     expect(push?.cwd).toBe('X');
   });
 });
+
+describe('ControlDispatcher — WS-GD.1 CA-M04: panelFetchSeq pruning', () => {
+  it('pruneFetchSeqForSession removes the unbounded per-session (subagents) fetch-seq entry', async () => {
+    const { port, registry } = makePort();
+    registerFakeSource(registry, 'subagents', async () => ({
+      data: {} as unknown as PanelDataMap['subagents'], // shape-agnostic; the test asserts on the map key, not payload
+    }));
+    const dispatcher = new ControlDispatcher(port);
+    // Reach the private map (private is compile-time only — no production surface added).
+    const seqMap = (dispatcher as unknown as { panelFetchSeq: Map<string, number> }).panelFetchSeq;
+
+    await dispatcher.invokeControl('panel.data', { panel: 'subagents', sessionId: 'S1' });
+    expect(seqMap.has('subagents:S1')).toBe(true); // the fetch minted the per-session key
+
+    dispatcher.pruneFetchSeqForSession('S1');
+    expect(seqMap.has('subagents:S1')).toBe(false); // ... and prune drops exactly it
+  });
+});
