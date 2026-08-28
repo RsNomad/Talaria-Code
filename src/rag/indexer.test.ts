@@ -1138,7 +1138,7 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
   });
 });
 
-describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBuild', () => {
+describe('AUDIT-5 Task 10: RAG perf — cached ignore filter (the single-read runBuild optimization below was intentionally reverted by RAG-01 — see the RAG-01 describe block further down)', () => {
   let workspaceRoot: string;
   let indexDir: string;
 
@@ -1238,7 +1238,7 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
     indexer.dispose();
   });
 
-  it("RED: runBuild reads each candidate file's bytes ONCE — reindexFiles reuses the hash-pass buffer instead of re-reading", async () => {
+  it("RAG-01 (2026-08-28) intentionally reverted this: runBuild now reads each CHANGED candidate's bytes TWICE — the hash pass no longer retains a buffer for reindexFiles to reuse", async () => {
     await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
     const absPath = path.join(workspaceRoot, 'src', 'app.ts');
 
@@ -1247,14 +1247,92 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
 
     await indexer.build();
 
-    // At HEAD: runBuild's hash pass reads absPath once (indexer.ts's
-    // `current` loop), then reindexFiles reads it AGAIN for every path that
-    // ends up in `toCompute` — everything, on a fresh build — even though
-    // the content cannot have changed between the two passes.
-    expect(readFileCallsFor(readFileSpy, absPath)).toBe(1);
+    // Pre-RAG-01 (AUDIT-5 Task 10): runBuild's hash pass read absPath once
+    // and handed the same buffer to reindexFiles via a retained `preloaded`
+    // map, so the embed pass never read it again — 1 total. RAG-01 removed
+    // that map to bound peak memory during hashing by ONE file instead of
+    // the whole repo: the hash pass now reads-and-releases, and reindexFiles
+    // reads the same changed target again itself for the embed pass — 2
+    // total. (Unchanged files are still read only once — see the RAG-01
+    // describe block below.)
+    expect(readFileCallsFor(readFileSpy, absPath)).toBe(2);
 
     readFileSpy.mockRestore();
     indexer.dispose();
+  });
+});
+
+describe('RAG-01: the full-build hash pass streams — it no longer retains every candidate buffer in a `preloaded` map', () => {
+  it('a full first build reads each CHANGED file for BOTH the hash pass and the embed pass (2x total) — only true once the preloaded buffer map is removed', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b5a-count-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      const relPaths = ['src/f0.txt', 'src/f1.txt', 'src/f2.txt'];
+      for (const rel of relPaths) {
+        await fs.writeFile(path.join(workspaceRoot, rel), `content of ${rel}\n`, 'utf8');
+      }
+      const absPaths = relPaths.map((rel) => path.join(workspaceRoot, rel));
+
+      // Plain array-push call-through recorder (no `vi.fn()`/`vi.spyOn` — the
+      // same idiom as this file's top-level `fs.rename` wrapper above):
+      // monkey-patch fs.readFile directly, record every absolute path it is
+      // invoked with, delegate to the real implementation, restore after.
+      const readCalls: string[] = [];
+      const realReadFile = fs.readFile;
+      fs.readFile = ((filePath: Parameters<typeof fs.readFile>[0], ...rest: unknown[]) => {
+        readCalls.push(String(filePath));
+        return (realReadFile as typeof fs.readFile)(filePath as never, ...(rest as unknown as never[]));
+      }) as typeof fs.readFile;
+
+      const indexer = createIndexer({
+        workspaceRoot,
+        indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434',
+        embedModel: 'test-model',
+        debounceMs: 10,
+      });
+      try {
+        await indexer.build();
+      } finally {
+        fs.readFile = realReadFile;
+      }
+
+      // Today's retained-buffer code reads each changed file ONCE — the hash
+      // pass's buffer is handed to reindexFiles via `preloaded`, so the embed
+      // pass never calls fs.readFile again for it. This assertion is RED
+      // against that code (count 1, not 2). RAG-01 removes `preloaded`: the
+      // hash pass reads-and-releases, and reindexFiles reads the same
+      // changed target's bytes again for the embed pass — TWICE per changed
+      // file total. This read pattern ONLY holds once the retained map is
+      // gone.
+      for (const absPath of absPaths) {
+        expect(readCalls.filter((p) => p === absPath).length).toBe(2);
+      }
+
+      indexer.dispose();
+    } finally {
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('RAG-01: the full-build hash pass does not retain buffers — unchanged files are not re-read for embedding', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b5a-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      for (let i = 0; i < 5; i++) await fs.writeFile(path.join(workspaceRoot, `src/f${i}.txt`), `content ${i}\n`, 'utf8');
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      await indexer.build(); // first build: all changed
+      embedMock.mockClear();
+      // second build: nothing changed. reindexFiles must embed nothing.
+      await indexer.build();
+      expect(embedMock).not.toHaveBeenCalled(); // no toCompute ⇒ no embed ⇒ memory-bounded
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
   });
 });
 

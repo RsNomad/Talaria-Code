@@ -891,20 +891,17 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     knownNestedIgnoreDirs = discoveredNestedDirs;
 
     const current: Record<string, string> = {};
-    // AUDIT-5 Task 10: read each candidate's bytes ONCE here for the hash
-    // pass, and hand the same buffer to reindexFiles's embed pass below via
-    // `preloaded` — the pre-Task-10 shape read every candidate file twice on
-    // every full build (once here, again inside reindexFiles for whichever
-    // paths ended up in `toCompute`), even though the content cannot have
-    // changed between the two passes within one build.
-    const preloaded = new Map<string, Buffer>();
+    // RAG-01: stream the hash pass — read each candidate ONCE, hash it,
+    // release the buffer, next. Peak memory during hashing is one file (not
+    // the whole repo). Changed files are re-read by reindexFiles; the embed
+    // working set is already one-batch bounded (TA-3), so overall peak
+    // scales with the changed set, not the repo size.
     for (const absPath of absPaths) {
       const relPath = toPosixRelative(path.relative(opts.workspaceRoot, absPath));
       try {
         const buf = await fs.readFile(absPath);
         if (buf.byteLength > MAX_FILE_BYTES || looksBinary(buf)) continue;
         current[relPath] = hashContent(buf.toString('utf8'));
-        preloaded.set(absPath, buf);
       } catch {
         continue;
       }
@@ -975,7 +972,7 @@ export function createIndexer(opts: IndexerOptions): Indexer {
     const effectiveWidth = computeEffectiveWidth(storedMeta);
     let observedWidth: number | undefined;
     try {
-      observedWidth = await reindexFiles(toComputeTargets, manifest, effectiveWidth, preloaded);
+      observedWidth = await reindexFiles(toComputeTargets, manifest, effectiveWidth);
     } catch (err) {
       // TA-3 (AU-3): persist whatever scrub `reindexFiles` already applied
       // to `manifest` even though this build failed — otherwise a
