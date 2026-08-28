@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { Embedder } from '../rag/embedder';
 import type { SearchFilter, SearchHit, VectorStore } from '../rag/store/VectorStore';
-import { formatHitAsText, runCodebaseSearch } from './search';
+import { buildEmbeddingQueryText, formatHitAsText, runCodebaseSearch } from './search';
+import type { CodebaseSearchDeps } from './search';
 import { compilePathGlobs } from './pathGlob';
+import type { CodebaseSearchInput } from './toolSchema';
 
 /**
  * V-21 pathGlob amplifier fold-in (tier2-remediation-architecture.md §8):
@@ -160,5 +162,86 @@ describe('formatHitAsText', () => {
     const out = formatHitAsText(hitWithControlChars);
     expect(out).not.toMatch(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/); // no control chars
     expect(out).toContain('\n\tindented bell+nul'); // \t and \n preserved, \x07/\x00 gone
+  });
+});
+
+/**
+ * A-05 [SECURITY]: Qwen3-Embedding (QwenLM/Qwen3-Embedding `get_detailed_instruct`,
+ * confirmed against the HF card via Context7) is an instruction-aware retrieval
+ * model — QUERIES get an `Instruct: {task}\nQuery:{query}` prefix (no space
+ * after `Query:`), DOCUMENTS stay bare. The prefix is applied ONLY at the
+ * query-EMBED choke, and ONLY when the configured embedder id names a
+ * Qwen3-Embedding variant; the FTS leg (`store.hybridSearch`'s first
+ * argument) and the document/index side are untouched — no re-index needed
+ * when the instruction text changes.
+ *
+ * `embedder`/`store` below are hand-built objects that satisfy the full
+ * `Embedder`/`VectorStore` interfaces (every required method stubbed, not
+ * just the ones this test exercises) so `deps`/`input` type-check as the
+ * real `CodebaseSearchDeps`/`CodebaseSearchInput` with no cast. The capture
+ * arrays are plain array-push spies per the Global Constraint (no new
+ * `vi.fn()`).
+ */
+describe('A-05: Qwen3-Embedding query instruction prefix', () => {
+  it('prefixes the EMBED text for a Qwen3-Embedding model but leaves the FTS query raw', async () => {
+    const embedTexts: string[][] = [];
+    const ftsQueries: string[] = [];
+    const embedder: Embedder = {
+      embed: async (texts: string[]) => {
+        embedTexts.push(texts);
+        return texts.map(() => [0.1, 0.2, 0.3]);
+      },
+    };
+    const store: VectorStore = {
+      init: async () => {},
+      upsert: async () => {},
+      deleteByPath: async () => {},
+      listFileHashes: async () => ({}),
+      hybridSearch: async (queryText: string) => {
+        ftsQueries.push(queryText);
+        return [];
+      },
+      close: async () => {},
+    };
+    const deps: CodebaseSearchDeps = { embedder, store, embedModel: 'qwen3-embedding:0.6b' };
+    const input: CodebaseSearchInput = { query: 'find the parser', k: 5 };
+
+    await runCodebaseSearch(deps, input);
+
+    expect(embedTexts[0]).toEqual([
+      'Instruct: Given a code search query, retrieve relevant code snippets that satisfy it.\nQuery:find the parser',
+    ]);
+    expect(ftsQueries[0]).toBe('find the parser'); // FTS leg raw
+  });
+
+  it('leaves the query raw for a non-Qwen3 model', async () => {
+    const embedTexts: string[][] = [];
+    const embedder: Embedder = {
+      embed: async (texts: string[]) => {
+        embedTexts.push(texts);
+        return texts.map(() => [0.1]);
+      },
+    };
+    const store: VectorStore = {
+      init: async () => {},
+      upsert: async () => {},
+      deleteByPath: async () => {},
+      listFileHashes: async () => ({}),
+      hybridSearch: async () => [],
+      close: async () => {},
+    };
+    const deps: CodebaseSearchDeps = { embedder, store, embedModel: 'nomic-embed-text' };
+    const input: CodebaseSearchInput = { query: 'find the parser', k: 5 };
+
+    await runCodebaseSearch(deps, input);
+
+    expect(embedTexts[0]).toEqual(['find the parser']);
+  });
+
+  it('buildEmbeddingQueryText: undefined model ⇒ raw', () => {
+    expect(buildEmbeddingQueryText('q', undefined)).toBe('q');
+    expect(buildEmbeddingQueryText('q', 'Qwen/Qwen3-Embedding-8B')).toBe(
+      'Instruct: Given a code search query, retrieve relevant code snippets that satisfy it.\nQuery:q',
+    );
   });
 });
