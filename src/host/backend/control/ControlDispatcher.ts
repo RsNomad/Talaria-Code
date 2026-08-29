@@ -21,7 +21,6 @@ import type { Logger } from '../../transport/JsonRpcStdio';
 import type { PanelSourceRegistry } from '../../panels/PanelSourceRegistry';
 import type { DashboardService } from '../../dashboard/HermesDashboardManager';
 import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../../dashboard/HermesDashboardClient';
-import { hasDashboardAdmin } from '../../dashboard/HermesDashboardClient';
 import { hasToggleNameCache, hasHubNameCache } from '../../dashboard/dashboardPanelSources';
 import type { AcpLoadSessionResult } from '../acp/acpClient';
 import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
@@ -41,38 +40,15 @@ import { assertSkillIdentifier, validateSkillCreate, TRUSTED_SKILL_PREFIXES } fr
 import { redactForModal } from '../../setup/SetupController';
 import { ConfigWriteTail } from './configWriteTail';
 import { PanelDataCoordinator } from './panelDataCoordinator';
+import { runAdminOp, resolveDashboardAdminClient, pollActionUntilVerified, POLL_UNCONFIRMED_MESSAGE, TRUST_GATED_METHODS } from './adminOpRunner';
 
 /**
- * Task A5 (features-add-mcp-skills-architecture.md §3 Layer 5, §4.5 item 1):
- * the FULL trust-gated method set for T1 (MCP admin) + T2 (skills admin) —
- * checked FIRST, before any network call or modal, for every method in this
- * set. Mirrors `SetupController.MUTATING_METHODS` + its `handle()` check
- * (`SetupController.ts:612-634, :1146-1148`) as a SECOND, independent gate
- * on the control-method surface (defense-in-depth over `trustGate.ts`'s
- * "no ACP backend in an untrusted workspace" gate).
- *
- * Pinned as the FULL 9-method set: A5 routes `mcp.add`/`mcp.remove`/
- * `mcp.setEnabled`/`mcp.test`/`mcp.auth`'s trust+fail-closed-cache guard;
- * A6 routes `mcp.auth`'s body + `mcp.catalogInstall`; the three
- * `skills.*` admin methods are routed by B4/B5 — but the trust-gate SET
- * itself is defined here, once, so no later task can silently add a
- * mutating method without also classifying it here (the
- * `SetupController.test.ts:1675-1712` partition-lock idiom, mirrored in
- * `AcpBackend.test.ts`'s `PINNED_TRUST_GATED_METHODS` lock test).
- * `mcp.catalog` (listing) is deliberately ABSENT — §4.7 pins it read-only,
- * same class as `tools.list`, not trust-gated.
+ * WS-GD.2a A5: `TRUST_GATED_METHODS` now lives on `adminOpRunner.ts` (its
+ * own full doc moved there verbatim) — re-exported here so
+ * `AcpBackend.test.ts`'s partition-lock import path (`./control/
+ * ControlDispatcher`) stays stable.
  */
-export const TRUST_GATED_METHODS: ReadonlySet<string> = new Set([
-  'mcp.add',
-  'mcp.remove',
-  'mcp.setEnabled',
-  'mcp.test',
-  'mcp.auth',
-  'mcp.catalogInstall',
-  'skills.create',
-  'skills.hubInstall',
-  'skills.hubUninstall',
-]);
+export { TRUST_GATED_METHODS } from './adminOpRunner';
 
 /**
  * Task A6 (§4.8): the narrowed `CancellationToken` shape {@link
@@ -517,21 +493,15 @@ export class ControlDispatcher {
     // immediate instead of a silent wait. This holds for BOTH branches below
     // — the exempt branch never queues at all, so the same reasoning applies
     // even more directly there.
-    const releaseSingleFlight = this.acquireMcpSingleFlight(method, params);
-    let result: Promise<unknown>;
-    if (TAIL_EXEMPT_MCP_METHODS.has(method)) {
-      // F3: no client-bracketable config write (see the const's doc) — never
-      // joins, never holds, never reassigns the tail.
-      result = this.handleMcpAdminInner(method, params);
-    } else {
-      result = this.configWriteTail.join(() => this.handleMcpAdminInner(method, params));
-    }
-    if (releaseSingleFlight) {
-      // Release regardless of outcome — a declined modal, a validation
-      // refusal, or a real failure must free the name exactly like success.
-      result.then(releaseSingleFlight, releaseSingleFlight);
-    }
-    return result;
+    // WS-GD.2a A5: the acquire/tail-or-direct/release choreography itself
+    // moved onto the shared {@link runAdminOp} primitive — behavior
+    // unchanged (see that function's own doc).
+    return runAdminOp({
+      acquire: () => this.acquireMcpSingleFlight(method, params),
+      tailExempt: TAIL_EXEMPT_MCP_METHODS.has(method),
+      tail: this.configWriteTail,
+      run: () => this.handleMcpAdminInner(method, params),
+    });
   }
 
   /**
@@ -578,7 +548,7 @@ export class ControlDispatcher {
       throw new Error(`Refusing '${method}': the workspace is not trusted — trust this workspace to manage MCP servers.`);
     }
 
-    const client = await this.resolveDashboardAdminClient(method);
+    const client = await resolveDashboardAdminClient(() => this.port.getDashboard(), method);
 
     if (method === 'mcp.catalog') {
       return this.mcpCatalog(client);
@@ -614,32 +584,9 @@ export class ControlDispatcher {
     }
   }
 
-  /**
-   * Task A5 (§4.5 item 2), widened by Task B4: `dashboard.ensure()` then the
-   * `hasDashboardAdmin` structural narrowing (the `hasToggleNameCache`
-   * idiom) — a dashboard client without the full T1+T2 admin surface (or no
-   * dashboard at all) fails closed rather than silently no-op-ing. The
-   * return type is intersected with `DashboardClientLike` (NOT re-declared
-   * on `DashboardAdminClient` itself — `HermesDashboardClient.ts` is
-   * B2-owned, untouched here): `client` above is typed `DashboardClientLike`
-   * BEFORE the `hasDashboardAdmin` guard, so TypeScript's own type-predicate
-   * narrowing already widens it to `DashboardClientLike & DashboardAdminClient`
-   * inside this function — this signature just carries that same width to
-   * every caller, so Task B4's `skills.hubInstall` ground-truth `listSkills()`
-   * re-check (a `DashboardClientLike` member) is reachable off the SAME
-   * resolved client the T1 MCP methods use.
-   */
-  private async resolveDashboardAdminClient(method: string): Promise<DashboardAdminClient & DashboardClientLike> {
-    const dashboard = this.port.getDashboard();
-    if (!dashboard) {
-      throw new Error(`Refusing '${method}': the Hermes dashboard channel is not configured.`);
-    }
-    const client = await dashboard.ensure();
-    if (!hasDashboardAdmin(client)) {
-      throw new Error(`Refusing '${method}': the dashboard client does not support admin actions.`);
-    }
-    return client;
-  }
+  // WS-GD.2a A5: `resolveDashboardAdminClient` moved onto `adminOpRunner.ts`
+  // (its own doc moved there verbatim) — call sites below now pass a bound
+  // `() => this.port.getDashboard()` thunk.
 
   /**
    * Task A5 (§3 Layer 5 critic IMPORTANT-2, §4.5 item 3): the FAIL-CLOSED
@@ -781,44 +728,8 @@ export class ControlDispatcher {
     return await this.pollCatalogInstall(client, entry.name, result.action);
   }
 
-  /**
-   * CA-M05: run ONE `actionStatus` bounded by the poll deadline. A long-hanging
-   * call can otherwise blow past the deadline undetected (the loop's between-
-   * calls check is only reached AFTER the await returns). A settle-once race:
-   * a wall-clock timeout resolves `{ timedOut: true }`; a real status resolves
-   * `{ status }`; a TRANSPORT rejection passes through as a rejection (→ {@link
-   * throwPollUnconfirmed}). The timer is `unref()`d and cleared on the fast path.
-   */
-  private actionStatusWithinDeadline(
-    client: DashboardAdminClient,
-    action: string,
-    deadline: number,
-  ): Promise<PolledOutcome> {
-    const remaining = Math.max(0, deadline - Date.now());
-    return new Promise<PolledOutcome>((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        resolve({ timedOut: true });
-      }, remaining);
-      timer.unref?.();
-      client.actionStatus(action).then(
-        (status) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve({ status });
-        },
-        (err: unknown) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(err instanceof Error ? err : new Error(String(err)));
-        },
-      );
-    });
-  }
+  // WS-GD.2a A5: `actionStatusWithinDeadline` moved onto `adminOpRunner.ts`
+  // (rebuilt on WS-R1's `settleRace`; own doc moved there verbatim).
 
   /**
    * Task A6 (§4.7 item 2, background branch): poll `actionStatus` at a
@@ -831,46 +742,29 @@ export class ControlDispatcher {
    * CA-M05: the deadline bounds the `actionStatus` call itself (via {@link
    * actionStatusWithinDeadline}), not just the gap between calls — a hung
    * call can no longer blow past the cap undetected.
+   * WS-GD.2a A5: the poll loop itself now runs on the shared {@link
+   * pollActionUntilVerified} primitive — the `lastCatalogEntries` caching
+   * side effect lives inside the `verify` closure below, exactly where the
+   * inline loop used to set it, so it still runs on every verify attempt.
    */
   private async pollCatalogInstall(
     client: DashboardAdminClient,
     name: string,
     action: string,
   ): Promise<McpCatalogInstallResult> {
-    const deadline = Date.now() + CATALOG_POLL_CAP_MS;
-    let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
-    let lastLines: string[] = [];
-    for (;;) {
-      let polled: PolledOutcome;
-      try {
-        polled = await this.actionStatusWithinDeadline(client, action, deadline);
-      } catch (err) {
-        this.throwPollUnconfirmed(action, err);
-      }
-      if ('timedOut' in polled) {
-        this.rejectCatalogInstall(name, lastLines);
-      }
-      const status = polled.status;
-      lastLines = status.lines;
-      if (!status.running) break;
-      if (Date.now() >= deadline) {
-        this.rejectCatalogInstall(name, lastLines); // cheap fast-path exit; now redundant with the bound but harmless
-      }
-      await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
-      delay = BACKGROUND_POLL_STEP_DELAY_MS;
-    }
-
-    let verify: McpCatalogData;
-    try {
-      verify = await client.listMcpCatalog();
-    } catch (err) {
-      this.throwPollUnconfirmed(action, err);
-    }
-    this.lastCatalogEntries = verify.entries;
-    const row = verify.entries.find((entry) => entry.name === name);
-    if (!row || row.installed !== true) {
-      this.rejectCatalogInstall(name, lastLines);
-    }
+    await pollActionUntilVerified({
+      client,
+      action,
+      capMs: CATALOG_POLL_CAP_MS,
+      verify: async () => {
+        const verify = await client.listMcpCatalog();
+        this.lastCatalogEntries = verify.entries;
+        const row = verify.entries.find((entry) => entry.name === name);
+        return row !== undefined && row.installed === true;
+      },
+      rejectUnverified: (tailLines) => this.rejectCatalogInstall(name, tailLines),
+      throwUnconfirmed: (err) => this.throwPollUnconfirmed(action, err),
+    });
 
     await this.reloadMcpAndRefetch();
     return { ok: true, name };
@@ -992,23 +886,16 @@ export class ControlDispatcher {
    * `mcp.add`).
    */
   private async handleSkillsAdmin(method: SkillsAdminMethod, params: unknown): Promise<unknown> {
-    const releaseSingleFlight = this.acquireSkillSingleFlight(method, params);
-    let result: Promise<unknown>;
-    if (SKILLS_TAIL_EXEMPT_METHODS.has(method)) {
-      // F3 membership rule (mirrors TAIL_EXEMPT_MCP_METHODS): no client-
-      // bracketable config write of its own — never joins, never holds,
-      // never reassigns the tail.
-      result = this.handleSkillsAdminInner(method, params);
-    } else {
-      result = this.configWriteTail.join(() => this.handleSkillsAdminInner(method, params));
-    }
-    if (releaseSingleFlight) {
-      // Release regardless of outcome — a declined modal, a scan-gate
-      // refusal, or a real failure must free the identifier exactly like
-      // success (mirrors handleMcpAdmin's own release discipline).
-      result.then(releaseSingleFlight, releaseSingleFlight);
-    }
-    return result;
+    // WS-GD.2a A5: the acquire/tail-or-direct/release choreography itself
+    // moved onto the shared {@link runAdminOp} primitive — behavior
+    // unchanged (see that function's own doc, and {@link handleMcpAdmin}'s
+    // mirrored call for why `acquire` runs synchronously).
+    return runAdminOp({
+      acquire: () => this.acquireSkillSingleFlight(method, params),
+      tailExempt: SKILLS_TAIL_EXEMPT_METHODS.has(method),
+      tail: this.configWriteTail,
+      run: () => this.handleSkillsAdminInner(method, params),
+    });
   }
 
   /**
@@ -1076,11 +963,11 @@ export class ControlDispatcher {
         this.port.logger?.append(`[AcpBackend] '${method}' refused skill identifier: ${gate.detail}`);
         throw new Error(gate.reason);
       }
-      const client = await this.resolveDashboardAdminClient(method);
+      const client = await resolveDashboardAdminClient(() => this.port.getDashboard(), method);
       return method === 'skills.hubPreview' ? client.previewHubSkill(identifier) : client.scanHubSkill(identifier);
     }
 
-    const client = await this.resolveDashboardAdminClient(method);
+    const client = await resolveDashboardAdminClient(() => this.port.getDashboard(), method);
 
     if (method === 'skills.create') {
       return this.skillsCreate(client, params);
@@ -1196,39 +1083,17 @@ export class ControlDispatcher {
     skillName: string,
     action: string,
   ): Promise<HubInstallResult> {
-    const deadline = Date.now() + SKILLS_INSTALL_POLL_CAP_MS;
-    let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
-    let lastLines: string[] = [];
-    for (;;) {
-      let polled: PolledOutcome;
-      try {
-        polled = await this.actionStatusWithinDeadline(client, action, deadline);
-      } catch (err) {
-        this.throwPollUnconfirmed(action, err);
-      }
-      if ('timedOut' in polled) {
-        this.rejectSkillInstall(skillName, lastLines);
-      }
-      const status = polled.status;
-      lastLines = status.lines;
-      if (!status.running) break;
-      if (Date.now() >= deadline) {
-        this.rejectSkillInstall(skillName, lastLines); // cheap fast-path exit; now redundant with the bound but harmless
-      }
-      await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
-      delay = BACKGROUND_POLL_STEP_DELAY_MS;
-    }
-
-    let rows: Awaited<ReturnType<DashboardClientLike['listSkills']>>;
-    try {
-      rows = await client.listSkills();
-    } catch (err) {
-      this.throwPollUnconfirmed(action, err);
-    }
-    const found = rows.some((row) => row.name === skillName);
-    if (!found) {
-      this.rejectSkillInstall(skillName, lastLines);
-    }
+    await pollActionUntilVerified({
+      client,
+      action,
+      capMs: SKILLS_INSTALL_POLL_CAP_MS,
+      verify: async () => {
+        const rows = await client.listSkills();
+        return rows.some((row) => row.name === skillName);
+      },
+      rejectUnverified: (tailLines) => this.rejectSkillInstall(skillName, tailLines),
+      throwUnconfirmed: (err) => this.throwPollUnconfirmed(action, err),
+    });
 
     await this.panels.fetchPanelData('skills');
     return { ok: true, name: skillName };
@@ -1322,39 +1187,17 @@ export class ControlDispatcher {
     skillName: string,
     action: string,
   ): Promise<{ ok: true; name: string }> {
-    const deadline = Date.now() + SKILLS_INSTALL_POLL_CAP_MS;
-    let delay = BACKGROUND_POLL_FIRST_DELAY_MS;
-    let lastLines: string[] = [];
-    for (;;) {
-      let polled: PolledOutcome;
-      try {
-        polled = await this.actionStatusWithinDeadline(client, action, deadline);
-      } catch (err) {
-        this.throwPollUnconfirmed(action, err);
-      }
-      if ('timedOut' in polled) {
-        this.rejectSkillUninstall(skillName, lastLines);
-      }
-      const status = polled.status;
-      lastLines = status.lines;
-      if (!status.running) break;
-      if (Date.now() >= deadline) {
-        this.rejectSkillUninstall(skillName, lastLines); // cheap fast-path exit; now redundant with the bound but harmless
-      }
-      await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
-      delay = BACKGROUND_POLL_STEP_DELAY_MS;
-    }
-
-    let rows: Awaited<ReturnType<DashboardClientLike['listSkills']>>;
-    try {
-      rows = await client.listSkills();
-    } catch (err) {
-      this.throwPollUnconfirmed(action, err);
-    }
-    const stillPresent = rows.some((row) => row.name === skillName);
-    if (stillPresent) {
-      this.rejectSkillUninstall(skillName, lastLines);
-    }
+    await pollActionUntilVerified({
+      client,
+      action,
+      capMs: SKILLS_INSTALL_POLL_CAP_MS,
+      verify: async () => {
+        const rows = await client.listSkills();
+        return !rows.some((row) => row.name === skillName);
+      },
+      rejectUnverified: (tailLines) => this.rejectSkillUninstall(skillName, tailLines),
+      throwUnconfirmed: (err) => this.throwPollUnconfirmed(action, err),
+    });
 
     await this.panels.fetchPanelData('skills');
     return { ok: true, name: skillName };
@@ -1804,29 +1647,10 @@ function toMcpAddParams(
 const MCP_RELOAD_DIVERGENCE_MESSAGE =
   'The MCP configuration was saved, but reloading the running Hermes server failed — reload the window or restart Hermes to apply the change.';
 
-/**
- * F2-09: reported when a poll/verify TRANSPORT call rejects — the action was
- * already DISPATCHED server-side; we merely lost visibility (distinct from the
- * ground-truth "did not complete" refusals).
- */
-const POLL_UNCONFIRMED_MESSAGE =
-  'The action was dispatched, but its status could not be confirmed — refresh the panel to check whether it completed.';
-
-/** CA-M05: the raw `actionStatus` envelope shape. */
-type ActionStatus = { running: boolean; exit_code: number | null; lines: string[] };
-/** CA-M05: either the fetched status, or a wall-clock timeout that the caller maps to its own "did not complete" refusal. */
-type PolledOutcome = { status: ActionStatus } | { timedOut: true };
-
-/**
- * Task A6 (§4.7 item 2), widened by Task B4: the shared background-poll
- * cadence — the FIRST wait is 1s, every wait after that is 2s — reused by
- * BOTH {@link pollCatalogInstall} (cap {@link CATALOG_POLL_CAP_MS}, 180s:
- * clone + build headroom) and {@link pollSkillInstall} (cap
- * {@link SKILLS_INSTALL_POLL_CAP_MS}, 120s per §5.4 — NOT the catalog's
- * 180s; skill installs never clone/build, they only copy files).
- */
-const BACKGROUND_POLL_FIRST_DELAY_MS = 1_000;
-const BACKGROUND_POLL_STEP_DELAY_MS = 2_000;
+// WS-GD.2a A5: `POLL_UNCONFIRMED_MESSAGE`, `ActionStatus`/`PolledOutcome`,
+// and the shared 1s->2s poll cadence consts all moved onto `adminOpRunner.ts`
+// (own docs moved there verbatim) — the two poll-cap consts below stay here,
+// domain-side, passed in as `pollActionUntilVerified`'s `capMs`.
 const CATALOG_POLL_CAP_MS = 180_000;
 /**
  * Task B4 (§5.4 "cap 120s") + Task B5 reuse: the shared skills-hub ACTION
@@ -1879,14 +1703,6 @@ const SKILLS_TAIL_EXEMPT_METHODS: ReadonlySet<SkillsAdminMethod> = new Set([
   'skills.hubInstall',
   'skills.hubUninstall',
 ]);
-
-/** Task A6: a plain `setTimeout` wait — {@link pollCatalogInstall}'s backoff step. Real timers in production; `vi.useFakeTimers()` in tests. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
-  });
-}
 
 /**
  * P3 (arch A3): pinned refusal returned by {@link ControlDispatcher
