@@ -31,7 +31,11 @@ export function useDebouncedPersist<T>(
     bridge.setState(buildRef.current());
   };
 
-  // Trailing debounce keyed on the SAME deps the direct write used.
+  // Trailing debounce keyed on the SAME deps the direct write used, PLUS
+  // `delayMs` itself as a reschedule key (CA-10 M1): the effect closes over
+  // `delayMs` but previously only rescheduled on `deps` change, so a changed
+  // `delayMs` would not take effect until the next `deps` change. Appending
+  // it here means a delay change alone reschedules the pending timer too.
   useEffect(() => {
     if (timerRef.current !== undefined) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => {
@@ -45,7 +49,7 @@ export function useDebouncedPersist<T>(
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
+  }, [...deps, delayMs]);
 
   // Immediate flush on hidden + unmount — the two moments a pending trailing
   // write must not be dropped. Mount-once; reads live refs.

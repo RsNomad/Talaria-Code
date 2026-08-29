@@ -447,12 +447,15 @@ describe('A11Y-06: tab close button meets the 24x24 minimum target size', () => 
         chatPanelMounted={true}
       />,
     );
-    const close = screen.getByRole('button', { name: 'Close Alpha' });
-    const cls = close.className;
-    expect(cls).toContain('min-h-6');
-    expect(cls).toContain('min-w-6');
-    expect(cls).toContain('items-center');
-    expect(cls).toContain('justify-center');
+    const closeButtons = screen.getAllByRole('button', { name: /^Close / });
+    expect(closeButtons).toHaveLength(3);
+    for (const close of closeButtons) {
+      const cls = close.className;
+      expect(cls).toContain('min-h-6');
+      expect(cls).toContain('min-w-6');
+      expect(cls).toContain('items-center');
+      expect(cls).toContain('justify-center');
+    }
   });
 });
 

@@ -480,7 +480,7 @@ export const ChatView = memo(function ChatView({
            * queries. The always-mounted log IS the live region. */}
           {hidden > 0 && (
             <div className="flex-none py-1 text-center text-2xs text-faint">
-              {hidden} earlier {hidden === 1 ? 'message' : 'messages'} hidden to keep the view responsive
+              {hidden} earlier {hidden === 1 ? 'item' : 'items'} hidden to keep the view responsive
             </div>
           )}
           {transcript.map((item, i) => (

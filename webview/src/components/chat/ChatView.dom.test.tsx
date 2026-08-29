@@ -498,23 +498,23 @@ describe('CA-M14: memoized transcript scans render identically', () => {
 describe('CA-M15: collapsed-older-messages affordance', () => {
   it('shows the honest count when items were hidden', () => {
     renderChatViewWithHidden([messageItem({ text: 'newest' })], 7);
-    expect(screen.getByText(/7 earlier messages hidden/i)).toBeInTheDocument();
+    expect(screen.getByText(/7 earlier items hidden/i)).toBeInTheDocument();
   });
 
   it('renders the affordance INSIDE the role="log" live region (announced as an addition)', () => {
     renderChatViewWithHidden([messageItem({ text: 'newest' })], 7);
     const log = screen.getByRole('log');
-    expect(within(log).getByText(/7 earlier messages hidden/i)).toBeInTheDocument();
+    expect(within(log).getByText(/7 earlier items hidden/i)).toBeInTheDocument();
   });
 
   it('singular pluralization for exactly one hidden message', () => {
     renderChatViewWithHidden([messageItem({ text: 'newest' })], 1);
-    expect(screen.getByText(/1 earlier message hidden/i)).toBeInTheDocument();
+    expect(screen.getByText(/1 earlier item hidden/i)).toBeInTheDocument();
   });
 
   it('renders no affordance when nothing is hidden (and does not add a second status region)', () => {
     renderChatViewWithHidden([messageItem({ text: 'only' })], undefined);
-    expect(screen.queryByText(/earlier message/i)).toBeNull();
+    expect(screen.queryByText(/earlier item/i)).toBeNull();
     // regression: still exactly one polite status region (settlement), so the
     // existing getByRole('status') singular queries keep resolving.
     expect(screen.getAllByRole('status')).toHaveLength(1);

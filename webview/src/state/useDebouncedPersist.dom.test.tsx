@@ -38,10 +38,21 @@ describe('CA-10: useDebouncedPersist coalesces writes', () => {
     expect(setState).not.toHaveBeenCalled();
     const original = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState');
     Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
-    act(() => { document.dispatchEvent(new Event('visibilitychange')); });
-    expect(setState).toHaveBeenCalledTimes(1);
-    expect(setState).toHaveBeenLastCalledWith({ n: 3 });
-    if (original) Object.defineProperty(document, 'visibilityState', original);
+    try {
+      act(() => { document.dispatchEvent(new Event('visibilitychange')); });
+      expect(setState).toHaveBeenCalledTimes(1);
+      expect(setState).toHaveBeenLastCalledWith({ n: 3 });
+    } finally {
+      // CA-10 M2: restore in `finally` so an assertion failure above can't
+      // leak the `'hidden'` override into later tests; if there was no
+      // prototype descriptor to restore, delete the instance override
+      // added above so either way the document is left as it was found.
+      if (original) {
+        Object.defineProperty(document, 'visibilityState', original);
+      } else {
+        delete (document as { visibilityState?: unknown }).visibilityState;
+      }
+    }
   });
 
   it('flushes the latest snapshot on unmount', () => {

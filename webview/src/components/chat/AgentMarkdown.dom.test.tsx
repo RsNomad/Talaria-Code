@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { AgentMarkdown, splitStableBoundary } from './AgentMarkdown';
+import { AgentMarkdown, splitStableBoundary, renderMarkdown } from './AgentMarkdown';
 
 /**
  * Audit G-5. Lists were unsupported (raw dashes in a paragraph), `#` headings
@@ -355,6 +355,74 @@ describe('CA-11: memoized streaming render is transparent (warm === cold for eve
     const { rerender, container } = render(<AgentMarkdown text={MULTI_BLOCK.slice(0, 1)} streaming />);
     for (let k = 2; k <= MULTI_BLOCK.length; k++) {
       const prefix = MULTI_BLOCK.slice(0, k);
+      rerender(<AgentMarkdown text={prefix} streaming />);
+      const warm = container.innerHTML;
+      const fresh = render(<AgentMarkdown text={prefix} streaming />);
+      const cold = fresh.container.innerHTML;
+      fresh.unmount();
+      expect(warm).toBe(cold);
+    }
+  });
+
+  /**
+   * CA-11 M1: the test above only proves split==split (the memoized instance
+   * agrees with a fresh mount that ALSO goes through the same stable/tail
+   * split). It never checks the split against a genuinely UNSPLIT whole-text
+   * render — so a bug that made splitting itself non-transparent (e.g. the
+   * stable/tail boundary subtly changing block structure vs. parsing the
+   * whole string in one pass) could slip past it. `renderMarkdown` is called
+   * directly here with the FULL `MULTI_BLOCK` text and no `splitStableBoundary`
+   * call at all — reproducing exactly what `AgentMarkdown` would render if it
+   * never split (single `tokenize`/`renderBlocks` pass over the whole text,
+   * `keyPrefix: 'tail'` to mirror the tail segment's own prefix). `key` props
+   * never surface in `innerHTML`, so the differing 'stable'/'tail' key
+   * namespaces the real component uses cannot cause a spurious mismatch here
+   * — only an actual structural divergence would.
+   */
+  it('CA-11 M1: the memoized split render is byte-identical to a whole, unsplit render of the same text', () => {
+    const { container: splitContainer } = render(<AgentMarkdown text={MULTI_BLOCK} streaming />);
+
+    function ReferenceWhole() {
+      return (
+        <div className="text-[13px] leading-relaxed text-fg">
+          {renderMarkdown(MULTI_BLOCK, true, 'tail')}
+          <span className="h-live text-accent">▍</span>
+        </div>
+      );
+    }
+    const { container: wholeContainer } = render(<ReferenceWhole />);
+
+    expect(splitContainer.innerHTML).toBe(wholeContainer.innerHTML);
+  });
+});
+
+/**
+ * CA-11 M2: `MULTI_BLOCK` above never exercises a mid-prose triple-backtick
+ * mention (the `type ``` to open` case from the C2 describe block, above)
+ * alongside a REAL fenced block, nor a 4-backtick fence run — both are
+ * corners where `splitStableBoundary`'s fence-parity counting could disagree
+ * with `tokenize`'s own fence regex about where a block boundary actually is.
+ * `FENCE_EDGE` grows both into one fixture so the warm===cold loop below
+ * locks fence-parity ≡ tokenizer agreement on exactly the corners `MULTI_BLOCK`
+ * omits.
+ */
+const FENCE_EDGE = [
+  'Text with ``` inline mention.',
+  '',
+  'Then a real block:',
+  '',
+  '````ts',
+  'const x = 1;',
+  '````',
+  '',
+  'Tail in progress',
+].join('\n');
+
+describe('CA-11: memoized streaming render is transparent on fence-edge corners (warm === cold for every prefix)', () => {
+  it('an incrementally-grown instance renders identically to a fresh mount at every prefix (FENCE_EDGE)', () => {
+    const { rerender, container } = render(<AgentMarkdown text={FENCE_EDGE.slice(0, 1)} streaming />);
+    for (let k = 2; k <= FENCE_EDGE.length; k++) {
+      const prefix = FENCE_EDGE.slice(0, k);
       rerender(<AgentMarkdown text={prefix} streaming />);
       const warm = container.innerHTML;
       const fresh = render(<AgentMarkdown text={prefix} streaming />);
