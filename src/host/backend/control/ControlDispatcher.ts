@@ -45,6 +45,7 @@ import {
 import { assertSkillIdentifier, validateSkillCreate, TRUSTED_SKILL_PREFIXES } from './skillSourceGate';
 import { redactForModal } from '../../setup/SetupController';
 import { redactSecretsDeep } from '../../redactControlResponse';
+import { ConfigWriteTail } from './configWriteTail';
 
 /**
  * Task A5 (features-add-mcp-skills-architecture.md §3 Layer 5, §4.5 item 1):
@@ -279,30 +280,7 @@ export class ControlDispatcher {
    */
   private static readonly UNKNOWN_SESSION_ID = 'unknown-session';
 
-  /**
-   * AH5: HOST-SIDE serialization tail, originally for {@link toggleDashboard}
-   * alone (moved verbatim off `AcpBackend`). Task A5 (§4.5) widened its use to
-   * every dashboard-mutating control method; F3 NARROWED that again — this
-   * tail now serializes every SHORT config-mutating method only
-   * (`skills.toggle`/`toolsets.toggle`/`mcp.add`/`mcp.remove`/
-   * `mcp.setEnabled`, and Task B4's `skills.create`), so two of OUR requests
-   * can never interleave two read-modify-write cycles on the same underlying
-   * `~/.hermes/config.yaml`. The four {@link TAIL_EXEMPT_MCP_METHODS}
-   * (`mcp.catalog`/`mcp.test`/`mcp.auth`/`mcp.catalogInstall`) and the four
-   * {@link SKILLS_TAIL_EXEMPT_METHODS} (`skills.hubPreview`/`skills.hubScan`/
-   * `skills.hubInstall` — Task B4; `skills.hubUninstall` — Task B5) run OFF
-   * this tail instead — none of them performs a client-bracketable config
-   * write of its own (`hubInstall`/`hubUninstall`'s only write happens
-   * server-side, at the END of the action, same membership rule as the MCP
-   * set) — with same-name/same-identifier exclusion carried by {@link
-   * busyMcpNames}/{@link busySkillInstallIds}/{@link busySkillUninstallNames}
-   * instead. Tail-exempting the up-to-120s
-   * `skills.hubInstall`/`skills.hubUninstall` polls is the whole point:
-   * holding the tail for one would freeze every other short config mutation
-   * behind a single slow install/uninstall — the exact regression this
-   * mirrors away from.
-   */
-  private dashboardToggleTail: Promise<unknown> = Promise.resolve();
+  private readonly configWriteTail = new ConfigWriteTail();
 
   /**
    * T-C1 (closes audit V-2): mints a unique synthetic lease-holder id per
@@ -677,13 +655,7 @@ export class ControlDispatcher {
     method: 'skills.toggle' | 'toolsets.toggle',
     params: unknown,
   ): Promise<DashboardToggleResult> {
-    const run = () => this.toggleDashboardInner(method, params);
-    const result = this.dashboardToggleTail.then(run, run);
-    this.dashboardToggleTail = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+    return this.configWriteTail.join(() => this.toggleDashboardInner(method, params));
   }
 
   private async toggleDashboardInner(
@@ -744,12 +716,7 @@ export class ControlDispatcher {
       // joins, never holds, never reassigns the tail.
       result = this.handleMcpAdminInner(method, params);
     } else {
-      const run = () => this.handleMcpAdminInner(method, params);
-      result = this.dashboardToggleTail.then(run, run);
-      this.dashboardToggleTail = result.then(
-        () => undefined,
-        () => undefined,
-      );
+      result = this.configWriteTail.join(() => this.handleMcpAdminInner(method, params));
     }
     if (releaseSingleFlight) {
       // Release regardless of outcome — a declined modal, a validation
@@ -1225,12 +1192,7 @@ export class ControlDispatcher {
       // never reassigns the tail.
       result = this.handleSkillsAdminInner(method, params);
     } else {
-      const run = () => this.handleSkillsAdminInner(method, params);
-      result = this.dashboardToggleTail.then(run, run);
-      this.dashboardToggleTail = result.then(
-        () => undefined,
-        () => undefined,
-      );
+      result = this.configWriteTail.join(() => this.handleSkillsAdminInner(method, params));
     }
     if (releaseSingleFlight) {
       // Release regardless of outcome — a declined modal, a scan-gate
