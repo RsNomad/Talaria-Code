@@ -265,6 +265,100 @@ describe('golden: single-flight admin acquire — all 5 pinned busy messages + r
 });
 
 // ---------------------------------------------------------------------------
+// 2b. Single-flight RELEASE pins — the two skills locks + a tail-exempt mcp
+// lock (WS-GD.2a A2 fix I1/I3). Before this block, only busyMcpNames' own
+// release was pinned, and only via the tail-RIDING mcp.add decline test
+// above — busySkillInstallIds/busySkillUninstallNames (a SEPARATE
+// `result.then(release, release)` wiring `handleSkillsAdmin` owns) and the
+// tail-EXEMPT mcp release path (mcp.auth's own `result.then(release,
+// release)` inside `handleMcpAdmin`) were never proven to actually free
+// their name/identifier once the guarded call settles.
+// ---------------------------------------------------------------------------
+
+describe('golden: single-flight RELEASE — the two skills locks + a tail-exempt mcp lock', () => {
+  it('busySkillInstallIds is released once a hubInstall settles — the SAME identifier is admitted again immediately', async () => {
+    let releaseInstall!: () => void;
+    let installCallCount = 0;
+    const hanging = new Promise<{ ok: boolean; name: string }>((resolve) => {
+      releaseInstall = () => resolve({ ok: true, name: 'act-1' });
+    });
+    const client = makeFakeAdminClient({
+      installHubSkill: () => {
+        installCallCount += 1;
+        return installCallCount === 1 ? hanging : Promise.resolve({ ok: true, name: 'act-1' });
+      },
+      listSkills: async () => [makeDashboardSkill({ name: 'my-skill' })], // ground-truth-verifies both installs
+    });
+    const { port, registry } = makePort({ getDashboard: () => makeFakeDashboard(client), confirm: async () => true });
+    registerSkillsSourceWithHubNames(registry, [], []);
+    const dispatcher = new ControlDispatcher(port);
+
+    const first = dispatcher.invokeControl('skills.hubInstall', { identifier: VALID_HUB_IDENTIFIER });
+    releaseInstall();
+    await first;
+
+    // A dropped/one-sided release would refuse this with the busy message
+    // forever — instead it must reach `installHubSkill` a second time.
+    await dispatcher.invokeControl('skills.hubInstall', { identifier: VALID_HUB_IDENTIFIER });
+    expect(installCallCount).toBe(2);
+  });
+
+  it('busySkillUninstallNames is released once a hubUninstall settles — the SAME name is admitted again immediately', async () => {
+    let releaseUninstall!: () => void;
+    let uninstallCallCount = 0;
+    const hanging = new Promise<{ ok: boolean; name: string }>((resolve) => {
+      releaseUninstall = () => resolve({ ok: true, name: 'act-1' });
+    });
+    const client = makeFakeAdminClient({
+      uninstallHubSkill: () => {
+        uninstallCallCount += 1;
+        return uninstallCallCount === 1 ? hanging : Promise.resolve({ ok: true, name: 'act-1' });
+      },
+      listSkills: async () => [], // absence-verifies both uninstalls
+    });
+    const { port, registry } = makePort({ getDashboard: () => makeFakeDashboard(client), confirm: async () => true });
+    registerSkillsSourceWithHubNames(registry, ['my-skill'], ['my-skill']);
+    const dispatcher = new ControlDispatcher(port);
+
+    const first = dispatcher.invokeControl('skills.hubUninstall', { name: 'my-skill' });
+    releaseUninstall();
+    await first;
+
+    // A dropped/one-sided release would refuse this with the busy message
+    // forever — instead it must reach `uninstallHubSkill` a second time.
+    await dispatcher.invokeControl('skills.hubUninstall', { name: 'my-skill' });
+    expect(uninstallCallCount).toBe(2);
+  });
+
+  it('busyMcpNames is released on the mcp.auth TAIL-EXEMPT path — the SAME name is admitted again immediately', async () => {
+    let releaseAuth!: () => void;
+    let authCallCount = 0;
+    const hanging = new Promise<McpTestResult>((resolve) => {
+      releaseAuth = () => resolve({ ok: true, tools: [] });
+    });
+    const client = makeFakeAdminClient({
+      authMcpServer: () => {
+        authCallCount += 1;
+        return authCallCount === 1 ? hanging : Promise.resolve({ ok: true, tools: [] });
+      },
+    });
+    const { port, registry } = makePort({ getDashboard: () => makeFakeDashboard(client), confirm: async () => true });
+    registerMcpSourceWithNames(registry, ['github']);
+    const dispatcher = new ControlDispatcher(port);
+
+    const first = dispatcher.invokeControl('mcp.auth', { name: 'github' });
+    releaseAuth();
+    await first;
+
+    // mcp.auth never joins dashboardToggleTail (TAIL_EXEMPT_MCP_METHODS) — its
+    // own `result.then(release, release)` is the ONLY thing that frees the
+    // name. A dropped release here would refuse this with the busy message.
+    await dispatcher.invokeControl('mcp.auth', { name: 'github' });
+    expect(authCallCount).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 3. Shared serialization tail (×3 call sites) + tail-exempt bypass
 // ---------------------------------------------------------------------------
 
@@ -306,6 +400,140 @@ describe('golden: dashboardToggleTail serialization + tail-exempt bypass', () =>
     await toggle;
     await setEnabled;
     expect(events.indexOf('setEnabled:github')).toBeGreaterThan(events.indexOf('toggle:a'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. skills.create tail MEMBERSHIP + the exempt-bypass counter-proof, plus a
+// deeper FIFO pin (WS-GD.2a A2 fix I2/I4). Section 3 above proves toggle and
+// mcp.setEnabled share a tail and mcp.test bypasses it — it never exercises
+// `skills.create`'s OWN tail-joining branch (`handleSkillsAdmin`'s `else` arm,
+// ControlDispatcher.ts ~:1227-1234) nor a tail-EXEMPT LONG (background-
+// polled) op racing a held tail, and its FIFO assertion only has ONE queued
+// op behind the held one — too few to distinguish FIFO from LIFO.
+// ---------------------------------------------------------------------------
+
+describe('golden: skills.create shares the SAME dashboardToggleTail; a tail-exempt long op bypasses it', () => {
+  it('skills.create is BLOCKED behind a pending tail op and admitted only after it releases, in submission order', async () => {
+    const events: string[] = [];
+    let releaseToggle!: () => void;
+    const gate = new Promise<DashboardToggleResult>((res) => {
+      releaseToggle = () => res({ ok: true, name: 'a', enabled: true });
+    });
+    const client = makeFakeAdminClient({
+      toggleSkill: (name) => {
+        events.push(`toggle:${name}`);
+        return gate;
+      },
+      createSkill: async (body) => {
+        events.push(`create:${body.name}`);
+        return {};
+      },
+    });
+    const { port, registry } = makePort({ getDashboard: () => makeFakeDashboard(client), confirm: async () => true });
+    registerFakeSource(registry, 'skills', async () => ({ data: { skills: [], categories: [] } }));
+    const dispatcher = new ControlDispatcher(port);
+
+    const toggle = dispatcher.invokeControl('skills.toggle', { name: 'a', enabled: true });
+    const create = dispatcher.invokeControl('skills.create', {
+      name: 'my-new-skill',
+      content: '---\nname: my-new-skill\n---\n',
+    });
+
+    // Drain the microtask queue past a real macrotask boundary — create's own
+    // handler has no timer of its own, so if it were NOT gated by the SAME
+    // tail as toggle it would already have reached `createSkill` by now.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(events).not.toContain('create:my-new-skill'); // queued behind the hung toggle — SAME tail instance
+
+    releaseToggle();
+    await toggle;
+    await create;
+    expect(events.indexOf('create:my-new-skill')).toBeGreaterThan(events.indexOf('toggle:a')); // admitted only once the tail freed up, in submission order
+  });
+
+  it('a tail-EXEMPT long op (skills.hubInstall) does NOT wait behind a pending tail op — unlike skills.create above', async () => {
+    let toggleReleased = false;
+    let releaseToggle!: () => void;
+    const gate = new Promise<DashboardToggleResult>((res) => {
+      releaseToggle = () => {
+        toggleReleased = true;
+        res({ ok: true, name: 'a', enabled: true });
+      };
+    });
+    let releaseInstall!: () => void;
+    const hangingInstall = new Promise<{ ok: boolean; name: string }>((resolve) => {
+      releaseInstall = () => resolve({ ok: true, name: 'act-1' });
+    });
+    let resolveReachedInstall!: () => void;
+    const reachedInstall = new Promise<void>((resolve) => {
+      resolveReachedInstall = resolve;
+    });
+    const client = makeFakeAdminClient({
+      toggleSkill: () => gate,
+      installHubSkill: () => {
+        resolveReachedInstall();
+        return hangingInstall;
+      },
+      listSkills: async () => [makeDashboardSkill({ name: 'my-skill' })],
+    });
+    const { port, registry } = makePort({ getDashboard: () => makeFakeDashboard(client), confirm: async () => true });
+    registerFakeSource(registry, 'skills', async () => ({ data: { skills: [], categories: [] } }));
+    const dispatcher = new ControlDispatcher(port);
+
+    const toggle = dispatcher.invokeControl('skills.toggle', { name: 'a', enabled: true });
+    const install = dispatcher.invokeControl('skills.hubInstall', { identifier: VALID_HUB_IDENTIFIER });
+
+    await reachedInstall; // resolves the instant installHubSkill is invoked — no tick-counting needed
+    expect(toggleReleased).toBe(false); // the tail-holding toggle is STILL pending — install ran without ever waiting on it
+
+    releaseInstall();
+    releaseToggle();
+    await Promise.all([toggle, install]);
+  });
+
+  it('the shared tail preserves FIFO submission order across ≥2 QUEUED ops (distinguishes FIFO from LIFO)', async () => {
+    const events: string[] = [];
+    let releaseToggle!: () => void;
+    const gate = new Promise<DashboardToggleResult>((res) => {
+      releaseToggle = () => res({ ok: true, name: 'a', enabled: true });
+    });
+    const client = makeFakeAdminClient({
+      toggleSkill: (name) => {
+        events.push(`toggle:${name}`);
+        return gate;
+      },
+      setMcpServerEnabled: async (name, enabled) => {
+        events.push(`setEnabled:${name}`);
+        return { ok: true, name, enabled };
+      },
+      removeMcpServer: async (name) => {
+        events.push(`remove:${name}`);
+        return { ok: true };
+      },
+    });
+    const { port, registry } = makePort({
+      getDashboard: () => makeFakeDashboard(client),
+      confirm: async () => true,
+      dispatch: async () => undefined,
+    });
+    registerMcpSourceWithNames(registry, ['sentry', 'github']);
+    registerFakeSource(registry, 'skills', async () => ({ data: { skills: [], categories: [] } }));
+    const dispatcher = new ControlDispatcher(port);
+
+    const toggle = dispatcher.invokeControl('skills.toggle', { name: 'a', enabled: true });
+    const setEnabled = dispatcher.invokeControl('mcp.setEnabled', { name: 'sentry', enabled: false });
+    const remove = dispatcher.invokeControl('mcp.remove', { name: 'github' });
+
+    releaseToggle();
+    await toggle;
+    await setEnabled;
+    await remove;
+
+    // With only ONE queued op behind the held one (the section-3 pin above),
+    // a LIFO-broken tail would be indistinguishable from FIFO. Two queued ops
+    // make the two orderings produce different, checkable results.
+    expect(events).toEqual(['toggle:a', 'setEnabled:sentry', 'remove:github']);
   });
 });
 
