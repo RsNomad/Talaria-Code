@@ -61,6 +61,10 @@ describe('A11Y-04: light-theme brand tokens clear WCAG AA (≥4.5:1)', () => {
     expect(contrast(del, tintOverWhite('#e05475'))).toBeGreaterThanOrEqual(4.5);
   });
   it('dark-theme accent is unchanged (regression guard — do not touch dark)', () => {
-    expect(THEME_CSS).toMatch(/body\.vscode-dark\s*\{[\s\S]*--h-accent:\s*#2dd4bf/);
+    // `[^}]*` (not `[\s\S]*`) keeps the match INSIDE the dark block: `#2dd4bf`
+    // also appears in body.vscode-high-contrast and the standalone fallback, so
+    // a greedy cross-block match would still pass on a real dark-accent
+    // regression. rgba() values contain no `}`, so `[^}]*` cannot leave the block.
+    expect(THEME_CSS).toMatch(/body\.vscode-dark\s*\{[^}]*--h-accent:\s*#2dd4bf/);
   });
 });
