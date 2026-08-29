@@ -195,7 +195,7 @@ export function TabStrip({
                     }
                     onClose(tab.tabId);
                   }}
-                  className="flex-none rounded p-0.5 opacity-0 hover:text-del group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100"
+                  className="flex min-h-6 min-w-6 flex-none items-center justify-center rounded opacity-0 hover:text-del group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100"
                 >
                   <Icon name="close" size={10} />
                 </button>

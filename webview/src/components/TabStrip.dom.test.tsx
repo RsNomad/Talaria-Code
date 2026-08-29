@@ -433,6 +433,29 @@ describe('W4-T6 (UI#14): aria-controls is a dangling IDREF when the chat panel i
  * "(connecting…)" into the tab button's accessible name ONLY while
  * `tab.binding === 'pending'` — bound/unbound tabs are textually unchanged.
  */
+describe('A11Y-06: tab close button meets the 24x24 minimum target size', () => {
+  it('each close button carries the ≥24px min-size + centering utilities', () => {
+    render(
+      <TabStrip
+        tabs={THREE_TABS}
+        activeTabId="t2"
+        maxTabs={5}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+        onOpen={() => undefined}
+        backendKind="acp"
+        chatPanelMounted={true}
+      />,
+    );
+    const close = screen.getByRole('button', { name: 'Close Alpha' });
+    const cls = close.className;
+    expect(cls).toContain('min-h-6');
+    expect(cls).toContain('min-w-6');
+    expect(cls).toContain('items-center');
+    expect(cls).toContain('justify-center');
+  });
+});
+
 describe('Task 18 (WCAG 1.1.1): a pending tab announces "connecting" to assistive tech', () => {
   function pendingTab(tabId: string, title: string) {
     return { ...makeTabState(tabId, title), binding: 'pending' as const };
