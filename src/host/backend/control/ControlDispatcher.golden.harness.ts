@@ -4,7 +4,7 @@ import type { PanelSource } from '../../panels/PanelSourceRegistry';
 import { SessionRegistry } from '../session/SessionRegistry';
 import { RootRegistry } from '../../checkpoints/rootRegistry';
 import type { ToggleNameCache, HubNameCache } from '../../dashboard/dashboardPanelSources';
-import type { DashboardAdminClient, DashboardClientLike } from '../../dashboard/HermesDashboardClient';
+import type { DashboardAdminClient, DashboardClientLike, DashboardSkill } from '../../dashboard/HermesDashboardClient';
 import type { DashboardService } from '../../dashboard/HermesDashboardManager';
 import type { DataPanel, PanelDataMap, HostToWebview, McpCatalogEntry, HubScan, HubPreview } from '../../../shared/protocol';
 
@@ -169,6 +169,25 @@ export function makeHubScan(overrides: Partial<HubScan> = {}): HubScan {
     policy_reason: '',
     findings: [],
     severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+    ...overrides,
+  };
+}
+
+/**
+ * Complete (all 6 fields), real `DashboardSkill` fixture — override only what
+ * a test cares about. Added by Task A2 for the {@link pollSkillUninstall}/
+ * {@link pollSkillInstall} ground-truth-verify poll pins (presence/absence
+ * checks against `listSkills()`'s rows) — exported so a later skills-admin
+ * task (A6+) can reuse it instead of hand-building a `DashboardSkill` row.
+ */
+export function makeDashboardSkill(overrides: Partial<DashboardSkill> = {}): DashboardSkill {
+  return {
+    name: 'my-skill',
+    description: 'Test skill',
+    category: 'general',
+    enabled: true,
+    usage: 0,
+    provenance: 'hub',
     ...overrides,
   };
 }
