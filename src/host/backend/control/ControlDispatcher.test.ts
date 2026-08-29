@@ -106,7 +106,8 @@ describe('ControlDispatcher — WS-GD.1 CA-M04: panelFetchSeq pruning', () => {
     }));
     const dispatcher = new ControlDispatcher(port);
     // Reach the private map (private is compile-time only — no production surface added).
-    const seqMap = (dispatcher as unknown as { panelFetchSeq: Map<string, number> }).panelFetchSeq;
+    // WS-GD.2a A4: panelFetchSeq now lives on the extracted PanelDataCoordinator.
+    const seqMap = (dispatcher as unknown as { panels: { panelFetchSeq: Map<string, number> } }).panels.panelFetchSeq;
 
     await dispatcher.invokeControl('panel.data', { panel: 'subagents', sessionId: 'S1' });
     expect(seqMap.has('subagents:S1')).toBe(true); // the fetch minted the per-session key
@@ -124,7 +125,8 @@ describe('ControlDispatcher — WS-GD.1 CA-M04b: registry-close pruning (all clo
     }));
     const dispatcher = new ControlDispatcher(port);
     // Reach the private map (private is compile-time only — no production surface added).
-    const seqMap = (dispatcher as unknown as { panelFetchSeq: Map<string, number> }).panelFetchSeq;
+    // WS-GD.2a A4: panelFetchSeq now lives on the extracted PanelDataCoordinator.
+    const seqMap = (dispatcher as unknown as { panels: { panelFetchSeq: Map<string, number> } }).panels.panelFetchSeq;
 
     await dispatcher.invokeControl('panel.data', { panel: 'subagents', sessionId: 'S1' });
     expect(seqMap.has('subagents:S1')).toBe(true); // the fetch minted the per-session key
