@@ -17,7 +17,7 @@
  * post-hoc filter on an already-parsed URL — there is no parsed-but-rejected
  * href to accidentally leak into an `href` attribute.
  */
-import { Fragment, type ReactNode } from 'react';
+import { Fragment, useMemo, type ReactNode } from 'react';
 
 interface Props {
   text: string;
@@ -424,25 +424,70 @@ function renderBlocks(text: string, keyPrefix: string, depth = 0): ReactNode {
   );
 }
 
+/** CA-11: the token→node render, extracted so the completed-block PREFIX can
+ * be memoized separately from the still-open tail. `keyPrefix` namespaces the
+ * per-token keys so the stable and tail segments never collide. Behavior is
+ * byte-identical to the previous inline `tokens.map`. */
+export function renderMarkdown(text: string, streaming: boolean, keyPrefix: string): ReactNode {
+  const tokens = tokenize(text, streaming);
+  return tokens.map((tok, ti) => {
+    const key = `${keyPrefix}-${ti}`;
+    if (tok.code) {
+      return (
+        <pre
+          key={key}
+          className="my-2 overflow-x-auto rounded-card border border-border bg-surface p-3 font-mono text-xs leading-relaxed text-muted"
+        >
+          {tok.lang && <div className="mb-1 text-2xs uppercase text-faint">{tok.lang}</div>}
+          <code>{tok.body.replace(/\n$/, '')}</code>
+        </pre>
+      );
+    }
+    return renderBlocks(tok.body, key);
+  });
+}
+
+/** CA-11: split streaming text at the last COMPLETED block boundary. Returns
+ * the largest `stable` prefix that ends exactly at a `\n{2,}` block separator
+ * AND has balanced ``` fences (so cutting there never splits an open code
+ * block and reproduces the exact leading tokens of the whole text). Single
+ * pass, O(n). `stable === ''` means no completed block yet. */
+export function splitStableBoundary(text: string): { stable: string; tail: string } {
+  let fenceParity = 0; // count of ``` runs seen, mod 2
+  let cut = -1;
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith('```', i)) {
+      fenceParity ^= 1;
+      i += 3;
+      continue;
+    }
+    if (text[i] === '\n' && text[i + 1] === '\n') {
+      if (fenceParity === 0) cut = i; // balanced here → a valid cut
+      while (text[i] === '\n') i++; // skip the whole newline run
+      continue;
+    }
+    i++;
+  }
+  if (cut < 0) return { stable: '', tail: text };
+  return { stable: text.slice(0, cut), tail: text.slice(cut) };
+}
+
 export function AgentMarkdown({ text, streaming }: Props) {
-  const tokens = tokenize(text, streaming === true);
+  const isStreaming = streaming === true;
+  const { stable, tail } = isStreaming ? splitStableBoundary(text) : { stable: '', tail: text };
+  // Only the completed prefix is memoized (streaming=false — it is settled and
+  // fence-balanced); it re-parses solely when a new block completes.
+  const stableNodes = useMemo(
+    () => (stable.length > 0 ? renderMarkdown(stable, false, 'stable') : null),
+    [stable],
+  );
+  const tailNodes = renderMarkdown(tail, isStreaming, 'tail');
   return (
     <div className="text-[13px] leading-relaxed text-fg">
-      {tokens.map((tok, ti) => {
-        if (tok.code) {
-          return (
-            <pre
-              key={ti}
-              className="my-2 overflow-x-auto rounded-card border border-border bg-surface p-3 font-mono text-xs leading-relaxed text-muted"
-            >
-              {tok.lang && <div className="mb-1 text-2xs uppercase text-faint">{tok.lang}</div>}
-              <code>{tok.body.replace(/\n$/, '')}</code>
-            </pre>
-          );
-        }
-        return renderBlocks(tok.body, String(ti));
-      })}
-      {streaming && <span className="h-live text-accent">▍</span>}
+      {stableNodes}
+      {tailNodes}
+      {isStreaming && <span className="h-live text-accent">▍</span>}
     </div>
   );
 }

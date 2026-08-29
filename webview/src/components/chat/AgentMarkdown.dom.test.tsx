@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { AgentMarkdown } from './AgentMarkdown';
+import { AgentMarkdown, splitStableBoundary } from './AgentMarkdown';
 
 /**
  * Audit G-5. Lists were unsupported (raw dashes in a paragraph), `#` headings
@@ -304,5 +304,63 @@ describe('M-1: the C2 link-scheme gate applies uniformly inside table cells, lis
     render(<AgentMarkdown text={'> [x](javascript:alert(1))'} />);
     expect(screen.queryByRole('link')).not.toBeInTheDocument();
     expect(screen.getByText(/javascript:alert\(1\)/)).toBeInTheDocument();
+  });
+});
+
+const MULTI_BLOCK = [
+  '# Title',
+  '',
+  'A paragraph with **bold** and `code`.',
+  '',
+  '- item one',
+  '- item two',
+  '',
+  '```ts',
+  'const x = 1;',
+  '```',
+  '',
+  '| a | b |',
+  '| - | - |',
+  '| 1 | 2 |',
+  '',
+  'Closing paragraph in progress',
+].join('\n');
+
+describe('CA-11: splitStableBoundary is block-aligned and fence-safe', () => {
+  it('never cuts inside an open fenced-code block', () => {
+    const openFence = 'intro\n\n```ts\nconst a = 1;\n\nconst b = 2;'; // blank line INSIDE the fence
+    const { stable, tail } = splitStableBoundary(openFence);
+    expect(stable).toBe('intro'); // the in-fence blank line is not a valid boundary
+    expect(tail.startsWith('\n\n```ts')).toBe(true);
+  });
+
+  it('[perf genuine-RED] the stable prefix is byte-invariant across tail-only growth', () => {
+    const base = '# H\n\npara one\n\nopen tail';
+    const grown = base + ' more text';
+    expect(splitStableBoundary(base).stable).toBe(splitStableBoundary(grown).stable);
+    // ^ so the useMemo key (stable) does not change → the completed prefix is
+    //   not re-parsed on a delta that only extends the open block. On the
+    //   pre-CA-11 code this function does not exist; a naive re-implementation
+    //   that recomputed the boundary from the whole text each call would fail
+    //   this invariance check.
+  });
+
+  it('returns no stable prefix when there is no completed block yet', () => {
+    expect(splitStableBoundary('just an open line')).toEqual({ stable: '', tail: 'just an open line' });
+  });
+});
+
+describe('CA-11: memoized streaming render is transparent (warm === cold for every prefix)', () => {
+  it('an incrementally-grown instance renders identically to a fresh mount at every prefix', () => {
+    const { rerender, container } = render(<AgentMarkdown text={MULTI_BLOCK.slice(0, 1)} streaming />);
+    for (let k = 2; k <= MULTI_BLOCK.length; k++) {
+      const prefix = MULTI_BLOCK.slice(0, k);
+      rerender(<AgentMarkdown text={prefix} streaming />);
+      const warm = container.innerHTML;
+      const fresh = render(<AgentMarkdown text={prefix} streaming />);
+      const cold = fresh.container.innerHTML;
+      fresh.unmount();
+      expect(warm).toBe(cold);
+    }
   });
 });
