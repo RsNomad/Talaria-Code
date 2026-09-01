@@ -664,13 +664,13 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "0.17.1",
-    "@lancedb/lancedb": "^0.33.0",
+    "@lancedb/lancedb": "^0.37.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "apache-arrow": "18.1.0",
     "ignore": "^7.0.6",
     "tree-sitter-wasms": "0.1.13",
-    "web-tree-sitter": "0.25.10",
-    "zod": "^4.4.3"
+    "web-tree-sitter": "0.26.13",
+    "zod": "^4.5.2"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.1",
