@@ -4,7 +4,6 @@ import type { BackendDescriptor, InstallRecipe, ProbeSpec } from './registry';
 import type { HfDigestVerdict, HfGgufSpec, LfsOidVerdict } from './hfDigest';
 import { isLoopbackHost } from '../../autocomplete/backends/secureTransport';
 import { managerFor, parseOsRelease, resolveDistroFamily } from './osDetect';
-import type { DistroFamily, OsRelease, PackageManager } from './osDetect';
 import { installCommand, pythonInstallPlan } from './packageTable';
 import type { PipxEnv, PipxLocateResult } from './pipxLocator';
 import type { HermesPaths, InstallEvent } from './pipxInstaller';
@@ -19,7 +18,18 @@ import type { GgufStoreSpec } from './ggufIngest';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import { createMutationGate, type MutationGate } from '../util/mutationGate';
 import { SettledProbeMemo } from './settledProbeMemo';
-import { DEFAULT_OLLAMA_ENDPOINT, coerceDedicatedBackendId, composeFimTuning, composeNextEditBlock, composeRagBlock } from './statusBlocks';
+import {
+  DEFAULT_OLLAMA_ENDPOINT,
+  PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE,
+  coerceDedicatedBackendId,
+  composeAgentBlock,
+  composeBootstrap,
+  composeFimTuning,
+  composeNextEditBlock,
+  composeOsBlock,
+  composeRagBlock,
+} from './statusBlocks';
+import type { OsResolution } from './statusBlocks';
 import type {
   AgentSetupPhase,
   SetupBackendOption,
@@ -431,17 +441,6 @@ const TRUST_REFUSAL_REASON = 'Workspace is not trusted — Setup changes are dis
  * id is an agent-managed provider credential method (§2.1).
  */
 export const HERMES_SETUP_AUTH_METHOD_ID = 'hermes-setup';
-/**
- * beta.5 §6 copy, verbatim (drift-locked by SetupController.test.ts). The
- * bootstrap COMMAND itself is no longer a constant here — T5 deleted the old
- * hardcoded Fedora `PIPX_BOOTSTRAP_COMMAND`; every pre-typed line is now
- * resolved server-side from the T4 engine ({@link installCommand} /
- * {@link pythonInstallPlan}) for the DETECTED family, or refused fail-closed.
- */
-const PIPX_MISSING_KNOWN_DISTRO_GUIDANCE =
-  'pipx was not found on your PATH. Open a terminal to install it, then re-check.';
-const PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE =
-  "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
 const CONTAINER_NOTE =
   "Talaria can't tell which system your terminal acts on (VS Code appears to run in a sandbox/container) — run the install commands in a terminal on your host system, then re-check.";
 
@@ -686,22 +685,6 @@ export function pruneExpiredThrottleEntries(
       throttle.delete(key);
     }
   }
-}
-
-/**
- * T5: one interpreted os-release read — everything the §1.2 wiring needs.
- * `release` keeps the full parsed identity (the Python planner's C-3 gate
- * needs `id`/`versionId`, never just the collapsed family); `containerNote`
- * is set ONLY for the S-F10 degrade (container marker with no host
- * os-release) — a merely unreadable file degrades to `unknown` WITHOUT the
- * note, because "VS Code appears to run in a sandbox/container" would be a
- * fabrication there (§1.2's trigger sentence is the authority).
- */
-interface OsResolution {
-  release: OsRelease;
-  family: DistroFamily;
-  manager: PackageManager;
-  containerNote?: string;
 }
 
 /** T6 (§2.5): the llama.cpp runtime memo's settled shape — the current
@@ -953,20 +936,14 @@ export class SetupController {
 
     const data: SetupData = {
       trusted,
-      agent: {
+      agent: composeAgentBlock({
         options: agentOptions,
-        selectedId: 'hermes',
         phase: agentPhase,
-        ...(installRecord?.version ? { version: installRecord.version } : {}),
-        ...(this.lastAgentIssue ? { detail: this.lastAgentIssue.detail } : {}),
-        ...(this.installLogTail.length > 0 ? { logTail: [...this.installLogTail] } : {}),
-        // T5 §1.2: present iff the phase calls for them — the webview only
-        // ever RENDERS these (it never composes command text, Constraint 1).
-        ...(agentPhase === 'pipx-missing' ? { bootstrap: composeBootstrap(osInfo) } : {}),
-        ...(agentPhase === 'python-unsuitable'
-          ? { pythonInstall: pythonInstallPlan(osInfo.release, osInfo.family) }
-          : {}),
-      },
+        installRecordVersion: installRecord?.version,
+        lastIssueDetail: this.lastAgentIssue?.detail,
+        logTail: this.installLogTail,
+        osInfo,
+      }),
       provider,
       fim: {
         options: fimOptions,
@@ -1005,12 +982,7 @@ export class SetupController {
       // fresh from the 3 `talaria.agent.localModel.*` settings on every call.
       agentLocalModel: this.composeAgentLocalModel(provider.phase, storePresence),
       ready,
-      os: {
-        family: osInfo.family,
-        manager: osInfo.manager,
-        ...(osInfo.release.prettyName !== undefined ? { prettyName: osInfo.release.prettyName } : {}),
-        ...(osInfo.containerNote !== undefined ? { containerNote: osInfo.containerNote } : {}),
-      },
+      os: composeOsBlock(osInfo),
     };
     return data;
   }
@@ -2810,19 +2782,6 @@ function computeReady(
   fimGreen: boolean,
 ): boolean {
   return agentPhase === 'ready' && providerPhase === 'configured' && fimGreen;
-}
-
-/**
- * T5 §1.2: the `pipx-missing` card's engine-composed bootstrap. A known
- * family carries the exact pre-typed line + the §6 known-distro copy; an
- * unknown family (incl. the container degrade) carries ONLY the §6
- * unknown-distro copy — no command is ever guessed (Global Constraint 1).
- */
-function composeBootstrap(osInfo: OsResolution): { command?: string; guidance: string } {
-  const spec = installCommand(osInfo.family, 'pipx');
-  return spec !== undefined
-    ? { command: spec.command, guidance: PIPX_MISSING_KNOWN_DISTRO_GUIDANCE }
-    : { guidance: PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
 }
 
 // --- T6 (beta.6): llama.cpp install projection + catalog cell gates ----------

@@ -1,5 +1,7 @@
-import type { SetupData } from '../../shared/protocol';
+import type { AgentSetupPhase, SetupBackendOption, SetupData } from '../../shared/protocol';
 import { NEXT_DEDICATED_MODEL } from './registry';
+import type { DistroFamily, OsRelease, PackageManager } from './osDetect';
+import { installCommand, pythonInstallPlan } from './packageTable';
 
 /**
  * WS-GD.2b (Task B3): `status()` settings-block composers — a pure move of
@@ -197,5 +199,95 @@ export function composeRagBlock(args: {
     tuning: ragTuning,
     indexDir: ragIndexDir,
     ...(trusted ? {} : { preconditionDetail: 'The codebase index needs a trusted, open workspace.' }),
+  };
+}
+
+/**
+ * T5: one interpreted os-release read — everything the §1.2 wiring needs.
+ * `release` keeps the full parsed identity (the Python planner's C-3 gate
+ * needs `id`/`versionId`, never just the collapsed family); `containerNote`
+ * is set ONLY for the S-F10 degrade (container marker with no host
+ * os-release) — a merely unreadable file degrades to `unknown` WITHOUT the
+ * note, because "VS Code appears to run in a sandbox/container" would be a
+ * fabrication there (§1.2's trigger sentence is the authority).
+ */
+export interface OsResolution {
+  release: OsRelease;
+  family: DistroFamily;
+  manager: PackageManager;
+  containerNote?: string;
+}
+
+/**
+ * beta.5 §6 copy, verbatim (drift-locked by SetupController.test.ts). The
+ * bootstrap COMMAND itself is no longer a constant here — T5 deleted the old
+ * hardcoded Fedora `PIPX_BOOTSTRAP_COMMAND`; every pre-typed line is now
+ * resolved server-side from the T4 engine ({@link installCommand} /
+ * {@link pythonInstallPlan}) for the DETECTED family, or refused fail-closed.
+ */
+const PIPX_MISSING_KNOWN_DISTRO_GUIDANCE =
+  'pipx was not found on your PATH. Open a terminal to install it, then re-check.';
+/** Exported — `SetupController.handleOpenBootstrapTerminal`'s pipx-target
+ *  refusal reuses this same string (one source, never a second literal). */
+export const PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE =
+  "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
+
+/**
+ * T5 §1.2: the `pipx-missing` card's engine-composed bootstrap. A known
+ * family carries the exact pre-typed line + the §6 known-distro copy; an
+ * unknown family (incl. the container degrade) carries ONLY the §6
+ * unknown-distro copy — no command is ever guessed (Global Constraint 1).
+ */
+export function composeBootstrap(osInfo: OsResolution): { command?: string; guidance: string } {
+  const spec = installCommand(osInfo.family, 'pipx');
+  return spec !== undefined
+    ? { command: spec.command, guidance: PIPX_MISSING_KNOWN_DISTRO_GUIDANCE }
+    : { guidance: PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
+}
+
+/** Pure move of `status()`'s `agent` object literal (Card 1 — Hermes /
+ *  OpenClaw / Talaria AI). `selectedId` stays the hardcoded `'hermes'`
+ *  literal `status()` always used — not a caller-supplied field. Every
+ *  conditional key-omission spread is preserved exactly, including the
+ *  `detail` check: the original tested "was an issue recorded at all"
+ *  (`this.lastAgentIssue`, the PARENT object), never `.detail`'s own
+ *  truthiness — reproduced here as `lastIssueDetail !== undefined`. */
+export function composeAgentBlock(args: {
+  options: SetupBackendOption[];
+  phase: AgentSetupPhase;
+  installRecordVersion: string | undefined;
+  lastIssueDetail: string | undefined;
+  logTail: readonly string[];
+  osInfo: OsResolution;
+}): SetupData['agent'] {
+  const { options, phase, installRecordVersion, lastIssueDetail, logTail, osInfo } = args;
+  return {
+    options,
+    selectedId: 'hermes',
+    phase,
+    ...(installRecordVersion ? { version: installRecordVersion } : {}),
+    ...(lastIssueDetail !== undefined ? { detail: lastIssueDetail } : {}),
+    ...(logTail.length > 0 ? { logTail: [...logTail] } : {}),
+    // T5 §1.2: present iff the phase calls for them — the webview only
+    // ever RENDERS these (it never composes command text, Constraint 1).
+    ...(phase === 'pipx-missing' ? { bootstrap: composeBootstrap(osInfo) } : {}),
+    ...(phase === 'python-unsuitable'
+      ? { pythonInstall: pythonInstallPlan(osInfo.release, osInfo.family) }
+      : {}),
+  };
+}
+
+/** Pure move of `status()`'s `os` object literal (the §1.2 detected-OS block
+ *  every pre-typed install command on the panel was composed for).
+ *  `NonNullable` — `status()` always populates this key (never omits it);
+ *  the field's own optionality on `SetupData` is additive-wire-shape only
+ *  (Global Constraint 6), not a signal that a caller may hand back
+ *  `undefined` for a key it does include (exactOptionalPropertyTypes). */
+export function composeOsBlock(osInfo: OsResolution): NonNullable<SetupData['os']> {
+  return {
+    family: osInfo.family,
+    manager: osInfo.manager,
+    ...(osInfo.release.prettyName !== undefined ? { prettyName: osInfo.release.prettyName } : {}),
+    ...(osInfo.containerNote !== undefined ? { containerNote: osInfo.containerNote } : {}),
   };
 }
