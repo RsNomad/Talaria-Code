@@ -11,17 +11,15 @@ import type { RootRegistry } from '../../checkpoints/rootRegistry';
 import type { Logger } from '../../transport/JsonRpcStdio';
 import type { PanelSourceRegistry } from '../../panels/PanelSourceRegistry';
 import type { DashboardService } from '../../dashboard/HermesDashboardManager';
-import type { DashboardToggleResult } from '../../dashboard/HermesDashboardClient';
-import { hasToggleNameCache } from '../../dashboard/dashboardPanelSources';
 import type { AcpLoadSessionResult } from '../acp/acpClient';
-import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
-import type { SessionController } from '../session/SessionController';
 import type { SessionRegistry } from '../session/SessionRegistry';
 import { ConfigWriteTail } from './configWriteTail';
 import { PanelDataCoordinator } from './panelDataCoordinator';
 import { McpAdminHandler, isMcpAdminMethod } from './mcpAdminHandler';
 import { SkillsAdminHandler, isSkillsAdminMethod } from './skillsAdminHandler';
 import { CheckpointActionHandler } from './checkpointActions';
+import { DashboardToggleHandler } from './dashboardToggles';
+import { SessionScopeActions } from './sessionScopeActions';
 
 /**
  * WS-GD.2a A5: `TRUST_GATED_METHODS` now lives on `adminOpRunner.ts` (its
@@ -231,34 +229,36 @@ export class ControlDispatcher {
    */
   private readonly checkpoints: CheckpointActionHandler;
 
+  /**
+   * WS-GD.2a A9: the dashboard-toggles domain — see {@link
+   * DashboardToggleHandler}. Constructed in the constructor from the SAME
+   * port + `configWriteTail` this class owns (the full
+   * `ControlDispatcherHostPort` structurally satisfies its narrower
+   * `DashboardTogglePort` Pick).
+   */
+  private readonly dashboardToggles: DashboardToggleHandler;
+
+  /**
+   * WS-GD.2a A9: the sessions-scope domain — see {@link SessionScopeActions}.
+   * Constructed in the constructor from the SAME port this class owns (the
+   * full `ControlDispatcherHostPort` structurally satisfies its narrower
+   * `SessionScopePort` Pick).
+   */
+  private readonly sessionScope: SessionScopeActions;
+
   constructor(private readonly port: ControlDispatcherHostPort) {
     this.panels = new PanelDataCoordinator(this.port);
     this.mcpAdmin = new McpAdminHandler(this.port, this.configWriteTail, (panel) => this.panels.fetchPanelData(panel));
     this.skillsAdmin = new SkillsAdminHandler(this.port, this.configWriteTail, (panel) => this.panels.fetchPanelData(panel));
     this.checkpoints = new CheckpointActionHandler(this.port, (panel, params) => this.panels.fetchPanelData(panel, params));
+    this.dashboardToggles = new DashboardToggleHandler(this.port, this.configWriteTail);
+    this.sessionScope = new SessionScopeActions(this.port);
     // CA-M04b: self-wire the per-session fetch-seq prune to the registry's
     // close choke point — every close path (tab close, rebind, swap-eviction,
     // failed/abandoned loads, crash-recovery failure, teardown disposeAll)
     // funnels through `SessionRegistry.close`/`disposeAll`, so this ONE hook
     // covers them all, present and future, with no per-site wiring.
     port.sessions.setOnClosed((sessionId) => this.panels.pruneFetchSeqForSession(sessionId));
-  }
-
-  /**
-   * The most-recently-opened/loaded session's controller, or `undefined`
-   * before any session is open.
-   *
-   * W6-FG (3-way ARCH I-2 — ambient-state-elimination): kept ONLY for
-   * {@link getPreset}/{@link getAvailableCommands} — a last-resort,
-   * DISPLAY-only hydrate-seed read with no session identity available at
-   * its call site (see those methods' own docs on the original
-   * `AcpBackend`). Moved verbatim — reimplemented here against the injected
-   * `getActiveSessionId`/`sessions` port accessors instead of `this.
-   * activeSessionId`/`this.sessions` directly.
-   */
-  private activeController(): SessionController | undefined {
-    const activeSessionId = this.port.getActiveSessionId();
-    return activeSessionId ? this.port.sessions.get(activeSessionId) : undefined;
   }
 
   /**
@@ -303,7 +303,7 @@ export class ControlDispatcher {
     }
 
     if (method === 'skills.toggle' || method === 'toolsets.toggle') {
-      return this.toggleDashboard(method, params);
+      return this.dashboardToggles.toggle(method, params);
     }
 
     // Task A5+A6 (§4.5, §4.7, §4.8): the full T1 MCP admin core —
@@ -348,46 +348,9 @@ export class ControlDispatcher {
     return this.port.dispatch(method, params);
   }
 
-  /**
-   * W1.5: the real Skills / Tools toggle — routed to the dashboard REST
-   * channel. Moved verbatim off `AcpBackend.toggleDashboard` — AH5's
-   * host-side serialization tail ({@link dashboardToggleTail}) moved WITH
-   * it (see that field's own doc).
-   */
-  private async toggleDashboard(
-    method: 'skills.toggle' | 'toolsets.toggle',
-    params: unknown,
-  ): Promise<DashboardToggleResult> {
-    return this.configWriteTail.join(() => this.toggleDashboardInner(method, params));
-  }
-
-  private async toggleDashboardInner(
-    method: 'skills.toggle' | 'toolsets.toggle',
-    params: unknown,
-  ): Promise<DashboardToggleResult> {
-    const dashboard = this.port.getDashboard();
-    if (!dashboard) {
-      throw new Error(`Refusing '${method}': the Hermes dashboard channel is not configured.`);
-    }
-    const { name, enabled } = extractToggleParams(params);
-    if (!name) {
-      throw new Error(`'${method}' requires a { name, enabled } payload.`);
-    }
-
-    const panel = method === 'skills.toggle' ? 'skills' : 'tools';
-    const source = this.port.panelSources.get(panel);
-    if (hasToggleNameCache(source)) {
-      const known = source.lastListedNames();
-      if (known && !known.has(name)) {
-        throw new Error(`Refusing '${method}': '${name}' is not in the last-listed ${panel} set.`);
-      }
-    }
-
-    const client = await dashboard.ensure();
-    return method === 'skills.toggle'
-      ? client.toggleSkill(name, enabled)
-      : client.toggleToolset(name, enabled);
-  }
+  // WS-GD.2a A9: `toggleDashboard`/`toggleDashboardInner`/`extractToggleParams`
+  // moved onto `dashboardToggles.ts` (own docs moved there verbatim, the
+  // public entry renamed `toggle`) — imported above.
 
   /**
    * WS-GD.2a Task A8: thin delegator — the full Zone CKPT / C1 warm-index
@@ -400,137 +363,63 @@ export class ControlDispatcher {
   }
 
   /**
-   * W2-F1 wire-pin (mode-coordination §4.1): the boot-time hydrate-seed
-   * read. Moved verbatim off `AcpBackend.getPreset` — see the original
-   * method's doc for the full W6-FG/W6-FF sanctioned-exception rationale
-   * (unchanged).
+   * WS-GD.2a Task A9: thin delegator — the full W2-F1 wire-pin doc moved
+   * WITH the implementation onto {@link SessionScopeActions.getPreset}. The
+   * PUBLIC surface (`AcpBackend.getPreset` calls this exact method) is
+   * unchanged.
    */
   getPreset(): EditPolicyPreset {
-    return this.activeController()?.getPreset() ?? 'manual';
+    return this.sessionScope.getPreset();
   }
 
   /**
-   * W2 F-S: the cached ACP `available_commands` catalog for the
-   * most-recently-opened session. Moved verbatim off `AcpBackend
-   * .getAvailableCommands` — see the original method's doc (unchanged).
+   * WS-GD.2a Task A9: thin delegator — the full W2 F-S doc moved WITH the
+   * implementation onto {@link SessionScopeActions.getAvailableCommands}.
+   * The PUBLIC surface (`AcpBackend.getAvailableCommands` calls this exact
+   * method) is unchanged.
    */
   getAvailableCommands(): SlashCommandInfo[] | undefined {
-    return this.activeController()?.getAvailableCommands();
+    return this.sessionScope.getAvailableCommands();
   }
 
   /**
-   * W6-FF (3-way ARCH I-1): every LIVE session's tab-identity triple
-   * (+rootId), for `TalariaViewProvider.seedState`'s `hydrate` payload. Moved
-   * verbatim off `AcpBackend.listTabs` — see the original method's doc
-   * (unchanged); reads `this.port.sessions.values()` instead of `this.
-   * sessions.values()`.
-   *
-   * H4-B8 (arch report Minor-2): each entry ALSO carries that SAME
-   * controller's OWN per-tab display fields — `preset`/`currentModelId`/
-   * `activeModeId`/`availableCommands` — read directly off THAT controller
-   * (never the active/ambient one), so P-1 isolation holds: entry N's
-   * values can only ever be entry N's own session's values. `activeModeId`
-   * maps `activeCustomModeId`'s `null` ("no custom mode") to `undefined`
-   * (the seed's own absent-field convention, matching `currentModelId`/
-   * `availableCommands`'s existing `undefined`-when-unset shape).
+   * WS-GD.2a Task A9: thin delegator — the full W6-FF/H4-B8 doc moved WITH
+   * the implementation onto {@link SessionScopeActions.listTabs}. The
+   * PUBLIC surface (`AcpBackend.listTabs` calls this exact method) is
+   * unchanged.
    */
   listTabs(): HydrateTabSeed[] {
-    return [...this.port.sessions.values()].map((controller) => {
-      const currentModelId = controller.currentModelId;
-      const activeModeId = controller.activeCustomModeId ?? undefined;
-      const availableCommands = controller.getAvailableCommands();
-      return {
-        tabId: controller.tabId,
-        sessionId: controller.sessionId,
-        cwd: controller.cwd,
-        rootId: controller.getRootId(),
-        preset: controller.getPreset(),
-        ...(currentModelId !== undefined ? { currentModelId } : {}),
-        ...(activeModeId !== undefined ? { activeModeId } : {}),
-        ...(availableCommands !== undefined ? { availableCommands } : {}),
-        // A5 (T-1 V-12 seed fold-in): this tab's OWN live-turn status, so a
-        // post-recreate reconcile regains the Stop affordance immediately.
-        turnActive: controller.hasLiveTurn(),
-      };
-    });
+    return this.sessionScope.listTabs();
   }
 
   /**
-   * P7-N10: the sessionId-less fan-out `setMode(mode)` (`for (const
-   * controller of sessions.values()) controller.setMode(mode)`) that used to
-   * live here was YAGNI-deleted — a twice-flagged latent footgun (a wire
-   * message with no `sessionId` that mutated EVERY live session, safe today
-   * only because its sole caller hardcoded `'default'`). Grep confirmed no
-   * caller depended on it beyond that hardcoded pinned-default use, and the
-   * webview never actually sent the wire message (the mode PICKER is a
-   * completely different, sessionId-scoped path: `mode.set` -> {@link
-   * setCustomMode} below). "Every session pinned at default" remains
-   * enforced by the INDEPENDENT per-session mechanisms already on
-   * `SessionController` (constructor init, the newSession/loadSession
-   * reassert-on-drift, the per-turn reassert) — none of which ever routed
-   * through the fan-out.
-   */
-
-  /**
-   * W4-T4b (SF-2 §4.3 mitigation 1 — the PRIMARY self-widening fix):
-   * snapshot-on-activate. Moved verbatim off `AcpBackend.setCustomMode` —
-   * see the original method's doc (unchanged).
+   * WS-GD.2a Task A9: thin delegator — the full W4-T4b mitigation-1 doc (and
+   * the P7-N10 fan-out-deletion tombstone) moved WITH the implementation
+   * onto {@link SessionScopeActions.setCustomMode}. The PUBLIC surface
+   * (`AcpBackend.setCustomMode` calls this exact method) is unchanged.
    */
   setCustomMode(sessionId: string, modeId: string | null): void {
-    const controller = this.port.sessions.get(sessionId);
-    if (!controller) return;
-    const configs = readCustomModes();
-    const config = modeId !== null ? configs.find((c) => c.id === modeId) : undefined;
-    const resolvedModeId = config ? config.id : null;
-    const snapshot = config ? buildModeFloorSnapshot(config) : undefined;
-    controller.setCustomMode(snapshot, resolvedModeId);
-    this.port.emit({
-      type: 'mode.state',
-      sessionId,
-      modeId: resolvedModeId,
-      available: toCatalog(configs),
-    });
+    this.sessionScope.setCustomMode(sessionId, modeId);
   }
 
   /**
-   * W4-T4b (SF-2 §4.3 mitigation 2 — the self-widening CLOSE). Moved
-   * verbatim off `AcpBackend.handleCustomModesConfigChanged` — see the
-   * original method's doc (unchanged); `vscode.window.showWarningMessage`
-   * is now reached through the injected `showWarningMessage` port accessor
-   * so this module stays vscode-free.
+   * WS-GD.2a Task A9: thin delegator — the full W4-T4b mitigation-2 doc
+   * moved WITH the implementation onto {@link SessionScopeActions
+   * .handleCustomModesConfigChanged}. The PUBLIC surface
+   * (`AcpBackend.handleCustomModesConfigChanged` calls this exact method) is
+   * unchanged.
    */
   handleCustomModesConfigChanged(): void {
-    const affected = [...this.port.sessions.values()].filter((c) => c.activeCustomModeId !== null);
-    if (affected.length === 0) return;
-    this.port.showWarningMessage(
-      "A custom mode's definition changed on disk. The active session keeps enforcing the previously-selected definition — re-select the mode to apply changes.",
-    );
-    const available = toCatalog(readCustomModes());
-    for (const controller of affected) {
-      this.port.emit({
-        type: 'mode.state',
-        sessionId: controller.sessionId,
-        modeId: controller.activeCustomModeId,
-        available,
-      });
-    }
+    this.sessionScope.handleCustomModesConfigChanged();
   }
 
   /**
-   * W4-T5b (§2d `tab.load` wire): the PUBLIC entry for a tab-scoped History
-   * load. Moved verbatim off `AcpBackend.loadTab` — see the original
-   * method's doc (unchanged); `loadSessionIntoTab` itself stays on
-   * `AcpBackend` (too entangled, see this class's own header doc) and is
-   * reached through the injected port.
+   * WS-GD.2a Task A9: thin delegator — the full W4-T5b doc moved WITH the
+   * implementation onto {@link SessionScopeActions.loadTab}. The PUBLIC
+   * surface (`AcpBackend.loadTab` calls this exact method) is unchanged.
    */
   async loadTab(tabId: string, sessionId: string, cwd: string, title?: string): Promise<void> {
-    try {
-      await this.port.loadSessionIntoTab(sessionId, cwd, tabId, title);
-    } catch (err) {
-      this.port.logger?.append(
-        `[AcpBackend] loadTab failed (tabId=${tabId}, sessionId=${sessionId}): ${errorMessage(err)}`,
-      );
-    }
+    return this.sessionScope.loadTab(tabId, sessionId, cwd, title);
   }
 
   /**
@@ -555,10 +444,6 @@ export class ControlDispatcher {
 }
 
 // --- module-local helpers ----------------------------------------------------
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /**
  * `reload.mcp` only actually reloaded when `status === "reloaded"`. Moved
@@ -592,20 +477,18 @@ function extractLoadParams(params: unknown): { sessionId?: string; cwd?: string 
   };
 }
 
-/** W1.5: pull `{name, enabled}` out of a `skills.toggle`/`toolsets.toggle` payload. Moved verbatim. */
-function extractToggleParams(params: unknown): { name?: string; enabled: boolean } {
-  if (!params || typeof params !== 'object') return { enabled: false };
-  const p = params as { name?: unknown; enabled?: unknown };
-  const name = typeof p.name === 'string' ? p.name : undefined;
-  return {
-    ...(name !== undefined ? { name } : {}),
-    enabled: p.enabled === true,
-  };
-}
-
 // WS-GD.2a A8: `TURN_ACTIVE_RESTORE_REFUSAL`/`AMBIGUOUS_ROOT`/
 // `UNKNOWN_ROOT_RESTORE_REFUSAL`/`NO_TRACKER_RESTORE_REFUSAL`/
 // `MALFORMED_RESTORE_REFUSAL`/`extractRestoreParams`/
 // `CHECKPOINT_LABEL_MAX_LEN`/`truncateCheckpointLabel` moved onto
 // `checkpointActions.ts` (own docs moved there verbatim) with the rest of
 // the checkpoints domain.
+
+// WS-GD.2a A9: `extractToggleParams` moved onto `dashboardToggles.ts` with
+// the rest of the dashboard-toggles domain; `errorMessage` (this file's own
+// copy) moved onto `sessionScopeActions.ts` — it had exactly one caller
+// (`loadTab`), which moved with it. `activeController`/`getPreset`/
+// `getAvailableCommands`/`listTabs`/`setCustomMode`/
+// `handleCustomModesConfigChanged`/`loadTab` moved onto
+// `sessionScopeActions.ts` (own docs moved there verbatim, including the
+// P7-N10 tombstone) with the rest of the sessions-scope domain.
