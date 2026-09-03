@@ -17,6 +17,7 @@ import type { GgufDestResult } from './modelStore';
 import type { GgufStoreSpec } from './ggufIngest';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import { createMutationGate, type MutationGate } from '../util/mutationGate';
+import { LatchRegistry } from './latchRegistry';
 import { SettledProbeMemo } from './settledProbeMemo';
 import {
   DEFAULT_OLLAMA_ENDPOINT,
@@ -73,8 +74,8 @@ import { SETUP_METHODS } from '../../shared/protocol';
  *   tunable'}` (FM-16), no modal either way (Tier-2 is modal-free by
  *   design).
  * - `setup.install`/`setup.pullModel` are single-flight per `(op, id)` —
- *   FM-12 — tracked via {@link inFlight}, which ALSO holds each attempt's
- *   `AbortController` so `setup.cancel` can interrupt it.
+ *   FM-12 — tracked via {@link latches} ({@link LatchRegistry}), which ALSO
+ *   holds each attempt's `AbortController` so `setup.cancel` can interrupt it.
  * - Fail-closed ORDER on install: `locatePipx` -> `installHermes` (which
  *   only resolves after its own `--check` verify passes) -> ONLY THEN are
  *   `hermesPath`/`pythonPath`/`backend` written together, THEN the
@@ -724,12 +725,12 @@ export class SetupController {
   }
 
   /** Keyed `${op}:${id}` (`install:<backendId>` / `pull:<model>`) — presence = single-flight latch (FM-12); the held `AbortController` is what `setup.cancel` interrupts. */
-  private readonly inFlight = new Map<string, AbortController>();
+  private readonly latches = new LatchRegistry(() => this.lifecycle.closed);
   private readonly throttle = new Map<string, ThrottleState>();
   /** F2-16: the WS-R2 gate idiom — flipped CLOSED synchronously by
-   *  {@link dispose} BEFORE any teardown, so {@link armLatch} can never arm
-   *  a new install/pull latch that no dispose will ever abort (the TC-6
-   *  detached-download class, closed structurally at one choke point). */
+   *  {@link dispose} BEFORE any teardown, so {@link LatchRegistry.arm} can
+   *  never arm a new install/pull latch that no dispose will ever abort (the
+   *  TC-6 detached-download class, closed structurally at one choke point). */
   private readonly lifecycle: MutationGate = createMutationGate();
 
   private installLogTail: string[] = [];
@@ -813,29 +814,28 @@ export class SetupController {
 
   dispose(): void {
     // F2-16: flip the gate CLOSED synchronously, FIRST — before any teardown
-    // below — so a concurrent `armLatch` call can never interleave between
+    // below — so a concurrent `latches.arm` call can never interleave between
     // this flip and the teardown that follows (run-to-completion; see
-    // {@link armLatch}'s own doc for the atomicity this buys).
+    // {@link LatchRegistry.arm}'s own doc for the atomicity this buys).
     void this.lifecycle.close(Promise.resolve());
     for (const state of this.throttle.values()) {
       if (state.timer) clearTimeout(state.timer);
     }
     this.throttle.clear();
     // TC-6 (AU-6): abort every install/pull/provision still latched in
-    // `inFlight` — at HEAD this map was never iterated here, so a
+    // `this.latches` — at HEAD this map was never iterated here, so a
     // window-reload mid-install left the pipx child / multi-GB GGUF fetch
     // running detached from a disposed controller. Placed BEFORE the emitter
     // disposals below (mirrors the llama.cpp probe ordering just after) so
     // any synchronous abort-path progress a caller emits still finds a live
     // emitter or is dropped harmlessly; the existing `finally {
-    // this.inFlight.delete(key) }` blocks in every handler make a late
-    // delete here (once those handlers' own catch/finally runs) a no-op.
+    // this.latches.release(key) }` blocks in every handler make a late
+    // release here (once those handlers' own catch/finally runs) a no-op.
     // `AbortController#abort()` never throws — even a listener that throws
     // is reported asynchronously (Node/DOM event-dispatch semantics), never
     // synchronously out of `abort()` — so this loop cannot abort disposal
     // partway through, keeping `dispose()` safe/idempotent by construction.
-    for (const abort of this.inFlight.values()) abort.abort();
-    this.inFlight.clear();
+    this.latches.abortAll();
     // T6: supersede + cancel any in-flight llama.cpp probe — its late settle
     // must neither write state nor fire into the (now-cleared) emitter.
     this.llamaCppMemo.supersede();
@@ -1178,7 +1178,7 @@ export class SetupController {
   private async handleInstall(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
     const backendId = str(params, 'backendId') ?? 'hermes';
     const key = `install:${backendId}`;
-    if (this.inFlight.has(key)) {
+    if (this.latches.has(key)) {
       return { ok: false, reason: 'install already running' };
     }
     const descriptor = this.deps.registry.getBackend(backendId);
@@ -1187,7 +1187,7 @@ export class SetupController {
       return { ok: false, reason: `'${backendId}' has no pipx install recipe.` };
     }
 
-    const abort = this.armLatch(key);
+    const abort = this.latches.arm(key);
     if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     this.lastAgentIssue = undefined;
     this.installLogTail = [];
@@ -1276,7 +1276,7 @@ export class SetupController {
       this.host.offerReload();
       return { ok: true };
     } finally {
-      this.inFlight.delete(key);
+      this.latches.release(key);
     }
   }
 
@@ -1506,16 +1506,16 @@ export class SetupController {
     }
     // (4) plain library `name[:tag]` / `ns/name` — existing behavior, unchanged.
     const key = `pull:${model}`;
-    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
+    if (this.latches.has(key)) return { ok: false, reason: 'pull already running' };
 
     // Latch BEFORE the modal (mirrors handleInstall) — otherwise two
     // `setup.pullModel` calls dispatched before the user answers the first
     // modal both pass the `has()` check above, and if both are approved the
-    // second `inFlight.set` clobbers the first's AbortController, leaving
+    // second `arm()` clobbers the first's AbortController, leaving
     // `setup.cancel` unable to reach the first pull. The `finally` below
-    // still deletes the key on every exit path, including a decline, so a
+    // still releases the key on every exit path, including a decline, so a
     // declined pull never wedges the latch.
-    const abort = this.armLatch(key);
+    const abort = this.latches.arm(key);
     if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     try {
       // T1 (beta.6 panel-fix PT1): sanitize BEFORE the modal below — a
@@ -1540,7 +1540,7 @@ export class SetupController {
       if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
-      this.inFlight.delete(key);
+      this.latches.release(key);
       // §7.2.2: terminal marker on EVERY settle path (success, failure,
       // cancel, or a post-latch decline) — the webview deletes its
       // accumulated progress entry, clearing a frozen bar + dead Cancel.
@@ -1566,7 +1566,7 @@ export class SetupController {
    * pullModel` route to the SAME artifact) derives the identical id here so
    * both RPCs join ONE latch instead of each winning its own and starting a
    * duplicate multi-GB download. `handleCancel` resolves through this SAME
-   * method before its `inFlight.get` lookup — a second, divergent copy of
+   * method before its `latches.abort` lookup — a second, divergent copy of
    * this lookup there would just re-open the exact class of bug this
    * closes (a cancel key that doesn't match what the latch is actually
    * keyed under). Resolved from MODEL_CATALOG by created-name match rather
@@ -1605,8 +1605,8 @@ export class SetupController {
     // `finally` still releases under this SAME key on every exit path.
     const canonicalId = this.canonicalPullLatchId(created);
     const key = `pull:${canonicalId}`;
-    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
-    const abort = this.armLatch(key);
+    if (this.latches.has(key)) return { ok: false, reason: 'pull already running' };
+    const abort = this.latches.arm(key);
     if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     try {
       // (c) integrity pre-flight — dep can also REJECT (a fetch binding
@@ -1639,7 +1639,7 @@ export class SetupController {
       if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
-      this.inFlight.delete(key);
+      this.latches.release(key);
       // §7.2.2: terminal marker on EVERY settle path — see handlePullModel's
       // own finally for the full rationale; progress rides the `created`
       // name here (T13 `pullGate.test.ts` drift-lock).
@@ -1690,8 +1690,8 @@ export class SetupController {
     if (!sources.ok) return { ok: false, reason: sources.reason };
     // (3) latch BEFORE the modal; finally-release on every exit path.
     const key = `pull:${entry.id}`;
-    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
-    const abort = this.armLatch(key);
+    if (this.latches.has(key)) return { ok: false, reason: 'pull already running' };
+    const abort = this.latches.arm(key);
     if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     try {
       return backend === 'ollama'
@@ -1701,7 +1701,7 @@ export class SetupController {
       if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
       return { ok: false, reason: this.redact(errorMessage(err)) };
     } finally {
-      this.inFlight.delete(key);
+      this.latches.release(key);
       // §7.2.2: terminal marker on EVERY settle path — `entry.id` is the
       // ONE progress/cancel key on every branch (CC-1/CC-9), so this single
       // finally covers both `provisionOllama` and `provisionLlamacpp`.
@@ -2173,18 +2173,6 @@ export class SetupController {
     return { modelId: entry.id, backend, endpoint, servedName, ...(runCommand !== undefined ? { runCommand } : {}) };
   }
 
-  /** F2-16: the ONE place an install/pull latch is armed. Refuses after
-   *  dispose (gate closed) — the caller maps `undefined` to
-   *  {@link SETUP_DISPOSED_REFUSAL}. Synchronous by construction: the
-   *  closed-check and the Map.set run in one tick (run-to-completion), so a
-   *  concurrent dispose() cannot interleave between them. */
-  private armLatch(key: string): AbortController | undefined {
-    if (this.lifecycle.closed) return undefined;
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
-    return abort;
-  }
-
   // --- setup.cancel (read-only / best-effort) -----------------------------------
 
   private handleCancel(params: unknown): SetupCancelResult {
@@ -2200,12 +2188,10 @@ export class SetupController {
       // for that row silently no-ops (dedup itself still holds; only
       // Cancel was missing it). Every other `op` (`install`) is unaffected.
       const latchId = op === 'pull' ? this.canonicalPullLatchId(id) : id;
-      const latch = this.inFlight.get(`${op}:${latchId}`);
-      if (latch !== undefined) {
-        latch.abort();
-        // F2-20: report what actually happened — an abort was DELIVERED to a
-        // live latch. `{cancelled:false}` below is the honest "nothing to
-        // cancel" outcome the webview's T31 face renders.
+      // F2-20: report what actually happened — an abort was DELIVERED to a
+      // live latch. `{cancelled:false}` below is the honest "nothing to
+      // cancel" outcome the webview's T31 face renders.
+      if (this.latches.abort(`${op}:${latchId}`)) {
         return { ok: true, cancelled: true, matched: latchId };
       }
     }
@@ -2609,7 +2595,7 @@ export class SetupController {
     configuredBackend: string,
     discoveredHermesPath?: string | null,
   ): AgentSetupPhase {
-    if (this.inFlight.has(`install:hermes`)) return 'installing';
+    if (this.latches.has(`install:hermes`)) return 'installing';
     if (this.awaitingReload) return 'awaiting-reload';
     // TC-3 (AU-8/INV-11): a configured setting is authoritative; PATH
     // discovery is only ever a FALLBACK when it's empty — mirrors the
