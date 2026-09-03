@@ -19,6 +19,7 @@ import type { GgufStoreSpec } from './ggufIngest';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import { createMutationGate, type MutationGate } from '../util/mutationGate';
 import { SettledProbeMemo } from './settledProbeMemo';
+import { DEFAULT_OLLAMA_ENDPOINT, coerceDedicatedBackendId, composeFimTuning, composeNextEditBlock, composeRagBlock } from './statusBlocks';
 import type {
   AgentSetupPhase,
   SetupBackendOption,
@@ -422,9 +423,6 @@ export const OLLAMA_PROBE_MEMO_TTL_MS = 1_000;
 export const SETUP_DISPOSED_REFUSAL = 'setup controller disposed';
 const LOG_TAIL_MAX = 40;
 const DEFAULT_FIM_MODEL = 'qwen2.5-coder:1.5b-base';
-const DEFAULT_OLLAMA_ENDPOINT = 'http://127.0.0.1:11434';
-const DEFAULT_RAG_EMBED_MODEL = 'qwen3-embedding:0.6b';
-const DEFAULT_RAG_INDEX_DIR = '.hermes/index';
 const TRUST_REFUSAL_REASON = 'Workspace is not trusted — Setup changes are disabled in Restricted Mode.';
 /**
  * Task 13: the id of Hermes' ALWAYS-advertised terminal setup-wizard auth
@@ -460,9 +458,6 @@ const NEXT_REMOTE_ENDPOINT_REFUSAL =
   'Verified downloads only run against a local Ollama (loopback). For a remote server, download and verify the model on that machine — see the guided instructions.';
 /** §4.4.3c — ONE line for every integrity failure mode (no detail leaks what to forge). */
 const NEXT_INTEGRITY_REFUSAL = 'integrity check failed — refusing to download';
-/** §6 "NEXT warning (D4, card-level)" — host-composed, honest CPU caveat. */
-const NEXT_DEDICATED_WARNING =
-  'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.';
 /** §6 "Pull modal (D3, rev 5)" — every word of the strong claim is what the
  *  engine actually does (Talaria hashes the downloaded bytes; Ollama
  *  re-verifies at blob ingest). Composed from the registry pins so the modal
@@ -517,31 +512,6 @@ const AGENT_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; vllm
   llamacpp: 'http://127.0.0.1:8013',
   vllm: 'http://127.0.0.1:8000',
 };
-/** §3.2 (audit A5, beta.6 panel-fix T2): host-owned RAG endpoint defaults —
- *  mirrors {@link AGENT_ENDPOINT_DEFAULTS}'s CC-6 pattern exactly, one const
- *  per surface. `llamacpp` matches {@link LLAMACPP_RUN_FLAGS}'s embedding
- *  port (8081 — drift-locked by test); `openai-compat` is the vLLM
- *  convention port. `ollama` reuses {@link DEFAULT_OLLAMA_ENDPOINT} — ONE
- *  source for that value, never a second literal. Never webview-fabricated
- *  (Global Constraint 1). */
-const RAG_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; 'openai-compat': string }> = {
-  ollama: DEFAULT_OLLAMA_ENDPOINT,
-  llamacpp: 'http://127.0.0.1:8081',
-  'openai-compat': 'http://127.0.0.1:8000',
-};
-/** T8 (CC-10): `setup.setNextEdit`'s additive `dedicatedBackendId` enum — the
- *  4 unified-block backend panes. Shared by the write-side validation and the
- *  `status()` read-side coercion (never trust settings.json without
- *  re-checking — same posture as {@link coerceNextEditTransport}). */
-const NEXT_DEDICATED_BACKEND_IDS = ['ollama', 'llamacpp', 'vllm', 'openai-compat'] as const;
-
-/** `undefined` for anything outside the 4-value enum — a malformed/edited
- *  settings.json value degrades to "no restoration hint" (the panel's
- *  existing transport-heuristic fallback), never a fabricated pane. */
-function coerceDedicatedBackendId(raw: string | undefined): string | undefined {
-  return raw !== undefined && (NEXT_DEDICATED_BACKEND_IDS as readonly string[]).includes(raw) ? raw : undefined;
-}
-
 /**
  * T13 (beta.5 §4.4 "classify", rev 6 — the owner personally corrected the
  * earlier dot-counting bug): HOST-SOURCED iff the model contains a `/` AND
@@ -966,17 +936,6 @@ export class SetupController {
     const model = (this.host.getSetting<string>('talaria.autocomplete.model') ?? '').trim() || DEFAULT_FIM_MODEL;
     const endpointValue = (this.host.getSetting<string>('talaria.autocomplete.endpoint') ?? '').trim();
 
-    const tuning = {
-      debounceMs: this.host.getSetting<number>('talaria.autocomplete.debounceMs') ?? 350,
-      maxPromptTokens: this.host.getSetting<number>('talaria.autocomplete.maxPromptTokens') ?? 1024,
-      temperature: this.host.getSetting<number>('talaria.autocomplete.temperature') ?? 0.01,
-      crossFileEnabled: this.host.getSetting<boolean>('talaria.autocomplete.crossFile.enabled') ?? true,
-      prefixInjection: this.host.getSetting<boolean>('talaria.autocomplete.crossFile.prefixInjection') ?? false,
-      prefixInjectionRemote:
-        this.host.getSetting<boolean>('talaria.autocomplete.crossFile.prefixInjectionRemote') ?? false,
-      warmUp: this.host.getSetting<boolean>('talaria.autocomplete.crossFile.warmUp') ?? false,
-    };
-
     const fimAuthSatisfied =
       fimDescriptor.remote?.auth.kind !== 'apiKey' || !fimDescriptor.remote.auth.required || apiKeySet;
 
@@ -987,70 +946,7 @@ export class SetupController {
     const provider = computeProviderCard(this.deps.getAdvertisedAuthMethods());
 
     const nextSource = this.deps.getNextEditSource();
-    const nextBackend = coerceNextEditTransport(this.host.getSetting<string>('talaria.nextEdit.backend'));
-    const nextEndpoint = (this.host.getSetting<string>('talaria.nextEdit.endpoint') ?? '').trim();
-    const nextModel = (this.host.getSetting<string>('talaria.nextEdit.model') ?? '').trim();
     const genericSupported = fimDescriptor.nextEditTransport !== undefined;
-    const dedicatedConfigured = nextEndpoint !== '' && nextModel !== '';
-    // T8 (beta.6 CC-10): additive restoration hint — which unified-block pane
-    // configured the dedicated NEXT connection. `undefined` (never set, or a
-    // malformed/edited settings.json value) ⇒ omitted from the wire, so the
-    // panel falls back to its existing transport heuristic.
-    const nextDedicatedBackendIdRaw = (
-      this.host.getSetting<string>('talaria.nextEdit.dedicatedBackendId') ?? ''
-    ).trim();
-    const nextDedicatedBackendId = coerceDedicatedBackendId(
-      nextDedicatedBackendIdRaw === '' ? undefined : nextDedicatedBackendIdRaw,
-    );
-    // T13 (§4.2): capability + raw facts for the dedicated NEXT card —
-    // computed purely from the registry pins (no await; the CR-002
-    // synchronous tail below stays intact). `downloadReady` is driven by the
-    // sha256 pin and NOTHING else.
-    const downloadReady = (NEXT_DEDICATED_MODEL.gguf.sha256 as string) !== '';
-    const dedicated: NonNullable<SetupData['nextEdit']['dedicated']> = {
-      displayName: NEXT_DEDICATED_MODEL.displayName,
-      // ⚠ R-3: '' while !downloadReady — configuration is fail-closed, not
-      // just the download (see the protocol.ts field doc).
-      modelDefaults: {
-        ollama: downloadReady ? NEXT_DEDICATED_MODEL.ollamaCreatedName : '',
-        openaiCompat: NEXT_DEDICATED_MODEL.upstream.hfRepo,
-      },
-      downloadReady,
-      downloadApproxBytes: NEXT_DEDICATED_MODEL.gguf.approxBytes,
-      warning: NEXT_DEDICATED_WARNING,
-      guided: {
-        // §6 copy: command line + honesty note, newline-separated.
-        vllm: `Run: vllm serve ${NEXT_DEDICATED_MODEL.upstream.hfRepo}\n(official Sweep release, ~15 GB download)`,
-        // llamacpp ONLY when the pin is published (S-F2/S-F5): `-hf` verifies
-        // nothing itself, so the line ships WITH the manual sha256sum hint.
-        ...(downloadReady
-          ? {
-              llamacpp:
-                `Run: llama-server -hf ${NEXT_DEDICATED_MODEL.gguf.hfRepo}:${NEXT_DEDICATED_MODEL.gguf.quant} --port 8012` +
-                `\nVerify the download: sha256sum should print ${NEXT_DEDICATED_MODEL.gguf.sha256}`,
-            }
-          : {}),
-      },
-    };
-
-    const ragEnabled = this.host.getSetting<boolean>('talaria.rag.enabled') ?? true;
-    const ragEmbedEndpoint = (this.host.getSetting<string>('talaria.rag.embedEndpoint') ?? '').trim() || DEFAULT_OLLAMA_ENDPOINT;
-    // T8 (beta.6 CC-10): additive restoration hint — which backend the RAG
-    // embedder block is configured against. UNLIKE `dedicatedBackendId`, this
-    // has one clean single default ('ollama') and is ALWAYS populated on the
-    // wire (never omitted) — a malformed/edited settings.json value degrades
-    // to that default, same fail-closed coercion as `coerceNextEditTransport`.
-    const ragEmbedBackendRaw = this.host.getSetting<string>('talaria.rag.embedBackend');
-    const ragEmbedBackend: 'ollama' | 'llamacpp' | 'openai-compat' =
-      ragEmbedBackendRaw === 'llamacpp' || ragEmbedBackendRaw === 'openai-compat' ? ragEmbedBackendRaw : 'ollama';
-    const ragEmbedModel = (this.host.getSetting<string>('talaria.rag.embedModel') ?? '').trim() || DEFAULT_RAG_EMBED_MODEL;
-    const ragTuning = {
-      dims: this.host.getSetting<number>('talaria.rag.dims') ?? 0,
-      maxChunkTokens: this.host.getSetting<number>('talaria.rag.maxChunkTokens') ?? 512,
-      debounceMs: this.host.getSetting<number>('talaria.rag.debounceMs') ?? 500,
-      excludeGlobs: this.host.getSetting<string[]>('talaria.rag.excludeGlobs') ?? [],
-    };
-    const ragIndexDir = (this.host.getSetting<string>('talaria.rag.indexDir') ?? '').trim() || DEFAULT_RAG_INDEX_DIR;
 
     const fimGreen = fimDescriptor.status === 'available' && enabled && fimAuthSatisfied;
     const ready = computeReady(agentPhase, provider.phase, fimGreen);
@@ -1078,43 +974,20 @@ export class SetupController {
         enabled,
         model,
         endpointValue,
-        tuning,
+        tuning: composeFimTuning(this.host),
       },
-      nextEdit: {
-        source: nextSource,
-        backend: nextBackend,
-        endpoint: nextEndpoint,
-        model: nextModel,
-        dedicatedConfigured,
-        ...(nextDedicatedBackendId !== undefined ? { dedicatedBackendId: nextDedicatedBackendId } : {}),
+      nextEdit: composeNextEditBlock({
+        reader: this.host,
+        nextSource,
         genericSupported,
-        ...(nextSource === 'generic' && !genericSupported
-          ? {
-              refusalDetail: `The selected FIM backend ('${fimDescriptor.displayName}') does not support Generic Next-Edit.`,
-            }
-          : {}),
-        dedicated,
-      },
-      rag: {
-        enabled: ragEnabled,
-        embedEndpoint: ragEmbedEndpoint,
-        embedBackend: ragEmbedBackend,
-        embedModel: ragEmbedModel,
-        // beta.6 panel-fix T2 (audit A5): host-owned per-pane endpoint
-        // defaults, ALWAYS populated — mirrors agentLocalModel.endpointDefaults
-        // (CC-6) exactly. Never webview-fabricated (Global Constraint 1).
-        endpointDefaults: RAG_ENDPOINT_DEFAULTS,
-        // @deprecated beta.6 T14 (wire compat only): the wrong-daemon
-        // computation §3.4 replaced — it answers for the endpoint this
-        // status() probed, not `embedEndpoint`, and the exact `===` misses
-        // `:latest`. The unified UI derives presence client-side instead
-        // (`ragEmbedPresence`, endpoint-scoped per C-6); no webview code
-        // reads this field anymore (source-scan-locked in SetupPanel.test.ts).
-        embedModelPresent: ollamaStatus.running ? ollamaStatus.models.some((m) => m.name === ragEmbedModel) : false,
-        tuning: ragTuning,
-        indexDir: ragIndexDir,
-        ...(trusted ? {} : { preconditionDetail: 'The codebase index needs a trusted, open workspace.' }),
-      },
+        fimDisplayName: fimDescriptor.displayName,
+      }),
+      rag: composeRagBlock({
+        reader: this.host,
+        trusted,
+        ollamaRunning: ollamaStatus.running,
+        ollamaModels: ollamaStatus.running ? ollamaStatus.models : [],
+      }),
       // T13 (§4.2): `endpoint` = the endpoint this status() ACTUALLY probed
       // — presence claims are scoped to it (critic C-6).
       ollama: ollamaStatus.running
@@ -2937,10 +2810,6 @@ function computeReady(
   fimGreen: boolean,
 ): boolean {
   return agentPhase === 'ready' && providerPhase === 'configured' && fimGreen;
-}
-
-function coerceNextEditTransport(raw: string | undefined): 'ollama' | 'openai-compat' {
-  return raw === 'openai-compat' ? 'openai-compat' : 'ollama';
 }
 
 /**

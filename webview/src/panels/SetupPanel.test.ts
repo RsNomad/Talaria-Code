@@ -1551,11 +1551,15 @@ describe('T14 — the beta.5 wrong-daemon presence boolean: webview consumption 
 
   it('the wire field + host computation SURVIVE (compat), marked @deprecated beta.6 T14', () => {
     const protocolSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'shared', 'protocol.ts'), 'utf-8');
-    const controllerSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'host', 'setup', 'SetupController.ts'), 'utf-8');
+    // WS-GD.2b B3: the composition moved from SetupController.ts's inline
+    // status() body into statusBlocks.ts's composeRagBlock — same computation,
+    // read off `ollamaRunning`/`ollamaModels` (the composer's own args) rather
+    // than `ollamaStatus.running`/`.models`.
+    const statusBlocksSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'host', 'setup', 'statusBlocks.ts'), 'utf-8');
     expect(protocolSrc).toContain(`${WIRE_BOOLEAN}: boolean`);
     expect(protocolSrc).toContain('@deprecated beta.6 T14');
-    expect(controllerSrc).toContain(`${WIRE_BOOLEAN}: ollamaStatus.running`);
-    expect(controllerSrc).toContain('@deprecated beta.6 T14');
+    expect(statusBlocksSrc).toContain(`${WIRE_BOOLEAN}: ollamaRunning`);
+    expect(statusBlocksSrc).toContain('@deprecated beta.6 T14');
   });
 });
 
