@@ -1709,6 +1709,86 @@ export class SetupController {
     }
   }
 
+  /** pinned-mode digest core: pinnedVerifySpec → verifyHfDigest (seam-rejection → refusal).
+   *  Caller has ALREADY refused the empty pin (order-locked). */
+  private async resolvePinnedDigest(
+    gguf: CatalogGguf,
+    sha256: string,
+  ): Promise<
+    | { ok: true; expected: string; allowedRepoFiles: readonly string[] | undefined }
+    | { ok: false; reason: string }
+  > {
+    const pinnedSpec = pinnedVerifySpec(gguf, sha256);
+    if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+    let verdict: HfDigestVerdict;
+    try {
+      verdict = await this.deps.verifyHfDigest(pinnedSpec.spec);
+    } catch {
+      verdict = { ok: false, reason: 'verify seam rejected' };
+    }
+    if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+    return { ok: true, expected: sha256, allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles };
+  }
+
+  /** live-oid core: resolveLfsOid (seam-rejection → refusal). */
+  private async resolveLiveOidDigest(
+    gguf: CatalogGguf,
+  ): Promise<{ ok: true; expected: string } | { ok: false; reason: string }> {
+    let oid: LfsOidVerdict;
+    try {
+      oid = await this.deps.resolveLfsOid(gguf.hfRepo, gguf.file);
+    } catch {
+      oid = { ok: false, reason: 'resolve seam rejected' };
+    }
+    if (!oid.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+    return { ok: true, expected: oid.oid };
+  }
+
+  /** the shared guarded ingest call both provisionOllama arms end with. */
+  private async runOllamaIngest(args: {
+    entry: CatalogModel;
+    cell: Extract<CatalogModel['ollama'], { tier: 'hf-ingest' }>;
+    sha256: string;
+    allowedRepoFiles: readonly string[] | undefined;
+    endpoint: string;
+    signal: AbortSignal;
+  }): Promise<void> {
+    const { entry, cell, sha256, allowedRepoFiles, endpoint, signal } = args;
+    // §7.2.2: settled-flag straggler guard around ingestGguf's own
+    // await — same discipline as {@link runLibraryPull}; the shared
+    // `entry.id`-keyed terminal `done` push lives in the CALLER's
+    // (`handleProvisionModel`'s) finally, which runs strictly after
+    // this flag flips. NOTE beyond the round's doc's literal 4-site
+    // list: this is the SAME `ingestGguf` dep, the SAME shared
+    // `entry.id`-keyed `done` push, and is a genuinely reachable
+    // path today (the `devstral-24b` catalog row hits this `live-oid`
+    // arm; the sibling `pinned` arm is currently dormant, sha256 `''`;
+    // the 11 `library`-tier rows route through the already-guarded
+    // `runLibraryPull` site, not here) — so it gets the identical
+    // guard for consistency and genuine safety, not just the
+    // dormant sibling.
+    await this.runWithSettledGuard(
+      (p) => this.pushPullProgress(entry.id, p),
+      (cb) =>
+        this.deps.ingestGguf(
+          {
+            gguf: {
+              hfRepo: cell.gguf.hfRepo,
+              file: cell.gguf.file,
+              quant: cell.gguf.quant,
+              sha256,
+              approxBytes: cell.gguf.approxBytes,
+              ...(allowedRepoFiles !== undefined ? { allowedRepoFiles } : {}),
+            },
+            ollamaCreatedName: cell.createdName,
+          },
+          endpoint,
+          cb,
+          signal,
+        ),
+    );
+  }
+
   /** §2.5 step 4 — the ollama branch (library tier + both hf-ingest modes).
    *  Runs INSIDE the `pull:<modelId>` latch; the caller owns catch/finally. */
   private async provisionOllama(
@@ -1745,52 +1825,21 @@ export class SetupController {
         // → Tier-1 modal → ingest. Every refusal BEFORE the modal.
         if (cell.verify.sha256 === '') return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
         if (!isLoopbackEndpoint(validated.url)) return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
-        const pinnedSpec = pinnedVerifySpec(cell.gguf, cell.verify.sha256);
-        if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        let verdict: HfDigestVerdict;
-        try {
-          verdict = await this.deps.verifyHfDigest(pinnedSpec.spec);
-        } catch {
-          verdict = { ok: false, reason: 'verify seam rejected' };
-        }
-        if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        const digest = await this.resolvePinnedDigest(cell.gguf, cell.verify.sha256);
+        if (!digest.ok) return { ok: false, reason: digest.reason };
         const confirmed = await this.host.showModal(
           composePinnedOllamaModal(entry.displayName, cell.gguf, validated.url),
           'Download',
         );
         if (!confirmed) return { ok: false, reason: 'declined' };
-        // WV3-MIN-FUNC follow-on: `cell.verify.sha256` narrows off the
-        // `VerifySpec` union only within this switch case's own scope — the
-        // narrowing does not survive into the closure below (a property-path
-        // narrowing, unlike a plain local's), so it is hoisted to a local
-        // here. Same value, same read timing (still after every await
-        // above); no behavior change.
-        const sha256 = cell.verify.sha256;
-        // §7.2.2: settled-flag straggler guard around ingestGguf's own
-        // await — same discipline as {@link runLibraryPull}; the shared
-        // `entry.id`-keyed terminal `done` push lives in the CALLER's
-        // (`handleProvisionModel`'s) finally, which runs strictly after
-        // this flag flips.
-        await this.runWithSettledGuard(
-          (p) => this.pushPullProgress(entry.id, p),
-          (cb) =>
-            this.deps.ingestGguf(
-              {
-                gguf: {
-                  hfRepo: cell.gguf.hfRepo,
-                  file: cell.gguf.file,
-                  quant: cell.gguf.quant,
-                  sha256,
-                  approxBytes: cell.gguf.approxBytes,
-                  allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles,
-                },
-                ollamaCreatedName: cell.createdName,
-              },
-              validated.url,
-              cb,
-              signal,
-            ),
-        );
+        await this.runOllamaIngest({
+          entry,
+          cell,
+          sha256: digest.expected,
+          allowedRepoFiles: digest.allowedRepoFiles,
+          endpoint: validated.url,
+          signal,
+        });
         return { ok: true };
       }
       case 'live-oid': {
@@ -1799,13 +1848,8 @@ export class SetupController {
         // digest the ingest engine hashes the received bytes against, and
         // Ollama re-verifies it server-side at blob ingest.
         if (!isLoopbackEndpoint(validated.url)) return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
-        let oid: LfsOidVerdict;
-        try {
-          oid = await this.deps.resolveLfsOid(cell.gguf.hfRepo, cell.gguf.file);
-        } catch {
-          oid = { ok: false, reason: 'resolve seam rejected' };
-        }
-        if (!oid.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
+        const digest = await this.resolveLiveOidDigest(cell.gguf);
+        if (!digest.ok) return { ok: false, reason: digest.reason };
         const publisher = trustedPublisherFor(entry.publisher);
         if (publisher === undefined) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
         const confirmed = await this.host.showModal(
@@ -1813,36 +1857,14 @@ export class SetupController {
           'Download',
         );
         if (!confirmed) return { ok: false, reason: 'declined' };
-        // §7.2.2: settled-flag straggler guard — same discipline as the
-        // 'pinned' branch above (this file's own doc for that branch has
-        // the full rationale). NOTE beyond the round's doc's literal 4-site
-        // list: this is the SAME `ingestGguf` dep, the SAME shared
-        // `entry.id`-keyed `done` push, and is a genuinely reachable
-        // path today (the `devstral-24b` catalog row hits this `live-oid`
-        // arm; the sibling `pinned` arm is currently dormant, sha256 `''`;
-        // the 11 `library`-tier rows route through the already-guarded
-        // `runLibraryPull` site, not here) — so it gets the identical
-        // guard for consistency and genuine safety, not just the
-        // dormant sibling.
-        await this.runWithSettledGuard(
-          (p) => this.pushPullProgress(entry.id, p),
-          (cb) =>
-            this.deps.ingestGguf(
-              {
-                gguf: {
-                  hfRepo: cell.gguf.hfRepo,
-                  file: cell.gguf.file,
-                  quant: cell.gguf.quant,
-                  sha256: oid.oid,
-                  approxBytes: cell.gguf.approxBytes,
-                },
-                ollamaCreatedName: cell.createdName,
-              },
-              validated.url,
-              cb,
-              signal,
-            ),
-        );
+        await this.runOllamaIngest({
+          entry,
+          cell,
+          sha256: digest.expected,
+          allowedRepoFiles: undefined,
+          endpoint: validated.url,
+          signal,
+        });
         return { ok: true };
       }
       default:
@@ -1868,29 +1890,17 @@ export class SetupController {
     switch (cell.verify.mode) {
       case 'pinned': {
         if (cell.verify.sha256 === '') return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
-        const pinnedSpec = pinnedVerifySpec(cell.gguf, cell.verify.sha256);
-        if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
         // SC-5: the FULL beta.5 chain on EVERY backend — the exact-file-set
         // pre-flight runs on the file path too, not just the Ollama ingest.
-        let verdict: HfDigestVerdict;
-        try {
-          verdict = await this.deps.verifyHfDigest(pinnedSpec.spec);
-        } catch {
-          verdict = { ok: false, reason: 'verify seam rejected' };
-        }
-        if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        expected = cell.verify.sha256;
+        const digest = await this.resolvePinnedDigest(cell.gguf, cell.verify.sha256);
+        if (!digest.ok) return { ok: false, reason: digest.reason };
+        expected = digest.expected;
         break;
       }
       case 'live-oid': {
-        let oid: LfsOidVerdict;
-        try {
-          oid = await this.deps.resolveLfsOid(cell.gguf.hfRepo, cell.gguf.file);
-        } catch {
-          oid = { ok: false, reason: 'resolve seam rejected' };
-        }
-        if (!oid.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        expected = oid.oid;
+        const digest = await this.resolveLiveOidDigest(cell.gguf);
+        if (!digest.ok) return { ok: false, reason: digest.reason };
+        expected = digest.expected;
         break;
       }
       default:
