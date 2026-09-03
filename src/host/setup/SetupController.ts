@@ -18,6 +18,7 @@ import type { GgufDestResult } from './modelStore';
 import type { GgufStoreSpec } from './ggufIngest';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import { createMutationGate, type MutationGate } from '../util/mutationGate';
+import { SettledProbeMemo } from './settledProbeMemo';
 import type {
   AgentSetupPhase,
   SetupBackendOption,
@@ -399,8 +400,8 @@ export interface SetupControllerDeps {
    * `talaria.hermesPath` is empty (a configured setting is authoritative and
    * is never second-guessed by a PATH probe); resolves the discovered
    * absolute path, or REJECTS if the login-shell PATH lookup fails —
-   * {@link SetupController.kickHermesDiscovery} maps a rejection to the
-   * honest "not found" memo state, mirroring {@link
+   * {@link SetupController.hermesDiscoveryMemo}'s `onRejected` maps a
+   * rejection to the honest "not found" memo state, mirroring {@link
    * SetupControllerDeps.locateLlamaServer}'s reject→settle posture. OPTIONAL
    * (same idiom as {@link reconnectAgent} above, same reason: a required
    * member would break every existing deps-literal/factory-call test site);
@@ -733,6 +734,10 @@ interface OsResolution {
   containerNote?: string;
 }
 
+/** T6 (§2.5): the llama.cpp runtime memo's settled shape — the current
+ *  inline field type, named for {@link SettledProbeMemo}'s type parameter. */
+type LlamaCppSettled = { binary: 'found' | 'missing' | 'unknown'; version?: string; path?: string };
+
 export class SetupController {
   private readonly progressEmitter = new Emitter<SetupProgress>();
   /** Throttled >=150ms between pushes for the same `(op, id)` pair, via a real `setTimeout` — never drops the final value, only delays it. */
@@ -784,58 +789,74 @@ export class SetupController {
    *  the file may have become readable). */
   private osResolution: Promise<OsResolution> | undefined;
 
-  /**
-   * T6 (beta.6 §2.5): the llama.cpp runtime SETTLED-VALUE memo — deliberately
-   * NOT the awaited {@link osResolution} pattern (which cannot express
-   * `'checking'`): `status()` kicks the probe once (lazily, {@link
-   * kickLlamaCppProbe}) and returns immediately with `'checking'`; the
-   * probe's settle writes this field and fires {@link onStatusChanged}
-   * exactly ONCE (the seq-guarded push repaints). `undefined` = not settled
-   * yet. The `path` is stored ALREADY `~`-redacted (T6 M-3 discipline).
-   */
-  private llamaCppRuntime: { binary: 'found' | 'missing' | 'unknown'; version?: string; path?: string } | undefined;
-  /** True while a probe attempt is in flight — with {@link llamaCppRuntime}
-   *  `undefined` + this false, the next `status()` kicks a fresh probe. */
-  private llamaCppProbeInFlight = false;
-  /** The in-flight probe attempt's AbortController — a scoped recheck (and
-   *  {@link dispose}) aborts it so a superseded login-shell probe dies
-   *  instead of lingering (T5 CR-1 signal threading). */
-  private llamaCppProbeAbort: AbortController | undefined;
-  /** Monotonic supersession guard: bumped by {@link rekickLlamaCppProbe} so a
-   *  SUPERSEDED probe settling late can neither overwrite the fresh state
-   *  nor fire a stray push. */
-  private llamaCppProbeEpoch = 0;
-
-  /**
-   * TC-3 (AU-8 / INV-11): the Hermes PATH-discovery settled-value memo —
-   * SAME posture as {@link llamaCppRuntime} above. `undefined` = never
-   * probed; `{found: string | null}` = settled (`found` = the discovered
-   * absolute path, `null` = the login-shell PATH lookup came up empty or
-   * rejected — the honest "not found" outcome, never a thrown error out of
-   * `status()`). `status()` kicks the probe lazily ({@link
-   * kickHermesDiscovery}) ONLY when `talaria.hermesPath` is unset, and only
-   * while `this.deps.discoverHermes` is bound — an unbound dep (older/
-   * partial wiring) leaves this memo permanently `undefined`, which {@link
-   * computeAgentPhase} reads exactly like the pre-AU-8 settings-only truth.
-   */
-  private hermesPathDiscovery: { found: string | null } | undefined;
-  /** True while a discovery attempt is in flight — with {@link
-   *  hermesPathDiscovery} `undefined` + this false, the next `status()`
-   *  kicks a fresh probe. */
-  private hermesDiscoveryProbeInFlight = false;
-  /** Monotonic supersession guard, mirroring {@link llamaCppProbeEpoch}:
-   *  bumped by {@link dispose} and by `setup.recheck`'s memo-clear so a
-   *  superseded probe's late settle can neither overwrite fresher state nor
-   *  fire a stray push. Unlike {@link llamaCppProbeAbort}, there is no
-   *  cancellation seam here — {@link SetupControllerDeps.discoverHermes}
-   *  takes no `AbortSignal` — so a superseded attempt keeps running in the
-   *  background; the epoch just makes ITS eventual settle inert. */
-  private hermesDiscoveryEpoch = 0;
-
   constructor(
     private readonly host: SetupHost,
     private readonly deps: SetupControllerDeps,
   ) {}
+
+  /**
+   * T6 (beta.6 §2.5): the llama.cpp runtime settled-value memo — see {@link
+   * SettledProbeMemo} for the shared kick/invalidate/rekick/supersede
+   * contract (deliberately NOT the awaited {@link osResolution} pattern,
+   * which cannot express `'checking'`). `status()` kicks the probe once
+   * (lazily, {@link kickLlamaCppProbe}) and returns immediately with
+   * `'checking'`; the probe's settle writes {@link SettledProbeMemo.value}
+   * and fires {@link onStatusChanged} exactly ONCE via `onSettled` (the
+   * seq-guarded push repaints). Unsettled `.value` = not settled yet. The
+   * `path` is stored ALREADY `~`-redacted (T6 M-3 discipline). Cancellable:
+   * true — {@link SetupControllerDeps.locateLlamaServer} takes an
+   * `AbortSignal`, so a scoped recheck (or {@link dispose}) cancels a
+   * superseded login-shell probe instead of leaving it lingering (T5 CR-1
+   * signal threading). CAUTION (construction order): this field initializer
+   * reads `this.deps`/`this.redact` inside its `probe`/`onSettled` closures
+   * — safe because those closures only run LATER, at `kick()` time, well
+   * after the constructor above has already bound `this.deps`/`this.host`.
+   */
+  private readonly llamaCppMemo = new SettledProbeMemo<LlamaCppSettled>({
+    probe: async (signal) => {
+      const result = await this.deps.locateLlamaServer(signal);
+      return result.ok
+        ? {
+            binary: 'found',
+            ...(result.version !== undefined ? { version: result.version } : {}),
+            path: this.redact(result.path),
+          }
+        : { binary: result.reason === 'probe-timeout' ? 'unknown' : 'missing' };
+    },
+    onRejected: () => ({ binary: 'unknown' }),
+    onSettled: () => this.bumpStatus(),
+    cancellable: true,
+  });
+
+  /**
+   * TC-3 (AU-8 / INV-11): the Hermes PATH-discovery settled-value memo — SAME
+   * {@link SettledProbeMemo} contract as {@link llamaCppMemo} above.
+   * Unsettled `.value` = never probed; `{found: string | null}` = settled
+   * (`found` = the discovered absolute path, `null` = the login-shell PATH
+   * lookup came up empty or rejected — the honest "not found" outcome, never
+   * a thrown error out of `status()`). `status()` kicks the probe lazily
+   * ({@link kickHermesDiscovery}) ONLY when `talaria.hermesPath` is unset,
+   * and only while `this.deps.discoverHermes` is bound — an unbound dep
+   * (older/partial wiring) leaves this memo permanently unsettled, which
+   * {@link computeAgentPhase} reads exactly like the pre-AU-8 settings-only
+   * truth (the unbound-dep guard stays in {@link kickHermesDiscovery} itself
+   * — the memo never learns about optional deps; the `discover` re-read
+   * inside `probe` below narrows only to satisfy the type checker for a path
+   * that `kickHermesDiscovery`'s guard already makes unreachable — `deps` is
+   * `readonly`, so it cannot become unbound between the guard and this call).
+   * Cancellable: false — {@link SetupControllerDeps.discoverHermes} takes no
+   * `AbortSignal`, so a superseded attempt keeps running in the background;
+   * the epoch just makes ITS eventual settle inert.
+   */
+  private readonly hermesDiscoveryMemo = new SettledProbeMemo<{ found: string | null }>({
+    probe: async () => {
+      const discover = this.deps.discoverHermes;
+      return { found: discover ? await discover() : null };
+    },
+    onRejected: () => ({ found: null }),
+    onSettled: () => this.bumpStatus(),
+    cancellable: false,
+  });
 
   dispose(): void {
     // F2-16: flip the gate CLOSED synchronously, FIRST — before any teardown
@@ -864,14 +885,12 @@ export class SetupController {
     this.inFlight.clear();
     // T6: supersede + cancel any in-flight llama.cpp probe — its late settle
     // must neither write state nor fire into the (now-cleared) emitter.
-    this.llamaCppProbeEpoch += 1;
-    this.llamaCppProbeAbort?.abort();
-    this.llamaCppProbeAbort = undefined;
+    this.llamaCppMemo.supersede();
     // TC-3 (AU-8/INV-11): supersede any in-flight Hermes discovery probe too
     // — no abort seam exists (discoverHermes takes no signal), so bumping the
     // epoch is the only guard; its late settle is dropped (epoch mismatch)
     // instead of writing state or firing into the disposed emitter.
-    this.hermesDiscoveryEpoch += 1;
+    this.hermesDiscoveryMemo.supersede();
     // CA-M18: drop the Ollama probe memo too — an in-flight probe's late
     // settle is harmless (it resolves the stored promise, nothing more),
     // but a disposed controller must never SERVE a memoized result again.
@@ -930,7 +949,7 @@ export class SetupController {
     const configuredBackend = this.host.getSetting<string>('talaria.backend') ?? 'mock';
     // TC-3 (AU-8/INV-11): the discovered PATH fallback — `null`/unsettled
     // both read as "nothing found yet", exactly like a settings-only miss.
-    const agentPhase = this.computeAgentPhase(hermesPath, configuredBackend, this.hermesPathDiscovery?.found);
+    const agentPhase = this.computeAgentPhase(hermesPath, configuredBackend, this.hermesDiscoveryMemo.value?.found);
     const installRecord = this.host.globalState.get<{ version: string; venvRoot: string; installedAt: string }>(
       'talaria.setup.hermesInstall',
     );
@@ -1159,7 +1178,7 @@ export class SetupController {
   /**
    * Kick the `llama-server` probe ONCE, lazily — a no-op while a settled
    * value exists or an attempt is already in flight. The settle writes
-   * {@link llamaCppRuntime} and fires {@link onStatusChanged} exactly once;
+   * {@link llamaCppMemo}'s value and fires {@link onStatusChanged} exactly once;
    * a settle whose epoch was superseded (scoped recheck / dispose) is
    * DROPPED entirely. Mapping (CC-5): found ⇒ `'found'`, `not-found` ⇒
    * `'missing'`, `probe-timeout` ⇒ `'unknown'` (never `'missing'`); a
@@ -1167,45 +1186,14 @@ export class SetupController {
    * become an unhandled rejection out of a fire-and-forget kick.
    */
   private kickLlamaCppProbe(): void {
-    if (this.llamaCppRuntime !== undefined || this.llamaCppProbeInFlight) return;
-    this.llamaCppProbeInFlight = true;
-    const epoch = this.llamaCppProbeEpoch;
-    const abort = new AbortController();
-    this.llamaCppProbeAbort = abort;
-    void (async () => {
-      let settled: NonNullable<SetupController['llamaCppRuntime']>;
-      try {
-        const result = await this.deps.locateLlamaServer(abort.signal);
-        settled = result.ok
-          ? {
-              binary: 'found',
-              ...(result.version !== undefined ? { version: result.version } : {}),
-              path: this.redact(result.path),
-            }
-          : { binary: result.reason === 'probe-timeout' ? 'unknown' : 'missing' };
-      } catch {
-        // Rejection (incl. an abort racing the settle) ⇒ honest 'unknown';
-        // a superseded epoch is dropped below either way.
-        settled = { binary: 'unknown' };
-      }
-      if (epoch !== this.llamaCppProbeEpoch) return; // superseded — the fresh probe owns the state
-      this.llamaCppRuntime = settled;
-      this.llamaCppProbeInFlight = false;
-      this.llamaCppProbeAbort = undefined;
-      this.bumpStatus();
-    })();
+    this.llamaCppMemo.kick();
   }
 
   /** Clear state + memo, cancel the superseded attempt, and re-kick WITHOUT
    *  awaiting — `setup.recheck {scope:'llamacpp'}`'s non-blocking re-check
    *  (the recheck RPC's own budget is untouched). */
   private rekickLlamaCppProbe(): void {
-    this.llamaCppProbeEpoch += 1;
-    this.llamaCppProbeAbort?.abort();
-    this.llamaCppProbeAbort = undefined;
-    this.llamaCppRuntime = undefined;
-    this.llamaCppProbeInFlight = false;
-    this.kickLlamaCppProbe();
+    this.llamaCppMemo.rekick();
   }
 
   /** The wire projection of the memo (§1.3 `llamacppRuntime`): unsettled ⇒
@@ -1213,7 +1201,7 @@ export class SetupController {
    *  `'unknown'`, where an install button would assert a fact the probe
    *  could not establish). */
   private composeLlamaCppRuntime(osInfo: OsResolution): NonNullable<SetupData['llamacppRuntime']> {
-    const settled = this.llamaCppRuntime;
+    const settled = this.llamaCppMemo.value;
     if (settled === undefined) return { binary: 'checking' };
     return {
       binary: settled.binary,
@@ -2432,14 +2420,12 @@ export class SetupController {
       // — mirrors osResolution's clear-only posture above (not
       // rekickLlamaCppProbe's immediate re-kick): the next status() call
       // re-probes lazily through kickHermesDiscovery, picking up e.g. a
-      // hermes the user just pipx-installed in a terminal. Reset the
-      // in-flight flag too (not just bump the epoch) — a superseded probe's
-      // late settle is dropped by the epoch check BEFORE it would ever clear
-      // the flag itself, so leaving it `true` here would wedge every future
-      // kick into a permanent no-op.
-      this.hermesDiscoveryEpoch += 1;
-      this.hermesPathDiscovery = undefined;
-      this.hermesDiscoveryProbeInFlight = false;
+      // hermes the user just pipx-installed in a terminal. invalidate()
+      // resets the in-flight flag too (not just the epoch) — a superseded
+      // probe's late settle is dropped by the epoch check BEFORE it would
+      // ever clear the flag itself, so leaving it `true` here would wedge
+      // every future kick into a permanent no-op.
+      this.hermesDiscoveryMemo.invalidate();
       try {
         const located = await this.deps.locatePipx();
         if (located.ok) {
@@ -2752,30 +2738,13 @@ export class SetupController {
    * (`setup.recheck {scope:'agent'}`), without a window reload.
    * `discoverHermes` offers no cancellation seam (unlike {@link
    * SetupControllerDeps.locateLlamaServer}'s `signal`), so a superseded
-   * attempt keeps running in the background — {@link hermesDiscoveryEpoch}
-   * just makes ITS eventual settle inert, mirroring {@link
-   * llamaCppProbeEpoch}'s supersession guard.
+   * attempt keeps running in the background — the memo's epoch just makes
+   * ITS eventual settle inert, mirroring {@link llamaCppMemo}'s supersession
+   * guard.
    */
   private kickHermesDiscovery(): void {
-    const discover = this.deps.discoverHermes;
-    if (!discover) return;
-    if (this.hermesPathDiscovery !== undefined || this.hermesDiscoveryProbeInFlight) return;
-    this.hermesDiscoveryProbeInFlight = true;
-    const epoch = this.hermesDiscoveryEpoch;
-    void (async () => {
-      let settled: NonNullable<SetupController['hermesPathDiscovery']>;
-      try {
-        settled = { found: await discover() };
-      } catch {
-        // Rejection (login-shell lookup failed) ⇒ honest "not found"; a
-        // superseded epoch is dropped below either way.
-        settled = { found: null };
-      }
-      if (epoch !== this.hermesDiscoveryEpoch) return; // superseded — the fresh probe (or a recheck clear) owns the state
-      this.hermesPathDiscovery = settled;
-      this.hermesDiscoveryProbeInFlight = false;
-      this.bumpStatus();
-    })();
+    if (!this.deps.discoverHermes) return;
+    this.hermesDiscoveryMemo.kick();
   }
 
   // --- helpers --------------------------------------------------------------
