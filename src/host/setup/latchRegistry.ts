@@ -6,6 +6,10 @@
  * owned by `SetupController` (this class never sees it directly, only its
  * `closed` flag).
  */
+/** F2-16: the refusal every post-dispose mutating latch gets — a closed
+ *  literal (webview-rendered), matching the file's terse refusal style. */
+export const SETUP_DISPOSED_REFUSAL = 'setup controller disposed';
+
 export class LatchRegistry {
   private readonly latches = new Map<string, AbortController>();
 
