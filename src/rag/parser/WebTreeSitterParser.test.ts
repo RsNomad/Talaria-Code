@@ -74,22 +74,20 @@ vi.mock('web-tree-sitter', () => ({
 
 import { Parser } from 'web-tree-sitter';
 
-import { WebTreeSitterParser, resetParserInitForTests } from './WebTreeSitterParser';
+import { WebTreeSitterParser, createParserInitMemo } from './WebTreeSitterParser';
 
 beforeEach(() => {
   trackedParsers.length = 0;
   trackedTrees.length = 0;
-  // The `parserInitPromise` memo is module-level (shared across every
-  // `WebTreeSitterParser` instance, mirroring the real singleton
-  // `Parser.init()` semantics), so it must be reset between tests the same
-  // way `resetHermesBinCache` resets `resolveHermes.ts`'s module cache.
-  resetParserInitForTests();
   vi.mocked(Parser.init).mockClear();
 });
 
 describe('WebTreeSitterParser', () => {
   it('reuses the same Parser instance across repeated parse() calls for the same language', async () => {
-    const parser = new WebTreeSitterParser({ grammarsDir: '/fake-grammars' });
+    const parser = new WebTreeSitterParser({
+      grammarsDir: '/fake-grammars',
+      ensureParserInit: createParserInitMemo(),
+    });
 
     await parser.parse('typescript', 'const a = 1;');
     await parser.parse('typescript', 'const b = 2;');
@@ -100,7 +98,10 @@ describe('WebTreeSitterParser', () => {
   });
 
   it('caches a separate Parser per language, reusing each within its own language', async () => {
-    const parser = new WebTreeSitterParser({ grammarsDir: '/fake-grammars' });
+    const parser = new WebTreeSitterParser({
+      grammarsDir: '/fake-grammars',
+      ensureParserInit: createParserInitMemo(),
+    });
 
     await parser.parse('typescript', 'const a = 1;');
     await parser.parse('javascript', 'const b = 2;');
@@ -110,7 +111,10 @@ describe('WebTreeSitterParser', () => {
   });
 
   it('keeps a parsed tree alive through consumption, and only frees it once the next parse() call starts', async () => {
-    const parser = new WebTreeSitterParser({ grammarsDir: '/fake-grammars' });
+    const parser = new WebTreeSitterParser({
+      grammarsDir: '/fake-grammars',
+      ensureParserInit: createParserInitMemo(),
+    });
 
     const root1 = await parser.parse('typescript', 'const a = 1;');
     const tree1 = trackedTrees[0];
@@ -145,7 +149,10 @@ describe('WebTreeSitterParser', () => {
     const initMock = vi.mocked(Parser.init);
     initMock.mockRejectedValueOnce(new Error('transient wasm init failure'));
 
-    const parser = new WebTreeSitterParser({ grammarsDir: '/fake-grammars' });
+    const parser = new WebTreeSitterParser({
+      grammarsDir: '/fake-grammars',
+      ensureParserInit: createParserInitMemo(),
+    });
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     const first = await parser.parse('typescript', 'const a = 1;');
@@ -165,7 +172,10 @@ describe('WebTreeSitterParser', () => {
   });
 
   it('RED: dispose() frees the cached parser and pending tree, and a later parse() call re-initializes cleanly rather than crashing', async () => {
-    const parser = new WebTreeSitterParser({ grammarsDir: '/fake-grammars' });
+    const parser = new WebTreeSitterParser({
+      grammarsDir: '/fake-grammars',
+      ensureParserInit: createParserInitMemo(),
+    });
 
     await parser.parse('typescript', 'const a = 1;');
     const cachedParser = trackedParsers[0];
