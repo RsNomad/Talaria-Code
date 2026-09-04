@@ -21,7 +21,7 @@ import {
   DEFAULT_LOCK_STALE_MS,
 } from './constants';
 import { sanitizeGitEnv } from './gitEnv';
-import { runGit, runGitBinary, type RunGitOptions } from './gitProcess';
+import { runGit, runGitBinary, type RunGitOptions, type GitSpawn } from './gitProcess';
 import { parseNameStatusZ, type CheckpointDiffEntry } from './nameStatus';
 import { missingObjects, type RunGit } from './objectClosure';
 import { acquireLock } from './shadowLock';
@@ -113,6 +113,14 @@ export interface CheckpointTrackerOptions {
    * real repo and a real-repo `gc --prune` could orphan them).
    */
   localizeDebounceMs?: number;
+  /**
+   * The `git` spawner every shadow-repo invocation this tracker makes goes
+   * through ({@link ./gitProcess.RunGitOptions.spawn}). Default = Node's real
+   * `spawn`; production never sets it. A test that must intercept a specific
+   * git call (a stalled `write-tree`, a failing `repack`, an overlap detector
+   * for `init`/`config`) injects it here — per instance, no module state.
+   */
+  spawn?: GitSpawn;
 }
 
 /** Result of {@link CheckpointTracker.restore}. */
@@ -249,6 +257,7 @@ export class CheckpointTracker {
   private readonly lockMaxWaitMs: number;
   private readonly gitTimeoutMs: number;
   private readonly localizeDebounceMs: number;
+  private readonly gitSpawn: GitSpawn | undefined;
 
   private readonly shadowDir: string;
   private readonly gitDir: string;
@@ -280,6 +289,7 @@ export class CheckpointTracker {
     this.lockMaxWaitMs = options.lockMaxWaitMs ?? DEFAULT_LOCK_MAX_WAIT_MS;
     this.gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
     this.localizeDebounceMs = options.localizeDebounceMs ?? DEFAULT_LOCALIZE_DEBOUNCE_MS;
+    this.gitSpawn = options.spawn;
 
     this.shadowDir = shadowDirFor(this.storageDir, this.workspaceRoot);
     this.gitDir = path.join(this.shadowDir, '.git');
@@ -1057,8 +1067,14 @@ export class CheckpointTracker {
     }
   }
 
+  /** The per-call spawner key for every `RunGitOptions` this tracker builds — omitted (never `undefined`) when none was injected. */
+  private spawnOpt(): Pick<RunGitOptions, 'spawn'> {
+    return this.gitSpawn !== undefined ? { spawn: this.gitSpawn } : {};
+  }
+
   private shadowOpts(input?: string): RunGitOptions {
     return {
+      ...this.spawnOpt(),
       cwd: this.workspaceRoot,
       env: sanitizeGitEnv(process.env, { GIT_DIR: this.gitDir, GIT_WORK_TREE: this.workspaceRoot }),
       ...(input !== undefined ? { input } : {}),
@@ -1159,7 +1175,7 @@ export class CheckpointTracker {
 
   private async preflightGitAvailable(): Promise<void> {
     try {
-      await runGit(['--version'], { cwd: this.storageDir, env: sanitizeGitEnv(process.env) });
+      await runGit(['--version'], { ...this.spawnOpt(), cwd: this.storageDir, env: sanitizeGitEnv(process.env) });
     } catch (err) {
       throw new GitUnavailableError(
         `git executable not found on PATH; checkpoints are disabled (${errCode(err)})`,
@@ -1179,12 +1195,14 @@ export class CheckpointTracker {
     let realGitDir: string | null = null;
     try {
       const isInside = await runGit(['rev-parse', '--is-inside-work-tree'], {
+        ...this.spawnOpt(),
         cwd: this.workspaceRoot,
         env: discoveryEnv,
         allowFailure: true,
       });
       if (isInside.code === 0 && isInside.stdout.trim() === 'true') {
         const commonDir = await runGit(['rev-parse', '--git-common-dir'], {
+          ...this.spawnOpt(),
           cwd: this.workspaceRoot,
           env: discoveryEnv,
         });

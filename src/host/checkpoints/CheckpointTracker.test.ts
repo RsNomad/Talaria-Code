@@ -7,7 +7,7 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CheckpointTracker, WorktreeScanTimeoutError } from './CheckpointTracker';
-import { GitTimeoutError, __setSpawnForTests } from './gitProcess';
+import { GitTimeoutError, type GitSpawn } from './gitProcess';
 import { acquireLock } from './shadowLock';
 import { must } from '../../testing/must';
 
@@ -18,6 +18,19 @@ class FakeGitChild extends EventEmitter {
   stdin = { on: (): void => undefined, write: (): void => undefined, end: (): void => undefined };
   kill = vi.fn((_signal?: NodeJS.Signals | number): boolean => true);
 }
+
+/**
+ * TST-02 (WS-TD): the spawner every tracker constructed inside a
+ * spawn-intercepting describe below is given (`spawn: testSpawn`). It
+ * delegates to whatever `currentSpawn` holds — the real `spawn` by default; a
+ * test installs its interceptor by ASSIGNING `currentSpawn`, and that
+ * describe's `afterEach` restores the real one. This is test-local state,
+ * scoped to this file: `gitProcess.ts` itself no longer has a module-level
+ * slot to reset.
+ */
+let currentSpawn: GitSpawn = realSpawn;
+const testSpawn: GitSpawn = ((command: string, args: string[], options: unknown) =>
+  currentSpawn(command as never, args as never, options as never)) as unknown as GitSpawn;
 
 /** Read the tracker's on-disk metadata index (`<shadow>/index.json`). */
 async function readDiskIndex(
@@ -199,14 +212,14 @@ describe('CheckpointTracker', () => {
 
   describe('init — AU-25/TD-3: cross-process shadow lock serializes creation', () => {
     afterEach(() => {
-      __setSpawnForTests(null);
+      currentSpawn = realSpawn;
     });
 
     it(
       'two concurrent init() calls on the same fresh root (simulating two windows cold-opening it) never both run git init/config — the loser double-checks under the lock and no-ops',
       async () => {
-        const trackerA = new CheckpointTracker(storageDir, workspaceRoot);
-        const trackerB = new CheckpointTracker(storageDir, workspaceRoot);
+        const trackerA = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
+        const trackerB = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
         // Sanity: both "windows" share the same on-disk shadow repo (same
         // storageDir+workspaceRoot hash) — the whole premise of the race.
         const gitDirPath = trackerA.shadowGitDir;
@@ -243,29 +256,27 @@ describe('CheckpointTracker', () => {
         const initCalls: string[] = [];
         let inFlight = 0;
         let overlapDetected = false;
-        __setSpawnForTests(
-          ((command: string, args: string[], options: unknown) => {
-            const cmd = Array.isArray(args) ? String(args[0]) : '';
-            if (cmd !== 'init' && cmd !== 'config') {
-              return realSpawn(command as never, args as never, options as never);
-            }
-            if (inFlight > 0) {
-              overlapDetected = true;
-              const fake = new FakeGitChild();
-              queueMicrotask(() => fake.emit('close', 128)); // git's own config.lock exit code
-              return fake;
-            }
-            initCalls.push(cmd);
-            inFlight++;
-            const child = realSpawn(command as never, args as never, options as never);
-            const clear = (): void => {
-              inFlight--;
-            };
-            child.once('close', clear);
-            child.once('error', clear);
-            return child;
-          }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-        );
+        currentSpawn = ((command: string, args: string[], options: unknown) => {
+          const cmd = Array.isArray(args) ? String(args[0]) : '';
+          if (cmd !== 'init' && cmd !== 'config') {
+            return realSpawn(command as never, args as never, options as never);
+          }
+          if (inFlight > 0) {
+            overlapDetected = true;
+            const fake = new FakeGitChild();
+            queueMicrotask(() => fake.emit('close', 128)); // git's own config.lock exit code
+            return fake;
+          }
+          initCalls.push(cmd);
+          inFlight++;
+          const child = realSpawn(command as never, args as never, options as never);
+          const clear = (): void => {
+            inFlight--;
+          };
+          child.once('close', clear);
+          child.once('error', clear);
+          return child;
+        }) as unknown as GitSpawn;
 
         try {
           await Promise.all([trackerA.init(), trackerB.init()]);
@@ -1097,14 +1108,14 @@ describe('CheckpointTracker', () => {
 
   describe('restore check-to-write TOCTOU (AU-14/TD-2)', () => {
     afterEach(() => {
-      __setSpawnForTests(null);
+      currentSpawn = realSpawn;
     });
 
     it(
       'fetches content via `git show` BEFORE the leaf symlink cleanup/write — no awaited subprocess remains inside the check-to-write window',
       async () => {
         await writeFile('keep.txt', 'keep');
-        const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+        const tracker = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
         await tracker.init();
         const ckpt1 = (await tracker.snapshot(1, 'first'))!;
 
@@ -1119,14 +1130,12 @@ describe('CheckpointTracker', () => {
           if (String(p) === leafPath) order.push('lstat-leaf');
           return realLstat(p as never, ...(rest as unknown as never[]));
         });
-        __setSpawnForTests(
-          ((command: string, args: string[], options: unknown) => {
-            if (Array.isArray(args) && args[0] === 'show' && String(args[1]).endsWith(':new.txt')) {
-              order.push('git-show');
-            }
-            return realSpawn(command as never, args as never, options as never);
-          }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-        );
+        currentSpawn = ((command: string, args: string[], options: unknown) => {
+          if (Array.isArray(args) && args[0] === 'show' && String(args[1]).endsWith(':new.txt')) {
+            order.push('git-show');
+          }
+          return realSpawn(command as never, args as never, options as never);
+        }) as unknown as GitSpawn;
 
         try {
           void ckpt1;
@@ -1188,7 +1197,7 @@ describe('CheckpointTracker', () => {
         const victim = path.join(outside, 'victim.txt');
         try {
           await writeFile('keep.txt', 'keep');
-          const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+          const tracker = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
           await tracker.init();
           const ckpt1 = (await tracker.snapshot(1, 'first'))!;
 
@@ -1197,18 +1206,16 @@ describe('CheckpointTracker', () => {
           await fs.rm(path.join(workspaceRoot, 'new.txt'), { force: true });
 
           let planted = false;
-          __setSpawnForTests(
-            ((command: string, args: string[], options: unknown) => {
-              if (!planted && Array.isArray(args) && args[0] === 'show' && String(args[1]).endsWith(':new.txt')) {
-                planted = true;
-                // Simulate a concurrent local actor planting a symlink at the
-                // restore leaf WHILE `git show` is in flight — exactly AU-14's
-                // check-to-write gap.
-                symlinkSync(victim, path.join(workspaceRoot, 'new.txt'), 'file');
-              }
-              return realSpawn(command as never, args as never, options as never);
-            }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-          );
+          currentSpawn = ((command: string, args: string[], options: unknown) => {
+            if (!planted && Array.isArray(args) && args[0] === 'show' && String(args[1]).endsWith(':new.txt')) {
+              planted = true;
+              // Simulate a concurrent local actor planting a symlink at the
+              // restore leaf WHILE `git show` is in flight — exactly AU-14's
+              // check-to-write gap.
+              symlinkSync(victim, path.join(workspaceRoot, 'new.txt'), 'file');
+            }
+            return realSpawn(command as never, args as never, options as never);
+          }) as unknown as GitSpawn;
 
           const res = await tracker.restore(ckpt2.id, { force: true });
           expect(res.restored).toBe(true);
@@ -1545,7 +1552,7 @@ describe('CheckpointTracker', () => {
 
   describe('object durability — auto-localization on the shortened debounce (I-2)', () => {
     afterEach(() => {
-      __setSpawnForTests(null);
+      currentSpawn = realSpawn;
     });
 
     it('auto-localizes a borrowing snapshot via the debounce (NO explicit flush) so it survives a real-repo prune', async () => {
@@ -1559,15 +1566,16 @@ describe('CheckpointTracker', () => {
 
       // Record every git spawn so we can observe the debounce auto-fire a repack.
       const gitCalls: string[][] = [];
-      __setSpawnForTests(
-        ((command: string, args: string[], options: unknown) => {
-          gitCalls.push([...args]);
-          return realSpawn(command as never, args as never, options as never);
-        }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-      );
+      currentSpawn = ((command: string, args: string[], options: unknown) => {
+        gitCalls.push([...args]);
+        return realSpawn(command as never, args as never, options as never);
+      }) as unknown as GitSpawn;
 
       // Short debounce so localization auto-fires quickly — the I-2 window shrink.
-      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { localizeDebounceMs: 30 });
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot, {
+        localizeDebounceMs: 30,
+        spawn: testSpawn,
+      });
       await tracker.init();
       expect(tracker.hasRealGitAlternates).toBe(true);
       const ckpt1 = (await tracker.snapshot(1, 'v1'))!;
@@ -1615,13 +1623,16 @@ describe('CheckpointTracker', () => {
 
   describe('wall-clock timeout on a stalled git (arch A#1 / C1-safe)', () => {
     afterEach(() => {
-      __setSpawnForTests(null);
+      currentSpawn = realSpawn;
     });
 
     it('rejects the snapshot when git stalls, leaving currentBaselineId uncorrupted', async () => {
       await writeFile('a.txt', 'A1');
       // Small git timeout so the stalled write-tree fails fast in the test.
-      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { gitTimeoutMs: 300 });
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot, {
+        gitTimeoutMs: 300,
+        spawn: testSpawn,
+      });
       await tracker.init();
       const ckpt1 = (await tracker.snapshot(1, 'first'))!; // real, succeeds
 
@@ -1631,14 +1642,12 @@ describe('CheckpointTracker', () => {
       // Make ONLY `write-tree` hang (all other git calls run for real). write-tree
       // is the step whose completion gates `currentBaselineId`, so a stall here is
       // the exact C1-safety case: the baseline must NOT move.
-      __setSpawnForTests(
-        ((command: string, args: string[], options: unknown) => {
-          if (Array.isArray(args) && args.includes('write-tree')) {
-            return new FakeGitChild();
-          }
-          return realSpawn(command as never, args as never, options as never);
-        }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-      );
+      currentSpawn = ((command: string, args: string[], options: unknown) => {
+        if (Array.isArray(args) && args.includes('write-tree')) {
+          return new FakeGitChild();
+        }
+        return realSpawn(command as never, args as never, options as never);
+      }) as unknown as GitSpawn;
 
       await writeFile('a.txt', 'A2-EDIT'); // give the (doomed) snapshot something to stage
       await expect(tracker.snapshot(2, 'second')).rejects.toBeInstanceOf(GitTimeoutError);
@@ -1657,7 +1666,7 @@ describe('CheckpointTracker', () => {
 
   describe('repack relocated OFF the snapshot barrier (corr-I1)', () => {
     afterEach(() => {
-      __setSpawnForTests(null);
+      currentSpawn = realSpawn;
     });
 
     it('does not run repack (or read-tree --empty) inside snapshot(); runs repack on flush', async () => {
@@ -1670,16 +1679,15 @@ describe('CheckpointTracker', () => {
       realGit(workspaceRoot, ['commit', '-q', '-m', 'seed']);
 
       const gitCalls: string[][] = [];
-      __setSpawnForTests(
-        ((command: string, args: string[], options: unknown) => {
-          gitCalls.push([...args]);
-          return realSpawn(command as never, args as never, options as never);
-        }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-      );
+      currentSpawn = ((command: string, args: string[], options: unknown) => {
+        gitCalls.push([...args]);
+        return realSpawn(command as never, args as never, options as never);
+      }) as unknown as GitSpawn;
 
       // Long debounce so the ONLY repack in this test is the explicit flush below.
       const tracker = new CheckpointTracker(storageDir, workspaceRoot, {
         localizeDebounceMs: 60_000,
+        spawn: testSpawn,
       });
       await tracker.init();
       expect(tracker.hasRealGitAlternates).toBe(true);
@@ -1785,7 +1793,7 @@ describe('CheckpointTracker', () => {
 
   describe('warm index keeps the captured tree exact (corr-I1)', () => {
     afterEach(() => {
-      __setSpawnForTests(null);
+      currentSpawn = realSpawn;
     });
 
     it('never runs read-tree --empty, yet captures add/modify/delete exactly across snapshots', async () => {
@@ -1793,14 +1801,12 @@ describe('CheckpointTracker', () => {
       await writeFile('drop.txt', 'D1');
 
       const gitCalls: string[][] = [];
-      __setSpawnForTests(
-        ((command: string, args: string[], options: unknown) => {
-          gitCalls.push([...args]);
-          return realSpawn(command as never, args as never, options as never);
-        }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-      );
+      currentSpawn = ((command: string, args: string[], options: unknown) => {
+        gitCalls.push([...args]);
+        return realSpawn(command as never, args as never, options as never);
+      }) as unknown as GitSpawn;
 
-      const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
       await tracker.init();
       const c1 = (await tracker.snapshot(1, 'first'))!; // {keep.txt, drop.txt}
 
@@ -1830,7 +1836,7 @@ describe('CheckpointTracker', () => {
     it('drops a file from the tree when it crosses the size cutoff out of the tracked set', async () => {
       // 1 MiB <= 2 MiB cutoff → captured in c1.
       await writeFile('payload.dat', Buffer.alloc(1 * 1024 * 1024, 0x41));
-      const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
       await tracker.init();
       const c1 = (await tracker.snapshot(1, 'v1'))!;
 
@@ -1984,16 +1990,14 @@ describe('CheckpointTracker', () => {
      */
     function installFakeGitChild(): { emitCloseAll: (code: number) => void } {
       const fakes: FakeGitChild[] = [];
-      __setSpawnForTests(
-        ((command: string, args: string[], options: unknown) => {
-          if (Array.isArray(args) && args.includes('write-tree')) {
-            const fake = new FakeGitChild();
-            fakes.push(fake);
-            return fake;
-          }
-          return realSpawn(command as never, args as never, options as never);
-        }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-      );
+      currentSpawn = ((command: string, args: string[], options: unknown) => {
+        if (Array.isArray(args) && args.includes('write-tree')) {
+          const fake = new FakeGitChild();
+          fakes.push(fake);
+          return fake;
+        }
+        return realSpawn(command as never, args as never, options as never);
+      }) as unknown as GitSpawn;
       return {
         emitCloseAll(code: number): void {
           for (const fake of fakes) fake.emit('close', code);
@@ -2013,13 +2017,16 @@ describe('CheckpointTracker', () => {
 
       // Large debounce so nothing auto-flushes localization on its own — only
       // an explicit dispose()/disposeAndFlush() determines durability here.
-      tracker = new CheckpointTracker(storageDir, workspaceRoot, { localizeDebounceMs: 60_000 });
+      tracker = new CheckpointTracker(storageDir, workspaceRoot, {
+        localizeDebounceMs: 60_000,
+        spawn: testSpawn,
+      });
       await tracker.init();
       expect(tracker.hasRealGitAlternates).toBe(true);
     });
 
     afterEach(() => {
-      __setSpawnForTests(null);
+      currentSpawn = realSpawn;
     });
 
     it('HAZARD PIN: timer-only dispose() + real-repo prune orphans a borrowing checkpoint', async () => {
@@ -2028,7 +2035,7 @@ describe('CheckpointTracker', () => {
       tracker.dispose(); // the OLD teardown — no flush
       // Make the borrowed blobs unreachable in the real repo, then prune hard.
       pruneRealRepoHard(workspaceRoot);
-      const fresh = new CheckpointTracker(storageDir, workspaceRoot);
+      const fresh = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
       const r = await fresh.restore(cp!.id, { force: true });
       expect(r.restored).toBe(false); // silent-rot made visible: closure pre-check refuses
       if (!r.restored) expect(r.reason).toMatch(/missing/);
@@ -2040,7 +2047,7 @@ describe('CheckpointTracker', () => {
       expect(cp).not.toBeNull();
       await expect(tracker.disposeAndFlush()).resolves.toBe('flushed');
       pruneRealRepoHard(workspaceRoot);
-      const fresh = new CheckpointTracker(storageDir, workspaceRoot);
+      const fresh = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
       const r = await fresh.restore(cp!.id, { force: true });
       expect(r.restored).toBe(true);
       fresh.dispose();
@@ -2113,7 +2120,7 @@ describe('CheckpointTracker', () => {
         // debounce timer could ever fire.
         pruneRealRepoHard(workspaceRoot);
 
-        const fresh = new CheckpointTracker(storageDir, workspaceRoot);
+        const fresh = new CheckpointTracker(storageDir, workspaceRoot, { spawn: testSpawn });
         const r = await fresh.restore(cp!.id, { force: true });
         // Pre-fix: the borrow was deferred to the cleared/re-armed timer, so
         // pruning orphans it and restore refuses (restored: false). Post-fix:
@@ -2134,19 +2141,17 @@ describe('CheckpointTracker', () => {
         // every other git call (including this test's own scaffolding) runs
         // for real. Same FakeGitChild + queueMicrotask(close) idiom already
         // used above (installFakeGitChild / the AU-25 lock-race describe).
-        __setSpawnForTests(
-          ((command: string, args: string[], options: unknown) => {
-            if (Array.isArray(args) && args[0] === 'repack') {
-              const fake = new FakeGitChild();
-              queueMicrotask(() => {
-                fake.stderr.emit('data', Buffer.from('fatal: simulated repack failure\n'));
-                fake.emit('close', 1);
-              });
-              return fake;
-            }
-            return realSpawn(command as never, args as never, options as never);
-          }) as unknown as Parameters<typeof __setSpawnForTests>[0],
-        );
+        currentSpawn = ((command: string, args: string[], options: unknown) => {
+          if (Array.isArray(args) && args[0] === 'repack') {
+            const fake = new FakeGitChild();
+            queueMicrotask(() => {
+              fake.stderr.emit('data', Buffer.from('fatal: simulated repack failure\n'));
+              fake.emit('close', 1);
+            });
+            return fake;
+          }
+          return realSpawn(command as never, args as never, options as never);
+        }) as unknown as GitSpawn;
 
         const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
         await expect(tracker.disposeAndFlush()).resolves.toBe('failed');

@@ -12,21 +12,15 @@ import { spawn } from 'node:child_process';
 import { DEFAULT_GIT_TIMEOUT_MS } from './constants';
 
 /**
- * The child-process spawner every runner uses. A module-level indirection so a
- * test can inject a fake `git` child (see {@link __setSpawnForTests}) — in
- * production this is always Node's real `spawn`.
+ * The child-process spawner {@link runGit}/{@link runGitBinary} use — Node's
+ * `spawn` signature exactly. Production never passes one (the default is
+ * Node's real `spawn`); a caller that needs to substitute the child (a test
+ * injecting a fake `git` that never emits `close`, to exercise the wall-clock
+ * timeout + SIGKILL path deterministically without a real hung subprocess)
+ * passes it PER CALL via {@link RunGitOptions.spawn}. There is no module-level
+ * mutable slot and no test-only reset (TST-02, purity-lock doctrine).
  */
-let spawnImpl: typeof spawn = spawn;
-
-/**
- * TEST SEAM — not for production use. Overrides the spawner so a test can inject
- * a fake `git` child (e.g. one that never emits `close`, to exercise the
- * wall-clock timeout + SIGKILL path deterministically without a real hung
- * subprocess). Pass `null` to restore the real `spawn`.
- */
-export function __setSpawnForTests(fn: typeof spawn | null): void {
-  spawnImpl = fn ?? spawn;
-}
+export type GitSpawn = typeof spawn;
 
 /**
  * Thin `git` subprocess runner used by {@link ./CheckpointTracker}.
@@ -75,6 +69,11 @@ export interface RunGitOptions {
    * (`gc`/`repack`) that runs OFF the turn's critical path.
    */
   timeoutMs?: number;
+  /**
+   * The spawner for THIS invocation. Defaults to Node's real `spawn`. See
+   * {@link GitSpawn} — injected per call, never through module state.
+   */
+  spawn?: GitSpawn;
 }
 
 export interface GitResult {
@@ -130,7 +129,7 @@ function spawnGitCollect(args: string[], options: RunGitOptions): Promise<RawGit
   return new Promise((resolve, reject) => {
     const cap = options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
     const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
-    const child = spawnImpl('git', args, { cwd: options.cwd, env: options.env });
+    const child = (options.spawn ?? spawn)('git', args, { cwd: options.cwd, env: options.env });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
