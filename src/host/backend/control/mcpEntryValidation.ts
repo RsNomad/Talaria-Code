@@ -46,6 +46,16 @@ const ARGS_MAX_COUNT = 64;
 const ENV_VALUE_MAX_LEN = 4096;
 const ENV_MAX_COUNT = 32;
 
+/** AU-59: cap on secret env NAMES per manual add (plaintext env allows 32; more than 8 secrets is not a real server shape). */
+const SECRET_ENV_MAX_COUNT = 8;
+/**
+ * AU-59: `save_env_value` (`hermes_cli/config.py`) SILENTLY strips non-ASCII
+ * and CR/LF before writing `.env` — a value carrying lookalike Unicode glyphs
+ * (a PDF/rich-text paste) would be persisted MANGLED and fail at first use.
+ * Refuse it client-side instead: printable ASCII (0x20–0x7E) only.
+ */
+const SECRET_VALUE_PATTERN = /^[\x20-\x7E]+$/;
+
 /**
  * S-4 (F-1 CONFIRMED, stricter than Hermes): mirrors
  * `mcp_security.py:33-45` (`_SHELL_INTERPRETERS`) exactly. A catalog/manual
@@ -80,10 +90,20 @@ function isShellInterpreter(command: string): boolean {
 // ---------------------------------------------------------------------------
 
 export type McpValidation =
-  | { ok: true; body: { name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> } }
+  | {
+      ok: true;
+      body: { name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> };
+      /**
+       * AU-59: the validated secret env NAMES (stdio; always `[]` for http) —
+       * a SIBLING of `body`, never inside it: `body` is the exact REST wire
+       * body `POST /api/mcp/servers` receives, and Hermes must never see this
+       * field.
+       */
+      secretEnvNames: string[];
+    }
   | { ok: false; reason: string };
 
-type Checked<T> = { ok: true; value: T } | { ok: false; reason: string };
+export type Checked<T> = { ok: true; value: T } | { ok: false; reason: string };
 
 function checkName(value: unknown): Checked<string> {
   if (typeof value !== 'string' || value === '.' || value === '..' || !NAME_PATTERN.test(value)) {
@@ -143,6 +163,88 @@ function checkEnv(value: unknown, allowedKeys?: ReadonlySet<string>): Checked<Re
   return { ok: true, value: out };
 }
 
+/**
+ * AU-59: NAMES only, same lenience on absence as {@link checkArgs}/{@link
+ * checkEnv} (an older caller that omits the field adds no secrets); same
+ * charset as a plaintext env KEY ({@link ENV_NAME_PATTERN}) because each name
+ * is ALSO written as a key into the server's `env` map (`env[name] =
+ * "${MCP_…}"`); DISJOINT from the plaintext keys (one key, one storage);
+ * capped. Hygiene: a name that fails the charset is NOT echoed in the reason
+ * (a VALUE pasted into the names box would otherwise reach the output log
+ * via `String(err)`) — only its 1-based position is.
+ */
+function checkSecretEnvNames(value: unknown, plaintextKeys: ReadonlySet<string>): Checked<string[]> {
+  if (value === undefined) return { ok: true, value: [] };
+  if (!Array.isArray(value)) return { ok: false, reason: 'secretEnvNames must be an array of strings.' };
+  const names: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') return { ok: false, reason: 'every secret env name must be a string.' };
+    const t = item.trim();
+    if (t.length === 0) continue; // drop blank lines
+    names.push(t);
+  }
+  if (names.length > SECRET_ENV_MAX_COUNT) {
+    return { ok: false, reason: `secretEnvNames must not have more than ${SECRET_ENV_MAX_COUNT} entries.` };
+  }
+  const seen = new Set<string>();
+  for (const [index, name] of names.entries()) {
+    if (!ENV_NAME_PATTERN.test(name)) {
+      return { ok: false, reason: `a secret env name must match ^[A-Z_][A-Z0-9_]{0,63}$ (entry ${index + 1}).` };
+    }
+    if (seen.has(name)) return { ok: false, reason: `duplicate secret env name "${name}".` };
+    seen.add(name);
+    if (plaintextKeys.has(name)) {
+      return { ok: false, reason: `"${name}" is listed both as a plain-text env key and as a secret env name — choose one.` };
+    }
+  }
+  return { ok: true, value: names };
+}
+
+/**
+ * AU-59: the `.env` key a manual add's secret lands under — Hermes' OWN
+ * namespacing idiom `_env_key_for_server` (`hermes_cli/mcp_config.py`:
+ * `MCP_<SUFFIX>_API_KEY`, suffix = `name.upper()` with every
+ * non-`[A-Za-z0-9_]` char → `_`, then stripped of leading/trailing `_`),
+ * generalized to `MCP_<SUFFIX>_<KEY>`. Namespacing is deliberate and differs
+ * from the catalog path, which saves a catalog entry's OWN declared var names
+ * (e.g. `N8N_KEY`) un-namespaced because the entry's config references them
+ * by exactly those names: a manual add has no spec, so an un-namespaced
+ * `GITHUB_TOKEN` would silently clobber the user's global one in
+ * `~/.hermes/.env`. By construction the result always matches Hermes'
+ * `_ENV_VAR_NAME_RE` (`^[A-Za-z_][A-Za-z0-9_]*$`) and, starting with `MCP_`,
+ * can never equal a `_ENV_VAR_NAME_DENYLIST` entry (`hermes_cli/config.py`).
+ * (`serverName` is `NAME_PATTERN`-validated ASCII, so `toUpperCase` is safe.)
+ */
+export function secretEnvKeyFor(serverName: string, secretName: string): string {
+  const suffix = serverName
+    .toUpperCase()
+    .replace(/[^A-Z0-9_]/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return `MCP_${suffix}_${secretName}`;
+}
+
+/** AU-59: the `${KEY}` reference written into config.yaml — matches {@link ENV_REFERENCE_PATTERN} by construction (round-trip pinned in the tests). */
+export function envReference(key: string): string {
+  return '${' + key + '}';
+}
+
+/**
+ * AU-59: the client-side gate `mcpAdd` applies to a prompted secret VALUE
+ * before `PUT /api/env` ({@link SECRET_VALUE_PATTERN}, same 4096 cap as a
+ * plaintext env value). The refusal says NOTHING about the value.
+ */
+export function checkSecretValue(value: string): Checked<string> {
+  if (value.length > ENV_VALUE_MAX_LEN) return { ok: false, reason: `secret value exceeds ${ENV_VALUE_MAX_LEN} characters.` };
+  if (!SECRET_VALUE_PATTERN.test(value)) {
+    return {
+      ok: false,
+      reason:
+        'secret value must be printable ASCII (Hermes silently strips anything else — re-copy the key from the provider, not from a PDF or rich-text source).',
+    };
+  }
+  return { ok: true, value };
+}
+
 function shellRefusal(command: string): { ok: false; reason: string } {
   return { ok: false, reason: `Refusing "${command}": shell interpreters are not allowed as MCP server commands.` };
 }
@@ -155,10 +257,21 @@ function validateStdio(name: string, params: Record<string, unknown>): McpValida
   if (!argsCheck.ok) return argsCheck;
   const envCheck = checkEnv(params.env);
   if (!envCheck.ok) return envCheck;
-  return { ok: true, body: { name, command: commandCheck.value, args: argsCheck.value, env: envCheck.value } };
+  const secretCheck = checkSecretEnvNames(params.secretEnvNames, new Set(Object.keys(envCheck.value)));
+  if (!secretCheck.ok) return secretCheck;
+  return {
+    ok: true,
+    body: { name, command: commandCheck.value, args: argsCheck.value, env: envCheck.value },
+    secretEnvNames: secretCheck.value,
+  };
 }
 
 function validateHttp(name: string, params: Record<string, unknown>): McpValidation {
+  // AU-59: a remote server has no subprocess env — anything but an absent or
+  // empty `secretEnvNames` is a crafted payload; refuse rather than drop it.
+  if (params.secretEnvNames !== undefined && !(Array.isArray(params.secretEnvNames) && params.secretEnvNames.length === 0)) {
+    return { ok: false, reason: 'secretEnvNames is only accepted for stdio servers.' };
+  }
   if (typeof params.url !== 'string') return { ok: false, reason: 'url must be a string.' };
   let parsed: URL;
   try {
@@ -173,7 +286,7 @@ function validateHttp(name: string, params: Record<string, unknown>): McpValidat
   if (parsed.username.length > 0 || parsed.password.length > 0) {
     return { ok: false, reason: 'url must not contain userinfo.' };
   }
-  return { ok: true, body: { name, url: params.url } };
+  return { ok: true, body: { name, url: params.url }, secretEnvNames: [] };
 }
 
 export function validateMcpAdd(params: unknown): McpValidation {
@@ -275,6 +388,22 @@ function referenceEnvLines(references: readonly string[]): string[] {
   return [REFERENCE_ENV_LINE_PREFIX + references.join(', ')];
 }
 
+/**
+ * AU-59 (CF-13 parity): FUTURE-TENSE, names only — the same binding as
+ * {@link catalogCredentialLine}: nothing has been collected at describe-time
+ * (the masked prompts run AFTER consent), so the line says what WILL be asked
+ * and exactly where each value persists. `undefined` when there is nothing to
+ * prompt for — no false disclosure.
+ */
+function secretEnvLine(serverName: string, names: readonly string[]): string | undefined {
+  if (names.length === 0) return undefined;
+  const keys = names.map((n) => secretEnvKeyFor(serverName, n));
+  return (
+    `Will prompt for: ${names.join(', ')} — saved to Hermes' .env store (~/.hermes/.env) as ${keys.join(', ')}; ` +
+    'config.yaml gets only the ${KEY} reference, never the value.'
+  );
+}
+
 type ModalDescription = { ok: true; message: string; detail: string } | { ok: false; reason: string };
 
 function composeModal(message: string, lines: string[]): ModalDescription {
@@ -304,6 +433,8 @@ export function describeAddForModal(p: McpAddParams): ModalDescription {
     const { plaintext, references } = partitionEnvKeys(p.env);
     lines.push(...plaintextEnvLines(plaintext));
     lines.push(...referenceEnvLines(references));
+    const secretLine = secretEnvLine(p.name, p.secretEnvNames);
+    if (secretLine !== undefined) lines.push(secretLine);
     lines.push(RUNS_ON_MACHINE_LINE);
     lines.push(RELOAD_LINE);
   } else {

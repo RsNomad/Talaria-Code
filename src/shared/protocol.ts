@@ -296,9 +296,28 @@ export interface McpData {
   servers: McpServer[];
 }
 
-/** `mcp.add` params — discriminated on `transport` (§4.2). */
+/**
+ * `mcp.add` params — discriminated on `transport` (§4.2).
+ *
+ * AU-59 (CF-13 parity for the manual add): `secretEnvNames` carries env var
+ * NAMES ONLY — never a value. The host prompts for each value itself, masked
+ * (`ControlDispatcherHostPort.promptSecret`), AFTER the consent modal, stores
+ * it in Hermes' `~/.hermes/.env` under `MCP_<NAME>_<KEY>` (`PUT /api/env`) and
+ * writes only the `${MCP_<NAME>_<KEY>}` reference into config.yaml
+ * (`McpAdminHandler.mcpAdd`). `env` stays the PLAINTEXT map (values land
+ * literally in config.yaml). The two key sets must be disjoint
+ * (`validateMcpAdd`). Absent from the `http` variant — a remote server has no
+ * subprocess env.
+ */
 export type McpAddParams =
-  | { name: string; transport: 'stdio'; command: string; args: string[]; env: Record<string, string> }
+  | {
+      name: string;
+      transport: 'stdio';
+      command: string;
+      args: string[];
+      env: Record<string, string>;
+      secretEnvNames: string[];
+    }
   | { name: string; transport: 'http'; url: string };
 
 /** `transport` is threaded from the VALIDATED McpAddParams discriminant (the request's own

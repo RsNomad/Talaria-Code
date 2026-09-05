@@ -236,8 +236,14 @@ export class McpAdminHandler {
     if (!validated.ok) {
       throw new Error(validated.reason);
     }
+    // AU-59 Task 3 INTERIM (removed by Task 5): the names are validated but the
+    // env-store sequence does not exist yet — fail CLOSED before any modal or
+    // network call rather than add the server without its secrets.
+    if (validated.secretEnvNames.length > 0) {
+      throw new Error(SECRET_ENV_NOT_WIRED_MESSAGE);
+    }
     const transport = extractValidatedAddTransport(params);
-    const described = describeAddForModal(toMcpAddParams(validated.body, transport));
+    const described = describeAddForModal(toMcpAddParams(validated.body, transport, validated.secretEnvNames));
     if (!described.ok) {
       throw new Error(described.reason);
     }
@@ -509,10 +515,11 @@ function extractValidatedAddTransport(params: unknown): 'stdio' | 'http' {
 function toMcpAddParams(
   body: { name: string; url?: string; command?: string; args?: string[]; env?: Record<string, string> },
   transport: 'stdio' | 'http',
+  secretEnvNames: string[],
 ): McpAddParams {
   return transport === 'http'
     ? { name: body.name, transport: 'http', url: body.url ?? '' }
-    : { name: body.name, transport: 'stdio', command: body.command ?? '', args: body.args ?? [], env: body.env ?? {} };
+    : { name: body.name, transport: 'stdio', command: body.command ?? '', args: body.args ?? [], env: body.env ?? {}, secretEnvNames };
 }
 
 /**
@@ -521,6 +528,10 @@ function toMcpAddParams(
  */
 const MCP_RELOAD_DIVERGENCE_MESSAGE =
   'The MCP configuration was saved, but reloading the running Hermes server failed — reload the window or restart Hermes to apply the change.';
+
+/** AU-59 Task 3 INTERIM (removed by Task 5). */
+const SECRET_ENV_NOT_WIRED_MESSAGE =
+  'Refusing: secret env for a manual add is validated but not yet stored by this build — nothing was saved.';
 
 const CATALOG_POLL_CAP_MS = 180_000;
 

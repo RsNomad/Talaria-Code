@@ -400,6 +400,8 @@ function AddServerDisclosure({
         command: trimmedCommand,
         args: parseArgsLines(argsText),
         env: envResult.env,
+        // AU-59: wired to the Secret env field by Task 6; an explicit empty list until then.
+        secretEnvNames: [],
       };
     } else {
       const trimmedUrl = url.trim();
