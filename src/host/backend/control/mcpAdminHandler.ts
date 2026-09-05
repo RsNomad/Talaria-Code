@@ -7,7 +7,7 @@ import type {
   McpTestResult,
   DataPanel,
 } from '../../../shared/protocol';
-import type { DashboardAdminClient } from '../../dashboard/HermesDashboardClient';
+import type { DashboardAdminClient, DashboardEnvRow } from '../../dashboard/HermesDashboardClient';
 import { hasToggleNameCache } from '../../dashboard/dashboardPanelSources';
 import {
   validateMcpAdd,
@@ -17,10 +17,14 @@ import {
   describeCatalogForModal,
   extractMcpEnabled,
   RELOAD_LINE,
+  secretEnvKeyFor,
+  envReference,
+  checkSecretValue,
 } from './mcpEntryValidation';
 import type { ConfigWriteTail } from './configWriteTail';
 import { runAdminOp, resolveDashboardAdminClient, pollActionUntilVerified, TRUST_GATED_METHODS, POLL_UNCONFIRMED_MESSAGE } from './adminOpRunner';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
+import { isRecord } from '../../../shared/typeGuards';
 
 /** The 7 MCP admin methods {@link ControlDispatcher.handleMcpAdmin} routes (A5: add/remove/setEnabled/test/auth; A6: catalog/catalogInstall). */
 export type McpAdminMethod = 'mcp.add' | 'mcp.remove' | 'mcp.setEnabled' | 'mcp.test' | 'mcp.auth' | 'mcp.catalog' | 'mcp.catalogInstall';
@@ -230,17 +234,21 @@ export class McpAdminHandler {
    * panel refetch -> `{ok:true, name, transport}` (`transport` is the
    * VALIDATED discriminant — see the `McpAddResult` doc, protocol.ts). `env`
    * VALUES pass through `validated.body` exactly once and are never logged.
+   *
+   * AU-59 (CF-13 parity for the manual add, ADR-023): when the validated
+   * params carry `secretEnvNames`, the values are collected HERE, host-side
+   * and masked ({@link McpAdminPort.promptSecret}), ONLY after consent — a
+   * dismissed/blank/non-ASCII answer for ANY name declines the WHOLE add
+   * before any network call ({@link collectSecretEnv}). Then
+   * {@link addWithSecretEnv} runs the CONFIG-FIRST, fail-closed sequence.
+   * Still rides `ConfigWriteTail` unchanged: the consent modal already holds
+   * the tail while the user reads; the secret prompts extend that same held
+   * window (no new class of blocking). The result shape is unchanged.
    */
   private async mcpAdd(client: DashboardAdminClient, params: unknown): Promise<McpAddResult> {
     const validated = validateMcpAdd(params);
     if (!validated.ok) {
       throw new Error(validated.reason);
-    }
-    // AU-59 Task 3 INTERIM (removed by Task 5): the names are validated but the
-    // env-store sequence does not exist yet — fail CLOSED before any modal or
-    // network call rather than add the server without its secrets.
-    if (validated.secretEnvNames.length > 0) {
-      throw new Error(SECRET_ENV_NOT_WIRED_MESSAGE);
     }
     const transport = extractValidatedAddTransport(params);
     const described = describeAddForModal(toMcpAddParams(validated.body, transport, validated.secretEnvNames));
@@ -251,9 +259,113 @@ export class McpAdminHandler {
     if (!confirmed) {
       throw new Error(`Adding MCP server "${validated.body.name}" was declined or cancelled.`);
     }
-    await client.addMcpServer(validated.body);
+    const secrets = await this.collectSecretEnv(validated.body.name, validated.secretEnvNames);
+    if (secrets.length === 0) {
+      await client.addMcpServer(validated.body);
+    } else {
+      await this.addWithSecretEnv(client, validated.body, secrets);
+    }
     await this.reloadMcpAndRefetch();
     return { ok: true, name: validated.body.name, transport };
+  }
+
+  /**
+   * AU-59: the masked prompt loop — mirrors {@link mcpCatalogInstall}'s
+   * (consent first; dismiss or blank = decline the WHOLE add) plus the
+   * client-side value gate ({@link checkSecretValue}: `save_env_value`
+   * silently strips non-ASCII, so a lookalike-glyph paste would persist
+   * MANGLED — refuse it before anything is written). The prompt text carries
+   * only the server name (NAME_PATTERN-safe) and env/.env key names, so it
+   * needs no control-byte strip. Returns the values ONLY to the caller's
+   * stack — nothing is stored on `this`.
+   */
+  private async collectSecretEnv(serverName: string, names: readonly string[]): Promise<CollectedSecret[]> {
+    const collected: CollectedSecret[] = [];
+    for (const name of names) {
+      const key = secretEnvKeyFor(serverName, name);
+      const value = await this.port.promptSecret(`"${serverName}": value for ${name} (saved to ~/.hermes/.env as ${key})`);
+      if (value === undefined || value === '') {
+        throw new Error(`Adding MCP server "${serverName}" was declined or cancelled.`);
+      }
+      const checked = checkSecretValue(value);
+      if (!checked.ok) {
+        throw new Error(`Refusing the value for ${name}: ${checked.reason} Nothing was saved.`);
+      }
+      collected.push({ name, key, value: checked.value });
+    }
+    return collected;
+  }
+
+  /**
+   * AU-59 (ADR-023) — CONFIG-FIRST, fail-closed:
+   *  (1) `POST /api/mcp/servers` with `env = plaintext ∪ { name: "${key}" }`
+   *      — the secret literal NEVER enters config.yaml, only the reference.
+   *      Every Hermes-side refusal that can fire on an add (409 name exists,
+   *      400 `validate_mcp_server_entry` IOC/shape) fires HERE, before any
+   *      secret is written anywhere.
+   *  (2) `PUT /api/env` per secret under `MCP_<NAME>_<KEY>`.
+   *  (3) Layer 6: `GET /api/env` must list EVERY key `is_set:true` —
+   *      managed/container mode answers (2) with `{ok:true}` while writing
+   *      nothing (`save_env_value` → `is_managed()` early return).
+   *  On ANY failure in (2)/(3): {@link compensateSecretAdd} — `DELETE
+   *  /api/env` for every key already written (secret residue first), then
+   *  `DELETE /api/mcp/servers/{name}` — so nothing half-registered and no
+   *  secret persisted remains; the thrown message names keys only, the
+   *  underlying cause goes to the output channel. The reverse order (env
+   *  first) was rejected: a 409 on the POST would then already have
+   *  overwritten a same-named `.env` key, and a crash between the steps would
+   *  leave the SECRET as the residue rather than a secret-free `${…}`
+   *  reference.
+   */
+  private async addWithSecretEnv(
+    client: DashboardAdminClient,
+    body: { name: string; command?: string; args?: string[]; env?: Record<string, string> },
+    secrets: readonly CollectedSecret[],
+  ): Promise<void> {
+    const env: Record<string, string> = { ...(body.env ?? {}) };
+    for (const s of secrets) env[s.name] = envReference(s.key);
+    await client.addMcpServer({ ...body, env });
+
+    const written: string[] = [];
+    try {
+      for (const s of secrets) {
+        await client.setEnvVar(s.key, s.value);
+        written.push(s.key);
+      }
+      const rows = await client.listEnvKeys();
+      const missing = secrets.map((s) => s.key).filter((key) => !isEnvKeySet(rows, key));
+      if (missing.length > 0) {
+        throw new SecretEnvNotPersistedError(missing);
+      }
+    } catch (err) {
+      this.port.logger?.append(`[AcpBackend] mcp.add "${body.name}": secret env step failed — rolling back: ${errorMessage(err)}`);
+      const serverRemoved = await this.compensateSecretAdd(client, body.name, written);
+      throw new Error(secretAddRollbackMessage(body.name, err, serverRemoved));
+    }
+  }
+
+  /**
+   * AU-59 compensation — best-effort, log-only per step, keys only. Removes
+   * the secret residue FIRST (the `.env` keys already written), then the
+   * server entry. Returns whether the entry came out; a leftover entry holds
+   * only `${…}` references (no secret), so the caller discloses it and the
+   * user removes it from the panel.
+   */
+  private async compensateSecretAdd(client: DashboardAdminClient, name: string, written: readonly string[]): Promise<boolean> {
+    for (const key of written) {
+      try {
+        await client.removeEnvVar(key);
+      } catch (err) {
+        this.port.logger?.append(`[AcpBackend] mcp.add "${name}" rollback: could not remove .env key ${key}: ${errorMessage(err)}`);
+      }
+    }
+    try {
+      await client.removeMcpServer(name);
+      return true;
+    } catch (err) {
+      this.port.logger?.append(`[AcpBackend] mcp.add "${name}" rollback: could not remove the server entry: ${errorMessage(err)}`);
+      return false;
+    }
   }
 
   /** Task A5 (§4.5 item 5): confirm -> `removeMcpServer` -> reload -> refetch. */
@@ -529,9 +641,39 @@ function toMcpAddParams(
 const MCP_RELOAD_DIVERGENCE_MESSAGE =
   'The MCP configuration was saved, but reloading the running Hermes server failed — reload the window or restart Hermes to apply the change.';
 
-/** AU-59 Task 3 INTERIM (removed by Task 5). */
-const SECRET_ENV_NOT_WIRED_MESSAGE =
-  'Refusing: secret env for a manual add is validated but not yet stored by this build — nothing was saved.';
+/**
+ * AU-59: one collected secret — lives ONLY in `mcpAdd`'s call stack (never on
+ * the handler instance, never logged, never in a thrown message). `key` is the
+ * namespaced `.env` key; `name` the server-env key the `${key}` reference is
+ * written under.
+ */
+interface CollectedSecret {
+  name: string;
+  key: string;
+  value: string;
+}
+
+/** AU-59: Layer-6 read of a `GET /api/env` row — fail-closed on any non-row shape (a rogue/odd body counts as "not set"). */
+function isEnvKeySet(rows: Record<string, DashboardEnvRow>, key: string): boolean {
+  const row: unknown = isRecord(rows) ? rows[key] : undefined;
+  return isRecord(row) && row.is_set === true;
+}
+
+/** AU-59: Layer 6 found a key Hermes claimed to have saved absent from `.env` (managed/container mode's `{ok:true}` no-op). Keys only. */
+class SecretEnvNotPersistedError extends Error {
+  constructor(readonly missing: readonly string[]) {
+    super(`Hermes answered ok but ~/.hermes/.env does not contain ${missing.join(', ')} (managed/container mode?)`);
+  }
+}
+
+/** AU-59: the user-facing rollback message — keys only; a transport cause is routed to the output log, never quoted here. */
+function secretAddRollbackMessage(name: string, err: unknown, serverRemoved: boolean): string {
+  const cause = err instanceof SecretEnvNotPersistedError ? err.message : 'Hermes did not store its secret env — see the Talaria output log';
+  const tail = serverRemoved
+    ? 'Nothing was saved.'
+    : `The server entry "${name}" could NOT be removed automatically — remove it from the MCP panel (it holds only ` + '${…} references, no secret).';
+  return `Adding MCP server "${name}" was rolled back: ${cause}. ${tail}`;
+}
 
 const CATALOG_POLL_CAP_MS = 180_000;
 
