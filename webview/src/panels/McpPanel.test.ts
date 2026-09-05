@@ -15,6 +15,7 @@ import {
   testNotice,
   catalogRowBadges,
   authNotice,
+  parseSecretNameLines,
 } from './McpPanel';
 
 describe('McpPanel status lookup (UI-I1)', () => {
@@ -89,4 +90,15 @@ describe('McpPanel Catalog + Login helpers (A8)', () => {
     expect(result.tone).toBe('error');
     expect(result.text).toBe(cancelText);
   });
+});
+
+/* AU-59: the Secret env field parses NAMES only — one per line, trimmed,
+ * blanks dropped. A value is never typed into the webview; the host prompts
+ * for it, masked, after consent. Pure, no jsdom (this file's style). */
+describe('McpPanel Secret env helper (AU-59)', () => {
+  it('parseSecretNameLines: one NAME per line, trimmed, blanks dropped', () =>
+    expect(parseSecretNameLines(' GITHUB_TOKEN \n\n OPENAI_API_KEY \n')).toEqual(['GITHUB_TOKEN', 'OPENAI_API_KEY']));
+
+  it('parseSecretNameLines: empty text → no names (an add without secrets is the unchanged path)', () =>
+    expect(parseSecretNameLines('')).toEqual([]));
 });

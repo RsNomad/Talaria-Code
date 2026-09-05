@@ -18,6 +18,7 @@ import { describe, it, expect } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type {
+  McpAddParams,
   McpAddResult,
   McpCatalogData,
   McpCatalogEntry,
@@ -26,7 +27,7 @@ import type {
   McpData,
   McpTestResult,
 } from '../protocol';
-import { McpPanel, ENV_PLACEHOLDER, ENV_PLAINTEXT_HINT } from './McpPanel';
+import { McpPanel, ENV_PLACEHOLDER, ENV_PLAINTEXT_HINT, SECRET_ENV_HINT } from './McpPanel';
 import { must } from '../testing/must';
 
 function mcpData(): McpData {
@@ -201,8 +202,13 @@ describe('A7: MCP panel row actions + Add server form', () => {
       />,
     );
     await user.click(screen.getByRole('button', { name: /Add server/i }));
-    await user.type(screen.getByLabelText(/Name/i), 'gh');
-    await user.type(screen.getByLabelText(/Command/i), 'npx');
+    // AU-59 drift note: the new "Secret env (names only, one per line)" label
+    // contains "name" as a substring of "names" — the old /Name/i regex query
+    // (a substring test, not anchored) now matches BOTH fields. Switched to
+    // the file's own exact-string idiom (already used at Name/Command below in
+    // the Task 16 + AU-59 tests) — same field, unambiguous match.
+    await user.type(screen.getByLabelText('Name'), 'gh');
+    await user.type(screen.getByLabelText('Command'), 'npx');
     await user.click(screen.getByRole('button', { name: /^Add$/i }));
     await waitFor(() => expect(added).toHaveLength(1));
     await waitFor(() => expect(tested).toEqual(['gh']));
@@ -580,5 +586,114 @@ describe('AU-59 D-lite: the plaintext Env field discloses where its values land'
     expect(args).not.toHaveAttribute('aria-describedby');
     expect(args).not.toHaveAttribute('autocomplete');
     expect(args).not.toHaveAttribute('spellcheck');
+  });
+});
+
+/* AU-59 (D-full): the Secret env field. Names only — the value is never
+ * collected in this form; the HOST prompts for it (masked) after the consent
+ * modal. Pins: the wire shape (names ride `secretEnvNames`, values nowhere),
+ * the local disjointness check keyed to THIS field, the caption/hygiene
+ * attributes, the http variant carrying no such key, and the reset. */
+describe('AU-59: Secret env (names only) field on the Add-server form', () => {
+  function renderAdd(added: McpAddParams[]) {
+    render(
+      <McpPanel
+        data={mcpData()}
+        onReload={async () => ({ status: 'reloaded' })}
+        {...noopMcpAdminProps()}
+        onAdd={async (p) => {
+          added.push(p);
+          return { ok: true, name: p.name, transport: p.transport };
+        }}
+      />,
+    );
+  }
+
+  it('submits secretEnvNames (names only) alongside the plaintext env; no textbox on the form ever takes the VALUE', async () => {
+    const user = userEvent.setup();
+    const added: McpAddParams[] = [];
+    renderAdd(added);
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    // Name, Command, Args, Env, Secret env — and nothing else; none is a password box.
+    expect(screen.getAllByRole('textbox')).toHaveLength(5);
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+
+    await user.type(screen.getByLabelText('Name'), 'gh');
+    await user.type(screen.getByLabelText('Command'), 'npx');
+    await user.type(screen.getByLabelText('Env (KEY=VALUE per line)'), 'LOG_LEVEL=info');
+    await user.type(screen.getByLabelText('Secret env (names only, one per line)'), 'GITHUB_TOKEN');
+    await user.click(screen.getByRole('button', { name: /^Add$/i }));
+
+    await waitFor(() =>
+      expect(added).toEqual([
+        { name: 'gh', transport: 'stdio', command: 'npx', args: [], env: { LOG_LEVEL: 'info' }, secretEnvNames: ['GITHUB_TOKEN'] },
+      ]),
+    );
+  });
+
+  it('a name listed in BOTH Env and Secret env is refused locally, keyed to the Secret env field (the host refuses it too)', async () => {
+    const user = userEvent.setup();
+    const added: McpAddParams[] = [];
+    renderAdd(added);
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    await user.type(screen.getByLabelText('Name'), 'gh');
+    await user.type(screen.getByLabelText('Command'), 'npx');
+    await user.type(screen.getByLabelText('Env (KEY=VALUE per line)'), 'GITHUB_TOKEN=x');
+    await user.type(screen.getByLabelText('Secret env (names only, one per line)'), 'GITHUB_TOKEN');
+    await user.click(screen.getByRole('button', { name: /^Add$/i }));
+
+    const secret = screen.getByLabelText('Secret env (names only, one per line)');
+    expect(secret).toHaveAttribute('aria-invalid', 'true');
+    const texts = must(secret.getAttribute('aria-describedby'))
+      .split(' ')
+      .map((id) => must(document.getElementById(id)).textContent ?? '');
+    expect(texts).toContain('"GITHUB_TOKEN" is listed both as Env and as Secret env.');
+    expect(screen.getByLabelText('Env (KEY=VALUE per line)')).not.toHaveAttribute('aria-invalid');
+    expect(added).toHaveLength(0);
+  });
+
+  it('the Secret env field carries its caption (aria-describedby), browser assist off, and a names-only placeholder', async () => {
+    const user = userEvent.setup();
+    renderAdd([]);
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    const secret = screen.getByLabelText('Secret env (names only, one per line)');
+    expect(secret).toHaveAttribute('autocomplete', 'off');
+    expect(secret).toHaveAttribute('spellcheck', 'false');
+    expect(secret).toHaveAttribute('placeholder', 'GITHUB_TOKEN');
+    const captions = must(secret.getAttribute('aria-describedby'))
+      .split(' ')
+      .map((id) => must(document.getElementById(id)).textContent ?? '')
+      .join('\n');
+    expect(captions).toContain(SECRET_ENV_HINT);
+    expect(SECRET_ENV_HINT).toContain('MCP_<NAME>_<KEY>');
+  });
+
+  it('HTTP transport sends NO secretEnvNames key at all (the http variant has no subprocess env)', async () => {
+    const user = userEvent.setup();
+    const added: McpAddParams[] = [];
+    renderAdd(added);
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    await user.type(screen.getByLabelText('Name'), 'remote');
+    await user.click(screen.getByLabelText('HTTP'));
+    await user.type(screen.getByLabelText('URL'), 'https://x.example/mcp');
+    await user.click(screen.getByRole('button', { name: /^Add$/i }));
+    await waitFor(() => expect(added).toHaveLength(1));
+    expect(added[0]).toEqual({ name: 'remote', transport: 'http', url: 'https://x.example/mcp' });
+    expect(added[0] !== undefined && 'secretEnvNames' in added[0]).toBe(false);
+  });
+
+  it('a successful add clears the Secret env text (resetFields), same as Env', async () => {
+    const user = userEvent.setup();
+    const added: McpAddParams[] = [];
+    renderAdd(added);
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    await user.type(screen.getByLabelText('Name'), 'gh');
+    await user.type(screen.getByLabelText('Command'), 'npx');
+    await user.type(screen.getByLabelText('Secret env (names only, one per line)'), 'GITHUB_TOKEN');
+    await user.click(screen.getByRole('button', { name: /^Add$/i }));
+    await waitFor(() => expect(added).toHaveLength(1));
+    // The disclosure closed on success; re-open and the field is empty.
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    expect(screen.getByLabelText('Secret env (names only, one per line)')).toHaveValue('');
   });
 });

@@ -207,6 +207,21 @@ export const ENV_PLAINTEXT_HINT =
  */
 export const ENV_PLACEHOLDER = 'LOG_LEVEL=info\nGITHUB_TOKEN=${GITHUB_TOKEN}';
 
+/**
+ * AU-59: one secret env NAME per line — the same "one token per line" grammar
+ * as {@link parseArgsLines} (trimmed, blanks dropped), kept as its own export
+ * because the two fields mean different things. Names only: the VALUE is
+ * never typed into the webview; the host prompts for it (masked) after the
+ * consent modal and stores it in Hermes' `.env` (`McpAdminHandler.mcpAdd`).
+ */
+export function parseSecretNameLines(text: string): string[] {
+  return parseArgsLines(text);
+}
+
+/** AU-59: the Secret env field's caption — what will be asked, where it lands, and what config.yaml gets instead. */
+export const SECRET_ENV_HINT =
+  "Names only. You'll be prompted for each value (masked) after confirming; it's saved to ~/.hermes/.env as MCP_<NAME>_<KEY> and config.yaml gets only the ${KEY} reference.";
+
 /** Task A7: the `SetupPanel.tsx:457-486` label+input TextField pattern, copied
  *  locally (no shared component exists to import — same posture as this
  *  file's own plain `<button>`s).
@@ -353,6 +368,7 @@ function AddServerDisclosure({
   const [command, setCommand] = useState('');
   const [argsText, setArgsText] = useState('');
   const [envText, setEnvText] = useState('');
+  const [secretEnvText, setSecretEnvText] = useState('');
   const [url, setUrl] = useState('');
   const [adding, setAdding] = useState(false);
   // Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): field-keyed (was a flat `string`) so
@@ -361,7 +377,7 @@ function AddServerDisclosure({
   // covers the onAdd-rejection case, which has no field of its own to attach
   // to and renders in the same spot the old flat string used to.
   const [error, setError] = useState<
-    { field: 'name' | 'command' | 'env' | 'url' | 'submit'; text: string } | undefined
+    { field: 'name' | 'command' | 'env' | 'secretEnv' | 'url' | 'submit'; text: string } | undefined
   >();
 
   const resetFields = () => {
@@ -369,6 +385,7 @@ function AddServerDisclosure({
     setCommand('');
     setArgsText('');
     setEnvText('');
+    setSecretEnvText('');
     setUrl('');
   };
 
@@ -394,14 +411,23 @@ function AddServerDisclosure({
         setError({ field: 'env', text: envResult.error });
         return;
       }
+      // AU-59: names only. The host re-checks disjointness (`validateMcpAdd`);
+      // this local check just keys the SAME refusal to the field the user can
+      // fix. `Object.hasOwn` — a typed name like `constructor` must not match
+      // the prototype.
+      const secretEnvNames = parseSecretNameLines(secretEnvText);
+      const overlap = secretEnvNames.find((n) => Object.hasOwn(envResult.env, n));
+      if (overlap !== undefined) {
+        setError({ field: 'secretEnv', text: `"${overlap}" is listed both as Env and as Secret env.` });
+        return;
+      }
       params = {
         name: trimmedName,
         transport: 'stdio',
         command: trimmedCommand,
         args: parseArgsLines(argsText),
         env: envResult.env,
-        // AU-59: wired to the Secret env field by Task 6; an explicit empty list until then.
-        secretEnvNames: [],
+        secretEnvNames,
       };
     } else {
       const trimmedUrl = url.trim();
@@ -500,6 +526,15 @@ function AddServerDisclosure({
                 hint={ENV_PLAINTEXT_HINT}
                 noBrowserAssist
                 error={error?.field === 'env' ? error.text : undefined}
+              />
+              <TextAreaField
+                label="Secret env (names only, one per line)"
+                value={secretEnvText}
+                onChange={setSecretEnvText}
+                placeholder="GITHUB_TOKEN"
+                hint={SECRET_ENV_HINT}
+                noBrowserAssist
+                error={error?.field === 'secretEnv' ? error.text : undefined}
               />
             </>
           ) : (
