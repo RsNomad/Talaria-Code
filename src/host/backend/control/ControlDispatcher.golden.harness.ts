@@ -215,6 +215,9 @@ export interface RecordedCalls {
   listSkills: number[];
   toggleSkill: Array<{ name: string; enabled: boolean }>;
   toggleToolset: Array<{ name: string; enabled: boolean }>;
+  setEnvVar: Array<{ key: string; value: string }>;
+  listEnvKeys: number[];
+  removeEnvVar: string[];
 }
 
 export type FakeAdminClient = DashboardAdminClient & DashboardClientLike & { calls: RecordedCalls };
@@ -237,6 +240,9 @@ export function makeFakeAdminClient(overrides: Partial<FakeAdminClient> = {}): F
     listSkills: [],
     toggleSkill: [],
     toggleToolset: [],
+    setEnvVar: [],
+    listEnvKeys: [],
+    removeEnvVar: [],
   };
   const base: FakeAdminClient = {
     calls,
@@ -305,6 +311,22 @@ export function makeFakeAdminClient(overrides: Partial<FakeAdminClient> = {}): F
     uninstallHubSkill: async (name) => {
       calls.uninstallHubSkill.push(name);
       return { ok: true, name: 'act-1' };
+    },
+    setEnvVar: async (key, value) => {
+      calls.setEnvVar.push({ key, value });
+      return { ok: true, key };
+    },
+    // Default mirrors a NON-managed Hermes: every key this fake was asked to
+    // set reads back `is_set:true`. A managed-mode scenario overrides this with
+    // `async () => ({})` to reproduce the `{ok:true}`-but-nothing-written
+    // false positive Layer 6 exists for.
+    listEnvKeys: async () => {
+      calls.listEnvKeys.push(1);
+      return Object.fromEntries(calls.setEnvVar.map((c) => [c.key, { is_set: true }]));
+    },
+    removeEnvVar: async (key) => {
+      calls.removeEnvVar.push(key);
+      return { ok: true, key };
     },
   };
   return { ...base, ...overrides, calls };

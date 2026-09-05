@@ -47,7 +47,7 @@ import type { RestoreResult } from '../checkpoints/CheckpointTracker';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
 import type { PanelSource } from '../panels/PanelSourceRegistry';
 import type { DashboardService } from '../dashboard/HermesDashboardManager';
-import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../dashboard/HermesDashboardClient';
+import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult, DashboardEnvRow } from '../dashboard/HermesDashboardClient';
 import type { ConfinedReader } from './acp/confinedOpen';
 import { ConnectionSupervisor, type ConnectionSupervisorHostPort } from './connection/ConnectionSupervisor';
 import type { WorkspaceStateLike } from './oneshot/OneShotSessionRegistry';
@@ -7870,7 +7870,7 @@ function makeBackendWithDashboard(): {
  * admin surface (`HermesDashboardClient.ts:137-167`), with a call-recording
  * array per member so tests can assert exactly what reached the "dashboard"
  * — mirrors `FakeDashboardClient`'s own `toggleSkillCalls`/`toggleToolsetCalls`
- * idiom, extended to the 13 admin methods `hasDashboardAdmin` structurally
+ * idiom, extended to the 16 admin methods `hasDashboardAdmin` structurally
  * checks for (B2-M1 cleanup: was 8 before the T2 skills-admin members were
  * added).
  */
@@ -8049,6 +8049,29 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
     this.uninstallHubSkillCalls.push(name);
     if (this.uninstallHubSkillDeferred) return this.uninstallHubSkillDeferred;
     return this.uninstallHubSkillResult;
+  }
+
+  // --- AU-59 harness extension: the three env-store members
+  // `hasDashboardAdmin` now checks for (16 total) — call-recording stubs,
+  // same idiom as the T1/T2 members above. `listEnvKeys` mirrors a NON-managed
+  // Hermes (every set key reads back is_set:true).
+  setEnvVarCalls: Array<{ key: string; value: string }> = [];
+  listEnvKeysCalls = 0;
+  removeEnvVarCalls: string[] = [];
+
+  async setEnvVar(key: string, value: string): Promise<{ ok: boolean; key: string }> {
+    this.setEnvVarCalls.push({ key, value });
+    return { ok: true, key };
+  }
+
+  async listEnvKeys(): Promise<Record<string, DashboardEnvRow>> {
+    this.listEnvKeysCalls += 1;
+    return Object.fromEntries(this.setEnvVarCalls.map((c) => [c.key, { is_set: true }]));
+  }
+
+  async removeEnvVar(key: string): Promise<{ ok: boolean; key: string }> {
+    this.removeEnvVarCalls.push(key);
+    return { ok: true, key };
   }
 }
 
