@@ -1,6 +1,7 @@
 import { MODAL_UNSAFE_TEXT_PATTERN } from '../../setup/SetupController';
 import type { McpAddParams, McpCatalogEntry } from '../../../shared/protocol';
 import { isRecord } from '../../../shared/typeGuards';
+import { CREDENTIAL_NAME_CORE } from '../../redactControlResponse';
 
 /**
  * Task A3 (features-add-mcp-skills-architecture.md §4.4, §3 Layer 1/3) — the
@@ -224,6 +225,56 @@ export const RELOAD_LINE =
 const RUNS_ON_MACHINE_LINE = 'This command will run on your machine every time the agent starts.';
 const PLAINTEXT_ENV_LINE = "Env values will be stored in PLAIN TEXT in Hermes' ~/.hermes/config.yaml.";
 
+/**
+ * AU-59 (D-lite): a VALUE that is exactly one `${VAR}` / `${env:VAR}`
+ * reference. Hermes resolves it from `~/.hermes/.env` when the server config
+ * is loaded (`tools/mcp_tool.py` `_ENV_VAR_PATTERN` = `\$\{([^}]+)\}`, walked
+ * over the whole server dict by `_interpolate_env_vars` on the runtime load
+ * path AND on `mcp_config.py`'s `_resolve_mcp_server_config` test-probe path),
+ * so the literal in config.yaml never holds the secret. ANCHORED on purpose: a
+ * partial interpolation (`Bearer ${X}`) is still stored as typed and is
+ * classified plaintext here — the modal must describe what config.yaml will
+ * literally contain.
+ */
+export const ENV_REFERENCE_PATTERN = /^\$\{[^}]+\}$/;
+const REFERENCE_ENV_LINE_PREFIX =
+  "Env keys resolved from Hermes' .env at runtime (${KEY} reference — config.yaml stores only the reference): ";
+
+/** AU-59 (D-lite): env keys split by what config.yaml will literally hold — a secret-free `${KEY}` reference, or the typed value. */
+function partitionEnvKeys(env: Record<string, string>): { plaintext: string[]; references: string[] } {
+  const plaintext: string[] = [];
+  const references: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    (ENV_REFERENCE_PATTERN.test(value) ? references : plaintext).push(key);
+  }
+  return { plaintext, references };
+}
+
+/**
+ * AU-59 (D-lite): the plaintext disclosure, precise per category. The
+ * credential hint is a WARN (not a refusal — env is legitimately mixed) folded
+ * INTO the plaintext paragraph (not a paragraph of its own — the standing
+ * 5-paragraph pin for a stdio+env add holds), driven by the SAME deny-list
+ * core the host->webview belt redacts with ({@link CREDENTIAL_NAME_CORE},
+ * CR-003 single-source; deliberately WITHOUT the belt's `env` breadth so
+ * `ENVIRONMENT`-style keys don't over-warn). Keys only — never a value.
+ */
+function plaintextEnvLines(plaintext: readonly string[]): string[] {
+  if (plaintext.length === 0) return [];
+  const credentialShaped = plaintext.filter((key) => CREDENTIAL_NAME_CORE.test(key));
+  const warn =
+    credentialShaped.length > 0
+      ? ` Looks like a credential and will be stored in plain text: ${credentialShaped.join(', ')} — keep secrets out of plain-text env; reference a ~/.hermes/.env key as ` +
+        '${KEY} instead.'
+      : '';
+  return [`Env keys (plain text): ${plaintext.join(', ')}`, PLAINTEXT_ENV_LINE + warn];
+}
+
+function referenceEnvLines(references: readonly string[]): string[] {
+  if (references.length === 0) return [];
+  return [REFERENCE_ENV_LINE_PREFIX + references.join(', ')];
+}
+
 type ModalDescription = { ok: true; message: string; detail: string } | { ok: false; reason: string };
 
 function composeModal(message: string, lines: string[]): ModalDescription {
@@ -250,11 +301,9 @@ export function describeAddForModal(p: McpAddParams): ModalDescription {
   if (p.transport === 'stdio') {
     const argsStr = p.args.length > 0 ? ` ${p.args.join(' ')}` : '';
     lines.push(`Runs: ${p.command}${argsStr}`);
-    const envKeys = Object.keys(p.env);
-    if (envKeys.length > 0) {
-      lines.push(`Env keys: ${envKeys.join(', ')}`);
-      lines.push(PLAINTEXT_ENV_LINE);
-    }
+    const { plaintext, references } = partitionEnvKeys(p.env);
+    lines.push(...plaintextEnvLines(plaintext));
+    lines.push(...referenceEnvLines(references));
     lines.push(RUNS_ON_MACHINE_LINE);
     lines.push(RELOAD_LINE);
   } else {

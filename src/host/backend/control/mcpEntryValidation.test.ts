@@ -6,6 +6,7 @@ import {
   validateCatalogInstall,
   describeCatalogForModal,
   extractMcpEnabled,
+  ENV_REFERENCE_PATTERN,
 } from './mcpEntryValidation';
 import type { McpAddParams, McpCatalogEntry } from '../../../shared/protocol';
 
@@ -86,6 +87,74 @@ describe('describeAddForModal', () => {
     // reload); joined with '\n\n' they MUST stay five paragraphs. The old join-then-strip order
     // erased every separator and collapsed the whole disclosure into one run-on line.
     expect(d.detail.split('\n\n')).toHaveLength(5);
+  });
+});
+
+/* AU-59 (D-lite): the modal now says PRECISELY what config.yaml will hold per
+ * env key — a typed value (plain text) or a secret-free `${KEY}` reference
+ * Hermes resolves from `.env` at load time — and WARNS (never refuses; env is
+ * legitimately mixed) when a PLAINTEXT key looks like a credential, using
+ * the same deny-list core the host->webview redaction belt uses. Keys only —
+ * a value never appears in the modal. */
+describe('describeAddForModal — AU-59 D-lite: plaintext vs ${KEY}-reference partition + credential warn', () => {
+  it('lists plaintext keys and reference keys as SEPARATE categories, each only when non-empty', () => {
+    const d = describeAddForModal(stdio({ env: { LOG_LEVEL: 'info', GITHUB_TOKEN: '${GITHUB_TOKEN}' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).toContain('Env keys (plain text): LOG_LEVEL');
+    expect(d.detail).toContain("Env keys resolved from Hermes' .env at runtime (${KEY} reference — config.yaml stores only the reference): GITHUB_TOKEN");
+    expect(d.detail).not.toContain('${GITHUB_TOKEN}'); // keys only — the reference VALUE itself is never echoed
+    expect(d.detail).not.toContain('Looks like a credential'); // GITHUB_TOKEN is a reference; LOG_LEVEL is not credential-shaped
+  });
+
+  it('a reference-only env emits NO plaintext line at all (no false "PLAIN TEXT" disclosure)', () => {
+    const d = describeAddForModal(stdio({ env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).not.toContain('PLAIN TEXT');
+    expect(d.detail).not.toContain('Env keys (plain text)');
+    expect(d.detail.split('\n\n')).toHaveLength(4); // Runs / reference line / runs-on-machine / reload
+  });
+
+  it('WARNS (never refuses) when a PLAINTEXT key looks like a credential — keys only, the value never appears', () => {
+    const d = describeAddForModal(stdio({ env: { GITHUB_TOKEN: 'ghp_secret', LOG_LEVEL: 'info' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    const warnTail = d.detail.split('Looks like a credential and will be stored in plain text: ')[1] ?? '';
+    expect(warnTail.startsWith('GITHUB_TOKEN —')).toBe(true); // ONLY the credential-shaped key is named in the warn
+    expect(d.detail).toContain('reference a ~/.hermes/.env key as ${KEY} instead');
+    expect(d.detail).not.toContain('ghp_secret');
+  });
+
+  it('does NOT over-warn on ENVIRONMENT/NODE_ENV-style keys (the hint core has no `env` breadth)', () => {
+    const d = describeAddForModal(stdio({ env: { ENVIRONMENT: 'prod', NODE_ENV: 'production' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).not.toContain('Looks like a credential');
+    expect(d.detail).toContain('Env keys (plain text): ENVIRONMENT, NODE_ENV');
+  });
+
+  it('a PARTIAL interpolation (`Bearer ${X}`) is classified plaintext — the modal describes what config.yaml literally holds', () => {
+    const d = describeAddForModal(stdio({ env: { AUTH_HEADER: 'Bearer ${X}' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).toContain('Env keys (plain text): AUTH_HEADER');
+    expect(d.detail).not.toContain("resolved from Hermes' .env");
+  });
+
+  it('the warn is folded INTO the plaintext paragraph: a credential-shaped plaintext add still composes exactly 5 paragraphs (the standing pin holds)', () => {
+    const d = describeAddForModal(stdio({ env: { GITHUB_TOKEN: 'ghp_secret' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail.split('\n\n')).toHaveLength(5);
+  });
+
+  it('ENV_REFERENCE_PATTERN: whole-value ${VAR} and ${env:VAR} only (mirrors tools/mcp_tool.py _ENV_VAR_PATTERN, anchored)', () => {
+    expect(ENV_REFERENCE_PATTERN.test('${GITHUB_TOKEN}')).toBe(true);
+    expect(ENV_REFERENCE_PATTERN.test('${env:GITHUB_TOKEN}')).toBe(true);
+    for (const notWhole of ['Bearer ${X}', '${X} ', '${}', 'plain', '$X', '${A}${B}']) {
+      expect(ENV_REFERENCE_PATTERN.test(notWhole)).toBe(false);
+    }
   });
 });
 
