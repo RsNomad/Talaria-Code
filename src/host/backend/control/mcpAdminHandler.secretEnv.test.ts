@@ -32,6 +32,8 @@ interface Knobs {
   answers?: ReadonlyArray<string | undefined>;
   /** the `.env` key whose PUT rejects (Hermes 400/500/network) */
   failSetEnvVarAt?: string;
+  /** the `.env` key whose compensating DELETE rejects (Hermes 400/500/network) */
+  failRemoveEnvVarAt?: string;
   /** managed/container mode: PUT answers ok:true, GET shows nothing set */
   managedMode?: boolean;
   /** compensation's removeMcpServer rejects */
@@ -65,6 +67,7 @@ function harness(knobs: Knobs = {}) {
     },
     removeEnvVar: async (key) => {
       order.push(`removeEnvVar:${key}`);
+      if (knobs.failRemoveEnvVarAt === key) throw new Error('Hermes dashboard DELETE /api/env failed: 500 Internal Server Error');
       return { ok: true, key };
     },
     removeMcpServer: async (name) => {
@@ -195,6 +198,26 @@ describe('mcp.add with secretEnvNames — AU-59 config-first, fail-closed orches
     expect(h.dispatched).toEqual([]); // no reload.mcp after a rollback
     expect(h.logs.join('\n')).toContain('PUT /api/env failed: 500'); // the cause goes to the output channel…
     for (const v of VALUES) expect(h.leakSurface()).not.toContain(v); // …and never a value
+  });
+
+  it('PUT failure on the 2nd secret AND the compensating DELETE for the 1st key also fails → the stranded key is DISCLOSED, never "Nothing was saved."', async () => {
+    const h = harness({ failSetEnvVarAt: 'MCP_GH_OPENAI_API_KEY', failRemoveEnvVarAt: 'MCP_GH_GITHUB_TOKEN' });
+    const outcome = await h.invoke();
+    expect(outcome.settled).toBe('rejected');
+    if (outcome.settled !== 'rejected') return;
+    expect(outcome.message).toContain('MCP_GH_GITHUB_TOKEN');
+    expect(outcome.message).not.toContain('Nothing was saved.');
+    expect(outcome.message).not.toContain('ghp_live_value_1');
+    expect(h.order.slice(3)).toEqual([
+      'addMcpServer',
+      'setEnvVar:MCP_GH_GITHUB_TOKEN',
+      'setEnvVar:MCP_GH_OPENAI_API_KEY',
+      'removeEnvVar:MCP_GH_GITHUB_TOKEN',
+      'removeMcpServer:gh',
+    ]);
+    expect(h.dispatched).toEqual([]);
+    expect(h.logs.join('\n')).toContain('could not remove .env key MCP_GH_GITHUB_TOKEN');
+    for (const v of VALUES) expect(h.leakSurface()).not.toContain(v);
   });
 
   it('Layer 6: managed-mode {ok:true} with nothing on disk → rolled back (both keys + the server); the message names the missing KEYS', async () => {

@@ -339,32 +339,39 @@ export class McpAdminHandler {
       }
     } catch (err) {
       this.port.logger?.append(`[AcpBackend] mcp.add "${body.name}": secret env step failed — rolling back: ${errorMessage(err)}`);
-      const serverRemoved = await this.compensateSecretAdd(client, body.name, written);
-      throw new Error(secretAddRollbackMessage(body.name, err, serverRemoved));
+      const compensation = await this.compensateSecretAdd(client, body.name, written);
+      throw new Error(secretAddRollbackMessage(body.name, err, compensation));
     }
   }
 
   /**
    * AU-59 compensation — best-effort, log-only per step, keys only. Removes
    * the secret residue FIRST (the `.env` keys already written), then the
-   * server entry. Returns whether the entry came out; a leftover entry holds
-   * only `${…}` references (no secret), so the caller discloses it and the
-   * user removes it from the panel.
+   * server entry. Returns whether the entry came out AND which `.env` keys'
+   * DELETE also rejected (stranded — the secret VALUE may still be at rest);
+   * a leftover entry holds only `${…}` references (no secret), so the caller
+   * discloses both facts and the user cleans up manually.
    */
-  private async compensateSecretAdd(client: DashboardAdminClient, name: string, written: readonly string[]): Promise<boolean> {
+  private async compensateSecretAdd(
+    client: DashboardAdminClient,
+    name: string,
+    written: readonly string[],
+  ): Promise<{ serverRemoved: boolean; stranded: string[] }> {
+    const stranded: string[] = [];
     for (const key of written) {
       try {
         await client.removeEnvVar(key);
       } catch (err) {
+        stranded.push(key);
         this.port.logger?.append(`[AcpBackend] mcp.add "${name}" rollback: could not remove .env key ${key}: ${errorMessage(err)}`);
       }
     }
     try {
       await client.removeMcpServer(name);
-      return true;
+      return { serverRemoved: true, stranded };
     } catch (err) {
       this.port.logger?.append(`[AcpBackend] mcp.add "${name}" rollback: could not remove the server entry: ${errorMessage(err)}`);
-      return false;
+      return { serverRemoved: false, stranded };
     }
   }
 
@@ -666,12 +673,32 @@ class SecretEnvNotPersistedError extends Error {
   }
 }
 
-/** AU-59: the user-facing rollback message — keys only; a transport cause is routed to the output log, never quoted here. */
-function secretAddRollbackMessage(name: string, err: unknown, serverRemoved: boolean): string {
+/**
+ * AU-59 (SEC follow-up): the user-facing rollback message — keys only; a
+ * transport cause is routed to the output log, never quoted here. `stranded`
+ * lists `.env` keys whose compensating DELETE also rejected — their secret
+ * VALUE may still be at rest in `~/.hermes/.env`, so this must NEVER claim
+ * "Nothing was saved." when `stranded` is non-empty.
+ */
+function secretAddRollbackMessage(name: string, err: unknown, compensation: { serverRemoved: boolean; stranded: readonly string[] }): string {
   const cause = err instanceof SecretEnvNotPersistedError ? err.message : 'Hermes did not store its secret env — see the Talaria output log';
-  const tail = serverRemoved
-    ? 'Nothing was saved.'
-    : `The server entry "${name}" could NOT be removed automatically — remove it from the MCP panel (it holds only ` + '${…} references, no secret).';
+  const strandedNote =
+    compensation.stranded.length > 0
+      ? `the secret(s) for ${compensation.stranded.join(', ')} may remain in ~/.hermes/.env — remove them manually (see the Talaria output log).`
+      : undefined;
+  const serverNote = compensation.serverRemoved
+    ? undefined
+    : `The server entry "${name}" could NOT be removed automatically — remove it from the MCP panel (it holds only ` + '${…} references, no secret)';
+  let tail: string;
+  if (serverNote !== undefined && strandedNote !== undefined) {
+    tail = `${serverNote}; ${strandedNote}`;
+  } else if (serverNote !== undefined) {
+    tail = `${serverNote}.`;
+  } else if (strandedNote !== undefined) {
+    tail = `The server entry was removed, but ${strandedNote}`;
+  } else {
+    tail = 'Nothing was saved.';
+  }
   return `Adding MCP server "${name}" was rolled back: ${cause}. ${tail}`;
 }
 
