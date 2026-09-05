@@ -26,7 +26,7 @@ import type {
   McpData,
   McpTestResult,
 } from '../protocol';
-import { McpPanel } from './McpPanel';
+import { McpPanel, ENV_PLACEHOLDER, ENV_PLAINTEXT_HINT } from './McpPanel';
 import { must } from '../testing/must';
 
 function mcpData(): McpData {
@@ -524,5 +524,61 @@ describe('WV4-MIN a11y: MCP add-server form field errors are keyed to their fiel
     const describedBy = name.getAttribute('aria-describedby');
     expect(describedBy).toBeTruthy();
     expect(document.getElementById(must(describedBy))).toHaveTextContent('Name is required.');
+  });
+});
+
+/* AU-59 D-lite: the plaintext Env field stays for NON-secret env, so it must
+ * stop inviting secrets. Three pins: (1) a non-secret-leading placeholder
+ * that also shows the `${KEY}` reference idiom (the old `API_KEY=...`
+ * invited pasting a live key), (2) an always-rendered caption stating that
+ * values land as plain text in `~/.hermes/config.yaml`, reachable by a
+ * screen reader through `aria-describedby`, (3) AU-41's CWE-549 hygiene
+ * (`autocomplete=off`, `spellcheck=false`) on the textarea. */
+describe('AU-59 D-lite: the plaintext Env field discloses where its values land', () => {
+  it('has a non-secret placeholder showing the ${KEY} idiom, a linked plaintext caption, and browser assist off', async () => {
+    const user = userEvent.setup();
+    render(<McpPanel data={mcpData()} onReload={async () => ({ status: 'reloaded' })} {...noopMcpAdminProps()} />);
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+
+    const env = screen.getByLabelText('Env (KEY=VALUE per line)');
+    expect(env).toHaveAttribute('placeholder', ENV_PLACEHOLDER);
+    expect(ENV_PLACEHOLDER.startsWith('LOG_LEVEL=')).toBe(true); // the example LEADS with a non-secret
+    expect(ENV_PLACEHOLDER).toContain('GITHUB_TOKEN=${GITHUB_TOKEN}'); // ...and shows the reference idiom, never a pasted value
+    expect(env).toHaveAttribute('autocomplete', 'off');
+    expect(env).toHaveAttribute('spellcheck', 'false');
+
+    const ids = must(env.getAttribute('aria-describedby')).split(' ');
+    const captions = ids.map((id) => must(document.getElementById(id)).textContent ?? '').join('\n');
+    expect(captions).toContain(ENV_PLAINTEXT_HINT);
+    expect(ENV_PLAINTEXT_HINT).toMatch(/plain text in Hermes' ~\/\.hermes\/config\.yaml/);
+  });
+
+  it('an Env parse error keeps the caption linked AND adds the error id (both reach the screen reader)', async () => {
+    const user = userEvent.setup();
+    render(<McpPanel data={mcpData()} onReload={async () => ({ status: 'reloaded' })} {...noopMcpAdminProps()} />);
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    await user.type(screen.getByLabelText('Name'), 'gh');
+    await user.type(screen.getByLabelText('Command'), 'npx');
+    await user.type(screen.getByLabelText('Env (KEY=VALUE per line)'), 'noequals');
+    await user.click(screen.getByRole('button', { name: /^Add$/i }));
+
+    const env = screen.getByLabelText('Env (KEY=VALUE per line)');
+    expect(env).toHaveAttribute('aria-invalid', 'true');
+    const ids = must(env.getAttribute('aria-describedby')).split(' ');
+    expect(ids).toHaveLength(2);
+    const texts = ids.map((id) => must(document.getElementById(id)).textContent ?? '');
+    expect(texts).toContain(ENV_PLAINTEXT_HINT);
+    expect(texts.some((t) => t.includes('is not KEY=VALUE'))).toBe(true);
+  });
+
+  it('scope guard: the Args textarea is untouched — no caption, no autocomplete/spellcheck attributes', async () => {
+    const user = userEvent.setup();
+    render(<McpPanel data={mcpData()} onReload={async () => ({ status: 'reloaded' })} {...noopMcpAdminProps()} />);
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+
+    const args = screen.getByLabelText('Args (one per line)');
+    expect(args).not.toHaveAttribute('aria-describedby');
+    expect(args).not.toHaveAttribute('autocomplete');
+    expect(args).not.toHaveAttribute('spellcheck');
   });
 });

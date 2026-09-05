@@ -186,6 +186,27 @@ function errorMessage(err: unknown, fallback: string): string {
   return typeof err === 'string' ? err : fallback;
 }
 
+/**
+ * AU-59 (D-lite): the Env textarea's caption — always rendered under the
+ * field and linked via `aria-describedby`. States the ONE thing a user must
+ * know before pasting here: values land as PLAIN TEXT in Hermes'
+ * `~/.hermes/config.yaml` — a file that is dumped raw over the tui_gateway
+ * wire on every MCP-panel refresh (`config.get{key:'full'}`) and
+ * round-tripped by the dashboard's mcp.json editor. A whole-value `${KEY}`
+ * is the one safe idiom for this field: Hermes resolves it from
+ * `~/.hermes/.env` at load time (`tools/mcp_tool.py` `_interpolate_env_vars`)
+ * and the literal never holds the secret.
+ */
+export const ENV_PLAINTEXT_HINT =
+  "Stored as plain text in Hermes' ~/.hermes/config.yaml. Keep secrets out of this field — a ${KEY} value is resolved from ~/.hermes/.env at runtime instead.";
+
+/**
+ * AU-59 (D-lite): a NON-secret-leading example that also shows the `${KEY}`
+ * reference idiom. The old `API_KEY=...` placeholder invited pasting a live
+ * key into a plaintext field.
+ */
+export const ENV_PLACEHOLDER = 'LOG_LEVEL=info\nGITHUB_TOKEN=${GITHUB_TOKEN}';
+
 /** Task A7: the `SetupPanel.tsx:457-486` label+input TextField pattern, copied
  *  locally (no shared component exists to import — same posture as this
  *  file's own plain `<button>`s).
@@ -246,21 +267,38 @@ function TextField({
  *  Args (one per line) / Env (`KEY=VALUE` per line). Task 16: same
  *  `error`/`aria-invalid`/`aria-describedby` wiring as {@link TextField},
  *  including the same sibling-not-nested placement of the error `<span>` —
- *  see {@link TextField}'s doc comment for why. */
+ *  see {@link TextField}'s doc comment for why.
+ *
+ *  AU-59 (D-lite): `hint` is an ALWAYS-rendered caption (the `SetupPanel.tsx`
+ *  `TextField({describedBy})` idiom, with the id plumbing kept local because
+ *  this component owns both caption and control), rendered as a SIBLING of
+ *  `<label>` for the same accessible-name reason as the error span;
+ *  `aria-describedby` lists the hint id and — when present — the error id.
+ *  `noBrowserAssist` applies AU-41's CWE-549 hygiene (`autoComplete="off"`,
+ *  `spellCheck={false}`) to a field whose text must not be harvested or sent
+ *  by browser assist. Both omitted ⇒ byte-identical rendering to before. */
 function TextAreaField({
   label,
   value,
   onChange,
   placeholder,
   error,
+  hint,
+  noBrowserAssist,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
   error?: string | undefined;
+  hint?: string;
+  noBrowserAssist?: boolean;
 }) {
   const errorId = useId();
+  const hintId = useId();
+  const describedBy = [hint !== undefined ? hintId : undefined, error ? errorId : undefined]
+    .filter((id): id is string => id !== undefined)
+    .join(' ');
   return (
     <div className="flex flex-col gap-1 text-2xs text-muted">
       <label className="flex flex-col gap-1">
@@ -270,11 +308,18 @@ function TextAreaField({
           placeholder={placeholder}
           rows={3}
           aria-invalid={error ? true : undefined}
-          aria-describedby={error ? errorId : undefined}
+          aria-describedby={describedBy.length > 0 ? describedBy : undefined}
+          autoComplete={noBrowserAssist ? 'off' : undefined}
+          spellCheck={noBrowserAssist ? false : undefined}
           onChange={(e) => onChange(e.target.value)}
           className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg aria-[invalid=true]:border-del"
         />
       </label>
+      {hint !== undefined && (
+        <span id={hintId} className="text-2xs text-faint">
+          {hint}
+        </span>
+      )}
       {error && (
         <span id={errorId} className="text-2xs text-del">
           {error}
@@ -449,7 +494,9 @@ function AddServerDisclosure({
                 label="Env (KEY=VALUE per line)"
                 value={envText}
                 onChange={setEnvText}
-                placeholder={'API_KEY=...'}
+                placeholder={ENV_PLACEHOLDER}
+                hint={ENV_PLAINTEXT_HINT}
+                noBrowserAssist
                 error={error?.field === 'env' ? error.text : undefined}
               />
             </>
