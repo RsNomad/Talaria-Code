@@ -45,6 +45,7 @@ vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
 
 import { spawn } from 'node:child_process';
 import { AcpClient, type AcpClientCallbacks } from './acpClient';
+import { EXTENSION_VERSION } from '../../../shared/version';
 
 const NOOP_CALLBACKS: AcpClientCallbacks = {
   onSessionUpdate: () => {},
@@ -122,37 +123,72 @@ async function flush(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
+/**
+ * WS-AC A-02: the pinned-Hermes initialize advertisement, mirrored
+ * field-for-field from `acp_adapter/server.py:884-897` (protocol_version=1,
+ * load_session=True, prompt_capabilities image-only, session_capabilities
+ * fork/list/resume — NO close, NO mcp_capabilities). Tests that need a
+ * STRICTER or RICHER agent pass their own `initResult`.
+ */
+const PINNED_HERMES_INIT_RESULT = {
+  protocolVersion: 1,
+  agentInfo: { name: 'hermes-agent', version: '2026.7.7.2' },
+  agentCapabilities: {
+    loadSession: true,
+    promptCapabilities: { image: true },
+    sessionCapabilities: { fork: {}, list: {}, resume: {} },
+  },
+  authMethods: [],
+};
+
+/**
+ * A-02: connect + initialize (id 0) against `initResult`, returning a frame
+ * reader that SKIPS the initialize frame — post-gate tests assert their own
+ * request frames (which now carry id 1) without re-pinning initialize.
+ */
+async function connectInitializedClient(initResult: unknown = PINNED_HERMES_INIT_RESULT): Promise<{
+  client: AcpClient;
+  wireFramesAfterInit: () => unknown[];
+  respond: (frame: unknown) => void;
+}> {
+  const { client, wireFrames, respond } = await connectClient();
+  const init = client.initialize();
+  await flush();
+  respond({ jsonrpc: '2.0', id: 0, result: initResult });
+  await init;
+  return { client, wireFramesAfterInit: () => wireFrames().slice(1), respond };
+}
+
 describe('AcpClient — real client, real stdin bytes (Task 5 review F-1)', () => {
   it('listSessions() writes an unprefixed "session/list" request frame', async () => {
-    const { client, wireFrames } = await connectClient();
+    const { client, wireFramesAfterInit } = await connectInitializedClient();
     void client.listSessions();
     await flush();
-    expect(wireFrames()).toEqual([{ jsonrpc: '2.0', id: 0, method: 'session/list', params: {} }]);
+    expect(wireFramesAfterInit()).toEqual([{ jsonrpc: '2.0', id: 1, method: 'session/list', params: {} }]);
   });
 
   it('listSessions(cwd, cursor) attaches both params to the request frame', async () => {
-    const { client, wireFrames } = await connectClient();
+    const { client, wireFramesAfterInit } = await connectInitializedClient();
     void client.listSessions('/workspace', 'cur-1');
     await flush();
-    expect(wireFrames()).toEqual([
-      { jsonrpc: '2.0', id: 0, method: 'session/list', params: { cwd: '/workspace', cursor: 'cur-1' } },
+    expect(wireFramesAfterInit()).toEqual([
+      { jsonrpc: '2.0', id: 1, method: 'session/list', params: { cwd: '/workspace', cursor: 'cur-1' } },
     ]);
   });
 
   it('setSessionModel() writes an unprefixed "session/set_model" request frame', async () => {
-    const { client, wireFrames } = await connectClient();
+    const { client, wireFramesAfterInit } = await connectInitializedClient();
     void client.setSessionModel('s1', 'm1');
     await flush();
-    expect(wireFrames()).toEqual([
-      { jsonrpc: '2.0', id: 0, method: 'session/set_model', params: { sessionId: 's1', modelId: 'm1' } },
+    expect(wireFramesAfterInit()).toEqual([
+      { jsonrpc: '2.0', id: 1, method: 'session/set_model', params: { sessionId: 's1', modelId: 'm1' } },
     ]);
   });
 
-  it('closeSession() writes an unprefixed "session/close" request frame', async () => {
+  it('closeSession() pre-initialize is a silent no-op — nothing written, never rejects (A-02 MUST NOT)', async () => {
     const { client, wireFrames } = await connectClient();
-    void client.closeSession('s1');
-    await flush();
-    expect(wireFrames()).toEqual([{ jsonrpc: '2.0', id: 0, method: 'session/close', params: { sessionId: 's1' } }]);
+    await expect(client.closeSession('s1')).resolves.toBeUndefined();
+    expect(wireFrames()).toEqual([]);
   });
 
   it('initialize() writes the pinned protocolVersion + capabilities frame', async () => {
@@ -166,6 +202,7 @@ describe('AcpClient — real client, real stdin bytes (Task 5 review F-1)', () =
         method: 'initialize',
         params: {
           protocolVersion: 1,
+          clientInfo: { name: 'talaria-code', title: 'Talaria Code', version: EXTENSION_VERSION },
           clientCapabilities: {
             fs: { readTextFile: true, writeTextFile: false },
             terminal: false,
@@ -255,14 +292,7 @@ describe('AcpClient — Task 13: initialize retains the advertised authMethods',
     expect(client.getAdvertisedAuthMethods()).toEqual([{ id: 'openrouter', name: 'openrouter runtime credentials' }]);
   });
 
-  it('FIX 4 (T13 M-1): a null `result` never throws reading .authMethods off it — resolves to []', async () => {
-    const { client, respond } = await connectClient();
-    const init = client.initialize();
-    await flush();
-    respond({ jsonrpc: '2.0', id: 0, result: null });
-    await expect(init).resolves.toBeUndefined();
-    expect(client.getAdvertisedAuthMethods()).toEqual([]);
-  });
+  // The old "null result resolves []" test moved to the A-02 describe below as a fail-closed REJECTION — A-02's version assert now refuses a result with no protocolVersion.
 
   it('onAuthMethodsChanged fires once initialize has retained the methods (getter already fresh inside the handler)', async () => {
     const { client, respond } = await connectClient();
@@ -279,5 +309,108 @@ describe('AcpClient — Task 13: initialize retains the advertised authMethods',
     await init;
 
     expect(seen).toEqual([[{ id: 'hermes-setup', name: 'Configure Hermes provider' }]]);
+  });
+});
+
+/**
+ * WS-AC A-02 root: `initialize()` must RETAIN {protocolVersion,
+ * agentCapabilities, promptCapabilities} (it used to keep only authMethods)
+ * and ASSERT the negotiated version — the spec's own guidance on
+ * `InitializeResponse.protocolVersion` is "The client should disconnect, if
+ * it doesn't support this version" (types.gen.d.ts:1512-1518). All no-ops vs
+ * pinned Hermes (always version 1); the rejects fire only against a
+ * non-conformant agent, and they surface through
+ * ConnectionSupervisor.startInternal's existing connect-phase catch+banner.
+ */
+describe('AcpClient — WS-AC A-02 root: initialize retains + asserts the advertisement', () => {
+  it('rejects initialize when the agent negotiates a different protocolVersion', async () => {
+    const { client, respond } = await connectClient();
+    const init = client.initialize();
+    await flush();
+    respond({ jsonrpc: '2.0', id: 0, result: { protocolVersion: 2, agentCapabilities: {} } });
+    await expect(init).rejects.toThrow(/unsupported ACP protocolVersion/);
+    expect(client.getAdvertisedPromptCapabilities()).toBeUndefined();
+  });
+
+  it('rejects initialize on a null result (no protocolVersion) — fail-closed, no TypeError', async () => {
+    const { client, respond } = await connectClient();
+    const init = client.initialize();
+    await flush();
+    respond({ jsonrpc: '2.0', id: 0, result: null });
+    await expect(init).rejects.toThrow(/unsupported ACP protocolVersion/);
+    expect(client.getAdvertisedAuthMethods()).toBeUndefined();
+  });
+
+  it('retains the pinned-Hermes promptCapabilities projection', async () => {
+    const { client } = await connectInitializedClient();
+    expect(client.getAdvertisedPromptCapabilities()).toEqual({ image: true });
+  });
+
+  it('getAdvertisedPromptCapabilities() is undefined before initialize', async () => {
+    const { client } = await connectClient();
+    expect(client.getAdvertisedPromptCapabilities()).toBeUndefined();
+  });
+
+  it('absent agentCapabilities retains the empty projection, not a crash', async () => {
+    const { client } = await connectInitializedClient({ protocolVersion: 1 });
+    expect(client.getAdvertisedPromptCapabilities()).toEqual({});
+  });
+
+  it('gate: session/load against an agent NOT advertising loadSession — refused, NO frame written', async () => {
+    const { client, wireFramesAfterInit } = await connectInitializedClient({
+      protocolVersion: 1,
+      agentCapabilities: { promptCapabilities: { image: true }, sessionCapabilities: { fork: {}, list: {}, resume: {} } },
+      authMethods: [],
+    });
+    await expect(client.loadSession('/w', 's1')).rejects.toThrow(/did not advertise loadSession/);
+    expect(wireFramesAfterInit()).toEqual([]);
+  });
+
+  it('gate: session/load before initialize() is refused (initialize-first)', async () => {
+    const { client } = await connectClient();
+    await expect(client.loadSession('/w', 's1')).rejects.toThrow(/before initialize/);
+  });
+
+  it('gate: pinned Hermes advertises no close capability — closeSession resolves without writing ANY frame', async () => {
+    const { client, wireFramesAfterInit } = await connectInitializedClient();
+    await expect(client.closeSession('s1')).resolves.toBeUndefined();
+    expect(wireFramesAfterInit()).toEqual([]);
+  });
+
+  it('gate: a richer agent advertising sessionCapabilities.close still gets the best-effort frame', async () => {
+    const { client, wireFramesAfterInit } = await connectInitializedClient({
+      protocolVersion: 1,
+      agentCapabilities: {
+        loadSession: true,
+        promptCapabilities: { image: true },
+        sessionCapabilities: { fork: {}, list: {}, resume: {}, close: {} },
+      },
+      authMethods: [],
+    });
+    void client.closeSession('s1');
+    await flush();
+    expect(wireFramesAfterInit()).toEqual([
+      { jsonrpc: '2.0', id: 1, method: 'session/close', params: { sessionId: 's1' } },
+    ]);
+  });
+
+  it('gate: session/list against an agent NOT advertising sessionCapabilities.list — refused, NO frame', async () => {
+    const { client, wireFramesAfterInit } = await connectInitializedClient({
+      protocolVersion: 1,
+      agentCapabilities: {
+        loadSession: true,
+        promptCapabilities: { image: true },
+        sessionCapabilities: { fork: {}, resume: {} },
+      },
+      authMethods: [],
+    });
+    await expect(client.listSessions()).rejects.toThrow(/did not advertise sessionCapabilities\.list/);
+    expect(wireFramesAfterInit()).toEqual([]);
+  });
+
+  it('gate: session/list and session/set_model before initialize() are refused (initialize-first)', async () => {
+    const { client } = await connectClient();
+    await expect(client.listSessions()).rejects.toThrow(/before initialize/);
+    await expect(client.setSessionModel('s1', 'm1')).rejects.toThrow(/before initialize/);
   });
 });

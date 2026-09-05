@@ -9,7 +9,7 @@
  * server's confirmation / failure is SURFACED inline instead of being dropped by
  * a fire-and-forget invoke. The click is still the confirmation (the host sends
  * `confirm:true`); we only make the RESULT visible. */
-import { useState, type FormEvent } from 'react';
+import { useId, useState, type FormEvent } from 'react';
 import type {
   McpAddParams,
   McpAddResult,
@@ -28,7 +28,7 @@ import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill, type PillTone } from '../components/Pill';
 import { Toggle } from '../components/Toggle';
-import { PanelShell } from './PanelShell';
+import { EmptyPanel, PanelShell } from './PanelShell';
 import { useToggle } from './useToggle';
 
 /** Exported (UI-I1) so `McpPanel.test.ts` can exercise the total lookup
@@ -186,58 +186,161 @@ function errorMessage(err: unknown, fallback: string): string {
   return typeof err === 'string' ? err : fallback;
 }
 
+/**
+ * AU-59 (D-lite): the Env textarea's caption — always rendered under the
+ * field and linked via `aria-describedby`. States the ONE thing a user must
+ * know before pasting here: values land as PLAIN TEXT in Hermes'
+ * `~/.hermes/config.yaml` — a file that is dumped raw over the tui_gateway
+ * wire on every MCP-panel refresh (`config.get{key:'full'}`) and
+ * round-tripped by the dashboard's mcp.json editor. A whole-value `${KEY}`
+ * is the one safe idiom for this field: Hermes resolves it from
+ * `~/.hermes/.env` at load time (`tools/mcp_tool.py` `_interpolate_env_vars`)
+ * and the literal never holds the secret.
+ */
+export const ENV_PLAINTEXT_HINT =
+  "Stored as plain text in Hermes' ~/.hermes/config.yaml. Keep secrets out of this field — a ${KEY} value is resolved from ~/.hermes/.env at runtime instead.";
+
+/**
+ * AU-59 (D-lite): a NON-secret-leading example that also shows the `${KEY}`
+ * reference idiom. The old `API_KEY=...` placeholder invited pasting a live
+ * key into a plaintext field.
+ */
+export const ENV_PLACEHOLDER = 'LOG_LEVEL=info\nGITHUB_TOKEN=${GITHUB_TOKEN}';
+
+/**
+ * AU-59: one secret env NAME per line — the same "one token per line" grammar
+ * as {@link parseArgsLines} (trimmed, blanks dropped), kept as its own export
+ * because the two fields mean different things. Names only: the VALUE is
+ * never typed into the webview; the host prompts for it (masked) after the
+ * consent modal and stores it in Hermes' `.env` (`McpAdminHandler.mcpAdd`).
+ */
+export function parseSecretNameLines(text: string): string[] {
+  return parseArgsLines(text);
+}
+
+/** AU-59: the Secret env field's caption — what will be asked, where it lands, and what config.yaml gets instead. */
+export const SECRET_ENV_HINT =
+  "Names only. You'll be prompted for each value (masked) after confirming; it's saved to ~/.hermes/.env as MCP_<NAME>_<KEY> and config.yaml gets only the ${KEY} reference.";
+
 /** Task A7: the `SetupPanel.tsx:457-486` label+input TextField pattern, copied
  *  locally (no shared component exists to import — same posture as this
- *  file's own plain `<button>`s). */
+ *  file's own plain `<button>`s).
+ *
+ * Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): `error` — when present — wires
+ * `aria-invalid` + `aria-describedby` to a rendered `<span id={errorId}>` so
+ * a screen reader announces WHICH field failed and WHY. The error `<span>` is
+ * a SIBLING of `<label>`, not nested inside it: the browser's accessible-name
+ * algorithm for a wrapping `<label>` folds ALL descendant text into the
+ * control's accessible NAME (not just its description) — nesting the span
+ * inside would corrupt the field's name into "NameName is required." instead
+ * of leaving "Name" as the name and the error as a separate
+ * `aria-describedby` description, which defeats this task's own WCAG intent.
+ * (Confirmed empirically: `@testing-library/dom`'s label-content walk —
+ * `label-helpers.js`'s `getTextContent` — implements the identical
+ * name-computation rule and reproduces the same corruption in jsdom.)
+ * `undefined` (no error) omits both attributes entirely, per
+ * `exactOptionalPropertyTypes` — never a `false`/empty-string placeholder
+ * attribute value. */
 function TextField({
   label,
   value,
   onChange,
   placeholder,
+  error,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
+  error?: string | undefined;
 }) {
+  const errorId = useId();
   return (
-    <label className="flex flex-col gap-1 text-2xs text-muted">
-      {label}
-      <input
-        type="text"
-        value={value}
-        placeholder={placeholder}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg"
-      />
-    </label>
+    <div className="flex flex-col gap-1 text-2xs text-muted">
+      <label className="flex flex-col gap-1">
+        {label}
+        <input
+          type="text"
+          value={value}
+          placeholder={placeholder}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? errorId : undefined}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg aria-[invalid=true]:border-del"
+        />
+      </label>
+      {error && (
+        <span id={errorId} className="text-2xs text-del">
+          {error}
+        </span>
+      )}
+    </div>
   );
 }
 
 /** Task A7: the textarea sibling of {@link TextField} — same classes, for
- *  Args (one per line) / Env (`KEY=VALUE` per line). */
+ *  Args (one per line) / Env (`KEY=VALUE` per line). Task 16: same
+ *  `error`/`aria-invalid`/`aria-describedby` wiring as {@link TextField},
+ *  including the same sibling-not-nested placement of the error `<span>` —
+ *  see {@link TextField}'s doc comment for why.
+ *
+ *  AU-59 (D-lite): `hint` is an ALWAYS-rendered caption (the `SetupPanel.tsx`
+ *  `TextField({describedBy})` idiom, with the id plumbing kept local because
+ *  this component owns both caption and control), rendered as a SIBLING of
+ *  `<label>` for the same accessible-name reason as the error span;
+ *  `aria-describedby` lists the hint id and — when present — the error id.
+ *  `noBrowserAssist` applies AU-41's CWE-549 hygiene (`autoComplete="off"`,
+ *  `spellCheck={false}`) to a field whose text must not be harvested or sent
+ *  by browser assist. Both omitted ⇒ byte-identical rendering to before. */
 function TextAreaField({
   label,
   value,
   onChange,
   placeholder,
+  error,
+  hint,
+  noBrowserAssist,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
+  error?: string | undefined;
+  hint?: string;
+  noBrowserAssist?: boolean;
 }) {
+  const errorId = useId();
+  const hintId = useId();
+  const describedBy = [hint !== undefined ? hintId : undefined, error ? errorId : undefined]
+    .filter((id): id is string => id !== undefined)
+    .join(' ');
   return (
-    <label className="flex flex-col gap-1 text-2xs text-muted">
-      {label}
-      <textarea
-        value={value}
-        placeholder={placeholder}
-        rows={3}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg"
-      />
-    </label>
+    <div className="flex flex-col gap-1 text-2xs text-muted">
+      <label className="flex flex-col gap-1">
+        {label}
+        <textarea
+          value={value}
+          placeholder={placeholder}
+          rows={3}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={describedBy.length > 0 ? describedBy : undefined}
+          autoComplete={noBrowserAssist ? 'off' : undefined}
+          spellCheck={noBrowserAssist ? false : undefined}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg aria-[invalid=true]:border-del"
+        />
+      </label>
+      {hint !== undefined && (
+        <span id={hintId} className="text-2xs text-faint">
+          {hint}
+        </span>
+      )}
+      {error && (
+        <span id={errorId} className="text-2xs text-del">
+          {error}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -265,15 +368,24 @@ function AddServerDisclosure({
   const [command, setCommand] = useState('');
   const [argsText, setArgsText] = useState('');
   const [envText, setEnvText] = useState('');
+  const [secretEnvText, setSecretEnvText] = useState('');
   const [url, setUrl] = useState('');
   const [adding, setAdding] = useState(false);
-  const [error, setError] = useState<string | undefined>();
+  // Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): field-keyed (was a flat `string`) so
+  // each field's own `TextField`/`TextAreaField` can wire `aria-invalid` +
+  // `aria-describedby` to ONLY the field that actually failed — `'submit'`
+  // covers the onAdd-rejection case, which has no field of its own to attach
+  // to and renders in the same spot the old flat string used to.
+  const [error, setError] = useState<
+    { field: 'name' | 'command' | 'env' | 'secretEnv' | 'url' | 'submit'; text: string } | undefined
+  >();
 
   const resetFields = () => {
     setName('');
     setCommand('');
     setArgsText('');
     setEnvText('');
+    setSecretEnvText('');
     setUrl('');
   };
 
@@ -283,7 +395,7 @@ function AddServerDisclosure({
 
     const trimmedName = name.trim();
     if (!trimmedName) {
-      setError('Name is required.');
+      setError({ field: 'name', text: 'Name is required.' });
       return;
     }
 
@@ -291,12 +403,22 @@ function AddServerDisclosure({
     if (transport === 'stdio') {
       const trimmedCommand = command.trim();
       if (!trimmedCommand) {
-        setError('Command is required.');
+        setError({ field: 'command', text: 'Command is required.' });
         return;
       }
       const envResult = parseEnvLines(envText);
       if (!envResult.ok) {
-        setError(envResult.error);
+        setError({ field: 'env', text: envResult.error });
+        return;
+      }
+      // AU-59: names only. The host re-checks disjointness (`validateMcpAdd`);
+      // this local check just keys the SAME refusal to the field the user can
+      // fix. `Object.hasOwn` — a typed name like `constructor` must not match
+      // the prototype.
+      const secretEnvNames = parseSecretNameLines(secretEnvText);
+      const overlap = secretEnvNames.find((n) => Object.hasOwn(envResult.env, n));
+      if (overlap !== undefined) {
+        setError({ field: 'secretEnv', text: `"${overlap}" is listed both as Env and as Secret env.` });
         return;
       }
       params = {
@@ -305,11 +427,12 @@ function AddServerDisclosure({
         command: trimmedCommand,
         args: parseArgsLines(argsText),
         env: envResult.env,
+        secretEnvNames,
       };
     } else {
       const trimmedUrl = url.trim();
       if (!trimmedUrl) {
-        setError('URL is required.');
+        setError({ field: 'url', text: 'URL is required.' });
         return;
       }
       params = { name: trimmedName, transport: 'http', url: trimmedUrl };
@@ -326,7 +449,7 @@ function AddServerDisclosure({
       },
       (err: unknown) => {
         setAdding(false);
-        setError(errorMessage(err, 'Add failed.'));
+        setError({ field: 'submit', text: errorMessage(err, 'Add failed.') });
       },
     );
   };
@@ -350,7 +473,13 @@ function AddServerDisclosure({
       </button>
       {open && (
         <form onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
-          <TextField label="Name" value={name} onChange={setName} placeholder="my-server" />
+          <TextField
+            label="Name"
+            value={name}
+            onChange={setName}
+            placeholder="my-server"
+            error={error?.field === 'name' ? error.text : undefined}
+          />
 
           <fieldset className="flex items-center gap-3">
             <legend className="sr-only">Transport</legend>
@@ -376,7 +505,13 @@ function AddServerDisclosure({
 
           {transport === 'stdio' ? (
             <>
-              <TextField label="Command" value={command} onChange={setCommand} placeholder="npx" />
+              <TextField
+                label="Command"
+                value={command}
+                onChange={setCommand}
+                placeholder="npx"
+                error={error?.field === 'command' ? error.text : undefined}
+              />
               <TextAreaField
                 label="Args (one per line)"
                 value={argsText}
@@ -387,18 +522,46 @@ function AddServerDisclosure({
                 label="Env (KEY=VALUE per line)"
                 value={envText}
                 onChange={setEnvText}
-                placeholder={'API_KEY=...'}
+                placeholder={ENV_PLACEHOLDER}
+                hint={ENV_PLAINTEXT_HINT}
+                noBrowserAssist
+                error={error?.field === 'env' ? error.text : undefined}
+              />
+              <TextAreaField
+                label="Secret env (names only, one per line)"
+                value={secretEnvText}
+                onChange={setSecretEnvText}
+                placeholder="GITHUB_TOKEN"
+                hint={SECRET_ENV_HINT}
+                noBrowserAssist
+                error={error?.field === 'secretEnv' ? error.text : undefined}
               />
             </>
           ) : (
-            <TextField label="URL" value={url} onChange={setUrl} placeholder="https://example.com/mcp" />
+            <TextField
+              label="URL"
+              value={url}
+              onChange={setUrl}
+              placeholder="https://example.com/mcp"
+              error={error?.field === 'url' ? error.text : undefined}
+            />
           )}
 
-          <LiveRegion text={error ?? ''} className="sr-only" />
-          {error && (
+          {/* Finding-7: this LiveRegion stays the SOLE screen-reader
+              announcer for every refusal on this form — field-level errors
+              above are ALSO wired via aria-invalid/aria-describedby (WCAG
+              1.3.1/3.3.1), but this permanently-mounted region is what
+              actually fires the announcement, same posture as every other
+              LiveRegion in this file. */}
+          <LiveRegion text={error?.text ?? ''} className="sr-only" />
+          {/* The onAdd-rejection case has no field of its own to attach to —
+              it keeps rendering in this form-level slot, same as the old
+              flat string did. Every OTHER error now renders field-adjacent,
+              via the TextField/TextAreaField `error` prop above. */}
+          {error?.field === 'submit' && (
             <div className="flex items-start gap-1.5 rounded border border-del bg-del-soft px-2 py-1 text-2xs text-fg">
               <Icon name="error" size={11} className="mt-0.5 flex-none text-del" />
-              <span className="min-w-0 flex-1 break-words">{error}</span>
+              <span className="min-w-0 flex-1 break-words">{error.text}</span>
             </div>
           )}
 
@@ -714,96 +877,109 @@ export function McpPanel({ data, onReload, onAdd, onTest, onRemove, onSetEnabled
 
   return (
     <PanelShell title="Active MCP servers" meta={`${data.servers.length} configured`}>
-      {data.servers.map((srv) => {
-        const s = totalLookup(STATUS, srv.status, UNKNOWN_MCP_STATUS);
-        const rowTesting = testing[srv.name] === true;
-        const rowRemoving = removing[srv.name] === true;
-        const rowAuthing = authing[srv.name] === true;
-        // AU-40: none of these three is genuinely-indefinite — each is
-        // purely "a request from THIS button is in flight".
-        const testInteraction = busyInteraction(false, rowTesting);
-        const removeInteraction = busyInteraction(false, rowRemoving);
-        const authInteraction = busyInteraction(false, rowAuthing);
-        const toggleErr = lastError(srv.name);
-        return (
-          <div key={srv.id} className="mb-2 rounded-card border border-border bg-surface px-3 py-2.5">
-            <div className="flex items-center gap-2">
-              <Icon name="server-process" size={15} className="flex-none text-accent" />
-              <span className="min-w-0 truncate font-mono text-xs text-fg">{srv.name}</span>
-              <span className="ml-auto flex flex-none items-center gap-2">
-                <Pill tone={s.tone} icon={s.icon}>
-                  {s.label}
-                </Pill>
-                <Toggle
-                  on={isOn(srv.name, srv.enabled)}
-                  label={`Enable ${srv.name}`}
-                  onChange={(next) => toggle(srv.name, next)}
-                />
-              </span>
-            </div>
-            <div className="mt-1.5 truncate font-mono text-2xs text-faint" title={srv.command}>
-              {srv.command}
-            </div>
-            <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
-              {srv.toolCount} tools
-            </div>
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): the server-row collection was `div`
+          soup — no `role="list"`/`role="listitem"` at all. AddServerDisclosure
+          and CatalogDisclosure below (each rendering their own independent
+          collections — the catalog's `entries.map` is a separate,
+          out-of-scope list per the task brief) stay OUTSIDE this list. */}
+      {/* Task 22 (UX-01/UX-16): the standard empty state — this panel used to
+          render silent blank space with zero servers. Rendered BEFORE the
+          (empty) list, never as an early return: AddServerDisclosure and
+          CatalogDisclosure below still render in the zero-row case (AU-46 —
+          the empty state must never hide the way OUT of being empty). */}
+      {data.servers.length === 0 && <EmptyPanel hint="No MCP servers yet — add one below." />}
+      <div role="list">
+        {data.servers.map((srv) => {
+          const s = totalLookup(STATUS, srv.status, UNKNOWN_MCP_STATUS);
+          const rowTesting = testing[srv.name] === true;
+          const rowRemoving = removing[srv.name] === true;
+          const rowAuthing = authing[srv.name] === true;
+          // AU-40: none of these three is genuinely-indefinite — each is
+          // purely "a request from THIS button is in flight".
+          const testInteraction = busyInteraction(false, rowTesting);
+          const removeInteraction = busyInteraction(false, rowRemoving);
+          const authInteraction = busyInteraction(false, rowAuthing);
+          const toggleErr = lastError(srv.name);
+          return (
+            <div key={srv.id} role="listitem" className="mb-2 rounded-card border border-border bg-surface px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <Icon name="server-process" size={15} className="flex-none text-accent" />
+                <span className="min-w-0 truncate font-mono text-xs text-fg">{srv.name}</span>
+                <span className="ml-auto flex flex-none items-center gap-2">
+                  <Pill tone={s.tone} icon={s.icon}>
+                    {s.label}
+                  </Pill>
+                  <Toggle
+                    on={isOn(srv.name, srv.enabled)}
+                    label={`Enable ${srv.name}`}
+                    onChange={(next) => toggle(srv.name, next)}
+                  />
+                </span>
+              </div>
+              <div className="mt-1.5 truncate font-mono text-2xs text-faint" title={srv.command}>
+                {srv.command}
+              </div>
+              <div className="mt-1 font-mono text-2xs uppercase tracking-wide text-faint">
+                {srv.toolCount} tools
+              </div>
 
-            {/* V-11 (TOGGLE-HONESTY) grammar, exactly as SkillsPanel.tsx uses
-                it: a rejected `mcp.setEnabled` rolls the switch back and
-                names why, through this permanently-mounted LiveRegion. */}
-            <LiveRegion
-              text={toggleErr ? `Not saved: ${toggleErr}` : ''}
-              className="mt-1 text-2xs text-del"
-              title={toggleErr}
-            />
+              {/* V-11 (TOGGLE-HONESTY) grammar, exactly as SkillsPanel.tsx uses
+                  it: a rejected `mcp.setEnabled` rolls the switch back and
+                  names why, through this permanently-mounted LiveRegion. */}
+              <LiveRegion
+                text={toggleErr ? `Not saved: ${toggleErr}` : ''}
+                className="mt-1 text-2xs text-del"
+                title={toggleErr}
+              />
 
-            <div className="mt-2 flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => handleTest(srv.name)}
-                disabled={testInteraction.nativeDisabled}
-                aria-disabled={testInteraction.ariaDisabled}
-                aria-busy={testInteraction.ariaBusy}
-                className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
-              >
-                <Icon name={rowTesting ? 'loading' : 'beaker'} size={12} spin={rowTesting} />
-                {rowTesting ? 'Testing…' : 'Test'}
-              </button>
-              <button
-                type="button"
-                onClick={() => handleRemove(srv.name)}
-                disabled={removeInteraction.nativeDisabled}
-                aria-disabled={removeInteraction.ariaDisabled}
-                aria-busy={removeInteraction.ariaBusy}
-                className="flex items-center gap-1.5 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
-              >
-                <Icon name={rowRemoving ? 'loading' : 'trash'} size={12} spin={rowRemoving} />
-                {rowRemoving ? 'Removing…' : 'Remove'}
-              </button>
-              {/* Task A8 (§4.8): OAuth login only makes sense for HTTP-transport
-                  servers — stdio servers "authenticate via env keys, not OAuth"
-                  (`web_server.py:10568-10572`), which is exactly why the
-                  dispatcher itself 400s a stdio `mcp.auth` call; gating the
-                  button here keeps the panel from ever offering an action the
-                  host would refuse. */}
-              {srv.transport === 'http' && (
+              <div className="mt-2 flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => handleAuth(srv.name)}
-                  disabled={authInteraction.nativeDisabled}
-                  aria-disabled={authInteraction.ariaDisabled}
-                  aria-busy={authInteraction.ariaBusy}
+                  onClick={() => handleTest(srv.name)}
+                  disabled={testInteraction.nativeDisabled}
+                  aria-disabled={testInteraction.ariaDisabled}
+                  aria-busy={testInteraction.ariaBusy}
                   className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
                 >
-                  <Icon name={rowAuthing ? 'loading' : 'sign-in'} size={12} spin={rowAuthing} />
-                  {rowAuthing ? 'Waiting for browser sign-in…' : 'Login'}
+                  <Icon name={rowTesting ? 'loading' : 'beaker'} size={12} spin={rowTesting} />
+                  {rowTesting ? 'Testing…' : 'Test'}
                 </button>
-              )}
+                <button
+                  type="button"
+                  onClick={() => handleRemove(srv.name)}
+                  disabled={removeInteraction.nativeDisabled}
+                  aria-disabled={removeInteraction.ariaDisabled}
+                  aria-busy={removeInteraction.ariaBusy}
+                  className="flex items-center gap-1.5 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
+                >
+                  <Icon name={rowRemoving ? 'loading' : 'trash'} size={12} spin={rowRemoving} />
+                  {rowRemoving ? 'Removing…' : 'Remove'}
+                </button>
+                {/* Task A8 (§4.8): OAuth login only makes sense for HTTP-transport
+                    servers — stdio servers "authenticate via env keys, not OAuth"
+                    (`web_server.py:10568-10572`), which is exactly why the
+                    dispatcher itself 400s a stdio `mcp.auth` call; gating the
+                    button here keeps the panel from ever offering an action the
+                    host would refuse. */}
+                {srv.transport === 'http' && (
+                  <button
+                    type="button"
+                    onClick={() => handleAuth(srv.name)}
+                    disabled={authInteraction.nativeDisabled}
+                    aria-disabled={authInteraction.ariaDisabled}
+                    aria-busy={authInteraction.ariaBusy}
+                    className="flex items-center gap-1.5 rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
+                  >
+                    <Icon name={rowAuthing ? 'loading' : 'sign-in'} size={12} spin={rowAuthing} />
+                    {rowAuthing ? 'Waiting for browser sign-in…' : 'Login'}
+                  </button>
+                )}
+              </div>
+              <RowNoticeCard notice={rowNotice[srv.name]} />
             </div>
-            <RowNoticeCard notice={rowNotice[srv.name]} />
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
 
       <AddServerDisclosure onAdd={onAdd} onAdded={handleTest} />
       <CatalogDisclosure onCatalog={onCatalog} onCatalogInstall={onCatalogInstall} />

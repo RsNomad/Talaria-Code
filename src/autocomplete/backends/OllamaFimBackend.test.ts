@@ -280,3 +280,42 @@ describe('OllamaFimBackend.streamFim — mid-stream {error} chunk (T6, invariant
     expect(caught).toBeInstanceOf(BackendStreamError);
   });
 });
+
+describe('OllamaFimBackend.streamFim — WS-BG NDJSON chunk ingress', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function ndjsonBodyStream(lines: unknown[]): ReadableStream<Uint8Array> {
+    const bytes = new TextEncoder().encode(lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+  }
+
+  async function collect(lines: unknown[]): Promise<string[]> {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, body: ndjsonBodyStream(lines) } as unknown as Response),
+    );
+    const backend = new OllamaFimBackend({ apiBase: 'http://127.0.0.1:11434', model: 'qwen2.5-coder:1.5b-base' });
+    const parts: string[] = [];
+    for await (const t of backend.streamFim(req(), new AbortController().signal)) parts.push(t);
+    return parts;
+  }
+
+  it('non-record NDJSON lines are skipped, not dotted into', async () => {
+    expect(await collect([42, 'noise', ['x'], { response: 'ok' }, { done: true }])).toEqual(['ok']);
+  });
+
+  it('a non-string response field is dropped, never yielded as fake completion text', async () => {
+    expect(await collect([{ response: 7 }, { response: 'real' }, { done: true }])).toEqual(['real']);
+  });
+
+  it('a mid-stream error chunk still throws BackendStreamError (unchanged)', async () => {
+    await expect(collect([{ error: 'boom' }])).rejects.toThrow(BackendStreamError);
+  });
+});

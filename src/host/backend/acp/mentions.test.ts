@@ -1,10 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { mentionBlocks } from './mentions';
 import type { ResolvedContext } from '../../context/types';
+import { PROMPT_DEGRADE_INACTIVE, type PromptDegradeCaps } from './promptCaps';
+
+const INACTIVE = PROMPT_DEGRADE_INACTIVE;
+const ACTIVE: PromptDegradeCaps = { degradeEmbeddedResources: true };
 
 describe('mentionBlocks', () => {
   it('returns [] for empty input', () => {
-    expect(mentionBlocks([])).toEqual([]);
+    expect(mentionBlocks([], INACTIVE)).toEqual([]);
   });
 
   it('returns [] when every ref is skipped', () => {
@@ -22,7 +26,7 @@ describe('mentionBlocks', () => {
         skipped: { reason: 'unavailable', detail: 'no git extension' },
       },
     ];
-    expect(mentionBlocks(resolved)).toEqual([]);
+    expect(mentionBlocks(resolved, INACTIVE)).toEqual([]);
   });
 
   it('maps a link-only file ref to a bare resource_link with no bytes', () => {
@@ -34,7 +38,7 @@ describe('mentionBlocks', () => {
         linkOnly: true,
       },
     ];
-    expect(mentionBlocks(resolved)).toEqual([{ type: 'resource_link', uri: 'file:///repo/src/foo.ts', name: 'foo.ts' }]);
+    expect(mentionBlocks(resolved, INACTIVE)).toEqual([{ type: 'resource_link', uri: 'file:///repo/src/foo.ts', name: 'foo.ts' }]);
   });
 
   it('maps a link-only folder ref to a bare resource_link', () => {
@@ -46,7 +50,7 @@ describe('mentionBlocks', () => {
         linkOnly: true,
       },
     ];
-    expect(mentionBlocks(resolved)).toEqual([{ type: 'resource_link', uri: 'file:///repo/src', name: 'src' }]);
+    expect(mentionBlocks(resolved, INACTIVE)).toEqual([{ type: 'resource_link', uri: 'file:///repo/src', name: 'src' }]);
   });
 
   it('maps a non-link ref with text to an embedded text/plain resource', () => {
@@ -58,7 +62,7 @@ describe('mentionBlocks', () => {
         text: '```src/foo.ts:1-1\nconst x = 1;\n```',
       },
     ];
-    expect(mentionBlocks(resolved)).toEqual([
+    expect(mentionBlocks(resolved, INACTIVE)).toEqual([
       {
         type: 'resource',
         resource: { uri: 'selection://active', mimeType: 'text/plain', text: '```src/foo.ts:1-1\nconst x = 1;\n```' },
@@ -68,7 +72,7 @@ describe('mentionBlocks', () => {
 
   it('emits no block for a non-link ref with no text and not skipped', () => {
     const resolved: ResolvedContext[] = [{ ref: { id: '1', kind: 'terminal' }, uri: 'terminal://capture', title: 'terminal' }];
-    expect(mentionBlocks(resolved)).toEqual([]);
+    expect(mentionBlocks(resolved, INACTIVE)).toEqual([]);
   });
 
   it('maps a mixed batch: skipped dropped, link-only and embedded both emitted, in order', () => {
@@ -92,12 +96,40 @@ describe('mentionBlocks', () => {
         text: 'staged  a.ts\n\ndiff --git ...',
       },
     ];
-    expect(mentionBlocks(resolved)).toEqual([
+    expect(mentionBlocks(resolved, INACTIVE)).toEqual([
       { type: 'resource_link', uri: 'file:///repo/a.ts', name: 'a.ts' },
       {
         type: 'resource',
         resource: { uri: 'git://working-tree', mimeType: 'text/plain', text: 'staged  a.ts\n\ndiff --git ...' },
       },
+    ]);
+  });
+
+  it('WS-AC A-03 ACTIVE: an inlined ambient ref degrades to a titled plain-text block', () => {
+    const resolved: ResolvedContext[] = [
+      {
+        ref: { id: '1', kind: 'problems' },
+        uri: 'talaria://problems',
+        title: 'Problems',
+        text: 'E1: broken',
+      },
+    ];
+    expect(mentionBlocks(resolved, ACTIVE)).toEqual([
+      { type: 'text', text: '[Problems]\nE1: broken' },
+    ]);
+  });
+
+  it('WS-AC A-03 ACTIVE: linkOnly refs are untouched by the degrade', () => {
+    const resolved: ResolvedContext[] = [
+      {
+        ref: { id: '1', kind: 'file', path: '/repo/src/foo.ts' },
+        uri: 'file:///repo/src/foo.ts',
+        title: 'foo.ts',
+        linkOnly: true,
+      },
+    ];
+    expect(mentionBlocks(resolved, ACTIVE)).toEqual([
+      { type: 'resource_link', uri: 'file:///repo/src/foo.ts', name: 'foo.ts' },
     ]);
   });
 });

@@ -69,7 +69,9 @@ function collapseChildren(
   let removedChild = false;
   while (estimateTokenCount(working.trim()) > maxChunkTokens && collapsedChildren.length > 0) {
     removedChild = true;
-    const childCode = collapsedChildren.pop() as string;
+    const childCode = collapsedChildren.pop();
+    // The loop condition just checked length > 0; unreachable (typed-total).
+    if (childCode === undefined) break;
     const index = working.lastIndexOf(childCode);
     // AU-36:R12 — a match at offset 0 (`working.lastIndexOf` returns `0`)
     // is a legitimate find; `index > 0` silently skipped it (0 is not

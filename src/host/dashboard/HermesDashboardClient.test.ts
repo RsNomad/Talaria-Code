@@ -3,6 +3,7 @@ import {
   HermesDashboardClient,
   isHermesStatusShape,
   anySignal,
+  hasDashboardAdmin,
   type FetchLike,
 } from './HermesDashboardClient';
 import { must } from '../../testing/must';
@@ -66,7 +67,12 @@ function json(body: unknown, status = 200): Response {
 }
 
 function makeClient(fetchImpl: FetchLike, token?: string) {
-  return new HermesDashboardClient({ port: 9119, fetchImpl, token, timeoutMs: 1000 });
+  return new HermesDashboardClient({
+    port: 9119,
+    fetchImpl,
+    ...(token !== undefined ? { token } : {}),
+    timeoutMs: 1000,
+  });
 }
 
 describe('HermesDashboardClient — base URL + Host guard', () => {
@@ -495,5 +501,85 @@ describe('DashboardAdminClient — T2 skills endpoints', () => {
     expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/skills/hub/uninstall');
     expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ name: 'pdf' });
     expect(res).toEqual({ ok: true, name: 'pdf' });
+  });
+});
+
+/**
+ * AU-59: characterization of Hermes' env-store routes (`hermes_cli/
+ * web_server.py` `get_env_vars`/`set_env_var`/`remove_env_var`) against the
+ * stubbed fetch — BUILD-BLIND: wire correctness comes from the on-disk
+ * source, not a live dashboard. The `setEnvVar` body is the ONE place a
+ * secret value legitimately travels; every other surface (URL, thrown
+ * message, logger) must stay value-free.
+ */
+describe('DashboardAdminClient — AU-59 env endpoints (PUT/GET/DELETE /api/env)', () => {
+  it('setEnvVar PUTs {key, value} to /api/env (JSON body, token header) and resolves the {ok, key} envelope', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, key: 'MCP_GH_GITHUB_TOKEN' }));
+    const res = await makeClient(fetchImpl, 'tkn').setEnvVar('MCP_GH_GITHUB_TOKEN', 'ghp_value');
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/env');
+    expect(must(calls[0]).init?.method).toBe('PUT');
+    const headers = must(calls[0]).init?.headers as Record<string, string>;
+    expect(headers['Content-Type']).toBe('application/json');
+    expect(headers['X-Hermes-Session-Token']).toBe('tkn');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ key: 'MCP_GH_GITHUB_TOKEN', value: 'ghp_value' });
+    expect(res).toEqual({ ok: true, key: 'MCP_GH_GITHUB_TOKEN' });
+  });
+
+  it('setEnvVar: a 400 (invalid/denylisted name) rejects status-only; the server body goes to the logger; the VALUE goes nowhere', async () => {
+    const lines: string[] = [];
+    const { fetchImpl } = stubFetch(() => json({ detail: "Environment variable 'PATH' is on the writer denylist." }, 400));
+    const client = new HermesDashboardClient({ port: 9119, fetchImpl, timeoutMs: 1000, logger: { append: (l) => lines.push(l) } });
+    await expect(client.setEnvVar('PATH', 'ghp_value')).rejects.toThrow('Hermes dashboard PUT /api/env failed: 400');
+    await expect(client.setEnvVar('PATH', 'ghp_value')).rejects.not.toThrow(/denylist|ghp_value/);
+    expect(lines.join('\n')).toContain('writer denylist'); // response body → output channel only
+    expect(lines.join('\n')).not.toContain('ghp_value'); // request bodies are never logged
+  });
+
+  it('setEnvVar: the managed-mode false positive is REAL at this layer — a bare {ok:true} resolves (Layer 6 lives in the handler)', async () => {
+    const { fetchImpl } = stubFetch(() => json({ ok: true, key: 'X' }));
+    await expect(makeClient(fetchImpl).setEnvVar('X', 'v')).resolves.toEqual({ ok: true, key: 'X' });
+  });
+
+  it('listEnvKeys GETs /api/env with no body and returns the name-keyed row map with is_set intact (extra fields tolerated)', async () => {
+    const rows = {
+      MCP_GH_GITHUB_TOKEN: { is_set: true, redacted_value: 'ghp_****', category: 'custom', is_password: true, custom: true, channel_managed: false },
+      OPENAI_API_KEY: { is_set: false, redacted_value: null, category: 'provider' },
+    };
+    const { fetchImpl, calls } = stubFetch(() => json(rows));
+    const res = await makeClient(fetchImpl).listEnvKeys();
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/env');
+    expect(must(calls[0]).init?.method).toBe('GET');
+    expect(must(calls[0]).init?.body).toBeUndefined();
+    expect(res.MCP_GH_GITHUB_TOKEN?.is_set).toBe(true);
+    expect(res.OPENAI_API_KEY?.is_set).toBe(false);
+  });
+
+  it('removeEnvVar sends DELETE /api/env with a {key} JSON body (the route reads EnvVarDelete from the body, not the path)', async () => {
+    const { fetchImpl, calls } = stubFetch(() => json({ ok: true, key: 'MCP_GH_GITHUB_TOKEN' }));
+    await expect(makeClient(fetchImpl).removeEnvVar('MCP_GH_GITHUB_TOKEN')).resolves.toEqual({ ok: true, key: 'MCP_GH_GITHUB_TOKEN' });
+    expect(must(calls[0]).url).toBe('http://127.0.0.1:9119/api/env');
+    expect(must(calls[0]).init?.method).toBe('DELETE');
+    expect(JSON.parse(String(must(calls[0]).init?.body))).toEqual({ key: 'MCP_GH_GITHUB_TOKEN' });
+  });
+
+  it('removeEnvVar: a 404 (key not in .env — also what managed mode returns) rejects status-only, like removeMcpServer', async () => {
+    const { fetchImpl } = stubFetch(() => json({ detail: 'MCP_GH_GITHUB_TOKEN not found in .env' }, 404));
+    await expect(makeClient(fetchImpl).removeEnvVar('MCP_GH_GITHUB_TOKEN')).rejects.toThrow(/404/);
+    await expect(makeClient(fetchImpl).removeEnvVar('MCP_GH_GITHUB_TOKEN')).rejects.not.toThrow(/not found in \.env/);
+  });
+
+  it('hasDashboardAdmin fails CLOSED without any of the three env members (the structural guard grew with the surface)', () => {
+    const members = [
+      'addMcpServer', 'removeMcpServer', 'testMcpServer', 'setMcpServerEnabled', 'authMcpServer', 'listMcpCatalog',
+      'installCatalogEntry', 'actionStatus', 'createSkill', 'previewHubSkill', 'scanHubSkill', 'installHubSkill',
+      'uninstallHubSkill', 'setEnvVar', 'listEnvKeys', 'removeEnvVar',
+    ] as const;
+    const full: Record<string, unknown> = Object.fromEntries(members.map((m) => [m, () => undefined]));
+    expect(hasDashboardAdmin(full)).toBe(true);
+    for (const missing of ['setEnvVar', 'listEnvKeys', 'removeEnvVar'] as const) {
+      const partial: Record<string, unknown> = { ...full };
+      delete partial[missing];
+      expect(hasDashboardAdmin(partial)).toBe(false);
+    }
   });
 });

@@ -225,6 +225,34 @@ describe('session-lost at the App level (ARCH-1, UI I-3): a dead session disable
       screen.queryByPlaceholderText('Session lost — load it again from History or start a new chat'),
     ).not.toBeInTheDocument();
   });
+
+  it('UX-04c: the standing session-lost row speaks the reason and keeps History; legacy copy without one', async () => {
+    const { user } = setup(<App />);
+    act(() => {
+      bridge.emit({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        message: 'the session died when the agent restarted',
+        kind: 'session-lost',
+        reason: 'timeout',
+      });
+    });
+    // The standing row is gated on `!tab.error` (same as the other cases in
+    // this describe block) — dismiss the banner to reveal it.
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+
+    expect(screen.getByText('The agent did not respond while loading this session.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'History' })).toBeInTheDocument();
+  });
+
+  it('UX-04c: the standing row falls back to the legacy sentence when no reason rides the wire', async () => {
+    const { user } = setup(<App />);
+    emitSessionLost(); // no `reason` — legacy/back-compat emitter
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+
+    expect(screen.getByText("This chat's session was lost when the agent restarted.")).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'History' })).toBeInTheDocument();
+  });
 });
 
 /**
@@ -310,7 +338,10 @@ describe('T-16 F9: every PriorityTabs tab controls a real role=tabpanel, and non
     { label: 'History' },
     { label: 'Models' },
     { label: 'Setup' },
-    { label: 'Settings' },
+    // Task 27 (UX-14): nav label renamed 'Settings' -> 'Agent config' — the
+    // panel `id` ('settings', PANELS is only ever used to look tabs up by
+    // their human-facing name) does not change, only this pinned label.
+    { label: 'Agent config' },
   ];
 
   it('no tab in the Panels tablist carries aria-current (aria-selected is the correct tab state)', () => {
@@ -454,6 +485,165 @@ describe('W3-T6 (CF-11/D2): the composer posts tab.newSession, never the old con
       expect.objectContaining({ type: 'tab.newSession', tabId: BOOTSTRAP_TAB_ID }),
     );
     postSpy.mockRestore();
+  });
+});
+
+/**
+ * UX-04a: "Starting a new session…" pending state — mirrors the T10
+ * `stopPending` pattern for the New-Session flow (UX-03's own App-level
+ * counterpart is the GatewayHealthBanner describe below; this is the sibling
+ * for the composer's own New Session button). Proves the row + LiveRegion
+ * wiring against a REAL `<App>` render: `App.newSession` dispatches
+ * `local.newSessionPending` before posting `tab.newSession`, and only a
+ * `tab.bound`/`tab.error` terminal ever retires it — nothing in `Composer`
+ * itself owns this state.
+ */
+describe('UX-04a at the App level: "Starting a new session…" pending state', () => {
+  function setup(jsx: ReactElement) {
+    return { user: userEvent.setup(), ...render(jsx) };
+  }
+
+  it('clicking New Session shows the standing row + announces it via role="status"; tab.bound clears both', async () => {
+    const { user } = setup(<App />);
+
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    // The visible row's <span> and the permanently-mounted sr-only
+    // LiveRegion both carry the exact same text (Finding-7 discipline) — a
+    // bare `getByText` would throw on the duplicate match, so this asserts
+    // the COUNT (2) instead, same "duplicate exact text" shape as
+    // GatewayHealthBanner's own describe below, which sidesteps it the same
+    // way (getAllByRole('status').some(...) rather than a bare getByText).
+    expect(screen.getAllByText('Starting a new session…')).toHaveLength(2);
+    const announced = screen
+      .getAllByRole('status')
+      .some((el) => (el.textContent ?? '').includes('Starting a new session…'));
+    expect(announced).toBe(true);
+
+    act(() => {
+      bridge.emit({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 's1', rootId: '/r' });
+    });
+
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+  });
+
+  it('tab.error also clears it (a refusal is a terminal too — the row must not survive a failed New Session)', async () => {
+    const { user } = setup(<App />);
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+    expect(screen.getAllByText('Starting a new session…')).toHaveLength(2);
+
+    act(() => {
+      bridge.emit({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, message: 'no client', kind: 'open-failed' });
+    });
+
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+  });
+});
+
+/**
+ * WS-UX P2 M1 (wave-review cross-task Minor, T28 × T30/G-9): the two standing
+ * recovery rows (G-9 "Reconnect", ARCH-1 "History") must YIELD to the
+ * "Starting a new session…" pending row while a New Session is in flight for
+ * the tab — two truthful standing rows at once is a presentation conflict,
+ * resolved by render priority (same grammar as the rows' own `!tab.error`
+ * gates), NOT by stripping the host-owned `sessionLost`/`openFailed` markers
+ * in the reducer (see the `local.newSessionPending` fold comment,
+ * transcript.ts): the markers stay true in state, so a FAILED New Session
+ * attempt restores the recovery affordance by itself.
+ */
+describe('WS-UX P2 M1: standing recovery rows yield to the New-Session pending row', () => {
+  function setup(jsx: ReactElement) {
+    return { user: userEvent.setup(), ...render(jsx) };
+  }
+
+  /** Same idiom as the G-9 / session-lost describes above. */
+  function emitOpenFailed() {
+    act(() => {
+      bridge.emit({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        message: 'could not open the session',
+        kind: 'open-failed',
+      });
+    });
+  }
+
+  function emitSessionLost() {
+    act(() => {
+      bridge.emit({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        message: 'the session died when the agent restarted',
+        kind: 'session-lost',
+      });
+    });
+  }
+
+  it('clicking New Session on a session-lost tab swaps the standing History row for the pending row (no double standing-row)', async () => {
+    const { user } = setup(<App />);
+    emitSessionLost();
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+    // The revealed standing row — the M1 starting position.
+    expect(screen.getByRole('button', { name: 'History' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    // The pending row (visible <span> + sr-only LiveRegion twin — the same
+    // duplicate-exact-text COUNT idiom as the UX-04a describe above) is now
+    // the ONLY standing surface; the session-lost row must NOT stand beside it.
+    expect(screen.getAllByText('Starting a new session…')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'History' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("This chat's session was lost when the agent restarted."),
+    ).not.toBeInTheDocument();
+
+    // Host completes the flow in its real order: tab.clear FIRST (retires the
+    // lost/openFailed markers), then the fresh bind (retires the pending flag).
+    act(() => {
+      bridge.emit({ type: 'tab.clear', tabId: BOOTSTRAP_TAB_ID });
+    });
+    act(() => {
+      bridge.emit({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 's-new', rootId: '/r' });
+    });
+
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+    expect(screen.queryByRole('button', { name: 'History' })).not.toBeInTheDocument();
+  });
+
+  it('clicking New Session on an open-failed tab hides the standing Reconnect row while the request is in flight', async () => {
+    const { user } = setup(<App />);
+    emitOpenFailed();
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+    expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(screen.getAllByText('Starting a new session…')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'Reconnect' })).not.toBeInTheDocument();
+  });
+
+  it('a FAILED New Session attempt restores the standing History row — the fail-safe the render gate (vs a reducer strip) preserves', async () => {
+    const { user } = setup(<App />);
+    emitSessionLost();
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+    expect(screen.queryByRole('button', { name: 'History' })).not.toBeInTheDocument();
+
+    // The attempt fails: tab.error is the pending flag's other terminal. The
+    // fresh dismissible banner covers the rows (their `!tab.error` gate)…
+    emitOpenFailed();
+    await user.click(screen.getByRole('button', { name: 'Dismiss this error' }));
+
+    // …and once dismissed, the recovery affordance is BACK: `sessionLost`
+    // was never stripped from state, only out-prioritized while pending.
+    // (The G-9 Reconnect row also stands here — `openFailed` landed true too;
+    // that dual-marker rendering is pre-existing UX-04c-pinned behavior, not
+    // this fix's concern.)
+    expect(screen.queryAllByText('Starting a new session…')).toHaveLength(0);
+    expect(screen.getByRole('button', { name: 'History' })).toBeInTheDocument();
   });
 });
 
@@ -637,5 +827,65 @@ describe('Task 2 (P1 §3.3): cause-tagged setup fetch on panel.activate + hydrat
     // spreads it in when a caller passes one).
     expect(requestSpy).toHaveBeenCalledWith('panel.data', { panel: 'setup' }, undefined);
     requestSpy.mockRestore();
+  });
+});
+
+/**
+ * Task 13: App-level mount + end-to-end wiring for `GatewayHealthBanner`
+ * (Tasks 12/12b). Proves the three things the pure component tests cannot:
+ * the banner is actually mounted in the real tree, driven by the real
+ * `gateway.health` push; `onForceReconnect` is actually wired to
+ * `dispatchSetup('setup.reconnectAgent', {force:true})` over the correlated
+ * control wire; and the 12b confirm gate is actually wired to real tab
+ * liveness (`state.tabs[...].turnActive`), not just the component's own
+ * `anyTurnLive` prop in isolation.
+ */
+describe('UX-02 at the App level: gateway.health drives the standing banner', () => {
+  it('a down push mounts the banner + Force reconnect; an ok push retires it', () => {
+    render(<App />);
+    expect(screen.queryByText(/Management link/)).not.toBeInTheDocument();
+    act(() => {
+      bridge.emit({ type: 'gateway.health', state: 'down', attempts: 10 });
+    });
+    expect(screen.getByRole('button', { name: 'Force reconnect' })).toBeInTheDocument();
+    const announced = screen.getAllByRole('status').some((el) => (el.textContent ?? '').includes('Management link down'));
+    expect(announced).toBe(true);
+    act(() => {
+      bridge.emit({ type: 'gateway.health', state: 'ok' });
+    });
+    expect(screen.queryByRole('button', { name: 'Force reconnect' })).not.toBeInTheDocument();
+  });
+
+  it('Force reconnect posts setup.reconnectAgent {force:true} over the correlated control wire', async () => {
+    const user = userEvent.setup();
+    const request = vi.spyOn(bridge, 'request').mockResolvedValue({ ok: true });
+    try {
+      render(<App />);
+      act(() => {
+        bridge.emit({ type: 'gateway.health', state: 'degraded', attempts: 5 });
+      });
+      await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+      expect(request).toHaveBeenCalledWith('setup.reconnectAgent', { force: true });
+    } finally {
+      request.mockRestore();
+    }
+  });
+
+  it('12b wiring: with a live turn, Force reconnect asks first — confirming fires the {force:true} post', async () => {
+    const user = userEvent.setup();
+    const request = vi.spyOn(bridge, 'request').mockResolvedValue({ ok: true });
+    try {
+      render(<App />);
+      act(() => {
+        bridge.emit({ type: 'turn.start', turnId: 't1', sessionId: 's1' }); // same liveness idiom as the reducer suites
+        bridge.emit({ type: 'gateway.health', state: 'down', attempts: 10 });
+      });
+      await user.click(screen.getByRole('button', { name: 'Force reconnect' }));
+      expect(request).not.toHaveBeenCalled(); // asked, not fired — the 12b gate is actually WIRED to tab liveness
+      await user.click(screen.getByRole('button', { name: 'Force reconnect anyway' }));
+      expect(request).toHaveBeenCalledWith('setup.reconnectAgent', { force: true });
+    } finally {
+      request.mockRestore();
+    }
   });
 });

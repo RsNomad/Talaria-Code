@@ -133,7 +133,7 @@ export function fixCode(provider: SeedTarget, diagnostics: readonly vscode.Diagn
     severity: d.severity,
     line: d.range.start.line,
     message: d.message,
-    source: d.source,
+    ...(d.source !== undefined ? { source: d.source } : {}),
   }));
   runSeedAction('fix', provider, flat);
 }

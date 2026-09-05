@@ -121,13 +121,13 @@ export function createHermesCrossFileContextService(
     template: options.template,
     crossFileEnabled: options.crossFileEnabled,
     prefixInjection: options.prefixInjection,
-    backend: options.backend,
+    ...(options.backend !== undefined ? { backend: options.backend } : {}),
     ringBuffer,
     sources: [editTrackerSource, recentlyOpenedSource],
     getCurrentAnchor,
     getSkipUntrustedRemote: options.getSkipUntrustedRemote,
     getEnabled: options.getEnabled,
-    getWarmUpEnabled: options.getWarmUpEnabled,
+    ...(options.getWarmUpEnabled !== undefined ? { getWarmUpEnabled: options.getWarmUpEnabled } : {}),
   });
 
   const saveSub = vscode.workspace.onDidSaveTextDocument((doc) => {

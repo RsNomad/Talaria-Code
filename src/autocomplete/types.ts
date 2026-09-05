@@ -111,7 +111,7 @@ export interface FimBackend {
 /** Builds the raw FIM prompt string for a model family; unused by native-FIM backends. */
 export interface FimTemplate {
   render(prefix: string, suffix: string, ctx: FimContext): string;
-  stop: string[];
+  stop: readonly string[];
   /** Optional (single-owner boundary — see W5-T0 report): `true` on templates that
    *  know how to render `ctx.snippets` into the prompt (set by T4 on the two
    *  snippet-aware templates). `undefined`/absent = not snippet-aware = safe
@@ -134,7 +134,9 @@ export interface AutocompleteOptions {
 }
 
 export interface CompletionCache {
-  /** Longest-prefix match, returns the completion remainder (already-typed portion sliced off). */
-  get(prefixKey: string): string | undefined;
-  put(prefixKey: string, completion: string): void;
+  /** Longest-prefix match WITHIN the `contextKey` partition. `prefix === ''`
+   *  is never a hit and never stored (F1-10). Returns the completion
+   *  remainder (already-typed portion sliced off). */
+  get(contextKey: string, prefix: string): string | undefined;
+  put(contextKey: string, prefix: string, completion: string): void;
 }

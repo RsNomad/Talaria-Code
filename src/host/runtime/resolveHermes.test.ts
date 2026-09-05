@@ -1,11 +1,11 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import {
   resolveHermes,
   resolveHermesBin,
-  resetHermesBinCache,
+  createHermesBinCache,
   defaultExecLookup,
   type ExecLookup,
   type RealpathLookup,
@@ -40,21 +40,19 @@ const identityRealpath: RealpathLookup = async (p) => p;
 const alwaysAccessible: AccessCheck = async () => {};
 
 describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
-  beforeEach(() => resetHermesBinCache());
-
   it('an explicit hermesPath wins; the lookup is never executed', async () => {
     const { exec, calls } = fakeExec('/never/used');
     await expect(
-      resolveHermesBin({ hermesPath: '/opt/hermes/bin/hermes' }, exec),
+      resolveHermesBin({ hermesPath: '/opt/hermes/bin/hermes' }, exec, createHermesBinCache()),
     ).resolves.toBe('/opt/hermes/bin/hermes');
     expect(calls).toEqual([]);
   });
 
   it('runs `command -v hermes` through the login shell with a 10s timeout and trims stdout', async () => {
     const { exec, calls } = fakeExec('/home/u/.venvs/hermes/bin/hermes\n');
-    await expect(resolveHermesBin({ shell: '/bin/zsh' }, exec)).resolves.toBe(
-      '/home/u/.venvs/hermes/bin/hermes',
-    );
+    await expect(
+      resolveHermesBin({ shell: '/bin/zsh' }, exec, createHermesBinCache()),
+    ).resolves.toBe('/home/u/.venvs/hermes/bin/hermes');
     // NOTE: no `exec` wrapper here. `command` is a POSIX shell builtin, not an
     // external executable — `exec command -v hermes` fails with exit 127
     // ("exec: command: not found") because `exec` only PATH-searches for real
@@ -66,14 +64,24 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
 
   it('takes the LAST stdout line (login-shell profile noise precedes the answer)', async () => {
     const { exec } = fakeExec('Welcome back!\nmotd line\n/usr/local/bin/hermes\n');
-    await expect(resolveHermesBin({}, exec)).resolves.toBe('/usr/local/bin/hermes');
+    await expect(resolveHermesBin({}, exec, createHermesBinCache())).resolves.toBe(
+      '/usr/local/bin/hermes',
+    );
   });
 
   it('caches a successful lookup for the process lifetime (one exec total)', async () => {
     const { exec, calls } = fakeExec('/usr/local/bin/hermes\n');
-    await resolveHermesBin({}, exec);
-    await resolveHermesBin({}, exec);
+    const cache = createHermesBinCache();
+    await resolveHermesBin({}, exec, cache);
+    await resolveHermesBin({}, exec, cache);
     expect(calls).toHaveLength(1);
+  });
+
+  it('TST-02: two caches are independent — a hit in one never short-circuits the other', async () => {
+    const { exec, calls } = fakeExec('/usr/local/bin/hermes\n');
+    await resolveHermesBin({}, exec, createHermesBinCache());
+    await resolveHermesBin({}, exec, createHermesBinCache());
+    expect(calls).toHaveLength(2);
   });
 
   it('a failed exec surfaces an actionable error naming talaria.hermesPath — and is NOT cached', async () => {
@@ -82,17 +90,21 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
       attempts += 1;
       throw new Error('ETIMEDOUT');
     };
-    await expect(resolveHermesBin({}, failing)).rejects.toThrow(/talaria\.hermesPath/);
-    await expect(resolveHermesBin({}, failing)).rejects.toThrow();
+    const cache = createHermesBinCache();
+    await expect(resolveHermesBin({}, failing, cache)).rejects.toThrow(/talaria\.hermesPath/);
+    await expect(resolveHermesBin({}, failing, cache)).rejects.toThrow();
     expect(attempts).toBe(2); // failure retried, never cached
   });
 
   it('empty or non-absolute output is rejected with the actionable error', async () => {
     const { exec } = fakeExec('\n');
-    await expect(resolveHermesBin({}, exec)).rejects.toThrow(/talaria\.hermesPath/);
-    resetHermesBinCache();
+    await expect(resolveHermesBin({}, exec, createHermesBinCache())).rejects.toThrow(
+      /talaria\.hermesPath/,
+    );
     const relative = fakeExec('hermes: aliased to hx\n');
-    await expect(resolveHermesBin({}, relative.exec)).rejects.toThrow(/talaria\.hermesPath/);
+    await expect(
+      resolveHermesBin({}, relative.exec, createHermesBinCache()),
+    ).rejects.toThrow(/talaria\.hermesPath/);
   });
 
   it('AUDIT-5 SEC M-2: the login-shell discovery pins a NON-workspace cwd (os.homedir) so workspace auto-env hooks (direnv) can never steer PATH', async () => {
@@ -101,8 +113,7 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
       seen.push(opts);
       return '/usr/local/bin/hermes\n';
     };
-    resetHermesBinCache();
-    await resolveHermesBin({ hermesPath: undefined, pythonPath: undefined, cwd: undefined }, exec);
+    await resolveHermesBin({}, exec, createHermesBinCache());
     expect(seen[0]?.cwd).toBe(os.homedir());
   });
 
@@ -113,6 +124,7 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
       exec,
       identityRealpath,
       alwaysAccessible,
+      createHermesBinCache(),
     );
     expect(resolved.hermesBin).toBe('/home/u/.venvs/hermes/bin/hermes');
     expect(resolved.python).toBe('/home/u/.venvs/hermes/bin/python');
@@ -127,6 +139,7 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
       exec,
       identityRealpath,
       alwaysAccessible,
+      createHermesBinCache(),
     );
     // `exec` replaces the login shell so SIGTERM/SIGKILL from disposal reaches
     // the real child. Only the one-shot `command -v hermes` lookup should skip it.
@@ -139,18 +152,17 @@ describe('resolveHermesBin — R-A5: real cached login-shell lookup', () => {
   it('AUDIT-5 SEC M-3: with no workspace open (cwd undefined), resolveHermes falls back to os.homedir() — never process.cwd() (the EH install dir)', async () => {
     const { exec } = fakeExec('/home/u/.venvs/hermes/bin/hermes\n');
     const resolved = await resolveHermes(
-      { cwd: undefined, shell: '/bin/bash' },
+      { shell: '/bin/bash' },
       exec,
       identityRealpath,
       alwaysAccessible,
+      createHermesBinCache(),
     );
     expect(resolved.cwd).toBe(os.homedir());
   });
 });
 
 describe('resolveHermes — AU-7: symlink-blind interpreter derivation (INV-9 / ADR-3)', () => {
-  beforeEach(() => resetHermesBinCache());
-
   it('a pipx-shim symlink derives python from the REALPATH TARGET, not the symlink\'s own sibling (fails at HEAD: string-sibling math never realpaths)', async () => {
     // pipx layout (V5): `~/.local/bin/hermes` is a SYMLINK into
     // `~/.local/share/pipx/venvs/hermes-agent/bin/`; pipx puts no `python` in
@@ -173,7 +185,7 @@ describe('resolveHermes — AU-7: symlink-blind interpreter derivation (INV-9 / 
       }
     };
 
-    const resolved = await resolveHermes({}, exec, realpathImpl, accessImpl);
+    const resolved = await resolveHermes({}, exec, realpathImpl, accessImpl, createHermesBinCache());
 
     expect(resolved.python).toBe('/home/u/.local/share/pipx/venvs/hermes-agent/bin/python');
     expect(resolved.python).not.toBe('/home/u/.local/bin/python'); // the symlink's own (nonexistent) sibling
@@ -194,9 +206,9 @@ describe('resolveHermes — AU-7: symlink-blind interpreter derivation (INV-9 / 
       throw new Error('ENOENT');
     };
 
-    await expect(resolveHermes({}, exec, realpathImpl, accessImpl)).rejects.toThrow(
-      /talaria\.pythonPath/,
-    );
+    await expect(
+      resolveHermes({}, exec, realpathImpl, accessImpl, createHermesBinCache()),
+    ).rejects.toThrow(/talaria\.pythonPath/);
     // realpath failure fell back to the LEXICAL sibling (still attempted a
     // derivation, never silently gave up before the existence check).
     expect(seenAccessArgs).toEqual(['/home/u/.local/bin/python']);
@@ -219,6 +231,7 @@ describe('resolveHermes — AU-7: symlink-blind interpreter derivation (INV-9 / 
       exec,
       realpathImpl,
       accessImpl,
+      createHermesBinCache(),
     );
 
     expect(resolved.python).toBe('/opt/custom/bin/python');
@@ -280,4 +293,25 @@ describe('defaultExecLookup — TC-5 (AU-28): AbortSignal actually kills the in-
 
     await expect(promise).rejects.toThrow();
   }, 3_000);
+});
+
+describe('TST-02: the DEFAULT cache is one process-wide singleton shared by resolveHermesBin AND resolveHermes', () => {
+  // Every other test in this file passes its own `createHermesBinCache()`, so
+  // the module-level default is exercised ONLY here — on a FRESH module
+  // instance (`vi.resetModules()` + dynamic import), so this pin can neither
+  // be polluted by nor pollute any other test regardless of order. This is
+  // the R-A5 production contract: `setupHost`'s `discoverHermes` and the
+  // runtime's `resolveHermes` (ACP + control + dashboard) all share ONE
+  // login-shell lookup per extension-host lifetime.
+  it('one login-shell lookup serves both entry points', async () => {
+    vi.resetModules();
+    const fresh = await import('./resolveHermes');
+    const { exec, calls } = fakeExec('/home/u/.venvs/hermes/bin/hermes\n');
+
+    await expect(fresh.resolveHermesBin({}, exec)).resolves.toBe('/home/u/.venvs/hermes/bin/hermes');
+    const resolved = await fresh.resolveHermes({ shell: '/bin/bash' }, exec, identityRealpath, alwaysAccessible);
+
+    expect(resolved.hermesBin).toBe('/home/u/.venvs/hermes/bin/hermes');
+    expect(calls).toHaveLength(1); // the second entry point hit the SAME default cache
+  });
 });

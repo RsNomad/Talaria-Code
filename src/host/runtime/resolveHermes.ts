@@ -182,17 +182,38 @@ export const defaultExecLookup: ExecLookup = (command, args, opts) =>
   });
 
 /**
+ * The `hermes` lookup cache {@link resolveHermesBin} reads and (on success
+ * only) writes. `get()` is `undefined` until a successful lookup has landed;
+ * `set()` is only ever called with a `/`-prefixed absolute path.
+ */
+export interface HermesBinCache {
+  get(): string | undefined;
+  set(bin: string): void;
+}
+
+/**
+ * TST-02: build one lookup cache. The module-private default below is the
+ * process-wide singleton every production caller shares; a test that needs
+ * isolation passes its own to {@link resolveHermesBin}/{@link resolveHermes}
+ * — there is no module-level reset.
+ */
+export function createHermesBinCache(): HermesBinCache {
+  let cachedHermesBin: string | undefined;
+  return {
+    get: () => cachedHermesBin,
+    set: (bin) => {
+      cachedHermesBin = bin;
+    },
+  };
+}
+
+/**
  * R-A5: successful discovery is cached for the extension-host lifetime —
  * `hermes` does not move mid-session, and every `resolveHermes` call (two
  * channels + dashboard) would otherwise pay a login-shell spawn. Failures are
  * NEVER cached (the user may install hermes and retry).
  */
-let cachedHermesBin: string | undefined;
-
-/** Test-only: clear the module-level lookup cache. */
-export function resetHermesBinCache(): void {
-  cachedHermesBin = undefined;
-}
+const defaultHermesBinCache: HermesBinCache = createHermesBinCache();
 
 /**
  * Locate the `hermes` executable.
@@ -212,9 +233,11 @@ export function resetHermesBinCache(): void {
 export async function resolveHermesBin(
   config: HermesRuntimeConfig,
   exec: ExecLookup = defaultExecLookup,
+  cache: HermesBinCache = defaultHermesBinCache,
 ): Promise<string> {
   if (config.hermesPath) return config.hermesPath;
-  if (cachedHermesBin) return cachedHermesBin;
+  const cached = cache.get();
+  if (cached) return cached;
 
   const lookup = loginShellSpawn('command', ['-v', 'hermes'], config, { exec: false });
   let stdout: string;
@@ -245,7 +268,7 @@ export async function resolveHermesBin(
         `Set the 'talaria.hermesPath' setting to the absolute path of the hermes executable.`,
     );
   }
-  cachedHermesBin = bin;
+  cache.set(bin);
   return bin;
 }
 
@@ -313,8 +336,9 @@ export async function resolveHermes(
   exec?: ExecLookup,
   realpathImpl: RealpathLookup = defaultRealpathLookup,
   accessImpl: AccessCheck = defaultAccessCheck,
+  cache: HermesBinCache = defaultHermesBinCache,
 ): Promise<ResolvedHermes> {
-  const hermesBin = await resolveHermesBin(config, exec);
+  const hermesBin = await resolveHermesBin(config, exec, cache);
   const python =
     config.pythonPath ?? (await deriveAndVerifyPython(hermesBin, realpathImpl, accessImpl));
   // AUDIT-5 SEC M-3 (F-2): no workspace open -> the agent runs from $HOME,

@@ -164,6 +164,113 @@ import { isSecretForCompletion } from '../shared/secretPaths';
 // file — the real scanner runs against real chunk content (SEC-1, audit-3).
 import { scanSnippetForSecrets } from '../autocomplete/context/secretScanner';
 
+// TST-01 (WS-R2): fake timers make the debounce + async-handler settling
+// deterministic — the `.not.toHaveBeenCalled()`-after-sleep assertions below
+// are otherwise a wall-clock false-pass direction. The only production timer
+// in play is the watch() debounce (indexer.ts); the embedder/store are mocked
+// (no real network/IO timer), so faking timers globally is safe here.
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+// TST-01 (WS-R2) drain helpers. The watch path is fire-and-forget behind a
+// debounce timer (indexer.ts schedule(): setTimeout(debounceMs) -> void
+// handleFsEvent().catch()). A single vi.advanceTimersByTimeAsync(N) FIRES the
+// debounce but @sinonjs/fake-timers' doTick async branch yields only ~one real
+// macrotask turn per fake-timer firing, whereas handleFsEvent's REAL
+// fs.promises chain (readManifest -> lstat -> resolveWithinWorkspaceReal's 2x
+// realpath -> readMeta -> reindexFiles -> writeManifest) needs MANY real turns
+// to drain -- a count that varies by platform (Windows Defender/NTFS inflate
+// it vs the Fedora CI target). A fixed extra-tick count is therefore
+// platform-dependent and flaky. advanceTimersByTimeAsync(0) NEVER advances
+// virtual time (tickTo === now), so it cannot fire a not-yet-due timer nor
+// perturb any time-ordering assertion -- it only hands the real event loop one
+// more turn. drainUntil loops it until the caller's predicate observes the
+// handler's real effect: it waits EXACTLY as many turns as the I/O needs, on
+// any platform. The cap only trips on a genuine hang (a wrong predicate or a
+// handler that never produces the awaited effect), turning an infinite hang
+// into a fast, legible failure.
+const WATCH_DRAIN_CAP = 5000;
+async function drainUntil(until: () => boolean): Promise<void> {
+  for (let i = 0; i < WATCH_DRAIN_CAP; i++) {
+    if (until()) return;
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  throw new Error(
+    'drainUntil: watch handler did not settle within ' +
+      WATCH_DRAIN_CAP +
+      ' drain turns -- the awaited condition never held (a real hang, or a wrong until() predicate).',
+  );
+}
+/** Fire the pending debounce, then drain real event-loop turns until `until`
+ * observes the fire-and-forget handler's effect. */
+async function flushWatch(debounceMs: number, until: () => boolean): Promise<void> {
+  await vi.advanceTimersByTimeAsync(debounceMs);
+  await drainUntil(until);
+}
+
+/**
+ * B1a: production's `writeManifest` writes via a same-dir `.tmp` file then
+ * `fs.rename`s it into place — atomic on the target's Linux filesystem, so a
+ * concurrent reader NEVER observes a torn write and the rename ITSELF never
+ * fails there. This dev box (Windows) has no such guarantee: a `readFileSync`
+ * of the live manifest file that happens to run while `fs.rename` is
+ * transiently mid-flight can hold the destination open long enough to make
+ * the Windows MoveFileEx equivalent fail outright with a sharing violation —
+ * a purely Windows-dev-box artifact of a `drainUntil`/`flushWatch` predicate
+ * READING the manifest FILE mid-build, not a real production bug. B1 papered
+ * over this with a Windows-only retry loop in production; B1a removes that
+ * (POSIX has no such failure mode to retry around) and fixes it on the test
+ * side instead: no drain predicate below may read the manifest file while a
+ * build/reindex could still be in flight.
+ *
+ * This plain array-push call-through recorder (no `vi.fn()`/`vi.spyOn` —
+ * matches this file's other fakes, e.g. `nextEditNotice.vscode.test.ts`) lets
+ * a predicate wait for the RENAME ITSELF — `writeManifest`'s atomic commit
+ * signal — instead of the file's content. The real rename still runs
+ * (call-through), so the file on disk, and every POST-drain assertion (which
+ * only runs after the build has settled, so there is no race there), are
+ * unaffected.
+ *
+ * `real`/`restore` are captured as LOCALS inside each `beforeEach`
+ * invocation, not a shared outer `let` re-read at call time: several tests
+ * in this file (by design — see F3-11's "dangling `buildChain`" tests)
+ * deliberately leave an unawaited `build()`/watch chain still running past
+ * their own test's completion, so an OLDER test's wrapper can still fire its
+ * real `fs.rename` call while a LATER test is executing. A shared mutable
+ * "real" binding would have every still-live wrapper (from every test so
+ * far) call whatever the CURRENT test most recently captured — on a long
+ * enough chain of leftover wrappers this can loop back on itself. Each
+ * `beforeEach` call's own `real`/`restore` closure pair is self-contained,
+ * so an old wrapper firing late always still resolves to a genuine,
+ * terminating call chain down to the true `fs.rename`.
+ */
+let renameCommits: Array<[string, string]>;
+let restoreRename: () => void;
+beforeEach(() => {
+  renameCommits = [];
+  const real = fs.rename;
+  fs.rename = (async (
+    from: Parameters<typeof fs.rename>[0],
+    to: Parameters<typeof fs.rename>[1],
+  ): Promise<void> => {
+    // Record AFTER the real rename resolves, not before — a predicate must
+    // only see a rename that actually LANDED (the genuine atomic-commit
+    // signal), never one merely attempted (which could still reject).
+    await (real as typeof fs.rename)(from, to);
+    renameCommits.push([String(from), String(to)]);
+  }) as typeof fs.rename;
+  restoreRename = () => {
+    fs.rename = real;
+  };
+});
+afterEach(() => {
+  restoreRename();
+});
+
 describe('createIndexer — secret-path filtering (W5-T6)', () => {
   let workspaceRoot: string;
   let indexDir: string;
@@ -314,9 +421,10 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
     const onCreate = fsWatcherListeners.create[0]!;
     onCreate({ fsPath: path.join(workspaceRoot, '.env') });
 
-    // past the 10ms debounce configured above, plus slack for the async
-    // handler (fs read + manifest read/write) to complete.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Drain the fire-and-forget secret-path handler until its terminal purge is
+    // observed; `upsert not called` then holds by construction (the secret
+    // branch purges and returns, never reaching embed/upsert).
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === '.env'));
 
     expect(upsertMock).not.toHaveBeenCalled();
     expect(deleteByPathMock).toHaveBeenCalledWith('.env');
@@ -334,7 +442,7 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
     const onCreate = fsWatcherListeners.create[0]!;
     onCreate({ fsPath: path.join(workspaceRoot, 'src/app.txt') });
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(10, () => upsertMock.mock.calls.length > 0);
 
     expect(upsertMock).toHaveBeenCalled();
 
@@ -637,7 +745,10 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
     // does not touch b's embed call; the mock reverts to its normal fast
     // implementation for every call after this one.
     embedMock.mockImplementationOnce(async (texts: string[]) => {
-      await new Promise((resolve) => setTimeout(resolve, 80));
+      // KEEP (TST-01 #3): this nested tickAsync self-drives its own 80ms
+      // range (validated); do NOT convert to a real setTimeout — a setTimeout
+      // delay never fires under the advanceTimersByTimeAsync(0) drain.
+      await vi.advanceTimersByTimeAsync(80);
       return texts.map(() => [0.1, 0.2, 0.3]);
     });
 
@@ -648,11 +759,22 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
     // serialized, b's fast cycle would finish and write first, and a's slow
     // cycle would finish later and overwrite b's entry with a stale
     // manifest that never saw it.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // KEEP (TST-01 #4): sequences a's debounce ahead of b; leave as a
+    // virtual-time advance.
+    await vi.advanceTimersByTimeAsync(20);
     onChange({ fsPath: path.join(workspaceRoot, 'b.txt') });
 
-    // Comfortably past both debounces plus the artificial 80ms embed delay.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // b's debounce timer was already fired by a's nested-80 advance above;
+    // drain (no extra debounce advance) until both serialize()-ordered
+    // cycles have written their entries. B1a: anchor on the WRITE COMMIT
+    // itself (the `fs.rename` call `writeManifest` makes) rather than
+    // reading the live manifest.json file — that read is exactly what raced
+    // production's own in-flight rename on this dev box (see the recorder's
+    // doc comment above). Each cycle's success path calls `writeManifest`
+    // exactly once, so two renames to `manifestPath` means both cycles'
+    // entries have actually landed on disk.
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    await drainUntil(() => renameCommits.filter(([, to]) => to === manifestPath).length >= 2);
 
     const manifest = await readManifest();
     expect(manifest['a.txt']).toBeDefined();
@@ -715,9 +837,10 @@ describe('RAG-4: watch() Disposable clears pending debounce timers on dispose', 
     // elapses must cancel the pending timer, not just stop future events.
     disposable.dispose();
 
-    // Comfortably past the debounce window, with slack for the (would-be)
-    // async handler to have run if the timer had fired.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // KEEP (TST-01 #6): the timer was cleared by dispose() above, so
+    // advancing fires nothing; `init not called` holds deterministically by
+    // construction, without any drain.
+    await vi.advanceTimersByTimeAsync(200);
 
     // handleFsEvent's first action is ensureStoreInitialized() -> store.init()
     // — if the timer had fired despite dispose(), initMock would have been
@@ -739,7 +862,7 @@ describe('RAG-4: watch() Disposable clears pending debounce timers on dispose', 
 
     // Past the 10ms debounce, plus slack for the async handler to complete —
     // dispose() only happens AFTER the timer has already fired.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(10, () => upsertMock.mock.calls.length > 0);
     disposable.dispose();
 
     expect(upsertMock).toHaveBeenCalled();
@@ -871,7 +994,11 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     upsertMock.mockClear();
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(indexDir, 'manifest.json') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // KEEP (TST-01 #8): the prior build() left the ignore filter CACHED, so
+    // the handler awaits a cached predicate (a microtask, no fs) and
+    // early-returns at the isUnderIndexDir gate within microtasks — a single
+    // advance settles it deterministically.
+    await vi.advanceTimersByTimeAsync(200);
 
     expect(embedMock).not.toHaveBeenCalled();
     expect(upsertMock).not.toHaveBeenCalled();
@@ -892,7 +1019,7 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
         const disposable = indexer.watch();
 
         fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'vault', 'private.txt') });
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await flushWatch(5, () => deleteByPathMock.mock.calls.some(([p]) => p === 'vault/private.txt'));
 
         expect(embedMock).not.toHaveBeenCalled(); // at HEAD: fs.readFile FOLLOWS the link and the content IS embedded
         expect(upsertMock).not.toHaveBeenCalled();
@@ -916,7 +1043,7 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
         const disposable = indexer.watch();
 
         fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'link.txt') });
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await flushWatch(5, () => deleteByPathMock.mock.calls.some(([p]) => p === 'link.txt'));
 
         expect(embedMock).not.toHaveBeenCalled();
         expect(deleteByPathMock.mock.calls.map(([p]) => p)).toContain('link.txt');
@@ -936,7 +1063,11 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
       const disposable = indexer.watch();
 
       fsWatcherListeners.change[0]!({ fsPath: path.join(sibling, 'b.ts') });
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // KEEP (TST-01 #11): handleFsEvent early-returns at the SYNCHRONOUS
+      // !isPathValid(relPath) guard (no await before it), so it runs to
+      // completion synchronously the instant the debounce fires — a single
+      // advance settles it deterministically.
+      await vi.advanceTimersByTimeAsync(200);
 
       // At HEAD: ignore@7 throws RangeError inside the filter, caught by
       // schedule()'s catch -> console.error('hermes-codebase: incremental reindex failed', ...).
@@ -953,7 +1084,9 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
   it('CR-B: a watcher event racing the first build() runs store.init() exactly ONCE (memoized single-flight)', async () => {
     await writeWorkspaceFile('src/app.txt', 'ordinary content to chunk and index.\n');
     initMock.mockImplementationOnce(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 100)); // first native init is slow — the cold-start race window
+      // KEEP (TST-01 #12): this nested tickAsync self-drives (validated) —
+      // first native init is slow, the cold-start race window.
+      await vi.advanceTimersByTimeAsync(100);
     });
     const indexer = makeIndexer(5);
     const disposable = indexer.watch();
@@ -961,7 +1094,10 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     const buildPromise = indexer.build(); // enters ensureStoreInitialized, parks on the slow init
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') }); // fires ~5ms in, while init is pending
     await buildPromise;
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The racing watch debounce was already fired by the init's nested-100
+    // advance above; drain (no extra debounce advance) until build's own
+    // reindex (1 upsert) plus the racing watch reindex (2nd upsert) both land.
+    await drainUntil(() => upsertMock.mock.calls.length >= 2);
 
     expect(initMock).toHaveBeenCalledTimes(1); // at HEAD: 2 — both callers pass the un-set flag
     disposable.dispose();
@@ -979,8 +1115,18 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     const disposable = indexer.watch();
     deleteByPathMock.mockClear();
 
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    const renameCountBeforeDelete = renameCommits.filter(([, to]) => to === manifestPath).length;
     fsWatcherListeners.delete[0]!({ fsPath: path.join(workspaceRoot, 'src') }); // ONE event for the dir — the granularity ARCH-5 names
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // B1a: anchor on the delete-branch's SINGLE `writeManifest` commit (one
+    // new rename to `manifestPath`, observed via the call-through recorder)
+    // instead of reading the live manifest.json file inside the drain loop —
+    // see the recorder's doc comment for why that read races production's
+    // in-flight rename on this dev box.
+    await flushWatch(
+      5,
+      () => renameCommits.filter(([, to]) => to === manifestPath).length > renameCountBeforeDelete,
+    );
 
     const deleted = deleteByPathMock.mock.calls.map(([p]) => p);
     expect(deleted).toContain('src/a.txt');
@@ -992,7 +1138,7 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
   });
 });
 
-describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBuild', () => {
+describe('AUDIT-5 Task 10: RAG perf — cached ignore filter (the single-read runBuild optimization below was intentionally reverted by RAG-01 — see the RAG-01 describe block further down)', () => {
   let workspaceRoot: string;
   let indexDir: string;
 
@@ -1044,9 +1190,9 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
     const disposable = indexer.watch();
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'a.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(5, () => upsertMock.mock.calls.flatMap(([r]) => r.map((x) => x.path)).includes('a.txt'));
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'b.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await flushWatch(5, () => upsertMock.mock.calls.flatMap(([r]) => r.map((x) => x.path)).includes('b.txt'));
 
     // At HEAD: loadIgnoreFilter() re-reads .gitignore on EVERY handleFsEvent
     // call — 2 events -> 2 reads, growing unboundedly with watcher traffic.
@@ -1067,17 +1213,23 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
     // Prime the cache with the OLD .gitignore (no generated/** rule) via an
     // unrelated event.
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'unrelated.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // The file is not on disk -> the unconfinable/ENOENT branch purges it;
+    // that purge also proves the ignore filter was (re)loaded and cached.
+    await flushWatch(5, () => deleteByPathMock.mock.calls.some(([p]) => p === 'unrelated.txt'));
 
     await writeWorkspaceFile('.gitignore', 'generated/**\n');
-    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, '.gitignore') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, '.gitignore') }); // keep the fire line!
+    await flushWatch(5, () => upsertMock.mock.calls.flatMap(([r]) => r.map((x) => x.path)).includes('.gitignore'));
 
     embedMock.mockClear();
     upsertMock.mockClear();
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'generated', 'x.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // KEEP (TST-01 #19): the prior .gitignore-change event repopulated the
+    // cache WITH the generated/** rule, so this handler hits the warm cache
+    // and early-returns at the ignoreFilter gate within microtasks — a
+    // single advance settles it deterministically.
+    await vi.advanceTimersByTimeAsync(200);
 
     expect(embedMock).not.toHaveBeenCalled();
     expect(upsertMock).not.toHaveBeenCalled();
@@ -1086,7 +1238,7 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
     indexer.dispose();
   });
 
-  it("RED: runBuild reads each candidate file's bytes ONCE — reindexFiles reuses the hash-pass buffer instead of re-reading", async () => {
+  it("RAG-01 (2026-08-28) intentionally reverted this: runBuild now reads each CHANGED candidate's bytes TWICE — the hash pass no longer retains a buffer for reindexFiles to reuse", async () => {
     await writeWorkspaceFile('src/app.ts', 'export const x = 1;\n');
     const absPath = path.join(workspaceRoot, 'src', 'app.ts');
 
@@ -1095,14 +1247,201 @@ describe('AUDIT-5 Task 10: RAG perf — cached ignore filter + single-read runBu
 
     await indexer.build();
 
-    // At HEAD: runBuild's hash pass reads absPath once (indexer.ts's
-    // `current` loop), then reindexFiles reads it AGAIN for every path that
-    // ends up in `toCompute` — everything, on a fresh build — even though
-    // the content cannot have changed between the two passes.
-    expect(readFileCallsFor(readFileSpy, absPath)).toBe(1);
+    // Pre-RAG-01 (AUDIT-5 Task 10): runBuild's hash pass read absPath once
+    // and handed the same buffer to reindexFiles via a retained `preloaded`
+    // map, so the embed pass never read it again — 1 total. RAG-01 removed
+    // that map to bound peak memory during hashing by ONE file instead of
+    // the whole repo: the hash pass now reads-and-releases, and reindexFiles
+    // reads the same changed target again itself for the embed pass — 2
+    // total. (Unchanged files are still read only once — see the RAG-01
+    // describe block below.)
+    expect(readFileCallsFor(readFileSpy, absPath)).toBe(2);
 
     readFileSpy.mockRestore();
     indexer.dispose();
+  });
+});
+
+describe('RAG-01: the full-build hash pass streams — it no longer retains every candidate buffer in a `preloaded` map', () => {
+  it('a full first build reads each CHANGED file for BOTH the hash pass and the embed pass (2x total) — only true once the preloaded buffer map is removed', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b5a-count-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      const relPaths = ['src/f0.txt', 'src/f1.txt', 'src/f2.txt'];
+      for (const rel of relPaths) {
+        await fs.writeFile(path.join(workspaceRoot, rel), `content of ${rel}\n`, 'utf8');
+      }
+      const absPaths = relPaths.map((rel) => path.join(workspaceRoot, rel));
+
+      // Plain array-push call-through recorder (no `vi.fn()`/`vi.spyOn` — the
+      // same idiom as this file's top-level `fs.rename` wrapper above):
+      // monkey-patch fs.readFile directly, record every absolute path it is
+      // invoked with, delegate to the real implementation, restore after.
+      const readCalls: string[] = [];
+      const realReadFile = fs.readFile;
+      fs.readFile = ((filePath: Parameters<typeof fs.readFile>[0], ...rest: unknown[]) => {
+        readCalls.push(String(filePath));
+        return (realReadFile as typeof fs.readFile)(filePath as never, ...(rest as unknown as never[]));
+      }) as typeof fs.readFile;
+
+      const indexer = createIndexer({
+        workspaceRoot,
+        indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434',
+        embedModel: 'test-model',
+        debounceMs: 10,
+      });
+      try {
+        await indexer.build();
+      } finally {
+        fs.readFile = realReadFile;
+      }
+
+      // Today's retained-buffer code reads each changed file ONCE — the hash
+      // pass's buffer is handed to reindexFiles via `preloaded`, so the embed
+      // pass never calls fs.readFile again for it. This assertion is RED
+      // against that code (count 1, not 2). RAG-01 removes `preloaded`: the
+      // hash pass reads-and-releases, and reindexFiles reads the same
+      // changed target's bytes again for the embed pass — TWICE per changed
+      // file total. This read pattern ONLY holds once the retained map is
+      // gone.
+      for (const absPath of absPaths) {
+        expect(readCalls.filter((p) => p === absPath).length).toBe(2);
+      }
+
+      indexer.dispose();
+    } finally {
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('RAG-01: the full-build hash pass does not retain buffers — unchanged files are not re-read for embedding', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b5a-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      for (let i = 0; i < 5; i++) await fs.writeFile(path.join(workspaceRoot, `src/f${i}.txt`), `content ${i}\n`, 'utf8');
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      await indexer.build(); // first build: all changed
+      embedMock.mockClear();
+      // second build: nothing changed. reindexFiles must embed nothing.
+      await indexer.build();
+      expect(embedMock).not.toHaveBeenCalled(); // no toCompute ⇒ no embed ⇒ memory-bounded
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+});
+
+/**
+ * RAG-02: `walk()` (indexer.ts) descends the workspace tree with a bounded
+ * pool (`createConcurrencyPool`, `WALK_CONCURRENCY`) instead of one
+ * sequential recursive await-chain. Walk ORDER is no longer deterministic —
+ * every assertion below is Set/count-based, never order-based.
+ */
+describe('RAG-02: bounded-parallel directory walk', () => {
+  beforeEach(() => {
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  it('RAG-02: parallel walk discovers the same files as a sequential walk and honors nested ignores', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b5b-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      // wide + deep tree
+      for (let d = 0; d < 8; d++) {
+        const dir = path.join(workspaceRoot, `pkg${d}`, 'sub');
+        await fs.mkdir(dir, { recursive: true });
+        for (let f = 0; f < 4; f++) await fs.writeFile(path.join(dir, `f${f}.txt`), `pkg${d} sub f${f}\n`, 'utf8');
+      }
+      // nested ignore: pkg0/sub/.gitignore excludes f3.txt
+      await fs.writeFile(path.join(workspaceRoot, 'pkg0', 'sub', '.gitignore'), 'f3.txt\n', 'utf8');
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      await indexer.build();
+      const upserted = new Set(upsertMock.mock.calls.flatMap(([recs]) => recs.map((r) => r.path)));
+      expect(upserted.has('pkg0/sub/f0.txt')).toBe(true);
+      expect(upserted.has('pkg7/sub/f0.txt')).toBe(true);
+      expect(upserted.has('pkg0/sub/f3.txt')).toBe(false); // nested ignore honored
+      expect([...upserted].filter((p) => /pkg\d\/sub\/f\d\.txt/.test(p)).length).toBe(8 * 4 - 1);
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('RAG-02: walk() overlaps readdir calls up to WALK_CONCURRENCY, never exceeding it', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b5b-conc-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    // Mirrors indexer.ts's own WALK_CONCURRENCY (not exported — this is the
+    // fan-out bound `walk()` must never exceed; keep this literal in sync if
+    // that constant ever changes).
+    const WALK_CONCURRENCY = 8;
+    try {
+      // WALK_CONCURRENCY siblings directly under the root, each holding one
+      // file. The bounded-pool BFS schedules every sibling's pool.run(...)
+      // synchronously in one pass (no await between pushes — see walk()'s
+      // deadlock-safety comment), so all admitted tasks enter their
+      // readdir() call before any of them can resolve.
+      for (let d = 0; d < WALK_CONCURRENCY; d++) {
+        const dir = path.join(workspaceRoot, `pkg${d}`);
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, 'f.txt'), `pkg${d}\n`, 'utf8');
+      }
+
+      // Plain counter/array-push seam (no vi.fn()), same monkey-patch idiom
+      // as this file's top-level fs.rename wrapper and the RAG-01 fs.readFile
+      // wrapper above: replace fs.readdir, call through to the real
+      // implementation, restore in `finally`. The `await Promise.resolve()`
+      // BEFORE the call-through is what makes overlap deterministically
+      // observable — every task admitted in the same synchronous scheduling
+      // pass increments the counter before any of them can decrement it, so
+      // the peak reflects genuine concurrent admission rather than real I/O
+      // timing luck.
+      let inFlightReaddir = 0;
+      let peakConcurrentReaddir = 0;
+      const realReaddir = fs.readdir;
+      fs.readdir = (async (dirPath: Parameters<typeof fs.readdir>[0], ...rest: unknown[]) => {
+        inFlightReaddir++;
+        if (inFlightReaddir > peakConcurrentReaddir) peakConcurrentReaddir = inFlightReaddir;
+        await Promise.resolve();
+        try {
+          return await (realReaddir as typeof fs.readdir)(dirPath as never, ...(rest as unknown as never[]));
+        } finally {
+          inFlightReaddir--;
+        }
+      }) as typeof fs.readdir;
+
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      try {
+        await indexer.build();
+      } finally {
+        fs.readdir = realReaddir;
+      }
+
+      // FD-safety: the pool never admits more concurrent readdir calls than
+      // its bound.
+      expect(peakConcurrentReaddir).toBeLessThanOrEqual(WALK_CONCURRENCY);
+      // Genuine parallelism: a sequential walk (or a regression to the
+      // deadlock-prone `await pool.run(...)` form) never exceeds 1 in-flight
+      // readdir call — this is the assertion that actually pins the fan-out.
+      expect(peakConcurrentReaddir).toBeGreaterThanOrEqual(2);
+
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
   });
 });
 
@@ -1168,8 +1507,25 @@ describe('AUDIT-5 Task 11: reindexFiles reads the VALIDATED path (pathConfine re
       const indexer = makeIndexer();
       const disposable = indexer.watch();
 
+      const manifestPath = path.join(indexDir, 'manifest.json');
+      // close-out (test-hygiene): baseline-delta instead of a bare `.some()`
+      // — the SAME pattern the file uses elsewhere (e.g. the TA-6 tests
+      // below) — so a future edit that inserts a PRE-event manifest write
+      // can never satisfy this predicate prematurely; only a rename that
+      // lands AFTER this baseline is captured counts.
+      const renamesBefore = renameCommits.filter(([, to]) => to === manifestPath).length;
       fsWatcherListeners.change[0]!({ fsPath: aliasAbs });
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // B1a: wait for the upsert AND the manifest write's rename commit to
+      // have actually landed — the upsert call alone is not a sufficient
+      // "done" signal (writeManifest's atomic replace is a further real-fs
+      // await beyond it) — see the recorder's doc comment for why this no
+      // longer reads the live manifest file to observe that.
+      await flushWatch(
+        5,
+        () =>
+          upsertedPaths().includes('alias/doc.txt') &&
+          renameCommits.filter(([, to]) => to === manifestPath).length > renamesBefore,
+      );
 
       // (a) THE RED PAIR — the reindex read must hit the CONFINED canonical
       // path (pathConfine.ts: "read exactly the returned path so the file
@@ -1327,7 +1683,7 @@ describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'src', 'app.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => indexer.failedIncrementalReindexes() > 0);
     errorSpy.mockRestore();
 
     // HEAD's bug: reindexFiles deletes the path's OLD rows unconditionally,
@@ -1365,7 +1721,7 @@ describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'src', 'app.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => indexer.failedIncrementalReindexes() > 0);
     errorSpy.mockRestore();
 
     // Embed succeeded (default mock), so the swap's delete DID run for this
@@ -1409,7 +1765,7 @@ describe('TA-3 (AU-3, High): watch-path delete-before-embed permanently drops a 
     // Identical-bytes resave of the SAME unchanged big file.
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'big.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await flushWatch(10, () => indexer.failedIncrementalReindexes() > 0);
     errorSpy.mockRestore();
 
     // Batch 1's swap ran to completion (one delete, one upsert) before
@@ -1488,6 +1844,8 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
     expect(before['big.ts']).toBeDefined();
     deleteByPathMock.mockClear();
     upsertMock.mockClear();
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    const renameCountBaseline = renameCommits.filter(([, to]) => to === manifestPath).length;
 
     const disposable = indexer.watch();
     // Grow the SAME path well past the 1MB cap (indexer.ts's MAX_FILE_BYTES)
@@ -1498,7 +1856,17 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'big.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // B1a: wait for the delete call AND the manifest purge's rename commit
+    // to have actually landed — waiting on the delete call alone can observe
+    // "done" one turn before `writeManifest`'s atomic replace is actually
+    // persisted. See the recorder's doc comment for why this no longer reads
+    // the live manifest file to observe that.
+    await flushWatch(
+      10,
+      () =>
+        deleteByPathMock.mock.calls.some(([p]) => p === 'big.ts') &&
+        renameCommits.filter(([, to]) => to === manifestPath).length > renameCountBaseline,
+    );
 
     // AU-24: at HEAD, the oversize `continue` fires BEFORE any purge — the
     // file's OLD (now-wrong) chunks stay in the store and the manifest still
@@ -1521,6 +1889,8 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
     expect(before['data.ts']).toBeDefined();
     deleteByPathMock.mockClear();
     upsertMock.mockClear();
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    const renameCountBaseline = renameCommits.filter(([, to]) => to === manifestPath).length;
 
     const disposable = indexer.watch();
     // A NUL byte in the first 8000 bytes is indexer.ts's `looksBinary` test —
@@ -1530,7 +1900,13 @@ describe('TA-6 (AU-24, Med): a file crossing the 1MB/binary threshold on a watch
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'data.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // B1a: see the sibling GROWS test's comment above — same reason.
+    await flushWatch(
+      10,
+      () =>
+        deleteByPathMock.mock.calls.some(([p]) => p === 'data.ts') &&
+        renameCommits.filter(([, to]) => to === manifestPath).length > renameCountBaseline,
+    );
 
     expect(deleteByPathMock).toHaveBeenCalledWith('data.ts');
     expect(upsertMock).not.toHaveBeenCalled();
@@ -1635,7 +2011,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, '.env') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => closeMock.mock.calls.length > 0);
     readFileSpy.mockRestore();
 
     // Fails at HEAD: the secret-path branch runs to completion regardless of
@@ -1719,7 +2095,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'src/app.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => closeMock.mock.calls.length > 0);
 
     // Fails at HEAD: `store.upsert` throws (closed), `reindexFiles`'s catch
     // block scrubs `manifest['src/app.txt']` (TA-3), and `handleFsEvent`'s
@@ -1791,25 +2167,33 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
     // Fire dispose() from INSIDE the sweep loop's own awaited
     // `store.deleteByPath('dir/a.txt')` — the loop's first iteration, not
     // the entry guard's `readManifest`/first `deleteByPath('dir')` the
-    // earlier TA-5 pass already covers (indexer.ts:880). The loop has no
-    // per-iteration `disposed` check by design (deleteByPath no-ops on a
-    // closed store — `LanceDBStore.ts:362-364`), so it keeps running; the
-    // fix under test is the WRITE after it.
+    // earlier TA-5 pass already covers (indexer.ts:880).
+    //
+    // F3-11 ripple: dispose() now flips the shared `gate` (A2), and the
+    // flip is synchronous — a `gate.sink()` call issued later in this SAME
+    // synchronous loop (the 'dir/b.txt' iteration, right after this one)
+    // is therefore refused outright: `store.deleteByPath('dir/b.txt')` is
+    // never even invoked. This is a STRONGER guarantee than the old
+    // per-branch `disposed` checks (which relied on the by-then-closed
+    // store's own `deleteByPath` no-op, `LanceDBStore.ts:362-364`) — the
+    // choke point now sits one level up, at the gate itself. Only
+    // `deleteByPathMock` calls that happened before the flip ('dir', then
+    // 'dir/a.txt' which triggers the flip) are observed.
     deleteByPathMock.mockImplementation(async (p: string) => {
       if (p === 'dir/a.txt') indexer.dispose();
     });
 
     const onDelete = fsWatcherListeners.delete[0]!;
     onDelete({ fsPath: path.join(workspaceRoot, 'dir') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.length >= 2);
 
-    // Fails at HEAD: the loop purges both children from the in-memory
-    // manifest object regardless of `disposed`, then `writeManifest` at
-    // indexer.ts:896 runs unconditionally, persisting the now-empty
-    // manifest to disk even though dispose() fired mid-sweep.
-    expect(deleteByPathMock.mock.calls.map(([p]) => p)).toEqual(
-      expect.arrayContaining(['dir/a.txt', 'dir/b.txt']),
-    );
+    // Fails at HEAD (pre-F3-11, dispose() never flipped the gate): the loop
+    // purged both children from the in-memory manifest object regardless of
+    // `disposed`, then `writeManifest` at indexer.ts:896 ran unconditionally,
+    // persisting the now-empty manifest to disk even though dispose() fired
+    // mid-sweep. Post-F3-11, 'dir/b.txt' is refused by the gate before ever
+    // reaching `store.deleteByPath`.
+    expect(deleteByPathMock.mock.calls.map(([p]) => p)).toEqual(['dir', 'dir/a.txt']);
     const manifestAfter = await readManifest();
     expect(manifestAfter).toEqual(seedManifest);
 
@@ -1836,7 +2220,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, '.env') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === '.env'));
 
     // Fails at HEAD: `writeManifest` at indexer.ts:908 runs unconditionally
     // after the awaited deleteByPath, stripping `.env` from the on-disk
@@ -1871,7 +2255,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
     const onChange = fsWatcherListeners.change[0]!;
     onChange({ fsPath: path.join(workspaceRoot, 'ghost.txt') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'ghost.txt'));
 
     // Fails at HEAD: `writeManifest` at indexer.ts:944 runs unconditionally
     // after the awaited deleteByPath.
@@ -1907,7 +2291,7 @@ describe('TA-5 (AU-23, Med): post-dispose debounce body must not write the manif
 
         const onChange = fsWatcherListeners.change[0]!;
         onChange({ fsPath: path.join(workspaceRoot, 'link.txt') });
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === 'link.txt'));
 
         // Fails at HEAD: `writeManifest` at indexer.ts:944 runs
         // unconditionally after the awaited deleteByPath.
@@ -2044,14 +2428,18 @@ describe('TA-7 (AU-34): nested .gitignore/.hermesignore files are honored, not j
     // Edit the nested .gitignore to now exclude target.ts, and fire ITS OWN
     // change event.
     await writeWorkspaceFile('sub/.gitignore', 'target.ts\n');
-    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'sub', '.gitignore') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'sub', '.gitignore') }); // keep the fire line!
+    await flushWatch(10, () => upsertMock.mock.calls.flatMap(([r]) => r.map((x) => x.path)).includes('sub/.gitignore'));
 
     embedMock.mockClear();
     upsertMock.mockClear();
 
     fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'sub', 'target.ts') });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // KEEP (TST-01 #33): the prior nested-.gitignore-change event repopulated
+    // the cache WITH the target.ts rule, so this handler hits the warm cache
+    // and early-returns at the matchesNestedIgnore gate within microtasks —
+    // a single advance settles it deterministically.
+    await vi.advanceTimersByTimeAsync(300);
 
     // AU-34 (fails at HEAD): the pre-fix invalidation check only matches
     // `relPath === '.gitignore'` (workspace root, exact match) — a nested
@@ -2063,5 +2451,368 @@ describe('TA-7 (AU-34): nested .gitignore/.hermesignore files are honored, not j
 
     disposable.dispose();
     indexer.dispose();
+  });
+});
+
+/**
+ * F2-12: `schedule()`'s catch (the debounced watch path's failure handler)
+ * was `console.error('hermes-codebase: incremental reindex failed', err)` —
+ * passing the RAW `err` object straight to `console.error`. Node's default
+ * Error formatting prints the full message (and an fs error's message
+ * embeds the absolute path it failed on — here, the workspace tmp dir), so
+ * every incremental-reindex failure leaked the user's absolute workspace
+ * path into the log. The fix folds `err` down to its `name` only (errno-name
+ * idiom, never `String(err)`/`.message`) through an injectable `logger?`
+ * option, and surfaces a cumulative `failedIncrementalReindexes()` counter
+ * so a future panel can read it (there is no RAG panel at HEAD — the
+ * extension OutputChannel is the user-visible surface today).
+ */
+describe('F2-12: incremental-reindex failure — logger seam + counter + path-disclosure hygiene', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-f2-12-'));
+    indexDir = path.join(workspaceRoot, 'index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it('increments failedIncrementalReindexes() and logs an errno-name-only line that never contains the workspace path', async () => {
+    const logSpy = vi.fn();
+    const indexer = createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs: 5,
+      logger: logSpy,
+    });
+    const disposable = indexer.watch();
+
+    // Simulate a real fs-style failure inside the incremental path (e.g. a
+    // permission/corruption error surfacing through store.init()) whose
+    // message embeds the absolute workspace path — the exact shape that
+    // leaked before this fix.
+    const fsLikeErr = new Error(
+      `ENOENT: no such file or directory, open '${path.join(workspaceRoot, 'src', 'app.txt')}'`,
+    );
+    fsLikeErr.name = 'ENOENT';
+    initMock.mockRejectedValueOnce(fsLikeErr);
+
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') });
+    await flushWatch(5, () => indexer.failedIncrementalReindexes() > 0);
+
+    expect(indexer.failedIncrementalReindexes()).toBe(1);
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const [line] = logSpy.mock.calls[0]!;
+    expect(line).toContain('incremental reindex failed');
+    expect(line).toContain('ENOENT');
+    expect(line).not.toContain(workspaceRoot);
+
+    disposable.dispose();
+    indexer.dispose();
+  });
+});
+
+/**
+ * F3-11: `dispose()` used to close the store EAGERLY (`void store.close()`,
+ * unconditional) even while `buildChain` had an in-flight run — the same
+ * "mutation races the teardown it should be gated by" shape TA-5/AU-23
+ * closed for the individual store/manifest sinks, just one level up, at the
+ * store handle itself. The fix routes dispose() through `gate.close
+ * (buildChain)`: the gate flips (sinks refused) synchronously, THEN the
+ * caller-supplied `buildChain` drain is awaited (bounded by
+ * `MUTATION_GATE_DRAIN_DEADLINE_MS`), and only then does `store.close()` run.
+ */
+describe('F3-11: dispose() drains the in-flight buildChain before closing the store', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'talaria-indexer-f3-11-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear();
+    deleteByPathMock.mockClear();
+    initMock.mockClear();
+    closeMock.mockClear();
+    embedMock.mockClear();
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    closeMock.mockImplementation(async () => {});
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+
+  afterEach(() => {
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    closeMock.mockImplementation(async () => {});
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it('F3-11: dispose() drains the in-flight buildChain before closing the store', async () => {
+    await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'real content to embed\n', 'utf8');
+    const indexer = createIndexer({
+      workspaceRoot, indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+    });
+
+    // Hold the embed open so the build is genuinely in-flight when dispose fires.
+    let releaseEmbed!: () => void;
+    const embedGate = new Promise<void>((r) => { releaseEmbed = r; });
+    embedMock.mockImplementationOnce(async (texts: string[]) => {
+      await embedGate;
+      return texts.map(() => [0.1, 0.2, 0.3]);
+    });
+
+    const building = indexer.build();
+    await vi.advanceTimersByTimeAsync(0); // let the build reach the held embed
+    closeMock.mockClear();
+
+    indexer.dispose();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closeMock).not.toHaveBeenCalled(); // store NOT closed while chain is in-flight
+
+    releaseEmbed();
+    await building.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closeMock).toHaveBeenCalledTimes(1); // closed AFTER the drain
+  });
+
+  it('F3-11: dispose() still closes the store after the drain deadline if the chain never settles', async () => {
+    const indexer = createIndexer({
+      workspaceRoot, indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+    });
+    // ISO-1: a CONTROLLABLE hung embed (not a genuinely-never-settling promise).
+    // During the assertion window it stays unresolved (so the deadline path is
+    // exercised exactly as before); in cleanup we reject it and await the build
+    // so the chain fully unwinds BEFORE afterEach's rmSync — no dangling op can
+    // race the recursive delete (the Windows ENOTEMPTY flake this kills).
+    let releaseHungEmbed!: () => void;
+    const hungEmbed = new Promise<number[][]>((_resolve, reject) => {
+      releaseHungEmbed = () => reject(new Error('ISO-1 cleanup: unwind parked build chain'));
+    });
+    // Whether the production chain actually reaches this mock before it bails
+    // out via an earlier `disposed` check (a real timing race — verified
+    // empirically that within this test's own execution window it can settle
+    // via that earlier bail-out WITHOUT ever calling embed) is not something
+    // this test controls. Attach our own handler unconditionally so releasing
+    // it below can never surface as an unhandled rejection either way.
+    hungEmbed.catch(() => undefined);
+    embedMock.mockImplementationOnce(() => hungEmbed);
+    await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+    const building = indexer.build();
+    await vi.advanceTimersByTimeAsync(0);
+    closeMock.mockClear();
+
+    indexer.dispose();
+    await vi.advanceTimersByTimeAsync(11_000); // past MUTATION_GATE_DRAIN_DEADLINE_MS (10s)
+    expect(closeMock).toHaveBeenCalledTimes(1);
+
+    // ISO-1: unwind the parked chain now that the deadline behaviour is proven,
+    // so it cannot outlive the test and race afterEach's rmSync. The gate is
+    // already closed (dispose fired), so the rejected embed simply unwinds
+    // reindexFiles/runBuild with no sink writes; build() settles.
+    releaseHungEmbed();
+    await building.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+  });
+});
+
+describe('WS-R2 A5: AU-23 class is dead — dispose mid-await mutates nothing', () => {
+  let workspaceRoot: string;
+  let indexDir: string;
+  beforeEach(() => {
+    workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-a5-'));
+    indexDir = path.join(workspaceRoot, '.hermes-index');
+    upsertMock.mockClear(); deleteByPathMock.mockClear();
+    // M-1 (B1 self-containment hardening): this block installs its own
+    // watcher via indexer.watch()/fsWatcherListeners.change[0] — without
+    // clearing these arrays here, a leftover listener pushed by an earlier
+    // describe block's own indexer.watch() call (never disposed, or disposed
+    // after this beforeEach already read index [0]) could be selected
+    // instead of THIS test's own listener.
+    fsWatcherListeners.create.length = 0;
+    fsWatcherListeners.change.length = 0;
+    fsWatcherListeners.delete.length = 0;
+  });
+  afterEach(() => {
+    // M-2 (B1 self-containment hardening): restore embedMock's base
+    // implementation (mirrors the F3-11 block's own afterEach) — this
+    // describe's test permanently swaps embedMock via `.mockImplementation`
+    // (never `.mockImplementationOnce`), so without a restore that swap
+    // would otherwise leak into whichever test runs next.
+    embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it('a change event whose embed is in-flight when dispose() fires never upserts or writes the manifest', async () => {
+    await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'ordinary content to chunk and embed\n', 'utf8');
+    const indexer = createIndexer({
+      workspaceRoot, indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+    });
+
+    let releaseEmbed!: () => void;
+    const embedGate = new Promise<void>((r) => { releaseEmbed = r; });
+    const CONTENT_MARKER = 'ordinary content to chunk and embed';
+    // IMPLEMENTER FIX (A5 verification finding — see task-A5-report.md):
+    // a plain `mockImplementationOnce` is a FIFO queue SHARED across this
+    // whole file's `embedMock`. An unrelated EARLIER test ("F3-11: dispose()
+    // still closes the store after the drain deadline...") parks a build
+    // chain on a controllable hung embed and — as of ISO-1 — captures,
+    // rejects, and awaits that same chain in its own cleanup, so it no
+    // longer outlives that test. This block's content-gated mock remains a
+    // correct defensive backstop regardless: it no longer needs to defend
+    // against a permanently-stuck chain, but gating on THIS call's own
+    // content still makes the block immune to queue position and to any
+    // other in-flight call (e.g. one from a test that hasn't reached its own
+    // cleanup yet) — whichever invocation actually carries this file's
+    // content is the one that blocks; anything else (differently-worded
+    // content) resolves normally.
+    embedMock.mockReset(); // drop any stale queued `once` entries left by earlier tests
+    embedMock.mockImplementation(async (texts: string[]) => {
+      if (texts.some((t) => t.includes(CONTENT_MARKER))) await embedGate;
+      return texts.map(() => [0.1, 0.2, 0.3]);
+    });
+
+    const disposable = indexer.watch();
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src/a.txt') });
+    await vi.advanceTimersByTimeAsync(20); // fire the debounce
+    // A fixed advance alone does NOT reliably get the handler as far as the
+    // held embed — traced empirically: a single `advanceTimersByTimeAsync`
+    // call fires the debounce timer and yields only ~one real turn, leaving
+    // the handler still mid-`loadIgnoreFilter()`/`ensureStoreInitialized()`,
+    // several real fs-await turns short of `reindexFiles`'s `embedder.embed`
+    // call. `dispose()` called that early captures whatever `buildChain` was
+    // BEFORE this handler ever reaches `serialize()` — a stale,
+    // already-resolved chain — so `gate.close(buildChain)` (and therefore
+    // `closeMock`) resolves almost immediately, well before the handler is
+    // anywhere near a mutation. Without this drain the assertions below would
+    // hold VACUOUSLY (the mutation was simply never attempted YET, not
+    // refused) — the exact false-pass shape M-1 already closed on the other
+    // side of `dispose()`. Drain (real turns, no wall-clock sleep) until THIS
+    // file's own call (content-matched, not just "any call" — the dangling
+    // chain described above can also produce a call, with different content,
+    // that would otherwise satisfy a position-only predicate prematurely) is
+    // GENUINELY parked inside the held `embedGate` await, so `dispose()`
+    // below captures the buildChain THIS handler actually joined.
+    await drainUntil(() =>
+      embedMock.mock.calls.some(([texts]) => texts.some((t) => t.includes(CONTENT_MARKER))),
+    );
+    upsertMock.mockClear();
+
+    closeMock.mockClear();
+    indexer.dispose();     // A4: gate flips closed synchronously; dispose drains buildChain THEN closes the store
+    releaseEmbed();        // handler resumes past the await; the :762 disposed-guard bails and the gate refuses the sinks
+
+    // TERMINAL ANCHOR (A1-review M-1) — do NOT use a fixed `advanceTimersByTimeAsync(200)`:
+    // a fixed advance can pass merely because the resumed continuation has not yet REACHED
+    // the (refused) upsert/writeManifest = a false pass. After A4, dispose() drains the
+    // in-flight buildChain (this very handler) and only THEN closes the store, so closeMock
+    // firing is the deterministic signal that the handler ran to completion having mutated
+    // nothing. (A5 runs after A4, so drain-then-close is in place.)
+    await drainUntil(() => closeMock.mock.calls.length > 0);
+
+    expect(upsertMock).not.toHaveBeenCalled();
+    const manifestExists = await fs.readFile(path.join(indexDir, 'manifest.json'), 'utf8').then(() => true).catch(() => false);
+    expect(manifestExists).toBe(false); // writeManifest was guarded/refused → no manifest file was written
+    disposable.dispose();
+  });
+});
+
+/**
+ * F2-13 (adversarial-review-flagged durability fix): `writeManifest` used to
+ * write `manifest.json` directly — a crash (or an out-of-process reader)
+ * mid-write could observe a torn/partial file. `readManifest`'s catch also
+ * used to fold EVERY failure (missing file, permission error, corrupt JSON)
+ * into the SAME silent `{}` — masking real corruption as an ordinary "no
+ * index yet" first run. The fix: `writeManifest` writes a same-directory
+ * `.tmp` file then `fs.rename`s it into place (POSIX same-filesystem atomic
+ * replace — never a torn read); `readManifest` still returns `{}` silently
+ * for ENOENT (the ordinary "no index yet" case) but logs a name-only line
+ * before returning `{}` for any other read failure or parse/shape corruption.
+ */
+describe('F2-13: writeManifest is a crash-safe atomic write; readManifest distinguishes ENOENT from corruption', () => {
+  it('writeManifest writes via a same-dir .tmp then renames (atomic)', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b1-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const renames: Array<[string, string]> = [];
+      const realRename = fs.rename;
+      const spy = vi.spyOn(fs, 'rename').mockImplementation(
+        async (from: Parameters<typeof fs.rename>[0], to: Parameters<typeof fs.rename>[1]) => {
+          renames.push([String(from), String(to)]);
+          return (realRename as typeof fs.rename)(from, to);
+        },
+      );
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      await indexer.build();
+      const manifestPath = path.join(indexDir, 'manifest.json');
+      expect(renames.some(([from, to]) => from === `${manifestPath}.tmp` && to === manifestPath)).toBe(true);
+      await expect(fs.readFile(manifestPath, 'utf8')).resolves.toContain('src/a.txt');
+      spy.mockRestore();
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('readManifest logs a corrupt manifest (not silent) and rebuilds; ENOENT stays silent', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b1c-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(indexDir, { recursive: true });
+      await fs.writeFile(path.join(indexDir, 'manifest.json'), '{ this is not json', 'utf8'); // corrupt
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      expect(logs.some((l) => /manifest/i.test(l) && /corrupt|parse/i.test(l))).toBe(true);
+      expect(upsertMock).toHaveBeenCalled(); // rebuilt src/a.txt despite the corrupt manifest
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('F2-13 parity: writeMeta commits manifest.meta.json atomically via rename', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-b1d-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+      });
+      await indexer.build();
+      const metaPath = path.join(indexDir, 'manifest.meta.json');
+      const committedMeta = renameCommits.some(([, to]) => to === metaPath);
+      expect(committedMeta).toBe(true);
+      await expect(fs.readFile(metaPath, 'utf8')).resolves.toContain('schema');
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
   });
 });

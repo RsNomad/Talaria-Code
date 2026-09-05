@@ -71,12 +71,12 @@ body.vscode-dark {
 
 /* Light themes: deepen accent for contrast on light surfaces. */
 body.vscode-light {
-  --h-accent: #0d8a7d;
+  --h-accent: #0b7264; /* A11Y-04: 5.83:1 on white (was #0d8a7d, 4.24:1) */
   --h-accent-fg: #ffffff;
-  --h-accent-soft: rgba(13, 138, 125, 0.12);
+  --h-accent-soft: rgba(11, 114, 100, 0.12); /* A11Y-04: re-derived from --h-accent #0b7264 (was rgba(13,138,125,…) = stale #0d8a7d) */
   --h-add: #1a7f4b;
-  --h-del: #c43b57;
-  --h-warn: #b26206;
+  --h-del: #b83350; /* A11Y-04: 4.81:1 on del-soft tint (was #c43b57, 4.25:1) */
+  --h-warn: #9e5805; /* A11Y-04: 4.73:1 on warn-soft tint (was #b26206, 3.92:1) */
   --h-run: #5457d6;
   --h-border: var(--vscode-panel-border, rgba(18, 23, 28, 0.12));
   --h-border-strong: var(--vscode-contrastBorder, rgba(18, 23, 28, 0.22));

@@ -32,6 +32,26 @@ describe('mapUsage', () => {
     expect(mapUsage('nope')).toBeUndefined();
     expect(mapUsage({})).toBeUndefined();
   });
+
+  it('F1-14: NaN token counts are treated as absent, never rendered', () => {
+    expect(mapUsage({ inputTokens: Number.NaN })).toBeUndefined();
+  });
+
+  it('F1-14: an Infinity camelCase count falls through to a finite snake_case sibling', () => {
+    expect(mapUsage({ inputTokens: Number.POSITIVE_INFINITY, input_tokens: 10 })).toEqual({
+      inputTokens: 10,
+      outputTokens: 0,
+      totalTokens: 10,
+    });
+  });
+
+  it('F1-14: a non-finite totalTokens is discarded and re-derived from the finite parts', () => {
+    expect(mapUsage({ inputTokens: 5, outputTokens: 2, totalTokens: Number.NEGATIVE_INFINITY })).toEqual({
+      inputTokens: 5,
+      outputTokens: 2,
+      totalTokens: 7,
+    });
+  });
 });
 
 describe('mapStopReasonToStatus', () => {

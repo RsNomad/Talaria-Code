@@ -8,7 +8,7 @@ import { totalLookup } from '../lookup';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Toggle } from '../components/Toggle';
-import { PanelShell, SectionLabel } from './PanelShell';
+import { EmptyPanel, PanelShell, SectionLabel } from './PanelShell';
 import { useToggle } from './useToggle';
 
 interface ToolsPanelProps {
@@ -64,48 +64,62 @@ export function ToolsPanel({ data, onToggle }: ToolsPanelProps) {
         These toggles govern Hermes' CLI and desktop sessions. The editor chat uses Hermes' fixed editor
         toolset and is not affected.
       </p>
-      {data.toolsets.map((ts) => {
-        const on = isOn(ts.name, ts.enabled);
-        const err = lastError(ts.name);
-        return (
-          <div key={ts.name}>
-            <div className="mb-1.5 mt-3 flex items-center gap-2 first:mt-0">
-              <SectionLabel>{ts.name}</SectionLabel>
-              <span className="font-mono text-2xs text-faint">{ts.toolCount} tools</span>
-              <span className="ml-auto flex-none">
-                <Toggle on={on} label={`Enable ${ts.name} toolset`} onChange={(next) => toggle(ts.name, next)} />
-              </span>
-            </div>
-            {/* V-11 (TOGGLE-HONESTY): see SkillsPanel.tsx's identical block —
-                same grammar as SettingsPanel's FieldRow, mounted
-                unconditionally (WCAG 2.2 SC 4.1.3), only its text swaps. */}
-            <LiveRegion text={err ? `Not saved: ${err}` : ''} className="mb-1.5 text-2xs text-del" title={err} />
-            {(grouped.get(ts.name) ?? []).map((t) => (
-              <div
-                key={t.name}
-                className={`mb-1.5 flex items-center gap-2 rounded-card border border-border bg-surface px-3 py-2 ${
-                  on ? '' : 'opacity-50'
-                }`}
-              >
-                <Icon
-                  name={totalLookup(KIND_ICON, t.kind, UNKNOWN_KIND_ICON)}
-                  size={15}
-                  className="flex-none text-muted"
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate font-mono text-xs text-fg">
-                    {t.name}
-                    {t.source !== 'core' && (
-                      <span className="ml-1.5 text-2xs uppercase tracking-wide text-faint">{t.source}</span>
-                    )}
-                  </div>
-                  {t.description && <div className="text-2xs leading-snug text-muted">{t.description}</div>}
-                </div>
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): the TOP-LEVEL toolset collection was
+          `div` soup — no `role="list"`/`role="listitem"` at all. Scoped to
+          this top-level collection only, per the task brief — the nested
+          per-toolset `tools` collection below stays untouched. */}
+      {/* Task 22 (UX-01/UX-16): the standard empty state — this panel used to
+          render silent blank space with zero toolsets. Rendered BEFORE the
+          (empty) list, never as an early return — this panel has no add
+          affordance of its own (toolsets are agent-reported), so the panel
+          shell/title above is what stays visible (AU-46 posture, adapted:
+          the empty state must never hide the way OUT of being empty; here
+          there is none to hide). */}
+      {data.toolsets.length === 0 && <EmptyPanel hint="No toolsets reported by the agent yet." />}
+      <div role="list">
+        {data.toolsets.map((ts) => {
+          const on = isOn(ts.name, ts.enabled);
+          const err = lastError(ts.name);
+          return (
+            <div key={ts.name} role="listitem">
+              <div className="mb-1.5 mt-3 flex items-center gap-2 first:mt-0">
+                <SectionLabel>{ts.name}</SectionLabel>
+                <span className="font-mono text-2xs text-faint">{ts.toolCount} tools</span>
+                <span className="ml-auto flex-none">
+                  <Toggle on={on} label={`Enable ${ts.name} toolset`} onChange={(next) => toggle(ts.name, next)} />
+                </span>
               </div>
-            ))}
-          </div>
-        );
-      })}
+              {/* V-11 (TOGGLE-HONESTY): see SkillsPanel.tsx's identical block —
+                  same grammar as SettingsPanel's FieldRow, mounted
+                  unconditionally (WCAG 2.2 SC 4.1.3), only its text swaps. */}
+              <LiveRegion text={err ? `Not saved: ${err}` : ''} className="mb-1.5 text-2xs text-del" title={err} />
+              {(grouped.get(ts.name) ?? []).map((t) => (
+                <div
+                  key={t.name}
+                  className={`mb-1.5 flex items-center gap-2 rounded-card border border-border bg-surface px-3 py-2 ${
+                    on ? '' : 'opacity-50'
+                  }`}
+                >
+                  <Icon
+                    name={totalLookup(KIND_ICON, t.kind, UNKNOWN_KIND_ICON)}
+                    size={15}
+                    className="flex-none text-muted"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-mono text-xs text-fg">
+                      {t.name}
+                      {t.source !== 'core' && (
+                        <span className="ml-1.5 text-2xs uppercase tracking-wide text-faint">{t.source}</span>
+                      )}
+                    </div>
+                    {t.description && <div className="text-2xs leading-snug text-muted">{t.description}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          );
+        })}
+      </div>
     </PanelShell>
   );
 }

@@ -88,13 +88,17 @@ export function useHostActions(
       if (activePanel !== 'chat') dispatchLocal({ type: 'local.setPanel', panel: 'chat' });
       // W2-F1: every turn pins the ACP wire mode at 'default'; the
       // edit-policy preset (not a wire mode) governs approvals host-side.
+      // exactOptional prep (arm 1): `attachments`/`mentions` are optional
+      // params (`T[] | undefined`); the `prompt` WIRE message's fields are
+      // `?: Attachment[]` / `?: ContextRef[]` — spread each key in only when
+      // present rather than widening the protocol type.
       bridge.post({
         type: 'prompt',
         sessionId: tab.sessionId ?? UNBOUND_SESSION_PLACEHOLDER,
         text,
         mode: 'default',
-        attachments,
-        mentions,
+        ...(attachments !== undefined ? { attachments } : {}),
+        ...(mentions !== undefined ? { mentions } : {}),
       });
     },
     [activePanel, tab.sessionId, dispatchLocal],

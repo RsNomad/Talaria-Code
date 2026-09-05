@@ -253,11 +253,16 @@ export function fetchPanel(
 
   if (panel === 'subagents' && !(req.params && 'sessionId' in req.params)) {
     const emptySubagents: PanelDataMap['subagents'] = { delegations: [] };
-    deps.dispatch({ type: 'local.panelLoading', panel, scopeKey, emptyData: emptySubagents });
+    deps.dispatch({
+      type: 'local.panelLoading',
+      panel,
+      ...(scopeKey !== undefined ? { scopeKey } : {}),
+      emptyData: emptySubagents,
+    });
     return Promise.resolve({ ok: true });
   }
 
-  deps.dispatch({ type: 'local.panelLoading', panel, scopeKey });
+  deps.dispatch({ type: 'local.panelLoading', panel, ...(scopeKey !== undefined ? { scopeKey } : {}) });
   return deps.request(req.method, req.params).then(
     (): FetchPanelOutcome => {
       /* success data arrives via the `panel.data` push; nothing to do here. */
@@ -268,9 +273,9 @@ export function fetchPanel(
       deps.dispatch({
         type: 'local.panelError',
         panel,
-        scopeKey,
         message,
         retryable: true,
+        ...(scopeKey !== undefined ? { scopeKey } : {}),
       });
       return { ok: false, message };
     },

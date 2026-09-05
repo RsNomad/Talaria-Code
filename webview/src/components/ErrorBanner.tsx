@@ -14,15 +14,27 @@ export interface ErrorBannerRetry {
 
 interface ErrorBannerProps {
   message: string;
-  detail?: string;
+  /**
+   * exactOptional prep (arm 3): widened to `?: string | undefined` — every
+   * real caller (`App.tsx`'s `state.systemError.detail` / `tab.error.detail`)
+   * hands this a `string | undefined` read straight off an already-optional
+   * source field, so the prop's own optionality must absorb an explicit
+   * `undefined`, not just an absent key.
+   */
+  detail?: string | undefined;
   /** Audit G-6 (WCAG 2.2 SC 4.1.2): the dismiss button below contains only an
    * <Icon>, so without an explicit accessible name a screen reader announced
    * "button" and nothing else. Required (not optional) so a future caller
    * cannot reintroduce the gap by omission. */
   dismissLabel: string;
   onDismiss: () => void;
-  /** Present only for the tab-error banner's `'open-failed'` case. */
-  retry?: ErrorBannerRetry;
+  /**
+   * Present only for the tab-error banner's `'open-failed'` case.
+   * exactOptional prep (arm 3): widened to `?: ErrorBannerRetry | undefined`
+   * — every real caller hands this a ternary (`cond ? {...} : undefined`),
+   * which is `ErrorBannerRetry | undefined`, not merely "absent when unused".
+   */
+  retry?: ErrorBannerRetry | undefined;
 }
 
 export function ErrorBanner({ message, detail, dismissLabel, onDismiss, retry }: ErrorBannerProps) {

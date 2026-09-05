@@ -41,4 +41,20 @@ describe('balanceBrackets', () => {
       'const x = 1; // done',
     );
   });
+
+  it('F1-11: the suffix seed continues past newlines — a closer on the NEXT line still counts as an implied opener (per the "first non-whitespace, non-bracket" contract; \\n IS whitespace)', () => {
+    // File shape:  foo(<cursor>
+    //              \n)
+    // The ')' on the next line implies an open '(' the completion may reuse.
+    expect(balanceBrackets(')', '', '\n  )')).toBe(')');
+  });
+
+  it('F1-11: carriage returns are whitespace too (CRLF files)', () => {
+    expect(balanceBrackets(')', '', '\r\n)')).toBe(')');
+  });
+
+  it('the seed still stops at the first real character on a later line', () => {
+    // 'x' terminates the scan — the ']' after it must NOT seed.
+    expect(balanceBrackets(']', '', '\nx]')).toBe('');
+  });
 });

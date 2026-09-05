@@ -16,6 +16,10 @@ import type {
   AcpSessionUpdate,
 } from './types';
 import type { AcpMcpServerHttp } from '../../../shared/acpMcpServerHttp';
+import { isRecord } from '../../../shared/typeGuards';
+import { EXTENSION_NAME, EXTENSION_TITLE, EXTENSION_VERSION } from '../../../shared/version';
+import { MAX_ACP_LINE_BYTES } from '../../transport/maxLineBytes';
+import { createStdoutByteCapTransform } from './stdoutByteCap';
 
 /**
  * Thin seam around the ACP TypeScript SDK (`@agentclientprotocol/sdk`,
@@ -168,6 +172,39 @@ export interface AdvertisedAuthMethod {
 }
 
 /**
+ * A-02 (WS-AC root): the retained, defensively-projected `initialize`
+ * advertisement — `undefined` until {@link AcpClient.initialize} resolves
+ * (single-lifecycle retention, same posture as `advertisedAuthMethods`).
+ * The SDK hands the raw JSON-RPC result back WITHOUT zod-parsing it
+ * (`dist/acp.js:451-453`), so every field below is read through `isRecord`
+ * guards, never trusted.
+ *
+ * Deliberately NOT projected/gated here: `agentCapabilities.mcpCapabilities`.
+ * The pinned Hermes never sets `mcp_capabilities` in its InitializeResponse
+ * (`acp_adapter/server.py:884-897`) yet ACCEPTS and registers
+ * `McpServerHttp` entries unconditionally (`server.py:795-818` — the
+ * `{url, headers}` else-branch) — the live `vscode_lsp` http binding depends
+ * on exactly that. Gating http-MCP emission on the advertised flag would
+ * therefore break a working production flow to satisfy an advertisement the
+ * agent itself does not honor — the same compensating-violations asymmetry
+ * as A-03's embedded resources, and it ships inactive the same way (see
+ * `promptCaps.ts`'s activation contract; upstream note filed in
+ * `docs_claude/lens-dorabotok/hermes-upstream-notes.md`).
+ */
+export interface AdvertisedCapabilities {
+  /** Negotiated version — always === PROTOCOL_VERSION once retained (asserted in initialize()). */
+  protocolVersion: number;
+  /** `agentCapabilities.loadSession === true` — the `session/load` MUST-gate. */
+  loadSession: boolean;
+  /** `agentCapabilities.sessionCapabilities.list` advertised (present, object) — the `session/list` gate. */
+  sessionList: boolean;
+  /** `agentCapabilities.sessionCapabilities.close` advertised — the `session/close` MUST-NOT gate. */
+  sessionClose: boolean;
+  /** Raw `agentCapabilities.promptCapabilities` record ({} when absent/malformed) — A-03's input. */
+  promptCapabilities: Record<string, unknown>;
+}
+
+/**
  * An environment variable to set when launching an MCP server — ACP's
  * `EnvVariable`. Re-verified (audit-3 CA-12) against the INSTALLED
  * `@agentclientprotocol/sdk@0.17.1` (`package.json`'s pinned version;
@@ -286,6 +323,15 @@ export interface AcpClientLike {
    * event). OPTIONAL for the same test-double reason as the getter.
    */
   onAuthMethodsChanged?(handler: () => void): { dispose(): void };
+  /**
+   * A-03 (WS-AC): the raw advertised `promptCapabilities` record —
+   * `undefined` until THIS client's `initialize()` has resolved. OPTIONAL,
+   * like {@link getAdvertisedAuthMethods}: a test double that never
+   * implements it reads as "nothing advertised" through the caller's own
+   * `?.()` chain (`SessionController.runTurn` → `derivePromptCaps`), never a
+   * crash.
+   */
+  getAdvertisedPromptCapabilities?(): Record<string, unknown> | undefined;
   dispose(): void;
 }
 
@@ -307,6 +353,13 @@ export class AcpClient implements AcpClientLike {
    */
   private advertisedAuthMethods: AdvertisedAuthMethod[] | undefined;
   private readonly authMethodsHandlers = new Set<() => void>();
+
+  /**
+   * A-02: the retained advertisement — `undefined` until {@link initialize}
+   * resolves, never cleared afterwards (single-lifecycle instance; a restart
+   * mints a whole new client). See {@link AdvertisedCapabilities}.
+   */
+  private advertised: AdvertisedCapabilities | undefined;
 
   /**
    * W1-T1 (CF-01/A-2): the central terminate-race primitive. The pinned ACP
@@ -363,6 +416,14 @@ export class AcpClient implements AcpClientLike {
     return this.advertisedAuthMethods?.map((m) => ({ ...m }));
   }
 
+  /** A-03 (WS-AC): the raw advertised `promptCapabilities` record ({} = agent
+   *  advertised none), `undefined` until initialize() has retained the
+   *  advertisement. Defensive copy, same posture as
+   *  {@link getAdvertisedAuthMethods}. */
+  getAdvertisedPromptCapabilities(): Record<string, unknown> | undefined {
+    return this.advertised ? { ...this.advertised.promptCapabilities } : undefined;
+  }
+
   /** Task 13: see {@link AcpClientLike.onAuthMethodsChanged}. Same
    *  subscribe/dispose shape as {@link onExit}. */
   onAuthMethodsChanged(handler: () => void): { dispose(): void } {
@@ -384,6 +445,12 @@ export class AcpClient implements AcpClientLike {
    */
   async connect(): Promise<void> {
     if (this.child) throw new Error('AcpClient.connect: already connected');
+    const child = this.spawnAcpChild();
+    this.wireAcpConnection(child);
+  }
+
+  /** WV3-MIN-FUNC (WS-AC): extraction only — every line and comment moved verbatim from the former 180-line connect(). */
+  private spawnAcpChild(): ChildProcess {
     const { command, args } = this.options.spawn;
     this.log(`spawn: ${command} ${args.join(' ')}`);
     const child = spawn(command, args, {
@@ -502,7 +569,11 @@ export class AcpClient implements AcpClientLike {
       this.log(`hermes acp spawn error: ${String(err)}`);
       terminate(null);
     });
+    return child;
+  }
 
+  /** WV3-MIN-FUNC (WS-AC): extraction only — every line and comment moved verbatim from the former 180-line connect(). */
+  private wireAcpConnection(child: ChildProcess): void {
     if (!child.stdin || !child.stdout) {
       throw new Error('hermes acp: missing stdio pipes');
     }
@@ -510,8 +581,30 @@ export class AcpClient implements AcpClientLike {
     // type as generic Web Streams; cast to the byte-stream shape `ndJsonStream`
     // declares (Context7: `ndJsonStream(output: WritableStream<Uint8Array>,
     // input: ReadableStream<Uint8Array>): Stream`).
+    //
+    // CA-01 (WS-AC): the byte-cap Transform sits BETWEEN stdout and the web
+    // adapter — OUTSIDE the SDK's ndJsonStream, framing untouched. On trip
+    // it kills the child WITHOUT clearing `this.child`, so the natural
+    // 'exit' drives the EXISTING crash machinery (terminate() →
+    // termination-pair rejection → exitHandlers → supervisor respawn):
+    // cap-then-teardown+respawn, the JsonRpcStdio model — no silent
+    // truncation, no parallel error channel. Message carries byte counts
+    // only, never buffered content.
+    const capTransform = createStdoutByteCapTransform(MAX_ACP_LINE_BYTES, (bufferedBytes) => {
+      this.log(
+        `[fatal] ACP stdout line exceeded ${MAX_ACP_LINE_BYTES} bytes ` +
+          `(${bufferedBytes} bytes since last newline) — killing child for respawn`,
+      );
+      if (child.exitCode === null && !child.killed) {
+        child.kill('SIGTERM');
+        const killTimer = setTimeout(() => {
+          if (child.exitCode === null) child.kill('SIGKILL');
+        }, 5000);
+        killTimer.unref?.();
+      }
+    });
     const output = Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>;
-    const input = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
+    const input = Readable.toWeb(child.stdout.pipe(capTransform)) as unknown as ReadableStream<Uint8Array>;
     const stream = ndJsonStream(output, input);
 
     const callbacks = this.options.callbacks;
@@ -568,6 +661,11 @@ export class AcpClient implements AcpClientLike {
       // constant was confirmed" comment was fabrication-adjacent: the
       // constant exists.
       protocolVersion: PROTOCOL_VERSION,
+      // S1-05 (WS-AC): ACP SHOULD — identify the client (the spec marks
+      // clientInfo "will be required" in future versions; Hermes logs the
+      // client name at initialize, acp_adapter/server.py:877-882). Values
+      // are the package.json identity via the test-pinned shared constant.
+      clientInfo: { name: EXTENSION_NAME, title: EXTENSION_TITLE, version: EXTENSION_VERSION },
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: false },
         // Audit (🟡): we advertised `terminal: true` while registering ZERO
@@ -578,6 +676,44 @@ export class AcpClient implements AcpClientLike {
         terminal: false,
       },
     });
+    // A-02 (WS-AC root): assert the negotiated version BEFORE retaining
+    // anything. Spec guidance on InitializeResponse.protocolVersion: "The
+    // client should disconnect, if it doesn't support this version"
+    // (types.gen.d.ts:1512-1518). Throwing here surfaces as an honest
+    // connect-phase failure through ConnectionSupervisor.startInternal's
+    // existing try/catch + banner (raceConnectPhase wraps THIS call,
+    // ConnectionSupervisor.ts:418-422). A malformed/absent version fails the
+    // same way — fail-closed. Vs pinned Hermes this is a provable no-op:
+    // acp_adapter/server.py:885 always answers acp.PROTOCOL_VERSION (= 1,
+    // both SDKs pin it).
+    const raw: unknown = response;
+    // `rawRecord` is the guarded view — a non-object result reads as {} and
+    // fails the version assert below (no field to find). Explicitly typed so
+    // the {} arm keeps the index-signature access legal (no casts).
+    const rawRecord: Record<string, unknown> = isRecord(raw) ? raw : {};
+    const rawVersion = rawRecord.protocolVersion;
+    if (typeof rawVersion !== 'number' || rawVersion !== PROTOCOL_VERSION) {
+      const shown = typeof rawVersion === 'number' ? String(rawVersion) : typeof rawVersion;
+      throw new Error(
+        `hermes acp: agent negotiated unsupported ACP protocolVersion (${shown}); ` +
+          `this client requires ${PROTOCOL_VERSION} — closing (spec: client should disconnect)`,
+      );
+    }
+    // A-02: retain the advertisement (defensive isRecord projection at the
+    // wire boundary — same belt-and-braces posture as the authMethods read
+    // below). `sessionCapabilities.list/close` advertise by PRESENCE of the
+    // capability object (`SessionCapabilities { close?: … | null; list?: … |
+    // null }`, types.gen.d.ts:2600-2645); Hermes serializes each set
+    // capability as `{}` (pydantic by_alias + exclude_unset).
+    const agentCaps = isRecord(rawRecord.agentCapabilities) ? rawRecord.agentCapabilities : {};
+    const sessionCaps = isRecord(agentCaps.sessionCapabilities) ? agentCaps.sessionCapabilities : {};
+    this.advertised = {
+      protocolVersion: rawVersion,
+      loadSession: agentCaps.loadSession === true,
+      sessionList: isRecord(sessionCaps.list),
+      sessionClose: isRecord(sessionCaps.close),
+      promptCapabilities: isRecord(agentCaps.promptCapabilities) ? agentCaps.promptCapabilities : {},
+    };
     // Task 13: RETAIN the advertised auth methods (`response.authMethods` —
     // the SDK-typed field, see {@link AdvertisedAuthMethod}'s verification
     // trail). The SDK's client-side wrapper hands back the raw JSON-RPC
@@ -635,7 +771,9 @@ export class AcpClient implements AcpClientLike {
       // A7: surface the harness-bound model at session start — kills the
       // generic "Model" placeholder (`webview/src/App.tsx`) until the
       // user's first manual switch.
-      currentModelId: response.models?.currentModelId,
+      ...(response.models?.currentModelId !== undefined
+        ? { currentModelId: response.models.currentModelId }
+        : {}),
     };
   }
 
@@ -742,6 +880,16 @@ export class AcpClient implements AcpClientLike {
    * `=== null` check that can never fire against the pinned SDK.
    */
   async setSessionModel(sessionId: string, modelId: string): Promise<void> {
+    // A-02 (WS-AC): ACP v1 advertises NO capability for `session/set_model`
+    // at all — SessionCapabilities carries only close/fork/list/resume
+    // (types.gen.d.ts:2600-2645, verified against the installed SDK), so the
+    // only wire-level conformance gates available are the protocolVersion
+    // assert and initialize-first. Session-scoped availability is already
+    // structurally gated upstream: the Models UI only exists when the
+    // session advertised `models` state (A7 retention). Same
+    // requireConnection-first ordering as listSessions.
+    this.requireConnection();
+    this.requireAdvertised('set_model');
     // W1-T1 (CF-01/A-2): raced against child termination. The sole caller
     // (`SessionController.setModel`) already attaches an explicit rejection
     // handler (`.then(resolve, reject)`, a seq-guarded UI rollback) — this
@@ -761,6 +909,19 @@ export class AcpClient implements AcpClientLike {
    * `_session/list` and made the Sessions panel permanently unloadable.
    */
   async listSessions(cwd?: string, cursor?: string): Promise<AcpListSessionsRawResult> {
+    // A-02 gate (WS-AC): `session/list` only when advertised. ORDER MATTERS:
+    // requireConnection first — a never-connected or already-terminated
+    // client must keep failing "not connected" (the terminate suite pins
+    // it), advertisement state is only consulted on a live connection. Vs
+    // pinned Hermes a no-op (SessionListCapabilities advertised,
+    // server.py:892); the refusal propagates through
+    // SessionsPanelSource.fetchPage's documented honest error face (:769-787
+    // below).
+    this.requireConnection();
+    const caps = this.requireAdvertised('session/list');
+    if (!caps.sessionList) {
+      throw new Error('AcpClient: agent did not advertise sessionCapabilities.list — refusing session/list');
+    }
     const params: Record<string, unknown> = {};
     if (cwd !== undefined) params.cwd = cwd;
     if (cursor !== undefined) params.cursor = cursor;
@@ -806,11 +967,26 @@ export class AcpClient implements AcpClientLike {
     sessionId: string,
     mcpServers: AcpMcpServer[] = [],
   ): Promise<AcpLoadSessionResult> {
+    // A-02 gate (WS-AC): the spec MUST-check — `session/load` may only be
+    // called when the agent advertised `loadSession`. Vs pinned Hermes this
+    // is a no-op (`acp_adapter/server.py:888` advertises load_session=True);
+    // the refusal fires only against a stricter agent, and both callers
+    // (`SessionController.loadReplayOutcome`'s try/catch at :1401 — honest
+    // error + terminal turn.end; ConnectionSupervisor.recoverOneSession via
+    // the same controller path) already surface a loadSession rejection
+    // honestly. requireConnection FIRST (uniform gate order across the
+    // gated RPCs): a never-connected or terminated client keeps failing
+    // "not connected"; advertisement is only consulted on a live one.
+    this.requireConnection();
+    const caps = this.requireAdvertised('session/load');
+    if (!caps.loadSession) {
+      throw new Error('AcpClient: agent did not advertise loadSession — refusing session/load');
+    }
     // W1-T1 (CF-01/A-2): raced against child termination.
     // `ConnectionSupervisor.recoverOneSession`'s crash-recovery caller
     // already races this same call via `raceRecoveryAgainstChildExit`
     // (`onExit`-based, pre-existing) — redundant with this, unchanged.
-    // `SessionController.loadReplay`'s History-panel caller (`:1141`) had NO
+    // `SessionController.loadReplayOutcome`'s History-panel caller (`:1141`) had NO
     // race of its own: its `try/catch` (already correct — emits an honest
     // `error` + terminal `turn.end`) could never fire on a child death
     // mid-load before this fix, for the identical "the await itself never
@@ -841,9 +1017,11 @@ export class AcpClient implements AcpClientLike {
           found: true,
           currentModeId: response.modes.currentModeId ?? 'default',
           // A7: same capture as `newSession` — a History-panel load or
-          // crash-recovery replay (`SessionController.loadReplay`) restores
+          // crash-recovery replay (`SessionController.loadReplayOutcome`) restores
           // the harness-bound model too, not just the mode.
-          currentModelId: response.models?.currentModelId,
+          ...(response.models?.currentModelId !== undefined
+            ? { currentModelId: response.models.currentModelId }
+            : {}),
         }
       : { found: false };
   }
@@ -859,10 +1037,31 @@ export class AcpClient implements AcpClientLike {
    * `close_session` handler. This call is therefore expected to be refused,
    * which is exactly why it stays fire-and-forget: a rejection must never
    * block or throw out of `SessionController.dispose()`.
+   *
+   * WS-R1 F3-10: routed through raceTermination like every sibling request —
+   * child death now settles the promise instead of leaving it eternally
+   * pending; the termination rejection lands in the existing best-effort
+   * catch.
+   *
+   * WS-AC A-02: the call is now additionally gated on the advertised
+   * sessionCapabilities.close — see the in-body comment.
    */
   async closeSession(sessionId: string): Promise<void> {
+    // A-02 gate (WS-AC): the spec MUST NOT call an unadvertised
+    // `session/close`. Pinned Hermes advertises fork/list/resume and no
+    // close (`acp_adapter/server.py:890-894`), so vs the pinned harness this
+    // stops emitting a frame Hermes could only refuse (-32601) — the ONE
+    // deliberate wire change in the A-02 set, and the call is best-effort
+    // fire-and-forget with an identical client-observable outcome (resolves
+    // void either way; `SessionController.dispose`'s `?.catch(() => {})`
+    // never sees a difference). Fail-toward-silence, never rejects — the
+    // pre-initialize case skips for the same reason.
+    if (!this.advertised?.sessionClose) {
+      this.log('session/close not advertised — skipping (ACP MUST NOT call unadvertised session/close)');
+      return;
+    }
     try {
-      await this.requireConnection().unstable_closeSession({ sessionId });
+      await this.raceTermination(() => this.requireConnection().unstable_closeSession({ sessionId }));
     } catch (err) {
       this.log(`session/close failed (best-effort, ignored): ${String(err)}`);
     }
@@ -895,6 +1094,15 @@ export class AcpClient implements AcpClientLike {
   private requireConnection(): ClientSideConnection {
     if (!this.connection) throw new Error('AcpClient: not connected (call connect() first)');
     return this.connection;
+  }
+
+  /** A-02: initialize-first conformance choke for the gated session RPCs
+   *  (ACP: initialization MUST complete before other requests). */
+  private requireAdvertised(method: string): AdvertisedCapabilities {
+    if (!this.advertised) {
+      throw new Error(`AcpClient: ${method} called before initialize() completed (ACP: initialization must complete first)`);
+    }
+    return this.advertised;
   }
 
   private log(message: string): void {

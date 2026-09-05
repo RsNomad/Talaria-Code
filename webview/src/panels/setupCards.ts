@@ -244,13 +244,16 @@ export function foldSetupProgress(map: SetupProgressMap, msg: SetupProgress): Se
   }
   const prev = map[key];
   const logTail = msg.line !== undefined ? clampLogTail([...(prev?.logTail ?? []), msg.line]) : (prev?.logTail ?? []);
+  const phase = msg.phase ?? prev?.phase;
+  const totalBytes = msg.totalBytes ?? prev?.totalBytes;
+  const completedBytes = msg.completedBytes ?? prev?.completedBytes;
   const entry: SetupProgressEntry = {
     op: msg.op,
     id: msg.id,
-    phase: msg.phase ?? prev?.phase,
     logTail,
-    totalBytes: msg.totalBytes ?? prev?.totalBytes,
-    completedBytes: msg.completedBytes ?? prev?.completedBytes,
+    ...(phase !== undefined ? { phase } : {}),
+    ...(totalBytes !== undefined ? { totalBytes } : {}),
+    ...(completedBytes !== undefined ? { completedBytes } : {}),
   };
   return { ...map, [key]: entry };
 }
@@ -800,6 +803,53 @@ export function cancelPullParams(catalogId: string): { op: 'pull'; id: string } 
   return { op: 'pull', id: catalogId };
 }
 
+/* --- WS-SU T31/T32: honest action outcomes (F2-20-face / F1-6-face) ------- */
+
+/** One resolved Setup-mutation result, mapped for ActionButton's live line. */
+export type ActionOutcome = { text: string; tone: 'success' | 'failure' };
+
+/** T31 copy — the two honest cancel outcomes (WS-UX plan Task 31, verbatim). */
+export const CANCEL_DONE_TEXT = 'Cancelled';
+export const CANCEL_NOTHING_TEXT = 'Nothing to cancel — it had already finished.';
+
+/** T31 (F2-20-face): maps a resolved `setup.cancel` result onto its honest
+ *  outcome copy. A result without the WS-SU `{cancelled: boolean}`
+ *  discriminant renders NOTHING — the face never fabricates an outcome the
+ *  host didn't report. Both outcomes ride the success (non-error) tone: a
+ *  no-op cancel is information, not a failure. */
+export function cancelOutcome(result: unknown): ActionOutcome | undefined {
+  if (typeof result !== 'object' || result === null) return undefined;
+  const r = result as { ok?: unknown; cancelled?: unknown };
+  if (r.ok !== true || typeof r.cancelled !== 'boolean') return undefined;
+  return { text: r.cancelled ? CANCEL_DONE_TEXT : CANCEL_NOTHING_TEXT, tone: 'success' };
+}
+
+/** T32 (F1-6-face): TRUE only for a host result that affirmatively reports
+ *  `{ok: true}` — the ONLY shape allowed to claim pull completion. */
+export function isConfirmedOk(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && (result as { ok?: unknown }).ok === true;
+}
+
+/** T32 honest-copy for a resolve that is neither DECLINED nor a confirmed ok. */
+export const PULL_NOT_CONFIRMED_TEXT =
+  'The backend did not confirm the pull completed — re-check the model list before relying on it.';
+
+/** T32: outcome mapper for the Ollama pull buttons — a confirmed `{ok:true}`
+ *  earns the success flash; any OTHER resolve renders the honest
+ *  not-confirmed line instead of a fabricated success. (DECLINED never
+ *  reaches this — ActionButton short-circuits it first; an {ok:false}
+ *  refusal never reaches it either — unwrapSetupResult throws those.) */
+export function pullCompletionOutcome(
+  successLabel: string | undefined,
+): (result: unknown) => ActionOutcome | undefined {
+  return (result) =>
+    isConfirmedOk(result)
+      ? successLabel !== undefined
+        ? { text: successLabel, tone: 'success' }
+        : undefined
+      : { text: PULL_NOT_CONFIRMED_TEXT, tone: 'failure' };
+}
+
 /** The block's own scoped `setup.recheck` payload — narrower than the full
  *  `SetupMethod` param validation (T9), since the block only ever re-checks
  *  the ONE backend pane it renders. */
@@ -1236,6 +1286,11 @@ export interface RoleRec {
   bytes: number;
   /** {@link formatGiB} of `bytes` — the role line's `{size}`. */
   sizeGiB: string;
+  /** The SAME rounded 1-dp number `sizeGiB` prints ({@link roundGiB} of
+   *  `bytes`) — the numeric twin, so the meter never round-trips through
+   *  the display string (WV3-MIN-SYN). `sizeGiB === sizeGiBNum.toFixed(1)`
+   *  by construction. */
+  sizeGiBNum: number;
   vramLine: string;
   /** B-F5: the llama.cpp tier's rounded GiB, present ONLY when it differs
    *  from `sizeGiB` after rounding (not merely a differing raw byte count). */
@@ -1259,7 +1314,8 @@ function baseRoleRec(row: SetupCatalogModel): RoleRec | undefined {
   // exactly like a missing one — never let a non-finite or non-positive
   // value reach `formatGiB` and print "~NaN GB" / "~0 GB".
   if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return undefined;
-  const sizeGiB = formatGiB(bytes);
+  const sizeGiBNum = roundGiB(bytes);
+  const sizeGiB = sizeGiBNum.toFixed(1);
   const llamacppBytes = row.llamacpp?.approxBytes;
   const llamacppGiB = llamacppBytes !== undefined ? formatGiB(llamacppBytes) : undefined;
   return {
@@ -1268,8 +1324,9 @@ function baseRoleRec(row: SetupCatalogModel): RoleRec | undefined {
     displayName: row.displayName,
     bytes,
     sizeGiB,
+    sizeGiBNum,
     vramLine: row.vramLine,
-    divergenceGiB: llamacppGiB !== undefined && llamacppGiB !== sizeGiB ? llamacppGiB : undefined,
+    ...(llamacppGiB !== undefined && llamacppGiB !== sizeGiB ? { divergenceGiB: llamacppGiB } : {}),
   };
 }
 
@@ -1341,9 +1398,9 @@ export interface MeterSegment {
 
 export function meterSegments(agent: RoleRec, fim: RoleRec, embedding: RoleRec): MeterSegment[] {
   return [
-    { role: 'agent', pct: (Number(agent.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
-    { role: 'fim', pct: (Number(fim.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
-    { role: 'embedding', pct: (Number(embedding.sizeGiB) / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'agent', pct: (agent.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'fim', pct: (fim.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100 },
+    { role: 'embedding', pct: (embedding.sizeGiBNum / USABLE_VRAM_24GB_GIB) * 100 },
   ];
 }
 

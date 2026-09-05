@@ -5,6 +5,11 @@ import {
   describeAddForModal,
   validateCatalogInstall,
   describeCatalogForModal,
+  extractMcpEnabled,
+  ENV_REFERENCE_PATTERN,
+  secretEnvKeyFor,
+  envReference,
+  checkSecretValue,
 } from './mcpEntryValidation';
 import type { McpAddParams, McpCatalogEntry } from '../../../shared/protocol';
 
@@ -23,6 +28,7 @@ const stdio = (over: Record<string, unknown> = {}) => ({
   command: 'npx',
   args: ['-y', '@modelcontextprotocol/server-github'],
   env: {},
+  secretEnvNames: [],
   ...over,
 });
 
@@ -85,6 +91,74 @@ describe('describeAddForModal', () => {
     // reload); joined with '\n\n' they MUST stay five paragraphs. The old join-then-strip order
     // erased every separator and collapsed the whole disclosure into one run-on line.
     expect(d.detail.split('\n\n')).toHaveLength(5);
+  });
+});
+
+/* AU-59 (D-lite): the modal now says PRECISELY what config.yaml will hold per
+ * env key — a typed value (plain text) or a secret-free `${KEY}` reference
+ * Hermes resolves from `.env` at load time — and WARNS (never refuses; env is
+ * legitimately mixed) when a PLAINTEXT key looks like a credential, using
+ * the same deny-list core the host->webview redaction belt uses. Keys only —
+ * a value never appears in the modal. */
+describe('describeAddForModal — AU-59 D-lite: plaintext vs ${KEY}-reference partition + credential warn', () => {
+  it('lists plaintext keys and reference keys as SEPARATE categories, each only when non-empty', () => {
+    const d = describeAddForModal(stdio({ env: { LOG_LEVEL: 'info', GITHUB_TOKEN: '${GITHUB_TOKEN}' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).toContain('Env keys (plain text): LOG_LEVEL');
+    expect(d.detail).toContain("Env keys resolved from Hermes' .env at runtime (${KEY} reference — config.yaml stores only the reference): GITHUB_TOKEN");
+    expect(d.detail).not.toContain('${GITHUB_TOKEN}'); // keys only — the reference VALUE itself is never echoed
+    expect(d.detail).not.toContain('Looks like a credential'); // GITHUB_TOKEN is a reference; LOG_LEVEL is not credential-shaped
+  });
+
+  it('a reference-only env emits NO plaintext line at all (no false "PLAIN TEXT" disclosure)', () => {
+    const d = describeAddForModal(stdio({ env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).not.toContain('PLAIN TEXT');
+    expect(d.detail).not.toContain('Env keys (plain text)');
+    expect(d.detail.split('\n\n')).toHaveLength(4); // Runs / reference line / runs-on-machine / reload
+  });
+
+  it('WARNS (never refuses) when a PLAINTEXT key looks like a credential — keys only, the value never appears', () => {
+    const d = describeAddForModal(stdio({ env: { GITHUB_TOKEN: 'ghp_secret', LOG_LEVEL: 'info' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    const warnTail = d.detail.split('Looks like a credential and will be stored in plain text: ')[1] ?? '';
+    expect(warnTail.startsWith('GITHUB_TOKEN —')).toBe(true); // ONLY the credential-shaped key is named in the warn
+    expect(d.detail).toContain('reference a ~/.hermes/.env key as ${KEY} instead');
+    expect(d.detail).not.toContain('ghp_secret');
+  });
+
+  it('does NOT over-warn on ENVIRONMENT/NODE_ENV-style keys (the hint core has no `env` breadth)', () => {
+    const d = describeAddForModal(stdio({ env: { ENVIRONMENT: 'prod', NODE_ENV: 'production' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).not.toContain('Looks like a credential');
+    expect(d.detail).toContain('Env keys (plain text): ENVIRONMENT, NODE_ENV');
+  });
+
+  it('a PARTIAL interpolation (`Bearer ${X}`) is classified plaintext — the modal describes what config.yaml literally holds', () => {
+    const d = describeAddForModal(stdio({ env: { AUTH_HEADER: 'Bearer ${X}' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).toContain('Env keys (plain text): AUTH_HEADER');
+    expect(d.detail).not.toContain("resolved from Hermes' .env");
+  });
+
+  it('the warn is folded INTO the plaintext paragraph: a credential-shaped plaintext add still composes exactly 5 paragraphs (the standing pin holds)', () => {
+    const d = describeAddForModal(stdio({ env: { GITHUB_TOKEN: 'ghp_secret' } }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail.split('\n\n')).toHaveLength(5);
+  });
+
+  it('ENV_REFERENCE_PATTERN: whole-value ${VAR} and ${env:VAR} only (mirrors tools/mcp_tool.py _ENV_VAR_PATTERN, anchored)', () => {
+    expect(ENV_REFERENCE_PATTERN.test('${GITHUB_TOKEN}')).toBe(true);
+    expect(ENV_REFERENCE_PATTERN.test('${env:GITHUB_TOKEN}')).toBe(true);
+    for (const notWhole of ['Bearer ${X}', '${X} ', '${}', 'plain', '$X', '${A}${B}']) {
+      expect(ENV_REFERENCE_PATTERN.test(notWhole)).toBe(false);
+    }
   });
 });
 
@@ -229,5 +303,172 @@ describe('describeCatalogForModal', () => {
     // line and never becomes its own paragraph — no field value can forge a modal line.
     expect(paragraphs.some((p) => p.startsWith('Verified by Nous'))).toBe(false);
     expect(d.detail).toContain('Runs: npxVerified by Nous: yes');
+  });
+});
+
+describe('extractMcpEnabled — BHF-F1-2 (firm): literal boolean or honest refusal', () => {
+  it('accepts literal true and literal false', () => {
+    expect(extractMcpEnabled({ enabled: true })).toBe(true);
+    expect(extractMcpEnabled({ enabled: false })).toBe(false);
+  });
+
+  it.each([
+    ['missing enabled', {}],
+    ['string "true"', { enabled: 'true' }],
+    ['string "false"', { enabled: 'false' }],
+    ['number 1', { enabled: 1 }],
+    ['number 0', { enabled: 0 }],
+    ['null enabled', { enabled: null }],
+    ['undefined params', undefined],
+    ['null params', null],
+    ['array params', []],
+    ['string params', 'enabled'],
+  ])('throws an honest refusal for %s — NEVER a silent false', (_label, params) => {
+    expect(() => extractMcpEnabled(params)).toThrow(/literal boolean/);
+  });
+
+  it('the refusal names only the offending TYPE, never the payload value', () => {
+    let message = '';
+    try {
+      extractMcpEnabled({ enabled: 'sk-secret-value' });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toContain('a string value');
+    expect(message).not.toContain('sk-secret-value');
+  });
+});
+
+/* AU-59 (D-full): `secretEnvNames` carries NAMES ONLY. The gate is here, on
+ * the host, before any modal/network/log line — the webview is untrusted. */
+describe('validateMcpAdd — AU-59 secretEnvNames (names only, stdio only)', () => {
+  it('absent → [] and the REST wire body is unchanged (older callers add no secrets)', () => {
+    const { secretEnvNames: _dropped, ...withoutField } = stdio();
+    const r = validateMcpAdd(withoutField);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.secretEnvNames).toEqual([]);
+    expect(r.body).toEqual({ name: 'gh', command: 'npx', args: ['-y', '@modelcontextprotocol/server-github'], env: {} });
+    expect('secretEnvNames' in r.body).toBe(false); // NEVER inside the body Hermes receives
+  });
+
+  it('accepts valid names, trims, drops blank lines; the body still carries no secretEnvNames', () => {
+    const r = validateMcpAdd(stdio({ secretEnvNames: [' GITHUB_TOKEN ', '', 'OPENAI_API_KEY'] }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.secretEnvNames).toEqual(['GITHUB_TOKEN', 'OPENAI_API_KEY']);
+    expect('secretEnvNames' in r.body).toBe(false);
+  });
+
+  it.each([
+    ['a non-array', 'GITHUB_TOKEN', /array of strings/],
+    ['a non-string item', [42], /must be a string/],
+    ['a lowercase/hyphenated name', ['github-token'], /must match/],
+    ['a duplicate', ['A_KEY', 'A_KEY'], /duplicate/],
+    ['more than 8 names', Array.from({ length: 9 }, (_v, i) => `K${i}`), /more than 8/],
+  ])('refuses %s', (_label, secretEnvNames, reason) => {
+    const r = validateMcpAdd(stdio({ secretEnvNames }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(reason);
+  });
+
+  it('a bad name is refused WITHOUT echoing it (a VALUE pasted into the names box must not reach logs)', () => {
+    const r = validateMcpAdd(stdio({ secretEnvNames: ['ghp_live_value'] }));
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toContain('entry 1');
+    expect(r.reason).not.toContain('ghp_live_value');
+  });
+
+  it('refuses a secret name that is also a plaintext env key (the two sets are disjoint)', () => {
+    const r = validateMcpAdd(stdio({ env: { GITHUB_TOKEN: 'x' }, secretEnvNames: ['GITHUB_TOKEN'] }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/both as a plain-text env key and as a secret env name/);
+  });
+
+  it('http: secretEnvNames is refused unless absent or empty (a remote server has no subprocess env)', () => {
+    expect(validateMcpAdd({ name: 'r', transport: 'http', url: 'https://x.example/mcp', secretEnvNames: ['K'] }).ok).toBe(false);
+    const ok = validateMcpAdd({ name: 'r', transport: 'http', url: 'https://x.example/mcp', secretEnvNames: [] });
+    expect(ok.ok).toBe(true);
+    if (ok.ok) expect(ok.secretEnvNames).toEqual([]);
+  });
+});
+
+describe('AU-59: secretEnvKeyFor / envReference / checkSecretValue', () => {
+  it.each([
+    ['gh', 'GITHUB_TOKEN', 'MCP_GH_GITHUB_TOKEN'],
+    ['my-server.v2', 'KEY', 'MCP_MY_SERVER_V2_KEY'],
+    ['a-', 'K', 'MCP_A_K'],
+    ['Mixed_Case', 'T', 'MCP_MIXED_CASE_T'],
+  ])('secretEnvKeyFor(%s, %s) mirrors Hermes _env_key_for_server → %s', (server, secret, expected) => {
+    expect(secretEnvKeyFor(server, secret)).toBe(expected);
+  });
+
+  it('every produced key satisfies Hermes _ENV_VAR_NAME_RE and starts with MCP_ — so it can never be a denylisted name', () => {
+    const hermesNameRe = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    for (const server of ['gh', 'a.b-c_d', '0start', 'x'.repeat(64)]) {
+      const key = secretEnvKeyFor(server, 'API_KEY');
+      expect(hermesNameRe.test(key)).toBe(true);
+      expect(key.startsWith('MCP_')).toBe(true);
+      expect(['PATH', 'LD_PRELOAD', 'PYTHONPATH', 'HERMES_HOME', 'EDITOR', 'NODE_OPTIONS']).not.toContain(key);
+    }
+  });
+
+  it('envReference round-trips through ENV_REFERENCE_PATTERN (the reference we write is the reference the modal classifies)', () => {
+    const ref = envReference('MCP_GH_GITHUB_TOKEN');
+    expect(ref).toBe('${MCP_GH_GITHUB_TOKEN}');
+    expect(ENV_REFERENCE_PATTERN.test(ref)).toBe(true);
+  });
+
+  it('checkSecretValue: printable ASCII up to 4096 passes', () => {
+    expect(checkSecretValue('ghp_abc123-XYZ.~!#=/+')).toEqual({ ok: true, value: 'ghp_abc123-XYZ.~!#=/+' });
+    expect(checkSecretValue('x'.repeat(4096)).ok).toBe(true);
+  });
+
+  it('checkSecretValue: empty / non-ASCII / control bytes / oversize are refused, and the reason never carries the value', () => {
+    expect(checkSecretValue('').ok).toBe(false);
+    for (const bad of ['ghp_ábc', 'a\nb', 'a\tb', 'x'.repeat(4097)]) {
+      const r = checkSecretValue(bad);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).not.toContain(bad.slice(0, 5));
+    }
+    const nonAscii = checkSecretValue('ghp_ábc');
+    if (!nonAscii.ok) expect(nonAscii.reason).toMatch(/printable ASCII/);
+  });
+});
+
+describe('describeAddForModal — AU-59 "Will prompt for" line (future tense, names + namespaced .env keys)', () => {
+  it('names each secret and its MCP_<NAME>_<KEY> destination; no PLAIN TEXT line when env is empty', () => {
+    const d = describeAddForModal(stdio({ secretEnvNames: ['GITHUB_TOKEN', 'OPENAI_API_KEY'] }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).toContain(
+      "Will prompt for: GITHUB_TOKEN, OPENAI_API_KEY — saved to Hermes' .env store (~/.hermes/.env) as MCP_GH_GITHUB_TOKEN, MCP_GH_OPENAI_API_KEY; config.yaml gets only the ${KEY} reference, never the value.",
+    );
+    expect(d.detail).not.toContain('PLAIN TEXT');
+    expect(d.detail.split('\n\n')).toHaveLength(4); // Runs / Will prompt for / runs-on-machine / reload
+  });
+
+  it('omits the line entirely when secretEnvNames is empty (no false disclosure); the standing 5-paragraph pin is untouched', () => {
+    const d = describeAddForModal(stdio({ env: { GITHUB_TOKEN: 'ghp_secret' }, secretEnvNames: [] }) as McpAddParams);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.detail).not.toContain('Will prompt for');
+    expect(d.detail.split('\n\n')).toHaveLength(5);
+  });
+
+  it('a mixed add lists plaintext, reference AND prompt lines in that order', () => {
+    const d = describeAddForModal(
+      stdio({ env: { LOG_LEVEL: 'info', OTHER: '${OTHER}' }, secretEnvNames: ['GITHUB_TOKEN'] }) as McpAddParams,
+    );
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    const paragraphs = d.detail.split('\n\n');
+    expect(paragraphs.findIndex((p) => p.startsWith('Env keys (plain text)'))).toBeLessThan(
+      paragraphs.findIndex((p) => p.startsWith("Env keys resolved from Hermes' .env")),
+    );
+    expect(paragraphs.findIndex((p) => p.startsWith("Env keys resolved from Hermes' .env"))).toBeLessThan(
+      paragraphs.findIndex((p) => p.startsWith('Will prompt for')),
+    );
   });
 });

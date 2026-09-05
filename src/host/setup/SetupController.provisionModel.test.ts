@@ -14,6 +14,7 @@ import type { OllamaStatus, PullProgress } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
 import type { SetupProgress } from '../../shared/protocol';
 import { homedir } from 'node:os';
+import { GgufStoreSymlinkRaceError } from './ggufIngest';
 
 /**
  * T7 (beta.6 §2.5): `setup.provisionModel` — the REFUSAL-ORDER spy table over
@@ -213,6 +214,33 @@ function makeProvController(
   return { host, controller, calls, pullArgs, ingestArgs, storeArgs, resolveArgs, emitPullProgress };
 }
 
+/**
+ * CA-M09 non-frozen half (WS-SU Task 18): a thin `makeProvController`
+ * variant whose `downloadGgufToStore` sink ALWAYS rejects with the given
+ * error — the fixed counterpart of the `{hang: 'store'}` behavior above,
+ * for pinning clean-refusal propagation (rather than an in-flight hang)
+ * out of the T3 atomic sink. Threads the SAME shared `calls` array
+ * `makeProvController` already returns (recorded lazily: the override
+ * closure captures `calls` by reference before `makeProvController`
+ * returns it, and only reads it once actually invoked), and wires
+ * `onProgress` up front so callers get a ready-made `events` log —
+ * exactly what the propagation pin needs to assert the terminal
+ * `done: true` push.
+ */
+function makeProvControllerWithRejectingStore(error: Error): Recorded & { events: SetupProgress[] } {
+  let calls: string[] | undefined;
+  const recorded = makeProvController({
+    downloadGgufToStore: async (): Promise<void> => {
+      calls?.push('downloadGgufToStore');
+      throw error;
+    },
+  });
+  calls = recorded.calls;
+  const events: SetupProgress[] = [];
+  recorded.controller.onProgress((e) => events.push(e));
+  return { ...recorded, events };
+}
+
 // --- step 0: trust gate ------------------------------------------------------
 
 describe('T7 step 0: trust gate (MUTATING_METHODS membership)', () => {
@@ -372,6 +400,34 @@ describe('T7 step 4b: library tier (qwen25-coder-1.5b via ollama)', () => {
     });
     await controller.handle('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' });
     await expect(first).resolves.toEqual({ ok: false, reason: 'cancelled' });
+  });
+
+  it('F2-20: setup.cancel with an in-flight pull resolves {ok, cancelled:true, matched:<canonical id>}', async () => {
+    const { controller, calls } = makeProvController({}, { hang: 'pull' });
+    const first = controller.handle('setup.provisionModel', { modelId: 'qwen25-coder-1.5b', backend: 'ollama' });
+    await vi.waitFor(() => {
+      expect(calls).toContain('pullModel');
+    });
+    await expect(controller.handle('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' })).resolves.toEqual({
+      ok: true,
+      cancelled: true,
+      matched: 'qwen25-coder-1.5b',
+    });
+    await expect(first).resolves.toEqual({ ok: false, reason: 'cancelled' });
+  });
+
+  it('F2-20: setup.cancel with NOTHING in flight resolves {ok, cancelled:false} — no matched key', async () => {
+    const { controller } = makeProvController();
+    // toEqual is exact: asserts `matched` is ABSENT (key omission), not undefined.
+    await expect(controller.handle('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' })).resolves.toEqual({
+      ok: true,
+      cancelled: false,
+    });
+  });
+
+  it('F2-20: setup.cancel with malformed params (no op/id) resolves {ok, cancelled:false}', async () => {
+    const { controller } = makeProvController();
+    await expect(controller.handle('setup.cancel', {})).resolves.toEqual({ ok: true, cancelled: false });
   });
 });
 
@@ -752,5 +808,75 @@ describe('T7 step 5: llamacpp file downloads (live-oid rows)', () => {
     });
     await controller.handle('setup.cancel', { op: 'pull', id: 'qwen3-embedding-0.6b' });
     await expect(retry).resolves.toEqual({ ok: false, reason: 'cancelled' });
+  });
+});
+
+// --- CA-M09 non-frozen half (WS-SU Task 18) ---------------------------------
+
+describe('CA-M09 non-frozen half: reassert-to-sink ordering + race-refusal propagation (WS-SU Task 18)', () => {
+  it('downloadGgufToStore receives the RE-ASSERTED dest (2nd checkedStoreDest result), not the pre-modal one', async () => {
+    // Two DISTINCT ok:true dest results — A (pre-modal, call 1) and B
+    // (post-modal re-assert, call 2) — so a sink invoked with A's fields
+    // instead of B's is caught, not masked by both calls returning the
+    // same value (AU-13/TD-2's own race test above only proves the FAILING
+    // half of this; a success/success pair pins the passing half).
+    const destA = {
+      destDir: `${homedir()}/.local/share/talaria/models/Qwen/Qwen3-Embedding-0.6B-GGUF-A`,
+      destFile: 'dest-A.gguf',
+    };
+    const destB = {
+      destDir: `${homedir()}/.local/share/talaria/models/Qwen/Qwen3-Embedding-0.6B-GGUF-B`,
+      destFile: 'dest-B.gguf',
+    };
+    let checkedStoreDestCalls = 0;
+    const { controller, storeArgs } = makeProvController({
+      checkedStoreDest: async () => {
+        checkedStoreDestCalls += 1;
+        const dest = checkedStoreDestCalls === 1 ? destA : destB;
+        return { ok: true as const, destDir: dest.destDir, destFile: dest.destFile, destPath: `${dest.destDir}/${dest.destFile}` };
+      },
+    });
+
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'qwen3-embedding-0.6b',
+      backend: 'llamacpp',
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(checkedStoreDestCalls).toBe(2);
+    expect(storeArgs).toHaveLength(1);
+    expect(storeArgs[0]?.destDir).toBe(destB.destDir);
+    expect(storeArgs[0]?.destFile).toBe(destB.destFile);
+    // Negative check: the sink must NOT have carried the stale, pre-modal A.
+    expect(storeArgs[0]?.destDir).not.toBe(destA.destDir);
+    expect(storeArgs[0]?.destFile).not.toBe(destA.destFile);
+  });
+
+  it('a GgufStoreSymlinkRaceError from the sink surfaces as a clean {ok:false} with the fixed path-free reason, latch released, done-push emitted', async () => {
+    const { controller, events, calls } = makeProvControllerWithRejectingStore(new GgufStoreSymlinkRaceError());
+
+    const result = await controller.handle('setup.provisionModel', {
+      modelId: 'qwen3-embedding-0.6b',
+      backend: 'llamacpp',
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      reason: 'store destination changed while downloading (possible symlink race) — refusing to place the file',
+    });
+    expect(events.at(-1)).toMatchObject({ op: 'pull', id: 'qwen3-embedding-0.6b', done: true });
+
+    // latch released (mirrors the retry idiom above, :772-782): a retry
+    // reaches the store dep again — never 'pull already running' — proving
+    // the throw was caught and the `finally` ran `inFlight.delete(key)`.
+    const retry = await controller.handle('setup.provisionModel', {
+      modelId: 'qwen3-embedding-0.6b',
+      backend: 'llamacpp',
+    });
+    expect(retry).toEqual({
+      ok: false,
+      reason: 'store destination changed while downloading (possible symlink race) — refusing to place the file',
+    });
+    expect(calls.filter((c) => c === 'downloadGgufToStore')).toHaveLength(2);
   });
 });

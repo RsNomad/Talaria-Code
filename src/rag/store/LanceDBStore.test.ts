@@ -24,7 +24,7 @@ vi.mock('@lancedb/lancedb', () => ({
 }));
 
 // eslint-disable-next-line import/first -- must follow the vi.mock call above.
-import { IndexNotReadyError, LanceDBStore } from './LanceDBStore';
+import { IndexNotReadyError, isFileHashRow, isStoredRow, LanceDBStore } from './LanceDBStore';
 
 interface FakeQueryChain {
   where: (predicate: string) => FakeQueryChain;
@@ -353,5 +353,161 @@ describe('LanceDBStore.init — TA-4 Rev-2: self-heal probe/drop failure rethrow
     const store = new LanceDBStore('/fake/index/dir');
 
     await expect(store.init()).rejects.toThrow(/failed to reset malformed/i);
+  });
+});
+
+describe('WS-BG row-shape guards (exported pure)', () => {
+  const goodRow = { id: 'c1', path: 'a.ts', startLine: 0, endLine: 3, content: 'x', language: 'typescript' };
+
+  it('isStoredRow accepts well-formed rows, tolerating null/absent language (nullable column)', () => {
+    expect(isStoredRow(goodRow)).toBe(true);
+    expect(isStoredRow({ ...goodRow, language: null })).toBe(true);
+    const { language, ...noLang } = goodRow;
+    expect(isStoredRow(noLang)).toBe(true);
+  });
+
+  it.each([
+    ['non-record', 'row'],
+    ['missing id', { ...goodRow, id: undefined }],
+    ['numeric path', { ...goodRow, path: 7 }],
+    ['string startLine', { ...goodRow, startLine: '0' }],
+    ['missing content', { ...goodRow, content: undefined }],
+  ])('isStoredRow refuses %s', (_label, row) => {
+    expect(isStoredRow(row)).toBe(false);
+  });
+
+  it('isFileHashRow checks exactly path+contentHash strings', () => {
+    expect(isFileHashRow({ path: 'a.ts', contentHash: 'h1' })).toBe(true);
+    expect(isFileHashRow({ path: 'a.ts' })).toBe(false);
+    expect(isFileHashRow({ path: 7, contentHash: 'h1' })).toBe(false);
+    expect(isFileHashRow(null)).toBe(false);
+  });
+});
+
+describe('WS-BG: hybridSearch filters malformed rows instead of casting them into hits', () => {
+  beforeEach(() => {
+    connectMock.mockReset();
+  });
+
+  it('a malformed vector-leg row is dropped; well-formed rows still fuse', async () => {
+    const good = { id: 'c1', path: 'a.ts', startLine: 0, endLine: 3, content: 'x', language: 'typescript' };
+    const table = makeFakeTable({
+      vecRows: async () => [good, { id: 42, garbage: true }],
+      ftsRows: async () => [],
+    });
+    const { store } = await makeInitializedStore(table);
+
+    const hits = await store.hybridSearch('q', [0.1], 5);
+
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ id: 'c1', path: 'a.ts' });
+  });
+});
+
+describe('WS-BG: listFileHashes skips malformed rows (self-healing: the file re-reads as changed)', () => {
+  beforeEach(() => {
+    connectMock.mockReset();
+  });
+
+  interface FakeHashChain {
+    select: (cols: string[]) => FakeHashChain;
+    toArray: () => Promise<unknown[]>;
+  }
+
+  function makeHashesTable(rows: unknown[]): FakeTable {
+    const chain: FakeHashChain = {
+      select: () => chain,
+      toArray: async () => rows,
+    };
+    return {
+      query: () => chain,
+      createIndex: vi.fn(async () => {}),
+      close: vi.fn(),
+      schema: vi.fn(async () => ({ fields: HEALTHY_SCHEMA_FIELD_NAMES.map((name) => ({ name })) })),
+    } as unknown as FakeTable;
+  }
+
+  it('returns only the well-formed path->hash pairs', async () => {
+    const { store } = await makeInitializedStore(
+      makeHashesTable([
+        { path: 'a.ts', contentHash: 'h1' },
+        { path: 7, contentHash: 'h2' },
+        'garbage',
+        { path: 'b.ts', contentHash: 'h3' },
+      ]),
+    );
+
+    expect(await store.listFileHashes()).toEqual({ 'a.ts': 'h1', 'b.ts': 'h3' });
+  });
+});
+
+/**
+ * F2-12: the malformed-row warn (`warnMalformedRowsOnce`) was `console.error`
+ * only, with no way for a caller to observe HOW MANY rows have been dropped
+ * over the store's lifetime, nor to redirect the log line to the extension's
+ * own OutputChannel instead of the process stderr. `logger?` is an injected
+ * seam (default `console.error`, behavior-identical where unwired — e.g. the
+ * MCP child); `droppedMalformedRows` is a CUMULATIVE counter incremented on
+ * EVERY drop even though the warn line itself stays once-gated (spamming the
+ * log on every query would be worse than the bug this store already fixed).
+ */
+describe('F2-12: injected logger seam + cumulative droppedMalformedRows counter', () => {
+  beforeEach(() => {
+    connectMock.mockReset();
+  });
+
+  interface FakeHashChain {
+    select: (cols: string[]) => FakeHashChain;
+    toArray: () => Promise<unknown[]>;
+  }
+
+  it('the once-gated warn logs through the injected logger exactly once, while the counter accumulates every drop', async () => {
+    const logSpy = vi.fn();
+    let rows: unknown[] = [{ path: 'a.ts', contentHash: 'h1' }, 'garbage'];
+    const chain: FakeHashChain = {
+      select: () => chain,
+      toArray: async () => rows,
+    };
+    const table: FakeTable = {
+      query: () => chain,
+      createIndex: vi.fn(async () => {}),
+      close: vi.fn(),
+      schema: vi.fn(async () => ({ fields: HEALTHY_SCHEMA_FIELD_NAMES.map((name) => ({ name })) })),
+    } as unknown as FakeTable;
+    const db = makeFakeDb(table);
+    connectMock.mockResolvedValue(db);
+    const store = new LanceDBStore('/fake/index/dir', { logger: logSpy });
+    await store.init();
+
+    await store.listFileHashes(); // 1 malformed row dropped ('garbage')
+    rows = [{ path: 'b.ts', contentHash: 'h2' }, 7, { path: 9, contentHash: 'h3' }];
+    await store.listFileHashes(); // 2 more malformed rows dropped (7, {path:9,...})
+
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls[0]?.[0]).toContain('dropped 1 malformed row');
+    expect(store.droppedMalformedRows).toBe(3);
+  });
+
+  it('defaults the logger to console.error when unwired (MCP-child/back-compat behavior)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const chain: FakeHashChain = {
+      select: () => chain,
+      toArray: async () => [],
+    };
+    const table: FakeTable = {
+      query: () => chain,
+      createIndex: vi.fn(async () => {}),
+      close: vi.fn(),
+      schema: vi.fn(async () => ({ fields: HEALTHY_SCHEMA_FIELD_NAMES.map((name) => ({ name })) })),
+    } as unknown as FakeTable;
+    const db = makeFakeDb(table);
+    connectMock.mockResolvedValue(db);
+    const store = new LanceDBStore('/fake/index/dir');
+    await store.init();
+
+    await store.listFileHashes(); // no rows -> nothing dropped, just proves construction still works
+    expect(store.droppedMalformedRows).toBe(0);
+
+    errSpy.mockRestore();
   });
 });

@@ -21,12 +21,14 @@ type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Arra
 
 // --- shared fetch-response fakes ----------------------------------------
 
+// WS-SU Task 6: probeOllama now reads the BODY stream (F2-15) — fixture carries one.
 function jsonResponse(status: number, statusText: string, body: unknown): Response {
+  const chunk = new TextEncoder().encode(JSON.stringify(body));
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText,
-    json: async () => body,
+    body: chunkedBody([chunk]),
   } as unknown as Response;
 }
 
@@ -156,6 +158,57 @@ describe('probeOllama — GET /api/tags (§2.4)', () => {
     const result = await probeOllama(ENDPOINT, fetchImpl as unknown as typeof fetch, 5);
 
     expect(result.running).toBe(false);
+  });
+});
+
+describe('F2-15: probeOllama caps the /api/tags body read', () => {
+  it('an over-cap body degrades to {running:false} with a cap-naming detail', async () => {
+    const huge = new TextEncoder().encode(`{"models":[{"name":"${'x'.repeat(1_100_000)}","size":1}]}`);
+    const response = { ok: true, status: 200, statusText: 'OK', body: chunkedBody([huge]) } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    const status = await probeOllama(ENDPOINT, fetchImpl);
+    expect(status.running).toBe(false);
+    if (!status.running) expect(status.detail).toContain('exceeded');
+  });
+  it('stops reading once the running total crosses the cap — never drains the rest of the stream (M-T6b pin)', async () => {
+    // The invariant the renamed test above cannot observe from a single
+    // chunk: `readBodyBounded` returns BEFORE appending the over-cap chunk
+    // and stops issuing read()s. Same read-call-count idiom as pullModel's
+    // "bails out WHILE reading" test below. Six 512 KiB chunks are on offer
+    // (3 MiB); the 1 MiB probe cap is first EXCEEDED on chunk 3 (1.5 MiB —
+    // chunk 2's exact 1 MiB is not `>` the cap), so read() must be called at
+    // most 3 times — draining all 6 (plus the terminal done-read) is the
+    // regression this pins against.
+    const chunk = new Uint8Array(512 * 1024).fill(97); // 'a' bytes; no newline needed — the probe body is one-shot JSON
+    let calls = 0;
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const reader = {
+      read: vi.fn(async (): Promise<StreamReadResult> => {
+        calls += 1;
+        if (calls > 6) return { value: undefined, done: true };
+        return { value: chunk, done: false };
+      }),
+      cancel,
+      releaseLock: vi.fn(),
+    } as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    const response = { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+
+    const status = await probeOllama(ENDPOINT, fetchImpl);
+
+    expect(status.running).toBe(false);
+    if (!status.running) expect(status.detail).toContain('exceeded');
+    expect(calls).toBeLessThanOrEqual(3); // the load-bearing assertion: bailed WHILE reading
+    expect(cancel).toHaveBeenCalled(); // teardown sanity — the finally cancels on every exit path
+  });
+  it('a 200 with NO readable body degrades to {running:false} with a reason-naming detail (fail-closed, never a crash)', async () => {
+    const response = { ok: true, status: 200, statusText: 'OK' } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    const status = await probeOllama(ENDPOINT, fetchImpl);
+    expect(status.running).toBe(false);
+    // M-T6a: parity with the over-cap sibling — the detail names WHY, so the
+    // failure is diagnosable. Pins readBodyBounded's stable template reason.
+    if (!status.running) expect(status.detail).toContain('no readable body');
   });
 });
 
@@ -314,5 +367,71 @@ describe('pullModel — POST /api/pull streaming NDJSON (§2.4)', () => {
     // AT MOST 5 times, nowhere near all 20 (let alone the 21st done-read).
     expect(calls).toBeLessThanOrEqual(5);
     expect(cancel).toHaveBeenCalled();
+  });
+});
+
+describe('F1-6: pull completion is REQUIRED, not assumed', () => {
+  it('a stream that ends WITHOUT {"status":"success"} rejects PullIncompleteError', async () => {
+    const lines = [
+      JSON.stringify({ status: 'pulling manifest' }),
+      JSON.stringify({ status: 'pulling sha256:aaa', total: 10, completed: 5 }),
+    ];
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    const promise = pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal);
+    await expect(promise).rejects.toThrow('pull stream ended before {"status":"success"} — incomplete');
+    await expect(promise).rejects.toMatchObject({ name: 'PullIncompleteError' });
+  });
+
+  it('success arriving as the FINAL, un-newline-terminated trailing chunk still resolves', async () => {
+    const chunk = new TextEncoder().encode(`${JSON.stringify({ status: 'pulling manifest' })}\n${JSON.stringify({ status: 'success' })}`);
+    const response = { ok: true, body: chunkedBody([chunk]) } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).resolves.toBeUndefined();
+  });
+
+  it('an empty stream (immediate done) rejects PullIncompleteError', async () => {
+    const response = { ok: true, body: chunkedBody([]) } as unknown as Response;
+    const fetchImpl = vi.fn().mockResolvedValue(response);
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      name: 'PullIncompleteError',
+    });
+  });
+});
+
+describe('F1-7: malformed NDJSON lines are counted + skipped, never fatal one-by-one', () => {
+  it('one malformed line mid-stream is skipped; the pull still completes on the later success', async () => {
+    const lines = [JSON.stringify({ status: 'pulling manifest' }), '{not json', JSON.stringify({ status: 'success' })];
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    const seen: string[] = [];
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, (p) => seen.push(p.status), new AbortController().signal)).resolves.toBeUndefined();
+    expect(seen).toEqual(['pulling manifest', 'success']);
+  });
+  it('MORE than MAX_MALFORMED_PULL_LINES malformed lines fail the pull honestly', async () => {
+    const lines = Array.from({ length: 21 }, () => '{not json');
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      name: 'PullMalformedStreamError',
+    });
+  });
+  it('EXACTLY MAX_MALFORMED_PULL_LINES (20) malformed lines are tolerated — the boundary itself, not just 21 (M-T5 pin)', async () => {
+    // Pins the strict `>` in `malformedLines > MAX_MALFORMED_PULL_LINES`
+    // (ollamaClient.ts): a silent regression to `>=` would still pass the
+    // 21-line test above yet break the documented "20 tolerated" guarantee.
+    // `streamingResponse` newline-terminates every line, so all 20 malformed
+    // lines land in the inner parse loop before the success line does.
+    const lines = [...Array.from({ length: 20 }, () => '{not json'), JSON.stringify({ status: 'success' })];
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    const seen: string[] = [];
+    await expect(
+      pullModel(ENDPOINT, 'm', fetchImpl, (p) => seen.push(p.status), new AbortController().signal),
+    ).resolves.toBeUndefined();
+    expect(seen).toEqual(['success']); // the malformed lines emitted no progress ticks
+  });
+  it('fail-closed interplay (F1-6×F1-7): a malformed SUCCESS line ends as PullIncompleteError, never silent success', async () => {
+    const lines = [JSON.stringify({ status: 'pulling manifest' }), '{"status":"success"']; // truncated JSON
+    const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(lines));
+    await expect(pullModel(ENDPOINT, 'm', fetchImpl, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      name: 'PullIncompleteError',
+    });
   });
 });

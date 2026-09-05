@@ -340,7 +340,14 @@ export function createLibServerHost(deps: LibServerHostDeps): LibServerHost {
       maxBodyBytes,
     });
 
-    server.on('request', createLibRequestListener({ expect, buildMcpServer: deps.buildMcpServer, log }));
+    server.on(
+      'request',
+      createLibRequestListener({
+        expect,
+        buildMcpServer: deps.buildMcpServer,
+        ...(log !== undefined ? { log } : {}),
+      }),
+    );
     server.on('error', onServerError);
 
     // Built as plain (mutable-typed) values first, then deep-frozen via

@@ -49,6 +49,12 @@ export type NextEditVerdict =
   | { kind: 'no-op' }
   | { kind: 'invalid'; reason: string };
 export interface AnchoredProposal { region: EditableRegion; newText: string; docVersion: number; cursorLine: number }
+/** BHF-F3-15 — the freshness pair `applyEdit` re-validates immediately
+ *  before building the WorkspaceEdit: the document version the proposal's
+ *  region coordinates were last validated against (the shell's
+ *  `trackedVersion` as of the dispatch that emitted the effect), and the
+ *  region's base text as anchored/reanchored. */
+export interface ApplyExpectation { docVersion: number; baseText: string }
 export type NextEditFsmState =
   | { kind: 'idle' } | { kind: 'proposed'; p: AnchoredProposal } | { kind: 'jumped'; p: AnchoredProposal };
 export type NextEditFsmEvent =

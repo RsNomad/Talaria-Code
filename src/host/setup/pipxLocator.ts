@@ -1,6 +1,9 @@
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loginShellSpawn, type ExecLookup, type LoginShellSpawnOptions } from '../runtime/resolveHermes';
+import { isExecTimeout, lastNonEmptyLine, throwIfAborted } from './locatorShared';
+
+export { isExecTimeout } from './locatorShared';
 
 /**
  * pipx + Python locator (onboarding-backend-setup-architecture.md §2.2,
@@ -56,6 +59,10 @@ import { loginShellSpawn, type ExecLookup, type LoginShellSpawnOptions } from '.
  *   `python3 --version` probe on any failure of that lookup (whether the
  *   `--value` call itself errors, or the resolved interpreter's `--version`
  *   call fails).
+ *
+ * `isExecTimeout`/`throwIfAborted`/`lastNonEmptyLine` — shared core extracted
+ * to `locatorShared.ts` (WS-SU); `llamaCppLocator.ts`'s own clone of them
+ * follows the same extraction.
  */
 
 /** Resolved pipx + Python facts needed by the (later) install pipeline. */
@@ -120,35 +127,6 @@ const ABSOLUTE_CANDIDATE_TIMEOUT_MS = 2_000;
  *  AND every absolute-candidate fallback have failed to answer in time. */
 const PROBE_TIMEOUT_DETAIL =
   "Your login shell didn't answer in time — a slow shell profile (nvm, conda, a network home directory) can cause this. It's usually transient: press Re-check.";
-
-/**
- * T11 (§3, critic C-9): classify a rejected `ExecLookup` error as a TIMEOUT
- * kill specifically — Node's `execFile` sets `err.killed = true` (and
- * usually `err.signal = 'SIGTERM'`) when the `timeout` option fires, but ALSO
- * sets `killed: true` when the child is killed for exceeding `maxBuffer` —
- * that second case must NOT be retried/treated as a login-shell slowness
- * signal, so it is excluded via Node's own `err.code` for that condition.
- * Exported so both this module's callers AND its own test suite can pin the
- * classifier against a REAL `execFile` timeout (Global Constraint 4 — no
- * mock-theater for this specific gap, since `ExecLookup` itself carries no
- * error shape).
- */
-export function isExecTimeout(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const e = err as { killed?: unknown; signal?: unknown; code?: unknown };
-  const killedOrSigterm = e.killed === true || e.signal === 'SIGTERM';
-  return killedOrSigterm && e.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
-}
-
-/** T11 (§3, critic C-11): `locatePipx`'s optional cancellation seam — checked
- *  BETWEEN the three major steps (pipx lookup / python gate / venvsRoot
- *  read), matching the `throwIfAborted` pattern `pipxInstaller.ts` already
- *  uses for its own pipeline. */
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) {
-    throw new DOMException('The operation was aborted.', 'AbortError');
-  }
-}
 
 /**
  * Locate `pipx` and gate its default Python interpreter into Hermes's
@@ -276,7 +254,11 @@ async function findPipxPath(exec: ExecLookup, cwd: string, signal: AbortSignal |
 
   let stdout: string;
   try {
-    stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_TIMEOUT_MS, cwd, signal });
+    stdout = await exec(spec.command, spec.args, {
+      timeoutMs: PIPX_STEP0_TIMEOUT_MS,
+      cwd,
+      ...(signal !== undefined ? { signal } : {}),
+    });
   } catch (firstErr) {
     // TC-5/AU-28: an abort takes priority over the timeout classifier — Node
     // sets `killed`/`signal` on an abort-driven kill too (the same shape a
@@ -286,7 +268,11 @@ async function findPipxPath(exec: ExecLookup, cwd: string, signal: AbortSignal |
     if (signal?.aborted) throw firstErr;
     if (!isExecTimeout(firstErr)) return { kind: 'missing' };
     try {
-      stdout = await exec(spec.command, spec.args, { timeoutMs: PIPX_STEP0_RETRY_TIMEOUT_MS, cwd, signal });
+      stdout = await exec(spec.command, spec.args, {
+        timeoutMs: PIPX_STEP0_RETRY_TIMEOUT_MS,
+        cwd,
+        ...(signal !== undefined ? { signal } : {}),
+      });
     } catch (secondErr) {
       if (signal?.aborted) throw secondErr;
       if (!isExecTimeout(secondErr)) return { kind: 'missing' };
@@ -314,7 +300,11 @@ async function probeAbsoluteCandidates(
 ): Promise<PipxLookup> {
   for (const candidate of absoluteCandidatePaths()) {
     try {
-      await exec(candidate, ['--version'], { timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS, cwd, signal });
+      await exec(candidate, ['--version'], {
+        timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS,
+        cwd,
+        ...(signal !== undefined ? { signal } : {}),
+      });
       return { kind: 'found', path: candidate };
     } catch (err) {
       // TC-5/AU-28: an abort must propagate, not be swallowed as "try the
@@ -423,25 +413,23 @@ async function runLoginShell(
 ): Promise<string> {
   const spec = loginShellSpawn(command, args, undefined, options);
   try {
-    return await exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd, signal });
+    return await exec(spec.command, spec.args, {
+      timeoutMs: LOOKUP_TIMEOUT_MS,
+      cwd,
+      ...(signal !== undefined ? { signal } : {}),
+    });
   } catch (err) {
     // TC-5/AU-28: an abort takes priority over the timeout classifier (see
     // {@link findPipxPath}'s identical guard) — propagate immediately
     // instead of retrying into an already-aborted signal.
     if (signal?.aborted) throw err;
     if (!isExecTimeout(err)) throw err;
-    return exec(spec.command, spec.args, { timeoutMs: LOOKUP_TIMEOUT_MS, cwd, signal });
+    return exec(spec.command, spec.args, {
+      timeoutMs: LOOKUP_TIMEOUT_MS,
+      cwd,
+      ...(signal !== undefined ? { signal } : {}),
+    });
   }
-}
-
-/** Login shells may echo profile/motd noise before the answer — same
- *  tolerance `resolveHermes.ts`'s `resolveHermesBin` needs. */
-function lastNonEmptyLine(stdout: string): string {
-  const lines = stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-  return lines[lines.length - 1] ?? '';
 }
 
 function stripPythonPrefix(s: string): string {

@@ -44,11 +44,11 @@ export function rrfFuse(
         scores.set(item.id, 0);
         firstSeenOrder.push(item.id);
       }
-      scores.set(item.id, (scores.get(item.id) as number) + contribution);
+      scores.set(item.id, (scores.get(item.id) ?? 0) + contribution);
     });
   });
 
   return firstSeenOrder
-    .map((id) => ({ id, score: scores.get(id) as number }))
+    .map((id) => ({ id, score: scores.get(id) ?? 0 }))
     .sort((a, b) => b.score - a.score);
 }

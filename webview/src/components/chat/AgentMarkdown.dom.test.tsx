@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { AgentMarkdown } from './AgentMarkdown';
+import { AgentMarkdown, splitStableBoundary, renderMarkdown } from './AgentMarkdown';
 
 /**
  * Audit G-5. Lists were unsupported (raw dashes in a paragraph), `#` headings
@@ -260,6 +260,22 @@ describe('UI#2 review: markdown block/list recursion depth is capped against unt
 });
 
 /**
+ * A11Y-03 lock (WCAG 1.3.1 / 2.4.6): pins the G-5/C2 heading-demotion
+ * behavior above (`renderBlock`'s `# `-`######` -> `h3`-`h6` clamp) as a
+ * regression guard for the panel-chrome heading work — the transcript's own
+ * headings must stay BELOW the panel's `h2` (`PanelShell`) / the chat
+ * surface's sr-only `h2` (`ChatView`), never colliding with or outranking
+ * them. No renderer change: this locks already-implemented behavior.
+ */
+describe('A11Y-03 lock: markdown heading clamp stays below the panel/chat h2', () => {
+  it('markdown # maps to h3 and #### collapses to h6 (transcript headings stay below the panel h2)', () => {
+    render(<AgentMarkdown text={'# a\n\n#### b'} />);
+    expect(screen.getByRole('heading', { level: 3, name: 'a' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 6, name: 'b' })).toBeInTheDocument();
+  });
+});
+
+/**
  * M-1 (review-verified-by-hand, now locked as regression coverage): the C2
  * link-scheme gate lives in `inline()`'s regex, and every leaf block
  * (paragraph, table cell, list item, blockquote content) routes its content
@@ -288,5 +304,131 @@ describe('M-1: the C2 link-scheme gate applies uniformly inside table cells, lis
     render(<AgentMarkdown text={'> [x](javascript:alert(1))'} />);
     expect(screen.queryByRole('link')).not.toBeInTheDocument();
     expect(screen.getByText(/javascript:alert\(1\)/)).toBeInTheDocument();
+  });
+});
+
+const MULTI_BLOCK = [
+  '# Title',
+  '',
+  'A paragraph with **bold** and `code`.',
+  '',
+  '- item one',
+  '- item two',
+  '',
+  '```ts',
+  'const x = 1;',
+  '```',
+  '',
+  '| a | b |',
+  '| - | - |',
+  '| 1 | 2 |',
+  '',
+  'Closing paragraph in progress',
+].join('\n');
+
+describe('CA-11: splitStableBoundary is block-aligned and fence-safe', () => {
+  it('never cuts inside an open fenced-code block', () => {
+    const openFence = 'intro\n\n```ts\nconst a = 1;\n\nconst b = 2;'; // blank line INSIDE the fence
+    const { stable, tail } = splitStableBoundary(openFence);
+    expect(stable).toBe('intro'); // the in-fence blank line is not a valid boundary
+    expect(tail.startsWith('\n\n```ts')).toBe(true);
+  });
+
+  it('[perf genuine-RED] the stable prefix is byte-invariant across tail-only growth', () => {
+    const base = '# H\n\npara one\n\nopen tail';
+    const grown = base + ' more text';
+    expect(splitStableBoundary(base).stable).toBe(splitStableBoundary(grown).stable);
+    // ^ so the useMemo key (stable) does not change → the completed prefix is
+    //   not re-parsed on a delta that only extends the open block. On the
+    //   pre-CA-11 code this function does not exist; a naive re-implementation
+    //   that recomputed the boundary from the whole text each call would fail
+    //   this invariance check.
+  });
+
+  it('returns no stable prefix when there is no completed block yet', () => {
+    expect(splitStableBoundary('just an open line')).toEqual({ stable: '', tail: 'just an open line' });
+  });
+});
+
+describe('CA-11: memoized streaming render is transparent (warm === cold for every prefix)', () => {
+  it('an incrementally-grown instance renders identically to a fresh mount at every prefix', () => {
+    const { rerender, container } = render(<AgentMarkdown text={MULTI_BLOCK.slice(0, 1)} streaming />);
+    for (let k = 2; k <= MULTI_BLOCK.length; k++) {
+      const prefix = MULTI_BLOCK.slice(0, k);
+      rerender(<AgentMarkdown text={prefix} streaming />);
+      const warm = container.innerHTML;
+      const fresh = render(<AgentMarkdown text={prefix} streaming />);
+      const cold = fresh.container.innerHTML;
+      fresh.unmount();
+      expect(warm).toBe(cold);
+    }
+  });
+
+  /**
+   * CA-11 M1: the test above only proves split==split (the memoized instance
+   * agrees with a fresh mount that ALSO goes through the same stable/tail
+   * split). It never checks the split against a genuinely UNSPLIT whole-text
+   * render — so a bug that made splitting itself non-transparent (e.g. the
+   * stable/tail boundary subtly changing block structure vs. parsing the
+   * whole string in one pass) could slip past it. `renderMarkdown` is called
+   * directly here with the FULL `MULTI_BLOCK` text and no `splitStableBoundary`
+   * call at all — reproducing exactly what `AgentMarkdown` would render if it
+   * never split (single `tokenize`/`renderBlocks` pass over the whole text,
+   * `keyPrefix: 'tail'` to mirror the tail segment's own prefix). `key` props
+   * never surface in `innerHTML`, so the differing 'stable'/'tail' key
+   * namespaces the real component uses cannot cause a spurious mismatch here
+   * — only an actual structural divergence would.
+   */
+  it('CA-11 M1: the memoized split render is byte-identical to a whole, unsplit render of the same text', () => {
+    const { container: splitContainer } = render(<AgentMarkdown text={MULTI_BLOCK} streaming />);
+
+    function ReferenceWhole() {
+      return (
+        <div className="text-[13px] leading-relaxed text-fg">
+          {renderMarkdown(MULTI_BLOCK, true, 'tail')}
+          <span className="h-live text-accent">▍</span>
+        </div>
+      );
+    }
+    const { container: wholeContainer } = render(<ReferenceWhole />);
+
+    expect(splitContainer.innerHTML).toBe(wholeContainer.innerHTML);
+  });
+});
+
+/**
+ * CA-11 M2: `MULTI_BLOCK` above never exercises a mid-prose triple-backtick
+ * mention (the `type ``` to open` case from the C2 describe block, above)
+ * alongside a REAL fenced block, nor a 4-backtick fence run — both are
+ * corners where `splitStableBoundary`'s fence-parity counting could disagree
+ * with `tokenize`'s own fence regex about where a block boundary actually is.
+ * `FENCE_EDGE` grows both into one fixture so the warm===cold loop below
+ * locks fence-parity ≡ tokenizer agreement on exactly the corners `MULTI_BLOCK`
+ * omits.
+ */
+const FENCE_EDGE = [
+  'Text with ``` inline mention.',
+  '',
+  'Then a real block:',
+  '',
+  '````ts',
+  'const x = 1;',
+  '````',
+  '',
+  'Tail in progress',
+].join('\n');
+
+describe('CA-11: memoized streaming render is transparent on fence-edge corners (warm === cold for every prefix)', () => {
+  it('an incrementally-grown instance renders identically to a fresh mount at every prefix (FENCE_EDGE)', () => {
+    const { rerender, container } = render(<AgentMarkdown text={FENCE_EDGE.slice(0, 1)} streaming />);
+    for (let k = 2; k <= FENCE_EDGE.length; k++) {
+      const prefix = FENCE_EDGE.slice(0, k);
+      rerender(<AgentMarkdown text={prefix} streaming />);
+      const warm = container.innerHTML;
+      const fresh = render(<AgentMarkdown text={prefix} streaming />);
+      const cold = fresh.container.innerHTML;
+      fresh.unmount();
+      expect(warm).toBe(cold);
+    }
   });
 });

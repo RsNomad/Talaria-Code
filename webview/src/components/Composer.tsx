@@ -32,6 +32,9 @@ import { describeMention, basename } from '../composer/mentionChip';
 import { parsePathPick, filesToFolders } from '../composer/fileSearch';
 import { useFileSearch } from '../composer/useFileSearch';
 import { applySeed, type ComposerSeed } from '../composer/applySeed';
+import { busyInteraction } from './busyInteraction';
+import { useFocusAnchorOnUnmount } from '../hooks/useFocusAnchorOnUnmount';
+import { ConfirmStrip } from './ConfirmStrip';
 
 // W2-F1: the picker replaced the wire AgentMode picker — every preset pins the
 // ACP mode at 'default' and differs only in the client-side edit-policy engine.
@@ -87,6 +90,19 @@ interface ComposerProps {
   preset: EditPolicyPreset;
   modelLabel: string;
   busy: boolean;
+  /** UX-03: Stop dispatched, terminal not yet arrived — renders the disabled
+   * "Stopping" affordance + the SR announcement. App wires `tab.stopPending`. */
+  stopping: boolean;
+  /**
+   * UX-04a: New Session dispatched, no `tab.bound`/`tab.error` terminal has
+   * arrived yet — the New Session button's mirror of `stopping` above. App
+   * wires `tab.newSessionPending === true`; the standing "Starting a new
+   * session…" row + its SR announcement are App's own (this component only
+   * needs the flag for the button's `busyInteraction` posture). Optional
+   * (unlike `stopping`, which App has always passed) — existing fixtures
+   * that omit it default to "not pending", same posture `disabled` uses.
+   */
+  newSessionPending?: boolean;
   /**
    * W4 §2e: the per-tab composer latch — the multi-tab generalization of the
    * old `backendStarted` latch. Disabled (textarea + send both inert) until
@@ -101,8 +117,12 @@ interface ComposerProps {
    * be a lie there (nothing is connecting; the route back is History/New
    * Chat, never a passive wait). `undefined` (every other disabled reason —
    * a fresh/pending tab) keeps the original copy.
+   *
+   * exactOptional prep (arm 3): widened to `?: string | undefined` — the real
+   * caller (`App.tsx`) hands this a ternary (`cond ? '...' : undefined`),
+   * which is `string | undefined`, not merely "absent when unused".
    */
-  disabledPlaceholder?: string;
+  disabledPlaceholder?: string | undefined;
   /**
    * SF-2 (T4 populates `availableModes`/owns the engine — T3b wires only
    * this picker UI SHELL, reading `mode.state`). `null` = no custom mode
@@ -293,6 +313,8 @@ export function Composer({
   preset,
   modelLabel,
   busy,
+  stopping,
+  newSessionPending = false,
   disabled = false,
   disabledPlaceholder,
   activeModeId = null,
@@ -337,6 +359,12 @@ export function Composer({
    * the region itself is never conditionally mounted, only this text is
    * swapped). Empty string = no notice. */
   const [attachNotice, setAttachNotice] = useState('');
+  /** Task 21 (WCAG 4.1.3): `attachNotice` above only ever announces FAILURE —
+   * a successful attach was silent to assistive tech. Surfaced through its
+   * own permanently-mounted `LiveRegion` (Finding-7 discipline: mounted
+   * empty, text swaps per attach) so a screen-reader user gets the same
+   * confirmation a sighted user gets from the new chip appearing. */
+  const [attachAnnounce, setAttachAnnounce] = useState('');
 
   // W2 T1 (§2b): the ONE shared suggest primitive drives both `@` (mentions,
   // any word boundary — unchanged pre-T1 behavior) and `/` (slash commands,
@@ -360,6 +388,28 @@ export function Composer({
   const presetWrapRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  // Task 6 (A11Y-01, WCAG 2.4.3): Send unmounts the instant `busy` flips true
+  // (swapped for Stop) and Stop unmounts the instant the turn ends (swapped
+  // back to Send) — without this, either commit drops focus to `<body>`. The
+  // send/stop wrapper div is the stable anchor (`tabIndex={-1}` below), same
+  // contract ApprovalCard's/DiffCard's own A11Y-01 adoptions document.
+  const sendStopWrapRef = useRef<HTMLDivElement | null>(null);
+  const armFocusAnchor = useFocusAnchorOnUnmount(sendStopWrapRef);
+
+  // Task 11 (UX-11): "+ New Session" while a turn is live must ASK first
+  // (ConfirmStrip), not silently cancel the running turn — the same
+  // ConfirmStrip contract Task 7/12 already use (role="alertdialog", focus
+  // -> confirm on mount, Escape cancels, every exit calls `returnFocus`).
+  // `newSessionRef` is the strip's trigger/return-focus target.
+  const [confirmingNewSession, setConfirmingNewSession] = useState(false);
+  const newSessionRef = useRef<HTMLButtonElement | null>(null);
+
+  // Same stale-consent class as Task 2/12: if the live turn ends (or is
+  // cancelled) while the strip is open, there is nothing left to warn
+  // about — a lingering "New session anyway" invites a no-op click.
+  useEffect(() => {
+    if (!busy) setConfirmingNewSession(false);
+  }, [busy]);
 
   // B3 (UI M-1) / path doc §2.3: the preset and mode pickers adopt the same
   // APG menu keyboard contract as AttachMenu, via the shared `useMenuFocus`
@@ -516,6 +566,9 @@ export function Composer({
         const raw = String(reader.result);
         const base64 = raw.slice(raw.indexOf(',') + 1);
         onAttachAdd({ ...meta, dataUri: `data:${mime};base64,${base64}` });
+        // Task 21 (WCAG 4.1.3): announce the success too — until now only
+        // the failure branches (oversize / reader.onerror, above) spoke.
+        setAttachAnnounce(`Attached "${file.name}"`);
       };
       // A2 (UI I-9): previously unassigned — a FileReader failure (permission
       // denial, an unreadable/vanished file, an OS-level read error) was
@@ -928,6 +981,14 @@ export function Composer({
   // is "removed" (no separate remove-affordance in v1, per the brief).
   const draftMentions = parseMentions(draft);
 
+  // UX-04a: mirrors `stopInteraction` (computed inline below for Stop) —
+  // busy-focusable while a New Session request is in flight (dispatched, no
+  // `tab.bound`/`tab.error` yet), guarding the click against a double-
+  // dispatch. `false` first arg: nothing genuinely disables this button —
+  // only the in-flight state goes busy (busyInteraction's MIXED-site
+  // convention, same as GatewayHealthBanner's `reconnectInteraction`).
+  const newSessionInteraction = busyInteraction(false, newSessionPending);
+
   return (
     <div
       ref={rootRef}
@@ -1099,6 +1160,19 @@ export function Composer({
             </button>
           )}
         </div>
+
+        {/* UX-03: stop-lifecycle announcement — permanently-mounted LiveRegion
+          * (Finding-7 discipline, same as the attachNotice region above): the
+          * region always exists, only the text swaps. sr-only: sighted users
+          * already see the disabled "Stopping" button state. */}
+        <LiveRegion text={stopping ? 'Stopping — waiting for the agent to confirm…' : ''} className="sr-only" />
+
+        {/* Task 21 (WCAG 4.1.3): successful-attach announcement — permanently
+          * mounted LiveRegion (Finding-7 discipline, same as the two regions
+          * above): the region always exists, only `attachAnnounce` swaps. The
+          * failure notice (`attachNotice` above) is unchanged; this is purely
+          * additive for the success case it never covered. */}
+        <LiveRegion text={attachAnnounce} className="sr-only" />
 
         {/* toolbar */}
         <div className="mt-2 flex items-center gap-1.5">
@@ -1274,14 +1348,46 @@ export function Composer({
             {!narrow && <span className="max-w-[120px] truncate">{modelLabel}</span>}
           </button>
 
-          <div className="ml-auto flex items-center gap-1.5">
+          <div
+            ref={sendStopWrapRef}
+            tabIndex={-1}
+            data-testid="send-stop-wrap"
+            className="ml-auto flex items-center gap-1.5"
+          >
             {/* new session */}
             <button
+              ref={newSessionRef}
               type="button"
-              onClick={newSession}
+              onClick={() => {
+                // WS-UX P2 M2: the UX-04a in-flight guard runs FIRST.
+                // busyInteraction's `interactive` click-guard STANDS IN for
+                // native `disabled`'s own click-blocking (busyInteraction.ts)
+                // — native disabled would have suppressed the whole click,
+                // confirm gate included. A click while "Starting a new
+                // session…" is already in flight asks for nothing new (it is
+                // already starting); running the UX-11 busy gate first here
+                // let a second click re-open the ConfirmStrip in the
+                // busy && newSessionPending window, and a second confirm
+                // re-dispatched `tab.newSession`.
+                if (!newSessionInteraction.interactive) return;
+                // UX-11: a live turn must be asked about, never silently
+                // cancelled — mirrors submit()'s own UI#9-honesty `busy`
+                // gate. Reached only when NO New-Session request is in
+                // flight (guard above; at this MIXED site `interactive` is
+                // exactly `!newSessionPending`), so the plain live-turn case
+                // still always asks.
+                if (busy) {
+                  setConfirmingNewSession(true);
+                  return;
+                }
+                newSession();
+              }}
+              disabled={newSessionInteraction.nativeDisabled}
+              aria-disabled={newSessionInteraction.ariaDisabled}
+              aria-busy={newSessionInteraction.ariaBusy}
               title="New Session"
               aria-label="New Session"
-              className="flex items-center gap-1 rounded-lg border border-border px-2 py-1.5 text-2xs text-muted transition-colors hover:border-accent hover:text-fg"
+              className="flex items-center gap-1 rounded-lg border border-border px-2 py-1.5 text-2xs text-muted transition-colors hover:border-accent hover:text-fg aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
             >
               <Icon name="add" size={13} />
               {!narrow && <span>New Session</span>}
@@ -1289,19 +1395,39 @@ export function Composer({
 
             {/* send / stop */}
             {busy ? (
-              <button
-                type="button"
-                onClick={onCancel}
-                title="Stop"
-                aria-label="Stop"
-                className="flex h-7 w-7 flex-none items-center justify-center rounded-lg border border-del text-del transition-colors hover:bg-del-soft"
-              >
-                <Icon name="debug-stop" size={14} />
-              </button>
+              (() => {
+                // T11 (A11Y-01 sibling): `stopping` is purely IN-FLIGHT — native
+                // `disabled` blurred a keyboard user to <body> the instant Stop was
+                // pressed (busyInteraction.ts's own rationale; SessionsPanel TI-1
+                // precedent). Genuine-indefinite half is `false`: nothing but the
+                // in-flight stop ever gates this control.
+                const stopInteraction = busyInteraction(false, stopping);
+                return (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      if (!stopInteraction.interactive) return;
+                      armFocusAnchor(e.currentTarget);
+                      onCancel();
+                    }}
+                    disabled={stopInteraction.nativeDisabled}
+                    aria-disabled={stopInteraction.ariaDisabled}
+                    aria-busy={stopInteraction.ariaBusy}
+                    title={stopping ? 'Stopping' : 'Stop'}
+                    aria-label={stopping ? 'Stopping' : 'Stop'}
+                    className="flex h-7 w-7 flex-none items-center justify-center rounded-lg border border-del text-del transition-colors hover:bg-del-soft disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                  >
+                    <Icon name="debug-stop" size={14} />
+                  </button>
+                );
+              })()
             ) : (
               <button
                 type="button"
-                onClick={submit}
+                onClick={(e) => {
+                  armFocusAnchor(e.currentTarget);
+                  submit();
+                }}
                 disabled={disabled || (!draft.trim() && draftAttachments.length === 0)}
                 title="Send"
                 aria-label="Send"
@@ -1312,6 +1438,29 @@ export function Composer({
             )}
           </div>
         </div>
+
+        {/* UX-11: New-Session-while-busy confirm gate — a full-width sibling
+            below the toolbar row, same slot grammar GatewayHealthBanner's own
+            ConfirmStrip uses (there via `className="basis-full"` inside its
+            `flex-wrap` row; here the parent is `flex-col`, so a plain block
+            sibling already stretches full-width via the default
+            `align-items: stretch` — `mt-2` supplies the same row-gap
+            `basis-full` gave it there). Reuses Task 7's ConfirmStrip rather
+            than a second confirm surface. */}
+        {confirmingNewSession && (
+          <ConfirmStrip
+            className="mt-2"
+            ariaLabel="Confirm new session"
+            message="Starting a new session will cancel the turn still running in this tab."
+            confirmLabel="New session anyway"
+            onConfirm={() => {
+              setConfirmingNewSession(false);
+              newSession();
+            }}
+            onCancel={() => setConfirmingNewSession(false)}
+            returnFocus={() => newSessionRef.current?.focus()}
+          />
+        )}
       </div>
 
       {/* drag overlay */}

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { DiffCard } from './DiffCard';
 import type { ToolDiff } from '../../protocol';
 
@@ -240,5 +241,51 @@ describe('DiffCard — B5: per-hunk Accept/Reject accessible names are distinct 
     expect(new Set(labels).size).toBe(2);
     expect(labels[0]).toBe('Reject hunk 1 of 2 in src/multi.ts');
     expect(labels[1]).toBe('Reject hunk 2 of 2 in src/multi.ts');
+  });
+});
+
+/**
+ * Task 6 (A11Y-01, WCAG 2.4.3): the DiffCard sibling of ApprovalCard's own
+ * A11Y-01 adoption. A hunk's Accept/Reject button unmounts the instant its
+ * hunk resolves (`showButtons = pending && !resolved`, above) — without the
+ * shared `useFocusAnchorOnUnmount` hook the browser silently drops focus to
+ * `<body>`. The card root is the stable anchor (`ref={cardRef}
+ * tabIndex={-1}`, same contract `useFocusAnchorOnUnmount.ts` documents).
+ */
+describe('DiffCard — A11Y-01: focus anchor on hunk-button unmount (WCAG 2.4.3)', () => {
+  const diff: ToolDiff = {
+    path: 'src/example.ts',
+    hunks: [{ header: '@@ -1,2 +1,2 @@', lines: [{ sign: '+', text: 'added line' }] }],
+  };
+
+  it('focus lands on the card root (not <body>) when Accept hunk unmounts on resolve', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <DiffCard diff={diff} resolvedHunks={{}} hunkOffset={0} onResolve={() => undefined} pending />,
+    );
+    const btn = screen.getByRole('button', { name: 'Accept hunk 1 of 1 in src/example.ts' });
+    await user.click(btn);
+    // Simulate the resolve landing (the caller's `onResolve` would drive this
+    // via `resolvedHunks` in the real reducer) — the hunk buttons unmount.
+    rerender(
+      <DiffCard diff={diff} resolvedHunks={{ 0: 'accept' }} hunkOffset={0} onResolve={() => undefined} pending />,
+    );
+    expect(screen.queryByRole('button', { name: 'Accept hunk 1 of 1 in src/example.ts' })).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(document.body);
+    expect((document.activeElement as HTMLElement).closest('.rounded-card')).not.toBeNull();
+  });
+
+  it('focus lands on the card root (not <body>) when Reject hunk unmounts on resolve', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <DiffCard diff={diff} resolvedHunks={{}} hunkOffset={0} onResolve={() => undefined} pending />,
+    );
+    const btn = screen.getByRole('button', { name: 'Reject hunk 1 of 1 in src/example.ts' });
+    await user.click(btn);
+    rerender(
+      <DiffCard diff={diff} resolvedHunks={{ 0: 'reject' }} hunkOffset={0} onResolve={() => undefined} pending />,
+    );
+    expect(document.activeElement).not.toBe(document.body);
+    expect((document.activeElement as HTMLElement).closest('.rounded-card')).not.toBeNull();
   });
 });

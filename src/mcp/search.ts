@@ -1,15 +1,42 @@
 import type { Embedder } from '../rag/embedder';
 import type { SearchFilter, SearchHit, VectorStore } from '../rag/store/VectorStore';
+import { CONTROL_CHAR_PATTERN } from './lsp/frameSanitize';
 import { compilePathGlobs, matchesCompiledPathGlobs } from './pathGlob';
 import type { CodebaseSearchInput } from './toolSchema';
 
 export interface CodebaseSearchDeps {
   embedder: Embedder;
   store: VectorStore;
+  /** Configured embedder id, e.g. `qwen3-embedding:0.6b` (Ollama tag) or
+   * `Qwen/Qwen3-Embedding-8B` (HF repo id). Optional — absent means the
+   * caller didn't wire it (or the composition root couldn't determine it),
+   * and `buildEmbeddingQueryText` then leaves the query raw. Clear this by
+   * KEY OMISSION, never `= undefined` (exactOptionalPropertyTypes). */
+  embedModel?: string;
 }
 
 export interface CodebaseSearchResult {
   hits: SearchHit[];
+}
+
+/**
+ * A-05: Qwen3-Embedding is an instruction-aware retrieval model. Its HF card
+ * and the QwenLM/Qwen3-Embedding repo (`get_detailed_instruct`) document that
+ * QUERIES get an `Instruct: {task}\nQuery:{query}` prefix while DOCUMENTS stay
+ * bare — asymmetric usage, so changing the instruction needs no re-index. We
+ * apply the prefix ONLY when the configured embedder id is a Qwen3-Embedding
+ * variant (e.g. `qwen3-embedding:0.6b`, `Qwen/Qwen3-Embedding-8B`); every
+ * other model (nomic/bge/e5/...) embeds the raw query.
+ */
+const QWEN3_EMBEDDING_ID = /qwen3-embedding/i;
+const CODE_SEARCH_INSTRUCTION =
+  'Given a code search query, retrieve relevant code snippets that satisfy it.';
+
+export function buildEmbeddingQueryText(rawQuery: string, embedModel: string | undefined): string {
+  if (embedModel !== undefined && QWEN3_EMBEDDING_ID.test(embedModel)) {
+    return `Instruct: ${CODE_SEARCH_INSTRUCTION}\nQuery:${rawQuery}`;
+  }
+  return rawQuery;
 }
 
 /**
@@ -24,7 +51,8 @@ export async function runCodebaseSearch(
   input: CodebaseSearchInput,
 ): Promise<CodebaseSearchResult> {
   const k = input.k ?? 10;
-  const [queryVector] = await deps.embedder.embed([input.query]);
+  const embedText = buildEmbeddingQueryText(input.query, deps.embedModel);
+  const [queryVector] = await deps.embedder.embed([embedText]);
   if (!queryVector) {
     return { hits: [] };
   }
@@ -62,5 +90,14 @@ const FENCE_LANGUAGE_PATTERN = /^[A-Za-z0-9_+-]{1,32}$/;
 export function formatHitAsText(hit: SearchHit): string {
   const rawLanguage = hit.language ?? '';
   const fence = FENCE_LANGUAGE_PATTERN.test(rawLanguage) ? rawLanguage : '';
-  return `${hit.path}:${hit.startLine + 1}-${hit.endLine + 1}\n\`\`\`${fence}\n${hit.content}\n\`\`\``;
+  // LSP-02 (DiD): strip C0 controls + DEL from the untrusted snippet, exactly
+  // as the LSP tool outputs are sanitized. CR/LF/tab are intentionally kept
+  // (CONTROL_CHAR_PATTERN excludes them) — they are legitimate in a fenced
+  // code block and pose no framing risk.
+  const safeContent = hit.content.replace(CONTROL_CHAR_PATTERN, '');
+  // LSP-02 DiD parity: the path is untrusted too — strip the same control chars
+  // the LSP tool outputs strip from every field (sanitizeLsString), so a crafted
+  // filename can't smuggle control bytes into the header.
+  const safePath = hit.path.replace(CONTROL_CHAR_PATTERN, '');
+  return `${safePath}:${hit.startLine + 1}-${hit.endLine + 1}\n\`\`\`${fence}\n${safeContent}\n\`\`\``;
 }

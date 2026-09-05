@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { FimEngine } from './engine';
 import { AutocompleteDebouncer } from './debouncer';
 import { InMemoryCompletionCache } from './cache';
-import { snippetSetHash } from './context/hash';
+import { snippetSetHash, fimContextHash } from './context/hash';
 import { scannedSnippetForTest } from './context/scannedSnippetTestFactory';
 import { getStopTokens } from './stopTokens';
 import { getTemplateForModel } from './templates';
@@ -67,24 +67,26 @@ function makeEngine(backend: FakeBackend, opts: AutocompleteOptions) {
     options: opts,
     cache: new InMemoryCompletionCache(),
     debouncer: new AutocompleteDebouncer(),
+    checkEgress: () => 'allow',
   });
 }
 
-/** Records every key passed to get/put so cache-key tests can pin the exact string,
- *  while still behaving like a real cache (backed by a Map) for round-trip tests. */
+/** Records every (contextKey, prefix) pair passed to get/put so cache-key tests
+ *  can pin the exact partition/prefix, while still behaving like a real cache
+ *  (backed by a Map, keyed on the pair) for round-trip tests. */
 class RecordingCache implements CompletionCache {
-  readonly gets: string[] = [];
-  readonly puts: { key: string; value: string }[] = [];
+  readonly gets: { contextKey: string; prefix: string }[] = [];
+  readonly puts: { contextKey: string; prefix: string; value: string }[] = [];
   private readonly map = new Map<string, string>();
 
-  get(prefixKey: string): string | undefined {
-    this.gets.push(prefixKey);
-    return this.map.get(prefixKey);
+  get(contextKey: string, prefix: string): string | undefined {
+    this.gets.push({ contextKey, prefix });
+    return this.map.get(`${contextKey} ${prefix}`);
   }
 
-  put(prefixKey: string, completion: string): void {
-    this.puts.push({ key: prefixKey, value: completion });
-    this.map.set(prefixKey, completion);
+  put(contextKey: string, prefix: string, completion: string): void {
+    this.puts.push({ contextKey, prefix, value: completion });
+    this.map.set(`${contextKey} ${prefix}`, completion);
   }
 }
 
@@ -232,16 +234,18 @@ describe('FimEngine', () => {
         options: options(),
         cache,
         debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
       });
 
-      await engine.complete(
-        ctx({ prefix: 'const x = ', suffix: '\n' }),
-        { manual: true },
-        new AbortController().signal,
-      );
+      const context = ctx({ prefix: 'const x = ', suffix: '\n' });
+      await engine.complete(context, { manual: true }, new AbortController().signal);
 
       expect(cache.puts.length).toBe(1);
-      expect(must(cache.puts[0]).key).toBe('0000000000000000 const x = ');
+      expect(must(cache.puts[0]).contextKey).toBe(
+        '0000000000000000 ' +
+          fimContextHash(context.languageId, context.filepath, context.suffix),
+      );
+      expect(must(cache.puts[0]).prefix).toBe('const x = ');
     });
 
     it('produces a different cache key for a different (non-empty) snippet set', async () => {
@@ -252,6 +256,7 @@ describe('FimEngine', () => {
         options: options(),
         cache,
         debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
       });
       const signal = new AbortController().signal;
 
@@ -267,7 +272,7 @@ describe('FimEngine', () => {
       );
 
       expect(cache.puts.length).toBe(2);
-      expect(must(cache.puts[0]).key).not.toBe(must(cache.puts[1]).key);
+      expect(must(cache.puts[0]).contextKey).not.toBe(must(cache.puts[1]).contextKey);
       expect(backend.calls.length).toBe(2); // second snippet set must not hit the first's cache entry
     });
 
@@ -294,6 +299,30 @@ describe('FimEngine', () => {
       );
       expect(second?.text).toBe(';');
       expect(backend.calls.length).toBe(1); // still 1 -> served from cache
+    });
+  });
+
+  describe('F1-10 — engine skips the cache entirely for an empty pruned prefix', () => {
+    it('never calls cache.get or cache.put when the pruned prefix is empty (cursor at file start)', async () => {
+      const backend = new FakeBackend();
+      backend.chunks = ['1;'];
+      const cache = new RecordingCache();
+      const engine = new FimEngine({
+        backend,
+        options: options(),
+        cache,
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
+      });
+
+      await engine.complete(
+        ctx({ prefix: '', suffix: 'rest of file' }),
+        { manual: true },
+        new AbortController().signal,
+      );
+
+      expect(cache.gets).toEqual([]);
+      expect(cache.puts).toEqual([]);
     });
   });
 
@@ -337,7 +366,7 @@ describe('FimEngine', () => {
       expect(must(backend.calls[0]).stop.length).toBeGreaterThan(0);
       // Sanity: it's not just the newline guard — the template's own FIM/EOT
       // tokens (what actually halts generation at the hole boundary) are present.
-      expect(must(backend.calls[0]).stop).toEqual(expect.arrayContaining(template.stop));
+      expect(must(backend.calls[0]).stop).toEqual(expect.arrayContaining([...template.stop]));
     });
   });
 
@@ -362,7 +391,7 @@ describe('FimEngine', () => {
       'leaves the request prefix untouched when crossFileMode is %s',
       async (mode) => {
         const backend = new FakeBackend();
-        const engine = makeEngine(backend, options({ crossFileMode: mode }));
+        const engine = makeEngine(backend, options(mode !== undefined ? { crossFileMode: mode } : {}));
         const snippets = [snippet()];
 
         await engine.complete(
@@ -384,17 +413,226 @@ describe('FimEngine', () => {
         options: options({ crossFileMode: 'comment-inject' }),
         cache,
         debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
+      });
+      const snippets = [snippet({ filepath: 'src/util.ts', content: 'export function helper() {}' })];
+      const context = ctx({ prefix: 'const x = ', snippets });
+
+      await engine.complete(context, { manual: true }, new AbortController().signal);
+
+      const expectedKey =
+        snippetSetHash(snippets) +
+        ' ' +
+        fimContextHash(context.languageId, context.filepath, context.suffix);
+      expect(must(cache.puts[0]).contextKey).toBe(expectedKey);
+      expect(must(cache.puts[0]).prefix).toBe('const x = ');
+    });
+  });
+
+  describe('CA-06 — pre-egress content gate', () => {
+    it('a blocking guard returns undefined BEFORE any backend call, and caches nothing', async () => {
+      const backend = new FakeBackend();
+      const cache = new InMemoryCompletionCache();
+      const engine = new FimEngine({
+        backend,
+        options: options(),
+        cache,
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'block',
+      });
+      const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+      expect(result).toBeUndefined();
+      expect(backend.calls).toEqual([]); // no egress
+    });
+
+    it('the guard receives the POST-prune, POST-injection egressing strings (prefix, suffix) — not the raw document', async () => {
+      const seen: string[][] = [];
+      const backend = new FakeBackend();
+      const engine = new FimEngine({
+        backend,
+        options: options(),
+        cache: new InMemoryCompletionCache(),
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: (texts) => {
+          seen.push([...texts]);
+          return 'allow';
+        },
+      });
+      await engine.complete(ctx({ prefix: 'const x = ', suffix: ';\n' }), { manual: true }, new AbortController().signal);
+      expect(seen).toHaveLength(1);
+      const call = must(seen[0]);
+      // The engine egresses exactly what it scanned: the request the backend saw
+      // carries the same two strings.
+      const req = must(backend.calls[0]);
+      expect(call).toEqual([req.prefix, req.suffix]);
+    });
+
+    it('an allowing guard leaves the completion flow byte-identical (control)', async () => {
+      const backend = new FakeBackend();
+      backend.chunks = ['world'];
+      const engine = new FimEngine({
+        backend,
+        options: options(),
+        cache: new InMemoryCompletionCache(),
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: () => 'allow',
+      });
+      const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+      expect(result).toEqual({ text: 'world' });
+    });
+
+    it('scans the POST-injection prefix (comment-inject mode) — pins the gate AFTER snippet injection', async () => {
+      // T2's own "post-injection" test above ran in the default (non-comment-inject)
+      // mode, so it never pinned that the content gate sits AFTER snippet
+      // injection. Step 5(c) rewrites that exact gate site, so this test guards
+      // against a future reorder that moves the gate back before injection.
+      const seen: string[][] = [];
+      const backend = new FakeBackend();
+      const engine = new FimEngine({
+        backend,
+        options: options({ crossFileMode: 'comment-inject' }),
+        cache: new InMemoryCompletionCache(),
+        debouncer: new AutocompleteDebouncer(),
+        checkEgress: (texts) => {
+          seen.push([...texts]);
+          return 'allow';
+        },
       });
       const snippets = [snippet({ filepath: 'src/util.ts', content: 'export function helper() {}' })];
 
       await engine.complete(
-        ctx({ prefix: 'const x = ', snippets }),
+        ctx({ prefix: 'const x = ', languageId: 'typescript', snippets }),
         { manual: true },
         new AbortController().signal,
       );
 
-      const expectedHash = snippetSetHash(snippets);
-      expect(must(cache.puts[0]).key).toBe(`${expectedHash} const x = `);
+      expect(seen).toHaveLength(1);
+      const [scannedPrefix] = must(seen[0]);
+      expect(scannedPrefix).toContain('export function helper() {}');
     });
+  });
+});
+
+describe('CA-07 — the cache key discriminates suffix / filepath / languageId', () => {
+  async function completeOnce(
+    cache: RecordingCache,
+    overrides: Partial<FimContext>,
+  ): Promise<void> {
+    const backend = new FakeBackend();
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache,
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'allow',
+    });
+    await engine.complete(ctx(overrides), { manual: true }, new AbortController().signal);
+  }
+
+  it('same prefix, DIFFERENT suffix ⇒ different contextKey (no wrong-context hit)', async () => {
+    const cache = new RecordingCache();
+    await completeOnce(cache, { prefix: 'const x = ', suffix: ';\n' });
+    await completeOnce(cache, { prefix: 'const x = ', suffix: '}\n' });
+    expect(cache.gets).toHaveLength(2);
+    expect(must(cache.gets[0]).contextKey).not.toBe(must(cache.gets[1]).contextKey);
+  });
+
+  it('same prefix+suffix, DIFFERENT filepath ⇒ different contextKey', async () => {
+    const cache = new RecordingCache();
+    await completeOnce(cache, { filepath: 'file:///repo/a.ts' });
+    await completeOnce(cache, { filepath: 'file:///repo/b.ts' });
+    expect(must(cache.gets[0]).contextKey).not.toBe(must(cache.gets[1]).contextKey);
+  });
+
+  it('same everything, DIFFERENT languageId ⇒ different contextKey', async () => {
+    const cache = new RecordingCache();
+    await completeOnce(cache, { languageId: 'typescript' });
+    await completeOnce(cache, { languageId: 'python' });
+    expect(must(cache.gets[0]).contextKey).not.toBe(must(cache.gets[1]).contextKey);
+  });
+
+  it('identical context ⇒ identical contextKey (cache still hits)', async () => {
+    const cache = new RecordingCache();
+    await completeOnce(cache, {});
+    await completeOnce(cache, {});
+    expect(must(cache.gets[0]).contextKey).toBe(must(cache.gets[1]).contextKey);
+  });
+});
+
+describe('CA-06-face — the egress-verdict observer seam', () => {
+  // The engine's face of the two-kind union: guard 'block' → 'content-block'.
+  it('notifies (filepath, verdict) on a blocked attempt — and still fail-closes', async () => {
+    const seen: Array<[string, string]> = [];
+    const backend = new FakeBackend();
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache: new InMemoryCompletionCache(),
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'block',
+      onEgressVerdict: (filepath, verdict) => {
+        seen.push([filepath, verdict]);
+      },
+    });
+    const result = await engine.complete(
+      ctx({ filepath: 'file:///tmp/observed.ts' }),
+      { manual: true },
+      new AbortController().signal,
+    );
+    expect(result).toBeUndefined();
+    expect(backend.calls).toEqual([]); // the block is untouched by the seam
+    expect(seen).toEqual([['file:///tmp/observed.ts', 'content-block']]);
+  });
+
+  it('a THROWING observer changes nothing on the block path (fail-closed intact, no egress)', async () => {
+    const backend = new FakeBackend();
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache: new InMemoryCompletionCache(),
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'block',
+      onEgressVerdict: () => {
+        throw new Error('surface exploded');
+      },
+    });
+    const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+    expect(result).toBeUndefined();
+    expect(backend.calls).toEqual([]);
+  });
+
+  it('a THROWING observer does not break the ALLOW path either', async () => {
+    const backend = new FakeBackend();
+    backend.chunks = ['world'];
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache: new InMemoryCompletionCache(),
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'allow',
+      onEgressVerdict: () => {
+        throw new Error('surface exploded');
+      },
+    });
+    const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+    expect(result).toEqual({ text: 'world' });
+  });
+
+  it('receives the allow verdict too (the surface clears badges on it)', async () => {
+    const verdicts: string[] = [];
+    const backend = new FakeBackend();
+    backend.chunks = ['x'];
+    const engine = new FimEngine({
+      backend,
+      options: options(),
+      cache: new InMemoryCompletionCache(),
+      debouncer: new AutocompleteDebouncer(),
+      checkEgress: () => 'allow',
+      onEgressVerdict: (_filepath, verdict) => {
+        verdicts.push(verdict);
+      },
+    });
+    await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+    expect(verdicts).toEqual(['allow']);
   });
 });

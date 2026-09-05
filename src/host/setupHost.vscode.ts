@@ -192,7 +192,9 @@ function createPushableLineChannel(source: NodeJS.ReadableStream | null): {
   async function* generate(): AsyncGenerator<string> {
     for (;;) {
       if (queue.length > 0) {
-        yield queue.shift() as string;
+        const line = queue.shift();
+        // length > 0 was just checked; `undefined` is unreachable (typed-total).
+        if (line !== undefined) yield line;
         continue;
       }
       if (ended) return;
@@ -334,6 +336,22 @@ function createNodeGgufIngestIo(): GgufIngestIo & GgufStoreIo {
 
     ensureDir: async (dir: string): Promise<void> => {
       await mkdir(dir, { recursive: true });
+    },
+    // CA-M09 (frozen commit, owner-approved rev-3): 'missing' on ENOENT;
+    // NEVER follows symlinks (`lstat`, checking `isSymbolicLink()` first);
+    // any other error rejects (fail-closed). Backs the pre-rename
+    // destination re-check in `downloadGgufToStore`.
+    lstatKind: async (p: string): Promise<'missing' | 'file' | 'dir' | 'symlink' | 'other'> => {
+      try {
+        const st = await lstat(p);
+        if (st.isSymbolicLink()) return 'symlink';
+        if (st.isDirectory()) return 'dir';
+        if (st.isFile()) return 'file';
+        return 'other';
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'missing';
+        throw err;
+      }
     },
     // Same open/write/close discipline as `createTempWrite` above (T14
     // Finding 1's own comment applies verbatim: `destroy()` + wait for the
@@ -553,11 +571,11 @@ const boundFetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
  * {@link SetupControllerDeps.reconnectAgent}'s optionality exactly so every
  * existing zero-second-arg factory call site keeps compiling unchanged.
  * `extension.ts` passes a thunk over the CURRENT backend
- * (`() => backend.reconnectAgent?.() ?? Promise.resolve({ok:false,...})`).
+ * (`(opts) => backend.reconnectAgent?.(opts) ?? Promise.resolve({ok:false,...})`).
  */
 export function createSetupControllerDeps(
   getAdvertisedAuthMethods: () => AdvertisedAuthMethod[] | undefined,
-  reconnectAgent?: () => Promise<{ ok: true } | { ok: false; reason: string }>,
+  reconnectAgent?: (opts?: { force?: boolean }) => Promise<{ ok: true } | { ok: false; reason: string }>,
 ): SetupControllerDeps {
   const exec = createExecLookup();
   const spawn = createNodeSpawnFn();
@@ -677,6 +695,7 @@ export function createVsCodeSetupHost(context: vscode.ExtensionContext): SetupHo
       const { section, prop } = splitSettingKey(key);
       await vscode.workspace.getConfiguration(section).update(prop, value, vscode.ConfigurationTarget.Global);
     },
+    inspectSettingGlobal: (key: string): unknown => vscode.workspace.getConfiguration().inspect(key)?.globalValue,
     secrets: {
       store: (key, v) => Promise.resolve(context.secrets.store(key, v)),
       // Final review wave, pre-merge defensive fix: `has()`'s contract

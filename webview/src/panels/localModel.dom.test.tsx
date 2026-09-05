@@ -15,12 +15,44 @@ import userEvent from '@testing-library/user-event';
 import type { SetupCatalogModel, SetupData } from '../protocol';
 import { DECLINED } from '../state/panels';
 import { LocalModelBlock, type LocalModelBlockProps } from './localModel';
+import { PULL_NOT_CONFIRMED_TEXT } from './setupCards';
 
 function setup(jsx: ReactElement) {
   return { user: userEvent.setup(), ...render(jsx) };
 }
 
-function catalogModel(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogModel {
+const DEFAULT_LLAMACPP: NonNullable<SetupCatalogModel['llamacpp']> = {
+  file: 'qwen2.5-coder-1.5b-q8_0.gguf',
+  approxBytes: 1_646_573_056,
+  present: false,
+  available: true,
+};
+
+/**
+ * `llamacpp`/`ollamaTag`/`vllm`/`defaultForRole` default to a present value
+ * below, so a caller that wants to test the "field is absent" render path
+ * (e.g. F-3/F-4 honest-absence) needs to say so explicitly — `{ llamacpp:
+ * undefined }` — rather than merely omitting the key (which would keep the
+ * default). `Partial<SetupCatalogModel>` cannot express that under
+ * `exactOptionalPropertyTypes` (an optional field's value type excludes
+ * `undefined`), so this test-only override type widens JUST those four
+ * fields to accept an explicit `undefined` override signal; the
+ * `SetupCatalogModel` this function RETURNS never carries an explicit-
+ * undefined key (arm 1: resolved via `'field' in overrides` + conditional
+ * spread) — the widening is confined to this local builder's input, not the
+ * shared protocol type.
+ */
+function catalogModel(
+  overrides: Partial<Omit<SetupCatalogModel, 'llamacpp' | 'vllm' | 'defaultForRole' | 'ollamaTag'>> & {
+    llamacpp?: SetupCatalogModel['llamacpp'] | undefined;
+    vllm?: SetupCatalogModel['vllm'] | undefined;
+    defaultForRole?: boolean | undefined;
+    ollamaTag?: string | undefined;
+  } = {},
+): SetupCatalogModel {
+  const { llamacpp, vllm, defaultForRole, ollamaTag, ...rest } = overrides;
+  const resolvedLlamacpp = 'llamacpp' in overrides ? llamacpp : DEFAULT_LLAMACPP;
+  const resolvedOllamaTag = 'ollamaTag' in overrides ? ollamaTag : 'qwen2.5-coder:1.5b-base';
   return {
     id: 'qwen25-coder-1.5b',
     role: 'fim',
@@ -29,15 +61,12 @@ function catalogModel(overrides: Partial<SetupCatalogModel> = {}): SetupCatalogM
     license: 'apache-2.0',
     vramLine: 'any modern GPU (~1–2 GB)',
     progressId: 'qwen25-coder-1.5b',
-    ollamaTag: 'qwen2.5-coder:1.5b-base',
     ollamaApproxBytes: 986_000_000,
-    llamacpp: {
-      file: 'qwen2.5-coder-1.5b-q8_0.gguf',
-      approxBytes: 1_646_573_056,
-      present: false,
-      available: true,
-    },
-    ...overrides,
+    ...rest,
+    ...(resolvedOllamaTag !== undefined ? { ollamaTag: resolvedOllamaTag } : {}),
+    ...(resolvedLlamacpp !== undefined ? { llamacpp: resolvedLlamacpp } : {}),
+    ...(vllm !== undefined ? { vllm } : {}),
+    ...(defaultForRole !== undefined ? { defaultForRole } : {}),
   };
 }
 
@@ -178,6 +207,149 @@ describe('LocalModelBlock — Ollama in-flight pull (CC-9)', () => {
   it('Cancel is NEVER trust-gated (stays enabled while disabledReason is set)', () => {
     renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress, disabledReason: 'Workspace is not trusted.' });
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled();
+  });
+});
+
+describe('T31 (F2-20-face): Cancel announces the HOST-reported outcome', () => {
+  const inFlightProgress = {
+    'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 1000, completedBytes: 400 },
+  };
+
+  it('{cancelled:true} → announces "Cancelled"', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: true, matched: 'qwen25-coder-1.5b' });
+    const { user } = renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Cancelled')).toBeInTheDocument();
+  });
+
+  it('{cancelled:false} → announces the nothing-to-cancel copy, NOT "Cancelled"', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: false });
+    const { user } = renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Nothing to cancel — it had already finished.')).toBeInTheDocument();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+  });
+
+  it('a legacy {ok:true} result (no discriminant) announces NOTHING', async () => {
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const { user } = renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    // give the resolve a tick, then assert silence
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+    expect(screen.queryByText('Nothing to cancel — it had already finished.')).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * A11Y-05 (WCAG 4.1.3): the percent row no longer chatters `aria-live`
+ * itself — a single sr-only `PullAnnouncer` (`role="status"`) speaks only
+ * 10%-step crossings, and the Cancel button never sits inside a live
+ * region.
+ */
+describe('LocalModelBlock — in-flight pull a11y (A11Y-05)', () => {
+  const inFlightProgress = {
+    'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 1000, completedBytes: 400 },
+  };
+
+  it('the progressbar row no longer carries aria-live (silent aria-valuenow updates)', () => {
+    renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress });
+    expect(screen.getByRole('progressbar').closest('[aria-live]')).toBeNull();
+  });
+
+  it('an sr-only role="status" PullAnnouncer region exists inside the in-flight block', () => {
+    renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress });
+    // Every `ActionButton` (Pull, Cancel, …) mounts its own always-on
+    // `LiveRegion` (role="status", usually empty) — find THIS one by its
+    // announced text, not by role alone (role="status" is not unique here).
+    const announcer = screen.getByText(/^Pulling qwen25-coder-1\.5b — \d+%$/);
+    expect(announcer).toHaveAttribute('role', 'status');
+  });
+
+  it('percent 7 then 9 leaves the announcer text unchanged (10%-step latch)', () => {
+    const at7 = {
+      'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 100, completedBytes: 7 },
+    };
+    const at9 = {
+      'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 100, completedBytes: 9 },
+    };
+    const { rerender } = renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: at7 });
+    const textAt7 = screen.getByText(/^Pulling qwen25-coder-1\.5b — \d+%$/).textContent;
+    rerender(<LocalModelBlock {...baseProps({ ollama: ollamaWire({ running: true, models: [] }), progress: at9 })} />);
+    expect(screen.getByText(/^Pulling qwen25-coder-1\.5b — \d+%$/).textContent).toBe(textAt7);
+  });
+
+  it('the Cancel button is NOT a descendant of any [aria-live] element', () => {
+    renderBlock({ ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress });
+    const cancelBtn = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancelBtn.closest('[aria-live]')).toBeNull();
+  });
+});
+
+/**
+ * UX-09: the window between dispatching a Pull and the FIRST `setup.progress`
+ * push for it had no feedback and no way to cancel — the ActionButton's own
+ * "Working…" pending label is the only signal, and it vanishes the instant
+ * the dispatch promise settles even if no progress entry has shown up yet.
+ * `dispatching` (local `useState`) covers exactly that window; the render
+ * guard (`dispatching && live === undefined`) keeps it mutually exclusive
+ * with the CC-9 in-flight block above (which takes over the instant `live`
+ * appears).
+ */
+describe('LocalModelBlock — Ollama pre-progress Working line (UX-09)', () => {
+  it('clicking Pull with no progress entry yet shows the Working line + an early Cancel button', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }) })} />);
+
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it('the early Cancel dispatches setup.cancel {op:"pull", id:<catalogId>} — same as the in-flight Cancel', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }) })} />);
+
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(dispatch).toHaveBeenCalledWith('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' });
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it('once a progress entry arrives, the Working line yields to the ordinary in-flight block — exactly ONE Cancel button', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user, rerender } = setup(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }) })} />);
+
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+
+    const inFlightProgress = {
+      'pull:qwen25-coder-1.5b': { op: 'pull' as const, id: 'qwen25-coder-1.5b', logTail: [], totalBytes: 1000, completedBytes: 400 },
+    };
+    rerender(<LocalModelBlock {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }), progress: inFlightProgress })} />);
+
+    expect(screen.queryByText('Working — waiting for the backend to report progress…')).not.toBeInTheDocument();
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '40');
+    expect(screen.getAllByRole('button', { name: 'Cancel' })).toHaveLength(1);
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
   });
 });
 
@@ -377,6 +549,24 @@ describe('LocalModelBlock — llama.cpp in-flight download (CC-9)', () => {
     const { user, dispatch } = renderBlock({ backend: 'llamacpp', progress: inFlightProgress });
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(dispatch).toHaveBeenCalledWith('setup.cancel', { op: 'pull', id: 'qwen25-coder-1.5b' });
+  });
+});
+
+describe('LocalModelBlock — llama.cpp pre-progress Working line (UX-09)', () => {
+  it('clicking Download with no progress entry yet shows the Working line + an early Cancel button', async () => {
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const { user } = setup(<LocalModelBlock {...baseProps({ dispatch, backend: 'llamacpp' })} />);
+
+    await user.click(screen.getByRole('button', { name: /Download Qwen2\.5-Coder/ }));
+
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
   });
 });
 
@@ -662,13 +852,15 @@ describe('LocalModelBlock — pinnedDownload (T13, §3.3): the NEXT pinned-model
 
 /* ------------------------------------------------------------------ *
  * beta.6 panel-fix T6 — `onOllamaPullSuccess` (opt-in): fires exactly when
- * an OLLAMA-pane Pull dispatch resolves with a result ≠ DECLINED. Never on
- * rejection, never on DECLINED, never on llama.cpp/vLLM Download. OPT-IN —
- * omitted, the ollama Pull path stays byte-identical.
+ * an OLLAMA-pane Pull dispatch resolves with a CONFIRMED `{ok:true}` result
+ * (T32/F1-6-face). Never on rejection, never on DECLINED, never on an
+ * unconfirmed resolve, never on llama.cpp/vLLM Download. OPT-IN — omitted,
+ * the ollama Pull path stays byte-identical.
  * ------------------------------------------------------------------ */
 
 describe('LocalModelBlock — onOllamaPullSuccess (panel-fix T6)', () => {
-  it('ollama Pull resolves non-DECLINED: calls onOllamaPullSuccess once with the row model', async () => {
+  // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+  it('ollama Pull resolves confirmed {ok:true}: calls onOllamaPullSuccess once with the row model', async () => {
     const dispatch = vi.fn().mockResolvedValue({ ok: true });
     const onOllamaPullSuccess = vi.fn();
     const { user } = setup(
@@ -711,6 +903,23 @@ describe('LocalModelBlock — onOllamaPullSuccess (panel-fix T6)', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    expect(onOllamaPullSuccess).not.toHaveBeenCalled();
+    expect(screen.queryByText('✓ nudge')).not.toBeInTheDocument();
+  });
+
+  it('T32: a pull that "resolves" WITHOUT a confirmed ok shows the not-confirmed copy and NO success nudge', async () => {
+    const dispatch = vi.fn().mockResolvedValue({}); // resolved, but nothing confirmed
+    const onOllamaPullSuccess = vi.fn();
+    const { user } = setup(
+      <LocalModelBlock
+        {...baseProps({ dispatch, ollama: ollamaWire({ running: true, models: [] }), onOllamaPullSuccess, ollamaPullSuccessLabel: '✓ nudge' })}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /Pull qwen2\.5-coder/ }));
+    // The failure-tone outcome rides the SAME error state as a rejection, so
+    // it renders with the ✗ prefix — mirroring the sibling REJECTS test's
+    // `'✗ boom'` assertion above.
+    expect(await screen.findByText(`✗ ${PULL_NOT_CONFIRMED_TEXT}`)).toBeInTheDocument();
     expect(onOllamaPullSuccess).not.toHaveBeenCalled();
     expect(screen.queryByText('✓ nudge')).not.toBeInTheDocument();
   });

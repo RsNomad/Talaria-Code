@@ -190,8 +190,9 @@ function mapDefinitionTarget(t: LocationLike | LocationLinkLike): PlainLocation 
     return {
       targetUri: t.targetUri.toString(),
       targetRange: toPlainRange(t.targetRange),
-      targetSelectionRange:
-        t.targetSelectionRange !== undefined ? toPlainRange(t.targetSelectionRange) : undefined,
+      ...(t.targetSelectionRange !== undefined
+        ? { targetSelectionRange: toPlainRange(t.targetSelectionRange) }
+        : {}),
     };
   }
   return { uri: t.uri.toString(), range: toPlainRange(t.range) };
@@ -219,10 +220,10 @@ function mapSymbolInformation(sym: SymbolInformationLike): PlainSymbolInformatio
   return {
     name: sym.name,
     kind: sym.kind,
-    containerName: sym.containerName,
+    ...(sym.containerName !== undefined ? { containerName: sym.containerName } : {}),
     location: {
       uri: sym.location.uri.toString(),
-      range: sym.location.range !== undefined ? toPlainRange(sym.location.range) : undefined,
+      ...(sym.location.range !== undefined ? { range: toPlainRange(sym.location.range) } : {}),
     },
   };
 }
@@ -248,7 +249,7 @@ const MAX_SYMBOL_TREE_DEPTH = 64;
 function mapDocumentSymbol(sym: DocumentSymbolLike, depth = 0): PlainDocumentSymbol {
   return {
     name: sym.name,
-    detail: sym.detail,
+    ...(sym.detail !== undefined ? { detail: sym.detail } : {}),
     kind: sym.kind,
     range: toPlainRange(sym.range),
     selectionRange: toPlainRange(sym.selectionRange),
@@ -381,12 +382,13 @@ function normalizeDiagnosticCode(code: DiagnosticLike['code']): string | undefin
  * RAW vscode ordinal (0 Error…3 Hint) — the label mapping lives in
  * `tools.ts`, not here (I-1(e)). */
 function mapDiagnostic(d: DiagnosticLike): RawDiagnostic {
+  const code = normalizeDiagnosticCode(d.code);
   return {
     range: toPlainRange(d.range),
     message: d.message,
     severity: d.severity,
-    source: d.source,
-    code: normalizeDiagnosticCode(d.code),
+    ...(d.source !== undefined ? { source: d.source } : {}),
+    ...(code !== undefined ? { code } : {}),
   };
 }
 

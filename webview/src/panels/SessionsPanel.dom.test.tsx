@@ -22,7 +22,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { ReactElement } from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { SessionSummary, SessionsData, WebviewToHost } from '../protocol';
 import { SessionsPanel } from './SessionsPanel';
@@ -48,8 +48,12 @@ function renderPanel(config: {
   nextCursor?: string;
   onLoadMore?: (cursor: string) => void;
   loadingMore?: boolean;
+  loadNotice?: { text: string; onDismiss: () => void };
 }) {
-  const data: SessionsData = { sessions: config.sessions ?? [session()], nextCursor: config.nextCursor };
+  const data: SessionsData = {
+    sessions: config.sessions ?? [session()],
+    ...(config.nextCursor !== undefined ? { nextCursor: config.nextCursor } : {}),
+  };
   return (
     <SessionsPanel
       data={data}
@@ -60,6 +64,7 @@ function renderPanel(config: {
       loadingSessionId={config.loadingSessionId}
       onLoadMore={config.onLoadMore ?? (() => {})}
       loadingMore={config.loadingMore ?? false}
+      loadNotice={config.loadNotice}
     />
   );
 }
@@ -104,6 +109,13 @@ describe('C4: History rows carry a bound marker and confirm before replacing a l
 
     expect(loads).toEqual([]);
     expect(screen.getByRole('button', { name: 'Load anyway' })).toBeInTheDocument();
+    // A11Y-07 (task-8-brief.md): this strip used to be a plain, unnamed
+    // <div> — no dialog role at all, so a screen-reader user perceived a
+    // silent DOM change with no cue a decision was being asked of them.
+    // Pinning the shared ConfirmStrip's alertdialog role + accessible name
+    // here replaces that old no-role characterization (GatewayHealthBanner
+    // A11Y-07 adoption precedent, ConfirmStrip.tsx).
+    expect(screen.getByRole('alertdialog', { name: 'Confirm load' })).toBeInTheDocument();
   });
 
   it('"Load anyway" loads the session exactly once', async () => {
@@ -127,6 +139,53 @@ describe('C4: History rows carry a bound marker and confirm before replacing a l
 
     expect(loads).toEqual([]);
     expect(screen.queryByRole('button', { name: 'Load anyway' })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * A11Y-07 (task-8-brief.md): SessionsPanel's inline "load anyway" strip
+ * adopts the shared `ConfirmStrip` alertdialog (built in Task 7,
+ * GatewayHealthBanner.dom.test.tsx's "UX-02/12b" describe block is the same
+ * adoption a beat earlier). Three focus-management behaviors this task adds
+ * that the old raw `<div>` strip never had: focus moves to "Load anyway" on
+ * open, and EVERY way out (Escape here, "Load anyway" below) hands focus
+ * back to the clicked ROW button — not a generic trigger, since History has
+ * many rows and only the confirming one's button is wired as the
+ * `returnFocus` target (`confirmTriggerRef`, conditionally attached via
+ * `ref={isConfirming ? confirmTriggerRef : undefined}`).
+ */
+describe('A11Y-07: the confirm-load strip is a focus-managed alertdialog', () => {
+  it('opening the strip moves focus to "Load anyway"', async () => {
+    const { user } = setup(renderPanel({ activeTabHasLiveTurn: true }));
+
+    await user.click(screen.getByRole('button', { name: /Fix the bug/ }));
+
+    expect(screen.getByRole('alertdialog', { name: 'Confirm load' })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Load anyway' })),
+    );
+  });
+
+  it('Escape cancels the strip and returns focus to the clicked row button', async () => {
+    const { user } = setup(renderPanel({ activeTabHasLiveTurn: true }));
+    const rowButton = screen.getByRole('button', { name: /Fix the bug/ });
+
+    await user.click(rowButton);
+    await user.keyboard('{Escape}');
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm load' })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(rowButton));
+  });
+
+  it('"Load anyway" closes the strip and returns focus to the row button', async () => {
+    const { user } = setup(renderPanel({ activeTabHasLiveTurn: true }));
+    const rowButton = screen.getByRole('button', { name: /Fix the bug/ });
+
+    await user.click(rowButton);
+    await user.click(screen.getByRole('button', { name: 'Load anyway' }));
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm load' })).not.toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toBe(rowButton));
   });
 });
 
@@ -245,6 +304,104 @@ describe('AU-46: the empty state keeps the "History" panel header', () => {
     setup(renderPanel({ sessions: [] }));
 
     expect(screen.getByText('History')).toBeInTheDocument();
+    expect(screen.getByText('No past sessions yet.')).toBeInTheDocument();
+  });
+});
+
+/**
+ * Task 19 (WCAG 1.3.1, WV4-MIN): the History row collection was `div` soup —
+ * no `role="list"`/`role="listitem"` at all, so AT could not count or
+ * navigate rows as a set. The "Load more" footer (a distinct, non-row
+ * control) stays OUTSIDE the list element.
+ */
+describe('WV4-MIN (Task 19, WCAG 1.3.1): History rows carry list/listitem semantics', () => {
+  it('the row collection exposes role="list" with one listitem per session', () => {
+    setup(
+      renderPanel({
+        sessions: [
+          session({ id: 'sess-1', title: 'Fix the bug' }),
+          session({ id: 'sess-2', title: 'Other session' }),
+        ],
+      }),
+    );
+
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});
+
+/**
+ * UX-04b: the webview watchdog's own fallback notice (`useSessionLoadWatchdog`,
+ * `App.tsx`) — DEFENSE IN DEPTH over WS-R4's host-side
+ * `SESSION_ESTABLISH_DEADLINE_MS`. `loadNotice` is `undefined` in every other
+ * test in this file (the `renderPanel` default), so those stay an implicit
+ * characterization that the banner adds nothing when absent.
+ */
+describe('UX-04b: the History-load watchdog notice', () => {
+  it('with no loadNotice, renders no banner and an empty (but present) sr-only live region', () => {
+    setup(renderPanel({}));
+
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+    // Finding-7: the LiveRegion is ALWAYS mounted — only its text is empty.
+    expect(screen.getByRole('status')).toHaveTextContent('');
+  });
+
+  it('with a loadNotice set, renders the warning banner text AND announces it via the sr-only role="status" region', () => {
+    setup(
+      renderPanel({
+        loadNotice: {
+          text: 'Still no reply from the agent after 130 seconds — the load may be stuck. Force reconnect from the connection banner, or click the session again.',
+          onDismiss: () => {},
+        },
+      }),
+    );
+
+    // Two copies of the text exist by design: the visible banner AND the
+    // permanently-mounted sr-only LiveRegion (Finding-7) that announces it.
+    expect(
+      screen.getAllByText(
+        'Still no reply from the agent after 130 seconds — the load may be stuck. Force reconnect from the connection banner, or click the session again.',
+      ),
+    ).toHaveLength(2);
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Still no reply from the agent after 130 seconds — the load may be stuck. Force reconnect from the connection banner, or click the session again.',
+    );
+  });
+
+  it('the banner sits ABOVE/OUTSIDE the row list — its Dismiss button is not one of the list\'s descendants', () => {
+    setup(
+      renderPanel({
+        sessions: [session({ id: 'sess-1', title: 'Fix the bug' })],
+        loadNotice: { text: 'Stuck.', onDismiss: () => {} },
+      }),
+    );
+
+    const list = screen.getByRole('list');
+    expect(within(list).queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument();
+  });
+
+  it('clicking Dismiss calls onDismiss (the caller, App.tsx, is what actually clears the notice)', async () => {
+    const onDismiss = () => {
+      dismissed = true;
+    };
+    let dismissed = false;
+    const { user } = setup(renderPanel({ loadNotice: { text: 'Stuck.', onDismiss } }));
+
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }));
+
+    expect(dismissed).toBe(true);
+  });
+
+  it('renders the banner above the EmptyPanel hint too — the empty-sessions path keeps the same top-of-shell placement', () => {
+    setup(
+      renderPanel({
+        sessions: [],
+        loadNotice: { text: 'Stuck.', onDismiss: () => {} },
+      }),
+    );
+
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument();
     expect(screen.getByText('No past sessions yet.')).toBeInTheDocument();
   });
 });

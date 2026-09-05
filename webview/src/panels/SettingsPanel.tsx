@@ -142,11 +142,11 @@ function FieldRow({
       ) : (
         <span className="flex-none font-mono text-2xs text-muted">{String(local)}</span>
       )}
-      {pending && (
-        <span className="flex-none text-2xs text-muted" aria-live="polite">
-          Saving…
-        </span>
-      )}
+      {/* Task 17 (Finding-7, WV4-MIN): ALWAYS mounted, same discipline as
+          the "Not saved" region above — a region created only once
+          `pending` goes true is the known-unreliable mount-with-content
+          pattern this task closes out. */}
+      <LiveRegion text={pending ? 'Saving…' : ''} className="flex-none text-2xs text-muted" />
     </div>
   );
 }

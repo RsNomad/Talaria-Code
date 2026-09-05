@@ -26,7 +26,7 @@
  * on every call — there is no captured/stale-opts value for it to go stale
  * against, so no reload is ever needed for a change to "take effect").
  */
-export const RAG_SETTING_RELOAD: Record<string, 'reload' | 'live'> = {
+export const RAG_SETTING_RELOAD: Readonly<Record<string, 'reload' | 'live'>> = Object.freeze({
   enabled: 'reload',
   embedEndpoint: 'reload',
   embedModel: 'reload',
@@ -36,4 +36,4 @@ export const RAG_SETTING_RELOAD: Record<string, 'reload' | 'live'> = {
   debounceMs: 'reload',
   excludeGlobs: 'reload',
   embedBackend: 'live',
-};
+});

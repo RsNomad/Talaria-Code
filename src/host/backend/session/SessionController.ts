@@ -16,6 +16,7 @@ import { TurnTranslator } from '../acp/turnTranslator';
 import { ReplayTranslator } from '../acp/replayTranslator';
 import { buildPromptContent, confineAttachmentPaths } from '../acp/attachments';
 import { mentionBlocks } from '../acp/mentions';
+import { derivePromptCaps } from '../acp/promptCaps';
 import {
   mapPermissionRequest,
   applyResolvedPresentation,
@@ -52,7 +53,7 @@ import { extractPreviewFiles } from '../../preview/extractPreviewFiles';
  * MOVED VERBATIM off `AcpBackend`: `sendPrompt`, `cancel`, `respondApproval`,
  * `resolveDiff`, `applyUpdate` (ex-`handleSessionUpdate` body),
  * `handlePermission` (ex-`handleRequestPermission` body), `setPreset`,
- * `setModel`, the `loadReplay`/replay bookkeeping, and `dispose()`
+ * `setModel`, the `loadReplayOutcome`/replay bookkeeping, and `dispose()`
  * — each now reading THIS controller's own fields instead of `AcpBackend`'s
  * flat globals. (The `setMode` body that once lived here was YAGNI-deleted in
  * H9/P7-N10 — the wire-mode pin is `pinWireModeDefault`; the picker uses
@@ -86,9 +87,20 @@ import { extractPreviewFiles } from '../../preview/extractPreviewFiles';
  * load's belated resolution must not flip the WINNING load's `replaying`
  * flag" test, which spies on ONE stable `subagents` object instance across
  * two overlapping loads targeting different session ids). `sessionId`/`cwd`
- * are therefore plain mutable fields, reassigned only by {@link loadReplay}.
+ * are therefore plain mutable fields, reassigned only by {@link loadReplayOutcome}.
  * T3 replaces this approximation with a REAL per-tab controller mint.
  */
+
+export type LoadReplayOutcome =
+  | { kind: 'loaded'; result: AcpLoadSessionResult }
+  | { kind: 'no-client' }
+  | { kind: 'load-failed'; message: string }
+  | { kind: 'not-found' }
+  /** Empty for the :1203/:1226/:1269 supersede arms; carries the real result
+   *  for :1240's success-but-superseded arm — callers today treat that one
+   *  as SUCCESS, and the adapter preserves exactly that. */
+  | { kind: 'superseded'; result?: AcpLoadSessionResult };
+
 export class SessionController {
   sessionId: string;
   cwd: string;
@@ -112,6 +124,16 @@ export class SessionController {
   private liveTurnId: string | undefined;
   /** The turn id (if any) the user cancelled — see `AcpBackend`'s original field doc. */
   private cancelledTurnId: string | undefined;
+  /** WS-R1 F3-4: the armed cancel-fallback deadline, if any (one per cancel window). */
+  private cancelFallbackTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * WS-R1 F3-4: turn ids ended by the fallback deadline (not by a genuine
+   * turn end). The record: (a) makes the force-end queryable (wasForceEnded —
+   * WS-R3's reconnect wedge-break evidence), and (b) documents WHY the
+   * belated genuine settlement is dropped — forceEndCancelledTurn clears
+   * currentTurnId/turn, so runTurn's own :1021/:1042 guards discard it.
+   */
+  private readonly forceEndedTurnIds = new Set<string>();
 
   // --- policy inputs ------------------------------------------------------
   /** W2-F1: boots at `'manual'` — today's ask-everything behavior. */
@@ -139,7 +161,7 @@ export class SessionController {
    * snapshot immune to a later `onDidChangeConfiguration` firing — only an
    * explicit {@link setCustomMode} call (a user re-pick) replaces it.
    */
-  activeCustomMode?: ModeFloor;
+  activeCustomMode?: ModeFloor | undefined;
   /**
    * W4-T4b: the id of the active custom mode, or `null` when none is
    * active. `AcpBackend`'s `onDidChangeConfiguration` handler reads this
@@ -159,7 +181,7 @@ export class SessionController {
   /**
    * ARCH-1 (final review, UI I-1) §1.6 — liveness token for `setModel`, the
    * same idiom this controller already uses for `this.replay !== replay`
-   * (loadReplay) and BF-B's `disposed` re-check. Two rapid picks A→B can
+   * (loadReplayOutcome) and BF-B's `disposed` re-check. Two rapid picks A→B can
    * settle out of order; each attempt captures `++this.modelSwitchSeq` at
    * entry, and its resolve/reject handler drops silently if a NEWER attempt
    * has since bumped the counter — only the newest attempt's terminal push
@@ -177,7 +199,7 @@ export class SessionController {
    * BF-B: closes the pre-registration dangling-promise window in
    * `handlePermission` — mirrors the controller's existing liveness-token
    * idiom (the `this.replay !== replay` re-check after an await in the
-   * `loadReplay` path). `dispose()`'s `cancelPendingApprovals()` only
+   * `loadReplayOutcome` path). `dispose()`'s `cancelPendingApprovals()` only
    * settles approvals ALREADY registered in `pendingApprovals`; a
    * `handlePermission` still suspended on `buildPresentEffectSignals`'s
    * async path canonicalization at dispose time has nothing there yet to
@@ -215,6 +237,11 @@ export class SessionController {
     return this.liveTurnId !== undefined;
   }
 
+  /** WS-R1 F3-4: was `turnId` ended by the cancel fallback deadline (not a genuine turn end)? */
+  wasForceEnded(turnId: string): boolean {
+    return this.forceEndedTurnIds.has(turnId);
+  }
+
   getPreset(): EditPolicyPreset {
     return this.activePreset;
   }
@@ -245,10 +272,10 @@ export class SessionController {
    * `AcpBackend.pinWireModeDefault` — F4 (the pin is per-controller now).
    *
    * CF-01/I-2 (W1-T3): this is the ONE place both call sites reach —
-   * `loadReplay` (~:1123) and `AcpBackend.openSession` (~:754) — so
+   * `loadReplayOutcome` (~:1123) and `AcpBackend.openSession` (~:754) — so
    * catching `setSessionMode`'s rejection HERE closes both by construction,
    * with no duplicated try/catch at either await. Before this fix, a
-   * rejection propagated out of `loadReplay` (falsifying its documented
+   * rejection propagated out of `loadReplayOutcome` (falsifying its documented
    * "never rejects" contract — the webview's already-emitted `clear`/
    * `turn.start` pair would never get a closing `turn.end`) and out of
    * `openSession` (which `establishInitialSession`'s try/catch does stop
@@ -324,6 +351,25 @@ export class SessionController {
       return;
     }
 
+    // WS-SL F1-13: refuse an empty utterance BEFORE any turn/ordinal/
+    // checkpoint mint — a whitespace-only prompt with nothing attached would
+    // burn a turn id, a ROOT-scoped checkpoint ordinal and a snapshot for a
+    // prompt Hermes treats as empty. Deliberately ahead of the `liveTurnId`
+    // branch: an empty mid-turn utterance can never be a `/steer`/`/queue`
+    // control command, and "empty" is the more honest refusal than "already
+    // running". Closed literal only — nothing user-supplied reaches the wire.
+    if (text.trim() === '' && (attachments?.length ?? 0) === 0 && (mentions?.length ?? 0) === 0) {
+      this.port.logger?.append(
+        '[SessionController] sendPrompt refused — empty message (no text, attachments, or mentions)',
+      );
+      this.port.emit({
+        type: 'error',
+        sessionId: this.sessionId,
+        message: 'Cannot send an empty message.',
+      });
+      return;
+    }
+
     if (this.liveTurnId) {
       // V-18 (Tier-2 remediation architecture §2.2): the ONE narrow exception
       // to the refusal below — a text-only `/steer` or `/queue` typed while
@@ -381,7 +427,26 @@ export class SessionController {
     this.port.emit({ type: 'turn.start', turnId, sessionId: this.sessionId });
     this.port.emit({ type: 'user', turnId, sessionId: this.sessionId, text, mode });
 
-    void this.runTurnWithCheckpoint(turnId, turnOrdinal, text, mode, attachments, mentions);
+    // WS-SL F2-05: the terminal catch — `runTurnWithCheckpoint`'s pre-guard
+    // `Promise.all` (checkpoint snapshot + mention resolution) can reject
+    // BEFORE runTurn's own try/catch is even entered; unhandled, that leaked
+    // the root turn lease + liveTurnId forever. Mirrors runTurn's error arm
+    // exactly: same superseded guard, same bounded `errorMessage(err)`
+    // (Error.message only — the established webview-safe form), same
+    // `emitTurnEnd(turnId,'error')` (which releases the lease, settles any
+    // straggler approvals, and emits the closing bracket). State first, log
+    // last (T17/T18 ordering lesson).
+    void this.runTurnWithCheckpoint(turnId, turnOrdinal, text, mode, attachments, mentions).catch(
+      (err: unknown) => {
+        if (this.currentTurnId === turnId) {
+          this.port.emit({ type: 'error', sessionId: this.sessionId, message: errorMessage(err), turnId });
+          this.emitTurnEnd(turnId, 'error');
+        }
+        this.port.logger?.append(
+          `[SessionController] turn '${turnId}' aborted before the prompt settled: ${errorMessage(err)}`,
+        );
+      },
+    );
   }
 
   /**
@@ -521,6 +586,14 @@ export class SessionController {
    */
   cancel(): void {
     this.cancelledTurnId = this.currentTurnId;
+    // WS-SL preemptive tool-cancel (ACP SHOULD; WV1-MIN-ARCH): mark the LIVE
+    // turn's in-flight tool calls interrupted the moment the user stops —
+    // display-only (no wire change); a belated genuine tool_call_update
+    // still overwrites through applyUpdate. Replay/idle cancels no-op
+    // (no live turn / no live translator).
+    if (this.liveTurnId !== undefined && this.turn) {
+      for (const message of this.turn.markInFlightToolsInterrupted()) this.port.emit(message);
+    }
     const client = this.port.getClient();
     if (!client) {
       this.settlePendingApprovals('cancelled');
@@ -530,6 +603,51 @@ export class SessionController {
       this.port.logger?.append(`[SessionController] session/cancel failed: ${errorMessage(err)}`);
     });
     this.settlePendingApprovals('cancelled');
+    this.armCancelFallback();
+  }
+
+  /** WS-R1 F3-4: arm the force-end deadline for the LIVE prompt turn (replay
+   *  cancels arm nothing — there is no lease/liveTurnId to strand). One
+   *  timer per cancel window; a second cancel() while armed keeps the first. */
+  private armCancelFallback(): void {
+    const turnId = this.liveTurnId;
+    if (turnId === undefined || this.cancelFallbackTimer !== undefined) return;
+    this.cancelFallbackTimer = setTimeout(() => {
+      this.cancelFallbackTimer = undefined;
+      this.forceEndCancelledTurn(turnId);
+    }, CANCEL_FALLBACK_DEADLINE_MS);
+    this.cancelFallbackTimer.unref?.();
+  }
+
+  private clearCancelFallback(): void {
+    if (this.cancelFallbackTimer !== undefined) {
+      clearTimeout(this.cancelFallbackTimer);
+      this.cancelFallbackTimer = undefined;
+    }
+  }
+
+  /**
+   * WS-R1 F3-4: the agent never confirmed the stop — end the turn locally.
+   * emitTurnEnd releases the root lease (liveTurnId still matches), settles
+   * any straggler approvals, emits turn.end{cancelled} and takes the
+   * after-turn snapshot — the SAME terminal machinery a genuine end uses.
+   * Clearing currentTurnId/turn afterwards makes the belated genuine prompt
+   * settlement drop at runTurn's existing guards (:1021/:1042) — no
+   * duplicate turn.end, no stale result.summary (idempotence, §3.1 step 5).
+   */
+  private forceEndCancelledTurn(turnId: string): void {
+    if (this.disposed) return;
+    if (this.currentTurnId !== turnId || this.liveTurnId !== turnId) return; // ended genuinely — nothing to force
+    this.forceEndedTurnIds.add(turnId);
+    this.emitTurnEnd(turnId, 'cancelled');
+    this.currentTurnId = undefined;
+    this.turn = undefined;
+    this.port.emit({
+      type: 'error',
+      sessionId: this.sessionId,
+      turnId,
+      message: 'The agent did not confirm the stop — the turn was force-stopped locally.',
+    });
   }
 
   // --- approvals ------------------------------------------------------------
@@ -562,7 +680,7 @@ export class SessionController {
       sessionId: this.sessionId,
       turnId: pending.turnId,
       id,
-      toolId: pending.toolId,
+      ...(pending.toolId !== undefined ? { toolId: pending.toolId } : {}),
       outcome: 'selected',
       optionId,
     });
@@ -582,6 +700,20 @@ export class SessionController {
       this.finishApproval(approvalId, findOptionId(pending.options, 'deny') ?? 'deny');
       this.hunkState.delete(toolId);
       this.toolIdToApprovalId.delete(toolId);
+      return;
+    }
+
+    // BHF-F1-3 (WS-BG, owner-adjudicated FIRM): `hunkIndex` arrives off the
+    // webview wire (`diff.resolve`, protocol.ts:2240-2246). A junk index —
+    // non-integer, negative, or >= totalHunks — used to land in `decisions`
+    // and count toward the `decisions.size >= totalHunks` accept threshold
+    // below, so a hostile/buggy webview could satisfy the "all hunks
+    // decided => allow" invariant with ZERO real hunks decided. Refuse it
+    // loudly (ids/counts only in the log — no content) and count nothing.
+    if (!Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= hunks.totalHunks) {
+      this.port.logger?.append(
+        `[SessionController] resolveDiff: ignoring out-of-range hunkIndex ${String(hunkIndex)} for tool '${toolId}' (totalHunks=${hunks.totalHunks})`,
+      );
       return;
     }
 
@@ -615,7 +747,7 @@ export class SessionController {
       sessionId: this.sessionId,
       turnId: pending.turnId,
       id: approvalId,
-      toolId: pending.toolId,
+      ...(pending.toolId !== undefined ? { toolId: pending.toolId } : {}),
       outcome: 'selected',
       optionId,
     });
@@ -658,7 +790,7 @@ export class SessionController {
           sessionId: this.sessionId,
           turnId: pending.turnId,
           id: approvalId,
-          toolId: pending.toolId,
+          ...(pending.toolId !== undefined ? { toolId: pending.toolId } : {}),
           outcome: reason,
         });
       }
@@ -730,7 +862,7 @@ export class SessionController {
         // interchangeable:
         //  - disposed: stay as silent as every other BF-B liveness guard in
         //    this file (`reportUndeliveredUtterance`, `emitApprovalCard`,
-        //    the `loadReplay` continuation, `dispose()` itself). By the time
+        //    the `loadReplayOutcome` continuation, `dispose()` itself). By the time
         //    a belated resolve lands here, `SessionRegistry.open`'s
         //    same-sessionId replace (W6-FB) may already have minted a FRESH
         //    controller sharing this same `port` — emitting would risk
@@ -809,6 +941,22 @@ export class SessionController {
       this.lastCommands = mapAvailableCommands(update.availableCommands);
       this.port.emit({ type: 'commands.available', sessionId: this.sessionId, commands: this.lastCommands });
       return;
+    }
+
+    // WS-SL A-04: record an agent-initiated mode switch so `runTurn`'s
+    // re-pin backstop (`this.currentMode !== 'default'` before
+    // `client.prompt`) can see it — previously typed but never applied,
+    // leaving the backstop blind to a wire switch to accept_edits/dont_ask.
+    // Deliberately NOT an early return: the update still falls through to
+    // the live translator below so a mid-reasoning current_mode_update keeps
+    // closing the reasoning block exactly as before (the pure mapper —
+    // sessionUpdate.ts — is unchanged). Zero behavior change vs pinned
+    // Hermes 2026.7.7.2 (never emits this update — grep 0).
+    if (update.sessionUpdate === 'current_mode_update') {
+      this.currentMode = update.currentModeId;
+      this.port.logger?.append(
+        `[SessionController] agent-initiated mode change reported: '${update.currentModeId}' — the next turn re-pins 'default'`,
+      );
     }
 
     if (this.replay) {
@@ -930,7 +1078,20 @@ export class SessionController {
     const { approval, diffs } = mapped;
     const options = approval.options;
 
-    return new Promise<AcpRequestPermissionResponse>((resolve) => {
+    // WS-SL F3-3: turn-liveness at the sole registration point. `cancel()`'s
+    // `settlePendingApprovals` is a one-time snapshot — an approval whose
+    // `handlePermission` was suspended across that snapshot would otherwise
+    // register a fresh card for a stopped turn and live until the 60 s
+    // expiry (the zombie). Refusal resolves the ACP future cancelled — the
+    // harness maps that to deny (fail-closed), same as every settle path.
+    if (this.isStaleApprovalRegistration(approval.turnId)) {
+      this.port.logger?.append(
+        `[SessionController] approval '${approvalId}' refused at registration — its turn is gone or cancelled (fail-closed)`,
+      );
+      return Promise.resolve(buildCancelledOutcome());
+    }
+
+    const response = new Promise<AcpRequestPermissionResponse>((resolve) => {
       // T-A0 (M2-b): arm the host-side auto-deny deadline HERE, the sole
       // registration point into `pendingApprovals` — our timer starts at
       // receipt, i.e. always >= the harness's own deadline (which starts at
@@ -959,9 +1120,55 @@ export class SessionController {
         this.port.editPreviewRegistry?.set(this.sessionId, req.toolCall.toolCallId, approvalId, previewFiles);
       }
 
-      this.port.emit(approval);
-      for (const diff of diffs) this.port.emit(diff);
+      // WS-SL F2-06: the emit itself can throw (a torn-down webview port, a
+      // listener bug). Settle FIRST (fail-closed cancelled, emit:false — the
+      // port just proved unreliable, and the harness maps cancelled to deny),
+      // log LAST (a throwing logger must never strand the future — the
+      // T17/T18 ordering lesson). `settlePendingApprovals` clears the entry,
+      // its 60 s timer, and the hunk/preview bookkeeping in one sweep.
+      try {
+        this.port.emit(approval);
+        for (const diff of diffs) this.port.emit(diff);
+      } catch (err) {
+        this.settlePendingApprovals('cancelled', { onlyApprovalId: approvalId, emit: false });
+        this.port.logger?.append(
+          `[SessionController] approval card emit failed — approval '${approvalId}' resolved cancelled (fail-closed): ${errorMessage(err)}`,
+        );
+      }
     });
+
+    // WS-SL F3-3 (the arch's mandated post-registration re-check): the guard
+    // above and the executor run synchronously today, so this is unreachable
+    // unless future code motion inserts an await between them — in which
+    // case anything that raced past the guard is settled here, never left
+    // as a zombie until expiry. Settle-then-return keeps the future honest.
+    if (this.isStaleApprovalRegistration(approval.turnId)) {
+      this.settlePendingApprovals('cancelled', { onlyApprovalId: approvalId });
+    }
+    return response;
+  }
+
+  /**
+   * WS-SL F3-3: is a card registration for an approval born under
+   * `birthTurnId` stale? True when: no turn was ever admitted / the turn
+   * bookkeeping was cleared (crash, restart, force-end, dispose); the
+   * CURRENT turn is the one the user cancelled (the primary zombie window
+   * — `cancel()` already swept `pendingApprovals`, anything registering
+   * after that sweep is unreachable by it); or the approval was born under
+   * a PREVIOUS turn (its `handlePermission` suspended across a turn
+   * transition — `birthTurnId` is `handlePermission`'s entry-time capture,
+   * threaded here via `mapped.approval.turnId`). Residual (documented,
+   * accepted): a turn that ended `complete` leaves `currentTurnId` set, so
+   * a straggler registering in THAT narrow window still cards and is
+   * bounded by the M2-b expiry — closing it needs the turn-scoped approval
+   * registry ADR-SL explicitly rejected.
+   */
+  private isStaleApprovalRegistration(birthTurnId: string): boolean {
+    return (
+      this.currentTurnId === undefined ||
+      this.cancelledTurnId === this.currentTurnId ||
+      birthTurnId !== this.currentTurnId
+    );
   }
 
   // --- turn plumbing ----------------------------------------------------------
@@ -1012,9 +1219,16 @@ export class SessionController {
       }
 
       const promptText = this.activePreset === 'plan' ? PLAN_PREAMBLE + text : text;
+      // A-03 (WS-AC): the degrade decision is derived ONCE per turn from the
+      // client's retained initialize advertisement — SHIP-INACTIVE today
+      // (derivePromptCaps returns the inactive decision for every input; see
+      // its activation contract). Threading it now means activation is a
+      // one-line change in promptCaps.ts, nowhere else. Optional-member `?.`:
+      // test doubles without the getter read as "nothing advertised".
+      const promptCaps = derivePromptCaps(client.getAdvertisedPromptCapabilities?.());
       const content: AcpOutboundContentBlock[] = [
-        ...buildPromptContent(promptText, confinedAttachments),
-        ...mentionBlocks(resolved ?? []),
+        ...buildPromptContent(promptText, confinedAttachments, promptCaps),
+        ...mentionBlocks(resolved ?? [], promptCaps),
       ];
       const response = await client.prompt(this.sessionId, content);
 
@@ -1024,6 +1238,8 @@ export class SessionController {
 
       const usage = mapUsage(response.usage);
       const status = mapStopReasonToStatus(response.stopReason);
+      const summaryText = this.turn.settledText || undefined;
+      const summaryUsage = usage ? { ...usage, durationMs: Date.now() - this.turnStartedAt } : undefined;
       this.port.emit({
         type: 'result.summary',
         turnId,
@@ -1032,8 +1248,8 @@ export class SessionController {
         // `emitTurnEnd` below carries, computed once above. T4 owns the
         // UI-facing tone-mapped render this unlocks (ResultSummary.tsx).
         status,
-        text: this.turn.settledText || undefined,
-        usage: usage ? { ...usage, durationMs: Date.now() - this.turnStartedAt } : undefined,
+        ...(summaryText !== undefined ? { text: summaryText } : {}),
+        ...(summaryUsage !== undefined ? { usage: summaryUsage } : {}),
       });
       this.emitTurnEnd(turnId, status);
     } catch (err) {
@@ -1044,6 +1260,7 @@ export class SessionController {
   }
 
   private emitTurnEnd(turnId: string, status: 'complete' | 'cancelled' | 'error'): void {
+    this.clearCancelFallback();
     // T-A0 (V-5-host backstop): FIRST act — a turn ending means nothing is
     // running in this session (one live turn per session), so any approval
     // still open when it ends is abandoned exactly like the anomalous-turn-end
@@ -1121,7 +1338,7 @@ export class SessionController {
    * snapshot call site — i.e. captured AT SNAPSHOT TIME — and handed to
    * `tracker.snapshot(...)` as plain data; the tracker stores it verbatim on
    * the row it writes and NEVER re-reads it later. Because `sessionId` can
-   * be reassigned in place (`loadReplay`, per this class's own T1a
+   * be reassigned in place (`loadReplayOutcome`, per this class's own T1a
    * mutability note), a later rotation never retroactively changes an
    * already-written row's label — exactly the R8 guarantee (session ids
    * rotate on auto-compaction, so they must never be treated as a live
@@ -1154,15 +1371,22 @@ export class SessionController {
    * `session/load` call itself uses (mirrors today's exact asymmetry:
    * `client.loadSession(cwd, ...)` used the raw param while internal state
    * adopted the confined `adoptedCwd`).
+   *
+   * WS-R4 step 5: the sole surviving entry point — both production callers
+   * (`ConnectionSupervisor.recoverOneSession`, `AcpBackend
+   * .loadSessionIntoTabInternal`) discriminate this method's
+   * `LoadReplayOutcome` union natively; the thin `loadReplay` adapter that
+   * used to collapse it back to `AcpLoadSessionResult | undefined` is
+   * deleted (Tasks 21-22 migrated both callers off it first).
    */
-  async loadReplay(
+  async loadReplayOutcome(
     rawCwd: string,
     sessionId: string,
     adoptedCwd: string,
     mcpServers: AcpMcpServer[],
-  ): Promise<AcpLoadSessionResult | undefined> {
+  ): Promise<LoadReplayOutcome> {
     const client = this.port.getClient();
-    if (!client) return undefined;
+    if (!client) return { kind: 'no-client' };
 
     if (this.sessionId !== sessionId) this.lastCommands = undefined;
     this.sessionId = sessionId;
@@ -1198,13 +1422,13 @@ export class SessionController {
     try {
       result = await client.loadSession(rawCwd, sessionId, mcpServers);
     } catch (err) {
-      if (this.replay !== replay) return undefined;
+      if (this.replay !== replay) return { kind: 'superseded' };
       this.subagents.setReplaying(false);
       this.replay = undefined;
       this.port.emit({ type: 'error', sessionId, message: errorMessage(err), turnId: replay.currentTurnId });
       this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
       this.markSubagentsInterrupted();
-      return undefined;
+      return { kind: 'load-failed', message: errorMessage(err) };
     }
 
     // Audit A-3: `found: false` means Hermes had no session under this id
@@ -1221,7 +1445,7 @@ export class SessionController {
     // crash recovery) the `error` emitted here is the user-visible signal,
     // since that tab is already bound.
     if (!result.found) {
-      if (this.replay !== replay) return undefined; // superseded while awaiting
+      if (this.replay !== replay) return { kind: 'superseded' }; // superseded while awaiting
       this.subagents.setReplaying(false);
       this.replay = undefined;
       this.port.emit({
@@ -1232,10 +1456,10 @@ export class SessionController {
       });
       this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
       this.markSubagentsInterrupted();
-      return undefined;
+      return { kind: 'not-found' };
     }
 
-    if (this.replay !== replay) return result; // superseded while awaiting
+    if (this.replay !== replay) return { kind: 'superseded', result }; // superseded while awaiting
     this.subagents.setReplaying(false);
     this.replay = undefined;
     for (const message of replay.finish()) this.port.emit(message);
@@ -1249,12 +1473,12 @@ export class SessionController {
     }
     await this.pinWireModeDefault(result.currentModeId);
     // I-2 (W1-T3 review, Important fix; re-review fix2 added `|| this.
-    // disposed`): recheck for a superseding `loadReplay` AFTER this await —
+    // disposed`): recheck for a superseding `loadReplayOutcome` call AFTER this await —
     // the guard just above (~:1180) only covers the `client.loadSession`
     // await; `pinWireModeDefault` is a SEPARATE suspension point with no
     // recheck of its own before this fix. THIS call reset `this.replay` to
     // `undefined` two lines above; a non-undefined value at this point can
-    // only mean a second, superseding `loadReplay` claimed it on the SAME
+    // only mean a second, superseding `loadReplayOutcome` call claimed it on the SAME
     // instance in the meantime (the synthetic case production never
     // creates). The REAL production supersede is `SessionRegistry.open`
     // minting a FRESH controller and DISPOSING this one — which also resets
@@ -1264,13 +1488,13 @@ export class SessionController {
     // past this point (subagents mutation, `commands.available`, the
     // closing `turn.end`) belongs to a turn that no longer exists from the
     // webview's perspective and must not fire.
-    if (this.replay !== undefined || this.disposed) return;
+    if (this.replay !== undefined || this.disposed) return { kind: 'superseded' };
     this.markSubagentsInterrupted();
     if (this.lastCommands) {
       this.port.emit({ type: 'commands.available', sessionId, commands: this.lastCommands });
     }
     this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'complete' });
-    return result;
+    return { kind: 'loaded', result };
   }
 
   // --- crash / dispose ----------------------------------------------------
@@ -1283,6 +1507,16 @@ export class SessionController {
    * session-lost" fan-out).
    */
   endOnCrash(): void {
+    // M1 (Task 8 follow-up, concurrency-lens review): defensive symmetry with
+    // dispose() — this method clears the turn bookkeeping directly (bypassing
+    // emitTurnEnd) and, unfixed, left an armed cancelFallbackTimer stranded.
+    // Harmless when the stray timer fires (forceEndCancelledTurn's own
+    // currentTurnId/liveTurnId guard no-ops it against a monotonic, never-
+    // reused turn id), but armCancelFallback's `cancelFallbackTimer !==
+    // undefined` early-return means a surviving handle would silently
+    // suppress the NEXT turn's fallback on a reused controller — regressing
+    // the exact "Stop looks dead" bug F3-4 fixes, with no error surfaced.
+    this.clearCancelFallback();
     if (this.liveTurnId !== undefined) {
       const deadTurnId = this.liveTurnId;
       this.liveTurnId = undefined;
@@ -1305,14 +1539,21 @@ export class SessionController {
    * endOnCrash} — reuses that method's exact live-turn/replay arms
    * (release the root turn-lease, emit the closing `turn.end` bracket, mark
    * subagents interrupted) instead of inventing a second mechanism. The ONE
-   * difference: the live-turn arm's `turn.end` carries `status:'cancelled'`,
-   * not `'error'` — this end is USER-intended (an explicit restart / "New
-   * Session"), never a failure. Called by `ConnectionSupervisor`'s restart
-   * fan-out (`startInternal`, BEFORE `teardownSession()`) while this
-   * controller is still registered and the port is live — the same
-   * reasoning that lets `endOnCrash` emit safely.
+   * difference from endOnCrash: BOTH arms' `turn.end` carry
+   * `status:'cancelled'`, not `'error'` — this end is USER-intended (an
+   * explicit restart / "New Session" / force reconnect), never a failure;
+   * a replay abandoned by user choice is abandoned, not broken
+   * (ADR-UX-P2-2, WS-UX Phase-2 plan 2026-08-22; extends V-12's own
+   * principle to the replay arm — endOnCrash alone keeps 'error'). Called
+   * by `ConnectionSupervisor`'s restart fan-out (`startInternal`, BEFORE
+   * `teardownSession()`) while this controller is still registered and the
+   * port is live — the same reasoning that lets `endOnCrash` emit safely.
    */
   endForRestart(): void {
+    // M1 (Task 8 follow-up, concurrency-lens review): see endOnCrash's
+    // identical comment — defensive symmetry with dispose(), clears a
+    // stranded cancel-fallback timer handle.
+    this.clearCancelFallback();
     if (this.liveTurnId !== undefined) {
       const deadTurnId = this.liveTurnId;
       this.liveTurnId = undefined;
@@ -1325,7 +1566,7 @@ export class SessionController {
       this.subagents.setReplaying(false);
       this.replay = undefined;
       this.currentTurnId = undefined;
-      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status: 'error' });
+      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status: 'cancelled' });
       this.markSubagentsInterrupted();
     }
   }
@@ -1346,13 +1587,13 @@ export class SessionController {
    * every rejection). Child + tracker + dashboard are disposed ONLY in
    * `AcpBackend.dispose()` — this method never touches them.
    *
-   * W4-T5a: also invalidates an in-flight `loadReplay` (sets `this.replay =
+   * W4-T5a: also invalidates an in-flight `loadReplayOutcome` call (sets `this.replay =
    * undefined` with NO emit). `loadSessionIntoTab` now mints a FRESH
    * controller per load and disposes the tab's PRIOR one (F6) instead of
    * reusing one controller in place — so a prior controller's `session/load`
    * can still be awaiting `client.loadSession()` at the moment it is
    * disposed (a second, faster load into the SAME tab won the race). Without
-   * this, that belated resolution would run `loadReplay`'s success/failure
+   * this, that belated resolution would run `loadReplayOutcome`'s success/failure
    * tail on the DISPOSED controller and emit stale `clear`/`turn.start`-
    * bracketed messages via the shared `port.emit` — into a tab a fresh
    * controller has since taken over (the cross-controller generalization of
@@ -1362,6 +1603,7 @@ export class SessionController {
    */
   dispose(): void {
     this.disposed = true;
+    this.clearCancelFallback();
     const client = this.port.getClient();
     if (client && this.liveTurnId !== undefined) {
       void client.cancel(this.sessionId).catch((err) => {
@@ -1459,6 +1701,15 @@ function isMidTurnControlUtterance(text: string, attachments?: Attachment[], men
  * user's own live turn, not just this utterance.
  */
 const UTTERANCE_DEADLINE_MS = 15_000;
+
+/**
+ * WS-R1 F3-4: how long cancel() waits for the agent to confirm the stop
+ * (a genuine turn end) before force-ending the turn locally. The harness
+ * genuinely can fail to unpark (see cancel()'s own doc) — without this the
+ * turn lease is held forever and Stop looks dead. Proposed default; tunable
+ * on Fedora live-QA.
+ */
+const CANCEL_FALLBACK_DEADLINE_MS = 15_000;
 
 /**
  * W2-F1 Plan preamble (C3, pinned VERBATIM — moved off `AcpBackend`):

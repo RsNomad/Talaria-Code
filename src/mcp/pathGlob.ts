@@ -12,7 +12,24 @@
  * A pattern beginning with `!` is a negation (excludes matches) — the same
  * "later/negation wins" semantics as `.gitignore`.
  */
+// CA-M21: bound the translation so a pathological glob can't amplify into a
+// catastrophic regex. Production input is already schema-capped (16 globs /
+// 256 chars each — toolSchema.ts); these are defence-in-depth backstops for
+// any direct/other caller of compilePathGlobs/matchesPathGlobs.
+const MAX_GLOB_LENGTH = 1024;
+const MAX_GLOB_SEGMENTS = 64;
+
 function globToRegExpSource(bareGlob: string): string {
+  if (bareGlob.length > MAX_GLOB_LENGTH) {
+    throw new RangeError(`path glob exceeds ${MAX_GLOB_LENGTH} characters`);
+  }
+  let segmentCount = 1;
+  for (let s = 0; s < bareGlob.length; s++) {
+    if (bareGlob[s] === '/') segmentCount++;
+  }
+  if (segmentCount > MAX_GLOB_SEGMENTS) {
+    throw new RangeError(`path glob exceeds ${MAX_GLOB_SEGMENTS} segments`);
+  }
   let out = '';
   for (let i = 0; i < bareGlob.length; i++) {
     const c = bareGlob[i];

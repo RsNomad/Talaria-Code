@@ -22,6 +22,8 @@
  * either way (§7 B7) — this parser is a second, independent layer of "never
  * silently accept a shape we didn't design for".
  */
+
+import { isSafePreviewId } from './previewIds';
 export interface ParsedDiffUri {
   side: 'before' | 'after';
   sessionId: string;
@@ -55,6 +57,10 @@ export function parseDiffUri(uri: DiffUriLike): ParsedDiffUri | null {
   const toolId = rest.slice(0, secondSlash);
   const path = rest.slice(secondSlash + 1);
   if (!sessionId || !toolId || !path) return null;
+  // CA-M17 (WS-BG): parse accepts exactly what composePreviewKey/
+  // buildDiffUriParts can mint — a whitespace-carrying id is refused here
+  // for symmetry (the `/` case is structurally impossible past the splits).
+  if (!isSafePreviewId(sessionId) || !isSafePreviewId(toolId)) return null;
 
   return { side: uri.authority, sessionId, toolId, path };
 }
@@ -65,15 +71,17 @@ export function parseDiffUri(uri: DiffUriLike): ParsedDiffUri | null {
  * (no `vscode` import) so `TalariaViewProvider`'s `diff.open` routing stays a
  * one-line `vscode.Uri.from(buildDiffUriParts(...))` call — the URI-building
  * logic itself is headless-tested here, round-tripped against
- * {@link parseDiffUri} in the test file. Assumes `sessionId`/`toolId` never
- * themselves contain a `/` (ACP session/tool-call ids don't); `path` may
- * (nested directories).
+ * {@link parseDiffUri} in the test file. `sessionId`/`toolId` must never
+ * themselves contain a `/` or whitespace (ACP session/tool-call ids don't) —
+ * that is now ENFORCED (a violation is refused with `undefined`), not just
+ * assumed; `path` may contain `/` (nested directories).
  */
 export function buildDiffUriParts(
   side: 'before' | 'after',
   sessionId: string,
   toolId: string,
   path: string,
-): DiffUriLike {
+): DiffUriLike | undefined {
+  if (!isSafePreviewId(sessionId) || !isSafePreviewId(toolId)) return undefined;
   return { scheme: SCHEME, authority: side, path: `/${sessionId}/${toolId}/${path}` };
 }

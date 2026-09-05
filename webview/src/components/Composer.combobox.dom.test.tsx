@@ -47,6 +47,7 @@ function StatefulComposer(props: {
       preset="normal"
       modelLabel="test-model"
       busy={false}
+      stopping={false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}

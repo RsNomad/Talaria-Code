@@ -23,7 +23,13 @@ import type { CheckpointTrackerLike } from './trackerContract';
 export interface RootCoordinatorLike {
   /** The canonical (realpath'd) root key this coordinator was registered under (`rootRegistry`'s map key). */
   readonly rootId: string;
-  /** The ONE per-root shadow-git tracker instance, or `undefined` when checkpoints aren't wired for this root. */
+  /**
+   * The per-root shadow-git tracker, or `undefined` when checkpoints aren't
+   * wired for this root. WS-CK-A6: resolved PER-ACCESS (not frozen at mint
+   * time) — under the registry-backed factory the value can appear (a folder
+   * re-added / init retry) or disappear (folder removed) across successive
+   * reads of this same coordinator instance.
+   */
   readonly tracker: CheckpointTrackerLike | undefined;
   /**
    * Synchronously claim the root's turn lease for `sessionId`. `false` ⇒
@@ -68,7 +74,23 @@ export interface RootCoordinatorLike {
  */
 export class RootCoordinator implements RootCoordinatorLike {
   readonly rootId: string;
-  readonly tracker: CheckpointTrackerLike | undefined;
+
+  /**
+   * WS-CK-A6 prep: `tracker` is a GETTER over a stored factory, consulted on
+   * EVERY access — not a mint-time-frozen field. This is what lets a later
+   * registry-backed factory (`() => this.trackerRegistry.get(canonicalRoot)`,
+   * A6's own wiring) reflect a tracker that appears after mint (folder
+   * re-added / init retry) or disappears (folder removed). Behavior-
+   * preserving for every CURRENT caller: today's two production factories
+   * (`AcpBackend.resolveRootCoordinator`'s captured-const ternary, and A6's
+   * future Map lookup) are both pure over stable captures, so re-invoking on
+   * every access returns the identical value a mint-time read would have.
+   * The factory MUST stay cheap + side-effect-free — it can now run far more
+   * than once.
+   */
+  get tracker(): CheckpointTrackerLike | undefined {
+    return this.trackerFactory();
+  }
 
   /**
    * The single current lease holder (a real `sessionId`, or a one-shot's
@@ -87,20 +109,22 @@ export class RootCoordinator implements RootCoordinatorLike {
    * W6-FI-c Part 2 (3-way ARCH I-4c / W4-F5 placement fix): the checkpoints-
    * panel refresh trigger for THIS root, injected ONCE at mint time by
    * `rootRegistry.getOrCreate`'s caller (`AcpBackend.resolveRootCoordinator`)
-   * — mirrors `trackerFactory`'s own "constructed once, at mint time" posture.
-   * Defaults to a no-op so every EXISTING 2-arg `new RootCoordinator(rootId,
-   * tracker)` call site (this class's own unit tests, `rootRegistry.test.ts`'s
-   * 2-arg `getOrCreate` calls) keeps compiling and behaving identically —
-   * this class stays vscode-free either way (the real implementation, on
+   * — the CALLBACK REFERENCE is stored once at mint time (unlike
+   * `trackerFactory`, WS-CK-A6 prep made that one re-invoked on every
+   * `.tracker` access — this one is still invoked once PER
+   * `refreshCheckpointsPanel()` call, same as before). Defaults to a no-op so
+   * every EXISTING 2-arg `new RootCoordinator(rootId, trackerFactory)` call
+   * site (this class's own unit tests, `rootRegistry.test.ts`'s 2-arg
+   * `getOrCreate` calls) keeps compiling and behaving identically — this
+   * class stays vscode-free either way (the real implementation, on
    * `ControlDispatcher`, is injected from the vscode-touching host).
    */
   constructor(
     rootId: string,
-    tracker: CheckpointTrackerLike | undefined,
+    private readonly trackerFactory: () => CheckpointTrackerLike | undefined,
     private readonly notifyCheckpointsChanged: () => void = () => {},
   ) {
     this.rootId = rootId;
-    this.tracker = tracker;
   }
 
   tryAcquireTurnLease(sessionId: string): boolean {

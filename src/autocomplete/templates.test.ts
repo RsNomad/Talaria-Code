@@ -26,6 +26,18 @@ function ctx(overrides: Partial<FimContext> = {}): FimContext {
   };
 }
 
+function snippet(overrides: Partial<Parameters<typeof scannedSnippetForTest>[0]> = {}) {
+  return scannedSnippetForTest({
+    uri: 'file:///repo/src/util.ts',
+    filepath: 'src/util.ts',
+    content: 'export function helper() {}',
+    kind: 'recently-opened',
+    startLine: 0,
+    endLine: 1,
+    ...overrides,
+  });
+}
+
 describe('getTemplateForModel — selection', () => {
   it('picks the Qwen2.5-Coder (multifile) template for qwen+coder models', () => {
     const t = getTemplateForModel('qwen2.5-coder:1.5b-base');
@@ -153,6 +165,46 @@ describe('qwenMultifileTemplate — repo-level cross-file assembly', () => {
   });
 });
 
+describe('WV1-MIN-ARCH: empty <|repo_name|> guard (qwenMultifileFimTemplate)', () => {
+  it('WV1-MIN-ARCH: an absent reponame renders the llama.cpp-parity dummy, never an empty <|repo_name|> line', () => {
+    const rendered = qwenMultifileFimTemplate.render('P', 'S', {
+      filepath: 'file:///repo/src/a.ts',
+      languageId: 'typescript',
+      prefix: 'P',
+      suffix: 'S',
+      workspaceUris: ['file:///repo'],
+      snippets: [snippet()], // non-empty ⇒ repo-FIM branch
+    });
+    expect(rendered.startsWith('<|repo_name|>myproject\n')).toBe(true);
+  });
+
+  it('an EMPTY-string reponame gets the same guard', () => {
+    const rendered = qwenMultifileFimTemplate.render('P', 'S', {
+      filepath: 'file:///repo/src/a.ts',
+      languageId: 'typescript',
+      prefix: 'P',
+      suffix: 'S',
+      reponame: '',
+      workspaceUris: ['file:///repo'],
+      snippets: [snippet()],
+    });
+    expect(rendered.startsWith('<|repo_name|>myproject\n')).toBe(true);
+  });
+
+  it('a real reponame renders unchanged (control)', () => {
+    const rendered = qwenMultifileFimTemplate.render('P', 'S', {
+      filepath: 'file:///repo/src/a.ts',
+      languageId: 'typescript',
+      prefix: 'P',
+      suffix: 'S',
+      reponame: 'repo',
+      workspaceUris: ['file:///repo'],
+      snippets: [snippet()],
+    });
+    expect(rendered.startsWith('<|repo_name|>repo\n')).toBe(true);
+  });
+});
+
 // ── Task 16 (08 §11, ADR-010) ────────────────────────────────────────────────
 describe('isKnownFimModel', () => {
   it('is true for every branch of the existing match chain', () => {
@@ -198,5 +250,23 @@ describe('isKnownFimModel', () => {
   it('G-14: qwen+coder always resolves to the multifile template — there is no second Qwen template to edit by mistake', () => {
     expect(getTemplateForModel('qwen2.5-coder:1.5b-base')).toBe(qwenMultifileFimTemplate);
     expect(getTemplateForModel('qwen2.5-coder:7b-base')).toBe(qwenMultifileFimTemplate);
+  });
+});
+
+describe('WV3-MIN-SYN: template stop lists are frozen (mutable-export class)', () => {
+  const all = [
+    qwenMultifileFimTemplate,
+    starcoder2FimTemplate,
+    stableCodeFimTemplate,
+    codestralFimTemplate,
+    codeLlamaFimTemplate,
+    deepseekFimTemplate,
+    codegemmaFimTemplate,
+    holeFillerTemplate,
+  ];
+  it('all 8 singleton stop arrays are frozen', () => {
+    for (const t of all) {
+      expect(Object.isFrozen(t.stop)).toBe(true);
+    }
   });
 });

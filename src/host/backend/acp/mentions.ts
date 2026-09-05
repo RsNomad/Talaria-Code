@@ -1,5 +1,6 @@
 import type { ResolvedContext } from '../../context/types';
 import type { AcpOutboundContentBlock } from './types';
+import type { PromptDegradeCaps } from './promptCaps';
 
 /**
  * Pure mapper: `ResolvedContext[]` → outbound ACP content blocks (§2a/§3.1).
@@ -17,7 +18,7 @@ import type { AcpOutboundContentBlock } from './types';
  * - A ref that is neither `linkOnly` nor carries `text` (and isn't skipped)
  *   emits no block either — there's nothing to send.
  */
-export function mentionBlocks(resolved: ResolvedContext[]): AcpOutboundContentBlock[] {
+export function mentionBlocks(resolved: ResolvedContext[], promptCaps: PromptDegradeCaps): AcpOutboundContentBlock[] {
   const blocks: AcpOutboundContentBlock[] = [];
 
   for (const item of resolved) {
@@ -29,6 +30,13 @@ export function mentionBlocks(resolved: ResolvedContext[]): AcpOutboundContentBl
     }
 
     if (item.text !== undefined) {
+      if (promptCaps.degradeEmbeddedResources) {
+        // A-03 degrade (INACTIVE vs pinned Hermes — promptCaps.ts): ambient
+        // context text goes as a plain text block headed by the ref's
+        // display title (the synthetic uri is not fetchable anyway).
+        blocks.push({ type: 'text', text: `[${item.title}]\n${item.text}` });
+        continue;
+      }
       blocks.push({
         type: 'resource',
         resource: { uri: item.uri, mimeType: 'text/plain', text: item.text },

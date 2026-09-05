@@ -715,3 +715,43 @@ describe('the mint is the only ScannedNextEditRequest source', () => {
     expect(offenders).not.toContain('backends/__next_cast_probe__.ts');
   });
 });
+
+describe('CA-M13 — quarantine cap + LRU eviction', () => {
+  // Reuses this file's existing `candidate()` builder — a rejected fixture
+  // (PEM header, already used across the quarantine block above) and a
+  // clean fixture (plain benign body, same as the "clearQuarantine
+  // re-enables ingestion" tests above), each pinned to a caller-supplied uri.
+  function rejectedCandidateFor(uri: string): IngestCandidate {
+    return candidate({ uri, content: '-----BEGIN PRIVATE KEY-----' });
+  }
+
+  function cleanCandidateFor(uri: string): IngestCandidate {
+    return candidate({ uri, content: 'clean content, nothing sensitive' });
+  }
+
+  it('evicts the least-recently-HIT uri past the cap; the evicted uri is scanned again (and re-quarantines) instead of being skip-dropped', () => {
+    const rb = new RingBuffer();
+    // Quarantine MAX_QUARANTINED_URIS distinct uris (each via one rejected ingest).
+    for (let i = 0; i < 512; i++) {
+      rb.ingest(rejectedCandidateFor(`file:///w/secret-${i}.ts`), ACTIVE_URI, DEFAULT_ANCHOR);
+    }
+    // Refresh uri 0 by hitting its quarantine (a dropped ingest).
+    rb.ingest(cleanCandidateFor('file:///w/secret-0.ts'), ACTIVE_URI, DEFAULT_ANCHOR);
+    // One more NEW quarantined uri => evicts the LRU (uri 1, not the refreshed uri 0).
+    rb.ingest(rejectedCandidateFor('file:///w/secret-512.ts'), ACTIVE_URI, DEFAULT_ANCHOR);
+
+    // uri 0 (refreshed) is still quarantined: a clean window from it still drops.
+    const epochBefore = rb.currentEpoch();
+    rb.ingest(cleanCandidateFor('file:///w/secret-0.ts'), ACTIVE_URI, DEFAULT_ANCHOR);
+    expect(rb.currentEpoch()).toBe(epochBefore);
+
+    // uri 1 (evicted) is scanned again: a CLEAN window from it now mints…
+    rb.ingest(cleanCandidateFor('file:///w/secret-1.ts'), ACTIVE_URI, DEFAULT_ANCHOR);
+    expect(rb.currentEpoch()).toBe(epochBefore + 1);
+    // …and an offending window from it re-quarantines at the scan (authority intact).
+    rb.ingest(rejectedCandidateFor('file:///w/secret-1.ts'), ACTIVE_URI, DEFAULT_ANCHOR);
+    const epochAfter = rb.currentEpoch();
+    rb.ingest(cleanCandidateFor('file:///w/secret-1.ts'), ACTIVE_URI, DEFAULT_ANCHOR);
+    expect(rb.currentEpoch()).toBe(epochAfter); // dropped again — re-quarantined
+  });
+});

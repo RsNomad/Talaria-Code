@@ -25,6 +25,9 @@ import type { McpTestResult, McpCatalogData, HubPreview, HubScan } from '../../s
  *   `{ok, name, enabled}` (`:13087-13116`).
  * - `GET  /api/status` → 200 liveness probe, PUBLIC (no token) even non-loopback
  *   (`dashboard_auth/public_paths.py`) — used as the adopt/health probe.
+ * - `PUT    /api/env` body `{key, value}` → `{ok, key}`; 400 invalid/denylisted name (`:5895-5909`).
+ * - `GET    /api/env` → `{[name]: {is_set, redacted_value, …}}` (`:5832-5892`).
+ * - `DELETE /api/env` body `{key}` → `{ok, key}` | 404 (`:6014-6031`).
  *
  * ## Auth & the loopback Host-guard (`web_server.py:389-393,455-472`)
  * A loopback bind (127.0.0.1/localhost/::1) needs **no token**: `should_require_auth`
@@ -133,6 +136,21 @@ export interface AdoptableDashboardClient extends DashboardClientLike {
  * T2 skill-admin members (`createSkill`, `previewHubSkill`, `scanHubSkill`,
  * `installHubSkill`, `uninstallHubSkill`) added by task B2.
  */
+/**
+ * AU-59: one `GET /api/env` row (`web_server.py` `get_env_vars` → `_row`).
+ * The ONLY field this client's consumers read is `is_set` — `bool(value)` of
+ * the ON-DISK `~/.hermes/.env` entry (`load_env()` reads the FILE, mtime-
+ * memoised and invalidated by every writer), so a managed-mode no-op write
+ * shows up here as `is_set:false`. Every other row field (`redacted_value` —
+ * already masked server-side, `description`, `url`, `category`, `is_password`,
+ * `tools`, `advanced`, `channel_managed`, `provider`, `provider_label`,
+ * `custom`) is tolerated and ignored (ADR-BG shallow guard: exactly the
+ * fields the consumer reads).
+ */
+export interface DashboardEnvRow {
+  is_set: boolean;
+}
+
 export interface DashboardAdminClient {
   /** `POST /api/mcp/servers` (`web_server.py:10410-10452`). */
   addMcpServer(body: {
@@ -173,6 +191,32 @@ export interface DashboardAdminClient {
   installHubSkill(identifier: string): Promise<{ ok: boolean; name: string }>;
   /** `POST /api/skills/hub/uninstall` body `{name}` (`:11802-11818`). */
   uninstallHubSkill(name: string): Promise<{ ok: boolean; name: string }>;
+  /**
+   * AU-59: `PUT /api/env` body `{key, value}` → `{ok:true, key}`
+   * (`web_server.py` `set_env_var` → `save_env_value`, `hermes_cli/config.py`).
+   * 400 `{detail}` for a name outside `^[A-Za-z_][A-Za-z0-9_]*$` or on the
+   * writer denylist (`_ENV_VAR_NAME_DENYLIST`: PATH/LD_PRELOAD/PYTHONPATH/
+   * EDITOR/HERMES_HOME…); 500 otherwise. ⚠ Managed/container mode
+   * (`is_managed()`, or `managed_scope.is_env_managed(key)`): `save_env_value`
+   * prints and RETURNS without writing, and the route still answers
+   * `{ok:true}` — callers MUST confirm presence via {@link listEnvKeys}
+   * (Layer 6). `value` is sent ONCE, here, in the JSON body over loopback;
+   * this client never logs a request body (its non-2xx log line carries the
+   * server's `{detail}`, which names the KEY only). `save_env_value` also
+   * strips CR/LF and non-ASCII silently — the caller gates the value first
+   * (`checkSecretValue`).
+   */
+  setEnvVar(key: string, value: string): Promise<{ ok: boolean; key: string }>;
+  /** AU-59: `GET /api/env` → `{ [VAR_NAME]: DashboardEnvRow }` — every catalogued var plus every custom key present in `~/.hermes/.env` (`custom:true`, masked). */
+  listEnvKeys(): Promise<Record<string, DashboardEnvRow>>;
+  /**
+   * AU-59: `DELETE /api/env` body `{key}` → `{ok:true, key}`; 404 when the key
+   * is not in `.env` (also what managed mode returns — `remove_env_value`
+   * → False); 400 for an invalid name (`web_server.py` `remove_env_var`).
+   * Rejects on non-2xx like {@link removeMcpServer}; compensation callers
+   * treat a rejection as log-only.
+   */
+  removeEnvVar(key: string): Promise<{ ok: boolean; key: string }>;
 }
 
 /** Structural check: does this client expose the {@link DashboardAdminClient} admin surface? */
@@ -192,7 +236,10 @@ export function hasDashboardAdmin(c: unknown): c is DashboardAdminClient {
     typeof o.previewHubSkill === 'function' &&
     typeof o.scanHubSkill === 'function' &&
     typeof o.installHubSkill === 'function' &&
-    typeof o.uninstallHubSkill === 'function'
+    typeof o.uninstallHubSkill === 'function' &&
+    typeof o.setEnvVar === 'function' &&
+    typeof o.listEnvKeys === 'function' &&
+    typeof o.removeEnvVar === 'function'
   );
 }
 
@@ -349,7 +396,7 @@ export class HermesDashboardClient implements AdoptableDashboardClient, Dashboar
     // Server probe window is >= 315s (browser OAuth consent); 340s leaves margin.
     return this.json('POST', `/api/mcp/servers/${encodeURIComponent(name)}/auth`, undefined, {
       timeoutMs: 340_000,
-      signal,
+      ...(signal !== undefined ? { signal } : {}),
     });
   }
 
@@ -395,6 +442,23 @@ export class HermesDashboardClient implements AdoptableDashboardClient, Dashboar
     return this.json('POST', '/api/skills/hub/uninstall', { name });
   }
 
+  // --- AU-59: Hermes .env store (secret env for manual MCP adds) ------------
+
+  setEnvVar(key: string, value: string): Promise<{ ok: boolean; key: string }> {
+    return this.json('PUT', '/api/env', { key, value });
+  }
+
+  listEnvKeys(): Promise<Record<string, DashboardEnvRow>> {
+    return this.json('GET', '/api/env');
+  }
+
+  removeEnvVar(key: string): Promise<{ ok: boolean; key: string }> {
+    // `DELETE` WITH a JSON body — the route reads `EnvVarDelete{key}` from the
+    // body, not the path (mirrors `apps/desktop/src/hermes.ts` `removeEnvVar`);
+    // fetch permits a body on DELETE (only GET/HEAD forbid one).
+    return this.json('DELETE', '/api/env', { key });
+  }
+
   // --- internals -------------------------------------------------------------
 
   private headers(hasBody: boolean): Record<string, string> {
@@ -421,7 +485,7 @@ export class HermesDashboardClient implements AdoptableDashboardClient, Dashboar
     return this.fetchImpl(`${this.base}${path}`, {
       method,
       headers: this.headers(hasBody),
-      body: hasBody ? JSON.stringify(body) : undefined,
+      ...(hasBody ? { body: JSON.stringify(body) } : {}),
       signal,
     });
   }

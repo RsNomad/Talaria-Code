@@ -358,6 +358,10 @@ describe('fetchPanel controller — catch-on-invoke + retry (Part X2)', () => {
  */
 describe('resolvePanelRequest — P7-N4: every DataPanel resolves its EXACT pre-existing scope key + params (behavior-preserving)', () => {
   const tab = { tabId: 'tab-1', sessionId: 'session-1', rootId: '/workspace/root-a' };
+  // exactOptional prep (arm 4): an "unbound tab" fixture must omit sessionId
+  // entirely (absent), never carry it as an explicit `undefined` — mirrors
+  // PanelRequestTab.sessionId's own `?: string` (no `| undefined`).
+  const unboundTab = { tabId: 'tab-1', rootId: '/workspace/root-a' };
 
   it('subagents: scopeKey = the owning tab id; params carry sessionId when bound', () => {
     expect(resolvePanelRequest('subagents', tab)).toEqual({
@@ -368,7 +372,7 @@ describe('resolvePanelRequest — P7-N4: every DataPanel resolves its EXACT pre-
   });
 
   it('subagents: an unbound tab (no sessionId) omits the sessionId param but still carries scopeKey', () => {
-    expect(resolvePanelRequest('subagents', { ...tab, sessionId: undefined })).toEqual({
+    expect(resolvePanelRequest('subagents', unboundTab)).toEqual({
       scopeKey: 'tab-1',
       rejectTag: 'tab-1',
       params: { panel: 'subagents' },
@@ -386,7 +390,7 @@ describe('resolvePanelRequest — P7-N4: every DataPanel resolves its EXACT pre-
     expect(resolvePanelRequest('sessions', tab)).toEqual({
       params: { panel: 'sessions', sessionId: 'session-1' },
     });
-    expect(resolvePanelRequest('sessions', { ...tab, sessionId: undefined })).toEqual({
+    expect(resolvePanelRequest('sessions', unboundTab)).toEqual({
       params: { panel: 'sessions' },
     });
   });

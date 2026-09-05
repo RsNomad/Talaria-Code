@@ -10,9 +10,10 @@
  * `force: true`) rather than ever silently retrying — the data-loss guard
  * the tracker's own review fought for must not be bypassed from the UI.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 import type { Checkpoint, CheckpointPhase, CheckpointRestoreResult, CheckpointsData } from '../protocol';
 import { busyInteraction } from '../components/busyInteraction';
+import { ConfirmStrip } from '../components/ConfirmStrip';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
@@ -123,6 +124,45 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
   const [redoBlocked, setRedoBlocked] = useState<{ kind: RedoKind; reason: string } | undefined>(undefined);
   const [redoDone, setRedoDone] = useState<RedoKind | undefined>(undefined);
   const [redoSkipped, setRedoSkipped] = useState<{ kind: RedoKind; paths: string[] } | undefined>(undefined);
+
+  /**
+   * A11Y-07 (task-9-brief.md): `ConfirmStrip`'s `returnFocus` target for each
+   * of the three strips this task adopts. `restoringId`/`confirming`/`blocked`
+   * are panel-scoped scalars (not per-row), so ONE ref per trigger — same
+   * shape as `GatewayHealthBanner`'s `reconnectRef` — covers every row: at
+   * most one row's Restore button is ever the live trigger at a time. Redo
+   * and Redo-all get separate refs because `redoBlocked` can name either
+   * kind, and `returnFocus` must land back on the SPECIFIC button that
+   * opened the strip, not always the same one.
+   */
+  const restoreTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const redoTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const redoAllTriggerRef = useRef<HTMLButtonElement | null>(null);
+
+  /**
+   * A11Y-07 continuation: unlike `GatewayHealthBanner`'s always-mounted
+   * "Force reconnect" trigger (its `ConfirmStrip` appends AS A SIBLING),
+   * every trigger here — the row's Restore button, Redo, Redo-all — is
+   * REPLACED by its strip (the block/confirming/idle and
+   * redoBlocked/idle ternaries above are mutually exclusive), so it is
+   * UNMOUNTED for as long as the strip is open. `ConfirmStrip` calls
+   * `returnFocus` SYNCHRONOUSLY inside its own confirm/cancel/Escape
+   * handlers — before React has committed the re-render that would remount
+   * the trigger — so a plain `triggerRef.current?.focus()` reads a `null`
+   * ref at that instant and silently does nothing. `pendingFocusRef` defers:
+   * `returnFocus` only ARMS it with which ref to focus once something
+   * remounts, and this bare (no-dep) effect — the same "the remount can land
+   * on ANY later commit" shape as `useFocusAnchorOnUnmount` — runs after
+   * EVERY commit and focuses the target the first time it exists again.
+   */
+  const pendingFocusRef = useRef<RefObject<HTMLButtonElement | null> | null>(null);
+  useEffect(() => {
+    const target = pendingFocusRef.current;
+    if (target?.current) {
+      target.current.focus();
+      pendingFocusRef.current = null;
+    }
+  });
 
   /**
    * CF-12 review fix, IMP-1: this panel is NOT remounted on a tab/root
@@ -322,39 +362,22 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
           </div>
 
           {redoBlocked ? (
-            <div className="mt-1.5 rounded border border-warn bg-warn-soft px-2 py-1.5">
-              <div className="flex items-start gap-1.5 text-2xs text-fg">
-                <Icon name="warning" size={12} className="mt-0.5 flex-none text-warn" />
-                <span>{redoBlocked.reason}</span>
-              </div>
-              <div className="mt-1.5 flex gap-2">
-                <button
-                  type="button"
-                  disabled={redoInteraction.nativeDisabled}
-                  aria-disabled={redoInteraction.ariaDisabled}
-                  aria-busy={redoInteraction.ariaBusy}
-                  onClick={() => {
-                    // AU-40: belt-and-suspenders — `runRedo` already guards
-                    // `if (redoPending !== undefined) return;` itself.
-                    if (!redoInteraction.interactive) return;
-                    runRedo(redoBlocked.kind, true);
-                  }}
-                  className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay aria-disabled:cursor-default aria-disabled:opacity-50"
-                >
-                  {redoBlocked.kind === 'redo' ? 'Redo anyway' : 'Redo all anyway'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setRedoBlocked(undefined)}
-                  className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay"
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
+            <ConfirmStrip
+              className="mt-1.5"
+              ariaLabel="Redo was blocked"
+              message={redoBlocked.reason}
+              confirmLabel={redoBlocked.kind === 'redo' ? 'Redo anyway' : 'Redo all anyway'}
+              onConfirm={() => runRedo(redoBlocked.kind, true)}
+              onCancel={() => setRedoBlocked(undefined)}
+              confirmBusy={redoPending !== undefined}
+              returnFocus={() => {
+                pendingFocusRef.current = redoBlocked.kind === 'redo' ? redoTriggerRef : redoAllTriggerRef;
+              }}
+            />
           ) : (
             <div className="mt-1.5 flex items-center gap-2">
               <button
+                ref={redoTriggerRef}
                 type="button"
                 disabled={redoInteraction.nativeDisabled}
                 aria-disabled={redoInteraction.ariaDisabled}
@@ -368,6 +391,7 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
                 Redo
               </button>
               <button
+                ref={redoAllTriggerRef}
                 type="button"
                 disabled={redoInteraction.nativeDisabled}
                 aria-disabled={redoInteraction.ariaDisabled}
@@ -405,7 +429,12 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
           )}
         </div>
       )}
-      <ol className="relative m-0 list-none p-0">
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): explicit `role="list"`/`role="listitem"`
+          alongside the native `<ol>`/`<li>` — `list-none` above strips the
+          native list SEMANTICS in some browsers/AT (WebKit/VoiceOver) unless
+          the role is stated explicitly, so the implicit tag-based mapping
+          alone is not enough here. */}
+      <ol role="list" className="relative m-0 list-none p-0">
         {data.checkpoints.map((cp, i) => {
           const last = i === data.checkpoints.length - 1;
           const latest = i === 0;
@@ -446,7 +475,7 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
                 : '';
           const rowStatusClass = restoringId === cp.id ? 'text-2xs text-muted' : 'text-2xs text-fg';
           return (
-            <li key={cp.id} className="relative flex gap-3 pb-3">
+            <li key={cp.id} role="listitem" className="relative flex gap-3 pb-3">
               {/* timeline rail */}
               <div className="flex flex-none flex-col items-center">
                 <Icon
@@ -499,72 +528,35 @@ export function CheckpointsPanel({ data, onRestore, onRedo, onRedoAll }: Checkpo
                 </div>
 
                 {block ? (
-                  <div className="mt-2 rounded border border-warn bg-warn-soft px-2 py-1.5">
-                    <div className="flex items-start gap-1.5 text-2xs text-fg">
-                      <Icon name="warning" size={12} className="mt-0.5 flex-none text-warn" />
-                      <span>{block.reason}</span>
-                    </div>
-                    <div className="mt-1.5 flex gap-2">
-                      <button
-                        type="button"
-                        disabled={restoreInteraction.nativeDisabled}
-                        aria-disabled={restoreInteraction.ariaDisabled}
-                        aria-busy={restoreInteraction.ariaBusy}
-                        onClick={() => {
-                          // AU-40: belt-and-suspenders — `confirmRestore`
-                          // already guards `if (restoringId !== undefined)
-                          // return;` itself.
-                          if (!restoreInteraction.interactive) return;
-                          confirmRestore(cp.id, true);
-                        }}
-                        className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay aria-disabled:cursor-default aria-disabled:opacity-50"
-                      >
-                        Restore anyway
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setBlocked(undefined)}
-                        className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
+                  <ConfirmStrip
+                    className="mt-2"
+                    ariaLabel="Restore was blocked"
+                    message={block.reason}
+                    confirmLabel="Restore anyway"
+                    onConfirm={() => confirmRestore(cp.id, true)}
+                    onCancel={() => setBlocked(undefined)}
+                    confirmBusy={restoringId !== undefined}
+                    returnFocus={() => {
+                      pendingFocusRef.current = restoreTriggerRef;
+                    }}
+                  />
                 ) : confirming === cp.id ? (
-                  <div className="mt-2 rounded border border-warn bg-warn-soft px-2 py-1.5">
-                    <div className="flex items-start gap-1.5 text-2xs text-fg">
-                      <Icon name="warning" size={12} className="mt-0.5 flex-none text-warn" />
-                      <span>
-                        This will overwrite your working tree with the files as they were at this
-                        checkpoint. Uncommitted changes made since then are lost.
-                      </span>
-                    </div>
-                    <div className="mt-1.5 flex gap-2">
-                      <button
-                        type="button"
-                        disabled={restoreInteraction.nativeDisabled}
-                        aria-disabled={restoreInteraction.ariaDisabled}
-                        aria-busy={restoreInteraction.ariaBusy}
-                        onClick={() => {
-                          if (!restoreInteraction.interactive) return;
-                          confirmRestore(cp.id);
-                        }}
-                        className="rounded border border-warn px-2 py-0.5 font-mono text-2xs text-warn hover:bg-overlay disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
-                      >
-                        Restore workspace
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConfirming(undefined)}
-                        className="rounded border border-border px-2 py-0.5 font-mono text-2xs text-muted hover:bg-overlay"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
+                  <ConfirmStrip
+                    className="mt-2"
+                    ariaLabel="Confirm restore"
+                    message="This will overwrite your working tree with the files as they were at this checkpoint. Uncommitted changes made since then are lost."
+                    confirmLabel="Restore workspace"
+                    onConfirm={() => confirmRestore(cp.id)}
+                    onCancel={() => setConfirming(undefined)}
+                    confirmBusy={restoringId !== undefined}
+                    returnFocus={() => {
+                      pendingFocusRef.current = restoreTriggerRef;
+                    }}
+                  />
                 ) : (
                   <div className="mt-2 flex items-center gap-2">
                     <button
+                      ref={restoreTriggerRef}
                       type="button"
                       disabled={restoreInteraction.nativeDisabled}
                       aria-disabled={restoreInteraction.ariaDisabled}

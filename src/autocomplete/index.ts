@@ -12,12 +12,16 @@ import {
   shouldClearLegacyApiKeySetting,
 } from './apiKey';
 import { isLoopbackHost } from './backends/secureTransport';
+import { makeFimEgressGuard, isLoopbackFimEndpoint } from './egressScan';
+import { createEgressNoticeSurface } from './egressNotice.vscode';
+import type { EgressVerdictObserver } from './engine';
 import { getTemplateForModel } from './templates';
 import { crossFileMode } from './context/mode';
 import { createHermesCrossFileContextService } from './context/contextService.vscode';
 import { createVsCodeNextEditConfigPort, NextEditGuard } from './nextedit/guard';
 import { fimActivityRelay, registerTalariaNextEdit, requestNextEditToggle } from './nextedit/shell.vscode';
 import type { NextEditShellDeps } from './nextedit/shell.vscode';
+import { createNextEditNoticeSurface } from './nextedit/nextEditNotice.vscode';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
 import type { BackendCapabilities, FimBackend, FimTemplate } from './types';
 
@@ -61,6 +65,16 @@ function endpointHost(rawUrl: string): string {
 }
 
 /**
+ * BHF-F3-6 — liveness token for the two async API-key reads (activation
+ * `initApiKey`, rotation re-read), the `SessionController.modelSwitchSeq`
+ * idiom: each read captures `++keyRefreshSeq` AT ISSUE TIME and applies
+ * (`secretApiKey = …; rebuild()`) only while still current. The rotation
+ * listener's read, issued later, therefore always outranks a slower
+ * activation read — one winner assigns AND rebuilds; losers no-op.
+ */
+let keyRefreshSeq = 0;
+
+/**
  * Frozen public entry (Zone AC) — the controller wires this
  * into `extension.ts`. Reads its own config from
  * `vscode.workspace.getConfiguration('talaria.autocomplete')`.
@@ -92,7 +106,16 @@ export function registerTalariaAutocomplete(
   // refreshed on change. Until it resolves, the engine uses whatever legacy
   // setting value `cfg.apiKey` carries (back-compat).
   let secretApiKey: string | undefined;
-  let built = buildEngine(cfg, secretApiKey);
+  // CA-06-face: ONE surface per activation. The observer is threaded only
+  // for a non-loopback endpoint, decided by the SAME classifier the guard
+  // factory uses (`isLoopbackFimEndpoint`) — no drift possible between
+  // "the guard scans" and "the surface is wired". This gates the ENGINE
+  // (content) thread ONLY — the provider's path thread is wired
+  // unconditionally at the provider construction below (9(f)).
+  const egressNotice = createEgressNoticeSurface();
+  const egressObserverFor = (endpoint: string): EgressVerdictObserver | undefined =>
+    isLoopbackFimEndpoint(endpoint) ? undefined : egressNotice.onEgressVerdict;
+  let built = buildEngine(cfg, secretApiKey, egressObserverFor(cfg.endpoint));
   let engine = built.engine;
   // S4.3: recomputed alongside `engine` on every rebuild (config change), so a
   // changed `talaria.autocomplete.endpoint` is reflected immediately. Workspace
@@ -126,27 +149,32 @@ export function registerTalariaAutocomplete(
       getWarmUpEnabled: () => cfg.crossFile.warmUp,
     });
 
-  const provider = new TalariaInlineCompletionProvider(
-    () => engine,
-    () => cfg.enabled,
-    () => remote && !vscode.workspace.isTrusted,
+  const provider = new TalariaInlineCompletionProvider({
+    getEngine: () => engine,
+    getEnabled: () => cfg.enabled,
+    getSkipUntrustedRemote: () => remote && !vscode.workspace.isTrusted,
     contextService,
     // A5: live closures over the mutable `cfg` binding below (reassigned by
     // `onDidChangeConfiguration`), same posture as `getEnabled` above.
-    () => cfg.backend,
-    () => endpointHost(cfg.endpoint),
+    getBackendName: () => cfg.backend,
+    getEndpointHost: () => endpointHost(cfg.endpoint),
     // F-B: same live-closure posture — reads `talaria.autocomplete.model`
     // fresh on every failure so the 404 arm's message always names the
     // currently-configured model, not a stale one from a prior rebuild.
-    () => cfg.model,
+    getModelName: () => cfg.model,
     reportFailure,
     // W5.1 Task 12 (R2/R4): the next-edit observation seam. `fimActivityRelay`
     // is a fixed forwarding address — a no-op until `registerTalariaNextEdit`
     // below attaches to it, and a no-op again after it disposes. Passing it
     // unconditionally keeps the provider's construction independent of
     // whether next-edit registered successfully.
-    fimActivityRelay,
-  );
+    fimActivity: fimActivityRelay,
+    // CA-06-path-face: the path-skip notice thread — UNCONDITIONAL, the
+    // deliberate contrast with egressObserverFor above: the S4.1 secret-path
+    // gate fires regardless of endpoint locality, so its face must too. The
+    // surface renders 'path-block' as an Information badge with no toast.
+    onEgressVerdict: egressNotice.onEgressVerdict,
+  });
 
   const providerDisposable = vscode.languages.registerInlineCompletionItemProvider(
     { pattern: '**' },
@@ -162,7 +190,11 @@ export function registerTalariaAutocomplete(
     // would miss this rebuild's own chance to re-warn on a still-broken (or
     // newly re-broken) config, and only catch up one rebuild late.
     clearBackendFactoryWarnings();
-    built = buildEngine(cfg, secretApiKey);
+    // CA-06-face: a rebuild is an epoch boundary — the endpoint may have
+    // changed. Clear badges and re-arm the one-shot toasts (the same
+    // clearSurfacedAutocompleteFailures re-arm posture used just below).
+    egressNotice.reset();
+    built = buildEngine(cfg, secretApiKey, egressObserverFor(cfg.endpoint));
     engine = built.engine;
     remote = !isLoopbackEndpoint(cfg.endpoint);
     // A5: re-arm every surfaced-once failure warning on every rebuild (config
@@ -183,8 +215,12 @@ export function registerTalariaAutocomplete(
   };
 
   // Load (and one-time migrate) the API key from SecretStorage.
+  const initSeq = ++keyRefreshSeq; // F3-6: captured at ISSUE time
   void initApiKey(context, cfg.apiKey).then(
     (key) => {
+      // F3-6: a rotation read issued after us owns the state now — do not
+      // overwrite the fresher key with this slower read's result.
+      if (initSeq !== keyRefreshSeq) return;
       secretApiKey = key;
       rebuild();
     },
@@ -228,8 +264,10 @@ export function registerTalariaAutocomplete(
   // another window) without a reload.
   const secretDisposable = context.secrets.onDidChange((e) => {
     if (e.key !== AUTOCOMPLETE_API_KEY_SECRET) return;
+    const seq = ++keyRefreshSeq; // F3-6: captured at ISSUE time
     void context.secrets.get(AUTOCOMPLETE_API_KEY_SECRET).then(
       (key) => {
+        if (seq !== keyRefreshSeq) return; // superseded — the newer read owns the state
         secretApiKey = key ?? undefined;
         rebuild();
       },
@@ -269,6 +307,11 @@ export function registerTalariaAutocomplete(
   let nextEditDisposable: vscode.Disposable | undefined;
   let nextEditGuard: NextEditGuard | undefined;
   let nextEditTornDown = false;
+  // CA-06-NE-face: ONE notice surface per activation, wired UNCONDITIONALLY —
+  // the next-edit gates scan regardless of endpoint locality (unlike FIM's
+  // CA-06), so the observer mirrors the gate it observes. Inert while
+  // talaria.nextEdit.source is 'off' (GATE 1 precedes every notify site).
+  const nextEditNotice = createNextEditNoticeSurface();
   // Hoisted so the toggle port below and `registerTalariaNextEdit` share ONE
   // deps object: `requestNextEditToggle`'s Generic refusal must be decided
   // against exactly the FIM backend the runtime path would use, never a
@@ -286,6 +329,7 @@ export function registerTalariaAutocomplete(
     // `context.secrets.onDidChange` subscription above, so rotation reaches
     // Generic with no reload and nothing new is loaded, watched, or stored.
     getAutocompleteApiKey: () => pickApiKey(secretApiKey, cfg.apiKey),
+    onEgressVerdict: nextEditNotice.onEgressVerdict,
   };
   void NextEditGuard.hydrate(createVsCodeNextEditConfigPort(), { reportFailure }).then(
     (guard) => {
@@ -325,11 +369,13 @@ export function registerTalariaAutocomplete(
     secretDisposable,
     setKeyCommand,
     contextServiceDisposable,
+    egressNotice,
     {
       dispose: () => {
         nextEditTornDown = true;
         nextEditDisposable?.dispose();
         nextEditGuard?.dispose();
+        nextEditNotice.dispose();
       },
     },
   );
@@ -467,9 +513,10 @@ interface BuiltEngine {
 function buildEngine(
   cfg: HermesAutocompleteConfig,
   secretApiKey: string | undefined,
+  onEgressVerdict?: EgressVerdictObserver,
 ): BuiltEngine {
   const apiKey = pickApiKey(secretApiKey, cfg.apiKey);
-  const backend = createBackend({ ...cfg, apiKey });
+  const backend = createBackend({ ...cfg, ...(apiKey !== undefined ? { apiKey } : {}) });
   const template = getTemplateForModel(cfg.model);
   // §4.2 — the crossFileMode predicate gates gathering (R6) and tells the
   // engine which assembly path applies (comment-inject is the only one the
@@ -498,6 +545,17 @@ function buildEngine(
     },
     cache: new InMemoryCompletionCache(),
     debouncer: new AutocompleteDebouncer(),
+    // CA-06: classified once per build — cfg.endpoint is already the RESOLVED
+    // egress destination (readConfig substitutes the backend's default when
+    // the raw setting is empty/invalid, and every backend receives
+    // `apiBase: cfg.endpoint` from backendFactory), so this string IS where
+    // streamFim will POST.
+    checkEgress: makeFimEgressGuard(cfg.endpoint),
+    // CA-06-face: present ONLY for non-loopback endpoints (the caller omits
+    // it otherwise) — the default local path never carries the callback.
+    // This gates the ENGINE (content) thread ONLY — the provider's path
+    // thread is wired unconditionally at the provider construction (9(f)).
+    ...(onEgressVerdict !== undefined ? { onEgressVerdict } : {}),
   });
 
   return { engine, capabilities: backend.capabilities, template, backend };

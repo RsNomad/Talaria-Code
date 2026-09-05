@@ -47,7 +47,7 @@ export function mapDiagnosticEntries(
       severity: e.severity === errorSeverity ? 'error' : 'warning',
       line: e.line + 1,
       message: e.message,
-      source: e.source,
+      ...(e.source !== undefined ? { source: e.source } : {}),
     });
   }
   return rows;

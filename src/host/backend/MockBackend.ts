@@ -14,7 +14,7 @@ import type {
 import { CONTROL_METHODS, makePanelData } from '../../shared/protocol';
 import { mockScenario } from '../../shared/mockScenario';
 import type { MockScenario, MockStep } from '../../shared/mockScenario';
-import { AgentBackend } from './AgentBackend';
+import type { AgentBackend } from './AgentBackend';
 
 /**
  * W4 §2d/§7 B12: the host `MockBackend` auto-binds ONE session at startup so

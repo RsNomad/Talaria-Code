@@ -1,7 +1,5 @@
 import * as vscode from 'vscode';
-import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import * as path from 'node:path';
 import type {
   HostToWebviewMessage,
   AgentMode,
@@ -19,13 +17,21 @@ import { describeError } from '../../shared/errorText';
 // import direction is backend → setup only (`SetupController` itself never
 // imports from `src/host/backend/`, preserving its purity constraint).
 import { computeProviderCard } from '../setup/SetupController';
-import type { CheckpointTrackerLike } from '../checkpoints/trackerContract';
+import type { CheckpointTrackerLike, CheckpointTrackerRegistryLike } from '../checkpoints/trackerContract';
 import type { RootCoordinator } from '../checkpoints/RootCoordinator';
 import { RootRegistry } from '../checkpoints/rootRegistry';
+import {
+  canonicalizeWorkspaceRoot,
+  findContainingWorkspaceRoot,
+} from '../checkpoints/rootResolution';
+import { MULTI_ROOT_CHECKPOINTS } from '../checkpoints/multiRootFlag';
 import type { Logger } from '../transport/JsonRpcStdio';
 import type { ResolvedContext } from '../context/types';
 import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
 import { ControlChannel } from '../control/ControlChannel';
+import { combineGatewayHealth } from '../control/respawnHealth';
+import type { RespawnHealth } from '../control/respawnHealth';
+import { wireGatewayHealth } from './gatewayHealth';
 import { createDefaultPanelSources } from '../panels/PanelSourceRegistry';
 import type {
   PanelSource,
@@ -37,7 +43,7 @@ import {
   DashboardSkillsPanelSource,
   DashboardToolsPanelSource,
 } from '../dashboard/dashboardPanelSources';
-import { AgentBackend } from './AgentBackend';
+import type { AgentBackend } from './AgentBackend';
 import { AcpClient } from './acp/acpClient';
 import type {
   AcpClientFactory,
@@ -67,7 +73,13 @@ import {
   ONESHOT_SESSION_IDS_STORAGE_KEY,
   type WorkspaceStateLike,
 } from './oneshot/OneShotSessionRegistry';
-import { ConnectionSupervisor, type ConnectionSupervisorHostPort, type ReconnectOutcome } from './connection/ConnectionSupervisor';
+import {
+  ConnectionSupervisor,
+  SESSION_ESTABLISH_DEADLINE_MS,
+  type ConnectionSupervisorHostPort,
+  type ReconnectOutcome,
+} from './connection/ConnectionSupervisor';
+import { settleRace } from './connection/settleRace';
 import { ControlDispatcher, type ControlDispatcherHostPort } from './control/ControlDispatcher';
 
 /**
@@ -205,6 +217,10 @@ export class AcpBackend implements AgentBackend {
   private clientAuthMethodsSub: { dispose(): void } | undefined;
 
   private readonly control: ControlChannel;
+
+  /** UX-02 (F2-19 UI face): the combined-push subscription wired in the
+   * constructor — see {@link wireGatewayHealth}. */
+  private readonly gatewayHealthSub: { dispose(): void };
 
   /**
    * W4 §2d: "the most recently opened/loaded session" bookkeeping —
@@ -351,7 +367,7 @@ export class AcpBackend implements AgentBackend {
    * `sendPrompt` see it INSTANTLY) while keeping the removal ITSELF
    * deferred on the tail — ordering safety is unchanged: a close still
    * queues behind an in-flight load rather than interrupting one mid-
-   * `loadReplay`. Read by `ConnectionSupervisor.handleAcpCrash` through the
+   * `loadReplayOutcome`. Read by `ConnectionSupervisor.handleAcpCrash` through the
    * narrow `ConnectionSupervisorHostPort.isPendingClose` predicate (not a
    * broad new port surface — see that member's own doc) and directly by
    * {@link sendPrompt}/{@link handleSessionUpdate} (same class).
@@ -440,6 +456,13 @@ export class AcpBackend implements AgentBackend {
       get: () => undefined,
       update: () => Promise.resolve(),
     },
+    /**
+     * WS-CK-A6: the per-root tracker registry (extension.ts-owned, threaded in
+     * like checkpointTracker above; `undefined` pre-flip and in tests).
+     * Consulted LAZILY per RootCoordinator.tracker access, behind
+     * MULTI_ROOT_CHECKPOINTS — `checkpointTracker` remains the flag-off path.
+     */
+    private readonly trackerRegistry?: CheckpointTrackerRegistryLike,
   ) {
     this.control = new ControlChannel(config, logger);
     // TG-5 (AU-51): seeded from the persisted array (oldest-first,
@@ -456,7 +479,7 @@ export class AcpBackend implements AgentBackend {
       getClient: () => this.connectionSupervisor.getClient(),
       getConnectionCwd: () => this.cwd,
       resolveRoot: (cwd) => this.resolveRootCoordinator(cwd),
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
       recordOneShotSessionId: (id) => this.recordOneShotSessionId(id),
       deleteOneShotSession: (id) => this.deleteOneShotSession(id),
     };
@@ -483,7 +506,7 @@ export class AcpBackend implements AgentBackend {
         this.clientAuthMethodsSub = client.onAuthMethodsChanged?.(() => this.authMethodsEmitter.fire());
         return client;
       },
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
       callbacks: {
         onSessionUpdate: (sessionId, update) => this.handleSessionUpdate(sessionId, update),
         onRequestPermission: (req) => this.handleRequestPermission(req),
@@ -531,6 +554,23 @@ export class AcpBackend implements AgentBackend {
       emit: (msg) => this.emitter.fire(msg),
     };
     this.connectionSupervisor = new ConnectionSupervisor(connectionPort);
+    // UX-02 (F2-19 UI face): both management links feed ONE combined
+    // gateway.health webview push — see gatewayHealth.ts. The log callback
+    // is guarded here (not just in the tracker) because it runs on the
+    // respawn loops' critical path, same rationale as safeLog everywhere
+    // else on that chain.
+    this.gatewayHealthSub = wireGatewayHealth(
+      this.control,
+      this.connectionSupervisor,
+      (msg) => this.emitter.fire(msg),
+      (message) => {
+        try {
+          this.logger?.append(`[AcpBackend] gateway.health: ${message}`);
+        } catch {
+          // A logging failure must never affect control flow.
+        }
+      },
+    );
     this.panelSources = createDefaultPanelSources(this.buildPanelSourceContext());
     // W6-FI-c (3-way ARCH I-4, part 3 of 3): every accessor closes over
     // `this`, read at CALL TIME — mirrors `oneShotPort`/`connectionPort`'s
@@ -540,7 +580,7 @@ export class AcpBackend implements AgentBackend {
     const controlPort: ControlDispatcherHostPort = {
       dispatch: (method, params) => this.control.dispatch(method, params),
       emit: (msg) => this.emitter.fire(msg),
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
       panelSources: this.panelSources,
       sessions: this.sessions,
       rootRegistry: this.rootRegistry,
@@ -606,7 +646,8 @@ export class AcpBackend implements AgentBackend {
     // only when no dashboard is wired. A fetch made while the dashboard is
     // unreachable REJECTS (retryable panel error), never a fake success.
     if (this.dashboard) {
-      const ensure = () => this.dashboard!.ensure();
+      const dashboard = this.dashboard;
+      const ensure = () => dashboard.ensure();
       this.panelSources.register('skills', new DashboardSkillsPanelSource(ensure));
       this.panelSources.register('tools', new DashboardToolsPanelSource(ensure));
     }
@@ -634,10 +675,11 @@ export class AcpBackend implements AgentBackend {
     return {
       getClient: () => this.connectionSupervisor.getClient(),
       emit: (msg) => this.emitter.fire(msg),
-      emitSystemError: (message, detail) => this.emitter.fire({ type: 'system.error', message, detail }),
+      emitSystemError: (message, detail) =>
+        this.emitter.fire({ type: 'system.error', message, ...(detail !== undefined ? { detail } : {}) }),
       root,
       workspaceRoots: () => this.workspaceRoots(),
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
       // W6-FI-c Part 2 (3-way ARCH I-4c, W4-F5 placement fix): this session's
       // OWN root, resolved once at port-build time above — never ambient
       // ("the active controller's root") — now delegates DIRECTLY to that
@@ -649,7 +691,7 @@ export class AcpBackend implements AgentBackend {
       // `ControlDispatcher.refreshCheckpointsPanel`'s own doc for the exact
       // (unchanged) implementation this now runs through.
       refreshCheckpointsPanel: () => root.refreshCheckpointsPanel(),
-      editPreviewRegistry: this.editPreviewRegistry,
+      ...(this.editPreviewRegistry !== undefined ? { editPreviewRegistry: this.editPreviewRegistry } : {}),
       resolveMentions: (mentions) => this.resolveMentionsSafe(mentions),
     };
   }
@@ -685,42 +727,36 @@ export class AcpBackend implements AgentBackend {
     const containingRoot = this.findContainingWorkspaceRoot(cwd);
     const canonicalRoot = this.canonicalizeWorkspaceRoot(containingRoot);
     const primaryRoot = this.canonicalizeWorkspaceRoot(this.workspaceRoots()[0] ?? cwd);
+    // WS-CK-A6 prep: `RootCoordinator.tracker` now re-invokes this thunk on
+    // EVERY access (not just once at mint) — a no-op change for THIS thunk,
+    // since `canonicalRoot`/`primaryRoot` are captures of already-computed
+    // consts and `this.checkpointTracker` is a readonly field, so every
+    // re-evaluation is idempotent (identical result every time).
     return this.rootRegistry.getOrCreate(
       canonicalRoot,
-      () => (canonicalRoot === primaryRoot ? this.checkpointTracker : undefined),
+      // WS-CK-A6 ship gate: registry-backed per-root trackers vs today's
+      // primary-only single tracker. Evaluated per `tracker` ACCESS (Task 11's
+      // lazy getter) over stable captures — idempotent either way.
+      MULTI_ROOT_CHECKPOINTS
+        ? () => this.trackerRegistry?.get(canonicalRoot)
+        : () => (canonicalRoot === primaryRoot ? this.checkpointTracker : undefined),
       () => this.controlDispatcher.refreshCheckpointsPanel(canonicalRoot),
     );
   }
 
-  /** The open workspace folder that CONTAINS `cwd`, or the first folder / `cwd` itself when none contains it (no workspace open — a bare cwd is its own root). */
+  /** The open workspace folder that CONTAINS `cwd`, or the first folder / `cwd` itself when none contains it (no workspace open — a bare cwd is its own root). Delegates to {@link findContainingWorkspaceRoot} (moved to `rootResolution.ts` — WS-CK-A6 prep, so the registry's desired set derives from the SAME resolver). */
   private findContainingWorkspaceRoot(cwd: string): string {
-    const roots = this.workspaceRoots();
-    const firstRoot = roots[0];
-    if (roots.length === 0 || firstRoot === undefined) return cwd;
-    const resolved = path.resolve(cwd || firstRoot);
-    for (const root of roots) {
-      if (isPathWithin(resolved, path.resolve(root))) return root;
-    }
-    return firstRoot;
+    return findContainingWorkspaceRoot(cwd, this.workspaceRoots());
   }
 
   /**
-   * Realpath a workspace root to its canonical form (sync — this keeps
-   * {@link buildSessionPort}/{@link resolveRootCoordinator} synchronous,
-   * matching `tryAcquireTurnLease`'s own synchronous-admission discipline;
-   * called rarely — once per genuinely NEW root, not per-turn). Falls back
-   * to the lexical form on any FS error (a not-yet-existing/unreadable root
-   * still needs a STABLE key). An empty/falsy `root` is returned AS-IS —
-   * never realpath'd — so a degenerate no-cwd caller (headless tests) never
-   * silently resolves to `process.cwd()` via `path.resolve('')`.
+   * Realpath a workspace root to its canonical form. Delegates to
+   * {@link canonicalizeWorkspaceRoot} (moved to `rootResolution.ts` —
+   * WS-CK-A6 prep; ONE canonicalization for both the registry key and the
+   * tracker's constructor arg / shadow-dir hash).
    */
   private canonicalizeWorkspaceRoot(root: string): string {
-    if (!root) return root;
-    try {
-      return realpathSync(path.resolve(root));
-    } catch {
-      return path.resolve(root);
-    }
+    return canonicalizeWorkspaceRoot(root);
   }
 
   /**
@@ -745,7 +781,7 @@ export class AcpBackend implements AgentBackend {
       // TG-5 (AU-51, INV-20): the `sessions` source's exclusion set — see
       // `OneShotSessionRegistry`'s own doc.
       getOneShotSessionIds: () => this.oneShotSessionRegistry.ids(),
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
     };
   }
 
@@ -808,11 +844,22 @@ export class AcpBackend implements AgentBackend {
     return this.connectionSupervisor.getClient()?.getAdvertisedAuthMethods?.();
   }
 
+  /**
+   * UX-02: the combined management-link health, computed FRESH from both
+   * loops' live counters (never a cached transition payload) — the provider
+   * posts this right after every `hydrate` so a re-created webview can't
+   * assume 'ok' through an ongoing outage (the exact late-subscriber gap
+   * `currentHealth()` documents, ControlChannel.ts:180-191).
+   */
+  currentGatewayHealth(): RespawnHealth {
+    return combineGatewayHealth(this.control.currentHealth(), this.connectionSupervisor.currentHealth());
+  }
+
   /** beta.7 B3: thin passthrough to {@link ConnectionSupervisor.reconnect} —
    * see that method's own doc for the full tail-serialized teardown +
    * respawn + re-`initialize()` rationale. */
-  async reconnectAgent(): Promise<ReconnectOutcome> {
-    return this.connectionSupervisor.reconnect();
+  async reconnectAgent(opts?: { force?: boolean }): Promise<ReconnectOutcome> {
+    return this.connectionSupervisor.reconnect(opts);
   }
 
   /**
@@ -871,14 +918,18 @@ export class AcpBackend implements AgentBackend {
    *
    * T-3 (closes B1-M1): `isStaleAttempt`, when supplied, is checked ONCE
    * `client.newSession` resolves — BEFORE `sessions.open`'s registration
-   * has a chance to become visible via `tab.bound`. Only
-   * `ConnectionSupervisor.establishInitialSession`'s bootstrap race passes
-   * one (see its own doc for why the guard has to live HERE rather than at
-   * that call site: this method's register-then-announce runs to
-   * completion synchronously off the SAME microtask `newSession` resolves
-   * into, so by the time control would return to a caller-side check,
-   * `tab.bound` has already fired). `openTab` never passes one — a plain
-   * new-tab mint has no earlier deadline/exit to have been abandoned by.
+   * has a chance to become visible via `tab.bound`. The guard has to live
+   * HERE rather than at either call site: this method's register-then-
+   * announce runs to completion synchronously off the SAME microtask
+   * `newSession` resolves into, so by the time control would return to a
+   * caller-side check, `tab.bound` has already fired. WS-R1 F3-1: BOTH
+   * mints now pass one — `ConnectionSupervisor.establishInitialSession`'s
+   * bootstrap race and `openTabInternal`'s user-tab race each wrap their
+   * `openSession(...)` call in `settleRace(open, { exit, deadline:
+   * SESSION_ESTABLISH_DEADLINE_MS })` and supply `() => attemptAbandoned`
+   * as this argument, so a belated `session/new` for either kind of mint
+   * lands here and is discarded: the orphaned session is closed and no
+   * `tab.bound` is ever announced for it.
    */
   private async openSession(
     cwd: string,
@@ -966,6 +1017,25 @@ export class AcpBackend implements AgentBackend {
   }
 
   private async openTabInternal(tabId: string): Promise<void> {
+    // WS-SL F3-5: per-tabId occupant dedup — the mint path's missing guard
+    // (its load sibling already dedups per-sessionId at the registry, W6-FB).
+    // A double-fired `tab.open` (webview retry affordances, replayed posts)
+    // would otherwise mint a SECOND session for the same tab: the first
+    // controller leaks and `getByTabId` (first-match) diverges from the
+    // webview's binding (last `tab.bound`). Idempotent no-op ack, NOT a
+    // `tab.error`: opens are tail-serialized, so an occupant existing here
+    // means its `tab.bound` was already announced (§7 B8 satisfied), and the
+    // webview's open-failed fold would deface that healthy bound tab
+    // (`transcript.ts` sets error+openFailed regardless of binding). A
+    // genuinely failed first open leaves NO occupant, so its Retry re-post
+    // still proceeds normally.
+    const occupant = this.sessions.getByTabId(tabId);
+    if (occupant) {
+      this.logger?.append(
+        `[AcpBackend] openTab('${tabId}') ignored — session '${occupant.sessionId}' already occupies this tab (tab.bound already announced)`,
+      );
+      return;
+    }
     const client = this.connectionSupervisor.getClient();
     if (!client) {
       this.emitter.fire({
@@ -977,8 +1047,30 @@ export class AcpBackend implements AgentBackend {
       return;
     }
     const cwd = this.cwd ?? this.workspaceRoots()[0] ?? '';
+    // WS-R1 F3-1: the user-tab mint gets the SAME deadline + exit race the
+    // bootstrap twin (establishInitialSession) has — un-raced, a hung-but-
+    // alive child wedged this tail link (and therefore EVERY later
+    // openTab/closeTab/load/start) forever. Belated-resolution cleanup is
+    // caller-owned via openSession's existing isStaleAttempt guard
+    // (:900-924): the abandoned mint closes its own orphaned session and
+    // never announces tab.bound. A genuine newSession rejection passes
+    // through settleRace and keeps the existing describeHostError terminal.
+    let attemptAbandoned = false;
     try {
-      await this.openSession(cwd, tabId);
+      const open = this.openSession(cwd, tabId, () => attemptAbandoned);
+      const outcome = await settleRace(open, { exit: client, deadline: SESSION_ESTABLISH_DEADLINE_MS });
+      attemptAbandoned = true;
+      if (outcome.kind !== 'value') {
+        this.emitter.fire({
+          type: 'tab.error',
+          tabId,
+          kind: 'open-failed',
+          message:
+            outcome.kind === 'exit'
+              ? 'The agent exited while opening this tab.'
+              : 'The agent did not respond while opening this tab — try again.',
+        });
+      }
     } catch (err) {
       this.emitter.fire({ type: 'tab.error', tabId, kind: 'open-failed', message: describeHostError(err) });
     }
@@ -1029,6 +1121,8 @@ export class AcpBackend implements AgentBackend {
 
   private async closeTabInternal(sessionId: string): Promise<void> {
     try {
+      // CA-M04b: `SessionRegistry.close` itself fires the fetch-seq prune now
+      // (hook wired in `ControlDispatcher`'s constructor) — no explicit call.
       this.sessions.close(sessionId);
     } finally {
       // CF-01/L3-1 fix: clear the tombstone only once the ACTUAL removal has
@@ -1182,8 +1276,24 @@ export class AcpBackend implements AgentBackend {
     // (`old` undefined) exactly the same as a live-old-session tab. See this
     // method's own doc.
     this.emitter.fire({ type: 'tab.clear', tabId });
+    // WS-R1 F3-1 (sibling site, tail-audit-mandated): same race + belated-
+    // cleanup contract as openTabInternal — see that method's comment.
+    let attemptAbandoned = false;
     try {
-      await this.openSession(cwd, tabId);
+      const open = this.openSession(cwd, tabId, () => attemptAbandoned);
+      const outcome = await settleRace(open, { exit: client, deadline: SESSION_ESTABLISH_DEADLINE_MS });
+      attemptAbandoned = true;
+      if (outcome.kind !== 'value') {
+        this.emitter.fire({
+          type: 'tab.error',
+          tabId,
+          kind: 'open-failed',
+          message:
+            outcome.kind === 'exit'
+              ? 'The agent exited while starting a new session.'
+              : 'The agent did not respond while starting a new session — try again.',
+        });
+      }
     } catch (err) {
       this.emitter.fire({ type: 'tab.error', tabId, kind: 'open-failed', message: describeHostError(err) });
     }
@@ -1474,7 +1584,7 @@ export class AcpBackend implements AgentBackend {
    * has a live turn (P3), confines `cwd` to the workspace (vscode-backed,
    * stays here), then mints a FRESH controller for the loaded session and
    * disposes the tab's PRIOR controller (F6), delegating the session-scoped
-   * replay bookkeeping to {@link SessionController.loadReplay}. `tabId`
+   * replay bookkeeping to {@link SessionController.loadReplayOutcome}. `tabId`
    * defaults to the shared `BOOTSTRAP_TAB_ID`: the legacy control-method
    * caller (`invokeControl('session.load', …)`) has no per-tab wire field;
    * real per-tab wiring rides `tab.load` (§2d).
@@ -1592,9 +1702,10 @@ export class AcpBackend implements AgentBackend {
    * NO SELF-DEADLOCK: `loadSessionIntoTabInternal`'s body never calls
    * `start`/`openTab`/`closeTab`/`loadSessionIntoTab` (itself) — it only
    * reaches `this.sessions.*`/`this.buildSessionPort`/
-   * `this.announceSessionBound`/`controller.loadReplay`, none of which touch
-   * `runOnStartTail` — so this enqueues exactly once per call, at this outer
-   * entry, never re-entering the tail from within an already-queued link.
+   * `this.announceSessionBound`/`controller.loadReplayOutcome` (WS-R4 step
+   * 4), none of which touch `runOnStartTail` — so this enqueues exactly once
+   * per call, at this outer entry, never re-entering the tail from within an
+   * already-queued link.
    */
   private async loadSessionIntoTab(
     sessionId: string,
@@ -1708,6 +1819,13 @@ export class AcpBackend implements AgentBackend {
       this.buildSessionPort(sessionId, adoptedCwd),
       tabId,
     );
+    // WS-R4 F3-7: captured so a FAILED load can unwind the cwd this
+    // adoption is about to overwrite. activeSessionId is NOT captured for
+    // restore — when the adoption fires because the active session was this
+    // tab's occupant, that occupant was closed above (:1746); restoring its
+    // id would point at a disposed session, so the unwind clears to
+    // undefined instead (an honest "no active session").
+    const priorCwd = this.cwd;
     if (this.activeSessionId === undefined || this.activeSessionId === currentOccupant?.sessionId) {
       this.activeSessionId = sessionId;
       this.cwd = adoptedCwd;
@@ -1729,6 +1847,7 @@ export class AcpBackend implements AgentBackend {
         type: 'tab.error',
         tabId: orphanedTabId,
         kind: 'session-lost',
+        reason: 'superseded',
         message: 'This session was loaded into another tab.',
       });
     }
@@ -1749,86 +1868,170 @@ export class AcpBackend implements AgentBackend {
     // confinement check above, a real fs call) sat open between this
     // method's own entry-check and here; if the ACP child crashed during
     // that window, `this.connectionSupervisor.getClient()` now reads
-    // `undefined` again. `SessionController.loadReplay`'s OWN `!client`
-    // early-guard (before ANY `clear`/`turn.start`/turnId exists) would then
-    // return `undefined` completely silently — unlike the reject/
-    // `found:false` branches further inside `loadReplay`, which emit their
-    // own session-scoped `error`+`turn.end` before resolving `undefined`,
-    // that specific branch emits NOTHING at all. Left alone, the tab would
-    // sit "bound" with an empty transcript and no failure affordance —
-    // exactly what `recoverOneSession`'s crash-recovery path already guards
-    // against via its own unconditional `result === undefined` check (see
-    // that method's own doc); this router never had the equivalent.
+    // `undefined` again. `SessionController.loadReplayOutcome`'s OWN
+    // `!client` early-guard (before ANY `clear`/`turn.start`/turnId exists)
+    // would then resolve `{kind:'no-client'}` completely silently — unlike
+    // the reject/`found:false` branches further inside `loadReplayOutcome`,
+    // which emit their own session-scoped `error`+`turn.end` before
+    // resolving their own non-`loaded` kind, that specific branch emits
+    // NOTHING at all. Left alone, the tab would sit "bound" with an empty
+    // transcript and no failure affordance — exactly what
+    // `recoverOneSession`'s crash-recovery path already guards against via
+    // its own `kind !== 'loaded'` check (see that method's own doc); this
+    // router never had the equivalent.
     //
     // Checked HERE, synchronously, with NO `await` between this read and
-    // `loadReplay`'s own identical `getClient()` read (both resolve through
-    // the SAME `connectionSupervisor.getClient()` accessor — see
+    // `loadReplayOutcome`'s own identical `getClient()` read (both resolve
+    // through the SAME `connectionSupervisor.getClient()` accessor — see
     // `buildSessionPort`) — so this can never disagree with what
-    // `loadReplay` is about to see: if this finds a client, `loadReplay`'s
-    // own check is GUARANTEED to also find one (same JS tick, nothing else
-    // runs in between), so an eventual `undefined` from `loadReplay` can
-    // only be the reject/`found:false` branches, which already emitted
-    // their own signal — this short-circuit can never fire alongside them
-    // (no double-signal). If this finds NO client, `loadReplay` is about to
-    // take its silent path — short-circuit before ever calling it and reuse
-    // the SAME tab-chrome restart affordance the timeout branch below fires
+    // `loadReplayOutcome` is about to see: if this finds a client,
+    // `loadReplayOutcome`'s own check is GUARANTEED to also find one (same
+    // JS tick, nothing else runs in between), so `loadReplayOutcome`'s own
+    // `no-client` kind can never fire here — an eventual `load-failed`/
+    // `not-found` kind can only come from the reject/`found:false`
+    // branches, which already emitted their own signal — this short-circuit
+    // can never fire alongside them (no double-signal). If this finds NO
+    // client, `loadReplayOutcome` is about to take its silent path —
+    // short-circuit before ever calling it and reuse the SAME tab-chrome
+    // restart affordance the timeout branch below fires
     // (`tab.error{kind:'session-lost'}`, existing taxonomy, no new `kind`),
     // including its identical identity-guarded controller cleanup.
     if (!this.connectionSupervisor.getClient()) {
-      if (this.sessions.get(sessionId) === controller) this.sessions.close(sessionId);
+      if (this.sessions.get(sessionId) === controller) {
+        this.sessions.close(sessionId);
+        // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the
+        // switch below and used to skip its unwind): unwind the identity
+        // THIS failed load adopted pre-load (:1769-1772). Same double guard
+        // as the switch's failure kinds (below) factored around the close —
+        // the registry leg above is evaluated BEFORE close() deletes the map
+        // entry, so it cannot be re-checked after; the activeSessionId leg
+        // nests inside it instead.
+        if (this.activeSessionId === sessionId) {
+          this.activeSessionId = undefined; // never restore: prior occupant closed at :1746 (T24 Case A/B)
+          this.cwd = priorCwd;
+        }
+      }
       this.emitter.fire({
         type: 'tab.error',
         tabId,
         kind: 'session-lost',
+        reason: 'disconnected',
         message: 'The agent disconnected while loading this session — try again.',
       });
       return undefined;
     }
 
     // CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
-    // commit): `client.loadSession` (inside `loadReplay`) had NO wall-clock
-    // deadline at all — only `AcpClient.raceTermination`'s child-EXIT-only
-    // race. Before this commit that was merely a LOCALIZED hang (this one
-    // tab's load); now that this whole method is tail-serialized (see
-    // `loadSessionIntoTab`'s own doc), a hung-but-alive child wedges the
-    // ENTIRE topology tail forever — every subsequent `openTab`/`closeTab`/
-    // `loadSessionIntoTab`/`start` chains behind it. Mirrors
-    // `recoverOneSession`'s `SESSION_ESTABLISH_DEADLINE_MS` deadline via
-    // {@link ConnectionSupervisor.raceSessionLoadAgainstDeadline} — see that
-    // method's own doc for why it is DELIBERATELY NOT a reuse of
-    // `raceAgainstChildExit` (that helper cannot distinguish "the deadline
-    // fired" from "`loadReplay` genuinely resolved `undefined`" — the
-    // ordinary `found:false`/rejected-load outcome, which already emits its
-    // OWN session-scoped `error` via `loadReplay` itself and must NOT also
-    // get a second, duplicate `tab.error` here).
+    // commit): `client.loadSession` (inside `loadReplayOutcome`, WS-R4 step
+    // 4 — formerly reached through the now-legacy `loadReplay` adapter) had
+    // NO wall-clock deadline at all — only `AcpClient.raceTermination`'s
+    // child-EXIT-only race. Before this commit that was merely a LOCALIZED
+    // hang (this one tab's load); now that this whole method is
+    // tail-serialized (see `loadSessionIntoTab`'s own doc), a hung-but-alive
+    // child wedges the ENTIRE topology tail forever — every subsequent
+    // `openTab`/`closeTab`/`loadSessionIntoTab`/`start` chains behind it.
+    // Mirrors `recoverOneSession`'s `SESSION_ESTABLISH_DEADLINE_MS` deadline
+    // via settleRace with deadline-only opts; no exit source — a child exit
+    // already reaches p via AcpClient.raceTermination (that call cannot
+    // distinguish "the deadline fired" from "`loadReplayOutcome` genuinely
+    // resolved a non-`loaded` kind" the way the discriminated switch below
+    // now does directly — the ordinary `found:false`/rejected-load outcome,
+    // which already emits its OWN session-scoped `error` via
+    // `loadReplayOutcome` itself and must NOT also get a second, duplicate
+    // `tab.error` here).
     const mcpServers = [...this.mcpServers.values()];
-    const loadReplay = controller.loadReplay(cwd, sessionId, adoptedCwd, mcpServers);
-    const outcome = await this.connectionSupervisor.raceSessionLoadAgainstDeadline(loadReplay);
-    if (outcome.kind === 'timeout') {
+    const load = controller.loadReplayOutcome(cwd, sessionId, adoptedCwd, mcpServers);
+    const raced = await settleRace(load, { deadline: SESSION_ESTABLISH_DEADLINE_MS });
+    if (raced.kind !== 'value') {
       // The child stayed ALIVE but never answered within
       // SESSION_ESTABLISH_DEADLINE_MS. JS promises can't be cancelled — the
-      // original `loadReplay` keeps running in the background and MAY still
-      // belatedly resolve. Identity-guarded close (mirrors
+      // original `loadReplayOutcome` call keeps running in the background
+      // and MAY still belatedly resolve. Identity-guarded close (mirrors
       // `recoverOneSession`'s own guard, W6-FG) de-fangs that: disposing
       // `controller` now sets `this.replay = undefined` on it, which trips
-      // `loadReplay`'s own supersede recheck (`this.replay !== replay`) the
-      // moment the belated `client.loadSession` finally settles, making that
+      // `loadReplayOutcome`'s own supersede recheck (`this.replay !==
+      // replay`) the moment the belated `client.loadSession` finally
+      // settles, making that
       // continuation a silent no-op instead of emitting stale `clear`/
       // `turn.start`/`turn.end` into a tab we already told the user timed
       // out. Emits the SAME tab-chrome restart affordance
       // (`tab.error{kind:'session-lost'}`, §7 B8) the recovery path's own
       // timeout uses, and — by returning — RELEASES the topology tail for
       // the next queued link.
-      if (this.sessions.get(sessionId) === controller) this.sessions.close(sessionId);
+      if (this.sessions.get(sessionId) === controller) {
+        this.sessions.close(sessionId);
+        // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the
+        // switch below and used to skip its unwind): unwind the identity
+        // THIS failed load adopted pre-load (:1769-1772). Same double guard
+        // as the switch's failure kinds (below) factored around the close —
+        // the registry leg above is evaluated BEFORE close() deletes the map
+        // entry, so it cannot be re-checked after; the activeSessionId leg
+        // nests inside it instead.
+        if (this.activeSessionId === sessionId) {
+          this.activeSessionId = undefined; // never restore: prior occupant closed at :1746 (T24 Case A/B)
+          this.cwd = priorCwd;
+        }
+      }
       this.emitter.fire({
         type: 'tab.error',
         tabId,
         kind: 'session-lost',
+        reason: 'timeout',
         message: 'The agent did not respond while loading this session — try again.',
       });
       return undefined;
     }
-    return outcome.value;
+    // WS-R4 step 4: discriminate the union natively instead of going through
+    // the (now-legacy) `loadReplay` adapter's value-only collapse.
+    const outcome = raced.value;
+    switch (outcome.kind) {
+      case 'loaded':
+        return outcome.result;
+      case 'superseded':
+        // §3.4 (reviewed decision, THIS caller only): the :1240-equivalent
+        // data-bearing arm (a genuine success that raced a newer supersede)
+        // keeps today's silent-success behavior — returning `outcome.result`
+        // reproduces exactly what the deleted `loadReplay` adapter did for
+        // this arm (audit-A-3-pinned by Task 19's pin 6, re-verified below).
+        // The empty `superseded` arm returns `undefined` here too, via the
+        // SAME branch (`outcome.result` is `undefined` on that arm) — again
+        // matching the adapter's old mapping byte-for-byte. This is
+        // DELIBERATELY DIFFERENT from `recoverOneSession`'s Task-21 decision
+        // to treat BOTH `superseded` arms as a strict no-op: that caller
+        // adopts `activeSessionId`/`cwd` as a side effect of a truthy return,
+        // which is wrong once a newer op already owns the tab, so Task 21
+        // changed it. This caller (`loadSessionIntoTabInternal`) has no such
+        // adopt side effect — a returned result here only flows back to its
+        // own two callers (`ControlDispatcher.ts` session.load / loadTab),
+        // which already treat "the load that raced in" as this call's
+        // answer regardless of which internal arm produced it. Preserving
+        // the old value keeps this migration behavior-identical, per the
+        // brief; F3-7's discriminant-aware behavior change (if any) is
+        // Task 24's job, not this structural step's.
+        return outcome.result;
+      case 'no-client':
+      case 'load-failed':
+      case 'not-found':
+        // `loadReplayOutcome`'s own arms already emitted the session-scoped
+        // signal (`error`+`turn.end` or nothing, per arm); this router adds
+        // nothing here — exactly what the deleted adapter's collapse-to-
+        // `undefined` produced for these three kinds.
+        //
+        // WS-R4 F3-7: unwind the identity THIS failed load adopted pre-load
+        // (above, at the `priorCwd` capture). Double identity guard (mirrors
+        // the two sibling failure exits above — the TI-5 no-client
+        // short-circuit and the settleRace timeout branch, WS-R4 F3-7-S —
+        // both nest this SAME `sessions.get(sessionId) === controller`
+        // registry guard plus the activeSessionId check around their own
+        // close) — it can only ever unwind state this exact failed load set.
+        // NEVER fires on 'superseded' (either arm): a superseding op owns
+        // identity.
+        if (this.sessions.get(sessionId) === controller && this.activeSessionId === sessionId) {
+          this.activeSessionId = undefined;
+          this.cwd = priorCwd;
+        }
+        return undefined;
+    }
   }
 
   dispose(): void {
@@ -1861,6 +2064,7 @@ export class AcpBackend implements AgentBackend {
     this.clientAuthMethodsSub?.dispose();
     this.clientAuthMethodsSub = undefined;
     this.authMethodsEmitter.dispose();
+    this.gatewayHealthSub.dispose();
     this.emitter.dispose();
   }
 
@@ -1917,6 +2121,19 @@ export class AcpBackend implements AgentBackend {
     if (!req.sessionId) {
       this.logger?.append(
         '[policy] permission request with a malformed/absent sessionId — auto-denied (fail-closed)',
+      );
+      return buildCancelledOutcome();
+    }
+
+    // WS-SL F3-9: a session mid-`closeTab` is about to be gone — its
+    // registry entry may linger while the close is queued on the topology
+    // tail (up to 120 s behind a hung link). Auto-deny instead of emitting a
+    // card onto a closing tab; the SAME synchronous tombstone `sendPrompt`
+    // and `handleSessionUpdate` already read — this was the last unguarded
+    // ingress. Fail-closed: cancelled maps to deny harness-side.
+    if (this.pendingClose.has(req.sessionId)) {
+      this.logger?.append(
+        `[policy] permission request on closing session '${req.sessionId}' — auto-denied (fail-closed)`,
       );
       return buildCancelledOutcome();
     }
@@ -2052,17 +2269,8 @@ function describeHostError(err: unknown): string {
   return describeError(err, homedir());
 }
 
-/**
- * W4-T2: is `child` at or below `parent`? Mirrors `pathConfine.ts`'s own
- * `isWithin` (kept local — that module's version isn't exported, and this
- * is a cheap lexical containment check over already-`path.resolve`'d
- * strings, not a security boundary — `resolveRootCoordinator` only ever
- * uses it to pick WHICH already-open workspace folder a cwd belongs to).
- */
-function isPathWithin(child: string, parent: string): boolean {
-  const rel = path.relative(parent, child);
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
-}
+// W4-T2: `isPathWithin` moved to `rootResolution.ts` verbatim (WS-CK-A6
+// prep) — `findContainingWorkspaceRoot`'s only caller now lives there too.
 
 // W6-FI-c: `isReloadedResult`/`extractLoadParams`/`extractToggleParams`/
 // `TURN_ACTIVE_RESTORE_REFUSAL`/`AMBIGUOUS_ROOT`/`UNKNOWN_ROOT_RESTORE_REFUSAL`/

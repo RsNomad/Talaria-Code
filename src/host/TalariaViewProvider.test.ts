@@ -235,7 +235,6 @@ describe('TalariaViewProvider — control.request responder (Part A2)', () => {
       instanceId: 'test-instance',
       requestId: 9,
       method: 'config.show',
-      params: undefined,
     });
     await flush();
 
@@ -2302,6 +2301,33 @@ describe('TalariaViewProvider — TE-7 (AU-31): per-view disposable scope does n
     expect(posted2.some((m) => m.type === 'hydrate')).toBe(true);
   });
 
+  it('CA-M16 (WS-BG): tab.close routes on sessionId PRESENCE — absent -> no closeTab; present -> closeTab', () => {
+    const closeTab = vi.fn();
+    const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend(undefined, { closeTab }));
+
+    let capturedCb: ((msg: WebviewToHostMessage) => void) | undefined;
+    const view = {
+      webview: {
+        cspSource: 'vscode-webview:',
+        asWebviewUri: (uri: unknown) => uri,
+        onDidReceiveMessage: (cb: (msg: WebviewToHostMessage) => void) => {
+          capturedCb = cb;
+          return { dispose() {} };
+        },
+        postMessage: () => Promise.resolve(true),
+      },
+      onDidDispose: () => ({ dispose() {} }),
+    };
+    provider.resolveWebviewView(view as never, {} as never, {} as never);
+    expect(capturedCb).toBeDefined();
+
+    capturedCb?.({ type: 'tab.close', tabId: 't1' });
+    expect(closeTab).not.toHaveBeenCalled();
+
+    capturedCb?.({ type: 'tab.close', tabId: 't1', sessionId: 's1' });
+    expect(closeTab).toHaveBeenCalledWith('s1');
+  });
+
   it('setNextEditToggles rewiring does not leave a disposed husk in the provider-lifetime disposables array', () => {
     const provider = new TalariaViewProvider({ fsPath: '/ext' } as never, makeFakeBackend());
     const baseline = disposablesOf(provider).length;
@@ -2350,5 +2376,45 @@ describe('TalariaViewProvider — TE-7 (AU-31): per-view disposable scope does n
 
     expect(disposeMessageSub).toHaveBeenCalledTimes(1);
     expect(disposeDisposeSub).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TalariaViewProvider — UX-02: gateway.health re-sync', () => {
+  /** The optional-capability seam, mirroring makePresetBackend/makeTabsBackend above. */
+  function makeHealthBackend(health: { state: 'ok' | 'degraded' | 'down'; attempts: number }): AgentBackend {
+    return { ...makeFakeBackend(), currentGatewayHealth: () => health };
+  }
+
+  it('posts gateway.health AFTER hydrate when the backend exposes currentGatewayHealth (a re-created webview must not assume ok)', () => {
+    const { provider, posted } = makeProviderWith(makeHealthBackend({ state: 'down', attempts: 12 }));
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    const hydrateIndex = posted.findIndex((m) => m.type === 'hydrate');
+    const healthIndex = posted.findIndex((m) => m.type === 'gateway.health');
+    expect(hydrateIndex).toBeGreaterThanOrEqual(0);
+    // AFTER hydrate — the webview's {state:'ok'} boot fold must not overwrite the truth:
+    expect(healthIndex).toBeGreaterThan(hydrateIndex);
+    expect(posted[healthIndex]).toEqual({ type: 'gateway.health', state: 'down', attempts: 12 });
+  });
+
+  it('skips the push for a backend without the capability (mock) — the webview keeps its honest ok default', () => {
+    const { provider, posted } = makeProviderWith(makeFakeBackend());
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    expect(posted.filter((m) => m.type === 'gateway.health')).toEqual([]);
+  });
+
+  it("setBackend (trust-upgrade swap) posts the NEW backend's health after backend.state", () => {
+    const { provider, posted } = makeProviderWith(makeFakeBackend());
+    seam(provider).handleWebviewMessage({ type: 'ready' });
+    posted.length = 0; // only the swap's own output matters below (idiom of :499)
+    const acpBackend: AgentBackend = {
+      ...makeFakeBackend(),
+      kind: 'acp',
+      currentGatewayHealth: () => ({ state: 'degraded' as const, attempts: 6 }),
+    };
+    provider.setBackend(acpBackend);
+    const stateIndex = posted.findIndex((m) => m.type === 'backend.state');
+    const healthIndex = posted.findIndex((m) => m.type === 'gateway.health');
+    expect(healthIndex).toBeGreaterThan(stateIndex);
+    expect(posted[healthIndex]).toEqual({ type: 'gateway.health', state: 'degraded', attempts: 6 });
   });
 });

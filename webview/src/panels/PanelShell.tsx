@@ -1,6 +1,7 @@
 /* Shared scaffolding for side panels: a telemetry header + scroll body. */
-import type { ReactNode } from 'react';
+import { useId, type ReactNode } from 'react';
 import { Icon } from '../components/Icon';
+import { LiveRegion } from '../components/LiveRegion';
 import type { RemoteData } from '../state/remoteData';
 
 interface PanelShellProps {
@@ -9,11 +10,24 @@ interface PanelShellProps {
   children: ReactNode;
 }
 
+/**
+ * A11Y-03 (WCAG 1.3.1 / 2.4.6): the title used to be a plain `<span>` — AT
+ * saw NO document structure anywhere in panel chrome: no heading to jump to,
+ * no landmark naming the panel. It's now a real `<h2>`, and the shell itself
+ * is a `role="region"` named by that h2 via `aria-labelledby` (the string
+ * lives in exactly one place, not duplicated into a separate `aria-label`).
+ * This is the outline root every panel's content sits under — SectionLabel's
+ * `h3` below it, and (in the chat surface) AgentMarkdown's clamped `h3`-`h6`
+ * markdown headings via ChatView's own sr-only `h2`.
+ */
 export function PanelShell({ title, meta, children }: PanelShellProps) {
+  const headingId = useId();
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div role="region" aria-labelledby={headingId} className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-none items-center justify-between px-3 py-2.5">
-        <span className="h-eyebrow">{title}</span>
+        <h2 id={headingId} className="h-eyebrow">
+          {title}
+        </h2>
         {meta && <span className="font-mono text-2xs text-faint">{meta}</span>}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-4">{children}</div>
@@ -31,12 +45,17 @@ export function EmptyPanel({ hint }: { hint: string }) {
  * heading after `scrollIntoView`, and a heading needs to be programmatically
  * focusable to receive it. Every existing caller omits `id` and is
  * byte-for-byte unaffected (optional, defaults to `undefined`).
+ *
+ * A11Y-03: was a plain `<div>` — now a real `<h3>`, sitting below the
+ * `PanelShell` `h2` that wraps every panel using it. Tailwind preflight
+ * zeroes heading margin/font-size (`.h-eyebrow` fully defines the rendered
+ * appearance), so this is a visual no-op — same classes, same look.
  */
 export function SectionLabel({ children, id }: { children: ReactNode; id?: string }) {
   return (
-    <div id={id} tabIndex={id !== undefined ? -1 : undefined} className="h-eyebrow mb-1.5 mt-3 first:mt-0">
+    <h3 id={id} tabIndex={id !== undefined ? -1 : undefined} className="h-eyebrow mb-1.5 mt-3 first:mt-0">
       {children}
-    </div>
+    </h3>
   );
 }
 
@@ -67,7 +86,7 @@ interface RemotePanelProps<T> {
    * renders exactly as before — every existing caller that doesn't pass this
    * prop is byte-for-byte unaffected.
    */
-  refreshError?: RefreshErrorBanner;
+  refreshError?: RefreshErrorBanner | undefined;
   /** Rendered ONLY in the success state, with the resolved data. */
   children: (data: T) => ReactNode;
 }
@@ -89,6 +108,16 @@ export function RemotePanel<T>({ remote, loadingHint, onRetry, refreshError, chi
   if (remote?.status === 'success') {
     return (
       <>
+        {/* Task 17 (Finding-7, WV4-MIN): ALWAYS mounted — the stale-data
+            announcement itself lives here now, not on the visible banner's
+            own (now dropped) role="status" below. A region that mounts
+            together with its content is the known-unreliable screen-reader
+            announcement pattern; this one exists empty on every success
+            render and only its text swaps when refreshError appears. */}
+        <LiveRegion
+          text={refreshError ? 'Couldn’t refresh — showing last loaded data.' : ''}
+          className="sr-only"
+        />
         {refreshError && (
           <RefreshErrorNotice
             message={refreshError.message}
@@ -115,16 +144,18 @@ export function RemotePanel<T>({ remote, loadingHint, onRetry, refreshError, chi
 /**
  * TI-3 (AU-42 Part B): the dismissible "stale data, refresh failed" banner —
  * same tokens-only vocabulary as `PanelError` below (border-del/bg-del-soft
- * for the message, a bordered Retry button), not a restyle. `role="status"`
- * directly on the container (no separate `LiveRegion`, matching this file's
- * own loading-branch idiom just above) — the banner mounts/unmounts with
- * `refreshError` itself, so there is no stable "permanently mounted" slot to
- * route through a text-swapping LiveRegion the way a per-row notice does.
+ * for the message, a bordered Retry button), not a restyle.
+ *
+ * Task 17 (Finding-7, WV4-MIN): this used to carry its OWN `role="status"`
+ * directly on the container — mounted/unmounted together with `refreshError`
+ * itself, the known-unreliable announcement pattern. The announcement now
+ * rides the ALWAYS-mounted `LiveRegion` in `RemotePanel`'s success branch
+ * just above this component's call site instead, so this container is a
+ * plain, purely visual `<div>` — no live-region role of its own.
  */
 function RefreshErrorNotice({ message, onRetry, onDismiss }: RefreshErrorBanner) {
   return (
     <div
-      role="status"
       className="mx-3 mb-2 mt-2 flex flex-none items-start gap-2 rounded-card border border-del bg-del-soft px-3 py-2 text-2xs text-fg"
     >
       <Icon name="error" size={13} className="mt-0.5 flex-none text-del" />

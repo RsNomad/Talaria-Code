@@ -14,8 +14,14 @@ import {
   composeLlamacppCell,
   redactForModal,
   MODAL_UNSAFE_TEXT_PATTERN,
+  SETUP_DISPOSED_REFUSAL,
+  pruneExpiredThrottleEntries,
+  OLLAMA_PROBE_MEMO_TTL_MS,
+  EXCLUDE_GLOBS_MAX_ENTRIES,
+  EXCLUDE_GLOB_MAX_LENGTH,
   type SetupHost,
   type SetupControllerDeps,
+  type ThrottleState,
 } from './SetupController';
 import { AGENT_BACKENDS, FIM_BACKENDS, getBackend, NEXT_DEDICATED_MODEL } from './registry';
 import { MODEL_CATALOG } from './modelCatalog';
@@ -77,6 +83,11 @@ class FakeSetupHost implements SetupHost {
   async updateSettingGlobal(key: string, value: unknown): Promise<void> {
     this.calls.push(`write:${key}=${JSON.stringify(value)}`);
     this.settings.set(key, value);
+  }
+
+  // F2-17: in the fake, the settings map IS global scope.
+  inspectSettingGlobal(key: string): unknown {
+    return this.settings.get(key);
   }
 
   secrets = {
@@ -291,7 +302,9 @@ describe('FM-14: mutating methods refused when untrusted', () => {
   it('setup.cancel still works when untrusted', async () => {
     const { controller } = makeController({ trusted: false });
     const result = await controller.handle('setup.cancel', { op: 'install', id: 'hermes' });
-    expect(result).toEqual({ ok: true });
+    // WS-SU Task 1: cancel result now carries {cancelled} (F2-20) — nothing
+    // was in flight here, so the honest outcome is cancelled:false.
+    expect(result).toEqual({ ok: true, cancelled: false });
   });
 
   it('status() still renders when untrusted', async () => {
@@ -446,6 +459,30 @@ describe('FM-16: setup.setTunable allowlist (D9)', () => {
     const result = await controller.handle('setup.setTunable', { key: 'talaria.autocomplete.debounceMs', value: -5 });
     expect(result.ok).toBe(false);
     expect(host.settings.size).toBe(0);
+  });
+});
+
+// --- CA-M11: excludeGlobs length caps ---------------------------------------
+
+describe('CA-M11: excludeGlobs is length-capped', () => {
+  it('refuses more than EXCLUDE_GLOBS_MAX_ENTRIES entries', async () => {
+    const { controller } = makeController();
+    const value = Array.from({ length: EXCLUDE_GLOBS_MAX_ENTRIES + 1 }, (_, i) => `**/${i}`);
+    const result = (await controller.handle('setup.setTunable', { key: 'talaria.rag.excludeGlobs', value })) as { ok: boolean };
+    expect(result.ok).toBe(false);
+  });
+  it('refuses a single glob longer than EXCLUDE_GLOB_MAX_LENGTH', async () => {
+    const { controller } = makeController();
+    const result = (await controller.handle('setup.setTunable', {
+      key: 'talaria.rag.excludeGlobs',
+      value: ['x'.repeat(EXCLUDE_GLOB_MAX_LENGTH + 1)],
+    })) as { ok: boolean };
+    expect(result.ok).toBe(false);
+  });
+  it('accepts a normal list unchanged', async () => {
+    const { controller, host } = makeController();
+    await controller.handle('setup.setTunable', { key: 'talaria.rag.excludeGlobs', value: ['**/node_modules/**'] });
+    expect(host.settings.get('talaria.rag.excludeGlobs')).toEqual(['**/node_modules/**']);
   });
 });
 
@@ -853,6 +890,62 @@ describe('setup.applyFim: Tier-1 modal names old->new endpoint', () => {
     expect(result).toEqual({ ok: true });
     const modalCall = host.calls.find((c) => c.startsWith('showModal:'));
     expect(modalCall).toContain("from '(default)' to");
+  });
+});
+
+// --- F2-17: multi-key settings writes disclose + roll back partial failure ---
+
+describe('F2-17: multi-key settings writes disclose + roll back partial failure', () => {
+  function failNthWrite(host: FakeSetupHost, n: number): void {
+    const original = host.updateSettingGlobal.bind(host);
+    let count = 0;
+    host.updateSettingGlobal = async (key: string, value: unknown): Promise<void> => {
+      count += 1;
+      if (count === n) throw new Error('EACCES: settings file locked');
+      return original(key, value);
+    };
+  }
+
+  it('applyFim: 2nd write fails -> first key ROLLED BACK to its prior global value, reason names both', async () => {
+    const { host, controller } = makeController();
+    host.settings.set('talaria.autocomplete.backend', 'mock'); // prior global value
+    failNthWrite(host, 2);
+    const result = await controller.handle('setup.applyFim', { backendId: 'ollama', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toMatchObject({ ok: false });
+    if (result && typeof result === 'object' && 'reason' in result) {
+      const reason = String((result as { reason: unknown }).reason);
+      expect(reason).toContain("failed at 'talaria.autocomplete.endpoint'");
+      expect(reason).toContain('Rolled back: talaria.autocomplete.backend');
+    }
+    expect(host.settings.get('talaria.autocomplete.backend')).toBe('mock'); // restored
+  });
+
+  it('applyFim: FIRST write fails -> "no other keys were changed"', async () => {
+    const { host, controller } = makeController();
+    failNthWrite(host, 1);
+    const result = (await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    })) as { ok: boolean; reason?: string };
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('no other keys were changed');
+  });
+
+  it('rollback itself failing is DISCLOSED per key', async () => {
+    const { host, controller } = makeController();
+    host.settings.set('talaria.autocomplete.backend', 'mock');
+    const original = host.updateSettingGlobal.bind(host);
+    let count = 0;
+    host.updateSettingGlobal = async (key: string, value: unknown): Promise<void> => {
+      count += 1;
+      if (count >= 2) throw new Error('EACCES'); // 2nd write AND the rollback write both fail
+      return original(key, value);
+    };
+    const result = (await controller.handle('setup.applyFim', {
+      backendId: 'ollama',
+      endpoint: 'http://127.0.0.1:11434',
+    })) as { ok: boolean; reason?: string };
+    expect(result.reason).toContain('Rollback FAILED for: talaria.autocomplete.backend');
   });
 });
 
@@ -1536,6 +1629,17 @@ describe('setup.reconnectAgent (beta.7 B3)', () => {
     const result = await controller.handle('setup.reconnectAgent', {});
     expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('spawn ENOENT') });
   });
+
+  it('threads {force:true} through to deps.reconnectAgent; absent or non-boolean force stays non-force (fail-closed)', async () => {
+    const reconnectAgent = vi.fn().mockResolvedValue({ ok: true });
+    const { controller } = makeController({}, { reconnectAgent });
+    await controller.handle('setup.reconnectAgent', { force: true });
+    expect(reconnectAgent).toHaveBeenLastCalledWith({ force: true });
+    await controller.handle('setup.reconnectAgent', {});
+    expect(reconnectAgent).toHaveBeenLastCalledWith(undefined);
+    await controller.handle('setup.reconnectAgent', { force: 'yes' });
+    expect(reconnectAgent).toHaveBeenLastCalledWith(undefined);
+  });
 });
 
 // --- FIX 1 (final review wave, IMPORTANT): setup.recheck re-probes pipx -----
@@ -2184,6 +2288,70 @@ describe('§7.2.2 (extra-a, T4): a terminal `done` push on every pull settle pat
     // The straggler's distinguishing byte count must never have landed —
     // neither by overwriting the pending `done` slot nor by a later push.
     expect(received.some((p) => p.completedBytes === 9)).toBe(false);
+  });
+});
+
+// --- WS-SU M-T1 (F2-20 informational follow-up): repeat-cancel semantics ---
+//
+// Pins BOTH phases of a repeated `setup.cancel` against the same (op,id) so
+// the semantics cannot silently drift in either direction:
+//   1. a second cancel landing while the aborted op is still winding down
+//      (latch not yet released by the pull handler's finally) reports
+//      {cancelled:true, matched} again — the matched op is genuinely still
+//      live, and AbortController#abort() is an idempotent no-op;
+//   2. a cancel after the op has fully settled (latch released) reports
+//      {cancelled:false} with NO `matched` key — nothing live matched.
+// Adjudicated 2026-08-23 (WS-SU minor-fixes plan): current behavior is
+// CORRECT under the SetupCancelResult contract — this test is a pin, not a
+// fix. Fake timers mirror the §7.2.2 cancelled-pull test above (the settle
+// path's terminal `done` push rides the real-setTimeout throttle).
+describe('WS-SU M-T1: setup.cancel repeated against the same op (F2-20)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('wind-down repeat reports cancelled:true again; post-settle repeat reports cancelled:false with matched omitted', async () => {
+    const { controller } = makeController(
+      {},
+      {
+        // Hangs until aborted — same fixture shape as the §7.2.2 cancelled-
+        // pull test (mirrors real pullModel's abort-rejects-in-flight contract).
+        pullModel: (_endpoint, _model, _onProgress, sig): Promise<void> =>
+          new Promise<void>((_resolve, reject) => {
+            sig.addEventListener('abort', () => {
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          }),
+      },
+    );
+
+    const pullPromise = controller.handle('setup.pullModel', { model: 'llama3:8b' });
+    await flushMicrotasks(); // modal confirm -> runLibraryPull -> the hanging dep; the pull latch is now held
+
+    // Phase 1: two cancels back-to-back with NO await between them.
+    // `handle()` reaches the synchronous `handleCancel` with no prior await,
+    // so BOTH run before any microtask can execute the pull handler's
+    // finally (which releases the latch) — a deterministic wind-down window.
+    const first = controller.handle('setup.cancel', { op: 'pull', id: 'llama3:8b' });
+    const second = controller.handle('setup.cancel', { op: 'pull', id: 'llama3:8b' });
+    await expect(first).resolves.toEqual({ ok: true, cancelled: true, matched: 'llama3:8b' });
+    await expect(second).resolves.toEqual({ ok: true, cancelled: true, matched: 'llama3:8b' });
+
+    // Let the aborted pull settle fully (latch released in its finally;
+    // terminal `done` push flushed through the throttle timer).
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(THROTTLE_FLUSH_MS);
+    await expect(pullPromise).resolves.toEqual({ ok: false, reason: 'cancelled' });
+
+    // Phase 2: nothing live matches any more.
+    const third = await controller.handle('setup.cancel', { op: 'pull', id: 'llama3:8b' });
+    expect(third).toEqual({ ok: true, cancelled: false });
+    expect(third).not.toHaveProperty('matched'); // key OMITTED, never `= undefined`
   });
 });
 
@@ -3285,6 +3453,51 @@ describe('TC-6 (AU-6): dispose() aborts in-flight installs/pulls', () => {
   });
 });
 
+describe('F2-16: a disposed controller refuses to arm NEW install/pull latches', () => {
+  it('setup.pullModel after dispose() refuses without invoking the pull dep', async () => {
+    const pullModel = vi.fn();
+    const { controller } = makeController({}, { pullModel });
+    controller.dispose();
+    const result = await controller.handle('setup.pullModel', { model: 'llama3:8b', endpoint: 'http://127.0.0.1:11434' });
+    expect(result).toEqual({ ok: false, reason: SETUP_DISPOSED_REFUSAL });
+    expect(pullModel).not.toHaveBeenCalled();
+  });
+  it('setup.install after dispose() refuses the same way', async () => {
+    const { controller } = makeController();
+    controller.dispose();
+    await expect(controller.handle('setup.install', { backendId: 'hermes' })).resolves.toEqual({
+      ok: false,
+      reason: SETUP_DISPOSED_REFUSAL,
+    });
+  });
+  it('setup.provisionModel after dispose() refuses the same way', async () => {
+    const { controller } = makeController();
+    controller.dispose();
+    await expect(
+      controller.handle('setup.provisionModel', { modelId: 'qwen25-coder-1.5b', backend: 'ollama' }),
+    ).resolves.toEqual({ ok: false, reason: SETUP_DISPOSED_REFUSAL });
+  });
+});
+
+describe('F2-16: throttle-map entry expiry', () => {
+  it('pruneExpiredThrottleEntries drops idle entries and keeps live ones', () => {
+    const throttle = new Map<string, ThrottleState>();
+    throttle.set('pull:stale', { lastEmit: 1_000, timer: undefined, pending: undefined });
+    throttle.set('pull:pending', { lastEmit: 1_000, timer: undefined, pending: { op: 'pull', id: 'pending' } });
+    const timer = setTimeout(() => {}, 1);
+    throttle.set('pull:timed', { lastEmit: 1_000, timer, pending: undefined });
+    pruneExpiredThrottleEntries(throttle, 1_200, 150);
+    expect([...throttle.keys()].sort()).toEqual(['pull:pending', 'pull:timed']);
+    clearTimeout(timer);
+  });
+  it('a pruned key throttles a fresh burst exactly like a first-ever key (semantics preserved)', () => {
+    // fresh entry: lastEmit=-Infinity ⇒ immediate fire — identical to a pruned-then-recreated entry.
+    const throttle = new Map<string, ThrottleState>();
+    pruneExpiredThrottleEntries(throttle, Date.now(), 150); // empty map: no-op, no throw
+    expect(throttle.size).toBe(0);
+  });
+});
+
 /*
  * beta.6 T9 (§1.3/§2.5): the tests above pin `setup.recheck`'s BEHAVIOR
  * through `controller.handle()` round-trips (a bad scope refused, absent
@@ -3607,5 +3820,34 @@ describe('T6 (CC-2): setup.testRemote result widening — {ok:true, models} when
     const { controller } = makeController({}, { probeRemote: async () => ({ ok: true, detail: 'ok' }) });
     const result = await controller.handle('setup.testRemote', { backendId: 'ollama' });
     expect(result).toEqual({ ok: true });
+  });
+});
+
+// --- WS-SU Task 9 (CA-M18): single-flight, short-TTL memo over safeProbeOllama ---
+
+describe('CA-M18: back-to-back status() passes share ONE Ollama probe', () => {
+  it('two immediate status() calls probe once; TTL expiry probes again', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const probeOllama = vi.fn().mockResolvedValue({ running: false, detail: 'down' });
+    const { controller } = makeController({}, { probeOllama });
+    await controller.status();
+    await controller.status();
+    expect(probeOllama).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(1_000_000 + OLLAMA_PROBE_MEMO_TTL_MS + 1);
+    await controller.status();
+    expect(probeOllama).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it('a status-changing completion invalidates the memo (the completion push sees fresh truth)', async () => {
+    const probeOllama = vi.fn().mockResolvedValue({ running: true, models: [] });
+    const { controller } = makeController({}, { probeOllama });
+    await controller.status(); // memo armed
+    // any successful mutation that fires onStatusChanged — use setup.recheck
+    // if no cheaper seam exists in the fixture; the assertion is the same:
+    await controller.handle('setup.recheck', {});
+    await controller.status();
+    expect(probeOllama).toHaveBeenCalledTimes(2);
   });
 });

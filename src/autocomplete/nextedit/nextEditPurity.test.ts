@@ -6,8 +6,9 @@ import type { ScannableSource } from '../../host/purityScan';
 
 /**
  * F-10 (final-review-findings.md ARCH I-3) — `nextedit/`'s pure-core/thin-shell
- * boundary HOLDS today (only `config.ts`, `guard.ts`, `shell.vscode.ts` import
- * `vscode`) but until this file, nothing LOCKED it. `contextPurity.test.ts`
+ * boundary HOLDS today (only `config.ts`, `guard.ts`, `shell.vscode.ts`, and
+ * (CA-06-NE-face, WS-FIM T16b) `nextEditNotice.vscode.ts` import `vscode`)
+ * but until this file, nothing LOCKED it. `contextPurity.test.ts`
  * covers `context/` only; `nextedit/` had zero headless-purity guard, the
  * exact coverage gap the repo's own precedent (W6-FK I-9) already named once
  * for `context/`. ARCH ranked the consequence: "the first expedient `vscode`
@@ -15,9 +16,9 @@ import type { ScannableSource } from '../../host/purityScan';
  *
  * This is a direct clone of `../context/contextPurity.test.ts`'s mechanism
  * (same shared `src/host/purityScan.ts` walk+scan, same `VSCODE_IMPORT_BAN`/
- * `FS_IMPORT_BAN`), narrowed to `nextedit/`'s own three-file allowlist rather
+ * `FS_IMPORT_BAN`), narrowed to `nextedit/`'s own four-file allowlist rather
  * than `context/`'s two-file one. Unlike `context/`, `nextedit/` uses a single
- * naming convention for its one non-`.vscode.ts`-named adapter (`guard.ts` —
+ * naming convention for its non-`.vscode.ts`-named adapter (`guard.ts` —
  * see its own header: "this class contributes exactly three things a pure
  * function cannot: persistence, SERIALIZATION ..., and user-visible alerts"),
  * so this file names it explicitly rather than pattern-matching a suffix.
@@ -33,18 +34,19 @@ import type { ScannableSource } from '../../host/purityScan';
 const NEXTEDIT_ROOT = join(__dirname);
 
 /**
- * The three files this task's own brief names as the sanctioned `vscode`
- * importers — verified NON-VACUOUSLY below (each must actually import
- * `vscode`, so this allowlist cannot silently grow past what's true).
+ * The four files this task's own brief (plus CA-06-NE-face, WS-FIM T16b)
+ * names as the sanctioned `vscode` importers — verified NON-VACUOUSLY below
+ * (each must actually import `vscode`, so this allowlist cannot silently
+ * grow past what's true).
  */
-const ADAPTER_ALLOW = new Set(['config.ts', 'guard.ts', 'shell.vscode.ts']);
+const ADAPTER_ALLOW = new Set(['config.ts', 'guard.ts', 'shell.vscode.ts', 'nextEditNotice.vscode.ts']);
 
 function collectNextEditSources(): ScannableSource[] {
   return collectNonTestTsSources(NEXTEDIT_ROOT);
 }
 
 describe('F-10: nextedit/ purity guard (pure-core/thin-shell boundary, mechanized)', () => {
-  it('discovers config.ts, guard.ts and shell.vscode.ts (non-vacuous file discovery)', () => {
+  it('discovers config.ts, guard.ts, shell.vscode.ts and nextEditNotice.vscode.ts (non-vacuous file discovery)', () => {
     const files = collectNextEditSources();
     expect(files.length).toBeGreaterThan(0);
     for (const adapter of ADAPTER_ALLOW) {
@@ -60,7 +62,7 @@ describe('F-10: nextedit/ purity guard (pure-core/thin-shell boundary, mechanize
     expect(offenders).toEqual([]);
   });
 
-  it('no module under nextedit/ imports vscode EXCEPT the three sanctioned files', () => {
+  it('no module under nextedit/ imports vscode EXCEPT the four sanctioned files', () => {
     const offenders = collectNextEditSources()
       .filter((f) => !ADAPTER_ALLOW.has(f.file))
       .filter((f) => VSCODE_IMPORT_BAN.test(f.content))
@@ -69,7 +71,7 @@ describe('F-10: nextedit/ purity guard (pure-core/thin-shell boundary, mechanize
     expect(offenders).toEqual([]);
   });
 
-  it('sanity: all three sanctioned files DO import vscode (the exemption is real, not vacuous)', () => {
+  it('sanity: all four sanctioned files DO import vscode (the exemption is real, not vacuous)', () => {
     const files = collectNextEditSources();
     for (const adapter of ADAPTER_ALLOW) {
       const source = files.find((f) => f.file === adapter);
@@ -154,9 +156,14 @@ describe('F-10: nextedit/ purity guard (pure-core/thin-shell boundary, mechanize
  * allowlist itself is at least visible in a diff of a file whose name says
  * what it is.
  */
-describe('F-10: the adapter allowlist is exactly three files, named', () => {
-  it('ADAPTER_ALLOW contains exactly config.ts, guard.ts, shell.vscode.ts — no more, no fewer', () => {
-    expect([...ADAPTER_ALLOW].sort()).toEqual(['config.ts', 'guard.ts', 'shell.vscode.ts']);
+describe('F-10: the adapter allowlist is exactly four files, named', () => {
+  it('ADAPTER_ALLOW contains exactly config.ts, guard.ts, nextEditNotice.vscode.ts, shell.vscode.ts — no more, no fewer', () => {
+    expect([...ADAPTER_ALLOW].sort()).toEqual([
+      'config.ts',
+      'guard.ts',
+      'nextEditNotice.vscode.ts',
+      'shell.vscode.ts',
+    ]);
   });
 
   it('sanity: each allowlisted file exists on disk under nextedit/ (not a stale/typo\'d entry)', () => {

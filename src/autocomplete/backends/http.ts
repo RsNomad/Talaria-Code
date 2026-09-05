@@ -1,3 +1,5 @@
+import { isRecord } from '../../shared/typeGuards';
+
 /**
  * The subset of `fetch`'s `Response` these parsers need — just enough to be unit
  * testable against a synthetic `ReadableStream` without a real HTTP round-trip.
@@ -64,7 +66,7 @@ export class BackendStreamError extends Error {
  *  is the ONLY signal `readOpenAiSseText` keys on — see its doc comment. */
 interface OpenAiSseChunk {
   error?: unknown;
-  choices?: { text?: string; delta?: { content?: string } }[];
+  choices?: { text?: string | null; delta?: { content?: string | null } | null }[] | null;
 }
 
 /**
@@ -81,6 +83,16 @@ interface OpenAiSseChunk {
  * controls what is sent, not us.
  */
 export const MAX_STREAM_BYTES = 4 * 1024 * 1024;
+
+/**
+ * F1-9: an SSE event boundary is a blank line — the spec permits CRLF, LF,
+ * or a mix, so `\r?\n\r?\n` with the EARLIEST match wins. The per-line
+ * `data:` extraction in {@link readSseEvents} already tolerates a trailing
+ * `\r` (`line.slice(5).trim()`), so only the boundary needed fixing. Hoisted
+ * to module scope: a `g`-less regex is stateless (no `lastIndex` to leak
+ * across calls), so reuse here is safe.
+ */
+const SSE_EVENT_BOUNDARY = /\r?\n\r?\n/;
 
 /**
  * §6: the ONE class every byte-cap throw-site below constructs
@@ -208,10 +220,11 @@ export async function* readSseEvents(
       }
       buffer += decoder.decode(value, { stream: true });
 
-      let idx: number;
-      while ((idx = buffer.indexOf('\n\n')) !== -1) {
-        const rawEvent = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
+      for (;;) {
+        const m = SSE_EVENT_BOUNDARY.exec(buffer);
+        if (m === null) break;
+        const rawEvent = buffer.slice(0, m.index);
+        buffer = buffer.slice(m.index + m[0].length);
         yield* emitEvent(rawEvent);
       }
     }
@@ -258,13 +271,16 @@ export async function* readOpenAiSseText(
   for await (const data of readSseEvents(response)) {
     if (data === '[DONE]') return;
     const parsed = tryParseJson(data);
-    if (typeof parsed !== 'object' || parsed === null) continue;
+    // WS-BG (SYN-BOUNDARY): record-shaped frames only — `isRecord` also
+    // excludes arrays, which the old typeof-object check let through (they
+    // behaved as "no text" anyway; now the skip is uniform and total).
+    if (!isRecord(parsed)) continue;
     const chunk = parsed as OpenAiSseChunk;
     if (chunk.error != null) {
       throw new BackendStreamError(`${label} reported an error mid-stream`);
     }
     const text = chunk.choices?.[0]?.text ?? chunk.choices?.[0]?.delta?.content;
-    if (text) yield text;
+    if (typeof text === 'string' && text) yield text;
   }
 }
 

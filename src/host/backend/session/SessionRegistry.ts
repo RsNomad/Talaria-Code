@@ -10,6 +10,26 @@ export class SessionRegistry {
   private readonly controllers = new Map<string, SessionController>();
 
   /**
+   * CA-M04b: optional per-session teardown hook — fired synchronously with
+   * the closing session's id at EVERY `close(sessionId)` entry
+   * (UNCONDITIONALLY — including a no-op close of an id this registry no
+   * longer holds, preserving the unconditional semantics of the explicit
+   * `AcpBackend.closeTabInternal` prune this replaces) and, per
+   * formerly-registered id, after `disposeAll()`'s dispose loop.
+   * Deliberately NOT fired by `open()`'s W6-FB same-sessionId collision
+   * branch: that path REBINDS the id to a fresh controller — the id stays
+   * live, and per-id ancillary state keyed on it (`ControlDispatcher
+   * .panelFetchSeq`'s T-12 staleness tokens) must survive the re-mint.
+   * Contract: the hook is cheap, never throws, never re-enters this
+   * registry. Single writer: `ControlDispatcher`'s constructor.
+   */
+  private onClosed: ((sessionId: string) => void) | undefined = undefined;
+
+  setOnClosed(hook: (sessionId: string) => void): void {
+    this.onClosed = hook;
+  }
+
+  /**
    * Mint and register a new controller for `sessionId`, owned by `tabId`
    * (W4-T5a deliverable 1 — omit to default to `BOOTSTRAP_TAB_ID`, keeping
    * every pre-T5a single-tab caller unchanged).
@@ -25,7 +45,7 @@ export class SessionRegistry {
    * from the map FIRST, synchronously, THEN disposed — BEFORE the new
    * controller is minted and takes its slot. `dispose()` clears the stale
    * controller's `replay` (no-emit) and settles its pendingApprovals/turn,
-   * so a belated in-flight `loadReplay` on it trips ITS OWN `this.replay
+   * so a belated in-flight `loadReplayOutcome` call on it trips ITS OWN `this.replay
    * !== replay` supersede-guard the instant it resumes — the exact
    * mechanism the same-TAB C1 fix already relies on (`AcpBackend
    * .loadSessionIntoTab`'s doc), now also covering the same-SESSION-
@@ -89,6 +109,7 @@ export class SessionRegistry {
    * registered.
    */
   close(sessionId: string): void {
+    this.onClosed?.(sessionId); // CA-M04b: unconditional — see the hook's doc
     const controller = this.controllers.get(sessionId);
     if (!controller) return;
     this.controllers.delete(sessionId);
@@ -105,5 +126,6 @@ export class SessionRegistry {
     const all = [...this.controllers.values()];
     this.controllers.clear();
     for (const controller of all) controller.dispose();
+    for (const controller of all) this.onClosed?.(controller.sessionId); // CA-M04b: per formerly-registered id
   }
 }

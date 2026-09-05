@@ -328,6 +328,9 @@ import {
   NEXT_EDIT_MODEL_UNSET_NOTE,
   genericUnsupportedBackendMessage,
   type NextEditExecutorHost,
+  type NextEditShellDeps,
+  type NextEditEgressObserver,
+  type NextEditEgressVerdict,
 } from './shell.vscode';
 import { NextEditGuard, type NextEditConfigPort, type NextEditSource } from './guard';
 import { BackendHttpError } from '../backends/http';
@@ -406,7 +409,9 @@ function makeMockHost(): MockHost {
 describe('next-edit effect executor', () => {
   it('INVARIANT (replaces the deleted wall-clock timeout): after every effect batch, jumpVisible === decorationsShown', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    // BHF-F3-15: no batch here exercises `applyEdit`, so the expectation
+    // getter is never consulted — `() => null` keeps the arrangement honest.
+    const exec = makeExecutor(mock, () => {}, () => null);
     const batches: NextEditEffect[][] = [
       [{ kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true }, { kind: 'showDecorations', p: P }],
       [{ kind: 'clearAll' }],
@@ -422,7 +427,7 @@ describe('next-edit effect executor', () => {
 
   it('clearAll drives BOTH context keys false and clears the decorations', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
 
     exec.run([
       { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
@@ -439,7 +444,7 @@ describe('next-edit effect executor', () => {
 
   it('an executor exception forces clearAll — the invariant survives a throwing host', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
     mock.throwOnShowDecorations = true;
 
     exec.run([
@@ -454,7 +459,7 @@ describe('next-edit effect executor', () => {
 
   it('F-1: a DECLINED paint forces clearAll — a SILENT no-op host may not leave jumpVisible up with nothing on screen', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
     mock.paintDeclined = true;
 
     // The exact batch `idle × proposalReady` emits. The executor's own header
@@ -473,7 +478,7 @@ describe('next-edit effect executor', () => {
 
   it('F-1: a paint DECLINED during the jumped re-render clears too (the locator re-render is a paint like any other)', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
 
     exec.run([
       { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
@@ -491,7 +496,7 @@ describe('next-edit effect executor', () => {
 
   it('reveal forwards the range to the host', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
     exec.run([{ kind: 'reveal', range: { startLine: 4, endLine: 8 } }]);
     expect(mock.reveals).toEqual([{ startLine: 4, endLine: 8 }]);
   });
@@ -499,7 +504,14 @@ describe('next-edit effect executor', () => {
   it('applyEdit reports the host boolean back as an applyResult event', async () => {
     const mock = makeMockHost();
     const results: boolean[] = [];
-    const exec = makeExecutor(mock, (ok) => void results.push(ok));
+    // BHF-F3-15: this test DOES exercise `applyEdit`, so it wires a real
+    // (non-null) getter — the MockHost's own `applyEdit` ignores `expected`
+    // (it is not the re-validating host; that logic lives in the shell's
+    // `executorHost.applyEdit`, covered by the shell-level suite below).
+    const exec = makeExecutor(mock, (ok) => void results.push(ok), () => ({
+      docVersion: 7,
+      baseText: REGION.content,
+    }));
 
     mock.applyResolves = true;
     exec.run([{ kind: 'applyEdit', region: REGION, newText: 'const a = 2;\n' }]);
@@ -513,7 +525,10 @@ describe('next-edit effect executor', () => {
   it('a REJECTED applyEdit is reported as applyResult(false), never as an unhandled rejection', async () => {
     const mock = makeMockHost();
     const results: boolean[] = [];
-    const exec = makeExecutor(mock, (ok) => void results.push(ok));
+    const exec = makeExecutor(mock, (ok) => void results.push(ok), () => ({
+      docVersion: 7,
+      baseText: REGION.content,
+    }));
 
     mock.applyRejects = true;
     exec.run([{ kind: 'applyEdit', region: REGION, newText: 'x' }]);
@@ -525,7 +540,7 @@ describe('next-edit effect executor', () => {
 
   it('noteOnce surfaces a given msgId exactly once, however many times it is emitted', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
 
     exec.run([{ kind: 'noteOnce', msgId: 'apply-failed' }]);
     exec.run([{ kind: 'noteOnce', msgId: 'apply-failed' }]);
@@ -536,7 +551,7 @@ describe('next-edit effect executor', () => {
 
   it('the locator flips to "Tab to accept" once the jumped key goes up (the FSM tabJump batch carries no showDecorations)', () => {
     const mock = makeMockHost();
-    const exec = makeExecutor(mock);
+    const exec = makeExecutor(mock, () => {}, () => null);
 
     exec.run([
       { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
@@ -663,15 +678,32 @@ function makeContext(): vscodeTypes.ExtensionContext {
   return { subscriptions: [] } as unknown as vscodeTypes.ExtensionContext;
 }
 
-/** Registers the shell against a freshly-hydrated Guard. */
-async function setupShell(toggles?: ToggleState): Promise<{
+/** Registers the shell against a freshly-hydrated Guard. `observer`
+ *  (CA-06-NE-face) is threaded FIELD-BY-FIELD — no spread-with-override
+ *  (repo purity guards) — so the observer-absent path hands the SAME
+ *  `SHELL_DEPS` object every pre-existing call site already used. */
+async function setupShell(
+  toggles?: ToggleState,
+  observer?: NextEditEgressObserver,
+): Promise<{
   guard: NextEditGuard;
   disposable: vscodeTypes.Disposable;
 }> {
   const guard = await NextEditGuard.hydrate(makeSourcePort(sourceOf(toggles)), {
     reportFailure: SHELL_DEPS.reportFailure,
   });
-  const disposable = registerTalariaNextEdit(makeContext(), guard, SHELL_DEPS);
+  const deps: NextEditShellDeps =
+    observer === undefined
+      ? SHELL_DEPS
+      : {
+          reportFailure: SHELL_DEPS.reportFailure,
+          getAutocompleteEndpoint: SHELL_DEPS.getAutocompleteEndpoint,
+          getAutocompleteModel: SHELL_DEPS.getAutocompleteModel,
+          getAutocompleteBackend: SHELL_DEPS.getAutocompleteBackend,
+          getAutocompleteApiKey: SHELL_DEPS.getAutocompleteApiKey,
+          onEgressVerdict: observer,
+        };
+  const disposable = registerTalariaNextEdit(makeContext(), guard, deps);
   return { guard, disposable };
 }
 
@@ -1862,7 +1894,7 @@ describe('V-1: next-edit is not structurally dead on an oversized file (bounded,
     expect(call.req.fileContext).not.toContain('x'.repeat(3000));
   });
 
-  it('RED-3: a 3 000-char line ON the cursor line makes the mint reject oversized-line, and the toast is the HONEST mint-rejection copy (never the server-blame fallback)', async () => {
+  it('RED-3: a 3 000-char line ON the cursor line makes the mint reject oversized-line, and the audit line is the HONEST mint-rejection copy in the LOG ONLY (never a toast, never the server-blame fallback)', async () => {
     const lines = Array.from({ length: 21 }, (_, i) => `const v${i} = ${i};`);
     lines[10] = 'x'.repeat(3000);
     const doc = `${lines.join('\n')}\n`;
@@ -1878,14 +1910,17 @@ describe('V-1: next-edit is not structurally dead on an oversized file (bounded,
     expect(backendSpy.predicts).toHaveLength(0);
     // The mint WAS reached (and rejected) — this is not an earlier gate skip.
     expect(mintCalls).toHaveLength(1);
-    expect(host.warnings).toHaveLength(1);
-    const msg = must(host.warnings[0]);
+    // CA-06-NE-face: the mint arm no longer toasts — the per-file badge +
+    // one-shot toast (nextEditNotice.vscode.ts) is the ONLY human surface
+    // for this condition now; this arm keeps only the technical audit line.
+    expect(host.warnings).toEqual([]);
+    expect(failures).toHaveLength(1);
+    const msg = must(failures[0]);
     expect(msg).toContain('oversized-line');
     expect(msg).toContain('No request was sent');
     expect(msg.toLowerCase()).not.toContain('server');
     expect(msg).not.toContain('talaria.nextEdit.endpoint');
     expect(msg).not.toContain('talaria.nextEdit.model');
-    expect(failures).toEqual([msg]);
   });
 
   /**
@@ -1920,8 +1955,12 @@ describe('V-1: next-edit is not structurally dead on an oversized file (bounded,
 
       expect(backendSpy.predicts).toHaveLength(0);
       expect(mintCalls).toHaveLength(1);
-      expect(host.warnings).toHaveLength(1);
-      const msg = must(host.warnings[0]);
+      // CA-06-NE-face: same log-once conversion as RED-3 above — this is a
+      // mint rejection too, so it no longer toasts; the audit line moves to
+      // `failures` (the technical output-channel surface).
+      expect(host.warnings).toEqual([]);
+      expect(failures).toHaveLength(1);
+      const msg = must(failures[0]);
       expect(msg).toContain('aws-akia');
       expect(msg).not.toContain(SECRET);
     });
@@ -3302,5 +3341,533 @@ describe('B-3/B-7: ordering and settle no-ops are individually observable', () =
 
     const setContextCalls = host.executed.filter((e) => e.command === 'setContext');
     expect(setContextCalls.length).toBeGreaterThan(0);
+  });
+});
+
+// ────────────── BHF-F3-15: apply-time document-version + base-text ──────────────
+// re-validation (next-edit executor). See task-5-brief.md for the finding.
+
+describe('BHF-F3-15 — makeExecutor threads the apply expectation', () => {
+  function scriptedHost(calls: string[], applyResult: boolean | Error) {
+    return {
+      setContext: (key: string, value: boolean) => {
+        calls.push(`setContext ${key}=${String(value)}`);
+      },
+      showDecorations: () => {
+        calls.push('showDecorations');
+        return true;
+      },
+      clearDecorations: () => {
+        calls.push('clearDecorations');
+      },
+      reveal: () => {
+        calls.push('reveal');
+      },
+      applyEdit: (
+        _region: EditableRegion,
+        _newText: string,
+        expected: import('./types').ApplyExpectation | null,
+      ) => {
+        calls.push(`applyEdit expected=${expected === null ? 'null' : `${expected.docVersion}:${expected.baseText}`}`);
+        return applyResult instanceof Error ? Promise.reject(applyResult) : Promise.resolve(applyResult);
+      },
+      note: (msgId: string) => {
+        calls.push(`note ${msgId}`);
+      },
+    };
+  }
+
+  const region: EditableRegion = {
+    uri: 'file:///w/a.ts',
+    filepath: 'a.ts',
+    startLine: 0,
+    endLine: 1,
+    content: 'base\ntext',
+  };
+
+  it('passes getApplyExpectation() through to host.applyEdit and reports the boolean back', async () => {
+    const calls: string[] = [];
+    const results: boolean[] = [];
+    const executor = makeExecutor(
+      scriptedHost(calls, true),
+      (ok) => results.push(ok),
+      () => ({ docVersion: 7, baseText: 'base\ntext' }),
+    );
+    executor.run([{ kind: 'applyEdit', region, newText: 'new' }]);
+    await Promise.resolve();
+    expect(calls).toEqual(['applyEdit expected=7:base\ntext']);
+    expect(results).toEqual([true]);
+  });
+
+  it('a null expectation still reaches the host (the HOST refuses — fail-closed lives host-side), and a rejecting applyEdit reports false', async () => {
+    const calls: string[] = [];
+    const results: boolean[] = [];
+    const executor = makeExecutor(
+      scriptedHost(calls, new Error('boom')),
+      (ok) => results.push(ok),
+      () => null,
+    );
+    executor.run([{ kind: 'applyEdit', region, newText: 'new' }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual(['applyEdit expected=null']);
+    expect(results).toEqual([false]);
+  });
+});
+
+describe('BHF-F3-15 — stale-coordinate apply is refused and dismissed', () => {
+  // Mirrors the 'next-edit commands' describe block's own beforeEach/afterEach
+  // verbatim (this file's established convention — see 'B-2/B-8' and 'B-3/B-7'
+  // above, which each duplicate the same setup rather than sharing it).
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHost();
+    failures.length = 0;
+    backendSpy.constructed.length = 0;
+    backendSpy.predicts.length = 0;
+    mintCalls.length = 0;
+    backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
+    autocompleteConfig.backend = 'ollama';
+    autocompleteConfig.apiKey = undefined;
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a document change in the dispatch→apply gap (version moved, no event delivered) refuses the WorkspaceEdit and fires the apply-failed note', async () => {
+    // Arrange: drive the shell to a live proposal in `jumped` state exactly
+    // as the existing accept-path test does (proposalReady → tabJump) — see
+    // 'jump then accept applies the edit through a plain WorkspaceEdit'.
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false });
+    await fireTrigger();
+
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+    expect(contextKeyValue('talaria.nextEdit.jumped')).toBe(true);
+
+    // THE GAP: mutate the fake document's version + text directly WITHOUT
+    // firing a change event — modeling a change whose event has not reached
+    // the shell yet (the unguarded window the finding names).
+    const editor = must(host.activeTextEditor);
+    editor.document.version += 1;
+
+    // Act: Tab-accept.
+    must(host.registeredCommands.get('talaria.nextEdit.accept'))();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Assert: NO edit was applied; the existing dismiss+note path fired.
+    expect(host.appliedEdits).toEqual([]);
+    expect(host.warnings.some((w) => w.includes('could not be applied'))).toBe(true);
+  });
+
+  it('the happy path is unchanged: version and base text intact ⇒ the edit applies', async () => {
+    // Same arrangement, no mutation between jump and accept.
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false });
+    await fireTrigger();
+
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+
+    must(host.registeredCommands.get('talaria.nextEdit.accept'))();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(host.appliedEdits).toHaveLength(1);
+    expect(host.warnings).toEqual([]);
+  });
+
+  it('base-text drift at an unmoved version (belt: what version cannot see) refuses and dismisses', async () => {
+    // Same arrangement; mutate the region TEXT the fake document serves for
+    // getText(range) WITHOUT bumping version (only a harness can do this —
+    // real vscode cannot — which is exactly why the belt exists: it also
+    // catches any future reanchor-drift bug).
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false });
+    await fireTrigger();
+
+    await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+
+    const editor = must(host.activeTextEditor);
+    editor.document.getText = (range?: { start: FakePosition; end: FakePosition }): string =>
+      range === undefined ? DOC_TEXT : 'DRIFTED BASE TEXT';
+
+    must(host.registeredCommands.get('talaria.nextEdit.accept'))();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(host.appliedEdits).toEqual([]);
+    expect(host.warnings.some((w) => w.includes('could not be applied'))).toBe(true);
+  });
+});
+
+// ───────── WS-FIM T15 — FUNC-NEXTEDIT characterization: ordered host-effect ─────────
+// trace pins (pre-T16 move). Lesson applied (memory: T13/WS-R1): pin the
+// ORDERING of host effects, not the end state — a final-state pin can be
+// backstop-masked. These are behavior-preservation pins for T16's promotion
+// of `registerTalariaNextEdit` to a class: characterization tests that pass
+// GREEN on current code (that IS success here, not a RED-first cycle).
+
+describe('FUNC-NEXTEDIT characterization — executor ordered-effect trace (pre-T16 move)', () => {
+  /**
+   * A THIRD `scriptedHost`, block-local — same shape as the BHF-F3-15 one
+   * above, duplicated rather than shared (this file's established
+   * convention; see the 'BHF-F3-15 — stale-coordinate apply is refused'
+   * block's own comment about mirroring setup verbatim). Every call renders
+   * as exactly one string so a whole multi-batch scenario reads as ONE
+   * ordered list via a single `toEqual`.
+   */
+  function scriptedHost(calls: string[], applyResult: boolean | Error) {
+    return {
+      setContext: (key: string, value: boolean) => {
+        calls.push(`setContext ${key}=${String(value)}`);
+      },
+      showDecorations: () => {
+        calls.push('showDecorations');
+        return true;
+      },
+      clearDecorations: () => {
+        calls.push('clearDecorations');
+      },
+      reveal: () => {
+        calls.push('reveal');
+      },
+      applyEdit: (
+        _region: EditableRegion,
+        _newText: string,
+        expected: import('./types').ApplyExpectation | null,
+      ) => {
+        calls.push(
+          `applyEdit expected=${expected === null ? 'null' : `${expected.docVersion}:${expected.baseText}`}`,
+        );
+        return applyResult instanceof Error ? Promise.reject(applyResult) : Promise.resolve(applyResult);
+      },
+      note: (msgId: string) => {
+        calls.push(`note ${msgId}`);
+      },
+    };
+  }
+
+  const p: AnchoredProposal = {
+    region: { uri: 'file:///w/a.ts', filepath: 'a.ts', startLine: 2, endLine: 6, content: 'R' },
+    newText: 'N',
+    docVersion: 3,
+    cursorLine: 4,
+  };
+
+  it('pins the exact host-call order for the canonical batches', async () => {
+    const calls: string[] = [];
+    const results: boolean[] = [];
+    const executor = makeExecutor(
+      scriptedHost(calls, true),
+      (ok) => results.push(ok),
+      () => ({ docVersion: 3, baseText: 'R' }),
+    );
+    // proposalReady batch (idle×proposalReady): setContext THEN paint.
+    executor.run([
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
+      { kind: 'showDecorations', p },
+    ]);
+    // proposed×tabJump batch: jumped flip triggers the property-2 re-render, then reveal.
+    executor.run([
+      { kind: 'setContext', key: 'talaria.nextEdit.jumped', value: true },
+      { kind: 'reveal', range: { startLine: 2, endLine: 6 } },
+    ]);
+    // jumped×tabAccept batch: applyEdit THEN clearAll.
+    executor.run([{ kind: 'applyEdit', region: p.region, newText: 'N' }, { kind: 'clearAll' }]);
+    await Promise.resolve();
+
+    expect(calls).toEqual([
+      'setContext talaria.nextEdit.jumpVisible=true',
+      'showDecorations',
+      'setContext talaria.nextEdit.jumped=true',
+      'showDecorations', // property 2: the jumped flip re-renders in place
+      'reveal',
+      'applyEdit expected=3:R',
+      'setContext talaria.nextEdit.jumpVisible=false', // clearAll, exact internal order
+      'setContext talaria.nextEdit.jumped=false',
+      'clearDecorations',
+    ]);
+    expect(results).toEqual([true]);
+  });
+
+  it('pins the declined-paint order: a false showDecorations forces the full clearAll sequence immediately', () => {
+    const calls: string[] = [];
+    const host = scriptedHost(calls, true);
+    host.showDecorations = () => {
+      calls.push('showDecorations->declined');
+      return false;
+    };
+    const executor = makeExecutor(host, () => {}, () => null);
+    executor.run([
+      { kind: 'setContext', key: 'talaria.nextEdit.jumpVisible', value: true },
+      { kind: 'showDecorations', p },
+    ]);
+    expect(calls).toEqual([
+      'setContext talaria.nextEdit.jumpVisible=true',
+      'showDecorations->declined',
+      'setContext talaria.nextEdit.jumpVisible=false',
+      'setContext talaria.nextEdit.jumped=false',
+      'clearDecorations',
+    ]);
+  });
+});
+
+/**
+ * Shell-level ordered trace: ONE scenario through the REAL
+ * `registerTalariaNextEdit` against the fake-vscode harness, from activation
+ * through an applied edit. Reuses `setupShell`/`fireTrigger`/
+ * `host.docChangeHandlers`/`makeEditor`/`makeDoc` verbatim (the same pieces
+ * 'next-edit commands' and 'next-edit document listeners' already use above)
+ * — no parallel harness.
+ *
+ * The interleaved trace is assembled by tapping the harness's OWN recorders
+ * (`host.executed`'s setContext entries, `host.decorationCalls`,
+ * `host.reveals`, `host.appliedEdits`) IN REAL TIME as the scenario runs, so
+ * the merge reflects the true cross-array call order rather than a guess
+ * reconstructed after the fact from four separately-timestamped arrays. The
+ * tap is installed and torn down inside this one test only — it is never a
+ * permanent change to the shared `host` fake.
+ */
+describe('FUNC-NEXTEDIT characterization — shell ordered-effect trace (pre-T16 move)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHost();
+    failures.length = 0;
+    backendSpy.constructed.length = 0;
+    backendSpy.predicts.length = 0;
+    mintCalls.length = 0;
+    backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
+    autocompleteConfig.backend = 'ollama';
+    autocompleteConfig.apiKey = undefined;
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Temporarily wraps `arr.push` to also feed `onPush`, returning the
+   *  restorer. Scoped to ONE test via the `finally` below — never a
+   *  permanent harness change. */
+  function tapPush<T>(arr: T[], onPush: (item: T) => void): () => void {
+    const original = arr.push.bind(arr);
+    arr.push = (...items: T[]): number => {
+      for (const item of items) onPush(item);
+      return original(...items);
+    };
+    return () => {
+      arr.push = original;
+    };
+  }
+
+  /** Region calls carry bare `Range`-shaped entries (`.start`/`.end`
+   *  directly); locator calls carry `{ range, renderOptions }` entries —
+   *  same shape distinction 'an edit ENTIRELY ABOVE the region SHIFTS...'
+   *  uses above. An empty `ranges` array (a `clearDecorations` sweep) cannot
+   *  be told apart by shape, hence the third label. */
+  function decorationLabel(call: { type: string; ranges: unknown[] }): string {
+    if (call.ranges.length === 0) return 'setDecorations clear';
+    const first = call.ranges[0];
+    return typeof first === 'object' && first !== null && 'start' in first
+      ? 'setDecorations region'
+      : 'setDecorations locator';
+  }
+
+  it('pins one interleaved host-effect trace: activation -> toggle-on -> edit burst -> proposalReady paint -> docChanged remap -> tabJump -> tabAccept -> applied', async () => {
+    const trace: string[] = [];
+    const untaps = [
+      tapPush(host.executed, (item) => {
+        if (item.command === 'setContext') {
+          trace.push(`setContext ${String(item.args[0])}=${String(item.args[1])}`);
+        }
+      }),
+      tapPush(host.decorationCalls, (item) => trace.push(decorationLabel(item))),
+      tapPush(host.reveals, () => trace.push('reveal')),
+      tapPush(host.appliedEdits, (item) => {
+        const r = item.range as { start: { line: number }; end: { line: number } };
+        trace.push(`applyEdit range=${r.start.line}-${r.end.line}`);
+      }),
+    ];
+
+    try {
+      // activation + toggle-on (NextEditGuard hydrated straight to
+      // 'dedicated', the same pattern every test in this file uses).
+      const tallLines = Array.from({ length: 60 }, (_, i) => `const v${i} = ${i};`);
+      const doc = makeDoc({ text: `${tallLines.join('\n')}\n` });
+      host.activeTextEditor = makeEditor(doc, 40); // region = lines 30..50 (windowLines=10)
+      await setupShell({ next: true, generic: false });
+
+      // edit burst -> (mocked backend) round-trip -> proposalReady paint.
+      await fireTrigger();
+      expect(contextKeyValue('talaria.nextEdit.jumpVisible')).toBe(true);
+
+      // docChanged remap: an edit entirely ABOVE the region shifts it rather
+      // than dismissing it (same shape as 'an edit ENTIRELY ABOVE the region
+      // SHIFTS the proposal down instead of dismissing it', above). Unlike
+      // that test, THIS scenario goes on to apply through the real region
+      // text afterwards, so the fake document's actual lines must reflect
+      // the insertion too (inserting 'a\nb\n' at line 5 shifts everything
+      // from line 5 down by two, content unchanged) — a plain `.version`
+      // bump on the SAME object (as `fireDocChange` above does) does not
+      // touch the closed-over `lines` the fake's `getText`/`lineAt` read
+      // from, which the BHF-F3-15 base-text-drift test relies on directly.
+      const editedLines = [...tallLines.slice(0, 5), 'a', 'b', ...tallLines.slice(5)];
+      const editedDoc = makeDoc({ text: `${editedLines.join('\n')}\n`, version: doc.version + 1 });
+      host.activeTextEditor = makeEditor(editedDoc, 42); // same identity (default uri); cursor is stale post-shift, unused after this point
+      for (const handler of host.docChangeHandlers) {
+        handler({
+          document: editedDoc,
+          contentChanges: [
+            { range: { start: { line: 5, character: 0 }, end: { line: 5, character: 0 } }, text: 'a\nb\n' },
+          ],
+        });
+      }
+
+      // tabJump.
+      await host.registeredCommands.get('talaria.nextEdit.jump')?.();
+      // tabAccept -> applied.
+      await host.registeredCommands.get('talaria.nextEdit.accept')?.();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(host.appliedEdits).toHaveLength(1);
+    } finally {
+      for (const untap of untaps) untap();
+    }
+
+    expect(trace).toEqual([
+      // idle×proposalReady: setContext THEN the paint (region, then locator).
+      'setContext talaria.nextEdit.jumpVisible=true',
+      'setDecorations region',
+      'setDecorations locator',
+      // proposed×docChanged(remapped): re-anchor repaints, no setContext —
+      // the proposal did not change, only its on-screen coordinates.
+      'setDecorations region',
+      'setDecorations locator',
+      // proposed×tabJump: setContext, THEN the executor's own property-2
+      // re-render (the jumped flip repaints the locator's verb in place),
+      // THEN reveal.
+      'setContext talaria.nextEdit.jumped=true',
+      'setDecorations region',
+      'setDecorations locator',
+      'reveal',
+      // jumped×tabAccept: applyEdit (at the RE-ANCHORED span, 32-52 = the
+      // original 30-50 shifted +2 by the docChanged step above) THEN
+      // clearAll's two setContext calls. clearAll's THIRD action
+      // (clearDecorations) produces no `setDecorations` entries here because
+      // this scenario's `host.visibleTextEditors` is empty — the same
+      // harness shape 'jump then accept applies the edit through a plain
+      // WorkspaceEdit' above uses, never populated there either.
+      'applyEdit range=32-52',
+      'setContext talaria.nextEdit.jumpVisible=false',
+      'setContext talaria.nextEdit.jumped=false',
+    ]);
+  });
+});
+
+/**
+ * CA-06-NE-face — the egress-verdict observer seam (WS-FIM T16b).
+ *
+ * `onEgressVerdict` is optional and purely observational: every existing
+ * test above hands the shell the plain `SHELL_DEPS` object (no observer),
+ * so this suite is the ONLY place the seam is exercised — the untouched
+ * suite above is the observer-absent control (design §7(a)).
+ */
+describe('CA-06-NE-face — the egress-verdict observer seam', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHost();
+    failures.length = 0;
+    backendSpy.constructed.length = 0;
+    backendSpy.predicts.length = 0;
+    mintCalls.length = 0;
+    backendSpy.respond = () => Promise.resolve({ text: 'REWRITTEN LINE\n', stopReason: 'stop' as const });
+    autocompleteConfig.endpoint = 'http://127.0.0.1:11434';
+    autocompleteConfig.model = 'qwen2.5-coder:7b';
+    autocompleteConfig.backend = 'ollama';
+    autocompleteConfig.apiKey = undefined;
+    host.settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11435');
+    host.settings.set('talaria.nextEdit.model', 'sweep-next-edit-v2-7B');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('GATE 5: a secret-path file notifies (uri, path-block) — and still builds nothing', async () => {
+    const seen: Array<[string, NextEditEgressVerdict]> = [];
+    host.activeTextEditor = makeEditor(
+      makeDoc({ uri: 'file:///home/u/.env', path: '/home/u/.env' }),
+    );
+    await setupShell({ next: true, generic: false }, (filepath, verdict) => {
+      seen.push([filepath, verdict]);
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(0);
+    expect(mintCalls).toEqual([]); // the gate still returns before the mint
+    expect(seen).toHaveLength(1);
+    expect(must(seen[0])[1]).toBe('path-block');
+  });
+
+  it('a mint rejection notifies content-block, logs ONCE (no toast), and stays fail-closed', async () => {
+    const seen: NextEditEgressVerdict[] = [];
+    // The RED-3 arrangement: a 3 000-char line ON the cursor line makes the
+    // mint reject (ruleId oversized-line) — same fixture, new surfacing.
+    const lines = Array.from({ length: 21 }, (_, i) => `const v${i} = ${i};`);
+    lines[10] = 'x'.repeat(3000);
+    host.activeTextEditor = makeEditor(makeDoc({ text: `${lines.join('\n')}\n` }), 10);
+    await setupShell({ next: true, generic: false }, (_filepath, verdict) => {
+      seen.push(verdict);
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(0);
+    expect(mintCalls).toHaveLength(1); // the mint WAS reached and rejected
+    expect(seen).toEqual(['content-block']);
+    expect(host.warnings).toEqual([]); // NO shell toast any more — the surface owns the human side
+    expect(failures).toHaveLength(1); // the technical audit line survives, once
+    expect(must(failures[0])).toContain('oversized-line');
+    expect(must(failures[0])).toContain('No request was sent');
+  });
+
+  it('a successful mint notifies allow and the request proceeds', async () => {
+    const seen: NextEditEgressVerdict[] = [];
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false }, (_filepath, verdict) => {
+      seen.push(verdict);
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(1);
+    expect(seen).toEqual(['allow']);
+  });
+
+  it('a THROWING observer changes nothing: the allow-path request still goes out', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    await setupShell({ next: true, generic: false }, () => {
+      throw new Error('surface exploded');
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(1); // the throw was swallowed BEFORE the backend call
+    expect(host.warnings).toEqual([]); // and never misclassified as a trigger failure
+  });
+
+  it('a THROWING observer changes nothing on the path-block gate either', async () => {
+    host.activeTextEditor = makeEditor(makeDoc({ uri: 'file:///home/u/.env', path: '/home/u/.env' }));
+    await setupShell({ next: true, generic: false }, () => {
+      throw new Error('surface exploded');
+    });
+
+    await fireTrigger();
+
+    expect(backendSpy.predicts).toHaveLength(0);
+    expect(mintCalls).toEqual([]);
   });
 });

@@ -165,10 +165,17 @@ describe('LOCK: every nextedit/ file that calls fetch( also calls assertSecureAu
       // force every new `nextedit/` file through this lock rather than
       // bumping the count reflexively — it was looked at, and it is clean.
       'fileWindow.ts',
+      // CA-06-NE-face (WS-FIM T16b) — the next-edit notice surface. It
+      // contains no `fetch(` call at all (it only renders a language-status
+      // badge + a toast from the shell's OWN, already-scanned verdict), so
+      // it passes this lock by containing nothing the pattern matches —
+      // named here for the same reason `fileWindow.ts` above is: forced
+      // through this lock rather than the count bumped reflexively.
+      'nextEditNotice.vscode.ts',
     ]) {
       expect(files).toContain(expected);
     }
-    expect(files.length).toBe(14);
+    expect(files.length).toBe(15);
   });
 
   it('no non-allowlisted nextedit/ file contains fetch( without also calling BOTH assertSecureAuthTransport( and mintScannedNextEditRequest( (the real lock)', () => {

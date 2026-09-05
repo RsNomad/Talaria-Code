@@ -11,7 +11,8 @@ import type {
   ThemeKind,
   WebviewState,
 } from '../shared/protocol';
-import { AgentBackend } from './backend/AgentBackend';
+import type { AgentBackend } from './backend/AgentBackend';
+import { gatewayHealthMessage } from './backend/gatewayHealth';
 import { getNonce } from './util/nonce';
 import { buildSearchFilesResponse } from './context/searchFilesResponse';
 import type { FindFilesFn } from './context/searchFilesResponse';
@@ -120,7 +121,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
   /** View id contributed in package.json (Agent C) and used in `activate`. */
   public static readonly viewId = 'talaria.panel';
 
-  private view?: vscode.WebviewView;
+  private view: vscode.WebviewView | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   /** TE-7 (AU-31): per-VIEW scope — `resolveWebviewView`'s own subscriptions
    *  (`onDidReceiveMessage`, `onDidDispose`), as opposed to {@link
@@ -157,7 +158,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * parameter property) so {@link setSearchFiles} can rewire it on a
    * mock→real backend upgrade, mirroring {@link setBackend}'s swap seam.
    */
-  private searchFiles?: FindFilesFn;
+  private searchFiles: FindFilesFn | undefined;
 
   /**
    * W5.1 R5 (Task 13): the «Next Edit Suggestions» toggle capability, wired by
@@ -168,10 +169,10 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * answered with an honest refusal instead of being forwarded to an agent
    * that does not own this state.
    */
-  private nextEditToggles?: NextEditTogglePort;
+  private nextEditToggles: NextEditTogglePort | undefined;
   /** Subscription to {@link nextEditToggles}'s `onDidChange`; replaced (and
    *  disposed) if the port is ever rewired, so one push never becomes two. */
-  private nextEditTogglesSub?: vscode.Disposable;
+  private nextEditTogglesSub: vscode.Disposable | undefined;
 
   /**
    * Task 9 (onboarding-backend-setup-architecture.md §7/§8): the Setup /
@@ -227,7 +228,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * one seed is held — a second `seedComposer` before delivery overwrites
    * the first (last-wins; matches `postToWebview`'s no-queueing posture for
    * every other message type). */
-  private pendingSeed?: { text: string; mentions?: ContextRef[] };
+  private pendingSeed: { text: string; mentions?: ContextRef[] } | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -387,6 +388,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // trust-upgrade mock->acp swap gets; `WebviewState.backendKind` at the
     // next genuine hydrate is the OTHER half of the pair.
     this.postToWebview({ type: 'backend.state', kind: backend.kind });
+    this.postGatewayHealth();
     if (this.view) {
       // T-1 (V-12 RESTART-STATE): no host-side `clear` here anymore — the
       // retired `PENDING_SESSION_PLACEHOLDER` was a dead letter
@@ -516,12 +518,15 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         'Talaria: the seeded prompt exceeded the 64 KB limit and was truncated.',
       );
     }
-    const payload = { text: capped.text, mentions: seed.mentions };
+    const payload = {
+      text: capped.text,
+      ...(seed.mentions !== undefined ? { mentions: seed.mentions } : {}),
+    };
 
     this.revealView();
 
     if (decideSeedDelivery(this.isWebviewLive) === 'post') {
-      this.postToWebview({ type: 'composer.seed', text: payload.text, mentions: payload.mentions });
+      this.postToWebview({ type: 'composer.seed', ...payload });
     } else {
       this.pendingSeed = payload;
     }
@@ -622,6 +627,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         this.webviewSignalEmitter.fire({ kind: 'ready' });
         this.postTheme();
         this.postToWebview({ type: 'hydrate', state: this.seedState() });
+        this.postGatewayHealth();
         // R-C4: only the FIRST ready arms the backend. A re-created view
         // (memory-pressure dispose; retainContextWhenHidden is best-effort)
         // re-hydrates but must NOT replace the live ACP session.
@@ -740,7 +746,11 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       case 'tab.close':
         // W4 §2d: only a BOUND tab has a session to close — a still-unbound
         // tab (its `tab.open` never resolved) carries no `sessionId`.
-        if (message.sessionId) this.backend.closeTab(message.sessionId);
+        // CA-M16 (WS-BG): PRESENCE, not truthiness — the wire contract's
+        // discriminator is "sessionId absent for a still-unbound tab"
+        // (protocol.ts:2297-2300); a truthy check conflates absent with
+        // falsy, and this boundary's job is to mirror the contract exactly.
+        if (message.sessionId !== undefined) this.backend.closeTab(message.sessionId);
         break;
 
       case 'tab.activate':
@@ -844,8 +854,17 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
    * it can never be mistaken for an ordinary file compare.
    */
   private openDiffPreview(sessionId: string, toolId: string, path: string): void {
-    const before = vscode.Uri.from(buildDiffUriParts('before', sessionId, toolId, path));
-    const after = vscode.Uri.from(buildDiffUriParts('after', sessionId, toolId, path));
+    const beforeParts = buildDiffUriParts('before', sessionId, toolId, path);
+    const afterParts = buildDiffUriParts('after', sessionId, toolId, path);
+    if (!beforeParts || !afterParts) {
+      // CA-M17 (WS-BG): an id the talaria-diff: URI cannot round-trip is
+      // refused — the registry refused registering it too, so there is
+      // nothing to preview. Ids only; never log paths/content here.
+      this.logger?.appendLine('[diff.open] refused: session/tool id is not talaria-diff-safe');
+      return;
+    }
+    const before = vscode.Uri.from(beforeParts);
+    const after = vscode.Uri.from(afterParts);
     const basename = path.split('/').pop() || path;
     // F-3 (final-4way-fixes.md): still fire-and-forget (no caller awaits
     // this), but a rejection (e.g. no diff content provider registered) is
@@ -983,7 +1002,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         requestId,
         ok: false,
         error: { message: 'unknown method' },
-        instanceId,
+        ...(instanceId !== undefined ? { instanceId } : {}),
       });
       return;
     }
@@ -1025,7 +1044,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         requestId,
         ok: true,
         result: redactControlResponse(method, result),
-        instanceId,
+        ...(instanceId !== undefined ? { instanceId } : {}),
       });
     } catch (err) {
       if (panel) {
@@ -1037,7 +1056,7 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         requestId,
         ok: false,
         error: { message: errorMessage(err) },
-        instanceId,
+        ...(instanceId !== undefined ? { instanceId } : {}),
       });
     }
   }
@@ -1209,11 +1228,21 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     const seed = this.pendingSeed;
     if (!seed) return;
     this.pendingSeed = undefined;
-    this.postToWebview({ type: 'composer.seed', text: seed.text, mentions: seed.mentions });
+    this.postToWebview({ type: 'composer.seed', ...seed });
   }
 
   private postTheme(): void {
     this.postToWebview({ type: 'theme', theme: this.currentTheme() });
+  }
+
+  /** UX-02: one unconditional re-sync of the standing gateway-health signal.
+   * The push is edge-triggered backend-side; a (re)created webview boots to
+   * {state:'ok'}, so every hydrate needs the CURRENT combined truth —
+   * fresh-computed, never the last transition payload. No-op under mock
+   * (optional capability, AgentBackend.currentGatewayHealth?). */
+  private postGatewayHealth(): void {
+    const health = this.backend.currentGatewayHealth?.();
+    if (health) this.postToWebview(gatewayHealthMessage(health));
   }
 
   private currentTheme(): ThemeInfo {
@@ -1231,6 +1260,8 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
     // 'setup'.
     const activePanel = this.initialPanel;
     this.initialPanel = 'chat';
+    const availableCommands = this.availableCommands();
+    const tabs = this.liveTabs();
     return {
       sessionId: null,
       theme: this.currentTheme(),
@@ -1250,14 +1281,14 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
       // `available_commands` catalog without the adapter replaying it.
       // Absent/undefined until the first catalog arrives, or on a backend
       // with no commands seam (mock).
-      availableCommands: this.availableCommands(),
+      ...(availableCommands !== undefined ? { availableCommands } : {}),
       // W6-FF (3-way ARCH I-1): every LIVE session the registry currently
       // holds — lets the webview reconcile its WHOLE tab model on a
       // memory-pressure webview re-create (`retainContextWhenHidden` is
       // best-effort, :366) instead of orphaning them (drop-unknown). Absent
       // on a genuine cold boot (empty registry) or a backend with no
       // multi-tab registry (mock) — see {@link liveTabs}.
-      tabs: this.liveTabs(),
+      ...(tabs !== undefined ? { tabs } : {}),
     };
   }
 

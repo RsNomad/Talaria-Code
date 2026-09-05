@@ -49,7 +49,7 @@ function normalizeCaughtError(thrown: unknown): Error {
 }
 
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  state: ErrorBoundaryState = { error: undefined };
+  override state: ErrorBoundaryState = { error: undefined };
 
   static getDerivedStateFromError(thrown: unknown): ErrorBoundaryState {
     return { error: normalizeCaughtError(thrown) };

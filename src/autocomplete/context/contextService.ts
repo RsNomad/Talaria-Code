@@ -465,9 +465,15 @@ export class CrossFileContextService {
             kind: candidate.kind,
             startLine: candidate.startLine,
             endLine: candidate.endLine,
-            score: candidate.score,
             anchor: requestAnchor,
           };
+          // Post-assign (not a `score: candidate.score` field on the literal
+          // above) — `score` is optional and `candidate.score` may genuinely
+          // be `undefined`; exactOptionalPropertyTypes distinguishes absent
+          // from explicit undefined, so the key is added only when present.
+          if (candidate.score !== undefined) {
+            ingestCandidate.score = candidate.score;
+          }
           this.ringBuffer.ingest(ingestCandidate, liveAnchor.uri, liveAnchor);
         }
       }

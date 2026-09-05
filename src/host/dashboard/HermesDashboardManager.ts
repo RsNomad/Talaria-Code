@@ -116,11 +116,41 @@ export interface HermesDashboardManagerOptions {
 /** Default backoff for the post-spawn health probe (~9.4s total across 8 tries). */
 const DEFAULT_PROBE_BACKOFF_MS = [150, 300, 500, 800, 1200, 1600, 2000, 2800];
 
+/** F2-18: how long a SIGTERM'd dashboard child gets before SIGKILL. */
+export const DASHBOARD_KILL_ESCALATION_MS = 3_000;
+
+/**
+ * F2-18: SIGTERM now; SIGKILL after `escalationMs` if the child still has
+ * not died (a wedged `serve` used to survive dispose forever). The timer is
+ * unref()'d so a dying extension host never waits on it. Exported because
+ * the real spawn path is build-blind to the unit suite (deps.spawn is
+ * injected) — this helper IS the testable seam.
+ */
+export function killWithEscalation(
+  target: { kill(signal?: NodeJS.Signals): boolean },
+  isDead: () => boolean,
+  escalationMs: number = DASHBOARD_KILL_ESCALATION_MS,
+): void {
+  target.kill();
+  if (isDead()) return;
+  const timer = setTimeout(() => {
+    if (!isDead()) target.kill('SIGKILL');
+  }, escalationMs);
+  timer.unref?.();
+}
+
 export class HermesDashboardManager implements DashboardService {
   private readonly deps: HermesDashboardManagerDeps;
   private readonly probeBackoffMs: number[];
   private child: DashboardChild | undefined;
   private ready: Promise<DashboardClientLike> | undefined;
+  /**
+   * F3-12: true only once `this.ready` has settled SUCCESSFULLY and is still
+   * the current memo. Gates re-validation to RESOLVED memos ONLY — concurrent
+   * callers during bring-up (`!readyResolved`) join the in-flight attempt
+   * instead of double-probing a client `waitHealthy` just verified.
+   */
+  private readyResolved = false;
   private disposed = false;
 
   constructor(private readonly opts: HermesDashboardManagerOptions) {
@@ -129,9 +159,9 @@ export class HermesDashboardManager implements DashboardService {
       makeClient: (token) =>
         new HermesDashboardClient({
           port: opts.port,
-          host: opts.host,
-          token,
-          logger: opts.logger,
+          ...(opts.host !== undefined ? { host: opts.host } : {}),
+          ...(token !== undefined ? { token } : {}),
+          ...(opts.logger !== undefined ? { logger: opts.logger } : {}),
         }),
       spawn: (token) => this.spawnServe(token),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -142,15 +172,10 @@ export class HermesDashboardManager implements DashboardService {
 
   ensure(): Promise<DashboardClientLike> {
     if (this.disposed) return Promise.reject(new Error('HermesDashboardManager: disposed'));
-    // CF-15: a previously memoized bring-up (`this.ready` already resolved)
-    // can go stale when the child dies AFTER we started trusting it — e.g. the
-    // spawned Hermes backend crashes post-ready. Without this re-check, the
-    // Skills/Tools panel's "Retry" would call `ensure()` and get the SAME dead
-    // client back forever (the memo only clears on a bring-up REJECTION, never
-    // on a later liveness change). Detect that here, before the memo check,
-    // and clear the same fields `dispose()` clears — `kill()` is idempotent
-    // (a no-op on an already-dead child) so this mirrors that path exactly
-    // rather than hand-rolling a partial reset.
+    // CF-15 (kept as the cheap synchronous fast path): a spawned child KNOWN
+    // dead — kill + clear before the memo check. F3-12 below covers what
+    // this never could: adopt mode has no child at all, and a server can be
+    // dead while the process flag still reads alive.
     if (this.child && !this.child.alive()) {
       try {
         this.child.kill();
@@ -159,31 +184,57 @@ export class HermesDashboardManager implements DashboardService {
       }
       this.child = undefined;
       this.ready = undefined;
+      this.readyResolved = false;
     }
     if (!this.ready) {
-      // CF-15 review: the dead-child guard above can clear this.ready/this.child
-      // and force a SECOND, concurrent bringUp() while an EARLIER bringUp() is
-      // still pending (its own this.child was already assigned pre-health-probe).
-      // If that stale first attempt later fails, its rejection must NOT clobber
-      // this.ready if a newer bring-up has since become the current memo — mirror
-      // the codebase's identity self-reset idiom (ConnectionSupervisor's
-      // `this.inFlightStart === run`): capture the attempt promise itself and
-      // only clear this.ready if it is STILL that same attempt.
-      const attempt: Promise<DashboardClientLike> = this.bringUp().catch((err) => {
-        // Clear the memo so the NEXT panel fetch (Retry) re-attempts adopt/spawn
-        // rather than caching the failure forever — but only if we're still the
-        // current attempt (see comment above).
-        if (this.ready === attempt) this.ready = undefined;
-        throw err;
-      });
+      // (identity self-reset idiom preserved — see the original CF-15 comment)
+      const attempt: Promise<DashboardClientLike> = this.bringUp().then(
+        (client) => {
+          if (this.ready === attempt) this.readyResolved = true;
+          return client;
+        },
+        (err: unknown) => {
+          if (this.ready === attempt) {
+            this.ready = undefined;
+            this.readyResolved = false;
+          }
+          throw err;
+        },
+      );
       this.ready = attempt;
+      this.readyResolved = false;
+      return attempt;
     }
-    return this.ready;
+    if (!this.readyResolved) return this.ready; // bring-up in flight — waitHealthy just probed; don't double-probe
+    // F3-12: re-validate a RESOLVED memo with a live HTTP probe (GET
+    // /api/status via client.probe(), never-throws). A dead server — spawn
+    // OR adopt mode — heals by one full re-bring-up instead of being cached
+    // forever. Identity-guarded exactly like the attempt above; recursion is
+    // bounded at depth 2 (the re-entry takes the !this.ready branch).
+    const current = this.ready;
+    return current.then(async (client) => {
+      if (await client.probe()) return client;
+      if (this.disposed) throw new Error('HermesDashboardManager: disposed');
+      if (this.ready === current) {
+        this.ready = undefined;
+        this.readyResolved = false;
+        if (this.child) {
+          try {
+            this.child.kill();
+          } catch (err) {
+            this.log(`failed to kill dead dashboard child: ${errorMessage(err)}`);
+          }
+          this.child = undefined;
+        }
+      }
+      return this.ensure();
+    });
   }
 
   dispose(): void {
     this.disposed = true;
     this.ready = undefined;
+    this.readyResolved = false;
     if (this.child) {
       try {
         this.child.kill();
@@ -340,7 +391,7 @@ export class HermesDashboardManager implements DashboardService {
       dead = true;
       this.log(`dashboard child exited (code ${code})`);
     });
-    return { kill: () => proc.kill(), alive: () => !dead };
+    return { kill: () => killWithEscalation(proc, () => dead), alive: () => !dead };
   }
 
   private describeTarget(): string {

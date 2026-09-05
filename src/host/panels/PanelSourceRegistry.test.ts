@@ -38,7 +38,6 @@ function makeContext(overrides: Partial<PanelSourceContext> = {}): PanelSourceCo
     getSessionSubagentsSnapshot: () => undefined,
     getRootTracker: () => undefined,
     getOneShotSessionIds: () => new Set(),
-    logger: undefined,
     ...overrides,
   };
 }

@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { ReactElement } from 'react';
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { AgentSetupPhase, SetupBackendOption, SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
 import { NEXT_EDIT_ROWS } from './nextEditCopy';
@@ -23,6 +23,7 @@ import {
   pendingSelectionLine,
   PIPX_INSTALL_DOCS_URL,
   progressKey,
+  PULL_NOT_CONFIRMED_TEXT,
   PYTHON_VERSION_HELP_URL,
   RAG_LLAMACPP_MODEL_NOTE,
   RAG_MODEL_FIELD_CAPTION,
@@ -332,6 +333,46 @@ describe('Agent card — renders every AgentSetupPhase fixture (§6 card 1)', ()
   });
 });
 
+describe('Agent card — "installing" phase: Cancel moved out of the live region (A11Y-05)', () => {
+  it('the live sub-phase text stays inside aria-live, but Cancel does NOT', () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'installing', selectedId: 'hermes' } });
+    const progress = {
+      [progressKey('install', 'hermes')]: { op: 'install' as const, id: 'hermes', logTail: [], phase: 'downloading' },
+    };
+    renderPanel(data, { progress });
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    expect(within(agentSection).getByText('(downloading)').closest('[aria-live]')).not.toBeNull();
+    expect(within(agentSection).getByRole('button', { name: 'Cancel' }).closest('[aria-live]')).toBeNull();
+  });
+});
+
+describe('F2-20-face site 6: Agent card "installing" Cancel announces the HOST outcome', () => {
+  it('{cancelled:true} → announces "Cancelled"', async () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'installing', selectedId: 'hermes' } });
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: true, matched: 'hermes' }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { dispatch });
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    await user.click(within(agentSection).getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Cancelled')).toBeInTheDocument();
+  });
+
+  it('{cancelled:false} → announces the nothing-to-cancel copy, NOT "Cancelled"', async () => {
+    const data = baseData({ agent: { ...baseData().agent, phase: 'installing', selectedId: 'hermes' } });
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: false }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { dispatch });
+    const agentSection = must(document.getElementById('setup-card-agent'));
+    await user.click(within(agentSection).getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Nothing to cancel — it had already finished.')).toBeInTheDocument();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+  });
+});
+
 describe('Agent card — identity options are informational, not selectable (§6, A19/C1-13)', () => {
   // A19 (C1-13): the Agent card never passes `onSelect` to `BackendOptionRow`
   // (identity here isn't a click-to-pick control) — every row, including the
@@ -479,6 +520,207 @@ describe('FIM card — pull progress renders a percent (§6)', () => {
   });
 });
 
+/**
+ * UX-09: the window between dispatching the CC-8 configured-model Pull and
+ * the FIRST `setup.progress` push for it had no feedback and no way to
+ * cancel — `ConfiguredModelRow`'s local `dispatching` state covers exactly
+ * that window, mutually exclusive with the `inFlight` block above (which
+ * takes over the instant `live` appears).
+ */
+describe('FIM card — CC-8 configured-model row: pre-progress Working line (UX-09)', () => {
+  function configuredModelData() {
+    return baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      // Empty daemon list ⇒ the configured model is honestly 'not present',
+      // so the row shows its Pull affordance.
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
+    });
+  }
+
+  it('clicking Pull with no progress entry yet shows the Working line + an early Cancel button', async () => {
+    const data = configuredModelData();
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull qwen2.5-coder:1.5b-base' }));
+
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it('the early Cancel dispatches setup.cancel {op:"pull", id:<model>} — TAG-keyed, same as the in-flight Cancel', async () => {
+    const data = configuredModelData();
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; })) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull qwen2.5-coder:1.5b-base' }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(dispatch).toHaveBeenCalledWith('setup.cancel', { op: 'pull', id: 'qwen2.5-coder:1.5b-base' });
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it('once a progress entry arrives, the Working line yields to the ordinary in-flight block — exactly ONE Cancel button', async () => {
+    const data = configuredModelData();
+    let resolveDispatch!: (v: unknown) => void;
+    const dispatch = vi.fn(() => new Promise((resolve) => { resolveDispatch = resolve; }));
+    const mk = (progress: SetupProgressMap) => (
+      <SetupPanel
+        data={{ status: 'success', data }}
+        onRetry={noopRetry}
+        progress={progress}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={vi.fn().mockResolvedValue(undefined)}
+        dispatch={dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />
+    );
+
+    const { user, rerender } = setup(mk({}));
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull qwen2.5-coder:1.5b-base' }));
+    expect(screen.getByText('Working — waiting for the backend to report progress…')).toBeInTheDocument();
+
+    const withEntry: SetupProgressMap = {
+      [progressKey('pull', 'qwen2.5-coder:1.5b-base')]: {
+        op: 'pull',
+        id: 'qwen2.5-coder:1.5b-base',
+        logTail: [],
+        totalBytes: 1000,
+        completedBytes: 250,
+      },
+    };
+    rerender(mk(withEntry));
+
+    expect(screen.queryByText('Working — waiting for the backend to report progress…')).not.toBeInTheDocument();
+    expect(screen.getByText('25%')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Cancel' })).toHaveLength(1);
+
+    resolveDispatch({ ok: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+});
+
+describe('T31 (F2-20-face): ConfiguredModelRow Cancel announces the HOST-reported outcome', () => {
+  function inFlightConfiguredModelData(): { data: SetupData; progress: SetupProgressMap } {
+    // Same fixture as the CC-8 configured-model row's own `configuredModelData()`
+    // above (empty daemon list ⇒ honest 'not present', so the row shows its
+    // Pull/in-flight affordance) plus an already-in-flight progress entry.
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
+    });
+    const progress: SetupProgressMap = {
+      [progressKey('pull', 'qwen2.5-coder:1.5b-base')]: {
+        op: 'pull',
+        id: 'qwen2.5-coder:1.5b-base',
+        logTail: [],
+        totalBytes: 1000,
+        completedBytes: 250,
+      },
+    };
+    return { data, progress };
+  }
+
+  it('{cancelled:true} → announces "Cancelled"', async () => {
+    const { data, progress } = inFlightConfiguredModelData();
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: true, matched: 'qwen2.5-coder:1.5b-base' }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { progress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Cancelled')).toBeInTheDocument();
+  });
+
+  it('{cancelled:false} → announces the nothing-to-cancel copy, NOT "Cancelled"', async () => {
+    const { data, progress } = inFlightConfiguredModelData();
+    const dispatch = vi.fn().mockResolvedValue({ ok: true, cancelled: false }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user } = renderPanel(data, { progress, dispatch });
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('Nothing to cancel — it had already finished.')).toBeInTheDocument();
+    expect(screen.queryByText('Cancelled')).not.toBeInTheDocument();
+  });
+});
+
+describe('FIM card — pull progress a11y: PullAnnouncer replaces the row aria-live (A11Y-05)', () => {
+  function fimInstallData(progressPercent: { totalBytes: number; completedBytes: number }) {
+    const data = baseData({
+      fim: { ...baseData().fim, options: [ollamaOption()], selectedId: 'ollama' },
+      ollama: { running: true, endpoint: 'http://127.0.0.1:11434', models: [] },
+    });
+    const progress = {
+      'pull:qwen2.5-coder:1.5b-base': {
+        op: 'pull' as const,
+        id: 'qwen2.5-coder:1.5b-base',
+        logTail: [],
+        totalBytes: progressPercent.totalBytes,
+        completedBytes: progressPercent.completedBytes,
+      },
+    };
+    return { data, progress };
+  }
+
+  it('the progressbar row no longer carries aria-live (silent aria-valuenow updates)', async () => {
+    const { data, progress } = fimInstallData({ totalBytes: 1000, completedBytes: 250 });
+    const { user, container } = renderPanel(data, { progress });
+    await user.click(within(container).getByRole('button', { name: 'Install locally' }));
+    expect(within(container).getByRole('progressbar').closest('[aria-live]')).toBeNull();
+  });
+
+  it('an sr-only role="status" PullAnnouncer region exists inside the in-flight block', async () => {
+    const { data, progress } = fimInstallData({ totalBytes: 1000, completedBytes: 250 });
+    const { user, container } = renderPanel(data, { progress });
+    await user.click(within(container).getByRole('button', { name: 'Install locally' }));
+    // Other cards mount their own always-on `LiveRegion`s (role="status"), so
+    // find THIS one by its announced text, not by role alone.
+    const announcer = within(container).getByText(/^Pulling qwen2\.5-coder:1\.5b-base — \d+%$/);
+    expect(announcer).toHaveAttribute('role', 'status');
+  });
+
+  it('percent 7 then 9 leaves the announcer text unchanged (10%-step latch)', async () => {
+    const at7 = fimInstallData({ totalBytes: 100, completedBytes: 7 });
+    const { user: userAt7, container: containerAt7 } = renderPanel(at7.data, { progress: at7.progress });
+    await userAt7.click(within(containerAt7).getByRole('button', { name: 'Install locally' }));
+    const textAt7 = within(containerAt7).getByText(/^Pulling qwen2\.5-coder:1\.5b-base — \d+%$/).textContent;
+
+    const at9 = fimInstallData({ totalBytes: 100, completedBytes: 9 });
+    const { user: userAt9, container: containerAt9 } = renderPanel(at9.data, { progress: at9.progress });
+    await userAt9.click(within(containerAt9).getByRole('button', { name: 'Install locally' }));
+    expect(within(containerAt9).getByText(/^Pulling qwen2\.5-coder:1\.5b-base — \d+%$/).textContent).toBe(textAt7);
+  });
+
+  it('the Cancel button is NOT a descendant of any [aria-live] element', async () => {
+    const { data, progress } = fimInstallData({ totalBytes: 1000, completedBytes: 250 });
+    const { user, container } = renderPanel(data, { progress });
+    await user.click(within(container).getByRole('button', { name: 'Install locally' }));
+    expect(within(container).getByRole('button', { name: 'Cancel' }).closest('[aria-live]')).toBeNull();
+  });
+});
+
 describe('§7.2.2 extra-a (T4): a `done` fold clears the frozen pull-progress bar + dead Cancel', () => {
   it('folding a done push removes the progressbar and Cancel — the Pull button REMAINS (it never hid)', async () => {
     const model = 'qwen2.5-coder:1.5b-base';
@@ -579,7 +821,8 @@ describe('RAG card — renders precondition text (§6 card 5)', () => {
   });
 
   it('renders nothing precondition-ish when unset', () => {
-    renderPanel(baseData({ rag: { ...baseData().rag, preconditionDetail: undefined } }));
+    // Base `rag` fixture already carries no `preconditionDetail` key.
+    renderPanel(baseData());
     expect(screen.queryByText(/needs a trusted/)).not.toBeInTheDocument();
   });
 });
@@ -616,12 +859,58 @@ describe('!trusted disables every mutating button with an explanatory reason (§
 describe('"You\'re ready" banner (§6)', () => {
   it('renders when agent + provider + fim are all green', () => {
     renderPanel(baseData({ ready: true }));
-    expect(screen.getByText(/You.re ready/)).toBeInTheDocument();
+    // Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): the ready text
+    // now also lives in the sr-only announcement `LiveRegion` (empty until
+    // ready, then carrying this SAME string) — `{ selector: 'span' }` scopes
+    // this query to the visible card's own copy, which is the thing this
+    // test actually means to assert on.
+    expect(screen.getByText(/You.re ready/, { selector: 'span' })).toBeInTheDocument();
   });
 
   it('does not render when not ready', () => {
     renderPanel(baseData({ ready: false }));
     expect(screen.queryByText(/You.re ready/)).not.toBeInTheDocument();
+  });
+
+  /**
+   * Task 17 (Finding-7, WV4-MIN): the visible card above is decorative now —
+   * the actual screen-reader announcement rides an ALWAYS-mounted sr-only
+   * `LiveRegion` in `SetupCards`, immediately above the conditional card,
+   * empty until `setup.ready` flips true. Index [1], not [0]: `RemotePanel`
+   * (Task 17's OTHER site — see `PanelShell.dom.test.tsx`) always mounts its
+   * own sr-only stale-data region FIRST, ahead of `SetupCards`' own content,
+   * and `SetupPanel` never passes it a `refreshError` — so that region stays
+   * permanently empty and is index [0] in every render below. This region is
+   * index [1]: the first thing `SetupCards` itself renders (`baseData()`'s
+   * `trusted: true` and no `os.containerNote` mean nothing else precedes it
+   * either).
+   */
+  it('the sr-only status region exists (empty) while not ready, and fills once ready flips true', () => {
+    const { rerender, onToggleNextEdit } = renderPanel(baseData({ ready: false }));
+    const status = must(screen.getAllByRole('status')[1]);
+    expect(
+      status,
+      'the region must not carry the ready text before setup.ready is true, or the "already mounted" ' +
+        'half of this test proves nothing',
+    ).not.toHaveTextContent(/You.re ready/);
+
+    rerender(
+      <SetupPanel
+        data={{ status: 'success', data: baseData({ ready: true }) }}
+        onRetry={noopRetry}
+        progress={{}}
+        nextEdit={{ next: false, generic: true }}
+        onToggleNextEdit={onToggleNextEdit}
+        dispatch={vi.fn().mockResolvedValue(undefined) as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>}
+      />,
+    );
+
+    expect(
+      must(screen.getAllByRole('status')[1]),
+      'the SAME node must update its text, not be unmounted and replaced — a fresh node would miss a ' +
+        'live-region listener a screen reader attached at mount time',
+    ).toBe(status);
+    expect(status).toHaveTextContent("You're ready — agent, provider, and autocomplete are all set up.");
   });
 });
 
@@ -828,7 +1117,8 @@ describe('container-note banner (§1.2, T10)', () => {
   });
 
   it('renders nothing when os is absent', () => {
-    renderPanel(baseData({ os: undefined }));
+    // Base fixture already carries no `os` key.
+    renderPanel(baseData());
     expect(screen.queryByText(/can't tell which system/)).not.toBeInTheDocument();
   });
 
@@ -885,7 +1175,7 @@ describe('B5 "done / what next" one-line status under each card (§6, T10)', () 
 /** A tiny fixture over `baseData()` for the Provider card's own phase — B3's
  *  Re-check tests only vary this one field. */
 function withProviderPhase(phase: SetupData['provider']['phase']): SetupData {
-  return baseData({ provider: { phase, providerId: phase === 'configured' ? 'anthropic' : undefined } });
+  return baseData({ provider: { phase, ...(phase === 'configured' ? { providerId: 'anthropic' } : {}) } });
 }
 
 describe('Provider card — Re-check provider (beta.7 B3)', () => {
@@ -1686,39 +1976,46 @@ function fimCatalogRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatalog
  *  absence cells on this surface) — plus one agent-role row to prove the
  *  role filter. */
 function fimCatalog(): SetupCatalogModel[] {
-  return [
-    fimCatalogRow(),
-    fimCatalogRow({
-      id: 'qwen25-coder-7b',
-      displayName: 'Qwen2.5-Coder 7B (base)',
-      defaultForRole: undefined,
-      vramLine: '~8 GB GPUs',
-      ollamaTag: 'qwen2.5-coder:7b-base',
-      ollamaApproxBytes: 4_700_000_000,
-      llamacpp: { file: 'qwen2.5-coder-7b-q8_0.gguf', approxBytes: 8_100_000_000, present: false, available: true },
-    }),
-    fimCatalogRow({
-      id: 'qwen25-coder-14b',
-      displayName: 'Qwen2.5-Coder 14B (base)',
-      defaultForRole: undefined,
-      vramLine: 'Q8 wants a 24 GB card (the Ollama 14b-base tag is the Q4 build at 9.0 GB)',
-      ollamaTag: 'qwen2.5-coder:14b-base',
-      ollamaApproxBytes: 9_000_000_000,
-      llamacpp: { file: 'qwen2.5-coder-14b-q8_0.gguf', approxBytes: 15_700_000_000, present: false, available: true },
-    }),
-    fimCatalogRow({
-      id: 'devstral-24b',
-      role: 'agent',
-      displayName: 'Devstral-24B (2507)',
-      defaultForRole: true,
-      vramLine: '24 GB',
-      ollamaTag: undefined,
-      ollamaApproxBytes: 14_333_915_904,
-      ollamaCreatedName: 'devstral-small-2507:24b',
-      llamacpp: undefined,
-      note: undefined,
-    }),
-  ];
+  // The base `fimCatalogRow()` sets `defaultForRole: true` — only the first
+  // (1.5b) row keeps it; these two are genuinely NOT the role default, so
+  // the key must be DELETED (not left present-as-undefined).
+  const qwen7b = fimCatalogRow({
+    id: 'qwen25-coder-7b',
+    displayName: 'Qwen2.5-Coder 7B (base)',
+    vramLine: '~8 GB GPUs',
+    ollamaTag: 'qwen2.5-coder:7b-base',
+    ollamaApproxBytes: 4_700_000_000,
+    llamacpp: { file: 'qwen2.5-coder-7b-q8_0.gguf', approxBytes: 8_100_000_000, present: false, available: true },
+  });
+  delete qwen7b.defaultForRole;
+
+  const qwen14b = fimCatalogRow({
+    id: 'qwen25-coder-14b',
+    displayName: 'Qwen2.5-Coder 14B (base)',
+    vramLine: 'Q8 wants a 24 GB card (the Ollama 14b-base tag is the Q4 build at 9.0 GB)',
+    ollamaTag: 'qwen2.5-coder:14b-base',
+    ollamaApproxBytes: 9_000_000_000,
+    llamacpp: { file: 'qwen2.5-coder-14b-q8_0.gguf', approxBytes: 15_700_000_000, present: false, available: true },
+  });
+  delete qwen14b.defaultForRole;
+
+  // hf-ingest-tier row (Devstral): no ollamaTag/llamacpp/note — the base
+  // fixture sets each, so genuinely delete them rather than pass explicit
+  // `undefined`.
+  const devstral = fimCatalogRow({
+    id: 'devstral-24b',
+    role: 'agent',
+    displayName: 'Devstral-24B (2507)',
+    defaultForRole: true,
+    vramLine: '24 GB',
+    ollamaApproxBytes: 14_333_915_904,
+    ollamaCreatedName: 'devstral-small-2507:24b',
+  });
+  delete devstral.ollamaTag;
+  delete devstral.llamacpp;
+  delete devstral.note;
+
+  return [fimCatalogRow(), qwen7b, qwen14b, devstral];
 }
 
 function fimBlockData(overrides: Partial<SetupData> = {}): SetupData {
@@ -1733,8 +2030,8 @@ function fimBlockData(overrides: Partial<SetupData> = {}): SetupData {
   });
 }
 
-async function openFimInstallTab(data: SetupData, pickerName?: string) {
-  const utils = renderPanel(data);
+async function openFimInstallTab(data: SetupData, pickerName?: string, extra: Partial<Parameters<typeof SetupPanel>[0]> = {}) {
+  const utils = renderPanel(data, extra);
   if (pickerName !== undefined) {
     await utils.user.click(screen.getByRole('button', { name: pickerName }));
   }
@@ -1803,7 +2100,12 @@ describe('T11 — THREE catalog fim rows render (1.5b ★ / 7b / 14b), role-filt
   });
 
   it('a catalog Pull dispatches setup.provisionModel keyed by catalog id, then flashes the §6 FIM post-pull nudge', async () => {
-    const { fimCard, user, dispatch } = await openFimInstallTab(fimBlockData());
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { fimCard, user } = await openFimInstallTab(fimBlockData(), undefined, { dispatch });
     await user.click(within(fimCard).getByRole('button', { name: 'Pull qwen2.5-coder:7b-base (~4.4 GB)' }));
     expect(dispatch).toHaveBeenCalledWith('setup.provisionModel', {
       modelId: 'qwen25-coder-7b',
@@ -1978,74 +2280,76 @@ function agentCatalogRow(overrides: Partial<SetupCatalogModel> = {}): SetupCatal
   };
 }
 
+/** library-tier agent row builder: the base `agentCatalogRow()` fixture sets
+ *  `defaultForRole: true` and `ollamaCreatedName` (the hf-ingest-tier
+ *  Devstral shape) — every OTHER row here is library-tier (ollamaTag) and
+ *  never the role default, so both keys are genuinely DELETED (not left
+ *  present-as-undefined). */
+function libraryTierAgentRow(overrides: Partial<SetupCatalogModel>): SetupCatalogModel {
+  const row = agentCatalogRow(overrides);
+  delete row.defaultForRole;
+  delete row.ollamaCreatedName;
+  return row;
+}
+
 /** The six REAL agent rows (ids/names/publishers/notes mirror MODEL_CATALOG)
  *  + one fim row to prove the role filter. */
 function agentCatalog(): SetupCatalogModel[] {
   return [
     agentCatalogRow(),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'ornith-9b',
-      defaultForRole: undefined,
       displayName: 'Ornith-1.0 9B',
       publisher: 'ornith-ai',
       vramLine: '24GB-easy (128K+ ctx headroom)',
       progressId: 'ornith-9b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'ornith:9b',
       ollamaApproxBytes: 5_600_000_000,
       llamacpp: { file: 'ornith-1.0-9b-Q4_K_M.gguf', approxBytes: 5_629_108_704, present: false, available: true },
       vllm: { runCommand: 'vllm serve ornith-ai/Ornith-1.0-9B' },
     }),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'ornith-35b',
-      defaultForRole: undefined,
       displayName: 'Ornith-1.0 35B (MoE)',
       publisher: 'ornith-ai',
       vramLine: '24GB-stretch (CPU-offload) / 32GB-comfortable',
       note: T12_MOE_NOTE,
       progressId: 'ornith-35b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'ornith:35b',
       ollamaApproxBytes: 21_000_000_000,
       llamacpp: { file: 'ornith-1.0-35b-Q4_K_M.gguf', approxBytes: 21_166_757_760, present: false, available: true },
       vllm: { runCommand: 'vllm serve ornith-ai/Ornith-1.0-35B' },
     }),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'qwen36-27b',
-      defaultForRole: undefined,
       displayName: 'Qwen3.6-27B',
       publisher: 'unsloth',
       vramLine: '24GB-comfortable, tighter ctx (~24–40K)',
       note: T12_MMPROJ_NOTE,
       progressId: 'qwen36-27b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'qwen3.6:27b',
       ollamaApproxBytes: 17_000_000_000,
       llamacpp: { file: 'Qwen3.6-27B-Q4_K_M.gguf', approxBytes: 16_817_244_384, present: false, available: true },
       vllm: { runCommand: 'vllm serve Qwen/Qwen3.6-27B' },
     }),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'gpt-oss-20b',
-      defaultForRole: undefined,
       displayName: 'gpt-oss-20b',
       publisher: 'ggml-org',
       vramLine: '24GB-easy (100K+ ctx)',
       progressId: 'gpt-oss-20b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'gpt-oss:20b',
       ollamaApproxBytes: 14_000_000_000,
       llamacpp: { file: 'gpt-oss-20b-MXFP4.gguf', approxBytes: 12_109_566_624, present: false, available: true },
       vllm: { runCommand: 'vllm serve openai/gpt-oss-20b' },
     }),
-    agentCatalogRow({
+    libraryTierAgentRow({
       id: 'qwen36-35b-a3b',
-      defaultForRole: undefined,
       displayName: 'Qwen3.6-35B-A3B',
       publisher: 'unsloth',
       vramLine: '24GB-stretch (offload) / 32GB-comfortable',
       note: T12_MOE_NOTE,
       progressId: 'qwen36-35b-a3b',
-      ollamaCreatedName: undefined,
       ollamaTag: 'qwen3.6:35b',
       ollamaApproxBytes: 24_000_000_000,
       llamacpp: { file: 'Qwen3.6-35B-A3B-UD-Q4_K_S.gguf', approxBytes: 20_893_015_008, present: false, available: true },
@@ -2417,7 +2721,7 @@ describe('T12 — providerGuidance renders from the wire; the copy never points 
 
   function guidanceData(phase: SetupData['provider']['phase'], guidance: string): SetupData {
     return agentBlockData({
-      provider: { phase, providerId: phase === 'configured' ? 'custom' : undefined },
+      provider: { phase, ...(phase === 'configured' ? { providerId: 'custom' } : {}) },
       ready: false,
       agentLocalModel: {
         endpointDefaults: T12_ENDPOINT_DEFAULTS,
@@ -2534,7 +2838,7 @@ function nextSurfaceData(
       ...base.nextEdit,
       ...(opts.dedicatedBackendId !== undefined ? { dedicatedBackendId: opts.dedicatedBackendId } : {}),
       dedicated: downloadReady
-        ? base.nextEdit.dedicated
+        ? base.nextEdit.dedicated!
         : {
             ...base.nextEdit.dedicated!,
             downloadReady: false,
@@ -2605,6 +2909,40 @@ describe('T13 — Ollama pane in-flight: progress + Cancel keyed pull:sweep-next
     };
     const { nextCard } = await openNextForm(nextSurfaceData(), { progress: stale });
     expect(within(nextCard).queryByRole('progressbar')).not.toBeInTheDocument();
+  });
+
+  it('A11Y-05: the progressbar row no longer carries aria-live', async () => {
+    const { nextCard } = await openNextForm(nextSurfaceData(), { progress: inFlight });
+    expect(within(nextCard).getByRole('progressbar').closest('[aria-live]')).toBeNull();
+  });
+
+  it('A11Y-05: an sr-only role="status" PullAnnouncer region exists inside the in-flight block', async () => {
+    const { nextCard } = await openNextForm(nextSurfaceData(), { progress: inFlight });
+    // The NEXT card also mounts a per-settings-row `LiveRegion` (save-error,
+    // usually empty) for every `NEXT_EDIT_ROWS` entry — find THIS one by its
+    // announced text, not by role alone (role="status" is not unique here).
+    const announcer = within(nextCard).getByText(/^Pulling sweep-next — \d+%$/);
+    expect(announcer).toHaveAttribute('role', 'status');
+  });
+
+  it('A11Y-05: percent 7 then 9 leaves the announcer text unchanged (10%-step latch)', async () => {
+    const at7 = {
+      'pull:sweep-next': { op: 'pull' as const, id: 'sweep-next', logTail: [], totalBytes: 100, completedBytes: 7 },
+    };
+    const at9 = {
+      'pull:sweep-next': { op: 'pull' as const, id: 'sweep-next', logTail: [], totalBytes: 100, completedBytes: 9 },
+    };
+    const { nextCard: cardAt7 } = await openNextForm(nextSurfaceData(), { progress: at7 });
+    const textAt7 = within(cardAt7).getByText(/^Pulling sweep-next — \d+%$/).textContent;
+    cleanup();
+
+    const { nextCard: cardAt9 } = await openNextForm(nextSurfaceData(), { progress: at9 });
+    expect(within(cardAt9).getByText(/^Pulling sweep-next — \d+%$/).textContent).toBe(textAt7);
+  });
+
+  it('A11Y-05: the Cancel button is NOT a descendant of any [aria-live] element', async () => {
+    const { nextCard } = await openNextForm(nextSurfaceData(), { progress: inFlight });
+    expect(within(nextCard).getByRole('button', { name: 'Cancel' }).closest('[aria-live]')).toBeNull();
   });
 });
 
@@ -3200,13 +3538,34 @@ describe('T18 — RecommendationsBlock strip (§3.5)', () => {
     // OTHER, unlabelled markup. `ready: false` suppresses the (unrelated)
     // "You're ready" banner, which would otherwise be a legitimate
     // preceding sibling of its own and mask this check.
+    //
+    // Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): the Agent card's
+    // immediate previous sibling is no longer literally absent — TWO
+    // always-mounted, empty sr-only `role="status"` regions now precede real
+    // panel content on every success render: `RemotePanel`'s own stale-data
+    // region (Task 17's OTHER site, `PanelShell.tsx` — `SetupPanel` never
+    // gives it a `refreshError`, so it stays permanently empty) and
+    // `SetupCards`' own "You're ready" region (this site, empty here since
+    // `ready: false`). The check's real intent survives: walk back over
+    // ONLY that always-mounted, always-empty status chrome and confirm
+    // nothing else — in particular no `RecommendationsBlock` output — sits
+    // between it and the Agent card.
     function agentCardHasNoPrecedingSibling(): void {
       const agentSection = must(document.getElementById('setup-card-agent'));
-      expect(agentSection.previousElementSibling).toBeNull();
+      let node = agentSection.previousElementSibling;
+      while (node !== null) {
+        expect(node.getAttribute('role')).toBe('status');
+        expect(node.textContent).toBe('');
+        node = node.previousElementSibling;
+      }
     }
 
     it('renders NOTHING when catalog is absent', () => {
-      renderPanel(recsData({ catalog: undefined, ready: false }));
+      // `recsData`'s own default sets `catalog` — genuinely DELETE it rather
+      // than pass explicit `undefined`.
+      const data = recsData({ ready: false });
+      delete data.catalog;
+      renderPanel(data);
       expect(screen.queryByText('Recommended local models')).not.toBeInTheDocument();
       agentCardHasNoPrecedingSibling();
     });
@@ -3635,7 +3994,11 @@ describe('PT4-M1 — FIM Connect "not saved yet" is announced to screen readers 
 
 describe('PT4 — FIM Install-tab selectable rows + pending draft (§3.2)', () => {
   it('(a) catalog Pull success selects the row: highlight + pending line + Connect Model field — and NO settings write (pull ≠ save)', async () => {
-    const { user, dispatch } = renderPanel(fimSelectionData());
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const { user } = renderPanel(fimSelectionData(), {
+      dispatch: dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>,
+    });
     await user.click(screen.getByRole('button', { name: 'Install locally' }));
     await user.click(screen.getByRole('button', { name: /^Pull deepseek-coder:6\.7b-base/ }));
     const row = screen.getByRole('button', { name: 'DeepSeek Coder 6.7B (base)' });
@@ -3688,11 +4051,16 @@ describe('PT4 — FIM Install-tab selectable rows + pending draft (§3.2)', () =
   });
 
   it("(k) the ConfiguredModelRow's pull success selects ITS (out-of-catalog) model (C1-2)", async () => {
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
     const data = fimSelectionData({
       fim: { ...baseData().fim, model: 'my-legacy-model' },
       ollama: { ...baseData().ollama, models: [] },
     });
-    const { user, dispatch } = renderPanel(data);
+    const { user } = renderPanel(data, { dispatch });
     const field = screen.getByRole('textbox', { name: 'Model' });
     await user.clear(field);
     await user.type(field, 'typed-draft');
@@ -3703,6 +4071,31 @@ describe('PT4 — FIM Install-tab selectable rows + pending draft (§3.2)', () =
     );
     await user.click(screen.getByRole('button', { name: 'Connect' }));
     await waitFor(() => expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('my-legacy-model'));
+  });
+
+  it('T32: a ConfiguredModelRow pull that "resolves" WITHOUT a confirmed ok shows the not-confirmed copy and does NOT select the model', async () => {
+    const dispatch = vi.fn().mockResolvedValue({}) as unknown as ( // resolved, but nothing confirmed
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const data = fimSelectionData({
+      fim: { ...baseData().fim, model: 'my-legacy-model' },
+      ollama: { ...baseData().ollama, models: [] },
+    });
+    const { user } = renderPanel(data, { dispatch });
+    const field = screen.getByRole('textbox', { name: 'Model' });
+    await user.clear(field);
+    await user.type(field, 'typed-draft');
+    await user.click(screen.getByRole('button', { name: 'Install locally' }));
+    await user.click(screen.getByRole('button', { name: 'Pull my-legacy-model' }));
+    // The failure-tone outcome rides the SAME error state as a rejection, so
+    // it renders with the ✗ prefix (mirrors the codebase's `✗ <reason>`
+    // rejection convention this Task's global constraints name).
+    expect(await screen.findByText(`✗ ${PULL_NOT_CONFIRMED_TEXT}`)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    // The unconfirmed resolve never fired onPullSuccess, so the pending draft
+    // was never overwritten with the pulled model's id.
+    expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue('typed-draft');
   });
 });
 
@@ -3809,7 +4202,11 @@ describe('PT5 — RAG Apply persists everything it shows (§3.2, write-shape pin
 
 describe('PT5 — RAG ollama rows selectable; the pull is honored (§3.2)', () => {
   it('(a) catalog Pull success selects the row: highlight + pending line + field — and ZERO settings writes (pull ≠ save)', async () => {
-    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true });
+    const { user, ragCard } = await openRagSection(ragSurfaceData(), {
+      dispatch: dispatch as (method: SetupMethod, params?: Record<string, unknown>) => Promise<unknown>,
+    });
     await user.click(within(ragCard).getByRole('button', { name: /^Pull qwen3-embedding:4b/ }));
     const row = within(ragCard).getByRole('button', { name: 'Qwen3-Embedding 4B' });
     await waitFor(() => expect(row).toHaveAttribute('aria-pressed', 'true'));
@@ -3872,7 +4269,12 @@ describe('PT5 — RAG ollama rows selectable; the pull is honored (§3.2)', () =
   });
 
   it("the ConfiguredModelRow's pull success selects ITS (out-of-catalog) model with the NEW pull nudge (C1-2)", async () => {
-    const { user, dispatch, ragCard } = await openRagSection(ragSurfaceData());
+    // WS-SU Task 4: success now requires a confirmed {ok:true} (F1-6-face)
+    const dispatch = vi.fn().mockResolvedValue({ ok: true }) as unknown as (
+      method: SetupMethod,
+      params?: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const { user, ragCard } = await openRagSection(ragSurfaceData(), { dispatch });
     const field = within(ragCard).getByRole('textbox', { name: 'Embedding model' });
     await user.clear(field);
     await user.type(field, 'typed-draft');

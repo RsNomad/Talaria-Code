@@ -38,6 +38,24 @@
  * call site already owns its own outside-click effect (it needs the
  * trigger-node check, to avoid the opening click immediately re-closing the
  * menu) — see `AttachMenu.tsx`'s own effect and `Composer.tsx:284-302`.
+ *
+ * Task 20 (WV4-MIN, additive — existing fields/behavior unchanged):
+ * - https://www.w3.org/WAI/ARIA/apg/patterns/menu/ — "Home: moves focus to
+ *   first item"; "End: moves focus to last item". `onMenuKey`'s arrow branch
+ *   now also routes Home/End through `nextRovingIndex` (it already computed
+ *   both — `rovingIndex.ts:58-61` — this only wires them in). AttachMenu
+ *   never emits Home/End itself, so its characterization stays green
+ *   unmodified; it simply never triggers the new branch.
+ * - `openMenuAt(index)` / `focusItem(index)`: OverflowMenu's local roving
+ *   copy is being retired onto this hook. Both pieces of OverflowMenu-local
+ *   behavior the hook deliberately doesn't own (see above) still need a way
+ *   to reach into the hook's state from outside a keypress: `openMenuAt`
+ *   lets a caller open with initial focus on an arbitrary index
+ *   (OverflowMenu's G-4 park-on-the-ACTIVE-item, not always index 0/last the
+ *   way `openAtRef`'s ArrowUp/ArrowDown cases are); `focusItem` lets a caller
+ *   move roving focus programmatically (OverflowMenu's T-16 WV-2 shrink-clamp
+ *   effect). Both clamp into `[0, itemCount - 1]`, matching this hook's
+ *   existing clamp-not-wrap convention.
  */
 import { useEffect, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import { nextRovingIndex } from '../components/rovingIndex';
@@ -63,6 +81,14 @@ export interface UseMenuFocusResult {
    * the trigger; pass `false` from a selection handler where the click
    * already dismissed the popup and no refocus is needed. */
   closeMenu: (returnFocus?: boolean) => void;
+  /** Task 20: opens the menu with initial focus on `index` (clamped into
+   * range) instead of the default first item — e.g. OverflowMenu's
+   * park-on-the-active-item behavior. */
+  openMenuAt: (index: number) => void;
+  /** Task 20: moves roving focus to `index` (clamped into range)
+   * programmatically, outside of a keypress — e.g. OverflowMenu's
+   * shrink-clamp effect re-parking focus after `items` shrinks. */
+  focusItem: (index: number) => void;
 }
 
 export function useMenuFocus(
@@ -117,7 +143,7 @@ export function useMenuFocus(
       setOpen(false);
       return;
     }
-    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
       const next = nextRovingIndex(focusIdx, e.key, itemCount, { wrap: false });
       if (next !== null) {
         e.preventDefault();
@@ -141,5 +167,28 @@ export function useMenuFocus(
     itemRefs.current[i] = el;
   };
 
-  return { open, focusIdx, itemRef, onMenuKey, onTriggerKey, openMenu, toggleMenu, closeMenu };
+  // Task 20: caller-driven open-at-index — reuses the same one-shot
+  // `openAtRef` the ArrowUp/ArrowDown trigger-open path already writes, so
+  // the open-effect's single read-and-reset-to-0 logic stays the only place
+  // that consumes it (no second code path to keep in sync).
+  const openMenuAt = (index: number) => {
+    if (itemCount > 0) openAtRef.current = Math.max(0, Math.min(index, itemCount - 1));
+    setOpen(true);
+  };
+  // Task 20: caller-driven roving-focus move, clamped the same way `move`
+  // itself clamps via `onMenuKey`'s Arrow/Home/End branch.
+  const focusItem = (index: number) => move(Math.max(0, Math.min(index, itemCount - 1)));
+
+  return {
+    open,
+    focusIdx,
+    itemRef,
+    onMenuKey,
+    onTriggerKey,
+    openMenu,
+    toggleMenu,
+    closeMenu,
+    openMenuAt,
+    focusItem,
+  };
 }

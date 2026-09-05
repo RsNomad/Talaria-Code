@@ -1,31 +1,60 @@
 import { homedir } from 'node:os';
-import { NEXT_DEDICATED_MODEL } from './registry';
 import type { BackendDescriptor, InstallRecipe, ProbeSpec } from './registry';
 import type { HfDigestVerdict, HfGgufSpec, LfsOidVerdict } from './hfDigest';
-import { isLoopbackHost } from '../../autocomplete/backends/secureTransport';
 import { managerFor, parseOsRelease, resolveDistroFamily } from './osDetect';
-import type { DistroFamily, OsRelease, PackageManager } from './osDetect';
 import { installCommand, pythonInstallPlan } from './packageTable';
 import type { PipxEnv, PipxLocateResult } from './pipxLocator';
 import type { HermesPaths, InstallEvent } from './pipxInstaller';
 import type { OllamaStatus, PullProgress } from './ollamaClient';
 import type { ProbeOutcome } from './remoteProbe';
 import { validateEndpointUrl } from './remoteProbe';
-import { MODEL_CATALOG, TRUSTED_HF_PUBLISHERS, VLLM_ONLY_SERVE_REPOS, assertCatalogSource } from './modelCatalog';
-import type { CatalogGguf, CatalogModel, CatalogRole, TrustedPublisher } from './modelCatalog';
+import { MODEL_CATALOG, VLLM_ONLY_SERVE_REPOS, assertCatalogSource } from './modelCatalog';
+import type { CatalogModel, CatalogRole } from './modelCatalog';
 import type { LlamaCppLocateResult } from './llamaCppLocator';
 import type { GgufDestResult } from './modelStore';
 import type { GgufStoreSpec } from './ggufIngest';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
+import { createMutationGate, type MutationGate } from '../util/mutationGate';
+import { LatchRegistry, SETUP_DISPOSED_REFUSAL } from './latchRegistry';
+import { SettledProbeMemo } from './settledProbeMemo';
+import {
+  ProvisionRunner,
+  assertProvisionSources,
+  isAllowlistedHfOwner,
+  LLAMACPP_HONEST_ABSENCE,
+  PROVISION_UNKNOWN_ID_REFUSAL,
+  canonicalPullLatchId,
+} from './provisionRunner';
+import { redactForModal, refuseUnsafeModalText } from './modalText';
+import {
+  DEFAULT_OLLAMA_ENDPOINT,
+  PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE,
+  coerceDedicatedBackendId,
+  composeAgentBlock,
+  composeBootstrap,
+  composeFimTuning,
+  composeNextEditBlock,
+  composeOsBlock,
+  composeRagBlock,
+} from './statusBlocks';
+import type { OsResolution } from './statusBlocks';
 import type {
   AgentSetupPhase,
   SetupBackendOption,
+  SetupCancelResult,
   SetupCatalogModel,
   SetupData,
   SetupMethod,
   SetupProgress,
 } from '../../shared/protocol';
 import { SETUP_METHODS } from '../../shared/protocol';
+
+// --- WS-GD.2b B7: façade re-exports — these symbols now live in provisionRunner.ts /
+// modalText.ts / latchRegistry.ts; re-exported here so existing external import
+// paths (tests, skillsAdminHandler.ts, ControlDispatcher-side code) stay stable. ---
+export { SETUP_DISPOSED_REFUSAL } from './latchRegistry';
+export { isHostSourcedModel, assertProvisionSources } from './provisionRunner';
+export { MODAL_UNSAFE_TEXT_PATTERN, redactForModal } from './modalText';
 
 /**
  * SetupController — the host-side brain for Setup / Talaria Config
@@ -59,8 +88,8 @@ import { SETUP_METHODS } from '../../shared/protocol';
  *   tunable'}` (FM-16), no modal either way (Tier-2 is modal-free by
  *   design).
  * - `setup.install`/`setup.pullModel` are single-flight per `(op, id)` —
- *   FM-12 — tracked via {@link inFlight}, which ALSO holds each attempt's
- *   `AbortController` so `setup.cancel` can interrupt it.
+ *   FM-12 — tracked via {@link latches} ({@link LatchRegistry}), which ALSO
+ *   holds each attempt's `AbortController` so `setup.cancel` can interrupt it.
  * - Fail-closed ORDER on install: `locatePipx` -> `installHermes` (which
  *   only resolves after its own `--check` verify passes) -> ONLY THEN are
  *   `hermesPath`/`pythonPath`/`backend` written together, THEN the
@@ -127,6 +156,14 @@ export interface SetupHost {
   runInTerminal(name: string, shellPath: string, shellArgs: string[]): void;
   getSetting<T>(key: string): T | undefined;
   updateSettingGlobal(key: string, value: unknown): Promise<void>;
+  /**
+   * F2-17: the GLOBAL-scope stored value of `key` (VS Code
+   * `inspect(key)?.globalValue`) — `undefined` = not set at Global scope.
+   * Backs {@link SetupController.writeSettingsBatch}'s exact rollback.
+   * OPTIONAL (the `discoverHermes` idiom): every existing host fake keeps
+   * compiling; when absent the batch skips rollback and SAYS so.
+   */
+  inspectSettingGlobal?(key: string): unknown;
   secrets: {
     store(key: string, v: string): Promise<void>;
     has(key: string): Promise<boolean>;
@@ -367,9 +404,13 @@ export interface SetupControllerDeps {
   ): Promise<void>;
   /**
    * beta.7 B3: the deliberate teardown+respawn+re-`initialize()` reconnect —
-   * bound to `() => backend.reconnectAgent?.() ?? Promise.resolve({ok:false,
-   * reason:...})` (a thunk over the CURRENT backend, `extension.ts`) so the
-   * trust-upgrade mock→real swap is reflected on the next call. OPTIONAL
+   * bound to `(opts) => backend.reconnectAgent?.(opts) ?? Promise.resolve({
+   * ok:false, reason:...})` (a thunk over the CURRENT backend, `extension.ts`)
+   * so the trust-upgrade mock→real swap is reflected on the next call.
+   * T16: `opts.force` threads straight through to `ConnectionSupervisor.
+   * reconnect`'s own force posture — this seam does no parsing of its own
+   * (that's {@link SetupController.handleReconnectAgent}'s job, fail-closed
+   * via the `bool` helper). OPTIONAL
    * (posture of `loadTab?`/`getAdvertisedAuthMethods?` above) — NOT a
    * required member: a required member would break `check-types:all` in
    * every existing deps-literal/factory-call test site. `undefined` = no
@@ -377,7 +418,7 @@ export interface SetupControllerDeps {
    * handleReconnectAgent} fails closed with an honest reason rather than
    * throwing.
    */
-  reconnectAgent?(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  reconnectAgent?(opts?: { force?: boolean }): Promise<{ ok: true } | { ok: false; reason: string }>;
   /**
    * TC-3 (AU-8 / INV-11): the SAME settings-OR-PATH resolution the runtime
    * uses to find `hermes` — bound to `resolveHermesBin({}, exec)`
@@ -385,8 +426,8 @@ export interface SetupControllerDeps {
    * `talaria.hermesPath` is empty (a configured setting is authoritative and
    * is never second-guessed by a PATH probe); resolves the discovered
    * absolute path, or REJECTS if the login-shell PATH lookup fails —
-   * {@link SetupController.kickHermesDiscovery} maps a rejection to the
-   * honest "not found" memo state, mirroring {@link
+   * {@link SetupController.hermesDiscoveryMemo}'s `onRejected` maps a
+   * rejection to the honest "not found" memo state, mirroring {@link
    * SetupControllerDeps.locateLlamaServer}'s reject→settle posture. OPTIONAL
    * (same idiom as {@link reconnectAgent} above, same reason: a required
    * member would break every existing deps-literal/factory-call test site);
@@ -399,11 +440,11 @@ export interface SetupControllerDeps {
 // --- misc constants -------------------------------------------------------
 
 const PROGRESS_THROTTLE_MS = 150;
+/** CA-M18: single-flight, short-TTL memo window over {@link
+ *  SetupController.safeProbeOllama} — see that method's doc for why. */
+export const OLLAMA_PROBE_MEMO_TTL_MS = 1_000;
 const LOG_TAIL_MAX = 40;
 const DEFAULT_FIM_MODEL = 'qwen2.5-coder:1.5b-base';
-const DEFAULT_OLLAMA_ENDPOINT = 'http://127.0.0.1:11434';
-const DEFAULT_RAG_EMBED_MODEL = 'qwen3-embedding:0.6b';
-const DEFAULT_RAG_INDEX_DIR = '.hermes/index';
 const TRUST_REFUSAL_REASON = 'Workspace is not trusted — Setup changes are disabled in Restricted Mode.';
 /**
  * Task 13: the id of Hermes' ALWAYS-advertised terminal setup-wizard auth
@@ -412,64 +453,8 @@ const TRUST_REFUSAL_REASON = 'Workspace is not trusted — Setup changes are dis
  * id is an agent-managed provider credential method (§2.1).
  */
 export const HERMES_SETUP_AUTH_METHOD_ID = 'hermes-setup';
-/**
- * beta.5 §6 copy, verbatim (drift-locked by SetupController.test.ts). The
- * bootstrap COMMAND itself is no longer a constant here — T5 deleted the old
- * hardcoded Fedora `PIPX_BOOTSTRAP_COMMAND`; every pre-typed line is now
- * resolved server-side from the T4 engine ({@link installCommand} /
- * {@link pythonInstallPlan}) for the DETECTED family, or refused fail-closed.
- */
-const PIPX_MISSING_KNOWN_DISTRO_GUIDANCE =
-  'pipx was not found on your PATH. Open a terminal to install it, then re-check.';
-const PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE =
-  "pipx was not found, and this Linux distribution wasn't recognized — install pipx with your system's package manager, then re-check.";
 const CONTAINER_NOTE =
   "Talaria can't tell which system your terminal acts on (VS Code appears to run in a sandbox/container) — run the install commands in a terminal on your host system, then re-check.";
-
-// --- T13 (beta.5 §4.4/§6): the verified NEXT download path — copy, verbatim --
-
-/** §6 "host-sourced pull refusal (rev 5)" — kills the S-F1 class outright. */
-const HOST_SOURCED_PULL_REFUSAL =
-  "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
-/** §6 "NEXT download unavailable (D3)" — the sha256 pin is still empty. */
-const NEXT_DOWNLOAD_UNAVAILABLE =
-  "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
-/** §6 "NEXT download remote-endpoint refusal (S-F3)" — ingest is loopback-only. */
-const NEXT_REMOTE_ENDPOINT_REFUSAL =
-  'Verified downloads only run against a local Ollama (loopback). For a remote server, download and verify the model on that machine — see the guided instructions.';
-/** §4.4.3c — ONE line for every integrity failure mode (no detail leaks what to forge). */
-const NEXT_INTEGRITY_REFUSAL = 'integrity check failed — refusing to download';
-/** §6 "NEXT warning (D4, card-level)" — host-composed, honest CPU caveat. */
-const NEXT_DEDICATED_WARNING =
-  'Needs ~15 GB of GPU memory at full precision, or ~5 GB for the 4-bit build. On a CPU-only machine a 7B model produces a few tokens per second — dedicated next-edit will feel slow; the Generic mode reuses your smaller FIM model instead.';
-/** §6 "Pull modal (D3, rev 5)" — every word of the strong claim is what the
- *  engine actually does (Talaria hashes the downloaded bytes; Ollama
- *  re-verifies at blob ingest). Composed from the registry pins so the modal
- *  can never name a different artifact than the gate downloads. */
-const NEXT_PULL_MODAL_COPY =
-  `Download '${NEXT_DEDICATED_MODEL.displayName}' (~4.7 GB) and install it into your local Ollama? ` +
-  `Source: huggingface.co/${NEXT_DEDICATED_MODEL.gguf.hfRepo} — Syntinal's build converted from Sweep's official release. ` +
-  "Talaria verifies the file's checksum against its pinned value after downloading, and Ollama verifies it again during install.";
-
-// --- T7 (beta.6 §2.5/§6): setup.provisionModel — copy, verbatim --------------
-
-/** §6 "provision refusal: unknown id". */
-const PROVISION_UNKNOWN_ID_REFUSAL = 'Unknown model — the catalog is fixed in this release.';
-/** §6 "provision refusal: vllm backend" — refused, never ignored. */
-const PROVISION_VLLM_REFUSAL =
-  'vLLM serves models from its own command line — nothing to download here. Copy the run command instead.';
-/** Strict-enum refusal for anything outside the two provisionable backends. */
-const PROVISION_BACKEND_REFUSAL = "backend must be 'ollama' or 'llamacpp'.";
-/** §2.5 4a — fixture/future rows only (every shipping row carries an ollama
- *  cell): the ollama-side honest-absence line, mirroring the §6 llamacpp one. */
-const PROVISION_OLLAMA_HONEST_ABSENCE =
-  'No build of this model from a verified publisher exists for Ollama — use it via llama.cpp instead.';
-/** SC-A-9: the exhaustive-VerifySpec default arm — a future third mode
- *  refuses, it never falls through permissively. */
-const PROVISION_UNKNOWN_VERIFY_REFUSAL = 'unknown verify mode — refusing to download';
-/** T1-M1 (carried): an option-shaped tag is refused in {@link SetupController.
- *  runLibraryPull} before the pull dep is ever invoked. */
-const LIBRARY_TAG_DASH_REFUSAL = "model tag must not begin with '-'";
 
 // --- T8 (beta.6 §2.5/§6): setup.saveAgentModel — copy + constants, verbatim --
 
@@ -496,126 +481,6 @@ const AGENT_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; vllm
   llamacpp: 'http://127.0.0.1:8013',
   vllm: 'http://127.0.0.1:8000',
 };
-/** §3.2 (audit A5, beta.6 panel-fix T2): host-owned RAG endpoint defaults —
- *  mirrors {@link AGENT_ENDPOINT_DEFAULTS}'s CC-6 pattern exactly, one const
- *  per surface. `llamacpp` matches {@link LLAMACPP_RUN_FLAGS}'s embedding
- *  port (8081 — drift-locked by test); `openai-compat` is the vLLM
- *  convention port. `ollama` reuses {@link DEFAULT_OLLAMA_ENDPOINT} — ONE
- *  source for that value, never a second literal. Never webview-fabricated
- *  (Global Constraint 1). */
-const RAG_ENDPOINT_DEFAULTS: Readonly<{ ollama: string; llamacpp: string; 'openai-compat': string }> = {
-  ollama: DEFAULT_OLLAMA_ENDPOINT,
-  llamacpp: 'http://127.0.0.1:8081',
-  'openai-compat': 'http://127.0.0.1:8000',
-};
-/** T8 (CC-10): `setup.setNextEdit`'s additive `dedicatedBackendId` enum — the
- *  4 unified-block backend panes. Shared by the write-side validation and the
- *  `status()` read-side coercion (never trust settings.json without
- *  re-checking — same posture as {@link coerceNextEditTransport}). */
-const NEXT_DEDICATED_BACKEND_IDS = ['ollama', 'llamacpp', 'vllm', 'openai-compat'] as const;
-
-/** `undefined` for anything outside the 4-value enum — a malformed/edited
- *  settings.json value degrades to "no restoration hint" (the panel's
- *  existing transport-heuristic fallback), never a fabricated pane. */
-function coerceDedicatedBackendId(raw: string | undefined): string | undefined {
-  return raw !== undefined && (NEXT_DEDICATED_BACKEND_IDS as readonly string[]).includes(raw) ? raw : undefined;
-}
-
-/**
- * T13 (beta.5 §4.4 "classify", rev 6 — the owner personally corrected the
- * earlier dot-counting bug): HOST-SOURCED iff the model contains a `/` AND
- * the substring before the FIRST `/` is host-like — contains a `.` OR a `:`
- * (port) OR equals `localhost` case-insensitively. A model with NO `/` is
- * ALWAYS a library name; dots in the name or tag are IRRELEVANT
- * (`qwen2.5-coder:1.5b-base` / `qwen3-embedding:0.6b` = library;
- * `ns/name:tag` = library; `hf.co/x`, `huggingface.co/x`,
- * `registry.example.com/x`, `localhost:11434/x` = host-sourced). Callers
- * normalize (trim) BEFORE classifying. Exported for the truth-table lock.
- */
-export function isHostSourcedModel(model: string): boolean {
-  const slash = model.indexOf('/');
-  if (slash === -1) return false;
-  const head = model.slice(0, slash);
-  return head.includes('.') || head.includes(':') || head.toLowerCase() === 'localhost';
-}
-
-/**
- * S4.3 parity (reused, not reinvented — `src/autocomplete/index.ts`): is the
- * endpoint's host the loopback interface, per `secureTransport.ts`'s single
- * source of truth. Malformed URLs fail CLOSED (non-loopback ⇒ refused) —
- * though `validateEndpointUrl` runs first on this path, so none should reach here.
- */
-function isLoopbackEndpoint(rawUrl: string): boolean {
-  try {
-    return isLoopbackHost(new URL(rawUrl).hostname);
-  } catch {
-    return false;
-  }
-}
-
-/** T1 (beta.6 panel-fix PT1, CR-001 fix): the modal-forging character
- *  class — covers exactly: C0 controls (U+0000-U+001F), DEL (U+007F), C1
- *  controls incl. NEL (U+0080-U+009F), the ARABIC LETTER MARK (U+061C),
- *  zero-width characters + directional marks (U+200B-U+200F), the Unicode
- *  LINE/PARAGRAPH SEPARATORs (U+2028/U+2029), bidi embedding/override
- *  (U+202A-U+202E), the WORD JOINER (U+2060), isolate (U+2066-U+2069)
- *  controls, and ZERO WIDTH NO-BREAK SPACE / BOM (U+FEFF). Any of these can
- *  forge extra lines or visually reorder a single-line native `showModal`
- *  prompt.
- *
- *  T4 (beta.6 fix-wave L1-M2): U+061C/U+2060/U+FEFF added as
- *  defense-in-depth for modal free-text (model/dir names) — endpoints
- *  already neutralize them via T1's canonicalization chokepoint.
- *
- *  T2 (beta.6 panel-fix CR-003): factored into ONE source string so the
- *  REFUSE regex ({@link MODAL_UNSAFE_TEXT_PATTERN}) and the REDACT regex
- *  (used by {@link redactForModal}) are built from the exact same class and
- *  can never silently drift apart. Do NOT hand-duplicate this class as a
- *  second regex literal anywhere else in this file. */
-const MODAL_UNSAFE_CHARS = '\\x00-\\x1f\\x7f\\u0080-\\u009f\\u061c\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2060\\u2066-\\u2069\\ufeff';
-export const MODAL_UNSAFE_TEXT_PATTERN = new RegExp(`[${MODAL_UNSAFE_CHARS}]`);
-/** T2 (CR-003): the global (strip-all-occurrences) variant of {@link MODAL_UNSAFE_TEXT_PATTERN} — see {@link redactForModal}. */
-const MODAL_UNSAFE_TEXT_PATTERN_G = new RegExp(`[${MODAL_UNSAFE_CHARS}]`, 'g');
-/** §7/§6 T1: the shared length cap for any free-text value that reaches a modal. */
-const MODAL_TEXT_MAX_LEN = 200;
-
-/**
- * T1 (beta.6 panel-fix PT1): the shared modal-forging SANITATION SWEEP —
- * applied to EVERY free-text param that reaches {@link SetupHost.showModal}
- * BEFORE its modal renders (`applyFim.model`, `setRag.embedModel`,
- * `setRag.indexDir`, `setNextEdit.model`, `pullModel.model`). `label` names
- * the offending param in the refusal reason so each call site's failure is
- * traceable to its own field. Purely additive — never touches endpoint/URL
- * validation ({@link validateEndpointUrl}) or the download-integrity gates.
- */
-function refuseUnsafeModalText(value: string, label: string): { ok: true } | { ok: false; reason: string } {
-  if (value.length > MODAL_TEXT_MAX_LEN) {
-    return { ok: false, reason: `${label} is too long (max ${MODAL_TEXT_MAX_LEN} characters).` };
-  }
-  if (MODAL_UNSAFE_TEXT_PATTERN.test(value)) {
-    return { ok: false, reason: `${label} contains characters that are not allowed in a confirmation prompt.` };
-  }
-  return { ok: true };
-}
-
-/**
- * T2 (beta.6 panel-fix CR-003): NEUTRALIZE (never refuse) a value the user
- * already has SAVED, before it is interpolated into a Tier-1 confirmation
- * modal as an 'old' value (e.g. the current `talaria.autocomplete.endpoint`
- * / `talaria.nextEdit.endpoint`, shown in the 'from X to Y' Apply prompt).
- * Unlike {@link refuseUnsafeModalText} — which REFUSES a freshly-submitted
- * param — refusing the whole Apply because a hand-edited settings.json has
- * an odd character in the OLD value would trap the user out of fixing it.
- * Strips every character in the same class as {@link MODAL_UNSAFE_TEXT_PATTERN}
- * (built from the same {@link MODAL_UNSAFE_CHARS} source, so the two can
- * never drift apart), then caps to {@link MODAL_TEXT_MAX_LEN}.
- * DISPLAY-ONLY: never touches what gets WRITTEN to a setting — callers
- * still write the validated/raw value, never this redacted copy.
- */
-export function redactForModal(value: string): string {
-  const stripped = value.replace(MODAL_UNSAFE_TEXT_PATTERN_G, '');
-  return stripped.length > MODAL_TEXT_MAX_LEN ? stripped.slice(0, MODAL_TEXT_MAX_LEN) : stripped;
-}
 
 /** D9: which {@link SetupMethod}s are consequence-bearing mutations, gated
  *  on `host.isTrusted()` (FM-14). Everything else (`setup.status` — handled
@@ -674,27 +539,32 @@ export const READ_ONLY_METHODS: readonly SetupMethod[] = [
  *  other caller of `handle` directly. */
 const SETUP_METHOD_SET: ReadonlySet<string> = new Set<SetupMethod>(SETUP_METHODS);
 
-interface ThrottleState {
+export interface ThrottleState {
   lastEmit: number;
-  timer?: ReturnType<typeof setTimeout>;
-  pending?: SetupProgress;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  pending: SetupProgress | undefined;
 }
 
-/**
- * T5: one interpreted os-release read — everything the §1.2 wiring needs.
- * `release` keeps the full parsed identity (the Python planner's C-3 gate
- * needs `id`/`versionId`, never just the collapsed family); `containerNote`
- * is set ONLY for the S-F10 degrade (container marker with no host
- * os-release) — a merely unreadable file degrades to `unknown` WITHOUT the
- * note, because "VS Code appears to run in a sandbox/container" would be a
- * fabrication there (§1.2's trigger sentence is the authority).
- */
-interface OsResolution {
-  release: OsRelease;
-  family: DistroFamily;
-  manager: PackageManager;
-  containerNote?: string;
+/** F2-16: an entry with no armed timer, no pending value, and a lastEmit
+ *  older than the throttle window is SEMANTICALLY identical to no entry (a
+ *  fresh entry's `-Infinity` lastEmit also fires immediately) — so pruning
+ *  it is behavior-preserving, and the map stops growing one entry per
+ *  (op,id) pair forever. Exported pure for direct unit tests. */
+export function pruneExpiredThrottleEntries(
+  throttle: Map<string, ThrottleState>,
+  now: number,
+  throttleMs: number,
+): void {
+  for (const [key, state] of throttle) {
+    if (state.timer === undefined && state.pending === undefined && now - state.lastEmit >= throttleMs) {
+      throttle.delete(key);
+    }
+  }
 }
+
+/** T6 (§2.5): the llama.cpp runtime memo's settled shape — the current
+ *  inline field type, named for {@link SettledProbeMemo}'s type parameter. */
+type LlamaCppSettled = { binary: 'found' | 'missing' | 'unknown'; version?: string; path?: string };
 
 export class SetupController {
   private readonly progressEmitter = new Emitter<SetupProgress>();
@@ -720,103 +590,158 @@ export class SetupController {
   private readonly statusChangedEmitter = new Emitter<void>();
   readonly onStatusChanged: Event<void> = this.statusChangedEmitter.event;
 
+  /** CA-M18: any state change that re-pushes SetupData ALSO invalidates the
+   *  probe memo — the resulting status() pass reflects post-change truth,
+   *  while the two pushes it triggers still share ONE fresh probe. */
+  private bumpStatus(): void {
+    this.ollamaProbeMemo = undefined;
+    this.statusChangedEmitter.fire();
+  }
+
   /** Keyed `${op}:${id}` (`install:<backendId>` / `pull:<model>`) — presence = single-flight latch (FM-12); the held `AbortController` is what `setup.cancel` interrupts. */
-  private readonly inFlight = new Map<string, AbortController>();
+  private readonly latches = new LatchRegistry(() => this.lifecycle.closed);
+  /** WS-GD.2b B7: the provision/pull family, extracted to its own class —
+   *  see {@link ProvisionRunner}'s own doc for the cycle rule this seam exists
+   *  to satisfy (it never imports from this file). Assigned in the
+   *  constructor BODY, not as a field initializer here — a field initializer
+   *  would read `this.deps` (a constructor parameter property) BEFORE the
+   *  constructor body has assigned it, which `tsc` refuses to compile
+   *  (TS2729, "used before its initialization"; field initializers run
+   *  before the constructor's own body for a base class with no `extends`). */
+  private readonly provision: ProvisionRunner;
   private readonly throttle = new Map<string, ThrottleState>();
+  /** F2-16: the WS-R2 gate idiom — flipped CLOSED synchronously by
+   *  {@link dispose} BEFORE any teardown, so {@link LatchRegistry.arm} can
+   *  never arm a new install/pull latch that no dispose will ever abort (the
+   *  TC-6 detached-download class, closed structurally at one choke point). */
+  private readonly lifecycle: MutationGate = createMutationGate();
 
   private installLogTail: string[] = [];
-  private lastAgentIssue?: { phase: AgentSetupPhase; detail: string };
+  private lastAgentIssue: { phase: AgentSetupPhase; detail: string } | undefined;
   /** Set once a `setup.install` succeeds THIS session; never cleared here (a real reload replaces the whole extension host, and therefore this controller instance). */
   private awaitingReload = false;
   /** T5: memoized OS detection (a PROMISE, so concurrent `status()` calls
    *  share one read) — cleared by `setup.recheck` so the next demand
    *  re-reads (the user may have installed VS Code outside the sandbox, or
    *  the file may have become readable). */
-  private osResolution?: Promise<OsResolution>;
-
-  /**
-   * T6 (beta.6 §2.5): the llama.cpp runtime SETTLED-VALUE memo — deliberately
-   * NOT the awaited {@link osResolution} pattern (which cannot express
-   * `'checking'`): `status()` kicks the probe once (lazily, {@link
-   * kickLlamaCppProbe}) and returns immediately with `'checking'`; the
-   * probe's settle writes this field and fires {@link onStatusChanged}
-   * exactly ONCE (the seq-guarded push repaints). `undefined` = not settled
-   * yet. The `path` is stored ALREADY `~`-redacted (T6 M-3 discipline).
-   */
-  private llamaCppRuntime?: { binary: 'found' | 'missing' | 'unknown'; version?: string; path?: string };
-  /** True while a probe attempt is in flight — with {@link llamaCppRuntime}
-   *  `undefined` + this false, the next `status()` kicks a fresh probe. */
-  private llamaCppProbeInFlight = false;
-  /** The in-flight probe attempt's AbortController — a scoped recheck (and
-   *  {@link dispose}) aborts it so a superseded login-shell probe dies
-   *  instead of lingering (T5 CR-1 signal threading). */
-  private llamaCppProbeAbort?: AbortController;
-  /** Monotonic supersession guard: bumped by {@link rekickLlamaCppProbe} so a
-   *  SUPERSEDED probe settling late can neither overwrite the fresh state
-   *  nor fire a stray push. */
-  private llamaCppProbeEpoch = 0;
-
-  /**
-   * TC-3 (AU-8 / INV-11): the Hermes PATH-discovery settled-value memo —
-   * SAME posture as {@link llamaCppRuntime} above. `undefined` = never
-   * probed; `{found: string | null}` = settled (`found` = the discovered
-   * absolute path, `null` = the login-shell PATH lookup came up empty or
-   * rejected — the honest "not found" outcome, never a thrown error out of
-   * `status()`). `status()` kicks the probe lazily ({@link
-   * kickHermesDiscovery}) ONLY when `talaria.hermesPath` is unset, and only
-   * while `this.deps.discoverHermes` is bound — an unbound dep (older/
-   * partial wiring) leaves this memo permanently `undefined`, which {@link
-   * computeAgentPhase} reads exactly like the pre-AU-8 settings-only truth.
-   */
-  private hermesPathDiscovery?: { found: string | null };
-  /** True while a discovery attempt is in flight — with {@link
-   *  hermesPathDiscovery} `undefined` + this false, the next `status()`
-   *  kicks a fresh probe. */
-  private hermesDiscoveryProbeInFlight = false;
-  /** Monotonic supersession guard, mirroring {@link llamaCppProbeEpoch}:
-   *  bumped by {@link dispose} and by `setup.recheck`'s memo-clear so a
-   *  superseded probe's late settle can neither overwrite fresher state nor
-   *  fire a stray push. Unlike {@link llamaCppProbeAbort}, there is no
-   *  cancellation seam here — {@link SetupControllerDeps.discoverHermes}
-   *  takes no `AbortSignal` — so a superseded attempt keeps running in the
-   *  background; the epoch just makes ITS eventual settle inert. */
-  private hermesDiscoveryEpoch = 0;
+  private osResolution: Promise<OsResolution> | undefined;
 
   constructor(
     private readonly host: SetupHost,
     private readonly deps: SetupControllerDeps,
-  ) {}
+  ) {
+    this.provision = new ProvisionRunner(
+      {
+        showModal: (m, l) => this.host.showModal(m, l),
+        redact: (t) => this.redact(t),
+        pushProgress: (p) => this.pushProgress(p),
+        bumpStatus: () => this.bumpStatus(),
+      },
+      this.deps,
+      this.latches,
+    );
+  }
+
+  /**
+   * T6 (beta.6 §2.5): the llama.cpp runtime settled-value memo — see {@link
+   * SettledProbeMemo} for the shared kick/invalidate/rekick/supersede
+   * contract (deliberately NOT the awaited {@link osResolution} pattern,
+   * which cannot express `'checking'`). `status()` kicks the probe once
+   * (lazily, {@link kickLlamaCppProbe}) and returns immediately with
+   * `'checking'`; the probe's settle writes {@link SettledProbeMemo.value}
+   * and fires {@link onStatusChanged} exactly ONCE via `onSettled` (the
+   * seq-guarded push repaints). Unsettled `.value` = not settled yet. The
+   * `path` is stored ALREADY `~`-redacted (T6 M-3 discipline). Cancellable:
+   * true — {@link SetupControllerDeps.locateLlamaServer} takes an
+   * `AbortSignal`, so a scoped recheck (or {@link dispose}) cancels a
+   * superseded login-shell probe instead of leaving it lingering (T5 CR-1
+   * signal threading). CAUTION (construction order): this field initializer
+   * reads `this.deps`/`this.redact` inside its `probe`/`onSettled` closures
+   * — safe because those closures only run LATER, at `kick()` time, well
+   * after the constructor above has already bound `this.deps`/`this.host`.
+   */
+  private readonly llamaCppMemo = new SettledProbeMemo<LlamaCppSettled>({
+    probe: async (signal) => {
+      const result = await this.deps.locateLlamaServer(signal);
+      return result.ok
+        ? {
+            binary: 'found',
+            ...(result.version !== undefined ? { version: result.version } : {}),
+            path: this.redact(result.path),
+          }
+        : { binary: result.reason === 'probe-timeout' ? 'unknown' : 'missing' };
+    },
+    onRejected: () => ({ binary: 'unknown' }),
+    onSettled: () => this.bumpStatus(),
+    cancellable: true,
+  });
+
+  /**
+   * TC-3 (AU-8 / INV-11): the Hermes PATH-discovery settled-value memo — SAME
+   * {@link SettledProbeMemo} contract as {@link llamaCppMemo} above.
+   * Unsettled `.value` = never probed; `{found: string | null}` = settled
+   * (`found` = the discovered absolute path, `null` = the login-shell PATH
+   * lookup came up empty or rejected — the honest "not found" outcome, never
+   * a thrown error out of `status()`). `status()` kicks the probe lazily
+   * ({@link kickHermesDiscovery}) ONLY when `talaria.hermesPath` is unset,
+   * and only while `this.deps.discoverHermes` is bound — an unbound dep
+   * (older/partial wiring) leaves this memo permanently unsettled, which
+   * {@link computeAgentPhase} reads exactly like the pre-AU-8 settings-only
+   * truth (the unbound-dep guard stays in {@link kickHermesDiscovery} itself
+   * — the memo never learns about optional deps; the `discover` re-read
+   * inside `probe` below narrows only to satisfy the type checker for a path
+   * that `kickHermesDiscovery`'s guard already makes unreachable — `deps` is
+   * `readonly`, so it cannot become unbound between the guard and this call).
+   * Cancellable: false — {@link SetupControllerDeps.discoverHermes} takes no
+   * `AbortSignal`, so a superseded attempt keeps running in the background;
+   * the epoch just makes ITS eventual settle inert.
+   */
+  private readonly hermesDiscoveryMemo = new SettledProbeMemo<{ found: string | null }>({
+    probe: async () => {
+      const discover = this.deps.discoverHermes;
+      return { found: discover ? await discover() : null };
+    },
+    onRejected: () => ({ found: null }),
+    onSettled: () => this.bumpStatus(),
+    cancellable: false,
+  });
 
   dispose(): void {
+    // F2-16: flip the gate CLOSED synchronously, FIRST — before any teardown
+    // below — so a concurrent `latches.arm` call can never interleave between
+    // this flip and the teardown that follows (run-to-completion; see
+    // {@link LatchRegistry.arm}'s own doc for the atomicity this buys).
+    void this.lifecycle.close(Promise.resolve());
     for (const state of this.throttle.values()) {
       if (state.timer) clearTimeout(state.timer);
     }
     this.throttle.clear();
     // TC-6 (AU-6): abort every install/pull/provision still latched in
-    // `inFlight` — at HEAD this map was never iterated here, so a
+    // `this.latches` — at HEAD this map was never iterated here, so a
     // window-reload mid-install left the pipx child / multi-GB GGUF fetch
     // running detached from a disposed controller. Placed BEFORE the emitter
     // disposals below (mirrors the llama.cpp probe ordering just after) so
     // any synchronous abort-path progress a caller emits still finds a live
     // emitter or is dropped harmlessly; the existing `finally {
-    // this.inFlight.delete(key) }` blocks in every handler make a late
-    // delete here (once those handlers' own catch/finally runs) a no-op.
+    // this.latches.release(key) }` blocks in every handler make a late
+    // release here (once those handlers' own catch/finally runs) a no-op.
     // `AbortController#abort()` never throws — even a listener that throws
     // is reported asynchronously (Node/DOM event-dispatch semantics), never
     // synchronously out of `abort()` — so this loop cannot abort disposal
     // partway through, keeping `dispose()` safe/idempotent by construction.
-    for (const abort of this.inFlight.values()) abort.abort();
-    this.inFlight.clear();
+    this.latches.abortAll();
     // T6: supersede + cancel any in-flight llama.cpp probe — its late settle
     // must neither write state nor fire into the (now-cleared) emitter.
-    this.llamaCppProbeEpoch += 1;
-    this.llamaCppProbeAbort?.abort();
-    this.llamaCppProbeAbort = undefined;
+    this.llamaCppMemo.supersede();
     // TC-3 (AU-8/INV-11): supersede any in-flight Hermes discovery probe too
     // — no abort seam exists (discoverHermes takes no signal), so bumping the
     // epoch is the only guard; its late settle is dropped (epoch mismatch)
     // instead of writing state or firing into the disposed emitter.
-    this.hermesDiscoveryEpoch += 1;
+    this.hermesDiscoveryMemo.supersede();
+    // CA-M18: drop the Ollama probe memo too — an in-flight probe's late
+    // settle is harmless (it resolves the stored promise, nothing more),
+    // but a disposed controller must never SERVE a memoized result again.
+    this.ollamaProbeMemo = undefined;
     this.progressEmitter.dispose();
     this.statusChangedEmitter.dispose();
   }
@@ -871,7 +796,7 @@ export class SetupController {
     const configuredBackend = this.host.getSetting<string>('talaria.backend') ?? 'mock';
     // TC-3 (AU-8/INV-11): the discovered PATH fallback — `null`/unsettled
     // both read as "nothing found yet", exactly like a settings-only miss.
-    const agentPhase = this.computeAgentPhase(hermesPath, configuredBackend, this.hermesPathDiscovery?.found);
+    const agentPhase = this.computeAgentPhase(hermesPath, configuredBackend, this.hermesDiscoveryMemo.value?.found);
     const installRecord = this.host.globalState.get<{ version: string; venvRoot: string; installedAt: string }>(
       'talaria.setup.hermesInstall',
     );
@@ -888,17 +813,6 @@ export class SetupController {
     const model = (this.host.getSetting<string>('talaria.autocomplete.model') ?? '').trim() || DEFAULT_FIM_MODEL;
     const endpointValue = (this.host.getSetting<string>('talaria.autocomplete.endpoint') ?? '').trim();
 
-    const tuning = {
-      debounceMs: this.host.getSetting<number>('talaria.autocomplete.debounceMs') ?? 350,
-      maxPromptTokens: this.host.getSetting<number>('talaria.autocomplete.maxPromptTokens') ?? 1024,
-      temperature: this.host.getSetting<number>('talaria.autocomplete.temperature') ?? 0.01,
-      crossFileEnabled: this.host.getSetting<boolean>('talaria.autocomplete.crossFile.enabled') ?? true,
-      prefixInjection: this.host.getSetting<boolean>('talaria.autocomplete.crossFile.prefixInjection') ?? false,
-      prefixInjectionRemote:
-        this.host.getSetting<boolean>('talaria.autocomplete.crossFile.prefixInjectionRemote') ?? false,
-      warmUp: this.host.getSetting<boolean>('talaria.autocomplete.crossFile.warmUp') ?? false,
-    };
-
     const fimAuthSatisfied =
       fimDescriptor.remote?.auth.kind !== 'apiKey' || !fimDescriptor.remote.auth.required || apiKeySet;
 
@@ -909,90 +823,21 @@ export class SetupController {
     const provider = computeProviderCard(this.deps.getAdvertisedAuthMethods());
 
     const nextSource = this.deps.getNextEditSource();
-    const nextBackend = coerceNextEditTransport(this.host.getSetting<string>('talaria.nextEdit.backend'));
-    const nextEndpoint = (this.host.getSetting<string>('talaria.nextEdit.endpoint') ?? '').trim();
-    const nextModel = (this.host.getSetting<string>('talaria.nextEdit.model') ?? '').trim();
     const genericSupported = fimDescriptor.nextEditTransport !== undefined;
-    const dedicatedConfigured = nextEndpoint !== '' && nextModel !== '';
-    // T8 (beta.6 CC-10): additive restoration hint — which unified-block pane
-    // configured the dedicated NEXT connection. `undefined` (never set, or a
-    // malformed/edited settings.json value) ⇒ omitted from the wire, so the
-    // panel falls back to its existing transport heuristic.
-    const nextDedicatedBackendIdRaw = (
-      this.host.getSetting<string>('talaria.nextEdit.dedicatedBackendId') ?? ''
-    ).trim();
-    const nextDedicatedBackendId = coerceDedicatedBackendId(
-      nextDedicatedBackendIdRaw === '' ? undefined : nextDedicatedBackendIdRaw,
-    );
-    // T13 (§4.2): capability + raw facts for the dedicated NEXT card —
-    // computed purely from the registry pins (no await; the CR-002
-    // synchronous tail below stays intact). `downloadReady` is driven by the
-    // sha256 pin and NOTHING else.
-    const downloadReady = (NEXT_DEDICATED_MODEL.gguf.sha256 as string) !== '';
-    const dedicated: NonNullable<SetupData['nextEdit']['dedicated']> = {
-      displayName: NEXT_DEDICATED_MODEL.displayName,
-      // ⚠ R-3: '' while !downloadReady — configuration is fail-closed, not
-      // just the download (see the protocol.ts field doc).
-      modelDefaults: {
-        ollama: downloadReady ? NEXT_DEDICATED_MODEL.ollamaCreatedName : '',
-        openaiCompat: NEXT_DEDICATED_MODEL.upstream.hfRepo,
-      },
-      downloadReady,
-      downloadApproxBytes: NEXT_DEDICATED_MODEL.gguf.approxBytes,
-      warning: NEXT_DEDICATED_WARNING,
-      guided: {
-        // §6 copy: command line + honesty note, newline-separated.
-        vllm: `Run: vllm serve ${NEXT_DEDICATED_MODEL.upstream.hfRepo}\n(official Sweep release, ~15 GB download)`,
-        // llamacpp ONLY when the pin is published (S-F2/S-F5): `-hf` verifies
-        // nothing itself, so the line ships WITH the manual sha256sum hint.
-        ...(downloadReady
-          ? {
-              llamacpp:
-                `Run: llama-server -hf ${NEXT_DEDICATED_MODEL.gguf.hfRepo}:${NEXT_DEDICATED_MODEL.gguf.quant} --port 8012` +
-                `\nVerify the download: sha256sum should print ${NEXT_DEDICATED_MODEL.gguf.sha256}`,
-            }
-          : {}),
-      },
-    };
-
-    const ragEnabled = this.host.getSetting<boolean>('talaria.rag.enabled') ?? true;
-    const ragEmbedEndpoint = (this.host.getSetting<string>('talaria.rag.embedEndpoint') ?? '').trim() || DEFAULT_OLLAMA_ENDPOINT;
-    // T8 (beta.6 CC-10): additive restoration hint — which backend the RAG
-    // embedder block is configured against. UNLIKE `dedicatedBackendId`, this
-    // has one clean single default ('ollama') and is ALWAYS populated on the
-    // wire (never omitted) — a malformed/edited settings.json value degrades
-    // to that default, same fail-closed coercion as `coerceNextEditTransport`.
-    const ragEmbedBackendRaw = this.host.getSetting<string>('talaria.rag.embedBackend');
-    const ragEmbedBackend: 'ollama' | 'llamacpp' | 'openai-compat' =
-      ragEmbedBackendRaw === 'llamacpp' || ragEmbedBackendRaw === 'openai-compat' ? ragEmbedBackendRaw : 'ollama';
-    const ragEmbedModel = (this.host.getSetting<string>('talaria.rag.embedModel') ?? '').trim() || DEFAULT_RAG_EMBED_MODEL;
-    const ragTuning = {
-      dims: this.host.getSetting<number>('talaria.rag.dims') ?? 0,
-      maxChunkTokens: this.host.getSetting<number>('talaria.rag.maxChunkTokens') ?? 512,
-      debounceMs: this.host.getSetting<number>('talaria.rag.debounceMs') ?? 500,
-      excludeGlobs: this.host.getSetting<string[]>('talaria.rag.excludeGlobs') ?? [],
-    };
-    const ragIndexDir = (this.host.getSetting<string>('talaria.rag.indexDir') ?? '').trim() || DEFAULT_RAG_INDEX_DIR;
 
     const fimGreen = fimDescriptor.status === 'available' && enabled && fimAuthSatisfied;
     const ready = computeReady(agentPhase, provider.phase, fimGreen);
 
     const data: SetupData = {
       trusted,
-      agent: {
+      agent: composeAgentBlock({
         options: agentOptions,
-        selectedId: 'hermes',
         phase: agentPhase,
-        ...(installRecord?.version ? { version: installRecord.version } : {}),
-        ...(this.lastAgentIssue ? { detail: this.lastAgentIssue.detail } : {}),
-        ...(this.installLogTail.length > 0 ? { logTail: [...this.installLogTail] } : {}),
-        // T5 §1.2: present iff the phase calls for them — the webview only
-        // ever RENDERS these (it never composes command text, Constraint 1).
-        ...(agentPhase === 'pipx-missing' ? { bootstrap: composeBootstrap(osInfo) } : {}),
-        ...(agentPhase === 'python-unsuitable'
-          ? { pythonInstall: pythonInstallPlan(osInfo.release, osInfo.family) }
-          : {}),
-      },
+        installRecordVersion: installRecord?.version,
+        lastIssueDetail: this.lastAgentIssue?.detail,
+        logTail: this.installLogTail,
+        osInfo,
+      }),
       provider,
       fim: {
         options: fimOptions,
@@ -1000,43 +845,20 @@ export class SetupController {
         enabled,
         model,
         endpointValue,
-        tuning,
+        tuning: composeFimTuning(this.host),
       },
-      nextEdit: {
-        source: nextSource,
-        backend: nextBackend,
-        endpoint: nextEndpoint,
-        model: nextModel,
-        dedicatedConfigured,
-        ...(nextDedicatedBackendId !== undefined ? { dedicatedBackendId: nextDedicatedBackendId } : {}),
+      nextEdit: composeNextEditBlock({
+        reader: this.host,
+        nextSource,
         genericSupported,
-        ...(nextSource === 'generic' && !genericSupported
-          ? {
-              refusalDetail: `The selected FIM backend ('${fimDescriptor.displayName}') does not support Generic Next-Edit.`,
-            }
-          : {}),
-        dedicated,
-      },
-      rag: {
-        enabled: ragEnabled,
-        embedEndpoint: ragEmbedEndpoint,
-        embedBackend: ragEmbedBackend,
-        embedModel: ragEmbedModel,
-        // beta.6 panel-fix T2 (audit A5): host-owned per-pane endpoint
-        // defaults, ALWAYS populated — mirrors agentLocalModel.endpointDefaults
-        // (CC-6) exactly. Never webview-fabricated (Global Constraint 1).
-        endpointDefaults: RAG_ENDPOINT_DEFAULTS,
-        // @deprecated beta.6 T14 (wire compat only): the wrong-daemon
-        // computation §3.4 replaced — it answers for the endpoint this
-        // status() probed, not `embedEndpoint`, and the exact `===` misses
-        // `:latest`. The unified UI derives presence client-side instead
-        // (`ragEmbedPresence`, endpoint-scoped per C-6); no webview code
-        // reads this field anymore (source-scan-locked in SetupPanel.test.ts).
-        embedModelPresent: ollamaStatus.running ? ollamaStatus.models.some((m) => m.name === ragEmbedModel) : false,
-        tuning: ragTuning,
-        indexDir: ragIndexDir,
-        ...(trusted ? {} : { preconditionDetail: 'The codebase index needs a trusted, open workspace.' }),
-      },
+        fimDisplayName: fimDescriptor.displayName,
+      }),
+      rag: composeRagBlock({
+        reader: this.host,
+        trusted,
+        ollamaRunning: ollamaStatus.running,
+        ollamaModels: ollamaStatus.running ? ollamaStatus.models : [],
+      }),
       // T13 (§4.2): `endpoint` = the endpoint this status() ACTUALLY probed
       // — presence claims are scoped to it (critic C-6).
       ollama: ollamaStatus.running
@@ -1054,12 +876,7 @@ export class SetupController {
       // fresh from the 3 `talaria.agent.localModel.*` settings on every call.
       agentLocalModel: this.composeAgentLocalModel(provider.phase, storePresence),
       ready,
-      os: {
-        family: osInfo.family,
-        manager: osInfo.manager,
-        ...(osInfo.release.prettyName !== undefined ? { prettyName: osInfo.release.prettyName } : {}),
-        ...(osInfo.containerNote !== undefined ? { containerNote: osInfo.containerNote } : {}),
-      },
+      os: composeOsBlock(osInfo),
     };
     return data;
   }
@@ -1100,7 +917,7 @@ export class SetupController {
   /**
    * Kick the `llama-server` probe ONCE, lazily — a no-op while a settled
    * value exists or an attempt is already in flight. The settle writes
-   * {@link llamaCppRuntime} and fires {@link onStatusChanged} exactly once;
+   * {@link llamaCppMemo}'s value and fires {@link onStatusChanged} exactly once;
    * a settle whose epoch was superseded (scoped recheck / dispose) is
    * DROPPED entirely. Mapping (CC-5): found ⇒ `'found'`, `not-found` ⇒
    * `'missing'`, `probe-timeout` ⇒ `'unknown'` (never `'missing'`); a
@@ -1108,45 +925,14 @@ export class SetupController {
    * become an unhandled rejection out of a fire-and-forget kick.
    */
   private kickLlamaCppProbe(): void {
-    if (this.llamaCppRuntime !== undefined || this.llamaCppProbeInFlight) return;
-    this.llamaCppProbeInFlight = true;
-    const epoch = this.llamaCppProbeEpoch;
-    const abort = new AbortController();
-    this.llamaCppProbeAbort = abort;
-    void (async () => {
-      let settled: NonNullable<SetupController['llamaCppRuntime']>;
-      try {
-        const result = await this.deps.locateLlamaServer(abort.signal);
-        settled = result.ok
-          ? {
-              binary: 'found',
-              ...(result.version !== undefined ? { version: result.version } : {}),
-              path: this.redact(result.path),
-            }
-          : { binary: result.reason === 'probe-timeout' ? 'unknown' : 'missing' };
-      } catch {
-        // Rejection (incl. an abort racing the settle) ⇒ honest 'unknown';
-        // a superseded epoch is dropped below either way.
-        settled = { binary: 'unknown' };
-      }
-      if (epoch !== this.llamaCppProbeEpoch) return; // superseded — the fresh probe owns the state
-      this.llamaCppRuntime = settled;
-      this.llamaCppProbeInFlight = false;
-      this.llamaCppProbeAbort = undefined;
-      this.statusChangedEmitter.fire();
-    })();
+    this.llamaCppMemo.kick();
   }
 
   /** Clear state + memo, cancel the superseded attempt, and re-kick WITHOUT
    *  awaiting — `setup.recheck {scope:'llamacpp'}`'s non-blocking re-check
    *  (the recheck RPC's own budget is untouched). */
   private rekickLlamaCppProbe(): void {
-    this.llamaCppProbeEpoch += 1;
-    this.llamaCppProbeAbort?.abort();
-    this.llamaCppProbeAbort = undefined;
-    this.llamaCppRuntime = undefined;
-    this.llamaCppProbeInFlight = false;
-    this.kickLlamaCppProbe();
+    this.llamaCppMemo.rekick();
   }
 
   /** The wire projection of the memo (§1.3 `llamacppRuntime`): unsettled ⇒
@@ -1154,7 +940,7 @@ export class SetupController {
    *  `'unknown'`, where an install button would assert a fact the probe
    *  could not establish). */
   private composeLlamaCppRuntime(osInfo: OsResolution): NonNullable<SetupData['llamacppRuntime']> {
-    const settled = this.llamaCppRuntime;
+    const settled = this.llamaCppMemo.value;
     if (settled === undefined) return { binary: 'checking' };
     return {
       binary: settled.binary,
@@ -1226,7 +1012,7 @@ export class SetupController {
   async handle(
     method: SetupMethod,
     params: unknown,
-  ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; models?: string[] } | { ok: false; reason: string } | SetupCancelResult> {
     // TE-4 (AU-11, INV-15) belt — see SETUP_METHOD_SET's doc: a method
     // outside the known set fails closed HERE, before the trust gate or the
     // switch, instead of silently falling through to an unhandled `undefined`.
@@ -1253,9 +1039,9 @@ export class SetupController {
       case 'setup.testRemote':
         return this.handleTestRemote(params);
       case 'setup.pullModel':
-        return this.handlePullModel(params);
+        return this.provision.handlePullModel(params);
       case 'setup.provisionModel':
-        return this.handleProvisionModel(params);
+        return this.provision.handleProvisionModel(params);
       case 'setup.saveAgentModel':
         return this.handleSaveAgentModel(params);
       case 'setup.cancel':
@@ -1269,7 +1055,7 @@ export class SetupController {
       case 'setup.reload':
         return this.handleReload();
       case 'setup.reconnectAgent':
-        return this.handleReconnectAgent();
+        return this.handleReconnectAgent(params);
       case 'setup.recheck':
         return this.handleRecheck(params);
       case 'setup.setNextEdit':
@@ -1286,7 +1072,7 @@ export class SetupController {
   private async handleInstall(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
     const backendId = str(params, 'backendId') ?? 'hermes';
     const key = `install:${backendId}`;
-    if (this.inFlight.has(key)) {
+    if (this.latches.has(key)) {
       return { ok: false, reason: 'install already running' };
     }
     const descriptor = this.deps.registry.getBackend(backendId);
@@ -1295,8 +1081,8 @@ export class SetupController {
       return { ok: false, reason: `'${backendId}' has no pipx install recipe.` };
     }
 
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
+    const abort = this.latches.arm(key);
+    if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
     this.lastAgentIssue = undefined;
     this.installLogTail = [];
     try {
@@ -1309,7 +1095,7 @@ export class SetupController {
       // after the user's CONFIRM — never at the in-flight latch above (which
       // is set BEFORE the modal, so firing there would push a phase the user
       // hasn't agreed to yet).
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
 
       let located: PipxLocateResult;
       try {
@@ -1321,7 +1107,7 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
-        this.statusChangedEmitter.fire();
+        this.bumpStatus();
         return { ok: false, reason: detail };
       }
       if (!located.ok) {
@@ -1336,7 +1122,7 @@ export class SetupController {
         // to the generic 'error' phase (the detail line carries the specifics).
         const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
         this.lastAgentIssue = { phase, detail };
-        this.statusChangedEmitter.fire();
+        this.bumpStatus();
         const reason =
           located.reason === 'pipx-missing' ? composeBootstrap(await this.resolveOs()).guidance : detail;
         return { ok: false, reason };
@@ -1353,7 +1139,7 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
-        this.statusChangedEmitter.fire();
+        this.bumpStatus();
         return { ok: false, reason: detail };
       }
 
@@ -1376,15 +1162,15 @@ export class SetupController {
       } catch (err) {
         const detail = this.redact(errorMessage(err));
         this.lastAgentIssue = { phase: 'error', detail };
-        this.statusChangedEmitter.fire();
+        this.bumpStatus();
         return { ok: false, reason: detail };
       }
       this.awaitingReload = true;
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
       this.host.offerReload();
       return { ok: true };
     } finally {
-      this.inFlight.delete(key);
+      this.latches.release(key);
     }
   }
 
@@ -1405,11 +1191,61 @@ export class SetupController {
       // only surface (§0.1 ②); `handleInstall`'s own catch below fires again
       // once the rejection propagates, which the provider's seq guard
       // safely collapses with this one.
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
       this.pushProgress({ op: 'install', id: backendId, phase: event.phase, line: detail });
     } else if (event.kind === 'done') {
       this.pushProgress({ op: 'install', id: backendId, phase: 'verify', line: 'Install verified.' });
     }
+  }
+
+  /**
+   * F2-17: one multi-key Global settings write as a DISCLOSED transaction —
+   * sequential writes; on the first failure, best-effort rollback of every
+   * key already written (to its exact prior Global value via the optional
+   * {@link SetupHost.inspectSettingGlobal} seam) and an honest per-key
+   * disclosure in the reason. Reasons carry closed `talaria.*` key literals
+   * and a redacted error only — never setting VALUES (webview-bound).
+   */
+  private async writeSettingsBatch(
+    writes: ReadonlyArray<readonly [string, unknown]>,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const inspect = this.host.inspectSettingGlobal?.bind(this.host);
+    const written: Array<readonly [string, unknown]> = [];
+    for (const [key, value] of writes) {
+      const prior = inspect?.(key);
+      try {
+        await this.host.updateSettingGlobal(key, value);
+      } catch (err) {
+        const detail = this.redact(errorMessage(err));
+        if (written.length === 0) {
+          return { ok: false, reason: `settings write failed at '${key}' (${detail}) — no other keys were changed.` };
+        }
+        if (inspect === undefined) {
+          return {
+            ok: false,
+            reason:
+              `settings write failed at '${key}' (${detail}) — already written and NOT rolled back: ` +
+              `${written.map(([k]) => k).join(', ')}. Re-apply to finish, or revert in settings.json.`,
+          };
+        }
+        const restored: string[] = [];
+        const failed: string[] = [];
+        for (const [k, prev] of written) {
+          try {
+            await this.host.updateSettingGlobal(k, prev);
+            restored.push(k);
+          } catch {
+            failed.push(k);
+          }
+        }
+        const parts = [`settings write failed at '${key}' (${detail}).`];
+        if (restored.length > 0) parts.push(`Rolled back: ${restored.join(', ')}.`);
+        if (failed.length > 0) parts.push(`Rollback FAILED for: ${failed.join(', ')} — check settings.json.`);
+        return { ok: false, reason: parts.join(' ') };
+      }
+      written.push([key, prior] as const);
+    }
+    return { ok: true };
   }
 
   // --- setup.applyAgent ------------------------------------------------------
@@ -1429,9 +1265,8 @@ export class SetupController {
       'Activate',
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
-    for (const [settingKey, value] of entries) {
-      await this.host.updateSettingGlobal(settingKey, value);
-    }
+    const wrote = await this.writeSettingsBatch(entries.map(([k, v]) => [k, v] as const));
+    if (!wrote.ok) return wrote;
     this.host.offerReload();
     return { ok: true };
   }
@@ -1473,12 +1308,12 @@ export class SetupController {
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
 
-    await this.host.updateSettingGlobal('talaria.autocomplete.backend', backendId);
-    await this.host.updateSettingGlobal('talaria.autocomplete.endpoint', validated.url);
-    if (model) {
-      await this.host.updateSettingGlobal('talaria.autocomplete.model', model);
-    }
-    return { ok: true };
+    const writes: Array<readonly [string, unknown]> = [
+      ['talaria.autocomplete.backend', backendId],
+      ['talaria.autocomplete.endpoint', validated.url],
+    ];
+    if (model) writes.push(['talaria.autocomplete.model', model]);
+    return this.writeSettingsBatch(writes);
   }
 
   // --- setup.setApiKey --------------------------------------------------------
@@ -1530,549 +1365,6 @@ export class SetupController {
     }
   }
 
-  // --- setup.pullModel ---------------------------------------------------------
-
-  /**
-   * T13 (beta.5 §4.4 — the ALLOWLIST pull gate, refusal order verbatim):
-   * normalize(trim) → classify (rev 6 predicate, {@link isHostSourcedModel})
-   * → (1) `validateEndpointUrl` (⚠ S-F3: this was the only URL-bearing
-   * handler skipping it) → (2) host-sourced? ALWAYS refused (rev 5: the
-   * automated `ollama pull hf.co/…` class is REMOVED, not gated — kills
-   * S-F1 outright, including the `huggingface.co` alias bypass) → (3) the
-   * registry-pinned `ollamaCreatedName` (case-insensitive)? the VETTED
-   * INGEST branch ({@link handleVettedIngest}) → (4) plain `name[:tag]` /
-   * `ns/name` = the pre-existing, ledger-documented library tier (§5.2),
-   * byte-identical to before.
-   */
-  private async handlePullModel(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
-    // normalize: trim BEFORE classification — ' hf.co/x' must not dodge the gate.
-    const model = str(params, 'model')?.trim();
-    if (!model) return { ok: false, reason: 'model is required.' };
-    const endpoint =
-      str(params, 'endpoint')?.trim() ||
-      this.deps.registry.getBackend('ollama')?.remote?.endpoint.defaultValue ||
-      DEFAULT_OLLAMA_ENDPOINT;
-    // (1) endpoint validity — before anything else touches it.
-    const validated = validateEndpointUrl(endpoint);
-    if (!validated.ok) return { ok: false, reason: validated.reason };
-    // (2) host-sourced models: ALWAYS refused, no modal, no exceptions.
-    if (isHostSourcedModel(model)) {
-      return { ok: false, reason: HOST_SOURCED_PULL_REFUSAL };
-    }
-    // (3) the ONE vetted artifact installs through the digest-enforced ingest.
-    if (model.toLowerCase() === NEXT_DEDICATED_MODEL.ollamaCreatedName.toLowerCase()) {
-      return this.handleVettedIngest(validated.url);
-    }
-    // (4) plain library `name[:tag]` / `ns/name` — existing behavior, unchanged.
-    const key = `pull:${model}`;
-    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
-
-    // Latch BEFORE the modal (mirrors handleInstall) — otherwise two
-    // `setup.pullModel` calls dispatched before the user answers the first
-    // modal both pass the `has()` check above, and if both are approved the
-    // second `inFlight.set` clobbers the first's AbortController, leaving
-    // `setup.cancel` unable to reach the first pull. The `finally` below
-    // still deletes the key on every exit path, including a decline, so a
-    // declined pull never wedges the latch.
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
-    try {
-      // T1 (beta.6 panel-fix PT1): sanitize BEFORE the modal below — a
-      // STRICTER, EARLIER gate than the leading-'-' check inside
-      // {@link runLibraryPull}, never a looser one; that check stays exactly
-      // where it is. The vetted-ingest branch (step 3, above) never reaches
-      // this modal, so it needs no sanitation of its own.
-      const sanitized = refuseUnsafeModalText(model, 'model');
-      if (!sanitized.ok) return sanitized;
-      const confirmed = await this.host.showModal(
-        `Pull model '${model}' from the Ollama registry to your local disk?`,
-        'Pull',
-      );
-      if (!confirmed) return { ok: false, reason: 'declined' };
-
-      // T7 (beta.6): the pull body is the EXTRACTED {@link runLibraryPull} —
-      // shared with the catalog tier. Behavior here is unchanged: same modal
-      // (above), same latch, tag-keyed progress id.
-      await this.runLibraryPull(model, endpoint, model, abort.signal);
-      return { ok: true };
-    } catch (err) {
-      if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
-      return { ok: false, reason: this.redact(errorMessage(err)) };
-    } finally {
-      this.inFlight.delete(key);
-      // §7.2.2: terminal marker on EVERY settle path (success, failure,
-      // cancel, or a post-latch decline) — the webview deletes its
-      // accumulated progress entry, clearing a frozen bar + dead Cancel.
-      this.pushProgress({ op: 'pull', id: model, done: true });
-    }
-  }
-
-  /**
-   * T13 (beta.5 §4.4.3a-d): the vetted-ingest branch, refusal order EXACT —
-   * (a) unpublished pin → refuse; (b) non-loopback endpoint → refuse (the
-   * ingest engine downloads on THIS machine and uploads to the daemon; a
-   * remote daemon gets the guided/manual path); (c) HF-tree digest
-   * pre-flight → ANY failure refuses; (d) ONLY THEN the Tier-1 modal (§6
-   * verbatim) and, on confirm, the T14 engine. Every refusal lands BEFORE
-   * the modal — the user is never asked to approve something already known
-   * to be unavailable, remote, or unverified.
-   */
-  /**
-   * AU-30 (TC-7) + follow-up: the created-name → catalog-id resolution the
-   * `pull:` latch is keyed by. `setup.provisionModel`'s route to the Sweep
-   * artifact (`handleProvisionModel` → `provisionOllama`, ~:1690) latches
-   * `pull:<catalog id>`; {@link handleVettedIngest} (the legacy `setup.
-   * pullModel` route to the SAME artifact) derives the identical id here so
-   * both RPCs join ONE latch instead of each winning its own and starting a
-   * duplicate multi-GB download. `handleCancel` resolves through this SAME
-   * method before its `inFlight.get` lookup — a second, divergent copy of
-   * this lookup there would just re-open the exact class of bug this
-   * closes (a cancel key that doesn't match what the latch is actually
-   * keyed under). Resolved from MODEL_CATALOG by created-name match rather
-   * than hardcoded a second time — `modelCatalog.test.ts` locks `sweep-
-   * next`'s `createdName` to `NEXT_DEDICATED_MODEL.ollamaCreatedName`, so
-   * the lookup always hits for the shipping row; the `?? created` fallback
-   * covers a fixture/test catalog that omits the row, AND any id that was
-   * never an hf-ingest created name to begin with (e.g. a plain library
-   * tag like `llama3:8b`) — those pass through unchanged, exactly what
-   * `handleCancel` needs for the non-canonical `pull:<tag>` latches
-   * {@link handlePullModel}'s library branch and {@link runLibraryPull}
-   * use.
-   */
-  private canonicalPullLatchId(created: string): string {
-    return (
-      MODEL_CATALOG.find((m) => m.ollama?.tier === 'hf-ingest' && m.ollama.createdName === created)?.id ?? created
-    );
-  }
-
-  private async handleVettedIngest(endpoint: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const created = NEXT_DEDICATED_MODEL.ollamaCreatedName;
-    // (a) fail-closed until the out-of-band publication fills the pin (§5.4).
-    if (NEXT_DEDICATED_MODEL.gguf.sha256 === '') {
-      return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
-    }
-    // (b) loopback only — checked on the ALREADY-validated URL.
-    if (!isLoopbackEndpoint(endpoint)) {
-      return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
-    }
-    // Single-flight latch keyed by the CATALOG id (AU-30 fix, {@link
-    // canonicalPullLatchId}) — see that method's doc for why. Progress/
-    // cancel stay keyed by `created` on the wire (unchanged, T13 `pullGate.
-    // test.ts` drift-lock); only the LATCH's internal key is canonical —
-    // `handleCancel` resolves the SAME canonical id before its lookup so a
-    // cancel dispatched with the wire-level `created` name still finds it.
-    // `finally` still releases under this SAME key on every exit path.
-    const canonicalId = this.canonicalPullLatchId(created);
-    const key = `pull:${canonicalId}`;
-    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
-    try {
-      // (c) integrity pre-flight — dep can also REJECT (a fetch binding
-      // throwing synchronously); that is the same refusal, never a crash.
-      let verdict: HfDigestVerdict;
-      try {
-        verdict = await this.deps.verifyHfDigest(NEXT_DEDICATED_MODEL.gguf);
-      } catch {
-        verdict = { ok: false, reason: 'verify seam rejected' };
-      }
-      if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-      // (d) Tier-1 modal (§6 verbatim) → the T14 ingest engine.
-      const confirmed = await this.host.showModal(NEXT_PULL_MODAL_COPY, 'Download');
-      if (!confirmed) return { ok: false, reason: 'declined' };
-      // §7.2.2: settled-flag straggler guard around ingestGguf's own await —
-      // same discipline as {@link runLibraryPull}; required regardless of
-      // the (verified-by-inspection) FROZEN dep's actual timing contract.
-      let settled = false;
-      try {
-        await this.deps.ingestGguf(
-          { gguf: NEXT_DEDICATED_MODEL.gguf, ollamaCreatedName: created },
-          endpoint,
-          (p) => {
-            if (settled) return;
-            this.pushProgress({
-              op: 'pull',
-              id: created,
-              phase: p.status,
-              ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
-              ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
-            });
-          },
-          abort.signal,
-        );
-      } finally {
-        settled = true;
-      }
-      return { ok: true };
-    } catch (err) {
-      if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
-      return { ok: false, reason: this.redact(errorMessage(err)) };
-    } finally {
-      this.inFlight.delete(key);
-      // §7.2.2: terminal marker on EVERY settle path — see handlePullModel's
-      // own finally for the full rationale; progress rides the `created`
-      // name here (T13 `pullGate.test.ts` drift-lock).
-      this.pushProgress({ op: 'pull', id: created, done: true });
-    }
-  }
-
-  // --- setup.provisionModel (beta.6 T7 — the §2.5 refusal-order engine) ---------
-
-  /**
-   * T7 (beta.6 §2.5): `setup.provisionModel {modelId, backend, endpoint?}` —
-   * the ONE place a catalog model gets pulled/downloaded/ingested. Refusal
-   * order is LOCKED by spy-ordering tests (an out-of-order check is a
-   * security hole):
-   *
-   *   0. trust gate (MUTATING_METHODS) — caller-enforced in {@link handle}.
-   *   1. params: `modelId` ∈ MODEL_CATALOG (strict); backend ∈
-   *      {'ollama','llamacpp'}; 'vllm' REFUSED with the §6 line, never
-   *      ignored.
-   *   2. {@link assertProvisionSources} (SC-1): charset assert on EVERY
-   *      string the branch will use + publisher ∈ allowlist + hfRepo-prefix
-   *      re-assert — BEFORE any latch/network/fs work (assert-before-resolve:
-   *      `resolveLfsOid` does not re-assert charset, so nothing may reach it
-   *      unasserted).
-   *   3. single-flight latch `pull:<modelId>` BEFORE the modal (rule 7);
-   *      `finally`-released on every exit path. `<modelId>` is the ONE
-   *      progress/cancel key on every branch (CC-1/CC-9).
-   *   4/5. the backend branches ({@link provisionOllama} /
-   *      {@link provisionLlamacpp}) — every remaining refusal lands BEFORE
-   *      the Tier-1 modal.
-   *
-   * The NEXT re-route rides this handler: `{modelId:'sweep-next',
-   * backend:'ollama'}` reaches the SAME vetted-ingest engine semantics as
-   * beta.5's {@link handleVettedIngest}, latched/keyed `pull:sweep-next`.
-   * The legacy `setup.pullModel` route stays byte-compatible (its own modal,
-   * its own tag-derived key) and refusal-equivalent.
-   */
-  private async handleProvisionModel(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
-    // (1) strict params — the webview only ever sends a catalog id back.
-    const modelId = str(params, 'modelId');
-    const entry = modelId === undefined ? undefined : MODEL_CATALOG.find((m) => m.id === modelId);
-    if (entry === undefined) return { ok: false, reason: PROVISION_UNKNOWN_ID_REFUSAL };
-    const backend = str(params, 'backend');
-    if (backend === 'vllm') return { ok: false, reason: PROVISION_VLLM_REFUSAL };
-    if (backend !== 'ollama' && backend !== 'llamacpp') return { ok: false, reason: PROVISION_BACKEND_REFUSAL };
-    // (2) SC-1 — refuse on ANY unasserted source string BEFORE any other work.
-    const sources = assertProvisionSources(entry, backend);
-    if (!sources.ok) return { ok: false, reason: sources.reason };
-    // (3) latch BEFORE the modal; finally-release on every exit path.
-    const key = `pull:${entry.id}`;
-    if (this.inFlight.has(key)) return { ok: false, reason: 'pull already running' };
-    const abort = new AbortController();
-    this.inFlight.set(key, abort);
-    try {
-      return backend === 'ollama'
-        ? await this.provisionOllama(entry, params, abort.signal)
-        : await this.provisionLlamacpp(entry, abort.signal);
-    } catch (err) {
-      if (isAbortError(err)) return { ok: false, reason: 'cancelled' };
-      return { ok: false, reason: this.redact(errorMessage(err)) };
-    } finally {
-      this.inFlight.delete(key);
-      // §7.2.2: terminal marker on EVERY settle path — `entry.id` is the
-      // ONE progress/cancel key on every branch (CC-1/CC-9), so this single
-      // finally covers both `provisionOllama` and `provisionLlamacpp`.
-      this.pushProgress({ op: 'pull', id: entry.id, done: true });
-    }
-  }
-
-  /** §2.5 step 4 — the ollama branch (library tier + both hf-ingest modes).
-   *  Runs INSIDE the `pull:<modelId>` latch; the caller owns catch/finally. */
-  private async provisionOllama(
-    entry: CatalogModel,
-    params: unknown,
-    signal: AbortSignal,
-  ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const cell = entry.ollama;
-    // (4a) honest absence — fixture/future rows only.
-    if (cell === undefined) return { ok: false, reason: PROVISION_OLLAMA_HONEST_ABSENCE };
-    const endpoint =
-      str(params, 'endpoint')?.trim() ||
-      this.deps.registry.getBackend('ollama')?.remote?.endpoint.defaultValue ||
-      DEFAULT_OLLAMA_ENDPOINT;
-    const validated = validateEndpointUrl(endpoint);
-    if (!validated.ok) return { ok: false, reason: validated.reason };
-
-    // (4b) library tier — ONE modal (§6 copy NAMES the endpoint, SC-A-7),
-    // then the EXTRACTED pull body under progress id = the catalog id.
-    if (cell.tier === 'library') {
-      const confirmed = await this.host.showModal(
-        `Pull model '${cell.tag}' from the Ollama registry onto '${validated.url}'?`,
-        'Pull',
-      );
-      if (!confirmed) return { ok: false, reason: 'declined' };
-      await this.runLibraryPull(cell.tag, validated.url, entry.id, signal);
-      return { ok: true };
-    }
-
-    // (4c) hf-ingest — exhaustive over VerifySpec, default-REFUSE (SC-A-9).
-    switch (cell.verify.mode) {
-      case 'pinned': {
-        // EXACT beta.5 vetted order: empty pin → loopback → exact-set verify
-        // → Tier-1 modal → ingest. Every refusal BEFORE the modal.
-        if (cell.verify.sha256 === '') return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
-        if (!isLoopbackEndpoint(validated.url)) return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
-        const pinnedSpec = pinnedVerifySpec(cell.gguf, cell.verify.sha256);
-        if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        let verdict: HfDigestVerdict;
-        try {
-          verdict = await this.deps.verifyHfDigest(pinnedSpec.spec);
-        } catch {
-          verdict = { ok: false, reason: 'verify seam rejected' };
-        }
-        if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        const confirmed = await this.host.showModal(
-          composePinnedOllamaModal(entry.displayName, cell.gguf, validated.url),
-          'Download',
-        );
-        if (!confirmed) return { ok: false, reason: 'declined' };
-        // §7.2.2: settled-flag straggler guard around ingestGguf's own
-        // await — same discipline as {@link runLibraryPull}; the shared
-        // `entry.id`-keyed terminal `done` push lives in the CALLER's
-        // (`handleProvisionModel`'s) finally, which runs strictly after
-        // this flag flips.
-        {
-          let settled = false;
-          try {
-            await this.deps.ingestGguf(
-              {
-                gguf: {
-                  hfRepo: cell.gguf.hfRepo,
-                  file: cell.gguf.file,
-                  quant: cell.gguf.quant,
-                  sha256: cell.verify.sha256,
-                  approxBytes: cell.gguf.approxBytes,
-                  allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles,
-                },
-                ollamaCreatedName: cell.createdName,
-              },
-              validated.url,
-              (p) => {
-                if (!settled) this.pushPullProgress(entry.id, p);
-              },
-              signal,
-            );
-          } finally {
-            settled = true;
-          }
-        }
-        return { ok: true };
-      }
-      case 'live-oid': {
-        // loopback → resolveLfsOid → refuse on ANY failure — all BEFORE the
-        // DISTINCT live-oid modal (A-2). The resolved oid IS the expected
-        // digest the ingest engine hashes the received bytes against, and
-        // Ollama re-verifies it server-side at blob ingest.
-        if (!isLoopbackEndpoint(validated.url)) return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
-        let oid: LfsOidVerdict;
-        try {
-          oid = await this.deps.resolveLfsOid(cell.gguf.hfRepo, cell.gguf.file);
-        } catch {
-          oid = { ok: false, reason: 'resolve seam rejected' };
-        }
-        if (!oid.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        const publisher = trustedPublisherFor(entry.publisher);
-        if (publisher === undefined) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        const confirmed = await this.host.showModal(
-          composeLiveOidOllamaModal(entry.displayName, cell.gguf, publisher, validated.url),
-          'Download',
-        );
-        if (!confirmed) return { ok: false, reason: 'declined' };
-        // §7.2.2: settled-flag straggler guard — same discipline as the
-        // 'pinned' branch above (this file's own doc for that branch has
-        // the full rationale). NOTE beyond the round's doc's literal 4-site
-        // list: this is the SAME `ingestGguf` dep, the SAME shared
-        // `entry.id`-keyed `done` push, and is a genuinely reachable
-        // path today (the `devstral-24b` catalog row hits this `live-oid`
-        // arm; the sibling `pinned` arm is currently dormant, sha256 `''`;
-        // the 11 `library`-tier rows route through the already-guarded
-        // `runLibraryPull` site, not here) — so it gets the identical
-        // guard for consistency and genuine safety, not just the
-        // dormant sibling.
-        {
-          let settled = false;
-          try {
-            await this.deps.ingestGguf(
-              {
-                gguf: {
-                  hfRepo: cell.gguf.hfRepo,
-                  file: cell.gguf.file,
-                  quant: cell.gguf.quant,
-                  sha256: oid.oid,
-                  approxBytes: cell.gguf.approxBytes,
-                },
-                ollamaCreatedName: cell.createdName,
-              },
-              validated.url,
-              (p) => {
-                if (!settled) this.pushPullProgress(entry.id, p);
-              },
-              signal,
-            );
-          } finally {
-            settled = true;
-          }
-        }
-        return { ok: true };
-      }
-      default:
-        return { ok: false, reason: PROVISION_UNKNOWN_VERIFY_REFUSAL };
-    }
-  }
-
-  /** §2.5 step 5 — the llamacpp branch: expected digest (mode-exhaustive,
-   *  default-REFUSE) → WRITE-gated dest (SC-A-3: {@link SetupControllerDeps.
-   *  checkedStoreDest}, NEVER the read-only `storeDest`) → mode-distinct
-   *  Tier-1 modal naming the ~-redacted dest → the T3 atomic file sink.
-   *  Runs INSIDE the `pull:<modelId>` latch; the caller owns catch/finally. */
-  private async provisionLlamacpp(
-    entry: CatalogModel,
-    signal: AbortSignal,
-  ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const cell = entry.llamacpp;
-    // (5a) honest absence — the §6 unavailableReason copy.
-    if (cell === undefined) return { ok: false, reason: LLAMACPP_HONEST_ABSENCE };
-    // (5b) the expected digest, per verify mode — every failure refuses here,
-    // BEFORE dest resolution and BEFORE the modal.
-    let expected: string;
-    switch (cell.verify.mode) {
-      case 'pinned': {
-        if (cell.verify.sha256 === '') return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
-        const pinnedSpec = pinnedVerifySpec(cell.gguf, cell.verify.sha256);
-        if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        // SC-5: the FULL beta.5 chain on EVERY backend — the exact-file-set
-        // pre-flight runs on the file path too, not just the Ollama ingest.
-        let verdict: HfDigestVerdict;
-        try {
-          verdict = await this.deps.verifyHfDigest(pinnedSpec.spec);
-        } catch {
-          verdict = { ok: false, reason: 'verify seam rejected' };
-        }
-        if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        expected = cell.verify.sha256;
-        break;
-      }
-      case 'live-oid': {
-        let oid: LfsOidVerdict;
-        try {
-          oid = await this.deps.resolveLfsOid(cell.gguf.hfRepo, cell.gguf.file);
-        } catch {
-          oid = { ok: false, reason: 'resolve seam rejected' };
-        }
-        if (!oid.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-        expected = oid.oid;
-        break;
-      }
-      default:
-        return { ok: false, reason: PROVISION_UNKNOWN_VERIFY_REFUSAL };
-    }
-    // (5c) the WRITE gate (T6 SC-A-3): lstat-checked, symlink-refusing dest —
-    // a refusal here lands BEFORE the modal, and the modal below names the
-    // ~-redacted destination this exact result resolved.
-    const dest = await this.deps.checkedStoreDest(cell.gguf.hfRepo, cell.gguf.file);
-    if (!dest.ok) return { ok: false, reason: this.redact(dest.reason) };
-    const publisher = trustedPublisherFor(entry.publisher);
-    if (publisher === undefined) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-    const confirmed = await this.host.showModal(
-      composeLlamacppDownloadModal(cell.verify.mode, entry.displayName, cell.gguf, publisher, this.redact(dest.destPath)),
-      'Download',
-    );
-    if (!confirmed) return { ok: false, reason: 'declined' };
-    // AU-13/TD-2 (INV-7/ADR-7 — check-to-write re-assertion): `showModal`
-    // above is an UNBOUNDED, human-speed await — a local attacker has that
-    // whole window to swap `<owner>`/`<repo>` for a symlink after the FIRST
-    // `checkedStoreDest` call (5c) but before the write. Re-run the SAME
-    // write gate now, immediately before `downloadGgufToStore`, and refuse on
-    // any change (the lstat re-check now fails) rather than let `ensureDir`
-    // (which follows symlinks) + the write proceed through a raced-in link.
-    const reassert = await this.deps.checkedStoreDest(cell.gguf.hfRepo, cell.gguf.file);
-    if (!reassert.ok) return { ok: false, reason: this.redact(reassert.reason) };
-    // (5d) the T3 atomic sink: same-dir `.part` → digest equality → rename →
-    // sidecar. Progress rides the ONE `pull:<modelId>` key. Writes through
-    // the FRESHLY re-asserted destination (`reassert`), not the stale
-    // pre-modal one — the same "read exactly the path that was validated"
-    // discipline `pathConfine.ts`'s own doc establishes for reads.
-    // §7.2.2: settled-flag straggler guard around downloadGgufToStore's own
-    // await — same discipline as {@link runLibraryPull}; the shared
-    // `entry.id`-keyed terminal `done` push lives in the CALLER's
-    // (`handleProvisionModel`'s) finally, which runs strictly after this
-    // flag flips.
-    let settled = false;
-    try {
-      await this.deps.downloadGgufToStore(
-        {
-          catalogId: entry.id,
-          gguf: {
-            hfRepo: cell.gguf.hfRepo,
-            file: cell.gguf.file,
-            quant: cell.gguf.quant,
-            sha256: expected,
-            approxBytes: cell.gguf.approxBytes,
-          },
-        },
-        reassert.destDir,
-        reassert.destFile,
-        (p) => {
-          if (!settled) this.pushPullProgress(entry.id, p);
-        },
-        signal,
-      );
-    } finally {
-      settled = true;
-    }
-    // Presence flips: the sidecar now exists, so the next status() scan reads
-    // present — fire so the panel re-fetches without waiting for a user poke.
-    this.statusChangedEmitter.fire();
-    return { ok: true };
-  }
-
-  /**
-   * T7 (§2.5 4b): the EXTRACTED library-pull body — ONE implementation shared
-   * by the legacy free-text tier ({@link handlePullModel}, tag-keyed progress)
-   * and the catalog tier ({@link provisionOllama}, catalog-id-keyed progress).
-   * Modal and latch stay with each CALLER (one modal total per route).
-   *
-   * T1-M1 (carried obligation): an option-shaped tag (leading '-') is refused
-   * before the pull dep is invoked. Defense-in-depth — the pull itself is an
-   * HTTP `POST /api/pull` with a JSON body ({@link SetupControllerDeps.
-   * pullModel} → `ollamaClient.pullModel`), never a composed shell string,
-   * and no catalog tag can carry a leading '-' past T1's drift-lock — but a
-   * tag that LOOKS like a CLI flag must never reach any pull surface.
-   */
-  private async runLibraryPull(tag: string, endpoint: string, progressId: string, signal: AbortSignal): Promise<void> {
-    if (tag.startsWith('-')) {
-      throw new Error(LIBRARY_TAG_DASH_REFUSAL);
-    }
-    // §7.2.2: silence a straggler progress tick that fires AFTER
-    // `deps.pullModel`'s own promise has settled — it must never race the
-    // terminal `done` push the caller's `finally` emits right after this
-    // returns (throttle single-pending-slot hazard, SetupController.ts's
-    // `pushProgress`). Verified by inspection: the real `pullModel`
-    // (`ollamaClient.ts`) streams every `onProgress` call from a fully
-    // awaited read loop, strictly before its own promise settles — this
-    // guard is required regardless, since a FROZEN dep is not a contract.
-    let settled = false;
-    try {
-      await this.deps.pullModel(endpoint, tag, (p) => { if (!settled) this.pushPullProgress(progressId, p); }, signal);
-    } finally {
-      settled = true;
-    }
-  }
-
-  /** One `{op:'pull'}` progress push under the given key — the shared
-   *  projection every pull/ingest/download branch rides (rule 7). */
-  private pushPullProgress(id: string, p: PullProgress): void {
-    this.pushProgress({
-      op: 'pull',
-      id,
-      phase: p.status,
-      ...(p.totalBytes !== undefined ? { totalBytes: p.totalBytes } : {}),
-      ...(p.completedBytes !== undefined ? { completedBytes: p.completedBytes } : {}),
-    });
-  }
-
   // --- setup.saveAgentModel (beta.6 T8 — §2.5/§6) ---------------------------
 
   /**
@@ -2102,10 +1394,12 @@ export class SetupController {
     if (bool(params, 'clear') === true) {
       const confirmed = await this.host.showModal(CLEAR_AGENT_MODEL_MODAL, 'Clear');
       if (!confirmed) return { ok: false, reason: 'declined' };
-      await this.host.updateSettingGlobal('talaria.agent.localModel.modelId', undefined);
-      await this.host.updateSettingGlobal('talaria.agent.localModel.backend', undefined);
-      await this.host.updateSettingGlobal('talaria.agent.localModel.endpoint', undefined);
-      return { ok: true };
+      const wrote = await this.writeSettingsBatch([
+        ['talaria.agent.localModel.modelId', undefined],
+        ['talaria.agent.localModel.backend', undefined],
+        ['talaria.agent.localModel.endpoint', undefined],
+      ]);
+      return wrote.ok ? { ok: true } : wrote;
     }
 
     const modelId = str(params, 'modelId');
@@ -2129,10 +1423,12 @@ export class SetupController {
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
 
-    await this.host.updateSettingGlobal('talaria.agent.localModel.modelId', entry.id);
-    await this.host.updateSettingGlobal('talaria.agent.localModel.backend', backend);
-    await this.host.updateSettingGlobal('talaria.agent.localModel.endpoint', validated.url);
-    return { ok: true };
+    const wrote = await this.writeSettingsBatch([
+      ['talaria.agent.localModel.modelId', entry.id],
+      ['talaria.agent.localModel.backend', backend],
+      ['talaria.agent.localModel.endpoint', validated.url],
+    ]);
+    return wrote.ok ? { ok: true } : wrote;
   }
 
   /**
@@ -2219,7 +1515,7 @@ export class SetupController {
 
   // --- setup.cancel (read-only / best-effort) -----------------------------------
 
-  private handleCancel(params: unknown): { ok: true } {
+  private handleCancel(params: unknown): SetupCancelResult {
     const op = str(params, 'op');
     const id = str(params, 'id');
     if (op && id) {
@@ -2231,10 +1527,15 @@ export class SetupController {
       // `handleVettedIngest` uses before looking the latch up, or a cancel
       // for that row silently no-ops (dedup itself still holds; only
       // Cancel was missing it). Every other `op` (`install`) is unaffected.
-      const latchId = op === 'pull' ? this.canonicalPullLatchId(id) : id;
-      this.inFlight.get(`${op}:${latchId}`)?.abort();
+      const latchId = op === 'pull' ? canonicalPullLatchId(id) : id;
+      // F2-20: report what actually happened — an abort was DELIVERED to a
+      // live latch. `{cancelled:false}` below is the honest "nothing to
+      // cancel" outcome the webview's T31 face renders.
+      if (this.latches.abort(`${op}:${latchId}`)) {
+        return { ok: true, cancelled: true, matched: latchId };
+      }
     }
-    return { ok: true };
+    return { ok: true, cancelled: false };
   }
 
   // --- setup.recheck (read-only, re-probes pipx) --------------------------------
@@ -2274,6 +1575,10 @@ export class SetupController {
    * (rev-2 critic fold).
    */
   private async handleRecheck(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
+    // CA-M18: an explicit user re-probe always drops the memo, regardless of
+    // scope — the completion fire below must reflect a FRESH Ollama probe,
+    // not a stale in-window one.
+    this.ollamaProbeMemo = undefined;
     const scope = validateRecheckScope(params);
     if (scope === undefined) {
       return { ok: false, reason: "scope must be one of 'all', 'agent', 'os', 'ollama', 'llamacpp'." };
@@ -2296,14 +1601,12 @@ export class SetupController {
       // — mirrors osResolution's clear-only posture above (not
       // rekickLlamaCppProbe's immediate re-kick): the next status() call
       // re-probes lazily through kickHermesDiscovery, picking up e.g. a
-      // hermes the user just pipx-installed in a terminal. Reset the
-      // in-flight flag too (not just bump the epoch) — a superseded probe's
-      // late settle is dropped by the epoch check BEFORE it would ever clear
-      // the flag itself, so leaving it `true` here would wedge every future
-      // kick into a permanent no-op.
-      this.hermesDiscoveryEpoch += 1;
-      this.hermesPathDiscovery = undefined;
-      this.hermesDiscoveryProbeInFlight = false;
+      // hermes the user just pipx-installed in a terminal. invalidate()
+      // resets the in-flight flag too (not just the epoch) — a superseded
+      // probe's late settle is dropped by the epoch check BEFORE it would
+      // ever clear the flag itself, so leaving it `true` here would wedge
+      // every future kick into a permanent no-op.
+      this.hermesDiscoveryMemo.invalidate();
       try {
         const located = await this.deps.locatePipx();
         if (located.ok) {
@@ -2322,7 +1625,7 @@ export class SetupController {
     // write above) — recheck is read-only/no-modal, so "the recheck
     // completed" is itself the single meaningful state-change signal,
     // whether it cleared the sticky issue or refreshed it.
-    this.statusChangedEmitter.fire();
+    this.bumpStatus();
     return { ok: true };
   }
 
@@ -2473,17 +1776,21 @@ export class SetupController {
 
   // --- setup.reconnectAgent (beta.7 B3) --------------------------------------
 
-  private async handleReconnectAgent(): Promise<{ ok: true } | { ok: false; reason: string }> {
+  private async handleReconnectAgent(params: unknown): Promise<{ ok: true } | { ok: false; reason: string }> {
     const reconnect = this.deps.reconnectAgent;
     if (!reconnect) {
       return { ok: false, reason: 'The agent connection is not running yet.' };
     }
+    // T16/UX-04: force = the banner's wedge-break — bypasses the live-turn
+    // refusal host-side and ends the turn as user intent (turn.end{cancelled},
+    // ADR-T16). Absent or non-boolean input fails closed to non-force.
+    const force = bool(params, 'force');
     try {
-      const result = await reconnect();
-      this.statusChangedEmitter.fire(); // handleRecheck's single completion-fire posture (:2069-2073)
+      const result = await reconnect(force === true ? { force: true } : undefined);
+      this.bumpStatus(); // handleRecheck's single completion-fire posture (:2069-2073)
       return result;
     } catch (err) {
-      this.statusChangedEmitter.fire();
+      this.bumpStatus();
       return { ok: false, reason: this.redact(errorMessage(err)) };
     }
   }
@@ -2525,13 +1832,13 @@ export class SetupController {
     );
     if (!confirmed) return { ok: false, reason: 'declined' };
 
-    await this.host.updateSettingGlobal('talaria.nextEdit.backend', backend);
-    await this.host.updateSettingGlobal('talaria.nextEdit.endpoint', validated.url);
-    await this.host.updateSettingGlobal('talaria.nextEdit.model', model);
-    if (dedicatedBackendIdRaw !== undefined) {
-      await this.host.updateSettingGlobal('talaria.nextEdit.dedicatedBackendId', dedicatedBackendIdRaw);
-    }
-    return { ok: true };
+    const writes: Array<readonly [string, unknown]> = [
+      ['talaria.nextEdit.backend', backend],
+      ['talaria.nextEdit.endpoint', validated.url],
+      ['talaria.nextEdit.model', model],
+    ];
+    if (dedicatedBackendIdRaw !== undefined) writes.push(['talaria.nextEdit.dedicatedBackendId', dedicatedBackendIdRaw]);
+    return this.writeSettingsBatch(writes);
   }
 
   // --- setup.setRag -----------------------------------------------------------
@@ -2579,10 +1886,7 @@ export class SetupController {
     const confirmed = await this.host.showModal(`Update codebase-index settings: ${summary}?`, 'Apply');
     if (!confirmed) return { ok: false, reason: 'declined' };
 
-    for (const [settingKey, value] of Object.entries(patch)) {
-      await this.host.updateSettingGlobal(settingKey, value);
-    }
-    return { ok: true };
+    return this.writeSettingsBatch(Object.entries(patch));
   }
 
   // --- setup.setTunable (Tier-2, no modal) -----------------------------------------
@@ -2615,30 +1919,13 @@ export class SetupController {
    * (`setup.recheck {scope:'agent'}`), without a window reload.
    * `discoverHermes` offers no cancellation seam (unlike {@link
    * SetupControllerDeps.locateLlamaServer}'s `signal`), so a superseded
-   * attempt keeps running in the background — {@link hermesDiscoveryEpoch}
-   * just makes ITS eventual settle inert, mirroring {@link
-   * llamaCppProbeEpoch}'s supersession guard.
+   * attempt keeps running in the background — the memo's epoch just makes
+   * ITS eventual settle inert, mirroring {@link llamaCppMemo}'s supersession
+   * guard.
    */
   private kickHermesDiscovery(): void {
-    const discover = this.deps.discoverHermes;
-    if (!discover) return;
-    if (this.hermesPathDiscovery !== undefined || this.hermesDiscoveryProbeInFlight) return;
-    this.hermesDiscoveryProbeInFlight = true;
-    const epoch = this.hermesDiscoveryEpoch;
-    void (async () => {
-      let settled: NonNullable<SetupController['hermesPathDiscovery']>;
-      try {
-        settled = { found: await discover() };
-      } catch {
-        // Rejection (login-shell lookup failed) ⇒ honest "not found"; a
-        // superseded epoch is dropped below either way.
-        settled = { found: null };
-      }
-      if (epoch !== this.hermesDiscoveryEpoch) return; // superseded — the fresh probe (or a recheck clear) owns the state
-      this.hermesPathDiscovery = settled;
-      this.hermesDiscoveryProbeInFlight = false;
-      this.statusChangedEmitter.fire();
-    })();
+    if (!this.deps.discoverHermes) return;
+    this.hermesDiscoveryMemo.kick();
   }
 
   // --- helpers --------------------------------------------------------------
@@ -2648,7 +1935,7 @@ export class SetupController {
     configuredBackend: string,
     discoveredHermesPath?: string | null,
   ): AgentSetupPhase {
-    if (this.inFlight.has(`install:hermes`)) return 'installing';
+    if (this.latches.has(`install:hermes`)) return 'installing';
     if (this.awaitingReload) return 'awaiting-reload';
     // TC-3 (AU-8/INV-11): a configured setting is authoritative; PATH
     // discovery is only ever a FALLBACK when it's empty — mirrors the
@@ -2698,12 +1985,29 @@ export class SetupController {
     return option;
   }
 
-  private async safeProbeOllama(endpoint: string): Promise<OllamaStatus> {
-    try {
-      return await this.deps.probeOllama(endpoint);
-    } catch (err) {
-      return { running: false, detail: this.redact(errorMessage(err)) };
+  /** CA-M18: single-flight, short-TTL memo over the network Ollama probe —
+   *  the two back-to-back SetupData pushes ONE mutation triggers (provider
+   *  post-handle + onStatusChanged) share one probe instead of two. The
+   *  PROMISE is stored at issue time, so concurrent status() calls join the
+   *  in-flight probe. Invalidated by {@link bumpStatus}, `setup.recheck`,
+   *  and {@link dispose}. */
+  private ollamaProbeMemo: { endpoint: string; startedAt: number; result: Promise<OllamaStatus> } | undefined;
+
+  private safeProbeOllama(endpoint: string): Promise<OllamaStatus> {
+    const now = Date.now();
+    const memo = this.ollamaProbeMemo;
+    if (memo !== undefined && memo.endpoint === endpoint && now - memo.startedAt < OLLAMA_PROBE_MEMO_TTL_MS) {
+      return memo.result;
     }
+    const result = (async (): Promise<OllamaStatus> => {
+      try {
+        return await this.deps.probeOllama(endpoint);
+      } catch (err) {
+        return { running: false, detail: this.redact(errorMessage(err)) };
+      }
+    })();
+    this.ollamaProbeMemo = { endpoint, startedAt: now, result };
+    return result;
   }
 
   /** T6 M-3 carry-forward: replace the real home directory with `~` in any
@@ -2715,11 +2019,15 @@ export class SetupController {
   }
 
   private pushProgress(progress: SetupProgress): void {
+    // F2-16: a straggler progress tick after dispose must not re-create
+    // throttle entries or arm timers against a disposed emitter.
+    if (this.lifecycle.closed) return;
     const key = `${progress.op}:${progress.id}`;
     const now = Date.now();
+    pruneExpiredThrottleEntries(this.throttle, now, PROGRESS_THROTTLE_MS);
     let state = this.throttle.get(key);
     if (!state) {
-      state = { lastEmit: -Infinity };
+      state = { lastEmit: -Infinity, timer: undefined, pending: undefined };
       this.throttle.set(key, state);
     }
     const elapsed = now - state.lastEmit;
@@ -2812,33 +2120,11 @@ function computeReady(
   return agentPhase === 'ready' && providerPhase === 'configured' && fimGreen;
 }
 
-function coerceNextEditTransport(raw: string | undefined): 'ollama' | 'openai-compat' {
-  return raw === 'openai-compat' ? 'openai-compat' : 'ollama';
-}
-
-/**
- * T5 §1.2: the `pipx-missing` card's engine-composed bootstrap. A known
- * family carries the exact pre-typed line + the §6 known-distro copy; an
- * unknown family (incl. the container degrade) carries ONLY the §6
- * unknown-distro copy — no command is ever guessed (Global Constraint 1).
- */
-function composeBootstrap(osInfo: OsResolution): { command?: string; guidance: string } {
-  const spec = installCommand(osInfo.family, 'pipx');
-  return spec !== undefined
-    ? { command: spec.command, guidance: PIPX_MISSING_KNOWN_DISTRO_GUIDANCE }
-    : { guidance: PIPX_MISSING_UNKNOWN_DISTRO_GUIDANCE };
-}
-
 // --- T6 (beta.6): llama.cpp install projection + catalog cell gates ----------
 
 /** beta.6 §6 copy, verbatim: the "llama.cpp missing" line (single-sourced —
  *  the webview renders this string, never restates it). */
 const LLAMACPP_MISSING_GUIDANCE = 'llama-server was not found on your PATH. Install llama.cpp, then re-check.';
-/** beta.6 §6 copy, verbatim: the llamacpp honest-absence line — rev 3:
- *  fixture/future-rows only, NO shipping row renders it (every shipping
- *  row's gguf source passes the compose-time gate below). */
-const LLAMACPP_HONEST_ABSENCE =
-  'No build of this model from a verified publisher exists for llama.cpp — use it via Ollama instead.';
 /** Docs link for the guidance-only install cells (debian/unknown/container)
  *  — the same llama-server docs URL the registry's guided-terminal recipe
  *  pins (`registry.ts`, llamacpp `localInstall.recipe.docsUrl`). */
@@ -2871,10 +2157,6 @@ const LLAMACPP_RUN_FLAGS: Readonly<Record<CatalogRole, string>> = {
   agent: '--jinja --port 8013',
   next: '--port 8012',
 };
-
-function isAllowlistedHfOwner(owner: string): boolean {
-  return TRUSTED_HF_PUBLISHERS.some((p) => p.hfOwner === owner);
-}
 
 /**
  * T6 (SC-2, §2.2.6): the vLLM `serveRepo` COMPOSE-TIME gate. Order is
@@ -2946,136 +2228,6 @@ export function composeLlamacppCell(
       ? { runCommand: `llama-server -m ${redactedDestPath} ${LLAMACPP_RUN_FLAGS[model.role]}` }
       : {}),
   };
-}
-
-// --- T7 (beta.6 §2.5): provisionModel pure helpers ---------------------------
-
-/**
- * T7 (§2.5 step 2, SC-1): the runtime source assert for ONE `(row, backend)`
- * provisioning branch — charset assert on EVERY string the branch will use +
- * publisher ∈ {@link TRUSTED_HF_PUBLISHERS} + hfRepo-prefix re-assert
- * (`owner/… === publisher/…`). Unreachable for shipping data (T1's
- * drift-locks close it at build time) but REQUIRED at runtime: a poisoned
- * catalog edit has to defeat a reviewed data diff AND this independent
- * check, and `resolveLfsOid`/`verifyHfDigest` never see an unasserted
- * string (assert-before-resolve). An absent backend cell asserts vacuously —
- * its branch refuses with the honest-absence copy instead (steps 4a/5a).
- * Exported PURE so the closure test can drive every catalog row directly.
- */
-export function assertProvisionSources(
-  model: CatalogModel,
-  backend: 'ollama' | 'llamacpp',
-): { ok: true } | { ok: false; reason: string } {
-  if (!isAllowlistedHfOwner(model.publisher)) {
-    return { ok: false, reason: `publisher '${model.publisher}' is not on the trusted-publisher allowlist` };
-  }
-  if (backend === 'ollama') {
-    const cell = model.ollama;
-    if (cell === undefined) return { ok: true };
-    if (cell.tier === 'library') {
-      return assertCatalogSource({ tag: cell.tag });
-    }
-    // hf-ingest cells also hand the created name to the daemon (`/api/create`)
-    // — asserted under the tag charset (no '/', no '.'/'..').
-    const charset = assertCatalogSource({ hfRepo: cell.gguf.hfRepo, file: cell.gguf.file, tag: cell.createdName });
-    if (!charset.ok) return charset;
-    if (!cell.gguf.hfRepo.startsWith(`${model.publisher}/`)) {
-      return { ok: false, reason: "hfRepo owner does not match the row's publisher" };
-    }
-    return { ok: true };
-  }
-  const cell = model.llamacpp;
-  if (cell === undefined) return { ok: true };
-  const charset = assertCatalogSource({ hfRepo: cell.gguf.hfRepo, file: cell.gguf.file });
-  if (!charset.ok) return charset;
-  if (!cell.gguf.hfRepo.startsWith(`${model.publisher}/`)) {
-    return { ok: false, reason: "hfRepo owner does not match the row's publisher" };
-  }
-  return { ok: true };
-}
-
-/** The allowlist row for a catalog publisher — modal copy (name + trustBasis)
- *  comes from HERE, never from the webview. */
-function trustedPublisherFor(owner: string): TrustedPublisher | undefined {
-  return TRUSTED_HF_PUBLISHERS.find((p) => p.hfOwner === owner);
-}
-
-/**
- * T7 (§2.5 4c/5b, SC-5): the pinned-mode verify input. The FULL beta.5 chain
- * needs `allowedRepoFiles` (exact-file-set equality, both directions), which
- * catalog rows don't carry — it comes from the registry's own Sweep pin,
- * drift-locked equal to the catalog's pinned row (T1: sweep≡registry,
- * pinned⇔SyntinalCo). A pinned row naming any OTHER artifact cannot be
- * exact-set-verified and refuses outright — fail-closed, unreachable for
- * shipping data, fixture-tested.
- */
-function pinnedVerifySpec(gguf: CatalogGguf, sha256: string): { ok: true; spec: HfGgufSpec } | { ok: false } {
-  if (gguf.hfRepo !== NEXT_DEDICATED_MODEL.gguf.hfRepo || gguf.file !== NEXT_DEDICATED_MODEL.gguf.file) {
-    return { ok: false };
-  }
-  return {
-    ok: true,
-    spec: {
-      hfRepo: gguf.hfRepo,
-      file: gguf.file,
-      sha256,
-      allowedRepoFiles: NEXT_DEDICATED_MODEL.gguf.allowedRepoFiles,
-    },
-  };
-}
-
-/** Modal size rendering: decimal GB to one decimal from the EXACT catalog
- *  bytes (beta.5 precedent — 4 680 000 000 renders `4.7 GB`). */
-function formatApproxGb(bytes: number): string {
-  return `${(bytes / 1e9).toFixed(1)} GB`;
-}
-
-/** §6 "Provision modal — pinned", ollama-ingest arm: the beta.5 strong-claim
- *  wording UNCHANGED + the endpoint clause (SC-A-7 — the modal names the
- *  daemon it installs onto). DISTINCT from the live-oid copy (A-2): "against
- *  its pinned value" is the strong claim only this mode may make. */
-function composePinnedOllamaModal(displayName: string, gguf: CatalogGguf, endpoint: string): string {
-  return (
-    `Download '${displayName}' (~${formatApproxGb(gguf.approxBytes)}) and install it into your local Ollama? ` +
-    `Source: huggingface.co/${gguf.hfRepo} — Syntinal's build converted from Sweep's official release. ` +
-    "Talaria verifies the file's checksum against its pinned value after downloading, " +
-    `and Ollama verifies it again during install at ${endpoint}.`
-  );
-}
-
-/** §6 "Provision modal — live-oid", ollama-ingest arm (verbatim template):
- *  names the artifact, the publisher + trustBasis, the honest (weaker)
- *  verification basis, and the ingest endpoint. */
-function composeLiveOidOllamaModal(
-  displayName: string,
-  gguf: CatalogGguf,
-  publisher: TrustedPublisher,
-  endpoint: string,
-): string {
-  return (
-    `Download '${displayName}' (${gguf.quant}, ~${formatApproxGb(gguf.approxBytes)}) from huggingface.co/${gguf.hfRepo}? ` +
-    `Publisher: ${publisher.name} — ${publisher.trustBasis} ` +
-    "Talaria verifies the file's checksum against the publisher's manifest after downloading, " +
-    `and Ollama verifies it again during install at ${endpoint}.`
-  );
-}
-
-/** §2.5 5c: the llamacpp download modal — mode-distinct copy (A-2) naming
- *  publisher + trustBasis + repo + size + the ~-redacted destination. */
-function composeLlamacppDownloadModal(
-  mode: 'pinned' | 'live-oid',
-  displayName: string,
-  gguf: CatalogGguf,
-  publisher: TrustedPublisher,
-  redactedDest: string,
-): string {
-  const basis = mode === 'pinned' ? 'against its pinned value' : "against the publisher's manifest";
-  return (
-    `Download '${displayName}' (${gguf.quant}, ~${formatApproxGb(gguf.approxBytes)}) from huggingface.co/${gguf.hfRepo}? ` +
-    `Publisher: ${publisher.name} — ${publisher.trustBasis} ` +
-    `Talaria verifies the file's checksum ${basis} after downloading, ` +
-    `then places it in ${redactedDest}.`
-  );
 }
 
 // --- T8 (beta.6 §2.5/§6): setup.saveAgentModel pure helpers -------------------
@@ -3228,10 +2380,6 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function isAbortError(err: unknown): boolean {
-  return err instanceof Error && err.name === 'AbortError';
-}
-
 function isNonNegativeNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
@@ -3243,6 +2391,10 @@ function isPositiveInteger(value: unknown): value is number {
 function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
+
+/** CA-M11: generous ceilings — real ignore lists are dozens of entries. */
+export const EXCLUDE_GLOBS_MAX_ENTRIES = 128;
+export const EXCLUDE_GLOB_MAX_LENGTH = 256;
 
 function validateTunableValue(
   key: string,
@@ -3268,9 +2420,14 @@ function validateTunableValue(
         ? { ok: true, value }
         : { ok: false, reason: `${key} must be a non-negative integer.` };
     case 'talaria.rag.excludeGlobs':
-      return Array.isArray(value) && value.every((v) => typeof v === 'string')
+      return Array.isArray(value) &&
+        value.length <= EXCLUDE_GLOBS_MAX_ENTRIES &&
+        value.every((v) => typeof v === 'string' && v.length <= EXCLUDE_GLOB_MAX_LENGTH)
         ? { ok: true, value }
-        : { ok: false, reason: `${key} must be an array of strings.` };
+        : {
+            ok: false,
+            reason: `${key} must be an array of at most ${EXCLUDE_GLOBS_MAX_ENTRIES} strings, each at most ${EXCLUDE_GLOB_MAX_LENGTH} characters.`,
+          };
     case 'talaria.autocomplete.crossFile.enabled':
     case 'talaria.autocomplete.crossFile.prefixInjection':
     case 'talaria.autocomplete.crossFile.warmUp':

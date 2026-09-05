@@ -35,6 +35,20 @@ import { success, type RemoteData } from './remoteData';
 import { handleSessionChange, sessionToTab } from './tabs';
 
 /**
+ * CA-M15: hard cap on transcript items per tab. The reducer keeps the last
+ * MAX_TRANSCRIPT_ITEMS and records the running drop count in `TabState.
+ * hiddenCount`. The active turn's items are always at the tail, so trimming
+ * the oldest settled items never orphans an in-flight streaming fold.
+ */
+export const MAX_TRANSCRIPT_ITEMS = 500;
+
+function capTranscript(tab: TabState): TabState {
+  const over = tab.transcript.length - MAX_TRANSCRIPT_ITEMS;
+  if (over <= 0) return tab;
+  return { ...tab, transcript: tab.transcript.slice(over), hiddenCount: (tab.hiddenCount ?? 0) + over };
+}
+
+/**
  * Deterministic id for a new message block, derived from the turn and how many
  * message blocks already exist for it. Pure — safe under React StrictMode's
  * double-invocation of reducers (no module-level mutable counter).
@@ -152,8 +166,13 @@ type TranscriptFoldMessage = Extract<
  */
 function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
   switch (msg.type) {
-    case 'clear':
-      return { ...tab, transcript: [], plan: [], turnActive: false, error: undefined };
+    case 'clear': {
+      // exactOptional prep (arm 1): clear `error` by OMITTING the key
+      // (absent ≡ initial), never by writing an explicit `undefined` —
+      // TabState.error stays `?: {...}`, no `| undefined` widening.
+      const { error: _clearedError, ...rest } = tab;
+      return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false, hiddenCount: 0 };
+    }
 
     case 'turn.end': {
       if (msg.status === 'complete') {
@@ -163,7 +182,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
         // papered over client-side. `closeOpenMessages` still runs its own
         // narrower MID-TURN role here (settling only a still-streaming
         // `message` block) — unchanged, pre-dates this fork.
-        return { ...tab, turnActive: false, transcript: closeOpenMessages(tab.transcript) };
+        return { ...tab, turnActive: false, stopPending: false, transcript: closeOpenMessages(tab.transcript) };
       }
       // V-5/V-4 + CF-06/R2: the webview mirror of the host's
       // `markSubagentsInterrupted` — a turn ending anything other than
@@ -172,7 +191,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       // item — message, reasoning, tool, approval alike — must stop lying
       // about being live. Derived in one place (settleOpenItems) instead of
       // enumerated per-kind here.
-      return { ...tab, turnActive: false, transcript: settleOpenItems(tab.transcript), plan: settlePlanSteps(tab.plan) };
+      return { ...tab, turnActive: false, stopPending: false, transcript: settleOpenItems(tab.transcript), plan: settlePlanSteps(tab.plan) };
     }
 
     case 'user': {
@@ -222,14 +241,27 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       };
 
     case 'message.delta': {
-      const open = [...tab.transcript]
-        .reverse()
-        .find((i) => i.kind === 'message' && i.streaming && i.turnId === msg.turnId);
+      // CA-09: the open streaming message is provably the LAST element in the
+      // normal flow (any interleaving item runs closeOpenMessages, settling
+      // prior streaming messages, so a new delta opens a fresh one at the tail).
+      // Check the tail first (O(1)); keep the reverse-scan as the rare fallback
+      // (an open message that is not last) so the result is provably identical.
+      const lastIndex = tab.transcript.length - 1;
+      const last = tab.transcript[lastIndex];
+      const openIsLast =
+        last !== undefined && last.kind === 'message' && last.streaming && last.turnId === msg.turnId;
+      const open = openIsLast
+        ? last
+        : [...tab.transcript].reverse().find((i) => i.kind === 'message' && i.streaming && i.turnId === msg.turnId);
       if (open && open.kind === 'message') {
-        return {
-          ...tab,
-          transcript: tab.transcript.map((i) => (i === open ? { ...i, text: i.text + msg.text } : i)),
-        };
+        // Targeted splice: copy the array once, replace only the matched index —
+        // no per-element .map callback, no reverse-copy on the fast path. Unchanged
+        // items keep their references (slice copies references), exactly like the
+        // old .map(i => i === open ? {...} : i).
+        const idx = openIsLast ? lastIndex : tab.transcript.indexOf(open);
+        const nextTranscript = tab.transcript.slice();
+        nextTranscript[idx] = { ...open, text: open.text + msg.text };
+        return { ...tab, transcript: nextTranscript };
       }
       return {
         ...tab,
@@ -287,7 +319,10 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
             toolKind: msg.kind,
             title: msg.title,
             status: msg.status,
-            rawInput: msg.rawInput,
+            // exactOptional prep (arm 1): omit `rawInput` when the wire
+            // didn't carry one, instead of writing an explicit `undefined`
+            // into ToolItem's `rawInput?: string`.
+            ...(msg.rawInput !== undefined ? { rawInput: msg.rawInput } : {}),
           },
         ],
       };
@@ -300,7 +335,11 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
             ? {
                 ...i,
                 status: msg.status ?? i.status,
-                output: msg.output !== undefined ? (i.output ?? '') + msg.output : i.output,
+                // exactOptional prep (arm 1): only touch `output` when
+                // `msg.output` actually arrived — leaving it untouched when
+                // absent preserves `i.output` (present or absent) exactly,
+                // instead of re-writing it as an explicit `undefined`.
+                ...(msg.output !== undefined ? { output: (i.output ?? '') + msg.output } : {}),
               }
             : i,
         ),
@@ -325,14 +364,17 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
             kind: 'approval',
             turnId: msg.turnId,
             id: msg.id,
-            toolId: msg.toolId,
             approvalKind: msg.kind,
             title: msg.title,
-            detail: msg.detail,
             options: msg.options,
+            // exactOptional prep (arm 1): toolId/detail/timeoutMs are all
+            // optional on ApprovalItem — omit each when the wire didn't
+            // carry one instead of writing an explicit `undefined`.
+            ...(msg.toolId !== undefined ? { toolId: msg.toolId } : {}),
+            ...(msg.detail !== undefined ? { detail: msg.detail } : {}),
             // T-A1: the field already existed on the wire — folded now so
             // T-A2's countdown display has something to read.
-            timeoutMs: msg.timeoutMs,
+            ...(msg.timeoutMs !== undefined ? { timeoutMs: msg.timeoutMs } : {}),
           },
         ],
       };
@@ -382,7 +424,15 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
         ...tab,
         transcript: [
           ...closeOpenMessages(tab.transcript),
-          { kind: 'result', turnId: msg.turnId, status: msg.status, text: msg.text, usage: msg.usage },
+          {
+            kind: 'result',
+            turnId: msg.turnId,
+            status: msg.status,
+            // exactOptional prep (arm 1): omit text/usage when the wire
+            // didn't carry one, instead of writing an explicit `undefined`.
+            ...(msg.text !== undefined ? { text: msg.text } : {}),
+            ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+          },
         ],
       };
 
@@ -392,7 +442,13 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       // arrive mid-turn and must not unlock THIS tab's composer while its
       // turn still runs — every fatal turn error is accompanied by its own
       // `turn.end{error}`, which is the single place `turnActive` clears.
-      return { ...tab, error: { message: msg.message, detail: msg.detail } };
+      return {
+        ...tab,
+        // exactOptional prep (arm 1): omit `detail` when the wire didn't
+        // carry one, instead of writing an explicit `undefined` into
+        // TabState.error's `detail?: string`.
+        error: { message: msg.message, ...(msg.detail !== undefined ? { detail: msg.detail } : {}) },
+      };
 
     default: {
       const exhaustive: never = msg;
@@ -457,7 +513,11 @@ function foldTabScoped(
 function foldTurnStart(state: AppState, msg: Extract<HostToWebview, { type: 'turn.start' }>): AppState {
   const known = sessionToTab(state.tabs)[msg.sessionId];
   if (known) {
-    return foldTabScoped(state, known, 'turn.start', (tab) => ({ ...tab, turnActive: true, error: undefined }));
+    // exactOptional prep (arm 1): clear `error` by omitting the key.
+    return foldTabScoped(state, known, 'turn.start', (tab) => {
+      const { error: _clearedError, ...rest } = tab;
+      return { ...rest, turnActive: true };
+    });
   }
   const activeTab = state.tabs[state.activeTabId];
   const title = activeTab?.title ?? 'Chat';
@@ -472,10 +532,9 @@ function foldTurnStart(state: AppState, msg: Extract<HostToWebview, { type: 'tur
     // case-4 mint that inherited it would name two tabs identically).
     newTabTitle: `Chat ${state.nextChatNumber}`,
   });
-  // H1-A1: only case 4 ever grows tabOrder (cases 1/2/3 retitle/adopt an
-  // EXISTING tab) — a mint is therefore detected by tabOrder growing, and
-  // `nextChatNumber` advances exactly once per mint, never on close/retitle.
-  const minted = result.tabOrder.length > state.tabOrder.length;
+  // H1-A1 (WS-R4): only case 4 mints — now stated by the reconciler itself
+  // instead of inferred from tabOrder growth.
+  const minted = result.kind === 'opened';
   const nextChatNumber = minted ? state.nextChatNumber + 1 : state.nextChatNumber;
   // W4-T3b (§7 B9(c) wiring): APPEND whatever handleSessionChange returns
   // onto the existing queue — never overwrite it. Case 2's dedup (the only
@@ -503,11 +562,13 @@ function foldTurnStart(state: AppState, msg: Extract<HostToWebview, { type: 'tur
       nextChatNumber,
     };
   }
+  // exactOptional prep (arm 1): clear `error` by omitting the key.
+  const { error: _clearedBoundTabError, ...boundTabRest } = boundTab;
   return {
     ...state,
     tabs: {
       ...result.tabs,
-      [result.activeTabId]: { ...boundTab, binding: 'bound', turnActive: true, error: undefined },
+      [result.activeTabId]: { ...boundTabRest, binding: 'bound', turnActive: true },
     },
     tabOrder: result.tabOrder,
     activeTabId: result.activeTabId,
@@ -542,11 +603,12 @@ function foldPanelData(state: AppState, msg: Extract<HostToWebview, { type: 'pan
       // scopeKey(tabId)-routed (reducePanelActionScoped), success here is
       // sessionId-routed (foldSessionScoped), both land on the same
       // TabState, so a single updater keeps them lockstep.
-      return foldSessionScoped(state, msg.sessionId, 'panel.data:subagents', (tab) => ({
-        ...tab,
-        subagents: success(msg.data),
-        subagentsRefreshError: undefined,
-      }));
+      // exactOptional prep (arm 1): clear subagentsRefreshError by omitting
+      // the key, never by writing an explicit `undefined`.
+      return foldSessionScoped(state, msg.sessionId, 'panel.data:subagents', (tab) => {
+        const { subagentsRefreshError: _clearedSubagentsRefreshError, ...rest } = tab;
+        return { ...rest, subagents: success(msg.data) };
+      });
     case 'checkpoints': {
       const rootPanels = { ...state.rootPanels, [msg.rootId]: success(msg.data) };
       // AU-61: a fresh success push is one of the two ways THIS root's
@@ -564,7 +626,10 @@ function foldPanelData(state: AppState, msg: Extract<HostToWebview, { type: 'pan
       const sessionsPanel = success(msg.data);
       // AU-61: same no-op-when-unset posture as checkpoints above.
       if (!state.sessionsRefreshError) return { ...state, sessionsPanel };
-      return { ...state, sessionsPanel, sessionsRefreshError: undefined };
+      // exactOptional prep (arm 1): clear sessionsRefreshError by omitting
+      // the key, never by writing an explicit `undefined`.
+      const { sessionsRefreshError: _clearedSessionsRefreshError, ...rest } = state;
+      return { ...rest, sessionsPanel };
     }
     // TI-3 (AU-42 Part B, scope decision): 'setup' stays on the plain path —
     // see `RefreshErrorPanel`'s doc (state/panels.ts) for why it carries no
@@ -646,10 +711,18 @@ function foldHydrateReconcile(state: AppState, seed: WebviewState): AppState {
 
   seedTabs.forEach((entry, index) => {
     const priorTabId = priorTabForSession[entry.sessionId];
-    const base =
+    const rawBase =
       (priorTabId ? state.tabs[priorTabId] : undefined) ??
       state.tabs[entry.tabId] ??
       makeTabState(entry.tabId, state.restoredTitles?.[entry.tabId] ?? `Chat ${index + 1}`);
+    // UX-04a (261faba lesson, mirrors `stopPending: false` below): unlike
+    // `stopPending` (a real boolean), `newSessionPending` is exactOptional
+    // (`?: true`) — cleared by KEY OMISSION so a second hydrate on a
+    // still-live webview can never leak a stale "Starting a new session…"
+    // through `...base` (its own `tab.bound`/`tab.error` terminal already
+    // resolved it if that flow completed; if it hasn't yet, this very
+    // reconcile IS the fresh bind, so the flag is moot either way).
+    const { newSessionPending: _clearedNewSessionPending, ...base } = rawBase;
     tabs[entry.tabId] = {
       ...base,
       tabId: entry.tabId,
@@ -664,6 +737,15 @@ function foldHydrateReconcile(state: AppState, seed: WebviewState): AppState {
       // absent falls back to makeTabState's `false` default, same posture
       // as every other optional display field above.
       turnActive: entry.turnActive ?? false,
+      // T10 Opus review fix: `stopPending` is deliberately NOT hydrate-carried
+      // (no `HydrateTabSeed.stopPending` field exists) — reset it here
+      // structurally, symmetric with `turnActive` above, so `...base` can
+      // never leak a still-live tab's in-flight-Stop flag through a second
+      // hydrate on a still-live webview (its `turn.end` already landed
+      // `turnActive: false` via the fold above; without this line
+      // `stopPending: true` alone would ride `...base` and paint a
+      // "Stopping…" that outlives its turn).
+      stopPending: false,
       // AUDIT-5 UI M-2: a LIVE draft on `base` (already spread in above) always
       // wins — `restoredDrafts` only fills a freshly-minted `makeTabState` base
       // (draft: ''), giving an unsent Composer draft back after a
@@ -736,10 +818,16 @@ function foldHydrate(state: AppState, s: HostToWebview & { type: 'hydrate' }): A
       ...state.tabs,
       [state.activeTabId]: {
         ...activeTab,
-        sessionId: seed.sessionId ?? activeTab.sessionId,
         currentModelId: seed.currentModelId ?? activeTab.currentModelId,
         preset: seed.preset,
         availableCommands: seed.availableCommands ?? activeTab.availableCommands,
+        // exactOptional prep (arm 1): only overwrite `sessionId` when the
+        // seed actually carries one (`WebviewState.sessionId` is `string |
+        // null`, never absent — `null` means "no information", per this
+        // function's own doc) — when it's `null`, `...activeTab` above
+        // already preserves the existing value (present or absent) exactly
+        // as the old `seed.sessionId ?? activeTab.sessionId` fallback did.
+        ...(seed.sessionId !== null ? { sessionId: seed.sessionId } : {}),
       },
     },
   };
@@ -771,14 +859,34 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // §7 B1: a CONNECTION-GLOBAL error — no session to tag it to. Renders
       // as a banner across every tab (AppState.systemError), never folded
       // into (or dropped alongside) any one tab's transcript.
-      return { ...state, systemError: { message: msg.message, detail: msg.detail } };
+      // exactOptional prep (arm 1): omit `detail` when the wire didn't
+      // carry one, instead of writing an explicit `undefined`.
+      return {
+        ...state,
+        systemError: { message: msg.message, ...(msg.detail !== undefined ? { detail: msg.detail } : {}) },
+      };
 
-    case 'system.recovered':
+    case 'system.recovered': {
       // ARCH-1 / Q2 (final review): retirement of the `system.error` banner
       // on a successful connection establish — not a second signal, the
       // resolution of the first. Idempotent (a fresh boot with no standing
       // banner folds to the same undefined it already was).
-      return { ...state, systemError: undefined };
+      // exactOptional prep (arm 1): clear by omitting the key.
+      const { systemError: _clearedSystemError, ...rest } = state;
+      return rest;
+    }
+
+    case 'gateway.health':
+      // UX-02: CONNECTION-GLOBAL — same posture as `backend.state`/
+      // `nextEdit.state` above (no sessionId, one gateway per connection).
+      // exactOptional (arm 1): omit `attempts` when the wire omitted it.
+      return {
+        ...state,
+        gatewayHealth: {
+          state: msg.state,
+          ...(msg.attempts !== undefined ? { attempts: msg.attempts } : {}),
+        },
+      };
 
     case 'turn.start':
       return foldTurnStart(state, msg);
@@ -828,18 +936,32 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // read) can never resolve. This is the ONE place `TabState.rootId`
       // ever changes.
       return clearResolvedSessionLoad(
-        foldTabScoped(state, msg.tabId, 'tab.bound', (tab) => ({
-          ...tab,
-          sessionId: msg.sessionId,
-          binding: 'bound',
-          rootId: msg.rootId,
-          title: msg.title ?? tab.title,
-          // Audit G-9: a successful bind is the one thing that retires the marker.
-          openFailed: false,
-          // ARCH-1 (final review, UI I-3): a successful bind is likewise the
-          // one thing that retires the session-lost marker (G-9 parity).
-          sessionLost: false,
-        })),
+        foldTabScoped(state, msg.tabId, 'tab.bound', (tab) => {
+          // UX-04a: `newSessionPending` is exactOptional (`?: true`) — clear
+          // by KEY OMISSION (never `false`/`undefined`), same discipline the
+          // `clear`/`tab.clear` folds already use for `error`. A successful
+          // bind is one of this flag's two terminals.
+          // UX-04c: a successful bind retires `sessionLostReason` together
+          // with the `sessionLost` marker it rides on — same key-omission
+          // discipline (exactOptional: cleared by omission, never `undefined`).
+          const {
+            newSessionPending: _clearedNewSessionPending,
+            sessionLostReason: _clearedSessionLostReason,
+            ...rest
+          } = tab;
+          return {
+            ...rest,
+            sessionId: msg.sessionId,
+            binding: 'bound',
+            rootId: msg.rootId,
+            title: msg.title ?? tab.title,
+            // Audit G-9: a successful bind is the one thing that retires the marker.
+            openFailed: false,
+            // ARCH-1 (final review, UI I-3): a successful bind is likewise the
+            // one thing that retires the session-lost marker (G-9 parity).
+            sessionLost: false,
+          };
+        }),
         msg.tabId,
       );
 
@@ -848,18 +970,37 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // for `open-failed`). Audit G-9: `openFailed` outlives the banner so the
       // route back survives a dismissal.
       return clearResolvedSessionLoad(
-        foldTabScoped(state, msg.tabId, 'tab.error', (tab) => ({
-          ...tab,
-          error: { message: msg.message, kind: msg.kind },
-          ...(msg.kind === 'open-failed' ? { openFailed: true } : {}),
+        foldTabScoped(state, msg.tabId, 'tab.error', (tab) => {
+          // UX-04a: the other terminal for `newSessionPending` — every host
+          // refusal path for `tab.newSession` already lands as `tab.error`
+          // (verified — `AcpBackend.newSessionInTabInternal`), so this is the
+          // exhaustive pair with `tab.bound` above. Same key-omission clear.
+          const { newSessionPending: _clearedNewSessionPending, ...rest } = tab;
+          if (msg.kind === 'open-failed') {
+            // UX-04c: open-failed leaves any prior session-lost marker AND
+            // its reason untouched, exactly as before — its standing row is
+            // already honest for every open-failed path (no reason
+            // vocabulary needed there, scope pin).
+            return { ...rest, error: { message: msg.message, kind: msg.kind }, openFailed: true };
+          }
           // ARCH-1 (final review, UI I-3): a lost session is a terminal
           // transition — regress `binding` so the composer (App.tsx
           // `disabled={tab.binding !== 'bound'}`) stops accepting sends that
           // have nowhere to go. `sessionLost` outlives the dismissible banner
           // exactly like `openFailed` does (G-9 pattern); cleared by the next
           // successful `tab.bound` above.
-          ...(msg.kind === 'session-lost' ? { binding: 'unbound' as const, sessionLost: true } : {}),
-        })),
+          // UX-04c: strip any PREVIOUS loss's reason first, so a reason-less
+          // new loss never wears stale vocabulary; re-add only what THIS
+          // message says (exactOptional: key omitted when the host sent none).
+          const { sessionLostReason: _staleReason, ...restWithoutReason } = rest;
+          return {
+            ...restWithoutReason,
+            error: { message: msg.message, kind: msg.kind },
+            binding: 'unbound' as const,
+            sessionLost: true,
+            ...(msg.reason !== undefined ? { sessionLostReason: msg.reason } : {}),
+          };
+        }),
         msg.tabId,
       );
 
@@ -876,15 +1017,16 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
       // one). Without this, a "New Session" click on a session-lost tab left
       // the stale "Session lost" banner standing even after the fresh
       // `tab.bound` that follows.
-      return foldTabScoped(state, msg.tabId, 'tab.clear', (tab) => ({
-        ...tab,
-        transcript: [],
-        plan: [],
-        turnActive: false,
-        error: undefined,
-        openFailed: false,
-        sessionLost: false,
-      }));
+      // exactOptional prep (arm 1): clear `error` by omitting the key
+      // (openFailed/sessionLost stay explicit `false` — a real, non-undefined
+      // boolean value, not the exactOptional case).
+      // UX-04c: `sessionLostReason` rides the same exactOptional-by-omission
+      // discipline as `error` — strip it here too, or a stale reason from the
+      // session that just went lost would survive into the fresh tab.
+      return foldTabScoped(state, msg.tabId, 'tab.clear', (tab) => {
+        const { error: _clearedError, sessionLostReason: _clearedReason, ...rest } = tab;
+        return { ...rest, transcript: [], plan: [], turnActive: false, stopPending: false, openFailed: false, sessionLost: false, hiddenCount: 0 };
+      });
 
     // ---- generic session-scoped fold (drop-unknown; §2e reuses foldTab) ----
     case 'clear':
@@ -903,7 +1045,7 @@ export function reduce(state: AppState, msg: HostToWebview): AppState {
     case 'plan.update':
     case 'result.summary':
     case 'error':
-      return foldSessionScoped(state, msg.sessionId, msg.type, (tab) => foldTab(tab, msg));
+      return foldSessionScoped(state, msg.sessionId, msg.type, (tab) => capTranscript(foldTab(tab, msg)));
 
     // Task 10: CONNECTION-GLOBAL accumulation of the throttled
     // `setup.progress` stream (Agent install log lines, FIM/RAG model pull
@@ -959,6 +1101,7 @@ function assertReduceHandlesEveryRoutedMessage(
     case 'nextEdit.state':
     case 'system.error':
     case 'system.recovered':
+    case 'gateway.health':
     case 'turn.start':
     case 'policy.state':
     case 'commands.available':
@@ -1044,6 +1187,15 @@ export type LocalAction =
   // .pendingSessionLoad`'s own doc for the clearing half (the `tab.bound`/
   // `tab.error` cases below).
   | { type: 'local.sessionLoad.start'; tabId: string; sessionId: string }
+  // UX-04b: the webview-side watchdog's own fallback timeout — DEFENSE IN
+  // DEPTH over WS-R4's host-side `SESSION_ESTABLISH_DEADLINE_MS` (120s):
+  // this fires (`useSessionLoadWatchdog`, `hooks/useSessionLoadWatchdog.ts`)
+  // only when NO host terminal (`tab.bound`/`tab.error`) ever arrives for
+  // the pending load at all. Carries no `tabId` — the hook is armed against
+  // the CURRENT `pendingSessionLoad` snapshot already, so there is nothing
+  // left to match; the fold below clears it unconditionally, same as
+  // `local.dismissSystemError`'s single-slot clear just below.
+  | { type: 'local.sessionLoad.timeout' }
   // TI-3 (AU-42 Part B): dismisses one panel's `refreshError` banner — the
   // OTHER way it clears besides that panel's next success push (see
   // `AppState.refreshError`'s own doc). `panel` is scoped to
@@ -1068,6 +1220,11 @@ export type LocalAction =
       type: 'local.scopedRefreshError.dismiss';
       target: { panel: 'sessions' } | { panel: 'checkpoints'; rootId: string } | { panel: 'subagents'; tabId: string };
     }
+  // UX-03: Stop clicked — paired by the caller with the 'cancel' post (this reducer never posts).
+  | { type: 'local.stopPending'; tabId: string }
+  // UX-04a: New Session clicked — paired by the caller (App.newSession) with
+  // the 'tab.newSession' post that follows (this reducer never posts).
+  | { type: 'local.newSessionPending'; tabId: string }
   // Part X2: a panel's own loading/error transitions (fed by fetchPanel).
   | PanelAction;
 
@@ -1085,7 +1242,11 @@ export type LocalAction =
  * tab's still-in-flight History load).
  */
 function clearResolvedSessionLoad(next: AppState, tabId: string): AppState {
-  return next.pendingSessionLoad?.tabId === tabId ? { ...next, pendingSessionLoad: undefined } : next;
+  if (next.pendingSessionLoad?.tabId !== tabId) return next;
+  // exactOptional prep (arm 1): clear `pendingSessionLoad` by omitting the
+  // key, never by writing an explicit `undefined`.
+  const { pendingSessionLoad: _clearedPendingSessionLoad, ...rest } = next;
+  return rest;
 }
 
 /** Route a scoped-panel loading/error transition (Part X2 no-flash rule) to
@@ -1130,7 +1291,10 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
       // retires a standing signal — a stale "couldn't refresh" banner over a
       // fresh empty SUCCESS would lie (see `PanelAction.emptyData`'s doc).
       if (action.type === 'local.panelLoading' && action.emptyData !== undefined) {
-        return { ...state, tabs: { ...state.tabs, [tabId]: { ...tab, subagents, subagentsRefreshError: undefined } } };
+        // exactOptional prep (arm 1): clear subagentsRefreshError by
+        // omitting the key, never by writing an explicit `undefined`.
+        const { subagentsRefreshError: _clearedSubagentsRefreshError, ...tabRest } = tab;
+        return { ...state, tabs: { ...state.tabs, [tabId]: { ...tabRest, subagents } } };
       }
       // A plain `local.panelLoading` (background refetch in flight) does NOT
       // clear a standing signal — it survives until success or dismiss,
@@ -1263,11 +1427,26 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
     case 'local.setPanel':
       return { ...state, activePanel: action.panel };
     case 'local.dismissError':
-      return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, error: undefined }));
+      // exactOptional prep (arm 1): clear `error` by omitting the key.
+      return foldTabScoped(state, action.tabId, action.type, (tab) => {
+        const { error: _clearedError, ...rest } = tab;
+        return rest;
+      });
     case 'local.sessionLoad.start':
       return { ...state, pendingSessionLoad: { tabId: action.tabId, sessionId: action.sessionId } };
-    case 'local.dismissSystemError':
-      return { ...state, systemError: undefined };
+    case 'local.sessionLoad.timeout': {
+      // UX-04b: clears `pendingSessionLoad` by key omission — the same
+      // exactOptional discipline `clearResolvedSessionLoad` (above) already
+      // uses for the host-terminal half; this is the webview watchdog's own
+      // fallback half. Nothing else in state changes.
+      const { pendingSessionLoad: _clearedPendingSessionLoadOnTimeout, ...rest } = state;
+      return rest;
+    }
+    case 'local.dismissSystemError': {
+      // exactOptional prep (arm 1): clear by omitting the key.
+      const { systemError: _clearedSystemError, ...rest } = state;
+      return rest;
+    }
     case 'local.panelLoading':
     case 'local.panelError':
       return reducePanelActionScoped(state, action);
@@ -1284,9 +1463,12 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
     case 'local.scopedRefreshError.dismiss': {
       const { target } = action;
       switch (target.panel) {
-        case 'sessions':
+        case 'sessions': {
           if (!state.sessionsRefreshError) return state; // nothing to clear
-          return { ...state, sessionsRefreshError: undefined };
+          // exactOptional prep (arm 1): clear by omitting the key.
+          const { sessionsRefreshError: _clearedSessionsRefreshError, ...rest } = state;
+          return rest;
+        }
         case 'checkpoints': {
           if (!state.checkpointsRefreshError?.[target.rootId]) return state; // nothing to clear
           const checkpointsRefreshError = { ...state.checkpointsRefreshError };
@@ -1298,7 +1480,11 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
           // state) covers the "unknown tab" case for free — same posture the
           // design doc calls for (mirrors transcript.ts's subagents
           // drop-unknown path).
-          return foldTabScoped(state, target.tabId, action.type, (tab) => ({ ...tab, subagentsRefreshError: undefined }));
+          // exactOptional prep (arm 1): clear by omitting the key.
+          return foldTabScoped(state, target.tabId, action.type, (tab) => {
+            const { subagentsRefreshError: _clearedSubagentsRefreshError, ...rest } = tab;
+            return rest;
+          });
       }
     }
 
@@ -1380,6 +1566,29 @@ export function reduceLocal(state: AppState, action: LocalAction): AppState {
 
     case 'local.draft.clear':
       return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, draft: '', draftAttachments: [] }));
+
+    case 'local.stopPending':
+      // UX-03: only meaningful while a turn is live — a stray dispatch on an
+      // idle tab must not paint a "Stopping…" nothing will ever clear.
+      return foldTabScoped(state, action.tabId, action.type, (tab) =>
+        tab.turnActive ? { ...tab, stopPending: true } : tab,
+      );
+
+    case 'local.newSessionPending':
+      // UX-04a: unlike stopPending, unconditional — New Session is legal on
+      // any tab (bound or not, idle or live-turn; Composer's own Task-11
+      // confirm gate is what asks first while busy, not this fold). Cleared
+      // by `tab.bound`/`tab.error` below (exhaustive terminals for the
+      // `tab.newSession` post App.newSession issues right after this).
+      // WS-UX P2 M1 (deliberate non-fix): this fold does NOT touch
+      // `sessionLost`/`sessionLostReason`/`openFailed`. Those are host-owned
+      // truth with exactly two retirers (`tab.bound`, `tab.clear`) — a local
+      // optimistic action must never become a third writer, or a lost
+      // `tab.newSession` post would strand the tab with its recovery
+      // affordances stripped and no way to rebuild them. While the request
+      // is in flight, App.tsx GATES the two standing recovery rows on this
+      // flag instead (render priority, not state mutation).
+      return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, newSessionPending: true }));
 
     default:
       return state;

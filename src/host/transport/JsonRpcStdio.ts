@@ -1,5 +1,6 @@
 import { spawn, ChildProcess } from 'node:child_process';
 import { redactSecretsDeep } from '../redactControlResponse';
+import { MAX_LINE_BYTES } from './maxLineBytes';
 
 /**
  * Newline-delimited JSON-RPC 2.0 over a child process's stdio.
@@ -88,12 +89,13 @@ const KILL_GRACE_MS = 5_000;
  * hostile stream (a truncated JSON line would fail to parse anyway), so
  * we refuse to buffer it and tear the transport down for a clean respawn
  * rather than grow unbounded or silently truncate.
+ * Shared with the ACP channel's stdoutByteCap Transform since WS-AC CA-01 —
+ * one definition (./maxLineBytes.ts).
  */
-const MAX_LINE_BYTES = 4 * 1024 * 1024;
 
 export class JsonRpcStdio implements Disposable {
   private readonly child: ChildProcess;
-  private readonly logger?: Logger;
+  private readonly logger: Logger | undefined;
   private readonly requestTimeoutMs: number;
 
   private nextId = 1;
@@ -159,8 +161,13 @@ export class JsonRpcStdio implements Disposable {
    * error frames, on child exit, and after {@link requestTimeoutMs}.
    */
   request<T>(method: string, params?: unknown): Promise<T> {
-    if (this.disposed) {
-      return Promise.reject(new Error('JsonRpcStdio disposed'));
+    if (this.disposed || this.terminated) {
+      // F2-01/F3-13 (WS-AC): a terminated (crashed) child can never answer —
+      // queueing would burn the full 120s timeout against a dead stdin.
+      // Same fast-fail the disposed path always had.
+      return Promise.reject(
+        new Error(this.terminated && !this.disposed ? `request '${method}' refused: child already terminated` : 'JsonRpcStdio disposed'),
+      );
     }
     const id = this.nextId++;
     const frame = { jsonrpc: '2.0' as const, id, method, params };
@@ -171,6 +178,9 @@ export class JsonRpcStdio implements Disposable {
         reject(new Error(`request '${method}' (id ${id}) timed out ` +
           `after ${this.requestTimeoutMs}ms`));
       }, this.requestTimeoutMs);
+      // F2-02 (WS-AC): a pending-request timeout must not hold the host's
+      // event loop open by itself — same convention as killTimer below.
+      timer.unref?.();
 
       this.pending.set(id, {
         resolve: resolve as (v: unknown) => void,
@@ -184,7 +194,7 @@ export class JsonRpcStdio implements Disposable {
 
   /** Fire-and-forget notification (no `id`, no reply expected). */
   notify(method: string, params?: unknown): void {
-    if (this.disposed) return;
+    if (this.disposed || this.terminated) return;
     this.send({ jsonrpc: '2.0', method, params });
   }
 
@@ -220,6 +230,17 @@ export class JsonRpcStdio implements Disposable {
     this.rejectAll(new Error('JsonRpcStdio disposed'));
     this.eventHandlers.clear();
 
+    // F2-02 (WS-AC): stop consuming the dead child's streams. The
+    // constructor's child 'exit'/'error' listeners stay ON PURPOSE (the
+    // natural exit → terminate() → exitHandlers chain is the upstream
+    // respawn signal — see this method's TE-1 doc above), and stdin's
+    // 'error' listener stays (a just-issued write can still error
+    // asynchronously and must not crash the host) — but nothing may keep
+    // BUFFERING or LOGGING stdout/stderr after teardown.
+    this.child.stdout?.removeAllListeners('data');
+    this.child.stderr?.removeAllListeners('data');
+    this.stdoutBuffer = '';
+
     if (this.child.exitCode === null && !this.child.killed) {
       this.child.kill('SIGTERM');
       const killTimer = setTimeout(() => {
@@ -251,36 +272,43 @@ export class JsonRpcStdio implements Disposable {
       if (line.length > 0) this.handleFrame(line);
     }
 
-    // B-4 (SEC-6): bound the RESIDUAL (post-drain) partial frame, not the
-    // transient pre-drain total — a legitimate burst of many complete
-    // `\n`-terminated frames in one chunk can exceed MAX_LINE_BYTES in
-    // total without ever leaving an oversized unterminated tail behind, and
-    // must not false-trip. What's left here (if anything) is always a
-    // SINGLE partial line still waiting on its terminator.
-    if (this.stdoutBuffer.length > MAX_LINE_BYTES) {
-      const oversizedByteCount = this.stdoutBuffer.length;
-      // Never retain the oversized data and never parse a partial frame —
-      // clear before anything else so no code path downstream can see it.
-      this.stdoutBuffer = '';
-      this.log(
-        `[fatal] residual stdout line exceeded ${MAX_LINE_BYTES} bytes ` +
-          `(${oversizedByteCount} bytes buffered, no terminating newline) — ` +
-          'tearing down transport for respawn',
-      );
-      this.rejectAll(
-        new Error(
-          `JsonRpcStdio: stdout frame exceeded ${MAX_LINE_BYTES} bytes ` +
-            `(${oversizedByteCount} bytes) without a terminating newline`,
-        ),
-      );
-      // Reuse the existing teardown path: dispose() kills the child
-      // (SIGTERM, escalating to SIGKILL) without inventing a parallel error
-      // channel. dispose() does not remove the constructor's 'exit'
-      // listener, so the natural exit -> exitHandlers chain still fires
-      // once the child actually dies — the same signal a crash reaches —
-      // which is what drives an upstream supervisor's respawn (e.g.
-      // ControlChannel.spawnAndAwaitReady's `transport.onExit(...)`).
-      this.dispose();
+    // B-4 (SEC-6) + CA-M01 (WS-AC): bound the RESIDUAL (post-drain) partial
+    // frame in UTF-8 BYTES, not UTF-16 code units — `.length` under-counts
+    // multi-byte text up to 3× (a CJK-heavy line could buffer ~12 MiB of
+    // real bytes before a `.length` check saw 4 Mi "characters"). Cheap
+    // pre-filter: one UTF-16 code unit encodes to AT MOST 3 UTF-8 bytes
+    // (astral pairs: 2 units → 4 bytes = 2 bytes/unit), so when
+    // `length * 3` cannot reach the cap the exact byte count cannot either
+    // and the O(n) `Buffer.byteLength` scan is skipped — the common case
+    // costs nothing. What's left here (if anything) is always a SINGLE
+    // partial line still waiting on its terminator (see the drain loop
+    // above).
+    if (this.stdoutBuffer.length * 3 > MAX_LINE_BYTES) {
+      const residualBytes = Buffer.byteLength(this.stdoutBuffer, 'utf8');
+      if (residualBytes > MAX_LINE_BYTES) {
+        // Never retain the oversized data and never parse a partial frame —
+        // clear before anything else so no code path downstream can see it.
+        this.stdoutBuffer = '';
+        this.log(
+          `[fatal] residual stdout line exceeded ${MAX_LINE_BYTES} bytes ` +
+            `(${residualBytes} bytes buffered, no terminating newline) — ` +
+            'tearing down transport for respawn',
+        );
+        this.rejectAll(
+          new Error(
+            `JsonRpcStdio: stdout frame exceeded ${MAX_LINE_BYTES} bytes ` +
+              `(${residualBytes} bytes) without a terminating newline`,
+          ),
+        );
+        // Reuse the existing teardown path: dispose() kills the child
+        // (SIGTERM, escalating to SIGKILL) without inventing a parallel
+        // error channel. dispose() does not remove the constructor's 'exit'
+        // listener, so the natural exit -> exitHandlers chain still fires
+        // once the child actually dies — the same signal a crash reaches —
+        // which is what drives an upstream supervisor's respawn (e.g.
+        // ControlChannel.spawnAndAwaitReady's `transport.onExit(...)`).
+        this.dispose();
+      }
     }
   }
 

@@ -1,14 +1,14 @@
 import { EventEmitter } from 'node:events';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { sanitizeGitEnv } from './gitEnv';
 import {
   GitOutputLimitError,
   GitTimeoutError,
-  __setSpawnForTests,
   runGit,
   runGitBinary,
+  type GitSpawn,
 } from './gitProcess';
 
 /**
@@ -23,9 +23,9 @@ class FakeGitChild extends EventEmitter {
   kill = vi.fn((_signal?: NodeJS.Signals | number): boolean => true);
 }
 
-/** Cast a `() => FakeGitChild` into the shape {@link __setSpawnForTests} expects. */
-function injectSpawn(child: FakeGitChild): void {
-  __setSpawnForTests((() => child) as unknown as Parameters<typeof __setSpawnForTests>[0]);
+/** Cast a `() => FakeGitChild` into the {@link GitSpawn} shape `RunGitOptions.spawn` expects. */
+function spawnOf(child: FakeGitChild): GitSpawn {
+  return (() => child) as unknown as GitSpawn;
 }
 
 /**
@@ -68,17 +68,12 @@ describe('runGit output cap (S-M6c)', () => {
 describe('runGit wall-clock timeout + SIGKILL (arch A#1)', () => {
   const baseEnv = sanitizeGitEnv(process.env);
 
-  afterEach(() => {
-    __setSpawnForTests(null); // restore the real spawn
-  });
-
   it('SIGKILLs a stalled git and rejects with GitTimeoutError after timeoutMs', async () => {
     const child = new FakeGitChild();
-    injectSpawn(child);
 
     const start = Date.now();
     await expect(
-      runGit(['write-tree'], { cwd: process.cwd(), env: baseEnv, timeoutMs: 50 }),
+      runGit(['write-tree'], { cwd: process.cwd(), env: baseEnv, timeoutMs: 50, spawn: spawnOf(child) }),
     ).rejects.toBeInstanceOf(GitTimeoutError);
 
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
@@ -88,19 +83,22 @@ describe('runGit wall-clock timeout + SIGKILL (arch A#1)', () => {
 
   it('binary variant is bounded too', async () => {
     const child = new FakeGitChild();
-    injectSpawn(child);
     await expect(
-      runGitBinary(['show', 'HEAD:big'], { cwd: process.cwd(), env: baseEnv, timeoutMs: 50 }),
+      runGitBinary(['show', 'HEAD:big'], {
+        cwd: process.cwd(),
+        env: baseEnv,
+        timeoutMs: 50,
+        spawn: spawnOf(child),
+      }),
     ).rejects.toBeInstanceOf(GitTimeoutError);
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
   });
 
   it('does NOT time out when timeoutMs is 0 (disabled) — settles only on close', async () => {
     const child = new FakeGitChild();
-    injectSpawn(child);
 
     let settled = false;
-    const p = runGit(['gc'], { cwd: process.cwd(), env: baseEnv, timeoutMs: 0 }).then(
+    const p = runGit(['gc'], { cwd: process.cwd(), env: baseEnv, timeoutMs: 0, spawn: spawnOf(child) }).then(
       () => {
         settled = true;
       },
@@ -137,10 +135,6 @@ describe('runGit wall-clock timeout + SIGKILL (arch A#1)', () => {
 describe('runGit stdin error guard is unconditional (M-1)', () => {
   const baseEnv = sanitizeGitEnv(process.env);
 
-  afterEach(() => {
-    __setSpawnForTests(null);
-  });
-
   /** A fake child whose stdin is a REAL EventEmitter, so an unhandled `'error'`
    * throws exactly as Node's would (a plain stub can't reproduce M-1). */
   class FakeGitChildEmitterStdin extends EventEmitter {
@@ -155,13 +149,15 @@ describe('runGit stdin error guard is unconditional (M-1)', () => {
 
   it('swallows a stdin EPIPE on a NO-INPUT git call instead of throwing', async () => {
     const child = new FakeGitChildEmitterStdin();
-    __setSpawnForTests((() => child) as unknown as Parameters<typeof __setSpawnForTests>[0]);
 
     // No `input` — the pre-M-1 code attached the stdin 'error' listener only in
     // the `input !== undefined` branch, so this call had NO listener.
-    const p = runGit(['write-tree'], { cwd: process.cwd(), env: baseEnv, timeoutMs: 0 }).catch(
-      () => undefined,
-    );
+    const p = runGit(['write-tree'], {
+      cwd: process.cwd(),
+      env: baseEnv,
+      timeoutMs: 0,
+      spawn: (() => child) as unknown as GitSpawn,
+    }).catch(() => undefined);
 
     // Emitting 'error' with no listener throws synchronously at the emit site
     // (Node EventEmitter semantics). With the unconditional guard it is swallowed.
@@ -169,5 +165,39 @@ describe('runGit stdin error guard is unconditional (M-1)', () => {
 
     child.emit('close', 0);
     await p;
+  });
+});
+
+/**
+ * TST-02 (WS-TD): the spawner is injected PER CALL through `RunGitOptions.spawn`
+ * — there is no module-level slot and no test-only reset. This pins the seam's
+ * contract: the runner hands the injected spawner exactly (`'git'`, argv,
+ * `{ cwd, env }`) — the SAME triple the real `spawn` receives — and consumes
+ * the child it returns.
+ */
+describe('runGit spawner seam (TST-02: per-call injection, no module-level slot)', () => {
+  const baseEnv = sanitizeGitEnv(process.env);
+
+  it('hands the injected spawner exactly (`git`, args, {cwd, env}) and uses its child', async () => {
+    const child = new FakeGitChild();
+    const seen: Array<{ command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }> = [];
+    const spawn = ((command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }) => {
+      seen.push({ command, args: [...args], cwd: options.cwd, env: options.env });
+      // Listeners are attached synchronously after spawn() returns (inside the
+      // same Promise executor), so a microtask is late enough — the same
+      // `queueMicrotask(() => fake.emit('close', …))` idiom CheckpointTracker.test.ts uses.
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from('out\n'));
+        child.emit('close', 0);
+      });
+      return child;
+    }) as unknown as GitSpawn;
+
+    const res = await runGit(['status', '--porcelain'], { cwd: '/some/cwd', env: baseEnv, spawn });
+
+    expect(res).toEqual({ code: 0, stdout: 'out\n', stderr: '' });
+    expect(seen).toEqual([{ command: 'git', args: ['status', '--porcelain'], cwd: '/some/cwd', env: baseEnv }]);
+    expect(seen[0]?.env).toBe(baseEnv); // the exact env object the caller passed — never process.env, never a copy
+    expect(child.kill).not.toHaveBeenCalled();
   });
 });

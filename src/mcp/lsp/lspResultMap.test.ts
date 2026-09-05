@@ -363,10 +363,30 @@ describe('mapDiagnosticsForUri / mapDiagnosticsDump — I-1(e) correct resource 
   // -------------------------------------------------------------------------
 
   it('AU-17: normalizes a null/malformed code to undefined instead of throwing (totality)', () => {
+    // Malformed/adversarial `code` values (null / {} / {value:null}) — never
+    // `undefined` itself (that path is covered above); each cast narrows to
+    // `Exclude<…, undefined>` so the object literal's inferred `code` field
+    // matches the ACTUAL runtime value's shape under exactOptionalPropertyTypes
+    // (arm-4 fixture fix — the fuzzed value itself must stay non-undefined).
     const diags: DiagnosticLike[] = [
-      { range: range(0, 0, 0, 1), message: 'null-code', severity: 0, code: null as unknown as DiagnosticLike['code'] },
-      { range: range(0, 0, 0, 1), message: 'empty-object-code', severity: 0, code: {} as unknown as DiagnosticLike['code'] },
-      { range: range(0, 0, 0, 1), message: 'null-value-code', severity: 0, code: { value: null } as unknown as DiagnosticLike['code'] },
+      {
+        range: range(0, 0, 0, 1),
+        message: 'null-code',
+        severity: 0,
+        code: null as unknown as Exclude<DiagnosticLike['code'], undefined>,
+      },
+      {
+        range: range(0, 0, 0, 1),
+        message: 'empty-object-code',
+        severity: 0,
+        code: {} as unknown as Exclude<DiagnosticLike['code'], undefined>,
+      },
+      {
+        range: range(0, 0, 0, 1),
+        message: 'null-value-code',
+        severity: 0,
+        code: { value: null } as unknown as Exclude<DiagnosticLike['code'], undefined>,
+      },
     ];
 
     expect(() => mapDiagnosticsForUri(diags, 'file:///n.ts')).not.toThrow();

@@ -35,14 +35,27 @@ import type {
   McpTestResult,
   NextEditToggleSource,
   Panel,
+  SessionLostReason,
   SetupMethod,
   SkillCreateParams,
   ThemeKind,
 } from './protocol';
 import { MAX_TABS, PANEL_SCOPE } from './protocol';
+import {
+  asShape,
+  isCheckpointRestoreResult,
+  isHubInstallResult,
+  isHubPreview,
+  isHubScan,
+  isMcpAddResult,
+  isMcpCatalogData,
+  isMcpCatalogInstallResult,
+  isMcpTestResult,
+} from './shapeGuards';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
+import { useDebouncedPersist } from './state/useDebouncedPersist';
 import {
   errorMessage,
   fetchPanel,
@@ -56,6 +69,7 @@ import { idle } from './state/remoteData';
 import { createInitialState, type AppState, type TabState } from './types';
 import type { ComposerSeed } from './composer/applySeed';
 import { useHostActions } from './hooks/useHostActions';
+import { useSessionLoadWatchdog } from './hooks/useSessionLoadWatchdog';
 
 import { PriorityTabs, panelTabDomId, panelTabpanelId } from './components/PriorityTabs';
 import { TabStrip, tabDomId, CHAT_TABPANEL_ID } from './components/TabStrip';
@@ -73,8 +87,10 @@ import { ModelsPanel } from './panels/ModelsPanel';
 import { SettingsPanel } from './panels/SettingsPanel';
 import { SetupPanel } from './panels/SetupPanel';
 import { ErrorBanner } from './components/ErrorBanner';
+import { GatewayHealthBanner } from './components/GatewayHealthBanner';
 import { MockNotice } from './components/MockNotice';
 import { Icon } from './components/Icon';
+import { LiveRegion } from './components/LiveRegion';
 
 type Action = { host: HostToWebview } | { local: LocalAction };
 
@@ -90,6 +106,18 @@ type Action = { host: HostToWebview } | { local: LocalAction };
  * whenever no session is live yet.
  */
 const UNBOUND_SESSION_PLACEHOLDER = '';
+
+/**
+ * WS-BG: guard-or-throw for correlated RPC results. A refused shape rejects
+ * with an honest method-named Error — the same rejected-promise path every
+ * caller already handles for RPC timeouts (panel error rendering /
+ * optimistic rollback). Message names the METHOD only, never the payload.
+ */
+const requireShape = <T,>(raw: unknown, guard: (x: unknown) => x is T, method: string): T => {
+  const shaped = asShape(raw, guard);
+  if (shaped === undefined) throw new Error(`${method} returned an unrecognized result shape`);
+  return shaped;
+};
 
 function rootReducer(state: AppState, action: Action): AppState {
   if ('host' in action) return reduce(state, action.host);
@@ -132,6 +160,32 @@ function modelLabel(state: AppState): string {
     ?.providers.flatMap((p) => p.models)
     .find((m) => m.id === id);
   return found?.label ?? id;
+}
+
+/** UX-04c: the standing row used to claim "lost when the agent restarted"
+ * for EVERY loss — false for a mid-load timeout, a mid-load disconnect,
+ * and a session another tab took over. Copy is per-reason now; the
+ * affordance stays History for all of them deliberately (History IS the
+ * retry surface for a load; Force-reconnect already self-surfaces in the
+ * connection banner when health is down — no second home for a
+ * consent-gated destructive control). Exhaustive over all 5 reasons +
+ * `undefined` (the legacy sentence) — no `default` arm, so tsc enforces
+ * exhaustiveness against `SessionLostReason` if it ever grows. */
+function sessionLostRowCopy(reason: SessionLostReason | undefined): string {
+  switch (reason) {
+    case 'superseded':
+      return 'This session is now open in another tab.';
+    case 'disconnected':
+      return 'The agent disconnected while loading this session.';
+    case 'timeout':
+      return 'The agent did not respond while loading this session.';
+    case 'recovery-failed':
+      return 'This session could not be recovered after the agent restarted.';
+    case 'restarted':
+      return 'This session ended when the agent restarted.';
+    case undefined:
+      return "This chat's session was lost when the agent restarted.";
+  }
 }
 
 /** D1 (M7): the shape `vscode.setState`/`getState` persist across a webview
@@ -191,6 +245,24 @@ export function App() {
   // already-loaded list (see `loadMoreFooterState`, state/panels.ts).
   const [sessionsLoadMoreError, setSessionsLoadMoreError] = useState<string | undefined>(undefined);
 
+  // UX-04b: a webview-side watchdog on `state.pendingSessionLoad` — DEFENSE
+  // IN DEPTH over WS-R4's host-side `SESSION_ESTABLISH_DEADLINE_MS` (120s,
+  // now merged on this branch, which already closes the wedge host-side).
+  // This hook fires only when NO host terminal (`tab.bound`/`tab.error`)
+  // ever arrives for a committed History load at all. `sessionLoadNotice`
+  // drives SessionsPanel's dismissible banner AND its permanently-mounted
+  // sr-only LiveRegion (Finding-7 discipline: the region itself is never
+  // conditionally mounted, only its text swaps) — cleared here on dismiss,
+  // and by `loadSession` below (the real `onLoad` path) the instant a NEW
+  // load starts, so a stale notice can never linger over a fresh attempt.
+  const [sessionLoadNotice, setSessionLoadNotice] = useState<string | undefined>(undefined);
+  useSessionLoadWatchdog(state.pendingSessionLoad, () => {
+    dispatch({ local: { type: 'local.sessionLoad.timeout' } });
+    setSessionLoadNotice(
+      'Still no reply from the agent after 130 seconds — the load may be stuck. Force reconnect from the connection banner, or click the session again.',
+    );
+  });
+
   // C4: every session id currently bound to an open tab — a History row for
   // one of these already has a live tab somewhere, so it gets a bound marker
   // (SessionsPanel §boundSessionIds). Unbound tabs (`sessionId` still
@@ -248,7 +320,15 @@ export function App() {
         dispatch({ local: { type: 'local.setPanel', panel: 'chat' } });
         // Capture the ACTIVE tab id at ARRIVAL time. The user may switch tabs
         // before the Composer mounts and applies it (audit C-3).
-        setPendingSeed({ tabId: activeTabIdRef.current, text: msg.text, mentions: msg.mentions });
+        // exactOptional prep (arm 1): `msg.mentions` is `ContextRef[] |
+        // undefined`; `ComposerSeed.mentions` (composer/applySeed.ts, outside
+        // this batch) is `mentions?: ContextRef[]` — spread the key in only
+        // when present rather than widening that declaration.
+        setPendingSeed({
+          tabId: activeTabIdRef.current,
+          text: msg.text,
+          ...(msg.mentions !== undefined ? { mentions: msg.mentions } : {}),
+        });
       }
       if (msg.type === 'panel.activate' && msg.panel !== 'chat') {
         requestPanelRef.current(msg.panel, 'activate'); // narrowed to DataPanel
@@ -286,29 +366,38 @@ export function App() {
   // needed). Title ownership stays webview-side (the host deliberately does
   // not own a tab title); this is a read-only snapshot, never a second
   // source of truth for `TabState.title` itself.
-  useEffect(() => {
-    // F-5 (final-4way-fixes.md, defensive): guard-consistent with the
-    // TabStrip render below (`.filter((t): t is TabState => t !== undefined)`)
-    // — under `noUncheckedIndexedAccess`, `state.tabs[id]` is `TabState |
-    // undefined`; a stale id in `tabOrder` with no matching `tabs` entry
-    // (unreachable today given how the effect derives its ids, hence
-    // Minor/defensive) must skip that id rather than throw on `.title`.
-    const tabTitles = Object.fromEntries(
-      state.tabOrder
-        .map((id) => state.tabs[id])
-        .filter((t): t is TabState => t !== undefined)
-        .map((t) => [t.tabId, t.title]),
-    );
-    bridge.setState({
-      composerHeight,
-      tabTitles,
-      nextChatNumber: state.nextChatNumber,
-      // AUDIT-5 UI M-2: same per-write-derived-fresh posture as `tabTitles`
-      // above — a closed tab's stale draft is pruned automatically on the
-      // very next write, no separate cleanup path needed.
-      drafts: buildDraftSnapshot(state),
-    });
-  }, [composerHeight, state.tabs, state.tabOrder, state.nextChatNumber]);
+  // CA-10: same snapshot + same dep list as the direct write; execution
+  // coalesced to a trailing 400ms write + flush on hidden/unmount (see
+  // useDebouncedPersist). state.tabs gets a fresh ref per token fold, so the
+  // direct write fired per delta — this coalesces that to one write per
+  // quiescence without changing WHAT or WHEN (durability-wise) is persisted.
+  useDebouncedPersist(
+    () => {
+      // F-5 (final-4way-fixes.md, defensive): guard-consistent with the
+      // TabStrip render below (`.filter((t): t is TabState => t !== undefined)`)
+      // — under `noUncheckedIndexedAccess`, `state.tabs[id]` is `TabState |
+      // undefined`; a stale id in `tabOrder` with no matching `tabs` entry
+      // (unreachable today given how the effect derives its ids, hence
+      // Minor/defensive) must skip that id rather than throw on `.title`.
+      const tabTitles = Object.fromEntries(
+        state.tabOrder
+          .map((id) => state.tabs[id])
+          .filter((t): t is TabState => t !== undefined)
+          .map((t) => [t.tabId, t.title]),
+      );
+      return {
+        composerHeight,
+        tabTitles,
+        nextChatNumber: state.nextChatNumber,
+        // AUDIT-5 UI M-2: same per-write-derived-fresh posture as `tabTitles`
+        // above — a closed tab's stale draft is pruned automatically on the
+        // very next write, no separate cleanup path needed.
+        drafts: buildDraftSnapshot(state),
+      };
+    },
+    [composerHeight, state.tabs, state.tabOrder, state.nextChatNumber],
+    400,
+  );
 
   // §7 B9(c): drain any tabIds `handleSessionChange`'s dedup queued for
   // closing — post `tab.close` for each so the host session doesn't leak
@@ -388,7 +477,12 @@ export function App() {
         request: (method, p) => bridge.request(method, p, rejectTag),
         dispatch: (action) => dispatch({ local: action }),
       },
-      { scopeKey, req: { method: 'panel.data', params: trigger ? { ...params, trigger } : params } },
+      {
+        // exactOptional prep (arm 1): `scopeKey` is `string | undefined`;
+        // the target's `scopeKey?: string` — spread it in only when present.
+        ...(scopeKey !== undefined ? { scopeKey } : {}),
+        req: { method: 'panel.data', params: trigger ? { ...params, trigger } : params },
+      },
     );
   };
   requestPanelRef.current = requestPanel;
@@ -415,7 +509,7 @@ export function App() {
     const params: Record<string, unknown> = { id, rootId: tab.rootId };
     if (force) params.force = true;
     const result = await bridge.request('checkpoint.restore', params, tab.tabId);
-    return result as CheckpointRestoreResult | undefined;
+    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.restore');
   };
 
   // CF-12 review fix (W3-T7): correlated `checkpoint.redo`/`checkpoint.redoAll`
@@ -433,14 +527,14 @@ export function App() {
     const params: Record<string, unknown> = { rootId: tab.rootId };
     if (force) params.force = true;
     const result = await bridge.request('checkpoint.redo', params, tab.tabId);
-    return result as CheckpointRestoreResult | undefined;
+    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.redo');
   };
 
   const redoAllCheckpoint = async (force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
     const params: Record<string, unknown> = { rootId: tab.rootId };
     if (force) params.force = true;
     const result = await bridge.request('checkpoint.redoAll', params, tab.tabId);
-    return result as CheckpointRestoreResult | undefined;
+    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.redoAll');
   };
 
   // A#5: MCP "Reload servers" over the CORRELATED path so the gateway's result
@@ -453,17 +547,18 @@ export function App() {
   // Task A7 (§4.9): the MCP admin RPCs `McpPanel`'s row actions + Add-server
   // form drive. All correlated (`bridge.request`), same F-1 posture as
   // `reloadMcp`/`toggle` above — `mcp` is connection-global, so these are
-  // UNTAGGED. `addMcpServer`/`testMcpServer`/`authMcpServer` cast the
-  // resolved value to its known shape, the same `restoreCheckpoint`/
-  // `redoCheckpoint` idiom above (`bridge.request` itself only promises
-  // `unknown` — the host's real return shape is the wire contract).
+  // UNTAGGED. `addMcpServer`/`testMcpServer`/`authMcpServer` now GUARD the
+  // resolved value onto its known shape via `requireShape` (WS-BG), the same
+  // `restoreCheckpoint`/`redoCheckpoint` idiom above (`bridge.request` itself
+  // only promises `unknown` — the host's real return shape is the wire
+  // contract).
   const addMcpServer = async (params: McpAddParams): Promise<McpAddResult> => {
     const result = await bridge.request('mcp.add', params);
-    return result as McpAddResult;
+    return requireShape(result, isMcpAddResult, 'mcp.add');
   };
   const testMcpServer = async (name: string): Promise<McpTestResult> => {
     const result = await bridge.request('mcp.test', { name });
-    return result as McpTestResult;
+    return requireShape(result, isMcpTestResult, 'mcp.test');
   };
   const removeMcpServer = (name: string) => bridge.request('mcp.remove', { name });
   const setMcpServerEnabled = (name: string, enabled: boolean) =>
@@ -471,15 +566,15 @@ export function App() {
   // Task A8 (§4.8): drives the panel's per-row `Login` button.
   const authMcpServer = async (name: string): Promise<McpTestResult> => {
     const result = await bridge.request('mcp.auth', { name });
-    return result as McpTestResult;
+    return requireShape(result, isMcpTestResult, 'mcp.auth');
   };
   // Task A8 (§4.7): the Catalog disclosure's fetch (read-only, not trust-
   // gated — fired at most once per panel mount, on first expand) and its
-  // `Install` action. Same untagged/cast posture as the other MCP admin RPCs
-  // above — `mcp` is connection-global.
+  // `Install` action. Same untagged/guarded posture as the other MCP admin
+  // RPCs above — `mcp` is connection-global.
   const mcpCatalog = async (): Promise<McpCatalogData> => {
     const result = await bridge.request('mcp.catalog', {});
-    return result as McpCatalogData;
+    return requireShape(result, isMcpCatalogData, 'mcp.catalog');
   };
   const mcpCatalogInstall = async (p: McpCatalogInstallParams): Promise<McpCatalogInstallResult> => {
     // `bridge.request` wants `Record<string, unknown>`; unlike `McpAddParams`
@@ -493,11 +588,11 @@ export function App() {
     // `required_env` vars itself, masked, after the consent modal.
     const wireParams: Record<string, unknown> = { name: p.name };
     const result = await bridge.request('mcp.catalogInstall', wireParams);
-    return result as McpCatalogInstallResult;
+    return requireShape(result, isMcpCatalogInstallResult, 'mcp.catalogInstall');
   };
 
   // Task B6 (§5.6): the T2 skills admin RPCs `SkillsPanel`'s Create/Install-
-  // from-hub disclosures and hub-row Remove button drive. Same untagged/cast
+  // from-hub disclosures and hub-row Remove button drive. Same untagged/guarded
   // posture as the MCP admin RPCs above — `skills` is connection-global
   // (`skills.toggle` above already is untagged), so these are UNTAGGED too.
   // `createSkill` rebuilds `params` as a fresh `Record<string, unknown>`
@@ -511,15 +606,15 @@ export function App() {
   };
   const previewHubSkill = async (identifier: string): Promise<HubPreview> => {
     const result = await bridge.request('skills.hubPreview', { identifier });
-    return result as HubPreview;
+    return requireShape(result, isHubPreview, 'skills.hubPreview');
   };
   const scanHubSkill = async (identifier: string): Promise<HubScan> => {
     const result = await bridge.request('skills.hubScan', { identifier });
-    return result as HubScan;
+    return requireShape(result, isHubScan, 'skills.hubScan');
   };
   const installHubSkill = async (identifier: string): Promise<HubInstallResult> => {
     const result = await bridge.request('skills.hubInstall', { identifier });
-    return result as HubInstallResult;
+    return requireShape(result, isHubInstallResult, 'skills.hubInstall');
   };
   const uninstallHubSkill = (name: string) => bridge.request('skills.hubUninstall', { name });
 
@@ -613,6 +708,15 @@ export function App() {
       .finally(() => setSessionsLoadingMore(false));
   };
 
+  // UX-04b: the real `onLoad` path SessionsPanel calls into — clears any
+  // stale watchdog notice the instant a NEW load starts (TI-1/AU-39's own
+  // "committed load" moment, the same moment `hostActions.loadSession`
+  // dispatches `local.sessionLoad.start`), then delegates to it unchanged.
+  const loadSession = (message: Parameters<typeof hostActions.loadSession>[0]) => {
+    setSessionLoadNotice(undefined);
+    hostActions.loadSession(message);
+  };
+
   // W2 T2e (§2e/§3.1): the `@file`/`@folder` submenu's file source, threaded
   // into the Composer as a plain injected function — same posture as
   // `restoreCheckpoint`/`reloadMcp` above (a narrow, typed wrapper over the
@@ -630,11 +734,23 @@ export function App() {
     // the reducer (the draft used to live in Composer's own useState, which
     // `newSession`'s local handler cleared directly — that state is gone now).
     dispatch({ local: { type: 'local.draft.clear', tabId: tab.tabId } });
+    // UX-04a: mark the pending "Starting a new session…" state FIRST (pure
+    // local fold, mirrors `onCancel`'s `local.stopPending`-before-`cancel`
+    // ordering below) — only `tab.bound`/`tab.error` ever clear it.
+    dispatch({ local: { type: 'local.newSessionPending', tabId: tab.tabId } });
     // W3-T6 (CF-11/D2): rebind ONLY this tab — leaves every sibling tab's
     // live turn untouched (the old `{type:'newSession'}` restarted the WHOLE
     // connection, ending every tab). `tab.sessionId` is a hint only; the
     // host always re-reads this tab's ACTUAL occupant before acting on it.
-    bridge.post({ type: 'tab.newSession', tabId: tab.tabId, sessionId: tab.sessionId });
+    // exactOptional prep (arm 1): `tab.sessionId` is `string | undefined`;
+    // `WebviewToHost`'s `tab.newSession.sessionId?: string` is a WIRE field —
+    // absent-vs-undefined is exactly what this flag protects, so spread the
+    // key in only when present rather than widening the protocol type.
+    bridge.post({
+      type: 'tab.newSession',
+      tabId: tab.tabId,
+      ...(tab.sessionId !== undefined ? { sessionId: tab.sessionId } : {}),
+    });
   };
 
   // Renamed from `selectTab` (W4): this switches a side PANEL, not a
@@ -670,7 +786,12 @@ export function App() {
   const selectTab = (tabId: string) => {
     const target = state.tabs[tabId];
     dispatch({ local: { type: 'local.tab.select', tabId } });
-    bridge.post({ type: 'tab.activate', tabId, sessionId: target?.sessionId });
+    // exactOptional prep (arm 1): wire field, same posture as `tab.newSession` above.
+    bridge.post({
+      type: 'tab.activate',
+      tabId,
+      ...(target?.sessionId !== undefined ? { sessionId: target.sessionId } : {}),
+    });
   };
 
   // Close a chat tab: reject its in-flight RPCs (Deliverable 5 — a per-tab
@@ -681,7 +802,12 @@ export function App() {
     const target = state.tabs[tabId];
     bridge.rejectTab(tabId, 'Tab was closed.');
     dispatch({ local: { type: 'local.tab.close', tabId } });
-    bridge.post({ type: 'tab.close', tabId, sessionId: target?.sessionId });
+    // exactOptional prep (arm 1): wire field, same posture as `tab.newSession` above.
+    bridge.post({
+      type: 'tab.close',
+      tabId,
+      ...(target?.sessionId !== undefined ? { sessionId: target.sessionId } : {}),
+    });
   };
 
   // W2 T4 (F-D): open the read-only, both-virtual editor diff preview for a
@@ -734,6 +860,19 @@ export function App() {
     };
   };
 
+  // exactOptional prep (arm 1): every `RemotePanel`/`SettingsPanel` call below
+  // hands its `refreshError` prop the RESULT of `refreshErrorProp`/
+  // `scopedRefreshErrorProp`, which is `RefreshErrorBanner | undefined` — but
+  // `RemotePanelProps.refreshError` (`panels/PanelShell.tsx`, outside this
+  // batch) and `SettingsPanelProps.refreshError` (`panels/SettingsPanel.tsx`,
+  // also outside this batch) are both `refreshError?: RefreshErrorBanner`.
+  // Takes the ALREADY-COMPUTED value (not the getter) so spreading it never
+  // invokes `refreshErrorProp`/`scopedRefreshErrorProp` a second time — both
+  // mint a fresh object literal per call, so a double-call would hand two
+  // distinct (if structurally equal) object identities into the same render.
+  const withRefreshError = (banner: RefreshErrorBanner | undefined): { refreshError?: RefreshErrorBanner } =>
+    banner !== undefined ? { refreshError: banner } : {};
+
   return (
     <>
       <TabStrip
@@ -762,6 +901,24 @@ export function App() {
       {state.backendKind === 'mock' && <MockNotice onOpenSetup={openSetup} />}
 
       <PriorityTabs active={state.activePanel} onSelect={selectPanel} />
+
+      {/* UX-02 (F2-19 UI face): the STANDING management-link banner — its
+          LiveRegion is permanently mounted (Finding-7); only the visual row
+          is conditional. Sits above the dismissible system.error banner:
+          this is standing state, that one is a one-shot signal. Force
+          reconnect = the wedge-break (T16): rides setup.reconnectAgent
+          {force:true}; a refusal REJECTS out of dispatchSetup with the
+          redacted reason, which the banner surfaces + announces. The 12b
+          confirm gate asks first when ANY tab's turn is live — the webview
+          mirror of the liveness the host's force guard fans out over (force
+          ends EVERY live turn, so any-tab-live is the honest gate, not just
+          the active tab; SessionsPanel's active-tab gate protects one tab,
+          this one protects them all). */}
+      <GatewayHealthBanner
+        health={state.gatewayHealth}
+        anyTurnLive={Object.values(state.tabs).some((t) => t.turnActive)}
+        onForceReconnect={() => dispatchSetup('setup.reconnectAgent', { force: true })}
+      />
 
       {/* Audit G-6 (WCAG 2.2 SC 4.1.2): both dismiss buttons contained only
           an <Icon>, so a screen reader announced "button" and nothing else.
@@ -804,8 +961,16 @@ export function App() {
 
       {/* Audit G-9: the standing route back. The banner above is dismissible;
           this row is not, and it survives the dismissal, so a tab that failed
-          to open can always be retried instead of being silently dead. */}
-      {!tab.error && tab.openFailed === true && tab.binding !== 'bound' && (
+          to open can always be retried instead of being silently dead.
+          WS-UX P2 M1: yields to the "Starting a new session…" row below while
+          a New Session is in flight for THIS tab — a standing Reconnect for a
+          tab already being replaced is a stale affordance, and its pending
+          sibling is the honest surface. Render priority ONLY (same grammar as
+          this row's own `!tab.error` gate): the marker itself stays true in
+          state (host-owned truth — see the `local.newSessionPending` fold),
+          so the flag's terminals (`tab.bound`/`tab.error`) restore this row
+          automatically if the attempt fails. */}
+      {!tab.error && tab.openFailed === true && tab.binding !== 'bound' && tab.newSessionPending !== true && (
         <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
           <Icon name="warning" size={12} className="flex-none text-warn" />
           <span className="min-w-0 flex-1">This chat never connected to the agent.</span>
@@ -823,11 +988,13 @@ export function App() {
           row above — same non-dismissible posture, but a lost session has no
           connection to retry (Reconnect would just fail again), so this
           routes to the real recovery surface instead of offering a fake
-          retry. */}
-      {!tab.error && tab.sessionLost === true && tab.binding !== 'bound' && (
+          retry. WS-UX P2 M1: same yield-to-pending gate as the G-9 row above
+          (render priority only — `sessionLost`/`sessionLostReason` stay
+          untouched in state, so a failed attempt restores this row). */}
+      {!tab.error && tab.sessionLost === true && tab.binding !== 'bound' && tab.newSessionPending !== true && (
         <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
           <Icon name="warning" size={12} className="flex-none text-warn" />
-          <span className="min-w-0 flex-1">This chat's session was lost when the agent restarted.</span>
+          <span className="min-w-0 flex-1">{sessionLostRowCopy(tab.sessionLostReason)}</span>
           <button
             type="button"
             onClick={() => dispatch({ local: { type: 'local.setPanel', panel: 'sessions' } })}
@@ -837,6 +1004,22 @@ export function App() {
           </button>
         </div>
       )}
+
+      {/* UX-04a: honest "Starting a new session…" pending state, mirroring
+          the T10 `stopPending`/GatewayHealthBanner posture — visible row +
+          permanently-mounted sr-only LiveRegion (Finding-7 discipline: the
+          region itself is never conditionally mounted, only its text
+          swaps). `!tab.error` gate matches the two standing rows above: a
+          failed New Session lands as `tab.error` (App's own ErrorBanner
+          takes over), so this row never overlaps that banner. `tab.bound`
+          arrival removes both. */}
+      {tab.newSessionPending === true && !tab.error && (
+        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
+          <Icon name="loading" size={12} spin className="flex-none" />
+          <span className="min-w-0 flex-1">Starting a new session…</span>
+        </div>
+      )}
+      <LiveRegion text={tab.newSessionPending === true ? 'Starting a new session…' : ''} className="sr-only" />
 
       {state.activePanel === 'chat' && (
         <ErrorBoundary region="the chat view">
@@ -876,6 +1059,17 @@ export function App() {
                  pending/unbound tab (no session yet) must grey it out the same
                  way instead of dropping the click silently. */
               starterDisabled={tab.binding !== 'bound'}
+              // UX-07: same live-turn signal Composer's `busy` below is wired
+              // from — gates the "Waiting for the agent…" indicator for the
+              // dead-air window right after the user's echo lands.
+              turnActive={tab.turnActive}
+              // CA-M15: `tab.hiddenCount` is `number | undefined`
+              // (exactOptionalPropertyTypes forbids passing that straight
+              // into an optional-not-undefined `hiddenCount?: number` prop)
+              // — `?? 0` is behaviorally identical since ChatView does
+              // `hiddenCount ?? 0` itself and gates the affordance on
+              // `hidden > 0` (0 and undefined render the same: nothing).
+              hiddenCount={tab.hiddenCount ?? 0}
             />
           </div>
           <Composer
@@ -892,6 +1086,8 @@ export function App() {
             preset={tab.preset}
             modelLabel={modelLabel(state)}
             busy={tab.turnActive}
+            stopping={tab.stopPending}
+            newSessionPending={tab.newSessionPending === true}
             disabled={tab.binding !== 'bound'}
             // ARCH-1 (final review, UI I-3): honest copy for a lost session —
             // "Connecting…" (the default) would be a lie here; nothing is
@@ -907,7 +1103,12 @@ export function App() {
             initialHeight={composerHeight}
             onHeightChange={setComposerHeight}
             onSubmit={hostActions.sendDraft}
-            onCancel={() => bridge.post({ type: 'cancel', sessionId: tab.sessionId ?? UNBOUND_SESSION_PLACEHOLDER })}
+            onCancel={() => {
+              // UX-03: mark the pending stop FIRST (pure local fold), then post
+              // the cancel — turn.end (any status) is the single clearer.
+              dispatch({ local: { type: 'local.stopPending', tabId: tab.tabId } });
+              bridge.post({ type: 'cancel', sessionId: tab.sessionId ?? UNBOUND_SESSION_PLACEHOLDER });
+            }}
             onSetPreset={hostActions.setPreset}
             onPickModel={() => selectPanel('models')}
             onNewSession={newSession}
@@ -945,7 +1146,7 @@ export function App() {
               remote={globalPanels.tools}
               loadingHint="Loading tools…"
               onRetry={() => requestPanel('tools')}
-              refreshError={refreshErrorProp('tools')}
+              {...withRefreshError(refreshErrorProp('tools'))}
             >
               {(data) => (
                 <ToolsPanel
@@ -969,7 +1170,7 @@ export function App() {
               remote={globalPanels.mcp}
               loadingHint="Loading servers…"
               onRetry={() => requestPanel('mcp')}
-              refreshError={refreshErrorProp('mcp')}
+              {...withRefreshError(refreshErrorProp('mcp'))}
             >
               {(data) => (
                 <McpPanel
@@ -1000,7 +1201,7 @@ export function App() {
               remote={globalPanels.skills}
               loadingHint="Loading skills…"
               onRetry={() => requestPanel('skills')}
-              refreshError={refreshErrorProp('skills')}
+              {...withRefreshError(refreshErrorProp('skills'))}
             >
               {(data) => (
                 <SkillsPanel
@@ -1030,7 +1231,7 @@ export function App() {
               remote={checkpointsRemote}
               loadingHint="Loading checkpoints…"
               onRetry={() => requestPanel('checkpoints')}
-              refreshError={scopedRefreshErrorProp('checkpoints')}
+              {...withRefreshError(scopedRefreshErrorProp('checkpoints'))}
             >
               {(data) => (
                 <CheckpointsPanel
@@ -1056,7 +1257,7 @@ export function App() {
               remote={tab.subagents}
               loadingHint="Loading subagents…"
               onRetry={() => requestPanel('subagents')}
-              refreshError={scopedRefreshErrorProp('subagents')}
+              {...withRefreshError(scopedRefreshErrorProp('subagents'))}
             >
               {(data) => <SubagentsPanel data={data} />}
             </RemotePanel>
@@ -1075,7 +1276,7 @@ export function App() {
               remote={state.sessionsPanel}
               loadingHint="Loading sessions…"
               onRetry={() => requestPanel('sessions')}
-              refreshError={scopedRefreshErrorProp('sessions')}
+              {...withRefreshError(scopedRefreshErrorProp('sessions'))}
             >
               {(data) => (
                 <SessionsPanel
@@ -1083,11 +1284,26 @@ export function App() {
                   activeTabId={state.activeTabId}
                   boundSessionIds={boundSessionIds}
                   activeTabHasLiveTurn={tab.turnActive}
-                  onLoad={hostActions.loadSession}
-                  loadingSessionId={state.pendingSessionLoad?.sessionId}
+                  onLoad={loadSession}
+                  /* exactOptional prep (arm 1): `SessionsPanelProps`
+                     (`panels/SessionsPanel.tsx`, outside this batch) declares
+                     both as `?: string` — spread each key in only when present. */
+                  {...(state.pendingSessionLoad?.sessionId !== undefined
+                    ? { loadingSessionId: state.pendingSessionLoad.sessionId }
+                    : {})}
                   onLoadMore={loadMoreSessions}
                   loadingMore={sessionsLoadingMore}
-                  loadMoreError={sessionsLoadMoreError}
+                  {...(sessionsLoadMoreError !== undefined ? { loadMoreError: sessionsLoadMoreError } : {})}
+                  // UX-04b: `loadNotice?: {...} | undefined` — unlike the
+                  // spread-omission props above, this type explicitly
+                  // includes `| undefined`, so assigning it directly (rather
+                  // than omitting the key) type-checks under
+                  // exactOptionalPropertyTypes.
+                  loadNotice={
+                    sessionLoadNotice !== undefined
+                      ? { text: sessionLoadNotice, onDismiss: () => setSessionLoadNotice(undefined) }
+                      : undefined
+                  }
                 />
               )}
             </RemotePanel>
@@ -1106,7 +1322,7 @@ export function App() {
               remote={globalPanels.models}
               loadingHint="Loading models…"
               onRetry={() => requestPanel('models')}
-              refreshError={refreshErrorProp('models')}
+              {...withRefreshError(refreshErrorProp('models'))}
             >
               {(data) => (
                 <ModelsPanel
@@ -1170,7 +1386,7 @@ export function App() {
               config={globalPanels.settings}
               onRetryConfig={() => requestPanel('settings')}
               onSetConfig={setConfig}
-              refreshError={refreshErrorProp('settings')}
+              {...withRefreshError(refreshErrorProp('settings'))}
             />
           </ErrorBoundary>
         </div>

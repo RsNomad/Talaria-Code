@@ -35,9 +35,10 @@
  * every tab - active or not - points `aria-controls` at the same shared id;
  * that id resolves to real content only once its tab becomes active.
  */
-import { useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { BackendKind } from '../protocol';
 import type { TabState } from '../types';
+import { ConfirmStrip } from './ConfirmStrip';
 import { Icon } from './Icon';
 import { Pill } from './Pill';
 import { nextRovingIndex } from './rovingIndex';
@@ -103,6 +104,26 @@ export function TabStrip({
   const canClose = tabs.length > 1;
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
+  /**
+   * UX-10: which tab's × is asking "Close anyway?" — at most one at a time.
+   * A `turnActive` tab must not be closed on a single click (it would
+   * silently cancel the turn still running in it); idle tabs keep the
+   * unchanged immediate-close path below.
+   */
+  const [confirmingCloseId, setConfirmingCloseId] = useState<string | undefined>(undefined);
+
+  /**
+   * Same class as the reset effect on SessionsPanel/CheckpointsPanel
+   * (A11Y-07): if the confirming tab closed by some other path, or its turn
+   * ended while the strip was open, the confirm is stale — clear it rather
+   * than leave a dangling strip pointed at a tab that no longer needs one.
+   */
+  useEffect(() => {
+    if (confirmingCloseId !== undefined && !tabs.some((t) => t.tabId === confirmingCloseId && t.turnActive)) {
+      setConfirmingCloseId(undefined);
+    }
+  }, [tabs, confirmingCloseId]);
+
   // Roving Arrow/Home/End navigation, wrap at the ends (APG tabs). Automatic
   // activation: moving focus also calls `onSelect` — no separate Enter/Space
   // step, since switching a chat tab is instant local state.
@@ -117,77 +138,112 @@ export function TabStrip({
   };
 
   return (
-    <div
-      role="tablist"
-      aria-label="Chat sessions"
-      className="flex flex-none items-center gap-1 overflow-x-auto border-b border-border bg-raised px-2 py-1"
-    >
-      {tabs.map((tab, pos) => {
-        const active = tab.tabId === activeTabId;
-        return (
-          <div
-            key={tab.tabId}
-            className={`group flex flex-none items-center gap-1 rounded px-2 py-1 text-2xs transition-colors ${
-              active ? 'bg-accent-soft text-accent' : 'text-faint hover:bg-overlay hover:text-muted'
-            }`}
-          >
-            <button
-              ref={(el) => {
-                tabRefs.current[pos] = el;
-              }}
-              type="button"
-              id={tabDomId(tab.tabId)}
-              role="tab"
-              aria-selected={active}
-              aria-controls={chatPanelMounted ? CHAT_TABPANEL_ID : undefined}
-              tabIndex={active ? 0 : -1}
-              onClick={() => onSelect(tab.tabId)}
-              onKeyDown={(e) => onTabKey(pos, e)}
-              title={tab.title}
-              className="flex max-w-[9rem] items-center gap-1 truncate"
-            >
-              {tab.binding === 'pending' && (
-                <Icon name="loading" size={10} spin className="flex-none" />
-              )}
-              <span className="truncate">{tab.title}</span>
-            </button>
-            {canClose && (
-              <button
-                type="button"
-                aria-label={`Close ${tab.title}`}
-                title={`Close ${tab.title}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClose(tab.tabId);
-                }}
-                className="flex-none rounded p-0.5 opacity-0 hover:text-del group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100"
-              >
-                <Icon name="close" size={10} />
-              </button>
-            )}
-          </div>
-        );
-      })}
-
-      <button
-        type="button"
-        aria-label="New chat tab"
-        title={atCap ? `Maximum ${maxTabs} tabs open` : 'New chat tab'}
-        disabled={atCap}
-        onClick={onOpen}
-        className="flex-none rounded p-1 text-faint transition-colors hover:bg-overlay hover:text-muted disabled:cursor-not-allowed disabled:opacity-40"
+    <>
+      <div
+        role="tablist"
+        aria-label="Chat sessions"
+        className="flex flex-none items-center gap-1 overflow-x-auto border-b border-border bg-raised px-2 py-1"
       >
-        <Icon name="add" size={12} />
-      </button>
+        {tabs.map((tab, pos) => {
+          const active = tab.tabId === activeTabId;
+          return (
+            <div
+              key={tab.tabId}
+              className={`group flex flex-none items-center gap-1 rounded px-2 py-1 text-2xs transition-colors ${
+                active ? 'bg-accent-soft text-accent' : 'text-faint hover:bg-overlay hover:text-muted'
+              }`}
+            >
+              <button
+                ref={(el) => {
+                  tabRefs.current[pos] = el;
+                }}
+                type="button"
+                id={tabDomId(tab.tabId)}
+                role="tab"
+                aria-selected={active}
+                aria-controls={chatPanelMounted ? CHAT_TABPANEL_ID : undefined}
+                tabIndex={active ? 0 : -1}
+                onClick={() => onSelect(tab.tabId)}
+                onKeyDown={(e) => onTabKey(pos, e)}
+                title={tab.title}
+                className="flex max-w-[9rem] items-center gap-1 truncate"
+              >
+                {tab.binding === 'pending' && (
+                  <Icon name="loading" size={10} spin className="flex-none" />
+                )}
+                <span className="truncate">{tab.title}</span>
+                {/* Task 18 (WCAG 1.1.1): the spinner above is `aria-hidden`
+                 * (Icon's own default) — a bare glyph with no text
+                 * alternative, so a pending tab's accessible name was
+                 * identical to a bound tab's and AT users had no way to
+                 * tell a session was still connecting. This sr-only span
+                 * folds "(connecting…)" into the button's accessible name
+                 * ONLY while binding is 'pending'; bound/unbound tabs are
+                 * textually unchanged. */}
+                {tab.binding === 'pending' && <span className="sr-only">(connecting…)</span>}
+              </button>
+              {canClose && (
+                <button
+                  type="button"
+                  aria-label={`Close ${tab.title}`}
+                  title={`Close ${tab.title}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (tab.turnActive) {
+                      setConfirmingCloseId(tab.tabId);
+                      return;
+                    }
+                    onClose(tab.tabId);
+                  }}
+                  className="flex min-h-6 min-w-6 flex-none items-center justify-center rounded opacity-0 hover:text-del group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100"
+                >
+                  <Icon name="close" size={10} />
+                </button>
+              )}
+            </div>
+          );
+        })}
 
-      {backendKind === 'mock' && (
-        <span
-          className="ml-auto flex-none"
-          title="MockBackend — set talaria.backend to 'acp' and trust this workspace to run the real agent."
+        <button
+          type="button"
+          aria-label="New chat tab"
+          title={atCap ? `Maximum ${maxTabs} tabs open` : 'New chat tab'}
+          disabled={atCap}
+          onClick={onOpen}
+          className="flex-none rounded p-1 text-faint transition-colors hover:bg-overlay hover:text-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
-          <Pill tone="warn">Mock</Pill>
-        </span>
-      )}
-    </div>
+          <Icon name="add" size={12} />
+        </button>
+
+        {backendKind === 'mock' && (
+          <span
+            className="ml-auto flex-none"
+            title="MockBackend — set talaria.backend to 'acp' and trust this workspace to run the real agent."
+          >
+            <Pill tone="warn">Mock</Pill>
+          </span>
+        )}
+      </div>
+      {confirmingCloseId !== undefined &&
+        (() => {
+          const pos = tabs.findIndex((t) => t.tabId === confirmingCloseId);
+          if (pos < 0) return null;
+          const closingTabId = confirmingCloseId;
+          return (
+            <ConfirmStrip
+              className="mx-2 mb-1"
+              ariaLabel="Confirm close tab"
+              message="Closing this tab will cancel the turn still running in it."
+              confirmLabel="Close anyway"
+              onConfirm={() => {
+                setConfirmingCloseId(undefined);
+                onClose(closingTabId);
+              }}
+              onCancel={() => setConfirmingCloseId(undefined)}
+              returnFocus={() => tabRefs.current[pos]?.focus()}
+            />
+          );
+        })()}
+    </>
   );
 }

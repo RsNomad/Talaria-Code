@@ -296,9 +296,28 @@ export interface McpData {
   servers: McpServer[];
 }
 
-/** `mcp.add` params — discriminated on `transport` (§4.2). */
+/**
+ * `mcp.add` params — discriminated on `transport` (§4.2).
+ *
+ * AU-59 (CF-13 parity for the manual add): `secretEnvNames` carries env var
+ * NAMES ONLY — never a value. The host prompts for each value itself, masked
+ * (`ControlDispatcherHostPort.promptSecret`), AFTER the consent modal, stores
+ * it in Hermes' `~/.hermes/.env` under `MCP_<NAME>_<KEY>` (`PUT /api/env`) and
+ * writes only the `${MCP_<NAME>_<KEY>}` reference into config.yaml
+ * (`McpAdminHandler.mcpAdd`). `env` stays the PLAINTEXT map (values land
+ * literally in config.yaml). The two key sets must be disjoint
+ * (`validateMcpAdd`). Absent from the `http` variant — a remote server has no
+ * subprocess env.
+ */
 export type McpAddParams =
-  | { name: string; transport: 'stdio'; command: string; args: string[]; env: Record<string, string> }
+  | {
+      name: string;
+      transport: 'stdio';
+      command: string;
+      args: string[];
+      env: Record<string, string>;
+      secretEnvNames: string[];
+    }
   | { name: string; transport: 'http'; url: string };
 
 /** `transport` is threaded from the VALIDATED McpAddParams discriminant (the request's own
@@ -1203,6 +1222,21 @@ export interface WebviewState {
  * ------------------------------------------------------------------ */
 
 /**
+ * UX-04c: WHY a session-lost happened — a CLOSED machine-readable literal
+ * (never free-form; the human `message` stays the banner's copy, and no
+ * reason ever carries a path). Drives the webview's standing-row
+ * vocabulary; OPTIONAL so an emitter that sends none simply falls back to
+ * the generic copy. `open-failed` deliberately has no reason field — its
+ * standing affordance is already honest for every open-failed path.
+ */
+export type SessionLostReason =
+  | 'superseded'      // another tab loaded this session out from under this one
+  | 'disconnected'    // the agent client vanished mid-load
+  | 'timeout'         // the load hit SESSION_ESTABLISH_DEADLINE_MS with no reply
+  | 'recovery-failed' // post-respawn recovery could not restore it
+  | 'restarted';      // a deliberate restart/new-session fan-out ended it
+
+/**
  * Messages the extension host sends to the webview. Discriminated on `type`.
  */
 export type HostToWebview =
@@ -1445,6 +1479,26 @@ export type HostToWebview =
   | { type: 'system.recovered' }
 
   /**
+   * WS-UX UX-02 (the F2-19 UI face): COMBINED health of the two host↔Hermes
+   * management links — the control plane (`ControlChannel`) and the ACP
+   * connection (`ConnectionSupervisor`) — classified by the shared
+   * respawn-attempt thresholds (`src/host/control/respawnHealth.ts`) and
+   * combined worst-state-wins (`combineGatewayHealth`). CONNECTION-GLOBAL
+   * (no sessionId; there is one gateway per extension, never one per tab).
+   * Edge-triggered: one push per COMBINED-state transition — plus one
+   * unconditional re-sync right after every `hydrate` (and after a backend
+   * swap), because a re-created webview boots back to `{state:'ok'}`.
+   * `attempts` (the live retry counter of the worst port) is present iff
+   * `state !== 'ok'`. Deliberately NOT `system.error`: that message's T5
+   * contract above reserves it for one-shot connection signals retired by
+   * the next successful establish — this is a STANDING degraded state with
+   * its own retirement (`state:'ok'`). The literals mirror
+   * `RespawnHealthState` structurally; this dependency-free module must not
+   * import host code (same posture as `BackendKind`'s note, :150-165).
+   */
+  | { type: 'gateway.health'; state: 'ok' | 'degraded' | 'down'; attempts?: number }
+
+  /**
    * The editor color theme changed.
    * Origin: host-side `window.onDidChangeActiveColorTheme`.
    */
@@ -1554,8 +1608,15 @@ export type HostToWebview =
    * webview offers a retry affordance on the still-unbound tab.
    * `open-failed` = the initial bind never succeeded; `session-lost` = a
    * previously-bound tab's session died and could not be restored.
+   *
+   * UX-04c: `reason` is session-lost-only, OPTIONAL, and a CLOSED literal
+   * ({@link SessionLostReason}) — `open-failed` deliberately never carries
+   * one (scope pin: its standing row is already honest for every
+   * open-failed path; duplicating a reason vocabulary there is not needed).
+   * Omitted ⇒ the webview's standing row falls back to its legacy sentence
+   * (additive, back-compatible with any pre-UX-04c emitter).
    */
-  | { type: 'tab.error'; tabId: string; message: string; kind: 'open-failed' | 'session-lost' }
+  | { type: 'tab.error'; tabId: string; message: string; kind: 'open-failed' | 'session-lost'; reason?: SessionLostReason }
 
   /**
    * W3-T6 (CF-11/D2 3-lens review fix, IMP-2): tabId-scoped transcript clear
@@ -1992,6 +2053,25 @@ export const SETUP_METHODS = [
   'setup.setRag',
   'setup.setTunable',
 ] as const;
+
+/**
+ * WS-SU F2-20: `setup.cancel`'s result. `cancelled` is TRUE only when an
+ * in-flight `(op,id)` latch actually existed and abort() was delivered to it
+ * by THIS call — idempotently: a repeat cancel landing while the already-
+ * aborted op is still winding down (latch not yet released by its handler's
+ * finally) also reports true, because the matched op is genuinely still
+ * live; `{ok:true, cancelled:false}` = nothing matched (the
+ * op had already finished, or never started). `matched` — present ONLY when
+ * `cancelled` is true — echoes the CANONICAL latch id that was aborted (a
+ * catalog id / backendId: a bounded catalog-derived value the webview
+ * already renders, never a path or host state). Additive: the transport
+ * envelope stays `ok:true`, so an older webview renders exactly as before.
+ */
+export interface SetupCancelResult {
+  ok: true;
+  cancelled: boolean;
+  matched?: string;
+}
 
 /** A Setup-panel control-request method. Derived from {@link SETUP_METHODS}. */
 export type SetupMethod = (typeof SETUP_METHODS)[number];

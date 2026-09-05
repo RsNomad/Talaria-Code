@@ -25,14 +25,14 @@
  * `AcpBackend.test.ts`'s `makeTmpWs`/`makeEditReq` pattern for the same
  * canonicalization seam).
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as path from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import * as os from 'node:os';
 import { SessionController } from './SessionController';
 import type { SessionHostPort } from './types';
 import type { RootCoordinatorLike } from '../../checkpoints/RootCoordinator';
-import { buildCancelledOutcome } from '../acp/permission';
+import { buildCancelledOutcome, buildSelectedOutcome } from '../acp/permission';
 import type { AcpRequestPermissionRequest, AcpOutboundContentBlock } from '../acp/types';
 import type { AcpClientLike, AcpListSessionsRawResult, AcpLoadSessionResult } from '../acp/acpClient';
 import type { Attachment, HostToWebviewMessage } from '../../../shared/protocol';
@@ -83,7 +83,6 @@ function makePort(ws: string): { port: SessionHostPort; emitted: unknown[]; logs
     workspaceRoots: () => [ws],
     logger: { append: (l) => logs.push(l) },
     refreshCheckpointsPanel: () => {},
-    editPreviewRegistry: undefined,
     resolveMentions: async () => [],
   };
   return { port, emitted, logs };
@@ -200,7 +199,6 @@ describe('SessionController.setModel — ARCH-1 (final review, UI I-1): terminal
       root: makeRoot(),
       workspaceRoots: () => [],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted };
@@ -319,7 +317,7 @@ describe('SessionController.setModel — ARCH-1 (final review, UI I-1): terminal
    *
    * `dispose()` case: the controller must stay as silent as every other
    * BF-B liveness guard in this file (`reportUndeliveredUtterance`,
-   * `emitApprovalCard`, the `loadReplay` continuation, `dispose()` itself) —
+   * `emitApprovalCard`, the `loadReplayOutcome` continuation, `dispose()` itself) —
    * `SessionRegistry.open`'s same-sessionId replace (W6-FB) can already have
    * minted a FRESH controller sharing this `port` by the time this resolve
    * lands, so an emit here would risk clobbering the NEW controller's
@@ -416,7 +414,6 @@ describe('SessionController.setModel — ARCH-1 (final review, UI I-1): terminal
       root: makeRoot(),
       workspaceRoots: () => [],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controller = new SessionController('session-1', '/tmp/ws', port);
@@ -534,16 +531,20 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
       workspaceRoots: () => ['/tmp/ws-a0'],
       logger: { append: (l) => logs.push(l) },
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted, logs };
   }
 
   it('V-4 RED: cancel() settles a pending approval — the promise resolves cancelled AND approval.settle{outcome:"cancelled"} is emitted', async () => {
-    const client = makeApprovalClient({ cancel: async () => undefined });
+    const client = makeApprovalClient({
+      cancel: async () => undefined,
+      prompt: () => new Promise<never>(() => {}),
+    });
     const { port, emitted } = makeSettlePort(client);
     const controller = new SessionController('session-1', '/tmp/ws-a0', port);
+    controller.sendPrompt('run it', 'default');
+    await flushMicrotasks(); // turn-1 live, prompt hanging
 
     const pending = controller.handlePermission(makeCommandReq('npm test'), 'appr-1');
     await flushMicrotasks();
@@ -559,7 +560,7 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
     expect(emitted).toContainEqual({
       type: 'approval.settle',
       sessionId: 'session-1',
-      turnId: 'turn',
+      turnId: 'turn-1',
       id: 'appr-1',
       toolId: 'cmd-1',
       outcome: 'cancelled',
@@ -571,9 +572,11 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
     async () => {
       vi.useFakeTimers();
       try {
-        const client = makeApprovalClient();
+        const client = makeApprovalClient({ prompt: () => new Promise<never>(() => {}) });
         const { port, emitted, logs } = makeSettlePort(client);
         const controller = new SessionController('session-1', '/tmp/ws-a0', port);
+        controller.sendPrompt('run it', 'default');
+        await flushMicrotasks(); // turn-1 live, prompt hanging
 
         const pending = controller.handlePermission(makeCommandReq('npm test', 'cmd-v6'), 'appr-v6');
         await flushMicrotasks();
@@ -587,7 +590,7 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
         expect(emitted).toContainEqual({
           type: 'approval.settle',
           sessionId: 'session-1',
-          turnId: 'turn',
+          turnId: 'turn-1',
           id: 'appr-v6',
           toolId: 'cmd-v6',
           outcome: 'expired',
@@ -641,9 +644,11 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
   });
 
   it('Echo RED: respondApproval emits approval.settle{outcome:"selected", optionId}', async () => {
-    const client = makeApprovalClient();
+    const client = makeApprovalClient({ prompt: () => new Promise<never>(() => {}) });
     const { port, emitted } = makeSettlePort(client);
     const controller = new SessionController('session-1', '/tmp/ws-a0', port);
+    controller.sendPrompt('run it', 'default');
+    await flushMicrotasks(); // turn-1 live, prompt hanging
 
     const pending = controller.handlePermission(makeCommandReq('npm test', 'cmd-echo'), 'appr-echo');
     await flushMicrotasks();
@@ -657,7 +662,7 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
     expect(emitted).toContainEqual({
       type: 'approval.settle',
       sessionId: 'session-1',
-      turnId: 'turn',
+      turnId: 'turn-1',
       id: 'appr-echo',
       toolId: 'cmd-echo',
       outcome: 'selected',
@@ -670,9 +675,11 @@ describe('SessionController — T-A0: host settle spine + approval.settle wire m
     async () => {
       vi.useFakeTimers();
       try {
-        const client = makeApprovalClient();
+        const client = makeApprovalClient({ prompt: () => new Promise<never>(() => {}) });
         const { port, emitted } = makeSettlePort(client);
         const controller = new SessionController('session-1', '/tmp/ws-a0', port);
+        controller.sendPrompt('run it', 'default');
+        await flushMicrotasks(); // turn-1 live, prompt hanging
 
         const pending = controller.handlePermission(makeCommandReq('npm test', 'cmd-hyg'), 'appr-hyg');
         await flushMicrotasks();
@@ -735,7 +742,6 @@ describe('SessionController.sendPrompt — ARCH-1 (final review, UI I-4): result
       root: makeRoot(),
       workspaceRoots: () => ['/tmp/ws'],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted };
@@ -891,7 +897,6 @@ describe('SessionController.sendPrompt — V-18 STEER-QUEUE: mid-turn control ut
       root: makeRoot(),
       workspaceRoots: () => ['/tmp/ws-v18'],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted };
@@ -1066,7 +1071,6 @@ describe('SessionController.sendPrompt — V-18 STEER-QUEUE: mid-turn control ut
       root: sharedRoot,
       workspaceRoots: () => ['/tmp/ws-v18-shared'],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controllerA = new SessionController('session-A', '/tmp/ws-v18-shared', portA);
@@ -1083,7 +1087,6 @@ describe('SessionController.sendPrompt — V-18 STEER-QUEUE: mid-turn control ut
       root: sharedRoot,
       workspaceRoots: () => ['/tmp/ws-v18-shared'],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controllerB = new SessionController('session-B', '/tmp/ws-v18-shared', portB);
@@ -1233,7 +1236,6 @@ describe('SessionController.sendPrompt — V-19: attachment path confinement', (
       root: makeRoot(),
       workspaceRoots: () => [ws],
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     return { port, emitted };
@@ -1293,23 +1295,29 @@ describe('SessionController.sendPrompt — V-19: attachment path confinement', (
 });
 
 /**
- * I-2 (W1-T3 review, Important fix): `loadReplay`'s LAST supersede guard
- * (`this.replay !== replay`) sits right before `this.replay = undefined`
- * (~:1142-1144) — but `await this.pinWireModeDefault(...)` (~:1154) is a
- * SEPARATE suspension point AFTER that guard, with no recheck once it
- * resolves. If a second, superseding `loadReplay` call (B) starts while the
- * first (A) is parked on that pin await — and B is itself still in flight
- * (parked on its OWN `client.loadSession` await, so `this.replay` still
- * points at B's fresh `ReplayTranslator`) — A resuming after the pin would,
- * pre-fix, call `markSubagentsInterrupted()` against B's already-reset fold
- * and emit a STALE `turn.end{complete}` for A's own superseded turn on top
- * of B's still-live replay. Fixed: recheck `this.replay !== undefined`
- * right after the pin await, before touching subagents or emitting
- * `turn.end` — A's own reset at ~:1144 left `this.replay` `undefined`; a
- * non-undefined value at this point can only mean a superseding call
- * claimed it in the meantime.
+ * I-2 (W1-T3 review, Important fix): `loadReplayOutcome`'s LAST supersede
+ * guard (`this.replay !== replay`) sits right before `this.replay =
+ * undefined` (~:1142-1144) — but `await this.pinWireModeDefault(...)`
+ * (~:1154) is a SEPARATE suspension point AFTER that guard, with no recheck
+ * once it resolves. If a second, superseding `loadReplayOutcome` call (B)
+ * starts while the first (A) is parked on that pin await — and B is itself
+ * still in flight (parked on its OWN `client.loadSession` await, so
+ * `this.replay` still points at B's fresh `ReplayTranslator`) — A resuming
+ * after the pin would, pre-fix, call `markSubagentsInterrupted()` against
+ * B's already-reset fold and emit a STALE `turn.end{complete}` for A's own
+ * superseded turn on top of B's still-live replay. Fixed: recheck
+ * `this.replay !== undefined` right after the pin await, before touching
+ * subagents or emitting `turn.end` — A's own reset at ~:1144 left
+ * `this.replay` `undefined`; a non-undefined value at this point can only
+ * mean a superseding call claimed it in the meantime.
+ *
+ * WS-R4 step 5: both tests below drive `loadReplayOutcome` directly (the
+ * `loadReplay` adapter these were originally written against is deleted) —
+ * their `resultA`/`resultB` assertions now check the union `kind` instead of
+ * the adapter's collapsed `AcpLoadSessionResult | undefined`; the underlying
+ * race being characterized is unchanged.
  */
-describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck AFTER the pinWireModeDefault await', () => {
+describe('SessionController.loadReplayOutcome — I-2 (W1-T3 review): supersede recheck AFTER the pinWireModeDefault await', () => {
   /** Same tiny deferred-promise helper `AcpBackend.test.ts` uses. */
   function deferred<T>() {
     let resolve!: (value: T) => void;
@@ -1320,8 +1328,9 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
   }
 
   // I-2 re-review (W1-T3 fix2): this first test exercises the SYNTHETIC
-  // same-instance variant — a second `loadReplay` re-claiming `this.replay`
-  // on the SAME controller — which the recheck's `this.replay !== undefined`
+  // same-instance variant — a second `loadReplayOutcome` call re-claiming
+  // `this.replay` on the SAME controller — which the recheck's
+  // `this.replay !== undefined`
   // half does cover, but which production never actually does. The test
   // below it ('A DISPOSED while parked...') exercises the REAL production
   // supersede: `SessionRegistry.open` minting a FRESH controller and
@@ -1378,13 +1387,12 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
       workspaceRoots: () => [],
       logger: { append: () => {} },
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controller = new SessionController('bootstrap', '/ws', port);
 
     // A starts and parks on `client.loadSession`.
-    const replayA = controller.loadReplay('/ws', 'session-A', '/ws', []);
+    const replayA = controller.loadReplayOutcome('/ws', 'session-A', '/ws', []);
 
     // A's load resolves with a drift, so A proceeds into the pin — which
     // itself parks on `setSessionModeA`. Flush generously: since
@@ -1393,29 +1401,32 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
     loadSessionA.resolve({ found: true, currentModeId: 'accept_edits' });
     for (let i = 0; i < 10; i++) await Promise.resolve();
 
-    // B supersedes A on the SAME controller — a second, later `loadReplay`
-    // call — and parks on ITS OWN `client.loadSession` (never reaches the
-    // pin in this test). `this.replay` now points at B's fresh
-    // ReplayTranslator.
-    const replayB = controller.loadReplay('/ws', 'session-B', '/ws', []);
+    // B supersedes A on the SAME controller — a second, later
+    // `loadReplayOutcome` call — and parks on ITS OWN `client.loadSession`
+    // (never reaches the pin in this test). `this.replay` now points at B's
+    // fresh ReplayTranslator.
+    const replayB = controller.loadReplayOutcome('/ws', 'session-B', '/ws', []);
     await Promise.resolve();
 
     emitted.length = 0; // isolate: only what happens from here on is under test
 
-    // Let A's pin settle — A resumes INSIDE loadReplay, past the pin await,
-    // with B still fully in flight.
+    // Let A's pin settle — A resumes INSIDE loadReplayOutcome, past the pin
+    // await, with B still fully in flight.
     setSessionModeA.resolve(undefined);
     const resultA = await replayA;
 
     // The fix: A emits NOTHING past the pin boundary once superseded — no
-    // stale turn.end, no commands.available, nothing.
+    // stale turn.end, no commands.available, nothing. WS-R4 step 5: this is
+    // the post-pin supersede arm — bare `{kind:'superseded'}`, no `result`
+    // key (exactOptional absent-key discipline).
     expect(emitted).toEqual([]);
-    expect(resultA).toBeUndefined();
+    expect(resultA).toEqual({ kind: 'superseded' });
+    expect('result' in resultA).toBe(false);
 
     // B is unaffected and still completes honestly with its own turn.end.
     loadSessionB.resolve({ found: true, currentModeId: 'default' });
     const resultB = await replayB;
-    expect(resultB).toEqual({ found: true, currentModeId: 'default' });
+    expect(resultB).toEqual({ kind: 'loaded', result: { found: true, currentModeId: 'default' } });
     expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'complete' }));
   });
 
@@ -1483,13 +1494,12 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
       workspaceRoots: () => [],
       logger: { append: () => {} },
       refreshCheckpointsPanel: () => {},
-      editPreviewRegistry: undefined,
       resolveMentions: async () => [],
     };
     const controller = new SessionController('bootstrap', '/ws', port);
 
     // A starts and parks on `client.loadSession`.
-    const replayA = controller.loadReplay('/ws', 'session-A', '/ws', []);
+    const replayA = controller.loadReplayOutcome('/ws', 'session-A', '/ws', []);
 
     // A's load resolves with a drift, so A proceeds into the pin — which
     // itself parks on `setSessionModeA`. Flush generously: since
@@ -1500,21 +1510,1007 @@ describe('SessionController.loadReplay — I-2 (W1-T3 review): supersede recheck
 
     // The REAL production supersede: a fresh controller is minted for this
     // sessionId (`SessionRegistry.open`) and THIS controller is disposed —
-    // never a second `loadReplay` call on the same instance. No live turn
-    // is registered here, so `dispose()` takes its no-op branch for the
+    // never a second `loadReplayOutcome` call on the same instance. No live
+    // turn is registered here, so `dispose()` takes its no-op branch for the
     // cancel/turn-lease bookkeeping; what matters is `this.replay =
     // undefined` and `this.disposed = true`.
     emitted.length = 0; // isolate: only what happens from here on is under test
     controller.dispose();
 
-    // Let A's pin settle — A resumes INSIDE loadReplay, past the pin await,
-    // on a controller that is now disposed.
+    // Let A's pin settle — A resumes INSIDE loadReplayOutcome, past the pin
+    // await, on a controller that is now disposed.
     setSessionModeA.resolve(undefined);
     const resultA = await replayA;
 
     // The fix: A emits NOTHING past the pin boundary once disposed — no
-    // stale turn.end, no commands.available, nothing.
+    // stale turn.end, no commands.available, nothing. WS-R4 step 5: bare
+    // `{kind:'superseded'}` via the `|| this.disposed` half of the recheck.
     expect(emitted).toEqual([]);
-    expect(resultA).toBeUndefined();
+    expect(resultA).toEqual({ kind: 'superseded' });
+    expect('result' in resultA).toBe(false);
+  });
+});
+
+describe('WS-R1 F3-4 — cancel fallback deadline force-ends an unresponsive turn', () => {
+  function deferredPrompt(): {
+    promise: Promise<{ stopReason: string }>;
+    resolve: (v: { stopReason: string }) => void;
+  } {
+    let resolve!: (v: { stopReason: string }) => void;
+    const promise = new Promise<{ stopReason: string }>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  function makeCancelHarness(): {
+    controller: SessionController;
+    emitted: HostToWebviewMessage[];
+    releaseCalls: number[];
+    prompt: ReturnType<typeof deferredPrompt>;
+    cancelCalls: string[];
+  } {
+    const emitted: HostToWebviewMessage[] = [];
+    const releaseCalls: number[] = [];
+    const cancelCalls: string[] = [];
+    const prompt = deferredPrompt();
+    const client = {
+      cancel: async (sessionId: string) => {
+        cancelCalls.push(sessionId);
+      },
+      prompt: () => prompt.promise,
+    } as unknown as AcpClientLike;
+    const root: RootCoordinatorLike = {
+      rootId: 'root-1',
+      tracker: undefined,
+      tryAcquireTurnLease: () => true,
+      releaseTurnLease: () => {
+        releaseCalls.push(Date.now());
+      },
+      anyLiveTurn: () => false,
+      nextTurnOrdinal: () => 1,
+      nextBaselineOrdinal: () => -1,
+      refreshCheckpointsPanel: () => {},
+    };
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root,
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', '/fake/ws', port);
+    return { controller, emitted, releaseCalls, prompt, cancelCalls };
+  }
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('no turn end within 15s of cancel() → local force-end: turn.end{cancelled}, lease released, notice emitted, turnId recorded', async () => {
+    const { controller, emitted, releaseCalls, cancelCalls } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0); // flush to the hanging client.prompt
+    controller.cancel();
+    expect(cancelCalls).toEqual(['session-1']);
+    await vi.advanceTimersByTimeAsync(15_000);
+    // M1 (code-lens review): exactly ONE turn.end on the pure force-end path
+    // (not merely "at least one") — a double-emit regression on this path is
+    // otherwise only caught on the harder belated-settlement test (below).
+    expect(emitted.filter((m) => m.type === 'turn.end' && m.turnId === 'turn-1')).toHaveLength(1);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'cancelled' }),
+    );
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'error', turnId: 'turn-1', message: expect.stringContaining('force-stopped') }),
+    );
+    expect(releaseCalls).toHaveLength(1);
+    expect(controller.hasLiveTurn()).toBe(false);
+    expect(controller.wasForceEnded('turn-1')).toBe(true);
+  });
+
+  it('belated genuine prompt settlement after a force-end is dropped: exactly ONE turn.end, NO result.summary', async () => {
+    const { controller, emitted, prompt } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel();
+    await vi.advanceTimersByTimeAsync(15_000); // force-end fires
+    prompt.resolve({ stopReason: 'cancelled' }); // the belated genuine settlement
+    await vi.advanceTimersByTimeAsync(0);
+    expect(emitted.filter((m) => m.type === 'turn.end' && m.turnId === 'turn-1')).toHaveLength(1);
+    expect(emitted.filter((m) => m.type === 'result.summary')).toHaveLength(0);
+  });
+
+  it('a genuine turn end BEFORE the deadline clears the timer — no force-end, no notice', async () => {
+    const { controller, emitted, prompt } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel();
+    prompt.resolve({ stopReason: 'cancelled' });
+    await vi.advanceTimersByTimeAsync(0); // genuine turn.end lands
+    await vi.advanceTimersByTimeAsync(15_000); // deadline horizon passes
+    expect(emitted.filter((m) => m.type === 'turn.end' && m.turnId === 'turn-1')).toHaveLength(1);
+    expect(emitted.filter((m) => m.type === 'error' && typeof m.message === 'string' && m.message.includes('force-stopped'))).toHaveLength(0);
+    expect(controller.wasForceEnded('turn-1')).toBe(false);
+  });
+
+  // M2 (code-lens review): the test above's "no force-end, no notice" outcome
+  // is ALSO satisfiable by forceEndCancelledTurn's own independent
+  // `liveTurnId !== turnId` guard — it would still pass even if emitTurnEnd
+  // stopped calling clearCancelFallback(). This test isolates the clear
+  // itself: checking vi.getTimerCount() right after the genuine end (with no
+  // deadline advance in between) proves the timer handle is actually gone,
+  // not merely neutralized by the other guard.
+  it('a genuine turn.end before the deadline actually clears the cancel-fallback timer handle', async () => {
+    const { controller, prompt } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel();
+    expect(vi.getTimerCount()).toBe(1); // fallback armed
+    prompt.resolve({ stopReason: 'cancelled' });
+    await vi.advanceTimersByTimeAsync(0); // genuine turn.end lands via emitTurnEnd
+    expect(vi.getTimerCount()).toBe(0); // the handle itself is cleared, not just guarded
+  });
+
+  it('cancel() with no live prompt turn arms NO fallback timer', async () => {
+    const { controller } = makeCancelHarness();
+    const before = vi.getTimerCount();
+    controller.cancel(); // nothing live
+    expect(vi.getTimerCount()).toBe(before);
+  });
+
+  // Task 8 follow-up (concurrency-lens review Minor 1 / code-lens review M3):
+  // endOnCrash/endForRestart clear the turn bookkeeping but, pre-fix, did NOT
+  // clear an armed cancelFallbackTimer — stranding the handle. Harmless when
+  // IT fires (forceEndCancelledTurn's own currentTurnId/liveTurnId guard
+  // no-ops), but armCancelFallback's `cancelFallbackTimer !== undefined`
+  // early-return means a stranded handle surviving onto a reused controller
+  // would silently suppress the NEXT turn's fallback. vi.getTimerCount()
+  // right after the crash/restart call is the discriminator: pre-fix it
+  // stays elevated (the handle is still queued); post-fix it drops to 0.
+  it('endOnCrash clears an armed cancel-fallback timer (defensive symmetry with dispose)', async () => {
+    const { controller, emitted } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel(); // arms the fallback
+    expect(vi.getTimerCount()).toBe(1);
+    controller.endOnCrash();
+    expect(vi.getTimerCount()).toBe(0); // RED pre-fix: stays 1, the handle is stranded
+    await vi.advanceTimersByTimeAsync(15_000); // deadline horizon passes
+    expect(
+      emitted.filter(
+        (m) => m.type === 'error' && typeof m.message === 'string' && m.message.includes('force-stopped'),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it('endForRestart clears an armed cancel-fallback timer (defensive symmetry with dispose)', async () => {
+    const { controller, emitted } = makeCancelHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.advanceTimersByTimeAsync(0);
+    controller.cancel(); // arms the fallback
+    expect(vi.getTimerCount()).toBe(1);
+    controller.endForRestart();
+    expect(vi.getTimerCount()).toBe(0); // RED pre-fix: stays 1, the handle is stranded
+    await vi.advanceTimersByTimeAsync(15_000); // deadline horizon passes
+    expect(
+      emitted.filter(
+        (m) => m.type === 'error' && typeof m.message === 'string' && m.message.includes('force-stopped'),
+      ),
+    ).toHaveLength(0);
+  });
+});
+
+/**
+ * WS-R4 step 1 (REMEDIATION-ARCHITECTURE §3.4): characterization pins for
+ * ALL SIX caller-visible outcomes `SessionController.loadReplayOutcome` can
+ * produce. Originally written (Task 19) against the pre-union
+ * `AcpLoadSessionResult | undefined` sentinel return, driven through the
+ * `loadReplay` adapter Task 20 laid over the new union (Task 21-22 migrated
+ * both production callers off that adapter onto the union directly). WS-R4
+ * step 5 (Task 23) deletes the now-unused `loadReplay` adapter and flips
+ * these SAME six arms to drive `loadReplayOutcome` directly, asserting its
+ * `LoadReplayOutcome` union `kind` (+ payload) instead of the adapter's
+ * collapsed return. These are NOT new-behavior tests — every pin here
+ * characterizes the SAME underlying six-arm behavior before and after the
+ * flip; if one fails, the test mischaracterized reality and must be fixed,
+ * never the production code (characterization-TDD, not red/green TDD).
+ *
+ * The reusable harness (`makeLoadHarness` + `FakeLoadClient`) is deliberately
+ * factored out here for reuse — same fake client, same port shape, so the
+ * six arms below stay the behavior-preservation contract across the
+ * adapter's whole migration-then-deletion arc.
+ *
+ * The decisive pin is the "success-but-superseded" arm (current source
+ * `:1301`, `if (this.replay !== replay) return { kind: 'superseded', result
+ * };`): unlike every other supersede arm in this method (which returns a
+ * BARE `{ kind: 'superseded' }`, no `result` key), THIS one carries a
+ * TRUTHY, well-formed `AcpLoadSessionResult` on the union while a
+ * superseding load has already claimed `this.replay` — and both of
+ * `loadReplayOutcome`'s production callers (`AcpBackend
+ * .loadSessionIntoTabInternal`, `ConnectionSupervisor.recoverOneSession`)
+ * treat this arm's `result` as SUCCESS, never touching the tab. A naive
+ * union consumer that maps every `superseded` kind generically (ignoring the
+ * `result` payload) would flip this arm's caller-visible outcome from
+ * silent-success to `tab.error{session-lost}` + a guarded close — a real
+ * regression that would still pass `tsc` and every OTHER existing test.
+ * Pinning the truthy `toEqual({ kind: 'superseded', result: {...} })` here
+ * (not just `toMatchObject({ kind: 'superseded' })`) is what makes that
+ * regression fail loudly.
+ */
+class FakeLoadClient {
+  loadSessionCalls: Array<{ cwd: string; sessionId: string }> = [];
+  private loadDeferreds: Array<{
+    resolve: (r: AcpLoadSessionResult) => void;
+    reject: (e: unknown) => void;
+  }> = [];
+  setSessionModeCalls: Array<{ sessionId: string; modeId: string }> = [];
+  private modeDeferreds: Array<{ resolve: () => void }> = [];
+
+  loadSession(cwd: string, sessionId: string): Promise<AcpLoadSessionResult> {
+    this.loadSessionCalls.push({ cwd, sessionId });
+    return new Promise<AcpLoadSessionResult>((resolve, reject) => {
+      this.loadDeferreds.push({ resolve, reject });
+    });
+  }
+  resolveLoad(index: number, result: AcpLoadSessionResult): void {
+    this.loadDeferreds[index]?.resolve(result);
+  }
+  rejectLoad(index: number, err: unknown): void {
+    this.loadDeferreds[index]?.reject(err);
+  }
+  setSessionMode(sessionId: string, modeId: string): Promise<void> {
+    this.setSessionModeCalls.push({ sessionId, modeId });
+    return new Promise<void>((resolve) => {
+      this.modeDeferreds.push({ resolve: () => resolve() });
+    });
+  }
+  resolveMode(index: number): void {
+    this.modeDeferreds[index]?.resolve();
+  }
+  async cancel(): Promise<void> {}
+}
+
+function makeLoadHarness(): {
+  controller: SessionController;
+  client: FakeLoadClient;
+  emitted: HostToWebviewMessage[];
+} {
+  const emitted: HostToWebviewMessage[] = [];
+  const client = new FakeLoadClient();
+  const port: SessionHostPort = {
+    getClient: () => client as unknown as AcpClientLike,
+    emit: (msg) => emitted.push(msg),
+    emitSystemError: () => {},
+    root: makeRoot(),
+    workspaceRoots: () => ['/fake/ws'],
+    logger: { append: () => {} },
+    refreshCheckpointsPanel: () => {},
+    resolveMentions: async () => [],
+  };
+  return { controller: new SessionController('session-1', '/fake/ws', port), client, emitted };
+}
+
+describe('WS-R4 characterization — the SIX loadReplayOutcome arms (REMEDIATION-ARCHITECTURE §3.4)', () => {
+  it('ARM loaded (happy path): clear + turn.start stream, turn.end{complete}, returns {kind:"loaded", result}', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    client.resolveLoad(0, { found: true, currentModeId: 'default' });
+    const outcome = await load;
+    expect(outcome).toEqual({ kind: 'loaded', result: { found: true, currentModeId: 'default' } });
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'clear', sessionId: 'session-1' }));
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.start', turnId: 'turn-1' }));
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'complete' }),
+    );
+  });
+
+  it('ARM no-client: resolves {kind:"no-client"} with ZERO emissions (the silent arm)', async () => {
+    const { controller, emitted } = makeLoadHarness();
+    // A port whose getClient answers undefined:
+    const noClient = new SessionController('session-1', '/fake/ws', {
+      getClient: () => undefined,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    });
+    void controller; // the harness controller is unused in this arm
+    await expect(noClient.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', [])).resolves.toEqual({
+      kind: 'no-client',
+    });
+    expect(emitted).toHaveLength(0);
+  });
+
+  it('ARM load-failed: error{message} + turn.end{error}, resolves {kind:"load-failed", message}', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    client.rejectLoad(0, new Error('load boom'));
+    await expect(load).resolves.toEqual({ kind: 'load-failed', message: 'load boom' });
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'error', message: 'load boom' }));
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'error' }));
+  });
+
+  it('ARM not-found: the pinned message + turn.end{error}, resolves {kind:"not-found"}', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    client.resolveLoad(0, { found: false });
+    await expect(load).resolves.toEqual({ kind: 'not-found' });
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: 'error',
+        message: 'That conversation no longer exists on the agent. Start a new chat.',
+      }),
+    );
+    expect(emitted).toContainEqual(expect.objectContaining({ type: 'turn.end', status: 'error' }));
+  });
+
+  it('ARM superseded-mid-await (empty): a superseded load resolves bare {kind:"superseded"} SILENTLY, no result key (no error, no turn.end from the loser)', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const loser = controller.loadReplayOutcome('/fake/ws', 'session-A', '/fake/ws', []);
+    void controller.loadReplayOutcome('/fake/ws', 'session-B', '/fake/ws', []); // supersedes on the SAME instance (T1a reuse)
+    const emissionsBefore = emitted.length;
+    client.resolveLoad(0, { found: false }); // the LOSER's response
+    const outcome = await loser;
+    expect(outcome).toEqual({ kind: 'superseded' });
+    expect('result' in outcome).toBe(false); // exactOptional absent-key discipline
+    expect(emitted).toHaveLength(emissionsBefore); // strict silence
+  });
+
+  it("ARM :1301 success-but-superseded — NAMED OBSERVABLE (union): {kind:'superseded'} CARRIES the result (callers treat as SUCCESS), zero further emissions from the loser's tail", async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const loser = controller.loadReplayOutcome('/fake/ws', 'session-A', '/fake/ws', []);
+    void controller.loadReplayOutcome('/fake/ws', 'session-B', '/fake/ws', []);
+    const emissionsBefore = emitted.length;
+    client.resolveLoad(0, { found: true, currentModeId: 'default' }); // the loser SUCCEEDED
+    await expect(loser).resolves.toEqual({
+      kind: 'superseded',
+      result: { found: true, currentModeId: 'default' },
+    });
+    expect(emitted).toHaveLength(emissionsBefore); // silent success
+  });
+
+  it('ARM superseded-post-pin (:1330): dispose mid-pinWireModeDefault → bare {kind:"superseded"} return, no result key, NO closing turn.end', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    client.resolveLoad(0, { found: true, currentModeId: 'weird-mode' }); // non-default → pin awaits setSessionMode
+    await Promise.resolve(); // let loadReplayOutcome reach the pin await
+    await Promise.resolve();
+    controller.dispose(); // the production supersede (SessionRegistry.open disposes the prior controller)
+    client.resolveMode(0);
+    const outcome = await load;
+    expect(outcome).toEqual({ kind: 'superseded' });
+    expect('result' in outcome).toBe(false);
+    expect(emitted.filter((m) => m.type === 'turn.end' && m.status === 'complete')).toHaveLength(0);
+  });
+});
+
+/**
+ * ADR-UX-P2-2 (WS-UX Phase-2, Task 3): `endForRestart`'s replay arm must
+ * close the bracket with `status:'cancelled'`, not `'error'` — extending
+ * V-12's own reasoning (the live-turn arm already does this) to the replay
+ * arm. `endForRestart` is reached only on user-intended paths (per-tab New
+ * Session, explicit restart fan-out, T16 force-reconnect), so an in-flight
+ * replay it interrupts was abandoned by user choice, not broken.
+ * `endOnCrash` (a real failure path) keeps `'error'` in both arms —
+ * untouched by this task.
+ *
+ * Reuses the `makeLoadHarness`/`FakeLoadClient` fixture from the WS-R4
+ * `loadReplayOutcome` suite above: `loadSession()` never resolves, so
+ * `this.replay` stays set exactly like the "mid-await" arms there — the
+ * same in-flight-replay state `endForRestart` must interrupt.
+ */
+describe('SessionController.endForRestart — ADR-UX-P2-2 (replay arm)', () => {
+  it('landing MID-REPLAY closes the replay bracket with status "cancelled" (user-intended), not "error"', () => {
+    const { controller, emitted } = makeLoadHarness();
+    // Arrange: an in-flight replay (this.replay set, client.loadSession()
+    // never resolves) — the same pending-loadSession fixture the
+    // loadReplayOutcome suite uses.
+    void controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    // Act:
+    controller.endForRestart();
+    // Assert: the closing bracket is user-intent vocabulary, not 'error'.
+    const end = emitted.find((m) => m.type === 'turn.end');
+    expect(end).toMatchObject({ type: 'turn.end', status: 'cancelled' });
+  });
+
+  it("CA-03 pin: the replay-arm bracket is EXACTLY ONE turn.end{cancelled} carrying the replay's turn id — no 'error' twin", () => {
+    const { controller, emitted } = makeLoadHarness();
+    void controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    controller.endForRestart();
+    expect(emitted.filter((m) => m.type === 'turn.end')).toEqual([
+      { type: 'turn.end', turnId: 'turn-1', sessionId: 'session-1', status: 'cancelled' },
+    ]);
+  });
+});
+
+/**
+ * WS-SL F3-3 (BHF-F3-3): turn-liveness at approval registration.
+ * The zombie: `handlePermission` suspends at `await buildPresentEffectSignals`;
+ * a `cancel()` landing in that window runs `settlePendingApprovals` over a
+ * snapshot that does NOT yet contain this approval — when the await resolves,
+ * `emitApprovalCard` registers a fresh card for a turn the user already
+ * stopped, and it lives until the 60 s M2-b expiry (or the 15 s WS-R1 cancel
+ * fallback force-end). Characterization-first: the first committed shape of
+ * the first test below PINNED today's zombie (card emitted after cancel,
+ * promise stranded), then flipped to the fixed expectation — the flip is the
+ * regression test.
+ */
+describe('SessionController.emitApprovalCard — WS-SL F3-3: turn-liveness at registration', () => {
+  async function flushF33(times = 6): Promise<void> {
+    for (let i = 0; i < times; i++) await Promise.resolve();
+  }
+
+  function makeF33CommandReq(command: string, toolCallId = 'cmd-1'): AcpRequestPermissionRequest {
+    return {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId,
+        title: `Run: ${command}`,
+        kind: 'execute',
+        content: [{ content: { type: 'text', text: `$ ${command}` } }],
+        rawInput: { command, description: 'run' },
+      },
+    };
+  }
+
+  function makeF33Harness(): {
+    controller: SessionController;
+    emitted: HostToWebviewMessage[];
+    logs: string[];
+    resolvePrompt: (v: { stopReason: string }) => void;
+  } {
+    const emitted: HostToWebviewMessage[] = [];
+    const logs: string[] = [];
+    let resolvePrompt!: (v: { stopReason: string }) => void;
+    const client = {
+      cancel: async () => undefined,
+      prompt: () =>
+        new Promise<{ stopReason: string }>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    } as unknown as AcpClientLike;
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: (l) => logs.push(l) },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', '/fake/ws', port);
+    return { controller, emitted, logs, resolvePrompt: (v) => resolvePrompt(v) };
+  }
+
+  it('a cancel() landing while handlePermission is suspended refuses the registration — cancelled outcome, NO card, nothing pending', async () => {
+    const { controller, emitted } = makeF33Harness();
+    controller.sendPrompt('do the thing', 'default');
+    await flushF33(); // reach the hanging client.prompt — turn-1 is live
+
+    // Suspends at `await this.buildPresentEffectSignals(...)`:
+    const pending = controller.handlePermission(makeF33CommandReq('npm test'), 'appr-z1');
+    controller.cancel(); // lands INSIDE the suspension window — the F3-3 race
+
+    const res = await pending;
+    expect(res).toEqual(buildCancelledOutcome());
+    // The zombie observable (pre-fix): approval.request WAS emitted after
+    // cancel and lived until expiry. Post-fix: no card at all.
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(false);
+    // Nothing was registered: a late answer is the documented no-op and emits
+    // no settle echo.
+    controller.respondApproval('appr-z1', 'allow_once');
+    expect(emitted.some((m) => m.type === 'approval.settle')).toBe(false);
+  });
+
+  it('after the cancelled turn ends, a straggler handlePermission still resolves cancelled with no card (cancelledTurnId bookkeeping lingers)', async () => {
+    const { controller, emitted, resolvePrompt } = makeF33Harness();
+    controller.sendPrompt('do the thing', 'default');
+    await flushF33();
+    controller.cancel();
+    resolvePrompt({ stopReason: 'cancelled' });
+    await flushF33(); // turn-1 fully over (turn.end{cancelled} emitted)
+    emitted.length = 0;
+
+    const res = await controller.handlePermission(makeF33CommandReq('npm test', 'cmd-z2'), 'appr-z2');
+    expect(res).toEqual(buildCancelledOutcome());
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(false);
+  });
+
+  it('a permission arriving with NO turn ever admitted refuses registration (fail-closed) instead of minting a 60 s zombie card', async () => {
+    const { controller, emitted } = makeF33Harness();
+    const res = await controller.handlePermission(makeF33CommandReq('npm test', 'cmd-z3'), 'appr-z3');
+    expect(res).toEqual(buildCancelledOutcome());
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(false);
+  });
+
+  it('a live, uncancelled turn still gets its card and a user answer resolves selected (healthy path untouched)', async () => {
+    const { controller, emitted } = makeF33Harness();
+    controller.sendPrompt('do the thing', 'default');
+    await flushF33();
+    const pending = controller.handlePermission(makeF33CommandReq('npm test', 'cmd-z4'), 'appr-z4');
+    await flushF33();
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+    controller.respondApproval('appr-z4', 'allow_once');
+    await expect(pending).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow_once' } });
+  });
+});
+
+/**
+ * WS-SL F2-06: `emitApprovalCard` registers into `pendingApprovals` (entry +
+ * 60 s timer) BEFORE `port.emit(approval)`. Pre-fix, an emit throw propagated
+ * out of the Promise executor — the returned promise REJECTED (the harness
+ * saw an RPC error) while the entry and its 60 s timer lingered, later firing
+ * a stale `approval.settle{expired}` for a card the webview may never have
+ * rendered. Characterization-first: the first committed shape of this test
+ * PINNED the rejection + leaked timer, then flipped.
+ */
+describe('SessionController.emitApprovalCard — WS-SL F2-06: emit-throw settles fail-closed', () => {
+  it('a port.emit throw during the card emit resolves the approval cancelled, clears the entry + timer, and leaks nothing', async () => {
+    vi.useFakeTimers();
+    try {
+      const emitted: HostToWebviewMessage[] = [];
+      const logs: string[] = [];
+      let boomArmed = true;
+      const client = {
+        cancel: async () => undefined,
+        prompt: () => new Promise<never>(() => {}),
+      } as unknown as AcpClientLike;
+      const port: SessionHostPort = {
+        getClient: () => client,
+        emit: (msg) => {
+          if (boomArmed && msg.type === 'approval.request') throw new Error('webview gone');
+          emitted.push(msg);
+        },
+        emitSystemError: () => {},
+        root: makeRoot(),
+        workspaceRoots: () => ['/fake/ws'],
+        logger: { append: (l) => logs.push(l) },
+        refreshCheckpointsPanel: () => {},
+        resolveMentions: async () => [],
+      };
+      const controller = new SessionController('session-1', '/fake/ws', port);
+      controller.sendPrompt('do the thing', 'default');
+      for (let i = 0; i < 6; i++) await Promise.resolve(); // turn-1 live, prompt hanging
+      const timersBefore = vi.getTimerCount();
+
+      const res = await controller.handlePermission(
+        {
+          sessionId: 'session-1',
+          options: EDIT_OPTIONS.map((o) => ({ ...o })),
+          toolCall: {
+            toolCallId: 'cmd-f206',
+            title: 'Run: npm test',
+            kind: 'execute',
+            content: [{ content: { type: 'text', text: '$ npm test' } }],
+            rawInput: { command: 'npm test', description: 'run' },
+          },
+        },
+        'appr-f206',
+      );
+
+      // Fail-closed: the future RESOLVES cancelled (never rejects — a
+      // rejection is an RPC error, not a deny).
+      expect(res).toEqual(buildCancelledOutcome());
+      // The just-registered entry + its 60 s timer are gone.
+      expect(vi.getTimerCount()).toBe(timersBefore);
+      boomArmed = false;
+      controller.respondApproval('appr-f206', 'allow_once');
+      expect(logs.some((l) => l.includes("no pending approval 'appr-f206'"))).toBe(true);
+      // The settle used emit:false (the port just proved unreliable) — no
+      // approval.settle echo was attempted through the failing port.
+      expect(emitted.some((m) => m.type === 'approval.settle')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/**
+ * WS-SL F1-13: `sendPrompt` minted a turn id, a ROOT-scoped checkpoint
+ * ordinal, and a checkpoint snapshot for a whitespace-only prompt with
+ * nothing attached — burning a turn + ordinal on an utterance Hermes treats
+ * as empty. Characterization-first: the first committed shape of the first
+ * test PINNED the burn (turn.start emitted, ordinal minted), then flipped.
+ */
+describe('SessionController.sendPrompt — WS-SL F1-13: empty-prompt refusal', () => {
+  function makeF113Harness(): {
+    controller: SessionController;
+    emitted: HostToWebviewMessage[];
+    ordinalCalls: () => number;
+    promptCalls: () => number;
+  } {
+    const emitted: HostToWebviewMessage[] = [];
+    let ordinals = 0;
+    let prompts = 0;
+    const client = {
+      cancel: async () => undefined,
+      prompt: () => {
+        prompts += 1;
+        return new Promise<never>(() => {});
+      },
+    } as unknown as AcpClientLike;
+    const root: RootCoordinatorLike = {
+      rootId: 'root-1',
+      tracker: undefined,
+      tryAcquireTurnLease: () => true,
+      releaseTurnLease: () => {},
+      anyLiveTurn: () => false,
+      nextTurnOrdinal: () => {
+        ordinals += 1;
+        return ordinals;
+      },
+      nextBaselineOrdinal: () => -1,
+      refreshCheckpointsPanel: () => {},
+    };
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root,
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return {
+      controller: new SessionController('session-1', '/fake/ws', port),
+      emitted,
+      ordinalCalls: () => ordinals,
+      promptCalls: () => prompts,
+    };
+  }
+
+  it('a whitespace-only prompt with no attachments/mentions is refused BEFORE any mint: error emitted, no turn.start, no ordinal, no client.prompt', async () => {
+    const { controller, emitted, ordinalCalls, promptCalls } = makeF113Harness();
+    controller.sendPrompt('   \n\t ', 'default');
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+
+    expect(emitted).toEqual([
+      { type: 'error', sessionId: 'session-1', message: 'Cannot send an empty message.' },
+    ]);
+    expect(ordinalCalls()).toBe(0);
+    expect(promptCalls()).toBe(0);
+    expect(controller.hasLiveTurn()).toBe(false);
+  });
+
+  it('an empty text WITH an attachment is admitted (the attachment carries the content)', async () => {
+    const { controller, emitted, ordinalCalls } = makeF113Harness();
+    controller.sendPrompt('', 'default', [
+      { id: 'att-1', name: 'notes.txt', kind: 'file', path: '/fake/ws/notes.txt' },
+    ]);
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(emitted.some((m) => m.type === 'turn.start')).toBe(true);
+    expect(ordinalCalls()).toBe(1);
+  });
+
+  it('an empty text WITH a mention is admitted', async () => {
+    const { controller, emitted } = makeF113Harness();
+    controller.sendPrompt('', 'default', undefined, [{ id: 'ref-1', kind: 'file', path: 'a.ts' }]);
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    expect(emitted.some((m) => m.type === 'turn.start')).toBe(true);
+  });
+});
+
+/**
+ * WS-SL F2-05: `void this.runTurnWithCheckpoint(...)` had no terminal catch —
+ * a rejection from `snapshotCheckpoint`/`resolveMentions` (the `Promise.all`
+ * before any turn guard) became an unhandled rejection AND leaked the root
+ * turn lease + `liveTurnId`, wedging every later prompt on this root behind
+ * "A turn is already running…". Characterization-first: the first committed
+ * shape of this test PINNED the wedge (no turn.end, lease held, next prompt
+ * refused), then flipped. The catch mirrors `runTurn`'s own error arm:
+ * same guard, same bounded `errorMessage(err)`, same `emitTurnEnd`.
+ */
+describe('SessionController.runTurnWithCheckpoint — WS-SL F2-05: terminal catch (no leaked lease)', () => {
+  function makeF205Harness(): {
+    controller: SessionController;
+    emitted: HostToWebviewMessage[];
+    releaseCalls: () => number;
+    promptCalls: () => number;
+    disarmMentionBoom: () => void;
+  } {
+    const emitted: HostToWebviewMessage[] = [];
+    let releases = 0;
+    let prompts = 0;
+    let mentionBoom = true;
+    const client = {
+      cancel: async () => undefined,
+      prompt: () => {
+        prompts += 1;
+        return new Promise<never>(() => {});
+      },
+    } as unknown as AcpClientLike;
+    const root: RootCoordinatorLike = {
+      rootId: 'root-1',
+      tracker: undefined,
+      tryAcquireTurnLease: () => true,
+      releaseTurnLease: () => {
+        releases += 1;
+      },
+      anyLiveTurn: () => false,
+      nextTurnOrdinal: () => 1,
+      nextBaselineOrdinal: () => -1,
+      refreshCheckpointsPanel: () => {},
+    };
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root,
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => {
+        if (mentionBoom) throw new Error('mention resolution boom');
+        return [];
+      },
+    };
+    return {
+      controller: new SessionController('session-1', '/fake/ws', port),
+      emitted,
+      releaseCalls: () => releases,
+      promptCalls: () => prompts,
+      disarmMentionBoom: () => {
+        mentionBoom = false;
+      },
+    };
+  }
+
+  it('a pre-prompt rejection ends the turn honestly: error{turnId} + turn.end{error}, lease released, next prompt admitted', async () => {
+    const { controller, emitted, releaseCalls, promptCalls, disarmMentionBoom } = makeF205Harness();
+
+    controller.sendPrompt('do the thing', 'default');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => m.type === 'turn.end')).toBe(true);
+    });
+
+    expect(emitted).toContainEqual({
+      type: 'error',
+      sessionId: 'session-1',
+      message: 'mention resolution boom',
+      turnId: 'turn-1',
+    });
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'error' }),
+    );
+    expect(releaseCalls()).toBe(1);
+    expect(controller.hasLiveTurn()).toBe(false);
+    expect(promptCalls()).toBe(0); // the turn never reached client.prompt
+
+    // The lease is genuinely free: the NEXT prompt is admitted, not refused.
+    disarmMentionBoom();
+    controller.sendPrompt('again', 'default');
+    await vi.waitFor(() => expect(promptCalls()).toBe(1));
+    expect(emitted.some((m) => m.type === 'error' && m.message.includes('already running'))).toBe(false);
+  });
+});
+
+/**
+ * WS-SL A-04: `current_mode_update` was typed (`types.ts:158`) but never
+ * applied to `currentMode` — `runTurn`'s re-pin backstop (`if
+ * (this.currentMode !== 'default')` before `client.prompt`) was blind to an
+ * agent-initiated switch to accept_edits/dont_ask. Zero behavior change vs
+ * pinned Hermes 2026.7.7.2 (never emits it — grep 0); real on a future
+ * harness. Characterization-first: the first committed shape of the first
+ * test PINNED the blindness (no re-pin call), then flipped.
+ */
+describe('SessionController.applyUpdate — WS-SL A-04: current_mode_update reaches the re-pin backstop', () => {
+  function makeA04Harness(): {
+    controller: SessionController;
+    setSessionModeCalls: Array<{ sessionId: string; modeId: string }>;
+    promptCalls: () => number;
+  } {
+    const setSessionModeCalls: Array<{ sessionId: string; modeId: string }> = [];
+    let prompts = 0;
+    const client = {
+      cancel: async () => undefined,
+      setSessionMode: async (sessionId: string, modeId: string) => {
+        setSessionModeCalls.push({ sessionId, modeId });
+      },
+      prompt: () => {
+        prompts += 1;
+        return new Promise<never>(() => {});
+      },
+    } as unknown as AcpClientLike;
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: () => {},
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return {
+      controller: new SessionController('session-1', '/fake/ws', port),
+      setSessionModeCalls,
+      promptCalls: () => prompts,
+    };
+  }
+
+  it('an agent-initiated switch reported via current_mode_update makes the NEXT turn re-pin default before prompting', async () => {
+    const { controller, setSessionModeCalls, promptCalls } = makeA04Harness();
+
+    controller.applyUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'acceptEdits' });
+
+    controller.sendPrompt('do the thing', 'default');
+    await vi.waitFor(() => expect(promptCalls()).toBe(1));
+    expect(setSessionModeCalls).toEqual([{ sessionId: 'session-1', modeId: 'default' }]);
+  });
+
+  it('without a current_mode_update the next turn does NOT re-pin (baseline — proves the write, not ambient behavior)', async () => {
+    const { controller, setSessionModeCalls, promptCalls } = makeA04Harness();
+    controller.sendPrompt('do the thing', 'default');
+    await vi.waitFor(() => expect(promptCalls()).toBe(1));
+    expect(setSessionModeCalls).toEqual([]);
+  });
+
+  it('a switch back to default overwrites the record — no spurious re-pin', async () => {
+    const { controller, setSessionModeCalls, promptCalls } = makeA04Harness();
+    controller.applyUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'acceptEdits' });
+    controller.applyUpdate({ sessionUpdate: 'current_mode_update', currentModeId: 'default' });
+    controller.sendPrompt('do the thing', 'default');
+    await vi.waitFor(() => expect(promptCalls()).toBe(1));
+    expect(setSessionModeCalls).toEqual([]);
+  });
+});
+
+/** WS-SL preemptive tool-cancel (ACP SHOULD): cancel() marks the LIVE turn's
+ *  in-flight tools interrupted immediately — the user sees the stop land
+ *  without waiting for the harness to acknowledge. Display-only. */
+describe('SessionController.cancel — WS-SL preemptive tool-cancel marking', () => {
+  function makeCancelMarkHarness(): { controller: SessionController; emitted: HostToWebviewMessage[] } {
+    const emitted: HostToWebviewMessage[] = [];
+    const client = {
+      cancel: async () => undefined,
+      prompt: () => new Promise<never>(() => {}),
+    } as unknown as AcpClientLike;
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return { controller: new SessionController('session-1', '/fake/ws', port), emitted };
+  }
+
+  it("cancel() marks the live turn's running tools interrupted before the agent confirms the stop", async () => {
+    const { controller, emitted } = makeCancelMarkHarness();
+    controller.sendPrompt('do the thing', 'default');
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    controller.applyUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tc-live',
+      title: 'run tests',
+      kind: 'execute',
+      status: 'in_progress',
+    });
+
+    controller.cancel();
+
+    expect(emitted).toContainEqual({
+      type: 'tool.update',
+      turnId: 'turn-1',
+      sessionId: 'session-1',
+      toolId: 'tc-live',
+      status: 'interrupted',
+    });
+  });
+
+  it('cancel() with no live turn emits no tool.update (replay/idle cancels stay silent)', () => {
+    const { controller, emitted } = makeCancelMarkHarness();
+    controller.cancel();
+    expect(emitted.some((m) => m.type === 'tool.update')).toBe(false);
+  });
+});
+
+describe('SessionController.resolveDiff — BHF-F1-3 (firm): junk hunk indices never count toward the accept threshold', () => {
+  const tmpDirs: string[] = [];
+  function makeTmpWs(): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-sc-f13-ws-'));
+    tmpDirs.push(dir);
+    return dir;
+  }
+  afterEach(() => {
+    while (tmpDirs.length) {
+      const dir = tmpDirs.pop()!;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+
+  /** A hanging `AcpClientLike` (mirrors the T-A0 describe's
+   *  `makeApprovalClient`): `prompt` never resolves, so `sendPrompt` below
+   *  keeps a LIVE turn (`currentTurnId` set) for the whole test — required
+   *  because `emitApprovalCard`'s `isStaleApprovalRegistration` guard
+   *  (`SessionController.ts:1152-1158`) short-circuits to a cancelled
+   *  no-registration outcome whenever `currentTurnId === undefined`, which
+   *  would otherwise mask the vulnerability under test (no hunk state would
+   *  ever be registered for `resolveDiff` to mis-accept). */
+  function makeHangingEditClient(): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in a BHF-F1-3 test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt: () => new Promise<never>(() => {}),
+      cancel: async () => undefined,
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  /** Registers ONE pending edit approval (1 hunk: 'a' -> 'b') and waits for
+   *  the approval.request emit — the same headless handlePermission seam the
+   *  BF-B describe above drives, with a live turn (see `makeHangingEditClient`)
+   *  so the approval actually registers instead of short-circuiting cancelled. */
+  async function makePendingEditApproval() {
+    const ws = makeTmpWs();
+    const { port, emitted, logs } = makePort(ws);
+    const liveClientPort: SessionHostPort = { ...port, getClient: () => makeHangingEditClient() };
+    const controller = new SessionController('session-1', ws, liveClientPort);
+    controller.sendPrompt('edit it', 'default');
+    const pending = controller.handlePermission(makeEditReq('src/a.ts'), 'appr-1');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => (m as { type?: string }).type === 'approval.request')).toBe(true);
+    });
+    return { controller, pending, emitted, logs };
+  }
+
+  it('RED-pin: an out-of-range accept (index 999 on a 1-hunk diff) must NOT settle the approval; a valid index still does', async () => {
+    const { controller, pending, emitted } = await makePendingEditApproval();
+
+    controller.resolveDiff('edit-1', 999, 'accept');
+    expect(emitted.some((m) => (m as { type?: string }).type === 'approval.settle')).toBe(false);
+
+    controller.resolveDiff('edit-1', 0, 'accept');
+    const res = await pending;
+    expect(res).toEqual(buildSelectedOutcome('allow_once'));
+  });
+
+  it.each([[-1], [0.5], [Number.NaN], [1]])(
+    'junk/out-of-range index %p is refused, logged, and counts for nothing',
+    async (idx) => {
+      const { controller, pending, emitted, logs } = await makePendingEditApproval();
+
+      controller.resolveDiff('edit-1', idx, 'accept');
+
+      expect(emitted.some((m) => (m as { type?: string }).type === 'approval.settle')).toBe(false);
+      expect(logs.some((l) => l.includes('ignoring out-of-range hunkIndex'))).toBe(true);
+
+      // Cleanup: settle the still-pending approval so its 60s auto-deny
+      // timer does not outlive the test (dispose() cancels fail-closed).
+      controller.dispose();
+      await pending;
+    },
+  );
+
+  it('acceptWholeFileDiff still settles through valid indices 0..totalHunks-1', async () => {
+    const { controller, pending } = await makePendingEditApproval();
+    controller.acceptWholeFileDiff('edit-1');
+    const res = await pending;
+    expect(res).toEqual(buildSelectedOutcome('allow_once'));
   });
 });

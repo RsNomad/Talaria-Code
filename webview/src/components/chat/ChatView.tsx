@@ -2,10 +2,12 @@
  * Renders the streaming transcript. Auto-scrolls to the newest item unless the
  * user has scrolled up to read history. Dispatches diff / approval resolutions.
  */
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { TranscriptItem, ToolItem } from '../../types';
 import { Hero } from '../Hero';
+import { Icon } from '../Icon';
 import { LiveRegion } from '../LiveRegion';
+import { scrollIntoViewRespectingMotion } from '../scrollIntoViewRespectingMotion';
 import { UserMessage } from './UserMessage';
 import { ReasoningBlock } from './ReasoningBlock';
 import { AgentMarkdown } from './AgentMarkdown';
@@ -26,20 +28,6 @@ import { JumpToLatest } from './JumpToLatest';
  */
 const REPIN_BUFFER_PX = 100;
 
-/**
- * UI#1: native `scrollIntoView({behavior:'smooth'})` is not a CSS
- * transition, so the global `prefers-reduced-motion` kill-rule (`index.css`)
- * has no effect on it — this must be checked explicitly, mirroring the same
- * defensive `matchMedia` guard `MockBackend.ts` already uses (jsdom, and
- * some older engines, don't implement `matchMedia` at all).
- */
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false)
-  );
-}
-
 interface ChatViewProps {
   transcript: TranscriptItem[];
   onApproval: (id: string, optionId: string) => void;
@@ -52,6 +40,16 @@ interface ChatViewProps {
   starterDisabled?: boolean;
   /** Task 10: forwarded straight through to `<Hero>` — see Hero's `onOpenSetup` doc. */
   onOpenSetup?: () => void;
+  /** UX-07: whether the active turn (if any) is still in flight — gates the
+   * "Waiting for the agent…" indicator during the dead-air window between
+   * the user's echoed message and the first agent item. Optional so every
+   * existing render without it stays byte-identical. */
+  turnActive?: boolean;
+  /** CA-M15: how many oldest transcript items the reducer has trimmed from
+   * this tab (TabState.hiddenCount). Drives the honest collapse affordance,
+   * rendered inside role="log" so its appearance is announced politely
+   * (announce-once — see the affordance comment). Absent/0 → nothing rendered. */
+  hiddenCount?: number;
 }
 
 /**
@@ -351,7 +349,10 @@ export const ChatView = memo(function ChatView({
   onStarter,
   starterDisabled,
   onOpenSetup,
+  turnActive,
+  hiddenCount,
 }: ChatViewProps) {
+  const hidden = hiddenCount ?? 0;
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // UI#1: `pinnedRef` stays the single SYNCHRONOUS source of truth for the
@@ -370,8 +371,21 @@ export const ChatView = memo(function ChatView({
    * a turn start, so the effect below can tell "this turn's transcript grew
    * again" from "a NEW turn just began" without a dedicated prop. */
   const lastTurnIdRef = useRef<string | undefined>(undefined);
-  const pendingToolIds = pendingDiffToolIds(transcript);
-  const deniedIds = deniedToolIds(transcript);
+  // CA-M14: all four scans are pure functions of `transcript` alone — wrap
+  // them in ONE memo keyed on `transcript` so they recompute only when the
+  // transcript array's reference actually changes, not on every ChatView
+  // render (a scroll/pin state change re-renders this component without
+  // touching `transcript`; see this component's own `React.memo` doc above
+  // for why a draft-keystroke fold preserves `tab.transcript`'s identity).
+  const { pendingToolIds, deniedIds, pendingApproval, settlement } = useMemo(
+    () => ({
+      pendingToolIds: pendingDiffToolIds(transcript),
+      deniedIds: deniedToolIds(transcript),
+      pendingApproval: pendingApprovalAnnouncement(transcript),
+      settlement: settlementAnnouncement(transcript),
+    }),
+    [transcript],
+  );
 
   // Track whether the user is pinned to the bottom. UI#1: buffer raised
   // 48px -> 100px (see REPIN_BUFFER_PX doc).
@@ -393,10 +407,7 @@ export const ChatView = memo(function ChatView({
   const jumpToLatest = () => {
     pinnedRef.current = true;
     setPinned(true);
-    endRef.current?.scrollIntoView({
-      block: 'end',
-      behavior: prefersReducedMotion() ? 'auto' : 'smooth',
-    });
+    scrollIntoViewRespectingMotion(endRef.current, { block: 'end' });
   };
 
   useEffect(() => {
@@ -427,19 +438,28 @@ export const ChatView = memo(function ChatView({
 
   return (
     <>
+      {/* A11Y-03 (WCAG 1.3.1 / 2.4.6): AgentMarkdown clamps its `#`-`######`
+       * markdown into `h3`-`h6` (G-5/C2) so a transcript message's own
+       * headings sit BELOW the panel chrome's `h2` — but this chat surface
+       * has no PanelShell wrapper of its own, so without a heading here
+       * those h3-h6 would be orphaned (no h2 above them in the document
+       * outline). `sr-only`: sighted users already see this is the
+       * conversation; screen-reader/heading-navigation users get the
+       * structure. */}
+      <h2 className="sr-only">Conversation</h2>
       {/* B1: assertive sibling, mounted BEFORE the log region — a separate
        * element from the log's own implicit polite live-ness (role="log"
        * already carries an implicit aria-live="polite"; doubling an
        * assertive announcer onto that same element would fight it). Stays
        * mounted at all times (Finding-7 discipline) and only its text
        * changes; `sr-only` keeps it out of the visual layout. */}
-      <LiveRegion text={pendingApprovalAnnouncement(transcript)} assertive className="sr-only" />
+      <LiveRegion text={pendingApproval} assertive className="sr-only" />
       {/* T-A2-SC4: a SEPARATE polite region for settlement disclosure — a
        * state change inside `role="log"` is not reliably announced, and the
        * assertive region above only ever speaks PENDING approvals (it goes
        * silent, not descriptive, the instant one settles). Same
        * always-mounted, text-swap-only discipline as the assertive sibling. */}
-      <LiveRegion text={settlementAnnouncement(transcript)} className="sr-only" />
+      <LiveRegion text={settlement} className="sr-only" />
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div
           ref={scrollRef}
@@ -449,6 +469,20 @@ export const ChatView = memo(function ChatView({
           tabIndex={0}
           className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-3 py-3.5"
         >
+          {/* CA-M15: honest "older messages collapsed" affordance. Rendered as
+           * the first child of role="log" (implicit aria-live="polite"): its
+           * APPEARANCE is announced as a log addition (announce-once); later
+           * count bumps are text changes to an existing node, which role="log"
+           * does not re-announce (this file's settlementAnnouncement doc) —
+           * exactly the desired low-chatter cadence. No separate live region:
+           * LiveRegion's frozen signature can't be told apart by name, and a
+           * second role="status" would break the singular getByRole('status')
+           * queries. The always-mounted log IS the live region. */}
+          {hidden > 0 && (
+            <div className="flex-none py-1 text-center text-2xs text-faint">
+              {hidden} earlier {hidden === 1 ? 'item' : 'items'} hidden to keep the view responsive
+            </div>
+          )}
           {transcript.map((item, i) => (
             <div key={itemKey(item, i)}>
               <TranscriptRow
@@ -461,6 +495,16 @@ export const ChatView = memo(function ChatView({
               />
             </div>
           ))}
+          {/* UX-07: the dead-air window between the user echo and the first
+           * reasoning/message item — the ONLY period with zero feedback. Lives
+           * inside role="log" (implicit polite) so its appearance is announced
+           * once; disappears the moment any agent item lands. */}
+          {turnActive === true && transcript[transcript.length - 1]?.kind === 'user' && (
+            <div className="flex items-center gap-2 text-2xs text-faint">
+              <Icon name="loading" size={12} spin className="flex-none" />
+              Waiting for the agent…
+            </div>
+          )}
           <div ref={endRef} />
         </div>
         {/* UI#1: only while scrolled away from the bottom AND content has

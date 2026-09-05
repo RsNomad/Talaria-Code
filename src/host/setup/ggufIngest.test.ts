@@ -172,7 +172,7 @@ function routedFetch(handlers: {
   const calls: { url: string; init?: RequestInit }[] = [];
   const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = String(input);
-    calls.push({ url, init });
+    calls.push({ url, ...(init !== undefined ? { init } : {}) });
     if (url.startsWith('https://huggingface.co/')) return handlers.download(url);
     if (url.includes('/api/blobs/')) return (handlers.blob ?? (() => plainResponse(200)))(url);
     if (url.includes('/api/create')) return (handlers.create ?? (() => createResponse(['{"status":"success"}'])))(url);
@@ -465,6 +465,34 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
   });
 });
 
+/** CA-M10: thin wrapper over this file's EXISTING createModel/ingest
+ *  fixtures (`fakeIo`, `routedFetch`, `downloadResponse`, `createResponse`) —
+ *  drives the REAL `ingestGguf` through a fake `/api/create` NDJSON stream
+ *  built from caller-supplied raw lines (well-formed or not), so a test can
+ *  assert on `handleCreateChunkLine`'s parse-failure behavior without a
+ *  parallel harness. */
+function runCreateWithLines(lines: string[]): Promise<void> {
+  const { io } = fakeIo();
+  const { fetchImpl } = routedFetch({
+    download: () => downloadResponse([CONTENT]),
+    create: () => createResponse(lines),
+  });
+  io.fetchImpl = fetchImpl;
+  return ingestGguf(io, SPEC, ENDPOINT, () => {}, new AbortController().signal);
+}
+
+describe('CA-M10 (frozen, owner-approved): a malformed create NDJSON line fails the create, typed', () => {
+  it('one malformed line mid-stream rejects GgufCreateLineParseError — no success is ever reported', async () => {
+    await expect(runCreateWithLines(['{"status":"reading model"}', '{not json'])).rejects.toMatchObject({
+      name: 'GgufCreateLineParseError',
+    });
+  });
+  it('the rejection message carries a byte length, never the line content', async () => {
+    await expect(runCreateWithLines(['{secret-looking-garbage'])).rejects.toThrow(/malformed NDJSON line \(\d+ bytes\)/);
+    await expect(runCreateWithLines(['{secret-looking-garbage'])).rejects.not.toThrow(/secret-looking/);
+  });
+});
+
 // --- downloadGgufToStore (beta.6 T3, §2.4/§2.2.8/§7 line 509) --------------
 
 const STORE_CATALOG_ID = 'sweep-next';
@@ -491,7 +519,11 @@ const STORE_SPEC: GgufStoreSpec = {
  *  `downloadGgufToStore` is asked to write into — a test overrides it to
  *  simulate a `createStoreTempWrite` binding that (incorrectly) placed the
  *  temp file elsewhere (the SC-4 contract-violation case). */
-function fakeStoreIo(opts: { tempDir?: string } = {}): {
+/** CA-M09: the pre-rename re-lstat classification shape, mirrored from
+ *  {@link GgufStoreIo.lstatKind}. */
+type LstatKind = 'missing' | 'file' | 'dir' | 'symlink' | 'other';
+
+function fakeStoreIo(opts: { tempDir?: string; lstatKinds?: Record<string, LstatKind> } = {}): {
   io: GgufStoreIo;
   ensureDir: ReturnType<typeof vi.fn>;
   removeTemp: ReturnType<typeof vi.fn>;
@@ -503,6 +535,15 @@ function fakeStoreIo(opts: { tempDir?: string } = {}): {
   const tempStore = new Map<string, Uint8Array[]>();
   const order: string[] = [];
   const tempDir = opts.tempDir ?? DEST_DIR;
+  // CA-M09: defaults match the real-world common case — the destination
+  // directory already exists (it was just written into by `ensureDir`) and
+  // the destination file does not exist yet. A test overrides one entry to
+  // simulate a symlink racing into the store path during the download.
+  const lstatKinds: Record<string, LstatKind> = {
+    [DEST_DIR]: 'dir',
+    [DEST_PATH]: 'missing',
+    ...opts.lstatKinds,
+  };
   const ensureDir = vi.fn(async (_dir: string) => {});
   const removeTemp = vi.fn(async (path: string) => {
     tempStore.delete(path);
@@ -534,6 +575,7 @@ function fakeStoreIo(opts: { tempDir?: string } = {}): {
     removeTemp,
     renameTemp,
     writeSidecar,
+    lstatKind: async (p: string): Promise<LstatKind> => lstatKinds[p] ?? 'missing',
   };
   return { io, ensureDir, removeTemp, renameTemp, writeSidecar, closeSpy, order };
 }
@@ -806,5 +848,58 @@ describe('downloadGgufToStore — atomic same-dir file sink (beta.6 T3, §2.4/§
     const downloadEvents = progress.filter((p) => p.completedBytes !== undefined);
     expect(downloadEvents.length).toBeGreaterThanOrEqual(1);
     expect(downloadEvents.at(-1)!.completedBytes).toBe(CONTENT.byteLength);
+  });
+});
+
+describe('CA-M09 (frozen, owner-approved): pre-rename destination re-lstat', () => {
+  it('a symlink raced in at destPath → refuses, removes the .part, writes NO sidecar', async () => {
+    const { io, removeTemp, renameTemp, writeSidecar } = fakeStoreIo({ lstatKinds: { [DEST_PATH]: 'symlink' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toMatchObject({ name: 'GgufStoreSymlinkRaceError' });
+
+    expect(renameTemp).not.toHaveBeenCalled();
+    expect(writeSidecar).not.toHaveBeenCalled();
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
+  it('destDir swapped for a symlink → refuses the same way', async () => {
+    const { io, removeTemp, renameTemp, writeSidecar } = fakeStoreIo({ lstatKinds: { [DEST_DIR]: 'symlink' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toMatchObject({ name: 'GgufStoreSymlinkRaceError' });
+
+    expect(renameTemp).not.toHaveBeenCalled();
+    expect(writeSidecar).not.toHaveBeenCalled();
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
+  it('destPath being an existing regular FILE still proceeds (re-download path unchanged)', async () => {
+    const { io, renameTemp, writeSidecar } = fakeStoreIo({ lstatKinds: { [DEST_PATH]: 'file' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).resolves.toBeUndefined();
+
+    expect(renameTemp).toHaveBeenCalledTimes(1);
+    expect(writeSidecar).toHaveBeenCalledTimes(1);
+  });
+
+  it('the refusal message is path-free', async () => {
+    const { io } = fakeStoreIo({ lstatKinds: { [DEST_PATH]: 'symlink' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toThrow('store destination changed while downloading (possible symlink race) — refusing to place the file');
   });
 });

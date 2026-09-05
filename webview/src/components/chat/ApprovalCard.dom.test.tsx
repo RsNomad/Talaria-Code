@@ -17,6 +17,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { act, render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { ApprovalCard } from './ApprovalCard';
 import type { ApprovalItem } from '../../types';
 
@@ -94,7 +95,7 @@ describe('ApprovalCard — settled-card copy (V-4/V-5) and expiry (V-6)', () => 
   });
 
   it('renders live buttons with NO deadline line when timeoutMs is absent (never fabricate a deadline the wire did not state)', () => {
-    render(<ApprovalCard item={approval({ timeoutMs: undefined })} onRespond={() => undefined} />);
+    render(<ApprovalCard item={approval()} onRespond={() => undefined} />);
     expect(screen.getByRole('button', { name: 'Allow' })).toBeInTheDocument();
     expect(screen.queryByText(/Auto-denies/)).not.toBeInTheDocument();
   });
@@ -145,5 +146,22 @@ describe('ApprovalCard — settled-card copy (V-4/V-5) and expiry (V-6)', () => 
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('A11Y-01: focus lands on the card (not <body>) when the clicked option row unmounts on settle', async () => {
+    const user = userEvent.setup();
+    const item = approval();
+    const { rerender } = render(<ApprovalCard item={item} onRespond={() => undefined} />);
+    const btn = screen.getByRole('button', { name: 'Allow' });
+    btn.focus();
+    await user.click(btn);
+    rerender(
+      <ApprovalCard
+        item={approval({ resolvedOptionId: 'allow', settledOutcome: 'selected' })}
+        onRespond={() => undefined}
+      />,
+    );
+    expect(document.activeElement).not.toBe(document.body);
+    expect((document.activeElement as HTMLElement).closest('[data-testid="approval-card"], .rounded-card')).not.toBeNull();
   });
 });

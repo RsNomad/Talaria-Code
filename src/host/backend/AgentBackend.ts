@@ -198,8 +198,18 @@ export interface AgentBackend extends vscode.Disposable {
    * an honest `{ok:false}` refusal when this is absent (mirrors the
    * `getAdvertisedAuthMethods?`/`loadTab?` optional-capability posture
    * above). Refuses (never kills) while a turn is live or before the
-   * connection has ever started. */
-  reconnectAgent?(): Promise<{ ok: true } | { ok: false; reason: string }>;
+   * connection has ever started — UNLESS `{force:true}` (the WS-UX banner's
+   * wedge-break) bypasses the live-turn refusal and ends the turn as user
+   * intent (`turn.end{cancelled}`, ADR-T16). */
+  reconnectAgent?(opts?: { force?: boolean }): Promise<{ ok: true } | { ok: false; reason: string }>;
+
+  /** UX-02 (F2-19 UI face): fresh combined management-link health snapshot
+   * (worst of both respawn loops). OPTIONAL capability — posture of
+   * `reconnectAgent?`/`loadTab?` above: only the real `AcpBackend` has
+   * respawn loops; under mock the provider skips the post-hydrate re-sync
+   * and the webview keeps its honest `{state:'ok'}` boot default.
+   * Structurally identical to `RespawnHealth` (src/host/control/respawnHealth.ts). */
+  currentGatewayHealth?(): { state: 'ok' | 'degraded' | 'down'; attempts: number };
 
   /** W4-T5b (§2d): route a History-panel row load into an EXPLICIT tab —
    * only the real `AcpBackend` can (T5a's hardened `loadSessionIntoTab`);

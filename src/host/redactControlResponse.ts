@@ -10,7 +10,21 @@
 // `McpCatalogEntry.required_env`, `apiKeySet`), the fix is an explicit,
 // justified `REDACTION_EXEMPT` entry below — not a narrower regex that
 // could just as easily miss the next credential-shaped key.
-const SECRET_KEY = /authorization|token|api[_-]?key|password|secret|credential|bearer|cookie|passphrase|private[_-]?key|env/i;
+/**
+ * AU-59 (D-lite): the credential-shaped KEY-NAME core of {@link SECRET_KEY} —
+ * everything EXCEPT the deliberately broad `env` alternative — exported so
+ * `mcpEntryValidation.ts`'s consent-modal hint ("looks like a credential and
+ * will be stored in plain text") is driven by the SAME deny-list this belt
+ * redacts with (CR-003: one source, never a hand-duplicated regex). `env` is
+ * excluded ON PURPOSE for that consumer: it hints on individual env KEY
+ * names, where `ENVIRONMENT`/`NODE_ENV`-style keys are not credentials — the
+ * breadth that is right for whole-value redaction would over-warn there.
+ * {@link SECRET_KEY}'s behaviour is unchanged: it is recomposed from this core
+ * + `|env` below with the same `i` flag (the existing redaction tests pass
+ * unedited; `redactControlResponse.core.test.ts` pins the split).
+ */
+export const CREDENTIAL_NAME_CORE = /authorization|token|api[_-]?key|password|secret|credential|bearer|cookie|passphrase|private[_-]?key/i;
+const SECRET_KEY = new RegExp(`${CREDENTIAL_NAME_CORE.source}|env`, 'i');
 const REDACTED = '[redacted]';
 
 /**

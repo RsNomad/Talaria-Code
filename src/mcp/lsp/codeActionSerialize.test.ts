@@ -235,7 +235,7 @@ function actionWithEdit(opts: {
     edit: {
       allEntriesAvailable: opts.allEntriesAvailable,
       hasNonTextEntry: opts.hasNonTextEntry ?? false,
-      nonTextKind: opts.nonTextKind,
+      ...(opts.nonTextKind !== undefined ? { nonTextKind: opts.nonTextKind } : {}),
       files: opts.files,
     },
   };

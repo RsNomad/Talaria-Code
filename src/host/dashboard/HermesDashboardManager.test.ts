@@ -13,7 +13,12 @@ import type { ChildProcess } from 'node:child_process';
 vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
 
 import { spawn } from 'node:child_process';
-import { HermesDashboardManager, type DashboardChild } from './HermesDashboardManager';
+import {
+  HermesDashboardManager,
+  type DashboardChild,
+  DASHBOARD_KILL_ESCALATION_MS,
+  killWithEscalation,
+} from './HermesDashboardManager';
 import type { AdoptableDashboardClient, DashboardToggleResult } from './HermesDashboardClient';
 import { must } from '../../testing/must';
 
@@ -555,6 +560,67 @@ describe('HermesDashboardManager.ensure — CF-15: re-checks child liveness befo
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// F3-12: `ensure()` re-validates a RESOLVED memo with a live HTTP probe
+// (`client.probe()`, GET /api/status, never-throws) instead of caching it
+// forever. Closes what CF-15 above never could: adopt mode has no child at
+// all, and a server can be dead while the process flag still reads alive.
+//
+// Harness facts that shape the scripted sequences below (verified by reading
+// `nextProbe()`/`makeManager` at :36-135, not assumed):
+//  - `nextProbe()` clamps to the LAST array element forever once its scripted
+//    sequence is exhausted — NOT `false`.
+//  - `probeAdoptCallCount` increments only inside `probeAdopt()`; `probe()`
+//    shares the same cursor but never bumps that counter.
+//  - `makeManager`'s `deps.makeClient` hands out `clients[0]` on the FIRST
+//    ever call and `clients[1]` on EVERY call after that (a monotonic
+//    `handed` counter clamped to `clients.length - 1`) — so a second
+//    `bringUp()` (a fresh shape-mode adopt attempt, or spawn-only's
+//    post-respawn health-check client) always gets a NEW client instance,
+//    never reuses `clients[0]`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('F3-12: a memoized dashboard client is re-validated by live probe', () => {
+  it("adopt-mode ('shape') HEALS: dead adopted server → re-runs bring-up instead of caching the dead client forever", async () => {
+    // clients[0]: adopt-probe true (first ensure adopts), then revalidate-probe
+    // false (dead). clients[1]: the RE-adopt candidate for the real second
+    // bring-up (makeClient's first call always hands clients[0]; every call
+    // after hands clients[1] — see harness note above) — probeAdopt true
+    // heals it, so the fix must re-run bringUp() rather than return the dead
+    // memo, and it must heal via re-adopt, never a spawn.
+    const h = makeManager({ adopt: 'shape', adoptProbe: [true, false], spawnedProbe: [true] });
+    const first = await h.manager.ensure();
+    const healed = await h.manager.ensure();
+    expect(healed).toBeDefined();
+    expect(healed).not.toBe(first); // a genuinely fresh client, not the cached dead one
+    expect(must(h.clients[0]).probeAdoptCallCount).toBe(1); // first bring-up's adopt gate
+    expect(must(h.clients[1]).probeAdoptCallCount).toBe(1); // re-bring-up's adopt gate — proves a REAL second bring-up, not a cached return
+    expect(h.spawnCalls).toHaveLength(0); // healed by re-adopt, not by a spawn
+  });
+
+  it('a HEALTHY memo is returned without a new bring-up (one probe consumed, no re-adopt)', async () => {
+    const h = makeManager({ adopt: 'shape', adoptProbe: [true, true] });
+    const a = await h.manager.ensure();
+    const b = await h.manager.ensure();
+    expect(b).toBe(a);
+    expect(must(h.clients[0]).probeAdoptCallCount).toBe(1); // probeAdopt only on the FIRST bring-up; revalidation calls probe(), which shares the cursor but not this counter
+  });
+
+  it('spawn-mode HEALS: stale-resolved memo with a dead server kills the child and re-spawns', async () => {
+    // clients[0] (the client the FIRST bring-up's `makeClient(token)` call
+    // returns) carries both the initial health-check probe (true) AND the
+    // later revalidation probe (false, on the SAME client — revalidation
+    // calls .probe() on the already-memoized client). clients[1] is the
+    // fresh client the HEALING re-bring-up's `makeClient(token)` call
+    // returns, healthy immediately.
+    const h = makeManager({ adopt: 'spawn-only', adoptProbe: [true, false], spawnedProbe: [true] });
+    await h.manager.ensure();
+    await h.manager.ensure(); // revalidate=false → kill + respawn → healthy
+    expect(h.spawnCalls.length).toBeGreaterThanOrEqual(2);
+    expect(h.child.killed).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CF-15 REVIEW: the dead-child guard (~154-162) can force a SECOND concurrent
 // bringUp() while an EARLIER bringUp() is still pending. When the stale first
 // attempt later settles (fails), its catch handlers must NOT unconditionally
@@ -760,5 +826,29 @@ describe('HermesDashboardManager — T-B2: dashboard liveness fail-open (V-9, re
     // treats the mismatch as benign drift -> ADOPTS the squatter. Must instead
     // throw the existing "served by a process we did not spawn" refusal.
     await expect(manager.ensure()).rejects.toThrow(/we did not spawn/i);
+  });
+});
+
+describe('F2-18: killWithEscalation', () => {
+  it('sends SIGTERM immediately and SIGKILL after the escalation window if still alive', () => {
+    vi.useFakeTimers();
+    const signals: (string | undefined)[] = [];
+    const target = { kill: (signal?: NodeJS.Signals): boolean => (signals.push(signal), true) };
+    killWithEscalation(target, () => false, DASHBOARD_KILL_ESCALATION_MS);
+    expect(signals).toEqual([undefined]); // default kill() = SIGTERM
+    vi.advanceTimersByTime(DASHBOARD_KILL_ESCALATION_MS);
+    expect(signals).toEqual([undefined, 'SIGKILL']);
+    vi.useRealTimers();
+  });
+  it('never escalates once the child is dead', () => {
+    vi.useFakeTimers();
+    const signals: (string | undefined)[] = [];
+    let dead = false;
+    const target = { kill: (signal?: NodeJS.Signals): boolean => (signals.push(signal), true) };
+    killWithEscalation(target, () => dead, DASHBOARD_KILL_ESCALATION_MS);
+    dead = true;
+    vi.advanceTimersByTime(DASHBOARD_KILL_ESCALATION_MS);
+    expect(signals).toEqual([undefined]);
+    vi.useRealTimers();
   });
 });

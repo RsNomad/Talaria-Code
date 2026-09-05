@@ -157,6 +157,30 @@ real; only the OS lookup is stubbed:
   login shell (the exact command is built; the exec is `notImplemented()` until
   Fedora wiring).
 
+## Checkpoints — the panel is the authoritative in-editor undo (A-07)
+
+Two checkpoint systems exist around a Hermes session; they are **never
+co-active over ACP** (deliberate — Hermes' native checkpoint tooling is inert
+over the ACP transport), and their restore semantics deliberately diverge.
+**The extension's Checkpoints panel is the authoritative in-editor undo.**
+
+| | Extension panel (`src/host/checkpoints/CheckpointTracker.ts`) | Hermes native (`tools/checkpoint_manager.py`, restore ≈ lines 794-845) |
+|---|---|---|
+| Snapshot unit | `git write-tree` into a per-root shadow repo (no commit chain) | commit per snapshot, into **one shared** shadow store with per-project isolation via a dedicated ref + git index file keyed on `sha256(abs_path)[:16]` — not a separate repo/store per directory |
+| Restore mechanism | per-path apply of the tree diff; only paths that differ between baseline and target are touched | `git checkout <commit> -- .` (or a single file) against the working dir |
+| Dirty worktree | **refuses** unless `{ force: true }`; uncaptured (ignored/oversized) live bytes are never overwritten | always proceeds — takes an automatic pre-rollback snapshot first ("undo the undo") |
+| Files created after the checkpoint | **deleted** when they were captured by a later checkpoint (a true return to the earlier tree); never-captured files are left alone | **kept** (`checkout -- .` only rewrites paths present in the commit) |
+| Symlink escapes | realpath containment re-asserted per path; escapes surfaced in `skippedPaths` | no equivalent guard on the whole-tree (`.`) path; the optional single-file mode does one upfront `resolve()` check, not re-asserted at the checkout |
+| Undo-of-undo | explicit anchor row + persisted redo pointer (panel Redo / Redo All) | implicit via the automatic pre-rollback snapshot |
+| Per-file restore | not offered (whole-tree) | supported (`file_path` argument, with the upfront path check above) |
+
+Practical consequence: after an agent turn, use the **panel** to roll the
+workspace back/forward; a Hermes-side rollback (if ever driven out-of-band)
+follows checkout semantics — it keeps newly-created files and overwrites dirty
+state after auto-snapshotting. The divergence is documented rather than
+reconciled: the panel's refuse-by-default + disclosure posture is the safety
+contract this extension guarantees.
+
 ## How the real ACP / tui_gateway wiring lands later
 
 `AcpBackend` + `ControlChannel` are stubs that already carry the full shape and

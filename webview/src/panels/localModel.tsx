@@ -52,8 +52,11 @@ import type { SetupCatalogModel, SetupData, SetupMethod } from '../protocol';
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
+import { PullAnnouncer } from '../components/PullAnnouncer';
 import { DECLINED, errorMessage } from '../state/panels';
 import {
+  type ActionOutcome,
+  cancelOutcome,
   CANCEL_LABEL,
   CATALOG_DEFAULT_CHIP_LABEL,
   LLAMACPP_CHECKING_TEXT,
@@ -67,10 +70,12 @@ import {
   cancelPullParams,
   catalogPresence,
   catalogPresenceText,
+  isConfirmedOk,
   llamacppDownloadButtonLabel,
   llamacppPresenceText,
   ollamaPullButtonLabel,
   progressKey,
+  pullCompletionOutcome,
   pullPercent,
   recheckScopeParams,
   servingLine,
@@ -134,10 +139,11 @@ export interface LocalModelBlockProps {
   pinnedDownload?: { label: string; unavailableReason: string };
   /**
    * beta.6 panel-fix (T6): fires exactly when an OLLAMA-pane Pull dispatch
-   * resolves with a result ≠ DECLINED (the same condition as the success
-   * flash). Never on rejection, never on DECLINED, never on llama.cpp/vLLM
-   * Download. The surface owns any snapshot/no-clobber rule. Omitted ⇒
-   * byte-identical behavior.
+   * resolves with a CONFIRMED `{ok:true}` result (T32/F1-6-face — the same
+   * condition as the success flash). Never on rejection, never on DECLINED,
+   * never on an unconfirmed resolve, never on llama.cpp/vLLM Download. The
+   * surface owns any snapshot/no-clobber rule. Omitted ⇒ byte-identical
+   * behavior.
    */
   onOllamaPullSuccess?: (model: SetupCatalogModel) => void;
 }
@@ -190,7 +196,7 @@ function OllamaBackendHeader({
 }: {
   ollama: SetupData['ollama'];
   dispatch: LocalModelBlockProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
 }) {
   if (!ollama.running) {
     return (
@@ -227,7 +233,7 @@ function LlamacppBackendHeader({
 }: {
   runtime: SetupData['llamacppRuntime'];
   dispatch: LocalModelBlockProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
 }) {
   const binary = runtime?.binary ?? 'checking';
 
@@ -328,21 +334,36 @@ function ModelRow({
   endpoint: string;
   progress: SetupProgressMap;
   dispatch: LocalModelBlockProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   selected: boolean;
-  onSelect?: (id: string) => void;
-  ollamaPullSuccessLabel?: string;
-  caption?: string;
-  runCommandCaption?: string;
+  onSelect?: ((id: string) => void) | undefined;
+  ollamaPullSuccessLabel?: string | undefined;
+  caption?: string | undefined;
+  runCommandCaption?: string | undefined;
   pinnedDownload?: LocalModelBlockProps['pinnedDownload'];
   onOllamaPullSuccess?: LocalModelBlockProps['onOllamaPullSuccess'];
 }) {
   const live = progress[progressKey('pull', model.id)];
   const percent = pullPercent(live?.totalBytes, live?.completedBytes);
+  // UX-09: covers the window between dispatching the pull/download and the
+  // FIRST `setup.progress` push for it — before `live` exists there is
+  // otherwise no feedback and no way to cancel. Set true right before the
+  // dispatch, false when it settles; the render guard below
+  // (`dispatching && live === undefined`) keeps this mutually exclusive with
+  // the `inFlight` block, which takes over the instant `live` appears.
+  const [dispatching, setDispatching] = useState(false);
 
   let presenceText: string | undefined;
   let isPresent = false;
-  let action: { label: string; onRun: () => Promise<unknown>; disabledReason?: string; successLabel?: string } | undefined;
+  let action:
+    | {
+        label: string;
+        onRun: () => Promise<unknown>;
+        disabledReason?: string | undefined;
+        successLabel?: string | undefined;
+        outcomeFor?: ((result: unknown) => ActionOutcome | undefined) | undefined;
+      }
+    | undefined;
   let absenceOnly: string | undefined; // llama.cpp honest-absence: no action at all
 
   if (backend === 'ollama') {
@@ -355,14 +376,18 @@ function ModelRow({
         onRun: onOllamaPullSuccess
           ? () =>
               dispatch('setup.provisionModel', { modelId: model.id, backend: 'ollama', endpoint }).then((result) => {
-                if (result !== DECLINED) onOllamaPullSuccess(model);
+                if (isConfirmedOk(result)) onOllamaPullSuccess(model);
                 return result;
               })
           : () => dispatch('setup.provisionModel', { modelId: model.id, backend: 'ollama', endpoint }),
         // §4.1: Ollama rows with no daemon are visible, Pull disabled-with-reason —
         // independent of (but additive to) the trust gate.
         disabledReason: disabledReason ?? (!ollama.running ? OLLAMA_DAEMON_DOWN_PULL_REASON : undefined),
-        successLabel: ollamaPullSuccessLabel,
+        // T32 (F1-6-face): the success flash is earned only by a CONFIRMED
+        // {ok:true} resolve — any other resolve renders the honest
+        // not-confirmed line instead (pullCompletionOutcome supersedes
+        // successLabel below; see the ActionButton render site).
+        outcomeFor: pullCompletionOutcome(ollamaPullSuccessLabel),
       };
     }
   } else if (backend === 'llamacpp') {
@@ -399,6 +424,17 @@ function ModelRow({
   }
   // vllm: no presence/action at all — the run command IS the row's content.
 
+  if (action) {
+    const rawOnRun = action.onRun;
+    action = {
+      ...action,
+      onRun: () => {
+        setDispatching(true);
+        return rawOnRun().finally(() => setDispatching(false));
+      },
+    };
+  }
+
   const inFlight = live !== undefined && !isPresent && backend !== 'vllm';
   const runCommand = backend === 'llamacpp' && isPresent ? model.llamacpp?.runCommand : backend === 'vllm' ? model.vllm?.runCommand : undefined;
 
@@ -431,7 +467,14 @@ function ModelRow({
 
       {action && (
         <div>
-          <ActionButton label={action.label} icon="cloud-download" onRun={action.onRun} disabledReason={action.disabledReason} successLabel={action.successLabel} />
+          <ActionButton
+            label={action.label}
+            icon="cloud-download"
+            onRun={action.onRun}
+            disabledReason={action.disabledReason}
+            successLabel={action.successLabel}
+            outcomeFor={action.outcomeFor}
+          />
         </div>
       )}
 
@@ -445,10 +488,28 @@ function ModelRow({
         </>
       )}
 
+      {dispatching && live === undefined && (
+        <div className="flex flex-col gap-1">
+          <StatusLine icon="sync" text="Working — waiting for the backend to report progress…" tone="neutral" />
+          <div>
+            <ActionButton
+              label={CANCEL_LABEL}
+              icon="close"
+              onRun={() => dispatch('setup.cancel', cancelPullParams(model.id))}
+              outcomeFor={cancelOutcome}
+            />
+          </div>
+        </div>
+      )}
+
       {inFlight && (
         <div className="flex flex-col gap-1">
+          {/* A11Y-05: mounted for the whole in-flight block (before the
+              `percent !== undefined` guard) so the sr-only region exists
+              before its first text (Finding-7). */}
+          <PullAnnouncer label={`Pulling ${model.id}`} percent={percent} />
           {percent !== undefined && (
-            <div className="flex items-center gap-2" aria-live="polite">
+            <div className="flex items-center gap-2">
               <div
                 role="progressbar"
                 aria-valuenow={percent}
@@ -463,7 +524,12 @@ function ModelRow({
             </div>
           )}
           <div>
-            <ActionButton label={CANCEL_LABEL} icon="close" onRun={() => dispatch('setup.cancel', cancelPullParams(model.id))} />
+            <ActionButton
+              label={CANCEL_LABEL}
+              icon="close"
+              onRun={() => dispatch('setup.cancel', cancelPullParams(model.id))}
+              outcomeFor={cancelOutcome}
+            />
           </div>
         </div>
       )}
@@ -578,35 +644,47 @@ function ActionButton({
   icon,
   successLabel,
   pendingLabel,
+  outcomeFor,
 }: {
   label: string;
   onRun: () => Promise<unknown>;
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   icon?: string;
-  successLabel?: string;
+  successLabel?: string | undefined;
   pendingLabel?: string;
+  outcomeFor?: ((result: unknown) => ActionOutcome | undefined) | undefined;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
-  const [success, setSuccess] = useState(false);
+  const [successText, setSuccessText] = useState<string | undefined>(undefined);
   const genuinelyDisabled = disabledReason !== undefined;
 
   useEffect(() => {
-    if (!success) return;
-    const timer = setTimeout(() => setSuccess(false), 4000);
+    if (successText === undefined) return;
+    const timer = setTimeout(() => setSuccessText(undefined), 4000);
     return () => clearTimeout(timer);
-  }, [success]);
+  }, [successText]);
 
   const onClick = () => {
     if (genuinelyDisabled || pending) return;
     setPending(true);
     setError(undefined);
-    setSuccess(false);
+    setSuccessText(undefined);
     void onRun().then(
       (result: unknown) => {
         setPending(false);
         if (result === DECLINED) return; // C-2 lock: neither success nor failure
-        if (successLabel !== undefined) setSuccess(true);
+        if (outcomeFor !== undefined) {
+          const outcome = outcomeFor(result);
+          if (outcome === undefined) return;
+          if (outcome.tone === 'failure') {
+            setError(outcome.text);
+            return;
+          }
+          setSuccessText(outcome.text);
+          return;
+        }
+        if (successLabel !== undefined) setSuccessText(successLabel);
       },
       (err: unknown) => {
         setPending(false);
@@ -615,7 +693,7 @@ function ActionButton({
     );
   };
 
-  const liveText = error ? `✗ ${error}` : success && successLabel !== undefined ? successLabel : '';
+  const liveText = error ? `✗ ${error}` : (successText ?? '');
   const liveClass = error ? 'text-2xs text-del' : 'text-2xs text-add';
 
   return (

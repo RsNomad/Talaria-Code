@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseDiffUri, buildDiffUriParts } from './parseDiffUri';
+import { parseDiffUri, buildDiffUriParts, type DiffUriLike } from './parseDiffUri';
 
 /** Minimal structural stand-in for `vscode.Uri` — `parseDiffUri` is pure and
  * headless-tested, so it must accept this shape without importing `vscode`. */
@@ -96,7 +96,22 @@ describe('buildDiffUriParts — W2 T4 F-D: pure talaria-diff: URI builder (parse
       ['before', 'session-3', 'appr-abc123', 'a b/c.ts'], // spaces are legal in a workspace-relative path
     ];
     for (const [side, sessionId, toolId, path] of cases) {
-      expect(parseDiffUri(buildDiffUriParts(side, sessionId, toolId, path))).toEqual({ side, sessionId, toolId, path });
+      const parts = buildDiffUriParts(side, sessionId, toolId, path);
+      expect(parts).toBeDefined();
+      expect(parseDiffUri(parts as DiffUriLike)).toEqual({ side, sessionId, toolId, path });
     }
+  });
+});
+
+describe('CA-M17 (WS-BG): id-wellformedness enforced at the compose/parse pair', () => {
+  it('buildDiffUriParts refuses a sessionId/toolId the URI cannot round-trip', () => {
+    expect(buildDiffUriParts('before', 'a/b', 't', 'f.ts')).toBeUndefined();
+    expect(buildDiffUriParts('before', 's', 'a b', 'f.ts')).toBeUndefined();
+    expect(buildDiffUriParts('before', '', 't', 'f.ts')).toBeUndefined();
+  });
+
+  it('parseDiffUri rejects segments compose could never have minted (whitespace ids)', () => {
+    expect(parseDiffUri({ scheme: 'talaria-diff', authority: 'before', path: '/a b/t/f.ts' })).toBeNull();
+    expect(parseDiffUri({ scheme: 'talaria-diff', authority: 'before', path: '/s/t x/f.ts' })).toBeNull();
   });
 });

@@ -17,6 +17,7 @@ import type {
   ToolsData,
   ToolsetInfo,
 } from '../../shared/protocol';
+import { isRecord } from '../../shared/typeGuards';
 
 /**
  * The Zone S reshaping seam: PURE functions that turn a raw control-plane RPC
@@ -42,9 +43,10 @@ import type {
 
 /**
  * One resolved tool row, kept only for DEFENSIVE/forward-compat handling. The
- * REAL `tools.list` wire shape carries tool NAMES as bare strings (see
- * {@link RawToolset}); this object form is tolerated in case a future Hermes
- * build enriches the per-tool entry (it is NOT evidenced by current source).
+ * REAL `tools.list` wire shape carries tool NAMES as bare strings under the
+ * `tools` key (see {@link RawToolset}); this object form is tolerated in case
+ * a future Hermes build enriches the per-tool entry (NOT evidenced by
+ * current source).
  */
 export interface RawToolDef {
   name: string;
@@ -53,26 +55,30 @@ export interface RawToolDef {
 }
 
 /**
- * One toolset bundle inside a `tools.list` result
- * (`tui_gateway/server.py:13439-13467`).
+ * One toolset bundle inside a `tools.list` result (`tui_gateway/server.py`,
+ * the `@method("tools.list")` handler — re-grepped WS-AC Task 15; cite the
+ * CURRENT line of the `"tools": info["resolved_tools"]` emission here: 13462).
  *
- * corr-M1 — GROUND TRUTH: a toolset's member tools arrive as
- * `resolved_tools: List[str]` — bare tool-NAME strings, not `{name,...}` objects
- * (`tools/toolsets.py:687,920`; the dashboard `GET /api/tools/toolsets` reshaper
- * already treats them as `string[]`). The reshaper reads {@link resolved_tools}
- * first; the legacy `tools` field (either `string[]` or the defensive
- * {@link RawToolDef} object form) is a fallback so an older/mock shape still
- * works. Reading a plain string as `t.name` was crashing the LIVE no-dashboard
- * tools source (`classifySource(undefined)` TypeError).
+ * S4-09 (WS-AC doc fix) — GROUND TRUTH INVERTED from what this doc used to
+ * claim: the WIRE key is `tools` (the handler serializes its internal
+ * `resolved_tools` list UNDER the key `"tools"`); a `resolved_tools` key
+ * never appears on this wire. The reshaper's read order
+ * `resolved_tools ?? tools` (:138) still lands correctly — real payloads
+ * carry only `tools`, so the first alternative is simply absent — and the
+ * order is deliberately KEPT (behavior-preserving doc fix): `resolved_tools`
+ * remains tolerated in case a future Hermes emits the internal name
+ * directly. Entries are bare tool-NAME strings (`tools/toolsets.py`
+ * `resolved_tools: List[str]`); the {@link RawToolDef} object form is
+ * defensive only.
  */
 export interface RawToolset {
   name: string;
   description?: string;
   tool_count: number;
   enabled: boolean;
-  /** Real tui_gateway field: resolved tool NAMES. */
+  /** Defensive/forward-compat: the INTERNAL Hermes field name — never observed on this wire. */
   resolved_tools?: string[];
-  /** Legacy/defensive fallback: names, or the object form for forward-compat. */
+  /** Real tui_gateway wire field: resolved tool NAMES (or the defensive object form). */
   tools?: Array<string | RawToolDef>;
 }
 
@@ -120,8 +126,10 @@ export function classifySource(name: string): ToolInfo['source'] {
 /**
  * Reshape a raw `tools.list` result into `ToolsData` (`ToolsPanel.tsx`).
  *
- * corr-M1: a toolset's member tools are `resolved_tools: string[]` on the real
- * wire (bare names). Each entry is normalized to `{name, description?, enabled?}`
+ * corr-M1 (read order) + S4-09 (WS-AC, key name): a toolset's member tools
+ * arrive as bare NAME strings under the wire key `tools`; `resolved_tools` is
+ * the internal Hermes name, tolerated first in the read order as
+ * forward-compat only. Each entry is normalized to `{name, description?, enabled?}`
  * whether it arrives as a string (real shape → empty description, inherits the
  * toolset's `enabled`) or as a defensive/legacy object. Handling the string case
  * is what fixes the `classifySource(undefined)` TypeError the LIVE no-dashboard
@@ -223,13 +231,17 @@ export function reshapeSkillsList(raw: RawSkillsManageListResult): SkillsData {
 /* ------------------------------------------------------------------ *
  * Raw MCP sources — grounded in contracts-tui-gateway.md §3 (GAPS #1: no
  * single RPC returns server list + status + tool counts). Joined from
- * `config.get({key:"full"}).mcp_servers` (server list + launch command,
- * `tools/mcp_tool.py:13-60` schema) and `tools.list`'s per-toolset
- * `tool_count` (`tui_gateway/server.py:13439-13467`).
+ * `config.get({key:"full"})` → `{config:{…, mcp_servers}}` (ENVELOPED,
+ * `tui_gateway/server.py:10868-10869`; unwrapped by `unwrapConfigFull` —
+ * server list + launch command per the `tools/mcp_tool.py:13-60` schema)
+ * and `tools.list`'s per-toolset `tool_count`
+ * (`tui_gateway/server.py:13439-13467`).
  * ------------------------------------------------------------------ */
 
 /**
- * One `mcp_servers.<name>` entry from `config.get({key:"full"})`. The
+ * One `mcp_servers.<name>` entry from the UNWRAPPED `config.get({key:"full"})`
+ * payload (the wire nests it under a `config` envelope — see
+ * {@link unwrapConfigFull}). The
  * docstring example (`tools/mcp_tool.py:13-60`) shows `command`/`args`/`env`
  * for stdio transport or `url`/`headers` for HTTP/SSE transport, plus
  * optional `timeout`/`connect_timeout`. `enabled` is NOT in that example but
@@ -245,9 +257,47 @@ export interface RawMcpServerConfig {
   [key: string]: unknown;
 }
 
-/** Raw `config.get({key:"full"})` result — only the `mcp_servers` slice is used here. */
+/**
+ * The UNWRAPPED `config.get({key:"full"})` payload — only the `mcp_servers`
+ * slice is used here. NOT the wire shape: the gateway envelopes it as
+ * `{config: <this>}` (`tui_gateway/server.py:10868-10869`); the only
+ * sanctioned ingress is {@link unwrapConfigFull}, which also tolerates the
+ * legacy flat form and unwraps junk to `{}`.
+ */
 export interface RawConfigFullResult {
   mcp_servers?: Record<string, RawMcpServerConfig>;
+}
+
+/**
+ * A-01 (lens-dorabotok 🔴): unwrap the `config.get({key:"full"})` ENVELOPE.
+ *
+ * The shipped Hermes gateway returns `{"config": <full config dict>}` —
+ * `tui_gateway/server.py:10868-10869` (`if key == "full": return _ok(rid,
+ * {"config": _load_cfg()})`) — so `mcp_servers` lives at
+ * `result.config.mcp_servers`, one level BELOW where the pre-fix code read
+ * it (`panelSources.ts` old :161-162), which left `knownNames` empty and
+ * made `requireListedMcpName` (`ControlDispatcher.ts:831-843`) refuse every
+ * MCP admin op.
+ *
+ * Tolerant legacy-flat fallback: an older Hermes build (NOT-VERIFIED
+ * register) may have returned the flat payload — if there is no record
+ * `config` key but the value itself is a record, use it as-is. Anything
+ * else (null / undefined / primitive / array) unwraps to `{}` — null-safe
+ * by construction, killing the `rawConfig.mcp_servers` TypeError on a wire
+ * `result: null` (the SYN-BOUNDARY flagship sub-site).
+ *
+ * This is the ONLY sanctioned ingress for `config.get{full}`; the guarded
+ * `as` below is the codebase's documented assert-after-guard posture at an
+ * untyped wire boundary (WS-BG later makes the class uniform).
+ */
+export function unwrapConfigFull(raw: unknown): RawConfigFullResult {
+  if (isRecord(raw)) {
+    if (isRecord(raw.config)) {
+      return raw.config as RawConfigFullResult;
+    }
+    return raw as RawConfigFullResult;
+  }
+  return {};
 }
 
 /**
@@ -271,7 +321,9 @@ function formatCommand(cfg: RawMcpServerConfig): string {
 }
 
 /**
- * Join `config.get({key:"full"}).mcp_servers` with `tools.list`'s toolset
+ * Join the UNWRAPPED `config.get({key:"full"})` payload's `mcp_servers`
+ * (see {@link unwrapConfigFull} — this function never sees the envelope)
+ * with `tools.list`'s toolset
  * `tool_count` into `McpData` (`McpPanel.tsx`).
  *
  * `reload.mcp` (the third source the original design suggested
@@ -419,17 +471,18 @@ export function reshapeSessionsList(
   const sessions: SessionSummary[] = (raw.sessions ?? [])
     .map((s) => {
       const id = s.session_id ?? s.sessionId ?? '';
-      const updatedAtRaw = s.updated_at ?? s.updatedAt;
+      const title = s.title ?? undefined;
+      const updatedAt = normalizeUpdatedAt(s.updated_at ?? s.updatedAt);
       return {
         id,
         cwd: s.cwd ?? '',
-        title: s.title ?? undefined,
-        updatedAt: normalizeUpdatedAt(updatedAtRaw),
+        ...(title !== undefined ? { title } : {}),
+        ...(updatedAt !== undefined ? { updatedAt } : {}),
       };
     })
     .filter((s) => !excludeIds?.has(s.id));
   const nextCursor = raw.next_cursor ?? raw.nextCursor ?? undefined;
-  return { sessions, nextCursor: nextCursor ?? undefined };
+  return { sessions, ...(nextCursor !== undefined ? { nextCursor } : {}) };
 }
 
 /* ------------------------------------------------------------------ *

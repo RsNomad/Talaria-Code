@@ -14,7 +14,7 @@
  * create/install/uninstall (§5.5); every click here only SUMMONS it —
  * this file never gates, confirms, or second-guesses that decision.
  */
-import { useState, type FormEvent } from 'react';
+import { useId, useState, type FormEvent } from 'react';
 import type { HubInstallResult, HubPreview, HubScan, SkillCreateParams, SkillInfo, SkillsData } from '../protocol';
 import { APPLIES_NEXT_SESSION } from '../copy';
 import { totalLookup } from '../lookup';
@@ -23,7 +23,7 @@ import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill, type PillTone } from '../components/Pill';
 import { Toggle } from '../components/Toggle';
-import { PanelShell } from './PanelShell';
+import { EmptyPanel, PanelShell } from './PanelShell';
 import { useToggle } from './useToggle';
 
 interface SkillsPanelProps {
@@ -228,59 +228,103 @@ function errorMessage(err: unknown, fallback: string): string {
   return typeof err === 'string' ? err : fallback;
 }
 
+/** Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): `error` — when present — wires
+ * `aria-invalid` + `aria-describedby` to a rendered `<span id={errorId}>` so
+ * a screen reader announces WHICH field failed and WHY. The error `<span>` is
+ * a SIBLING of `<label>`, not nested inside it: the browser's accessible-name
+ * algorithm for a wrapping `<label>` folds ALL descendant text into the
+ * control's accessible NAME (not just its description) — nesting the span
+ * inside would corrupt the field's name into "NameName is required." instead
+ * of leaving "Name" as the name and the error as a separate
+ * `aria-describedby` description, which defeats this task's own WCAG intent.
+ * (Confirmed empirically: `@testing-library/dom`'s label-content walk —
+ * `label-helpers.js`'s `getTextContent` — implements the identical
+ * name-computation rule and reproduces the same corruption in jsdom.)
+ * `undefined` (no error) omits both attributes entirely, per
+ * `exactOptionalPropertyTypes` — never a `false`/empty-string placeholder
+ * attribute value. Kept in lock-step with McpPanel's own local `TextField`
+ * (deliberate local copies, no shared component — see this section's header
+ * comment). */
 function TextField({
   label,
   value,
   onChange,
   placeholder,
+  error,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
+  error?: string | undefined;
 }) {
+  const errorId = useId();
   return (
-    <label className="flex flex-col gap-1 text-2xs text-muted">
-      {label}
-      <input
-        type="text"
-        value={value}
-        placeholder={placeholder}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg"
-      />
-    </label>
+    <div className="flex flex-col gap-1 text-2xs text-muted">
+      <label className="flex flex-col gap-1">
+        {label}
+        <input
+          type="text"
+          value={value}
+          placeholder={placeholder}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? errorId : undefined}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg aria-[invalid=true]:border-del"
+        />
+      </label>
+      {error && (
+        <span id={errorId} className="text-2xs text-del">
+          {error}
+        </span>
+      )}
+    </div>
   );
 }
 
 /** Same sibling as McpPanel's `TextAreaField`, with an optional `rows`
  *  (default 3, matching McpPanel's fixed value) — the Create-skill Content
  *  field wants more visible lines for a multi-line frontmatter doc; this is
- *  an HTML attribute, not a new style/token. */
+ *  an HTML attribute, not a new style/token. Task 16: same `error`/
+ *  `aria-invalid`/`aria-describedby` wiring (and same sibling-not-nested
+ *  error-`<span>` placement — see {@link TextField}'s doc comment for why)
+ *  as {@link TextField}. */
 function TextAreaField({
   label,
   value,
   onChange,
   placeholder,
   rows = 3,
+  error,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
   rows?: number;
+  error?: string | undefined;
 }) {
+  const errorId = useId();
   return (
-    <label className="flex flex-col gap-1 text-2xs text-muted">
-      {label}
-      <textarea
-        value={value}
-        placeholder={placeholder}
-        rows={rows}
-        onChange={(e) => onChange(e.target.value)}
-        className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg"
-      />
-    </label>
+    <div className="flex flex-col gap-1 text-2xs text-muted">
+      <label className="flex flex-col gap-1">
+        {label}
+        <textarea
+          value={value}
+          placeholder={placeholder}
+          rows={rows}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? errorId : undefined}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded border border-border bg-overlay px-2 py-1 font-mono text-2xs text-fg aria-[invalid=true]:border-del"
+        />
+      </label>
+      {error && (
+        <span id={errorId} className="text-2xs text-del">
+          {error}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -365,7 +409,11 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
   const [content, setContent] = useState('');
   const [contentEdited, setContentEdited] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | undefined>();
+  // Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): field-keyed (was a flat `string`),
+  // same twin treatment as McpPanel's `AddServerDisclosure` — `'submit'`
+  // covers the onCreate-rejection case, which renders in the same form-level
+  // slot the old flat string used to.
+  const [error, setError] = useState<{ field: 'name' | 'content' | 'submit'; text: string } | undefined>();
 
   const handleNameChange = (next: string) => {
     setName(next);
@@ -390,11 +438,11 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
 
     const trimmedName = name.trim();
     if (!trimmedName) {
-      setError('Name is required.');
+      setError({ field: 'name', text: 'Name is required.' });
       return;
     }
     if (!content.trim()) {
-      setError('Content is required.');
+      setError({ field: 'content', text: 'Content is required.' });
       return;
     }
 
@@ -412,7 +460,7 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
       },
       (err: unknown) => {
         setCreating(false);
-        setError(errorMessage(err, 'Create failed.'));
+        setError({ field: 'submit', text: errorMessage(err, 'Create failed.') });
       },
     );
   };
@@ -435,7 +483,13 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
       </button>
       {open && (
         <form onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
-          <TextField label="Name" value={name} onChange={handleNameChange} placeholder="my-skill" />
+          <TextField
+            label="Name"
+            value={name}
+            onChange={handleNameChange}
+            placeholder="my-skill"
+            error={error?.field === 'name' ? error.text : undefined}
+          />
           <TextField
             label="Category (optional)"
             value={category}
@@ -448,13 +502,25 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
             onChange={handleContentChange}
             placeholder={skillTemplate('my-skill')}
             rows={8}
+            error={error?.field === 'content' ? error.text : undefined}
           />
 
-          <LiveRegion text={error ?? ''} className="sr-only" />
-          {error && (
+          {/* Finding-7: this LiveRegion stays the SOLE screen-reader
+              announcer for every refusal on this form — field-level errors
+              above are ALSO wired via aria-invalid/aria-describedby (WCAG
+              1.3.1/3.3.1), but this permanently-mounted region is what
+              actually fires the announcement, same posture as every other
+              LiveRegion in this file. */}
+          <LiveRegion text={error?.text ?? ''} className="sr-only" />
+          {/* The onCreate-rejection case has no field of its own to attach
+              to — it keeps rendering in this form-level slot, same as the
+              old flat string did. Every OTHER error now renders
+              field-adjacent, via the TextField/TextAreaField `error` prop
+              above. */}
+          {error?.field === 'submit' && (
             <div className="flex items-start gap-1.5 rounded border border-del bg-del-soft px-2 py-1 text-2xs text-fg">
               <Icon name="error" size={11} className="mt-0.5 flex-none text-del" />
-              <span className="min-w-0 flex-1 break-words">{error}</span>
+              <span className="min-w-0 flex-1 break-words">{error.text}</span>
             </div>
           )}
 
@@ -834,68 +900,83 @@ export function SkillsPanel({
       <p className="mb-2 px-1 text-2xs leading-snug text-faint">
         {`Toggles persist immediately. ${APPLIES_NEXT_SESSION}`}
       </p>
-      {data.skills.map((sk) => {
-        const err = lastError(sk.id);
-        const isHub = sk.provenance === 'hub';
-        const rowUninstalling = uninstalling[sk.name] === true;
-        // AU-40: purely in-flight — nothing genuinely-indefinite gates uninstall.
-        const uninstallInteraction = busyInteraction(false, rowUninstalling);
-        return (
-          <div
-            key={sk.id}
-            className="mb-1.5 flex items-start gap-2 rounded-card border border-border bg-surface px-3 py-2"
-          >
-            <Icon name="extensions" size={15} className="mt-0.5 flex-none text-accent" />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5">
-                <span className="truncate font-mono text-xs text-fg">{sk.name}</span>
-                <Pill tone="neutral">{sk.category}</Pill>
-                {sk.provenance && (
-                  <Pill tone="neutral">
-                    {totalLookup(PROVENANCE_LABEL, sk.provenance, UNKNOWN_PROVENANCE_LABEL)}
-                  </Pill>
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): the skill-row collection was `div`
+          soup — no `role="list"`/`role="listitem"` at all. CreateSkillDisclosure
+          and InstallFromHubDisclosure below stay OUTSIDE this list. */}
+      {/* Task 22 (UX-01/UX-16): the standard empty state — this panel used to
+          render silent blank space with zero skills. Rendered BEFORE the
+          (empty) list, never as an early return: CreateSkillDisclosure and
+          InstallFromHubDisclosure below still render in the zero-row case
+          (AU-46 — the empty state must never hide the way OUT of being
+          empty). */}
+      {data.skills.length === 0 && (
+        <EmptyPanel hint="No skills yet — create one below, or install from the hub." />
+      )}
+      <div role="list">
+        {data.skills.map((sk) => {
+          const err = lastError(sk.id);
+          const isHub = sk.provenance === 'hub';
+          const rowUninstalling = uninstalling[sk.name] === true;
+          // AU-40: purely in-flight — nothing genuinely-indefinite gates uninstall.
+          const uninstallInteraction = busyInteraction(false, rowUninstalling);
+          return (
+            <div
+              key={sk.id}
+              role="listitem"
+              className="mb-1.5 flex items-start gap-2 rounded-card border border-border bg-surface px-3 py-2"
+            >
+              <Icon name="extensions" size={15} className="mt-0.5 flex-none text-accent" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate font-mono text-xs text-fg">{sk.name}</span>
+                  <Pill tone="neutral">{sk.category}</Pill>
+                  {sk.provenance && (
+                    <Pill tone="neutral">
+                      {totalLookup(PROVENANCE_LABEL, sk.provenance, UNKNOWN_PROVENANCE_LABEL)}
+                    </Pill>
+                  )}
+                  {typeof sk.usage === 'number' && sk.usage > 0 && (
+                    <span className="text-2xs text-faint">used {sk.usage}×</span>
+                  )}
+                </div>
+                {sk.description && (
+                  <div className="mt-0.5 text-2xs leading-snug text-muted">{sk.description}</div>
                 )}
-                {typeof sk.usage === 'number' && sk.usage > 0 && (
-                  <span className="text-2xs text-faint">used {sk.usage}×</span>
+                {/* V-11 (TOGGLE-HONESTY): a rejected persist used to roll the
+                    switch back with NOTHING surfaced anywhere. Same grammar
+                    SettingsPanel's FieldRow already carries (SettingsPanel.tsx:
+                    159): a permanently-mounted LiveRegion (WCAG 2.2 SC 4.1.3),
+                    only its text swaps — never conditionally mounted. */}
+                <LiveRegion text={err ? `Not saved: ${err}` : ''} className="text-2xs text-del" title={err} />
+                {isHub && <HubNoticeCard notice={hubNotice[sk.name]} />}
+              </div>
+              <div className="flex flex-none items-center gap-2 pt-0.5">
+                <Toggle
+                  on={isOn(sk.id, sk.enabled)}
+                  label={`Enable ${sk.name}`}
+                  onChange={(next) => toggle(sk.id, next)}
+                />
+                {/* Task B6 (§5.6 item 3): only hub-provenance rows get a
+                    Remove — a bundled/agent skill has no hub install to
+                    reverse this way. */}
+                {isHub && (
+                  <button
+                    type="button"
+                    onClick={() => handleHubUninstall(sk.name)}
+                    disabled={uninstallInteraction.nativeDisabled}
+                    aria-disabled={uninstallInteraction.ariaDisabled}
+                    aria-busy={uninstallInteraction.ariaBusy}
+                    className="flex items-center gap-1 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
+                  >
+                    <Icon name={rowUninstalling ? 'loading' : 'trash'} size={12} spin={rowUninstalling} />
+                    {rowUninstalling ? 'Removing…' : 'Remove'}
+                  </button>
                 )}
               </div>
-              {sk.description && (
-                <div className="mt-0.5 text-2xs leading-snug text-muted">{sk.description}</div>
-              )}
-              {/* V-11 (TOGGLE-HONESTY): a rejected persist used to roll the
-                  switch back with NOTHING surfaced anywhere. Same grammar
-                  SettingsPanel's FieldRow already carries (SettingsPanel.tsx:
-                  159): a permanently-mounted LiveRegion (WCAG 2.2 SC 4.1.3),
-                  only its text swaps — never conditionally mounted. */}
-              <LiveRegion text={err ? `Not saved: ${err}` : ''} className="text-2xs text-del" title={err} />
-              {isHub && <HubNoticeCard notice={hubNotice[sk.name]} />}
             </div>
-            <div className="flex flex-none items-center gap-2 pt-0.5">
-              <Toggle
-                on={isOn(sk.id, sk.enabled)}
-                label={`Enable ${sk.name}`}
-                onChange={(next) => toggle(sk.id, next)}
-              />
-              {/* Task B6 (§5.6 item 3): only hub-provenance rows get a
-                  Remove — a bundled/agent skill has no hub install to
-                  reverse this way. */}
-              {isHub && (
-                <button
-                  type="button"
-                  onClick={() => handleHubUninstall(sk.name)}
-                  disabled={uninstallInteraction.nativeDisabled}
-                  aria-disabled={uninstallInteraction.ariaDisabled}
-                  aria-busy={uninstallInteraction.ariaBusy}
-                  className="flex items-center gap-1 rounded border border-del px-2 py-0.5 font-mono text-2xs text-del hover:bg-del-soft disabled:cursor-default disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
-                >
-                  <Icon name={rowUninstalling ? 'loading' : 'trash'} size={12} spin={rowUninstalling} />
-                  {rowUninstalling ? 'Removing…' : 'Remove'}
-                </button>
-              )}
-            </div>
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
 
       <CreateSkillDisclosure onCreate={onCreate} />
       <InstallFromHubDisclosure onHubPreview={onHubPreview} onHubScan={onHubScan} onHubInstall={onHubInstall} />

@@ -8,6 +8,7 @@
  */
 
 import { readJsonBounded } from '../autocomplete/backends/http';
+import { isRecord } from '../shared/typeGuards';
 
 export interface EmbeddingsRequestBody {
   model: string;
@@ -48,6 +49,17 @@ export function buildEmbeddingsRequestBody(
     body.dimensions = dimensions;
   }
   return body;
+}
+
+/**
+ * WS-BG (SYN-BOUNDARY): SHALLOW envelope guard at the `/v1/embeddings`
+ * ingress — record-ness + `data` is an array, nothing deeper (ADR-BG: the
+ * deep per-datum validation already lives in {@link parseEmbeddingsResponse}
+ * and {@link isWellFormedVector}). Exported for test, the same posture as
+ * `parseEmbeddingsResponse` itself.
+ */
+export function isEmbeddingsResponseEnvelope(x: unknown): x is EmbeddingsResponse {
+  return isRecord(x) && Array.isArray(x.data);
 }
 
 /**
@@ -184,8 +196,12 @@ export class HttpEmbedder implements Embedder {
       timedOut = true;
       controller.abort();
     }, EMBED_TIMEOUT_MS);
+    // Invariant (WV3-MIN-SYN): at runtime `timer` is Node's Timeout, which has
+    // unref(). Under this host build (lib: ES2022 + @types/node) `timer` is already
+    // NodeJS.Timeout, so this double-cast + optional-call is belt-and-suspenders —
+    // it stays safe even if a DOM-typed setTimeout (number, no unref) were ever in scope.
     (timer as unknown as { unref?: () => void }).unref?.();
-    let json: EmbeddingsResponse;
+    let json: unknown;
     try {
       const res = await this.fetchImpl(`${this.endpoint}/v1/embeddings`, {
         method: 'POST',
@@ -212,7 +228,7 @@ export class HttpEmbedder implements Embedder {
       // free to send anything" rationale). This is the one call site both
       // `indexer.ts` (host) and `codebase-server.ts` (MCP child) route
       // through via `HttpEmbedder`, so one change caps both.
-      json = (await readJsonBounded(res)) as EmbeddingsResponse;
+      json = await readJsonBounded(res);
     } catch (err) {
       // V-16 RAG-2 (review M-2): a deadline abort surfaces a self-explanatory,
       // body-free message (the indexer log then names the embeddings deadline)
@@ -224,6 +240,11 @@ export class HttpEmbedder implements Embedder {
       throw err;
     } finally {
       clearTimeout(timer);
+    }
+    // WS-BG: honest refusal of a malformed envelope — the message names the
+    // endpoint and expected shape only, NEVER body content (C-5 hygiene).
+    if (!isEmbeddingsResponseEnvelope(json)) {
+      throw new Error('/v1/embeddings response was not the documented { data: [...] } JSON object shape');
     }
     const vectors = parseEmbeddingsResponse(json, batch.length);
     // TA-2 (AU-5): per-row shape validation — V2 (reproduced, worse than

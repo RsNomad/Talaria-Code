@@ -63,7 +63,7 @@ async function main(): Promise<void> {
     makeCodebaseSearchHandler({
       runSearch: (args) =>
         runCodebaseSearch(
-          { embedder, store },
+          { embedder, store, embedModel },
           { query: args.query, k: args.k ?? 10, path_globs: args.path_globs, language: args.language },
         ),
       log: (line) => console.error(line),

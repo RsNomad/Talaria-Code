@@ -77,6 +77,14 @@ export interface HandleSessionChangeResult {
    * this task wires; closing the async-race gap fully is a follow-up.
    */
   closeIntents: string[];
+  /**
+   * WS-R4 (handleSessionChange discriminant): names the topology outcome so
+   * callers stop DIFFING tabOrder.length to infer it — 'opened' = case 4
+   * minted a new tab; 'switched' = case 2 activated another tab; 'noop' =
+   * cases 1/3 + the defensive path (the active tab was kept; retitle/adopt
+   * only).
+   */
+  kind: 'opened' | 'switched' | 'noop';
 }
 
 /** Fallback random id for case 4 when the caller supplies no `newTabId`, and
@@ -109,7 +117,7 @@ export function handleSessionChange(
 
   if (!activeTab) {
     console.warn(`tabs: handleSessionChange — unknown active tab "${activeTabId}", ignoring`);
-    return { tabs, tabOrder, activeTabId, closeIntents: [] };
+    return { tabs, tabOrder, activeTabId, closeIntents: [], kind: 'noop' };
   }
 
   // Case 1: the active tab already owns this session.
@@ -119,6 +127,7 @@ export function handleSessionChange(
       tabOrder,
       activeTabId,
       closeIntents: [],
+      kind: 'noop',
     };
   }
 
@@ -145,6 +154,7 @@ export function handleSessionChange(
       tabOrder: tabOrder.filter((id) => id in nextTabs),
       activeTabId: existingTabId,
       closeIntents,
+      kind: 'switched',
     };
   }
 
@@ -166,6 +176,7 @@ export function handleSessionChange(
       tabOrder,
       activeTabId,
       closeIntents: [],
+      kind: 'noop',
     };
   }
 
@@ -183,5 +194,6 @@ export function handleSessionChange(
     tabOrder: [...tabOrder, id],
     activeTabId: id,
     closeIntents: [],
+    kind: 'opened',
   };
 }

@@ -23,6 +23,7 @@ import type {
   NextEditToggleState,
   Panel,
   PlanItem,
+  SessionLostReason,
   SessionsData,
   SlashCommandInfo,
   SubagentsData,
@@ -185,8 +186,41 @@ export interface TabState {
   binding: 'unbound' | 'pending' | 'bound';
   title: string;
   transcript: TranscriptItem[];
+  /**
+   * CA-M15: how many oldest transcript items have been trimmed from this tab
+   * to keep the view responsive (reducer-level cap, MAX_TRANSCRIPT_ITEMS).
+   * Absent ≡ 0 (kept off `makeTabState` so existing toEqual assertions on a
+   * fresh tab stay byte-identical); reset to 0 on `clear`. Monotonic between
+   * clears. Drives ChatView's honest "N earlier messages hidden" affordance +
+   * a one-time polite SR announcement.
+   */
+  hiddenCount?: number;
   plan: PlanStepView[];
   turnActive: boolean;
+  /**
+   * UX-03: Stop was dispatched and no terminal has arrived yet — drives the
+   * composer's disabled "Stopping…" affordance + SR announcement. Set by
+   * `local.stopPending` at Stop-click time; cleared EVERYWHERE `turnActive`
+   * clears (turn.end all statuses, clear, tab.clear). Deliberately NOT
+   * hydrate-carried: a re-created webview drops the pending flag — the turn
+   * either ends (clearing is then a no-op) or the user presses Stop again.
+   */
+  stopPending: boolean;
+  /**
+   * UX-04a: a `tab.newSession` request was dispatched and no `tab.bound`/
+   * `tab.error` terminal has arrived yet — drives the standing "Starting a
+   * new session…" row + SR announcement (App.tsx, below the sessionLost
+   * row) and the New Session button's busy-focusable posture (mirrors
+   * `stopPending` above, minus its `turnActive` guard: New Session is legal
+   * on any tab, bound or not). Set by `local.newSessionPending` at
+   * New-Session-click time, ahead of the `tab.newSession` post. exactOptional
+   * (`?: true`, never `false`/`undefined`): cleared by KEY OMISSION on
+   * `tab.bound`, `tab.error`, and the hydrate reconcile (the T10/261faba
+   * lesson — a reload must never resurrect a stale pending flag; every host
+   * refusal path already lands as `tab.error`, so bound/error are the
+   * exhaustive terminals for this flow).
+   */
+  newSessionPending?: true;
   currentModelId: string | null;
   /** Per-tab (Q-7 decided) — W2-F1 edit-policy preset. */
   preset: EditPolicyPreset;
@@ -245,6 +279,14 @@ export interface TabState {
    */
   sessionLost?: boolean;
   /**
+   * UX-04c: WHY the session was lost — the host's closed literal
+   * (`tab.error.reason`, session-lost only). Drives the standing row's
+   * per-reason copy in App.tsx; outlives the dismissible banner alongside
+   * `sessionLost` and clears with it on the next successful `tab.bound`
+   * (exactOptional: cleared by key omission, never `undefined`).
+   */
+  sessionLostReason?: SessionLostReason;
+  /**
    * W6-FE Part 1 (3-way ARCH I-3b): the ACP `available_commands` catalog for
    * THIS tab's session — per-tab (was a single GLOBAL `useState` in
    * `App.tsx` pre-fix, which let a second tab's `commands.available` push
@@ -272,6 +314,13 @@ export interface TabState {
   draftAttachments: Attachment[];
 }
 
+/** UX-02: the `gateway.health` payload as held in state (type-only mirror). */
+export interface GatewayHealthView {
+  state: 'ok' | 'degraded' | 'down';
+  /** Live retry counter of the worst management link; present iff state !== 'ok'. */
+  attempts?: number;
+}
+
 export interface AppState {
   tabs: Record<string, TabState>;
   tabOrder: string[];
@@ -287,6 +336,13 @@ export interface AppState {
    * `Pill` in `TabStrip`.
    */
   backendKind: BackendKind;
+  /**
+   * UX-02: combined management-link health (`gateway.health` push) —
+   * CONNECTION-GLOBAL, exactly like `backendKind`/`nextEditToggles` above.
+   * Boot default `{state:'ok'}`: no banner until the host says otherwise
+   * (the provider re-syncs the real value right after every hydrate).
+   */
+  gatewayHealth: GatewayHealthView;
   /**
    * W5.1 R5 (Task 13): the Guard-ratified «Next Edit Suggestions» toggles —
    * CONNECTION-GLOBAL, exactly like `theme`/`backendKind` above (there is one
@@ -425,22 +481,23 @@ export const DEFAULT_PRESET: EditPolicyPreset = 'manual';
 
 /** A freshly-minted, fully-idle tab (unbound, empty transcript, idle panels). */
 export function makeTabState(tabId: string, title: string): TabState {
+  // exactOptional prep (arm 1): `sessionId`/`subagentsRefreshError`/`error`
+  // are all optional (`?:`) on `TabState` — a fresh tab has none of them, so
+  // the keys are simply absent rather than present-with-`undefined`.
   return {
     tabId,
-    sessionId: undefined,
     binding: 'unbound',
     title,
     transcript: [],
     plan: [],
     turnActive: false,
+    stopPending: false,
     currentModelId: null,
     preset: DEFAULT_PRESET,
     activeModeId: null,
     rootId: '',
     availableModes: [],
     subagents: idle,
-    subagentsRefreshError: undefined,
-    error: undefined,
     availableCommands: [],
     draft: '',
     draftAttachments: [],
@@ -486,6 +543,9 @@ export function createInitialState(restored?: {
     // fallback for the one render before hydrate — exactly the A2 bug this
     // badge exists to close).
     backendKind: 'mock',
+    // UX-02: boot default {state:'ok'} — no banner until the host says
+    // otherwise (the provider re-syncs the real value right after hydrate).
+    gatewayHealth: { state: 'ok' },
     // R5 (Task 13): boot both-OFF — the same hardcoded first-run default the
     // Guard itself uses. Before the first `nextEdit.state` push there IS no
     // known state, and honestly showing OFF (then self-correcting the instant
@@ -496,12 +556,16 @@ export function createInitialState(restored?: {
     globalPanels: {},
     rootPanels: {},
     sessionsPanel: idle,
-    systemError: undefined,
-    pendingSessionLoad: undefined,
+    // exactOptional prep (arm 1): `systemError`/`pendingSessionLoad` are
+    // optional on `AppState` — boot has neither, so the keys are absent
+    // rather than present-with-`undefined`.
     closeIntents: [],
     nextChatNumber: restored?.nextChatNumber ?? 2,
-    restoredTitles: restored?.tabTitles,
-    restoredDrafts: restored?.drafts,
+    // `restored?.tabTitles`/`restored?.drafts` are themselves `T | undefined`
+    // (an optional field read off an optional param) — spread each key in
+    // only when the caller actually supplied one.
+    ...(restored?.tabTitles !== undefined ? { restoredTitles: restored.tabTitles } : {}),
+    ...(restored?.drafts !== undefined ? { restoredDrafts: restored.drafts } : {}),
     setupProgress: EMPTY_SETUP_PROGRESS,
   };
 }

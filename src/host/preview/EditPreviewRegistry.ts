@@ -37,6 +37,8 @@
  * `vscode.EventEmitter<vscode.Uri>`.
  */
 
+import { composePreviewKey, type PreviewKey } from './previewIds';
+
 /** The RAW (pre-hunk-derivation) texts for one edited file, straight off the
  * ACP `AcpDiffContent` block — `oldText` is `null`/`undefined` for a
  * brand-new file, mirroring `diffHunks.ts`'s own convention. */
@@ -63,25 +65,21 @@ export interface PreviewChangeSubscription {
   dispose(): void;
 }
 
-/** Space-joined compound key — `sessionId`/`toolCallId` are opaque,
- * server-issued, whitespace-free ids, so joining on a plain space cannot
- * ambiguously collide two DIFFERENT `(sessionId, toolId)` pairs onto the
- * same string. */
-function compoundKey(sessionId: string, toolId: string): string {
-  return `${sessionId} ${toolId}`;
-}
-
 export class EditPreviewRegistry {
-  private readonly entries = new Map<string, PreviewEntry>();
+  private readonly entries = new Map<PreviewKey, PreviewEntry>();
   private readonly listeners = new Set<PreviewChangeListener>();
 
   /**
    * Populate (or replace) the entry for `(sessionId, toolId)`. Called ONLY
    * from the ask path (`SessionController.emitApprovalCard`) — see the class
-   * doc's §7 A6 pin.
+   * doc's §7 A6 pin. CA-M17 (WS-BG): an id `composePreviewKey` refuses never
+   * registers — `diff.open` for it then serves the placeholder, the same
+   * fail-safe every other miss already takes.
    */
   set(sessionId: string, toolId: string, approvalId: string, files: readonly PreviewFile[]): void {
-    this.entries.set(compoundKey(sessionId, toolId), { approvalId, files: [...files] });
+    const key = composePreviewKey(sessionId, toolId);
+    if (key === undefined) return;
+    this.entries.set(key, { approvalId, files: [...files] });
     this.notify();
   }
 
@@ -92,17 +90,19 @@ export class EditPreviewRegistry {
    * treat a miss as "serve the placeholder", never fall back to a file read.
    */
   getFile(sessionId: string, toolId: string, path: string): PreviewFileTexts | undefined {
-    const entry = this.entries.get(compoundKey(sessionId, toolId));
+    const key = composePreviewKey(sessionId, toolId);
+    const entry = key !== undefined ? this.entries.get(key) : undefined;
     if (!entry) return undefined;
     const file = entry.files.find((f) => f.path === path);
     if (!file) return undefined;
-    return { oldText: file.oldText, newText: file.newText };
+    return { ...(file.oldText !== undefined ? { oldText: file.oldText } : {}), newText: file.newText };
   }
 
   /** Remove the entry for `(sessionId, toolId)` (approval resolved/denied/
    * cancelled/torn down) — a no-op if it's already gone. */
   delete(sessionId: string, toolId: string): void {
-    if (this.entries.delete(compoundKey(sessionId, toolId))) this.notify();
+    const key = composePreviewKey(sessionId, toolId);
+    if (key !== undefined && this.entries.delete(key)) this.notify();
   }
 
   /** Remove every entry (full teardown). */

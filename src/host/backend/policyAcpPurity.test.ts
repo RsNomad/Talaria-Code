@@ -221,20 +221,39 @@ describe('W6-FK (I-9): session/ purity guard — HEADLESS tier (vscode-free + fs
 // this task. Mirrors `contextPurity.test.ts`/`nextEditPurity.test.ts`'s
 // established shape (own ROOT, own ADAPTER_ALLOW, the SAME shared
 // `VSCODE_IMPORT_BAN`/`FS_IMPORT_BAN` from `purityScan.ts`), narrowed to
-// rag/'s own adapter: `indexer.ts` is the one file that legitimately
-// imports BOTH `vscode` (workspace root resolution / file-watcher wiring)
-// AND `node:fs` (walking the workspace tree to index it) — unlike
+// rag/'s own adapter(s): `indexer.ts` is the file that legitimately imports
+// BOTH `vscode` (workspace root resolution / file-watcher wiring) AND
+// `node:fs` (walking the workspace tree to index it) — unlike
 // `context/`/`nextedit/`'s adapters, which need vscode but never fs, so
 // (unlike those two files' zero-exception fs-ban) THIS guard's fs-ban
-// carries the identical adapter exception as its vscode-ban. Every other
-// rag/ module (chunk/, parser/, store/, chunker.ts, contentHash.ts,
-// embedder.ts, gitignore.ts, header.ts, hybrid.ts) must import neither —
-// verified true at widening time (empirically re-checked: `indexer.ts` is
-// the ONLY vscode/fs importer anywhere under `src/rag/`).
+// carries a WIDER adapter exception than its vscode-ban. Every other rag/
+// module (chunk/, parser/, store/, chunker.ts, contentHash.ts, embedder.ts,
+// gitignore.ts, header.ts, hybrid.ts) must import neither.
+//
+// B8 (FUNC-INDEXER, pure-move refactor): `indexer.ts`'s `runBuild`/
+// `reindexFiles`/`walk` were extracted into `buildPipeline.ts` verbatim,
+// including their `node:fs` calls (the RAG test suite monkey-patches
+// `node:fs`'s promise methods on the shared module-cache singleton, so the
+// extracted module imports `fs` the SAME way indexer.ts does rather than
+// threading it through the `IndexerContext` bag — see buildPipeline.ts's own
+// doc comment). `buildPipeline.ts` never imports `vscode` (it takes
+// `opts.workspaceRoot` etc. as plain data via the ctx bag), so it widens
+// ONLY the fs-ban exception (`RAG_FS_ADAPTER_ALLOW`), not the vscode-ban one
+// (`RAG_ADAPTER_ALLOW`) — a future accidental `import 'vscode'` inside
+// buildPipeline.ts would still be caught.
+//
+// `indexer.ts`'s `watch()` body (the file-watcher + `handleFsEvent`
+// debounce loop) was likewise extracted verbatim into `watchPipeline.ts`.
+// Unlike `buildPipeline.ts`, it genuinely needs BOTH `vscode`
+// (`vscode.workspace.createFileSystemWatcher`, `vscode.Disposable`,
+// `vscode.Uri`) and `node:fs` (`fs.lstat`, same monkey-patch-visibility
+// reasoning) — the same dual exemption `indexer.ts` itself has — so it is
+// added to both allow-sets.
 // ---------------------------------------------------------------------------
 
 const RAG_ROOT = join(__dirname, '..', '..', 'rag');
-const RAG_ADAPTER_ALLOW = new Set(['indexer.ts']);
+const RAG_ADAPTER_ALLOW = new Set(['indexer.ts', 'watchPipeline.ts']);
+const RAG_FS_ADAPTER_ALLOW = new Set(['indexer.ts', 'buildPipeline.ts', 'watchPipeline.ts']);
 
 function collectRagSources() {
   return collectNonTestTsSources(RAG_ROOT);
@@ -247,7 +266,7 @@ describe('T-18 (C3): rag/ purity guard', () => {
     expect(files.some((f) => f.file === 'indexer.ts')).toBe(true);
   });
 
-  it('no module under rag/ imports vscode EXCEPT the sanctioned indexer.ts', () => {
+  it('no module under rag/ imports vscode EXCEPT the sanctioned indexer.ts/watchPipeline.ts', () => {
     const offenders = collectRagSources()
       .filter((f) => !RAG_ADAPTER_ALLOW.has(f.file))
       .filter((f) => VSCODE_IMPORT_BAN.test(f.content))
@@ -255,9 +274,9 @@ describe('T-18 (C3): rag/ purity guard', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('no module under rag/ imports node:fs EXCEPT the sanctioned indexer.ts', () => {
+  it('no module under rag/ imports node:fs EXCEPT the sanctioned indexer.ts/buildPipeline.ts/watchPipeline.ts', () => {
     const offenders = collectRagSources()
-      .filter((f) => !RAG_ADAPTER_ALLOW.has(f.file))
+      .filter((f) => !RAG_FS_ADAPTER_ALLOW.has(f.file))
       .filter((f) => FS_IMPORT_BAN.test(f.content))
       .map((f) => f.file);
     expect(offenders).toEqual([]);
@@ -281,7 +300,7 @@ describe('T-18 (C3): rag/ purity guard', () => {
 
   it('RED-first proof: the fs-ban would catch a hypothetical non-adapter violation (in-memory injection into the REAL collected file list)', () => {
     const withInjectedViolation = [
-      ...collectRagSources().filter((f) => !RAG_ADAPTER_ALLOW.has(f.file)),
+      ...collectRagSources().filter((f) => !RAG_FS_ADAPTER_ALLOW.has(f.file)),
       { file: '__hypothetical_fs_violation__.ts', absPath: '', content: "import { readFileSync } from 'node:fs';\n" },
     ];
     const offenders = withInjectedViolation.filter((f) => FS_IMPORT_BAN.test(f.content)).map((f) => f.file);
@@ -313,14 +332,24 @@ describe('T-18 (C3): rag/ purity guard', () => {
 // honest guard, and re-litigating them here would be redundant, not
 // stricter. `index.ts` (the activation/registration entry), `provider.ts`
 // (the `vscode.InlineCompletionItemProvider` registration) and `config.ts`
-// (`vscode.workspace.getConfiguration` reads) are the three top-level
+// (`vscode.workspace.getConfiguration` reads) are three top-level
 // adapter-tier files — the non-`.vscode.ts`-named outlier this repo's
 // naming-convention backlog already documents (`purityScan.ts`'s module
 // doc) — verified below to genuinely need `vscode`, non-vacuously.
+// CA-06-face + CA-06-path-face (WS-FIM T2b) added a FOURTH: `egressNotice.
+// vscode.ts` — the two-kind egress-notice surface (`LanguageStatusItem` +
+// toast). It follows the repo's proper `.vscode.ts` adapter-naming
+// convention (unlike the three legacy outliers above), so it needs no
+// naming-backlog entry — just this allowlist addition.
 // ---------------------------------------------------------------------------
 
 const AUTOCOMPLETE_ROOT = join(__dirname, '..', '..', 'autocomplete');
-const AUTOCOMPLETE_ADAPTER_ALLOW = new Set(['index.ts', 'provider.ts', 'config.ts']);
+const AUTOCOMPLETE_ADAPTER_ALLOW = new Set([
+  'index.ts',
+  'provider.ts',
+  'config.ts',
+  'egressNotice.vscode.ts',
+]);
 
 /**
  * Non-recursive top-level-only sibling of `collectNonTestTsSources` — used
@@ -346,7 +375,7 @@ function collectAutocompleteRootSources() {
 }
 
 describe('T-18 (C3): autocomplete/ ROOT purity guard (top-level files only — context/ and nextedit/ have their own dedicated guards)', () => {
-  it('discovers the three adapters + at least one pure sibling (non-vacuous file discovery)', () => {
+  it('discovers the four adapters + at least one pure sibling (non-vacuous file discovery)', () => {
     const files = collectAutocompleteRootSources();
     expect(files.length).toBeGreaterThan(0);
     for (const adapter of AUTOCOMPLETE_ADAPTER_ALLOW) {
@@ -355,14 +384,14 @@ describe('T-18 (C3): autocomplete/ ROOT purity guard (top-level files only — c
     expect(files.some((f) => f.file === 'apiKey.ts')).toBe(true);
   });
 
-  it('no top-level autocomplete/ module imports node:fs (zero exceptions — not even the three adapters need it)', () => {
+  it('no top-level autocomplete/ module imports node:fs (zero exceptions — not even the four adapters need it)', () => {
     const offenders = collectAutocompleteRootSources()
       .filter((f) => FS_IMPORT_BAN.test(f.content))
       .map((f) => f.file);
     expect(offenders).toEqual([]);
   });
 
-  it('no top-level autocomplete/ module imports vscode EXCEPT the three sanctioned adapters', () => {
+  it('no top-level autocomplete/ module imports vscode EXCEPT the four sanctioned adapters', () => {
     const offenders = collectAutocompleteRootSources()
       .filter((f) => !AUTOCOMPLETE_ADAPTER_ALLOW.has(f.file))
       .filter((f) => VSCODE_IMPORT_BAN.test(f.content))
@@ -370,7 +399,7 @@ describe('T-18 (C3): autocomplete/ ROOT purity guard (top-level files only — c
     expect(offenders).toEqual([]);
   });
 
-  it('sanity: all three sanctioned adapters DO import vscode (the exemption is real, not vacuous)', () => {
+  it('sanity: all four sanctioned adapters DO import vscode (the exemption is real, not vacuous)', () => {
     const files = collectAutocompleteRootSources();
     for (const adapter of AUTOCOMPLETE_ADAPTER_ALLOW) {
       const source = files.find((f) => f.file === adapter);
@@ -405,6 +434,7 @@ describe('T-18 (C3): autocomplete/ ROOT purity guard (top-level files only — c
     expect(offenders).not.toContain('index.ts');
     expect(offenders).not.toContain('provider.ts');
     expect(offenders).not.toContain('config.ts');
+    expect(offenders).not.toContain('egressNotice.vscode.ts');
   });
 
   it('non-recursive by construction: never descends into context/, nextedit/, or backends/ (those are scanned by their own dedicated guards)', () => {

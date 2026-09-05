@@ -224,7 +224,7 @@ describe('LOCK: every egress-DESTINATION-steering setting is machine-scoped (I-2
     const real = configurationProperties();
     const mutated: Record<string, ConfigProperty> = {
       ...real,
-      'talaria.autocomplete.endpoint': { scope: undefined },
+      'talaria.autocomplete.endpoint': {},
     };
     const notMachine = eligibleKeys(mutated).filter((key) => mutated[key]?.scope !== 'machine');
     expect(notMachine).toContain('talaria.autocomplete.endpoint');
@@ -252,7 +252,7 @@ describe('LOCK: every model-integrity setting is machine-scoped (I-1/I-3: a sepa
   it('RED-first proof: an unscoped model key is caught (in-memory injection)', () => {
     const props: Record<string, ConfigProperty> = {
       ...configurationProperties(),
-      'talaria.rag.embedModel': { scope: undefined },
+      'talaria.rag.embedModel': {},
     };
     const notMachine = eligibleKeys(props).filter((key) => props[key]?.scope !== 'machine');
     expect(notMachine).toContain('talaria.rag.embedModel');

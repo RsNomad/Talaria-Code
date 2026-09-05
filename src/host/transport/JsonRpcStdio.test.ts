@@ -47,14 +47,16 @@ function makeFakeChild(): {
 function makeTransport(): {
   transport: JsonRpcStdio;
   stdout: PassThrough;
+  stdin: PassThrough;
   fakeChild: ChildProcess & { kill: ReturnType<typeof vi.fn>; exitCode: number | null };
 } {
-  const { child, stdout } = makeFakeChild();
+  const { child, stdout, stdin } = makeFakeChild();
   vi.mocked(spawn).mockReturnValue(child);
   const transport = new JsonRpcStdio({ command: 'python', args: ['-m', 'tui_gateway.entry'] });
   return {
     transport,
     stdout,
+    stdin,
     fakeChild: child as unknown as ChildProcess & { kill: ReturnType<typeof vi.fn>; exitCode: number | null },
   };
 }
@@ -120,6 +122,24 @@ describe('JsonRpcStdio.onStdout — B-4 (SEC-6): cap the residual (post-drain) s
     await flush();
     stdout.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'pong' })}\n`);
     await expect(pending).resolves.toBe('pong');
+  });
+
+  it('CA-M01 (WS-AC): a CJK residual line trips the cap by UTF-8 BYTES, not UTF-16 units', async () => {
+    const { transport, stdout, fakeChild } = makeTransport();
+    void transport;
+    // 1.5M CJK chars = 1.5M UTF-16 units (< 4Mi units — the OLD check never
+    // fired) but 4.5 MB UTF-8 bytes (> 4 MiB — the cap's real meaning).
+    stdout.emit('data', '一'.repeat(1_500_000));
+    await Promise.resolve();
+    expect(fakeChild.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+
+  it('CA-M01: a CJK residual UNDER the byte cap does not trip', async () => {
+    const { transport, stdout, fakeChild } = makeTransport();
+    void transport;
+    stdout.emit('data', '一'.repeat(1_000_000)); // 3 MB bytes < 4 MiB
+    await Promise.resolve();
+    expect(fakeChild.kill).not.toHaveBeenCalled();
   });
 });
 
@@ -377,5 +397,44 @@ describe("JsonRpcStdio — AU-12/TE-1: child 'error' fans to onExit (mirrors Acp
 
     expect(throwing).toHaveBeenCalledWith(null);
     expect(other).toHaveBeenCalledWith(null);
+  });
+});
+
+describe('F2-01/F3-13 (WS-AC): requests against a terminated child fast-fail, never 120s-hang', () => {
+  it('request() after child exit rejects immediately with a terminated message', async () => {
+    const { transport, fakeChild } = makeTransport();
+    fakeChild.emit('exit', 1); // ChildProcess IS an EventEmitter — same idiom as the file's other tests
+    // RED evidence (pre-fix): this stays pending until the 120s request
+    // timer — the rejects-assertion times out at vitest's 5s default, the
+    // same red shape acpClient.terminate.test.ts documents.
+    await expect(transport.request('config.show')).rejects.toThrow(/terminated/i);
+  });
+
+  it('notify() after child exit writes nothing to the dead stdin', async () => {
+    const { transport, fakeChild, stdin } = makeTransport();
+    const written: Buffer[] = [];
+    stdin.on('data', (c: Buffer) => written.push(c));
+    fakeChild.emit('exit', 1);
+    transport.notify('ui.ping');
+    await Promise.resolve();
+    expect(Buffer.concat(written).toString('utf8')).toBe('');
+  });
+});
+
+describe('F2-02 (WS-AC): dispose() stops consuming the dead child streams', () => {
+  it('stdout data after dispose is neither buffered nor logged', async () => {
+    const lines: string[] = [];
+    const { child, stdout } = makeFakeChild();
+    vi.mocked(spawn).mockReturnValue(child);
+    const transport = new JsonRpcStdio({
+      command: 'python',
+      args: ['-m', 'tui_gateway.entry'],
+      logger: { append: (l) => lines.push(l) },
+    });
+    transport.dispose();
+    const before = lines.length;
+    stdout.emit('data', '{"jsonrpc":"2.0","method":"ev","params":{}}\n');
+    await Promise.resolve();
+    expect(lines.slice(before).filter((l) => l.includes('←'))).toEqual([]);
   });
 });

@@ -50,7 +50,11 @@ describe('pendingDiffToolIds', () => {
   });
 
   it('excludes a command approval that carries no toolId', () => {
-    const transcript: TranscriptItem[] = [approval({ toolId: undefined, approvalKind: 'command' })];
+    // exactOptional prep (arm 1, T16 precedent): `toolId` must be ABSENT, not
+    // an explicit `undefined` key — drop it via rest destructuring rather
+    // than overriding the shared fixture's default `toolId: 'tool-1'`.
+    const { toolId: _clearedToolId, ...rest } = approval({ approvalKind: 'command' });
+    const transcript: TranscriptItem[] = [rest];
     expect(pendingDiffToolIds(transcript).size).toBe(0);
   });
 
@@ -61,7 +65,7 @@ describe('pendingDiffToolIds', () => {
   it('T-A2 (V-4/V-5): excludes a toolId whose approval has settledOutcome set, even with no resolvedOptionId (e.g. a turn.end cancel-fold)', () => {
     const transcript: TranscriptItem[] = [
       tool(),
-      approval({ resolvedOptionId: undefined, settledOutcome: 'cancelled' }),
+      approval({ settledOutcome: 'cancelled' }),
     ];
     expect(pendingDiffToolIds(transcript).has('tool-1')).toBe(false);
   });

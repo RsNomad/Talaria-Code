@@ -3,7 +3,7 @@ import type { CheckpointsData, DataPanel, PanelDataMap, ThemeInfo } from '../pro
 import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type AppState, type MessageItem } from '../types';
 import { must } from '../testing/must';
 import { assertExhaustivePanel } from './panels';
-import { reduce, reduceLocal } from './transcript';
+import { reduce, reduceLocal, MAX_TRANSCRIPT_ITEMS } from './transcript';
 
 /** One minimal-valid payload per GLOBAL DataPanel (§2f) — used to pin every
  * global panel's routing, not just `tools` (P7-N4). */
@@ -339,7 +339,12 @@ describe('transcript reducer — W2 T4 F-D: approval.request carries toolId into
     });
 
     const item = activeTab(state).transcript.find((i) => i.kind === 'approval');
-    expect(item).toMatchObject({ kind: 'approval', id: 'appr-1', toolId: undefined });
+    expect(item).toMatchObject({ kind: 'approval', id: 'appr-1' });
+    // exactOptional prep (arm 1): the fold now OMITS `toolId` entirely when
+    // the wire didn't carry one (absent, not an explicit `undefined` key) —
+    // `toMatchObject({ toolId: undefined })` no longer matches an absent
+    // key, so presence is asserted directly.
+    expect(item).not.toHaveProperty('toolId');
   });
 });
 
@@ -552,6 +557,57 @@ describe('transcript reducer — W6-FF (3-way ARCH I-1): hydrate reconciles the 
     expect(Object.keys(hydrated.tabs)).toEqual([priorTabId]);
     expect(must(hydrated.tabs[priorTabId]).transcript).toHaveLength(1); // preserved, not reset
     expect(hydrated.tabs[priorTabId]).toMatchObject({ sessionId: 'sA', binding: 'bound', rootId: '/root-a' });
+  });
+
+  /** T10 Opus review fix: `stopPending` is documented "deliberately NOT
+   * hydrate-carried" but the reconcile literal never structurally enforced
+   * it the way it does for `turnActive` (explicit `entry.turnActive ?? false`
+   * override on the same `{ ...base, ...overrides }` literal). Same
+   * still-live-webview harness as the test above — `base` is a tab this
+   * webview already holds, now carrying `stopPending: true` from an
+   * in-flight Stop click — proving the reset is structural, not incidental
+   * to `base` happening to be idle. RED before the fix: `stopPending` rides
+   * `...base` unreset, so a second hydrate on a still-live webview mid-Stop
+   * paints "Stopping…" that will never clear (its `turn.end` already fired,
+   * `turnActive` correctly lands `false` here). */
+  it('resets stopPending:false when reconciling a session already bound in the current state — never leaks a stale "Stopping…" past a live turn\'s end', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 'sA' }); // adopts into bootstrap
+    const priorTabId = state.activeTabId;
+    state = reduceLocal(state, { type: 'local.stopPending', tabId: priorTabId });
+    expect(state.tabs[priorTabId]?.stopPending).toBe(true); // precondition: base really carries it
+
+    const reSeed = {
+      ...twoLiveTabsSeed,
+      tabs: [{ tabId: priorTabId, sessionId: 'sA', cwd: '/root-a', rootId: '/root-a', preset: 'manual' as const }],
+    };
+    const hydrated = reduce(state, { type: 'hydrate', state: reSeed });
+
+    expect(hydrated.tabs[priorTabId]).toMatchObject({ stopPending: false });
+  });
+
+  /** UX-04a (mirrors the T10/261faba lesson immediately above): `newSessionPending`
+   * is likewise NOT hydrate-carried — `local.newSessionPending` sets it at
+   * New-Session-click time, and only `tab.bound`/`tab.error` (the terminal
+   * response to the `tab.newSession` post that follows) ever clear it. A
+   * reload/second-hydrate on a still-live webview must never resurrect a
+   * stale "Starting a new session…" that its own terminal already resolved.
+   * Unlike `stopPending: false` (a real boolean), the exactOptional `?: true`
+   * field can only be cleared by KEY OMISSION — asserted via `toBeUndefined()`
+   * / `not.toHaveProperty`, never a `false` literal. */
+  it('clears newSessionPending (by key omission) when reconciling a session already bound in the current state — never leaks a stale "Starting a new session…" past its own tab.bound/tab.error', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 'sA' }); // adopts into bootstrap
+    const priorTabId = state.activeTabId;
+    state = reduceLocal(state, { type: 'local.newSessionPending', tabId: priorTabId });
+    expect(state.tabs[priorTabId]?.newSessionPending).toBe(true); // precondition: base really carries it
+
+    const reSeed = {
+      ...twoLiveTabsSeed,
+      tabs: [{ tabId: priorTabId, sessionId: 'sA', cwd: '/root-a', rootId: '/root-a', preset: 'manual' as const }],
+    };
+    const hydrated = reduce(state, { type: 'hydrate', state: reSeed });
+
+    expect(hydrated.tabs[priorTabId]?.newSessionPending).toBeUndefined();
+    expect(hydrated.tabs[priorTabId]).not.toHaveProperty('newSessionPending');
   });
 
   /** H4-B8 (arch report Minor-2): the seed's per-tab DISPLAY fields
@@ -1032,7 +1088,7 @@ describe('transcript reducer — AU-61: scoped refreshError state core (sessions
         type: 'panel.data',
         panel: 'sessions',
         cwd: '/w',
-        data: { sessions: [{ id: 's1', cwd: '/w', title: 'A' }], nextCursor: undefined },
+        data: { sessions: [{ id: 's1', cwd: '/w', title: 'A' }] },
       });
       s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
       expect(s.sessionsPanel.status).toBe('success'); // keep-data (TI-3) — already green at HEAD
@@ -1046,30 +1102,30 @@ describe('transcript reducer — AU-61: scoped refreshError state core (sessions
     });
 
     it('the next sessions success push clears sessionsRefreshError', () => {
-      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [] } });
       s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
       expect(s.sessionsRefreshError).toBe('boom');
 
-      s = reduce(s, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      s = reduce(s, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [] } });
       expect(s.sessionsRefreshError).toBeUndefined();
-      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [], nextCursor: undefined } });
+      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [] } });
     });
 
     it('local.scopedRefreshError.dismiss{sessions} clears the slot (and is a no-op when unset)', () => {
       const untouched = reduceLocal(INITIAL_STATE, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'sessions' } });
       expect(untouched).toBe(INITIAL_STATE); // no-op — same reference
 
-      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [] } });
       s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
       expect(s.sessionsRefreshError).toBe('boom');
 
       s = reduceLocal(s, { type: 'local.scopedRefreshError.dismiss', target: { panel: 'sessions' } });
       expect(s.sessionsRefreshError).toBeUndefined();
-      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [], nextCursor: undefined } });
+      expect(s.sessionsPanel).toEqual({ status: 'success', data: { sessions: [] } });
     });
 
     it('local.panelLoading (a plain background refetch) does NOT clear a standing sessionsRefreshError — it survives until success or dismiss', () => {
-      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [], nextCursor: undefined } });
+      let s = reduce(INITIAL_STATE, { type: 'panel.data', panel: 'sessions', cwd: '/w', data: { sessions: [] } });
       s = reduceLocal(s, { type: 'local.panelError', panel: 'sessions', message: 'boom', retryable: true });
       s = reduceLocal(s, { type: 'local.panelLoading', panel: 'sessions' });
       expect(s.sessionsRefreshError).toBe('boom');
@@ -1288,6 +1344,26 @@ describe('transcript reducer — TI-1 (AU-39): pendingSessionLoad clears on the 
   });
 });
 
+describe('transcript reducer — UX-04b: local.sessionLoad.timeout (webview-side watchdog fallback, defense in depth over WS-R4\'s host-side deadline)', () => {
+  it('clears pendingSessionLoad, mirroring clearResolvedSessionLoad\'s key-omission discipline', () => {
+    let state = reduceLocal(INITIAL_STATE, {
+      type: 'local.sessionLoad.start',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'hist-1',
+    });
+    expect(state.pendingSessionLoad).toEqual({ tabId: BOOTSTRAP_TAB_ID, sessionId: 'hist-1' });
+
+    state = reduceLocal(state, { type: 'local.sessionLoad.timeout' });
+    expect(state.pendingSessionLoad).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(state, 'pendingSessionLoad')).toBe(false);
+  });
+
+  it('is a no-op when nothing is pending', () => {
+    const state = reduceLocal(INITIAL_STATE, { type: 'local.sessionLoad.timeout' });
+    expect(state.pendingSessionLoad).toBeUndefined();
+  });
+});
+
 describe('transcript reducer — W4-T3b D1: the checkpoints eternal-spinner fix (App-read <-> push-key consistency)', () => {
   it('fetch-loading -> tab.bound{rootId} -> checkpoints push{rootId} resolves the ACTIVE tab\'s rootPanels slice to success, not a stuck idle/loading', () => {
     // 1. The panel is opened BEFORE the tab is bound — a `local.panelLoading`
@@ -1329,7 +1405,14 @@ describe('transcript reducer — W4-T3b Deliverable 5: local tab lifecycle actio
     const state = reduceLocal(INITIAL_STATE, { type: 'local.tab.open', tabId: 'tab-2' });
     expect(state.tabOrder).toEqual([BOOTSTRAP_TAB_ID, 'tab-2']);
     expect(state.activeTabId).toBe('tab-2');
-    expect(state.tabs['tab-2']).toMatchObject({ binding: 'pending', sessionId: undefined });
+    // `toMatchObject` requires the key to literally EXIST on the received
+    // object (Jest/Vitest `subsetEquality`'s `hasPropertyInObject` check), so
+    // since exactOptional prep made `TabState.sessionId` absent (not
+    // present-with-`undefined`) for a fresh tab (`types.ts`'s
+    // `makeTabState`), asserting its absence needs its own check rather than
+    // `{ sessionId: undefined }` inside `toMatchObject`.
+    expect(state.tabs['tab-2']).toMatchObject({ binding: 'pending' });
+    expect(state.tabs['tab-2']?.sessionId).toBeUndefined();
   });
 
   it('local.tab.select switches the active tab', () => {
@@ -1937,6 +2020,80 @@ describe('transcript reducer — ARCH-1 (final review, UI I-3): draft survives a
     // half of its own fold) — open-failed must not FLIP that to true.
     expect(activeTab(state).sessionLost).toBe(false);
   });
+
+  it('UX-04c: session-lost reason rides the marker; a successful bind clears it BY KEY OMISSION', () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess1',
+      rootId: '/workspace/root-a',
+    });
+
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'x',
+      reason: 'timeout',
+    });
+    expect(activeTab(state).sessionLostReason).toBe('timeout');
+
+    state = reduce(state, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 's2',
+      rootId: '/workspace/root-a',
+    });
+
+    expect('sessionLostReason' in activeTab(state)).toBe(false); // key GONE, never `undefined`
+  });
+
+  it('UX-04c: reason omitted on the wire → no sessionLostReason key at all', () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess1',
+      rootId: '/workspace/root-a',
+    });
+
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'the session is gone',
+      // no `reason` — legacy/back-compat emitter
+    });
+
+    expect('sessionLostReason' in activeTab(state)).toBe(false);
+  });
+
+  it("UX-04c: a NEW session-lost WITHOUT a reason clears a previous loss's reason (no stale vocabulary)", () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess1',
+      rootId: '/workspace/root-a',
+    });
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'x',
+      reason: 'disconnected',
+    });
+    expect(activeTab(state).sessionLostReason).toBe('disconnected');
+
+    // A second session-lost for the SAME tab (e.g. a subsequent History
+    // load attempt that fails again) — this time the host sends no reason.
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'y',
+    });
+
+    expect('sessionLostReason' in activeTab(state)).toBe(false);
+  });
 });
 
 describe('transcript reducer — IMP-2 (W3-T6 3-lens review, CF-11): tab.clear is tabId-scoped + unconditional', () => {
@@ -2014,6 +2171,27 @@ describe('transcript reducer — IMP-2 (W3-T6 3-lens review, CF-11): tab.clear i
 
   it('tab.clear for an unknown tabId is dropped (dev-log), never throws', () => {
     expect(() => reduce(INITIAL_STATE, { type: 'tab.clear', tabId: 'no-such-tab' })).not.toThrow();
+  });
+
+  it('UX-04c: tab.clear strips sessionLostReason along with error', () => {
+    let state = reduce(INITIAL_STATE, {
+      type: 'tab.bound',
+      tabId: BOOTSTRAP_TAB_ID,
+      sessionId: 'sess-dead',
+      rootId: '/root',
+    });
+    state = reduce(state, {
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      message: 'the session is gone',
+      reason: 'recovery-failed',
+    });
+    expect(activeTab(state).sessionLostReason).toBe('recovery-failed');
+
+    state = reduce(state, { type: 'tab.clear', tabId: BOOTSTRAP_TAB_ID });
+
+    expect('sessionLostReason' in activeTab(state)).toBe(false);
   });
 });
 
@@ -2464,5 +2642,220 @@ describe('panel.activate (P1 entry-point fix)', () => {
   it('is a pure fold — no other state is touched', () => {
     const next = reduce(INITIAL_STATE, { type: 'panel.activate', panel: 'setup' });
     expect({ ...next, activePanel: INITIAL_STATE.activePanel }).toEqual(INITIAL_STATE);
+  });
+});
+
+describe('UX-02: gateway.health folds into AppState.gatewayHealth (connection-global)', () => {
+  it('folds state + attempts; a later ok push (attempts omitted) retires it', () => {
+    let state = reduce(INITIAL_STATE, { type: 'gateway.health', state: 'degraded', attempts: 5 });
+    expect(state.gatewayHealth).toEqual({ state: 'degraded', attempts: 5 });
+    state = reduce(state, { type: 'gateway.health', state: 'down', attempts: 10 });
+    expect(state.gatewayHealth).toEqual({ state: 'down', attempts: 10 });
+    state = reduce(state, { type: 'gateway.health', state: 'ok' });
+    // exactOptional: the key is ABSENT after an ok push, never present-with-undefined.
+    expect(state.gatewayHealth).toEqual({ state: 'ok' });
+    expect('attempts' in state.gatewayHealth).toBe(false);
+  });
+
+  it('boot default is {state:"ok"} — no banner until the host says otherwise', () => {
+    expect(INITIAL_STATE.gatewayHealth).toEqual({ state: 'ok' });
+  });
+
+  it('does not touch any tab state (connection-global, like backend.state)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'gateway.health', state: 'down', attempts: 12 });
+    expect(activeTab(state).turnActive).toBe(true); // untouched
+  });
+});
+
+describe('UX-03: stop lifecycle — stopPending', () => {
+  it('local.stopPending marks the live tab; turn.end{cancelled} clears it with turnActive', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
+    expect(activeTab(state).stopPending).toBe(true);
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'cancelled' });
+    expect(activeTab(state).stopPending).toBe(false);
+    expect(activeTab(state).turnActive).toBe(false);
+  });
+
+  it('every terminal clears it — complete and error too (the pending stop must never outlive its turn)', () => {
+    for (const status of ['complete', 'error'] as const) {
+      let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+      state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
+      state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status });
+      expect(activeTab(state).stopPending).toBe(false);
+    }
+  });
+
+  it('local.stopPending on an idle tab is a no-op (nothing would ever clear it)', () => {
+    const state = reduceLocal(INITIAL_STATE, { type: 'local.stopPending', tabId: INITIAL_STATE.activeTabId });
+    expect(activeTab(state).stopPending).toBe(false);
+  });
+
+  it('clear resets stopPending alongside turnActive', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
+    state = reduce(state, { type: 'clear', sessionId: 's1' });
+    expect(activeTab(state).stopPending).toBe(false);
+  });
+
+  // Coverage Minor (T10 review): tab.clear's OWN reset literal (the
+  // tabId-scoped path used by "New Session" on an already-unbound tab, §930)
+  // had never been exercised for stopPending — only the generic
+  // session-scoped `clear` above was. Both reset it independently.
+  it('tab.clear resets stopPending alongside turnActive', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduceLocal(state, { type: 'local.stopPending', tabId: activeTab(state).tabId });
+    expect(activeTab(state).stopPending).toBe(true); // precondition
+
+    state = reduce(state, { type: 'tab.clear', tabId: activeTab(state).tabId });
+    expect(activeTab(state).stopPending).toBe(false);
+  });
+});
+
+describe('UX-04a: new-session lifecycle — newSessionPending', () => {
+  it('local.newSessionPending marks the tab; tab.bound clears it (by key omission)', () => {
+    let state = reduceLocal(INITIAL_STATE, { type: 'local.newSessionPending', tabId: INITIAL_STATE.activeTabId });
+    expect(activeTab(state).newSessionPending).toBe(true);
+
+    state = reduce(state, { type: 'tab.bound', tabId: activeTab(state).tabId, sessionId: 's1', rootId: '/r' });
+    expect(activeTab(state).newSessionPending).toBeUndefined();
+    expect(activeTab(state)).not.toHaveProperty('newSessionPending');
+  });
+
+  it('tab.error clears it too — a refusal is a terminal exactly like a successful bind (every host refusal path lands as tab.error)', () => {
+    let state = reduceLocal(INITIAL_STATE, { type: 'local.newSessionPending', tabId: INITIAL_STATE.activeTabId });
+    expect(activeTab(state).newSessionPending).toBe(true);
+
+    state = reduce(state, { type: 'tab.error', tabId: activeTab(state).tabId, message: 'no client', kind: 'open-failed' });
+    expect(activeTab(state).newSessionPending).toBeUndefined();
+    expect(activeTab(state)).not.toHaveProperty('newSessionPending');
+  });
+
+  // Unlike `local.stopPending` (turnActive-guarded — Stop is only meaningful
+  // mid-turn), New Session is legal on ANY tab regardless of a live turn —
+  // Composer's own Task-11 confirm gate is what asks first while busy, not
+  // this fold. Sets unconditionally on both an idle and a live-turn tab.
+  it('sets unconditionally — both an idle tab and a live-turn tab (no turnActive guard, unlike stopPending)', () => {
+    const idle = reduceLocal(INITIAL_STATE, { type: 'local.newSessionPending', tabId: INITIAL_STATE.activeTabId });
+    expect(activeTab(idle).newSessionPending).toBe(true);
+
+    let live = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    live = reduceLocal(live, { type: 'local.newSessionPending', tabId: activeTab(live).tabId });
+    expect(activeTab(live).newSessionPending).toBe(true);
+  });
+});
+
+describe('CA-09: message.delta O(1) fast path (behavior-identical, no reverse-copy on the fast path)', () => {
+  it('[perf genuine-RED] does NOT allocate+reverse a copy when the open message is the last item', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'Hel' });
+    const reverseSpy = vi.spyOn(Array.prototype, 'reverse');
+    try {
+      state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'lo' });
+      expect(reverseSpy).not.toHaveBeenCalled();
+    } finally {
+      reverseSpy.mockRestore();
+    }
+    const tab = must(state.tabs[state.activeTabId], 'active tab');
+    const msgs = tab.transcript.filter((i) => i.kind === 'message');
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toMatchObject({ text: 'Hello', streaming: true });
+  });
+
+  it('appends the SAME text as before across a multi-delta sequence (fold semantics unchanged)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    for (const chunk of ['a', 'b', 'c', 'd']) {
+      state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: chunk });
+    }
+    const tab = must(state.tabs[state.activeTabId], 'active tab');
+    const msgs = tab.transcript.filter((i) => i.kind === 'message');
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toMatchObject({ text: 'abcd', streaming: true });
+  });
+
+  it('unchanged items keep their object identity (immutable-update parity with the old .map)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'reasoning.end', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'x' });
+    const before = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    const reasoningBefore = before.find((i) => i.kind === 'reasoning');
+    state = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'y' });
+    const after = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    // the reasoning item was not the target — its reference must be preserved
+    expect(after.find((i) => i.kind === 'reasoning')).toBe(reasoningBefore);
+  });
+
+  it('FALLBACK: an open streaming message that is NOT last still receives the delta (reverse-scan retained)', () => {
+    // Hand-build a tab whose last item is a reasoning block while an earlier
+    // message is still streaming — exercises the retained reverse-scan path.
+    const streamingMsg = { kind: 'message' as const, turnId: 't1', id: 'msg-t1-0', text: 'A', streaming: true };
+    const reasoning = { kind: 'reasoning' as const, turnId: 't1', blockId: 'r9', text: 'thinking', streaming: false };
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript: [streamingMsg, reasoning] };
+    const state: AppState = { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+    const next = reduce(state, { type: 'message.delta', turnId: 't1', sessionId: 's1', text: 'B' });
+    const nextTab = must(next.tabs.boot, 'boot tab');
+    expect(nextTab.transcript[0]).toMatchObject({ kind: 'message', text: 'AB', streaming: true });
+    expect(nextTab.transcript[1]).toBe(reasoning); // untouched
+  });
+});
+
+describe('CA-M15: transcript length cap keeps the tail and records the drop count', () => {
+  function tabWithNItems(n: number): AppState {
+    const transcript = Array.from({ length: n }, (_, i) => ({
+      kind: 'message' as const, turnId: `t${i}`, id: `msg-t${i}-0`, text: `m${i}`, streaming: false,
+    }));
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript };
+    return { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+  }
+
+  it('trims to the cap and reports how many were dropped when a fold pushes over the limit', () => {
+    const state = tabWithNItems(MAX_TRANSCRIPT_ITEMS); // exactly at the cap
+    const next = reduce(state, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
+    const tab = must(next.tabs.boot, 'boot tab');
+    expect(tab.transcript).toHaveLength(MAX_TRANSCRIPT_ITEMS); // one added, one dropped
+    expect(tab.hiddenCount).toBe(1);
+    expect(tab.transcript[tab.transcript.length - 1]).toMatchObject({ kind: 'reasoning', blockId: 'rN' });
+    expect(tab.transcript[0]).toMatchObject({ text: 'm1' }); // m0 was dropped from the front
+  });
+
+  it('leaves a below-cap transcript (and hiddenCount) untouched', () => {
+    const state = tabWithNItems(10);
+    const next = reduce(state, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
+    const tab = must(next.tabs.boot, 'boot tab');
+    expect(tab.transcript).toHaveLength(11);
+    expect(tab.hiddenCount ?? 0).toBe(0);
+  });
+
+  it('the active streaming message still folds correctly after trimming', () => {
+    let state = tabWithNItems(MAX_TRANSCRIPT_ITEMS);
+    state = reduce(state, { type: 'message.delta', turnId: 'live', sessionId: 's1', text: 'A' }); // opens, pushes over the cap, trims
+    state = reduce(state, { type: 'message.delta', turnId: 'live', sessionId: 's1', text: 'B' }); // folds the tail AFTER the trim
+    const tab = must(state.tabs.boot, 'boot tab');
+    expect(tab.hiddenCount ?? 0).toBeGreaterThanOrEqual(1); // a trim genuinely happened, not a no-op
+    const live = tab.transcript.filter((i) => i.kind === 'message' && i.turnId === 'live');
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ text: 'AB', streaming: true });
+  });
+
+  it('clear resets hiddenCount to 0', () => {
+    const over = tabWithNItems(MAX_TRANSCRIPT_ITEMS + 5);
+    const trimmed = reduce(over, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
+    expect(must(trimmed.tabs.boot, 'boot').hiddenCount).toBeGreaterThan(0);
+    const cleared = reduce(trimmed, { type: 'clear', sessionId: 's1' });
+    const tab = must(cleared.tabs.boot, 'boot');
+    expect(tab.transcript).toHaveLength(0);
+    expect(tab.hiddenCount ?? 0).toBe(0);
+  });
+
+  it('tab.clear (the session-lost "New Session" path) also resets hiddenCount to 0', () => {
+    const over = tabWithNItems(MAX_TRANSCRIPT_ITEMS + 5);
+    const trimmed = reduce(over, { type: 'reasoning.start', turnId: 'tN', sessionId: 's1', blockId: 'rN' });
+    expect(must(trimmed.tabs.boot, 'boot').hiddenCount).toBeGreaterThan(0);
+    const cleared = reduce(trimmed, { type: 'tab.clear', tabId: 'boot' });
+    const tab = must(cleared.tabs.boot, 'boot');
+    expect(tab.transcript).toHaveLength(0);
+    expect(tab.hiddenCount ?? 0).toBe(0);
   });
 });

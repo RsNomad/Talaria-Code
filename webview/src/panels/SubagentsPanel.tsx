@@ -61,7 +61,10 @@ export function SubagentsPanel({ data }: SubagentsPanelProps) {
 
   return (
     <PanelShell title="Subagents" meta={`${data.delegations.length} delegation${data.delegations.length === 1 ? '' : 's'}`}>
-      <div className="flex flex-col gap-2">
+      {/* Task 19 (WCAG 1.3.1, WV4-MIN): the delegation-row collection was
+          `div` soup — no `role="list"`/`role="listitem"` at all, so AT could
+          not count or navigate delegations as a set. */}
+      <div role="list" className="flex flex-col gap-2">
         {data.delegations.map((d) => {
           const st = totalLookup(STATUS, d.status, UNKNOWN_SUBAGENT_STATUS);
           // W4-T6 (UI#8): relative-age parity with SessionsPanel's History
@@ -69,7 +72,7 @@ export function SubagentsPanel({ data }: SubagentsPanelProps) {
           // timestamp) instead of going through the same shared helper.
           const age = relativeAge(d.startedAt);
           return (
-            <div key={d.id} className="rounded-card border border-border bg-surface px-3 py-2">
+            <div key={d.id} role="listitem" className="rounded-card border border-border bg-surface px-3 py-2">
               <div className="flex items-start gap-2">
                 <Icon name="hubot" size={15} className="mt-0.5 flex-none text-muted" />
                 <div className="min-w-0 flex-1">

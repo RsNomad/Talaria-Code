@@ -75,7 +75,7 @@ function makeBackend(transport: NextEditTransportId, overrides: { apiKey?: strin
   return new NextEditHttpBackend({
     transport,
     apiBase: overrides.apiBase ?? apiBaseFor(transport),
-    apiKey: overrides.apiKey,
+    ...(overrides.apiKey !== undefined ? { apiKey: overrides.apiKey } : {}),
     model: 'test-model',
     sentinels: [],
   });
@@ -594,6 +594,55 @@ describe('NextEditHttpBackend.predict — abort signal', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
     expect(init.signal).toBe(controller.signal);
+  });
+});
+
+describe('NextEditHttpBackend.predict — WS-BG ingress shape guards', () => {
+  it.each([['a bare string', 'nope'], ['an array', [1, 2]], ['a number', 42], ['null', null]])(
+    'ollama: %s ok-body is refused loudly, not silently treated as empty text',
+    async (_label, body) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(fakeOkResponse(body)));
+      const backend = makeBackend('ollama');
+      await expect(backend.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
+        /unrecognized response shape/,
+      );
+    },
+  );
+
+  it('ollama: a wrong-typed present field (response: 42) is refused — the type lie never flows into output.text', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(fakeOkResponse({ response: 42, done_reason: 'stop' })));
+    const backend = makeBackend('ollama');
+    await expect(backend.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
+      /unrecognized response shape/,
+    );
+  });
+
+  it('ollama: null optional fields stay tolerated (the ?? reads already handle null)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(fakeOkResponse({ response: null, done_reason: null })));
+    const backend = makeBackend('ollama');
+    const out = await backend.predict(minted(), rendered(), new AbortController().signal);
+    expect(out).toEqual({ text: '', stopReason: 'unknown' });
+  });
+
+  it('openai-compat: a non-record body is refused loudly', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(fakeOkResponse([{ text: 'sneaky' }])));
+    const backend = makeBackend('openai-compat');
+    await expect(backend.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
+      /unrecognized response shape/,
+    );
+  });
+
+  it('openai-compat: a wrong-typed choices[0].text is refused; an empty choices array still resolves empty', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(fakeOkResponse({ choices: [{ text: 7 }] })));
+    const backendBad = makeBackend('openai-compat');
+    await expect(backendBad.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
+      /unrecognized response shape/,
+    );
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(fakeOkResponse({ choices: [] })));
+    const backendEmpty = makeBackend('openai-compat');
+    const out = await backendEmpty.predict(minted(), rendered(), new AbortController().signal);
+    expect(out).toEqual({ text: '', stopReason: 'unknown' });
   });
 });
 

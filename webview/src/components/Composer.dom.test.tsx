@@ -23,14 +23,25 @@ import { resolveWithinWorkspace } from '../../../src/host/backend/acp/pathConfin
  * chat re-applied the same seed; and `onDraftChange` is bound to the ACTIVE
  * tab, so a tab switch in between delivered the text to another conversation.
  */
-function renderComposer(props: {
+interface RenderComposerProps {
   tabId: string;
   draft: string;
   pendingSeed: ComposerSeed | null;
   onDraftChange: (text: string) => void;
   onSeedApplied: (seed: ComposerSeed) => void;
-}) {
-  return render(
+  busy?: boolean;
+  stopping?: boolean;
+  onCancel?: () => void;
+  onNewSession?: () => void;
+  /** WS-UX P2 M2: UX-04a in-flight flag, wired by App from `tab.newSessionPending`. */
+  newSessionPending?: boolean;
+}
+
+// T11: factored out of `renderComposer` so a rerender (a busy -> stopping
+// transition, in particular) can produce the exact same element tree —
+// `render`'s own `rerender` takes a JSX element, not a prop bag.
+function composerElementForRender(props: RenderComposerProps) {
+  return (
     <Composer
       tabId={props.tabId}
       draft={props.draft}
@@ -40,7 +51,9 @@ function renderComposer(props: {
       onAttachRemove={() => undefined}
       preset="normal"
       modelLabel="test-model"
-      busy={false}
+      busy={props.busy ?? false}
+      newSessionPending={props.newSessionPending ?? false}
+      stopping={props.stopping ?? false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}
@@ -48,16 +61,20 @@ function renderComposer(props: {
       initialHeight={120}
       onHeightChange={() => undefined}
       onSubmit={async () => undefined}
-      onCancel={() => undefined}
+      onCancel={props.onCancel ?? (() => undefined)}
       onSetPreset={async () => undefined}
       onPickModel={() => undefined}
-      onNewSession={() => undefined}
+      onNewSession={props.onNewSession ?? (() => undefined)}
       availableCommands={[]}
       searchFiles={async () => []}
       pendingSeed={props.pendingSeed}
       onSeedApplied={props.onSeedApplied}
-    />,
+    />
   );
+}
+
+function renderComposer(props: RenderComposerProps) {
+  return render(composerElementForRender(props));
 }
 
 describe('C-3: a composer seed is applied exactly once, to the tab it was minted for', () => {
@@ -158,6 +175,7 @@ function renderComposerForAttachments(onAttachAdd: (a: Attachment) => void) {
       preset="normal"
       modelLabel="test-model"
       busy={false}
+      stopping={false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}
@@ -187,16 +205,30 @@ function getGenericFileInput(container: HTMLElement): HTMLInputElement {
   return input;
 }
 
+/** UX-03 grew a SECOND permanently-mounted `role="status"` region (the
+ * stop-lifecycle announcer, alongside this existing attachment / "still
+ * running" notice) — so `getByRole('status')` is no longer unambiguous
+ * anywhere in this file. This selects the attachment-notice region
+ * specifically, by its stable production class (`text-del`), rather than by
+ * role alone. */
+function attachNoticeRegion(root: ParentNode = document.body): HTMLElement {
+  const region = root.querySelector('[role="status"].text-del');
+  if (!(region instanceof HTMLElement)) {
+    throw new Error('attach notice live region not found');
+  }
+  return region;
+}
+
 describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region notice', () => {
   it('the notice region is mounted (empty) from the start — Finding-7 discipline', () => {
-    const { getByRole } = renderComposerForAttachments(() => undefined);
+    const { container } = renderComposerForAttachments(() => undefined);
 
-    expect(getByRole('status')).toHaveTextContent('');
+    expect(attachNoticeRegion(container)).toHaveTextContent('');
   });
 
   it('an oversized file is skipped AND the notice names it (was console.warn-only)', () => {
     const added: Attachment[] = [];
-    const { container, getByRole } = renderComposerForAttachments((a) => added.push(a));
+    const { container } = renderComposerForAttachments((a) => added.push(a));
 
     // Composer.tsx: MAX_FILE_BYTES (generic-file cap) is 512 * 1024.
     const oversizedBytes = 512 * 1024 + 1;
@@ -204,7 +236,7 @@ describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region no
 
     fireEvent.change(getGenericFileInput(container), { target: { files: [bigFile] } });
 
-    expect(getByRole('status')).toHaveTextContent(/huge\.txt/);
+    expect(attachNoticeRegion(container)).toHaveTextContent(/huge\.txt/);
     expect(added).toEqual([]);
   });
 
@@ -226,12 +258,12 @@ describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region no
     globalThis.FileReader = FailingFileReader as unknown as typeof FileReader;
 
     try {
-      const { container, getByRole } = renderComposerForAttachments((a) => added.push(a));
+      const { container } = renderComposerForAttachments((a) => added.push(a));
       const smallFile = new File(['hello'], 'notes.txt', { type: 'text/plain' });
 
       fireEvent.change(getGenericFileInput(container), { target: { files: [smallFile] } });
 
-      await waitFor(() => expect(getByRole('status')).toHaveTextContent(/notes\.txt/));
+      await waitFor(() => expect(attachNoticeRegion(container)).toHaveTextContent(/notes\.txt/));
       expect(added).toEqual([]);
     } finally {
       globalThis.FileReader = originalFileReader;
@@ -244,27 +276,49 @@ describe('A2 (UI I-9): oversized/unreadable attachments surface a live-region no
     const bigFile = new File([new Uint8Array(oversizedBytes)], 'huge.txt', { type: 'text/plain' });
 
     fireEvent.change(getGenericFileInput(container), { target: { files: [bigFile] } });
-    expect(getByRole('status')).toHaveTextContent(/huge\.txt/);
+    expect(attachNoticeRegion(container)).toHaveTextContent(/huge\.txt/);
 
     fireEvent.click(getByRole('button', { name: 'Dismiss attachment notice' }));
 
     // The region stays mounted (Finding-7) — only its text clears.
-    expect(getByRole('status')).toHaveTextContent('');
+    expect(attachNoticeRegion(container)).toHaveTextContent('');
     expect(queryByRole('button', { name: 'Dismiss attachment notice' })).not.toBeInTheDocument();
   });
 
   it('a subsequent successful attach clears a stale oversize notice', () => {
     const added: Attachment[] = [];
-    const { container, getByRole } = renderComposerForAttachments((a) => added.push(a));
+    const { container } = renderComposerForAttachments((a) => added.push(a));
     const oversizedBytes = 512 * 1024 + 1;
     const bigFile = new File([new Uint8Array(oversizedBytes)], 'huge.txt', { type: 'text/plain' });
     fireEvent.change(getGenericFileInput(container), { target: { files: [bigFile] } });
-    expect(getByRole('status')).toHaveTextContent(/huge\.txt/);
+    expect(attachNoticeRegion(container)).toHaveTextContent(/huge\.txt/);
 
     const okFile = new File(['ok'], 'small.txt', { type: 'text/plain' });
     fireEvent.change(getGenericFileInput(container), { target: { files: [okFile] } });
 
-    expect(getByRole('status')).toHaveTextContent('');
+    expect(attachNoticeRegion(container)).toHaveTextContent('');
+  });
+});
+
+/**
+ * Task 21 (WCAG 4.1.3): only FAILURE was ever announced (via `attachNotice`
+ * above) — a screen-reader user got no confirmation that a successful attach
+ * actually landed. Scoped by the announced TEXT rather than a bare
+ * `getByRole('status')`: every ActionButton/LiveRegion mounts a
+ * `role="status"` region in this tree (Task 14's lesson), so a role-only
+ * query is ambiguous.
+ */
+describe('Task 21 (WCAG 4.1.3): a successful attach is announced too', () => {
+  it('a successful attach announces the filename through a role="status" live region', async () => {
+    const added: Attachment[] = [];
+    const { container } = renderComposerForAttachments((a) => added.push(a));
+    const file = new File(['hello'], 'notes.txt', { type: 'text/plain' });
+
+    fireEvent.change(getGenericFileInput(container), { target: { files: [file] } });
+
+    const announcement = await waitFor(() => screen.getByText('Attached "notes.txt"'));
+    expect(announcement).toHaveAttribute('role', 'status');
+    expect(added).toHaveLength(1);
   });
 });
 
@@ -300,6 +354,7 @@ function renderComposerChips(overrides: {
       preset={overrides.preset ?? 'normal'}
       modelLabel={overrides.modelLabel ?? 'test-model'}
       busy={false}
+      stopping={false}
       disabled={false}
       activeModeId={overrides.activeModeId ?? null}
       availableModes={overrides.availableModes ?? []}
@@ -368,6 +423,7 @@ describe('B5: state-bearing chips carry a dynamic aria-label (title alone is unr
         preset="normal"
         modelLabel="claude-sonnet"
         busy={false}
+        stopping={false}
         disabled={false}
         activeModeId={null}
         availableModes={[]}
@@ -432,6 +488,7 @@ function renderComposerForIME(overrides: {
         preset="normal"
         modelLabel="test-model"
         busy={false}
+        stopping={false}
         disabled={false}
         activeModeId={null}
         availableModes={[]}
@@ -492,6 +549,7 @@ function renderComposerBusy(overrides: {
         preset="normal"
         modelLabel="test-model"
         busy={true}
+        stopping={false}
         disabled={false}
         activeModeId={null}
         availableModes={[]}
@@ -530,7 +588,7 @@ describe('UI#9-honesty: a mid-turn submit never silently vanishes', () => {
     expect(screen.getByText('notes.txt')).toBeInTheDocument();
     // An honest, visible affordance — not a silent no-op — via the EXISTING
     // composer status LiveRegion (role="status").
-    expect(screen.getByRole('status')).toHaveTextContent(/turn.*running|still running/i);
+    expect(attachNoticeRegion()).toHaveTextContent(/turn.*running|still running/i);
   });
 
   it('clicking the (disabled) Send button while a turn is live is inert — Stop is rendered instead, so Send is not even present', () => {
@@ -564,6 +622,7 @@ function composerElement(props: { tabId: string; busy: boolean; draft: string })
       preset="normal"
       modelLabel="test-model"
       busy={props.busy}
+      stopping={false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}
@@ -593,14 +652,14 @@ describe('UI#9 review: the "still running" status notice cannot survive a tab sw
     fireEvent.keyDown(textarea, { key: 'Enter' });
 
     // Sanity: the busy-branch notice fired on tab A.
-    expect(screen.getByRole('status')).toHaveTextContent(/still running/i);
+    expect(attachNoticeRegion()).toHaveTextContent(/still running/i);
 
     // Simulate switching to a DIFFERENT, IDLE tab: same mounted Composer
     // instance (it is not keyed by tabId), new tabId, busy now false.
     rerender(composerElement({ tabId: 'tab-B', busy: false, draft: '' }));
 
     // The stale notice must NOT survive onto tab B — tab B has no live turn.
-    expect(screen.getByRole('status')).toBeEmptyDOMElement();
+    expect(attachNoticeRegion()).toBeEmptyDOMElement();
   });
 });
 
@@ -696,6 +755,7 @@ function renderComposerForAccessibleName(
       preset="normal"
       modelLabel="test-model"
       busy={false}
+      stopping={false}
       disabled={overrides.disabled ?? false}
       disabledPlaceholder={overrides.disabledPlaceholder}
       activeModeId={null}
@@ -920,6 +980,7 @@ function renderComposerForResize(onHeightChange: (height: number) => void = () =
       preset="normal"
       modelLabel="test-model"
       busy={false}
+      stopping={false}
       disabled={false}
       activeModeId={null}
       availableModes={[]}
@@ -989,5 +1050,299 @@ describe('T5 (§7.2.3): Composer drag-resize window-listener leak on unmount', (
 
     expect(onHeightChange).toHaveBeenCalledTimes(1);
     expect(document.body.style.userSelect).toBe('');
+  });
+});
+
+describe('UX-03: Stop -> Stopping… lifecycle (role/name/value)', () => {
+  it('busy + not stopping: an enabled button named "Stop"; no stopping announcement anywhere', () => {
+    renderComposer({ tabId: 'tab-1', draft: '', pendingSeed: null, onDraftChange: () => undefined, onSeedApplied: () => undefined, busy: true });
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled();
+    const announced = screen.getAllByRole('status').some((el) => (el.textContent ?? '').includes('Stopping'));
+    expect(announced).toBe(false);
+  });
+
+  it('stopping: the button is renamed "Stopping", kept focusable via aria-disabled (T11 — not native disabled), and a permanently-mounted status region announces it', () => {
+    renderComposer({ tabId: 'tab-1', draft: '', pendingSeed: null, onDraftChange: () => undefined, onSeedApplied: () => undefined, busy: true, stopping: true });
+    const button = screen.getByRole('button', { name: 'Stopping' });
+    expect(button).not.toBeDisabled();
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+    const region = screen
+      .getAllByRole('status')
+      .find((el) => (el.textContent ?? '').includes('Stopping — waiting for the agent to confirm'));
+    expect(region).toBeDefined();
+  });
+
+  it('the stop live region exists (empty) even while idle — Finding-7: the region never mounts together with its content', () => {
+    renderComposer({ tabId: 'tab-1', draft: '', pendingSeed: null, onDraftChange: () => undefined, onSeedApplied: () => undefined });
+    // attachNotice region + stop region are both permanently mounted:
+    expect(screen.getAllByRole('status').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('T11 (A11Y): the Stop button stays focusable while stopping — aria-disabled, never native disabled — and a click while stopping does not fire onCancel', async () => {
+    const onCancel = vi.fn();
+    const user = userEvent.setup();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      stopping: false,
+      onCancel,
+    };
+    const { rerender } = renderComposer(baseProps);
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    stop.focus();
+    rerender(composerElementForRender({ ...baseProps, stopping: true }));
+    const stopping = screen.getByRole('button', { name: 'Stopping' });
+    expect(stopping).not.toBeDisabled(); // the T11 bug: native disabled blurred it
+    expect(stopping).toHaveAttribute('aria-disabled', 'true'); // role/name/value (axe-style)
+    expect(stopping).toHaveAttribute('aria-busy', 'true');
+    expect(document.activeElement).toBe(stopping); // focus retained through the flip
+    await user.click(stopping);
+    expect(onCancel).not.toHaveBeenCalled(); // guarded click replaces native blocking
+  });
+});
+
+/**
+ * Task 6 (A11Y-01, WCAG 2.4.3): the Composer sibling of ApprovalCard's and
+ * DiffCard's own A11Y-01 adoption. Send unmounts the instant `busy` flips
+ * true (swapped for Stop) and Stop unmounts the instant the turn ends
+ * (swapped back to Send) — without `useFocusAnchorOnUnmount`, either commit
+ * silently drops focus to `<body>`. The send/stop wrapper div
+ * (`data-testid="send-stop-wrap"`, `tabIndex={-1}`) is the stable anchor.
+ */
+describe('A11Y-01: focus anchor on Send/Stop unmount (WCAG 2.4.3)', () => {
+  it('focus lands on the send/stop wrapper (not <body>) when Send unmounts as busy flips true', async () => {
+    const user = userEvent.setup();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: 'hello',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: false,
+    };
+    const { rerender } = renderComposer(baseProps);
+    const send = screen.getByRole('button', { name: 'Send' });
+    await user.click(send);
+    rerender(composerElementForRender({ ...baseProps, busy: true }));
+    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(document.body);
+    expect((document.activeElement as HTMLElement).closest('[data-testid="send-stop-wrap"]')).not.toBeNull();
+  });
+
+  it('focus lands on the send/stop wrapper (not <body>) when Stop unmounts as the turn ends', async () => {
+    const onCancel = vi.fn();
+    const user = userEvent.setup();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      stopping: false,
+      onCancel,
+    };
+    const { rerender } = renderComposer(baseProps);
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    await user.click(stop);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    rerender(composerElementForRender({ ...baseProps, busy: false }));
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(document.body);
+    expect((document.activeElement as HTMLElement).closest('[data-testid="send-stop-wrap"]')).not.toBeNull();
+  });
+});
+
+/**
+ * Task 11 (UX-11): "+ New Session" while a turn is live must ASK first
+ * (ConfirmStrip alertdialog), not silently cancel the running turn.
+ * `busy` (= `tab.turnActive`, wired by App.tsx) is the same live-turn signal
+ * `submit()`'s UI#9-honesty branch already reads. Reuses `ConfirmStrip`
+ * (Task 7) rather than forking a second confirm surface.
+ */
+describe('UX-11: "+ New Session" with a live turn asks first (ConfirmStrip)', () => {
+  it('busy: clicking New Session does NOT start a new session — an alertdialog asks first', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      onNewSession,
+    });
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(onNewSession).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('alertdialog', { name: 'Confirm new session' });
+    expect(dialog).toHaveTextContent(
+      'Starting a new session will cancel the turn still running in this tab.',
+    );
+  });
+
+  it('busy: "New session anyway" starts the new session exactly once and returns focus to the New Session button', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      onNewSession,
+    });
+
+    const newSessionButton = screen.getByRole('button', { name: 'New Session' });
+    await user.click(newSessionButton);
+    await user.click(screen.getByRole('button', { name: 'New session anyway' }));
+
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(newSessionButton);
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
+  });
+
+  it('not busy: clicking New Session starts the new session immediately — no confirm dialog (characterization)', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: false,
+      onNewSession,
+    });
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('the confirm strip auto-dismisses (stale-consent class) when busy flips false out from under it', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      onNewSession,
+    };
+    const { rerender } = renderComposer(baseProps);
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+    expect(screen.getByRole('alertdialog', { name: 'Confirm new session' })).toBeInTheDocument();
+
+    // The live turn ended while the strip was open — the confirm gate must
+    // not survive it (a stale "cancel it anyway" invites a no-op click).
+    rerender(composerElementForRender({ ...baseProps, busy: false }));
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
+    expect(onNewSession).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * WS-UX P2 M2 (wave-review cross-task Minor, T11 × T28): in the
+ * `busy && newSessionPending` window (confirm consumed, request in flight,
+ * live turn not yet ended by the host's `tab.clear`), the Task-11 `busy`
+ * confirm gate used to run BEFORE the UX-04a `!interactive` in-flight guard —
+ * so a second click re-opened the ConfirmStrip and a second confirm
+ * re-dispatched `tab.newSession`. busyInteraction's click-guard stands in for
+ * native `disabled`'s click-blocking (busyInteraction.ts) — native disabled
+ * would have suppressed the WHOLE click, confirm-open included — so the
+ * in-flight guard must run FIRST. A click while "Starting a new session…" is
+ * already in flight means nothing: it is already starting.
+ */
+describe('WS-UX P2 M2: the in-flight New Session guard wins over the busy confirm gate', () => {
+  it('busy && newSessionPending: a click does nothing — no confirm strip, no dispatch (busy-focusable posture intact)', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      newSessionPending: true,
+      onNewSession,
+    });
+
+    const button = screen.getByRole('button', { name: 'New Session' });
+    // UX-04a posture untouched by the reorder: in-flight is BUSY, never
+    // natively disabled (the control stays focusable — busyInteraction.ts).
+    expect(button).not.toBeDisabled();
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+    expect(button).toHaveAttribute('aria-busy', 'true');
+
+    await user.click(button);
+
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
+    expect(onNewSession).not.toHaveBeenCalled();
+  });
+
+  it('the race window end-to-end: after one confirm, a re-click cannot re-open the confirm and double-dispatch', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    const baseProps: RenderComposerProps = {
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: true,
+      onNewSession,
+    };
+    const { rerender } = renderComposer(baseProps);
+
+    // T11's normal live-turn flow, unchanged: ask, confirm once.
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+    await user.click(screen.getByRole('button', { name: 'New session anyway' }));
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+
+    // App's reaction lands (`local.newSessionPending`), but the live turn has
+    // not ended yet — the host's `tab.clear` is still a message-hop away.
+    // This is the exact busy && newSessionPending window.
+    rerender(composerElementForRender({ ...baseProps, newSessionPending: true }));
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    // Before the fix: the strip re-opened here, and a second "New session
+    // anyway" would have made this 2 — the latent double-dispatch.
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm new session' })).not.toBeInTheDocument();
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('not busy && newSessionPending: a click still does nothing (the pre-existing UX-04a click-guard, unchanged by the reorder)', async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderComposer({
+      tabId: 'tab-1',
+      draft: '',
+      pendingSeed: null,
+      onDraftChange: () => undefined,
+      onSeedApplied: () => undefined,
+      busy: false,
+      newSessionPending: true,
+      onNewSession,
+    });
+
+    await user.click(screen.getByRole('button', { name: 'New Session' }));
+
+    expect(onNewSession).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 });

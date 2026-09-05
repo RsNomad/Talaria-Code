@@ -205,7 +205,17 @@ const ZERO_RANGE: PlainRange = Object.freeze({
  * while still keeping that summary's TOTAL accurate. */
 const UNCLASSIFIED_TAIL_VERDICT: ConfinementVerdict = Object.freeze({ inRoot: false, externalUri: '' });
 
-const SERVER_NAME = 'hermes-lsp';
+// B7 (WV1-MIN-ARCH serverInfo naming): the server's own serverInfo.name must
+// match the wire registration key every consumer uses — backend.setMcpServer
+// registers this server as 'vscode_lsp' (extension.ts, libServerHost.ts
+// DEFAULT_SERVER_NAME). The prior internal 'hermes-lsp' was a cosmetic drift.
+//
+// NOTE (accepted-as-is): the codebase server's tool id renders as the
+// `mcp__codebase_search__codebase_search` stutter. It is NOT renamed here —
+// the server/tool name is part of the id Hermes-side tool-permission configs
+// may reference, so renaming risks real breakage for a cosmetic gain. Owner
+// may override later.
+const SERVER_NAME = 'vscode_lsp';
 const SERVER_VERSION = '1.0.0';
 
 // ---------------------------------------------------------------------------
@@ -374,8 +384,8 @@ function toDiagnosticEntry(relPath: string, raw: RawDiagnostic): PlainDiagnostic
     line: raw.range.start.line,
     character: raw.range.start.character,
     message: raw.message,
-    source: raw.source,
-    code: raw.code,
+    ...(raw.source !== undefined ? { source: raw.source } : {}),
+    ...(raw.code !== undefined ? { code: raw.code } : {}),
   };
 }
 
@@ -410,7 +420,7 @@ function normalizeDocumentSymbol(entry: RawDocumentSymbolEntry): PlainDocumentSy
   const range = entry.location.range ?? ZERO_RANGE;
   return {
     name: entry.name,
-    detail: entry.containerName,
+    ...(entry.containerName !== undefined ? { detail: entry.containerName } : {}),
     kind: entry.kind,
     range,
     selectionRange: range,
@@ -926,7 +936,9 @@ async function handleWorkspaceSymbols(
   // true total.
   const capped = run.value.slice(0, capLimit);
   const classified: WorkspaceSymbolTarget[] = await Promise.all(
-    capped.map(async (sym) => ({ sym, verdict: await deps.classifyUri(sym.location.uri) })),
+    capped.map((sym) =>
+      deps.pool.run(async () => ({ sym, verdict: await deps.classifyUri(sym.location.uri) })),
+    ),
   );
   const tail: WorkspaceSymbolTarget[] = run.value
     .slice(capLimit)
@@ -1039,7 +1051,7 @@ async function buildResolvedCodeAction(
       deps.pool.run(async () => {
         const verdict = await deps.classifyUri(f.uri);
         const docText = verdict.inRoot ? await deps.readFullText(f.uri) : undefined;
-        return { uri: f.uri, verdict, edits: f.edits, docText };
+        return { uri: f.uri, verdict, edits: f.edits, ...(docText !== undefined ? { docText } : {}) };
       }),
     ),
   );
@@ -1049,7 +1061,7 @@ async function buildResolvedCodeAction(
     edit: {
       allEntriesAvailable: raw.edit.allEntriesAvailable,
       hasNonTextEntry: raw.edit.hasNonTextEntry,
-      nonTextKind: raw.edit.nonTextKind,
+      ...(raw.edit.nonTextKind !== undefined ? { nonTextKind: raw.edit.nonTextKind } : {}),
       files,
     },
   };
@@ -1140,7 +1152,15 @@ export function buildLibMcpServer(deps: LspToolDeps): McpServer {
       inputSchema: diagnosticsInputShape,
       annotations: { readOnlyHint: true },
     },
-    (args) => safeHandler(deps, () => handleDiagnostics(deps, tracker, args)),
+    (args) =>
+      safeHandler(deps, () =>
+        handleDiagnostics(deps, tracker, {
+          ...(args.path !== undefined ? { path: args.path } : {}),
+          ...(args.scope !== undefined ? { scope: args.scope } : {}),
+          ...(args.severities !== undefined ? { severities: args.severities } : {}),
+          ...(args.limit !== undefined ? { limit: args.limit } : {}),
+        }),
+      ),
   );
 
   server.registerTool(
@@ -1184,7 +1204,13 @@ export function buildLibMcpServer(deps: LspToolDeps): McpServer {
       inputSchema: workspaceSymbolsInputShape,
       annotations: { readOnlyHint: true },
     },
-    (args) => safeHandler(deps, () => handleWorkspaceSymbols(deps, pool, tracker, args)),
+    (args) =>
+      safeHandler(deps, () =>
+        handleWorkspaceSymbols(deps, pool, tracker, {
+          query: args.query,
+          ...(args.limit !== undefined ? { limit: args.limit } : {}),
+        }),
+      ),
   );
 
   server.registerTool(
@@ -1206,7 +1232,18 @@ export function buildLibMcpServer(deps: LspToolDeps): McpServer {
       inputSchema: codeActionsInputShape,
       annotations: { readOnlyHint: true },
     },
-    (args) => safeHandler(deps, () => handleCodeActions(deps, pool, args)),
+    (args) =>
+      safeHandler(deps, () =>
+        handleCodeActions(deps, pool, {
+          path: args.path,
+          startLine: args.startLine,
+          startChar: args.startChar,
+          endLine: args.endLine,
+          endChar: args.endChar,
+          ...(args.kind !== undefined ? { kind: args.kind } : {}),
+          ...(args.maxActions !== undefined ? { maxActions: args.maxActions } : {}),
+        }),
+      ),
   );
 
   return server;

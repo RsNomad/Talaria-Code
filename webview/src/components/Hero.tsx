@@ -14,13 +14,13 @@ interface HeroProps {
    * so it must be gated the same way (a pending/unbound tab has no session
    * for the host to attach the prompt to; the message is silently dropped,
    * which otherwise reads as a dead click next to the greyed-out composer). */
-  disabled?: boolean;
+  disabled?: boolean | undefined;
   /**
    * Task 10: deep-link into the Setup / Talaria Config panel. Optional so
    * Hero still renders standalone without it; `App.tsx` always supplies it
    * (`openSetup`, threaded through `ChatView`).
    */
-  onOpenSetup?: () => void;
+  onOpenSetup?: (() => void) | undefined;
 }
 
 const STARTERS = [

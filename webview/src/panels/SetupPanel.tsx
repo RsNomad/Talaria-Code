@@ -33,6 +33,9 @@ import type {
 import { Icon } from '../components/Icon';
 import { LiveRegion } from '../components/LiveRegion';
 import { Pill } from '../components/Pill';
+import { PullAnnouncer } from '../components/PullAnnouncer';
+import { scrollIntoViewRespectingMotion } from '../components/scrollIntoViewRespectingMotion';
+import { SegmentedSwitch } from '../components/SegmentedSwitch';
 import { Toggle } from '../components/Toggle';
 import { DECLINED, errorMessage } from '../state/panels';
 import type { RemoteData } from '../state/remoteData';
@@ -54,7 +57,9 @@ import {
   BACKEND_DISPLAY,
   buildCopyLogText,
   catalogPreselectId,
+  type ActionOutcome,
   type AgentModelBackend,
+  cancelOutcome,
   CANCEL_LABEL,
   cancelPullParams,
   CATALOG_DEFAULT_CHIP_LABEL,
@@ -80,6 +85,7 @@ import {
   initDedicatedFormFieldState,
   initPendingModel,
   isComingSoon,
+  isConfirmedOk,
   meterSegments,
   mutationDisabledReason,
   NEXT_DOWNLOAD_BUTTON_LABEL,
@@ -99,6 +105,7 @@ import {
   providerDoneLine,
   PROVIDER_RECHECK_CAPTION,
   PYTHON_VERSION_HELP_URL,
+  pullCompletionOutcome,
   pullPercent,
   RAG_APPLY_NUDGE,
   RAG_LLAMACPP_MODEL_NOTE,
@@ -191,7 +198,7 @@ function useExpandOnJump(
   useEffect(() => {
     if (pendingSeq === 0 || !isOpen) return;
     setPendingSeq(0);
-    toggleRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    scrollIntoViewRespectingMotion(toggleRef.current, { block: 'start' });
     toggleRef.current?.focus({ preventScroll: true });
   }, [pendingSeq, isOpen, toggleRef]);
 }
@@ -237,11 +244,17 @@ function SetupCards({
         </div>
       )}
 
+      {/* Task 17 (Finding-7, WV4-MIN): ALWAYS mounted — the actual
+          screen-reader announcement now lives here, not on the visible
+          card's own (now dropped) role="status" below. A region that mounts
+          together with its content is the known-unreliable announcement
+          pattern; this one exists empty until setup.ready flips true. */}
+      <LiveRegion
+        text={setup.ready ? "You're ready — agent, provider, and autocomplete are all set up." : ''}
+        className="sr-only"
+      />
       {setup.ready && (
-        <div
-          role="status"
-          className="mb-3 flex items-center gap-2 rounded-card border border-add bg-add-soft px-3 py-2 text-xs text-fg"
-        >
+        <div className="mb-3 flex items-center gap-2 rounded-card border border-add bg-add-soft px-3 py-2 text-xs text-fg">
           <Icon name="pass-filled" size={14} className="flex-none text-add" />
           <span>You&apos;re ready — agent, provider, and autocomplete are all set up.</span>
         </div>
@@ -274,10 +287,10 @@ function SetupCards({
  * `Set up →` `scrollIntoView` target) and, via `${id}-heading`, the
  * focusable heading id (beta.6 T18, B-F6). Every pre-T18 caller omits it.
  */
-function Card({ title, children, id }: { title: string; children: ReactNode; id?: string }) {
+function Card({ title, children, id }: { title: string; children: ReactNode; id?: string | undefined }) {
   return (
     <section id={id} className="mb-3 rounded-card border border-border bg-surface p-3">
-      <SectionLabel id={id !== undefined ? `${id}-heading` : undefined}>{title}</SectionLabel>
+      <SectionLabel {...(id !== undefined ? { id: `${id}-heading` } : {})}>{title}</SectionLabel>
       {children}
     </section>
   );
@@ -351,36 +364,48 @@ function ActionButton({
   icon,
   successLabel,
   pendingLabel,
+  outcomeFor,
 }: {
   label: string;
   onRun: () => Promise<unknown>;
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   tone?: Tone;
   icon?: string;
   successLabel?: string;
   pendingLabel?: string;
+  outcomeFor?: (result: unknown) => ActionOutcome | undefined;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
-  const [success, setSuccess] = useState(false);
+  const [successText, setSuccessText] = useState<string | undefined>(undefined);
   const genuinelyDisabled = disabledReason !== undefined;
 
   useEffect(() => {
-    if (!success) return;
-    const timer = setTimeout(() => setSuccess(false), 4000);
+    if (successText === undefined) return;
+    const timer = setTimeout(() => setSuccessText(undefined), 4000);
     return () => clearTimeout(timer);
-  }, [success]);
+  }, [successText]);
 
   const onClick = () => {
     if (genuinelyDisabled || pending) return;
     setPending(true);
     setError(undefined);
-    setSuccess(false);
+    setSuccessText(undefined);
     void onRun().then(
       (result: unknown) => {
         setPending(false);
         if (result === DECLINED) return; // C-2 lock: neither success nor failure
-        if (successLabel !== undefined) setSuccess(true);
+        if (outcomeFor !== undefined) {
+          const outcome = outcomeFor(result);
+          if (outcome === undefined) return;
+          if (outcome.tone === 'failure') {
+            setError(outcome.text);
+            return;
+          }
+          setSuccessText(outcome.text);
+          return;
+        }
+        if (successLabel !== undefined) setSuccessText(successLabel);
       },
       (err: unknown) => {
         setPending(false);
@@ -396,7 +421,7 @@ function ActionButton({
         ? 'border-warn text-warn hover:bg-warn-soft'
         : 'border-border text-muted hover:bg-overlay';
 
-  const liveText = error ? `✗ ${error}` : success && successLabel !== undefined ? successLabel : '';
+  const liveText = error ? `✗ ${error}` : (successText ?? '');
   const liveClass = error ? 'text-2xs text-del' : 'text-2xs text-add';
 
   return (
@@ -413,7 +438,7 @@ function ActionButton({
         {icon && <Icon name={icon} size={12} spin={pending} />}
         {pending ? (pendingLabel ?? 'Working…') : label}
       </button>
-      <LiveRegion text={liveText} className={liveClass} title={error} />
+      <LiveRegion text={liveText} className={liveClass} {...(error !== undefined ? { title: error } : {})} />
     </div>
   );
 }
@@ -473,7 +498,7 @@ function TextField({
   label: string;
   value: string;
   onChange: (next: string) => void;
-  placeholder?: string;
+  placeholder?: string | undefined;
   /** id of an external caption element — `aria-describedby` plumbing
    *  (beta.6 panel-fix PT4, critic C1-15). The CALLER owns rendering an
    *  element with this id; omitted ⇒ byte-identical behavior. */
@@ -526,7 +551,7 @@ const RECS_METER_SEGMENT_CLASS: Record<'agent' | 'fim' | 'embedding', string> = 
  */
 function jumpToCard(cardId: string): void {
   const section = document.getElementById(cardId);
-  section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  scrollIntoViewRespectingMotion(section, { block: 'start' });
   document.getElementById(`${cardId}-heading`)?.focus({ preventScroll: true });
 }
 
@@ -625,8 +650,8 @@ function AgentCard({
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
-  jump?: JumpSignal;
+  disabledReason?: string | undefined;
+  jump?: JumpSignal | undefined;
 }) {
   const agent = setup.agent;
   const action = agentPrimaryAction(agent.phase);
@@ -803,16 +828,20 @@ function AgentCard({
       )}
 
       {agent.phase === 'installing' ? (
-        <div className="mt-2 flex flex-col gap-1.5" aria-live="polite">
-          {/* The phase label above already says "Installing…" — only add a
-              SECOND line when there is genuinely more to say (the live
-              sub-phase from a `setup.progress` push), never a duplicate of
-              the same text. */}
-          {live?.phase && <StatusLine icon="sync" text={`(${live.phase})`} tone="accent" />}
-          {/* `setup.cancel` is read-only/best-effort (§8) — never trust-gated. */}
+        <div className="mt-2 flex flex-col gap-1.5">
+          <div aria-live="polite">
+            {/* The phase label above already says "Installing…" — only add
+                a SECOND line when there is genuinely more to say (the live
+                sub-phase from a `setup.progress` push), never a duplicate
+                of the same text. */}
+            {live?.phase && <StatusLine icon="sync" text={`(${live.phase})`} tone="accent" />}
+          </div>
+          {/* `setup.cancel` is read-only/best-effort (§8) — never trust-gated.
+              A11Y-05: interactive content never sits inside a live region. */}
           <ActionButton
             label="Cancel"
             onRun={() => dispatch('setup.cancel', { op: 'install', id: agent.selectedId })}
+            outcomeFor={cancelOutcome}
           />
         </div>
       ) : (
@@ -868,8 +897,8 @@ function AgentLocalModelSection({
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
-  jump?: JumpSignal;
+  disabledReason?: string | undefined;
+  jump?: JumpSignal | undefined;
 }) {
   const local = setup.agentLocalModel;
   const saved = local?.saved;
@@ -961,7 +990,10 @@ function AgentLocalModelSection({
               tone="add"
             />
             {saved.runCommand && (
-              <RunCommandLine command={saved.runCommand} label={saved.backend === 'llamacpp' ? 'Start the server:' : undefined} />
+              <RunCommandLine
+                command={saved.runCommand}
+                {...(saved.backend === 'llamacpp' ? { label: 'Start the server:' } : {})}
+              />
             )}
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -983,21 +1015,12 @@ function AgentLocalModelSection({
 
         {pickerOpen && (
           <div className="flex flex-col gap-2">
-            <div className="inline-flex gap-1 self-start rounded border border-border p-0.5">
-              {(['ollama', 'llamacpp', 'vllm'] as const).map((b) => (
-                <button
-                  key={b}
-                  type="button"
-                  aria-pressed={backend === b}
-                  onClick={() => setBackend(b)}
-                  className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-                    backend === b ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
-                  }`}
-                >
-                  {BACKEND_DISPLAY[b]}
-                </button>
-              ))}
-            </div>
+            <SegmentedSwitch
+              ariaLabel="Backend"
+              options={(['ollama', 'llamacpp', 'vllm'] as const).map((b) => ({ id: b, label: BACKEND_DISPLAY[b] }))}
+              value={backend}
+              onChange={setBackend}
+            />
 
             <TextField
               label="Endpoint"
@@ -1014,11 +1037,11 @@ function AgentLocalModelSection({
               endpoint={ep.value}
               progress={progress}
               dispatch={dispatch}
-              disabledReason={disabledReason}
-              selectedId={sel.id}
+              {...(disabledReason !== undefined ? { disabledReason } : {})}
+              {...(sel.id !== undefined ? { selectedId: sel.id } : {})}
               onSelect={(id) => setSel({ lastSavedId: sel.lastSavedId, id })}
               rowCaption={(m) => agentRowCaption(m, backend)}
-              runCommandCaption={backend === 'llamacpp' ? AGENT_PRESAVE_RUN_COMMAND_CAPTION : undefined}
+              {...(backend === 'llamacpp' ? { runCommandCaption: AGENT_PRESAVE_RUN_COMMAND_CAPTION } : {})}
             />
 
             {/* The Ollama pane has no in-block Test (§4.1) — same surface-level
@@ -1063,7 +1086,7 @@ function ProviderCard({
 }: {
   setup: SetupData;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
 }) {
   const provider = setup.provider;
   const text =
@@ -1122,7 +1145,7 @@ function FimCard({
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
 }) {
   const fim = setup.fim;
   // A6 (beta.6 panel-fix PT4): the picker highlight is reconciled against
@@ -1195,28 +1218,16 @@ function FimCard({
       {hasLocal && (
         <>
           <p className="mb-1.5 text-2xs text-muted">Install locally, or connect to an existing endpoint?</p>
-          <div className="mb-2 inline-flex gap-1 rounded border border-border p-0.5">
-            <button
-              type="button"
-              aria-pressed={mode === 'connect'}
-              onClick={() => setMode('connect')}
-              className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-                mode === 'connect' ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
-              }`}
-            >
-              Connect
-            </button>
-            <button
-              type="button"
-              aria-pressed={mode === 'install'}
-              onClick={() => setMode('install')}
-              className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-                mode === 'install' ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
-              }`}
-            >
-              Install locally
-            </button>
-          </div>
+          <SegmentedSwitch
+            ariaLabel="Install method"
+            options={[
+              { id: 'connect' as const, label: 'Connect' },
+              { id: 'install' as const, label: 'Install locally' },
+            ]}
+            value={mode}
+            onChange={setMode}
+            className="mb-2"
+          />
         </>
       )}
 
@@ -1262,7 +1273,7 @@ function FimConnectTab({
 }: {
   option: SetupBackendOption;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   /** The card-owned pending draft (§3.2 PT4) — survives tab switches. */
   pendingModel: string;
   /** The wire's SAVED `fim.model` — the field's placeholder + diff baseline. */
@@ -1405,7 +1416,7 @@ function FimInstallTab({
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   /** §3.2 PT4 — the card-owned pending draft, consumed by the Ollama pane
    *  only (llamacpp/vLLM panes carry no model-name selection). */
   pendingModel: string;
@@ -1480,7 +1491,7 @@ function OllamaInstallPanel({
   endpoint: string;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   /** §3.2 PT4 — the card-owned pending draft; row highlight is DERIVED from
    *  it ({@link catalogRowIdForModel}), never a second selection state. */
   pendingModel: string;
@@ -1524,8 +1535,8 @@ function OllamaInstallPanel({
         endpoint={endpoint}
         progress={progress}
         dispatch={dispatch}
-        disabledReason={disabledReason}
-        selectedId={rowSelectedId}
+        {...(disabledReason !== undefined ? { disabledReason } : {})}
+        {...(rowSelectedId !== undefined ? { selectedId: rowSelectedId } : {})}
         onSelect={(id) => {
           const row = models.find((m) => m.id === id);
           const target = row?.ollamaCreatedName ?? row?.ollamaTag; // the catalogOllamaTarget rule
@@ -1576,11 +1587,12 @@ function ConfiguredModelRow({
   endpoint: string;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
   pullSuccessLabel: string;
   /** beta.6 panel-fix PT4 (C1-2): fires exactly when the pull dispatch
-   *  resolves with a result ≠ DECLINED (the success-flash condition) —
-   *  never on rejection, never on DECLINED. Mirrors the block's PT6
+   *  resolves with a CONFIRMED `{ok:true}` result (T32/F1-6-face — the
+   *  success-flash condition) — never on rejection, never on DECLINED,
+   *  never on an unconfirmed resolve. Mirrors the block's PT6
    *  `onOllamaPullSuccess`. Omitted ⇒ byte-identical behavior. */
   onPullSuccess?: () => void;
 }) {
@@ -1591,6 +1603,20 @@ function ConfiguredModelRow({
   const live = progress[progressKey('pull', model)];
   const percent = pullPercent(live?.totalBytes, live?.completedBytes);
   const inFlight = live !== undefined && !present;
+  // UX-09: covers the window between dispatching the pull and the FIRST
+  // `setup.progress` push for it — before `live` exists there is otherwise
+  // no feedback and no way to cancel. Set true right before the dispatch,
+  // false when it settles; the render guard below (`dispatching && live ===
+  // undefined`) keeps this mutually exclusive with the `inFlight` block,
+  // which takes over the instant `live` appears.
+  const [dispatching, setDispatching] = useState(false);
+  const pullOnRun = onPullSuccess
+    ? () =>
+        dispatch('setup.pullModel', { model, endpoint }).then((result) => {
+          if (isConfirmedOk(result)) onPullSuccess();
+          return result;
+        })
+    : () => dispatch('setup.pullModel', { model, endpoint });
 
   return (
     <div className="flex flex-col gap-1 rounded border border-border bg-overlay px-2 py-1.5">
@@ -1608,24 +1634,37 @@ function ConfiguredModelRow({
           <ActionButton
             label={`Pull ${model}`}
             icon="cloud-download"
-            onRun={
-              onPullSuccess
-                ? () =>
-                    dispatch('setup.pullModel', { model, endpoint }).then((result) => {
-                      if (result !== DECLINED) onPullSuccess();
-                      return result;
-                    })
-                : () => dispatch('setup.pullModel', { model, endpoint })
-            }
+            onRun={() => {
+              setDispatching(true);
+              return pullOnRun().finally(() => setDispatching(false));
+            }}
             disabledReason={disabledReason}
-            successLabel={pullSuccessLabel}
+            outcomeFor={pullCompletionOutcome(pullSuccessLabel)}
           />
+        </div>
+      )}
+      {dispatching && live === undefined && (
+        <div className="flex flex-col gap-1">
+          <StatusLine icon="sync" text="Working — waiting for the backend to report progress…" tone="neutral" />
+          <div>
+            <ActionButton
+              label={CANCEL_LABEL}
+              icon="close"
+              onRun={() => dispatch('setup.cancel', cancelPullParams(model))}
+              outcomeFor={cancelOutcome}
+            />
+          </div>
         </div>
       )}
       {inFlight && (
         <div className="flex flex-col gap-1">
+          {/* A11Y-05: mounted for the whole in-flight block (before the
+              `percent !== undefined` guard) so the sr-only region exists
+              before its first text (Finding-7) — not conditionally mounted
+              together with the percent it announces. */}
+          <PullAnnouncer label={`Pulling ${model}`} percent={percent} />
           {percent !== undefined && (
-            <div className="flex items-center gap-2" aria-live="polite">
+            <div className="flex items-center gap-2">
               <div
                 role="progressbar"
                 aria-valuenow={percent}
@@ -1640,7 +1679,12 @@ function ConfiguredModelRow({
             </div>
           )}
           <div>
-            <ActionButton label={CANCEL_LABEL} icon="close" onRun={() => dispatch('setup.cancel', cancelPullParams(model))} />
+            <ActionButton
+              label={CANCEL_LABEL}
+              icon="close"
+              onRun={() => dispatch('setup.cancel', cancelPullParams(model))}
+              outcomeFor={cancelOutcome}
+            />
           </div>
         </div>
       )}
@@ -1669,7 +1713,7 @@ function FimLlamacppPane({
   endpoint: string;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
 }) {
   const anyPresent = models.some((m) => m.llamacpp?.present === true);
   return (
@@ -1682,7 +1726,7 @@ function FimLlamacppPane({
         endpoint={endpoint}
         progress={progress}
         dispatch={dispatch}
-        disabledReason={disabledReason}
+        {...(disabledReason !== undefined ? { disabledReason } : {})}
       />
       {anyPresent && <p className="text-2xs text-muted">{FIM_LLAMACPP_NUDGE}</p>}
     </div>
@@ -1749,8 +1793,8 @@ function NextEditCard({
   nextEdit: NextEditToggleState;
   onToggleNextEdit: SetupPanelProps['onToggleNextEdit'];
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
-  jump?: JumpSignal;
+  disabledReason?: string | undefined;
+  jump?: JumpSignal | undefined;
 }) {
   const [showForm, setShowForm] = useState(false);
   const next = setup.nextEdit;
@@ -1848,7 +1892,11 @@ function NextEditToggleRow({
           {row.label}
         </label>
         <div className="text-2xs text-muted">{row.description}</div>
-        <LiveRegion text={lastError ? `Not saved: ${lastError}` : ''} className="text-2xs text-del" title={lastError} />
+        <LiveRegion
+          text={lastError ? `Not saved: ${lastError}` : ''}
+          className="text-2xs text-del"
+          {...(lastError !== undefined ? { title: lastError } : {})}
+        />
       </div>
       {/* F-7 parity (SettingsPanel.tsx): this toggle store is host-internal
           extension state, not a settings write — it must remain ACTIONABLE
@@ -1891,7 +1939,7 @@ function DedicatedNextForm({
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
+  disabledReason?: string | undefined;
 }) {
   const candidates = setup.fim.options.filter((o) => o.nextEditTransport !== undefined);
   const preferred = candidates.find((o) => o.id === dedicatedInitialCandidateId(setup.nextEdit, candidates));
@@ -1924,6 +1972,10 @@ function DedicatedNextForm({
   const livePull = pinnedRow !== undefined ? progress[progressKey('pull', pinnedRow.id)] : undefined;
   const pullPct = pullPercent(livePull?.totalBytes, livePull?.completedBytes);
   const pullInFlight = livePull !== undefined && presence !== 'present';
+  // llama.cpp pane's run-command caption (SC-3 digest hint) — computed once
+  // so the LocalModelBlock call site below can spread it conditionally
+  // without re-invoking the helper.
+  const runCommandCaption = nextLlamacppDigestHint(dedicated);
 
   // §4.3 point 5, narrowed by T13: ONLY vLLM keeps a read-only guided line
   // (§3.3 — unchanged). The llama.cpp -hf guided line is retired from that
@@ -1985,8 +2037,12 @@ function DedicatedNextForm({
               )}
               {pinnedRow !== undefined && pullInFlight && (
                 <div className="flex flex-col gap-1">
+                  {/* A11Y-05: mounted for the whole in-flight block (before
+                      the `pullPct !== undefined` guard) — see the
+                      configured-model row above for the same discipline. */}
+                  <PullAnnouncer label={`Pulling ${pinnedRow.id}`} percent={pullPct} />
                   {pullPct !== undefined && (
-                    <div className="flex items-center gap-2" aria-live="polite">
+                    <div className="flex items-center gap-2">
                       <div
                         role="progressbar"
                         aria-valuenow={pullPct}
@@ -2008,6 +2064,7 @@ function DedicatedNextForm({
                       label={CANCEL_LABEL}
                       icon="close"
                       onRun={() => dispatch('setup.cancel', cancelPullParams(pinnedRow.id))}
+                      outcomeFor={cancelOutcome}
                     />
                   </div>
                 </div>
@@ -2024,9 +2081,9 @@ function DedicatedNextForm({
               endpoint={endpoint}
               progress={progress}
               dispatch={dispatch}
-              disabledReason={disabledReason}
+              {...(disabledReason !== undefined ? { disabledReason } : {})}
               pinnedDownload={{ label: NEXT_DOWNLOAD_BUTTON_LABEL, unavailableReason: NEXT_DOWNLOAD_UNAVAILABLE_TEXT }}
-              runCommandCaption={nextLlamacppDigestHint(dedicated)}
+              {...(runCommandCaption !== undefined ? { runCommandCaption } : {})}
             />
           )}
 
@@ -2100,8 +2157,8 @@ function RagCard({
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
-  jump?: JumpSignal;
+  disabledReason?: string | undefined;
+  jump?: JumpSignal | undefined;
 }) {
   const rag = setup.rag;
   // T14 (§3.4): presence of the CONFIGURED embed model, endpoint-scoped
@@ -2136,7 +2193,7 @@ function RagCard({
           on={rag.enabled}
           label="Enable codebase index"
           disabled={disabledReason !== undefined}
-          title={disabledReason}
+          {...(disabledReason !== undefined ? { title: disabledReason } : {})}
           onChange={(next) => void dispatch('setup.setRag', { enabled: next })}
         />
       </div>
@@ -2217,8 +2274,8 @@ function RagEmbedSection({
   setup: SetupData;
   progress: SetupProgressMap;
   dispatch: SetupPanelProps['dispatch'];
-  disabledReason?: string;
-  jump?: JumpSignal;
+  disabledReason?: string | undefined;
+  jump?: JumpSignal | undefined;
 }) {
   const rag = setup.rag;
   const embedModels = (setup.catalog?.models ?? []).filter((m) => m.role === 'embedding');
@@ -2295,21 +2352,15 @@ function RagEmbedSection({
       </button>
       {open && (
         <div className="mt-2 flex flex-col gap-2">
-          <div className="inline-flex gap-1 self-start rounded border border-border p-0.5">
-            {(['ollama', 'llamacpp', 'openai-compat'] as const).map((b) => (
-              <button
-                key={b}
-                type="button"
-                aria-pressed={pane === b}
-                onClick={() => setPane(b)}
-                className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-                  pane === b ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
-                }`}
-              >
-                {b === 'openai-compat' ? RAG_THIRD_TAB_LABEL : BACKEND_DISPLAY[b]}
-              </button>
-            ))}
-          </div>
+          <SegmentedSwitch
+            ariaLabel="Embedding backend"
+            options={(['ollama', 'llamacpp', 'openai-compat'] as const).map((b) => ({
+              id: b,
+              label: b === 'openai-compat' ? RAG_THIRD_TAB_LABEL : BACKEND_DISPLAY[b],
+            }))}
+            value={pane}
+            onChange={setPane}
+          />
 
           <TextField
             label="Endpoint"
@@ -2358,21 +2409,21 @@ function RagEmbedSection({
             endpoint={ep.value}
             progress={progress}
             dispatch={dispatch}
-            disabledReason={disabledReason}
+            {...(disabledReason !== undefined ? { disabledReason } : {})}
             // PT5 §3.2: rows are MODEL selectors on the Ollama pane only —
             // on llama.cpp/vLLM the model choice is expressed by the
             // run/serve command, not these settings, so rows stay
             // informational there (no fake affordance).
-            selectedId={pane === 'ollama' ? rowSelectedId : undefined}
-            onSelect={
-              pane === 'ollama'
-                ? (id) => {
+            {...(pane === 'ollama' && rowSelectedId !== undefined ? { selectedId: rowSelectedId } : {})}
+            {...(pane === 'ollama'
+              ? {
+                  onSelect: (id: string) => {
                     const row = embedModels.find((m) => m.id === id);
                     const target = row?.ollamaCreatedName ?? row?.ollamaTag; // the catalogOllamaTarget rule
                     if (target !== undefined) setPendingModel(target);
-                  }
-                : undefined
-            }
+                  },
+                }
+              : {})}
             ollamaPullSuccessLabel={RAG_OLLAMA_PULL_NUDGE}
             onOllamaPullSuccess={(model) => {
               const target = model.ollamaCreatedName ?? model.ollamaTag;

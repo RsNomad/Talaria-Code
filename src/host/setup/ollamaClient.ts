@@ -75,6 +75,31 @@ export class StreamByteCapError extends Error {
   }
 }
 
+/** WS-SU F1-6: thrown by {@link pullModel} when the NDJSON stream ends
+ *  WITHOUT the terminal `{"status":"success"}` chunk — a clean mid-pull
+ *  disconnect used to be reported as a completed pull. Fixed template
+ *  message (no endpoint/response detail), mirroring {@link
+ *  StreamByteCapError}'s shape discipline. */
+export class PullIncompleteError extends Error {
+  constructor() {
+    super('pull stream ended before {"status":"success"} — incomplete');
+    this.name = 'PullIncompleteError';
+  }
+}
+
+/** F1-7: how many malformed NDJSON lines one pull tolerates before failing
+ *  honestly. Generous — a healthy Ollama stream contains zero. */
+const MAX_MALFORMED_PULL_LINES = 20;
+
+/** F1-7: thrown when a pull stream exceeds {@link MAX_MALFORMED_PULL_LINES}.
+ *  Carries a COUNT only — never line content (untrusted stream data). */
+export class PullMalformedStreamError extends Error {
+  constructor(count: number) {
+    super(`pull stream produced ${count} malformed NDJSON lines — aborting`);
+    this.name = 'PullMalformedStreamError';
+  }
+}
+
 interface TagsResponseModel {
   name: string;
   size: number;
@@ -82,6 +107,42 @@ interface TagsResponseModel {
 
 interface TagsResponseBody {
   models?: TagsResponseModel[];
+}
+
+/** F2-15: probeOllama's own body ceiling — /api/tags is a small JSON
+ *  document; 1 MiB is orders of magnitude above any legitimate tag list. */
+const PROBE_MAX_BODY_BYTES = 1 * 1024 * 1024;
+
+type BoundedBodyResult = { ok: true; text: string } | { ok: false; reason: string };
+
+/** F2-15: reads a fetch Response body through `getReader()` with a byte
+ *  ceiling — the same idiom {@link pullModel} already applies to its own
+ *  stream (`MAX_STREAM_BYTES`), now covering the probe's one-shot JSON body.
+ *  Cancels the reader on every exit path (F7 discipline, see pullModel). */
+async function readBodyBounded(response: Response, maxBytes: number): Promise<BoundedBodyResult> {
+  if (!response.body) {
+    return { ok: false, reason: 'response had no readable body' };
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let received = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        return { ok: false, reason: `response exceeded ${maxBytes} bytes without completing` };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return { ok: true, text };
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 }
 
 /**
@@ -107,7 +168,11 @@ export async function probeOllama(
         detail: `Ollama /api/tags responded ${response.status} ${response.statusText}`,
       };
     }
-    const body = (await response.json()) as TagsResponseBody;
+    const raw = await readBodyBounded(response, PROBE_MAX_BODY_BYTES);
+    if (!raw.ok) {
+      return { running: false, detail: `Ollama /api/tags ${raw.reason}` };
+    }
+    const body = JSON.parse(raw.text) as TagsResponseBody;
     const models: OllamaModel[] = (body.models ?? []).map((m) => ({ name: m.name, sizeBytes: m.size }));
     return { running: true, models };
   } catch (err) {
@@ -132,7 +197,8 @@ interface PullResponseChunk {
  * line to `onProgress`. Rejects on a non-2xx response, on a mid-stream
  * `{"error":e}` chunk (`new Error(e)`), or when `signal` aborts (an
  * `AbortError` `DOMException`, interrupting even an in-flight read).
- * Resolves as soon as a `{"status":"success"}` chunk is observed.
+ * Resolves ONLY when a `{"status":"success"}` chunk is observed; a stream
+ * that ends without one rejects with {@link PullIncompleteError} (F1-6).
  */
 export async function pullModel(
   endpoint: string,
@@ -160,6 +226,7 @@ export async function pullModel(
   const decoder = new TextDecoder();
   let buffer = '';
   let received = 0;
+  let malformedLines = 0;
   try {
     for (;;) {
       const { value, done } = await readWithAbort(reader, signal);
@@ -183,13 +250,24 @@ export async function pullModel(
         const line = buffer.slice(0, newlineIdx).trim();
         buffer = buffer.slice(newlineIdx + 1);
         if (!line) continue;
-        if (handlePullChunkLine(line, onProgress)) return;
+        const outcome = handlePullChunkLine(line, onProgress);
+        if (outcome === 'success') return;
+        if (outcome === 'malformed') {
+          malformedLines += 1;
+          if (malformedLines > MAX_MALFORMED_PULL_LINES) {
+            throw new PullMalformedStreamError(malformedLines);
+          }
+        }
       }
     }
     const trailing = buffer.trim();
     if (trailing) {
-      handlePullChunkLine(trailing, onProgress);
+      if (handlePullChunkLine(trailing, onProgress) === 'success') return;
     }
+    // F1-6: the loop returns above the moment success is observed; reaching
+    // here means the stream ended (or was closed under us) without ever
+    // confirming completion — reject, never fabricate a completed pull.
+    throw new PullIncompleteError();
   } finally {
     // F7 discipline (this codebase's `readNdjsonLines`/`readSseEvents`
     // convention, http.ts): cancel() on every exit path — success,
@@ -203,19 +281,35 @@ export async function pullModel(
 // --- internals ---------------------------------------------------------
 
 /** Parses one NDJSON line, forwards it as a {@link PullProgress}, and
- *  returns `true` once the stream has reached its terminal
- *  `"status":"success"`. Throws the runner's own message verbatim (never
- *  redacted — see module doc) on an `{"error":…}` chunk. */
-function handlePullChunkLine(line: string, onProgress: (p: PullProgress) => void): boolean {
-  const chunk = JSON.parse(line) as PullResponseChunk;
+ *  returns a tri-state outcome: `'success'` once the stream has reached its
+ *  terminal `"status":"success"`, `'progress'` for any other well-formed
+ *  chunk, or `'malformed'` when the line isn't valid JSON (F1-7: counted +
+ *  skipped by the caller, up to {@link MAX_MALFORMED_PULL_LINES}). Throws
+ *  the runner's own message verbatim (never redacted — see module doc) on
+ *  an `{"error":…}` chunk. */
+function handlePullChunkLine(line: string, onProgress: (p: PullProgress) => void): 'success' | 'progress' | 'malformed' {
+  let chunk: PullResponseChunk;
+  try {
+    chunk = JSON.parse(line) as PullResponseChunk;
+  } catch {
+    // F1-7: count-and-skip at the CALLER — never log or embed the line
+    // content. Fail-closed by construction: F1-6's terminal-success
+    // requirement means a skipped success line still ends in
+    // PullIncompleteError, never a fabricated success.
+    return 'malformed';
+  }
   if (chunk.error) {
     throw new Error(chunk.error);
   }
   if (chunk.status) {
-    onProgress({ status: chunk.status, totalBytes: chunk.total, completedBytes: chunk.completed });
-    if (chunk.status === 'success') return true;
+    onProgress({
+      status: chunk.status,
+      ...(chunk.total !== undefined ? { totalBytes: chunk.total } : {}),
+      ...(chunk.completed !== undefined ? { completedBytes: chunk.completed } : {}),
+    });
+    if (chunk.status === 'success') return 'success';
   }
-  return false;
+  return 'progress';
 }
 
 /**

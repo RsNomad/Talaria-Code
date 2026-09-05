@@ -401,7 +401,10 @@ export const panelData: PanelDataMap = {
     sessions: [
       { id: 'sess-hist-3', cwd: '/home/dev/talaria-code', title: 'Refactor login() to async/await', updatedAt: '2026-07-11T14:32:10Z' },
       { id: 'sess-hist-2', cwd: '/home/dev/talaria-code', title: 'Wire up the RAG search MCP server', updatedAt: '2026-07-10T09:12:00Z' },
-      { id: 'sess-hist-1', cwd: '/home/dev/other-repo', title: undefined, updatedAt: '2026-07-09T22:05:44Z' },
+      // exactOptional prep (arm 4): `SessionSummary.title` is `?: string` —
+      // this fixture deliberately exercises the no-title fallback, so the
+      // key is simply absent rather than present-with-`undefined`.
+      { id: 'sess-hist-1', cwd: '/home/dev/other-repo', updatedAt: '2026-07-09T22:05:44Z' },
     ],
   },
 

@@ -115,7 +115,7 @@ describe('createBackend — vLLM arm apiKey wiring (A3)', () => {
   });
 
   it('passes apiKey through as undefined, not "", when cfg.apiKey is undefined (no `?? \'\'` coercion)', () => {
-    const backend = createBackend(cfg({ backend: 'vllm', apiKey: undefined }));
+    const backend = createBackend(cfg({ backend: 'vllm' }));
     // Behaviorally, undefined and '' are indistinguishable from the outside —
     // both are falsy at VllmFimBackend's `if (this.opts.apiKey)` header check,
     // so no fetch-header assertion can tell them apart. This is the one
@@ -177,7 +177,7 @@ describe('createBackend — F-1 unknown backend name fails closed', () => {
 describe('createBackend — audit C-4 / review C-1: a keyless Codestral config builds, but never egresses', () => {
   it('does NOT throw for backend=codestral with no apiKey (construction must survive the async SecretStorage race)', () => {
     expect(() =>
-      createBackend(cfg({ backend: 'codestral', apiKey: undefined })),
+      createBackend(cfg({ backend: 'codestral' })),
     ).not.toThrow();
   });
 
@@ -185,7 +185,7 @@ describe('createBackend — audit C-4 / review C-1: a keyless Codestral config b
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
     try {
-      const backend = createBackend(cfg({ backend: 'codestral', apiKey: undefined }));
+      const backend = createBackend(cfg({ backend: 'codestral' }));
       const iterator = backend
         .streamFim(fimRequest(), new AbortController().signal)
         [Symbol.asyncIterator]();
@@ -207,7 +207,7 @@ describe('createBackend — audit C-4 / review C-1: a keyless Codestral config b
   it('does NOT refuse the local runners without a key (the remote-runner architecture stays intact)', () => {
     for (const backend of ['ollama', 'llamacpp', 'vllm', 'openai-compat'] as const) {
       expect(() =>
-        createBackend(cfg({ backend, endpoint: 'http://gpu.lan:8000', apiKey: undefined })),
+        createBackend(cfg({ backend, endpoint: 'http://gpu.lan:8000' })),
       ).not.toThrow();
     }
   });
@@ -241,7 +241,7 @@ describe('createBackend — F4: warns once when a configured apiKey is dropped f
   });
 
   it('does NOT warn when backend=ollama has no apiKey configured', () => {
-    createBackend(cfg({ backend: 'ollama', apiKey: undefined }));
+    createBackend(cfg({ backend: 'ollama' }));
     expect(warnSpy).not.toHaveBeenCalled();
   });
 

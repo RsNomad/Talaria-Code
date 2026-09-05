@@ -2,6 +2,7 @@ import type { Attachment } from '../../../shared/protocol';
 import { resolveWithinWorkspaceReal } from './pathConfine';
 import { isSecretPath } from '../../context/sanitize';
 import type { AcpOutboundContentBlock } from './types';
+import type { PromptDegradeCaps } from './promptCaps';
 
 /**
  * Build the ACP `session/prompt` `prompt: ContentBlock[]` array from the
@@ -19,17 +20,36 @@ import type { AcpOutboundContentBlock } from './types';
  * everything else; live Hermes acceptance of both variants is verified at
  * the Fedora local-test phase (cannot run `hermes acp` here).
  */
-export function buildPromptContent(text: string, attachments: Attachment[] | undefined): AcpOutboundContentBlock[] {
+declare const CONFINED_BRAND: unique symbol;
+/**
+ * CA-M03 (WS-AC): compile-time brand for "this attachment came out of
+ * {@link confineAttachmentPaths}" — the ONE blessing point (V-19's
+ * confine-first, secret-gate-second choke; dataUri-only attachments pass
+ * through it too and are blessed by passage). Zero runtime representation;
+ * the single `as` below is the documented blessing, making a RAW webview
+ * attachment handed straight to {@link buildPromptContent} a type error
+ * instead of a reviewer catch.
+ */
+export type ConfinedAttachment = Attachment & { readonly [CONFINED_BRAND]: true };
+
+export function buildPromptContent(
+  text: string,
+  attachments: readonly ConfinedAttachment[] | undefined,
+  promptCaps: PromptDegradeCaps,
+): AcpOutboundContentBlock[] {
   const blocks: AcpOutboundContentBlock[] = [];
   if (text) blocks.push({ type: 'text', text });
   for (const attachment of attachments ?? []) {
-    const block = attachmentToContentBlock(attachment);
+    const block = attachmentToContentBlock(attachment, promptCaps);
     if (block) blocks.push(block);
   }
   return blocks;
 }
 
-function attachmentToContentBlock(attachment: Attachment): AcpOutboundContentBlock | undefined {
+function attachmentToContentBlock(
+  attachment: Attachment,
+  promptCaps: PromptDegradeCaps,
+): AcpOutboundContentBlock | undefined {
   const parsed = attachment.dataUri ? parseDataUri(attachment.dataUri) : undefined;
 
   if (attachment.kind === 'image') {
@@ -39,7 +59,7 @@ function attachmentToContentBlock(attachment: Attachment): AcpOutboundContentBlo
         type: 'resource_link',
         uri: pathToFileUri(attachment.path),
         name: attachment.name,
-        mimeType: attachment.mime,
+        ...(attachment.mime !== undefined ? { mimeType: attachment.mime } : {}),
       };
     }
     return undefined;
@@ -51,21 +71,28 @@ function attachmentToContentBlock(attachment: Attachment): AcpOutboundContentBlo
       type: 'resource_link',
       uri: pathToFileUri(attachment.path),
       name: attachment.name,
-      mimeType: attachment.mime,
+      ...(attachment.mime !== undefined ? { mimeType: attachment.mime } : {}),
     };
   }
   if (parsed) {
     const uri = `attachment://${attachment.id}/${encodeURIComponent(attachment.name)}`;
     if (isTextMime(parsed.mime)) {
-      return {
-        type: 'resource',
-        resource: { uri, mimeType: parsed.mime, text: Buffer.from(parsed.base64, 'base64').toString('utf8') },
-      };
+      const text = Buffer.from(parsed.base64, 'base64').toString('utf8');
+      if (promptCaps.degradeEmbeddedResources) {
+        // A-03 degrade (INACTIVE vs pinned Hermes — promptCaps.ts): the
+        // decoded text still reaches the agent, as a plain text block
+        // headed by the attachment name (no on-disk path exists to link).
+        return { type: 'text', text: `[attachment: ${attachment.name}]\n${text}` };
+      }
+      return { type: 'resource', resource: { uri, mimeType: parsed.mime, text } };
     }
-    return {
-      type: 'resource',
-      resource: { uri, mimeType: parsed.mime, blob: parsed.base64 },
-    };
+    if (promptCaps.degradeEmbeddedResources) {
+      // A-03 degrade: binary bytes have no text form — a resource_link to
+      // the synthetic attachment uri is the best remaining reference
+      // (fidelity loss is exactly why this path ships inactive).
+      return { type: 'resource_link', uri, name: attachment.name, mimeType: parsed.mime };
+    }
+    return { type: 'resource', resource: { uri, mimeType: parsed.mime, blob: parsed.base64 } };
   }
   return undefined;
 }
@@ -104,7 +131,7 @@ function parseDataUri(dataUri: string): { mime: string; base64: string } | undef
 export type AttachmentConfineFn = (path: string, roots: readonly string[]) => Promise<string | null>;
 
 export interface ConfineAttachmentsResult {
-  attachments: Attachment[];
+  attachments: ConfinedAttachment[];
   droppedCount: number;
 }
 
@@ -130,11 +157,11 @@ export async function confineAttachmentPaths(
   workspaceRoots: readonly string[],
   confine: AttachmentConfineFn = resolveWithinWorkspaceReal,
 ): Promise<ConfineAttachmentsResult> {
-  const kept: Attachment[] = [];
+  const kept: ConfinedAttachment[] = [];
   let droppedCount = 0;
   for (const attachment of attachments) {
     if (!attachment.path) {
-      kept.push(attachment);
+      kept.push(attachment as ConfinedAttachment); // blessed: no fs reference to confine
       continue;
     }
     const canonical = await confine(attachment.path, workspaceRoots);
@@ -142,13 +169,28 @@ export async function confineAttachmentPaths(
       droppedCount++;
       continue;
     }
-    kept.push(canonical === attachment.path ? attachment : { ...attachment, path: canonical });
+    kept.push((canonical === attachment.path ? attachment : { ...attachment, path: canonical }) as ConfinedAttachment);
   }
   return { attachments: kept, droppedCount };
 }
 
+/**
+ * CA-M02 (WS-AC): RFC-3986-safe `file://` URI from a (confined) filesystem
+ * path — per-segment `encodeURIComponent`, restoring `:` (legal in path
+ * segments; keeps `C:` drive prefixes intact). Deliberately NOT
+ * `node:url.pathToFileURL`: that resolves through the HOST platform's path
+ * rules, so the same input produces different URIs on the Windows dev gate
+ * vs Linux CI — this must stay platform-deterministic (repo lesson: never
+ * per-arch behavior in gate-covered code). Inputs that already look like
+ * URIs pass through untouched, as before.
+ */
 function pathToFileUri(path: string): string {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) return path;
   const normalized = path.replace(/\\/g, '/');
-  return normalized.startsWith('/') ? `file://${normalized}` : `file:///${normalized}`;
+  const rooted = normalized.startsWith('/') ? normalized : `/${normalized}`;
+  const encoded = rooted
+    .split('/')
+    .map((segment) => encodeURIComponent(segment).replace(/%3A/gi, ':'))
+    .join('/');
+  return `file://${encoded}`;
 }

@@ -816,7 +816,12 @@ describe('TI-3 (AU-42 Part B): a refreshError renders a dismissible banner over 
 
     // The banner AND the previously-loaded row both render — the defect
     // this task fixes replaced the row with a full-panel error card instead.
-    expect(screen.getByText(/Couldn.t refresh/i)).toBeInTheDocument();
+    //
+    // Task 17 (Finding-7, WV4-MIN, DELIBERATE pin update): the same text now
+    // ALSO lives in RemotePanel's always-mounted sr-only announcement
+    // LiveRegion — `:not(.sr-only)` scopes this query to the VISIBLE banner
+    // copy, which is what this test actually means to assert on.
+    expect(screen.getByText(/Couldn.t refresh/i, { selector: ':not(.sr-only)' })).toBeInTheDocument();
     expect(screen.getByText('Agent is not connected yet.')).toBeInTheDocument();
     expect(screen.getByText('web-search')).toBeInTheDocument();
     expect(screen.getByRole('switch', { name: 'Enable web-search' })).toBeInTheDocument();
@@ -826,5 +831,93 @@ describe('TI-3 (AU-42 Part B): a refreshError renders a dismissible banner over 
 
     await user.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(dismissed).toEqual([true]);
+  });
+});
+
+/**
+ * Task 16 (WCAG 3.3.1/1.3.1, WV4-MIN): the Create-skill form's error state is
+ * field-keyed (`{field, text}`), same twin fix as McpPanel's Add-server form
+ * above — `aria-invalid` + `aria-describedby` tie the offending field to its
+ * error text for a screen reader.
+ */
+/**
+ * Task 19 (WCAG 1.3.1, WV4-MIN): the skill-row collection was `div` soup —
+ * no `role="list"`/`role="listitem"` at all. `CreateSkillDisclosure` and
+ * `InstallFromHubDisclosure` stay OUTSIDE the skills list element, as does
+ * the panel-level "Toggles persist immediately" note (already renders above
+ * the row collection).
+ */
+describe('WV4-MIN (Task 19, WCAG 1.3.1): the skills list carries explicit list/listitem semantics', () => {
+  it('the skill collection exposes role="list" with one listitem per skill', () => {
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+});
+
+/**
+ * Task 22 (UX-01/UX-16): a standard empty state, reused from `PanelShell`'s
+ * `EmptyPanel` — the panel used to render silent blank space with zero
+ * skills. The AU-46 lesson (empty state must keep the shell) plus this
+ * panel-specific twist: the empty state must never hide the way OUT of being
+ * empty — both the Create-skill and Install-from-hub disclosures stay
+ * rendered below it.
+ */
+describe('Task 22 (UX-01/UX-16): Skills panel empty state', () => {
+  it('renders the empty-state hint and keeps the Create-skill and Install-from-hub affordances when there are zero skills', () => {
+    render(
+      <SkillsPanel
+        data={{ skills: [], categories: [] }}
+        onToggle={async () => undefined}
+        onRefresh={noop}
+        {...noopSkillsAdminProps()}
+      />,
+    );
+
+    expect(screen.getByText('No skills yet — create one below, or install from the hub.')).toBeInTheDocument();
+    // AU-46: the way OUT of empty must never be hidden by the empty state.
+    expect(screen.getByRole('button', { name: /Create skill/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Install from hub/i })).toBeInTheDocument();
+  });
+});
+
+describe('WV4-MIN a11y: SkillsPanel create-form field errors are keyed to their field', () => {
+  it('submitting the create form with an empty Name marks the field aria-invalid and wires the error via aria-describedby', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    const name = screen.getByLabelText(/^Name$/i);
+    expect(name).toHaveAttribute('aria-invalid', 'true');
+    const describedBy = name.getAttribute('aria-describedby');
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(must(describedBy))).toHaveTextContent('Name is required.');
+  });
+
+  it('submitting with a Name but empty Content marks Content aria-invalid instead, and Name is no longer flagged', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    const name = screen.getByLabelText(/^Name$/i);
+    await user.type(name, 'my-skill');
+    const content = screen.getByLabelText(/^Content$/i);
+    await user.clear(content); // seeded content cleared → contentEdited, empty
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    expect(content).toHaveAttribute('aria-invalid', 'true');
+    const describedBy = content.getAttribute('aria-describedby');
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(must(describedBy))).toHaveTextContent('Content is required.');
+    expect(name).not.toHaveAttribute('aria-invalid', 'true');
   });
 });

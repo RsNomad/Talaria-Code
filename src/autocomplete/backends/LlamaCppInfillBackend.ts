@@ -2,6 +2,7 @@ import { joinUrl } from '../util';
 import { BackendHttpError, readJsonBounded } from './http';
 import { assertSecureAuthTransport } from './secureTransport';
 import { assertAllScanned } from '../context/assertAllScanned';
+import { isRecord } from '../../shared/typeGuards';
 import type { BackendCapabilities, FimBackend, FimRequest } from '../types';
 import type { ScannedSnippet } from '../context/types';
 
@@ -20,12 +21,18 @@ export interface LlamaCppInfillBackendOptions {
 }
 
 interface LlamaCppInfillResponse {
-  content?: string;
+  content?: string | null;
   /** dead: constant `true` in the local llama.cpp snapshot, never the real
    * completion-reason discriminator — that's `stop_type` (unread here, and
    * unread by anything downstream). Kept typed but never consulted below
    * (`:133-136` reads `content` only). Per audit-3 CA-1. */
   stop?: boolean;
+}
+
+/** WS-BG (SYN-BOUNDARY): shallow ingress guard — `streamFim` reads ONLY
+ *  `content` (`:138-140`); `null` tolerated (the truthy read skips it). */
+function isLlamaCppInfillResponse(x: unknown): x is LlamaCppInfillResponse {
+  return isRecord(x) && (x.content == null || typeof x.content === 'string');
 }
 
 /**
@@ -134,9 +141,16 @@ export class LlamaCppInfillBackend implements FimBackend {
     // llama.cpp's stream:false /infill body is a single JSON blob whose
     // realistic legitimate ceiling is ~1 MB (own-context-bounded prompt
     // echo); readJsonBounded caps it against a hostile/misconfigured server.
-    const data = (await readJsonBounded(response)) as LlamaCppInfillResponse;
-    if (data.content) {
-      yield data.content;
+    const raw = await readJsonBounded(response);
+    if (!isLlamaCppInfillResponse(raw)) {
+      // WS-BG: refuse an unrecognized ok-body loudly — status only, never
+      // body content (C-5 hygiene).
+      throw new Error(
+        `llama.cpp /infill returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+      );
+    }
+    if (raw.content) {
+      yield raw.content;
     }
   }
 

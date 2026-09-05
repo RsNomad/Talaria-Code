@@ -154,7 +154,7 @@ function makeFakeDeps(overrides: Partial<LspToolDeps> = {}): LspToolDeps {
     readSnippet: overrides.readSnippet ?? vi.fn(async () => 'fake-snippet'),
     readFullText: overrides.readFullText ?? vi.fn(async () => 'fake-full-text'),
     sleep: overrides.sleep ?? vi.fn(async () => undefined),
-    log: overrides.log,
+    ...(overrides.log !== undefined ? { log: overrides.log } : {}),
     pool: overrides.pool ?? getFreshShared().pool,
     tracker: overrides.tracker ?? getFreshShared().tracker,
     docSymbolsCache: overrides.docSymbolsCache ?? getFreshShared().docSymbolsCache,
@@ -242,6 +242,16 @@ describe('buildLibMcpServer — registration', () => {
         expect(tool.annotations?.readOnlyHint).toBe(true);
         expect(typeof tool.title === 'string' || tool.annotations?.title !== undefined).toBe(true);
       }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("B7: the LIB LSP MCP server advertises serverInfo.name === 'vscode_lsp' (matches the wire registration key every consumer uses)", async () => {
+    const { client, cleanup } = await connectClient(makeFakeDeps());
+    try {
+      const info = client.getServerVersion();
+      expect(info?.name).toBe('vscode_lsp');
     } finally {
       await cleanup();
     }
@@ -711,13 +721,14 @@ describe('concurrency pool — bounds in-flight gateway calls', () => {
 // AU-20 — post-gateway classification (classifyUri/readFullText realpath
 // fan-out) used to run as a raw `Promise.all` OUTSIDE the 4-slot pool, so a
 // single tool call with many raw targets could fan out unboundedly
-// concurrent realpath work. Each of the three call sites (locations targets,
-// workspace-diagnostics filtering, code-actions file resolution) must route
-// through the SAME pool primitive the gateway calls already use.
+// concurrent realpath work. Each of the four call sites (locations targets,
+// workspace-symbols classification, workspace-diagnostics filtering,
+// code-actions file resolution) must route through the SAME pool primitive
+// the gateway calls already use.
 // ---------------------------------------------------------------------------
 
 /** Builds a counting/pending-release `classifyUri` fake — same "counting
- * seam" shape as the concurrency-pool test above, reused for AU-20's three
+ * seam" shape as the concurrency-pool test above, reused for AU-20's four
  * scenarios. */
 function makeCountingClassifyUri(): {
   classifyUri: (uri: string) => Promise<ConfinementVerdict>;
@@ -806,6 +817,24 @@ describe('AU-20: post-gateway classifyUri realpath fan-out is bounded by the poo
     const deps = makeFakeDeps({ classifyUri, gateway: makeFakeGateway({ getCodeActions }) });
 
     const promise = callTool(deps, 'lsp_code_actions', CODE_ACTIONS_ARGS);
+    await drainUntilSettled(promise, pending);
+    await promise;
+
+    expect(getPeak()).toBeLessThanOrEqual(MAX_IN_FLIGHT);
+    expect(classifyUri).toHaveBeenCalledTimes(50);
+  });
+
+  it('lsp_workspace_symbols: 50 raw symbols never run more than MAX_IN_FLIGHT concurrent classifyUri calls', async () => {
+    const { classifyUri, pending, getPeak } = makeCountingClassifyUri();
+    const symbols: PlainSymbolInformation[] = Array.from({ length: 50 }, (_, i) => ({
+      name: `sym${i}`,
+      kind: 12, // SymbolKind.Function
+      location: { uri: `file:///usr/lib/f${i}.ts`, range: range(0, 0, 0, 1) },
+    }));
+    const getWorkspaceSymbols = vi.fn(async (): Promise<readonly PlainSymbolInformation[]> => symbols);
+    const deps = makeFakeDeps({ classifyUri, gateway: makeFakeGateway({ getWorkspaceSymbols }) });
+
+    const promise = callTool(deps, 'lsp_workspace_symbols', { query: 'sym' });
     await drainUntilSettled(promise, pending);
     await promise;
 

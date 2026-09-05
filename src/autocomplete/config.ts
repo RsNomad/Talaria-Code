@@ -103,7 +103,7 @@ export function readConfig(): HermesAutocompleteConfig {
     debounceMs: cfg.get<number>('debounceMs', 350),
     maxPromptTokens: cfg.get<number>('maxPromptTokens', 1024),
     temperature: cfg.get<number>('temperature', 0.01),
-    apiKey: apiKey || undefined,
+    ...(apiKey ? { apiKey } : {}),
     crossFile: {
       enabled: cfg.get<boolean>('crossFile.enabled', true),
       prefixInjection: cfg.get<boolean>('crossFile.prefixInjection', false),

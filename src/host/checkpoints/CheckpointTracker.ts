@@ -10,12 +10,25 @@ import type {
 } from '../../shared/protocol';
 // T-19 (C1+C2): moved out of rag/ — host/checkpoints/ importing from rag/ was a zone-crossing edge.
 import { createIgnoreFilter } from '../../shared/ignoreFilter';
+import { isRecord } from '../../shared/typeGuards';
 import { resolveWithinWorkspaceReal } from '../backend/acp/pathConfine';
 import { writeFileNoFollow } from '../backend/acp/safeWrite';
+import { settleRace } from '../backend/connection/settleRace';
+import {
+  DEFAULT_DISPOSE_FLUSH_DEADLINE_MS,
+  DEFAULT_GIT_TIMEOUT_MS,
+  DEFAULT_LOCK_MAX_WAIT_MS,
+  DEFAULT_LOCK_STALE_MS,
+} from './constants';
 import { sanitizeGitEnv } from './gitEnv';
-import { runGit, runGitBinary, type RunGitOptions } from './gitProcess';
+import { runGit, runGitBinary, type RunGitOptions, type GitSpawn } from './gitProcess';
+import { parseNameStatusZ, type CheckpointDiffEntry } from './nameStatus';
 import { missingObjects, type RunGit } from './objectClosure';
 import { acquireLock } from './shadowLock';
+
+// CKP-04 (WS-CK CA-M08): re-exported so every existing importer of these
+// types keeps compiling after the parser + its types moved to nameStatus.ts.
+export type { DiffStatus, CheckpointDiffEntry } from './nameStatus';
 
 // Re-export so consumers (e.g. AcpBackend) can distinguish a transient,
 // retryable lock timeout from a permanent checkpoint failure without reaching
@@ -100,16 +113,14 @@ export interface CheckpointTrackerOptions {
    * real repo and a real-repo `gc --prune` could orphan them).
    */
   localizeDebounceMs?: number;
-}
-
-/** One file's change status between two trees (or a tree and the live worktree). */
-export type DiffStatus = 'added' | 'modified' | 'deleted';
-
-/** One entry of a {@link CheckpointTracker.diff} result. */
-export interface CheckpointDiffEntry {
-  /** POSIX-relative path from the workspace root. */
-  path: string;
-  status: DiffStatus;
+  /**
+   * The `git` spawner every shadow-repo invocation this tracker makes goes
+   * through ({@link ./gitProcess.RunGitOptions.spawn}). Default = Node's real
+   * `spawn`; production never sets it. A test that must intercept a specific
+   * git call (a stalled `write-tree`, a failing `repack`, an overlap detector
+   * for `init`/`config`) injects it here — per instance, no module state.
+   */
+  spawn?: GitSpawn;
 }
 
 /** Result of {@link CheckpointTracker.restore}. */
@@ -157,7 +168,9 @@ export class WorktreeScanTimeoutError extends Error {
 
 const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024; // ~2 MiB, mirrors OpenCode's live size cutoff.
 const DEFAULT_PRUNE_DAYS = 7; // mirrors OpenCode's `prune = "7.days"`.
-const DEFAULT_GIT_TIMEOUT_MS = 15_000; // wall-clock bound per barrier/foreground git op (arch A#1).
+// DEFAULT_GIT_TIMEOUT_MS (wall-clock bound per barrier/foreground git op, arch
+// A#1) moved to ./constants — WS-CK dedup (was previously ALSO independently
+// defined in gitProcess.ts).
 // I-2: shortened 2 s -> 500 ms so a borrowing checkpoint is localized (made
 // self-contained) sooner, shrinking the window in which a real-repo `gc --prune`
 // could orphan its still-borrowed blobs. The debounce is NON-resetting (fires
@@ -221,6 +234,19 @@ interface CheckpointIndexFile {
   redo?: CheckpointRedoState;
 }
 
+/**
+ * WS-CK-A6: the deterministic per-root shadow directory — sha256(canonical
+ * root), 16 hex chars, under `<storage>/checkpoints/`. Pure-move of the
+ * constructor's hash rule (behavior-preserving: `path.resolve` only, NOT
+ * realpath — canonicalization is the A6 registry's job, not this rule's).
+ * ONE source of truth the constructor AND the A6 registry both reuse (key
+ * === hash input by construction) for collision checks and adopt-by-rename.
+ */
+export function shadowDirFor(storageDir: string, workspaceRoot: string): string {
+  const hash = createHash('sha256').update(path.resolve(workspaceRoot)).digest('hex').slice(0, 16);
+  return path.join(path.resolve(storageDir), 'checkpoints', hash);
+}
+
 export class CheckpointTracker {
   private readonly workspaceRoot: string;
   private readonly storageDir: string;
@@ -231,6 +257,7 @@ export class CheckpointTracker {
   private readonly lockMaxWaitMs: number;
   private readonly gitTimeoutMs: number;
   private readonly localizeDebounceMs: number;
+  private readonly gitSpawn: GitSpawn | undefined;
 
   private readonly shadowDir: string;
   private readonly gitDir: string;
@@ -258,13 +285,13 @@ export class CheckpointTracker {
     this.maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     this.extraIgnoreGlobs = options.extraIgnoreGlobs ?? [];
     this.defaultPruneDays = options.pruneDays ?? DEFAULT_PRUNE_DAYS;
-    this.lockStaleMs = options.lockStaleMs ?? 30_000;
-    this.lockMaxWaitMs = options.lockMaxWaitMs ?? 10_000;
+    this.lockStaleMs = options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS;
+    this.lockMaxWaitMs = options.lockMaxWaitMs ?? DEFAULT_LOCK_MAX_WAIT_MS;
     this.gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
     this.localizeDebounceMs = options.localizeDebounceMs ?? DEFAULT_LOCALIZE_DEBOUNCE_MS;
+    this.gitSpawn = options.spawn;
 
-    const hash = createHash('sha256').update(this.workspaceRoot).digest('hex').slice(0, 16);
-    this.shadowDir = path.join(this.storageDir, 'checkpoints', hash);
+    this.shadowDir = shadowDirFor(this.storageDir, this.workspaceRoot);
     this.gitDir = path.join(this.shadowDir, '.git');
     this.indexPath = path.join(this.shadowDir, 'index.json');
   }
@@ -467,13 +494,14 @@ export class CheckpointTracker {
     await this.init();
     return this.enqueue(() => this.withLock(async () => {
       const index = await this.loadIndex();
-      if (!index.redo) return { restored: false, reason: 'No redo available.' };
+      const redo = index.redo;
+      if (!redo) return { restored: false, reason: 'No redo available.' };
       const gone = await this.clearRedoIfAnchorMissing(index);
       if (gone) return gone;
-      const cursorIdx = index.checkpoints.findIndex((c) => c.id === index.redo!.cursorId);
+      const cursorIdx = index.checkpoints.findIndex((c) => c.id === redo.cursorId);
       const stepTarget = cursorIdx >= 0 ? index.checkpoints[cursorIdx + 1] : undefined;
       // Degenerate cursor (missing row / already at the tip): fall through to the anchor.
-      return this.restoreInternal(stepTarget ? stepTarget.id : index.redo.anchorId, opts);
+      return this.restoreInternal(stepTarget ? stepTarget.id : redo.anchorId, opts);
     }));
   }
 
@@ -497,7 +525,12 @@ export class CheckpointTracker {
    * MUST already hold the lock (`redo`/`redoAll`).
    */
   private async clearRedoIfAnchorMissing(index: CheckpointIndexFile): Promise<RestoreResult | undefined> {
-    const anchorRow = index.checkpoints.find((c) => c.id === index.redo!.anchorId);
+    const redo = index.redo;
+    // Callers (`redo`/`redoAll`) already refuse when no redo pointer exists;
+    // this arm is unreachable today and simply makes the invariant local
+    // instead of a `!` assertion (WV3-MIN-SYN).
+    if (!redo) return undefined;
+    const anchorRow = index.checkpoints.find((c) => c.id === redo.anchorId);
     const anchorTree = anchorRow?.tree;
     // F1 closure check (not just the top tree): an anchor whose closure has a
     // pruned blob/sub-tree can never be redone, so clear the pointer honestly.
@@ -543,6 +576,25 @@ export class CheckpointTracker {
     const target = await this.findCheckpoint(id);
     const index = await this.loadIndex();
 
+    const targetRefusal = await this.refuseIfTargetIncomplete(id, target);
+    if (targetRefusal) return targetRefusal;
+
+    const preconditions = await this.assessRestorePreconditions(index, target, opts);
+    if ('refusal' in preconditions) return preconditions.refusal;
+    const { currentTree, currentFiles, changes } = preconditions;
+
+    const { workingIndex, anchorRowId } = await this.ensureAnchorRow(index, currentTree, currentFiles);
+
+    const { changedPaths, skippedPaths } = await this.applyRestoreChanges(changes, target.tree);
+
+    await this.persistRestoreOutcome(workingIndex, target, anchorRowId);
+
+    return skippedPaths.length > 0
+      ? { restored: true, filesChanged: changedPaths.length, changedPaths, skippedPaths }
+      : { restored: true, filesChanged: changedPaths.length, changedPaths };
+  }
+
+  private async refuseIfTargetIncomplete(id: string, target: PersistedCheckpoint): Promise<RestoreResult | null> {
     // R1 (universal target pre-check, F1 closure check): refuse cleanly if ANY
     // object in the target tree's closure — the tree, its sub-trees, or a leaf
     // blob — is gone from the shadow store (external `gc --prune`, a deleted
@@ -563,7 +615,21 @@ export class CheckpointTracker {
           'store (pruned externally?) — refusing to restore so the worktree is not partially mutated.',
       };
     }
+    return null;
+  }
 
+  private async assessRestorePreconditions(
+    index: CheckpointIndexFile,
+    target: PersistedCheckpoint,
+    opts: { force?: boolean },
+  ): Promise<
+    | { refusal: RestoreResult }
+    | {
+        currentTree: string;
+        currentFiles: string[];
+        changes: CheckpointDiffEntry[];
+      }
+  > {
     const { tree: currentTree, files: currentFiles } = await this.writeTreeFromWorktree();
     const includedSet = new Set(currentFiles);
     const baseline = index.currentBaselineId;
@@ -599,11 +665,21 @@ export class CheckpointTracker {
             '(excluded by ignore rules or the file-size cutoff)'
           : 'the worktree has changes since the last checkpoint that no checkpoint captured';
       return {
-        restored: false,
-        reason: `Refusing to restore: ${detail}. Pass { force: true } to override.`,
+        refusal: {
+          restored: false,
+          reason: `Refusing to restore: ${detail}. Pass { force: true } to override.`,
+        },
       };
     }
 
+    return { currentTree, currentFiles, changes };
+  }
+
+  private async ensureAnchorRow(
+    index: CheckpointIndexFile,
+    currentTree: string,
+    currentFiles: string[],
+  ): Promise<{ workingIndex: CheckpointIndexFile; anchorRowId: string }> {
     // ---- P1 (Task 6): eager anchor pre-capture (BEFORE any file mutation) ---
     // The pre-restore live tree (`currentTree`) must exist as a restorable row
     // so nothing this restore overwrites is ever lost. NOT via snapshot(): its
@@ -650,7 +726,13 @@ export class CheckpointTracker {
       anchorRowId_ = anchorRecord.id;
       this.markLocalizeNeeded(); // the fresh tree may borrow alternate objects
     }
+    return { workingIndex, anchorRowId: anchorRowId_ };
+  }
 
+  private async applyRestoreChanges(
+    changes: CheckpointDiffEntry[],
+    targetTree: string,
+  ): Promise<{ changedPaths: string[]; skippedPaths: string[] }> {
     // AU-4/INV-12: ONE batched mode read for the whole restore (not per-file
     // — see {@link readTreeModes}'s doc for the rejected alternative), used
     // below to reapply the executable bit `git show` (content-only) can't
@@ -658,7 +740,7 @@ export class CheckpointTracker {
     // or empty diff — the common no-op-restore case): a deletion never reads
     // a mode, so there is no reason to pay for the extra `git` child.
     const targetModes = changes.some((c) => c.status !== 'deleted')
-      ? await this.readTreeModes(target.tree)
+      ? await this.readTreeModes(targetTree)
       : new Map<string, string>();
 
     const changedPaths: string[] = [];
@@ -711,13 +793,34 @@ export class CheckpointTracker {
           // the worktree.
           await fs.mkdir(path.dirname(absPath), { recursive: true });
           const content = await runGitBinary(
-            ['show', `${target.tree}:${change.path}`],
+            ['show', `${targetTree}:${change.path}`],
             this.shadowOpts(),
           );
           // Never write THROUGH an in-worktree symlink at the leaf: drop the
           // link (whether stale from a prior state, or raced in above) so a
           // fresh regular file lands at the intended in-tree path.
           await removeIfSymlink(absPath);
+          // CA-05 (WS-CK): containment RE-ASSERTION, placed immediately before
+          // the write — AFTER removeIfSymlink — so the validation→write window
+          // shrinks to the single open() below. The `safe` result computed at
+          // the top of this iteration does NOT travel with the string: the OS
+          // re-resolves every path component fresh on each syscall, so an
+          // ancestor dir swapped to an out-of-tree symlink during the awaited
+          // `git show` above would be FOLLOWED by this write's non-leaf
+          // components (O_NOFOLLOW guards the LEAF only — the :704-711
+          // argument, applied symmetrically to the ancestor). A violation
+          // rides the SAME skippedPaths disclosure as the loop-top refusal.
+          // Honest residual (ADR-019): between THIS check's own resolution and
+          // the open() an ancestor swap is theoretically still possible; full
+          // closure needs openat()-per-component inside frozen safeWrite —
+          // owner-gated, deliberately not taken here.
+          const dirSafe = await resolveWithinWorkspaceReal(path.dirname(absPath), [
+            this.workspaceRoot,
+          ]);
+          if (dirSafe === null) {
+            skippedPaths.push(change.path);
+            continue;
+          }
           // `writeFileNoFollow` (`../backend/acp/safeWrite.ts`) is the belt-
           // and-suspenders backstop for the tiny remaining gap between the
           // cleanup above and this open: on Linux it opens with `O_NOFOLLOW`,
@@ -755,22 +858,26 @@ export class CheckpointTracker {
         }
         changedPaths.push(change.path);
       } catch (err: unknown) {
-        const code =
-          (err as NodeJS.ErrnoException).code ??
-          (err instanceof Error ? err.name : 'unknown');
-        console.error(`restore: failed to apply ${change.path}: ${code}`);
+        console.error(`restore: failed to apply ${change.path}: ${errCode(err)}`);
         skippedPaths.push(change.path);
         continue;
       }
     }
+    return { changedPaths, skippedPaths };
+  }
 
+  private async persistRestoreOutcome(
+    workingIndex: CheckpointIndexFile,
+    target: PersistedCheckpoint,
+    anchorRowId: string,
+  ): Promise<void> {
     // ---- redo pointer + baseline (single durable write; corr-M3 disk-first,
     // P4/C5) --------------------------------------------------------------
     // Establish (rule 1) on the first undo; Move (rule 3) keeps the ORIGINAL
     // anchor and only moves the cursor while a redo is already outstanding;
     // Consume (rule 4) clears the pointer when the restore target IS the
     // anchor row itself (a manual restore of it, or redoAll()).
-    const anchorId = workingIndex.redo?.anchorId ?? anchorRowId_;
+    const anchorId = workingIndex.redo?.anchorId ?? anchorRowId;
     const next: CheckpointIndexFile = { ...workingIndex, currentBaselineId: target.tree };
     if (target.id === anchorId) {
       delete next.redo; // restored the forward tip — pointer consumed
@@ -779,10 +886,6 @@ export class CheckpointTracker {
     }
     await this.persistIndex(next);
     this.cachedIndex = next;
-
-    return skippedPaths.length > 0
-      ? { restored: true, filesChanged: changedPaths.length, changedPaths, skippedPaths }
-      : { restored: true, filesChanged: changedPaths.length, changedPaths };
   }
 
   /**
@@ -853,6 +956,73 @@ export class CheckpointTracker {
     }
   }
 
+  /**
+   * WS-CK-A6 (spec req 6): dispose WITH the durability flush — for per-root
+   * teardown on folder removal (and deactivate). Cancels the debounce, runs
+   * any pending localization (queue+lock-serialized), then awaits the queue
+   * tail so no in-flight op is abandoned mid-critical-section — all bounded by
+   * `deadlineMs` via the WS-R1 settleRace. 'deadline' means the flush is
+   * still running in the background (safe: it holds the cross-process lock;
+   * a successor tracker instance on this root serializes against it) — the
+   * CALLER discloses it. NEVER deletes the on-disk shadow repo: history is
+   * retention-by-default; a re-added folder finds it via shadowDirFor.
+   *
+   * Review fix (durability, post-commit): TWO ordering/disclosure defects in
+   * the original body are fixed here —
+   *
+   *  1. **Drain BEFORE flush, not flush-then-drain.** An op racing teardown
+   *     (`snapshot`/`restore`) sets `localizePending` via
+   *     {@link markLocalizeNeeded} only on ITS OWN completion. Flushing first
+   *     (the original order) checks `localizePending` while that op is still
+   *     in flight, sees `false`, and no-ops — then the drain below waits for
+   *     the op to finish, which RE-ARMS the debounce timer `dispose()` already
+   *     cleared above, deferring the borrow's localization to that timer
+   *     (~`localizeDebounceMs` later) instead of doing it before 'flushed' is
+   *     returned. A crash/`gc --prune` in that window silently loses it. A
+   *     single drain-then-flush is sufficient (not a loop): the drained
+   *     promise chain only settles AFTER the racing op's synchronous
+   *     `markLocalizeNeeded()` call has already run (it happens before that
+   *     op's own promise resolves), so by the time `flushLocalization()` runs
+   *     immediately after the drain, `localizePending` is guaranteed
+   *     up-to-date and its OWN `enqueue`+`withLock` call correctly localizes
+   *     the now-pending borrow. Nothing else can race a NEW `markLocalizeNeeded`
+   *     into the gap between the drain and the flush call — this whole
+   *     sequence has no `await` where a new caller could interleave (`dispose()`
+   *     already ran, cancelling the debounce path).
+   *  2. **A repack failure must not be indistinguishable from success.** The
+   *     original `flushLocalization().catch(() => undefined)` swallowed a
+   *     genuine durability-flush failure (disk-full, corrupt object) and
+   *     still returned 'flushed' — violating this file's own CA-M07 rule
+   *     (never silently swallow a repack failure). The error is now captured
+   *     and, if present, logged via `errCode` (errno/name only — never a raw
+   *     path) and disclosed as `'failed'`.
+   */
+  async disposeAndFlush(
+    deadlineMs: number = DEFAULT_DISPOSE_FLUSH_DEADLINE_MS,
+  ): Promise<'flushed' | 'deadline' | 'failed'> {
+    this.dispose();
+    let flushError: unknown;
+    const work = (async (): Promise<void> => {
+      // Drain the queue tail FIRST: see defect (1) above for why flushing
+      // before the drain can localize nothing.
+      await this.queue.then(
+        () => undefined,
+        () => undefined,
+      );
+      await this.flushLocalization().catch((err: unknown) => {
+        flushError = err;
+      });
+    })();
+    const outcome = await settleRace(work, { deadline: deadlineMs });
+    if (outcome.kind !== 'value') return 'deadline';
+    if (flushError !== undefined) {
+      // CA-M07: never silently swallow a repack failure (errno-only — no path leak).
+      console.error(`checkpoints: dispose flush repack failed: ${errCode(flushError)}`);
+      return 'failed';
+    }
+    return 'flushed';
+  }
+
   // --- internals ----------------------------------------------------------
 
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
@@ -897,11 +1067,17 @@ export class CheckpointTracker {
     }
   }
 
+  /** The per-call spawner key for every `RunGitOptions` this tracker builds — omitted (never `undefined`) when none was injected. */
+  private spawnOpt(): Pick<RunGitOptions, 'spawn'> {
+    return this.gitSpawn !== undefined ? { spawn: this.gitSpawn } : {};
+  }
+
   private shadowOpts(input?: string): RunGitOptions {
     return {
+      ...this.spawnOpt(),
       cwd: this.workspaceRoot,
       env: sanitizeGitEnv(process.env, { GIT_DIR: this.gitDir, GIT_WORK_TREE: this.workspaceRoot }),
-      input,
+      ...(input !== undefined ? { input } : {}),
       // Wall-clock bound so a stalled git can never hang the awaited barrier
       // (arch A#1). Maintenance ops (repack/gc) override this with `timeoutMs: 0`.
       timeoutMs: this.gitTimeoutMs,
@@ -915,7 +1091,10 @@ export class CheckpointTracker {
    */
   private shadowGit(): RunGit {
     return (args, opts) =>
-      runGit(args, { ...this.shadowOpts(opts?.input), allowFailure: opts?.allowFailure });
+      runGit(args, {
+        ...this.shadowOpts(opts?.input),
+        ...(opts?.allowFailure !== undefined ? { allowFailure: opts.allowFailure } : {}),
+      });
   }
 
   /**
@@ -944,7 +1123,12 @@ export class CheckpointTracker {
     if (this.localizeTimer !== undefined) return; // a flush is already scheduled
     this.localizeTimer = setTimeout(() => {
       this.localizeTimer = undefined;
-      void this.flushLocalization().catch(() => undefined);
+      void this.flushLocalization().catch((err: unknown) => {
+        // CA-M07 (WS-CK): a silently-swallowed repack failure leaves borrowed
+        // blobs un-localized with zero trace — log the errno code (never
+        // String(err): fs errors embed absolute paths).
+        console.error(`checkpoints: background localization repack failed: ${errCode(err)}`);
+      });
     }, this.localizeDebounceMs);
   }
 
@@ -991,10 +1175,10 @@ export class CheckpointTracker {
 
   private async preflightGitAvailable(): Promise<void> {
     try {
-      await runGit(['--version'], { cwd: this.storageDir, env: sanitizeGitEnv(process.env) });
+      await runGit(['--version'], { ...this.spawnOpt(), cwd: this.storageDir, env: sanitizeGitEnv(process.env) });
     } catch (err) {
       throw new GitUnavailableError(
-        `git executable not found on PATH; checkpoints are disabled (${String(err)})`,
+        `git executable not found on PATH; checkpoints are disabled (${errCode(err)})`,
       );
     }
   }
@@ -1011,12 +1195,14 @@ export class CheckpointTracker {
     let realGitDir: string | null = null;
     try {
       const isInside = await runGit(['rev-parse', '--is-inside-work-tree'], {
+        ...this.spawnOpt(),
         cwd: this.workspaceRoot,
         env: discoveryEnv,
         allowFailure: true,
       });
       if (isInside.code === 0 && isInside.stdout.trim() === 'true') {
         const commonDir = await runGit(['rev-parse', '--git-common-dir'], {
+          ...this.spawnOpt(),
           cwd: this.workspaceRoot,
           env: discoveryEnv,
         });
@@ -1132,14 +1318,32 @@ export class CheckpointTracker {
 
     let parsed: CheckpointIndexFile;
     try {
-      parsed = JSON.parse(raw) as CheckpointIndexFile;
+      const parsedUnknown: unknown = JSON.parse(raw);
+      // WV3-MIN-SYN / T13: `JSON.parse` returns any — a self-written index
+      // whose root is not a record with a checkpoints array of records is
+      // corrupt; refuse it HERE (the honest error below) instead of letting
+      // it masquerade as the index and TypeError later in the migration loop
+      // (e.g. `c.tree = c.id` on a non-object element).
+      if (
+        !isRecord(parsedUnknown) ||
+        !Array.isArray(parsedUnknown.checkpoints) ||
+        !parsedUnknown.checkpoints.every(isRecord)
+      ) {
+        throw new Error('index root is not an object with a checkpoints array of objects');
+      }
+      // The isRecord + checkpoints-array checks above are the actual runtime
+      // proof; CheckpointIndexFile's OTHER fields (workspaceRoot,
+      // currentBaselineId) are narrower than the guard checks, so TS's
+      // structural-overlap check rejects a direct `as` here — bridge through
+      // `unknown` (tsc's own suggested fix), not a blind cast.
+      parsed = parsedUnknown as unknown as CheckpointIndexFile;
     } catch (err) {
       // Corrupt index. Refuse to silently reset it — that would DELETE the
       // user's checkpoint history. Surface the failure instead so the caller can
       // report/recover. (Because {@link saveIndex} writes atomically, a
       // concurrent writer can never expose a half-written file here, so this
       // signals genuine corruption rather than a benign read/write race.)
-      throw new Error(`Checkpoint index at ${this.indexPath} is unreadable/corrupt: ${String(err)}`);
+      throw new Error(`Checkpoint index at ${this.indexPath} is unreadable/corrupt: ${errCode(err)}`);
     }
 
     // Migration: pre-existing records stored only the bare `write-tree` hash as
@@ -1560,7 +1764,9 @@ function toPublicCheckpoint(record: PersistedCheckpoint): Checkpoint {
     age: formatAge(record.timestamp),
     timestamp: record.timestamp,
     filesChanged: record.filesChanged,
-    turnOrdinal: record.turnOrdinal,
+    // Same posture as `phase`/`sessionLabel` below: surface `turnOrdinal` ONLY
+    // when the record carries it (never `turnOrdinal: undefined`).
+    ...(record.turnOrdinal !== undefined ? { turnOrdinal: record.turnOrdinal } : {}),
     // W2-F2: surface `phase` ONLY when the record carries it — legacy (pre-W2)
     // rows have no phase and must stay shapeless-compatible (never `phase: undefined`).
     ...(record.phase ? { phase: record.phase } : {}),
@@ -1583,52 +1789,6 @@ function formatAge(timestampIso: string): string {
   return `${days}d ago`;
 }
 
-/**
- * Parse `git diff-tree --name-status -z` output. The `-z` stream is a flat run
- * of NUL-terminated tokens: `STATUS\0PATH\0` per change, except renames/copies
- * (`R###`/`C###`) which carry `STATUS\0OLDPATH\0NEWPATH\0`. Rename detection is
- * NOT enabled here (the {@link CheckpointTracker.diffTrees} call passes no
- * `-M`/`-C`), but we parse it defensively so a future `-M` can't corrupt the
- * walk (i.e. misinterpret the 3-token record as two 2-token ones).
- *
- * AU-36:CP-rename landmine (deferred — dead code today, no live call site
- * passes `-M`/`-C`): the R/C branch below records ONLY the NEW path as
- * `modified` and silently drops OLDPATH — no `deleted` entry is ever emitted
- * for it. That is correct AS LONG AS rename detection stays off (git's own
- * `--name-status`, undetected, already reports a rename as a plain D+A pair
- * that this function handles fine). But the moment a future change enables
- * `-M`/`-C` on the `diff-tree` call, a genuine rename would restore the
- * content at NEWPATH while leaving OLDPATH's file untouched on disk — a
- * stale duplicate `restoreInternal` never deletes, silently corrupting the
- * restore. Fix-on-enable: also push `{ path: OLDPATH, status: 'deleted' }`
- * for the R/C case.
- */
-function parseNameStatusZ(output: string): CheckpointDiffEntry[] {
-  const tokens = output.split('\0');
-  const entries: CheckpointDiffEntry[] = [];
-  let i = 0;
-  while (i < tokens.length) {
-    const statusCode = tokens[i];
-    if (!statusCode) {
-      i++;
-      continue;
-    }
-    if (statusCode[0] === 'R' || statusCode[0] === 'C') {
-      const newPath = tokens[i + 2];
-      if (newPath) entries.push({ path: newPath, status: 'modified' });
-      i += 3;
-      continue;
-    }
-    const filePath = tokens[i + 1];
-    if (filePath === undefined) break;
-    const status: DiffStatus =
-      statusCode[0] === 'A' ? 'added' : statusCode[0] === 'D' ? 'deleted' : 'modified';
-    entries.push({ path: filePath, status });
-    i += 2;
-  }
-  return entries;
-}
-
 async function pathExists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
@@ -1641,4 +1801,11 @@ async function pathExists(p: string): Promise<boolean> {
 /** Normalizes an OS path separator to the forward-slash form git's `alternates` file expects. */
 function toPosixAbsolute(p: string): string {
   return p.replace(/\\/g, '/');
+}
+
+/** CKP-05: errno-code-or-name only — never String(err) (fs errors embed absolute paths). */
+function errCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  if (typeof code === 'string') return code;
+  return err instanceof Error ? err.name : 'unknown';
 }

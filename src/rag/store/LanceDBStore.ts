@@ -11,6 +11,7 @@ import * as lancedb from '@lancedb/lancedb';
 // identity is safe by design.
 import { Field, FixedSizeList, Float32, Int32, Schema, Utf8 } from 'apache-arrow';
 
+import { isRecord } from '../../shared/typeGuards';
 import { fuseHybridRows, type StoredRow } from './fuseHybridRows';
 import type { ChunkRecord, SearchFilter, SearchHit, VectorStore } from './VectorStore';
 
@@ -94,6 +95,32 @@ function toStoreRow(record: ChunkRecord): Record<string, unknown> {
  */
 export function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
+}
+
+/**
+ * WS-BG (SYN-BOUNDARY): shallow row-shape guard over rows returned by the
+ * native binding's `.toArray()` — unknown-in-truth (an older or corrupt
+ * index is free to hold anything; the same distrust `isWellFormedVector`
+ * codifies for the write path, `embedder.ts`). Exactly the RESULT_COLUMNS
+ * fields `fuseHybridRows` reads, at the depth it reads them; `language`
+ * tolerates `null` (nullable column — `toStoreRow` writes `null` on
+ * purpose). Exported for test (mirrors `escapeSqlLiteral` above).
+ */
+export function isStoredRow(x: unknown): x is StoredRow {
+  return (
+    isRecord(x) &&
+    typeof x.id === 'string' &&
+    typeof x.path === 'string' &&
+    typeof x.startLine === 'number' &&
+    typeof x.endLine === 'number' &&
+    typeof x.content === 'string' &&
+    (x.language == null || typeof x.language === 'string')
+  );
+}
+
+/** WS-BG: the `listFileHashes` projection's row guard. Exported for test. */
+export function isFileHashRow(x: unknown): x is { path: string; contentHash: string } {
+  return isRecord(x) && typeof x.path === 'string' && typeof x.contentHash === 'string';
 }
 
 /**
@@ -186,7 +213,33 @@ export class LanceDBStore implements VectorStore {
    * once the first failure has been recorded.
    */
   private ftsRepairAttempted = false;
+  /** WS-BG: once-per-instance malformed-row warning (mirrors `ftsRepairAttempted`). */
+  private rowShapeWarned = false;
   private readonly connectImpl: typeof lancedb.connect;
+  /** F2-12: injected log seam — default `console.error`, behavior-identical where unwired. */
+  private readonly log: (line: string) => void;
+  /**
+   * F2-12: CUMULATIVE count of malformed rows dropped over this store
+   * instance's lifetime — incremented on EVERY drop, even once the warn
+   * line itself goes quiet after the first (`rowShapeWarned`). Exposed via
+   * `droppedMalformedRows` so a caller (today: the extension's
+   * OutputChannel wiring; tomorrow: a RAG panel — none exists at HEAD) can
+   * observe the true extent of dropped rows, not just "it happened once".
+   */
+  private droppedMalformedRowsTotal = 0;
+
+  get droppedMalformedRows(): number {
+    return this.droppedMalformedRowsTotal;
+  }
+
+  private warnMalformedRowsOnce(dropped: number): void {
+    this.droppedMalformedRowsTotal += dropped;
+    if (this.rowShapeWarned) return;
+    this.rowShapeWarned = true;
+    this.log(
+      `hermes-codebase: dropped ${dropped} malformed row(s) from a store query (older or corrupt index?) — results may be incomplete until a re-index`,
+    );
+  }
 
   /**
    * TA-4 (AU-22, Med) / Rev-1 A5 — named seam: `LanceDBStore` built its own
@@ -201,9 +254,10 @@ export class LanceDBStore implements VectorStore {
    */
   constructor(
     private readonly indexDir: string,
-    options: { connectImpl?: typeof lancedb.connect } = {},
+    options: { connectImpl?: typeof lancedb.connect; logger?: (line: string) => void } = {},
   ) {
     this.connectImpl = options.connectImpl ?? lancedb.connect;
+    this.log = options.logger ?? ((line) => console.error(line));
   }
 
   async init(): Promise<void> {
@@ -234,7 +288,7 @@ export class LanceDBStore implements VectorStore {
         const fields = (await this.table.schema()).fields.map((f) => f.name);
         const missing = REQUIRED_COLUMNS.filter((name) => !fields.includes(name));
         if (missing.length > 0) {
-          console.error(
+          this.log(
             `hermes-codebase: dropping a legacy '${TABLE_NAME}' table missing required column(s) [${missing.join(', ')}] — the next index build recreates it with the current pinned schema`,
           );
           await this.db.dropTable(TABLE_NAME);
@@ -344,9 +398,8 @@ export class LanceDBStore implements VectorStore {
       try {
         await this.table.createIndex('content', { config: lancedb.Index.fts() });
       } catch (err) {
-        console.error(
-          'hermes-codebase: failed to create FTS index (sparse search will be empty until this succeeds)',
-          err,
+        this.log(
+          `hermes-codebase: failed to create FTS index (sparse search will be empty until this succeeds): ${err instanceof Error ? err.name : 'unknown'}`,
         );
       }
       return;
@@ -366,14 +419,19 @@ export class LanceDBStore implements VectorStore {
 
   async listFileHashes(): Promise<Record<string, string>> {
     if (!this.table) return {};
-    const rows = (await this.table
-      .query()
-      .select(['path', 'contentHash'])
-      .toArray()) as Array<{ path: string; contentHash: string }>;
+    const rows: unknown[] = await this.table.query().select(['path', 'contentHash']).toArray();
     const result: Record<string, string> = {};
+    let dropped = 0;
     for (const row of rows) {
+      // WS-BG: a malformed row is SKIPPED — its file then reads as changed
+      // and simply gets re-indexed (the self-healing direction).
+      if (!isFileHashRow(row)) {
+        dropped += 1;
+        continue;
+      }
       result[row.path] = row.contentHash;
     }
+    if (dropped > 0) this.warnMalformedRowsOnce(dropped);
     return result;
   }
 
@@ -431,11 +489,13 @@ export class LanceDBStore implements VectorStore {
       // — never silently degraded like the FTS leg below.
       throw vecOutcome.reason;
     }
-    const vecRows = vecOutcome.value as StoredRow[];
+    const vecRaw: unknown[] = vecOutcome.value;
+    const vecRows = vecRaw.filter(isStoredRow);
 
     let ftsRows: StoredRow[] = [];
     if (ftsOutcome.status === 'fulfilled') {
-      ftsRows = ftsOutcome.value as StoredRow[];
+      const ftsRaw: unknown[] = ftsOutcome.value;
+      ftsRows = ftsRaw.filter(isStoredRow);
     } else if (!this.ftsRepairAttempted) {
       // Degrade-visibly-not-silently: log once per store instance (not once
       // per search — a broken FTS index would otherwise spam the log on
@@ -443,14 +503,18 @@ export class LanceDBStore implements VectorStore {
       // self-heal so a transient first-build failure (`upsert()`'s
       // `createIndex` catch) can repair itself for later searches.
       this.ftsRepairAttempted = true;
-      console.error(
-        'hermes-codebase: sparse (FTS) search failed — degrading to vector-only results for this and future searches; attempting a one-time index repair',
-        ftsOutcome.reason,
+      this.log(
+        `hermes-codebase: sparse (FTS) search failed — degrading to vector-only results for this and future searches; attempting a one-time index repair: ${ftsOutcome.reason instanceof Error ? ftsOutcome.reason.name : 'unknown'}`,
       );
       void table.createIndex('content', { config: lancedb.Index.fts() }).catch((err: unknown) => {
-        console.error('hermes-codebase: FTS index repair attempt failed', err);
+        this.log(`hermes-codebase: FTS index repair attempt failed: ${err instanceof Error ? err.name : 'unknown'}`);
       });
     }
+
+    const droppedHybrid =
+      vecRaw.length - vecRows.length +
+      (ftsOutcome.status === 'fulfilled' ? ftsOutcome.value.length - ftsRows.length : 0);
+    if (droppedHybrid > 0) this.warnMalformedRowsOnce(droppedHybrid);
 
     return fuseHybridRows(vecRows, ftsRows, k);
   }
@@ -466,12 +530,12 @@ export class LanceDBStore implements VectorStore {
     try {
       this.table?.close();
     } catch (err) {
-      console.error('hermes-codebase: failed to close LanceDB table', err);
+      this.log(`hermes-codebase: failed to close LanceDB table: ${err instanceof Error ? err.name : 'unknown'}`);
     }
     try {
       this.db?.close();
     } catch (err) {
-      console.error('hermes-codebase: failed to close LanceDB connection', err);
+      this.log(`hermes-codebase: failed to close LanceDB connection: ${err instanceof Error ? err.name : 'unknown'}`);
     }
     this.db = undefined;
     this.table = undefined;

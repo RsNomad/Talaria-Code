@@ -43,7 +43,7 @@ describe('SessionHostPort.emit — constrained to SessionScoped<HostToWebviewMes
       getClient: () => client,
       emit: () => undefined,
       emitSystemError: () => undefined,
-      root: new RootCoordinator('/ws', undefined),
+      root: new RootCoordinator('/ws', () => undefined),
       workspaceRoots: () => [],
       refreshCheckpointsPanel: () => undefined,
       resolveMentions: async () => [],

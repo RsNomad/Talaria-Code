@@ -41,12 +41,13 @@ import type { AcpMcpServerHttp } from '../../shared/acpMcpServerHttp';
 import type { AcpSessionUpdate, AcpRequestPermissionRequest, AcpRequestPermissionResponse } from './acp/types';
 import { evaluateEditPolicy } from './policy/editPolicy';
 import { EditPreviewRegistry } from '../preview/EditPreviewRegistry';
-import type { CheckpointTrackerLike } from '../checkpoints/trackerContract';
+import type { CheckpointTrackerLike, CheckpointTrackerRegistryLike } from '../checkpoints/trackerContract';
+import { canonicalizeWorkspaceRoot } from '../checkpoints/rootResolution';
 import type { RestoreResult } from '../checkpoints/CheckpointTracker';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
 import type { PanelSource } from '../panels/PanelSourceRegistry';
 import type { DashboardService } from '../dashboard/HermesDashboardManager';
-import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult } from '../dashboard/HermesDashboardClient';
+import type { DashboardAdminClient, DashboardClientLike, DashboardToggleResult, DashboardEnvRow } from '../dashboard/HermesDashboardClient';
 import type { ConfinedReader } from './acp/confinedOpen';
 import { ConnectionSupervisor, type ConnectionSupervisorHostPort } from './connection/ConnectionSupervisor';
 import type { WorkspaceStateLike } from './oneshot/OneShotSessionRegistry';
@@ -55,6 +56,8 @@ import { SessionRegistry } from './session/SessionRegistry';
 import { must } from '../../testing/must';
 import { TRUST_GATED_METHODS } from './control/ControlDispatcher';
 import { RELOAD_LINE } from './control/mcpEntryValidation';
+import { respawnBackoffMs } from '../control/respawnBackoff';
+import type { RespawnHealth } from '../control/respawnHealth';
 
 /**
  * `vscode` isn't resolvable outside the extension host; `AcpBackend` only
@@ -336,7 +339,7 @@ class FakeAcpClient {
     cwd: string,
     mcpServers?: AcpMcpServer[],
   ): Promise<{ sessionId: string; currentModeId: string; currentModelId?: string }> {
-    this.newSessionCalls.push({ cwd, mcpServers });
+    this.newSessionCalls.push({ cwd, ...(mcpServers !== undefined ? { mcpServers } : {}) });
     if (this.hungNewSession) return new Promise<{ sessionId: string; currentModeId: string }>(() => {}); // never resolves
     if (this.nextNewSessionError !== undefined) {
       const err = this.nextNewSessionError;
@@ -348,7 +351,11 @@ class FakeAcpClient {
       return this.delayedNewSessionDeferred.promise;
     }
     const sessionId = this.queuedSessionIds.shift() ?? 'session-1';
-    return { sessionId, currentModeId: this.newSessionModeId, currentModelId: this.newSessionModelId };
+    return {
+      sessionId,
+      currentModeId: this.newSessionModeId,
+      ...(this.newSessionModelId !== undefined ? { currentModelId: this.newSessionModelId } : {}),
+    };
   }
 
   async setSessionMode(sessionId: string, modeId: string): Promise<void> {
@@ -429,7 +436,7 @@ class FakeAcpClient {
   }
 
   async listSessions(cwd?: string, cursor?: string): Promise<AcpListSessionsRawResult> {
-    this.listSessionsCalls.push({ cwd, cursor });
+    this.listSessionsCalls.push({ ...(cwd !== undefined ? { cwd } : {}), ...(cursor !== undefined ? { cursor } : {}) });
     return this.listSessionsResult;
   }
 
@@ -455,7 +462,7 @@ class FakeAcpClient {
     sessionId: string,
     mcpServers?: AcpMcpServer[],
   ): Promise<AcpLoadSessionResult> {
-    this.loadSessionCalls.push({ cwd, sessionId, mcpServers });
+    this.loadSessionCalls.push({ cwd, sessionId, ...(mcpServers !== undefined ? { mcpServers } : {}) });
     for (const update of this.replayUpdates) {
       this.callbacks?.onSessionUpdate(sessionId, update);
     }
@@ -973,6 +980,16 @@ class FakeControlChannel {
     if (deferred) return deferred as Promise<T>;
     return (this.resultsByMethod.has(method) ? this.resultsByMethod.get(method) : this.nextResult) as T;
   }
+
+  // UX-02: the health face the gateway wiring reads. The fake never respawns,
+  // so it is always 'ok'; per-test health driving happens through the ACP
+  // loop side (see the new describe below).
+  onHealth(_handler: (health: RespawnHealth) => void): { dispose(): void } {
+    return { dispose: () => {} };
+  }
+  currentHealth(): RespawnHealth {
+    return { state: 'ok', attempts: 0 };
+  }
 }
 
 function withFakeControl(backend: AcpBackend): FakeControlChannel {
@@ -1003,7 +1020,12 @@ class FakeCheckpointTracker implements CheckpointTrackerLike {
     label?: string,
     opts?: { phase?: CheckpointPhase; sessionLabel?: string },
   ): Promise<Checkpoint | null> {
-    this.snapshotCalls.push({ turnOrdinal, label, phase: opts?.phase, sessionLabel: opts?.sessionLabel });
+    this.snapshotCalls.push({
+      turnOrdinal,
+      ...(label !== undefined ? { label } : {}),
+      ...(opts?.phase !== undefined ? { phase: opts.phase } : {}),
+      ...(opts?.sessionLabel !== undefined ? { sessionLabel: opts.sessionLabel } : {}),
+    });
     return {
       id: `ckpt-${turnOrdinal}`,
       label: label ?? `Turn ${turnOrdinal}`,
@@ -1022,7 +1044,7 @@ class FakeCheckpointTracker implements CheckpointTrackerLike {
   }
 
   async restore(id: string, opts?: { force?: boolean }): Promise<RestoreResult> {
-    this.restoreCalls.push({ id, force: opts?.force });
+    this.restoreCalls.push({ id, ...(opts?.force !== undefined ? { force: opts.force } : {}) });
     return this.restoreResult;
   }
 
@@ -1033,13 +1055,38 @@ class FakeCheckpointTracker implements CheckpointTrackerLike {
   redoResult: RestoreResult = { restored: true, filesChanged: 0, changedPaths: [] };
 
   async redo(opts?: { force?: boolean }): Promise<RestoreResult> {
-    this.redoCalls.push({ kind: 'redo', force: opts?.force });
+    this.redoCalls.push({ kind: 'redo', ...(opts?.force !== undefined ? { force: opts.force } : {}) });
     return this.redoResult;
   }
 
   async redoAll(opts?: { force?: boolean }): Promise<RestoreResult> {
-    this.redoCalls.push({ kind: 'redoAll', force: opts?.force });
+    this.redoCalls.push({ kind: 'redoAll', ...(opts?.force !== undefined ? { force: opts.force } : {}) });
     return this.redoResult;
+  }
+}
+
+/**
+ * WS-CK-A6 Task 17 (post-flip test-pin migration): with `MULTI_ROOT_CHECKPOINTS`
+ * true, `resolveRootCoordinator`'s factory ternary resolves a tracker
+ * EXCLUSIVELY through `this.trackerRegistry?.get(canonicalRoot)` — the
+ * `checkpointTracker` ctor-arg arm (position 4) is dead on this path (see the
+ * dedicated "A6 flag-on wiring" suite). Every OTHER test in this file that
+ * injects a `checkpointTracker` to exercise genuine checkpoint FUNCTIONALITY
+ * (turn barriers, snapshot ordinals, restore/redo, panel refresh — not the A6
+ * wiring contract itself) never configures more than ONE `mockWorkspace
+ * .workspaceFolders` entry, under which `findContainingWorkspaceRoot` always
+ * returns that one folder (or the bare cwd when zero are configured) — so the
+ * canonical root the registry is asked for is trivially always the SAME one
+ * the pre-flip ternary trivially always matched too. This fake reproduces
+ * that exact pre-flip primary-only shape for the registry seam: it answers
+ * with ONE fixed tracker for ANY canonical root asked, matching what the bare
+ * `checkpointTracker` ctor arg used to provide unconditionally in every one
+ * of those single/zero-root test contexts.
+ */
+class UniversalTrackerRegistry implements CheckpointTrackerRegistryLike {
+  constructor(private readonly tracker: CheckpointTrackerLike) {}
+  get(): CheckpointTrackerLike | undefined {
+    return this.tracker;
   }
 }
 
@@ -1074,7 +1121,22 @@ function makeBackendWithCheckpoints(mentionResolver?: MentionResolverLike): {
 } {
   const config: HermesRuntimeConfig = {};
   const tracker = new FakeCheckpointTracker();
-  const backend = new AcpBackend(config, undefined, undefined, tracker, undefined, mentionResolver);
+  const backend = new AcpBackend(
+    config,
+    undefined,
+    undefined,
+    tracker,
+    undefined,
+    mentionResolver,
+    undefined,
+    undefined,
+    undefined,
+    // GUARD: valid ONLY for ≤1-folder tests (canonicalRoot === primaryRoot
+    // for every cwd here). A 2+-element workspaceFolders needs a
+    // discriminating fake (PrimaryOnlyTrackerRegistry / SpyTrackerRegistry)
+    // instead, or this silently masks a non-primary→undefined divergence.
+    new UniversalTrackerRegistry(tracker),
+  );
   const client = new FakeAcpClient();
   seam(backend).client = client;
   seam(backend).sessionId = 'session-1';
@@ -1236,8 +1298,10 @@ describe('AcpBackend.invokeControl — Zone CFG: MCP-hub panel refresh (multi-RP
     const { backend, messages } = makeBackend();
     const control = withFakeControl(backend);
     control.setResultFor('config.get', {
-      mcp_servers: {
-        filesystem: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] },
+      config: {
+        mcp_servers: {
+          filesystem: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] },
+        },
       },
     });
     control.setResultFor('tools.list', {
@@ -1263,7 +1327,7 @@ describe('AcpBackend.invokeControl — Zone CFG: MCP-hub panel refresh (multi-RP
     const { backend, messages } = makeBackend();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
 
     const result = await backend.invokeControl('reload.mcp', { confirm: true });
@@ -2120,7 +2184,7 @@ describe('AcpBackend.start — T-3 (closes B1-M1): session-establish wall-clock 
     const { backend, clients } = makeStartableBackend(undefined, (client, index) => {
       if (index === 0) {
         client.newSession = async (cwd: string, mcpServers?: AcpMcpServer[]) => {
-          client.newSessionCalls.push({ cwd, mcpServers });
+          client.newSessionCalls.push({ cwd, ...(mcpServers !== undefined ? { mcpServers } : {}) });
           return resolver.promise;
         };
       }
@@ -2193,10 +2257,13 @@ describe('AcpBackend.start — T-3 (closes B1-M1): session-establish wall-clock 
 
     // RED (pre-fix): only the child's own exit is raced during recovery —
     // no exit is simulated here, so this message never appears.
+    // UX-04c: this is `recoverOneSession`'s crash-recovery route — the pin
+    // gains `reason` (characterization-first, never deleted silently).
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: 'tab-2',
       kind: 'session-lost',
+      reason: 'recovery-failed',
       message: expect.any(String),
     });
     expect(hasController(backend, 'session-2')).toBe(false);
@@ -2208,6 +2275,45 @@ describe('AcpBackend.start — T-3 (closes B1-M1): session-establish wall-clock 
     expect(clients).toHaveLength(1);
     expect(must(clients[0]).newSessionCalls).toHaveLength(1);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('WS-R1 F2-03 — crash-recovery budget bounds the serial session/load chain', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('3 hung recoveries settle within 120s + 3×10s (not 3×120s); the un-attempted remainder is marked session-lost', async () => {
+    const { backend, clients } = makeStartableBackend(undefined, (client, index) => {
+      if (index > 0) client.hangLoadSession(); // the RESPAWN child never answers session/load
+    });
+    await backend.start(); // session-1 @ bootstrap tab
+    const boot = must(clients[0]);
+    boot.queueSessionId('session-2');
+    await backend.openTab('tab-2');
+    boot.queueSessionId('session-3');
+    await backend.openTab('tab-3');
+
+    // Registered AFTER the bootstrap settles (mirrors the sibling recovery
+    // tests above) — the fresh bootstrap ALSO emits its own system.recovered
+    // (T5 fold, `establishInitialSession`'s non-recovery branch), which is
+    // not what this test is about; only the crash-recovery leg's messages
+    // matter here.
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    boot.simulateExit(1); // crash: snapshot = 3 sessions
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1)); // respawn attempt 1 → clients[1]
+    // Budget = 120_000 + 3×10_000 = 150_000. Session A: min(120s, 150s)=120s;
+    // B: min(120s, 30s)=30s; C: remaining 0 → session-lost with NO attempt.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const lost = messages.filter((m) => m.type === 'tab.error' && m.kind === 'session-lost');
+    expect(lost).toHaveLength(3);
+    expect(must(clients[1]).loadSessionCalls).toHaveLength(2); // C never attempted — budget honesty
+    // the outage still resolves (recovery settled; banner retired):
+    expect(messages.filter((m) => m.type === 'system.recovered')).toHaveLength(1);
   });
 });
 
@@ -2329,7 +2435,14 @@ describe('ConnectionSupervisor.establishInitialSession — T5 (UI I-2 / Q2, owne
     must(clients[0]).simulateExit(1);
     await vi.advanceTimersByTimeAsync(500);
 
-    expect(messages).toContainEqual({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'session-lost', message: expect.any(String) });
+    // UX-04c: post-crash `recoverOneSession` route — pin gains `reason`.
+    expect(messages).toContainEqual({
+      type: 'tab.error',
+      tabId: BOOTSTRAP_TAB_ID,
+      kind: 'session-lost',
+      reason: 'recovery-failed',
+      message: expect.any(String),
+    });
     expect(messages).toContainEqual({ type: 'system.recovered' });
   });
 });
@@ -2403,6 +2516,148 @@ describe('AcpBackend.openTab/closeTab — W4-T3b (§2d/§2e Deliverable 5): the 
     const { backend } = makeStartableBackend();
     await backend.start();
     expect(() => backend.closeTab('never-existed')).not.toThrow();
+  });
+
+  it('WS-SL F3-5: a second tab.open for an ALREADY-OCCUPIED tabId is an idempotent no-op — no second session mint, no tab.error onto the healthy tab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).queueSessionId('session-2');
+    await backend.openTab('tab-2'); // first open: mints + binds session-2
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    must(clients[0]).queueSessionId('session-3'); // would be consumed by a (wrong) second mint
+
+    await backend.openTab('tab-2'); // the duplicate (double-fired tab.open)
+
+    // No second mint: boot + tab-2 only.
+    expect(must(clients[0]).newSessionCalls).toHaveLength(2);
+    // The healthy bound tab is untouched: no tab.error, no second tab.bound.
+    expect(messages).toEqual([]);
+    // The occupant is still session-2 (registry first-match and the webview
+    // binding agree — the finding's divergence never happens).
+    expect(sessionIdForTab(backend, 'tab-2')).toBe('session-2');
+  });
+});
+
+describe('WS-R1 F3-1 — openTab mint is raced (deadline + exit)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('a hung session/new times out: tab.error{open-failed} lands and the topology tail is RELEASED', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start(); // boot mint = newSessionCalls[0]
+    const client = must(clients[0]);
+    client.hangNewSession(); // EVERY later newSession hangs (the fake's flag is sticky)
+
+    const first = backend.openTab('tab-2'); // newSessionCalls[1] — hung
+    await vi.advanceTimersByTimeAsync(120_000);
+    await first;
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: 'tab-2', kind: 'open-failed' }),
+    );
+
+    // The tail is free: a SECOND openTab's body runs (its newSession is
+    // reached) instead of queueing forever behind the hung first mint.
+    const second = backend.openTab('tab-3');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.newSessionCalls).toHaveLength(3); // boot + tab-2 + tab-3
+    await vi.advanceTimersByTimeAsync(120_000); // let the second mint time out too — no dangling await
+    await second;
+  });
+
+  it('child exit during a tab mint lands the same open-failed terminal without waiting 120s', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.hangNewSession();
+    const open = backend.openTab('tab-2');
+    await vi.advanceTimersByTimeAsync(0);
+    client.simulateExit(1);
+    await vi.advanceTimersByTimeAsync(0);
+    await open;
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: 'tab-2', kind: 'open-failed' }),
+    );
+  });
+
+  it('belated session/new after the deadline: orphaned session closed, NO tab.bound announced', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.delayNewSession(); // NEXT newSession returns a controllable deferred
+    const open = backend.openTab('tab-2');
+    await vi.advanceTimersByTimeAsync(120_000); // give up
+    await open;
+    messages.length = 0;
+    client.resolveDelayedNewSession('session-belated'); // the belated resolution
+    await vi.advanceTimersByTimeAsync(0);
+    // openSession's isStaleAttempt guard (:900-924): close, never bind.
+    expect(client.closeSessionCalls).toContain('session-belated');
+    expect(messages.filter((m) => m.type === 'tab.bound')).toHaveLength(0);
+    expect(hasController(backend, 'session-belated')).toBe(false); // no registry leak on the discard path
+  });
+
+  it('newSessionInTab: a hung mint times out with tab.error{open-failed} and releases the tail', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.hangNewSession();
+    const rebind = backend.newSessionInTab(BOOTSTRAP_TAB_ID);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await rebind;
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'open-failed' }),
+    );
+    // Tail released: a follow-up openTab reaches its own newSession.
+    const after = backend.openTab('tab-2');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.newSessionCalls.length).toBeGreaterThanOrEqual(3);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await after;
+  });
+
+  it('newSessionInTab: child exit during the mint lands the same open-failed terminal without waiting 120s', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.hangNewSession();
+    const rebind = backend.newSessionInTab(BOOTSTRAP_TAB_ID);
+    await vi.advanceTimersByTimeAsync(0);
+    client.simulateExit(1);
+    await vi.advanceTimersByTimeAsync(0);
+    await rebind;
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'open-failed' }),
+    );
+  });
+
+  it('newSessionInTab: belated session/new after the deadline is closed, never bound', async () => {
+    const { backend, clients } = makeStartableBackend();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    await backend.start();
+    const client = must(clients[0]);
+    client.delayNewSession(); // NEXT newSession returns a controllable deferred
+    const rebind = backend.newSessionInTab(BOOTSTRAP_TAB_ID);
+    await vi.advanceTimersByTimeAsync(120_000); // give up
+    await rebind;
+    messages.length = 0;
+    client.resolveDelayedNewSession('session-belated'); // the belated resolution
+    await vi.advanceTimersByTimeAsync(0);
+    // openSession's isStaleAttempt guard (:900-924): close, never bind.
+    expect(client.closeSessionCalls).toContain('session-belated');
+    expect(messages.filter((m) => m.type === 'tab.bound')).toHaveLength(0);
+    expect(hasController(backend, 'session-belated')).toBe(false); // no registry leak on the discard path
   });
 });
 
@@ -2496,6 +2751,56 @@ describe('AcpBackend.closeTab — CF-01/L3-1 fix (Important): the pendingClose t
     await flushMicrotasks();
 
     expect(must(clients[0]).promptCallCount).toBe(1);
+  });
+});
+
+/**
+ * WS-SL F3-9: `closeTab` tombstones `pendingClose` SYNCHRONOUSLY but the
+ * registry removal is queued on the topology tail — behind a hung link, up
+ * to SESSION_ESTABLISH_DEADLINE_MS (120 s). In that window
+ * `handleRequestPermission` still found the live controller and emitted an
+ * approval card onto a tab the user already closed (the harness thread then
+ * blocked on a card nobody can answer). The tombstone check mirrors the
+ * sendPrompt (:1322) and handleSessionUpdate (:2068) guards — this was the
+ * last unguarded ingress. Characterization-first: the first committed shape
+ * of this test PINNED the card-onto-closing-tab, then flipped.
+ */
+describe('AcpBackend.handleRequestPermission — WS-SL F3-9: pendingClose tombstone refusal', () => {
+  it('a request_permission landing in the closeTab deferral window is auto-denied (cancelled) — no card onto the closing tab', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
+    const client = must(clients[0]);
+
+    // A LIVE turn on session-1 (so post-F3-3 the registration would be
+    // legitimate — the refusal under test must come from the tombstone,
+    // not from turn-liveness). FakeAcpClient.prompt hangs by default.
+    backend.sendPrompt('session-1', 'work', 'default');
+    await flushMicrotasks();
+
+    // Occupy the topology tail so the queued close CANNOT run yet:
+    client.hangLoadSession();
+    const loadPromise = backend.loadTab('tab-2', 'history-x', '/ws');
+    await flushMicrotasks();
+    backend.closeTab('session-1'); // tombstoned SYNCHRONOUSLY; removal queued BEHIND the hung load
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    const res = await must(client.callbacks).onRequestPermission({
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId: 'closing-1',
+        title: 'Run: npm test',
+        kind: 'execute',
+        content: [{ content: { type: 'text', text: '$ npm test' } }],
+        rawInput: { command: 'npm test', description: 'run' },
+      },
+    });
+
+    expect(res).toEqual({ outcome: { outcome: 'cancelled' } });
+    expect(messages.some((m) => m.type === 'approval.request')).toBe(false);
+    void loadPromise; // deliberately left in flight (hung child) — discarded at teardown
   });
 });
 
@@ -2822,7 +3127,22 @@ describe('AcpBackend — W4-T1b §3: a crash releases the (bridge) root turn-lea
       clients.push(client);
       return client;
     };
-    const backend = new AcpBackend(config, undefined, createClient, tracker);
+    const backend = new AcpBackend(
+      config,
+      undefined,
+      createClient,
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      // GUARD: valid ONLY for ≤1-folder tests (canonicalRoot === primaryRoot
+      // for every cwd here). A 2+-element workspaceFolders needs a
+      // discriminating fake (PrimaryOnlyTrackerRegistry / SpyTrackerRegistry)
+      // instead, or this silently masks a non-primary→undefined divergence.
+      new UniversalTrackerRegistry(tracker),
+    );
     seam(backend).control = new FakeControlChannel();
     return { backend, clients };
   }
@@ -2976,10 +3296,12 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
     await vi.advanceTimersByTimeAsync(500);
 
     // session-2's load failed -> a per-tab session-lost affordance, controller dropped
+    // UX-04c: routes through `recoverOneSession`'s failure branch — pin gains `reason`.
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: 'tab-2',
       kind: 'session-lost',
+      reason: 'recovery-failed',
       message: expect.any(String),
     });
     expect(hasController(backend, 'session-2')).toBe(false);
@@ -3002,8 +3324,8 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
    * `found:false` (not a rejection) for the recovered session id. Proves ALL
    * THREE effects fire together through the REAL recovery path
    * (`ConnectionSupervisor.recoverOneSession` -> `SessionController.
-   * loadReplay`'s `!result.found` branch -> that branch's existing `result
-   * === undefined` handling): the transcript-level `error`, the tab-chrome
+   * loadReplayOutcome`'s `!result.found` branch -> that branch's existing
+   * `{kind:'not-found'}` handling): the transcript-level `error`, the tab-chrome
    * `tab.error{kind:'session-lost'}`, and the dropped controller — not just
    * each one covered in isolation elsewhere.
    */
@@ -3023,7 +3345,7 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
     expect(clients).toHaveLength(2);
     expect(must(clients[1]).loadSessionCalls).toHaveLength(1);
 
-    // the transcript-level signal — loadReplay's own found:false branch,
+    // the transcript-level signal — loadReplayOutcome's own found:false branch,
     // identical shape to a rejected client.loadSession().
     expect(messages).toContainEqual({
       type: 'error',
@@ -3037,10 +3359,12 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
     expect(turnEnd).toMatchObject({ status: 'error', sessionId: 'session-1' });
 
     // the tab-chrome-level terminal signal — the SAME tab.error{kind:'session-lost'} a rejected recovery fires.
+    // UX-04c: pin gains `reason` (characterization-first, never deleted silently).
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: BOOTSTRAP_TAB_ID,
       kind: 'session-lost',
+      reason: 'recovery-failed',
       message: 'Could not recover this session after reconnecting.',
     });
 
@@ -3086,7 +3410,7 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
 
   /**
    * I1 (independent concurrency review, W4-T5a fix pass): `recoverOneSession`
-   * awaits `client.loadSession` (via `controller.loadReplay`) INSIDE the
+   * awaits `client.loadSession` (via `controller.loadReplayOutcome`) INSIDE the
    * `inFlightStart`-serialized `start()` run. `AcpClientLike.loadSession` is
    * not contractually guaranteed to reject when its child is killed
    * mid-request — if it HANGS, that await never settles, `start()`'s `run`
@@ -3127,6 +3451,59 @@ describe('AcpBackend — W4-T5a: respawn recovery fan-out (Q-10 / F2 / P-W4-6 sh
     // the still-outstanding session-1 recovery.
     expect(clients).toHaveLength(3);
     expect(must(clients[2]).loadSessionCalls.map((c) => c.sessionId)).toEqual(['session-1']);
+  });
+});
+
+/**
+ * WS-R3 F3-2: `establishInitialSession`'s recovery arm used to emit
+ * `system.recovered` UNCONDITIONALLY once `recoverSessions` settled, while
+ * its sibling `system.error` emit (the deadline/exit branch a few lines
+ * below) guards on `this.acpState !== 'respawning'`. `handleAcpCrash` flips
+ * `acpState` to `'respawning'` SYNCHRONOUSLY on the child's `exit` event
+ * (the last act of `teardownForRespawn`) — so a SECOND crash landing while
+ * `recoverSessions` is still awaiting a hung `loadSession` flips the state
+ * before that await ever settles (the raced `loadReplayOutcome` call
+ * resolves via the same exit, one tick later). The unconditional emit
+ * then wrongly retired the outage banner the 2nd crash had just raised.
+ */
+describe('WS-R3 F3-2 — a 2nd crash mid-recovery must not retire the fresh outage banner', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('system.recovered is suppressed when acpState flipped back to respawning during recoverSessions', async () => {
+    const { backend, clients } = makeStartableBackend(undefined, (client, index) => {
+      if (index === 1) client.hangLoadSession(); // 1st respawn: recovery hangs, we crash it mid-flight
+    });
+    await backend.start();
+    // Registered AFTER the bootstrap settles (mirrors the sibling recovery
+    // tests above, e.g. WS-R1 F2-03) — the fresh bootstrap ALSO emits its
+    // own system.recovered (T5 fold, the non-recovery branch), which is not
+    // what this test is about; only the crash-recovery leg's messages matter.
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+    must(clients[0]).simulateExit(1); // crash #1
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(1)); // respawn #1; recovery hung on session/load
+    must(clients[1]).simulateExit(1); // crash #2 MID-RECOVERY: the raced load settles undefined via the exit
+    await vi.advanceTimersByTimeAsync(1); // let recoverSessions drain + establishInitialSession return
+    expect(messages.filter((m) => m.type === 'system.recovered')).toHaveLength(0); // the pinned suppression
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(2)); // respawn #2 — clients[2] loads fine
+    await vi.advanceTimersByTimeAsync(1);
+    expect(messages.filter((m) => m.type === 'system.recovered')).toHaveLength(1); // the genuine retirement
+  });
+});
+
+describe('WS-R3 F3-4 — a force-ended turn no longer blocks reconnect', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('cancel → 15s force-end → reconnectAgent() proceeds (ok:true)', async () => {
+    const { backend } = makeStartableBackend();
+    await backend.start();
+    backend.sendPrompt('session-1', 'first prompt', 'default'); // prompt hangs on the fake's deferred
+    await vi.advanceTimersByTimeAsync(0);
+    backend.cancel('session-1'); // verified public signature: cancel(sessionId: string): void (:1282)
+    await vi.advanceTimersByTimeAsync(15_000); // CANCEL_FALLBACK_DEADLINE_MS force-end
+    await expect(backend.reconnectAgent()).resolves.toEqual({ ok: true });
   });
 });
 
@@ -3217,10 +3594,10 @@ describe('AcpBackend — T-1 (V-12 RESTART-STATE): explicit restart fans out end
       expect(loadedIds).toEqual(['session-1', 'session-2']); // both sessions recovered normally
 
       // Exactly ONE `clear` per recovered session — `SessionController.
-      // loadReplay`'s OWN, pre-existing per-session clear (unrelated to the
+      // loadReplayOutcome`'s OWN, pre-existing per-session clear (unrelated to the
       // restart fan-out). If the fan-out's `pendingRecovery` guard were
       // broken, the bootstrap session would get a SECOND, extra clear from
-      // `fanOutRestartSignal` stacked on top of `loadReplay`'s.
+      // `fanOutRestartSignal` stacked on top of `loadReplayOutcome`'s.
       const clears = messages.filter((m) => m.type === 'clear') as Array<{ sessionId: string }>;
       expect(clears.map((c) => c.sessionId).sort()).toEqual(['session-1', 'session-2']);
 
@@ -3442,6 +3819,14 @@ describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session"
         calls.push(d);
         return d.promise;
       },
+      // WS-R1 F3-1 (this task): newSessionInTabInternal now races its mint
+      // via settleRace({ exit: client, ... }), which subscribes to
+      // client.onExit — a never-firing stub keeps this test's own child
+      // "alive" for its full duration (this test asserts tail-serialization
+      // ordering, not exit behavior).
+      onExit(): { dispose(): void } {
+        return { dispose: () => {} };
+      },
     };
     seam(backend).client = client;
 
@@ -3504,7 +3889,7 @@ describe('AcpBackend.newSessionInTab — W3-T6 (CF-11/D2): per-tab "New Session"
  * a failed/superseded recovery load, with NO identity guard. `loadTab`/
  * `tab.load` used to NOT be serialized behind `inFlightStart` (only `openTab`
  * was) — a user could load the SAME `sessionId` into a DIFFERENT tab WHILE
- * this recovery's own `loadReplay` await was still in flight.
+ * this recovery's own `loadReplayOutcome` await was still in flight.
  * `SessionRegistry.open`'s W6-FB remove-then-dispose then disposed recovery's
  * controller and rebound `sessionId` to the winner's fresh controller. If
  * recovery's own load THEN failed, closing by key disposed the WINNER (not
@@ -3551,7 +3936,7 @@ describe('AcpBackend — CF-01/L3-1: loadTab is now serialized on the SAME tail 
     await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID, on client[0]
 
     must(clients[0]).simulateExit(1); // crash -> respawning, backoff scheduled
-    await vi.advanceTimersByTimeAsync(500); // respawn #1 fires -> recoverOneSession's own loadReplay (call #0) is now in flight, still inside start()'s OWN runOnStartTail turn
+    await vi.advanceTimersByTimeAsync(500); // respawn #1 fires -> recoverOneSession's own loadReplayOutcome call (call #0) is now in flight, still inside start()'s OWN runOnStartTail turn
 
     expect(loadCalls).toHaveLength(1); // recovery's own session-1 load — not yet settled
 
@@ -3570,19 +3955,21 @@ describe('AcpBackend — CF-01/L3-1: loadTab is now serialized on the SAME tail 
     // recovery — no second call has been made yet.
     expect(loadCalls).toHaveLength(1);
 
-    // Recovery's OWN load (call #0) now fails. `SessionController.loadReplay`
+    // Recovery's OWN load (call #0) now fails. `SessionController.loadReplayOutcome`
     // never rejects (it catches internally) — this settles `recoverOneSession`'s
-    // `result === undefined` failure branch, which identity-guard-closes
+    // non-`loaded` `outcome.kind` failure branch, which identity-guard-closes
     // session-1 (still its own, untouched, controller at this point).
     must(loadCalls[0]).reject(new Error('history store corrupt'));
     await flushMicrotasks();
 
+    // UX-04c: recovery's own load failure — pin gains `reason`.
     expect(
       messages.filter((m) => m.type === 'tab.error' && (m as { tabId: string }).tabId === BOOTSTRAP_TAB_ID),
     ).toContainEqual({
       type: 'tab.error',
       tabId: BOOTSTRAP_TAB_ID,
       kind: 'session-lost',
+      reason: 'recovery-failed',
       message: expect.any(String),
     });
 
@@ -3632,7 +4019,7 @@ describe('AcpBackend — CF-01/L3-1: loadSessionIntoTab/closeTab are serialized 
     // would already be 2 here. GREEN (post-fix): load B is queued behind
     // load A on the SAME `inFlightStart` tail — it cannot start until load
     // A's ENTIRE tail-wrapped call (through its own client.loadSession
-    // resolving and its whole announce/loadReplay chain) settles.
+    // resolving and its whole announce/loadReplayOutcome chain) settles.
     expect(calls).toHaveLength(1);
 
     calls[0]?.resolve({ found: true, currentModeId: 'default' });
@@ -3687,10 +4074,12 @@ describe('AcpBackend — CF-01/L3-1: loadSessionIntoTab/closeTab are serialized 
  * that the whole method is tail-serialized (the describe block immediately
  * above), a hung-but-alive child wedges the ENTIRE topology tail forever —
  * every subsequent `openTab`/`closeTab`/`loadSessionIntoTab`/`start` chains
- * behind it. These tests prove `ConnectionSupervisor
- * .raceSessionLoadAgainstDeadline`'s `SESSION_ESTABLISH_DEADLINE_MS` (120s)
- * closes that gap, mirroring the T-3 "session-establish wall-clock deadline"
- * describe block's own style for the bootstrap/recovery legs.
+ * behind it. These tests prove `loadSessionIntoTabInternal`'s direct
+ * `settleRace(loadReplayOutcome, { deadline: SESSION_ESTABLISH_DEADLINE_MS })` call
+ * (WS-R1 step 3b — migrated off the now-deleted deadline-only adapter
+ * `ConnectionSupervisor` used to expose) closes that gap, mirroring the T-3
+ * "session-establish wall-clock deadline" describe block's own style for the
+ * bootstrap/recovery legs.
  */
 describe('AcpBackend.loadTab — CF-01/L3-1 fix (Critical): a hung-but-alive client.loadSession must not wedge the topology tail forever', () => {
   beforeEach(() => {
@@ -3725,10 +4114,12 @@ describe('AcpBackend.loadTab — CF-01/L3-1 fix (Critical): a hung-but-alive cli
     expect(settlement.settled()).toBe(true);
     await loadPromise;
 
+    // UX-04c: the settleRace deadline mid-load route — pin gains `reason`.
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: 'tab-2',
       kind: 'session-lost',
+      reason: 'timeout',
       message: expect.any(String),
     });
     // The abandoned attempt's controller is disposed (identity-guarded,
@@ -3753,7 +4144,7 @@ describe('AcpBackend.loadTab — CF-01/L3-1 fix (Critical): a hung-but-alive cli
     await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID
     const resolver = deferred<AcpLoadSessionResult>();
     must(clients[0]).loadSession = async (cwd: string, sessionId: string, mcpServers?: AcpMcpServer[]) => {
-      must(clients[0]).loadSessionCalls.push({ cwd, sessionId, mcpServers });
+      must(clients[0]).loadSessionCalls.push({ cwd, sessionId, ...(mcpServers !== undefined ? { mcpServers } : {}) });
       return resolver.promise;
     };
 
@@ -3975,7 +4366,7 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
     );
   });
 
-  it('a stale loadReplay whose controller was disposed (superseded by a fresh mint on the SAME tab) never emits into the tab after the fact (F6 x P4b generalized across mint-fresh)', async () => {
+  it('a stale loadReplayOutcome call whose controller was disposed (superseded by a fresh mint on the SAME tab) never emits into the tab after the fact (F6 x P4b generalized across mint-fresh)', async () => {
     const { backend } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
     let resolveFirst!: (result: AcpLoadSessionResult) => void;
     const firstLoad = new Promise<AcpLoadSessionResult>((resolve) => {
@@ -4016,15 +4407,16 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
    * Task-7 fix-wave (Important-1, guard 1 of 3): the SAME stale-superseded-load
    * proof as immediately above, but the belated resolution is `found:false`
    * (audit A-3's lost-session branch) instead of a genuine success. Proves the
-   * `if (this.replay !== replay) return undefined;` re-check INSIDE that
-   * branch (`SessionController.loadReplay`, right after the `!result.found`
-   * check) is load-bearing: without it, load A's belated `found:false`
-   * resolution would fall through and emit `error`/`turn.end` into tab-1
-   * AFTER its controller was disposed by load B's fresh mint — the exact
-   * "stale emit after supersede" class this file's `found:true` sibling test
-   * exists to forbid, just reached via the OTHER exit of `loadReplay`.
+   * `if (this.replay !== replay) return { kind: 'superseded' };` re-check
+   * INSIDE that branch (`SessionController.loadReplayOutcome`, right after
+   * the `!result.found` check) is load-bearing: without it, load A's belated
+   * `found:false` resolution would fall through and emit `error`/`turn.end`
+   * into tab-1 AFTER its controller was disposed by load B's fresh mint —
+   * the exact "stale emit after supersede" class this file's `found:true`
+   * sibling test exists to forbid, just reached via the OTHER exit of
+   * `loadReplayOutcome`.
    */
-  it('a stale loadReplay whose controller was disposed (superseded by a fresh mint on the SAME tab) never emits into the tab after the fact — found:false variant (audit A-3 supersede re-check)', async () => {
+  it('a stale loadReplayOutcome call whose controller was disposed (superseded by a fresh mint on the SAME tab) never emits into the tab after the fact — found:false variant (audit A-3 supersede re-check)', async () => {
     const { backend } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
     let resolveFirst!: (result: AcpLoadSessionResult) => void;
     const firstLoad = new Promise<AcpLoadSessionResult>((resolve) => {
@@ -4060,7 +4452,7 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
 
   /**
    * C1 (independent concurrency review, W4-T5a fix pass): the ABOVE "stale
-   * loadReplay" test runs with `workspaceFolders === undefined` — the ONE
+   * loadReplayOutcome" test runs with `workspaceFolders === undefined` — the ONE
    * branch of `loadSessionIntoTab` with NO `await` between capturing the
    * tab's occupant (:1601) and disposing it (pre-fix :1626). With a
    * workspace OPEN, `resolveWithinWorkspaceReal` (:1615) is a REAL `await`
@@ -4196,16 +4588,40 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
       // No silent zombie: tab-1 gets the EXISTING T5a terminal signal — the
       // SAME `tab.error{kind:'session-lost'}` a failed respawn recovery
       // fires — never left bound-to-a-dead-controller with no affordance.
+      // UX-04c: the orphaned-tab route — pin gains `reason`.
       expect(messages).toContainEqual({
         type: 'tab.error',
         tabId: 'tab-1',
         kind: 'session-lost',
+        reason: 'superseded',
         message: expect.any(String),
       });
 
       // Exactly one controller is live for SA, and it is bound to tab-2.
       expect(sessionIdForTab(backend, 'tab-2')).toBe('SA');
       expect(sessionIdForTab(backend, 'tab-1')).toBeUndefined();
+    } finally {
+      await fsp.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('UX-04c: the orphaned-tab session-lost emit carries reason "superseded"', async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'hermes-acp-w6fb-ux04c-'));
+    try {
+      const project = path.join(tmpRoot, 'project');
+      await fsp.mkdir(project, { recursive: true });
+      mockWorkspace.workspaceFolders = [{ uri: { fsPath: tmpRoot } }];
+
+      const { backend, messages } = makeBackend(); // session-1 @ BOOTSTRAP_TAB_ID
+      const load = callLoadSessionIntoTab(backend);
+
+      await load('SA', project, 'tab-1');
+      messages.length = 0; // drop tab-1's own tab.bound/mode.state/clear/turn.start/turn.end noise
+      await load('SA', project, 'tab-2');
+
+      expect(messages).toContainEqual(
+        expect.objectContaining({ type: 'tab.error', tabId: 'tab-1', kind: 'session-lost', reason: 'superseded' }),
+      );
     } finally {
       await fsp.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
     }
@@ -4282,10 +4698,12 @@ describe('AcpBackend.loadSessionIntoTab — W4-T5a deliverable 3: proper per-tab
       const orphan = xHasSA ? 'tab-y' : 'tab-x';
 
       // No silent zombie: the orphaned tab got the terminal session-lost signal.
+      // UX-04c: the orphaned-tab route — pin gains `reason`.
       expect(messages).toContainEqual({
         type: 'tab.error',
         tabId: orphan,
         kind: 'session-lost',
+        reason: 'superseded',
         message: expect.any(String),
       });
     } finally {
@@ -4342,27 +4760,27 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
    * previously genuinely-silent branch: the client disappearing in the
    * window AFTER this method's own entry-check (a real ACP-child crash
    * while the `resolveWithinWorkspaceReal` confinement `await` is in flight
-   * is the realistic trigger) but BEFORE `controller.loadReplay` actually
-   * runs. `announceSessionBound` has ALREADY fired `tab.bound` by that
-   * point, so pre-fix this tab was left silently "bound" with an empty
+   * is the realistic trigger) but BEFORE `controller.loadReplayOutcome`
+   * actually runs. `announceSessionBound` has ALREADY fired `tab.bound` by
+   * that point, so pre-fix this tab was left silently "bound" with an empty
    * transcript and no failure affordance at all: `SessionController
-   * .loadReplay`'s own `!client` early-guard returns `undefined` with no
-   * `clear`/`turn.start`/`error`/`turn.end` of its own, and (pre-fix)
-   * `loadSessionIntoTabInternal` just forwarded that bare `undefined`
-   * straight through with no emission of its own — unlike
+   * .loadReplayOutcome`'s own `!client` early-guard resolves
+   * `{kind:'no-client'}` with no `clear`/`turn.start`/`error`/`turn.end` of
+   * its own, and (pre-fix) `loadSessionIntoTabInternal` just forwarded that
+   * bare `undefined` straight through with no emission of its own — unlike
    * `recoverOneSession`'s crash-recovery path, which already turns ANY
-   * `loadReplay` `undefined` (including this exact cause) into
+   * non-`loaded` `loadReplayOutcome` kind (including this exact cause) into
    * `tab.error{kind:'session-lost'}` unconditionally.
    *
    * A call-counting `getClient` stub simulates the crash deterministically
    * (no real fs interleaving needed): the FIRST call is this method's own
    * entry-check (must see the live client, or the test would exercise
    * CF-14's branch instead); every call after that — this fix's own
-   * pre-`loadReplay` check, and `loadReplay`'s internal check if ever
-   * reached — sees the client gone, exactly as an ACP crash mid-await
-   * would leave it.
+   * pre-`loadReplayOutcome` check, and `loadReplayOutcome`'s internal check
+   * if ever reached — sees the client gone, exactly as an ACP crash
+   * mid-await would leave it.
    */
-  it('TI-5 (AU-60): a client that disappears AFTER tab.bound fires but BEFORE loadReplay runs surfaces tab.error{session-lost} — not a silent no-op', async () => {
+  it('TI-5 (AU-60): a client that disappears AFTER tab.bound fires but BEFORE loadReplayOutcome runs surfaces tab.error{session-lost} — not a silent no-op', async () => {
     const { backend, clients } = makeStartableBackend();
     await backend.start(); // session-1 @ BOOTSTRAP_TAB_ID, client alive
     const messages: HostToWebviewMessage[] = [];
@@ -4382,13 +4800,15 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
     expect(result).toBeUndefined();
     // RED (pre-fix): messages would contain ONLY tab.bound/mode.state (the
     // mint's own emissions) — no tab.error at all; the genuinely-silent gap.
+    // UX-04c: TI-5 no-client mid-load route — pin gains `reason`.
     expect(messages).toContainEqual({
       type: 'tab.error',
       tabId: 'tab-2',
       kind: 'session-lost',
+      reason: 'disconnected',
       message: expect.any(String),
     });
-    // Never reached the ACP client — loadReplay's own `!client` guard (or
+    // Never reached the ACP client — loadReplayOutcome's own `!client` guard (or
     // this fix's short-circuit ahead of it) refused before that.
     expect(must(clients[0]).loadSessionCalls).toEqual([]);
     // No leaked controller — mirrors the timeout branch's identity-guarded
@@ -4431,6 +4851,232 @@ describe('AcpBackend.loadTab — W4-T5b: the public tab.load entry (thin wrapper
 
     await expect(backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws')).resolves.toBeUndefined();
     expect(must(clients[0]).loadSessionCalls).toEqual([]); // refused before reaching the ACP client
+  });
+});
+
+describe('WS-R4 F3-7 — failed load unwinds the pre-adopted identity (identity-guarded)', () => {
+  type IdentitySeam = { activeSessionId: string | undefined; cwd: string | undefined };
+
+  it('not-found into the ACTIVE tab: activeSessionId cleared (not restored — the occupant is closed), cwd restored', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // active = session-1 @ bootstrap tab
+    const seam = backend as unknown as IdentitySeam;
+    const priorCwd = seam.cwd;
+    must(clients[0]).setLoadSessionResult({ found: false }); // the load will fail not-found
+    await backend.loadTab(BOOTSTRAP_TAB_ID, 'session-ghost', '/fake/ws');
+    expect(seam.activeSessionId).toBeUndefined(); // unwound — never left dangling on 'session-ghost'
+    expect(seam.cwd).toBe(priorCwd);
+  });
+
+  it('failed load into a NON-active tab: guard misses, identity untouched', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start();
+    const boot = must(clients[0]);
+    boot.queueSessionId('session-2');
+    await backend.openTab('tab-2'); // active flips to session-2 — openSession adopts unconditionally (:925-926)
+    const seam = backend as unknown as IdentitySeam;
+    const activeBefore = seam.activeSessionId;
+    boot.setLoadSessionResult({ found: false });
+    await backend.loadTab('tab-3', 'session-ghost', '/fake/ws'); // fails; adoption condition was false (an active session exists and tab-3 had no occupant)
+    expect(seam.activeSessionId).toBe(activeBefore);
+  });
+});
+
+/**
+ * F3-7-S (WS-R4 F3-7 sibling closure — Phase-1 close-out
+ * `docs_claude/lens-dorabotok/PHASE1-CLOSEOUT-DECISION.md` §1.4): the switch's
+ * failure kinds (the describe block right above) unwind the pre-load identity
+ * adoption (:1769) on their own failure exit — but `loadSessionIntoTabInternal`
+ * has TWO SIBLING failure exits that sit BEFORE the switch and used to skip
+ * that unwind entirely: the TI-5 no-client short-circuit and the settleRace
+ * wall-clock timeout. Neither branch's identity-guarded `sessions.close()`
+ * resets `activeSessionId`/`cwd` (the only `setActiveSessionId(undefined)` in
+ * the codebase is `ConnectionSupervisor.teardownSession()`, which neither
+ * branch reaches) — so pre-fix both branches leave a FAILED load's identity
+ * dangling on the dead session id, exactly the bug class F3-7 killed for the
+ * switch arms.
+ */
+describe('F3-7-S — sibling identity-unwind (TI-5 short-circuit + settleRace timeout)', () => {
+  type IdentitySeam = { activeSessionId: string | undefined; cwd: string | undefined };
+
+  describe('TI-5 no-client short-circuit', () => {
+    it('into the ACTIVE tab: activeSessionId cleared (not restored), cwd restored — not left dangling on the dead session', async () => {
+      const { backend } = makeStartableBackend();
+      await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID, client alive
+      const seam = backend as unknown as IdentitySeam;
+      const priorCwd = seam.cwd;
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      const supervisor = (backend as unknown as { connectionSupervisor: { getClient(): unknown } })
+        .connectionSupervisor;
+      const originalGetClient = supervisor.getClient.bind(supervisor);
+      let calls = 0;
+      supervisor.getClient = () => {
+        calls += 1;
+        return calls === 1 ? originalGetClient() : undefined;
+      };
+
+      // Loading into BOOTSTRAP_TAB_ID (session-1's own tab) makes the :1769
+      // pre-load adoption fire (`activeSessionId === currentOccupant.sessionId`)
+      // before the client-disappears short-circuit below it takes over.
+      const result = await backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+
+      expect(result).toBeUndefined();
+      // UX-04c: TI-5 no-client mid-load route — pin gains `reason`.
+      expect(messages).toContainEqual({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        kind: 'session-lost',
+        reason: 'disconnected',
+        message: expect.any(String),
+      });
+      expect(hasController(backend, 'history-session')).toBe(false);
+      expect(calls).toBeGreaterThanOrEqual(2); // entry-check + this branch's own check both ran
+      // RED (pre-fix): this short-circuit never unwinds — activeSessionId
+      // stays 'history-session' (a closed, disposed, unregistered session)
+      // and cwd stays the failed load's adoptedCwd, forever (until a LATER
+      // unrelated op happens to overwrite it).
+      expect(seam.activeSessionId).toBeUndefined();
+      expect(seam.cwd).toBe(priorCwd);
+    });
+
+    it('UX-04c: the mid-load disconnect emit carries reason "disconnected"', async () => {
+      const { backend } = makeStartableBackend();
+      await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID, client alive
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      const supervisor = (backend as unknown as { connectionSupervisor: { getClient(): unknown } })
+        .connectionSupervisor;
+      const originalGetClient = supervisor.getClient.bind(supervisor);
+      let calls = 0;
+      supervisor.getClient = () => {
+        calls += 1;
+        return calls === 1 ? originalGetClient() : undefined;
+      };
+
+      await backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+
+      expect(messages).toContainEqual(
+        expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'session-lost', reason: 'disconnected' }),
+      );
+    });
+
+    it('into a NON-active tab: guard misses, identity untouched (true negative)', async () => {
+      const { backend, clients } = makeStartableBackend();
+      await backend.start();
+      const boot = must(clients[0]);
+      boot.queueSessionId('session-2');
+      await backend.openTab('tab-2'); // active flips to session-2
+      const seam = backend as unknown as IdentitySeam;
+      const activeBefore = seam.activeSessionId;
+      const cwdBefore = seam.cwd;
+
+      const supervisor = (backend as unknown as { connectionSupervisor: { getClient(): unknown } })
+        .connectionSupervisor;
+      const originalGetClient = supervisor.getClient.bind(supervisor);
+      let calls = 0;
+      supervisor.getClient = () => {
+        calls += 1;
+        return calls === 1 ? originalGetClient() : undefined;
+      };
+
+      // tab-3 has no occupant and session-2 (not undefined) is active — the
+      // :1769 adoption condition is false, so nothing was ever adopted for
+      // this failed load to unwind.
+      await backend.loadTab('tab-3', 'session-ghost', '/fake/ws');
+      expect(calls).toBeGreaterThanOrEqual(2);
+      expect(seam.activeSessionId).toBe(activeBefore);
+      expect(seam.cwd).toBe(cwdBefore);
+    });
+  });
+
+  describe('settleRace wall-clock timeout', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('a hung-but-alive load into the ACTIVE tab times out and unwinds activeSessionId/cwd — not left dangling permanently', async () => {
+      const { backend, clients } = makeStartableBackend();
+      await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID
+      const seam = backend as unknown as IdentitySeam;
+      const priorCwd = seam.cwd;
+      must(clients[0]).hangLoadSession();
+
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      // Loading into BOOTSTRAP_TAB_ID makes the :1769 pre-load adoption fire
+      // before the deadline below it expires.
+      const loadPromise = backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+      const settlement = trackSettlement(loadPromise);
+      await flushMicrotasks();
+      expect(settlement.settled()).toBe(false); // still hanging — the child never exits
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(settlement.settled()).toBe(true);
+      await loadPromise;
+
+      // UX-04c: the settleRace deadline mid-load route — pin gains `reason`.
+      expect(messages).toContainEqual({
+        type: 'tab.error',
+        tabId: BOOTSTRAP_TAB_ID,
+        kind: 'session-lost',
+        reason: 'timeout',
+        message: expect.any(String),
+      });
+      expect(hasController(backend, 'history-session')).toBe(false);
+      // RED (pre-fix): the timeout branch never unwinds — activeSessionId
+      // stays 'history-session' PERMANENTLY: no downstream path resets it
+      // (the designed session-lost -> History recovery flow can never
+      // re-adopt, since the :1769 guard needs activeSessionId === undefined
+      // or === the target tab's occupant, and after the dangle neither holds).
+      expect(seam.activeSessionId).toBeUndefined();
+      expect(seam.cwd).toBe(priorCwd);
+    });
+
+    it('UX-04c: the mid-load deadline emit carries reason "timeout"', async () => {
+      const { backend, clients } = makeStartableBackend();
+      await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID
+      must(clients[0]).hangLoadSession();
+
+      const messages: HostToWebviewMessage[] = [];
+      backend.onMessage((m) => messages.push(m));
+
+      const loadPromise = backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+      await vi.advanceTimersByTimeAsync(120_000);
+      await loadPromise;
+
+      expect(messages).toContainEqual(
+        expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'session-lost', reason: 'timeout' }),
+      );
+    });
+
+    it('a hung-but-alive load into a NON-active tab times out with identity untouched (true negative)', async () => {
+      const { backend, clients } = makeStartableBackend();
+      await backend.start();
+      const boot = must(clients[0]);
+      boot.queueSessionId('session-2');
+      await backend.openTab('tab-2'); // active flips to session-2
+      const seam = backend as unknown as IdentitySeam;
+      const activeBefore = seam.activeSessionId;
+      const cwdBefore = seam.cwd;
+      boot.hangLoadSession();
+
+      // tab-3 has no occupant and session-2 (not undefined) is active — the
+      // :1769 adoption condition is false, so nothing was ever adopted for
+      // this failed load to unwind.
+      const loadPromise = backend.loadTab('tab-3', 'session-ghost', '/fake/ws');
+      await vi.advanceTimersByTimeAsync(120_000);
+      await loadPromise;
+
+      expect(seam.activeSessionId).toBe(activeBefore);
+      expect(seam.cwd).toBe(cwdBefore);
+    });
   });
 });
 
@@ -4565,7 +5211,7 @@ describe('AcpBackend.invokeControl — Zone HIST: session.load (row click) round
 
     const result = await backend.invokeControl('session.load', { sessionId: 'gone-session', cwd: '/ws' });
 
-    // `loadReplay`'s own "not performed" signal — same shape a rejected
+    // `loadReplayOutcome`'s own "not performed" signal — same shape a rejected
     // `client.loadSession` already returns, NOT a bound empty transcript.
     expect(result).toBeUndefined();
     expect(messages.map((m) => m.type)).toEqual(['tab.bound', 'mode.state', 'clear', 'turn.start', 'error', 'turn.end']);
@@ -4582,7 +5228,7 @@ describe('AcpBackend.invokeControl — Zone HIST: session.load (row click) round
   /**
    * Task-7 fix-wave (Important-1, guard 2 of 3): proves
    * `this.subagents.setReplaying(false)` INSIDE the `!result.found` branch
-   * (`SessionController.loadReplay`) is load-bearing, mirroring the existing
+   * (`SessionController.loadReplayOutcome`) is load-bearing, mirroring the existing
    * P4b spy idiom (`seamFor(...).subagents`, `vi.spyOn`) rather than
    * reinventing one. Without it, a session whose load reports `found:false`
    * would be left permanently stuck in "replaying" mode — a LATER live
@@ -4604,7 +5250,7 @@ describe('AcpBackend.invokeControl — Zone HIST: session.load (row click) round
     seam(backend).client = client;
 
     const p = backend.invokeControl('session.load', { sessionId: 'gone-session', cwd: '/ws' });
-    await flushMicrotasks(); // let loadReplay reach `await client.loadSession(...)` — controller minted, setReplaying(true) already fired
+    await flushMicrotasks(); // let loadReplayOutcome reach `await client.loadSession(...)` — controller minted, setReplaying(true) already fired
 
     const ctrlSubagents = seamFor(backend, 'gone-session').subagents as { setReplaying(replaying: boolean): void };
     const setReplayingSpy = vi.spyOn(ctrlSubagents, 'setReplaying');
@@ -4618,7 +5264,7 @@ describe('AcpBackend.invokeControl — Zone HIST: session.load (row click) round
   /**
    * Task-7 fix-wave (Important-1, guard 3 of 3): proves `this.replay =
    * undefined` INSIDE the `!result.found` branch (`SessionController.
-   * loadReplay`) is load-bearing. The History-panel path (unlike crash
+   * loadReplayOutcome`) is load-bearing. The History-panel path (unlike crash
    * recovery) never closes the controller on `found:false` — it stays
    * registered, still bound to its tab (see `loadSessionIntoTab`'s own doc).
    * Without the clear, a LATER `session/update` for this same sessionId
@@ -5811,7 +6457,18 @@ describe('AcpBackend — C1: the pre-turn checkpoint snapshot is an AWAITED barr
     tracker.snapshot = async () => {
       throw new Error('git executable not found on PATH');
     };
-    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, tracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      { append: (l) => logs.push(l) },
+      undefined,
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      tracker ? new UniversalTrackerRegistry(tracker) : undefined,
+    );
     const client = new FakeAcpClient();
     seam(backend).client = client;
     seam(backend).sessionId = 'session-1';
@@ -6000,6 +6657,10 @@ describe('AcpBackend — T2c: @-mentions resolve in parallel with the C1 barrier
       tracker,
       undefined,
       resolver,
+      undefined,
+      undefined,
+      undefined,
+      new UniversalTrackerRegistry(tracker),
     );
     const client = new FakeAcpClient();
     seam(backend).client = client;
@@ -6202,7 +6863,18 @@ describe('AcpBackend — W2-F2 Phase 0: after-turn checkpoint on every terminal 
       if (opts?.phase === 'after') throw new Error('after write-tree boom');
       return null;
     };
-    const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, tracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      { append: (l) => logs.push(l) },
+      undefined,
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      tracker ? new UniversalTrackerRegistry(tracker) : undefined,
+    );
     const client = new FakeAcpClient();
     seam(backend).client = client;
     seam(backend).sessionId = 'session-1';
@@ -6851,7 +7523,7 @@ describe('AcpBackend.invokeControl — T-C1 (V-2): restore/redo HOLD the root tu
     // `tracker.restoreCalls` below must still reflect every call that
     // actually reached the tracker.
     tracker.restore = async (id: string, opts?: { force?: boolean }) => {
-      tracker.restoreCalls.push({ id, force: opts?.force });
+      tracker.restoreCalls.push({ id, ...(opts?.force !== undefined ? { force: opts.force } : {}) });
       return restoreGate.promise;
     };
 
@@ -7198,7 +7870,7 @@ function makeBackendWithDashboard(): {
  * admin surface (`HermesDashboardClient.ts:137-167`), with a call-recording
  * array per member so tests can assert exactly what reached the "dashboard"
  * — mirrors `FakeDashboardClient`'s own `toggleSkillCalls`/`toggleToolsetCalls`
- * idiom, extended to the 13 admin methods `hasDashboardAdmin` structurally
+ * idiom, extended to the 16 admin methods `hasDashboardAdmin` structurally
  * checks for (B2-M1 cleanup: was 8 before the T2 skills-admin members were
  * added).
  */
@@ -7247,6 +7919,8 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
     exit_code: 0,
     lines: [],
   };
+  /** WS-GD.1 F2-09/CA-M05 harness extension: when set, the NEXT actionStatus resolves to THIS promise (reject → F2-09 unconfirmed; never-settling → CA-M05 hung). Mirrors installDeferred/authDeferred. */
+  actionStatusDeferred: Promise<{ running: boolean; exit_code: number | null; lines: string[] }> | undefined;
   /** Settable canned envelope `authMcpServer` resolves with (signal ignored — the happy-path default). */
   authResult: McpTestResult = { ok: true, tools: [] };
   /** When set, `authMcpServer` returns THIS promise verbatim (ignoring `authResult`/signal) — the IMPORTANT-3 single-flight test's controllable in-flight call. */
@@ -7302,6 +7976,11 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
 
   async actionStatus(name: string): Promise<{ running: boolean; exit_code: number | null; lines: string[] }> {
     this.actionStatusCalls.push(name);
+    if (this.actionStatusDeferred) {
+      const d = this.actionStatusDeferred;
+      this.actionStatusDeferred = undefined;
+      return d;
+    }
     const next = this.statusSeq.shift();
     if (next) this.lastStatus = next;
     return this.lastStatus;
@@ -7370,6 +8049,29 @@ class FakeAdminDashboardClient extends FakeDashboardClient implements DashboardA
     this.uninstallHubSkillCalls.push(name);
     if (this.uninstallHubSkillDeferred) return this.uninstallHubSkillDeferred;
     return this.uninstallHubSkillResult;
+  }
+
+  // --- AU-59 harness extension: the three env-store members
+  // `hasDashboardAdmin` now checks for (16 total) — call-recording stubs,
+  // same idiom as the T1/T2 members above. `listEnvKeys` mirrors a NON-managed
+  // Hermes (every set key reads back is_set:true).
+  setEnvVarCalls: Array<{ key: string; value: string }> = [];
+  listEnvKeysCalls = 0;
+  removeEnvVarCalls: string[] = [];
+
+  async setEnvVar(key: string, value: string): Promise<{ ok: boolean; key: string }> {
+    this.setEnvVarCalls.push({ key, value });
+    return { ok: true, key };
+  }
+
+  async listEnvKeys(): Promise<Record<string, DashboardEnvRow>> {
+    this.listEnvKeysCalls += 1;
+    return Object.fromEntries(this.setEnvVarCalls.map((c) => [c.key, { is_set: true }]));
+  }
+
+  async removeEnvVar(key: string): Promise<{ ok: boolean; key: string }> {
+    this.removeEnvVarCalls.push(key);
+    return { ok: true, key };
   }
 }
 
@@ -7576,7 +8278,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     mockShowWarningMessage.mockResolvedValueOnce('Add server'); // user confirms the native modal
 
@@ -7623,7 +8325,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
   it('mcp.remove refuses a name outside lastListedNames (S-M4)', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache
     await expect(backend.invokeControl('mcp.remove', { name: 'evil' })).rejects.toThrow(/not in the last-listed/);
@@ -7656,7 +8358,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
   it('mcp.test resolves the ok:false envelope verbatim, with NO reload and NO modal', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' });
     client.testResult = { ok: false, error: 'boom', tools: [] };
@@ -7676,7 +8378,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache
     mockShowWarningMessage.mockClear();
@@ -7698,7 +8400,7 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: { gh: { command: 'npx' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate the cache with 'gh'
 
@@ -7713,6 +8415,27 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
 
     expect(result).toEqual({ ok: true });
     expect(client.removeCalls).toEqual(['gh']);
+  });
+
+  it('F2-08: a reload.mcp failure AFTER the config mutate refetches the panel and discloses divergence (no false success, no stale panel)', async () => {
+    const { backend, client, messages } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    // reload.mcp REJECTS on the next (only) dispatch — the mutate already landed.
+    control.setDeferredFor('reload.mcp', Promise.reject(new Error('gateway said no')));
+    control.setResultFor('config.get', { config: { mcp_servers: { gh: { command: 'npx' } } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    mockShowWarningMessage.mockResolvedValueOnce('Add server'); // user confirms the native modal
+
+    await expect(
+      backend.invokeControl('mcp.add', { name: 'gh', transport: 'stdio', command: 'npx', args: [], env: {} }),
+    ).rejects.toThrow(/saved.*reload|reload.*fail|restart Hermes/i);
+
+    // the mutate DID happen (config was written) ...
+    expect(client.addCalls).toEqual([{ name: 'gh', command: 'npx', args: [], env: {} }]);
+    // ... so the panel is RE-FETCHED to reflect the true persisted state (not left stale) ...
+    expect(control.dispatchCalls.map((c) => c.method)).toContain('config.get');
+    // ... and a fresh mcp panel.data PUSH is emitted (divergence surfaced, not swallowed).
+    expect(messages.some((m) => m.type === 'panel.data' && (m as { panel?: string }).panel === 'mcp')).toBe(true);
   });
 });
 
@@ -7790,7 +8513,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
     client.catalogEntries = [
       catalogRow({
@@ -7825,6 +8548,56 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     expect(detail.detail).toContain('$ npm ci');
     expect(control.dispatchCalls.some((c) => c.method === 'reload.mcp')).toBe(true);
     expect(client.actionStatusCalls).toEqual(['mcp-install-builder-ab12cd34', 'mcp-install-builder-ab12cd34']);
+  });
+
+  it('CA-M06: the background-poll sleep timer is unref()ed (a pending poll-sleep cannot keep the event loop alive)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'builder', needs_install: true, required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'act-1' };
+    client.statusSeq = [
+      { running: true, exit_code: null, lines: [] }, // → the loop sleeps once ...
+      { running: false, exit_code: 0, lines: ['done'] },
+    ];
+    client.catalogEntriesAfterInstall = [catalogRow({ name: 'builder', needs_install: true, installed: true })];
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    // Record each setTimeout's delay + whether unref() was later called on its handle.
+    const timers: Array<{ ms: number; unrefed: boolean }> = [];
+    const realSetTimeout: typeof setTimeout = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((cb: (...cbArgs: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+        const handle = realSetTimeout(cb, ms, ...rest);
+        const record = { ms: ms ?? 0, unrefed: false };
+        timers.push(record);
+        const timer = handle as unknown as { unref?: () => unknown };
+        if (typeof timer.unref === 'function') {
+          const realUnref = timer.unref.bind(timer);
+          timer.unref = () => {
+            record.unrefed = true;
+            return realUnref();
+          };
+        }
+        return handle;
+      }) as unknown as typeof setTimeout,
+    );
+    try {
+      const resultPromise = backend.invokeControl('mcp.catalogInstall', { name: 'builder' });
+      await vi.advanceTimersByTimeAsync(1_000); // fire the one poll-sleep
+      await resultPromise;
+      // Pin the poll-SLEEP timer specifically (NOT the Task-3 deadline timer, which is 180000ms).
+      // The sleep timer is the short, non-deadline one the loop created.
+      const sleepTimers = timers.filter((t) => t.ms > 0 && t.ms < 180_000);
+      expect(sleepTimers.length).toBeGreaterThan(0); // the poll actually slept
+      expect(sleepTimers.every((t) => t.unrefed)).toBe(true); // and every poll-sleep timer was unref'd
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('mcp.catalogInstall: action finished but installed-flag still false -> generic reject, tail to logger only', async () => {
@@ -7865,6 +8638,43 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     expect(logs.some((l) => l.includes('EACCES permission denied'))).toBe(true); // ...only into the output-channel logger
   });
 
+  it('F2-09: an actionStatus REJECTION reports "dispatched — confirmation unknown" (not a hard install failure)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'builder', needs_install: true, required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'act-1' };
+    client.actionStatusDeferred = Promise.reject(new Error('ECONNRESET')); // transport blip on the first poll
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    await expect(backend.invokeControl('mcp.catalogInstall', { name: 'builder' })).rejects.toThrow(
+      /could not be confirmed|confirmation unknown|refresh/i,
+    );
+    // NOT the raw transport error, and NOT the ground-truth "did not complete".
+    await expect(backend.invokeControl('mcp.catalog', {})).resolves.toBeDefined(); // sanity: client still usable
+  });
+
+  it('CA-M05: a hung actionStatus that blows past the deadline is bounded (rejects "did not complete") instead of hanging forever', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('reload.mcp', { status: 'reloaded' });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    client.catalogEntries = [catalogRow({ name: 'builder', needs_install: true, required_env: [] })];
+    await backend.invokeControl('mcp.catalog', {});
+    client.installResult = { ok: true, name: 'builder', background: true, action: 'act-1' };
+    client.actionStatusDeferred = new Promise(() => {}); // a HUNG status call — never resolves
+    mockShowWarningMessage.mockResolvedValueOnce('Install & build');
+
+    const resultPromise = backend.invokeControl('mcp.catalogInstall', { name: 'builder' });
+    const assertion = expect(resultPromise).rejects.toThrow(/did not complete/i);
+    await vi.advanceTimersByTimeAsync(181_000); // > CATALOG_POLL_CAP_MS (180s) — fire the around-call deadline
+    await assertion;
+  });
+
   // ---------------------------------------------------------------------
   // Rev-1 B4 (CF-13 parity, TH-4) — SUPERSEDES the test above (old name:
   // "describeCatalogForModal receives the VALIDATED submitted env (A3-IMP2
@@ -7878,7 +8688,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
     client.catalogEntries = [catalogRow()]; // needs_install: false -> synchronous install; required_env: [{N8N_KEY}]
     await backend.invokeControl('mcp.catalog', {});
@@ -7956,7 +8766,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
     // required_env: [] on BOTH rows — this test exercises single-flight
     // concurrency, not the credential-prompt flow (see the dedicated Rev-1
@@ -8014,7 +8824,7 @@ describe('ControlDispatcher — Task A6 catalog (F-3)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('reload.mcp', { status: 'reloaded' });
-    control.setResultFor('config.get', { mcp_servers: {} });
+    control.setResultFor('config.get', { config: { mcp_servers: {} } });
     control.setResultFor('tools.list', { toolsets: [] });
     client.catalogEntries = [catalogRow({ name: 'n8n', required_env: [] })];
     await backend.invokeControl('mcp.catalog', {});
@@ -8042,7 +8852,7 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
   it('mcp.auth resolves the envelope and refetches the mcp panel on ok:true', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { remote: { url: 'https://x/mcp' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' }); // cache 'remote'
     client.authResult = { ok: true, tools: [{ name: 't', description: '' }] };
@@ -8059,7 +8869,7 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
   it('mcp.auth: an {ok:false} envelope resolves as-is (Hermes-authored guidance) with NO refetch', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { remote: { url: 'https://x/mcp' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' });
     client.authResult = { ok: false, error: 'only allows pre-approved OAuth clients', tools: [] };
@@ -8075,7 +8885,7 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
   it('mcp.auth cancellation yields the HONEST cancel envelope (never a rejection) — abandons OUR wait only', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
-    control.setResultFor('config.get', { mcp_servers: { remote: { url: 'https://x/mcp' } } });
+    control.setResultFor('config.get', { config: { mcp_servers: { remote: { url: 'https://x/mcp' } } } });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' });
 
@@ -8128,7 +8938,9 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     const control = withFakeControl(backend);
     control.setResultFor('config.get', {
-      mcp_servers: { remote: { url: 'https://x/mcp' }, other: { url: 'https://y/mcp' } },
+      config: {
+        mcp_servers: { remote: { url: 'https://x/mcp' }, other: { url: 'https://y/mcp' } },
+      },
     });
     control.setResultFor('tools.list', { toolsets: [] });
     await backend.invokeControl('panel.data', { panel: 'mcp' });
@@ -8177,7 +8989,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed the fail-closed name cache
 
@@ -8206,7 +9018,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' }); // seed 'gh'
 
@@ -8241,7 +9053,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' });
 
@@ -8268,7 +9080,9 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
       control.setResultFor('config.get', {
-        mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } },
+        config: {
+          mcp_servers: { gh: { url: 'https://gh.example' }, other: { url: 'https://o.example' } },
+        },
       });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' });
@@ -8309,7 +9123,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' });
 
@@ -8334,7 +9148,7 @@ describe('ControlDispatcher — F3 concurrency (long MCP ops off the serializati
     async () => {
       const { backend, client } = makeBackendWithAdminDashboard();
       const control = withFakeControl(backend);
-      control.setResultFor('config.get', { mcp_servers: { gh: { url: 'https://gh.example' } } });
+      control.setResultFor('config.get', { config: { mcp_servers: { gh: { url: 'https://gh.example' } } } });
       control.setResultFor('tools.list', { toolsets: [] });
       await backend.invokeControl('panel.data', { panel: 'mcp' });
       control.setResultFor('reload.mcp', { status: 'reloaded' });
@@ -10027,11 +10841,11 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
   /**
    * CF-01/I-2 (W1-T3, concurrency-critical): `pinWireModeDefault` is called
    * from TWO await sites that must never let a REJECTED `setSessionMode`
-   * escape uncaught — `loadReplay` (`SessionController.ts` ~:1123) and
+   * escape uncaught — `loadReplayOutcome` (`SessionController.ts` ~:1123) and
    * `openSession` (`AcpBackend.ts` ~:754). Before this fix, NEITHER call
    * site wrapped the pin, so a rejection propagated:
-   *  - out of `loadReplay` -> `loadSessionIntoTab` -> `invokeControl`,
-   *    falsifying `loadReplay`'s documented "never rejects" contract and
+   *  - out of `loadReplayOutcome` -> `loadSessionIntoTab` -> `invokeControl`,
+   *    falsifying `loadReplayOutcome`'s documented "never rejects" contract and
    *    leaving the webview's transcript stuck mid-turn (the `clear`/
    *    `turn.start` pair it already emitted is never closed by a `turn.end`
    *    — a genuinely different, protocol-level channel from the
@@ -10050,7 +10864,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
    * wrapping is duplicated at either await.
    */
   describe('CF-01/I-2 (W1-T3): a REJECTED setSessionMode pin degrades instead of propagating', () => {
-    it('loadReplay: never rejects past the pin, and still emits the closing turn.end (found:true, mode drift, setSessionMode rejects)', async () => {
+    it('loadReplayOutcome: never rejects past the pin, and still emits the closing turn.end (found:true, mode drift, setSessionMode rejects)', async () => {
       const { backend, client, messages } = makeBackend();
       mockWorkspace.workspaceFolders = undefined; // no roots -> load cwd confinement skipped (mirrors :6854)
       client.setLoadSessionResult({ found: true, currentModeId: 'accept_edits' }); // forces the pin's setSessionMode call
@@ -10059,7 +10873,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
         return Promise.reject(new Error('wire: setSessionMode failed'));
       };
 
-      // RED (pre-fix): this rejects — `loadReplay`'s "never rejects" contract
+      // RED (pre-fix): this rejects — `loadReplayOutcome`'s "never rejects" contract
       // is falsified by the un-caught pin at SessionController.ts ~:1123.
       const result = await backend.invokeControl('session.load', { sessionId: 'old-session', cwd: '/ws' });
       expect(result).toBeDefined(); // the load itself genuinely succeeded — only the best-effort pin degraded
@@ -10078,7 +10892,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
 
     /**
      * CF-01 (W1-T3 review, CRITICAL fix): the brief's concrete failing
-     * scenario end to end — crash-recovery/History `loadReplay` for a
+     * scenario end to end — crash-recovery/History `loadReplayOutcome` for a
      * session Hermes reports as `accept_edits` (real drift), whose re-pin
      * ALSO rejects. The load itself still degrades honestly (proven by the
      * test right above). The bug: before the fix, `currentMode` stayed
@@ -10092,7 +10906,7 @@ describe('AcpBackend — W2-F1: wire-mode pin (never accept_edits/dont_ask; re-a
      * genuinely re-attempts the pin — and, since it ALSO fails here, aborts
      * the turn honestly instead of ever reaching `client.prompt`.
      */
-    it('CF-01 fix: a loadReplay-drifted session with a persistently-failing pin ABORTS its next turn — never reaches client.prompt', async () => {
+    it('CF-01 fix: a loadReplayOutcome-drifted session with a persistently-failing pin ABORTS its next turn — never reaches client.prompt', async () => {
       const { backend, client, messages } = makeBackend();
       mockWorkspace.workspaceFolders = undefined; // no roots -> load cwd confinement skipped
       client.setLoadSessionResult({ found: true, currentModeId: 'accept_edits' }); // forces the pin's setSessionMode call
@@ -10337,7 +11151,22 @@ function makeOneShotBackend(tracker?: CheckpointTrackerLike): {
   logs: string[];
 } {
   const logs: string[] = [];
-  const backend = new AcpBackend({} as HermesRuntimeConfig, { append: (l) => logs.push(l) }, undefined, tracker);
+  const backend = new AcpBackend(
+    {} as HermesRuntimeConfig,
+    { append: (l) => logs.push(l) },
+    undefined,
+    tracker,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    // GUARD: valid ONLY for ≤1-folder tests (canonicalRoot === primaryRoot
+    // for every cwd here). A 2+-element workspaceFolders needs a
+    // discriminating fake (PrimaryOnlyTrackerRegistry / SpyTrackerRegistry)
+    // instead, or this silently masks a non-primary→undefined divergence.
+    tracker ? new UniversalTrackerRegistry(tracker) : undefined,
+  );
   const client = new FakeAcpClient();
   seam(backend).client = client;
   // W4-T2: `cwd` MUST be set BEFORE `sessionId` mints the controller — the
@@ -11412,6 +12241,7 @@ describe('AcpBackend.handleRequestPermission — W4-T1b: P-0 multi-controller po
     const client = new FakeAcpClient();
     seam(backend).client = client;
     seam(backend).sessionId = 'session-a';
+    seam(backend).currentTurnId = 'turn-1'; // WS-SL F3-3: card registration now requires a live turn id
     const messages: HostToWebviewMessage[] = [];
     backend.onMessage((m) => messages.push(m));
     return { backend, client, messages, logs };
@@ -11424,6 +12254,7 @@ describe('AcpBackend.handleRequestPermission — W4-T1b: P-0 multi-controller po
   function mintSecondController(backend: AcpBackend, sessionId: string, cwd: string): void {
     seam(backend).sessionId = sessionId;
     seam(backend).cwd = cwd;
+    seam(backend).currentTurnId = 'turn-1'; // WS-SL F3-3: arm the fresh controller too
   }
 
   /** Like {@link makeEditReq} but the caller supplies BOTH the target
@@ -11609,6 +12440,7 @@ describe('AcpBackend.handleRequestPermission — W4-T1b: P-0 multi-controller po
     const client = new FakeAcpClient();
     seam(backend).client = client;
     seam(backend).sessionId = 'session-a';
+    seam(backend).currentTurnId = 'turn-1'; // WS-SL F3-3: card registration now requires a live turn id
     const messages: HostToWebviewMessage[] = [];
     backend.onMessage((m) => messages.push(m));
 
@@ -11674,7 +12506,22 @@ describe('AcpBackend — W4-T2: real per-root turn lease + root-scoped ordinals 
     client: FakeAcpClient;
     messages: HostToWebviewMessage[];
   } {
-    const backend = new AcpBackend({} as HermesRuntimeConfig, undefined, undefined, tracker);
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      tracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      // GUARD: valid ONLY for ≤1-folder tests (canonicalRoot === primaryRoot
+      // for every cwd here). A 2+-element workspaceFolders needs a
+      // discriminating fake (PrimaryOnlyTrackerRegistry / SpyTrackerRegistry)
+      // instead, or this silently masks a non-primary→undefined divergence.
+      tracker ? new UniversalTrackerRegistry(tracker) : undefined,
+    );
     const client = new FakeAcpClient();
     seam(backend).client = client;
     const messages: HostToWebviewMessage[] = [];
@@ -12011,6 +12858,246 @@ describe('AcpBackend — W4-T2: real per-root turn lease + root-scoped ordinals 
       client.resolveInFlightPrompt({ stopReason: 'end_turn' });
       await flushMicrotasks();
     });
+  });
+});
+
+/**
+ * WS-CK-A6 Task 17 (post-flip) — golden master pinning the OBSERVABLE
+ * behavior of the registry-backed tracker factory inside
+ * `resolveRootCoordinator` (`:735-744`) now that `MULTI_ROOT_CHECKPOINTS` is
+ * true: the ternary's registry arm (`this.trackerRegistry?.get(canonicalRoot)`)
+ * is live, and the legacy `checkpointTracker` ctor-arg arm is dead code on
+ * this path (proven separately by the "legacy arm is dead" suite below).
+ * These are the SAME four observable outcomes Task 10 originally pinned for
+ * the pre-flip primary-only factory — inverted here onto a fake
+ * `CheckpointTrackerRegistryLike` whose `get` answers only for ONE
+ * pre-registered canonical root (mirroring `extension.ts`'s real registry,
+ * which today only ever reconciles the roots VS Code reports; a second LIVE
+ * root end-to-end is Fedora-probed, per Task 13/14/16's registry-level
+ * isolation tests + Task 3's tracker-level characterization): primary root
+ * -> tracker; unregistered non-primary root -> undefined (the honest
+ * NO_TRACKER refusal feed, not a silently shared shadow-git); same canonical
+ * root -> same coordinator instance; zero workspace folders -> a bare cwd is
+ * its own root and still resolves a tracker. Scoped to non-symlinked roots
+ * (spec's scoped-honesty — see `canonicalizeWorkspaceRoot`'s FS-error
+ * fallback); fake non-existent absolute paths are fine here (same convention
+ * as `/root-1`/`/root-b` elsewhere in this file).
+ */
+describe('A6 golden master — registry-backed tracker factory (post-flip pin)', () => {
+  afterEach(() => {
+    mockWorkspace.workspaceFolders = undefined;
+  });
+
+  /**
+   * Reach past `private` to the REAL production root resolution (not a
+   * reimplementation) — same idiom as `rootIdFor`/`rootFor` above, but
+   * returns the actual `RootCoordinator` instance itself (not just a scalar
+   * field off it) so both `.tracker` AND same-instance identity are directly
+   * observable from the SAME call site.
+   */
+  function coordinatorFor(backend: AcpBackend, cwd: string): { tracker: CheckpointTrackerLike | undefined } {
+    return (
+      backend as unknown as {
+        resolveRootCoordinator(cwd: string): { tracker: CheckpointTrackerLike | undefined };
+      }
+    ).resolveRootCoordinator(cwd);
+  }
+
+  /** `get` answers only for the ONE pre-canonicalized root the fake is registered with — `undefined` for every other canonical root, matching the honest per-root registry contract (an un-reconciled root has no tracker). */
+  class PrimaryOnlyTrackerRegistry implements CheckpointTrackerRegistryLike {
+    constructor(
+      private readonly tracker: CheckpointTrackerLike,
+      private readonly registeredCanonicalRoot: string,
+    ) {}
+    get(canonicalRoot: string): CheckpointTrackerLike | undefined {
+      return canonicalRoot === this.registeredCanonicalRoot ? this.tracker : undefined;
+    }
+  }
+
+  it('a cwd under the PRIMARY (first-listed) root resolves a coordinator holding the registry-backed tracker', () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    const registry = new PrimaryOnlyTrackerRegistry(fakeTracker, canonicalizeWorkspaceRoot('/root-a'));
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+
+    const coordinator = coordinatorFor(backend, '/root-a/sub/dir');
+
+    expect(coordinator.tracker).toBe(fakeTracker);
+  });
+
+  it('a cwd under a NON-registered root resolves tracker: undefined (the honest NO_TRACKER refusal feed)', () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    const registry = new PrimaryOnlyTrackerRegistry(fakeTracker, canonicalizeWorkspaceRoot('/root-a'));
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+
+    const coordinator = coordinatorFor(backend, '/root-b/sub/dir');
+
+    expect(coordinator.tracker).toBeUndefined();
+  });
+
+  it('the same canonical root always yields the SAME coordinator instance', () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    const registry = new PrimaryOnlyTrackerRegistry(fakeTracker, canonicalizeWorkspaceRoot('/root-a'));
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }];
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+
+    const first = coordinatorFor(backend, '/root-a/x');
+    const second = coordinatorFor(backend, '/root-a/y');
+
+    expect(first).toBe(second);
+  });
+
+  it("zero workspace folders: a bare cwd is its own root and gets the registry-backed tracker (today's reachable shape)", () => {
+    const fakeTracker = new FakeCheckpointTracker();
+    // Zero folders: `resolveRootCoordinator`'s `primaryRoot` capture falls
+    // back to the cwd itself (`workspaceRoots()[0] ?? cwd`), so the fake
+    // must be registered under the SAME cwd-derived canonical root.
+    const registry = new PrimaryOnlyTrackerRegistry(fakeTracker, canonicalizeWorkspaceRoot('/bare-cwd'));
+    mockWorkspace.workspaceFolders = [];
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+
+    const coordinator = coordinatorFor(backend, '/bare-cwd');
+
+    expect(coordinator.tracker).toBe(fakeTracker);
+  });
+});
+
+/**
+ * WS-CK-A6 Task 17 — flag-on inversion of Task 15's flag-off pin: with
+ * `MULTI_ROOT_CHECKPOINTS` now true, `resolveRootCoordinator`'s ternary
+ * (`:740-742`) takes the REGISTRY arm unconditionally, so an injected
+ * `trackerRegistry` MUST be consulted, and the legacy `checkpointTracker`
+ * ctor-arg arm is dead code — proven here by injecting BOTH a legacy tracker
+ * and a distinct registry-backed tracker and observing the registry's
+ * tracker wins (identity, not just "truthy"). Deliberately does NOT mock
+ * `./checkpoints/multiRootFlag` — it flips for real in this commit, so this
+ * exercises the REAL flag-on value, mirroring Task 15's own "don't mock the
+ * flag" discipline.
+ */
+describe('A6 flag-on wiring — registry is consulted, legacy checkpointTracker arm is dead', () => {
+  afterEach(() => {
+    mockWorkspace.workspaceFolders = undefined;
+  });
+
+  /** Same reach-past-`private` idiom as `coordinatorFor` above, scoped locally to this block. */
+  function coordinatorFor(backend: AcpBackend, cwd: string): { tracker: CheckpointTrackerLike | undefined } {
+    return (
+      backend as unknown as {
+        resolveRootCoordinator(cwd: string): { tracker: CheckpointTrackerLike | undefined };
+      }
+    ).resolveRootCoordinator(cwd);
+  }
+
+  /** Spy fake — records every canonical root it's asked about, and always answers with its OWN tracker (a distinct instance from the legacy ctor-arg tracker in every test below), so identity alone proves which arm won. */
+  class SpyTrackerRegistry implements CheckpointTrackerRegistryLike {
+    readonly getCalls: string[] = [];
+    constructor(private readonly tracker: CheckpointTrackerLike) {}
+    get(canonicalRoot: string): CheckpointTrackerLike | undefined {
+      this.getCalls.push(canonicalRoot);
+      return this.tracker;
+    }
+  }
+
+  it('flag-on: registry.get IS called, AND its tracker wins over the injected legacy checkpointTracker for both the primary and a non-primary root', () => {
+    const legacyTracker = new FakeCheckpointTracker();
+    const registryTracker = new FakeCheckpointTracker();
+    const registry = new SpyTrackerRegistry(registryTracker);
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: '/root-a' } }, { uri: { fsPath: '/root-b' } }];
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      legacyTracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+
+    // Primary root: registry's tracker wins, NOT the legacy ctor-arg one —
+    // under flag-off this same shape resolved `legacyTracker` (Task 10/15).
+    expect(coordinatorFor(backend, '/root-a/sub/dir').tracker).toBe(registryTracker);
+    // Non-primary root: also served through the registry — under flag-off
+    // this was hardwired to `undefined` (the legacy arm is primary-only);
+    // under flag-on it depends entirely on what the registry answers.
+    expect(coordinatorFor(backend, '/root-b/sub/dir').tracker).toBe(registryTracker);
+    // Same canonical root -> same coordinator instance still holds.
+    expect(coordinatorFor(backend, '/root-a/x')).toBe(coordinatorFor(backend, '/root-a/y'));
+    // The registry arm was actually taken (not silently short-circuited) —
+    // once per `.tracker` access above (the identity check just above does
+    // NOT touch `.tracker`, so it adds no further calls).
+    expect(registry.getCalls).toEqual([canonicalizeWorkspaceRoot('/root-a'), canonicalizeWorkspaceRoot('/root-b')]);
+  });
+
+  it('zero workspace folders, flag-on: a bare cwd resolves through the registry, not the legacy checkpointTracker ctor-arg', () => {
+    const legacyTracker = new FakeCheckpointTracker();
+    const registryTracker = new FakeCheckpointTracker();
+    const registry = new SpyTrackerRegistry(registryTracker);
+    mockWorkspace.workspaceFolders = [];
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      legacyTracker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      registry,
+    );
+
+    const coordinator = coordinatorFor(backend, '/bare-cwd');
+
+    expect(coordinator.tracker).toBe(registryTracker);
+    expect(registry.getCalls).toContain(canonicalizeWorkspaceRoot('/bare-cwd'));
   });
 });
 
@@ -12505,5 +13592,59 @@ describe('beta.7 B3: user-triggered reconnect (backend.reconnectAgent)', () => {
     const rebinds = messages.filter((m) => m.type === 'tab.bound');
     expect(rebinds.length).toBeGreaterThan(0);
     for (const b of rebinds) expect('title' in b).toBe(false);
+  });
+});
+
+describe('T16: reconnectAgent({force:true}) passthrough', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('forwards force to ConnectionSupervisor.reconnect — a live turn refuses non-force but yields to force', async () => {
+    const { backend } = makeStartableBackend();
+    await backend.start();
+    backend.sendPrompt('session-1', 'first prompt', 'default'); // hangs on the fake's held-open deferred
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(backend.reconnectAgent()).resolves.toEqual({
+      ok: false,
+      reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
+    });
+    await expect(backend.reconnectAgent({ force: true })).resolves.toEqual({ ok: true });
+  });
+});
+
+describe('UX-02: AcpBackend pushes gateway.health on combined transitions (ACP-loop driven)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('crash-loop to attempt 5 pushes {degraded,5}; a successful respawn pushes {ok} with no attempts key', async () => {
+    let failRespawns = true;
+    const { backend, clients } = makeStartableBackend({}, (client, index) => {
+      if (index > 0 && failRespawns) client.connectError = new Error('spawn refused');
+    });
+    await backend.start();
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    must(clients[0]).simulateExit(1); // crash → attempt 1
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await vi.advanceTimersByTimeAsync(respawnBackoffMs(attempt));
+      await vi.advanceTimersByTimeAsync(1); // let the failed start() settle + reschedule
+    }
+    expect(messages.filter((m) => m.type === 'gateway.health')).toEqual([
+      { type: 'gateway.health', state: 'degraded', attempts: 5 },
+    ]);
+
+    failRespawns = false;
+    await vi.advanceTimersByTimeAsync(respawnBackoffMs(6));
+    await vi.advanceTimersByTimeAsync(1);
+    const health = messages.filter((m) => m.type === 'gateway.health');
+    expect(health[health.length - 1]).toEqual({ type: 'gateway.health', state: 'ok' });
+    expect(health).toHaveLength(2);
+  });
+
+  it('currentGatewayHealth() reads the live combined counter fresh (not the last transition payload)', async () => {
+    const { backend } = makeStartableBackend();
+    await backend.start();
+    expect(backend.currentGatewayHealth()).toEqual({ state: 'ok', attempts: 0 });
   });
 });

@@ -146,12 +146,39 @@ export class RpcClient {
       if (effectiveTimeoutMs > 0) {
         handle = this.setTimer(() => {
           if (this.pending.delete(requestId)) {
-            reject(new Error(`control.request '${method}' timed out after ${effectiveTimeoutMs}ms`));
+            // UX-12 (WS-UX Phase-2, docs/superpowers/plans/2026-08-22-ws-ux-phase2.md
+            // Task 25): raw milliseconds ("timed out after 30000ms") read as a bug
+            // report, not a status. Human copy: seconds (not ms), honest
+            // uncertainty (the agent may still be working — this is a client-side
+            // giveup, not proof of failure), and a next step.
+            const seconds = Math.round(effectiveTimeoutMs / 1000);
+            reject(
+              new Error(
+                `The agent didn't reply within ${seconds} seconds ('${method}'). It may still be busy — try again, or check the connection banner.`,
+              ),
+            );
           }
         }, effectiveTimeoutMs);
       }
-      this.pending.set(requestId, { resolve, reject, clearTimer: clearTimerFn, tag });
-      this.send({ type: 'control.request', requestId, method, params, instanceId: this.instanceId });
+      // exactOptional prep (arm 1): `tag`/`params` are `string | undefined` /
+      // `Record<string, unknown> | undefined`; `PendingRequest.tag` is a plain
+      // data field (`?: string`) and `ControlRequest.params` is a WIRE field
+      // (`?: Record<string, unknown>`) — spread each key in only when present
+      // rather than widening either declaration (the wire type especially:
+      // absent-vs-undefined on the wire is exactly what this flag protects).
+      this.pending.set(requestId, {
+        resolve,
+        reject,
+        clearTimer: clearTimerFn,
+        ...(tag !== undefined ? { tag } : {}),
+      });
+      this.send({
+        type: 'control.request',
+        requestId,
+        method,
+        ...(params !== undefined ? { params } : {}),
+        instanceId: this.instanceId,
+      });
     });
   }
 

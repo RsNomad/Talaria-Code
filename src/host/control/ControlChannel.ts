@@ -4,6 +4,8 @@ import type { HermesRuntimeConfig } from '../runtime/resolveHermes';
 import { resolveHermes } from '../runtime/resolveHermes';
 import { parseGatewayEvent, isGatewayReady } from './eventDemux';
 import { respawnBackoffMs } from './respawnBackoff';
+import { respawnHealthForAttempt, RespawnHealthTracker } from './respawnHealth';
+import type { RespawnHealth } from './respawnHealth';
 
 /**
  * The Hermes **control plane** (spec §4).
@@ -82,6 +84,13 @@ export class ControlChannel {
 
   private readonly eventHandlers = new Set<(type: string, payload: unknown) => void>();
 
+  /** WS-R3 F2-19: health-transition machinery (the gateway.health source) —
+   * consolidated into the shared RespawnHealthTracker (see its class doc for
+   * the double defensive guard that used to live inline here). The `log`
+   * callback is this class's own guarded `log()` (:461-477), so a throwing
+   * OutputChannel still cannot reach the respawn-critical path. */
+  private readonly healthTracker = new RespawnHealthTracker((m) => this.log(m));
+
   private state: ControlChannelState = 'idle';
   /** The in-flight promise for "next time we reach `ready`", shared by an
    * explicit {@link start} call and internal respawn attempts so concurrent
@@ -155,6 +164,46 @@ export class ControlChannel {
     };
   }
 
+  /**
+   * WS-R3 F2-19: subscribe to respawn-health TRANSITIONS ('ok' → 'degraded'
+   * at 5 failed attempts → 'down' at 10 → back to 'ok' on a successful
+   * handshake). Transition-only — never one event per attempt. The loop
+   * itself keeps its backoff schedule forever (fail-visible, never
+   * fail-stopped). Channel-scoped like onEvent — survives respawns.
+   */
+  onHealth(handler: (health: RespawnHealth) => void): { dispose(): void } {
+    return this.healthTracker.onHealth(handler);
+  }
+
+  /**
+   * WS-R3 F2-19a (arch review Important-1): the CURRENT health, computed
+   * fresh from the live `respawnAttempts` through the same classifier
+   * `emitHealth` uses — NOT the frozen payload of the last-fired
+   * transition. `onHealth` is purely edge-triggered and holds no replay, so
+   * a subscriber that registers AFTER the channel has already crash-looped
+   * past a threshold (e.g. a webview panel VS Code creates lazily, only
+   * revealed post-outage) would otherwise hear nothing and default to
+   * assuming `'ok'`. Also doubles as the live "retried N times" counter
+   * (arch review Minor-1) — unlike a transition payload, `attempts` here
+   * keeps climbing past the threshold crossing instead of freezing at 5/10.
+   */
+  currentHealth(): RespawnHealth {
+    return {
+      state: respawnHealthForAttempt(this.respawnAttempts),
+      attempts: this.respawnAttempts,
+    };
+  }
+
+  // F2-19a (concurrency review Minor-1): both call sites of `emitHealth`
+  // sit on the respawn loop's critical path — `scheduleRespawn` arms the
+  // next backoff around this call (see the ordering note there) and
+  // `spawnAndAwaitReady` calls it as its very last step on the success
+  // path — so the double defensive guard (per-handler + whole-body) now
+  // lives in `RespawnHealthTracker.emit` instead of here; see its class doc.
+  private emitHealth(attempts: number): void {
+    this.healthTracker.emit({ state: respawnHealthForAttempt(attempts), attempts });
+  }
+
   dispose(): void {
     this.state = 'disposed';
     this.clearRespawnTimer();
@@ -183,7 +232,7 @@ export class ControlChannel {
       command: resolved.control.command,
       args: resolved.control.args,
       cwd: resolved.cwd,
-      logger: this.logger,
+      ...(this.logger !== undefined ? { logger: this.logger } : {}),
     });
 
     // Attach the permanent fan-out BEFORE waiting for readiness so a
@@ -227,6 +276,7 @@ export class ControlChannel {
     this.transportExitSub = transport.onExit((code) => this.handleCrash(code));
     this.respawnAttempts = 0;
     this.state = 'ready';
+    this.emitHealth(0);
   }
 
   /** Race the `gateway.ready` event against a timeout and an early child exit. */
@@ -298,8 +348,24 @@ export class ControlChannel {
 
   /** The control process died after a successful handshake — respawn it. */
   private handleCrash(code: number | null): void {
-    this.transportEventSub?.dispose();
-    this.transportExitSub?.dispose();
+    // WS-R3 F2-19 close-out: each dispose is guarded in its OWN try/catch —
+    // best-effort, so a throwing event-sub dispose can never prevent the
+    // exit-sub from STILL being disposed, and neither can prevent the
+    // unconditional nulling below (idempotency: a late child `onExit` must
+    // never re-enter a live sub — the existing invariant). These are
+    // injected-factory transport disposables (transport-swap-ready); the
+    // self-heal loop's "always another respawn attempt" guarantee must not
+    // depend on one behaving — mirrors `log()`'s own hardening on this path.
+    try {
+      this.transportEventSub?.dispose();
+    } catch (err) {
+      this.log(`transport event-sub dispose failed during crash teardown: ${String(err)}`);
+    }
+    try {
+      this.transportExitSub?.dispose();
+    } catch (err) {
+      this.log(`transport exit-sub dispose failed during crash teardown: ${String(err)}`);
+    }
     this.transportEventSub = undefined;
     this.transportExitSub = undefined;
     this.transport = undefined;
@@ -315,11 +381,24 @@ export class ControlChannel {
     const attempt = ++this.respawnAttempts;
     const delayMs = respawnBackoffMs(attempt);
     this.log(`respawn attempt ${attempt} in ${delayMs}ms`);
+    // F2-19a (concurrency review Minor-1/Minor-2): the next backoff is
+    // armed BEFORE `emitHealth` runs — not after. `emitHealth` fans out to
+    // arbitrary subscriber callbacks synchronously; arming first means the
+    // loop's own scheduling work is already committed before any of that
+    // untrusted code runs, so nothing in the emit path (a throw that
+    // somehow escapes `emitHealth`'s own defensive wrapper, or a subscriber
+    // that reentrantly calls `dispose()`/`start()` from inside its
+    // callback) can prevent — or race — this attempt's timer. A reentrant
+    // `dispose()` now correctly clears this very timer via
+    // `clearRespawnTimer()` instead of leaving one armed post-dispose; a
+    // reentrant `start()` now correctly clears it too before arming its own
+    // spawn, instead of this call re-arming a stale one afterward.
     this.respawnTimer = setTimeout(() => {
       this.respawnTimer = undefined;
       this.attemptRespawn();
     }, delayMs);
     this.respawnTimer.unref?.();
+    this.emitHealth(attempt);
   }
 
   private attemptRespawn(): void {
@@ -356,6 +435,22 @@ export class ControlChannel {
   }
 
   private log(message: string): void {
-    this.logger?.append(`[ControlChannel] ${message}`);
+    // F2-19a (concurrency re-review IMPORTANT-1): three call sites on the
+    // crash/respawn critical path — `handleCrash`, `scheduleRespawn`, and
+    // `attemptRespawn`'s failure handler — all call `log()` BEFORE the next
+    // backoff timer is armed or the next attempt is scheduled. An unguarded
+    // `logger?.append` (e.g. a bad/disposed `vscode.OutputChannel` on
+    // Fedora) would otherwise escape `log()` and propagate out of whichever
+    // caller invoked it, aborting that method before it reaches
+    // `scheduleRespawn()`/`this.state = 'respawning'` — leaving the channel
+    // a zombie (`state` stuck, `transport` undefined) that never respawns:
+    // exactly the F2-19 silent fail-stop this class exists to prevent.
+    // Guarding here, once, hardens every call site at once — same rationale
+    // as `emitHealth`'s own defensive wrap.
+    try {
+      this.logger?.append(`[ControlChannel] ${message}`);
+    } catch {
+      // Swallow: a logging failure must never affect control flow.
+    }
   }
 }

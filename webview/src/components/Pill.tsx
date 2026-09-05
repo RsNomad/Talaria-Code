@@ -19,7 +19,7 @@ const TONE: Record<PillTone, string> = {
 interface PillProps {
   tone?: PillTone;
   icon?: string;
-  spin?: boolean;
+  spin?: boolean | undefined;
   live?: boolean;
   children: ReactNode;
 }

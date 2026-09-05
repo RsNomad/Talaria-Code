@@ -22,18 +22,66 @@ const host = {
 function resetHost(): void {
   host.settings.clear();
   host.failures.length = 0;
+  createdStatusItems.length = 0;
+  shownWarningToasts.length = 0;
+  registeredInlineProviders.length = 0;
+  closeListeners.length = 0;
 }
+
+/** CA-06-face + CA-06-path-face recorders — plain-array pushes (repo
+ *  convention, never `vi.fn()`). Populated by the `vscode` mock below. */
+const createdStatusItems: string[] = [];
+const shownWarningToasts: string[] = [];
+const registeredInlineProviders: vscode.InlineCompletionItemProvider[] = [];
+const closeListeners: Array<(doc: { uri: { toString(): string } }) => void> = [];
 
 vi.mock('vscode', () => ({
   ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+  LanguageStatusSeverity: { Information: 0, Warning: 1, Error: 2 },
+  Position: class {
+    constructor(
+      public readonly line: number,
+      public readonly character: number,
+    ) {}
+  },
+  Uri: {
+    parse: (value: string) => ({
+      scheme: value.slice(0, Math.max(0, value.indexOf(':'))),
+      fsPath: value.startsWith('file://') ? value.slice('file://'.length) : value,
+    }),
+  },
   commands: {
     registerCommand: () => ({ dispose() {} }),
+    executeCommand: () => Promise.resolve(undefined),
   },
   languages: {
-    registerInlineCompletionItemProvider: () => ({ dispose() {} }),
+    registerInlineCompletionItemProvider: (
+      _selector: unknown,
+      provider: vscode.InlineCompletionItemProvider,
+    ) => {
+      registeredInlineProviders.push(provider);
+      return { dispose() {} };
+    },
+    createLanguageStatusItem: (id: string) => {
+      createdStatusItems.push(id);
+      return {
+        id,
+        name: undefined,
+        text: '',
+        detail: undefined,
+        severity: 0,
+        command: undefined,
+        accessibilityInformation: undefined,
+        busy: false,
+        dispose(): void {},
+      };
+    },
   },
   window: {
-    showWarningMessage: () => Promise.resolve(undefined),
+    showWarningMessage: (message: string) => {
+      shownWarningToasts.push(message);
+      return Promise.resolve(undefined);
+    },
     showInformationMessage: () => Promise.resolve(undefined),
     showInputBox: () => Promise.resolve(undefined),
   },
@@ -44,6 +92,10 @@ vi.mock('vscode', () => ({
       update: () => Promise.resolve(undefined),
     }),
     onDidChangeConfiguration: () => ({ dispose() {} }),
+    onDidCloseTextDocument: (cb: (doc: { uri: { toString(): string } }) => void) => {
+      closeListeners.push(cb);
+      return { dispose() {} };
+    },
     get isTrusted() {
       return true;
     },
@@ -94,6 +146,7 @@ vi.mock('./nextedit/shell.vscode', () => ({
 import * as vscode from 'vscode';
 import { registerTalariaAutocomplete } from './index';
 import { AUTOCOMPLETE_API_KEY_SECRET } from './apiKey';
+import { must } from '../testing/must';
 
 /** Lets pending microtasks (async key load, `rebuild()`, the re-read) run. */
 function flushAsync(): Promise<void> {
@@ -198,5 +251,55 @@ describe('C-7: a failed secret re-read is reported, never silent', () => {
     disposable.dispose();
 
     expect(host.failures).toEqual([]);
+  });
+});
+
+describe('CA-06-face + CA-06-path-face — composition-root wiring', () => {
+  beforeEach(() => {
+    resetHost();
+  });
+
+  it('CA-06-face content surface is inert at rest: activation on the default (loopback) config creates no language status item and no toast', () => {
+    const { ctx } = makeFakeContext();
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    disposable.dispose();
+    expect(createdStatusItems).toEqual([]);
+  });
+
+  it('CA-06-path-face fires on the DEFAULT loopback config: a secret doc through the registered provider creates the Information badge, no toast', async () => {
+    const { ctx } = makeFakeContext();
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    const provider = must(registeredInlineProviders[0]); // the mock's recorded registration
+    const doc = {
+      languageId: 'plaintext',
+      uri: { scheme: 'file', path: '/repo/.env', toString: () => 'file:///repo/.env' },
+    };
+    const result = await provider.provideInlineCompletionItems(
+      doc as unknown as vscode.TextDocument,
+      new vscode.Position(0, 0),
+      { triggerKind: 1, selectedCompletionInfo: undefined } as unknown as vscode.InlineCompletionContext,
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose: () => {} }) } as unknown as vscode.CancellationToken,
+    );
+    expect(result).toBeNull();
+    expect(createdStatusItems).toEqual(['talaria.autocomplete.egressPaused:file:///repo/.env']);
+    expect(shownWarningToasts).toEqual([]); // content face stays inert on loopback; path kind never toasts
+    disposable.dispose();
+  });
+});
+
+describe('CA-06-NE-face — composition-root wiring', () => {
+  beforeEach(() => {
+    resetHost();
+  });
+
+  it('is inert at rest: activation with next-edit OFF (default) creates no language status item and no toast', async () => {
+    const { ctx } = makeFakeContext();
+    const disposable = registerTalariaAutocomplete(ctx, (msg: string) => host.failures.push(msg));
+    await Promise.resolve(); // let the NextEditGuard.hydrate continuation land
+    disposable.dispose();
+    expect(
+      createdStatusItems.filter((id) => id.startsWith('talaria.nextEdit.egressPaused:')),
+    ).toEqual([]);
+    expect(shownWarningToasts).toEqual([]);
   });
 });

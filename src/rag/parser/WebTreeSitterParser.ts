@@ -22,7 +22,7 @@ import type { CodeParser } from './CodeParser';
 // SAME set this class actually uses at runtime, instead of hand-duplicating
 // the language→file mapping in the test and risking silent drift between
 // the two lists.
-export const GRAMMAR_FILE_BY_LANGUAGE: Record<string, string> = {
+export const GRAMMAR_FILE_BY_LANGUAGE: Readonly<Record<string, string>> = Object.freeze({
   typescript: 'tree-sitter-typescript.wasm',
   typescriptreact: 'tree-sitter-tsx.wasm',
   javascript: 'tree-sitter-javascript.wasm',
@@ -34,35 +34,52 @@ export const GRAMMAR_FILE_BY_LANGUAGE: Record<string, string> = {
   csharp: 'tree-sitter-c_sharp.wasm',
   c: 'tree-sitter-c.wasm',
   cpp: 'tree-sitter-cpp.wasm',
-};
+});
 
 export interface WebTreeSitterParserOptions {
   /** Directory containing the `tree-sitter-*.wasm` grammar files. */
   grammarsDir: string;
+
+  /**
+   * TST-02: the `Parser.init()` memo this instance awaits before any grammar
+   * load / parser construction. Defaults to the module-level singleton memo
+   * (the process-wide `Parser.init()` semantics production relies on — every
+   * instance in the process shares ONE init). A caller that needs an ISOLATED
+   * memo passes its own {@link createParserInitMemo} result.
+   */
+  ensureParserInit?: () => Promise<void>;
 }
 
-let parserInitPromise: Promise<void> | undefined;
-
-/** Test-only: clear the module-level `Parser.init()` memo. */
-export function resetParserInitForTests(): void {
-  parserInitPromise = undefined;
+/**
+ * Build one `Parser.init()` memo: the returned thunk calls `Parser.init()`
+ * at most once per SUCCESS and re-attempts after a rejection. The module-level
+ * default below is the process-wide singleton every instance shares (the
+ * pre-TST-02 module-level semantics, unchanged); a caller that needs an
+ * ISOLATED memo (a test harness that must observe a fresh `Parser.init()` per
+ * case) builds its own and passes it via
+ * {@link WebTreeSitterParserOptions.ensureParserInit}. There is no reset.
+ */
+export function createParserInitMemo(): () => Promise<void> {
+  let parserInitPromise: Promise<void> | undefined;
+  return function ensureParserInit(): Promise<void> {
+    if (!parserInitPromise) {
+      // AU-35: same clear-on-reject idiom as `indexer.ts`'s
+      // `ensureStoreInitialized` (`:222-234`). Without this, one transient
+      // `Parser.init()` failure (e.g. a momentary FS/wasm hiccup) memoizes the
+      // REJECTED promise forever — every later `parse()` call, for the
+      // process lifetime, reuses that dead rejection instead of retrying,
+      // even once whatever caused the failure has cleared.
+      parserInitPromise = Parser.init().catch((err: unknown) => {
+        parserInitPromise = undefined;
+        throw err;
+      });
+    }
+    return parserInitPromise;
+  };
 }
 
-function ensureParserInit(): Promise<void> {
-  if (!parserInitPromise) {
-    // AU-35: same clear-on-reject idiom as `indexer.ts`'s
-    // `ensureStoreInitialized` (`:222-234`). Without this, one transient
-    // `Parser.init()` failure (e.g. a momentary FS/wasm hiccup) memoizes the
-    // REJECTED promise forever — every later `parse()` call, for the
-    // process lifetime, reuses that dead rejection instead of retrying,
-    // even once whatever caused the failure has cleared.
-    parserInitPromise = Parser.init().catch((err: unknown) => {
-      parserInitPromise = undefined;
-      throw err;
-    });
-  }
-  return parserInitPromise;
-}
+/** The process-wide default: ONE `Parser.init()` shared by every instance that does not override it. */
+const ensureParserInit: () => Promise<void> = createParserInitMemo();
 
 /**
  * `web-tree-sitter`-backed {@link CodeParser}. All native/WASM surface is
@@ -81,7 +98,11 @@ export class WebTreeSitterParser implements CodeParser {
   // The `Tree` returned by the most recent `parse()` call, not yet freed.
   private pendingTree: Tree | null = null;
 
-  constructor(private readonly opts: WebTreeSitterParserOptions) {}
+  private readonly ensureInit: () => Promise<void>;
+
+  constructor(private readonly opts: WebTreeSitterParserOptions) {
+    this.ensureInit = opts.ensureParserInit ?? ensureParserInit;
+  }
 
   supports(languageId: string): boolean {
     return languageId in GRAMMAR_FILE_BY_LANGUAGE;
@@ -120,7 +141,7 @@ export class WebTreeSitterParser implements CodeParser {
   }
 
   private async getOrCreateParser(languageId: string, language: Language): Promise<Parser> {
-    await ensureParserInit();
+    await this.ensureInit();
     let parser = this.parserCache.get(languageId);
     if (!parser) {
       parser = new Parser();
@@ -143,7 +164,7 @@ export class WebTreeSitterParser implements CodeParser {
       return null;
     }
     try {
-      await ensureParserInit();
+      await this.ensureInit();
       const language = await Language.load(path.join(this.opts.grammarsDir, grammarFile));
       this.languageCache.set(languageId, language);
       return language;
@@ -162,8 +183,9 @@ export class WebTreeSitterParser implements CodeParser {
    * write-time: only `Parser`, `Tree`, `Node`, and `Query` do), so clearing
    * `languageCache` is the only disposal action available for it.
    *
-   * Deliberately does NOT touch the module-level `parserInitPromise` — that
-   * memo models the singleton `Parser.init()` call, which is process-wide,
+   * Deliberately does NOT touch the `Parser.init()` memo (`ensureInit` — by
+   * default the module-level singleton built by {@link createParserInitMemo})
+   * — that memo models the singleton `Parser.init()` call, which is process-wide,
    * not owned by this instance. A later `parse()` call on this (still-live)
    * instance after `dispose()` is safe, not a crash: `languageCache` and
    * `parserCache` being empty just means it re-loads the language and

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { SessionRegistry } from './SessionRegistry';
+import type { SessionController } from './SessionController';
 import type { SessionHostPort } from './types';
 import { RootCoordinator } from '../../checkpoints/RootCoordinator';
 import type { AcpClientLike, AcpLoadSessionResult } from '../acp/acpClient';
@@ -44,8 +45,9 @@ function makePort(emitted: HostToWebviewMessage[]): SessionHostPort {
   return {
     getClient: () => client,
     emit: (msg) => emitted.push(msg),
-    emitSystemError: (message, detail) => emitted.push({ type: 'system.error', message, detail }),
-    root: new RootCoordinator('/ws', undefined),
+    emitSystemError: (message, detail) =>
+      emitted.push({ type: 'system.error', message, ...(detail !== undefined ? { detail } : {}) }),
+    root: new RootCoordinator('/ws', () => undefined),
     workspaceRoots: () => [],
     refreshCheckpointsPanel: () => undefined,
     resolveMentions: async () => [],
@@ -88,6 +90,13 @@ function makeEditReq(sessionId: string, toolCallId: string): AcpRequestPermissio
   };
 }
 
+/** WS-SL F3-3: card registration now requires a live turn — arm the private
+ *  turn fields directly (runtime-visible; TS `private` is compile-time only),
+ *  mirroring `AcpBackend.test.ts`'s `seam(...).currentTurnId = 'turn-1'` idiom. */
+function armLiveTurn(controller: SessionController): void {
+  (controller as unknown as Record<string, unknown>).currentTurnId = 'turn-1';
+}
+
 async function flush(): Promise<void> {
   for (let i = 0; i < 8; i++) await Promise.resolve();
 }
@@ -113,8 +122,10 @@ describe('W4-T1a — SessionController/SessionRegistry isolation (headless, fake
     const registry = new SessionRegistry();
     const emittedA: HostToWebviewMessage[] = [];
     const emittedB: HostToWebviewMessage[] = [];
-    registry.open('session-a', '/ws', makePort(emittedA));
-    registry.open('session-b', '/ws', makePort(emittedB));
+    const a = registry.open('session-a', '/ws', makePort(emittedA));
+    const b = registry.open('session-b', '/ws', makePort(emittedB));
+    armLiveTurn(a);
+    armLiveTurn(b);
     const logs: string[] = [];
 
     const pendingA = routePermission(registry, makeEditReq('session-a', 'tc-a'), 'appr-a', logs);
@@ -212,7 +223,8 @@ describe('W4-T1a — SessionController/SessionRegistry isolation (headless, fake
     const registry = new SessionRegistry();
     const emittedA: HostToWebviewMessage[] = [];
     const emittedB: HostToWebviewMessage[] = [];
-    registry.open('session-shared', '/ws', makePort(emittedA), 'tab-1');
+    const first = registry.open('session-shared', '/ws', makePort(emittedA), 'tab-1');
+    armLiveTurn(first); // WS-SL F3-3: card registration now requires a live turn
 
     const logs: string[] = [];
     let settledFirst = false;
@@ -241,5 +253,46 @@ describe('W4-T1a — SessionController/SessionRegistry isolation (headless, fake
     expect(registry.get('session-shared')).toBe(second);
     expect(registry.getByTabId('tab-1')).toBeUndefined();
     expect(registry.getByTabId('tab-2')).toBe(second);
+  });
+});
+
+describe('CA-M04b — SessionRegistry.setOnClosed teardown hook', () => {
+  it('close() fires the hook with the id — including a no-op close of an unregistered id (unconditional)', () => {
+    const registry = new SessionRegistry();
+    const closed: string[] = [];
+    registry.setOnClosed((id) => closed.push(id));
+
+    registry.open('session-a', '/ws', makePort([]));
+    registry.close('session-a');
+    registry.close('never-registered'); // no controller — hook still fires (mirrors the unconditional closeTabInternal prune this replaces)
+
+    expect(closed).toEqual(['session-a', 'never-registered']);
+  });
+
+  it('disposeAll() fires the hook once per formerly-registered id, after the registry is emptied', () => {
+    const registry = new SessionRegistry();
+    const closed: string[] = [];
+    registry.setOnClosed((id) => closed.push(id));
+
+    registry.open('session-a', '/ws', makePort([]));
+    registry.open('session-b', '/ws', makePort([]));
+    registry.disposeAll();
+
+    expect([...closed].sort()).toEqual(['session-a', 'session-b']);
+    expect(registry.size).toBe(0);
+  });
+
+  it("open()-collision (W6-FB same-id re-mint) does NOT fire the hook — the id stays live and its per-id ancillary state (T-12 fetch-seq token) must survive", () => {
+    const registry = new SessionRegistry();
+    const closed: string[] = [];
+    registry.setOnClosed((id) => closed.push(id));
+
+    registry.open('session-a', '/ws', makePort([]));
+    registry.open('session-a', '/ws', makePort([])); // collision: remove+dispose the old controller, mint fresh — a REBIND, not a session end
+
+    // Guards a future "simplify open() to call close()" refactor: routing the
+    // collision through close() would reset a LIVE scope's staleness token.
+    expect(closed).toEqual([]);
+    expect(registry.get('session-a')).toBeDefined();
   });
 });

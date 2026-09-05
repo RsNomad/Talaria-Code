@@ -3,6 +3,8 @@ import type { Logger } from '../../transport/JsonRpcStdio';
 import type { HermesRuntimeConfig } from '../../runtime/resolveHermes';
 import { resolveHermes } from '../../runtime/resolveHermes';
 import { respawnBackoffMs } from '../../control/respawnBackoff';
+import { respawnHealthForAttempt, RespawnHealthTracker } from '../../control/respawnHealth';
+import type { RespawnHealth } from '../../control/respawnHealth';
 import { describeError, isAuthRequiredError } from '../../../shared/errorText';
 import { BOOTSTRAP_TAB_ID } from '../../../shared/protocol';
 import type { HostToWebviewMessage } from '../../../shared/protocol';
@@ -10,12 +12,13 @@ import type {
   AcpClientCallbacks,
   AcpClientFactory,
   AcpClientLike,
-  AcpLoadSessionResult,
   AcpMcpServer,
 } from '../acp/acpClient';
-import type { SessionController } from '../session/SessionController';
+import type { SessionController, LoadReplayOutcome } from '../session/SessionController';
 import type { SessionRegistry } from '../session/SessionRegistry';
 import type { SessionHostPort } from '../session/types';
+import { settleRace } from './settleRace';
+import type { RaceOutcome } from './settleRace';
 
 /**
  * T-B1 (closes V-8): how long `startInternal` waits for `connect()` ->
@@ -32,7 +35,8 @@ const CONNECT_PHASE_DEADLINE_MS = 30_000;
  * `session/load` wait for the child to ANSWER before giving up. Distinct
  * from {@link CONNECT_PHASE_DEADLINE_MS} (which bounds connect/initialize/
  * startControl, BEFORE a session is even attempted) and from {@link
- * ConnectionSupervisor.raceAgainstChildExit}'s pre-existing exit-only race
+ * settleRace}'s pre-existing exit-only race (as used by {@link
+ * ConnectionSupervisor.recoverOneSession}, WS-R4 step 3)
  * (T-B1/V-8, which already covers "the child DIED mid-request" but not "the
  * child stayed ALIVE and simply never answered" — a harness deadlock or a
  * stuck event loop, the gap this task closes). 120s matches `JsonRpcStdio`'s
@@ -41,7 +45,17 @@ const CONNECT_PHASE_DEADLINE_MS = 30_000;
  * `session/load` streams back in seconds, so this bounds only the
  * pathological hang, never an ordinary slow response.
  */
-const SESSION_ESTABLISH_DEADLINE_MS = 120_000;
+export const SESSION_ESTABLISH_DEADLINE_MS = 120_000;
+
+/**
+ * WS-R1 F2-03: per-session increment on the OVERALL crash-recovery budget.
+ * Recovery of N sessions is bounded by SESSION_ESTABLISH_DEADLINE_MS +
+ * N × this — the first wedged session may burn the full establish deadline,
+ * later ones only ever the shrinking remainder, and sessions past the
+ * budget are marked session-lost WITHOUT an attempt (never their own full
+ * serial 120s slot). Proposed default; tunable on Fedora live-QA.
+ */
+const RECOVERY_PER_SESSION_INCREMENT_MS = 10_000;
 
 /** Outcome of {@link ConnectionSupervisor.raceConnectPhase}'s internal race. */
 type ConnectPhaseOutcome = { kind: 'connected' } | { kind: 'deadline' } | { kind: 'exit'; code: number | null };
@@ -120,6 +134,12 @@ export class ConnectionSupervisor {
   private acpRespawnAttempts = 0;
   private acpRespawnTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /** WS-R3 F2-19b: the ACP loop's health machinery — the shared
+   * RespawnHealthTracker (same consolidation as ControlChannel; see the
+   * class doc in respawnHealth.ts). `safeLog` keeps the pinned
+   * `[AcpBackend] health handler threw: …` string byte-identical. */
+  private readonly healthTracker = new RespawnHealthTracker((m) => this.safeLog(`[AcpBackend] ${m}`));
+
   /**
    * W4-T5a (Q-10 / F2 / P-W4-6): a snapshot of every session registered at
    * CRASH time — `{sessionId, cwd, tabId}` — captured by {@link handleAcpCrash}
@@ -178,6 +198,40 @@ export class ConnectionSupervisor {
   /** The live ACP client, read at call time — `undefined` before/between connections. */
   getClient(): AcpClientLike | undefined {
     return this.client;
+  }
+
+  /**
+   * WS-R3 F2-19b: subscribe to the ACP respawn loop's health TRANSITIONS
+   * ('ok' → 'degraded' at 5 failed attempts → 'down' at 10 → back to 'ok'
+   * on a successful respawn). Transition-only — never one event per
+   * attempt. `scheduleAcpRespawn` keeps its backoff schedule forever
+   * regardless of subscribers (fail-visible, never fail-stopped) — see
+   * {@link emitHealth}'s own doc for the hardening that guarantees it.
+   * Supervisor-scoped like the crash/reconnect machinery it observes.
+   */
+  onHealth(handler: (health: RespawnHealth) => void): { dispose(): void } {
+    return this.healthTracker.onHealth(handler);
+  }
+
+  /**
+   * WS-R3 F2-19b (arch review Important-1): the CURRENT health, computed
+   * fresh from the live `acpRespawnAttempts` through the same classifier
+   * `emitHealth` uses — NOT the frozen payload of the last-fired
+   * transition. `onHealth` is purely edge-triggered and holds no replay, so
+   * a subscriber that registers AFTER the ACP child has already
+   * crash-looped past a threshold (e.g. a webview panel VS Code creates
+   * lazily, only revealed post-outage) would otherwise hear nothing and
+   * default to assuming `'ok'` — the exact fail-invisible regression F2-19
+   * exists to prevent, reintroduced for the ACP-child half. Mirrors
+   * `ControlChannel.currentHealth()` field-for-field (ControlChannel.ts
+   * :192-197) — also doubles as the live "retried N times" counter, unlike
+   * a transition payload which freezes at the 5/10 threshold crossing.
+   */
+  currentHealth(): RespawnHealth {
+    return {
+      state: respawnHealthForAttempt(this.acpRespawnAttempts),
+      attempts: this.acpRespawnAttempts,
+    };
   }
 
   /**
@@ -331,13 +385,21 @@ export class ConnectionSupervisor {
     let connectedCwd: string | undefined;
     try {
       const resolved = await resolveHermes(this.port.config);
+      // Dispose-race fix (WS-UX T5 review; mirrors ControlChannel
+      // .spawnAndAwaitReady's CF-01/I-5 pre-spawn re-check, ControlChannel.ts
+      // :227-229): `AcpBackend.dispose()` -> `markDisposed()` can land while
+      // `resolveHermes` is in flight. Don't create a client — whose
+      // `connect()` would spawn a child NOTHING will ever reap, because
+      // dispose() has already run — for a supervisor that's already gone.
+      // Cast: same TS-narrowing reasoning as this try's catch below.
+      if ((this.acpState as string) === 'disposed') throw new Error('AcpBackend: disposed');
       this.port.setCwd(resolved.cwd);
       connectedCwd = resolved.cwd;
 
       this.client = this.port.createClient({
         spawn: resolved.acp,
         cwd: resolved.cwd,
-        logger: this.port.logger,
+        ...(this.port.logger !== undefined ? { logger: this.port.logger } : {}),
         callbacks: this.port.callbacks,
       });
       const client = this.client;
@@ -359,6 +421,22 @@ export class ConnectionSupervisor {
         await this.port.startControl();
       });
 
+      // Dispose-race fix (WS-UX T5 review; mirrors ControlChannel
+      // .spawnAndAwaitReady's post-await disposed re-check, ControlChannel.ts
+      // :263-267): `AcpBackend.dispose()` landing after the connect phase
+      // settled but before this continuation resumed must NOT resurrect a
+      // disposed supervisor to 'ready', must NOT fire a spurious 'ok' health
+      // transition to still-registered onHealth subscribers, and must NOT
+      // attach a crash subscription to a client dispose()'s teardownSession
+      // already tore down. Everything from this check to `emitHealth(0)`
+      // below is synchronous, so this re-check is race-free by construction.
+      // The throw lands in this try's own catch, which is already
+      // disposed-aware: it keeps acpState 'disposed' (never resets to
+      // 'idle'), disposes+nulls any still-assigned client (CF-01/I-1), and
+      // suppresses the failure banner — a disposed supervisor stays disposed
+      // and no child is orphaned.
+      if ((this.acpState as string) === 'disposed') throw new Error('AcpBackend: disposed');
+
       // R-A6: supervise the live child as soon as the CONNECTION itself is
       // healthy — independent of whether the session below manages to
       // establish (F2). Mirrors ControlChannel (onExit attached post-ready, :192).
@@ -366,6 +444,7 @@ export class ConnectionSupervisor {
 
       this.acpRespawnAttempts = 0;
       this.acpState = 'ready';
+      this.emitHealth(0);
     } catch (err) {
       // Cast: TS narrows `acpState` to 'starting' | 'ready' across this try
       // block's control flow, but `AcpBackend.dispose()` can reassign it (via
@@ -411,8 +490,8 @@ export class ConnectionSupervisor {
    * on stream close, see `acpClient.ts`'s own doc) and a wall-clock deadline
    * ({@link CONNECT_PHASE_DEADLINE_MS}) for the case where the child stays
    * alive but never answers at all. Precedent: the in-repo event-vs-exit
-   * race idiom ({@link raceRecoveryAgainstChildExit}) and `ControlChannel`'s
-   * own `awaitReady` race.
+   * race idiom ({@link settleRace}, as used by {@link recoverOneSession},
+   * WS-R4 step 3) and `ControlChannel`'s own `awaitReady` race.
    *
    * The temporary `onExit` subscription (and the deadline timer) are armed
    * BEFORE `run()` is invoked, not after — `run()`'s first act is
@@ -510,7 +589,13 @@ export class ConnectionSupervisor {
       // `tab.error{kind:'session-lost'}`, honestly per-tab per T3). This is a
       // terminal-transition push, not a per-retry-attempt re-emission: it
       // fires exactly once, here, after `recoverSessions` genuinely settles.
-      this.port.emit({ type: 'system.recovered' });
+      //
+      // WS-R3 F3-2: guarded on acpState — mirrors the sibling system.error
+      // guard at :565; a crash during recoverSessions has already flipped
+      // state via handleAcpCrash, which runs synchronously on exit.
+      if (this.acpState !== 'respawning') {
+        this.port.emit({ type: 'system.recovered' });
+      }
       return;
     }
 
@@ -543,15 +628,21 @@ export class ConnectionSupervisor {
       // token without needing cross-attempt bookkeeping on the class.
       let attemptAbandoned = false;
       const openSession = this.port.openSession(connectedCwd, BOOTSTRAP_TAB_ID, () => attemptAbandoned);
-      const controller = this.client
-        ? await this.raceAgainstChildExit(openSession, this.client, SESSION_ESTABLISH_DEADLINE_MS)
-        : await openSession;
+      // WS-R1: raced via settleRace directly — exit and deadline are now
+      // discriminated outcomes, but this branch deliberately keeps mapping
+      // BOTH to the same abandoned-attempt handling below (the acpState
+      // check already tells outage from deadline for the banner; new
+      // per-outcome copy is WS-UX's job, not this migration's).
+      const outcome = this.client
+        ? await settleRace(openSession, { exit: this.client, deadline: SESSION_ESTABLISH_DEADLINE_MS })
+        : { kind: 'value' as const, value: await openSession };
       attemptAbandoned = true;
+      const controller = outcome.kind === 'value' ? outcome.value : undefined;
       if (controller === undefined) {
         // T-3: this `undefined` came from EITHER the child's own exit
         // (raced since T-B1/V-8) OR the new SESSION_ESTABLISH_DEADLINE_MS
         // wall-clock deadline (the child stayed ALIVE but never answered
-        // `session/new`) — `raceAgainstChildExit` deliberately makes the
+        // `session/new`) — this `settleRace` collapse deliberately makes the
         // two indistinguishable to ITS caller (the un-jam contract is
         // identical), so this method tells them apart the same way
         // `startInternal`'s own `wasRespawning` capture does:
@@ -669,16 +760,48 @@ export class ConnectionSupervisor {
    * 'respawning')` guard, unaffected here) — `system.recovered` fires
    * exactly once per successful `establishInitialSession`, never per
    * attempt.
+   *
+   * WS-R1 F2-03: this loop previously gave EVERY session its own full
+   * `SESSION_ESTABLISH_DEADLINE_MS` (120s) — N crash-snapshotted sessions
+   * that all hang could therefore wedge this whole tail for up to N×120s.
+   * Now bounded by ONE overall budget (`SESSION_ESTABLISH_DEADLINE_MS +
+   * RECOVERY_PER_SESSION_INCREMENT_MS × recovery.length`, computed once
+   * above the loop) consumed cooperatively across attempts: each session
+   * gets `min(SESSION_ESTABLISH_DEADLINE_MS, remaining-budget)`, and a
+   * session whose turn comes up after the budget is already exhausted is
+   * marked `tab.error{kind:'session-lost'}` WITHOUT even attempting
+   * `session/load` — honest about never having tried, not a slow-attempt
+   * masquerading as an instant one. A session that recovers fast still
+   * only ever consumes its real wall-clock time, exactly as before.
    */
   private async recoverSessions(
     recovery: Array<{ sessionId: string; cwd: string; tabId: string }>,
   ): Promise<void> {
+    // WS-R1 F2-03: one OVERALL budget for the whole serial chain — computed
+    // once, consumed cooperatively (fake-timer- and Fedora-clock-friendly:
+    // Date.now() under vitest fake timers advances with the clock).
+    const budgetDeadline =
+      Date.now() + SESSION_ESTABLISH_DEADLINE_MS + RECOVERY_PER_SESSION_INCREMENT_MS * recovery.length;
     for (const { sessionId, cwd, tabId } of recovery) {
+      const remainingMs = budgetDeadline - Date.now();
+      if (remainingMs <= 0) {
+        this.port.logger?.append(
+          `[AcpBackend] respawn recovery: budget exhausted — session '${sessionId}' (tab '${tabId}') marked session-lost without an attempt`,
+        );
+        this.port.emit({
+          type: 'tab.error',
+          tabId,
+          kind: 'session-lost',
+          reason: 'recovery-failed',
+          message: 'Could not recover this session after reconnecting.',
+        });
+        continue;
+      }
       try {
-        await this.recoverOneSession(sessionId, cwd, tabId);
+        await this.recoverOneSession(sessionId, cwd, tabId, Math.min(SESSION_ESTABLISH_DEADLINE_MS, remainingMs));
       } catch (err) {
         // Defensive — `recoverOneSession` itself never throws today
-        // (`SessionController.loadReplay` never rejects), but keeping this
+        // (`SessionController.loadReplayOutcome` never rejects), but keeping this
         // per-attempt catch makes the F2 "one bad session can't wedge the
         // others" guarantee airtight against a future change to that
         // contract, exactly like `establishInitialSession`'s own try/catch
@@ -686,7 +809,7 @@ export class ConnectionSupervisor {
         this.port.logger?.append(
           `[AcpBackend] respawn recovery: unexpected failure recovering session '${sessionId}' (tab '${tabId}') — treating as session-lost: ${describeHostError(err)}`,
         );
-        this.port.emit({ type: 'tab.error', tabId, kind: 'session-lost', message: describeHostError(err) });
+        this.port.emit({ type: 'tab.error', tabId, kind: 'session-lost', reason: 'recovery-failed', message: describeHostError(err) });
       }
     }
   }
@@ -704,260 +827,150 @@ export class ConnectionSupervisor {
    * `resolveWithinWorkspaceReal` on our OWN recorded state would be
    * redundant, so (unlike `loadSessionIntoTab`) this trusts it directly.
    *
-   * `controller.loadReplay` never rejects — a load failure resolves
-   * `undefined` (after emitting its own `error`/`turn.end` pair for that
-   * tab's transcript, UNLESS superseded — see the W6-FG note below). The
-   * ADDITIONAL `tab.error{kind: 'session-lost'}` below is the tab-chrome-level
-   * restart affordance (§7 B8); the orphaned controller is dropped via the
-   * registry's F6 remove-before-dispose, IDENTITY-GUARDED (see the close
-   * below) — never a second, unconditional removal path.
+   * `controller.loadReplayOutcome` never rejects — a load failure resolves a
+   * failure-kind `LoadReplayOutcome` (after emitting its own `error`/
+   * `turn.end` pair for that tab's transcript, UNLESS superseded — see the
+   * W6-FG note below). The ADDITIONAL `tab.error{kind: 'session-lost'}` below
+   * is the tab-chrome-level restart affordance (§7 B8); the orphaned
+   * controller is dropped via the registry's F6 remove-before-dispose,
+   * IDENTITY-GUARDED (see the close below) — never a second, unconditional
+   * removal path.
    *
    * CF-01/L3-1: the race this doc originally described can no longer be
    * reached through the public API — `loadTab`/`session.load` now chain onto
    * this SAME `inFlightStart` tail (see {@link recoverSessions}'s own
    * updated doc), so a `tab.load` for this `sessionId` cannot even START
-   * until this recovery attempt's `loadReplay` has fully settled. The
+   * until this recovery attempt's `loadReplayOutcome` has fully settled. The
    * identity-guarded close immediately below is KEPT anyway — pure
    * redundancy now, never removed (a future caller reaching this method some
    * other way, or a bug in the tail itself, still can't zombify the winner).
    *
    * W6-FG (folded-in W6-FB review Minor — doc-honesty fix + the identity
    * guard itself, HISTORICAL): a prior revision of this comment claimed
-   * "this controller was just minted exclusively for this attempt, so
-   * `loadReplay`'s internal 'superseded while awaiting' branch can never fire
-   * for it" — that was FALSE at the time. `loadTab`/`tab.load` used to be
+   * "this controller was just minted exclusively for this attempt, so the
+   * load's internal 'superseded while awaiting' branch can never fire for
+   * it" — that was FALSE at the time. `loadTab`/`tab.load` used to be
    * fire-and-forget, NOT serialized behind `inFlightStart` — a
    * user COULD load this SAME `sessionId` into a DIFFERENT tab while this
-   * `loadReplay` await was still in flight. `SessionRegistry.open`'s W6-FB
+   * load await was still in flight. `SessionRegistry.open`'s W6-FB
    * remove-then-dispose then disposes THIS `controller` and rebinds
    * `sessionId` to the winner's fresh controller — which DOES trip
-   * `loadReplay`'s own supersede guard (`this.replay !== replay`) on THIS
-   * controller, resolving `undefined` here exactly as an ordinary failure
-   * would. If this method then closed by KEY (`this.sessions.close(sessionId)`
-   * unconditionally), it would dispose the WINNER — not this stale attempt —
-   * silently zombifying the winner's tab with no `tab.error` at all. Fixed by
-   * guarding the close by IDENTITY: `controller` is captured ABOVE, before
-   * the await, and only closed if it is STILL the registry's current owner
-   * for `sessionId`. A no-op when the recovery is genuinely NOT superseded
-   * (the overwhelmingly common case) — `this.port.sessions.get(sessionId) ===
-   * controller` then holds and the close proceeds exactly as before.
+   * `loadReplayOutcome`'s own supersede guard (`this.replay !== replay`) on
+   * THIS controller, resolving a `superseded` outcome here — now handled by
+   * an EXPLICIT no-op route (WS-R4 step 3, below) instead of collapsing into
+   * the generic failure branch. If this method then closed by KEY
+   * (`this.sessions.close(sessionId)` unconditionally), it would dispose the
+   * WINNER — not this stale attempt — silently zombifying the winner's tab
+   * with no `tab.error` at all. Fixed by guarding the close by IDENTITY:
+   * `controller` is captured ABOVE, before the await, and only closed if it
+   * is STILL the registry's current owner for `sessionId`. A no-op when the
+   * recovery is genuinely NOT superseded (the overwhelmingly common case) —
+   * `this.port.sessions.get(sessionId) === controller` then holds and the
+   * close proceeds exactly as before.
    *
-   * I1 (independent concurrency review, W4-T5a fix pass): the `loadReplay`
-   * await is raced against `this.client`'s own `onExit` ({@link
-   * raceRecoveryAgainstChildExit}) — see that method's doc for why a hung
-   * `client.loadSession` here would otherwise wedge the ENTIRE respawn tail,
-   * not just this one session's recovery.
+   * WS-R4 step 3 (§3.4, R1×R4 co-edit — the reviewed route table, RETIRES
+   * the two hand-rolled exit-race helper methods that used to sit here — a
+   * two-level adapter pair that collapsed exit/deadline AND every
+   * `LoadReplayOutcome` failure kind into one `undefined` sentinel): the
+   * `loadReplayOutcome` await is now raced against `this.client`'s own exit
+   * AND `deadlineMs` directly via {@link settleRace}, nested one level —
+   * `settleRace` yields `RaceOutcome<LoadReplayOutcome>`: either
+   * `{kind:'exit'}` / `{kind:'deadline'}` (the race itself un-jamming) or
+   * `{kind:'value', value: LoadReplayOutcome}` (the load settled, and is
+   * discriminated further). This method was the LAST caller of both retired
+   * helpers, which are now fully deleted. Every route below is now an
+   * explicit, named branch:
+   *
+   *   - `exit` / `deadline` (the race itself) → session-lost — the wall
+   *     clock/child-death un-jam this project systematically provides.
+   *   - `no-client` / `load-failed` / `not-found` → the SAME session-lost
+   *     route — behavior-preserving (these already collapsed to `undefined`
+   *     under the old adapter).
+   *   - `superseded` (either arm — with or without a carried result) →
+   *     NO-OP. DELIBERATE BEHAVIOR CHANGE (reviewed): the OLD adapter
+   *     treated a superseded-WITH-result load as a truthy success (adopting
+   *     `activeSessionId`/`cwd` for a load a NEWER op already owns) and a
+   *     superseded-empty load as an ordinary failure (erroring a tab a newer
+   *     op legitimately owns). Both were wrong — a newer op owns this tab
+   *     now, so recovery silently stands down instead. Reachable only
+   *     through non-public interleavings today (CF-01/L3-1 tail-serialized
+   *     the API — see the W6-FG paragraph above), so this route has no
+   *     integration-level trigger, only the dedicated supervisor-level pin.
+   *   - `loaded` → adopt `activeSessionId`/`cwd` if none is active yet
+   *     (unchanged from the old truthy-adopt behavior).
+   *   - an unexpected rejection of the raced promise (defensive only —
+   *     `loadReplayOutcome` never rejects today) is treated as `load-failed`,
+   *     preserving the old swallow-to-undefined contract's spirit as an
+   *     explicit, named route instead of a silent catch.
    */
-  private async recoverOneSession(sessionId: string, cwd: string, tabId: string): Promise<void> {
+  private async recoverOneSession(sessionId: string, cwd: string, tabId: string, deadlineMs: number): Promise<void> {
     const mcpServers = this.port.getMcpServers();
     const controller = this.port.sessions.open(sessionId, cwd, this.port.buildSessionPort(sessionId, cwd), tabId);
 
     this.port.announceSessionBound(tabId, sessionId, controller.getRootId());
 
-    const loadReplay = controller.loadReplay(cwd, sessionId, cwd, mcpServers);
-    const result = this.client
-      ? await this.raceRecoveryAgainstChildExit(loadReplay, this.client)
-      : await loadReplay;
-    if (result === undefined) {
+    const load = controller.loadReplayOutcome(cwd, sessionId, cwd, mcpServers);
+    let raced: RaceOutcome<LoadReplayOutcome>;
+    try {
+      raced = this.client
+        ? await settleRace(load, { exit: this.client, deadline: deadlineMs })
+        : { kind: 'value', value: await load };
+    } catch (err) {
+      // Defensive: loadReplayOutcome never rejects today — preserve the old
+      // swallow-to-undefined contract as an explicit load-failed route.
+      raced = { kind: 'value', value: { kind: 'load-failed', message: describeHostError(err) } };
+    }
+
+    const sessionLost = (): void => {
       this.port.emit({
         type: 'tab.error',
         tabId,
         kind: 'session-lost',
+        reason: 'recovery-failed',
         message: 'Could not recover this session after reconnecting.',
       });
       // W6-FG: identity-guarded — only close if `controller` (captured above,
       // BEFORE the await) is STILL the registry's current owner for
       // `sessionId`. See this method's own doc for the race this guards.
       if (this.port.sessions.get(sessionId) === controller) this.port.sessions.close(sessionId);
+    };
+
+    if (raced.kind === 'exit' || raced.kind === 'deadline') {
+      sessionLost();
       return;
     }
-
-    if (this.port.getActiveSessionId() === undefined) {
-      this.port.setActiveSessionId(sessionId);
-      this.port.setCwd(cwd);
-    }
-  }
-
-  /**
-   * I1 (independent concurrency review, W4-T5a fix pass): bound {@link
-   * recoverOneSession}'s `loadReplay` await against `client`'s own
-   * unexpected death. `AcpClientLike.loadSession` (via `loadReplay`) is
-   * NOT contractually guaranteed to reject when its child is killed
-   * mid-request — `onExit`'s own doc only promises the exit NOTIFICATION
-   * (R-A6), never that every in-flight RPC settles. If it hangs, this await
-   * never settles, `recoverSessions`'s loop never advances past this
-   * session, `establishInitialSession`/`startInternal` never resolve, and
-   * the CURRENT `start()` call's `run` — what {@link inFlightStart} is
-   * holding — never resolves either: a SECOND crash's `scheduleAcpRespawn ->
-   * start()` chains onto that same tail (P0's serialization) and can never
-   * reach its own `startInternal()`. Every open tab stays "reconnecting"
-   * forever — the never-resolves class this project systematically kills.
-   *
-   * Races against `client.onExit` rather than a wall-clock timeout — the
-   * child dying IS the recovery failing, the exact signal, with no need to
-   * guess a duration that's long enough to never misfire on a genuinely
-   * slow (but alive) replay. A raced loss resolves `undefined`, which
-   * `recoverOneSession`'s EXISTING `result === undefined` branch already
-   * treats as a failed recovery (`tab.error{kind:'session-lost'}` +
-   * registry drop, reused verbatim — no new failure path). The happy path
-   * (`loadReplay` resolves before any exit) is unaffected: the exit branch
-   * never wins a race it never enters, and its subscription is disposed
-   * either way (mirrors `ControlChannel.awaitReady`'s own event-vs-exit
-   * race, `ControlChannel.ts:197`).
-   */
-  private raceRecoveryAgainstChildExit(
-    loadReplay: Promise<AcpLoadSessionResult | undefined>,
-    client: AcpClientLike,
-  ): Promise<AcpLoadSessionResult | undefined> {
-    // T-B1 (closes V-8): re-implemented on {@link raceAgainstChildExit} —
-    // behavior identical for this method's own caller (`recoverOneSession`,
-    // which has no try/catch around this call): a defensive-only rejection
-    // from `loadReplay` (never happens today — see this method's own doc)
-    // still resolves `undefined` here, exactly as before, rather than
-    // passing through and rejecting `recoverOneSession`'s await the way the
-    // generalized helper does for ITS callers.
-    //
-    // T-3 (closes B1-M1): SESSION_ESTABLISH_DEADLINE_MS added alongside the
-    // pre-existing exit-only race — a respawned child that stays ALIVE but
-    // never answers `session/load` (no exit ever fires) previously hung
-    // this ONE tab's recovery forever (F2's per-tab isolation still holds:
-    // `recoverSessions`'s per-attempt try/catch means a stuck sibling never
-    // blocked THIS session's own eventual timeout, and vice versa). No
-    // belated-resolution guard is needed here the way `establishInitialSession`
-    // needed one for `openSession`: `recoverOneSession` already announces
-    // `tab.bound` and registers the controller BEFORE this await even
-    // starts (§7 B9(b)), so there is no "belated bind" to prevent — and a
-    // belated `loadReplay` resolution arriving after THIS method's own
-    // `result === undefined` branch (below) has already
-    // identity-guard-closed the controller is caught by REUSED, pre-existing
-    // machinery: `SessionController.dispose()` clears `this.replay`, which
-    // trips `loadReplay`'s own supersede guard (`this.replay !== replay`,
-    // the W6-FG note above) and makes the belated continuation a silent
-    // no-op, exactly as it already does for the `tab.load`-supersedes-
-    // recovery race this same guard was built for.
-    return this.raceAgainstChildExit(loadReplay, client, SESSION_ESTABLISH_DEADLINE_MS).catch(() => undefined);
-  }
-
-  /**
-   * T-B1 (closes V-8): generalizes {@link raceRecoveryAgainstChildExit} to
-   * an arbitrary in-flight request `p` — races it against `client`'s own
-   * exit. Resolves `p`'s value on the happy path, resolves `undefined` if
-   * the child dies first, and — UNLIKE `raceRecoveryAgainstChildExit` —
-   * PASSES THROUGH a genuine rejection of `p` rather than swallowing it to
-   * `undefined`, so a caller with its OWN honest catch (e.g.
-   * `establishInitialSession`'s bootstrap `openSession` race) keeps seeing
-   * the real error instead of a misleadingly-generic "child exited" story.
-   *
-   * T-3 (closes B1-M1): generalized with an OPTIONAL `deadlineMs` — a THIRD
-   * way this race can end, resolving `undefined` on the EXACT same contract
-   * as the exit branch (an un-jam, not a failure signal of its own; the
-   * caller decides what `undefined` means for its own leg). Un-raced, a
-   * child that stays ALIVE but never answers `p` (a harness deadlock, a
-   * stuck event loop) hangs this await — and therefore `inFlightStart` —
-   * forever, exactly the class of bug `raceConnectPhase` already closed for
-   * the CONNECT phase; this closes it for session establishment/recovery
-   * too. The timer is armed BEFORE `p` is awaited (harmless — `p` is
-   * already in flight by the time this is called, so there's no
-   * spawn-ordering window to protect here the way `raceConnectPhase` has to
-   * protect one) and cleared on EVERY settle path (exit, deadline, or `p`
-   * itself resolving/rejecting), so a fast happy path never leaves a stray
-   * timer armed (proven by the T-3 fast-path test). Omitting `deadlineMs`
-   * reproduces the exact prior behavior (no timer created at all).
-   */
-  private raceAgainstChildExit<T>(p: Promise<T>, client: AcpClientLike, deadlineMs?: number): Promise<T | undefined> {
-    return new Promise<T | undefined>((resolve, reject) => {
-      let settled = false;
-      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-      const clearDeadline = (): void => {
-        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-      };
-      const settleResolve = (value: T | undefined): void => {
-        if (settled) return;
-        settled = true;
-        exitSub.dispose();
-        clearDeadline();
-        resolve(value);
-      };
-      const settleReject = (err: unknown): void => {
-        if (settled) return;
-        settled = true;
-        exitSub.dispose();
-        clearDeadline();
-        reject(err);
-      };
-      const exitSub = client.onExit(() => settleResolve(undefined));
-      if (deadlineMs !== undefined) {
-        deadlineTimer = setTimeout(() => settleResolve(undefined), deadlineMs);
-        // Don't keep the event loop alive on this deadline — matches
-        // raceConnectPhase's own CONNECT_PHASE_DEADLINE_MS timer and
-        // scheduleAcpRespawn's backoff timer.
-        deadlineTimer.unref?.();
+    const outcome = raced.value;
+    switch (outcome.kind) {
+      case 'no-client':
+      case 'load-failed':
+      case 'not-found':
+        sessionLost();
+        return;
+      case 'superseded':
+        // §3.4 step 3 (reviewed decision, either arm): a newer op owns the
+        // tab — recovery stands down silently. Reachable only through
+        // non-public interleavings since CF-01/L3-1 serialized the tail.
+        return;
+      case 'loaded':
+        if (this.port.getActiveSessionId() === undefined) {
+          this.port.setActiveSessionId(sessionId);
+          this.port.setCwd(cwd);
+        }
+        return;
+      default: {
+        // WS-R4 step 3 follow-up (all three review lenses — I-1/M-4, M1,
+        // M1): exhaustiveness guard against union extension. All 5 current
+        // `LoadReplayOutcome` kinds are handled above, so this default is
+        // UNREACHABLE today — no runtime behavior change. Its purpose is
+        // compile-time: a future 6th kind must fail to COMPILE here, not
+        // silently fall through to an implicit no-op return — the exact
+        // sentinel-conflation-by-omission disease this workstream exists to
+        // kill (a recovery method going fail-silent on an unrecognized
+        // terminal state).
+        const _exhaustive: never = outcome;
+        throw new Error(`unhandled LoadReplayOutcome kind: ${(_exhaustive as { kind: string }).kind}`);
       }
-      p.then(settleResolve, settleReject);
-    });
-  }
-
-  /**
-   * CF-01/L3-1 fix (Critical — 3-lens review of the tail-serialization
-   * commit): gives an arbitrary in-flight promise `p` (here:
-   * `AcpBackend.loadSessionIntoTabInternal`'s `controller.loadReplay(...)`,
-   * whose `client.loadSession` had NO wall-clock deadline at all — only
-   * `AcpClient.raceTermination`'s child-EXIT-only race) the SAME {@link
-   * SESSION_ESTABLISH_DEADLINE_MS} `recoverOneSession`'s own `session/load`
-   * already gets via {@link raceAgainstChildExit}.
-   *
-   * Deliberately NOT built on `raceAgainstChildExit` itself, despite the
-   * SAME deadline duration: that helper collapses "the deadline fired" and
-   * "`p` genuinely resolved to `undefined` on its own" into the SAME
-   * `undefined` return value. That ambiguity is harmless for
-   * `recoverOneSession` (both outcomes get IDENTICAL `tab.error{session-lost}`
-   * + identity-guarded-close handling there) but would be WRONG here:
-   * `loadReplay` legitimately resolves `undefined` on an ordinary
-   * `found:false`/rejected direct load — a case that already emits its OWN
-   * session-scoped `error` (see `SessionController.loadReplay`'s own doc)
-   * and, unlike recovery, leaves the controller registered — it must NOT
-   * also get a second, duplicate `tab.error` here (see the existing "audit
-   * A-3" `found:false` tests in `AcpBackend.test.ts`, which pin the EXACT
-   * message list with no `tab.error` in it). Returns a DISCRIMINATED
-   * outcome instead, so `loadSessionIntoTabInternal` can tell "`p` settled
-   * on its own" (even with an `undefined` value) apart from "we gave up
-   * waiting."
-   *
-   * Deadline-only — no child-exit race, unlike `raceAgainstChildExit`: a
-   * child exit already reaches `p` via `AcpClient.raceTermination` (rejects
-   * the in-flight `client.loadSession` the instant `terminate()` fires —
-   * W1-T1/CF-01/A-2, added after `raceRecoveryAgainstChildExit`'s own
-   * exit-race was written), which `loadReplay`'s try/catch already turns
-   * into an honest, session-scoped failure — no SEPARATE exit-race is
-   * needed at this layer.
-   */
-  raceSessionLoadAgainstDeadline<T>(p: Promise<T>): Promise<{ kind: 'settled'; value: T } | { kind: 'timeout' }> {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        resolve({ kind: 'timeout' });
-      }, SESSION_ESTABLISH_DEADLINE_MS);
-      // Don't keep the event loop alive on this deadline — matches every
-      // other deadline timer in this class (raceConnectPhase/
-      // raceAgainstChildExit/scheduleAcpRespawn).
-      timer.unref?.();
-      p.then(
-        (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve({ kind: 'settled', value });
-        },
-        (err: unknown) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(err);
-        },
-      );
-    });
+    }
   }
 
   /**
@@ -993,6 +1006,7 @@ export class ConnectionSupervisor {
           type: 'tab.error',
           tabId: controller.tabId,
           kind: 'session-lost',
+          reason: 'restarted',
           message: 'Session ended — a new agent session was started.',
         });
       }
@@ -1029,6 +1043,94 @@ export class ConnectionSupervisor {
   }
 
   /**
+   * WS-R3 (FUNC-RECONNECT-DRIFT, §3.3): the ONE shared outage teardown both
+   * handleAcpCrash and reconnect() previously hand-copied ("verbatim order"
+   * — the highest-drift-risk duplication in this concurrency zone). Body
+   * order is the crash path's proven sequence, unchanged:
+   *  1. exit-sub dispose — UNCONDITIONAL FIRST statement (idempotent:
+   *     ?.dispose() + set-undefined) so the child's exit can never ALSO
+   *     schedule a crash respawn mid-teardown (double-start);
+   *  2. pendingRecovery snapshot (pendingClose-tombstoned sessions excluded);
+   *  3. settleOneShot(settleReason) — each caller's reason string preserved;
+   *  4. guarded per-controller ending fan-out — a throwing controller
+   *     never aborts the loop; `fanOutLog` is PER-CALLER because the two
+   *     callers' log lines genuinely differ (crash carries the "(tab '…')"
+   *     segment, reconnect does not — both pinned observables); the body
+   *     appends ": <describeHostError(err)>";
+   *  5. client dispose + null (arch-A2), acpState = 'respawning'.
+   * Drift is dead by construction — one body (ADR-R3).
+   *
+   * T16 (ADR-T16): `ending` picks which per-controller method the fan-out
+   * calls — 'crash' (default) = `endOnCrash` -> `turn.end{error}` (the crash
+   * path and the non-force reconnect, byte-identical to before); 'restart' =
+   * `endForRestart` -> `turn.end{cancelled}`, the USER-intent ending — ONLY
+   * the explicit `{force:true}` reconnect passes it (a user-initiated
+   * wedge-break is intent, not a failure).
+   */
+  private teardownForRespawn(
+    settleReason: string,
+    fanOutLog: (controller: SessionController) => string,
+    // T16 (ADR-T16): which ending the per-controller fan-out uses. 'crash'
+    // (default) = endOnCrash -> turn.end{error} — the crash path and the
+    // non-force reconnect, byte-identical to before. 'restart' = the
+    // user-intent ending endForRestart -> turn.end{cancelled} — ONLY the
+    // explicit {force:true} reconnect passes it (a user-initiated wedge-break
+    // is intent, not a failure; the V-12 endForRestart precedent).
+    ending: 'crash' | 'restart' = 'crash',
+  ): void {
+    // WS-R3 F2-19 close-out: guarded, same shape as `handleAcpCrash`'s own
+    // exit-sub guard below — on the handleAcpCrash path this dispose is a
+    // no-op (already nulled there), but it disposes for REAL on the
+    // reconnect() path, where clientExitSub is still live. An injected-
+    // factory client's exit-sub dispose must not be able to abort this
+    // method before the unconditional nulling below (or before this
+    // teardown's caller reaches startInternal()/reschedule).
+    try {
+      this.clientExitSub?.dispose();
+    } catch (err) {
+      this.safeLog(`[AcpBackend] clientExitSub dispose failed during teardownForRespawn: ${describeHostError(err)}`);
+    }
+    this.clientExitSub = undefined;
+    this.pendingRecovery = [...this.port.sessions.values()]
+      .filter((controller) => !this.port.isPendingClose(controller.sessionId))
+      .map((controller) => ({
+        sessionId: controller.sessionId,
+        cwd: controller.cwd,
+        tabId: controller.tabId,
+      }));
+    this.port.settleOneShot(settleReason);
+    for (const controller of this.port.sessions.values()) {
+      try {
+        if (ending === 'restart') controller.endForRestart();
+        else controller.endOnCrash();
+      } catch (err) {
+        // WS-R3 F2-19b: `safeLog`, not a raw `port.logger?.append` — this
+        // fan-out sits directly on the `handleAcpCrash -> teardownForRespawn
+        // -> scheduleAcpRespawn` critical path; an unguarded throwing logger
+        // here would abort this loop before `this.acpState = 'respawning'`
+        // below and before `handleAcpCrash` ever reaches its
+        // `scheduleAcpRespawn()` call, zombie-ing the connection.
+        this.safeLog(`${fanOutLog(controller)}: ${describeHostError(err)}`);
+      }
+    }
+    // WS-R3 F2-19 close-out follow-up: `handleAcpCrash` calls
+    // `teardownForRespawn(...)` then `scheduleAcpRespawn()` with NO outer
+    // try/catch — an unguarded throw here would propagate straight out of
+    // `handleAcpCrash`, aborting it before `this.acpState = 'respawning'`
+    // below (and, on that caller, before `scheduleAcpRespawn()` is ever
+    // reached) — the exact F2-19 zombie every other collaborator call on
+    // this path is already guarded against. `client` is produced by the
+    // same injected `AcpClientFactory` as the exit-sub above.
+    try {
+      this.client?.dispose();
+    } catch (err) {
+      this.safeLog(`[AcpBackend] client dispose threw during respawn teardown: ${describeHostError(err)}`);
+    }
+    this.client = undefined;
+    this.acpState = 'respawning';
+  }
+
+  /**
    * R-A6: the ACP child died after a successful session establishment.
    * Mirrors ControlChannel.handleCrash: detach, mark respawning, schedule a
    * backoff retry. Emits ONE user-visible signal per outage.
@@ -1059,59 +1161,41 @@ export class ConnectionSupervisor {
    * the full tombstone rationale.
    */
   private handleAcpCrash(code: number | null): void {
-    this.clientExitSub?.dispose();
+    // WS-R3 F2-19 close-out: guarded — this injected-factory exit-sub dispose
+    // could throw under a future transport, and a throw here would abort this
+    // method before teardownForRespawn/scheduleAcpRespawn below ever run
+    // (zombie loop). The other injected-collaborator calls on this chain (the
+    // client dispose in teardownForRespawn, the log, the emit) are guarded the
+    // same way; the remaining calls are first-party and non-throwing.
+    try {
+      this.clientExitSub?.dispose();
+    } catch (err) {
+      this.safeLog(`[AcpBackend] clientExitSub dispose failed during crash teardown: ${describeHostError(err)}`);
+    }
     this.clientExitSub = undefined;
     if (this.acpState === 'disposed') return;
-    this.port.logger?.append(
-      `[AcpBackend] hermes acp exited unexpectedly (code ${code}); scheduling respawn`,
-    );
+    // WS-R3 F2-19b (mirrors ControlChannel.handleCrash's own log() guard):
+    // this banner log runs BEFORE teardownForRespawn/scheduleAcpRespawn
+    // below — an unguarded throwing logger must not be able to abort this
+    // method before the respawn is actually scheduled.
+    this.safeLog(`[AcpBackend] hermes acp exited unexpectedly (code ${code}); scheduling respawn`);
     if (this.acpState !== 'respawning') {
       // W4 §7 B1: connection-global — hits every open tab, so it rides
       // `system.error` (no sessionId), never a session-scoped `error` that
       // drop-unknown would eat the moment that one tab closes.
-      this.port.emit({ type: 'system.error', message: 'The agent exited unexpectedly — reconnecting…' });
+      // WS-R3 F2-19b (concurrency re-review Important-1): `safeEmit`, not a
+      // raw `port.emit` — see that method's own doc. Like every injected-
+      // collaborator call on the crash/respawn/arm chain (the guarded
+      // disposes, log, emit), it runs BEFORE teardownForRespawn/
+      // scheduleAcpRespawn below, so an unguarded throw here would abort the
+      // handler before the respawn is scheduled.
+      this.safeEmit({ type: 'system.error', message: 'The agent exited unexpectedly — reconnecting…' });
     }
-    // W4-T5a (Q-10): snapshot every registered session's identity BEFORE the
-    // per-controller fan-out / the coming respawn's teardownSession() clears
-    // the registry — endOnCrash() never mutates sessionId/cwd/tabId, so
-    // capturing here (vs. after the loop) makes no functional difference,
-    // but doing it FIRST keeps the recovery worklist visibly independent of
-    // whatever endOnCrash does to each controller's turn/replay state.
-    this.pendingRecovery = [...this.port.sessions.values()]
-      .filter((controller) => !this.port.isPendingClose(controller.sessionId))
-      .map((controller) => ({
-        sessionId: controller.sessionId,
-        cwd: controller.cwd,
-        tabId: controller.tabId,
-      }));
-    // §2c req 5: settle any in-flight one-shot on this SAME child crash —
-    // independent of (and before) the per-controller handling below.
-    // W6-FI-a: delegates to `OneShotRunner` via the port.
-    this.port.settleOneShot('ACP connection lost');
-    // CF-01/A fix wave (arch Important, secondary robustness fix): guarded
-    // per-controller, mirroring `recoverSessions`'s EXISTING per-attempt
-    // try/catch (`:533-546`) — defensive-only (`SessionController.endOnCrash`
-    // never throws today, pure turn/state bookkeeping + event emission), but
-    // an unguarded abort here would skip BOTH the remaining controllers'
-    // crash-end AND the trailing `this.client?.dispose()` below, which is
-    // what clears `this.connection` (via `AcpClient.dispose()`) and is now
-    // the ONLY thing standing between a stale post-terminate client
-    // reference and a hang if `terminate()` itself somehow didn't already
-    // self-clear it — see `acpClient.ts`'s `terminate` closure doc.
-    for (const controller of this.port.sessions.values()) {
-      try {
-        controller.endOnCrash();
-      } catch (err) {
-        this.port.logger?.append(
-          `[AcpBackend] crash fan-out: endOnCrash failed for session '${controller.sessionId}' (tab '${controller.tabId}'), continuing: ${describeHostError(err)}`,
-        );
-      }
-    }
-    // arch-A2: null the dead client so sendPrompt/loadSession's admission
-    // guards refuse honestly ("not started yet") during the backoff window.
-    this.client?.dispose();
-    this.client = undefined;
-    this.acpState = 'respawning';
+    this.teardownForRespawn(
+      'ACP connection lost',
+      (controller) =>
+        `[AcpBackend] crash fan-out: endOnCrash failed for session '${controller.sessionId}' (tab '${controller.tabId}'), continuing`,
+    );
     this.scheduleAcpRespawn();
   }
 
@@ -1133,8 +1217,15 @@ export class ConnectionSupervisor {
    * On startInternal rejection: same stay-in-outage posture as a failed
    * scheduled respawn attempt (:1129-1131) — hand the outage to the existing
    * backoff machinery AND refuse honestly, so a failed reconnect still heals.
+   *
+   * WS-R3 F3-4: wedge-break — a turn whose cancel force-end deadline already
+   * fired has hasLiveTurn() false (WS-R1 routed the force-end through
+   * emitTurnEnd), so it no longer trips this guard; an explicit `{force:true}`
+   * (the WS-UX banner affordance) bypasses a still-live turn — the fan-out
+   * ends it via `endForRestart` (`turn.end{cancelled}`, user intent;
+   * ADR-T16), idempotent if the turn completes in between.
    */
-  async reconnect(): Promise<ReconnectOutcome> {
+  async reconnect(opts?: { force?: boolean }): Promise<ReconnectOutcome> {
     return this.runOnStartTail(async () => {
       if (this.acpState !== 'ready') {
         return {
@@ -1145,34 +1236,23 @@ export class ConnectionSupervisor {
               : 'The agent connection is not running.',
         };
       }
-      for (const controller of this.port.sessions.values()) {
-        if (controller.hasLiveTurn()) {
-          return {
-            ok: false as const,
-            reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
-          };
+      if (opts?.force !== true) {
+        for (const controller of this.port.sessions.values()) {
+          if (controller.hasLiveTurn()) {
+            return {
+              ok: false as const,
+              reason: 'A turn is still running — wait for it to finish (or cancel it) before re-checking.',
+            };
+          }
         }
       }
-      // handleAcpCrash's teardown, verbatim order — exit-sub FIRST so the
-      // child's exit cannot ALSO schedule a crash respawn (double-start).
-      this.clientExitSub?.dispose();
-      this.clientExitSub = undefined;
-      this.pendingRecovery = [...this.port.sessions.values()]
-        .filter((c) => !this.port.isPendingClose(c.sessionId))
-        .map((c) => ({ sessionId: c.sessionId, cwd: c.cwd, tabId: c.tabId }));
-      this.port.settleOneShot('agent reconnecting');
-      for (const controller of this.port.sessions.values()) {
-        try {
-          controller.endOnCrash();
-        } catch (err) {
-          this.port.logger?.append(
-            `[AcpBackend] reconnect fan-out: endOnCrash failed for session '${controller.sessionId}', continuing: ${describeHostError(err)}`,
-          );
-        }
-      }
-      this.client?.dispose();
-      this.client = undefined;
-      this.acpState = 'respawning';
+      const ending = opts?.force === true ? ('restart' as const) : ('crash' as const);
+      this.teardownForRespawn(
+        'agent reconnecting',
+        (controller) =>
+          `[AcpBackend] reconnect fan-out: ${ending === 'restart' ? 'endForRestart' : 'endOnCrash'} failed for session '${controller.sessionId}', continuing`,
+        ending,
+      );
       try {
         await this.startInternal();
         return { ok: true as const };
@@ -1188,18 +1268,31 @@ export class ConnectionSupervisor {
 
   /** Mirrors ControlChannel.scheduleRespawn/attemptRespawn: retry
    * start() forever on the shared respawnBackoffMs schedule; a failed attempt
-   * reschedules, a successful one resets the counter (inside start()). */
+   * reschedules, a successful one resets the counter (inside start()).
+   *
+   * WS-R3 F2-19b (mirrors ControlChannel's own F2-19a hardening,
+   * concurrency review Minor-1/Minor-2): the next backoff is armed BEFORE
+   * `emitHealth` runs — not after. `emitHealth` fans out to arbitrary
+   * subscriber callbacks synchronously; arming first means this attempt's
+   * timer is already committed before any of that untrusted code runs, so
+   * nothing in the emit path (a throw that somehow escapes `emitHealth`'s
+   * own defensive wrapper, or a reentrant subscriber) can prevent — or
+   * race — the next attempt from being scheduled. */
   private scheduleAcpRespawn(): void {
     if (this.acpState === 'disposed') return;
     const attempt = ++this.acpRespawnAttempts;
     const delayMs = respawnBackoffMs(attempt);
-    this.port.logger?.append(`[AcpBackend] ACP respawn attempt ${attempt} in ${delayMs}ms`);
+    // WS-R3 F2-19b: guarded — see `safeLog`'s own doc. This log runs BEFORE
+    // the timer below is armed; an unguarded throw here would silently
+    // abort the whole respawn schedule.
+    this.safeLog(`[AcpBackend] ACP respawn attempt ${attempt} in ${delayMs}ms`);
     this.acpRespawnTimer = setTimeout(() => {
       this.acpRespawnTimer = undefined;
       void this.start().catch((err) => {
-        this.port.logger?.append(
-          `[AcpBackend] ACP respawn attempt ${attempt} failed: ${describeHostError(err)}`,
-        );
+        // WS-R3 F2-19b: guarded — this failure log runs BEFORE the
+        // reschedule call below; an unguarded throw here would silently
+        // drop the outage instead of retrying it.
+        this.safeLog(`[AcpBackend] ACP respawn attempt ${attempt} failed: ${describeHostError(err)}`);
         if ((this.acpState as string) !== 'disposed') {
           this.acpState = 'respawning'; // stay in-outage: no second UI signal
           this.scheduleAcpRespawn();
@@ -1207,12 +1300,76 @@ export class ConnectionSupervisor {
       });
     }, delayMs);
     this.acpRespawnTimer.unref?.();
+    this.emitHealth(attempt);
   }
 
   private clearAcpRespawnTimer(): void {
     if (this.acpRespawnTimer) {
       clearTimeout(this.acpRespawnTimer);
       this.acpRespawnTimer = undefined;
+    }
+  }
+
+  // F2-19a (concurrency review Minor-1): both call sites of `emitHealth`
+  // sit on the respawn loop's critical path — `scheduleAcpRespawn` arms the
+  // next backoff around this call (see its own ordering note) and
+  // `startInternal`'s success path calls it as its very last step — so the
+  // double defensive guard (per-handler + whole-body) now lives in
+  // `RespawnHealthTracker.emit` instead of here; see its class doc.
+  private emitHealth(attempts: number): void {
+    this.healthTracker.emit({ state: respawnHealthForAttempt(attempts), attempts });
+  }
+
+  /**
+   * WS-R3 F2-19b (mirrors ControlChannel.log()'s own guard, concurrency
+   * re-review IMPORTANT-1): every `port.logger?.append` call on the
+   * crash/respawn/arm critical path — `handleAcpCrash`'s banner,
+   * `teardownForRespawn`'s per-controller fan-out, `scheduleAcpRespawn`'s
+   * own log, and the retry-failure log inside its timeout callback — routes
+   * through here instead of calling `port.logger?.append` directly. An
+   * unguarded call (e.g. a bad/disposed `vscode.OutputChannel` on Fedora)
+   * would otherwise escape and abort whichever caller invoked it before it
+   * reaches the next scheduling step — leaving the connection a zombie that
+   * never respawns: exactly the F2-19 silent fail-stop this class exists to
+   * prevent. A logging failure must never affect control flow.
+   *
+   * WS-R3 F2-19b (code review Minor — doc footgun): deliberately does NOT
+   * prepend a `[AcpBackend]` prefix itself, unlike `ControlChannel.log()`.
+   * Every call site on this class already embeds `[AcpBackend]` inline in
+   * its own message string — adding one here would double-prefix those
+   * messages and redden T13's fan-out-log characterization pins (the exact
+   * strings `ConnectionSupervisor.test.ts` asserts on). Do not "fix" this.
+   */
+  private safeLog(message: string): void {
+    try {
+      this.port.logger?.append(message);
+    } catch {
+      // Swallow: a logging failure must never affect control flow.
+    }
+  }
+
+  /**
+   * WS-R3 F2-19b (concurrency re-review Important-1): guards
+   * `handleAcpCrash`'s crash-banner `port.emit(...)` call — the one
+   * remaining unguarded collaborator call on the `handleAcpCrash ->
+   * teardownForRespawn -> scheduleAcpRespawn -> arm` chain, sitting BEFORE
+   * `teardownForRespawn`/`scheduleAcpRespawn` run. If it threw,
+   * `handleAcpCrash` would abort at that statement: `teardownForRespawn`
+   * never runs (client not disposed, `pendingRecovery` never snapshotted,
+   * `acpState` never flips to 'respawning') and `scheduleAcpRespawn()` is
+   * never reached — the exact F2-19 zombie this class exists to prevent.
+   * Safe in production TODAY only because `port.emit` -> `AcpBackend.emit`
+   * -> `vscode.EventEmitter.fire` happens to route a throwing listener to
+   * `onUnexpectedError` rather than rethrow synchronously into the caller —
+   * that is the PRIMITIVE's behavior, not a guarantee this call site
+   * enforces itself. Mirrors `safeLog`'s try/catch-swallow shape exactly.
+   */
+  private safeEmit(msg: HostToWebviewMessage): void {
+    try {
+      this.port.emit(msg);
+    } catch {
+      // Swallow: an emit failure must never affect control flow — see the
+      // doc comment above.
     }
   }
 
@@ -1226,6 +1383,7 @@ export class ConnectionSupervisor {
    * {@link teardownSession} several statements later (AFTER
    * `rootRegistry.disposeAll()`) — that ordering is NOT bundled here, since
    * it is not adjacent in the original.
+   *
    */
   markDisposed(): void {
     this.acpState = 'disposed';
@@ -1289,9 +1447,11 @@ export interface ConnectionSupervisorHostPort {
    * `client.newSession` resolves — BEFORE registering the controller or
    * firing `tab.bound` — so a belated resolve for an attempt this class
    * already gave up on (deadline/exit) closes the orphaned session instead
-   * of binding it. `establishInitialSession` is the only caller that passes
-   * one; `openTab`'s un-raced mint has nothing to abandon it, so it omits
-   * the argument (always `undefined` there — never stale).
+   * of binding it. `establishInitialSession` is the only caller reached
+   * through this port interface that passes one. WS-R1 F3-1: `openTab`'s
+   * mint (`AcpBackend.openTabInternal`, called directly — not through this
+   * port) is ALSO now deadline+exit-raced and passes the same guard; it is
+   * no longer un-raced, and no longer unconditionally `undefined`/never-stale.
    */
   openSession(cwd: string, tabId: string, isStaleAttempt?: () => boolean): Promise<SessionController>;
   /** `[...this.mcpServers.values()]` — the MCP servers to advertise on a recovered `session/load`. */

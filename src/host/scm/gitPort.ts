@@ -103,7 +103,7 @@ class VscodeGitPort implements GitPortWithRepoRoot {
         // mislabeling every repo author's subjects as the user's own.
         if (!authorPattern) return [];
       }
-      const commits = await repo.log({ maxEntries: n, author: authorPattern });
+      const commits = await repo.log({ maxEntries: n, ...(authorPattern !== undefined ? { author: authorPattern } : {}) });
       return commits.map((c) => commitSubject(c.message));
     } catch {
       return [];
