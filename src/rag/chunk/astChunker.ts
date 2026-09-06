@@ -283,6 +283,21 @@ function* smartCollapsedChunks(
  * functions"), merged back in line order. This keeps the T-B tail
  * invariant: every source line of a chunked file is covered by at least
  * one chunk.
+ *
+ * L2-CA-04 — coverage is tracked by the union of EMITTED chunks' own
+ * `[startLine, endLine]` spans, not by the child node's whole span. A
+ * non-captured CONTAINER child (a TS `namespace`/Rust `mod`/an `if`
+ * wrapping a function — too big to fit whole, and not a
+ * `collapsedNodeConstructors` type) yields chunks only for its captured
+ * descendants, never for its own header/interstitial lines; treating the
+ * whole child span as "covered" the moment it yields >= 1 chunk silently
+ * skipped those container-owned lines. Back-filling before EVERY emitted
+ * chunk (sorted by `startLine`) instead catches gaps at any depth, not just
+ * between top-level children. `fillGapThroughRow`'s `gapEndRow < gapStartRow`
+ * guard already makes overlaps a no-op, so a collapsed parent chunk whose
+ * span already covers its members' rows is never double-filled — this is
+ * why a fully-captured child (whose one chunk's span equals its own node
+ * span) still produces byte-identical output to before.
  */
 export function chunkAst(
   rootNode: SyntaxNodeLike,
@@ -317,12 +332,14 @@ export function chunkAst(
   };
 
   for (const child of rootNode.children) {
-    const childChunks = [...smartCollapsedChunks(child, sourceCode, maxChunkTokens, false)];
-    if (childChunks.length === 0) continue; // still an open gap; keep accumulating
-
-    fillGapThroughRow(child.startPosition.row - 1);
-    results.push(...childChunks);
-    coveredThroughRow = Math.max(coveredThroughRow, child.endPosition.row);
+    const childChunks = [...smartCollapsedChunks(child, sourceCode, maxChunkTokens, false)].sort(
+      (x, y) => x.startLine - y.startLine,
+    );
+    for (const chunk of childChunks) {
+      fillGapThroughRow(chunk.startLine - 1); // back-fill any uncovered rows BEFORE this chunk
+      results.push(chunk);
+      coveredThroughRow = Math.max(coveredThroughRow, chunk.endLine);
+    }
   }
   fillGapThroughRow(rootNode.endPosition.row);
 
