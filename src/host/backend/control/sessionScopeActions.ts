@@ -86,23 +86,23 @@ export class SessionScopeActions {
     return [...this.port.sessions.values()]
       .filter((controller) => !this.port.isPendingClose(controller.sessionId))
       .map((controller) => {
-      const currentModelId = controller.currentModelId;
-      const activeModeId = controller.activeCustomModeId ?? undefined;
-      const availableCommands = controller.getAvailableCommands();
-      return {
-        tabId: controller.tabId,
-        sessionId: controller.sessionId,
-        cwd: controller.cwd,
-        rootId: controller.getRootId(),
-        preset: controller.getPreset(),
-        ...(currentModelId !== undefined ? { currentModelId } : {}),
-        ...(activeModeId !== undefined ? { activeModeId } : {}),
-        ...(availableCommands !== undefined ? { availableCommands } : {}),
-        // A5 (T-1 V-12 seed fold-in): this tab's OWN live-turn status, so a
-        // post-recreate reconcile regains the Stop affordance immediately.
-        turnActive: controller.hasLiveTurn(),
-      };
-    });
+        const currentModelId = controller.currentModelId;
+        const activeModeId = controller.activeCustomModeId ?? undefined;
+        const availableCommands = controller.getAvailableCommands();
+        return {
+          tabId: controller.tabId,
+          sessionId: controller.sessionId,
+          cwd: controller.cwd,
+          rootId: controller.getRootId(),
+          preset: controller.getPreset(),
+          ...(currentModelId !== undefined ? { currentModelId } : {}),
+          ...(activeModeId !== undefined ? { activeModeId } : {}),
+          ...(availableCommands !== undefined ? { availableCommands } : {}),
+          // A5 (T-1 V-12 seed fold-in): this tab's OWN live-turn status, so a
+          // post-recreate reconcile regains the Stop affordance immediately.
+          turnActive: controller.hasLiveTurn(),
+        };
+      });
   }
 
   /**

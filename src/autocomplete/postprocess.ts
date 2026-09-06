@@ -56,9 +56,15 @@ function editDistance(a: string, b: string): number {
  *  DP whenever the length difference alone already proves the ratio can't
  *  be < 0.1 (Levenshtein(a,b) >= |len(a)-len(b)|, so when that lower bound
  *  is already >= 10% of |b| the true ratio can only be >= that too — same
- *  result as running the DP, no DP needed). Both are result-preserving
- *  (golden-pinned): they only ever return `false` where the un-guarded DP
- *  would also have returned `false`. */
+ *  result as running the DP, no DP needed). These two early-outs are NOT
+ *  equivalent: (2) the length-gap short-circuit is EXACTLY result-preserving
+ *  (golden-pinned) — it only ever returns `false` where the un-guarded DP
+ *  would also have returned `false`. (1) the MAX_REPEAT_CHECK_CHARS ceiling
+ *  is a DELIBERATE bound, not a proof-preserving optimization: a pair where
+ *  either line exceeds 2000 chars and IS a near-duplicate (would have made
+ *  the un-guarded DP return `true`) now returns `false` instead — an
+ *  intentional OOM tradeoff whose only behavioral change is for lines
+ *  longer than this near-duplicate check's useful range. */
 function lineIsRepeated(a: string, b: string): boolean {
   if (a.length <= 4 || b.length <= 4) return false;
   const aTrim = a.trim();

@@ -181,7 +181,14 @@ function deriveSettledToolStatus(
       const chosenKind = approvalItem?.options.find((o) => o.id === msg.optionId)?.kind;
       return isDenyOptionKind(chosenKind) ? 'denied' : 'approved';
     }
-    // no default: the union is exhaustive; tsc enforces it
+    // no default: the switch above covers all 4 members of `msg.outcome`
+    // ('selected'|'cancelled'|'expired'|'superseded'), so every case DOES
+    // return. This is a manual invariant, not one tsc verifies — the
+    // function's declared return type is `ToolStatus | undefined`, so a
+    // missing case would NOT be flagged by tsc; it would just fall through
+    // and return `undefined` here. The caller already handles that
+    // `undefined` (the settle fold below no-ops when this returns it), so
+    // an unnoticed gap would degrade safely rather than break the build.
   }
 }
 
