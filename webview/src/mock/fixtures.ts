@@ -6,8 +6,13 @@
  * standalone browser dev renders identically to the real extension host.
  *
  * `mockTurn` is an ordered, delay-timed script of HostToWebview messages
- * modelling one coding turn; `panelData` gives realistic snapshots for all 8
- * control panels.
+ * modelling ONE realistic coding turn: the user asks to refactor `login()`, the
+ * agent reasons, reads the file, proposes a 2-hunk patch and — under the default
+ * `manual` preset — asks permission to APPLY it (the BH-05 two-card shape: the
+ * real `tc-…` patch card plus the synthetic `edit-approval-1` diff card, gate #1),
+ * asks permission to run `npm test` (gate #2), updates a plan, and summarizes.
+ * The MockBackend echoes `approval.settle` for each gate itself, as the real
+ * host does. `panelData` gives realistic snapshots for all 8 control panels.
  */
 import type { HostToWebview, PanelDataMap, ThemeInfo } from '../protocol';
 
@@ -26,9 +31,15 @@ const TURN_ID = 'turn-1';
 const SESSION_ID = 'sess-8a4c';
 const REASON_BLOCK = 'think-1';
 const TOOL_READ = 'tool-read-1';
-const TOOL_PATCH = 'tool-patch-1';
+/** The REAL `patch` tool call — Hermes mints `tc-<12 hex>` ids (acp_adapter/tools.py make_tool_call_id). */
+const TOOL_PATCH = 'tc-8a4c2f1e9b3d';
+/** The edit permission's OWN ToolCallUpdate id (acp_adapter/edit_approval.py build_acp_edit_tool_call) — the BH-05 synthetic diff card is keyed to it. */
+const EDIT_APPROVAL_TOOL = 'edit-approval-1';
+/** Approval id of the edit gate — the FIRST gate the MockBackend parks on. Host-minted in production, opaque. */
+const EDIT_APPROVAL_ID = 'appr-1';
 const TOOL_TEST = 'tool-test-1';
-const APPROVAL_ID = 'appr-1';
+/** Approval id of the `npm test` command gate — the SECOND gate. */
+const CMD_APPROVAL_ID = 'appr-2';
 
 /** Default theme the MockBackend seeds hydrate with. */
 export const mockTheme: ThemeInfo = {
@@ -36,8 +47,13 @@ export const mockTheme: ThemeInfo = {
   accent: '#14b8a6',
 };
 
-/** The approval id the MockBackend pauses on before continuing the turn. */
-export const mockApprovalId = APPROVAL_ID;
+/**
+ * The approval id of the FIRST gate the MockBackend parks on (the BH-05 edit
+ * approval). The player reads each gate's id off the parked step itself, so
+ * the second gate — `CMD_APPROVAL_ID`, the `npm test` command approval —
+ * resumes on its own id.
+ */
+export const mockApprovalId = EDIT_APPROVAL_ID;
 
 /** The scripted coding turn (the MockBackend sleeps `delayMs` before each emit). */
 export const mockTurn: MockStep[] = [
@@ -130,7 +146,13 @@ export const mockTurn: MockStep[] = [
     },
   },
 
-  // --- patch tool + 2-hunk diff ---
+  // --- patch tool under the MANUAL preset (BH-05): the REAL tool card starts first ---
+  // Hermes announces the real `patch` ToolCallStart (id tc-…, kind edit,
+  // title `patch (replace): <path>`, no diff — its text block literally says
+  // "Approval prompt shows the diff") BEFORE it asks for permission:
+  // agent/tool_executor.py fires tool.started for every call before any
+  // executes; acp_adapter/events.py _tool_progress sends the start; then
+  // model_tools.py maybe_require_edit_approval blocks on the client.
   {
     delayMs: 300,
     message: {
@@ -139,18 +161,36 @@ export const mockTurn: MockStep[] = [
       sessionId: SESSION_ID,
       toolId: TOOL_PATCH,
       kind: 'edit',
-      title: 'Patch src/auth/login.ts',
-      status: 'running',
-      rawInput: 'src/auth/login.ts',
+      title: 'patch (replace): src/auth/login.ts',
+      status: 'pending',
+    },
+  },
+
+  // --- the edit permission rides a SEPARATE ToolCallUpdate: edit-approval-1 ---
+  // Our host turns session/request_permission into tool.start → tool.diff →
+  // approval.request, all keyed to the permission's own toolCallId
+  // (SessionController.emitApprovalCard). Under the manual preset the diff
+  // exists ONLY here — never on the tc-… card. Title/kind come from the
+  // host's RESOLVED presentation ("Edit: <path>"), not Hermes' own title.
+  {
+    delayMs: 250,
+    message: {
+      type: 'tool.start',
+      turnId: TURN_ID,
+      sessionId: SESSION_ID,
+      toolId: EDIT_APPROVAL_TOOL,
+      kind: 'edit',
+      title: 'Edit: src/auth/login.ts',
+      status: 'pending',
     },
   },
   {
-    delayMs: 450,
+    delayMs: 150,
     message: {
       type: 'tool.diff',
       turnId: TURN_ID,
       sessionId: SESSION_ID,
-      toolId: TOOL_PATCH,
+      toolId: EDIT_APPROVAL_TOOL,
       path: 'src/auth/login.ts',
       hunks: [
         {
@@ -186,14 +226,43 @@ export const mockTurn: MockStep[] = [
     },
   },
   {
-    delayMs: 200,
+    delayMs: 150,
+    message: {
+      type: 'approval.request',
+      turnId: TURN_ID,
+      sessionId: SESSION_ID,
+      id: EDIT_APPROVAL_ID,
+      kind: 'edit',
+      title: 'Edit: src/auth/login.ts',
+      toolId: EDIT_APPROVAL_TOOL,
+      timeoutMs: 60000,
+      // Hermes' own option set for an edit (edit_approval.py): allow_once /
+      // deny — the host keeps the option ids verbatim as the kinds.
+      options: [
+        { id: 'allow_once', label: 'Allow edit', kind: 'allow_once' },
+        { id: 'deny', label: 'Deny', kind: 'deny' },
+      ],
+    },
+    // Park here until the user answers (approval.respond, or per-hunk
+    // diff.resolve). The MockBackend echoes approval.settle itself — in
+    // production the HOST emits it from respondApproval, Hermes never does.
+    gate: 'approval',
+  },
+
+  // --- (resumes after the edit is allowed) the REAL tool completes ---
+  // Hermes' step callback sends ToolCallUpdate{completed} for the tc-… id
+  // with the _format_edit_result text (files_modified are absolute paths).
+  // The edit-approval-1 card never receives a tool.update — its pill is the
+  // settle-derived Approved/Denied (ADR-R2-15).
+  {
+    delayMs: 500,
     message: {
       type: 'tool.update',
       turnId: TURN_ID,
       sessionId: SESSION_ID,
       toolId: TOOL_PATCH,
       status: 'done',
-      output: '2 hunks applied to src/auth/login.ts',
+      output: '✅ patch completed for `src/auth/login.ts`\nFiles: `/home/dev/talaria-code/src/auth/login.ts`',
     },
   },
 
@@ -233,7 +302,7 @@ export const mockTurn: MockStep[] = [
       type: 'approval.request',
       turnId: TURN_ID,
       sessionId: SESSION_ID,
-      id: APPROVAL_ID,
+      id: CMD_APPROVAL_ID,
       kind: 'command',
       title: 'Run `npm test`?',
       detail: 'Talaria wants to execute the terminal command `npm test` in the workspace root.',

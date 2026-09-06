@@ -9,7 +9,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { HostToWebview } from '../protocol';
 import { BOOTSTRAP_TAB_ID } from '../protocol';
 import { MockBackend } from './MockBackend';
-import { mockApprovalId } from './fixtures';
+import { mockApprovalId, mockTurn } from './fixtures';
 
 function makeHarness() {
   const messages: HostToWebview[] = [];
@@ -395,5 +395,83 @@ describe('webview MockBackend — R5 nextEdit.toggle (Task 13, structural-replac
     backend.handle({ type: 'ready' });
 
     expect(messages).toContainEqual({ type: 'nextEdit.state', state: { next: false, generic: false } });
+  });
+});
+
+/*
+ * WS-A T5c (BH-05): the mock scene must model the REAL two-card manual
+ * edit-approval shape Hermes puts on the wire (grounded in
+ * acp_adapter/events.py _tool_progress + edit_approval.py
+ * build_acp_edit_tool_call + tools.py build_tool_complete): a real `tc-…`
+ * patch card (pending → done) AND a separate synthetic `edit-approval-1`
+ * card (tool.start → tool.diff → approval.request, same id) whose pill is
+ * settle-derived — never one item that goes running → diff → done (that is
+ * the auto-allowed accept_edits/dont_ask path, which masked the bug).
+ */
+describe('fixtures — WS-A T5c (BH-05): manual edit-approval scene shape (pure data)', () => {
+  const REAL_TOOL = 'tc-8a4c2f1e9b3d';
+  const SYNTHETIC = 'edit-approval-1';
+  const messages: HostToWebview[] = mockTurn.map((step) => step.message);
+  const indexOf = (predicate: (m: HostToWebview) => boolean): number => messages.findIndex(predicate);
+
+  it('has exactly two approval gates: the EDIT gate first (its id IS mockApprovalId), the npm-test COMMAND gate second under a different id', () => {
+    const gated = mockTurn.filter((step) => step.gate === 'approval');
+    expect(gated).toHaveLength(2);
+    expect(gated[0]?.message).toMatchObject({ type: 'approval.request', kind: 'edit', id: mockApprovalId, toolId: SYNTHETIC });
+    expect(gated[1]?.message).toMatchObject({ type: 'approval.request', kind: 'command' });
+    expect(gated[1]?.message.type === 'approval.request' ? gated[1].message.id : 'wrong-type').not.toBe(mockApprovalId);
+    expect(mockTurn.some((step) => step.gate === 'diff')).toBe(false);
+  });
+
+  it('two-card shape in host emit order: real tc-… start → synthetic start → synthetic diff → edit approval.request (gated) → real tc-… done; the synthetic id never gets a tool.update and the real id never gets a tool.diff', () => {
+    const realStart = indexOf((m) => m.type === 'tool.start' && m.toolId === REAL_TOOL);
+    const synthStart = indexOf((m) => m.type === 'tool.start' && m.toolId === SYNTHETIC);
+    const synthDiff = indexOf((m) => m.type === 'tool.diff' && m.toolId === SYNTHETIC);
+    const request = indexOf((m) => m.type === 'approval.request' && m.id === mockApprovalId);
+    const realDone = indexOf((m) => m.type === 'tool.update' && m.toolId === REAL_TOOL && m.status === 'done');
+
+    expect(realStart).toBeGreaterThanOrEqual(0);
+    expect(realStart).toBeLessThan(synthStart);
+    expect(synthStart).toBeLessThan(synthDiff);
+    expect(synthDiff).toBeLessThan(request);
+    expect(request).toBeLessThan(realDone);
+    expect(mockTurn[request]?.gate).toBe('approval');
+
+    expect(messages[realStart]).toMatchObject({ kind: 'edit', title: 'patch (replace): src/auth/login.ts', status: 'pending' });
+    expect(messages[realStart] !== undefined && 'rawInput' in messages[realStart]).toBe(false);
+    expect(messages[synthStart]).toMatchObject({ kind: 'edit', title: 'Edit: src/auth/login.ts', status: 'pending' });
+    expect(messages[synthDiff]).toMatchObject({ path: 'src/auth/login.ts' });
+    expect(messages[synthDiff]?.type === 'tool.diff' ? messages[synthDiff].hunks : []).toHaveLength(2);
+
+    expect(messages.some((m) => m.type === 'tool.update' && m.toolId === SYNTHETIC)).toBe(false);
+    expect(messages.some((m) => m.type === 'tool.diff' && m.toolId === REAL_TOOL)).toBe(false);
+  });
+
+  it('the edit approval carries the wire-exact Hermes option set (allow_once "Allow edit" / deny "Deny"), the 60 s deadline, and NO detail (a diff-only permission has no text block)', () => {
+    const request = messages.find((m) => m.type === 'approval.request' && m.id === mockApprovalId);
+    expect(request).toMatchObject({
+      title: 'Edit: src/auth/login.ts',
+      timeoutMs: 60000,
+      options: [
+        { id: 'allow_once', label: 'Allow edit', kind: 'allow_once' },
+        { id: 'deny', label: 'Deny', kind: 'deny' },
+      ],
+    });
+    expect(request !== undefined && 'detail' in request).toBe(false);
+  });
+
+  it('timing budget the replay tests rely on: the FIRST gate lands after 2550 ms and before 6000 ms of cumulative delay, and the first post-gate step within 3000 ms', () => {
+    let elapsed = 0;
+    let firstGateAt = -1;
+    let firstPostGateDelay = -1;
+    for (const step of mockTurn) {
+      elapsed += step.delayMs;
+      if (firstGateAt >= 0 && firstPostGateDelay < 0) firstPostGateDelay = step.delayMs;
+      if (step.gate && firstGateAt < 0) firstGateAt = elapsed;
+    }
+    expect(firstGateAt).toBeGreaterThan(2550);
+    expect(firstGateAt).toBeLessThan(6000);
+    expect(firstPostGateDelay).toBeGreaterThanOrEqual(0);
+    expect(firstPostGateDelay).toBeLessThan(3000);
   });
 });
