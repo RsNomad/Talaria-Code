@@ -4,6 +4,7 @@ import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type
 import { must } from '../testing/must';
 import { assertExhaustivePanel } from './panels';
 import { reduce, reduceLocal, MAX_TRANSCRIPT_ITEMS } from './transcript';
+import { pendingDiffToolIds, deniedToolIds } from '../components/chat/ChatView';
 
 /** One minimal-valid payload per GLOBAL DataPanel (§2f) — used to pin every
  * global panel's routing, not just `tools` (P7-N4). */
@@ -2636,6 +2637,115 @@ describe('transcript reducer — BH-05 (WS-A T4, Q2 / ADR-R2-15): tool.start cre
 
     const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
     expect(tool).toMatchObject({ toolId: 'tool-1', status: 'done', hunksLocked: true });
+  });
+});
+
+/**
+ * WS-A T5b (BH-05, round-2 🔴): the webview reducer contract for the
+ * post-T3 emit order the host actually sends for a real edit-approval card —
+ * `tool.start` -> `tool.diff` -> `approval.request`, all keyed by the SAME
+ * `toolId` ('edit-approval-1'). This is the routing the whole fix depends
+ * on: a card built from three separately-emitted messages folds into ONE
+ * tool item carrying its diff, gated pending by `pendingDiffToolIds` via
+ * that shared `toolId`, until `approval.settle` resolves it.
+ */
+describe('transcript reducer — BH-05 (WS-A T5b): edit-approval card end-to-end fold (tool.start -> tool.diff -> approval.request -> approval.settle)', () => {
+  const TOOL_ID = 'edit-approval-1';
+
+  /** Folds the three host messages, in emit order, exactly as T3 wires them
+   * for a real edit-approval card (values per the WS-A T5b brief). */
+  function foldEditApprovalCard(): AppState {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: TOOL_ID,
+      kind: 'edit',
+      title: 'Edit: src/auth/login.ts',
+      status: 'pending',
+    });
+    state = reduce(state, {
+      type: 'tool.diff',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: TOOL_ID,
+      path: 'src/auth/login.ts',
+      hunks: [
+        {
+          header: '@@ -1,6 +1,10 @@',
+          lines: [
+            { sign: ' ', text: "import { api } from '../client';" },
+            { sign: '+', text: '' },
+            { sign: '+', text: 'export class LoginError extends Error {' },
+          ],
+        },
+      ],
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      kind: 'edit',
+      title: 'Edit: src/auth/login.ts',
+      toolId: TOOL_ID,
+      options: [
+        { id: 'opt-allow', label: 'Allow once', kind: 'allow_once' },
+        { id: 'opt-deny', label: 'Deny', kind: 'deny' },
+      ],
+    });
+    return state;
+  }
+
+  it('folds into exactly ONE tool item carrying its diff, gated pending via pendingDiffToolIds, with the approval routed to the SAME toolId', () => {
+    const state = foldEditApprovalCard();
+    const transcript = activeTab(state).transcript;
+
+    const toolItems = transcript.filter((i) => i.kind === 'tool');
+    expect(toolItems).toHaveLength(1);
+    const tool = toolItems[0];
+    expect(tool).toMatchObject({ toolId: TOOL_ID });
+    expect(tool?.kind === 'tool' ? tool.diffs?.length : undefined).toBe(1);
+    expect(tool?.kind === 'tool' ? tool.diffs?.[0]?.hunks : undefined).toEqual([
+      {
+        header: '@@ -1,6 +1,10 @@',
+        lines: [
+          { sign: ' ', text: "import { api } from '../client';" },
+          { sign: '+', text: '' },
+          { sign: '+', text: 'export class LoginError extends Error {' },
+        ],
+      },
+    ]);
+
+    // Approval item present, unresolved, unsettled — the exact condition
+    // pendingDiffToolIds requires to count a toolId as pending.
+    const approval = transcript.find((i) => i.kind === 'approval');
+    expect(approval).toMatchObject({ id: 'appr-1', toolId: TOOL_ID });
+    expect(approval?.kind === 'approval' ? approval.resolvedOptionId : 'wrong-kind').toBeUndefined();
+    expect(approval?.kind === 'approval' ? approval.settledOutcome : 'wrong-kind').toBeUndefined();
+
+    expect(pendingDiffToolIds(transcript).has(TOOL_ID)).toBe(true);
+  });
+
+  it('after approval.settle{outcome:"selected", optionId:"opt-allow"}: the tool item is "approved", pendingDiffToolIds drops the toolId, and deniedToolIds does NOT pick it up (allow, not deny)', () => {
+    let state = foldEditApprovalCard();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: TOOL_ID,
+      outcome: 'selected',
+      optionId: 'opt-allow',
+    });
+
+    const transcript = activeTab(state).transcript;
+    const tool = transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: TOOL_ID, status: 'approved' });
+
+    expect(pendingDiffToolIds(transcript).has(TOOL_ID)).toBe(false);
+    expect(deniedToolIds(transcript).has(TOOL_ID)).toBe(false);
   });
 });
 
