@@ -20,6 +20,7 @@ import {
   secretEnvKeyFor,
   envReference,
   checkSecretValue,
+  findSecretKeyCollision,
 } from './mcpEntryValidation';
 import type { ConfigWriteTail } from './configWriteTail';
 import { runAdminOp, resolveDashboardAdminClient, pollActionUntilVerified, TRUST_GATED_METHODS, POLL_UNCONFIRMED_MESSAGE } from './adminOpRunner';
@@ -255,9 +256,41 @@ export class McpAdminHandler {
     if (!described.ok) {
       throw new Error(described.reason);
     }
+    // L2-CA-22 (ADR-R2-10) pre-check — LENIENT, before consent: an
+    // unfetched `mcp` panel (`listed === undefined`) skips this; the `.env`
+    // clobber belt below (after consent) is the REAL guard. This one exists
+    // so a predictable collision is refused before the user is even asked,
+    // saving them a modal + secret prompt they'd lose anyway.
+    if (validated.secretEnvNames.length > 0) {
+      const source = this.port.panelSources.get('mcp');
+      const listed = hasToggleNameCache(source) ? source.lastListedNames() : undefined;
+      if (listed !== undefined) {
+        const collision = findSecretKeyCollision(validated.body.name, validated.secretEnvNames, listed);
+        if (collision) {
+          throw new Error(
+            `Refusing to add "${validated.body.name}": its secret key ${collision.key} would collide with server "${collision.otherServer}" — choose a name that differs by more than punctuation.`,
+          );
+        }
+      }
+    }
     const confirmed = await this.port.confirm(described.message, described.detail, 'Add server');
     if (!confirmed) {
       throw new Error(`Adding MCP server "${validated.body.name}" was declined or cancelled.`);
+    }
+    // L2-CA-22 (ADR-R2-10) clobber belt — the REAL guard, after consent and
+    // BEFORE `collectSecretEnv` prompts for any value: never overwrite an
+    // `.env` key that is already set. The user must never be prompted for a
+    // secret that will be refused, and nothing may be written first.
+    if (validated.secretEnvNames.length > 0) {
+      const rows = await client.listEnvKeys();
+      const clobber = validated.secretEnvNames
+        .map((n) => secretEnvKeyFor(validated.body.name, n))
+        .filter((k) => isEnvKeySet(rows, k));
+      if (clobber.length > 0) {
+        throw new Error(
+          `Refusing to add "${validated.body.name}": .env key(s) ${clobber.join(', ')} already exist — mcp.add never overwrites an existing secret.`,
+        );
+      }
     }
     const secrets = await this.collectSecretEnv(validated.body.name, validated.secretEnvNames);
     if (secrets.length === 0) {

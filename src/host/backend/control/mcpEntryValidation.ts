@@ -229,6 +229,33 @@ export function envReference(key: string): string {
 }
 
 /**
+ * L2-CA-22 (ADR-R2-10): {@link secretEnvKeyFor} is MANY-TO-ONE — `my-server`,
+ * `my.server`, `my_server` all upper-case/punctuation-normalize to the SAME
+ * suffix, so two servers whose names differ only by punctuation, sharing a
+ * secret NAME, would land under the SAME `.env` key: one server's credential
+ * silently bleeds into (overwrites) another's. Pure lookup: for the name
+ * being added, does ANY already-listed server (excluding the new name
+ * itself — a same-name collision is Hermes' own 409, not this check) produce
+ * the same {@link secretEnvKeyFor} output for any of the new server's secret
+ * names? Returns the FIRST such collision (key + the other server's name) so
+ * the caller can refuse with a precise, value-free message.
+ */
+export function findSecretKeyCollision(
+  newName: string,
+  secretNames: readonly string[],
+  existingNames: ReadonlySet<string>,
+): { key: string; otherServer: string } | undefined {
+  for (const existing of existingNames) {
+    if (existing === newName) continue;
+    for (const secret of secretNames) {
+      const key = secretEnvKeyFor(newName, secret);
+      if (secretEnvKeyFor(existing, secret) === key) return { key, otherServer: existing };
+    }
+  }
+  return undefined;
+}
+
+/**
  * AU-59: the client-side gate `mcpAdd` applies to a prompted secret VALUE
  * before `PUT /api/env` ({@link SECRET_VALUE_PATTERN}, same 4096 cap as a
  * plaintext env value). The refusal says NOTHING about the value.

@@ -8325,6 +8325,71 @@ describe('ControlDispatcher — Task A5 MCP admin core', () => {
     expect(result).toMatchObject({ ok: true, name: 'gh' });
   });
 
+  it('L2-CA-22: mcp.add refuses BEFORE consent when the new secret key would collide with an already-listed server (punctuation-only name difference)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    const control = withFakeControl(backend);
+    control.setResultFor('config.get', { config: { mcp_servers: { 'my.server': { command: 'x' } } } });
+    control.setResultFor('tools.list', { toolsets: [] });
+    await backend.invokeControl('panel.data', { panel: 'mcp' }); // populate lastListedNames() with 'my.server'
+    mockShowWarningMessage.mockClear();
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('mcp.add', {
+        name: 'my-server',
+        transport: 'stdio',
+        command: 'npx',
+        args: [],
+        env: {},
+        secretEnvNames: ['TOKEN'],
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toContain('MCP_MY_SERVER_TOKEN');
+    expect(message).toContain('my.server');
+    expect(mockShowWarningMessage).not.toHaveBeenCalled(); // refused BEFORE the consent modal
+    expect(client.addCalls).toEqual([]);
+    expect(client.setEnvVarCalls).toEqual([]);
+  });
+
+  it('L2-CA-22: mcp.add refuses AFTER consent, before the POST and before any secret prompt, when the .env key is already set (the real clobber belt)', async () => {
+    const { backend, client } = makeBackendWithAdminDashboard();
+    // No prior panel.data fetch — lastListedNames() is undefined, so the
+    // pre-check skips (lenient); this proves the belt catches it independently.
+    client.setEnvVarCalls.push({ key: 'MCP_GH_TOKEN', value: 'x' }); // so listEnvKeys() reports it is_set:true
+    // Deliberately leave `mockShowInputBox` unconfigured (defaults to
+    // `undefined`, per its own harness-comment convention) rather than
+    // arming a resolved value here: the belt must refuse before it is ever
+    // called, so nothing should consume — or need — a queued answer.
+    mockShowInputBox.mockClear();
+    mockShowWarningMessage.mockClear();
+    mockShowWarningMessage.mockResolvedValueOnce('Add server'); // user confirms the native modal
+
+    let caught: unknown;
+    try {
+      await backend.invokeControl('mcp.add', {
+        name: 'gh',
+        transport: 'stdio',
+        command: 'npx',
+        args: [],
+        env: {},
+        secretEnvNames: ['TOKEN'],
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain('MCP_GH_TOKEN');
+    expect(client.addCalls).toEqual([]); // refused BEFORE the config POST
+    expect(mockShowInputBox).not.toHaveBeenCalled(); // ...and BEFORE any secret prompt
+    expect(client.setEnvVarCalls).toEqual([{ key: 'MCP_GH_TOKEN', value: 'x' }]); // unchanged
+  });
+
   it('mcp.add: a declined modal sends NOTHING to the dashboard client', async () => {
     const { backend, client } = makeBackendWithAdminDashboard();
     mockShowWarningMessage.mockResolvedValueOnce(undefined); // user hit Cancel
