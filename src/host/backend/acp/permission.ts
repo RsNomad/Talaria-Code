@@ -1,7 +1,12 @@
 import type { ApprovalOption, HostToWebviewMessage } from '../../../shared/protocol';
 import type { PolicySignal } from '../policy/editPolicy';
 import { extractDiffs, extractToolCallOutputText } from './contentBlocks';
-import type { AcpPermissionOption, AcpRequestPermissionRequest, AcpRequestPermissionResponse } from './types';
+import type {
+  AcpPermissionOption,
+  AcpRequestPermissionRequest,
+  AcpRequestPermissionResponse,
+  AcpToolCallFields,
+} from './types';
 
 /**
  * Hermes' `optionId` values are, by construction, already the exact strings
@@ -171,6 +176,39 @@ export function applyResolvedPresentation(
       ? `Edit: ${effect.paths.join(', ') || '(unresolved path)'}`
       : `Run: ${effect.command || '(unresolved command)'}`;
   return { ...approval, kind: effect.kind, title };
+}
+
+/** Narrow alias for the `tool.start` variant, mirroring {@link ApprovalRequestMessage}/{@link ToolDiffMessage}. */
+export type ToolStartMessage = Extract<HostToWebviewMessage, { type: 'tool.start' }>;
+
+/**
+ * ADR-R2-02 (BH-05 fix, [SEC]): build the synthetic `tool.start` keyed to an
+ * edit-approval's `toolCallId` so the DiffCard the client already renders for
+ * that id (via `tool.diff`) has a TOOL item to attach to — under the default
+ * `manual`/`ask` preset the diff previously rode `toolCall`/`tool.diff` alone
+ * with no `tool.start` ever emitted for that id, so the card rendered blind.
+ *
+ * SECURITY: `title`/`kind` are read from `approval` — the caller's
+ * ALREADY-RESOLVED presentation (see {@link applyResolvedPresentation}), i.e.
+ * OUR verified effect the human is about to approve — never from
+ * `toolCall.title`/`toolCall.kind`, which are agent-authored and could be
+ * crafted to mislabel the real effect. `toolId = toolCall.toolCallId` is the
+ * routing id (not presentation) and MUST match the id `tool.diff`/`approval`
+ * already carry for the DiffCard to attach.
+ */
+export function buildPermissionToolStart(
+  toolCall: AcpToolCallFields,
+  approval: ApprovalRequestMessage,
+): ToolStartMessage {
+  return {
+    type: 'tool.start',
+    turnId: approval.turnId,
+    sessionId: approval.sessionId,
+    toolId: toolCall.toolCallId,
+    kind: approval.kind === 'edit' ? 'edit' : 'execute',
+    title: approval.title,
+    status: 'pending',
+  };
 }
 
 /**

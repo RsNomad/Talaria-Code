@@ -6,9 +6,10 @@ import {
   buildCancelledOutcome,
   buildMinimalAskApproval,
   applyResolvedPresentation,
+  buildPermissionToolStart,
 } from './permission';
 import type { ApprovalRequestMessage } from './permission';
-import type { AcpRequestPermissionRequest } from './types';
+import type { AcpRequestPermissionRequest, AcpToolCallFields } from './types';
 
 describe('mapApprovalOption', () => {
   it('uses the Hermes optionId directly as the protocol kind when known', () => {
@@ -184,6 +185,76 @@ describe('applyResolvedPresentation (F2 card-from-our-resolved-state)', () => {
     expect(edit.title).toBe('Edit: (unresolved path)');
     const cmd = applyResolvedPresentation(agentLabeled, { kind: 'command', command: '' });
     expect(cmd.title).toBe('Run: (unresolved command)');
+  });
+});
+
+// ADR-R2-02 (BH-05 fix, [SEC]): the synthetic `tool.start` keyed to the
+// edit-approval id must present OUR resolved `approval.kind`/`approval.title`
+// (already re-labeled by applyResolvedPresentation) — never the agent-authored
+// `toolCall.title`/`toolCall.kind` — so the DiffCard the human sees is titled
+// with the verified effect, not attacker-crafted copy.
+describe('buildPermissionToolStart', () => {
+  const resolvedEditApproval: ApprovalRequestMessage = {
+    type: 'approval.request',
+    turnId: 'turn-1',
+    sessionId: 'sess-1',
+    id: 'appr-1',
+    kind: 'edit',
+    title: 'Edit: src/a.ts, src/b.ts',
+    options: [],
+    timeoutMs: 60000,
+  };
+
+  it('reads title/kind from approval (resolved), never from toolCall (misleading agent copy)', () => {
+    const toolCall: AcpToolCallFields = {
+      toolCallId: 'edit-approval-1',
+      title: 'Delete everything',
+      kind: 'read',
+    };
+    const result = buildPermissionToolStart(toolCall, resolvedEditApproval);
+    expect(result.title).toBe('Edit: src/a.ts, src/b.ts');
+    expect(result.kind).toBe('edit');
+  });
+
+  it('reads the routing id from toolCall.toolCallId', () => {
+    const toolCall: AcpToolCallFields = { toolCallId: 'edit-approval-1' };
+    const result = buildPermissionToolStart(toolCall, resolvedEditApproval);
+    expect(result.toolId).toBe('edit-approval-1');
+  });
+
+  it('maps approval.kind: command -> execute, edit -> edit', () => {
+    const toolCall: AcpToolCallFields = { toolCallId: 't-1' };
+    const commandApproval: ApprovalRequestMessage = {
+      ...resolvedEditApproval,
+      kind: 'command',
+      title: 'Run: npm test',
+    };
+    expect(buildPermissionToolStart(toolCall, commandApproval).kind).toBe('execute');
+    expect(buildPermissionToolStart(toolCall, resolvedEditApproval).kind).toBe('edit');
+  });
+
+  it('carries turnId/sessionId from approval and sets status pending', () => {
+    const toolCall: AcpToolCallFields = { toolCallId: 't-1' };
+    const approval: ApprovalRequestMessage = { ...resolvedEditApproval, turnId: 'turn-9', sessionId: 'sess-9' };
+    const result = buildPermissionToolStart(toolCall, approval);
+    expect(result.turnId).toBe('turn-9');
+    expect(result.sessionId).toBe('sess-9');
+    expect(result.status).toBe('pending');
+  });
+
+  it('produces exactly the expected ToolStartMessage shape, with rawInput absent', () => {
+    const toolCall: AcpToolCallFields = { toolCallId: 'edit-approval-1', title: 'irrelevant', kind: 'read' };
+    const result = buildPermissionToolStart(toolCall, resolvedEditApproval);
+    expect(result).toEqual({
+      type: 'tool.start',
+      turnId: 'turn-1',
+      sessionId: 'sess-1',
+      toolId: 'edit-approval-1',
+      kind: 'edit',
+      title: 'Edit: src/a.ts, src/b.ts',
+      status: 'pending',
+    });
+    expect('rawInput' in result).toBe(false);
   });
 });
 
