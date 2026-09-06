@@ -3250,4 +3250,46 @@ describe("L2-CA-10 (OD-3): plan.update keeps one plan card PER TURN, not one reb
       items: [{ text: 'step one', status: 'done' }, { text: 'step two', status: 'active' }],
     });
   });
+
+  it("once TWO turns' plan cards coexist, a second plan.update for the LATER turn rebinds only THAT turn's card -- the earlier turn's card is untouched (pins the map predicate's own turn guard, not just the some-predicate's)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'step one', status: 'done' }],
+    });
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'complete' });
+
+    state = reduce(state, { type: 'turn.start', turnId: 't2', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't2',
+      sessionId: 's1',
+      items: [{ text: 'step A', status: 'active' }],
+    });
+
+    // Two turns, two cards, both still in the transcript (CA-10 append path).
+    const seeded = activeTab(state).transcript.filter((i) => i.kind === 'plan');
+    expect(seeded).toHaveLength(2);
+
+    // A SECOND plan.update for t2 (the later turn) must hit the UPDATE (map)
+    // branch, not append -- and must rebind ONLY t2's own card. If the map
+    // predicate's turn guard were dropped (matching whichever plan item
+    // `map` reaches, not the one whose turnId equals msg.turnId), this
+    // update would rewrite EVERY plan item -- including t1's already-closed
+    // card -- to t2's incoming items. That is the exact CA-10 cross-turn
+    // corruption this test pins on the map branch specifically.
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't2',
+      sessionId: 's1',
+      items: [{ text: 'step B', status: 'done' }],
+    });
+
+    const planCards = activeTab(state).transcript.filter((i) => i.kind === 'plan');
+    expect(planCards).toHaveLength(2); // no new card appended, none removed
+    expect(planCards[0]).toMatchObject({ turnId: 't1', items: [{ text: 'step one', status: 'done' }] }); // earlier turn's card unchanged
+    expect(planCards[1]).toMatchObject({ turnId: 't2', items: [{ text: 'step B', status: 'done' }] }); // only the later turn's card updated
+  });
 });
