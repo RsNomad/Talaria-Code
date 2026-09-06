@@ -32,10 +32,12 @@ import * as os from 'node:os';
 import { SessionController } from './SessionController';
 import type { SessionHostPort } from './types';
 import type { RootCoordinatorLike } from '../../checkpoints/RootCoordinator';
+import type { CheckpointTrackerLike } from '../../checkpoints/trackerContract';
+import type { RestoreResult } from '../../checkpoints/CheckpointTracker';
 import { buildCancelledOutcome, buildSelectedOutcome } from '../acp/permission';
 import type { AcpRequestPermissionRequest, AcpOutboundContentBlock } from '../acp/types';
 import type { AcpClientLike, AcpListSessionsRawResult, AcpLoadSessionResult } from '../acp/acpClient';
-import type { Attachment, HostToWebviewMessage } from '../../../shared/protocol';
+import type { Attachment, Checkpoint, CheckpointsData, HostToWebviewMessage } from '../../../shared/protocol';
 
 const EDIT_OPTIONS = [
   { optionId: 'allow_once', kind: 'allow_once', name: 'Allow edit' },
@@ -2687,5 +2689,156 @@ describe('SessionController.resolveDiff — BHF-F1-3 (firm): junk hunk indices n
     controller.acceptWholeFileDiff('edit-1');
     const res = await pending;
     expect(res).toEqual(buildSelectedOutcome('allow_once'));
+  });
+});
+
+/**
+ * BH-03 (Lens-R2, WS-B Task 1) [CONC]: fail-closed the N1 auto-allow fast
+ * path after Stop. `handlePermission` re-validates liveness right after
+ * `await this.buildPresentEffectSignals(...)` (BF-B) — but ONLY via
+ * `this.disposed`, never turn-cancellation. A `cancel()` landing in that same
+ * suspension window sets `cancelledTurnId` (not `disposed`), so a
+ * Normal-preset auto-allow edit (N1: in-workspace, checkpoint-protected,
+ * non-secret, non-protected) sailed straight through to `buildSelectedOutcome`
+ * — an allow decided and returned for a turn the user already stopped, with
+ * no card and no settle to intercept it. The card path
+ * (`emitApprovalCard`) already runs `isStaleApprovalRegistration` at its own
+ * registration point; the fast path never did.
+ *
+ * Characterization-first, same suspension mechanism the BF-B suite above
+ * uses: `handlePermission`'s `await this.buildPresentEffectSignals(...)`
+ * suspends on REAL fs `realpath`/`lstat` (a temp workspace dir) — calling
+ * `cancel()` synchronously right after starting the promise, before ever
+ * awaiting it, deterministically lands inside that window every run (no
+ * timers, no polling).
+ */
+describe('SessionController.handlePermission — BH-03: turn-liveness on the N1 auto-allow fast path', () => {
+  const tmpDirs: string[] = [];
+  function makeTmpWs(): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-sc-bh03-ws-'));
+    tmpDirs.push(dir);
+    return dir;
+  }
+  afterEach(() => {
+    while (tmpDirs.length) {
+      const dir = tmpDirs.pop()!;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+
+  /** Minimal `CheckpointTrackerLike` fake whose `snapshot` never throws — all
+   *  `snapshotCheckpoint` needs to flip `currentTurnProtected` true, N1's
+   *  other prerequisite alongside an in-workspace, non-secret, non-protected
+   *  path. Every other member is unused by this suite. */
+  class AlwaysSucceedsTracker implements CheckpointTrackerLike {
+    async snapshot(): Promise<Checkpoint | null> {
+      return null;
+    }
+    async list(): Promise<CheckpointsData> {
+      return { checkpoints: [] };
+    }
+    async restore(): Promise<RestoreResult> {
+      return { restored: false, reason: 'unused in this suite' };
+    }
+    async redo(): Promise<RestoreResult> {
+      return { restored: false, reason: 'unused in this suite' };
+    }
+    async redoAll(): Promise<RestoreResult> {
+      return { restored: false, reason: 'unused in this suite' };
+    }
+  }
+
+  /** A hanging `AcpClientLike` (mirrors the WS-SL F3-3 suite's
+   *  `makeF33Harness`): `prompt` never resolves, so the admitted turn stays
+   *  LIVE (`currentTurnId`/`liveTurnId` set) for the whole test — required so
+   *  `cancel()` takes its real client-cancel branch and `handlePermission`'s
+   *  entry-time `turnId` capture reads a genuine live turn, not the
+   *  no-client fallback. */
+  function makeHangingClient(): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in a BH-03 test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt: () => new Promise<never>(() => {}),
+      cancel: async () => undefined,
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  /** Flushes the microtask queue N times — `runTurnWithCheckpoint`'s
+   *  `Promise.all([snapshotCheckpoint, resolveMentions])` (plus
+   *  `runTurn`'s own pre-prompt awaits) needs a few hops before
+   *  `currentTurnProtected` settles true and the turn parks on the hanging
+   *  `client.prompt`. Purely microtask-driven (no real timers/I/O in this
+   *  suite's fakes) — deterministic regardless of iteration count as long as
+   *  it's enough to drain the chain. Mirrors the F3-3 suite's `flushF33`. */
+  async function flushTurns(times = 10): Promise<void> {
+    for (let i = 0; i < times; i++) await Promise.resolve();
+  }
+
+  /** A LIVE, checkpoint-protected turn under the 'normal' preset — the exact
+   *  precondition an N1 auto-allow edit needs. */
+  async function makeLiveNormalTurn(
+    ws: string,
+  ): Promise<{ controller: SessionController; emitted: unknown[]; logs: string[] }> {
+    const emitted: unknown[] = [];
+    const logs: string[] = [];
+    const client = makeHangingClient();
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: { ...makeRoot(), tracker: new AlwaysSucceedsTracker() },
+      workspaceRoots: () => [ws],
+      logger: { append: (l) => logs.push(l) },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', ws, port);
+    controller.setPreset('normal');
+    controller.sendPrompt('edit it', 'default');
+    await flushTurns();
+    return { controller, emitted, logs };
+  }
+
+  it('a cancel() landing while handlePermission is suspended in canonicalization fails the N1 fast path closed (no post-Stop allow)', async () => {
+    const ws = makeTmpWs();
+    const { controller, emitted, logs } = await makeLiveNormalTurn(ws);
+
+    // Suspends at `await this.buildPresentEffectSignals(...)` (real fs
+    // realpath/lstat) — `cancel()` right below is synchronous and runs
+    // BEFORE that await resolves, landing squarely in the BH-03 window.
+    const pending = controller.handlePermission(makeEditReq('src/a.ts'), 'appr-bh03-1');
+    controller.cancel();
+
+    const res = await pending;
+
+    // Fail-closed: a Stop landing mid-canonicalization must never let the N1
+    // fast path resolve allow — this is the exact fail-OPEN BH-03 pins.
+    expect(res).toEqual(buildCancelledOutcome());
+    expect(emitted.some((m) => (m as { type?: string }).type === 'approval.request')).toBe(false);
+    expect(logs.some((l) => l.includes('refused after suspension'))).toBe(true);
+  });
+
+  it("a LIVE (non-cancelled) turn's N1 auto-allow still resolves ALLOW (no over-refusal)", async () => {
+    const ws = makeTmpWs();
+    const { controller, emitted } = await makeLiveNormalTurn(ws);
+
+    const res = await controller.handlePermission(makeEditReq('src/a.ts'), 'appr-bh03-2');
+
+    expect(res).toEqual(buildSelectedOutcome('allow_once'));
+    expect(emitted.some((m) => (m as { type?: string }).type === 'approval.request')).toBe(false);
   });
 });

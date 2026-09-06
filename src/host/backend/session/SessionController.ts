@@ -998,6 +998,24 @@ export class SessionController {
       // any allow/deny/card decision, so nothing gets registered into (or
       // emitted from) a now-dead controller.
       if (this.disposed) return buildCancelledOutcome();
+      // BH-03 (Lens-R2, WS-B): the disposed check above is the liveness belt
+      // — this is the turn-cancellation one. A `cancel()` landing in the
+      // SAME suspension window sets `cancelledTurnId`, not `disposed`; left
+      // unchecked, a Normal-preset auto-allow (N1) still fell through to
+      // `buildSelectedOutcome` below for a turn the user already stopped —
+      // fail-OPEN. `isStaleApprovalRegistration` is the SAME predicate the
+      // card path already applies at its own registration point
+      // (`emitApprovalCard`, kept as belt-and-suspenders); applying it here,
+      // uniformly, BEFORE the allow/deny/card decision, closes the fast-path
+      // gap without touching that later check. `turnId` is this method's
+      // entry-time capture — exactly the "birth turn" `isStaleApprovalRegistration`
+      // expects.
+      if (this.isStaleApprovalRegistration(turnId)) {
+        this.port.logger?.append(
+          `[policy] permission for turn ${turnId} refused after suspension — turn cancelled/gone (fail-closed)`,
+        );
+        return buildCancelledOutcome();
+      }
       const { signal, decision } = pickStrictest(evaluated);
 
       mapped = { ...mapped, approval: applyResolvedPresentation(mapped.approval, signal) };
