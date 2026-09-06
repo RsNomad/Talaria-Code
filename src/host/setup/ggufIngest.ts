@@ -571,13 +571,15 @@ async function createModel(io: GgufIngestIo, spec: GgufIngestSpec, endpoint: str
     }
     const trailing = buffer.trim();
     if (trailing) {
-      handleCreateChunkLine(trailing);
+      if (handleCreateChunkLine(trailing)) return;
     }
-    // Stream ended without hitting an explicit terminal chunk either way.
-    // `handleCreateChunkLine` above already threw on any `{"error":…}` chunk
-    // observed along the way, so reaching here means none was seen — treat
-    // as success (defensive: some Ollama versions end quietly), exactly
-    // `pullModel`'s own fall-through behavior one module over.
+    // CA-17 (Lens-R2, FROZEN-TOUCH, refusal-only): reaching here means the stream
+    // drained with no {"error":…} (else handleCreateChunkLine threw) AND no terminal
+    // {"status":"success"} (else we returned). Q6 grounded: every files:-capable Ollama
+    // tag (v0.5.5→main, docs + server/create.go) ends with {"status":"success"}; a quiet
+    // end is an Ollama regression, reported — NEVER fabricated as success. No /api/tags
+    // fallback-accept, no stream:false (Q6 items 3-4).
+    throw new GgufCreateIncompleteError();
   } finally {
     // Same F7 discipline as `pullModel`/`downloadToTemp`: cancel() on every
     // exit path (success, mid-stream error, or abort), not just
@@ -602,6 +604,15 @@ export class GgufCreateLineParseError extends Error {
   constructor(byteLength: number) {
     super(`Ollama model create stream produced a malformed NDJSON line (${byteLength} bytes) — create failed`);
     this.name = 'GgufCreateLineParseError';
+  }
+}
+
+/** CA-17 (Lens-R2, FROZEN-TOUCH, refusal-only): the create stream ended without the
+ *  terminal {"status":"success"} chunk. Carries no URL/model name (existing hygiene). */
+export class GgufCreateIncompleteError extends Error {
+  constructor() {
+    super('Ollama model create stream ended before {"status":"success"} — create not confirmed');
+    this.name = 'GgufCreateIncompleteError';
   }
 }
 

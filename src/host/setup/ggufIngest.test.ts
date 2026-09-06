@@ -307,6 +307,21 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
     expect(removeTemp).toHaveBeenCalledTimes(1);
   });
 
+  it('CA-17 (Lens-R2): a 200 /api/create stream that ends WITHOUT a terminal {"status":"success"} chunk REJECTS — a quiet end is never fabricated as success', async () => {
+    const { io, removeTemp } = fakeIo();
+    const { fetchImpl } = routedFetch({
+      download: () => downloadResponse([CONTENT]),
+      create: () => createResponse(['{"status":"reading model metadata"}', '{"status":"writing manifest"}']),
+    });
+    io.fetchImpl = fetchImpl;
+
+    await expect(ingestGguf(io, SPEC, ENDPOINT, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      name: 'GgufCreateIncompleteError',
+    });
+
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
   it('aborting mid-create-stream cancels the reader and rejects with AbortError', async () => {
     const { io, removeTemp } = fakeIo();
     const { reader } = controllableReader();
