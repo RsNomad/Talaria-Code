@@ -4,6 +4,7 @@ import type {
   HostToWebviewMessage,
   AgentMode,
   Attachment,
+  ApprovalOption,
   ContextRef,
   ControlMethod,
   DiffAction,
@@ -15,6 +16,7 @@ import { CONTROL_METHODS, makePanelData } from '../../shared/protocol';
 import { mockScenario } from '../../shared/mockScenario';
 import type { MockScenario, MockStep } from '../../shared/mockScenario';
 import type { AgentBackend } from './AgentBackend';
+import type { ApprovalRequestMessage } from './acp/permission';
 
 /**
  * W4 §2d/§7 B12: the host `MockBackend` auto-binds ONE session at startup so
@@ -30,6 +32,16 @@ const MOCK_SESSION_ID = 'mock-session-1';
 const MOCK_TAB_ID = 'mock-tab-1';
 
 /**
+ * WS-A T5c (BH-05): the same one-line rule as `SessionController.ts`'s
+ * module-private `findOptionId` (kept private there — the mock must not
+ * reach into the controller, and importing it would drag the controller's
+ * whole import graph under this file's `vscode` shim in tests).
+ */
+function optionIdOfKind(options: ApprovalOption[], kind: ApprovalOption['kind']): string | undefined {
+  return options.find((option) => option.kind === kind)?.id;
+}
+
+/**
  * The DEFAULT backend. Replays a canned coding turn so the whole extension runs
  * on any OS with **no Hermes process and no network** (pinned decision #4).
  *
@@ -37,9 +49,12 @@ const MOCK_TAB_ID = 'mock-tab-1';
  * and streams the timeline out through {@link onMessage} on realistic
  * `setTimeout` delays, producing the exact sequence the real backend will:
  *
- *   turn.start → user → reasoning.start/delta/end → message.delta/end →
- *   tool.start/update → tool.diff → approval.request → plan.update →
- *   result.summary → turn.end
+ *   turn.start → user → reasoning.start/delta/end → tool.start/update (read) →
+ *   message.delta → tool.start (real tc-… patch, pending) →
+ *   tool.start/tool.diff/approval.request (synthetic edit-approval-1, gate) →
+ *   approval.settle (echoed by this mock) → tool.update (tc-… done) →
+ *   plan.update → tool.start/approval.request (npm test, gate) →
+ *   approval.settle → … → result.summary → turn.end
  *
  * ### Assumed scenario shape (contract with Agent D — see docs/arch-host.md)
  * ```ts
@@ -90,6 +105,11 @@ export class MockBackend implements AgentBackend {
   private timer: ReturnType<typeof setTimeout> | undefined;
   /** What kind of user response the parked player is waiting for, if any. */
   private gate: 'approval' | 'diff' | undefined;
+  /** WS-A T5c (BH-05): per-hunk ACCEPT decisions for the PARKED edit
+   * approval — the host's `hunkState.decisions` stand-in. Cleared on every
+   * settle and on `reset()`. Connection-level, like `gate`/`cursor` (this
+   * host mock stays single-scenario-at-a-time — see `openTab`'s doc). */
+  private readonly hunkDecisions = new Set<number>();
   private playing = false;
   /** Last turn id seen in the stream — used for `cancel`'s `turn.end`. */
   private currentTurnId: string | undefined;
@@ -208,23 +228,55 @@ export class MockBackend implements AgentBackend {
     });
   }
 
+  /**
+   * WS-A T5c (BH-05): resumes ONLY when `id` is the approval the player is
+   * parked on (read off the parked step — so the script's second gate, the
+   * npm-test command approval, resumes on its own id), and — as the real
+   * host does in `SessionController.respondApproval` — echoes the
+   * authoritative `approval.settle{selected, optionId}` FIRST, carrying the
+   * option the user ACTUALLY chose. A deny is echoed honestly (the webview
+   * folds the synthetic edit-approval card to Denied); the scripted
+   * continuation is linear and still plays — the same skeleton posture as
+   * denying the npm-test gate.
+   */
   respondApproval(_sessionId: string, id: string, optionId: string): void {
-    void id;
-    void optionId;
-    // A `deny` could branch the mock; for the skeleton any response resumes.
-    if (this.gate === 'approval') {
-      this.gate = undefined;
-      this.advance();
-    }
+    const parked = this.parkedApproval();
+    if (!parked || parked.id !== id) return;
+    this.settleAndAdvance(parked, optionId);
   }
 
+  /**
+   * WS-A T5c (BH-05): the host-mock mirror of `SessionController.resolveDiff`
+   * for the PARKED edit approval — any reject settles the whole edit to its
+   * deny option; accepts accumulate and settle to the allow option once every
+   * hunk is accepted; an out-of-range index is ignored (BHF-F1-3). The legacy
+   * `'diff'` gate (unused by the current script) keeps its old advance.
+   *
+   * Faithfulness note: the REAL `SessionController.resolveDiff` only has
+   * `hunkState` for a toolId when `totalHunks > 0` (emitApprovalCard sets it
+   * only then) — a diff-less approval has no hunk-aggregation state at all,
+   * so its `resolveDiff` is an unconditional no-op regardless of `action`.
+   * Mirror that here (unlike the webview mock's own deferred Minor on this
+   * point) so this host mock stays fully host-accurate.
+   */
   resolveDiff(_sessionId: string, toolId: string, hunkIndex: number, action: DiffAction): void {
-    void toolId;
-    void hunkIndex;
-    void action;
     if (this.gate === 'diff') {
       this.gate = undefined;
       this.advance();
+      return;
+    }
+    const parked = this.parkedApproval();
+    if (!parked || parked.toolId !== toolId) return;
+    const total = this.totalHunksFor(toolId);
+    if (total === 0) return;
+    if (action === 'reject') {
+      this.settleAndAdvance(parked, optionIdOfKind(parked.options, 'deny') ?? 'deny');
+      return;
+    }
+    if (!Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= total) return;
+    this.hunkDecisions.add(hunkIndex);
+    if (this.hunkDecisions.size >= total) {
+      this.settleAndAdvance(parked, optionIdOfKind(parked.options, 'allow_once') ?? 'allow_once');
     }
   }
 
@@ -308,12 +360,49 @@ export class MockBackend implements AgentBackend {
     this.clearTimer();
     this.cursor = 0;
     this.gate = undefined;
+    this.hunkDecisions.clear();
     this.playing = false;
   }
 
   private advance(): void {
     this.cursor++;
     this.scheduleNext();
+  }
+
+  /** The scripted `approval.request` the player is parked on right now, or
+   * undefined when not parked on an approval gate. */
+  private parkedApproval(): ApprovalRequestMessage | undefined {
+    if (this.gate !== 'approval') return undefined;
+    const message = this.scenario.timeline[this.cursor]?.message;
+    return message !== undefined && message.type === 'approval.request' ? message : undefined;
+  }
+
+  /** Total hunks the scenario attaches to `toolId` via `tool.diff` steps —
+   * the stand-in for the host's `hunkState.totalHunks`. */
+  private totalHunksFor(toolId: string): number {
+    let total = 0;
+    for (const step of this.scenario.timeline) {
+      const message = step.message;
+      if (message.type === 'tool.diff' && message.toolId === toolId) total += message.hunks.length;
+    }
+    return total;
+  }
+
+  /** Settle echo first (the real host's `respondApproval`/`finishApproval`
+   * order), then un-park and advance. */
+  private settleAndAdvance(parked: ApprovalRequestMessage, optionId: string): void {
+    this.gate = undefined;
+    this.hunkDecisions.clear();
+    this.emit({
+      type: 'approval.settle',
+      sessionId: parked.sessionId,
+      turnId: parked.turnId,
+      id: parked.id,
+      ...(parked.toolId !== undefined ? { toolId: parked.toolId } : {}),
+      outcome: 'selected',
+      optionId,
+    });
+    this.advance();
   }
 
   private scheduleNext(): void {
