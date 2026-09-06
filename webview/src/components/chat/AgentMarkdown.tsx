@@ -45,7 +45,7 @@ interface Props {
  * while `streaming` is true, preserving the G-5 fix above. Corollary: a turn
  * that ends mid-fence re-renders its tail as prose once it settles.
  */
-function tokenize(
+export function tokenize(
   src: string,
   streaming: boolean,
 ): { code: boolean; lang?: string; body: string }[] {
@@ -424,6 +424,14 @@ function renderBlocks(text: string, keyPrefix: string, depth = 0): ReactNode {
   );
 }
 
+/** WS-E E1 (L2-CA-03): hoisted so `renderMarkdown`'s code branch and the
+ * fence branch in `AgentMarkdown` below share ONE source of truth for the
+ * `<pre>` className and cannot drift apart. WS-U (later) wraps this `<pre>`
+ * — both branches must keep rendering exactly one `<pre className={CODE_BLOCK_CLASS}>`
+ * per fence. Exact string preserved from the pre-existing code branch. */
+const CODE_BLOCK_CLASS =
+  'my-2 overflow-x-auto rounded-card border border-border bg-surface p-3 font-mono text-xs leading-relaxed text-muted';
+
 /** CA-11: the token→node render, extracted so the completed-block PREFIX can
  * be memoized separately from the still-open tail. `keyPrefix` namespaces the
  * per-token keys so the stable and tail segments never collide. Behavior is
@@ -434,10 +442,7 @@ export function renderMarkdown(text: string, streaming: boolean, keyPrefix: stri
     const key = `${keyPrefix}-${ti}`;
     if (tok.code) {
       return (
-        <pre
-          key={key}
-          className="my-2 overflow-x-auto rounded-card border border-border bg-surface p-3 font-mono text-xs leading-relaxed text-muted"
-        >
+        <pre key={key} className={CODE_BLOCK_CLASS}>
           {tok.lang && <div className="mb-1 text-2xs uppercase text-faint">{tok.lang}</div>}
           <code>{tok.body.replace(/\n$/, '')}</code>
         </pre>
@@ -473,20 +478,108 @@ export function splitStableBoundary(text: string): { stable: string; tail: strin
   return { stable: text.slice(0, cut), tail: text.slice(cut) };
 }
 
+/** WS-E E1 (L2-CA-03): while streaming, `splitStableBoundary` only cuts at a
+ * balanced `\n\n` — INSIDE an open code fence the entire message is the
+ * unmemoized `tail`, so a long streamed code block gets fully re-tokenized
+ * and re-rendered on every delta (O(n^2) over the stream). `CODE_STABLE_CHUNK`
+ * quantizes a trailing OPEN fence's body into a memo-stable `bodyStable`
+ * prefix (identical across every delta within one 4096-char window) plus a
+ * small `bodyTail`, so only the tail text node needs to change per delta. */
+export const CODE_STABLE_CHUNK = 4096;
+
+export interface StreamingRenderPlan {
+  stable: string;
+  tail: string;
+  fence?: { pre: string; opener: string; lang?: string; bodyStable: string; bodyTail: string };
+}
+
+const CLOSED_FENCE_RE = /```([\w-]*)\n?([\s\S]*?)```/g;
+const OPEN_FENCE_RE = /```([\w-]*)\n?([\s\S]*)$/;
+
+/** Pure planner: splits `text` into the already-memoized `stable` prefix (via
+ * `splitStableBoundary`) and, when the `tail` ends in a trailing OPEN fence,
+ * further splits that fence's body into `bodyStable` (quantized, memo-stable
+ * within one `CODE_STABLE_CHUNK` window) + `bodyTail`. Mirrors `tokenize`'s
+ * own fence regexes exactly (skip closed pairs, then look for a trailing
+ * opener) so the two always agree on whether a trailing fence is open. */
+export function planStreamingRender(text: string): StreamingRenderPlan {
+  const { stable, tail } = splitStableBoundary(text);
+  // Skip closed pairs exactly as tokenize does, then look for a trailing opener.
+  let last = 0;
+  for (const m of tail.matchAll(CLOSED_FENCE_RE)) last = (m.index ?? 0) + m[0].length;
+  const rest = tail.slice(last);
+  const open = OPEN_FENCE_RE.exec(rest);
+  if (!open) return { stable, tail };
+  const pre = tail.slice(0, last + open.index);
+  const body = open[2] ?? '';
+  const opener = open[0].slice(0, open[0].length - body.length);
+  const q = (Math.floor(body.length / CODE_STABLE_CHUNK) - 1) * CODE_STABLE_CHUNK;
+  const cut = q <= 0 ? 0 : body.lastIndexOf('\n', q) + 1;
+  const lang = open[1] ? open[1] : undefined;
+  return {
+    stable,
+    tail,
+    fence: {
+      pre,
+      opener,
+      ...(lang !== undefined ? { lang } : {}),
+      bodyStable: body.slice(0, cut),
+      bodyTail: body.slice(cut),
+    },
+  };
+}
+
 export function AgentMarkdown({ text, streaming }: Props) {
   const isStreaming = streaming === true;
-  const { stable, tail } = isStreaming ? splitStableBoundary(text) : { stable: '', tail: text };
+  // NOT streaming: bypass planStreamingRender entirely (no fence detection) —
+  // settled text keeps tokenize(text, false)'s CommonMark-divergent behavior
+  // (a trailing unclosed ``` mention is prose, never code; see tokenize's doc
+  // comment), unchanged from before this task.
+  const plan: StreamingRenderPlan = isStreaming
+    ? planStreamingRender(text)
+    : { stable: '', tail: text };
+  const { stable, tail, fence } = plan;
   // Only the completed prefix is memoized (streaming=false — it is settled and
   // fence-balanced); it re-parses solely when a new block completes.
   const stableNodes = useMemo(
     () => (stable.length > 0 ? renderMarkdown(stable, false, 'stable') : null),
     [stable],
   );
-  const tailNodes = renderMarkdown(tail, isStreaming, 'tail');
+  // WS-E E1: when the tail ends in an open fence, render its (memoized) prose
+  // prefix + ONE `<pre className={CODE_BLOCK_CLASS}>` built from the
+  // quantized bodyStable/bodyTail pair, instead of re-tokenizing/re-rendering
+  // the whole (potentially huge) tail on every delta.
+  const fencePre = fence?.pre;
+  const hasFence = fence !== undefined;
+  const fencePreNodes = useMemo(
+    () => (fencePre !== undefined ? renderMarkdown(fencePre, false, 'pre') : null),
+    [fencePre],
+  );
+  // Guarded by `hasFence` so `renderMarkdown(tail, …)` — potentially over the
+  // WHOLE (huge, still-growing) open-fence tail — is never even CALLED while
+  // a fence is open; skipping only the render of its result would still pay
+  // the O(n^2) cost this task exists to remove.
+  const tailNodes = useMemo(
+    () => (hasFence ? null : renderMarkdown(tail, isStreaming, 'tail')),
+    [hasFence, tail, isStreaming],
+  );
   return (
     <div className="text-[13px] leading-relaxed text-fg">
       {stableNodes}
-      {tailNodes}
+      {fence ? (
+        <>
+          {fencePreNodes}
+          <pre className={CODE_BLOCK_CLASS}>
+            {fence.lang && <div className="mb-1 text-2xs uppercase text-faint">{fence.lang}</div>}
+            <code>
+              {fence.bodyStable}
+              {fence.bodyTail.replace(/\n$/, '')}
+            </code>
+          </pre>
+        </>
+      ) : (
+        tailNodes
+      )}
       {isStreaming && <span className="h-live text-accent">▍</span>}
     </div>
   );
