@@ -21,6 +21,7 @@ import {
   mapPermissionRequest,
   applyResolvedPresentation,
   buildMinimalAskApproval,
+  buildPermissionToolStart,
   buildSelectedOutcome,
   buildCancelledOutcome,
   DEFAULT_APPROVAL_TIMEOUT_MS,
@@ -1127,8 +1128,11 @@ export class SessionController {
       // T17/T18 ordering lesson). `settlePendingApprovals` clears the entry,
       // its 60 s timer, and the hunk/preview bookkeeping in one sweep.
       try {
-        this.port.emit(approval);
+        if (diffs.length > 0) {
+          this.port.emit(buildPermissionToolStart(req.toolCall, approval));
+        }
         for (const diff of diffs) this.port.emit(diff);
+        this.port.emit(approval);
       } catch (err) {
         this.settlePendingApprovals('cancelled', { onlyApprovalId: approvalId, emit: false });
         this.port.logger?.append(

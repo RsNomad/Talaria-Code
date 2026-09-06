@@ -2114,6 +2114,181 @@ describe('SessionController.emitApprovalCard — WS-SL F2-06: emit-throw settles
 });
 
 /**
+ * WS-A T3 (BH-05 fix, ADR-R2-02): `emitApprovalCard` must gate a synthetic
+ * `tool.start` on `diffs.length > 0` so the webview has a tool item for the
+ * DiffCard to attach to, WITHOUT changing the diff-less (command) path and
+ * WITHOUT ever surfacing a tool item for the fail-closed minimal-ask card
+ * (`buildMinimalAskApproval` always builds `diffs: []`). New emit order for
+ * a diff-bearing edit: `tool.start` -> `tool.diff`* -> `approval.request`
+ * (the approval emit moved LAST).
+ */
+describe('SessionController.emitApprovalCard — WS-A T3: diff-gated tool.start emit order (BH-05 wiring)', () => {
+  const tmpDirs: string[] = [];
+  function makeTmpWs(): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-sc-t3-ws-'));
+    tmpDirs.push(dir);
+    return dir;
+  }
+  afterEach(() => {
+    while (tmpDirs.length) {
+      const dir = tmpDirs.pop()!;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+
+  /** Every member throws unless it's the one this suite actually drives
+   *  (`prompt`, hung forever so the turn stays live for the whole test —
+   *  mirrors the resolveDiff describe block's `makeHangingEditClient`). */
+  function makeHangingClient(): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in a WS-A T3 test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt: () => new Promise<never>(() => {}),
+      cancel: async () => undefined,
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  function makeT3Port(ws: string): { port: SessionHostPort; emitted: HostToWebviewMessage[] } {
+    const emitted: HostToWebviewMessage[] = [];
+    const port: SessionHostPort = {
+      getClient: () => makeHangingClient(),
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => [ws],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return { port, emitted };
+  }
+
+  function makeT3EditReq(toolCallId: string, p = 'src/a.ts'): AcpRequestPermissionRequest {
+    return {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId,
+        title: `Approve edit: ${p}`,
+        kind: 'edit',
+        content: [{ type: 'diff', path: p, oldText: 'a', newText: 'b' }],
+        rawInput: { tool: 'write_file', arguments: { path: p, content: 'b' } },
+      },
+    };
+  }
+
+  function makeT3CommandReq(toolCallId: string, command = 'npm test'): AcpRequestPermissionRequest {
+    return {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId,
+        title: `Run: ${command}`,
+        kind: 'execute',
+        content: [{ content: { type: 'text', text: `$ ${command}` } }],
+        rawInput: { command, description: 'run' },
+      },
+    };
+  }
+
+  it('a diff-bearing edit permission emits the exact ordered sequence tool.start -> tool.diff -> approval.request, all sharing one toolId', async () => {
+    const ws = makeTmpWs();
+    const { port, emitted } = makeT3Port(ws);
+    const controller = new SessionController('session-1', ws, port);
+    controller.sendPrompt('edit it', 'default');
+    emitted.length = 0; // isolate: only the permission-card emits are under test
+
+    const pending = controller.handlePermission(makeT3EditReq('edit-approval-1'), 'appr-t3-1');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+    });
+
+    // Exact sequence, exact order — no extra/missing messages.
+    expect(emitted.map((m) => m.type)).toEqual(['tool.start', 'tool.diff', 'approval.request']);
+
+    expect(emitted[0]).toEqual(
+      expect.objectContaining({ type: 'tool.start', toolId: 'edit-approval-1', kind: 'edit', status: 'pending' }),
+    );
+    expect(emitted[1]).toEqual(expect.objectContaining({ type: 'tool.diff', toolId: 'edit-approval-1' }));
+    expect(emitted[2]).toEqual(expect.objectContaining({ type: 'approval.request', toolId: 'edit-approval-1' }));
+
+    // Cleanup: settle the still-pending card so its 60s auto-deny timer
+    // does not outlive the test (dispose() cancels fail-closed).
+    controller.dispose();
+    await pending;
+  });
+
+  it('a diff-less command permission emits ONLY approval.request — no tool.start, no tool.diff', async () => {
+    const ws = makeTmpWs();
+    const { port, emitted } = makeT3Port(ws);
+    const controller = new SessionController('session-1', ws, port);
+    controller.sendPrompt('run it', 'default');
+    emitted.length = 0;
+
+    const pending = controller.handlePermission(makeT3CommandReq('cmd-approval-1'), 'appr-t3-2');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+    });
+
+    expect(emitted.map((m) => m.type)).toEqual(['approval.request']);
+    expect(emitted.some((m) => m.type === 'tool.start')).toBe(false);
+
+    controller.dispose();
+    await pending;
+  });
+
+  it('the fail-closed minimal-ask card (mapPermissionRequest throws, diffs: []) emits ONLY approval.request — no tool.start', async () => {
+    const ws = makeTmpWs();
+    const { port, emitted } = makeT3Port(ws);
+    const controller = new SessionController('session-1', ws, port);
+    controller.sendPrompt('edit it', 'default');
+    emitted.length = 0;
+
+    // Hostile diff content: `newText` is not a string, so `buildDiffHunks`
+    // throws inside `mapPermissionRequest` (mirrors AcpBackend.test.ts's F5).
+    const req: AcpRequestPermissionRequest = {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId: 'edit-evil-t3',
+        title: 'Update README',
+        kind: 'edit',
+        content: [{ type: 'diff', path: 'README.md', oldText: 'a', newText: 42 as unknown as string }],
+        rawInput: { tool: 'write_file', arguments: { path: 'README.md', content: 'x' } },
+      },
+    };
+
+    const pending = controller.handlePermission(req, 'appr-t3-3');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+    });
+
+    expect(emitted.map((m) => m.type)).toEqual(['approval.request']);
+    expect(emitted.some((m) => m.type === 'tool.start')).toBe(false);
+    expect(emitted[0]).toEqual(
+      expect.objectContaining({ type: 'approval.request', title: 'Approval required (request could not be parsed)' }),
+    );
+
+    controller.dispose();
+    await pending;
+  });
+});
+
+/**
  * WS-SL F1-13: `sendPrompt` minted a turn id, a ROOT-scoped checkpoint
  * ordinal, and a checkpoint snapshot for a whitespace-only prompt with
  * nothing attached — burning a turn + ordinal on an utterance Hermes treats
