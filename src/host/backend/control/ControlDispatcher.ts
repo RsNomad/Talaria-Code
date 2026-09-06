@@ -314,7 +314,20 @@ export class ControlDispatcher {
     }
 
     if (method === 'skills.toggle' || method === 'toolsets.toggle') {
-      return this.dashboardToggles.toggle(method, params);
+      const raw = await this.dashboardToggles.toggle(method, params);
+      // BH-01 (ADR-R2-04): the toggle persisted server-side, but the response carries
+      // only {ok,name,enabled}; the webview's V-11 reconcile shows `serverValue` once the
+      // op settles, so the persisted list MUST be pushed BEFORE this RPC resolves
+      // (postMessage is FIFO on one channel → the push folds first). The push is a
+      // courtesy re-fetch of state that already persisted, so its failure must not
+      // turn a successful toggle into a rejected RPC (ADR-R2-16) — log and return.
+      const panel = method === 'skills.toggle' ? 'skills' : 'tools';
+      try {
+        await this.panels.fetchPanelData(panel);
+      } catch (err) {
+        this.port.logger?.append(`[ControlDispatcher] ${method}: panel re-push failed (toggle persisted) — ${errorMessage(err)}`);
+      }
+      return raw;
     }
 
     // Task A5+A6 (§4.5, §4.7, §4.8): the full T1 MCP admin core —
@@ -496,10 +509,23 @@ function extractLoadParams(params: unknown): { sessionId?: string; cwd?: string 
 // the checkpoints domain.
 
 // WS-GD.2a A9: `extractToggleParams` moved onto `dashboardToggles.ts` with
-// the rest of the dashboard-toggles domain; `errorMessage` (this file's own
-// copy) moved onto `sessionScopeActions.ts` — it had exactly one caller
-// (`loadTab`), which moved with it. `activeController`/`getPreset`/
+// the rest of the dashboard-toggles domain; the ORIGINAL `errorMessage` (this
+// file's own copy) moved onto `sessionScopeActions.ts` — it had exactly one
+// caller (`loadTab`), which moved with it. `activeController`/`getPreset`/
 // `getAvailableCommands`/`listTabs`/`setCustomMode`/
 // `handleCustomModesConfigChanged`/`loadTab` moved onto
 // `sessionScopeActions.ts` (own docs moved there verbatim, including the
 // P7-N10 tombstone) with the rest of the sessions-scope domain.
+
+/**
+ * WS-C C1 (BH-01, round-2): a fresh local copy — this file went back to
+ * having exactly one caller (the `skills.toggle`/`toolsets.toggle` branch's
+ * failure-isolated panel re-push log line), the same one-name-per-file
+ * duplication `mcpAdminHandler.ts`/`checkpointActions.ts`/
+ * `panelDataCoordinator.ts`/`skillsAdminHandler.ts`/`sessionScopeActions.ts`
+ * each already carry (grepped before adding this — no shared export exists
+ * to reuse instead).
+ */
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}

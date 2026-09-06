@@ -15,6 +15,8 @@ import { PanelSourceRegistry } from '../../panels/PanelSourceRegistry';
 import { SessionRegistry } from '../session/SessionRegistry';
 import { RootRegistry } from '../../checkpoints/rootRegistry';
 import type { DataPanel, PanelDataMap, HostToWebview } from '../../../shared/protocol';
+import type { DashboardClientLike } from '../../dashboard/HermesDashboardClient';
+import type { DashboardService } from '../../dashboard/HermesDashboardManager';
 
 /**
  * F3-16 harness (reused by WS-GD.1 Tasks 6-7): a `vi.fn()`-free fake {@link
@@ -163,5 +165,84 @@ describe('ControlDispatcher — WS-GD.1 CA-M19 [SECURITY]: push-channel redactio
     expect(push).toBeDefined();
     const providers = (push?.data as unknown as { providers: Array<{ token: unknown }> } | undefined)?.providers;
     expect(providers?.[0]?.token).toBe('[redacted]'); // walked by the SAME deny-list the response path uses
+  });
+});
+
+/**
+ * BH-01 (round-2, WS-C C1): `skills.toggle`/`toolsets.toggle` used to return
+ * the toggle RPC result with NO re-push — the config persisted server-side,
+ * but the webview's `useToggle` V-11 reconcile shows the (stale) last-pushed
+ * `serverValue` the instant the op settles, so the switch visibly "snapped
+ * back" even though the toggle worked. `fakeClient` implements the full
+ * {@link DashboardClientLike} surface (`vi.fn()`-free — plain closures, no
+ * call-recording needed here since these tests assert on the EMITTED PUSH /
+ * LOG, not on what reached the client).
+ */
+function makeFakeToggleClient(): DashboardClientLike {
+  return {
+    probe: async () => true,
+    listSkills: async () => [],
+    toggleSkill: async (name, enabled) => ({ ok: true, name, enabled }),
+    listToolsets: async () => [],
+    toggleToolset: async (name, enabled) => ({ ok: true, name, enabled }),
+  };
+}
+
+describe('ControlDispatcher — WS-C C1 (BH-01): toggle re-push', () => {
+  it('toolsets.toggle pushes the persisted tools panel BEFORE the toggle RPC resolves', async () => {
+    const dashboard: DashboardService = { ensure: async () => makeFakeToggleClient(), dispose() {} };
+    const { port, emitted, registry } = makePort({ getDashboard: () => dashboard });
+    registerFakeSource(registry, 'tools', async () => ({
+      data: { toolsets: [{ name: 'web', enabled: true, toolCount: 1 }], tools: [] },
+    }));
+    const dispatcher = new ControlDispatcher(port);
+
+    let pushedBeforeResolve = false;
+    const raw = await dispatcher.invokeControl('toolsets.toggle', { name: 'web', enabled: true }).then((r) => {
+      pushedBeforeResolve = emitted.some((m) => m.type === 'panel.data' && m.panel === 'tools');
+      return r;
+    });
+    expect(raw).toEqual({ ok: true, name: 'web', enabled: true });
+    expect(pushedBeforeResolve, 'the persisted panel is pushed BEFORE the toggle RPC resolves').toBe(true);
+  });
+
+  it('skills.toggle pushes the persisted skills panel BEFORE the toggle RPC resolves', async () => {
+    const dashboard: DashboardService = { ensure: async () => makeFakeToggleClient(), dispose() {} };
+    const { port, emitted, registry } = makePort({ getDashboard: () => dashboard });
+    registerFakeSource(registry, 'skills', async () => ({
+      data: {
+        skills: [{ id: 'my-skill', name: 'my-skill', category: 'coding', description: 'x', enabled: true }],
+        categories: [],
+      },
+    }));
+    const dispatcher = new ControlDispatcher(port);
+
+    let pushedBeforeResolve = false;
+    const raw = await dispatcher.invokeControl('skills.toggle', { name: 'my-skill', enabled: true }).then((r) => {
+      pushedBeforeResolve = emitted.some((m) => m.type === 'panel.data' && m.panel === 'skills');
+      return r;
+    });
+    expect(raw).toEqual({ ok: true, name: 'my-skill', enabled: true });
+    expect(pushedBeforeResolve, 'the persisted panel is pushed BEFORE the toggle RPC resolves').toBe(true);
+  });
+
+  it('toolsets.toggle: a rejecting re-push still resolves the toggle result and logs exactly one line naming the method and "re-push"', async () => {
+    const dashboard: DashboardService = { ensure: async () => makeFakeToggleClient(), dispose() {} };
+    const logLines: string[] = [];
+    const { port, registry } = makePort({
+      getDashboard: () => dashboard,
+      logger: { append: (line) => logLines.push(line) },
+    });
+    registerFakeSource(registry, 'tools', async (): Promise<{ data: PanelDataMap['tools'] }> => {
+      throw new Error('dashboard unreachable');
+    });
+    const dispatcher = new ControlDispatcher(port);
+
+    const raw = await dispatcher.invokeControl('toolsets.toggle', { name: 'web', enabled: true });
+
+    expect(raw).toEqual({ ok: true, name: 'web', enabled: true });
+    expect(logLines).toHaveLength(1);
+    expect(logLines[0]).toEqual(expect.stringContaining('toolsets.toggle'));
+    expect(logLines[0]).toEqual(expect.stringContaining('re-push'));
   });
 });

@@ -160,6 +160,33 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
     });
   });
 
+  it('BH-01 (ADR-R2-04): a toggle that SETTLES followed by the host\'s AGREEING re-push stays flipped', async () => {
+    let resolveToggle: (() => void) | undefined;
+    const onToggle = () => new Promise<void>((res) => { resolveToggle = res; });
+    const { user, rerender } = setup(
+      <SkillsPanel data={skillsData(false)} onToggle={onToggle} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+    const toggle = () => screen.getByRole('switch', { name: 'Enable web-search' });
+
+    await user.click(toggle());
+    expect(toggle()).toHaveAttribute('aria-checked', 'true'); // optimistic, still in flight
+
+    resolveToggle?.(); // the persist actually succeeds — the toggle SETTLES
+
+    // BH-01: the host re-pushes the PERSISTED panel BEFORE the toggle RPC
+    // resolves — the pushed `serverValue` AGREES with the toggle the user
+    // just made, so the switch must stay flipped, never "snap back".
+    await waitFor(() => {
+      rerender(
+        <SkillsPanel data={skillsData(true)} onToggle={onToggle} onRefresh={noop} {...noopSkillsAdminProps()} />,
+      );
+      expect(
+        toggle(),
+        'an agreeing re-push after settle must leave the switch flipped, not revert it',
+      ).toHaveAttribute('aria-checked', 'true');
+    });
+  });
+
   it('TG-4 (AU-54), was beta.7 C3: the persist note renders ABOVE every skill row — a panel-level note, not the last group’s caption', () => {
     const data: SkillsData = {
       skills: [

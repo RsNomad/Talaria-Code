@@ -10,8 +10,10 @@
  * parallel calls race the `config.yaml` read-modify-write (`index.tsx:362`).
  *
  * The switch's on-state is `override ?? serverValue`: before any local toggle the
- * server's `enabled` shows through; after a toggle the optimistic value wins
- * (and stays — it equals the value we persisted).
+ * server's `enabled` shows through; after a toggle the optimistic value shows
+ * until the op settles; the host re-pushes the persisted panel BEFORE
+ * resolving the toggle RPC (ADR-R2-04), so the reconciled `serverValue` is the
+ * persisted one — an external later push still wins (V-11).
  *
  * ## Rollback baseline (Correctness M4)
  * A naive rollback to `!next` ASSUMES the pre-toggle state was `!next`. Under
