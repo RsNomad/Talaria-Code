@@ -1401,7 +1401,7 @@ function extractPanelName(params: Record<string, unknown> | undefined): string |
  * `panelFetch` signal for it.
  */
 function isDataPanel(name: string | undefined): name is DataPanel {
-  return name != null && name in PANEL_SCOPE;
+  return name != null && Object.hasOwn(PANEL_SCOPE, name);
 }
 
 /** Map VS Code's `ColorThemeKind` enum to the {@link ThemeKind} the webview themes on. */

@@ -1846,6 +1846,40 @@ describe('TalariaViewProvider — onWebviewSignal observability seam (Task 4, §
 
     expect(signals).toEqual([]);
   });
+
+  it("fires NO signal for the inherited prototype key 'constructor' (L2-CA-23: isDataPanel must use an own-property check, not `in`)", async () => {
+    const { provider } = makeProvider(vi.fn().mockResolvedValue({ ok: true }));
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      instanceId: 'test-instance',
+      requestId: 104,
+      method: 'panel.data',
+      params: { panel: 'constructor' },
+    } as never);
+    await flush();
+
+    expect(signals).toEqual([]);
+  });
+
+  it("fires NO signal for the inherited prototype key '__proto__' (L2-CA-23: isDataPanel must use an own-property check, not `in`)", async () => {
+    const { provider } = makeProvider(vi.fn().mockResolvedValue({ ok: true }));
+    const signals: WebviewSignal[] = [];
+    provider.onWebviewSignal((s) => signals.push(s));
+
+    seam(provider).handleWebviewMessage({
+      type: 'control.request',
+      instanceId: 'test-instance',
+      requestId: 105,
+      method: 'panel.data',
+      params: { panel: '__proto__' },
+    } as never);
+    await flush();
+
+    expect(signals).toEqual([]);
+  });
 });
 
 /*
