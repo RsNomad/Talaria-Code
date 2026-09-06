@@ -1120,6 +1120,9 @@ export class SessionController {
       const timer = setTimeout(() => {
         this.settlePendingApprovals('expired', { onlyApprovalId: approvalId });
       }, approval.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS);
+      // BH-04 (Lens-R2, WS-B Task 2): never keep the process alive — mirrors
+      // every other host-side timer in this file (:514, :620).
+      timer.unref?.();
       this.pendingApprovals.set(approvalId, {
         resolve,
         toolId: req.toolCall.toolCallId,
@@ -1539,6 +1542,11 @@ export class SessionController {
     // suppress the NEXT turn's fallback on a reused controller — regressing
     // the exact "Stop looks dead" bug F3-4 fixes, with no error surfaced.
     this.clearCancelFallback();
+    // BH-04 (Lens-R2, WS-B Task 2): settle any pending approval BEFORE the
+    // arm's closing `turn.end` below — unfixed, a pending approval's ACP
+    // promise was left hanging (never resolved) and its card kept looking
+    // live in the webview after the turn had already closed.
+    this.settlePendingApprovals('cancelled');
     if (this.liveTurnId !== undefined) {
       const deadTurnId = this.liveTurnId;
       this.liveTurnId = undefined;
@@ -1576,6 +1584,9 @@ export class SessionController {
     // identical comment — defensive symmetry with dispose(), clears a
     // stranded cancel-fallback timer handle.
     this.clearCancelFallback();
+    // BH-04 (Lens-R2, WS-B Task 2): see endOnCrash's identical comment —
+    // settle any pending approval BEFORE the arm's closing `turn.end` below.
+    this.settlePendingApprovals('cancelled');
     if (this.liveTurnId !== undefined) {
       const deadTurnId = this.liveTurnId;
       this.liveTurnId = undefined;

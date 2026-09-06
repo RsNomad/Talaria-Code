@@ -2842,3 +2842,143 @@ describe('SessionController.handlePermission — BH-03: turn-liveness on the N1 
     expect(emitted.some((m) => (m as { type?: string }).type === 'approval.request')).toBe(false);
   });
 });
+
+/**
+ * BH-04 (Lens-R2, WS-B Task 2): settle pending approvals on crash/restart.
+ * Neither `endOnCrash` nor `endForRestart` called `settlePendingApprovals`,
+ * so a pending approval's ACP promise was left hanging (never resolved) and
+ * its card kept looking live in the webview after the arm's closing
+ * `turn.end` had already fired. The fix settles every pending approval
+ * `'cancelled'` near the top of each method — BEFORE the arm's `turn.end`
+ * emit, so the webview sees the card resolve before the turn closes.
+ *
+ * Reuses the T-A0 settle-spine suite's `makeCommandReq` shape (an
+ * `execute`-kind request needs no real fs canonicalization, so
+ * `handlePermission`'s one await resolves in a couple of microtask hops)
+ * and drives a LIVE prompt turn (hanging `client.prompt`) so `endOnCrash`/
+ * `endForRestart` take their live-turn arm.
+ *
+ * The pending-promise resolution is observed via a `.then` side-channel
+ * (not a bare `await`) so a still-unfixed method's permanently-hanging
+ * promise fails the assertion fast (mismatched sentinel) instead of hanging
+ * the test.
+ */
+describe('SessionController.endOnCrash / endForRestart — BH-04 (Lens-R2, WS-B Task 2): settle pending approvals', () => {
+  /** Mirrors the T-A0 suite's `makeCommandReq` — an `execute`-kind request
+   *  so `buildPresentEffectSignals` needs no real fs canonicalization. */
+  function makeCommandReq(command: string, toolCallId = 'cmd-1'): AcpRequestPermissionRequest {
+    return {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId,
+        title: `Run: ${command}`,
+        kind: 'execute',
+        content: [{ content: { type: 'text', text: `$ ${command}` } }],
+        rawInput: { command, description: 'run' },
+      },
+    };
+  }
+
+  function makeHarness(): { controller: SessionController; emitted: HostToWebviewMessage[] } {
+    const emitted: HostToWebviewMessage[] = [];
+    const client = {
+      cancel: async () => undefined,
+      prompt: () => new Promise<never>(() => {}),
+    } as unknown as AcpClientLike;
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', '/fake/ws', port);
+    return { controller, emitted };
+  }
+
+  /** Flushes the microtask queue N times — same rationale as the T-A0
+   *  suite's `flushMicrotasks`: no real timers/I/O in this suite's fakes. */
+  async function flush(times = 4): Promise<void> {
+    for (let i = 0; i < times; i++) await Promise.resolve();
+  }
+
+  const STILL_PENDING = Symbol('still-pending');
+
+  it("endOnCrash settles a pending approval 'cancelled' BEFORE the live arm's turn.end{error}, and resolves the ACP promise", async () => {
+    const { controller, emitted } = makeHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await flush();
+
+    const pending = controller.handlePermission(makeCommandReq('npm test'), 'appr-crash-1');
+    await flush();
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+
+    let outcome: unknown = STILL_PENDING;
+    void pending.then((r) => {
+      outcome = r;
+    });
+
+    controller.endOnCrash();
+    await flush();
+
+    expect(outcome).toEqual(buildCancelledOutcome());
+
+    const settleIndex = emitted.findIndex((m) => m.type === 'approval.settle');
+    const endIndex = emitted.findIndex((m) => m.type === 'turn.end');
+    expect(settleIndex).toBeGreaterThanOrEqual(0);
+    expect(endIndex).toBeGreaterThanOrEqual(0);
+    expect(settleIndex).toBeLessThan(endIndex); // settle BEFORE the closing turn.end
+    expect(emitted[settleIndex]).toEqual({
+      type: 'approval.settle',
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      id: 'appr-crash-1',
+      toolId: 'cmd-1',
+      outcome: 'cancelled',
+    });
+    expect(emitted[endIndex]).toEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'error' }),
+    );
+  });
+
+  it("endForRestart settles a pending approval 'cancelled' BEFORE the live arm's turn.end{cancelled}, and resolves the ACP promise", async () => {
+    const { controller, emitted } = makeHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await flush();
+
+    const pending = controller.handlePermission(makeCommandReq('npm test'), 'appr-restart-1');
+    await flush();
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+
+    let outcome: unknown = STILL_PENDING;
+    void pending.then((r) => {
+      outcome = r;
+    });
+
+    controller.endForRestart();
+    await flush();
+
+    expect(outcome).toEqual(buildCancelledOutcome());
+
+    const settleIndex = emitted.findIndex((m) => m.type === 'approval.settle');
+    const endIndex = emitted.findIndex((m) => m.type === 'turn.end');
+    expect(settleIndex).toBeGreaterThanOrEqual(0);
+    expect(endIndex).toBeGreaterThanOrEqual(0);
+    expect(settleIndex).toBeLessThan(endIndex); // settle BEFORE the closing turn.end
+    expect(emitted[settleIndex]).toEqual({
+      type: 'approval.settle',
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      id: 'appr-restart-1',
+      toolId: 'cmd-1',
+      outcome: 'cancelled',
+    });
+    expect(emitted[endIndex]).toEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'cancelled' }),
+    );
+  });
+});
