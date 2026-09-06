@@ -7,6 +7,7 @@ import {
   reshapeModelOptions,
   reshapeConfigShow,
   unwrapConfigFull,
+  unwrapRecord,
 } from './reshapePanelData';
 import { must } from '../../testing/must';
 import { McpPanelSource } from './panelSources';
@@ -851,5 +852,35 @@ describe('unwrapConfigFull (A-01 — the config.get{key:"full"} envelope)', () =
   it('the envelope wins when both `config` and a top-level `mcp_servers` are present', () => {
     const both = { config: { mcp_servers: { inner: {} } }, mcp_servers: { outer: {} } };
     expect(Object.keys(unwrapConfigFull(both).mcp_servers ?? {})).toEqual(['inner']);
+  });
+});
+
+describe('unwrapRecord (ADR-R2-05 — the source-ingress null-total guard, L2-CA-02)', () => {
+  it('passes a well-formed record through unchanged (no log line, same reference)', () => {
+    const lines: string[] = [];
+    const logger = { append: (line: string) => lines.push(line) };
+    const raw = { toolsets: [] };
+    expect(unwrapRecord(raw, 'tools.list', logger)).toBe(raw);
+    expect(lines).toEqual([]);
+  });
+
+  it('coerces null/undefined/a bare string/an array to {} and logs exactly one line per call, naming the wire method', () => {
+    const lines: string[] = [];
+    const logger = { append: (line: string) => lines.push(line) };
+    expect(unwrapRecord(null, 'tools.list', logger)).toEqual({});
+    expect(unwrapRecord(undefined, 'skills.manage', logger)).toEqual({});
+    expect(unwrapRecord('nonsense', 'model.options', logger)).toEqual({});
+    expect(unwrapRecord([1, 2], 'config.show', logger)).toEqual({});
+    expect(lines).toEqual([
+      '[panels] tools.list returned a non-object result — rendering empty',
+      '[panels] skills.manage returned a non-object result — rendering empty',
+      '[panels] model.options returned a non-object result — rendering empty',
+      '[panels] config.show returned a non-object result — rendering empty',
+    ]);
+  });
+
+  it('tolerates a missing logger — still coerces to {}, no throw', () => {
+    expect(unwrapRecord(null, 'config.show')).toEqual({});
+    expect(unwrapRecord('nope', 'session/list')).toEqual({});
   });
 });

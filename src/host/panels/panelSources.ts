@@ -22,6 +22,7 @@ import {
   reshapeSkillsList,
   reshapeToolsList,
   unwrapConfigFull,
+  unwrapRecord,
   type RawConfigShowResult,
   type RawModelOptionsResult,
   type RawSessionListResult,
@@ -97,7 +98,7 @@ export class ToolsPanelSource implements PanelSource<'tools'> {
 
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'tools'>> {
     const raw = await this.ctx.dispatch('tools.list', params);
-    return { data: reshapeToolsList(raw as RawToolsListResult) };
+    return { data: reshapeToolsList(unwrapRecord(raw, 'tools.list', this.ctx.logger) as RawToolsListResult) };
   }
 }
 
@@ -114,7 +115,9 @@ export class SkillsPanelSource implements PanelSource<'skills'> {
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'skills'>> {
     const dispatchParams = { ...(params as Record<string, unknown> | undefined), action: 'list' };
     const raw = await this.ctx.dispatch('skills.manage', dispatchParams);
-    return { data: reshapeSkillsList(raw as RawSkillsManageListResult) };
+    return {
+      data: reshapeSkillsList(unwrapRecord(raw, 'skills.manage', this.ctx.logger) as RawSkillsManageListResult),
+    };
   }
 }
 
@@ -124,7 +127,7 @@ export class ModelsPanelSource implements PanelSource<'models'> {
 
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'models'>> {
     const raw = await this.ctx.dispatch('model.options', params);
-    return { data: reshapeModelOptions(raw as RawModelOptionsResult) };
+    return { data: reshapeModelOptions(unwrapRecord(raw, 'model.options', this.ctx.logger) as RawModelOptionsResult) };
   }
 }
 
@@ -134,7 +137,7 @@ export class SettingsPanelSource implements PanelSource<'settings'> {
 
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'settings'>> {
     const raw = await this.ctx.dispatch('config.show', params);
-    return { data: reshapeConfigShow(raw as RawConfigShowResult) };
+    return { data: reshapeConfigShow(unwrapRecord(raw, 'config.show', this.ctx.logger) as RawConfigShowResult) };
   }
 }
 
@@ -165,7 +168,10 @@ export class McpPanelSource implements PanelSource<'mcp'>, ToggleNameCache {
     // toggle-name cache and the reshaper read the same unwrapped payload.
     const rawConfig = unwrapConfigFull(config);
     this.knownNames = new Set(Object.keys(rawConfig.mcp_servers ?? {}));
-    const data: McpData = reshapeMcpServers(rawConfig, tools as RawToolsListResult);
+    const data: McpData = reshapeMcpServers(
+      rawConfig,
+      unwrapRecord(tools, 'tools.list', this.ctx.logger) as RawToolsListResult,
+    );
     return { data };
   }
 
@@ -309,7 +315,10 @@ export class SessionsPanelSource implements PanelSource<'sessions'> {
     // TG-5 (AU-51, INV-20): drop any ephemeral one-shot session id
     // (`OneShotRunner`'s `session/new` mints) before it ever enters the
     // accumulated page — see `reshapeSessionsList`'s own doc.
-    const page: SessionsData = reshapeSessionsList(raw as RawSessionListResult, this.ctx.getOneShotSessionIds());
+    const page: SessionsData = reshapeSessionsList(
+      unwrapRecord(raw, 'session/list', this.ctx.logger) as RawSessionListResult,
+      this.ctx.getOneShotSessionIds(),
+    );
 
     for (const session of page.sessions) {
       if (bucket.seenIds.has(session.id)) continue;
