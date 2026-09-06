@@ -1525,13 +1525,12 @@ export class SessionController {
   // --- crash / dispose ----------------------------------------------------
 
   /**
-   * T1a best-effort crash handling — moved off the per-session branch of
-   * `AcpBackend.handleAcpCrash` (`:2416-2434` in the pre-extraction file).
-   * The router iterates the registry and calls this on every controller
-   * (T1b generalizes this into the full "one reconnecting signal / per-tab
-   * session-lost" fan-out).
+   * FI-02 (Lens-R2, WS-S): the ONE crash/restart turn bracket shared by
+   * {@link endOnCrash} and {@link endForRestart} — `status` is the only
+   * difference between the two public entry points (crash = `'error'`,
+   * explicit restart = `'cancelled'`).
    */
-  endOnCrash(): void {
+  private endTurnBracket(status: 'error' | 'cancelled'): void {
     // M1 (Task 8 follow-up, concurrency-lens review): defensive symmetry with
     // dispose() — this method clears the turn bookkeeping directly (bypassing
     // emitTurnEnd) and, unfixed, left an armed cancelFallbackTimer stranded.
@@ -1552,16 +1551,27 @@ export class SessionController {
       this.liveTurnId = undefined;
       this.currentTurnId = undefined;
       this.port.root.releaseTurnLease(this.sessionId);
-      this.port.emit({ type: 'turn.end', turnId: deadTurnId, sessionId: this.sessionId, status: 'error' });
+      this.port.emit({ type: 'turn.end', turnId: deadTurnId, sessionId: this.sessionId, status });
       this.markSubagentsInterrupted();
     } else if (this.replay !== undefined) {
       const deadReplayTurnId = this.replay.currentTurnId;
       this.subagents.setReplaying(false);
       this.replay = undefined;
       this.currentTurnId = undefined;
-      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status: 'error' });
+      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status });
       this.markSubagentsInterrupted();
     }
+  }
+
+  /**
+   * T1a best-effort crash handling — moved off the per-session branch of
+   * `AcpBackend.handleAcpCrash` (`:2416-2434` in the pre-extraction file).
+   * The router iterates the registry and calls this on every controller
+   * (T1b generalizes this into the full "one reconnecting signal / per-tab
+   * session-lost" fan-out).
+   */
+  endOnCrash(): void {
+    this.endTurnBracket('error');
   }
 
   /**
@@ -1580,28 +1590,7 @@ export class SessionController {
    * port is live — the same reasoning that lets `endOnCrash` emit safely.
    */
   endForRestart(): void {
-    // M1 (Task 8 follow-up, concurrency-lens review): see endOnCrash's
-    // identical comment — defensive symmetry with dispose(), clears a
-    // stranded cancel-fallback timer handle.
-    this.clearCancelFallback();
-    // BH-04 (Lens-R2, WS-B Task 2): see endOnCrash's identical comment —
-    // settle any pending approval BEFORE the arm's closing `turn.end` below.
-    this.settlePendingApprovals('cancelled');
-    if (this.liveTurnId !== undefined) {
-      const deadTurnId = this.liveTurnId;
-      this.liveTurnId = undefined;
-      this.currentTurnId = undefined;
-      this.port.root.releaseTurnLease(this.sessionId);
-      this.port.emit({ type: 'turn.end', turnId: deadTurnId, sessionId: this.sessionId, status: 'cancelled' });
-      this.markSubagentsInterrupted();
-    } else if (this.replay !== undefined) {
-      const deadReplayTurnId = this.replay.currentTurnId;
-      this.subagents.setReplaying(false);
-      this.replay = undefined;
-      this.currentTurnId = undefined;
-      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status: 'cancelled' });
-      this.markSubagentsInterrupted();
-    }
+    this.endTurnBracket('cancelled');
   }
 
   /**
