@@ -711,17 +711,25 @@ interface LocationsToolOptions {
   readonly verb: (gateway: LspToolGateway, uri: string, position: PlainPosition) => Promise<readonly (PlainLocation | PlainLocationLink)[]>;
 }
 
-/** Classifies EVERY raw target (needed for the shaper's accurate "N
- * external" summary count over the FULL result set) but only reads a
- * snippet for the entries that will actually be shown after capping AND are
- * in-root — never for an external target, never for a beyond-cap entry.
+/** Classifies only the SHOWN prefix (the first `capLimit` targets —
+ * `shapeLocations` renders `shown` only and counts `externalCount` over that
+ * same shown set) and only reads a snippet for the shown entries that are
+ * also in-root — never for an external target, never for a beyond-cap entry.
  *
- * AU-20: each target's `classifyUri`/`readSnippet` pair runs through the
- * SAME 4-slot pool the gateway call already used — a raw `Promise.all` here
- * would fan out unboundedly (a symbol with hundreds of references). The
- * gateway call that produced `raw` has already resolved and released its
- * pool slot by the time this function runs (`handleLocationsTool` awaits it
- * first), so there is no re-entrant `pool.run` nesting. */
+ * L2-CA-20 (Lens-R2, [SEC]): classifying the FULL raw result before capping
+ * was agent-controlled unbounded FS work — a hot symbol with hundreds/
+ * thousands of references paid for a realpath per target even though only
+ * `capLimit` are ever shown. The beyond-cap tail is paired with the cheap,
+ * never-classified `UNCLASSIFIED_TAIL_VERDICT` placeholder instead, mirroring
+ * the landed M-2 fix for `lsp_workspace_symbols` (see that constant's doc and
+ * `handleWorkspaceSymbols` below).
+ *
+ * AU-20: each shown target's `classifyUri`/`readSnippet` pair still runs
+ * through the SAME 4-slot pool the gateway call already used — a raw
+ * `Promise.all` here would fan out unboundedly even bounded to `capLimit`
+ * entries. The gateway call that produced `raw` has already resolved and
+ * released its pool slot by the time this function runs (`handleLocationsTool`
+ * awaits it first), so there is no re-entrant `pool.run` nesting. */
 async function buildLocationTargets(
   deps: LspToolDeps,
   raw: readonly (PlainLocation | PlainLocationLink)[],
@@ -730,17 +738,23 @@ async function buildLocationTargets(
 ): Promise<LocationTarget[]> {
   const coalesced = raw.map(coalesceTarget);
   return Promise.all(
-    coalesced.map((target, index) =>
-      deps.pool.run(async () => {
+    coalesced.map((target, index) => {
+      // CA-20 (Lens-R2, [SEC]): only the shown prefix is classified — the beyond-cap tail is
+      // never rendered (shapeLocations renders `shown` only), so pair it with the cheap
+      // UNCLASSIFIED_TAIL_VERDICT placeholder instead of paying a realpath per agent-supplied
+      // location. Mirrors the landed M-2 lsp_workspace_symbols shape.
+      if (index >= capLimit) {
+        return Promise.resolve<LocationTarget>({ range: target.range, verdict: UNCLASSIFIED_TAIL_VERDICT });
+      }
+      return deps.pool.run(async () => {
         const verdict = await deps.classifyUri(target.uri);
-        const withinCap = index < capLimit;
-        if (verdict.inRoot && withinCap) {
+        if (verdict.inRoot) {
           const snippet = await deps.readSnippet(target.uri, target.range, snippetMaxLines);
           return { range: target.range, verdict: snippet === undefined ? verdict : { ...verdict, snippet } };
         }
         return { range: target.range, verdict };
-      }),
-    ),
+      });
+    }),
   );
 }
 
