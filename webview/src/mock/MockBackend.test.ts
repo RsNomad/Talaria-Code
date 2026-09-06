@@ -588,6 +588,20 @@ describe('webview MockBackend — WS-A T5c (BH-05): settle echo, per-step gate i
     expect(messages).toEqual([]);
   });
 
+  it('diff.resolve REJECT on the DIFF-LESS npm-test gate (tool-test-1, no tool.diff steps) is a no-op — no hunks means no aggregation state at all, mirroring SessionController.resolveDiff\'s total===0 no-op', async () => {
+    const { backend, messages, sessionId } = await bootToEditGate();
+    backend.handle({ type: 'approval.respond', sessionId, id: mockApprovalId, optionId: 'allow_once' });
+    await vi.advanceTimersByTimeAsync(6000);
+    const commandGate = messages.at(-1);
+    expect(commandGate).toMatchObject({ type: 'approval.request', kind: 'command', id: 'appr-2', toolId: 'tool-test-1' });
+    messages.length = 0;
+
+    backend.handle({ type: 'diff.resolve', sessionId, toolId: 'tool-test-1', hunkIndex: 0, action: 'reject' });
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(messages).toEqual([]);
+  });
+
   it('END-TO-END through the real reducer: the two cards land as edit-approval-1 → "approved" (with its diff) and tc-… → "done" (no diff) — never one item going done', async () => {
     const { backend, messages, sessionId } = await bootToEditGate();
     backend.handle({ type: 'approval.respond', sessionId, id: mockApprovalId, optionId: 'allow_once' });

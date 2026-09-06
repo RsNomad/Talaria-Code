@@ -501,17 +501,26 @@ export class MockBackend {
    * the edit settles to its allow option once every hunk is accepted. An
    * out-of-range index is ignored (the host's BHF-F1-3 rule). No parked
    * approval, or a different toolId → silent no-op.
+   *
+   * Faithfulness note (parity with the host MockBackend's own guard): the
+   * REAL `SessionController.resolveDiff` only has `hunkState` for a toolId
+   * when `totalHunks > 0` (emitApprovalCard sets it only then) — a
+   * diff-less approval (e.g. the npm-test command gate) has no
+   * hunk-aggregation state at all, so its `resolveDiff` is an unconditional
+   * no-op regardless of `action`. `total === 0` mirrors that BEFORE the
+   * reject branch, so a reject on a diff-less parked gate is also a no-op.
    */
   private resolveParkedDiff(sessionId: string, toolId: string, hunkIndex: number, action: DiffAction): void {
     const player = this.players.get(sessionId);
     if (!player || player.parkedAt < 0) return;
     const parked = parkedApproval(player.parkedAt);
     if (!parked || parked.toolId !== toolId) return;
+    const total = totalHunksFor(toolId);
+    if (total === 0) return;
     if (action === 'reject') {
       this.settleAndResume(player, parked, findOptionId(parked.options, 'deny') ?? 'deny');
       return;
     }
-    const total = totalHunksFor(toolId);
     if (!Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= total) return;
     player.hunkDecisions.add(hunkIndex);
     if (player.hunkDecisions.size >= total) {

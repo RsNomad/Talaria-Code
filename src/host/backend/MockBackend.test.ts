@@ -254,4 +254,19 @@ describe('MockBackend — WS-A T5c (BH-05): settle echo, per-step gate id, per-h
     expect(acceptRun.messages[0]).toMatchObject({ type: 'approval.settle', id: acceptRun.editId, toolId: SYNTHETIC, optionId: 'allow_once' });
     acceptRun.backend.dispose();
   });
+
+  it('resolveDiff REJECT on the DIFF-LESS npm-test gate (tool-test-1, no tool.diff steps) is a no-op — no hunks means no aggregation state at all, the total===0 guard mirroring SessionController.resolveDiff', async () => {
+    const { backend, messages, editId } = await bootToEditGate();
+    backend.respondApproval(SESSION, editId, 'allow_once');
+    await vi.advanceTimersByTimeAsync(6000);
+    const commandGate = messages.at(-1);
+    expect(commandGate).toMatchObject({ type: 'approval.request', kind: 'command', id: 'appr-2', toolId: 'tool-test-1' });
+    messages.length = 0;
+
+    backend.resolveDiff(SESSION, 'tool-test-1', 0, 'reject');
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(messages).toEqual([]);
+    backend.dispose();
+  });
 });
