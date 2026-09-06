@@ -130,7 +130,7 @@ function settleOpenItems(list: TranscriptItem[]): TranscriptItem[] {
  * `findOptionId` (`SessionController.ts`) so the webview's optimistic
  * reject-fold denies via the SAME option the host itself would pick.
  */
-function findOptionId(options: ApprovalOption[], kind: ApprovalOption['kind']): string | undefined {
+export function findOptionId(options: ApprovalOption[], kind: ApprovalOption['kind']): string | undefined {
   return options.find((option) => option.kind === kind)?.id;
 }
 

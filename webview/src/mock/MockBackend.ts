@@ -3,12 +3,19 @@
  * ------------------------------------------------------------------
  * It receives webview->host messages and replays the SHARED scripted
  * host->webview stream (mirrored from src/shared/mockScenario.ts): a full agent
- * turn (reasoning -> tool -> diff -> approval -> plan -> message -> result) plus
- * static-but-real-looking panel payloads. This is the same message shape the
- * real host emits, so App renders identically either way.
+ * turn (reasoning -> read tool -> real patch tool card -> synthetic
+ * edit-approval diff card -> edit approval -> settle echo -> plan -> command
+ * approval -> settle echo -> message -> result) plus static-but-real-looking
+ * panel payloads. This is the same message shape the real host emits, so App
+ * renders identically either way.
  *
  * In the shipped extension the real host owns this contract; the MockBackend is
  * only wired in standalone dev (see bridge.attachMock).
+ *
+ * WS-A T5c (BH-05): the mock echoes `approval.settle` itself on every gate —
+ * production's settle comes from the host, not from Hermes — and mirrors the
+ * host's per-hunk `resolveDiff` aggregation, so the DiffCard's hunk buttons
+ * are driveable here too.
  *
  * W4-T3b (§7 B12): this is the ONLY place W4's multi-tab UI is driveable
  * pre-Fedora under the build-blind rule, so it now mints a REAL session PER
@@ -18,6 +25,7 @@
  * composer states with real (not merely typed) coverage.
  */
 import type {
+  DiffAction,
   EditPolicyPreset,
   GlobalPanel,
   HostToWebview,
@@ -29,10 +37,41 @@ import type {
   WebviewState,
 } from '../protocol';
 import { BOOTSTRAP_TAB_ID, makePanelData } from '../protocol';
-import { mockApprovalId, mockTheme, mockTurn, panelData } from './fixtures';
+import { mockTheme, mockTurn, panelData } from './fixtures';
 import { NEXT_EDIT_ROWS } from '../panels/nextEditCopy';
+import { findOptionId } from '../state/transcript';
 
 type Send = (msg: HostToWebview) => void;
+
+/** The `approval.request` variant — the message every `gate: 'approval'` step carries. */
+type ApprovalRequestMessage = Extract<HostToWebview, { type: 'approval.request' }>;
+
+/**
+ * WS-A T5c (BH-05): the scripted `approval.request` a player is parked on at
+ * step `index` — every `gate: 'approval'` step IS one — or undefined when the
+ * step is not such a request. Reading the gate off the PARKED STEP (not off
+ * the single `mockApprovalId` constant) is what lets a script carry several
+ * gates (the edit approval, then the npm-test approval) and resume each on
+ * its own id.
+ */
+function parkedApproval(index: number): ApprovalRequestMessage | undefined {
+  const message = mockTurn[index]?.message;
+  return message !== undefined && message.type === 'approval.request' ? message : undefined;
+}
+
+/**
+ * WS-A T5c (BH-05): total hunk count the script attaches to `toolId` via its
+ * `tool.diff` steps — the mock's stand-in for the host's
+ * `hunkState.totalHunks` (SessionController.emitApprovalCard).
+ */
+function totalHunksFor(toolId: string): number {
+  let total = 0;
+  for (const step of mockTurn) {
+    const message = step.message;
+    if (message.type === 'tool.diff' && message.toolId === toolId) total += message.hunks.length;
+  }
+  return total;
+}
 
 /**
  * Task 12 (§5.5/D7 re-base): the set of valid `nextEdit.toggle` sources,
@@ -85,6 +124,10 @@ interface SessionPlayer {
    * `prompt` arrives (the scripted `user` step is only ever emitted after
    * one has). */
   promptText: string;
+  /** WS-A T5c (BH-05): per-hunk ACCEPT decisions for the PARKED edit
+   * approval — the host's `hunkState.decisions` stand-in. Cleared on every
+   * settle, restart, cancel. */
+  hunkDecisions: Set<number>;
 }
 
 /**
@@ -159,7 +202,10 @@ export class MockBackend {
         this.handleControlRequest(msg);
         break;
       case 'approval.respond':
-        this.resumeParked(msg.sessionId, msg.id);
+        this.resumeParked(msg.sessionId, msg.id, msg.optionId);
+        break;
+      case 'diff.resolve':
+        this.resolveParkedDiff(msg.sessionId, msg.toolId, msg.hunkIndex, msg.action);
         break;
       case 'cancel':
         this.cancelTurn(msg.sessionId);
@@ -182,8 +228,8 @@ export class MockBackend {
         this.send({ type: 'model.state', sessionId: msg.sessionId, modelId: msg.modelId });
         break;
       default:
-        // setMode / diff.resolve / control.invoke / tab.close / tab.activate
-        // are acknowledged optimistically in the UI; nothing to echo in the
+        // setMode / control.invoke / tab.close / tab.activate are
+        // acknowledged optimistically in the UI; nothing to echo in the
         // mock.
         break;
     }
@@ -245,7 +291,7 @@ export class MockBackend {
   }
 
   private registerPlayer(sessionId: string): void {
-    this.players.set(sessionId, { sessionId, timers: [], parkedAt: -1, preset: 'manual', promptText: '' });
+    this.players.set(sessionId, { sessionId, timers: [], parkedAt: -1, preset: 'manual', promptText: '', hunkDecisions: new Set() });
   }
 
   /** W4 §2d/§7 B12: mint the next scaffold session id (`mock-session-N`). */
@@ -284,6 +330,7 @@ export class MockBackend {
     if (player) {
       this.clearTimers(player);
       player.parkedAt = -1;
+      player.hunkDecisions.clear();
     }
     this.emit({ type: 'clear', sessionId });
   }
@@ -400,6 +447,7 @@ export class MockBackend {
     if (!player) return;
     this.clearTimers(player);
     player.parkedAt = -1;
+    player.hunkDecisions.clear();
     player.promptText = text;
     this.playFrom(player, 0);
   }
@@ -424,15 +472,72 @@ export class MockBackend {
     });
   }
 
-  /** Resume `sessionId`'s parked script iff it is genuinely parked on
-   * `approvalId` — a mismatched or already-resolved session is a silent
-   * no-op (never resumes a DIFFERENT tab's script; the independent-parking
-   * guarantee B12 exists to exercise). */
-  private resumeParked(sessionId: string, approvalId: string): void {
+  /**
+   * Resume `sessionId`'s parked script iff it is genuinely parked on an
+   * `approval.request` whose id is `approvalId` — a mismatched id or an
+   * unparked session is a silent no-op (never resumes a DIFFERENT tab's
+   * script; the independent-parking guarantee B12 exists to exercise).
+   *
+   * WS-A T5c (BH-05): the gate's id is read off the PARKED STEP, so the
+   * script's second gate (the npm-test command approval) resumes on its own
+   * id; `mockApprovalId` names only the first. And — as the real host does in
+   * `SessionController.respondApproval` — the authoritative
+   * `approval.settle{selected, optionId}` is echoed BEFORE the script
+   * continues, carrying the option the user ACTUALLY chose (the webview folds
+   * the synthetic edit-approval card's Approved/Denied pill from it).
+   */
+  private resumeParked(sessionId: string, approvalId: string, optionId: string): void {
     const player = this.players.get(sessionId);
-    if (!player || player.parkedAt < 0 || approvalId !== mockApprovalId) return;
+    if (!player || player.parkedAt < 0) return;
+    const parked = parkedApproval(player.parkedAt);
+    if (!parked || parked.id !== approvalId) return;
+    this.settleAndResume(player, parked, optionId);
+  }
+
+  /**
+   * WS-A T5c (BH-05): the standalone mirror of `SessionController.resolveDiff`
+   * — a per-hunk decision on the diff of the PARKED edit approval. Any reject
+   * settles the WHOLE edit to its deny option at once; accepts accumulate and
+   * the edit settles to its allow option once every hunk is accepted. An
+   * out-of-range index is ignored (the host's BHF-F1-3 rule). No parked
+   * approval, or a different toolId → silent no-op.
+   */
+  private resolveParkedDiff(sessionId: string, toolId: string, hunkIndex: number, action: DiffAction): void {
+    const player = this.players.get(sessionId);
+    if (!player || player.parkedAt < 0) return;
+    const parked = parkedApproval(player.parkedAt);
+    if (!parked || parked.toolId !== toolId) return;
+    if (action === 'reject') {
+      this.settleAndResume(player, parked, findOptionId(parked.options, 'deny') ?? 'deny');
+      return;
+    }
+    const total = totalHunksFor(toolId);
+    if (!Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= total) return;
+    player.hunkDecisions.add(hunkIndex);
+    if (player.hunkDecisions.size >= total) {
+      this.settleAndResume(player, parked, findOptionId(parked.options, 'allow_once') ?? 'allow_once');
+    }
+  }
+
+  /**
+   * The real host's settlement echo (`SessionController.respondApproval` /
+   * `finishApproval`): emit the authoritative `approval.settle` for the parked
+   * approval FIRST, then un-park and continue the script from the next step.
+   * Stamped straight onto the player's own session (no restamp needed).
+   */
+  private settleAndResume(player: SessionPlayer, parked: ApprovalRequestMessage, optionId: string): void {
     const resume = player.parkedAt + 1;
     player.parkedAt = -1;
+    player.hunkDecisions.clear();
+    this.emit({
+      type: 'approval.settle',
+      sessionId: player.sessionId,
+      turnId: parked.turnId,
+      id: parked.id,
+      ...(parked.toolId !== undefined ? { toolId: parked.toolId } : {}),
+      outcome: 'selected',
+      optionId,
+    });
     this.playFrom(player, resume);
   }
 
@@ -441,6 +546,7 @@ export class MockBackend {
     if (player) {
       this.clearTimers(player);
       player.parkedAt = -1;
+      player.hunkDecisions.clear();
     }
     this.emit({ type: 'turn.end', turnId: 'turn-1', sessionId, status: 'cancelled' });
   }

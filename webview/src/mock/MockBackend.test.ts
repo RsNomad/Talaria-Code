@@ -10,6 +10,9 @@ import type { HostToWebview } from '../protocol';
 import { BOOTSTRAP_TAB_ID } from '../protocol';
 import { MockBackend } from './MockBackend';
 import { mockApprovalId, mockTurn } from './fixtures';
+import { INITIAL_STATE, type AppState } from '../types';
+import { reduce } from '../state/transcript';
+import { must } from '../testing/must';
 
 function makeHarness() {
   const messages: HostToWebview[] = [];
@@ -473,5 +476,140 @@ describe('fixtures — WS-A T5c (BH-05): manual edit-approval scene shape (pure 
     expect(firstGateAt).toBeLessThan(6000);
     expect(firstPostGateDelay).toBeGreaterThanOrEqual(0);
     expect(firstPostGateDelay).toBeLessThan(3000);
+  });
+});
+
+describe('webview MockBackend — WS-A T5c (BH-05): settle echo, per-step gate id, per-hunk resume', () => {
+  const REAL_TOOL = 'tc-8a4c2f1e9b3d';
+  const SYNTHETIC = 'edit-approval-1';
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Boot, bind the bootstrap tab, start a turn, run to the FIRST gate. */
+  async function bootToEditGate() {
+    vi.useFakeTimers();
+    const { backend, messages } = makeHarness();
+    backend.handle({ type: 'ready' });
+    const sessionId = (messages.find((m) => m.type === 'tab.bound') as { sessionId: string }).sessionId;
+    backend.handle({ type: 'prompt', sessionId, text: 'go', mode: 'default' });
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(forSession(messages, sessionId).at(-1)).toMatchObject({ type: 'approval.request', id: mockApprovalId, kind: 'edit', toolId: SYNTHETIC });
+    return { backend, messages, sessionId };
+  }
+
+  it('approval.respond on the edit gate echoes approval.settle{selected, the chosen optionId, toolId} FIRST, then the real tc-… card completes, then the script parks on the npm-test gate (exactly one settle so far)', async () => {
+    const { backend, messages, sessionId } = await bootToEditGate();
+    messages.length = 0;
+
+    backend.handle({ type: 'approval.respond', sessionId, id: mockApprovalId, optionId: 'allow_once' });
+
+    expect(messages[0]).toEqual({
+      type: 'approval.settle',
+      sessionId,
+      turnId: 'turn-1',
+      id: mockApprovalId,
+      toolId: SYNTHETIC,
+      outcome: 'selected',
+      optionId: 'allow_once',
+    });
+    await vi.advanceTimersByTimeAsync(6000);
+    const doneIdx = messages.findIndex((m) => m.type === 'tool.update' && m.toolId === REAL_TOOL && m.status === 'done');
+    expect(doneIdx).toBeGreaterThan(0);
+    expect(messages.filter((m) => m.type === 'approval.settle')).toHaveLength(1);
+    expect(messages.at(-1)).toMatchObject({ type: 'approval.request', kind: 'command' });
+    expect(messages.some((m) => m.type === 'tool.update' && m.toolId === SYNTHETIC)).toBe(false);
+  });
+
+  it('a respond whose id is NOT the parked gate is a silent no-op (nothing emitted, still parked)', async () => {
+    const { backend, messages, sessionId } = await bootToEditGate();
+    messages.length = 0;
+
+    backend.handle({ type: 'approval.respond', sessionId, id: 'appr-2', optionId: 'allow_once' });
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(messages).toEqual([]);
+  });
+
+  it('the SECOND gate resumes on ITS OWN id (read off the parked step), not on mockApprovalId', async () => {
+    const { backend, messages, sessionId } = await bootToEditGate();
+    backend.handle({ type: 'approval.respond', sessionId, id: mockApprovalId, optionId: 'allow_once' });
+    await vi.advanceTimersByTimeAsync(6000);
+    const second = messages.at(-1);
+    expect(second).toMatchObject({ type: 'approval.request', kind: 'command' });
+    const secondId = second?.type === 'approval.request' ? second.id : 'wrong-type';
+    expect(secondId).not.toBe(mockApprovalId);
+    messages.length = 0;
+
+    backend.handle({ type: 'approval.respond', sessionId, id: mockApprovalId, optionId: 'opt-once' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(messages).toEqual([]);
+
+    backend.handle({ type: 'approval.respond', sessionId, id: secondId, optionId: 'opt-once' });
+    expect(messages[0]).toMatchObject({ type: 'approval.settle', id: secondId, outcome: 'selected', optionId: 'opt-once' });
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(messages.at(-1)).toMatchObject({ type: 'turn.end', status: 'complete' });
+  });
+
+  it('diff.resolve REJECT on any hunk of the parked edit settles the WHOLE edit to its deny option and resumes (mirrors SessionController.resolveDiff)', async () => {
+    const { backend, messages, sessionId } = await bootToEditGate();
+    messages.length = 0;
+
+    backend.handle({ type: 'diff.resolve', sessionId, toolId: SYNTHETIC, hunkIndex: 1, action: 'reject' });
+
+    expect(messages[0]).toMatchObject({ type: 'approval.settle', id: mockApprovalId, toolId: SYNTHETIC, outcome: 'selected', optionId: 'deny' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(messages.some((m) => m.type === 'tool.update' && m.toolId === REAL_TOOL)).toBe(true);
+  });
+
+  it('diff.resolve ACCEPT settles to allow_once only once EVERY hunk is accepted; duplicate and out-of-range indexes never count', async () => {
+    const { backend, messages, sessionId } = await bootToEditGate();
+    messages.length = 0;
+
+    backend.handle({ type: 'diff.resolve', sessionId, toolId: SYNTHETIC, hunkIndex: 0, action: 'accept' });
+    backend.handle({ type: 'diff.resolve', sessionId, toolId: SYNTHETIC, hunkIndex: 0, action: 'accept' });
+    backend.handle({ type: 'diff.resolve', sessionId, toolId: SYNTHETIC, hunkIndex: 7, action: 'accept' });
+    backend.handle({ type: 'diff.resolve', sessionId, toolId: SYNTHETIC, hunkIndex: -1, action: 'accept' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(messages).toEqual([]);
+
+    backend.handle({ type: 'diff.resolve', sessionId, toolId: SYNTHETIC, hunkIndex: 1, action: 'accept' });
+    expect(messages[0]).toMatchObject({ type: 'approval.settle', id: mockApprovalId, toolId: SYNTHETIC, outcome: 'selected', optionId: 'allow_once' });
+  });
+
+  it('diff.resolve for a toolId that is NOT the parked approval is a silent no-op', async () => {
+    const { backend, messages, sessionId } = await bootToEditGate();
+    messages.length = 0;
+
+    backend.handle({ type: 'diff.resolve', sessionId, toolId: REAL_TOOL, hunkIndex: 0, action: 'reject' });
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(messages).toEqual([]);
+  });
+
+  it('END-TO-END through the real reducer: the two cards land as edit-approval-1 → "approved" (with its diff) and tc-… → "done" (no diff) — never one item going done', async () => {
+    const { backend, messages, sessionId } = await bootToEditGate();
+    backend.handle({ type: 'approval.respond', sessionId, id: mockApprovalId, optionId: 'allow_once' });
+    await vi.advanceTimersByTimeAsync(6000);
+    const second = messages.at(-1);
+    const secondId = second?.type === 'approval.request' ? second.id : 'wrong-type';
+    backend.handle({ type: 'approval.respond', sessionId, id: secondId, optionId: 'opt-once' });
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(messages.at(-1)).toMatchObject({ type: 'turn.end', status: 'complete' });
+
+    let state: AppState = INITIAL_STATE;
+    for (const m of messages) state = reduce(state, m);
+    const tab = must(state.tabs[state.activeTabId], 'no active tab after replay');
+    const tools = tab.transcript.filter((i) => i.kind === 'tool');
+    const synthetic = tools.find((i) => i.kind === 'tool' && i.toolId === SYNTHETIC);
+    const real = tools.find((i) => i.kind === 'tool' && i.toolId === REAL_TOOL);
+
+    expect(synthetic).toMatchObject({ status: 'approved', title: 'Edit: src/auth/login.ts' });
+    expect(synthetic?.kind === 'tool' ? synthetic.diffs?.length : undefined).toBe(1);
+    expect(real).toMatchObject({ status: 'done', title: 'patch (replace): src/auth/login.ts' });
+    expect(real?.kind === 'tool' ? real.diffs : 'wrong-kind').toBeUndefined();
+    const editApproval = tab.transcript.find((i) => i.kind === 'approval' && i.id === mockApprovalId);
+    expect(editApproval).toMatchObject({ settledOutcome: 'selected', resolvedOptionId: 'allow_once', toolId: SYNTHETIC });
   });
 });
