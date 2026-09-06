@@ -89,6 +89,31 @@ describe('buildDiffUriParts — W2 T4 F-D: pure talaria-diff: URI builder (parse
     });
   });
 
+  // R2 WS-A T5a (BH-05, CA-M17 id-safety): the synthetic tool.start's id
+  // (`edit-approval-1`, `edit_approval.py:264-283`'s `edit-approval-{n}`)
+  // must survive the `talaria-diff:` URI the "Open diff in editor" button
+  // builds/parses — hyphens are legal (`isSafePreviewId` only bans `/` and
+  // whitespace), so this pins the exact BH-05 id round-trips both sides.
+  it('round-trips the BH-05 synthetic tool.start id ("edit-approval-1") on both sides', () => {
+    const afterParts = buildDiffUriParts('after', 'sess-1', 'edit-approval-1', 'src/auth/login.ts');
+    expect(afterParts).toBeDefined();
+    expect(parseDiffUri(afterParts as DiffUriLike)).toEqual({
+      side: 'after',
+      sessionId: 'sess-1',
+      toolId: 'edit-approval-1',
+      path: 'src/auth/login.ts',
+    });
+
+    const beforeParts = buildDiffUriParts('before', 'sess-1', 'edit-approval-1', 'src/auth/login.ts');
+    expect(beforeParts).toBeDefined();
+    expect(parseDiffUri(beforeParts as DiffUriLike)).toEqual({
+      side: 'before',
+      sessionId: 'sess-1',
+      toolId: 'edit-approval-1',
+      path: 'src/auth/login.ts',
+    });
+  });
+
   it('round-trips through parseDiffUri for a variety of sessionId/toolId/path values', () => {
     const cases: Array<['before' | 'after', string, string, string]> = [
       ['before', 'session-1', 'tool-1', 'a.ts'],

@@ -10,6 +10,7 @@ import {
 } from './permission';
 import type { ApprovalRequestMessage } from './permission';
 import type { AcpRequestPermissionRequest, AcpToolCallFields } from './types';
+import { buildEditSignalFromResolved } from './policySignal';
 
 describe('mapApprovalOption', () => {
   it('uses the Hermes optionId directly as the protocol kind when known', () => {
@@ -309,6 +310,83 @@ describe('buildMinimalAskApproval (F5 fail-closed fallback card)', () => {
 
     expect(approval.options).toEqual([]);
     expect(approval.kind).toBe('command');
+  });
+});
+
+// R2 WS-A T5a (BH-05 regression anchor): feed the LITERAL Hermes
+// `edit_approval.py:264-283` request_permission payload shape through the
+// full host mapping chain (parse -> resolve -> synthetic tool.start) and
+// assert the card the human sees carries OUR resolved title end to end,
+// never the agent-authored `toolCall.title`. This is the [SEC] anti-spoof
+// proof for ADR-R2-02 / BH-05 and a Minor deferred from T3.
+describe('BH-05 contract: Hermes edit_approval request_permission → resolved client output', () => {
+  // `tool_call_id = f"edit-approval-{next(_PERMISSION_REQUEST_IDS)}"` and
+  // `title = f"Approve edit: {proposal.path}"` (edit_approval.py:264-283) —
+  // the literal agent-authored id/title this fix must never let through.
+  const req: AcpRequestPermissionRequest = {
+    sessionId: 'sess-1',
+    options: [
+      { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+      { optionId: 'deny', kind: 'reject_once', name: 'Deny' },
+    ],
+    toolCall: {
+      toolCallId: 'edit-approval-1',
+      title: 'Approve edit: src/auth/login.ts',
+      kind: 'edit',
+      content: [{ type: 'diff', path: 'src/auth/login.ts', oldText: 'a', newText: 'b' }],
+      rawInput: { tool: 'write_file', arguments: { path: 'src/auth/login.ts' } },
+    },
+  };
+
+  it('parse stage (mapPermissionRequest): routing id/kind/diffs are correct, but the title is STILL the agent\'s (resolution is a separate step)', () => {
+    const mapped = mapPermissionRequest(req, 'turn-1', 'appr-1');
+
+    expect(mapped.approval.id).toBe('appr-1');
+    expect(mapped.approval.toolId).toBe('edit-approval-1');
+    expect(mapped.approval.kind).toBe('edit');
+
+    expect(mapped.diffs.length).toBeGreaterThanOrEqual(1);
+    for (const diff of mapped.diffs) {
+      expect(diff.toolId).toBe('edit-approval-1');
+    }
+    const totalHunks = mapped.diffs.reduce((sum, diff) => sum + diff.hunks.length, 0);
+    expect(totalHunks).toBeGreaterThanOrEqual(1);
+
+    // Documents the [SEC] boundary: at THIS stage the title is still
+    // unvetted agent copy — `applyResolvedPresentation` is what re-labels it.
+    expect(mapped.approval.title).toBe('Approve edit: src/auth/login.ts');
+  });
+
+  it('resolve stage (applyResolvedPresentation): the card title becomes OUR canonical resolved path, never the agent\'s "Approve edit: …" — the anti-spoof assertion', () => {
+    const mapped = mapPermissionRequest(req, 'turn-1', 'appr-1');
+    const editSignal = buildEditSignalFromResolved(
+      [{ canonicalPath: '/workspace/src/auth/login.ts', relPath: 'src/auth/login.ts', insideWorkspace: true }],
+      true,
+    );
+
+    const resolved = applyResolvedPresentation(mapped.approval, editSignal);
+
+    expect(resolved.title).toBe('Edit: src/auth/login.ts');
+    expect(resolved.title).not.toBe(req.toolCall.title);
+    expect(resolved.kind).toBe('edit');
+  });
+
+  it('synthetic tool.start (buildPermissionToolStart): the card the human sees carries the RESOLVED title/kind, never the agent\'s title — the whole chain never lets "Approve edit: …" reach the card', () => {
+    const mapped = mapPermissionRequest(req, 'turn-1', 'appr-1');
+    const editSignal = buildEditSignalFromResolved(
+      [{ canonicalPath: '/workspace/src/auth/login.ts', relPath: 'src/auth/login.ts', insideWorkspace: true }],
+      true,
+    );
+    const resolved = applyResolvedPresentation(mapped.approval, editSignal);
+
+    const start = buildPermissionToolStart(req.toolCall, resolved);
+
+    expect(start.toolId).toBe('edit-approval-1');
+    expect(start.kind).toBe('edit');
+    expect(start.status).toBe('pending');
+    expect(start.title).toBe(resolved.title);
+    expect(start.title).toBe('Edit: src/auth/login.ts');
+    expect(start.title).not.toBe(req.toolCall.title);
   });
 });
 
