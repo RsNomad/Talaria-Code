@@ -18,6 +18,17 @@ import type {
 
 const SINGLE_LINE_MAX_TOKENS = 128;
 const MULTILINE_MAX_TOKENS = 256;
+/** L2-CA-01: hard ceiling on the streamed completion the engine will
+ *  accumulate in memory. The reader in `http.ts` already caps total BYTES
+ *  received off the wire (`MAX_STREAM_BYTES`, 4 MiB) — this is a second,
+ *  independent cap on the DECODED completion string itself (a pathological
+ *  stream can otherwise grow `completion` unbounded before that byte cap is
+ *  ever reached). Breaking out of the `for await` below drives the backend
+ *  generator's `.return()` (standard `for await...of` IteratorClose on early
+ *  exit), which the reader's own `finally` (see `http.ts`'s
+ *  `readNdjsonLines`/`readSseEvents` F7 comment) already uses to cancel the
+ *  underlying socket — no second cancel needed here. */
+const MAX_COMPLETION_CHARS = 16 * 1024;
 
 /** CA-06-face + CA-06-path-face — the notice seam's verdict union and shape.
  *  Host-pure: plain types, no vscode. 'content-block'/'allow' are the
@@ -196,6 +207,10 @@ export class FimEngine {
     for await (const delta of this.backend.streamFim(req, signal)) {
       if (signal.aborted) return undefined;
       completion += delta;
+      if (completion.length > MAX_COMPLETION_CHARS) {
+        completion = completion.slice(0, MAX_COMPLETION_CHARS);
+        break;
+      }
       if (!multiline) {
         const newlineIdx = completion.indexOf('\n');
         if (newlineIdx !== -1) {

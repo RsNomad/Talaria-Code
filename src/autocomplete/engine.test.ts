@@ -25,12 +25,24 @@ class FakeBackend implements FimBackend {
   };
   calls: FimRequest[] = [];
   chunks: string[] = ['hello'];
+  /** WS-D D1 (L2-CA-01): set in a `finally` around the generator body, so it
+   *  observes EVERY exit path — including the consumer's `for await` `break`,
+   *  which drives the async-iteration protocol's `.return()` on this
+   *  generator (IteratorClose). Combined with a `chunks` fixture that has
+   *  more data than the cap allows in its first entry, a `true` reading here
+   *  after a capped completion demonstrates the engine actually stopped
+   *  pulling from the stream rather than merely truncating the string. */
+  returned = false;
 
   async *streamFim(req: FimRequest, signal: AbortSignal): AsyncIterable<string> {
     this.calls.push(req);
-    for (const chunk of this.chunks) {
-      if (signal.aborted) return;
-      yield chunk;
+    try {
+      for (const chunk of this.chunks) {
+        if (signal.aborted) return;
+        yield chunk;
+      }
+    } finally {
+      this.returned = true;
     }
   }
 }
@@ -556,6 +568,22 @@ describe('CA-07 — the cache key discriminates suffix / filepath / languageId',
     await completeOnce(cache, {});
     await completeOnce(cache, {});
     expect(must(cache.gets[0]).contextKey).toBe(must(cache.gets[1]).contextKey);
+  });
+});
+
+describe('L2-CA-01 — engine caps the streamed completion length and cancels the backend stream', () => {
+  it('truncates a runaway multiline stream to MAX_COMPLETION_CHARS (16 KiB) and drives the backend generator return()', async () => {
+    const backend = new FakeBackend();
+    // First chunk alone already exceeds the 16 KiB cap; a second chunk
+    // ('b') remains queued so a natural (non-early) exhaustion would have
+    // consumed it too — the engine must never ask for it.
+    backend.chunks = ['a'.repeat(20_000), 'b'];
+    const engine = makeEngine(backend, options({ multiline: 'always' }));
+
+    const result = await engine.complete(ctx(), { manual: true }, new AbortController().signal);
+
+    expect(result?.text.length).toBe(16 * 1024);
+    expect(backend.returned).toBe(true);
   });
 });
 
