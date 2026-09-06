@@ -38,14 +38,30 @@ import { handleSessionChange, sessionToTab } from './tabs';
  * CA-M15: hard cap on transcript items per tab. The reducer keeps the last
  * MAX_TRANSCRIPT_ITEMS and records the running drop count in `TabState.
  * hiddenCount`. The active turn's items are always at the tail, so trimming
- * the oldest settled items never orphans an in-flight streaming fold.
+ * the oldest settled items never orphans an in-flight streaming fold — CA-09
+ * (below) makes this a structural guarantee of `capTranscript` itself rather
+ * than an assumption a single oversized turn could violate.
  */
 export const MAX_TRANSCRIPT_ITEMS = 500;
 
 function capTranscript(tab: TabState): TabState {
   const over = tab.transcript.length - MAX_TRANSCRIPT_ITEMS;
   if (over <= 0) return tab;
-  return { ...tab, transcript: tab.transcript.slice(over), hiddenCount: (tab.hiddenCount ?? 0) + over };
+  // CA-09: SOFT, turn-aware — never trim the active turn (its items are provably at
+  // the tail, and trimming its earlier items orphans in-flight folds / duplicates
+  // `messageId`). Trim only OLDER-turn items from the front, up to `over`.
+  const activeTurnId = tab.transcript[tab.transcript.length - 1]?.turnId;
+  const kept: TranscriptItem[] = [];
+  let trimmed = 0;
+  for (const item of tab.transcript) {
+    if (trimmed < over && item.turnId !== activeTurnId) {
+      trimmed++;
+      continue;
+    }
+    kept.push(item);
+  }
+  if (trimmed === 0) return tab;
+  return { ...tab, transcript: kept, hiddenCount: (tab.hiddenCount ?? 0) + trimmed };
 }
 
 /**
@@ -463,9 +479,14 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
     }
 
     case 'plan.update': {
-      const exists = tab.transcript.some((i) => i.kind === 'plan');
+      // CA-10 (OD-3): one plan card PER TURN. The predicate is scoped to
+      // `msg.turnId` so a later turn's update APPENDS its own card instead of
+      // rebinding whichever turn's card `some`/`map` found first — the old
+      // turn-blind predicate let turn 3's plan.update rewrite the card still
+      // sitting in turn 1's transcript position.
+      const exists = tab.transcript.some((i) => i.kind === 'plan' && i.turnId === msg.turnId);
       const transcript = exists
-        ? tab.transcript.map((i) => (i.kind === 'plan' ? { ...i, items: msg.items } : i))
+        ? tab.transcript.map((i) => (i.kind === 'plan' && i.turnId === msg.turnId ? { ...i, items: msg.items } : i))
         : [...closeOpenMessages(tab.transcript), { kind: 'plan' as const, turnId: msg.turnId, items: msg.items }];
       return { ...tab, plan: msg.items, transcript };
     }

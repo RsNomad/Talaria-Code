@@ -353,6 +353,12 @@ export const ChatView = memo(function ChatView({
   hiddenCount,
 }: ChatViewProps) {
   const hidden = hiddenCount ?? 0;
+  // CA-08: count ARRIVALS, not the live array's length. At the CA-M15 cap,
+  // `transcript.length` stops growing (the reducer trims one off the front
+  // for every one that arrives), so the unseen-pill's "new since I scrolled
+  // away" arithmetic must track total arrivals (`hiddenCount +
+  // transcript.length`), or the pill silently stops appearing at the cap.
+  const arrived = hidden + transcript.length;
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // UI#1: `pinnedRef` stays the single SYNCHRONOUS source of truth for the
@@ -395,9 +401,9 @@ export const ChatView = memo(function ChatView({
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < REPIN_BUFFER_PX;
     if (atBottom === pinnedRef.current) return;
     pinnedRef.current = atBottom;
-    // Just scrolled away: snapshot how much already existed, so later growth
+    // Just scrolled away: snapshot how much already arrived, so later growth
     // can be counted as "unseen" against this baseline.
-    if (!atBottom) unseenBaselineRef.current = transcript.length;
+    if (!atBottom) unseenBaselineRef.current = arrived;
     setPinned(atBottom);
   };
 
@@ -418,19 +424,23 @@ export const ChatView = memo(function ChatView({
     const lastItem = transcript[transcript.length - 1];
     if (lastItem && lastItem.kind === 'user' && lastItem.turnId !== lastTurnIdRef.current) {
       lastTurnIdRef.current = lastItem.turnId;
-      unseenBaselineRef.current = transcript.length;
+      unseenBaselineRef.current = arrived;
       if (!pinnedRef.current) {
         pinnedRef.current = true;
         setPinned(true);
       }
     }
     if (pinnedRef.current) endRef.current?.scrollIntoView({ block: 'end' });
-  }, [transcript]);
+    // CA-08: `hidden` (== hiddenCount ?? 0) is included alongside `transcript`
+    // because `arrived` — read above — depends on both; it changes only
+    // together with `transcript` in one reducer result (CA-M15's
+    // `capTranscript`), so this is cheap and honest, not a new re-run trigger.
+  }, [transcript, hidden]);
 
   // UI#1: how much has arrived since the user scrolled away — always 0
   // while pinned (nothing to "catch up" on) and the gate `!pinned &&
   // unseenCount > 0` below relies on that for hiding the pill on re-pin.
-  const unseenCount = pinned ? 0 : Math.max(0, transcript.length - unseenBaselineRef.current);
+  const unseenCount = pinned ? 0 : Math.max(0, arrived - unseenBaselineRef.current);
 
   if (transcript.length === 0) {
     return <Hero onStarter={onStarter} disabled={starterDisabled} onOpenSetup={onOpenSetup} />;

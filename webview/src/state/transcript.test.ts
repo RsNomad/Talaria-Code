@@ -3162,3 +3162,92 @@ describe('CA-M15: transcript length cap keeps the tail and records the drop coun
     expect(tab.hiddenCount ?? 0).toBe(0);
   });
 });
+
+describe('L2-CA-09: capTranscript is turn-aware — the active (tail) turn is never trimmed', () => {
+  it('a single turn that grows past the cap is left whole; only an OLDER turn is ever trimmed, and no messageId collides afterward', () => {
+    const bigTurn = Array.from({ length: 600 }, (_, i) => ({
+      kind: 'message' as const, turnId: 't1', id: `msg-t1-${i}`, text: `m${i}`, streaming: false,
+    }));
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript: bigTurn };
+    const state: AppState = { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+
+    // A same-turn fold (reasoning.start for t1) pushes the tab 101 items past
+    // MAX_TRANSCRIPT_ITEMS -- but every item in the transcript belongs to the
+    // ACTIVE turn t1, so NOTHING may be trimmed (the old unconditional
+    // front-slice trimmed 101 of t1's own earlier items here, orphaning the
+    // still-in-flight turn and risking a duplicate messageId on its next
+    // message block).
+    const afterReasoning = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const tabAfterReasoning = must(afterReasoning.tabs.boot, 'boot tab');
+    expect(tabAfterReasoning.transcript).toHaveLength(601);
+    expect(tabAfterReasoning.hiddenCount ?? 0).toBe(0);
+
+    // Turn t2 begins: t1's 601 items are no longer the active tail, so the
+    // 102-item overage is trimmed from THEM (the front), never from t2.
+    const afterT2 = reduce(afterReasoning, { type: 'user', turnId: 't2', sessionId: 's1', text: 'next', mode: 'default' });
+    const tabAfterT2 = must(afterT2.tabs.boot, 'boot tab');
+    expect(tabAfterT2.transcript).toHaveLength(MAX_TRANSCRIPT_ITEMS);
+    expect(tabAfterT2.hiddenCount ?? 0).toBe(102);
+
+    const messageIds = tabAfterT2.transcript.filter((i): i is MessageItem => i.kind === 'message').map((i) => i.id);
+    expect(new Set(messageIds).size).toBe(messageIds.length); // no duplicate messageIds survive the trim
+  });
+});
+
+describe("L2-CA-10 (OD-3): plan.update keeps one plan card PER TURN, not one rebound across turns", () => {
+  it("a later turn's plan.update appends a NEW plan card instead of rewriting the earlier turn's card sitting in its own transcript position", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'step one', status: 'done' }],
+    });
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'complete' });
+
+    state = reduce(state, { type: 'turn.start', turnId: 't2', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't2',
+      sessionId: 's1',
+      items: [{ text: 'step A', status: 'active' }],
+    });
+
+    const transcript = activeTab(state).transcript;
+    const planCards = transcript.filter((i) => i.kind === 'plan');
+    // Today (pre-fix): the single shared predicate finds t1's card and
+    // REBINDS it in place -- length stays 1 and its `items`/`turnId` change
+    // out from under the earlier turn. Fixed: turn 2 gets its OWN card.
+    expect(planCards).toHaveLength(2);
+    expect(planCards[0]).toMatchObject({ turnId: 't1', items: [{ text: 'step one', status: 'done' }] });
+    expect(planCards[1]).toMatchObject({ turnId: 't2', items: [{ text: 'step A', status: 'active' }] });
+
+    // The side-panel projection always mirrors the LATEST update, regardless
+    // of how many per-turn cards sit in the transcript -- unchanged by CA-10.
+    expect(activeTab(state).plan).toEqual([{ text: 'step A', status: 'active' }]);
+  });
+
+  it("a second plan.update for the SAME turn still rebinds that turn's own card in place (no duplicate card per turn)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'step one', status: 'pending' }],
+    });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'step one', status: 'done' }, { text: 'step two', status: 'active' }],
+    });
+
+    const transcript = activeTab(state).transcript;
+    const planCards = transcript.filter((i) => i.kind === 'plan');
+    expect(planCards).toHaveLength(1);
+    expect(planCards[0]).toMatchObject({
+      turnId: 't1',
+      items: [{ text: 'step one', status: 'done' }, { text: 'step two', status: 'active' }],
+    });
+  });
+});

@@ -524,6 +524,46 @@ describe('CA-M15: collapsed-older-messages affordance', () => {
 });
 
 /**
+ * L2-CA-08: at the CA-M15 transcript cap, `transcript.length` stops growing
+ * (the reducer trims an equal number off the front for every item that
+ * arrives), so the jump-to-latest pill's unseen count must be measured in
+ * ARRIVALS — `hiddenCount + transcript.length` — never `transcript.length`
+ * alone, or the pill silently stops appearing the moment a tab hits the cap.
+ */
+describe('L2-CA-08: unseen-arrival count survives the transcript cap', () => {
+  function manyMessages(n: number, offset = 0): TranscriptItem[] {
+    return Array.from({ length: n }, (_, i) =>
+      messageItem({ id: `m${offset + i}`, turnId: `t${offset + i}`, text: `item ${offset + i}` }),
+    );
+  }
+
+  it('counts ARRIVALS (hiddenCount + transcript.length), not transcript.length alone, once the transcript is at the cap', () => {
+    const capped = manyMessages(500);
+    const { getByRole, rerender } = renderChatViewWithHidden(capped, 10);
+
+    scrollAway(getByRole('log'));
+
+    // 3 more items arrive; the reducer's cap keeps the transcript at 500 (3
+    // more roll off the front into hiddenCount, now 13). `transcript.length`
+    // alone sees 500 - 500 = 0 and the pill never appears.
+    const grown = [...capped.slice(3), ...manyMessages(3, 500)];
+    rerender(
+      <ChatView
+        transcript={grown}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+        hiddenCount={13}
+      />,
+    );
+
+    const pill = getByRole('button', { name: 'Jump to latest, 3 new' });
+    expect(pill).toBeInTheDocument();
+  });
+});
+
+/**
  * WS-A T5b (BH-05, round-2 🔴): the DOM half of the edit-approval card fix,
  * exercised end-to-end — the transcript is built by folding the real host
  * emit order (`tool.start` -> `tool.diff` -> `approval.request`, all keyed
