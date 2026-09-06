@@ -10,7 +10,7 @@
  * the P-1 isolation guarantee: a message tagged session B can only ever fold
  * into B's tab, never into A's.
  */
-import type { ApprovalOption, Attachment, HostToWebview, Panel, PanelDataMap, PlanItem, WebviewState } from '../protocol';
+import type { ApprovalOption, Attachment, HostToWebview, Panel, PanelDataMap, PlanItem, ToolStatus, WebviewState } from '../protocol';
 import { MAX_TABS } from '../protocol';
 import { foldSetupProgress } from '../panels/setupCards';
 import {
@@ -132,6 +132,41 @@ function settleOpenItems(list: TranscriptItem[]): TranscriptItem[] {
  */
 function findOptionId(options: ApprovalOption[], kind: ApprovalOption['kind']): string | undefined {
   return options.find((option) => option.kind === kind)?.id;
+}
+
+/**
+ * BH-05 (Q2 / ADR-R2-15): the single source of truth for "is this approval
+ * option a refusal" — allow = not-deny. Shared by {@link deriveSettledToolStatus}
+ * below and `deniedToolIds` (ChatView.tsx), so the deny-option check is never
+ * re-derived in two places.
+ */
+export function isDenyOptionKind(kind: ApprovalOption['kind'] | undefined): boolean {
+  return kind === 'deny' || kind === 'deny_always';
+}
+
+/**
+ * BH-05 (Q2 / ADR-R2-15): the synthetic edit-approval tool card's derived
+ * STATUS for an `approval.settle` echo. Pure translation of the settle
+ * outcome (+ the sibling approval item's chosen option, for `'selected'`) —
+ * the `approval.settle` fold below applies this ONLY while the matching tool
+ * item is still `'pending'` (never `running`/`done`/`failed`).
+ */
+function deriveSettledToolStatus(
+  msg: Extract<HostToWebview, { type: 'approval.settle' }>,
+  approvalItem: ApprovalItem | undefined,
+): ToolStatus | undefined {
+  switch (msg.outcome) {
+    case 'cancelled':
+    case 'superseded':
+      return 'interrupted';
+    case 'expired':
+      return 'denied';
+    case 'selected': {
+      const chosenKind = approvalItem?.options.find((o) => o.id === msg.optionId)?.kind;
+      return isDenyOptionKind(chosenKind) ? 'denied' : 'approved';
+    }
+    // no default: the union is exhaustive; tsc enforces it
+  }
 }
 
 /** Every session-scoped {@link HostToWebview} variant `foldTab` folds — i.e.
@@ -307,7 +342,13 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       };
     }
 
-    case 'tool.start':
+    case 'tool.start': {
+      // BH-05: create-if-absent. A tool item for this toolId already exists →
+      // no-op (the synthetic edit-approval card must never double-insert /
+      // dup its React key).
+      if (tab.transcript.some((i) => i.kind === 'tool' && i.toolId === msg.toolId)) {
+        return tab;
+      }
       return {
         ...tab,
         transcript: [
@@ -326,6 +367,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
           },
         ],
       };
+    }
 
     case 'tool.update':
       return {
@@ -379,12 +421,21 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
         ],
       };
 
-    case 'approval.settle':
+    case 'approval.settle': {
       // V-5/V-6/V-7: the authoritative host settlement — OVERWRITES any
       // optimistic value unconditionally (ARCH-1: optimistic can never
       // override authoritative). Also locks the settled approval's tool
       // hunks (M3-b) so a still-unresolved sibling hunk (e.g. a 60s auto-deny
       // that fired with zero user clicks) is never left looking live.
+      //
+      // BH-05 (Q2 / ADR-R2-15): ALSO derives the matching tool item's own
+      // `status` (Approved/Denied/Interrupted) for the synthetic
+      // edit-approval card — but ONLY while that tool item is still
+      // `'pending'` (never touches `running`/`done`/`failed`). Computed once,
+      // up front, since it needs the sibling approval item's `options` to
+      // resolve the chosen option's kind for the `'selected'` case.
+      const approvalItem = tab.transcript.find((i): i is ApprovalItem => i.kind === 'approval' && i.id === msg.id);
+      const settledToolStatus = deriveSettledToolStatus(msg, approvalItem);
       return {
         ...tab,
         transcript: tab.transcript.map((item) => {
@@ -403,11 +454,13 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
             };
           }
           if (item.kind === 'tool' && msg.toolId !== undefined && item.toolId === msg.toolId) {
-            return { ...item, hunksLocked: true };
+            const status = item.status === 'pending' && settledToolStatus !== undefined ? settledToolStatus : item.status;
+            return { ...item, hunksLocked: true, status };
           }
           return item;
         }),
       };
+    }
 
     case 'plan.update': {
       const exists = tab.transcript.some((i) => i.kind === 'plan');

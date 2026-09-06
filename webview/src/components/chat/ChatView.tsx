@@ -4,6 +4,7 @@
  */
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { TranscriptItem, ToolItem } from '../../types';
+import { isDenyOptionKind } from '../../state/transcript';
 import { Hero } from '../Hero';
 import { Icon } from '../Icon';
 import { LiveRegion } from '../LiveRegion';
@@ -101,8 +102,7 @@ export function deniedToolIds(transcript: TranscriptItem[]): Set<string> {
     if (item.kind !== 'approval' || item.toolId === undefined) continue;
     const settledDeny = item.settledOutcome !== undefined && item.settledOutcome !== 'selected';
     const chosenKind = item.options.find((o) => o.id === item.resolvedOptionId)?.kind;
-    const optionDeny = chosenKind === 'deny' || chosenKind === 'deny_always';
-    if (settledDeny || optionDeny) ids.add(item.toolId);
+    if (settledDeny || isDenyOptionKind(chosenKind)) ids.add(item.toolId);
   }
   return ids;
 }

@@ -2446,6 +2446,199 @@ describe('transcript reducer — T-A1 (audit-2 Cluster A, M3): webview authorita
   });
 });
 
+describe('transcript reducer — BH-05 (WS-A T4, Q2 / ADR-R2-15): tool.start create-if-absent + approval.settle status derivation', () => {
+  it('RED: a duplicate tool.start for the same toolId is a no-op (prevents a duplicate React key for the synthetic edit-approval card)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'edit-approval-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'pending',
+    });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'edit-approval-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'pending',
+    });
+
+    const afterDup = activeTab(state).transcript.filter((i) => i.kind === 'tool');
+    expect(afterDup).toHaveLength(1);
+
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tc-2',
+      kind: 'execute',
+      title: 'run: npm test',
+      status: 'running',
+    });
+    const afterNew = activeTab(state).transcript.filter((i) => i.kind === 'tool');
+    expect(afterNew).toHaveLength(2);
+    expect(afterNew.map((i) => (i.kind === 'tool' ? i.toolId : ''))).toEqual(['edit-approval-1', 'tc-2']);
+  });
+
+  /** A pending tool item + its gating approval (one allow option, one deny
+   * option) — the fixture every settle-derivation case below folds onto. */
+  function pendingToolWithApproval(): AppState {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'pending',
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Apply edit to a.ts',
+      options: [
+        { id: 'allow', label: 'Allow', kind: 'allow_once' },
+        { id: 'deny', label: 'Deny', kind: 'deny' },
+      ],
+    });
+    return state;
+  }
+
+  it('RED: settle{selected, allow option} derives the pending tool item to "approved" and still locks hunks + folds the approval branch', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      outcome: 'selected',
+      optionId: 'allow',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'approved', hunksLocked: true });
+    const approval = activeTab(state).transcript.find((i) => i.kind === 'approval');
+    expect(approval).toMatchObject({ id: 'appr-1', settledOutcome: 'selected', resolvedOptionId: 'allow' });
+  });
+
+  it('RED: settle{selected, deny option} derives the pending tool item to "denied"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      outcome: 'selected',
+      optionId: 'deny',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'denied', hunksLocked: true });
+  });
+
+  it('RED: settle{expired} derives the pending tool item to "denied"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, { type: 'approval.settle', sessionId: 's1', turnId: 't1', id: 'appr-1', toolId: 'tool-1', outcome: 'expired' });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'denied', hunksLocked: true });
+    const approval = activeTab(state).transcript.find((i) => i.kind === 'approval');
+    expect(approval).toMatchObject({ id: 'appr-1', settledOutcome: 'expired' });
+  });
+
+  it('RED: settle{cancelled} derives the pending tool item to "interrupted"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, { type: 'approval.settle', sessionId: 's1', turnId: 't1', id: 'appr-1', toolId: 'tool-1', outcome: 'cancelled' });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'interrupted', hunksLocked: true });
+  });
+
+  it('RED: settle{superseded} derives the pending tool item to "interrupted"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, { type: 'approval.settle', sessionId: 's1', turnId: 't1', id: 'appr-1', toolId: 'tool-1', outcome: 'superseded' });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'interrupted', hunksLocked: true });
+  });
+
+  it('a "running" tool item is left alone by settle (status stays "running"; only hunksLocked changes)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'running',
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Apply edit to a.ts',
+      options: [{ id: 'allow', label: 'Allow', kind: 'allow_once' }],
+    });
+
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      outcome: 'selected',
+      optionId: 'allow',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'running', hunksLocked: true });
+  });
+
+  it('a "done" tool item is left alone by settle (status stays "done"; only hunksLocked changes)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'done',
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Apply edit to a.ts',
+      options: [{ id: 'deny', label: 'Deny', kind: 'deny' }],
+    });
+
+    state = reduce(state, { type: 'approval.settle', sessionId: 's1', turnId: 't1', id: 'appr-1', toolId: 'tool-1', outcome: 'expired' });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'done', hunksLocked: true });
+  });
+});
+
 describe('transcript reducer — CF-06 / R2: settleOpenItems — settling every open/streaming kind is DERIVED in one place, not enumerated per-kind', () => {
   it('RED: turn.end{status:"error"} settles a still-streaming reasoning block (pre-fix: closeOpenMessages only settles "message", and the turn.end fold only mapped tool/approval — a streaming reasoning block fell through both and stayed streaming:true forever, the eternal "Thinking" spinner)', () => {
     let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
