@@ -67,6 +67,17 @@ export interface ControlDispatcherHostPort {
   panelSources: PanelSourceRegistry;
   /** The per-session actor registry — read at call time via the reference itself (a `Map`-backed registry, not a snapshot). */
   sessions: SessionRegistry;
+  /**
+   * BH-02 (round-2): `true` while `AcpBackend.pendingClose` tombstones
+   * `sessionId` — the close was requested but its registry removal is still
+   * deferred on the start tail (see `AcpBackend.pendingClose`'s own doc). The
+   * hydrate seed ({@link SessionScopeActions.listTabs}) excludes such a
+   * session so a webview dispose/recreate in that window never re-seeds a tab
+   * the user has already closed — the SAME tombstone honor
+   * `ConnectionSupervisor`'s crash snapshot already applies
+   * (`ConnectionSupervisorHostPort.isPendingClose`).
+   */
+  isPendingClose(sessionId: string): boolean;
   /** `Map<canonicalRoot, RootCoordinator>` — checkpoint restore/redo/baseline root routing + the single-root convenience fallback. */
   rootRegistry: RootRegistry;
   /** Resolve (or mint) the `RootCoordinator` owning `cwd`'s containing workspace root — accessor (fs-realpath resolution stays host-side, `AcpBackend`'s own `resolveRootCoordinator`). */

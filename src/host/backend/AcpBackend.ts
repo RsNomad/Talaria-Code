@@ -583,6 +583,7 @@ export class AcpBackend implements AgentBackend {
       ...(this.logger !== undefined ? { logger: this.logger } : {}),
       panelSources: this.panelSources,
       sessions: this.sessions,
+      isPendingClose: (sessionId) => this.pendingClose.has(sessionId),
       rootRegistry: this.rootRegistry,
       resolveRootCoordinator: (cwd) => this.resolveRootCoordinator(cwd),
       getConnectionCwd: () => this.cwd,

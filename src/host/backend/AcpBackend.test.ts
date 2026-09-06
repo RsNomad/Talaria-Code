@@ -2842,6 +2842,36 @@ describe('AcpBackend.listTabs — W6-FF (3-way ARCH I-1): the live tab list Tala
     expect(backend.listTabs().map((t) => t.tabId)).toEqual([BOOTSTRAP_TAB_ID]);
   });
 
+  /**
+   * BH-02 (round-2 Bug Hunt): a tab in the `pendingClose` WINDOW — closed
+   * (tombstoned SYNCHRONOUSLY) but whose registry removal is still deferred on
+   * the start tail — is EXCLUDED from the hydrate seed, so a webview
+   * dispose/recreate in that window never re-seeds a tab the user closed.
+   * Mirrors the tombstone honor `ConnectionSupervisor`'s crash snapshot
+   * already applies (ConnectionSupervisor.ts:1095). Distinct from the sibling
+   * above: NO flush here — the controller still lives in `sessions`; the
+   * FILTER (not removal) is what drops it.
+   * RED before the fix: `listTabs()` re-seeds the closing tab (returns both).
+   */
+  it('BH-02: a pending-close tab (tombstoned, removal still deferred) is excluded from the listTabs hydrate seed', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // BOOTSTRAP_TAB_ID / session-1
+    must(clients[0]).queueSessionId('session-2');
+    await backend.openTab('tab-2'); // session-2
+
+    // Sanity: both tabs are live before the close.
+    expect(backend.listTabs().map((t) => t.tabId).sort()).toEqual([BOOTSTRAP_TAB_ID, 'tab-2'].sort());
+
+    // closeTab tombstones `pendingClose` SYNCHRONOUSLY; the actual
+    // SessionRegistry removal is deferred on the start tail. NO flush —
+    // we are asserting inside the pre-removal window, so session-2's
+    // controller is still registered.
+    backend.closeTab('session-2');
+
+    // session-2 is excluded by the pendingClose filter, NOT by removal.
+    expect(backend.listTabs().map((t) => t.tabId)).toEqual([BOOTSTRAP_TAB_ID]);
+  });
+
   /** H4-B8 (arch report Minor-2): the seed's per-tab DISPLAY fields — each
    * entry surfaces THAT controller's OWN preset/currentModelId/
    * activeModeId/availableCommands, never another tab's (P-1 isolation),

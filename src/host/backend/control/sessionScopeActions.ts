@@ -12,7 +12,13 @@ import type { ControlDispatcherHostPort } from './ControlDispatcher';
  */
 export type SessionScopePort = Pick<
   ControlDispatcherHostPort,
-  'sessions' | 'emit' | 'getActiveSessionId' | 'showWarningMessage' | 'logger' | 'loadSessionIntoTab'
+  | 'sessions'
+  | 'emit'
+  | 'getActiveSessionId'
+  | 'showWarningMessage'
+  | 'logger'
+  | 'loadSessionIntoTab'
+  | 'isPendingClose'
 >;
 
 /**
@@ -77,7 +83,9 @@ export class SessionScopeActions {
    * `availableCommands`'s existing `undefined`-when-unset shape).
    */
   listTabs(): HydrateTabSeed[] {
-    return [...this.port.sessions.values()].map((controller) => {
+    return [...this.port.sessions.values()]
+      .filter((controller) => !this.port.isPendingClose(controller.sessionId))
+      .map((controller) => {
       const currentModelId = controller.currentModelId;
       const activeModeId = controller.activeCustomModeId ?? undefined;
       const availableCommands = controller.getAvailableCommands();
