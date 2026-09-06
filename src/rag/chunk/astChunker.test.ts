@@ -346,4 +346,72 @@ describe('chunkAst', () => {
       assertEveryRowCovered(chunks, 2); // row 3 is the trailing phantom '' line
     });
   });
+
+  // CA-21 — `smartCollapsedChunks` recursed into `node.children` with no
+  // depth bound. A pathologically deep nesting (e.g. 200 nested functions)
+  // grows `buildSymbolPath` one entry per level with no cap. Fix: a depth
+  // cap of 64 (matching the sibling `MAX_SYMBOL_TREE_DEPTH` in
+  // `resultShaper.ts`/`lspResultMap.ts`).
+  describe('CA-21: smartCollapsedChunks recursion is depth-capped', () => {
+    /** Textual source for `depth` levels of nested `function f() { ... }`,
+     * bottoming out in `filler` (a plain, non-function leaf). */
+    function buildFunctionChainSource(depth: number, filler: string): string {
+      return depth === 0 ? filler : `function f() {\n${buildFunctionChainSource(depth - 1, filler)}\n}`;
+    }
+
+    /** `lens[d]` = the character length of `buildFunctionChainSource(d, filler)`,
+     * computed from the same template used to build the source text, so the
+     * node tree built below lines up byte-for-byte without re-deriving
+     * offsets via ambiguous `indexOf` on a repetitive 200-deep structure. */
+    function buildFunctionChainLengths(depth: number, fillerLength: number): number[] {
+      const lens = [fillerLength];
+      for (let d = 1; d <= depth; d++) {
+        // "function f() {\n" (15 chars) + inner + "\n}" (2 chars) = inner + 17.
+        lens.push(must(lens[d - 1]) + 17);
+      }
+      return lens;
+    }
+
+    /** Mirrors `buildFunctionChainSource`'s template as a node tree: each
+     * level is a `function_declaration` with an `identifier` + a
+     * `statement_block` child; the `statement_block`'s single child is
+     * either the next nested `function_declaration` or (at depth 0) a
+     * plain `expression_statement` leaf holding `filler`. */
+    function buildFunctionChainNode(source: string, offset: number, depth: number, lens: number[]): SyntaxNodeLike {
+      const len = must(lens[depth]);
+      if (depth === 0) {
+        return mkNode(source, 'expression_statement', offset, offset + len, []);
+      }
+      const identifier = mkNode(source, 'identifier', offset + 9, offset + 10, []); // "function " is 9 chars
+      const child = buildFunctionChainNode(source, offset + 15, depth - 1, lens); // past "function f() {\n"
+      const bodyBlock = mkNode(source, 'statement_block', offset + 13, offset + len, [child]); // '{' is at +13
+      return mkNode(source, 'function_declaration', offset, offset + len, [identifier, bodyBlock]);
+    }
+
+    it('caps recursion at 64 and keeps every row covered for a 200-deep nested-function chain', () => {
+      const depth = 200;
+      const filler = 'x'.repeat(3000); // oversized at every level: every ancestor also fails to fit whole.
+      const source = buildFunctionChainSource(depth, filler);
+      const lens = buildFunctionChainLengths(depth, filler.length);
+      const outerFn = buildFunctionChainNode(source, 0, depth, lens);
+      const program = mkNode(source, 'program', 0, source.length, [outerFn]);
+
+      // Sanity-check the fixture: the computed lengths really do line up
+      // with the generated source text (no trailing newline at this depth).
+      expect(must(lens[depth])).toBe(source.length);
+
+      const chunks = chunkAst(program, source, 50);
+
+      expect(chunks.length).toBeGreaterThan(0);
+
+      const lastRow = source.split('\n').length - 1;
+      for (let line = 0; line <= lastRow; line++) {
+        const covered = chunks.some((c) => c.startLine <= line && line <= c.endLine);
+        expect(covered, `row ${line} should be covered by some chunk`).toBe(true);
+      }
+
+      const maxSymbolPathLength = Math.max(...chunks.map((c) => c.symbolPath?.length ?? 0));
+      expect(maxSymbolPathLength).toBeLessThanOrEqual(64);
+    });
+  });
 });

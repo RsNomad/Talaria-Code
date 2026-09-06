@@ -229,12 +229,30 @@ function maybeYieldChunk(
   return undefined;
 }
 
+/**
+ * L2-CA-21 (totality): caps how deep {@link smartCollapsedChunks} will
+ * recurse into `node.children`. A pathologically deep AST (e.g. ~200 nested
+ * functions — not something any real source file has, but this module's
+ * totality invariant is "no chunker function ever throws on
+ * malformed/adversarial input") would otherwise grow `buildSymbolPath`
+ * (and the call stack) without bound. Mirrors the sibling
+ * `MAX_SYMBOL_TREE_DEPTH` in `resultShaper.ts`/`lspResultMap.ts` — 64 is far
+ * deeper than any real source file's nesting; past it we stop descending.
+ * Coverage below the cap holds by construction: the last node processed
+ * before the cap is itself a collapsed type whose own chunk's
+ * `[startLine, endLine]` spans every deeper row, so nothing below is lost.
+ */
+const MAX_AST_DEPTH = 64;
+
 function* smartCollapsedChunks(
   node: SyntaxNodeLike,
   code: string,
   maxChunkTokens: number,
   root: boolean,
+  depth = 0,
 ): Generator<ChunkWithoutHeader> {
+  if (depth >= MAX_AST_DEPTH) return;
+
   const whole = maybeYieldChunk(node, maxChunkTokens, root);
   if (whole) {
     yield { ...whole, symbolPath: buildSymbolPath(node) };
@@ -259,7 +277,7 @@ function* smartCollapsedChunks(
   // Recurse regardless of whether a whole/collapsed chunk was just yielded
   // for `node` itself, so bodies are still indexed somewhere (how-to §3).
   for (const child of node.children) {
-    yield* smartCollapsedChunks(child, code, maxChunkTokens, false);
+    yield* smartCollapsedChunks(child, code, maxChunkTokens, false, depth + 1);
   }
 }
 
