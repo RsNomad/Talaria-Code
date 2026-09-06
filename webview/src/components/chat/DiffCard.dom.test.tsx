@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DiffCard } from './DiffCard';
@@ -287,5 +287,75 @@ describe('DiffCard — A11Y-01: focus anchor on hunk-button unmount (WCAG 2.4.3)
     );
     expect(document.activeElement).not.toBe(document.body);
     expect((document.activeElement as HTMLElement).closest('.rounded-card')).not.toBeNull();
+  });
+});
+
+/**
+ * WS-U U1 (UX-01, WCAG 2.1.1 / axe `scrollable-region-focusable`): the hunk
+ * body's `overflow-x-auto` container is wrapped in `ScrollRegion` so a
+ * keyboard-only user can reach and pan a wide diff — but ONLY while it
+ * actually overflows. jsdom never runs real layout (`scrollWidth`/
+ * `clientWidth` are both 0), so the golden test below pins the no-dead-tab-
+ * stop behavior; the RED block after it stubs overflow to prove the wrapper
+ * actually names the region (per-hunk, via `hunkNumber`/`total`/`path`,
+ * already threaded through `HunkView`) once it does.
+ */
+function stubOverflow(scrollWidth: number, clientWidth: number): void {
+  Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+    configurable: true,
+    get: () => scrollWidth,
+  });
+  Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+    configurable: true,
+    get: () => clientWidth,
+  });
+}
+
+function restoreOverflowStub(): void {
+  Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
+  Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+}
+
+describe('DiffCard — WS-U U1: hunk body scroll region is focusable + named ONLY while it overflows', () => {
+  afterEach(() => {
+    restoreOverflowStub();
+  });
+
+  const twoHunkDiff: ToolDiff = {
+    path: 'src/example.ts',
+    hunks: [
+      { header: '@@ -1,2 +1,2 @@', lines: [{ sign: '+', text: 'first hunk line' }] },
+      { header: '@@ -10,2 +10,2 @@', lines: [{ sign: '+', text: 'second hunk line' }] },
+    ],
+  };
+
+  it('Step 1 golden: the hunk body carries no tabindex/role/aria-label when not overflowing', () => {
+    render(
+      <DiffCard diff={twoHunkDiff} resolvedHunks={{}} hunkOffset={0} onResolve={() => undefined} pending={false} />,
+    );
+    const body = screen.getByText('+ first hunk line').parentElement;
+    expect(body).not.toHaveAttribute('tabindex');
+    expect(body).not.toHaveAttribute('role');
+    expect(body).not.toHaveAttribute('aria-label');
+  });
+
+  it('Step 2 RED->GREEN: the first hunk body becomes role="group" named "Diff hunk 1 of 2: src/example.ts" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(
+      <DiffCard diff={twoHunkDiff} resolvedHunks={{}} hunkOffset={0} onResolve={() => undefined} pending={false} />,
+    );
+    const region = screen.getByRole('group', { name: 'Diff hunk 1 of 2: src/example.ts' });
+    expect(region).toHaveAttribute('tabindex', '0');
+    expect(screen.getByText('+ first hunk line')).toBeInTheDocument();
+  });
+
+  it('Step 2: the second hunk body gets its OWN distinct name ("Diff hunk 2 of 2: ...")', () => {
+    stubOverflow(1000, 100);
+    render(
+      <DiffCard diff={twoHunkDiff} resolvedHunks={{}} hunkOffset={0} onResolve={() => undefined} pending={false} />,
+    );
+    expect(
+      screen.getByRole('group', { name: 'Diff hunk 2 of 2: src/example.ts' }),
+    ).toBeInTheDocument();
   });
 });

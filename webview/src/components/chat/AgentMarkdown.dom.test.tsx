@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { AgentMarkdown, splitStableBoundary, renderMarkdown } from './AgentMarkdown';
 
@@ -509,6 +509,100 @@ describe('WS-E E1 (L2-CA-03) Step 1: pinned DOM goldens (result-preserving paths
  * FAILS today: the current renderer passes `tok.body` as a single string
  * child, so `code.childNodes.length` is 1, not 2.
  */
+/**
+ * WS-U U1 (UX-01, WCAG 2.1.1 / axe `scrollable-region-focusable`): the code
+ * `<pre className={CODE_BLOCK_CLASS}>` (both the closed-fence branch in
+ * `renderMarkdown` and the open-fence streaming branch in `AgentMarkdown`
+ * itself) and the markdown table's `overflow-x-auto` wrapper are wrapped in
+ * `ScrollRegion` so a keyboard-only user can reach and pan them — but ONLY
+ * while they actually overflow. jsdom never runs real layout
+ * (`scrollWidth`/`clientWidth` are both 0), so the golden block below pins
+ * that E1's byte-identical goldens (above) hold precisely BECAUSE nothing in
+ * this suite ever overflows — the wrapper never adds an attribute here. The
+ * RED block that follows stubs overflow to prove the wrapper actually names
+ * the region once it does.
+ */
+function stubOverflow(scrollWidth: number, clientWidth: number): void {
+  Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+    configurable: true,
+    get: () => scrollWidth,
+  });
+  Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+    configurable: true,
+    get: () => clientWidth,
+  });
+}
+
+function restoreOverflowStub(): void {
+  Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
+  Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+}
+
+describe('WS-U U1 Step 1 golden: non-overflowing code block / table carry no dead tab stop', () => {
+  it('a closed-fence code block carries no tabindex/role/aria-label when not overflowing', () => {
+    render(<AgentMarkdown text={'```ts\nconst y = 2;\n```'} />);
+    const pre = document.querySelector('pre');
+    expect(pre).not.toBeNull();
+    expect(pre).not.toHaveAttribute('tabindex');
+    expect(pre).not.toHaveAttribute('role');
+    expect(pre).not.toHaveAttribute('aria-label');
+  });
+
+  it('a streaming OPEN-fence code block carries no tabindex/role/aria-label when not overflowing', () => {
+    render(<AgentMarkdown text={'```ts\nconst z = 3;'} streaming />);
+    const pre = document.querySelector('pre');
+    expect(pre).not.toBeNull();
+    expect(pre).not.toHaveAttribute('tabindex');
+    expect(pre).not.toHaveAttribute('role');
+    expect(pre).not.toHaveAttribute('aria-label');
+  });
+
+  it('a markdown table carries no tabindex/role/aria-label on its scroll wrapper when not overflowing', () => {
+    render(<AgentMarkdown text={'| a | b |\n| - | - |\n| 1 | 2 |'} />);
+    const table = screen.getByRole('table');
+    const wrapper = table.closest('.overflow-x-auto');
+    expect(wrapper).not.toBeNull();
+    expect(wrapper).not.toHaveAttribute('tabindex');
+    expect(wrapper).not.toHaveAttribute('role');
+    expect(wrapper).not.toHaveAttribute('aria-label');
+  });
+});
+
+describe('WS-U U1 Step 2 RED->GREEN: code block / table become a named, focusable group ONLY while overflowing', () => {
+  afterEach(() => {
+    restoreOverflowStub();
+  });
+
+  it('a closed-fence `ts` code block becomes role="group" named "Code block (ts)" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(<AgentMarkdown text={'```ts\nconst x = 1;\n```'} />);
+    const region = screen.getByRole('group', { name: 'Code block (ts)' });
+    expect(region.tagName).toBe('PRE');
+    expect(region).toHaveAttribute('tabindex', '0');
+  });
+
+  it('a code block with NO lang becomes role="group" named just "Code block" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(<AgentMarkdown text={'```\nconst x = 1;\n```'} />);
+    expect(screen.getByRole('group', { name: 'Code block' })).toBeInTheDocument();
+  });
+
+  it('a streaming OPEN-fence code block becomes role="group" named "Code block (ts)" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(<AgentMarkdown text={'```ts\nconst z = 3;'} streaming />);
+    const region = screen.getByRole('group', { name: 'Code block (ts)' });
+    expect(region.tagName).toBe('PRE');
+  });
+
+  it('a markdown table becomes role="group" named "Table" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(<AgentMarkdown text={'| a | b |\n| - | - |\n| 1 | 2 |'} />);
+    const region = screen.getByRole('group', { name: 'Table' });
+    expect(region).toHaveAttribute('tabindex', '0');
+    expect(screen.getByRole('table')).toBeInTheDocument();
+  });
+});
+
 describe('WS-E E1 (L2-CA-03) Step 3: open-fence streaming renders one <pre> from a stable+tail pair', () => {
   it('a large open-fence body (crossing a CODE_STABLE_CHUNK window) renders as exactly one <pre>, correct <code> text, a lang header, and a non-monolithic (stable+tail) text-node split', () => {
     // 300 lines * ~55 chars/line ≈ 16.5 KB — comfortably above 2*4096 so the

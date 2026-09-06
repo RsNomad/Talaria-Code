@@ -18,6 +18,7 @@
  * href to accidentally leak into an `href` attribute.
  */
 import { Fragment, useMemo, type ReactNode } from 'react';
+import { ScrollRegion } from '../ScrollRegion';
 
 interface Props {
   text: string;
@@ -289,9 +290,13 @@ function parseTableBlock(lines: string[]): ParsedTable | null {
   return { header, rows: rest.map(splitTableRow) };
 }
 
+/** WS-U U1 (UX-01): the table's horizontal-scroll wrapper's accessible name
+ * while it is actually focusable (`ScrollRegion` — see below). */
+const TABLE_SCROLL_LABEL = 'Table';
+
 function renderTable(table: ParsedTable, key: string): ReactNode {
   return (
-    <div key={key} className="mb-2 overflow-x-auto last:mb-0">
+    <ScrollRegion key={key} className="mb-2 overflow-x-auto last:mb-0" label={TABLE_SCROLL_LABEL}>
       <table className="w-full border-collapse text-left">
         <thead>
           <tr>
@@ -314,7 +319,7 @@ function renderTable(table: ParsedTable, key: string): ReactNode {
           ))}
         </tbody>
       </table>
-    </div>
+    </ScrollRegion>
   );
 }
 
@@ -432,6 +437,15 @@ function renderBlocks(text: string, keyPrefix: string, depth = 0): ReactNode {
 const CODE_BLOCK_CLASS =
   'my-2 overflow-x-auto rounded-card border border-border bg-surface p-3 font-mono text-xs leading-relaxed text-muted';
 
+/** WS-U U1 (UX-01): shared accessible-name formatter for BOTH `<pre
+ * className={CODE_BLOCK_CLASS}>` sites below (the closed-fence branch here
+ * and the open-fence streaming branch in `AgentMarkdown` further down) — one
+ * source of truth so the two can never drift on the label format, mirroring
+ * why `CODE_BLOCK_CLASS` itself is hoisted. */
+function codeBlockLabel(lang: string | undefined): string {
+  return lang ? `Code block (${lang})` : 'Code block';
+}
+
 /** CA-11: the token→node render, extracted so the completed-block PREFIX can
  * be memoized separately from the still-open tail. `keyPrefix` namespaces the
  * per-token keys so the stable and tail segments never collide. Behavior is
@@ -442,10 +456,10 @@ export function renderMarkdown(text: string, streaming: boolean, keyPrefix: stri
     const key = `${keyPrefix}-${ti}`;
     if (tok.code) {
       return (
-        <pre key={key} className={CODE_BLOCK_CLASS}>
+        <ScrollRegion key={key} as="pre" className={CODE_BLOCK_CLASS} label={codeBlockLabel(tok.lang)}>
           {tok.lang && <div className="mb-1 text-2xs uppercase text-faint">{tok.lang}</div>}
           <code>{tok.body.replace(/\n$/, '')}</code>
-        </pre>
+        </ScrollRegion>
       );
     }
     return renderBlocks(tok.body, key);
@@ -569,13 +583,13 @@ export function AgentMarkdown({ text, streaming }: Props) {
       {fence ? (
         <>
           {fencePreNodes}
-          <pre className={CODE_BLOCK_CLASS}>
+          <ScrollRegion as="pre" className={CODE_BLOCK_CLASS} label={codeBlockLabel(fence.lang)}>
             {fence.lang && <div className="mb-1 text-2xs uppercase text-faint">{fence.lang}</div>}
             <code>
               {fence.bodyStable}
               {fence.bodyTail.replace(/\n$/, '')}
             </code>
-          </pre>
+          </ScrollRegion>
         </>
       ) : (
         tailNodes

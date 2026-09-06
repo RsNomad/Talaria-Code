@@ -26,6 +26,7 @@ import { useRef } from 'react';
 import type { DiffHunk, ToolDiff } from '../../protocol';
 import { Icon } from '../Icon';
 import { Pill, type PillTone } from '../Pill';
+import { ScrollRegion } from '../ScrollRegion';
 import { useFocusAnchorOnUnmount } from '../../hooks/useFocusAnchorOnUnmount';
 
 interface DiffCardProps {
@@ -106,7 +107,10 @@ function HunkView({
         )}
       </div>
 
-      <div className="overflow-x-auto font-mono text-[11.5px] leading-relaxed">
+      <ScrollRegion
+        className="overflow-x-auto font-mono text-[11.5px] leading-relaxed"
+        label={`Diff hunk ${hunkNumber} of ${total}: ${path}`}
+      >
         {hunk.lines.map((ln, i) => (
           <div
             key={i}
@@ -121,7 +125,7 @@ function HunkView({
             {ln.sign} {ln.text}
           </div>
         ))}
-      </div>
+      </ScrollRegion>
 
       {showButtons && (
         <div className="flex gap-2 border-t border-border bg-surface px-3 py-2">
