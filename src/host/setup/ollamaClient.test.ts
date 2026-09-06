@@ -127,6 +127,39 @@ describe('probeOllama — GET /api/tags (§2.4)', () => {
     );
   });
 
+  // SY-01: `probeOllama` used to cast the parsed body and `.map()` each row
+  // unvalidated — a malformed row (missing/wrong-typed `name`/`size`) landed
+  // in the returned `OllamaModel[]` violating that type at runtime. Fixed to
+  // validate-first: only rows shaped `{name: string, size: finite number}`
+  // survive; everything else is dropped silently (the probe resolves-never-
+  // rejects and has no log seam).
+  it('drops malformed /api/tags rows and keeps only well-formed ones (SY-01)', async () => {
+    const fixture = {
+      models: [{}, { name: 'x' }, { name: 'y', size: '1' }, { name: 'ok', size: 7 }, 'junk'],
+    };
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(200, 'OK', fixture));
+
+    const result = await probeOllama(ENDPOINT, fetchImpl);
+
+    expect(result).toEqual<OllamaStatus>({ running: true, models: [{ name: 'ok', sizeBytes: 7 }] });
+  });
+
+  it('a non-array `models` field degrades to an empty model list (SY-01)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(200, 'OK', { models: 'nope' }));
+
+    const result = await probeOllama(ENDPOINT, fetchImpl);
+
+    expect(result).toEqual<OllamaStatus>({ running: true, models: [] });
+  });
+
+  it('a top-level non-object 200 body still reports running:true with an empty model list (SY-01)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(200, 'OK', 42));
+
+    const result = await probeOllama(ENDPOINT, fetchImpl);
+
+    expect(result).toEqual<OllamaStatus>({ running: true, models: [] });
+  });
+
   it('a connection-refused-style fetch rejection reports {running:false}', async () => {
     const fetchImpl = vi
       .fn()

@@ -29,6 +29,8 @@
  *     `reject(new Error(e))` contract.
  */
 
+import { isRecord } from '../../shared/typeGuards';
+
 export interface OllamaModel {
   name: string;
   sizeBytes: number;
@@ -100,15 +102,6 @@ export class PullMalformedStreamError extends Error {
   }
 }
 
-interface TagsResponseModel {
-  name: string;
-  size: number;
-}
-
-interface TagsResponseBody {
-  models?: TagsResponseModel[];
-}
-
 /** F2-15: probeOllama's own body ceiling — /api/tags is a small JSON
  *  document; 1 MiB is orders of magnitude above any legitimate tag list. */
 const PROBE_MAX_BODY_BYTES = 1 * 1024 * 1024;
@@ -172,8 +165,14 @@ export async function probeOllama(
     if (!raw.ok) {
       return { running: false, detail: `Ollama /api/tags ${raw.reason}` };
     }
-    const body = JSON.parse(raw.text) as TagsResponseBody;
-    const models: OllamaModel[] = (body.models ?? []).map((m) => ({ name: m.name, sizeBytes: m.size }));
+    const parsed: unknown = JSON.parse(raw.text);
+    // `Array.isArray` narrows `unknown` to `any[]` — annotate `rows` so no `any` leaks.
+    const rows: unknown[] = isRecord(parsed) && Array.isArray(parsed.models) ? parsed.models : [];
+    const models: OllamaModel[] = rows.flatMap((m: unknown) =>
+      isRecord(m) && typeof m.name === 'string' && typeof m.size === 'number' && Number.isFinite(m.size)
+        ? [{ name: m.name, sizeBytes: m.size }]
+        : [],
+    );
     return { running: true, models };
   } catch (err) {
     return { running: false, detail: errorMessage(err) };
