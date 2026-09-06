@@ -379,6 +379,29 @@ export async function downloadGgufToStore(
     throw err;
   }
 
+  // SEC-01 (Lens-R2, FROZEN-TOUCH, refusal-only): the write gate
+  // (modelStore.lstatCheckedGgufDest) checks root → owner → repo; re-assert
+  // root + owner here too, closing the multi-minute download window
+  // symmetrically. Same derivation as the gate (modelStore.ts:196-205): owner
+  // = dirnameOf(repo), root = dirnameOf(owner).
+  // ENOENT-on-swap already makes the rename fail closed (Security lens
+  // fp-check); this is defense-in-depth parity, not an exploit fix.
+  const ownerDir = dirnameOf(normalizedDestDir);
+  const rootDir = dirnameOf(ownerDir);
+  let rootKind: Awaited<ReturnType<typeof io.lstatKind>>;
+  let ownerKind: Awaited<ReturnType<typeof io.lstatKind>>;
+  try {
+    rootKind = await io.lstatKind(rootDir);
+    ownerKind = await io.lstatKind(ownerDir);
+  } catch (err) {
+    await io.removeTemp(handle.path);
+    throw err;
+  }
+  if (rootKind !== 'dir' || ownerKind !== 'dir') {
+    await io.removeTemp(handle.path);
+    throw new GgufStoreSymlinkRaceError();
+  }
+
   // CA-M09 (frozen commit, owner-approved rev-3): re-lstat the destination
   // IMMEDIATELY before the landing rename — the caller's checkedStoreDest
   // re-assert ran a whole download ago (the 2-await gap); a symlink raced
