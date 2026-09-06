@@ -66,8 +66,14 @@ export type ToolKind =
  * messages; folded client-side only (T-A1's job). Listed here so the shared
  * `ToolStatus` union — and the exhaustive `STATUS` Record consuming it in
  * `ToolCard.tsx` — stay the single source of truth `tsc` enforces.
+ *
+ * `approved`/`denied` (Lens-R2 BH-05 / ADR-R2-15): the terminal state of a
+ * synthetic edit-approval tool card, derived from `approval.settle` on the
+ * matching id when it is still `pending` — names the APPROVAL's outcome, not
+ * the underlying tool's (which the real `tc-…` card reports separately).
+ * NOT emitted by the host on `tool.*` messages; folded client-side only.
  */
-export type ToolStatus = 'pending' | 'running' | 'done' | 'failed' | 'interrupted';
+export type ToolStatus = 'pending' | 'running' | 'done' | 'failed' | 'interrupted' | 'approved' | 'denied';
 
 /**
  * A single hunk of a unified diff. `header` is the `@@ -a,b +c,d @@` line;

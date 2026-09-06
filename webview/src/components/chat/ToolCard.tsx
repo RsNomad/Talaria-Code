@@ -20,6 +20,10 @@ export const STATUS: Record<ToolStatus, { tone: PillTone; label: string; icon: s
   // file's `tsc` compile — green ahead of T-A1's real fold logic. See
   // `ToolStatus`'s own doc for what emits this.
   interrupted: { tone: 'neutral', label: 'Interrupted', icon: 'stop-circle' },
+  // Lens-R2 BH-05 / ADR-R2-15: synthetic edit-approval card terminal states —
+  // name the approval's outcome, not the tool's. See `ToolStatus`'s own doc.
+  approved: { tone: 'add', label: 'Approved', icon: 'check' },
+  denied: { tone: 'del', label: 'Denied', icon: 'circle-slash' },
 };
 
 /** UI-I1: a `status` outside the known `ToolStatus` enum (a version-skewed or

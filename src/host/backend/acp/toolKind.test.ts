@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { mapToolKind, mapToolStatus, mapPlanStatus, mapPlanEntry } from './toolKind';
+import type { AcpToolStatus } from './types';
 
 describe('mapToolKind', () => {
   it('passes through kinds shared with the protocol union', () => {
@@ -35,6 +36,22 @@ describe('mapToolStatus', () => {
     expect(mapToolStatus('pending')).toBe('pending');
     expect(mapToolStatus(null)).toBe('pending');
     expect(mapToolStatus(undefined)).toBe('pending');
+  });
+
+  it('lock: never returns approved/denied for any ACP input (those are folded client-side only, from approval.settle — the host never emits them on tool.* messages)', () => {
+    const acpInputs: (AcpToolStatus | null | undefined)[] = [
+      'pending',
+      'in_progress',
+      'completed',
+      'failed',
+      null,
+      undefined,
+    ];
+    for (const input of acpInputs) {
+      const mapped = mapToolStatus(input);
+      expect(mapped).not.toBe('approved');
+      expect(mapped).not.toBe('denied');
+    }
   });
 });
 
