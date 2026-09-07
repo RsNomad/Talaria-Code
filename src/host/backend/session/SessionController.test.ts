@@ -1297,6 +1297,104 @@ describe('SessionController.sendPrompt — V-19: attachment path confinement', (
 });
 
 /**
+ * WS-R1 R1-5 (L2-CA-25): `buildPromptContent` now returns `{blocks,
+ * droppedCount}` — `runTurn` destructures both and folds `droppedCount` into
+ * the SAME session-scoped "dropped" message `confineAttachmentPaths`'s count
+ * already produces (never a second message). A genuinely unparseable data
+ * URI (here: malformed percent-encoding, which throws `URIError` inside
+ * `parseDataUri`) must never surface as a `runTurn` rejection — the turn
+ * still resolves and `client.prompt` still runs with whatever attachments DID
+ * parse.
+ */
+describe('SessionController.sendPrompt — R1-5: unreadable data-URI attachments are counted, not silently dropped', () => {
+  function makeFakeClient(prompt: AcpClientLike['prompt']): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in an R1-5 attachment-drop-counting test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt,
+      cancel: async () => unused('cancel'),
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  function makePort(client: AcpClientLike): { port: SessionHostPort; emitted: HostToWebviewMessage[] } {
+    const emitted: HostToWebviewMessage[] = [];
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => [],
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return { port, emitted };
+  }
+
+  it('RED: a turn with unreadable (malformed percent-encoded) data-URI attachments resolves — the malformed URIError never rejects runTurn, and the OTHER attachments + text still reach client.prompt', async () => {
+    let promptContent: AcpOutboundContentBlock[] | undefined;
+    const client = makeFakeClient(async (_sessionId, content) => {
+      promptContent = content;
+      return { stopReason: 'end_turn' };
+    });
+    const { port, emitted } = makePort(client);
+    const controller = new SessionController('session-1', '/no-workspace', port);
+
+    const badAttachment: Attachment = { id: 'b1', name: 'bad.txt', kind: 'file', dataUri: 'data:,%E0%A4%A' };
+    const okAttachment: Attachment = { id: 'ok1', name: 'shot.png', kind: 'image', dataUri: 'data:image/png;base64,QUJD' };
+    controller.sendPrompt('look at this', 'default', [badAttachment, okAttachment]);
+
+    await vi.waitFor(() => expect(promptContent).toBeDefined());
+
+    // The unreadable attachment never reaches the prompt; the readable one does.
+    expect(promptContent).toEqual([
+      { type: 'text', text: 'look at this' },
+      { type: 'image', data: 'QUJD', mimeType: 'image/png' },
+    ]);
+
+    const errorMsg = emitted.find(
+      (m): m is Extract<HostToWebviewMessage, { type: 'error' }> => m.type === 'error',
+    );
+    expect(errorMsg).toBeDefined();
+    expect(errorMsg?.sessionId).toBe('session-1');
+    expect(errorMsg?.message).toContain('1 attachment');
+    expect(errorMsg?.message).not.toContain('bad.txt');
+    expect(errorMsg?.message).not.toContain('data:');
+  });
+
+  it('RED: droppedCount from buildPromptContent folds INTO the same message confineAttachmentPaths already produces (never a second error)', async () => {
+    let promptContent: AcpOutboundContentBlock[] | undefined;
+    const client = makeFakeClient(async (_sessionId, content) => {
+      promptContent = content;
+      return { stopReason: 'end_turn' };
+    });
+    const { port, emitted } = makePort(client);
+    const controller = new SessionController('session-1', '/no-workspace', port);
+
+    const bad1: Attachment = { id: 'b1', name: 'bad1.txt', kind: 'file', dataUri: 'data:garbage' };
+    const bad2: Attachment = { id: 'b2', name: 'bad2.txt', kind: 'file', dataUri: 'data:,%E0%A4%A' };
+    controller.sendPrompt('hi', 'default', [bad1, bad2]);
+
+    await vi.waitFor(() => expect(promptContent).toBeDefined());
+
+    expect(promptContent).toEqual([{ type: 'text', text: 'hi' }]);
+
+    const errorMsgs = emitted.filter((m) => m.type === 'error');
+    expect(errorMsgs).toHaveLength(1); // exactly one dropped-attachments message, not two
+    expect((errorMsgs[0] as Extract<HostToWebviewMessage, { type: 'error' }>).message).toContain('2 attachments');
+  });
+});
+
+/**
  * I-2 (W1-T3 review, Important fix): `loadReplayOutcome`'s LAST supersede
  * guard (`this.replay !== replay`) sits right before `this.replay =
  * undefined` (~:1142-1144) — but `await this.pinWireModeDefault(...)`

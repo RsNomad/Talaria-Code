@@ -1230,18 +1230,10 @@ export class SessionController {
       // canonical path) the mention path already gets (`context/resolver.ts`
       // `resolveFileOrFolder`). A dropped attachment is never sent; the
       // session-scoped error names only the COUNT, never the path/content.
-      const { attachments: confinedAttachments, droppedCount } = await confineAttachmentPaths(
+      const { attachments: confinedAttachments, droppedCount: confineDroppedCount } = await confineAttachmentPaths(
         attachments ?? [],
         this.port.workspaceRoots(),
       );
-      if (droppedCount > 0) {
-        this.port.emit({
-          type: 'error',
-          sessionId: this.sessionId,
-          turnId,
-          message: `${droppedCount} attachment${droppedCount === 1 ? '' : 's'} dropped (outside the workspace or secret-classified)`,
-        });
-      }
 
       const promptText = this.activePreset === 'plan' ? PLAN_PREAMBLE + text : text;
       // A-03 (WS-AC): the degrade decision is derived ONCE per turn from the
@@ -1251,8 +1243,28 @@ export class SessionController {
       // one-line change in promptCaps.ts, nowhere else. Optional-member `?.`:
       // test doubles without the getter read as "nothing advertised".
       const promptCaps = derivePromptCaps(client.getAdvertisedPromptCapabilities?.());
+      // L2-CA-25 (WS-R1 R1-5): `buildPromptContent` now ALSO counts
+      // attachments that survived confinement but were genuinely unreadable
+      // (a malformed/unparseable `dataUri` — see `attachments.ts`'s
+      // `parseDataUri`). Folded into the SAME session-scoped "dropped"
+      // message `confineDroppedCount` already produces below — never a
+      // second message, and never content/path/filename, count only.
+      const { blocks: promptContentBlocks, droppedCount: unreadableDroppedCount } = buildPromptContent(
+        promptText,
+        confinedAttachments,
+        promptCaps,
+      );
+      const droppedCount = confineDroppedCount + unreadableDroppedCount;
+      if (droppedCount > 0) {
+        this.port.emit({
+          type: 'error',
+          sessionId: this.sessionId,
+          turnId,
+          message: `${droppedCount} attachment${droppedCount === 1 ? '' : 's'} dropped (outside the workspace, secret-classified, or unreadable)`,
+        });
+      }
       const content: AcpOutboundContentBlock[] = [
-        ...buildPromptContent(promptText, confinedAttachments, promptCaps),
+        ...promptContentBlocks,
         ...mentionBlocks(resolved ?? [], promptCaps),
       ];
       const response = await client.prompt(this.sessionId, content);
