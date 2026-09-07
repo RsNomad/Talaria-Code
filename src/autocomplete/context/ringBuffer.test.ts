@@ -571,9 +571,14 @@ describe('no brand-preserving spread produces a ScannedSnippet outside the sanct
   // `ctx.snippets` (the branded array) passes through by reference,
   // untouched and never re-derived, so no new/unscanned content is ever
   // introduced under the brand.
+  // context/contextService.ts (FI-21 site 3): spreads `IngestCandidate` —
+  // PRE-scan, UNBRANDED (`context/types.ts`) — a false positive for
+  // SPREAD_RE's ScannedSnippet-provenance concern by construction; the only
+  // overridden field is `anchor` (a request-scoped value, not content).
   const SANCTIONED_SPREAD_FILES = new Set([
     'context/ringBuffer.ts',
     'context/snippetBudgeter.ts',
+    'context/contextService.ts',
     'index.ts',
     'engine.ts',
   ]);
@@ -589,6 +594,20 @@ describe('no brand-preserving spread produces a ScannedSnippet outside the sanct
     // would rubber-stamp any file.
     const hypotheticalUnsafeSite = 'const forged = { ...scanned, content: attackerControlledBytes };';
     expect(SPREAD_RE.test(hypotheticalUnsafeSite)).toBe(true);
+
+    // F9-3 (FI-21 site 3): the same brand-preserving shape, via the OTHER
+    // fields critic C-2 flagged as a narrowing risk — `ScannedSnippet` has
+    // no `path` field, so overriding `filepath`/`uri` is just as capable of
+    // smuggling unscanned provenance as overriding `content` directly.
+    const filepathOverride = 'const forged = { ...scanned, filepath: evilPath };';
+    expect(SPREAD_RE.test(filepathOverride)).toBe(true);
+    const uriOverride = 'const forged = { ...scanned, uri: evilUri };';
+    expect(SPREAD_RE.test(uriOverride)).toBe(true);
+    // Shorthand property form (`{ ...scanned, content }`) — same override,
+    // no `:`, still flagged (the regex only requires a spread followed by a
+    // comma-terminated identifier, not a `key: value` pair).
+    const shorthandOverride = 'const forged = { ...scanned, content };';
+    expect(SPREAD_RE.test(shorthandOverride)).toBe(true);
 
     // A bare clone with no overridden field is NOT flagged — it cannot
     // introduce different content, so it carries none of the risk this
