@@ -1,5 +1,5 @@
 import { joinUrl } from '../util';
-import { BackendHttpError, readOpenAiSseText } from './http';
+import { BackendHttpError, readOpenAiSseText, armStreamDeadlines, raceWithDeadline } from './http';
 import { assertSecureAuthTransport } from './secureTransport';
 import { assertAllScanned } from '../context/assertAllScanned';
 import type { BackendCapabilities, FimBackend, FimRequest } from '../types';
@@ -95,14 +95,22 @@ export class VllmFimBackend implements FimBackend {
     // embeds it is ever sent.
     assertAllScanned(req.context.snippets);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal,
-    });
+    // ADR-R2-06 (L2-CA-05, C-1-redesigned): armed immediately BEFORE fetch()
+    // so the first-byte deadline spans the fetch() await AND the reader's
+    // first read() — see http.ts's doc comments for the full design.
+    const dl = armStreamDeadlines(signal);
+    const response = await raceWithDeadline(
+      fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: dl.signal,
+      }),
+      dl,
+    );
 
     if (!response.ok) {
+      dl.dispose();
       throw new BackendHttpError(
         `vLLM /v1/completions failed: ${response.status} ${response.statusText}`,
         response.status,
@@ -113,6 +121,7 @@ export class VllmFimBackend implements FimBackend {
     // no real status to report as the cause, so this stays a plain Error rather
     // than a fabricated BackendHttpError with an invented status.
     if (!response.body) {
+      dl.dispose();
       throw new Error(
         `vLLM /v1/completions failed: ${response.status} ${response.statusText}`,
       );
@@ -122,6 +131,6 @@ export class VllmFimBackend implements FimBackend {
     // http.ts. vLLM really does emit a mid-stream error as a `data:` frame
     // on this same 200 stream (serving.py:491-497), which this used to read
     // as "no text this round" and silently continue past.
-    yield* readOpenAiSseText(response, 'vLLM');
+    yield* readOpenAiSseText(response, 'vLLM', dl);
   }
 }

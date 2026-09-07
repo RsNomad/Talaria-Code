@@ -1,5 +1,5 @@
 import { joinUrl } from '../util';
-import { BackendHttpError, BackendStreamError, readNdjsonLines } from './http';
+import { BackendHttpError, BackendStreamError, readNdjsonLines, armStreamDeadlines, raceWithDeadline } from './http';
 import { assertAllScanned } from '../context/assertAllScanned';
 import { isRecord } from '../../shared/typeGuards';
 import type { BackendCapabilities, FimBackend, FimRequest } from '../types';
@@ -79,14 +79,22 @@ export class OllamaFimBackend implements FimBackend {
     // adjacent placement of the other backends' transport/content guards).
     assertAllScanned(req.context.snippets);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
+    // ADR-R2-06 (L2-CA-05, C-1-redesigned): armed immediately BEFORE fetch()
+    // so the first-byte deadline spans the fetch() await AND the reader's
+    // first read() — see http.ts's doc comments for the full design.
+    const dl = armStreamDeadlines(signal);
+    const response = await raceWithDeadline(
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: dl.signal,
+      }),
+      dl,
+    );
 
     if (!response.ok) {
+      dl.dispose();
       throw new BackendHttpError(
         `Ollama /api/generate failed: ${response.status} ${response.statusText}`,
         response.status,
@@ -97,12 +105,13 @@ export class OllamaFimBackend implements FimBackend {
     // no real status to report as the cause, so this stays a plain Error rather
     // than a fabricated BackendHttpError with an invented status.
     if (!response.body) {
+      dl.dispose();
       throw new Error(
         `Ollama /api/generate failed: ${response.status} ${response.statusText}`,
       );
     }
 
-    for await (const raw of readNdjsonLines(response)) {
+    for await (const raw of readNdjsonLines(response, dl)) {
       // WS-BG (SYN-BOUNDARY): a non-record NDJSON line off a user-configured
       // server is junk — skip it exactly like the SSE reader's "no text this
       // round" posture, never dot into it through a bare cast.

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { OllamaFimBackend } from './OllamaFimBackend';
-import { BackendHttpError, BackendStreamError } from './http';
+import { BackendHttpError, BackendStreamError, StreamIdleTimeoutError, STREAM_IDLE_TIMEOUT_MS } from './http';
 import { scannedSnippetForTest } from '../context/scannedSnippetTestFactory';
 import type { FimContext, FimRequest } from '../types';
 import type { ScannedSnippet } from '../context/types';
@@ -317,5 +317,45 @@ describe('OllamaFimBackend.streamFim — WS-BG NDJSON chunk ingress', () => {
 
   it('a mid-stream error chunk still throws BackendStreamError (unchanged)', async () => {
     await expect(collect([{ error: 'boom' }])).rejects.toThrow(BackendStreamError);
+  });
+});
+
+/**
+ * WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): proves this backend
+ * actually threads `armStreamDeadlines`/`raceWithDeadline` end to end — a
+ * mid-stream stall (fetch resolves fast with a first chunk, then goes
+ * silent) is reaped as `StreamIdleTimeoutError` once the 120s inter-chunk
+ * idle elapses, not left to hang until VS Code cancels or the runtime's own
+ * 300s default.
+ */
+describe('OllamaFimBackend.streamFim — ADR-R2-06 stream deadlines (L2-CA-05)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('reaps a mid-stream stall as StreamIdleTimeoutError once the 120s inter-chunk idle elapses', async () => {
+    vi.useFakeTimers();
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(JSON.stringify({ response: 'a', done: false }) + '\n'));
+        // Deliberately never enqueue again, never close.
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, body } as unknown as Response));
+
+    const backend = new OllamaFimBackend({ apiBase: 'http://127.0.0.1:11434', model: 'qwen2.5-coder:1.5b-base' });
+    const iterator = backend.streamFim(req(), new AbortController().signal)[Symbol.asyncIterator]();
+
+    const first = await iterator.next();
+    expect(first.value).toBe('a');
+
+    // Attach the rejection expectation BEFORE advancing timers (vitest's own
+    // idiom for this exact shape — see embedder.test.ts's RAG-2 deadline
+    // test) so nothing ever observes `pending` as unhandled mid-advance.
+    const assertion = expect(iterator.next()).rejects.toBeInstanceOf(StreamIdleTimeoutError);
+    await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS);
+    await assertion;
   });
 });

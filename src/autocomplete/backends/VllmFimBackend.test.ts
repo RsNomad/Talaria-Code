@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { VllmFimBackend } from './VllmFimBackend';
-import { BackendHttpError, BackendStreamError } from './http';
+import { BackendHttpError, BackendStreamError, StreamIdleTimeoutError, STREAM_IDLE_TIMEOUT_MS } from './http';
 import { InsecureTransportError } from './secureTransport';
 import { scannedSnippetForTest } from '../context/scannedSnippetTestFactory';
 import type { FimContext, FimRequest } from '../types';
@@ -451,5 +451,42 @@ describe('VllmFimBackend.streamFim — V-14: mid-stream SSE error frame', () => 
     }
 
     expect(out).toEqual(['partial']);
+  });
+});
+
+/**
+ * WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): proves this backend
+ * actually threads `armStreamDeadlines`/`raceWithDeadline` end to end — a
+ * mid-stream stall (fetch resolves fast with a first SSE event, then goes
+ * silent) is reaped as `StreamIdleTimeoutError` once the 120s inter-chunk
+ * idle elapses, not left to hang until VS Code cancels or the runtime's own
+ * 300s default.
+ */
+describe('VllmFimBackend.streamFim — ADR-R2-06 stream deadlines (L2-CA-05)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('reaps a mid-stream stall as StreamIdleTimeoutError once the 120s inter-chunk idle elapses', async () => {
+    vi.useFakeTimers();
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"text":"a"}]}\n\n'));
+        // Deliberately never enqueue again, never close.
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, body } as unknown as Response));
+
+    const backend = new VllmFimBackend({ apiBase: 'http://127.0.0.1:8000', model: 'qwen2.5-coder:1.5b-base' });
+    const iterator = backend.streamFim(req(), new AbortController().signal)[Symbol.asyncIterator]();
+
+    const first = await iterator.next();
+    expect(first.value).toBe('a');
+
+    const assertion = expect(iterator.next()).rejects.toBeInstanceOf(StreamIdleTimeoutError);
+    await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS);
+    await assertion;
   });
 });

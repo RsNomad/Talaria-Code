@@ -333,7 +333,7 @@ import {
   type NextEditEgressVerdict,
 } from './shell.vscode';
 import { NextEditGuard, type NextEditConfigPort, type NextEditSource } from './guard';
-import { BackendHttpError } from '../backends/http';
+import { BackendHttpError, StreamIdleTimeoutError } from '../backends/http';
 import { InsecureTransportError } from '../backends/secureTransport';
 import type { ToggleState } from './mode';
 
@@ -1732,6 +1732,32 @@ describe('next-edit fails VISIBLY, once (F-4 / F-5 / C-5)', () => {
     expect(host.warnings[0]).not.toContain('user:pw');
     expect(host.warnings[0]).not.toContain('CWE-319');
     expect(host.warnings[0]).toContain('https');
+  });
+
+  // WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): `StreamIdleTimeoutError`
+  // is none of `InsecureTransportError`/`BackendHttpError`/
+  // `NextEditMintRejectionError` — it falls through `surfaceTriggerFailure`
+  // to the LAST, unconditional "unreachable" arm (the same one a genuine
+  // connection refusal or DNS failure hits), with ZERO code changes needed
+  // to this file: `runPrediction`'s own early-return guard
+  // (`controller.signal.aborted || this.disposed`) does NOT intercept this,
+  // because the AbortController that fires here is `armStreamDeadlines`'s
+  // OWN internal one — a DIFFERENT signal than the `controller` this file
+  // passes down (`AbortSignal.any` composition is one-directional: our own
+  // idle timer aborting never marks the CALLER's controller as aborted).
+  it('a StreamIdleTimeoutError (the ADR-R2-06 stream-idle reap) renders the SAME "unreachable" copy as a plain connection failure — no new arm needed', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    backendSpy.respond = () => Promise.reject(new StreamIdleTimeoutError());
+    await setupShell({ next: true, generic: false });
+
+    await fireTrigger();
+
+    expect(host.warnings).toHaveLength(1);
+    expect(host.warnings[0]).toMatch(/is paused: the request to the .* server at .* failed\. Check/);
+    // Egress hygiene, reinforced at the ladder: the rendered copy carries no
+    // hint of the deadline's own internal machinery.
+    expect(host.warnings[0]).not.toContain('StreamIdleTimeoutError');
+    expect(host.warnings[0]).not.toContain('deadline');
   });
 
   it('an ABORTED request surfaces NOTHING — aborts are the common case, not a failure', async () => {

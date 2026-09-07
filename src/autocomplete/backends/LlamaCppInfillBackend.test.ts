@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { LlamaCppInfillBackend } from './LlamaCppInfillBackend';
-import { BackendHttpError } from './http';
+import { BackendHttpError, StreamIdleTimeoutError, STREAM_IDLE_TIMEOUT_MS } from './http';
 import { InsecureTransportError } from './secureTransport';
 import { scannedSnippetForTest } from '../context/scannedSnippetTestFactory';
 import type { ScannedSnippet } from '../context/types';
@@ -641,5 +641,64 @@ describe('LlamaCppInfillBackend.warmUp — F4: optional apiKey', () => {
     expect(() => backend.warmUp([snippet()], new AbortController().signal)).not.toThrow();
 
     expect(fetchSpy).toHaveBeenCalledTimes(0);
+  });
+});
+
+/**
+ * WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): proves `streamFim`
+ * (the request `warmUp` never shares — warmUp is fire-and-forget and reads
+ * no body at all, so it deliberately keeps its own untouched signal, see
+ * `LlamaCppInfillBackend.ts`'s own comment) actually threads
+ * `armStreamDeadlines`/`raceWithDeadline` end to end. Unlike the SSE/NDJSON
+ * backends, `/infill` is non-streaming (`readJsonBounded`) — the analogous
+ * stall here is a response whose body starts arriving but never finishes,
+ * so `readJsonBounded`'s own read loop is what observes the idle deadline.
+ */
+describe('LlamaCppInfillBackend.streamFim — ADR-R2-06 stream deadlines (L2-CA-05)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function cleanReq(): FimRequest {
+    return {
+      model: 'qwen2.5-coder:1.5b-base',
+      prefix: 'const x = ',
+      suffix: '',
+      stop: [],
+      temperature: 0.01,
+      maxTokens: 128,
+      context: {
+        filepath: 'file:///a.ts',
+        languageId: 'typescript',
+        prefix: 'const x = ',
+        suffix: '',
+        workspaceUris: [],
+        snippets: [snippet({ content: 'const a = 1;' })],
+      },
+    };
+  }
+
+  it('reaps a stalled (never-completing) /infill body as StreamIdleTimeoutError once the 120s inter-chunk idle elapses', async () => {
+    vi.useFakeTimers();
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // A partial JSON body — arrives, but the response never completes
+        // (no closing brace, no close()).
+        controller.enqueue(encoder.encode('{"content":"partial'));
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, body } as unknown as Response));
+
+    const backend = new LlamaCppInfillBackend({ apiBase: 'http://127.0.0.1:8080' });
+    const pending = backend
+      .streamFim(cleanReq(), new AbortController().signal)
+      [Symbol.asyncIterator]()
+      .next();
+
+    const assertion = expect(pending).rejects.toBeInstanceOf(StreamIdleTimeoutError);
+    await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS);
+    await assertion;
   });
 });

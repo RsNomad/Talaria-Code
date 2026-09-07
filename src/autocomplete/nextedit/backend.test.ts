@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { NextEditHttpBackend, clearNextEditBackendWarnings } from './backend';
 import { InsecureTransportError } from '../backends/secureTransport';
-import { BackendHttpError } from '../backends/http';
+import { BackendHttpError, StreamIdleTimeoutError, STREAM_IDLE_TIMEOUT_MS } from '../backends/http';
 import { mintScannedNextEditRequest } from './scan';
 import type { NextEditRequest, NextEditTransportId, ScannedNextEditRequest } from './types';
 import type { RenderedNextEditPrompt, StopReason } from './formats/types';
@@ -581,7 +581,13 @@ describe('NextEditHttpBackend.predict — CA-5 missing response.body guard (mirr
 });
 
 describe('NextEditHttpBackend.predict — abort signal', () => {
-  it('abort signal is honored (fetch receives the same signal)', async () => {
+  // ADR-R2-06 (L2-CA-05): `predict` now wraps the caller's signal in
+  // `armStreamDeadlines`'s composite (`AbortSignal.any([signal, ...])`) so
+  // fetch receives a DIFFERENT signal object than the caller's own — this
+  // used to assert object identity (`toBe(controller.signal)`); updated to
+  // the functional invariant that identity check stood in for: aborting the
+  // caller's signal still aborts whatever signal fetch actually received.
+  it('abort signal is honored (aborting the caller signal aborts the one fetch receives)', async () => {
     const fetchSpy = vi
       .fn()
       .mockResolvedValue(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' }));
@@ -593,7 +599,11 @@ describe('NextEditHttpBackend.predict — abort signal', () => {
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
-    expect(init.signal).toBe(controller.signal);
+    const receivedSignal = init.signal as AbortSignal;
+    expect(receivedSignal).not.toBe(controller.signal);
+    expect(receivedSignal.aborted).toBe(false);
+    controller.abort();
+    expect(receivedSignal.aborted).toBe(true);
   });
 });
 
@@ -686,4 +696,41 @@ describe('NextEditHttpBackend.predict — D1 bounded JSON body reads (unbounded-
       /response exceeded \d+ bytes without completing/,
     );
   });
+});
+
+/**
+ * WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): proves `predict` (both
+ * transports go through the SAME `armStreamDeadlines` arm/dispatch in
+ * `predict` itself) actually threads the deadline end to end. Non-streaming
+ * (`readJsonBounded`) — the stall here is a response body that starts
+ * arriving but never finishes, exactly like the FIM backends' equivalent
+ * `readJsonBounded` case (`LlamaCppInfillBackend.streamFim`).
+ */
+describe('NextEditHttpBackend.predict — ADR-R2-06 stream deadlines (L2-CA-05)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it.each<NextEditTransportId>(['ollama', 'openai-compat'])(
+    'transport=%s: reaps a stalled (never-completing) response body as StreamIdleTimeoutError once the 120s inter-chunk idle elapses',
+    async (transport) => {
+      vi.useFakeTimers();
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // A partial JSON body — arrives, but the response never completes.
+          controller.enqueue(encoder.encode('{"response":"partial'));
+        },
+      });
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: 'OK', body } as unknown as Response));
+
+      const backend = makeBackend(transport);
+      const pending = backend.predict(minted(), rendered(), new AbortController().signal);
+
+      const assertion = expect(pending).rejects.toBeInstanceOf(StreamIdleTimeoutError);
+      await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS);
+      await assertion;
+    },
+  );
 });

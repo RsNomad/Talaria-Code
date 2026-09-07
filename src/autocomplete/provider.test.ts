@@ -10,7 +10,7 @@ import type { FimEngine, EgressVerdictObserver } from './engine';
 import type { FimContext } from './types';
 import type { CrossFileContextService } from './context/contextService';
 import { scannedSnippetForTest } from './context/scannedSnippetTestFactory';
-import { BackendHttpError, BackendStreamError } from './backends/http';
+import { BackendHttpError, BackendStreamError, StreamIdleTimeoutError } from './backends/http';
 import { InsecureTransportError } from './backends/secureTransport';
 import { MissingApiKeyError } from './backends/CodestralFimBackend';
 import { must } from '../testing/must';
@@ -1081,6 +1081,31 @@ describe('TalariaInlineCompletionProvider — failure surfacing (A5)', () => {
   it('a bare TypeError (or any other error) returns null silently — no warning, unchanged v1 behavior (narrowed, not widened)', async () => {
     const engine = new FakeEngine();
     engine.throwError = new TypeError('fetch failed');
+    const showWarningMessage = mockShowWarningMessage;
+    const provider = makeProvider(engine);
+
+    const result = await complete(provider);
+
+    expect(result).toBeNull();
+    expect(showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  // WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): `surfaceCompletionFailure`
+  // has NO "unreachable"/timeout catch-all arm at all (unlike
+  // `shell.vscode.ts`'s `surfaceTriggerFailure`, which does — see that
+  // file's test suite for the equivalent case) — timeouts and connection
+  // refusals are already, deliberately, silent here (the test immediately
+  // above proves this for a bare TypeError). Adding a NEW toast arm for
+  // `StreamIdleTimeoutError` specifically would be a behavior change this
+  // task does not intend: VS Code cancels almost every FIM request on the
+  // next keystroke anyway (this file's own value-honesty framing), so a
+  // once-per-idle-stall toast would fire on every slow-but-not-cancelled
+  // keystroke rather than staying silent like every other timeout-class
+  // failure. `StreamIdleTimeoutError` therefore falls through this ladder
+  // exactly like the bare TypeError above — proven directly, not assumed.
+  it('a StreamIdleTimeoutError (the ADR-R2-06 stream-idle reap) returns null silently — same treatment as any other timeout-class failure, no new toast', async () => {
+    const engine = new FakeEngine();
+    engine.throwError = new StreamIdleTimeoutError();
     const showWarningMessage = mockShowWarningMessage;
     const provider = makeProvider(engine);
 

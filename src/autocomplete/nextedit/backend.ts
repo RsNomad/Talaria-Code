@@ -65,7 +65,14 @@
 // `ScannedNextEditRequest` — it obtains (and re-verifies) the brand purely
 // by CALLING `mintScannedNextEditRequest`, the one sanctioned mint.
 import { joinUrl } from '../util';
-import { BackendHttpError, readJsonBounded } from '../backends/http';
+import {
+  BackendHttpError,
+  readJsonBounded,
+  armStreamDeadlines,
+  raceWithDeadline,
+  MAX_STREAM_BYTES,
+  type StreamDeadlines,
+} from '../backends/http';
 import { assertSecureAuthTransport } from '../backends/secureTransport';
 import { mintScannedNextEditRequest } from './scan';
 import { isRecord } from '../../shared/typeGuards';
@@ -231,15 +238,21 @@ export class NextEditHttpBackend {
     // a cast/`any` seam let through).
     mintScannedNextEditRequest(req, this.opts.sentinels);
 
+    // ADR-R2-06 (L2-CA-05, C-1-redesigned): armed immediately BEFORE fetch()
+    // (in either transport arm below) so the first-byte deadline spans the
+    // fetch() await AND the reader's first read() — see http.ts's doc
+    // comments for the full design.
+    const dl = armStreamDeadlines(signal);
+
     return this.opts.transport === 'ollama'
-      ? this.predictOllama(url, rendered, signal)
-      : this.predictOpenAiCompat(url, rendered, signal, apiKey);
+      ? this.predictOllama(url, rendered, dl)
+      : this.predictOpenAiCompat(url, rendered, dl, apiKey);
   }
 
   private async predictOllama(
     url: string,
     rendered: RenderedNextEditPrompt,
-    signal: AbortSignal,
+    dl: StreamDeadlines,
   ): Promise<NextEditModelOutput> {
     const body = {
       model: this.opts.model,
@@ -254,14 +267,18 @@ export class NextEditHttpBackend {
       },
     };
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
+    const response = await raceWithDeadline(
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: dl.signal,
+      }),
+      dl,
+    );
 
     if (!response.ok) {
+      dl.dispose();
       throw new BackendHttpError(
         `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
         response.status,
@@ -277,6 +294,7 @@ export class NextEditHttpBackend {
     // but an opaque `SyntaxError: Unexpected end of JSON input` that never
     // names next-edit or the Ollama transport.
     if (!response.body) {
+      dl.dispose();
       throw new Error(
         `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
       );
@@ -286,7 +304,7 @@ export class NextEditHttpBackend {
     // Ollama's non-streaming /api/generate body is bounded by our own
     // num_predict, but a hostile/misconfigured server is free to send
     // anything; readJsonBounded caps it.
-    const raw = await readJsonBounded(response);
+    const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
     if (!isOllamaGenerateResponse(raw)) {
       // WS-BG: an ok-status body that isn't the documented response shape is
       // a misbehaving/misconfigured server — refuse loudly. Status-only
@@ -301,7 +319,7 @@ export class NextEditHttpBackend {
   private async predictOpenAiCompat(
     url: string,
     rendered: RenderedNextEditPrompt,
-    signal: AbortSignal,
+    dl: StreamDeadlines,
     apiKey: string | undefined,
   ): Promise<NextEditModelOutput> {
     const body = {
@@ -323,14 +341,18 @@ export class NextEditHttpBackend {
       headers.Authorization = `Bearer ${apiKey}`;
     }
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal,
-    });
+    const response = await raceWithDeadline(
+      fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: dl.signal,
+      }),
+      dl,
+    );
 
     if (!response.ok) {
+      dl.dispose();
       throw new BackendHttpError(
         `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
         response.status,
@@ -341,6 +363,7 @@ export class NextEditHttpBackend {
     // its comment for the full rationale (mirrors every FIM backend's
     // identical named guard).
     if (!response.body) {
+      dl.dispose();
       throw new Error(
         `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
       );
@@ -348,7 +371,7 @@ export class NextEditHttpBackend {
 
     // D1: bounded read (4 MiB cap), not the unbounded response.json() —
     // same rationale as predictOllama above.
-    const raw = await readJsonBounded(response);
+    const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
     if (!isOpenAiCompletionResponse(raw)) {
       // WS-BG: same refusal posture as predictOllama above (C-5 hygiene:
       // status only, never body content).

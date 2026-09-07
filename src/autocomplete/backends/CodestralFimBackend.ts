@@ -1,5 +1,5 @@
 import { joinUrl } from '../util';
-import { BackendHttpError, readOpenAiSseText } from './http';
+import { BackendHttpError, readOpenAiSseText, armStreamDeadlines, raceWithDeadline } from './http';
 import { assertSecureAuthTransport } from './secureTransport';
 import { assertAllScanned } from '../context/assertAllScanned';
 import type { BackendCapabilities, FimBackend, FimRequest } from '../types';
@@ -108,17 +108,25 @@ export class CodestralFimBackend implements FimBackend {
     // forged/bypassed snippet or a future any-typed laundering seam.
     assertAllScanned(req.context.snippets);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${trimmedApiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal,
-    });
+    // ADR-R2-06 (L2-CA-05, C-1-redesigned): armed immediately BEFORE fetch()
+    // so the first-byte deadline spans the fetch() await AND the reader's
+    // first read() — see http.ts's doc comments for the full design.
+    const dl = armStreamDeadlines(signal);
+    const response = await raceWithDeadline(
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${trimmedApiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: dl.signal,
+      }),
+      dl,
+    );
 
     if (!response.ok) {
+      dl.dispose();
       throw new BackendHttpError(
         `Codestral FIM failed: ${response.status} ${response.statusText}`,
         response.status,
@@ -129,6 +137,7 @@ export class CodestralFimBackend implements FimBackend {
     // no real status to report as the cause, so this stays a plain Error rather
     // than a fabricated BackendHttpError with an invented status.
     if (!response.body) {
+      dl.dispose();
       throw new Error(
         `Codestral FIM failed: ${response.status} ${response.statusText}`,
       );
@@ -138,6 +147,6 @@ export class CodestralFimBackend implements FimBackend {
     // http.ts. Handles both this backend's `choices[0].delta.content` shape
     // and the mid-stream error-frame case this used to read as "no delta
     // this round" and silently continue past.
-    yield* readOpenAiSseText(response, 'Codestral');
+    yield* readOpenAiSseText(response, 'Codestral', dl);
   }
 }

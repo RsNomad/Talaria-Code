@@ -117,11 +117,171 @@ export class StreamByteCapError extends Error {
 }
 
 /**
+ * ADR-R2-06 (L2-CA-05, C-1-redesigned): ONE first-byte deadline, EQUAL to
+ * undici's own default (`headersTimeout`/`bodyTimeout` = 300 s each —
+ * `@vscode/proxy-agent`'s Agent carries no override), spanning the caller's
+ * `fetch` await AND the reader's first `read()` call. NEVER tighter than
+ * the runtime for the first byte: a CPU-only Ollama box writes nothing at
+ * all — not even response headers — until the model is loaded and the first
+ * token is ready (model load + prefill sit inside that very `fetch` await;
+ * cline#6549 / ollama#7685's failure class). A separate, tighter
+ * "headers deadline" was the ORIGINAL design here and was rejected for
+ * exactly this reason (critic C-1) — do not reintroduce one.
+ */
+export const STREAM_FIRST_BYTE_MS = 300_000;
+
+/**
+ * The ONE genuine behavioural delta this task makes (everything else is
+ * already covered by VS Code's own per-keystroke cancellation or the
+ * runtime's 300 s default): once a stream has produced its first byte, a
+ * gap this long before the NEXT one is treated as a dead connection —
+ * tighter than the runtime default, on the theory that a runner already
+ * mid-response and then silent for two minutes is stuck, not merely slow to
+ * start.
+ */
+export const STREAM_IDLE_TIMEOUT_MS = 120_000;
+
+/**
+ * Thrown via the `AbortSignal` {@link armStreamDeadlines} hands to the
+ * caller's own `fetch` call and to the reader, once either the first-byte
+ * or the inter-chunk-idle deadline elapses. Egress hygiene (mandatory —
+ * reviewed): name and message carry NO url, host, endpoint, or API key;
+ * either failure ladder (`provider.ts`, `shell.vscode.ts`) supplies any
+ * user-facing wording.
+ */
+export class StreamIdleTimeoutError extends Error {
+  constructor() {
+    super('stream exceeded its deadline without producing data');
+    this.name = 'StreamIdleTimeoutError';
+  }
+}
+
+/** What {@link armStreamDeadlines} hands back. */
+export interface StreamDeadlines {
+  /** Pass to the caller's own `fetch` call as `init.signal`, AND to the
+   *  reader (which threads it into every `reader.read()` via
+   *  {@link raceWithDeadline}). */
+  readonly signal: AbortSignal;
+  /** Call once, the moment the FIRST `read()` call settles (with data or an
+   *  immediate `done`) — clears the first-byte deadline and arms the
+   *  tighter idle one in its place. */
+  firstByte(): void;
+  /** Call after every read() from the second one on — re-arms the idle
+   *  deadline against the NEXT gap. */
+  chunk(): void;
+  /** Clears any still-pending timer. Idempotent — safe to call more than
+   *  once, or on a deadline that already fired. */
+  dispose(): void;
+}
+
+/**
+ * `AbortSignal.any` where available (Node >= 20.3); a manual once-listener
+ * bridge on older hosts so the repo's `engines.node >= 18` floor stays
+ * truthful. Mirrors `host/dashboard/HermesDashboardClient.ts`'s own
+ * `anySignal` helper verbatim in shape — deliberately NOT imported from
+ * there: `autocomplete/backends/` is a host-independent leaf (its own
+ * `assertAllScannedLock.test.ts`/`authGuardLock.test.ts` pin exactly which
+ * files live here), so it must not gain a dependency on `host/`.
+ */
+function anySignal(signals: readonly AbortSignal[]): AbortSignal {
+  const anyImpl = (AbortSignal as unknown as { any?: (s: readonly AbortSignal[]) => AbortSignal }).any;
+  if (anyImpl) return anyImpl.call(AbortSignal, signals);
+  const c = new AbortController();
+  for (const s of signals) {
+    if (s.aborted) {
+      c.abort(s.reason);
+      break;
+    }
+    s.addEventListener('abort', () => c.abort(s.reason), { once: true });
+  }
+  return c.signal;
+}
+
+/**
+ * ADR-R2-06 (L2-CA-05, C-1-redesigned) — see {@link STREAM_FIRST_BYTE_MS} /
+ * {@link STREAM_IDLE_TIMEOUT_MS} for why these two numbers, not one, and why
+ * the first is never tighter than the runtime. Arms the first-byte deadline
+ * IMMEDIATELY (the caller must call this BEFORE its own `fetch` call, so the
+ * deadline is already live for the whole of that await); `firstByte()`/
+ * `chunk()` swap it for the idle deadline once data starts moving. Both
+ * numbers are constants, not settings — there is no `talaria.*` knob for
+ * either (ADR-R2-06 Q10).
+ */
+export function armStreamDeadlines(signal: AbortSignal | undefined): StreamDeadlines {
+  const ac = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const clear = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+  const arm = (ms: number): void => {
+    clear();
+    timer = setTimeout(() => {
+      ac.abort(new StreamIdleTimeoutError());
+    }, ms);
+    timer.unref?.();
+  };
+  arm(STREAM_FIRST_BYTE_MS);
+  return {
+    signal: signal ? anySignal([signal, ac.signal]) : ac.signal,
+    firstByte(): void {
+      arm(STREAM_IDLE_TIMEOUT_MS);
+    },
+    chunk(): void {
+      arm(STREAM_IDLE_TIMEOUT_MS);
+    },
+    dispose(): void {
+      clear();
+    },
+  };
+}
+
+/**
+ * Races `promise` against `dl`'s own deadline signal so a deadline reap is
+ * deterministic — independent of whatever a synthetic test double (or even
+ * a real but slow-to-notice transport) would otherwise do on its own. A
+ * no-op passthrough when `dl` is omitted, so every existing call site that
+ * never threads a deadline is byte-for-byte unchanged (golden reader
+ * semantics, 0 edits). On an abort win, rejects with the abort reason —
+ * {@link StreamIdleTimeoutError} when OUR OWN timer fired; whatever the
+ * caller's own upstream signal carries when THEY cancelled first (preserving
+ * existing cancellation behavior unchanged). Exported so every FIM/next-edit
+ * backend can apply the identical treatment to its own `fetch` call, not
+ * only the readers below to their `reader.read()` calls.
+ */
+export function raceWithDeadline<T>(promise: Promise<T>, dl: StreamDeadlines | undefined): Promise<T> {
+  if (!dl) return promise;
+  const { signal } = dl;
+  const abortError = (): Error => {
+    const reason: unknown = signal.reason;
+    return reason instanceof Error ? reason : new Error(String(reason));
+  };
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
+
+/**
  * Ollama's `/api/generate` streams newline-delimited JSON objects (one per line;
  * the final one carries `"done": true`) — see runner-apis-howto.md §1a.
  */
 export async function* readNdjsonLines(
   response: StreamableResponse,
+  dl?: StreamDeadlines,
 ): AsyncGenerator<unknown> {
   const reader = response.body?.getReader();
   if (!reader) return;
@@ -129,9 +289,21 @@ export async function* readNdjsonLines(
   const decoder = new TextDecoder();
   let buffer = '';
   let received = 0;
+  let sawFirstByte = false;
   try {
     for (;;) {
-      const { value, done } = await reader.read();
+      // ADR-R2-06: races the read itself against the deadline (rather than
+      // trusting a synthetic/mocked transport, or even a real one, to error
+      // the stream on its own) so `reader.cancel()` below still runs against
+      // a still-'readable' stream — required for the F7 cancel-on-exit
+      // discipline to actually reach the underlying source's own cancel().
+      const { value, done } = await raceWithDeadline(reader.read(), dl);
+      if (sawFirstByte) {
+        dl?.chunk();
+      } else {
+        sawFirstByte = true;
+        dl?.firstByte();
+      }
       if (done) break;
       // Count RAW bytes BEFORE decode, so delimiter-free garbage counts
       // too — a hostile/misbehaving server that never emits a '\n' must
@@ -173,6 +345,7 @@ export async function* readNdjsonLines(
     // local runner kept generating to `max_tokens` after e.g. a single-line
     // completion was accepted mid-stream — the HTTP connection was only
     // ever released, never torn down.
+    dl?.dispose();
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
@@ -190,6 +363,7 @@ export async function* readNdjsonLines(
  */
 export async function* readSseEvents(
   response: StreamableResponse,
+  dl?: StreamDeadlines,
 ): AsyncGenerator<string> {
   const reader = response.body?.getReader();
   if (!reader) return;
@@ -207,9 +381,17 @@ export async function* readSseEvents(
   };
 
   let received = 0;
+  let sawFirstByte = false;
   try {
     for (;;) {
-      const { value, done } = await reader.read();
+      // ADR-R2-06 — see readNdjsonLines above for the full rationale.
+      const { value, done } = await raceWithDeadline(reader.read(), dl);
+      if (sawFirstByte) {
+        dl?.chunk();
+      } else {
+        sawFirstByte = true;
+        dl?.firstByte();
+      }
       if (done) break;
       // Count RAW bytes BEFORE decode — see readNdjsonLines above for the
       // same rationale (delimiter-free garbage must still be bounded).
@@ -234,6 +416,7 @@ export async function* readSseEvents(
   } finally {
     // F7 — see readNdjsonLines' identical finally block above for the full
     // rationale: cancel() on every exit path, not just releaseLock().
+    dl?.dispose();
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
@@ -267,8 +450,9 @@ export async function* readSseEvents(
 export async function* readOpenAiSseText(
   response: StreamableResponse,
   label: string,
+  dl?: StreamDeadlines,
 ): AsyncGenerator<string> {
-  for await (const data of readSseEvents(response)) {
+  for await (const data of readSseEvents(response, dl)) {
     if (data === '[DONE]') return;
     const parsed = tryParseJson(data);
     // WS-BG (SYN-BOUNDARY): record-shaped frames only — `isRecord` also
@@ -296,15 +480,24 @@ export async function* readOpenAiSseText(
 export async function readJsonBounded(
   response: StreamableResponse,
   cap: number = MAX_STREAM_BYTES,
+  dl?: StreamDeadlines,
 ): Promise<unknown> {
   const reader = response.body?.getReader();
   const chunks: Uint8Array[] = [];
 
   if (reader) {
     let received = 0;
+    let sawFirstByte = false;
     try {
       for (;;) {
-        const { value, done } = await reader.read();
+        // ADR-R2-06 — see readNdjsonLines above for the full rationale.
+        const { value, done } = await raceWithDeadline(reader.read(), dl);
+        if (sawFirstByte) {
+          dl?.chunk();
+        } else {
+          sawFirstByte = true;
+          dl?.firstByte();
+        }
         if (done) break;
         received += value.byteLength;
         if (received > cap) {
@@ -320,6 +513,7 @@ export async function readJsonBounded(
       // matches readNdjsonLines/readSseEvents above. Cancel on an
       // already-closed/cancelled stream (e.g. the explicit cancel() the D1
       // over-cap throw above already issued) resolves harmlessly.
+      dl?.dispose();
       await reader.cancel().catch(() => {});
       reader.releaseLock();
     }
