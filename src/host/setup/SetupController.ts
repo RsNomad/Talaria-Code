@@ -136,8 +136,27 @@ class Emitter<T> {
     return { dispose: () => this.listeners.delete(listener) };
   };
 
+  /**
+   * WS-R2 R2-2 (L2-CA-19): every listener is served even when an earlier one
+   * throws — the `[...this.listeners]` snapshot alone only guarded against
+   * mutation-during-iteration; a throw used to abort the `for` loop outright
+   * and starve every later listener of the event. Throws are now collected
+   * and re-thrown together as an `AggregateError` — isolation without a
+   * silent swallow. See ADR-025-B for the accepted `pushProgress` setTimeout
+   * boundary this does not (and need not) reach into.
+   */
   fire(value: T): void {
-    for (const listener of [...this.listeners]) listener(value);
+    const errors: unknown[] = [];
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(value);
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'SetupController listener(s) threw');
+    }
   }
 
   dispose(): void {

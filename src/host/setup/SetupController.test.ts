@@ -2764,6 +2764,41 @@ describe('T7: onStatusChanged fires on confirmed-start, failure-write, success, 
   });
 });
 
+// --- WS-R2 R2-2 (L2-CA-19): Emitter.fire isolates listeners + aggregates throws ---
+
+describe('WS-R2 R2-2 (L2-CA-19): a throwing onStatusChanged listener does not starve a later listener', () => {
+  it('every listener is served, and the throw surfaces as an AggregateError (not swallowed, not the raw error)', async () => {
+    const { controller } = makeController();
+    const later: boolean[] = [];
+    controller.onStatusChanged(() => {
+      throw new Error('boom');
+    });
+    controller.onStatusChanged(() => {
+      later.push(true);
+    });
+
+    let caught: unknown;
+    try {
+      // setup.recheck's single completion bumpStatus() (T7, ADR-025-D) is the
+      // trigger — handleRecheck has no try/catch around it, so a throw here
+      // propagates straight out of controller.handle() as a rejection.
+      await controller.handle('setup.recheck', {});
+    } catch (err) {
+      caught = err;
+    }
+
+    // The isolation half (CA-19's point): listener 2 still ran even though
+    // listener 1 threw FIRST.
+    expect(later).toEqual([true]);
+    // The no-silent-swallow half: the throw still surfaces, aggregated.
+    expect(caught).toBeInstanceOf(AggregateError);
+    const aggregate = caught as AggregateError;
+    expect(aggregate.errors).toHaveLength(1);
+    expect(aggregate.errors[0]).toBeInstanceOf(Error);
+    expect((aggregate.errors[0] as Error).message).toBe('boom');
+  });
+});
+
 // --- T13 (beta.5 §4.4): allowlist pull gate — classification + refusal order --
 
 // §6 copy, verbatim (drift-locked).
