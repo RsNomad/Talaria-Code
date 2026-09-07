@@ -1,6 +1,7 @@
 import type {
   HostToWebview,
   ControlMethod,
+  DataPanel,
   EditPolicyPreset,
   HydrateTabSeed,
   SlashCommandInfo,
@@ -320,13 +321,9 @@ export class ControlDispatcher {
       // op settles, so the persisted list MUST be pushed BEFORE this RPC resolves
       // (postMessage is FIFO on one channel → the push folds first). The push is a
       // courtesy re-fetch of state that already persisted, so its failure must not
-      // turn a successful toggle into a rejected RPC (ADR-R2-16) — log and return.
+      // turn a successful toggle into a rejected RPC (ADR-R2-16) — see {@link rePushPanel}.
       const panel = method === 'skills.toggle' ? 'skills' : 'tools';
-      try {
-        await this.panels.fetchPanelData(panel);
-      } catch (err) {
-        this.port.logger?.append(`[ControlDispatcher] ${method}: panel re-push failed (toggle persisted) — ${errorMessage(err)}`);
-      }
+      await this.rePushPanel(panel, method);
       return raw;
     }
 
@@ -345,7 +342,9 @@ export class ControlDispatcher {
     if (method === 'reload.mcp') {
       const raw = await this.port.dispatch(method, params);
       if (isReloadedResult(raw)) {
-        await this.panels.fetchPanelData('mcp');
+        // L2-CA-26 (ADR-R2-16 completion): the reload already persisted
+        // server-side by the time `raw` resolves — see {@link rePushPanel}.
+        await this.rePushPanel('mcp', method);
       }
       return raw;
     }
@@ -361,15 +360,39 @@ export class ControlDispatcher {
       // panel is re-fetched FRESH (a real `model.options` read, not
       // anything fabricated from the request) and pushed; a failure (e.g.
       // the harness's 4006 "managed install" refusal) rejects this call
-      // and never touches the panel.
+      // and never touches the panel. L2-CA-26 (ADR-R2-16 completion): the
+      // save already persisted by the time `raw` resolves, so the refetch
+      // itself must never turn that success into a rejection — see {@link
+      // rePushPanel} (which also NEVER logs `params`, the API key).
       const raw = await this.port.dispatch(method, params);
       if (isSaveKeyResult(raw)) {
-        await this.panels.fetchPanelData('models');
+        await this.rePushPanel('models', method);
       }
       return raw;
     }
 
     return this.port.dispatch(method, params);
+  }
+
+  /**
+   * CA-26 / ADR-R2-16 (completes C1/BH-01, which applied this pattern to the
+   * toggle branches only): a panel re-push is a courtesy re-fetch of state
+   * that ALREADY persisted server-side (the toggle write, the `reload.mcp`
+   * confirm, the `model.save_key` provider write) by the time this is
+   * called — its failure must never turn that successful, already-persisted
+   * RPC into a rejected one. All three panel-mutating branches
+   * (`skills.toggle`/`toolsets.toggle`, `reload.mcp`, `model.save_key`) route
+   * through this ONE helper instead of each carrying its own try/catch.
+   * NEVER logs `params` — `model.save_key`'s params carry the provider API
+   * key (CF-13/D1); the log line names only the method and the caught
+   * error's message.
+   */
+  private async rePushPanel(panel: DataPanel, method: string): Promise<void> {
+    try {
+      await this.panels.fetchPanelData(panel);
+    } catch (err) {
+      this.port.logger?.append(`[ControlDispatcher] ${method}: panel re-push failed (mutation persisted) — ${errorMessage(err)}`);
+    }
   }
 
   // WS-GD.2a A9: `toggleDashboard`/`toggleDashboardInner`/`extractToggleParams`

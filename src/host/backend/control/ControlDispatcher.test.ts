@@ -246,3 +246,69 @@ describe('ControlDispatcher — WS-C C1 (BH-01): toggle re-push', () => {
     expect(logLines[0]).toEqual(expect.stringContaining('re-push'));
   });
 });
+
+/**
+ * WS-R1 R1-6 (L2-CA-26, ADR-R2-16 completion): C1/BH-01 made ONLY the toggle
+ * branches failure-isolated (the suite above) — `reload.mcp` and
+ * `model.save_key` still `await`ed their re-fetch UNGUARDED, so a
+ * `fetchPanelData` rejection there turned an already-persisted, SUCCESSFUL
+ * mutation into a REJECTED RPC (the exact hazard ADR-R2-16 named). This table
+ * drives all THREE panel-mutating branches through one rejecting fake panel
+ * source and asserts the shared `rePushPanel` contract on every row: the RPC
+ * still RESOLVES its raw dispatch result, and exactly one `logger` line
+ * names the method and contains "re-push". Before `rePushPanel` exists, the
+ * `reload.mcp`/`model.save_key` rows fail (RED) because the unguarded await
+ * rejects the whole `invokeControl` call; the `toolsets.toggle` row already
+ * passes (it pins that the new helper preserves C1's existing behaviour).
+ */
+describe('ControlDispatcher — WS-R1 R1-6 (L2-CA-26): rePushPanel unifies all panel-mutating branches', () => {
+  interface RePushCase {
+    method: string;
+    panel: DataPanel;
+    invokeParams: unknown;
+    dispatchResult: unknown;
+  }
+
+  const CASES: RePushCase[] = [
+    { method: 'reload.mcp', panel: 'mcp', invokeParams: {}, dispatchResult: { status: 'reloaded' } },
+    {
+      method: 'model.save_key',
+      panel: 'models',
+      invokeParams: { slug: 'x', api_key: 'sk-super-secret-value' },
+      dispatchResult: { provider: {} },
+    },
+    {
+      method: 'toolsets.toggle',
+      panel: 'tools',
+      invokeParams: { name: 'web', enabled: true },
+      dispatchResult: { ok: true, name: 'web', enabled: true },
+    },
+  ];
+
+  it.each(CASES)(
+    '$method: a rejecting panel re-push still resolves the RPC result and logs exactly one "re-push" line, never the params',
+    async ({ method, panel, invokeParams, dispatchResult }) => {
+      const logLines: string[] = [];
+      const dashboard: DashboardService = { ensure: async () => makeFakeToggleClient(), dispose() {} };
+      const { port, registry } = makePort({
+        dispatch: async () => dispatchResult,
+        getDashboard: () => dashboard,
+        logger: { append: (line) => logLines.push(line) },
+      });
+      registerFakeSource(registry, panel, async () => {
+        throw new Error(`${panel} panel unreachable`);
+      });
+      const dispatcher = new ControlDispatcher(port);
+
+      const raw = await dispatcher.invokeControl(method, invokeParams);
+
+      expect(raw).toEqual(dispatchResult);
+      expect(logLines).toHaveLength(1);
+      expect(logLines[0]).toEqual(expect.stringContaining(method));
+      expect(logLines[0]).toEqual(expect.stringContaining('re-push'));
+      // SECURITY (model.save_key's params carry the API key): the log line
+      // must never interpolate `params` on any of the three branches.
+      expect(logLines[0]).not.toEqual(expect.stringContaining('sk-super-secret-value'));
+    },
+  );
+});
