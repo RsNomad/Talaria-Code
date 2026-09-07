@@ -32,17 +32,17 @@ import { AutocompleteDebouncer } from '../debouncer';
 import { BackendHttpError } from '../backends/http';
 import { InsecureTransportError } from '../backends/secureTransport';
 import { isSecretForCompletion } from '../../shared/secretPaths';
-import { scanSnippetForSecrets } from '../context/secretScanner';
 import { createEditTrackerAdapter, type EditTrackerAdapter } from '../context/editTrackerAdapter';
 import { isRecordableScheme, isTriggerableScheme } from '../context/recordableScheme';
 import type { FimActivityListener } from '../provider';
-import { regionAroundCursor, remapRange, type ContentChangeLite } from './anchors';
+import { regionAroundCursor, remapRange } from './anchors';
 import { NextEditHttpBackend } from './backend';
 import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
 import { reduceNextEdit } from './fsm';
 import type { RenderedNextEditPrompt } from './formats/types';
 import { NextEditGuard } from './guard';
 import { resolveNextEditMode, type NextEditMode, type ToggleRequest, type ToggleState } from './mode';
+import { computeChangesAboveCursor, filterEgressableDiffs, toContentChangeLites } from './nextEditEgress';
 import {
   deriveGenericTransport,
   endpointLabel,
@@ -63,7 +63,6 @@ import type {
   NextEditFsmEvent,
   NextEditFsmState,
   NextEditRequest,
-  RecentDiff,
 } from './types';
 
 /** The two context keys the executor owns — it is their ONLY writer. */
@@ -412,166 +411,17 @@ function toWorkspaceRelativePosixPath(uri: vscode.Uri): string {
 export { ensureTrailingNewline, stripLineTerminator, extractRegionRange };
 
 /**
- * F-3 — would this ONE diff survive the mint's own per-field checks?
- *
- * Runs exactly what `scan.ts` runs for a `diffs[]` entry, in the same order
- * (sentinel guard, then `scanSnippetForSecrets`, throw-is-reject), against the
- * SAME `diff.filepath` string the mint will use. That identity is the whole
- * point: normalizing the path here — or checking a different predicate, e.g.
- * the active-file `isSecretForCompletion` gate — would let a diff pass this
- * filter and still abort the mint, which is the bug this closes.
- *
- * An EMPTY sentinel is deliberately not treated as a diff verdict: the mint
- * rejects the whole request for it (`ruleId=empty-sentinel`, a caller-contract
- * bug, not content), and quietly dropping every diff would hide that.
- *
- * FINAL REVIEW — FINDING 7. That identity used to be held by this comment
- * alone. Behavioural tests covered the FILTER, but nothing tied its verdict to
- * the MINT's, and the two are separate code paths that must agree exactly:
- * a diff that passes this filter while the mint still aborts fails CLOSED into
- * a silent kill — every next-edit request in every file dies at the mint with
- * the trigger's catch reporting nothing, which is the precise bug F-3 existed
- * to fix. Same shape the five duplicated line-splitters had before
- * `lineSplitDrift.lock.test.ts` tied them.
- *
- * EXPORTED ONLY for that lock (`diffEgressDrift.lock.test.ts`), mirroring
- * `scan.ts`'s own `contentChecksFor` — "Exported ONLY for the fail-closed
- * drift lock in scan.test.ts". Not part of the shell's API; no production
- * caller outside this module.
+ * WS-F3 F3-4 (FI-06, FI-27): `diffMayEgress`, `filterEgressableDiffs`
+ * (renamed from `partitionEgressableDiffs`, now returning the kept list
+ * only), `computeChangesAboveCursor`, and `toContentChangeLites` moved
+ * verbatim to `./nextEditEgress` (a vscode-FREE leaf) — `diffMayEgress` is
+ * re-exported here so `diffEgressDrift.lock.test.ts`'s own
+ * `import { diffMayEgress } from './shell.vscode'` keeps resolving through
+ * `./shell.vscode` with zero further edits, exactly as the F3-1 golden
+ * masters' own module doc anticipates ("F3-2..F3-8 move implementations to
+ * new modules but the shell RE-EXPORTS each one").
  */
-export function diffMayEgress(diff: RecentDiff, sentinels: readonly string[]): boolean {
-  for (const content of [diff.before, diff.after]) {
-    for (const sentinel of sentinels) {
-      if (sentinel.length > 0 && content.includes(sentinel)) return false;
-    }
-    let allowed: boolean;
-    try {
-      allowed = scanSnippetForSecrets({ path: diff.filepath, content }).allowed;
-    } catch {
-      allowed = false; // fail-closed, mirroring ringBuffer.ingest's throw-is-reject
-    }
-    if (!allowed) return false;
-  }
-  return true;
-}
-
-/**
- * F-3 — the caller-side filter that keeps ONE poisoned diff from killing the
- * whole feature.
- *
- * `getRecentDiffs()` is a CROSS-DOCUMENT ring (`editTrackerAdapter.ts`), so a
- * single edit in `.env` used to make every next-edit request in every file
- * abort at the mint (first reject aborts the whole mint) — silently, because
- * the trigger's catch reported nothing. `ringBuffer.ingest` already answers
- * this for the FIM side: DROP the offending entry, keep the feature alive
- * everywhere else.
- *
- * This does not weaken the mint and cannot: the mint still fail-closed-scans
- * everything it is handed, including these very diffs, and remains the
- * authority. This only stops the shell from handing it auxiliary context it
- * had no business collecting for egress in the first place.
- *
- * `dropped` — WHAT IT IS AND IS NOT (corrected, final review Finding 6).
- *
- * This comment used to say the count "is returned so the trigger can note it
- * once (`08` §9.3: 'scan rejects count + note once') rather than dropping in
- * silence". That was written in the present tense about something that has
- * never happened: NOTHING READS `.dropped`. The sole call site
- * (`buildAndRun`, below) destructures `.kept` and nothing else, so drops ARE
- * silent — the comment asserted the opposite of the behaviour, which is the
- * third time on this branch a wrong reason in a comment has outlived the code
- * it described.
- *
- * The silence is nonetheless CORRECT today, and the count is deliberately
- * kept. Both facts are already recorded in `08` §9.3's own addendum: the
- * "count + note once" half is "a counter, not a feature… a deliberate scope
- * cut for fix wave 1 (F-4), not an oversight; wiring the drop count into a
- * one-shot note is open for a future wave, not silently abandoned."
- *
- * Silence is also the right default on the evidence, not merely the shipped
- * one: the FIM sibling this whole design cites — `ringBuffer.ingest` — drops a
- * rejected window with a bare `return`, no report and no toast. A drop here is
- * the protection WORKING, not a failure, and every other message path in this
- * file pairs `reportFailure` with a modal `showWarningMessage`. Noting a
- * routine, correct drop through that pair would be user-hostile noise.
- *
- * Whatever a future wave does with the count, the standing constraint on it is
- * unchanged: the COUNT only — never the path, never the matched text, never
- * the content.
- */
-function partitionEgressableDiffs(
-  diffs: readonly RecentDiff[],
-  sentinels: readonly string[],
-): { kept: readonly RecentDiff[]; dropped: number } {
-  const kept: RecentDiff[] = [];
-  let dropped = 0;
-  for (const diff of diffs) {
-    if (diffMayEgress(diff, sentinels)) {
-      kept.push(diff);
-    } else {
-      dropped += 1;
-    }
-  }
-  return { kept, dropped };
-}
-
-/**
- * `changesAboveCursor` — DOCUMENTED HEURISTIC, not vendor behaviour.
- * `compute_prefill` takes this flag as a caller-supplied parameter and the
- * vendor reference never shows how its own host derives it (**не нашёл
- * источник**). This implementation: true when the most recent tracked diff
- * for THIS document lies entirely above the cursor line. Being wrong is
- * cosmetic-to-mild — the flag only selects which of `compute_prefill`'s two
- * branches computes the prefill, and both branches produce a legal prefill.
- *
- * C-4 — MIXED COORDINATE SPACES, deliberately. `diff.endLine` is an OLD,
- * PRE-CHANGE document coordinate (see `RecentDiff` in `./types.ts`) while
- * `cursorLine` is a CURRENT one, so this comparison is approximate by
- * construction and drifts further the more edits land after the diff was
- * recorded. That is tolerable ONLY because of the paragraph above: both
- * answers produce a legal prefill, so the imprecision is cosmetic. Do not
- * copy this comparison into any site where being wrong is not cosmetic —
- * re-base the diff first, or use a different signal.
- */
-function computeChangesAboveCursor(
-  diffs: readonly RecentDiff[],
-  uri: string,
-  cursorLine: number,
-): boolean {
-  const mostRecent = diffs.find((diff) => diff.uri === uri);
-  return mostRecent !== undefined && mostRecent.endLine < cursorLine;
-}
-
-/**
- * Assembles `ContentChangeLite[]` from a raw change event.
- *
- * ORDERING CONTRACT (`anchors.ts`): `remapRange` does NOT re-sort — whoever
- * assembles its input must resolve delivery order FIRST. VS Code gives no
- * ordering guarantee for a multi-part `contentChanges` array
- * (microsoft/vscode#11487), and every `change.range` is expressed in the
- * OLD/pre-change document, so this mirrors `editTrackerAdapter.ts`'s
- * established descending sort (highest start position first): applying a
- * HIGHER change first never shifts the line numbers a LOWER, not-yet-applied
- * change still refers to. The source array is readonly — copy before sorting.
- */
-function toContentChangeLites(
-  changes: readonly vscode.TextDocumentContentChangeEvent[],
-): ContentChangeLite[] {
-  return [...changes]
-    .sort((a, b) => {
-      if (a.range.start.line !== b.range.start.line) {
-        return b.range.start.line - a.range.start.line;
-      }
-      return b.range.start.character - a.range.start.character;
-    })
-    .map((change) => ({
-      startLine: change.range.start.line,
-      endLine: change.range.end.line,
-      // Replacing the inclusive span [start, end] with text carrying N
-      // newlines yields N+1 lines.
-      newLineCount: (change.text.match(/\n/g) ?? []).length + 1,
-    }));
-}
+export { diffMayEgress } from './nextEditEgress';
 
 // ─────────────────────────────── registration ────────────────────────────────
 
@@ -1360,11 +1210,7 @@ class NextEditShell {
     // F-3 — the ring is cross-document, so it is filtered HERE, before the
     // mint ever sees it. `changesAboveCursor` reads the same kept list, so the
     // structural heuristic and the egressing payload describe one history.
-    const ringDiffs = partitionEgressableDiffs(
-      this.ensureEditTracker().tracker.getRecentDiffs(),
-      route.format.sentinels,
-    );
-    const diffs = ringDiffs.kept;
+    const diffs = filterEgressableDiffs(this.ensureEditTracker().tracker.getRecentDiffs(), route.format.sentinels);
     const docVersion = document.version;
 
     const region: EditableRegion = {
