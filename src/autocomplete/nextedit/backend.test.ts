@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { NextEditHttpBackend, clearNextEditBackendWarnings } from './backend';
+import { NextEditHttpBackend } from './backend';
+import { OnceRegistry } from '../onceRegistry';
 import { InsecureTransportError } from '../backends/secureTransport';
 import { BackendHttpError, StreamIdleTimeoutError, STREAM_IDLE_TIMEOUT_MS } from '../backends/http';
 import { mintScannedNextEditRequest } from './scan';
@@ -71,13 +72,23 @@ function apiBaseFor(transport: NextEditTransportId): string {
   return transport === 'ollama' ? 'http://127.0.0.1:11434' : 'http://127.0.0.1:8000';
 }
 
-function makeBackend(transport: NextEditTransportId, overrides: { apiKey?: string; apiBase?: string } = {}): NextEditHttpBackend {
+/** F10-2b: `registry` defaults to a FRESH `OnceRegistry()` per call — this
+ *  alone reproduces the isolation `clearNextEditBackendWarnings()` used to
+ *  provide between cases (each backend starts with nothing warned). A test
+ *  that needs to re-arm an EXISTING backend mid-test passes its own
+ *  `registry` override and calls `.reset()` on it directly (see the
+ *  "warns only ONCE … re-arms it" test below). */
+function makeBackend(
+  transport: NextEditTransportId,
+  overrides: { apiKey?: string; apiBase?: string; registry?: OnceRegistry } = {},
+): NextEditHttpBackend {
   return new NextEditHttpBackend({
     transport,
     apiBase: overrides.apiBase ?? apiBaseFor(transport),
     ...(overrides.apiKey !== undefined ? { apiKey: overrides.apiKey } : {}),
     model: 'test-model',
     sentinels: [],
+    registry: overrides.registry ?? new OnceRegistry(),
   });
 }
 
@@ -114,6 +125,7 @@ describe('NextEditHttpBackend.predict — pinned guard order (security)', () => 
       apiKey: 'k',
       model: 'test-model', // Finding 5: must match minted()'s req.model, or the (0) reconciliation check fires first.
       sentinels: [],
+      registry: new OnceRegistry(),
     });
     await expect(b.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(InsecureTransportError);
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -148,6 +160,7 @@ describe('NextEditHttpBackend.predict — pinned guard order (security)', () => 
       apiKey: 'k',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
     const forgedAndInsecure = {
       ...cleanReq(),
@@ -182,7 +195,11 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    clearNextEditBackendWarnings();
+    // F10-2b: no module-level reset needed any more — `makeBackend`'s default
+    // gives every call a FRESH `OnceRegistry()`, and each inline construction
+    // below passes its own fresh instance too, so every test already starts
+    // with nothing warned (exactly what `clearNextEditBackendWarnings()` used
+    // to provide here).
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
 
@@ -201,6 +218,7 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
       apiKey: 'leftover-fim-key',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
 
     const out = await backend.predict(minted(), rendered(), new AbortController().signal);
@@ -220,6 +238,7 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
       apiKey: 'super-secret-leftover-key',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
 
     await backend.predict(minted(), rendered(), new AbortController().signal);
@@ -254,7 +273,7 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  it('warns only ONCE across repeated predict calls until clearNextEditBackendWarnings() re-arms it', async () => {
+  it('warns only ONCE across repeated predict calls until registry.reset() re-arms it', async () => {
     // Each call must get its own fresh `ReadableStream` body — a single
     // shared response (via `mockResolvedValue`) would be drained by the
     // first `predict()` call, breaking the second/third with an unrelated
@@ -265,14 +284,18 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
         Promise.resolve(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' })),
       );
     vi.stubGlobal('fetch', fetchSpy);
-    const backend = makeBackend('ollama', { apiKey: 'leftover-key' });
+    // F10-2b: an explicit registry (not `makeBackend`'s own default) so this
+    // test can re-arm it directly — mirrors `shell.vscode.ts`'s own shared
+    // instance across predictions, just held by the test instead of a shell.
+    const registry = new OnceRegistry();
+    const backend = makeBackend('ollama', { apiKey: 'leftover-key', registry });
 
     await backend.predict(minted(), rendered(), new AbortController().signal);
     await backend.predict(minted(), rendered(), new AbortController().signal);
     await backend.predict(minted(), rendered(), new AbortController().signal);
     expect(warnSpy).toHaveBeenCalledTimes(1);
 
-    clearNextEditBackendWarnings();
+    registry.reset();
     await backend.predict(minted(), rendered(), new AbortController().signal);
     expect(warnSpy).toHaveBeenCalledTimes(2);
   });
@@ -286,6 +309,7 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
       apiKey: 'k',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
 
     await expect(backend.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
@@ -423,6 +447,7 @@ describe('NextEditHttpBackend.predict — openai-compat body shape (skip_special
       apiKey: '   ',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
 
     await backend.predict(minted(), rendered(), new AbortController().signal);

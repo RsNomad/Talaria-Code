@@ -88,45 +88,18 @@ export interface NextEditBackendOptions {
   /** For the wire-adjacent re-mint — the format module's own sentinel list. */
   sentinels: readonly string[];
   /**
-   * FI-26 (FSU §5 Q4): the {@link OnceRegistry} `predict`'s own `warnOnce`
-   * dedupes against — optional, defaulting to {@link defaultRegistry} below.
-   * This module stays vscode-free (pass the registry as a plain param, never
-   * reach into vscode to get one) — see that constant's own doc comment for
-   * why no current caller (the shell constructs a fresh `NextEditHttpBackend`
-   * per prediction attempt) actually supplies one today.
+   * FI-26 (FSU §5 Q4) — task F10-2b (3rd site closeout): the
+   * {@link OnceRegistry} `predict`'s own `warnOnce` dedupes against.
+   * REQUIRED, no module-level fallback: `shell.vscode.ts`'s `NextEditShell`
+   * holds ONE stable `OnceRegistry` field (constructed once per activation,
+   * alongside its other per-activation state) and passes that SAME instance
+   * to every per-prediction `new NextEditHttpBackend({...})` it constructs —
+   * so dedup spans predictions within an activation (warn-once-per-activation)
+   * with no module-level dedup state and no hidden test dependency. This
+   * module stays vscode-free (the registry arrives as a plain constructor
+   * param; this file never reaches into vscode to obtain one).
    */
-  registry?: OnceRegistry;
-}
-
-/**
- * CF-24 / L6 I-15: mirrors `../backendFactory.ts`'s own dedup discipline —
- * same `console.warn` (never `vscode.window` — this module deliberately
- * never imports `vscode`, which is what keeps `predict` callable from a plain
- * unit test), same re-arm-by-export discipline. `backendFactory.ts`'s F4 arm
- * already solved this exact problem for the FIM `ollama` backend (which has
- * no `apiKey` field at all); this is the same fix for next-edit's `ollama`
- * transport, which has the identical no-auth-story shape (see `predict`'s
- * key-drop below).
- *
- * FI-26 (FSU §5 Q4): the raw module-level `Set` is now an {@link OnceRegistry}
- * instance, `defaultRegistry` — the fallback every `NextEditHttpBackend`
- * uses when constructed without an explicit `registry` (`NextEditBackendOptions`
- * above). Every current caller (production and test) omits it, so this
- * module's dedup lifetime is UNCHANGED by this task: still process-lifetime,
- * never re-armed automatically (nothing ever called
- * {@link clearNextEditBackendWarnings} from production before this task
- * either — only this file's own tests call it directly to reset between
- * cases). The optional `registry` parameter exists so a FUTURE activation-
- * scoped caller can share one instance across sites without this module
- * reaching into vscode to obtain it.
- */
-const defaultRegistry = new OnceRegistry();
-
-/** Resets {@link defaultRegistry} — the fallback `NextEditHttpBackend` uses
- *  when constructed without an explicit `registry`. See that constant's own
- *  doc comment for this module's (unchanged) dedup lifetime. */
-export function clearNextEditBackendWarnings(): void {
-  defaultRegistry.reset();
+  registry: OnceRegistry;
 }
 
 /** Ollama `/api/generate` (non-streaming) response shape — only the fields
@@ -188,10 +161,20 @@ export class NextEditHttpBackend {
   private readonly registry: OnceRegistry;
 
   constructor(private readonly opts: NextEditBackendOptions) {
-    this.registry = opts.registry ?? defaultRegistry;
+    this.registry = opts.registry;
   }
 
-  /** See {@link defaultRegistry}'s doc comment for the dedup discipline. */
+  /**
+   * CF-24 / L6 I-15: mirrors `../backendFactory.ts`'s own dedup discipline —
+   * same `console.warn` (never `vscode.window` — this module deliberately
+   * never imports `vscode`, which is what keeps `predict` callable from a
+   * plain unit test). `backendFactory.ts`'s F4 arm already solved this exact
+   * problem for the FIM `ollama` backend (which has no `apiKey` field at
+   * all); this is the same fix for next-edit's `ollama` transport, which has
+   * the identical no-auth-story shape (see `predict`'s key-drop below). See
+   * {@link NextEditBackendOptions.registry}'s doc comment for the
+   * activation-scoped dedup discipline `this.registry` implements.
+   */
   private warnOnce(key: string, message: string): void {
     if (this.registry.has(key)) return;
     this.registry.add(key);

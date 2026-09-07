@@ -33,6 +33,7 @@ import { isSecretForCompletion } from '../../shared/secretPaths';
 import { createEditTrackerAdapter, type EditTrackerAdapter } from '../context/editTrackerAdapter';
 import { isTriggerableScheme } from '../context/recordableScheme';
 import type { FimActivityListener } from '../provider';
+import { OnceRegistry } from '../onceRegistry';
 import { regionAroundCursor } from './anchors';
 import { NextEditHttpBackend } from './backend';
 import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
@@ -306,6 +307,21 @@ class NextEditShell {
    */
   private readonly fim = { visible: false, inFlightCount: 0 };
   private readonly debouncer = new AutocompleteDebouncer();
+
+  /**
+   * FI-26 (FSU §5 Q4) — task F10-2b: ONE {@link OnceRegistry} instance for
+   * the whole shell lifetime (per activation — `NextEditShell` is
+   * constructed once per `registerTalariaNextEdit` call). `runPrediction`
+   * constructs a fresh `NextEditHttpBackend` per prediction attempt but
+   * always passes THIS SAME instance as `registry` — never a fresh
+   * `new OnceRegistry()` per prediction, which would reset dedup on every
+   * attempt (warn every time = a regression). Sharing this one instance
+   * across predictions gives warn-once-per-activation, matching the FIM
+   * path's own activation-scoped registry (`index.ts`'s `onceRegistry`,
+   * threaded to `backendFactory.ts`'s `createBackend` and to
+   * `provider.ts`'s construction).
+   */
+  private readonly onceRegistry = new OnceRegistry();
 
   /**
    * CF-20-lazy — `createEditTrackerAdapter()` is next-edit's HALF of two
@@ -918,6 +934,12 @@ class NextEditShell {
         apiBase: route.apiBase,
         model: route.model,
         sentinels: route.format.sentinels,
+        // FI-26 (F10-2b): the shell's own STABLE field — constructed once
+        // per activation and shared across every prediction attempt — never
+        // a fresh `new OnceRegistry()` here (this call runs once per
+        // prediction; a fresh instance each time would reset dedup on every
+        // attempt instead of warning once per activation).
+        registry: this.onceRegistry,
         // Absent for the NEXT branch, by construction (see NextEditRoute).
         ...(route.apiKey !== undefined ? { apiKey: route.apiKey } : {}),
       });

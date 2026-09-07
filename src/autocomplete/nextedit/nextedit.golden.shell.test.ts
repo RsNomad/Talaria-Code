@@ -147,13 +147,17 @@ vi.mock('vscode', () => {
   };
 });
 
-vi.mock('./backend', async () => {
-  const actual = await vi.importActual<typeof import('./backend')>('./backend');
+vi.mock('./backend', () => {
   return {
     // Field-by-field (never `{ ...actual, ... }`) — the repo's own
     // ringBuffer.test.ts SPREAD_RE guard shape, kept here on principle even
     // though it only scans non-test sources.
-    clearNextEditBackendWarnings: actual.clearNextEditBackendWarnings,
+    // F10-2b: `clearNextEditBackendWarnings` (and the `actual` import that
+    // supplied it) is REMOVED here — the real export it re-exported no
+    // longer exists on `./backend` (the module-level `defaultRegistry` it
+    // reset was removed; dedup is now an injected `OnceRegistry`, not module
+    // state). Nothing in this file ever called it — this mock only ever
+    // carried the re-export forward.
     NextEditHttpBackend: class {
       constructor() {
         calls.push('backend.constructed');
