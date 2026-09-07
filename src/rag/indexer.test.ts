@@ -2957,19 +2957,30 @@ describe('F6-6 (FI-20/FI-31): walk and the hash pass log non-ENOENT errno names;
 
       const blockedDir = path.join(workspaceRoot, 'blocked');
       const racedDir = path.join(workspaceRoot, 'raced');
+      // F6-6b: the EACCES (non-ENOENT, must-log) and ENOENT (must-stay-silent)
+      // fakes get DISTINCT .name values so a test assertion can pin the
+      // DIRECTION — which one got logged — not just that exactly one did.
       class FakeDirReadError extends Error {
         code: string;
-        constructor(code: string) {
+        constructor() {
           super('permission denied reading a secret directory'); // must NOT leak into the log
           this.name = 'FakeDirReadError';
-          this.code = code;
+          this.code = 'EACCES';
+        }
+      }
+      class FakeEnoentDirError extends Error {
+        code: string;
+        constructor() {
+          super('vanished mid-walk');
+          this.name = 'FakeEnoentDirError';
+          this.code = 'ENOENT';
         }
       }
       const realReaddir = fs.readdir.bind(fs);
       const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(async (dirPath, options) => {
         const dir = String(dirPath);
-        if (dir === blockedDir) throw new FakeDirReadError('EACCES');
-        if (dir === racedDir) throw new FakeDirReadError('ENOENT');
+        if (dir === blockedDir) throw new FakeDirReadError();
+        if (dir === racedDir) throw new FakeEnoentDirError();
         return realReaddir(dir, options);
       });
 
@@ -2985,7 +2996,8 @@ describe('F6-6 (FI-20/FI-31): walk and the hash pass log non-ENOENT errno names;
 
       const dirLogs = logs.filter((l) => /directory read failed/i.test(l));
       expect(dirLogs.length).toBe(1); // only the EACCES dir logs; the ENOENT dir stays silent
-      expect(dirLogs[0]).toContain('FakeDirReadError'); // err.name, present
+      expect(dirLogs[0]).toContain('FakeDirReadError'); // err.name of the non-ENOENT (EACCES) fake, present
+      expect(dirLogs[0]).not.toContain('FakeEnoentDirError'); // never the ENOENT fake's name — pins the direction
       expect(dirLogs[0]).not.toContain(blockedDir); // never the path
       expect(dirLogs[0]).not.toContain('permission denied reading a secret directory'); // never the raw err
       expect(upsertMock).toHaveBeenCalled(); // ok/a.txt still indexed despite the blocked sibling
@@ -3004,18 +3016,29 @@ describe('F6-6 (FI-20/FI-31): walk and the hash pass log non-ENOENT errno names;
 
       const blockedFile = path.join(workspaceRoot, 'src/blocked.txt');
       const racedFile = path.join(workspaceRoot, 'src/raced.txt');
+      // F6-6b: distinct .name values for the non-ENOENT (EACCES, must-log)
+      // and ENOENT (must-stay-silent) fakes, so the assertion below can pin
+      // the DIRECTION — which one got logged.
       class FakeHashReadError extends Error {
         code: string;
-        constructor(code: string) {
+        constructor() {
           super('permission denied reading a secret file'); // must NOT leak into the log
           this.name = 'FakeHashReadError';
-          this.code = code;
+          this.code = 'EACCES';
+        }
+      }
+      class FakeEnoentHashError extends Error {
+        code: string;
+        constructor() {
+          super('deleted between walk and read');
+          this.name = 'FakeEnoentHashError';
+          this.code = 'ENOENT';
         }
       }
       const realReadFile = fs.readFile.bind(fs);
       const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
-        if (String(file) === blockedFile) throw new FakeHashReadError('EACCES');
-        if (String(file) === racedFile) throw new FakeHashReadError('ENOENT');
+        if (String(file) === blockedFile) throw new FakeHashReadError();
+        if (String(file) === racedFile) throw new FakeEnoentHashError();
         return realReadFile(file, options);
       });
 
@@ -3031,7 +3054,8 @@ describe('F6-6 (FI-20/FI-31): walk and the hash pass log non-ENOENT errno names;
 
       const hashLogs = logs.filter((l) => /hash read failed/i.test(l));
       expect(hashLogs.length).toBe(1); // only the EACCES file logs; the ENOENT file stays silent
-      expect(hashLogs[0]).toContain('FakeHashReadError'); // err.name, present
+      expect(hashLogs[0]).toContain('FakeHashReadError'); // err.name of the non-ENOENT (EACCES) fake, present
+      expect(hashLogs[0]).not.toContain('FakeEnoentHashError'); // never the ENOENT fake's name — pins the direction
       expect(hashLogs[0]).not.toContain(blockedFile); // never the path
       expect(hashLogs[0]).not.toContain('permission denied reading a secret file'); // never the raw err
       expect(upsertMock).toHaveBeenCalled(); // ok.txt still indexed despite the blocked sibling
