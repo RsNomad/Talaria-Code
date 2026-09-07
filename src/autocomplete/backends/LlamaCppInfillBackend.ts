@@ -118,53 +118,64 @@ export class LlamaCppInfillBackend implements FimBackend {
     // untouched `signal` — there is nothing for a stream deadline to guard
     // there.
     const dl = armStreamDeadlines(signal);
-    const response = await raceWithDeadline(
-      fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: dl.signal,
-      }),
-      dl,
-    );
+    try {
+      const response = await raceWithDeadline(
+        fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: dl.signal,
+        }),
+        dl,
+      );
 
-    if (!response.ok) {
-      dl.dispose();
-      throw new BackendHttpError(
-        `llama.cpp /infill failed: ${response.status} ${response.statusText}`,
-        response.status,
-        response.statusText,
-      );
-    }
-    // T-6 F5 remainder (the Codestral half of F5 already lands locally in
-    // CodestralFimBackend.ts): a missing body on an `ok` response isn't an
-    // HTTP-status failure — there's no real status to report as the cause,
-    // so this stays a plain Error rather than a fabricated BackendHttpError
-    // with an invented status. Without this guard, `readJsonBounded` falls
-    // through to `JSON.parse('')` on a null body, which throws too, but an
-    // opaque `SyntaxError` that never names llama.cpp or `/infill` —
-    // unlike every sibling backend's identical named guard.
-    if (!response.body) {
-      dl.dispose();
-      throw new Error(
-        `llama.cpp /infill failed: ${response.status} ${response.statusText}`,
-      );
-    }
+      if (!response.ok) {
+        dl.dispose();
+        throw new BackendHttpError(
+          `llama.cpp /infill failed: ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+        );
+      }
+      // T-6 F5 remainder (the Codestral half of F5 already lands locally in
+      // CodestralFimBackend.ts): a missing body on an `ok` response isn't an
+      // HTTP-status failure — there's no real status to report as the cause,
+      // so this stays a plain Error rather than a fabricated BackendHttpError
+      // with an invented status. Without this guard, `readJsonBounded` falls
+      // through to `JSON.parse('')` on a null body, which throws too, but an
+      // opaque `SyntaxError` that never names llama.cpp or `/infill` —
+      // unlike every sibling backend's identical named guard.
+      if (!response.body) {
+        dl.dispose();
+        throw new Error(
+          `llama.cpp /infill failed: ${response.status} ${response.statusText}`,
+        );
+      }
 
-    // D1: bounded read (4 MiB cap), not the unbounded response.json() —
-    // llama.cpp's stream:false /infill body is a single JSON blob whose
-    // realistic legitimate ceiling is ~1 MB (own-context-bounded prompt
-    // echo); readJsonBounded caps it against a hostile/misconfigured server.
-    const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
-    if (!isLlamaCppInfillResponse(raw)) {
-      // WS-BG: refuse an unrecognized ok-body loudly — status only, never
-      // body content (C-5 hygiene).
-      throw new Error(
-        `llama.cpp /infill returned an unrecognized response shape: ${response.status} ${response.statusText}`,
-      );
-    }
-    if (raw.content) {
-      yield raw.content;
+      // D1: bounded read (4 MiB cap), not the unbounded response.json() —
+      // llama.cpp's stream:false /infill body is a single JSON blob whose
+      // realistic legitimate ceiling is ~1 MB (own-context-bounded prompt
+      // echo); readJsonBounded caps it against a hostile/misconfigured server.
+      const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
+      if (!isLlamaCppInfillResponse(raw)) {
+        // WS-BG: refuse an unrecognized ok-body loudly — status only, never
+        // body content (C-5 hygiene).
+        throw new Error(
+          `llama.cpp /infill returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+        );
+      }
+      if (raw.content) {
+        yield raw.content;
+      }
+    } catch (err) {
+      // R1-7-fix (review Minor #1): dl.dispose() is idempotent (clear()
+      // no-ops once the timer is already undefined) — this covers the ONE
+      // path the guards/reader above don't reach: raceWithDeadline(fetch)
+      // itself rejecting (fast network failure, keystroke cancel) before any
+      // response ever exists, which used to leave the 300s first-byte timer
+      // dangling.
+      dl.dispose();
+      throw err;
     }
   }
 

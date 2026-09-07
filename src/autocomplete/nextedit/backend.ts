@@ -267,53 +267,64 @@ export class NextEditHttpBackend {
       },
     };
 
-    const response = await raceWithDeadline(
-      fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: dl.signal,
-      }),
-      dl,
-    );
+    try {
+      const response = await raceWithDeadline(
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: dl.signal,
+        }),
+        dl,
+      );
 
-    if (!response.ok) {
-      dl.dispose();
-      throw new BackendHttpError(
-        `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
-        response.status,
-        response.statusText,
-      );
-    }
-    // CA-5 (audit-3): a missing body on an `ok` response isn't an
-    // HTTP-status failure — there's no real status to report as the cause,
-    // so this stays a plain Error rather than a fabricated BackendHttpError
-    // with an invented status. Mirrors every FIM backend's identical named
-    // guard (e.g. `OllamaFimBackend.ts`) — without it, `readJsonBounded`
-    // falls through to `JSON.parse('')` on a null body, which DOES throw,
-    // but an opaque `SyntaxError: Unexpected end of JSON input` that never
-    // names next-edit or the Ollama transport.
-    if (!response.body) {
-      dl.dispose();
-      throw new Error(
-        `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
-      );
-    }
+      if (!response.ok) {
+        dl.dispose();
+        throw new BackendHttpError(
+          `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+        );
+      }
+      // CA-5 (audit-3): a missing body on an `ok` response isn't an
+      // HTTP-status failure — there's no real status to report as the cause,
+      // so this stays a plain Error rather than a fabricated BackendHttpError
+      // with an invented status. Mirrors every FIM backend's identical named
+      // guard (e.g. `OllamaFimBackend.ts`) — without it, `readJsonBounded`
+      // falls through to `JSON.parse('')` on a null body, which DOES throw,
+      // but an opaque `SyntaxError: Unexpected end of JSON input` that never
+      // names next-edit or the Ollama transport.
+      if (!response.body) {
+        dl.dispose();
+        throw new Error(
+          `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
+        );
+      }
 
-    // D1: bounded read (4 MiB cap), not the unbounded response.json() —
-    // Ollama's non-streaming /api/generate body is bounded by our own
-    // num_predict, but a hostile/misconfigured server is free to send
-    // anything; readJsonBounded caps it.
-    const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
-    if (!isOllamaGenerateResponse(raw)) {
-      // WS-BG: an ok-status body that isn't the documented response shape is
-      // a misbehaving/misconfigured server — refuse loudly. Status-only
-      // message, NEVER body content (C-5 hygiene).
-      throw new Error(
-        `Next-edit Ollama /api/generate returned an unrecognized response shape: ${response.status} ${response.statusText}`,
-      );
+      // D1: bounded read (4 MiB cap), not the unbounded response.json() —
+      // Ollama's non-streaming /api/generate body is bounded by our own
+      // num_predict, but a hostile/misconfigured server is free to send
+      // anything; readJsonBounded caps it.
+      const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
+      if (!isOllamaGenerateResponse(raw)) {
+        // WS-BG: an ok-status body that isn't the documented response shape is
+        // a misbehaving/misconfigured server — refuse loudly. Status-only
+        // message, NEVER body content (C-5 hygiene).
+        throw new Error(
+          `Next-edit Ollama /api/generate returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+        );
+      }
+      return { text: raw.response ?? '', stopReason: normalizeStopReason(raw.done_reason ?? undefined) };
+    } catch (err) {
+      // R1-7-fix (review Minor #1): dl.dispose() is idempotent (clear()
+      // no-ops once the timer is already undefined) — this covers the ONE
+      // path the guards above don't reach: raceWithDeadline(fetch) itself
+      // rejecting (fast network failure, keystroke cancel) before any
+      // response ever exists, which used to leave the 300s first-byte timer
+      // dangling.
+      dl.dispose();
+      throw err;
     }
-    return { text: raw.response ?? '', stopReason: normalizeStopReason(raw.done_reason ?? undefined) };
   }
 
   private async predictOpenAiCompat(
@@ -341,45 +352,56 @@ export class NextEditHttpBackend {
       headers.Authorization = `Bearer ${apiKey}`;
     }
 
-    const response = await raceWithDeadline(
-      fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: dl.signal,
-      }),
-      dl,
-    );
+    try {
+      const response = await raceWithDeadline(
+        fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: dl.signal,
+        }),
+        dl,
+      );
 
-    if (!response.ok) {
-      dl.dispose();
-      throw new BackendHttpError(
-        `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
-        response.status,
-        response.statusText,
-      );
-    }
-    // CA-5 (audit-3): same missing-body guard as predictOllama above — see
-    // its comment for the full rationale (mirrors every FIM backend's
-    // identical named guard).
-    if (!response.body) {
-      dl.dispose();
-      throw new Error(
-        `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
-      );
-    }
+      if (!response.ok) {
+        dl.dispose();
+        throw new BackendHttpError(
+          `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+        );
+      }
+      // CA-5 (audit-3): same missing-body guard as predictOllama above — see
+      // its comment for the full rationale (mirrors every FIM backend's
+      // identical named guard).
+      if (!response.body) {
+        dl.dispose();
+        throw new Error(
+          `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
+        );
+      }
 
-    // D1: bounded read (4 MiB cap), not the unbounded response.json() —
-    // same rationale as predictOllama above.
-    const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
-    if (!isOpenAiCompletionResponse(raw)) {
-      // WS-BG: same refusal posture as predictOllama above (C-5 hygiene:
-      // status only, never body content).
-      throw new Error(
-        `Next-edit openai-compat /v1/completions returned an unrecognized response shape: ${response.status} ${response.statusText}`,
-      );
+      // D1: bounded read (4 MiB cap), not the unbounded response.json() —
+      // same rationale as predictOllama above.
+      const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
+      if (!isOpenAiCompletionResponse(raw)) {
+        // WS-BG: same refusal posture as predictOllama above (C-5 hygiene:
+        // status only, never body content).
+        throw new Error(
+          `Next-edit openai-compat /v1/completions returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+        );
+      }
+      const choice = raw.choices?.[0];
+      return { text: choice?.text ?? '', stopReason: normalizeStopReason(choice?.finish_reason ?? undefined) };
+    } catch (err) {
+      // R1-7-fix (review Minor #1): dl.dispose() is idempotent (clear()
+      // no-ops once the timer is already undefined) — this covers the ONE
+      // path the guards above don't reach: raceWithDeadline(fetch) itself
+      // rejecting (fast network failure, keystroke cancel) before any
+      // response ever exists, which used to leave the 300s first-byte timer
+      // dangling.
+      dl.dispose();
+      throw err;
     }
-    const choice = raw.choices?.[0];
-    return { text: choice?.text ?? '', stopReason: normalizeStopReason(choice?.finish_reason ?? undefined) };
   }
 }

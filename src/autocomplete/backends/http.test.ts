@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   BackendHttpError,
   BackendStreamError,
@@ -15,6 +15,8 @@ import {
   STREAM_IDLE_TIMEOUT_MS,
   type StreamableResponse,
 } from './http';
+import { OllamaFimBackend } from './OllamaFimBackend';
+import type { FimRequest } from '../types';
 
 describe('BackendHttpError', () => {
   it('is instanceof both BackendHttpError and Error, preserves .status, and sets .name (A1 — required for A5 catch-site narrowing)', () => {
@@ -752,12 +754,16 @@ describe('armStreamDeadlines / raceWithDeadline — ADR-R2-06 fake-timer proof',
     try {
       const dl = armStreamDeadlines(undefined);
       const encoder = new TextEncoder();
-      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      let setController: ((c: ReadableStreamDefaultController<Uint8Array>) => void) | undefined;
+      const controllerReady = new Promise<ReadableStreamDefaultController<Uint8Array>>((resolve) => {
+        setController = resolve;
+      });
       const body = new ReadableStream<Uint8Array>({
         start(c) {
-          controller = c;
+          setController?.(c);
         },
       });
+      const controller = await controllerReady;
 
       const collected: unknown[] = [];
       let caught: unknown;
@@ -797,5 +803,71 @@ describe('armStreamDeadlines / raceWithDeadline — ADR-R2-06 fake-timer proof',
       expect(err.message).not.toContain(marker);
       expect(err.name).not.toContain(marker);
     }
+  });
+});
+
+/**
+ * R1-7-fix (closes review Minor #1): each `dl`-arming call site does roughly
+ * `const dl = armStreamDeadlines(signal); const res = await
+ * raceWithDeadline(fetch(...), dl);` then disposes `dl` either in a
+ * `!res.ok`/`!res.body` guard branch or in the reader's own `finally`. NONE
+ * of those paths run when `raceWithDeadline(fetch(...), dl)` itself
+ * REJECTS — a fast network failure (`ECONNREFUSED`) or a VS Code keystroke
+ * cancellation before any `response` ever exists — leaving the 300s
+ * first-byte `setTimeout` dangling (unref'd and eventually harmless, but a
+ * genuine leak on the common failure path).
+ *
+ * Exercises a REAL production call site (`OllamaFimBackend.streamFim` — the
+ * simplest FIM backend, no apiKey/header complexity) rather than a
+ * hand-rolled re-implementation of the arm/race pattern, so removing the
+ * `catch { dl.dispose(); throw }` this fix adds at that exact site is what
+ * actually breaks this test (mutation check).
+ */
+describe('R1-7-fix — dl.dispose() on raceWithDeadline(fetch) itself rejecting (not just the !ok/!body/reader paths)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function ollamaReq(): FimRequest {
+    return {
+      model: 'qwen2.5-coder:1.5b-base',
+      prefix: 'const x = ',
+      suffix: '',
+      stop: [],
+      temperature: 0.01,
+      maxTokens: 128,
+      context: {
+        filepath: 'file:///a.ts',
+        languageId: 'typescript',
+        prefix: 'const x = ',
+        suffix: '',
+        workspaceUris: [],
+        snippets: [],
+      },
+    };
+  }
+
+  it('disposes the first-byte timer when fetch rejects, leaving no dangling 300s timer', async () => {
+    vi.useFakeTimers();
+    const fetchError = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:11434'), {
+      code: 'ECONNREFUSED',
+    });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchError));
+
+    const backend = new OllamaFimBackend({ apiBase: 'http://127.0.0.1:11434', model: 'qwen2.5-coder:1.5b-base' });
+    const iterator = backend.streamFim(ollamaReq(), new AbortController().signal)[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).rejects.toBe(fetchError);
+
+    // Today (pre-fix): the 300s first-byte timer survives the reject, so
+    // this is 1, not 0 — RED.
+    expect(vi.getTimerCount()).toBe(0);
+
+    // Even granting a survived timer, advancing past the first-byte deadline
+    // must not silently re-arm or fire anything post-hoc once the stream has
+    // already failed and been abandoned.
+    await vi.advanceTimersByTimeAsync(STREAM_FIRST_BYTE_MS);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -93,39 +93,50 @@ export class OpenAICompatFimBackend implements FimBackend {
     // so the first-byte deadline spans the fetch() await AND the reader's
     // first read() — see http.ts's doc comments for the full design.
     const dl = armStreamDeadlines(signal);
-    const response = await raceWithDeadline(
-      fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: dl.signal,
-      }),
-      dl,
-    );
-
-    if (!response.ok) {
-      dl.dispose();
-      throw new BackendHttpError(
-        `OpenAI-compat /v1/completions failed: ${response.status} ${response.statusText}`,
-        response.status,
-        response.statusText,
+    try {
+      const response = await raceWithDeadline(
+        fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: dl.signal,
+        }),
+        dl,
       );
-    }
-    // A missing body on an `ok` response isn't an HTTP-status failure — there's
-    // no real status to report as the cause, so this stays a plain Error rather
-    // than a fabricated BackendHttpError with an invented status.
-    if (!response.body) {
-      dl.dispose();
-      throw new Error(
-        `OpenAI-compat /v1/completions failed: ${response.status} ${response.statusText}`,
-      );
-    }
 
-    // V-14 (FIM-SSE-ERROR): the shared drain — see its doc comment in
-    // http.ts. Same runner error-as-data-frame convention as vLLM (this
-    // backend's own doc comment above already warns not to point it AT
-    // vLLM/llama.cpp, but the class of server behind it can still emit the
-    // same OpenAI-style `{"error": …}` frame shape mid-stream).
-    yield* readOpenAiSseText(response, 'OpenAI-compat', dl);
+      if (!response.ok) {
+        dl.dispose();
+        throw new BackendHttpError(
+          `OpenAI-compat /v1/completions failed: ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+        );
+      }
+      // A missing body on an `ok` response isn't an HTTP-status failure — there's
+      // no real status to report as the cause, so this stays a plain Error rather
+      // than a fabricated BackendHttpError with an invented status.
+      if (!response.body) {
+        dl.dispose();
+        throw new Error(
+          `OpenAI-compat /v1/completions failed: ${response.status} ${response.statusText}`,
+        );
+      }
+
+      // V-14 (FIM-SSE-ERROR): the shared drain — see its doc comment in
+      // http.ts. Same runner error-as-data-frame convention as vLLM (this
+      // backend's own doc comment above already warns not to point it AT
+      // vLLM/llama.cpp, but the class of server behind it can still emit the
+      // same OpenAI-style `{"error": …}` frame shape mid-stream).
+      yield* readOpenAiSseText(response, 'OpenAI-compat', dl);
+    } catch (err) {
+      // R1-7-fix (review Minor #1): dl.dispose() is idempotent (clear()
+      // no-ops once the timer is already undefined) — this covers the ONE
+      // path the guards/reader above don't reach: raceWithDeadline(fetch)
+      // itself rejecting (fast network failure, keystroke cancel) before any
+      // response ever exists, which used to leave the 300s first-byte timer
+      // dangling.
+      dl.dispose();
+      throw err;
+    }
   }
 }
