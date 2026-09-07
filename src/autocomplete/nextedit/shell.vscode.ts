@@ -42,6 +42,7 @@ import { readNextEditConfig } from './config';
 import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
 import { reduceNextEdit } from './fsm';
 import { genericInstructFormat } from './formats/genericInstruct';
+import { sliceLines, splitLinesKeepingTerminators } from './formats/shared';
 import { sweepV2Format } from './formats/sweepV2';
 import type { NextEditFormat, RenderedNextEditPrompt } from './formats/types';
 import { NextEditGuard } from './guard';
@@ -551,28 +552,6 @@ function endpointLabel(apiBase: string): string {
   }
 }
 
-/** Splits `text` into whole lines, each keeping its own trailing '\n'. */
-function splitKeepingNewlines(text: string): string[] {
-  const parts = text.split('\n');
-  const lines: string[] = [];
-  for (let i = 0; i < parts.length - 1; i++) {
-    lines.push(`${parts[i]}\n`);
-  }
-  const last = parts[parts.length - 1];
-  // `text.split('\n')` always yields at least one element, so `last` is
-  // always present; the undefined branch is unreachable (kept for
-  // totality/type safety, not a behavior change).
-  if (last !== undefined && last !== '') {
-    lines.push(last);
-  }
-  return lines;
-}
-
-/** The `[startLine, endLine]` (inclusive) span of `text`. */
-function extractLines(text: string, startLine: number, endLine: number): string {
-  return splitKeepingNewlines(text).slice(startLine, endLine + 1).join('');
-}
-
 /** Workspace-relative POSIX path, mirroring `editTrackerAdapter.ts`'s helper
  *  (Fedora/Linux target; workspace URIs are always '/'-separated). */
 function toWorkspaceRelativePosixPath(uri: vscode.Uri): string {
@@ -608,10 +587,10 @@ function stripLineTerminator(text: string): string {
  * pair the model diffs — so any difference between them that the user did not
  * make is noise on exactly the axis the model is trained to read as "what the
  * user just changed". `getText` stops at the last line's TEXT LENGTH, before
- * its terminator; `extractLines` KEEPS terminators. Composing the two here is
+ * its terminator; `sliceLines` KEEPS terminators. Composing the two here is
  * what makes the pair agree by construction rather than by coincidence.
  *
- * The terminator is dropped only when `endLine` names a line `extractLines`
+ * The terminator is dropped only when `endLine` names a line `sliceLines`
  * actually produced. When the span instead runs past the end — to the empty
  * line a trailing newline creates — `getText` stops there too, so the
  * preceding terminator is inside BOTH blocks and must stay. Dropping it
@@ -624,8 +603,8 @@ function stripLineTerminator(text: string): string {
  * both through one join.
  */
 function extractRegionRange(text: string, startLine: number, endLine: number): string {
-  const lineCount = splitKeepingNewlines(text).length;
-  const span = extractLines(text, startLine, endLine);
+  const lineCount = splitLinesKeepingTerminators(text).length;
+  const span = sliceLines(text, startLine, endLine);
   return endLine < lineCount ? stripLineTerminator(span) : span;
 }
 

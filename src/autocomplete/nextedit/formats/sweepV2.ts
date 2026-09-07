@@ -18,9 +18,16 @@
 // Field-by-field object construction only, no spread — this file lives
 // under `src/autocomplete/` and is in scope for `ringBuffer.test.ts`'s
 // repo-wide `SPREAD_RE`/`CAST_RE` purity guards.
-import type { EditableRegion, NextEditCursor, NextEditRequest, NextEditVerdict, RecentDiff } from '../types';
+import type { NextEditRequest, NextEditVerdict, RecentDiff } from '../types';
 import type { NextEditFormat, NextEditModelOutput, NextEditRenderResult, RenderedNextEditPrompt } from './types';
-import { isPureInsertionAboveCursor } from './shared';
+import {
+  DIFF_CHAR_BUDGET,
+  isPureInsertionAboveCursor,
+  relativeCursorOffset,
+  renderBudgetedBlocks,
+  splitLinesKeepingTerminators,
+  trimAtFirstStopToken,
+} from './shared';
 
 const FILE_SEP = '<|file_sep|>';
 const CURSOR_TOKEN = '<|cursor|>';
@@ -35,68 +42,6 @@ const MAX_TOKENS = 1024;
 // `regionAroundCursor`; this module never recomputes the window itself,
 // it only renders whatever `req.region` already carries.
 const WINDOW_LINES = 10;
-// `08` §4.3 / `01-arch-and-pattern.md` §4.6: the 4,000-char `recent_changes`
-// budget. The exact number is carried from the architecture doc's design
-// (not itself re-derived from `inference.py`, which this pass did not find
-// a client-side history budget in at all — the vendor script takes
-// `recent_diffs` as a caller-supplied list with no internal cap).
-const DIFF_CHAR_BUDGET = 4000;
-
-/**
- * Splits `text` into lines, each retaining its own trailing '\n' (the final
- * chunk's terminator is omitted when the text has none). A local twin of
- * `formats/shared.ts`'s private `splitLinesKeepingTerminators` — Task 5's
- * module is frozen and does not export that helper, and this file needs
- * the identical "line, keep terminator" contract for two different jobs
- * (`relativeCursorOffset`'s line lookup, and `computePrefill`'s
- * `changesAboveCursor` branch, which ports `04` §1.4's own
- * `code_block[:relative_cursor].splitlines(True)`). Duplicated on purpose
- * rather than reaching into a sibling task's frozen file.
- */
-function splitKeepingNewlines(text: string): string[] {
-  const lines: string[] = [];
-  let start = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '\n') {
-      lines.push(text.slice(start, i + 1));
-      start = i + 1;
-    }
-  }
-  if (start < text.length) {
-    lines.push(text.slice(start));
-  }
-  return lines;
-}
-
-/**
- * Character offset of `cursor` within `region.content` (UTF-16 code units,
- * matching `NextEditCursor.character`'s own unit — the same convention
- * `vscode.Position` uses, per `types.ts`). This is `relative_cursor` in
- * `04` §1.2/§1.4 — the reference script receives it pre-computed by its
- * own host, so there is no vendor formula for THIS half; the clamping
- * below is a fail-closed local design choice ([вывод]), mirroring
- * `anchors.ts`'s own clamp-at-each-edge style: a stale or out-of-window
- * cursor degrades to the nearest in-bounds offset rather than producing a
- * negative or out-of-range splice point.
- */
-function relativeCursorOffset(region: EditableRegion, cursor: NextEditCursor): number {
-  const lines = splitKeepingNewlines(region.content);
-  const lastLineIndex = Math.max(lines.length - 1, 0);
-  const lineIndex = Math.min(Math.max(cursor.line - region.startLine, 0), lastLineIndex);
-
-  let offset = 0;
-  for (let i = 0; i < lineIndex; i++) {
-    // i < lineIndex <= lastLineIndex keeps i within lines' bounds whenever
-    // lines is non-empty (the only case this loop body runs) — the `?? 0`
-    // fallback mirrors `lineText`'s own established pattern just below and
-    // is unreachable, not a behavior change.
-    offset += lines[i]?.length ?? 0;
-  }
-  const lineText = lines[lineIndex] ?? '';
-  const lineTextNoTerminator = lineText.endsWith('\n') ? lineText.slice(0, -1) : lineText;
-  const character = Math.min(Math.max(cursor.character, 0), lineTextNoTerminator.length);
-  return offset + character;
-}
 
 /**
  * Ports `04` §1.4 `compute_prefill`, BOTH branches, verbatim in shape:
@@ -130,7 +75,7 @@ function relativeCursorOffset(region: EditableRegion, cursor: NextEditCursor): n
 function computePrefill(codeBlock: string, relativeCursor: number, changesAboveCursor: boolean): string {
   if (changesAboveCursor) {
     const prefix = codeBlock.slice(0, relativeCursor);
-    const prefixLines = splitKeepingNewlines(prefix);
+    const prefixLines = splitLinesKeepingTerminators(prefix);
     const NUM_LINES_ABOVE = 1;
     let beforeSplit = prefixLines.slice(0, NUM_LINES_ABOVE).join('');
     const afterSplit = prefixLines.slice(NUM_LINES_ABOVE).join('');
@@ -212,18 +157,7 @@ function renderDiffBlock(diff: RecentDiff): string {
  * same family with the same block shape.
  */
 function renderRecentChanges(diffs: readonly RecentDiff[]): string {
-  const blocks: string[] = [];
-  let usedChars = 0;
-  for (const diff of diffs) {
-    const block = renderDiffBlock(diff);
-    const addedChars = block.length + (blocks.length > 0 ? 1 : 0); // +1 for the '\n' join, once there's a prior block
-    if (usedChars + addedChars > DIFF_CHAR_BUDGET) {
-      break;
-    }
-    blocks.push(block);
-    usedChars += addedChars;
-  }
-  return blocks.join('\n');
+  return renderBudgetedBlocks(diffs, renderDiffBlock, DIFF_CHAR_BUDGET, '\n');
 }
 
 /**
@@ -350,12 +284,7 @@ function parse(output: NextEditModelOutput, rendered: RenderedNextEditPrompt, re
   }
 
   let completion = output.text;
-  for (const stop of STOP_TOKENS) {
-    const idx = completion.indexOf(stop);
-    if (idx !== -1) {
-      completion = completion.slice(0, idx);
-    }
-  }
+  completion = trimAtFirstStopToken(completion, STOP_TOKENS);
 
   if (completion.includes(CURSOR_TOKEN)) {
     return { kind: 'invalid', reason: 'cursor-echo' };
