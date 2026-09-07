@@ -115,8 +115,23 @@ export function matchesNestedIgnore(entries: readonly NestedIgnoreEntry[], relPo
  * `fs` they ARE closure values and must be threaded here — the `vi.mock`
  * factories back the classes those instances come from, so the mock still
  * applies as long as the instance itself is passed through.
+ *
+ * FI-18 (F6-4): this file's five functions each used to take the WHOLE bag
+ * even though most touch only a handful of its ~18 members.
+ * `IndexerContextBag` (below, module-private) names every member ONCE;
+ * `IndexerStoreCtx` / `IndexerManifestCtx` / `IndexerIgnoreCtx` /
+ * `IndexerLogCtx` are role-based `Pick`s of it, and the exported
+ * `IndexerContext` is their intersection plus the residual members no
+ * single role owns (`opts`/`parser`/`embedder`/`isDisposed`/
+ * `recordFailedIncrementalReindex`) — structurally the SAME 18 members as
+ * before, so `createIndexer`'s bag construction (indexer.ts) and
+ * `watchPipeline.ts`'s `ctx: IndexerContext` params compile unchanged. Each
+ * function below narrows its own `ctx` parameter to the intersection of
+ * only the roles (and residual members) its body actually reads — grounded
+ * by reading each function, not guessed; `tsc` is the arbiter that a
+ * narrowed Pick still covers every field the function references.
  */
-export interface IndexerContext {
+interface IndexerContextBag {
   opts: IndexerOptions;
   store: VectorStore;
   embedder: Embedder;
@@ -141,8 +156,37 @@ export interface IndexerContext {
   recordFailedIncrementalReindex: () => void;
 }
 
+/** FI-18: the store-lifecycle role — `store`/`gate` and the async init that must precede touching either. */
+export type IndexerStoreCtx = Pick<IndexerContextBag, 'store' | 'gate' | 'ensureStoreInitialized'>;
+/** FI-18: the manifest/fingerprint-sidecar role — everything `runBuild` reads or writes to decide and record what changed. */
+export type IndexerManifestCtx = Pick<
+  IndexerContextBag,
+  'readManifest' | 'writeManifest' | 'readMeta' | 'writeMeta' | 'computeEffectiveWidth' | 'fingerprintMatches'
+>;
+/** FI-18: the ignore-filter role — loading it, and invalidating/recording its nested-directory cache. */
+export type IndexerIgnoreCtx = Pick<
+  IndexerContextBag,
+  'loadIgnoreFilter' | 'invalidateIgnoreFilterCache' | 'setKnownNestedIgnoreDirs'
+>;
+/** FI-18: the logging role — used only by `watchPipeline.ts`'s functions, not by anything in this file. */
+export type IndexerLogCtx = Pick<IndexerContextBag, 'logger'>;
+
+/**
+ * FI-18: the full bag, unchanged in shape — the intersection of every role
+ * above plus the residual members no role owns. `createIndexer`'s object
+ * literal (indexer.ts) satisfies this exactly as it satisfied the
+ * pre-refactor bag interface.
+ */
+export type IndexerContext = IndexerStoreCtx &
+  IndexerManifestCtx &
+  IndexerIgnoreCtx &
+  IndexerLogCtx &
+  Pick<IndexerContextBag, 'opts' | 'parser' | 'embedder' | 'isDisposed' | 'recordFailedIncrementalReindex'>;
+
 export async function walk(
-  ctx: IndexerContext,
+  // FI-18: `walk` reads only `ctx.opts.workspaceRoot` — no store, manifest,
+  // ignore-filter-role, or logger member.
+  ctx: Pick<IndexerContextBag, 'opts'>,
   root: string,
   ignoreFilter: (p: string) => boolean,
   out: string[],
@@ -293,7 +337,9 @@ type MutablePathState = { contentHash: string; remaining: number; deleted: boole
  * apart from "torn down mid-read" at the call site.
  */
 async function buildPendingRecords(
-  ctx: IndexerContext,
+  // FI-18: reads `ctx.isDisposed`, `ctx.gate`/`ctx.store` (the purge-and-bail
+  // and zero-chunk branches), `ctx.parser`, and `ctx.opts.maxChunkTokens`.
+  ctx: IndexerStoreCtx & Pick<IndexerContextBag, 'isDisposed' | 'parser' | 'opts'>,
   targets: ReindexTarget[],
   manifest: Record<string, string>,
 ): Promise<{ records: ChunkRecord[]; pathState: ReadonlyMap<string, MutablePathState> } | { disposed: true }> {
@@ -430,7 +476,9 @@ async function buildPendingRecords(
  * the TA-3 catch-scrub on any embed/store failure before rethrowing.
  */
 async function embedAndSwap(
-  ctx: IndexerContext,
+  // FI-18: reads `ctx.embedder`, `ctx.isDisposed`, and `ctx.gate`/`ctx.store`
+  // (the per-batch delete-before-upsert swap). No manifest/ignore/logger use.
+  ctx: IndexerStoreCtx & Pick<IndexerContextBag, 'embedder' | 'isDisposed'>,
   records: ChunkRecord[],
   pathState: ReadonlyMap<string, MutablePathState>,
   manifest: Record<string, string>,
@@ -550,7 +598,12 @@ async function embedAndSwap(
 }
 
 export async function reindexFiles(
-  ctx: IndexerContext,
+  // FI-18: `ctx.ensureStoreInitialized` directly, plus the union of what
+  // `buildPendingRecords` and `embedAndSwap` need (both called with this
+  // same `ctx`) — `IndexerStoreCtx` already covers `gate`/`store`/
+  // `ensureStoreInitialized`; `isDisposed`/`parser`/`opts`/`embedder` are
+  // the two callees' residual members.
+  ctx: IndexerStoreCtx & Pick<IndexerContextBag, 'isDisposed' | 'parser' | 'opts' | 'embedder'>,
   targets: ReindexTarget[],
   manifest: Record<string, string>,
   expectedWidth: number | undefined,
@@ -561,7 +614,20 @@ export async function reindexFiles(
   return embedAndSwap(ctx, pending.records, pending.pathState, manifest, expectedWidth);
 }
 
-export async function runBuild(ctx: IndexerContext): Promise<void> {
+export async function runBuild(
+  // FI-18: reads the store role directly (`ensureStoreInitialized`/`gate`/
+  // `store`), the full manifest role (`readManifest`/`writeManifest`/
+  // `readMeta`/`writeMeta`/`computeEffectiveWidth`/`fingerprintMatches`) and
+  // the full ignore role (`invalidateIgnoreFilterCache`/`loadIgnoreFilter`/
+  // `setKnownNestedIgnoreDirs`) directly, plus `opts`/`isDisposed` directly
+  // and `parser`/`embedder` transitively (passed on to `walk`/`reindexFiles`
+  // below). `logger`/`recordFailedIncrementalReindex` are unused here — they
+  // are `watchPipeline.ts`-only members, correctly absent from this Pick.
+  ctx: IndexerStoreCtx &
+    IndexerManifestCtx &
+    IndexerIgnoreCtx &
+    Pick<IndexerContextBag, 'opts' | 'parser' | 'embedder' | 'isDisposed'>,
+): Promise<void> {
   await ctx.ensureStoreInitialized();
   // AUDIT-5 Task 10: force a fresh ignore-filter read for every full
   // build, independent of whatever the watch path may already have
