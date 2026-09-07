@@ -2447,6 +2447,19 @@ describe('LOCK: the shell is the only next-edit context-key writer, and register
     expect(offenders).toEqual([]);
   });
 
+  // WS-F3 F3-9 (folded F3-8 Minor-1): the `[]` above is a NEGATIVE guard (no
+  // OTHER file both-writes-setContext-AND-names-a-next-edit-key); it does not
+  // itself say the shell IS the writer. Before this, that positive fact was
+  // only runtime-covered. This restores it as a static pin, mirroring the
+  // readFileSync/dynamic-import idiom the 'never registers an
+  // InlineCompletionItemProvider' test below already uses.
+  it('LOCK positive arm: shell.vscode.ts itself still contains the sole setContext write', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const shellSrc = fs.readFileSync(path.join(__dirname, 'shell.vscode.ts'), 'utf8');
+    expect(SET_CONTEXT_WRITE_RE.test(shellSrc)).toBe(true);
+  });
+
   it('the write-signature predicate is not a no-op that would rubber-stamp everything (sanity check on the mechanism)', () => {
     expect(SET_CONTEXT_WRITE_RE.test("void vscode.commands.executeCommand('setContext', key, value);")).toBe(true);
     // A pure core naming the effect kind is NOT a write.

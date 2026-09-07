@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
 /**
  * FINAL REVIEW — FINDING 7. The filter↔mint agreement lock.
@@ -34,61 +34,19 @@ import { describe, it, expect, vi } from 'vitest';
  */
 
 /**
- * `shell.vscode.ts` imports `vscode` at module scope, so it needs a stub to be
- * importable at all. Only module-load needs to succeed here — `diffMayEgress`
- * itself touches no `vscode` API (it is pure over `scanSnippetForSecrets`),
- * which is precisely why it can be locked this cheaply.
+ * WS-F3 F3-9 (FI-06): `diffMayEgress`'s real home is `nextEditEgress.ts`, a
+ * pure, vscode-free module (it depends only on `../context/secretScanner`,
+ * itself vscode-free, plus type-only imports); `mintScannedNextEditRequest`'s
+ * home, `scan.ts`, is the same shape (`../context/secretScanner` + type-only);
+ * `./types` is declarations only, no logic, no vscode import. With every
+ * import in this file resolved against a vscode-free module, the `vi.mock`
+ * stub `shell.vscode.ts`'s module-scope `vscode` import used to require here
+ * is dead — this lock now loads the real modules with nothing stubbed, which
+ * is the point: it proves the predicate against the genuine pure module, no
+ * vscode shim in the way.
  */
-vi.mock('vscode', () => ({
-  Disposable: { from: (...items: { dispose(): void }[]) => ({ dispose: () => items.forEach((i) => i.dispose()) }) },
-  EventEmitter: class {
-    event = () => ({ dispose() {} });
-    fire() {}
-    dispose() {}
-  },
-  Range: class {
-    constructor(
-      public a: unknown,
-      public b: unknown,
-      public c?: unknown,
-      public d?: unknown,
-    ) {}
-  },
-  Position: class {
-    constructor(
-      public line: number,
-      public character: number,
-    ) {}
-  },
-  ThemeColor: class {
-    constructor(public id: string) {}
-  },
-  MarkdownString: class {},
-  WorkspaceEdit: class {
-    replace() {}
-  },
-  commands: { registerCommand: () => ({ dispose() {} }), executeCommand: () => Promise.resolve() },
-  window: {
-    createTextEditorDecorationType: () => ({ dispose() {} }),
-    onDidChangeActiveTextEditor: () => ({ dispose() {} }),
-    onDidChangeWindowState: () => ({ dispose() {} }),
-    showWarningMessage: () => Promise.resolve(undefined),
-    activeTextEditor: undefined,
-    visibleTextEditors: [],
-  },
-  workspace: {
-    onDidChangeTextDocument: () => ({ dispose() {} }),
-    getConfiguration: () => ({ get: <T>(_k: string, d: T): T => d }),
-    applyEdit: () => Promise.resolve(true),
-    asRelativePath: (p: unknown) => String(p),
-    workspaceFolders: undefined,
-    get isTrusted() {
-      return true;
-    },
-  },
-}));
 
-import { diffMayEgress } from './shell.vscode';
+import { diffMayEgress } from './nextEditEgress';
 import { mintScannedNextEditRequest } from './scan';
 import type { NextEditRequest, RecentDiff } from './types';
 
