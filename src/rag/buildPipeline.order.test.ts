@@ -1,3 +1,5 @@
+import { promises as fs } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 
 import { reindexFiles, type IndexerContext, type ReindexTarget } from './buildPipeline';
@@ -69,6 +71,18 @@ import type { MutationGate } from '../host/util/mutationGate';
  * type's annotation to the extended `Embedder` shape) — that one declared
  * fixture edit is the ONLY change F6-7 may make to this file; the 2-batch
  * shape and every assertion here must otherwise stay byte-identical.
+ *
+ * F6-2 addendum (FI-42): the ONE other declared exception to "byte-identical
+ * forever" is the fs-injection seam itself. F6-1 originally drove this
+ * golden by handing `reindexFiles` a `preloaded: Map<string, Buffer>` as its
+ * 5th argument, bypassing `fs.readFile` entirely. F6-2 deletes that dead
+ * (never called by any production caller) parameter, so this file now
+ * monkey-patches `node:fs`'s `promises.readFile` to return the SAME fake
+ * buffers keyed by absolute path (mirroring `indexer.test.ts:1283-1286`'s
+ * monkey-patch idiom, restored per test in a `finally`) instead of passing a
+ * `preloaded` map. Every `expect(calls)`/`expect(manifest)` assertion below
+ * is byte-identical to what F6-1 left — only the plumbing that feeds
+ * `reindexFiles` its bytes changed.
  */
 
 const WORKSPACE_ROOT = '/fake-workspace';
@@ -104,7 +118,7 @@ function linesProducingChunks(prefix: string, count: number, expectedChunks: num
 
 interface Scenario {
   targets: ReindexTarget[];
-  preloaded: Map<string, Buffer>;
+  fileBytes: Map<string, Buffer>;
   zeroHash: string;
   alphaHash: string;
   betaHash: string;
@@ -121,7 +135,7 @@ function buildScenario(): Scenario {
     { readAbsPath: absPath(BETA_REL), storeRelPath: BETA_REL },
   ];
 
-  const preloaded = new Map<string, Buffer>([
+  const fileBytes = new Map<string, Buffer>([
     [absPath(ZERO_REL), Buffer.from(zeroContent, 'utf8')],
     [absPath(ALPHA_REL), Buffer.from(alphaContent, 'utf8')],
     [absPath(BETA_REL), Buffer.from(betaContent, 'utf8')],
@@ -129,10 +143,35 @@ function buildScenario(): Scenario {
 
   return {
     targets,
-    preloaded,
+    fileBytes,
     zeroHash: hashContent(zeroContent),
     alphaHash: hashContent(alphaContent),
     betaHash: hashContent(betaContent),
+  };
+}
+
+/**
+ * F6-2 (FI-42): `reindexFiles`'s `preloaded` param is gone, so this golden's
+ * filesystem-avoidance seam moves to `fs.readFile` itself. The fake
+ * `/fake-workspace/…` paths built by `buildScenario` do not exist on disk,
+ * so — unlike `indexer.test.ts:1283-1286`'s real-workspace spy, which
+ * delegates every call through to the real implementation — this mock must
+ * ANSWER from `fileBytes` for every path the scenario knows about. It still
+ * mirrors that file's monkey-patch idiom (plain reassignment, no
+ * `vi.fn()`/`vi.spyOn`) for any path it does NOT recognise, so an
+ * unexpected read fails the same way it would against the real filesystem
+ * rather than hanging or silently returning `undefined`. Callers restore the
+ * original in a `finally` via the returned function.
+ */
+function patchReadFile(fileBytes: Map<string, Buffer>): () => void {
+  const realReadFile = fs.readFile;
+  fs.readFile = ((filePath: Parameters<typeof fs.readFile>[0], ...rest: unknown[]) => {
+    const buf = fileBytes.get(String(filePath));
+    if (buf !== undefined) return Promise.resolve(buf);
+    return (realReadFile as typeof fs.readFile)(filePath as never, ...(rest as unknown as never[]));
+  }) as typeof fs.readFile;
+  return () => {
+    fs.readFile = realReadFile;
   };
 }
 
@@ -244,43 +283,48 @@ function buildHarness(opts: {
 
 describe('reindexFiles — spy-order golden bank (WS-F6 F6-1 characterization, buildPipeline.ts:275-516)', () => {
   it('(a) success: full ordered swap sequence + every path lands in the final manifest', async () => {
-    const { targets, preloaded, zeroHash, alphaHash, betaHash } = buildScenario();
+    const { targets, fileBytes, zeroHash, alphaHash, betaHash } = buildScenario();
     const { ctx, calls } = buildHarness({ isDisposedSequence: [false], embedWidth: 3 });
     const manifest: Record<string, string> = {};
 
-    const observedWidth = await reindexFiles(ctx, targets, manifest, undefined, preloaded);
+    const restoreReadFile = patchReadFile(fileBytes);
+    try {
+      const observedWidth = await reindexFiles(ctx, targets, manifest, undefined);
 
-    expect(observedWidth).toBe(3);
-    expect(calls).toEqual([
-      'ensureStoreInitialized',
-      // phase 1 (:307-403): zero.dat's 0 surviving chunks purge+manifest
-      // immediately (:391-399) — alpha/beta produce records instead
-      // (:401), deferred to the phase-2 swap below.
-      'deleteByPath:zero.dat',
-      // phase 2, batch 1 (records 0-63 = alpha's 50 + beta's first 14):
-      // embed, THEN delete each newly-represented path's stale rows
-      // (:474-480), THEN upsert (:482) — delete-before-upsert per path is
-      // the swap invariant (TA-3).
-      'embed:64',
-      'deleteByPath:alpha.dat',
-      'deleteByPath:beta.dat',
-      'upsert:64',
-      // phase 2, batch 2 (records 64-69 = beta's remaining 6): beta was
-      // already purged at batch 1 (`state.deleted` true) — TA-3's "purge
-      // each path's stale rows exactly once" — so this batch has no
-      // `deleteByPath` call at all, only the embed + upsert.
-      'embed:6',
-      'upsert:6',
-    ]);
-    expect(manifest).toEqual({
-      'zero.dat': zeroHash,
-      'alpha.dat': alphaHash,
-      'beta.dat': betaHash,
-    });
+      expect(observedWidth).toBe(3);
+      expect(calls).toEqual([
+        'ensureStoreInitialized',
+        // phase 1 (:307-403): zero.dat's 0 surviving chunks purge+manifest
+        // immediately (:391-399) — alpha/beta produce records instead
+        // (:401), deferred to the phase-2 swap below.
+        'deleteByPath:zero.dat',
+        // phase 2, batch 1 (records 0-63 = alpha's 50 + beta's first 14):
+        // embed, THEN delete each newly-represented path's stale rows
+        // (:474-480), THEN upsert (:482) — delete-before-upsert per path is
+        // the swap invariant (TA-3).
+        'embed:64',
+        'deleteByPath:alpha.dat',
+        'deleteByPath:beta.dat',
+        'upsert:64',
+        // phase 2, batch 2 (records 64-69 = beta's remaining 6): beta was
+        // already purged at batch 1 (`state.deleted` true) — TA-3's "purge
+        // each path's stale rows exactly once" — so this batch has no
+        // `deleteByPath` call at all, only the embed + upsert.
+        'embed:6',
+        'upsert:6',
+      ]);
+      expect(manifest).toEqual({
+        'zero.dat': zeroHash,
+        'alpha.dat': alphaHash,
+        'beta.dat': betaHash,
+      });
+    } finally {
+      restoreReadFile();
+    }
   });
 
   it('(b) throw in embed batch 2: the scrub deletes the half-swapped path, keeps the fully-swapped ones', async () => {
-    const { targets, preloaded, zeroHash, alphaHash, betaHash } = buildScenario();
+    const { targets, fileBytes, zeroHash, alphaHash, betaHash } = buildScenario();
     const { ctx, calls } = buildHarness({ isDisposedSequence: [false], embedWidth: 3, failOnEmbedCall: 2 });
     // beta.dat already has a manifest entry equal to its CURRENT content
     // hash — models the fingerprint-mismatch full-rebuild path
@@ -293,39 +337,44 @@ describe('reindexFiles — spy-order golden bank (WS-F6 F6-1 characterization, b
     // entry at all (irrelevant to the scrub either way).
     const manifest: Record<string, string> = { 'beta.dat': betaHash };
 
-    const pending = reindexFiles(ctx, targets, manifest, undefined, preloaded);
-    await expect(pending).rejects.toThrow('embed: simulated /v1/embeddings failure');
+    const restoreReadFile = patchReadFile(fileBytes);
+    try {
+      const pending = reindexFiles(ctx, targets, manifest, undefined);
+      await expect(pending).rejects.toThrow('embed: simulated /v1/embeddings failure');
 
-    // Ordered calls up to (and including) the throw: batch 1 completes in
-    // full (embed, swap-delete both paths, upsert); batch 2's embed call
-    // itself throws before reaching the delete/upsert step (:442 is never
-    // reached this batch) so nothing else follows it.
-    expect(calls).toEqual([
-      'ensureStoreInitialized',
-      'deleteByPath:zero.dat',
-      'embed:64',
-      'deleteByPath:alpha.dat',
-      'deleteByPath:beta.dat',
-      'upsert:64',
-      'embed:6:throw',
-    ]);
-    // The catch-scrub (:501-513): alpha.dat was fully swapped in batch 1
-    // (`deleted && remaining === 0`) -> kept (freshly SET, not merely left
-    // alone — it had no prior entry). beta.dat's stale rows were deleted in
-    // batch 1 but its remaining 6 records never landed (`deleted &&
-    // remaining > 0`) -> its PRE-EXISTING, already-matching manifest entry
-    // is actively deleted by the scrub. zero.dat never entered `pathState`
-    // at all (its 0-chunk purge is a separate phase-1 branch) -> untouched
-    // by the scrub, freshly set to its own current hash.
-    expect(manifest).toEqual({
-      'zero.dat': zeroHash,
-      'alpha.dat': alphaHash,
-    });
-    expect(manifest).not.toHaveProperty('beta.dat');
+      // Ordered calls up to (and including) the throw: batch 1 completes in
+      // full (embed, swap-delete both paths, upsert); batch 2's embed call
+      // itself throws before reaching the delete/upsert step (:442 is never
+      // reached this batch) so nothing else follows it.
+      expect(calls).toEqual([
+        'ensureStoreInitialized',
+        'deleteByPath:zero.dat',
+        'embed:64',
+        'deleteByPath:alpha.dat',
+        'deleteByPath:beta.dat',
+        'upsert:64',
+        'embed:6:throw',
+      ]);
+      // The catch-scrub (:501-513): alpha.dat was fully swapped in batch 1
+      // (`deleted && remaining === 0`) -> kept (freshly SET, not merely left
+      // alone — it had no prior entry). beta.dat's stale rows were deleted in
+      // batch 1 but its remaining 6 records never landed (`deleted &&
+      // remaining > 0`) -> its PRE-EXISTING, already-matching manifest entry
+      // is actively deleted by the scrub. zero.dat never entered `pathState`
+      // at all (its 0-chunk purge is a separate phase-1 branch) -> untouched
+      // by the scrub, freshly set to its own current hash.
+      expect(manifest).toEqual({
+        'zero.dat': zeroHash,
+        'alpha.dat': alphaHash,
+      });
+      expect(manifest).not.toHaveProperty('beta.dat');
+    } finally {
+      restoreReadFile();
+    }
   });
 
   it('(c) dispose mid-embed (after batch 1): batch 2 never upserts, its path is never finalized', async () => {
-    const { targets, preloaded, zeroHash, alphaHash } = buildScenario();
+    const { targets, fileBytes, zeroHash, alphaHash } = buildScenario();
     const { ctx, calls } = buildHarness({
       isDisposedSequence: [false, false, true],
       embedWidth: 3,
@@ -339,35 +388,40 @@ describe('reindexFiles — spy-order golden bank (WS-F6 F6-1 characterization, b
     // byte-identical.
     const manifest: Record<string, string> = { 'beta.dat': 'stale-hash-from-a-prior-build' };
 
-    const observedWidth = await reindexFiles(ctx, targets, manifest, undefined, preloaded);
+    const restoreReadFile = patchReadFile(fileBytes);
+    try {
+      const observedWidth = await reindexFiles(ctx, targets, manifest, undefined);
 
-    // The :442 guard fires right after batch 2's embed call resolves —
-    // batch 2's embed IS called (unlike case b, nothing throws), but its
-    // delete/upsert/manifest-write never run; `reindexFiles` returns
-    // whatever width batch 1 already observed.
-    expect(observedWidth).toBe(3);
-    expect(calls).toEqual([
-      'ensureStoreInitialized',
-      'deleteByPath:zero.dat',
-      'embed:64',
-      'deleteByPath:alpha.dat',
-      'deleteByPath:beta.dat',
-      'upsert:64',
-      'embed:6',
-    ]);
-    // beta.dat's stale rows were purged in batch 1 (deleted=true) but its
-    // remaining 6 replacement records never reached `store.upsert`, and —
-    // unlike case (b) — no throw ever runs the catch-scrub either: dispose
-    // is a plain early return (`:442`), not an exception. So beta.dat's
-    // manifest entry is neither finalized to `betaHash` NOR scrubbed to
-    // absent — it survives completely UNTOUCHED at whatever it held before
-    // this call, which is exactly the asymmetry between the throw path
-    // (case b, active scrub) and the dispose path (case c, silent no-op)
-    // that a decomposition must not blur.
-    expect(manifest).toEqual({
-      'zero.dat': zeroHash,
-      'alpha.dat': alphaHash,
-      'beta.dat': 'stale-hash-from-a-prior-build',
-    });
+      // The :442 guard fires right after batch 2's embed call resolves —
+      // batch 2's embed IS called (unlike case b, nothing throws), but its
+      // delete/upsert/manifest-write never run; `reindexFiles` returns
+      // whatever width batch 1 already observed.
+      expect(observedWidth).toBe(3);
+      expect(calls).toEqual([
+        'ensureStoreInitialized',
+        'deleteByPath:zero.dat',
+        'embed:64',
+        'deleteByPath:alpha.dat',
+        'deleteByPath:beta.dat',
+        'upsert:64',
+        'embed:6',
+      ]);
+      // beta.dat's stale rows were purged in batch 1 (deleted=true) but its
+      // remaining 6 replacement records never reached `store.upsert`, and —
+      // unlike case (b) — no throw ever runs the catch-scrub either: dispose
+      // is a plain early return (`:442`), not an exception. So beta.dat's
+      // manifest entry is neither finalized to `betaHash` NOR scrubbed to
+      // absent — it survives completely UNTOUCHED at whatever it held before
+      // this call, which is exactly the asymmetry between the throw path
+      // (case b, active scrub) and the dispose path (case c, silent no-op)
+      // that a decomposition must not blur.
+      expect(manifest).toEqual({
+        'zero.dat': zeroHash,
+        'alpha.dat': alphaHash,
+        'beta.dat': 'stale-hash-from-a-prior-build',
+      });
+    } finally {
+      restoreReadFile();
+    }
   });
 });

@@ -249,12 +249,12 @@ export async function walk(
  * diff found no files to recompute) — the caller uses this to decide what
  * to persist into the D-2 sidecar.
  *
- * AUDIT-5 Task 10: `preloaded` is an optional readAbsPath -> Buffer map.
- * When the caller already has a path's bytes in hand (`runBuild`'s hash
- * pass reads every candidate once already), pass them here instead of
- * letting this function `fs.readFile` the same path a second time. The
- * watch path (`handleFsEvent`) has no such buffer and passes nothing — it
- * keeps its original single read.
+ * Stream-and-reread (FI-42): `runBuild`'s hash pass (`~:537-543`) reads each
+ * candidate once already, but only to hash it and release the buffer — it
+ * does not retain the bytes. This function re-reads every changed path's
+ * bytes itself below, exactly like the single-target watch path
+ * (`handleFsEvent`) always has; both callers read once for the hash/verify
+ * step and once here for the embed step, unconditionally.
  */
 /**
  * AUDIT-5 Task 11: one reindex target = the abs path whose BYTES are read,
@@ -277,7 +277,6 @@ export async function reindexFiles(
   targets: ReindexTarget[],
   manifest: Record<string, string>,
   expectedWidth: number | undefined,
-  preloaded?: Map<string, Buffer>,
 ): Promise<number | undefined> {
   await ctx.ensureStoreInitialized();
   // TA-5 (AU-23, Med) / INV-5: `ensureStoreInitialized` above is itself an
@@ -304,7 +303,7 @@ export async function reindexFiles(
   for (const { readAbsPath, storeRelPath: relPath } of targets) {
     let buf: Buffer;
     try {
-      buf = preloaded?.get(readAbsPath) ?? (await fs.readFile(readAbsPath));
+      buf = await fs.readFile(readAbsPath);
     } catch {
       continue; // deleted between walk and read; the delete pass handles it.
     }
