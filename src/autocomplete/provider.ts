@@ -26,6 +26,7 @@ import { classifyBackendFailure } from './failureClass';
 // Task 16 (08 §11, ADR-010): the unknown-model signal — see the polarity
 // check in `provideInlineCompletionItems` below.
 import { isKnownFimModel } from './templates';
+import type { OnceRegistry } from './onceRegistry';
 
 /**
  * A5: the `Set API Key` action label shown on the 401/403 warning
@@ -69,30 +70,6 @@ const WARN_MSG = (model: string): string =>
 
 const REFUSE_MSG = (model: string): string =>
   `Talaria autocomplete is paused: unrecognized model "${model}". The vllm backend needs Talaria to build the model-specific FIM prompt itself, and guessing the format would produce silently wrong completions. Set "talaria.autocomplete.model" to a supported model (for example "qwen2.5-coder:7b-base").`;
-
-/**
- * A5: one-shot dedup for the actionable autocomplete failures
- * (`InsecureTransportError`, `MissingApiKeyError`, a 401/403 auth rejection,
- * a 400 dialect mismatch) — module-level (spans every completion request, every
- * provider instance) so a failing config is surfaced ONCE, not on every
- * keystroke. Keyed `${backend}|${endpointHost}|${statusClass}`. Cleared by
- * {@link clearSurfacedAutocompleteFailures}, which `index.ts`'s `rebuild()`
- * calls on every config change — so fixing the key/endpoint re-arms the
- * warning instead of going silent forever. No timers, no state beyond this
- * Set (A5 DoD).
- */
-const surfacedAutocompleteFailures = new Set<string>();
-
-/**
- * A5: re-arms every surfaced-once autocomplete failure warning. Wired into
- * `index.ts`'s `rebuild()` (fires on every `talaria.autocomplete.*` config
- * change and on the initial API-key load) so a user who just fixed their
- * key/endpoint gets a second signal on the next failure instead of
- * permanent silence.
- */
-export function clearSurfacedAutocompleteFailures(): void {
-  surfacedAutocompleteFailures.clear();
-}
 
 /**
  * W5.1 next-edit (Job B Task 12) — the OBSERVATION seam. FIM tells next-edit
@@ -202,11 +179,24 @@ export interface TalariaInlineCompletionProviderOptions {
   /** W5-T5: the single background gatherer/snapshot cache — §2.1/§2.4. */
   contextService: CrossFileContextService;
   /**
+   * FI-26 (FSU §5 Q4): the {@link OnceRegistry} `surfaceIfFirst` dedupes
+   * against — REQUIRED (unlike `fimActivity`/`onEgressVerdict` below, this
+   * has no no-op default: a dedup registry that silently did nothing would
+   * defeat the anti-spam guarantee this whole seam exists for). `index.ts`
+   * threads its ONE activation-scoped instance in; this state used to be a
+   * module-level `Set` here, cleared by `index.ts`'s `rebuild()` on every
+   * config change — the registry's activation-scoped lifetime now
+   * supersedes that per-rebuild re-arm (see `index.ts`'s `rebuild()` for the
+   * lifetime note): a surfaced failure stays silent for the rest of this
+   * activation, not just until the next engine rebuild.
+   */
+  registry: OnceRegistry;
+  /**
    * A5: the currently-configured backend name + endpoint host, read fresh
    * on every failure (mirrors `getEnabled`/`getSkipUntrustedRemote`'s
    * live-closure-over-mutable-`cfg` posture in `index.ts`) — used ONLY to
-   * build the one-shot Set key and the surfaced message text, never sent
-   * anywhere.
+   * build the one-shot registry key and the surfaced message text, never
+   * sent anywhere.
    */
   getBackendName: () => string;
   getEndpointHost: () => string;
@@ -260,6 +250,7 @@ export class TalariaInlineCompletionProvider
   private readonly getEnabled: () => boolean;
   private readonly getSkipUntrustedRemote: () => boolean;
   private readonly contextService: CrossFileContextService;
+  private readonly registry: OnceRegistry;
   private readonly getBackendName: () => string;
   private readonly getEndpointHost: () => string;
   private readonly getModelName: () => string;
@@ -272,6 +263,7 @@ export class TalariaInlineCompletionProvider
     this.getEnabled = opts.getEnabled;
     this.getSkipUntrustedRemote = opts.getSkipUntrustedRemote;
     this.contextService = opts.contextService;
+    this.registry = opts.registry;
     this.getBackendName = opts.getBackendName;
     this.getEndpointHost = opts.getEndpointHost;
     this.getModelName = opts.getModelName;
@@ -286,9 +278,11 @@ export class TalariaInlineCompletionProvider
    * surfacing primitive (precedent: `host/backend/customModes.ts:125`) —
    * and append one line to the `Talaria` output channel via the injected
    * {@link reportFailure} seam. Only on the FIRST insertion of `key` into
-   * {@link surfacedAutocompleteFailures} (one-shot, not per-keystroke);
-   * every subsequent identical failure is silent until the next engine
-   * rebuild clears the Set. A dismissed warning (the Thenable resolving
+   * {@link registry} (one-shot, not per-keystroke); every subsequent
+   * identical failure is silent for the rest of this activation (FI-26,
+   * FSU §5 Q4: `registry` is activation-scoped — there is no more automatic
+   * per-rebuild re-arm; only THIS key's own failed-remediation `.delete`
+   * below re-arms it early). A dismissed warning (the Thenable resolving
    * `undefined`) is a normal outcome, not an error.
    *
    * M3 (A7, pulled forward from A5's review): `showWarningMessage` returns a
@@ -304,12 +298,12 @@ export class TalariaInlineCompletionProvider
    * used to be `void`-discarded there. On a keyring-less Fedora box (our ship
    * target) `context.secrets.store` can reject: the key was never saved, no
    * error shown, and — because `store` failing means `onDidChange` never
-   * fires — `rebuild()` never re-armed this key, so every later failure went
-   * silent forever. The command's promise now gets the SAME
+   * fires — nothing else would ever re-arm this key, so every later failure
+   * went silent forever. The command's promise now gets the SAME
    * `.then(undefined, onRejected)` treatment (it too is a `Thenable`), and
-   * its `onRejected` deletes `key` from {@link surfacedAutocompleteFailures}
-   * before reporting — the remediation itself failed, so the user must be
-   * re-armed for a fresh signal, not stranded in silence.
+   * its `onRejected` deletes `key` from {@link registry} before reporting —
+   * the remediation itself failed, so the user must be re-armed for a fresh
+   * signal, not stranded in silence.
    *
    * F-C (final fix wave): `channelMessage` defaults to `message` (every arm
    * but one wants the toast and the output-channel line identical) — the
@@ -323,14 +317,14 @@ export class TalariaInlineCompletionProvider
     items: readonly string[] = [],
     channelMessage: string = message,
   ): void {
-    if (surfacedAutocompleteFailures.has(key)) return;
-    surfacedAutocompleteFailures.add(key);
+    if (this.registry.has(key)) return;
+    this.registry.add(key);
     this.reportFailure(channelMessage);
     void vscode.window.showWarningMessage(message, ...items).then(
       (selection) => {
         if (selection === SET_API_KEY_ACTION) {
           void vscode.commands.executeCommand('talaria.setAutocompleteApiKey').then(undefined, (err) => {
-            surfacedAutocompleteFailures.delete(key);
+            this.registry.delete(key);
             this.reportFailure(`[autocomplete.setApiKey] ${String(err)}`);
           });
         }

@@ -76,6 +76,7 @@ import {
 import { assertSecureAuthTransport } from '../backends/secureTransport';
 import { mintScannedNextEditRequest } from './scan';
 import { isRecord } from '../../shared/typeGuards';
+import { OnceRegistry } from '../onceRegistry';
 import type { NextEditTransportId, ScannedNextEditRequest } from './types';
 import type { NextEditModelOutput, RenderedNextEditPrompt, StopReason } from './formats/types';
 
@@ -86,32 +87,46 @@ export interface NextEditBackendOptions {
   model: string;
   /** For the wire-adjacent re-mint — the format module's own sentinel list. */
   sentinels: readonly string[];
+  /**
+   * FI-26 (FSU §5 Q4): the {@link OnceRegistry} `predict`'s own `warnOnce`
+   * dedupes against — optional, defaulting to {@link defaultRegistry} below.
+   * This module stays vscode-free (pass the registry as a plain param, never
+   * reach into vscode to get one) — see that constant's own doc comment for
+   * why no current caller (the shell constructs a fresh `NextEditHttpBackend`
+   * per prediction attempt) actually supplies one today.
+   */
+  registry?: OnceRegistry;
 }
 
 /**
- * CF-24 / L6 I-15: mirrors `../backendFactory.ts`'s own `warnedOnce`/
- * `warnOnce`/`clearBackendFactoryWarnings` VERBATIM — same dedupe-by-fixed-key
- * Set, same `console.warn` (never `vscode.window` — this module deliberately
+ * CF-24 / L6 I-15: mirrors `../backendFactory.ts`'s own dedup discipline —
+ * same `console.warn` (never `vscode.window` — this module deliberately
  * never imports `vscode`, which is what keeps `predict` callable from a plain
  * unit test), same re-arm-by-export discipline. `backendFactory.ts`'s F4 arm
  * already solved this exact problem for the FIM `ollama` backend (which has
  * no `apiKey` field at all); this is the same fix for next-edit's `ollama`
  * transport, which has the identical no-auth-story shape (see `predict`'s
  * key-drop below).
+ *
+ * FI-26 (FSU §5 Q4): the raw module-level `Set` is now an {@link OnceRegistry}
+ * instance, `defaultRegistry` — the fallback every `NextEditHttpBackend`
+ * uses when constructed without an explicit `registry` (`NextEditBackendOptions`
+ * above). Every current caller (production and test) omits it, so this
+ * module's dedup lifetime is UNCHANGED by this task: still process-lifetime,
+ * never re-armed automatically (nothing ever called
+ * {@link clearNextEditBackendWarnings} from production before this task
+ * either — only this file's own tests call it directly to reset between
+ * cases). The optional `registry` parameter exists so a FUTURE activation-
+ * scoped caller can share one instance across sites without this module
+ * reaching into vscode to obtain it.
  */
-const warnedOnce = new Set<string>();
+const defaultRegistry = new OnceRegistry();
 
-function warnOnce(key: string, message: string): void {
-  if (warnedOnce.has(key)) return;
-  warnedOnce.add(key);
-  console.warn(`[talaria.nextEdit] ${message}`);
-}
-
-/** Re-arms every construction-time warning {@link warnOnce} can emit — see
- *  its doc comment for the re-arm discipline this exists for (mirrors
- *  `../backendFactory.ts`'s `clearBackendFactoryWarnings`). */
+/** Resets {@link defaultRegistry} — the fallback `NextEditHttpBackend` uses
+ *  when constructed without an explicit `registry`. See that constant's own
+ *  doc comment for this module's (unchanged) dedup lifetime. */
 export function clearNextEditBackendWarnings(): void {
-  warnedOnce.clear();
+  defaultRegistry.reset();
 }
 
 /** Ollama `/api/generate` (non-streaming) response shape — only the fields
@@ -170,7 +185,18 @@ function normalizeStopReason(raw: string | undefined): StopReason {
 }
 
 export class NextEditHttpBackend {
-  constructor(private readonly opts: NextEditBackendOptions) {}
+  private readonly registry: OnceRegistry;
+
+  constructor(private readonly opts: NextEditBackendOptions) {
+    this.registry = opts.registry ?? defaultRegistry;
+  }
+
+  /** See {@link defaultRegistry}'s doc comment for the dedup discipline. */
+  private warnOnce(key: string, message: string): void {
+    if (this.registry.has(key)) return;
+    this.registry.add(key);
+    console.warn(`[talaria.nextEdit] ${message}`);
+  }
 
   async predict(
     req: ScannedNextEditRequest,
@@ -205,8 +231,8 @@ export class NextEditHttpBackend {
     const trimmedApiKey = this.opts.apiKey?.trim() || undefined;
 
     // CF-24 / L6 I-15 — parity with `../backendFactory.ts`'s own `ollama`
-    // arm (F4, mirrored verbatim via `warnOnce`/`warnedOnce` above): Ollama's
-    // `/api/generate` has no auth story this codebase speaks to here either
+    // arm (F4, mirrored via this class's own `warnOnce`/`registry` above):
+    // Ollama's `/api/generate` has no auth story this codebase speaks to here either
     // — `predictOllama` below never reads `apiKey` at all, so a leftover key
     // is DROPPED for this transport (warn-once, never the key value) instead
     // of being treated as "present" by `assertSecureAuthTransport`. Without
@@ -221,7 +247,7 @@ export class NextEditHttpBackend {
     // (`predictOpenAiCompat`'s `Authorization` header) and so must keep
     // refusing exactly as before — this is parity, not a removed protection.
     if (this.opts.transport === 'ollama' && trimmedApiKey !== undefined) {
-      warnOnce(
+      this.warnOnce(
         'nextedit-ollama-key-dropped',
         'An apiKey is configured, but the next-edit ollama transport has no authentication of its own — the key will never be sent. Clear the key, or switch talaria.nextEdit.backend to a transport that supports one.',
       );
