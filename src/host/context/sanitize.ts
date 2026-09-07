@@ -368,9 +368,16 @@ export function truncateDiffToBudget(
     return { diff: fileListFallback(sections), truncated: true, droppedFiles: sections.map((s) => s.path) };
   }
 
-  const keptPaths = new Set(byPriority.slice(0, keepCount).map((s) => s.path));
-  const keptBodies = sections.filter((s) => keptPaths.has(s.path)).map((s) => s.body);
-  const droppedFiles = sections.filter((s) => !keptPaths.has(s.path)).map((s) => s.path);
+  // Identity membership (not `.path`): two sections can share a path — real
+  // duplicates, or `extractSectionPath` returning `''` for a malformed
+  // header (L2-CA-12) — and a path-keyed Set would then keep/drop BOTH
+  // instead of exactly the budgeted count. `byPriority`'s elements are the
+  // very same object references as `sections`' (see the `.map` above), so a
+  // `Set<DiffFileSection>` membership test here is exact per-section, not
+  // per-path.
+  const kept = new Set(byPriority.slice(0, keepCount));
+  const keptBodies = sections.filter((s) => kept.has(s)).map((s) => s.body);
+  const droppedFiles = sections.filter((s) => !kept.has(s)).map((s) => s.path);
 
   return { diff: keptBodies.join(''), truncated: true, droppedFiles };
 }

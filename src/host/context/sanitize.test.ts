@@ -128,6 +128,22 @@ function makeSection(path: string, addedLine: string): string {
   );
 }
 
+/** Build one unified-diff file section with a MALFORMED `diff --git` header:
+ * no `a/<path> b/<path>` shape, and none of `rename to`/`+++ b/`/`--- a/`
+ * either — {@link extractSectionPath} falls through every extraction
+ * attempt and returns `''` for it (L2-CA-12: used to prove
+ * `truncateDiffToBudget` handles same-path — here, same EMPTY path —
+ * sections by identity, not by the path string). */
+function makeMalformedSection(addedLine: string): string {
+  return (
+    `diff --git malformed-header-no-path-here\n` +
+    `index 1111111..2222222 100644\n` +
+    `@@ -1 +1 @@\n` +
+    `-old\n` +
+    `+${addedLine}\n`
+  );
+}
+
 describe('extractSectionPath — unambiguous per-file path extraction (T5a fix)', () => {
   it('extracts the path from `+++ b/` even when the path itself contains a literal " b/" substring (T5a PoC)', () => {
     const body = makeSection('.ssh/known b/hosts', 'new');
@@ -392,5 +408,34 @@ describe('truncateDiffToBudget — GitLens priority-score binary-search truncati
   it('defaults the cap to CONTEXT_BUDGET.diffChars', () => {
     const diff = makeSection('src/tiny.ts', 'x');
     expect(truncateDiffToBudget(diff)).toEqual({ diff, truncated: false, droppedFiles: [] });
+  });
+
+  it('two sections with the same EMPTY path (malformed headers): keeps exactly the budgeted ONE, not both/neither (L2-CA-12)', () => {
+    const section1 = makeMalformedSection('first');
+    const section2 = makeMalformedSection('second-is-longer-than-first');
+    expect(extractSectionPath(section1)).toBe('');
+    expect(extractSectionPath(section2)).toBe('');
+    const diff = section1 + section2;
+    const cap = section1.length; // fits section1 alone, not both
+
+    const result = truncateDiffToBudget(diff, cap);
+
+    expect(result.truncated).toBe(true);
+    expect(result.droppedFiles.length).toBe(1);
+    expect(result.diff).toBe(section1);
+  });
+
+  it('two sections with the SAME real path: keeps exactly the budgeted ONE, not both/neither (L2-CA-12)', () => {
+    const section1 = makeSection('src/dup.ts', 'x'.repeat(20));
+    const section2 = makeSection('src/dup.ts', 'y'.repeat(20));
+    expect(section1.length).toBe(section2.length);
+    const diff = section1 + section2;
+    const cap = section1.length; // fits section1 alone, not both
+
+    const result = truncateDiffToBudget(diff, cap);
+
+    expect(result.truncated).toBe(true);
+    expect(result.droppedFiles.length).toBe(1);
+    expect(result.diff).toBe(section1);
   });
 });
