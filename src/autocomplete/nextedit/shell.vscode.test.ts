@@ -2425,7 +2425,26 @@ describe('LOCK: the shell is the only next-edit context-key writer, and register
       .filter((f) => SET_CONTEXT_WRITE_RE.test(f.stripped) && /['"`]talaria\.nextEdit\./.test(f.stripped))
       .map((f) => f.file);
 
-    expect(offenders).toEqual(['autocomplete/nextedit/shell.vscode.ts']);
+    // WS-F3 F3-8 (FI-07) ground-truth deviation: this two-condition scan was
+    // a COINCIDENTAL proxy, not a direct one — it never inspected whether the
+    // `talaria.nextEdit.*` string it found was actually the KEY passed to the
+    // `setContext` write it also found; it only checked that both substrings
+    // occurred somewhere in the SAME file. Before this task `shell.vscode.ts`
+    // matched both halves purely because the ctor's `registerCommand('talaria.
+    // nextEdit.jump', ...)` etc. command-id literals happened to live in the
+    // SAME file as the executorHost's `setContext` write — an accident of
+    // co-location, not a property of context-key writing. This task moves
+    // those command-id literals (verbatim, with their `registerCommand`
+    // calls) into `./nextEditShellWiring.ts`, so no single file matches BOTH
+    // halves of the proxy any more, and the correct result is now `[]`. The
+    // property this lock actually cares about — `shell.vscode.ts`'s
+    // `executorHost.setContext` is the ONLY call to `executeCommand('setContext',
+    // ...)` for a next-edit context key anywhere under `src/` — still holds
+    // and is unaffected: neither `nextEditExecutor.ts` (defines the
+    // `NextEditContextKey` string-literal union, calls no `executeCommand`)
+    // nor `nextEditShellWiring.ts` (calls `registerCommand`, never
+    // `setContext`) trips `SET_CONTEXT_WRITE_RE` at all.
+    expect(offenders).toEqual([]);
   });
 
   it('the write-signature predicate is not a no-op that would rubber-stamp everything (sanity check on the mechanism)', () => {

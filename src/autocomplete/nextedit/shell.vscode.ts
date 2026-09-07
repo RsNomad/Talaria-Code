@@ -31,9 +31,9 @@ import * as vscode from 'vscode';
 import { AutocompleteDebouncer } from '../debouncer';
 import { isSecretForCompletion } from '../../shared/secretPaths';
 import { createEditTrackerAdapter, type EditTrackerAdapter } from '../context/editTrackerAdapter';
-import { isRecordableScheme, isTriggerableScheme } from '../context/recordableScheme';
+import { isTriggerableScheme } from '../context/recordableScheme';
 import type { FimActivityListener } from '../provider';
-import { regionAroundCursor, remapRange } from './anchors';
+import { regionAroundCursor } from './anchors';
 import { NextEditHttpBackend } from './backend';
 import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
 import { attachFimActivity, detachFimActivity, fimActivityRelay } from './fimActivityRelay';
@@ -41,7 +41,7 @@ import { reduceNextEdit } from './fsm';
 import type { RenderedNextEditPrompt } from './formats/types';
 import { NextEditGuard } from './guard';
 import { resolveNextEditMode, type NextEditMode, type ToggleRequest, type ToggleState } from './mode';
-import { computeChangesAboveCursor, filterEgressableDiffs, toContentChangeLites } from './nextEditEgress';
+import { computeChangesAboveCursor, filterEgressableDiffs } from './nextEditEgress';
 import { describeTriggerFailure } from './nextEditFailureSurface';
 import {
   deriveGenericTransport,
@@ -51,6 +51,7 @@ import {
   resolveRoute,
   type NextEditRoute,
 } from './nextEditRoute';
+import { buildFimActivity, registerCommands, registerListeners, type ShellHostSeams } from './nextEditShellWiring';
 import { ensureTrailingNewline, extractRegionRange, stripLineTerminator } from './nextEditText';
 import {
   makeExecutor,
@@ -108,13 +109,14 @@ export { deriveGenericTransport, GENERIC_SETUP_NOTE, NEXT_EDIT_MODEL_UNSET_NOTE,
 // ──────────────────────────────── the FIM seam ───────────────────────────────
 
 /**
- * The command VS Code executes when the user ACCEPTS FIM ghost text — the R4
- * seam. Registered exactly once, by `registerTalariaNextEdit` below, and
- * advertised to `provider.ts` through `acceptCommandId()` ONLY by the
- * registration that registered it. `provider.ts` never names this string: an
- * item can therefore not carry a command id that nothing has registered.
+ * WS-F3 F3-8 (FI-07): `FIM_ACCEPT_COMMAND` (the R4 seam's command id) moved
+ * verbatim to `./nextEditShellWiring`, alongside its two use sites
+ * (`buildFimActivity`'s `acceptCommandId` and `registerCommands`'s fourth
+ * registration) — both moved there in the same commit, so the constant moved
+ * with them rather than being re-exported. Nothing in `shell.vscode.ts`
+ * itself names it any more; the ctor advertises it indirectly, by calling
+ * `attachFimActivity(this.fimActivity)` AFTER `registerCommands` has run.
  */
-const FIM_ACCEPT_COMMAND = 'talaria.nextEdit.onFimAccept';
 
 /**
  * WS-F3 F3-6 (FI-06): `NO_OP_FIM_ACTIVITY`, the module-level `currentFimActivity`
@@ -508,172 +510,55 @@ class NextEditShell {
       () => this.pendingApplyExpectation,
     );
 
-    this.fimActivity = {
-      requestStarted: () => {
-        this.fim.inFlightCount += 1;
-        try {
-          // R2, the direction that matters: FIM-start aborts next-edit. Never
-          // the reverse — nothing in this module can cancel a FIM request.
-          this.abortInFlight();
-          this.dispatch({ kind: 'fimVisibility', visible: true });
-        } catch {
-          // Must not escape this call: `provider.ts` sets its own
-          // `fimRequested` flag only AFTER `requestStarted()` returns, and
-          // only a set flag makes its `finally` call the paired
-          // `resultShown` later. A throw here (e.g. `dispatch()` reaching a
-          // throwing host) would skip that flag and strand the increment
-          // above forever — unlike the boolean this refcount replaced, it
-          // does not self-heal on the next FIM cycle. The count's integrity
-          // matters more than reporting whatever failed downstream.
-        }
+    // WS-F3 F3-8 (FI-07): the NARROW port `buildFimActivity`/
+    // `registerListeners`/`registerCommands` (`./nextEditShellWiring`) close
+    // over — an EXPLICIT seam object, never `this` itself (`fim`/`dispatch`/
+    // `armTrigger`/`abortInFlight`/`currentProposal` are all `private`, and
+    // passing `this` structurally into a public interface naming a private
+    // member does not type-check under `strict`). `fim` is the SAME mutable
+    // object this class holds (reference-shared, no copy); `trackedVersion`
+    // is a get/set ACCESSOR PROPERTY bridging to the class's own private
+    // field, precisely so every moved block's `this.trackedVersion` becomes
+    // `seams.trackedVersion` — a literal rename, not a reshaping into method
+    // calls. `shell` is captured because a `get`/`set` accessor shorthand's
+    // own `this` binds to the object literal it lives on, not the enclosing
+    // constructor's `this`.
+    const shell = this;
+    const hostSeams: ShellHostSeams = {
+      fim: this.fim,
+      get trackedVersion(): number | null {
+        return shell.trackedVersion;
       },
-      resultShown: (hasItem: boolean) => {
-        if (this.fim.inFlightCount === 0) {
-          // UNPAIRED settle: a settle whose `requestStarted` was delivered to
-          // a PREVIOUS registration (the relay swapped while that request was
-          // in flight), or a stray duplicate — either way nothing of ours is
-          // outstanding to count out. Complete no-op: touching `visible` here
-          // could silently clear a GENUINELY visible ghost-text flag set by a
-          // real, unrelated request, reopening GATE 2 against R2.
-          return;
-        }
-        this.fim.inFlightCount -= 1;
-        // SUPERSEDED settle — a NEWER FIM request is still in flight, so this
-        // result speaks for a request VS Code has already cancelled and whose
-        // item it discarded. It may not report on visibility at all: the
-        // newest request is the one that gets to settle that, and until it
-        // does the refcount above holds GATE 2 closed on its own. Treating a
-        // stale settle as authoritative is what let a boolean `visible` be
-        // cleared out from under a live FIM request.
-        if (this.fim.inFlightCount > 0) return;
-        // Conservative visibility: a non-null item COUNTS as on screen, even
-        // though VS Code may still decline to render it.
-        this.fim.visible = hasItem;
-        this.dispatch({ kind: 'fimVisibility', visible: hasItem });
+      set trackedVersion(value: number | null) {
+        shell.trackedVersion = value;
       },
-      accepted: () => {
-        // The ghost text was consumed, so FIM is no longer on screen — and this
-        // is the R4 seam: the post-FIM-accept moment is exactly when a next
-        // edit is most likely to exist.
-        //
-        // The refcount is deliberately NOT zeroed here. `provider.ts` pairs
-        // every `requestStarted` with a `resultShown` in its own `finally`, so
-        // the request that produced this accepted item has already been counted
-        // out; any count still standing belongs to a LATER request that is
-        // genuinely in flight. Zeroing it would discard that and reopen GATE 2
-        // against R2 — the armed trigger below simply waits for it instead.
-        this.fim.visible = false;
-        this.dispatch({ kind: 'fimVisibility', visible: false });
-        this.armTrigger();
-      },
-      // Safe to answer unconditionally: this object only ever reaches the relay
-      // AFTER the command below is registered (see the attach site at the end of
-      // this function), and it leaves the relay when this registration disposes.
-      acceptCommandId: () => FIM_ACCEPT_COMMAND,
+      dispatch: (event) => this.dispatch(event),
+      armTrigger: () => this.armTrigger(),
+      abortInFlight: () => this.abortInFlight(),
+      currentProposal: () => this.currentProposal(),
     };
 
-    // ── listeners ────────────────────────────────────────────────────────────
-
-    const changeSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
-      // CF-19 — GATE-4 parity: a non-recordable scheme (Output/SCM/etc.) must
-      // not arm anything at all. Before this guard, `armTrigger()` ran
-      // unconditionally on EVERY `onDidChangeTextDocument` event regardless of
-      // which document changed, so edit-burst noise from an unrelated
-      // Output/SCM document could arm (and eventually fire) a next-edit
-      // request against the CURRENT active editor — a document GATE-4 would
-      // separately have to be scheme-valid on its own, but the arm itself
-      // never checked the document that actually changed.
-      if (!isRecordableScheme(e.document.uri.scheme)) return;
-
-      // Source 2 of the ONE trigger path: the debounced edit burst. Armed
-      // unconditionally (once past the scheme guard above) — `trigger()`
-      // itself resolves which editor/document is current, so no editor lookup
-      // is needed (or wanted) this early.
-      this.armTrigger();
-
-      const proposal = this.currentProposal();
-      if (proposal === null || proposal.region.uri !== e.document.uri.toString()) return;
-
-      if (e.contentChanges.length === 0) {
-        // A metadata-only event (dirty-flag, EOL, save) still bumps `version`.
-        // Nothing textual moved, so re-baseline instead of dismissing.
-        this.trackedVersion = e.document.version;
-        return;
-      }
-
-      if (this.trackedVersion === null || e.document.version !== this.trackedVersion + 1) {
-        // Versions skipped ⇒ at least one change event never reached us, so the
-        // changes in hand cannot describe the full delta. Fail closed.
-        this.dispatch({ kind: 'docChanged', remapped: null });
-        return;
-      }
-
-      const remapped = remapRange(
-        { startLine: proposal.region.startLine, endLine: proposal.region.endLine },
-        toContentChangeLites(e.contentChanges),
-      );
-      this.trackedVersion = e.document.version;
-      this.dispatch({ kind: 'docChanged', remapped });
-    });
-
-    const activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor(() => {
-      // C-6 — the one clearer `fim.visible` can safely have. Esc on ghost text
-      // is unobservable on the stable API, so nothing but the NEXT FIM request
-      // settling ever lowered this flag; disable FIM in between and GATE 2 stays
-      // shut for the rest of the session with no ghost text on screen at all.
-      //
-      // Why THIS event and not `onDidChangeTextDocument`: an inline suggestion
-      // is painted into ONE editor and cannot outlive it being switched away
-      // from, so clearing here cannot let next-edit build against ghost text
-      // that is genuinely on screen. A document change would be the wrong
-      // signal — the ordinary keystroke path fires it BEFORE FIM's provider is
-      // invoked, so it would reopen the gate in exactly the window R2 exists to
-      // close.
-      //
-      // `inFlightCount` is deliberately NOT touched: a FIM request in flight
-      // survives an editor switch, and it alone must keep the gate shut.
-      this.fim.visible = false;
-      this.dispatch({ kind: 'editorChanged' });
-    });
-
-    const windowStateSubscription = vscode.window.onDidChangeWindowState((windowState) => {
-      if (!windowState.focused) {
-        this.dispatch({ kind: 'focusLost' });
-      }
-    });
-
-    // ── commands (registered ONCE) ───────────────────────────────────────────
-
-    const jumpCommand = vscode.commands.registerCommand('talaria.nextEdit.jump', () => {
-      this.dispatch({ kind: 'tabJump' });
-    });
-    const acceptCommand = vscode.commands.registerCommand('talaria.nextEdit.accept', () => {
-      this.dispatch({ kind: 'tabAccept' });
-    });
-    const dismissCommand = vscode.commands.registerCommand('talaria.nextEdit.dismiss', () => {
-      this.dispatch({ kind: 'esc' });
-    });
-    // The R4 seam: fired by the InlineCompletionItem's own `command`, which VS
-    // Code executes when the user ACCEPTS the FIM ghost text.
-    const onFimAcceptCommand = vscode.commands.registerCommand(FIM_ACCEPT_COMMAND, () => {
-      fimActivityRelay.accepted();
-    });
+    // The FIM-activity object literal, the onDidChangeTextDocument/
+    // onDidChangeActiveTextEditor/onDidChangeWindowState listeners, and the
+    // four registerCommand calls all moved verbatim to `./nextEditShellWiring`
+    // — the ctor now delegates to their builders over `hostSeams` above, IN
+    // THE SAME ORDER it always built them (registration/attach/dispose ORDER
+    // is load-bearing — F3-1's spy-ORDER golden pins it).
+    this.fimActivity = buildFimActivity(hostSeams);
+    const listenerDisposables = registerListeners(hostSeams);
+    const commandDisposables = registerCommands(hostSeams);
 
     // ATTACH LAST. `fimActivity.acceptCommandId()` advertises FIM_ACCEPT_COMMAND
     // to `provider.ts`, so the relay may not point here until that command is
-    // actually registered — which is the line above. Ordering it this way makes
-    // "an advertised command is a registered command" structural rather than a
-    // property of where the assignment happened to sit.
+    // actually registered — which happened inside `registerCommands` above.
+    // Ordering it this way makes "an advertised command is a registered
+    // command" structural rather than a property of where the assignment
+    // happened to sit.
     attachFimActivity(this.fimActivity);
 
     this.disposable = vscode.Disposable.from(
-      changeSubscription,
-      activeEditorSubscription,
-      windowStateSubscription,
-      jumpCommand,
-      acceptCommand,
-      dismissCommand,
-      onFimAcceptCommand,
+      ...listenerDisposables,
+      ...commandDisposables,
       guardToggleSubscription,
       this.regionDecoration,
       this.locatorDecoration,
