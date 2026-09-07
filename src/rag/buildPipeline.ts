@@ -272,20 +272,38 @@ export interface ReindexTarget {
   storeRelPath: string;
 }
 
-export async function reindexFiles(
+/**
+ * F6-3 (FI-08) / M-16: the phase-1/phase-2 hand-off shared between
+ * `buildPendingRecords` and `embedAndSwap`. The MAP's identity is fixed the
+ * moment `buildPendingRecords` returns it (typed `ReadonlyMap` at that
+ * boundary — no `.set`/`.delete` afterward), but each VALUE stays a mutable
+ * object so `embedAndSwap` can flip `deleted`/decrement `remaining` in
+ * place as the swap progresses. That is what lets a
+ * `Map<string, MutablePathState>` widen to
+ * `ReadonlyMap<string, MutablePathState>` with no cast: only the container
+ * is read-only, not what it points at.
+ */
+type MutablePathState = { contentHash: string; remaining: number; deleted: boolean };
+
+/**
+ * F6-3 (FI-08): phase 1 of `reindexFiles` — reads and chunks every target,
+ * building the pending embed queue and its per-path swap bookkeeping.
+ * Returns `{ disposed: true }` (never `undefined`) the moment either
+ * `isDisposed` guard fires, so `reindexFiles` can tell "nothing to embed"
+ * apart from "torn down mid-read" at the call site.
+ */
+async function buildPendingRecords(
   ctx: IndexerContext,
   targets: ReindexTarget[],
   manifest: Record<string, string>,
-  expectedWidth: number | undefined,
-): Promise<number | undefined> {
-  await ctx.ensureStoreInitialized();
+): Promise<{ records: ChunkRecord[]; pathState: ReadonlyMap<string, MutablePathState> } | { disposed: true }> {
   // TA-5 (AU-23, Med) / INV-5: `ensureStoreInitialized` above is itself an
   // await — `dispose()` may have fired while it was pending (this function
   // is reached both from the watch-path debounce body below and from
   // `runBuild`, either of which can race a shutdown). Re-check here, at
   // this function's own entry, so no chunk from `targets` reaches
   // `store.deleteByPath`/`store.upsert` once disposed.
-  if (ctx.isDisposed()) return undefined;
+  if (ctx.isDisposed()) return { disposed: true };
   const pendingRecords: ChunkRecord[] = [];
   // TA-3 (AU-3, Rev-1 A3) / INV-3: "old rows for a path are deleted only
   // after their replacement vectors exist." Per-path swap bookkeeping for
@@ -298,7 +316,7 @@ export async function reindexFiles(
   // (deleted but remaining > 0) is scrubbed from `manifest` in the catch
   // below instead of being left to claim rows that are gone — HEAD's bug
   // was exactly that stale claim surviving a partial/transient failure.
-  const pathState = new Map<string, { contentHash: string; remaining: number; deleted: boolean }>();
+  const pathState = new Map<string, MutablePathState>();
 
   for (const { readAbsPath, storeRelPath: relPath } of targets) {
     let buf: Buffer;
@@ -324,7 +342,7 @@ export async function reindexFiles(
       // that follows it (same discipline as every other await-then-mutate
       // site in this function); bail with no observed width yet, matching
       // this loop's own entry guard above (`if (disposed) return undefined;`).
-      if (ctx.isDisposed()) return undefined;
+      if (ctx.isDisposed()) return { disposed: true };
       delete manifest[relPath];
       continue;
     }
@@ -401,6 +419,23 @@ export async function reindexFiles(
     }
   }
 
+  return { records: pendingRecords, pathState };
+}
+
+/**
+ * F6-3 (FI-08): phase 2 of `reindexFiles` — embeds `records` in bounded
+ * batches and swaps each represented path's stale rows for its freshly
+ * embedded ones, mutating `pathState`'s VALUE objects (never the map
+ * itself, per M-16) and `manifest` in place as each path finalizes. Runs
+ * the TA-3 catch-scrub on any embed/store failure before rethrowing.
+ */
+async function embedAndSwap(
+  ctx: IndexerContext,
+  records: ChunkRecord[],
+  pathState: ReadonlyMap<string, MutablePathState>,
+  manifest: Record<string, string>,
+  expectedWidth: number | undefined,
+): Promise<number | undefined> {
   // Embed in batches (how-to §2.4: ~64-200 per request); per batch, swap:
   // a path's stale rows are purged only once ITS replacement vectors exist
   // (this batch), then the batch is upserted. TA-3 (AU-3, Rev-1 A3):
@@ -409,8 +444,8 @@ export async function reindexFiles(
   // 300+MB on a large repo).
   let observedWidth: number | undefined;
   try {
-    for (let i = 0; i < pendingRecords.length; i += EMBED_BATCH_SIZE) {
-      const batch = pendingRecords.slice(i, i + EMBED_BATCH_SIZE);
+    for (let i = 0; i < records.length; i += EMBED_BATCH_SIZE) {
+      const batch = records.slice(i, i + EMBED_BATCH_SIZE);
       const vectors = await ctx.embedder.embed(
         batch.map((r) => r.content),
         // TA-2 (AU-5, Rev-1 A2) / INV-2 (restated): "one BUILD = one width
@@ -512,6 +547,18 @@ export async function reindexFiles(
     throw err;
   }
   return observedWidth;
+}
+
+export async function reindexFiles(
+  ctx: IndexerContext,
+  targets: ReindexTarget[],
+  manifest: Record<string, string>,
+  expectedWidth: number | undefined,
+): Promise<number | undefined> {
+  await ctx.ensureStoreInitialized();
+  const pending = await buildPendingRecords(ctx, targets, manifest);
+  if ('disposed' in pending) return undefined;
+  return embedAndSwap(ctx, pending.records, pending.pathState, manifest, expectedWidth);
 }
 
 export async function runBuild(ctx: IndexerContext): Promise<void> {
