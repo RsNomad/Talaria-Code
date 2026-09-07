@@ -33,6 +33,7 @@
  * run.
  */
 import { isLoopbackHost } from '../backends/secureTransport';
+import { DEFAULT_ENDPOINTS } from '../endpoints';
 import { readNextEditConfig } from './config';
 import { genericInstructFormat } from './formats/genericInstruct';
 import { sweepV2Format } from './formats/sweepV2';
@@ -40,18 +41,6 @@ import type { NextEditFormat } from './formats/types';
 import type { NextEditMode } from './mode';
 import type { NextEditShellDeps } from './shell.vscode';
 import type { NextEditTransportId } from './types';
-
-/**
- * Transport defaults for an EMPTY `talaria.nextEdit.endpoint`, whose setting
- * description promises "Leave empty to use the backend's default". These
- * mirror `config.ts`'s own `DEFAULT_ENDPOINTS` rows for the two transports
- * next-edit supports (that table is module-private there, so the two rows are
- * restated rather than reached into).
- */
-export const DEFAULT_NEXT_EDIT_ENDPOINTS: Readonly<Record<NextEditTransportId, string>> = Object.freeze({
-  ollama: 'http://127.0.0.1:11434',
-  'openai-compat': 'http://127.0.0.1:8000',
-});
 
 /**
  * `08` §6.3 — the one-shot Generic setup note, pinned copy. No detection
@@ -171,7 +160,7 @@ export function resolveRoute(mode: NextEditMode, deps: NextEditShellDeps): Route
   if (mode === 'next') {
     const cfg = readNextEditConfig();
     if (cfg.model === '') return { kind: 'next-model-unset' };
-    const apiBase = cfg.endpoint === '' ? DEFAULT_NEXT_EDIT_ENDPOINTS[cfg.backend] : cfg.endpoint;
+    const apiBase = cfg.endpoint === '' ? DEFAULT_ENDPOINTS[cfg.backend] : cfg.endpoint;
     return {
       kind: 'route',
       route: {

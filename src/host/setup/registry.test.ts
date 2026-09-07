@@ -24,9 +24,9 @@ import {
  *    `[acp]` extra REQUIRED, console scripts `hermes`/`hermes-acp`,
  *    `requires-python = ">=3.11,<3.14"`, `hermes-acp --check` printing
  *    `Hermes ACP check OK`.
- *  - FIM endpoint defaults: `src/autocomplete/config.ts` DEFAULT_ENDPOINTS
+ *  - FIM endpoint defaults: `src/autocomplete/endpoints.ts` DEFAULT_ENDPOINTS
  *    (drift-locked BOTH ways below — registry vs. the five expected strings,
- *    AND config.ts source text vs. the same strings, so neither side can
+ *    AND endpoints.ts source text vs. the same strings, so neither side can
  *    move without this file going red).
  *  - SecretStorage key: `src/autocomplete/apiKey.ts`
  *    AUTOCOMPLETE_API_KEY_SECRET (imported — that module is vscode-free).
@@ -128,11 +128,17 @@ describe('registry (b): status invariant', () => {
 
 /**
  * (c) — the five endpoint defaults, copied VERBATIM from
- * `src/autocomplete/config.ts` DEFAULT_ENDPOINTS. Drift-lock direction 1:
- * the registry must equal these strings. Drift-lock direction 2: config.ts
- * (module-private, deliberately not exported) must still CONTAIN each
- * `key: 'value'` pair — so editing either file without the other turns
- * this suite red.
+ * `src/autocomplete/endpoints.ts` DEFAULT_ENDPOINTS. Drift-lock direction 1:
+ * the registry must equal these strings. Drift-lock direction 2: `endpoints.ts`
+ * must still CONTAIN each `key: 'value'` pair — so editing either file
+ * without the other turns this suite red.
+ *
+ * WS-F9 F9-4 (FI-22): this reverse-lock used to read `config.ts`, back when
+ * `DEFAULT_ENDPOINTS` was a module-private const there. The dedup moved the
+ * one true source of the five rows to the new pure leaf `endpoints.ts` (so
+ * `backendFactory.ts`/`nextEditRoute.ts` can import it without pulling
+ * `vscode` in via `config.ts`) — this lock is re-pointed at that new home,
+ * not weakened: it still fails red the moment either side moves.
  */
 const EXPECTED_ENDPOINTS: Record<string, string> = {
   ollama: 'http://127.0.0.1:11434',
@@ -143,8 +149,9 @@ const EXPECTED_ENDPOINTS: Record<string, string> = {
 };
 
 const CONFIG_TS_PATH = join(__dirname, '..', '..', 'autocomplete', 'config.ts');
+const ENDPOINTS_TS_PATH = join(__dirname, '..', '..', 'autocomplete', 'endpoints.ts');
 
-describe('registry (c): FIM endpoint defaults === config.ts DEFAULT_ENDPOINTS (drift-lock both ways)', () => {
+describe('registry (c): FIM endpoint defaults === endpoints.ts DEFAULT_ENDPOINTS (drift-lock both ways)', () => {
   it('every FIM descriptor exposes remote with the verbatim default endpoint', () => {
     for (const d of FIM_BACKENDS) {
       const expected = EXPECTED_ENDPOINTS[d.id];
@@ -155,8 +162,8 @@ describe('registry (c): FIM endpoint defaults === config.ts DEFAULT_ENDPOINTS (d
     }
   });
 
-  it('config.ts on disk still carries the same five pairs (reverse drift-lock)', () => {
-    const source = readFileSync(CONFIG_TS_PATH, 'utf-8');
+  it('endpoints.ts on disk still carries the same five pairs (reverse drift-lock)', () => {
+    const source = readFileSync(ENDPOINTS_TS_PATH, 'utf-8');
     expect(source).toContain("ollama: 'http://127.0.0.1:11434'");
     expect(source).toContain("llamacpp: 'http://127.0.0.1:8080'");
     expect(source).toContain("vllm: 'http://127.0.0.1:8000'");

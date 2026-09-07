@@ -39,7 +39,8 @@ vi.mock('./config', () => ({
   }),
 }));
 
-import { resolveRoute, endpointLabel, DEFAULT_NEXT_EDIT_ENDPOINTS, type RouteResolution } from './nextEditRoute';
+import { resolveRoute, endpointLabel, type RouteResolution } from './nextEditRoute';
+import { DEFAULT_ENDPOINTS } from '../endpoints';
 import { sweepV2Format } from './formats/sweepV2';
 import { genericInstructFormat } from './formats/genericInstruct';
 import type { NextEditShellDeps } from './shell.vscode';
@@ -82,7 +83,7 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
       route: {
         format: sweepV2Format,
         transport: 'ollama',
-        apiBase: DEFAULT_NEXT_EDIT_ENDPOINTS.ollama,
+        apiBase: DEFAULT_ENDPOINTS.ollama,
         model: 'sweep-next-edit-v2-7B',
         remote: false,
       },
@@ -106,7 +107,7 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
       route: {
         format: sweepV2Format,
         transport: 'openai-compat',
-        apiBase: DEFAULT_NEXT_EDIT_ENDPOINTS['openai-compat'],
+        apiBase: DEFAULT_ENDPOINTS['openai-compat'],
         model: 'sweep-next-edit-v2-7B',
         remote: false,
       },

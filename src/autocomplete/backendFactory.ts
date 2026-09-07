@@ -3,6 +3,7 @@ import { LlamaCppInfillBackend } from './backends/LlamaCppInfillBackend';
 import { VllmFimBackend } from './backends/VllmFimBackend';
 import { CodestralFimBackend } from './backends/CodestralFimBackend';
 import { OpenAICompatFimBackend } from './backends/OpenAICompatFimBackend';
+import { DEFAULT_ENDPOINTS } from './endpoints';
 import type { FimBackend } from './types';
 // Type-only import: erased at compile time (isolatedModules), so this module never
 // actually pulls in `vscode` at runtime — keeps it usable from a plain unit test.
@@ -48,20 +49,19 @@ export function clearBackendFactoryWarnings(): void {
   warnedOnce.clear();
 }
 
-/** F6: vLLM's OWN default port (`config.ts`'s unexported `DEFAULT_ENDPOINTS.vllm`,
- *  `'http://127.0.0.1:8000'`) — duplicated as a literal rather than exporting
- *  that constant, so this file's dependency surface stays exactly what it was. */
-const VLLM_DEFAULT_PORT = '8000';
+/** F6: vLLM's OWN default port, derived from the pure leaf's single source of
+ *  truth (`endpoints.ts`'s `DEFAULT_ENDPOINTS.vllm`) rather than restated as
+ *  a literal — FI-22: this file now imports the leaf directly instead of
+ *  duplicating its rows. */
+const VLLM_DEFAULT_PORT = new URL(DEFAULT_ENDPOINTS.vllm).port;
 
-/** CA-8 (audit-3): `config.ts`'s unexported `DEFAULT_ENDPOINTS['openai-compat']`
- *  (`'http://127.0.0.1:8000'`) — duplicated as a literal for the same reason
- *  as {@link VLLM_DEFAULT_PORT} above (this file's dependency surface stays
- *  exactly what it was). This backend's OWN shipped default happens to sit on
- *  vLLM's default port too, so without this the F6 vLLM-port heuristic below
- *  fires on a completely untouched, freshly-installed openai-compat config —
- *  the extension warning about its own default. Does NOT change the default
- *  port/endpoint value; only suppresses the self-warning for it. */
-const OPENAI_COMPAT_DEFAULT_ENDPOINT = 'http://127.0.0.1:8000';
+/** CA-8 (audit-3): `DEFAULT_ENDPOINTS['openai-compat']` — this backend's OWN
+ *  shipped default happens to sit on vLLM's default port too, so without this
+ *  the F6 vLLM-port heuristic below fires on a completely untouched,
+ *  freshly-installed openai-compat config — the extension warning about its
+ *  own default. Does NOT change the default port/endpoint value; only
+ *  suppresses the self-warning for it. */
+const OPENAI_COMPAT_DEFAULT_ENDPOINT = DEFAULT_ENDPOINTS['openai-compat'];
 
 /** `undefined` on anything `URL` can't parse — `cfg.endpoint` is normally
  *  already `isHttpUrl`-validated by `config.ts:readConfig`, but a hand-built
