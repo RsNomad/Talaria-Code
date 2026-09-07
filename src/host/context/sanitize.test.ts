@@ -68,6 +68,30 @@ describe('clampText', () => {
     expect(result.text.length).toBeLessThanOrEqual(10);
     expect(result.truncated).toBe(true);
   });
+
+  it('never exceeds cap for multi-line input even when the read-more notice would overshoot it (L2-CA-11)', () => {
+    const lines = Array.from({ length: 60 }, (_, i) => `line ${i} of the file`);
+    const text = lines.join('\n');
+    const result = clampText(text, 200);
+
+    expect(result.text.length).toBeLessThanOrEqual(200);
+    // Content-integrity check (not just length): the reserve should keep the
+    // tail line intact rather than relying on a hard slice that would chop
+    // it away — a hard slice alone (no reserve) loses this last line.
+    expect(result.text).toContain('line 59 of the file');
+  });
+
+  it('never exceeds a very small cap for multi-line input, where the notice reserve dominates the budget (L2-CA-11)', () => {
+    const lines = Array.from({ length: 60 }, (_, i) => `line ${i} of the file`);
+    const text = lines.join('\n');
+    const result = clampText(text, 60);
+
+    expect(result.text.length).toBeLessThanOrEqual(60);
+    // Content-integrity check: the notice itself must come through whole
+    // (ending in its closing "… \n"), not chopped mid-string by a hard slice
+    // that had to compensate for an unreserved budget.
+    expect(result.text).toMatch(/ask to read the file for more …\n$/);
+  });
 });
 
 describe('isSecretPath', () => {
