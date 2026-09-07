@@ -200,6 +200,9 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   const parser = new WebTreeSitterParser({
     grammarsDir:
       opts.grammarsDir ?? path.join(opts.workspaceRoot, 'node_modules', 'tree-sitter-wasms', 'out'),
+    // FI-20/FI-31 (F6-6): same injected log seam as everything else in this
+    // factory — a grammar-load failure logs err.name only, never raw err.
+    logger,
   });
 
   const manifestPath = path.join(opts.indexDir, MANIFEST_FILE);

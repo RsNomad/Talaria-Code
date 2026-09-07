@@ -72,7 +72,7 @@ vi.mock('web-tree-sitter', () => ({
   Language: { load: vi.fn().mockResolvedValue({ __fakeLanguage: true }) },
 }));
 
-import { Parser } from 'web-tree-sitter';
+import { Language, Parser } from 'web-tree-sitter';
 
 import { WebTreeSitterParser, createParserInitMemo } from './WebTreeSitterParser';
 
@@ -87,6 +87,7 @@ describe('WebTreeSitterParser', () => {
     const parser = new WebTreeSitterParser({
       grammarsDir: '/fake-grammars',
       ensureParserInit: createParserInitMemo(),
+      logger: () => {},
     });
 
     await parser.parse('typescript', 'const a = 1;');
@@ -101,6 +102,7 @@ describe('WebTreeSitterParser', () => {
     const parser = new WebTreeSitterParser({
       grammarsDir: '/fake-grammars',
       ensureParserInit: createParserInitMemo(),
+      logger: () => {},
     });
 
     await parser.parse('typescript', 'const a = 1;');
@@ -114,6 +116,7 @@ describe('WebTreeSitterParser', () => {
     const parser = new WebTreeSitterParser({
       grammarsDir: '/fake-grammars',
       ensureParserInit: createParserInitMemo(),
+      logger: () => {},
     });
 
     const root1 = await parser.parse('typescript', 'const a = 1;');
@@ -149,9 +152,16 @@ describe('WebTreeSitterParser', () => {
     const initMock = vi.mocked(Parser.init);
     initMock.mockRejectedValueOnce(new Error('transient wasm init failure'));
 
+    // WS-F6 F6-6 (FI-20/FI-31): this init failure surfaces through
+    // `loadLanguage`'s catch, which used to go straight to `console.error`
+    // with the raw `err` — now it goes through the injected logger, `err.name`
+    // only. The console.error spy below now proves the NEGATIVE (never
+    // called), strengthening what was previously just noise-suppression.
+    const logs: string[] = [];
     const parser = new WebTreeSitterParser({
       grammarsDir: '/fake-grammars',
       ensureParserInit: createParserInitMemo(),
+      logger: (line) => logs.push(line),
     });
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -169,12 +179,47 @@ describe('WebTreeSitterParser', () => {
     // `undefined` even though the transient failure has "cleared".
     expect(initMock).toHaveBeenCalledTimes(2);
     expect(second).toBeDefined();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('Error');
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  // WS-F6 F6-6 (FI-20/FI-31): at HEAD `loadLanguage`'s catch was
+  // `console.error(\`... for ${languageId}\`, err)` — the raw error object
+  // straight to the process's stderr. The fix routes it through the injected
+  // `opts.logger` instead, carrying `err.name` ONLY (the message, which could
+  // carry filesystem detail, must never leak); `languageId` itself stays —
+  // it's a language id, not a path or secret.
+  it('RED: a grammar-load failure logs err.name only through the injected logger — never the raw error, never console.error', async () => {
+    const loadMock = vi.mocked(Language.load);
+    loadMock.mockRejectedValueOnce(new RangeError('grammar file is corrupt: /secret/looking/path'));
+    const logs: string[] = [];
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const parser = new WebTreeSitterParser({
+      grammarsDir: '/fake-grammars',
+      ensureParserInit: createParserInitMemo(),
+      logger: (line) => logs.push(line),
+    });
+
+    const root = await parser.parse('typescript', 'const a = 1;');
+
+    errorSpy.mockRestore();
+
+    expect(root).toBeUndefined();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('RangeError');
+    expect(logs[0]).toContain('typescript');
+    expect(logs[0]).not.toContain('grammar file is corrupt');
+    expect(logs[0]).not.toContain('/secret/looking/path');
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 
   it('RED: dispose() frees the cached parser and pending tree, and a later parse() call re-initializes cleanly rather than crashing', async () => {
     const parser = new WebTreeSitterParser({
       grammarsDir: '/fake-grammars',
       ensureParserInit: createParserInitMemo(),
+      logger: () => {},
     });
 
     await parser.parse('typescript', 'const a = 1;');

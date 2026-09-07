@@ -16,6 +16,10 @@ export interface ChunkFileOptions {
    * caller already knows AST chunking isn't applicable). */
   parser?: CodeParser;
   maxChunkTokens?: number;
+  /** FI-20/FI-31: injected log seam for the AST-failure branch below — called
+   * with `err.name` ONLY (never the raw error, never `relPath`), mirroring
+   * `indexer.ts`'s `readManifest`/`readMeta` `(${err.name})` idiom. */
+  logger: (line: string) => void;
 }
 
 export interface FileChunk extends ChunkWithoutHeader {
@@ -45,9 +49,10 @@ export async function chunkFile(opts: ChunkFileOptions): Promise<FileChunk[]> {
         rawChunks = chunkAst(root, opts.contents, maxChunkTokens);
       }
     } catch (err) {
-      console.error(
-        `hermes-codebase: AST chunking failed for ${opts.relPath}, falling back to line windows`,
-        err,
+      // FI-20/FI-31: never the path, never the raw error — err.name only,
+      // through the injected logger (not console.error).
+      opts.logger(
+        `hermes-codebase: AST chunking failed (${err instanceof Error ? err.name : 'unknown'}), falling back to line windows`,
       );
       rawChunks = undefined;
     }

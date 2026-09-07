@@ -2933,3 +2933,109 @@ describe('F2-13: writeManifest is a crash-safe atomic write; readManifest distin
     } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
   });
 });
+
+/**
+ * F6-6 (FI-20/FI-31): `buildPipeline.ts`'s `walk` and `runBuild` (hash pass)
+ * used to swallow every read/readdir failure SILENTLY (`catch { return; }` /
+ * `catch { continue; }`) — no distinction between the ordinary "vanished
+ * mid-walk" (ENOENT) case and a real errno (EACCES/EIO/...) worth surfacing.
+ * These RED tests mirror F6-5's readMeta idiom above: spy on the specific
+ * absolute path/dir that must fail, assert err.name-only (never the
+ * path/raw err) for the non-ENOENT case, and silence for the ENOENT case,
+ * while the rest of the build still completes.
+ */
+describe('F6-6 (FI-20/FI-31): walk and the hash pass log non-ENOENT errno names; ENOENT stays silent', () => {
+  it('RED: walk logs a non-ENOENT directory-read failure with err.name only (no path/raw err) and the build still indexes the rest; a racing ENOENT dir stays silent', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f66-walk-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'ok'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'ok/a.txt'), 'content\n', 'utf8');
+      await fs.mkdir(path.join(workspaceRoot, 'blocked'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'blocked/b.txt'), 'content\n', 'utf8');
+      await fs.mkdir(path.join(workspaceRoot, 'raced'), { recursive: true });
+
+      const blockedDir = path.join(workspaceRoot, 'blocked');
+      const racedDir = path.join(workspaceRoot, 'raced');
+      class FakeDirReadError extends Error {
+        code: string;
+        constructor(code: string) {
+          super('permission denied reading a secret directory'); // must NOT leak into the log
+          this.name = 'FakeDirReadError';
+          this.code = code;
+        }
+      }
+      const realReaddir = fs.readdir.bind(fs);
+      const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(async (dirPath, options) => {
+        const dir = String(dirPath);
+        if (dir === blockedDir) throw new FakeDirReadError('EACCES');
+        if (dir === racedDir) throw new FakeDirReadError('ENOENT');
+        return realReaddir(dir, options);
+      });
+
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      readdirSpy.mockRestore();
+
+      const dirLogs = logs.filter((l) => /directory read failed/i.test(l));
+      expect(dirLogs.length).toBe(1); // only the EACCES dir logs; the ENOENT dir stays silent
+      expect(dirLogs[0]).toContain('FakeDirReadError'); // err.name, present
+      expect(dirLogs[0]).not.toContain(blockedDir); // never the path
+      expect(dirLogs[0]).not.toContain('permission denied reading a secret directory'); // never the raw err
+      expect(upsertMock).toHaveBeenCalled(); // ok/a.txt still indexed despite the blocked sibling
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('RED: the hash pass logs a non-ENOENT read failure with err.name only (no path/raw err); an ENOENT (deleted between walk and read) stays silent', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f66-hash-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/ok.txt'), 'content\n', 'utf8');
+      await fs.writeFile(path.join(workspaceRoot, 'src/blocked.txt'), 'content\n', 'utf8');
+      await fs.writeFile(path.join(workspaceRoot, 'src/raced.txt'), 'content\n', 'utf8');
+
+      const blockedFile = path.join(workspaceRoot, 'src/blocked.txt');
+      const racedFile = path.join(workspaceRoot, 'src/raced.txt');
+      class FakeHashReadError extends Error {
+        code: string;
+        constructor(code: string) {
+          super('permission denied reading a secret file'); // must NOT leak into the log
+          this.name = 'FakeHashReadError';
+          this.code = code;
+        }
+      }
+      const realReadFile = fs.readFile.bind(fs);
+      const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (String(file) === blockedFile) throw new FakeHashReadError('EACCES');
+        if (String(file) === racedFile) throw new FakeHashReadError('ENOENT');
+        return realReadFile(file, options);
+      });
+
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      readFileSpy.mockRestore();
+
+      const hashLogs = logs.filter((l) => /hash read failed/i.test(l));
+      expect(hashLogs.length).toBe(1); // only the EACCES file logs; the ENOENT file stays silent
+      expect(hashLogs[0]).toContain('FakeHashReadError'); // err.name, present
+      expect(hashLogs[0]).not.toContain(blockedFile); // never the path
+      expect(hashLogs[0]).not.toContain('permission denied reading a secret file'); // never the raw err
+      expect(upsertMock).toHaveBeenCalled(); // ok.txt still indexed despite the blocked sibling
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+});

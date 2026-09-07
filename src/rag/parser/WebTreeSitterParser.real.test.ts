@@ -58,7 +58,7 @@ describe('WebTreeSitterParser — real load smoke test (no mocks, TB-1/AU-2/ADR-
   });
 
   it.each(languageIds)('loads and parses the real bundled grammar for %s', async (languageId) => {
-    const parser = new WebTreeSitterParser({ grammarsDir: GRAMMARS_DIR });
+    const parser = new WebTreeSitterParser({ grammarsDir: GRAMMARS_DIR, logger: () => {} });
     const snippet = SNIPPET_BY_LANGUAGE[languageId];
     expect(snippet).toBeDefined();
 
@@ -77,7 +77,7 @@ describe('WebTreeSitterParser — real load smoke test (no mocks, TB-1/AU-2/ADR-
   });
 
   it('chunkFile end-to-end: a TS file with two functions yields AST (symbol-bearing) chunks, not the line-window fallback', async () => {
-    const parser = new WebTreeSitterParser({ grammarsDir: GRAMMARS_DIR });
+    const parser = new WebTreeSitterParser({ grammarsDir: GRAMMARS_DIR, logger: () => {} });
     const contents = [
       'export function add(a: number, b: number): number {',
       '  return a + b;',
@@ -95,6 +95,7 @@ describe('WebTreeSitterParser — real load smoke test (no mocks, TB-1/AU-2/ADR-
       languageId: 'typescript',
       extension: 'ts',
       parser,
+      logger: () => {},
       // Deliberately tiny: forces every node (including the whole-file
       // root) past the "fits as-is" branch in `astChunker.ts`'s
       // `maybeYieldChunk`, so chunking recurses down to the individual

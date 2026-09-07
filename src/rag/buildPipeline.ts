@@ -63,6 +63,23 @@ function looksBinary(buf: Buffer): boolean {
 }
 
 /**
+ * FI-20/FI-31 (F6-6): shared errno classifier for this file's read/readdir
+ * catches (`walk`'s readdir + nested-ignore-file reads, and `runBuild`'s
+ * hash-pass read) — mirrors `indexer.ts`'s inline `readManifest`/`readMeta`
+ * idiom (`err.code === 'ENOENT'`), factored out once here since this file has
+ * FOUR such catches where `indexer.ts` has two.
+ */
+function isEnoent(err: unknown): boolean {
+  return err instanceof Error && 'code' in err && (err as { code?: string }).code === 'ENOENT';
+}
+
+/** FI-20/FI-31: the log-safe name for an error — never the message (which
+ * can carry filesystem/secret detail), mirroring `indexer.ts`'s `(${err.name})` idiom. */
+function errName(err: unknown): string {
+  return err instanceof Error ? err.name : 'unknown';
+}
+
+/**
  * TA-7 (AU-34) / INV-6: a nested per-directory ignore matcher scoped to
  * `dirRel` (POSIX-relative to `workspaceRoot`). `matches` is a
  * `createIgnoreFilter`-produced predicate built from that directory's OWN
@@ -184,9 +201,12 @@ export type IndexerContext = IndexerStoreCtx &
   Pick<IndexerContextBag, 'opts' | 'parser' | 'embedder' | 'isDisposed' | 'recordFailedIncrementalReindex'>;
 
 export async function walk(
-  // FI-18: `walk` reads only `ctx.opts.workspaceRoot` — no store, manifest,
-  // ignore-filter-role, or logger member.
-  ctx: Pick<IndexerContextBag, 'opts'>,
+  // FI-18: `walk` reads `ctx.opts.workspaceRoot` — no store/manifest/
+  // ignore-filter-role member. FI-20/FI-31 (F6-6): it now ALSO reads
+  // `ctx.logger` — the readdir/nested-ignore-file catches below log a
+  // non-ENOENT errno name; ENOENT itself stays silent (a missing/racing
+  // directory mid-walk is ordinary, not an error).
+  ctx: Pick<IndexerContextBag, 'opts'> & IndexerLogCtx,
   root: string,
   ignoreFilter: (p: string) => boolean,
   out: string[],
@@ -210,7 +230,13 @@ export async function walk(
         let entries: Dirent[];
         try {
           entries = await fs.readdir(dir, { withFileTypes: true });
-        } catch {
+        } catch (err) {
+          // FI-20/FI-31: ENOENT (a missing/racing directory) stays silent —
+          // the ordinary case; any other errno (EACCES, EIO, ...) is logged
+          // with err.name only, never the path.
+          if (!isEnoent(err)) {
+            ctx.logger(`hermes-codebase: directory read failed (${errName(err)})`);
+          }
           return;
         }
 
@@ -229,13 +255,21 @@ export async function walk(
           const dirContents: string[] = [];
           try {
             dirContents.push(await fs.readFile(path.join(dir, '.gitignore'), 'utf8'));
-          } catch {
-            // no nested .gitignore in this directory.
+          } catch (err) {
+            // FI-20/FI-31: ENOENT ("no nested .gitignore here") stays
+            // silent; any other read error is logged, err.name only.
+            if (!isEnoent(err)) {
+              ctx.logger(`hermes-codebase: nested .gitignore read failed (${errName(err)})`);
+            }
           }
           try {
             dirContents.push(await fs.readFile(path.join(dir, '.hermesignore'), 'utf8'));
-          } catch {
-            // optional
+          } catch (err) {
+            // FI-20/FI-31: same rule — ENOENT ("optional, not present") is
+            // silent; any other read error is logged, err.name only.
+            if (!isEnoent(err)) {
+              ctx.logger(`hermes-codebase: nested .hermesignore read failed (${errName(err)})`);
+            }
           }
           if (dirContents.length > 0) {
             dirAncestors = [...localAncestors, { dirRel, matches: createIgnoreFilter(dirContents) }];
@@ -339,7 +373,9 @@ type MutablePathState = { contentHash: string; remaining: number; deleted: boole
 async function buildPendingRecords(
   // FI-18: reads `ctx.isDisposed`, `ctx.gate`/`ctx.store` (the purge-and-bail
   // and zero-chunk branches), `ctx.parser`, and `ctx.opts.maxChunkTokens`.
-  ctx: IndexerStoreCtx & Pick<IndexerContextBag, 'isDisposed' | 'parser' | 'opts'>,
+  // FI-20/FI-31 (F6-6): also reads `ctx.logger`, threaded straight through to
+  // `chunkFile`'s injected logger (`chunker.ts`'s AST-failure log).
+  ctx: IndexerStoreCtx & IndexerLogCtx & Pick<IndexerContextBag, 'isDisposed' | 'parser' | 'opts'>,
   targets: ReindexTarget[],
   manifest: Record<string, string>,
 ): Promise<{ records: ChunkRecord[]; pathState: ReadonlyMap<string, MutablePathState> } | { disposed: true }> {
@@ -409,6 +445,7 @@ async function buildPendingRecords(
       contents,
       languageId: languageId ?? extension,
       extension,
+      logger: ctx.logger,
       ...(languageId ? { parser: ctx.parser } : {}),
       ...(ctx.opts.maxChunkTokens !== undefined ? { maxChunkTokens: ctx.opts.maxChunkTokens } : {}),
     });
@@ -602,8 +639,11 @@ export async function reindexFiles(
   // `buildPendingRecords` and `embedAndSwap` need (both called with this
   // same `ctx`) — `IndexerStoreCtx` already covers `gate`/`store`/
   // `ensureStoreInitialized`; `isDisposed`/`parser`/`opts`/`embedder` are
-  // the two callees' residual members.
-  ctx: IndexerStoreCtx & Pick<IndexerContextBag, 'isDisposed' | 'parser' | 'opts' | 'embedder'>,
+  // the two callees' residual members. FI-20/FI-31 (F6-6): `IndexerLogCtx`
+  // joins the Pick too — `buildPendingRecords` (called with this same `ctx`
+  // below) now reads `ctx.logger`, so this function's own parameter type
+  // must cover it for that call to typecheck.
+  ctx: IndexerStoreCtx & IndexerLogCtx & Pick<IndexerContextBag, 'isDisposed' | 'parser' | 'opts' | 'embedder'>,
   targets: ReindexTarget[],
   manifest: Record<string, string>,
   expectedWidth: number | undefined,
@@ -621,11 +661,15 @@ export async function runBuild(
   // the full ignore role (`invalidateIgnoreFilterCache`/`loadIgnoreFilter`/
   // `setKnownNestedIgnoreDirs`) directly, plus `opts`/`isDisposed` directly
   // and `parser`/`embedder` transitively (passed on to `walk`/`reindexFiles`
-  // below). `logger`/`recordFailedIncrementalReindex` are unused here — they
-  // are `watchPipeline.ts`-only members, correctly absent from this Pick.
+  // below). FI-20/FI-31 (F6-6): `logger` is now used directly here too — the
+  // hash-pass read catch (below) logs a non-ENOENT errno name via it,
+  // mirroring `walk`'s own errno-name logging, and it's threaded on to
+  // `walk`/`reindexFiles` (both now require it). `recordFailedIncrementalReindex`
+  // remains `watchPipeline.ts`-only, correctly absent from this Pick.
   ctx: IndexerStoreCtx &
     IndexerManifestCtx &
     IndexerIgnoreCtx &
+    IndexerLogCtx &
     Pick<IndexerContextBag, 'opts' | 'parser' | 'embedder' | 'isDisposed'>,
 ): Promise<void> {
   await ctx.ensureStoreInitialized();
@@ -659,7 +703,13 @@ export async function runBuild(
       const buf = await fs.readFile(absPath);
       if (buf.byteLength > MAX_FILE_BYTES || looksBinary(buf)) continue;
       current[relPath] = hashContent(buf.toString('utf8'));
-    } catch {
+    } catch (err) {
+      // FI-20/FI-31: ENOENT (deleted between walk and this read) stays
+      // silent — the documented case; any other errno is logged, err.name
+      // only, never the path.
+      if (!isEnoent(err)) {
+        ctx.logger(`hermes-codebase: hash read failed (${errName(err)})`);
+      }
       continue;
     }
   }
