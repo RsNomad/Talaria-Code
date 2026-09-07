@@ -225,10 +225,21 @@ describe('LOCK: every nextedit/ file that calls fetch( also calls assertSecureAu
       // through this lock rather than bumping the count reflexively — it was
       // looked at, and it is clean.
       'fimActivityRelay.ts',
+      // WS-F3 F3-7 (FI-13) — `nextEditFailureSurface.ts`, the PURE copy
+      // builder for the trigger-failure surface (`describeTriggerFailure`)
+      // extracted out of `shell.vscode.ts`. It contains no `fetch(` call at
+      // all — it only classifies (via the shared, autocomplete-root
+      // `failureClass.ts`, OUTSIDE `nextedit/` and so not counted here) and
+      // builds copy strings, never touching the network itself (verified by
+      // the "no other nextedit/ file contains fetch(" sanity test below) —
+      // named here per this pin's own stated purpose: force every new
+      // `nextedit/` file through this lock rather than bumping the count
+      // reflexively — it was looked at, and it is clean.
+      'nextEditFailureSurface.ts',
     ]) {
       expect(files).toContain(expected);
     }
-    expect(files.length).toBe(20);
+    expect(files.length).toBe(21);
   });
 
   it('no non-allowlisted nextedit/ file contains fetch( without also calling BOTH assertSecureAuthTransport( and mintScannedNextEditRequest( (the real lock)', () => {

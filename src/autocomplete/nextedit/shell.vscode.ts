@@ -29,8 +29,6 @@
  */
 import * as vscode from 'vscode';
 import { AutocompleteDebouncer } from '../debouncer';
-import { BackendHttpError } from '../backends/http';
-import { InsecureTransportError } from '../backends/secureTransport';
 import { isSecretForCompletion } from '../../shared/secretPaths';
 import { createEditTrackerAdapter, type EditTrackerAdapter } from '../context/editTrackerAdapter';
 import { isRecordableScheme, isTriggerableScheme } from '../context/recordableScheme';
@@ -44,9 +42,9 @@ import type { RenderedNextEditPrompt } from './formats/types';
 import { NextEditGuard } from './guard';
 import { resolveNextEditMode, type NextEditMode, type ToggleRequest, type ToggleState } from './mode';
 import { computeChangesAboveCursor, filterEgressableDiffs, toContentChangeLites } from './nextEditEgress';
+import { describeTriggerFailure } from './nextEditFailureSurface';
 import {
   deriveGenericTransport,
-  endpointLabel,
   GENERIC_SETUP_NOTE,
   genericUnsupportedBackendMessage,
   NEXT_EDIT_MODEL_UNSET_NOTE,
@@ -221,12 +219,15 @@ export async function requestNextEditToggle(
  * `RouteResolution` and `resolveRoute` (plus `endpointLabel`) moved verbatim
  * to `./nextEditRoute` (a vscode-FREE leaf) — imported above where the shell
  * still consumes them (`resolveRoute` from `resolveReportedRoute` below,
- * `endpointLabel` from `surfaceTriggerFailure`, `NextEditRoute` as the type
- * every method below still spells). `isLoopbackEndpoint` and
- * `RouteResolution` are module-private/unused-by-name in this file; neither
- * was part of the shell's public surface before the move, so neither needs
- * re-exporting — the F3-1 goldens observe them only through
- * `registerTalariaNextEdit`, unaffected by this move.
+ * `NextEditRoute` as the type every method below still spells).
+ * `isLoopbackEndpoint` and `RouteResolution` are module-private/unused-by-name
+ * in this file; neither was part of the shell's public surface before the
+ * move, so neither needs re-exporting — the F3-1 goldens observe them only
+ * through `registerTalariaNextEdit`, unaffected by this move. `endpointLabel`
+ * itself is no longer imported HERE at all (WS-F3 F3-7, FI-13):
+ * `surfaceTriggerFailure`'s only caller of it moved to
+ * `nextEditFailureSurface.ts`'s `describeTriggerFailure`, which imports
+ * `endpointLabel` directly from `./nextEditRoute`.
  */
 
 /** Workspace-relative POSIX path, mirroring `editTrackerAdapter.ts`'s helper
@@ -769,100 +770,28 @@ class NextEditShell {
 
   /**
    * F-4 — classify ONE trigger failure into a message the user can act on, or
-   * into deliberate silence.
-   *
-   * Every string built here is assembled from status/statusText, the transport
-   * id, the endpoint HOST and the model name — never `err.message` (which can
-   * carry the raw url, and with it userinfo credentials), never a response
-   * body, never an API key, never matched secret text. `08` §9.3's third
-   * clause is honoured too: parse/apply failures dismiss silently and never
-   * reach here at all (they are verdicts, not throws).
+   * into deliberate silence. WS-F3 F3-7 (FI-13): the classification AND the
+   * byte-exact copy now live in the pure `describeTriggerFailure`
+   * (`nextEditFailureSurface.ts`, which itself defers the actual error→`kind`
+   * decision to the shared `classifyBackendFailure`, `../failureClass`) —
+   * this method shrinks to a thin caller that keeps ONLY the two
+   * side-effecting things a pure function cannot own: the `surfaceOnce`
+   * toast + its dedup Set, and the mint path's separate log-only dedup
+   * (same `surfacedFailures` Set, no toast). Reproduces BOTH paths exactly:
+   * a `'toast'` channel goes through `surfaceOnce` (dedup + `reportFailure` +
+   * `showWarningMessage`); a `'log'` channel (mint only) dedups against the
+   * SAME Set but calls only `reportFailure`, never the toast.
    */
   private surfaceTriggerFailure(err: unknown, route: NextEditRoute, mode: NextEditMode): void {
-    const where = endpointLabel(route.apiBase);
-    const endpointSetting =
-      mode === 'next' ? '"talaria.nextEdit.endpoint"' : '"talaria.autocomplete.endpoint"';
-    const modelSetting = mode === 'next' ? '"talaria.nextEdit.model"' : '"talaria.autocomplete.model"';
-    const key = (statusClass: string): string => `${route.transport}|${where}|${statusClass}`;
-
-    if (err instanceof InsecureTransportError) {
-      // Rebuild the copy — never echo the throw site, which names the scheme,
-      // the raw url and "(CWE-319)". Same discipline as `provider.ts`'s
-      // insecure-transport arm.
-      this.surfaceOnce(
-        key('insecure-transport'),
-        'Next Edit is paused: refusing to send credentials over cleartext HTTP to a remote host. Use https, or point the endpoint at a loopback address (127.0.0.1/localhost).',
-      );
+    const { key, message, channel } = describeTriggerFailure(err, route, mode);
+    if (channel === 'toast') {
+      this.surfaceOnce(key, message);
       return;
     }
-
-    if (err instanceof BackendHttpError) {
-      if (err.status === 404) {
-        this.surfaceOnce(
-          key('model'),
-          `Next Edit is paused: the ${route.transport} server at ${where} does not serve the model "${route.model}" (404). Check ${modelSetting}.`,
-        );
-        return;
-      }
-      if (err.status === 401 || err.status === 403) {
-        this.surfaceOnce(
-          key('auth'),
-          `Next Edit is paused: the ${route.transport} server at ${where} rejected the request (${err.status} ${err.statusText}). Check that ${endpointSetting} points at a server this machine is authorized to use.`,
-        );
-        return;
-      }
-      if (err.status === 400) {
-        this.surfaceOnce(
-          key('dialect'),
-          `Next Edit is paused: the server at ${where} rejected the request (${err.status} ${err.statusText}). This usually means the configured transport doesn't match the server's API dialect — it can also mean the prompt exceeded the server's context length.`,
-        );
-        return;
-      }
-      this.surfaceOnce(
-        key('http'),
-        `Next Edit is paused: the ${route.transport} server at ${where} returned ${err.status} ${err.statusText}. Check ${endpointSetting}.`,
-      );
-      return;
+    if (!this.surfacedFailures.has(key)) {
+      this.surfacedFailures.add(key);
+      this.deps.reportFailure(message);
     }
-
-    // V-1 fix — the misdiagnosis half. A mint rejection is thrown BEFORE any
-    // request is built or sent (`scan.ts`'s `mintScannedNextEditRequest`),
-    // so it must never fall into the generic "the request... failed... check
-    // that the server is running" copy below — that used to send the user to
-    // debug healthy infra for a request that was never sent. Names the real
-    // cause (a scan rule) and nothing else — never the matched content,
-    // never the endpoint, and deliberately never the word "server" either:
-    // this message must not even RESEMBLE the unreachable-fallback's
-    // server-blame copy, which is exactly the misdiagnosis this arm exists
-    // to prevent. Dedup key includes `ruleId` so a secret-rule skip and a
-    // rare oversize skip each surface once, independently.
-    if (err instanceof NextEditMintRejectionError) {
-      // CA-06-NE-face: the HUMAN surface for this condition is the per-file
-      // badge + one-shot toast (nextEditNotice.vscode.ts). This arm keeps
-      // only the technical audit line — output channel, ruleId-only
-      // contract (never matched text, never content) — deduped by the same
-      // registration-scoped Set surfaceOnce uses, minus its toast.
-      const logKey = key(`mint|${err.ruleId}`);
-      if (!this.surfacedFailures.has(logKey)) {
-        this.surfacedFailures.add(logKey);
-        this.deps.reportFailure(
-          `Next Edit skipped for this file: its content cannot be sent safely (rule: ${err.ruleId}). No request was sent.`,
-        );
-      }
-      return;
-    }
-
-    // Everything else — a connection refusal or DNS failure (a mint
-    // rejection is handled by the arm above, before this fallback, so it can
-    // no longer reach here). ARCH's F-4 named "a wrong endpoint" specifically:
-    // without this arm a typo'd port is indistinguishable from a feature
-    // that simply never has anything to suggest. One message per
-    // transport/host/class per registration, so a permanently-down server
-    // costs exactly one toast.
-    this.surfaceOnce(
-      key('unreachable'),
-      `Next Edit is paused: the request to the ${route.transport} server at ${where} failed. Check ${endpointSetting}, and that the server is running.`,
-    );
   }
 
   private abortInFlight(): void {
