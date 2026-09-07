@@ -299,16 +299,18 @@ export async function scanPresence(
   io: ModelStorePresenceIo,
   catalog: readonly CatalogModel[],
 ): Promise<ReadonlyMap<string, boolean>> {
-  const result = new Map<string, boolean>();
   const rootResult = storeRoot(io.env);
-  for (const model of catalog) {
-    const gguf = model.llamacpp?.gguf;
-    if (!gguf) continue;
-    if (!rootResult.ok) {
-      result.set(model.id, false);
-      continue;
-    }
-    result.set(model.id, await scanOnePresence(io, rootResult.root, gguf));
+  const entries = await Promise.all(
+    catalog.map(async (model): Promise<readonly [string, boolean] | undefined> => {
+      const gguf = model.llamacpp?.gguf;
+      if (!gguf) return undefined; // non-gguf rows: skipped (not in the map)
+      if (!rootResult.ok) return [model.id, false] as const; // fail-closed: no root, nowhere to look
+      return [model.id, await scanOnePresence(io, rootResult.root, gguf)] as const;
+    }),
+  );
+  const result = new Map<string, boolean>();
+  for (const entry of entries) {
+    if (entry !== undefined) result.set(entry[0], entry[1]);
   }
   return result;
 }

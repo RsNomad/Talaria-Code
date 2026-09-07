@@ -425,3 +425,86 @@ describe('scanPresence — sidecar presence truth table (§2.2.8, NO hashing on 
     expect(result.get('fixture-model-2')).toBe(true);
   });
 });
+
+// --- scanPresence — WS-R2 R2-4 (L2-CA-15): concurrent sidecar reads ----------
+// FROZEN-TOUCH, OD-B: `scanPresence` reads every eligible catalog row's
+// sidecar CONCURRENTLY (`Promise.all`) instead of serially (`for...of`).
+// `scanOnePresence` and the write gate `lstatCheckedGgufDest` are untouched —
+// every truth-table golden above (0 edits) already pins those unchanged.
+
+const MODEL_B: CatalogModel = {
+  ...FIXTURE_MODEL,
+  id: 'model-b',
+  llamacpp: {
+    gguf: { hfRepo: 'ggml-org/B-GGUF', file: 'b-q8_0.gguf', quant: 'Q8_0', approxBytes: 1000 },
+    verify: { mode: 'live-oid' },
+  },
+};
+
+const MODEL_C: CatalogModel = {
+  ...FIXTURE_MODEL,
+  id: 'model-c',
+  llamacpp: {
+    gguf: { hfRepo: 'ggml-org/C-GGUF', file: 'c-q8_0.gguf', quant: 'Q8_0', approxBytes: 1000 },
+    verify: { mode: 'live-oid' },
+  },
+};
+
+const MODEL_B_SIDECAR_PATH = `${ROOT}/ggml-org/B-GGUF/b-q8_0.gguf.talaria.json`;
+const MODEL_C_SIDECAR_PATH = `${ROOT}/ggml-org/C-GGUF/c-q8_0.gguf.talaria.json`;
+
+describe('scanPresence — WS-R2 R2-4 (L2-CA-15): concurrent sidecar reads (FROZEN-TOUCH, OD-B)', () => {
+  it('reads every eligible row\'s sidecar CONCURRENTLY — all readFile calls are in flight before any resolves — and assembles the result Map in CATALOG order regardless of resolution order', async () => {
+    const pending: Array<{ path: string; resolve: (value: string | null) => void }> = [];
+    const readCalls: string[] = [];
+    const io: ModelStorePresenceIo = {
+      env: XDG_ENV,
+      readFile: (path: string) => {
+        readCalls.push(path);
+        return new Promise<string | null>((resolve) => {
+          pending.push({ path, resolve });
+        });
+      },
+      statSize: async () => null,
+    };
+
+    // OLLAMA_ONLY_MODEL is interleaved to prove the non-gguf skip does not
+    // disturb catalog-order assembly of the eligible rows around it.
+    const catalog = [FIXTURE_MODEL, OLLAMA_ONLY_MODEL, MODEL_B, MODEL_C];
+    const resultPromise = scanPresence(io, catalog);
+
+    // Synchronous assertion, BEFORE resolving a single readFile call: every
+    // eligible row's readFile must already be in flight (overlap). Under the
+    // pre-fix serial `for...of`, `scanPresence` suspends on the FIRST row's
+    // `await io.readFile(...)` before the loop ever reaches the second
+    // eligible row, so only ONE call would be recorded here — this
+    // assertion is RED against that implementation.
+    expect(readCalls).toEqual([FIXTURE_SIDECAR_PATH, MODEL_B_SIDECAR_PATH, MODEL_C_SIDECAR_PATH]);
+
+    // Resolve deliberately OUT of catalog order — proves the result Map's
+    // order comes from the catalog (assembly loop), never from resolution
+    // order.
+    pending[2]!.resolve(null); // model-c resolves first
+    pending[0]!.resolve(null); // fixture-model resolves second
+    pending[1]!.resolve(null); // model-b resolves last
+
+    const result = await resultPromise;
+    expect(Array.from(result.keys())).toEqual(['fixture-model', 'model-b', 'model-c']);
+    expect(result.get('fixture-model')).toBe(false);
+    expect(result.get('model-b')).toBe(false);
+    expect(result.get('model-c')).toBe(false);
+  });
+
+  it('rejects scanPresence itself on a mid-scan readFile rejection (reject-on-first-error — Promise.all, never allSettled)', async () => {
+    const boom = new Error('sidecar read boom');
+    const io: ModelStorePresenceIo = {
+      env: XDG_ENV,
+      readFile: async (path: string) => {
+        if (path === MODEL_B_SIDECAR_PATH) throw boom;
+        return null;
+      },
+      statSize: async () => null,
+    };
+    await expect(scanPresence(io, [FIXTURE_MODEL, MODEL_B, MODEL_C])).rejects.toBe(boom);
+  });
+});
