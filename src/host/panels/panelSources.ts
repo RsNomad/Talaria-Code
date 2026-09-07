@@ -180,16 +180,23 @@ export class McpPanelSource implements PanelSource<'mcp'>, ToggleNameCache {
   }
 }
 
-/** One cwd's independent accumulation/coalescing state (W4-T3b §7 B7). */
+/** One cwd's independent accumulation/coalescing/serialization state (W4-T3b §7 B7). */
 interface SessionsCwdBucket {
   accumulated: SessionSummary[];
   seenIds: Set<string>;
   /** In-flight fetches keyed by cursor (`''` = the cursor-less page-1 fetch). */
   inFlight: Map<string, Promise<PanelFetchOutcome<'sessions'>>>;
+  /**
+   * L2-CA-13: serializes this bucket's page fetches so a different-cursor
+   * fetch started before an earlier one resolves can't race the shared
+   * `accumulated`/`seenIds` mutation — see {@link SessionsPanelSource.fetch}'s
+   * doc for the settled-swallow mechanics (mirrors `ConfigWriteTail`).
+   */
+  chain: Promise<void>;
 }
 
 function newBucket(): SessionsCwdBucket {
-  return { accumulated: [], seenIds: new Set(), inFlight: new Map() };
+  return { accumulated: [], seenIds: new Set(), inFlight: new Map(), chain: Promise.resolve() };
 }
 
 /**
@@ -235,6 +242,27 @@ function newBucket(): SessionsCwdBucket {
  * cursor is COALESCED: a concurrent fetch with the same cursor key returns the
  * in-flight promise instead of issuing a second `listSessions`. This makes
  * "load more" idempotent under overlapping clicks.
+ *
+ * ## Cross-cursor serialization (L2-CA-13)
+ * `inFlight` coalescing above only protects the SAME cursor. Two DIFFERENT
+ * cursors (a cursor-less page-1 load racing a cursored "Load more") are NOT
+ * coalesced — each gets its own {@link fetchPage} run — so without further
+ * care they'd race the shared `accumulated`/`seenIds` mutation: whichever
+ * `listSessions` call settles first mutates the bucket first, corrupting the
+ * final order (or worse, a page-1 reset landing AFTER a "Load more" already
+ * appended would silently wipe it out). `fetch` serializes different-cursor
+ * runs through `bucket.chain`, a promise tail mirroring `ConfigWriteTail`'s
+ * settled-swallow `.then(run, run)` (`host/backend/control/configWriteTail.ts`):
+ * each run is queued as `bucket.chain = bucket.chain.then(run, run)` — the
+ * BOTH-ARMS form means a run that REJECTS still lets the next queued run
+ * fire (the chain is never left in a permanently-rejected state), while the
+ * chained promise this fetch itself hands back and awaits (not the
+ * always-resolves swallow tail) still carries this run's OWN real
+ * resolution/rejection to ITS caller. The same-cursor `inFlight` coalescing
+ * stays layered ON TOP: a coalesced duplicate returns the SAME chained
+ * promise, so it never enqueues a second run on the chain. A fresh cwd
+ * bucket ({@link newBucket}) always starts with its own `Promise.resolve()`
+ * chain, so buckets never share or block on each other's queue.
  */
 export class SessionsPanelSource implements PanelSource<'sessions'> {
   private readonly buckets = new Map<string, SessionsCwdBucket>();
@@ -288,10 +316,26 @@ export class SessionsPanelSource implements PanelSource<'sessions'> {
     const existing = bucket.inFlight.get(key);
     if (existing) return existing;
 
-    const run = this.fetchPage(client, cwd, bucket, cursor);
-    bucket.inFlight.set(key, run);
+    // L2-CA-13: queue THIS run behind the bucket's chain instead of firing
+    // `fetchPage` immediately — a different-cursor run already queued/running
+    // must fully finish (including its `accumulated`/`seenIds` mutation)
+    // before this one's `listSessions` call is even issued. `result` (not
+    // the swallow tail below) is what this call returns/awaits, so a
+    // rejection here still rejects THIS caller with the real error.
+    const run = () => this.fetchPage(client, cwd, bucket, cursor);
+    const result = bucket.chain.then(run, run);
+    // Settled-swallow tail (mirrors `ConfigWriteTail.join`): always resolves
+    // regardless of whether `result` fulfilled or rejected, so ONE failed
+    // fetch can never permanently poison the chain for the next queued one,
+    // and — since a handler is attached here synchronously — `result`
+    // rejecting can never surface as an unhandled rejection either.
+    bucket.chain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    bucket.inFlight.set(key, result);
     try {
-      return await run;
+      return await result;
     } finally {
       bucket.inFlight.delete(key);
     }
