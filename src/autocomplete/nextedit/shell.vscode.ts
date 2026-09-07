@@ -42,11 +42,11 @@ import { readNextEditConfig } from './config';
 import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
 import { reduceNextEdit } from './fsm';
 import { genericInstructFormat } from './formats/genericInstruct';
-import { sliceLines, splitLinesKeepingTerminators } from './formats/shared';
 import { sweepV2Format } from './formats/sweepV2';
 import type { NextEditFormat, RenderedNextEditPrompt } from './formats/types';
 import { NextEditGuard } from './guard';
 import { resolveNextEditMode, type NextEditMode, type ToggleRequest, type ToggleState } from './mode';
+import { ensureTrailingNewline, extractRegionRange, stripLineTerminator } from './nextEditText';
 import { mintScannedNextEditRequest, NextEditMintRejectionError } from './scan';
 import type {
   AnchoredProposal,
@@ -553,60 +553,26 @@ function endpointLabel(apiBase: string): string {
 }
 
 /** Workspace-relative POSIX path, mirroring `editTrackerAdapter.ts`'s helper
- *  (Fedora/Linux target; workspace URIs are always '/'-separated). */
+ *  (Fedora/Linux target; workspace URIs are always '/'-separated).
+ *
+ *  STAYS here (WS-F3 F3-2, critic I-1): unlike the three text helpers below,
+ *  this one calls `vscode.workspace.asRelativePath` on a `vscode.Uri` and is
+ *  therefore NOT pure — moving it into the vscode-FREE `nextEditText.ts`
+ *  would break that module's purity boundary (`nextEditPurity.test.ts`). */
 function toWorkspaceRelativePosixPath(uri: vscode.Uri): string {
   return vscode.workspace.asRelativePath(uri, false).split('\\').join('/');
 }
 
 /**
- * CONTRACT (`formats/*`): `fileContext` must end in '\n' — the sweepV2 render
- * splices it directly into the template and the vendor builds the equivalent
- * value via `"".join(lines)`, i.e. always newline-terminated. A file whose
- * last line has no terminator would otherwise glue `{initial_file}` to the
- * next template line.
+ * WS-F3 F3-2 (FI-06): `ensureTrailingNewline`, `stripLineTerminator`, and
+ * `extractRegionRange` moved verbatim to `./nextEditText` (a vscode-FREE pure
+ * leaf) — re-exported here so the shell's own surface, and every internal
+ * call site below, keep resolving through `./shell.vscode` with zero further
+ * edits, exactly as the F3-1 golden masters' own module doc anticipates
+ * ("F3-2..F3-8 move implementations to new modules but the shell RE-EXPORTS
+ * each one").
  */
-function ensureTrailingNewline(text: string): string {
-  return text.endsWith('\n') ? text : `${text}\n`;
-}
-
-/** `text` without ONE trailing line terminator, `\r\n` preferred over `\n`.
- *  Never strips a second one: a genuinely blank final line is content. */
-function stripLineTerminator(text: string): string {
-  if (text.endsWith('\r\n')) return text.slice(0, -2);
-  if (text.endsWith('\n')) return text.slice(0, -1);
-  return text;
-}
-
-/**
- * C-3 / ADR-018. Reads `text`'s `[startLine, endLine]` span as the SAME RANGE
- * `region.content` is read as, only against the pre-edit text instead of the
- * live document — i.e. the mirror of
- * `getText(new Range(startLine, 0, endLine, lineAt(endLine).text.length))`.
- *
- * Those two values become sweep-v2's `original/` and `current/` blocks — the
- * pair the model diffs — so any difference between them that the user did not
- * make is noise on exactly the axis the model is trained to read as "what the
- * user just changed". `getText` stops at the last line's TEXT LENGTH, before
- * its terminator; `sliceLines` KEEPS terminators. Composing the two here is
- * what makes the pair agree by construction rather than by coincidence.
- *
- * The terminator is dropped only when `endLine` names a line `sliceLines`
- * actually produced. When the span instead runs past the end — to the empty
- * line a trailing newline creates — `getText` stops there too, so the
- * preceding terminator is inside BOTH blocks and must stay. Dropping it
- * unconditionally would inject the same phantom difference in the other
- * direction, including for an untouched region, where the two blocks must be
- * byte-identical.
- *
- * The vendor has no such asymmetry by construction: `inference.py` assigns
- * literally the same string to both blocks, and v1's `run_model.py` passes
- * both through one join.
- */
-function extractRegionRange(text: string, startLine: number, endLine: number): string {
-  const lineCount = splitLinesKeepingTerminators(text).length;
-  const span = sliceLines(text, startLine, endLine);
-  return endLine < lineCount ? stripLineTerminator(span) : span;
-}
+export { ensureTrailingNewline, stripLineTerminator, extractRegionRange };
 
 /**
  * F-3 — would this ONE diff survive the mint's own per-field checks?
