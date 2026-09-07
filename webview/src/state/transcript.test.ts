@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { CheckpointsData, DataPanel, PanelDataMap, ThemeInfo } from '../protocol';
-import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type AppState, type MessageItem } from '../types';
+import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type AppState, type MessageItem, type TranscriptItem } from '../types';
 import { must } from '../testing/must';
 import { assertExhaustivePanel } from './panels';
 import { reduce, reduceLocal, MAX_TRANSCRIPT_ITEMS } from './transcript';
@@ -3101,6 +3101,230 @@ describe('CA-09: message.delta O(1) fast path (behavior-identical, no reverse-co
     const nextTab = must(next.tabs.boot, 'boot tab');
     expect(nextTab.transcript[0]).toMatchObject({ kind: 'message', text: 'AB', streaming: true });
     expect(nextTab.transcript[1]).toBe(reasoning); // untouched
+  });
+});
+
+describe('L2-CA-07: reasoning.delta/reasoning.end fold tail-first like message.delta (broader than filed — both arms)', () => {
+  // Test-local ORACLE: the PRE-CHANGE, full-`.map` fold bodies kept verbatim
+  // (not reachable from production code) so the new tail-first splice can be
+  // proven identical to the old behaviour across many random interleavings,
+  // not just the handful of goldens above.
+  function oracleReasoningDelta(transcript: TranscriptItem[], blockId: string, text: string): TranscriptItem[] {
+    return transcript.map((i) => (i.kind === 'reasoning' && i.blockId === blockId ? { ...i, text: i.text + text } : i));
+  }
+  function oracleReasoningEnd(transcript: TranscriptItem[], blockId: string): TranscriptItem[] {
+    return transcript.map((i) => (i.kind === 'reasoning' && i.blockId === blockId ? { ...i, streaming: false } : i));
+  }
+
+  // Deterministic PRNG (mulberry32) — the "many random interleavings"
+  // property test below must be reproducible, never flaky.
+  function mulberry32(seed: number): () => number {
+    let a = seed;
+    return () => {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // `seedTurnId` defaults to a DISTINCT turn per seed item (many past turns'
+  // settled history) — the natural shape for the property test below. The
+  // perf test overrides it to the SAME turnId as its tail block: `capTranscript`
+  // (CA-09, run by `reduce` right after every fold) is turn-aware and never
+  // trims the ACTIVE (tail) turn's own items — seeding with a distinct turn
+  // per item would have capTranscript silently collapse a >500-item tab down
+  // to MAX_TRANSCRIPT_ITEMS on the very FIRST delta, defeating an "N-item
+  // tab" perf setup for any N > 500. One shared turnId keeps every seed item
+  // "belonging to the active turn", so capTranscript is a genuine no-op and
+  // the fold under test really does see all N items on every one of the M calls.
+  function tabWithSettledTail(n: number, tail: TranscriptItem[], seedTurnId: (i: number) => string = (i) => `seed${i}`): AppState {
+    const settled: TranscriptItem[] = Array.from({ length: n }, (_, i) => ({
+      kind: 'message' as const,
+      turnId: seedTurnId(i),
+      id: `msg-seed${i}-0`,
+      text: `seed${i}`,
+      streaming: false,
+    }));
+    const tab = {
+      ...makeTabState('boot', 'Chat 1'),
+      sessionId: 's1',
+      binding: 'bound' as const,
+      transcript: [...settled, ...tail],
+    };
+    return { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+  }
+
+  it('[property, RED before the fix / GREEN after] result-identity: the new fold matches the old full-map oracle for 300 random reasoning.start/delta/end interleavings across 2 turns on a 300-item tab', () => {
+    const rand = mulberry32(20260907);
+    let state = tabWithSettledTail(300, []);
+    let oracleTranscript = must(state.tabs.boot, 'boot').transcript;
+
+    const turns = ['t1', 't2'] as const;
+    const open: Record<'t1' | 't2', string | undefined> = { t1: undefined, t2: undefined };
+    let blockSeq = 0;
+
+    for (let step = 0; step < 300; step++) {
+      const turn = must(turns[Math.floor(rand() * turns.length)], 'turn');
+      const openBlockId = open[turn];
+      const action: 'start' | 'delta' | 'end' = openBlockId === undefined ? 'start' : rand() < 0.3 ? 'end' : 'delta';
+
+      if (action === 'start') {
+        const blockId = `${turn}-r${blockSeq++}`;
+        open[turn] = blockId;
+        state = reduce(state, { type: 'reasoning.start', turnId: turn, sessionId: 's1', blockId });
+        // `reasoning.start` is NOT changed by this task — resync the mirror
+        // to the real (unmodified) fold instead of re-deriving it, so this
+        // property test stays scoped to the delta/end divergence under test.
+        oracleTranscript = must(state.tabs.boot, 'boot').transcript;
+      } else if (action === 'delta') {
+        const blockId = must(openBlockId, 'open block for delta');
+        const text = `x${step}`;
+        state = reduce(state, { type: 'reasoning.delta', turnId: turn, sessionId: 's1', blockId, text });
+        oracleTranscript = oracleReasoningDelta(oracleTranscript, blockId, text);
+      } else {
+        const blockId = must(openBlockId, 'open block for end');
+        state = reduce(state, { type: 'reasoning.end', turnId: turn, sessionId: 's1', blockId });
+        oracleTranscript = oracleReasoningEnd(oracleTranscript, blockId);
+        open[turn] = undefined;
+      }
+
+      expect(must(state.tabs.boot, 'boot').transcript).toEqual(oracleTranscript);
+    }
+  });
+
+  // Write-time finding, recorded here and in the task report: the brief's
+  // literal "2000-item tab" sits ABOVE MAX_TRANSCRIPT_ITEMS (500) — `reduce`
+  // runs `capTranscript` right after every fold (CA-09), and `capTranscript`
+  // UNCONDITIONALLY does its own full-array scan-and-rebuild whenever
+  // `length > 500`, even when (as here, one shared turnId) nothing ends up
+  // trimmed. That scan costs the SAME for the old `.map` and the new splice,
+  // so above the cap it dominates and drowns out the very difference under
+  // test: at a 2000-item tab the measured old/new wall-clock ratio collapsed
+  // to ~1.6–2x (2000 deltas: 49.8 ms old vs 31 ms new — old barely over the
+  // 50 ms line, not a safe RED). Worse, under `npm run gate`'s real parallel
+  // worker contention (measured: ~3x slower than an isolated run) a wall-clock
+  // assertion with that little headroom is genuinely flaky in either
+  // direction — this was caught empirically, not assumed.
+  //
+  // Two independent fixes, both grounded against `message.delta`'s OWN
+  // precedent test just above (`CA-09`), which already solves exactly this
+  // problem by asserting STRUCTURE (a spy on `Array.prototype.reverse`), not
+  // a clock:
+  //  1. The PRIMARY, mutation-sensitive, timing-independent proof is the two
+  //     spy-based tests directly below: on the common tail-match path,
+  //     neither arm may call `Array.prototype.map` (the old full rebuild) or
+  //     `Array.prototype.reverse` (the fallback scan) — deterministic, and
+  //     exactly what the brief's named mutation ("force the tail check
+  //     always false") breaks.
+  //  2. The wall-clock test is KEPT (the brief's own explicit ask, mirroring
+  //     `postprocess.test.ts`'s `< 50 ms` idiom) as CORROBORATING evidence
+  //     that the fold is fast in absolute terms, but is deliberately sized
+  //     small (the brief's own 2000-delta count, at a 500-item tab — the
+  //     live cap boundary, so `capTranscript` stays a genuine no-op) so its
+  //     margin under gate-parallel contention is generous (~30 ms isolated
+  //     against a 50 ms bound); it is not relied on to catch the mutation —
+  //     tests 1 above are.
+  const PERF_TAB_SIZE = 500; // 499 settled + 1 open reasoning tail = the live MAX_TRANSCRIPT_ITEMS cap
+  const PERF_DELTA_COUNT = 2000;
+
+  it('[structural, mutation-sensitive] on the tail-match path, reasoning.delta calls neither Array.prototype.map (old full rebuild) nor Array.prototype.reverse (fallback scan)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const mapSpy = vi.spyOn(Array.prototype, 'map');
+    const reverseSpy = vi.spyOn(Array.prototype, 'reverse');
+    try {
+      state = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'thinking' });
+      expect(mapSpy).not.toHaveBeenCalled();
+      expect(reverseSpy).not.toHaveBeenCalled();
+    } finally {
+      mapSpy.mockRestore();
+      reverseSpy.mockRestore();
+    }
+    const tab = must(state.tabs[state.activeTabId], 'active tab');
+    expect(tab.transcript.find((i) => i.kind === 'reasoning')).toMatchObject({ text: 'thinking', streaming: true });
+  });
+
+  it('[structural, mutation-sensitive] on the tail-match path, reasoning.end calls neither Array.prototype.map (old full rebuild) nor Array.prototype.reverse (fallback scan)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'thinking' });
+    const mapSpy = vi.spyOn(Array.prototype, 'map');
+    const reverseSpy = vi.spyOn(Array.prototype, 'reverse');
+    try {
+      state = reduce(state, { type: 'reasoning.end', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+      expect(mapSpy).not.toHaveBeenCalled();
+      expect(reverseSpy).not.toHaveBeenCalled();
+    } finally {
+      mapSpy.mockRestore();
+      reverseSpy.mockRestore();
+    }
+    const tab = must(state.tabs[state.activeTabId], 'active tab');
+    expect(tab.transcript.find((i) => i.kind === 'reasoning')).toMatchObject({ text: 'thinking', streaming: false });
+  });
+
+  it(
+    `[perf, corroborating] ${PERF_DELTA_COUNT} reasoning.delta onto a ${PERF_TAB_SIZE}-item tab (at the live cap) whose tail is the matching reasoning block complete in < 50 ms`,
+    () => {
+      const openReasoning: TranscriptItem = { kind: 'reasoning', turnId: 'live', blockId: 'r-live', text: '', streaming: true };
+      let state = tabWithSettledTail(PERF_TAB_SIZE - 1, [openReasoning], () => 'live');
+
+      const start = performance.now();
+      for (let i = 0; i < PERF_DELTA_COUNT; i++) {
+        state = reduce(state, { type: 'reasoning.delta', turnId: 'live', sessionId: 's1', blockId: 'r-live', text: 'x' });
+      }
+      const elapsed = performance.now() - start;
+      expect(elapsed).toBeLessThan(50);
+
+      const reasoning = must(state.tabs.boot, 'boot').transcript.find((i) => i.kind === 'reasoning');
+      expect(reasoning).toMatchObject({ blockId: 'r-live', text: 'x'.repeat(PERF_DELTA_COUNT), streaming: true });
+    },
+    5000,
+  );
+
+  it("reasoning.delta leaves an unrelated item's reference untouched (immutable-update parity with the old .map)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'user', turnId: 't1', sessionId: 's1', text: 'hi', mode: 'default' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const before = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    const userBefore = before.find((i) => i.kind === 'user');
+    state = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'thinking' });
+    const after = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    expect(after.find((i) => i.kind === 'user')).toBe(userBefore);
+  });
+
+  it("reasoning.end leaves an unrelated item's reference untouched (immutable-update parity with the old .map)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'user', turnId: 't1', sessionId: 's1', text: 'hi', mode: 'default' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'thinking' });
+    const before = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    const userBefore = before.find((i) => i.kind === 'user');
+    state = reduce(state, { type: 'reasoning.end', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const after = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    expect(after.find((i) => i.kind === 'user')).toBe(userBefore);
+  });
+
+  it('FALLBACK: reasoning.delta still finds a reasoning block that is NOT last (reverse-scan retained)', () => {
+    const reasoning = { kind: 'reasoning' as const, turnId: 't1', blockId: 'r1', text: 'A', streaming: true };
+    const later = { kind: 'message' as const, turnId: 't1', id: 'msg-t1-0', text: 'B', streaming: true };
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript: [reasoning, later] };
+    const state: AppState = { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+    const next = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'B' });
+    const nextTab = must(next.tabs.boot, 'boot tab');
+    expect(nextTab.transcript[0]).toMatchObject({ kind: 'reasoning', text: 'AB', streaming: true });
+    expect(nextTab.transcript[1]).toBe(later); // untouched
+  });
+
+  it('FALLBACK: reasoning.end still finds a reasoning block that is NOT last (reverse-scan retained)', () => {
+    const reasoning = { kind: 'reasoning' as const, turnId: 't1', blockId: 'r1', text: 'A', streaming: true };
+    const later = { kind: 'message' as const, turnId: 't1', id: 'msg-t1-0', text: 'B', streaming: true };
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript: [reasoning, later] };
+    const state: AppState = { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+    const next = reduce(state, { type: 'reasoning.end', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const nextTab = must(next.tabs.boot, 'boot tab');
+    expect(nextTab.transcript[0]).toMatchObject({ kind: 'reasoning', text: 'A', streaming: false });
+    expect(nextTab.transcript[1]).toBe(later); // untouched
   });
 });
 

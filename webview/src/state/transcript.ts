@@ -282,21 +282,54 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
         ],
       };
 
-    case 'reasoning.delta':
-      return {
-        ...tab,
-        transcript: tab.transcript.map((i) =>
-          i.kind === 'reasoning' && i.blockId === msg.blockId ? { ...i, text: i.text + msg.text } : i,
-        ),
-      };
+    case 'reasoning.delta': {
+      // L2-CA-07: mirrors `message.delta`'s tail-first splice below EXACTLY
+      // (same idiom, same fallback shape) — the open reasoning block is
+      // provably the LAST element in the normal flow for the identical
+      // reason `message.delta`'s open message is: any interleaving item
+      // (a new reasoning/tool/approval/plan block) opens fresh at the tail.
+      // Tail check first (O(1) common case); reverse-scan kept as the rare
+      // fallback (a reasoning block that is not last) so the result is
+      // provably identical to the old full `.map`.
+      const lastIndex = tab.transcript.length - 1;
+      const last = tab.transcript[lastIndex];
+      const matchLast = last !== undefined && last.kind === 'reasoning' && last.blockId === msg.blockId;
+      const match = matchLast
+        ? last
+        : [...tab.transcript].reverse().find((i) => i.kind === 'reasoning' && i.blockId === msg.blockId);
+      if (match && match.kind === 'reasoning') {
+        // Targeted splice: copy the array once, replace only the matched
+        // index — no per-element `.map` callback. Unchanged items keep their
+        // references (slice copies references), exactly like the old
+        // `.map(i => i === match ? {...} : i)`.
+        const idx = matchLast ? lastIndex : tab.transcript.indexOf(match);
+        const next = tab.transcript.slice();
+        next[idx] = { ...match, text: match.text + msg.text };
+        return { ...tab, transcript: next };
+      }
+      // No match (a missing reasoning block is not a normal flow —
+      // `reasoning.start` always creates it) — identity, mirroring the old
+      // `.map`'s no-op transform when nothing matched.
+      return { ...tab, transcript: tab.transcript };
+    }
 
-    case 'reasoning.end':
-      return {
-        ...tab,
-        transcript: tab.transcript.map((i) =>
-          i.kind === 'reasoning' && i.blockId === msg.blockId ? { ...i, streaming: false } : i,
-        ),
-      };
+    case 'reasoning.end': {
+      // L2-CA-07: identical to `reasoning.delta` above except the
+      // replacement settles `streaming: false` instead of appending text.
+      const lastIndex = tab.transcript.length - 1;
+      const last = tab.transcript[lastIndex];
+      const matchLast = last !== undefined && last.kind === 'reasoning' && last.blockId === msg.blockId;
+      const match = matchLast
+        ? last
+        : [...tab.transcript].reverse().find((i) => i.kind === 'reasoning' && i.blockId === msg.blockId);
+      if (match && match.kind === 'reasoning') {
+        const idx = matchLast ? lastIndex : tab.transcript.indexOf(match);
+        const next = tab.transcript.slice();
+        next[idx] = { ...match, streaming: false };
+        return { ...tab, transcript: next };
+      }
+      return { ...tab, transcript: tab.transcript };
+    }
 
     case 'message.delta': {
       // CA-09: the open streaming message is provably the LAST element in the
