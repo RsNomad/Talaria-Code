@@ -910,7 +910,7 @@ describe('R2 LOCK (single-flight DIRECTION, structural): the shell aborts only i
     expect(
       receivers,
       'RED-first proof failed: a planted fimController.abort() must break the inFlight-only equality check',
-    ).not.toEqual(['inFlight']);
+    ).not.toEqual(['this.inFlight']);
   });
 
   /**
@@ -933,7 +933,7 @@ describe('R2 LOCK (single-flight DIRECTION, structural): the shell aborts only i
     expect(
       receivers,
       'RED-first proof failed: the optional-chained FIM abort must break the inFlight-only equality check',
-    ).not.toEqual(['inFlight']);
+    ).not.toEqual(['this.inFlight']);
   });
 
   /**
@@ -954,7 +954,7 @@ describe('R2 LOCK (single-flight DIRECTION, structural): the shell aborts only i
     expect(
       receivers,
       'RED-first proof failed: a FIM-owned field merely NAMED inFlight must not be indistinguishable from the shell own inFlight variable',
-    ).not.toEqual(['inFlight']);
+    ).not.toEqual(['this.inFlight']);
   });
 
   /**
