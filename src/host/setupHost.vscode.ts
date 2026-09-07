@@ -20,6 +20,7 @@ import {
   type TempReadStream,
 } from './setup/ggufIngest';
 import { writeFileNoFollow } from './backend/acp/safeWrite';
+import { makeSidecarWriter } from './setup/sidecarWriter';
 import { probeRemote } from './setup/remoteProbe';
 import { locateLlamaServer, type LlamaCppLocateResult } from './setup/llamaCppLocator';
 import {
@@ -386,8 +387,9 @@ function createNodeGgufIngestIo(): GgufIngestIo & GgufStoreIo {
     // is the one that refuses-and-cleans-up rather than falling back to a
     // copy — this binding never catches or retries.
     renameTemp: (tempPath: string, destPath: string): Promise<void> => rename(tempPath, destPath),
-    writeSidecar: (sidecarPath: string, content: string): Promise<void> =>
-      writeFileNoFollow(sidecarPath, Buffer.from(content, 'utf8')),
+    // WS-R2 R2-3 (L2-CA-18, OD-C non-frozen half): the retry-once + honest
+    // kept-file-error policy lives in the injected binding, not here.
+    writeSidecar: makeSidecarWriter(writeFileNoFollow),
   };
 }
 
