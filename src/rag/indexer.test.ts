@@ -2815,4 +2815,121 @@ describe('F2-13: writeManifest is a crash-safe atomic write; readManifest distin
       indexer.dispose();
     } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
   });
+
+  // F6-5 (FI-19): readMeta mirrors readManifest's errno-classification +
+  // shape-validation above it — at HEAD (pre-fix) readMeta is a bare
+  // `JSON.parse(...) as IndexMeta` with a plain `catch { return undefined }`,
+  // so it NEVER logs (a bad-shape sidecar parses "successfully" and is cast
+  // blindly; a parse-error and every read errno fall into the same silent
+  // catch). These 3 cases prove that silence is gone; the 4th (ENOENT) pins
+  // the one silence that must SURVIVE the fix.
+  it('RED: readMeta logs a corrupt meta (bad shape) once and rebuilds', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f65-shape-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(indexDir, { recursive: true });
+      // Valid JSON, wrong shape: `dims` is a string, not a number — parses
+      // fine, so only shape validation (not JSON.parse) can catch this.
+      await fs.writeFile(
+        path.join(indexDir, 'manifest.meta.json'),
+        JSON.stringify({ schema: 2, embedModel: 'test-model', dims: 'zero' }),
+        'utf8',
+      );
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      const metaLogs = logs.filter((l) => /meta/i.test(l) && /corrupt/i.test(l));
+      expect(metaLogs.length).toBe(1);
+      expect(upsertMock).toHaveBeenCalled(); // rebuilt src/a.txt despite the corrupt meta
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('RED: readMeta logs a corrupt meta (parse error) once and rebuilds', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f65-parse-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(indexDir, { recursive: true });
+      await fs.writeFile(path.join(indexDir, 'manifest.meta.json'), '{ this is not json', 'utf8'); // corrupt
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      const metaLogs = logs.filter((l) => /meta/i.test(l) && /corrupt/i.test(l));
+      expect(metaLogs.length).toBe(1);
+      expect(upsertMock).toHaveBeenCalled(); // rebuilt src/a.txt despite the corrupt meta
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('RED: readMeta logs a non-ENOENT read error with err.name only (no path/raw err) and rebuilds', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f65-errno-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const metaFilePath = path.join(indexDir, 'manifest.meta.json');
+      class FakeMetaReadError extends Error {
+        code = 'EACCES';
+        constructor() {
+          super('permission denied reading a secret path'); // must NOT leak into the log
+          this.name = 'FakeMetaReadError';
+        }
+      }
+      const realReadFile = fs.readFile.bind(fs);
+      const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (String(file) === metaFilePath) {
+          throw new FakeMetaReadError();
+        }
+        return realReadFile(file, options);
+      });
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      readFileSpy.mockRestore();
+      const metaLogs = logs.filter((l) => /meta/i.test(l));
+      expect(metaLogs.length).toBe(1);
+      expect(metaLogs[0]).toContain('FakeMetaReadError'); // err.name, present
+      expect(metaLogs[0]).not.toContain(metaFilePath); // never the path
+      expect(metaLogs[0]).not.toContain('permission denied reading a secret path'); // never the raw err
+      expect(upsertMock).toHaveBeenCalled(); // rebuilt src/a.txt despite the meta read failure
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('readMeta stays silent on ENOENT (no meta file yet — ordinary first build)', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f65-enoent-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const logs: string[] = [];
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build(); // manifest.meta.json does not exist yet -> ENOENT
+      expect(logs.some((l) => /meta/i.test(l))).toBe(false);
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
 });
