@@ -230,6 +230,11 @@ function buildHarness(opts: {
       calls.push(`embed:${texts.length}`);
       return texts.map(() => Array.from({ length: opts.embedWidth }, () => 0.1));
     },
+    // F6-7 (FI-29, M-7 hand-over): `Embedder` now requires `batchSize`;
+    // `buildPipeline.ts` batches by `ctx.embedder.batchSize` instead of the
+    // deleted `EMBED_BATCH_SIZE` module constant. 64 preserves this golden's
+    // 2-batch (64 + 6) split — the ONLY change F6-7 may make to this file.
+    batchSize: 64,
   };
 
   const parser: CodeParser = {

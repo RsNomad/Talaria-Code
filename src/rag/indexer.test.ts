@@ -54,6 +54,11 @@ vi.mock('./store/LanceDBStore', () => ({
 vi.mock('./embedder', () => ({
   HttpEmbedder: class {
     embed = embedMock;
+    // F6-7 (FI-29): `Embedder` now requires `batchSize`; `buildPipeline.ts`
+    // reads `ctx.embedder.batchSize` at runtime, so this mock must carry it
+    // too — 64 matches the real `HttpEmbedder`'s own default and preserves
+    // every batch-boundary test below (e.g. the 64/65-chunk split tests).
+    batchSize = 64;
   },
 }));
 

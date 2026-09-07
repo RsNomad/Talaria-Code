@@ -29,7 +29,6 @@ import type { ChunkRecord, VectorStore } from './store/VectorStore';
 import type { MutationGate } from '../host/util/mutationGate';
 
 const MAX_FILE_BYTES = 1_000_000; // matches Continue's shouldChunk cutoff
-const EMBED_BATCH_SIZE = 64; // how-to §2.4: batch ~64-200
 // RAG-02: bounded fan-out for the full-build directory descent — enough to
 // overlap readdir latency without exhausting file descriptors on a big repo.
 const WALK_CONCURRENCY = 8;
@@ -529,8 +528,11 @@ async function embedAndSwap(
   // 300+MB on a large repo).
   let observedWidth: number | undefined;
   try {
-    for (let i = 0; i < records.length; i += EMBED_BATCH_SIZE) {
-      const batch = records.slice(i, i + EMBED_BATCH_SIZE);
+    // FI-29: batched by the embedder's OWN batch size (`ctx.embedder.batchSize`)
+    // rather than a separate module constant — see embedder.ts's `Embedder`
+    // interface doc comment.
+    for (let i = 0; i < records.length; i += ctx.embedder.batchSize) {
+      const batch = records.slice(i, i + ctx.embedder.batchSize);
       const vectors = await ctx.embedder.embed(
         batch.map((r) => r.content),
         // TA-2 (AU-5, Rev-1 A2) / INV-2 (restated): "one BUILD = one width

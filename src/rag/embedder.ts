@@ -138,6 +138,14 @@ export interface Embedder {
    * duplicate it.
    */
   embed(texts: string[], expectedWidth?: number): Promise<number[][]>;
+  /**
+   * FI-29: the batch size this embedder's caller should chunk its own
+   * work by (buildPipeline.ts's `embedAndSwap` batches `records` by this
+   * value) — single-sourced here on the embedder rather than duplicated as
+   * a separate module constant, since `HttpEmbedder` already owns the real
+   * per-request batching decision (`opts.batchSize ?? 64`).
+   */
+  readonly batchSize: number;
 }
 
 export interface HttpEmbedderOptions {
@@ -161,7 +169,10 @@ export class HttpEmbedder implements Embedder {
   private readonly endpoint: string;
   private readonly model: string;
   private readonly dimensions: number | undefined;
-  private readonly batchSize: number;
+  // FI-29: public so callers (buildPipeline.ts's embedAndSwap) can batch
+  // their own work by the SAME value this class batches its own HTTP
+  // requests by — satisfies the `Embedder` interface's `batchSize` field.
+  readonly batchSize: number;
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: HttpEmbedderOptions) {

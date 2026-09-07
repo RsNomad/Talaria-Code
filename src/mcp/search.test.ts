@@ -20,7 +20,10 @@ vi.mock('./pathGlob', async (importOriginal) => {
 });
 
 function fakeEmbedder(vector: number[] = [0.1, 0.2, 0.3]): Embedder {
-  return { embed: vi.fn(async (texts: string[]) => texts.map(() => vector)) };
+  // F6-7 (FI-29): `Embedder` now requires `batchSize` — mechanical fixture
+  // extension, unused by `runCodebaseSearch` (a single-query embed, not a
+  // batched index build), so the value is arbitrary.
+  return { embed: vi.fn(async (texts: string[]) => texts.map(() => vector)), batchSize: 64 };
 }
 
 // `language` is widened to accept an explicit `undefined` HERE (test-helper-
@@ -103,7 +106,7 @@ describe('runCodebaseSearch', () => {
 
   it('returns no hits when the embedder yields nothing for the query', async () => {
     const store = fakeStore([hit('a', 'src/a.ts')]);
-    const embedder: Embedder = { embed: vi.fn(async () => []) };
+    const embedder: Embedder = { embed: vi.fn(async () => []), batchSize: 64 };
 
     const result = await runCodebaseSearch({ embedder, store }, { query: '', k: 10 });
 
@@ -201,6 +204,7 @@ describe('A-05: Qwen3-Embedding query instruction prefix', () => {
         embedTexts.push(texts);
         return texts.map(() => [0.1, 0.2, 0.3]);
       },
+      batchSize: 64,
     };
     const store: VectorStore = {
       init: async () => {},
@@ -231,6 +235,7 @@ describe('A-05: Qwen3-Embedding query instruction prefix', () => {
         embedTexts.push(texts);
         return texts.map(() => [0.1]);
       },
+      batchSize: 64,
     };
     const store: VectorStore = {
       init: async () => {},

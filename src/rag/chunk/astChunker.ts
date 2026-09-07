@@ -35,8 +35,8 @@ function collapsedReplacement(node: SyntaxNodeLike): string {
   return node.type === 'statement_block' ? '{ ... }' : '...';
 }
 
-function firstChildOfType(node: SyntaxNodeLike, types: readonly string[]): SyntaxNodeLike | null {
-  return node.children.find((c) => types.includes(c.type)) ?? null;
+function firstChildOfType(node: SyntaxNodeLike, types: readonly string[]): SyntaxNodeLike | undefined {
+  return node.children.find((c) => types.includes(c.type));
 }
 
 function collapseChildren(
@@ -122,6 +122,22 @@ function constructClassDefinitionChunk(node: SyntaxNodeLike, code: string, maxCh
   );
 }
 
+/**
+ * FI-28: the shared degrade tail both `constructFunctionDefinitionChunk`
+ * branches (isInClass and plain) fall through to once their own combined/
+ * whole-function form doesn't fit — verbatim extraction of what was
+ * duplicated at both call sites: `funcText` (signature + collapsed body) if
+ * it fits, else `minimal` (first signature line + collapsed body) if THAT
+ * fits, else the bare collapsed body.
+ */
+function fitOrDegrade(funcText: string, signature: string, collapsedBody: string, max: number): string {
+  if (estimateTokenCount(funcText) <= max) return funcText;
+  const firstLine = signature.split('\n')[0] ?? '';
+  const minimal = `${firstLine} ${collapsedBody}`;
+  if (estimateTokenCount(minimal) <= max) return minimal;
+  return collapsedBody;
+}
+
 function constructFunctionDefinitionChunk(node: SyntaxNodeLike, code: string, maxChunkTokens: number): string {
   const bodyNode = node.children[node.children.length - 1];
   if (!bodyNode) return node.text;
@@ -143,18 +159,10 @@ function constructFunctionDefinitionChunk(node: SyntaxNodeLike, code: string, ma
     const indent = ' '.repeat(node.startPosition.column);
     const combined = `${classHeader}...\n\n${indent}${funcText}`;
     if (estimateTokenCount(combined) <= maxChunkTokens) return combined;
-    if (estimateTokenCount(funcText) <= maxChunkTokens) return funcText;
-    const firstLine = signature.split('\n')[0] ?? '';
-    const minimal = `${firstLine} ${collapsedBody}`;
-    if (estimateTokenCount(minimal) <= maxChunkTokens) return minimal;
-    return collapsedBody;
+    return fitOrDegrade(funcText, signature, collapsedBody, maxChunkTokens);
   }
 
-  if (estimateTokenCount(funcText) <= maxChunkTokens) return funcText;
-  const firstLine = signature.split('\n')[0] ?? '';
-  const minimal = `${firstLine} ${collapsedBody}`;
-  if (estimateTokenCount(minimal) <= maxChunkTokens) return minimal;
-  return collapsedBody;
+  return fitOrDegrade(funcText, signature, collapsedBody, maxChunkTokens);
 }
 
 type CollapsedConstructor = (node: SyntaxNodeLike, code: string, maxChunkTokens: number) => string;
