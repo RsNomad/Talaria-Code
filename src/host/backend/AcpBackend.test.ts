@@ -6302,6 +6302,34 @@ describe('AcpBackend.handleReadTextFile — F1: bounded confined read (self-DoS 
     expect(await readTextFile(withLimit)(file, 1, 100)).toBe(body);
     expect(await readTextFile(withoutLimit)(file, null, null)).toBe(body);
   });
+
+  // L2-CA-24: the confined-read `'escape'` denial used to blame "a symlink"
+  // unconditionally — misleading when the over-deny was really the LOCAL
+  // `isWithin`'s bug (fixed elsewhere in this commit), and inaccurate for any
+  // OTHER post-canonicalization mismatch reaching this branch. The copy now
+  // names the real cause instead of assuming a symlink.
+  it('the confined-read escape denial names the real (canonicalization) cause, not "a symlink" (L2-CA-24)', async () => {
+    mockWorkspace.workspaceFolders = [{ uri: { fsPath: tmpRoot } }];
+    const file = path.join(tmpRoot, 'a.ts');
+    const reader: ConfinedReader = {
+      supported: async () => true,
+      readContained: async () => ({ ok: false, denial: { kind: 'escape', realPath: '/etc/passwd' } }),
+    };
+    const backend = new AcpBackend(
+      {} as HermesRuntimeConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      reader,
+    );
+
+    await expect(readTextFile(backend)(file, null, null)).rejects.toThrow(
+      /resolves outside the workspace after canonicalization/,
+    );
+  });
 });
 
 describe('AcpBackend — Zone CKPT: checkpoint snapshot hook (turn-start, before edits)', () => {

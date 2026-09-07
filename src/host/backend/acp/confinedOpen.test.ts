@@ -10,6 +10,7 @@ import {
   type FileHandleLike,
   type FileStatLike,
 } from './confinedOpen';
+import { isWithin as pathConfineIsWithin } from './pathConfine';
 import { must } from '../../../testing/must';
 
 const O_PATH = 0o10000000;
@@ -164,6 +165,46 @@ describe('confinedOpen — readContained (fake port, any OS)', () => {
   it('supported() is false off Linux (caller falls back to today’s read path)', async () => {
     expect(await makeProcFdReader(fakePort({ platform: 'win32' }).port).supported()).toBe(false);
     expect(await makeProcFdReader(fakePort({ platform: 'darwin' }).port).supported()).toBe(false);
+  });
+});
+
+// L2-CA-24: `readContained`'s post-pin containment re-check (step 3, driven by
+// its own local `isWithin`) must agree with the canonical `pathConfine.isWithin`
+// on every row — the local copy used to be WEAKER (`!rel.startsWith('..')`),
+// over-denying any in-workspace name that merely BEGINS with `..` (a directory
+// literally named `..cache`, `..x`, etc.) with a misleading escape/symlink
+// error. Drive `readContained` with a fake port whose `readlink` reports the
+// row's path verbatim (identity `realpath`) so its containment decision is
+// governed ONLY by the `isWithin` predicate under test — then compare that
+// decision against `pathConfine.isWithin` called on the exact same pair.
+describe('confinedOpen — readContained parity with the canonical pathConfine.isWithin (L2-CA-24)', () => {
+  const ROOT = '/ws';
+  const rows: readonly string[] = ['', '..', '../x', '..x', '..cache/x', 'a/..b', '/abs', 'a/../..'];
+
+  it.each(rows)('containment decision for row %j matches pathConfine.isWithin', async (rel) => {
+    const child = rel === '' ? ROOT : path.join(ROOT, rel);
+    const expectedContained = pathConfineIsWithin(child, ROOT);
+
+    const { port } = fakePort({
+      pinStat: regular,
+      linkPath: child,
+      realpath: (r) => r, // identity — isolates the decision to `isWithin` itself
+      bytes: Buffer.from('OK'),
+    });
+    const res = await makeProcFdReader(port).readContained(child, [ROOT]);
+
+    expect(res.ok).toBe(expectedContained);
+    if (!expectedContained && !res.ok) expect(res.denial.kind).toBe('escape');
+  });
+
+  it('`<root>/..cache/x` (a legitimate in-workspace directory NAME) is CONTAINED, not denied', async () => {
+    const child = path.join(ROOT, '..cache/x');
+    expect(pathConfineIsWithin(child, ROOT)).toBe(true); // sanity: canonical says contained
+
+    const { port } = fakePort({ pinStat: regular, linkPath: child, realpath: (r) => r, bytes: Buffer.from('OK') });
+    const res = await makeProcFdReader(port).readContained(child, [ROOT]);
+
+    expect(res.ok).toBe(true);
   });
 });
 

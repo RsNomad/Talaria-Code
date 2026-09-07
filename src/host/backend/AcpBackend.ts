@@ -2227,7 +2227,7 @@ export class AcpBackend implements AgentBackend {
   private confinedDenialMessage(denial: ConfinedReadDenial, requested: string): string {
     switch (denial.kind) {
       case 'escape':
-        return `readTextFile denied: '${requested}' resolves through a symlink to a location outside the workspace. If this access is intentional, add that location as a workspace folder.`;
+        return `readTextFile denied: '${requested}' resolves outside the workspace after canonicalization. If this access is intentional, add that location as a workspace folder.`;
       case 'not-regular':
         return `readTextFile denied: '${requested}' is not a regular file.`;
       case 'gone':
