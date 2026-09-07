@@ -680,18 +680,8 @@ class NextEditShell {
   }
 
   private abortInFlight(): void {
-    // Read into a local first: the R2-direction structural lock
-    // (`coexistence.lock.test.ts`'s `ABORT_RECEIVER` scan) asserts every
-    // `.abort()` call in this file resolves to the bare receiver `inFlight` —
-    // `this.inFlight.abort()` would scan as receiver `this.inFlight`, a
-    // DIFFERENT string, and trip that lock. Same field, same behavior
-    // (read-check-abort-clear), the local is purely what the receiver text
-    // resolves to.
-    const inFlight = this.inFlight;
-    if (inFlight !== null) {
-      inFlight.abort();
-      this.inFlight = null;
-    }
+    this.inFlight?.abort();
+    this.inFlight = null;
   }
 
   // ── the ONE trigger path ─────────────────────────────────────────────────
