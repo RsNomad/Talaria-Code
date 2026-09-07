@@ -1597,6 +1597,29 @@ export class SetupController {
       this.rekickLlamaCppProbe();
     }
     if (scope === 'all' || scope === 'agent') {
+      // TC-3 (AU-8/INV-11): drop the settled Hermes PATH-discovery memo —
+      // mirrors osResolution's clear-only posture above (not
+      // rekickLlamaCppProbe's immediate re-kick): the next status() call
+      // re-probes lazily through kickHermesDiscovery, picking up e.g. a
+      // hermes the user just pipx-installed in a terminal. invalidate()
+      // resets the in-flight flag too (not just the epoch) — a superseded
+      // probe's late settle is dropped by the epoch check BEFORE it would
+      // ever clear the flag itself, so leaving it `true` here would wedge
+      // every future kick into a permanent no-op.
+      //
+      // R2-1-fix (review Minor): hoisted to run ONCE per recheck call, ABOVE
+      // the single-flight coalesce guard below — invalidate() is a cheap,
+      // idempotent epoch bump (SettledProbeMemo.invalidate; cancellable:
+      // false for this memo, so it never touches an in-flight probe or the
+      // `recheck` latch), so running it unconditionally is harmless on the
+      // in-flight call and closes a race on the COALESCING one: without
+      // this, a status() poll that lands between an in-flight recheck's
+      // invalidate() and its locatePipx settle can re-kick and re-settle the
+      // memo with a now-stale value that a coalesced second recheck used to
+      // leave untouched (its own invalidate() lived inside the guard below
+      // and never ran) — one extra Re-check click could then still show
+      // "hermes not found" right after the user installed it.
+      this.hermesDiscoveryMemo.invalidate();
       // R2-1 (L2-CA-16): the probe below now runs under a `'recheck'`-keyed
       // latch — `dispose()`'s `abortAll()` couldn't reach it before (it was
       // never armed), so a window-reload mid-recheck left it running
@@ -1611,16 +1634,6 @@ export class SetupController {
         const abort = this.latches.arm('recheck');
         if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
         try {
-          // TC-3 (AU-8/INV-11): drop the settled Hermes PATH-discovery memo
-          // too — mirrors osResolution's clear-only posture above (not
-          // rekickLlamaCppProbe's immediate re-kick): the next status() call
-          // re-probes lazily through kickHermesDiscovery, picking up e.g. a
-          // hermes the user just pipx-installed in a terminal. invalidate()
-          // resets the in-flight flag too (not just the epoch) — a
-          // superseded probe's late settle is dropped by the epoch check
-          // BEFORE it would ever clear the flag itself, so leaving it `true`
-          // here would wedge every future kick into a permanent no-op.
-          this.hermesDiscoveryMemo.invalidate();
           const located = await this.deps.locatePipx(abort.signal);
           if (located.ok) {
             this.lastAgentIssue = undefined;

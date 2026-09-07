@@ -3514,6 +3514,59 @@ describe("R2-1 (L2-CA-16): setup.recheck {scope:'agent'} probes under a 'recheck
     resolveProbe?.(OK_PIPX_LOCATE);
     await expect(first).resolves.toEqual({ ok: true });
   });
+
+  it("R2-1-fix review Minor: the COALESCING recheck also invalidates the Hermes discovery memo, not just the in-flight one — closes the stale-memo race (fails at HEAD: the coalescing recheck's invalidate is skipped, so a re-kicked-stale memo survives it and the next status() never re-probes)", async () => {
+    let discoverCalls = 0;
+    let locateCalls = 0;
+    let resolveProbe: ((r: PipxLocateResult) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: async () => {
+          discoverCalls++;
+          throw new Error('not yet installed');
+        },
+        locatePipx: (): Promise<PipxLocateResult> => {
+          locateCalls++;
+          return new Promise<PipxLocateResult>((resolve) => {
+            resolveProbe = resolve;
+          });
+        },
+      },
+    );
+
+    // Seed a settled ("not found") discovery memo via the natural status() kick.
+    await controller.status();
+    await tickT6();
+    expect(discoverCalls).toBe(1);
+
+    // recheck #1: arms the 'recheck' latch, invalidates the memo, then blocks on locatePipx.
+    const first = controller.handle('setup.recheck', { scope: 'agent' });
+    expect(locateCalls).toBe(1);
+
+    // While recheck #1's locatePipx is still pending, an unrelated status()
+    // poll re-kicks the (now-cleared) memo — re-settling it with a STALE
+    // "not found" value. This is the race window the R2-1 review Minor names
+    // (e.g. the user installs Hermes right in this window).
+    await controller.status();
+    await tickT6();
+    expect(discoverCalls).toBe(2);
+
+    // recheck #2 overlaps and coalesces — single-flight: locatePipx must NOT
+    // run again — but it must STILL invalidate the discovery memo so the
+    // stale re-kicked value from the window above doesn't survive it.
+    const second = await controller.handle('setup.recheck', { scope: 'agent' });
+    expect(locateCalls).toBe(1); // single-flight preserved — still exactly one probe
+    expect(second).toEqual({ ok: true });
+
+    resolveProbe?.(OK_PIPX_LOCATE);
+    await expect(first).resolves.toEqual({ ok: true });
+
+    // The very next status() must re-probe — proves recheck #2 invalidated
+    // the memo too, not merely recheck #1's own (already-superseded) invalidate.
+    await controller.status();
+    expect(discoverCalls).toBe(3); // fails at HEAD: stays at 2 — the coalescing recheck never invalidated
+  });
 });
 
 describe('F2-16: a disposed controller refuses to arm NEW install/pull latches', () => {
