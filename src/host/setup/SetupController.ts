@@ -1597,28 +1597,44 @@ export class SetupController {
       this.rekickLlamaCppProbe();
     }
     if (scope === 'all' || scope === 'agent') {
-      // TC-3 (AU-8/INV-11): drop the settled Hermes PATH-discovery memo too
-      // — mirrors osResolution's clear-only posture above (not
-      // rekickLlamaCppProbe's immediate re-kick): the next status() call
-      // re-probes lazily through kickHermesDiscovery, picking up e.g. a
-      // hermes the user just pipx-installed in a terminal. invalidate()
-      // resets the in-flight flag too (not just the epoch) — a superseded
-      // probe's late settle is dropped by the epoch check BEFORE it would
-      // ever clear the flag itself, so leaving it `true` here would wedge
-      // every future kick into a permanent no-op.
-      this.hermesDiscoveryMemo.invalidate();
-      try {
-        const located = await this.deps.locatePipx();
-        if (located.ok) {
-          this.lastAgentIssue = undefined;
-        } else {
-          // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
-          // — probe-timeout is not a distinct sticky phase.
-          const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
-          this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+      // R2-1 (L2-CA-16): the probe below now runs under a `'recheck'`-keyed
+      // latch — `dispose()`'s `abortAll()` couldn't reach it before (it was
+      // never armed), so a window-reload mid-recheck left it running
+      // detached, writing `lastAgentIssue` and firing status after teardown.
+      // A recheck already in flight is COALESCED, not refused or re-armed: a
+      // second `arm('recheck')` would OVERWRITE the map entry under the SAME
+      // key and orphan the first `AbortController` so `dispose()` could
+      // never reach it again. Recheck is read-only, so the in-flight probe
+      // already covers the agent state this call asked for — it falls
+      // through to the completion `bumpStatus()` below untouched.
+      if (!this.latches.has('recheck')) {
+        const abort = this.latches.arm('recheck');
+        if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
+        try {
+          // TC-3 (AU-8/INV-11): drop the settled Hermes PATH-discovery memo
+          // too — mirrors osResolution's clear-only posture above (not
+          // rekickLlamaCppProbe's immediate re-kick): the next status() call
+          // re-probes lazily through kickHermesDiscovery, picking up e.g. a
+          // hermes the user just pipx-installed in a terminal. invalidate()
+          // resets the in-flight flag too (not just the epoch) — a
+          // superseded probe's late settle is dropped by the epoch check
+          // BEFORE it would ever clear the flag itself, so leaving it `true`
+          // here would wedge every future kick into a permanent no-op.
+          this.hermesDiscoveryMemo.invalidate();
+          const located = await this.deps.locatePipx(abort.signal);
+          if (located.ok) {
+            this.lastAgentIssue = undefined;
+          } else {
+            // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
+            // — probe-timeout is not a distinct sticky phase.
+            const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
+            this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+          }
+        } catch (err) {
+          this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
+        } finally {
+          this.latches.release('recheck');
         }
-      } catch (err) {
-        this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
       }
     }
     // T7 (§2.2.2): fired exactly ONCE at completion (not per lastAgentIssue

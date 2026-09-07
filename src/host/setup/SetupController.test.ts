@@ -3453,6 +3453,69 @@ describe('TC-6 (AU-6): dispose() aborts in-flight installs/pulls', () => {
   });
 });
 
+// --- R2-1 (L2-CA-16): the agent-recheck probe runs under a `recheck`-keyed
+// latch dispose() can reach ---------------------------------------------------
+
+describe("R2-1 (L2-CA-16): setup.recheck {scope:'agent'} probes under a 'recheck'-keyed latch", () => {
+  it("cancel-on-dispose: dispose() aborts the signal locatePipx received; a late resolve fires no status change (fails at HEAD — no signal is ever passed)", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    let resolveProbe: ((r: PipxLocateResult) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: (signal?: AbortSignal): Promise<PipxLocateResult> => {
+          capturedSignal = signal;
+          return new Promise<PipxLocateResult>((resolve) => {
+            resolveProbe = resolve;
+          });
+        },
+      },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const pending = controller.handle('setup.recheck', { scope: 'agent' });
+
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    controller.dispose();
+    expect(capturedSignal?.aborted).toBe(true);
+
+    resolveProbe?.(OK_PIPX_LOCATE); // the late resolve — must not overwrite state or fire
+    await tickT6();
+    expect(fires.length).toBe(0);
+
+    await pending; // drain — no unhandled rejection
+  });
+
+  it('single-flight: a second overlapping agent recheck coalesces — locatePipx is called exactly once, no orphaned controller (fails at HEAD — two probes run)', async () => {
+    let locateCalls = 0;
+    let resolveProbe: ((r: PipxLocateResult) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: (): Promise<PipxLocateResult> => {
+          locateCalls++;
+          return new Promise<PipxLocateResult>((resolve) => {
+            resolveProbe = resolve;
+          });
+        },
+      },
+    );
+
+    const first = controller.handle('setup.recheck', { scope: 'agent' });
+    expect(locateCalls).toBe(1);
+
+    const second = await controller.handle('setup.recheck', { scope: 'agent' });
+    expect(locateCalls).toBe(1); // coalesced — no second probe, no second arm()
+    expect(second).toEqual({ ok: true });
+
+    resolveProbe?.(OK_PIPX_LOCATE);
+    await expect(first).resolves.toEqual({ ok: true });
+  });
+});
+
 describe('F2-16: a disposed controller refuses to arm NEW install/pull latches', () => {
   it('setup.pullModel after dispose() refuses without invoking the pull dep', async () => {
     const pullModel = vi.fn();
