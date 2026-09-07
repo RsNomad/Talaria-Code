@@ -351,16 +351,11 @@ export function applyTextEdits(docText: string, edits: readonly PlainTextEdit[])
 // renderUnifiedDiff — pure, total, minimal line-based unified diff (no dep)
 // ---------------------------------------------------------------------------
 
-// Kind labels are deliberately NOT the more obvious verb-shaped trio one
-// might reach for first — this directory's static invariant lock
-// (lspInvariant.test.ts)'s write-shaped tool-name-literal ban is a blunt,
-// comment-blind SUBSTRING scan for any QUOTED token starting with a small
-// set of verb roots (curated to catch things like a tool named for applying
-// an edit). A bare quoted verb-shaped label with no relation to any tool
-// name collides with it too. Renaming these three purely-internal labels
-// sidesteps that collision without touching the lock itself. (Backticks, not
-// quotes, are used for code spans throughout this file's prose for exactly
-// this reason — the ban only matches the ASCII quote characters.)
+/** One line's classification in the diff engine's edit script — `kept`
+ * (unchanged, carried through from `oldLines`), `added` (present only in
+ * `newLines`), or `dropped` (present only in `oldLines`). Purely internal:
+ * {@link DIFF_LINE_PREFIX} maps each kind to its rendered `+`/`-`/` `
+ * unified-diff prefix; the label itself never reaches the wire. */
 type DiffOpKind = 'kept' | 'added' | 'dropped';
 
 interface DiffOp {
@@ -720,19 +715,13 @@ function to1Based(n: number): number {
   return clamped + 1;
 }
 
-/** One entry of `SerializedCodeAction.edits` — written as a standalone
- * interface rather than an indexed-access type on `SerializedCodeAction`,
- * purely to avoid a quoted field-name string literal in source (would also
- * collide with the tool-name-literal ban — see the `DiffOpKind` rename
- * comment above). Must stay structurally identical to the element type of
- * `SerializedCodeAction`'s own `edits` field. */
-interface WireEdit {
-  readonly startLine: number;
-  readonly startChar: number;
-  readonly endLine: number;
-  readonly endChar: number;
-  readonly newText: string;
-}
+/** One entry of `SerializedCodeAction.edits` — the natural indexed-access
+ * type on `SerializedCodeAction` itself, so it can never structurally drift
+ * from that field's element shape. `NonNullable` is required because
+ * `edits` is an optional property (`edits?: readonly {...}[]`): indexing a
+ * union that includes `undefined` with `[number]` has no matching index
+ * signature and fails to compile without it. */
+type WireEdit = NonNullable<SerializedCodeAction['edits']>[number];
 
 /** The single-action size ceiling for the `too-large` decision: the sum of
  * every wire edit's `newText` length plus the preview's length, compared
