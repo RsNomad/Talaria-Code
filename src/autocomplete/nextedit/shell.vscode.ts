@@ -38,6 +38,7 @@ import type { FimActivityListener } from '../provider';
 import { regionAroundCursor, remapRange } from './anchors';
 import { NextEditHttpBackend } from './backend';
 import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
+import { attachFimActivity, detachFimActivity, fimActivityRelay } from './fimActivityRelay';
 import { reduceNextEdit } from './fsm';
 import type { RenderedNextEditPrompt } from './formats/types';
 import { NextEditGuard } from './guard';
@@ -117,37 +118,20 @@ export { deriveGenericTransport, GENERIC_SETUP_NOTE, NEXT_EDIT_MODEL_UNSET_NOTE,
  */
 const FIM_ACCEPT_COMMAND = 'talaria.nextEdit.onFimAccept';
 
-const NO_OP_FIM_ACTIVITY: FimActivityListener = {
-  requestStarted: () => {},
-  resultShown: () => {},
-  accepted: () => {},
-  acceptCommandId: () => undefined,
-};
-
-let currentFimActivity: FimActivityListener = NO_OP_FIM_ACTIVITY;
-
 /**
- * The stable object `index.ts` hands to `TalariaInlineCompletionProvider`.
- *
- * Composition-order problem it solves: the provider is constructed by
- * `registerTalariaAutocomplete`, the listener's real implementation by
- * `registerTalariaNextEdit`, and neither can hold the other's result at
- * construction time — while `registerTalariaNextEdit`'s signature is pinned to
- * return a bare `Disposable`. This relay is a fixed forwarding address: it is
- * a no-op until the shell attaches (so a build with next-edit unregistered
- * behaves exactly as before), and reverts to a no-op on dispose.
- *
- * Observation-only in BOTH directions of the R2 rule: FIM tells next-edit
- * what it is doing; next-edit holds no handle that could cancel FIM.
+ * WS-F3 F3-6 (FI-06): `NO_OP_FIM_ACTIVITY`, the module-level `currentFimActivity`
+ * slot, and `fimActivityRelay` itself moved verbatim to `./fimActivityRelay`
+ * (a vscode-FREE leaf; the slot is KEPT BY DESIGN — provider→shell
+ * decoupling, and FI-26's future home, task F10-2) — re-exported here so the
+ * shell's own public surface, and `provider.ts`'s/`index.ts`'s
+ * `import { fimActivityRelay, ... } from './nextedit/shell.vscode'` plus
+ * `shell.vscode.test.ts`'s and `nextedit.golden.shell.test.ts`'s own
+ * `import { fimActivityRelay, ... } from './shell.vscode'`, keep resolving
+ * through `./shell.vscode` with zero further edits, exactly as the F3-1
+ * golden masters' own module doc anticipates ("F3-2..F3-8 move
+ * implementations to new modules but the shell RE-EXPORTS each one").
  */
-export const fimActivityRelay: FimActivityListener = {
-  requestStarted: () => currentFimActivity.requestStarted(),
-  resultShown: (hasItem: boolean) => currentFimActivity.resultShown(hasItem),
-  accepted: () => currentFimActivity.accepted(),
-  // Forwarded, never answered here: the relay must report what the CURRENTLY
-  // attached registration has registered — `undefined` while none is.
-  acceptCommandId: () => currentFimActivity.acceptCommandId(),
-};
+export { fimActivityRelay };
 
 // ───────────────────────────── the toggle gate ───────────────────────────────
 
@@ -380,8 +364,9 @@ class NextEditShell {
 
   /**
    * Held under its own name so `dispose()` below can prove it still OWNS the
-   * module-level relay slot before clearing it — `currentFimActivity` is a
-   * single shared slot, and a newer registration may already have taken it.
+   * module-level relay slot before clearing it — `./fimActivityRelay`'s
+   * `currentFimActivity` is a single shared slot, and a newer registration
+   * may already have taken it.
    */
   private readonly fimActivity: FimActivityListener;
 
@@ -678,7 +663,7 @@ class NextEditShell {
     // actually registered — which is the line above. Ordering it this way makes
     // "an advertised command is a registered command" structural rather than a
     // property of where the assignment happened to sit.
-    currentFimActivity = this.fimActivity;
+    attachFimActivity(this.fimActivity);
 
     this.disposable = vscode.Disposable.from(
       changeSubscription,
@@ -700,13 +685,12 @@ class NextEditShell {
           // an unconditional `.dispose()`.
           this.editTrackerInstance?.dispose();
           // BF-B's liveness idiom (`SessionController.ts`'s `disposed` re-check),
-          // applied to a MODULE-level slot: clear the relay only while THIS
-          // registration still owns it. Disposing a registration that a newer
-          // one already replaced must not point the relay back at the no-op —
-          // that would silently disarm R2 for the shell that is actually live.
-          if (currentFimActivity === this.fimActivity) {
-            currentFimActivity = NO_OP_FIM_ACTIVITY;
-          }
+          // applied to a MODULE-level slot (now `./fimActivityRelay`'s own):
+          // `detachFimActivity` clears the relay only while THIS registration
+          // still owns it. Disposing a registration that a newer one already
+          // replaced must not point the relay back at the no-op — that would
+          // silently disarm R2 for the shell that is actually live.
+          detachFimActivity(this.fimActivity);
         },
       },
     );

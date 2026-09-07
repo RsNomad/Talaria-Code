@@ -214,10 +214,21 @@ describe('LOCK: every nextedit/ file that calls fetch( also calls assertSecureAu
       // file through this lock rather than bumping the count reflexively —
       // it was looked at, and it is clean.
       'nextEditExecutor.ts',
+      // WS-F3 F3-6 (FI-06) — `fimActivityRelay.ts`, the FIM-activity relay
+      // (`fimActivityRelay`, `attachFimActivity`, `detachFimActivity`, plus
+      // the module-level `currentFimActivity` slot kept by design) extracted
+      // out of `shell.vscode.ts`. It contains no `fetch(` call at all — it
+      // holds no wire call of any kind, only in-memory forwarding to
+      // whichever listener is currently attached (verified by the "no other
+      // nextedit/ file contains fetch(" sanity test below) — named here per
+      // this pin's own stated purpose: force every new `nextedit/` file
+      // through this lock rather than bumping the count reflexively — it was
+      // looked at, and it is clean.
+      'fimActivityRelay.ts',
     ]) {
       expect(files).toContain(expected);
     }
-    expect(files.length).toBe(19);
+    expect(files.length).toBe(20);
   });
 
   it('no non-allowlisted nextedit/ file contains fetch( without also calling BOTH assertSecureAuthTransport( and mintScannedNextEditRequest( (the real lock)', () => {
