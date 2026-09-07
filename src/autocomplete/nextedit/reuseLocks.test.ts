@@ -181,10 +181,22 @@ describe('LOCK: every nextedit/ file that calls fetch( also calls assertSecureAu
       // rather than bumping the count reflexively — it was looked at, and it
       // is clean.
       'nextEditText.ts',
+      // WS-F3 F3-3 (FI-06) — `nextEditRoute.ts`, the route-resolution core +
+      // route/toggle copy extracted out of `shell.vscode.ts` (`resolveRoute`,
+      // `endpointLabel`, `deriveGenericTransport`, the two note constants,
+      // `genericUnsupportedBackendMessage`, `DEFAULT_NEXT_EDIT_ENDPOINTS`).
+      // It reaches the wire only THROUGH `backend.ts` (the shell's own
+      // `NextEditHttpBackend` construction site, unmoved) and contains no
+      // `fetch(` call of its own at all (verified by the "no other nextedit/
+      // file contains fetch(" sanity test below) — named here per this pin's
+      // own stated purpose: force every new `nextedit/` file through this
+      // lock rather than bumping the count reflexively — it was looked at,
+      // and it is clean.
+      'nextEditRoute.ts',
     ]) {
       expect(files).toContain(expected);
     }
-    expect(files.length).toBe(16);
+    expect(files.length).toBe(17);
   });
 
   it('no non-allowlisted nextedit/ file contains fetch( without also calling BOTH assertSecureAuthTransport( and mintScannedNextEditRequest( (the real lock)', () => {
