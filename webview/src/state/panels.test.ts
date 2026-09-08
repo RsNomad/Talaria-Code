@@ -121,6 +121,23 @@ describe('panel RemoteData reducer helpers (Part X2)', () => {
   });
 
   /*
+   * FI-39 drift-lock symmetry: `applyPanelTransition`'s loading-no-flash-over-
+   * success arm (`current.status === 'success' ? current : loading`) is the
+   * counterpart of `reducePanelAction`'s tested-above rule (:44). Without this
+   * assertion a regression that flashed `loading` over already-loaded data in
+   * `applyPanelTransition` ALONE — exactly a drift between the two functions —
+   * would pass the whole suite (the sessions path executes this arm but asserts
+   * only its side-map). Pins the `? current` (keep) branch by reference.
+   */
+  it('applyPanelTransition does NOT flash loading over already-loaded data (silent background refresh — mirrors reducePanelAction:44)', () => {
+    const loaded = success<PanelDataMap['subagents']>({ delegations: [] });
+    const next = applyPanelTransition(loaded, { type: 'local.panelLoading', panel: 'subagents', scopeKey: 'tab-1' });
+    // Cached data stays visible while the correlated refresh is in flight —
+    // the `current` branch, not `loading`; unchanged reference (no re-alloc).
+    expect(next).toBe(loaded);
+  });
+
+  /*
    * TI-3 (AU-42 Part B): the re-scoped panels (subagents/checkpoints/
    * sessions — everything that folds through `applyPanelTransition` rather
    * than the map-keyed `reducePanelAction` above) get the SAME keep-data
