@@ -134,6 +134,19 @@ export class ConnectionSupervisor {
   private acpRespawnAttempts = 0;
   private acpRespawnTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /** FI-23: `acpState` is async-mutable — a re-entrant `dispose()` can flip it
+   *  to 'disposed' during an `await`, but TS control-flow-analysis narrows the
+   *  field to its last synchronous assignment and cannot model that. Reading
+   *  through this predicate returns the full-union type (no CFA narrowing on a
+   *  method-call result), so the disposed check compiles WITHOUT an `as`-cast.
+   *  ⚠ [CONC]: this reads `this.acpState` FRESH on every call — callers MUST
+   *  invoke it at the check point (after the await), never cache its result
+   *  into a `const` reused across a later await, or the re-entrant-dispose
+   *  detection this exists for is defeated. */
+  private isDisposed(): boolean {
+    return this.acpState === 'disposed';
+  }
+
   /** WS-R3 F2-19b: the ACP loop's health machinery — the shared
    * RespawnHealthTracker (same consolidation as ControlChannel; see the
    * class doc in respawnHealth.ts). `safeLog` keeps the pinned
@@ -371,7 +384,7 @@ export class ConnectionSupervisor {
    * connection."
    */
   private async startInternal(): Promise<void> {
-    if (this.acpState === 'disposed') throw new Error('AcpBackend: disposed');
+    if (this.isDisposed()) throw new Error('AcpBackend: disposed');
     this.clearAcpRespawnTimer(); // an explicit (re)start replaces any pending retry
     this.fanOutRestartSignal();
     this.teardownSession();
@@ -391,8 +404,8 @@ export class ConnectionSupervisor {
       // `resolveHermes` is in flight. Don't create a client — whose
       // `connect()` would spawn a child NOTHING will ever reap, because
       // dispose() has already run — for a supervisor that's already gone.
-      // Cast: same TS-narrowing reasoning as this try's catch below.
-      if ((this.acpState as string) === 'disposed') throw new Error('AcpBackend: disposed');
+      // FI-23: fresh re-check via isDisposed() — see its own doc.
+      if (this.isDisposed()) throw new Error('AcpBackend: disposed');
       this.port.setCwd(resolved.cwd);
       connectedCwd = resolved.cwd;
 
@@ -435,7 +448,7 @@ export class ConnectionSupervisor {
       // 'idle'), disposes+nulls any still-assigned client (CF-01/I-1), and
       // suppresses the failure banner — a disposed supervisor stays disposed
       // and no child is orphaned.
-      if ((this.acpState as string) === 'disposed') throw new Error('AcpBackend: disposed');
+      if (this.isDisposed()) throw new Error('AcpBackend: disposed');
 
       // R-A6: supervise the live child as soon as the CONNECTION itself is
       // healthy — independent of whether the session below manages to
@@ -446,12 +459,14 @@ export class ConnectionSupervisor {
       this.acpState = 'ready';
       this.emitHealth(0);
     } catch (err) {
-      // Cast: TS narrows `acpState` to 'starting' | 'ready' across this try
+      // FI-23: TS narrows `acpState` to 'starting' | 'ready' across this try
       // block's control flow, but `AcpBackend.dispose()` can reassign it (via
       // {@link markDisposed}) to 'disposed' during any of the `await`s above
-      // (same reasoning as `scheduleAcpRespawn`'s cast below) — a real
-      // runtime possibility TS's synchronous CFA doesn't model.
-      if ((this.acpState as string) !== 'disposed') this.acpState = 'idle';
+      // — a real runtime possibility TS's synchronous CFA doesn't model.
+      // isDisposed() reads the full union fresh, so no cast is needed (see
+      // its own doc); no `await` sits between this check and the write below,
+      // so the check-then-write stays atomic.
+      if (!this.isDisposed()) this.acpState = 'idle';
       // CF-01/I-1: mirrors `handleAcpCrash`'s own arch-A2 guard (:856-857) —
       // a connect-phase failure must dispose+clear the zombie client the
       // same way a post-connection crash does. Without this, the
@@ -467,7 +482,7 @@ export class ConnectionSupervisor {
       // guard discipline as `handleAcpCrash` (below): a respawn-loop attempt
       // failing here must NOT add a second banner on top of the crash's own
       // ("The agent exited unexpectedly — reconnecting…").
-      if (!wasRespawning && (this.acpState as string) !== 'disposed') {
+      if (!wasRespawning && !this.isDisposed()) {
         this.port.emit({
           type: 'system.error',
           message: `Hermes failed to start: ${describeHostError(err)}`,
@@ -1257,7 +1272,7 @@ export class ConnectionSupervisor {
         await this.startInternal();
         return { ok: true as const };
       } catch (err) {
-        if ((this.acpState as string) !== 'disposed') {
+        if (!this.isDisposed()) {
           this.acpState = 'respawning';
           this.scheduleAcpRespawn();
         }
@@ -1293,7 +1308,7 @@ export class ConnectionSupervisor {
         // reschedule call below; an unguarded throw here would silently
         // drop the outage instead of retrying it.
         this.safeLog(`[AcpBackend] ACP respawn attempt ${attempt} failed: ${describeHostError(err)}`);
-        if ((this.acpState as string) !== 'disposed') {
+        if (!this.isDisposed()) {
           this.acpState = 'respawning'; // stay in-outage: no second UI signal
           this.scheduleAcpRespawn();
         }
