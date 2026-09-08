@@ -21,38 +21,14 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import { bridge } from './bridge';
 import type {
   CheckpointRestoreResult,
-  ControlMethod,
-  ControlRequestMethod,
   DataPanel,
   HostToWebview,
-  HubInstallResult,
-  HubPreview,
-  HubScan,
-  McpAddParams,
-  McpAddResult,
-  McpCatalogData,
-  McpCatalogInstallParams,
-  McpCatalogInstallResult,
-  McpTestResult,
-  NextEditToggleSource,
   Panel,
   SessionLostReason,
-  SetupMethod,
-  SkillCreateParams,
   ThemeKind,
 } from './protocol';
 import { MAX_TABS, PANEL_SCOPE } from './protocol';
-import {
-  asShape,
-  isCheckpointRestoreResult,
-  isHubInstallResult,
-  isHubPreview,
-  isHubScan,
-  isMcpAddResult,
-  isMcpCatalogData,
-  isMcpCatalogInstallResult,
-  isMcpTestResult,
-} from './shapeGuards';
+import { isCheckpointRestoreResult } from './shapeGuards';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
@@ -63,7 +39,6 @@ import {
   panelData,
   readScopedRefreshError,
   resolvePanelRequest,
-  unwrapSetupResult,
   type RefreshErrorPanel,
 } from './state/panels';
 import { idle } from './state/remoteData';
@@ -71,6 +46,27 @@ import { createInitialState, type AppState, type TabState } from './types';
 import type { ComposerSeed } from './composer/applySeed';
 import { useHostActions } from './hooks/useHostActions';
 import { useSessionLoadWatchdog } from './hooks/useSessionLoadWatchdog';
+import { requestShapedOptional } from './rpcShaped';
+import {
+  onAddProviderKey,
+  toggle,
+  reloadMcp,
+  addMcpServer,
+  testMcpServer,
+  removeMcpServer,
+  setMcpServerEnabled,
+  authMcpServer,
+  mcpCatalog,
+  mcpCatalogInstall,
+  createSkill,
+  previewHubSkill,
+  scanHubSkill,
+  installHubSkill,
+  uninstallHubSkill,
+  setConfig,
+  setNextEditToggle,
+  dispatchSetup,
+} from './globalActions';
 
 import { PriorityTabs } from './components/PriorityTabs';
 import { TabStrip, tabDomId, CHAT_TABPANEL_ID } from './components/TabStrip';
@@ -108,61 +104,6 @@ type Action = { host: HostToWebview } | { local: LocalAction };
  * whenever no session is live yet.
  */
 const UNBOUND_SESSION_PLACEHOLDER = '';
-
-/**
- * WS-BG: guard-or-throw for correlated RPC results. A refused shape rejects
- * with an honest method-named Error — the same rejected-promise path every
- * caller already handles for RPC timeouts (panel error rendering /
- * optimistic rollback). Message names the METHOD only, never the payload.
- */
-const requireShape = <T,>(raw: unknown, guard: (x: unknown) => x is T, method: string): T => {
-  const shaped = asShape(raw, guard);
-  if (shaped === undefined) throw new Error(`${method} returned an unrecognized result shape`);
-  return shaped;
-};
-
-/**
- * WS-F1 F1-1 (FI-35): folds the invoke+shape tail every ALWAYS-SHAPE
- * correlated RPC call below repeated — `await bridge.request(method, params[,
- * tag])` then `requireShape(result, guard, method)`. `method` is passed ONCE
- * here (used for both the request and the `requireShape` error label),
- * removing the doubled literal every call site carried before. `bridge` is
- * this module's own top-level singleton (see `bridge.ts`'s `export const
- * bridge = new Bridge()`), already in scope at module level exactly like
- * `requireShape` above — no new module global introduced. Omitting `tag`
- * (the 8 mcp/skills call sites) is IDENTICAL to passing `tag === undefined`
- * here: `RpcClient.request` (`rpc.ts`) only ever spreads `tag` onto the
- * pending entry `...(tag !== undefined ? { tag } : {})`, so a bare pass-
- * through (no branch needed) preserves both call shapes untouched.
- */
-async function requestShaped<T>(
-  method: ControlRequestMethod,
-  params: Record<string, unknown>,
-  guard: (x: unknown) => x is T,
-  tag?: string,
-): Promise<T> {
-  const result = await bridge.request(method, params, tag);
-  return requireShape(result, guard, method);
-}
-
-/**
- * Same fold as {@link requestShaped}, for the 3 `checkpoint.*` call sites
- * whose host refusal paths can resolve a bare `undefined` (see
- * `requireShape`'s own doc above) — that passthrough must survive UNSHAPED,
- * never routed through `requireShape` (which would instead throw an
- * "unrecognized result shape" error, a different failure than the panel's
- * own honest "the host returned no result" handling expects — see
- * `CheckpointsPanel.tsx`'s T-C2/V-17 branch).
- */
-async function requestShapedOptional<T>(
-  method: ControlRequestMethod,
-  params: Record<string, unknown>,
-  guard: (x: unknown) => x is T,
-  tag?: string,
-): Promise<T | undefined> {
-  const result = await bridge.request(method, params, tag);
-  return result === undefined ? undefined : requireShape(result, guard, method);
-}
 
 function rootReducer(state: AppState, action: Action): AppState {
   if ('host' in action) return reduce(state, action.host);
@@ -477,11 +418,6 @@ export function App() {
     applyStandaloneTheme(state.theme.kind);
   }, [state.theme.kind]);
 
-  // CF-13/D1: the Models panel's "Add key" affordance — posts ONLY the
-  // provider slug. The host prompts for the key directly (masked) and
-  // dispatches `model.save_key`; the key never enters the webview.
-  const onAddProviderKey = (slug: string) => bridge.post({ type: 'model.addKey', slug });
-
   // W4 §7 B6: the correlated panel fetch carries an EXPLICIT scope key,
   // captured HERE at issue time from the tab that's active RIGHT NOW —
   // never re-resolved from `state.activeTabId` when the promise later
@@ -532,16 +468,6 @@ export function App() {
   };
   requestPanelRef.current = requestPanel;
 
-  // Correlated toggle (W1.5): the Skills/Tools switches persist through the
-  // dashboard REST channel and need the resolved/rejected result so the panel
-  // can do optimistic write-through with rollback-on-error. Returns the
-  // promise. F-1 (final-4way-fixes.md): Tools/Skills toggles are connection-
-  // global (`tools`/`skills` own no single tab, per the panel-scope
-  // taxonomy) — UNTAGGED, so closing an unrelated tab can never reject this
-  // in-flight write and trigger a false optimistic-rollback.
-  const toggle = (method: ControlMethod, params: Record<string, unknown>) =>
-    bridge.request(method, params);
-
   // Correlated `checkpoint.restore` (Part A2 reference migration): resolves with
   // the tracker's result so the panel can honor the dirty-worktree guard.
   // W4 §2d (sync-4/B4-control): carries an EXPLICIT `rootId` — resolving via
@@ -575,126 +501,6 @@ export function App() {
     if (force) params.force = true;
     return requestShapedOptional('checkpoint.redoAll', params, isCheckpointRestoreResult, tab.tabId);
   };
-
-  // A#5: MCP "Reload servers" over the CORRELATED path so the gateway's result
-  // (`{status, message?}`) — or a failure — becomes visible in the panel,
-  // instead of the old fire-and-forget that dropped both. The host still
-  // re-fetches + re-pushes the server list when the reload actually
-  // confirmed. F-1: `mcp` is connection-global (owns no tab) — UNTAGGED.
-  const reloadMcp = () => bridge.request('reload.mcp', { confirm: true });
-
-  // Task A7 (§4.9): the MCP admin RPCs `McpPanel`'s row actions + Add-server
-  // form drive. All correlated (`bridge.request`), same F-1 posture as
-  // `reloadMcp`/`toggle` above — `mcp` is connection-global, so these are
-  // UNTAGGED. `addMcpServer`/`testMcpServer`/`authMcpServer` now GUARD the
-  // resolved value onto its known shape via `requireShape` (WS-BG), the same
-  // `restoreCheckpoint`/`redoCheckpoint` idiom above (`bridge.request` itself
-  // only promises `unknown` — the host's real return shape is the wire
-  // contract).
-  const addMcpServer = (params: McpAddParams): Promise<McpAddResult> =>
-    requestShaped('mcp.add', params, isMcpAddResult);
-  const testMcpServer = (name: string): Promise<McpTestResult> =>
-    requestShaped('mcp.test', { name }, isMcpTestResult);
-  const removeMcpServer = (name: string) => bridge.request('mcp.remove', { name });
-  const setMcpServerEnabled = (name: string, enabled: boolean) =>
-    bridge.request('mcp.setEnabled', { name, enabled });
-  // Task A8 (§4.8): drives the panel's per-row `Login` button.
-  const authMcpServer = (name: string): Promise<McpTestResult> =>
-    requestShaped('mcp.auth', { name }, isMcpTestResult);
-  // Task A8 (§4.7): the Catalog disclosure's fetch (read-only, not trust-
-  // gated — fired at most once per panel mount, on first expand) and its
-  // `Install` action. Same untagged/guarded posture as the other MCP admin
-  // RPCs above — `mcp` is connection-global.
-  const mcpCatalog = (): Promise<McpCatalogData> => requestShaped('mcp.catalog', {}, isMcpCatalogData);
-  const mcpCatalogInstall = (p: McpCatalogInstallParams): Promise<McpCatalogInstallResult> => {
-    // `bridge.request` wants `Record<string, unknown>`; unlike `McpAddParams`
-    // (a `type` alias, structurally weak against an index signature),
-    // `McpCatalogInstallParams` is an `interface` — TS never infers an
-    // implicit index signature for those, so the params are rebuilt as a
-    // fresh object literal here (the same posture `restoreCheckpoint` above
-    // uses for its own `Record<string, unknown>` params).
-    // Rev-1 B4 (CF-13 parity): no `env` field at all — the webview never
-    // collects a credential value; the host prompts for each of the entry's
-    // `required_env` vars itself, masked, after the consent modal.
-    const wireParams: Record<string, unknown> = { name: p.name };
-    return requestShaped('mcp.catalogInstall', wireParams, isMcpCatalogInstallResult);
-  };
-
-  // Task B6 (§5.6): the T2 skills admin RPCs `SkillsPanel`'s Create/Install-
-  // from-hub disclosures and hub-row Remove button drive. Same untagged/guarded
-  // posture as the MCP admin RPCs above — `skills` is connection-global
-  // (`skills.toggle` above already is untagged), so these are UNTAGGED too.
-  // `createSkill` rebuilds `params` as a fresh `Record<string, unknown>`
-  // object literal (the same `mcpCatalogInstall` posture immediately above)
-  // — `SkillCreateParams` is an `interface`, so TS never infers an implicit
-  // index signature for it the way it does for `McpAddParams`'s `type` alias.
-  const createSkill = (params: SkillCreateParams) => {
-    const wireParams: Record<string, unknown> = { name: params.name, content: params.content };
-    if (params.category !== undefined) wireParams.category = params.category;
-    return bridge.request('skills.create', wireParams);
-  };
-  const previewHubSkill = (identifier: string): Promise<HubPreview> =>
-    requestShaped('skills.hubPreview', { identifier }, isHubPreview);
-  const scanHubSkill = (identifier: string): Promise<HubScan> =>
-    requestShaped('skills.hubScan', { identifier }, isHubScan);
-  const installHubSkill = (identifier: string): Promise<HubInstallResult> =>
-    requestShaped('skills.hubInstall', { identifier }, isHubInstallResult);
-  const uninstallHubSkill = (name: string) => bridge.request('skills.hubUninstall', { name });
-
-  // D3/N13: SettingsPanel's `config.set` over the CORRELATED path (the same
-  // `toggle` pattern above) so a rejected/failed write resolves/rejects and
-  // the row can roll back instead of lying — replaces the old fire-and-
-  // forget `invoke('config.set', …)`, whose effect was only ever observable
-  // through a server-initiated `panel.data` push that doesn't exist today.
-  // F-1 (the Important finding this fix brief exists for): `settings` is
-  // connection-global — this MUST be UNTAGGED. Tagging it with `tab.tabId`
-  // (the pre-fix bug) meant closing tab A while a `config.set` issued from
-  // tab A was still in flight rejected the promise via `rejectByTag`, even
-  // though the host went on to persist the write — SettingsPanel then ran
-  // its rollback and showed "Not saved" for a value that WAS saved.
-  const setConfig = (key: string, value: string | number | boolean) =>
-    bridge.request('config.set', { key, value });
-
-  // R5 (Task 13): the «Next Edit Suggestions» toggles, over the HOST-INTERNAL
-  // correlated `nextEdit.toggle` request — special-cased in the host router
-  // before backend dispatch, so this never reaches Hermes (the toggles are
-  // extension state, not agent config). Resolves with the newly ratified
-  // state; REJECTS with the Guard's refusal message, which is what makes the
-  // row's `rollbackField` snap the switch back and show the reason.
-  //
-  // F-1: the toggle store is CONNECTION-GLOBAL (one per extension, owned by
-  // no chat tab) — this MUST be UNTAGGED, exactly like `setConfig` above. A
-  // `tab.tabId` tag here would let an unrelated tab close reject a legitimate
-  // in-flight toggle via `rejectByTag`, and the row would then show a refusal
-  // for a toggle the Guard actually ratified. Locked in `rpc.test.ts`.
-  const setNextEditToggle = (source: NextEditToggleSource, on: boolean) =>
-    bridge.request('nextEdit.toggle', { source, on });
-
-  // Task 10: the Setup / Talaria Config panel's single mutating-action
-  // dispatcher — every `SetupMethod` (install/apply/setApiKey/testRemote/
-  // pullModel/cancel/openProviderWizard/openInstallTerminal/recheck/
-  // setNextEdit/setRag/setTunable) rides this ONE correlated request, mirroring
-  // `setConfig`/`toggle` above. F-1: CONNECTION-GLOBAL (installing a backend
-  // or pulling a model belongs to no one chat tab) — UNTAGGED, so closing an
-  // unrelated tab can never reject an in-flight Setup mutation. The host
-  // re-pushes a fresh `panel.data{panel:'setup'}` on every accepted mutation
-  // (mirrors `reload.mcp`/`model.save_key`'s "dispatch -> refetch -> push"
-  // precedent — see `SetupController.handle`'s own doc), so this panel needs
-  // no manual re-fetch after a successful call.
-  //
-  // T2 (§0.1 ②, §2.2.4 — corrects the previous docstring here, which was
-  // silent on refusals): a controller REFUSAL is `ok:true` at the RPC
-  // TRANSPORT layer (the request itself succeeded) carrying `result:
-  // {ok:false, reason}` — so the raw `bridge.request(...)` promise used to
-  // RESOLVE on a refusal, and `ActionButton`'s error state never fired.
-  // Routed through `unwrapSetupResult` so this dispatcher has the SAME
-  // resolve/reject contract as `setConfig`/`setNextEditToggle` above: an
-  // accepted mutation resolves with its result, a refusal REJECTS with
-  // `reason` (or a default message) — except `reason: 'declined'` (the user
-  // dismissed a native confirmation modal), which resolves to the `DECLINED`
-  // sentinel instead of either (not an error, not a success to label).
-  const dispatchSetup = (method: SetupMethod, params?: Record<string, unknown>) =>
-    bridge.request(method, params).then(unwrapSetupResult);
 
   // Deep-link into the Setup panel (MockNotice / Hero "Set up backends").
   const openSetup = () => selectPanel('setup');

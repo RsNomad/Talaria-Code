@@ -453,14 +453,14 @@ describe('RpcClient — AU-9/INV-13: a stale control.response from a PRIOR page 
   });
 });
 
-describe('App.tsx issues nextEdit.toggle connection-GLOBAL (F-1 source lock, Task 13)', () => {
-  const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf-8');
+describe('globalActions.ts issues nextEdit.toggle connection-GLOBAL (F-1 source lock, Task 13)', () => {
+  const appSource = readFileSync(new URL('./globalActions.ts', import.meta.url), 'utf-8');
 
   it('calls bridge.request for nextEdit.toggle with NO tag argument', () => {
     // `bridge.request(method, params)` — a third argument is a tab tag, which
     // would let an unrelated tab close reject a legitimate in-flight toggle.
     const call = /bridge\s*\.?\s*request\(\s*'nextEdit\.toggle'\s*,\s*\{[^}]*\}\s*(,)?\s*\)/.exec(appSource);
-    expect(call, 'App.tsx must issue a bridge.request(\'nextEdit.toggle\', { … }) call').not.toBeNull();
+    expect(call, 'globalActions.ts must issue a bridge.request(\'nextEdit.toggle\', { … }) call').not.toBeNull();
     expect(call?.[1], 'nextEdit.toggle must be UNTAGGED (connection-global) — no third argument').toBeUndefined();
   });
 
