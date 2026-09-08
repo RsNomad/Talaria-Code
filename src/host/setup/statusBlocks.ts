@@ -103,10 +103,28 @@ export function composeNextEditBlock(args: {
   const nextDedicatedBackendId = coerceDedicatedBackendId(
     nextDedicatedBackendIdRaw === '' ? undefined : nextDedicatedBackendIdRaw,
   );
-  // T13 (§4.2): capability + raw facts for the dedicated NEXT card —
-  // computed purely from the registry pins (no await; the CR-002
-  // synchronous tail below stays intact). `downloadReady` is driven by the
-  // sha256 pin and NOTHING else.
+  return {
+    source: nextSource,
+    backend: nextBackend,
+    endpoint: nextEndpoint,
+    model: nextModel,
+    dedicatedConfigured,
+    ...(nextDedicatedBackendId !== undefined ? { dedicatedBackendId: nextDedicatedBackendId } : {}),
+    genericSupported,
+    ...(nextSource === 'generic' && !genericSupported
+      ? {
+          refusalDetail: `The selected FIM backend ('${fimDisplayName}') does not support Generic Next-Edit.`,
+        }
+      : {}),
+    dedicated: composeDedicated(),
+  };
+}
+
+/** FI-32 (task F8-5): split out of {@link composeNextEditBlock} — the
+ *  registry-pin card for the dedicated NEXT flow, computed PURELY from
+ *  {@link NEXT_DEDICATED_MODEL} (no settings, no parameters). `downloadReady`
+ *  is driven by the sha256 pin and NOTHING else. */
+export function composeDedicated(): NonNullable<SetupData['nextEdit']['dedicated']> {
   const downloadReady = (NEXT_DEDICATED_MODEL.gguf.sha256 as string) !== '';
   const dedicated: NonNullable<SetupData['nextEdit']['dedicated']> = {
     displayName: NEXT_DEDICATED_MODEL.displayName,
@@ -133,21 +151,7 @@ export function composeNextEditBlock(args: {
         : {}),
     },
   };
-  return {
-    source: nextSource,
-    backend: nextBackend,
-    endpoint: nextEndpoint,
-    model: nextModel,
-    dedicatedConfigured,
-    ...(nextDedicatedBackendId !== undefined ? { dedicatedBackendId: nextDedicatedBackendId } : {}),
-    genericSupported,
-    ...(nextSource === 'generic' && !genericSupported
-      ? {
-          refusalDetail: `The selected FIM backend ('${fimDisplayName}') does not support Generic Next-Edit.`,
-        }
-      : {}),
-    dedicated,
-  };
+  return dedicated;
 }
 
 /** Pure move of `status()`'s `rag` composition (Card 5 — codebase index).
