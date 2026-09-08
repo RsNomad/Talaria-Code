@@ -1062,9 +1062,22 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
 
   it('ARCH-3: an event from OUTSIDE the workspace root (multi-root sibling) early-returns — no RangeError logged, no store touch', async () => {
     const sibling = mkdtempSync(path.join(os.tmpdir(), 'talaria-sibling-'));
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Assert on THIS indexer's OWN injected logger, not the global console.error:
+    // a sibling `it.skipIf(!canLinkFile)` symlink test that runs only on POSIX CI
+    // can leave a fire-and-forget writeManifest chain in flight whose post-teardown
+    // ENOENT rejection reaches the DEFAULT console.error logger of a DIFFERENT
+    // indexer. A global console spy would catch that cross-test leak and fail here
+    // spuriously on Linux; a per-indexer logger observes only this indexer's output.
+    const logSpy = vi.fn();
     try {
-      const indexer = makeIndexer();
+      const indexer = createIndexer({
+        workspaceRoot,
+        indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434',
+        embedModel: 'test-model',
+        debounceMs: 5,
+        logger: logSpy,
+      });
       const disposable = indexer.watch();
 
       fsWatcherListeners.change[0]!({ fsPath: path.join(sibling, 'b.ts') });
@@ -1074,14 +1087,14 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
       // advance settles it deterministically.
       await vi.advanceTimersByTimeAsync(200);
 
-      // At HEAD: ignore@7 throws RangeError inside the filter, caught by
-      // schedule()'s catch -> console.error('hermes-codebase: incremental reindex failed', ...).
-      expect(errorSpy).not.toHaveBeenCalled();
+      // The `../talaria-sibling-…/b.ts` relPath is rejected by ignore@7's
+      // isPathValid on BOTH win32 and posix, so handleFsEvent early-returns
+      // before the ignore filter (no RangeError) and before store.init().
+      expect(logSpy).not.toHaveBeenCalled();
       expect(initMock).not.toHaveBeenCalled();
       disposable.dispose();
       indexer.dispose();
     } finally {
-      errorSpy.mockRestore();
       rmSync(sibling, { recursive: true, force: true });
     }
   });
