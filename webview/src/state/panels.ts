@@ -181,6 +181,32 @@ export function reducePanelAction(panels: PanelStateMap, action: PanelAction): P
   }
 }
 
+/**
+ * A background-refresh failure: the panel was already `success` (not a first
+ * load) AND this action is a `local.panelError`. Such a failure KEEPS the
+ * already-loaded data and records `action.message` in the scope's
+ * refresh-error side-map (AU-10/TI-3); a first-load failure (not
+ * `wasSuccess`) gets the visible error card instead (`applyPanelTransition`/
+ * `reducePanelAction` above own that RemoteData half — unchanged by this
+ * export).
+ *
+ * FI-16: single source for the guard the 4 panel scopes in `transcript.ts`
+ * (`subagents`/`checkpoints`/`sessions`/the global-5) each used to spell out
+ * inline as `action.type === 'local.panelError' && wasSuccess` — one of them
+ * (global-5) in NEGATED early-return form. A real TYPE GUARD (`action is
+ * Extract<PanelAction, {type:'local.panelError'}>`), not a boolean+cast, so
+ * `if (isRefreshFailure(action, wasSuccess))` narrows `action` and a caller
+ * can read `action.message` with no cast. Each scope's `wasSuccess` capture,
+ * transition function, and refresh-error side-map shape stay scope-specific
+ * and inline in `transcript.ts` — only this truth value is shared.
+ */
+export function isRefreshFailure(
+  action: PanelAction,
+  wasSuccess: boolean,
+): action is Extract<PanelAction, { type: 'local.panelError' }> {
+  return action.type === 'local.panelError' && wasSuccess;
+}
+
 /** Read the success data for a panel, or `undefined` if it is not loaded. */
 export function panelData<P extends DataPanel>(
   panels: PanelStateMap,

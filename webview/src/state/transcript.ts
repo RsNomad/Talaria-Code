@@ -26,6 +26,7 @@ import {
 import {
   applyPanelTransition,
   assertExhaustivePanel,
+  isRefreshFailure,
   reducePanelAction,
   setPanelSuccess,
   type PanelAction,
@@ -1396,9 +1397,14 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
       // subagents were already `success` (a background refresh) as opposed
       // to a first load (idle/loading/error), which never writes the signal
       // (AU-10: a first-load failure gets the visible error card instead).
+      // FI-16: the `action.type === 'local.panelError' && wasSuccess` truth
+      // value itself is single-sourced as `isRefreshFailure` (panels.ts) —
+      // this scope (like checkpoints/sessions/global-5 below) still owns its
+      // own `wasSuccess` capture, transition call, side-map shape, and
+      // return assembly inline; only the guard predicate is shared.
       const wasSuccess = tab.subagents.status === 'success';
       const subagents = applyPanelTransition(tab.subagents, action);
-      if (action.type === 'local.panelError' && wasSuccess) {
+      if (isRefreshFailure(action, wasSuccess)) {
         return { ...state, tabs: { ...state.tabs, [tabId]: { ...tab, subagents, subagentsRefreshError: action.message } } };
       }
       // CF-10: an honest empty landing (unbound-tab short-circuit) also
@@ -1422,7 +1428,7 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
       // cases — see that case's doc.
       const wasSuccess = current.status === 'success';
       const next = applyPanelTransition(current, action);
-      if (action.type === 'local.panelError' && wasSuccess) {
+      if (isRefreshFailure(action, wasSuccess)) {
         return {
           ...state,
           rootPanels: { ...state.rootPanels, [rootId]: next },
@@ -1436,7 +1442,7 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
       // checkpoints/global-5 cases — see the subagents case's doc.
       const wasSuccess = state.sessionsPanel.status === 'success';
       const sessionsPanel = applyPanelTransition(state.sessionsPanel, action);
-      if (action.type === 'local.panelError' && wasSuccess) {
+      if (isRefreshFailure(action, wasSuccess)) {
         return { ...state, sessionsPanel, sessionsRefreshError: action.message };
       }
       return { ...state, sessionsPanel };
@@ -1458,7 +1464,7 @@ function reducePanelActionScoped(state: AppState, action: PanelAction): AppState
       // `reducePanelAction`'s own keep-data rule makes.
       const wasSuccess = state.globalPanels[action.panel]?.status === 'success';
       const globalPanels = reducePanelAction(state.globalPanels, action);
-      if (action.type !== 'local.panelError' || !wasSuccess) {
+      if (!isRefreshFailure(action, wasSuccess)) {
         return { ...state, globalPanels };
       }
       // TI-3 (AU-42 Part B): the SAME fold step that just kept the
