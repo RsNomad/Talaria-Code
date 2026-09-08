@@ -536,7 +536,7 @@ export class AcpBackend implements AgentBackend {
       // probe for the session-start banner. Reads the SAME accessor
       // `extension.ts` binds for `SetupControllerDeps.getAdvertisedAuthMethods`
       // (`() => backend.getAdvertisedAuthMethods?.()` resolves to exactly
-      // this instance's method below, :718) through the SAME
+      // this instance's method below) through the SAME
       // `computeProviderCard` mapping — banner and Provider card can never
       // disagree. Call-time posture like every other accessor here: reads
       // the CURRENT client's advertisement at establish-failure time.
@@ -1052,8 +1052,9 @@ export class AcpBackend implements AgentBackend {
     // bootstrap twin (establishInitialSession) has — un-raced, a hung-but-
     // alive child wedged this tail link (and therefore EVERY later
     // openTab/closeTab/load/start) forever. Belated-resolution cleanup is
-    // caller-owned via openSession's existing isStaleAttempt guard
-    // (:900-924): the abandoned mint closes its own orphaned session and
+    // caller-owned via openSession's existing isStaleAttempt guard (the
+    // `if (isStaleAttempt?.())` check near the top of that method): the
+    // abandoned mint closes its own orphaned session and
     // never announces tab.bound. A genuine newSession rejection passes
     // through settleRace and keeps the existing describeHostError terminal.
     let attemptAbandoned = false;
@@ -1614,8 +1615,9 @@ export class AcpBackend implements AgentBackend {
    *   remove+dispose the WRONG (freshly-minted) controller.
    * - **C1 fix (concurrency review): re-read the occupant AFTER the
    *   confinement await, not before.** The tab's occupant is captured twice
-   *   — `target` at :1601 (a pre-check for the P3 live-turn guard, read
-   *   before ANY await) and `currentOccupant`, re-read via
+   *   — `target` (captured via `const target = this.sessions.getByTabId
+   *   (tabId)`, a pre-check for the P3 live-turn guard, read before ANY
+   *   await) and `currentOccupant`, re-read via
    *   `sessions.getByTabId(tabId)` immediately before the dispose/
    *   `activeSessionId` comparison below, AFTER the confinement `await`
    *   (present whenever a workspace is open). Two concurrent same-tab loads
@@ -1660,10 +1662,8 @@ export class AcpBackend implements AgentBackend {
    *
    * NEVER throws to the caller (mirrors {@link openTab}'s fire-and-forget +
    * terminal-reply discipline): `loadSessionIntoTab`'s own early-return
-   * branches ALL emit a terminal signal now (CF-14 fix — corrects this doc's
-   * former FALSE claim that every branch already did; no live client and cwd
-   * outside the workspace used to only log and silently return, an ARCH-1-
-   * banned no-op). No live client and cwd outside the workspace each fire
+   * branches ALL emit a terminal signal now (CF-14 fix). No live client and
+   * cwd outside the workspace each fire
    * `tab.error{kind:'open-failed'}` (mirrors {@link openTabInternal}'s
    * identical no-client shape — the initial bind never succeeded); target
    * tab busy fires the session-scoped `error` against the tab's current
@@ -1686,7 +1686,7 @@ export class AcpBackend implements AgentBackend {
    * CF-01/L3-1 (closes the C1/W6-FB/W6-FG cross-tab race family's
    * generator): the tail-wrapped ENTRY — BOTH callers (`invokeControl`'s
    * `session.load` branch and `loadTab`/`tab.load`, via the SAME injected
-   * `ControlDispatcherHostPort.loadSessionIntoTab` accessor, :436) reach the
+   * `ControlDispatcherHostPort.loadSessionIntoTab` accessor) reach the
    * real body exclusively through this method, so wrapping HERE — once —
    * covers both entry points, exactly mirroring how {@link openTab} wraps
    * {@link openTabInternal}. Chains onto the SAME `inFlightStart` tail
@@ -1726,7 +1726,9 @@ export class AcpBackend implements AgentBackend {
    *
    * `activeSessionId` is cleared, never restored to the prior occupant it
    * displaced (T24 Case A/B) — that prior occupant's controller was already
-   * closed at the pre-load `currentOccupant` check (:1746), so restoring its
+   * closed via the pre-load `currentOccupant` re-read (`const
+   * currentOccupant = this.sessions.getByTabId(tabId);`, in
+   * `loadSessionIntoTabInternal`), so restoring its
    * id would only point at a disposed session; `undefined` (an honest "no
    * active session") is the only correct unwind target.
    */
@@ -1814,13 +1816,14 @@ export class AcpBackend implements AgentBackend {
 
     // C1 (independent concurrency review, W4-T5a fix pass): re-read the
     // tab's occupant HERE, after the confinement await above — `target`
-    // (captured before that await, :1601) can be STALE by now: a concurrent
+    // (captured before that await, via `const target = this.sessions
+    // .getByTabId(tabId)` above) can be STALE by now: a concurrent
     // same-tab load that resumed first has already closed `target` and
     // minted its OWN controller in its place. Disposing/comparing against
     // the stale `target` would silently no-op the close (the registry no
     // longer holds it) and leak the racing controller forever — the actual
     // bug this re-read fixes. When `roots.length === 0` above, there is no
-    // await between :1601 and here, so `currentOccupant` is always
+    // await between that capture and here, so `currentOccupant` is always
     // IDENTICAL to `target` and this is a no-op for that branch.
     const currentOccupant = this.sessions.getByTabId(tabId);
 
@@ -1859,7 +1862,8 @@ export class AcpBackend implements AgentBackend {
     // WS-R4 F3-7: captured so a FAILED load can unwind the cwd this
     // adoption is about to overwrite. activeSessionId is NOT captured for
     // restore — when the adoption fires because the active session was this
-    // tab's occupant, that occupant was closed above (:1746); restoring its
+    // tab's occupant, that occupant was closed above (see the
+    // `currentOccupant` close a few lines up); restoring its
     // id would point at a disposed session, so the unwind clears to
     // undefined instead (an honest "no active session").
     const priorCwd = this.cwd;
@@ -1936,7 +1940,8 @@ export class AcpBackend implements AgentBackend {
     if (!this.connectionSupervisor.getClient()) {
       // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the switch
       // below and used to skip its unwind): unwind the identity THIS failed
-      // load adopted pre-load (:1769-1772) via the shared FI-03 helper
+      // load adopted pre-load (the adoption's `this.activeSessionId =
+      // sessionId; this.cwd = adoptedCwd;` assignment above) via the shared FI-03 helper
       // (`close: true` — the session is still registered here).
       this.unwindFailedLoadIdentity(sessionId, controller, priorCwd, true);
       this.emitter.fire({
@@ -1988,7 +1993,8 @@ export class AcpBackend implements AgentBackend {
       // the next queued link.
       // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the switch
       // below and used to skip its unwind): unwind the identity THIS failed
-      // load adopted pre-load (:1769-1772) via the shared FI-03 helper
+      // load adopted pre-load (the adoption's `this.activeSessionId =
+      // sessionId; this.cwd = adoptedCwd;` assignment above) via the shared FI-03 helper
       // (`close: true` — the session is still registered here).
       this.unwindFailedLoadIdentity(sessionId, controller, priorCwd, true);
       this.emitter.fire({
@@ -2007,8 +2013,10 @@ export class AcpBackend implements AgentBackend {
       case 'loaded':
         return outcome.result;
       case 'superseded':
-        // §3.4 (reviewed decision, THIS caller only): the :1240-equivalent
-        // data-bearing arm (a genuine success that raced a newer supersede)
+        // §3.4 (reviewed decision, THIS caller only): `SessionController
+        // .loadReplayOutcome`'s data-bearing superseded arm (`if (this.replay
+        // !== replay) return { kind: 'superseded', result };`, a genuine
+        // success that raced a newer supersede)
         // keeps today's silent-success behavior — returning `outcome.result`
         // reproduces exactly what the deleted `loadReplay` adapter did for
         // this arm (audit-A-3-pinned by Task 19's pin 6, re-verified below).

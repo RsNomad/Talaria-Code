@@ -1821,7 +1821,7 @@ export class SetupController {
     const force = bool(params, 'force');
     try {
       const result = await reconnect(force === true ? { force: true } : undefined);
-      this.bumpStatus(); // handleRecheck's single completion-fire posture (:2069-2073)
+      this.bumpStatus(); // mirrors handleRecheck's own single completion-fire posture (see that method's T7 doc, above)
       return result;
     } catch (err) {
       this.bumpStatus();

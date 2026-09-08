@@ -467,13 +467,15 @@ export class ConnectionSupervisor {
       // its own doc); no `await` sits between this check and the write below,
       // so the check-then-write stays atomic.
       if (!this.isDisposed()) this.acpState = 'idle';
-      // CF-01/I-1: mirrors `handleAcpCrash`'s own arch-A2 guard (:856-857) —
-      // a connect-phase failure must dispose+clear the zombie client the
-      // same way a post-connection crash does. Without this, the
-      // assignment at :221 survives the failure: `getClient()` keeps
-      // returning a client whose transport is dead, so a later `openTab`
-      // calls `newSession()` on it and NEVER settles — wedging
-      // `inFlightStart` forever behind a permanent "reconnecting…" banner.
+      // CF-01/I-1: mirrors `handleAcpCrash`'s own arch-A2 guard (the guarded
+      // `this.clientExitSub?.dispose()` try/catch at that method's top) — a
+      // connect-phase failure must dispose+clear the zombie client the same
+      // way a post-connection crash does. Without this, the `this.client =
+      // this.port.createClient(...)` assignment survives the failure:
+      // `getClient()` keeps returning a client whose transport is dead, so a
+      // later `openTab` calls `newSession()` on it and NEVER settles —
+      // wedging `inFlightStart` forever behind a permanent "reconnecting…"
+      // banner.
       this.client?.dispose();
       this.client = undefined;
       // T-B1 (closes V-8): a connect-phase failure must become a VISIBLE
@@ -606,8 +608,10 @@ export class ConnectionSupervisor {
       // fires exactly once, here, after `recoverSessions` genuinely settles.
       //
       // WS-R3 F3-2: guarded on acpState — mirrors the sibling system.error
-      // guard at :565; a crash during recoverSessions has already flipped
-      // state via handleAcpCrash, which runs synchronously on exit.
+      // guard inside `establishInitialSession`'s establish-deadline branch
+      // (the `if (this.acpState !== 'respawning')` check there); a crash
+      // during recoverSessions has already flipped state via handleAcpCrash,
+      // which runs synchronously on exit.
       if (this.acpState !== 'respawning') {
         this.port.emit({ type: 'system.recovered' });
       }
@@ -661,8 +665,9 @@ export class ConnectionSupervisor {
         // two indistinguishable to ITS caller (the un-jam contract is
         // identical), so this method tells them apart the same way
         // `startInternal`'s own `wasRespawning` capture does:
-        // `handleAcpCrash` (the connection-phase :232 `onExit`
-        // subscription, independent of this race) fires SYNCHRONOUSLY on
+        // `handleAcpCrash` (wired via `this.clientExitSub = client.onExit
+        // (...)` in this same connection phase, independent of this race)
+        // fires SYNCHRONOUSLY on
         // exit and unconditionally flips `acpState` to 'respawning' as its
         // LAST act — so if we're still 'ready' here, nobody has bannered
         // this outage yet (the deadline case; the exit case's own banner +
@@ -742,15 +747,11 @@ export class ConnectionSupervisor {
    * technically overlap a recovery in flight, but that is a per-session-turn
    * concern, not a topology-identity one — out of this task's scope).
    *
-   * W6-FG (doc-honesty fix, HISTORICAL — the race this originally described,
-   * now closed by CF-01/L3-1 above): a prior revision of this comment
-   * overclaimed `tab.load`/`sendPrompt` were ALSO "queued behind the same
-   * tail"; they were NOT. `loadTab` (the `tab.load` wire entry) was
-   * fire-and-forget — it awaited `AcpBackend.loadSessionIntoTab` directly,
-   * with no `inFlightStart` chaining at all. It COULD genuinely interleave
-   * with a still-in-flight recovery here; see {@link recoverOneSession}'s own
-   * doc for the race this created (a same-`sessionId` `tab.load` winning the
-   * registry slot mid-recovery) and its identity-guarded close.
+   * W6-FG (doc-honesty note, superseded by CF-01/L3-1 above): `loadTab` used
+   * to be fire-and-forget and could interleave with an in-flight recovery —
+   * see {@link recoverOneSession}'s own doc for the race this used to create
+   * (a same-`sessionId` `tab.load` winning the registry slot mid-recovery)
+   * and its identity-guarded close, kept in place as redundancy.
    *
    * T5 (UI I-2 / Q2, owner-ratified — REVERSES the paragraph this replaces;
    * see `remediation-architecture.md` §2 for the full argument): the prior
@@ -1230,8 +1231,10 @@ export class ConnectionSupervisor {
    *    an outage respawn, or a disposed supervisor);
    *  - any live turn → refusal (a reconnect must never kill a running turn).
    * On startInternal rejection: same stay-in-outage posture as a failed
-   * scheduled respawn attempt (:1129-1131) — hand the outage to the existing
-   * backoff machinery AND refuse honestly, so a failed reconnect still heals.
+   * scheduled respawn attempt (the `acpState = 'respawning'` + reschedule
+   * inside `scheduleAcpRespawn`'s own timer callback) — hand the outage to
+   * the existing backoff machinery AND refuse honestly, so a failed
+   * reconnect still heals.
    *
    * WS-R3 F3-4: wedge-break — a turn whose cancel force-end deadline already
    * fired has hasLiveTurn() false (WS-R1 routed the force-end through

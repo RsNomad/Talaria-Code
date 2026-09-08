@@ -74,9 +74,8 @@ import { extractPreviewFiles } from '../../preview/extractPreviewFiles';
  * `homedir()` (path canonicalization) — both real, load-bearing, and
  * deliberately NOT ripped out (that would be a behavior change, not a
  * grading fix). "Vscode-free" and "deterministic" are two different
- * guarantees; this class only ever held the first one, and the class doc
- * used to say "pure" as if it held both — that overstatement is what this
- * note corrects. `session/` is mechanically scanned at the HEADLESS tier by
+ * guarantees; this class holds only the first one. `session/` is
+ * mechanically scanned at the HEADLESS tier by
  * `policyAcpPurity.test.ts`'s session/ extension (no `vscode`, no `fs`;
  * `Date.now()`/`homedir()` are the sanctioned headless seams).
  *
@@ -98,9 +97,10 @@ export type LoadReplayOutcome =
   | { kind: 'no-client' }
   | { kind: 'load-failed'; message: string }
   | { kind: 'not-found' }
-  /** Empty for the :1203/:1226/:1269 supersede arms; carries the real result
-   *  for :1240's success-but-superseded arm — callers today treat that one
-   *  as SUCCESS, and the adapter preserves exactly that. */
+  /** Empty for `loadReplayOutcome`'s supersede arms (~1483/~1502/~1536);
+   *  carries the real result for its success-but-superseded arm (~1507) —
+   *  callers today treat that one as SUCCESS, and the adapter preserves
+   *  exactly that. */
   | { kind: 'superseded'; result?: AcpLoadSessionResult };
 
 export class SessionController {
@@ -133,7 +133,8 @@ export class SessionController {
    * turn end). The record: (a) makes the force-end queryable (wasForceEnded —
    * WS-R3's reconnect wedge-break evidence), and (b) documents WHY the
    * belated genuine settlement is dropped — forceEndCancelledTurn clears
-   * currentTurnId/turn, so runTurn's own :1021/:1042 guards discard it.
+   * currentTurnId/turn, so runTurn's own `this.currentTurnId !== turnId`
+   * guards (~1273/~1294) discard it.
    */
   private readonly forceEndedTurnIds = new Set<string>();
 
@@ -148,7 +149,8 @@ export class SessionController {
    * A failed re-assert (`pinWireModeDefault`'s catch) now seeds this field
    * with the RAW drifted mode id Hermes reported — not guaranteed to be one
    * of our own `AgentMode` literals — so `runTurn`'s `!== 'default'` re-pin
-   * check (~:894, this field's ONLY reader in the file — grep-confirmed) can
+   * check (the `if (this.currentMode !== 'default')` guard near that
+   * method's top, this field's ONLY reader in the file — grep-confirmed) can
    * actually detect the drift, instead of the field staying permanently
    * `'default'` (its only other assignments) and that check being dead code.
    */
@@ -274,7 +276,7 @@ export class SessionController {
    * `AcpBackend.pinWireModeDefault` — F4 (the pin is per-controller now).
    *
    * CF-01/I-2 (W1-T3): this is the ONE place both call sites reach —
-   * `loadReplayOutcome` (~:1123) and `AcpBackend.openSession` (~:754) — so
+   * `loadReplayOutcome` and `AcpBackend.openSession` — so
    * catching `setSessionMode`'s rejection HERE closes both by construction,
    * with no duplicated try/catch at either await. Before this fix, a
    * rejection propagated out of `loadReplayOutcome` (falsifying its documented
@@ -298,7 +300,8 @@ export class SessionController {
    * (init, this method's own success tail below, `runTurn`'s own re-pin
    * success) — so "left untouched" meant it silently STAYED `'default'` even
    * though the session is still non-default server-side, and `runTurn`'s
-   * `!== 'default'` check (~:894) could then NEVER fire. That "backstop" was
+   * `!== 'default'` check (that method's own guard, near its top) could then
+   * NEVER fire. That "backstop" was
    * unreachable dead code, not a safeguard — a drifted `accept_edits`
    * session could take a prompt with Hermes auto-applying edits (no
    * `request_permission`), our whole out-of-process approval gate silently
@@ -309,7 +312,8 @@ export class SessionController {
    * field's type widened from `AgentMode` to `string` — see its own doc).
    * That makes `runTurn`'s check a REAL backstop: it forces a genuine re-pin
    * attempt on the session's next turn; if THAT re-pin also fails,
-   * `runTurn`'s own try/catch (~:943) aborts the turn with an honest
+   * `runTurn`'s own try/catch (wrapping that method's entire body) aborts
+   * the turn with an honest
    * `error` — `client.prompt` is never reached. A degraded pin can
    * therefore delay a prompt (one failed-then-retried re-pin) or abort it
    * outright — it can never let one through silently un-pinned.
@@ -634,7 +638,8 @@ export class SessionController {
    * any straggler approvals, emits turn.end{cancelled} and takes the
    * after-turn snapshot — the SAME terminal machinery a genuine end uses.
    * Clearing currentTurnId/turn afterwards makes the belated genuine prompt
-   * settlement drop at runTurn's existing guards (:1021/:1042) — no
+   * settlement drop at runTurn's existing `this.currentTurnId !== turnId`
+   * guards (~1273/~1294) — no
    * duplicate turn.end, no stale result.summary (idempotence, §3.1 step 5).
    */
   private forceEndCancelledTurn(turnId: string): void {
@@ -1090,8 +1095,9 @@ export class SessionController {
     approvalId: string,
   ): Promise<AcpRequestPermissionResponse> {
     // BF-B belt-and-suspenders: the sole registration point into
-    // `pendingApprovals` — guarded independently of the :466 re-check above
-    // so ANY future caller of this method (not just today's one call site)
+    // `pendingApprovals` — guarded independently of the disposed re-check in
+    // `handlePermission` (`if (this.disposed) return buildCancelledOutcome();`,
+    // above) so ANY future caller of this method (not just today's one call site)
     // can never register a fresh approval into a disposed controller.
     if (this.disposed) return Promise.resolve(buildCancelledOutcome());
 
@@ -1519,7 +1525,8 @@ export class SessionController {
     await this.pinWireModeDefault(result.currentModeId);
     // I-2 (W1-T3 review, Important fix; re-review fix2 added `|| this.
     // disposed`): recheck for a superseding `loadReplayOutcome` call AFTER this await —
-    // the guard just above (~:1180) only covers the `client.loadSession`
+    // the `if (this.replay !== replay) return { kind: 'superseded', result };`
+    // guard just above only covers the `client.loadSession`
     // await; `pinWireModeDefault` is a SEPARATE suspension point with no
     // recheck of its own before this fix. THIS call reset `this.replay` to
     // `undefined` two lines above; a non-undefined value at this point can
@@ -1663,7 +1670,7 @@ export class SessionController {
     // future direct `dispose()` of a live-turn controller would otherwise
     // leave `currentTurnId`/`turn` set, and a belated `runTurn` continuation
     // would only be stopped by ITS `if (this.currentTurnId !== turnId ||
-    // !this.turn) return;` guard (:603) by ACCIDENT (a turnId mismatch),
+    // !this.turn) return;` guard by ACCIDENT (a turnId mismatch),
     // not by design.
     this.currentTurnId = undefined;
     this.turn = undefined;
