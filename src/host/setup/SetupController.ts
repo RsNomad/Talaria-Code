@@ -13,6 +13,7 @@ import type { CatalogModel, CatalogRole } from './modelCatalog';
 import type { LlamaCppLocateResult } from './llamaCppLocator';
 import type { GgufDestResult } from './modelStore';
 import type { GgufStoreSpec } from './ggufIngest';
+import type { GgufIngestSpec } from './ggufIngestSpec';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import { createMutationGate, type MutationGate } from '../util/mutationGate';
 import { LatchRegistry, SETUP_DISPOSED_REFUSAL } from './latchRegistry';
@@ -251,26 +252,12 @@ export interface SetupControllerRegistry {
 }
 
 /**
- * T13 (beta.5 §4.4.3d): what the controller hands the T14 ingest engine —
- * ALWAYS the registry-pinned artifact (`NEXT_DEDICATED_MODEL.gguf` +
- * `ollamaCreatedName`), never anything webview-derived. The engine's own
- * io/fs/fetch seams are bound in `setupHost.vscode.ts`, NOT passed here.
+ * WS-F8 F8-3 (FI-17): moved to its own leaf so the FROZEN `ggufIngest.ts`
+ * (which imports it from `'./SetupController'`) no longer depends on this
+ * god-file for its own type — re-exported here (type-only, erased at
+ * compile time) so that frozen import line keeps resolving unchanged.
  */
-export interface GgufIngestSpec {
-  gguf: {
-    hfRepo: string;
-    file: string;
-    quant: string;
-    sha256: string;
-    approxBytes: number;
-    /** T3 (beta.6 §2.4): optional — meaningful only in `pinned` mode (the
-     *  pinned llama.cpp/Ollama path passes it for `verifyHfDigest`'s exact-
-     *  file-set check upstream of `ingestGguf`; `live-oid` mode passes
-     *  none, since nothing else in the repo is ever read for that file). */
-    allowedRepoFiles?: readonly string[];
-  };
-  ollamaCreatedName: string;
-}
+export type { GgufIngestSpec } from './ggufIngestSpec';
 
 export interface SetupControllerDeps {
   /** Bound to its real `ExecLookup` by the caller. Can REJECT — always try/catch this (T4 M-2).

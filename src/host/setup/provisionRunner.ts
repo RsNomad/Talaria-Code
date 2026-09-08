@@ -29,6 +29,26 @@ import type { SetupProgress } from '../../shared/protocol';
 import { errorMessage } from '../../shared/errorMessage';
 import type { SetupControllerDeps } from './SetupController';
 
+/**
+ * WS-F8 F8-3 (FI-17): the Interface-Segregation narrowing of {@link
+ * SetupControllerDeps} to EXACTLY the 7 members {@link ProvisionRunner}'s
+ * body reads off `this.deps` (grep-confirmed: `registry`, `verifyHfDigest`,
+ * `ingestGguf`, `resolveLfsOid`, `checkedStoreDest`, `downloadGgufToStore`,
+ * `pullModel` — not more, not fewer). `SetupController` still constructs
+ * `new ProvisionRunner(this.deps, …)` unchanged: the full `SetupControllerDeps`
+ * it holds structurally satisfies this narrower Pick.
+ */
+export type ProvisionDeps = Pick<
+  SetupControllerDeps,
+  | 'checkedStoreDest'
+  | 'downloadGgufToStore'
+  | 'ingestGguf'
+  | 'pullModel'
+  | 'registry'
+  | 'resolveLfsOid'
+  | 'verifyHfDigest'
+>;
+
 /** The seam {@link ProvisionRunner} reaches the host/façade through — the
  *  same four operations `SetupController` itself performs, narrowed to what
  *  the provision/pull family needs (never the full {@link SetupHost}). */
@@ -256,7 +276,7 @@ function composeLlamacppDownloadModal(
 export class ProvisionRunner {
   constructor(
     private readonly port: ProvisionRunnerPort,
-    private readonly deps: SetupControllerDeps,
+    private readonly deps: ProvisionDeps,
     private readonly latches: LatchRegistry,
   ) {}
 
