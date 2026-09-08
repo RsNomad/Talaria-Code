@@ -1398,6 +1398,26 @@ export class SessionController {
   // --- session/load replay ----------------------------------------------------
 
   /**
+   * FI-03 (WS-F7 F7-3a): the replay-fail emit+cleanup shared by
+   * `loadReplayOutcome`'s two failure exits (load-failed, not-found). Call
+   * ONLY AFTER the caller's own `this.replay !== replay` supersede-recheck
+   * has passed — that recheck stays INLINE at each call site (it determines
+   * the differing return: `{ kind: 'superseded' }` for both failure exits,
+   * vs the success exit's data-bearing `{ kind: 'superseded', result }`),
+   * and it must read `this.replay` FRESH after the `client.loadSession`
+   * await, which only the call site can do. ⚠ [CONC]: this method itself is
+   * synchronous (no `await`) — the recheck→emitReplayFailure→return sequence
+   * at each call site is one uninterrupted critical section.
+   */
+  private emitReplayFailure(replay: ReplayTranslator, sessionId: string, message: string): void {
+    this.subagents.setReplaying(false);
+    this.replay = undefined;
+    this.port.emit({ type: 'error', sessionId, message, turnId: replay.currentTurnId });
+    this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
+    this.markSubagentsInterrupted();
+  }
+
+  /**
    * The session-scoped body of a History-panel load, moved off
    * `AcpBackend.loadSession` — called by the router
    * (`AcpBackend.loadSessionIntoTab`) AFTER it has: verified a live client
@@ -1461,11 +1481,7 @@ export class SessionController {
       result = await client.loadSession(rawCwd, sessionId, mcpServers);
     } catch (err) {
       if (this.replay !== replay) return { kind: 'superseded' };
-      this.subagents.setReplaying(false);
-      this.replay = undefined;
-      this.port.emit({ type: 'error', sessionId, message: errorMessage(err), turnId: replay.currentTurnId });
-      this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
-      this.markSubagentsInterrupted();
+      this.emitReplayFailure(replay, sessionId, errorMessage(err));
       return { kind: 'load-failed', message: errorMessage(err) };
     }
 
@@ -1484,16 +1500,7 @@ export class SessionController {
     // since that tab is already bound.
     if (!result.found) {
       if (this.replay !== replay) return { kind: 'superseded' }; // superseded while awaiting
-      this.subagents.setReplaying(false);
-      this.replay = undefined;
-      this.port.emit({
-        type: 'error',
-        sessionId,
-        message: 'That conversation no longer exists on the agent. Start a new chat.',
-        turnId: replay.currentTurnId,
-      });
-      this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
-      this.markSubagentsInterrupted();
+      this.emitReplayFailure(replay, sessionId, 'That conversation no longer exists on the agent. Start a new chat.');
       return { kind: 'not-found' };
     }
 

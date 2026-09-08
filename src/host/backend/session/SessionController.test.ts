@@ -1988,6 +1988,51 @@ describe('WS-R4 characterization — the SIX loadReplayOutcome arms (REMEDIATION
     expect('result' in outcome).toBe(false);
     expect(emitted.filter((m) => m.type === 'turn.end' && m.status === 'complete')).toHaveLength(0);
   });
+
+  // FI-03 (WS-F7 F7-3a gap-fill): the "superseded-mid-await (empty)" arm
+  // above drives the supersede recheck through the `!result.found` branch
+  // only (`resolveLoad(0, { found: false })`). The CATCH branch
+  // (`client.loadSession` rejecting) shares the SAME inline recheck
+  // (`if (this.replay !== replay) return { kind: 'superseded' };`) but was
+  // never independently pinned — added so the F7-3a `emitReplayFailure`
+  // extraction cannot silently drop THIS exit's own supersede guard.
+  it('ARM superseded-mid-await via REJECT (catch branch): a superseded load whose loadSession REJECTS resolves bare {kind:"superseded"} SILENTLY (no error emit, no turn.end)', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const loser = controller.loadReplayOutcome('/fake/ws', 'session-A', '/fake/ws', []);
+    void controller.loadReplayOutcome('/fake/ws', 'session-B', '/fake/ws', []); // supersedes on the SAME instance (T1a reuse)
+    const emissionsBefore = emitted.length;
+    client.rejectLoad(0, new Error('load boom')); // the LOSER's rejection
+    const outcome = await loser;
+    expect(outcome).toEqual({ kind: 'superseded' });
+    expect('result' in outcome).toBe(false);
+    expect(emitted).toHaveLength(emissionsBefore); // strict silence — emitReplayFailure never ran
+  });
+
+  // FI-03 (WS-F7 F7-3a gap-fill): `emitReplayFailure`'s `this.replay =
+  // undefined` postcondition is not directly observable in the returned
+  // union or the emissions from the SAME call. Pin it via a SUBSEQUENT
+  // `endForRestart()` on the same controller: if the failure path left
+  // `this.replay` truthy, `endTurnBracket`'s replay arm would fire a SECOND,
+  // stale `turn.end` for a turn that already closed with status:'error'.
+  it("load-failed clears `this.replay` — a later endForRestart() finds nothing left to unwind (no second, stale turn.end)", async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    client.rejectLoad(0, new Error('load boom'));
+    await load;
+    const turnEndsBefore = emitted.filter((m) => m.type === 'turn.end').length;
+    controller.endForRestart();
+    expect(emitted.filter((m) => m.type === 'turn.end')).toHaveLength(turnEndsBefore);
+  });
+
+  it("not-found clears `this.replay` — a later endForRestart() finds nothing left to unwind (no second, stale turn.end)", async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    client.resolveLoad(0, { found: false });
+    await load;
+    const turnEndsBefore = emitted.filter((m) => m.type === 'turn.end').length;
+    controller.endForRestart();
+    expect(emitted.filter((m) => m.type === 'turn.end')).toHaveLength(turnEndsBefore);
+  });
 });
 
 /**
