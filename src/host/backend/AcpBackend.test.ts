@@ -5110,6 +5110,89 @@ describe('F3-7-S — sibling identity-unwind (TI-5 short-circuit + settleRace ti
   });
 });
 
+/**
+ * FI-03 (WS-F7 F7-3b gap-fill, characterization-first for the
+ * `unwindFailedLoadIdentity` extraction): the describe blocks above pin
+ * close-or-not/reset-or-not/emit-or-not for all three identity-unwind exits
+ * via activeSessionId "ACTIVE tab" vs "NON-active tab" scenarios — but none
+ * pins (a) that the SWITCH's flat-guard arm (branch 3, no close at all) is
+ * actually distinct from the two sibling short-circuits (branch 1/2, which
+ * DO close), or (b) the registry-match-BEFORE-close ORDER itself: that a
+ * stale failed load's own `controller` reference, once superseded in the
+ * registry by a fresh one under the SAME sessionId, must never have its
+ * `sessions.close()` fire against the FRESH occupant. Both gaps are closed
+ * here, characterizing the pre-extraction inline code so the extraction
+ * (`unwindFailedLoadIdentity(..., close)`) has a faithful-move proof.
+ */
+describe('FI-03 (WS-F7 F7-3b gap-fill): unwindFailedLoadIdentity close-flag + registry-match-before-close ORDER', () => {
+  it('switch-fail path (branch 3, not-found) never closes the controller — unlike the two sibling short-circuits, this arm has NO `sessions.close` call', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID
+    // Resolves quickly with found:false -> reaches the SWITCH's 'not-found'
+    // arm directly (not the TI-5 no-client short-circuit, not the settleRace
+    // timeout — both of THOSE close; this one must not).
+    must(clients[0]).setLoadSessionResult({ found: false });
+    await backend.loadTab(BOOTSTRAP_TAB_ID, 'session-ghost', '/fake/ws');
+    expect(hasController(backend, 'session-ghost')).toBe(true);
+  });
+
+  it('a superseding controller for the SAME sessionId is NEVER closed by a stale settleRace-timeout unwind (registry-match is evaluated BEFORE close, not after)', async () => {
+    const { backend, clients } = makeStartableBackend();
+    await backend.start(); // active = session-1 @ BOOTSTRAP_TAB_ID
+    must(clients[0]).hangLoadSession(); // this load never resolves -> falls through to the wall-clock deadline
+
+    const messages: HostToWebviewMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    vi.useFakeTimers();
+    try {
+      const loadPromise = backend.loadTab(BOOTSTRAP_TAB_ID, 'history-session', '/ws');
+      // Let loadSessionIntoTabInternal run synchronously through minting its
+      // controller and starting the settleRace deadline (no workspace
+      // folders configured -> no await before the mint, per the method's own
+      // C1 doc), then suspend on the still-hanging client.loadSession.
+      await flushMicrotasks();
+
+      // Simulate an independent op re-registering 'history-session' under a
+      // FRESH controller while the stale load is still hung — mirrors what
+      // `SessionRegistry.open`'s own W6-FB same-sessionId collision guard
+      // does for a real racing caller (remove-then-dispose-then-mint). The
+      // stale load's own local `controller` variable is now a dangling
+      // reference: a DIFFERENT object occupies the registry slot.
+      const registry = backend as unknown as {
+        sessions: {
+          open(id: string, cwd: string, port: unknown, tabId?: string): unknown;
+          get(id: string): unknown;
+        };
+        buildSessionPort(sessionId: string, cwd: string): unknown;
+      };
+      registry.sessions.open(
+        'history-session',
+        '/ws',
+        registry.buildSessionPort('history-session', '/ws'),
+        BOOTSTRAP_TAB_ID,
+      );
+      const freshController = registry.sessions.get('history-session');
+
+      await vi.advanceTimersByTimeAsync(120_000); // the STALE load's deadline fires
+      await loadPromise;
+
+      // The caller's OWN tab.error emit still fires unconditionally (outside
+      // the registry-match guard) —
+      expect(messages).toContainEqual(
+        expect.objectContaining({ type: 'tab.error', tabId: BOOTSTRAP_TAB_ID, kind: 'session-lost', reason: 'timeout' }),
+      );
+      // — but the registry-match guard must have found `controller !==
+      // freshController` and skipped `sessions.close()` entirely: the fresh
+      // controller stays registered, byte-identical reference, untouched.
+      expect(registry.sessions.get('history-session')).toBe(freshController);
+      expect(hasController(backend, 'history-session')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('beta.7 B1: loadTab threads the History title into tab.bound', () => {
   it('a titled load emits tab.bound carrying that title', async () => {
     const { backend, clients } = makeStartableBackend();

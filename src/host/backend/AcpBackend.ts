@@ -1708,6 +1708,42 @@ export class AcpBackend implements AgentBackend {
    * per call, at this outer entry, never re-entering the tail from within an
    * already-queued link.
    */
+  /**
+   * FI-03 (WS-F7 F7-3b): unwind the identity a FAILED load adopted pre-load
+   * (the `priorCwd` capture + `activeSessionId`), shared by
+   * `loadSessionIntoTabInternal`'s three failure exits. `close` says whether
+   * to also close the session registry entry: `true` for the two exits that
+   * sit BEFORE the switch below (the session is still registered there);
+   * `false` for the switch's fail-kinds arm (`loadReplayOutcome` already
+   * handled that lifecycle — its own arms emitted their own signal).
+   *
+   * ⚠ [CONC]/ORDER: the registry-match (`this.sessions.get(sessionId) ===
+   * controller`) is evaluated BEFORE `close()` deletes the map entry — do
+   * NOT reorder. `close()` must never run against a DIFFERENT (superseding)
+   * controller's entry; the registry-match guard is what stops that.
+   * Synchronous — no `await`. The caller emits its own `tab.error` (the
+   * reason/message differ per exit) AFTER calling this.
+   *
+   * `activeSessionId` is cleared, never restored to the prior occupant it
+   * displaced (T24 Case A/B) — that prior occupant's controller was already
+   * closed at the pre-load `currentOccupant` check (:1746), so restoring its
+   * id would only point at a disposed session; `undefined` (an honest "no
+   * active session") is the only correct unwind target.
+   */
+  private unwindFailedLoadIdentity(
+    sessionId: string,
+    controller: SessionController,
+    priorCwd: string | undefined,
+    close: boolean,
+  ): void {
+    if (this.sessions.get(sessionId) !== controller) return;
+    if (close) this.sessions.close(sessionId);
+    if (this.activeSessionId === sessionId) {
+      this.activeSessionId = undefined;
+      this.cwd = priorCwd;
+    }
+  }
+
   private async loadSessionIntoTab(
     sessionId: string,
     cwd: string,
@@ -1898,20 +1934,11 @@ export class AcpBackend implements AgentBackend {
     // (`tab.error{kind:'session-lost'}`, existing taxonomy, no new `kind`),
     // including its identical identity-guarded controller cleanup.
     if (!this.connectionSupervisor.getClient()) {
-      if (this.sessions.get(sessionId) === controller) {
-        this.sessions.close(sessionId);
-        // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the
-        // switch below and used to skip its unwind): unwind the identity
-        // THIS failed load adopted pre-load (:1769-1772). Same double guard
-        // as the switch's failure kinds (below) factored around the close —
-        // the registry leg above is evaluated BEFORE close() deletes the map
-        // entry, so it cannot be re-checked after; the activeSessionId leg
-        // nests inside it instead.
-        if (this.activeSessionId === sessionId) {
-          this.activeSessionId = undefined; // never restore: prior occupant closed at :1746 (T24 Case A/B)
-          this.cwd = priorCwd;
-        }
-      }
+      // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the switch
+      // below and used to skip its unwind): unwind the identity THIS failed
+      // load adopted pre-load (:1769-1772) via the shared FI-03 helper
+      // (`close: true` — the session is still registered here).
+      this.unwindFailedLoadIdentity(sessionId, controller, priorCwd, true);
       this.emitter.fire({
         type: 'tab.error',
         tabId,
@@ -1959,20 +1986,11 @@ export class AcpBackend implements AgentBackend {
       // (`tab.error{kind:'session-lost'}`, §7 B8) the recovery path's own
       // timeout uses, and — by returning — RELEASES the topology tail for
       // the next queued link.
-      if (this.sessions.get(sessionId) === controller) {
-        this.sessions.close(sessionId);
-        // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the
-        // switch below and used to skip its unwind): unwind the identity
-        // THIS failed load adopted pre-load (:1769-1772). Same double guard
-        // as the switch's failure kinds (below) factored around the close —
-        // the registry leg above is evaluated BEFORE close() deletes the map
-        // entry, so it cannot be re-checked after; the activeSessionId leg
-        // nests inside it instead.
-        if (this.activeSessionId === sessionId) {
-          this.activeSessionId = undefined; // never restore: prior occupant closed at :1746 (T24 Case A/B)
-          this.cwd = priorCwd;
-        }
-      }
+      // WS-R4 F3-7-S (sibling closure — this branch sits BEFORE the switch
+      // below and used to skip its unwind): unwind the identity THIS failed
+      // load adopted pre-load (:1769-1772) via the shared FI-03 helper
+      // (`close: true` — the session is still registered here).
+      this.unwindFailedLoadIdentity(sessionId, controller, priorCwd, true);
       this.emitter.fire({
         type: 'tab.error',
         tabId,
@@ -2019,18 +2037,12 @@ export class AcpBackend implements AgentBackend {
         // `undefined` produced for these three kinds.
         //
         // WS-R4 F3-7: unwind the identity THIS failed load adopted pre-load
-        // (above, at the `priorCwd` capture). Double identity guard (mirrors
-        // the two sibling failure exits above — the TI-5 no-client
-        // short-circuit and the settleRace timeout branch, WS-R4 F3-7-S —
-        // both nest this SAME `sessions.get(sessionId) === controller`
-        // registry guard plus the activeSessionId check around their own
-        // close) — it can only ever unwind state this exact failed load set.
-        // NEVER fires on 'superseded' (either arm): a superseding op owns
-        // identity.
-        if (this.sessions.get(sessionId) === controller && this.activeSessionId === sessionId) {
-          this.activeSessionId = undefined;
-          this.cwd = priorCwd;
-        }
+        // (above, at the `priorCwd` capture), via the shared FI-03 helper
+        // (`close: false` — the two sibling failure exits above, WS-R4
+        // F3-7-S, already handled the registry lifecycle for this failed
+        // load; this arm only ever unwinds `activeSessionId`/`cwd`). NEVER
+        // fires on 'superseded' (either arm): a superseding op owns identity.
+        this.unwindFailedLoadIdentity(sessionId, controller, priorCwd, false);
         return undefined;
     }
   }
