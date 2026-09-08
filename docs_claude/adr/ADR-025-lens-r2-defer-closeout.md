@@ -750,3 +750,31 @@ The ONLY logic change anywhere in the split: phase 1's two `return undefined;` g
 **Count discipline:** baseline (`b731176`, F6-7 HEAD, per ADR-025-AE's own after-count) = **348 test files passed, 7646 passed | 15 skipped (7661), tsc 0 (host + webview)**. Full-gate run after this task: **348 test files passed, 7646 passed | 15 skipped (7661), tsc 0 (host + webview).** Delta: 0 (pure extraction — no test was added, edited, or removed; `LanceDBStore.test.ts` is 0-EDIT).
 
 **★ FI-30 closed.** `hybridSearch` delegates to `resolveTable`/`buildPredicate`/`accountRows`/`attemptFtsRepairOnce` and reads as five named steps ending in `fuseHybridRows`. The vec-rejected-throws-loud / fts-rejected-degrades-silently split, the `ftsRepairAttempted` once-per-instance gate, and the combined dropped-row accounting into a single `warnMalformedRowsOnce` call are all byte-identical to the pre-fix behaviour — proven by the full `LanceDBStore.test.ts` suite (23 tests, including the FTS-degrade, repair-once ×2, and malformed-row tests) staying 0-EDIT and green, plus two live mutations (the repair-once gate and the vec-loud/fts-silent split) that were confirmed to flip the expected tests before being reverted. `resolveTable` returns `this.table` directly rather than via any cast, preserving the not-undefined narrowing across the caller's `await` by construction — no `as`-cast anywhere in the diff.
+
+## ADR-025-AG — WS-F6 (RAG pipeline cluster) complete (task F6-9, WS-F6 — LAST task of WS-F6, DOC-ONLY)
+
+**Outcome (task F6-9, WS-F6 closeout, DOC-ONLY):** WS-F6 (the RAG pipeline cluster, `src/rag/**`, design source **ADR-FSU-07**) is complete. F6-1 (`ADR-025-Y`) laid down the characterization-first golden kicking the workstream off; F6-2..F6-8 closed all 10 findings the FSU arch assigned this cluster; this task is the closing index — no production or test file changes, only this ADR entry.
+
+1. **Findings-closed index — task → finding(s) → ADR section.**
+
+   | Task | Finding(s) | ADR section |
+   |---|---|---|
+   | F6-2 | FI-42 | `ADR-025-Z` |
+   | F6-3 | FI-08 | `ADR-025-AA` |
+   | F6-4 | FI-18 | `ADR-025-AB` |
+   | F6-5 | FI-19 | `ADR-025-AC` |
+   | F6-6 | FI-20 + FI-31 | `ADR-025-AD` |
+   | F6-7 | FI-28 + FI-40 + FI-29 | `ADR-025-AE` |
+   | F6-8 | FI-30 | `ADR-025-AF` |
+
+   Ten findings total — FI-08, FI-18, FI-19, FI-20, FI-28, FI-29, FI-30, FI-31, FI-40, FI-42 — every one of the WS-F6 row's assignments in the FSU remediation arch's finding→workstream map (`.superpowers/plans/2026-09-06-lens-r2-fsu-remediation-arch.md:344-361`) now closed. F6-1 (kickoff golden) and this task (closeout) close no finding of their own.
+2. **Design source.** All seven fix tasks (F6-2..F6-8) implement **ADR-FSU-07** (`.superpowers/plans/2026-09-06-lens-r2-fsu-remediation-arch.md:76-80,307`) verbatim: the two-phase `reindexFiles` split with an explicit `pathState` hand-off (F6-3), ISP role contexts for `IndexerContext` (F6-4), the injected-logger seam reaching the chunker/parser/build-pipeline sinks (F6-6), and the embed batch size single-sourced on the `Embedder` (F6-7) are exactly the four design points that ADR row names; F6-2's dead-parameter removal, F6-5's `readMeta`/`readManifest` parity, and F6-8's `hybridSearch` step extraction are the arch's adjacent 🔵 nits folded into the same cluster.
+3. **FI-20 scope note — reaffirmed, not re-derived.** `ADR-025-AD` item 8 already records which `console.*` sinks in `src/` are deliberately OUT of FI-20's scope: `indexer.ts`'s own `logger` seam defaulting to `console.error` when a caller wires none (the default IS the seam, not a violation of it); `backendFactory.ts:42` and `nextedit/backend.ts:100`'s once-only user-facing warnings (F10-2's `OnceRegistry`, a user-notification concern, not log hygiene); `CheckpointTracker.ts`'s own `errCode()` classifier (already err.name/code-shaped); and `codebase-server.ts`'s MCP child-process stderr stream (not the extension host's log surface `readManifest`/`readMeta`/F6-6's five sites all write to). That note stands as the authoritative scope boundary for FI-20; this closeout does not narrow or widen it.
+4. **F6-1's golden — the WS-F6 contract, kept green.** `buildPipeline.order.test.ts` (`ADR-025-Y`) drove the real `reindexFiles` through F6-2..F6-8 with **zero edits** to any of its ordered-`calls`/`manifest` assertions, except the two changes `ADR-025-Y` itself pre-declared as acceptable: F6-2's fs-injection seam swap (`preloaded` map → `fs.readFile` mock, `ADR-025-Z` item 1 — plumbing only, no assertion touched) and F6-7's `batchSize: 64` fixture addition to `buildHarness`'s fake embedder (`ADR-025-AE` item 4(a) — the one forward-compatibility edit `ADR-025-Y` point 5 authorized in advance, preserving the pinned 64+6 two-batch split). Every other task (F6-3, F6-4, F6-5, F6-6, F6-8) left this file at 0-EDIT.
+5. **Final gate count and HEAD.** Baseline going into this task = `be32b9b` (F6-8 HEAD, per `ADR-025-AF`'s own after-count): **348 test files passed, 7646 passed | 15 skipped (7661), tsc 0 (host + webview)**. This task changes only this ADR file — no production file, no test file — so the full-gate run after this commit reproduces the identical count: **348 test files passed, 7646 passed | 15 skipped (7661), tsc 0 (host + webview).** Delta: none, as expected for a doc-only closeout. This commit becomes the new WS-F6-closed HEAD on `fix/lens-r2-bh05-approval-diff`.
+
+**Frozen-zone check.** No frozen files touched — no production or test file of any kind touched by this task.
+
+**Byte-scan:** `ADR-025-lens-r2-defer-closeout.md` (this file, the one file this task edits) — NUL: 0, U+2028: 0, U+2029: 0.
+
+**★ WS-F6 CLOSED.** All nine tasks (F6-1 kickoff/golden through F6-9 this closeout) are done; `src/rag/**`'s `reindexFiles` two-phase split, ISP role contexts, injected-logger seam, and embedder-owned batch size (ADR-FSU-07) are all in place, and the 10 findings FI-08/18/19/20/28/29/30/31/40/42 are closed per the index above. The F6-1 golden (`buildPipeline.order.test.ts`) is the workstream's kept contract, 0-edit except its two pre-declared exceptions. Gate: 7646 passed | 15 skipped (7661), tsc 0 (host + webview) — unchanged by this doc-only task.
