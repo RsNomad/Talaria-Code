@@ -435,31 +435,79 @@ export class LanceDBStore implements VectorStore {
     return result;
   }
 
+  /**
+   * FI-30: `hybridSearch`'s table-resolution step. CF-04: the table may have
+   * appeared since `init()` (or since the previous query) — one bounded
+   * attempt to pick it up before giving up. Returns the non-null table
+   * directly rather than leaving the caller to re-read `this.table`: a fresh
+   * local bound to this method's own declared return type carries the
+   * not-undefined narrowing across the caller's later `await` by
+   * construction (`this.table` is a mutable field; narrowing on `this.x`
+   * does not persist across an `await` point).
+   */
+  private async resolveTable(): Promise<lancedb.Table> {
+    if (!this.table) {
+      await this.tryReopenTable();
+    }
+    if (!this.table) {
+      throw new IndexNotReadyError();
+    }
+    return this.table;
+  }
+
+  /**
+   * FI-30: `hybridSearch`'s predicate-building step. `language` is pushed
+   * down as SQL when the caller filters on it; `'true'` (match everything)
+   * otherwise.
+   */
+  private buildPredicate(filter?: SearchFilter): string {
+    return filter?.language ? `language = '${escapeSqlLiteral(filter.language)}'` : 'true';
+  }
+
+  /**
+   * FI-30 / WS-BG: `hybridSearch`'s per-leg row-accounting step — filters a
+   * raw query-leg result to well-formed rows and reports how many were
+   * dropped, so the caller can sum both legs' drops into a single
+   * `warnMalformedRowsOnce` call.
+   */
+  private accountRows(raw: unknown[]): { rows: StoredRow[]; dropped: number } {
+    const rows = raw.filter(isStoredRow);
+    return { rows, dropped: raw.length - rows.length };
+  }
+
+  /**
+   * FI-30 / V-16 RAG-FTS-BLAST: `hybridSearch`'s one-shot FTS repair step.
+   * Degrade-visibly-not-silently: log once per store instance (not once per
+   * search — a broken FTS index would otherwise spam the log on every
+   * subsequent query), then attempt a one-shot, fire-and-forget self-heal so
+   * a transient first-build failure (`upsert()`'s `createIndex` catch) can
+   * repair itself for later searches. The caller gates this call on
+   * `!this.ftsRepairAttempted`, so the log line and the repair attempt each
+   * fire at most once per store instance.
+   */
+  private attemptFtsRepairOnce(table: lancedb.Table, reason: unknown): void {
+    this.ftsRepairAttempted = true;
+    this.log(
+      `hermes-codebase: sparse (FTS) search failed — degrading to vector-only results for this and future searches; attempting a one-time index repair: ${reason instanceof Error ? reason.name : 'unknown'}`,
+    );
+    void table.createIndex('content', { config: lancedb.Index.fts() }).catch((err: unknown) => {
+      this.log(`hermes-codebase: FTS index repair attempt failed: ${err instanceof Error ? err.name : 'unknown'}`);
+    });
+  }
+
   async hybridSearch(
     queryText: string,
     queryVector: number[],
     k: number,
     filter?: SearchFilter,
   ): Promise<SearchHit[]> {
-    if (!this.table) {
-      // CF-04: the table may have appeared since `init()` (or since the
-      // previous query) — one bounded attempt to pick it up before giving up.
-      await this.tryReopenTable();
-    }
-    if (!this.table) {
-      throw new IndexNotReadyError();
-    }
+    const table = await this.resolveTable();
 
     // Overfetch: `language` is pushed down as SQL, but `path_globs` is
     // applied downstream (src/mcp/pathGlob.ts) after fusion, so fetch extra
     // candidates to leave headroom for that later filter.
     const candidateLimit = Math.max(k * 3, 50);
-    const predicate = filter?.language ? `language = '${escapeSqlLiteral(filter.language)}'` : 'true';
-    // Captured into a local so TypeScript keeps the not-undefined narrowing
-    // from the guard above across the `await` below (`this.table` is a
-    // mutable field; narrowing on `this.x` does not persist across an
-    // `await` point).
-    const table = this.table;
+    const predicate = this.buildPredicate(filter);
 
     // V-16 RAG-FTS-BLAST: the dense (vector) and sparse (FTS) legs are
     // INDEPENDENT outcomes — MDN documents `Promise.allSettled` as the tool
@@ -489,32 +537,17 @@ export class LanceDBStore implements VectorStore {
       // — never silently degraded like the FTS leg below.
       throw vecOutcome.reason;
     }
-    const vecRaw: unknown[] = vecOutcome.value;
-    const vecRows = vecRaw.filter(isStoredRow);
+    const { rows: vecRows, dropped: vecDropped } = this.accountRows(vecOutcome.value);
 
     let ftsRows: StoredRow[] = [];
+    let ftsDropped = 0;
     if (ftsOutcome.status === 'fulfilled') {
-      const ftsRaw: unknown[] = ftsOutcome.value;
-      ftsRows = ftsRaw.filter(isStoredRow);
+      ({ rows: ftsRows, dropped: ftsDropped } = this.accountRows(ftsOutcome.value));
     } else if (!this.ftsRepairAttempted) {
-      // Degrade-visibly-not-silently: log once per store instance (not once
-      // per search — a broken FTS index would otherwise spam the log on
-      // every subsequent query), then attempt a one-shot, fire-and-forget
-      // self-heal so a transient first-build failure (`upsert()`'s
-      // `createIndex` catch) can repair itself for later searches.
-      this.ftsRepairAttempted = true;
-      this.log(
-        `hermes-codebase: sparse (FTS) search failed — degrading to vector-only results for this and future searches; attempting a one-time index repair: ${ftsOutcome.reason instanceof Error ? ftsOutcome.reason.name : 'unknown'}`,
-      );
-      void table.createIndex('content', { config: lancedb.Index.fts() }).catch((err: unknown) => {
-        this.log(`hermes-codebase: FTS index repair attempt failed: ${err instanceof Error ? err.name : 'unknown'}`);
-      });
+      this.attemptFtsRepairOnce(table, ftsOutcome.reason);
     }
 
-    const droppedHybrid =
-      vecRaw.length - vecRows.length +
-      (ftsOutcome.status === 'fulfilled' ? ftsOutcome.value.length - ftsRows.length : 0);
-    if (droppedHybrid > 0) this.warnMalformedRowsOnce(droppedHybrid);
+    if (vecDropped + ftsDropped > 0) this.warnMalformedRowsOnce(vecDropped + ftsDropped);
 
     return fuseHybridRows(vecRows, ftsRows, k);
   }
