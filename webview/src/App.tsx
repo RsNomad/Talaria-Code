@@ -72,10 +72,11 @@ import type { ComposerSeed } from './composer/applySeed';
 import { useHostActions } from './hooks/useHostActions';
 import { useSessionLoadWatchdog } from './hooks/useSessionLoadWatchdog';
 
-import { PriorityTabs, panelTabDomId, panelTabpanelId } from './components/PriorityTabs';
+import { PriorityTabs } from './components/PriorityTabs';
 import { TabStrip, tabDomId, CHAT_TABPANEL_ID } from './components/TabStrip';
 import { Composer } from './components/Composer';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { PanelScaffold } from './components/PanelScaffold';
 import { ChatView } from './components/chat/ChatView';
 import { RemotePanel, type RefreshErrorBanner } from './panels/PanelShell';
 import { ToolsPanel } from './panels/ToolsPanel';
@@ -1136,215 +1137,170 @@ export function App() {
           reused, since `chat`'s wrapper is already claimed by TabStrip's own
           chat-session tabs (see `panelTabpanelId`'s doc comment in
           PriorityTabs.tsx for why `chat` is the one exception that needs NO
-          new wrapper). The wrapper sits OUTSIDE `ErrorBoundary`/`RemotePanel`
-          so the tabpanel region exists — and is announced — in every state
-          (loading/error/success), not only once data resolves. `flex min-h-0
-          flex-1 flex-col` reproduces exactly what each panel's own
-          `PanelShell` root already assumes of its parent (a flex-column
-          ancestor sized via `flex-1`/`min-h-0`) — same classes ChatView's
-          wrapper uses — so nesting one more level here does not change any
-          panel's rendered size. */}
+          new wrapper). FI-14: the wrapper + its `ErrorBoundary` are now
+          single-sourced in `<PanelScaffold>` (`components/PanelScaffold.tsx`)
+          instead of repeated by hand at each of the 9 call sites below — see
+          that file's header for the full rationale (region passed explicitly,
+          chat left inline as structurally different). The wrapper sits
+          OUTSIDE `ErrorBoundary`/`RemotePanel` so the tabpanel region exists —
+          and is announced — in every state (loading/error/success), not only
+          once data resolves. `flex min-h-0 flex-1 flex-col` reproduces
+          exactly what each panel's own `PanelShell` root already assumes of
+          its parent (a flex-column ancestor sized via `flex-1`/`min-h-0`) —
+          same classes ChatView's wrapper uses — so nesting one more level
+          here does not change any panel's rendered size. */}
       {state.activePanel === 'tools' && (
-        <div
-          id={panelTabpanelId('tools')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('tools')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Tools panel">
-            <RemotePanel
-              remote={globalPanels.tools}
-              loadingHint="Loading tools…"
-              onRetry={() => requestPanel('tools')}
-              {...withRefreshError(refreshErrorProp('tools'))}
-            >
-              {(data) => (
-                <ToolsPanel
-                  data={data}
-                  onToggle={(name, enabled) => toggle('toolsets.toggle', { name, enabled })}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="tools" region="the Tools panel">
+          <RemotePanel
+            remote={globalPanels.tools}
+            loadingHint="Loading tools…"
+            onRetry={() => requestPanel('tools')}
+            {...withRefreshError(refreshErrorProp('tools'))}
+          >
+            {(data) => (
+              <ToolsPanel
+                data={data}
+                onToggle={(name, enabled) => toggle('toolsets.toggle', { name, enabled })}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'mcp' && (
-        <div
-          id={panelTabpanelId('mcp')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('mcp')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the MCP panel">
-            <RemotePanel
-              remote={globalPanels.mcp}
-              loadingHint="Loading servers…"
-              onRetry={() => requestPanel('mcp')}
-              {...withRefreshError(refreshErrorProp('mcp'))}
-            >
-              {(data) => (
-                <McpPanel
-                  data={data}
-                  onReload={reloadMcp}
-                  onAdd={addMcpServer}
-                  onTest={testMcpServer}
-                  onRemove={removeMcpServer}
-                  onSetEnabled={setMcpServerEnabled}
-                  onAuth={authMcpServer}
-                  onCatalog={mcpCatalog}
-                  onCatalogInstall={mcpCatalogInstall}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="mcp" region="the MCP panel">
+          <RemotePanel
+            remote={globalPanels.mcp}
+            loadingHint="Loading servers…"
+            onRetry={() => requestPanel('mcp')}
+            {...withRefreshError(refreshErrorProp('mcp'))}
+          >
+            {(data) => (
+              <McpPanel
+                data={data}
+                onReload={reloadMcp}
+                onAdd={addMcpServer}
+                onTest={testMcpServer}
+                onRemove={removeMcpServer}
+                onSetEnabled={setMcpServerEnabled}
+                onAuth={authMcpServer}
+                onCatalog={mcpCatalog}
+                onCatalogInstall={mcpCatalogInstall}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'skills' && (
-        <div
-          id={panelTabpanelId('skills')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('skills')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Skills panel">
-            <RemotePanel
-              remote={globalPanels.skills}
-              loadingHint="Loading skills…"
-              onRetry={() => requestPanel('skills')}
-              {...withRefreshError(refreshErrorProp('skills'))}
-            >
-              {(data) => (
-                <SkillsPanel
-                  data={data}
-                  onToggle={(name, enabled) => toggle('skills.toggle', { name, enabled })}
-                  onRefresh={() => requestPanel('skills')}
-                  onCreate={createSkill}
-                  onHubPreview={previewHubSkill}
-                  onHubScan={scanHubSkill}
-                  onHubInstall={installHubSkill}
-                  onHubUninstall={uninstallHubSkill}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="skills" region="the Skills panel">
+          <RemotePanel
+            remote={globalPanels.skills}
+            loadingHint="Loading skills…"
+            onRetry={() => requestPanel('skills')}
+            {...withRefreshError(refreshErrorProp('skills'))}
+          >
+            {(data) => (
+              <SkillsPanel
+                data={data}
+                onToggle={(name, enabled) => toggle('skills.toggle', { name, enabled })}
+                onRefresh={() => requestPanel('skills')}
+                onCreate={createSkill}
+                onHubPreview={previewHubSkill}
+                onHubScan={scanHubSkill}
+                onHubInstall={installHubSkill}
+                onHubUninstall={uninstallHubSkill}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'checkpoints' && (
-        <div
-          id={panelTabpanelId('checkpoints')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('checkpoints')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Checkpoints panel">
-            <RemotePanel
-              remote={checkpointsRemote}
-              loadingHint="Loading checkpoints…"
-              onRetry={() => requestPanel('checkpoints')}
-              {...withRefreshError(scopedRefreshErrorProp('checkpoints'))}
-            >
-              {(data) => (
-                <CheckpointsPanel
-                  data={data}
-                  onRestore={restoreCheckpoint}
-                  onRedo={redoCheckpoint}
-                  onRedoAll={redoAllCheckpoint}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="checkpoints" region="the Checkpoints panel">
+          <RemotePanel
+            remote={checkpointsRemote}
+            loadingHint="Loading checkpoints…"
+            onRetry={() => requestPanel('checkpoints')}
+            {...withRefreshError(scopedRefreshErrorProp('checkpoints'))}
+          >
+            {(data) => (
+              <CheckpointsPanel
+                data={data}
+                onRestore={restoreCheckpoint}
+                onRedo={redoCheckpoint}
+                onRedoAll={redoAllCheckpoint}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'subagents' && (
-        <div
-          id={panelTabpanelId('subagents')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('subagents')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Subagents panel">
-            <RemotePanel
-              remote={tab.subagents}
-              loadingHint="Loading subagents…"
-              onRetry={() => requestPanel('subagents')}
-              {...withRefreshError(scopedRefreshErrorProp('subagents'))}
-            >
-              {(data) => <SubagentsPanel data={data} />}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="subagents" region="the Subagents panel">
+          <RemotePanel
+            remote={tab.subagents}
+            loadingHint="Loading subagents…"
+            onRetry={() => requestPanel('subagents')}
+            {...withRefreshError(scopedRefreshErrorProp('subagents'))}
+          >
+            {(data) => <SubagentsPanel data={data} />}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'sessions' && (
-        <div
-          id={panelTabpanelId('sessions')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('sessions')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Sessions panel">
-            <RemotePanel
-              remote={state.sessionsPanel}
-              loadingHint="Loading sessions…"
-              onRetry={() => requestPanel('sessions')}
-              {...withRefreshError(scopedRefreshErrorProp('sessions'))}
-            >
-              {(data) => (
-                <SessionsPanel
-                  data={data}
-                  activeTabId={state.activeTabId}
-                  boundSessionIds={boundSessionIds}
-                  activeTabHasLiveTurn={tab.turnActive}
-                  onLoad={loadSession}
-                  /* exactOptional prep (arm 1): `SessionsPanelProps`
-                     (`panels/SessionsPanel.tsx`, outside this batch) declares
-                     both as `?: string` — spread each key in only when present. */
-                  {...(state.pendingSessionLoad?.sessionId !== undefined
-                    ? { loadingSessionId: state.pendingSessionLoad.sessionId }
-                    : {})}
-                  onLoadMore={loadMoreSessions}
-                  loadingMore={sessionsLoadingMore}
-                  {...(sessionsLoadMoreError !== undefined ? { loadMoreError: sessionsLoadMoreError } : {})}
-                  // UX-04b: `loadNotice?: {...} | undefined` — unlike the
-                  // spread-omission props above, this type explicitly
-                  // includes `| undefined`, so assigning it directly (rather
-                  // than omitting the key) type-checks under
-                  // exactOptionalPropertyTypes.
-                  loadNotice={
-                    sessionLoadNotice !== undefined
-                      ? { text: sessionLoadNotice, onDismiss: () => setSessionLoadNotice(undefined) }
-                      : undefined
-                  }
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="sessions" region="the Sessions panel">
+          <RemotePanel
+            remote={state.sessionsPanel}
+            loadingHint="Loading sessions…"
+            onRetry={() => requestPanel('sessions')}
+            {...withRefreshError(scopedRefreshErrorProp('sessions'))}
+          >
+            {(data) => (
+              <SessionsPanel
+                data={data}
+                activeTabId={state.activeTabId}
+                boundSessionIds={boundSessionIds}
+                activeTabHasLiveTurn={tab.turnActive}
+                onLoad={loadSession}
+                /* exactOptional prep (arm 1): `SessionsPanelProps`
+                   (`panels/SessionsPanel.tsx`, outside this batch) declares
+                   both as `?: string` — spread each key in only when present. */
+                {...(state.pendingSessionLoad?.sessionId !== undefined
+                  ? { loadingSessionId: state.pendingSessionLoad.sessionId }
+                  : {})}
+                onLoadMore={loadMoreSessions}
+                loadingMore={sessionsLoadingMore}
+                {...(sessionsLoadMoreError !== undefined ? { loadMoreError: sessionsLoadMoreError } : {})}
+                // UX-04b: `loadNotice?: {...} | undefined` — unlike the
+                // spread-omission props above, this type explicitly
+                // includes `| undefined`, so assigning it directly (rather
+                // than omitting the key) type-checks under
+                // exactOptionalPropertyTypes.
+                loadNotice={
+                  sessionLoadNotice !== undefined
+                    ? { text: sessionLoadNotice, onDismiss: () => setSessionLoadNotice(undefined) }
+                    : undefined
+                }
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'models' && (
-        <div
-          id={panelTabpanelId('models')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('models')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Models panel">
-            <RemotePanel
-              remote={globalPanels.models}
-              loadingHint="Loading models…"
-              onRetry={() => requestPanel('models')}
-              {...withRefreshError(refreshErrorProp('models'))}
-            >
-              {(data) => (
-                <ModelsPanel
-                  data={data}
-                  activeModelId={tab.currentModelId}
-                  onSetModel={hostActions.setModel}
-                  onAddProviderKey={onAddProviderKey}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="models" region="the Models panel">
+          <RemotePanel
+            remote={globalPanels.models}
+            loadingHint="Loading models…"
+            onRetry={() => requestPanel('models')}
+            {...withRefreshError(refreshErrorProp('models'))}
+          >
+            {(data) => (
+              <ModelsPanel
+                data={data}
+                activeModelId={tab.currentModelId}
+                onSetModel={hostActions.setModel}
+                onAddProviderKey={onAddProviderKey}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {/* Task 10: the Setup / Talaria Config panel — unlike Settings (F-7
           below), the WHOLE `SetupData` snapshot is host-assembled from
@@ -1353,23 +1309,16 @@ export function App() {
           RemoteData straight through (SetupPanel owns its own `RemotePanel`
           gate internally, same as every other data panel here). */}
       {state.activePanel === 'setup' && (
-        <div
-          id={panelTabpanelId('setup')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('setup')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Setup panel">
-            <SetupPanel
-              data={globalPanels.setup}
-              onRetry={() => requestPanel('setup')}
-              progress={state.setupProgress}
-              nextEdit={state.nextEditToggles}
-              onToggleNextEdit={setNextEditToggle}
-              dispatch={dispatchSetup}
-            />
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="setup" region="the Setup panel">
+          <SetupPanel
+            data={globalPanels.setup}
+            onRetry={() => requestPanel('setup')}
+            progress={state.setupProgress}
+            nextEdit={state.nextEditToggles}
+            onToggleNextEdit={setNextEditToggle}
+            dispatch={dispatchSetup}
+          />
+        </PanelScaffold>
       )}
 
       {/* Task 12 (§5.1/§5.2): "Agent config" (`'settings'` panel id, unchanged
@@ -1385,21 +1334,14 @@ export function App() {
           un-narrowed `RemoteData` union, so re-wrapping it here still cannot
           typecheck; the structure is locked in `panels/SettingsPanel.test.ts`. */}
       {state.activePanel === 'settings' && (
-        <div
-          id={panelTabpanelId('settings')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('settings')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Settings panel">
-            <SettingsPanel
-              config={globalPanels.settings}
-              onRetryConfig={() => requestPanel('settings')}
-              onSetConfig={setConfig}
-              {...withRefreshError(refreshErrorProp('settings'))}
-            />
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="settings" region="the Settings panel">
+          <SettingsPanel
+            config={globalPanels.settings}
+            onRetryConfig={() => requestPanel('settings')}
+            onSetConfig={setConfig}
+            {...withRefreshError(refreshErrorProp('settings'))}
+          />
+        </PanelScaffold>
       )}
     </>
   );
