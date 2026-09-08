@@ -170,6 +170,17 @@ function compareRevisions(label, fileNameBefore, textBefore, fileNameAfter, text
  * "zero-or-one" quantifier — left unescaped it would otherwise leak
  * straight into the compiled pattern as one).
  */
+/**
+ * Escape every RegExp metacharacter in a literal so it matches verbatim — a
+ * standard escapeRegExp sanitizer (js/regex-injection). The `--allow` globs
+ * arrive as command-line arguments, so their literal characters MUST be
+ * escaped before they reach `new RegExp`; the `*`/`?` wildcards are translated
+ * to fixed safe fragments by the caller and never pass through here raw.
+ */
+function escapeRegExp(literal) {
+  return literal.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+}
+
 function globToRegExp(glob) {
   let pattern = '^';
   for (let i = 0; i < glob.length; i += 1) {
@@ -183,10 +194,12 @@ function globToRegExp(glob) {
       }
     } else if (ch === '?') {
       pattern += '[^/]';
-    } else if ('.+^${}()|[]\\'.includes(ch)) {
-      pattern += `\\${ch}`;
     } else {
-      pattern += ch;
+      // Every non-wildcard character is escaped through escapeRegExp so no
+      // metacharacter from the CLI-supplied glob leaks into the compiled
+      // pattern; combined with the fixed wildcard fragments above (and no
+      // nested quantifiers), the result is injection- and ReDoS-safe.
+      pattern += escapeRegExp(ch);
     }
   }
   pattern += '$';
