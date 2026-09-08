@@ -23,7 +23,7 @@ import { AttachMenu } from './AttachMenu';
 import { LiveRegion } from './LiveRegion';
 import { useMenuFocus } from '../hooks/useMenuFocus';
 import { Pill } from './Pill';
-import { SuggestMenu, flattenSuggestSections, activeOptionId, type SuggestItem } from './SuggestMenu';
+import { SuggestMenu, flattenSuggestSections, type SuggestItem } from './SuggestMenu';
 import { filterMentions, type MentionItem } from '../composer/mentionCatalog';
 import { buildSlashSections, type AgentSlashItem, type SlashTemplate } from '../composer/slashCatalog';
 import { useSuggest, pathPickEmptyKey } from '../composer/useSuggest';
@@ -31,6 +31,12 @@ import { parseMentions, formatMentionToken } from '../composer/parseMentions';
 import { describeMention, basename } from '../composer/mentionChip';
 import { parsePathPick, filesToFolders } from '../composer/fileSearch';
 import { useFileSearch } from '../composer/useFileSearch';
+import {
+  filePickHeading as deriveFilePickHeading,
+  openPopupId as deriveOpenPopupId,
+  activeOptionOf,
+  type PopupId,
+} from '../composer/composerDerive';
 import { applySeed, type ComposerSeed } from '../composer/applySeed';
 import { busyInteraction } from './busyInteraction';
 import { useFocusAnchorOnUnmount } from '../hooks/useFocusAnchorOnUnmount';
@@ -659,16 +665,7 @@ export function Composer({
     hint: p,
     icon: pathPick?.kind === 'folder' ? 'folder' : 'file',
   }));
-  const filePickHeading =
-    fileSearch.status === 'loading'
-      ? 'Searching…'
-      : fileSearch.status === 'error'
-        ? 'Search failed'
-        : filePickItems.length === 0
-          ? 'No matches'
-          : pathPick?.kind === 'folder'
-            ? 'Folders'
-            : 'Files';
+  const filePickHeading = deriveFilePickHeading(fileSearch.status, filePickItems.length, pathPick?.kind === 'folder');
   const showFilePick = pathPick !== null;
 
   const filteredMentions: MentionItem[] = mentionSuggest.state.open && !pathPick
@@ -692,27 +689,21 @@ export function Composer({
   // `pathPick !== null`); `onKeyDown` below documents why mention and slash
   // can't legitimately both be open at one caret position either — so this
   // first-match order is never ambiguous in practice.
-  const openPopupId: 'mention' | 'filepick' | 'slash' | undefined = showMention
-    ? 'mention'
-    : showFilePick
-      ? 'filepick'
-      : showSlash
-        ? 'slash'
-        : undefined;
+  const openPopupId: PopupId | undefined = deriveOpenPopupId(showMention, showFilePick, showSlash);
   // filePick can be OPEN with ZERO rendered options (the "Searching…"/
   // "No matches" states — `showFilePick` doesn't gate on item count, unlike
   // mention/slash which already require length > 0 to show at all). An
   // aria-activedescendant naming an id with no matching element would itself
   // be an a11y bug, so this only ever names an id that is on an actually
   // rendered `role="option"` element.
-  const activeOptId: string | undefined =
-    openPopupId === 'mention' && filteredMentions.length > 0
-      ? activeOptionId('mention', mentionActiveIndex)
-      : openPopupId === 'filepick' && filePickItems.length > 0
-        ? activeOptionId('filepick', mentionActiveIndex)
-        : openPopupId === 'slash' && slashItems.length > 0
-          ? activeOptionId('slash', slashActiveIndex)
-          : undefined;
+  const activeOptId: string | undefined = activeOptionOf(
+    openPopupId,
+    filteredMentions.length,
+    filePickItems.length,
+    slashItems.length,
+    mentionActiveIndex,
+    slashActiveIndex,
+  );
 
   const onComposerTextChange = (value: string, caret: number) => {
     mentionSuggest.onTextChange(value, caret);
