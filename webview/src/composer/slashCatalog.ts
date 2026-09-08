@@ -28,8 +28,20 @@ export interface SlashTemplate extends SuggestItem {
   expand: (arg: string) => string;
 }
 
-/** v1 client template set (§3.2). Each expands to a prompt ending in an open slot for the user's argument. */
-export const SLASH_TEMPLATES: SlashTemplate[] = [
+/**
+ * v1 client template set (§3.2). Each expands to a prompt ending in an open
+ * slot for the user's argument.
+ *
+ * SY-02: deeply immutable — same `readonly … []` + per-element `Readonly<>`
+ * idiom as `MENTIONS` (`mentionCatalog.ts`), matching `ignoreFilter.ts`/
+ * `nextEditCopy.ts`'s type-only (no runtime freeze) posture for a
+ * latent-only catalog. `.map`/`.filter`/`for…of` below and in
+ * `buildSlashSections` all still compile unchanged — none of them write
+ * back into the catalog, and a `Readonly<SlashTemplate>` satisfies every
+ * place that expects the wide `SlashTemplate` (e.g. `SuggestSection`'s
+ * `items`) with no cast.
+ */
+export const SLASH_TEMPLATES: readonly Readonly<SlashTemplate>[] = [
   {
     id: 'explain',
     label: '/explain',

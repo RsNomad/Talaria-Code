@@ -32,21 +32,36 @@ import { EmptyPanel, PanelShell } from './PanelShell';
 import { useToggle } from './useToggle';
 
 /** Exported (UI-I1) so `McpPanel.test.ts` can exercise the total lookup
- * directly — this repo's webview tests don't use jsdom. */
-export const STATUS: Record<McpStatus, { tone: PillTone; label: string; icon: string }> = {
-  connected: { tone: 'add', label: 'Connected', icon: 'circle-filled' },
-  disconnected: { tone: 'neutral', label: 'Disconnected', icon: 'circle-outline' },
-};
+ * directly — this repo's webview tests don't use jsdom.
+ *
+ * SY-02: deeply immutable — `Readonly<Record<…>>` blocks reassigning a whole
+ * entry (`STATUS.connected = …`), the inner `Readonly<{…}>` blocks a
+ * per-field write (`STATUS.connected.tone = …`), and the nested
+ * `Object.freeze` calls make both guards hold at RUNTIME too, not just at
+ * the type level — matching this repo's `DEFAULT_ENDPOINTS`
+ * (`src/autocomplete/endpoints.ts`) / `ZERO_RANGE`
+ * (`src/mcp/lsp/tools.ts`)-style "`Readonly<Record<…>>` + `Object.freeze`,
+ * nested `Object.freeze` per object value" idiom for a static lookup table.
+ * `totalLookup`'s `map: Record<K, V>` parameter still accepts this — an
+ * object typed `readonly` is structurally assignable to a mutable-typed
+ * parameter (readonly-ness isn't part of an object type's identity beyond
+ * arrays/tuples), so every read-only consumer compiles unchanged. */
+export const STATUS: Readonly<Record<McpStatus, Readonly<{ tone: PillTone; label: string; icon: string }>>> =
+  Object.freeze({
+    connected: Object.freeze({ tone: 'add', label: 'Connected', icon: 'circle-filled' }),
+    disconnected: Object.freeze({ tone: 'neutral', label: 'Disconnected', icon: 'circle-outline' }),
+  });
 
 /** UI-I1: a server `status` outside the known `McpStatus` enum (a
  * version-skewed or buggy host — `bridge.ts` only checks `.type`) falls back
  * to this instead of `STATUS[bad]` being `undefined` and `.tone` throwing
- * mid-render. */
-export const UNKNOWN_MCP_STATUS: { tone: PillTone; label: string; icon: string } = {
+ * mid-render. SY-02: same deep-immutability posture as {@link STATUS} — see
+ * its doc comment. */
+export const UNKNOWN_MCP_STATUS: Readonly<{ tone: PillTone; label: string; icon: string }> = Object.freeze({
   tone: 'neutral',
   label: 'Unknown',
   icon: 'question',
-};
+});
 
 /**
  * Task A7 (§4.9): one command-line argument per line, trimmed, blank lines
