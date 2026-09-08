@@ -97,10 +97,10 @@ export type LoadReplayOutcome =
   | { kind: 'no-client' }
   | { kind: 'load-failed'; message: string }
   | { kind: 'not-found' }
-  /** Empty for `loadReplayOutcome`'s supersede arms (~1483/~1502/~1536);
-   *  carries the real result for its success-but-superseded arm (~1507) —
-   *  callers today treat that one as SUCCESS, and the adapter preserves
-   *  exactly that. */
+  /** Empty for `loadReplayOutcome`'s plain supersede arms; carries the real
+   *  result for its success-but-superseded arm (the one that forwards
+   *  `result`) — callers today treat that one as SUCCESS, and the adapter
+   *  preserves exactly that. */
   | { kind: 'superseded'; result?: AcpLoadSessionResult };
 
 export class SessionController {
@@ -134,7 +134,7 @@ export class SessionController {
    * WS-R3's reconnect wedge-break evidence), and (b) documents WHY the
    * belated genuine settlement is dropped — forceEndCancelledTurn clears
    * currentTurnId/turn, so runTurn's own `this.currentTurnId !== turnId`
-   * guards (~1273/~1294) discard it.
+   * guards discard it.
    */
   private readonly forceEndedTurnIds = new Set<string>();
 
@@ -639,7 +639,7 @@ export class SessionController {
    * after-turn snapshot — the SAME terminal machinery a genuine end uses.
    * Clearing currentTurnId/turn afterwards makes the belated genuine prompt
    * settlement drop at runTurn's existing `this.currentTurnId !== turnId`
-   * guards (~1273/~1294) — no
+   * guards — no
    * duplicate turn.end, no stale result.summary (idempotence, §3.1 step 5).
    */
   private forceEndCancelledTurn(turnId: string): void {
