@@ -20,10 +20,14 @@ export interface GgufIngestSpec {
     quant: string;
     sha256: string;
     approxBytes: number;
-    /** T3 (beta.6 §2.4): optional — meaningful only in `pinned` mode (the
-     *  pinned llama.cpp/Ollama path passes it for `verifyHfDigest`'s exact-
-     *  file-set check upstream of `ingestGguf`; `live-oid` mode passes
-     *  none, since nothing else in the repo is ever read for that file). */
+    /** FI-34: optional — this engine (`ingestGguf`) never reads it. Exact-
+     *  file-set enforcement, when it applies, happens UPSTREAM of this sink:
+     *  `verifyHfDigest` (`hfDigest.ts`, ⚠ S-F4), called by `provisionRunner`
+     *  in pinned mode BEFORE `ingestGguf` ever runs — NOT here. This field
+     *  exists only for shape parity with `GgufStoreSpec.gguf.allowedRepoFiles`
+     *  (`ggufIngest.ts`, also optional) so a `GgufIngestSpec` literal can
+     *  carry it; a caller must not read its presence on THIS type as "the
+     *  sink enforces the exact file set." */
     allowedRepoFiles?: readonly string[];
   };
   ollamaCreatedName: string;

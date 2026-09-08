@@ -495,10 +495,7 @@ export class ProvisionRunner {
   private async resolvePinnedDigest(
     gguf: CatalogGguf,
     sha256: string,
-  ): Promise<
-    | { ok: true; expected: string; allowedRepoFiles: readonly string[] | undefined }
-    | { ok: false; reason: string }
-  > {
+  ): Promise<{ ok: true; expected: string } | { ok: false; reason: string }> {
     const pinnedSpec = pinnedVerifySpec(gguf, sha256);
     if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
     let verdict: HfDigestVerdict;
@@ -508,7 +505,7 @@ export class ProvisionRunner {
       verdict = { ok: false, reason: 'verify seam rejected' };
     }
     if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-    return { ok: true, expected: sha256, allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles };
+    return { ok: true, expected: sha256 };
   }
 
   /** live-oid core: resolveLfsOid (seam-rejection → refusal). */
@@ -530,11 +527,10 @@ export class ProvisionRunner {
     entry: CatalogModel;
     cell: Extract<CatalogModel['ollama'], { tier: 'hf-ingest' }>;
     sha256: string;
-    allowedRepoFiles: readonly string[] | undefined;
     endpoint: string;
     signal: AbortSignal;
   }): Promise<void> {
-    const { entry, cell, sha256, allowedRepoFiles, endpoint, signal } = args;
+    const { entry, cell, sha256, endpoint, signal } = args;
     // §7.2.2: settled-flag straggler guard around ingestGguf's own
     // await — same discipline as {@link runLibraryPull}; the shared
     // `entry.id`-keyed terminal `done` push lives in the CALLER's
@@ -559,7 +555,6 @@ export class ProvisionRunner {
               quant: cell.gguf.quant,
               sha256,
               approxBytes: cell.gguf.approxBytes,
-              ...(allowedRepoFiles !== undefined ? { allowedRepoFiles } : {}),
             },
             ollamaCreatedName: cell.createdName,
           },
@@ -617,7 +612,6 @@ export class ProvisionRunner {
           entry,
           cell,
           sha256: digest.expected,
-          allowedRepoFiles: digest.allowedRepoFiles,
           endpoint: validated.url,
           signal,
         });
@@ -642,7 +636,6 @@ export class ProvisionRunner {
           entry,
           cell,
           sha256: digest.expected,
-          allowedRepoFiles: undefined,
           endpoint: validated.url,
           signal,
         });
