@@ -1,7 +1,13 @@
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loginShellSpawn, type ExecLookup } from '../runtime/resolveHermes';
-import { isExecTimeout, lastNonEmptyLine, throwIfAborted } from './locatorShared';
+import {
+  PROBE_TIMEOUT_DETAIL,
+  lastNonEmptyLine,
+  locateOnLoginPath,
+  throwIfAborted,
+  type LocateOnLoginPathSpec,
+} from './locatorShared';
 
 export { isExecTimeout } from './locatorShared';
 
@@ -49,9 +55,12 @@ export { isExecTimeout } from './locatorShared';
  *      — the path is real (the login shell just told us so), only the
  *      cosmetic version string is missing.
  *
- * `isExecTimeout`/`throwIfAborted`/`lastNonEmptyLine` — this module's clone
- * of `pipxLocator.ts`'s trio — shared core extracted to `locatorShared.ts`
- * (WS-SU).
+ * `isExecTimeout`/`throwIfAborted`/`lastNonEmptyLine` (WS-SU) and the step-0
+ * lookup itself, `locateOnLoginPath` (FI-10, WS-F8 F8-1) — this module's
+ * clone of `pipxLocator.ts`'s recipe — are the shared core extracted to
+ * `locatorShared.ts`; this module is now a CALLER building its own `spec`
+ * (see {@link llamaServerSpec}) and mapping the generic
+ * `found`/`missing`/`probe-timeout` result to its own `LlamaCppLocateResult`.
  */
 
 /** Typed probe result — the exact shape the controller (T6) consumes. */
@@ -76,12 +85,6 @@ const ABSOLUTE_CANDIDATE_TIMEOUT_MS = 2_000;
  *  is populated. */
 const VERSION_PROBE_TIMEOUT_MS = 2_000;
 
-/** §6 copy — same wording `pipxLocator.ts` uses for its own `probe-timeout`
- *  detail (the identical honesty framing applies: a probe that never got an
- *  answer, not a probe that got a clean "not installed" answer). */
-const PROBE_TIMEOUT_DETAIL =
-  "Your login shell didn't answer in time — a slow shell profile (nvm, conda, a network home directory) can cause this. It's usually transient: press Re-check.";
-
 /**
  * Locate `llama-server` and (best-effort) its version. Never throws for the
  * two SCRIPTED failure modes (`not-found`, `probe-timeout`) — those are
@@ -95,7 +98,7 @@ export async function locateLlamaServer(exec: ExecLookup, signal?: AbortSignal):
   const cwd = os.homedir();
 
   throwIfAborted(signal);
-  const lookup = await findLlamaServerPath(exec, cwd, signal);
+  const lookup = await locateOnLoginPath(exec, llamaServerSpec(), cwd, signal);
   if (lookup.kind === 'probe-timeout') {
     return { ok: false, reason: 'probe-timeout', detail: PROBE_TIMEOUT_DETAIL };
   }
@@ -116,98 +119,28 @@ export async function locateLlamaServer(exec: ExecLookup, signal?: AbortSignal):
 
 // --- internals ---------------------------------------------------------
 
-/** The three outcomes step 0 (+ its absolute-candidate fallback) can
- *  resolve to. `probe-timeout` is reached ONLY after both the login-shell
- *  lookup (5s, then a 10s retry) AND every absolute-candidate fallback have
- *  failed to answer in time. A fallback candidate's own successful
- *  `--version` call doubles as its version source (`version` present here
- *  means `locateLlamaServer` skips the redundant post-resolution probe). */
-type LlamaServerLookup =
-  | { kind: 'found'; path: string; version?: string }
-  | { kind: 'missing' }
-  | { kind: 'probe-timeout' };
-
 /**
- * Step 0 — locate `llama-server` on the login-shell PATH. The login shell
- * remains the semantic authority for WHICH binary is used (matching
- * `pipxLocator.ts`'s `findPipxPath` rationale verbatim): absolute
- * candidates are consulted ONLY when the login shell itself could not
- * answer twice in a row, never as a faster substitute for it.
+ * This locator's `spec` for the shared `locateOnLoginPath` core
+ * (`locatorShared.ts`, FI-10, WS-F8 F8-1): the step-0 binary name, the
+ * absolute-candidate probe list in PATH-precedence order (a user-local build
+ * — `~/.local/bin`, a common from-source llama.cpp install location — then
+ * `/usr/local/bin`, the typical `make install`/manual-build target, then the
+ * distro package path `/usr/bin`), this module's own timeouts, and
+ * `captureVersion: true` — a fallback candidate's own successful `--version`
+ * call doubles as its version source (`locateLlamaServer` then skips the
+ * redundant post-resolution probe).
  */
-async function findLlamaServerPath(
-  exec: ExecLookup,
-  cwd: string,
-  signal: AbortSignal | undefined,
-): Promise<LlamaServerLookup> {
-  const spec = loginShellSpawn('command', ['-v', 'llama-server'], undefined, { exec: false });
-
-  let stdout: string;
-  try {
-    stdout = await exec(spec.command, spec.args, {
-      timeoutMs: STEP0_TIMEOUT_MS,
-      cwd,
-      ...(signal !== undefined ? { signal } : {}),
-    });
-  } catch (firstErr) {
-    // TC-5/AU-28: an abort takes priority over the timeout classifier — Node
-    // sets `killed`/`signal` on an abort-driven kill too (the same shape a
-    // genuine timeout produces), so without this check a scoped recheck
-    // cancel could be misread as "the login shell was merely slow" and
-    // silently retried instead of propagating the cancellation.
-    if (signal?.aborted) throw firstErr;
-    if (!isExecTimeout(firstErr)) return { kind: 'missing' };
-    try {
-      stdout = await exec(spec.command, spec.args, {
-        timeoutMs: STEP0_RETRY_TIMEOUT_MS,
-        cwd,
-        ...(signal !== undefined ? { signal } : {}),
-      });
-    } catch (secondErr) {
-      if (signal?.aborted) throw secondErr;
-      if (!isExecTimeout(secondErr)) return { kind: 'missing' };
-      return probeAbsoluteCandidates(exec, cwd, signal);
-    }
-  }
-
-  const line = lastNonEmptyLine(stdout);
-  return line.startsWith('/') ? { kind: 'found', path: line } : { kind: 'missing' };
-}
-
-/** PATH-precedence order: a user-local build (`~/.local/bin`, a common
- *  from-source llama.cpp install location), then `/usr/local/bin` (the
- *  typical `make install`/manual-build target), then the distro package
- *  path `/usr/bin`. Called with NO shell — direct `execFile` probes. */
-function absoluteCandidatePaths(): string[] {
-  return [
-    path.join(os.homedir(), '.local', 'bin', 'llama-server'),
-    '/usr/local/bin/llama-server',
-    '/usr/bin/llama-server',
-  ];
-}
-
-async function probeAbsoluteCandidates(
-  exec: ExecLookup,
-  cwd: string,
-  signal: AbortSignal | undefined,
-): Promise<LlamaServerLookup> {
-  for (const candidate of absoluteCandidatePaths()) {
-    try {
-      const raw = await exec(candidate, ['--version'], {
-        timeoutMs: ABSOLUTE_CANDIDATE_TIMEOUT_MS,
-        cwd,
-        ...(signal !== undefined ? { signal } : {}),
-      });
-      const version = lastNonEmptyLine(raw);
-      return { kind: 'found', path: candidate, ...(version ? { version } : {}) };
-    } catch (err) {
-      // TC-5/AU-28: an abort must propagate, not be swallowed as "try the
-      // next candidate" — the whole point of a cancel is to stop probing.
-      if (signal?.aborted) throw err;
-      // Try the next candidate; every candidate failing falls through to
-      // 'probe-timeout' below.
-    }
-  }
-  return { kind: 'probe-timeout' };
+function llamaServerSpec(): LocateOnLoginPathSpec {
+  return {
+    binary: 'llama-server',
+    candidates: [
+      path.join(os.homedir(), '.local', 'bin', 'llama-server'),
+      '/usr/local/bin/llama-server',
+      '/usr/bin/llama-server',
+    ],
+    timeouts: { step0: STEP0_TIMEOUT_MS, retry: STEP0_RETRY_TIMEOUT_MS, candidate: ABSOLUTE_CANDIDATE_TIMEOUT_MS },
+    captureVersion: true,
+  };
 }
 
 /** Best-effort `<path> --version` for a path already confirmed present via
