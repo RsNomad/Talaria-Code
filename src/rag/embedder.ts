@@ -207,11 +207,11 @@ export class HttpEmbedder implements Embedder {
       timedOut = true;
       controller.abort();
     }, EMBED_TIMEOUT_MS);
-    // Invariant (WV3-MIN-SYN): at runtime `timer` is Node's Timeout, which has
-    // unref(). Under this host build (lib: ES2022 + @types/node) `timer` is already
-    // NodeJS.Timeout, so this double-cast + optional-call is belt-and-suspenders —
-    // it stays safe even if a DOM-typed setTimeout (number, no unref) were ever in scope.
-    (timer as unknown as { unref?: () => void }).unref?.();
+    // `timer` is Node's `NodeJS.Timeout` under this host build (lib: ES2022 +
+    // @types/node, no DOM lib), so `.unref()` is a direct call — it detaches
+    // the timer from the event loop so a pending embed request never keeps
+    // the process alive.
+    timer.unref();
     let json: unknown;
     try {
       const res = await this.fetchImpl(`${this.endpoint}/v1/embeddings`, {
