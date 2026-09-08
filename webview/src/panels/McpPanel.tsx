@@ -9,7 +9,7 @@
  * server's confirmation / failure is SURFACED inline instead of being dropped by
  * a fire-and-forget invoke. The click is still the confirmation (the host sends
  * `confirm:true`); we only make the RESULT visible. */
-import { useId, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import type {
   McpAddParams,
   McpAddResult,
@@ -394,6 +394,22 @@ function AddServerDisclosure({
   const [error, setError] = useState<
     { field: 'name' | 'command' | 'env' | 'secretEnv' | 'url' | 'submit'; text: string } | undefined
   >();
+  const formRef = useRef<HTMLFormElement>(null);
+
+  // UX-03 (🔵 a11y, focus management): the form already marks the SOLE
+  // invalid field via `aria-invalid` (Task 16 above); this effect moves
+  // FOCUS there too, so a keyboard/SR user lands where they must fix instead
+  // of staying stranded on the Submit button. Fires after React commits (so
+  // `aria-invalid="true"` is already in the DOM to query). The async
+  // `'submit'` error (onAdd rejection) marks no field `aria-invalid` -->
+  // `querySelector` returns null --> no focus move, correctly: a
+  // submit-failure names no field to jump to. `error === undefined` covers
+  // both the first render (no autofocus-on-mount) and a successful submit
+  // (`setError(undefined)` right before the async call).
+  useEffect(() => {
+    if (error === undefined) return;
+    formRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+  }, [error]);
 
   const resetFields = () => {
     setName('');
@@ -487,7 +503,7 @@ function AddServerDisclosure({
         <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} className="ml-auto" />
       </button>
       {open && (
-        <form onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
+        <form ref={formRef} onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
           <TextField
             label="Name"
             value={name}

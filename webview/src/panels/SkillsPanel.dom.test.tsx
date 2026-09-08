@@ -948,3 +948,44 @@ describe('WV4-MIN a11y: SkillsPanel create-form field errors are keyed to their 
     expect(name).not.toHaveAttribute('aria-invalid', 'true');
   });
 });
+
+/**
+ * UX-03 (🔵 a11y/UX, focus management): the Create-skill form already
+ * announces+marks the sole invalid field (`aria-invalid`/`aria-describedby`,
+ * Task 16 above) but left focus sitting on the Submit button — a keyboard/SR
+ * user heard the error but had to navigate back to it manually. A `formRef`
+ * + an `error`-keyed effect now moves focus to the single
+ * `[aria-invalid="true"]` element after each failed submit.
+ */
+describe('UX-03: a failed Create-skill submit moves focus to the first invalid field', () => {
+  it('submitting with an empty Name focuses the Name input (the sole aria-invalid field)', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    const name = screen.getByLabelText(/^Name$/i);
+    expect(name).toHaveAttribute('aria-invalid', 'true');
+    expect(name).toHaveFocus();
+  });
+
+  it('once Name is filled, submitting with empty Content focuses Content instead — the CURRENT first-invalid field, not always Name', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    const name = screen.getByLabelText(/^Name$/i);
+    await user.type(name, 'my-skill');
+    const content = screen.getByLabelText(/^Content$/i);
+    await user.clear(content); // seeded content cleared → contentEdited, empty
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    expect(content).toHaveAttribute('aria-invalid', 'true');
+    expect(content).toHaveFocus();
+  });
+});

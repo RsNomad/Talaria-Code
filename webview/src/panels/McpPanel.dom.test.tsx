@@ -533,6 +533,41 @@ describe('WV4-MIN a11y: MCP add-server form field errors are keyed to their fiel
   });
 });
 
+/**
+ * UX-03 (🔵 a11y/UX, focus management): the forms already announce+mark the
+ * sole invalid field (`aria-invalid`/`aria-describedby`, Task 16 above) but
+ * left focus sitting on the Submit button — a keyboard/SR user heard the
+ * error but had to navigate back to it manually. A `formRef` + an
+ * `error`-keyed effect now moves focus to the single
+ * `[aria-invalid="true"]` element after each failed submit.
+ */
+describe('UX-03: a failed Add-server submit moves focus to the first invalid field', () => {
+  it('submitting with an empty Name focuses the Name input (the sole aria-invalid field)', async () => {
+    const user = userEvent.setup();
+    render(<McpPanel data={mcpData()} onReload={async () => ({ status: 'reloaded' })} {...noopMcpAdminProps()} />);
+
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    await user.click(screen.getByRole('button', { name: /^Add$/i }));
+
+    const name = screen.getByLabelText('Name');
+    expect(name).toHaveAttribute('aria-invalid', 'true');
+    expect(name).toHaveFocus();
+  });
+
+  it('once Name is filled, submitting with an empty Command focuses Command instead — the CURRENT first-invalid field, not always Name', async () => {
+    const user = userEvent.setup();
+    render(<McpPanel data={mcpData()} onReload={async () => ({ status: 'reloaded' })} {...noopMcpAdminProps()} />);
+
+    await user.click(screen.getByRole('button', { name: /Add server/i }));
+    await user.type(screen.getByLabelText('Name'), 'gh');
+    await user.click(screen.getByRole('button', { name: /^Add$/i }));
+
+    const command = screen.getByLabelText('Command');
+    expect(command).toHaveAttribute('aria-invalid', 'true');
+    expect(command).toHaveFocus();
+  });
+});
+
 /* AU-59 D-lite: the plaintext Env field stays for NON-secret env, so it must
  * stop inviting secrets. Three pins: (1) a non-secret-leading placeholder
  * that also shows the `${KEY}` reference idiom (the old `API_KEY=...`

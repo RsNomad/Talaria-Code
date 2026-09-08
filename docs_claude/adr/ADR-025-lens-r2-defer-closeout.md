@@ -1630,3 +1630,26 @@ Per-task review caught the one asymmetry: `applyPanelTransition`'s loading-no-fl
 
 ### Conclusion
 FI-39 is closed by evidence: `applyPanelTransition` and `reducePanelAction` are two required materializations (a `RemoteData<T>` value vs an identity-preserving `PanelStateMap` slot, with an `emptyData` arm on only one and a compiler-forced correlation-free form on the other) of one small keep-data decision whose sole shared kernel is a one-line predicate. A shared-decision helper is an FI-41 relocate-without-reduction that would add a discriminated union, two mapping switches, and a dead case. The drift risk the finding names is already covered by the existing per-function characterization in `panels.test.ts`. No code change; the inline `panels.ts:147-157` note already records the non-reuse rationale for future readers. **FI-39 → Fixed-pending-merge (close-by-evidence).**
+
+## ADR-025-BF — UX-03: focus moves to the first invalid field on a failed Add-server / Create-skill submit (task UX-03, WS-U tail)
+
+**Finding (UX-03, 🔵 a11y/UX):** `McpPanel.tsx`'s `AddServerDisclosure` and `SkillsPanel.tsx`'s `CreateSkillDisclosure` already wire `aria-invalid`+`aria-describedby` on the single field that failed validation (Task 16), and a permanently-mounted `LiveRegion` announces the error text — but on a failed submit, DOM focus stayed on the Submit button. A keyboard/screen-reader user heard/read the error but had to navigate back to the field manually.
+
+**Fix:** each disclosure component (the one that owns `handleSubmit` + `error` state + the `<form>`) gets a `const formRef = useRef<HTMLFormElement>(null);`, `ref={formRef}` on its `<form>`, and:
+```ts
+useEffect(() => {
+  if (error === undefined) return;
+  formRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+}, [error]);
+```
+Ref-free with respect to the field components: `TextField`/`TextAreaField` are untouched, no ref threading through them — the effect queries the DOM for whichever element the existing `aria-invalid="true"` wiring already marks, exploiting the invariant that exactly one field carries it at a time (verified: every `TextField`/`TextAreaField` call site's `error={error?.field === '<its-field>' ? error.text : undefined}` scoping is unchanged, byte-identical to before this task).
+
+Natural no-op for the async `'submit'` error: `onAdd`/`onCreate` rejection sets `error: {field: 'submit', ...}`, which renders in the form-level notice slot, not on any `TextField`/`TextAreaField` — no element gets `aria-invalid`, so the `querySelector` finds nothing and no focus move happens. This isn't special-cased; it falls out of the same query the field-validation path uses.
+
+No autofocus-on-mount: first render has `error === undefined`, so the effect's guard clause returns immediately. A successful submit calls `setError(undefined)` before the async `onAdd`/`onCreate` call, which re-runs the effect only to hit the same guard — no-op. Each new `{field, text}` object identity on a subsequent failed submit re-triggers the effect (React's `[error]` dependency compares by reference), so focus moves correctly through a multi-step validation progression (e.g. McpPanel's name → command → env → secretEnv → url order).
+
+**Tests:** extended the existing `McpPanel.dom.test.tsx` / `SkillsPanel.dom.test.tsx` (both already existed, correctly `.dom.test.tsx`-named so the webview jsdom/RTL vitest project actually collects them) with a `UX-03` describe block per file, two tests each: (1) submit with the first field empty → that field is `document.activeElement`; (2) fill the first field, leave the next one empty, submit again → the SECOND field is now focused — proving the effect focuses the CURRENT first-invalid field via the live `aria-invalid` query, not a hardcoded "always field N" assumption. Mutation-proven: temporarily emptying the effect body (keeping the `if (error === undefined) return;` guard, deleting only the `formRef.current?.querySelector(...).focus()` line) flipped all 4 new tests RED (focus stayed on the Submit button) while the other 47 tests in both files stayed green; restoring the line returned all 51 to green.
+
+**Scope discipline:** no change to validation order, error text, `aria-invalid`/`aria-describedby` wiring, `LiveRegion` announcement, or any other behaviour — purely additive focus management on top of the existing Task 16 a11y wiring.
+
+**FI-status:** UX-03 → Fixed-pending-merge.
