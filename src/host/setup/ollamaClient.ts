@@ -30,6 +30,8 @@
  */
 
 import { isRecord } from '../../shared/typeGuards';
+import { errorMessage } from '../../shared/errorMessage';
+import { abortError, joinUrl, readBodyBounded, readWithAbort } from './httpStream';
 
 export interface OllamaModel {
   name: string;
@@ -57,9 +59,9 @@ const DEFAULT_PROBE_TIMEOUT_MS = 1500;
  * also duplicated locally by `host/transport/JsonRpcStdio.ts`'s
  * `MAX_LINE_BYTES` for the identical reason) — duplicated locally here too
  * rather than imported, matching THIS module's own established
- * self-contained discipline (see `joinUrl`'s doc comment below: "matching
- * registry.ts's own zero-cross-feature-import discipline one directory
- * over").
+ * self-contained discipline for module-specific constants (the HTTP-stream
+ * PRIMITIVES themselves, e.g. `joinUrl`, are shared via `./httpStream` —
+ * FI-11, WS-F8 F8-2 — but this byte cap stays module-local, same as before).
  */
 const MAX_STREAM_BYTES = 4 * 1024 * 1024;
 
@@ -106,38 +108,6 @@ export class PullMalformedStreamError extends Error {
  *  document; 1 MiB is orders of magnitude above any legitimate tag list. */
 const PROBE_MAX_BODY_BYTES = 1 * 1024 * 1024;
 
-type BoundedBodyResult = { ok: true; text: string } | { ok: false; reason: string };
-
-/** F2-15: reads a fetch Response body through `getReader()` with a byte
- *  ceiling — the same idiom {@link pullModel} already applies to its own
- *  stream (`MAX_STREAM_BYTES`), now covering the probe's one-shot JSON body.
- *  Cancels the reader on every exit path (F7 discipline, see pullModel). */
-async function readBodyBounded(response: Response, maxBytes: number): Promise<BoundedBodyResult> {
-  if (!response.body) {
-    return { ok: false, reason: 'response had no readable body' };
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let text = '';
-  let received = 0;
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      received += value.byteLength;
-      if (received > maxBytes) {
-        return { ok: false, reason: `response exceeded ${maxBytes} bytes without completing` };
-      }
-      text += decoder.decode(value, { stream: true });
-    }
-    text += decoder.decode();
-    return { ok: true, text };
-  } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
-  }
-}
-
 /**
  * `GET {endpoint}/api/tags`. Resolves — never rejects — with a discriminated
  * `OllamaStatus`: `{running:true, models}` on a 200 whose `models[]` maps to
@@ -161,7 +131,7 @@ export async function probeOllama(
         detail: `Ollama /api/tags responded ${response.status} ${response.statusText}`,
       };
     }
-    const raw = await readBodyBounded(response, PROBE_MAX_BODY_BYTES);
+    const raw = await readBodyBounded(response, PROBE_MAX_BODY_BYTES, 'response');
     if (!raw.ok) {
       return { running: false, detail: `Ollama /api/tags ${raw.reason}` };
     }
@@ -311,61 +281,6 @@ function handlePullChunkLine(line: string, onProgress: (p: PullProgress) => void
   return 'progress';
 }
 
-/**
- * Races a single `reader.read()` against `signal`'s `abort` event. Needed
- * because the caller-injected `fetchImpl` in unit tests is a stub that never
- * itself observes `signal` the way a real `fetch` implementation does — an
- * abort fired while a `read()` is already in flight (e.g. waiting on the
- * next network chunk) must still interrupt it immediately rather than wait
- * for that read to settle on its own (which, for a stalled/hostile server,
- * might never happen).
- */
-/** `ReadableStreamReadResult<Uint8Array>` isn't a global type name under
- *  this repo's `lib: ["ES2022"]` tsconfig (no DOM lib) — derived structurally
- *  from `ReadableStreamDefaultReader.read`'s own return type instead, since
- *  that interface (unlike the free-standing result-type alias) IS resolved
- *  globally via `@types/node`'s `stream/web` augmentation. */
-type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>;
-
-function readWithAbort(reader: ReadableStreamDefaultReader<Uint8Array>, signal: AbortSignal): Promise<StreamReadResult> {
-  if (signal.aborted) return Promise.reject(abortError());
-  return new Promise((resolve, reject) => {
-    const onAbort = (): void => reject(abortError());
-    signal.addEventListener('abort', onAbort, { once: true });
-    reader.read().then(
-      (result) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(result);
-      },
-      (err: unknown) => {
-        signal.removeEventListener('abort', onAbort);
-        reject(err);
-      },
-    );
-  });
-}
-
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw abortError();
-}
-
-/** Matches this codebase's established abort-rejection shape
- *  (`pipxInstaller.ts`, `rag/embedder.ts`, `autocomplete/nextedit/*.test.ts`). */
-function abortError(): DOMException {
-  return new DOMException('The operation was aborted.', 'AbortError');
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-/** Joins a base URL to a relative path without losing an existing subpath
- *  on the base and without doubling slashes — same normalization
- *  `autocomplete/util.ts`'s `joinUrl` applies, kept as a local copy here so
- *  this module stays self-contained (matching `registry.ts`'s own
- *  zero-cross-feature-import discipline one directory over). */
-function joinUrl(base: string, path: string): string {
-  const normalizedBase = base.endsWith('/') ? base : `${base}/`;
-  const normalizedPath = path.replace(/^\/+/, '');
-  return new URL(normalizedPath, normalizedBase).toString();
 }

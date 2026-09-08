@@ -4,6 +4,7 @@ import { makePanelData } from '../../../shared/protocol';
 import { PanelUnavailableError } from '../../panels/PanelSourceRegistry';
 import { extractCwd, extractRootId, extractSessionId } from '../../panels/panelSources';
 import { redactSecretsDeep } from '../../redactControlResponse';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /**
  * WS-GD.2a Task A4: the slice of {@link ControlDispatcherHostPort} the
@@ -268,8 +269,4 @@ export class PanelDataCoordinator {
   pruneFetchSeqForSession(sessionId: string): void {
     this.panelFetchSeq.delete(`subagents:${sessionId}`);
   }
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

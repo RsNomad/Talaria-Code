@@ -13,6 +13,7 @@
  * tab enumeration live in the thin, deliberately-untested
  * `contextService.vscode.ts`.
  */
+import { errorMessage } from '../../shared/errorMessage';
 import { RingBuffer, type IngestCandidate } from './ringBuffer';
 import { buildSnapshot } from './snippetBudgeter';
 import { shouldRegenerate } from './snapshotPolicy';
@@ -173,10 +174,6 @@ function raceWithTimeout(
  */
 export interface GatherCycleLogger {
   append(line: string): void;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 export interface CrossFileContextServiceModeInput {

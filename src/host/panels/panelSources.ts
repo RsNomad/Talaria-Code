@@ -5,6 +5,7 @@ import type {
   SubagentsData,
   CheckpointsData,
 } from '../../shared/protocol';
+import { errorMessage } from '../../shared/errorMessage';
 import type { AcpClientLike, AcpListSessionsRawResult } from '../backend/acp/acpClient';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
 import type { ToggleNameCache } from '../dashboard/dashboardPanelSources';
@@ -510,8 +511,4 @@ function extractStringField(params: unknown, field: string): string | undefined 
     return typeof value === 'string' ? value : undefined;
   }
   return undefined;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

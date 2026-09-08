@@ -26,6 +26,7 @@ import type { ConfigWriteTail } from './configWriteTail';
 import { runAdminOp, resolveDashboardAdminClient, pollActionUntilVerified, TRUST_GATED_METHODS, POLL_UNCONFIRMED_MESSAGE } from './adminOpRunner';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
 import { isRecord } from '../../../shared/typeGuards';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /** The 7 MCP admin methods {@link ControlDispatcher.handleMcpAdmin} routes (A5: add/remove/setEnabled/test/auth; A6: catalog/catalogInstall). */
 export type McpAdminMethod = 'mcp.add' | 'mcp.remove' | 'mcp.setEnabled' | 'mcp.test' | 'mcp.auth' | 'mcp.catalog' | 'mcp.catalogInstall';
@@ -754,7 +755,3 @@ const TAIL_EXEMPT_MCP_METHODS: ReadonlySet<McpAdminMethod> = new Set([
   'mcp.auth',
   'mcp.catalogInstall',
 ]);
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}

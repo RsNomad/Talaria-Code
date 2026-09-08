@@ -2,6 +2,7 @@ import type { RestoreResult } from '../../checkpoints/CheckpointTracker';
 import type { CheckpointTrackerLike } from '../../checkpoints/trackerContract';
 import type { RootCoordinator } from '../../checkpoints/RootCoordinator';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /**
  * WS-GD.2a A8: the narrowed slice of {@link ControlDispatcherHostPort} the
@@ -243,8 +244,4 @@ function truncateCheckpointLabel(promptText: string): string {
   const collapsed = promptText.replace(/\s+/g, ' ').trim();
   if (collapsed.length <= CHECKPOINT_LABEL_MAX_LEN) return collapsed;
   return `${collapsed.slice(0, CHECKPOINT_LABEL_MAX_LEN - 1).trimEnd()}…`;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

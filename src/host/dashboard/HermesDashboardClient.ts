@@ -1,6 +1,7 @@
 import type { Logger } from '../transport/JsonRpcStdio';
 import { extractInjectedDashboardToken } from './servedToken';
 import { httpFailureMessage } from '../../shared/httpFailure';
+import { errorMessage } from '../../shared/errorMessage';
 import type { McpTestResult, McpCatalogData, HubPreview, HubScan } from '../../shared/protocol';
 
 /**
@@ -563,8 +564,4 @@ export function isHermesStatusShape(body: unknown): boolean {
     typeof s.gateway_drainable === 'boolean' &&
     typeof s.nous_session_valid === 'string'
   );
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

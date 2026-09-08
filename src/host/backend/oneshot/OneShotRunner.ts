@@ -4,6 +4,7 @@ import type { AcpClientLike } from '../acp/acpClient';
 import type { AcpSessionUpdate, AcpToolKind } from '../acp/types';
 import { extractSingleBlockText } from '../acp/contentBlocks';
 import type { OneShotResult } from '../../scm/utilityModel';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /**
  * W6-FI-a (3-way ARCH I-4, part 1 of 3) — the ephemeral one-shot subsystem,
@@ -494,8 +495,4 @@ class OneShotCollector {
     this.resolveResult(result);
     this.onSettled?.(this.sessionId);
   }
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

@@ -26,6 +26,7 @@ import type { LatchRegistry } from './latchRegistry';
 import { refuseUnsafeModalText } from './modalText';
 import type { PullProgress } from './ollamaClient';
 import type { SetupProgress } from '../../shared/protocol';
+import { errorMessage } from '../../shared/errorMessage';
 import type { SetupControllerDeps } from './SetupController';
 
 /** The seam {@link ProvisionRunner} reaches the host/façade through — the
@@ -820,10 +821,6 @@ function str(params: unknown, key: string): string | undefined {
     return typeof v === 'string' ? v : undefined;
   }
   return undefined;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function isAbortError(err: unknown): boolean {

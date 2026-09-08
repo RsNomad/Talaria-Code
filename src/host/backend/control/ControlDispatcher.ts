@@ -21,6 +21,7 @@ import { SkillsAdminHandler, isSkillsAdminMethod } from './skillsAdminHandler';
 import { CheckpointActionHandler } from './checkpointActions';
 import { DashboardToggleHandler } from './dashboardToggles';
 import { SessionScopeActions } from './sessionScopeActions';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /**
  * WS-GD.2a A5: `TRUST_GATED_METHODS` now lives on `adminOpRunner.ts` (its
@@ -539,16 +540,3 @@ function extractLoadParams(params: unknown): { sessionId?: string; cwd?: string 
 // `handleCustomModesConfigChanged`/`loadTab` moved onto
 // `sessionScopeActions.ts` (own docs moved there verbatim, including the
 // P7-N10 tombstone) with the rest of the sessions-scope domain.
-
-/**
- * WS-C C1 (BH-01, round-2): a fresh local copy — this file went back to
- * having exactly one caller (the `skills.toggle`/`toolsets.toggle` branch's
- * failure-isolated panel re-push log line), the same one-name-per-file
- * duplication `mcpAdminHandler.ts`/`checkpointActions.ts`/
- * `panelDataCoordinator.ts`/`skillsAdminHandler.ts`/`sessionScopeActions.ts`
- * each already carry (grepped before adding this — no shared export exists
- * to reuse instead).
- */
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}

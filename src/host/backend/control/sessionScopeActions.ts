@@ -2,6 +2,7 @@ import type { EditPolicyPreset, HydrateTabSeed, SlashCommandInfo } from '../../.
 import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
 import type { SessionController } from '../session/SessionController';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /**
  * WS-GD.2a A9: the narrowed slice of {@link ControlDispatcherHostPort} the
@@ -182,8 +183,4 @@ export class SessionScopeActions {
       );
     }
   }
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

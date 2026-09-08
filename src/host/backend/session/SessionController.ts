@@ -10,6 +10,7 @@ import type {
   SubagentsData,
 } from '../../../shared/protocol';
 import { BOOTSTRAP_TAB_ID, makePanelData } from '../../../shared/protocol';
+import { errorMessage } from '../../../shared/errorMessage';
 import type { ResolvedContext } from '../../context/types';
 import type { SessionHostPort } from './types';
 import { TurnTranslator } from '../acp/turnTranslator';
@@ -1762,10 +1763,6 @@ const PLAN_PREAMBLE =
  * T3/T5's job; this is only "don't emit a misleading 'turn N'".
  */
 const AFTER_TURN_LABEL = 'After turn';
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 function findOptionId(options: ApprovalOption[], kind: ApprovalOption['kind']): string | undefined {
   return options.find((option) => option.kind === kind)?.id;

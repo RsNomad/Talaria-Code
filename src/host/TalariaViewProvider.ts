@@ -18,6 +18,7 @@ import { buildSearchFilesResponse } from './context/searchFilesResponse';
 import type { FindFilesFn } from './context/searchFilesResponse';
 import { buildDiffUriParts } from './preview/parseDiffUri';
 import type { NextEditTogglePort } from '../shared/nextEditTogglePort';
+import { errorMessage } from '../shared/errorMessage';
 import type { DataPanel, NextEditToggleState, Panel, SetupMethod } from '../shared/protocol';
 import { KNOWN_REQUEST_METHODS, makePanelData, PANEL_SCOPE } from '../shared/protocol';
 import { redactControlResponse } from './redactControlResponse';
@@ -1371,11 +1372,6 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
-}
-
-/** Extract a human-readable message from an unknown thrown value. */
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 /** Task 9: every `SetupMethod` literal starts with `'setup.'` and no other

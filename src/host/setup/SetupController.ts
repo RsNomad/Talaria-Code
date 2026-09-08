@@ -48,6 +48,7 @@ import type {
   SetupProgress,
 } from '../../shared/protocol';
 import { SETUP_METHODS } from '../../shared/protocol';
+import { errorMessage } from '../../shared/errorMessage';
 
 // --- WS-GD.2b B7: façade re-exports — these symbols now live in provisionRunner.ts /
 // modalText.ts / latchRegistry.ts; re-exported here so existing external import
@@ -2422,10 +2423,6 @@ function bool(params: unknown, key: string): boolean | undefined {
     return typeof v === 'boolean' ? v : undefined;
   }
   return undefined;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function isNonNegativeNumber(value: unknown): value is number {
