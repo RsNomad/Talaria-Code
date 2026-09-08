@@ -22,6 +22,7 @@ import { Icon } from './Icon';
 import { AttachMenu } from './AttachMenu';
 import { LiveRegion } from './LiveRegion';
 import { useMenuFocus } from '../hooks/useMenuFocus';
+import { MenuPopup } from './MenuPopup';
 import { Pill } from './Pill';
 import { SuggestMenu, flattenSuggestSections, type SuggestItem } from './SuggestMenu';
 import { filterMentions, type MentionItem } from '../composer/mentionCatalog';
@@ -1190,19 +1191,16 @@ export function Composer({
               <Icon name="chevron-down" size={10} />
             </button>
             {presetMenu.open && (
-              <div
-                role="menu"
-                // W4-T6 (UI#8): APG Menu pattern
-                // (https://www.w3.org/WAI/ARIA/apg/patterns/menu/, fetched
-                // live for this task): "An element with role menu either
-                // has: aria-labelledby ... [or] a label provided by
-                // aria-label." This menu carried neither — unlike
-                // `AttachMenu.tsx`'s own `role="menu"`, which already does
-                // (`aria-label="Attach"`).
-                aria-label="Edit policy"
-                onKeyDown={presetMenu.onMenuKey}
-                className="absolute bottom-full left-0 z-30 mb-1 min-w-[184px] overflow-hidden rounded-card border border-border bg-overlay py-1 shadow-lg"
-              >
+              // W4-T6 (UI#8): APG Menu pattern
+              // (https://www.w3.org/WAI/ARIA/apg/patterns/menu/, fetched live
+              // for this task): "An element with role menu either has:
+              // aria-labelledby ... [or] a label provided by aria-label."
+              // This menu carried neither — unlike `AttachMenu.tsx`'s own
+              // `role="menu"`, which already does (`aria-label="Attach"`).
+              // FI-15: the container chrome (role/aria-label/border/
+              // positioning) is single-sourced in `MenuPopup` — see its file
+              // header for the extraction rationale.
+              <MenuPopup ariaLabel="Edit policy" minWidthClass="min-w-[184px]" onKeyDown={presetMenu.onMenuKey}>
                 {PRESETS.map((p, i) => {
                   const selected = p.id === preset;
                   return (
@@ -1236,7 +1234,7 @@ export function Composer({
                     </button>
                   );
                 })}
-              </div>
+              </MenuPopup>
             )}
           </div>
 
@@ -1266,14 +1264,11 @@ export function Composer({
                 <Icon name="chevron-down" size={10} />
               </button>
               {modeMenu.open && (
-                <div
-                  role="menu"
-                  // W4-T6 (UI#8): same unnamed-menu fix as the preset menu
-                  // above — see its comment for the APG grounding.
-                  aria-label="Mode"
-                  onKeyDown={modeMenu.onMenuKey}
-                  className="absolute bottom-full left-0 z-30 mb-1 min-w-[160px] overflow-hidden rounded-card border border-border bg-overlay py-1 shadow-lg"
-                >
+                // W4-T6 (UI#8): same unnamed-menu fix as the preset menu
+                // above — see its comment for the APG grounding. FI-15: same
+                // shared `MenuPopup` container as the preset menu (see its
+                // file header) — only `minWidthClass` differs between them.
+                <MenuPopup ariaLabel="Mode" minWidthClass="min-w-[160px]" onKeyDown={modeMenu.onMenuKey}>
                   <div className="border-b border-border px-2.5 py-1.5 font-mono text-2xs text-faint">
                     Restricts edits only, not a sandbox — terminal/code/subagent/MCP writes bypass it
                   </div>
@@ -1322,7 +1317,7 @@ export function Composer({
                       </button>
                     );
                   })}
-                </div>
+                </MenuPopup>
               )}
             </div>
           )}
