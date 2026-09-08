@@ -245,7 +245,7 @@ export interface TabState {
    * wipes the loaded delegation tree, just drives a dismissible banner over
    * it. Lives IN `TabState` (not a top-level `Record<tabId,string>`) so it
    * closes for free on `local.tab.close` — no separate GC pass needed (see
-   * `state/transcript.ts`'s AU-61 doc for the full lifecycle: set by
+   * `state/panelScopeFold.ts`'s AU-61 doc for the full lifecycle: set by
    * `reducePanelActionScoped`'s `subagents` case, cleared by that same tab's
    * next success push, a CF-10 empty landing, or a
    * `local.scopedRefreshError.dismiss{panel:'subagents'}`).
@@ -394,7 +394,7 @@ export interface AppState {
    * AUDIT-5 UI M-2: a READ-ONLY boot-time snapshot of this connection's
    * persisted, unsent per-tab Composer drafts, restored from
    * `vscode.getState()` (App.tsx) and consumed exactly once by
-   * `foldHydrateReconcile` (transcript.ts) — same lifecycle/keying posture as
+   * `foldHydrateReconcile` (hydrateFold.ts) — same lifecycle/keying posture as
    * {@link restoredTitles} (keyed by tabId, boot-only, never a second source
    * of truth for `TabState.draft`). A LIVE draft on the reconciled base
    * always wins over a restored one (see `foldHydrateReconcile`'s fold);
@@ -435,7 +435,7 @@ export interface AppState {
    * `refreshError` prop, `panels/PanelShell.tsx`). Scoped to
    * {@link RefreshErrorPanel} (`tools`/`mcp`/`skills`/`models`/`settings` —
    * see that type's own doc for why `'setup'` alone is excluded). Set by
-   * `state/transcript.ts`'s `reducePanelActionScoped` on a `local.panelError`
+   * `state/panelScopeFold.ts`'s `reducePanelActionScoped` on a `local.panelError`
    * over already-success data; cleared by that SAME panel's next success
    * push (`foldPanelData`) or a user dismiss (`local.refreshError.dismiss`).
    * The three re-scoped panels (subagents/checkpoints/sessions) are NOT
@@ -454,7 +454,7 @@ export interface AppState {
    * "Load more" page — OQ-1 Option A keeps that untouched): this signal is
    * for the WHOLE-LIST background refresh failing, driving the banner ABOVE
    * the list via `RemotePanel`'s `refreshError` prop. Set by
-   * `state/transcript.ts`'s `reducePanelActionScoped` `'sessions'` case on a
+   * `state/panelScopeFold.ts`'s `reducePanelActionScoped` `'sessions'` case on a
    * `local.panelError` over already-success data; cleared by the next
    * success push (`foldPanelData`) or `local.scopedRefreshError.dismiss{
    * panel:'sessions'}`.
@@ -465,7 +465,7 @@ export interface AppState {
    * rootId-keyed to mirror `rootPanels`' own keying (one shadow-git timeline
    * shared by every same-root tab, so the failure/banner is shared the same
    * way). Same TI-3 posture as {@link refreshError}. Set by
-   * `state/transcript.ts`'s `reducePanelActionScoped` `'checkpoints'` case
+   * `state/panelScopeFold.ts`'s `reducePanelActionScoped` `'checkpoints'` case
    * on a `local.panelError` over already-success data (keyed by
    * `action.scopeKey` — the root captured at fetch-issue time, B6); cleared
    * by that root's next success push or `local.scopedRefreshError.dismiss{

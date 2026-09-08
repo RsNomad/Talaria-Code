@@ -69,8 +69,9 @@ export type PanelAction =
        * receive its push, so there is no real "loading" happening). Kept
        * under the SAME `local.panelLoading` discriminant (rather than a new
        * action type) so the routing this already has —
-       * `reduceLocal`/`reducePanelActionScoped` in `transcript.ts` — doesn't
-       * need a matching new case; `applyPanelTransition` below is the only
+       * `reduceLocal` (`state/localReducer.ts`)/`reducePanelActionScoped`
+       * (`state/panelScopeFold.ts`) — doesn't need a matching new case;
+       * `applyPanelTransition` below is the only
        * place that inspects it. Type-erased to `unknown` for the same reason
        * `PanelAction` stays panel-agnostic everywhere else in this file (see
        * `reducePanelAction`'s doc): the caller (`fetchPanel`) is the only
@@ -107,7 +108,7 @@ export function setPanelSuccess<P extends DataPanel>(
  * (idle/loading, no data yet) still becomes `failure`. Mirrors TanStack
  * Query's `data` staying intact across a background `error` (query stays
  * `status: 'success'`, `isError` is a separate flag) — the analogous
- * `refreshError` side-map (`AppState.refreshError`, `state/transcript.ts`)
+ * `refreshError` side-map (`AppState.refreshError`, `state/panelScopeFold.ts`)
  * is what a caller reads to know a background refresh failed; this function
  * only owns the RemoteData half.
  *
@@ -121,7 +122,7 @@ export function setPanelSuccess<P extends DataPanel>(
  * left it a follow-up. AU-61 (T1/T2) SHIPPED that follow-up: each of the
  * three now has its own signal (`AppState.sessionsRefreshError` /
  * `.checkpointsRefreshError` / `TabState.subagentsRefreshError`, set by
- * `state/transcript.ts`'s `reducePanelActionScoped`) and its own dismissible
+ * `state/panelScopeFold.ts`'s `reducePanelActionScoped`) and its own dismissible
  * banner, wired through `RemotePanel`'s existing `refreshError` prop via
  * {@link readScopedRefreshError} (App.tsx's three `RemotePanel` sites) —
  * distinct from, and additive to, the map-keyed `RefreshErrorPanel` banner
@@ -167,7 +168,7 @@ export function reducePanelAction(panels: PanelStateMap, action: PanelAction): P
       // (return `panels` unchanged for this slot) rather than replacing it
       // with a `failure(...)` card. Only a first-load failure (current is
       // idle/loading/error — no data to preserve) still becomes `failure`.
-      // `state/transcript.ts`'s `reducePanelActionScoped` is what records the
+      // `state/panelScopeFold.ts`'s `reducePanelActionScoped` is what records the
       // parallel `refreshError` side-map entry for the 5 in-scope panels —
       // this function only owns the RemoteData half, same split as
       // `applyPanelTransition`.

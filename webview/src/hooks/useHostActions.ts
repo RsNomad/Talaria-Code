@@ -13,7 +13,7 @@
  *       re-resolved from ambient `state.activeTabId` at fold time (N5, ARCH
  *       I-2): a host message (e.g. `turn.start` adopting a new session)
  *       can move `activeTabId` between an optimistic dispatch and its
- *       fold; `foldTabScoped` (state/transcript.ts) means the change always
+ *       fold; `foldTabScoped` (state/scopedFold.ts) means the change always
  *       lands on the tab the user actually acted on. Same shape P7-N1's
  *       `local.draft.*` actions established.
  *
