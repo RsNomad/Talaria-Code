@@ -90,8 +90,8 @@ import { SetupPanel } from './panels/SetupPanel';
 import { ErrorBanner } from './components/ErrorBanner';
 import { GatewayHealthBanner } from './components/GatewayHealthBanner';
 import { MockNotice } from './components/MockNotice';
-import { Icon } from './components/Icon';
 import { LiveRegion } from './components/LiveRegion';
+import { RecoveryRow } from './components/RecoveryRow';
 
 type Action = { host: HostToWebview } | { local: LocalAction };
 
@@ -993,17 +993,11 @@ export function App() {
           so the flag's terminals (`tab.bound`/`tab.error`) restore this row
           automatically if the attempt fails. */}
       {!tab.error && tab.openFailed === true && tab.binding !== 'bound' && tab.newSessionPending !== true && (
-        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
-          <Icon name="warning" size={12} className="flex-none text-warn" />
-          <span className="min-w-0 flex-1">This chat never connected to the agent.</span>
-          <button
-            type="button"
-            onClick={() => bridge.post({ type: 'tab.open', tabId: tab.tabId })}
-            className="flex-none rounded border border-border px-1.5 py-0.5 text-2xs text-fg hover:bg-overlay"
-          >
-            Reconnect
-          </button>
-        </div>
+        <RecoveryRow
+          icon={{ name: 'warning', className: 'flex-none text-warn' }}
+          message="This chat never connected to the agent."
+          action={{ label: 'Reconnect', onClick: () => bridge.post({ type: 'tab.open', tabId: tab.tabId }) }}
+        />
       )}
 
       {/* ARCH-1 (final review, UI I-3): the session-lost sibling of the G-9
@@ -1014,17 +1008,14 @@ export function App() {
           (render priority only — `sessionLost`/`sessionLostReason` stay
           untouched in state, so a failed attempt restores this row). */}
       {!tab.error && tab.sessionLost === true && tab.binding !== 'bound' && tab.newSessionPending !== true && (
-        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
-          <Icon name="warning" size={12} className="flex-none text-warn" />
-          <span className="min-w-0 flex-1">{sessionLostRowCopy(tab.sessionLostReason)}</span>
-          <button
-            type="button"
-            onClick={() => dispatch({ local: { type: 'local.setPanel', panel: 'sessions' } })}
-            className="flex-none rounded border border-border px-1.5 py-0.5 text-2xs text-fg hover:bg-overlay"
-          >
-            History
-          </button>
-        </div>
+        <RecoveryRow
+          icon={{ name: 'warning', className: 'flex-none text-warn' }}
+          message={sessionLostRowCopy(tab.sessionLostReason)}
+          action={{
+            label: 'History',
+            onClick: () => dispatch({ local: { type: 'local.setPanel', panel: 'sessions' } }),
+          }}
+        />
       )}
 
       {/* UX-04a: honest "Starting a new session…" pending state, mirroring
@@ -1036,10 +1027,7 @@ export function App() {
           takes over), so this row never overlaps that banner. `tab.bound`
           arrival removes both. */}
       {tab.newSessionPending === true && !tab.error && (
-        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
-          <Icon name="loading" size={12} spin className="flex-none" />
-          <span className="min-w-0 flex-1">Starting a new session…</span>
-        </div>
+        <RecoveryRow icon={{ name: 'loading', spin: true, className: 'flex-none' }} message="Starting a new session…" />
       )}
       <LiveRegion text={tab.newSessionPending === true ? 'Starting a new session…' : ''} className="sr-only" />
 
