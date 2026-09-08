@@ -39,6 +39,7 @@ import {
   type PopupId,
 } from '../composer/composerDerive';
 import { applySeed, type ComposerSeed } from '../composer/applySeed';
+import { MIN_H, useComposerResize } from '../composer/useComposerResize';
 import { busyInteraction } from './busyInteraction';
 import { useFocusAnchorOnUnmount } from '../hooks/useFocusAnchorOnUnmount';
 import { ConfirmStrip } from './ConfirmStrip';
@@ -74,7 +75,6 @@ function nonEmptyFirst<T>(arr: readonly T[]): T {
 
 const FIRST_PRESET = nonEmptyFirst(PRESETS);
 
-const MIN_H = 64;
 const NARROW = 360;
 
 interface ComposerProps {
@@ -342,25 +342,9 @@ export function Composer({
   const modeWrapRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
   const [narrow, setNarrow] = useState(false);
-  const [height, setHeight] = useState(initialHeight);
-  // T5 (§7.2.3): owns the drag-resize AbortController — see `startResize`
-  // and the unmount-cleanup `useEffect` below.
-  const resizeAbortRef = useRef<AbortController | null>(null);
-  /**
-   * W4-T6 (UI#8): the resize grabber's `aria-valuemax` (below) used to be a
-   * plain `const` recomputed from `window.innerHeight` inline in the render
-   * body — which happened to track the real viewport whenever SOME OTHER
-   * prop/state change caused a re-render, but nothing re-rendered this
-   * component on an actual window `resize` with no other trigger, so the
-   * announced max silently lagged behind reality (a stale snapshot, not a
-   * live one) until the next unrelated render. State + a `resize` listener
-   * makes it genuinely reactive. `clampH` below is UNCHANGED — it already
-   * reads `window.innerHeight` fresh at drag-time, which was always correct;
-   * only the DISPLAYED `aria-valuemax` was stale.
-   */
-  const [maxH, setMaxH] = useState(() =>
-    Math.round((typeof window !== 'undefined' ? window.innerHeight : 800) * 0.6),
-  );
+  // WS-F5 F5-3 (FI-05, part 1/2): drag/keyboard resize state, handlers, and
+  // effects moved verbatim into `useComposerResize` (see that file).
+  const { height, maxH, startResize, resizeByKey } = useComposerResize(initialHeight, onHeightChange);
   /** A2 (UI I-9): oversize-attachment / FileReader-error notice — surfaced
    * through the permanently-mounted `LiveRegion` below (Finding-7 discipline:
    * the region itself is never conditionally mounted, only this text is
@@ -441,16 +425,6 @@ export function Composer({
     ro.observe(el);
     setNarrow(el.getBoundingClientRect().width < NARROW);
     return () => ro.disconnect();
-  }, []);
-
-  // W4-T6 (UI#8): keeps `maxH` (the resize grabber's `aria-valuemax`) in
-  // sync with the ACTUAL viewport on a real window resize — see the state
-  // declaration's doc above for why the old inline-`const` computation went
-  // stale.
-  useEffect(() => {
-    const onResize = () => setMaxH(Math.round(window.innerHeight * 0.6));
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
   }, []);
 
   // Dismiss the preset picker on an outside press.
@@ -892,77 +866,6 @@ export function Composer({
       e.preventDefault();
       submit();
     }
-  };
-
-  // ---- drag-resize ----
-
-  const clampH = (h: number) => Math.max(MIN_H, Math.min(h, Math.round(window.innerHeight * 0.6)));
-
-  /**
-   * T5 (§7.2.3, AU-61 extra-b): one `AbortController` owns BOTH window
-   * listeners (MDN: `abort()` removes every listener registered with that
-   * signal), so the unmount path (below) and the pointerup path share ONE
-   * teardown and neither can forget the other's listener. Before this fix,
-   * teardown lived ONLY inside `up`: unmounting mid-drag (e.g. a host
-   * panel-switch away from 'chat') leaked both window listeners until the
-   * NEXT pointerup anywhere, left `document.body` stuck at
-   * `user-select: none`, kept calling `setHeight` on an unmounted
-   * component, and later fired `onHeightChange` through a stale closure.
-   */
-  const startResize = (e: React.PointerEvent) => {
-    e.preventDefault();
-    const startY = e.clientY;
-    const startH = height;
-    let latest = startH;
-    const controller = new AbortController();
-    resizeAbortRef.current = controller;
-    document.body.style.userSelect = 'none';
-    window.addEventListener(
-      'pointermove',
-      (ev) => {
-        latest = clampH(startH + (startY - ev.clientY));
-        setHeight(latest);
-      },
-      { signal: controller.signal },
-    );
-    window.addEventListener(
-      'pointerup',
-      () => {
-        controller.abort(); // removes both listeners
-        resizeAbortRef.current = null;
-        document.body.style.userSelect = '';
-        onHeightChange(latest);
-      },
-      { signal: controller.signal },
-    );
-  };
-
-  // T5 (§7.2.3): unmount-only cleanup — ends an in-progress drag exactly as
-  // `pointerup` would, EXCEPT it does NOT call `onHeightChange` (no persist
-  // for a drag the unmount cancelled — a deliberate cancel-vs-commit
-  // choice). Guarded on the ref so it only touches `userSelect` when a drag
-  // was actually active, never clobbering an unrelated future writer of that
-  // style. Idempotent: React 19 StrictMode's double-invoke finds the ref
-  // already null on its second pass.
-  useEffect(
-    () => () => {
-      if (resizeAbortRef.current) {
-        resizeAbortRef.current.abort();
-        resizeAbortRef.current = null;
-        document.body.style.userSelect = '';
-      }
-    },
-    [],
-  );
-
-  const resizeByKey = (e: React.KeyboardEvent) => {
-    let next: number | null = null;
-    if (e.key === 'ArrowUp') next = clampH(height + 16);
-    else if (e.key === 'ArrowDown') next = clampH(height - 16);
-    if (next === null) return;
-    e.preventDefault();
-    setHeight(next);
-    onHeightChange(next);
   };
 
   const activePreset = PRESETS.find((p) => p.id === preset) ?? FIRST_PRESET;
