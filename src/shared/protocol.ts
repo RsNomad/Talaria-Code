@@ -751,10 +751,6 @@ export interface SetupBackendOption {
      *  docs link + endpoint Test only (e.g. vLLM, §5.2 rev 3 ⑪). */
     flavor: 'pipx' | 'guided-terminal' | 'docs-only';
     effort: 'one-script' | 'manual-guided';
-    /** @deprecated beta.6 T11 — the unified FIM/RAG surfaces read
-     *  `SetupData.catalog.models` instead; still projected for wire compat
-     *  (see `registry.ts` `LocalInstallMode.models`), do NOT remove. */
-    models?: { role: 'fim' | 'embedding'; model: string; present: boolean }[];
   };
   /** Present iff this FIM backend also supports the NEXT card's "generic" (reuse) source. */
   nextEditTransport?: 'ollama' | 'openai-compat';
@@ -953,15 +949,6 @@ export interface SetupData {
      */
     embedBackend?: 'ollama' | 'llamacpp' | 'openai-compat';
     embedModel: string;
-    /**
-     * @deprecated beta.6 T14 — computed against the daemon the HOST probed,
-     * not `embedEndpoint`, so it answers for the wrong daemon whenever the
-     * two differ (and its exact match misses `:latest`). The unified UI
-     * derives presence client-side, endpoint-scoped (§3.4 C-6,
-     * `ragEmbedPresence` in `setupCards.ts`); the field stays on the wire
-     * for compat only — no webview code reads it (source-scan-locked).
-     */
-    embedModelPresent: boolean;
     tuning: { dims: number; maxChunkTokens: number; debounceMs: number; excludeGlobs: string[] };
     indexDir: string;
     /** `shouldActivateRag` text, populated when RAG is blocked from activating. */

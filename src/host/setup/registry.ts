@@ -64,16 +64,6 @@ export interface LocalInstallMode {
   /** Honesty label rendered on the card, e.g. 'clean one-script install' vs
    *  'manual install — needs your own build/hardware decisions'. */
   effort: 'one-script' | 'manual-guided';
-  /** Model provisioning once the server is reachable (Ollama only in v1).
-   *
-   *  @deprecated beta.6 T11 — the unified FIM/RAG surfaces (`LocalModelBlock`)
-   *  read the verified catalog (`SetupData.catalog.models`, projected from
-   *  `MODEL_CATALOG`) instead; no shipping UI consumes this projection
-   *  anymore. It STAYS on the wire for compat (`SetupController.
-   *  projectBackend` still projects it) — do NOT remove without a
-   *  wire-compat decision. */
-  models?: { pull: 'ollama-api';
-             defaults: { role: 'fim' | 'embedding'; model: string; settingKey: string }[] };
 }
 
 export interface RemoteMode {
@@ -190,19 +180,6 @@ export const FIM_BACKENDS: readonly BackendDescriptor[] = [
         docsUrl: 'https://ollama.com/download/linux',
       },
       effort: 'one-script',
-      // Deprecated wire data (see `LocalInstallMode.models`' @deprecated note):
-      // kept for wire compat only — the unified UI reads `catalog.models` now.
-      models: {
-        pull: 'ollama-api',
-        defaults: [
-          // = config.ts DEFAULT_MODEL (drift-locked by registry.test.ts (f)).
-          { role: 'fim', model: 'qwen2.5-coder:1.5b-base', settingKey: 'talaria.autocomplete.model' },
-          // = package.json talaria.rag.embedModel default — the embedding
-          // role rides this card because rag.embedEndpoint already defaults
-          // to the same daemon (§2.4).
-          { role: 'embedding', model: 'qwen3-embedding:0.6b', settingKey: 'talaria.rag.embedModel' },
-        ],
-      },
     },
     nextEditTransport: 'ollama',
   },

@@ -808,8 +808,8 @@ export class SetupController {
       'talaria.setup.hermesInstall',
     );
 
-    const agentOptions = this.deps.registry.AGENT_BACKENDS.map((d) => this.projectBackend(d, ollamaStatus, apiKeySet));
-    const fimOptions = this.deps.registry.FIM_BACKENDS.map((d) => this.projectBackend(d, ollamaStatus, apiKeySet));
+    const agentOptions = this.deps.registry.AGENT_BACKENDS.map((d) => this.projectBackend(d, apiKeySet));
+    const fimOptions = this.deps.registry.FIM_BACKENDS.map((d) => this.projectBackend(d, apiKeySet));
 
     const fimBackendId = this.host.getSetting<string>('talaria.autocomplete.backend') ?? 'ollama';
     const fimDescriptor =
@@ -863,8 +863,6 @@ export class SetupController {
       rag: composeRagBlock({
         reader: this.host,
         trusted,
-        ollamaRunning: ollamaStatus.running,
-        ollamaModels: ollamaStatus.running ? ollamaStatus.models : [],
       }),
       // T13 (§4.2): `endpoint` = the endpoint this status() ACTUALLY probed
       // — presence claims are scoped to it (critic C-6).
@@ -1981,7 +1979,7 @@ export class SetupController {
     return 'missing';
   }
 
-  private projectBackend(d: BackendDescriptor, ollama: OllamaStatus, apiKeySet: boolean): SetupBackendOption {
+  private projectBackend(d: BackendDescriptor, apiKeySet: boolean): SetupBackendOption {
     const option: SetupBackendOption = {
       id: d.id,
       kind: d.kind,
@@ -2005,15 +2003,6 @@ export class SetupController {
       option.localInstall = {
         flavor: d.localInstall.recipe.kind,
         effort: d.localInstall.effort,
-        ...(d.localInstall.models
-          ? {
-              models: d.localInstall.models.defaults.map((m) => ({
-                role: m.role,
-                model: m.model,
-                present: ollama.running ? ollama.models.some((om) => om.name === m.model) : false,
-              })),
-            }
-          : {}),
       };
     }
     if (d.nextEditTransport) option.nextEditTransport = d.nextEditTransport;

@@ -34,7 +34,6 @@ const FIXTURE: SetupData = {
     enabled: true,
     embedEndpoint: 'http://127.0.0.1:11434',
     embedModel: 'qwen3-embedding:0.6b',
-    embedModelPresent: false,
     tuning: { dims: 0, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: [] },
     indexDir: '.hermes/index',
   },

@@ -48,7 +48,6 @@ const globalPanelData: { [P in Exclude<DataPanel, 'subagents' | 'checkpoints' | 
       enabled: false,
       embedEndpoint: '',
       embedModel: '',
-      embedModelPresent: false,
       tuning: { dims: 0, maxChunkTokens: 0, debounceMs: 0, excludeGlobs: [] },
       indexDir: '',
     },

@@ -213,16 +213,7 @@ describe('registry (e): nextEditTransport mapping (§2.3 NEXT row)', () => {
   });
 });
 
-describe('registry (f): ollama model provisioning', () => {
-  it('maps fim → talaria.autocomplete.model and embedding → talaria.rag.embedModel', () => {
-    const models = mustGet('ollama').localInstall?.models;
-    expect(models?.pull).toBe('ollama-api');
-    expect(models?.defaults).toEqual([
-      { role: 'fim', model: 'qwen2.5-coder:1.5b-base', settingKey: 'talaria.autocomplete.model' },
-      { role: 'embedding', model: 'qwen3-embedding:0.6b', settingKey: 'talaria.rag.embedModel' },
-    ]);
-  });
-
+describe('registry (f): ollama default-model drift locks (real sources)', () => {
   it('the fim default model still matches config.ts DEFAULT_MODEL (reverse drift-lock)', () => {
     const source = readFileSync(CONFIG_TS_PATH, 'utf-8');
     expect(source).toContain("const DEFAULT_MODEL = 'qwen2.5-coder:1.5b-base'");

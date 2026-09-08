@@ -460,7 +460,6 @@ function ragData(overrides: Partial<SetupData['rag']> = {}): SetupData['rag'] {
     enabled: true,
     embedEndpoint: 'http://127.0.0.1:11434',
     embedModel: 'nomic-embed-text',
-    embedModelPresent: true,
     tuning: { dims: 768, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: [] },
     indexDir: '.talaria/index',
     ...overrides,
@@ -469,9 +468,7 @@ function ragData(overrides: Partial<SetupData['rag']> = {}): SetupData['rag'] {
 
 describe('ragDoneLine — B5 done line, T14 endpoint-scoped honesty (§3.4 truth table)', () => {
   // T14: the second argument is the CLIENT-derived, endpoint-scoped presence
-  // of the configured embed model (`ragEmbedPresence`) — the deprecated wire
-  // boolean rides along inside `rag` in every case below (`ragData()` pins it
-  // TRUE) and must be IGNORED entirely.
+  // of the configured embed model (`ragEmbedPresence`).
   it("is the exact §6 copy when enabled + unblocked + genuinely 'present' at the configured endpoint", () => {
     expect(ragDoneLine(ragData(), 'present')).toBe('Codebase index is ready — the agent can search your project.');
   });
@@ -486,8 +483,8 @@ describe('ragDoneLine — B5 done line, T14 endpoint-scoped honesty (§3.4 truth
       ragDoneLine(ragData({ preconditionDetail: 'The codebase index needs a trusted, open workspace.' }), 'present'),
     ).toBe('');
   });
-  it("presence 'unknown' (configured endpoint ≠ the probed daemon) makes NO claim — even while the deprecated wire boolean says true (the beta.5 wrong-daemon lie, pinned dead)", () => {
-    expect(ragDoneLine(ragData({ embedModelPresent: true }), 'unknown')).toBe('');
+  it("presence 'unknown' (configured endpoint ≠ the probed daemon) makes NO claim", () => {
+    expect(ragDoneLine(ragData(), 'unknown')).toBe('');
   });
 });
 
@@ -1155,8 +1152,7 @@ describe('§6 copy — verbatim + single-sourced (SCOPED source-scan: hand-writt
 });
 
 /* ------------------------------------------------------------------ *
- * beta.6 T11 (§3.2/§6): FIM-surface nudge constants + the
- * `localInstall.models` deprecation lock.
+ * beta.6 T11 (§3.2/§6): FIM-surface nudge constants.
  * ------------------------------------------------------------------ */
 
 describe('§6 FIM-surface nudges (T11) — verbatim + single-sourced', () => {
@@ -1174,24 +1170,6 @@ describe('§6 FIM-surface nudges (T11) — verbatim + single-sourced', () => {
     const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
     expect(setupPanelSrc).not.toContain('set it as your FIM model in the Connect tab');
     expect(setupPanelSrc).not.toContain('Then open the Connect tab and Apply.');
-  });
-});
-
-describe('T11 — the registry `localInstall.models` wire projection: deprecated-in-comment, NOT removed', () => {
-  const registrySrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'host', 'setup', 'registry.ts'), 'utf-8');
-  const setupPanelSrc = readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8');
-
-  it('registry.ts still carries the models projection (wire compat — never removed by T11)', () => {
-    expect(registrySrc).toContain("{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', settingKey: 'talaria.autocomplete.model' }");
-    expect(registrySrc).toContain("{ role: 'embedding', model: 'qwen3-embedding:0.6b', settingKey: 'talaria.rag.embedModel' }");
-  });
-
-  it('registry.ts marks the projection @deprecated (beta.6 T11 — the unified UI reads catalog.models)', () => {
-    expect(registrySrc).toContain('@deprecated beta.6 T11');
-  });
-
-  it('SetupPanel.tsx no longer consumes localInstall.models (the block reads catalog.models instead)', () => {
-    expect(setupPanelSrc).not.toMatch(/localInstall\??\.models/);
   });
 });
 
@@ -1535,31 +1513,6 @@ describe('T14 — F-3 closed: every embedding row has a verified llama.cpp build
       expect(row.llamacpp).toBeDefined();
     }
     expect(embedRows.find((m) => m.id === 'embeddinggemma-300m')?.llamacpp?.gguf.hfRepo).toBe('ggml-org/embeddinggemma-300M-GGUF');
-  });
-});
-
-describe('T14 — the beta.5 wrong-daemon presence boolean: webview consumption REMOVED, wire kept (deprecated-in-comment)', () => {
-  // The identifier is spelled out only HERE (test file) — the three scanned
-  // sources must not carry it at all, comments included.
-  const WIRE_BOOLEAN = 'embedModelPresent';
-
-  it('SetupPanel.tsx / localModel.tsx / setupCards.ts no longer mention the wire boolean (endpoint-scoped derivation replaced it)', () => {
-    expect(readFileSync(join(__dirname, 'SetupPanel.tsx'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
-    expect(readFileSync(join(__dirname, 'localModel.tsx'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
-    expect(readFileSync(join(__dirname, 'setupCards.ts'), 'utf-8')).not.toContain(WIRE_BOOLEAN);
-  });
-
-  it('the wire field + host computation SURVIVE (compat), marked @deprecated beta.6 T14', () => {
-    const protocolSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'shared', 'protocol.ts'), 'utf-8');
-    // WS-GD.2b B3: the composition moved from SetupController.ts's inline
-    // status() body into statusBlocks.ts's composeRagBlock — same computation,
-    // read off `ollamaRunning`/`ollamaModels` (the composer's own args) rather
-    // than `ollamaStatus.running`/`.models`.
-    const statusBlocksSrc = readFileSync(join(__dirname, '..', '..', '..', 'src', 'host', 'setup', 'statusBlocks.ts'), 'utf-8');
-    expect(protocolSrc).toContain(`${WIRE_BOOLEAN}: boolean`);
-    expect(protocolSrc).toContain('@deprecated beta.6 T14');
-    expect(statusBlocksSrc).toContain(`${WIRE_BOOLEAN}: ollamaRunning`);
-    expect(statusBlocksSrc).toContain('@deprecated beta.6 T14');
   });
 });
 

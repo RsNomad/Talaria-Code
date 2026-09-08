@@ -1991,7 +1991,7 @@ describe('status(): assembles SetupData from registry + settings + secrets + oll
     expect(data.agent.phase).toBe('awaiting-reload');
   });
 
-  it('ollama running populates ollama.models and embedModelPresent', async () => {
+  it('ollama running is reflected on ollama.running', async () => {
     const { controller } = makeController(
       {},
       {
@@ -2003,7 +2003,6 @@ describe('status(): assembles SetupData from registry + settings + secrets + oll
     );
     const data = await controller.status();
     expect(data.ollama.running).toBe(true);
-    expect(data.rag.embedModelPresent).toBe(true);
   });
 
   it('nextEdit.source=generic on a backend without generic support carries a refusalDetail', async () => {

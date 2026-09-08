@@ -70,7 +70,6 @@ function ollamaOption(overrides: Partial<SetupBackendOption> = {}): SetupBackend
     localInstall: {
       flavor: 'guided-terminal',
       effort: 'one-script',
-      models: [{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', present: true }],
     },
     nextEditTransport: 'ollama',
     ...overrides,
@@ -249,7 +248,6 @@ function baseData(overrides: Partial<SetupData> = {}): SetupData {
       enabled: false,
       embedEndpoint: 'http://127.0.0.1:11434',
       embedModel: 'nomic-embed-text',
-      embedModelPresent: false,
       // beta.6 panel-fix PT2: host-owned per-pane endpoint defaults — a
       // post-PT2 host ALWAYS populates these (RAG_ENDPOINT_DEFAULTS,
       // drift-locked host-side). Old-host fixtures delete the field.
@@ -1154,9 +1152,8 @@ describe('B5 "done / what next" one-line status under each card (§6, T10)', () 
     expect(screen.getByText('Next-edit suggestions are on (reusing your FIM model).')).toBeInTheDocument();
   });
 
-  it('RAG card shows the done line once green (T14: green = endpoint-scoped presence, never the deprecated wire boolean)', () => {
-    // The daemon at the CONFIGURED embed endpoint genuinely lists the model —
-    // the wire's `embedModelPresent` stays FALSE to prove it is ignored.
+  it('RAG card shows the done line once green (T14: green = endpoint-scoped presence)', () => {
+    // The daemon at the CONFIGURED embed endpoint genuinely lists the model.
     renderPanel(
       baseData({
         rag: { ...baseData().rag, enabled: true },
@@ -3413,10 +3410,8 @@ describe('T14 — embedBackend restoration (§4.2): the initial pane reads rag.e
 });
 
 describe('T14 — card-level presence honesty (the §3.4 truth table, dom half)', () => {
-  it('the deprecated wire boolean can no longer fake a green line: endpoint mismatch ⇒ NO done line even with the boolean true', () => {
-    renderPanel(
-      baseData({ rag: { ...baseData().rag, enabled: true, embedModelPresent: true, embedEndpoint: 'http://10.0.0.9:11434' } }),
-    );
+  it('endpoint mismatch keeps presence unknown ⇒ NO done line', () => {
+    renderPanel(baseData({ rag: { ...baseData().rag, enabled: true, embedEndpoint: 'http://10.0.0.9:11434' } }));
     expect(screen.queryByText('Codebase index is ready — the agent can search your project.')).not.toBeInTheDocument();
   });
 
@@ -3428,7 +3423,7 @@ describe('T14 — card-level presence honesty (the §3.4 truth table, dom half)'
     expect(within(ragCard).queryByText('not present')).not.toBeInTheDocument();
   });
 
-  it('a genuinely present model at the configured endpoint (:latest-tolerant) turns the done line green with the boolean FALSE', () => {
+  it('a genuinely present model at the configured endpoint (:latest-tolerant) turns the done line green', () => {
     renderPanel(
       baseData({
         rag: { ...baseData().rag, enabled: true },

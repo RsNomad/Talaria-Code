@@ -591,7 +591,6 @@ export const panelData: PanelDataMap = {
           localInstall: {
             flavor: 'guided-terminal',
             effort: 'one-script',
-            models: [{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', present: true }],
           },
           nextEditTransport: 'ollama',
         },
@@ -622,7 +621,6 @@ export const panelData: PanelDataMap = {
       enabled: false,
       embedEndpoint: 'http://127.0.0.1:11434',
       embedModel: 'nomic-embed-text',
-      embedModelPresent: false,
       tuning: { dims: 768, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: ['node_modules/**', '.git/**'] },
       indexDir: '.talaria/index',
     },

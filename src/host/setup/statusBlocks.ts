@@ -155,16 +155,12 @@ export function composeDedicated(): NonNullable<SetupData['nextEdit']['dedicated
 }
 
 /** Pure move of `status()`'s `rag` composition (Card 5 — codebase index).
- *  `trusted`/`ollamaRunning`/`ollamaModels` are computed by the caller and
- *  passed in. **CAUTION**: `embedModelPresent` reproduces the deprecated
- *  wrong-daemon computation byte-identically — see its own doc below. */
+ *  `trusted` is computed by the caller and passed in. */
 export function composeRagBlock(args: {
   reader: SettingsReader;
   trusted: boolean;
-  ollamaRunning: boolean;
-  ollamaModels: readonly { name: string }[];
 }): SetupData['rag'] {
-  const { reader, trusted, ollamaRunning, ollamaModels } = args;
+  const { reader, trusted } = args;
   const ragEnabled = reader.getSetting<boolean>('talaria.rag.enabled') ?? true;
   const ragEmbedEndpoint =
     (reader.getSetting<string>('talaria.rag.embedEndpoint') ?? '').trim() || DEFAULT_OLLAMA_ENDPOINT;
@@ -193,13 +189,6 @@ export function composeRagBlock(args: {
     // defaults, ALWAYS populated — mirrors agentLocalModel.endpointDefaults
     // (CC-6) exactly. Never webview-fabricated (Global Constraint 1).
     endpointDefaults: RAG_ENDPOINT_DEFAULTS,
-    // @deprecated beta.6 T14 (wire compat only): the wrong-daemon
-    // computation §3.4 replaced — it answers for the endpoint this
-    // status() probed, not `embedEndpoint`, and the exact `===` misses
-    // `:latest`. The unified UI derives presence client-side instead
-    // (`ragEmbedPresence`, endpoint-scoped per C-6); no webview code
-    // reads this field anymore (source-scan-locked in SetupPanel.test.ts).
-    embedModelPresent: ollamaRunning ? ollamaModels.some((m) => m.name === ragEmbedModel) : false,
     tuning: ragTuning,
     indexDir: ragIndexDir,
     ...(trusted ? {} : { preconditionDetail: 'The codebase index needs a trusted, open workspace.' }),
