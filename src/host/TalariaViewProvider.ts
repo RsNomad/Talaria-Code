@@ -619,6 +619,28 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
 
   // --- webview → backend routing --------------------------------------------
 
+  /** FI-24: the optional-backend-member dispatch idiom. `supported` is the
+   *  presence check for an OPTIONAL backend method; when absent, log
+   *  `onMissing` and return. Otherwise run `invoke`; if it returns a Promise
+   *  and `onFail` is given, attach a `.catch` that logs `onFail(err)` (the
+   *  fire-and-forget discipline — the backend never rejects in normal flow;
+   *  this is defense-in-depth against an unhandled rejection). */
+  private dispatchOptional(
+    supported: boolean,
+    invoke: () => void | Promise<unknown>,
+    onMissing: string,
+    onFail?: (err: unknown) => string,
+  ): void {
+    if (!supported) {
+      this.logger?.appendLine(onMissing);
+      return;
+    }
+    const result = invoke();
+    if (result instanceof Promise && onFail !== undefined) {
+      void result.catch((err) => this.logger?.appendLine(onFail(err)));
+    }
+  }
+
   private handleWebviewMessage(message: WebviewToHostMessage): void {
     switch (message.type) {
       case 'ready':
@@ -710,27 +732,25 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         // W2-F1: route the edit-policy preset switch to the backend's client-side
         // engine, when the active backend has one (the real AcpBackend). The
         // backend answers with an authoritative `policy.state` push.
-        if (this.backend.setPreset) {
-          this.backend.setPreset(message.sessionId, message.preset);
-        } else {
-          this.logger?.appendLine(
-            `[policy] setPreset '${message.preset}' ignored — backend has no policy engine`,
-          );
-        }
+        // FI-24: factored through `dispatchOptional` (the shared optional-
+        // backend-member guard-else-log idiom).
+        this.dispatchOptional(
+          this.backend.setPreset !== undefined,
+          () => this.backend.setPreset?.(message.sessionId, message.preset),
+          `[policy] setPreset '${message.preset}' ignored — backend has no policy engine`,
+        );
         break;
 
       case 'mode.set':
         // SF-2 (T4b): route the custom-mode switch to the backend's engine,
         // when the active backend has one (the real AcpBackend). The
         // backend answers with an authoritative `mode.state` push, same
-        // posture as `policy.setPreset` above.
-        if (this.backend.setCustomMode) {
-          this.backend.setCustomMode(message.sessionId, message.modeId);
-        } else {
-          this.logger?.appendLine(
-            `[policy] mode.set '${String(message.modeId)}' ignored — backend has no custom-mode engine`,
-          );
-        }
+        // posture as `policy.setPreset` above (FI-24: `dispatchOptional`).
+        this.dispatchOptional(
+          this.backend.setCustomMode !== undefined,
+          () => this.backend.setCustomMode?.(message.sessionId, message.modeId),
+          `[policy] mode.set '${String(message.modeId)}' ignored — backend has no custom-mode engine`,
+        );
         break;
 
       case 'tab.open':
@@ -769,39 +789,38 @@ export class TalariaViewProvider implements vscode.WebviewViewProvider {
         // session.load does not), so it routes directly to the backend's
         // loadTab (T5a's hardened loadSessionIntoTab with an explicit tabId)
         // when the active backend supports it; no-ops for MockBackend (same
-        // optional-member posture as `setPreset`/`setCustomMode` above).
-        // loadTab itself never throws/rejects (mirrors tab.open's
-        // fire-and-forget discipline) —
+        // optional-member posture as `setPreset`/`setCustomMode` above,
+        // factored through `dispatchOptional`, FI-24). loadTab itself never
+        // throws/rejects (mirrors tab.open's fire-and-forget discipline) —
         // the `.catch` here is defense in depth only.
-        if (this.backend.loadTab) {
-          void this.backend
-            .loadTab(
+        this.dispatchOptional(
+          this.backend.loadTab !== undefined,
+          () =>
+            this.backend.loadTab?.(
               message.tabId,
               message.sessionId,
               message.cwd,
               ...(message.title !== undefined ? ([message.title] as const) : ([] as const)),
-            )
-            .catch((err) => this.logger?.appendLine(`[tab.load] ${message.tabId} failed: ${String(err)}`));
-        } else {
-          this.logger?.appendLine(`[tab.load] ${message.tabId} ignored — backend has no loadTab support`);
-        }
+            ),
+          `[tab.load] ${message.tabId} ignored — backend has no loadTab support`,
+          (err) => `[tab.load] ${message.tabId} failed: ${String(err)}`,
+        );
         break;
 
       case 'tab.newSession':
         // W3-T6 (CF-11/D2): the composer's per-tab "New Session" — routes
         // directly to the backend's newSessionInTab when the active backend
-        // supports it (same optional-member posture as loadTab above);
-        // no-ops for a backend without one. newSessionInTab itself never
-        // throws/rejects (mirrors tab.open/tab.load's fire-and-forget +
-        // terminal-tab.error discipline) — the `.catch` here is defense in
-        // depth only.
-        if (this.backend.newSessionInTab) {
-          void this.backend
-            .newSessionInTab(message.tabId, message.sessionId)
-            .catch((err) => this.logger?.appendLine(`[tab.newSession] ${message.tabId} failed: ${String(err)}`));
-        } else {
-          this.logger?.appendLine(`[tab.newSession] ${message.tabId} ignored — backend has no newSessionInTab support`);
-        }
+        // supports it (same optional-member posture as loadTab above,
+        // factored through `dispatchOptional`, FI-24); no-ops for a backend
+        // without one. newSessionInTab itself never throws/rejects (mirrors
+        // tab.open/tab.load's fire-and-forget + terminal-tab.error
+        // discipline) — the `.catch` here is defense in depth only.
+        this.dispatchOptional(
+          this.backend.newSessionInTab !== undefined,
+          () => this.backend.newSessionInTab?.(message.tabId, message.sessionId),
+          `[tab.newSession] ${message.tabId} ignored — backend has no newSessionInTab support`,
+          (err) => `[tab.newSession] ${message.tabId} failed: ${String(err)}`,
+        );
         break;
 
       case 'switchPanel':
