@@ -11,8 +11,8 @@
  * touch: it was looked at, and it is clean.
  *
  * VSCODE-FREE — NOT in `nextEditPurity.test.ts`'s `ADAPTER_ALLOW` (locked at
- * exactly 4 files: `config.ts`, `guard.ts`, `shell.vscode.ts`,
- * `nextEditNotice.vscode.ts`): this module never imports the `vscode`
+ * exactly 5 files: `config.ts`, `guard.ts`, `shell.vscode.ts`,
+ * `nextEditNotice.vscode.ts`, `nextEditShellWiring.ts`): this module never imports the `vscode`
  * package itself, in any form, and — since R3-ARCH-02 — has no edge to
  * `shell.vscode.ts` at all, real or type-only. `resolveRoute` takes its
  * generic-branch dependencies through the narrow {@link NextEditRouteDeps}
