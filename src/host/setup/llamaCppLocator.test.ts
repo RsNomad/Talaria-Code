@@ -5,7 +5,7 @@ import type { ExecLookup } from '../runtime/resolveHermes';
 
 /**
  * llamaCppLocator.test.ts — beta.6 Task T5
- * (docs_claude/beta6-unified-local-model-onboarding-architecture.md §2.4).
+ * (internal-notes/beta6-unified-local-model-onboarding-architecture.md §2.4).
  *
  * Clones `pipxLocator.test.ts`'s scripted-`ExecLookup` fixture pattern: every
  * OS-touching call `locateLlamaServer` makes routes through `loginShellSpawn`

@@ -60,7 +60,7 @@ describe('theme.css — audit-3 A-2: --h-faint reads off descriptionForeground, 
  * tiers IN-EDITOR. `--h-muted` becomes the color-mix midpoint of the theme's
  * two text anchors; `--h-faint` stays on descriptionForeground (the safe
  * floor — audit-3 A-2 above is UNTOUCHED and must stay green). Contrast
- * grounding: docs_claude/audit5-remediation-architecture.md, Addendum 2.
+ * grounding: internal-notes/audit5-remediation-architecture.md, Addendum 2.
  */
 function extractMutedDeclaration(css: string): string {
   const match = css.match(/^\s*--h-muted:.*;\s*$/m);

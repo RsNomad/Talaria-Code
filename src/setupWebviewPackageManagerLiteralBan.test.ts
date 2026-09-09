@@ -1,5 +1,5 @@
 /**
- * T10 (beta5-setup-hardening-architecture.md §5.1 Global Constraint 1 /
+ * T10 (setup-architecture-notes.md §5.1 Global Constraint 1 /
  * §1.2): the webview must NEVER hardcode a distro-specific package-manager
  * command literal. Every pre-typed install line is composed HOST-side (the
  * osDetect/packageTable engine, `src/host/setup/`) and reaches the webview

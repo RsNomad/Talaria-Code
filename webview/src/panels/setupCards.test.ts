@@ -2,7 +2,7 @@
  * §7.2.2 (extra-a, AU-61 round T4): the terminal `done` marker on
  * `foldSetupProgress` — the webview half of "cancelled/failed pull leaves
  * frozen progress + dead Cancel". Colocated with `setupCards.ts` per the
- * architecture doc's Files line (`docs_claude/au61-round-architecture.md`
+ * architecture doc's Files line (`internal-notes/au61-round-architecture.md`
  * §3.3); `SetupPanel.test.ts` carries the PRE-EXISTING `foldSetupProgress`
  * accumulation-only coverage (byte-unchanged behavior) — this file adds ONLY
  * the new deletion-arm behavior so the two suites stay additive, not

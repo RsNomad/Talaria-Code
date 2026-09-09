@@ -11,7 +11,7 @@ import {
 } from './osDetect';
 
 /**
- * osDetect.test.ts — Task T3 (beta5-setup-hardening-architecture.md §1.1).
+ * osDetect.test.ts — Task T3 (setup-architecture-notes.md §1.1).
  * Fixture table copied verbatim from the task brief
  * (`.superpowers/sdd/task-T3-brief.md` Step 1): Fedora 44, Ubuntu 24.04,
  * Debian 13, Arch, openSUSE Tumbleweed, Linux Mint 21.3 (the ID_LIKE-preserved

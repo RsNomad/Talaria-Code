@@ -270,7 +270,7 @@ export interface RawConfigFullResult {
 }
 
 /**
- * A-01 (lens-dorabotok 🔴): unwrap the `config.get({key:"full"})` ENVELOPE.
+ * A-01 (internal 🔴): unwrap the `config.get({key:"full"})` ENVELOPE.
  *
  * The shipped Hermes gateway returns `{"config": <full config dict>}` —
  * `tui_gateway/server.py:10868-10869` (`if key == "full": return _ok(rid,

@@ -1810,7 +1810,7 @@ describe('WS-R1 F3-4 — cancel fallback deadline force-ends an unresponsive tur
 });
 
 /**
- * WS-R4 step 1 (REMEDIATION-ARCHITECTURE §3.4): characterization pins for
+ * WS-R4 step 1 (DESIGN-NOTES §3.4): characterization pins for
  * ALL SIX caller-visible outcomes `SessionController.loadReplayOutcome` can
  * produce. Originally written (Task 19) against the pre-union
  * `AcpLoadSessionResult | undefined` sentinel return, driven through the
@@ -1899,7 +1899,7 @@ function makeLoadHarness(): {
   return { controller: new SessionController('session-1', '/fake/ws', port), client, emitted };
 }
 
-describe('WS-R4 characterization — the SIX loadReplayOutcome arms (REMEDIATION-ARCHITECTURE §3.4)', () => {
+describe('WS-R4 characterization — the SIX loadReplayOutcome arms (DESIGN-NOTES §3.4)', () => {
   it('ARM loaded (happy path): clear + turn.start stream, turn.end{complete}, returns {kind:"loaded", result}', async () => {
     const { controller, client, emitted } = makeLoadHarness();
     const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);

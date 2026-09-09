@@ -1,6 +1,6 @@
 /**
  * OS-release parsing + distro-family/package-manager resolution
- * (beta5-setup-hardening-architecture.md §1.1, Task T3).
+ * (setup-architecture-notes.md §1.1, Task T3).
  *
  * PURE — zero `vscode`, zero `fs` imports (Global Constraint 5, as sharpened
  * for this module by the T3 task brief: "osDetect.ts has ZERO vscode

@@ -1,6 +1,6 @@
 /**
  * CA-06-NE-face — the visible face of the silent next-edit egress refusals
- * (design: docs_claude/lens-dorabotok/CA-06-nextedit-face-design.md).
+ * (design: internal-notes/nextedit-face-notes.md).
  *
  * The shell's gates stay silent and fail-closed — this module is a detached
  * observer on `NextEditShellDeps.onEgressVerdict` that renders:

@@ -1003,7 +1003,7 @@ function createWorkspaceTrackerRegistry(
         'Checkpoint history for this folder started fresh when its parent folder was removed; ' +
         'the prior history is retained with the parent folder and returns if it is re-added.';
       output.appendLine(`Talaria Checkpoints: ${msg} (folder: ${childRoot}; former parent: ${formerParentRoot})`);
-      // Surface ruling (docs_claude/lens-dorabotok/A06-surface-decisions.md):
+      // Surface ruling (internal-notes/surface-notes.md):
       // non-modal toast + a 'Show Log' action revealing the detail line above.
       // Deliberately NO 'Do not show again' — suppression would re-introduce
       // silent history loss. Fires once per promoted child (registry dedup).

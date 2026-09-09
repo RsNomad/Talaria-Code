@@ -1,6 +1,6 @@
 /**
  * CA-06-face + CA-06-path-face — the visible faces of FIM's two silent
- * egress protections (design: docs_claude/lens-dorabotok/
+ * egress protections (design: internal-notes/
  * CA-06-notice-feature-design.md + CA-06-path-face-design.md).
  *
  * Both gates stay silent and fail-closed — this module is a detached

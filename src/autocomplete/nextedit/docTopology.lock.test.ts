@@ -176,7 +176,7 @@ describe('reach proof — every file these locks read really was read', () => {
  * The original of this lock ALSO pinned §10 of an internal architecture-research
  * doc (`08-jobB-final-architecture.md`) against the shell's rendered string.
  * That research doc is not part of the published repo (it lives in the private
- * `docs_claude/` tree), so a clone cannot read it — its pins were removed here.
+ * `internal-notes/` tree), so a clone cannot read it — its pins were removed here.
  * What remains locks only the SHIPPED artefacts — the shell's own template and
  * the public `next-edit.md` — which is all a clone can (and should) verify. The
  * lost research-doc pin is replaced by a lock of the public page against the

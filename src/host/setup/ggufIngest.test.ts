@@ -15,7 +15,7 @@ import type { GgufIngestSpec } from './SetupController';
 import type { PullProgress } from './ollamaClient';
 
 /**
- * ggufIngest.test.ts — T14 (beta5-setup-hardening-architecture.md §4.4.3d,
+ * ggufIngest.test.ts — T14 (setup-architecture-notes.md §4.4.3d,
  * facts §0.3). Every network call `ingestGguf` makes routes through the
  * caller-injected `io.fetchImpl` seam, and every disk touch routes through
  * `io.createTempWrite`/`io.removeTemp`/`io.openTempRead` (in-memory fakes

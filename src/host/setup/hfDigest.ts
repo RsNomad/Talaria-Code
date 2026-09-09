@@ -1,6 +1,6 @@
 /**
  * hfDigest — the HF-tree integrity pre-flight for verified downloads
- * (beta5-setup-hardening-architecture.md §4.4.3c, facts §0.3; generalized
+ * (setup-architecture-notes.md §4.4.3c, facts §0.3; generalized
  * for the allowlist tier by beta6-unified-local-model-onboarding-architecture.md
  * §2.2.5/§2.4, T2).
  *

@@ -947,7 +947,7 @@ describe('CF-07: Explorer drag-drop of a file:// URI is parsed to an fsPath', ()
 });
 
 /**
- * T5 (§7.2.3, AU-61 extra-b, `docs_claude/au61-round-architecture.md` §4).
+ * T5 (§7.2.3, AU-61 extra-b, `internal-notes/au61-round-architecture.md` §4).
  * `startResize` registered `window.addEventListener('pointermove', move)` +
  * `('pointerup', up)` and set `document.body.style.userSelect = 'none'`, with
  * ALL teardown living inside `up`. If the Composer unmounted mid-drag (a

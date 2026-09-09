@@ -29,6 +29,6 @@ export const MAX_LINE_BYTES = 4 * 1024 * 1024;
  * before cap-then-teardown+respawn. Consumer:
  * `host/backend/acp/stdoutByteCap.ts` (ACP channel — pre-SDK Transform), used
  * by `acpClient.ts`'s `wireAcpConnection`. Full derivation:
- * docs_claude/lens-dorabotok/m3-acp-cap-analysis.md.
+ * internal-notes/m3-acp-cap-analysis.md.
  */
 export const MAX_ACP_LINE_BYTES = 32 * 1024 * 1024;

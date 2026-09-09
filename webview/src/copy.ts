@@ -9,7 +9,7 @@
  * `config.mcp_servers` — the ACP wire has no reload/close RPC, so a
  * config-plane write (however successfully persisted, however immediately
  * the panel's own refetch shows it as active) only reaches a chat that
- * starts AFTER the write. See `docs_claude/audit-fix-architecture.md`,
+ * starts AFTER the write. See `internal-notes/audit-fix-architecture.md`,
  * ADR-4 and T-G (TG-1..TG-4) for the full two-process-topology reasoning.
  *
  * INV-18: "Every UI surface that persists config the live ACP session

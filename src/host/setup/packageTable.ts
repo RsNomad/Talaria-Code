@@ -1,6 +1,6 @@
 /**
  * Per-distro install-command table + Python-install planner
- * (beta5-setup-hardening-architecture.md §1.1, §0.2, §5.3; Task T4).
+ * (setup-architecture-notes.md §1.1, §0.2, §5.3; Task T4).
  *
  * PURE — zero `vscode` imports (Global Constraint 5, purity-scanned by
  * `packageTable.test.ts`, same mechanism `osDetect.test.ts`/`registry.test.ts`

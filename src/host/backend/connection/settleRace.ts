@@ -1,7 +1,7 @@
 // src/host/backend/connection/settleRace.ts
 
 /**
- * WS-R1 (FUNC-RACE-ROOT, REMEDIATION-ARCHITECTURE.md §3.1): the ONE
+ * WS-R1 (FUNC-RACE-ROOT, DESIGN-NOTES.md §3.1): the ONE
  * settle-once / exit-race / deadline primitive the ~8-member hand-rolled
  * race family (`raceAgainstChildExit`, the deadline-only session-load race
  * deleted at WS-R1 step 3b once `loadSessionIntoTabInternal` migrated to

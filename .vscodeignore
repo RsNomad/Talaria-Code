@@ -25,7 +25,7 @@ docs/**
 # architecture-doc tree, the SDD ledger (task briefs/reports/reviews), the
 # stray Dependabot `bump` scratch file, and the dev-only benchmark script
 # (not referenced anywhere in dist/** at runtime — grepped clean).
-docs_claude/**
+internal-notes/**
 .superpowers/**
 bump
 scripts/**
