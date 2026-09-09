@@ -12,6 +12,7 @@ import {
   checkSecretValue,
   findSecretKeyCollision,
 } from './mcpEntryValidation';
+import { MODAL_UNSAFE_TEXT_PATTERN, redactForModal } from '../../setup/modalText';
 import type { McpAddParams, McpCatalogEntry } from '../../../shared/protocol';
 
 /**
@@ -168,6 +169,51 @@ describe('stripModalControls', () => {
     const long = 'x'.repeat(1000);
     expect(stripModalControls(long)).toHaveLength(1000);
     expect(stripModalControls('a\u202Eb\u200Bc')).toBe('abc'); // RTL-override / zero-width stripped (escaped literals)
+  });
+});
+
+/**
+ * R3-ARCH-01 (T5): `stripModalControls` now delegates to `modalText.ts`'s
+ * `stripModalUnsafeText` (the leaf) instead of rebuilding its own module-init
+ * `.source`-derived `/g` regex \u2014 behaviour-preserving. Every codepoint below
+ * is built via `String.fromCharCode` (never a literal escape) so this test
+ * file itself never carries a raw exotic byte.
+ */
+describe('R3-ARCH-01: stripModalControls delegates to the modalText leaf (behaviour-preserving)', () => {
+  const BOUNDARY_CODEPOINTS: Array<[string, number]> = [
+    ['U+0000', 0x0000],
+    ['U+001F', 0x001f],
+    ['U+007F', 0x007f],
+    ['U+0080', 0x0080],
+    ['U+009F', 0x009f],
+    ['U+061C', 0x061c],
+    ['U+200B', 0x200b],
+    ['U+200F', 0x200f],
+    ['U+2028', 0x2028],
+    ['U+2029', 0x2029],
+    ['U+202A', 0x202a],
+    ['U+202E', 0x202e],
+    ['U+2060', 0x2060],
+    ['U+2066', 0x2066],
+    ['U+2069', 0x2069],
+    ['U+FEFF', 0xfeff],
+  ];
+
+  it.each(BOUNDARY_CODEPOINTS)('strips %s (one codepoint per sub-range of the unsafe class)', (_name, code) => {
+    const ch = String.fromCharCode(code);
+    const stripped = stripModalControls(`a${ch}b`);
+    expect(MODAL_UNSAFE_TEXT_PATTERN.test(stripped)).toBe(false);
+    expect(stripped).toBe('ab');
+  });
+
+  it('BLOCKER invariant: strip-only, never length-slices \u2014 a 300-char value keeps all 300 characters', () => {
+    expect(stripModalControls('a'.repeat(300)).length).toBe(300);
+  });
+
+  it('agrees with redactForModal under its 200-char cap (behaviour-identical below the cap)', () => {
+    const withUnsafe = `x${String.fromCharCode(0x202e)}y${String.fromCharCode(0x200b)}z`;
+    expect(withUnsafe.length).toBeLessThan(200);
+    expect(stripModalControls(withUnsafe)).toBe(redactForModal(withUnsafe));
   });
 });
 
