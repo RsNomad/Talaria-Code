@@ -674,6 +674,15 @@ export class SessionController {
       this.port.logger?.append(`[SessionController] respondApproval: no pending approval '${id}'`);
       return;
     }
+    if (!pending.options.some((option) => option.id === optionId)) {
+      // R3-SEC-01 (BHF-F1-3 shape): the webview wire is untrusted — an id that is not one
+      // of THIS approval's options is refused loudly and counts for nothing. Ids/counts only
+      // in the log, never the supplied string.
+      this.port.logger?.append(
+        `[SessionController] respondApproval: ignoring unknown optionId for approval '${id}' (${pending.options.length} options)`,
+      );
+      return;
+    }
     clearTimeout(pending.timer);
     this.pendingApprovals.delete(id);
     if (pending.toolId) {
@@ -704,7 +713,18 @@ export class SessionController {
     }
 
     if (action === 'reject') {
-      this.finishApproval(approvalId, findOptionId(pending.options, 'deny') ?? 'deny');
+      const denyId = findOptionId(pending.options, 'deny');
+      if (denyId === undefined) {
+        // R3-SEC-01: never put a non-option id on the wire. No deny-kind option → settle
+        // CANCELLED (ACP: cancelled ⇒ not applied; Hermes default-denies) — the same
+        // landing the policy-deny path takes when no deny option exists.
+        this.port.logger?.append(
+          `[SessionController] resolveDiff: reject for tool '${toolId}' — approval has no deny option; settling cancelled (fail-closed)`,
+        );
+        this.settlePendingApprovals('cancelled', { onlyApprovalId: approvalId });
+        return;
+      }
+      this.finishApproval(approvalId, denyId);
       this.hunkState.delete(toolId);
       this.toolIdToApprovalId.delete(toolId);
       return;
@@ -726,7 +746,16 @@ export class SessionController {
 
     hunks.decisions.set(hunkIndex, action);
     if (hunks.decisions.size >= hunks.totalHunks) {
-      this.finishApproval(approvalId, findOptionId(pending.options, 'allow_once') ?? 'allow_once');
+      const allowId = findOptionId(pending.options, 'allow_once');
+      if (allowId === undefined) {
+        // R3-SEC-01: consent cannot be synthesised from an unknown option vocabulary —
+        // leave the approval pending; the card's own options stay the only consent path.
+        this.port.logger?.append(
+          `[SessionController] resolveDiff: all ${hunks.totalHunks} hunks accepted for tool '${toolId}' but the approval has no allow_once option — not settling`,
+        );
+        return;
+      }
+      this.finishApproval(approvalId, allowId);
       this.hunkState.delete(toolId);
       this.toolIdToApprovalId.delete(toolId);
     }
