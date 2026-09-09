@@ -16,7 +16,7 @@ import type { ChunkRecord } from './VectorStore';
  * task fixes lives in the native package's OWN schema-INFERENCE behavior
  * (an all-undefined `language` column is silently dropped from a table
  * created via `db.createTable(name, rows)` with no explicit schema — see
- * `docs_claude/audit-fix-architecture.md` TA-1, evidence V1/V2/V7/V9), which
+ * `internal-notes/audit-fix-architecture.md` TA-1, evidence V1/V2/V7/V9), which
  * a hand-rolled fake table cannot reproduce.
  */
 

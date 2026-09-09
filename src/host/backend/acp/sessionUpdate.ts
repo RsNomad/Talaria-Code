@@ -108,7 +108,7 @@ export function mapSessionUpdate(
     // real field names directly off `AcpSessionUpdate` instead of
     // reverse-engineering them from the wire.
     //
-    // Confirmed-as-designed (lens-dorabotok WS-AC, 2026-08-26): deliberately
+    // Confirmed-as-designed (internal WS-AC, 2026-08-26): deliberately
     // unmapped stands — a context-window/session-title UI is tracked open
     // item R9, not a mapping bug; the ledger row closes as by-design.
     default:

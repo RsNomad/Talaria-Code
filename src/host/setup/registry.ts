@@ -301,7 +301,7 @@ export function getBackend(id: string): BackendDescriptor | undefined {
   );
 }
 
-// §4 Block D — Dedicated NEXT parity (beta5-setup-hardening-architecture.md §4.1).
+// §4 Block D — Dedicated NEXT parity (setup-architecture-notes.md §4.1).
 
 /** ⚠ ONE owner constant — the out-of-band publication uploads to the SAME string; T12 locks every
  *  derived id to it (critic S-F2). Namespace owner-confirmed (rev 3). */

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 /**
  * CA-06-NE-face — the visible face of the silent next-edit egress refusals
- * (design: docs_claude/lens-dorabotok/CA-06-nextedit-face-design.md).
+ * (design: internal-notes/nextedit-face-notes.md).
  * Recording vscode fake: plain array-push recorders, no vi.fn() spies.
  * The surface must (1) dedup to one badge per file and one toast per file
  * per epoch, content kind ONLY toasting, (2) clear on allow/close/reset,

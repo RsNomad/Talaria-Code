@@ -1,5 +1,5 @@
 /**
- * TG-5 (AU-51, `docs_claude/audit-fix-architecture.md` — ADR-4): layer 1 of
+ * TG-5 (AU-51, `internal-notes/audit-fix-architecture.md` — ADR-4): layer 1 of
  * the two-layer one-shot-cleanup fix. The ACP wire has NO `session/close` —
  * every ephemeral `session/new` `OneShotRunner` mints (commit-message
  * generation etc.) persists server-side forever (`acp_adapter/session.py`

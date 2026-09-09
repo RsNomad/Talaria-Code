@@ -4,7 +4,7 @@ import { installCommand, pythonInstallPlan, type PackageKey } from './packageTab
 import type { DistroFamily, OsRelease } from './osDetect';
 
 /**
- * packageTable.test.ts — Task T4 (beta5-setup-hardening-architecture.md
+ * packageTable.test.ts — Task T4 (setup-architecture-notes.md
  * §1.1, §0.2, §5.3). Locks (a) the per-distro install-command table
  * verbatim, (b) the security flag posture (no auto-confirm, no
  * `add-apt-repository`, anywhere across EVERY composed command string), and

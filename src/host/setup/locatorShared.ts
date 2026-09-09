@@ -46,7 +46,7 @@ export function lastNonEmptyLine(stdout: string): string {
  *  failed to answer in time (FI-10, WS-F8 F8-1: previously duplicated
  *  verbatim in both `pipxLocator.ts` and `llamaCppLocator.ts`; single-sourced
  *  here so both locators import the one copy). Drift-locked against
- *  `docs_claude/beta5-setup-hardening-architecture.md` §6's "probe-timeout
+ *  `internal-notes/setup-architecture-notes.md` §6's "probe-timeout
  *  detail (C1)" row. */
 export const PROBE_TIMEOUT_DETAIL =
   "Your login shell didn't answer in time — a slow shell profile (nvm, conda, a network home directory) can cause this. It's usually transient: press Re-check.";

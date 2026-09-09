@@ -262,7 +262,7 @@ describe('registry (h): purity — zero vscode imports (purityScan discipline)',
 });
 
 /**
- * (i) — T6 (beta5-setup-hardening-architecture.md §1.2 A3): llama.cpp's
+ * (i) — T6 (setup-architecture-notes.md §1.2 A3): llama.cpp's
  * guided-terminal recipe gains `packageKey: 'llamacpp'` so
  * `SetupController.handleOpenInstallTerminal` can override its `command`
  * with the OS engine's (`packageTable.ts`) per-family verified line —
@@ -334,7 +334,7 @@ describe('registry (k): the deleted vLLM pip-install recipe string is gone from 
 });
 
 /**
- * (l) — T12 (beta5-setup-hardening-architecture.md §4.1): the Dedicated NEXT
+ * (l) — T12 (setup-architecture-notes.md §4.1): the Dedicated NEXT
  * (Sweep) model registry data. Fail-closed by design: `gguf.sha256` is the
  * EMPTY-STRING placeholder until the out-of-band GGUF publication lands —
  * that is intentional, not a defect, and this suite must never demand a

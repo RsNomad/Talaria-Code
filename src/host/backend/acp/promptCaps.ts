@@ -44,7 +44,7 @@ export const PROMPT_DEGRADE_INACTIVE: PromptDegradeCaps = { degradeEmbeddedResou
  * The `advertised` parameter is threaded NOW so activation touches only this
  * function — callers and builders are already wired and tested.
  *
- * Upstream note (docs_claude/lens-dorabotok/hermes-upstream-notes.md):
+ * Upstream note (internal-notes/hermes-upstream-notes.md):
  * Hermes should advertise `embedded_context=True`, retiring the question.
  */
 export function derivePromptCaps(advertised: Record<string, unknown> | undefined): PromptDegradeCaps {

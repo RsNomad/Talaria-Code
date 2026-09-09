@@ -93,7 +93,7 @@ describe('protocol — PANEL_SCOPE is a COMPILE-TIME-exhaustive Record<DataPanel
 });
 
 /**
- * Task 8 (protocol v2, §6 of `docs_claude/onboarding-backend-setup-architecture.md`)
+ * Task 8 (protocol v2, §6 of `internal-notes/onboarding-backend-setup-architecture.md`)
  * — the typed Setup panel contract. Types only: these are compile-time/shape
  * proofs, not behavior tests (the panel has no runtime yet).
  */

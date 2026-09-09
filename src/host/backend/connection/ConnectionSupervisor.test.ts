@@ -1,5 +1,5 @@
 /*
- * WS-R1/WS-R3 characterization + regression suite (REMEDIATION-ARCHITECTURE
+ * WS-R1/WS-R3 characterization + regression suite (DESIGN-NOTES
  * §3.1/§3.3). Pins the CURRENT observable contracts of the hand-rolled race
  * helpers and the crash/reconnect teardown BEFORE any structural change —
  * the branch-by-abstraction swaps (settleRace adapters, teardownForRespawn

@@ -260,7 +260,7 @@ function collectRagSources() {
 }
 
 // ---------------------------------------------------------------------------
-// R3-ARCH-01 (lens-r3 T5): `control/` must reach the modal-forging strip
+// R3-ARCH-01 (internal T5): `control/` must reach the modal-forging strip
 // primitive through the LEAF (`setup/modalText.ts`), never through the
 // 2438-line `SetupController.ts` façade — the façade import IS the module-
 // init `.source`-rebuild TDZ/latent-cycle vector this task deletes.

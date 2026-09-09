@@ -189,7 +189,7 @@ export interface AdvertisedAuthMethod {
  * agent itself does not honor — the same compensating-violations asymmetry
  * as A-03's embedded resources, and it ships inactive the same way (see
  * `promptCaps.ts`'s activation contract; upstream note filed in
- * `docs_claude/lens-dorabotok/hermes-upstream-notes.md`).
+ * `internal-notes/hermes-upstream-notes.md`).
  */
 export interface AdvertisedCapabilities {
   /** Negotiated version — always === PROTOCOL_VERSION once retained (asserted in initialize()). */

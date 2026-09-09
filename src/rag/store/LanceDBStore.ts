@@ -384,7 +384,7 @@ export class LanceDBStore implements VectorStore {
       // `createTable` loudly, V1). This is the order-independent
       // defense-in-depth belt under INV-1 that makes a 0-width pinned
       // column unreachable regardless of task sequencing or future
-      // refactors — see `docs_claude/audit-fix-architecture.md` TA-1.
+      // refactors — see `internal-notes/audit-fix-architecture.md` TA-1.
       const width = records[0]?.vector.length ?? 0;
       if (width === 0 || records.some((r) => r.vector.length !== width)) {
         // Status/reason only (this file's error-surface rule, see

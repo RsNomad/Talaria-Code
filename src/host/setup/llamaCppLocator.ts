@@ -13,7 +13,7 @@ export { isExecTimeout } from './locatorShared';
 
 /**
  * llama.cpp `llama-server` binary locator
- * (docs_claude/beta6-unified-local-model-onboarding-architecture.md §2.4;
+ * (internal-notes/beta6-unified-local-model-onboarding-architecture.md §2.4;
  * Task T5 of the beta.6 build). Close clone of `pipxLocator.ts`'s probe
  * pattern — see that file's header for the full login-shell-routing
  * rationale, reproduced only where it differs below.

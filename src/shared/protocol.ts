@@ -714,7 +714,7 @@ export interface SettingsData {
 
 /* ------------------------------------------------------------------ *
  * Setup / Talaria Config panel (Task 8 — protocol v2). Ground truth:
- * `docs_claude/onboarding-backend-setup-architecture.md` §6. These shapes
+ * `internal-notes/onboarding-backend-setup-architecture.md` §6. These shapes
  * are a deliberate WEBVIEW-SAFE PROJECTION of the host-side backend
  * registry (`src/host/setup/registry.ts`'s `BackendDescriptor`) — plain
  * data only, reproduced verbatim here rather than imported, so this

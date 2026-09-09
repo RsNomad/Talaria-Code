@@ -14,7 +14,7 @@ import { GRAMMAR_FILE_BY_LANGUAGE, WebTreeSitterParser } from './WebTreeSitterPa
  * `Language.load()`s every bundled `.wasm` grammar from the repo's own
  * `node_modules/tree-sitter-wasms/out`, then parses a real snippet with
  * each. This IS the reproduction harness for AU-2 (V3/V4 in
- * `docs_claude/audit-fix-architecture.md`): at HEAD, with
+ * `internal-notes/audit-fix-architecture.md`): at HEAD, with
  * `web-tree-sitter@0.26.11` installed against the bundled
  * `tree-sitter-wasms@0.1.13` grammars, `Language.load()` throws an
  * empty-message `Error` for every one of them — the bundled wasm's legacy

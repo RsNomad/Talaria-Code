@@ -5,7 +5,7 @@ import { LlamaCppInfillBackend } from './LlamaCppInfillBackend';
 import type { FimRequest } from '../types';
 
 /**
- * §2 (docs_claude/fim-backend-contract-and-followups-architecture.md) — the
+ * §2 (internal-notes/fim-backend-notes.md) — the
  * authoritative wire-contract table, pinned as ONE readable artifact. Every
  * fixture below is a literal (or realistically-shaped) wire payload, not an
  * invented shape: each carries a source comment naming the runner@version +

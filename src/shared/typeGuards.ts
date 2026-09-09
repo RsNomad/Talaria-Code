@@ -1,5 +1,5 @@
 /**
- * WS-A (lens-dorabotok A-01, REMEDIATION-ARCHITECTURE §2 WS-A step 3): the ONE
+ * WS-A (internal A-01, DESIGN-NOTES §2 WS-A step 3): the ONE
  * shared record guard for untyped ingress boundaries. This was the enabling
  * point WS-BG later migrated the whole boundary-assertion class onto
  * (branch-by-abstraction: helper first, class migration later) — WS-BG Task 2

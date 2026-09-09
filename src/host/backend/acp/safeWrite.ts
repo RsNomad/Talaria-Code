@@ -2,7 +2,7 @@ import { promises as realFs, constants as fsConstants } from 'node:fs';
 
 /**
  * safeWrite — the check-to-write TOCTOU floor for a LEAF file write (AU-14 /
- * TD-2, INV-7 / ADR-7: `docs_claude/audit-fix-architecture.md`).
+ * TD-2, INV-7 / ADR-7: `internal-notes/audit-fix-architecture.md`).
  *
  * ## Why
  * A plain `fs.writeFile(p, data)` opens with the default `'w'` flag

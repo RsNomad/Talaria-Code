@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { verifyHfDigest, resolveLfsOid } from './hfDigest';
 
 /**
- * T13 (beta5-setup-hardening-architecture.md §4.4.3c / §0.3): the HF-tree
+ * T13 (setup-architecture-notes.md §4.4.3c / §0.3): the HF-tree
  * digest pre-flight. Canned tree JSON only — the fetch seam is a fake; the
  * REAL binding (`setupHost.vscode.ts`) is one line over `globalThis.fetch`.
  *

@@ -1804,7 +1804,7 @@ describe('AcpBackend.start — W4-T1b F2: connection/session phase split (critic
  * appended, so the routed branch can never hide it.
  */
 describe('ConnectionSupervisor/AcpBackend — T8 (§2.3 ⑧): structural no-provider banner at session-establish failure', () => {
-  /** §6 copy, VERBATIM (docs_claude/beta5-setup-hardening-architecture.md:451). */
+  /** §6 copy, VERBATIM (internal-notes/setup-architecture-notes.md:451). */
   const NO_PROVIDER_BANNER =
     'Hermes has no chat provider configured. Open Setup → Provider → "Configure provider", then try again.';
 
@@ -4914,7 +4914,7 @@ describe('WS-R4 F3-7 — failed load unwinds the pre-adopted identity (identity-
 
 /**
  * F3-7-S (WS-R4 F3-7 sibling closure — Phase-1 close-out
- * `docs_claude/lens-dorabotok/PHASE1-CLOSEOUT-DECISION.md` §1.4): the switch's
+ * `internal-notes/phase1-notes.md` §1.4): the switch's
  * failure kinds (the describe block right above) unwind the pre-load identity
  * adoption (:1769) on their own failure exit — but `loadSessionIntoTabInternal`
  * has TWO SIBLING failure exits that sit BEFORE the switch and used to skip
@@ -9176,7 +9176,7 @@ describe('ControlDispatcher — Task A6 OAuth login (F-4)', () => {
 });
 
 // =============================================================================
-// F3 (docs_claude/features-f3-concurrency-fix-architecture.md): long MCP admin
+// F3 (internal-notes/features-f3-concurrency-fix-architecture.md): long MCP admin
 // ops (`mcp.auth`, `mcp.catalogInstall`, and the read-only `mcp.catalog`/
 // `mcp.test`) must not monopolize `dashboardToggleTail` — they run OFF the
 // tail (`TAIL_EXEMPT_MCP_METHODS`), and same-name exclusion across ALL
@@ -10071,7 +10071,7 @@ describe('ControlDispatcher — Task B5 skills.hubUninstall concurrency (F3/B4 m
 });
 
 // =============================================================================
-// B5-KS (docs_claude/features-b5-singleflight-keyspace-fix-architecture.md):
+// B5-KS (internal-notes/features-b5-singleflight-keyspace-fix-architecture.md):
 // the single-flight busy registry split into two kind-scoped collections
 // (`busySkillInstallIds`/`busySkillUninstallNames`) so a same-string
 // cross-kind pair (an install typo colliding with an in-flight uninstall of
@@ -12075,7 +12075,7 @@ describe('AcpBackend.oneShot — §2c one-shot utility-model surface (T5b)', () 
 });
 
 /**
- * TG-5 (AU-51, `docs_claude/audit-fix-architecture.md` ADR-4, INV-20):
+ * TG-5 (AU-51, `internal-notes/audit-fix-architecture.md` ADR-4, INV-20):
  * one-shot utility sessions (`OneShotRunner`'s ephemeral `session/new`
  * mints — commit-message generation etc.) persist server-side forever (the
  * ACP wire has no close) and would otherwise pollute `session.list` +
