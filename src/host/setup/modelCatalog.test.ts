@@ -9,7 +9,7 @@ import {
   type CatalogModel,
   type CatalogRole,
 } from './modelCatalog';
-import { NEXT_DEDICATED_MODEL, SYNTINAL_HF_OWNER, getBackend } from './registry';
+import { NEXT_DEDICATED_MODEL, SYNTINAL_HF_OWNER } from './registry';
 import { isHostSourcedModel } from './SetupController';
 
 /**
@@ -257,24 +257,6 @@ describe('catalog defaults ≡ existing default sites (drift-lock)', () => {
     if (m.ollama?.tier === 'library') {
       expect(m.ollama.tag).toBe('qwen2.5-coder:1.5b-base');
     }
-  });
-
-  it('registry.ts:190 FIM default matches (ollama backend, defaults[0])', () => {
-    const defaults = getBackend('ollama')?.localInstall?.models?.defaults;
-    expect(defaults?.[0]).toEqual({
-      role: 'fim',
-      model: 'qwen2.5-coder:1.5b-base',
-      settingKey: 'talaria.autocomplete.model',
-    });
-  });
-
-  it('registry.ts:194 embedding default matches (ollama backend, defaults[1])', () => {
-    const defaults = getBackend('ollama')?.localInstall?.models?.defaults;
-    expect(defaults?.[1]).toEqual({
-      role: 'embedding',
-      model: 'qwen3-embedding:0.6b',
-      settingKey: 'talaria.rag.embedModel',
-    });
   });
 
   it("qwen3-embedding-0.6b's ollama.tag equals the registry.ts:194 embedding default", () => {

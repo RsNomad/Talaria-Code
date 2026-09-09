@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { CheckpointsData, DataPanel, PanelDataMap, ThemeInfo } from '../protocol';
-import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type AppState, type MessageItem } from '../types';
+import { BOOTSTRAP_TAB_ID, INITIAL_STATE, createInitialState, makeTabState, type AppState, type MessageItem, type TranscriptItem } from '../types';
 import { must } from '../testing/must';
 import { assertExhaustivePanel } from './panels';
 import { reduce, reduceLocal, MAX_TRANSCRIPT_ITEMS } from './transcript';
+import { pendingDiffToolIds, deniedToolIds } from '../components/chat/ChatView';
 
 /** One minimal-valid payload per GLOBAL DataPanel (§2f) — used to pin every
  * global panel's routing, not just `tools` (P7-N4). */
@@ -47,7 +48,6 @@ const globalPanelData: { [P in Exclude<DataPanel, 'subagents' | 'checkpoints' | 
       enabled: false,
       embedEndpoint: '',
       embedModel: '',
-      embedModelPresent: false,
       tuning: { dims: 0, maxChunkTokens: 0, debounceMs: 0, excludeGlobs: [] },
       indexDir: '',
     },
@@ -2446,6 +2446,308 @@ describe('transcript reducer — T-A1 (audit-2 Cluster A, M3): webview authorita
   });
 });
 
+describe('transcript reducer — BH-05 (WS-A T4, Q2 / ADR-R2-15): tool.start create-if-absent + approval.settle status derivation', () => {
+  it('RED: a duplicate tool.start for the same toolId is a no-op (prevents a duplicate React key for the synthetic edit-approval card)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'edit-approval-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'pending',
+    });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'edit-approval-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'pending',
+    });
+
+    const afterDup = activeTab(state).transcript.filter((i) => i.kind === 'tool');
+    expect(afterDup).toHaveLength(1);
+
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tc-2',
+      kind: 'execute',
+      title: 'run: npm test',
+      status: 'running',
+    });
+    const afterNew = activeTab(state).transcript.filter((i) => i.kind === 'tool');
+    expect(afterNew).toHaveLength(2);
+    expect(afterNew.map((i) => (i.kind === 'tool' ? i.toolId : ''))).toEqual(['edit-approval-1', 'tc-2']);
+  });
+
+  /** A pending tool item + its gating approval (one allow option, one deny
+   * option) — the fixture every settle-derivation case below folds onto. */
+  function pendingToolWithApproval(): AppState {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'pending',
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Apply edit to a.ts',
+      options: [
+        { id: 'allow', label: 'Allow', kind: 'allow_once' },
+        { id: 'deny', label: 'Deny', kind: 'deny' },
+      ],
+    });
+    return state;
+  }
+
+  it('RED: settle{selected, allow option} derives the pending tool item to "approved" and still locks hunks + folds the approval branch', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      outcome: 'selected',
+      optionId: 'allow',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'approved', hunksLocked: true });
+    const approval = activeTab(state).transcript.find((i) => i.kind === 'approval');
+    expect(approval).toMatchObject({ id: 'appr-1', settledOutcome: 'selected', resolvedOptionId: 'allow' });
+  });
+
+  it('RED: settle{selected, deny option} derives the pending tool item to "denied"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      outcome: 'selected',
+      optionId: 'deny',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'denied', hunksLocked: true });
+  });
+
+  it('RED: settle{expired} derives the pending tool item to "denied"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, { type: 'approval.settle', sessionId: 's1', turnId: 't1', id: 'appr-1', toolId: 'tool-1', outcome: 'expired' });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'denied', hunksLocked: true });
+    const approval = activeTab(state).transcript.find((i) => i.kind === 'approval');
+    expect(approval).toMatchObject({ id: 'appr-1', settledOutcome: 'expired' });
+  });
+
+  it('RED: settle{cancelled} derives the pending tool item to "interrupted"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, { type: 'approval.settle', sessionId: 's1', turnId: 't1', id: 'appr-1', toolId: 'tool-1', outcome: 'cancelled' });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'interrupted', hunksLocked: true });
+  });
+
+  it('RED: settle{superseded} derives the pending tool item to "interrupted"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, { type: 'approval.settle', sessionId: 's1', turnId: 't1', id: 'appr-1', toolId: 'tool-1', outcome: 'superseded' });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'interrupted', hunksLocked: true });
+  });
+
+  it('a "running" tool item is left alone by settle (status stays "running"; only hunksLocked changes)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'running',
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Apply edit to a.ts',
+      options: [{ id: 'allow', label: 'Allow', kind: 'allow_once' }],
+    });
+
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      outcome: 'selected',
+      optionId: 'allow',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'running', hunksLocked: true });
+  });
+
+  it('a "done" tool item is left alone by settle (status stays "done"; only hunksLocked changes)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'done',
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Apply edit to a.ts',
+      options: [{ id: 'deny', label: 'Deny', kind: 'deny' }],
+    });
+
+    state = reduce(state, { type: 'approval.settle', sessionId: 's1', turnId: 't1', id: 'appr-1', toolId: 'tool-1', outcome: 'expired' });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'done', hunksLocked: true });
+  });
+});
+
+/**
+ * WS-A T5b (BH-05, round-2 🔴): the webview reducer contract for the
+ * post-T3 emit order the host actually sends for a real edit-approval card —
+ * `tool.start` -> `tool.diff` -> `approval.request`, all keyed by the SAME
+ * `toolId` ('edit-approval-1'). This is the routing the whole fix depends
+ * on: a card built from three separately-emitted messages folds into ONE
+ * tool item carrying its diff, gated pending by `pendingDiffToolIds` via
+ * that shared `toolId`, until `approval.settle` resolves it.
+ */
+describe('transcript reducer — BH-05 (WS-A T5b): edit-approval card end-to-end fold (tool.start -> tool.diff -> approval.request -> approval.settle)', () => {
+  const TOOL_ID = 'edit-approval-1';
+
+  /** Folds the three host messages, in emit order, exactly as T3 wires them
+   * for a real edit-approval card (values per the WS-A T5b brief). */
+  function foldEditApprovalCard(): AppState {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: TOOL_ID,
+      kind: 'edit',
+      title: 'Edit: src/auth/login.ts',
+      status: 'pending',
+    });
+    state = reduce(state, {
+      type: 'tool.diff',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: TOOL_ID,
+      path: 'src/auth/login.ts',
+      hunks: [
+        {
+          header: '@@ -1,6 +1,10 @@',
+          lines: [
+            { sign: ' ', text: "import { api } from '../client';" },
+            { sign: '+', text: '' },
+            { sign: '+', text: 'export class LoginError extends Error {' },
+          ],
+        },
+      ],
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      kind: 'edit',
+      title: 'Edit: src/auth/login.ts',
+      toolId: TOOL_ID,
+      options: [
+        { id: 'opt-allow', label: 'Allow once', kind: 'allow_once' },
+        { id: 'opt-deny', label: 'Deny', kind: 'deny' },
+      ],
+    });
+    return state;
+  }
+
+  it('folds into exactly ONE tool item carrying its diff, gated pending via pendingDiffToolIds, with the approval routed to the SAME toolId', () => {
+    const state = foldEditApprovalCard();
+    const transcript = activeTab(state).transcript;
+
+    const toolItems = transcript.filter((i) => i.kind === 'tool');
+    expect(toolItems).toHaveLength(1);
+    const tool = toolItems[0];
+    expect(tool).toMatchObject({ toolId: TOOL_ID });
+    expect(tool?.kind === 'tool' ? tool.diffs?.length : undefined).toBe(1);
+    expect(tool?.kind === 'tool' ? tool.diffs?.[0]?.hunks : undefined).toEqual([
+      {
+        header: '@@ -1,6 +1,10 @@',
+        lines: [
+          { sign: ' ', text: "import { api } from '../client';" },
+          { sign: '+', text: '' },
+          { sign: '+', text: 'export class LoginError extends Error {' },
+        ],
+      },
+    ]);
+
+    // Approval item present, unresolved, unsettled — the exact condition
+    // pendingDiffToolIds requires to count a toolId as pending.
+    const approval = transcript.find((i) => i.kind === 'approval');
+    expect(approval).toMatchObject({ id: 'appr-1', toolId: TOOL_ID });
+    expect(approval?.kind === 'approval' ? approval.resolvedOptionId : 'wrong-kind').toBeUndefined();
+    expect(approval?.kind === 'approval' ? approval.settledOutcome : 'wrong-kind').toBeUndefined();
+
+    expect(pendingDiffToolIds(transcript).has(TOOL_ID)).toBe(true);
+  });
+
+  it('after approval.settle{outcome:"selected", optionId:"opt-allow"}: the tool item is "approved", pendingDiffToolIds drops the toolId, and deniedToolIds does NOT pick it up (allow, not deny)', () => {
+    let state = foldEditApprovalCard();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: TOOL_ID,
+      outcome: 'selected',
+      optionId: 'opt-allow',
+    });
+
+    const transcript = activeTab(state).transcript;
+    const tool = transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: TOOL_ID, status: 'approved' });
+
+    expect(pendingDiffToolIds(transcript).has(TOOL_ID)).toBe(false);
+    expect(deniedToolIds(transcript).has(TOOL_ID)).toBe(false);
+  });
+});
+
 describe('transcript reducer — CF-06 / R2: settleOpenItems — settling every open/streaming kind is DERIVED in one place, not enumerated per-kind', () => {
   it('RED: turn.end{status:"error"} settles a still-streaming reasoning block (pre-fix: closeOpenMessages only settles "message", and the turn.end fold only mapped tool/approval — a streaming reasoning block fell through both and stayed streaming:true forever, the eternal "Thinking" spinner)', () => {
     let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
@@ -2801,6 +3103,230 @@ describe('CA-09: message.delta O(1) fast path (behavior-identical, no reverse-co
   });
 });
 
+describe('L2-CA-07: reasoning.delta/reasoning.end fold tail-first like message.delta (broader than filed — both arms)', () => {
+  // Test-local ORACLE: the PRE-CHANGE, full-`.map` fold bodies kept verbatim
+  // (not reachable from production code) so the new tail-first splice can be
+  // proven identical to the old behaviour across many random interleavings,
+  // not just the handful of goldens above.
+  function oracleReasoningDelta(transcript: TranscriptItem[], blockId: string, text: string): TranscriptItem[] {
+    return transcript.map((i) => (i.kind === 'reasoning' && i.blockId === blockId ? { ...i, text: i.text + text } : i));
+  }
+  function oracleReasoningEnd(transcript: TranscriptItem[], blockId: string): TranscriptItem[] {
+    return transcript.map((i) => (i.kind === 'reasoning' && i.blockId === blockId ? { ...i, streaming: false } : i));
+  }
+
+  // Deterministic PRNG (mulberry32) — the "many random interleavings"
+  // property test below must be reproducible, never flaky.
+  function mulberry32(seed: number): () => number {
+    let a = seed;
+    return () => {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // `seedTurnId` defaults to a DISTINCT turn per seed item (many past turns'
+  // settled history) — the natural shape for the property test below. The
+  // perf test overrides it to the SAME turnId as its tail block: `capTranscript`
+  // (CA-09, run by `reduce` right after every fold) is turn-aware and never
+  // trims the ACTIVE (tail) turn's own items — seeding with a distinct turn
+  // per item would have capTranscript silently collapse a >500-item tab down
+  // to MAX_TRANSCRIPT_ITEMS on the very FIRST delta, defeating an "N-item
+  // tab" perf setup for any N > 500. One shared turnId keeps every seed item
+  // "belonging to the active turn", so capTranscript is a genuine no-op and
+  // the fold under test really does see all N items on every one of the M calls.
+  function tabWithSettledTail(n: number, tail: TranscriptItem[], seedTurnId: (i: number) => string = (i) => `seed${i}`): AppState {
+    const settled: TranscriptItem[] = Array.from({ length: n }, (_, i) => ({
+      kind: 'message' as const,
+      turnId: seedTurnId(i),
+      id: `msg-seed${i}-0`,
+      text: `seed${i}`,
+      streaming: false,
+    }));
+    const tab = {
+      ...makeTabState('boot', 'Chat 1'),
+      sessionId: 's1',
+      binding: 'bound' as const,
+      transcript: [...settled, ...tail],
+    };
+    return { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+  }
+
+  it('[property, RED before the fix / GREEN after] result-identity: the new fold matches the old full-map oracle for 300 random reasoning.start/delta/end interleavings across 2 turns on a 300-item tab', () => {
+    const rand = mulberry32(20260907);
+    let state = tabWithSettledTail(300, []);
+    let oracleTranscript = must(state.tabs.boot, 'boot').transcript;
+
+    const turns = ['t1', 't2'] as const;
+    const open: Record<'t1' | 't2', string | undefined> = { t1: undefined, t2: undefined };
+    let blockSeq = 0;
+
+    for (let step = 0; step < 300; step++) {
+      const turn = must(turns[Math.floor(rand() * turns.length)], 'turn');
+      const openBlockId = open[turn];
+      const action: 'start' | 'delta' | 'end' = openBlockId === undefined ? 'start' : rand() < 0.3 ? 'end' : 'delta';
+
+      if (action === 'start') {
+        const blockId = `${turn}-r${blockSeq++}`;
+        open[turn] = blockId;
+        state = reduce(state, { type: 'reasoning.start', turnId: turn, sessionId: 's1', blockId });
+        // `reasoning.start` is NOT changed by this task — resync the mirror
+        // to the real (unmodified) fold instead of re-deriving it, so this
+        // property test stays scoped to the delta/end divergence under test.
+        oracleTranscript = must(state.tabs.boot, 'boot').transcript;
+      } else if (action === 'delta') {
+        const blockId = must(openBlockId, 'open block for delta');
+        const text = `x${step}`;
+        state = reduce(state, { type: 'reasoning.delta', turnId: turn, sessionId: 's1', blockId, text });
+        oracleTranscript = oracleReasoningDelta(oracleTranscript, blockId, text);
+      } else {
+        const blockId = must(openBlockId, 'open block for end');
+        state = reduce(state, { type: 'reasoning.end', turnId: turn, sessionId: 's1', blockId });
+        oracleTranscript = oracleReasoningEnd(oracleTranscript, blockId);
+        open[turn] = undefined;
+      }
+
+      expect(must(state.tabs.boot, 'boot').transcript).toEqual(oracleTranscript);
+    }
+  });
+
+  // Write-time finding, recorded here and in the task report: the brief's
+  // literal "2000-item tab" sits ABOVE MAX_TRANSCRIPT_ITEMS (500) — `reduce`
+  // runs `capTranscript` right after every fold (CA-09), and `capTranscript`
+  // UNCONDITIONALLY does its own full-array scan-and-rebuild whenever
+  // `length > 500`, even when (as here, one shared turnId) nothing ends up
+  // trimmed. That scan costs the SAME for the old `.map` and the new splice,
+  // so above the cap it dominates and drowns out the very difference under
+  // test: at a 2000-item tab the measured old/new wall-clock ratio collapsed
+  // to ~1.6–2x (2000 deltas: 49.8 ms old vs 31 ms new — old barely over the
+  // 50 ms line, not a safe RED). Worse, under `npm run gate`'s real parallel
+  // worker contention (measured: ~3x slower than an isolated run) a wall-clock
+  // assertion with that little headroom is genuinely flaky in either
+  // direction — this was caught empirically, not assumed.
+  //
+  // Two independent fixes, both grounded against `message.delta`'s OWN
+  // precedent test just above (`CA-09`), which already solves exactly this
+  // problem by asserting STRUCTURE (a spy on `Array.prototype.reverse`), not
+  // a clock:
+  //  1. The PRIMARY, mutation-sensitive, timing-independent proof is the two
+  //     spy-based tests directly below: on the common tail-match path,
+  //     neither arm may call `Array.prototype.map` (the old full rebuild) or
+  //     `Array.prototype.reverse` (the fallback scan) — deterministic, and
+  //     exactly what the brief's named mutation ("force the tail check
+  //     always false") breaks.
+  //  2. The wall-clock test is KEPT (the brief's own explicit ask, mirroring
+  //     `postprocess.test.ts`'s `< 50 ms` idiom) as CORROBORATING evidence
+  //     that the fold is fast in absolute terms, but is deliberately sized
+  //     small (the brief's own 2000-delta count, at a 500-item tab — the
+  //     live cap boundary, so `capTranscript` stays a genuine no-op) so its
+  //     margin under gate-parallel contention is generous (~30 ms isolated
+  //     against a 50 ms bound); it is not relied on to catch the mutation —
+  //     tests 1 above are.
+  const PERF_TAB_SIZE = 500; // 499 settled + 1 open reasoning tail = the live MAX_TRANSCRIPT_ITEMS cap
+  const PERF_DELTA_COUNT = 2000;
+
+  it('[structural, mutation-sensitive] on the tail-match path, reasoning.delta calls neither Array.prototype.map (old full rebuild) nor Array.prototype.reverse (fallback scan)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const mapSpy = vi.spyOn(Array.prototype, 'map');
+    const reverseSpy = vi.spyOn(Array.prototype, 'reverse');
+    try {
+      state = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'thinking' });
+      expect(mapSpy).not.toHaveBeenCalled();
+      expect(reverseSpy).not.toHaveBeenCalled();
+    } finally {
+      mapSpy.mockRestore();
+      reverseSpy.mockRestore();
+    }
+    const tab = must(state.tabs[state.activeTabId], 'active tab');
+    expect(tab.transcript.find((i) => i.kind === 'reasoning')).toMatchObject({ text: 'thinking', streaming: true });
+  });
+
+  it('[structural, mutation-sensitive] on the tail-match path, reasoning.end calls neither Array.prototype.map (old full rebuild) nor Array.prototype.reverse (fallback scan)', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'thinking' });
+    const mapSpy = vi.spyOn(Array.prototype, 'map');
+    const reverseSpy = vi.spyOn(Array.prototype, 'reverse');
+    try {
+      state = reduce(state, { type: 'reasoning.end', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+      expect(mapSpy).not.toHaveBeenCalled();
+      expect(reverseSpy).not.toHaveBeenCalled();
+    } finally {
+      mapSpy.mockRestore();
+      reverseSpy.mockRestore();
+    }
+    const tab = must(state.tabs[state.activeTabId], 'active tab');
+    expect(tab.transcript.find((i) => i.kind === 'reasoning')).toMatchObject({ text: 'thinking', streaming: false });
+  });
+
+  it(
+    `[perf, corroborating] ${PERF_DELTA_COUNT} reasoning.delta onto a ${PERF_TAB_SIZE}-item tab (at the live cap) whose tail is the matching reasoning block complete in < 50 ms`,
+    () => {
+      const openReasoning: TranscriptItem = { kind: 'reasoning', turnId: 'live', blockId: 'r-live', text: '', streaming: true };
+      let state = tabWithSettledTail(PERF_TAB_SIZE - 1, [openReasoning], () => 'live');
+
+      const start = performance.now();
+      for (let i = 0; i < PERF_DELTA_COUNT; i++) {
+        state = reduce(state, { type: 'reasoning.delta', turnId: 'live', sessionId: 's1', blockId: 'r-live', text: 'x' });
+      }
+      const elapsed = performance.now() - start;
+      expect(elapsed).toBeLessThan(50);
+
+      const reasoning = must(state.tabs.boot, 'boot').transcript.find((i) => i.kind === 'reasoning');
+      expect(reasoning).toMatchObject({ blockId: 'r-live', text: 'x'.repeat(PERF_DELTA_COUNT), streaming: true });
+    },
+    5000,
+  );
+
+  it("reasoning.delta leaves an unrelated item's reference untouched (immutable-update parity with the old .map)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'user', turnId: 't1', sessionId: 's1', text: 'hi', mode: 'default' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const before = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    const userBefore = before.find((i) => i.kind === 'user');
+    state = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'thinking' });
+    const after = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    expect(after.find((i) => i.kind === 'user')).toBe(userBefore);
+  });
+
+  it("reasoning.end leaves an unrelated item's reference untouched (immutable-update parity with the old .map)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, { type: 'user', turnId: 't1', sessionId: 's1', text: 'hi', mode: 'default' });
+    state = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    state = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'thinking' });
+    const before = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    const userBefore = before.find((i) => i.kind === 'user');
+    state = reduce(state, { type: 'reasoning.end', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const after = must(state.tabs[state.activeTabId], 'active tab').transcript;
+    expect(after.find((i) => i.kind === 'user')).toBe(userBefore);
+  });
+
+  it('FALLBACK: reasoning.delta still finds a reasoning block that is NOT last (reverse-scan retained)', () => {
+    const reasoning = { kind: 'reasoning' as const, turnId: 't1', blockId: 'r1', text: 'A', streaming: true };
+    const later = { kind: 'message' as const, turnId: 't1', id: 'msg-t1-0', text: 'B', streaming: true };
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript: [reasoning, later] };
+    const state: AppState = { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+    const next = reduce(state, { type: 'reasoning.delta', turnId: 't1', sessionId: 's1', blockId: 'r1', text: 'B' });
+    const nextTab = must(next.tabs.boot, 'boot tab');
+    expect(nextTab.transcript[0]).toMatchObject({ kind: 'reasoning', text: 'AB', streaming: true });
+    expect(nextTab.transcript[1]).toBe(later); // untouched
+  });
+
+  it('FALLBACK: reasoning.end still finds a reasoning block that is NOT last (reverse-scan retained)', () => {
+    const reasoning = { kind: 'reasoning' as const, turnId: 't1', blockId: 'r1', text: 'A', streaming: true };
+    const later = { kind: 'message' as const, turnId: 't1', id: 'msg-t1-0', text: 'B', streaming: true };
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript: [reasoning, later] };
+    const state: AppState = { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+    const next = reduce(state, { type: 'reasoning.end', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const nextTab = must(next.tabs.boot, 'boot tab');
+    expect(nextTab.transcript[0]).toMatchObject({ kind: 'reasoning', text: 'A', streaming: false });
+    expect(nextTab.transcript[1]).toBe(later); // untouched
+  });
+});
+
 describe('CA-M15: transcript length cap keeps the tail and records the drop count', () => {
   function tabWithNItems(n: number): AppState {
     const transcript = Array.from({ length: n }, (_, i) => ({
@@ -2857,5 +3383,136 @@ describe('CA-M15: transcript length cap keeps the tail and records the drop coun
     const tab = must(cleared.tabs.boot, 'boot');
     expect(tab.transcript).toHaveLength(0);
     expect(tab.hiddenCount ?? 0).toBe(0);
+  });
+});
+
+describe('L2-CA-09: capTranscript is turn-aware — the active (tail) turn is never trimmed', () => {
+  it('a single turn that grows past the cap is left whole; only an OLDER turn is ever trimmed, and no messageId collides afterward', () => {
+    const bigTurn = Array.from({ length: 600 }, (_, i) => ({
+      kind: 'message' as const, turnId: 't1', id: `msg-t1-${i}`, text: `m${i}`, streaming: false,
+    }));
+    const tab = { ...makeTabState('boot', 'Chat 1'), sessionId: 's1', binding: 'bound' as const, transcript: bigTurn };
+    const state: AppState = { ...INITIAL_STATE, tabs: { ...INITIAL_STATE.tabs, boot: tab }, tabOrder: ['boot'], activeTabId: 'boot' };
+
+    // A same-turn fold (reasoning.start for t1) pushes the tab 101 items past
+    // MAX_TRANSCRIPT_ITEMS -- but every item in the transcript belongs to the
+    // ACTIVE turn t1, so NOTHING may be trimmed (the old unconditional
+    // front-slice trimmed 101 of t1's own earlier items here, orphaning the
+    // still-in-flight turn and risking a duplicate messageId on its next
+    // message block).
+    const afterReasoning = reduce(state, { type: 'reasoning.start', turnId: 't1', sessionId: 's1', blockId: 'r1' });
+    const tabAfterReasoning = must(afterReasoning.tabs.boot, 'boot tab');
+    expect(tabAfterReasoning.transcript).toHaveLength(601);
+    expect(tabAfterReasoning.hiddenCount ?? 0).toBe(0);
+
+    // Turn t2 begins: t1's 601 items are no longer the active tail, so the
+    // 102-item overage is trimmed from THEM (the front), never from t2.
+    const afterT2 = reduce(afterReasoning, { type: 'user', turnId: 't2', sessionId: 's1', text: 'next', mode: 'default' });
+    const tabAfterT2 = must(afterT2.tabs.boot, 'boot tab');
+    expect(tabAfterT2.transcript).toHaveLength(MAX_TRANSCRIPT_ITEMS);
+    expect(tabAfterT2.hiddenCount ?? 0).toBe(102);
+
+    const messageIds = tabAfterT2.transcript.filter((i): i is MessageItem => i.kind === 'message').map((i) => i.id);
+    expect(new Set(messageIds).size).toBe(messageIds.length); // no duplicate messageIds survive the trim
+  });
+});
+
+describe("L2-CA-10 (OD-3): plan.update keeps one plan card PER TURN, not one rebound across turns", () => {
+  it("a later turn's plan.update appends a NEW plan card instead of rewriting the earlier turn's card sitting in its own transcript position", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'step one', status: 'done' }],
+    });
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'complete' });
+
+    state = reduce(state, { type: 'turn.start', turnId: 't2', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't2',
+      sessionId: 's1',
+      items: [{ text: 'step A', status: 'active' }],
+    });
+
+    const transcript = activeTab(state).transcript;
+    const planCards = transcript.filter((i) => i.kind === 'plan');
+    // Today (pre-fix): the single shared predicate finds t1's card and
+    // REBINDS it in place -- length stays 1 and its `items`/`turnId` change
+    // out from under the earlier turn. Fixed: turn 2 gets its OWN card.
+    expect(planCards).toHaveLength(2);
+    expect(planCards[0]).toMatchObject({ turnId: 't1', items: [{ text: 'step one', status: 'done' }] });
+    expect(planCards[1]).toMatchObject({ turnId: 't2', items: [{ text: 'step A', status: 'active' }] });
+
+    // The side-panel projection always mirrors the LATEST update, regardless
+    // of how many per-turn cards sit in the transcript -- unchanged by CA-10.
+    expect(activeTab(state).plan).toEqual([{ text: 'step A', status: 'active' }]);
+  });
+
+  it("a second plan.update for the SAME turn still rebinds that turn's own card in place (no duplicate card per turn)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'step one', status: 'pending' }],
+    });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'step one', status: 'done' }, { text: 'step two', status: 'active' }],
+    });
+
+    const transcript = activeTab(state).transcript;
+    const planCards = transcript.filter((i) => i.kind === 'plan');
+    expect(planCards).toHaveLength(1);
+    expect(planCards[0]).toMatchObject({
+      turnId: 't1',
+      items: [{ text: 'step one', status: 'done' }, { text: 'step two', status: 'active' }],
+    });
+  });
+
+  it("once TWO turns' plan cards coexist, a second plan.update for the LATER turn rebinds only THAT turn's card -- the earlier turn's card is untouched (pins the map predicate's own turn guard, not just the some-predicate's)", () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't1',
+      sessionId: 's1',
+      items: [{ text: 'step one', status: 'done' }],
+    });
+    state = reduce(state, { type: 'turn.end', turnId: 't1', sessionId: 's1', status: 'complete' });
+
+    state = reduce(state, { type: 'turn.start', turnId: 't2', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't2',
+      sessionId: 's1',
+      items: [{ text: 'step A', status: 'active' }],
+    });
+
+    // Two turns, two cards, both still in the transcript (CA-10 append path).
+    const seeded = activeTab(state).transcript.filter((i) => i.kind === 'plan');
+    expect(seeded).toHaveLength(2);
+
+    // A SECOND plan.update for t2 (the later turn) must hit the UPDATE (map)
+    // branch, not append -- and must rebind ONLY t2's own card. If the map
+    // predicate's turn guard were dropped (matching whichever plan item
+    // `map` reaches, not the one whose turnId equals msg.turnId), this
+    // update would rewrite EVERY plan item -- including t1's already-closed
+    // card -- to t2's incoming items. That is the exact CA-10 cross-turn
+    // corruption this test pins on the map branch specifically.
+    state = reduce(state, {
+      type: 'plan.update',
+      turnId: 't2',
+      sessionId: 's1',
+      items: [{ text: 'step B', status: 'done' }],
+    });
+
+    const planCards = activeTab(state).transcript.filter((i) => i.kind === 'plan');
+    expect(planCards).toHaveLength(2); // no new card appended, none removed
+    expect(planCards[0]).toMatchObject({ turnId: 't1', items: [{ text: 'step one', status: 'done' }] }); // earlier turn's card unchanged
+    expect(planCards[1]).toMatchObject({ turnId: 't2', items: [{ text: 'step B', status: 'done' }] }); // only the later turn's card updated
   });
 });

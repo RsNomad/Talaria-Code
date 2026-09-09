@@ -43,6 +43,7 @@ export function makePort(overrides: Partial<ControlDispatcherHostPort> = {}): {
     },
     panelSources: registry,
     sessions: new SessionRegistry(),
+    isPendingClose: () => false,
     rootRegistry: new RootRegistry(),
     resolveRootCoordinator: (_cwd) => {
       throw new Error('resolveRootCoordinator not used in these tests');

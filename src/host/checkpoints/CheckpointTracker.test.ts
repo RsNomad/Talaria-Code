@@ -91,7 +91,35 @@ function detectNewlineFilenameSupport(): boolean {
   }
 }
 
+/**
+ * Can this platform create a plain FILE symlink (needs elevation/Developer
+ * Mode on Windows; unrestricted on POSIX)? Distinct from {@link CAN_SYMLINK},
+ * which only proves NTFS DIRECTORY-junction support (see its own S-M1 use) —
+ * the L2-CA-14 lstat-vs-stat micro-check below symlinks a FILE.
+ */
+function detectFileSymlinkSupport(): boolean {
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-filesymcap-'));
+    const target = path.join(dir, 't.txt');
+    writeFileSync(target, 'x');
+    symlinkSync(target, path.join(dir, 'l.txt'), 'file');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (dir) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 const CAN_SYMLINK = detectSymlinkSupport();
+const CAN_FILE_SYMLINK = detectFileSymlinkSupport();
 const CAN_NEWLINE_FILENAME = detectNewlineFilenameSupport();
 
 describe('CheckpointTracker', () => {
@@ -964,6 +992,88 @@ describe('CheckpointTracker', () => {
       const changed = await tracker.diff(ckpt1.id);
       expect(Array.isArray(changed)).toBe(true);
     });
+  });
+
+  describe('init/cleanup — L2-CA-14: stale index.json.tmp-* orphan sweep', () => {
+    // Fixed, valid-shaped UUIDs (the sweep's filename regex only cares about
+    // shape) so each test seeds deterministic, distinct temp-file names.
+    const STALE_UUID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const FRESH_UUID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const SYMLINK_UUID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const STALE_AGE_MS = 11 * 60_000; // > the 10-minute cutoff
+
+    it('init() removes a stale index.json.tmp-* orphan, keeps a fresh one, and never touches the real index.json', async () => {
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+      const shadowDir = path.dirname(tracker.shadowGitDir);
+      await fs.mkdir(shadowDir, { recursive: true });
+
+      const staleTmp = path.join(shadowDir, `index.json.tmp-${STALE_UUID}`);
+      const freshTmp = path.join(shadowDir, `index.json.tmp-${FRESH_UUID}`);
+      const realIndex = path.join(shadowDir, 'index.json');
+      const realIndexContent = JSON.stringify(
+        { workspaceRoot, currentBaselineId: null, checkpoints: [] },
+        null,
+        2,
+      );
+
+      await fs.writeFile(staleTmp, 'stale-orphan');
+      await fs.writeFile(freshTmp, 'fresh-orphan');
+      await fs.writeFile(realIndex, realIndexContent, 'utf8');
+      const past = new Date(Date.now() - STALE_AGE_MS);
+      await fs.utimes(staleTmp, past, past);
+
+      await tracker.init();
+
+      await expect(fs.access(staleTmp)).rejects.toThrow();
+      await expect(fs.access(freshTmp)).resolves.toBeUndefined();
+      expect(await fs.readFile(realIndex, 'utf8')).toBe(realIndexContent);
+    });
+
+    it('cleanup() removes a stale index.json.tmp-* orphan, keeps a fresh one, and never touches the real index.json', async () => {
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+      await tracker.init();
+      const shadowDir = path.dirname(tracker.shadowGitDir);
+      const realIndex = path.join(shadowDir, 'index.json');
+      const realIndexContentBefore = await fs.readFile(realIndex, 'utf8');
+
+      const staleTmp = path.join(shadowDir, `index.json.tmp-${STALE_UUID}`);
+      const freshTmp = path.join(shadowDir, `index.json.tmp-${FRESH_UUID}`);
+      await fs.writeFile(staleTmp, 'stale-orphan');
+      await fs.writeFile(freshTmp, 'fresh-orphan');
+      const past = new Date(Date.now() - STALE_AGE_MS);
+      await fs.utimes(staleTmp, past, past);
+
+      await tracker.cleanup(0);
+
+      await expect(fs.access(staleTmp)).rejects.toThrow();
+      await expect(fs.access(freshTmp)).resolves.toBeUndefined();
+      expect(await fs.readFile(realIndex, 'utf8')).toBe(realIndexContentBefore);
+    });
+
+    (CAN_FILE_SYMLINK ? it : it.skip)(
+      'uses lstat (never stat): a stale symlink named index.json.tmp-* is swept even though its FRESH target survives untouched',
+      async () => {
+        const tracker = new CheckpointTracker(storageDir, workspaceRoot);
+        const shadowDir = path.dirname(tracker.shadowGitDir);
+        await fs.mkdir(shadowDir, { recursive: true });
+
+        const target = path.join(shadowDir, 'fresh-target.txt');
+        await fs.writeFile(target, 'fresh-target-content'); // fresh mtime
+        const link = path.join(shadowDir, `index.json.tmp-${SYMLINK_UUID}`);
+        await fs.symlink(target, link, 'file');
+        // The LINK's own mtime is stale; its TARGET's mtime is fresh. Only
+        // `lutimes` (no-follow) can set the former without touching the latter.
+        const past = new Date(Date.now() - STALE_AGE_MS);
+        await fs.lutimes(link, past, past);
+
+        await tracker.init();
+
+        // The stale link itself was swept (lstat governed, not the fresh target).
+        await expect(fs.lstat(link)).rejects.toThrow();
+        // The target it pointed at was never followed/touched.
+        await expect(fs.readFile(target, 'utf8')).resolves.toBe('fresh-target-content');
+      },
+    );
   });
 
   describe('restore — dirty-guard hardening (review CRITICAL #1)', () => {

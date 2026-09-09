@@ -39,9 +39,15 @@
 // Field-by-field object construction only, no spread — this file lives
 // under `src/autocomplete/` and is in scope for `ringBuffer.test.ts`'s
 // repo-wide `SPREAD_RE`/`CAST_RE` purity guards.
-import type { EditableRegion, NextEditCursor, NextEditRequest, NextEditVerdict, RecentDiff } from '../types';
+import type { NextEditRequest, NextEditVerdict, RecentDiff } from '../types';
 import type { NextEditFormat, NextEditModelOutput, NextEditRenderResult, RenderedNextEditPrompt } from './types';
-import { isPureInsertionAboveCursor } from './shared';
+import {
+  DIFF_CHAR_BUDGET,
+  isPureInsertionAboveCursor,
+  relativeCursorOffset,
+  renderBudgetedBlocks,
+  trimAtFirstStopToken,
+} from './shared';
 
 // The five literal control/XML tokens the sourced prompt uses. Also this
 // format's `sentinels` (task-8-brief.md, exact order) — the egress mint
@@ -70,12 +76,6 @@ const MAX_TOKENS = 1024;
 // module never recomputes the window itself, it only renders whatever
 // `req.region` already carries — same convention as `sweepV2.ts`.
 const WINDOW_LINES = 10;
-// `08` §4.3's sweep-v2 diff budget, reused here for the SAME "don't let one
-// oversized diff crowd out the whole recent-changes section" rationale
-// (`01-arch-and-pattern.md` §4.6's skip-not-crop precedent). Not itself
-// re-derived from any qwen_prompt.md source — the appendix quotes the
-// prompt's FRAME, not a fill budget for `{recent_changes}`.
-const DIFF_CHAR_BUDGET = 4000;
 
 // The assistant turn is entirely fixed scaffolding text — task-8-brief.md:
 // "the prompt ENDS mid-assistant-turn; `prefill` = the assistant turn's
@@ -130,18 +130,7 @@ function renderDiffPair(diff: RecentDiff): string {
  * different prompt.
  */
 function renderRecentChanges(diffs: readonly RecentDiff[]): string {
-  const blocks: string[] = [];
-  let usedChars = 0;
-  for (const diff of diffs) {
-    const block = renderDiffPair(diff);
-    const addedChars = block.length + (blocks.length > 0 ? 1 : 0); // +1 for the '\n' join, once there's a prior block
-    if (usedChars + addedChars > DIFF_CHAR_BUDGET) {
-      break;
-    }
-    blocks.push(block);
-    usedChars += addedChars;
-  }
-  return blocks.join('\n');
+  return renderBudgetedBlocks(diffs, renderDiffPair, DIFF_CHAR_BUDGET, '\n');
 }
 
 /**
@@ -243,61 +232,6 @@ export function render(req: NextEditRequest): NextEditRenderResult {
   };
 }
 
-/**
- * Splits `text` into lines, each retaining its own trailing '\n' (the final
- * chunk's terminator is omitted when the text has none). A local twin of
- * `formats/shared.ts`'s private `splitLinesKeepingTerminators` and
- * `sweepV2.ts`'s own `splitKeepingNewlines` — Task 5's module is frozen and
- * does not export it, and `sweepV2.ts` owns its private copy for the same
- * "two different jobs need the identical split" reason (its own doc
- * comment). This file's render (Task 8) never needed cursor placement at
- * all — `05` §2.3: no cursor marker anywhere in the ChatML prompt — so
- * there was no prior copy here; parse (Task 9) is the first consumer.
- * Duplicated on purpose rather than reaching into a sibling task's frozen
- * file or another format module's private helper.
- */
-function splitKeepingNewlines(text: string): string[] {
-  const lines: string[] = [];
-  let start = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '\n') {
-      lines.push(text.slice(start, i + 1));
-      start = i + 1;
-    }
-  }
-  if (start < text.length) {
-    lines.push(text.slice(start));
-  }
-  return lines;
-}
-
-/**
- * Character offset of `cursor` within `region.content` (UTF-16 code units)
- * — needed here only for `isPureInsertionAboveCursor`'s `relativeCursor`
- * parameter (Task 9's own rule; the render half never computes this).
- * Structurally identical to `sweepV2.ts`'s own `relativeCursorOffset`
- * (same clamp-at-each-edge fail-closed style — an out-of-window cursor
- * degrades to the nearest in-bounds offset rather than throwing).
- */
-function relativeCursorOffset(region: EditableRegion, cursor: NextEditCursor): number {
-  const lines = splitKeepingNewlines(region.content);
-  const lastLineIndex = Math.max(lines.length - 1, 0);
-  const lineIndex = Math.min(Math.max(cursor.line - region.startLine, 0), lastLineIndex);
-
-  let offset = 0;
-  for (let i = 0; i < lineIndex; i++) {
-    // i < lineIndex <= lastLineIndex keeps i within lines' bounds whenever
-    // lines is non-empty (the only case this loop body runs) — the `?? 0`
-    // fallback mirrors `lineText`'s own established pattern just below and
-    // is unreachable, not a behavior change.
-    offset += lines[i]?.length ?? 0;
-  }
-  const lineText = lines[lineIndex] ?? '';
-  const lineTextNoTerminator = lineText.endsWith('\n') ? lineText.slice(0, -1) : lineText;
-  const character = Math.min(Math.max(cursor.character, 0), lineTextNoTerminator.length);
-  return offset + character;
-}
-
 // task-9-brief.md's echo-dismissal set (Job B Task 9 fix, Opus-review-
 // flagged) — the four sentinels this format renders OUTSIDE the
 // STOP_TOKENS set. Reuses the module's existing named consts (above); no
@@ -395,8 +329,8 @@ const ECHO_SENTINELS = [IM_START, CURRENT_FILE_OPEN, RECENT_CHANGES_OPEN, CODE_B
  *      region itself, `04` §1.4).
  *   7. `isPureInsertionAboveCursor` (`formats/shared.ts`, Task 5) ⇒
  *      `no-op` (task-9-brief.md / `08` §4.4 — "✔ (shared helper)" in the
- *      fail-closed map, `08` §4.5). `relativeCursor` is computed by this
- *      module's own `relativeCursorOffset`, above.
+ *      fail-closed map, `08` §4.5). `relativeCursor` is computed by
+ *      `formats/shared.ts`'s own `relativeCursorOffset` (imported, above).
  *   8. Else `rewrite`, over `req.region` — never a model-derived region
  *      (same invariant as `sweepV2.ts`'s final rule).
  */
@@ -407,12 +341,7 @@ function parse(output: NextEditModelOutput, _rendered: RenderedNextEditPrompt, r
   }
 
   let completion = output.text;
-  for (const stop of STOP_TOKENS) {
-    const idx = completion.indexOf(stop);
-    if (idx !== -1) {
-      completion = completion.slice(0, idx);
-    }
-  }
+  completion = trimAtFirstStopToken(completion, STOP_TOKENS);
 
   for (const sentinel of ECHO_SENTINELS) {
     if (completion.includes(sentinel)) {

@@ -528,6 +528,40 @@ async function runSyncVerbWithRetry<T>(
   return { status: retryEmpty ? 'maybe-indexing' : 'ok', value: retry };
 }
 
+/** Options for {@link settleAsyncVerb} — each of the five call sites supplies
+ * its OWN empty-shape thunk and its OWN exact rejected-log string (the
+ * framed output and the log message both differ per handler); `log` is
+ * always `deps.log` (optional, never called on the success path). */
+interface SettleAsyncVerbOptions {
+  readonly emptyShape: () => string;
+  readonly rejectedLog: string;
+  readonly log?: (msg: string) => void;
+}
+
+/** FI-25 — collapses the `timeout-partial`/`error` settle boilerplate
+ * repeated by all five async LSP verb handlers (definition/references via
+ * {@link handleLocationsTool}, document_symbols, workspace_symbols, hover,
+ * code_actions) against a {@link GatewayVerdict}. Returns a DISCRIMINATED
+ * result rather than `ToolResult | undefined`: narrowing on a separate
+ * `early !== undefined` boolean does not narrow the ORIGINAL `run` union
+ * (the timeout/error variants have no `.value`), and forcing it with `as`/`!`
+ * is banned — so the caller narrows on `'early' in settled` instead and gets
+ * `settled.value`/`settled.status` typed exactly like the old
+ * `run.value`/`run.status` was after its own two early returns. */
+function settleAsyncVerb<T>(
+  run: GatewayVerdict<T>,
+  opts: SettleAsyncVerbOptions,
+): { readonly early: ToolResult } | { readonly value: T; readonly status: 'ok' | 'maybe-indexing' } {
+  if (run.status === 'timeout-partial') {
+    return { early: textResult(withStatus('timeout-partial', opts.emptyShape())) };
+  }
+  if (run.status === 'error') {
+    opts.log?.(opts.rejectedLog);
+    return { early: errorResult() };
+  }
+  return { value: run.value, status: run.status };
+}
+
 // ---------------------------------------------------------------------------
 // Shared path+position resolution (definition/references/hover)
 // ---------------------------------------------------------------------------
@@ -711,17 +745,25 @@ interface LocationsToolOptions {
   readonly verb: (gateway: LspToolGateway, uri: string, position: PlainPosition) => Promise<readonly (PlainLocation | PlainLocationLink)[]>;
 }
 
-/** Classifies EVERY raw target (needed for the shaper's accurate "N
- * external" summary count over the FULL result set) but only reads a
- * snippet for the entries that will actually be shown after capping AND are
- * in-root — never for an external target, never for a beyond-cap entry.
+/** Classifies only the SHOWN prefix (the first `capLimit` targets —
+ * `shapeLocations` renders `shown` only and counts `externalCount` over that
+ * same shown set) and only reads a snippet for the shown entries that are
+ * also in-root — never for an external target, never for a beyond-cap entry.
  *
- * AU-20: each target's `classifyUri`/`readSnippet` pair runs through the
- * SAME 4-slot pool the gateway call already used — a raw `Promise.all` here
- * would fan out unboundedly (a symbol with hundreds of references). The
- * gateway call that produced `raw` has already resolved and released its
- * pool slot by the time this function runs (`handleLocationsTool` awaits it
- * first), so there is no re-entrant `pool.run` nesting. */
+ * L2-CA-20 (Lens-R2, [SEC]): classifying the FULL raw result before capping
+ * was agent-controlled unbounded FS work — a hot symbol with hundreds/
+ * thousands of references paid for a realpath per target even though only
+ * `capLimit` are ever shown. The beyond-cap tail is paired with the cheap,
+ * never-classified `UNCLASSIFIED_TAIL_VERDICT` placeholder instead, mirroring
+ * the landed M-2 fix for `lsp_workspace_symbols` (see that constant's doc and
+ * `handleWorkspaceSymbols` below).
+ *
+ * AU-20: each shown target's `classifyUri`/`readSnippet` pair still runs
+ * through the SAME 4-slot pool the gateway call already used — a raw
+ * `Promise.all` here would fan out unboundedly even bounded to `capLimit`
+ * entries. The gateway call that produced `raw` has already resolved and
+ * released its pool slot by the time this function runs (`handleLocationsTool`
+ * awaits it first), so there is no re-entrant `pool.run` nesting. */
 async function buildLocationTargets(
   deps: LspToolDeps,
   raw: readonly (PlainLocation | PlainLocationLink)[],
@@ -730,17 +772,23 @@ async function buildLocationTargets(
 ): Promise<LocationTarget[]> {
   const coalesced = raw.map(coalesceTarget);
   return Promise.all(
-    coalesced.map((target, index) =>
-      deps.pool.run(async () => {
+    coalesced.map((target, index) => {
+      // CA-20 (Lens-R2, [SEC]): only the shown prefix is classified — the beyond-cap tail is
+      // never rendered (shapeLocations renders `shown` only), so pair it with the cheap
+      // UNCLASSIFIED_TAIL_VERDICT placeholder instead of paying a realpath per agent-supplied
+      // location. Mirrors the landed M-2 lsp_workspace_symbols shape.
+      if (index >= capLimit) {
+        return Promise.resolve<LocationTarget>({ range: target.range, verdict: UNCLASSIFIED_TAIL_VERDICT });
+      }
+      return deps.pool.run(async () => {
         const verdict = await deps.classifyUri(target.uri);
-        const withinCap = index < capLimit;
-        if (verdict.inRoot && withinCap) {
+        if (verdict.inRoot) {
           const snippet = await deps.readSnippet(target.uri, target.range, snippetMaxLines);
           return { range: target.range, verdict: snippet === undefined ? verdict : { ...verdict, snippet } };
         }
         return { range: target.range, verdict };
-      }),
-    ),
+      });
+    }),
   );
 }
 
@@ -767,19 +815,18 @@ async function handleLocationsTool(
     work: () => opts.verb(deps.gateway, arg.uri, position),
   });
 
-  if (run.status === 'timeout-partial') {
-    return textResult(
-      withStatus('timeout-partial', shapeLocations([], DEFAULT_SHAPER_CAPS, { cap: opts.capLimit })),
-    );
-  }
-  if (run.status === 'error') {
-    deps.log?.('[lsp] locations gateway call rejected');
-    return errorResult();
+  const settled = settleAsyncVerb(run, {
+    emptyShape: () => shapeLocations([], DEFAULT_SHAPER_CAPS, { cap: opts.capLimit }),
+    rejectedLog: '[lsp] locations gateway call rejected',
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+  });
+  if ('early' in settled) {
+    return settled.early;
   }
 
-  const targets = await buildLocationTargets(deps, run.value, opts.capLimit, opts.snippetMaxLines);
+  const targets = await buildLocationTargets(deps, settled.value, opts.capLimit, opts.snippetMaxLines);
   const framed = shapeLocations(targets, DEFAULT_SHAPER_CAPS, { cap: opts.capLimit });
-  return textResult(withStatus(run.status, framed));
+  return textResult(withStatus(settled.status, framed));
 }
 
 async function handleDefinition(
@@ -858,14 +905,13 @@ async function handleDocumentSymbols(
     work: () => deps.gateway.getDocumentSymbols(arg.uri),
   });
 
-  if (run.status === 'timeout-partial') {
-    return textResult(
-      withStatus('timeout-partial', shapeDocumentSymbols([], args.path, DEFAULT_SHAPER_CAPS)),
-    );
-  }
-  if (run.status === 'error') {
-    deps.log?.('[lsp] document_symbols gateway call rejected');
-    return errorResult();
+  const settled = settleAsyncVerb(run, {
+    emptyShape: () => shapeDocumentSymbols([], args.path, DEFAULT_SHAPER_CAPS),
+    rejectedLog: '[lsp] document_symbols gateway call rejected',
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+  });
+  if ('early' in settled) {
+    return settled.early;
   }
 
   // M-1 fix: never cache an empty result. Language-server indexing
@@ -877,11 +923,11 @@ async function handleDocumentSymbols(
   // the first-empty retry/status policy), and can recover once indexing
   // finishes. A real non-empty result still caches normally (overwriting
   // whatever was previously cached for this uri, at any version — L4).
-  if (run.value.length > 0) {
-    cache.set(arg.uri, { version: arg.version, entries: run.value });
+  if (settled.value.length > 0) {
+    cache.set(arg.uri, { version: arg.version, entries: settled.value });
   }
-  const framed = shapeDocumentSymbols(run.value.map(normalizeDocumentSymbol), args.path, DEFAULT_SHAPER_CAPS);
-  return textResult(withStatus(run.status, framed));
+  const framed = shapeDocumentSymbols(settled.value.map(normalizeDocumentSymbol), args.path, DEFAULT_SHAPER_CAPS);
+  return textResult(withStatus(settled.status, framed));
 }
 
 // ---------------------------------------------------------------------------
@@ -911,14 +957,13 @@ async function handleWorkspaceSymbols(
     work: () => deps.gateway.getWorkspaceSymbols(args.query),
   });
 
-  if (run.status === 'timeout-partial') {
-    return textResult(
-      withStatus('timeout-partial', shapeWorkspaceSymbols([], DEFAULT_SHAPER_CAPS, { cap: capLimit })),
-    );
-  }
-  if (run.status === 'error') {
-    deps.log?.('[lsp] workspace_symbols gateway call rejected');
-    return errorResult();
+  const settled = settleAsyncVerb(run, {
+    emptyShape: () => shapeWorkspaceSymbols([], DEFAULT_SHAPER_CAPS, { cap: capLimit }),
+    rejectedLog: '[lsp] workspace_symbols gateway call rejected',
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+  });
+  if ('early' in settled) {
+    return settled.early;
   }
 
   // Highest-disclosure tool (research doc §5.2): every SHOWN location
@@ -934,18 +979,18 @@ async function handleWorkspaceSymbols(
   // cheap, never-classified placeholder (see `UNCLASSIFIED_TAIL_VERDICT`)
   // purely so the shaper's "N of TOTAL shown" summary still reports the
   // true total.
-  const capped = run.value.slice(0, capLimit);
+  const capped = settled.value.slice(0, capLimit);
   const classified: WorkspaceSymbolTarget[] = await Promise.all(
     capped.map((sym) =>
       deps.pool.run(async () => ({ sym, verdict: await deps.classifyUri(sym.location.uri) })),
     ),
   );
-  const tail: WorkspaceSymbolTarget[] = run.value
+  const tail: WorkspaceSymbolTarget[] = settled.value
     .slice(capLimit)
     .map((sym) => ({ sym, verdict: UNCLASSIFIED_TAIL_VERDICT }));
   const targets: WorkspaceSymbolTarget[] = [...classified, ...tail];
   const framed = shapeWorkspaceSymbols(targets, DEFAULT_SHAPER_CAPS, { cap: capLimit });
-  return textResult(withStatus(run.status, framed));
+  return textResult(withStatus(settled.status, framed));
 }
 
 // ---------------------------------------------------------------------------
@@ -974,16 +1019,17 @@ async function handleHover(
     work: () => deps.gateway.getHover(arg.uri, position),
   });
 
-  if (run.status === 'timeout-partial') {
-    return textResult(withStatus('timeout-partial', shapeHover([], DEFAULT_SHAPER_CAPS)));
-  }
-  if (run.status === 'error') {
-    deps.log?.('[lsp] hover gateway call rejected');
-    return errorResult();
+  const settled = settleAsyncVerb(run, {
+    emptyShape: () => shapeHover([], DEFAULT_SHAPER_CAPS),
+    rejectedLog: '[lsp] hover gateway call rejected',
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+  });
+  if ('early' in settled) {
+    return settled.early;
   }
 
-  const framed = shapeHover(run.value, DEFAULT_SHAPER_CAPS);
-  return textResult(withStatus(run.status, framed));
+  const framed = shapeHover(settled.value, DEFAULT_SHAPER_CAPS);
+  return textResult(withStatus(settled.status, framed));
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,22 +1132,35 @@ async function handleCodeActions(
   const { arg, range } = resolved;
   const itemResolveCount = clampMaxActionsK(args.maxActions);
 
-  const run = await runOnce(pool, DEADLINE_CODE_ACTIONS_MS, () =>
+  const rawRun = await runOnce(pool, DEADLINE_CODE_ACTIONS_MS, () =>
     deps.gateway.getCodeActions(arg.uri, range, args.kind, itemResolveCount),
   );
+  // FI-25: `settleAsyncVerb` settles the `status`-discriminated
+  // `GatewayVerdict` shape `runAsyncVerbWithRetry` returns. `runOnce` (this
+  // tool's own single-shot caller — there is no first-empty/maybe-indexing
+  // retry here, see the file section header above) returns the
+  // `kind`-discriminated shape instead (and never a 'maybe-indexing' arm);
+  // translate it into the shared vocabulary before settling.
+  const run: GatewayVerdict<readonly RawCodeAction[]> =
+    rawRun.kind === 'ok'
+      ? { status: 'ok', value: rawRun.value }
+      : rawRun.kind === 'timeout'
+        ? { status: 'timeout-partial' }
+        : { status: 'error', error: rawRun.error };
 
-  if (run.kind === 'timeout') {
-    return textResult(withStatus('timeout-partial', shapeCodeActions([], DEFAULT_SHAPER_CAPS)));
-  }
-  if (run.kind === 'error') {
-    deps.log?.('[lsp] code_actions gateway call rejected');
-    return errorResult();
+  const settled = settleAsyncVerb(run, {
+    emptyShape: () => shapeCodeActions([], DEFAULT_SHAPER_CAPS),
+    rejectedLog: '[lsp] code_actions gateway call rejected',
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+  });
+  if ('early' in settled) {
+    return settled.early;
   }
 
-  const resolvedActions = await Promise.all(run.value.map((raw) => buildResolvedCodeAction(deps, raw)));
+  const resolvedActions = await Promise.all(settled.value.map((raw) => buildResolvedCodeAction(deps, raw)));
   const serialized = resolvedActions.map((action) => classifyCodeAction(action, DEFAULT_SHAPER_CAPS));
   const framed = shapeCodeActions(serialized, DEFAULT_SHAPER_CAPS);
-  return textResult(withStatus('ok', framed));
+  return textResult(withStatus(settled.status, framed));
 }
 
 // ---------------------------------------------------------------------------

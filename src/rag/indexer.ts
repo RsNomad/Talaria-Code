@@ -147,6 +147,29 @@ export interface IndexMeta {
 }
 
 /**
+ * F6-5 (FI-19): the structural validator `readMeta` runs before trusting a
+ * parsed `manifest.meta.json` — mirrors `readManifest`'s inline
+ * `isRecord`/per-value checks (`:283-292`) but for `IndexMeta`'s shape, and
+ * replaces the old blind `as IndexMeta` cast (the validator now PROVES the
+ * type instead of asserting it). Only the TYPE of each field is checked, not
+ * `schema`'s literal value `2` — `fingerprintMatches` already treats any
+ * `!== 2` value as a mismatch downstream (full recompute), so re-checking
+ * the literal here would be redundant. `width`/`scannerVersion` are both
+ * optional on `IndexMeta` (absent on a first build or a pre-existing legacy
+ * sidecar) — `undefined` is accepted for either, same as a present number.
+ */
+function isWellFormedMeta(x: unknown): x is IndexMeta {
+  return (
+    isRecord(x) &&
+    typeof x.schema === 'number' &&
+    typeof x.embedModel === 'string' &&
+    typeof x.dims === 'number' &&
+    (x.width === undefined || typeof x.width === 'number') &&
+    (x.scannerVersion === undefined || typeof x.scannerVersion === 'number')
+  );
+}
+
+/**
  * Extension-host indexer: owns the workspace walk, file watcher, chunking,
  * embedding calls, and `VectorStore` writes (how-to §6/§7 — "the extension
  * host owns indexing ... the MCP process only queries"). All native/HTTP
@@ -177,6 +200,9 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   const parser = new WebTreeSitterParser({
     grammarsDir:
       opts.grammarsDir ?? path.join(opts.workspaceRoot, 'node_modules', 'tree-sitter-wasms', 'out'),
+    // FI-20/FI-31 (F6-6): same injected log seam as everything else in this
+    // factory — a grammar-load failure logs err.name only, never raw err.
+    logger,
   });
 
   const manifestPath = path.join(opts.indexDir, MANIFEST_FILE);
@@ -317,9 +343,34 @@ export function createIndexer(opts: IndexerOptions): Indexer {
   }
 
   async function readMeta(): Promise<IndexMeta | undefined> {
+    let raw: string;
     try {
-      return JSON.parse(await fs.readFile(metaPath, 'utf8')) as IndexMeta;
+      raw = await fs.readFile(metaPath, 'utf8');
+    } catch (err) {
+      // F6-5 (FI-19): mirrors readManifest's F2-13 errno classification
+      // (`:273-275`) — ENOENT is the ordinary "no meta yet" case (silent);
+      // any other read error is logged (name only, never the path/raw err)
+      // before falling back to the same "no meta" signal ENOENT returns.
+      if (!(err instanceof Error && 'code' in err && (err as { code?: string }).code === 'ENOENT')) {
+        logger(`hermes-codebase: meta read failed (${err instanceof Error ? err.name : 'unknown'}) — rebuilding`);
+      }
+      return undefined;
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      // F6-5 (FI-19): a parsed value that doesn't match IndexMeta's shape is
+      // corrupt — treat it exactly like a missing/unreadable meta sidecar
+      // (full rebuild via fingerprintMatches(undefined) below) instead of
+      // trusting it via a blind cast.
+      if (!isWellFormedMeta(parsed)) {
+        logger('hermes-codebase: meta is corrupt (bad shape) — rebuilding');
+        return undefined;
+      }
+      return parsed;
     } catch {
+      // F6-5 (FI-19): parse failure = corruption; NEVER a silent undefined
+      // without a log — mirrors readManifest's own parse-error branch.
+      logger('hermes-codebase: meta is corrupt (parse error) — rebuilding');
       return undefined;
     }
   }

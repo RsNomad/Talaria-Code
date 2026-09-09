@@ -274,7 +274,7 @@ async function realpathOfExistingPrefix(target: string): Promise<string> {
  * An out-of-parent target yields a `path.relative` result that is either
  * `..`, starts with `..${sep}`, or is absolute (different drive on win32).
  */
-function isWithin(child: string, parent: string): boolean {
+export function isWithin(child: string, parent: string): boolean {
   const rel = path.relative(parent, child);
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
 }

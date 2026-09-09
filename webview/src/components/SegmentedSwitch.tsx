@@ -37,7 +37,7 @@ export function SegmentedSwitch<T extends string>({
           aria-pressed={value === o.id}
           onClick={() => onChange(o.id)}
           className={`rounded px-2 py-0.5 font-mono text-2xs uppercase tracking-wide ${
-            value === o.id ? 'bg-accent-soft text-accent' : 'text-faint hover:text-muted'
+            value === o.id ? 'border border-accent bg-accent-soft font-semibold text-accent' : 'border border-transparent text-faint hover:text-muted'
           }`}
         >
           {o.label}

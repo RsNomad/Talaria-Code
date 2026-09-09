@@ -13,6 +13,7 @@ import type { CatalogModel, CatalogRole } from './modelCatalog';
 import type { LlamaCppLocateResult } from './llamaCppLocator';
 import type { GgufDestResult } from './modelStore';
 import type { GgufStoreSpec } from './ggufIngest';
+import type { GgufIngestSpec } from './ggufIngestSpec';
 import { AUTOCOMPLETE_API_KEY_SECRET } from '../../autocomplete/apiKey';
 import { createMutationGate, type MutationGate } from '../util/mutationGate';
 import { LatchRegistry, SETUP_DISPOSED_REFUSAL } from './latchRegistry';
@@ -48,6 +49,7 @@ import type {
   SetupProgress,
 } from '../../shared/protocol';
 import { SETUP_METHODS } from '../../shared/protocol';
+import { errorMessage } from '../../shared/errorMessage';
 
 // --- WS-GD.2b B7: façade re-exports — these symbols now live in provisionRunner.ts /
 // modalText.ts / latchRegistry.ts; re-exported here so existing external import
@@ -136,8 +138,27 @@ class Emitter<T> {
     return { dispose: () => this.listeners.delete(listener) };
   };
 
+  /**
+   * WS-R2 R2-2 (L2-CA-19): every listener is served even when an earlier one
+   * throws — the `[...this.listeners]` snapshot alone only guarded against
+   * mutation-during-iteration; a throw used to abort the `for` loop outright
+   * and starve every later listener of the event. Throws are now collected
+   * and re-thrown together as an `AggregateError` — isolation without a
+   * silent swallow. See ADR-025-B for the accepted `pushProgress` setTimeout
+   * boundary this does not (and need not) reach into.
+   */
   fire(value: T): void {
-    for (const listener of [...this.listeners]) listener(value);
+    const errors: unknown[] = [];
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(value);
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'SetupController listener(s) threw');
+    }
   }
 
   dispose(): void {
@@ -231,26 +252,12 @@ export interface SetupControllerRegistry {
 }
 
 /**
- * T13 (beta.5 §4.4.3d): what the controller hands the T14 ingest engine —
- * ALWAYS the registry-pinned artifact (`NEXT_DEDICATED_MODEL.gguf` +
- * `ollamaCreatedName`), never anything webview-derived. The engine's own
- * io/fs/fetch seams are bound in `setupHost.vscode.ts`, NOT passed here.
+ * WS-F8 F8-3 (FI-17): moved to its own leaf so the FROZEN `ggufIngest.ts`
+ * (which imports it from `'./SetupController'`) no longer depends on this
+ * god-file for its own type — re-exported here (type-only, erased at
+ * compile time) so that frozen import line keeps resolving unchanged.
  */
-export interface GgufIngestSpec {
-  gguf: {
-    hfRepo: string;
-    file: string;
-    quant: string;
-    sha256: string;
-    approxBytes: number;
-    /** T3 (beta.6 §2.4): optional — meaningful only in `pinned` mode (the
-     *  pinned llama.cpp/Ollama path passes it for `verifyHfDigest`'s exact-
-     *  file-set check upstream of `ingestGguf`; `live-oid` mode passes
-     *  none, since nothing else in the repo is ever read for that file). */
-    allowedRepoFiles?: readonly string[];
-  };
-  ollamaCreatedName: string;
-}
+export type { GgufIngestSpec } from './ggufIngestSpec';
 
 export interface SetupControllerDeps {
   /** Bound to its real `ExecLookup` by the caller. Can REJECT — always try/catch this (T4 M-2).
@@ -801,8 +808,8 @@ export class SetupController {
       'talaria.setup.hermesInstall',
     );
 
-    const agentOptions = this.deps.registry.AGENT_BACKENDS.map((d) => this.projectBackend(d, ollamaStatus, apiKeySet));
-    const fimOptions = this.deps.registry.FIM_BACKENDS.map((d) => this.projectBackend(d, ollamaStatus, apiKeySet));
+    const agentOptions = this.deps.registry.AGENT_BACKENDS.map((d) => this.projectBackend(d, apiKeySet));
+    const fimOptions = this.deps.registry.FIM_BACKENDS.map((d) => this.projectBackend(d, apiKeySet));
 
     const fimBackendId = this.host.getSetting<string>('talaria.autocomplete.backend') ?? 'ollama';
     const fimDescriptor =
@@ -856,8 +863,6 @@ export class SetupController {
       rag: composeRagBlock({
         reader: this.host,
         trusted,
-        ollamaRunning: ollamaStatus.running,
-        ollamaModels: ollamaStatus.running ? ollamaStatus.models : [],
       }),
       // T13 (§4.2): `endpoint` = the endpoint this status() ACTUALLY probed
       // — presence claims are scoped to it (critic C-6).
@@ -1597,8 +1602,8 @@ export class SetupController {
       this.rekickLlamaCppProbe();
     }
     if (scope === 'all' || scope === 'agent') {
-      // TC-3 (AU-8/INV-11): drop the settled Hermes PATH-discovery memo too
-      // — mirrors osResolution's clear-only posture above (not
+      // TC-3 (AU-8/INV-11): drop the settled Hermes PATH-discovery memo —
+      // mirrors osResolution's clear-only posture above (not
       // rekickLlamaCppProbe's immediate re-kick): the next status() call
       // re-probes lazily through kickHermesDiscovery, picking up e.g. a
       // hermes the user just pipx-installed in a terminal. invalidate()
@@ -1606,19 +1611,48 @@ export class SetupController {
       // probe's late settle is dropped by the epoch check BEFORE it would
       // ever clear the flag itself, so leaving it `true` here would wedge
       // every future kick into a permanent no-op.
+      //
+      // R2-1-fix (review Minor): hoisted to run ONCE per recheck call, ABOVE
+      // the single-flight coalesce guard below — invalidate() is a cheap,
+      // idempotent epoch bump (SettledProbeMemo.invalidate; cancellable:
+      // false for this memo, so it never touches an in-flight probe or the
+      // `recheck` latch), so running it unconditionally is harmless on the
+      // in-flight call and closes a race on the COALESCING one: without
+      // this, a status() poll that lands between an in-flight recheck's
+      // invalidate() and its locatePipx settle can re-kick and re-settle the
+      // memo with a now-stale value that a coalesced second recheck used to
+      // leave untouched (its own invalidate() lived inside the guard below
+      // and never ran) — one extra Re-check click could then still show
+      // "hermes not found" right after the user installed it.
       this.hermesDiscoveryMemo.invalidate();
-      try {
-        const located = await this.deps.locatePipx();
-        if (located.ok) {
-          this.lastAgentIssue = undefined;
-        } else {
-          // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
-          // — probe-timeout is not a distinct sticky phase.
-          const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
-          this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+      // R2-1 (L2-CA-16): the probe below now runs under a `'recheck'`-keyed
+      // latch — `dispose()`'s `abortAll()` couldn't reach it before (it was
+      // never armed), so a window-reload mid-recheck left it running
+      // detached, writing `lastAgentIssue` and firing status after teardown.
+      // A recheck already in flight is COALESCED, not refused or re-armed: a
+      // second `arm('recheck')` would OVERWRITE the map entry under the SAME
+      // key and orphan the first `AbortController` so `dispose()` could
+      // never reach it again. Recheck is read-only, so the in-flight probe
+      // already covers the agent state this call asked for — it falls
+      // through to the completion `bumpStatus()` below untouched.
+      if (!this.latches.has('recheck')) {
+        const abort = this.latches.arm('recheck');
+        if (abort === undefined) return { ok: false, reason: SETUP_DISPOSED_REFUSAL };
+        try {
+          const located = await this.deps.locatePipx(abort.signal);
+          if (located.ok) {
+            this.lastAgentIssue = undefined;
+          } else {
+            // T11 (§3, critic C-8): same 'error'-phase mapping as handleInstall
+            // — probe-timeout is not a distinct sticky phase.
+            const phase: AgentSetupPhase = located.reason === 'probe-timeout' ? 'error' : located.reason;
+            this.lastAgentIssue = { phase, detail: this.redact(located.detail) };
+          }
+        } catch (err) {
+          this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
+        } finally {
+          this.latches.release('recheck');
         }
-      } catch (err) {
-        this.lastAgentIssue = { phase: 'error', detail: this.redact(errorMessage(err)) };
       }
     }
     // T7 (§2.2.2): fired exactly ONCE at completion (not per lastAgentIssue
@@ -1787,7 +1821,7 @@ export class SetupController {
     const force = bool(params, 'force');
     try {
       const result = await reconnect(force === true ? { force: true } : undefined);
-      this.bumpStatus(); // handleRecheck's single completion-fire posture (:2069-2073)
+      this.bumpStatus(); // mirrors handleRecheck's own single completion-fire posture (see that method's T7 doc, above)
       return result;
     } catch (err) {
       this.bumpStatus();
@@ -1945,7 +1979,7 @@ export class SetupController {
     return 'missing';
   }
 
-  private projectBackend(d: BackendDescriptor, ollama: OllamaStatus, apiKeySet: boolean): SetupBackendOption {
+  private projectBackend(d: BackendDescriptor, apiKeySet: boolean): SetupBackendOption {
     const option: SetupBackendOption = {
       id: d.id,
       kind: d.kind,
@@ -1969,15 +2003,6 @@ export class SetupController {
       option.localInstall = {
         flavor: d.localInstall.recipe.kind,
         effort: d.localInstall.effort,
-        ...(d.localInstall.models
-          ? {
-              models: d.localInstall.models.defaults.map((m) => ({
-                role: m.role,
-                model: m.model,
-                present: ollama.running ? ollama.models.some((om) => om.name === m.model) : false,
-              })),
-            }
-          : {}),
       };
     }
     if (d.nextEditTransport) option.nextEditTransport = d.nextEditTransport;
@@ -2374,10 +2399,6 @@ function bool(params: unknown, key: string): boolean | undefined {
     return typeof v === 'boolean' ? v : undefined;
   }
   return undefined;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function isNonNegativeNumber(value: unknown): value is number {

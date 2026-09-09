@@ -20,53 +20,58 @@ function isBlank(text: string): boolean {
   return text.trim().length === 0;
 }
 
-/** Classic Levenshtein edit distance — small and dependency-free. */
+/** CA-01: a "line" longer than this cannot meaningfully repeat the line
+ *  above; skip the DP. Without this, a server-controlled multi-megabyte
+ *  completion line compared against a short prefix line attempts an
+ *  unbounded-size Levenshtein DP (seconds/OOM on the ext host) on every
+ *  completion — see L2-CA-01. */
+const MAX_REPEAT_CHECK_CHARS = 2000;
+
+/**
+ * Classic Levenshtein edit distance — two-row (O(min(a,b)) memory) instead
+ * of a full `(a+1)x(b+1)` matrix. Identical results to the prior full-matrix
+ * implementation for every input (golden-pinned in postprocess.test.ts);
+ * this is a memory optimization only, not a behavior change.
+ */
 function editDistance(a: string, b: string): number {
-  const dp: number[][] = Array.from({ length: a.length + 1 }, () =>
-    new Array<number>(b.length + 1).fill(0),
-  );
-  // dp always has a.length + 1 rows (indices 0..a.length), each with
-  // b.length + 1 columns — every row/column access below is within those
-  // bounds; the undefined branches are unreachable and kept for totality/
-  // type safety (no non-null assertion), not a behavior change.
-  const row0 = dp[0];
-  if (row0 === undefined) {
-    return 0;
-  }
-  for (let i = 0; i <= a.length; i++) {
-    const row = dp[i];
-    if (row === undefined) {
-      continue;
-    }
-    row[0] = i;
-  }
-  for (let j = 0; j <= b.length; j++) row0[j] = j;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  let curr = new Array<number>(b.length + 1).fill(0);
   for (let i = 1; i <= a.length; i++) {
-    const row = dp[i];
-    const prevRow = dp[i - 1];
-    if (row === undefined || prevRow === undefined) {
-      continue;
-    }
+    curr[0] = i;
     for (let j = 1; j <= b.length; j++) {
-      row[j] =
+      curr[j] =
         a[i - 1] === b[j - 1]
-          ? (prevRow[j - 1] ?? 0)
-          : 1 + Math.min(prevRow[j] ?? 0, row[j - 1] ?? 0, prevRow[j - 1] ?? 0);
+          ? (prev[j - 1] ?? 0)
+          : 1 + Math.min(prev[j] ?? 0, curr[j - 1] ?? 0, prev[j - 1] ?? 0);
     }
+    [prev, curr] = [curr, prev];
   }
-  const lastRow = dp[a.length];
-  if (lastRow === undefined) {
-    return 0;
-  }
-  return lastRow[b.length] ?? 0;
+  return prev[b.length] ?? 0;
 }
 
-/** Near-duplicate check (>90% similar), ported from Continue's `lineIsRepeated`. */
+/** Near-duplicate check (>90% similar), ported from Continue's `lineIsRepeated`.
+ *  L2-CA-01: bounded by two early-outs before ever invoking the DP —
+ *  (1) MAX_REPEAT_CHECK_CHARS caps the absolute size the DP can be asked to
+ *  run against, and (2) the exact length-gap short-circuit below skips the
+ *  DP whenever the length difference alone already proves the ratio can't
+ *  be < 0.1 (Levenshtein(a,b) >= |len(a)-len(b)|, so when that lower bound
+ *  is already >= 10% of |b| the true ratio can only be >= that too — same
+ *  result as running the DP, no DP needed). These two early-outs are NOT
+ *  equivalent: (2) the length-gap short-circuit is EXACTLY result-preserving
+ *  (golden-pinned) — it only ever returns `false` where the un-guarded DP
+ *  would also have returned `false`. (1) the MAX_REPEAT_CHECK_CHARS ceiling
+ *  is a DELIBERATE bound, not a proof-preserving optimization: a pair where
+ *  either line exceeds 2000 chars and IS a near-duplicate (would have made
+ *  the un-guarded DP return `true`) now returns `false` instead — an
+ *  intentional OOM tradeoff whose only behavioral change is for lines
+ *  longer than this near-duplicate check's useful range. */
 function lineIsRepeated(a: string, b: string): boolean {
   if (a.length <= 4 || b.length <= 4) return false;
   const aTrim = a.trim();
   const bTrim = b.trim();
   if (bTrim.length === 0) return false;
+  if (aTrim.length > MAX_REPEAT_CHECK_CHARS || bTrim.length > MAX_REPEAT_CHECK_CHARS) return false;
+  if (Math.abs(aTrim.length - bTrim.length) >= 0.1 * bTrim.length) return false;
   return editDistance(aTrim, bTrim) / bTrim.length < 0.1;
 }
 

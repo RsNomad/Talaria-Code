@@ -54,6 +54,11 @@ vi.mock('./store/LanceDBStore', () => ({
 vi.mock('./embedder', () => ({
   HttpEmbedder: class {
     embed = embedMock;
+    // F6-7 (FI-29): `Embedder` now requires `batchSize`; `buildPipeline.ts`
+    // reads `ctx.embedder.batchSize` at runtime, so this mock must carry it
+    // too — 64 matches the real `HttpEmbedder`'s own default and preserves
+    // every batch-boundary test below (e.g. the 64/65-chunk split tests).
+    batchSize = 64;
   },
 }));
 
@@ -1057,9 +1062,22 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
 
   it('ARCH-3: an event from OUTSIDE the workspace root (multi-root sibling) early-returns — no RangeError logged, no store touch', async () => {
     const sibling = mkdtempSync(path.join(os.tmpdir(), 'talaria-sibling-'));
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Assert on THIS indexer's OWN injected logger, not the global console.error:
+    // a sibling `it.skipIf(!canLinkFile)` symlink test that runs only on POSIX CI
+    // can leave a fire-and-forget writeManifest chain in flight whose post-teardown
+    // ENOENT rejection reaches the DEFAULT console.error logger of a DIFFERENT
+    // indexer. A global console spy would catch that cross-test leak and fail here
+    // spuriously on Linux; a per-indexer logger observes only this indexer's output.
+    const logSpy = vi.fn();
     try {
-      const indexer = makeIndexer();
+      const indexer = createIndexer({
+        workspaceRoot,
+        indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434',
+        embedModel: 'test-model',
+        debounceMs: 5,
+        logger: logSpy,
+      });
       const disposable = indexer.watch();
 
       fsWatcherListeners.change[0]!({ fsPath: path.join(sibling, 'b.ts') });
@@ -1069,14 +1087,14 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
       // advance settles it deterministically.
       await vi.advanceTimersByTimeAsync(200);
 
-      // At HEAD: ignore@7 throws RangeError inside the filter, caught by
-      // schedule()'s catch -> console.error('hermes-codebase: incremental reindex failed', ...).
-      expect(errorSpy).not.toHaveBeenCalled();
+      // The `../talaria-sibling-…/b.ts` relPath is rejected by ignore@7's
+      // isPathValid on BOTH win32 and posix, so handleFsEvent early-returns
+      // before the ignore filter (no RangeError) and before store.init().
+      expect(logSpy).not.toHaveBeenCalled();
       expect(initMock).not.toHaveBeenCalled();
       disposable.dispose();
       indexer.dispose();
     } finally {
-      errorSpy.mockRestore();
       rmSync(sibling, { recursive: true, force: true });
     }
   });
@@ -2812,6 +2830,253 @@ describe('F2-13: writeManifest is a crash-safe atomic write; readManifest distin
       const committedMeta = renameCommits.some(([, to]) => to === metaPath);
       expect(committedMeta).toBe(true);
       await expect(fs.readFile(metaPath, 'utf8')).resolves.toContain('schema');
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  // F6-5 (FI-19): readMeta mirrors readManifest's errno-classification +
+  // shape-validation above it — at HEAD (pre-fix) readMeta is a bare
+  // `JSON.parse(...) as IndexMeta` with a plain `catch { return undefined }`,
+  // so it NEVER logs (a bad-shape sidecar parses "successfully" and is cast
+  // blindly; a parse-error and every read errno fall into the same silent
+  // catch). These 3 cases prove that silence is gone; the 4th (ENOENT) pins
+  // the one silence that must SURVIVE the fix.
+  it('RED: readMeta logs a corrupt meta (bad shape) once and rebuilds', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f65-shape-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(indexDir, { recursive: true });
+      // Valid JSON, wrong shape: `dims` is a string, not a number — parses
+      // fine, so only shape validation (not JSON.parse) can catch this.
+      await fs.writeFile(
+        path.join(indexDir, 'manifest.meta.json'),
+        JSON.stringify({ schema: 2, embedModel: 'test-model', dims: 'zero' }),
+        'utf8',
+      );
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      const metaLogs = logs.filter((l) => /meta/i.test(l) && /corrupt/i.test(l));
+      expect(metaLogs.length).toBe(1);
+      expect(upsertMock).toHaveBeenCalled(); // rebuilt src/a.txt despite the corrupt meta
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('RED: readMeta logs a corrupt meta (parse error) once and rebuilds', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f65-parse-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(indexDir, { recursive: true });
+      await fs.writeFile(path.join(indexDir, 'manifest.meta.json'), '{ this is not json', 'utf8'); // corrupt
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      const metaLogs = logs.filter((l) => /meta/i.test(l) && /corrupt/i.test(l));
+      expect(metaLogs.length).toBe(1);
+      expect(upsertMock).toHaveBeenCalled(); // rebuilt src/a.txt despite the corrupt meta
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('RED: readMeta logs a non-ENOENT read error with err.name only (no path/raw err) and rebuilds', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f65-errno-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const metaFilePath = path.join(indexDir, 'manifest.meta.json');
+      class FakeMetaReadError extends Error {
+        code = 'EACCES';
+        constructor() {
+          super('permission denied reading a secret path'); // must NOT leak into the log
+          this.name = 'FakeMetaReadError';
+        }
+      }
+      const realReadFile = fs.readFile.bind(fs);
+      const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (String(file) === metaFilePath) {
+          throw new FakeMetaReadError();
+        }
+        return realReadFile(file, options);
+      });
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      readFileSpy.mockRestore();
+      const metaLogs = logs.filter((l) => /meta/i.test(l));
+      expect(metaLogs.length).toBe(1);
+      expect(metaLogs[0]).toContain('FakeMetaReadError'); // err.name, present
+      expect(metaLogs[0]).not.toContain(metaFilePath); // never the path
+      expect(metaLogs[0]).not.toContain('permission denied reading a secret path'); // never the raw err
+      expect(upsertMock).toHaveBeenCalled(); // rebuilt src/a.txt despite the meta read failure
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('readMeta stays silent on ENOENT (no meta file yet — ordinary first build)', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f65-enoent-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/a.txt'), 'content\n', 'utf8');
+      const logs: string[] = [];
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build(); // manifest.meta.json does not exist yet -> ENOENT
+      expect(logs.some((l) => /meta/i.test(l))).toBe(false);
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+});
+
+/**
+ * F6-6 (FI-20/FI-31): `buildPipeline.ts`'s `walk` and `runBuild` (hash pass)
+ * used to swallow every read/readdir failure SILENTLY (`catch { return; }` /
+ * `catch { continue; }`) — no distinction between the ordinary "vanished
+ * mid-walk" (ENOENT) case and a real errno (EACCES/EIO/...) worth surfacing.
+ * These RED tests mirror F6-5's readMeta idiom above: spy on the specific
+ * absolute path/dir that must fail, assert err.name-only (never the
+ * path/raw err) for the non-ENOENT case, and silence for the ENOENT case,
+ * while the rest of the build still completes.
+ */
+describe('F6-6 (FI-20/FI-31): walk and the hash pass log non-ENOENT errno names; ENOENT stays silent', () => {
+  it('RED: walk logs a non-ENOENT directory-read failure with err.name only (no path/raw err) and the build still indexes the rest; a racing ENOENT dir stays silent', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f66-walk-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'ok'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'ok/a.txt'), 'content\n', 'utf8');
+      await fs.mkdir(path.join(workspaceRoot, 'blocked'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'blocked/b.txt'), 'content\n', 'utf8');
+      await fs.mkdir(path.join(workspaceRoot, 'raced'), { recursive: true });
+
+      const blockedDir = path.join(workspaceRoot, 'blocked');
+      const racedDir = path.join(workspaceRoot, 'raced');
+      // F6-6b: the EACCES (non-ENOENT, must-log) and ENOENT (must-stay-silent)
+      // fakes get DISTINCT .name values so a test assertion can pin the
+      // DIRECTION — which one got logged — not just that exactly one did.
+      class FakeDirReadError extends Error {
+        code: string;
+        constructor() {
+          super('permission denied reading a secret directory'); // must NOT leak into the log
+          this.name = 'FakeDirReadError';
+          this.code = 'EACCES';
+        }
+      }
+      class FakeEnoentDirError extends Error {
+        code: string;
+        constructor() {
+          super('vanished mid-walk');
+          this.name = 'FakeEnoentDirError';
+          this.code = 'ENOENT';
+        }
+      }
+      const realReaddir = fs.readdir.bind(fs);
+      const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(async (dirPath, options) => {
+        const dir = String(dirPath);
+        if (dir === blockedDir) throw new FakeDirReadError();
+        if (dir === racedDir) throw new FakeEnoentDirError();
+        return realReaddir(dir, options);
+      });
+
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      readdirSpy.mockRestore();
+
+      const dirLogs = logs.filter((l) => /directory read failed/i.test(l));
+      expect(dirLogs.length).toBe(1); // only the EACCES dir logs; the ENOENT dir stays silent
+      expect(dirLogs[0]).toContain('FakeDirReadError'); // err.name of the non-ENOENT (EACCES) fake, present
+      expect(dirLogs[0]).not.toContain('FakeEnoentDirError'); // never the ENOENT fake's name — pins the direction
+      expect(dirLogs[0]).not.toContain(blockedDir); // never the path
+      expect(dirLogs[0]).not.toContain('permission denied reading a secret directory'); // never the raw err
+      expect(upsertMock).toHaveBeenCalled(); // ok/a.txt still indexed despite the blocked sibling
+      indexer.dispose();
+    } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
+  });
+
+  it('RED: the hash pass logs a non-ENOENT read failure with err.name only (no path/raw err); an ENOENT (deleted between walk and read) stays silent', async () => {
+    const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), 'hermes-indexer-f66-hash-'));
+    const indexDir = path.join(workspaceRoot, '.hermes-index');
+    try {
+      await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(workspaceRoot, 'src/ok.txt'), 'content\n', 'utf8');
+      await fs.writeFile(path.join(workspaceRoot, 'src/blocked.txt'), 'content\n', 'utf8');
+      await fs.writeFile(path.join(workspaceRoot, 'src/raced.txt'), 'content\n', 'utf8');
+
+      const blockedFile = path.join(workspaceRoot, 'src/blocked.txt');
+      const racedFile = path.join(workspaceRoot, 'src/raced.txt');
+      // F6-6b: distinct .name values for the non-ENOENT (EACCES, must-log)
+      // and ENOENT (must-stay-silent) fakes, so the assertion below can pin
+      // the DIRECTION — which one got logged.
+      class FakeHashReadError extends Error {
+        code: string;
+        constructor() {
+          super('permission denied reading a secret file'); // must NOT leak into the log
+          this.name = 'FakeHashReadError';
+          this.code = 'EACCES';
+        }
+      }
+      class FakeEnoentHashError extends Error {
+        code: string;
+        constructor() {
+          super('deleted between walk and read');
+          this.name = 'FakeEnoentHashError';
+          this.code = 'ENOENT';
+        }
+      }
+      const realReadFile = fs.readFile.bind(fs);
+      const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (file, options) => {
+        if (String(file) === blockedFile) throw new FakeHashReadError();
+        if (String(file) === racedFile) throw new FakeEnoentHashError();
+        return realReadFile(file, options);
+      });
+
+      const logs: string[] = [];
+      upsertMock.mockClear();
+      const indexer = createIndexer({
+        workspaceRoot, indexDir,
+        embedEndpoint: 'http://127.0.0.1:11434', embedModel: 'test-model', debounceMs: 10,
+        logger: (line) => logs.push(line),
+      });
+      await indexer.build();
+      readFileSpy.mockRestore();
+
+      const hashLogs = logs.filter((l) => /hash read failed/i.test(l));
+      expect(hashLogs.length).toBe(1); // only the EACCES file logs; the ENOENT file stays silent
+      expect(hashLogs[0]).toContain('FakeHashReadError'); // err.name of the non-ENOENT (EACCES) fake, present
+      expect(hashLogs[0]).not.toContain('FakeEnoentHashError'); // never the ENOENT fake's name — pins the direction
+      expect(hashLogs[0]).not.toContain(blockedFile); // never the path
+      expect(hashLogs[0]).not.toContain('permission denied reading a secret file'); // never the raw err
+      expect(upsertMock).toHaveBeenCalled(); // ok.txt still indexed despite the blocked sibling
       indexer.dispose();
     } finally { rmSync(workspaceRoot, { recursive: true, force: true }); }
   });

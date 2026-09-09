@@ -1991,7 +1991,7 @@ describe('status(): assembles SetupData from registry + settings + secrets + oll
     expect(data.agent.phase).toBe('awaiting-reload');
   });
 
-  it('ollama running populates ollama.models and embedModelPresent', async () => {
+  it('ollama running is reflected on ollama.running', async () => {
     const { controller } = makeController(
       {},
       {
@@ -2003,7 +2003,6 @@ describe('status(): assembles SetupData from registry + settings + secrets + oll
     );
     const data = await controller.status();
     expect(data.ollama.running).toBe(true);
-    expect(data.rag.embedModelPresent).toBe(true);
   });
 
   it('nextEdit.source=generic on a backend without generic support carries a refusalDetail', async () => {
@@ -2764,6 +2763,41 @@ describe('T7: onStatusChanged fires on confirmed-start, failure-write, success, 
   });
 });
 
+// --- WS-R2 R2-2 (L2-CA-19): Emitter.fire isolates listeners + aggregates throws ---
+
+describe('WS-R2 R2-2 (L2-CA-19): a throwing onStatusChanged listener does not starve a later listener', () => {
+  it('every listener is served, and the throw surfaces as an AggregateError (not swallowed, not the raw error)', async () => {
+    const { controller } = makeController();
+    const later: boolean[] = [];
+    controller.onStatusChanged(() => {
+      throw new Error('boom');
+    });
+    controller.onStatusChanged(() => {
+      later.push(true);
+    });
+
+    let caught: unknown;
+    try {
+      // setup.recheck's single completion bumpStatus() (T7, ADR-025-D) is the
+      // trigger — handleRecheck has no try/catch around it, so a throw here
+      // propagates straight out of controller.handle() as a rejection.
+      await controller.handle('setup.recheck', {});
+    } catch (err) {
+      caught = err;
+    }
+
+    // The isolation half (CA-19's point): listener 2 still ran even though
+    // listener 1 threw FIRST.
+    expect(later).toEqual([true]);
+    // The no-silent-swallow half: the throw still surfaces, aggregated.
+    expect(caught).toBeInstanceOf(AggregateError);
+    const aggregate = caught as AggregateError;
+    expect(aggregate.errors).toHaveLength(1);
+    expect(aggregate.errors[0]).toBeInstanceOf(Error);
+    expect((aggregate.errors[0] as Error).message).toBe('boom');
+  });
+});
+
 // --- T13 (beta.5 §4.4): allowlist pull gate — classification + refusal order --
 
 // §6 copy, verbatim (drift-locked).
@@ -3450,6 +3484,122 @@ describe('TC-6 (AU-6): dispose() aborts in-flight installs/pulls', () => {
     // The epoch bump inside dispose() (pre-existing TC-3 behavior) must still
     // drop this late settle — the memo is never written.
     expect((await controller.status()).agent.phase).toBe('missing');
+  });
+});
+
+// --- R2-1 (L2-CA-16): the agent-recheck probe runs under a `recheck`-keyed
+// latch dispose() can reach ---------------------------------------------------
+
+describe("R2-1 (L2-CA-16): setup.recheck {scope:'agent'} probes under a 'recheck'-keyed latch", () => {
+  it("cancel-on-dispose: dispose() aborts the signal locatePipx received; a late resolve fires no status change (fails at HEAD — no signal is ever passed)", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    let resolveProbe: ((r: PipxLocateResult) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: (signal?: AbortSignal): Promise<PipxLocateResult> => {
+          capturedSignal = signal;
+          return new Promise<PipxLocateResult>((resolve) => {
+            resolveProbe = resolve;
+          });
+        },
+      },
+    );
+    const fires: void[] = [];
+    controller.onStatusChanged(() => fires.push(undefined));
+
+    const pending = controller.handle('setup.recheck', { scope: 'agent' });
+
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    controller.dispose();
+    expect(capturedSignal?.aborted).toBe(true);
+
+    resolveProbe?.(OK_PIPX_LOCATE); // the late resolve — must not overwrite state or fire
+    await tickT6();
+    expect(fires.length).toBe(0);
+
+    await pending; // drain — no unhandled rejection
+  });
+
+  it('single-flight: a second overlapping agent recheck coalesces — locatePipx is called exactly once, no orphaned controller (fails at HEAD — two probes run)', async () => {
+    let locateCalls = 0;
+    let resolveProbe: ((r: PipxLocateResult) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        locatePipx: (): Promise<PipxLocateResult> => {
+          locateCalls++;
+          return new Promise<PipxLocateResult>((resolve) => {
+            resolveProbe = resolve;
+          });
+        },
+      },
+    );
+
+    const first = controller.handle('setup.recheck', { scope: 'agent' });
+    expect(locateCalls).toBe(1);
+
+    const second = await controller.handle('setup.recheck', { scope: 'agent' });
+    expect(locateCalls).toBe(1); // coalesced — no second probe, no second arm()
+    expect(second).toEqual({ ok: true });
+
+    resolveProbe?.(OK_PIPX_LOCATE);
+    await expect(first).resolves.toEqual({ ok: true });
+  });
+
+  it("R2-1-fix review Minor: the COALESCING recheck also invalidates the Hermes discovery memo, not just the in-flight one — closes the stale-memo race (fails at HEAD: the coalescing recheck's invalidate is skipped, so a re-kicked-stale memo survives it and the next status() never re-probes)", async () => {
+    let discoverCalls = 0;
+    let locateCalls = 0;
+    let resolveProbe: ((r: PipxLocateResult) => void) | undefined;
+    const { controller } = makeController(
+      {},
+      {
+        discoverHermes: async () => {
+          discoverCalls++;
+          throw new Error('not yet installed');
+        },
+        locatePipx: (): Promise<PipxLocateResult> => {
+          locateCalls++;
+          return new Promise<PipxLocateResult>((resolve) => {
+            resolveProbe = resolve;
+          });
+        },
+      },
+    );
+
+    // Seed a settled ("not found") discovery memo via the natural status() kick.
+    await controller.status();
+    await tickT6();
+    expect(discoverCalls).toBe(1);
+
+    // recheck #1: arms the 'recheck' latch, invalidates the memo, then blocks on locatePipx.
+    const first = controller.handle('setup.recheck', { scope: 'agent' });
+    expect(locateCalls).toBe(1);
+
+    // While recheck #1's locatePipx is still pending, an unrelated status()
+    // poll re-kicks the (now-cleared) memo — re-settling it with a STALE
+    // "not found" value. This is the race window the R2-1 review Minor names
+    // (e.g. the user installs Hermes right in this window).
+    await controller.status();
+    await tickT6();
+    expect(discoverCalls).toBe(2);
+
+    // recheck #2 overlaps and coalesces — single-flight: locatePipx must NOT
+    // run again — but it must STILL invalidate the discovery memo so the
+    // stale re-kicked value from the window above doesn't survive it.
+    const second = await controller.handle('setup.recheck', { scope: 'agent' });
+    expect(locateCalls).toBe(1); // single-flight preserved — still exactly one probe
+    expect(second).toEqual({ ok: true });
+
+    resolveProbe?.(OK_PIPX_LOCATE);
+    await expect(first).resolves.toEqual({ ok: true });
+
+    // The very next status() must re-probe — proves recheck #2 invalidated
+    // the memo too, not merely recheck #1's own (already-superseded) invalidate.
+    await controller.status();
+    expect(discoverCalls).toBe(3); // fails at HEAD: stays at 2 — the coalescing recheck never invalidated
   });
 });
 

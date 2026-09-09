@@ -113,6 +113,10 @@ describe('mcp.add with secretEnvNames — AU-59 config-first, fail-closed orches
     expect(result).toEqual({ ok: true, name: 'gh', transport: 'stdio' });
     expect(h.order).toEqual([
       'confirm',
+      // L2-CA-22 (ADR-R2-10): the clobber-belt's `listEnvKeys()` fires HERE —
+      // after consent, before any secret is even prompted for — so the user
+      // is never asked for a value the belt will end up refusing.
+      'listEnvKeys',
       'promptSecret:"gh": value for GITHUB_TOKEN (saved to ~/.hermes/.env as MCP_GH_GITHUB_TOKEN)',
       'promptSecret:"gh": value for OPENAI_API_KEY (saved to ~/.hermes/.env as MCP_GH_OPENAI_API_KEY)',
       'addMcpServer',
@@ -157,7 +161,9 @@ describe('mcp.add with secretEnvNames — AU-59 config-first, fail-closed orches
     const h = harness({ answers: ['ghp_live_value_1', undefined] });
     const outcome = await h.invoke();
     expect(outcome).toEqual({ settled: 'rejected', message: 'Adding MCP server "gh" was declined or cancelled.' });
-    expect(h.order.filter((s) => !s.startsWith('promptSecret'))).toEqual(['confirm']);
+    // L2-CA-22: the belt's `listEnvKeys()` runs before any prompt (see the
+    // happy-path ORDER test's own note).
+    expect(h.order.filter((s) => !s.startsWith('promptSecret'))).toEqual(['confirm', 'listEnvKeys']);
     expect(h.leakSurface()).not.toContain('ghp_live_value_1');
   });
 
@@ -165,7 +171,7 @@ describe('mcp.add with secretEnvNames — AU-59 config-first, fail-closed orches
     const h = harness({ answers: [''] });
     const outcome = await h.invoke();
     expect(outcome).toEqual({ settled: 'rejected', message: 'Adding MCP server "gh" was declined or cancelled.' });
-    expect(h.order.filter((s) => !s.startsWith('promptSecret'))).toEqual(['confirm']);
+    expect(h.order.filter((s) => !s.startsWith('promptSecret'))).toEqual(['confirm', 'listEnvKeys']);
   });
 
   it('a non-ASCII secret value is refused BEFORE any network call; the refusal names the env NAME, never the value', async () => {
@@ -177,7 +183,7 @@ describe('mcp.add with secretEnvNames — AU-59 config-first, fail-closed orches
     expect(outcome.message).toMatch(/^Refusing the value for GITHUB_TOKEN: secret value must be printable ASCII/);
     expect(outcome.message).toMatch(/Nothing was saved\.$/);
     expect(outcome.message).not.toContain(bad);
-    expect(h.order.filter((s) => !s.startsWith('promptSecret'))).toEqual(['confirm']);
+    expect(h.order.filter((s) => !s.startsWith('promptSecret'))).toEqual(['confirm', 'listEnvKeys']);
     expect(h.leakSurface()).not.toContain(bad);
   });
 
@@ -188,7 +194,10 @@ describe('mcp.add with secretEnvNames — AU-59 config-first, fail-closed orches
       settled: 'rejected',
       message: 'Adding MCP server "gh" was rolled back: Hermes did not store its secret env — see the Talaria output log. Nothing was saved.',
     });
-    expect(h.order.slice(3)).toEqual([
+    // L2-CA-22: slice(4), not (3) — the belt's `listEnvKeys()` (index 1)
+    // shifts the two `promptSecret` entries (indices 2-3) ahead of this
+    // rollback tail (see the happy-path ORDER test's own note).
+    expect(h.order.slice(4)).toEqual([
       'addMcpServer',
       'setEnvVar:MCP_GH_GITHUB_TOKEN',
       'setEnvVar:MCP_GH_OPENAI_API_KEY',
@@ -208,7 +217,8 @@ describe('mcp.add with secretEnvNames — AU-59 config-first, fail-closed orches
     expect(outcome.message).toContain('MCP_GH_GITHUB_TOKEN');
     expect(outcome.message).not.toContain('Nothing was saved.');
     expect(outcome.message).not.toContain('ghp_live_value_1');
-    expect(h.order.slice(3)).toEqual([
+    // L2-CA-22: slice(4), not (3) — see the earlier rollback test's own note.
+    expect(h.order.slice(4)).toEqual([
       'addMcpServer',
       'setEnvVar:MCP_GH_GITHUB_TOKEN',
       'setEnvVar:MCP_GH_OPENAI_API_KEY',

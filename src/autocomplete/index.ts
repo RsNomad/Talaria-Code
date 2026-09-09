@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
-import { createBackend, clearBackendFactoryWarnings } from './backendFactory';
+import { createBackend } from './backendFactory';
 import { AutocompleteDebouncer } from './debouncer';
 import { InMemoryCompletionCache } from './cache';
 import { readConfig, effectivePrefixInjection, type HermesAutocompleteConfig } from './config';
 import { FimEngine } from './engine';
-import { TalariaInlineCompletionProvider, clearSurfacedAutocompleteFailures } from './provider';
+import { TalariaInlineCompletionProvider } from './provider';
+import { OnceRegistry } from './onceRegistry';
 import {
   AUTOCOMPLETE_API_KEY_SECRET,
   pickApiKey,
@@ -75,6 +76,20 @@ function endpointHost(rawUrl: string): string {
 let keyRefreshSeq = 0;
 
 /**
+ * FI-26 (WS-F10 task 2, FSU §5 Q4): the ONE activation-scoped dedup
+ * registry, module-local like {@link keyRefreshSeq} above (but NOT the
+ * same kind of state — `keyRefreshSeq` is a monotonic race token, this is
+ * one-shot warning dedup). Threaded to `buildEngine`/`createBackend`
+ * (`backendFactory.ts`'s construction-time warnings) and to the
+ * `TalariaInlineCompletionProvider` (its request-time failure surfacing)
+ * below, replacing the three independent module-level `Set`s those sites
+ * used to keep. Its lifetime spans the WHOLE activation, including every
+ * `rebuild()` — unlike the old per-site Sets, nothing re-arms it on a
+ * config change any more (see `rebuild()` below for what that supersedes).
+ */
+const onceRegistry = new OnceRegistry();
+
+/**
  * Frozen public entry (Zone AC) — the controller wires this
  * into `extension.ts`. Reads its own config from
  * `vscode.workspace.getConfiguration('talaria.autocomplete')`.
@@ -115,7 +130,7 @@ export function registerTalariaAutocomplete(
   const egressNotice = createEgressNoticeSurface();
   const egressObserverFor = (endpoint: string): EgressVerdictObserver | undefined =>
     isLoopbackFimEndpoint(endpoint) ? undefined : egressNotice.onEgressVerdict;
-  let built = buildEngine(cfg, secretApiKey, egressObserverFor(cfg.endpoint));
+  let built = buildEngine(cfg, secretApiKey, onceRegistry, egressObserverFor(cfg.endpoint));
   let engine = built.engine;
   // S4.3: recomputed alongside `engine` on every rebuild (config change), so a
   // changed `talaria.autocomplete.endpoint` is reflected immediately. Workspace
@@ -154,6 +169,10 @@ export function registerTalariaAutocomplete(
     getEnabled: () => cfg.enabled,
     getSkipUntrustedRemote: () => remote && !vscode.workspace.isTrusted,
     contextService,
+    // FI-26: the ONE activation-scoped registry (see its own doc comment
+    // above) — this provider instance is constructed once per activation
+    // and outlives every `rebuild()` below, so its dedup state now does too.
+    registry: onceRegistry,
     // A5: live closures over the mutable `cfg` binding below (reassigned by
     // `onDidChangeConfiguration`), same posture as `getEnabled` above.
     getBackendName: () => cfg.backend,
@@ -182,26 +201,24 @@ export function registerTalariaAutocomplete(
   );
 
   const rebuild = (): void => {
-    // T-6 F4/F6: re-arm `createBackend`'s construction-time warnings BEFORE
-    // it runs (inside `buildEngine` below) — not after, like
-    // `clearSurfacedAutocompleteFailures` below, whose Set is only consulted
-    // later, on an actual completion request. `createBackend`'s warnings
-    // fire synchronously DURING this call, so clearing after it returns
-    // would miss this rebuild's own chance to re-warn on a still-broken (or
-    // newly re-broken) config, and only catch up one rebuild late.
-    clearBackendFactoryWarnings();
-    // CA-06-face: a rebuild is an epoch boundary — the endpoint may have
-    // changed. Clear badges and re-arm the one-shot toasts (the same
-    // clearSurfacedAutocompleteFailures re-arm posture used just below).
+    // FI-26 (FSU §5 Q4): `createBackend`'s construction-time warnings and
+    // the provider's request-time failure surfacing used to be re-armed
+    // HERE, on every rebuild — `clearBackendFactoryWarnings()` before
+    // `buildEngine` ran (its warnings fire synchronously during
+    // construction) and `clearSurfacedAutocompleteFailures()` after, since
+    // the provider's Set was only ever consulted later, on an actual
+    // completion request. Both are now backed by `onceRegistry` above,
+    // whose lifetime is the WHOLE activation, not one rebuild — so a
+    // surfaced warning/failure now stays silent until this activation ends,
+    // not merely until the next config change. This IS the intended
+    // unification (FSU §5 Q4: "yes for all three"), not an oversight — see
+    // `onceRegistry`'s own doc comment. `egressNotice` (a DIFFERENT seam,
+    // CA-06's badge/toast surface, not this task's dedup registry) still
+    // resets every rebuild — unaffected by this change.
     egressNotice.reset();
-    built = buildEngine(cfg, secretApiKey, egressObserverFor(cfg.endpoint));
+    built = buildEngine(cfg, secretApiKey, onceRegistry, egressObserverFor(cfg.endpoint));
     engine = built.engine;
     remote = !isLoopbackEndpoint(cfg.endpoint);
-    // A5: re-arm every surfaced-once failure warning on every rebuild (config
-    // change, API-key load/rotation) — a config change (e.g. the user just
-    // fixed a wrong key) must produce a fresh signal on the next failure
-    // rather than staying silent forever against the OLD key's dedup key.
-    clearSurfacedAutocompleteFailures();
     contextService.reconfigure({
       capabilities: built.capabilities,
       template: built.template,
@@ -513,10 +530,13 @@ interface BuiltEngine {
 function buildEngine(
   cfg: HermesAutocompleteConfig,
   secretApiKey: string | undefined,
+  // FI-26: the ONE activation-scoped registry, threaded straight through to
+  // `createBackend` — see `onceRegistry`'s own doc comment above.
+  registry: OnceRegistry,
   onEgressVerdict?: EgressVerdictObserver,
 ): BuiltEngine {
   const apiKey = pickApiKey(secretApiKey, cfg.apiKey);
-  const backend = createBackend({ ...cfg, ...(apiKey !== undefined ? { apiKey } : {}) });
+  const backend = createBackend({ ...cfg, ...(apiKey !== undefined ? { apiKey } : {}) }, registry);
   const template = getTemplateForModel(cfg.model);
   // §4.2 — the crossFileMode predicate gates gathering (R6) and tells the
   // engine which assembly path applies (comment-inject is the only one the

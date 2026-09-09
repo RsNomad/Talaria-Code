@@ -49,7 +49,16 @@ export function clampText(text: string, cap: number): { text: string; truncated:
     return { text: `${head}${CHAR_ELISION_NOTICE}${tail}`, truncated: true };
   }
 
-  const halfBudget = cap / 2;
+  // L2-CA-11: reserve the read-more notice's width BEFORE splitting the
+  // budget, so head+notice+tail can't overshoot `cap` by the notice's own
+  // length. `readMoreNotice(0, total)` is a cheap stand-in for the real
+  // notice (the true `shown` isn't known until after the head/tail split
+  // below) — `shown`'s digit count can exceed `0`'s, so this reserve can
+  // still slightly under-count; the final belt below is the
+  // mirror-of-single-line (`:43-45`) backstop that catches that residual gap
+  // unconditionally.
+  const reserve = readMoreNotice(0, total).length;
+  const halfBudget = Math.max(0, Math.floor((cap - reserve) / 2));
 
   let headEnd = 0;
   let headLen = 0;
@@ -84,8 +93,13 @@ export function clampText(text: string, cap: number): { text: string; truncated:
   const notice = readMoreNotice(shown, total);
   const headText = lines.slice(0, headEnd).join('\n');
   const tailText = lines.slice(tailStart).join('\n');
+  const out = `${headText}${notice}${tailText}`;
 
-  return { text: `${headText}${notice}${tailText}`, truncated: true };
+  // Mirror of the single-line guard (`:43-45`): the reserve above handles
+  // the common case, but this is the unconditional backstop so the result
+  // can never exceed `cap`.
+  if (out.length > cap) return { text: out.slice(0, cap), truncated: true };
+  return { text: out, truncated: true };
 }
 
 /**
@@ -354,9 +368,16 @@ export function truncateDiffToBudget(
     return { diff: fileListFallback(sections), truncated: true, droppedFiles: sections.map((s) => s.path) };
   }
 
-  const keptPaths = new Set(byPriority.slice(0, keepCount).map((s) => s.path));
-  const keptBodies = sections.filter((s) => keptPaths.has(s.path)).map((s) => s.body);
-  const droppedFiles = sections.filter((s) => !keptPaths.has(s.path)).map((s) => s.path);
+  // Identity membership (not `.path`): two sections can share a path — real
+  // duplicates, or `extractSectionPath` returning `''` for a malformed
+  // header (L2-CA-12) — and a path-keyed Set would then keep/drop BOTH
+  // instead of exactly the budgeted count. `byPriority`'s elements are the
+  // very same object references as `sections`' (see the `.map` above), so a
+  // `Set<DiffFileSection>` membership test here is exact per-section, not
+  // per-path.
+  const kept = new Set(byPriority.slice(0, keepCount));
+  const keptBodies = sections.filter((s) => kept.has(s)).map((s) => s.body);
+  const droppedFiles = sections.filter((s) => !kept.has(s)).map((s) => s.path);
 
   return { diff: keptBodies.join(''), truncated: true, droppedFiles };
 }

@@ -124,7 +124,6 @@ describe('protocol — Setup panel contract (Task 8)', () => {
             localInstall: {
               flavor: 'pipx',
               effort: 'one-script',
-              models: [{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', present: false }],
             },
             docsUrl: 'https://example.invalid/hermes',
           },
@@ -164,7 +163,6 @@ describe('protocol — Setup panel contract (Task 8)', () => {
             localInstall: {
               flavor: 'guided-terminal',
               effort: 'one-script',
-              models: [{ role: 'fim', model: 'qwen2.5-coder:1.5b-base', present: true }],
             },
             nextEditTransport: 'ollama',
           },
@@ -195,7 +193,6 @@ describe('protocol — Setup panel contract (Task 8)', () => {
         enabled: false,
         embedEndpoint: 'http://127.0.0.1:11434',
         embedModel: 'nomic-embed-text',
-        embedModelPresent: false,
         tuning: { dims: 768, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: ['node_modules/**'] },
         indexDir: '.talaria/index',
         preconditionDetail: 'FIM must be configured first.',

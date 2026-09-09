@@ -178,6 +178,10 @@ const DEFAULT_PRUNE_DAYS = 7; // mirrors OpenCode's `prune = "7.days"`.
 // checkpoints of a session become durable within one short interval. Kept OFF
 // the pre-turn barrier (Fix-A): repack never runs synchronously before a prompt.
 const DEFAULT_LOCALIZE_DEBOUNCE_MS = 500; // debounce before an off-barrier localization repack (corr-I1 / I-2).
+// L2-CA-14: `persistIndex` writes `<indexPath>.tmp-<uuid>` then renames it over
+// `index.json`; a hard-kill between the write and the rename orphans the temp
+// file. Anything older than this is swept as stale (see `sweepStaleIndexTemps`).
+const STALE_INDEX_TMP_MS = 10 * 60_000;
 
 interface PersistedCheckpoint {
   /**
@@ -909,6 +913,7 @@ export class CheckpointTracker {
   async cleanup(pruneDays?: number): Promise<void> {
     await this.init();
     return this.enqueue(() => this.withLock(async () => {
+      await this.sweepStaleIndexTemps(this.shadowDir); // L2-CA-14
       // Durability backstop (S-M6g): localize any checkpoint objects still
       // borrowed from the real repo BEFORE gc. snapshot() now defers this off
       // the barrier and a crash could skip a debounced run, so cleanup() —
@@ -1166,6 +1171,7 @@ export class CheckpointTracker {
         await runGit(['config', 'user.email', 'checkpoints@hermes.local'], this.shadowOpts());
         await runGit(['config', 'commit.gpgsign', 'false'], this.shadowOpts());
         await runGit(['config', 'gc.auto', '0'], this.shadowOpts()); // we gc explicitly via cleanup()
+        await this.sweepStaleIndexTemps(this.shadowDir); // L2-CA-14
       });
     }
 
@@ -1386,6 +1392,53 @@ export class CheckpointTracker {
     } catch (err) {
       await fs.rm(tmpPath, { force: true }).catch(() => undefined);
       throw err;
+    }
+  }
+
+  /**
+   * L2-CA-14: best-effort orphan sweep for {@link persistIndex}'s temp files —
+   * a hard-kill between its write and its rename leaves `index.json.tmp-<uuid>`
+   * behind, and nothing else ever cleans it up. Removes only entries matching
+   * that exact name shape AND older than {@link STALE_INDEX_TMP_MS}; the live
+   * `index.json` itself never matches the pattern, so it is never touched.
+   *
+   * Uses `lstat`, never `stat` — a planted symlink's TARGET mtime must not
+   * decide staleness (the link's OWN mtime governs), and `fs.rm` removes the
+   * link entry either way, never following into the target.
+   *
+   * Best-effort: a missing shadow dir (ENOENT) is silently fine (nothing to
+   * sweep); any OTHER errno is logged by name only (never a path/message), and
+   * this never throws — an orphan sweep must not block init()/cleanup().
+   */
+  private async sweepStaleIndexTemps(dir: string): Promise<void> {
+    let names: string[];
+    try {
+      names = await fs.readdir(dir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.error(`checkpoints: stale index.json.tmp sweep (readdir) failed: ${errCode(err)}`);
+      }
+      return;
+    }
+    const cutoff = Date.now() - STALE_INDEX_TMP_MS;
+    let removed = 0;
+    for (const name of names) {
+      if (!/^index\.json\.tmp-[0-9a-f-]{36}$/.test(name)) continue;
+      const entryPath = path.join(dir, name);
+      try {
+        const st = await fs.lstat(entryPath);
+        if (st.mtimeMs < cutoff) {
+          await fs.rm(entryPath, { force: true });
+          removed++;
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+          console.error(`checkpoints: stale index.json.tmp sweep (entry) failed: ${errCode(err)}`);
+        }
+      }
+    }
+    if (removed > 0) {
+      console.error(`checkpoints: swept ${removed} stale index.json.tmp orphan(s)`);
     }
   }
 

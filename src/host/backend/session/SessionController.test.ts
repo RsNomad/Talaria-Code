@@ -32,10 +32,12 @@ import * as os from 'node:os';
 import { SessionController } from './SessionController';
 import type { SessionHostPort } from './types';
 import type { RootCoordinatorLike } from '../../checkpoints/RootCoordinator';
+import type { CheckpointTrackerLike } from '../../checkpoints/trackerContract';
+import type { RestoreResult } from '../../checkpoints/CheckpointTracker';
 import { buildCancelledOutcome, buildSelectedOutcome } from '../acp/permission';
 import type { AcpRequestPermissionRequest, AcpOutboundContentBlock } from '../acp/types';
 import type { AcpClientLike, AcpListSessionsRawResult, AcpLoadSessionResult } from '../acp/acpClient';
-import type { Attachment, HostToWebviewMessage } from '../../../shared/protocol';
+import type { Attachment, Checkpoint, CheckpointsData, HostToWebviewMessage } from '../../../shared/protocol';
 
 const EDIT_OPTIONS = [
   { optionId: 'allow_once', kind: 'allow_once', name: 'Allow edit' },
@@ -1295,6 +1297,104 @@ describe('SessionController.sendPrompt — V-19: attachment path confinement', (
 });
 
 /**
+ * WS-R1 R1-5 (L2-CA-25): `buildPromptContent` now returns `{blocks,
+ * droppedCount}` — `runTurn` destructures both and folds `droppedCount` into
+ * the SAME session-scoped "dropped" message `confineAttachmentPaths`'s count
+ * already produces (never a second message). A genuinely unparseable data
+ * URI (here: malformed percent-encoding, which throws `URIError` inside
+ * `parseDataUri`) must never surface as a `runTurn` rejection — the turn
+ * still resolves and `client.prompt` still runs with whatever attachments DID
+ * parse.
+ */
+describe('SessionController.sendPrompt — R1-5: unreadable data-URI attachments are counted, not silently dropped', () => {
+  function makeFakeClient(prompt: AcpClientLike['prompt']): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in an R1-5 attachment-drop-counting test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt,
+      cancel: async () => unused('cancel'),
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  function makePort(client: AcpClientLike): { port: SessionHostPort; emitted: HostToWebviewMessage[] } {
+    const emitted: HostToWebviewMessage[] = [];
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => [],
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return { port, emitted };
+  }
+
+  it('RED: a turn with unreadable (malformed percent-encoded) data-URI attachments resolves — the malformed URIError never rejects runTurn, and the OTHER attachments + text still reach client.prompt', async () => {
+    let promptContent: AcpOutboundContentBlock[] | undefined;
+    const client = makeFakeClient(async (_sessionId, content) => {
+      promptContent = content;
+      return { stopReason: 'end_turn' };
+    });
+    const { port, emitted } = makePort(client);
+    const controller = new SessionController('session-1', '/no-workspace', port);
+
+    const badAttachment: Attachment = { id: 'b1', name: 'bad.txt', kind: 'file', dataUri: 'data:,%E0%A4%A' };
+    const okAttachment: Attachment = { id: 'ok1', name: 'shot.png', kind: 'image', dataUri: 'data:image/png;base64,QUJD' };
+    controller.sendPrompt('look at this', 'default', [badAttachment, okAttachment]);
+
+    await vi.waitFor(() => expect(promptContent).toBeDefined());
+
+    // The unreadable attachment never reaches the prompt; the readable one does.
+    expect(promptContent).toEqual([
+      { type: 'text', text: 'look at this' },
+      { type: 'image', data: 'QUJD', mimeType: 'image/png' },
+    ]);
+
+    const errorMsg = emitted.find(
+      (m): m is Extract<HostToWebviewMessage, { type: 'error' }> => m.type === 'error',
+    );
+    expect(errorMsg).toBeDefined();
+    expect(errorMsg?.sessionId).toBe('session-1');
+    expect(errorMsg?.message).toContain('1 attachment');
+    expect(errorMsg?.message).not.toContain('bad.txt');
+    expect(errorMsg?.message).not.toContain('data:');
+  });
+
+  it('RED: droppedCount from buildPromptContent folds INTO the same message confineAttachmentPaths already produces (never a second error)', async () => {
+    let promptContent: AcpOutboundContentBlock[] | undefined;
+    const client = makeFakeClient(async (_sessionId, content) => {
+      promptContent = content;
+      return { stopReason: 'end_turn' };
+    });
+    const { port, emitted } = makePort(client);
+    const controller = new SessionController('session-1', '/no-workspace', port);
+
+    const bad1: Attachment = { id: 'b1', name: 'bad1.txt', kind: 'file', dataUri: 'data:garbage' };
+    const bad2: Attachment = { id: 'b2', name: 'bad2.txt', kind: 'file', dataUri: 'data:,%E0%A4%A' };
+    controller.sendPrompt('hi', 'default', [bad1, bad2]);
+
+    await vi.waitFor(() => expect(promptContent).toBeDefined());
+
+    expect(promptContent).toEqual([{ type: 'text', text: 'hi' }]);
+
+    const errorMsgs = emitted.filter((m) => m.type === 'error');
+    expect(errorMsgs).toHaveLength(1); // exactly one dropped-attachments message, not two
+    expect((errorMsgs[0] as Extract<HostToWebviewMessage, { type: 'error' }>).message).toContain('2 attachments');
+  });
+});
+
+/**
  * I-2 (W1-T3 review, Important fix): `loadReplayOutcome`'s LAST supersede
  * guard (`this.replay !== replay`) sits right before `this.replay =
  * undefined` (~:1142-1144) — but `await this.pinWireModeDefault(...)`
@@ -1888,6 +1988,51 @@ describe('WS-R4 characterization — the SIX loadReplayOutcome arms (REMEDIATION
     expect('result' in outcome).toBe(false);
     expect(emitted.filter((m) => m.type === 'turn.end' && m.status === 'complete')).toHaveLength(0);
   });
+
+  // FI-03 (WS-F7 F7-3a gap-fill): the "superseded-mid-await (empty)" arm
+  // above drives the supersede recheck through the `!result.found` branch
+  // only (`resolveLoad(0, { found: false })`). The CATCH branch
+  // (`client.loadSession` rejecting) shares the SAME inline recheck
+  // (`if (this.replay !== replay) return { kind: 'superseded' };`) but was
+  // never independently pinned — added so the F7-3a `emitReplayFailure`
+  // extraction cannot silently drop THIS exit's own supersede guard.
+  it('ARM superseded-mid-await via REJECT (catch branch): a superseded load whose loadSession REJECTS resolves bare {kind:"superseded"} SILENTLY (no error emit, no turn.end)', async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const loser = controller.loadReplayOutcome('/fake/ws', 'session-A', '/fake/ws', []);
+    void controller.loadReplayOutcome('/fake/ws', 'session-B', '/fake/ws', []); // supersedes on the SAME instance (T1a reuse)
+    const emissionsBefore = emitted.length;
+    client.rejectLoad(0, new Error('load boom')); // the LOSER's rejection
+    const outcome = await loser;
+    expect(outcome).toEqual({ kind: 'superseded' });
+    expect('result' in outcome).toBe(false);
+    expect(emitted).toHaveLength(emissionsBefore); // strict silence — emitReplayFailure never ran
+  });
+
+  // FI-03 (WS-F7 F7-3a gap-fill): `emitReplayFailure`'s `this.replay =
+  // undefined` postcondition is not directly observable in the returned
+  // union or the emissions from the SAME call. Pin it via a SUBSEQUENT
+  // `endForRestart()` on the same controller: if the failure path left
+  // `this.replay` truthy, `endTurnBracket`'s replay arm would fire a SECOND,
+  // stale `turn.end` for a turn that already closed with status:'error'.
+  it("load-failed clears `this.replay` — a later endForRestart() finds nothing left to unwind (no second, stale turn.end)", async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    client.rejectLoad(0, new Error('load boom'));
+    await load;
+    const turnEndsBefore = emitted.filter((m) => m.type === 'turn.end').length;
+    controller.endForRestart();
+    expect(emitted.filter((m) => m.type === 'turn.end')).toHaveLength(turnEndsBefore);
+  });
+
+  it("not-found clears `this.replay` — a later endForRestart() finds nothing left to unwind (no second, stale turn.end)", async () => {
+    const { controller, client, emitted } = makeLoadHarness();
+    const load = controller.loadReplayOutcome('/fake/ws', 'session-1', '/fake/ws', []);
+    client.resolveLoad(0, { found: false });
+    await load;
+    const turnEndsBefore = emitted.filter((m) => m.type === 'turn.end').length;
+    controller.endForRestart();
+    expect(emitted.filter((m) => m.type === 'turn.end')).toHaveLength(turnEndsBefore);
+  });
 });
 
 /**
@@ -2110,6 +2255,181 @@ describe('SessionController.emitApprovalCard — WS-SL F2-06: emit-throw settles
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/**
+ * WS-A T3 (BH-05 fix, ADR-R2-02): `emitApprovalCard` must gate a synthetic
+ * `tool.start` on `diffs.length > 0` so the webview has a tool item for the
+ * DiffCard to attach to, WITHOUT changing the diff-less (command) path and
+ * WITHOUT ever surfacing a tool item for the fail-closed minimal-ask card
+ * (`buildMinimalAskApproval` always builds `diffs: []`). New emit order for
+ * a diff-bearing edit: `tool.start` -> `tool.diff`* -> `approval.request`
+ * (the approval emit moved LAST).
+ */
+describe('SessionController.emitApprovalCard — WS-A T3: diff-gated tool.start emit order (BH-05 wiring)', () => {
+  const tmpDirs: string[] = [];
+  function makeTmpWs(): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-sc-t3-ws-'));
+    tmpDirs.push(dir);
+    return dir;
+  }
+  afterEach(() => {
+    while (tmpDirs.length) {
+      const dir = tmpDirs.pop()!;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+
+  /** Every member throws unless it's the one this suite actually drives
+   *  (`prompt`, hung forever so the turn stays live for the whole test —
+   *  mirrors the resolveDiff describe block's `makeHangingEditClient`). */
+  function makeHangingClient(): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in a WS-A T3 test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt: () => new Promise<never>(() => {}),
+      cancel: async () => undefined,
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  function makeT3Port(ws: string): { port: SessionHostPort; emitted: HostToWebviewMessage[] } {
+    const emitted: HostToWebviewMessage[] = [];
+    const port: SessionHostPort = {
+      getClient: () => makeHangingClient(),
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => [ws],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    return { port, emitted };
+  }
+
+  function makeT3EditReq(toolCallId: string, p = 'src/a.ts'): AcpRequestPermissionRequest {
+    return {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId,
+        title: `Approve edit: ${p}`,
+        kind: 'edit',
+        content: [{ type: 'diff', path: p, oldText: 'a', newText: 'b' }],
+        rawInput: { tool: 'write_file', arguments: { path: p, content: 'b' } },
+      },
+    };
+  }
+
+  function makeT3CommandReq(toolCallId: string, command = 'npm test'): AcpRequestPermissionRequest {
+    return {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId,
+        title: `Run: ${command}`,
+        kind: 'execute',
+        content: [{ content: { type: 'text', text: `$ ${command}` } }],
+        rawInput: { command, description: 'run' },
+      },
+    };
+  }
+
+  it('a diff-bearing edit permission emits the exact ordered sequence tool.start -> tool.diff -> approval.request, all sharing one toolId', async () => {
+    const ws = makeTmpWs();
+    const { port, emitted } = makeT3Port(ws);
+    const controller = new SessionController('session-1', ws, port);
+    controller.sendPrompt('edit it', 'default');
+    emitted.length = 0; // isolate: only the permission-card emits are under test
+
+    const pending = controller.handlePermission(makeT3EditReq('edit-approval-1'), 'appr-t3-1');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+    });
+
+    // Exact sequence, exact order — no extra/missing messages.
+    expect(emitted.map((m) => m.type)).toEqual(['tool.start', 'tool.diff', 'approval.request']);
+
+    expect(emitted[0]).toEqual(
+      expect.objectContaining({ type: 'tool.start', toolId: 'edit-approval-1', kind: 'edit', status: 'pending' }),
+    );
+    expect(emitted[1]).toEqual(expect.objectContaining({ type: 'tool.diff', toolId: 'edit-approval-1' }));
+    expect(emitted[2]).toEqual(expect.objectContaining({ type: 'approval.request', toolId: 'edit-approval-1' }));
+
+    // Cleanup: settle the still-pending card so its 60s auto-deny timer
+    // does not outlive the test (dispose() cancels fail-closed).
+    controller.dispose();
+    await pending;
+  });
+
+  it('a diff-less command permission emits ONLY approval.request — no tool.start, no tool.diff', async () => {
+    const ws = makeTmpWs();
+    const { port, emitted } = makeT3Port(ws);
+    const controller = new SessionController('session-1', ws, port);
+    controller.sendPrompt('run it', 'default');
+    emitted.length = 0;
+
+    const pending = controller.handlePermission(makeT3CommandReq('cmd-approval-1'), 'appr-t3-2');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+    });
+
+    expect(emitted.map((m) => m.type)).toEqual(['approval.request']);
+    expect(emitted.some((m) => m.type === 'tool.start')).toBe(false);
+
+    controller.dispose();
+    await pending;
+  });
+
+  it('the fail-closed minimal-ask card (mapPermissionRequest throws, diffs: []) emits ONLY approval.request — no tool.start', async () => {
+    const ws = makeTmpWs();
+    const { port, emitted } = makeT3Port(ws);
+    const controller = new SessionController('session-1', ws, port);
+    controller.sendPrompt('edit it', 'default');
+    emitted.length = 0;
+
+    // Hostile diff content: `newText` is not a string, so `buildDiffHunks`
+    // throws inside `mapPermissionRequest` (mirrors AcpBackend.test.ts's F5).
+    const req: AcpRequestPermissionRequest = {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId: 'edit-evil-t3',
+        title: 'Update README',
+        kind: 'edit',
+        content: [{ type: 'diff', path: 'README.md', oldText: 'a', newText: 42 as unknown as string }],
+        rawInput: { tool: 'write_file', arguments: { path: 'README.md', content: 'x' } },
+      },
+    };
+
+    const pending = controller.handlePermission(req, 'appr-t3-3');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+    });
+
+    expect(emitted.map((m) => m.type)).toEqual(['approval.request']);
+    expect(emitted.some((m) => m.type === 'tool.start')).toBe(false);
+    expect(emitted[0]).toEqual(
+      expect.objectContaining({ type: 'approval.request', title: 'Approval required (request could not be parsed)' }),
+    );
+
+    controller.dispose();
+    await pending;
   });
 });
 
@@ -2512,5 +2832,296 @@ describe('SessionController.resolveDiff — BHF-F1-3 (firm): junk hunk indices n
     controller.acceptWholeFileDiff('edit-1');
     const res = await pending;
     expect(res).toEqual(buildSelectedOutcome('allow_once'));
+  });
+});
+
+/**
+ * BH-03 (Lens-R2, WS-B Task 1) [CONC]: fail-closed the N1 auto-allow fast
+ * path after Stop. `handlePermission` re-validates liveness right after
+ * `await this.buildPresentEffectSignals(...)` (BF-B) — but ONLY via
+ * `this.disposed`, never turn-cancellation. A `cancel()` landing in that same
+ * suspension window sets `cancelledTurnId` (not `disposed`), so a
+ * Normal-preset auto-allow edit (N1: in-workspace, checkpoint-protected,
+ * non-secret, non-protected) sailed straight through to `buildSelectedOutcome`
+ * — an allow decided and returned for a turn the user already stopped, with
+ * no card and no settle to intercept it. The card path
+ * (`emitApprovalCard`) already runs `isStaleApprovalRegistration` at its own
+ * registration point; the fast path never did.
+ *
+ * Characterization-first, same suspension mechanism the BF-B suite above
+ * uses: `handlePermission`'s `await this.buildPresentEffectSignals(...)`
+ * suspends on REAL fs `realpath`/`lstat` (a temp workspace dir) — calling
+ * `cancel()` synchronously right after starting the promise, before ever
+ * awaiting it, deterministically lands inside that window every run (no
+ * timers, no polling).
+ */
+describe('SessionController.handlePermission — BH-03: turn-liveness on the N1 auto-allow fast path', () => {
+  const tmpDirs: string[] = [];
+  function makeTmpWs(): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-sc-bh03-ws-'));
+    tmpDirs.push(dir);
+    return dir;
+  }
+  afterEach(() => {
+    while (tmpDirs.length) {
+      const dir = tmpDirs.pop()!;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+
+  /** Minimal `CheckpointTrackerLike` fake whose `snapshot` never throws — all
+   *  `snapshotCheckpoint` needs to flip `currentTurnProtected` true, N1's
+   *  other prerequisite alongside an in-workspace, non-secret, non-protected
+   *  path. Every other member is unused by this suite. */
+  class AlwaysSucceedsTracker implements CheckpointTrackerLike {
+    async snapshot(): Promise<Checkpoint | null> {
+      return null;
+    }
+    async list(): Promise<CheckpointsData> {
+      return { checkpoints: [] };
+    }
+    async restore(): Promise<RestoreResult> {
+      return { restored: false, reason: 'unused in this suite' };
+    }
+    async redo(): Promise<RestoreResult> {
+      return { restored: false, reason: 'unused in this suite' };
+    }
+    async redoAll(): Promise<RestoreResult> {
+      return { restored: false, reason: 'unused in this suite' };
+    }
+  }
+
+  /** A hanging `AcpClientLike` (mirrors the WS-SL F3-3 suite's
+   *  `makeF33Harness`): `prompt` never resolves, so the admitted turn stays
+   *  LIVE (`currentTurnId`/`liveTurnId` set) for the whole test — required so
+   *  `cancel()` takes its real client-cancel branch and `handlePermission`'s
+   *  entry-time `turnId` capture reads a genuine live turn, not the
+   *  no-client fallback. */
+  function makeHangingClient(): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in a BH-03 test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt: () => new Promise<never>(() => {}),
+      cancel: async () => undefined,
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  /** Flushes the microtask queue N times — `runTurnWithCheckpoint`'s
+   *  `Promise.all([snapshotCheckpoint, resolveMentions])` (plus
+   *  `runTurn`'s own pre-prompt awaits) needs a few hops before
+   *  `currentTurnProtected` settles true and the turn parks on the hanging
+   *  `client.prompt`. Purely microtask-driven (no real timers/I/O in this
+   *  suite's fakes) — deterministic regardless of iteration count as long as
+   *  it's enough to drain the chain. Mirrors the F3-3 suite's `flushF33`. */
+  async function flushTurns(times = 10): Promise<void> {
+    for (let i = 0; i < times; i++) await Promise.resolve();
+  }
+
+  /** A LIVE, checkpoint-protected turn under the 'normal' preset — the exact
+   *  precondition an N1 auto-allow edit needs. */
+  async function makeLiveNormalTurn(
+    ws: string,
+  ): Promise<{ controller: SessionController; emitted: unknown[]; logs: string[] }> {
+    const emitted: unknown[] = [];
+    const logs: string[] = [];
+    const client = makeHangingClient();
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: { ...makeRoot(), tracker: new AlwaysSucceedsTracker() },
+      workspaceRoots: () => [ws],
+      logger: { append: (l) => logs.push(l) },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', ws, port);
+    controller.setPreset('normal');
+    controller.sendPrompt('edit it', 'default');
+    await flushTurns();
+    return { controller, emitted, logs };
+  }
+
+  it('a cancel() landing while handlePermission is suspended in canonicalization fails the N1 fast path closed (no post-Stop allow)', async () => {
+    const ws = makeTmpWs();
+    const { controller, emitted, logs } = await makeLiveNormalTurn(ws);
+
+    // Suspends at `await this.buildPresentEffectSignals(...)` (real fs
+    // realpath/lstat) — `cancel()` right below is synchronous and runs
+    // BEFORE that await resolves, landing squarely in the BH-03 window.
+    const pending = controller.handlePermission(makeEditReq('src/a.ts'), 'appr-bh03-1');
+    controller.cancel();
+
+    const res = await pending;
+
+    // Fail-closed: a Stop landing mid-canonicalization must never let the N1
+    // fast path resolve allow — this is the exact fail-OPEN BH-03 pins.
+    expect(res).toEqual(buildCancelledOutcome());
+    expect(emitted.some((m) => (m as { type?: string }).type === 'approval.request')).toBe(false);
+    expect(logs.some((l) => l.includes('refused after suspension'))).toBe(true);
+  });
+
+  it("a LIVE (non-cancelled) turn's N1 auto-allow still resolves ALLOW (no over-refusal)", async () => {
+    const ws = makeTmpWs();
+    const { controller, emitted } = await makeLiveNormalTurn(ws);
+
+    const res = await controller.handlePermission(makeEditReq('src/a.ts'), 'appr-bh03-2');
+
+    expect(res).toEqual(buildSelectedOutcome('allow_once'));
+    expect(emitted.some((m) => (m as { type?: string }).type === 'approval.request')).toBe(false);
+  });
+});
+
+/**
+ * BH-04 (Lens-R2, WS-B Task 2): settle pending approvals on crash/restart.
+ * Neither `endOnCrash` nor `endForRestart` called `settlePendingApprovals`,
+ * so a pending approval's ACP promise was left hanging (never resolved) and
+ * its card kept looking live in the webview after the arm's closing
+ * `turn.end` had already fired. The fix settles every pending approval
+ * `'cancelled'` near the top of each method — BEFORE the arm's `turn.end`
+ * emit, so the webview sees the card resolve before the turn closes.
+ *
+ * Reuses the T-A0 settle-spine suite's `makeCommandReq` shape (an
+ * `execute`-kind request needs no real fs canonicalization, so
+ * `handlePermission`'s one await resolves in a couple of microtask hops)
+ * and drives a LIVE prompt turn (hanging `client.prompt`) so `endOnCrash`/
+ * `endForRestart` take their live-turn arm.
+ *
+ * The pending-promise resolution is observed via a `.then` side-channel
+ * (not a bare `await`) so a still-unfixed method's permanently-hanging
+ * promise fails the assertion fast (mismatched sentinel) instead of hanging
+ * the test.
+ */
+describe('SessionController.endOnCrash / endForRestart — BH-04 (Lens-R2, WS-B Task 2): settle pending approvals', () => {
+  /** Mirrors the T-A0 suite's `makeCommandReq` — an `execute`-kind request
+   *  so `buildPresentEffectSignals` needs no real fs canonicalization. */
+  function makeCommandReq(command: string, toolCallId = 'cmd-1'): AcpRequestPermissionRequest {
+    return {
+      sessionId: 'session-1',
+      options: EDIT_OPTIONS.map((o) => ({ ...o })),
+      toolCall: {
+        toolCallId,
+        title: `Run: ${command}`,
+        kind: 'execute',
+        content: [{ content: { type: 'text', text: `$ ${command}` } }],
+        rawInput: { command, description: 'run' },
+      },
+    };
+  }
+
+  function makeHarness(): { controller: SessionController; emitted: HostToWebviewMessage[] } {
+    const emitted: HostToWebviewMessage[] = [];
+    const client = {
+      cancel: async () => undefined,
+      prompt: () => new Promise<never>(() => {}),
+    } as unknown as AcpClientLike;
+    const port: SessionHostPort = {
+      getClient: () => client,
+      emit: (msg) => emitted.push(msg),
+      emitSystemError: () => {},
+      root: makeRoot(),
+      workspaceRoots: () => ['/fake/ws'],
+      logger: { append: () => {} },
+      refreshCheckpointsPanel: () => {},
+      resolveMentions: async () => [],
+    };
+    const controller = new SessionController('session-1', '/fake/ws', port);
+    return { controller, emitted };
+  }
+
+  /** Flushes the microtask queue N times — same rationale as the T-A0
+   *  suite's `flushMicrotasks`: no real timers/I/O in this suite's fakes. */
+  async function flush(times = 4): Promise<void> {
+    for (let i = 0; i < times; i++) await Promise.resolve();
+  }
+
+  const STILL_PENDING = Symbol('still-pending');
+
+  it("endOnCrash settles a pending approval 'cancelled' BEFORE the live arm's turn.end{error}, and resolves the ACP promise", async () => {
+    const { controller, emitted } = makeHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await flush();
+
+    const pending = controller.handlePermission(makeCommandReq('npm test'), 'appr-crash-1');
+    await flush();
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+
+    let outcome: unknown = STILL_PENDING;
+    void pending.then((r) => {
+      outcome = r;
+    });
+
+    controller.endOnCrash();
+    await flush();
+
+    expect(outcome).toEqual(buildCancelledOutcome());
+
+    const settleIndex = emitted.findIndex((m) => m.type === 'approval.settle');
+    const endIndex = emitted.findIndex((m) => m.type === 'turn.end');
+    expect(settleIndex).toBeGreaterThanOrEqual(0);
+    expect(endIndex).toBeGreaterThanOrEqual(0);
+    expect(settleIndex).toBeLessThan(endIndex); // settle BEFORE the closing turn.end
+    expect(emitted[settleIndex]).toEqual({
+      type: 'approval.settle',
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      id: 'appr-crash-1',
+      toolId: 'cmd-1',
+      outcome: 'cancelled',
+    });
+    expect(emitted[endIndex]).toEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'error' }),
+    );
+  });
+
+  it("endForRestart settles a pending approval 'cancelled' BEFORE the live arm's turn.end{cancelled}, and resolves the ACP promise", async () => {
+    const { controller, emitted } = makeHarness();
+    controller.sendPrompt('do the thing', 'default');
+    await flush();
+
+    const pending = controller.handlePermission(makeCommandReq('npm test'), 'appr-restart-1');
+    await flush();
+    expect(emitted.some((m) => m.type === 'approval.request')).toBe(true);
+
+    let outcome: unknown = STILL_PENDING;
+    void pending.then((r) => {
+      outcome = r;
+    });
+
+    controller.endForRestart();
+    await flush();
+
+    expect(outcome).toEqual(buildCancelledOutcome());
+
+    const settleIndex = emitted.findIndex((m) => m.type === 'approval.settle');
+    const endIndex = emitted.findIndex((m) => m.type === 'turn.end');
+    expect(settleIndex).toBeGreaterThanOrEqual(0);
+    expect(endIndex).toBeGreaterThanOrEqual(0);
+    expect(settleIndex).toBeLessThan(endIndex); // settle BEFORE the closing turn.end
+    expect(emitted[settleIndex]).toEqual({
+      type: 'approval.settle',
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      id: 'appr-restart-1',
+      toolId: 'cmd-1',
+      outcome: 'cancelled',
+    });
+    expect(emitted[endIndex]).toEqual(
+      expect.objectContaining({ type: 'turn.end', turnId: 'turn-1', status: 'cancelled' }),
+    );
   });
 });

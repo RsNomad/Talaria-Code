@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { AgentMarkdown, splitStableBoundary, renderMarkdown } from './AgentMarkdown';
 
@@ -430,5 +430,200 @@ describe('CA-11: memoized streaming render is transparent on fence-edge corners 
       fresh.unmount();
       expect(warm).toBe(cold);
     }
+  });
+});
+
+/**
+ * WS-E E1 (L2-CA-03) Step 1 — explicit DOM goldens pinned BEFORE the
+ * fence-aware streaming-render change below. These are literal
+ * `container.innerHTML` strings (NOT `toMatchSnapshot`) captured from the
+ * pre-change renderer, for (a) a CLOSED multi-fence message and (b) a
+ * streaming message with NO open trailing fence. Both paths are untouched by
+ * `planStreamingRender` (it only engages for a trailing OPEN fence while
+ * streaming), so these goldens must stay byte-identical after the change —
+ * any diff here means the new fence branch leaked into a path it must not
+ * touch.
+ */
+const E1_CLOSED_MULTI_FENCE = [
+  '# Title',
+  '',
+  'Some text with **bold**, `code`, and a [link](https://example.com).',
+  '',
+  '- item one',
+  '- item two',
+  '',
+  '```ts',
+  'const x = 1;',
+  '```',
+  '',
+  'Middle paragraph.',
+  '',
+  '```py',
+  'def f():',
+  '    return 1',
+  '```',
+  '',
+  'Final paragraph.',
+].join('\n');
+
+const E1_CLOSED_MULTI_FENCE_GOLDEN =
+  '<div class="text-[13px] leading-relaxed text-fg"><h3 class="mb-1 mt-2 font-semibold text-fg">Title</h3><p class="mb-2 last:mb-0">Some text with <strong class="font-semibold text-fg">bold</strong>, <code class="rounded bg-surface px-1 py-0.5 font-mono text-[0.85em] text-accent">code</code>, and a <a href="https://example.com" class="text-accent underline" title="https://example.com">link</a>.</p><ul class="mb-2 list-disc pl-5 last:mb-0"><li>item one</li><li>item two</li></ul><pre class="my-2 overflow-x-auto rounded-card border border-border bg-surface p-3 font-mono text-xs leading-relaxed text-muted"><div class="mb-1 text-2xs uppercase text-faint">ts</div><code>const x = 1;</code></pre><p class="mb-2 last:mb-0">Middle paragraph.</p><pre class="my-2 overflow-x-auto rounded-card border border-border bg-surface p-3 font-mono text-xs leading-relaxed text-muted"><div class="mb-1 text-2xs uppercase text-faint">py</div><code>def f():\n    return 1</code></pre><p class="mb-2 last:mb-0">Final paragraph.</p></div>';
+
+const E1_STREAMING_NO_OPEN_FENCE = [
+  'Intro paragraph.',
+  '',
+  '```ts',
+  'const a = 1;',
+  '```',
+  '',
+  'After the code, some words still streaming',
+].join('\n');
+
+const E1_STREAMING_NO_OPEN_FENCE_GOLDEN =
+  '<div class="text-[13px] leading-relaxed text-fg"><p class="mb-2 last:mb-0">Intro paragraph.</p><pre class="my-2 overflow-x-auto rounded-card border border-border bg-surface p-3 font-mono text-xs leading-relaxed text-muted"><div class="mb-1 text-2xs uppercase text-faint">ts</div><code>const a = 1;</code></pre><p class="mb-2 last:mb-0">After the code, some words still streaming</p><span class="h-live text-accent">▍</span></div>';
+
+describe('WS-E E1 (L2-CA-03) Step 1: pinned DOM goldens (result-preserving paths)', () => {
+  it('a CLOSED multi-fence message renders byte-identically to the pre-change golden', () => {
+    const { container } = render(<AgentMarkdown text={E1_CLOSED_MULTI_FENCE} />);
+    expect(container.innerHTML).toBe(E1_CLOSED_MULTI_FENCE_GOLDEN);
+  });
+
+  it('a streaming message with NO open trailing fence renders byte-identically to the pre-change golden', () => {
+    const { container } = render(<AgentMarkdown text={E1_STREAMING_NO_OPEN_FENCE} streaming />);
+    expect(container.innerHTML).toBe(E1_STREAMING_NO_OPEN_FENCE_GOLDEN);
+  });
+});
+
+/**
+ * WS-E E1 (L2-CA-03) Step 3 — RED DOM test for the fix itself: a streaming
+ * message with an OPEN trailing fence and a large body (long enough to cross
+ * a full `CODE_STABLE_CHUNK` window, so `bodyStable` is non-empty) must
+ * render as exactly ONE `<pre>` element, with correct `<code>` text and a
+ * lang header — AND that `<code>` must now be built from the memo-stable
+ * `bodyStable` + `bodyTail` PAIR (two adjacent non-empty string children),
+ * not one monolithic string. Two adjacent non-empty string children produce
+ * two DOM text nodes (verified empirically: an empty-string child produces
+ * NO node, so a genuinely non-empty `bodyStable` is required for this to be
+ * a real structural difference, not a same-count coincidence).
+ *
+ * FAILS today: the current renderer passes `tok.body` as a single string
+ * child, so `code.childNodes.length` is 1, not 2.
+ */
+/**
+ * WS-U U1 (UX-01, WCAG 2.1.1 / axe `scrollable-region-focusable`): the code
+ * `<pre className={CODE_BLOCK_CLASS}>` (both the closed-fence branch in
+ * `renderMarkdown` and the open-fence streaming branch in `AgentMarkdown`
+ * itself) and the markdown table's `overflow-x-auto` wrapper are wrapped in
+ * `ScrollRegion` so a keyboard-only user can reach and pan them — but ONLY
+ * while they actually overflow. jsdom never runs real layout
+ * (`scrollWidth`/`clientWidth` are both 0), so the golden block below pins
+ * that E1's byte-identical goldens (above) hold precisely BECAUSE nothing in
+ * this suite ever overflows — the wrapper never adds an attribute here. The
+ * RED block that follows stubs overflow to prove the wrapper actually names
+ * the region once it does.
+ */
+function stubOverflow(scrollWidth: number, clientWidth: number): void {
+  Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+    configurable: true,
+    get: () => scrollWidth,
+  });
+  Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+    configurable: true,
+    get: () => clientWidth,
+  });
+}
+
+function restoreOverflowStub(): void {
+  Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
+  Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+}
+
+describe('WS-U U1 Step 1 golden: non-overflowing code block / table carry no dead tab stop', () => {
+  it('a closed-fence code block carries no tabindex/role/aria-label when not overflowing', () => {
+    render(<AgentMarkdown text={'```ts\nconst y = 2;\n```'} />);
+    const pre = document.querySelector('pre');
+    expect(pre).not.toBeNull();
+    expect(pre).not.toHaveAttribute('tabindex');
+    expect(pre).not.toHaveAttribute('role');
+    expect(pre).not.toHaveAttribute('aria-label');
+  });
+
+  it('a streaming OPEN-fence code block carries no tabindex/role/aria-label when not overflowing', () => {
+    render(<AgentMarkdown text={'```ts\nconst z = 3;'} streaming />);
+    const pre = document.querySelector('pre');
+    expect(pre).not.toBeNull();
+    expect(pre).not.toHaveAttribute('tabindex');
+    expect(pre).not.toHaveAttribute('role');
+    expect(pre).not.toHaveAttribute('aria-label');
+  });
+
+  it('a markdown table carries no tabindex/role/aria-label on its scroll wrapper when not overflowing', () => {
+    render(<AgentMarkdown text={'| a | b |\n| - | - |\n| 1 | 2 |'} />);
+    const table = screen.getByRole('table');
+    const wrapper = table.closest('.overflow-x-auto');
+    expect(wrapper).not.toBeNull();
+    expect(wrapper).not.toHaveAttribute('tabindex');
+    expect(wrapper).not.toHaveAttribute('role');
+    expect(wrapper).not.toHaveAttribute('aria-label');
+  });
+});
+
+describe('WS-U U1 Step 2 RED->GREEN: code block / table become a named, focusable group ONLY while overflowing', () => {
+  afterEach(() => {
+    restoreOverflowStub();
+  });
+
+  it('a closed-fence `ts` code block becomes role="group" named "Code block (ts)" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(<AgentMarkdown text={'```ts\nconst x = 1;\n```'} />);
+    const region = screen.getByRole('group', { name: 'Code block (ts)' });
+    expect(region.tagName).toBe('PRE');
+    expect(region).toHaveAttribute('tabindex', '0');
+  });
+
+  it('a code block with NO lang becomes role="group" named just "Code block" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(<AgentMarkdown text={'```\nconst x = 1;\n```'} />);
+    expect(screen.getByRole('group', { name: 'Code block' })).toBeInTheDocument();
+  });
+
+  it('a streaming OPEN-fence code block becomes role="group" named "Code block (ts)" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(<AgentMarkdown text={'```ts\nconst z = 3;'} streaming />);
+    const region = screen.getByRole('group', { name: 'Code block (ts)' });
+    expect(region.tagName).toBe('PRE');
+  });
+
+  it('a markdown table becomes role="group" named "Table" once it overflows', () => {
+    stubOverflow(1000, 100);
+    render(<AgentMarkdown text={'| a | b |\n| - | - |\n| 1 | 2 |'} />);
+    const region = screen.getByRole('group', { name: 'Table' });
+    expect(region).toHaveAttribute('tabindex', '0');
+    expect(screen.getByRole('table')).toBeInTheDocument();
+  });
+});
+
+describe('WS-E E1 (L2-CA-03) Step 3: open-fence streaming renders one <pre> from a stable+tail pair', () => {
+  it('a large open-fence body (crossing a CODE_STABLE_CHUNK window) renders as exactly one <pre>, correct <code> text, a lang header, and a non-monolithic (stable+tail) text-node split', () => {
+    // 300 lines * ~55 chars/line ≈ 16.5 KB — comfortably above 2*4096 so the
+    // quantized bodyStable is guaranteed non-empty (cut > 0).
+    const body = Array.from(
+      { length: 300 },
+      (_, i) => `  line ${i} of many kilobytes of streamed code content here`,
+    ).join('\n');
+    const text = 'Intro\n\n```ts\n' + body;
+    const { container } = render(<AgentMarkdown text={text} streaming />);
+    const pres = container.querySelectorAll('pre');
+    expect(pres).toHaveLength(1);
+    const pre = pres[0];
+    const code = pre?.querySelector('code');
+    expect(code?.textContent).toBe(body.replace(/\n$/, ''));
+    const langHeader = pre?.querySelector('div');
+    expect(langHeader).not.toBeUndefined();
+    expect(langHeader).not.toBeNull();
+    expect(langHeader?.textContent).toBe('ts');
+    // The real fix: bodyStable + bodyTail are two SEPARATE non-empty string
+    // children (two text nodes), not one monolithic string (one text node).
+    expect(code?.childNodes.length).toBe(2);
   });
 });

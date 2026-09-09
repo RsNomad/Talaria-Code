@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { NextEditHttpBackend, clearNextEditBackendWarnings } from './backend';
+import { NextEditHttpBackend } from './backend';
+import { OnceRegistry } from '../onceRegistry';
 import { InsecureTransportError } from '../backends/secureTransport';
-import { BackendHttpError } from '../backends/http';
+import { BackendHttpError, StreamIdleTimeoutError, STREAM_IDLE_TIMEOUT_MS } from '../backends/http';
 import { mintScannedNextEditRequest } from './scan';
 import type { NextEditRequest, NextEditTransportId, ScannedNextEditRequest } from './types';
 import type { RenderedNextEditPrompt, StopReason } from './formats/types';
@@ -71,13 +72,23 @@ function apiBaseFor(transport: NextEditTransportId): string {
   return transport === 'ollama' ? 'http://127.0.0.1:11434' : 'http://127.0.0.1:8000';
 }
 
-function makeBackend(transport: NextEditTransportId, overrides: { apiKey?: string; apiBase?: string } = {}): NextEditHttpBackend {
+/** F10-2b: `registry` defaults to a FRESH `OnceRegistry()` per call — this
+ *  alone reproduces the isolation `clearNextEditBackendWarnings()` used to
+ *  provide between cases (each backend starts with nothing warned). A test
+ *  that needs to re-arm an EXISTING backend mid-test passes its own
+ *  `registry` override and calls `.reset()` on it directly (see the
+ *  "warns only ONCE … re-arms it" test below). */
+function makeBackend(
+  transport: NextEditTransportId,
+  overrides: { apiKey?: string; apiBase?: string; registry?: OnceRegistry } = {},
+): NextEditHttpBackend {
   return new NextEditHttpBackend({
     transport,
     apiBase: overrides.apiBase ?? apiBaseFor(transport),
     ...(overrides.apiKey !== undefined ? { apiKey: overrides.apiKey } : {}),
     model: 'test-model',
     sentinels: [],
+    registry: overrides.registry ?? new OnceRegistry(),
   });
 }
 
@@ -114,6 +125,7 @@ describe('NextEditHttpBackend.predict — pinned guard order (security)', () => 
       apiKey: 'k',
       model: 'test-model', // Finding 5: must match minted()'s req.model, or the (0) reconciliation check fires first.
       sentinels: [],
+      registry: new OnceRegistry(),
     });
     await expect(b.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(InsecureTransportError);
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -148,6 +160,7 @@ describe('NextEditHttpBackend.predict — pinned guard order (security)', () => 
       apiKey: 'k',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
     const forgedAndInsecure = {
       ...cleanReq(),
@@ -182,7 +195,11 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    clearNextEditBackendWarnings();
+    // F10-2b: no module-level reset needed any more — `makeBackend`'s default
+    // gives every call a FRESH `OnceRegistry()`, and each inline construction
+    // below passes its own fresh instance too, so every test already starts
+    // with nothing warned (exactly what `clearNextEditBackendWarnings()` used
+    // to provide here).
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
 
@@ -201,6 +218,7 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
       apiKey: 'leftover-fim-key',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
 
     const out = await backend.predict(minted(), rendered(), new AbortController().signal);
@@ -220,6 +238,7 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
       apiKey: 'super-secret-leftover-key',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
 
     await backend.predict(minted(), rendered(), new AbortController().signal);
@@ -254,7 +273,7 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  it('warns only ONCE across repeated predict calls until clearNextEditBackendWarnings() re-arms it', async () => {
+  it('warns only ONCE across repeated predict calls until registry.reset() re-arms it', async () => {
     // Each call must get its own fresh `ReadableStream` body — a single
     // shared response (via `mockResolvedValue`) would be drained by the
     // first `predict()` call, breaking the second/third with an unrelated
@@ -265,14 +284,18 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
         Promise.resolve(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' })),
       );
     vi.stubGlobal('fetch', fetchSpy);
-    const backend = makeBackend('ollama', { apiKey: 'leftover-key' });
+    // F10-2b: an explicit registry (not `makeBackend`'s own default) so this
+    // test can re-arm it directly — mirrors `shell.vscode.ts`'s own shared
+    // instance across predictions, just held by the test instead of a shell.
+    const registry = new OnceRegistry();
+    const backend = makeBackend('ollama', { apiKey: 'leftover-key', registry });
 
     await backend.predict(minted(), rendered(), new AbortController().signal);
     await backend.predict(minted(), rendered(), new AbortController().signal);
     await backend.predict(minted(), rendered(), new AbortController().signal);
     expect(warnSpy).toHaveBeenCalledTimes(1);
 
-    clearNextEditBackendWarnings();
+    registry.reset();
     await backend.predict(minted(), rendered(), new AbortController().signal);
     expect(warnSpy).toHaveBeenCalledTimes(2);
   });
@@ -286,6 +309,7 @@ describe('NextEditHttpBackend.predict — CF-24: ollama transport drops a leftov
       apiKey: 'k',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
 
     await expect(backend.predict(minted(), rendered(), new AbortController().signal)).rejects.toThrow(
@@ -423,6 +447,7 @@ describe('NextEditHttpBackend.predict — openai-compat body shape (skip_special
       apiKey: '   ',
       model: 'test-model',
       sentinels: [],
+      registry: new OnceRegistry(),
     });
 
     await backend.predict(minted(), rendered(), new AbortController().signal);
@@ -581,7 +606,13 @@ describe('NextEditHttpBackend.predict — CA-5 missing response.body guard (mirr
 });
 
 describe('NextEditHttpBackend.predict — abort signal', () => {
-  it('abort signal is honored (fetch receives the same signal)', async () => {
+  // ADR-R2-06 (L2-CA-05): `predict` now wraps the caller's signal in
+  // `armStreamDeadlines`'s composite (`AbortSignal.any([signal, ...])`) so
+  // fetch receives a DIFFERENT signal object than the caller's own — this
+  // used to assert object identity (`toBe(controller.signal)`); updated to
+  // the functional invariant that identity check stood in for: aborting the
+  // caller's signal still aborts whatever signal fetch actually received.
+  it('abort signal is honored (aborting the caller signal aborts the one fetch receives)', async () => {
     const fetchSpy = vi
       .fn()
       .mockResolvedValue(fakeOkResponse({ response: 'txt', done: true, done_reason: 'stop' }));
@@ -593,7 +624,11 @@ describe('NextEditHttpBackend.predict — abort signal', () => {
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
-    expect(init.signal).toBe(controller.signal);
+    const receivedSignal = init.signal as AbortSignal;
+    expect(receivedSignal).not.toBe(controller.signal);
+    expect(receivedSignal.aborted).toBe(false);
+    controller.abort();
+    expect(receivedSignal.aborted).toBe(true);
   });
 });
 
@@ -686,4 +721,41 @@ describe('NextEditHttpBackend.predict — D1 bounded JSON body reads (unbounded-
       /response exceeded \d+ bytes without completing/,
     );
   });
+});
+
+/**
+ * WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): proves `predict` (both
+ * transports go through the SAME `armStreamDeadlines` arm/dispatch in
+ * `predict` itself) actually threads the deadline end to end. Non-streaming
+ * (`readJsonBounded`) — the stall here is a response body that starts
+ * arriving but never finishes, exactly like the FIM backends' equivalent
+ * `readJsonBounded` case (`LlamaCppInfillBackend.streamFim`).
+ */
+describe('NextEditHttpBackend.predict — ADR-R2-06 stream deadlines (L2-CA-05)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it.each<NextEditTransportId>(['ollama', 'openai-compat'])(
+    'transport=%s: reaps a stalled (never-completing) response body as StreamIdleTimeoutError once the 120s inter-chunk idle elapses',
+    async (transport) => {
+      vi.useFakeTimers();
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // A partial JSON body — arrives, but the response never completes.
+          controller.enqueue(encoder.encode('{"response":"partial'));
+        },
+      });
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: 'OK', body } as unknown as Response));
+
+      const backend = makeBackend(transport);
+      const pending = backend.predict(minted(), rendered(), new AbortController().signal);
+
+      const assertion = expect(pending).rejects.toBeInstanceOf(StreamIdleTimeoutError);
+      await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS);
+      await assertion;
+    },
+  );
 });

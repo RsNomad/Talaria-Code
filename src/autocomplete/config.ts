@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { isHttpUrl } from '../shared/url';
+import { DEFAULT_ENDPOINTS } from './endpoints';
 import type { FimBackendName } from './types';
 
 /**
@@ -39,14 +40,6 @@ export interface CrossFileConfig {
    *  holds. Default-off until Fedora P2 evidence decides default-on. */
   warmUp: boolean;
 }
-
-const DEFAULT_ENDPOINTS: Record<FimBackendName, string> = {
-  ollama: 'http://127.0.0.1:11434',
-  llamacpp: 'http://127.0.0.1:8080',
-  vllm: 'http://127.0.0.1:8000',
-  codestral: 'https://codestral.mistral.ai',
-  'openai-compat': 'http://127.0.0.1:8000',
-};
 
 const DEFAULT_MODEL = 'qwen2.5-coder:1.5b-base';
 

@@ -413,6 +413,15 @@ export interface LocationTarget {
  * expanded; the item list itself is capped at `opts.cap ??
  * DEFAULT_LOCATIONS_CAP`, and the dropped count is reported in a trailing
  * summary line.
+ *
+ * L2-CA-20 (Lens-R2, [SEC]): `externalCount` is computed over the SHOWN set
+ * ONLY, not the full `targets` array. The caller (`buildLocationTargets`)
+ * classifies only the shown prefix and pairs the beyond-cap tail with the
+ * `UNCLASSIFIED_TAIL_VERDICT` placeholder (`inRoot: false`) purely so this
+ * function's total count stays accurate — counting over the full array
+ * would double-count that never-classified, never-rendered tail as
+ * "external", which it was never actually checked to be. The summary wording
+ * ("N of the shown external") reflects this honestly.
  */
 export function shapeLocations(
   targets: readonly LocationTarget[],
@@ -426,10 +435,10 @@ export function shapeLocations(
   }
   const capLimit = normalizeCap(opts?.cap, DEFAULT_LOCATIONS_CAP);
   const shown = targets.slice(0, capLimit);
-  const externalCount = targets.filter((t) => t.verdict.inRoot === false).length;
+  const externalCount = shown.filter((t) => t.verdict.inRoot === false).length;
   const droppedCount = Math.max(0, total - shown.length);
   const lines = shown.map((t) => renderLocationLine(t, caps));
-  const summary = `(${shown.length} of ${total} shown; ${externalCount} external; ${droppedCount} more not shown)`;
+  const summary = `(${shown.length} of ${total} shown; ${externalCount} of the shown external; ${droppedCount} more not shown)`;
   const assembled = [...lines, summary].join('\n');
   return frameLspResult(capTotalBody(assembled, caps), nonce);
 }

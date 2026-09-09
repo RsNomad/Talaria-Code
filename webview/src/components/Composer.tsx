@@ -22,8 +22,9 @@ import { Icon } from './Icon';
 import { AttachMenu } from './AttachMenu';
 import { LiveRegion } from './LiveRegion';
 import { useMenuFocus } from '../hooks/useMenuFocus';
+import { MenuPopup } from './MenuPopup';
 import { Pill } from './Pill';
-import { SuggestMenu, flattenSuggestSections, activeOptionId, type SuggestItem } from './SuggestMenu';
+import { SuggestMenu, flattenSuggestSections, type SuggestItem } from './SuggestMenu';
 import { filterMentions, type MentionItem } from '../composer/mentionCatalog';
 import { buildSlashSections, type AgentSlashItem, type SlashTemplate } from '../composer/slashCatalog';
 import { useSuggest, pathPickEmptyKey } from '../composer/useSuggest';
@@ -31,7 +32,15 @@ import { parseMentions, formatMentionToken } from '../composer/parseMentions';
 import { describeMention, basename } from '../composer/mentionChip';
 import { parsePathPick, filesToFolders } from '../composer/fileSearch';
 import { useFileSearch } from '../composer/useFileSearch';
+import {
+  filePickHeading as deriveFilePickHeading,
+  openPopupId as deriveOpenPopupId,
+  activeOptionOf,
+  type PopupId,
+} from '../composer/composerDerive';
 import { applySeed, type ComposerSeed } from '../composer/applySeed';
+import { MIN_H, useComposerResize } from '../composer/useComposerResize';
+import { useAttachmentIntake } from '../composer/useAttachmentIntake';
 import { busyInteraction } from './busyInteraction';
 import { useFocusAnchorOnUnmount } from '../hooks/useFocusAnchorOnUnmount';
 import { ConfirmStrip } from './ConfirmStrip';
@@ -67,7 +76,6 @@ function nonEmptyFirst<T>(arr: readonly T[]): T {
 
 const FIRST_PRESET = nonEmptyFirst(PRESETS);
 
-const MIN_H = 64;
 const NARROW = 360;
 
 interface ComposerProps {
@@ -180,110 +188,8 @@ interface ComposerProps {
   onSeedApplied: (seed: ComposerSeed) => void;
 }
 
-function uid(): string {
-  return crypto.randomUUID?.() ?? `att-${Math.random().toString(36).slice(2)}`;
-}
-
-function kindOf(file: File): Attachment['kind'] {
-  if (file.type.startsWith('image/')) return 'image';
-  if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) return 'pdf';
-  return 'file';
-}
-
-/** Extension → MIME fallback for the common text-ish kinds browsers report as `''`. */
-const EXT_MIME: Record<string, string> = {
-  txt: 'text/plain',
-  md: 'text/markdown',
-  log: 'text/plain',
-  csv: 'text/csv',
-  json: 'application/json',
-  ts: 'application/typescript',
-  tsx: 'application/typescript',
-  js: 'application/javascript',
-  jsx: 'application/javascript',
-  py: 'text/x-python',
-  sh: 'application/x-sh',
-  yml: 'application/x-yaml',
-  yaml: 'application/x-yaml',
-  xml: 'application/xml',
-  html: 'text/html',
-  css: 'text/css',
-};
-
-/** A non-empty MIME for a file: its own `type`, else an extension-based guess, else a binary default. */
-function resolveMime(file: File): string {
-  if (file.type) return file.type;
-  const ext = file.name.toLowerCase().split('.').pop() ?? '';
-  return EXT_MIME[ext] ?? 'application/octet-stream';
-}
-
-/**
- * Per-kind cap on inline-read attachment bytes — above the cap we skip inlining
- * rather than send a dead chip. Generic files (the newly-supported inline path)
- * get a tight 512 KB cap; images/pdf keep their prior "read unconditionally"
- * behavior with only a loose 20 MB sanity bound so a routine screenshot never
- * falls through.
- */
-const MAX_FILE_BYTES = 512 * 1024; // 512 KB — generic text/binary files
-const MAX_MEDIA_BYTES = 20 * 1024 * 1024; // 20 MB — images & pdfs
-function maxInlineBytes(kind: Attachment['kind']): number {
-  return kind === 'image' || kind === 'pdf' ? MAX_MEDIA_BYTES : MAX_FILE_BYTES;
-}
-
 function chipIcon(kind: Attachment['kind']): string {
   return kind === 'image' ? 'file-media' : kind === 'pdf' ? 'file-pdf' : 'file';
-}
-
-/**
- * CF-07 (L5 F-8): an Explorer drag delivers its `text/uri-list` entry as a
- * `file://` URI (e.g. `file:///home/user/proj/src/app.ts`), but
- * `Attachment.path`'s contract is a workspace fsPath — host-side
- * `confineAttachmentPaths` (`src/host/backend/acp/attachments.ts`)
- * `path.resolve()`s it against each workspace root. A raw URI string never
- * resolves inside any root that way, so storing it verbatim gets the
- * attachment silently dropped with a misleading "outside the workspace or
- * secret-classified" outcome — fixed HERE, at the composer boundary, so
- * confinement itself stays a pure fsPath-only contract (smaller blast
- * radius than teaching it to accept URIs too).
- *
- * Grounded via Context7 (`/nodejs/node`, `url.fileURLToPath` doc, write-time):
- * `new URL(uri).pathname` alone is NOT the fsPath — it stays
- * percent-encoded (`file:///hello world` -> pathname `/hello%20world`,
- * `file:///你好.txt` -> `/%E4%BD%A0%E5%A5%BD.txt`) — `decodeURIComponent`
- * on top is required to get the real path back, exactly what
- * `fileURLToPath` does internally. `url.fileURLToPath` itself is Node-only
- * and unavailable here (this module runs in the webview's browser
- * context), so this reimplements its POSIX case against the WHATWG `URL`
- * global instead, which the webview host and jsdom both provide.
- *
- * POSIX-only (Fedora is the target platform): `file:///abs/path` has an
- * empty authority, and per RFC 8089 + Node's own `fileURLToPath` docs
- * ("On Unix-like systems, only localhost or an empty host is supported"),
- * `file://localhost/abs/path` is an equally valid LOCAL alias for it —
- * only a genuinely different, non-empty, non-localhost host (e.g.
- * `file://otherhost/...`) is a REMOTE/UNC form. The WHATWG `URL` parser
- * used here already normalizes a literal `localhost` authority (any case,
- * even percent-encoded) to an empty `url.hostname` for the `file:` scheme
- * as part of its own "file host" state, so the `!== 'localhost'` check
- * below is belt-and-suspenders — it makes the RFC 8089 exemption explicit
- * in this function's own logic instead of leaning on that engine-internal
- * normalization implicitly. A genuinely different host is deliberately
- * left unhandled (returns `undefined`, falling through to the non-URI
- * branch below) rather than guessed at.
- *
- * @returns the decoded fsPath, or `undefined` when `uri` is not a
- *          recognizable local `file://` URI (caller falls back to storing
- *          it verbatim, unchanged from before this fix).
- */
-function fileUriToFsPath(uri: string): string | undefined {
-  if (!/^file:\/\//i.test(uri)) return undefined;
-  try {
-    const url = new URL(uri);
-    if (url.hostname && url.hostname.toLowerCase() !== 'localhost') return undefined;
-    return decodeURIComponent(url.pathname);
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -333,38 +239,10 @@ export function Composer({
   onSeedApplied,
 }: ComposerProps) {
   const modeWrapRef = useRef<HTMLDivElement>(null);
-  const [dragging, setDragging] = useState(false);
   const [narrow, setNarrow] = useState(false);
-  const [height, setHeight] = useState(initialHeight);
-  // T5 (§7.2.3): owns the drag-resize AbortController — see `startResize`
-  // and the unmount-cleanup `useEffect` below.
-  const resizeAbortRef = useRef<AbortController | null>(null);
-  /**
-   * W4-T6 (UI#8): the resize grabber's `aria-valuemax` (below) used to be a
-   * plain `const` recomputed from `window.innerHeight` inline in the render
-   * body — which happened to track the real viewport whenever SOME OTHER
-   * prop/state change caused a re-render, but nothing re-rendered this
-   * component on an actual window `resize` with no other trigger, so the
-   * announced max silently lagged behind reality (a stale snapshot, not a
-   * live one) until the next unrelated render. State + a `resize` listener
-   * makes it genuinely reactive. `clampH` below is UNCHANGED — it already
-   * reads `window.innerHeight` fresh at drag-time, which was always correct;
-   * only the DISPLAYED `aria-valuemax` was stale.
-   */
-  const [maxH, setMaxH] = useState(() =>
-    Math.round((typeof window !== 'undefined' ? window.innerHeight : 800) * 0.6),
-  );
-  /** A2 (UI I-9): oversize-attachment / FileReader-error notice — surfaced
-   * through the permanently-mounted `LiveRegion` below (Finding-7 discipline:
-   * the region itself is never conditionally mounted, only this text is
-   * swapped). Empty string = no notice. */
-  const [attachNotice, setAttachNotice] = useState('');
-  /** Task 21 (WCAG 4.1.3): `attachNotice` above only ever announces FAILURE —
-   * a successful attach was silent to assistive tech. Surfaced through its
-   * own permanently-mounted `LiveRegion` (Finding-7 discipline: mounted
-   * empty, text swaps per attach) so a screen-reader user gets the same
-   * confirmation a sighted user gets from the new chip appearing. */
-  const [attachAnnounce, setAttachAnnounce] = useState('');
+  // WS-F5 F5-3 (FI-05, part 1/2): drag/keyboard resize state, handlers, and
+  // effects moved verbatim into `useComposerResize` (see that file).
+  const { height, maxH, startResize, resizeByKey } = useComposerResize(initialHeight, onHeightChange);
 
   // W2 T1 (§2b): the ONE shared suggest primitive drives both `@` (mentions,
   // any word boundary — unchanged pre-T1 behavior) and `/` (slash commands,
@@ -374,6 +252,20 @@ export function Composer({
   const slashSuggest = useSuggest({ trigger: '/', requireStart: true });
 
   const rootRef = useRef<HTMLDivElement>(null);
+  const {
+    dragging,
+    attachNotice,
+    setAttachNotice,
+    attachAnnounce,
+    fileInputRef,
+    imageInputRef,
+    addFiles,
+    onDragOver,
+    onDragLeave,
+    onDrop,
+    onPaste,
+    resetForTab,
+  } = useAttachmentIntake({ onAttachAdd, rootRef });
   const taRef = useRef<HTMLTextAreaElement>(null);
   /**
    * CF-02: belt for the compositionstart/compositionend event-order gap
@@ -386,8 +278,6 @@ export function Composer({
    */
   const composingRef = useRef(false);
   const presetWrapRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
   // Task 6 (A11Y-01, WCAG 2.4.3): Send unmounts the instant `busy` flips true
   // (swapped for Stop) and Stop unmounts the instant the turn ends (swapped
   // back to Send) — without this, either commit drops focus to `<body>`. The
@@ -434,16 +324,6 @@ export function Composer({
     ro.observe(el);
     setNarrow(el.getBoundingClientRect().width < NARROW);
     return () => ro.disconnect();
-  }, []);
-
-  // W4-T6 (UI#8): keeps `maxH` (the resize grabber's `aria-valuemax`) in
-  // sync with the ACTUAL viewport on a real window resize — see the state
-  // declaration's doc above for why the old inline-`const` computation went
-  // stale.
-  useEffect(() => {
-    const onResize = () => setMaxH(Math.round(window.innerHeight * 0.6));
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
   }, []);
 
   // Dismiss the preset picker on an outside press.
@@ -520,8 +400,7 @@ export function Composer({
     slashSuggest.close();
     presetMenu.closeMenu(false);
     modeMenu.closeMenu(false);
-    setDragging(false);
-    setAttachNotice('');
+    resetForTab();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately
     // keyed on tabId ONLY; mentionSuggest/slashSuggest/presetMenu/modeMenu
     // are stable-enough per render — their imperative methods' identity
@@ -530,117 +409,7 @@ export function Composer({
 
   // ---- attachments ----
 
-  const addFiles = (files: Iterable<File>) => {
-    // A2 (UI I-9): a fresh attach attempt clears any stale notice from a
-    // PRIOR call — each failure below (over)writes it again (last-wins).
-    setAttachNotice('');
-    for (const file of files) {
-      const kind = kindOf(file);
-      const id = uid();
-      const mime = resolveMime(file);
-      // Above the per-kind inline cap we can't embed bytes and there's no path to
-      // fall back to (that's the Explorer-drag branch in onDrop) — a chip that
-      // sends nothing is worse than no chip, so skip it outright. Images/pdf keep
-      // their prior always-read behavior under a loose 20 MB sanity bound; only
-      // generic files get the tight 512 KB cap.
-      const cap = maxInlineBytes(kind);
-      if (file.size > cap) {
-        console.warn(`Talaria: "${file.name}" is ${file.size} bytes, over the ${cap}-byte inline cap — skipping attachment`);
-        // A2 (UI I-9): the console.warn above is invisible to the user —
-        // this is the user-visible, screen-reader-announced counterpart.
-        setAttachNotice(`"${file.name}" is too large to attach — skipped.`);
-        continue;
-      }
-      const meta: Attachment = { id, name: file.name, kind, mime };
-      const reader = new FileReader();
-      reader.onload = () => {
-        // Rebuild the data URI with our resolved MIME: the browser's own
-        // readAsDataURL output uses file.type verbatim, which is `''` for many
-        // text-ish extensions (.csv/.md/.log) and would otherwise produce an
-        // unparseable `data:;base64,...` URI downstream.
-        // P7-N1: appended at the REDUCER (onAttachAdd -> local.draft.attach.add),
-        // not via a whole-array controlled write here — reader.onload resolves
-        // ASYNCHRONOUSLY, so two readers resolving close together would race a
-        // stale `draftAttachments` prop and drop a sibling file. The reducer's
-        // append is atomic per dispatch instead.
-        const raw = String(reader.result);
-        const base64 = raw.slice(raw.indexOf(',') + 1);
-        onAttachAdd({ ...meta, dataUri: `data:${mime};base64,${base64}` });
-        // Task 21 (WCAG 4.1.3): announce the success too — until now only
-        // the failure branches (oversize / reader.onerror, above) spoke.
-        setAttachAnnounce(`Attached "${file.name}"`);
-      };
-      // A2 (UI I-9): previously unassigned — a FileReader failure (permission
-      // denial, an unreadable/vanished file, an OS-level read error) was
-      // fully silent: no attachment, no chip, no console output, no notice.
-      reader.onerror = () => {
-        setAttachNotice(`"${file.name}" couldn't be read — skipped.`);
-      };
-      reader.readAsDataURL(file);
-    }
-  };
-
   const removeAttachment = (id: string) => onAttachRemove(id);
-
-  // ---- drag-drop ----
-
-  const onDragOver = (e: React.DragEvent) => {
-    if (e.dataTransfer?.types?.includes('Files') || e.dataTransfer?.types?.includes('text/uri-list')) {
-      e.preventDefault();
-      setDragging(true);
-    }
-  };
-  const onDragLeave = (e: React.DragEvent) => {
-    if (!rootRef.current?.contains(e.relatedTarget as Node)) setDragging(false);
-  };
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    const files = e.dataTransfer?.files;
-    if (files && files.length) {
-      addFiles(Array.from(files));
-      return;
-    }
-    // Explorer drag: fall back to the uri-list as path references.
-    const uris = e.dataTransfer?.getData('text/uri-list');
-    if (uris) {
-      uris
-        .split('\n')
-        .map((s) => s.trim())
-        .filter((s) => s && !s.startsWith('#'))
-        .forEach((u) => {
-          // CF-07: a `file://` URI is parsed to its fsPath before it's
-          // stored — `path` is already decoded in that case, so the name is
-          // taken from IT (not re-decoded, which would corrupt a filename
-          // that happens to contain a literal `%`). A non-URI drop is
-          // already an fsPath — unchanged prior behavior.
-          const fsPath = fileUriToFsPath(u);
-          if (fsPath !== undefined) {
-            const name = fsPath.split('/').pop() || fsPath;
-            onAttachAdd({ id: uid(), name, kind: 'file', path: fsPath });
-            return;
-          }
-          const name = decodeURIComponent(u.split('/').pop() || u);
-          onAttachAdd({ id: uid(), name, kind: 'file', path: u });
-        });
-    }
-  };
-
-  // ---- paste image ----
-
-  const onPaste = (e: React.ClipboardEvent) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const images = Array.from(items).filter(
-      (it) => it.kind === 'file' && it.type.startsWith('image/'),
-    );
-    if (!images.length) return;
-    e.preventDefault();
-    for (const it of images) {
-      const file = it.getAsFile();
-      if (file) addFiles([file]);
-    }
-  };
 
   // ---- @ mention / / slash suggest — one shared primitive, two instances ----
 
@@ -659,16 +428,7 @@ export function Composer({
     hint: p,
     icon: pathPick?.kind === 'folder' ? 'folder' : 'file',
   }));
-  const filePickHeading =
-    fileSearch.status === 'loading'
-      ? 'Searching…'
-      : fileSearch.status === 'error'
-        ? 'Search failed'
-        : filePickItems.length === 0
-          ? 'No matches'
-          : pathPick?.kind === 'folder'
-            ? 'Folders'
-            : 'Files';
+  const filePickHeading = deriveFilePickHeading(fileSearch.status, filePickItems.length, pathPick?.kind === 'folder');
   const showFilePick = pathPick !== null;
 
   const filteredMentions: MentionItem[] = mentionSuggest.state.open && !pathPick
@@ -692,27 +452,21 @@ export function Composer({
   // `pathPick !== null`); `onKeyDown` below documents why mention and slash
   // can't legitimately both be open at one caret position either — so this
   // first-match order is never ambiguous in practice.
-  const openPopupId: 'mention' | 'filepick' | 'slash' | undefined = showMention
-    ? 'mention'
-    : showFilePick
-      ? 'filepick'
-      : showSlash
-        ? 'slash'
-        : undefined;
+  const openPopupId: PopupId | undefined = deriveOpenPopupId(showMention, showFilePick, showSlash);
   // filePick can be OPEN with ZERO rendered options (the "Searching…"/
   // "No matches" states — `showFilePick` doesn't gate on item count, unlike
   // mention/slash which already require length > 0 to show at all). An
   // aria-activedescendant naming an id with no matching element would itself
   // be an a11y bug, so this only ever names an id that is on an actually
   // rendered `role="option"` element.
-  const activeOptId: string | undefined =
-    openPopupId === 'mention' && filteredMentions.length > 0
-      ? activeOptionId('mention', mentionActiveIndex)
-      : openPopupId === 'filepick' && filePickItems.length > 0
-        ? activeOptionId('filepick', mentionActiveIndex)
-        : openPopupId === 'slash' && slashItems.length > 0
-          ? activeOptionId('slash', slashActiveIndex)
-          : undefined;
+  const activeOptId: string | undefined = activeOptionOf(
+    openPopupId,
+    filteredMentions.length,
+    filePickItems.length,
+    slashItems.length,
+    mentionActiveIndex,
+    slashActiveIndex,
+  );
 
   const onComposerTextChange = (value: string, caret: number) => {
     mentionSuggest.onTextChange(value, caret);
@@ -900,77 +654,6 @@ export function Composer({
       e.preventDefault();
       submit();
     }
-  };
-
-  // ---- drag-resize ----
-
-  const clampH = (h: number) => Math.max(MIN_H, Math.min(h, Math.round(window.innerHeight * 0.6)));
-
-  /**
-   * T5 (§7.2.3, AU-61 extra-b): one `AbortController` owns BOTH window
-   * listeners (MDN: `abort()` removes every listener registered with that
-   * signal), so the unmount path (below) and the pointerup path share ONE
-   * teardown and neither can forget the other's listener. Before this fix,
-   * teardown lived ONLY inside `up`: unmounting mid-drag (e.g. a host
-   * panel-switch away from 'chat') leaked both window listeners until the
-   * NEXT pointerup anywhere, left `document.body` stuck at
-   * `user-select: none`, kept calling `setHeight` on an unmounted
-   * component, and later fired `onHeightChange` through a stale closure.
-   */
-  const startResize = (e: React.PointerEvent) => {
-    e.preventDefault();
-    const startY = e.clientY;
-    const startH = height;
-    let latest = startH;
-    const controller = new AbortController();
-    resizeAbortRef.current = controller;
-    document.body.style.userSelect = 'none';
-    window.addEventListener(
-      'pointermove',
-      (ev) => {
-        latest = clampH(startH + (startY - ev.clientY));
-        setHeight(latest);
-      },
-      { signal: controller.signal },
-    );
-    window.addEventListener(
-      'pointerup',
-      () => {
-        controller.abort(); // removes both listeners
-        resizeAbortRef.current = null;
-        document.body.style.userSelect = '';
-        onHeightChange(latest);
-      },
-      { signal: controller.signal },
-    );
-  };
-
-  // T5 (§7.2.3): unmount-only cleanup — ends an in-progress drag exactly as
-  // `pointerup` would, EXCEPT it does NOT call `onHeightChange` (no persist
-  // for a drag the unmount cancelled — a deliberate cancel-vs-commit
-  // choice). Guarded on the ref so it only touches `userSelect` when a drag
-  // was actually active, never clobbering an unrelated future writer of that
-  // style. Idempotent: React 19 StrictMode's double-invoke finds the ref
-  // already null on its second pass.
-  useEffect(
-    () => () => {
-      if (resizeAbortRef.current) {
-        resizeAbortRef.current.abort();
-        resizeAbortRef.current = null;
-        document.body.style.userSelect = '';
-      }
-    },
-    [],
-  );
-
-  const resizeByKey = (e: React.KeyboardEvent) => {
-    let next: number | null = null;
-    if (e.key === 'ArrowUp') next = clampH(height + 16);
-    else if (e.key === 'ArrowDown') next = clampH(height - 16);
-    if (next === null) return;
-    e.preventDefault();
-    setHeight(next);
-    onHeightChange(next);
   };
 
   const activePreset = PRESETS.find((p) => p.id === preset) ?? FIRST_PRESET;
@@ -1199,19 +882,16 @@ export function Composer({
               <Icon name="chevron-down" size={10} />
             </button>
             {presetMenu.open && (
-              <div
-                role="menu"
-                // W4-T6 (UI#8): APG Menu pattern
-                // (https://www.w3.org/WAI/ARIA/apg/patterns/menu/, fetched
-                // live for this task): "An element with role menu either
-                // has: aria-labelledby ... [or] a label provided by
-                // aria-label." This menu carried neither — unlike
-                // `AttachMenu.tsx`'s own `role="menu"`, which already does
-                // (`aria-label="Attach"`).
-                aria-label="Edit policy"
-                onKeyDown={presetMenu.onMenuKey}
-                className="absolute bottom-full left-0 z-30 mb-1 min-w-[184px] overflow-hidden rounded-card border border-border bg-overlay py-1 shadow-lg"
-              >
+              // W4-T6 (UI#8): APG Menu pattern
+              // (https://www.w3.org/WAI/ARIA/apg/patterns/menu/, fetched live
+              // for this task): "An element with role menu either has:
+              // aria-labelledby ... [or] a label provided by aria-label."
+              // This menu carried neither — unlike `AttachMenu.tsx`'s own
+              // `role="menu"`, which already does (`aria-label="Attach"`).
+              // FI-15: the container chrome (role/aria-label/border/
+              // positioning) is single-sourced in `MenuPopup` — see its file
+              // header for the extraction rationale.
+              <MenuPopup ariaLabel="Edit policy" minWidthClass="min-w-[184px]" onKeyDown={presetMenu.onMenuKey}>
                 {PRESETS.map((p, i) => {
                   const selected = p.id === preset;
                   return (
@@ -1245,7 +925,7 @@ export function Composer({
                     </button>
                   );
                 })}
-              </div>
+              </MenuPopup>
             )}
           </div>
 
@@ -1275,14 +955,11 @@ export function Composer({
                 <Icon name="chevron-down" size={10} />
               </button>
               {modeMenu.open && (
-                <div
-                  role="menu"
-                  // W4-T6 (UI#8): same unnamed-menu fix as the preset menu
-                  // above — see its comment for the APG grounding.
-                  aria-label="Mode"
-                  onKeyDown={modeMenu.onMenuKey}
-                  className="absolute bottom-full left-0 z-30 mb-1 min-w-[160px] overflow-hidden rounded-card border border-border bg-overlay py-1 shadow-lg"
-                >
+                // W4-T6 (UI#8): same unnamed-menu fix as the preset menu
+                // above — see its comment for the APG grounding. FI-15: same
+                // shared `MenuPopup` container as the preset menu (see its
+                // file header) — only `minWidthClass` differs between them.
+                <MenuPopup ariaLabel="Mode" minWidthClass="min-w-[160px]" onKeyDown={modeMenu.onMenuKey}>
                   <div className="border-b border-border px-2.5 py-1.5 font-mono text-2xs text-faint">
                     Restricts edits only, not a sandbox — terminal/code/subagent/MCP writes bypass it
                   </div>
@@ -1331,7 +1008,7 @@ export function Composer({
                       </button>
                     );
                   })}
-                </div>
+                </MenuPopup>
               )}
             </div>
           )}

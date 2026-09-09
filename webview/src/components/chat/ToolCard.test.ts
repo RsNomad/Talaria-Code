@@ -20,6 +20,13 @@ describe('ToolCard status lookup (UI-I1)', () => {
     expect(totalLookup(STATUS, 'interrupted', UNKNOWN_TOOL_STATUS)).toBe(STATUS.interrupted);
   });
 
+  it('resolves the approval-outcome states approved/denied (Q2 / ADR-R2-15) — folded client-side only, never emitted by the host on tool.* messages', () => {
+    expect(totalLookup(STATUS, 'approved', UNKNOWN_TOOL_STATUS)).toBe(STATUS.approved);
+    expect(STATUS.approved).toEqual({ tone: 'add', label: 'Approved', icon: 'check' });
+    expect(totalLookup(STATUS, 'denied', UNKNOWN_TOOL_STATUS)).toBe(STATUS.denied);
+    expect(STATUS.denied).toEqual({ tone: 'del', label: 'Denied', icon: 'circle-slash' });
+  });
+
   it('a malformed/out-of-contract status normalizes to the safe default, not undefined', () => {
     const result = totalLookup(STATUS, 'queued', UNKNOWN_TOOL_STATUS);
     expect(result).toBe(UNKNOWN_TOOL_STATUS);

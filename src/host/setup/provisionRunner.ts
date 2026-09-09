@@ -26,7 +26,28 @@ import type { LatchRegistry } from './latchRegistry';
 import { refuseUnsafeModalText } from './modalText';
 import type { PullProgress } from './ollamaClient';
 import type { SetupProgress } from '../../shared/protocol';
+import { errorMessage } from '../../shared/errorMessage';
 import type { SetupControllerDeps } from './SetupController';
+
+/**
+ * WS-F8 F8-3 (FI-17): the Interface-Segregation narrowing of {@link
+ * SetupControllerDeps} to EXACTLY the 7 members {@link ProvisionRunner}'s
+ * body reads off `this.deps` (grep-confirmed: `registry`, `verifyHfDigest`,
+ * `ingestGguf`, `resolveLfsOid`, `checkedStoreDest`, `downloadGgufToStore`,
+ * `pullModel` — not more, not fewer). `SetupController` still constructs
+ * `new ProvisionRunner(this.deps, …)` unchanged: the full `SetupControllerDeps`
+ * it holds structurally satisfies this narrower Pick.
+ */
+export type ProvisionDeps = Pick<
+  SetupControllerDeps,
+  | 'checkedStoreDest'
+  | 'downloadGgufToStore'
+  | 'ingestGguf'
+  | 'pullModel'
+  | 'registry'
+  | 'resolveLfsOid'
+  | 'verifyHfDigest'
+>;
 
 /** The seam {@link ProvisionRunner} reaches the host/façade through — the
  *  same four operations `SetupController` itself performs, narrowed to what
@@ -43,11 +64,15 @@ export interface ProvisionRunnerPort {
 /** §6 "host-sourced pull refusal (rev 5)" — kills the S-F1 class outright. */
 const HOST_SOURCED_PULL_REFUSAL =
   "Talaria never instructs Ollama to fetch from an external host — the vetted Sweep model installs through Talaria's own verified download.";
-/** §6 "NEXT download unavailable (D3)" — the sha256 pin is still empty. */
-const NEXT_DOWNLOAD_UNAVAILABLE =
+/** §6 "NEXT download unavailable (D3)" — the sha256 pin is still empty.
+ *  Exported (WS-F8 F8-4, FI-22) so {@link refusePinnedOllamaPreconditions}'s
+ *  own focused unit test can assert against the real string instead of
+ *  re-typing it. */
+export const NEXT_DOWNLOAD_UNAVAILABLE =
   "No vetted build of this model is published yet, so Talaria won't download it automatically. To use NEXT today, pick the vLLM backend in the dedicated NEXT setup (it runs Sweep's official release) — or use Generic mode, which reuses your FIM model.";
-/** §6 "NEXT download remote-endpoint refusal (S-F3)" — ingest is loopback-only. */
-const NEXT_REMOTE_ENDPOINT_REFUSAL =
+/** §6 "NEXT download remote-endpoint refusal (S-F3)" — ingest is loopback-only.
+ *  Exported (WS-F8 F8-4, FI-22) — see {@link NEXT_DOWNLOAD_UNAVAILABLE}. */
+export const NEXT_REMOTE_ENDPOINT_REFUSAL =
   'Verified downloads only run against a local Ollama (loopback). For a remote server, download and verify the model on that machine — see the guided instructions.';
 /** §4.4.3c — ONE line for every integrity failure mode (no detail leaks what to forge). */
 const NEXT_INTEGRITY_REFUSAL = 'integrity check failed — refusing to download';
@@ -110,6 +135,28 @@ function isLoopbackEndpoint(rawUrl: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * WS-F8 F8-4 (FI-22 setup-half): the pinned-Ollama fail-closed precondition
+ * ladder, single-sourced — this SAME two-check ladder used to live inline,
+ * duplicated verbatim, in both `handleVettedIngest` (the NEXT/dedicated-FIM
+ * path) and `provisionOllama`'s pinned arm (the catalog path). EXACT beta.5
+ * vetted ORDER — empty pin refuses BEFORE the loopback check; both refuse
+ * BEFORE any modal/verify/ingest. Callers pass their own sha256 pin plus the
+ * ALREADY-validated endpoint URL; a pure module function (no `this`), like
+ * its neighbour {@link isLoopbackEndpoint}. Exported so the dedicated
+ * `refusePinnedOllamaPreconditions.test.ts` can pin the ORDER directly — the
+ * behavioural tests each trigger only ONE of the two checks, so neither
+ * proves which reason wins when both fail.
+ */
+export function refusePinnedOllamaPreconditions(
+  sha256: string,
+  endpoint: string,
+): { ok: true } | { ok: false; reason: string } {
+  if (sha256 === '') return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
+  if (!isLoopbackEndpoint(endpoint)) return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
+  return { ok: true };
 }
 
 /** beta.6 §6 copy, verbatim: the llamacpp honest-absence line — rev 3:
@@ -255,7 +302,7 @@ function composeLlamacppDownloadModal(
 export class ProvisionRunner {
   constructor(
     private readonly port: ProvisionRunnerPort,
-    private readonly deps: SetupControllerDeps,
+    private readonly deps: ProvisionDeps,
     private readonly latches: LatchRegistry,
   ) {}
 
@@ -338,24 +385,21 @@ export class ProvisionRunner {
 
   /**
    * T13 (beta.5 §4.4.3a-d): the vetted-ingest branch, refusal order EXACT —
-   * (a) unpublished pin → refuse; (b) non-loopback endpoint → refuse (the
-   * ingest engine downloads on THIS machine and uploads to the daemon; a
-   * remote daemon gets the guided/manual path); (c) HF-tree digest
-   * pre-flight → ANY failure refuses; (d) ONLY THEN the Tier-1 modal (§6
-   * verbatim) and, on confirm, the T14 engine. Every refusal lands BEFORE
-   * the modal — the user is never asked to approve something already known
-   * to be unavailable, remote, or unverified.
+   * (a)+(b) the shared {@link refusePinnedOllamaPreconditions} ladder
+   * (unpublished pin → refuse; non-loopback endpoint → refuse — the ingest
+   * engine downloads on THIS machine and uploads to the daemon, so a remote
+   * daemon gets the guided/manual path); (c) HF-tree digest pre-flight → ANY
+   * failure refuses; (d) ONLY THEN the Tier-1 modal (§6 verbatim) and, on
+   * confirm, the T14 engine. Every refusal lands BEFORE the modal — the user
+   * is never asked to approve something already known to be unavailable,
+   * remote, or unverified.
    */
   private async handleVettedIngest(endpoint: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     const created = NEXT_DEDICATED_MODEL.ollamaCreatedName;
-    // (a) fail-closed until the out-of-band publication fills the pin (§5.4).
-    if (NEXT_DEDICATED_MODEL.gguf.sha256 === '') {
-      return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
-    }
-    // (b) loopback only — checked on the ALREADY-validated URL.
-    if (!isLoopbackEndpoint(endpoint)) {
-      return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
-    }
+    // (a)+(b) fail-closed until the out-of-band publication fills the pin
+    // (§5.4), and loopback-only — checked on the ALREADY-validated URL.
+    const pre = refusePinnedOllamaPreconditions(NEXT_DEDICATED_MODEL.gguf.sha256, endpoint);
+    if (!pre.ok) return pre;
     // Single-flight latch keyed by the CATALOG id (AU-30 fix, {@link
     // canonicalPullLatchId}) — see that method's doc for why. Progress/
     // cancel stay keyed by `created` on the wire (unchanged, T13 `pullGate.
@@ -474,10 +518,7 @@ export class ProvisionRunner {
   private async resolvePinnedDigest(
     gguf: CatalogGguf,
     sha256: string,
-  ): Promise<
-    | { ok: true; expected: string; allowedRepoFiles: readonly string[] | undefined }
-    | { ok: false; reason: string }
-  > {
+  ): Promise<{ ok: true; expected: string } | { ok: false; reason: string }> {
     const pinnedSpec = pinnedVerifySpec(gguf, sha256);
     if (!pinnedSpec.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
     let verdict: HfDigestVerdict;
@@ -487,7 +528,7 @@ export class ProvisionRunner {
       verdict = { ok: false, reason: 'verify seam rejected' };
     }
     if (!verdict.ok) return { ok: false, reason: NEXT_INTEGRITY_REFUSAL };
-    return { ok: true, expected: sha256, allowedRepoFiles: pinnedSpec.spec.allowedRepoFiles };
+    return { ok: true, expected: sha256 };
   }
 
   /** live-oid core: resolveLfsOid (seam-rejection → refusal). */
@@ -509,11 +550,10 @@ export class ProvisionRunner {
     entry: CatalogModel;
     cell: Extract<CatalogModel['ollama'], { tier: 'hf-ingest' }>;
     sha256: string;
-    allowedRepoFiles: readonly string[] | undefined;
     endpoint: string;
     signal: AbortSignal;
   }): Promise<void> {
-    const { entry, cell, sha256, allowedRepoFiles, endpoint, signal } = args;
+    const { entry, cell, sha256, endpoint, signal } = args;
     // §7.2.2: settled-flag straggler guard around ingestGguf's own
     // await — same discipline as {@link runLibraryPull}; the shared
     // `entry.id`-keyed terminal `done` push lives in the CALLER's
@@ -538,7 +578,6 @@ export class ProvisionRunner {
               quant: cell.gguf.quant,
               sha256,
               approxBytes: cell.gguf.approxBytes,
-              ...(allowedRepoFiles !== undefined ? { allowedRepoFiles } : {}),
             },
             ollamaCreatedName: cell.createdName,
           },
@@ -581,10 +620,11 @@ export class ProvisionRunner {
     // (4c) hf-ingest — exhaustive over VerifySpec, default-REFUSE (SC-A-9).
     switch (cell.verify.mode) {
       case 'pinned': {
-        // EXACT beta.5 vetted order: empty pin → loopback → exact-set verify
-        // → Tier-1 modal → ingest. Every refusal BEFORE the modal.
-        if (cell.verify.sha256 === '') return { ok: false, reason: NEXT_DOWNLOAD_UNAVAILABLE };
-        if (!isLoopbackEndpoint(validated.url)) return { ok: false, reason: NEXT_REMOTE_ENDPOINT_REFUSAL };
+        // EXACT beta.5 vetted order: empty pin → loopback (shared ladder,
+        // WS-F8 F8-4/FI-22) → exact-set verify → Tier-1 modal → ingest.
+        // Every refusal BEFORE the modal.
+        const pre = refusePinnedOllamaPreconditions(cell.verify.sha256, validated.url);
+        if (!pre.ok) return pre;
         const digest = await this.resolvePinnedDigest(cell.gguf, cell.verify.sha256);
         if (!digest.ok) return { ok: false, reason: digest.reason };
         const confirmed = await this.port.showModal(
@@ -596,7 +636,6 @@ export class ProvisionRunner {
           entry,
           cell,
           sha256: digest.expected,
-          allowedRepoFiles: digest.allowedRepoFiles,
           endpoint: validated.url,
           signal,
         });
@@ -621,7 +660,6 @@ export class ProvisionRunner {
           entry,
           cell,
           sha256: digest.expected,
-          allowedRepoFiles: undefined,
           endpoint: validated.url,
           signal,
         });
@@ -820,10 +858,6 @@ function str(params: unknown, key: string): string | undefined {
     return typeof v === 'string' ? v : undefined;
   }
   return undefined;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function isAbortError(err: unknown): boolean {

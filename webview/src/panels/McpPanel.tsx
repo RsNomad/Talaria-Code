@@ -9,7 +9,7 @@
  * server's confirmation / failure is SURFACED inline instead of being dropped by
  * a fire-and-forget invoke. The click is still the confirmation (the host sends
  * `confirm:true`); we only make the RESULT visible. */
-import { useId, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import type {
   McpAddParams,
   McpAddResult,
@@ -32,21 +32,36 @@ import { EmptyPanel, PanelShell } from './PanelShell';
 import { useToggle } from './useToggle';
 
 /** Exported (UI-I1) so `McpPanel.test.ts` can exercise the total lookup
- * directly — this repo's webview tests don't use jsdom. */
-export const STATUS: Record<McpStatus, { tone: PillTone; label: string; icon: string }> = {
-  connected: { tone: 'add', label: 'Connected', icon: 'circle-filled' },
-  disconnected: { tone: 'neutral', label: 'Disconnected', icon: 'circle-outline' },
-};
+ * directly — this repo's webview tests don't use jsdom.
+ *
+ * SY-02: deeply immutable — `Readonly<Record<…>>` blocks reassigning a whole
+ * entry (`STATUS.connected = …`), the inner `Readonly<{…}>` blocks a
+ * per-field write (`STATUS.connected.tone = …`), and the nested
+ * `Object.freeze` calls make both guards hold at RUNTIME too, not just at
+ * the type level — matching this repo's `DEFAULT_ENDPOINTS`
+ * (`src/autocomplete/endpoints.ts`) / `ZERO_RANGE`
+ * (`src/mcp/lsp/tools.ts`)-style "`Readonly<Record<…>>` + `Object.freeze`,
+ * nested `Object.freeze` per object value" idiom for a static lookup table.
+ * `totalLookup`'s `map: Record<K, V>` parameter still accepts this — an
+ * object typed `readonly` is structurally assignable to a mutable-typed
+ * parameter (readonly-ness isn't part of an object type's identity beyond
+ * arrays/tuples), so every read-only consumer compiles unchanged. */
+export const STATUS: Readonly<Record<McpStatus, Readonly<{ tone: PillTone; label: string; icon: string }>>> =
+  Object.freeze({
+    connected: Object.freeze({ tone: 'add', label: 'Connected', icon: 'circle-filled' }),
+    disconnected: Object.freeze({ tone: 'neutral', label: 'Disconnected', icon: 'circle-outline' }),
+  });
 
 /** UI-I1: a server `status` outside the known `McpStatus` enum (a
  * version-skewed or buggy host — `bridge.ts` only checks `.type`) falls back
  * to this instead of `STATUS[bad]` being `undefined` and `.tone` throwing
- * mid-render. */
-export const UNKNOWN_MCP_STATUS: { tone: PillTone; label: string; icon: string } = {
+ * mid-render. SY-02: same deep-immutability posture as {@link STATUS} — see
+ * its doc comment. */
+export const UNKNOWN_MCP_STATUS: Readonly<{ tone: PillTone; label: string; icon: string }> = Object.freeze({
   tone: 'neutral',
   label: 'Unknown',
   icon: 'question',
-};
+});
 
 /**
  * Task A7 (§4.9): one command-line argument per line, trimmed, blank lines
@@ -379,6 +394,22 @@ function AddServerDisclosure({
   const [error, setError] = useState<
     { field: 'name' | 'command' | 'env' | 'secretEnv' | 'url' | 'submit'; text: string } | undefined
   >();
+  const formRef = useRef<HTMLFormElement>(null);
+
+  // UX-03 (🔵 a11y, focus management): the form already marks the SOLE
+  // invalid field via `aria-invalid` (Task 16 above); this effect moves
+  // FOCUS there too, so a keyboard/SR user lands where they must fix instead
+  // of staying stranded on the Submit button. Fires after React commits (so
+  // `aria-invalid="true"` is already in the DOM to query). The async
+  // `'submit'` error (onAdd rejection) marks no field `aria-invalid` -->
+  // `querySelector` returns null --> no focus move, correctly: a
+  // submit-failure names no field to jump to. `error === undefined` covers
+  // both the first render (no autofocus-on-mount) and a successful submit
+  // (`setError(undefined)` right before the async call).
+  useEffect(() => {
+    if (error === undefined) return;
+    formRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+  }, [error]);
 
   const resetFields = () => {
     setName('');
@@ -472,7 +503,7 @@ function AddServerDisclosure({
         <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} className="ml-auto" />
       </button>
       {open && (
-        <form onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
+        <form ref={formRef} onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
           <TextField
             label="Name"
             value={name}

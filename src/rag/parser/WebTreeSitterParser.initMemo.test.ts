@@ -65,8 +65,8 @@ beforeEach(() => {
 
 describe('Parser.init() memo — the DEFAULT is process-wide (characterization, TST-02)', () => {
   it('two instances constructed with NO memo override share ONE Parser.init() call (module-level singleton semantics)', async () => {
-    const a = new WebTreeSitterParser({ grammarsDir: '/fake-grammars' });
-    const b = new WebTreeSitterParser({ grammarsDir: '/fake-grammars' });
+    const a = new WebTreeSitterParser({ grammarsDir: '/fake-grammars', logger: () => {} });
+    const b = new WebTreeSitterParser({ grammarsDir: '/fake-grammars', logger: () => {} });
 
     const first = await a.parse('typescript', 'const a = 1;');
     const second = await b.parse('javascript', 'const b = 2;');

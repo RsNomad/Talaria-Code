@@ -452,6 +452,9 @@ describe('T7 step 4c (pinned fixture pin published): sweep-next via ollama — t
         allowedRepoFiles: NEXT_DEDICATED_MODEL.gguf.allowedRepoFiles,
       },
     ]);
+    // FI-34: ingestGguf never reads gguf.allowedRepoFiles (enforcement is
+    // upstream, in the verifyArgs/verifyHfDigest S-F4 check above) — the spy
+    // bank pins that the field is NOT forwarded into the ingest spec.
     expect(ingestArgs).toEqual([
       {
         spec: {
@@ -461,7 +464,6 @@ describe('T7 step 4c (pinned fixture pin published): sweep-next via ollama — t
             quant: 'Q4_K_M',
             sha256: TEST_PIN,
             approxBytes: 4_680_000_000,
-            allowedRepoFiles: NEXT_DEDICATED_MODEL.gguf.allowedRepoFiles,
           },
           ollamaCreatedName: 'sweep-next-edit-v2-7b:q4_k_m',
         },

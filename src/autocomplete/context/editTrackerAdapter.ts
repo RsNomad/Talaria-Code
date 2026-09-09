@@ -19,6 +19,7 @@
  */
 import * as vscode from 'vscode';
 import { EditTracker, rangesOverlap } from './editTracker';
+import { sliceLines, splitLinesKeepingTerminators } from '../nextedit/formats/shared';
 import { isRecordableScheme } from './recordableScheme';
 import type { EditEvent } from './types';
 
@@ -105,39 +106,10 @@ function toEditEvent(
   };
 }
 
-/**
- * Splits `text` into whole lines, each carrying its own trailing `\n` (the
- * final line carries none when `text` has no trailing newline). Line N of
- * the returned array is exactly the span a `[startLine, endLine]` (0-based,
- * inclusive) range replaces, matching
- * `TextDocumentContentChangeEvent.range`'s convention where BOTH `start`
- * and `end` are expressed in the OLD/pre-change document.
- */
-function splitKeepingNewlines(text: string): string[] {
-  const parts = text.split('\n');
-  const lines: string[] = [];
-  for (let i = 0; i < parts.length - 1; i++) {
-    lines.push(`${parts[i]}\n`);
-  }
-  const last = parts[parts.length - 1];
-  // `text.split('\n')` always yields at least one element, so `last` is
-  // always present; the undefined branch is unreachable (kept for
-  // totality/type safety, not a behavior change).
-  if (last !== undefined && last !== '') {
-    lines.push(last);
-  }
-  return lines;
-}
-
-/** The `[startLine, endLine]` (inclusive) span of `text`, newlines kept. */
-function extractLines(text: string, startLine: number, endLine: number): string {
-  return splitKeepingNewlines(text).slice(startLine, endLine + 1).join('');
-}
-
 /** `text` with its `[startLine, endLine]` (inclusive) span replaced by
  *  `replacement`; lines outside the span pass through unchanged. */
 function replaceLines(text: string, startLine: number, endLine: number, replacement: string): string {
-  const lines = splitKeepingNewlines(text);
+  const lines = splitLinesKeepingTerminators(text);
   const before = lines.slice(0, startLine).join('');
   const after = lines.slice(endLine + 1).join('');
   return `${before}${replacement}${after}`;
@@ -220,8 +192,8 @@ export function createEditTrackerAdapter(): EditTrackerAdapter {
       // the shadow on every intra-line edit. The RING's records stay
       // line-granular: `before`/`after` are both WHOLE-LINE spans of the
       // affected lines; only the splice arithmetic is character-exact.
-      const span = extractLines(shadow, startLine, endLine);
-      const spanLines = splitKeepingNewlines(span);
+      const span = sliceLines(shadow, startLine, endLine);
+      const spanLines = splitLinesKeepingTerminators(span);
       const firstLine = spanLines[0] ?? '';
       const lastLine = spanLines[spanLines.length - 1] ?? '';
       const prefixEnd = Math.min(change.range.start.character, firstLine.length);

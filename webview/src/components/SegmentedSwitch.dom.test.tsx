@@ -50,4 +50,17 @@ describe('SegmentedSwitch (UX-13 / ADR-UX-P2-3)', () => {
     expect(group).toHaveClass('mb-2');
     expect(group).not.toHaveClass('self-start');
   });
+
+  // UX-02 (WCAG 1.4.1 use-of-color): the pressed segment must carry a
+  // non-color cue (border + font-weight), not color alone. Unpressed uses
+  // border-transparent so both states occupy the same box size — no shift.
+  it('gives the pressed segment a border + weight cue, and the unpressed segment border-transparent with no accent border', () => {
+    render(<SegmentedSwitch options={OPTIONS} value="beta" onChange={() => {}} ariaLabel="Widget" />);
+    const pressed = screen.getByRole('button', { name: 'Beta' });
+    const unpressed = screen.getByRole('button', { name: 'Alpha' });
+    expect(pressed).toHaveClass('border-accent');
+    expect(pressed).toHaveClass('font-semibold');
+    expect(unpressed).toHaveClass('border-transparent');
+    expect(unpressed).not.toHaveClass('border-accent');
+  });
 });

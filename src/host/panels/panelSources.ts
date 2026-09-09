@@ -5,6 +5,7 @@ import type {
   SubagentsData,
   CheckpointsData,
 } from '../../shared/protocol';
+import { errorMessage } from '../../shared/errorMessage';
 import type { AcpClientLike, AcpListSessionsRawResult } from '../backend/acp/acpClient';
 import { CheckpointLockTimeoutError } from '../checkpoints/CheckpointTracker';
 import type { ToggleNameCache } from '../dashboard/dashboardPanelSources';
@@ -22,6 +23,7 @@ import {
   reshapeSkillsList,
   reshapeToolsList,
   unwrapConfigFull,
+  unwrapRecord,
   type RawConfigShowResult,
   type RawModelOptionsResult,
   type RawSessionListResult,
@@ -97,7 +99,7 @@ export class ToolsPanelSource implements PanelSource<'tools'> {
 
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'tools'>> {
     const raw = await this.ctx.dispatch('tools.list', params);
-    return { data: reshapeToolsList(raw as RawToolsListResult) };
+    return { data: reshapeToolsList(unwrapRecord(raw, 'tools.list', this.ctx.logger) as RawToolsListResult) };
   }
 }
 
@@ -114,7 +116,9 @@ export class SkillsPanelSource implements PanelSource<'skills'> {
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'skills'>> {
     const dispatchParams = { ...(params as Record<string, unknown> | undefined), action: 'list' };
     const raw = await this.ctx.dispatch('skills.manage', dispatchParams);
-    return { data: reshapeSkillsList(raw as RawSkillsManageListResult) };
+    return {
+      data: reshapeSkillsList(unwrapRecord(raw, 'skills.manage', this.ctx.logger) as RawSkillsManageListResult),
+    };
   }
 }
 
@@ -124,7 +128,7 @@ export class ModelsPanelSource implements PanelSource<'models'> {
 
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'models'>> {
     const raw = await this.ctx.dispatch('model.options', params);
-    return { data: reshapeModelOptions(raw as RawModelOptionsResult) };
+    return { data: reshapeModelOptions(unwrapRecord(raw, 'model.options', this.ctx.logger) as RawModelOptionsResult) };
   }
 }
 
@@ -134,7 +138,7 @@ export class SettingsPanelSource implements PanelSource<'settings'> {
 
   async fetch(params?: unknown): Promise<PanelFetchOutcome<'settings'>> {
     const raw = await this.ctx.dispatch('config.show', params);
-    return { data: reshapeConfigShow(raw as RawConfigShowResult) };
+    return { data: reshapeConfigShow(unwrapRecord(raw, 'config.show', this.ctx.logger) as RawConfigShowResult) };
   }
 }
 
@@ -165,7 +169,10 @@ export class McpPanelSource implements PanelSource<'mcp'>, ToggleNameCache {
     // toggle-name cache and the reshaper read the same unwrapped payload.
     const rawConfig = unwrapConfigFull(config);
     this.knownNames = new Set(Object.keys(rawConfig.mcp_servers ?? {}));
-    const data: McpData = reshapeMcpServers(rawConfig, tools as RawToolsListResult);
+    const data: McpData = reshapeMcpServers(
+      rawConfig,
+      unwrapRecord(tools, 'tools.list', this.ctx.logger) as RawToolsListResult,
+    );
     return { data };
   }
 
@@ -174,16 +181,23 @@ export class McpPanelSource implements PanelSource<'mcp'>, ToggleNameCache {
   }
 }
 
-/** One cwd's independent accumulation/coalescing state (W4-T3b §7 B7). */
+/** One cwd's independent accumulation/coalescing/serialization state (W4-T3b §7 B7). */
 interface SessionsCwdBucket {
   accumulated: SessionSummary[];
   seenIds: Set<string>;
   /** In-flight fetches keyed by cursor (`''` = the cursor-less page-1 fetch). */
   inFlight: Map<string, Promise<PanelFetchOutcome<'sessions'>>>;
+  /**
+   * L2-CA-13: serializes this bucket's page fetches so a different-cursor
+   * fetch started before an earlier one resolves can't race the shared
+   * `accumulated`/`seenIds` mutation — see {@link SessionsPanelSource.fetch}'s
+   * doc for the settled-swallow mechanics (mirrors `ConfigWriteTail`).
+   */
+  chain: Promise<void>;
 }
 
 function newBucket(): SessionsCwdBucket {
-  return { accumulated: [], seenIds: new Set(), inFlight: new Map() };
+  return { accumulated: [], seenIds: new Set(), inFlight: new Map(), chain: Promise.resolve() };
 }
 
 /**
@@ -229,6 +243,27 @@ function newBucket(): SessionsCwdBucket {
  * cursor is COALESCED: a concurrent fetch with the same cursor key returns the
  * in-flight promise instead of issuing a second `listSessions`. This makes
  * "load more" idempotent under overlapping clicks.
+ *
+ * ## Cross-cursor serialization (L2-CA-13)
+ * `inFlight` coalescing above only protects the SAME cursor. Two DIFFERENT
+ * cursors (a cursor-less page-1 load racing a cursored "Load more") are NOT
+ * coalesced — each gets its own {@link fetchPage} run — so without further
+ * care they'd race the shared `accumulated`/`seenIds` mutation: whichever
+ * `listSessions` call settles first mutates the bucket first, corrupting the
+ * final order (or worse, a page-1 reset landing AFTER a "Load more" already
+ * appended would silently wipe it out). `fetch` serializes different-cursor
+ * runs through `bucket.chain`, a promise tail mirroring `ConfigWriteTail`'s
+ * settled-swallow `.then(run, run)` (`host/backend/control/configWriteTail.ts`):
+ * each run is queued as `bucket.chain = bucket.chain.then(run, run)` — the
+ * BOTH-ARMS form means a run that REJECTS still lets the next queued run
+ * fire (the chain is never left in a permanently-rejected state), while the
+ * chained promise this fetch itself hands back and awaits (not the
+ * always-resolves swallow tail) still carries this run's OWN real
+ * resolution/rejection to ITS caller. The same-cursor `inFlight` coalescing
+ * stays layered ON TOP: a coalesced duplicate returns the SAME chained
+ * promise, so it never enqueues a second run on the chain. A fresh cwd
+ * bucket ({@link newBucket}) always starts with its own `Promise.resolve()`
+ * chain, so buckets never share or block on each other's queue.
  */
 export class SessionsPanelSource implements PanelSource<'sessions'> {
   private readonly buckets = new Map<string, SessionsCwdBucket>();
@@ -282,10 +317,26 @@ export class SessionsPanelSource implements PanelSource<'sessions'> {
     const existing = bucket.inFlight.get(key);
     if (existing) return existing;
 
-    const run = this.fetchPage(client, cwd, bucket, cursor);
-    bucket.inFlight.set(key, run);
+    // L2-CA-13: queue THIS run behind the bucket's chain instead of firing
+    // `fetchPage` immediately — a different-cursor run already queued/running
+    // must fully finish (including its `accumulated`/`seenIds` mutation)
+    // before this one's `listSessions` call is even issued. `result` (not
+    // the swallow tail below) is what this call returns/awaits, so a
+    // rejection here still rejects THIS caller with the real error.
+    const run = () => this.fetchPage(client, cwd, bucket, cursor);
+    const result = bucket.chain.then(run, run);
+    // Settled-swallow tail (mirrors `ConfigWriteTail.join`): always resolves
+    // regardless of whether `result` fulfilled or rejected, so ONE failed
+    // fetch can never permanently poison the chain for the next queued one,
+    // and — since a handler is attached here synchronously — `result`
+    // rejecting can never surface as an unhandled rejection either.
+    bucket.chain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    bucket.inFlight.set(key, result);
     try {
-      return await run;
+      return await result;
     } finally {
       bucket.inFlight.delete(key);
     }
@@ -309,7 +360,10 @@ export class SessionsPanelSource implements PanelSource<'sessions'> {
     // TG-5 (AU-51, INV-20): drop any ephemeral one-shot session id
     // (`OneShotRunner`'s `session/new` mints) before it ever enters the
     // accumulated page — see `reshapeSessionsList`'s own doc.
-    const page: SessionsData = reshapeSessionsList(raw as RawSessionListResult, this.ctx.getOneShotSessionIds());
+    const page: SessionsData = reshapeSessionsList(
+      unwrapRecord(raw, 'session/list', this.ctx.logger) as RawSessionListResult,
+      this.ctx.getOneShotSessionIds(),
+    );
 
     for (const session of page.sessions) {
       if (bucket.seenIds.has(session.id)) continue;
@@ -457,8 +511,4 @@ function extractStringField(params: unknown, field: string): string | undefined 
     return typeof value === 'string' ? value : undefined;
   }
   return undefined;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

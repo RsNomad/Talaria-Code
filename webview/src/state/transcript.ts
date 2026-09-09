@@ -10,42 +10,54 @@
  * the P-1 isolation guarantee: a message tagged session B can only ever fold
  * into B's tab, never into A's.
  */
-import type { ApprovalOption, Attachment, HostToWebview, Panel, PanelDataMap, PlanItem, WebviewState } from '../protocol';
-import { MAX_TABS } from '../protocol';
+import type { HostToWebview, PlanItem, ToolStatus } from '../protocol';
 import { foldSetupProgress } from '../panels/setupCards';
 import {
-  DEFAULT_PRESET,
   INITIAL_STATE,
-  makeTabState,
   type ApprovalItem,
   type AppState,
   type PlanStepView,
   type TabState,
   type TranscriptItem,
 } from '../types';
-import {
-  applyPanelTransition,
-  assertExhaustivePanel,
-  reducePanelAction,
-  setPanelSuccess,
-  type PanelAction,
-  type RefreshErrorPanel,
-} from './panels';
-import { success, type RemoteData } from './remoteData';
 import { handleSessionChange, sessionToTab } from './tabs';
+import { isDenyOptionKind } from './approvalOptions';
+import { foldSessionScoped, foldTabScoped } from './scopedFold';
+import { foldPanelData } from './panelScopeFold';
+import { foldHydrate } from './hydrateFold';
+
+export { findOptionId, isDenyOptionKind } from './approvalOptions';
+export { reduceLocal } from './localReducer';
+export type { LocalAction } from './localReducer';
 
 /**
  * CA-M15: hard cap on transcript items per tab. The reducer keeps the last
  * MAX_TRANSCRIPT_ITEMS and records the running drop count in `TabState.
  * hiddenCount`. The active turn's items are always at the tail, so trimming
- * the oldest settled items never orphans an in-flight streaming fold.
+ * the oldest settled items never orphans an in-flight streaming fold — CA-09
+ * (below) makes this a structural guarantee of `capTranscript` itself rather
+ * than an assumption a single oversized turn could violate.
  */
 export const MAX_TRANSCRIPT_ITEMS = 500;
 
 function capTranscript(tab: TabState): TabState {
   const over = tab.transcript.length - MAX_TRANSCRIPT_ITEMS;
   if (over <= 0) return tab;
-  return { ...tab, transcript: tab.transcript.slice(over), hiddenCount: (tab.hiddenCount ?? 0) + over };
+  // CA-09: SOFT, turn-aware — never trim the active turn (its items are provably at
+  // the tail, and trimming its earlier items orphans in-flight folds / duplicates
+  // `messageId`). Trim only OLDER-turn items from the front, up to `over`.
+  const activeTurnId = tab.transcript[tab.transcript.length - 1]?.turnId;
+  const kept: TranscriptItem[] = [];
+  let trimmed = 0;
+  for (const item of tab.transcript) {
+    if (trimmed < over && item.turnId !== activeTurnId) {
+      trimmed++;
+      continue;
+    }
+    kept.push(item);
+  }
+  if (trimmed === 0) return tab;
+  return { ...tab, transcript: kept, hiddenCount: (tab.hiddenCount ?? 0) + trimmed };
 }
 
 /**
@@ -125,13 +137,35 @@ function settleOpenItems(list: TranscriptItem[]): TranscriptItem[] {
 }
 
 /**
- * T-A1 (V-7): the first option of the given kind, or undefined if the
- * approval carries none (never fabricated). Mirrors the host's own
- * `findOptionId` (`SessionController.ts`) so the webview's optimistic
- * reject-fold denies via the SAME option the host itself would pick.
+ * BH-05 (Q2 / ADR-R2-15): the synthetic edit-approval tool card's derived
+ * STATUS for an `approval.settle` echo. Pure translation of the settle
+ * outcome (+ the sibling approval item's chosen option, for `'selected'`) —
+ * the `approval.settle` fold below applies this ONLY while the matching tool
+ * item is still `'pending'` (never `running`/`done`/`failed`).
  */
-function findOptionId(options: ApprovalOption[], kind: ApprovalOption['kind']): string | undefined {
-  return options.find((option) => option.kind === kind)?.id;
+function deriveSettledToolStatus(
+  msg: Extract<HostToWebview, { type: 'approval.settle' }>,
+  approvalItem: ApprovalItem | undefined,
+): ToolStatus | undefined {
+  switch (msg.outcome) {
+    case 'cancelled':
+    case 'superseded':
+      return 'interrupted';
+    case 'expired':
+      return 'denied';
+    case 'selected': {
+      const chosenKind = approvalItem?.options.find((o) => o.id === msg.optionId)?.kind;
+      return isDenyOptionKind(chosenKind) ? 'denied' : 'approved';
+    }
+    // no default: the switch above covers all 4 members of `msg.outcome`
+    // ('selected'|'cancelled'|'expired'|'superseded'), so every case DOES
+    // return. This is a manual invariant, not one tsc verifies — the
+    // function's declared return type is `ToolStatus | undefined`, so a
+    // missing case would NOT be flagged by tsc; it would just fall through
+    // and return `undefined` here. The caller already handles that
+    // `undefined` (the settle fold below no-ops when this returns it), so
+    // an unnoticed gap would degrade safely rather than break the build.
+  }
 }
 
 /** Every session-scoped {@link HostToWebview} variant `foldTab` folds — i.e.
@@ -224,21 +258,54 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
         ],
       };
 
-    case 'reasoning.delta':
-      return {
-        ...tab,
-        transcript: tab.transcript.map((i) =>
-          i.kind === 'reasoning' && i.blockId === msg.blockId ? { ...i, text: i.text + msg.text } : i,
-        ),
-      };
+    case 'reasoning.delta': {
+      // L2-CA-07: mirrors `message.delta`'s tail-first splice below EXACTLY
+      // (same idiom, same fallback shape) — the open reasoning block is
+      // provably the LAST element in the normal flow for the identical
+      // reason `message.delta`'s open message is: any interleaving item
+      // (a new reasoning/tool/approval/plan block) opens fresh at the tail.
+      // Tail check first (O(1) common case); reverse-scan kept as the rare
+      // fallback (a reasoning block that is not last) so the result is
+      // provably identical to the old full `.map`.
+      const lastIndex = tab.transcript.length - 1;
+      const last = tab.transcript[lastIndex];
+      const matchLast = last !== undefined && last.kind === 'reasoning' && last.blockId === msg.blockId;
+      const match = matchLast
+        ? last
+        : [...tab.transcript].reverse().find((i) => i.kind === 'reasoning' && i.blockId === msg.blockId);
+      if (match && match.kind === 'reasoning') {
+        // Targeted splice: copy the array once, replace only the matched
+        // index — no per-element `.map` callback. Unchanged items keep their
+        // references (slice copies references), exactly like the old
+        // `.map(i => i === match ? {...} : i)`.
+        const idx = matchLast ? lastIndex : tab.transcript.indexOf(match);
+        const next = tab.transcript.slice();
+        next[idx] = { ...match, text: match.text + msg.text };
+        return { ...tab, transcript: next };
+      }
+      // No match (a missing reasoning block is not a normal flow —
+      // `reasoning.start` always creates it) — identity, mirroring the old
+      // `.map`'s no-op transform when nothing matched.
+      return { ...tab, transcript: tab.transcript };
+    }
 
-    case 'reasoning.end':
-      return {
-        ...tab,
-        transcript: tab.transcript.map((i) =>
-          i.kind === 'reasoning' && i.blockId === msg.blockId ? { ...i, streaming: false } : i,
-        ),
-      };
+    case 'reasoning.end': {
+      // L2-CA-07: identical to `reasoning.delta` above except the
+      // replacement settles `streaming: false` instead of appending text.
+      const lastIndex = tab.transcript.length - 1;
+      const last = tab.transcript[lastIndex];
+      const matchLast = last !== undefined && last.kind === 'reasoning' && last.blockId === msg.blockId;
+      const match = matchLast
+        ? last
+        : [...tab.transcript].reverse().find((i) => i.kind === 'reasoning' && i.blockId === msg.blockId);
+      if (match && match.kind === 'reasoning') {
+        const idx = matchLast ? lastIndex : tab.transcript.indexOf(match);
+        const next = tab.transcript.slice();
+        next[idx] = { ...match, streaming: false };
+        return { ...tab, transcript: next };
+      }
+      return { ...tab, transcript: tab.transcript };
+    }
 
     case 'message.delta': {
       // CA-09: the open streaming message is provably the LAST element in the
@@ -307,7 +374,13 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       };
     }
 
-    case 'tool.start':
+    case 'tool.start': {
+      // BH-05: create-if-absent. A tool item for this toolId already exists →
+      // no-op (the synthetic edit-approval card must never double-insert /
+      // dup its React key).
+      if (tab.transcript.some((i) => i.kind === 'tool' && i.toolId === msg.toolId)) {
+        return tab;
+      }
       return {
         ...tab,
         transcript: [
@@ -326,6 +399,7 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
           },
         ],
       };
+    }
 
     case 'tool.update':
       return {
@@ -379,12 +453,21 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
         ],
       };
 
-    case 'approval.settle':
+    case 'approval.settle': {
       // V-5/V-6/V-7: the authoritative host settlement — OVERWRITES any
       // optimistic value unconditionally (ARCH-1: optimistic can never
       // override authoritative). Also locks the settled approval's tool
       // hunks (M3-b) so a still-unresolved sibling hunk (e.g. a 60s auto-deny
       // that fired with zero user clicks) is never left looking live.
+      //
+      // BH-05 (Q2 / ADR-R2-15): ALSO derives the matching tool item's own
+      // `status` (Approved/Denied/Interrupted) for the synthetic
+      // edit-approval card — but ONLY while that tool item is still
+      // `'pending'` (never touches `running`/`done`/`failed`). Computed once,
+      // up front, since it needs the sibling approval item's `options` to
+      // resolve the chosen option's kind for the `'selected'` case.
+      const approvalItem = tab.transcript.find((i): i is ApprovalItem => i.kind === 'approval' && i.id === msg.id);
+      const settledToolStatus = deriveSettledToolStatus(msg, approvalItem);
       return {
         ...tab,
         transcript: tab.transcript.map((item) => {
@@ -403,16 +486,23 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
             };
           }
           if (item.kind === 'tool' && msg.toolId !== undefined && item.toolId === msg.toolId) {
-            return { ...item, hunksLocked: true };
+            const status = item.status === 'pending' && settledToolStatus !== undefined ? settledToolStatus : item.status;
+            return { ...item, hunksLocked: true, status };
           }
           return item;
         }),
       };
+    }
 
     case 'plan.update': {
-      const exists = tab.transcript.some((i) => i.kind === 'plan');
+      // CA-10 (OD-3): one plan card PER TURN. The predicate is scoped to
+      // `msg.turnId` so a later turn's update APPENDS its own card instead of
+      // rebinding whichever turn's card `some`/`map` found first — the old
+      // turn-blind predicate let turn 3's plan.update rewrite the card still
+      // sitting in turn 1's transcript position.
+      const exists = tab.transcript.some((i) => i.kind === 'plan' && i.turnId === msg.turnId);
       const transcript = exists
-        ? tab.transcript.map((i) => (i.kind === 'plan' ? { ...i, items: msg.items } : i))
+        ? tab.transcript.map((i) => (i.kind === 'plan' && i.turnId === msg.turnId ? { ...i, items: msg.items } : i))
         : [...closeOpenMessages(tab.transcript), { kind: 'plan' as const, turnId: msg.turnId, items: msg.items }];
       return { ...tab, plan: msg.items, transcript };
     }
@@ -455,48 +545,6 @@ function foldTab(tab: TabState, msg: TranscriptFoldMessage): TabState {
       return exhaustive;
     }
   }
-}
-
-/** Resolve `sessionId` to a known tab and fold `updater` into it; DROP
- * (dev-log, unchanged state) when the session is not registered to any tab —
- * the P-1 isolation guarantee. Never `!`/`as` past the missing-tab case. */
-function foldSessionScoped(
-  state: AppState,
-  sessionId: string,
-  msgType: string,
-  updater: (tab: TabState) => TabState,
-): AppState {
-  const tabId = sessionToTab(state.tabs)[sessionId];
-  if (!tabId) {
-    console.warn(`transcript: dropping "${msgType}" for unknown session "${sessionId}"`);
-    return state;
-  }
-  const tab = state.tabs[tabId];
-  if (!tab) {
-    // sessionToTab resolves via the tab OBJECT's own `.tabId` field, not the
-    // map key it happens to be stored under — this second guard is the one
-    // that actually protects the invariant if those ever diverge (defensive;
-    // never `!`/`as` past a missing tab, symmetric with foldTabScoped below).
-    console.warn(`transcript: dropping "${msgType}" for session "${sessionId}" — resolved tabId "${tabId}" is not a live tab`);
-    return state;
-  }
-  return { ...state, tabs: { ...state.tabs, [tabId]: updater(tab) } };
-}
-
-/** Resolve a tabId directly (tab-lifecycle messages that already name their
- * target) and fold `updater` into it; drop-unknown otherwise. */
-function foldTabScoped(
-  state: AppState,
-  tabId: string,
-  msgType: string,
-  updater: (tab: TabState) => TabState,
-): AppState {
-  const tab = state.tabs[tabId];
-  if (!tab) {
-    console.warn(`transcript: dropping "${msgType}" for unknown tab "${tabId}"`);
-    return state;
-  }
-  return { ...state, tabs: { ...state.tabs, [tabId]: updater(tab) } };
 }
 
 /**
@@ -574,262 +622,6 @@ function foldTurnStart(state: AppState, msg: Extract<HostToWebview, { type: 'tur
     activeTabId: result.activeTabId,
     closeIntents,
     nextChatNumber,
-  };
-}
-
-/** `panel.data` routes by scope key (§2f): subagents -> the owning tab;
- * checkpoints -> `rootPanels[rootId]`; sessions -> the shared
- * `sessionsPanel`; everything else -> `globalPanels`.
- *
- * P7-N4 (ARCH I-1): every `DataPanel` is named explicitly — no bare
- * `default:`. The old `default: -> globalPanels` fallthrough would have
- * silently routed a FUTURE session/root/cwd-scoped panel to `globalPanels`
- * too (the exact cross-tab bleed `PANEL_SCOPE` exists to prevent);
- * `assertExhaustivePanel` (`./panels`) now closes the switch, so an
- * unhandled `DataPanel` is a `npm run typecheck -w webview` failure, not a
- * silent global write. See `panels.test.ts` for the non-vacuous proof. */
-function foldPanelData(state: AppState, msg: Extract<HostToWebview, { type: 'panel.data' }>): AppState {
-  // Switch on the ALIASED discriminant (not `msg.panel` directly): `panel`
-  // IS the tag `PanelDataMessage`'s union is keyed on, so exhausting it
-  // narrows `msg` itself to `never` inside `default` — leaving no `.panel`
-  // to read there. Assigning it to a local first keeps `msg` independently
-  // narrowed per case (TS's aliased-discriminant control-flow analysis)
-  // while giving the `default:` branch an actual panel value to report.
-  const panel = msg.panel;
-  switch (panel) {
-    case 'subagents':
-      // AU-61: the SAME fold step that lands the fresh success also clears
-      // this tab's own standing refresh-failure signal — error is
-      // scopeKey(tabId)-routed (reducePanelActionScoped), success here is
-      // sessionId-routed (foldSessionScoped), both land on the same
-      // TabState, so a single updater keeps them lockstep.
-      // exactOptional prep (arm 1): clear subagentsRefreshError by omitting
-      // the key, never by writing an explicit `undefined`.
-      return foldSessionScoped(state, msg.sessionId, 'panel.data:subagents', (tab) => {
-        const { subagentsRefreshError: _clearedSubagentsRefreshError, ...rest } = tab;
-        return { ...rest, subagents: success(msg.data) };
-      });
-    case 'checkpoints': {
-      const rootPanels = { ...state.rootPanels, [msg.rootId]: success(msg.data) };
-      // AU-61: a fresh success push is one of the two ways THIS root's
-      // checkpointsRefreshError entry clears (the other is a user dismiss).
-      // No-op (same `state.checkpointsRefreshError` reference) when nothing
-      // was set, mirroring the global-5 case below (:559-567) — a root that
-      // never had a background-refresh failure never grows a spurious empty
-      // entry.
-      if (!state.checkpointsRefreshError?.[msg.rootId]) return { ...state, rootPanels };
-      const checkpointsRefreshError = { ...state.checkpointsRefreshError };
-      delete checkpointsRefreshError[msg.rootId];
-      return { ...state, rootPanels, checkpointsRefreshError };
-    }
-    case 'sessions': {
-      const sessionsPanel = success(msg.data);
-      // AU-61: same no-op-when-unset posture as checkpoints above.
-      if (!state.sessionsRefreshError) return { ...state, sessionsPanel };
-      // exactOptional prep (arm 1): clear sessionsRefreshError by omitting
-      // the key, never by writing an explicit `undefined`.
-      const { sessionsRefreshError: _clearedSessionsRefreshError, ...rest } = state;
-      return { ...rest, sessionsPanel };
-    }
-    // TI-3 (AU-42 Part B, scope decision): 'setup' stays on the plain path —
-    // see `RefreshErrorPanel`'s doc (state/panels.ts) for why it carries no
-    // `refreshError` side-map entry to clear here.
-    case 'setup':
-      return { ...state, globalPanels: setPanelSuccess(state.globalPanels, msg.panel, msg.data) };
-    case 'tools':
-    case 'mcp':
-    case 'skills':
-    case 'models':
-    case 'settings': {
-      const globalPanels = setPanelSuccess(state.globalPanels, msg.panel, msg.data);
-      // TI-3 (AU-42 Part B): a fresh success push is one of the two ways a
-      // panel's `refreshError` clears (the other is a user dismiss — see
-      // `local.refreshError.dismiss` below). No-op (same `state.refreshError`
-      // reference) when nothing was set, so a panel that never had a
-      // background-refresh failure never grows a spurious empty entry.
-      if (!state.refreshError?.[msg.panel]) return { ...state, globalPanels };
-      const refreshError = { ...state.refreshError };
-      delete refreshError[msg.panel];
-      return { ...state, globalPanels, refreshError };
-    }
-    default:
-      return assertExhaustivePanel(panel);
-  }
-}
-
-/**
- * W6-FF (3-way ARCH I-1): rebuild the ENTIRE tab model from `seed.tabs` — the
- * live host-side session list `hydrate` now carries whenever
- * `AcpBackend.listTabs()`'s registry is non-empty. VS Code's
- * `retainContextWhenHidden` is documented BEST-EFFORT
- * (`TalariaViewProvider.ts`): a memory-pressure dispose+recreate tears down
- * this webview instance and mounts a fresh one at `INITIAL_STATE` (one
- * unbound bootstrap tab) while N host `SessionController`s are still alive.
- * Without this, `sessionToTab` never learns about them and every subsequent
- * stream for them hits `foldSessionScoped`'s drop-unknown path — the orphan
- * this closes.
- *
- * NOT a parallel routing path: each seed entry is folded with the exact
- * bind shape `tab.bound`'s own fold uses (sessionId/binding/rootId on a
- * named tab, `foldTabScoped`'s posture) — so the moment this returns,
- * `sessionToTab` (every OTHER session-scoped message's FIRST step, via
- * `foldSessionScoped`) resolves every seed session to its real tab. P-1
- * isolation is therefore intact by construction: a later update for session
- * B still resolves through the SAME `sessionToTab` map this function wrote,
- * so it can only ever land on B's tab.
- *
- * A session already bound to a tab in the CURRENT (pre-hydrate) state keeps
- * that tab's live transcript/panels — only its rootId/binding are refreshed
- * (defensive: only reachable if `hydrate` fires twice on one still-live
- * webview instance, never the re-create case, which always starts from
- * `INITIAL_STATE`). Any local tab the seed doesn't name (the stale bootstrap
- * placeholder, on the common re-create path) is dropped — it owns no live
- * host session, so there is nothing to leak (mirrors `tabs.ts`'s own
- * "genuinely unbound tab dropped silently" posture, §7 B9(c)).
- *
- * H4-B8 (arch report Minor-2 — closes the accepted gap noted above): the
- * seed triple (+rootId) ALSO carries each tab's OWN
- * preset/currentModelId/activeModeId/availableCommands — sourced from that
- * SAME session's `SessionController` (`getPreset()`/`currentModelId`/
- * `activeCustomModeId`/`getAvailableCommands()`), the exact fields
- * `policy.state`/`mode.state`/`commands.available`/the model push already
- * emit for it. This is NOT a new source of truth, just exposing those
- * SAME host-owned values at hydrate time so a reconciled NON-active tab
- * shows its real display state immediately instead of `makeTabState`
- * defaults while it waits for its own next push (which, for a background
- * tab, may not come for a long time). Each seed entry's values populate
- * ONLY that entry's own tab (P-1) — an absent field falls back to
- * `makeTabState`'s own default for that field, mirroring the legacy
- * single-tab `foldHydrate` path below. `title` is deliberately untouched
- * here (paired backlog M7, carried out of this task).
- */
-function foldHydrateReconcile(state: AppState, seed: WebviewState): AppState {
-  const seedTabs = seed.tabs ?? [];
-  const priorTabForSession = sessionToTab(state.tabs);
-  const tabs: Record<string, TabState> = {};
-  const tabOrder: string[] = [];
-
-  seedTabs.forEach((entry, index) => {
-    const priorTabId = priorTabForSession[entry.sessionId];
-    const rawBase =
-      (priorTabId ? state.tabs[priorTabId] : undefined) ??
-      state.tabs[entry.tabId] ??
-      makeTabState(entry.tabId, state.restoredTitles?.[entry.tabId] ?? `Chat ${index + 1}`);
-    // UX-04a (261faba lesson, mirrors `stopPending: false` below): unlike
-    // `stopPending` (a real boolean), `newSessionPending` is exactOptional
-    // (`?: true`) — cleared by KEY OMISSION so a second hydrate on a
-    // still-live webview can never leak a stale "Starting a new session…"
-    // through `...base` (its own `tab.bound`/`tab.error` terminal already
-    // resolved it if that flow completed; if it hasn't yet, this very
-    // reconcile IS the fresh bind, so the flag is moot either way).
-    const { newSessionPending: _clearedNewSessionPending, ...base } = rawBase;
-    tabs[entry.tabId] = {
-      ...base,
-      tabId: entry.tabId,
-      sessionId: entry.sessionId,
-      binding: 'bound',
-      rootId: entry.rootId,
-      preset: entry.preset ?? DEFAULT_PRESET,
-      currentModelId: entry.currentModelId ?? null,
-      activeModeId: entry.activeModeId ?? null,
-      availableCommands: entry.availableCommands ?? [],
-      // A5 (T-1 V-12 seed fold-in): this tab's OWN live-turn status —
-      // absent falls back to makeTabState's `false` default, same posture
-      // as every other optional display field above.
-      turnActive: entry.turnActive ?? false,
-      // T10 Opus review fix: `stopPending` is deliberately NOT hydrate-carried
-      // (no `HydrateTabSeed.stopPending` field exists) — reset it here
-      // structurally, symmetric with `turnActive` above, so `...base` can
-      // never leak a still-live tab's in-flight-Stop flag through a second
-      // hydrate on a still-live webview (its `turn.end` already landed
-      // `turnActive: false` via the fold above; without this line
-      // `stopPending: true` alone would ride `...base` and paint a
-      // "Stopping…" that outlives its turn).
-      stopPending: false,
-      // AUDIT-5 UI M-2: a LIVE draft on `base` (already spread in above) always
-      // wins — `restoredDrafts` only fills a freshly-minted `makeTabState` base
-      // (draft: ''), giving an unsent Composer draft back after a
-      // memory-pressure webview dispose+recreate. Never restores
-      // `draftAttachments` (see `persist.ts`).
-      draft: base.draft || state.restoredDrafts?.[entry.tabId] || '',
-    };
-    tabOrder.push(entry.tabId);
-  });
-
-  const firstTabId = tabOrder[0];
-  const activeTabId =
-    firstTabId === undefined ? state.activeTabId : tabOrder.includes(state.activeTabId) ? state.activeTabId : firstTabId;
-
-  // H1-A1 + D1 (M7): a subsequent `tab.open`'s `nextChatNumber` must not
-  // collide with a reconciled `Chat N` title, so seed it to a safe monotonic
-  // continuation past the reconciled set. D1 widens this to `Math.max` with
-  // `state.nextChatNumber` (already on `state` via `createInitialState`'s
-  // restore, when `getState()` persisted one before this recreate) — a
-  // restored counter is NEVER rolled back below the reconciled set, so a
-  // post-recreate mint can never collide with a restored `Chat N` title
-  // either (the pure `tabOrder.length + 1` floor alone only protects against
-  // the freshly-generated fallback titles, not a HIGHER restored counter).
-  const nextChatNumber = Math.max(state.nextChatNumber, tabOrder.length + 1);
-
-  return {
-    ...state,
-    theme: seed.theme,
-    backendKind: seed.backendKind,
-    activePanel: seed.activePanel,
-    tabs,
-    tabOrder,
-    activeTabId,
-    nextChatNumber,
-  };
-}
-
-/** `hydrate` rehydrates the ACTIVE tab's per-tab scalars (sessionId, preset,
- * modelId, availableCommands) — NOT transcripts (R-C4's honest single-session
- * stance kept). P3: a `null`/absent seed for sessionId/currentModelId/
- * availableCommands means "no information — keep the live value" (the host
- * keeps no persisted transcript-adjacent value to send today); a real seed
- * IS information and wins. W6-FE Part 1 (3-way ARCH I-3b): `availableCommands`
- * moved here from App.tsx's old GLOBAL `useState` — now folded onto the
- * ACTIVE tab exactly like `preset`/`currentModelId`, closing the same
- * cross-tab-clobber class this task's `commands.available` fix closes.
- *
- * W6-FF (3-way ARCH I-1): a NON-EMPTY `seed.tabs` means the host registry has
- * live sessions to reconcile (the webview re-create case) — delegates to
- * {@link foldHydrateReconcile} instead of this single-active-tab scalar
- * fold. An absent/empty `seed.tabs` (genuine cold boot, or a backend with no
- * multi-tab registry) leaves this legacy path — and every existing R-C4/P3
- * guarantee it makes — completely unchanged. */
-function foldHydrate(state: AppState, s: HostToWebview & { type: 'hydrate' }): AppState {
-  const seed = s.state;
-  if (seed.tabs && seed.tabs.length > 0) {
-    return foldHydrateReconcile(state, seed);
-  }
-  const activeTab = state.tabs[state.activeTabId];
-  if (!activeTab) {
-    console.warn(`transcript: hydrate — unknown active tab "${state.activeTabId}"`);
-    return { ...state, theme: seed.theme, backendKind: seed.backendKind, activePanel: seed.activePanel };
-  }
-  return {
-    ...state,
-    theme: seed.theme,
-    backendKind: seed.backendKind,
-    activePanel: seed.activePanel,
-    tabs: {
-      ...state.tabs,
-      [state.activeTabId]: {
-        ...activeTab,
-        currentModelId: seed.currentModelId ?? activeTab.currentModelId,
-        preset: seed.preset,
-        availableCommands: seed.availableCommands ?? activeTab.availableCommands,
-        // exactOptional prep (arm 1): only overwrite `sessionId` when the
-        // seed actually carries one (`WebviewState.sessionId` is `string |
-        // null`, never absent — `null` means "no information", per this
-        // function's own doc) — when it's `null`, `...activeTab` above
-        // already preserves the existing value (present or absent) exactly
-        // as the old `seed.sessionId ?? activeTab.sessionId` fallback did.
-        ...(seed.sessionId !== null ? { sessionId: seed.sessionId } : {}),
-      },
-    },
   };
 }
 
@@ -1144,90 +936,6 @@ function assertReduceHandlesEveryRoutedMessage(
 // whose entire value is compile-time-only.
 void assertReduceHandlesEveryRoutedMessage;
 
-/** Local UI-only mutations that never leave the webview (optimistic updates). */
-export type LocalAction =
-  // P7-N2N5 (ARCH I-2, the webview-half of the ambient-active-tab class the
-  // host side was already forbidden from using): EXPLICIT `tabId`, captured
-  // by the caller at dispatch time — never re-resolved from ambient
-  // `state.activeTabId` at fold time. A host message (e.g. `turn.start`
-  // adopting a new session) can move `activeTabId` between an optimistic
-  // dispatch and its fold; folding via `foldTabScoped` (below) means the
-  // change always lands on the tab the user actually acted on, never
-  // whichever tab happens to be active when the reducer runs.
-  | { type: 'local.approvalResolved'; tabId: string; id: string; optionId: string }
-  | { type: 'local.diffResolved'; tabId: string; toolId: string; hunkIndex: number; action: 'accept' | 'reject' }
-  | { type: 'local.setPanel'; panel: Panel }
-  | { type: 'local.setModel'; tabId: string; modelId: string }
-  | { type: 'local.dismissError'; tabId: string }
-  | { type: 'local.dismissSystemError' }
-  // W4 §2e (Deliverable 5): the tab strip's local half — the CALLER pairs
-  // each with the matching WebviewToHost post (`tab.open`/`tab.close`);
-  // this reducer never posts anything itself.
-  | { type: 'local.tab.open'; tabId: string }
-  | { type: 'local.tab.select'; tabId: string }
-  | { type: 'local.tab.close'; tabId: string }
-  // §7 B9(c): clears the queue once the caller has posted `tab.close` for
-  // every entry `handleSessionChange`'s dedup produced.
-  | { type: 'local.closeIntentsDrained' }
-  // P7-N1 (Critical wrong-session-send fix, ARCH S-1): the per-tab composer
-  // draft, lifted out of `Composer`'s component-local `useState` into
-  // `TabState`. Each carries an EXPLICIT `tabId` captured by the caller at
-  // dispatch time (never re-resolved from ambient `activeTabId` at fold
-  // time — these were the FIRST N2-pattern LocalActions; P7-N2N5 above
-  // migrated the remaining ambient-active ones to the same shape), folded
-  // via the same `foldTabScoped` drop-unknown discipline every tab-lifecycle
-  // message uses, so a draft action for tab X can only ever touch tab X, P-1).
-  | { type: 'local.draft.set'; tabId: string; text: string }
-  | { type: 'local.draft.attach.add'; tabId: string; attachment: Attachment }
-  | { type: 'local.draft.attach.remove'; tabId: string; attachmentId: string }
-  | { type: 'local.draft.clear'; tabId: string }
-  // TI-1 (AU-39): the History row's committed load — dispatched by
-  // `useHostActions.loadSession` the moment it posts `tab.load` (never on
-  // just opening the live-turn confirm strip). See `AppState
-  // .pendingSessionLoad`'s own doc for the clearing half (the `tab.bound`/
-  // `tab.error` cases below).
-  | { type: 'local.sessionLoad.start'; tabId: string; sessionId: string }
-  // UX-04b: the webview-side watchdog's own fallback timeout — DEFENSE IN
-  // DEPTH over WS-R4's host-side `SESSION_ESTABLISH_DEADLINE_MS` (120s):
-  // this fires (`useSessionLoadWatchdog`, `hooks/useSessionLoadWatchdog.ts`)
-  // only when NO host terminal (`tab.bound`/`tab.error`) ever arrives for
-  // the pending load at all. Carries no `tabId` — the hook is armed against
-  // the CURRENT `pendingSessionLoad` snapshot already, so there is nothing
-  // left to match; the fold below clears it unconditionally, same as
-  // `local.dismissSystemError`'s single-slot clear just below.
-  | { type: 'local.sessionLoad.timeout' }
-  // TI-3 (AU-42 Part B): dismisses one panel's `refreshError` banner — the
-  // OTHER way it clears besides that panel's next success push (see
-  // `AppState.refreshError`'s own doc). `panel` is scoped to
-  // {@link RefreshErrorPanel}, never a bare `DataPanel` — a dismiss for a
-  // panel outside this task's scope (e.g. `'setup'`) would be meaningless
-  // (no entry to clear) and this keeps that a compile-time impossibility.
-  | { type: 'local.refreshError.dismiss'; panel: RefreshErrorPanel }
-  // AU-61: dismisses ONE of the three re-scoped panels' own refreshError
-  // signal (`AppState.sessionsRefreshError` / `.checkpointsRefreshError` /
-  // `TabState.subagentsRefreshError`) — the scoped counterpart to
-  // `local.refreshError.dismiss` above. A SEPARATE action, not a reuse of
-  // that one, because it is TYPE-MANDATORY (Critic-1): `RefreshErrorPanel`
-  // is `Exclude<GlobalPanel,'setup'>` and `GlobalPanel` derives from
-  // `PANEL_SCOPE` (`protocol.ts`), where subagents/checkpoints/sessions are
-  // 'session'/'root'/'cwd'-scoped, NOT members of `GlobalPanel` — they
-  // cannot type-check as a `RefreshErrorPanel`. `target` carries each
-  // scope's own key shape (none for sessions' single slot, `rootId` for
-  // checkpoints, `tabId` for subagents) so a dismiss for the wrong shape is
-  // a compile-time impossibility, same discipline `scopeKey` uses on the
-  // fetch side (B6).
-  | {
-      type: 'local.scopedRefreshError.dismiss';
-      target: { panel: 'sessions' } | { panel: 'checkpoints'; rootId: string } | { panel: 'subagents'; tabId: string };
-    }
-  // UX-03: Stop clicked — paired by the caller with the 'cancel' post (this reducer never posts).
-  | { type: 'local.stopPending'; tabId: string }
-  // UX-04a: New Session clicked — paired by the caller (App.newSession) with
-  // the 'tab.newSession' post that follows (this reducer never posts).
-  | { type: 'local.newSessionPending'; tabId: string }
-  // Part X2: a panel's own loading/error transitions (fed by fetchPanel).
-  | PanelAction;
-
 /**
  * TI-1 (AU-39): clears `AppState.pendingSessionLoad` once the load it
  * tracks has resolved — called from BOTH the `tab.bound` and `tab.error`
@@ -1247,352 +955,6 @@ function clearResolvedSessionLoad(next: AppState, tabId: string): AppState {
   // key, never by writing an explicit `undefined`.
   const { pendingSessionLoad: _clearedPendingSessionLoad, ...rest } = next;
   return rest;
-}
-
-/** Route a scoped-panel loading/error transition (Part X2 no-flash rule) to
- * its real scope (§2f/§7 B6): subagents -> the tab named by `action.scopeKey`
- * (drop-unknown if it no longer exists — nothing reads a removed tab's slice
- * anyway); checkpoints -> `rootPanels[action.scopeKey]` (the ROOT captured at
- * fetch-issue time, NOT re-derived from whichever tab is active now — a
- * same-root sibling tab must keep seeing this transition even if the tab
- * that ISSUED the fetch has since closed); sessions -> the shared slot;
- * else -> globalPanels. `action.scopeKey` is fixed at issue time by
- * `fetchPanel`'s caller (`App.tsx`), never re-resolved here — this is the
- * fetch-side half of B6 (the push side is already scope-keyed by T3a).
- *
- * P7-N4 (ARCH I-1): every `DataPanel` is named explicitly — no bare
- * `default:`; see `foldPanelData`'s doc above (identical rationale) and
- * `panels.test.ts` for the non-vacuous `assertExhaustivePanel` proof. */
-function reducePanelActionScoped(state: AppState, action: PanelAction): AppState {
-  switch (action.panel) {
-    case 'subagents': {
-      const tabId = action.scopeKey;
-      if (!tabId) {
-        console.warn('transcript: dropping subagents panel action with no scopeKey');
-        return state;
-      }
-      const tab = state.tabs[tabId];
-      if (!tab) {
-        console.warn(`transcript: dropping subagents panel action for unknown tab "${tabId}"`);
-        return state;
-      }
-      // AU-61: captured BEFORE the fold below — the same pre-fold `wasSuccess`
-      // capture the global-5 case makes below (this function, the
-      // tools/mcp/skills/models/settings case) — tells whether this tab's
-      // subagents were already `success` (a background refresh) as opposed
-      // to a first load (idle/loading/error), which never writes the signal
-      // (AU-10: a first-load failure gets the visible error card instead).
-      const wasSuccess = tab.subagents.status === 'success';
-      const subagents = applyPanelTransition(tab.subagents, action);
-      if (action.type === 'local.panelError' && wasSuccess) {
-        return { ...state, tabs: { ...state.tabs, [tabId]: { ...tab, subagents, subagentsRefreshError: action.message } } };
-      }
-      // CF-10: an honest empty landing (unbound-tab short-circuit) also
-      // retires a standing signal — a stale "couldn't refresh" banner over a
-      // fresh empty SUCCESS would lie (see `PanelAction.emptyData`'s doc).
-      if (action.type === 'local.panelLoading' && action.emptyData !== undefined) {
-        // exactOptional prep (arm 1): clear subagentsRefreshError by
-        // omitting the key, never by writing an explicit `undefined`.
-        const { subagentsRefreshError: _clearedSubagentsRefreshError, ...tabRest } = tab;
-        return { ...state, tabs: { ...state.tabs, [tabId]: { ...tabRest, subagents } } };
-      }
-      // A plain `local.panelLoading` (background refetch in flight) does NOT
-      // clear a standing signal — it survives until success or dismiss,
-      // byte-consistent with the global-5 case's early return below.
-      return { ...state, tabs: { ...state.tabs, [tabId]: { ...tab, subagents } } };
-    }
-    case 'checkpoints': {
-      const rootId = action.scopeKey ?? '';
-      const current: RemoteData<PanelDataMap['checkpoints']> = state.rootPanels[rootId] ?? { status: 'idle' };
-      // AU-61: same pre-fold `wasSuccess` capture as the subagents/global-5
-      // cases — see that case's doc.
-      const wasSuccess = current.status === 'success';
-      const next = applyPanelTransition(current, action);
-      if (action.type === 'local.panelError' && wasSuccess) {
-        return {
-          ...state,
-          rootPanels: { ...state.rootPanels, [rootId]: next },
-          checkpointsRefreshError: { ...state.checkpointsRefreshError, [rootId]: action.message },
-        };
-      }
-      return { ...state, rootPanels: { ...state.rootPanels, [rootId]: next } };
-    }
-    case 'sessions': {
-      // AU-61: same pre-fold `wasSuccess` capture as the subagents/
-      // checkpoints/global-5 cases — see the subagents case's doc.
-      const wasSuccess = state.sessionsPanel.status === 'success';
-      const sessionsPanel = applyPanelTransition(state.sessionsPanel, action);
-      if (action.type === 'local.panelError' && wasSuccess) {
-        return { ...state, sessionsPanel, sessionsRefreshError: action.message };
-      }
-      return { ...state, sessionsPanel };
-    }
-    // TI-3 (AU-42 Part B, scope decision): 'setup' stays on the plain path —
-    // `reducePanelAction` above already applies the keep-data rule to it
-    // (panel-agnostic), it just never gains a `refreshError` side-map entry.
-    // See `RefreshErrorPanel`'s doc (state/panels.ts).
-    case 'setup':
-      return { ...state, globalPanels: reducePanelAction(state.globalPanels, action) };
-    case 'tools':
-    case 'mcp':
-    case 'skills':
-    case 'models':
-    case 'settings': {
-      // Captured BEFORE the fold below — this is what tells whether the
-      // panel was already `success` (a background refresh) as opposed to a
-      // first load (idle/loading/error), the same distinction
-      // `reducePanelAction`'s own keep-data rule makes.
-      const wasSuccess = state.globalPanels[action.panel]?.status === 'success';
-      const globalPanels = reducePanelAction(state.globalPanels, action);
-      if (action.type !== 'local.panelError' || !wasSuccess) {
-        return { ...state, globalPanels };
-      }
-      // TI-3 (AU-42 Part B): the SAME fold step that just kept the
-      // RemoteData (above) records the refresh-failure MESSAGE in the
-      // side-map — mirrors BF-A's `sessionsLoadMoreError` (App.tsx), kept
-      // OUTSIDE RemoteData so a background refresh failure never wipes the
-      // loaded list, just surfaces a dismissible banner over it.
-      return {
-        ...state,
-        globalPanels,
-        refreshError: { ...state.refreshError, [action.panel]: action.message },
-      };
-    }
-    default:
-      return assertExhaustivePanel(action.panel);
-  }
-}
-
-export function reduceLocal(state: AppState, action: LocalAction): AppState {
-  switch (action.type) {
-    case 'local.setModel':
-      return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, currentModelId: action.modelId }));
-    case 'local.approvalResolved':
-      // T-A1 (V-6) authority guard: an item the host (or a prior reject-fold)
-      // has already settledOutcome-ed can never be overwritten by an
-      // optimistic click — authoritative always wins.
-      return foldTabScoped(state, action.tabId, action.type, (tab) => ({
-        ...tab,
-        transcript: tab.transcript.map((i) =>
-          i.kind === 'approval' && i.id === action.id && i.settledOutcome === undefined
-            ? { ...i, resolvedOptionId: action.optionId }
-            : i,
-        ),
-      }));
-    case 'local.diffResolved':
-      return foldTabScoped(state, action.tabId, action.type, (tab) => {
-        const approval = tab.transcript.find(
-          (i): i is ApprovalItem => i.kind === 'approval' && i.toolId === action.toolId,
-        );
-        // T-A1 (V-6) authority guard — same rule as local.approvalResolved.
-        if (approval?.settledOutcome !== undefined) return tab;
-
-        if (action.action === 'reject') {
-          // T-A1 (V-7): a hunk reject denies the WHOLE edit (mirrors the
-          // host's own `resolveDiff` reject — SessionController.ts — which
-          // denies every remaining hunk, not just the one clicked). Every
-          // sibling hunk without its own explicit resolution is locked
-          // (`hunksLocked`), kept DISTINCT from an explicit per-hunk
-          // `'reject'` entry; the approval is optimistically resolved to its
-          // deny option, later reconfirmed by the host's own
-          // `approval.settle` echo.
-          const denyOptionId = approval ? findOptionId(approval.options, 'deny') : undefined;
-          return {
-            ...tab,
-            transcript: tab.transcript.map((i) => {
-              if (i.kind === 'tool' && i.toolId === action.toolId) {
-                return {
-                  ...i,
-                  resolvedHunks: { ...(i.resolvedHunks ?? {}), [action.hunkIndex]: 'reject' },
-                  hunksLocked: true,
-                };
-              }
-              if (i.kind === 'approval' && i.toolId === action.toolId && denyOptionId !== undefined) {
-                return { ...i, resolvedOptionId: denyOptionId, settledOutcome: 'selected' as const };
-              }
-              return i;
-            }),
-          };
-        }
-
-        return {
-          ...tab,
-          transcript: tab.transcript.map((i) =>
-            i.kind === 'tool' && i.toolId === action.toolId
-              ? { ...i, resolvedHunks: { ...(i.resolvedHunks ?? {}), [action.hunkIndex]: action.action } }
-              : i,
-          ),
-        };
-      });
-    case 'local.setPanel':
-      return { ...state, activePanel: action.panel };
-    case 'local.dismissError':
-      // exactOptional prep (arm 1): clear `error` by omitting the key.
-      return foldTabScoped(state, action.tabId, action.type, (tab) => {
-        const { error: _clearedError, ...rest } = tab;
-        return rest;
-      });
-    case 'local.sessionLoad.start':
-      return { ...state, pendingSessionLoad: { tabId: action.tabId, sessionId: action.sessionId } };
-    case 'local.sessionLoad.timeout': {
-      // UX-04b: clears `pendingSessionLoad` by key omission — the same
-      // exactOptional discipline `clearResolvedSessionLoad` (above) already
-      // uses for the host-terminal half; this is the webview watchdog's own
-      // fallback half. Nothing else in state changes.
-      const { pendingSessionLoad: _clearedPendingSessionLoadOnTimeout, ...rest } = state;
-      return rest;
-    }
-    case 'local.dismissSystemError': {
-      // exactOptional prep (arm 1): clear by omitting the key.
-      const { systemError: _clearedSystemError, ...rest } = state;
-      return rest;
-    }
-    case 'local.panelLoading':
-    case 'local.panelError':
-      return reducePanelActionScoped(state, action);
-
-    case 'local.refreshError.dismiss': {
-      if (!state.refreshError?.[action.panel]) return state; // nothing to clear
-      const refreshError = { ...state.refreshError };
-      delete refreshError[action.panel];
-      return { ...state, refreshError };
-    }
-
-    // AU-61: the scoped counterpart above — see `LocalAction`'s doc for why
-    // this is a separate, discriminated action.
-    case 'local.scopedRefreshError.dismiss': {
-      const { target } = action;
-      switch (target.panel) {
-        case 'sessions': {
-          if (!state.sessionsRefreshError) return state; // nothing to clear
-          // exactOptional prep (arm 1): clear by omitting the key.
-          const { sessionsRefreshError: _clearedSessionsRefreshError, ...rest } = state;
-          return rest;
-        }
-        case 'checkpoints': {
-          if (!state.checkpointsRefreshError?.[target.rootId]) return state; // nothing to clear
-          const checkpointsRefreshError = { ...state.checkpointsRefreshError };
-          delete checkpointsRefreshError[target.rootId];
-          return { ...state, checkpointsRefreshError };
-        }
-        case 'subagents':
-          // foldTabScoped's own drop-unknown discipline (dev-log + unchanged
-          // state) covers the "unknown tab" case for free — same posture the
-          // design doc calls for (mirrors transcript.ts's subagents
-          // drop-unknown path).
-          // exactOptional prep (arm 1): clear by omitting the key.
-          return foldTabScoped(state, target.tabId, action.type, (tab) => {
-            const { subagentsRefreshError: _clearedSubagentsRefreshError, ...rest } = tab;
-            return rest;
-          });
-      }
-    }
-
-    case 'local.tab.open': {
-      // MAX_TABS is primarily a UI admission check (the tab strip's "+"
-      // disables at the cap) — this is the defensive backstop so a stray
-      // dispatch past the cap can never corrupt state.
-      if (state.tabs[action.tabId] || state.tabOrder.length >= MAX_TABS) return state;
-      // H1-A1: `Chat ${nextChatNumber}`, NOT `tabOrder.length + 1` — the
-      // count-based scheme collides after a middle tab closes (a freed `N`
-      // gets re-minted by the next open, producing a duplicate title).
-      // `nextChatNumber` only ever increments, never reused/decremented.
-      const created = { ...makeTabState(action.tabId, `Chat ${state.nextChatNumber}`), binding: 'pending' as const };
-      return {
-        ...state,
-        tabs: { ...state.tabs, [action.tabId]: created },
-        tabOrder: [...state.tabOrder, action.tabId],
-        activeTabId: action.tabId,
-        nextChatNumber: state.nextChatNumber + 1,
-      };
-    }
-
-    case 'local.tab.select': {
-      if (!state.tabs[action.tabId]) {
-        console.warn(`transcript: local.tab.select — unknown tab "${action.tabId}"`);
-        return state;
-      }
-      return { ...state, activeTabId: action.tabId };
-    }
-
-    case 'local.tab.close': {
-      const removed = state.tabs[action.tabId];
-      if (!removed) return state;
-      if (state.tabOrder.length <= 1) {
-        // The UI already gates this (TabStrip's "x" only renders past one
-        // tab) — this is a defensive backstop, never leaving zero tabs.
-        console.warn('transcript: local.tab.close — refusing to close the last remaining tab');
-        return state;
-      }
-      const tabs = Object.fromEntries(Object.entries(state.tabs).filter(([id]) => id !== action.tabId));
-      const tabOrder = state.tabOrder.filter((id) => id !== action.tabId);
-      // H1-M6: closing the ACTIVE tab activates the editor-convention
-      // neighbor — the right neighbor (whatever now sits at the closed tab's
-      // former index), or the left neighbor (the new last) when the closed
-      // tab was last. Only applies when the CLOSED tab was active; closing a
-      // non-active tab leaves activeTabId untouched (existing behavior kept).
-      let activeTabId = state.activeTabId;
-      if (state.activeTabId === action.tabId) {
-        const closedIdx = state.tabOrder.indexOf(action.tabId);
-        activeTabId = tabOrder[Math.min(closedIdx, tabOrder.length - 1)] ?? tabOrder[0] ?? state.activeTabId;
-      }
-      return { ...state, tabs, tabOrder, activeTabId };
-    }
-
-    case 'local.closeIntentsDrained':
-      return { ...state, closeIntents: [] };
-
-    // P7-N1: the four draft.* actions — see the LocalAction union doc above
-    // for why each carries an explicit tabId and folds through foldTabScoped.
-    case 'local.draft.set':
-      return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, draft: action.text }));
-
-    case 'local.draft.attach.add':
-      // Additive at the reducer (not "set the whole array"): addFiles'
-      // FileReader.onload resolves ASYNCHRONOUSLY — a whole-array controlled
-      // write from the component could capture a stale `draftAttachments`
-      // prop and drop a sibling file when two readers resolve close
-      // together. This append is atomic per dispatch.
-      return foldTabScoped(state, action.tabId, action.type, (tab) => ({
-        ...tab,
-        draftAttachments: [...tab.draftAttachments, action.attachment],
-      }));
-
-    case 'local.draft.attach.remove':
-      return foldTabScoped(state, action.tabId, action.type, (tab) => ({
-        ...tab,
-        draftAttachments: tab.draftAttachments.filter((a) => a.id !== action.attachmentId),
-      }));
-
-    case 'local.draft.clear':
-      return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, draft: '', draftAttachments: [] }));
-
-    case 'local.stopPending':
-      // UX-03: only meaningful while a turn is live — a stray dispatch on an
-      // idle tab must not paint a "Stopping…" nothing will ever clear.
-      return foldTabScoped(state, action.tabId, action.type, (tab) =>
-        tab.turnActive ? { ...tab, stopPending: true } : tab,
-      );
-
-    case 'local.newSessionPending':
-      // UX-04a: unlike stopPending, unconditional — New Session is legal on
-      // any tab (bound or not, idle or live-turn; Composer's own Task-11
-      // confirm gate is what asks first while busy, not this fold). Cleared
-      // by `tab.bound`/`tab.error` below (exhaustive terminals for the
-      // `tab.newSession` post App.newSession issues right after this).
-      // WS-UX P2 M1 (deliberate non-fix): this fold does NOT touch
-      // `sessionLost`/`sessionLostReason`/`openFailed`. Those are host-owned
-      // truth with exactly two retirers (`tab.bound`, `tab.clear`) — a local
-      // optimistic action must never become a third writer, or a lost
-      // `tab.newSession` post would strand the tab with its recovery
-      // affordances stripped and no way to rebuild them. While the request
-      // is in flight, App.tsx GATES the two standing recovery rows on this
-      // flag instead (render priority, not state mutation).
-      return foldTabScoped(state, action.tabId, action.type, (tab) => ({ ...tab, newSessionPending: true }));
-
-    default:
-      return state;
-  }
 }
 
 export type { PlanItem };

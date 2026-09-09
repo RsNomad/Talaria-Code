@@ -18,6 +18,7 @@ import type {
   ToolsetInfo,
 } from '../../shared/protocol';
 import { isRecord } from '../../shared/typeGuards';
+import type { Logger } from '../transport/JsonRpcStdio';
 
 /**
  * The Zone S reshaping seam: PURE functions that turn a raw control-plane RPC
@@ -297,6 +298,33 @@ export function unwrapConfigFull(raw: unknown): RawConfigFullResult {
     }
     return raw as RawConfigFullResult;
   }
+  return {};
+}
+
+/**
+ * ADR-R2-05 (L2-CA-02): the generic SOURCE-INGRESS null-total guard. Every
+ * `PanelSource` casts its raw dispatch/ACP result straight into its reshaper
+ * (`raw as RawXxx`), and every reshaper unconditionally dereferences a field
+ * on it (`raw.toolsets`, `raw.skills`, `raw.sessions`, …). A malformed or
+ * degraded wire result (`null`, a bare string, an array, `undefined` in
+ * place of the expected object) made the reshaper throw `TypeError: Cannot
+ * read properties of null (reading '<field>')`, rejecting the WHOLE panel
+ * fetch. This coerces a non-record `raw` to `{}` — every reshaper already
+ * treats a record with the field absent as "empty" via its own `?? []`/`??
+ * {}` — with exactly ONE log line so a degraded panel renders empty
+ * (fail-safe) instead of throwing (fail-silent-or-crash) and the drop is
+ * never silent. `what` names the wire method that produced `raw` (e.g.
+ * `'tools.list'`), `logger` is the exact optional `PanelSourceContext.logger`
+ * a call site already carries — no adapter needed.
+ *
+ * The `as RawX` cast at each call site STAYS: this is the sanctioned WS-BG
+ * idiom "cast only where a guard was just applied" (see `isRecord`'s own
+ * doc) — callers wrap as `reshapeX(unwrapRecord(raw, 'x.y', ctx.logger) as
+ * RawX)`, replacing the bare `raw as RawX`.
+ */
+export function unwrapRecord(raw: unknown, what: string, logger?: Logger): Record<string, unknown> {
+  if (isRecord(raw)) return raw;
+  logger?.append(`[panels] ${what} returned a non-object result — rendering empty`);
   return {};
 }
 

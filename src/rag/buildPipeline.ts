@@ -29,7 +29,6 @@ import type { ChunkRecord, VectorStore } from './store/VectorStore';
 import type { MutationGate } from '../host/util/mutationGate';
 
 const MAX_FILE_BYTES = 1_000_000; // matches Continue's shouldChunk cutoff
-const EMBED_BATCH_SIZE = 64; // how-to §2.4: batch ~64-200
 // RAG-02: bounded fan-out for the full-build directory descent — enough to
 // overlap readdir latency without exhausting file descriptors on a big repo.
 const WALK_CONCURRENCY = 8;
@@ -60,6 +59,23 @@ const EXTENSION_TO_LANGUAGE_ID: Record<string, string> = {
 
 function looksBinary(buf: Buffer): boolean {
   return buf.subarray(0, 8000).includes(0);
+}
+
+/**
+ * FI-20/FI-31 (F6-6): shared errno classifier for this file's read/readdir
+ * catches (`walk`'s readdir + nested-ignore-file reads, and `runBuild`'s
+ * hash-pass read) — mirrors `indexer.ts`'s inline `readManifest`/`readMeta`
+ * idiom (`err.code === 'ENOENT'`), factored out once here since this file has
+ * FOUR such catches where `indexer.ts` has two.
+ */
+function isEnoent(err: unknown): boolean {
+  return err instanceof Error && 'code' in err && (err as { code?: string }).code === 'ENOENT';
+}
+
+/** FI-20/FI-31: the log-safe name for an error — never the message (which
+ * can carry filesystem/secret detail), mirroring `indexer.ts`'s `(${err.name})` idiom. */
+function errName(err: unknown): string {
+  return err instanceof Error ? err.name : 'unknown';
 }
 
 /**
@@ -115,8 +131,23 @@ export function matchesNestedIgnore(entries: readonly NestedIgnoreEntry[], relPo
  * `fs` they ARE closure values and must be threaded here — the `vi.mock`
  * factories back the classes those instances come from, so the mock still
  * applies as long as the instance itself is passed through.
+ *
+ * FI-18 (F6-4): this file's five functions each used to take the WHOLE bag
+ * even though most touch only a handful of its ~18 members.
+ * `IndexerContextBag` (below, module-private) names every member ONCE;
+ * `IndexerStoreCtx` / `IndexerManifestCtx` / `IndexerIgnoreCtx` /
+ * `IndexerLogCtx` are role-based `Pick`s of it, and the exported
+ * `IndexerContext` is their intersection plus the residual members no
+ * single role owns (`opts`/`parser`/`embedder`/`isDisposed`/
+ * `recordFailedIncrementalReindex`) — structurally the SAME 18 members as
+ * before, so `createIndexer`'s bag construction (indexer.ts) and
+ * `watchPipeline.ts`'s `ctx: IndexerContext` params compile unchanged. Each
+ * function below narrows its own `ctx` parameter to the intersection of
+ * only the roles (and residual members) its body actually reads — grounded
+ * by reading each function, not guessed; `tsc` is the arbiter that a
+ * narrowed Pick still covers every field the function references.
  */
-export interface IndexerContext {
+interface IndexerContextBag {
   opts: IndexerOptions;
   store: VectorStore;
   embedder: Embedder;
@@ -141,8 +172,40 @@ export interface IndexerContext {
   recordFailedIncrementalReindex: () => void;
 }
 
+/** FI-18: the store-lifecycle role — `store`/`gate` and the async init that must precede touching either. */
+export type IndexerStoreCtx = Pick<IndexerContextBag, 'store' | 'gate' | 'ensureStoreInitialized'>;
+/** FI-18: the manifest/fingerprint-sidecar role — everything `runBuild` reads or writes to decide and record what changed. */
+export type IndexerManifestCtx = Pick<
+  IndexerContextBag,
+  'readManifest' | 'writeManifest' | 'readMeta' | 'writeMeta' | 'computeEffectiveWidth' | 'fingerprintMatches'
+>;
+/** FI-18: the ignore-filter role — loading it, and invalidating/recording its nested-directory cache. */
+export type IndexerIgnoreCtx = Pick<
+  IndexerContextBag,
+  'loadIgnoreFilter' | 'invalidateIgnoreFilterCache' | 'setKnownNestedIgnoreDirs'
+>;
+/** FI-18: the logging role — used only by `watchPipeline.ts`'s functions, not by anything in this file. */
+export type IndexerLogCtx = Pick<IndexerContextBag, 'logger'>;
+
+/**
+ * FI-18: the full bag, unchanged in shape — the intersection of every role
+ * above plus the residual members no role owns. `createIndexer`'s object
+ * literal (indexer.ts) satisfies this exactly as it satisfied the
+ * pre-refactor bag interface.
+ */
+export type IndexerContext = IndexerStoreCtx &
+  IndexerManifestCtx &
+  IndexerIgnoreCtx &
+  IndexerLogCtx &
+  Pick<IndexerContextBag, 'opts' | 'parser' | 'embedder' | 'isDisposed' | 'recordFailedIncrementalReindex'>;
+
 export async function walk(
-  ctx: IndexerContext,
+  // FI-18: `walk` reads `ctx.opts.workspaceRoot` — no store/manifest/
+  // ignore-filter-role member. FI-20/FI-31 (F6-6): it now ALSO reads
+  // `ctx.logger` — the readdir/nested-ignore-file catches below log a
+  // non-ENOENT errno name; ENOENT itself stays silent (a missing/racing
+  // directory mid-walk is ordinary, not an error).
+  ctx: Pick<IndexerContextBag, 'opts'> & IndexerLogCtx,
   root: string,
   ignoreFilter: (p: string) => boolean,
   out: string[],
@@ -166,7 +229,13 @@ export async function walk(
         let entries: Dirent[];
         try {
           entries = await fs.readdir(dir, { withFileTypes: true });
-        } catch {
+        } catch (err) {
+          // FI-20/FI-31: ENOENT (a missing/racing directory) stays silent —
+          // the ordinary case; any other errno (EACCES, EIO, ...) is logged
+          // with err.name only, never the path.
+          if (!isEnoent(err)) {
+            ctx.logger(`hermes-codebase: directory read failed (${errName(err)})`);
+          }
           return;
         }
 
@@ -185,13 +254,21 @@ export async function walk(
           const dirContents: string[] = [];
           try {
             dirContents.push(await fs.readFile(path.join(dir, '.gitignore'), 'utf8'));
-          } catch {
-            // no nested .gitignore in this directory.
+          } catch (err) {
+            // FI-20/FI-31: ENOENT ("no nested .gitignore here") stays
+            // silent; any other read error is logged, err.name only.
+            if (!isEnoent(err)) {
+              ctx.logger(`hermes-codebase: nested .gitignore read failed (${errName(err)})`);
+            }
           }
           try {
             dirContents.push(await fs.readFile(path.join(dir, '.hermesignore'), 'utf8'));
-          } catch {
-            // optional
+          } catch (err) {
+            // FI-20/FI-31: same rule — ENOENT ("optional, not present") is
+            // silent; any other read error is logged, err.name only.
+            if (!isEnoent(err)) {
+              ctx.logger(`hermes-codebase: nested .hermesignore read failed (${errName(err)})`);
+            }
           }
           if (dirContents.length > 0) {
             dirAncestors = [...localAncestors, { dirRel, matches: createIgnoreFilter(dirContents) }];
@@ -249,12 +326,12 @@ export async function walk(
  * diff found no files to recompute) — the caller uses this to decide what
  * to persist into the D-2 sidecar.
  *
- * AUDIT-5 Task 10: `preloaded` is an optional readAbsPath -> Buffer map.
- * When the caller already has a path's bytes in hand (`runBuild`'s hash
- * pass reads every candidate once already), pass them here instead of
- * letting this function `fs.readFile` the same path a second time. The
- * watch path (`handleFsEvent`) has no such buffer and passes nothing — it
- * keeps its original single read.
+ * Stream-and-reread (FI-42): `runBuild`'s hash pass (`~:537-543`) reads each
+ * candidate once already, but only to hash it and release the buffer — it
+ * does not retain the bytes. This function re-reads every changed path's
+ * bytes itself below, exactly like the single-target watch path
+ * (`handleFsEvent`) always has; both callers read once for the hash/verify
+ * step and once here for the embed step, unconditionally.
  */
 /**
  * AUDIT-5 Task 11: one reindex target = the abs path whose BYTES are read,
@@ -272,21 +349,42 @@ export interface ReindexTarget {
   storeRelPath: string;
 }
 
-export async function reindexFiles(
-  ctx: IndexerContext,
+/**
+ * F6-3 (FI-08) / M-16: the phase-1/phase-2 hand-off shared between
+ * `buildPendingRecords` and `embedAndSwap`. The MAP's identity is fixed the
+ * moment `buildPendingRecords` returns it (typed `ReadonlyMap` at that
+ * boundary — no `.set`/`.delete` afterward), but each VALUE stays a mutable
+ * object so `embedAndSwap` can flip `deleted`/decrement `remaining` in
+ * place as the swap progresses. That is what lets a
+ * `Map<string, MutablePathState>` widen to
+ * `ReadonlyMap<string, MutablePathState>` with no cast: only the container
+ * is read-only, not what it points at.
+ */
+type MutablePathState = { contentHash: string; remaining: number; deleted: boolean };
+
+/**
+ * F6-3 (FI-08): phase 1 of `reindexFiles` — reads and chunks every target,
+ * building the pending embed queue and its per-path swap bookkeeping.
+ * Returns `{ disposed: true }` (never `undefined`) the moment either
+ * `isDisposed` guard fires, so `reindexFiles` can tell "nothing to embed"
+ * apart from "torn down mid-read" at the call site.
+ */
+async function buildPendingRecords(
+  // FI-18: reads `ctx.isDisposed`, `ctx.gate`/`ctx.store` (the purge-and-bail
+  // and zero-chunk branches), `ctx.parser`, and `ctx.opts.maxChunkTokens`.
+  // FI-20/FI-31 (F6-6): also reads `ctx.logger`, threaded straight through to
+  // `chunkFile`'s injected logger (`chunker.ts`'s AST-failure log).
+  ctx: IndexerStoreCtx & IndexerLogCtx & Pick<IndexerContextBag, 'isDisposed' | 'parser' | 'opts'>,
   targets: ReindexTarget[],
   manifest: Record<string, string>,
-  expectedWidth: number | undefined,
-  preloaded?: Map<string, Buffer>,
-): Promise<number | undefined> {
-  await ctx.ensureStoreInitialized();
+): Promise<{ records: ChunkRecord[]; pathState: ReadonlyMap<string, MutablePathState> } | { disposed: true }> {
   // TA-5 (AU-23, Med) / INV-5: `ensureStoreInitialized` above is itself an
   // await — `dispose()` may have fired while it was pending (this function
   // is reached both from the watch-path debounce body below and from
   // `runBuild`, either of which can race a shutdown). Re-check here, at
   // this function's own entry, so no chunk from `targets` reaches
   // `store.deleteByPath`/`store.upsert` once disposed.
-  if (ctx.isDisposed()) return undefined;
+  if (ctx.isDisposed()) return { disposed: true };
   const pendingRecords: ChunkRecord[] = [];
   // TA-3 (AU-3, Rev-1 A3) / INV-3: "old rows for a path are deleted only
   // after their replacement vectors exist." Per-path swap bookkeeping for
@@ -299,12 +397,12 @@ export async function reindexFiles(
   // (deleted but remaining > 0) is scrubbed from `manifest` in the catch
   // below instead of being left to claim rows that are gone — HEAD's bug
   // was exactly that stale claim surviving a partial/transient failure.
-  const pathState = new Map<string, { contentHash: string; remaining: number; deleted: boolean }>();
+  const pathState = new Map<string, MutablePathState>();
 
   for (const { readAbsPath, storeRelPath: relPath } of targets) {
     let buf: Buffer;
     try {
-      buf = preloaded?.get(readAbsPath) ?? (await fs.readFile(readAbsPath));
+      buf = await fs.readFile(readAbsPath);
     } catch {
       continue; // deleted between walk and read; the delete pass handles it.
     }
@@ -325,7 +423,7 @@ export async function reindexFiles(
       // that follows it (same discipline as every other await-then-mutate
       // site in this function); bail with no observed width yet, matching
       // this loop's own entry guard above (`if (disposed) return undefined;`).
-      if (ctx.isDisposed()) return undefined;
+      if (ctx.isDisposed()) return { disposed: true };
       delete manifest[relPath];
       continue;
     }
@@ -346,6 +444,7 @@ export async function reindexFiles(
       contents,
       languageId: languageId ?? extension,
       extension,
+      logger: ctx.logger,
       ...(languageId ? { parser: ctx.parser } : {}),
       ...(ctx.opts.maxChunkTokens !== undefined ? { maxChunkTokens: ctx.opts.maxChunkTokens } : {}),
     });
@@ -402,6 +501,25 @@ export async function reindexFiles(
     }
   }
 
+  return { records: pendingRecords, pathState };
+}
+
+/**
+ * F6-3 (FI-08): phase 2 of `reindexFiles` — embeds `records` in bounded
+ * batches and swaps each represented path's stale rows for its freshly
+ * embedded ones, mutating `pathState`'s VALUE objects (never the map
+ * itself, per M-16) and `manifest` in place as each path finalizes. Runs
+ * the TA-3 catch-scrub on any embed/store failure before rethrowing.
+ */
+async function embedAndSwap(
+  // FI-18: reads `ctx.embedder`, `ctx.isDisposed`, and `ctx.gate`/`ctx.store`
+  // (the per-batch delete-before-upsert swap). No manifest/ignore/logger use.
+  ctx: IndexerStoreCtx & Pick<IndexerContextBag, 'embedder' | 'isDisposed'>,
+  records: ChunkRecord[],
+  pathState: ReadonlyMap<string, MutablePathState>,
+  manifest: Record<string, string>,
+  expectedWidth: number | undefined,
+): Promise<number | undefined> {
   // Embed in batches (how-to §2.4: ~64-200 per request); per batch, swap:
   // a path's stale rows are purged only once ITS replacement vectors exist
   // (this batch), then the batch is upserted. TA-3 (AU-3, Rev-1 A3):
@@ -410,8 +528,11 @@ export async function reindexFiles(
   // 300+MB on a large repo).
   let observedWidth: number | undefined;
   try {
-    for (let i = 0; i < pendingRecords.length; i += EMBED_BATCH_SIZE) {
-      const batch = pendingRecords.slice(i, i + EMBED_BATCH_SIZE);
+    // FI-29: batched by the embedder's OWN batch size (`ctx.embedder.batchSize`)
+    // rather than a separate module constant — see embedder.ts's `Embedder`
+    // interface doc comment.
+    for (let i = 0; i < records.length; i += ctx.embedder.batchSize) {
+      const batch = records.slice(i, i + ctx.embedder.batchSize);
       const vectors = await ctx.embedder.embed(
         batch.map((r) => r.content),
         // TA-2 (AU-5, Rev-1 A2) / INV-2 (restated): "one BUILD = one width
@@ -515,7 +636,44 @@ export async function reindexFiles(
   return observedWidth;
 }
 
-export async function runBuild(ctx: IndexerContext): Promise<void> {
+export async function reindexFiles(
+  // FI-18: `ctx.ensureStoreInitialized` directly, plus the union of what
+  // `buildPendingRecords` and `embedAndSwap` need (both called with this
+  // same `ctx`) — `IndexerStoreCtx` already covers `gate`/`store`/
+  // `ensureStoreInitialized`; `isDisposed`/`parser`/`opts`/`embedder` are
+  // the two callees' residual members. FI-20/FI-31 (F6-6): `IndexerLogCtx`
+  // joins the Pick too — `buildPendingRecords` (called with this same `ctx`
+  // below) now reads `ctx.logger`, so this function's own parameter type
+  // must cover it for that call to typecheck.
+  ctx: IndexerStoreCtx & IndexerLogCtx & Pick<IndexerContextBag, 'isDisposed' | 'parser' | 'opts' | 'embedder'>,
+  targets: ReindexTarget[],
+  manifest: Record<string, string>,
+  expectedWidth: number | undefined,
+): Promise<number | undefined> {
+  await ctx.ensureStoreInitialized();
+  const pending = await buildPendingRecords(ctx, targets, manifest);
+  if ('disposed' in pending) return undefined;
+  return embedAndSwap(ctx, pending.records, pending.pathState, manifest, expectedWidth);
+}
+
+export async function runBuild(
+  // FI-18: reads the store role directly (`ensureStoreInitialized`/`gate`/
+  // `store`), the full manifest role (`readManifest`/`writeManifest`/
+  // `readMeta`/`writeMeta`/`computeEffectiveWidth`/`fingerprintMatches`) and
+  // the full ignore role (`invalidateIgnoreFilterCache`/`loadIgnoreFilter`/
+  // `setKnownNestedIgnoreDirs`) directly, plus `opts`/`isDisposed` directly
+  // and `parser`/`embedder` transitively (passed on to `walk`/`reindexFiles`
+  // below). FI-20/FI-31 (F6-6): `logger` is now used directly here too — the
+  // hash-pass read catch (below) logs a non-ENOENT errno name via it,
+  // mirroring `walk`'s own errno-name logging, and it's threaded on to
+  // `walk`/`reindexFiles` (both now require it). `recordFailedIncrementalReindex`
+  // remains `watchPipeline.ts`-only, correctly absent from this Pick.
+  ctx: IndexerStoreCtx &
+    IndexerManifestCtx &
+    IndexerIgnoreCtx &
+    IndexerLogCtx &
+    Pick<IndexerContextBag, 'opts' | 'parser' | 'embedder' | 'isDisposed'>,
+): Promise<void> {
   await ctx.ensureStoreInitialized();
   // AUDIT-5 Task 10: force a fresh ignore-filter read for every full
   // build, independent of whatever the watch path may already have
@@ -547,7 +705,13 @@ export async function runBuild(ctx: IndexerContext): Promise<void> {
       const buf = await fs.readFile(absPath);
       if (buf.byteLength > MAX_FILE_BYTES || looksBinary(buf)) continue;
       current[relPath] = hashContent(buf.toString('utf8'));
-    } catch {
+    } catch (err) {
+      // FI-20/FI-31: ENOENT (deleted between walk and this read) stays
+      // silent — the documented case; any other errno is logged, err.name
+      // only, never the path.
+      if (!isEnoent(err)) {
+        ctx.logger(`hermes-codebase: hash read failed (${errName(err)})`);
+      }
       continue;
     }
   }

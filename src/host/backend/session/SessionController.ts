@@ -10,6 +10,7 @@ import type {
   SubagentsData,
 } from '../../../shared/protocol';
 import { BOOTSTRAP_TAB_ID, makePanelData } from '../../../shared/protocol';
+import { errorMessage } from '../../../shared/errorMessage';
 import type { ResolvedContext } from '../../context/types';
 import type { SessionHostPort } from './types';
 import { TurnTranslator } from '../acp/turnTranslator';
@@ -21,6 +22,7 @@ import {
   mapPermissionRequest,
   applyResolvedPresentation,
   buildMinimalAskApproval,
+  buildPermissionToolStart,
   buildSelectedOutcome,
   buildCancelledOutcome,
   DEFAULT_APPROVAL_TIMEOUT_MS,
@@ -72,9 +74,8 @@ import { extractPreviewFiles } from '../../preview/extractPreviewFiles';
  * `homedir()` (path canonicalization) — both real, load-bearing, and
  * deliberately NOT ripped out (that would be a behavior change, not a
  * grading fix). "Vscode-free" and "deterministic" are two different
- * guarantees; this class only ever held the first one, and the class doc
- * used to say "pure" as if it held both — that overstatement is what this
- * note corrects. `session/` is mechanically scanned at the HEADLESS tier by
+ * guarantees; this class holds only the first one. `session/` is
+ * mechanically scanned at the HEADLESS tier by
  * `policyAcpPurity.test.ts`'s session/ extension (no `vscode`, no `fs`;
  * `Date.now()`/`homedir()` are the sanctioned headless seams).
  *
@@ -96,9 +97,10 @@ export type LoadReplayOutcome =
   | { kind: 'no-client' }
   | { kind: 'load-failed'; message: string }
   | { kind: 'not-found' }
-  /** Empty for the :1203/:1226/:1269 supersede arms; carries the real result
-   *  for :1240's success-but-superseded arm — callers today treat that one
-   *  as SUCCESS, and the adapter preserves exactly that. */
+  /** Empty for `loadReplayOutcome`'s plain supersede arms; carries the real
+   *  result for its success-but-superseded arm (the one that forwards
+   *  `result`) — callers today treat that one as SUCCESS, and the adapter
+   *  preserves exactly that. */
   | { kind: 'superseded'; result?: AcpLoadSessionResult };
 
 export class SessionController {
@@ -131,7 +133,8 @@ export class SessionController {
    * turn end). The record: (a) makes the force-end queryable (wasForceEnded —
    * WS-R3's reconnect wedge-break evidence), and (b) documents WHY the
    * belated genuine settlement is dropped — forceEndCancelledTurn clears
-   * currentTurnId/turn, so runTurn's own :1021/:1042 guards discard it.
+   * currentTurnId/turn, so runTurn's own `this.currentTurnId !== turnId`
+   * guards discard it.
    */
   private readonly forceEndedTurnIds = new Set<string>();
 
@@ -146,7 +149,8 @@ export class SessionController {
    * A failed re-assert (`pinWireModeDefault`'s catch) now seeds this field
    * with the RAW drifted mode id Hermes reported — not guaranteed to be one
    * of our own `AgentMode` literals — so `runTurn`'s `!== 'default'` re-pin
-   * check (~:894, this field's ONLY reader in the file — grep-confirmed) can
+   * check (the `if (this.currentMode !== 'default')` guard near that
+   * method's top, this field's ONLY reader in the file — grep-confirmed) can
    * actually detect the drift, instead of the field staying permanently
    * `'default'` (its only other assignments) and that check being dead code.
    */
@@ -272,7 +276,7 @@ export class SessionController {
    * `AcpBackend.pinWireModeDefault` — F4 (the pin is per-controller now).
    *
    * CF-01/I-2 (W1-T3): this is the ONE place both call sites reach —
-   * `loadReplayOutcome` (~:1123) and `AcpBackend.openSession` (~:754) — so
+   * `loadReplayOutcome` and `AcpBackend.openSession` — so
    * catching `setSessionMode`'s rejection HERE closes both by construction,
    * with no duplicated try/catch at either await. Before this fix, a
    * rejection propagated out of `loadReplayOutcome` (falsifying its documented
@@ -296,7 +300,8 @@ export class SessionController {
    * (init, this method's own success tail below, `runTurn`'s own re-pin
    * success) — so "left untouched" meant it silently STAYED `'default'` even
    * though the session is still non-default server-side, and `runTurn`'s
-   * `!== 'default'` check (~:894) could then NEVER fire. That "backstop" was
+   * `!== 'default'` check (that method's own guard, near its top) could then
+   * NEVER fire. That "backstop" was
    * unreachable dead code, not a safeguard — a drifted `accept_edits`
    * session could take a prompt with Hermes auto-applying edits (no
    * `request_permission`), our whole out-of-process approval gate silently
@@ -307,7 +312,8 @@ export class SessionController {
    * field's type widened from `AgentMode` to `string` — see its own doc).
    * That makes `runTurn`'s check a REAL backstop: it forces a genuine re-pin
    * attempt on the session's next turn; if THAT re-pin also fails,
-   * `runTurn`'s own try/catch (~:943) aborts the turn with an honest
+   * `runTurn`'s own try/catch (wrapping that method's entire body) aborts
+   * the turn with an honest
    * `error` — `client.prompt` is never reached. A degraded pin can
    * therefore delay a prompt (one failed-then-retried re-pin) or abort it
    * outright — it can never let one through silently un-pinned.
@@ -632,7 +638,8 @@ export class SessionController {
    * any straggler approvals, emits turn.end{cancelled} and takes the
    * after-turn snapshot — the SAME terminal machinery a genuine end uses.
    * Clearing currentTurnId/turn afterwards makes the belated genuine prompt
-   * settlement drop at runTurn's existing guards (:1021/:1042) — no
+   * settlement drop at runTurn's existing `this.currentTurnId !== turnId`
+   * guards — no
    * duplicate turn.end, no stale result.summary (idempotence, §3.1 step 5).
    */
   private forceEndCancelledTurn(turnId: string): void {
@@ -997,6 +1004,24 @@ export class SessionController {
       // any allow/deny/card decision, so nothing gets registered into (or
       // emitted from) a now-dead controller.
       if (this.disposed) return buildCancelledOutcome();
+      // BH-03 (Lens-R2, WS-B): the disposed check above is the liveness belt
+      // — this is the turn-cancellation one. A `cancel()` landing in the
+      // SAME suspension window sets `cancelledTurnId`, not `disposed`; left
+      // unchecked, a Normal-preset auto-allow (N1) still fell through to
+      // `buildSelectedOutcome` below for a turn the user already stopped —
+      // fail-OPEN. `isStaleApprovalRegistration` is the SAME predicate the
+      // card path already applies at its own registration point
+      // (`emitApprovalCard`, kept as belt-and-suspenders); applying it here,
+      // uniformly, BEFORE the allow/deny/card decision, closes the fast-path
+      // gap without touching that later check. `turnId` is this method's
+      // entry-time capture — exactly the "birth turn" `isStaleApprovalRegistration`
+      // expects.
+      if (this.isStaleApprovalRegistration(turnId)) {
+        this.port.logger?.append(
+          `[policy] permission for turn ${turnId} refused after suspension — turn cancelled/gone (fail-closed)`,
+        );
+        return buildCancelledOutcome();
+      }
       const { signal, decision } = pickStrictest(evaluated);
 
       mapped = { ...mapped, approval: applyResolvedPresentation(mapped.approval, signal) };
@@ -1070,8 +1095,9 @@ export class SessionController {
     approvalId: string,
   ): Promise<AcpRequestPermissionResponse> {
     // BF-B belt-and-suspenders: the sole registration point into
-    // `pendingApprovals` — guarded independently of the :466 re-check above
-    // so ANY future caller of this method (not just today's one call site)
+    // `pendingApprovals` — guarded independently of the disposed re-check in
+    // `handlePermission` (`if (this.disposed) return buildCancelledOutcome();`,
+    // above) so ANY future caller of this method (not just today's one call site)
     // can never register a fresh approval into a disposed controller.
     if (this.disposed) return Promise.resolve(buildCancelledOutcome());
 
@@ -1101,6 +1127,9 @@ export class SessionController {
       const timer = setTimeout(() => {
         this.settlePendingApprovals('expired', { onlyApprovalId: approvalId });
       }, approval.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS);
+      // BH-04 (Lens-R2, WS-B Task 2): never keep the process alive — mirrors
+      // every other host-side timer in this file (:514, :620).
+      timer.unref?.();
       this.pendingApprovals.set(approvalId, {
         resolve,
         toolId: req.toolCall.toolCallId,
@@ -1127,8 +1156,11 @@ export class SessionController {
       // T17/T18 ordering lesson). `settlePendingApprovals` clears the entry,
       // its 60 s timer, and the hunk/preview bookkeeping in one sweep.
       try {
-        this.port.emit(approval);
+        if (diffs.length > 0) {
+          this.port.emit(buildPermissionToolStart(req.toolCall, approval));
+        }
         for (const diff of diffs) this.port.emit(diff);
+        this.port.emit(approval);
       } catch (err) {
         this.settlePendingApprovals('cancelled', { onlyApprovalId: approvalId, emit: false });
         this.port.logger?.append(
@@ -1205,18 +1237,10 @@ export class SessionController {
       // canonical path) the mention path already gets (`context/resolver.ts`
       // `resolveFileOrFolder`). A dropped attachment is never sent; the
       // session-scoped error names only the COUNT, never the path/content.
-      const { attachments: confinedAttachments, droppedCount } = await confineAttachmentPaths(
+      const { attachments: confinedAttachments, droppedCount: confineDroppedCount } = await confineAttachmentPaths(
         attachments ?? [],
         this.port.workspaceRoots(),
       );
-      if (droppedCount > 0) {
-        this.port.emit({
-          type: 'error',
-          sessionId: this.sessionId,
-          turnId,
-          message: `${droppedCount} attachment${droppedCount === 1 ? '' : 's'} dropped (outside the workspace or secret-classified)`,
-        });
-      }
 
       const promptText = this.activePreset === 'plan' ? PLAN_PREAMBLE + text : text;
       // A-03 (WS-AC): the degrade decision is derived ONCE per turn from the
@@ -1226,8 +1250,28 @@ export class SessionController {
       // one-line change in promptCaps.ts, nowhere else. Optional-member `?.`:
       // test doubles without the getter read as "nothing advertised".
       const promptCaps = derivePromptCaps(client.getAdvertisedPromptCapabilities?.());
+      // L2-CA-25 (WS-R1 R1-5): `buildPromptContent` now ALSO counts
+      // attachments that survived confinement but were genuinely unreadable
+      // (a malformed/unparseable `dataUri` — see `attachments.ts`'s
+      // `parseDataUri`). Folded into the SAME session-scoped "dropped"
+      // message `confineDroppedCount` already produces below — never a
+      // second message, and never content/path/filename, count only.
+      const { blocks: promptContentBlocks, droppedCount: unreadableDroppedCount } = buildPromptContent(
+        promptText,
+        confinedAttachments,
+        promptCaps,
+      );
+      const droppedCount = confineDroppedCount + unreadableDroppedCount;
+      if (droppedCount > 0) {
+        this.port.emit({
+          type: 'error',
+          sessionId: this.sessionId,
+          turnId,
+          message: `${droppedCount} attachment${droppedCount === 1 ? '' : 's'} dropped (outside the workspace, secret-classified, or unreadable)`,
+        });
+      }
       const content: AcpOutboundContentBlock[] = [
-        ...buildPromptContent(promptText, confinedAttachments, promptCaps),
+        ...promptContentBlocks,
         ...mentionBlocks(resolved ?? [], promptCaps),
       ];
       const response = await client.prompt(this.sessionId, content);
@@ -1360,6 +1404,26 @@ export class SessionController {
   // --- session/load replay ----------------------------------------------------
 
   /**
+   * FI-03 (WS-F7 F7-3a): the replay-fail emit+cleanup shared by
+   * `loadReplayOutcome`'s two failure exits (load-failed, not-found). Call
+   * ONLY AFTER the caller's own `this.replay !== replay` supersede-recheck
+   * has passed — that recheck stays INLINE at each call site (it determines
+   * the differing return: `{ kind: 'superseded' }` for both failure exits,
+   * vs the success exit's data-bearing `{ kind: 'superseded', result }`),
+   * and it must read `this.replay` FRESH after the `client.loadSession`
+   * await, which only the call site can do. ⚠ [CONC]: this method itself is
+   * synchronous (no `await`) — the recheck→emitReplayFailure→return sequence
+   * at each call site is one uninterrupted critical section.
+   */
+  private emitReplayFailure(replay: ReplayTranslator, sessionId: string, message: string): void {
+    this.subagents.setReplaying(false);
+    this.replay = undefined;
+    this.port.emit({ type: 'error', sessionId, message, turnId: replay.currentTurnId });
+    this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
+    this.markSubagentsInterrupted();
+  }
+
+  /**
    * The session-scoped body of a History-panel load, moved off
    * `AcpBackend.loadSession` — called by the router
    * (`AcpBackend.loadSessionIntoTab`) AFTER it has: verified a live client
@@ -1423,11 +1487,7 @@ export class SessionController {
       result = await client.loadSession(rawCwd, sessionId, mcpServers);
     } catch (err) {
       if (this.replay !== replay) return { kind: 'superseded' };
-      this.subagents.setReplaying(false);
-      this.replay = undefined;
-      this.port.emit({ type: 'error', sessionId, message: errorMessage(err), turnId: replay.currentTurnId });
-      this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
-      this.markSubagentsInterrupted();
+      this.emitReplayFailure(replay, sessionId, errorMessage(err));
       return { kind: 'load-failed', message: errorMessage(err) };
     }
 
@@ -1446,16 +1506,7 @@ export class SessionController {
     // since that tab is already bound.
     if (!result.found) {
       if (this.replay !== replay) return { kind: 'superseded' }; // superseded while awaiting
-      this.subagents.setReplaying(false);
-      this.replay = undefined;
-      this.port.emit({
-        type: 'error',
-        sessionId,
-        message: 'That conversation no longer exists on the agent. Start a new chat.',
-        turnId: replay.currentTurnId,
-      });
-      this.port.emit({ type: 'turn.end', turnId: replay.currentTurnId, sessionId, status: 'error' });
-      this.markSubagentsInterrupted();
+      this.emitReplayFailure(replay, sessionId, 'That conversation no longer exists on the agent. Start a new chat.');
       return { kind: 'not-found' };
     }
 
@@ -1474,7 +1525,8 @@ export class SessionController {
     await this.pinWireModeDefault(result.currentModeId);
     // I-2 (W1-T3 review, Important fix; re-review fix2 added `|| this.
     // disposed`): recheck for a superseding `loadReplayOutcome` call AFTER this await —
-    // the guard just above (~:1180) only covers the `client.loadSession`
+    // the `if (this.replay !== replay) return { kind: 'superseded', result };`
+    // guard just above only covers the `client.loadSession`
     // await; `pinWireModeDefault` is a SEPARATE suspension point with no
     // recheck of its own before this fix. THIS call reset `this.replay` to
     // `undefined` two lines above; a non-undefined value at this point can
@@ -1500,13 +1552,12 @@ export class SessionController {
   // --- crash / dispose ----------------------------------------------------
 
   /**
-   * T1a best-effort crash handling — moved off the per-session branch of
-   * `AcpBackend.handleAcpCrash` (`:2416-2434` in the pre-extraction file).
-   * The router iterates the registry and calls this on every controller
-   * (T1b generalizes this into the full "one reconnecting signal / per-tab
-   * session-lost" fan-out).
+   * FI-02 (Lens-R2, WS-S): the ONE crash/restart turn bracket shared by
+   * {@link endOnCrash} and {@link endForRestart} — `status` is the only
+   * difference between the two public entry points (crash = `'error'`,
+   * explicit restart = `'cancelled'`).
    */
-  endOnCrash(): void {
+  private endTurnBracket(status: 'error' | 'cancelled'): void {
     // M1 (Task 8 follow-up, concurrency-lens review): defensive symmetry with
     // dispose() — this method clears the turn bookkeeping directly (bypassing
     // emitTurnEnd) and, unfixed, left an armed cancelFallbackTimer stranded.
@@ -1517,21 +1568,37 @@ export class SessionController {
     // suppress the NEXT turn's fallback on a reused controller — regressing
     // the exact "Stop looks dead" bug F3-4 fixes, with no error surfaced.
     this.clearCancelFallback();
+    // BH-04 (Lens-R2, WS-B Task 2): settle any pending approval BEFORE the
+    // arm's closing `turn.end` below — unfixed, a pending approval's ACP
+    // promise was left hanging (never resolved) and its card kept looking
+    // live in the webview after the turn had already closed.
+    this.settlePendingApprovals('cancelled');
     if (this.liveTurnId !== undefined) {
       const deadTurnId = this.liveTurnId;
       this.liveTurnId = undefined;
       this.currentTurnId = undefined;
       this.port.root.releaseTurnLease(this.sessionId);
-      this.port.emit({ type: 'turn.end', turnId: deadTurnId, sessionId: this.sessionId, status: 'error' });
+      this.port.emit({ type: 'turn.end', turnId: deadTurnId, sessionId: this.sessionId, status });
       this.markSubagentsInterrupted();
     } else if (this.replay !== undefined) {
       const deadReplayTurnId = this.replay.currentTurnId;
       this.subagents.setReplaying(false);
       this.replay = undefined;
       this.currentTurnId = undefined;
-      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status: 'error' });
+      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status });
       this.markSubagentsInterrupted();
     }
+  }
+
+  /**
+   * T1a best-effort crash handling — moved off the per-session branch of
+   * `AcpBackend.handleAcpCrash` (`:2416-2434` in the pre-extraction file).
+   * The router iterates the registry and calls this on every controller
+   * (T1b generalizes this into the full "one reconnecting signal / per-tab
+   * session-lost" fan-out).
+   */
+  endOnCrash(): void {
+    this.endTurnBracket('error');
   }
 
   /**
@@ -1550,25 +1617,7 @@ export class SessionController {
    * port is live — the same reasoning that lets `endOnCrash` emit safely.
    */
   endForRestart(): void {
-    // M1 (Task 8 follow-up, concurrency-lens review): see endOnCrash's
-    // identical comment — defensive symmetry with dispose(), clears a
-    // stranded cancel-fallback timer handle.
-    this.clearCancelFallback();
-    if (this.liveTurnId !== undefined) {
-      const deadTurnId = this.liveTurnId;
-      this.liveTurnId = undefined;
-      this.currentTurnId = undefined;
-      this.port.root.releaseTurnLease(this.sessionId);
-      this.port.emit({ type: 'turn.end', turnId: deadTurnId, sessionId: this.sessionId, status: 'cancelled' });
-      this.markSubagentsInterrupted();
-    } else if (this.replay !== undefined) {
-      const deadReplayTurnId = this.replay.currentTurnId;
-      this.subagents.setReplaying(false);
-      this.replay = undefined;
-      this.currentTurnId = undefined;
-      this.port.emit({ type: 'turn.end', turnId: deadReplayTurnId, sessionId: this.sessionId, status: 'cancelled' });
-      this.markSubagentsInterrupted();
-    }
+    this.endTurnBracket('cancelled');
   }
 
   /**
@@ -1621,7 +1670,7 @@ export class SessionController {
     // future direct `dispose()` of a live-turn controller would otherwise
     // leave `currentTurnId`/`turn` set, and a belated `runTurn` continuation
     // would only be stopped by ITS `if (this.currentTurnId !== turnId ||
-    // !this.turn) return;` guard (:603) by ACCIDENT (a turnId mismatch),
+    // !this.turn) return;` guard by ACCIDENT (a turnId mismatch),
     // not by design.
     this.currentTurnId = undefined;
     this.turn = undefined;
@@ -1728,10 +1777,6 @@ const PLAN_PREAMBLE =
  * T3/T5's job; this is only "don't emit a misleading 'turn N'".
  */
 const AFTER_TURN_LABEL = 'After turn';
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 function findOptionId(options: ApprovalOption[], kind: ApprovalOption['kind']): string | undefined {
   return options.find((option) => option.kind === kind)?.id;

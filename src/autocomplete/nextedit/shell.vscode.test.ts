@@ -333,7 +333,7 @@ import {
   type NextEditEgressVerdict,
 } from './shell.vscode';
 import { NextEditGuard, type NextEditConfigPort, type NextEditSource } from './guard';
-import { BackendHttpError } from '../backends/http';
+import { BackendHttpError, StreamIdleTimeoutError } from '../backends/http';
 import { InsecureTransportError } from '../backends/secureTransport';
 import type { ToggleState } from './mode';
 
@@ -1734,6 +1734,32 @@ describe('next-edit fails VISIBLY, once (F-4 / F-5 / C-5)', () => {
     expect(host.warnings[0]).toContain('https');
   });
 
+  // WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): `StreamIdleTimeoutError`
+  // is none of `InsecureTransportError`/`BackendHttpError`/
+  // `NextEditMintRejectionError` — it falls through `surfaceTriggerFailure`
+  // to the LAST, unconditional "unreachable" arm (the same one a genuine
+  // connection refusal or DNS failure hits), with ZERO code changes needed
+  // to this file: `runPrediction`'s own early-return guard
+  // (`controller.signal.aborted || this.disposed`) does NOT intercept this,
+  // because the AbortController that fires here is `armStreamDeadlines`'s
+  // OWN internal one — a DIFFERENT signal than the `controller` this file
+  // passes down (`AbortSignal.any` composition is one-directional: our own
+  // idle timer aborting never marks the CALLER's controller as aborted).
+  it('a StreamIdleTimeoutError (the ADR-R2-06 stream-idle reap) renders the SAME "unreachable" copy as a plain connection failure — no new arm needed', async () => {
+    host.activeTextEditor = makeEditor(makeDoc());
+    backendSpy.respond = () => Promise.reject(new StreamIdleTimeoutError());
+    await setupShell({ next: true, generic: false });
+
+    await fireTrigger();
+
+    expect(host.warnings).toHaveLength(1);
+    expect(host.warnings[0]).toMatch(/is paused: the request to the .* server at .* failed\. Check/);
+    // Egress hygiene, reinforced at the ladder: the rendered copy carries no
+    // hint of the deadline's own internal machinery.
+    expect(host.warnings[0]).not.toContain('StreamIdleTimeoutError');
+    expect(host.warnings[0]).not.toContain('deadline');
+  });
+
   it('an ABORTED request surfaces NOTHING — aborts are the common case, not a failure', async () => {
     host.activeTextEditor = makeEditor(makeDoc());
     backendSpy.respond = (signal: AbortSignal) =>
@@ -2399,7 +2425,39 @@ describe('LOCK: the shell is the only next-edit context-key writer, and register
       .filter((f) => SET_CONTEXT_WRITE_RE.test(f.stripped) && /['"`]talaria\.nextEdit\./.test(f.stripped))
       .map((f) => f.file);
 
-    expect(offenders).toEqual(['autocomplete/nextedit/shell.vscode.ts']);
+    // WS-F3 F3-8 (FI-07) ground-truth deviation: this two-condition scan was
+    // a COINCIDENTAL proxy, not a direct one — it never inspected whether the
+    // `talaria.nextEdit.*` string it found was actually the KEY passed to the
+    // `setContext` write it also found; it only checked that both substrings
+    // occurred somewhere in the SAME file. Before this task `shell.vscode.ts`
+    // matched both halves purely because the ctor's `registerCommand('talaria.
+    // nextEdit.jump', ...)` etc. command-id literals happened to live in the
+    // SAME file as the executorHost's `setContext` write — an accident of
+    // co-location, not a property of context-key writing. This task moves
+    // those command-id literals (verbatim, with their `registerCommand`
+    // calls) into `./nextEditShellWiring.ts`, so no single file matches BOTH
+    // halves of the proxy any more, and the correct result is now `[]`. The
+    // property this lock actually cares about — `shell.vscode.ts`'s
+    // `executorHost.setContext` is the ONLY call to `executeCommand('setContext',
+    // ...)` for a next-edit context key anywhere under `src/` — still holds
+    // and is unaffected: neither `nextEditExecutor.ts` (defines the
+    // `NextEditContextKey` string-literal union, calls no `executeCommand`)
+    // nor `nextEditShellWiring.ts` (calls `registerCommand`, never
+    // `setContext`) trips `SET_CONTEXT_WRITE_RE` at all.
+    expect(offenders).toEqual([]);
+  });
+
+  // WS-F3 F3-9 (folded F3-8 Minor-1): the `[]` above is a NEGATIVE guard (no
+  // OTHER file both-writes-setContext-AND-names-a-next-edit-key); it does not
+  // itself say the shell IS the writer. Before this, that positive fact was
+  // only runtime-covered. This restores it as a static pin, mirroring the
+  // readFileSync/dynamic-import idiom the 'never registers an
+  // InlineCompletionItemProvider' test below already uses.
+  it('LOCK positive arm: shell.vscode.ts itself still contains the sole setContext write', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const shellSrc = fs.readFileSync(path.join(__dirname, 'shell.vscode.ts'), 'utf8');
+    expect(SET_CONTEXT_WRITE_RE.test(shellSrc)).toBe(true);
   });
 
   it('the write-signature predicate is not a no-op that would rubber-stamp everything (sanity check on the mechanism)', () => {

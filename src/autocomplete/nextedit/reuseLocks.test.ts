@@ -172,10 +172,85 @@ describe('LOCK: every nextedit/ file that calls fetch( also calls assertSecureAu
       // named here for the same reason `fileWindow.ts` above is: forced
       // through this lock rather than the count bumped reflexively.
       'nextEditNotice.vscode.ts',
+      // WS-F3 F3-2 (FI-06) — `nextEditText.ts`, the pure text-helper leaf
+      // extracted out of `shell.vscode.ts` (`ensureTrailingNewline`,
+      // `stripLineTerminator`, `extractRegionRange`). It contains no
+      // `fetch(` call at all (verified by the "no other nextedit/ file
+      // contains fetch(" sanity test below) — named here per this pin's own
+      // stated purpose: force every new `nextedit/` file through this lock
+      // rather than bumping the count reflexively — it was looked at, and it
+      // is clean.
+      'nextEditText.ts',
+      // WS-F3 F3-3 (FI-06) — `nextEditRoute.ts`, the route-resolution core +
+      // route/toggle copy extracted out of `shell.vscode.ts` (`resolveRoute`,
+      // `endpointLabel`, `deriveGenericTransport`, the two note constants,
+      // `genericUnsupportedBackendMessage`, `DEFAULT_NEXT_EDIT_ENDPOINTS`).
+      // It reaches the wire only THROUGH `backend.ts` (the shell's own
+      // `NextEditHttpBackend` construction site, unmoved) and contains no
+      // `fetch(` call of its own at all (verified by the "no other nextedit/
+      // file contains fetch(" sanity test below) — named here per this pin's
+      // own stated purpose: force every new `nextedit/` file through this
+      // lock rather than bumping the count reflexively — it was looked at,
+      // and it is clean.
+      'nextEditRoute.ts',
+      // WS-F3 F3-4 (FI-06, FI-27) — `nextEditEgress.ts`, the egress
+      // predicate + pure diff/content-change helpers (`diffMayEgress`,
+      // `filterEgressableDiffs`, `computeChangesAboveCursor`,
+      // `toContentChangeLites`) extracted out of `shell.vscode.ts`. It
+      // contains no `fetch(` call at all — it calls `scanSnippetForSecrets`
+      // (an in-process check), never the network (verified by the "no other
+      // nextedit/ file contains fetch(" sanity test below) — named here per
+      // this pin's own stated purpose: force every new `nextedit/` file
+      // through this lock rather than bumping the count reflexively — it was
+      // looked at, and it is clean.
+      'nextEditEgress.ts',
+      // WS-F3 F3-5 (FI-06) — `nextEditExecutor.ts`, the FSM effect-executor
+      // (`NextEditContextKey`, `NextEditExecutorHost`, `NextEditExecutor`,
+      // `makeExecutor`) extracted out of `shell.vscode.ts`. It contains no
+      // `fetch(` call at all — it holds no wire call of any kind, only the
+      // in-memory effect-batch dispatch onto its host port (verified by the
+      // "no other nextedit/ file contains fetch(" sanity test below) — named
+      // here per this pin's own stated purpose: force every new `nextedit/`
+      // file through this lock rather than bumping the count reflexively —
+      // it was looked at, and it is clean.
+      'nextEditExecutor.ts',
+      // WS-F3 F3-6 (FI-06) — `fimActivityRelay.ts`, the FIM-activity relay
+      // (`fimActivityRelay`, `attachFimActivity`, `detachFimActivity`, plus
+      // the module-level `currentFimActivity` slot kept by design) extracted
+      // out of `shell.vscode.ts`. It contains no `fetch(` call at all — it
+      // holds no wire call of any kind, only in-memory forwarding to
+      // whichever listener is currently attached (verified by the "no other
+      // nextedit/ file contains fetch(" sanity test below) — named here per
+      // this pin's own stated purpose: force every new `nextedit/` file
+      // through this lock rather than bumping the count reflexively — it was
+      // looked at, and it is clean.
+      'fimActivityRelay.ts',
+      // WS-F3 F3-7 (FI-13) — `nextEditFailureSurface.ts`, the PURE copy
+      // builder for the trigger-failure surface (`describeTriggerFailure`)
+      // extracted out of `shell.vscode.ts`. It contains no `fetch(` call at
+      // all — it only classifies (via the shared, autocomplete-root
+      // `failureClass.ts`, OUTSIDE `nextedit/` and so not counted here) and
+      // builds copy strings, never touching the network itself (verified by
+      // the "no other nextedit/ file contains fetch(" sanity test below) —
+      // named here per this pin's own stated purpose: force every new
+      // `nextedit/` file through this lock rather than bumping the count
+      // reflexively — it was looked at, and it is clean.
+      'nextEditFailureSurface.ts',
+      // WS-F3 F3-8 (FI-07) — `nextEditShellWiring.ts`, the LAST leaf of the
+      // WS-F3 decomposition: the ctor's three wiring builders
+      // (`buildFimActivity`, `registerListeners`, `registerCommands`)
+      // extracted out of `shell.vscode.ts`. It contains no `fetch(` call at
+      // all — it only wires vscode events/commands to the shell's FSM via
+      // `ShellHostSeams.dispatch`, never touching the network itself
+      // (verified by the "no other nextedit/ file contains fetch(" sanity
+      // test below) — named here per this pin's own stated purpose: force
+      // every new `nextedit/` file through this lock rather than bumping the
+      // count reflexively — it was looked at, and it is clean.
+      'nextEditShellWiring.ts',
     ]) {
       expect(files).toContain(expected);
     }
-    expect(files.length).toBe(15);
+    expect(files.length).toBe(22);
   });
 
   it('no non-allowlisted nextedit/ file contains fetch( without also calling BOTH assertSecureAuthTransport( and mintScannedNextEditRequest( (the real lock)', () => {

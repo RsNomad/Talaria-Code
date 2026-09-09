@@ -8,6 +8,7 @@ import type { ToolKind, ToolStatus } from '../../protocol';
 import { totalLookup } from '../../lookup';
 import { Icon } from '../Icon';
 import { Pill, type PillTone } from '../Pill';
+import { ScrollRegion } from '../ScrollRegion';
 
 /** Exported (UI-I1) so `ToolCard.test.ts` can exercise the total lookup
  * directly — this repo's webview tests don't use jsdom. */
@@ -20,6 +21,10 @@ export const STATUS: Record<ToolStatus, { tone: PillTone; label: string; icon: s
   // file's `tsc` compile — green ahead of T-A1's real fold logic. See
   // `ToolStatus`'s own doc for what emits this.
   interrupted: { tone: 'neutral', label: 'Interrupted', icon: 'stop-circle' },
+  // Lens-R2 BH-05 / ADR-R2-15: synthetic edit-approval card terminal states —
+  // name the approval's outcome, not the tool's. See `ToolStatus`'s own doc.
+  approved: { tone: 'add', label: 'Approved', icon: 'check' },
+  denied: { tone: 'del', label: 'Denied', icon: 'circle-slash' },
 };
 
 /** UI-I1: a `status` outside the known `ToolStatus` enum (a version-skewed or
@@ -65,14 +70,20 @@ export function ToolCard({ item }: { item: ToolItem }) {
         </span>
       </div>
       {item.rawInput && (
-        <div className="overflow-x-auto border-t border-border bg-surface px-3 py-1.5 font-mono text-2xs text-faint">
+        <ScrollRegion
+          className="overflow-x-auto border-t border-border bg-surface px-3 py-1.5 font-mono text-2xs text-faint"
+          label="Tool input"
+        >
           {item.rawInput}
-        </div>
+        </ScrollRegion>
       )}
       {item.output && (
-        <div className="overflow-x-auto whitespace-pre-wrap border-t border-border bg-surface px-3 py-1.5 font-mono text-2xs text-muted">
+        <ScrollRegion
+          className="overflow-x-auto whitespace-pre-wrap border-t border-border bg-surface px-3 py-1.5 font-mono text-2xs text-muted"
+          label="Tool output"
+        >
           {item.output}
-        </div>
+        </ScrollRegion>
       )}
     </div>
   );

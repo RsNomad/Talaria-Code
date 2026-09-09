@@ -746,6 +746,59 @@ describe('CF-12 review fix (W3-T7, IMP-2): checkpoint redo carries rootId + the 
 });
 
 /**
+ * WS-F1 F1-1 (FI-35) characterization: `App.tsx`'s `restoreCheckpoint` (via
+ * `requestShapedOptional`, post-fold) must let a bare `undefined` resolution
+ * from `bridge.request('checkpoint.restore', ...)` pass straight through
+ * UNSHAPED — never routed through `requireShape` (which would instead throw
+ * an "unrecognized result shape" error, surfacing as a DIFFERENT failure
+ * message than the panel's own honest "the host returned no result" defense
+ * — see `CheckpointsPanel.tsx`'s T-C2/V-17 branch). This test exists
+ * end-to-end (real `<App>`, real `bridge.request` mock) because
+ * `CheckpointsPanel.dom.test.tsx`'s own T-C2 test only exercises an injected
+ * `onRestore` double, never the real App-level wiring this fold touches.
+ * Mutation proof (reviewer re-run): drop the `result === undefined ?
+ * undefined :` passthrough in `requestShapedOptional` — this test flips from
+ * "Restore failed — the host returned no result" to a thrown "checkpoint.
+ * restore returned an unrecognized result shape" surfacing instead.
+ */
+describe('WS-F1 F1-1 (FI-35) characterization: checkpoint.restore undefined-passthrough survives the requestShapedOptional fold', () => {
+  it('bridge.request resolving undefined for checkpoint.restore surfaces as "the host returned no result", not a shape-guard throw', async () => {
+    const requestSpy = vi.spyOn(bridge, 'request').mockImplementation(async (method) => {
+      if (method === 'checkpoint.restore') return undefined;
+      return { restored: true, filesChanged: 0, changedPaths: [] };
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    act(() => {
+      bridge.emit({ type: 'tab.bound', tabId: BOOTSTRAP_TAB_ID, sessionId: 's1', rootId: 'root-1' });
+    });
+
+    const panelsTablist = within(screen.getByRole('tablist', { name: 'Panels' }));
+    await user.click(panelsTablist.getByRole('tab', { name: 'Checkpoints' }));
+
+    act(() => {
+      bridge.emit({
+        type: 'panel.data',
+        panel: 'checkpoints',
+        rootId: 'root-1',
+        data: {
+          checkpoints: [
+            { id: 'ckpt-1', label: 'Before turn 1', age: '2m ago', timestamp: '2026-07-14T00:00:00Z' },
+          ],
+        },
+      });
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Restore' }));
+    await user.click(screen.getByRole('button', { name: 'Restore workspace' }));
+
+    expect(await screen.findByText(/Restore failed — the host returned no result/i)).toBeInTheDocument();
+    requestSpy.mockRestore();
+  });
+});
+
+/**
  * Task 2 (P1 entry-point fix, doc §3.3): the webview FETCH half. Task 1's
  * reducer (`transcript.ts`'s `case 'panel.activate'`) only folds
  * `activePanel` — a pure reducer cannot itself issue the correlated

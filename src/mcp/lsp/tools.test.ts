@@ -12,6 +12,7 @@ import type {
   ResolvedPathArg,
   SharedLspToolState,
 } from './lspToolContract';
+import { DEFAULT_LOCATIONS_CAP } from './resultShaper';
 import type {
   ConfinementVerdict,
   PlainDocumentSymbol,
@@ -840,6 +841,35 @@ describe('AU-20: post-gateway classifyUri realpath fan-out is bounded by the poo
 
     expect(getPeak()).toBeLessThanOrEqual(MAX_IN_FLIGHT);
     expect(classifyUri).toHaveBeenCalledTimes(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// L2-CA-20 (Lens-R2, [SEC]) — `buildLocationTargets` used to run
+// `classifyUri` (a realpath) through the pool for EVERY raw target, even
+// though only the first `capLimit` are ever shown — an agent-controlled
+// result with hundreds/thousands of locations paid for unbounded realpath
+// work no output ever surfaced. Mirrors the landed M-2 fix for
+// `lsp_workspace_symbols` above: classify only the shown prefix, pair the
+// beyond-cap tail with the cheap `UNCLASSIFIED_TAIL_VERDICT` placeholder.
+// ---------------------------------------------------------------------------
+
+describe('L2-CA-20: lsp_references classifies only the shown prefix, not the full raw result', () => {
+  it('classifyUri is called at most DEFAULT_LOCATIONS_CAP times for 1000 raw locations, and the summary reports the true total', async () => {
+    const locations: PlainLocation[] = Array.from({ length: 1000 }, (_, i) => ({
+      uri: `file:///workspace/f${i}.ts`,
+      range: range(i, 0, i, 3),
+    }));
+    const getReferences = vi.fn(async (): Promise<readonly PlainLocation[]> => locations);
+    const classifyUri = vi.fn(async (): Promise<ConfinementVerdict> => ({ inRoot: true, relPath: 'a.ts' }));
+    const deps = makeFakeDeps({ classifyUri, gateway: makeFakeGateway({ getReferences }) });
+
+    const { text } = await callTool(deps, 'lsp_references', { path: 'a.ts', line: 1, character: 1 });
+
+    expect(classifyUri.mock.calls.length).toBeLessThanOrEqual(DEFAULT_LOCATIONS_CAP);
+    expect(classifyUri).not.toHaveBeenCalledTimes(1000);
+    expect(text).toContain(`(${DEFAULT_LOCATIONS_CAP} of 1000 shown`);
+    expect(text).toContain(`${1000 - DEFAULT_LOCATIONS_CAP} more not shown`);
   });
 });
 

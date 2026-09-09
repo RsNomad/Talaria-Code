@@ -14,7 +14,7 @@
  * create/install/uninstall (§5.5); every click here only SUMMONS it —
  * this file never gates, confirms, or second-guesses that decision.
  */
-import { useId, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import type { HubInstallResult, HubPreview, HubScan, SkillCreateParams, SkillInfo, SkillsData } from '../protocol';
 import { APPLIES_NEXT_SESSION } from '../copy';
 import { totalLookup } from '../lookup';
@@ -414,6 +414,16 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
   // covers the onCreate-rejection case, which renders in the same form-level
   // slot the old flat string used to.
   const [error, setError] = useState<{ field: 'name' | 'content' | 'submit'; text: string } | undefined>();
+  const formRef = useRef<HTMLFormElement>(null);
+
+  // UX-03 (🔵 a11y, focus management): mirrors McpPanel's `AddServerDisclosure`
+  // effect exactly — see that file's comment for the full rationale. The
+  // form already marks the SOLE invalid field via `aria-invalid` (Task 16
+  // above); this moves FOCUS there too instead of leaving it on Submit.
+  useEffect(() => {
+    if (error === undefined) return;
+    formRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+  }, [error]);
 
   const handleNameChange = (next: string) => {
     setName(next);
@@ -482,7 +492,7 @@ function CreateSkillDisclosure({ onCreate }: { onCreate: SkillsPanelProps['onCre
         <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} className="ml-auto" />
       </button>
       {open && (
-        <form onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
+        <form ref={formRef} onSubmit={handleSubmit} className="flex flex-col gap-2 border-t border-border px-3 py-3">
           <TextField
             label="Name"
             value={name}

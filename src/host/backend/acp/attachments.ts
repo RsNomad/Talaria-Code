@@ -32,18 +32,41 @@ declare const CONFINED_BRAND: unique symbol;
  */
 export type ConfinedAttachment = Attachment & { readonly [CONFINED_BRAND]: true };
 
+/** {@link buildPromptContent}'s result: the wire-ready blocks, plus a COUNT
+ *  (never a path/name/content) of attachments that were genuinely unreadable. */
+export interface BuildPromptContentResult {
+  blocks: AcpOutboundContentBlock[];
+  droppedCount: number;
+}
+
 export function buildPromptContent(
   text: string,
   attachments: readonly ConfinedAttachment[] | undefined,
   promptCaps: PromptDegradeCaps,
-): AcpOutboundContentBlock[] {
+): BuildPromptContentResult {
   const blocks: AcpOutboundContentBlock[] = [];
   if (text) blocks.push({ type: 'text', text });
+  let droppedCount = 0;
   for (const attachment of attachments ?? []) {
     const block = attachmentToContentBlock(attachment, promptCaps);
-    if (block) blocks.push(block);
+    if (block) {
+      blocks.push(block);
+      continue;
+    }
+    // L2-CA-25: `attachmentToContentBlock` returns `undefined` from exactly
+    // two situations, both reachable only once `attachment.path` is absent
+    // (a present path always resolves to a `resource_link`, never
+    // `undefined`) — (1) `attachment.dataUri` was present but genuinely
+    // unparseable/unreadable (a REAL drop, worth counting), or (2) the
+    // attachment carried NEITHER a `dataUri` NOR a `path` at all (the golden
+    // "ghost" case, characterized by `attachments.test.ts`'s "skips an
+    // attachment with neither a path nor a data URI" — there was nothing to
+    // read, so this is an intentional non-attachment skip, not a drop).
+    // `attachment.dataUri !== undefined` is exactly the discriminator: only
+    // case (1) had a data URI in hand that failed to become a block.
+    if (attachment.dataUri !== undefined) droppedCount++;
   }
-  return blocks;
+  return { blocks, droppedCount };
 }
 
 function attachmentToContentBlock(
@@ -114,17 +137,42 @@ function isTextMime(mime?: string): boolean {
   return mime.startsWith('text/') || TEXT_MIME_SET.has(mime);
 }
 
+/**
+ * L2-CA-25: RFC 2397-tolerant data-URI parse. The prior regex
+ * (`/^data:([^;,]+)(?:;charset=[^;,]+)?;base64,(.*)$/s`) hard-required
+ * exactly `data:<type>[;charset=…];base64,<payload>` — an extra media-type
+ * param (`;name=…`), a non-base64 (percent-encoded) payload, or the
+ * `data:,` shorthand all failed to match and were silently DROPPED with no
+ * signal (the finding this fixes). This version accepts the general RFC
+ * 2397 grammar: an optional mime type, zero or more `;param` segments (ANY
+ * of which may be the bare `base64` flag, in any position), a comma, then
+ * the payload — non-base64 payloads are percent-decoded then re-encoded to
+ * base64 so the return shape stays `{mime, base64}` unchanged for callers.
+ */
 function parseDataUri(dataUri: string): { mime: string; base64: string } | undefined {
-  const match = /^data:([^;,]+)(?:;charset=[^;,]+)?;base64,(.*)$/s.exec(dataUri);
+  const match = /^data:([^;,]*)((?:;[^;,]*)*),(.*)$/s.exec(dataUri);
   if (!match) return undefined;
-  const mime = match[1];
-  const base64 = match[2];
-  if (mime === undefined || base64 === undefined) {
-    // Unreachable: both capture groups are non-optional in the pattern (no
-    // alternation), so a successful match always captures both.
+  const mimeRaw = match[1];
+  const paramsRaw = match[2];
+  const payload = match[3];
+  if (mimeRaw === undefined || paramsRaw === undefined || payload === undefined) {
+    // Unreachable: all three capture groups are non-optional in the pattern
+    // (no alternation), so a successful match always captures all three.
     return undefined;
   }
-  return { mime, base64 };
+  const mime = mimeRaw || 'text/plain';
+  const isBase64 = paramsRaw.split(';').some((param) => param === 'base64');
+  if (isBase64) return { mime, base64: payload };
+  try {
+    return { mime, base64: Buffer.from(decodeURIComponent(payload), 'utf8').toString('base64') };
+  } catch (err: unknown) {
+    // A malformed percent-encoded payload (e.g. a truncated `%A` escape)
+    // throws `URIError` from `decodeURIComponent` — caught here and turned
+    // into a drop (the caller counts it), never left to propagate out of
+    // `buildPromptContent` and abort the rest of the turn (critic M-5).
+    if (err instanceof URIError) return undefined;
+    throw err;
+  }
 }
 
 /** The confine primitive's shape (`resolveWithinWorkspaceReal`'s signature) — injected so tests stay headless, mirroring `context/resolver.ts`'s `ConfineFn`. */

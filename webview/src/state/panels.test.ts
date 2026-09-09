@@ -16,6 +16,7 @@ import {
   assertExhaustivePanel,
   DECLINED,
   fetchPanel,
+  isRefreshFailure,
   readScopedRefreshError,
   reducePanelAction,
   resolvePanelRequest,
@@ -117,6 +118,23 @@ describe('panel RemoteData reducer helpers (Part X2)', () => {
   it('a plain panelLoading action (no emptyData) still transitions to loading, unaffected', () => {
     const next = applyPanelTransition(idle, { type: 'local.panelLoading', panel: 'subagents', scopeKey: 'tab-1' });
     expect(isLoading(next)).toBe(true);
+  });
+
+  /*
+   * FI-39 drift-lock symmetry: `applyPanelTransition`'s loading-no-flash-over-
+   * success arm (`current.status === 'success' ? current : loading`) is the
+   * counterpart of `reducePanelAction`'s tested-above rule (:44). Without this
+   * assertion a regression that flashed `loading` over already-loaded data in
+   * `applyPanelTransition` ALONE — exactly a drift between the two functions —
+   * would pass the whole suite (the sessions path executes this arm but asserts
+   * only its side-map). Pins the `? current` (keep) branch by reference.
+   */
+  it('applyPanelTransition does NOT flash loading over already-loaded data (silent background refresh — mirrors reducePanelAction:44)', () => {
+    const loaded = success<PanelDataMap['subagents']>({ delegations: [] });
+    const next = applyPanelTransition(loaded, { type: 'local.panelLoading', panel: 'subagents', scopeKey: 'tab-1' });
+    // Cached data stays visible while the correlated refresh is in flight —
+    // the `current` branch, not `loading`; unchanged reference (no re-alloc).
+    expect(next).toBe(loaded);
   });
 
   /*
@@ -556,5 +574,48 @@ describe('readScopedRefreshError (AU-61 T2) — the scoped-panel banner read', (
 
   it('subagents: returns undefined when unset on the active tab', () => {
     expect(readScopedRefreshError('subagents', {}, { tabId: 'tab-2', rootId: 'root-1' })).toBeUndefined();
+  });
+});
+
+/*
+ * FI-16 (F2-2): `isRefreshFailure` single-sources the "background-refresh-
+ * failure" guard the 4 transcript.ts panel scopes (subagents/checkpoints/
+ * sessions/global-5) each used to spell out inline as
+ * `action.type === 'local.panelError' && wasSuccess` (one of them — global-5
+ * — in NEGATED form: `action.type !== 'local.panelError' || !wasSuccess`).
+ * It MUST be a genuine TYPE GUARD, not a boolean+cast: the compile-level test
+ * below proves a caller's `if (isRefreshFailure(action, wasSuccess))` block
+ * narrows `action` to the `local.panelError` variant, so `action.message` is
+ * readable with no cast.
+ */
+describe('isRefreshFailure (FI-16) — single-sourced background-refresh-failure guard', () => {
+  const loadingAction: PanelAction = { type: 'local.panelLoading', panel: 'tools' };
+  const errorAction: PanelAction = { type: 'local.panelError', panel: 'tools', message: 'boom', retryable: true };
+
+  it('true for a local.panelError while the panel WAS already success (a background refresh)', () => {
+    expect(isRefreshFailure(errorAction, true)).toBe(true);
+  });
+
+  it("false for a local.panelError on a FIRST load (wasSuccess=false) — the finding's load-bearing half", () => {
+    expect(isRefreshFailure(errorAction, false)).toBe(false);
+  });
+
+  it('false for a non-error action (local.panelLoading), regardless of wasSuccess', () => {
+    expect(isRefreshFailure(loadingAction, true)).toBe(false);
+    expect(isRefreshFailure(loadingAction, false)).toBe(false);
+  });
+
+  it('narrows action to the local.panelError variant — action.message is readable with no cast', () => {
+    const action: PanelAction = errorAction;
+    if (isRefreshFailure(action, true)) {
+      // Compile-level proof this is a real type guard, not a boolean
+      // predicate: `action.message` would not exist on the full `PanelAction`
+      // union (the `local.panelLoading` member has no `message` field) —
+      // this line only compiles because `isRefreshFailure` narrows `action`.
+      const message: string = action.message;
+      expect(message).toBe('boom');
+    } else {
+      throw new Error('expected isRefreshFailure to narrow true here');
+    }
   });
 });

@@ -228,7 +228,11 @@ const AGENT_OPTION_TALARIA_AI: SetupBackendOption = {
 const AGENT_OPTIONS_BASE: SetupBackendOption[] = [AGENT_OPTION_HERMES, AGENT_OPTION_OPENCLAW, AGENT_OPTION_TALARIA_AI];
 
 // --- fim.options (registry.ts FIM_BACKENDS, projected by projectBackend) ----
-// Ollama down (baseline) -> every localInstall.models row present:false.
+// FI-33: `projectBackend`'s localInstall branch is now the static
+// {flavor,effort} pair — it no longer varies with the ollama probe result,
+// so ONE ollama option fixture now covers both the ollama-down baseline and
+// the "ollama up" row (see row 4 below, which used to need a `_PRESENT`
+// variant of this fixture for the dead per-model presence echo).
 
 const FIM_OPTION_OLLAMA: SetupBackendOption = {
   id: 'ollama',
@@ -248,37 +252,6 @@ const FIM_OPTION_OLLAMA: SetupBackendOption = {
   localInstall: {
     flavor: 'guided-terminal',
     effort: 'one-script',
-    models: [
-      { role: 'fim', model: 'qwen2.5-coder:1.5b-base', present: false },
-      { role: 'embedding', model: 'qwen3-embedding:0.6b', present: false },
-    ],
-  },
-  nextEditTransport: 'ollama',
-};
-
-// Row 4 variant: Ollama up with both default models present.
-const FIM_OPTION_OLLAMA_PRESENT: SetupBackendOption = {
-  id: 'ollama',
-  kind: 'fim',
-  status: 'available',
-  displayName: 'Ollama',
-  description:
-    'Local model runner with one-script install and in-panel model pulls; also serves the embedding model for the codebase index.',
-  remote: {
-    endpointDefault: 'http://127.0.0.1:11434',
-    endpointValue: '',
-    endpointPlaceholder: 'http://127.0.0.1:11434',
-    auth: 'none',
-    apiKeySet: false,
-    probe: 'ollama-tags',
-  },
-  localInstall: {
-    flavor: 'guided-terminal',
-    effort: 'one-script',
-    models: [
-      { role: 'fim', model: 'qwen2.5-coder:1.5b-base', present: true },
-      { role: 'embedding', model: 'qwen3-embedding:0.6b', present: true },
-    ],
   },
   nextEditTransport: 'ollama',
 };
@@ -357,14 +330,6 @@ const FIM_OPTION_OPENAI_COMPAT: SetupBackendOption = {
 
 const FIM_OPTIONS_BASE: SetupBackendOption[] = [
   FIM_OPTION_OLLAMA,
-  FIM_OPTION_LLAMACPP,
-  FIM_OPTION_VLLM,
-  FIM_OPTION_CODESTRAL,
-  FIM_OPTION_OPENAI_COMPAT,
-];
-
-const FIM_OPTIONS_OLLAMA_UP: SetupBackendOption[] = [
-  FIM_OPTION_OLLAMA_PRESENT,
   FIM_OPTION_LLAMACPP,
   FIM_OPTION_VLLM,
   FIM_OPTION_CODESTRAL,
@@ -608,7 +573,6 @@ const BASE_DATA: SetupData = {
     embedEndpoint: 'http://127.0.0.1:11434',
     embedBackend: 'ollama',
     embedModel: 'qwen3-embedding:0.6b',
-    embedModelPresent: false,
     tuning: { dims: 0, maxChunkTokens: 512, debounceMs: 500, excludeGlobs: [] },
     indexDir: '.hermes/index',
     endpointDefaults: RAG_ENDPOINT_DEFAULTS_FIXTURE,
@@ -659,7 +623,7 @@ describe('WS-GD.2b B1: status() whole-shape golden master (probe-permutation mat
     });
   });
 
-  it('row 4: Ollama up with models — ollama.running, localInstall presence, rag.embedModelPresent', async () => {
+  it('row 4: Ollama up with models — only ollama.running/ollama.models change (FI-33: fim/rag no longer vary with the probe — the dead per-model presence echo was the only thing that used to)', async () => {
     const data = await statusFor({
       ollama: {
         running: true,
@@ -671,8 +635,6 @@ describe('WS-GD.2b B1: status() whole-shape golden master (probe-permutation mat
     });
     expect(data).toEqual({
       ...BASE_DATA,
-      fim: { ...BASE_DATA.fim, options: FIM_OPTIONS_OLLAMA_UP },
-      rag: { ...BASE_DATA.rag, embedModelPresent: true },
       ollama: {
         running: true,
         endpoint: 'http://127.0.0.1:11434',

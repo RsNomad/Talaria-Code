@@ -160,6 +160,33 @@ describe('SkillsPanel V-11 TOGGLE-HONESTY', () => {
     });
   });
 
+  it('BH-01 (ADR-R2-04): a toggle that SETTLES followed by the host\'s AGREEING re-push stays flipped', async () => {
+    let resolveToggle: (() => void) | undefined;
+    const onToggle = () => new Promise<void>((res) => { resolveToggle = res; });
+    const { user, rerender } = setup(
+      <SkillsPanel data={skillsData(false)} onToggle={onToggle} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+    const toggle = () => screen.getByRole('switch', { name: 'Enable web-search' });
+
+    await user.click(toggle());
+    expect(toggle()).toHaveAttribute('aria-checked', 'true'); // optimistic, still in flight
+
+    resolveToggle?.(); // the persist actually succeeds — the toggle SETTLES
+
+    // BH-01: the host re-pushes the PERSISTED panel BEFORE the toggle RPC
+    // resolves — the pushed `serverValue` AGREES with the toggle the user
+    // just made, so the switch must stay flipped, never "snap back".
+    await waitFor(() => {
+      rerender(
+        <SkillsPanel data={skillsData(true)} onToggle={onToggle} onRefresh={noop} {...noopSkillsAdminProps()} />,
+      );
+      expect(
+        toggle(),
+        'an agreeing re-push after settle must leave the switch flipped, not revert it',
+      ).toHaveAttribute('aria-checked', 'true');
+    });
+  });
+
   it('TG-4 (AU-54), was beta.7 C3: the persist note renders ABOVE every skill row — a panel-level note, not the last group’s caption', () => {
     const data: SkillsData = {
       skills: [
@@ -919,5 +946,46 @@ describe('WV4-MIN a11y: SkillsPanel create-form field errors are keyed to their 
     expect(describedBy).toBeTruthy();
     expect(document.getElementById(must(describedBy))).toHaveTextContent('Content is required.');
     expect(name).not.toHaveAttribute('aria-invalid', 'true');
+  });
+});
+
+/**
+ * UX-03 (🔵 a11y/UX, focus management): the Create-skill form already
+ * announces+marks the sole invalid field (`aria-invalid`/`aria-describedby`,
+ * Task 16 above) but left focus sitting on the Submit button — a keyboard/SR
+ * user heard the error but had to navigate back to it manually. A `formRef`
+ * + an `error`-keyed effect now moves focus to the single
+ * `[aria-invalid="true"]` element after each failed submit.
+ */
+describe('UX-03: a failed Create-skill submit moves focus to the first invalid field', () => {
+  it('submitting with an empty Name focuses the Name input (the sole aria-invalid field)', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    const name = screen.getByLabelText(/^Name$/i);
+    expect(name).toHaveAttribute('aria-invalid', 'true');
+    expect(name).toHaveFocus();
+  });
+
+  it('once Name is filled, submitting with empty Content focuses Content instead — the CURRENT first-invalid field, not always Name', async () => {
+    const user = userEvent.setup();
+    render(
+      <SkillsPanel data={skillsData(true)} onToggle={async () => undefined} onRefresh={noop} {...noopSkillsAdminProps()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Create skill/i }));
+    const name = screen.getByLabelText(/^Name$/i);
+    await user.type(name, 'my-skill');
+    const content = screen.getByLabelText(/^Content$/i);
+    await user.clear(content); // seeded content cleared → contentEdited, empty
+    await user.click(screen.getByRole('button', { name: /^Create$/i }));
+
+    expect(content).toHaveAttribute('aria-invalid', 'true');
+    expect(content).toHaveFocus();
   });
 });

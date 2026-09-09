@@ -91,6 +91,29 @@ describe('ToolsPanel V-11 TOGGLE-HONESTY', () => {
     });
   });
 
+  it('BH-01 (ADR-R2-04): a toggle that SETTLES followed by the host\'s AGREEING re-push stays flipped', async () => {
+    let resolveToggle: (() => void) | undefined;
+    const onToggle = () => new Promise<void>((res) => { resolveToggle = res; });
+    const { user, rerender } = setup(<ToolsPanel data={toolsData(false)} onToggle={onToggle} />);
+    const toggle = () => screen.getByRole('switch', { name: 'Enable web toolset' });
+
+    await user.click(toggle());
+    expect(toggle()).toHaveAttribute('aria-checked', 'true'); // optimistic, still in flight
+
+    resolveToggle?.(); // the persist actually succeeds — the toggle SETTLES
+
+    // BH-01: the host re-pushes the PERSISTED panel BEFORE the toggle RPC
+    // resolves — the pushed `serverValue` AGREES with the toggle the user
+    // just made, so the switch must stay flipped, never "snap back".
+    await waitFor(() => {
+      rerender(<ToolsPanel data={toolsData(true)} onToggle={onToggle} />);
+      expect(
+        toggle(),
+        'an agreeing re-push after settle must leave the switch flipped, not revert it',
+      ).toHaveAttribute('aria-checked', 'true');
+    });
+  });
+
   it('TG-1 (AU-47), was beta.7 C1: the scope note renders ABOVE every toolset group — a panel-level note, not the last group’s caption', () => {
     const data: ToolsData = {
       toolsets: [

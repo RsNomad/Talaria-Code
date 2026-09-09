@@ -1,6 +1,7 @@
 import type {
   HostToWebview,
   ControlMethod,
+  DataPanel,
   EditPolicyPreset,
   HydrateTabSeed,
   SlashCommandInfo,
@@ -20,6 +21,7 @@ import { SkillsAdminHandler, isSkillsAdminMethod } from './skillsAdminHandler';
 import { CheckpointActionHandler } from './checkpointActions';
 import { DashboardToggleHandler } from './dashboardToggles';
 import { SessionScopeActions } from './sessionScopeActions';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /**
  * WS-GD.2a A5: `TRUST_GATED_METHODS` now lives on `adminOpRunner.ts` (its
@@ -67,6 +69,17 @@ export interface ControlDispatcherHostPort {
   panelSources: PanelSourceRegistry;
   /** The per-session actor registry — read at call time via the reference itself (a `Map`-backed registry, not a snapshot). */
   sessions: SessionRegistry;
+  /**
+   * BH-02 (round-2): `true` while `AcpBackend.pendingClose` tombstones
+   * `sessionId` — the close was requested but its registry removal is still
+   * deferred on the start tail (see `AcpBackend.pendingClose`'s own doc). The
+   * hydrate seed ({@link SessionScopeActions.listTabs}) excludes such a
+   * session so a webview dispose/recreate in that window never re-seeds a tab
+   * the user has already closed — the SAME tombstone honor
+   * `ConnectionSupervisor`'s crash snapshot already applies
+   * (`ConnectionSupervisorHostPort.isPendingClose`).
+   */
+  isPendingClose(sessionId: string): boolean;
   /** `Map<canonicalRoot, RootCoordinator>` — checkpoint restore/redo/baseline root routing + the single-root convenience fallback. */
   rootRegistry: RootRegistry;
   /** Resolve (or mint) the `RootCoordinator` owning `cwd`'s containing workspace root — accessor (fs-realpath resolution stays host-side, `AcpBackend`'s own `resolveRootCoordinator`). */
@@ -303,7 +316,16 @@ export class ControlDispatcher {
     }
 
     if (method === 'skills.toggle' || method === 'toolsets.toggle') {
-      return this.dashboardToggles.toggle(method, params);
+      const raw = await this.dashboardToggles.toggle(method, params);
+      // BH-01 (ADR-R2-04): the toggle persisted server-side, but the response carries
+      // only {ok,name,enabled}; the webview's V-11 reconcile shows `serverValue` once the
+      // op settles, so the persisted list MUST be pushed BEFORE this RPC resolves
+      // (postMessage is FIFO on one channel → the push folds first). The push is a
+      // courtesy re-fetch of state that already persisted, so its failure must not
+      // turn a successful toggle into a rejected RPC (ADR-R2-16) — see {@link rePushPanel}.
+      const panel = method === 'skills.toggle' ? 'skills' : 'tools';
+      await this.rePushPanel(panel, method);
+      return raw;
     }
 
     // Task A5+A6 (§4.5, §4.7, §4.8): the full T1 MCP admin core —
@@ -321,7 +343,9 @@ export class ControlDispatcher {
     if (method === 'reload.mcp') {
       const raw = await this.port.dispatch(method, params);
       if (isReloadedResult(raw)) {
-        await this.panels.fetchPanelData('mcp');
+        // L2-CA-26 (ADR-R2-16 completion): the reload already persisted
+        // server-side by the time `raw` resolves — see {@link rePushPanel}.
+        await this.rePushPanel('mcp', method);
       }
       return raw;
     }
@@ -337,15 +361,39 @@ export class ControlDispatcher {
       // panel is re-fetched FRESH (a real `model.options` read, not
       // anything fabricated from the request) and pushed; a failure (e.g.
       // the harness's 4006 "managed install" refusal) rejects this call
-      // and never touches the panel.
+      // and never touches the panel. L2-CA-26 (ADR-R2-16 completion): the
+      // save already persisted by the time `raw` resolves, so the refetch
+      // itself must never turn that success into a rejection — see {@link
+      // rePushPanel} (which also NEVER logs `params`, the API key).
       const raw = await this.port.dispatch(method, params);
       if (isSaveKeyResult(raw)) {
-        await this.panels.fetchPanelData('models');
+        await this.rePushPanel('models', method);
       }
       return raw;
     }
 
     return this.port.dispatch(method, params);
+  }
+
+  /**
+   * CA-26 / ADR-R2-16 (completes C1/BH-01, which applied this pattern to the
+   * toggle branches only): a panel re-push is a courtesy re-fetch of state
+   * that ALREADY persisted server-side (the toggle write, the `reload.mcp`
+   * confirm, the `model.save_key` provider write) by the time this is
+   * called — its failure must never turn that successful, already-persisted
+   * RPC into a rejected one. All three panel-mutating branches
+   * (`skills.toggle`/`toolsets.toggle`, `reload.mcp`, `model.save_key`) route
+   * through this ONE helper instead of each carrying its own try/catch.
+   * NEVER logs `params` — `model.save_key`'s params carry the provider API
+   * key (CF-13/D1); the log line names only the method and the caught
+   * error's message.
+   */
+  private async rePushPanel(panel: DataPanel, method: string): Promise<void> {
+    try {
+      await this.panels.fetchPanelData(panel);
+    } catch (err) {
+      this.port.logger?.append(`[ControlDispatcher] ${method}: panel re-push failed (mutation persisted) — ${errorMessage(err)}`);
+    }
   }
 
   // WS-GD.2a A9: `toggleDashboard`/`toggleDashboardInner`/`extractToggleParams`
@@ -485,9 +533,9 @@ function extractLoadParams(params: unknown): { sessionId?: string; cwd?: string 
 // the checkpoints domain.
 
 // WS-GD.2a A9: `extractToggleParams` moved onto `dashboardToggles.ts` with
-// the rest of the dashboard-toggles domain; `errorMessage` (this file's own
-// copy) moved onto `sessionScopeActions.ts` — it had exactly one caller
-// (`loadTab`), which moved with it. `activeController`/`getPreset`/
+// the rest of the dashboard-toggles domain; the ORIGINAL `errorMessage` (this
+// file's own copy) moved onto `sessionScopeActions.ts` — it had exactly one
+// caller (`loadTab`), which moved with it. `activeController`/`getPreset`/
 // `getAvailableCommands`/`listTabs`/`setCustomMode`/
 // `handleCustomModesConfigChanged`/`loadTab` moved onto
 // `sessionScopeActions.ts` (own docs moved there verbatim, including the

@@ -29,98 +29,65 @@
  */
 import * as vscode from 'vscode';
 import { AutocompleteDebouncer } from '../debouncer';
-import { BackendHttpError } from '../backends/http';
-import { InsecureTransportError, isLoopbackHost } from '../backends/secureTransport';
 import { isSecretForCompletion } from '../../shared/secretPaths';
-import { scanSnippetForSecrets } from '../context/secretScanner';
 import { createEditTrackerAdapter, type EditTrackerAdapter } from '../context/editTrackerAdapter';
-import { isRecordableScheme, isTriggerableScheme } from '../context/recordableScheme';
+import { isTriggerableScheme } from '../context/recordableScheme';
 import type { FimActivityListener } from '../provider';
-import { regionAroundCursor, remapRange, type ContentChangeLite } from './anchors';
+import { OnceRegistry } from '../onceRegistry';
+import { regionAroundCursor } from './anchors';
 import { NextEditHttpBackend } from './backend';
-import { readNextEditConfig } from './config';
 import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
+import { attachFimActivity, detachFimActivity, fimActivityRelay } from './fimActivityRelay';
 import { reduceNextEdit } from './fsm';
-import { genericInstructFormat } from './formats/genericInstruct';
-import { sweepV2Format } from './formats/sweepV2';
-import type { NextEditFormat, RenderedNextEditPrompt } from './formats/types';
+import type { RenderedNextEditPrompt } from './formats/types';
 import { NextEditGuard } from './guard';
 import { resolveNextEditMode, type NextEditMode, type ToggleRequest, type ToggleState } from './mode';
+import { computeChangesAboveCursor, filterEgressableDiffs } from './nextEditEgress';
+import { describeTriggerFailure } from './nextEditFailureSurface';
+import {
+  deriveGenericTransport,
+  GENERIC_SETUP_NOTE,
+  genericUnsupportedBackendMessage,
+  NEXT_EDIT_MODEL_UNSET_NOTE,
+  resolveRoute,
+  type NextEditRoute,
+} from './nextEditRoute';
+import { buildFimActivity, registerCommands, registerListeners, type ShellHostSeams } from './nextEditShellWiring';
+import { ensureTrailingNewline, extractRegionRange, stripLineTerminator } from './nextEditText';
+import {
+  makeExecutor,
+  type NextEditContextKey,
+  type NextEditExecutor,
+  type NextEditExecutorHost,
+} from './nextEditExecutor';
 import { mintScannedNextEditRequest, NextEditMintRejectionError } from './scan';
 import type {
   AnchoredProposal,
   ApplyExpectation,
   EditableRegion,
-  LineRange,
-  NextEditEffect,
   NextEditFsmEvent,
   NextEditFsmState,
   NextEditRequest,
-  NextEditTransportId,
-  RecentDiff,
 } from './types';
 
-/** The two context keys the executor owns — it is their ONLY writer. */
-export type NextEditContextKey = 'talaria.nextEdit.jumpVisible' | 'talaria.nextEdit.jumped';
+/**
+ * WS-F3 F3-5 (FI-06): `NextEditContextKey`, `NextEditExecutorHost`,
+ * `NextEditExecutor` and `makeExecutor` moved verbatim to `./nextEditExecutor`
+ * (a vscode-FREE leaf, alongside the effect-executor core) — re-exported here
+ * so the shell's own public surface, and `shell.vscode.test.ts`'s
+ * `import { makeExecutor, type NextEditExecutorHost } from './shell.vscode'`,
+ * keep resolving through `./shell.vscode` with zero further edits, exactly as
+ * the F3-1 golden masters' own module doc anticipates ("F3-2..F3-8 move
+ * implementations to new modules but the shell RE-EXPORTS each one").
+ */
+export { makeExecutor };
+export type { NextEditContextKey, NextEditExecutorHost, NextEditExecutor };
 
 /** The edit-burst debounce. Matches `talaria.autocomplete.debounceMs`'s own
  *  350 ms default — next-edit rides the same "the user paused typing" signal
  *  FIM does, and reuses FIM's debouncer implementation rather than a second
  *  hand-rolled timer. */
 const TRIGGER_DEBOUNCE_MS = 350;
-
-/**
- * Transport defaults for an EMPTY `talaria.nextEdit.endpoint`, whose setting
- * description promises "Leave empty to use the backend's default". These
- * mirror `config.ts`'s own `DEFAULT_ENDPOINTS` rows for the two transports
- * next-edit supports (that table is module-private there, so the two rows are
- * restated rather than reached into).
- */
-const DEFAULT_NEXT_EDIT_ENDPOINTS: Readonly<Record<NextEditTransportId, string>> = Object.freeze({
-  ollama: 'http://127.0.0.1:11434',
-  'openai-compat': 'http://127.0.0.1:8000',
-});
-
-/**
- * `08` §6.3 — the one-shot Generic setup note, pinned copy. No detection
- * backs this (Global Constraints: "No orchestration. No code may measure
- * VRAM, detect hardware, count loaded models, or check whether models fit") —
- * it is a note, shown once per accepted generic toggle-on, and nothing more.
- */
-export const GENERIC_SETUP_NOTE =
-  "Generic next-edit sends ~6k-token prompts. Ollama's default context below 23 GiB VRAM is 4096: set OLLAMA_CONTEXT_LENGTH=16384 on your server, or proposals will be built from a truncated prompt.";
-
-/**
- * F-5 — the NEXT twin of {@link GENERIC_SETUP_NOTE}.
- *
- * `talaria.nextEdit.model` ships EMPTY (there is no sane default: the model is
- * served on the user's own endpoint), so flipping the NEXT row on with shipped
- * defaults used to be permanently, silently inert while the panel row read
- * "Uses sweep-next-edit-v2-7B on its own endpoint" in the present tense.
- * Generic got a one-shot setup note; NEXT — the source that actually REQUIRES
- * hand-editing `settings.json` — got nothing at all.
- *
- * Names the setting, because that is the only thing the user can act on. No
- * detection backs it (Global Constraints: nothing measures VRAM or checks
- * whether a model is loaded) — it fires on the observed empty string only.
- */
-export const NEXT_EDIT_MODEL_UNSET_NOTE =
-  'Next Edit is on, but "talaria.nextEdit.model" is empty — no suggestion can ever be produced. Set it in your settings (for example "sweep-next-edit-v2-7B"), together with "talaria.nextEdit.endpoint" if your model is not on the default port.';
-
-/**
- * `08` §5.3 / ADR-009 — why Generic REFUSES these two FIM backends rather
- * than silently producing garbage: an `openai-compat` FIM endpoint may be
- * Ollama's OpenAI surface, whose `/v1/completions` re-templates the prompt
- * with no `raw` escape (`openai/openai.go:777-786` sets no `Raw`;
- * `routes.go:508-541` wraps the prompt as a user chat message). Generic
- * renders its OWN complete chat prompt, so a second server-side templating
- * pass yields the well-formed-and-wrong class of failure — the kind no error
- * surface ever reports. Codestral's FIM API has no raw-completion route at
- * all. Actionable copy: names the offending backend and the exact way out.
- */
-export function genericUnsupportedBackendMessage(fimBackend: string): string {
-  return `Next Edit (Generic) cannot use the "${fimBackend}" autocomplete backend: that API re-templates the prompt server-side, which would silently corrupt the next-edit prompt. Set "talaria.autocomplete.backend" to ollama, vllm or llamacpp, or use the NEXT source instead.`;
-}
 
 /** Copy for every `noteOnce` msgId the FSM can emit. */
 const NOTE_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
@@ -129,215 +96,43 @@ const NOTE_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
 });
 
 /**
- * Generic's transport derivation (`08` §5.3 / ADR-009). `null` means
- * UNSUPPORTED — the generic toggle-on is refused, never silently downgraded.
+ * WS-F3 F3-3 (FI-06): `DEFAULT_NEXT_EDIT_ENDPOINTS`, `GENERIC_SETUP_NOTE`,
+ * `NEXT_EDIT_MODEL_UNSET_NOTE`, `genericUnsupportedBackendMessage` and
+ * `deriveGenericTransport` moved verbatim to `./nextEditRoute` (a vscode-FREE
+ * leaf, alongside the route-resolution core) — re-exported here so the
+ * shell's own public surface, and every internal call site below, keep
+ * resolving through `./shell.vscode` with zero further edits, exactly as the
+ * F3-1 golden masters' own module doc anticipates ("F3-2..F3-8 move
+ * implementations to new modules but the shell RE-EXPORTS each one").
  */
-export function deriveGenericTransport(fimBackend: string): NextEditTransportId | null {
-  if (fimBackend === 'ollama') return 'ollama';
-  if (fimBackend === 'vllm' || fimBackend === 'llamacpp') return 'openai-compat';
-  // 'codestral' and 'openai-compat' — see genericUnsupportedBackendMessage.
-  return null;
-}
-
-// ─────────────────────────────── the executor ────────────────────────────────
-
-/**
- * The executor's host port. Every effect the FSM can emit lands on exactly
- * one method here, so the executor's own logic (ordering, the forced
- * clear-all, the jumped-locator re-render, the noteOnce dedup) is testable
- * against a mock host with no editor in sight.
- */
-export interface NextEditExecutorHost {
-  setContext(key: NextEditContextKey, value: boolean): void;
-  /**
-   * `jumped` selects the locator's verb — `Tab to jump` vs `Tab to accept`.
-   *
-   * Returns whether the paint actually reached the screen. F-1: a host whose
-   * editor is gone (or is no longer the one this proposal belongs to) DECLINES
-   * rather than painting, and a declined paint must clear the pair — see
-   * property 1 below. A `void` return let a silent early return leave
-   * `jumpVisible` up with nothing on screen.
-   */
-  showDecorations(p: AnchoredProposal, jumped: boolean): boolean;
-  clearDecorations(): void;
-  reveal(range: LineRange): void;
-  /**
-   * BHF-F3-15: `expected` is the dispatch-time freshness snapshot (see
-   * `dispatch()`); the host MUST re-validate document.version and the
-   * region's base text against it immediately before the WorkspaceEdit and
-   * resolve `false` on ANY mismatch — that `false` is the FSM's
-   * `applyResult` and routes to the existing dismiss+note path. `null`
-   * (no live proposal at dispatch) MUST also resolve `false`.
-   */
-  applyEdit(region: EditableRegion, newText: string, expected: ApplyExpectation | null): Promise<boolean>;
-  note(msgId: string): void;
-}
-
-export interface NextEditExecutor {
-  run(effects: readonly NextEditEffect[]): void;
-}
-
-/**
- * Executes one FSM effect batch.
- *
- * Three properties this function owns, none of which the FSM can enforce on
- * its own because they are about the SIDE of the boundary where things can
- * fail:
- *
- *  1. **The invariant that replaced the deleted wall-clock timeout**: after
- *     every batch, `talaria.nextEdit.jumpVisible` is up if and only if
- *     decorations are on screen. The FSM guarantees the batches are
- *     well-formed; this function guarantees a THROWING host cannot leave the
- *     pair half-set — any exception mid-batch forces a full `clearAll`. A
- *     stuck `jumpVisible` with nothing on screen would silently steal Tab.
- *     F-1 closed the other half of that guarantee: a host that DECLINES to
- *     paint (returns `false` — a silent early return, not a throw) used to
- *     walk straight through the exception guard, which is precisely the
- *     failure this property names. A declined paint now forces the same
- *     `clearAll`, so the invariant holds for both failure shapes.
- *  2. **The jumped locator re-render**: `reduceNextEdit`'s `proposed×tabJump`
- *     batch is `[setContext jumped, reveal]` — deliberately no
- *     `showDecorations`, because the PROPOSAL did not change, only its
- *     presentation. The executor therefore re-renders the locator itself when
- *     the `jumped` key flips while a proposal is on screen.
- *  3. **`noteOnce` is once**: deduped per msgId for the life of the executor.
- *     (Distinct from the Guard's refusal alerts, which deliberately re-fire —
- *     a refusal answers a fresh user gesture, a note reports a condition.)
- *
- * NO TIMER anywhere in here: no proposal expires on a wall clock (`08` §7.6 —
- * the vendor lifetime enum is Accepted|Rejected|Ignored, there is no Timeout).
- */
-export function makeExecutor(
-  host: NextEditExecutorHost,
-  onApplyResult: (ok: boolean) => void,
-  /** BHF-F3-15 — read synchronously when an `applyEdit` effect executes;
-   *  REQUIRED so forgetting it is a compile error, not a silent fail-open. */
-  getApplyExpectation: () => ApplyExpectation | null,
-): NextEditExecutor {
-  let shownProposal: AnchoredProposal | null = null;
-  let jumped = false;
-  const noted = new Set<string>();
-
-  function clearAll(): void {
-    host.setContext('talaria.nextEdit.jumpVisible', false);
-    host.setContext('talaria.nextEdit.jumped', false);
-    host.clearDecorations();
-    shownProposal = null;
-    jumped = false;
-  }
-
-  function applyOne(effect: NextEditEffect): void {
-    switch (effect.kind) {
-      case 'setContext': {
-        host.setContext(effect.key, effect.value);
-        if (effect.key === 'talaria.nextEdit.jumped') {
-          jumped = effect.value;
-          // Property 2 above — re-render the locator's verb in place.
-          if (shownProposal !== null && !host.showDecorations(shownProposal, jumped)) {
-            clearAll();
-          }
-        }
-        return;
-      }
-      case 'showDecorations': {
-        if (!host.showDecorations(effect.p, jumped)) {
-          // F-1: the paint was declined, so there is nothing on screen. Taking
-          // the batch's `jumpVisible = true` at face value here is exactly the
-          // stuck-context-key failure property 1 forbids.
-          clearAll();
-          return;
-        }
-        shownProposal = effect.p;
-        return;
-      }
-      case 'reveal': {
-        host.reveal(effect.range);
-        return;
-      }
-      case 'applyEdit': {
-        // The boolean comes back as the FSM's `applyResult` event. A REJECTED
-        // `applyEdit` is reported as `false` (fail-closed: dismiss + note),
-        // never left as an unhandled rejection. BHF-F3-15: the expectation is
-        // read HERE, synchronously within this run — a later dispatch
-        // overwriting the shell's snapshot cannot affect an apply already
-        // dispatched.
-        void host.applyEdit(effect.region, effect.newText, getApplyExpectation()).then(
-          (ok) => onApplyResult(ok),
-          () => onApplyResult(false),
-        );
-        return;
-      }
-      case 'clearAll': {
-        clearAll();
-        return;
-      }
-      case 'noteOnce': {
-        if (noted.has(effect.msgId)) return;
-        noted.add(effect.msgId);
-        host.note(effect.msgId);
-        return;
-      }
-    }
-  }
-
-  return {
-    run(effects: readonly NextEditEffect[]): void {
-      try {
-        for (const effect of effects) {
-          applyOne(effect);
-        }
-      } catch {
-        // Property 1 above. `clearAll` itself touching a broken host would
-        // throw out of `run`, which is the honest outcome — there is nothing
-        // left to fall back to, and swallowing it would hide a dead executor.
-        clearAll();
-      }
-    },
-  };
-}
+export { deriveGenericTransport, GENERIC_SETUP_NOTE, NEXT_EDIT_MODEL_UNSET_NOTE, genericUnsupportedBackendMessage };
 
 // ──────────────────────────────── the FIM seam ───────────────────────────────
 
 /**
- * The command VS Code executes when the user ACCEPTS FIM ghost text — the R4
- * seam. Registered exactly once, by `registerTalariaNextEdit` below, and
- * advertised to `provider.ts` through `acceptCommandId()` ONLY by the
- * registration that registered it. `provider.ts` never names this string: an
- * item can therefore not carry a command id that nothing has registered.
+ * WS-F3 F3-8 (FI-07): `FIM_ACCEPT_COMMAND` (the R4 seam's command id) moved
+ * verbatim to `./nextEditShellWiring`, alongside its two use sites
+ * (`buildFimActivity`'s `acceptCommandId` and `registerCommands`'s fourth
+ * registration) — both moved there in the same commit, so the constant moved
+ * with them rather than being re-exported. Nothing in `shell.vscode.ts`
+ * itself names it any more; the ctor advertises it indirectly, by calling
+ * `attachFimActivity(this.fimActivity)` AFTER `registerCommands` has run.
  */
-const FIM_ACCEPT_COMMAND = 'talaria.nextEdit.onFimAccept';
-
-const NO_OP_FIM_ACTIVITY: FimActivityListener = {
-  requestStarted: () => {},
-  resultShown: () => {},
-  accepted: () => {},
-  acceptCommandId: () => undefined,
-};
-
-let currentFimActivity: FimActivityListener = NO_OP_FIM_ACTIVITY;
 
 /**
- * The stable object `index.ts` hands to `TalariaInlineCompletionProvider`.
- *
- * Composition-order problem it solves: the provider is constructed by
- * `registerTalariaAutocomplete`, the listener's real implementation by
- * `registerTalariaNextEdit`, and neither can hold the other's result at
- * construction time — while `registerTalariaNextEdit`'s signature is pinned to
- * return a bare `Disposable`. This relay is a fixed forwarding address: it is
- * a no-op until the shell attaches (so a build with next-edit unregistered
- * behaves exactly as before), and reverts to a no-op on dispose.
- *
- * Observation-only in BOTH directions of the R2 rule: FIM tells next-edit
- * what it is doing; next-edit holds no handle that could cancel FIM.
+ * WS-F3 F3-6 (FI-06): `NO_OP_FIM_ACTIVITY`, the module-level `currentFimActivity`
+ * slot, and `fimActivityRelay` itself moved verbatim to `./fimActivityRelay`
+ * (a vscode-FREE leaf; the slot is KEPT BY DESIGN — provider→shell
+ * decoupling, and FI-26's future home, task F10-2) — re-exported here so the
+ * shell's own public surface, and `provider.ts`'s/`index.ts`'s
+ * `import { fimActivityRelay, ... } from './nextedit/shell.vscode'` plus
+ * `shell.vscode.test.ts`'s and `nextedit.golden.shell.test.ts`'s own
+ * `import { fimActivityRelay, ... } from './shell.vscode'`, keep resolving
+ * through `./shell.vscode` with zero further edits, exactly as the F3-1
+ * golden masters' own module doc anticipates ("F3-2..F3-8 move
+ * implementations to new modules but the shell RE-EXPORTS each one").
  */
-export const fimActivityRelay: FimActivityListener = {
-  requestStarted: () => currentFimActivity.requestStarted(),
-  resultShown: (hasItem: boolean) => currentFimActivity.resultShown(hasItem),
-  accepted: () => currentFimActivity.accepted(),
-  // Forwarded, never answered here: the relay must report what the CURRENTLY
-  // attached registration has registered — `undefined` while none is.
-  acceptCommandId: () => currentFimActivity.acceptCommandId(),
-};
+export { fimActivityRelay };
 
 // ───────────────────────────── the toggle gate ───────────────────────────────
 
@@ -422,374 +217,56 @@ export async function requestNextEditToggle(
 
 // ────────────────────────────── request building ─────────────────────────────
 
-interface NextEditRoute {
-  format: NextEditFormat;
-  transport: NextEditTransportId;
-  apiBase: string;
-  model: string;
-  /** Non-loopback endpoint — the half of the trust gate that does not need
-   *  `vscode.workspace.isTrusted` and so can be computed before it. */
-  remote: boolean;
-  /**
-   * Set ONLY by the generic branch. `undefined` on the NEXT branch, by
-   * construction — that is what keeps "NEXT gets no key" a structural
-   * property rather than an intention.
-   */
-  apiKey?: string;
-}
-
 /**
- * S4.3 parity with `index.ts`'s own `isLoopbackEndpoint`: reuses
- * `secureTransport.ts`'s single loopback source of truth, and treats a
- * malformed URL as NON-loopback — which fails CLOSED (an untrusted workspace
- * then skips rather than shipping code off-box).
+ * WS-F3 F3-3 (FI-06): the `NextEditRoute` shape, `isLoopbackEndpoint`,
+ * `RouteResolution` and `resolveRoute` (plus `endpointLabel`) moved verbatim
+ * to `./nextEditRoute` (a vscode-FREE leaf) — imported above where the shell
+ * still consumes them (`resolveRoute` from `resolveReportedRoute` below,
+ * `NextEditRoute` as the type every method below still spells).
+ * `isLoopbackEndpoint` and `RouteResolution` are module-private/unused-by-name
+ * in this file; neither was part of the shell's public surface before the
+ * move, so neither needs re-exporting — the F3-1 goldens observe them only
+ * through `registerTalariaNextEdit`, unaffected by this move. `endpointLabel`
+ * itself is no longer imported HERE at all (WS-F3 F3-7, FI-13):
+ * `surfaceTriggerFailure`'s only caller of it moved to
+ * `nextEditFailureSurface.ts`'s `describeTriggerFailure`, which imports
+ * `endpointLabel` directly from `./nextEditRoute`.
  */
-function isLoopbackEndpoint(rawUrl: string): boolean {
-  try {
-    return isLoopbackHost(new URL(rawUrl).hostname);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Why no request can be built — the shape that lets the trigger tell a
- * SILENT skip from a condition the user can actually fix (F-5, C-5). Before
- * this, every one of these collapsed into a bare `null` and the feature went
- * quietly dead with the panel row still reading as if it were running.
- */
-type RouteResolution =
-  | { kind: 'route'; route: NextEditRoute }
-  /** NEXT is on but `talaria.nextEdit.model` is empty — actionable (F-5). */
-  | { kind: 'next-model-unset' }
-  /** Generic against a FIM backend whose API re-templates the prompt. The
-   *  toggle-time refusal (`requestNextEditToggle`) cannot cover this: the
-   *  backend can be changed AFTER Generic was ratified (C-5). */
-  | { kind: 'generic-unsupported-backend'; fimBackend: string }
-  /** Generic with no endpoint/model at all — see the note at the site. */
-  | { kind: 'generic-unconfigured' }
-  /** Mode is off. Unreachable from `trigger()` (GATE 1 already returned). */
-  | { kind: 'mode-off' };
-
-/**
- * Endpoint/model/transport/format per mode (`08` §5.3):
- *  - `next`    ⇒ `talaria.nextEdit.{endpoint,model,backend}` + sweep-v2;
- *  - `generic` ⇒ the AUTOCOMPLETE endpoint+model + generic-instruct, with the
- *                transport DERIVED from the FIM backend id.
- *
- * Anything but `'route'` = build nothing. An unconfigured model is one such
- * case: it cannot produce anything but a 404, and `backend.ts`'s fail-closed
- * model reconciliation would refuse it at the wire anyway. Note that
- * `route.model` is the SINGLE source for both `NextEditRequest.model` and the
- * backend's `opts.model`, which is what makes that reconciliation check
- * unfailable here by construction.
- */
-function resolveRoute(mode: NextEditMode, deps: NextEditShellDeps): RouteResolution {
-  if (mode === 'next') {
-    const cfg = readNextEditConfig();
-    if (cfg.model === '') return { kind: 'next-model-unset' };
-    const apiBase = cfg.endpoint === '' ? DEFAULT_NEXT_EDIT_ENDPOINTS[cfg.backend] : cfg.endpoint;
-    return {
-      kind: 'route',
-      route: {
-        format: sweepV2Format,
-        transport: cfg.backend,
-        apiBase,
-        model: cfg.model,
-        remote: !isLoopbackEndpoint(apiBase),
-      },
-    };
-  }
-
-  if (mode === 'generic') {
-    const fimBackend = deps.getAutocompleteBackend();
-    const transport = deriveGenericTransport(fimBackend);
-    if (transport === null) return { kind: 'generic-unsupported-backend', fimBackend };
-    const apiBase = deps.getAutocompleteEndpoint();
-    const model = deps.getAutocompleteModel();
-    // JUSTIFIED, not dead (the final review flagged it as dead code): it IS
-    // unreachable through the shipped composition root, because `index.ts`
-    // feeds these from `readConfig()`, which coerces both to a default
-    // (`config.ts:76,83`). But `NextEditShellDeps` is a plain interface, not a
-    // binding to `readConfig` — any other implementation of it may return ''.
-    // Removing this check would send an empty apiBase to `joinUrl` and an
-    // empty model to the wire, which is a worse failure than skipping. Kept
-    // deliberately as an interface-contract check, and silent because there is
-    // no user-facing setting that can be in this state.
-    if (apiBase === '' || model === '') return { kind: 'generic-unconfigured' };
-    const genericApiKey = deps.getAutocompleteApiKey();
-    return {
-      kind: 'route',
-      route: {
-        format: genericInstructFormat,
-        transport,
-        apiBase,
-        model,
-        remote: !isLoopbackEndpoint(apiBase),
-        ...(genericApiKey !== undefined ? { apiKey: genericApiKey } : {}),
-      },
-    };
-  }
-
-  return { kind: 'mode-off' };
-}
-
-/**
- * The host label for a user-facing message: `URL.host` only.
- *
- * Deliberately NOT the raw `apiBase` — a URL may carry `user:password@`
- * userinfo, and `host` is the one accessor that cannot return it (Global
- * Constraint: error messages never carry an API key). A malformed endpoint has
- * no host to name, so it degrades to a neutral phrase rather than echoing the
- * unparsed string back at the user.
- */
-function endpointLabel(apiBase: string): string {
-  try {
-    return new URL(apiBase).host;
-  } catch {
-    return 'the configured endpoint';
-  }
-}
-
-/** Splits `text` into whole lines, each keeping its own trailing '\n'. */
-function splitKeepingNewlines(text: string): string[] {
-  const parts = text.split('\n');
-  const lines: string[] = [];
-  for (let i = 0; i < parts.length - 1; i++) {
-    lines.push(`${parts[i]}\n`);
-  }
-  const last = parts[parts.length - 1];
-  // `text.split('\n')` always yields at least one element, so `last` is
-  // always present; the undefined branch is unreachable (kept for
-  // totality/type safety, not a behavior change).
-  if (last !== undefined && last !== '') {
-    lines.push(last);
-  }
-  return lines;
-}
-
-/** The `[startLine, endLine]` (inclusive) span of `text`. */
-function extractLines(text: string, startLine: number, endLine: number): string {
-  return splitKeepingNewlines(text).slice(startLine, endLine + 1).join('');
-}
 
 /** Workspace-relative POSIX path, mirroring `editTrackerAdapter.ts`'s helper
- *  (Fedora/Linux target; workspace URIs are always '/'-separated). */
+ *  (Fedora/Linux target; workspace URIs are always '/'-separated).
+ *
+ *  STAYS here (WS-F3 F3-2, critic I-1): unlike the three text helpers below,
+ *  this one calls `vscode.workspace.asRelativePath` on a `vscode.Uri` and is
+ *  therefore NOT pure — moving it into the vscode-FREE `nextEditText.ts`
+ *  would break that module's purity boundary (`nextEditPurity.test.ts`). */
 function toWorkspaceRelativePosixPath(uri: vscode.Uri): string {
   return vscode.workspace.asRelativePath(uri, false).split('\\').join('/');
 }
 
 /**
- * CONTRACT (`formats/*`): `fileContext` must end in '\n' — the sweepV2 render
- * splices it directly into the template and the vendor builds the equivalent
- * value via `"".join(lines)`, i.e. always newline-terminated. A file whose
- * last line has no terminator would otherwise glue `{initial_file}` to the
- * next template line.
+ * WS-F3 F3-2 (FI-06): `ensureTrailingNewline`, `stripLineTerminator`, and
+ * `extractRegionRange` moved verbatim to `./nextEditText` (a vscode-FREE pure
+ * leaf) — re-exported here so the shell's own surface, and every internal
+ * call site below, keep resolving through `./shell.vscode` with zero further
+ * edits, exactly as the F3-1 golden masters' own module doc anticipates
+ * ("F3-2..F3-8 move implementations to new modules but the shell RE-EXPORTS
+ * each one").
  */
-function ensureTrailingNewline(text: string): string {
-  return text.endsWith('\n') ? text : `${text}\n`;
-}
-
-/** `text` without ONE trailing line terminator, `\r\n` preferred over `\n`.
- *  Never strips a second one: a genuinely blank final line is content. */
-function stripLineTerminator(text: string): string {
-  if (text.endsWith('\r\n')) return text.slice(0, -2);
-  if (text.endsWith('\n')) return text.slice(0, -1);
-  return text;
-}
+export { ensureTrailingNewline, stripLineTerminator, extractRegionRange };
 
 /**
- * C-3 / ADR-018. Reads `text`'s `[startLine, endLine]` span as the SAME RANGE
- * `region.content` is read as, only against the pre-edit text instead of the
- * live document — i.e. the mirror of
- * `getText(new Range(startLine, 0, endLine, lineAt(endLine).text.length))`.
- *
- * Those two values become sweep-v2's `original/` and `current/` blocks — the
- * pair the model diffs — so any difference between them that the user did not
- * make is noise on exactly the axis the model is trained to read as "what the
- * user just changed". `getText` stops at the last line's TEXT LENGTH, before
- * its terminator; `extractLines` KEEPS terminators. Composing the two here is
- * what makes the pair agree by construction rather than by coincidence.
- *
- * The terminator is dropped only when `endLine` names a line `extractLines`
- * actually produced. When the span instead runs past the end — to the empty
- * line a trailing newline creates — `getText` stops there too, so the
- * preceding terminator is inside BOTH blocks and must stay. Dropping it
- * unconditionally would inject the same phantom difference in the other
- * direction, including for an untouched region, where the two blocks must be
- * byte-identical.
- *
- * The vendor has no such asymmetry by construction: `inference.py` assigns
- * literally the same string to both blocks, and v1's `run_model.py` passes
- * both through one join.
+ * WS-F3 F3-4 (FI-06, FI-27): `diffMayEgress`, `filterEgressableDiffs`
+ * (renamed from `partitionEgressableDiffs`, now returning the kept list
+ * only), `computeChangesAboveCursor`, and `toContentChangeLites` moved
+ * verbatim to `./nextEditEgress` (a vscode-FREE leaf) — `diffMayEgress` is
+ * re-exported here so `diffEgressDrift.lock.test.ts`'s own
+ * `import { diffMayEgress } from './shell.vscode'` keeps resolving through
+ * `./shell.vscode` with zero further edits, exactly as the F3-1 golden
+ * masters' own module doc anticipates ("F3-2..F3-8 move implementations to
+ * new modules but the shell RE-EXPORTS each one").
  */
-function extractRegionRange(text: string, startLine: number, endLine: number): string {
-  const lineCount = splitKeepingNewlines(text).length;
-  const span = extractLines(text, startLine, endLine);
-  return endLine < lineCount ? stripLineTerminator(span) : span;
-}
-
-/**
- * F-3 — would this ONE diff survive the mint's own per-field checks?
- *
- * Runs exactly what `scan.ts` runs for a `diffs[]` entry, in the same order
- * (sentinel guard, then `scanSnippetForSecrets`, throw-is-reject), against the
- * SAME `diff.filepath` string the mint will use. That identity is the whole
- * point: normalizing the path here — or checking a different predicate, e.g.
- * the active-file `isSecretForCompletion` gate — would let a diff pass this
- * filter and still abort the mint, which is the bug this closes.
- *
- * An EMPTY sentinel is deliberately not treated as a diff verdict: the mint
- * rejects the whole request for it (`ruleId=empty-sentinel`, a caller-contract
- * bug, not content), and quietly dropping every diff would hide that.
- *
- * FINAL REVIEW — FINDING 7. That identity used to be held by this comment
- * alone. Behavioural tests covered the FILTER, but nothing tied its verdict to
- * the MINT's, and the two are separate code paths that must agree exactly:
- * a diff that passes this filter while the mint still aborts fails CLOSED into
- * a silent kill — every next-edit request in every file dies at the mint with
- * the trigger's catch reporting nothing, which is the precise bug F-3 existed
- * to fix. Same shape the five duplicated line-splitters had before
- * `lineSplitDrift.lock.test.ts` tied them.
- *
- * EXPORTED ONLY for that lock (`diffEgressDrift.lock.test.ts`), mirroring
- * `scan.ts`'s own `contentChecksFor` — "Exported ONLY for the fail-closed
- * drift lock in scan.test.ts". Not part of the shell's API; no production
- * caller outside this module.
- */
-export function diffMayEgress(diff: RecentDiff, sentinels: readonly string[]): boolean {
-  for (const content of [diff.before, diff.after]) {
-    for (const sentinel of sentinels) {
-      if (sentinel.length > 0 && content.includes(sentinel)) return false;
-    }
-    let allowed: boolean;
-    try {
-      allowed = scanSnippetForSecrets({ path: diff.filepath, content }).allowed;
-    } catch {
-      allowed = false; // fail-closed, mirroring ringBuffer.ingest's throw-is-reject
-    }
-    if (!allowed) return false;
-  }
-  return true;
-}
-
-/**
- * F-3 — the caller-side filter that keeps ONE poisoned diff from killing the
- * whole feature.
- *
- * `getRecentDiffs()` is a CROSS-DOCUMENT ring (`editTrackerAdapter.ts`), so a
- * single edit in `.env` used to make every next-edit request in every file
- * abort at the mint (first reject aborts the whole mint) — silently, because
- * the trigger's catch reported nothing. `ringBuffer.ingest` already answers
- * this for the FIM side: DROP the offending entry, keep the feature alive
- * everywhere else.
- *
- * This does not weaken the mint and cannot: the mint still fail-closed-scans
- * everything it is handed, including these very diffs, and remains the
- * authority. This only stops the shell from handing it auxiliary context it
- * had no business collecting for egress in the first place.
- *
- * `dropped` — WHAT IT IS AND IS NOT (corrected, final review Finding 6).
- *
- * This comment used to say the count "is returned so the trigger can note it
- * once (`08` §9.3: 'scan rejects count + note once') rather than dropping in
- * silence". That was written in the present tense about something that has
- * never happened: NOTHING READS `.dropped`. The sole call site
- * (`buildAndRun`, below) destructures `.kept` and nothing else, so drops ARE
- * silent — the comment asserted the opposite of the behaviour, which is the
- * third time on this branch a wrong reason in a comment has outlived the code
- * it described.
- *
- * The silence is nonetheless CORRECT today, and the count is deliberately
- * kept. Both facts are already recorded in `08` §9.3's own addendum: the
- * "count + note once" half is "a counter, not a feature… a deliberate scope
- * cut for fix wave 1 (F-4), not an oversight; wiring the drop count into a
- * one-shot note is open for a future wave, not silently abandoned."
- *
- * Silence is also the right default on the evidence, not merely the shipped
- * one: the FIM sibling this whole design cites — `ringBuffer.ingest` — drops a
- * rejected window with a bare `return`, no report and no toast. A drop here is
- * the protection WORKING, not a failure, and every other message path in this
- * file pairs `reportFailure` with a modal `showWarningMessage`. Noting a
- * routine, correct drop through that pair would be user-hostile noise.
- *
- * Whatever a future wave does with the count, the standing constraint on it is
- * unchanged: the COUNT only — never the path, never the matched text, never
- * the content.
- */
-function partitionEgressableDiffs(
-  diffs: readonly RecentDiff[],
-  sentinels: readonly string[],
-): { kept: readonly RecentDiff[]; dropped: number } {
-  const kept: RecentDiff[] = [];
-  let dropped = 0;
-  for (const diff of diffs) {
-    if (diffMayEgress(diff, sentinels)) {
-      kept.push(diff);
-    } else {
-      dropped += 1;
-    }
-  }
-  return { kept, dropped };
-}
-
-/**
- * `changesAboveCursor` — DOCUMENTED HEURISTIC, not vendor behaviour.
- * `compute_prefill` takes this flag as a caller-supplied parameter and the
- * vendor reference never shows how its own host derives it (**не нашёл
- * источник**). This implementation: true when the most recent tracked diff
- * for THIS document lies entirely above the cursor line. Being wrong is
- * cosmetic-to-mild — the flag only selects which of `compute_prefill`'s two
- * branches computes the prefill, and both branches produce a legal prefill.
- *
- * C-4 — MIXED COORDINATE SPACES, deliberately. `diff.endLine` is an OLD,
- * PRE-CHANGE document coordinate (see `RecentDiff` in `./types.ts`) while
- * `cursorLine` is a CURRENT one, so this comparison is approximate by
- * construction and drifts further the more edits land after the diff was
- * recorded. That is tolerable ONLY because of the paragraph above: both
- * answers produce a legal prefill, so the imprecision is cosmetic. Do not
- * copy this comparison into any site where being wrong is not cosmetic —
- * re-base the diff first, or use a different signal.
- */
-function computeChangesAboveCursor(
-  diffs: readonly RecentDiff[],
-  uri: string,
-  cursorLine: number,
-): boolean {
-  const mostRecent = diffs.find((diff) => diff.uri === uri);
-  return mostRecent !== undefined && mostRecent.endLine < cursorLine;
-}
-
-/**
- * Assembles `ContentChangeLite[]` from a raw change event.
- *
- * ORDERING CONTRACT (`anchors.ts`): `remapRange` does NOT re-sort — whoever
- * assembles its input must resolve delivery order FIRST. VS Code gives no
- * ordering guarantee for a multi-part `contentChanges` array
- * (microsoft/vscode#11487), and every `change.range` is expressed in the
- * OLD/pre-change document, so this mirrors `editTrackerAdapter.ts`'s
- * established descending sort (highest start position first): applying a
- * HIGHER change first never shifts the line numbers a LOWER, not-yet-applied
- * change still refers to. The source array is readonly — copy before sorting.
- */
-function toContentChangeLites(
-  changes: readonly vscode.TextDocumentContentChangeEvent[],
-): ContentChangeLite[] {
-  return [...changes]
-    .sort((a, b) => {
-      if (a.range.start.line !== b.range.start.line) {
-        return b.range.start.line - a.range.start.line;
-      }
-      return b.range.start.character - a.range.start.character;
-    })
-    .map((change) => ({
-      startLine: change.range.start.line,
-      endLine: change.range.end.line,
-      // Replacing the inclusive span [start, end] with text carrying N
-      // newlines yields N+1 lines.
-      newLineCount: (change.text.match(/\n/g) ?? []).length + 1,
-    }));
-}
+export { diffMayEgress } from './nextEditEgress';
 
 // ─────────────────────────────── registration ────────────────────────────────
 
@@ -830,6 +307,21 @@ class NextEditShell {
    */
   private readonly fim = { visible: false, inFlightCount: 0 };
   private readonly debouncer = new AutocompleteDebouncer();
+
+  /**
+   * FI-26 (FSU §5 Q4) — task F10-2b: ONE {@link OnceRegistry} instance for
+   * the whole shell lifetime (per activation — `NextEditShell` is
+   * constructed once per `registerTalariaNextEdit` call). `runPrediction`
+   * constructs a fresh `NextEditHttpBackend` per prediction attempt but
+   * always passes THIS SAME instance as `registry` — never a fresh
+   * `new OnceRegistry()` per prediction, which would reset dedup on every
+   * attempt (warn every time = a regression). Sharing this one instance
+   * across predictions gives warn-once-per-activation, matching the FIM
+   * path's own activation-scoped registry (`index.ts`'s `onceRegistry`,
+   * threaded to `backendFactory.ts`'s `createBackend` and to
+   * `provider.ts`'s construction).
+   */
+  private readonly onceRegistry = new OnceRegistry();
 
   /**
    * CF-20-lazy — `createEditTrackerAdapter()` is next-edit's HALF of two
@@ -891,8 +383,9 @@ class NextEditShell {
 
   /**
    * Held under its own name so `dispose()` below can prove it still OWNS the
-   * module-level relay slot before clearing it — `currentFimActivity` is a
-   * single shared slot, and a newer registration may already have taken it.
+   * module-level relay slot before clearing it — `./fimActivityRelay`'s
+   * `currentFimActivity` is a single shared slot, and a newer registration
+   * may already have taken it.
    */
   private readonly fimActivity: FimActivityListener;
 
@@ -1033,172 +526,55 @@ class NextEditShell {
       () => this.pendingApplyExpectation,
     );
 
-    this.fimActivity = {
-      requestStarted: () => {
-        this.fim.inFlightCount += 1;
-        try {
-          // R2, the direction that matters: FIM-start aborts next-edit. Never
-          // the reverse — nothing in this module can cancel a FIM request.
-          this.abortInFlight();
-          this.dispatch({ kind: 'fimVisibility', visible: true });
-        } catch {
-          // Must not escape this call: `provider.ts` sets its own
-          // `fimRequested` flag only AFTER `requestStarted()` returns, and
-          // only a set flag makes its `finally` call the paired
-          // `resultShown` later. A throw here (e.g. `dispatch()` reaching a
-          // throwing host) would skip that flag and strand the increment
-          // above forever — unlike the boolean this refcount replaced, it
-          // does not self-heal on the next FIM cycle. The count's integrity
-          // matters more than reporting whatever failed downstream.
-        }
+    // WS-F3 F3-8 (FI-07): the NARROW port `buildFimActivity`/
+    // `registerListeners`/`registerCommands` (`./nextEditShellWiring`) close
+    // over — an EXPLICIT seam object, never `this` itself (`fim`/`dispatch`/
+    // `armTrigger`/`abortInFlight`/`currentProposal` are all `private`, and
+    // passing `this` structurally into a public interface naming a private
+    // member does not type-check under `strict`). `fim` is the SAME mutable
+    // object this class holds (reference-shared, no copy); `trackedVersion`
+    // is a get/set ACCESSOR PROPERTY bridging to the class's own private
+    // field, precisely so every moved block's `this.trackedVersion` becomes
+    // `seams.trackedVersion` — a literal rename, not a reshaping into method
+    // calls. `shell` is captured because a `get`/`set` accessor shorthand's
+    // own `this` binds to the object literal it lives on, not the enclosing
+    // constructor's `this`.
+    const shell = this;
+    const hostSeams: ShellHostSeams = {
+      fim: this.fim,
+      get trackedVersion(): number | null {
+        return shell.trackedVersion;
       },
-      resultShown: (hasItem: boolean) => {
-        if (this.fim.inFlightCount === 0) {
-          // UNPAIRED settle: a settle whose `requestStarted` was delivered to
-          // a PREVIOUS registration (the relay swapped while that request was
-          // in flight), or a stray duplicate — either way nothing of ours is
-          // outstanding to count out. Complete no-op: touching `visible` here
-          // could silently clear a GENUINELY visible ghost-text flag set by a
-          // real, unrelated request, reopening GATE 2 against R2.
-          return;
-        }
-        this.fim.inFlightCount -= 1;
-        // SUPERSEDED settle — a NEWER FIM request is still in flight, so this
-        // result speaks for a request VS Code has already cancelled and whose
-        // item it discarded. It may not report on visibility at all: the
-        // newest request is the one that gets to settle that, and until it
-        // does the refcount above holds GATE 2 closed on its own. Treating a
-        // stale settle as authoritative is what let a boolean `visible` be
-        // cleared out from under a live FIM request.
-        if (this.fim.inFlightCount > 0) return;
-        // Conservative visibility: a non-null item COUNTS as on screen, even
-        // though VS Code may still decline to render it.
-        this.fim.visible = hasItem;
-        this.dispatch({ kind: 'fimVisibility', visible: hasItem });
+      set trackedVersion(value: number | null) {
+        shell.trackedVersion = value;
       },
-      accepted: () => {
-        // The ghost text was consumed, so FIM is no longer on screen — and this
-        // is the R4 seam: the post-FIM-accept moment is exactly when a next
-        // edit is most likely to exist.
-        //
-        // The refcount is deliberately NOT zeroed here. `provider.ts` pairs
-        // every `requestStarted` with a `resultShown` in its own `finally`, so
-        // the request that produced this accepted item has already been counted
-        // out; any count still standing belongs to a LATER request that is
-        // genuinely in flight. Zeroing it would discard that and reopen GATE 2
-        // against R2 — the armed trigger below simply waits for it instead.
-        this.fim.visible = false;
-        this.dispatch({ kind: 'fimVisibility', visible: false });
-        this.armTrigger();
-      },
-      // Safe to answer unconditionally: this object only ever reaches the relay
-      // AFTER the command below is registered (see the attach site at the end of
-      // this function), and it leaves the relay when this registration disposes.
-      acceptCommandId: () => FIM_ACCEPT_COMMAND,
+      dispatch: (event) => this.dispatch(event),
+      armTrigger: () => this.armTrigger(),
+      abortInFlight: () => this.abortInFlight(),
+      currentProposal: () => this.currentProposal(),
     };
 
-    // ── listeners ────────────────────────────────────────────────────────────
-
-    const changeSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
-      // CF-19 — GATE-4 parity: a non-recordable scheme (Output/SCM/etc.) must
-      // not arm anything at all. Before this guard, `armTrigger()` ran
-      // unconditionally on EVERY `onDidChangeTextDocument` event regardless of
-      // which document changed, so edit-burst noise from an unrelated
-      // Output/SCM document could arm (and eventually fire) a next-edit
-      // request against the CURRENT active editor — a document GATE-4 would
-      // separately have to be scheme-valid on its own, but the arm itself
-      // never checked the document that actually changed.
-      if (!isRecordableScheme(e.document.uri.scheme)) return;
-
-      // Source 2 of the ONE trigger path: the debounced edit burst. Armed
-      // unconditionally (once past the scheme guard above) — `trigger()`
-      // itself resolves which editor/document is current, so no editor lookup
-      // is needed (or wanted) this early.
-      this.armTrigger();
-
-      const proposal = this.currentProposal();
-      if (proposal === null || proposal.region.uri !== e.document.uri.toString()) return;
-
-      if (e.contentChanges.length === 0) {
-        // A metadata-only event (dirty-flag, EOL, save) still bumps `version`.
-        // Nothing textual moved, so re-baseline instead of dismissing.
-        this.trackedVersion = e.document.version;
-        return;
-      }
-
-      if (this.trackedVersion === null || e.document.version !== this.trackedVersion + 1) {
-        // Versions skipped ⇒ at least one change event never reached us, so the
-        // changes in hand cannot describe the full delta. Fail closed.
-        this.dispatch({ kind: 'docChanged', remapped: null });
-        return;
-      }
-
-      const remapped = remapRange(
-        { startLine: proposal.region.startLine, endLine: proposal.region.endLine },
-        toContentChangeLites(e.contentChanges),
-      );
-      this.trackedVersion = e.document.version;
-      this.dispatch({ kind: 'docChanged', remapped });
-    });
-
-    const activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor(() => {
-      // C-6 — the one clearer `fim.visible` can safely have. Esc on ghost text
-      // is unobservable on the stable API, so nothing but the NEXT FIM request
-      // settling ever lowered this flag; disable FIM in between and GATE 2 stays
-      // shut for the rest of the session with no ghost text on screen at all.
-      //
-      // Why THIS event and not `onDidChangeTextDocument`: an inline suggestion
-      // is painted into ONE editor and cannot outlive it being switched away
-      // from, so clearing here cannot let next-edit build against ghost text
-      // that is genuinely on screen. A document change would be the wrong
-      // signal — the ordinary keystroke path fires it BEFORE FIM's provider is
-      // invoked, so it would reopen the gate in exactly the window R2 exists to
-      // close.
-      //
-      // `inFlightCount` is deliberately NOT touched: a FIM request in flight
-      // survives an editor switch, and it alone must keep the gate shut.
-      this.fim.visible = false;
-      this.dispatch({ kind: 'editorChanged' });
-    });
-
-    const windowStateSubscription = vscode.window.onDidChangeWindowState((windowState) => {
-      if (!windowState.focused) {
-        this.dispatch({ kind: 'focusLost' });
-      }
-    });
-
-    // ── commands (registered ONCE) ───────────────────────────────────────────
-
-    const jumpCommand = vscode.commands.registerCommand('talaria.nextEdit.jump', () => {
-      this.dispatch({ kind: 'tabJump' });
-    });
-    const acceptCommand = vscode.commands.registerCommand('talaria.nextEdit.accept', () => {
-      this.dispatch({ kind: 'tabAccept' });
-    });
-    const dismissCommand = vscode.commands.registerCommand('talaria.nextEdit.dismiss', () => {
-      this.dispatch({ kind: 'esc' });
-    });
-    // The R4 seam: fired by the InlineCompletionItem's own `command`, which VS
-    // Code executes when the user ACCEPTS the FIM ghost text.
-    const onFimAcceptCommand = vscode.commands.registerCommand(FIM_ACCEPT_COMMAND, () => {
-      fimActivityRelay.accepted();
-    });
+    // The FIM-activity object literal, the onDidChangeTextDocument/
+    // onDidChangeActiveTextEditor/onDidChangeWindowState listeners, and the
+    // four registerCommand calls all moved verbatim to `./nextEditShellWiring`
+    // — the ctor now delegates to their builders over `hostSeams` above, IN
+    // THE SAME ORDER it always built them (registration/attach/dispose ORDER
+    // is load-bearing — F3-1's spy-ORDER golden pins it).
+    this.fimActivity = buildFimActivity(hostSeams);
+    const listenerDisposables = registerListeners(hostSeams);
+    const commandDisposables = registerCommands(hostSeams);
 
     // ATTACH LAST. `fimActivity.acceptCommandId()` advertises FIM_ACCEPT_COMMAND
     // to `provider.ts`, so the relay may not point here until that command is
-    // actually registered — which is the line above. Ordering it this way makes
-    // "an advertised command is a registered command" structural rather than a
-    // property of where the assignment happened to sit.
-    currentFimActivity = this.fimActivity;
+    // actually registered — which happened inside `registerCommands` above.
+    // Ordering it this way makes "an advertised command is a registered
+    // command" structural rather than a property of where the assignment
+    // happened to sit.
+    attachFimActivity(this.fimActivity);
 
     this.disposable = vscode.Disposable.from(
-      changeSubscription,
-      activeEditorSubscription,
-      windowStateSubscription,
-      jumpCommand,
-      acceptCommand,
-      dismissCommand,
-      onFimAcceptCommand,
+      ...listenerDisposables,
+      ...commandDisposables,
       guardToggleSubscription,
       this.regionDecoration,
       this.locatorDecoration,
@@ -1211,13 +587,12 @@ class NextEditShell {
           // an unconditional `.dispose()`.
           this.editTrackerInstance?.dispose();
           // BF-B's liveness idiom (`SessionController.ts`'s `disposed` re-check),
-          // applied to a MODULE-level slot: clear the relay only while THIS
-          // registration still owns it. Disposing a registration that a newer
-          // one already replaced must not point the relay back at the no-op —
-          // that would silently disarm R2 for the shell that is actually live.
-          if (currentFimActivity === this.fimActivity) {
-            currentFimActivity = NO_OP_FIM_ACTIVITY;
-          }
+          // applied to a MODULE-level slot (now `./fimActivityRelay`'s own):
+          // `detachFimActivity` clears the relay only while THIS registration
+          // still owns it. Disposing a registration that a newer one already
+          // replaced must not point the relay back at the no-op — that would
+          // silently disarm R2 for the shell that is actually live.
+          detachFimActivity(this.fimActivity);
         },
       },
     );
@@ -1296,115 +671,33 @@ class NextEditShell {
 
   /**
    * F-4 — classify ONE trigger failure into a message the user can act on, or
-   * into deliberate silence.
-   *
-   * Every string built here is assembled from status/statusText, the transport
-   * id, the endpoint HOST and the model name — never `err.message` (which can
-   * carry the raw url, and with it userinfo credentials), never a response
-   * body, never an API key, never matched secret text. `08` §9.3's third
-   * clause is honoured too: parse/apply failures dismiss silently and never
-   * reach here at all (they are verdicts, not throws).
+   * into deliberate silence. WS-F3 F3-7 (FI-13): the classification AND the
+   * byte-exact copy now live in the pure `describeTriggerFailure`
+   * (`nextEditFailureSurface.ts`, which itself defers the actual error→`kind`
+   * decision to the shared `classifyBackendFailure`, `../failureClass`) —
+   * this method shrinks to a thin caller that keeps ONLY the two
+   * side-effecting things a pure function cannot own: the `surfaceOnce`
+   * toast + its dedup Set, and the mint path's separate log-only dedup
+   * (same `surfacedFailures` Set, no toast). Reproduces BOTH paths exactly:
+   * a `'toast'` channel goes through `surfaceOnce` (dedup + `reportFailure` +
+   * `showWarningMessage`); a `'log'` channel (mint only) dedups against the
+   * SAME Set but calls only `reportFailure`, never the toast.
    */
   private surfaceTriggerFailure(err: unknown, route: NextEditRoute, mode: NextEditMode): void {
-    const where = endpointLabel(route.apiBase);
-    const endpointSetting =
-      mode === 'next' ? '"talaria.nextEdit.endpoint"' : '"talaria.autocomplete.endpoint"';
-    const modelSetting = mode === 'next' ? '"talaria.nextEdit.model"' : '"talaria.autocomplete.model"';
-    const key = (statusClass: string): string => `${route.transport}|${where}|${statusClass}`;
-
-    if (err instanceof InsecureTransportError) {
-      // Rebuild the copy — never echo the throw site, which names the scheme,
-      // the raw url and "(CWE-319)". Same discipline as `provider.ts`'s
-      // insecure-transport arm.
-      this.surfaceOnce(
-        key('insecure-transport'),
-        'Next Edit is paused: refusing to send credentials over cleartext HTTP to a remote host. Use https, or point the endpoint at a loopback address (127.0.0.1/localhost).',
-      );
+    const { key, message, channel } = describeTriggerFailure(err, route, mode);
+    if (channel === 'toast') {
+      this.surfaceOnce(key, message);
       return;
     }
-
-    if (err instanceof BackendHttpError) {
-      if (err.status === 404) {
-        this.surfaceOnce(
-          key('model'),
-          `Next Edit is paused: the ${route.transport} server at ${where} does not serve the model "${route.model}" (404). Check ${modelSetting}.`,
-        );
-        return;
-      }
-      if (err.status === 401 || err.status === 403) {
-        this.surfaceOnce(
-          key('auth'),
-          `Next Edit is paused: the ${route.transport} server at ${where} rejected the request (${err.status} ${err.statusText}). Check that ${endpointSetting} points at a server this machine is authorized to use.`,
-        );
-        return;
-      }
-      if (err.status === 400) {
-        this.surfaceOnce(
-          key('dialect'),
-          `Next Edit is paused: the server at ${where} rejected the request (${err.status} ${err.statusText}). This usually means the configured transport doesn't match the server's API dialect — it can also mean the prompt exceeded the server's context length.`,
-        );
-        return;
-      }
-      this.surfaceOnce(
-        key('http'),
-        `Next Edit is paused: the ${route.transport} server at ${where} returned ${err.status} ${err.statusText}. Check ${endpointSetting}.`,
-      );
-      return;
+    if (!this.surfacedFailures.has(key)) {
+      this.surfacedFailures.add(key);
+      this.deps.reportFailure(message);
     }
-
-    // V-1 fix — the misdiagnosis half. A mint rejection is thrown BEFORE any
-    // request is built or sent (`scan.ts`'s `mintScannedNextEditRequest`),
-    // so it must never fall into the generic "the request... failed... check
-    // that the server is running" copy below — that used to send the user to
-    // debug healthy infra for a request that was never sent. Names the real
-    // cause (a scan rule) and nothing else — never the matched content,
-    // never the endpoint, and deliberately never the word "server" either:
-    // this message must not even RESEMBLE the unreachable-fallback's
-    // server-blame copy, which is exactly the misdiagnosis this arm exists
-    // to prevent. Dedup key includes `ruleId` so a secret-rule skip and a
-    // rare oversize skip each surface once, independently.
-    if (err instanceof NextEditMintRejectionError) {
-      // CA-06-NE-face: the HUMAN surface for this condition is the per-file
-      // badge + one-shot toast (nextEditNotice.vscode.ts). This arm keeps
-      // only the technical audit line — output channel, ruleId-only
-      // contract (never matched text, never content) — deduped by the same
-      // registration-scoped Set surfaceOnce uses, minus its toast.
-      const logKey = key(`mint|${err.ruleId}`);
-      if (!this.surfacedFailures.has(logKey)) {
-        this.surfacedFailures.add(logKey);
-        this.deps.reportFailure(
-          `Next Edit skipped for this file: its content cannot be sent safely (rule: ${err.ruleId}). No request was sent.`,
-        );
-      }
-      return;
-    }
-
-    // Everything else — a connection refusal or DNS failure (a mint
-    // rejection is handled by the arm above, before this fallback, so it can
-    // no longer reach here). ARCH's F-4 named "a wrong endpoint" specifically:
-    // without this arm a typo'd port is indistinguishable from a feature
-    // that simply never has anything to suggest. One message per
-    // transport/host/class per registration, so a permanently-down server
-    // costs exactly one toast.
-    this.surfaceOnce(
-      key('unreachable'),
-      `Next Edit is paused: the request to the ${route.transport} server at ${where} failed. Check ${endpointSetting}, and that the server is running.`,
-    );
   }
 
   private abortInFlight(): void {
-    // Read into a local first: the R2-direction structural lock
-    // (`coexistence.lock.test.ts`'s `ABORT_RECEIVER` scan) asserts every
-    // `.abort()` call in this file resolves to the bare receiver `inFlight` —
-    // `this.inFlight.abort()` would scan as receiver `this.inFlight`, a
-    // DIFFERENT string, and trip that lock. Same field, same behavior
-    // (read-check-abort-clear), the local is purely what the receiver text
-    // resolves to.
-    const inFlight = this.inFlight;
-    if (inFlight !== null) {
-      inFlight.abort();
-      this.inFlight = null;
-    }
+    this.inFlight?.abort();
+    this.inFlight = null;
   }
 
   // ── the ONE trigger path ─────────────────────────────────────────────────
@@ -1578,11 +871,7 @@ class NextEditShell {
     // F-3 — the ring is cross-document, so it is filtered HERE, before the
     // mint ever sees it. `changesAboveCursor` reads the same kept list, so the
     // structural heuristic and the egressing payload describe one history.
-    const ringDiffs = partitionEgressableDiffs(
-      this.ensureEditTracker().tracker.getRecentDiffs(),
-      route.format.sentinels,
-    );
-    const diffs = ringDiffs.kept;
+    const diffs = filterEgressableDiffs(this.ensureEditTracker().tracker.getRecentDiffs(), route.format.sentinels);
     const docVersion = document.version;
 
     const region: EditableRegion = {
@@ -1645,6 +934,12 @@ class NextEditShell {
         apiBase: route.apiBase,
         model: route.model,
         sentinels: route.format.sentinels,
+        // FI-26 (F10-2b): the shell's own STABLE field — constructed once
+        // per activation and shared across every prediction attempt — never
+        // a fresh `new OnceRegistry()` here (this call runs once per
+        // prediction; a fresh instance each time would reset dedup on every
+        // attempt instead of warning once per activation).
+        registry: this.onceRegistry,
         // Absent for the NEXT branch, by construction (see NextEditRoute).
         ...(route.apiKey !== undefined ? { apiKey: route.apiKey } : {}),
       });

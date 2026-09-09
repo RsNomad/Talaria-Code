@@ -3,19 +3,21 @@ import { LlamaCppInfillBackend } from './backends/LlamaCppInfillBackend';
 import { VllmFimBackend } from './backends/VllmFimBackend';
 import { CodestralFimBackend } from './backends/CodestralFimBackend';
 import { OpenAICompatFimBackend } from './backends/OpenAICompatFimBackend';
+import { DEFAULT_ENDPOINTS } from './endpoints';
 import type { FimBackend } from './types';
 // Type-only import: erased at compile time (isolatedModules), so this module never
 // actually pulls in `vscode` at runtime — keeps it usable from a plain unit test.
 import type { HermesAutocompleteConfig } from './config';
+import { OnceRegistry } from './onceRegistry';
 
 /**
- * T-6 F4/F6: construction-time, once-per-rebuild warnings for
- * self-documented-broken configurations `createBackend` can detect WITHOUT
- * making a single request — a configured key `createBackend` will never
- * send (F4) and a backend/endpoint or backend/model pairing this codebase's
- * OWN backend doc comments already document as broken (F6). `createBackend`
- * itself must NEVER throw (see the `codestral` arm's own comment below) —
- * these are warn-only, no behavior/egress change.
+ * T-6 F4/F6: construction-time warnings for self-documented-broken
+ * configurations `createBackend` can detect WITHOUT making a single request
+ * — a configured key `createBackend` will never send (F4) and a
+ * backend/endpoint or backend/model pairing this codebase's OWN backend doc
+ * comments already document as broken (F6). `createBackend` itself must
+ * NEVER throw (see the `codestral` arm's own comment below) — these are
+ * warn-only, no behavior/egress change.
  *
  * `console.warn`, not `vscode.window.showWarningMessage`: this module
  * deliberately imports no `vscode` (only a type-only import, erased at
@@ -26,42 +28,41 @@ import type { HermesAutocompleteConfig } from './config';
  * `vscode.window` would reintroduce exactly the dependency that property
  * exists to avoid.
  *
- * Deduped by a fixed per-warning key, re-armed by
- * {@link clearBackendFactoryWarnings} — `index.ts`'s `rebuild()` calls it on
- * every `talaria.autocomplete.*` config change, the SAME re-arm discipline
- * `provider.ts`'s `clearSurfacedAutocompleteFailures` already uses for its
- * own (request-time) warnings — so a user who fixes (or re-breaks) their
- * config gets a fresh signal on the very next build instead of either
- * spamming every rebuild or going silent forever.
+ * FI-26 (FSU §5 Q4): dedup now runs through the second, optional
+ * `registry` parameter below (an {@link OnceRegistry} — `index.ts`'s
+ * `buildEngine` threads its ONE activation-scoped instance through here),
+ * not a bare module-level `Set`. `defaultRegistry` exists only so every
+ * existing direct caller of `createBackend` (this module's own tests
+ * included) that omits the parameter keeps working unchanged — production
+ * (`index.ts`) always passes the real instance explicitly. Because the
+ * registry now outlives an engine rebuild by construction, `index.ts` no
+ * longer re-arms these warnings per rebuild (see its own `rebuild()` for
+ * the FSU §5 Q4 lifetime note); {@link clearBackendFactoryWarnings} is kept
+ * as the reset primitive for `defaultRegistry`, which only test callers
+ * that omit `registry` ever observe.
  */
-const warnedOnce = new Set<string>();
+const defaultRegistry = new OnceRegistry();
 
-function warnOnce(key: string, message: string): void {
-  if (warnedOnce.has(key)) return;
-  warnedOnce.add(key);
-  console.warn(`[talaria.autocomplete] ${message}`);
-}
-
-/** Re-arms every construction-time warning `createBackend` can emit — see
- *  {@link warnOnce}'s doc comment for the re-arm discipline this exists for. */
+/** Resets {@link defaultRegistry} — the fallback `createBackend` uses when
+ *  called without an explicit `registry` argument. See that parameter's own
+ *  doc comment for why production no longer calls this on every rebuild. */
 export function clearBackendFactoryWarnings(): void {
-  warnedOnce.clear();
+  defaultRegistry.reset();
 }
 
-/** F6: vLLM's OWN default port (`config.ts`'s unexported `DEFAULT_ENDPOINTS.vllm`,
- *  `'http://127.0.0.1:8000'`) — duplicated as a literal rather than exporting
- *  that constant, so this file's dependency surface stays exactly what it was. */
-const VLLM_DEFAULT_PORT = '8000';
+/** F6: vLLM's OWN default port, derived from the pure leaf's single source of
+ *  truth (`endpoints.ts`'s `DEFAULT_ENDPOINTS.vllm`) rather than restated as
+ *  a literal — FI-22: this file now imports the leaf directly instead of
+ *  duplicating its rows. */
+const VLLM_DEFAULT_PORT = new URL(DEFAULT_ENDPOINTS.vllm).port;
 
-/** CA-8 (audit-3): `config.ts`'s unexported `DEFAULT_ENDPOINTS['openai-compat']`
- *  (`'http://127.0.0.1:8000'`) — duplicated as a literal for the same reason
- *  as {@link VLLM_DEFAULT_PORT} above (this file's dependency surface stays
- *  exactly what it was). This backend's OWN shipped default happens to sit on
- *  vLLM's default port too, so without this the F6 vLLM-port heuristic below
- *  fires on a completely untouched, freshly-installed openai-compat config —
- *  the extension warning about its own default. Does NOT change the default
- *  port/endpoint value; only suppresses the self-warning for it. */
-const OPENAI_COMPAT_DEFAULT_ENDPOINT = 'http://127.0.0.1:8000';
+/** CA-8 (audit-3): `DEFAULT_ENDPOINTS['openai-compat']` — this backend's OWN
+ *  shipped default happens to sit on vLLM's default port too, so without this
+ *  the F6 vLLM-port heuristic below fires on a completely untouched,
+ *  freshly-installed openai-compat config — the extension warning about its
+ *  own default. Does NOT change the default port/endpoint value; only
+ *  suppresses the self-warning for it. */
+const OPENAI_COMPAT_DEFAULT_ENDPOINT = DEFAULT_ENDPOINTS['openai-compat'];
 
 /** `undefined` on anything `URL` can't parse — `cfg.endpoint` is normally
  *  already `isHttpUrl`-validated by `config.ts:readConfig`, but a hand-built
@@ -90,8 +91,22 @@ function sameEndpoint(a: string, b: string): boolean {
   }
 }
 
-/** Builds the configured `FimBackend` from `talaria.autocomplete.*` settings. */
-export function createBackend(cfg: HermesAutocompleteConfig): FimBackend {
+/**
+ * Builds the configured `FimBackend` from `talaria.autocomplete.*` settings.
+ *
+ * FI-26: `registry` is the {@link OnceRegistry} `warnOnce` below dedupes
+ * against — optional, defaulting to {@link defaultRegistry}, so every
+ * existing caller that omits it (this module's own tests) keeps its
+ * pre-existing per-call-site-shared-default behavior unchanged; `index.ts`'s
+ * `buildEngine` always passes its ONE real activation-scoped instance.
+ */
+export function createBackend(cfg: HermesAutocompleteConfig, registry: OnceRegistry = defaultRegistry): FimBackend {
+  const warnOnce = (key: string, message: string): void => {
+    if (registry.has(key)) return;
+    registry.add(key);
+    console.warn(`[talaria.autocomplete] ${message}`);
+  };
+
   switch (cfg.backend) {
     case 'ollama':
       // F4: `OllamaFimBackendOptions` has no `apiKey` field at all —

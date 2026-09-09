@@ -9,6 +9,7 @@ import {
   type DashboardClientLike,
 } from './HermesDashboardClient';
 import { isForeignBackendToken } from './servedToken';
+import { errorMessage } from '../../shared/errorMessage';
 
 /**
  * `HermesDashboardManager` — discover-or-spawn lifecycle for the dashboard REST
@@ -401,8 +402,4 @@ export class HermesDashboardManager implements DashboardService {
   private log(message: string): void {
     this.opts.logger?.append(`[HermesDashboard] ${message}`);
   }
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

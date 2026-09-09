@@ -35,8 +35,8 @@ function collapsedReplacement(node: SyntaxNodeLike): string {
   return node.type === 'statement_block' ? '{ ... }' : '...';
 }
 
-function firstChildOfType(node: SyntaxNodeLike, types: readonly string[]): SyntaxNodeLike | null {
-  return node.children.find((c) => types.includes(c.type)) ?? null;
+function firstChildOfType(node: SyntaxNodeLike, types: readonly string[]): SyntaxNodeLike | undefined {
+  return node.children.find((c) => types.includes(c.type));
 }
 
 function collapseChildren(
@@ -122,6 +122,22 @@ function constructClassDefinitionChunk(node: SyntaxNodeLike, code: string, maxCh
   );
 }
 
+/**
+ * FI-28: the shared degrade tail both `constructFunctionDefinitionChunk`
+ * branches (isInClass and plain) fall through to once their own combined/
+ * whole-function form doesn't fit — verbatim extraction of what was
+ * duplicated at both call sites: `funcText` (signature + collapsed body) if
+ * it fits, else `minimal` (first signature line + collapsed body) if THAT
+ * fits, else the bare collapsed body.
+ */
+function fitOrDegrade(funcText: string, signature: string, collapsedBody: string, max: number): string {
+  if (estimateTokenCount(funcText) <= max) return funcText;
+  const firstLine = signature.split('\n')[0] ?? '';
+  const minimal = `${firstLine} ${collapsedBody}`;
+  if (estimateTokenCount(minimal) <= max) return minimal;
+  return collapsedBody;
+}
+
 function constructFunctionDefinitionChunk(node: SyntaxNodeLike, code: string, maxChunkTokens: number): string {
   const bodyNode = node.children[node.children.length - 1];
   if (!bodyNode) return node.text;
@@ -143,18 +159,10 @@ function constructFunctionDefinitionChunk(node: SyntaxNodeLike, code: string, ma
     const indent = ' '.repeat(node.startPosition.column);
     const combined = `${classHeader}...\n\n${indent}${funcText}`;
     if (estimateTokenCount(combined) <= maxChunkTokens) return combined;
-    if (estimateTokenCount(funcText) <= maxChunkTokens) return funcText;
-    const firstLine = signature.split('\n')[0] ?? '';
-    const minimal = `${firstLine} ${collapsedBody}`;
-    if (estimateTokenCount(minimal) <= maxChunkTokens) return minimal;
-    return collapsedBody;
+    return fitOrDegrade(funcText, signature, collapsedBody, maxChunkTokens);
   }
 
-  if (estimateTokenCount(funcText) <= maxChunkTokens) return funcText;
-  const firstLine = signature.split('\n')[0] ?? '';
-  const minimal = `${firstLine} ${collapsedBody}`;
-  if (estimateTokenCount(minimal) <= maxChunkTokens) return minimal;
-  return collapsedBody;
+  return fitOrDegrade(funcText, signature, collapsedBody, maxChunkTokens);
 }
 
 type CollapsedConstructor = (node: SyntaxNodeLike, code: string, maxChunkTokens: number) => string;
@@ -229,12 +237,30 @@ function maybeYieldChunk(
   return undefined;
 }
 
+/**
+ * L2-CA-21 (totality): caps how deep {@link smartCollapsedChunks} will
+ * recurse into `node.children`. A pathologically deep AST (e.g. ~200 nested
+ * functions — not something any real source file has, but this module's
+ * totality invariant is "no chunker function ever throws on
+ * malformed/adversarial input") would otherwise grow `buildSymbolPath`
+ * (and the call stack) without bound. Mirrors the sibling
+ * `MAX_SYMBOL_TREE_DEPTH` in `resultShaper.ts`/`lspResultMap.ts` — 64 is far
+ * deeper than any real source file's nesting; past it we stop descending.
+ * Coverage below the cap holds by construction: the last node processed
+ * before the cap is itself a collapsed type whose own chunk's
+ * `[startLine, endLine]` spans every deeper row, so nothing below is lost.
+ */
+const MAX_AST_DEPTH = 64;
+
 function* smartCollapsedChunks(
   node: SyntaxNodeLike,
   code: string,
   maxChunkTokens: number,
   root: boolean,
+  depth = 0,
 ): Generator<ChunkWithoutHeader> {
+  if (depth >= MAX_AST_DEPTH) return;
+
   const whole = maybeYieldChunk(node, maxChunkTokens, root);
   if (whole) {
     yield { ...whole, symbolPath: buildSymbolPath(node) };
@@ -259,7 +285,7 @@ function* smartCollapsedChunks(
   // Recurse regardless of whether a whole/collapsed chunk was just yielded
   // for `node` itself, so bodies are still indexed somewhere (how-to §3).
   for (const child of node.children) {
-    yield* smartCollapsedChunks(child, code, maxChunkTokens, false);
+    yield* smartCollapsedChunks(child, code, maxChunkTokens, false, depth + 1);
   }
 }
 
@@ -283,6 +309,21 @@ function* smartCollapsedChunks(
  * functions"), merged back in line order. This keeps the T-B tail
  * invariant: every source line of a chunked file is covered by at least
  * one chunk.
+ *
+ * L2-CA-04 — coverage is tracked by the union of EMITTED chunks' own
+ * `[startLine, endLine]` spans, not by the child node's whole span. A
+ * non-captured CONTAINER child (a TS `namespace`/Rust `mod`/an `if`
+ * wrapping a function — too big to fit whole, and not a
+ * `collapsedNodeConstructors` type) yields chunks only for its captured
+ * descendants, never for its own header/interstitial lines; treating the
+ * whole child span as "covered" the moment it yields >= 1 chunk silently
+ * skipped those container-owned lines. Back-filling before EVERY emitted
+ * chunk (sorted by `startLine`) instead catches gaps at any depth, not just
+ * between top-level children. `fillGapThroughRow`'s `gapEndRow < gapStartRow`
+ * guard already makes overlaps a no-op, so a collapsed parent chunk whose
+ * span already covers its members' rows is never double-filled — this is
+ * why a fully-captured child (whose one chunk's span equals its own node
+ * span) still produces byte-identical output to before.
  */
 export function chunkAst(
   rootNode: SyntaxNodeLike,
@@ -317,12 +358,14 @@ export function chunkAst(
   };
 
   for (const child of rootNode.children) {
-    const childChunks = [...smartCollapsedChunks(child, sourceCode, maxChunkTokens, false)];
-    if (childChunks.length === 0) continue; // still an open gap; keep accumulating
-
-    fillGapThroughRow(child.startPosition.row - 1);
-    results.push(...childChunks);
-    coveredThroughRow = Math.max(coveredThroughRow, child.endPosition.row);
+    const childChunks = [...smartCollapsedChunks(child, sourceCode, maxChunkTokens, false)].sort(
+      (x, y) => x.startLine - y.startLine,
+    );
+    for (const chunk of childChunks) {
+      fillGapThroughRow(chunk.startLine - 1); // back-fill any uncovered rows BEFORE this chunk
+      results.push(chunk);
+      coveredThroughRow = Math.max(coveredThroughRow, chunk.endLine);
+    }
   }
   fillGapThroughRow(rootNode.endPosition.row);
 

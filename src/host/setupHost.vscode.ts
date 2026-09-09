@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { execFile, spawn as nodeSpawn } from 'node:child_process';
-import { access, readFile, lstat, stat, mkdir, rename, writeFile } from 'node:fs/promises';
+import { access, readFile, lstat, stat, mkdir, rename } from 'node:fs/promises';
 import { createWriteStream, createReadStream } from 'node:fs';
 import { unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -19,6 +19,8 @@ import {
   type TempWriteHandle,
   type TempReadStream,
 } from './setup/ggufIngest';
+import { writeFileNoFollow } from './backend/acp/safeWrite';
+import { makeSidecarWriter } from './setup/sidecarWriter';
 import { probeRemote } from './setup/remoteProbe';
 import { locateLlamaServer, type LlamaCppLocateResult } from './setup/llamaCppLocator';
 import {
@@ -385,7 +387,9 @@ function createNodeGgufIngestIo(): GgufIngestIo & GgufStoreIo {
     // is the one that refuses-and-cleans-up rather than falling back to a
     // copy — this binding never catches or retries.
     renameTemp: (tempPath: string, destPath: string): Promise<void> => rename(tempPath, destPath),
-    writeSidecar: (sidecarPath: string, content: string): Promise<void> => writeFile(sidecarPath, content, 'utf8'),
+    // WS-R2 R2-3 (L2-CA-18, OD-C non-frozen half): the retry-once + honest
+    // kept-file-error policy lives in the injected binding, not here.
+    writeSidecar: makeSidecarWriter(writeFileNoFollow),
   };
 }
 

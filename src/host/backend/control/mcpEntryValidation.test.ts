@@ -10,6 +10,7 @@ import {
   secretEnvKeyFor,
   envReference,
   checkSecretValue,
+  findSecretKeyCollision,
 } from './mcpEntryValidation';
 import type { McpAddParams, McpCatalogEntry } from '../../../shared/protocol';
 
@@ -434,6 +435,23 @@ describe('AU-59: secretEnvKeyFor / envReference / checkSecretValue', () => {
     }
     const nonAscii = checkSecretValue('ghp_ábc');
     if (!nonAscii.ok) expect(nonAscii.reason).toMatch(/printable ASCII/);
+  });
+});
+
+describe('L2-CA-22: findSecretKeyCollision — punctuation-only name collisions across listed servers', () => {
+  it('finds a collision when a new name\'s secret key would match an existing listed server\'s (punctuation-only name difference)', () => {
+    expect(findSecretKeyCollision('my-server', ['TOKEN'], new Set(['my.server']))).toEqual({
+      key: 'MCP_MY_SERVER_TOKEN',
+      otherServer: 'my.server',
+    });
+  });
+
+  it('no collision when no listed name maps to the same key', () => {
+    expect(findSecretKeyCollision('gh', ['TOKEN'], new Set(['gh2']))).toBeUndefined();
+  });
+
+  it('the new name itself already being listed is NOT our collision (Hermes\' own 409 handles a same-name re-add)', () => {
+    expect(findSecretKeyCollision('gh', ['TOKEN'], new Set(['gh']))).toBeUndefined();
   });
 });
 

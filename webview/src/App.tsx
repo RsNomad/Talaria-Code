@@ -21,37 +21,14 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import { bridge } from './bridge';
 import type {
   CheckpointRestoreResult,
-  ControlMethod,
   DataPanel,
   HostToWebview,
-  HubInstallResult,
-  HubPreview,
-  HubScan,
-  McpAddParams,
-  McpAddResult,
-  McpCatalogData,
-  McpCatalogInstallParams,
-  McpCatalogInstallResult,
-  McpTestResult,
-  NextEditToggleSource,
   Panel,
   SessionLostReason,
-  SetupMethod,
-  SkillCreateParams,
   ThemeKind,
 } from './protocol';
 import { MAX_TABS, PANEL_SCOPE } from './protocol';
-import {
-  asShape,
-  isCheckpointRestoreResult,
-  isHubInstallResult,
-  isHubPreview,
-  isHubScan,
-  isMcpAddResult,
-  isMcpCatalogData,
-  isMcpCatalogInstallResult,
-  isMcpTestResult,
-} from './shapeGuards';
+import { isCheckpointRestoreResult } from './shapeGuards';
 import { reduce, reduceLocal, type LocalAction } from './state/transcript';
 import { buildDraftSnapshot } from './state/persist';
 import { mintTabId } from './state/tabs';
@@ -62,7 +39,6 @@ import {
   panelData,
   readScopedRefreshError,
   resolvePanelRequest,
-  unwrapSetupResult,
   type RefreshErrorPanel,
 } from './state/panels';
 import { idle } from './state/remoteData';
@@ -70,11 +46,33 @@ import { createInitialState, type AppState, type TabState } from './types';
 import type { ComposerSeed } from './composer/applySeed';
 import { useHostActions } from './hooks/useHostActions';
 import { useSessionLoadWatchdog } from './hooks/useSessionLoadWatchdog';
+import { requestShapedOptional } from './rpcShaped';
+import {
+  onAddProviderKey,
+  toggle,
+  reloadMcp,
+  addMcpServer,
+  testMcpServer,
+  removeMcpServer,
+  setMcpServerEnabled,
+  authMcpServer,
+  mcpCatalog,
+  mcpCatalogInstall,
+  createSkill,
+  previewHubSkill,
+  scanHubSkill,
+  installHubSkill,
+  uninstallHubSkill,
+  setConfig,
+  setNextEditToggle,
+  dispatchSetup,
+} from './globalActions';
 
-import { PriorityTabs, panelTabDomId, panelTabpanelId } from './components/PriorityTabs';
+import { PriorityTabs } from './components/PriorityTabs';
 import { TabStrip, tabDomId, CHAT_TABPANEL_ID } from './components/TabStrip';
 import { Composer } from './components/Composer';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { PanelScaffold } from './components/PanelScaffold';
 import { ChatView } from './components/chat/ChatView';
 import { RemotePanel, type RefreshErrorBanner } from './panels/PanelShell';
 import { ToolsPanel } from './panels/ToolsPanel';
@@ -89,8 +87,8 @@ import { SetupPanel } from './panels/SetupPanel';
 import { ErrorBanner } from './components/ErrorBanner';
 import { GatewayHealthBanner } from './components/GatewayHealthBanner';
 import { MockNotice } from './components/MockNotice';
-import { Icon } from './components/Icon';
 import { LiveRegion } from './components/LiveRegion';
+import { RecoveryRow } from './components/RecoveryRow';
 
 type Action = { host: HostToWebview } | { local: LocalAction };
 
@@ -106,18 +104,6 @@ type Action = { host: HostToWebview } | { local: LocalAction };
  * whenever no session is live yet.
  */
 const UNBOUND_SESSION_PLACEHOLDER = '';
-
-/**
- * WS-BG: guard-or-throw for correlated RPC results. A refused shape rejects
- * with an honest method-named Error — the same rejected-promise path every
- * caller already handles for RPC timeouts (panel error rendering /
- * optimistic rollback). Message names the METHOD only, never the payload.
- */
-const requireShape = <T,>(raw: unknown, guard: (x: unknown) => x is T, method: string): T => {
-  const shaped = asShape(raw, guard);
-  if (shaped === undefined) throw new Error(`${method} returned an unrecognized result shape`);
-  return shaped;
-};
 
 function rootReducer(state: AppState, action: Action): AppState {
   if ('host' in action) return reduce(state, action.host);
@@ -432,11 +418,6 @@ export function App() {
     applyStandaloneTheme(state.theme.kind);
   }, [state.theme.kind]);
 
-  // CF-13/D1: the Models panel's "Add key" affordance — posts ONLY the
-  // provider slug. The host prompts for the key directly (masked) and
-  // dispatches `model.save_key`; the key never enters the webview.
-  const onAddProviderKey = (slug: string) => bridge.post({ type: 'model.addKey', slug });
-
   // W4 §7 B6: the correlated panel fetch carries an EXPLICIT scope key,
   // captured HERE at issue time from the tab that's active RIGHT NOW —
   // never re-resolved from `state.activeTabId` when the promise later
@@ -487,29 +468,15 @@ export function App() {
   };
   requestPanelRef.current = requestPanel;
 
-  // Correlated toggle (W1.5): the Skills/Tools switches persist through the
-  // dashboard REST channel and need the resolved/rejected result so the panel
-  // can do optimistic write-through with rollback-on-error. Returns the
-  // promise. F-1 (final-4way-fixes.md): Tools/Skills toggles are connection-
-  // global (`tools`/`skills` own no single tab, per the panel-scope
-  // taxonomy) — UNTAGGED, so closing an unrelated tab can never reject this
-  // in-flight write and trigger a false optimistic-rollback.
-  const toggle = (method: ControlMethod, params: Record<string, unknown>) =>
-    bridge.request(method, params);
-
   // Correlated `checkpoint.restore` (Part A2 reference migration): resolves with
   // the tracker's result so the panel can honor the dirty-worktree guard.
   // W4 §2d (sync-4/B4-control): carries an EXPLICIT `rootId` — resolving via
   // an ambient active-session pointer would race `tab.activate` (restore
   // against the wrong worktree); a mismatch REFUSES host-side, never restores.
-  const restoreCheckpoint = async (
-    id: string,
-    force?: boolean,
-  ): Promise<CheckpointRestoreResult | undefined> => {
+  const restoreCheckpoint = (id: string, force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
     const params: Record<string, unknown> = { id, rootId: tab.rootId };
     if (force) params.force = true;
-    const result = await bridge.request('checkpoint.restore', params, tab.tabId);
-    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.restore');
+    return requestShapedOptional('checkpoint.restore', params, isCheckpointRestoreResult, tab.tabId);
   };
 
   // CF-12 review fix (W3-T7): correlated `checkpoint.redo`/`checkpoint.redoAll`
@@ -523,155 +490,17 @@ export function App() {
   // only by the host's single-root convenience fallback). No checkpoint
   // `id`, unlike restore: redo/redoAll step/jump the tracker's own stored
   // cursor toward its anchor, never a panel-picked row.
-  const redoCheckpoint = async (force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
+  const redoCheckpoint = (force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
     const params: Record<string, unknown> = { rootId: tab.rootId };
     if (force) params.force = true;
-    const result = await bridge.request('checkpoint.redo', params, tab.tabId);
-    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.redo');
+    return requestShapedOptional('checkpoint.redo', params, isCheckpointRestoreResult, tab.tabId);
   };
 
-  const redoAllCheckpoint = async (force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
+  const redoAllCheckpoint = (force?: boolean): Promise<CheckpointRestoreResult | undefined> => {
     const params: Record<string, unknown> = { rootId: tab.rootId };
     if (force) params.force = true;
-    const result = await bridge.request('checkpoint.redoAll', params, tab.tabId);
-    return result === undefined ? undefined : requireShape(result, isCheckpointRestoreResult, 'checkpoint.redoAll');
+    return requestShapedOptional('checkpoint.redoAll', params, isCheckpointRestoreResult, tab.tabId);
   };
-
-  // A#5: MCP "Reload servers" over the CORRELATED path so the gateway's result
-  // (`{status, message?}`) — or a failure — becomes visible in the panel,
-  // instead of the old fire-and-forget that dropped both. The host still
-  // re-fetches + re-pushes the server list when the reload actually
-  // confirmed. F-1: `mcp` is connection-global (owns no tab) — UNTAGGED.
-  const reloadMcp = () => bridge.request('reload.mcp', { confirm: true });
-
-  // Task A7 (§4.9): the MCP admin RPCs `McpPanel`'s row actions + Add-server
-  // form drive. All correlated (`bridge.request`), same F-1 posture as
-  // `reloadMcp`/`toggle` above — `mcp` is connection-global, so these are
-  // UNTAGGED. `addMcpServer`/`testMcpServer`/`authMcpServer` now GUARD the
-  // resolved value onto its known shape via `requireShape` (WS-BG), the same
-  // `restoreCheckpoint`/`redoCheckpoint` idiom above (`bridge.request` itself
-  // only promises `unknown` — the host's real return shape is the wire
-  // contract).
-  const addMcpServer = async (params: McpAddParams): Promise<McpAddResult> => {
-    const result = await bridge.request('mcp.add', params);
-    return requireShape(result, isMcpAddResult, 'mcp.add');
-  };
-  const testMcpServer = async (name: string): Promise<McpTestResult> => {
-    const result = await bridge.request('mcp.test', { name });
-    return requireShape(result, isMcpTestResult, 'mcp.test');
-  };
-  const removeMcpServer = (name: string) => bridge.request('mcp.remove', { name });
-  const setMcpServerEnabled = (name: string, enabled: boolean) =>
-    bridge.request('mcp.setEnabled', { name, enabled });
-  // Task A8 (§4.8): drives the panel's per-row `Login` button.
-  const authMcpServer = async (name: string): Promise<McpTestResult> => {
-    const result = await bridge.request('mcp.auth', { name });
-    return requireShape(result, isMcpTestResult, 'mcp.auth');
-  };
-  // Task A8 (§4.7): the Catalog disclosure's fetch (read-only, not trust-
-  // gated — fired at most once per panel mount, on first expand) and its
-  // `Install` action. Same untagged/guarded posture as the other MCP admin
-  // RPCs above — `mcp` is connection-global.
-  const mcpCatalog = async (): Promise<McpCatalogData> => {
-    const result = await bridge.request('mcp.catalog', {});
-    return requireShape(result, isMcpCatalogData, 'mcp.catalog');
-  };
-  const mcpCatalogInstall = async (p: McpCatalogInstallParams): Promise<McpCatalogInstallResult> => {
-    // `bridge.request` wants `Record<string, unknown>`; unlike `McpAddParams`
-    // (a `type` alias, structurally weak against an index signature),
-    // `McpCatalogInstallParams` is an `interface` — TS never infers an
-    // implicit index signature for those, so the params are rebuilt as a
-    // fresh object literal here (the same posture `restoreCheckpoint` above
-    // uses for its own `Record<string, unknown>` params).
-    // Rev-1 B4 (CF-13 parity): no `env` field at all — the webview never
-    // collects a credential value; the host prompts for each of the entry's
-    // `required_env` vars itself, masked, after the consent modal.
-    const wireParams: Record<string, unknown> = { name: p.name };
-    const result = await bridge.request('mcp.catalogInstall', wireParams);
-    return requireShape(result, isMcpCatalogInstallResult, 'mcp.catalogInstall');
-  };
-
-  // Task B6 (§5.6): the T2 skills admin RPCs `SkillsPanel`'s Create/Install-
-  // from-hub disclosures and hub-row Remove button drive. Same untagged/guarded
-  // posture as the MCP admin RPCs above — `skills` is connection-global
-  // (`skills.toggle` above already is untagged), so these are UNTAGGED too.
-  // `createSkill` rebuilds `params` as a fresh `Record<string, unknown>`
-  // object literal (the same `mcpCatalogInstall` posture immediately above)
-  // — `SkillCreateParams` is an `interface`, so TS never infers an implicit
-  // index signature for it the way it does for `McpAddParams`'s `type` alias.
-  const createSkill = (params: SkillCreateParams) => {
-    const wireParams: Record<string, unknown> = { name: params.name, content: params.content };
-    if (params.category !== undefined) wireParams.category = params.category;
-    return bridge.request('skills.create', wireParams);
-  };
-  const previewHubSkill = async (identifier: string): Promise<HubPreview> => {
-    const result = await bridge.request('skills.hubPreview', { identifier });
-    return requireShape(result, isHubPreview, 'skills.hubPreview');
-  };
-  const scanHubSkill = async (identifier: string): Promise<HubScan> => {
-    const result = await bridge.request('skills.hubScan', { identifier });
-    return requireShape(result, isHubScan, 'skills.hubScan');
-  };
-  const installHubSkill = async (identifier: string): Promise<HubInstallResult> => {
-    const result = await bridge.request('skills.hubInstall', { identifier });
-    return requireShape(result, isHubInstallResult, 'skills.hubInstall');
-  };
-  const uninstallHubSkill = (name: string) => bridge.request('skills.hubUninstall', { name });
-
-  // D3/N13: SettingsPanel's `config.set` over the CORRELATED path (the same
-  // `toggle` pattern above) so a rejected/failed write resolves/rejects and
-  // the row can roll back instead of lying — replaces the old fire-and-
-  // forget `invoke('config.set', …)`, whose effect was only ever observable
-  // through a server-initiated `panel.data` push that doesn't exist today.
-  // F-1 (the Important finding this fix brief exists for): `settings` is
-  // connection-global — this MUST be UNTAGGED. Tagging it with `tab.tabId`
-  // (the pre-fix bug) meant closing tab A while a `config.set` issued from
-  // tab A was still in flight rejected the promise via `rejectByTag`, even
-  // though the host went on to persist the write — SettingsPanel then ran
-  // its rollback and showed "Not saved" for a value that WAS saved.
-  const setConfig = (key: string, value: string | number | boolean) =>
-    bridge.request('config.set', { key, value });
-
-  // R5 (Task 13): the «Next Edit Suggestions» toggles, over the HOST-INTERNAL
-  // correlated `nextEdit.toggle` request — special-cased in the host router
-  // before backend dispatch, so this never reaches Hermes (the toggles are
-  // extension state, not agent config). Resolves with the newly ratified
-  // state; REJECTS with the Guard's refusal message, which is what makes the
-  // row's `rollbackField` snap the switch back and show the reason.
-  //
-  // F-1: the toggle store is CONNECTION-GLOBAL (one per extension, owned by
-  // no chat tab) — this MUST be UNTAGGED, exactly like `setConfig` above. A
-  // `tab.tabId` tag here would let an unrelated tab close reject a legitimate
-  // in-flight toggle via `rejectByTag`, and the row would then show a refusal
-  // for a toggle the Guard actually ratified. Locked in `rpc.test.ts`.
-  const setNextEditToggle = (source: NextEditToggleSource, on: boolean) =>
-    bridge.request('nextEdit.toggle', { source, on });
-
-  // Task 10: the Setup / Talaria Config panel's single mutating-action
-  // dispatcher — every `SetupMethod` (install/apply/setApiKey/testRemote/
-  // pullModel/cancel/openProviderWizard/openInstallTerminal/recheck/
-  // setNextEdit/setRag/setTunable) rides this ONE correlated request, mirroring
-  // `setConfig`/`toggle` above. F-1: CONNECTION-GLOBAL (installing a backend
-  // or pulling a model belongs to no one chat tab) — UNTAGGED, so closing an
-  // unrelated tab can never reject an in-flight Setup mutation. The host
-  // re-pushes a fresh `panel.data{panel:'setup'}` on every accepted mutation
-  // (mirrors `reload.mcp`/`model.save_key`'s "dispatch -> refetch -> push"
-  // precedent — see `SetupController.handle`'s own doc), so this panel needs
-  // no manual re-fetch after a successful call.
-  //
-  // T2 (§0.1 ②, §2.2.4 — corrects the previous docstring here, which was
-  // silent on refusals): a controller REFUSAL is `ok:true` at the RPC
-  // TRANSPORT layer (the request itself succeeded) carrying `result:
-  // {ok:false, reason}` — so the raw `bridge.request(...)` promise used to
-  // RESOLVE on a refusal, and `ActionButton`'s error state never fired.
-  // Routed through `unwrapSetupResult` so this dispatcher has the SAME
-  // resolve/reject contract as `setConfig`/`setNextEditToggle` above: an
-  // accepted mutation resolves with its result, a refusal REJECTS with
-  // `reason` (or a default message) — except `reason: 'declined'` (the user
-  // dismissed a native confirmation modal), which resolves to the `DECLINED`
-  // sentinel instead of either (not an error, not a success to label).
-  const dispatchSetup = (method: SetupMethod, params?: Record<string, unknown>) =>
-    bridge.request(method, params).then(unwrapSetupResult);
 
   // Deep-link into the Setup panel (MockNotice / Hero "Set up backends").
   const openSetup = () => selectPanel('setup');
@@ -971,17 +800,11 @@ export function App() {
           so the flag's terminals (`tab.bound`/`tab.error`) restore this row
           automatically if the attempt fails. */}
       {!tab.error && tab.openFailed === true && tab.binding !== 'bound' && tab.newSessionPending !== true && (
-        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
-          <Icon name="warning" size={12} className="flex-none text-warn" />
-          <span className="min-w-0 flex-1">This chat never connected to the agent.</span>
-          <button
-            type="button"
-            onClick={() => bridge.post({ type: 'tab.open', tabId: tab.tabId })}
-            className="flex-none rounded border border-border px-1.5 py-0.5 text-2xs text-fg hover:bg-overlay"
-          >
-            Reconnect
-          </button>
-        </div>
+        <RecoveryRow
+          icon={{ name: 'warning', className: 'flex-none text-warn' }}
+          message="This chat never connected to the agent."
+          action={{ label: 'Reconnect', onClick: () => bridge.post({ type: 'tab.open', tabId: tab.tabId }) }}
+        />
       )}
 
       {/* ARCH-1 (final review, UI I-3): the session-lost sibling of the G-9
@@ -992,17 +815,14 @@ export function App() {
           (render priority only — `sessionLost`/`sessionLostReason` stay
           untouched in state, so a failed attempt restores this row). */}
       {!tab.error && tab.sessionLost === true && tab.binding !== 'bound' && tab.newSessionPending !== true && (
-        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
-          <Icon name="warning" size={12} className="flex-none text-warn" />
-          <span className="min-w-0 flex-1">{sessionLostRowCopy(tab.sessionLostReason)}</span>
-          <button
-            type="button"
-            onClick={() => dispatch({ local: { type: 'local.setPanel', panel: 'sessions' } })}
-            className="flex-none rounded border border-border px-1.5 py-0.5 text-2xs text-fg hover:bg-overlay"
-          >
-            History
-          </button>
-        </div>
+        <RecoveryRow
+          icon={{ name: 'warning', className: 'flex-none text-warn' }}
+          message={sessionLostRowCopy(tab.sessionLostReason)}
+          action={{
+            label: 'History',
+            onClick: () => dispatch({ local: { type: 'local.setPanel', panel: 'sessions' } }),
+          }}
+        />
       )}
 
       {/* UX-04a: honest "Starting a new session…" pending state, mirroring
@@ -1014,10 +834,7 @@ export function App() {
           takes over), so this row never overlaps that banner. `tab.bound`
           arrival removes both. */}
       {tab.newSessionPending === true && !tab.error && (
-        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2 text-2xs text-muted">
-          <Icon name="loading" size={12} spin className="flex-none" />
-          <span className="min-w-0 flex-1">Starting a new session…</span>
-        </div>
+        <RecoveryRow icon={{ name: 'loading', spin: true, className: 'flex-none' }} message="Starting a new session…" />
       )}
       <LiveRegion text={tab.newSessionPending === true ? 'Starting a new session…' : ''} className="sr-only" />
 
@@ -1126,215 +943,170 @@ export function App() {
           reused, since `chat`'s wrapper is already claimed by TabStrip's own
           chat-session tabs (see `panelTabpanelId`'s doc comment in
           PriorityTabs.tsx for why `chat` is the one exception that needs NO
-          new wrapper). The wrapper sits OUTSIDE `ErrorBoundary`/`RemotePanel`
-          so the tabpanel region exists — and is announced — in every state
-          (loading/error/success), not only once data resolves. `flex min-h-0
-          flex-1 flex-col` reproduces exactly what each panel's own
-          `PanelShell` root already assumes of its parent (a flex-column
-          ancestor sized via `flex-1`/`min-h-0`) — same classes ChatView's
-          wrapper uses — so nesting one more level here does not change any
-          panel's rendered size. */}
+          new wrapper). FI-14: the wrapper + its `ErrorBoundary` are now
+          single-sourced in `<PanelScaffold>` (`components/PanelScaffold.tsx`)
+          instead of repeated by hand at each of the 9 call sites below — see
+          that file's header for the full rationale (region passed explicitly,
+          chat left inline as structurally different). The wrapper sits
+          OUTSIDE `ErrorBoundary`/`RemotePanel` so the tabpanel region exists —
+          and is announced — in every state (loading/error/success), not only
+          once data resolves. `flex min-h-0 flex-1 flex-col` reproduces
+          exactly what each panel's own `PanelShell` root already assumes of
+          its parent (a flex-column ancestor sized via `flex-1`/`min-h-0`) —
+          same classes ChatView's wrapper uses — so nesting one more level
+          here does not change any panel's rendered size. */}
       {state.activePanel === 'tools' && (
-        <div
-          id={panelTabpanelId('tools')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('tools')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Tools panel">
-            <RemotePanel
-              remote={globalPanels.tools}
-              loadingHint="Loading tools…"
-              onRetry={() => requestPanel('tools')}
-              {...withRefreshError(refreshErrorProp('tools'))}
-            >
-              {(data) => (
-                <ToolsPanel
-                  data={data}
-                  onToggle={(name, enabled) => toggle('toolsets.toggle', { name, enabled })}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="tools" region="the Tools panel">
+          <RemotePanel
+            remote={globalPanels.tools}
+            loadingHint="Loading tools…"
+            onRetry={() => requestPanel('tools')}
+            {...withRefreshError(refreshErrorProp('tools'))}
+          >
+            {(data) => (
+              <ToolsPanel
+                data={data}
+                onToggle={(name, enabled) => toggle('toolsets.toggle', { name, enabled })}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'mcp' && (
-        <div
-          id={panelTabpanelId('mcp')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('mcp')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the MCP panel">
-            <RemotePanel
-              remote={globalPanels.mcp}
-              loadingHint="Loading servers…"
-              onRetry={() => requestPanel('mcp')}
-              {...withRefreshError(refreshErrorProp('mcp'))}
-            >
-              {(data) => (
-                <McpPanel
-                  data={data}
-                  onReload={reloadMcp}
-                  onAdd={addMcpServer}
-                  onTest={testMcpServer}
-                  onRemove={removeMcpServer}
-                  onSetEnabled={setMcpServerEnabled}
-                  onAuth={authMcpServer}
-                  onCatalog={mcpCatalog}
-                  onCatalogInstall={mcpCatalogInstall}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="mcp" region="the MCP panel">
+          <RemotePanel
+            remote={globalPanels.mcp}
+            loadingHint="Loading servers…"
+            onRetry={() => requestPanel('mcp')}
+            {...withRefreshError(refreshErrorProp('mcp'))}
+          >
+            {(data) => (
+              <McpPanel
+                data={data}
+                onReload={reloadMcp}
+                onAdd={addMcpServer}
+                onTest={testMcpServer}
+                onRemove={removeMcpServer}
+                onSetEnabled={setMcpServerEnabled}
+                onAuth={authMcpServer}
+                onCatalog={mcpCatalog}
+                onCatalogInstall={mcpCatalogInstall}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'skills' && (
-        <div
-          id={panelTabpanelId('skills')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('skills')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Skills panel">
-            <RemotePanel
-              remote={globalPanels.skills}
-              loadingHint="Loading skills…"
-              onRetry={() => requestPanel('skills')}
-              {...withRefreshError(refreshErrorProp('skills'))}
-            >
-              {(data) => (
-                <SkillsPanel
-                  data={data}
-                  onToggle={(name, enabled) => toggle('skills.toggle', { name, enabled })}
-                  onRefresh={() => requestPanel('skills')}
-                  onCreate={createSkill}
-                  onHubPreview={previewHubSkill}
-                  onHubScan={scanHubSkill}
-                  onHubInstall={installHubSkill}
-                  onHubUninstall={uninstallHubSkill}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="skills" region="the Skills panel">
+          <RemotePanel
+            remote={globalPanels.skills}
+            loadingHint="Loading skills…"
+            onRetry={() => requestPanel('skills')}
+            {...withRefreshError(refreshErrorProp('skills'))}
+          >
+            {(data) => (
+              <SkillsPanel
+                data={data}
+                onToggle={(name, enabled) => toggle('skills.toggle', { name, enabled })}
+                onRefresh={() => requestPanel('skills')}
+                onCreate={createSkill}
+                onHubPreview={previewHubSkill}
+                onHubScan={scanHubSkill}
+                onHubInstall={installHubSkill}
+                onHubUninstall={uninstallHubSkill}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'checkpoints' && (
-        <div
-          id={panelTabpanelId('checkpoints')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('checkpoints')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Checkpoints panel">
-            <RemotePanel
-              remote={checkpointsRemote}
-              loadingHint="Loading checkpoints…"
-              onRetry={() => requestPanel('checkpoints')}
-              {...withRefreshError(scopedRefreshErrorProp('checkpoints'))}
-            >
-              {(data) => (
-                <CheckpointsPanel
-                  data={data}
-                  onRestore={restoreCheckpoint}
-                  onRedo={redoCheckpoint}
-                  onRedoAll={redoAllCheckpoint}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="checkpoints" region="the Checkpoints panel">
+          <RemotePanel
+            remote={checkpointsRemote}
+            loadingHint="Loading checkpoints…"
+            onRetry={() => requestPanel('checkpoints')}
+            {...withRefreshError(scopedRefreshErrorProp('checkpoints'))}
+          >
+            {(data) => (
+              <CheckpointsPanel
+                data={data}
+                onRestore={restoreCheckpoint}
+                onRedo={redoCheckpoint}
+                onRedoAll={redoAllCheckpoint}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'subagents' && (
-        <div
-          id={panelTabpanelId('subagents')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('subagents')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Subagents panel">
-            <RemotePanel
-              remote={tab.subagents}
-              loadingHint="Loading subagents…"
-              onRetry={() => requestPanel('subagents')}
-              {...withRefreshError(scopedRefreshErrorProp('subagents'))}
-            >
-              {(data) => <SubagentsPanel data={data} />}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="subagents" region="the Subagents panel">
+          <RemotePanel
+            remote={tab.subagents}
+            loadingHint="Loading subagents…"
+            onRetry={() => requestPanel('subagents')}
+            {...withRefreshError(scopedRefreshErrorProp('subagents'))}
+          >
+            {(data) => <SubagentsPanel data={data} />}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'sessions' && (
-        <div
-          id={panelTabpanelId('sessions')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('sessions')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Sessions panel">
-            <RemotePanel
-              remote={state.sessionsPanel}
-              loadingHint="Loading sessions…"
-              onRetry={() => requestPanel('sessions')}
-              {...withRefreshError(scopedRefreshErrorProp('sessions'))}
-            >
-              {(data) => (
-                <SessionsPanel
-                  data={data}
-                  activeTabId={state.activeTabId}
-                  boundSessionIds={boundSessionIds}
-                  activeTabHasLiveTurn={tab.turnActive}
-                  onLoad={loadSession}
-                  /* exactOptional prep (arm 1): `SessionsPanelProps`
-                     (`panels/SessionsPanel.tsx`, outside this batch) declares
-                     both as `?: string` — spread each key in only when present. */
-                  {...(state.pendingSessionLoad?.sessionId !== undefined
-                    ? { loadingSessionId: state.pendingSessionLoad.sessionId }
-                    : {})}
-                  onLoadMore={loadMoreSessions}
-                  loadingMore={sessionsLoadingMore}
-                  {...(sessionsLoadMoreError !== undefined ? { loadMoreError: sessionsLoadMoreError } : {})}
-                  // UX-04b: `loadNotice?: {...} | undefined` — unlike the
-                  // spread-omission props above, this type explicitly
-                  // includes `| undefined`, so assigning it directly (rather
-                  // than omitting the key) type-checks under
-                  // exactOptionalPropertyTypes.
-                  loadNotice={
-                    sessionLoadNotice !== undefined
-                      ? { text: sessionLoadNotice, onDismiss: () => setSessionLoadNotice(undefined) }
-                      : undefined
-                  }
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="sessions" region="the Sessions panel">
+          <RemotePanel
+            remote={state.sessionsPanel}
+            loadingHint="Loading sessions…"
+            onRetry={() => requestPanel('sessions')}
+            {...withRefreshError(scopedRefreshErrorProp('sessions'))}
+          >
+            {(data) => (
+              <SessionsPanel
+                data={data}
+                activeTabId={state.activeTabId}
+                boundSessionIds={boundSessionIds}
+                activeTabHasLiveTurn={tab.turnActive}
+                onLoad={loadSession}
+                /* exactOptional prep (arm 1): `SessionsPanelProps`
+                   (`panels/SessionsPanel.tsx`, outside this batch) declares
+                   both as `?: string` — spread each key in only when present. */
+                {...(state.pendingSessionLoad?.sessionId !== undefined
+                  ? { loadingSessionId: state.pendingSessionLoad.sessionId }
+                  : {})}
+                onLoadMore={loadMoreSessions}
+                loadingMore={sessionsLoadingMore}
+                {...(sessionsLoadMoreError !== undefined ? { loadMoreError: sessionsLoadMoreError } : {})}
+                // UX-04b: `loadNotice?: {...} | undefined` — unlike the
+                // spread-omission props above, this type explicitly
+                // includes `| undefined`, so assigning it directly (rather
+                // than omitting the key) type-checks under
+                // exactOptionalPropertyTypes.
+                loadNotice={
+                  sessionLoadNotice !== undefined
+                    ? { text: sessionLoadNotice, onDismiss: () => setSessionLoadNotice(undefined) }
+                    : undefined
+                }
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {state.activePanel === 'models' && (
-        <div
-          id={panelTabpanelId('models')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('models')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Models panel">
-            <RemotePanel
-              remote={globalPanels.models}
-              loadingHint="Loading models…"
-              onRetry={() => requestPanel('models')}
-              {...withRefreshError(refreshErrorProp('models'))}
-            >
-              {(data) => (
-                <ModelsPanel
-                  data={data}
-                  activeModelId={tab.currentModelId}
-                  onSetModel={hostActions.setModel}
-                  onAddProviderKey={onAddProviderKey}
-                />
-              )}
-            </RemotePanel>
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="models" region="the Models panel">
+          <RemotePanel
+            remote={globalPanels.models}
+            loadingHint="Loading models…"
+            onRetry={() => requestPanel('models')}
+            {...withRefreshError(refreshErrorProp('models'))}
+          >
+            {(data) => (
+              <ModelsPanel
+                data={data}
+                activeModelId={tab.currentModelId}
+                onSetModel={hostActions.setModel}
+                onAddProviderKey={onAddProviderKey}
+              />
+            )}
+          </RemotePanel>
+        </PanelScaffold>
       )}
       {/* Task 10: the Setup / Talaria Config panel — unlike Settings (F-7
           below), the WHOLE `SetupData` snapshot is host-assembled from
@@ -1343,23 +1115,16 @@ export function App() {
           RemoteData straight through (SetupPanel owns its own `RemotePanel`
           gate internally, same as every other data panel here). */}
       {state.activePanel === 'setup' && (
-        <div
-          id={panelTabpanelId('setup')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('setup')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Setup panel">
-            <SetupPanel
-              data={globalPanels.setup}
-              onRetry={() => requestPanel('setup')}
-              progress={state.setupProgress}
-              nextEdit={state.nextEditToggles}
-              onToggleNextEdit={setNextEditToggle}
-              dispatch={dispatchSetup}
-            />
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="setup" region="the Setup panel">
+          <SetupPanel
+            data={globalPanels.setup}
+            onRetry={() => requestPanel('setup')}
+            progress={state.setupProgress}
+            nextEdit={state.nextEditToggles}
+            onToggleNextEdit={setNextEditToggle}
+            dispatch={dispatchSetup}
+          />
+        </PanelScaffold>
       )}
 
       {/* Task 12 (§5.1/§5.2): "Agent config" (`'settings'` panel id, unchanged
@@ -1375,21 +1140,14 @@ export function App() {
           un-narrowed `RemoteData` union, so re-wrapping it here still cannot
           typecheck; the structure is locked in `panels/SettingsPanel.test.ts`. */}
       {state.activePanel === 'settings' && (
-        <div
-          id={panelTabpanelId('settings')}
-          role="tabpanel"
-          aria-labelledby={panelTabDomId('settings')}
-          className="flex min-h-0 flex-1 flex-col"
-        >
-          <ErrorBoundary region="the Settings panel">
-            <SettingsPanel
-              config={globalPanels.settings}
-              onRetryConfig={() => requestPanel('settings')}
-              onSetConfig={setConfig}
-              {...withRefreshError(refreshErrorProp('settings'))}
-            />
-          </ErrorBoundary>
-        </div>
+        <PanelScaffold panel="settings" region="the Settings panel">
+          <SettingsPanel
+            config={globalPanels.settings}
+            onRetryConfig={() => requestPanel('settings')}
+            onSetConfig={setConfig}
+            {...withRefreshError(refreshErrorProp('settings'))}
+          />
+        </PanelScaffold>
       )}
     </>
   );

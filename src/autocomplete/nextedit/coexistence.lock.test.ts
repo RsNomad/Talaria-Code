@@ -896,7 +896,7 @@ describe('R2 LOCK (single-flight DIRECTION, structural): the shell aborts only i
     expect(
       [...new Set(receivers)],
       'R2 structural failed: every .abort() receiver in shell.vscode.ts must be the shell OWN inFlight controller — a different receiver means next-edit has (or has grown) a way to abort something it does not own',
-    ).toEqual(['inFlight']);
+    ).toEqual(['this.inFlight']);
   });
 
   it('RED-first proof: a planted FIM abort in the same file IS flagged', () => {
@@ -910,7 +910,7 @@ describe('R2 LOCK (single-flight DIRECTION, structural): the shell aborts only i
     expect(
       receivers,
       'RED-first proof failed: a planted fimController.abort() must break the inFlight-only equality check',
-    ).not.toEqual(['inFlight']);
+    ).not.toEqual(['this.inFlight']);
   });
 
   /**
@@ -933,7 +933,7 @@ describe('R2 LOCK (single-flight DIRECTION, structural): the shell aborts only i
     expect(
       receivers,
       'RED-first proof failed: the optional-chained FIM abort must break the inFlight-only equality check',
-    ).not.toEqual(['inFlight']);
+    ).not.toEqual(['this.inFlight']);
   });
 
   /**
@@ -954,38 +954,68 @@ describe('R2 LOCK (single-flight DIRECTION, structural): the shell aborts only i
     expect(
       receivers,
       'RED-first proof failed: a FIM-owned field merely NAMED inFlight must not be indistinguishable from the shell own inFlight variable',
-    ).not.toEqual(['inFlight']);
+    ).not.toEqual(['this.inFlight']);
   });
 
   /**
-   * REGRESSION CONTROL: the shell's own `abortInFlight()` uses an explicit
-   * null check (`if (inFlight !== null) { inFlight.abort(); ... }`). Were it
-   * collapsed to `inFlight?.abort()`, it must still resolve to the SAME
-   * receiver, `inFlight` — that is the identical, still-own-controller
-   * abort, merely spelled with a null-safety operator instead of an `if`.
-   * The receiver-identity check above (`toEqual(['inFlight'])`) is the real
-   * protection; this proves the `\??` addition does not turn a benign
-   * self-abort refactor into either a false violation report or, worse, an
-   * invisible one (an empty receiver list would silently pass the equality
-   * check above for the wrong reason — see the non-vacuity comment there).
+   * RED-first proof, the strengthening's own witness: `const inFlight =
+   * fim.inFlight; inFlight.abort()` reads a FIM-owned field into a LOCAL
+   * named `inFlight`, then calls `.abort()` on the bare local — the regex
+   * captures the receiver at the call site, so this resolves to the bare
+   * string `inFlight`, indistinguishable from the shell's OWN (former) bare
+   * receiver. Under the OLD allowed set `['inFlight']` this alias would have
+   * been WRONGLY ALLOWED — exactly the contortion `abortInFlight()` used to
+   * perform on its own legitimate field. Under the new, more specific
+   * allowed set `['this.inFlight']` it is flagged. This is the concrete
+   * proof that `['this.inFlight']` is strictly STRONGER than `['inFlight']`,
+   * not merely a renamed equivalent.
    */
-  it('REGRESSION: collapsing abortInFlight() to inFlight?.abort() still resolves to the SAME receiver', () => {
+  it('RED-first proof: const inFlight = fim.inFlight; inFlight.abort() is flagged — the old set would have wrongly allowed it', () => {
     const shell = loadStripped(NEXTEDIT_DIR).find((f) => f.file === 'shell.vscode.ts');
-    const withOptionalChain = (shell?.content ?? '').replace('inFlight.abort();', 'inFlight?.abort();');
+    const withViolation = `${shell?.content ?? ''}\n        const inFlight = fim.inFlight;\n        inFlight.abort();\n`;
+
+    const receivers = [...new Set(abortReceivers(withViolation))];
     expect(
-      withOptionalChain,
-      'setup: the inFlight.abort() -> inFlight?.abort() substitution did not land — check the shell source still contains that exact substring',
+      receivers,
+      'RED-first proof failed: a planted const inFlight = fim.inFlight; inFlight.abort() was not detected at all',
+    ).toContain('inFlight');
+    expect(
+      receivers,
+      'RED-first proof failed: a bare-inFlight alias of a FIM-owned field must break the this.inFlight-only equality check — the OLD [\'inFlight\'] set would have wrongly allowed this exact receiver string',
+    ).not.toEqual(['this.inFlight']);
+  });
+
+  /**
+   * REGRESSION CONTROL: the shell's own `abortInFlight()` reads
+   * `this.inFlight?.abort()` — optional-chained, no `if` guard. Were it
+   * reverted to a direct member call, `this.inFlight.abort()` (no `?`), it
+   * must still resolve to the SAME receiver, `this.inFlight` — receiver
+   * IDENTITY is invariant to the presence of the `?.` operator; this is the
+   * mutation the `[SEC]` lens re-runs to confirm the rewrite stays
+   * behaviour-equivalent under the lock. The receiver-identity check above
+   * (`toEqual(['this.inFlight'])`) is the real protection; this proves the
+   * `\??` addition does not turn a benign self-abort spelling change into
+   * either a false violation report or, worse, an invisible one (an empty
+   * receiver list would silently pass the equality check above for the
+   * wrong reason — see the non-vacuity comment there).
+   */
+  it('REGRESSION: reverting abortInFlight() to this.inFlight.abort() (no optional chain) still resolves to the SAME receiver', () => {
+    const shell = loadStripped(NEXTEDIT_DIR).find((f) => f.file === 'shell.vscode.ts');
+    const withoutOptionalChain = (shell?.content ?? '').replace('this.inFlight?.abort();', 'this.inFlight.abort();');
+    expect(
+      withoutOptionalChain,
+      'setup: the this.inFlight?.abort() -> this.inFlight.abort() substitution did not land — check the shell source still contains that exact substring',
     ).not.toBe(shell?.content ?? '');
 
-    const receivers = [...new Set(abortReceivers(withOptionalChain))];
+    const receivers = [...new Set(abortReceivers(withoutOptionalChain))];
     expect(
       receivers.length,
-      'REGRESSION failed: inFlight?.abort() must still be detected as SOME receiver, not silently made invisible by the \\?? addition',
+      'REGRESSION failed: this.inFlight.abort() must still be detected as SOME receiver, not silently made invisible by dropping the \\?? addition',
     ).toBeGreaterThan(0);
     expect(
       receivers,
-      'REGRESSION failed: inFlight?.abort() is a benign self-abort refactor and must still resolve to the SAME receiver, inFlight — not a false violation report',
-    ).toEqual(['inFlight']);
+      'REGRESSION failed: this.inFlight.abort() is a benign self-abort spelling change and must still resolve to the SAME receiver, this.inFlight — not a false violation report',
+    ).toEqual(['this.inFlight']);
   });
 });
 

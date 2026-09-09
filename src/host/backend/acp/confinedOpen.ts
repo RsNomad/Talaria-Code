@@ -2,6 +2,8 @@ import { promises as realFs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { isWithin } from './pathConfine';
+
 /**
  * O_PATH confined-open unit (accepted-limits Limit-1 close). Closes the classic `realpath`→open TOCTOU on
  * `handleReadTextFile`: between the pre-check's `realpath` and the actual read,
@@ -95,12 +97,6 @@ export interface ConfinedReader {
 
 function isErrno(e: unknown, code: string): boolean {
   return typeof e === 'object' && e !== null && (e as { code?: unknown }).code === code;
-}
-
-/** `child` is `parent` itself or nested under it (both already realpath'd). */
-function isWithin(child: string, parent: string): boolean {
-  const rel = path.relative(parent, child);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
 class ProcFdReader implements ConfinedReader {

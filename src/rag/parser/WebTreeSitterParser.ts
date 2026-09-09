@@ -48,6 +48,11 @@ export interface WebTreeSitterParserOptions {
    * memo passes its own {@link createParserInitMemo} result.
    */
   ensureParserInit?: () => Promise<void>;
+
+  /** FI-20/FI-31: injected log seam for the grammar-load-failure branch
+   * below — called with `err.name` ONLY (never the raw error), mirroring
+   * `indexer.ts`'s `readManifest`/`readMeta` `(${err.name})` idiom. */
+  logger: (line: string) => void;
 }
 
 /**
@@ -169,7 +174,13 @@ export class WebTreeSitterParser implements CodeParser {
       this.languageCache.set(languageId, language);
       return language;
     } catch (err) {
-      console.error(`hermes-codebase: failed to load tree-sitter grammar for ${languageId}`, err);
+      // FI-20/FI-31: err.name only, through the injected logger (not
+      // console.error) — never the raw error (its message can carry
+      // filesystem detail). `languageId` stays: it's a language id, not a
+      // path or secret.
+      this.opts.logger(
+        `hermes-codebase: failed to load tree-sitter grammar for ${languageId} (${err instanceof Error ? err.name : 'unknown'})`,
+      );
       this.languageCache.set(languageId, null);
       return null;
     }

@@ -15,6 +15,8 @@ import { PanelSourceRegistry } from '../../panels/PanelSourceRegistry';
 import { SessionRegistry } from '../session/SessionRegistry';
 import { RootRegistry } from '../../checkpoints/rootRegistry';
 import type { DataPanel, PanelDataMap, HostToWebview } from '../../../shared/protocol';
+import type { DashboardClientLike } from '../../dashboard/HermesDashboardClient';
+import type { DashboardService } from '../../dashboard/HermesDashboardManager';
 
 /**
  * F3-16 harness (reused by WS-GD.1 Tasks 6-7): a `vi.fn()`-free fake {@link
@@ -40,6 +42,7 @@ function makePort(overrides: Partial<ControlDispatcherHostPort> = {}): {
     },
     panelSources: registry,
     sessions: new SessionRegistry(),
+    isPendingClose: () => false,
     rootRegistry: new RootRegistry(),
     resolveRootCoordinator: (_cwd) => {
       throw new Error('resolveRootCoordinator not used in these tests');
@@ -163,4 +166,149 @@ describe('ControlDispatcher — WS-GD.1 CA-M19 [SECURITY]: push-channel redactio
     const providers = (push?.data as unknown as { providers: Array<{ token: unknown }> } | undefined)?.providers;
     expect(providers?.[0]?.token).toBe('[redacted]'); // walked by the SAME deny-list the response path uses
   });
+});
+
+/**
+ * BH-01 (round-2, WS-C C1): `skills.toggle`/`toolsets.toggle` used to return
+ * the toggle RPC result with NO re-push — the config persisted server-side,
+ * but the webview's `useToggle` V-11 reconcile shows the (stale) last-pushed
+ * `serverValue` the instant the op settles, so the switch visibly "snapped
+ * back" even though the toggle worked. `fakeClient` implements the full
+ * {@link DashboardClientLike} surface (`vi.fn()`-free — plain closures, no
+ * call-recording needed here since these tests assert on the EMITTED PUSH /
+ * LOG, not on what reached the client).
+ */
+function makeFakeToggleClient(): DashboardClientLike {
+  return {
+    probe: async () => true,
+    listSkills: async () => [],
+    toggleSkill: async (name, enabled) => ({ ok: true, name, enabled }),
+    listToolsets: async () => [],
+    toggleToolset: async (name, enabled) => ({ ok: true, name, enabled }),
+  };
+}
+
+describe('ControlDispatcher — WS-C C1 (BH-01): toggle re-push', () => {
+  it('toolsets.toggle pushes the persisted tools panel BEFORE the toggle RPC resolves', async () => {
+    const dashboard: DashboardService = { ensure: async () => makeFakeToggleClient(), dispose() {} };
+    const { port, emitted, registry } = makePort({ getDashboard: () => dashboard });
+    registerFakeSource(registry, 'tools', async () => ({
+      data: { toolsets: [{ name: 'web', enabled: true, toolCount: 1 }], tools: [] },
+    }));
+    const dispatcher = new ControlDispatcher(port);
+
+    let pushedBeforeResolve = false;
+    const raw = await dispatcher.invokeControl('toolsets.toggle', { name: 'web', enabled: true }).then((r) => {
+      pushedBeforeResolve = emitted.some((m) => m.type === 'panel.data' && m.panel === 'tools');
+      return r;
+    });
+    expect(raw).toEqual({ ok: true, name: 'web', enabled: true });
+    expect(pushedBeforeResolve, 'the persisted panel is pushed BEFORE the toggle RPC resolves').toBe(true);
+  });
+
+  it('skills.toggle pushes the persisted skills panel BEFORE the toggle RPC resolves', async () => {
+    const dashboard: DashboardService = { ensure: async () => makeFakeToggleClient(), dispose() {} };
+    const { port, emitted, registry } = makePort({ getDashboard: () => dashboard });
+    registerFakeSource(registry, 'skills', async () => ({
+      data: {
+        skills: [{ id: 'my-skill', name: 'my-skill', category: 'coding', description: 'x', enabled: true }],
+        categories: [],
+      },
+    }));
+    const dispatcher = new ControlDispatcher(port);
+
+    let pushedBeforeResolve = false;
+    const raw = await dispatcher.invokeControl('skills.toggle', { name: 'my-skill', enabled: true }).then((r) => {
+      pushedBeforeResolve = emitted.some((m) => m.type === 'panel.data' && m.panel === 'skills');
+      return r;
+    });
+    expect(raw).toEqual({ ok: true, name: 'my-skill', enabled: true });
+    expect(pushedBeforeResolve, 'the persisted panel is pushed BEFORE the toggle RPC resolves').toBe(true);
+  });
+
+  it('toolsets.toggle: a rejecting re-push still resolves the toggle result and logs exactly one line naming the method and "re-push"', async () => {
+    const dashboard: DashboardService = { ensure: async () => makeFakeToggleClient(), dispose() {} };
+    const logLines: string[] = [];
+    const { port, registry } = makePort({
+      getDashboard: () => dashboard,
+      logger: { append: (line) => logLines.push(line) },
+    });
+    registerFakeSource(registry, 'tools', async (): Promise<{ data: PanelDataMap['tools'] }> => {
+      throw new Error('dashboard unreachable');
+    });
+    const dispatcher = new ControlDispatcher(port);
+
+    const raw = await dispatcher.invokeControl('toolsets.toggle', { name: 'web', enabled: true });
+
+    expect(raw).toEqual({ ok: true, name: 'web', enabled: true });
+    expect(logLines).toHaveLength(1);
+    expect(logLines[0]).toEqual(expect.stringContaining('toolsets.toggle'));
+    expect(logLines[0]).toEqual(expect.stringContaining('re-push'));
+  });
+});
+
+/**
+ * WS-R1 R1-6 (L2-CA-26, ADR-R2-16 completion): C1/BH-01 made ONLY the toggle
+ * branches failure-isolated (the suite above) — `reload.mcp` and
+ * `model.save_key` still `await`ed their re-fetch UNGUARDED, so a
+ * `fetchPanelData` rejection there turned an already-persisted, SUCCESSFUL
+ * mutation into a REJECTED RPC (the exact hazard ADR-R2-16 named). This table
+ * drives all THREE panel-mutating branches through one rejecting fake panel
+ * source and asserts the shared `rePushPanel` contract on every row: the RPC
+ * still RESOLVES its raw dispatch result, and exactly one `logger` line
+ * names the method and contains "re-push". Before `rePushPanel` exists, the
+ * `reload.mcp`/`model.save_key` rows fail (RED) because the unguarded await
+ * rejects the whole `invokeControl` call; the `toolsets.toggle` row already
+ * passes (it pins that the new helper preserves C1's existing behaviour).
+ */
+describe('ControlDispatcher — WS-R1 R1-6 (L2-CA-26): rePushPanel unifies all panel-mutating branches', () => {
+  interface RePushCase {
+    method: string;
+    panel: DataPanel;
+    invokeParams: unknown;
+    dispatchResult: unknown;
+  }
+
+  const CASES: RePushCase[] = [
+    { method: 'reload.mcp', panel: 'mcp', invokeParams: {}, dispatchResult: { status: 'reloaded' } },
+    {
+      method: 'model.save_key',
+      panel: 'models',
+      invokeParams: { slug: 'x', api_key: 'sk-super-secret-value' },
+      dispatchResult: { provider: {} },
+    },
+    {
+      method: 'toolsets.toggle',
+      panel: 'tools',
+      invokeParams: { name: 'web', enabled: true },
+      dispatchResult: { ok: true, name: 'web', enabled: true },
+    },
+  ];
+
+  it.each(CASES)(
+    '$method: a rejecting panel re-push still resolves the RPC result and logs exactly one "re-push" line, never the params',
+    async ({ method, panel, invokeParams, dispatchResult }) => {
+      const logLines: string[] = [];
+      const dashboard: DashboardService = { ensure: async () => makeFakeToggleClient(), dispose() {} };
+      const { port, registry } = makePort({
+        dispatch: async () => dispatchResult,
+        getDashboard: () => dashboard,
+        logger: { append: (line) => logLines.push(line) },
+      });
+      registerFakeSource(registry, panel, async () => {
+        throw new Error(`${panel} panel unreachable`);
+      });
+      const dispatcher = new ControlDispatcher(port);
+
+      const raw = await dispatcher.invokeControl(method, invokeParams);
+
+      expect(raw).toEqual(dispatchResult);
+      expect(logLines).toHaveLength(1);
+      expect(logLines[0]).toEqual(expect.stringContaining(method));
+      expect(logLines[0]).toEqual(expect.stringContaining('re-push'));
+      // SECURITY (model.save_key's params carry the API key): the log line
+      // must never interpolate `params` on any of the three branches.
+      expect(logLines[0]).not.toEqual(expect.stringContaining('sk-super-secret-value'));
+    },
+  );
 });

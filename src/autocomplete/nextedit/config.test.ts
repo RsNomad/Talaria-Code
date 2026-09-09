@@ -37,4 +37,23 @@ describe('readNextEditConfig', () => {
     expect(cfg.enabled).toBeUndefined();
     expect(cfg.generic).toBeUndefined();
   });
+
+  it('L2-CA-06: a malformed endpoint (not a URL at all) is dropped to the empty-string sentinel, mirroring FIM', () => {
+    settings.set('talaria.nextEdit.endpoint', 'not a url');
+    expect(readNextEditConfig().endpoint).toBe('');
+  });
+
+  it('L2-CA-06: a malformed endpoint (non-http(s) scheme) is dropped to the empty-string sentinel, mirroring FIM', () => {
+    settings.set('talaria.nextEdit.endpoint', 'ftp://x');
+    expect(readNextEditConfig().endpoint).toBe('');
+  });
+
+  it('L2-CA-06: a valid http(s) endpoint passes through verbatim', () => {
+    settings.set('talaria.nextEdit.endpoint', 'http://127.0.0.1:11434');
+    expect(readNextEditConfig().endpoint).toBe('http://127.0.0.1:11434');
+  });
+
+  it('L2-CA-06: an unset endpoint stays the empty-string sentinel (unchanged)', () => {
+    expect(readNextEditConfig().endpoint).toBe('');
+  });
 });

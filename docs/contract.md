@@ -82,7 +82,7 @@ data: [`src/shared/mockScenario.ts`](../src/shared/mockScenario.ts).
 | Type | Definition | Origin |
 |---|---|---|
 | `ToolKind` | `'read'\|'edit'\|'execute'\|'search'\|'fetch'\|'think'\|'other'` | ACP `ToolCallKind` |
-| `ToolStatus` | `'pending'\|'running'\|'done'\|'failed'` | ACP `ToolCallStatus` |
+| `ToolStatus` | `'pending'\|'running'\|'done'\|'failed'\|'interrupted'\|'approved'\|'denied'` | ACP `ToolCallStatus` (`approved`/`denied`/`interrupted` are the BH-05 synthetic edit-approval card states — client-derived, not ACP) |
 | `DiffHunk` | `{ header: string; lines: { sign:'+'\|'-'\|' '; text: string }[] }` | ACP `tool_diff_content` |
 | `ApprovalOption` | `{ id; label; kind:'allow_once'\|'allow_session'\|'allow_always'\|'deny'\|'deny_always' }` | ACP `session/request_permission` |
 | `PlanItem` | `{ text: string; status:'done'\|'active'\|'pending' }` | ACP `plan` |

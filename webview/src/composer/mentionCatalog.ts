@@ -12,8 +12,22 @@ export interface MentionItem extends SuggestItem {
   token: string;
 }
 
-/** The reference kinds Hermes can resolve itself once wired to a backend. */
-export const MENTIONS: MentionItem[] = [
+/**
+ * The reference kinds Hermes can resolve itself once wired to a backend.
+ *
+ * SY-02: deeply immutable at the type level — `readonly … []` blocks
+ * `.push`/index-write on the catalog itself, and wrapping each element in
+ * `Readonly<>` blocks a per-entry field write too (`MENTIONS[0].label = …`),
+ * matching this repo's `ignoreFilter.ts`/`nextEditCopy.ts` "readonly-typed
+ * literal, no runtime freeze" idiom for a latent-only (no consumer mutates)
+ * catalog — unlike `EMPTY_SETUP_PROGRESS`, this is never handed out as a
+ * shared mutable default, so a compile-time guard is enough. `filterMentions`
+ * below still returns the wide, mutable `MentionItem[]` its signature always
+ * has — a `Readonly<MentionItem>` reads as a `MentionItem` (readonly-ness
+ * on an object's fields isn't part of structural assignability), so
+ * `.filter()`'s result satisfies it with no cast.
+ */
+export const MENTIONS: readonly Readonly<MentionItem>[] = [
   { id: 'file', label: 'File', hint: 'reference a file', icon: 'file', token: 'file' },
   { id: 'folder', label: 'Folder', hint: 'reference a folder', icon: 'folder', token: 'folder' },
   { id: 'problems', label: 'Problems', hint: 'current diagnostics', icon: 'warning', token: 'problems' },

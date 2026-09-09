@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   BackendHttpError,
   BackendStreamError,
@@ -8,7 +8,15 @@ import {
   readOpenAiSseText,
   MAX_STREAM_BYTES,
   readJsonBounded,
+  armStreamDeadlines,
+  raceWithDeadline,
+  StreamIdleTimeoutError,
+  STREAM_FIRST_BYTE_MS,
+  STREAM_IDLE_TIMEOUT_MS,
+  type StreamableResponse,
 } from './http';
+import { OllamaFimBackend } from './OllamaFimBackend';
+import type { FimRequest } from '../types';
 
 describe('BackendHttpError', () => {
   it('is instanceof both BackendHttpError and Error, preserves .status, and sets .name (A1 — required for A5 catch-site narrowing)', () => {
@@ -602,5 +610,264 @@ describe('readJsonBounded — F7: reader.cancel() in finally on every exit path 
 
     expect(cancelCalls).toBe(1);
     expect(releaseLockCalls).toBe(1);
+  });
+});
+
+/**
+ * ADR-R2-06 (L2-CA-05, C-1-redesigned) — task R1-7. Fake-timer proof of the
+ * ONE first-byte deadline (== undici's own 300s default, spanning the
+ * caller's `fetch` await AND the reader's first `read()`) plus the 120s
+ * inter-chunk idle. Every scenario here is modelled on REAL Ollama on a
+ * CPU-only box (cline#6549 / ollama#7685): `fetch` itself does not resolve
+ * — no headers, nothing — until the model is loaded and the first token is
+ * ready, so a deadline any tighter than the runtime's in front of `fetch`
+ * would reap a legitimately slow-but-alive completion. Case (i) below is
+ * the one that MUST keep passing.
+ *
+ * `armStreamDeadlines(undefined)` is used throughout (no external caller
+ * signal) so `dl.signal` is the bare internal `AbortController`'s signal —
+ * no `AbortSignal.any` composition to reason about — keeping each case
+ * about the deadline arithmetic alone.
+ */
+describe('armStreamDeadlines / raceWithDeadline — ADR-R2-06 fake-timer proof', () => {
+  it('the two deadlines are pinned to undici\'s default (300s) and the ONE genuine tightening (120s) — never a settings knob', () => {
+    expect(STREAM_FIRST_BYTE_MS).toBe(300_000);
+    expect(STREAM_IDLE_TIMEOUT_MS).toBe(120_000);
+  });
+
+  function ndjsonBody(): { body: ReadableStream<Uint8Array> } {
+    return streamFromChunks(['{"response":"a","done":false}\n{"response":"b","done":true}\n']);
+  }
+
+  // (i) — THE case that must never regress: Ollama resolving `fetch` only at
+  // t=200s (model load + prefill on a CPU-only box), WITH the first chunk
+  // already attached to that same response — the first-byte deadline is
+  // 300s, so this must complete normally, not be reaped.
+  it('(i) a 200s slow-first-token fetch (well under the 300s first-byte deadline) completes normally', async () => {
+    vi.useFakeTimers();
+    try {
+      const dl = armStreamDeadlines(undefined);
+      const fetchPromise = new Promise<StreamableResponse>((resolve) => {
+        setTimeout(() => resolve(ndjsonBody()), 200_000);
+      });
+
+      const drive = (async () => {
+        const response = await raceWithDeadline(fetchPromise, dl);
+        return collect(readNdjsonLines(response, dl));
+      })();
+
+      await vi.advanceTimersByTimeAsync(200_000);
+
+      await expect(drive).resolves.toEqual([
+        { response: 'a', done: false },
+        { response: 'b', done: true },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // (ii) — the ONLY genuine tightening this task makes: fetch resolves fast
+  // (5s) with a first chunk attached, then the connection goes silent. 130s
+  // of silence would elapse if nothing intervened; the 120s idle deadline
+  // (armed the moment the first chunk arrived, at t=5s) reaps it first, at
+  // t=125s — well before the hypothetical 130s mark — and `reader.cancel()`
+  // must have been awaited (F7 discipline) on the still-open stream.
+  it('(ii) fetch resolves at 5s with a first chunk, then the stream goes silent — reaped as StreamIdleTimeoutError at the 120s idle mark, with reader.cancel() awaited', async () => {
+    vi.useFakeTimers();
+    try {
+      const dl = armStreamDeadlines(undefined);
+      const encoder = new TextEncoder();
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('{"response":"a","done":false}\n'));
+          // Deliberately never enqueue again and never close — an open
+          // connection that goes silent after its first chunk.
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const fetchPromise = new Promise<StreamableResponse>((resolve) => {
+        setTimeout(() => resolve({ body }), 5_000);
+      });
+
+      const collected: unknown[] = [];
+      let caught: unknown;
+      const drive = (async () => {
+        try {
+          const response = await raceWithDeadline(fetchPromise, dl);
+          for await (const item of readNdjsonLines(response, dl)) collected.push(item);
+        } catch (e) {
+          caught = e;
+        }
+      })();
+
+      // t=5s: fetch resolves, the first read() fires (arms the 120s idle
+      // deadline against t=5s, i.e. an absolute deadline of t=125s).
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(collected).toEqual([{ response: 'a', done: false }]);
+      expect(caught).toBeUndefined();
+
+      // Advance the full modelled silence (130s) — the idle deadline fires
+      // at t=125s, strictly before this window ends.
+      await vi.advanceTimersByTimeAsync(130_000);
+      await drive;
+
+      expect(caught).toBeInstanceOf(StreamIdleTimeoutError);
+      expect(cancelled, 'reader.cancel() must reach the still-open stream').toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // (iii) — the span requirement's other half: a fetch that never resolves
+  // at all (no response, ever) is reaped at exactly the 300s first-byte
+  // deadline — not earlier (mutation (a) below flips this), and not later.
+  it('(iii) a fetch that never resolves is reaped at the 300s first-byte deadline, not earlier', async () => {
+    vi.useFakeTimers();
+    try {
+      const dl = armStreamDeadlines(undefined);
+      const neverResolves = new Promise<StreamableResponse>(() => {});
+      const guarded = raceWithDeadline(neverResolves, dl);
+      let caught: unknown;
+      guarded.catch((e: unknown) => {
+        caught = e;
+      });
+
+      await vi.advanceTimersByTimeAsync(STREAM_FIRST_BYTE_MS - 1);
+      expect(caught, 'must not reap before the 300s first-byte deadline').toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(caught).toBeInstanceOf(StreamIdleTimeoutError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // (iv) — the idle deadline is re-armed on EVERY chunk, not just the first:
+  // 18 chunks 10s apart (180s total, comfortably past the 120s idle window
+  // if it were never re-armed) must still complete normally.
+  it('(iv) chunks arriving every 10s for 3 minutes complete normally — the idle deadline re-arms on every chunk', async () => {
+    vi.useFakeTimers();
+    try {
+      const dl = armStreamDeadlines(undefined);
+      const encoder = new TextEncoder();
+      let setController: ((c: ReadableStreamDefaultController<Uint8Array>) => void) | undefined;
+      const controllerReady = new Promise<ReadableStreamDefaultController<Uint8Array>>((resolve) => {
+        setController = resolve;
+      });
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          setController?.(c);
+        },
+      });
+      const controller = await controllerReady;
+
+      const collected: unknown[] = [];
+      let caught: unknown;
+      const drive = (async () => {
+        try {
+          for await (const item of readNdjsonLines({ body }, dl)) collected.push(item);
+        } catch (e) {
+          caught = e;
+        }
+      })();
+
+      const CHUNKS = 18; // 18 * 10s = 180s (3 minutes)
+      for (let i = 0; i < CHUNKS; i++) {
+        controller.enqueue(encoder.encode(`{"response":"c${i}","done":false}\n`));
+        await vi.advanceTimersByTimeAsync(10_000);
+      }
+      controller.enqueue(encoder.encode('{"response":"done","done":true}\n'));
+      controller.close();
+      await vi.advanceTimersByTimeAsync(0);
+
+      await drive;
+      expect(caught).toBeUndefined();
+      expect(collected).toHaveLength(CHUNKS + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // (v) — egress hygiene (mandatory): the thrown error's name and message
+  // carry no url, host, endpoint, or API key — verified directly against
+  // the constructed class, independent of any specific backend's endpoint.
+  it('(v) StreamIdleTimeoutError leaks no url, host, endpoint, or API key', () => {
+    const err = new StreamIdleTimeoutError();
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe('StreamIdleTimeoutError');
+    for (const marker of ['http://', 'https://', '127.0.0.1', 'localhost', 'Bearer ', 'sk-', ':11434', ':8080', ':8000']) {
+      expect(err.message).not.toContain(marker);
+      expect(err.name).not.toContain(marker);
+    }
+  });
+});
+
+/**
+ * R1-7-fix (closes review Minor #1): each `dl`-arming call site does roughly
+ * `const dl = armStreamDeadlines(signal); const res = await
+ * raceWithDeadline(fetch(...), dl);` then disposes `dl` either in a
+ * `!res.ok`/`!res.body` guard branch or in the reader's own `finally`. NONE
+ * of those paths run when `raceWithDeadline(fetch(...), dl)` itself
+ * REJECTS — a fast network failure (`ECONNREFUSED`) or a VS Code keystroke
+ * cancellation before any `response` ever exists — leaving the 300s
+ * first-byte `setTimeout` dangling (unref'd and eventually harmless, but a
+ * genuine leak on the common failure path).
+ *
+ * Exercises a REAL production call site (`OllamaFimBackend.streamFim` — the
+ * simplest FIM backend, no apiKey/header complexity) rather than a
+ * hand-rolled re-implementation of the arm/race pattern, so removing the
+ * `catch { dl.dispose(); throw }` this fix adds at that exact site is what
+ * actually breaks this test (mutation check).
+ */
+describe('R1-7-fix — dl.dispose() on raceWithDeadline(fetch) itself rejecting (not just the !ok/!body/reader paths)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function ollamaReq(): FimRequest {
+    return {
+      model: 'qwen2.5-coder:1.5b-base',
+      prefix: 'const x = ',
+      suffix: '',
+      stop: [],
+      temperature: 0.01,
+      maxTokens: 128,
+      context: {
+        filepath: 'file:///a.ts',
+        languageId: 'typescript',
+        prefix: 'const x = ',
+        suffix: '',
+        workspaceUris: [],
+        snippets: [],
+      },
+    };
+  }
+
+  it('disposes the first-byte timer when fetch rejects, leaving no dangling 300s timer', async () => {
+    vi.useFakeTimers();
+    const fetchError = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:11434'), {
+      code: 'ECONNREFUSED',
+    });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchError));
+
+    const backend = new OllamaFimBackend({ apiBase: 'http://127.0.0.1:11434', model: 'qwen2.5-coder:1.5b-base' });
+    const iterator = backend.streamFim(ollamaReq(), new AbortController().signal)[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).rejects.toBe(fetchError);
+
+    // Today (pre-fix): the 300s first-byte timer survives the reject, so
+    // this is 1, not 0 — RED.
+    expect(vi.getTimerCount()).toBe(0);
+
+    // Even granting a survived timer, advancing past the first-byte deadline
+    // must not silently re-arm or fire anything post-hoc once the stream has
+    // already failed and been abandoned.
+    await vi.advanceTimersByTimeAsync(STREAM_FIRST_BYTE_MS);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

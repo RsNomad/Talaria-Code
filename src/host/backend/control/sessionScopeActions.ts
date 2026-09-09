@@ -2,6 +2,7 @@ import type { EditPolicyPreset, HydrateTabSeed, SlashCommandInfo } from '../../.
 import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
 import type { SessionController } from '../session/SessionController';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /**
  * WS-GD.2a A9: the narrowed slice of {@link ControlDispatcherHostPort} the
@@ -12,7 +13,13 @@ import type { ControlDispatcherHostPort } from './ControlDispatcher';
  */
 export type SessionScopePort = Pick<
   ControlDispatcherHostPort,
-  'sessions' | 'emit' | 'getActiveSessionId' | 'showWarningMessage' | 'logger' | 'loadSessionIntoTab'
+  | 'sessions'
+  | 'emit'
+  | 'getActiveSessionId'
+  | 'showWarningMessage'
+  | 'logger'
+  | 'loadSessionIntoTab'
+  | 'isPendingClose'
 >;
 
 /**
@@ -77,24 +84,26 @@ export class SessionScopeActions {
    * `availableCommands`'s existing `undefined`-when-unset shape).
    */
   listTabs(): HydrateTabSeed[] {
-    return [...this.port.sessions.values()].map((controller) => {
-      const currentModelId = controller.currentModelId;
-      const activeModeId = controller.activeCustomModeId ?? undefined;
-      const availableCommands = controller.getAvailableCommands();
-      return {
-        tabId: controller.tabId,
-        sessionId: controller.sessionId,
-        cwd: controller.cwd,
-        rootId: controller.getRootId(),
-        preset: controller.getPreset(),
-        ...(currentModelId !== undefined ? { currentModelId } : {}),
-        ...(activeModeId !== undefined ? { activeModeId } : {}),
-        ...(availableCommands !== undefined ? { availableCommands } : {}),
-        // A5 (T-1 V-12 seed fold-in): this tab's OWN live-turn status, so a
-        // post-recreate reconcile regains the Stop affordance immediately.
-        turnActive: controller.hasLiveTurn(),
-      };
-    });
+    return [...this.port.sessions.values()]
+      .filter((controller) => !this.port.isPendingClose(controller.sessionId))
+      .map((controller) => {
+        const currentModelId = controller.currentModelId;
+        const activeModeId = controller.activeCustomModeId ?? undefined;
+        const availableCommands = controller.getAvailableCommands();
+        return {
+          tabId: controller.tabId,
+          sessionId: controller.sessionId,
+          cwd: controller.cwd,
+          rootId: controller.getRootId(),
+          preset: controller.getPreset(),
+          ...(currentModelId !== undefined ? { currentModelId } : {}),
+          ...(activeModeId !== undefined ? { activeModeId } : {}),
+          ...(availableCommands !== undefined ? { availableCommands } : {}),
+          // A5 (T-1 V-12 seed fold-in): this tab's OWN live-turn status, so a
+          // post-recreate reconcile regains the Stop affordance immediately.
+          turnActive: controller.hasLiveTurn(),
+        };
+      });
   }
 
   /**
@@ -174,8 +183,4 @@ export class SessionScopeActions {
       );
     }
   }
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

@@ -32,6 +32,8 @@
 
 import type { ProbeSpec } from './registry';
 import { probeOllama } from './ollamaClient';
+import { errorMessage } from '../../shared/errorMessage';
+import { joinUrl } from './httpStream';
 
 export interface ProbeOutcome {
   ok: boolean;
@@ -193,17 +195,3 @@ async function probeOpenAiModels(
   }
 }
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-/** Joins a base URL to a relative path without losing an existing subpath
- *  on the base and without doubling slashes — same normalization
- *  `ollamaClient.ts`'s local `joinUrl` applies, kept as a local copy here so
- *  this module stays self-contained (matching `registry.ts`'s and
- *  `ollamaClient.ts`'s own zero-cross-feature-import discipline). */
-function joinUrl(base: string, path: string): string {
-  const normalizedBase = base.endsWith('/') ? base : `${base}/`;
-  const normalizedPath = path.replace(/^\/+/, '');
-  return new URL(normalizedPath, normalizedBase).toString();
-}

@@ -13,6 +13,7 @@
  * tab enumeration live in the thin, deliberately-untested
  * `contextService.vscode.ts`.
  */
+import { errorMessage } from '../../shared/errorMessage';
 import { RingBuffer, type IngestCandidate } from './ringBuffer';
 import { buildSnapshot } from './snippetBudgeter';
 import { shouldRegenerate } from './snapshotPolicy';
@@ -173,10 +174,6 @@ function raceWithTimeout(
  */
 export interface GatherCycleLogger {
   append(line: string): void;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 export interface CrossFileContextServiceModeInput {
@@ -451,29 +448,15 @@ export class CrossFileContextService {
             // Unreachable: i ranges over [0, candidates.length - 1] here.
             continue;
           }
-          // Field-by-field (not an object spread) on purpose:
-          // `ringBuffer.test.ts`'s SPREAD_RE source-scan lock flags any
-          // brand-preserving spread-plus-override object literal outside
-          // its sanctioned file list, and this file isn't one of them — a
-          // spread here would be a false positive for THAT lock's actual
-          // concern (ScannedSnippet content provenance), but the lock is a
-          // deliberately blunt syntactic scan, not a type-aware one.
+          // `candidate` here is an UNBRANDED, pre-scan `SnippetCandidate`
+          // (context/types.ts) — not a branded `ScannedSnippet` — so this
+          // spread is a false positive for `ringBuffer.test.ts`'s SPREAD_RE
+          // lock (its actual concern is ScannedSnippet content provenance);
+          // this file is sanctioned in that lock's SANCTIONED_SPREAD_FILES.
           const ingestCandidate: IngestCandidate = {
-            uri: candidate.uri,
-            filepath: candidate.filepath,
-            content: candidate.content,
-            kind: candidate.kind,
-            startLine: candidate.startLine,
-            endLine: candidate.endLine,
+            ...candidate,
             anchor: requestAnchor,
           };
-          // Post-assign (not a `score: candidate.score` field on the literal
-          // above) — `score` is optional and `candidate.score` may genuinely
-          // be `undefined`; exactOptionalPropertyTypes distinguishes absent
-          // from explicit undefined, so the key is added only when present.
-          if (candidate.score !== undefined) {
-            ingestCandidate.score = candidate.score;
-          }
           this.ringBuffer.ingest(ingestCandidate, liveAnchor.uri, liveAnchor);
         }
       }

@@ -68,6 +68,30 @@ describe('clampText', () => {
     expect(result.text.length).toBeLessThanOrEqual(10);
     expect(result.truncated).toBe(true);
   });
+
+  it('never exceeds cap for multi-line input even when the read-more notice would overshoot it (L2-CA-11)', () => {
+    const lines = Array.from({ length: 60 }, (_, i) => `line ${i} of the file`);
+    const text = lines.join('\n');
+    const result = clampText(text, 200);
+
+    expect(result.text.length).toBeLessThanOrEqual(200);
+    // Content-integrity check (not just length): the reserve should keep the
+    // tail line intact rather than relying on a hard slice that would chop
+    // it away — a hard slice alone (no reserve) loses this last line.
+    expect(result.text).toContain('line 59 of the file');
+  });
+
+  it('never exceeds a very small cap for multi-line input, where the notice reserve dominates the budget (L2-CA-11)', () => {
+    const lines = Array.from({ length: 60 }, (_, i) => `line ${i} of the file`);
+    const text = lines.join('\n');
+    const result = clampText(text, 60);
+
+    expect(result.text.length).toBeLessThanOrEqual(60);
+    // Content-integrity check: the notice itself must come through whole
+    // (ending in its closing "… \n"), not chopped mid-string by a hard slice
+    // that had to compensate for an unreserved budget.
+    expect(result.text).toMatch(/ask to read the file for more …\n$/);
+  });
 });
 
 describe('isSecretPath', () => {
@@ -98,6 +122,22 @@ function makeSection(path: string, addedLine: string): string {
     `index 1111111..2222222 100644\n` +
     `--- a/${path}\n` +
     `+++ b/${path}\n` +
+    `@@ -1 +1 @@\n` +
+    `-old\n` +
+    `+${addedLine}\n`
+  );
+}
+
+/** Build one unified-diff file section with a MALFORMED `diff --git` header:
+ * no `a/<path> b/<path>` shape, and none of `rename to`/`+++ b/`/`--- a/`
+ * either — {@link extractSectionPath} falls through every extraction
+ * attempt and returns `''` for it (L2-CA-12: used to prove
+ * `truncateDiffToBudget` handles same-path — here, same EMPTY path —
+ * sections by identity, not by the path string). */
+function makeMalformedSection(addedLine: string): string {
+  return (
+    `diff --git malformed-header-no-path-here\n` +
+    `index 1111111..2222222 100644\n` +
     `@@ -1 +1 @@\n` +
     `-old\n` +
     `+${addedLine}\n`
@@ -368,5 +408,34 @@ describe('truncateDiffToBudget — GitLens priority-score binary-search truncati
   it('defaults the cap to CONTEXT_BUDGET.diffChars', () => {
     const diff = makeSection('src/tiny.ts', 'x');
     expect(truncateDiffToBudget(diff)).toEqual({ diff, truncated: false, droppedFiles: [] });
+  });
+
+  it('two sections with the same EMPTY path (malformed headers): keeps exactly the budgeted ONE, not both/neither (L2-CA-12)', () => {
+    const section1 = makeMalformedSection('first');
+    const section2 = makeMalformedSection('second-is-longer-than-first');
+    expect(extractSectionPath(section1)).toBe('');
+    expect(extractSectionPath(section2)).toBe('');
+    const diff = section1 + section2;
+    const cap = section1.length; // fits section1 alone, not both
+
+    const result = truncateDiffToBudget(diff, cap);
+
+    expect(result.truncated).toBe(true);
+    expect(result.droppedFiles.length).toBe(1);
+    expect(result.diff).toBe(section1);
+  });
+
+  it('two sections with the SAME real path: keeps exactly the budgeted ONE, not both/neither (L2-CA-12)', () => {
+    const section1 = makeSection('src/dup.ts', 'x'.repeat(20));
+    const section2 = makeSection('src/dup.ts', 'y'.repeat(20));
+    expect(section1.length).toBe(section2.length);
+    const diff = section1 + section2;
+    const cap = section1.length; // fits section1 alone, not both
+
+    const result = truncateDiffToBudget(diff, cap);
+
+    expect(result.truncated).toBe(true);
+    expect(result.droppedFiles.length).toBe(1);
+    expect(result.diff).toBe(section1);
   });
 });

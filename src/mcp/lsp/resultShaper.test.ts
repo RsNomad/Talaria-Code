@@ -562,14 +562,22 @@ describe('caps — per-field and total truncation', () => {
     expect(out).toMatch(/truncated, \d+ of \d+ shown/);
   });
 
-  it('references honors an injected ~200 item cap and reports the dropped count', () => {
-    const targets = Array.from({ length: 250 }, (_, i) => ({
-      verdict: { inRoot: true, relPath: `f${i}.ts` } as ConfinementVerdict,
+  it('L2-CA-20: references honors an injected ~200 item cap, and counts external ONLY over the shown set (the beyond-cap tail carries a placeholder-shaped verdict but must not inflate the count)', () => {
+    const shown = Array.from({ length: 200 }, (_, i) => ({
+      verdict: (i < 10
+        ? ({ inRoot: false, externalUri: `file:///external/f${i}.ts` } as ConfinementVerdict)
+        : ({ inRoot: true, relPath: `f${i}.ts` } as ConfinementVerdict)),
       range: range(i, 0, i, 1),
     }));
-    const out = shapeLocations(targets, DEFAULT_SHAPER_CAPS, { cap: 200 });
-    expect(out).toContain('200 of 250 shown');
-    expect(out).toContain('50 more not shown');
+    // Beyond-cap tail: shaped exactly like `UNCLASSIFIED_TAIL_VERDICT`
+    // (`{inRoot: false, externalUri: ''}`) — never pooled, never classified,
+    // never rendered — and must NOT be counted as external.
+    const tail = Array.from({ length: 50 }, (_, i) => ({
+      verdict: { inRoot: false, externalUri: '' } as ConfinementVerdict,
+      range: range(200 + i, 0, 200 + i, 1),
+    }));
+    const out = shapeLocations([...shown, ...tail], DEFAULT_SHAPER_CAPS, { cap: 200 });
+    expect(out).toContain('(200 of 250 shown; 10 of the shown external; 50 more not shown)');
   });
 
   it('default location cap is 200 when opts.cap is omitted', () => {

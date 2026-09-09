@@ -1,5 +1,5 @@
 import { joinUrl } from '../util';
-import { BackendHttpError, BackendStreamError, readNdjsonLines } from './http';
+import { BackendHttpError, BackendStreamError, readNdjsonLines, armStreamDeadlines, raceWithDeadline } from './http';
 import { assertAllScanned } from '../context/assertAllScanned';
 import { isRecord } from '../../shared/typeGuards';
 import type { BackendCapabilities, FimBackend, FimRequest } from '../types';
@@ -79,58 +79,78 @@ export class OllamaFimBackend implements FimBackend {
     // adjacent placement of the other backends' transport/content guards).
     assertAllScanned(req.context.snippets);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
-
-    if (!response.ok) {
-      throw new BackendHttpError(
-        `Ollama /api/generate failed: ${response.status} ${response.statusText}`,
-        response.status,
-        response.statusText,
+    // ADR-R2-06 (L2-CA-05, C-1-redesigned): armed immediately BEFORE fetch()
+    // so the first-byte deadline spans the fetch() await AND the reader's
+    // first read() — see http.ts's doc comments for the full design.
+    const dl = armStreamDeadlines(signal);
+    try {
+      const response = await raceWithDeadline(
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: dl.signal,
+        }),
+        dl,
       );
-    }
-    // A missing body on an `ok` response isn't an HTTP-status failure — there's
-    // no real status to report as the cause, so this stays a plain Error rather
-    // than a fabricated BackendHttpError with an invented status.
-    if (!response.body) {
-      throw new Error(
-        `Ollama /api/generate failed: ${response.status} ${response.statusText}`,
-      );
-    }
 
-    for await (const raw of readNdjsonLines(response)) {
-      // WS-BG (SYN-BOUNDARY): a non-record NDJSON line off a user-configured
-      // server is junk — skip it exactly like the SSE reader's "no text this
-      // round" posture, never dot into it through a bare cast.
-      if (!isRecord(raw)) continue;
-      const chunk = raw as OllamaGenerateChunk;
-      if (chunk.error) {
-        // Invariant #3 (T6, M6 + ARCH-2): `chunk.error` is runner-generated
-        // text (can carry local filesystem paths / internal detail) — never
-        // surface it verbatim. This path has no injected logger (unlike
-        // HermesDashboardClient), so the body is dropped entirely rather
-        // than logged.
-        //
-        // T-6 M-2 (carried forward from the T-5 review): this used to throw
-        // a PLAIN `Error`, invisible to `provider.ts`'s typed catch chain —
-        // it fell through the `BackendStreamError` arm T-5 added for the SSE
-        // backends (vLLM/Codestral/openai-compat) straight to the silent
-        // `return null`, so a mid-stream Ollama error produced no signal at
-        // all. `BackendStreamError` is body-free by construction (no frame
-        // message interpolated, matching `http.ts`'s `readOpenAiSseText`)
-        // and reuses that same arm instead of inventing a second one.
-        throw new BackendStreamError('Ollama /api/generate reported an error mid-stream');
+      if (!response.ok) {
+        dl.dispose();
+        throw new BackendHttpError(
+          `Ollama /api/generate failed: ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+        );
       }
-      if (typeof chunk.response === 'string' && chunk.response) {
-        yield chunk.response;
+      // A missing body on an `ok` response isn't an HTTP-status failure — there's
+      // no real status to report as the cause, so this stays a plain Error rather
+      // than a fabricated BackendHttpError with an invented status.
+      if (!response.body) {
+        dl.dispose();
+        throw new Error(
+          `Ollama /api/generate failed: ${response.status} ${response.statusText}`,
+        );
       }
-      if (chunk.done === true) {
-        return;
+
+      for await (const raw of readNdjsonLines(response, dl)) {
+        // WS-BG (SYN-BOUNDARY): a non-record NDJSON line off a user-configured
+        // server is junk — skip it exactly like the SSE reader's "no text this
+        // round" posture, never dot into it through a bare cast.
+        if (!isRecord(raw)) continue;
+        const chunk = raw as OllamaGenerateChunk;
+        if (chunk.error) {
+          // Invariant #3 (T6, M6 + ARCH-2): `chunk.error` is runner-generated
+          // text (can carry local filesystem paths / internal detail) — never
+          // surface it verbatim. This path has no injected logger (unlike
+          // HermesDashboardClient), so the body is dropped entirely rather
+          // than logged.
+          //
+          // T-6 M-2 (carried forward from the T-5 review): this used to throw
+          // a PLAIN `Error`, invisible to `provider.ts`'s typed catch chain —
+          // it fell through the `BackendStreamError` arm T-5 added for the SSE
+          // backends (vLLM/Codestral/openai-compat) straight to the silent
+          // `return null`, so a mid-stream Ollama error produced no signal at
+          // all. `BackendStreamError` is body-free by construction (no frame
+          // message interpolated, matching `http.ts`'s `readOpenAiSseText`)
+          // and reuses that same arm instead of inventing a second one.
+          throw new BackendStreamError('Ollama /api/generate reported an error mid-stream');
+        }
+        if (typeof chunk.response === 'string' && chunk.response) {
+          yield chunk.response;
+        }
+        if (chunk.done === true) {
+          return;
+        }
       }
+    } catch (err) {
+      // R1-7-fix (review Minor #1): dl.dispose() is idempotent (clear()
+      // no-ops once the timer is already undefined) — this covers the ONE
+      // path the guards/reader above don't reach: raceWithDeadline(fetch)
+      // itself rejecting (fast network failure, keystroke cancel) before any
+      // response ever exists, which used to leave the 300s first-byte timer
+      // dangling.
+      dl.dispose();
+      throw err;
     }
   }
 }

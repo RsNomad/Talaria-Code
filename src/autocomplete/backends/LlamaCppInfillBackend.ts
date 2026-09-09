@@ -1,5 +1,5 @@
 import { joinUrl } from '../util';
-import { BackendHttpError, readJsonBounded } from './http';
+import { BackendHttpError, readJsonBounded, armStreamDeadlines, raceWithDeadline, MAX_STREAM_BYTES } from './http';
 import { assertSecureAuthTransport } from './secureTransport';
 import { assertAllScanned } from '../context/assertAllScanned';
 import { isRecord } from '../../shared/typeGuards';
@@ -109,48 +109,73 @@ export class LlamaCppInfillBackend implements FimBackend {
     // egress channel the backstop exists for (§3.2's enumeration item 1).
     assertAllScanned(req.context.snippets);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal,
-    });
+    // ADR-R2-06 (L2-CA-05, C-1-redesigned): armed immediately BEFORE fetch()
+    // so the first-byte deadline spans the fetch() await AND the reader's
+    // first read() — see http.ts's doc comments for the full design. This is
+    // the streaming (well — read-to-completion) request path; `warmUp`
+    // below is a genuine fire-and-forget with no reader at all (its response
+    // body is never even consumed), so it deliberately keeps its own
+    // untouched `signal` — there is nothing for a stream deadline to guard
+    // there.
+    const dl = armStreamDeadlines(signal);
+    try {
+      const response = await raceWithDeadline(
+        fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: dl.signal,
+        }),
+        dl,
+      );
 
-    if (!response.ok) {
-      throw new BackendHttpError(
-        `llama.cpp /infill failed: ${response.status} ${response.statusText}`,
-        response.status,
-        response.statusText,
-      );
-    }
-    // T-6 F5 remainder (the Codestral half of F5 already lands locally in
-    // CodestralFimBackend.ts): a missing body on an `ok` response isn't an
-    // HTTP-status failure — there's no real status to report as the cause,
-    // so this stays a plain Error rather than a fabricated BackendHttpError
-    // with an invented status. Without this guard, `readJsonBounded` falls
-    // through to `JSON.parse('')` on a null body, which throws too, but an
-    // opaque `SyntaxError` that never names llama.cpp or `/infill` —
-    // unlike every sibling backend's identical named guard.
-    if (!response.body) {
-      throw new Error(
-        `llama.cpp /infill failed: ${response.status} ${response.statusText}`,
-      );
-    }
+      if (!response.ok) {
+        dl.dispose();
+        throw new BackendHttpError(
+          `llama.cpp /infill failed: ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+        );
+      }
+      // T-6 F5 remainder (the Codestral half of F5 already lands locally in
+      // CodestralFimBackend.ts): a missing body on an `ok` response isn't an
+      // HTTP-status failure — there's no real status to report as the cause,
+      // so this stays a plain Error rather than a fabricated BackendHttpError
+      // with an invented status. Without this guard, `readJsonBounded` falls
+      // through to `JSON.parse('')` on a null body, which throws too, but an
+      // opaque `SyntaxError` that never names llama.cpp or `/infill` —
+      // unlike every sibling backend's identical named guard.
+      if (!response.body) {
+        dl.dispose();
+        throw new Error(
+          `llama.cpp /infill failed: ${response.status} ${response.statusText}`,
+        );
+      }
 
-    // D1: bounded read (4 MiB cap), not the unbounded response.json() —
-    // llama.cpp's stream:false /infill body is a single JSON blob whose
-    // realistic legitimate ceiling is ~1 MB (own-context-bounded prompt
-    // echo); readJsonBounded caps it against a hostile/misconfigured server.
-    const raw = await readJsonBounded(response);
-    if (!isLlamaCppInfillResponse(raw)) {
-      // WS-BG: refuse an unrecognized ok-body loudly — status only, never
-      // body content (C-5 hygiene).
-      throw new Error(
-        `llama.cpp /infill returned an unrecognized response shape: ${response.status} ${response.statusText}`,
-      );
-    }
-    if (raw.content) {
-      yield raw.content;
+      // D1: bounded read (4 MiB cap), not the unbounded response.json() —
+      // llama.cpp's stream:false /infill body is a single JSON blob whose
+      // realistic legitimate ceiling is ~1 MB (own-context-bounded prompt
+      // echo); readJsonBounded caps it against a hostile/misconfigured server.
+      const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
+      if (!isLlamaCppInfillResponse(raw)) {
+        // WS-BG: refuse an unrecognized ok-body loudly — status only, never
+        // body content (C-5 hygiene).
+        throw new Error(
+          `llama.cpp /infill returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+        );
+      }
+      if (raw.content) {
+        yield raw.content;
+      }
+    } catch (err) {
+      // R1-7-fix (review Minor #1): dl.dispose() is idempotent (clear()
+      // no-ops once the timer is already undefined) — this covers the ONE
+      // path the guards/reader above don't reach: raceWithDeadline(fetch)
+      // itself rejecting (fast network failure, keystroke cancel) before any
+      // response ever exists, which used to leave the 300s first-byte timer
+      // dangling.
+      dl.dispose();
+      throw err;
     }
   }
 

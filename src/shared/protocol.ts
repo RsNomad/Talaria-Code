@@ -66,8 +66,14 @@ export type ToolKind =
  * messages; folded client-side only (T-A1's job). Listed here so the shared
  * `ToolStatus` union — and the exhaustive `STATUS` Record consuming it in
  * `ToolCard.tsx` — stay the single source of truth `tsc` enforces.
+ *
+ * `approved`/`denied` (Lens-R2 BH-05 / ADR-R2-15): the terminal state of a
+ * synthetic edit-approval tool card, derived from `approval.settle` on the
+ * matching id when it is still `pending` — names the APPROVAL's outcome, not
+ * the underlying tool's (which the real `tc-…` card reports separately).
+ * NOT emitted by the host on `tool.*` messages; folded client-side only.
  */
-export type ToolStatus = 'pending' | 'running' | 'done' | 'failed' | 'interrupted';
+export type ToolStatus = 'pending' | 'running' | 'done' | 'failed' | 'interrupted' | 'approved' | 'denied';
 
 /**
  * A single hunk of a unified diff. `header` is the `@@ -a,b +c,d @@` line;
@@ -745,10 +751,6 @@ export interface SetupBackendOption {
      *  docs link + endpoint Test only (e.g. vLLM, §5.2 rev 3 ⑪). */
     flavor: 'pipx' | 'guided-terminal' | 'docs-only';
     effort: 'one-script' | 'manual-guided';
-    /** @deprecated beta.6 T11 — the unified FIM/RAG surfaces read
-     *  `SetupData.catalog.models` instead; still projected for wire compat
-     *  (see `registry.ts` `LocalInstallMode.models`), do NOT remove. */
-    models?: { role: 'fim' | 'embedding'; model: string; present: boolean }[];
   };
   /** Present iff this FIM backend also supports the NEXT card's "generic" (reuse) source. */
   nextEditTransport?: 'ollama' | 'openai-compat';
@@ -947,15 +949,6 @@ export interface SetupData {
      */
     embedBackend?: 'ollama' | 'llamacpp' | 'openai-compat';
     embedModel: string;
-    /**
-     * @deprecated beta.6 T14 — computed against the daemon the HOST probed,
-     * not `embedEndpoint`, so it answers for the wrong daemon whenever the
-     * two differ (and its exact match misses `:latest`). The unified UI
-     * derives presence client-side, endpoint-scoped (§3.4 C-6,
-     * `ragEmbedPresence` in `setupCards.ts`); the field stays on the wire
-     * for compat only — no webview code reads it (source-scan-locked).
-     */
-    embedModelPresent: boolean;
     tuning: { dims: number; maxChunkTokens: number; debounceMs: number; excludeGlobs: string[] };
     indexDir: string;
     /** `shouldActivateRag` text, populated when RAG is blocked from activating. */

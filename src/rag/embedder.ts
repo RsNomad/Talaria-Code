@@ -138,6 +138,14 @@ export interface Embedder {
    * duplicate it.
    */
   embed(texts: string[], expectedWidth?: number): Promise<number[][]>;
+  /**
+   * FI-29: the batch size this embedder's caller should chunk its own
+   * work by (buildPipeline.ts's `embedAndSwap` batches `records` by this
+   * value) — single-sourced here on the embedder rather than duplicated as
+   * a separate module constant, since `HttpEmbedder` already owns the real
+   * per-request batching decision (`opts.batchSize ?? 64`).
+   */
+  readonly batchSize: number;
 }
 
 export interface HttpEmbedderOptions {
@@ -161,7 +169,10 @@ export class HttpEmbedder implements Embedder {
   private readonly endpoint: string;
   private readonly model: string;
   private readonly dimensions: number | undefined;
-  private readonly batchSize: number;
+  // FI-29: public so callers (buildPipeline.ts's embedAndSwap) can batch
+  // their own work by the SAME value this class batches its own HTTP
+  // requests by — satisfies the `Embedder` interface's `batchSize` field.
+  readonly batchSize: number;
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: HttpEmbedderOptions) {
@@ -196,11 +207,11 @@ export class HttpEmbedder implements Embedder {
       timedOut = true;
       controller.abort();
     }, EMBED_TIMEOUT_MS);
-    // Invariant (WV3-MIN-SYN): at runtime `timer` is Node's Timeout, which has
-    // unref(). Under this host build (lib: ES2022 + @types/node) `timer` is already
-    // NodeJS.Timeout, so this double-cast + optional-call is belt-and-suspenders —
-    // it stays safe even if a DOM-typed setTimeout (number, no unref) were ever in scope.
-    (timer as unknown as { unref?: () => void }).unref?.();
+    // `timer` is Node's `NodeJS.Timeout` under this host build (lib: ES2022 +
+    // @types/node, no DOM lib), so `.unref()` is a direct call — it detaches
+    // the timer from the event loop so a pending embed request never keeps
+    // the process alive.
+    timer.unref();
     let json: unknown;
     try {
       const res = await this.fetchImpl(`${this.endpoint}/v1/embeddings`, {

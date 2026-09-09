@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { chunkFile } from './chunker';
 import type { CodeParser } from './parser/CodeParser';
@@ -26,6 +26,7 @@ describe('chunkFile', () => {
       contents,
       languageId: 'plaintext',
       extension: 'txt',
+      logger: () => {},
     });
 
     expect(chunks).toHaveLength(1);
@@ -46,6 +47,7 @@ describe('chunkFile', () => {
       extension: 'ts',
       parser,
       maxChunkTokens: 512,
+      logger: () => {},
     });
 
     expect(chunks).toHaveLength(1);
@@ -67,12 +69,47 @@ describe('chunkFile', () => {
       languageId: 'typescript',
       extension: 'ts',
       parser,
+      logger: () => {},
     });
 
     expect(chunks).toHaveLength(1);
     // Line-window fallback chunks have no AST symbolPath, so the regex
     // heuristic on the chunk's first line should pick up "doThing".
     expect(must(chunks[0]).headeredContent).toBe(`// file: src/b.ts › doThing\n${contents}`);
+  });
+
+  // WS-F6 F6-6 (FI-20/FI-31): at HEAD this AST-failure branch logged via
+  // `console.error(\`... for ${opts.relPath} ...\`, err)` — the raw error
+  // object AND the path, straight to the process's stderr. The fix routes it
+  // through the injected `opts.logger` instead, carrying `err.name` ONLY —
+  // mirrors `indexer.ts`'s `readManifest`/`readMeta` `(${err.name})` idiom.
+  it('RED: logs err.name only through the injected logger when the parser throws — never the path, never the raw error, never console.error', async () => {
+    const contents = 'function doThing(x) {\n  return x;\n}';
+    const parser: CodeParser = {
+      supports: () => true,
+      parse: async () => {
+        throw new RangeError('grammar failed to load: secret-looking detail that must never leak');
+      },
+    };
+    const logs: string[] = [];
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await chunkFile({
+      relPath: 'src/very/secret/path/b.ts',
+      contents,
+      languageId: 'typescript',
+      extension: 'ts',
+      parser,
+      logger: (line) => logs.push(line),
+    });
+
+    errorSpy.mockRestore();
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('RangeError');
+    expect(logs[0]).not.toContain('src/very/secret/path/b.ts');
+    expect(logs[0]).not.toContain('secret-looking detail');
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 
   it('skips the parser when it does not support the language', async () => {
@@ -90,6 +127,7 @@ describe('chunkFile', () => {
       languageId: 'shellscript',
       extension: 'sh',
       parser,
+      logger: () => {},
     });
 
     expect(chunks).toHaveLength(1);
@@ -102,6 +140,7 @@ describe('chunkFile', () => {
       contents: '   \n  \n',
       languageId: 'typescript',
       extension: 'ts',
+      logger: () => {},
     });
     expect(chunks).toEqual([]);
   });

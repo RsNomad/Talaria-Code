@@ -215,7 +215,29 @@ export interface SetupProgressEntry {
 
 export type SetupProgressMap = Record<string, SetupProgressEntry>;
 
-export const EMPTY_SETUP_PROGRESS: SetupProgressMap = {};
+/**
+ * SY-02: this is the ONE shared `{}` singleton every fresh `AppState`
+ * initializes `setupProgress` to (`types.ts`'s `createInitialState`) — unlike
+ * `MENTIONS`/`SLASH_TEMPLATES`/`STATUS`, a stray direct write here
+ * (`EMPTY_SETUP_PROGRESS[k] = …` instead of going through
+ * {@link foldSetupProgress}'s copy-on-write) would corrupt the shared default
+ * for every tab that hasn't yet received its first `setup.progress` push —
+ * a compile-time-only `readonly` type is not enough insurance for a value
+ * this widely aliased, so it is ALSO frozen at runtime
+ * (`Object.freeze({})`), matching this repo's `Object.freeze`-guarded
+ * singleton idiom (e.g. `EMPTY_SNAPSHOT` in
+ * `src/autocomplete/context/contextService.ts`). Confirmed safe:
+ * `foldSetupProgress` below already treats its `map` argument as immutable
+ * — every branch returns a NEW object (`{ ...map }` / `{ ...map, [key]:
+ * entry }`) or the SAME reference unchanged, never `map[key] = …` — so
+ * freezing this empty object cannot break it. `Readonly<SetupProgressMap>`
+ * (an index signature) is still assignable everywhere a plain
+ * `SetupProgressMap` is expected (`types.ts`'s `setupProgress` field,
+ * `foldSetupProgress`'s own `map` parameter) — readonly-ness isn't part of
+ * an object type's identity beyond arrays/tuples — so every consumer
+ * compiles unchanged.
+ */
+export const EMPTY_SETUP_PROGRESS: Readonly<SetupProgressMap> = Object.freeze({});
 
 /** The map key for one (op, id) pair — matches `SetupController`'s own `${op}:${id}` in-flight key. */
 export function progressKey(op: 'install' | 'pull', id: string): string {

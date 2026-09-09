@@ -103,10 +103,28 @@ export function composeNextEditBlock(args: {
   const nextDedicatedBackendId = coerceDedicatedBackendId(
     nextDedicatedBackendIdRaw === '' ? undefined : nextDedicatedBackendIdRaw,
   );
-  // T13 (§4.2): capability + raw facts for the dedicated NEXT card —
-  // computed purely from the registry pins (no await; the CR-002
-  // synchronous tail below stays intact). `downloadReady` is driven by the
-  // sha256 pin and NOTHING else.
+  return {
+    source: nextSource,
+    backend: nextBackend,
+    endpoint: nextEndpoint,
+    model: nextModel,
+    dedicatedConfigured,
+    ...(nextDedicatedBackendId !== undefined ? { dedicatedBackendId: nextDedicatedBackendId } : {}),
+    genericSupported,
+    ...(nextSource === 'generic' && !genericSupported
+      ? {
+          refusalDetail: `The selected FIM backend ('${fimDisplayName}') does not support Generic Next-Edit.`,
+        }
+      : {}),
+    dedicated: composeDedicated(),
+  };
+}
+
+/** FI-32 (task F8-5): split out of {@link composeNextEditBlock} — the
+ *  registry-pin card for the dedicated NEXT flow, computed PURELY from
+ *  {@link NEXT_DEDICATED_MODEL} (no settings, no parameters). `downloadReady`
+ *  is driven by the sha256 pin and NOTHING else. */
+export function composeDedicated(): NonNullable<SetupData['nextEdit']['dedicated']> {
   const downloadReady = (NEXT_DEDICATED_MODEL.gguf.sha256 as string) !== '';
   const dedicated: NonNullable<SetupData['nextEdit']['dedicated']> = {
     displayName: NEXT_DEDICATED_MODEL.displayName,
@@ -133,34 +151,16 @@ export function composeNextEditBlock(args: {
         : {}),
     },
   };
-  return {
-    source: nextSource,
-    backend: nextBackend,
-    endpoint: nextEndpoint,
-    model: nextModel,
-    dedicatedConfigured,
-    ...(nextDedicatedBackendId !== undefined ? { dedicatedBackendId: nextDedicatedBackendId } : {}),
-    genericSupported,
-    ...(nextSource === 'generic' && !genericSupported
-      ? {
-          refusalDetail: `The selected FIM backend ('${fimDisplayName}') does not support Generic Next-Edit.`,
-        }
-      : {}),
-    dedicated,
-  };
+  return dedicated;
 }
 
 /** Pure move of `status()`'s `rag` composition (Card 5 — codebase index).
- *  `trusted`/`ollamaRunning`/`ollamaModels` are computed by the caller and
- *  passed in. **CAUTION**: `embedModelPresent` reproduces the deprecated
- *  wrong-daemon computation byte-identically — see its own doc below. */
+ *  `trusted` is computed by the caller and passed in. */
 export function composeRagBlock(args: {
   reader: SettingsReader;
   trusted: boolean;
-  ollamaRunning: boolean;
-  ollamaModels: readonly { name: string }[];
 }): SetupData['rag'] {
-  const { reader, trusted, ollamaRunning, ollamaModels } = args;
+  const { reader, trusted } = args;
   const ragEnabled = reader.getSetting<boolean>('talaria.rag.enabled') ?? true;
   const ragEmbedEndpoint =
     (reader.getSetting<string>('talaria.rag.embedEndpoint') ?? '').trim() || DEFAULT_OLLAMA_ENDPOINT;
@@ -189,13 +189,6 @@ export function composeRagBlock(args: {
     // defaults, ALWAYS populated — mirrors agentLocalModel.endpointDefaults
     // (CC-6) exactly. Never webview-fabricated (Global Constraint 1).
     endpointDefaults: RAG_ENDPOINT_DEFAULTS,
-    // @deprecated beta.6 T14 (wire compat only): the wrong-daemon
-    // computation §3.4 replaced — it answers for the endpoint this
-    // status() probed, not `embedEndpoint`, and the exact `===` misses
-    // `:latest`. The unified UI derives presence client-side instead
-    // (`ragEmbedPresence`, endpoint-scoped per C-6); no webview code
-    // reads this field anymore (source-scan-locked in SetupPanel.test.ts).
-    embedModelPresent: ollamaRunning ? ollamaModels.some((m) => m.name === ragEmbedModel) : false,
     tuning: ragTuning,
     indexDir: ragIndexDir,
     ...(trusted ? {} : { preconditionDetail: 'The codebase index needs a trusted, open workspace.' }),

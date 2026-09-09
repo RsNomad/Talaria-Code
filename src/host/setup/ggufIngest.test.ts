@@ -307,6 +307,21 @@ describe('ingestGguf — digest-enforced GGUF ingest (T14, §4.4.3d)', () => {
     expect(removeTemp).toHaveBeenCalledTimes(1);
   });
 
+  it('CA-17 (Lens-R2): a 200 /api/create stream that ends WITHOUT a terminal {"status":"success"} chunk REJECTS — a quiet end is never fabricated as success', async () => {
+    const { io, removeTemp } = fakeIo();
+    const { fetchImpl } = routedFetch({
+      download: () => downloadResponse([CONTENT]),
+      create: () => createResponse(['{"status":"reading model metadata"}', '{"status":"writing manifest"}']),
+    });
+    io.fetchImpl = fetchImpl;
+
+    await expect(ingestGguf(io, SPEC, ENDPOINT, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      name: 'GgufCreateIncompleteError',
+    });
+
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
   it('aborting mid-create-stream cancels the reader and rejects with AbortError', async () => {
     const { io, removeTemp } = fakeIo();
     const { reader } = controllableReader();
@@ -523,6 +538,14 @@ const STORE_SPEC: GgufStoreSpec = {
  *  {@link GgufStoreIo.lstatKind}. */
 type LstatKind = 'missing' | 'file' | 'dir' | 'symlink' | 'other';
 
+/** SEC-01: local mirror of the module's own (unexported) `dirnameOf` —
+ *  same `lastIndexOf('/')` rule — so the fixture can derive the owner/root
+ *  directories from `DEST_DIR` exactly the way the pre-rename re-check does. */
+function dirnameOf(path: string): string {
+  const idx = path.lastIndexOf('/');
+  return idx === -1 ? '.' : path.slice(0, idx);
+}
+
 function fakeStoreIo(opts: { tempDir?: string; lstatKinds?: Record<string, LstatKind> } = {}): {
   io: GgufStoreIo;
   ensureDir: ReturnType<typeof vi.fn>;
@@ -542,6 +565,12 @@ function fakeStoreIo(opts: { tempDir?: string; lstatKinds?: Record<string, Lstat
   const lstatKinds: Record<string, LstatKind> = {
     [DEST_DIR]: 'dir',
     [DEST_PATH]: 'missing',
+    // SEC-01: owner + root default to 'dir' too — a test overrides one of
+    // these to simulate a symlink racing into the store root/owner level
+    // during the download (the CA-M09 defaults above only ever exercised
+    // repo/dest).
+    [dirnameOf(DEST_DIR)]: 'dir',
+    [dirnameOf(dirnameOf(DEST_DIR))]: 'dir',
     ...opts.lstatKinds,
   };
   const ensureDir = vi.fn(async (_dir: string) => {});
@@ -901,5 +930,37 @@ describe('CA-M09 (frozen, owner-approved): pre-rename destination re-lstat', () 
     await expect(
       downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
     ).rejects.toThrow('store destination changed while downloading (possible symlink race) — refusing to place the file');
+  });
+});
+
+describe('SEC-01 (Lens-R2): pre-rename re-check also covers store root + owner', () => {
+  it('the store ROOT swapped for a symlink → refuses, removes the .part, writes NO sidecar', async () => {
+    const rootDir = dirnameOf(dirnameOf(DEST_DIR));
+    const { io, removeTemp, renameTemp, writeSidecar } = fakeStoreIo({ lstatKinds: { [rootDir]: 'symlink' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toMatchObject({ name: 'GgufStoreSymlinkRaceError' });
+
+    expect(renameTemp).not.toHaveBeenCalled();
+    expect(writeSidecar).not.toHaveBeenCalled();
+    expect(removeTemp).toHaveBeenCalledTimes(1);
+  });
+
+  it('the <owner> directory swapped for a symlink → refuses the same way', async () => {
+    const ownerDir = dirnameOf(DEST_DIR);
+    const { io, removeTemp, renameTemp, writeSidecar } = fakeStoreIo({ lstatKinds: { [ownerDir]: 'symlink' } });
+    const { fetchImpl } = storeFetch({ download: () => downloadResponse([CONTENT]) });
+    io.fetchImpl = fetchImpl;
+
+    await expect(
+      downloadGgufToStore(io, STORE_SPEC, DEST_DIR, DEST_FILE, () => {}, new AbortController().signal),
+    ).rejects.toMatchObject({ name: 'GgufStoreSymlinkRaceError' });
+
+    expect(renameTemp).not.toHaveBeenCalled();
+    expect(writeSidecar).not.toHaveBeenCalled();
+    expect(removeTemp).toHaveBeenCalledTimes(1);
   });
 });

@@ -1395,12 +1395,12 @@ function FimConnectTab({
  * beta.6 T11 (§3.2): the Install tab IS the shared `LocalModelBlock` — one
  * pane per local-capable backend. The card's OWN 5-option picker above is the
  * block's ① (ONE picker — this tab never renders a second one); catalog rows
- * are role-filtered to `'fim'` from the wire's `catalog.models`. The beta.5
- * models list under `localInstall` is deliberately NOT consumed anymore
- * (deprecated-in-comment at `registry.ts`, kept on the wire for compat) —
- * only the CC-8 configured-model row still speaks the legacy free-text
- * `setup.pullModel` tier. Pulls never write settings: "done" stays presence +
- * Connect-tab state (§4.2), so switching panes changes nothing but the view.
+ * are role-filtered to `'fim'` from the wire's `catalog.models` (the beta.5
+ * `localInstall.models` echo FI-33 removed entirely — `LocalInstallMode` is
+ * just `{flavor, effort}` now). Only the CC-8 configured-model row still
+ * speaks the legacy free-text `setup.pullModel` tier. Pulls never write
+ * settings: "done" stays presence + Connect-tab state (§4.2), so switching
+ * panes changes nothing but the view.
  */
 function FimInstallTab({
   option,

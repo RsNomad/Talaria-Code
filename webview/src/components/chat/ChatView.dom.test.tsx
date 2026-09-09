@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, screen, within } from '@testing-library/react';
 import { ChatView } from './ChatView';
-import type { ApprovalItem, MessageItem, TranscriptItem, UserItem } from '../../types';
+import type { ApprovalItem, AppState, MessageItem, TranscriptItem, UserItem } from '../../types';
+import { INITIAL_STATE } from '../../types';
+import { reduce } from '../../state/transcript';
 
 /**
  * UI I-7 (path doc `af-architecture-path.md` §4 B1). Two independent gaps:
@@ -518,5 +520,141 @@ describe('CA-M15: collapsed-older-messages affordance', () => {
     // regression: still exactly one polite status region (settlement), so the
     // existing getByRole('status') singular queries keep resolving.
     expect(screen.getAllByRole('status')).toHaveLength(1);
+  });
+});
+
+/**
+ * L2-CA-08: at the CA-M15 transcript cap, `transcript.length` stops growing
+ * (the reducer trims an equal number off the front for every item that
+ * arrives), so the jump-to-latest pill's unseen count must be measured in
+ * ARRIVALS — `hiddenCount + transcript.length` — never `transcript.length`
+ * alone, or the pill silently stops appearing the moment a tab hits the cap.
+ */
+describe('L2-CA-08: unseen-arrival count survives the transcript cap', () => {
+  function manyMessages(n: number, offset = 0): TranscriptItem[] {
+    return Array.from({ length: n }, (_, i) =>
+      messageItem({ id: `m${offset + i}`, turnId: `t${offset + i}`, text: `item ${offset + i}` }),
+    );
+  }
+
+  it('counts ARRIVALS (hiddenCount + transcript.length), not transcript.length alone, once the transcript is at the cap', () => {
+    const capped = manyMessages(500);
+    const { getByRole, rerender } = renderChatViewWithHidden(capped, 10);
+
+    scrollAway(getByRole('log'));
+
+    // 3 more items arrive; the reducer's cap keeps the transcript at 500 (3
+    // more roll off the front into hiddenCount, now 13). `transcript.length`
+    // alone sees 500 - 500 = 0 and the pill never appears.
+    const grown = [...capped.slice(3), ...manyMessages(3, 500)];
+    rerender(
+      <ChatView
+        transcript={grown}
+        onApproval={() => undefined}
+        onDiff={() => undefined}
+        onOpenDiff={() => undefined}
+        onStarter={() => undefined}
+        hiddenCount={13}
+      />,
+    );
+
+    const pill = getByRole('button', { name: 'Jump to latest, 3 new' });
+    expect(pill).toBeInTheDocument();
+  });
+});
+
+/**
+ * WS-A T5b (BH-05, round-2 🔴): the DOM half of the edit-approval card fix,
+ * exercised end-to-end — the transcript is built by folding the real host
+ * emit order (`tool.start` -> `tool.diff` -> `approval.request`, all keyed
+ * `toolId: 'edit-approval-1'`) through the SAME reducer `transcript.test.ts`'s
+ * WS-A T5b suite exercises, so this test proves the real state shape renders
+ * correctly rather than a hand-built stand-in. While the gating approval is
+ * pending, `DiffCard` offers its hunk Accept/Reject + "Open diff in editor"
+ * controls; once `approval.settle{selected, opt-allow}` lands, those controls
+ * unmount (pending flips false) and the tool card's status pill reads
+ * "Approved" (`ToolCard`'s STATUS record for `approved` — T1, Q2 / ADR-R2-15
+ * — NOT the arch doc's stale "Done").
+ */
+describe('ChatView + DiffCard + ToolCard (BH-05, WS-A T5b): edit-approval card end-to-end (pending controls -> settle unmounts them, pill flips to "Approved")', () => {
+  const TOOL_ID = 'edit-approval-1';
+
+  /** Folds tool.start -> tool.diff -> approval.request, in emit order, onto
+   * INITIAL_STATE — mirrors `transcript.test.ts`'s WS-A T5b fold exactly. */
+  function pendingEditApprovalState(): AppState {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: TOOL_ID,
+      kind: 'edit',
+      title: 'Edit: src/auth/login.ts',
+      status: 'pending',
+    });
+    state = reduce(state, {
+      type: 'tool.diff',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: TOOL_ID,
+      path: 'src/auth/login.ts',
+      hunks: [
+        {
+          header: '@@ -1,6 +1,10 @@',
+          lines: [
+            { sign: ' ', text: "import { api } from '../client';" },
+            { sign: '+', text: '' },
+            { sign: '+', text: 'export class LoginError extends Error {' },
+          ],
+        },
+      ],
+    });
+    state = reduce(state, {
+      type: 'approval.request',
+      turnId: 't1',
+      sessionId: 's1',
+      id: 'appr-1',
+      kind: 'edit',
+      title: 'Edit: src/auth/login.ts',
+      toolId: TOOL_ID,
+      options: [
+        { id: 'opt-allow', label: 'Allow once', kind: 'allow_once' },
+        { id: 'opt-deny', label: 'Deny', kind: 'deny' },
+      ],
+    });
+    return state;
+  }
+
+  function activeTranscript(state: AppState): TranscriptItem[] {
+    const tab = state.tabs[state.activeTabId];
+    return tab ? tab.transcript : [];
+  }
+
+  it('pending: DiffCard renders the hunk Accept/Reject buttons and "Open diff in editor"', () => {
+    renderChatView(activeTranscript(pendingEditApprovalState()));
+
+    expect(screen.getByRole('button', { name: /Accept hunk/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Reject/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Open diff in editor/ })).toBeInTheDocument();
+  });
+
+  it('settled (approval.settle{selected, opt-allow}): the diff controls are gone and the tool pill reads "Approved"', () => {
+    let state = pendingEditApprovalState();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: TOOL_ID,
+      outcome: 'selected',
+      optionId: 'opt-allow',
+    });
+
+    renderChatView(activeTranscript(state));
+
+    expect(screen.queryByRole('button', { name: /Open diff in editor/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Accept hunk/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Reject/ })).toBeNull();
+    expect(screen.getByText('Approved')).toBeInTheDocument();
   });
 });

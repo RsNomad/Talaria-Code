@@ -65,10 +65,18 @@
 // `ScannedNextEditRequest` — it obtains (and re-verifies) the brand purely
 // by CALLING `mintScannedNextEditRequest`, the one sanctioned mint.
 import { joinUrl } from '../util';
-import { BackendHttpError, readJsonBounded } from '../backends/http';
+import {
+  BackendHttpError,
+  readJsonBounded,
+  armStreamDeadlines,
+  raceWithDeadline,
+  MAX_STREAM_BYTES,
+  type StreamDeadlines,
+} from '../backends/http';
 import { assertSecureAuthTransport } from '../backends/secureTransport';
 import { mintScannedNextEditRequest } from './scan';
 import { isRecord } from '../../shared/typeGuards';
+import { OnceRegistry } from '../onceRegistry';
 import type { NextEditTransportId, ScannedNextEditRequest } from './types';
 import type { NextEditModelOutput, RenderedNextEditPrompt, StopReason } from './formats/types';
 
@@ -79,32 +87,19 @@ export interface NextEditBackendOptions {
   model: string;
   /** For the wire-adjacent re-mint — the format module's own sentinel list. */
   sentinels: readonly string[];
-}
-
-/**
- * CF-24 / L6 I-15: mirrors `../backendFactory.ts`'s own `warnedOnce`/
- * `warnOnce`/`clearBackendFactoryWarnings` VERBATIM — same dedupe-by-fixed-key
- * Set, same `console.warn` (never `vscode.window` — this module deliberately
- * never imports `vscode`, which is what keeps `predict` callable from a plain
- * unit test), same re-arm-by-export discipline. `backendFactory.ts`'s F4 arm
- * already solved this exact problem for the FIM `ollama` backend (which has
- * no `apiKey` field at all); this is the same fix for next-edit's `ollama`
- * transport, which has the identical no-auth-story shape (see `predict`'s
- * key-drop below).
- */
-const warnedOnce = new Set<string>();
-
-function warnOnce(key: string, message: string): void {
-  if (warnedOnce.has(key)) return;
-  warnedOnce.add(key);
-  console.warn(`[talaria.nextEdit] ${message}`);
-}
-
-/** Re-arms every construction-time warning {@link warnOnce} can emit — see
- *  its doc comment for the re-arm discipline this exists for (mirrors
- *  `../backendFactory.ts`'s `clearBackendFactoryWarnings`). */
-export function clearNextEditBackendWarnings(): void {
-  warnedOnce.clear();
+  /**
+   * FI-26 (FSU §5 Q4) — task F10-2b (3rd site closeout): the
+   * {@link OnceRegistry} `predict`'s own `warnOnce` dedupes against.
+   * REQUIRED, no module-level fallback: `shell.vscode.ts`'s `NextEditShell`
+   * holds ONE stable `OnceRegistry` field (constructed once per activation,
+   * alongside its other per-activation state) and passes that SAME instance
+   * to every per-prediction `new NextEditHttpBackend({...})` it constructs —
+   * so dedup spans predictions within an activation (warn-once-per-activation)
+   * with no module-level dedup state and no hidden test dependency. This
+   * module stays vscode-free (the registry arrives as a plain constructor
+   * param; this file never reaches into vscode to obtain one).
+   */
+  registry: OnceRegistry;
 }
 
 /** Ollama `/api/generate` (non-streaming) response shape — only the fields
@@ -163,7 +158,28 @@ function normalizeStopReason(raw: string | undefined): StopReason {
 }
 
 export class NextEditHttpBackend {
-  constructor(private readonly opts: NextEditBackendOptions) {}
+  private readonly registry: OnceRegistry;
+
+  constructor(private readonly opts: NextEditBackendOptions) {
+    this.registry = opts.registry;
+  }
+
+  /**
+   * CF-24 / L6 I-15: mirrors `../backendFactory.ts`'s own dedup discipline —
+   * same `console.warn` (never `vscode.window` — this module deliberately
+   * never imports `vscode`, which is what keeps `predict` callable from a
+   * plain unit test). `backendFactory.ts`'s F4 arm already solved this exact
+   * problem for the FIM `ollama` backend (which has no `apiKey` field at
+   * all); this is the same fix for next-edit's `ollama` transport, which has
+   * the identical no-auth-story shape (see `predict`'s key-drop below). See
+   * {@link NextEditBackendOptions.registry}'s doc comment for the
+   * activation-scoped dedup discipline `this.registry` implements.
+   */
+  private warnOnce(key: string, message: string): void {
+    if (this.registry.has(key)) return;
+    this.registry.add(key);
+    console.warn(`[talaria.nextEdit] ${message}`);
+  }
 
   async predict(
     req: ScannedNextEditRequest,
@@ -198,8 +214,8 @@ export class NextEditHttpBackend {
     const trimmedApiKey = this.opts.apiKey?.trim() || undefined;
 
     // CF-24 / L6 I-15 — parity with `../backendFactory.ts`'s own `ollama`
-    // arm (F4, mirrored verbatim via `warnOnce`/`warnedOnce` above): Ollama's
-    // `/api/generate` has no auth story this codebase speaks to here either
+    // arm (F4, mirrored via this class's own `warnOnce`/`registry` above):
+    // Ollama's `/api/generate` has no auth story this codebase speaks to here either
     // — `predictOllama` below never reads `apiKey` at all, so a leftover key
     // is DROPPED for this transport (warn-once, never the key value) instead
     // of being treated as "present" by `assertSecureAuthTransport`. Without
@@ -214,7 +230,7 @@ export class NextEditHttpBackend {
     // (`predictOpenAiCompat`'s `Authorization` header) and so must keep
     // refusing exactly as before — this is parity, not a removed protection.
     if (this.opts.transport === 'ollama' && trimmedApiKey !== undefined) {
-      warnOnce(
+      this.warnOnce(
         'nextedit-ollama-key-dropped',
         'An apiKey is configured, but the next-edit ollama transport has no authentication of its own — the key will never be sent. Clear the key, or switch talaria.nextEdit.backend to a transport that supports one.',
       );
@@ -231,15 +247,21 @@ export class NextEditHttpBackend {
     // a cast/`any` seam let through).
     mintScannedNextEditRequest(req, this.opts.sentinels);
 
+    // ADR-R2-06 (L2-CA-05, C-1-redesigned): armed immediately BEFORE fetch()
+    // (in either transport arm below) so the first-byte deadline spans the
+    // fetch() await AND the reader's first read() — see http.ts's doc
+    // comments for the full design.
+    const dl = armStreamDeadlines(signal);
+
     return this.opts.transport === 'ollama'
-      ? this.predictOllama(url, rendered, signal)
-      : this.predictOpenAiCompat(url, rendered, signal, apiKey);
+      ? this.predictOllama(url, rendered, dl)
+      : this.predictOpenAiCompat(url, rendered, dl, apiKey);
   }
 
   private async predictOllama(
     url: string,
     rendered: RenderedNextEditPrompt,
-    signal: AbortSignal,
+    dl: StreamDeadlines,
   ): Promise<NextEditModelOutput> {
     const body = {
       model: this.opts.model,
@@ -254,54 +276,70 @@ export class NextEditHttpBackend {
       },
     };
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
+    try {
+      const response = await raceWithDeadline(
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: dl.signal,
+        }),
+        dl,
+      );
 
-    if (!response.ok) {
-      throw new BackendHttpError(
-        `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
-        response.status,
-        response.statusText,
-      );
-    }
-    // CA-5 (audit-3): a missing body on an `ok` response isn't an
-    // HTTP-status failure — there's no real status to report as the cause,
-    // so this stays a plain Error rather than a fabricated BackendHttpError
-    // with an invented status. Mirrors every FIM backend's identical named
-    // guard (e.g. `OllamaFimBackend.ts`) — without it, `readJsonBounded`
-    // falls through to `JSON.parse('')` on a null body, which DOES throw,
-    // but an opaque `SyntaxError: Unexpected end of JSON input` that never
-    // names next-edit or the Ollama transport.
-    if (!response.body) {
-      throw new Error(
-        `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
-      );
-    }
+      if (!response.ok) {
+        dl.dispose();
+        throw new BackendHttpError(
+          `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+        );
+      }
+      // CA-5 (audit-3): a missing body on an `ok` response isn't an
+      // HTTP-status failure — there's no real status to report as the cause,
+      // so this stays a plain Error rather than a fabricated BackendHttpError
+      // with an invented status. Mirrors every FIM backend's identical named
+      // guard (e.g. `OllamaFimBackend.ts`) — without it, `readJsonBounded`
+      // falls through to `JSON.parse('')` on a null body, which DOES throw,
+      // but an opaque `SyntaxError: Unexpected end of JSON input` that never
+      // names next-edit or the Ollama transport.
+      if (!response.body) {
+        dl.dispose();
+        throw new Error(
+          `Next-edit Ollama /api/generate failed: ${response.status} ${response.statusText}`,
+        );
+      }
 
-    // D1: bounded read (4 MiB cap), not the unbounded response.json() —
-    // Ollama's non-streaming /api/generate body is bounded by our own
-    // num_predict, but a hostile/misconfigured server is free to send
-    // anything; readJsonBounded caps it.
-    const raw = await readJsonBounded(response);
-    if (!isOllamaGenerateResponse(raw)) {
-      // WS-BG: an ok-status body that isn't the documented response shape is
-      // a misbehaving/misconfigured server — refuse loudly. Status-only
-      // message, NEVER body content (C-5 hygiene).
-      throw new Error(
-        `Next-edit Ollama /api/generate returned an unrecognized response shape: ${response.status} ${response.statusText}`,
-      );
+      // D1: bounded read (4 MiB cap), not the unbounded response.json() —
+      // Ollama's non-streaming /api/generate body is bounded by our own
+      // num_predict, but a hostile/misconfigured server is free to send
+      // anything; readJsonBounded caps it.
+      const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
+      if (!isOllamaGenerateResponse(raw)) {
+        // WS-BG: an ok-status body that isn't the documented response shape is
+        // a misbehaving/misconfigured server — refuse loudly. Status-only
+        // message, NEVER body content (C-5 hygiene).
+        throw new Error(
+          `Next-edit Ollama /api/generate returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+        );
+      }
+      return { text: raw.response ?? '', stopReason: normalizeStopReason(raw.done_reason ?? undefined) };
+    } catch (err) {
+      // R1-7-fix (review Minor #1): dl.dispose() is idempotent (clear()
+      // no-ops once the timer is already undefined) — this covers the ONE
+      // path the guards above don't reach: raceWithDeadline(fetch) itself
+      // rejecting (fast network failure, keystroke cancel) before any
+      // response ever exists, which used to leave the 300s first-byte timer
+      // dangling.
+      dl.dispose();
+      throw err;
     }
-    return { text: raw.response ?? '', stopReason: normalizeStopReason(raw.done_reason ?? undefined) };
   }
 
   private async predictOpenAiCompat(
     url: string,
     rendered: RenderedNextEditPrompt,
-    signal: AbortSignal,
+    dl: StreamDeadlines,
     apiKey: string | undefined,
   ): Promise<NextEditModelOutput> {
     const body = {
@@ -323,40 +361,56 @@ export class NextEditHttpBackend {
       headers.Authorization = `Bearer ${apiKey}`;
     }
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal,
-    });
+    try {
+      const response = await raceWithDeadline(
+        fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: dl.signal,
+        }),
+        dl,
+      );
 
-    if (!response.ok) {
-      throw new BackendHttpError(
-        `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
-        response.status,
-        response.statusText,
-      );
-    }
-    // CA-5 (audit-3): same missing-body guard as predictOllama above — see
-    // its comment for the full rationale (mirrors every FIM backend's
-    // identical named guard).
-    if (!response.body) {
-      throw new Error(
-        `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
-      );
-    }
+      if (!response.ok) {
+        dl.dispose();
+        throw new BackendHttpError(
+          `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+        );
+      }
+      // CA-5 (audit-3): same missing-body guard as predictOllama above — see
+      // its comment for the full rationale (mirrors every FIM backend's
+      // identical named guard).
+      if (!response.body) {
+        dl.dispose();
+        throw new Error(
+          `Next-edit openai-compat /v1/completions failed: ${response.status} ${response.statusText}`,
+        );
+      }
 
-    // D1: bounded read (4 MiB cap), not the unbounded response.json() —
-    // same rationale as predictOllama above.
-    const raw = await readJsonBounded(response);
-    if (!isOpenAiCompletionResponse(raw)) {
-      // WS-BG: same refusal posture as predictOllama above (C-5 hygiene:
-      // status only, never body content).
-      throw new Error(
-        `Next-edit openai-compat /v1/completions returned an unrecognized response shape: ${response.status} ${response.statusText}`,
-      );
+      // D1: bounded read (4 MiB cap), not the unbounded response.json() —
+      // same rationale as predictOllama above.
+      const raw = await readJsonBounded(response, MAX_STREAM_BYTES, dl);
+      if (!isOpenAiCompletionResponse(raw)) {
+        // WS-BG: same refusal posture as predictOllama above (C-5 hygiene:
+        // status only, never body content).
+        throw new Error(
+          `Next-edit openai-compat /v1/completions returned an unrecognized response shape: ${response.status} ${response.statusText}`,
+        );
+      }
+      const choice = raw.choices?.[0];
+      return { text: choice?.text ?? '', stopReason: normalizeStopReason(choice?.finish_reason ?? undefined) };
+    } catch (err) {
+      // R1-7-fix (review Minor #1): dl.dispose() is idempotent (clear()
+      // no-ops once the timer is already undefined) — this covers the ONE
+      // path the guards above don't reach: raceWithDeadline(fetch) itself
+      // rejecting (fast network failure, keystroke cancel) before any
+      // response ever exists, which used to leave the 300s first-byte timer
+      // dangling.
+      dl.dispose();
+      throw err;
     }
-    const choice = raw.choices?.[0];
-    return { text: choice?.text ?? '', stopReason: normalizeStopReason(choice?.finish_reason ?? undefined) };
   }
 }

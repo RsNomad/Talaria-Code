@@ -1,17 +1,16 @@
 import { realpathSync } from 'node:fs';
 import * as path from 'node:path';
 
+import { isWithin } from '../backend/acp/pathConfine';
+
 /**
- * W4-T2: is `child` at or below `parent`? Mirrors `pathConfine.ts`'s own
- * `isWithin` (kept local — that module's version isn't exported, and this
- * is a cheap lexical containment check over already-`path.resolve`'d
- * strings, not a security boundary — `resolveRootCoordinator` only ever
- * uses it to pick WHICH already-open workspace folder a cwd belongs to).
+ * W4-T2 / L2-CA-24: the canonical containment check, re-exported under its
+ * historical name here — this IS `pathConfine.ts`'s own `isWithin` (now
+ * exported), not a local copy any more (the last byte-twin is gone).
+ * `resolveRootCoordinator` only ever uses it to pick WHICH already-open
+ * workspace folder a cwd belongs to.
  */
-export function isPathWithin(child: string, parent: string): boolean {
-  const rel = path.relative(parent, child);
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
-}
+export { isWithin as isPathWithin };
 
 /** The open workspace folder that CONTAINS `cwd`, or the first folder / `cwd` itself when none contains it (no workspace open — a bare cwd is its own root). */
 export function findContainingWorkspaceRoot(cwd: string, roots: readonly string[]): string {
@@ -19,7 +18,7 @@ export function findContainingWorkspaceRoot(cwd: string, roots: readonly string[
   if (roots.length === 0 || firstRoot === undefined) return cwd;
   const resolved = path.resolve(cwd || firstRoot);
   for (const root of roots) {
-    if (isPathWithin(resolved, path.resolve(root))) return root;
+    if (isWithin(resolved, path.resolve(root))) return root;
   }
   return firstRoot;
 }

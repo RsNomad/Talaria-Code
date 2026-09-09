@@ -3,17 +3,29 @@ import * as vscode from 'vscode';
 import {
   TalariaInlineCompletionProvider,
   reponameFromWorkspace,
-  clearSurfacedAutocompleteFailures,
   type FimActivityListener,
 } from './provider';
 import type { FimEngine, EgressVerdictObserver } from './engine';
 import type { FimContext } from './types';
 import type { CrossFileContextService } from './context/contextService';
 import { scannedSnippetForTest } from './context/scannedSnippetTestFactory';
-import { BackendHttpError, BackendStreamError } from './backends/http';
+import { BackendHttpError, BackendStreamError, StreamIdleTimeoutError } from './backends/http';
 import { InsecureTransportError } from './backends/secureTransport';
 import { MissingApiKeyError } from './backends/CodestralFimBackend';
 import { must } from '../testing/must';
+// FI-26 (WS-F10 task 2, DECLARED test-harness edit): `provider.ts` no longer
+// keeps a module-level dedup Set (or the `clearSurfacedAutocompleteFailures`
+// export that cleared it) — dedup state is now a per-provider {@link
+// OnceRegistry} instance, passed in via `TalariaInlineCompletionProviderOptions.
+// registry`. `makeProvider()` below defaults to a FRESH registry per call
+// (so most tests need no explicit reset at all — a brand-new provider always
+// starts with nothing surfaced, which is what the old
+// `clearSurfacedAutocompleteFailures()` `beforeEach` calls were achieving
+// indirectly); the few tests that need to re-arm an EXISTING provider's
+// dedup mid-test construct their own registry and call `registry.reset()`
+// directly. Every `expect(...)` assertion in every affected test is
+// byte-identical to before this edit — only this reset MECHANISM changed.
+import { OnceRegistry } from './onceRegistry';
 
 /**
  * `vscode` isn't a real resolvable module outside the extension host (only
@@ -144,6 +156,11 @@ interface FailureSurfacingOpts {
   fimActivity?: FimActivityListener;
   /** CA-06-path-face: the secret-path-skip notice observer. */
   onEgressVerdict?: EgressVerdictObserver;
+  /** FI-26 (DECLARED test-harness edit): the dedup registry to construct
+   *  the provider with. Defaults to a FRESH `OnceRegistry` per call — pass
+   *  one explicitly only when a test needs to `.reset()` it (or re-check
+   *  `.has()`) from OUTSIDE `makeProvider`, mid-test. */
+  registry?: OnceRegistry;
 }
 
 function makeProvider(
@@ -156,6 +173,7 @@ function makeProvider(
     getEnabled: () => true,
     getSkipUntrustedRemote: () => false, // not Restricted Mode / not remote — never skip (S4.3 covered separately below)
     contextService: contextService as unknown as CrossFileContextService,
+    registry: opts.registry ?? new OnceRegistry(),
     getBackendName: opts.getBackendName ?? (() => 'vllm'),
     getEndpointHost: opts.getEndpointHost ?? (() => 'endpoint.example.com'),
     getModelName: opts.getModelName ?? (() => 'qwen2.5-coder:1.5b-base'),
@@ -275,6 +293,7 @@ describe(
         getEnabled: () => true,
         getSkipUntrustedRemote: () => true,
         contextService: new FakeContextService() as unknown as CrossFileContextService,
+        registry: new OnceRegistry(),
         getBackendName: () => 'vllm',
         getEndpointHost: () => 'endpoint.example.com',
         getModelName: () => 'qwen2.5-coder:1.5b-base',
@@ -306,6 +325,7 @@ describe(
         getEnabled: () => true,
         getSkipUntrustedRemote: () => false,
         contextService: new FakeContextService() as unknown as CrossFileContextService,
+        registry: new OnceRegistry(),
         getBackendName: () => 'vllm',
         getEndpointHost: () => 'endpoint.example.com',
         getModelName: () => 'qwen2.5-coder:1.5b-base',
@@ -598,6 +618,7 @@ describe('TalariaInlineCompletionProvider — cross-file wiring (W5-T5)', () => 
       getEnabled: () => true, // enabled
       getSkipUntrustedRemote: () => true, // skipUntrustedRemote
       contextService: new FakeContextService() as unknown as CrossFileContextService,
+      registry: new OnceRegistry(),
       getBackendName: () => 'vllm',
       getEndpointHost: () => 'endpoint.example.com',
       getModelName: () => 'qwen2.5-coder:1.5b-base',
@@ -628,6 +649,7 @@ describe('TalariaInlineCompletionProvider — cross-file wiring (W5-T5)', () => 
       getEnabled: () => false, // NOT enabled
       getSkipUntrustedRemote: () => false, // skipUntrustedRemote
       contextService: new FakeContextService() as unknown as CrossFileContextService,
+      registry: new OnceRegistry(),
       getBackendName: () => 'vllm',
       getEndpointHost: () => 'endpoint.example.com',
       getModelName: () => 'qwen2.5-coder:1.5b-base',
@@ -873,8 +895,12 @@ describe('the R4 accept command is advertised only by an ATTACHED next-edit regi
 
 // ── A5: narrowed catch — surface the 3 actionable failures, once each ──────
 describe('TalariaInlineCompletionProvider — failure surfacing (A5)', () => {
+  // FI-26 (DECLARED test-harness edit): no explicit dedup reset needed here
+  // any more — `makeProvider()` gives every call a FRESH `OnceRegistry` by
+  // default, so each test's own provider already starts with nothing
+  // surfaced (the same isolation `clearSurfacedAutocompleteFailures()` used
+  // to provide against the old shared module-level Set).
   beforeEach(() => {
-    clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
     mockShowWarningMessage.mockResolvedValue(undefined);
     mockExecuteCommand.mockClear();
@@ -918,18 +944,19 @@ describe('TalariaInlineCompletionProvider — failure surfacing (A5)', () => {
     expect(showWarningMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('rebuild re-arms: clearSurfacedAutocompleteFailures makes the same 401 surface again', async () => {
+  it('registry.reset() makes the same 401 surface again', async () => {
     const engine = new FakeEngine();
     engine.throwError = new BackendHttpError('vLLM /v1/completions failed: 401 Unauthorized', 401, 'Unauthorized');
     const showWarningMessage = mockShowWarningMessage;
-    const provider = makeProvider(engine);
+    const registry = new OnceRegistry();
+    const provider = makeProvider(engine, undefined, { registry });
 
     await complete(provider);
     expect(showWarningMessage).toHaveBeenCalledTimes(1);
     await complete(provider);
     expect(showWarningMessage).toHaveBeenCalledTimes(1); // still silent
 
-    clearSurfacedAutocompleteFailures();
+    registry.reset();
 
     await complete(provider);
     expect(showWarningMessage).toHaveBeenCalledTimes(2); // re-armed
@@ -1081,6 +1108,31 @@ describe('TalariaInlineCompletionProvider — failure surfacing (A5)', () => {
   it('a bare TypeError (or any other error) returns null silently — no warning, unchanged v1 behavior (narrowed, not widened)', async () => {
     const engine = new FakeEngine();
     engine.throwError = new TypeError('fetch failed');
+    const showWarningMessage = mockShowWarningMessage;
+    const provider = makeProvider(engine);
+
+    const result = await complete(provider);
+
+    expect(result).toBeNull();
+    expect(showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  // WS-R1 R1-7 (ADR-R2-06, L2-CA-05, C-1-redesigned): `surfaceCompletionFailure`
+  // has NO "unreachable"/timeout catch-all arm at all (unlike
+  // `shell.vscode.ts`'s `surfaceTriggerFailure`, which does — see that
+  // file's test suite for the equivalent case) — timeouts and connection
+  // refusals are already, deliberately, silent here (the test immediately
+  // above proves this for a bare TypeError). Adding a NEW toast arm for
+  // `StreamIdleTimeoutError` specifically would be a behavior change this
+  // task does not intend: VS Code cancels almost every FIM request on the
+  // next keystroke anyway (this file's own value-honesty framing), so a
+  // once-per-idle-stall toast would fire on every slow-but-not-cancelled
+  // keystroke rather than staying silent like every other timeout-class
+  // failure. `StreamIdleTimeoutError` therefore falls through this ladder
+  // exactly like the bare TypeError above — proven directly, not assumed.
+  it('a StreamIdleTimeoutError (the ADR-R2-06 stream-idle reap) returns null silently — same treatment as any other timeout-class failure, no new toast', async () => {
+    const engine = new FakeEngine();
+    engine.throwError = new StreamIdleTimeoutError();
     const showWarningMessage = mockShowWarningMessage;
     const provider = makeProvider(engine);
 
@@ -1319,8 +1371,10 @@ describe('TalariaInlineCompletionProvider — failure surfacing (A5)', () => {
 // on CURRENT code is the point; a RED means the copy drifted from the plan,
 // never that production should change to match this file.
 describe('FUNC-PROVIDER characterization — exact catch-classification strings (pinned BEFORE the T14 move)', () => {
+  // FI-26 (DECLARED test-harness edit): see the identical note on the A5
+  // describe block above — a fresh per-test `OnceRegistry` (via
+  // `makeProvider`'s default) makes an explicit reset here unnecessary.
   beforeEach(() => {
-    clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
     mockShowWarningMessage.mockResolvedValue(undefined);
     mockExecuteCommand.mockClear();
@@ -1515,8 +1569,9 @@ describe('FUNC-PROVIDER characterization — exact catch-classification strings 
 
 // ── Task 16 (08 §11, ADR-010): unknown-model one-shot warning / vllm refusal ──
 describe('TalariaInlineCompletionProvider — unknown-model warning / refusal (Task 16)', () => {
+  // FI-26 (DECLARED test-harness edit): see the identical note on the A5
+  // describe block above.
   beforeEach(() => {
-    clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
     mockShowWarningMessage.mockResolvedValue(undefined);
   });
@@ -1631,11 +1686,13 @@ describe('TalariaInlineCompletionProvider — unknown-model warning / refusal (T
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
-  it('clearSurfacedAutocompleteFailures() re-arms the unknown-model warning (vllm refusal)', async () => {
+  it('registry.reset() re-arms the unknown-model warning (vllm refusal)', async () => {
     const engine = new FakeEngine();
+    const registry = new OnceRegistry();
     const provider = makeProvider(engine, undefined, {
       getBackendName: () => 'vllm',
       getModelName: () => UNKNOWN_MODEL,
+      registry,
     });
 
     await complete(provider);
@@ -1643,18 +1700,20 @@ describe('TalariaInlineCompletionProvider — unknown-model warning / refusal (T
     await complete(provider);
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(1); // still silent
 
-    clearSurfacedAutocompleteFailures();
+    registry.reset();
 
     await complete(provider);
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(2); // re-armed
   });
 
-  it('clearSurfacedAutocompleteFailures() re-arms the unknown-model warning (ollama warn-and-proceed)', async () => {
+  it('registry.reset() re-arms the unknown-model warning (ollama warn-and-proceed)', async () => {
     const engine = new FakeEngine();
     engine.respondWith = 'ata()';
+    const registry = new OnceRegistry();
     const provider = makeProvider(engine, undefined, {
       getBackendName: () => 'ollama',
       getModelName: () => UNKNOWN_MODEL,
+      registry,
     });
 
     await complete(provider);
@@ -1662,7 +1721,7 @@ describe('TalariaInlineCompletionProvider — unknown-model warning / refusal (T
     await complete(provider);
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(1); // still silent
 
-    clearSurfacedAutocompleteFailures();
+    registry.reset();
 
     await complete(provider);
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(2); // re-armed
@@ -1676,8 +1735,9 @@ describe('TalariaInlineCompletionProvider — unknown-model warning / refusal (T
 // shape to its logger via two-argument `.then(undefined, ...)` — `Thenable`
 // (unlike a real Promise) has no `.catch`.
 describe('TalariaInlineCompletionProvider — M3: showWarningMessage rejection is routed to reportFailure, never unhandled', () => {
+  // FI-26 (DECLARED test-harness edit): see the identical note on the A5
+  // describe block above.
   beforeEach(() => {
-    clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
     mockExecuteCommand.mockClear();
   });
@@ -1726,8 +1786,9 @@ describe('TalariaInlineCompletionProvider — M3: showWarningMessage rejection i
 // rejects) rather than M3's mock (`showWarningMessage` itself rejecting),
 // which is the exact distinction the final security review's probe proved.
 describe('TalariaInlineCompletionProvider — F-A: a rejected talaria.setAutocompleteApiKey command must reach reportFailure and re-arm the Set', () => {
+  // FI-26 (DECLARED test-harness edit): see the identical note on the A5
+  // describe block above.
   beforeEach(() => {
-    clearSurfacedAutocompleteFailures();
     mockShowWarningMessage.mockClear();
     mockExecuteCommand.mockClear();
   });
@@ -1785,10 +1846,12 @@ describe('TalariaInlineCompletionProvider — F-A: a rejected talaria.setAutocom
     await Promise.resolve();
     await Promise.resolve();
 
-    // No explicit clearSurfacedAutocompleteFailures() call here (that only
-    // happens on the next config rebuild) — the failed remediation attempt
-    // itself must re-arm THIS key, or the user is stranded in permanent
-    // silence exactly as the F-A brief's failure scenario describes.
+    // No explicit registry reset here — FI-26: the registry is now
+    // activation-scoped and nothing re-arms it automatically any more (not
+    // even a config rebuild) — the failed remediation attempt itself must
+    // re-arm THIS key via its own `.delete(key)`, or the user is stranded in
+    // permanent silence exactly as the F-A brief's failure scenario
+    // describes.
     mockShowWarningMessage.mockResolvedValueOnce(undefined);
     await complete(provider);
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
@@ -1871,6 +1934,7 @@ describe('CA-06-path-face — the secret-path-skip observer seam', () => {
       getEnabled: () => false, // disabled — egressPreconditionsMet returns before the path gate
       getSkipUntrustedRemote: () => false,
       contextService: new FakeContextService() as unknown as CrossFileContextService,
+      registry: new OnceRegistry(),
       getBackendName: () => 'vllm',
       getEndpointHost: () => 'endpoint.example.com',
       getModelName: () => 'qwen2.5-coder:1.5b-base',

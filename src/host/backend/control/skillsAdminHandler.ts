@@ -7,6 +7,7 @@ import { redactForModal } from '../../setup/SetupController';
 import type { ConfigWriteTail } from './configWriteTail';
 import { runAdminOp, resolveDashboardAdminClient, pollActionUntilVerified, POLL_UNCONFIRMED_MESSAGE, TRUST_GATED_METHODS } from './adminOpRunner';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
+import { errorMessage } from '../../../shared/errorMessage';
 
 /**
  * Task B4 (create/hubPreview/hubScan/hubInstall) + Task B5 (`skills.
@@ -524,7 +525,3 @@ const SKILLS_TAIL_EXEMPT_METHODS: ReadonlySet<SkillsAdminMethod> = new Set([
   'skills.hubInstall',
   'skills.hubUninstall',
 ]);
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
