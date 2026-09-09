@@ -42,7 +42,7 @@
  * that is an owner/harness item, documented here rather than silently
  * ignored.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { ApprovalItem } from '../../types';
 import type { ApprovalOption } from '../../protocol';
 import { Icon } from '../Icon';
@@ -163,6 +163,12 @@ function LiveRow({
 
 export function ApprovalCard({ item, onRespond }: ApprovalCardProps) {
   const [expiredLocal, setExpiredLocal] = useState(false);
+  // R3-UI-02: the agent's own `detail` text is framed in a named `role="group"`
+  // whose visible caption ("From the agent") is real text in reading order AND
+  // the group's accessible name (via aria-labelledby) — so every AT hears the
+  // attribution before the agent's claim, and the accessibility tree keeps OUR
+  // title (a sibling outside this group) separate from what the agent said.
+  const captionId = useId();
   const isLive = item.settledOutcome === undefined && item.resolvedOptionId === undefined;
   // A11Y-01 (WCAG 2.4.3): when the clicked option button unmounts because the
   // card just settled, focus would otherwise silently drop to <body> — move
@@ -228,7 +234,14 @@ export function ApprovalCard({ item, onRespond }: ApprovalCardProps) {
         <Icon name="shield" size={15} className="mt-0.5 flex-none text-warn" />
         <div className="min-w-0">
           <div>{item.title}</div>
-          {item.detail && <div className="mt-0.5 text-2xs leading-snug text-muted">{item.detail}</div>}
+          {item.detail && (
+            <div role="group" aria-labelledby={captionId} className="mt-1 border-l-2 border-border pl-2">
+              <div id={captionId} className="text-2xs font-semibold uppercase tracking-wide text-faint">
+                From the agent
+              </div>
+              <div className="text-2xs leading-snug text-muted">{item.detail}</div>
+            </div>
+          )}
         </div>
       </div>
       {body}

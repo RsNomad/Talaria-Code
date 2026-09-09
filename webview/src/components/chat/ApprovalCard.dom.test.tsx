@@ -16,7 +16,7 @@
  * unmount), the HOST `approval.settle` push stays the authority.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ApprovalCard } from './ApprovalCard';
 import type { ApprovalItem } from '../../types';
@@ -163,5 +163,40 @@ describe('ApprovalCard — settled-card copy (V-4/V-5) and expiry (V-6)', () => 
     );
     expect(document.activeElement).not.toBe(document.body);
     expect((document.activeElement as HTMLElement).closest('[data-testid="approval-card"], .rounded-card')).not.toBeNull();
+  });
+});
+
+describe('R3-UI-02: agent-supplied detail is attributed', () => {
+  it('renders detail inside a group named "From the agent"; the title stays outside the group', () => {
+    render(
+      <ApprovalCard item={approval({ detail: 'Safe, reversible change' })} onRespond={() => undefined} />,
+    );
+    const group = screen.getByRole('group', { name: 'From the agent' });
+    expect(within(group).getByText('Safe, reversible change')).toBeInTheDocument();
+    expect(within(group).queryByText('Edit: src/a.ts')).not.toBeInTheDocument();
+    expect(screen.getByText('Edit: src/a.ts')).toBeInTheDocument();
+  });
+
+  it('renders no group and no caption when detail is absent (no empty frame)', () => {
+    render(<ApprovalCard item={approval()} onRespond={() => undefined} />);
+    expect(screen.queryByRole('group')).not.toBeInTheDocument();
+    expect(screen.queryByText('From the agent')).not.toBeInTheDocument();
+  });
+
+  it('the caption is not hidden from assistive technology', () => {
+    render(
+      <ApprovalCard item={approval({ detail: 'Safe, reversible change' })} onRespond={() => undefined} />,
+    );
+    expect(screen.getByText('From the agent').getAttribute('aria-hidden')).toBeNull();
+  });
+
+  it('the named group is still present on a settled card', () => {
+    render(
+      <ApprovalCard
+        item={approval({ detail: 'Safe, reversible change', settledOutcome: 'selected', resolvedOptionId: 'allow' })}
+        onRespond={() => undefined}
+      />,
+    );
+    expect(screen.getByRole('group', { name: 'From the agent' })).toBeInTheDocument();
   });
 });
