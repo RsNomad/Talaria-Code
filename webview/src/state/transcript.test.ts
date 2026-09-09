@@ -2574,6 +2574,64 @@ describe('transcript reducer — BH-05 (WS-A T4, Q2 / ADR-R2-15): tool.start cre
     expect(tool).toMatchObject({ toolId: 'tool-1', status: 'interrupted', hunksLocked: true });
   });
 
+  it('R3-SEC-01 RED: settle{selected, optionId not one of this approval\'s options} derives the pending tool item to "interrupted" — NEVER "approved" (fail-safe, not the affirmative default)', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      outcome: 'selected',
+      optionId: 'nonexistent',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'interrupted', hunksLocked: true });
+    const approval = activeTab(state).transcript.find((i) => i.kind === 'approval');
+    expect(approval).toMatchObject({ id: 'appr-1', settledOutcome: 'selected', resolvedOptionId: 'nonexistent' });
+  });
+
+  it('R3-SEC-01: settle{selected} with NO optionId derives the pending tool item to "interrupted"', () => {
+    let state = pendingToolWithApproval();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: 'tool-1',
+      outcome: 'selected',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'interrupted' });
+  });
+
+  it('R3-SEC-01: settle{selected} with no matching approval item in the transcript (approvalItem undefined) derives "interrupted" — not the affirmative-by-default path', () => {
+    let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
+    state = reduce(state, {
+      type: 'tool.start',
+      turnId: 't1',
+      sessionId: 's1',
+      toolId: 'tool-1',
+      kind: 'edit',
+      title: 'Edit: a.ts',
+      status: 'pending',
+    });
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-missing',
+      toolId: 'tool-1',
+      outcome: 'selected',
+      optionId: 'allow',
+    });
+
+    const tool = activeTab(state).transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: 'tool-1', status: 'interrupted' });
+  });
+
   it('a "running" tool item is left alone by settle (status stays "running"; only hunksLocked changes)', () => {
     let state = reduce(INITIAL_STATE, { type: 'turn.start', turnId: 't1', sessionId: 's1' });
     state = reduce(state, {
@@ -2744,6 +2802,33 @@ describe('transcript reducer — BH-05 (WS-A T5b): edit-approval card end-to-end
     expect(tool).toMatchObject({ toolId: TOOL_ID, status: 'approved' });
 
     expect(pendingDiffToolIds(transcript).has(TOOL_ID)).toBe(false);
+    expect(deniedToolIds(transcript).has(TOOL_ID)).toBe(false);
+  });
+
+  it('R3-SEC-01/CHURN-01 RED: after approval.settle{outcome:"selected", optionId:"not-an-option"}: the tool item is "interrupted", pendingDiffToolIds drops the toolId, and deniedToolIds DOES pick it up (fail-safe — not applied)', () => {
+    let state = foldEditApprovalCard();
+    state = reduce(state, {
+      type: 'approval.settle',
+      sessionId: 's1',
+      turnId: 't1',
+      id: 'appr-1',
+      toolId: TOOL_ID,
+      outcome: 'selected',
+      optionId: 'not-an-option',
+    });
+
+    const transcript = activeTab(state).transcript;
+    const tool = transcript.find((i) => i.kind === 'tool');
+    expect(tool).toMatchObject({ toolId: TOOL_ID, status: 'interrupted' });
+
+    expect(pendingDiffToolIds(transcript).has(TOOL_ID)).toBe(false);
+    expect(deniedToolIds(transcript).has(TOOL_ID)).toBe(true);
+  });
+
+  it('R3-SEC-01 negative control: an untouched (live, unsettled) card is NOT counted by deniedToolIds — the unresolved verdict must be gated on an AUTHORITATIVE settled selection, not a live card with no chosen option yet', () => {
+    const state = foldEditApprovalCard();
+    const transcript = activeTab(state).transcript;
+
     expect(deniedToolIds(transcript).has(TOOL_ID)).toBe(false);
   });
 });
