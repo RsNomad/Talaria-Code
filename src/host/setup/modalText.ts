@@ -66,9 +66,10 @@ export function stripModalUnsafeText(value: string): string {
  * Unlike {@link refuseUnsafeModalText} — which REFUSES a freshly-submitted
  * param — refusing the whole Apply because a hand-edited settings.json has
  * an odd character in the OLD value would trap the user out of fixing it.
- * {@link stripModalUnsafeText} (built from the same {@link MODAL_UNSAFE_CHARS}
- * source as {@link MODAL_UNSAFE_TEXT_PATTERN}, so the two can never drift
- * apart), then caps to {@link MODAL_TEXT_MAX_LEN}.
+ * This STRIPS the unsafe characters via {@link stripModalUnsafeText} (built
+ * from the same {@link MODAL_UNSAFE_CHARS} source as
+ * {@link MODAL_UNSAFE_TEXT_PATTERN}, so the two can never drift apart), then
+ * caps to {@link MODAL_TEXT_MAX_LEN}.
  * DISPLAY-ONLY: never touches what gets WRITTEN to a setting — callers
  * still write the validated/raw value, never this redacted copy.
  */
