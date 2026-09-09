@@ -502,9 +502,6 @@ export function App() {
     return requestShapedOptional('checkpoint.redoAll', params, isCheckpointRestoreResult, tab.tabId);
   };
 
-  // Deep-link into the Setup panel (MockNotice / Hero "Set up backends").
-  const openSetup = () => selectPanel('setup');
-
   // A#7/BF-A: Sessions "Load more" over the CORRELATED path (shows a loading
   // state + surfaces failure), replacing the old silent fire-and-forget
   // `session.list` that defeated X2. F-1: `sessions` is the one shared slice
@@ -586,12 +583,22 @@ export function App() {
   // chat-session tab — `PriorityTabs`/`selectPanel` vs `TabStrip`/`selectTab`
   // below (the naming collision the S0 `switchTab`->`switchPanel` rename
   // was pinned to kill).
-  const selectPanel = (panel: Panel) => {
-    dispatch({ local: { type: 'local.setPanel', panel } });
-    // Fetch the panel's data over the correlated request path so a failure is
-    // caught and shown as Error+Retry instead of an eternal spinner (Part X2).
-    if (panel !== 'chat') requestPanel(panel);
-  };
+  const selectPanel = useCallback(
+    (panel: Panel) => {
+      dispatch({ local: { type: 'local.setPanel', panel } });
+      // R3-UI-01: through the ref (the same idiom the message subscription uses at
+      // requestPanelRef) — `requestPanel` is re-minted every render (it closes over
+      // `tab`), so listing it as a dep would re-mint this callback every render and
+      // defeat ChatView's memo again. `requestPanelRef.current` is assigned during
+      // render, before any click can fire, so it is never stale here.
+      if (panel !== 'chat') requestPanelRef.current(panel);
+    },
+    [dispatch],
+  );
+
+  // Deep-link into the Setup panel (MockNotice / Hero "Set up backends"). Stable for the
+  // App's lifetime — `selectPanel` is.
+  const openSetup = useCallback(() => selectPanel('setup'), [selectPanel]);
 
   // ---- chat-session tab lifecycle (W4 §2d/§2e Deliverable 2/5) ----
 

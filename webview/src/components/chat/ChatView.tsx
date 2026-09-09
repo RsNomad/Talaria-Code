@@ -344,9 +344,9 @@ export function itemKey(item: TranscriptItem, index: number): string {
  * `TabState.draft` doesn't re-tokenize the settled transcript. This only
  * pays off because `tab.transcript` keeps its array identity across a draft
  * fold (the reducer only ever touches `draft`/`draftAttachments`) and
- * App.tsx's `onApproval`/`onDiff`/`onOpenDiff`/`onStarter` handlers are
- * `useCallback`-stabilized — otherwise a fresh function identity every
- * render would defeat the memo.
+ * App.tsx's `onApproval`/`onDiff`/`onOpenDiff`/`onStarter`/`onOpenSetup`
+ * handlers are `useCallback`-stabilized — otherwise a fresh function identity
+ * every render would defeat the memo.
  */
 export const ChatView = memo(function ChatView({
   transcript,
