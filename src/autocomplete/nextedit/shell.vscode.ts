@@ -36,6 +36,11 @@ import type { FimActivityListener } from '../provider';
 import { OnceRegistry } from '../onceRegistry';
 import { regionAroundCursor } from './anchors';
 import { NextEditHttpBackend } from './backend';
+// R3-ARCH-02: `nextEditRoute.ts` no longer imports `./config` itself (that
+// would reintroduce a vscode edge into a module `nextEditPurity.test.ts`
+// locks vscode-free) — the shell, already in `ADAPTER_ALLOW`, owns the read
+// and hands `resolveRoute` the reader as its third argument.
+import { readNextEditConfig } from './config';
 import { DEFAULT_FILE_WINDOW_OPTIONS, windowAroundCursor } from './fileWindow';
 import { attachFimActivity, detachFimActivity, fimActivityRelay } from './fimActivityRelay';
 import { reduceNextEdit } from './fsm';
@@ -51,6 +56,7 @@ import {
   NEXT_EDIT_MODEL_UNSET_NOTE,
   resolveRoute,
   type NextEditRoute,
+  type NextEditRouteDeps,
 } from './nextEditRoute';
 import { buildFimActivity, registerCommands, registerListeners, type ShellHostSeams } from './nextEditShellWiring';
 import { ensureTrailingNewline, extractRegionRange, stripLineTerminator } from './nextEditText';
@@ -140,25 +146,8 @@ export { fimActivityRelay };
 export type NextEditEgressVerdict = 'path-block' | 'content-block' | 'allow';
 export type NextEditEgressObserver = (filepath: string, verdict: NextEditEgressVerdict) => void;
 
-export interface NextEditShellDeps {
+export interface NextEditShellDeps extends NextEditRouteDeps {
   reportFailure(msg: string): void;
-  getAutocompleteEndpoint(): string;
-  getAutocompleteModel(): string;
-  getAutocompleteBackend(): string;
-  /**
-   * The EFFECTIVE FIM key — the SecretStorage value, falling back to the
-   * deprecated machine-scoped setting, exactly as the FIM engine resolves it
-   * (`apiKey.ts` `pickApiKey`). Generic rides FIM's endpoint and FIM's model,
-   * so it must ride FIM's credential: the destination is byte-identical, and
-   * an unauthenticated request to an authed endpoint is not safer, it is
-   * simply one that fails.
-   *
-   * The NEXT route must NEVER read this — it has its own endpoint, and
-   * sending FIM's credential to a different host would be a genuine new
-   * exposure. That is enforced structurally: the `next` branch of
-   * `resolveRoute` leaves `NextEditRoute.apiKey` unset.
-   */
-  getAutocompleteApiKey(): string | undefined;
   /** CA-06-NE-face — optional, purely OBSERVATIONAL: notified with the
    *  egress verdict at GATE 5 ('path-block'), after a successful mint
    *  ('allow'), and on a mint rejection ('content-block'). It cannot affect
@@ -796,7 +785,7 @@ class NextEditShell {
     // F-5 / C-5 — a route that cannot be built is REPORTED (once) when the
     // user can do something about it, instead of returning into silence while
     // the panel row still reads as if the source were running.
-    const resolution = resolveRoute(mode, this.deps);
+    const resolution = resolveRoute(mode, this.deps, readNextEditConfig);
     if (resolution.kind === 'next-model-unset') {
       this.surfaceOnce('next-model-unset', NEXT_EDIT_MODEL_UNSET_NOTE);
       return null;

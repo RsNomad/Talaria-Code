@@ -1,6 +1,14 @@
 // nextedit/types.ts — declarations only, no logic, no vscode import
 export type NextEditFormatId = 'sweep-v2' | 'generic-instruct';
 export type NextEditTransportId = 'ollama' | 'openai-compat';
+/** R3-ARCH-02: moved here from `config.ts` (the pure type leaf, not the
+ *  vscode-reading adapter) so `nextEditRoute.ts` can spell the shape of the
+ *  config it is handed without importing `config.ts` itself. */
+export interface HermesNextEditConfig {
+  backend: NextEditTransportId;
+  endpoint: string;
+  model: string;
+}
 export interface LineRange { startLine: number; endLine: number }            // 0-based inclusive
 export interface NextEditCursor { uri: string; line: number; character: number }
 export interface EditableRegion { uri: string; filepath: string; startLine: number; endLine: number; content: string }

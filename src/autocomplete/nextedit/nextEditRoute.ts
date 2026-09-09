@@ -13,12 +13,18 @@
  * VSCODE-FREE — NOT in `nextEditPurity.test.ts`'s `ADAPTER_ALLOW` (locked at
  * exactly 4 files: `config.ts`, `guard.ts`, `shell.vscode.ts`,
  * `nextEditNotice.vscode.ts`): this module never imports the `vscode`
- * package itself, in any form. The one import below that names
- * `./shell.vscode` is `import type` only —
- * erased at runtime, so it neither reintroduces vscode into this module nor
- * creates a runtime cycle with the shell's own runtime import of
- * `resolveRoute` from here (shell→nextEditRoute is a real runtime edge;
- * nextEditRoute→shell is type-only, gone by the time either module runs).
+ * package itself, in any form, and — since R3-ARCH-02 — has no edge to
+ * `shell.vscode.ts` at all, real or type-only. `resolveRoute` takes its
+ * generic-branch dependencies through the narrow {@link NextEditRouteDeps}
+ * port it declares here, and its NEXT-branch config through an injected
+ * {@link NextEditConfigReader} rather than importing `./config` (which pulls
+ * `vscode` in transitively) — so this module never reads configuration
+ * itself, and the shell (which already owns vscode access) supplies both.
+ * That deletes the day-someone-turns-`import type`-into-a-value latent
+ * runtime cycle this module used to carry, and makes the headlessness
+ * TESTABLE: `nextEditRoute.test.ts` needs no `vi.mock('./config')` any more
+ * — a real `./config` import would throw on the missing `vscode` module at
+ * import time, so the mock's absence is itself the structural proof.
  *
  * `resolveRoute` and `endpointLabel` were module-PRIVATE in `shell.vscode.ts`
  * — both are exported here (required so `nextEditRoute.test.ts` can pin
@@ -34,13 +40,42 @@
  */
 import { isLoopbackHost } from '../backends/secureTransport';
 import { DEFAULT_ENDPOINTS } from '../endpoints';
-import { readNextEditConfig } from './config';
 import { genericInstructFormat } from './formats/genericInstruct';
 import { sweepV2Format } from './formats/sweepV2';
 import type { NextEditFormat } from './formats/types';
 import type { NextEditMode } from './mode';
-import type { NextEditShellDeps } from './shell.vscode';
-import type { NextEditTransportId } from './types';
+import type { HermesNextEditConfig, NextEditTransportId } from './types';
+
+/**
+ * R3-ARCH-02 — exactly what route resolution reads from the generic (FIM)
+ * branch: the 4 FIM getters. A narrow port, not the shell's full deps bag —
+ * `reportFailure`/`onEgressVerdict` are shell-only concerns `resolveRoute`
+ * never touches.
+ */
+export interface NextEditRouteDeps {
+  getAutocompleteEndpoint(): string;
+  getAutocompleteModel(): string;
+  getAutocompleteBackend(): string;
+  /**
+   * The EFFECTIVE FIM key — the SecretStorage value, falling back to the
+   * deprecated machine-scoped setting, exactly as the FIM engine resolves it
+   * (`apiKey.ts` `pickApiKey`). Generic rides FIM's endpoint and FIM's model,
+   * so it must ride FIM's credential: the destination is byte-identical, and
+   * an unauthenticated request to an authed endpoint is not safer, it is
+   * simply one that fails.
+   *
+   * The NEXT route must NEVER read this — it has its own endpoint, and
+   * sending FIM's credential to a different host would be a genuine new
+   * exposure. That is enforced structurally: the `next` branch of
+   * `resolveRoute` leaves `NextEditRoute.apiKey` unset.
+   */
+  getAutocompleteApiKey(): string | undefined;
+}
+
+/** R3-ARCH-02 — how `resolveRoute` reads NEXT's own configuration: injected
+ *  by the caller (the shell, which already owns vscode access) rather than
+ *  imported. See the module doc above for why. */
+export type NextEditConfigReader = () => HermesNextEditConfig;
 
 /**
  * `08` §6.3 — the one-shot Generic setup note, pinned copy. No detection
@@ -155,10 +190,17 @@ export type RouteResolution =
  * `route.model` is the SINGLE source for both `NextEditRequest.model` and the
  * backend's `opts.model`, which is what makes that reconciliation check
  * unfailable here by construction.
+ *
+ * `readConfig` (R3-ARCH-02) is called ONLY on the `next` branch — the
+ * generic branch never touches NEXT's own configuration, it reads `deps`.
  */
-export function resolveRoute(mode: NextEditMode, deps: NextEditShellDeps): RouteResolution {
+export function resolveRoute(
+  mode: NextEditMode,
+  deps: NextEditRouteDeps,
+  readConfig: NextEditConfigReader,
+): RouteResolution {
   if (mode === 'next') {
-    const cfg = readNextEditConfig();
+    const cfg = readConfig();
     if (cfg.model === '') return { kind: 'next-model-unset' };
     const apiBase = cfg.endpoint === '' ? DEFAULT_ENDPOINTS[cfg.backend] : cfg.endpoint;
     return {
