@@ -32,6 +32,7 @@ Thumbs.db
 # Agent tooling & internal docs — NOT for the public repo
 .claude/
 .superpowers/
+docs_claude/
 internal-notes/
 
 # Neural-net / model / vector-index artifacts
