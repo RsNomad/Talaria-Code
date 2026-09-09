@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
 /**
  * WS-F3 F3-3 (FI-06) — the DIRECT whole-shape pin `nextEditRoute.ts`'s move
@@ -14,53 +14,29 @@ import { describe, it, expect, vi } from 'vitest';
  * `nextedit.golden.shell.test.ts`) so those two stay pristine/0-edit, exactly
  * as F3-2's precedent already established for `nextEditText.ts`.
  *
- * `./config` is mocked (its own `config.test.ts` does the same, for the same
- * reason: `readNextEditConfig` reads `vscode.workspace.getConfiguration`
- * under the hood, and this file has no other reason to touch `vscode` at
- * all) — driving `cfg.backend`/`cfg.endpoint`/`cfg.model` per row without
- * pulling the vscode module into a file that has no other need of it.
- * `nextEditRoute.ts` itself imports `NextEditShellDeps` `type`-only from
- * `./shell.vscode`, which is erased at compile time — so importing
- * `resolveRoute` here never runtime-imports `shell.vscode.ts`, and this file
- * needs no `vi.mock('vscode', ...)` of its own.
+ * R3-ARCH-02 — this file mocks NOTHING: `nextEditRoute.ts` no longer imports
+ * `./config` (or, even type-only, `./shell.vscode`) at all. NEXT's
+ * configuration is supplied to `resolveRoute` as an explicit third argument
+ * (`makeReader`, below) instead of being read through a module import, so
+ * there is no `vscode` edge anywhere on this file's import graph and no
+ * `vi.mock('./config', ...)` is needed to keep it that way — the absence IS
+ * the structural headlessness proof (mutation m10 re-adds the import and
+ * watches this file fail at import time on the missing `vscode` module).
  */
 
-const nextEditCfg: { backend: 'ollama' | 'openai-compat'; endpoint: string; model: string } = {
-  backend: 'ollama',
-  endpoint: '',
-  model: '',
-};
-
-vi.mock('./config', () => ({
-  readNextEditConfig: () => ({
-    backend: nextEditCfg.backend,
-    endpoint: nextEditCfg.endpoint,
-    model: nextEditCfg.model,
-  }),
-}));
-
-import { resolveRoute, endpointLabel, type RouteResolution } from './nextEditRoute';
+import { resolveRoute, endpointLabel, type NextEditRouteDeps, type RouteResolution } from './nextEditRoute';
+import type { HermesNextEditConfig } from './types';
 import { DEFAULT_ENDPOINTS } from '../endpoints';
 import { sweepV2Format } from './formats/sweepV2';
 import { genericInstructFormat } from './formats/genericInstruct';
-import type { NextEditShellDeps } from './shell.vscode';
 
-function resetNextEditCfg(): void {
-  nextEditCfg.backend = 'ollama';
-  nextEditCfg.endpoint = '';
-  nextEditCfg.model = '';
-}
-
-interface FakeGenericConfig {
+function makeDeps(generic: {
   backend: string;
   endpoint: string;
   model: string;
   apiKey?: string;
-}
-
-function makeDeps(generic: FakeGenericConfig): NextEditShellDeps {
+}): NextEditRouteDeps {
   return {
-    reportFailure: () => {},
     getAutocompleteEndpoint: () => generic.endpoint,
     getAutocompleteModel: () => generic.model,
     getAutocompleteBackend: () => generic.backend,
@@ -68,16 +44,19 @@ function makeDeps(generic: FakeGenericConfig): NextEditShellDeps {
   };
 }
 
-const NO_GENERIC_DEPS: NextEditShellDeps = makeDeps({ backend: 'ollama', endpoint: '', model: '' });
+function makeReader(cfg: HermesNextEditConfig): () => HermesNextEditConfig {
+  return () => cfg;
+}
+
+const NO_GENERIC_DEPS: NextEditRouteDeps = makeDeps({ backend: 'ollama', endpoint: '', model: '' });
 
 describe('direct pin: resolveRoute — whole-shape RouteResolution, format included (F3-1 deferred item #1, discharged)', () => {
   it('next / model set / empty endpoint: falls back to the ollama default, loopback, sweepV2Format', () => {
-    resetNextEditCfg();
-    nextEditCfg.backend = 'ollama';
-    nextEditCfg.endpoint = '';
-    nextEditCfg.model = 'sweep-next-edit-v2-7B';
-
-    const resolution = resolveRoute('next', NO_GENERIC_DEPS);
+    const resolution = resolveRoute(
+      'next',
+      NO_GENERIC_DEPS,
+      makeReader({ backend: 'ollama', endpoint: '', model: 'sweep-next-edit-v2-7B' }),
+    );
     const expected: RouteResolution = {
       kind: 'route',
       route: {
@@ -96,12 +75,11 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
   });
 
   it('next / openai-compat backend / empty endpoint: falls back to the openai-compat default', () => {
-    resetNextEditCfg();
-    nextEditCfg.backend = 'openai-compat';
-    nextEditCfg.endpoint = '';
-    nextEditCfg.model = 'sweep-next-edit-v2-7B';
-
-    const resolution = resolveRoute('next', NO_GENERIC_DEPS);
+    const resolution = resolveRoute(
+      'next',
+      NO_GENERIC_DEPS,
+      makeReader({ backend: 'openai-compat', endpoint: '', model: 'sweep-next-edit-v2-7B' }),
+    );
     expect(resolution).toEqual({
       kind: 'route',
       route: {
@@ -115,12 +93,11 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
   });
 
   it('next / a REMOTE endpoint: remote true, everything else unchanged', () => {
-    resetNextEditCfg();
-    nextEditCfg.backend = 'ollama';
-    nextEditCfg.endpoint = 'http://192.0.2.10:11434';
-    nextEditCfg.model = 'sweep-next-edit-v2-7B';
-
-    const resolution = resolveRoute('next', NO_GENERIC_DEPS);
+    const resolution = resolveRoute(
+      'next',
+      NO_GENERIC_DEPS,
+      makeReader({ backend: 'ollama', endpoint: 'http://192.0.2.10:11434', model: 'sweep-next-edit-v2-7B' }),
+    );
     expect(resolution).toEqual({
       kind: 'route',
       route: {
@@ -134,18 +111,17 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
   });
 
   it("next / cfg.model === '': next-model-unset, no route built at all", () => {
-    resetNextEditCfg();
-    nextEditCfg.backend = 'ollama';
-    nextEditCfg.endpoint = '';
-    nextEditCfg.model = '';
-
-    const resolution = resolveRoute('next', NO_GENERIC_DEPS);
+    const resolution = resolveRoute(
+      'next',
+      NO_GENERIC_DEPS,
+      makeReader({ backend: 'ollama', endpoint: '', model: '' }),
+    );
     expect(resolution).toEqual({ kind: 'next-model-unset' });
   });
 
   it('generic / ollama backend, no key: route, genericInstructFormat, apiKey absent', () => {
     const deps = makeDeps({ backend: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'qwen2.5-coder:7b' });
-    const resolution = resolveRoute('generic', deps);
+    const resolution = resolveRoute('generic', deps, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     const expected: RouteResolution = {
       kind: 'route',
       route: {
@@ -170,7 +146,7 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
       model: 'qwen2.5-coder:7b',
       apiKey: 'sk-test-key',
     });
-    const resolution = resolveRoute('generic', deps);
+    const resolution = resolveRoute('generic', deps, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     expect(resolution).toEqual({
       kind: 'route',
       route: {
@@ -186,7 +162,7 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
 
   it('generic / vllm backend derives openai-compat', () => {
     const deps = makeDeps({ backend: 'vllm', endpoint: 'http://127.0.0.1:8000', model: 'm' });
-    const resolution = resolveRoute('generic', deps);
+    const resolution = resolveRoute('generic', deps, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     expect(resolution).toEqual({
       kind: 'route',
       route: {
@@ -201,7 +177,7 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
 
   it('generic / a REMOTE endpoint: remote true', () => {
     const deps = makeDeps({ backend: 'ollama', endpoint: 'http://192.0.2.20:11434', model: 'm' });
-    const resolution = resolveRoute('generic', deps);
+    const resolution = resolveRoute('generic', deps, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     expect(resolution).toEqual({
       kind: 'route',
       route: {
@@ -219,30 +195,30 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
 
   it('generic / codestral backend: UNSUPPORTED, no route', () => {
     const deps = makeDeps({ backend: 'codestral', endpoint: 'http://127.0.0.1:8000', model: 'm' });
-    const resolution = resolveRoute('generic', deps);
+    const resolution = resolveRoute('generic', deps, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     expect(resolution).toEqual({ kind: 'generic-unsupported-backend', fimBackend: 'codestral' });
   });
 
   it('generic / openai-compat backend: ALSO unsupported (re-templates server-side)', () => {
     const deps = makeDeps({ backend: 'openai-compat', endpoint: 'http://127.0.0.1:8000', model: 'm' });
-    const resolution = resolveRoute('generic', deps);
+    const resolution = resolveRoute('generic', deps, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     expect(resolution).toEqual({ kind: 'generic-unsupported-backend', fimBackend: 'openai-compat' });
   });
 
   it('generic / empty endpoint: generic-unconfigured', () => {
     const deps = makeDeps({ backend: 'ollama', endpoint: '', model: 'm' });
-    const resolution = resolveRoute('generic', deps);
+    const resolution = resolveRoute('generic', deps, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     expect(resolution).toEqual({ kind: 'generic-unconfigured' });
   });
 
   it('generic / empty model: generic-unconfigured', () => {
     const deps = makeDeps({ backend: 'ollama', endpoint: 'http://127.0.0.1:11434', model: '' });
-    const resolution = resolveRoute('generic', deps);
+    const resolution = resolveRoute('generic', deps, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     expect(resolution).toEqual({ kind: 'generic-unconfigured' });
   });
 
   it("mode 'off': mode-off", () => {
-    const resolution = resolveRoute('off', NO_GENERIC_DEPS);
+    const resolution = resolveRoute('off', NO_GENERIC_DEPS, makeReader({ backend: 'ollama', endpoint: '', model: '' }));
     expect(resolution).toEqual({ kind: 'mode-off' });
   });
 
@@ -253,14 +229,15 @@ describe('direct pin: resolveRoute — whole-shape RouteResolution, format inclu
   });
 
   it('reach: both format singletons are actually exercised as .route.format (the point of this whole file)', () => {
-    resetNextEditCfg();
-    nextEditCfg.backend = 'ollama';
-    nextEditCfg.endpoint = '';
-    nextEditCfg.model = 'sweep-next-edit-v2-7B';
-    const nextResolution = resolveRoute('next', NO_GENERIC_DEPS);
+    const nextResolution = resolveRoute(
+      'next',
+      NO_GENERIC_DEPS,
+      makeReader({ backend: 'ollama', endpoint: '', model: 'sweep-next-edit-v2-7B' }),
+    );
     const genericResolution = resolveRoute(
       'generic',
       makeDeps({ backend: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'm' }),
+      makeReader({ backend: 'ollama', endpoint: '', model: '' }),
     );
     expect(nextResolution.kind).toBe('route');
     expect(genericResolution.kind).toBe('route');

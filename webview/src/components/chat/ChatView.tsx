@@ -4,7 +4,7 @@
  */
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { TranscriptItem, ToolItem } from '../../types';
-import { isDenyOptionKind } from '../../state/transcript';
+import { classifySelectedOption } from '../../state/transcript';
 import { Hero } from '../Hero';
 import { Icon } from '../Icon';
 import { LiveRegion } from '../LiveRegion';
@@ -95,14 +95,21 @@ export function pendingDiffToolIds(transcript: TranscriptItem[]): Set<string> {
  *       explicit card-deny click, the optimistic hunk-reject cascade
  *       (`local.diffResolved{reject}`, which sets `settledOutcome:'selected'`
  *       with the deny option id), and the host's own deny echo.
+ *   (c) R3-SEC-01: an AUTHORITATIVE 'selected' whose id resolves to none of
+ *       this approval's options — treated like route (a), never as an
+ *       applied edit (see `settledUnresolved` below).
  */
 export function deniedToolIds(transcript: TranscriptItem[]): Set<string> {
   const ids = new Set<string>();
   for (const item of transcript) {
     if (item.kind !== 'approval' || item.toolId === undefined) continue;
     const settledDeny = item.settledOutcome !== undefined && item.settledOutcome !== 'selected';
-    const chosenKind = item.options.find((o) => o.id === item.resolvedOptionId)?.kind;
-    if (settledDeny || isDenyOptionKind(chosenKind)) ids.add(item.toolId);
+    const verdict = classifySelectedOption(item.options, item.resolvedOptionId);
+    // (c) R3-SEC-01: an AUTHORITATIVE 'selected' whose id resolves to none of this
+    // approval's options is treated like route (a) — never as an applied edit. Gated on
+    // settledOutcome: a LIVE card (no settle, no click) is also 'unresolved' and must NOT count.
+    const settledUnresolved = item.settledOutcome === 'selected' && verdict === 'unresolved';
+    if (settledDeny || verdict === 'deny' || settledUnresolved) ids.add(item.toolId);
   }
   return ids;
 }
@@ -337,9 +344,9 @@ export function itemKey(item: TranscriptItem, index: number): string {
  * `TabState.draft` doesn't re-tokenize the settled transcript. This only
  * pays off because `tab.transcript` keeps its array identity across a draft
  * fold (the reducer only ever touches `draft`/`draftAttachments`) and
- * App.tsx's `onApproval`/`onDiff`/`onOpenDiff`/`onStarter` handlers are
- * `useCallback`-stabilized — otherwise a fresh function identity every
- * render would defeat the memo.
+ * App.tsx's `onApproval`/`onDiff`/`onOpenDiff`/`onStarter`/`onOpenSetup`
+ * handlers are `useCallback`-stabilized — otherwise a fresh function identity
+ * every render would defeat the memo.
  */
 export const ChatView = memo(function ChatView({
   transcript,

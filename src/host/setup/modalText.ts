@@ -44,6 +44,21 @@ export function refuseUnsafeModalText(value: string, label: string): { ok: true 
 }
 
 /**
+ * R3-ARCH-01: the one shared STRIP primitive (never length-slices) — the
+ * single owner `control/mcpEntryValidation.ts`'s `stripModalControls` now
+ * delegates to, instead of rebuilding its own module-init `.source`-derived
+ * `/g` regex (the TDZ/latent-cycle vector this replaces). Exported as a
+ * FUNCTION, not the `/g` regex object itself: a shared global `RegExp`
+ * carries `lastIndex` state across every importer (this codebase already
+ * resets `lastIndex` in `secretScanner.ts` for exactly this hazard) —
+ * `String.replace` happens to reset it, but exporting the object would
+ * invite a future `.test()`/`.exec()` caller to leak state across modules.
+ */
+export function stripModalUnsafeText(value: string): string {
+  return value.replace(MODAL_UNSAFE_TEXT_PATTERN_G, '');
+}
+
+/**
  * T2 (beta.6 panel-fix CR-003): NEUTRALIZE (never refuse) a value the user
  * already has SAVED, before it is interpolated into a Tier-1 confirmation
  * modal as an 'old' value (e.g. the current `talaria.autocomplete.endpoint`
@@ -51,13 +66,14 @@ export function refuseUnsafeModalText(value: string, label: string): { ok: true 
  * Unlike {@link refuseUnsafeModalText} — which REFUSES a freshly-submitted
  * param — refusing the whole Apply because a hand-edited settings.json has
  * an odd character in the OLD value would trap the user out of fixing it.
- * Strips every character in the same class as {@link MODAL_UNSAFE_TEXT_PATTERN}
- * (built from the same {@link MODAL_UNSAFE_CHARS} source, so the two can
- * never drift apart), then caps to {@link MODAL_TEXT_MAX_LEN}.
+ * This STRIPS the unsafe characters via {@link stripModalUnsafeText} (built
+ * from the same {@link MODAL_UNSAFE_CHARS} source as
+ * {@link MODAL_UNSAFE_TEXT_PATTERN}, so the two can never drift apart), then
+ * caps to {@link MODAL_TEXT_MAX_LEN}.
  * DISPLAY-ONLY: never touches what gets WRITTEN to a setting — callers
  * still write the validated/raw value, never this redacted copy.
  */
 export function redactForModal(value: string): string {
-  const stripped = value.replace(MODAL_UNSAFE_TEXT_PATTERN_G, '');
+  const stripped = stripModalUnsafeText(value);
   return stripped.length > MODAL_TEXT_MAX_LEN ? stripped.slice(0, MODAL_TEXT_MAX_LEN) : stripped;
 }

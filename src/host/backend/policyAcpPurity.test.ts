@@ -259,6 +259,64 @@ function collectRagSources() {
   return collectNonTestTsSources(RAG_ROOT);
 }
 
+// ---------------------------------------------------------------------------
+// R3-ARCH-01 (lens-r3 T5): `control/` must reach the modal-forging strip
+// primitive through the LEAF (`setup/modalText.ts`), never through the
+// 2438-line `SetupController.ts` façade — the façade import IS the module-
+// init `.source`-rebuild TDZ/latent-cycle vector this task deletes.
+// Mechanised (not just fixed once) so a future `control/` file cannot
+// silently re-open the same edge. Uses the SAME `collectSourceFiles()` /
+// `ROOTS` walk this file already runs for the vscode-freedom scan above —
+// `control/` is already in `ROOTS`.
+// ---------------------------------------------------------------------------
+
+const SETUP_FACADE_IMPORT_RE = /from\s+['"](?:\.\.\/)+setup\/SetupController['"]/;
+
+function collectControlSources() {
+  return collectSourceFiles().filter((f) => f.relKey.startsWith('control/'));
+}
+
+describe('R3-ARCH-01: control/ never imports the setup/SetupController façade', () => {
+  it('non-vacuous: discovers control/mcpEntryValidation.ts and control/skillsAdminHandler.ts', () => {
+    const files = collectControlSources();
+    expect(files.some((f) => f.relKey === 'control/mcpEntryValidation.ts')).toBe(true);
+    expect(files.some((f) => f.relKey === 'control/skillsAdminHandler.ts')).toBe(true);
+  });
+
+  it('no module under control/ imports setup/SetupController', () => {
+    const offenders = collectControlSources()
+      .filter((f) => SETUP_FACADE_IMPORT_RE.test(f.text))
+      .map((f) => f.relKey);
+    expect(offenders).toEqual([]);
+  });
+
+  it('RED-first proof: the ban would catch a hypothetical control/ façade violation (in-memory injection into the REAL collected file list)', () => {
+    const withInjectedViolation = [
+      ...collectControlSources(),
+      {
+        relKey: 'control/__hypothetical_facade_violation__.ts',
+        absPath: '',
+        text: "import { redactForModal } from '../../setup/SetupController';\n",
+      },
+    ];
+    const offenders = withInjectedViolation.filter((f) => SETUP_FACADE_IMPORT_RE.test(f.text)).map((f) => f.relKey);
+    expect(offenders).toContain('control/__hypothetical_facade_violation__.ts');
+  });
+
+  it('negative control: a control/ file importing setup/modalText (the leaf) is NOT flagged', () => {
+    const withLeafImport = [
+      ...collectControlSources(),
+      {
+        relKey: 'control/__hypothetical_leaf_import__.ts',
+        absPath: '',
+        text: "import { redactForModal } from '../../setup/modalText';\n",
+      },
+    ];
+    const offenders = withLeafImport.filter((f) => SETUP_FACADE_IMPORT_RE.test(f.text)).map((f) => f.relKey);
+    expect(offenders).not.toContain('control/__hypothetical_leaf_import__.ts');
+  });
+});
+
 describe('T-18 (C3): rag/ purity guard', () => {
   it('discovers indexer.ts (non-vacuous file discovery)', () => {
     const files = collectRagSources();

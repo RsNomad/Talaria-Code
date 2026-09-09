@@ -35,7 +35,7 @@ import type { RootCoordinatorLike } from '../../checkpoints/RootCoordinator';
 import type { CheckpointTrackerLike } from '../../checkpoints/trackerContract';
 import type { RestoreResult } from '../../checkpoints/CheckpointTracker';
 import { buildCancelledOutcome, buildSelectedOutcome } from '../acp/permission';
-import type { AcpRequestPermissionRequest, AcpOutboundContentBlock } from '../acp/types';
+import type { AcpRequestPermissionRequest, AcpOutboundContentBlock, AcpPermissionOption } from '../acp/types';
 import type { AcpClientLike, AcpListSessionsRawResult, AcpLoadSessionResult } from '../acp/acpClient';
 import type { Attachment, Checkpoint, CheckpointsData, HostToWebviewMessage } from '../../../shared/protocol';
 
@@ -46,11 +46,17 @@ const EDIT_OPTIONS = [
 
 /** Mirrors `AcpBackend.test.ts`'s `makeEditReq` — an `edit` permission
  *  request whose write_file path is `p`, so `buildPresentEffectSignals`
- *  takes the AWAITING `canonicalizeToolCallPaths` branch. */
-function makeEditReq(p: string): AcpRequestPermissionRequest {
+ *  takes the AWAITING `canonicalizeToolCallPaths` branch. R3 T2: `options`
+ *  generalised (default = `EDIT_OPTIONS`, cloned per call as before) so the
+ *  R3-SEC-01 suite can exercise option sets missing a deny-kind / allow_once
+ *  option without touching any existing call site. */
+function makeEditReq(
+  p: string,
+  options: AcpPermissionOption[] = EDIT_OPTIONS.map((o) => ({ ...o })),
+): AcpRequestPermissionRequest {
   return {
     sessionId: 'session-1',
-    options: EDIT_OPTIONS.map((o) => ({ ...o })),
+    options,
     toolCall: {
       toolCallId: 'edit-1',
       title: `Approve edit: ${p}`,
@@ -2832,6 +2838,148 @@ describe('SessionController.resolveDiff — BHF-F1-3 (firm): junk hunk indices n
     controller.acceptWholeFileDiff('edit-1');
     const res = await pending;
     expect(res).toEqual(buildSelectedOutcome('allow_once'));
+  });
+});
+
+/**
+ * R3-SEC-01 (host half, defense-in-depth): `resolveDiff`/`respondApproval`
+ * must never put an id on the `approval.settle{outcome:'selected'}` wire
+ * that is not one of THAT approval's own options. Today `resolveDiff` falls
+ * back to the LITERAL `'deny'`/`'allow_once'` when the approval's own option
+ * set carries no option of that kind, and `respondApproval` never validates
+ * `optionId` against `pending.options` at all — either lets a non-option id
+ * reach the wire, which the webview's (T1-fixed) fail-safe now maps to
+ * `'interrupted'`, but the host itself should never manufacture the
+ * situation in the first place.
+ */
+describe('SessionController.resolveDiff / respondApproval — R3-SEC-01: approval.settle{selected} never carries a non-option id', () => {
+  const tmpDirs: string[] = [];
+  function makeTmpWs(): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'hermes-sc-r3sec01-ws-'));
+    tmpDirs.push(dir);
+    return dir;
+  }
+  afterEach(() => {
+    while (tmpDirs.length) {
+      const dir = tmpDirs.pop()!;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+
+  /** Mirrors the BHF-F1-3 suite's `makeHangingEditClient` verbatim. */
+  function makeHangingEditClient(): AcpClientLike {
+    const unused = (name: string): never => {
+      throw new Error(`unexpected call to AcpClientLike.${name} in an R3-SEC-01 test`);
+    };
+    return {
+      connect: async () => unused('connect'),
+      initialize: async () => unused('initialize'),
+      newSession: async () => unused('newSession'),
+      prompt: () => new Promise<never>(() => {}),
+      cancel: async () => undefined,
+      setSessionMode: async () => unused('setSessionMode'),
+      setSessionModel: async () => unused('setSessionModel'),
+      listSessions: async (): Promise<AcpListSessionsRawResult> => unused('listSessions'),
+      loadSession: async () => unused('loadSession'),
+      onExit: () => ({ dispose: () => {} }),
+      dispose: () => {},
+    };
+  }
+
+  /** Generalises the BHF-F1-3 suite's `makePendingEditApproval` (same idiom:
+   *  hanging client, real tmp ws, live turn) to accept a custom option set —
+   *  this suite's whole point is approvals whose option vocabulary lacks a
+   *  deny-kind or an `allow_once` option. */
+  async function makePendingEditApproval(options?: AcpPermissionOption[]) {
+    const ws = makeTmpWs();
+    const { port, emitted, logs } = makePort(ws);
+    const liveClientPort: SessionHostPort = { ...port, getClient: () => makeHangingEditClient() };
+    const controller = new SessionController('session-1', ws, liveClientPort);
+    controller.sendPrompt('edit it', 'default');
+    const pending = controller.handlePermission(makeEditReq('src/a.ts', options), 'appr-1');
+    await vi.waitFor(() => {
+      expect(emitted.some((m) => (m as { type?: string }).type === 'approval.request')).toBe(true);
+    });
+    return { controller, pending, emitted, logs };
+  }
+
+  const STILL_PENDING = Symbol('r3-sec-01-still-pending');
+
+  it('RED: reject with no deny-kind option settles CANCELLED — never a literal "deny" optionId', async () => {
+    const { controller, pending, emitted, logs } = await makePendingEditApproval([
+      { optionId: 'ok', kind: 'allow_once', name: 'OK' },
+    ]);
+
+    controller.resolveDiff('edit-1', 0, 'reject');
+
+    expect(emitted).toContainEqual({
+      type: 'approval.settle',
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      id: 'appr-1',
+      toolId: 'edit-1',
+      outcome: 'cancelled',
+    });
+    expect(emitted.some((m) => (m as { optionId?: string }).optionId === 'deny')).toBe(false);
+    const res = await pending;
+    expect(res).toEqual(buildCancelledOutcome());
+    expect(logs.some((l) => l.includes('no deny option'))).toBe(true);
+  });
+
+  it('RED: accept-all-hunks with no allow_once option leaves the approval pending — never a literal "allow_once" optionId', async () => {
+    const { controller, pending, emitted, logs } = await makePendingEditApproval([
+      { optionId: 'no', kind: 'reject_once', name: 'No' },
+    ]);
+
+    controller.resolveDiff('edit-1', 0, 'accept');
+
+    expect(emitted.some((m) => (m as { type?: string }).type === 'approval.settle')).toBe(false);
+    expect(logs.some((l) => l.includes('no allow_once option'))).toBe(true);
+
+    let outcome: unknown = STILL_PENDING;
+    void pending.then((r) => {
+      outcome = r;
+    });
+    await Promise.resolve();
+    expect(outcome).toBe(STILL_PENDING);
+
+    // Positive control: the card's own option ('no', kind 'deny' post-mapping)
+    // remains a fully live consent path.
+    controller.respondApproval('appr-1', 'no');
+    const res = await pending;
+    expect(res).toEqual(buildSelectedOutcome('no'));
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'approval.settle', outcome: 'selected', optionId: 'no' }),
+    );
+  });
+
+  it('RED: respondApproval refuses an optionId that names none of the approval\'s options — no settle, id never logged', async () => {
+    const { controller, pending, emitted, logs } = await makePendingEditApproval();
+
+    controller.respondApproval('appr-1', 'bogus');
+
+    expect(emitted.some((m) => (m as { type?: string }).type === 'approval.settle')).toBe(false);
+    expect(logs.some((l) => l.includes('ignoring unknown optionId'))).toBe(true);
+    expect(logs.some((l) => l.includes('bogus'))).toBe(false);
+
+    let outcome: unknown = STILL_PENDING;
+    void pending.then((r) => {
+      outcome = r;
+    });
+    await Promise.resolve();
+    expect(outcome).toBe(STILL_PENDING);
+
+    // Positive control: a real option id on the standard fixture still settles.
+    controller.respondApproval('appr-1', 'deny');
+    const res = await pending;
+    expect(res).toEqual(buildSelectedOutcome('deny'));
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'approval.settle', outcome: 'selected', optionId: 'deny' }),
+    );
   });
 });
 

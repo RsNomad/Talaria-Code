@@ -1,15 +1,9 @@
 // nextedit/config.ts — DATA ONLY. The on/off toggles live in the Guard's store (guard.ts).
 import * as vscode from 'vscode';
 import { isHttpUrl } from '../../shared/url';
-import type { NextEditTransportId } from './types';
+import type { HermesNextEditConfig, NextEditTransportId } from './types';
 
 const TRANSPORT_IDS: readonly NextEditTransportId[] = ['ollama', 'openai-compat'];
-
-export interface HermesNextEditConfig {
-  backend: NextEditTransportId;
-  endpoint: string;
-  model: string;
-}
 
 export function readNextEditConfig(): HermesNextEditConfig {
   const cfg = vscode.workspace.getConfiguration('talaria.nextEdit');

@@ -1,4 +1,4 @@
-import { MODAL_UNSAFE_TEXT_PATTERN } from '../../setup/SetupController';
+import { stripModalUnsafeText } from '../../setup/modalText';
 import type { McpAddParams, McpCatalogEntry } from '../../../shared/protocol';
 import { isRecord } from '../../../shared/typeGuards';
 import { CREDENTIAL_NAME_CORE } from '../../redactControlResponse';
@@ -330,21 +330,18 @@ export function validateMcpAdd(params: unknown): McpValidation {
 // ---------------------------------------------------------------------------
 
 /**
- * Strip-ONLY (never length-slices) variant of `SetupController`'s modal
- * character sanitizer, derived from the SAME single-source pattern
- * ({@link MODAL_UNSAFE_TEXT_PATTERN}, `SetupController.ts:559`) per the
- * CR-003 "do NOT hand-duplicate this class" rule — `new RegExp(x.source,
- * 'g')` re-uses the exact character class, so the two can never drift
- * apart. `redactForModal`'s 200-char slice (`MODAL_TEXT_MAX_LEN`,
- * `SetupController.ts:563, :598-601`) is deliberately NOT reused here: a
- * consent-modal DETAIL (command + args, or a full bootstrap script) is
- * exactly the disclosure the user must read in full before consenting, and
- * silently truncating it would defeat the modal's purpose.
+ * R3-ARCH-01: strip-ONLY (never length-slices) — delegates to `modalText.ts`'s
+ * `stripModalUnsafeText` (the LEAF; `MODAL_UNSAFE_CHARS` / `MODAL_TEXT_MAX_LEN`
+ * are its single source), instead of rebuilding a second `/g` regex off
+ * `MODAL_UNSAFE_TEXT_PATTERN.source` at module-init time — that rebuild was
+ * the TDZ/latent-cycle vector `control/` importing the `SetupController.ts`
+ * façade created. `redactForModal`'s 200-char slice is deliberately NOT
+ * reused here: a consent-modal DETAIL (command + args, or a full bootstrap
+ * script) is exactly the disclosure the user must read in full before
+ * consenting, and silently truncating it would defeat the modal's purpose.
  */
-const MODAL_CONTROL_PATTERN_G = new RegExp(MODAL_UNSAFE_TEXT_PATTERN.source, 'g');
-
 export function stripModalControls(text: string): string {
-  return text.replace(MODAL_CONTROL_PATTERN_G, '');
+  return stripModalUnsafeText(text);
 }
 
 /** Fail-closed ceiling for a composed consent DETAIL: past this we REFUSE the action outright — never truncate. */

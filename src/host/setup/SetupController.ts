@@ -53,7 +53,11 @@ import { errorMessage } from '../../shared/errorMessage';
 
 // --- WS-GD.2b B7: façade re-exports — these symbols now live in provisionRunner.ts /
 // modalText.ts / latchRegistry.ts; re-exported here so existing external import
-// paths (tests, skillsAdminHandler.ts, ControlDispatcher-side code) stay stable. ---
+// paths (tests) stay stable. R3-ARCH-01: `control/` (mcpEntryValidation.ts,
+// skillsAdminHandler.ts) now imports modalText.ts's stripModalUnsafeText /
+// redactForModal directly (the leaf), never through this façade — the
+// MODAL_UNSAFE_TEXT_PATTERN / redactForModal re-export below has no
+// remaining production importer, only tests. ---
 export { SETUP_DISPOSED_REFUSAL } from './latchRegistry';
 export { isHostSourcedModel, assertProvisionSources } from './provisionRunner';
 export { MODAL_UNSAFE_TEXT_PATTERN, redactForModal } from './modalText';

@@ -3,7 +3,7 @@ import type { DashboardAdminClient, DashboardClientLike } from '../../dashboard/
 import { hasHubNameCache } from '../../dashboard/dashboardPanelSources';
 import { stripModalControls, MODAL_DETAIL_MAX } from './mcpEntryValidation';
 import { assertSkillIdentifier, validateSkillCreate, TRUSTED_SKILL_PREFIXES } from './skillSourceGate';
-import { redactForModal } from '../../setup/SetupController';
+import { redactForModal } from '../../setup/modalText';
 import type { ConfigWriteTail } from './configWriteTail';
 import { runAdminOp, resolveDashboardAdminClient, pollActionUntilVerified, POLL_UNCONFIRMED_MESSAGE, TRUST_GATED_METHODS } from './adminOpRunner';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';

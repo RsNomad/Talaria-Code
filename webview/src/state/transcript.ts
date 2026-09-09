@@ -21,12 +21,12 @@ import {
   type TranscriptItem,
 } from '../types';
 import { handleSessionChange, sessionToTab } from './tabs';
-import { isDenyOptionKind } from './approvalOptions';
+import { selectedSettleToolStatus } from './approvalOptions';
 import { foldSessionScoped, foldTabScoped } from './scopedFold';
 import { foldPanelData } from './panelScopeFold';
 import { foldHydrate } from './hydrateFold';
 
-export { findOptionId, isDenyOptionKind } from './approvalOptions';
+export { findOptionId, isDenyOptionKind, classifySelectedOption } from './approvalOptions';
 export { reduceLocal } from './localReducer';
 export type { LocalAction } from './localReducer';
 
@@ -153,10 +153,10 @@ function deriveSettledToolStatus(
       return 'interrupted';
     case 'expired':
       return 'denied';
-    case 'selected': {
-      const chosenKind = approvalItem?.options.find((o) => o.id === msg.optionId)?.kind;
-      return isDenyOptionKind(chosenKind) ? 'denied' : 'approved';
-    }
+    case 'selected':
+      // R3-SEC-01: an absent approval item, an absent optionId, or an id that is not one
+      // of the approval's options all yield 'interrupted' — never 'approved'.
+      return selectedSettleToolStatus(approvalItem?.options ?? [], msg.optionId);
     // no default: the switch above covers all 4 members of `msg.outcome`
     // ('selected'|'cancelled'|'expired'|'superseded'), so every case DOES
     // return. This is a manual invariant, not one tsc verifies — the

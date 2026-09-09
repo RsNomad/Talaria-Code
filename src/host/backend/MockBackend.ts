@@ -270,13 +270,21 @@ export class MockBackend implements AgentBackend {
     const total = this.totalHunksFor(toolId);
     if (total === 0) return;
     if (action === 'reject') {
-      this.settleAndAdvance(parked, optionIdOfKind(parked.options, 'deny') ?? 'deny');
+      const denyId = optionIdOfKind(parked.options, 'deny');
+      // R3-SEC-01: never settle with a literal, non-option id — fixtures always carry a
+      // deny-kind option (unreachable here), and this mirrors the host's own invariant.
+      if (denyId === undefined) return;
+      this.settleAndAdvance(parked, denyId);
       return;
     }
     if (!Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= total) return;
     this.hunkDecisions.add(hunkIndex);
     if (this.hunkDecisions.size >= total) {
-      this.settleAndAdvance(parked, optionIdOfKind(parked.options, 'allow_once') ?? 'allow_once');
+      const allowId = optionIdOfKind(parked.options, 'allow_once');
+      // R3-SEC-01: fixtures always carry an allow_once option (unreachable here); mirrors
+      // the host's own invariant of never manufacturing a non-option settle id.
+      if (allowId === undefined) return;
+      this.settleAndAdvance(parked, allowId);
     }
   }
 
