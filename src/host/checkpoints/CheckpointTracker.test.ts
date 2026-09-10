@@ -1825,9 +1825,11 @@ describe('CheckpointTracker', () => {
 
     it('rejects the snapshot when the worktree walk wedges (fs never resolves) before any git subprocess, leaving currentBaselineId uncorrupted', async () => {
       await writeFile('a.txt', 'A1');
-      // Small budget so the wedged walk fails fast. gitTimeoutMs IS the scan
-      // deadline (I-1 reuses the same budget as the git ops).
-      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { gitTimeoutMs: 300 });
+      // Small SCAN budget so the wedged walk fails fast — set independently of
+      // gitTimeoutMs (left at its 15 s default) so the setup `git init` / first
+      // snapshot below keep full headroom on a loaded CI runner: the coupled
+      // 300 ms git budget is what SIGKILLed `git init --quiet` in CI.
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { scanDeadlineMs: 300 });
       await tracker.init();
       const ckpt1 = (await tracker.snapshot(1, 'first'))!; // real, succeeds
 
@@ -1843,7 +1845,9 @@ describe('CheckpointTracker', () => {
         .mockReturnValue(new Promise(() => undefined) as never);
 
       await writeFile('a.txt', 'A2-EDIT'); // give the (doomed) snapshot a real change
-      await expect(tracker.snapshot(2, 'second')).rejects.toBeInstanceOf(WorktreeScanTimeoutError);
+      const rejection = tracker.snapshot(2, 'second');
+      await expect(rejection).rejects.toBeInstanceOf(WorktreeScanTimeoutError);
+      await expect(rejection).rejects.toThrow(/300ms wall-clock deadline/); // the SCAN budget, not the 15 s git timeout
       readdirSpy.mockRestore();
 
       // C1-safe: the barrier rejected BEFORE write-tree, so no half-tree became
@@ -1860,9 +1864,10 @@ describe('CheckpointTracker', () => {
 
     it('rejects the snapshot when an ignore-file read wedges (fs.readFile on .gitignore/.hermesignore never resolves), leaving currentBaselineId uncorrupted (CF-17)', async () => {
       await writeFile('a.txt', 'A1');
-      // Small budget so the wedged read fails fast. gitTimeoutMs IS the scan
-      // deadline (I-1 reuses the same budget as the git ops).
-      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { gitTimeoutMs: 300 });
+      // Small SCAN budget so the wedged read fails fast — decoupled from
+      // gitTimeoutMs (15 s default) for the same CI-headroom reason as the
+      // sibling readdir test above.
+      const tracker = new CheckpointTracker(storageDir, workspaceRoot, { scanDeadlineMs: 300 });
       await tracker.init();
       const ckpt1 = (await tracker.snapshot(1, 'first'))!; // real, succeeds
 
@@ -1885,7 +1890,9 @@ describe('CheckpointTracker', () => {
       });
 
       await writeFile('a.txt', 'A2-EDIT'); // give the (doomed) snapshot a real change
-      await expect(tracker.snapshot(2, 'second')).rejects.toBeInstanceOf(WorktreeScanTimeoutError);
+      const rejection = tracker.snapshot(2, 'second');
+      await expect(rejection).rejects.toBeInstanceOf(WorktreeScanTimeoutError);
+      await expect(rejection).rejects.toThrow(/300ms wall-clock deadline/); // the SCAN budget, not the 15 s git timeout
       readFileSpy.mockRestore();
 
       // C1-safe: the barrier rejected BEFORE write-tree, so no half-tree became
