@@ -1,6 +1,7 @@
 import type {
   HostToWebview,
   ControlMethod,
+  CustomModeConfig,
   DataPanel,
   EditPolicyPreset,
   HydrateTabSeed,
@@ -92,6 +93,16 @@ export interface ControlDispatcherHostPort {
   getDashboard(): DashboardService | undefined;
   /** Surface a non-blocking warning to the user (`vscode.window.showWarningMessage`) — injected so this module stays vscode-free, mirroring every other extracted subsystem's DI posture. */
   showWarningMessage(message: string): void;
+  /**
+   * R4-ARCH-01: the `talaria.customModes` WORKSPACE read
+   * (`customModes.vscode.ts`'s `readCustomModes`) — injected, read at call
+   * time, so `control/sessionScopeActions.ts` never value-imports the vscode
+   * adapter: that transitive edge was the false-green in
+   * `policyAcpPurity.test.ts`'s direct-import scan. Same accessor posture as
+   * `showWarningMessage`/`isTrusted`; the R3-ARCH-02 `NextEditConfigReader`
+   * precedent. `control/controlHeadless.lock.test.ts` is the runtime proof.
+   */
+  readCustomModes(): CustomModeConfig[];
   /**
    * Task A5 (§3 Layer 5, §4.5): `() => vscode.workspace.isTrusted` — the
    * dispatcher-side trust gate for {@link TRUST_GATED_METHODS}, defense-in-

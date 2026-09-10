@@ -1,6 +1,5 @@
 import type { EditPolicyPreset, HydrateTabSeed, SlashCommandInfo } from '../../../shared/protocol';
 import { toCatalog, buildModeFloorSnapshot } from '../customModes';
-import { readCustomModes } from '../customModes.vscode';
 import type { SessionController } from '../session/SessionController';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
 import { errorMessage } from '../../../shared/errorMessage';
@@ -21,13 +20,17 @@ export type SessionScopePort = Pick<
   | 'logger'
   | 'loadSessionIntoTab'
   | 'isPendingClose'
+  | 'readCustomModes'
 >;
 
 /**
  * WS-GD.2a A9: the sessions-scope domain — pure move off `ControlDispatcher`
  * behind the same `ControlDispatcherHostPort` slice ({@link
  * SessionScopePort}). Zero behavior change — see each member's own doc
- * (moved verbatim) for the full rationale.
+ * (moved verbatim) for the full rationale. R4-ARCH-01: the `talaria.customModes`
+ * read is the injected `readCustomModes` port member (never a value-import of
+ * `../customModes.vscode`), so this module is genuinely headless-importable —
+ * `sessionScopeActions.test.ts` loads it with no vscode mock.
  */
 export class SessionScopeActions {
   constructor(private readonly port: SessionScopePort) {}
@@ -131,7 +134,7 @@ export class SessionScopeActions {
   setCustomMode(sessionId: string, modeId: string | null): void {
     const controller = this.port.sessions.get(sessionId);
     if (!controller) return;
-    const configs = readCustomModes();
+    const configs = this.port.readCustomModes();
     const config = modeId !== null ? configs.find((c) => c.id === modeId) : undefined;
     const resolvedModeId = config ? config.id : null;
     const snapshot = config ? buildModeFloorSnapshot(config) : undefined;
@@ -149,7 +152,8 @@ export class SessionScopeActions {
    * verbatim off `AcpBackend.handleCustomModesConfigChanged` — see the
    * original method's doc (unchanged); `vscode.window.showWarningMessage`
    * is now reached through the injected `showWarningMessage` port accessor
-   * so this module stays vscode-free.
+   * so this module stays vscode-free, and the settings re-read through
+   * `readCustomModes` (R4-ARCH-01).
    */
   handleCustomModesConfigChanged(): void {
     const affected = [...this.port.sessions.values()].filter((c) => c.activeCustomModeId !== null);
@@ -157,7 +161,7 @@ export class SessionScopeActions {
     this.port.showWarningMessage(
       "A custom mode's definition changed on disk. The active session keeps enforcing the previously-selected definition — re-select the mode to apply changes.",
     );
-    const available = toCatalog(readCustomModes());
+    const available = toCatalog(this.port.readCustomModes());
     for (const controller of affected) {
       this.port.emit({
         type: 'mode.state',

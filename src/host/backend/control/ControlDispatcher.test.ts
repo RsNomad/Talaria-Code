@@ -51,6 +51,7 @@ function makePort(overrides: Partial<ControlDispatcherHostPort> = {}): {
     getActiveSessionId: () => undefined,
     getDashboard: () => undefined,
     showWarningMessage: (_message) => {},
+    readCustomModes: () => [],
     isTrusted: () => true,
     confirm: async (_message, _detail, _actionLabel) => false,
     promptSecret: async (_prompt) => undefined,
