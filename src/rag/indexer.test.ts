@@ -227,10 +227,14 @@ async function drainUntil(until: () => boolean, capMs: number = WATCH_DRAIN_CAP_
   }
 }
 /** Fire the pending debounce, then drain real event-loop turns until `until`
- * observes the fire-and-forget handler's effect. */
+ * observes the fire-and-forget handler's effect — and then (FU-1) until the
+ * cycle's index I/O has SETTLED, so no caller can return with a manifest
+ * write still in flight (see the recorder's doc below for why a store-call
+ * predicate always implies exactly that). */
 async function flushWatch(debounceMs: number, until: () => boolean): Promise<void> {
   await vi.advanceTimersByTimeAsync(debounceMs);
   await drainUntil(until);
+  await settleIndexIo();
 }
 
 describe('TST-01 drain helper self-check (R4-TEST-01)', () => {
@@ -260,7 +264,8 @@ describe('TST-01 drain helper self-check (R4-TEST-01)', () => {
  * signal — instead of the file's content. The real rename still runs
  * (call-through), so the file on disk, and every POST-drain assertion (which
  * only runs after the build has settled, so there is no race there), are
- * unaffected.
+ * unaffected. FU-1 (R4 T7): the same wrappers now also count in-flight
+ * writes/renames — see `indexIo` below.
  *
  * `real`/`restore` are captured as LOCALS inside each `beforeEach`
  * invocation, not a shared outer `let` re-read at call time: several tests
@@ -276,26 +281,80 @@ describe('TST-01 drain helper self-check (R4-TEST-01)', () => {
  * terminating call chain down to the true `fs.rename`.
  */
 let renameCommits: Array<[string, string]>;
-let restoreRename: () => void;
+let restoreIndexIo: () => void;
+/**
+ * FU-1 (R4 T7): in-flight index I/O. Every `fs.writeFile`/`fs.rename` call
+ * issued by the indexer (the manifest's `.tmp` write + atomic rename, the
+ * meta sidecar's pair) increments `inFlight` when CALLED and decrements it
+ * when the real op SETTLES. Minted per `beforeEach` for the same reason
+ * `real` is (see above): a wrapper from an earlier test that settles late
+ * decrements ITS OWN stale counter, never the current test's.
+ *
+ * Why this exists: `gate.sink` invokes its op synchronously and the store
+ * mocks resolve in a microtask, so `handleFsEvent`'s terminal
+ * `writeManifest` (`watchPipeline.ts:253-254`, `purgeAndPersist:57-58`) has
+ * ALREADY issued `fs.writeFile(manifest.json.tmp)` by the time a drain
+ * predicate can observe the `upsert`/`deleteByPath` that preceded it. A
+ * test that returns on such a predicate ends with that write in flight; its
+ * describe's `afterEach` then `rmSync`s the workspace under an open `.tmp`
+ * (ENOTEMPTY/EBUSY — the test fails in the hook) and the cycle's rename
+ * fails ENOENT ("hermes-codebase: incremental reindex failed" through the
+ * default logger — on Linux it can land in a LATER test's console spy, the
+ * R2 P2 ARCH-3 class). `flushWatch` therefore settles this counter to 0
+ * before returning, and the file-level `afterEach` below asserts it — the
+ * rule "a watch test never ends mid-cycle" is mechanised, not remembered.
+ */
+let indexIo: { inFlight: number } = { inFlight: 0 };
+function indexIoSettled(): boolean {
+  return indexIo.inFlight === 0;
+}
+/** Drain real turns until every in-flight index write/rename has settled. */
+async function settleIndexIo(): Promise<void> {
+  await drainUntil(indexIoSettled);
+}
 beforeEach(() => {
   renameCommits = [];
-  const real = fs.rename;
+  const counter = { inFlight: 0 };
+  indexIo = counter;
+  const realRename = fs.rename;
+  const realWriteFile = fs.writeFile;
   fs.rename = (async (
     from: Parameters<typeof fs.rename>[0],
     to: Parameters<typeof fs.rename>[1],
   ): Promise<void> => {
-    // Record AFTER the real rename resolves, not before — a predicate must
-    // only see a rename that actually LANDED (the genuine atomic-commit
-    // signal), never one merely attempted (which could still reject).
-    await (real as typeof fs.rename)(from, to);
-    renameCommits.push([String(from), String(to)]);
+    counter.inFlight += 1;
+    try {
+      // Record AFTER the real rename resolves, not before — a predicate must
+      // only see a rename that actually LANDED (the genuine atomic-commit
+      // signal), never one merely attempted (which could still reject).
+      await (realRename as typeof fs.rename)(from, to);
+      renameCommits.push([String(from), String(to)]);
+    } finally {
+      counter.inFlight -= 1;
+    }
   }) as typeof fs.rename;
-  restoreRename = () => {
-    fs.rename = real;
+  fs.writeFile = (async (...args: Parameters<typeof fs.writeFile>): Promise<void> => {
+    counter.inFlight += 1;
+    try {
+      await (realWriteFile as typeof fs.writeFile)(...args);
+    } finally {
+      counter.inFlight -= 1;
+    }
+  }) as typeof fs.writeFile;
+  restoreIndexIo = () => {
+    fs.rename = realRename;
+    fs.writeFile = realWriteFile;
   };
 });
 afterEach(() => {
-  restoreRename();
+  const leaked = indexIo.inFlight;
+  restoreIndexIo();
+  expect(
+    leaked,
+    `FU-1: this test ended with ${leaked} index write/rename call(s) still in flight — its drain predicate observed an ` +
+      'INTERMEDIATE effect (a store call) instead of the cycle\'s terminal commit. Drive the cycle through flushWatch ' +
+      '(which settles index I/O) or await settleIndexIo() before the test returns; never let afterEach rmSync race a live write.',
+  ).toBe(0);
 });
 
 describe('createIndexer — secret-path filtering (W5-T6)', () => {
@@ -452,6 +511,7 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
     // observed; `upsert not called` then holds by construction (the secret
     // branch purges and returns, never reaching embed/upsert).
     await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === '.env'));
+    expect(indexIoSettled()).toBe(true); // FU-1: flushWatch settled the cycle's manifest write — nothing is in flight
 
     expect(upsertMock).not.toHaveBeenCalled();
     expect(deleteByPathMock).toHaveBeenCalledWith('.env');
@@ -470,6 +530,7 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
     onCreate({ fsPath: path.join(workspaceRoot, 'src/app.txt') });
 
     await flushWatch(10, () => upsertMock.mock.calls.length > 0);
+    expect(indexIoSettled()).toBe(true); // FU-1: flushWatch settled the cycle's manifest write — nothing is in flight
 
     expect(upsertMock).toHaveBeenCalled();
 
@@ -1166,6 +1227,9 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     // advance above; drain (no extra debounce advance) until build's own
     // reindex (1 upsert) plus the racing watch reindex (2nd upsert) both land.
     await drainUntil(() => upsertMock.mock.calls.length >= 2);
+    // FU-1: the 2nd upsert is the racing watch cycle's INTERMEDIATE effect —
+    // its writeManifest is in flight; settle before this test returns.
+    await settleIndexIo();
 
     expect(initMock).toHaveBeenCalledTimes(1); // at HEAD: 2 — both callers pass the un-set flag
     disposable.dispose();
