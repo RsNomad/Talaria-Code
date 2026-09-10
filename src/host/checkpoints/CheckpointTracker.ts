@@ -106,6 +106,18 @@ export interface CheckpointTrackerOptions {
    */
   gitTimeoutMs?: number;
   /**
+   * Wall-clock deadline (ms) for the pre-`write-tree` worktree scan
+   * (`scanWorktree`: the ignore-file reads + the directory walk — I-1 / CF-17).
+   * Defaults to {@link gitTimeoutMs} (one budget for the whole barrier, the
+   * I-1 design); `0`/negative disables the raced timer and leaves only the
+   * per-entry check (parity with `gitTimeoutMs: 0`). Set it INDEPENDENTLY
+   * when the scan must be bounded tightly without also starving the
+   * foreground git ops that share `gitTimeoutMs` (the setup `git init` and
+   * first snapshot of a test) — the CI-load coupling the wedged-walk tests
+   * hit. Production never sets either option.
+   */
+  scanDeadlineMs?: number;
+  /**
    * Debounce (ms) before the background alternate-object localization (`repack`)
    * runs off the snapshot barrier (corr-I1). Coalesces a burst of turns into one
    * repack. Default 500 ms (I-2: shortened from 2 s to shrink the durability
@@ -260,6 +272,7 @@ export class CheckpointTracker {
   private readonly lockStaleMs: number;
   private readonly lockMaxWaitMs: number;
   private readonly gitTimeoutMs: number;
+  private readonly scanDeadlineMs: number;
   private readonly localizeDebounceMs: number;
   private readonly gitSpawn: GitSpawn | undefined;
 
@@ -292,6 +305,7 @@ export class CheckpointTracker {
     this.lockStaleMs = options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS;
     this.lockMaxWaitMs = options.lockMaxWaitMs ?? DEFAULT_LOCK_MAX_WAIT_MS;
     this.gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
+    this.scanDeadlineMs = options.scanDeadlineMs ?? this.gitTimeoutMs;
     this.localizeDebounceMs = options.localizeDebounceMs ?? DEFAULT_LOCALIZE_DEBOUNCE_MS;
     this.gitSpawn = options.spawn;
 
@@ -1623,8 +1637,9 @@ export class CheckpointTracker {
    * before it — otherwise they'd be a deadline-free prefix that could hang the
    * barrier forever before the race even starts.
    *
-   * We bound the WHOLE scan with the SAME budget as the git ops
-   * ({@link gitTimeoutMs}) two ways, closing both the slow-but-progressing and
+   * We bound the WHOLE scan with the scan budget ({@link scanDeadlineMs} —
+   * by default the SAME budget as the git ops, {@link gitTimeoutMs}; a caller
+   * may decouple the two) two ways, closing both the slow-but-progressing and
    * the fully-wedged subsets:
    *  - a per-entry deadline check throws once `Date.now()` passes the deadline
    *    (bounds a scan that keeps resolving fs calls but too slowly / too many);
@@ -1646,7 +1661,7 @@ export class CheckpointTracker {
    * point.
    */
   private async scanWorktree(): Promise<string[]> {
-    const budgetMs = this.gitTimeoutMs;
+    const budgetMs = this.scanDeadlineMs;
     const deadline = budgetMs > 0 ? Date.now() + budgetMs : Number.POSITIVE_INFINITY;
     const checkDeadline = (): void => {
       if (Date.now() > deadline) {

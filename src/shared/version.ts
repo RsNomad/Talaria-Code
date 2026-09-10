@@ -8,4 +8,4 @@
  */
 export const EXTENSION_NAME = 'talaria-code';
 export const EXTENSION_TITLE = 'Talaria Code';
-export const EXTENSION_VERSION = '0.2.0';
+export const EXTENSION_VERSION = '0.3.0';
