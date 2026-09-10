@@ -731,16 +731,6 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  function makeD5Indexer(debounceMs = 5) {
-    return createIndexer({
-      workspaceRoot,
-      indexDir,
-      embedEndpoint: 'http://127.0.0.1:11434',
-      embedModel: 'test-model',
-      debounceMs,
-    });
-  }
-
   async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
     const abs = path.join(workspaceRoot, relPath);
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -754,61 +744,99 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
 
   it('two different files changing in the same debounce window both survive in the final manifest', async () => {
     // The real hazard D-5 names: `handleFsEvent` debounces PER PATH (each
-    // `uri.fsPath` gets its own timer, see indexer.ts's `timers` map), so two
-    // DIFFERENT files changing close together fire two independent, overlapping
-    // read-modify-write cycles over the SAME manifest.json. Without
-    // serialization this is a classic lost update: whichever cycle writes
-    // last wins, silently dropping the other's entry — even though neither
-    // cycle did anything wrong on its own.
+    // `uri.fsPath` gets its own timer, see watchPipeline.ts's `timers` map),
+    // so two DIFFERENT files changing close together fire two independent,
+    // overlapping read-modify-write cycles over the SAME manifest.json.
+    // Without serialization this is a classic lost update: whichever cycle
+    // writes last wins, silently dropping the other's entry — even though
+    // neither cycle did anything wrong on its own.
+    //
+    // R4-TEST-01 drive (deterministic, the CR-B ordering generalised):
+    //   1. fire a's debounce and drain until a is PARKED inside its
+    //      serialize() critical section — after its manifest read, at its
+    //      embed — on an explicit gate (no virtual time involved);
+    //   2. schedule b's debounce and fire it with an advance issued AFTER the
+    //      schedule (never rely on an advance nested inside a mock to fire a
+    //      timer scheduled after the outer advance returned — that was the
+    //      old shape, and it held only by a fake-timers implementation
+    //      detail). b's pre-serialize awaits are cache/memo hits by now, so b
+    //      is queued behind a before that advance returns — the two cycles
+    //      genuinely overlap;
+    //   3. release a; drain until BOTH commits land.
+    // Under a broken RMW this ordering is a guaranteed lost update: b holds
+    // the stale manifest and is the LAST writer (mutations m1/m2 in the R4
+    // plan), so the two `toBeDefined` assertions below have real teeth.
     await writeWorkspaceFile('a.txt', 'file a content\n');
     await writeWorkspaceFile('b.txt', 'file b content\n');
 
-    const indexer = makeD5Indexer();
+    // Per-indexer logger (the ARCH-3 idiom): a cycle that FAILS (e.g. a
+    // replace-rename sharing violation on a Windows dev box — see the B1a
+    // recorder note above) must fail this test FAST with its own log line,
+    // never spin to drainUntil's cap masquerading as a hang.
+    const logSpy = vi.fn();
+    const indexer = createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs: 5,
+      logger: logSpy,
+    });
     const disposable = indexer.watch();
 
-    // Force file a's embed call (the first one issued) to resolve well after
-    // file b's entire cycle would finish on its own — this is what makes the
-    // interleaving deterministic instead of a timing-dependent flake. It
-    // does not touch b's embed call; the mock reverts to its normal fast
-    // implementation for every call after this one.
-    embedMock.mockImplementationOnce(async (texts: string[]) => {
-      // KEEP (TST-01 #3): this nested tickAsync self-drives its own 80ms
-      // range (validated); do NOT convert to a real setTimeout — a setTimeout
-      // delay never fires under the advanceTimersByTimeAsync(0) drain.
-      await vi.advanceTimersByTimeAsync(80);
+    // Persistent + content-keyed (NOT mockImplementationOnce — the once-queue
+    // is shared across this whole file, see the A5 note further down): ONLY
+    // the embed call carrying a.txt's own chunk parks; b's call passes
+    // straight through. Restored in `finally`.
+    const A_CONTENT = 'file a content';
+    let releaseA!: () => void;
+    const aEmbedGate = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    embedMock.mockImplementation(async (texts: string[]) => {
+      if (texts.some((t) => t.includes(A_CONTENT))) await aEmbedGate;
       return texts.map(() => [0.1, 0.2, 0.3]);
     });
+    const aEmbedCalled = (): boolean =>
+      embedMock.mock.calls.some(([texts]) => texts.some((t) => t.includes(A_CONTENT)));
 
-    const onChange = fsWatcherListeners.change[0]!;
-    onChange({ fsPath: path.join(workspaceRoot, 'a.txt') });
-    // b's event fires after a's debounce timer has already started (and,
-    // shortly after, a's slow embed call) — so if the two cycles were NOT
-    // serialized, b's fast cycle would finish and write first, and a's slow
-    // cycle would finish later and overwrite b's entry with a stale
-    // manifest that never saw it.
-    // KEEP (TST-01 #4): sequences a's debounce ahead of b; leave as a
-    // virtual-time advance.
-    await vi.advanceTimersByTimeAsync(20);
-    onChange({ fsPath: path.join(workspaceRoot, 'b.txt') });
+    try {
+      const onChange = fsWatcherListeners.change[0]!;
+      onChange({ fsPath: path.join(workspaceRoot, 'a.txt') });
+      // Step 1: a's debounce was scheduled BEFORE this advance; fire it and
+      // drain real turns until a is parked at its embed.
+      await flushWatch(5, aEmbedCalled);
+      expect(aEmbedCalled()).toBe(true);
 
-    // b's debounce timer was already fired by a's nested-80 advance above;
-    // drain (no extra debounce advance) until both serialize()-ordered
-    // cycles have written their entries. B1a: anchor on the WRITE COMMIT
-    // itself (the `fs.rename` call `writeManifest` makes) rather than
-    // reading the live manifest.json file — that read is exactly what raced
-    // production's own in-flight rename on this dev box (see the recorder's
-    // doc comment above). Each cycle's success path calls `writeManifest`
-    // exactly once, so two renames to `manifestPath` means both cycles'
-    // entries have actually landed on disk.
-    const manifestPath = path.join(indexDir, 'manifest.json');
-    await drainUntil(() => renameCommits.filter(([, to]) => to === manifestPath).length >= 2);
+      // Step 2: with a parked mid-section, b's event arrives. Schedule, THEN
+      // advance — b's timer is due at now+5, inside this advance's range.
+      onChange({ fsPath: path.join(workspaceRoot, 'b.txt') });
+      await vi.advanceTimersByTimeAsync(5);
+      expect(logSpy).not.toHaveBeenCalled();
 
-    const manifest = await readManifest();
-    expect(manifest['a.txt']).toBeDefined();
-    expect(manifest['b.txt']).toBeDefined();
+      // Step 3: release a; both serialize()-ordered cycles now run to their
+      // commits. B1a: anchor on the WRITE COMMIT itself (the `fs.rename`
+      // `writeManifest` makes), never on reading the live manifest.json.
+      releaseA();
+      const manifestPath = path.join(indexDir, 'manifest.json');
+      await drainUntil(() => {
+        if (logSpy.mock.calls.length > 0) {
+          throw new Error(
+            `D-5: a watch cycle FAILED (not hung): ${logSpy.mock.calls.map((call) => String(call[0])).join(' | ')}`,
+          );
+        }
+        return renameCommits.filter(([, to]) => to === manifestPath).length >= 2;
+      });
 
-    disposable.dispose();
-    indexer.dispose();
+      const manifest = await readManifest();
+      expect(manifest['a.txt']).toBeDefined();
+      expect(manifest['b.txt']).toBeDefined();
+    } finally {
+      releaseA();
+      disposable.dispose();
+      indexer.dispose();
+      embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    }
   });
 });
 
@@ -1132,7 +1160,7 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     const disposable = indexer.watch();
 
     const buildPromise = indexer.build(); // enters ensureStoreInitialized, parks on the slow init
-    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') }); // fires ~5ms in, while init is pending
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') }); // fires ~5ms in, while init is pending. KEEP this BEFORE `await buildPromise` (R4-TEST-01): the racing debounce must be scheduled BEFORE the advance that fires it (init's nested-100) — reordering it after would recreate the D-5 shape.
     await buildPromise;
     // The racing watch debounce was already fired by the init's nested-100
     // advance above; drain (no extra debounce advance) until build's own
