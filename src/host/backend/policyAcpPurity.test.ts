@@ -40,6 +40,17 @@ import { collectNonTestTsSources, VSCODE_IMPORT_BAN, FS_IMPORT_BAN } from '../pu
  * bans further down — those are narrower invariants specific to policy/acp's
  * own OS-seam allowlists, not part of what "extend ROOTS" asks for here.
  */
+
+/**
+ * R4-ARCH-01: every scan in this file is a DIRECT-import text scan — it
+ * cannot see a value-import of a neighbour that itself imports `vscode`
+ * (`control/sessionScopeActions.ts` → `customModes.ts` was exactly that
+ * false-green). Transitive headless-importability of `control/` is proven
+ * at RUNTIME by `control/controlHeadless.lock.test.ts` (every module
+ * value-imported with no vscode mock); this file stays the cheap first line.
+ * The scans below are byte-identical to before (R2: "catch exactly what they
+ * caught before").
+ */
 const ROOTS = ['policy', 'acp', 'connection', 'control'];
 
 /**

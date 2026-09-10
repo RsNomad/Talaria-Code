@@ -195,27 +195,53 @@ afterEach(() => {
 // perturb any time-ordering assertion -- it only hands the real event loop one
 // more turn. drainUntil loops it until the caller's predicate observes the
 // handler's real effect: it waits EXACTLY as many turns as the I/O needs, on
-// any platform. The cap only trips on a genuine hang (a wrong predicate or a
-// handler that never produces the awaited effect), turning an infinite hang
-// into a fast, legible failure.
-const WATCH_DRAIN_CAP = 5000;
-async function drainUntil(until: () => boolean): Promise<void> {
-  for (let i = 0; i < WATCH_DRAIN_CAP; i++) {
-    if (until()) return;
+// any platform.
+//
+// R4-TEST-01: the cap is REAL wall-clock time, not a turn count. One drain
+// turn is one `setImmediate` hop (that is what the async tick yields on Node:
+// the bundled fake-timers' `originalSetTimeout` IS `setImmediate`), so the old
+// 5000-turn cap was a budget of only ~25-50 ms of wall time. A two-cycle
+// watch drain needs ~20 SEQUENTIAL real-fs ops; a loaded threadpool, an AV
+// scan of the fresh temp dir, or a contended CI runner stalls ONE of them for
+// longer than that, and the cap tripped with a message blaming "a real hang"
+// (the D-5 flake). Wall-clock bounds what the turn count only approximated;
+// 4 s is deliberately below vitest's 5 s testTimeout so a genuine hang still
+// fails with THIS message, not vitest's. The message names every harness
+// cause it can have, because none of them is a production defect.
+const WATCH_DRAIN_CAP_MS = 4000;
+async function drainUntil(until: () => boolean, capMs: number = WATCH_DRAIN_CAP_MS): Promise<void> {
+  const startedAt = vi.getRealSystemTime();
+  let turns = 0;
+  while (!until()) {
+    const elapsedMs = vi.getRealSystemTime() - startedAt;
+    if (elapsedMs > capMs) {
+      throw new Error(
+        `drainUntil: the awaited condition never held within ${capMs} ms of real time (${turns} drain turns). ` +
+          'This is a TEST-HARNESS drive failure, not evidence of a production hang: the predicate can never be ' +
+          'satisfied, a timer was scheduled AFTER the advance meant to fire it, a fire-and-forget cycle FAILED ' +
+          "(check the indexer's injected logger), or the real-fs chain is starved under load.",
+      );
+    }
     await vi.advanceTimersByTimeAsync(0);
+    turns += 1;
   }
-  throw new Error(
-    'drainUntil: watch handler did not settle within ' +
-      WATCH_DRAIN_CAP +
-      ' drain turns -- the awaited condition never held (a real hang, or a wrong until() predicate).',
-  );
 }
 /** Fire the pending debounce, then drain real event-loop turns until `until`
- * observes the fire-and-forget handler's effect. */
+ * observes the fire-and-forget handler's effect — and then (FU-1) until the
+ * cycle's index I/O has SETTLED, so no caller can return with a manifest
+ * write still in flight (see the recorder's doc below for why a store-call
+ * predicate always implies exactly that). */
 async function flushWatch(debounceMs: number, until: () => boolean): Promise<void> {
   await vi.advanceTimersByTimeAsync(debounceMs);
   await drainUntil(until);
+  await settleIndexIo();
 }
+
+describe('TST-01 drain helper self-check (R4-TEST-01)', () => {
+  it('drainUntil: a never-satisfied predicate trips the REAL-time cap fast and names a harness failure, not a production hang', async () => {
+    await expect(drainUntil(() => false, 20)).rejects.toThrow(/TEST-HARNESS drive failure/);
+  });
+});
 
 /**
  * B1a: production's `writeManifest` writes via a same-dir `.tmp` file then
@@ -238,7 +264,8 @@ async function flushWatch(debounceMs: number, until: () => boolean): Promise<voi
  * signal — instead of the file's content. The real rename still runs
  * (call-through), so the file on disk, and every POST-drain assertion (which
  * only runs after the build has settled, so there is no race there), are
- * unaffected.
+ * unaffected. FU-1 (R4 T7): the same wrappers now also count in-flight
+ * writes/renames — see `indexIo` below.
  *
  * `real`/`restore` are captured as LOCALS inside each `beforeEach`
  * invocation, not a shared outer `let` re-read at call time: several tests
@@ -254,26 +281,80 @@ async function flushWatch(debounceMs: number, until: () => boolean): Promise<voi
  * terminating call chain down to the true `fs.rename`.
  */
 let renameCommits: Array<[string, string]>;
-let restoreRename: () => void;
+let restoreIndexIo: () => void;
+/**
+ * FU-1 (R4 T7): in-flight index I/O. Every `fs.writeFile`/`fs.rename` call
+ * issued by the indexer (the manifest's `.tmp` write + atomic rename, the
+ * meta sidecar's pair) increments `inFlight` when CALLED and decrements it
+ * when the real op SETTLES. Minted per `beforeEach` for the same reason
+ * `real` is (see above): a wrapper from an earlier test that settles late
+ * decrements ITS OWN stale counter, never the current test's.
+ *
+ * Why this exists: `gate.sink` invokes its op synchronously and the store
+ * mocks resolve in a microtask, so `handleFsEvent`'s terminal
+ * `writeManifest` (`watchPipeline.ts:253-254`, `purgeAndPersist:57-58`) has
+ * ALREADY issued `fs.writeFile(manifest.json.tmp)` by the time a drain
+ * predicate can observe the `upsert`/`deleteByPath` that preceded it. A
+ * test that returns on such a predicate ends with that write in flight; its
+ * describe's `afterEach` then `rmSync`s the workspace under an open `.tmp`
+ * (ENOTEMPTY/EBUSY — the test fails in the hook) and the cycle's rename
+ * fails ENOENT ("hermes-codebase: incremental reindex failed" through the
+ * default logger — on Linux it can land in a LATER test's console spy, the
+ * R2 P2 ARCH-3 class). `flushWatch` therefore settles this counter to 0
+ * before returning, and the file-level `afterEach` below asserts it — the
+ * rule "a watch test never ends mid-cycle" is mechanised, not remembered.
+ */
+let indexIo: { inFlight: number } = { inFlight: 0 };
+function indexIoSettled(): boolean {
+  return indexIo.inFlight === 0;
+}
+/** Drain real turns until every in-flight index write/rename has settled. */
+async function settleIndexIo(): Promise<void> {
+  await drainUntil(indexIoSettled);
+}
 beforeEach(() => {
   renameCommits = [];
-  const real = fs.rename;
+  const counter = { inFlight: 0 };
+  indexIo = counter;
+  const realRename = fs.rename;
+  const realWriteFile = fs.writeFile;
   fs.rename = (async (
     from: Parameters<typeof fs.rename>[0],
     to: Parameters<typeof fs.rename>[1],
   ): Promise<void> => {
-    // Record AFTER the real rename resolves, not before — a predicate must
-    // only see a rename that actually LANDED (the genuine atomic-commit
-    // signal), never one merely attempted (which could still reject).
-    await (real as typeof fs.rename)(from, to);
-    renameCommits.push([String(from), String(to)]);
+    counter.inFlight += 1;
+    try {
+      // Record AFTER the real rename resolves, not before — a predicate must
+      // only see a rename that actually LANDED (the genuine atomic-commit
+      // signal), never one merely attempted (which could still reject).
+      await (realRename as typeof fs.rename)(from, to);
+      renameCommits.push([String(from), String(to)]);
+    } finally {
+      counter.inFlight -= 1;
+    }
   }) as typeof fs.rename;
-  restoreRename = () => {
-    fs.rename = real;
+  fs.writeFile = (async (...args: Parameters<typeof fs.writeFile>): Promise<void> => {
+    counter.inFlight += 1;
+    try {
+      await (realWriteFile as typeof fs.writeFile)(...args);
+    } finally {
+      counter.inFlight -= 1;
+    }
+  }) as typeof fs.writeFile;
+  restoreIndexIo = () => {
+    fs.rename = realRename;
+    fs.writeFile = realWriteFile;
   };
 });
 afterEach(() => {
-  restoreRename();
+  const leaked = indexIo.inFlight;
+  restoreIndexIo();
+  expect(
+    leaked,
+    `FU-1: this test ended with ${leaked} index write/rename call(s) still in flight — its drain predicate observed an ` +
+      'INTERMEDIATE effect (a store call) instead of the cycle\'s terminal commit. Drive the cycle through flushWatch ' +
+      '(which settles index I/O) or await settleIndexIo() before the test returns; never let afterEach rmSync race a live write.',
+  ).toBe(0);
 });
 
 describe('createIndexer — secret-path filtering (W5-T6)', () => {
@@ -430,6 +511,7 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
     // observed; `upsert not called` then holds by construction (the secret
     // branch purges and returns, never reaching embed/upsert).
     await flushWatch(10, () => deleteByPathMock.mock.calls.some(([p]) => p === '.env'));
+    expect(indexIoSettled()).toBe(true); // FU-1: flushWatch settled the cycle's manifest write — nothing is in flight
 
     expect(upsertMock).not.toHaveBeenCalled();
     expect(deleteByPathMock).toHaveBeenCalledWith('.env');
@@ -448,6 +530,7 @@ describe('createIndexer — secret-path filtering (W5-T6)', () => {
     onCreate({ fsPath: path.join(workspaceRoot, 'src/app.txt') });
 
     await flushWatch(10, () => upsertMock.mock.calls.length > 0);
+    expect(indexIoSettled()).toBe(true); // FU-1: flushWatch settled the cycle's manifest write — nothing is in flight
 
     expect(upsertMock).toHaveBeenCalled();
 
@@ -709,16 +792,6 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  function makeD5Indexer(debounceMs = 5) {
-    return createIndexer({
-      workspaceRoot,
-      indexDir,
-      embedEndpoint: 'http://127.0.0.1:11434',
-      embedModel: 'test-model',
-      debounceMs,
-    });
-  }
-
   async function writeWorkspaceFile(relPath: string, content: string): Promise<void> {
     const abs = path.join(workspaceRoot, relPath);
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -732,61 +805,99 @@ describe('D-5: manifest read-modify-write is serialized under concurrent events'
 
   it('two different files changing in the same debounce window both survive in the final manifest', async () => {
     // The real hazard D-5 names: `handleFsEvent` debounces PER PATH (each
-    // `uri.fsPath` gets its own timer, see indexer.ts's `timers` map), so two
-    // DIFFERENT files changing close together fire two independent, overlapping
-    // read-modify-write cycles over the SAME manifest.json. Without
-    // serialization this is a classic lost update: whichever cycle writes
-    // last wins, silently dropping the other's entry — even though neither
-    // cycle did anything wrong on its own.
+    // `uri.fsPath` gets its own timer, see watchPipeline.ts's `timers` map),
+    // so two DIFFERENT files changing close together fire two independent,
+    // overlapping read-modify-write cycles over the SAME manifest.json.
+    // Without serialization this is a classic lost update: whichever cycle
+    // writes last wins, silently dropping the other's entry — even though
+    // neither cycle did anything wrong on its own.
+    //
+    // R4-TEST-01 drive (deterministic, the CR-B ordering generalised):
+    //   1. fire a's debounce and drain until a is PARKED inside its
+    //      serialize() critical section — after its manifest read, at its
+    //      embed — on an explicit gate (no virtual time involved);
+    //   2. schedule b's debounce and fire it with an advance issued AFTER the
+    //      schedule (never rely on an advance nested inside a mock to fire a
+    //      timer scheduled after the outer advance returned — that was the
+    //      old shape, and it held only by a fake-timers implementation
+    //      detail). b's pre-serialize awaits are cache/memo hits by now, so b
+    //      is queued behind a before that advance returns — the two cycles
+    //      genuinely overlap;
+    //   3. release a; drain until BOTH commits land.
+    // Under a broken RMW this ordering is a guaranteed lost update: b holds
+    // the stale manifest and is the LAST writer (mutations m1/m2 in the R4
+    // plan), so the two `toBeDefined` assertions below have real teeth.
     await writeWorkspaceFile('a.txt', 'file a content\n');
     await writeWorkspaceFile('b.txt', 'file b content\n');
 
-    const indexer = makeD5Indexer();
+    // Per-indexer logger (the ARCH-3 idiom): a cycle that FAILS (e.g. a
+    // replace-rename sharing violation on a Windows dev box — see the B1a
+    // recorder note above) must fail this test FAST with its own log line,
+    // never spin to drainUntil's cap masquerading as a hang.
+    const logSpy = vi.fn();
+    const indexer = createIndexer({
+      workspaceRoot,
+      indexDir,
+      embedEndpoint: 'http://127.0.0.1:11434',
+      embedModel: 'test-model',
+      debounceMs: 5,
+      logger: logSpy,
+    });
     const disposable = indexer.watch();
 
-    // Force file a's embed call (the first one issued) to resolve well after
-    // file b's entire cycle would finish on its own — this is what makes the
-    // interleaving deterministic instead of a timing-dependent flake. It
-    // does not touch b's embed call; the mock reverts to its normal fast
-    // implementation for every call after this one.
-    embedMock.mockImplementationOnce(async (texts: string[]) => {
-      // KEEP (TST-01 #3): this nested tickAsync self-drives its own 80ms
-      // range (validated); do NOT convert to a real setTimeout — a setTimeout
-      // delay never fires under the advanceTimersByTimeAsync(0) drain.
-      await vi.advanceTimersByTimeAsync(80);
+    // Persistent + content-keyed (NOT mockImplementationOnce — the once-queue
+    // is shared across this whole file, see the A5 note further down): ONLY
+    // the embed call carrying a.txt's own chunk parks; b's call passes
+    // straight through. Restored in `finally`.
+    const A_CONTENT = 'file a content';
+    let releaseA!: () => void;
+    const aEmbedGate = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    embedMock.mockImplementation(async (texts: string[]) => {
+      if (texts.some((t) => t.includes(A_CONTENT))) await aEmbedGate;
       return texts.map(() => [0.1, 0.2, 0.3]);
     });
+    const aEmbedCalled = (): boolean =>
+      embedMock.mock.calls.some(([texts]) => texts.some((t) => t.includes(A_CONTENT)));
 
-    const onChange = fsWatcherListeners.change[0]!;
-    onChange({ fsPath: path.join(workspaceRoot, 'a.txt') });
-    // b's event fires after a's debounce timer has already started (and,
-    // shortly after, a's slow embed call) — so if the two cycles were NOT
-    // serialized, b's fast cycle would finish and write first, and a's slow
-    // cycle would finish later and overwrite b's entry with a stale
-    // manifest that never saw it.
-    // KEEP (TST-01 #4): sequences a's debounce ahead of b; leave as a
-    // virtual-time advance.
-    await vi.advanceTimersByTimeAsync(20);
-    onChange({ fsPath: path.join(workspaceRoot, 'b.txt') });
+    try {
+      const onChange = fsWatcherListeners.change[0]!;
+      onChange({ fsPath: path.join(workspaceRoot, 'a.txt') });
+      // Step 1: a's debounce was scheduled BEFORE this advance; fire it and
+      // drain real turns until a is parked at its embed.
+      await flushWatch(5, aEmbedCalled);
+      expect(aEmbedCalled()).toBe(true);
 
-    // b's debounce timer was already fired by a's nested-80 advance above;
-    // drain (no extra debounce advance) until both serialize()-ordered
-    // cycles have written their entries. B1a: anchor on the WRITE COMMIT
-    // itself (the `fs.rename` call `writeManifest` makes) rather than
-    // reading the live manifest.json file — that read is exactly what raced
-    // production's own in-flight rename on this dev box (see the recorder's
-    // doc comment above). Each cycle's success path calls `writeManifest`
-    // exactly once, so two renames to `manifestPath` means both cycles'
-    // entries have actually landed on disk.
-    const manifestPath = path.join(indexDir, 'manifest.json');
-    await drainUntil(() => renameCommits.filter(([, to]) => to === manifestPath).length >= 2);
+      // Step 2: with a parked mid-section, b's event arrives. Schedule, THEN
+      // advance — b's timer is due at now+5, inside this advance's range.
+      onChange({ fsPath: path.join(workspaceRoot, 'b.txt') });
+      await vi.advanceTimersByTimeAsync(5);
+      expect(logSpy).not.toHaveBeenCalled();
 
-    const manifest = await readManifest();
-    expect(manifest['a.txt']).toBeDefined();
-    expect(manifest['b.txt']).toBeDefined();
+      // Step 3: release a; both serialize()-ordered cycles now run to their
+      // commits. B1a: anchor on the WRITE COMMIT itself (the `fs.rename`
+      // `writeManifest` makes), never on reading the live manifest.json.
+      releaseA();
+      const manifestPath = path.join(indexDir, 'manifest.json');
+      await drainUntil(() => {
+        if (logSpy.mock.calls.length > 0) {
+          throw new Error(
+            `D-5: a watch cycle FAILED (not hung): ${logSpy.mock.calls.map((call) => String(call[0])).join(' | ')}`,
+          );
+        }
+        return renameCommits.filter(([, to]) => to === manifestPath).length >= 2;
+      });
 
-    disposable.dispose();
-    indexer.dispose();
+      const manifest = await readManifest();
+      expect(manifest['a.txt']).toBeDefined();
+      expect(manifest['b.txt']).toBeDefined();
+    } finally {
+      releaseA();
+      disposable.dispose();
+      indexer.dispose();
+      embedMock.mockImplementation(async (texts: string[]) => texts.map(() => [0.1, 0.2, 0.3]));
+    }
   });
 });
 
@@ -1110,12 +1221,15 @@ describe('AUDIT-5 Task 1: the handleFsEvent gate (ARCH-1/2/3/5 + CR-B)', () => {
     const disposable = indexer.watch();
 
     const buildPromise = indexer.build(); // enters ensureStoreInitialized, parks on the slow init
-    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') }); // fires ~5ms in, while init is pending
+    fsWatcherListeners.change[0]!({ fsPath: path.join(workspaceRoot, 'src', 'app.txt') }); // fires ~5ms in, while init is pending. KEEP this BEFORE `await buildPromise` (R4-TEST-01): the racing debounce must be scheduled BEFORE the advance that fires it (init's nested-100) — reordering it after would recreate the D-5 shape.
     await buildPromise;
     // The racing watch debounce was already fired by the init's nested-100
     // advance above; drain (no extra debounce advance) until build's own
     // reindex (1 upsert) plus the racing watch reindex (2nd upsert) both land.
     await drainUntil(() => upsertMock.mock.calls.length >= 2);
+    // FU-1: the 2nd upsert is the racing watch cycle's INTERMEDIATE effect —
+    // its writeManifest is in flight; settle before this test returns.
+    await settleIndexIo();
 
     expect(initMock).toHaveBeenCalledTimes(1); // at HEAD: 2 — both callers pass the un-set flag
     disposable.dispose();

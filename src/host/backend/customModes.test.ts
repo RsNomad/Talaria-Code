@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 /**
- * W4-T4b — `customModes.ts` is the vscode-boundary read for SF-2 (§4.1/§4.3).
+ * W4-T4b — `customModes.vscode.ts` is the vscode-boundary read for SF-2
+ * (§4.1/§4.3); since R4-ARCH-01 the validation, warning text and shapers it
+ * delegates to live in the vscode-free core `customModes.ts` and are
+ * exercised END-TO-END through the adapter below — this file's assertion
+ * set is byte-identical to the pre-split file (characterization lock).
  * `vscode` isn't resolvable outside the extension host, so it's mocked here,
  * independent of `AcpBackend.test.ts`'s own mock (each test file owns its
  * module graph). The mock exposes two mutable seams mirroring VS Code's real
@@ -33,7 +37,8 @@ vi.mock('vscode', () => {
 });
 
 import * as vscode from 'vscode';
-import { readCustomModes, toCatalog, buildModeFloorSnapshot } from './customModes';
+import { readCustomModes } from './customModes.vscode';
+import { toCatalog, buildModeFloorSnapshot } from './customModes';
 
 const mockWorkspace = vscode.workspace as unknown as {
   __workspaceValue: unknown;

@@ -1,7 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
-/** `ControlDispatcher.ts` pulls in `./customModes.ts`, which imports `vscode` at module scope — same `vi.mock` as `ControlDispatcher.golden.admin.test.ts`. */
-vi.mock('vscode', () => ({}));
+// R4-ARCH-01: no `vi.mock('vscode')` here — `control/` is headless-importable
+// (the settings read is an injected port member); `controlHeadless.lock.test.ts`
+// is the tier-wide proof and this file's plain import is another.
 
 import { ControlDispatcher } from './ControlDispatcher';
 import { makePort, registerMcpSourceWithNames, makeFakeAdminClient, makeFakeDashboard } from './ControlDispatcher.golden.harness';

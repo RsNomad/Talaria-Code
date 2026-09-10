@@ -66,7 +66,8 @@ import { SessionController } from './session/SessionController';
 import { SessionRegistry } from './session/SessionRegistry';
 import type { SessionHostPort } from './session/types';
 import type { EditPreviewRegistry } from '../preview/EditPreviewRegistry';
-import { readCustomModes, toCatalog } from './customModes';
+import { toCatalog } from './customModes';
+import { readCustomModes } from './customModes.vscode';
 import { OneShotRunner, type OneShotHostPort } from './oneshot/OneShotRunner';
 import {
   OneShotSessionRegistry,
@@ -592,6 +593,10 @@ export class AcpBackend implements AgentBackend {
       showWarningMessage: (message) => {
         void vscode.window.showWarningMessage(message);
       },
+      // R4-ARCH-01: the vscode-bound settings read, injected so the
+      // dispatcher's sessions-scope domain stays headless — see
+      // `ControlDispatcherHostPort.readCustomModes`.
+      readCustomModes: () => readCustomModes(),
       // Task A5 (§3 Layer 5, §4.5): the dispatcher-side trust gate — a
       // call-time read (never cached), so a mid-session trust upgrade
       // (`workspace.onDidGrantWorkspaceTrust`) is picked up immediately.
