@@ -1,21 +1,25 @@
-import * as vscode from 'vscode';
 import type { CustomModeConfig, CustomModeInfo } from '../../shared/protocol';
 import type { ModeFloor } from './policy/editPolicy';
 
 /**
- * W4-T4b — the vscode-boundary read for SF-2 custom modes. This is
- * the ONLY module that reads/validates `talaria.customModes`; the pure engine
- * (`policy/editPolicy.ts`) never imports `vscode` and only ever consumes the
- * {@link ModeFloor} snapshot {@link buildModeFloorSnapshot} produces here.
- * Mirrors `src/autocomplete/config.ts`'s read pattern.
+ * W4-T4b — the SF-2 custom-modes CORE, vscode-free since R4-ARCH-01:
+ * validation of the raw `talaria.customModes` value, the rule-ingest
+ * warnings' text, the {@link ModeFloor} snapshot builder and the wire
+ * catalog projection. The ONE vscode-bound operation — reading the
+ * workspace setting and surfacing a warning toast — lives in the thin
+ * adapter `customModes.vscode.ts` (`readCustomModes`), which hands the raw
+ * value and a warning SINK into {@link parseCustomModes} here. The pure
+ * engine (`policy/editPolicy.ts`) never imports `vscode` and only ever
+ * consumes the snapshot {@link buildModeFloorSnapshot} produces. This split
+ * is what lets `control/sessionScopeActions.ts` value-import the two
+ * shapers below without dragging `vscode` onto the headless `control/`
+ * tier (`control/controlHeadless.lock.test.ts`).
  */
-
-const CUSTOM_MODES_SECTION = 'talaria.customModes';
 
 /**
  * §4.3 mitigation 3 (defense-in-depth ONLY — the primary self-widening
  * mitigations are snapshot-on-activate + require-re-select, both in
- * `AcpBackend`; see the module doc there). Always appended to `deny` for
+ * `control/sessionScopeActions.ts`). Always appended to `deny` for
  * BOTH deny-only and allowOnly modes — `violatesModeFloor` is deny-wins, so
  * appending here closes the seam under an allowOnly mode too (an allowOnly
  * rule that happens to also match one of these paths is still overridden by
@@ -25,29 +29,29 @@ const CUSTOM_MODES_SECTION = 'talaria.customModes';
 const SELF_PROTECTION_DENY: readonly string[] = ['.vscode/settings.json', '*.code-workspace'];
 
 /**
- * B10 / §4.1: read the WORKSPACE value SPECIFICALLY via `inspect()`, never
- * the merged `.get()`. VS Code's configuration override chain is
- * `default -> global -> workspace -> workspaceFolder` and `.get()` returns
- * the EFFECTIVE (already-overridden) value — so a FOLDER-level value would
- * silently take precedence over the workspace-level one `.get()` returns.
- * `.inspect().workspaceValue` is the security-relevant choice: a per-folder
- * override in a multi-root workspace must not be able to silently WIDEN a
- * workspace-level mode's floor, so folder overrides are IGNORED entirely.
- *
- * Defensive on untrusted workspace data throughout: a malformed/non-array
- * `workspaceValue`, a non-object entry, or an entry missing `id`/`name` is
- * dropped rather than thrown — `talaria.customModes` is workspace-controlled
- * settings data, not a value this extension itself produced.
+ * R4-ARCH-01: where {@link parseCustomModes} reports a malformed rule. The
+ * adapter binds it to `vscode.window.showWarningMessage`; a headless caller
+ * captures it. Receives the COMPLETE user-facing message (mode name included).
  */
-export function readCustomModes(): CustomModeConfig[] {
-  const inspected = vscode.workspace.getConfiguration().inspect<unknown>(CUSTOM_MODES_SECTION);
-  const raw = Array.isArray(inspected?.workspaceValue) ? inspected.workspaceValue : [];
+export type CustomModeWarningSink = (message: string) => void;
+
+/**
+ * Validate the raw WORKSPACE value of `talaria.customModes` (the adapter
+ * reads it via `inspect().workspaceValue` — see `customModes.vscode.ts` for
+ * why never the merged `.get()`). Defensive on untrusted workspace data
+ * throughout: a malformed/non-array `raw`, a non-object entry, or an entry
+ * missing `id`/`name` is dropped rather than thrown — `talaria.customModes`
+ * is workspace-controlled settings data, not a value this extension itself
+ * produced. Every kept config is checked by {@link warnOnSuspiciousRules}.
+ */
+export function parseCustomModes(raw: unknown, warn: CustomModeWarningSink): CustomModeConfig[] {
+  const entries: readonly unknown[] = Array.isArray(raw) ? raw : [];
 
   const configs: CustomModeConfig[] = [];
-  for (const entry of raw) {
+  for (const entry of entries) {
     const config = normalizeConfig(entry);
     if (!config) continue;
-    warnOnSuspiciousRules(config);
+    warnOnSuspiciousRules(config, warn);
     configs.push(config);
   }
   return configs;
@@ -60,11 +64,12 @@ export function toCatalog(configs: readonly CustomModeConfig[]): CustomModeInfo[
 
 /**
  * Snapshot builder (pure, unit-testable — no vscode dependency of its own):
- * `AcpBackend.setCustomMode` calls this at `mode.set` time and hands the
- * PLAIN DATA result to the `SessionController`, which enforces it from
- * memory until the next explicit `setCustomMode` call. That snapshot-on-
- * activate is the PRIMARY §4.3 self-widening mitigation; this function only
- * shapes the data, it does not itself decide when re-snapshotting happens.
+ * `SessionScopeActions.setCustomMode` calls this at `mode.set` time and
+ * hands the PLAIN DATA result to the `SessionController`, which enforces it
+ * from memory until the next explicit `setCustomMode` call. That snapshot-
+ * on-activate is the PRIMARY §4.3 self-widening mitigation; this function
+ * only shapes the data, it does not itself decide when re-snapshotting
+ * happens.
  */
 export function buildModeFloorSnapshot(config: CustomModeConfig): ModeFloor {
   const deny = [...(config.deny ?? []), ...SELF_PROTECTION_DENY];
@@ -119,9 +124,9 @@ function toStringArray(value: unknown): string[] | undefined {
  * Slashless `allowOnly` rules are fail-CLOSED/over-restrictive (the safer
  * direction), so they are warn-optional and not flagged.
  */
-function warnOnSuspiciousRules(config: CustomModeConfig): void {
+function warnOnSuspiciousRules(config: CustomModeConfig, sink: CustomModeWarningSink): void {
   const warn = (message: string): void => {
-    void vscode.window.showWarningMessage(`Talaria custom mode "${config.name}": ${message}`);
+    sink(`Talaria custom mode "${config.name}": ${message}`);
   };
   for (const rule of config.deny ?? []) {
     if (rule.startsWith('/')) {

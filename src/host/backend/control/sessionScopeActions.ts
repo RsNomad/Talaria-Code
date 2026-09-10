@@ -1,5 +1,6 @@
 import type { EditPolicyPreset, HydrateTabSeed, SlashCommandInfo } from '../../../shared/protocol';
-import { readCustomModes, toCatalog, buildModeFloorSnapshot } from '../customModes';
+import { toCatalog, buildModeFloorSnapshot } from '../customModes';
+import { readCustomModes } from '../customModes.vscode';
 import type { SessionController } from '../session/SessionController';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
 import { errorMessage } from '../../../shared/errorMessage';
