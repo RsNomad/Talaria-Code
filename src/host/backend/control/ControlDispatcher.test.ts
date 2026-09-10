@@ -1,13 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
-/**
- * `ControlDispatcher.ts` pulls in `./customModes.ts`, which imports `vscode`
- * at module scope (unused by the `sessions`-fetch path this suite exercises,
- * but still a static import that must resolve outside the Extension Host).
- * Mirrors `AcpBackend.test.ts`'s own `vi.mock('vscode', ...)` — this suite
- * never calls into `customModes.ts`'s functions, so an empty stub is enough.
- */
-vi.mock('vscode', () => ({}));
+// R4-ARCH-01: no `vi.mock('vscode')` here — `control/` is headless-importable
+// (the settings read is an injected port member); `controlHeadless.lock.test.ts`
+// is the tier-wide proof and this file's plain import is another.
 
 import { ControlDispatcher } from './ControlDispatcher';
 import type { ControlDispatcherHostPort } from './ControlDispatcher';
