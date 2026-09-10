@@ -195,20 +195,36 @@ afterEach(() => {
 // perturb any time-ordering assertion -- it only hands the real event loop one
 // more turn. drainUntil loops it until the caller's predicate observes the
 // handler's real effect: it waits EXACTLY as many turns as the I/O needs, on
-// any platform. The cap only trips on a genuine hang (a wrong predicate or a
-// handler that never produces the awaited effect), turning an infinite hang
-// into a fast, legible failure.
-const WATCH_DRAIN_CAP = 5000;
-async function drainUntil(until: () => boolean): Promise<void> {
-  for (let i = 0; i < WATCH_DRAIN_CAP; i++) {
-    if (until()) return;
+// any platform.
+//
+// R4-TEST-01: the cap is REAL wall-clock time, not a turn count. One drain
+// turn is one `setImmediate` hop (that is what the async tick yields on Node:
+// the bundled fake-timers' `originalSetTimeout` IS `setImmediate`), so the old
+// 5000-turn cap was a budget of only ~25-50 ms of wall time. A two-cycle
+// watch drain needs ~20 SEQUENTIAL real-fs ops; a loaded threadpool, an AV
+// scan of the fresh temp dir, or a contended CI runner stalls ONE of them for
+// longer than that, and the cap tripped with a message blaming "a real hang"
+// (the D-5 flake). Wall-clock bounds what the turn count only approximated;
+// 4 s is deliberately below vitest's 5 s testTimeout so a genuine hang still
+// fails with THIS message, not vitest's. The message names every harness
+// cause it can have, because none of them is a production defect.
+const WATCH_DRAIN_CAP_MS = 4000;
+async function drainUntil(until: () => boolean, capMs: number = WATCH_DRAIN_CAP_MS): Promise<void> {
+  const startedAt = vi.getRealSystemTime();
+  let turns = 0;
+  while (!until()) {
+    const elapsedMs = vi.getRealSystemTime() - startedAt;
+    if (elapsedMs > capMs) {
+      throw new Error(
+        `drainUntil: the awaited condition never held within ${capMs} ms of real time (${turns} drain turns). ` +
+          'This is a TEST-HARNESS drive failure, not evidence of a production hang: the predicate can never be ' +
+          'satisfied, a timer was scheduled AFTER the advance meant to fire it, a fire-and-forget cycle FAILED ' +
+          "(check the indexer's injected logger), or the real-fs chain is starved under load.",
+      );
+    }
     await vi.advanceTimersByTimeAsync(0);
+    turns += 1;
   }
-  throw new Error(
-    'drainUntil: watch handler did not settle within ' +
-      WATCH_DRAIN_CAP +
-      ' drain turns -- the awaited condition never held (a real hang, or a wrong until() predicate).',
-  );
 }
 /** Fire the pending debounce, then drain real event-loop turns until `until`
  * observes the fire-and-forget handler's effect. */
@@ -216,6 +232,12 @@ async function flushWatch(debounceMs: number, until: () => boolean): Promise<voi
   await vi.advanceTimersByTimeAsync(debounceMs);
   await drainUntil(until);
 }
+
+describe('TST-01 drain helper self-check (R4-TEST-01)', () => {
+  it('drainUntil: a never-satisfied predicate trips the REAL-time cap fast and names a harness failure, not a production hang', async () => {
+    await expect(drainUntil(() => false, 20)).rejects.toThrow(/TEST-HARNESS drive failure/);
+  });
+});
 
 /**
  * B1a: production's `writeManifest` writes via a same-dir `.tmp` file then
