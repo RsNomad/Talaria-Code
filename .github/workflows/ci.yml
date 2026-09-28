@@ -47,7 +47,7 @@ jobs:
       # Cache the downloaded VS Code test build (key pinned to the version in
       # .vscode-test.mjs — bump both together).
       - name: Cache VS Code 1.125.0 test build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .vscode-test/vscode-*
           key: vscode-test-${{ runner.os }}-1.125.0
